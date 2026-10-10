@@ -1,0 +1,1507 @@
+//! Workspace definitions loaded from KDL files.
+//!
+//! A workspace file is a Zellij layout, so existing `~/.config/zellij/layouts/*.kdl`
+//! files work unchanged. Zellij writes KDL v1; KDL v2 is accepted too. Only the
+//! subset kraal needs is interpreted: anything else is skipped and reported in
+//! [`WorkspaceDef::warnings`] rather than failing the load.
+//!
+//! kraal extends panes with two properties: `preview="notes.md"` (show a rendered
+//! file instead of a terminal) and `agent="claude"` (the pane runs a coding agent).
+//! Zellij rejects unknown properties, so files using them are kraal-only.
+
+use std::fmt::{self, Write as _};
+use std::path::{Path, PathBuf};
+use std::{env, fs, io};
+
+use anyhow::{Context as _, Result, anyhow};
+use kdl::{KdlDocument, KdlEntry, KdlError, KdlNode, KdlValue};
+use serde::{Deserialize, Serialize};
+
+/// How a split arranges its children.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+pub enum Axis {
+    /// Children placed left to right (Zellij `split_direction="vertical"`).
+    Row,
+    /// Children placed top to bottom (Zellij `split_direction="horizontal"`, the default).
+    #[default]
+    Column,
+}
+
+impl Axis {
+    fn from_zellij(s: &str) -> Option<Self> {
+        if s.eq_ignore_ascii_case("vertical") {
+            Some(Self::Row)
+        } else if s.eq_ignore_ascii_case("horizontal") {
+            Some(Self::Column)
+        } else {
+            None
+        }
+    }
+
+    fn zellij_name(self) -> &'static str {
+        match self {
+            Self::Row => "vertical",
+            Self::Column => "horizontal",
+        }
+    }
+}
+
+/// Size of a split child along its parent's axis.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum SizeSpec {
+    /// A fixed number of cells (columns in a row, lines in a column).
+    Fixed(u16),
+    /// A percentage (1-100) of the parent's extent.
+    Percent(u16),
+}
+
+/// What a pane shows.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum PaneKind {
+    /// A terminal running [`PaneDef::command`], or the default shell.
+    #[default]
+    Terminal,
+    /// A rendered preview of a file (kraal extension `preview="..."`).
+    Preview(PathBuf),
+}
+
+/// A leaf pane.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct PaneDef {
+    /// Display name (Zellij `name`).
+    pub name: Option<String>,
+    /// Program to run; `None` runs the default shell.
+    pub command: Option<String>,
+    /// Arguments for `command`.
+    pub args: Vec<String>,
+    /// Effective working directory, already resolved against the enclosing tab and workspace.
+    pub cwd: Option<PathBuf>,
+    /// Whether this pane should get the focus in its tab.
+    pub focus: bool,
+    /// Terminal or file preview.
+    pub kind: PaneKind,
+    /// Coding agent hint (kraal extension `agent="..."`).
+    pub agent: Option<String>,
+    /// Wait for a keypress before starting `command`.
+    pub start_suspended: bool,
+    /// Close the pane when `command` exits instead of holding it open.
+    pub close_on_exit: bool,
+}
+
+/// A tiled layout tree.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LayoutNode {
+    /// A single pane.
+    Pane(PaneDef),
+    /// Two or more children laid out along `axis`, each with an optional size.
+    Split {
+        /// Direction in which the children are placed.
+        axis: Axis,
+        /// Children in order, with their size along `axis` (`None` shares the remaining space).
+        children: Vec<(LayoutNode, Option<SizeSpec>)>,
+    },
+}
+
+impl LayoutNode {
+    /// Leaf panes in depth-first order.
+    pub fn panes(&self) -> Vec<&PaneDef> {
+        let mut out = Vec::new();
+        self.collect_panes(&mut out);
+        out
+    }
+
+    fn collect_panes<'a>(&'a self, out: &mut Vec<&'a PaneDef>) {
+        match self {
+            Self::Pane(pane) => out.push(pane),
+            Self::Split { children, .. } => {
+                for (child, _) in children {
+                    child.collect_panes(out);
+                }
+            }
+        }
+    }
+
+    fn into_panes(self) -> Vec<PaneDef> {
+        match self {
+            Self::Pane(pane) => vec![pane],
+            Self::Split { children, .. } => children.into_iter().flat_map(|(child, _)| child.into_panes()).collect(),
+        }
+    }
+}
+
+/// A tab: a tiled layout plus floating panes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TabDef {
+    /// Tab title.
+    pub name: Option<String>,
+    /// Whether this tab should be active when the workspace opens.
+    pub focus: bool,
+    /// Effective working directory, already resolved against the workspace cwd.
+    pub cwd: Option<PathBuf>,
+    /// Tiled panes.
+    pub root: LayoutNode,
+    /// Floating panes, in declaration order.
+    pub floating: Vec<PaneDef>,
+}
+
+impl TabDef {
+    /// Tiled panes in depth-first order, then floating panes.
+    pub fn panes(&self) -> Vec<&PaneDef> {
+        let mut out = self.root.panes();
+        out.extend(&self.floating);
+        out
+    }
+}
+
+/// A parsed workspace file.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceDef {
+    /// Workspace name (the file stem).
+    pub name: String,
+    /// Workspace-wide working directory (Zellij `cwd "..."` inside `layout`).
+    pub cwd: Option<PathBuf>,
+    /// Tabs in order; never empty for a parsed file.
+    pub tabs: Vec<TabDef>,
+    /// Constructs that were skipped, as `line N: message`.
+    pub warnings: Vec<String>,
+}
+
+impl WorkspaceDef {
+    /// Every pane in tab order (tiled then floating), handy for listings.
+    pub fn panes(&self) -> Vec<&PaneDef> {
+        self.tabs.iter().flat_map(TabDef::panes).collect()
+    }
+}
+
+/// Parse a workspace file. `name` is the workspace name (file stem).
+///
+/// Fails only on invalid KDL or a missing `layout` node. Relative `cwd` values are
+/// resolved against the enclosing cwd (pane, then tab, then workspace) and a
+/// leading `~/` is expanded with `$HOME`; panes and tabs without a `cwd` inherit it.
+pub fn parse_workspace(name: &str, src: &str) -> Result<WorkspaceDef> {
+    let doc = parse_kdl(src)?;
+    let mut parser = Parser { src, warnings: Vec::new() };
+    let mut layout = None;
+    for node in doc.nodes() {
+        match node.name().value() {
+            "layout" if layout.is_none() => layout = Some(node),
+            "layout" => parser.warn(node_pos(node), "extra `layout` node ignored"),
+            other => parser.warn(node_pos(node), format!("unknown top-level node `{other}` ignored")),
+        }
+    }
+    let layout = layout.context("no `layout` node")?;
+    let (cwd, tabs) = parser.layout(layout);
+    // Report in document order (the workspace cwd is read ahead of the rest).
+    parser.warnings.sort_by_key(|(offset, _)| *offset);
+    Ok(WorkspaceDef {
+        name: name.to_owned(),
+        cwd,
+        tabs,
+        warnings: parser.warnings.into_iter().map(|(_, msg)| msg).collect(),
+    })
+}
+
+/// Load every `*.kdl` in `dir`, sorted by name. Unparseable files are returned as
+/// `Err` entries with the path.
+///
+/// A missing directory yields an empty list; any other error reading it yields a
+/// single `Err` entry for `dir` itself.
+pub fn load_dir(dir: &Path) -> Vec<(PathBuf, Result<WorkspaceDef>)> {
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Vec::new(),
+        Err(e) => {
+            let err = anyhow::Error::new(e).context(format!("reading {}", dir.display()));
+            return vec![(dir.to_path_buf(), Err(err))];
+        }
+    };
+    let mut paths: Vec<PathBuf> = entries
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter(|path| path.extension().is_some_and(|ext| ext == "kdl") && path.is_file())
+        .collect();
+    paths.sort();
+    paths
+        .into_iter()
+        .map(|path| {
+            let ws = load_file(&path);
+            (path, ws)
+        })
+        .collect()
+}
+
+fn load_file(path: &Path) -> Result<WorkspaceDef> {
+    let src = fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    let name = path.file_stem().map(|stem| stem.to_string_lossy().into_owned()).unwrap_or_default();
+    parse_workspace(&name, &src).with_context(|| format!("parsing {}", path.display()))
+}
+
+/// Serialise back to KDL (v1 syntax, Zellij-compatible, kraal extensions as
+/// properties), so that `parse_workspace(name, &to_kdl(&ws))` round-trips.
+///
+/// The output includes Zellij's usual tab-bar/status-bar `default_tab_template`
+/// (ignored by kraal) so the file also looks right when opened in Zellij. Paths are
+/// written relative to the enclosing cwd only when they are relative themselves.
+pub fn to_kdl(ws: &WorkspaceDef) -> String {
+    let mut w = Writer::default();
+    w.line(0, "layout {");
+    if let Some(cwd) = &ws.cwd {
+        w.line(1, &format!("cwd {}", quote(&path_text(cwd, None))));
+    }
+    for line in DEFAULT_TAB_TEMPLATE.lines() {
+        w.line(1, line);
+    }
+    for tab in &ws.tabs {
+        let mut head = String::from("tab");
+        push_str(&mut head, "name", tab.name.as_deref());
+        push_flag(&mut head, "focus", tab.focus);
+        push_cwd(&mut head, tab.cwd.as_deref(), ws.cwd.as_deref());
+        head.push_str(" {");
+        w.line(1, &head);
+        let base = tab.cwd.as_deref().or(ws.cwd.as_deref());
+        w.node(&tab.root, None, base, 2);
+        if !tab.floating.is_empty() {
+            w.line(2, "floating_panes {");
+            for pane in &tab.floating {
+                w.pane(pane, None, base, 3);
+            }
+            w.line(2, "}");
+        }
+        w.line(1, "}");
+    }
+    w.line(0, "}");
+    w.out
+}
+
+// ---------------------------------------------------------------------------
+// Parsing
+
+/// A layout node with its size in the parent split.
+type SizedNode = (LayoutNode, Option<SizeSpec>);
+
+/// Parses the KDL text, trying v2 first and then v1 (Zellij's dialect).
+fn parse_kdl(src: &str) -> Result<KdlDocument> {
+    let v2_err = match KdlDocument::parse_v2(src) {
+        Ok(doc) => return Ok(doc),
+        Err(e) => e,
+    };
+    let v1_err = match KdlDocument::parse_v1(src) {
+        Ok(doc) => return Ok(doc),
+        Err(e) => e,
+    };
+    // Neither dialect fits: report the parser that got further, which most likely
+    // matches the dialect the author intended. Ties go to v1, Zellij's dialect.
+    let err = if error_offset(&v2_err) > error_offset(&v1_err) { &v2_err } else { &v1_err };
+    Err(anyhow!("invalid KDL: {}", describe_error(src, err)))
+}
+
+fn error_offset(err: &KdlError) -> usize {
+    err.diagnostics.iter().map(|d| d.span.offset()).min().unwrap_or(0)
+}
+
+fn describe_error(src: &str, err: &KdlError) -> String {
+    let parts: Vec<String> = err
+        .diagnostics
+        .iter()
+        .take(3)
+        .map(|d| {
+            let line = line_of(src, d.span.offset());
+            let msg = d.message.as_deref().unwrap_or("syntax error");
+            match &d.help {
+                Some(help) => format!("line {line}: {msg} ({help})"),
+                None => format!("line {line}: {msg}"),
+            }
+        })
+        .collect();
+    if parts.is_empty() { "syntax error".to_owned() } else { parts.join("; ") }
+}
+
+/// 1-based line number of a byte offset.
+fn line_of(src: &str, offset: usize) -> usize {
+    let end = offset.min(src.len());
+    src.as_bytes()[..end].iter().filter(|&&b| b == b'\n').count() + 1
+}
+
+fn node_pos(node: &KdlNode) -> usize {
+    node.name().span().offset()
+}
+
+fn entry_pos(entry: &KdlEntry) -> usize {
+    entry.span().offset()
+}
+
+fn entry_key(entry: &KdlEntry) -> Option<&str> {
+    entry.name().map(|name| name.value())
+}
+
+fn child_nodes(node: &KdlNode) -> &[KdlNode] {
+    node.children().map_or(&[], KdlDocument::nodes)
+}
+
+/// Converts a scalar to text; numbers and booleans are accepted where Zellij wants strings.
+fn scalar_text(value: &KdlValue) -> Option<String> {
+    match value {
+        KdlValue::String(s) => Some(s.clone()),
+        KdlValue::Integer(n) => Some(n.to_string()),
+        KdlValue::Float(f) => Some(f.to_string()),
+        KdlValue::Bool(b) => Some(b.to_string()),
+        KdlValue::Null => None,
+    }
+}
+
+/// Renders a value for messages; strings are always quoted.
+fn show(value: &KdlValue) -> String {
+    match value {
+        KdlValue::String(s) => format!("{s:?}"),
+        KdlValue::Integer(n) => n.to_string(),
+        KdlValue::Float(f) => f.to_string(),
+        KdlValue::Bool(b) => b.to_string(),
+        KdlValue::Null => "null".to_owned(),
+    }
+}
+
+fn parse_size(value: &KdlValue) -> Option<SizeSpec> {
+    match value {
+        KdlValue::Integer(n) => u16::try_from(*n).ok().filter(|&n| n > 0).map(SizeSpec::Fixed),
+        KdlValue::String(s) => {
+            let s = s.trim();
+            match s.strip_suffix('%') {
+                Some(pct) => {
+                    pct.trim().parse::<u16>().ok().filter(|pct| (1..=100).contains(pct)).map(SizeSpec::Percent)
+                }
+                None => s.parse::<u16>().ok().filter(|&n| n > 0).map(SizeSpec::Fixed),
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Expands a leading `~` or `~/` with `$HOME` and joins relative paths onto `base`.
+fn resolve_path(base: Option<&Path>, raw: &str) -> PathBuf {
+    let path = expand_home(raw);
+    match base {
+        Some(base) if path.is_relative() => base.join(path),
+        _ => path,
+    }
+}
+
+fn expand_home(raw: &str) -> PathBuf {
+    let rest = if raw == "~" { Some("") } else { raw.strip_prefix("~/") };
+    match (rest, env::var_os("HOME")) {
+        (Some(rest), Some(home)) if !home.is_empty() => {
+            let home = PathBuf::from(home);
+            if rest.is_empty() { home } else { home.join(rest) }
+        }
+        _ => PathBuf::from(raw),
+    }
+}
+
+/// The effective cwd of a node: its own (resolved) or the inherited one.
+fn inherit_cwd(base: Option<&Path>, raw: Option<&str>) -> Option<PathBuf> {
+    match raw {
+        Some(raw) => Some(resolve_path(base, raw)),
+        None => base.map(Path::to_path_buf),
+    }
+}
+
+/// Builds a split, collapsing it to its child when there is only one.
+fn collapse(axis: Axis, mut children: Vec<SizedNode>) -> Option<LayoutNode> {
+    match children.len() {
+        0 => None,
+        1 => children.pop().map(|(node, _)| node),
+        _ => Some(LayoutNode::Split { axis, children }),
+    }
+}
+
+/// The tiled root of a tab; an empty tab gets one shell pane, as in Zellij.
+fn tab_root(axis: Axis, panes: Vec<SizedNode>, cwd: Option<&Path>) -> LayoutNode {
+    collapse(axis, panes)
+        .unwrap_or_else(|| LayoutNode::Pane(PaneDef { cwd: cwd.map(Path::to_path_buf), ..PaneDef::default() }))
+}
+
+struct Parser<'a> {
+    src: &'a str,
+    /// Warnings with the byte offset they refer to.
+    warnings: Vec<(usize, String)>,
+}
+
+impl Parser<'_> {
+    fn warn(&mut self, offset: usize, msg: impl fmt::Display) {
+        let line = line_of(self.src, offset);
+        self.warnings.push((offset, format!("line {line}: {msg}")));
+    }
+
+    fn unknown_entry(&mut self, entry: &KdlEntry, owner: &str) {
+        let msg = match entry_key(entry) {
+            Some(key) => format!("unsupported property `{key}` on `{owner}` ignored"),
+            None => format!("unexpected argument {} on `{owner}` ignored", show(entry.value())),
+        };
+        self.warn(entry_pos(entry), msg);
+    }
+
+    fn unknown_node(&mut self, node: &KdlNode, owner: &str) {
+        let name = node.name().value();
+        self.warn(node_pos(node), format!("unsupported node `{name}` in `{owner}` ignored"));
+    }
+
+    fn string(&mut self, entry: &KdlEntry) -> Option<String> {
+        let text = scalar_text(entry.value());
+        if text.is_none() {
+            let key = entry_key(entry).unwrap_or("value");
+            self.warn(entry_pos(entry), format!("`{key}` must be a string, ignored"));
+        }
+        text
+    }
+
+    fn path(&mut self, entry: &KdlEntry) -> Option<String> {
+        let text = self.string(entry)?;
+        if text.is_empty() {
+            let key = entry_key(entry).unwrap_or("path");
+            self.warn(entry_pos(entry), format!("empty `{key}` ignored"));
+            return None;
+        }
+        Some(text)
+    }
+
+    fn flag(&mut self, entry: &KdlEntry) -> Option<bool> {
+        match entry.value() {
+            KdlValue::Bool(b) => Some(*b),
+            KdlValue::String(s) if s == "true" => Some(true),
+            KdlValue::String(s) if s == "false" => Some(false),
+            other => {
+                let key = entry_key(entry).unwrap_or("value");
+                self.warn(entry_pos(entry), format!("`{key}` must be true or false, found {}; ignored", show(other)));
+                None
+            }
+        }
+    }
+
+    /// A boolean child node such as `close_on_exit true`; a bare node means true.
+    fn flag_node(&mut self, node: &KdlNode) -> Option<bool> {
+        match node.entries().first() {
+            None => Some(true),
+            Some(entry) => self.flag(entry),
+        }
+    }
+
+    fn axis(&mut self, entry: &KdlEntry) -> Option<Axis> {
+        let axis = entry.value().as_string().and_then(Axis::from_zellij);
+        if axis.is_none() {
+            self.warn(
+                entry_pos(entry),
+                format!(
+                    "`split_direction` must be \"vertical\" or \"horizontal\", found {}; ignored",
+                    show(entry.value())
+                ),
+            );
+        }
+        axis
+    }
+
+    fn size(&mut self, entry: &KdlEntry) -> Option<SizeSpec> {
+        let size = parse_size(entry.value());
+        if size.is_none() {
+            self.warn(
+                entry_pos(entry),
+                format!(
+                    "invalid `size` {} (expected cells like 10 or a percentage like \"50%\"); ignored",
+                    show(entry.value())
+                ),
+            );
+        }
+        size
+    }
+
+    fn layout(&mut self, node: &KdlNode) -> (Option<PathBuf>, Vec<TabDef>) {
+        // Zellij treats these as the implicit tab's properties when there are no tabs.
+        let mut name = None;
+        let mut axis = None;
+        for entry in node.entries() {
+            match entry_key(entry) {
+                Some("name") => name = self.string(entry),
+                Some("split_direction") => axis = self.axis(entry),
+                Some("hide_floating_panes") => {}
+                _ => self.unknown_entry(entry, "layout"),
+            }
+        }
+        let items = child_nodes(node);
+
+        // The workspace cwd applies to every tab, wherever it is declared.
+        let mut cwd = None;
+        for item in items.iter().filter(|item| item.name().value() == "cwd") {
+            match item.entries().first() {
+                Some(entry) if entry_key(entry).is_none() => {
+                    if let Some(raw) = self.path(entry) {
+                        cwd = Some(resolve_path(None, &raw));
+                    }
+                }
+                _ => self.warn(node_pos(item), "`cwd` expects one path argument; ignored"),
+            }
+        }
+
+        let mut tabs = Vec::new();
+        let mut panes = Vec::new();
+        let mut floating = Vec::new();
+        let mut stray = None;
+        for item in items {
+            let before = (panes.len(), floating.len());
+            if self.tab_item(item, cwd.as_deref(), &mut panes, &mut floating) {
+                if stray.is_none() && (panes.len(), floating.len()) != before {
+                    stray = Some(node_pos(item));
+                }
+                continue;
+            }
+            match item.name().value() {
+                "tab" => tabs.push(self.tab(item, cwd.as_deref())),
+                // Templates only carry Zellij's own plugin bars; swap layouts are
+                // alternative arrangements that do not change the initial layout.
+                "cwd" | "default_tab_template" | "new_tab_template" | "swap_tiled_layout" | "swap_floating_layout" => {}
+                "pane_template" | "tab_template" => {
+                    let kind = item.name().value();
+                    self.warn(node_pos(item), format!("`{kind}` is not supported; ignored"));
+                }
+                _ => self.unknown_node(item, "layout"),
+            }
+        }
+
+        if tabs.is_empty() {
+            let root = tab_root(axis.unwrap_or_default(), panes, cwd.as_deref());
+            tabs.push(TabDef { name, focus: false, cwd: cwd.clone(), root, floating });
+        } else {
+            if let Some(at) = stray {
+                self.warn(at, "panes outside `tab` nodes are ignored when tabs exist");
+            }
+            if name.is_some() || axis.is_some() {
+                self.warn(node_pos(node), "`name`/`split_direction` on `layout` are ignored when tabs exist");
+            }
+        }
+        (cwd, tabs)
+    }
+
+    fn tab(&mut self, node: &KdlNode, ws_cwd: Option<&Path>) -> TabDef {
+        let mut name = None;
+        let mut focus = false;
+        let mut cwd_raw = None;
+        let mut axis = Axis::default();
+        for entry in node.entries() {
+            match entry_key(entry) {
+                Some("name") => name = self.string(entry),
+                Some("focus") => focus = self.flag(entry).unwrap_or(focus),
+                Some("cwd") => cwd_raw = self.path(entry),
+                Some("split_direction") => axis = self.axis(entry).unwrap_or(axis),
+                Some("hide_floating_panes") => {}
+                _ => self.unknown_entry(entry, "tab"),
+            }
+        }
+        let cwd = inherit_cwd(ws_cwd, cwd_raw.as_deref());
+        let mut panes = Vec::new();
+        let mut floating = Vec::new();
+        for item in child_nodes(node) {
+            if !self.tab_item(item, cwd.as_deref(), &mut panes, &mut floating) {
+                self.unknown_node(item, "tab");
+            }
+        }
+        let root = tab_root(axis, panes, cwd.as_deref());
+        TabDef { name, focus, cwd, root, floating }
+    }
+
+    /// Handles a node that may appear among a tab's panes; returns false for anything else.
+    fn tab_item(
+        &mut self,
+        node: &KdlNode,
+        cwd: Option<&Path>,
+        panes: &mut Vec<SizedNode>,
+        floating: &mut Vec<PaneDef>,
+    ) -> bool {
+        match node.name().value() {
+            "pane" | "plugin" => panes.extend(self.pane(node, cwd)),
+            "floating_panes" => {
+                let more = self.floating_panes(node, cwd);
+                floating.extend(more);
+            }
+            // Template placeholder; meaningless outside a template.
+            "children" => {}
+            _ => return false,
+        }
+        true
+    }
+
+    /// Parses a `pane` node. Returns `None` for plugin panes, which kraal drops.
+    fn pane(&mut self, node: &KdlNode, parent_cwd: Option<&Path>) -> Option<SizedNode> {
+        if node.name().value() == "plugin" {
+            return None;
+        }
+        let mut def = PaneDef::default();
+        let mut size = None;
+        let mut axis = Axis::default();
+        let mut cwd_raw = None;
+        let mut preview = None;
+        let mut plugin = false;
+        for entry in node.entries() {
+            match entry_key(entry) {
+                Some("name") => def.name = self.string(entry),
+                Some("command") => def.command = self.string(entry),
+                Some("cwd") => cwd_raw = self.path(entry),
+                Some("focus") => def.focus = self.flag(entry).unwrap_or(def.focus),
+                Some("size") => size = self.size(entry),
+                Some("split_direction") => axis = self.axis(entry).unwrap_or(axis),
+                Some("start_suspended") => {
+                    def.start_suspended = self.flag(entry).unwrap_or(def.start_suspended);
+                }
+                Some("close_on_exit") => {
+                    def.close_on_exit = self.flag(entry).unwrap_or(def.close_on_exit);
+                }
+                Some("preview") => preview = self.path(entry),
+                Some("agent") => def.agent = self.string(entry),
+                Some("plugin") => plugin = true,
+                // Cosmetics and floating-pane geometry, which kraal does not model.
+                Some("borderless" | "x" | "y" | "width" | "height" | "pinned") => {}
+                _ => self.unknown_entry(entry, "pane"),
+            }
+        }
+        let cwd = inherit_cwd(parent_cwd, cwd_raw.as_deref());
+
+        let mut children = Vec::new();
+        let mut container = false;
+        for item in child_nodes(node) {
+            match item.name().value() {
+                "pane" => {
+                    container = true;
+                    children.extend(self.pane(item, cwd.as_deref()));
+                }
+                "plugin" => plugin = true,
+                "args" => self.args(item, &mut def.args),
+                "start_suspended" => {
+                    def.start_suspended = self.flag_node(item).unwrap_or(def.start_suspended);
+                }
+                "close_on_exit" => {
+                    def.close_on_exit = self.flag_node(item).unwrap_or(def.close_on_exit);
+                }
+                "children" => {}
+                _ => self.unknown_node(item, "pane"),
+            }
+        }
+
+        if container {
+            if def.command.is_some() || !def.args.is_empty() || preview.is_some() || def.agent.is_some() {
+                self.warn(
+                    node_pos(node),
+                    "`command`, `args`, `preview` and `agent` on a pane with child panes are ignored",
+                );
+            }
+            // A container whose children were all plugins disappears with them.
+            return collapse(axis, children).map(|node| (node, size));
+        }
+        if plugin {
+            return None;
+        }
+        if def.command.is_none() && !def.args.is_empty() {
+            self.warn(node_pos(node), "`args` without `command` ignored");
+            def.args.clear();
+        }
+        if let Some(raw) = preview {
+            if def.command.is_some() {
+                self.warn(node_pos(node), "`command` on a preview pane ignored");
+                def.command = None;
+                def.args.clear();
+            }
+            def.kind = PaneKind::Preview(resolve_path(cwd.as_deref(), &raw));
+        }
+        def.cwd = cwd;
+        Some((LayoutNode::Pane(def), size))
+    }
+
+    fn args(&mut self, node: &KdlNode, out: &mut Vec<String>) {
+        for entry in node.entries() {
+            if entry_key(entry).is_some() {
+                self.unknown_entry(entry, "args");
+            } else if let Some(arg) = self.string(entry) {
+                out.push(arg);
+            }
+        }
+    }
+
+    fn floating_panes(&mut self, node: &KdlNode, cwd: Option<&Path>) -> Vec<PaneDef> {
+        for entry in node.entries() {
+            self.unknown_entry(entry, "floating_panes");
+        }
+        let mut out = Vec::new();
+        for item in child_nodes(node) {
+            match item.name().value() {
+                "pane" | "plugin" => match self.pane(item, cwd) {
+                    Some((LayoutNode::Pane(pane), _)) => out.push(pane),
+                    Some((split, _)) => {
+                        self.warn(node_pos(item), "nested panes inside a floating pane are flattened");
+                        out.extend(split.into_panes());
+                    }
+                    None => {}
+                },
+                _ => self.unknown_node(item, "floating_panes"),
+            }
+        }
+        out
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Writing
+
+const DEFAULT_TAB_TEMPLATE: &str = r#"default_tab_template {
+    pane size=1 borderless=true {
+        plugin location="zellij:tab-bar"
+    }
+    children
+    pane size=1 borderless=true {
+        plugin location="zellij:status-bar"
+    }
+}"#;
+
+#[derive(Default)]
+struct Writer {
+    out: String,
+}
+
+impl Writer {
+    fn line(&mut self, depth: usize, text: &str) {
+        for _ in 0..depth {
+            self.out.push_str("    ");
+        }
+        self.out.push_str(text);
+        self.out.push('\n');
+    }
+
+    fn node(&mut self, node: &LayoutNode, size: Option<SizeSpec>, base: Option<&Path>, depth: usize) {
+        match node {
+            LayoutNode::Pane(pane) => self.pane(pane, size, base, depth),
+            LayoutNode::Split { axis, children } => {
+                let mut head = String::from("pane");
+                push_str(&mut head, "split_direction", Some(axis.zellij_name()));
+                push_size(&mut head, size);
+                head.push_str(" {");
+                self.line(depth, &head);
+                for (child, child_size) in children {
+                    self.node(child, *child_size, base, depth + 1);
+                }
+                self.line(depth, "}");
+            }
+        }
+    }
+
+    fn pane(&mut self, pane: &PaneDef, size: Option<SizeSpec>, base: Option<&Path>, depth: usize) {
+        let mut head = String::from("pane");
+        push_str(&mut head, "name", pane.name.as_deref());
+        push_str(&mut head, "command", pane.command.as_deref());
+        push_cwd(&mut head, pane.cwd.as_deref(), base);
+        push_size(&mut head, size);
+        push_flag(&mut head, "focus", pane.focus);
+        push_flag(&mut head, "start_suspended", pane.start_suspended);
+        push_flag(&mut head, "close_on_exit", pane.close_on_exit);
+        if let PaneKind::Preview(path) = &pane.kind {
+            let own_cwd = pane.cwd.as_deref().or(base);
+            push_str(&mut head, "preview", Some(&path_text(path, own_cwd)));
+        }
+        push_str(&mut head, "agent", pane.agent.as_deref());
+        if pane.args.is_empty() {
+            self.line(depth, &head);
+            return;
+        }
+        head.push_str(" {");
+        self.line(depth, &head);
+        let args: Vec<String> = pane.args.iter().map(|arg| quote(arg)).collect();
+        self.line(depth + 1, &format!("args {}", args.join(" ")));
+        self.line(depth, "}");
+    }
+}
+
+fn push_str(head: &mut String, key: &str, value: Option<&str>) {
+    if let Some(value) = value {
+        let _ = write!(head, " {key}={}", quote(value));
+    }
+}
+
+fn push_flag(head: &mut String, key: &str, value: bool) {
+    if value {
+        let _ = write!(head, " {key}=true");
+    }
+}
+
+fn push_size(head: &mut String, size: Option<SizeSpec>) {
+    match size {
+        Some(SizeSpec::Fixed(n)) => {
+            let _ = write!(head, " size={n}");
+        }
+        Some(SizeSpec::Percent(n)) => {
+            let _ = write!(head, " size=\"{n}%\"");
+        }
+        None => {}
+    }
+}
+
+/// Writes `cwd` unless it is simply inherited from `base`.
+fn push_cwd(head: &mut String, cwd: Option<&Path>, base: Option<&Path>) {
+    if let Some(cwd) = cwd
+        && Some(cwd) != base
+    {
+        push_str(head, "cwd", Some(&path_text(cwd, base)));
+    }
+}
+
+/// Text for a path that the parser will resolve against `base`: absolute paths are
+/// written as-is, relative ones relative to `base`.
+fn path_text(path: &Path, base: Option<&Path>) -> String {
+    let shown = match base {
+        Some(base) if path.is_relative() => path.strip_prefix(base).unwrap_or(path),
+        _ => path,
+    };
+    if shown.as_os_str().is_empty() { ".".to_owned() } else { shown.to_string_lossy().into_owned() }
+}
+
+/// Quotes a string using escapes valid in both KDL v1 and v2.
+fn quote(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '\u{8}' => out.push_str("\\b"),
+            '\u{c}' => out.push_str("\\f"),
+            // Control, bidi-override and BOM characters must not appear literally in KDL v2.
+            c if c.is_control()
+                || matches!(
+                    c,
+                    '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}' | '\u{feff}'
+                ) =>
+            {
+                let _ = write!(out, "\\u{{{:x}}}", u32::from(c));
+            }
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const BARS: &str = r#"
+    default_tab_template {
+        pane size=1 borderless=true {
+            plugin location="tab-bar"
+        }
+        children
+        pane size=1 borderless=true {
+            plugin location="status-bar"
+        }
+    }
+"#;
+
+    /// Excerpt of a real fleet layout (the kind a Wave or Zellij user keeps).
+    fn zellij_fleet() -> String {
+        format!(
+            r#"// Zellij layout transposed from Wave workspace 'Kandy'
+layout {{
+{BARS}
+    tab name="lfimmo" {{
+        pane split_direction="vertical" {{
+            pane focus=true name="192.0.2.11" command="ssh" {{
+                args "admin@192.0.2.11"
+            }}
+            pane split_direction="horizontal" {{
+                pane name="192.0.2.12" command="ssh" {{
+                    args "admin@192.0.2.12"
+                }}
+                pane name="192.0.2.13" command="ssh" {{
+                    args "admin@192.0.2.13"
+                }}
+            }}
+        }}
+    }}
+    tab name="main" focus=true {{
+        pane split_direction="vertical" {{
+            pane split_direction="horizontal" {{
+                pane name="pve-main" command="ssh" {{
+                    args "-p" "2222" "root@pve-main.example.net"
+                }}
+                pane focus=true name="edge-proxy" command="ssh" {{
+                    args "deploy@edge-proxy.example.net"
+                }}
+            }}
+            pane split_direction="horizontal" {{
+                pane cwd="/home/me"
+                pane name="nvr" command="ssh" {{
+                    args "root@nvr.example.net"
+                }}
+            }}
+            pane name="198.51.100.249" command="ssh" {{
+                args "deploy@198.51.100.249"
+            }}
+        }}
+    }}
+    tab name="test" {{
+        pane focus=true name="app-test" command="ssh" {{
+            args "-t" "deploy@app-test.example.net" "cd /srv/website && exec $SHELL -l"
+        }}
+    }}
+}}
+"#
+        )
+    }
+
+    fn parse(src: &str) -> WorkspaceDef {
+        parse_workspace("test", src).expect("parses")
+    }
+
+    fn parse_clean(src: &str) -> WorkspaceDef {
+        let ws = parse(src);
+        assert!(ws.warnings.is_empty(), "unexpected warnings: {:?}", ws.warnings);
+        ws
+    }
+
+    fn leaf(node: &LayoutNode) -> &PaneDef {
+        match node {
+            LayoutNode::Pane(pane) => pane,
+            LayoutNode::Split { .. } => panic!("expected a pane, got {node:?}"),
+        }
+    }
+
+    fn split(node: &LayoutNode) -> (Axis, &[(LayoutNode, Option<SizeSpec>)]) {
+        match node {
+            LayoutNode::Split { axis, children } => (*axis, children),
+            LayoutNode::Pane(_) => panic!("expected a split, got {node:?}"),
+        }
+    }
+
+    fn assert_round_trip(ws: &WorkspaceDef) {
+        let text = to_kdl(ws);
+        let again = parse_workspace(&ws.name, &text).unwrap_or_else(|e| panic!("re-parse failed: {e:#}\n{text}"));
+        assert_eq!(&again, ws, "round trip changed the workspace:\n{text}");
+    }
+
+    #[test]
+    fn parses_zellij_fleet_layout() {
+        let ws = parse_clean(&zellij_fleet());
+        assert_eq!(ws.name, "test");
+        assert_eq!(ws.cwd, None);
+        let names: Vec<_> = ws.tabs.iter().map(|t| t.name.as_deref()).collect();
+        assert_eq!(names, [Some("lfimmo"), Some("main"), Some("test")]);
+        let focus: Vec<_> = ws.tabs.iter().map(|t| t.focus).collect();
+        assert_eq!(focus, [false, true, false]);
+
+        // Zellij "vertical" places children side by side.
+        let (axis, children) = split(&ws.tabs[0].root);
+        assert_eq!(axis, Axis::Row);
+        assert_eq!(children.len(), 2);
+        let first = leaf(&children[0].0);
+        assert_eq!(first.name.as_deref(), Some("192.0.2.11"));
+        assert_eq!(first.command.as_deref(), Some("ssh"));
+        assert_eq!(first.args, ["admin@192.0.2.11"]);
+        assert!(first.focus);
+        assert_eq!(first.kind, PaneKind::Terminal);
+        let (inner_axis, inner) = split(&children[1].0);
+        assert_eq!(inner_axis, Axis::Column);
+        assert_eq!(inner.len(), 2);
+        assert!(!leaf(&inner[0].0).focus);
+        assert_eq!(ws.tabs.iter().map(|t| t.panes().len()).sum::<usize>(), 9);
+    }
+
+    #[test]
+    fn keeps_multi_value_args() {
+        let ws = parse_clean(&zellij_fleet());
+        let (_, columns) = split(&ws.tabs[1].root);
+        let (_, top) = split(&columns[0].0);
+        assert_eq!(leaf(&top[0].0).args, ["-p", "2222", "root@pve-main.example.net"]);
+        let pool = leaf(&ws.tabs[2].root);
+        assert_eq!(pool.args, ["-t", "deploy@app-test.example.net", "cd /srv/website && exec $SHELL -l"]);
+    }
+
+    #[test]
+    fn single_pane_tab_is_the_root() {
+        let ws = parse_clean(&zellij_fleet());
+        let pool = leaf(&ws.tabs[2].root);
+        assert_eq!(pool.name.as_deref(), Some("app-test"));
+        assert!(pool.focus);
+    }
+
+    #[test]
+    fn bare_pane_is_a_shell() {
+        let ws = parse_clean(&zellij_fleet());
+        let (_, columns) = split(&ws.tabs[1].root);
+        let (_, middle) = split(&columns[1].0);
+        let shell = leaf(&middle[0].0);
+        assert_eq!(shell, &PaneDef { cwd: Some(PathBuf::from("/home/me")), ..PaneDef::default() });
+        let src = "layout {\n    tab name=\"empty\"\n    tab { pane; }\n}\n";
+        let ws = parse_clean(src);
+        assert_eq!(ws.tabs[0].root, LayoutNode::Pane(PaneDef::default()));
+        assert_eq!(ws.tabs[1].root, LayoutNode::Pane(PaneDef::default()));
+    }
+
+    #[test]
+    fn panes_without_tabs_form_one_tab() {
+        let src = r#"
+layout {
+    pane size=1 borderless=true {
+        plugin location="zellij:tab-bar"
+    }
+    pane command="htop"
+    pane command="btop" focus=true
+    floating_panes {
+        pane command="lazygit" x=10 y="10%" width="80%" height=20
+    }
+}
+"#;
+        let ws = parse_clean(src);
+        assert_eq!(ws.tabs.len(), 1);
+        let tab = &ws.tabs[0];
+        assert_eq!(tab.name, None);
+        let (axis, children) = split(&tab.root);
+        assert_eq!(axis, Axis::Column);
+        assert_eq!(children.len(), 2);
+        assert!(leaf(&children[1].0).focus);
+        assert_eq!(tab.floating.len(), 1);
+        assert_eq!(tab.floating[0].command.as_deref(), Some("lazygit"));
+
+        let ws = parse_clean("layout {\n}\n");
+        assert_eq!(ws.tabs.len(), 1);
+        assert_eq!(ws.tabs[0].root, LayoutNode::Pane(PaneDef::default()));
+
+        let ws = parse_clean("layout name=\"solo\" split_direction=\"vertical\" {\n    pane\n    pane\n}\n");
+        assert_eq!(ws.tabs[0].name.as_deref(), Some("solo"));
+        assert_eq!(split(&ws.tabs[0].root).0, Axis::Row);
+    }
+
+    #[test]
+    fn parses_sizes() {
+        let src = r#"
+layout {
+    tab split_direction="vertical" {
+        pane size=30
+        pane size="25%"
+        pane size=" 40 % "
+        pane
+    }
+}
+"#;
+        let ws = parse_clean(src);
+        let (axis, children) = split(&ws.tabs[0].root);
+        assert_eq!(axis, Axis::Row);
+        let sizes: Vec<_> = children.iter().map(|(_, size)| *size).collect();
+        assert_eq!(sizes, [Some(SizeSpec::Fixed(30)), Some(SizeSpec::Percent(25)), Some(SizeSpec::Percent(40)), None]);
+
+        let bad =
+            parse("layout {\n    pane size=0\n    pane size=\"150%\"\n    pane size=1.5\n    pane size=70000\n}\n");
+        assert_eq!(bad.warnings.len(), 4, "{:?}", bad.warnings);
+        assert!(bad.warnings.iter().all(|w| w.contains("invalid `size`")));
+        let (_, children) = split(&bad.tabs[0].root);
+        assert!(children.iter().all(|(_, size)| size.is_none()));
+    }
+
+    #[test]
+    fn collapses_single_child_splits() {
+        let src = r#"
+layout {
+    tab {
+        pane split_direction="vertical" {
+            pane size="30%" split_direction="horizontal" {
+                pane size=5 split_direction="vertical" {
+                    pane command="htop"
+                }
+            }
+            pane command="top"
+        }
+    }
+}
+"#;
+        let ws = parse_clean(src);
+        let (axis, children) = split(&ws.tabs[0].root);
+        assert_eq!(axis, Axis::Row);
+        // The chain of one-child containers collapses to the leaf, keeping the outer size.
+        assert_eq!(leaf(&children[0].0).command.as_deref(), Some("htop"));
+        assert_eq!(children[0].1, Some(SizeSpec::Percent(30)));
+    }
+
+    #[test]
+    fn drops_plugin_panes() {
+        let src = r#"
+layout {
+    tab {
+        pane size=1 borderless=true {
+            plugin location="zellij:tab-bar"
+        }
+        pane command="htop"
+        pane split_direction="vertical" {
+            pane { plugin location="zellij:strider"; }
+            plugin location="zellij:compact-bar"
+        }
+        pane plugin="zellij:status-bar"
+    }
+    tab {
+        pane { plugin location="zellij:session-manager"; }
+    }
+}
+"#;
+        let ws = parse_clean(src);
+        assert_eq!(leaf(&ws.tabs[0].root).command.as_deref(), Some("htop"));
+        // A tab with nothing but plugins still gets a shell, as in Zellij.
+        assert_eq!(ws.tabs[1].root, LayoutNode::Pane(PaneDef::default()));
+    }
+
+    #[test]
+    fn parses_floating_panes() {
+        let src = r#"
+layout {
+    tab name="dev" cwd="/srv" {
+        pane command="nvim"
+        floating_panes {
+            pane command="lazygit" width="80%" height="80%" x="10%" y="10%" pinned=true
+            pane cwd="logs" name="tail" command="tail" close_on_exit=true {
+                args "-f" "app.log"
+            }
+            pane { plugin location="zellij:filepicker"; }
+        }
+    }
+}
+"#;
+        let ws = parse_clean(src);
+        let tab = &ws.tabs[0];
+        assert_eq!(tab.floating.len(), 2);
+        assert_eq!(tab.floating[0].cwd, Some(PathBuf::from("/srv")));
+        assert_eq!(tab.floating[1].cwd, Some(PathBuf::from("/srv/logs")));
+        assert!(tab.floating[1].close_on_exit);
+        let commands: Vec<_> = ws.panes().iter().map(|p| p.command.clone()).collect();
+        assert_eq!(commands, [Some("nvim".to_owned()), Some("lazygit".to_owned()), Some("tail".to_owned())]);
+    }
+
+    #[test]
+    fn suspend_and_close_flags_as_properties_or_children() {
+        let src = r#"
+layout {
+    pane command="a" start_suspended=true close_on_exit=false
+    pane command="b" {
+        start_suspended true
+        close_on_exit true
+    }
+    pane command="c" {
+        close_on_exit
+    }
+}
+"#;
+        let ws = parse_clean(src);
+        let flags: Vec<_> = ws.panes().iter().map(|p| (p.start_suspended, p.close_on_exit)).collect();
+        assert_eq!(flags, [(true, false), (true, true), (false, true)]);
+    }
+
+    #[test]
+    fn kraal_extensions() {
+        let src = r#"
+layout {
+    tab name="agents" cwd="/work/kraal" {
+        pane split_direction="vertical" {
+            pane name="claude" command="claude" agent="claude" focus=true
+            pane name="plan" preview="docs/PLAN.md" size="40%"
+            pane preview="/etc/motd"
+        }
+    }
+}
+"#;
+        let ws = parse_clean(src);
+        let panes = ws.panes();
+        assert_eq!(panes[0].agent.as_deref(), Some("claude"));
+        assert_eq!(panes[0].kind, PaneKind::Terminal);
+        assert_eq!(panes[1].kind, PaneKind::Preview(PathBuf::from("/work/kraal/docs/PLAN.md")));
+        assert_eq!(panes[1].command, None);
+        assert_eq!(panes[2].kind, PaneKind::Preview(PathBuf::from("/etc/motd")));
+
+        let ws = parse("layout {\n    pane preview=\"a.md\" command=\"cat\" {\n        args \"x\"\n    }\n}\n");
+        let pane = leaf(&ws.tabs[0].root);
+        assert_eq!(pane.kind, PaneKind::Preview(PathBuf::from("a.md")));
+        assert_eq!((pane.command.as_deref(), pane.args.len()), (None, 0));
+        assert_eq!(ws.warnings.len(), 1, "{:?}", ws.warnings);
+    }
+
+    #[test]
+    fn resolves_cwd_chain() {
+        let src = r#"
+layout {
+    tab name="rel" cwd="projects" {
+        pane split_direction="vertical" cwd="kraal" {
+            pane cwd="src"
+            pane cwd="/tmp"
+            pane
+        }
+    }
+    tab name="abs" cwd="/opt" {
+        pane
+    }
+    tab name="inherit" {
+        pane cwd="notes"
+    }
+    cwd "/home/me"
+}
+"#;
+        let ws = parse_clean(src);
+        assert_eq!(ws.cwd, Some(PathBuf::from("/home/me")));
+        assert_eq!(ws.tabs[0].cwd, Some(PathBuf::from("/home/me/projects")));
+        let cwds: Vec<_> = ws.tabs[0].panes().iter().map(|p| p.cwd.clone()).collect();
+        assert_eq!(
+            cwds,
+            [
+                Some(PathBuf::from("/home/me/projects/kraal/src")),
+                Some(PathBuf::from("/tmp")),
+                Some(PathBuf::from("/home/me/projects/kraal")),
+            ]
+        );
+        assert_eq!(ws.tabs[1].cwd, Some(PathBuf::from("/opt")));
+        assert_eq!(leaf(&ws.tabs[1].root).cwd, Some(PathBuf::from("/opt")));
+        assert_eq!(ws.tabs[2].cwd, Some(PathBuf::from("/home/me")));
+        assert_eq!(leaf(&ws.tabs[2].root).cwd, Some(PathBuf::from("/home/me/notes")));
+    }
+
+    #[test]
+    fn expands_home() {
+        let ws = parse_clean(
+            "layout {\n    tab cwd=\"/elsewhere\" {\n        pane cwd=\"~/code\"\n        pane cwd=\"~\"\n        pane cwd=\"~other/x\"\n    }\n}\n",
+        );
+        let cwds: Vec<_> = ws.panes().iter().map(|p| p.cwd.clone().unwrap()).collect();
+        match env::var_os("HOME").filter(|h| !h.is_empty()) {
+            Some(home) => {
+                let home = PathBuf::from(home);
+                assert_eq!(cwds[0], home.join("code"));
+                assert_eq!(cwds[1], home);
+            }
+            None => assert_eq!(cwds[0], PathBuf::from("/elsewhere/~/code")),
+        }
+        // Only the current user's home is expanded.
+        assert_eq!(cwds[2], PathBuf::from("/elsewhere/~other/x"));
+    }
+
+    #[test]
+    fn accepts_kdl_v2() {
+        let src = r##"
+layout {
+    tab name=main focus=#true split_direction=vertical {
+        pane command=htop size="30%" close_on_exit=#true
+        pane focus=#true command=ls {
+            args -la "/tmp"
+        }
+    }
+    tab name=#"raw "quoted""#
+}
+"##;
+        let ws = parse_clean(src);
+        assert!(ws.tabs[0].focus);
+        let (axis, children) = split(&ws.tabs[0].root);
+        assert_eq!(axis, Axis::Row);
+        assert_eq!(children[0].1, Some(SizeSpec::Percent(30)));
+        assert!(leaf(&children[0].0).close_on_exit);
+        let ls = leaf(&children[1].0);
+        assert!(ls.focus);
+        assert_eq!(ls.args, ["-la", "/tmp"]);
+        assert_eq!(ws.tabs[1].name.as_deref(), Some("raw \"quoted\""));
+    }
+
+    #[test]
+    fn warns_on_unknown_constructs() {
+        let src = r#"layout {
+    mystery 1
+    pane_template name="ssh" {
+        pane command="ssh"
+    }
+    tab name="t" color="red" {
+        pane command="ls" stacked=true {
+            args "-l"
+            bogus
+        }
+        pane "positional"
+        pane focus="maybe"
+        pane split_direction="diagonal"
+        pane { args "orphan"; }
+        what
+    }
+}
+keybinds {
+}
+"#;
+        let ws = parse(src);
+        let expected = [
+            "line 2: unsupported node `mystery` in `layout` ignored",
+            "line 3: `pane_template` is not supported; ignored",
+            "line 6: unsupported property `color` on `tab` ignored",
+            "line 7: unsupported property `stacked` on `pane` ignored",
+            "line 9: unsupported node `bogus` in `pane` ignored",
+            "line 11: unexpected argument \"positional\" on `pane` ignored",
+            "line 12: `focus` must be true or false, found \"maybe\"; ignored",
+            "line 13: `split_direction` must be \"vertical\" or \"horizontal\", found \"diagonal\"; ignored",
+            "line 14: `args` without `command` ignored",
+            "line 15: unsupported node `what` in `tab` ignored",
+            "line 18: unknown top-level node `keybinds` ignored",
+        ];
+        assert_eq!(ws.warnings, expected);
+        // Everything that could be understood is still there.
+        assert_eq!(ws.panes().len(), 5);
+        assert_eq!(ws.panes()[0].args, ["-l"]);
+    }
+
+    #[test]
+    fn warns_on_panes_outside_tabs() {
+        let src = "layout {\n    pane command=\"stray\"\n    tab name=\"a\"\n}\n";
+        let ws = parse(src);
+        assert_eq!(ws.tabs.len(), 1);
+        assert_eq!(ws.panes()[0].command, None);
+        assert_eq!(ws.warnings, ["line 2: panes outside `tab` nodes are ignored when tabs exist"]);
+    }
+
+    #[test]
+    fn rejects_invalid_files() {
+        let err = parse_workspace("x", "layout {\n    pane name=\"a\n}\n").unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.starts_with("invalid KDL: line "), "{msg}");
+
+        let err = parse_workspace("x", "layout {\n    tab {\n        pane focus=true\n    \n").unwrap_err();
+        assert!(format!("{err:#}").contains("invalid KDL"));
+
+        let err = parse_workspace("x", "tab name=\"a\"\n").unwrap_err();
+        assert_eq!(err.to_string(), "no `layout` node");
+    }
+
+    #[test]
+    fn round_trips_zellij_layout() {
+        let ws = parse_clean(&zellij_fleet());
+        assert_round_trip(&ws);
+        let text = to_kdl(&ws);
+        // Plain Zellij input must produce plain Zellij output.
+        assert!(!text.contains("preview=") && !text.contains("agent="));
+        assert!(text.contains("args \"-p\" \"2222\" \"root@pve-main.example.net\""));
+        assert!(text.contains("default_tab_template"));
+    }
+
+    #[test]
+    fn round_trips_every_feature() {
+        let src = r#"
+layout {
+    cwd "/home/me"
+    tab name="agents" cwd="work" focus=true {
+        pane split_direction="vertical" {
+            pane name="claude" command="claude" agent="claude" focus=true size="60%"
+            pane split_direction="horizontal" size=40 cwd="docs" {
+                pane preview="PLAN.md" size=10
+                pane preview="/etc/motd"
+                pane command="cargo" start_suspended=true close_on_exit=true cwd="/tmp" {
+                    args "watch" "-x" "test"
+                }
+            }
+        }
+        floating_panes {
+            pane command="lazygit" cwd="sub" focus=true
+        }
+    }
+    tab name="fleet" {
+        pane command="ssh" name="web" {
+            args "-p" "44022" "root@web"
+        }
+    }
+}
+"#;
+        let ws = parse_clean(src);
+        assert_round_trip(&ws);
+    }
+
+    #[test]
+    fn round_trips_relative_cwds_and_odd_strings() {
+        let ws = WorkspaceDef {
+            name: "odd".to_owned(),
+            cwd: Some(PathBuf::from("projects")),
+            tabs: vec![
+                TabDef {
+                    name: Some("quote \" back \\ nl \n tab \t bell \u{7} rtl \u{202e} é 🦀".to_owned()),
+                    focus: false,
+                    cwd: Some(PathBuf::from("projects/kraal")),
+                    root: LayoutNode::Split {
+                        axis: Axis::Row,
+                        children: vec![
+                            (
+                                LayoutNode::Pane(PaneDef {
+                                    command: Some("sh".to_owned()),
+                                    args: vec!["-c".to_owned(), "echo \"$HOME\" && true".to_owned(), String::new()],
+                                    cwd: Some(PathBuf::from("projects/kraal/src")),
+                                    kind: PaneKind::Terminal,
+                                    ..PaneDef::default()
+                                }),
+                                Some(SizeSpec::Fixed(80)),
+                            ),
+                            (
+                                LayoutNode::Pane(PaneDef {
+                                    cwd: Some(PathBuf::from("projects/kraal")),
+                                    kind: PaneKind::Preview(PathBuf::from("projects/kraal")),
+                                    ..PaneDef::default()
+                                }),
+                                None,
+                            ),
+                        ],
+                    },
+                    floating: vec![],
+                },
+                TabDef {
+                    name: None,
+                    focus: true,
+                    cwd: Some(PathBuf::from("projects")),
+                    root: LayoutNode::Pane(PaneDef { cwd: Some(PathBuf::from("projects")), ..PaneDef::default() }),
+                    floating: vec![],
+                },
+            ],
+            warnings: vec![],
+        };
+        assert_round_trip(&ws);
+    }
+
+    #[test]
+    fn serde_round_trip() {
+        let ws = parse_clean(&zellij_fleet());
+        let json = serde_json::to_string(&ws).unwrap();
+        let back: WorkspaceDef = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, ws);
+    }
+
+    #[test]
+    fn load_dir_sorts_and_reports_errors() {
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos());
+        let dir = env::temp_dir().join(format!("kraal-ws-test-{}-{nanos}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("zeta.kdl"), "layout {\n    pane\n}\n").unwrap();
+        fs::write(dir.join("alpha.kdl"), zellij_fleet()).unwrap();
+        fs::write(dir.join("broken.kdl"), "layout {\n").unwrap();
+        fs::write(dir.join("notes.txt"), "not a layout").unwrap();
+
+        let loaded = load_dir(&dir);
+        let names: Vec<_> =
+            loaded.iter().map(|(path, _)| path.file_name().unwrap().to_string_lossy().into_owned()).collect();
+        assert_eq!(names, ["alpha.kdl", "broken.kdl", "zeta.kdl"]);
+        assert_eq!(loaded[0].1.as_ref().unwrap().name, "alpha");
+        let err = loaded[1].1.as_ref().unwrap_err();
+        assert!(format!("{err:#}").contains("broken.kdl"), "{err:#}");
+        assert_eq!(loaded[2].1.as_ref().unwrap().tabs.len(), 1);
+
+        fs::remove_dir_all(&dir).unwrap();
+        assert!(load_dir(&dir).is_empty());
+    }
+
+    /// Parses the real layouts in `~/.config/zellij/layouts` (run with `--ignored`).
+    #[test]
+    #[ignore = "depends on the local Zellij configuration"]
+    fn parses_local_zellij_layouts() {
+        let home = env::var_os("HOME").expect("HOME is set");
+        let dir = PathBuf::from(home).join(".config/zellij/layouts");
+        let loaded = load_dir(&dir);
+        assert!(!loaded.is_empty(), "no layouts in {}", dir.display());
+        for (path, ws) in loaded {
+            let ws = ws.unwrap_or_else(|e| panic!("{}: {e:#}", path.display()));
+            assert!(ws.warnings.is_empty(), "{}: {:?}", path.display(), ws.warnings);
+            assert_round_trip(&ws);
+            println!("{}: {} tabs, {} panes", ws.name, ws.tabs.len(), ws.panes().len());
+        }
+    }
+}

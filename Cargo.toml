@@ -1,0 +1,35 @@
+[package]
+name = "kraal"
+version = "0.1.0"
+edition = "2024"
+description = "A terminal workspace manager for SSH fleets and coding agents"
+license = "Apache-2.0"
+readme = "README.md"
+keywords = ["terminal", "multiplexer", "tmux", "ssh", "agents"]
+categories = ["command-line-utilities"]
+rust-version = "1.88"
+
+[dependencies]
+alacritty_terminal = "0.26"
+anyhow = "1"
+base64 = "0.22"
+clap = { version = "4", features = ["derive", "env"] }
+crossbeam-channel = "0.5"
+crossterm = "0.29"
+dirs = "6"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp"] }
+kdl = { version = "6", features = ["v1-fallback"] }
+libc = "0.2"
+signal-hook = "0.3"
+portable-pty = "0.9"
+pulldown-cmark = { version = "0.13", default-features = false }
+ratatui = { version = "0.30", default-features = false, features = ["std", "underline-color", "layout-cache"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+toml = "0.9"
+unicode-width = "0.2"
+
+[profile.release]
+lto = "thin"
+codegen-units = 4
+strip = true

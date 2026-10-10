@@ -1,0 +1,246 @@
+//! Wire protocol between the `kraal` client/CLI and the session server.
+//!
+//! Every message is a frame: `u32` little-endian payload length, one kind byte, then the payload.
+//! Kind [`JSON`] carries a serialized [`ClientMsg`] or [`ServerMsg`]; kind [`BYTES`] carries raw
+//! terminal bytes (keyboard input from the client, screen updates from the server).
+
+use std::io::{self, Read, Write};
+use std::path::PathBuf;
+
+use serde::{Deserialize, Serialize};
+
+use crate::agent::AgentState;
+
+pub const PROTOCOL_VERSION: u32 = 1;
+
+pub const JSON: u8 = 0;
+pub const BYTES: u8 = 1;
+
+const MAX_FRAME: usize = 64 << 20;
+
+pub fn write_frame(w: &mut impl Write, kind: u8, payload: &[u8]) -> io::Result<()> {
+    let mut header = [0u8; 5];
+    header[..4].copy_from_slice(&(payload.len() as u32).to_le_bytes());
+    header[4] = kind;
+    w.write_all(&header)?;
+    w.write_all(payload)?;
+    w.flush()
+}
+
+pub fn write_json<T: Serialize>(w: &mut impl Write, msg: &T) -> io::Result<()> {
+    let payload = serde_json::to_vec(msg).map_err(io::Error::other)?;
+    write_frame(w, JSON, &payload)
+}
+
+/// Read one frame. `Ok(None)` on a clean EOF between frames.
+pub fn read_frame(r: &mut impl Read) -> io::Result<Option<(u8, Vec<u8>)>> {
+    let mut header = [0u8; 5];
+    match r.read_exact(&mut header) {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
+        Err(e) => return Err(e),
+    }
+    let len = u32::from_le_bytes(header[..4].try_into().unwrap()) as usize;
+    if len > MAX_FRAME {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "frame too large"));
+    }
+    let mut payload = vec![0u8; len];
+    r.read_exact(&mut payload)?;
+    Ok(Some((header[4], payload)))
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ClientMsg {
+    /// Start an interactive session; raw input frames follow.
+    Attach {
+        version: u32,
+        cols: u16,
+        rows: u16,
+        /// Workspace to show first (opened from its definition if needed).
+        workspace: Option<String>,
+    },
+    Resize {
+        cols: u16,
+        rows: u16,
+    },
+    Detach,
+    /// One control request; the server answers with [`ServerMsg::Response`] and closes.
+    Request {
+        version: u32,
+        request: Request,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ServerMsg {
+    /// The interactive session ended (detach, server shutdown, …).
+    Exit {
+        reason: String,
+    },
+    Response {
+        result: Result<Response, String>,
+    },
+    /// Open a URL on the client's machine (Ctrl+click on a link).
+    Open {
+        url: String,
+    },
+}
+
+/// Where a new pane goes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Placement {
+    /// Split the target pane along its longer side.
+    #[default]
+    Auto,
+    Right,
+    Down,
+    Floating,
+    /// A new tab in the target workspace.
+    Tab,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "cmd", rename_all = "snake_case")]
+pub enum Request {
+    Ping,
+    ListPanes,
+    ListWorkspaces,
+    OpenWorkspace {
+        name: String,
+    },
+    /// `pane` refs are an id (`"12"`), a pane name, or `"current"` (the caller's `$KRAAL_PANE`).
+    NewPane {
+        target: Option<String>,
+        command: Vec<String>,
+        cwd: Option<PathBuf>,
+        name: Option<String>,
+        placement: Placement,
+        preview: Option<PathBuf>,
+        focus: bool,
+        /// Close the pane when its program exits (default: keep it, showing the exit code).
+        #[serde(default)]
+        close_on_exit: bool,
+    },
+    ClosePane {
+        pane: String,
+    },
+    FocusPane {
+        pane: String,
+    },
+    RenamePane {
+        pane: String,
+        name: String,
+    },
+    SendText {
+        pane: String,
+        text: String,
+    },
+    SendKeys {
+        pane: String,
+        keys: Vec<String>,
+    },
+    ReadPane {
+        pane: String,
+        /// Number of trailing lines, scrollback included; `None` = visible screen.
+        lines: Option<usize>,
+    },
+    /// Block until the pane matches one of `until` (`working`, `blocked`, `done`, `idle`,
+    /// `exit`, `quiet`) or the timeout expires.
+    Wait {
+        pane: String,
+        until: Vec<String>,
+        timeout_ms: Option<u64>,
+    },
+    /// Sent by agent hooks running inside a pane.
+    AgentReport {
+        pane: String,
+        agent: String,
+        state: Option<AgentState>,
+        session_id: Option<String>,
+        message: Option<String>,
+    },
+    Notify {
+        title: String,
+        body: String,
+    },
+    /// Open an SSH pane to a server (name or `user@host[:port]`), or a whole group in a grid.
+    OpenSsh {
+        target: String,
+        group: bool,
+        placement: Placement,
+        /// Pane to split (its workspace receives the new pane).
+        near: Option<String>,
+    },
+    /// Start an agent (claude, codex…) in a new pane, on `account` or the one the rules pick.
+    OpenAgent {
+        agent: String,
+        account: Option<String>,
+        placement: Placement,
+        near: Option<String>,
+        cwd: Option<PathBuf>,
+    },
+    /// Open a two-panel file manager on two locations (`/path` or `server:path`).
+    OpenFiles {
+        left: String,
+        right: String,
+        near: Option<String>,
+    },
+    /// Write the current layout of a workspace as a KDL definition file.
+    SaveWorkspace {
+        workspace: Option<String>,
+        name: Option<String>,
+    },
+    KillServer,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "data", rename_all = "snake_case")]
+pub enum Response {
+    Ok,
+    Pong { pid: u32, session: String, version: String },
+    Pane(PaneInfo),
+    Panes(Vec<PaneInfo>),
+    Workspaces(Vec<WorkspaceInfo>),
+    Text(String),
+    Path(PathBuf),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PaneInfo {
+    pub id: u32,
+    pub name: Option<String>,
+    pub title: String,
+    pub workspace: String,
+    pub tab: String,
+    pub kind: String,
+    pub command: Vec<String>,
+    pub cwd: Option<PathBuf>,
+    pub agent: Option<String>,
+    pub state: AgentState,
+    pub exit_code: Option<i32>,
+    /// The command waits for Enter (restored session, start_suspended, or it could not start).
+    #[serde(default)]
+    pub suspended: bool,
+    /// Kitty keyboard protocol flags the program enabled (0 = legacy keys).
+    #[serde(default)]
+    pub keyboard: u8,
+    pub focused: bool,
+    pub floating: bool,
+    pub cols: u16,
+    pub rows: u16,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkspaceInfo {
+    pub name: String,
+    pub open: bool,
+    pub definition: Option<PathBuf>,
+    pub tabs: usize,
+    pub panes: usize,
+    pub working: usize,
+    pub blocked: usize,
+    pub done: usize,
+}
