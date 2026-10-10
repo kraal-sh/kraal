@@ -59,6 +59,14 @@ pub enum ConfirmAction {
         agent: String,
         account: String,
     },
+    /// Run a git shell script in a job pane.
+    GitJob {
+        label: String,
+        script: String,
+    },
+    RemoveWorktree {
+        pane: PaneId,
+    },
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -89,6 +97,13 @@ pub enum PickAction {
     },
     AgentAdd {
         agent: String,
+    },
+    AgentWorktree {
+        agent: String,
+    },
+    Worktree {
+        pane: PaneId,
+        op: String,
     },
     /// Point a file manager panel at `~` (local) or `server:~`.
     FilesSet {
@@ -206,6 +221,22 @@ pub enum PromptAction {
     /// The value is the new account's name.
     AddAccount {
         agent: String,
+    },
+    /// The value is the worktree's name.
+    NewWorktree {
+        agent: String,
+    },
+    /// The value is a commit message for the pane's worktree.
+    Commit {
+        pane: PaneId,
+    },
+    /// The value is a command to run on these servers (`kraal exec`).
+    RunOn {
+        targets: Vec<String>,
+    },
+    /// The value is `[host:]port` to forward from this server.
+    Tunnel {
+        server: String,
     },
 }
 

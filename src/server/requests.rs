@@ -188,9 +188,10 @@ impl Server {
                     }
                 }
             }
-            Request::OpenSsh { target, group, placement, near } => {
+            Request::OpenSsh { target, group, placement, near, command } => {
                 if group {
-                    return Some(self.open_group(&target).map(|_| Response::Ok).map_err(|e| format!("{e:#}")));
+                    let group = target.strip_prefix('@').unwrap_or(&target);
+                    return Some(self.open_group(group, &command).map(|_| Response::Ok).map_err(|e| format!("{e:#}")));
                 }
                 let near = match near.as_deref().map(|n| self.resolve(n)).transpose() {
                     Ok(n) => n,
@@ -209,7 +210,7 @@ impl Server {
                         },
                     },
                 };
-                self.open_ssh(ws, near, &server, placement)
+                self.open_ssh_running(ws, near, &server, placement, &command)
                     .map(|p| Response::Pane(self.pane_info(p)))
                     .map_err(|e| format!("{e:#}"))
             }
@@ -251,6 +252,14 @@ impl Server {
                     .map(|p| Response::Pane(self.pane_info(p)))
                     .map_err(|e| format!("{e:#}"))
             }
+            Request::TunnelAdd { server, remote, local } => self
+                .add_tunnel(&server, &remote, local)
+                .map(|t| Response::Tunnels(vec![t]))
+                .map_err(|e| format!("{e:#}")),
+            Request::TunnelRemove { key } => {
+                self.remove_tunnel(&key).map(|_| Response::Ok).map_err(|e| format!("{e:#}"))
+            }
+            Request::TunnelList => Ok(Response::Tunnels(self.tunnel_infos())),
             Request::KillServer => {
                 self.quitting = true;
                 Ok(Response::Ok)

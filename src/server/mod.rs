@@ -6,10 +6,12 @@
 mod agents;
 mod fileman;
 mod input;
+pub mod net;
 mod render;
 mod requests;
 mod ssh;
 mod ui;
+mod worktrees;
 
 use std::collections::HashMap;
 use std::io::Write;
@@ -48,6 +50,8 @@ pub enum Event {
     ClientGone(ClientId),
     /// A background job (file listing) finished; poll and redraw.
     Wake,
+    /// `git status` of a directory, from the git thread.
+    Git(PathBuf, Option<Box<crate::git::GitInfo>>),
     Shutdown,
 }
 
@@ -294,6 +298,15 @@ pub struct Server {
     last_usage_load: Instant,
     last_codex_poll: Instant,
     limit_alerts: HashMap<PaneId, agents::LimitAlert>,
+    /// Branch and changes per directory (None: not a repository).
+    pub git: HashMap<PathBuf, Option<crate::git::GitInfo>>,
+    git_pending: std::collections::HashSet<PathBuf>,
+    git_requests: Sender<PathBuf>,
+    last_git_scan: Instant,
+    pub tunnels: Vec<net::Tunnel>,
+    /// Ports mentioned in pane output, and those of them something listens on.
+    port_candidates: HashMap<u16, PaneId>,
+    pub ports: std::collections::BTreeMap<u16, PaneId>,
     /// Panes with output waiting, in round-robin order.
     ready: std::collections::VecDeque<PaneId>,
     ready_set: std::collections::HashSet<PaneId>,
@@ -355,6 +368,7 @@ pub fn run(session: &str) -> Result<()> {
         })?;
     }
 
+    let git_tx = tx.clone();
     let env = PaneEnv {
         socket: socket.clone(),
         session: session.to_string(),
@@ -393,6 +407,13 @@ pub fn run(session: &str) -> Result<()> {
         limit_alerts: HashMap::new(),
         ready: Default::default(),
         ready_set: Default::default(),
+        tunnels: Vec::new(),
+        port_candidates: HashMap::new(),
+        ports: Default::default(),
+        git: HashMap::new(),
+        git_pending: Default::default(),
+        git_requests: worktrees::spawn_git_worker(git_tx),
+        last_git_scan: Instant::now() - Duration::from_secs(10),
     };
     server.scan_definitions();
     server.restore();
@@ -586,6 +607,11 @@ impl Server {
             self.reload_usage();
             self.check_limits();
         }
+        if self.last_git_scan.elapsed() > Duration::from_secs(3) {
+            self.refresh_git();
+            self.refresh_ports();
+        }
+        self.check_tunnels();
         if self.last_codex_poll.elapsed() > Duration::from_secs(300) {
             self.poll_codex_usage();
         }
@@ -625,6 +651,7 @@ impl Server {
             Event::Connection(stream) => self.new_connection(stream),
             Event::ClientFrame(id, kind, payload) => self.client_frame(id, kind, payload),
             Event::ClientGone(id) => self.drop_client(id),
+            Event::Git(dir, info) => self.git_result(dir, info),
             Event::Wake => {
                 let mut changed = false;
                 for p in self.panes.values_mut() {
@@ -641,6 +668,7 @@ impl Server {
     }
 
     fn pane_output(&mut self, id: PaneId, data: &[u8]) {
+        self.note_ports(id, data);
         let Some(pane) = self.panes.get_mut(&id) else { return };
         let signals = pane.feed(data);
         for s in signals {
@@ -1686,6 +1714,7 @@ impl Server {
         for p in self.panes.values_mut() {
             p.kill();
         }
+        self.stop_tunnels();
         // Give writer threads a moment to deliver the exit messages.
         std::thread::sleep(Duration::from_millis(50));
     }

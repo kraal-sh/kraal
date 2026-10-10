@@ -53,6 +53,8 @@ pub struct PaneSpec {
     pub account: Option<String>,
     /// Conversation id the agent was started with, for resuming it.
     pub session: Option<String>,
+    /// The git worktree kraal created for this pane's agent.
+    pub worktree: Option<crate::git::Worktree>,
 }
 
 #[derive(Clone, Default)]

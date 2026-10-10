@@ -19,6 +19,11 @@ different tools:
   each in its own config directory, logged in with the agent's own login. kraal shows each
   account's usage, picks one per workspace or directory, and when one reaches its threshold it
   alerts you, offers to continue the conversation on another, or switches by itself.
+- **Git and worktrees for agents**: every pane shows its branch and whether it has changes; start
+  an agent on its own branch in a new worktree, then review, commit, open a pull request, merge or
+  remove it from kraal.
+- **Fleet tools**: run a command on a whole group of servers at once, follow logs on every server
+  in a grid, keep SSH tunnels open, and see the dev servers your panes started.
 - **Persistence and a real UI**: sessions keep running when you close the terminal; a restart or
   a reboot brings the layout back, reconnects command panes and resumes agent conversations.
   Mouse support, floating panes, zoom, scrollback search, a fuzzy workspace picker, rich preview
@@ -71,6 +76,7 @@ Inside kraal, `ctrl+b ?` shows every key. The defaults:
 | `ctrl+b c`, `n`, `p`, `1`…`9` | new tab, next, previous, go to tab |
 | `ctrl+b s` | servers: connect to one, or open a whole group in a grid |
 | `ctrl+b f` | file manager: two panels, local and servers |
+| `ctrl+b R` | worktree: review, commit, pull request, merge, remove |
 | `ctrl+b U` / `ctrl+b D` | upload to / download from the focused pane's server |
 | `ctrl+b /` | search the scrollback (`n`/`N` for older/newer matches) |
 | `ctrl+b g` | find any pane across workspaces |
@@ -179,6 +185,40 @@ a shell there, `/` filters. Transfers run in a small window that closes itself w
 Drop a file from your file manager on an SSH pane and kraal offers to upload it to that server
 (Esc pastes the path instead, as usual). `ctrl+b D` downloads a path from the pane's server
 (the selected text is prefilled), into `~/Downloads` by default.
+
+## Git and worktrees
+
+Panes in a git repository show their branch in their frame (`⎇ main* ↑2`: changes, commits ahead).
+
+The agent picker (`alt+g`) offers to start an agent **in a new worktree**: kraal creates a branch
+`kraal/<name>` and a directory next to the repository (`<repo>.worktrees/<name>`), and starts the
+agent there in its own tab. Several agents can work on the same repository without stepping on each
+other. `ctrl+b R` in that tab reviews the changes (your pager, delta included), commits them, opens
+a pull request (`gh`), merges into the base branch or removes the worktree.
+
+```sh
+kraal wt new fix-login --agent claude   # the same from the command line
+kraal wt list
+kraal wt rm fix-login [--force]
+```
+
+## Fleet tools
+
+```sh
+kraal exec @prod -- uptime                       # run on every server of a group, in parallel
+kraal exec web01 db -- 'df -h | grep /dev'       # or on named servers; --json for scripts
+kraal ssh @prod --group -- journalctl -fu nginx  # one pane per server running it, in a grid
+kraal tunnel add db 5432                         # localhost:5432 → db's 5432, kept open
+kraal tunnel add bastion db.internal:5432 --local 15432
+kraal tunnel list
+```
+
+In the server picker (`ctrl+b s`), `ctrl+r` runs a command on the selected server or group and
+`ctrl+o` forwards one of its ports. Tunnels come back after a restart and reconnect when the network
+drops; the sidebar lists them (click copies `localhost:PORT`, ctrl+click opens it in the browser).
+
+Ports that programs in your panes announce (`http://localhost:5173`) and listen on show up in the
+sidebar under PORTS; a click opens them.
 
 ## Remote sessions
 

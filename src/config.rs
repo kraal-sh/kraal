@@ -126,6 +126,7 @@ download = ["D"]
 pane_picker = ["g"]
 agent_picker = ["G"]
 switch_account = ["A"]
+git_actions = ["R"]
 next_attention = ["a"]
 toggle_sidebar = ["b"]
 toggle_sync = ["y"]
@@ -287,6 +288,7 @@ pub enum Action {
     PanePicker,
     AgentPicker,
     SwitchAccount,
+    GitActions,
     NextAttention,
     ToggleSidebar,
     ToggleSync,
@@ -338,6 +340,7 @@ impl Action {
             "pane_picker" => PanePicker,
             "agent_picker" => AgentPicker,
             "switch_account" => SwitchAccount,
+            "git_actions" => GitActions,
             "next_attention" => NextAttention,
             "toggle_sidebar" => ToggleSidebar,
             "toggle_sync" => ToggleSync,
@@ -399,6 +402,7 @@ impl Action {
             PanePicker => "find a pane".into(),
             AgentPicker => "agents: start one on an account".into(),
             SwitchAccount => "continue this agent on another account".into(),
+            GitActions => "worktree: review, commit, pull request, merge, remove".into(),
             NextAttention => "next agent needing you".into(),
             ToggleSidebar => "sidebar".into(),
             ToggleSync => "sync typing: tab → workspace → off".into(),

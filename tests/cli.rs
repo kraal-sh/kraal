@@ -316,3 +316,35 @@ fn new_tab_puts_the_pane_in_a_new_tab() {
     assert_eq!(tabs.len(), 2);
     assert_ne!(tabs[0], tabs[1], "the new pane must be alone in its new tab: {json}");
 }
+
+#[test]
+fn worktrees_for_agents() {
+    let env = Env::new("worktrees");
+    let repo = env.root.join("app");
+    std::fs::create_dir_all(&repo).unwrap();
+    let git = |args: &[&str]| {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false"])
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+    };
+    git(&["init", "-q", "-b", "main"]);
+    std::fs::write(repo.join("README.md"), "hi\n").unwrap();
+    git(&["add", "README.md"]);
+    git(&["commit", "-q", "-m", "init"]);
+    let wt = |args: &[&str]| env.cmd(&[&["wt"], args].concat()).current_dir(&repo).output().unwrap();
+    let out = wt(&["new", "fix-login"]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let path = env.root.join("app.worktrees/fix-login");
+    assert!(path.join("README.md").exists());
+    let list = String::from_utf8(wt(&["list"]).stdout).unwrap();
+    assert!(list.contains("fix-login") && list.contains("kraal/fix-login"), "{list}");
+    std::fs::write(path.join("README.md"), "changed\n").unwrap();
+    assert!(!wt(&["rm", "fix-login"]).status.success(), "uncommitted changes need --force");
+    assert!(wt(&["rm", "fix-login", "--force"]).status.success());
+    assert!(!path.exists());
+}

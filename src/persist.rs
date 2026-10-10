@@ -20,6 +20,8 @@ const VERSION: u32 = 1;
 pub struct SessionSnapshot {
     pub version: u32,
     pub workspaces: Vec<WorkspaceSnap>,
+    #[serde(default)]
+    pub tunnels: Vec<crate::server::net::TunnelSpec>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -117,7 +119,7 @@ pub fn snapshot(server: &Server) -> SessionSnapshot {
                 .collect(),
         })
         .collect();
-    SessionSnapshot { version: VERSION, workspaces }
+    SessionSnapshot { version: VERSION, workspaces, tunnels: server.tunnels.iter().map(|t| t.spec.clone()).collect() }
 }
 
 pub fn save(session: &str, snap: &SessionSnapshot) -> Result<()> {
@@ -159,6 +161,12 @@ pub fn resume_command(agent: &str, session: &str) -> Option<String> {
 }
 
 pub fn apply(server: &mut Server, snap: SessionSnapshot) -> Result<()> {
+    for t in &snap.tunnels {
+        let remote = format!("{}:{}", t.remote_host, t.remote_port);
+        if let Err(e) = server.add_tunnel(&t.server, &remote, Some(t.local)) {
+            server.warnings.push(format!("tunnel {}: {e:#}", t.describe()));
+        }
+    }
     for ws in snap.workspaces {
         let panes_before: std::collections::HashSet<PaneId> = server.panes.keys().copied().collect();
         let workspaces_before: Vec<u32> = server.workspaces.iter().map(|w| w.id).collect();

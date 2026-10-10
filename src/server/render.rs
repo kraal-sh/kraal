@@ -30,6 +30,10 @@ pub enum SideItem {
     Workspace(u32),
     Definition(String),
     Pane(PaneId),
+    /// A tunnel, by local port.
+    Tunnel(u16),
+    /// A local port a pane's program listens on.
+    Port(u16),
 }
 
 impl Server {
@@ -252,6 +256,55 @@ impl Server {
                 ));
             }
         }
+        // Tunnels kraal keeps open, and dev servers seen in panes.
+        if !self.tunnels.is_empty() {
+            rows.push((None, Line::raw("")));
+            rows.push((
+                None,
+                Line::from(Span::styled(" TUNNELS", Style::default().fg(th().dim).add_modifier(Modifier::BOLD))),
+            ));
+            for t in &self.tunnels {
+                let (icon, color) = match t.state {
+                    super::net::TunnelState::Up => (th().icon(AgentState::Working), th().done),
+                    super::net::TunnelState::Connecting => (th().icon(AgentState::Idle), th().blocked),
+                    super::net::TunnelState::Down => (th().icon(AgentState::Blocked), Color::LightRed),
+                };
+                rows.push((
+                    Some(SideItem::Tunnel(t.spec.local)),
+                    Line::from(vec![
+                        Span::styled(format!("   {icon} "), Style::default().fg(color)),
+                        Span::styled(
+                            format!(":{} ", t.spec.local),
+                            Style::default().fg(th().text).add_modifier(Modifier::BOLD),
+                        ),
+                        Span::styled(
+                            format!("{}:{}", t.spec.server, t.spec.remote_port),
+                            Style::default().fg(th().dim),
+                        ),
+                    ]),
+                ));
+            }
+        }
+        if !self.ports.is_empty() {
+            rows.push((None, Line::raw("")));
+            rows.push((
+                None,
+                Line::from(Span::styled(" PORTS", Style::default().fg(th().dim).add_modifier(Modifier::BOLD))),
+            ));
+            for (port, pane) in &self.ports {
+                let name = self.panes.get(pane).map(|p| p.display_name()).unwrap_or_default();
+                rows.push((
+                    Some(SideItem::Port(*port)),
+                    Line::from(vec![
+                        Span::styled(
+                            format!("   :{port} "),
+                            Style::default().fg(th().accent).add_modifier(Modifier::BOLD),
+                        ),
+                        Span::styled(name, Style::default().fg(th().dim)),
+                    ]),
+                ));
+            }
+        }
         // Usage of the agent accounts kraal has heard about.
         let now = crate::accounts::now();
         let accounts: Vec<(String, f64, bool)> = self
@@ -444,6 +497,10 @@ impl Server {
             title.insert(0, Span::styled(" ◆", Style::default().fg(th().sync).add_modifier(Modifier::BOLD)));
         }
         let mut right = Vec::new();
+        if let Some(g) = self.pane_git(pid) {
+            let color = if g.dirty { Color::Yellow } else { th().dim };
+            right.push(Span::styled(format!(" {} ", g.label(th().ascii)), Style::default().fg(color)));
+        }
         if let Some(kind) = &pane.agent.kind {
             let kind = pane.spec.account.as_ref().map(|a| a.replace(':', "·")).unwrap_or_else(|| kind.clone());
             right.push(Span::styled(

@@ -280,6 +280,9 @@ impl Server {
                 });
             }
         }
+        if switch_for.is_none() {
+            items.extend(self.worktree_items(client));
+        }
         let title = if switch_for.is_some() {
             if current.as_ref().is_some_and(|c| conversations_move(&c.agent)) {
                 "Continue this conversation on…"

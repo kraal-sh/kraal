@@ -173,6 +173,9 @@ pub enum Request {
         placement: Placement,
         /// Pane to split (its workspace receives the new pane).
         near: Option<String>,
+        /// A remote command to run instead of a shell (e.g. `journalctl -fu nginx`).
+        #[serde(default)]
+        command: Vec<String>,
     },
     /// Start an agent (claude, codex…) in a new pane, on `account` or the one the rules pick.
     OpenAgent {
@@ -182,6 +185,17 @@ pub enum Request {
         near: Option<String>,
         cwd: Option<PathBuf>,
     },
+    /// Forward `remote` (`[host:]port` as seen from the server) to a local port, and keep it up.
+    TunnelAdd {
+        server: String,
+        remote: String,
+        local: Option<u16>,
+    },
+    /// Close a tunnel by its local port or id.
+    TunnelRemove {
+        key: String,
+    },
+    TunnelList,
     /// Open a two-panel file manager on two locations (`/path` or `server:path`).
     OpenFiles {
         left: String,
@@ -206,6 +220,7 @@ pub enum Response {
     Workspaces(Vec<WorkspaceInfo>),
     Text(String),
     Path(PathBuf),
+    Tunnels(Vec<crate::server::net::TunnelInfo>),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

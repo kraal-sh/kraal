@@ -7,6 +7,8 @@ mod client;
 mod codex_usage;
 mod config;
 mod files;
+mod fleet;
+mod git;
 mod input;
 mod integration;
 mod layout;
@@ -223,6 +225,35 @@ enum Cmd {
         #[arg(last = true)]
         args: Vec<String>,
     },
+    /// Run a command on several servers at once and show each result:
+    /// `kraal exec @prod -- uptime`, `kraal exec web01 db -- 'df -h | grep /dev'`.
+    Exec {
+        /// Server names, user@host, or @group.
+        #[arg(required = true)]
+        targets: Vec<String>,
+        /// The remote command line (as `ssh host command` takes it).
+        #[arg(last = true, required = true)]
+        command: Vec<String>,
+        /// How many servers at a time.
+        #[arg(short, long, default_value_t = 16)]
+        parallel: usize,
+        /// Seconds before giving up on a server.
+        #[arg(long, default_value_t = 60)]
+        timeout: u64,
+        #[arg(long)]
+        json: bool,
+    },
+    /// SSH tunnels kraal keeps open (and reopens after a drop or a restart):
+    /// `kraal tunnel add db 5432`, `kraal tunnel list`, `kraal tunnel rm 5432`.
+    Tunnel {
+        #[command(subcommand)]
+        action: TunnelCmd,
+    },
+    /// Git worktrees for agents: each one gets its own branch (kraal/<name>) and directory.
+    Wt {
+        #[command(subcommand)]
+        action: WtCmd,
+    },
     /// Status line for Claude Code: records the account's usage, then runs your own status line.
     #[command(hide = true)]
     Statusline,
@@ -245,6 +276,46 @@ enum Cmd {
     /// Run a session server in the foreground (normally started automatically).
     #[command(hide = true)]
     Server,
+}
+
+#[derive(Subcommand)]
+enum TunnelCmd {
+    /// Forward `[host:]port` as seen from the server to a local port.
+    Add {
+        server: String,
+        remote: String,
+        /// Local port (default: the same as the remote one when free).
+        #[arg(short, long)]
+        local: Option<u16>,
+    },
+    List,
+    /// Close a tunnel (by local port).
+    Rm {
+        port: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum WtCmd {
+    /// Create a worktree from the current repository; with --agent, start that agent in it
+    /// (in a new tab inside kraal).
+    New {
+        name: String,
+        #[arg(long)]
+        agent: Option<String>,
+        /// Branch to start from (default: the current one).
+        #[arg(long)]
+        base: Option<String>,
+    },
+    /// List this repository's kraal worktrees.
+    List,
+    /// Remove a worktree and delete its branch.
+    Rm {
+        name: String,
+        /// Even with uncommitted changes or an unmerged branch.
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -580,6 +651,7 @@ fn run(cli: Cli) -> Result<()> {
                     group,
                     placement: placement.unwrap_or_default(),
                     near: std::env::var("KRAAL_PANE").ok(),
+                    command: command.clone(),
                 })?;
                 return Ok(());
             }
@@ -610,6 +682,79 @@ fn run(cli: Cli) -> Result<()> {
                 return Ok(());
             }
             exec_agent(&agent, account.as_deref(), &args)
+        }
+        Some(Cmd::Exec { targets, command, parallel, timeout, json }) => {
+            exec_fleet(&targets, &command, parallel, timeout, json)
+        }
+        Some(Cmd::Tunnel { action }) => {
+            if std::env::var_os("KRAAL_SOCKET").is_none() {
+                client::ensure_server(&session)?;
+            }
+            let print = |list: Vec<server::net::TunnelInfo>| {
+                for t in list {
+                    let err = t.error.map(|e| format!("  ({e})")).unwrap_or_default();
+                    println!("{:<12} {}{err}", format!("{:?}", t.state).to_lowercase(), t.spec.describe());
+                }
+            };
+            match action {
+                TunnelCmd::Add { server, remote, local } => {
+                    if let Response::Tunnels(t) = req(Request::TunnelAdd { server, remote, local })? {
+                        print(t);
+                    }
+                }
+                TunnelCmd::List => {
+                    if let Response::Tunnels(t) = req(Request::TunnelList)? {
+                        if t.is_empty() {
+                            println!("no tunnels");
+                        }
+                        print(t);
+                    }
+                }
+                TunnelCmd::Rm { port } => {
+                    req(Request::TunnelRemove { key: port })?;
+                }
+            }
+            Ok(())
+        }
+        Some(Cmd::Wt { action }) => {
+            let cwd = std::env::current_dir()?;
+            match action {
+                WtCmd::New { name, agent, base } => {
+                    let w = git::add_worktree(&cwd, &name, base.as_deref())?;
+                    println!("{} on {} (from {})", w.path.display(), w.branch, w.base);
+                    if let Some(agent) = agent {
+                        if std::env::var_os("KRAAL_SOCKET").is_some() {
+                            req(Request::OpenAgent {
+                                agent,
+                                account: None,
+                                placement: Placement::Tab,
+                                near: std::env::var("KRAAL_PANE").ok(),
+                                cwd: Some(w.path.clone()),
+                            })?;
+                        } else {
+                            std::env::set_current_dir(&w.path)?;
+                            return exec_agent(&agent, None, &[]);
+                        }
+                    }
+                    Ok(())
+                }
+                WtCmd::List => {
+                    for w in git::list_worktrees(&cwd)? {
+                        let state = git::status(&w.path).map(|g| g.label(false)).unwrap_or_default();
+                        println!("{:<24} {:<32} {}", w.name(), state, paths::shorten_home(&w.path));
+                    }
+                    Ok(())
+                }
+                WtCmd::Rm { name, force } => {
+                    let w = git::list_worktrees(&cwd)?
+                        .into_iter()
+                        .find(|w| w.name() == name)
+                        .with_context(|| format!("no kraal worktree named {name:?} here"))?;
+                    git::remove_worktree(&w, force)?;
+                    println!("removed {} and {}", w.path.display(), w.branch);
+                    Ok(())
+                }
+            }
         }
         Some(Cmd::Statusline) => {
             integration::statusline();
@@ -1267,4 +1412,84 @@ fn exec_agent(agent: &str, account: Option<&str>, args: &[String]) -> Result<()>
     };
     let session = accounts::agent_kind(agent).and_then(|k| k.session_flag).map(|_| accounts::new_uuid());
     run_with(&accounts::launch(&a, args, None, session.as_deref())?, true).map(|_| ())
+}
+
+/// Servers named by `targets`: names, user@host, or @group.
+fn resolve_targets(known: &[servers::Known], targets: &[String]) -> Result<Vec<servers::Server>> {
+    let mut out: Vec<servers::Server> = Vec::new();
+    for t in targets {
+        let found: Vec<servers::Server> = match t.strip_prefix('@') {
+            Some(group) => {
+                let members: Vec<servers::Server> = known
+                    .iter()
+                    .filter(|k| k.server.groups.iter().any(|g| g == group))
+                    .map(|k| k.server.clone())
+                    .collect();
+                if members.is_empty() {
+                    bail!("no server in group {group:?} (see `kraal servers`)");
+                }
+                members
+            }
+            None => vec![servers::resolve(known, t).with_context(|| format!("not a server: {t}"))?],
+        };
+        for s in found {
+            if !out.iter().any(|o| o.destination() == s.destination() && o.port == s.port) {
+                out.push(s);
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn exec_fleet(targets: &[String], command: &[String], parallel: usize, timeout: u64, json: bool) -> Result<()> {
+    use std::io::IsTerminal;
+    let cfg = config::Config::load()?;
+    let known = known_servers(&cfg)?;
+    let list = resolve_targets(&known, targets)?;
+    let line = command.join(" ");
+    let control = if cfg.servers.multiplex { paths::ssh_control_path() } else { None };
+    let ssh = |s: &servers::Server| -> Vec<String> {
+        let mut o = Vec::new();
+        if let Some(c) = &control {
+            o.extend([
+                "-o".to_string(),
+                "ControlMaster=auto".into(),
+                "-o".into(),
+                format!("ControlPath={}", c.display()),
+                "-o".into(),
+                "ControlPersist=10m".into(),
+            ]);
+        }
+        o.extend(s.ssh_options(&|j| servers::resolve(&known, j).map(|js| js.address())));
+        o
+    };
+    let color = std::io::stdout().is_terminal();
+    if !json {
+        eprintln!("running `{line}` on {} server{}…", list.len(), if list.len() == 1 { "" } else { "s" });
+    }
+    let print = |o: &fleet::Outcome| {
+        if !json {
+            print!("{}", fleet::format_outcome(o, color));
+        }
+    };
+    let results = fleet::run_all(list, &line, &ssh, parallel, std::time::Duration::from_secs(timeout), &print);
+    let failed = results.iter().filter(|o| !o.ok()).count();
+    if json {
+        let v: Vec<serde_json::Value> = results
+            .iter()
+            .map(|o| {
+                serde_json::json!({
+                    "server": o.server, "code": o.code, "ok": o.ok(), "error": o.error,
+                    "stdout": o.stdout, "stderr": o.stderr, "seconds": o.elapsed.as_secs_f64(),
+                })
+            })
+            .collect();
+        println!("{}", serde_json::to_string_pretty(&v)?);
+    } else {
+        eprintln!("{} ok, {failed} failed", results.len() - failed);
+    }
+    if failed > 0 {
+        std::process::exit(1);
+    }
+    Ok(())
 }

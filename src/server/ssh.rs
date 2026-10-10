@@ -52,9 +52,20 @@ impl Server {
 
     /// Full `ssh …` command line for a pane connected to `s`.
     pub fn ssh_command(&self, s: &servers::Server) -> Vec<String> {
+        self.ssh_command_running(s, &[])
+    }
+
+    /// `ssh … host` running `remote` (with a terminal, for interactive or following commands).
+    pub fn ssh_command_running(&self, s: &servers::Server, remote: &[String]) -> Vec<String> {
         let mut cmd = vec!["ssh".to_string()];
         cmd.extend(self.ssh_options(s));
+        if !remote.is_empty() {
+            cmd.push("-t".into());
+        }
         cmd.push(s.destination());
+        if !remote.is_empty() {
+            cmd.push(remote.join(" "));
+        }
         cmd
     }
 
@@ -89,8 +100,20 @@ impl Server {
         s: &servers::Server,
         placement: Placement,
     ) -> Result<PaneId> {
+        self.open_ssh_running(ws, target, s, placement, &[])
+    }
+
+    /// Open an SSH pane to `s` running `remote` (a shell when empty).
+    pub fn open_ssh_running(
+        &mut self,
+        ws: u32,
+        target: Option<PaneId>,
+        s: &servers::Server,
+        placement: Placement,
+        remote: &[String],
+    ) -> Result<PaneId> {
         let spec = PaneSpec {
-            command: self.ssh_command(s),
+            command: self.ssh_command_running(s, remote),
             server: (!s.name.is_empty()).then(|| s.name.clone()),
             ..Default::default()
         };
@@ -100,8 +123,15 @@ impl Server {
 
     /// Open every server of a group in a grid, `max_panes_per_tab` per tab, in a workspace named
     /// after the group (switching to it if it is already open).
-    pub fn open_group(&mut self, group: &str) -> Result<u32> {
-        if let Some(ws) = self.workspaces.iter().find(|w| w.name == group) {
+    pub fn open_group(&mut self, group: &str, remote: &[String]) -> Result<u32> {
+        // `journalctl -fu nginx` on @prod gets its own workspace, next to the plain shells.
+        let ws_name = if remote.is_empty() {
+            group.to_string()
+        } else {
+            let short: String = remote.join(" ").chars().take(24).collect();
+            format!("{group}: {short}")
+        };
+        if let Some(ws) = self.workspaces.iter().find(|w| w.name == ws_name) {
             return Ok(ws.id);
         }
         let members: Vec<servers::Server> = self
@@ -112,14 +142,17 @@ impl Server {
             .collect();
         anyhow::ensure!(!members.is_empty(), "no server in group {group:?}");
         let per_tab = self.config.servers.max_panes_per_tab.max(1);
-        let ws = self.new_workspace(group.to_string(), None);
+        let ws = self.new_workspace(ws_name, None);
         let chunks: Vec<&[servers::Server]> = members.chunks(per_tab).collect();
         let many = chunks.len() > 1;
         for (i, chunk) in chunks.into_iter().enumerate() {
             let mut ids = Vec::new();
             for s in chunk {
-                let spec =
-                    PaneSpec { command: self.ssh_command(s), server: Some(s.name.clone()), ..Default::default() };
+                let spec = PaneSpec {
+                    command: self.ssh_command_running(s, remote),
+                    server: Some(s.name.clone()),
+                    ..Default::default()
+                };
                 ids.push(self.spawn_pane(Some(s.name.clone()), spec)?);
             }
             let tab_id = self.alloc_id();
@@ -208,7 +241,7 @@ impl Server {
         }
         Picker::new(
             PickerKind::Ssh,
-            "Servers  (enter connect · ctrl+t new tab · ctrl+f files · ctrl+e edit list · ctrl+x forget · type user@host)",
+            "Servers  (enter connect · ctrl+r run · ctrl+o forward a port · ctrl+f files · ctrl+t tab · ctrl+e edit · ctrl+x forget)",
             items,
         )
     }

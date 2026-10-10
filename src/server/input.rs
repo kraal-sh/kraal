@@ -381,6 +381,27 @@ impl Server {
                         }
                     }
                 }
+                (KeyCode::Char('r'), true) if p.kind == PickerKind::Ssh => {
+                    let target = match p.current().map(|i| i.action.clone()) {
+                        Some(PickAction::SshGroup(g)) => format!("@{g}"),
+                        Some(PickAction::Ssh(name)) => name,
+                        _ => return Mode::Picker(p),
+                    };
+                    return Mode::Prompt(Prompt::new(
+                        &format!("Run on {target} (results in a window)"),
+                        "",
+                        PromptAction::RunOn { targets: vec![target] },
+                    ));
+                }
+                (KeyCode::Char('o'), true) if p.kind == PickerKind::Ssh => {
+                    if let Some(PickAction::Ssh(name)) = p.current().map(|i| i.action.clone()) {
+                        return Mode::Prompt(Prompt::new(
+                            &format!("Forward from {name}: [host:]port (e.g. 5432, or db.internal:5432)"),
+                            "",
+                            PromptAction::Tunnel { server: name },
+                        ));
+                    }
+                }
                 (KeyCode::Char('e'), true) if p.kind == PickerKind::Ssh => {
                     self.edit_servers(id);
                     return Mode::Normal;
@@ -443,7 +464,7 @@ impl Server {
                 self.show_workspace(id, ws);
             }
             PickAction::Ssh(spec) => self.connect(id, &spec, Placement::Auto),
-            PickAction::SshGroup(group) => match self.open_group(&group) {
+            PickAction::SshGroup(group) => match self.open_group(&group, &[]) {
                 Ok(ws) => self.show_workspace(id, ws),
                 Err(e) => self.toast(id, format!("{e:#}")),
             },
@@ -466,6 +487,14 @@ impl Server {
                     self.toast(id, format!("{e:#}"));
                 }
             }
+            PickAction::AgentWorktree { agent } => {
+                return Mode::Prompt(Prompt::new(
+                    &format!("Name of the worktree for {agent} (branch kraal/<name>)"),
+                    "",
+                    PromptAction::NewWorktree { agent },
+                ));
+            }
+            PickAction::Worktree { pane, op } => return self.worktree_op(id, pane, &op),
             PickAction::AgentAdd { agent } => {
                 return Mode::Prompt(Prompt::new(
                     &format!("Name of the new {agent} account (e.g. pro, perso2)"),
@@ -600,6 +629,32 @@ impl Server {
                 }
                 self.start_job(id, "download", vec!["cp".into(), "--".into(), value, format!("{}/", dir.display())]);
             }
+            PromptAction::NewWorktree { agent } => {
+                if let Err(e) = self.agent_in_worktree(id, &agent, &value) {
+                    self.toast(id, format!("{e:#}"));
+                }
+            }
+            PromptAction::Commit { pane } => self.commit_worktree(id, pane, &value),
+            PromptAction::Tunnel { server } => match self.add_tunnel(&server, &value, None) {
+                Ok(t) => self.toast(id, format!("tunnel {}", t.spec.describe())),
+                Err(e) => self.toast(id, format!("{e:#}")),
+            },
+            PromptAction::RunOn { targets } => {
+                if value.is_empty() {
+                    return;
+                }
+                let Some(ws) = self.clients.get(&id).map(|c| c.workspace) else { return };
+                let exe = std::env::current_exe().map(|p| p.display().to_string()).unwrap_or_else(|_| "kraal".into());
+                let mut command = vec![exe, "exec".to_string()];
+                command.extend(targets.iter().cloned());
+                command.push("--".into());
+                command.push(value.clone());
+                let spec = PaneSpec { command, ..Default::default() };
+                let label = format!("» {} on {}", value.chars().take(30).collect::<String>(), targets.join(" "));
+                if let Err(e) = self.spawn_pane_in(ws, None, spec, Placement::Floating, Some(label)) {
+                    self.toast(id, format!("{e:#}"));
+                }
+            }
             PromptAction::AddAccount { agent } => {
                 if let Err(e) = self.add_account(id, &agent, &value) {
                     self.toast(id, format!("{e:#}"));
@@ -670,6 +725,10 @@ impl Server {
                     }
                     ConfirmAction::CloseWorkspace(ws) => self.close_workspace(ws),
                     ConfirmAction::Job { label, args } => self.start_job(id, &label, args),
+                    ConfirmAction::GitJob { label, script } => {
+                        self.git_job(id, &label, script, super::worktrees::JobEnd::CloseOnSuccess)
+                    }
+                    ConfirmAction::RemoveWorktree { pane } => self.remove_worktree(id, pane),
                     ConfirmAction::SwitchAccount { pane, agent, account } => {
                         let result = self
                             .accounts
@@ -1012,6 +1071,10 @@ impl Server {
             Action::SshPicker => return Mode::Picker(self.ssh_picker()),
             Action::PanePicker => return Mode::Picker(self.pane_picker()),
             Action::AgentPicker => return Mode::Picker(self.agent_picker(id, None)),
+            Action::GitActions => match focus.and_then(|f| self.worktree_picker(f)) {
+                Some(p) => return Mode::Picker(p),
+                None => self.toast(id, "this pane is not in a kraal worktree (alt+g: start an agent in one)"),
+            },
             Action::SwitchAccount => match focus.filter(|f| self.pane_account(*f).is_some()) {
                 Some(f) => return Mode::Picker(self.agent_picker(id, Some(f))),
                 None => self.toast(id, "this agent was not started from the agent manager (alt+g)"),
@@ -1360,6 +1423,16 @@ impl Server {
                         Ok(ws) => self.show_workspace(id, ws),
                         Err(e) => self.toast(id, format!("{e:#}")),
                     },
+                    // A dev server or a tunnel: open it in the browser with ctrl, else copy its address.
+                    Some(SideItem::Port(port)) | Some(SideItem::Tunnel(port)) => {
+                        let addr = format!("localhost:{port}");
+                        if m.mods.ctrl || matches!(self.sidebar_hit(id, m.row), Some(SideItem::Port(_))) {
+                            self.send_msg(id, &crate::protocol::ServerMsg::Open { url: format!("http://{addr}") });
+                            self.toast(id, format!("opening http://{addr}"));
+                        } else {
+                            self.copy_to_client(id, &addr);
+                        }
+                    }
                     None => {}
                 }
             }
