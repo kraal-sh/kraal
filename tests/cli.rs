@@ -2523,3 +2523,101 @@ fn images_reach_a_terminal_that_shows_them() {
     assert!(seen.contains("shown"), "the other client draws the pane");
     assert!(!seen.contains("\x1b_Ga=t") && !seen.contains('\u{10EEEE}'), "no image for a terminal that cannot show it");
 }
+
+/// A release as GitHub serves it, made from this build: `kraal-<target>.tar.gz` and its
+/// checksum, in `dir`.
+fn fake_release(dir: &Path) -> String {
+    let os = match std::env::consts::OS {
+        "macos" => "apple-darwin",
+        _ => "unknown-linux-musl",
+    };
+    let target = format!("{}-{os}", std::env::consts::ARCH);
+    let inner = dir.join(format!("kraal-{target}"));
+    std::fs::create_dir_all(&inner).unwrap();
+    std::fs::copy(env!("CARGO_BIN_EXE_kraal"), inner.join("kraal")).unwrap();
+    let asset = format!("kraal-{target}.tar.gz");
+    let tar = Command::new("tar")
+        .arg("-czf")
+        .arg(dir.join(&asset))
+        .arg("-C")
+        .arg(dir)
+        .arg(format!("kraal-{target}"))
+        .status()
+        .unwrap();
+    assert!(tar.success());
+    let sum = Command::new("sh")
+        .arg("-c")
+        .arg(format!(
+            "cd '{}' && (sha256sum {asset} 2>/dev/null || shasum -a 256 {asset}) > {asset}.sha256",
+            dir.display()
+        ))
+        .status()
+        .unwrap();
+    assert!(sum.success());
+    asset
+}
+
+/// `kraal update` puts a release that matches its checksum in place of itself, and leaves
+/// itself alone when the checksum is wrong.
+#[test]
+fn update_installs_a_checked_release_in_place() {
+    let env = Env::new("update");
+    let release = env.root.join("release");
+    let asset = fake_release(&release);
+    let bin = env.root.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let kraal = bin.join("kraal");
+    std::fs::copy(env!("CARGO_BIN_EXE_kraal"), &kraal).unwrap();
+    let url = format!("file://{}", release.display());
+    let update =
+        |args: &[&str]| Command::new(&kraal).arg("update").args(args).env("KRAAL_DOWNLOAD_URL", &url).output().unwrap();
+
+    let same = update(&[]);
+    assert!(same.status.success(), "{}", String::from_utf8_lossy(&same.stderr));
+    assert!(String::from_utf8_lossy(&same.stdout).contains("already installed"));
+
+    let before = std::fs::metadata(&kraal).unwrap().modified().unwrap();
+    std::thread::sleep(Duration::from_millis(20));
+    let forced = update(&["--force"]);
+    assert!(forced.status.success(), "{}", String::from_utf8_lossy(&forced.stderr));
+    assert_ne!(std::fs::metadata(&kraal).unwrap().modified().unwrap(), before, "replaced");
+    assert!(Command::new(&kraal).arg("--version").status().unwrap().success());
+    let left: Vec<_> = std::fs::read_dir(&bin).unwrap().map(|e| e.unwrap().file_name()).collect();
+    assert_eq!(left, ["kraal"], "nothing left beside it");
+
+    std::fs::write(release.join(format!("{asset}.sha256")), format!("{}  {asset}\n", "0".repeat(64))).unwrap();
+    let before = std::fs::metadata(&kraal).unwrap().modified().unwrap();
+    let wrong = update(&["--force"]);
+    assert!(!wrong.status.success());
+    assert!(String::from_utf8_lossy(&wrong.stderr).contains("does not match its checksum"));
+    assert_eq!(std::fs::metadata(&kraal).unwrap().modified().unwrap(), before, "left alone");
+}
+
+/// install.sh installs a release that matches its checksum, and nothing when it does not.
+#[test]
+fn install_script_installs_a_checked_release() {
+    let env = Env::new("installsh");
+    let release = env.root.join("release");
+    let asset = fake_release(&release);
+    let script = concat!(env!("CARGO_MANIFEST_DIR"), "/install.sh");
+    let dir = env.root.join("bin");
+    let install = || {
+        Command::new("sh")
+            .arg(script)
+            .env("KRAAL_DOWNLOAD_URL", format!("file://{}", release.display()))
+            .env("KRAAL_INSTALL_DIR", &dir)
+            .output()
+            .unwrap()
+    };
+    let done = install();
+    assert!(done.status.success(), "{}", String::from_utf8_lossy(&done.stderr));
+    assert!(String::from_utf8_lossy(&done.stderr).contains("Installed kraal"));
+    assert!(Command::new(dir.join("kraal")).arg("--version").status().unwrap().success());
+
+    std::fs::remove_file(dir.join("kraal")).unwrap();
+    std::fs::write(release.join(format!("{asset}.sha256")), format!("{}  {asset}\n", "0".repeat(64))).unwrap();
+    let wrong = install();
+    assert!(!wrong.status.success());
+    assert!(String::from_utf8_lossy(&wrong.stderr).contains("does not match its checksum"));
+    assert!(!dir.join("kraal").exists(), "nothing installed");
+}

@@ -6,6 +6,7 @@ mod panes;
 mod remote;
 mod runbooks;
 mod session;
+mod update;
 
 use std::path::PathBuf;
 
@@ -88,6 +89,7 @@ fn run(cli: Cli) -> Result<()> {
         Some(Cmd::Attach { workspace, host: None }) => session::attach(&s.name, workspace),
         Some(Cmd::Attach { workspace, host: Some(host) }) => remote::attach(&s.name, &host, workspace),
         Some(Cmd::RemoteInstall { server }) => remote::install(&server),
+        Some(Cmd::Update { check, to, force }) => update::update(check, to, force),
         Some(Cmd::Proxy) => client::proxy(&s.name),
         Some(Cmd::Server) => server::run(&s.name),
         Some(Cmd::Ls) => session::list_sessions(),

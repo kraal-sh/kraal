@@ -37,6 +37,18 @@ pub enum Cmd {
     },
     /// Install this kraal binary on a server (same OS and architecture), for `attach --host`.
     RemoteInstall { server: String },
+    /// Replace this kraal with the latest release from GitHub, after checking its checksum.
+    Update {
+        /// Only say whether a newer release exists.
+        #[arg(long)]
+        check: bool,
+        /// A release tag to install instead of the latest, e.g. v0.2.0.
+        #[arg(long, value_name = "TAG")]
+        to: Option<String>,
+        /// Install even when it is the version already here.
+        #[arg(long)]
+        force: bool,
+    },
     /// Relay a client to the local session (what `attach --host` runs on the server).
     #[command(hide = true)]
     Proxy,
