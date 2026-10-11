@@ -1,20 +1,46 @@
 //! Control requests from the CLI and from agents (`kraal run`, `kraal read`, hooks, …).
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use super::{ClientId, Server};
+use super::{ClientId, PendingWait, Server};
 use crate::agent::AgentState;
 use crate::input::KeySpec;
 use crate::layout::PaneId;
 use crate::pane::PaneSpec;
-use crate::protocol::{Request, Response, WorkspaceInfo};
+use crate::protocol::{self, Request, Response, ServerMsg, WorkspaceInfo};
 
 type Reply = Option<Result<Response, String>>;
 
 impl Server {
     /// Handle one request. `None` means the answer comes later (waits).
     pub(super) fn request(&mut self, client: ClientId, req: Request) -> Reply {
+        let reply = self.answer(client, req);
+        // A request that created a workspace for a pane that then failed to start leaves it
+        // empty.
+        self.drop_empty_workspaces();
+        reply
+    }
+
+    fn answer(&mut self, client: ClientId, req: Request) -> Reply {
         Some(match req {
+            Request::RunbookPlan { path, target, params, pane } => {
+                let pane = match pane.as_deref().map(|p| self.resolve(p)).transpose() {
+                    Ok(p) => p,
+                    Err(e) => return Some(Err(e)),
+                };
+                self.prepare_runbook(&path, target.as_deref(), params, pane)
+                    .map(|(text, token)| Response::Plan { text, token })
+                    .map_err(|e| format!("{e:#}"))
+            }
+            // Answered once the run is on record and its targets have started.
+            Request::RunbookRun { token } => match self.run_prepared(&token, client) {
+                Ok(()) => return None,
+                Err(e) => Err(format!("{e:#}")),
+            },
+            Request::Subscribe { events, since, boot } => match self.subscribe(client, events, since, boot) {
+                Ok(()) => return None,
+                Err(e) => Err(e),
+            },
             Request::Ping => Ok(Response::Pong {
                 pid: std::process::id(),
                 session: self.session.clone(),
@@ -55,17 +81,33 @@ impl Server {
                         .and_then(|wi| self.workspaces[wi].tabs.get(self.workspaces[wi].active))
                         .and_then(|t| t.focus),
                 };
+                // What is on screen, to put back when the new pane must not take the focus.
+                let shown = self.ws_index(ws).map(|wi| {
+                    let w = &self.workspaces[wi];
+                    (w.active, w.tabs.get(w.active).map(|t| t.show_floating))
+                });
                 let spec = PaneSpec { command, cwd, preview, close_on_exit, ..Default::default() };
                 match self.spawn_pane_in(ws, target, spec, placement, name) {
                     Ok(id) => {
-                        if !focus
-                            && let Some(prev) = previous
-                            && let Some((wi, ti)) = self.workspace_of(prev)
-                        {
-                            self.workspaces[wi].tabs[ti].set_focus(prev);
+                        if !focus {
+                            if let Some(prev) = previous
+                                && let Some((wi, ti)) = self.workspace_of(prev)
+                            {
+                                self.workspaces[wi].tabs[ti].set_focus(prev);
+                            }
+                            if let (Some(wi), Some((active, show_floating))) = (self.ws_index(ws), shown)
+                                && active < self.workspaces[wi].tabs.len()
+                            {
+                                let w = &mut self.workspaces[wi];
+                                w.active = active;
+                                if let Some(show) = show_floating {
+                                    w.tabs[active].show_floating = show && !w.tabs[active].floating.is_empty();
+                                }
+                            }
+                            self.relayout();
                         }
                         self.mark_dirty();
-                        Ok(Response::Pane(self.pane_info(id)))
+                        Ok(Response::Pane(Box::new(self.pane_info(id))))
                     }
                     Err(e) => Err(format!("{e:#}")),
                 }
@@ -81,6 +123,7 @@ impl Server {
                         if let Some((wi, ti)) = self.workspace_of(p) {
                             self.workspaces[wi].active = ti;
                             self.workspaces[wi].tabs[ti].set_focus(p);
+                            self.relayout();
                         }
                     }
                 }
@@ -94,7 +137,8 @@ impl Server {
                 self.mark_dirty();
                 Response::Ok
             }),
-            Request::SendText { pane, text } => self.resolve(&pane).and_then(|p| {
+            Request::SendText { pane, text, production } => self.resolve(&pane).and_then(|p| {
+                self.allow_input(p, production)?;
                 let pn = self.panes.get_mut(&p).ok_or("no such pane")?;
                 if pn.exit_code.is_some() {
                     return Err("the pane's program has exited".into());
@@ -102,7 +146,8 @@ impl Server {
                 pn.write_input(text.into_bytes());
                 Ok(Response::Ok)
             }),
-            Request::SendKeys { pane, keys } => self.resolve(&pane).and_then(|p| {
+            Request::SendKeys { pane, keys, production } => self.resolve(&pane).and_then(|p| {
+                self.allow_input(p, production)?;
                 let mut specs = Vec::new();
                 for k in &keys {
                     specs.push(KeySpec::parse(k).map_err(|e| format!("{k:?}: {e}"))?);
@@ -111,7 +156,9 @@ impl Server {
                 let modes = pn.input_modes();
                 let mut bytes = Vec::new();
                 for s in specs {
-                    bytes.extend(crate::input::encode_key_code(s.code, s.mods, modes));
+                    // As if typed: in the kitty protocol when the program uses it.
+                    let key = crate::input::Key { code: s.code, mods: s.mods, raw: Vec::new() };
+                    bytes.extend(crate::input::encode_key(&key, modes));
                 }
                 pn.write_input(bytes);
                 Ok(Response::Ok)
@@ -183,7 +230,7 @@ impl Server {
                 match wi.filter(|i| *i < self.workspaces.len()) {
                     None => Err("no such workspace".into()),
                     Some(wi) => {
-                        let name = name.unwrap_or_else(|| self.workspaces[wi].name.clone());
+                        let name = name.unwrap_or_else(|| crate::workspace::file_name_from(&self.workspaces[wi].name));
                         self.save_definition(wi, &name).map(Response::Path).map_err(|e| format!("{e:#}"))
                     }
                 }
@@ -211,27 +258,36 @@ impl Server {
                     },
                 };
                 self.open_ssh_running(ws, near, &server, placement, &command)
-                    .map(|p| Response::Pane(self.pane_info(p)))
+                    .map(|p| Response::Pane(Box::new(self.pane_info(p))))
                     .map_err(|e| format!("{e:#}"))
             }
-            Request::OpenAgent { agent, account, placement, near, cwd } => {
+            Request::OpenAgent { agent, account, placement, near, cwd, args } => {
                 let near = match near.as_deref().map(|n| self.resolve(n)).transpose() {
                     Ok(n) => n,
                     Err(e) => return Some(Err(e)),
                 };
-                let ws = match near.and_then(|n| self.workspace_of(n)) {
-                    Some((wi, _)) => self.workspaces[wi].id,
-                    None => match self.primary.and_then(|p| self.clients.get(&p)).map(|c| c.workspace) {
-                        Some(ws) => ws,
-                        None => match self.workspaces.first() {
-                            Some(w) => w.id,
-                            None => self.new_workspace("main".into(), None),
-                        },
-                    },
-                };
-                self.launch_agent(ws, near, &agent, account.as_deref(), placement, cwd)
-                    .map(|p| Response::Pane(self.pane_info(p)))
-                    .map_err(|e| format!("{e:#}"))
+                // The account rules may depend on which repository the directory belongs to (a
+                // worktree anywhere counts as its repository): git is asked first, off the loop,
+                // and the agent starts once it has answered.
+                if account.is_none() {
+                    let ws = self.agent_workspace(near);
+                    let dir = ws.and_then(|ws| self.agent_cwd(ws, near, cwd.clone()));
+                    if let Some(dir) = dir.filter(|d| self.accounts.undecided(&agent, Some(d))) {
+                        self.background(
+                            move || {
+                                crate::git::project_path(&dir);
+                            },
+                            move |server, ()| {
+                                let result = server.open_agent(near, &agent, None, placement, cwd, &args);
+                                server.send_msg(client, &ServerMsg::Response { result });
+                                server.clients.remove(&client);
+                                server.drop_empty_workspaces();
+                            },
+                        );
+                        return None;
+                    }
+                }
+                self.open_agent(near, &agent, account.as_deref(), placement, cwd, &args)
             }
             Request::OpenFiles { left, right, near } => {
                 let near = match near.as_deref().map(|n| self.resolve(n)).transpose() {
@@ -249,7 +305,7 @@ impl Server {
                     },
                 };
                 self.open_files(ws, left, right)
-                    .map(|p| Response::Pane(self.pane_info(p)))
+                    .map(|p| Response::Pane(Box::new(self.pane_info(p))))
                     .map_err(|e| format!("{e:#}"))
             }
             Request::TunnelAdd { server, remote, local } => self
@@ -260,14 +316,54 @@ impl Server {
                 self.remove_tunnel(&key).map(|_| Response::Ok).map_err(|e| format!("{e:#}"))
             }
             Request::TunnelList => Ok(Response::Tunnels(self.tunnel_infos())),
+            // Answered when the server stops, once its last state is written or has failed to
+            // be: `kraal kill` then says whether the layout a restart brings back is saved.
             Request::KillServer => {
                 self.quitting = true;
-                Ok(Response::Ok)
+                self.kill_waiters.push(client);
+                return None;
             }
         })
     }
 
     /// Resolve a pane reference: an id, a pane name, or `workspace:name`.
+    /// The workspace an agent opened from the CLI goes to: that of the pane it starts next to,
+    /// else the one the last active client shows, else the first.
+    fn agent_workspace(&self, near: Option<PaneId>) -> Option<u32> {
+        near.and_then(|n| self.workspace_of(n))
+            .map(|(wi, _)| self.workspaces[wi].id)
+            .or_else(|| self.primary.and_then(|p| self.clients.get(&p)).map(|c| c.workspace))
+            .or_else(|| self.workspaces.first().map(|w| w.id))
+    }
+
+    fn open_agent(
+        &mut self,
+        near: Option<PaneId>,
+        agent: &str,
+        account: Option<&str>,
+        placement: crate::protocol::Placement,
+        cwd: Option<std::path::PathBuf>,
+        args: &[String],
+    ) -> Result<Response, String> {
+        let ws = match self.agent_workspace(near) {
+            Some(ws) => ws,
+            None => self.new_workspace("main".into(), None),
+        };
+        self.launch_agent_with(ws, near, agent, account, placement, cwd, args)
+            .map(|p| Response::Pane(Box::new(self.pane_info(p))))
+            .map_err(|e| format!("{e:#}"))
+    }
+
+    /// Input from the CLI reaches a production pane only when the caller says it means to.
+    fn allow_input(&self, pane: PaneId, production: bool) -> Result<(), String> {
+        match self.pane_production(pane) {
+            Some(why) if !production => {
+                Err(format!("{} is production ({why}); add --production to send to it", self.pane_label(pane)))
+            }
+            _ => Ok(()),
+        }
+    }
+
     fn resolve(&self, r: &str) -> Result<PaneId, String> {
         if let Ok(id) = r.parse::<PaneId>() {
             return if self.panes.contains_key(&id) { Ok(id) } else { Err(format!("no pane with id {id}")) };
@@ -326,5 +422,49 @@ impl Server {
             });
         }
         out
+    }
+}
+
+impl Server {
+    pub(super) fn add_wait(&mut self, client: ClientId, pane: PaneId, until: Vec<String>, timeout: Option<Duration>) {
+        let Some(c) = self.clients.remove(&client) else { return };
+        self.waits.push(PendingWait { client, out: c.out, pane, until, deadline: timeout.map(|t| Instant::now() + t) });
+        self.check_waits();
+    }
+
+    pub(super) fn check_waits(&mut self) {
+        let now = Instant::now();
+        let mut i = 0;
+        while i < self.waits.len() {
+            let w = &self.waits[i];
+            let result = match self.panes.get(&w.pane) {
+                None => Some(Err("pane closed".to_string())),
+                Some(p) => {
+                    let state = p.agent.state;
+                    let hit = w.until.iter().any(|u| match u.as_str() {
+                        "exit" => p.exit_code.is_some(),
+                        "quiet" => p.last_output.elapsed() > Duration::from_secs(2),
+                        other => AgentState::parse(other) == Some(state),
+                    });
+                    if hit {
+                        Some(Ok(protocol::Response::Pane(Box::new(self.pane_info(w.pane)))))
+                    } else if w.deadline.is_some_and(|d| d <= now) {
+                        Some(Err("timeout".to_string()))
+                    } else {
+                        None
+                    }
+                }
+            };
+            match result {
+                Some(result) => {
+                    let w = self.waits.remove(i);
+                    let mut buf = Vec::new();
+                    if protocol::write_json(&mut buf, &ServerMsg::Response { result }).is_ok() {
+                        let _ = w.out.send_timeout(buf, Duration::from_millis(200));
+                    }
+                }
+                None => i += 1,
+            }
+        }
     }
 }

@@ -1,0 +1,111 @@
+//! Where things are: the main area, pane rectangles, and which workspace holds a pane.
+
+use ratatui::layout::Rect;
+
+use super::{Server, Tab};
+use crate::layout::PaneId;
+impl Server {
+    /// Main pane area for a client of the given size.
+    pub fn main_area(&self, cols: u16, rows: u16, sidebar: bool) -> Rect {
+        let top = 1;
+        let bottom = 1;
+        let height = rows.saturating_sub(top + bottom).max(1);
+        let sw = if sidebar { self.sidebar_width(cols) } else { 0 };
+        Rect::new(sw, top, cols.saturating_sub(sw).max(1), height)
+    }
+
+    pub fn sidebar_width(&self, cols: u16) -> u16 {
+        let w = self.config.sidebar.width;
+        if cols < w * 3 { 0 } else { w }
+    }
+
+    /// Whether a client sees the sidebar: as it chose, else when there is more to show than the
+    /// one workspace it is in (other workspaces, agents, ports, tunnels).
+    pub fn sidebar_shown(&self, c: &super::Client) -> bool {
+        c.sidebar.unwrap_or_else(|| self.config.sidebar.visible && self.sidebar_useful())
+    }
+
+    pub(super) fn sidebar_useful(&self) -> bool {
+        self.workspaces.len() > 1
+            || !self.def_names.is_empty()
+            || !self.tunnels.is_empty()
+            || !self.ports.is_empty()
+            || self.panes.values().any(|p| p.agent.kind.is_some())
+    }
+
+    /// Outer rectangle of every visible pane of a tab, in draw order (tiled, then floating).
+    pub fn tab_rects(&self, tab: &Tab, area: Rect) -> Vec<(PaneId, Rect, bool)> {
+        let mut out = Vec::new();
+        if let Some(z) = tab.zoom.filter(|z| !tab.is_floating(*z)) {
+            out.push((z, area, false));
+        } else if let Some(root) = &tab.root {
+            let rects = root.layout(area);
+            for id in root.leaves() {
+                out.push((id, rects[&id], false));
+            }
+        }
+        if tab.show_floating {
+            for f in &tab.floating {
+                out.push((f.pane, f.rect.to_rect(area), true));
+            }
+        }
+        out
+    }
+
+    /// Inner (content) rectangle of a pane drawn at `outer`.
+    pub fn inner(&self, outer: Rect) -> Rect {
+        if self.config.pane_frames && outer.width >= 4 && outer.height >= 3 {
+            Rect::new(outer.x + 1, outer.y + 1, outer.width - 2, outer.height - 2)
+        } else {
+            outer
+        }
+    }
+
+    /// Recompute the layout area from the primary client and resize every pane.
+    pub fn relayout(&mut self) {
+        if let Some(c) = self.primary.and_then(|p| self.clients.get(&p)) {
+            self.layout_area = self.main_area(c.cols, c.rows, self.sidebar_shown(c));
+        }
+        let area = self.layout_area;
+        let mut sizes = Vec::new();
+        for ws in &self.workspaces {
+            for tab in &ws.tabs {
+                let mut tiled = tab.root.as_ref().map(|r| r.layout(area)).unwrap_or_default();
+                if let Some(z) = tab.zoom {
+                    tiled.insert(z, area);
+                }
+                for (id, r) in tiled {
+                    sizes.push((id, self.inner(r)));
+                }
+                for f in &tab.floating {
+                    sizes.push((f.pane, self.inner(f.rect.to_rect(area))));
+                }
+            }
+        }
+        for (id, r) in sizes {
+            if let Some(p) = self.panes.get_mut(&id) {
+                p.resize(r.width, r.height);
+            }
+        }
+        for c in self.clients.values_mut() {
+            c.dirty = true;
+        }
+        self.schedule_render();
+    }
+
+    pub fn ws_index(&self, id: u32) -> Option<usize> {
+        self.workspaces.iter().position(|w| w.id == id)
+    }
+
+    /// (workspace index, tab index) holding a pane.
+    pub fn workspace_of(&self, pane: PaneId) -> Option<(usize, usize)> {
+        for (wi, ws) in self.workspaces.iter().enumerate() {
+            for (ti, tab) in ws.tabs.iter().enumerate() {
+                if tab.contains(pane) {
+                    return Some((wi, ti));
+                }
+            }
+        }
+        None
+    }
+}
