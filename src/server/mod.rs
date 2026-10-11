@@ -12,6 +12,7 @@ mod definitions;
 pub mod events;
 mod fileman;
 mod geometry;
+mod graphics;
 mod hints;
 mod input;
 pub mod net;
@@ -335,6 +336,8 @@ pub struct Server {
     kill_waiters: Vec<ClientId>,
     /// Colours of the outer terminal, learnt from OSC 10/11 replies.
     pub outer_colors: Option<(String, String)>,
+    /// What each client's terminal can show of the panes' images, and has been sent.
+    images: HashMap<ClientId, graphics::ClientImages>,
     /// Warnings not shown yet: they go to the clients and the messages log.
     pub warnings: Vec<String>,
     /// Why `accounts.toml` could not be read last time, so that it is said once, not every scan.
@@ -500,6 +503,10 @@ pub fn run(session: &str) -> Result<()> {
         session: session.to_string(),
         shell: config.shell(),
         scrollback: config.scrollback,
+        graphics: std::sync::Arc::new(crate::graphics::Shared::new(
+            config.graphics.enabled,
+            config.graphics.memory_mb.saturating_mul(1 << 20),
+        )),
     };
     let mut server = Server {
         session: session.to_string(),
@@ -521,6 +528,7 @@ pub fn run(session: &str) -> Result<()> {
         quitting: false,
         kill_waiters: Vec::new(),
         outer_colors: None,
+        images: HashMap::new(),
         warnings,
         accounts_error: None,
         messages: Default::default(),
@@ -1050,16 +1058,21 @@ impl Server {
                 continue;
             }
             let (buf, cursor, links) = self.compose(id);
+            // Images the client's terminal does not have yet go first.
+            let (mut bytes, more) = self.graphics_updates(id);
             let Some(c) = self.clients.get_mut(&id) else { continue };
-            let mut bytes = Vec::with_capacity(16 * 1024);
             c.encoder.encode(&buf, cursor, &links, &mut bytes);
-            c.dirty = false;
+            c.dirty = more;
+            again |= more;
             match c.out.try_send(frame_bytes(&bytes)) {
                 Ok(()) => {}
                 Err(TrySendError::Full(_)) => {
                     c.encoder.invalidate();
                     c.dirty = true;
                     again = true;
+                    if let Some(ci) = self.images.get_mut(&id) {
+                        ci.forget();
+                    }
                 }
                 Err(TrySendError::Disconnected(_)) => {}
             }

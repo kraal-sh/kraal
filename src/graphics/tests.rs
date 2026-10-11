@@ -1,0 +1,359 @@
+use alacritty_terminal::event::VoidListener;
+use alacritty_terminal::grid::Dimensions;
+use alacritty_terminal::index::{Column, Line};
+use alacritty_terminal::term::{Config, Term};
+use alacritty_terminal::vte::ansi::{Color as AColor, Processor, Rgb};
+use base64::Engine;
+use ratatui::buffer::Buffer;
+use ratatui::layout::Rect;
+use ratatui::style::Color;
+
+use super::scan::{MAX_APC, Scanner};
+use super::*;
+
+struct Size(usize, usize);
+
+impl Dimensions for Size {
+    fn total_lines(&self) -> usize {
+        self.1
+    }
+    fn screen_lines(&self) -> usize {
+        self.1
+    }
+    fn columns(&self) -> usize {
+        self.0
+    }
+}
+
+fn term(cols: usize, lines: usize) -> Term<VoidListener> {
+    Term::new(Config::default(), &Size(cols, lines), VoidListener)
+}
+
+fn shared(available: bool) -> Arc<Shared> {
+    let s = Arc::new(Shared::new(true, 64 << 20));
+    s.set_available(available);
+    s.set_cell(10, 20);
+    s
+}
+
+fn b64(data: &[u8]) -> String {
+    base64::engine::general_purpose::STANDARD.encode(data)
+}
+
+/// A kitty command for a `w × h` image of one colour, sent as RGB.
+fn rgb_image(keys: &str, w: u32, h: u32) -> Vec<u8> {
+    let data: Vec<u8> = (0..w * h).flat_map(|_| [200u8, 10, 10]).collect();
+    format!("\x1b_G{keys},f=24,s={w},v={h};{}\x1b\\", b64(&data)).into_bytes()
+}
+
+/// Feed `bytes` as a pane does: text to the emulator, images to `g`; the replies.
+fn feed(g: &mut PaneGraphics, t: &mut Term<VoidListener>, bytes: &[u8]) -> Vec<u8> {
+    let mut parser: Processor = Processor::new();
+    let mut replies = Vec::new();
+    for piece in g.split(bytes) {
+        match piece {
+            Piece::Text(text) => parser.advance(t, &text),
+            image => replies.extend(g.handle(image, t).unwrap_or_default()),
+        }
+    }
+    replies
+}
+
+fn cell_at(t: &Term<VoidListener>, line: i32, col: usize) -> Option<Placeholder> {
+    Placeholder::of_cell(&t.grid()[Line(line)][Column(col)])
+}
+
+#[test]
+fn image_sequences_are_taken_out_wherever_reads_cut_them() {
+    let stream: &[u8] = b"a\x1b_Gf=100,a=T;QUJD\x1b\\b\x1bP0;1q#0~~-\x1b\\c\x1b[1md\x1bPzz\x1b\\e";
+    for size in 1..stream.len() {
+        let mut s = Scanner::default();
+        let mut pieces = Vec::new();
+        for chunk in stream.chunks(size) {
+            pieces.extend(s.split(chunk));
+        }
+        // Text pieces cut by the reads come back together.
+        let mut merged: Vec<Piece> = Vec::new();
+        for p in pieces {
+            match (merged.last_mut(), p) {
+                (Some(Piece::Text(a)), Piece::Text(b)) => a.extend(b),
+                (_, p) => merged.push(p),
+            }
+        }
+        assert_eq!(
+            merged,
+            vec![
+                Piece::Text(b"a".to_vec()),
+                Piece::Kitty(b"f=100,a=T;QUJD".to_vec()),
+                Piece::Text(b"b".to_vec()),
+                Piece::Sixel { params: b"0;1".to_vec(), data: b"#0~~-".to_vec() },
+                // A DCS that is not sixel, and the rest, go to the emulator as they came.
+                Piece::Text(b"c\x1b[1md\x1bPzz\x1b\\e".to_vec()),
+            ],
+            "chunks of {size}"
+        );
+    }
+}
+
+#[test]
+fn a_cancelled_or_oversized_command_is_dropped() {
+    let mut s = Scanner::default();
+    assert_eq!(s.split(b"x\x1b_Ga=T\x18y"), vec![Piece::Text(b"xy".to_vec())]);
+    let mut s = Scanner::default();
+    let mut huge = b"\x1b_Ga=T;".to_vec();
+    huge.resize(MAX_APC + 100, b'A');
+    huge.extend_from_slice(b"\x1b\\z");
+    assert_eq!(s.split(&huge), vec![Piece::Text(b"z".to_vec())]);
+    // An ESC inside a command starts a new sequence.
+    let mut s = Scanner::default();
+    assert_eq!(s.split(b"\x1b_Ga=T\x1b[1m"), vec![Piece::Text(b"\x1b[1m".to_vec())]);
+}
+
+#[test]
+fn every_diacritic_is_a_zero_width_mark() {
+    use unicode_width::UnicodeWidthChar;
+    assert_eq!(PLACEHOLDER.width(), Some(1));
+    for d in DIACRITICS {
+        assert_eq!(d.width(), Some(0), "{d:?}");
+    }
+}
+
+#[test]
+fn a_placed_image_becomes_placeholder_cells_at_the_cursor() {
+    let mut g = PaneGraphics::new(shared(true));
+    let mut t = term(20, 6);
+    let replies = feed(&mut g, &mut t, b"ab");
+    assert!(replies.is_empty());
+    // 3 columns by 2 rows, then text after it.
+    let replies = feed(&mut g, &mut t, &rgb_image("a=T,i=5,c=3,r=2", 4, 4));
+    assert_eq!(replies, b"\x1b_Gi=5;OK\x1b\\");
+    let (kid, shown) = g.shown().next().unwrap();
+    assert_eq!(kid >> 24, KRAAL_ID >> 24);
+    assert_eq!(shown.placements, vec![(0, 3, 2)]);
+    for (line, col, row, column) in [(0, 2, 0, 0), (0, 4, 0, 2), (1, 2, 1, 0), (1, 4, 1, 2)] {
+        let p = cell_at(&t, line, col).unwrap();
+        assert_eq!((p.id, p.row, p.col), (kid, row, column), "line {line} col {col}");
+    }
+    assert!(cell_at(&t, 0, 5).is_none() && cell_at(&t, 1, 1).is_none());
+    // The cursor is after the image, on its last row; what follows keeps its own colours.
+    assert_eq!(t.grid().cursor.point, alacritty_terminal::index::Point::new(Line(1), Column(5)));
+    feed(&mut g, &mut t, b"z");
+    assert_eq!(t.grid()[Line(1)][Column(5)].c, 'z');
+    assert_ne!(
+        t.grid()[Line(1)][Column(5)].fg,
+        AColor::Spec(Rgb { r: (kid >> 16) as u8, g: (kid >> 8) as u8, b: kid as u8 })
+    );
+}
+
+#[test]
+fn an_image_wider_than_the_screen_is_cut_and_c1_keeps_the_cursor() {
+    let mut g = PaneGraphics::new(shared(true));
+    let mut t = term(10, 4);
+    feed(&mut g, &mut t, b"\x1b[1;8H");
+    feed(&mut g, &mut t, &rgb_image("a=T,C=1,c=6,r=2,q=1", 2, 2));
+    let (_, shown) = g.shown().next().unwrap();
+    assert_eq!(shown.placements, vec![(0, 3, 2)], "three columns fit");
+    assert!(cell_at(&t, 1, 9).is_some());
+    assert_eq!(t.grid().cursor.point, alacritty_terminal::index::Point::new(Line(0), Column(7)));
+}
+
+#[test]
+fn queries_are_answered_only_when_a_terminal_can_show_images() {
+    let query = b"\x1b_Gi=31,s=1,v=1,a=q,t=d,f=24;AAAA\x1b\\";
+    let mut t = term(10, 4);
+    let mut g = PaneGraphics::new(shared(false));
+    assert!(feed(&mut g, &mut t, query).is_empty(), "like a terminal without images");
+    let mut g = PaneGraphics::new(shared(true));
+    assert_eq!(feed(&mut g, &mut t, query), b"\x1b_Gi=31;OK\x1b\\");
+    assert_eq!(g.shown().count(), 0, "a query keeps nothing");
+    assert_eq!(g.device_attributes("\x1b[?6c"), "\x1b[?62;4;22c");
+    assert_eq!(PaneGraphics::new(shared(false)).device_attributes("\x1b[?6c"), "\x1b[?6c");
+}
+
+#[test]
+fn files_and_shared_memory_are_refused_alike() {
+    let mut g = PaneGraphics::new(shared(true));
+    let mut t = term(10, 4);
+    for medium in ["f", "t", "s"] {
+        let cmd = format!("\x1b_Gi=3,a=T,f=100,t={medium};{}\x1b\\", b64(b"/etc/passwd"));
+        assert_eq!(feed(&mut g, &mut t, cmd.as_bytes()), b"\x1b_Gi=3;EBADF:Failed to read image file\x1b\\");
+    }
+    assert_eq!(g.shown().count(), 0);
+}
+
+#[test]
+fn chunks_numbers_and_quiet_replies() {
+    let mut g = PaneGraphics::new(shared(true));
+    let mut t = term(20, 6);
+    let data: Vec<u8> = (0..4 * 4).flat_map(|_| [1u8, 2, 3, 255]).collect();
+    let all = b64(&data);
+    let (a, b) = all.split_at(32);
+    let first = format!("\x1b_GI=9,f=32,s=4,v=4,m=1;{a}\x1b\\");
+    let last = format!("\x1b_Gm=0;{b}\x1b\\");
+    assert!(feed(&mut g, &mut t, first.as_bytes()).is_empty());
+    let reply = String::from_utf8(feed(&mut g, &mut t, last.as_bytes())).unwrap();
+    // A numbered image gets an id of kraal's, given back with the number.
+    let id: u32 = reply.strip_prefix("\x1b_Gi=").unwrap().split(',').next().unwrap().parse().unwrap();
+    assert_eq!(reply, format!("\x1b_Gi={id},I=9;OK\x1b\\"));
+    // Placed by its number; q=1 silences the OK, q=2 errors too.
+    assert!(feed(&mut g, &mut t, b"\x1b_Ga=p,I=9,q=1\x1b\\").is_empty());
+    assert_eq!(g.shown().count(), 1);
+    assert!(feed(&mut g, &mut t, b"\x1b_Ga=p,i=77,q=2\x1b\\").is_empty());
+    assert_eq!(feed(&mut g, &mut t, b"\x1b_Ga=p,i=77\x1b\\"), b"\x1b_Gi=77;ENOENT:no such image\x1b\\");
+}
+
+#[test]
+fn deleted_images_render_blank_and_others_show() {
+    let mut g = PaneGraphics::new(shared(true));
+    let mut t = term(20, 6);
+    feed(&mut g, &mut t, &rgb_image("a=T,i=1,c=2,r=1,q=2", 2, 2));
+    feed(&mut g, &mut t, b"\r\n");
+    feed(&mut g, &mut t, &rgb_image("a=T,i=2,c=2,r=1,q=2", 2, 2));
+    assert_eq!(g.shown().count(), 2);
+    let render = |g: &PaneGraphics, t: &Term<VoidListener>, show: bool| {
+        let area = Rect::new(0, 0, 20, 6);
+        let mut buf = Buffer::empty(area);
+        crate::pane::render_term(t, area, &mut buf, None);
+        g.show_cells(area, &mut buf, show);
+        buf
+    };
+    let buf = render(&g, &t, true);
+    assert!(buf[(0, 0)].symbol().starts_with(PLACEHOLDER) && buf[(0, 1)].symbol().starts_with(PLACEHOLDER));
+    assert!(matches!(buf[(0, 0)].fg, Color::Rgb(..)));
+    // A client that cannot show images sees blanks, never the placeholder character.
+    let buf = render(&g, &t, false);
+    assert_eq!(buf[(0, 0)].symbol(), " ");
+    feed(&mut g, &mut t, b"\x1b_Ga=d,d=I,i=1\x1b\\");
+    assert_eq!(g.shown().count(), 1);
+    let buf = render(&g, &t, true);
+    assert_eq!(buf[(0, 0)].symbol(), " ");
+    assert!(buf[(0, 1)].symbol().starts_with(PLACEHOLDER));
+    // By position: the image under the cursor's cell (1-based x, y).
+    feed(&mut g, &mut t, b"\x1b_Ga=d,d=p,x=1,y=2\x1b\\");
+    assert_eq!(g.shown().count(), 0);
+}
+
+#[test]
+fn a_programs_own_placeholders_name_its_image_through_kraal() {
+    let mut g = PaneGraphics::new(shared(true));
+    let mut t = term(20, 6);
+    // A virtual placement, then the program prints placeholders for id 42 (256-colour), with
+    // the row diacritic only on the first cell, as kitty allows.
+    feed(&mut g, &mut t, &rgb_image("a=T,U=1,i=42,c=3,r=1,q=2", 3, 1));
+    let (kid, shown) = g.shown().next().unwrap();
+    assert_eq!(shown.placements, vec![(0, 3, 1)]);
+    assert!(t.grid()[Line(0)][Column(0)].c == ' ', "a virtual placement writes nothing");
+    let text = format!("\x1b[38;5;42m{PLACEHOLDER}\u{0305}{PLACEHOLDER}{PLACEHOLDER}\x1b[39m");
+    feed(&mut g, &mut t, text.as_bytes());
+    let area = Rect::new(0, 0, 20, 6);
+    let mut buf = Buffer::empty(area);
+    crate::pane::render_term(&t, area, &mut buf, None);
+    g.show_cells(area, &mut buf, true);
+    for col in 0..3u16 {
+        let p = Placeholder::of_symbol(buf[(col, 0)].symbol(), buf[(col, 0)].fg).unwrap();
+        assert_eq!((p.id, p.row, p.col), (kid, 0, col as usize), "column {col}");
+    }
+    // An id nothing shows renders blank.
+    let text = format!("\r\n\x1b[38;5;43m{PLACEHOLDER}\x1b[39m");
+    feed(&mut g, &mut t, text.as_bytes());
+    let mut buf = Buffer::empty(area);
+    crate::pane::render_term(&t, area, &mut buf, None);
+    g.show_cells(area, &mut buf, true);
+    assert_eq!(buf[(0, 1)].symbol(), " ");
+}
+
+#[test]
+fn the_oldest_images_go_when_the_quota_is_reached() {
+    let s = Arc::new(Shared::new(true, 1));
+    s.set_available(true);
+    let mut g = PaneGraphics::new(s.clone());
+    let mut t = term(20, 6);
+    feed(&mut g, &mut t, &rgb_image("a=T,i=1,q=2", 2, 2));
+    // Even one image is over a quota of one byte: it cannot stay.
+    assert_eq!(g.shown().count(), 0);
+    assert_eq!(feed(&mut g, &mut t, &rgb_image("a=T,i=2", 2, 2)), b"\x1b_Gi=2;ENOSPC:image storage is full\x1b\\");
+    assert_eq!(s.used(), 0, "nothing is left held");
+    // With room for one, the second replaces the first.
+    let one = {
+        let probe = Arc::new(Shared::new(true, usize::MAX));
+        let png = Picture::from_rgba(2, 2, [200, 10, 10, 255].repeat(4), &probe).unwrap();
+        png.png.len()
+    };
+    let s = Arc::new(Shared::new(true, one + one / 2));
+    s.set_available(true);
+    let mut g = PaneGraphics::new(s.clone());
+    feed(&mut g, &mut t, &rgb_image("a=T,i=1,q=2", 2, 2));
+    feed(&mut g, &mut t, &rgb_image("a=T,i=2,q=2", 2, 2));
+    assert_eq!(g.shown().count(), 1);
+    assert!(g.shown().all(|(_, sh)| sh.origin == 2));
+    assert!(s.used() <= one + one / 2);
+    drop(g);
+    assert_eq!(s.used(), 0, "a pane's images go with it");
+}
+
+#[test]
+fn sixel_images_decode_and_take_cells() {
+    // Two red columns six pixels high, then a band below in register 1's default blue.
+    let img = sixel::decode(b"\"1;1;2;12#0;2;100;0;0#0~~-#1!2~").unwrap();
+    assert_eq!((img.width, img.height), (2, 12));
+    assert_eq!(&img.pixels[..4], &[255, 0, 0, 255]);
+    assert_eq!(&img.pixels[6 * 2 * 4..6 * 2 * 4 + 4], &[51, 51, 204, 255]);
+    // Unpainted pixels are transparent.
+    let img = sixel::decode(b"#0;2;0;100;0@").unwrap();
+    assert_eq!((img.width, img.height), (1, 1));
+    assert_eq!(&img.pixels[..], &[0, 255, 0, 255]);
+    assert!(sixel::decode(b"!99999999~").is_none(), "too wide");
+    assert!(sixel::decode(b"").is_none());
+
+    let mut g = PaneGraphics::new(shared(true));
+    let mut t = term(20, 6);
+    feed(&mut g, &mut t, b"\x1bPq\"1;1;25;30#0;2;0;0;100#0!25~-!25~-!25~-!25~-!25~\x1b\\");
+    let (_, shown) = g.shown().next().unwrap();
+    // 25×30 pixels in 10×20 cells: 3 columns, 2 rows; the cursor goes below.
+    assert_eq!(shown.placements, vec![(0, 3, 2)]);
+    assert_eq!(t.grid().cursor.point.line, Line(2));
+}
+
+#[test]
+fn outer_terminal_commands_are_plain_and_chunked() {
+    let s = shared(true);
+    let picture = Picture::new(vec![7u8; 10_000], 1, 1, &s);
+    let mut out = Vec::new();
+    transmit(KRAAL_ID | 5, &picture, &mut out);
+    let text = String::from_utf8(out).unwrap();
+    assert!(text.starts_with(&format!("\x1b_Ga=t,f=100,i={},q=2,m=1;", KRAAL_ID | 5)));
+    assert!(text.ends_with("\x1b\\"));
+    assert_eq!(text.matches("\x1b_G").count(), 10_000_usize.div_ceil(3) * 4 / 4096 + 1);
+    let mut out = Vec::new();
+    place(9, 3, 4, 2, &mut out);
+    assert_eq!(out, b"\x1b_Ga=p,U=1,i=9,p=3,c=4,r=2,q=2\x1b\\");
+    assert_eq!(probe_answer(&format!("\x1b_Gi={PROBE_ID};OK\x1b\\")), Some(true));
+    assert_eq!(probe_answer(&format!("\x1b_Gi={PROBE_ID};ENOTSUPPORTED\x1b\\")), Some(false));
+    assert_eq!(probe_answer("\x1b[?62c"), None);
+    assert_eq!(cell_size_answer("\x1b[6;20;9t"), Some((9, 20)));
+    assert_eq!(terminal_name("\x1bP>|ghostty 1.1.3\x1b\\").as_deref(), Some("ghostty 1.1.3"));
+    assert!(draws_placeholders("kitty(0.39.1)") && draws_placeholders("ghostty 1.1.3"));
+    assert!(!draws_placeholders("WezTerm 20240203-110809-5046fc22"));
+}
+
+#[test]
+fn terminal_replies_reach_the_server_whole() {
+    let mut p = crate::input::InputParser::new();
+    let mut events = p.feed(format!("\x1b_Gi={PROBE_ID};OK\x1b\\\x1bP>|kitty(0.39.1)\x1b\\\x1b[6;20;9t").as_bytes());
+    events.extend(p.flush());
+    let raw: Vec<String> = events
+        .into_iter()
+        .filter_map(|e| match e {
+            crate::input::InputEvent::Raw(r) => Some(String::from_utf8_lossy(&r).into_owned()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        raw,
+        vec![
+            format!("\x1b_Gi={PROBE_ID};OK\x1b\\"),
+            "\x1bP>|kitty(0.39.1)\x1b\\".to_string(),
+            "\x1b[6;20;9t".to_string()
+        ]
+    );
+}

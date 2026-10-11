@@ -118,9 +118,30 @@ impl TermPane {
     /// Feed the emulator. While the pane has marks, the lines that scroll into the history are
     /// counted, so that the marks stay on their text.
     pub(super) fn advance(&mut self, bytes: &[u8]) {
-        let bytes = self.guard.filter(bytes);
+        for piece in self.graphics.split(bytes) {
+            match piece {
+                crate::graphics::Piece::Text(text) => {
+                    let text = self.guard.filter(&text);
+                    self.marked(|t| t.parser.advance(&mut t.term, &text));
+                }
+                image => self.marked(|t| {
+                    // Text held for a synchronized update goes first: the image comes after it.
+                    if t.parser.sync_timeout().sync_timeout().is_some() {
+                        t.parser.stop_sync(&mut t.term);
+                    }
+                    if let Some(reply) = t.graphics.handle(image, &mut t.term) {
+                        t.write(reply);
+                    }
+                }),
+            }
+        }
+    }
+
+    /// Change the grid with `change`, keeping count of the lines it scrolls so that the marks
+    /// stay on their lines.
+    fn marked(&mut self, change: impl FnOnce(&mut Self)) {
         if self.commands.list.is_empty() {
-            self.parser.advance(&mut self.term, &bytes);
+            change(self);
             return;
         }
         if !self.alt_screen() && self.commands.lifted.is_none() {
@@ -135,7 +156,7 @@ impl TermPane {
                 self.commands.lifted = Some((1, true));
             }
         }
-        self.parser.advance(&mut self.term, &bytes);
+        change(self);
         if !self.alt_screen() {
             self.count_scrolled();
         }
@@ -422,7 +443,13 @@ mod tests {
     /// A pane whose program prints nothing: the tests feed it output themselves.
     fn pane(rows: u16, scrollback: usize) -> (Pane, crossbeam_channel::Receiver<crate::server::Event>) {
         let (tx, rx) = crossbeam_channel::bounded(64);
-        let env = PaneEnv { socket: "/nonexistent".into(), session: "t".into(), shell: "sh".into(), scrollback };
+        let env = PaneEnv {
+            socket: "/nonexistent".into(),
+            session: "t".into(),
+            shell: "sh".into(),
+            scrollback,
+            graphics: Default::default(),
+        };
         let spec = PaneSpec { command: vec!["sleep".into(), "30".into()], ..Default::default() };
         (Pane::spawn(1, None, spec, 30, rows, &env, &tx).unwrap(), rx)
     }

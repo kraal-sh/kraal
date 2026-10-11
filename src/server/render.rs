@@ -769,6 +769,7 @@ impl Server {
         let wi = self.ws_index(c.workspace)?;
         let area = self.layout_area;
         let clip = buf.area;
+        let images = self.can_show_images(id);
         let ws = &self.workspaces[wi];
         let tab = ws.tab();
         let rects = self.tab_rects(tab, area);
@@ -806,6 +807,7 @@ impl Server {
                 f.set_viewer(id);
             }
             pane.render(content, buf, links);
+            pane.show_images(content, buf, images);
             if let Some(code) = pane.exit_code {
                 let msg = match code {
                     _ if pane.suspended => " not started · enter run · x close ".to_string(),

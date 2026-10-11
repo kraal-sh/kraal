@@ -402,8 +402,13 @@ pub(super) fn row_chars<T>(term: &Term<T>, line: Line) -> (String, Vec<usize>) {
         }
         last = n;
         index.push(n);
-        s.push(cell.c);
         n += 1;
+        // An image's cells read as blank.
+        if cell.c == crate::graphics::PLACEHOLDER {
+            s.push(' ');
+            continue;
+        }
+        s.push(cell.c);
         if let Some(zw) = cell.zerowidth() {
             s.extend(zw);
             n += zw.len();

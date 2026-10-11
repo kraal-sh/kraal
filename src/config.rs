@@ -74,6 +74,13 @@ on_done = true
 # (`kraal integration install zsh`, bash or fish). 0 turns it off.
 long_command = 30
 
+[graphics]
+# Images programs draw in panes (kitty graphics protocol, sixel), shown when your terminal draws
+# kitty graphics over Unicode placeholders (Ghostty, kitty); blank elsewhere.
+enabled = true
+# Memory kept for the images of all panes, in MB; the oldest go first.
+memory_mb = 256
+
 [contexts]
 # Show in pane frames what a pane works on besides git:
 # the Kubernetes context of panes that ran kubectl, k9s, helm…,
@@ -211,6 +218,7 @@ pub struct Config {
     pub theme: crate::theme::ThemeConfig,
     pub sidebar: SidebarConfig,
     pub notifications: NotificationConfig,
+    pub graphics: GraphicsConfig,
     pub contexts: ContextsConfig,
     pub production: ProductionConfig,
     pub hints: crate::hints::HintsConfig,
@@ -219,6 +227,12 @@ pub struct Config {
     #[serde(default)]
     pub tools: BTreeMap<String, crate::tools::ToolDef>,
     pub keys: crate::keymap::KeysConfig,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct GraphicsConfig {
+    pub enabled: bool,
+    pub memory_mb: usize,
 }
 
 #[derive(Debug, Clone, Deserialize)]

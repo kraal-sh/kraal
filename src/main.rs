@@ -12,6 +12,7 @@ mod exec;
 mod files;
 mod fleet;
 mod git;
+mod graphics;
 mod hints;
 mod input;
 mod integration;

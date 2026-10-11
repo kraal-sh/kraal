@@ -913,6 +913,7 @@ dependencies = [
  "image",
  "kdl 6.5.0",
  "libc",
+ "miniz_oxide 0.8.9",
  "portable-pty",
  "pulldown-cmark",
  "ratatui",

@@ -532,6 +532,25 @@ kraal attach --host db                 # attach to db's kraal; ctrl+c gives up w
 Ctrl+click on a link in a remote session opens it on your machine. A `localhost` address there is
 the server's, not yours: kraal copies it and says so instead of opening the wrong page.
 
+## Images
+
+Programs that draw images in the terminal work in panes, locally or over SSH: the kitty graphics
+protocol (kitty's `icat`, Yazi, timg, chafa…) and sixel (img2sixel, gnuplot, matplotlib
+backends…). kraal keeps each image and draws it in the pane like text: it scrolls with the
+output, is cut by the pane's frame, hides under a floating pane, and shows on every attached
+terminal that can draw it.
+
+- Your terminal must draw kitty graphics over Unicode placeholders: Ghostty and kitty do. kraal
+  asks each terminal when it attaches; on one that cannot (WezTerm and Konsole draw images, but
+  not this way), the image's cells stay blank, and programs in panes are told no images can be
+  shown, as a terminal without them would.
+- Programs send the image data itself. Reading an image from a file or shared memory is refused
+  (the program may run on another machine than kraal), and programs then send the data instead.
+- `[graphics] memory_mb` (256 by default) bounds the memory all panes keep for images; the oldest
+  go first. `enabled = false` turns images off: their sequences then reach the emulator, which
+  ignores them.
+- Not supported: animations, images under the text (negative z-index), offsets within a cell.
+
 ## Coding agents
 
 kraal recognises agents by their process (`claude`, `codex`, `opencode`, `gemini`, `aider`,
@@ -668,8 +687,8 @@ without box drawing) and optional `accent`, `dim`, `sync`, `production` colours 
 
 kraal is young. Known gaps:
 
-- Programs' images (kitty graphics, sixel) are not shown; preview panes draw images with
-  half-block characters.
+- Programs' images show only on terminals that draw kitty graphics over Unicode placeholders
+  (Ghostty, kitty); preview panes still draw images with half-block characters.
 - Remote sessions need kraal on the server; agents running there are not yet listed in your
   local sidebar, and the Kubernetes, Terraform and AWS contexts are read only for local panes.
 - Agent states come from hooks for Claude Code (and Codex's turn ends); for other agents they are

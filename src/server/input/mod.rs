@@ -90,7 +90,7 @@ impl Server {
 
     fn client_event(&mut self, id: ClientId, ev: InputEvent) {
         if let InputEvent::Raw(raw) = &ev
-            && (self.keyboard_reply(id, raw) || self.terminal_reply(raw))
+            && (self.keyboard_reply(id, raw) || self.terminal_reply(id, raw))
         {
             return;
         }
@@ -166,8 +166,11 @@ impl Server {
     }
 
     /// Replies from the outer terminal to queries the server sent (colours, DA, CPR).
-    fn terminal_reply(&mut self, raw: &[u8]) -> bool {
+    fn terminal_reply(&mut self, id: ClientId, raw: &[u8]) -> bool {
         let s = String::from_utf8_lossy(raw);
+        if self.graphics_reply(id, &s) {
+            return true;
+        }
         for (code, fg) in [("\x1b]10;", true), ("\x1b]11;", false)] {
             if let Some(rest) = s.strip_prefix(code) {
                 let value = rest.trim_end_matches(['\x07', '\\']).trim_end_matches('\x1b').to_string();

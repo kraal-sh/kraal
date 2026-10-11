@@ -2486,3 +2486,40 @@ fn the_leader_menu_reads_keys_by_their_place() {
     std::thread::sleep(Duration::from_millis(500));
     assert_eq!(count(&other, raised), 1);
 }
+
+/// A program's kitty image reaches a terminal that shows images: sent to it once, then drawn as
+/// placeholder cells where the program put it. A terminal that cannot draw them that way gets
+/// neither.
+#[test]
+fn images_reach_a_terminal_that_shows_them() {
+    let env = Env::new("images");
+    env.workspace("w", "layout {\n    pane name=\"img\"\n}\n");
+    env.run(&["open", "w"]);
+    env.wait_for_text("img", "$");
+    let script = env.root.join("img.sh");
+    // A 2×2 RGB image shown over 4 columns and 2 rows.
+    write_script(
+        &script,
+        "#!/bin/sh\nprintf '\\033_Ga=T,f=24,s=2,v=2,c=4,r=2,q=2;AAAAAAAAAAAAAAAA\\033\\\\'\necho shown\n",
+    );
+
+    let mut plain = RawClient::attach(&env, "w");
+    let mut client = RawClient::attach(&env, "w");
+    // The server asks each terminal; this one answers as Ghostty does, the other as a terminal
+    // that speaks the protocol without drawing placeholders.
+    client.wait_for_screen("a=q");
+    client.send(b"\x1b_Gi=1263684657;OK\x1b\\\x1bP>|ghostty 1.1.3\x1b\\\x1b[6;20;10t");
+    plain.wait_for_screen("a=q");
+    plain.send(b"\x1b_Gi=1263684657;OK\x1b\\\x1bP>|WezTerm 20240203\x1b\\");
+    std::thread::sleep(Duration::from_millis(300));
+    env.run(&["send", "-p", "img", &format!("{}\r", script.display())]);
+    env.wait_for_text("img", "shown");
+    client.wait_for_screen("\x1b_Ga=t,f=100,i=");
+    client.wait_for_screen("\x1b_Ga=p,U=1,i=");
+    client.wait_for_screen("\u{10EEEE}");
+    plain.send(b"\x1b[I");
+    std::thread::sleep(Duration::from_millis(300));
+    let seen = String::from_utf8_lossy(&plain.screen.lock().unwrap()).into_owned();
+    assert!(seen.contains("shown"), "the other client draws the pane");
+    assert!(!seen.contains("\x1b_Ga=t") && !seen.contains('\u{10EEEE}'), "no image for a terminal that cannot show it");
+}

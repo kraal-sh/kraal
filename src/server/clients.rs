@@ -114,6 +114,7 @@ impl Server {
                     c.encoder.invalidate();
                 }
                 self.primary = Some(id);
+                self.probe_cell_size(id);
                 self.relayout();
             }
             ClientMsg::Detach => self.detach(id, "detached"),
@@ -159,6 +160,7 @@ impl Server {
             // Ask the outer terminal for its colours so panes querying them get real values.
             let _ = c.out.try_send(frame_bytes(b"\x1b]10;?\x07\x1b]11;?\x07"));
         }
+        self.probe_graphics(id);
         self.primary = Some(id);
         self.relayout();
         self.mark_seen_focused(id);
@@ -167,6 +169,7 @@ impl Server {
     }
 
     pub fn detach(&mut self, id: ClientId, reason: &str) {
+        self.graphics_farewell(id);
         self.send_msg(id, &ServerMsg::Exit { reason: reason.to_string() });
         self.drop_client(id);
     }
@@ -188,6 +191,7 @@ impl Server {
             self.primary = self.clients.values().filter(|c| c.attached).max_by_key(|c| c.last_input).map(|c| c.id);
             self.relayout();
         }
+        self.graphics_client_gone(id);
     }
 
     pub fn send_msg(&self, id: ClientId, msg: &ServerMsg) {

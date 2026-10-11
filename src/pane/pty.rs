@@ -196,6 +196,14 @@ pub struct TermPane {
     pub(super) guard: KeyboardStackGuard,
     /// The shell's commands, as it marks them.
     pub(super) commands: Commands,
+    pub graphics: crate::graphics::PaneGraphics,
+}
+
+/// A PTY of `cols × rows`, with its size in pixels from the outer terminal's cells: programs
+/// that draw images size them from it.
+pub(super) fn pty_size(cols: u16, rows: u16, graphics: &crate::graphics::Shared) -> PtySize {
+    let (cw, ch) = graphics.cell();
+    PtySize { rows, cols, pixel_width: cols.saturating_mul(cw), pixel_height: rows.saturating_mul(ch) }
 }
 
 impl Drop for TermPane {
@@ -220,7 +228,7 @@ impl TermPane {
         let (cwd, own_dir) = spawn_dir(spec.cwd.as_deref(), strict)?;
         start_reaper().context("starting the thread that reaps panes' programs")?;
         let pty = portable_pty::native_pty_system();
-        let pair = pty.openpty(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 }).context("opening a pty")?;
+        let pair = pty.openpty(pty_size(cols, rows, &env.graphics)).context("opening a pty")?;
         let program: Vec<&OsStr> = if spec.command.is_empty() {
             vec![OsStr::new(&env.shell)]
         } else {
@@ -311,6 +319,7 @@ impl TermPane {
             osc: OscScanner::default(),
             guard: KeyboardStackGuard::default(),
             commands: Commands::new(env.scrollback),
+            graphics: crate::graphics::PaneGraphics::new(env.graphics.clone()),
         };
         if let Some(text) = &spec.startup_input {
             pane.write(text.clone().into_bytes());

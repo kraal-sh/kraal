@@ -8,7 +8,8 @@ use alacritty_terminal::grid::Scroll;
 use alacritty_terminal::term::TermMode;
 use anyhow::Result;
 use crossbeam_channel::Sender;
-use portable_pty::PtySize;
+use ratatui::buffer::Buffer;
+use ratatui::layout::Rect;
 
 use crate::agent::AgentTracker;
 use crate::input::PaneInputModes;
@@ -28,6 +29,8 @@ use osc::{Osc, OscScanner};
 pub use osc::{osc_notify, osc52};
 use pty::Size;
 pub use pty::{ProcessHold, TermPane};
+#[cfg(test)]
+pub use screen::render_term;
 pub use screen::set_outer_colors;
 use screen::{SearchState, default_color};
 
@@ -179,6 +182,8 @@ pub struct PaneEnv {
     pub session: String,
     pub shell: String,
     pub scrollback: usize,
+    /// Images: whether they can be shown, the outer terminal's cell size, the session quota.
+    pub graphics: std::sync::Arc<crate::graphics::Shared>,
 }
 
 impl Pane {
@@ -254,6 +259,8 @@ impl Pane {
         std::mem::swap(&mut fresh.term, &mut old.term);
         std::mem::swap(&mut fresh.events, &mut old.events);
         std::mem::swap(&mut fresh.commands, &mut old.commands);
+        // The images its scrollback shows stay with it.
+        std::mem::swap(&mut fresh.graphics, &mut old.graphics);
         fresh.parser.advance(&mut fresh.term, &reset_sequence(self.cols));
         fresh.count_scrolled();
         **old = fresh;
@@ -323,7 +330,7 @@ impl Pane {
         self.cols = cols;
         self.rows = rows;
         if let Content::Term(t) = &mut self.content {
-            let _ = t.master.resize(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 });
+            let _ = t.master.resize(pty::pty_size(cols, rows, t.graphics.shared()));
             t.resize_marked(Size { cols, rows });
         }
     }
@@ -355,6 +362,21 @@ impl Pane {
         signals
     }
 
+    /// Tell the program the pane's size in pixels again: the outer terminal's cells changed.
+    pub fn refresh_pixel_size(&mut self) {
+        if let Content::Term(t) = &mut self.content {
+            let _ = t.master.resize(pty::pty_size(self.cols, self.rows, t.graphics.shared()));
+        }
+    }
+
+    /// Make the image placeholders `area` shows from this pane displayable, or blank when the
+    /// client cannot show images.
+    pub fn show_images(&self, area: Rect, buf: &mut Buffer, can_show: bool) {
+        if let Content::Term(t) = &self.content {
+            t.graphics.show_cells(area, buf, can_show);
+        }
+    }
+
     /// The next chunk of output read from the PTY, if any.
     pub fn take_output(&self) -> Option<Vec<u8>> {
         self.term()?.output.try_recv().ok()
@@ -384,7 +406,7 @@ impl Pane {
         let events: Vec<TermEvent> = t.events.borrow_mut().drain(..).collect();
         for ev in events {
             match ev {
-                TermEvent::PtyWrite(s) => t.write(s.into_bytes()),
+                TermEvent::PtyWrite(s) => t.write(t.graphics.device_attributes(&s).into_bytes()),
                 TermEvent::Title(s) => {
                     self.title = sanitize_title(&s);
                     signals.push(PaneSignal::TitleChanged);
@@ -403,7 +425,8 @@ impl Pane {
                     t.write(format(rgb).into_bytes());
                 }
                 TermEvent::TextAreaSizeRequest(format) => {
-                    let size = WindowSize { num_lines: self.rows, num_cols: self.cols, cell_width: 8, cell_height: 16 };
+                    let (cell_width, cell_height) = t.graphics.shared().cell();
+                    let size = WindowSize { num_lines: self.rows, num_cols: self.cols, cell_width, cell_height };
                     t.write(format(size).into_bytes());
                 }
                 _ => {}
@@ -633,7 +656,13 @@ mod tests {
     #[test]
     fn replies_held_in_a_synchronized_update_go_out_when_it_times_out() {
         let (tx, _rx) = crossbeam_channel::bounded(64);
-        let env = PaneEnv { socket: "/nonexistent".into(), session: "t".into(), shell: "sh".into(), scrollback: 100 };
+        let env = PaneEnv {
+            socket: "/nonexistent".into(),
+            session: "t".into(),
+            shell: "sh".into(),
+            scrollback: 100,
+            graphics: Default::default(),
+        };
         // The program asks where the cursor is inside a synchronized update that never ends, then
         // prints the answer it reads.
         let spec = PaneSpec {
@@ -663,7 +692,13 @@ mod tests {
     #[test]
     fn a_command_never_runs_in_another_directory_than_its_own() {
         let (tx, _rx) = crossbeam_channel::bounded(64);
-        let env = PaneEnv { socket: "/nonexistent".into(), session: "t".into(), shell: "sh".into(), scrollback: 100 };
+        let env = PaneEnv {
+            socket: "/nonexistent".into(),
+            session: "t".into(),
+            shell: "sh".into(),
+            scrollback: 100,
+            graphics: Default::default(),
+        };
         let gone = Some(PathBuf::from("/nonexistent/kraal-test-dir"));
         let command = PaneSpec { command: vec!["true".into()], cwd: gone.clone(), ..Default::default() };
         let err = Pane::spawn(1, None, command, 20, 5, &env, &tx).err().expect("refused");
