@@ -6,9 +6,9 @@ use crate::keymap::Keymap;
 
 impl Server {
     /// Read the configuration again and apply it: keys, theme, sidebar, mouse, pane frames,
-    /// notifications, tools, hints, hooks, production words and contexts. Panes already open keep
-    /// their shell and scrollback length; new panes take the new ones. When the file cannot be
-    /// read, nothing changes. Returns the warnings.
+    /// notifications, tools, hints, hooks, production words, contexts and saving scrollback. Panes
+    /// already open keep their shell and scrollback length; new panes take the new ones. When the
+    /// file cannot be read, nothing changes. Returns the warnings.
     pub(super) fn reload_config(&mut self) -> Result<Vec<String>, String> {
         let config = Config::load().map_err(|e| format!("config: {e:#}"))?;
         let mut warnings = Vec::new();

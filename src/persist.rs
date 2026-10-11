@@ -4,8 +4,13 @@
 //! directory. Interactive SSH panes reconnect and agents with a known session id are resumed
 //! (`claude --resume <id>`); other command panes wait for Enter rather than run again by
 //! themselves. Typing is never broadcast after a restart.
+//!
+//! What each pane showed is saved too, unless `save_scrollback` is off: a file per pane in the
+//! session's scrollback directory, named by the state and given back to the pane replacing it.
 
+use std::collections::HashSet;
 use std::path::PathBuf;
+use std::time::Instant;
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -68,6 +73,18 @@ pub struct PaneSnap {
     /// The command had exited (or never started) when the snapshot was taken.
     #[serde(default)]
     pub stopped: bool,
+    /// The file in the session's scrollback directory holding what the pane showed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scrollback: Option<String>,
+}
+
+/// What is saved of a pane's scrollback.
+#[derive(Debug, Clone)]
+pub struct SavedScrollback {
+    /// Its file in the session's scrollback directory, once there was text to save.
+    pub file: Option<String>,
+    /// When it was read from the pane: output since is not in it.
+    pub taken: Instant,
 }
 
 pub fn snapshot(server: &Server) -> SessionSnapshot {
@@ -97,6 +114,7 @@ pub fn snapshot(server: &Server) -> SessionSnapshot {
             agent,
             agent_session: p.agent.session_id.clone(),
             stopped: p.exit_code.is_some(),
+            scrollback: server.scrollback.get(&id).and_then(|s| s.file.clone()),
         }
     };
     fn node(n: &Node, f: &dyn Fn(PaneId) -> PaneSnap) -> NodeSnap {
@@ -147,6 +165,63 @@ pub fn save(session: &str, snap: &SessionSnapshot) -> Result<()> {
     }
     paths::write_private(&path, &serde_json::to_vec_pretty(snap)?)?;
     Ok(())
+}
+
+/// Write a pane's scrollback, as [`crate::pane::Pane::scrollback_ansi`] gives it.
+pub fn save_scrollback(session: &str, file: &str, text: &[u8]) -> Result<()> {
+    let dir = paths::scrollback_dir(session);
+    paths::ensure_private_dir(&dir)?;
+    paths::write_private(&dir.join(file), text)?;
+    Ok(())
+}
+
+/// The scrollback files `snap` names.
+fn scrollback_files(snap: &SessionSnapshot) -> HashSet<&str> {
+    fn walk<'a>(n: &'a NodeSnap, out: &mut HashSet<&'a str>) {
+        match n {
+            NodeSnap::Pane(p) => out.extend(p.scrollback.as_deref()),
+            NodeSnap::Split { children, .. } => children.iter().for_each(|(c, _)| walk(c, out)),
+        }
+    }
+    let mut out = HashSet::new();
+    for tab in snap.workspaces.iter().flat_map(|w| &w.tabs) {
+        if let Some(root) = &tab.root {
+            walk(root, &mut out);
+        }
+        out.extend(tab.floating.iter().filter_map(|(p, _)| p.scrollback.as_deref()));
+    }
+    out
+}
+
+/// Delete the scrollback files of `session` that `snap`, just written, does not name: those of
+/// panes closed since, and of writes cut short.
+pub fn clean_scrollback(session: &str, snap: &SessionSnapshot) {
+    let dir = paths::scrollback_dir(session);
+    let Ok(entries) = std::fs::read_dir(&dir) else { return };
+    let keep = scrollback_files(snap);
+    for e in entries.flatten() {
+        if !keep.contains(e.file_name().to_string_lossy().as_ref()) {
+            let _ = std::fs::remove_file(e.path());
+        }
+    }
+    // Gone once nothing is left in it.
+    let _ = std::fs::remove_dir(&dir);
+}
+
+/// Delete all that is saved of the panes' scrollback of `session`. Whether there was any.
+pub fn forget_scrollback(session: &str) -> std::io::Result<bool> {
+    match std::fs::remove_dir_all(paths::scrollback_dir(session)) {
+        Ok(()) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
+/// Whether the state may name `file` as a pane's scrollback: a plain name in its directory.
+fn scrollback_name(file: &str) -> bool {
+    !file.is_empty()
+        && !file.starts_with('.')
+        && file.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
 }
 
 pub fn load(session: &str) -> Result<Option<SessionSnapshot>> {
@@ -265,6 +340,7 @@ fn spawn(server: &mut Server, p: &PaneSnap) -> Result<PaneId> {
     // An agent that was still waiting for its account waits again, and is resolved again.
     if p.spec.pending_agent.is_some() {
         let id = server.spawn_pane_suspended(p.name.clone(), p.spec.clone(), "choosing the account")?;
+        restore_scrollback(server, id, p);
         server.resolve_pending_agent(id);
         return Ok(id);
     }
@@ -296,6 +372,7 @@ fn spawn(server: &mut Server, p: &PaneSnap) -> Result<PaneId> {
     } else {
         server.spawn_pane(p.name.clone(), spec)?
     };
+    restore_scrollback(server, id, p);
     if let (Some(agent), Some(pane)) = (&p.agent, server.panes.get_mut(&id))
         && p.agent_session.is_some()
     {
@@ -303,6 +380,34 @@ fn spawn(server: &mut Server, p: &PaneSnap) -> Result<PaneId> {
         let _ = agent;
     }
     Ok(id)
+}
+
+/// Show in pane `id` what the pane it replaces showed, before anything its program writes (that
+/// is read later, on the event loop). The file stays the pane's until its text is saved again.
+fn restore_scrollback(server: &mut Server, id: PaneId, p: &PaneSnap) {
+    let Some(file) = p.scrollback.as_deref().filter(|f| scrollback_name(f)) else { return };
+    if !server.config.save_scrollback {
+        return;
+    }
+    let path = paths::scrollback_dir(&server.session).join(file);
+    let text = match paths::read_regular(&path, crate::pane::MAX_SAVED_BYTES as u64) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+        Err(e) => {
+            server.warnings.push(format!("could not show the scrollback saved in {}: {e}", paths::shorten_home(&path)));
+            return;
+        }
+    };
+    let saved_at = std::fs::metadata(&path).and_then(|m| m.modified()).ok().map(crate::text::unix_seconds);
+    let Some(pane) = server.panes.get_mut(&id) else { return };
+    // What the pane's history holds: older lines would only scroll out of it.
+    let lines = server.env.scrollback + usize::from(pane.rows);
+    // A file is one pane's: another naming it gets a new one when its text is saved.
+    if pane.restore_scrollback(&text, saved_at, lines)
+        && !server.scrollback.values().any(|s| s.file.as_deref() == Some(file))
+    {
+        server.scrollback.insert(id, SavedScrollback { file: Some(file.to_string()), taken: Instant::now() });
+    }
 }
 
 #[cfg(test)]
@@ -314,5 +419,24 @@ mod tests {
         assert_eq!(resume_command("claude", "abc-123").as_deref(), Some("claude --resume abc-123\r"));
         assert_eq!(resume_command("claude", "x; rm -rf /"), None);
         assert_eq!(resume_command("aider", "abc"), None);
+    }
+
+    #[test]
+    fn panes_name_their_scrollback_and_older_states_still_load() {
+        let old = r#"{"version":1,"workspaces":[{"name":"w","definition":null,"cwd":null,"active":0,"tabs":[
+            {"name":"","root":{"Pane":{"name":null,"spec":{},"agent":null,"agent_session":null}},
+             "floating":[],"focus":0,"show_floating":false,"zoomed":false,"sync":false}]}]}"#;
+        let mut snap: SessionSnapshot = serde_json::from_str(old).unwrap();
+        assert!(scrollback_files(&snap).is_empty());
+        let Some(NodeSnap::Pane(p)) = &mut snap.workspaces[0].tabs[0].root else { panic!() };
+        p.scrollback = Some("1-2-3.ans".into());
+        let json = serde_json::to_string(&snap).unwrap();
+        let again: SessionSnapshot = serde_json::from_str(&json).unwrap();
+        assert_eq!(scrollback_files(&again), HashSet::from(["1-2-3.ans"]));
+        // Only a plain name in the session's directory is read.
+        assert!(scrollback_name("1-2-3.ans"));
+        for bad in ["", "../x.ans", "a/b", ".hidden", "/etc/passwd"] {
+            assert!(!scrollback_name(bad), "{bad}");
+        }
     }
 }

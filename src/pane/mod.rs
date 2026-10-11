@@ -22,6 +22,7 @@ mod guard;
 mod osc;
 mod pty;
 mod screen;
+mod scrollback;
 
 pub use commands::{Finished, short_duration};
 use osc::sanitize_title;
@@ -33,6 +34,7 @@ pub use pty::{ProcessHold, TermPane};
 pub use screen::render_term;
 pub use screen::set_outer_colors;
 use screen::{SearchState, default_color};
+pub use scrollback::MAX_SAVED_BYTES;
 
 /// Every mode a program may have left set, back to how a fresh terminal starts, without RIS
 /// (which would clear the scrollback a restarted pane keeps): the alternate screen, the kitty
@@ -177,6 +179,8 @@ pub struct Pane {
     /// once the setup succeeds, and waits for Enter when it fails.
     pub preparing: bool,
     search: Option<SearchState>,
+    /// The line that marks where text saved before a restart ends, once it was given back.
+    restored: Option<String>,
 }
 
 /// Environment given to every pane process.
@@ -227,6 +231,7 @@ impl Pane {
             suspended: false,
             preparing: false,
             search: None,
+            restored: None,
         })
     }
 
@@ -253,6 +258,7 @@ impl Pane {
             suspended: false,
             preparing: false,
             search: None,
+            restored: None,
         }
     }
 

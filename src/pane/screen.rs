@@ -287,15 +287,7 @@ impl Pane {
                         (top, bottom)
                     }
                 };
-                let mut out = String::new();
-                for l in start..end {
-                    out.push_str(&row_text(&t.term, Line(l)));
-                    out.push('\n');
-                }
-                let trimmed = out.trim_end_matches('\n').len();
-                out.truncate(trimmed);
-                out.push('\n');
-                out
+                lines_text(&t.term, start, end)
             }
         }
     }
@@ -380,6 +372,19 @@ pub fn url_in_text(line: &str, col: usize) -> Option<String> {
     let begin = ["https://", "http://", "file://", "ftp://"].iter().filter_map(|s| word.find(s)).min()?;
     let url = word[begin..].trim_end_matches(['.', ',', ';', ':', ')', ']', '}', '!', '?']);
     (url.len() > 8).then(|| url.to_string())
+}
+
+/// The text of grid lines `start..end`, a line each, without the blank ones at the end.
+pub(super) fn lines_text<T>(term: &Term<T>, start: i32, end: i32) -> String {
+    let mut out = String::new();
+    for l in start..end {
+        out.push_str(&row_text(term, Line(l)));
+        out.push('\n');
+    }
+    let trimmed = out.trim_end_matches('\n').len();
+    out.truncate(trimmed);
+    out.push('\n');
+    out
 }
 
 pub(super) fn row_text<T>(term: &Term<T>, line: Line) -> String {

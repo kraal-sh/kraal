@@ -407,6 +407,11 @@ pub struct Server {
     preview_loads: std::collections::HashSet<PaneId>,
     /// The thread that writes the session state.
     persister: Sender<persistence::Persist>,
+    /// What is saved of each pane's scrollback.
+    pub scrollback: HashMap<PaneId, persist::SavedScrollback>,
+    /// Starts the names of the scrollback files this server makes, so that none is a file an
+    /// earlier server's state names.
+    scrollback_tag: String,
     /// Writes run logs and the run ledger, in order, off the event loop.
     run_logs: Sender<crate::runbooks::LogJob>,
     pub tunnels: Vec<net::Tunnel>,
@@ -579,6 +584,8 @@ pub fn run(session: &str) -> Result<()> {
         preview_loads: Default::default(),
         pending_opens: Vec::new(),
         persister: spawn_persister(persist_tx),
+        scrollback: HashMap::new(),
+        scrollback_tag: format!("{}-{}", crate::accounts::now(), std::process::id()),
         run_logs: {
             let warn = logs_tx;
             crate::runbooks::spawn_log_writer(move |w| {
@@ -814,7 +821,7 @@ impl Server {
             let agent = argv.as_deref().and_then(detect_agent);
             let mut moved = pane.agent.set_process(agent);
             if pane.agent.kind.is_some() {
-                let screen = pane.text(None);
+                let screen = pane.live_text();
                 let quiet = pane.last_output.elapsed();
                 moved |= pane.agent.observe(&screen, quiet);
             }
@@ -906,6 +913,7 @@ impl Server {
         for id in expired {
             self.close_pane(id);
         }
+        self.save_scrollback(false);
         if self.persist_dirty || self.last_persist.elapsed() > Duration::from_secs(30) {
             self.persist();
         }
@@ -1083,12 +1091,10 @@ impl Server {
     }
 
     fn shutdown(&mut self) {
-        // The last state goes through the writer, after anything it still has to write, and
-        // the server waits for it.
-        if !self.workspaces.is_empty() {
-            let snap = persist::snapshot(self);
-            let _ = self.persister.send(persistence::Persist::Save(self.session.clone(), snap));
-        }
+        // The last state goes through the writer, after anything it still has to write (the
+        // panes' scrollback first), and the server waits for it.
+        self.save_scrollback(true);
+        self.persist();
         let (done, written) = crossbeam_channel::bounded(1);
         let saved = match self.persister.send(persistence::Persist::Stop(done)) {
             Ok(()) => written

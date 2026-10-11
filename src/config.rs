@@ -20,6 +20,12 @@ pub const DEFAULT_CONFIG: &str = r##"# kraal configuration. Every setting is opt
 # Lines of scrollback kept per pane.
 scrollback = 10000
 
+# Save what each pane shows, its scrollback included, so that it shows again after the server
+# restarts (with a dim line marking where the new output starts). It is written to disk, in
+# ~/.local/state/kraal/scrollback, and can hold secrets: false saves nothing and deletes what was
+# saved.
+save_scrollback = true
+
 # A frame around every pane, with its name and what it works on; one cell of space between
 # panes. Without, panes touch and their details go in the top bar.
 pane_frames = true
@@ -226,6 +232,7 @@ prefix = ["ctrl+b"]
 pub struct Config {
     pub shell: Option<String>,
     pub scrollback: usize,
+    pub save_scrollback: bool,
     pub pane_frames: bool,
     pub mouse: bool,
     pub workspace_dirs: Vec<String>,
@@ -372,6 +379,7 @@ mod tests {
     fn defaults_parse() {
         let cfg = Config::default();
         assert_eq!(cfg.scrollback, 10000);
+        assert!(cfg.save_scrollback);
         assert_eq!(cfg.keys.preset, "kraal");
         assert!(cfg.keys.leader.is_empty() && cfg.keys.direct.is_empty(), "the preset has the bindings");
     }
@@ -383,6 +391,7 @@ mod tests {
         )
         .unwrap();
         assert!(!cfg.pane_frames);
+        assert!(!Config::from_user_toml("save_scrollback = false\n").unwrap().save_scrollback);
         assert_eq!(cfg.keys.prefix, vec!["ctrl+a".to_string()]);
         assert!(cfg.keys.direct["new_pane"].is_empty());
         // untouched defaults survive

@@ -57,12 +57,22 @@ impl Env {
     }
 
     fn wait_for_text(&self, pane: &str, text: &str) -> String {
+        self.wait_for(pane, text, |screen| screen)
+    }
+
+    /// Wait for `text` below the line marking what a restart restored, and return that part.
+    fn wait_for_text_since_restore(&self, pane: &str, text: &str) -> String {
+        self.wait_for(pane, text, since_restore)
+    }
+
+    fn wait_for(&self, pane: &str, text: &str, part: impl Fn(&str) -> &str) -> String {
         let start = Instant::now();
         loop {
             let screen = self.run(&["read", "-p", pane]);
+            let seen = part(&screen);
             // A narrow pane wraps long lines: the text may run over two rows.
-            if screen.contains(text) || screen.lines().collect::<String>().contains(text) {
-                return screen;
+            if seen.contains(text) || seen.lines().collect::<String>().contains(text) {
+                return seen.to_string();
             }
             assert!(start.elapsed() < Duration::from_secs(10), "timed out waiting for {text:?} in:\n{screen}");
             std::thread::sleep(Duration::from_millis(50));
@@ -246,6 +256,15 @@ fn write_script(path: &Path, body: &str) {
         .unwrap();
     child.stdin.take().unwrap().write_all(body.as_bytes()).unwrap();
     assert!(child.wait().unwrap().success(), "writing {}", path.display());
+}
+
+/// What a pane shows below the line marking the text a restart restored (all of it without one):
+/// what runs in the pane now wrote that.
+fn since_restore(screen: &str) -> &str {
+    match screen.rfind("kraal: restored from") {
+        Some(at) => screen[at..].split_once('\n').map_or("", |(_, rest)| rest),
+        None => screen,
+    }
 }
 
 fn wait_gone(path: &Path) {
@@ -838,12 +857,100 @@ fn restore_suspends_commands_but_reconnects_ssh() {
     env.wait_for_text("remote", "connected");
     env.run(&["kill"]);
     env.run(&["open", "w"]);
-    env.wait_for_text("srv", "connected admin@db");
-    let screen = env.wait_for_text("deploy", "restored session");
+    // What each pane printed before shows above the restore marker; what runs now writes below.
+    env.wait_for_text_since_restore("srv", "connected admin@db");
+    assert!(env.run(&["read", "-p", "deploy"]).contains("DEPLOYED"), "what it printed before shows");
+    let screen = env.wait_for_text_since_restore("deploy", "restored session");
     assert!(!screen.lines().any(|l| l.trim() == "DEPLOYED"), "the command must not run again by itself:\n{screen}");
     // An ssh that runs a command on the server is a command too, not a shell to reconnect.
-    let screen = env.wait_for_text("remote", "restored session");
+    let screen = env.wait_for_text_since_restore("remote", "restored session");
     assert!(!screen.contains("connected"), "the remote command must not run again by itself:\n{screen}");
+}
+
+#[test]
+fn scrollback_survives_a_server_restart() {
+    use std::os::unix::fs::PermissionsExt;
+    let env = Env::new("scrollback");
+    env.workspace("w", "layout {\n    pane name=\"shell\"\n}\n");
+    env.run(&["open", "w"]);
+    // More lines than the screen holds, then a coloured line with wide characters.
+    env.run(&["send", "-p", "shell", "--enter", "seq 1 300; printf '\\033[31m%s\\033[0m 日本\\n' red-$((6*7))"]);
+    env.wait_for_text("shell", "red-42 日本");
+    env.run(&["kill"]);
+    // Saved with its colours, for the user's eyes only.
+    let dir = env.root.join("state/kraal/scrollback/scrollback");
+    let files: Vec<PathBuf> = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().path()).collect();
+    assert_eq!(files.len(), 1, "{files:?}");
+    let saved = std::fs::read_to_string(&files[0]).unwrap();
+    assert!(saved.contains("\x1b[0;31mred-42\x1b[0m 日本"), "{saved:?}");
+    assert_eq!(std::fs::metadata(&files[0]).unwrap().permissions().mode() & 0o777, 0o600);
+    assert_eq!(std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777, 0o700);
+    // Back after the restart, history included, with what the new shell writes below a marker.
+    env.run(&["open", "w"]);
+    let screen = env.run(&["read", "-p", "shell"]);
+    assert!(screen.contains("red-42 日本") && screen.contains("kraal: restored from"), "{screen}");
+    let all = env.run(&["read", "-p", "shell", "--lines", "1000"]);
+    assert!(all.lines().any(|l| l == "1"), "{all}");
+    env.run(&["send", "-p", "shell", "--enter", "echo after-$((1+1))"]);
+    env.wait_for_text_since_restore("shell", "after-2");
+    // Restarted again: both restores show, in order.
+    env.run(&["kill"]);
+    env.run(&["open", "w"]);
+    let all = env.run(&["read", "-p", "shell", "--lines", "1000"]);
+    let at = |text: &str, from: usize| match all[from..].find(text) {
+        Some(i) => from + i,
+        None => panic!("no {text:?} after byte {from} of:\n{all}"),
+    };
+    let first = at("kraal: restored from", at("red-42 日本", at("300", 0)));
+    at("kraal: restored from", at("after-2", first));
+    // `kraal forget` deletes it with the layout.
+    env.run(&["kill"]);
+    env.run(&["forget"]);
+    assert!(!dir.exists() && !env.state_file().exists());
+    // Turned off, what was saved goes, and nothing is saved any more.
+    env.run(&["open", "w"]);
+    env.run(&["send", "-p", "shell", "--enter", "echo secret-$((2+2))"]);
+    env.wait_for_text("shell", "secret-4");
+    env.run(&["kill"]);
+    assert!(dir.exists());
+    let config = env.root.join("config/kraal/config.toml");
+    let base = std::fs::read_to_string(&config).unwrap();
+    std::fs::write(&config, format!("{base}save_scrollback = false\n")).unwrap();
+    env.run(&["open", "w"]);
+    let screen = env.run(&["read", "-p", "shell"]);
+    assert!(!screen.contains("secret-4") && !screen.contains("restored from"), "{screen}");
+    env.run(&["kill"]);
+    assert!(!dir.exists());
+}
+
+/// A server that dies without stopping (a crash) saved what its panes showed shortly before.
+#[cfg(target_os = "linux")]
+#[test]
+fn scrollback_survives_a_crash() {
+    let env = Env::new("crash");
+    env.workspace("w", "layout {\n    pane name=\"shell\"\n}\n");
+    env.run(&["open", "w"]);
+    env.run(&["send", "-p", "shell", "--enter", "echo before-$((3*3))"]);
+    env.wait_for_text("shell", "before-9");
+    // Written while the pane prints, then named by the state.
+    let dir = env.root.join("state/kraal/scrollback/crash");
+    let saved = || {
+        let files = std::fs::read_dir(&dir).into_iter().flatten().flatten();
+        files.filter(|e| std::fs::read_to_string(e.path()).unwrap_or_default().contains("before-9")).count() == 1
+    };
+    let named = || std::fs::read_to_string(env.state_file()).unwrap_or_default().contains(".ans\"");
+    let start = Instant::now();
+    while !(saved() && named()) {
+        assert!(start.elapsed() < Duration::from_secs(10), "the scrollback was not saved while the server ran");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let pid = env.server_pid().expect("the server's pid");
+    // SAFETY: plain syscall.
+    unsafe { libc::kill(pid, libc::SIGKILL) };
+    wait_gone(&PathBuf::from(format!("/proc/{pid}")));
+    env.run(&["open", "w"]);
+    let screen = env.run(&["read", "-p", "shell"]);
+    assert!(screen.contains("before-9") && screen.contains("kraal: restored from"), "{screen}");
 }
 
 #[test]

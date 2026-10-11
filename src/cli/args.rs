@@ -56,7 +56,7 @@ pub enum Cmd {
     Ls,
     /// Stop a session's server; its layout is saved for next time.
     Kill,
-    /// Forget a session's saved layout.
+    /// Forget a session's saved layout and scrollback.
     Forget,
     /// List workspaces: open ones and definitions on disk.
     #[command(alias = "ws")]

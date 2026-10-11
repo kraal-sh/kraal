@@ -22,6 +22,17 @@ again. After a restart of the server or a reboot, the processes are gone, but kr
 layout, reconnects SSH shells and resumes agent conversations; other commands wait for Enter
 before they run again.
 
+Each pane also shows again what it showed, scrollback and colours included, down to a dim
+`kraal: restored from <time>` line; what runs in it now writes below that line. Copy mode and
+search reach the restored text. A full-screen program (an editor, `htop`) is not saved: its pane
+comes back with the text from before it started. kraal saves this text when the server stops, and
+every 10 seconds or so while a pane prints, so a crash loses little.
+
+This text is written to disk, readable by you alone, in `~/.local/state/kraal/scrollback/<session>/`,
+and it can hold secrets (a token printed by a command, a password echoed by mistake):
+`save_scrollback = false` in the config stops saving it and deletes what was saved.
+`kraal forget` deletes the saved layout and scrollback of a stopped session.
+
 ## Workspace files
 
 Workspaces live in `~/.config/kraal/workspaces/*.kdl`, in KDL:

@@ -6,6 +6,7 @@ config only needs the keys it changes:
 ```toml
 pane_frames = true
 mouse = true
+save_scrollback = true   # panes show their text again after a restart; it is written to disk
 
 [sidebar]
 visible = true
@@ -28,8 +29,13 @@ toggle_floating = ["alt+f"]
 `kraal config check` validates the config, every workspace file, `accounts.toml` and
 `servers.toml`; it fails when one cannot be read. `kraal config reload` makes the running session
 read the config again: keys, theme, sidebar, mouse, pane frames, notifications, tools, hints, hooks,
-production words and contexts apply at once; panes already open keep their shell and scrollback
-length.
+production words, contexts and saving scrollback apply at once; panes already open keep their
+shell and scrollback length.
+
+`save_scrollback` saves what each pane shows, its scrollback included, in
+`~/.local/state/kraal/scrollback`, so that panes show it again after a restart (see
+[Persistence](workspaces.md#persistence)). Scrollback can hold secrets: `false` saves none and
+deletes what was saved.
 
 `[worktrees]` prepares the worktrees kraal makes for agents, in every repository, and numbers
 their ports (see [worktrees](agents.md#worktrees)):
