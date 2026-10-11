@@ -3,15 +3,16 @@
 A terminal workspace manager for people who live in many SSH sessions and run coding agents.
 
 kraal is a multiplexer in the tradition of tmux and Zellij that runs inside your terminal
-(Ghostty, kitty, WezTerm, iTerm2, …). It brings together three ideas that were spread across
-different tools:
+(Ghostty, kitty, WezTerm, iTerm2, …). It brings together what was spread across different tools:
 
 - **Workspaces you declare once** (from Wave and Zellij): a file lists your servers, kraal opens
-  one pane per server, laid out the way you want. Zellij layout files work as they are.
+  one pane per server, laid out the way you want. Zellij layout files work for their common part:
+  panes, tabs, splits, commands, directories (templates, swap layouts and plugin panes are
+  skipped with a warning).
 - **Agent awareness** (from herdr): kraal knows which panes run Claude Code, Codex and other
-  agents, and whether each one is working, blocked on a question, or done — in the sidebar, the
-  tab bar and as desktop notifications. One key jumps to the next agent that needs you.
-- **Your servers, one keystroke away**: an inventory of every machine you SSH to (filled from your
+  agents, and whether each one is working, waiting for you, or done — in the sidebar, the tab bar
+  and as desktop notifications. One key jumps to the next agent that needs you.
+- **Your servers at hand**: an inventory of every machine you SSH to (filled from your
   workspaces, `~/.ssh/config`, and every `ssh` you type), grouped, with a picker that opens one
   server or a whole group in a grid. Copy files local ↔ server or server ↔ server with `kraal cp`,
   or by dropping a file on an SSH pane.
@@ -24,21 +25,32 @@ different tools:
   remove it from kraal.
 - **Fleet tools**: run a command on a whole group of servers at once, follow logs on every server
   in a grid, keep SSH tunnels open, and see the dev servers your panes started.
-- **Persistence and a real UI**: sessions keep running when you close the terminal; a restart or
-  a reboot brings the layout back, reconnects command panes and resumes agent conversations.
-  Mouse support, floating panes, zoom, scrollback search, a fuzzy workspace picker, rich preview
-  panes.
+- **Tools where you work, and a production guard**: lazygit, k9s, htop, the logs… open on the
+  focused pane's server or in its directory. Frames show each pane's Kubernetes context, Terraform
+  workspace and AWS profile; production panes are red, and kraal asks before broadcast typing or a
+  multi-line paste reaches them (based on the names it detects, see below).
+- **Hints**: label the links, paths, commits, IPs, servers and pods on screen; a label copies it,
+  or acts on it (open, edit at the line, `git show`, ssh, pod logs).
+- **Runbooks**: procedures kept as files, yours or a repository's. kraal shows the plan, runs the
+  steps server by server, stops at the first failure and logs everything each step printed;
+  Markdown runbooks run their shell blocks one at a time, as you read.
+- **Events and hooks**: `kraal events` streams what happens (agents, exits, SSH, production,
+  tunnels, runbooks) as JSON lines, and `[hooks]` runs a command on any of them.
+- **Persistence and a real UI**: sessions keep running when you close the terminal. After a
+  restart or a reboot, the processes are gone but kraal rebuilds the layout, reconnects SSH
+  shells and resumes agent conversations; other commands wait for Enter.
+  Mouse support, floating panes, zoom, scrollback search, rich preview panes.
 
 ```
- prod   1:servers ▲   2:agents ✓   +                                     ▲1 ✓1  main
+ prod   1 web01 ▲   2 agents ✓   +                                       ▲1 ✓1  main
  WORKSPACES              ┏ web01 ━━━━━━━━━━━━━━━━━━━━━━━━┓╭ api ───── ▲ claude blocked ╮
- ▸ prod 46 ▲1            ┃admin@web01:~$                 ┃│ Do you want to proceed?      │
+ ▸ prod ▲1               ┃admin@web01:~$                 ┃│ Do you want to proceed?      │
      ▲ claude api        ┃                               ┃│ ❯ 1. Yes                     │
      ✓ codex docs        ┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛╰──────────────────────────────╯
-   staging 12            ╭ web02 ────────────────────────╮╭ docs ──────── ✓ codex done ╮
+   staging               ╭ web02 ────────────────────────╮╭ docs ──────── ✓ codex done ╮
  NOT RUNNING             │admin@web02:~$                 ││ ● Updated README.md          │
    lab                   │                               ││ >                            │
- NORMAL  ctrl+b prefix  alt+n new pane  alt+o workspaces  alt+a next agent  ctrl+b ? help
+ ▲ 1 agent needs you  alt+a go                                                ctrl+b menu
 ```
 
 ## Install
@@ -59,48 +71,62 @@ kraal perso                   # attach and open the workspace "perso"
 kraal integration install     # optional: exact agent states via Claude Code / Codex hooks
 ```
 
-Inside kraal, `ctrl+b ?` shows every key. The defaults:
+## Keys
 
-| Keys | Action |
+One key to remember: **`ctrl+b`** opens a menu of commands. Press it, let go, and the menu
+shows what each next key does; press that key (or click it).
+Commands are grouped by what they act on, so a key means the same thing everywhere (`n` new,
+`e` rename, `x` close, arrows move, Enter opens the group's list):
+
+| After `ctrl+b` | |
 |---|---|
-| `alt+n` | new pane (splits along the longer side) |
-| `alt+h/j/k/l`, `alt+arrows` | move focus (left/right at the edge switch tabs) |
-| `alt+o` | workspace picker (open, switch, create, `ctrl+x` close) |
-| `alt+a` | jump to the next agent that is blocked or done |
-| `alt+g` | agents: start Claude, Codex… on a chosen account, with each account's usage |
-| `ctrl+b A` | continue the focused agent's conversation on another account |
-| `alt+f`, `ctrl+b t` | show/hide floating panes |
-| `ctrl+b %` / `ctrl+b "` | split right / down |
-| `ctrl+b z` | zoom the focused pane (fullscreen) |
-| `ctrl+b x` | close pane |
-| `ctrl+b c`, `n`, `p`, `1`…`9` | new tab, next, previous, go to tab |
-| `ctrl+b s` | servers: connect to one, or open a whole group in a grid |
-| `ctrl+b f` | file manager: two panels, local and servers |
-| `ctrl+b R` | worktree: review, commit, pull request, merge, remove |
-| `ctrl+b U` / `ctrl+b D` | upload to / download from the focused pane's server |
-| `ctrl+b /` | search the scrollback (`n`/`N` for older/newer matches) |
-| `ctrl+b g` | find any pane across workspaces |
-| `ctrl+b y` | sync typing: this tab → whole workspace → off |
-| `ctrl+b m`, ctrl+click a title | mark panes: typing goes to the marked ones |
-| `ctrl+b [` | copy mode: vi keys (`hjkl w b 0 $ g G`), `v`/`V` select, `y` copy, `/` search |
-| `ctrl+b e` | preview a file in a pane |
-| `ctrl+b S` | save the current layout as a workspace file |
-| `ctrl+b d` | detach |
+| `n` · `x` · `z` | new pane · close pane · zoom pane |
+| arrows · `1`…`9` | focus the pane on that side · go to a tab |
+| `space` | search every command by what it does (and see its keys) |
+| `h` | help: every key, from your configuration |
+| `d` | detach (programs keep running) |
+| `p` | **panes**: `→`/`↓` split, `e` rename, `r` resize with the arrows, `f` floating, `p` find |
+| `t` | **tabs**: `n` new, `←`/`→` previous/next, `e` rename, `x` close |
+| `w` | **workspaces**: `w` choose, `n` new, `←`/`→`, `e` rename, `s` save layout, `x` close |
+| `a` | **agents**: `a` start one on an account, `n` next agent needing you, `c` change account |
+| `s` | **servers**: `s` connect (or a group in a grid), `u` upload, `d` download, `e` edit |
+| `f` | **files**: `f` file manager, `u`/`d` upload/download, `p` preview a file |
+| `r` | **run**: `r` tools, `b` runbooks, `g` git and worktrees |
+| `v` | **view**: `c` copy mode, `s` search the output, `h` hints, `f` floating panes, `b` sidebar, `m` messages |
+| `b` | **broadcast** typing: `m` select this pane, `s` to the selected ones, `t` this tab, `w` this workspace, `o` stop |
+| `ctrl+b` | type `ctrl+b` itself |
 
-The mouse works too: click to focus panes, tabs, workspaces and agents; drag borders to resize;
-drag floating panes by their title; wheel to scroll back; drag to select and copy (double click
-selects a word, triple click a line); Ctrl+click opens a link (OSC 8 links stay clickable, and
-plain URLs work too). Hold Shift to use your terminal's own selection.
+Without the prefix: `alt+arrows` move the focus (left/right at the edge go to the next tab),
+`alt+n` opens a new pane, `alt+a` jumps to the next agent that needs you.
 
-Keys reach programs unambiguously: kraal speaks the kitty keyboard protocol with terminals that
-support it (Ghostty, kitty, WezTerm, foot…) and passes it on to programs that ask for it, so
-Shift+Enter, Ctrl+Enter or Esc arrive as such (Claude Code's Shift+Enter makes a new line).
+In lists, type to filter, `↑↓` move, Enter chooses, **Tab shows what else can be done** with the
+selected item (connect in a new tab, browse its files, run a command…), Esc closes. Text fields edit
+like a shell line (arrows, `home`/`end`, `alt+←→`, `ctrl+w`, `ctrl+u`, `ctrl+k`). Questions show
+two buttons, Cancel first: `y` answers yes, `n` or Esc no, Enter takes the selected button.
+`ctrl+b v m` lists the messages kraal showed, warnings included.
+
+Used to tmux? `[keys] preset = "classic"` brings back tmux-style single keys (`%` `"` `c` `n` `p`
+`o` `s`…), still with the menu. Any command can be rebound (`kraal config keys` lists them all).
+
+The mouse works too: click to focus panes, tabs, workspaces and agents (a click on the workspace
+name opens the list); drag borders to resize; drag floating panes by their title; wheel to scroll
+back; drag to select and copy (double click selects a word, triple click a line); Ctrl+click opens
+a link (OSC 8 links stay clickable, and plain URLs work too). Hold Shift to use your terminal's own
+selection.
+
+Keys reach programs unambiguously: kraal asks terminals that support the kitty keyboard protocol
+(Ghostty, kitty, WezTerm, foot…) for its first level (disambiguated keys) and passes it on to
+programs that ask for it, so Shift+Enter, Ctrl+Enter or Esc arrive as such (Claude Code's
+Shift+Enter makes a new line). Key release events and the protocol's other levels are not passed
+on yet.
 
 ## Concepts
 
 - A **session** is one background server (`kraal -s work` for another one). It owns the processes;
   clients attach and detach.
-- A session holds **workspaces** (listed in the sidebar), each with **tabs**, each with **panes**:
+- A session holds **workspaces** (listed in the sidebar, which shows up once there is more than
+  the one workspace to see: other workspaces, agents, ports, tunnels), each with **tabs** (named
+  after their focused pane until you rename them), each with **panes**:
   tiled, or floating on top.
 - A pane is a terminal (a shell, or a command such as `ssh host`), or a **preview** of a file:
   rendered Markdown, an image, text, or a directory listing. Previews reload when the file changes.
@@ -132,8 +158,10 @@ layout {
 
 `split_direction="vertical"` places children side by side, `"horizontal"` stacks them. Sizes are
 percentages or cells. kraal adds two pane properties: `agent="<name>"` starts an agent in a shell,
-and `preview="<path>"` shows a file. `ctrl+b S` or `kraal save <name>` writes the current layout
-back as a file.
+and `preview="<path>"` shows a file. `ctrl+b w s` or `kraal save <name>` writes the current layout
+back as a file (`<name>.kdl` in the definitions directory; the file it replaces is kept as
+`.kdl.bak`). An agent started on an account is saved as `agent="claude:pro"` with its arguments,
+and a command that has not run yet keeps `start_suspended=true`.
 
 ## Servers and file transfers
 
@@ -144,8 +172,10 @@ kraal keeps an inventory in `~/.config/kraal/servers.toml`:
 name = "db"
 host = "db.lan"
 user = "admin"
-port = 2222          # optional
-jump = "bastion"     # optional ProxyJump, by name or user@host
+port = 2222          # optional; without it, ~/.ssh/config decides (so 22 is not the same as none)
+jump = "bastion"     # optional ProxyJump, by name or user@host; a jump host with its own key works too; "none" turns off one from ~/.ssh/config
+identity = "~/.ssh/db"  # optional; more_identities = ["~/.ssh/other"] for keys tried after it
+                        # ("IdentityFile=%d/.ssh/%h" passes ssh's option, tokens and all, not -i)
 groups = ["prod"]
 ```
 
@@ -162,8 +192,9 @@ kraal ssh db                           # plain ssh, resolved from the inventory
 kraal ssh prod --group                 # every server of "prod" in a grid of panes
 ```
 
-`ctrl+b s` opens the same list: Enter connects (or opens a whole group), `ctrl+t` in a new tab,
-`ctrl+e` edits the list, `ctrl+x` forgets a saved server.
+`ctrl+b s s` opens the same list: Enter connects (or opens a whole group); Tab shows the other
+actions: connect in a new tab, browse its files, run a command, forward a port, edit the list,
+remove a saved server.
 
 Copying files works in every direction and reuses the SSH connection of open panes:
 
@@ -171,35 +202,50 @@ Copying files works in every direction and reuses the SSH connection of open pan
 kraal cp report.pdf db:/tmp/           # upload (files and directories)
 kraal cp db:/var/log/app.log .         # download
 kraal cp web:/srv/data db:~/backup/    # server to server, streamed through this machine
-kraal cp --move a.tar db:/srv/         # copy, then delete the source
-kraal cp --dry-run …                   # show the rsync/scp/ssh commands
+kraal cp --move a.tar db:/srv/         # copy, then delete what was copied
+kraal cp --dry-run …                   # show the rsync/tar/ssh commands
 kraal rm db:/tmp/old.tar               # delete, locally or on a server
 ```
 
-`ctrl+b f` opens a two-panel file manager (Midnight Commander style) on the focused pane's
+A move deletes only what rsync copied (a file is compared by content), renames instead on one file
+system, and refuses when the destination is the source itself, even seen through a link or a
+server that shares this machine's files. On a server, a move between two file systems is refused:
+copy, then delete.
+
+`ctrl+b f f` opens a two-panel file manager (Midnight Commander style) on the focused pane's
 directory and, for an SSH pane, its server; `kraal files ~/Dev db:/var/log` from the command line.
 Each panel shows this machine or any server (`o` to choose). `space` marks, `c` copies to the
-other panel, `m` moves, `d` deletes, `enter` opens a directory or previews a local file, `s` opens
-a shell there, `/` filters. Transfers run in a small window that closes itself when done.
+other panel (it asks first when that would replace files there, and what you did not agree to
+replace is never replaced, even if it appears during the copy: that copy then waits in a hidden
+`.kraal-stage-…` directory in the destination, and kraal never removes one it cannot tell is over
+— a move's, the only copy of what it moved, is named instead; a directory is put in place by a
+rename that keeps it whole (owner, permissions, ACLs), which on a server takes GNU coreutils 8.30
+or later: elsewhere such a copy says so before it starts), `m` moves, `d` deletes, `enter`
+opens a directory or previews a local file, `s` opens a shell there, `/` filters. Selected files
+carry a ✓. Transfers run in a small window that closes itself when done.
 
 Drop a file from your file manager on an SSH pane and kraal offers to upload it to that server
-(Esc pastes the path instead, as usual). `ctrl+b D` downloads a path from the pane's server
+(`ctrl+p` pastes the path instead). `ctrl+b s d` downloads a path from the pane's server
 (the selected text is prefilled), into `~/Downloads` by default.
 
 ## Git and worktrees
 
-Panes in a git repository show their branch in their frame (`⎇ main* ↑2`: changes, commits ahead).
+Panes in a git repository show their branch in their frame (`⎇ main*? ↑2`: `*` changes, `?`
+untracked files, commits ahead).
 
-The agent picker (`alt+g`) offers to start an agent **in a new worktree**: kraal creates a branch
+The agent picker (`ctrl+b a a`) offers to start an agent **in a new worktree**: kraal creates a branch
 `kraal/<name>` and a directory next to the repository (`<repo>.worktrees/<name>`), and starts the
 agent there in its own tab. Several agents can work on the same repository without stepping on each
-other. `ctrl+b R` in that tab reviews the changes (your pager, delta included), commits them, opens
-a pull request (`gh`), merges into the base branch or removes the worktree.
+other. `ctrl+b r g` in that tab reviews the changes (your pager, delta included), commits them, opens
+a pull request (`gh`), merges into the base branch or removes the worktree. Removing says first
+what would be lost (uncommitted changes, commits the base does not have) and which panes it
+closes. Account rules written for the repository also apply in its worktrees.
 
 ```sh
 kraal wt new fix-login --agent claude   # the same from the command line
 kraal wt list
-kraal wt rm fix-login [--force]
+kraal wt rm fix-login              # refuses if it would lose changes or unmerged commits
+kraal wt rm fix-login --force      # removes anyway
 ```
 
 ## Fleet tools
@@ -211,14 +257,197 @@ kraal ssh @prod --group -- journalctl -fu nginx  # one pane per server running i
 kraal tunnel add db 5432                         # localhost:5432 → db's 5432, kept open
 kraal tunnel add bastion db.internal:5432 --local 15432
 kraal tunnel list
+kraal tunnel rm 15432                            # by local port (`#7` for the tunnel with id 7)
 ```
 
-In the server picker (`ctrl+b s`), `ctrl+r` runs a command on the selected server or group and
-`ctrl+o` forwards one of its ports. Tunnels come back after a restart and reconnect when the network
+In the server picker (`ctrl+b s s`), Tab then "Run a command" runs one on the selected server or
+group, and "Forward one of its ports" opens a tunnel. Tunnels come back after a restart and reconnect when the network
 drops; the sidebar lists them (click copies `localhost:PORT`, ctrl+click opens it in the browser).
 
 Ports that programs in your panes announce (`http://localhost:5173`) and listen on show up in the
 sidebar under PORTS; a click opens them.
+
+## Tools and contexts
+
+`ctrl+b r r` lists tools and starts one in a floating pane **where the focused pane is**: on its
+server over SSH (the shared connection makes it instant), or here in its directory. From an SSH pane
+on `web01`, `htop` shows web01's processes; from a local pane in a repository, `lazygit` opens on
+that repository. kraal ships lazygit, k9s, htop, logs (`journalctl -f`), docker and disk; tools that
+run here are hidden when their program is not installed. Add your own in the config:
+
+```toml
+[tools.pods]
+description = "pods of the pane's cluster and namespace"
+command = "kubectl get pods -o wide"
+on = "local"               # always here, with the pane's KUBECONFIG and AWS_PROFILE
+when = ["kubernetes"]      # only offered where a Kubernetes context is known
+hold = true                # keep the output on screen
+key = "i"                  # ctrl+b r i starts it directly
+
+[tools.show]
+command = 'git show "$KRAAL_SELECTION"'
+when = ["git", "selection"]
+```
+
+A tool gets the pane's context in `$KRAAL_CWD`, `$KRAAL_SERVER`, `$KRAAL_HOST`, `$KRAAL_REPO`,
+`$KRAAL_BRANCH`, `$KRAAL_KUBE_CONTEXT`, `$KRAAL_KUBE_NAMESPACE`, `$KRAAL_TF_WORKSPACE`,
+`$KRAAL_AWS_PROFILE`, `$KRAAL_SELECTION` and `$KRAAL_PRODUCTION`. A tool started on a server runs
+in the pane's directory there when the remote shell reports it (OSC 7), and fails rather than run
+elsewhere if that directory is gone. A tool that fails stays open to
+show why. `kraal config default` documents every field.
+
+Frames show what a pane works on besides its branch: the Terraform workspace of a directory where
+`terraform init` ran (`tf:prod`, or `TF_WORKSPACE`), the Kubernetes context and namespace of the
+last kubectl, k9s, helm… run in the pane (`⎈ prod-eks/payments`: its `--context`, `--namespace`
+and `--kubeconfig`, else the kubeconfig's current context, following `kubectx`), and the profile
+of the last aws, terraform, cdk… run (`--profile`, else `AWS_PROFILE`; nothing for the default
+profile). Local tools started from the pane use that same kubeconfig and profile. kraal reads
+kubeconfig files and the processes' command lines and environments; it never runs these programs
+itself. Commands are seen by looking a few times a second: one that ends in a split second can go
+unnoticed until the next.
+
+**Production.** A pane is production when its server, Kubernetes context or namespace, Terraform
+workspace or AWS profile has `prod`, `production` or `prd` as a word of its name (`web-prod-1`,
+`prod-eks`, `db.prod.lan`; not `products-api`), or when its server says `env = "prod"` in
+`servers.toml` (`kraal servers add … --env prod`; a server with another `env` never is). Production
+panes get a red frame and a PROD badge, and kraal asks before:
+
+- broadcast typing reaches a production pane (once per pane and production reason, until the
+  broadcast stops; no stops it);
+- several lines are pasted into a production program that would run them as they arrive (a shell
+  in bracketed paste mode shows them first, so it is not asked);
+- a tool starts on a production pane, unless the tool says `read_only = true` (htop, logs…);
+- a runbook runs on production targets (its plan says which).
+
+Scripts and agents get no prompt: `kraal send` and `kraal keys` refuse a production pane unless
+given `--production`. The `[production]` section changes the words or turns the questions off.
+This guard is a safety net based on names, not a permission system.
+
+## Hints
+
+`ctrl+b v h` puts a short label on everything kraal recognises in the focused pane: links, paths
+(`src/main.rs:42`), commits, `host:port` addresses, IPs and known servers, Kubernetes pods, UUIDs.
+The pane holds still meanwhile. Type a label to copy that text; press Tab first to act on it
+instead, where the pane is:
+
+| What | Tab, then the label |
+|---|---|
+| link | open it in your browser |
+| path | open it in `$EDITOR`, at its line |
+| commit (or container id) | `git show` in the pane's repository (or `docker logs -f`) |
+| `host:port` | open it; a port of the pane's server is reached through a new tunnel |
+| IP, server | ssh to it |
+| pod | `kubectl logs -f` with the pane's context and namespace |
+| UUID | type it into the pane |
+
+Your own patterns run a tool with the match in `$KRAAL_SELECTION`:
+
+```toml
+[hints.patterns.ticket]
+pattern = 'OPS-\d+'
+tool = "jira"               # a [tools.jira] that opens the ticket
+```
+
+## Runbooks
+
+A runbook is a procedure kept as a file: yours in `~/.config/kraal/runbooks/`, a repository's in
+its `.kraal/runbooks/` (shared with the code). `ctrl+b r b` lists both; `kraal runbook new <name>`
+starts one from a template.
+
+**Steps (TOML).** Steps, parameters, and where it runs:
+
+```toml
+description = "Check the nginx configuration, reload it, check the service"
+on = "server"            # "local", "pane" (where the focused pane is) or "server" (asked)
+rolling = 1              # servers at a time (0: all at once)
+stop_on_failure = true
+steps = [
+  "sudo nginx -t",
+  "sudo systemctl reload nginx",
+  "systemctl is-active nginx",
+]
+
+[[param]]
+name = "TICKET"
+prompt = "Ticket"
+default = "$KRAAL_BRANCH"            # the focused pane's variables work here
+# choices = ["a", "b"] or choices_command = "git tag --sort=-v:refname | head"
+```
+
+kraal asks for the server or group (the focused pane's server first) and the parameters, then
+shows the plan: where, how many at a time, the parameters, the steps, and which targets are
+production. On yes, a new tab gets one pane per server; the steps run in order, each announced,
+`rolling` servers at a time.
+
+Steps run with `set -e` (and `pipefail` where the shell has it): the first command that fails
+fails the step, as in a script, and steps share the shell, so a `cd` carries on. With
+`stop_on_failure = true` (the default), a failure stops the run: the servers still waiting are
+marked skipped and never touched. `timeout = "10m"` stops a server that takes longer. Closing a
+pane of the run stops what has not started; servers already running finish. Each run is logged in
+`~/.local/state/kraal/runs/`: who, where, parameters, steps, and everything each server printed
+(written as it comes, colours removed, a progress bar in its last state), with the result. If kraal
+stops in the middle, the next start says in the log which servers were left unfinished.
+Parameters marked `secret = true` are masked in plans, logs and events, and reach the command
+without going through a command line, the saved session or ssh's arguments (on a server, through
+ssh's input into a private file the command deletes); what the command itself prints is logged as
+printed, so do not echo them.
+
+```sh
+kraal runbook list
+kraal runbook run reload-nginx --on @prod -p TICKET=OPS-12   # shows the full plan, asks
+kraal runbook run reload-nginx --on @prod --yes --wait       # for scripts: fails if a server did
+kraal runbook run deploy --dry-run                           # the plan only
+kraal runbook new restart-api --markdown --repo
+```
+
+**Documents (Markdown).** A Markdown runbook is read like any document. `ctrl+b r b` opens it next to
+the focused pane and lists its shell blocks (```` ```sh ````, `bash`, `console`…); enter sends a
+block to that pane and runs it, and `ctrl+b r b` again offers the next one. kraal refuses while a
+program other than the shell runs in that pane (the block would go to it). It knows a block was
+sent, not whether it succeeded: watch the pane. Your existing procedure docs become runnable
+without being rewritten.
+
+A runbook from a repository runs nothing (not even a `choices_command`) before you have approved
+that version of it; kraal asks again when it changes. On the command line, the run is refused if
+the runbook, its targets or its parameters changed between the plan you read and your yes.
+
+## Events and hooks
+
+```sh
+kraal events                       # everything, as JSON lines
+kraal events agent.* pane.failed   # some types (kraal events --list)
+kraal events --since 1200          # first what came after event 1200, if still kept
+```
+
+```
+{"v":1,"seq":1201,"boot":1760184000000,"type":"agent.blocked","pane":12,"name":"api","workspace":"dev","agent":"claude",…}
+{"v":1,"seq":1202,"boot":1760184000000,"type":"pane.failed","pane":7,"name":"tests","code":1,"command":["cargo","test"],…}
+{"v":1,"seq":1203,"boot":1760184000000,"type":"ssh.started","pane":3,"server":"web-prod-1","host":"deploy@web-prod-1","production":true,…}
+```
+
+Types: `workspace.opened/closed`, `pane.opened/exited/failed/closed`, `agent.working/blocked/done/
+idle`, `ssh.started/ended` (an `ssh` process appeared or ended in a pane, whether or not it got
+connected), `production.entered/left` (`entered` again when the reason changes),
+`notification`, `tunnel.up/down`, `port.opened/closed`, `account.limit`,
+`runbook.started/finished`.
+
+`seq` grows with each event and `boot` changes when the server restarts. The server keeps the last
+1024 events: a script that was too slow (kraal drops it rather than slow down) or restarted can
+come back with `--since` its last `seq`; an `events.lost` line says when some are gone.
+
+`[hooks]` runs a command when one happens, with the event in `$KRAAL_EVENT_JSON` and its fields as
+`$KRAAL_<FIELD>`; output goes to `~/.local/state/kraal/hooks.log`:
+
+```toml
+[hooks]
+"agent.blocked" = 'curl -s -d "$KRAAL_AGENT needs you in $KRAAL_NAME" ntfy.sh/my-topic'
+"pane.failed" = 'notify-send "$KRAAL_NAME failed ($KRAAL_CODE)"'
+"ssh.started" = 'logger -t kraal "ssh $KRAAL_HOST production=$KRAAL_PRODUCTION"'
+```
+
+At most 20 hooks start per second and 32 run at once; a hook running for 10 minutes is stopped
+with everything it started; 64 KiB of each hook's output are kept. Hooks and scripts reading the
+stream run as you, like any script: kraal does not sandbox them.
 
 ## Remote sessions
 
@@ -230,7 +459,8 @@ kraal remote-install db                # copy this binary to db:~/.local/bin (sa
 kraal attach --host db                 # attach to db's kraal; ctrl+c gives up while reconnecting
 ```
 
-Ctrl+click on a link in a remote session opens it on your machine.
+Ctrl+click on a link in a remote session opens it on your machine. A `localhost` address there is
+the server's, not yours: kraal copies it and says so instead of opening the wrong page.
 
 ## Coding agents
 
@@ -249,7 +479,10 @@ The hooks do nothing outside kraal. States are shown with icons: `●` working, 
 looking at triggers a desktop notification through your terminal (OSC 777/9) or `notify-send`.
 
 When the server restarts, panes that ran an agent with a known session resume it
-(`claude --resume <id>`, `codex resume <id>`).
+(`claude --resume <id>`, `codex resume <id>`). A prompt given on the command line is never sent
+again, and a one-shot run (`claude -p`, `codex exec`) is not resumed. When kraal cannot tell an
+option's value from a prompt (an option it does not know), the pane shows the command and waits:
+Enter runs it as shown. The same goes for Enter on an ended agent and for an account switch.
 
 ## Agent accounts
 
@@ -289,11 +522,16 @@ agent = "claude"
 accounts = ["pro", "default"]   # in order of preference
 ```
 
-A new agent starts on the first account of the matching rule that is under its threshold. When
+A new agent starts on the first account of the matching rule that is under its threshold; when
+the matching rule names no account that exists any more, no account is used there (rather than
+any). The name `default` is the account in the agent's own home (`~/.claude`, `~/.codex`). When
 the account of a running agent reaches its threshold, kraal notifies you (`notify`), offers to
 continue the conversation on another account once the agent finished its turn (`ask`), or does it
-by itself at the end of the turn (`auto`). Workspace files can say `agent="claude"` (rules apply)
-or `agent="claude:pro"`.
+by itself at the end of the turn (`auto`). `auto` only switches when the agent's own hooks said
+its turn ended (`kraal integration install`); without them, kraal asks instead, since restarting
+an agent mid-turn would lose its work. A Claude conversation continues on the other account; a
+Codex one cannot (its history stays in its account's directory), so switching starts a new one.
+Workspace files can say `agent="claude"` (rules apply) or `agent="claude:pro"`.
 
 `auto` is off by default. Providers set usage limits per subscription; check their terms (for
 Anthropic, the Usage Policy's section on bypassing product restrictions) before letting a tool
@@ -302,7 +540,8 @@ move your work between subscriptions automatically.
 ## Scripting and agent control
 
 Every pane gets `KRAAL_SOCKET`, `KRAAL_SESSION` and `KRAAL_PANE`, so scripts and agents can drive
-kraal from inside:
+kraal from inside: commands act on the session they run in (`kraal kill` too), and on their own pane
+when none is named, unless `-s` names another session:
 
 ```sh
 kraal run --right --name tests -- cargo test     # prints the new pane id
@@ -334,43 +573,41 @@ width = 28
 mode = "terminal"        # terminal, system, both, off
 
 [keys]
+preset = "kraal"         # or "classic" for tmux-style keys
 prefix = ["ctrl+b"]
 
-[keys.direct]
-new_pane = ["alt+n"]
+[keys.leader]            # keys after the prefix; a space separates a sequence
+split_right = ["%", "p right"]
+
+[keys.direct]            # keys without the prefix
+toggle_floating = ["alt+f"]
 ```
 
-`kraal config check` validates the config and every workspace file.
+`kraal config check` validates the config, every workspace file, `accounts.toml` and
+`servers.toml`; it fails when one cannot be read.
 
 Themes: `[theme]` takes a `preset` (`default`, `high-contrast`, `ascii` for terminals or fonts
-without box drawing) and optional `accent`, `dim`, `sync` colours (names, `#rrggbb`, 0-255) and a
-`frames` style (`rounded`, `plain`, `thick`, `double`, `ascii`).
-
-## Performance
-
-With 100 panes, 99 of them printing `yes` as fast as they can, a keystroke appears on screen in
-4 ms (median, 8 ms p95); idle, a pane costs about 0.3 MiB. Details, method and how to run the
-benchmark: [docs/PERFORMANCE.md](docs/PERFORMANCE.md).
+without box drawing) and optional `accent`, `dim`, `sync`, `production` colours (names, `#rrggbb`,
+0-255) and a `frames` style (`rounded`, `plain`, `thick`, `double`, `ascii`).
 
 ## Status
 
 kraal is young. Known gaps:
 
-- Images in preview panes use half-block characters, not the kitty graphics protocol yet.
-- `start_suspended` in workspace files is accepted but the command starts immediately.
+- Programs' images (kitty graphics, sixel) are not shown; preview panes draw images with
+  half-block characters.
 - Remote sessions need kraal on the server; agents running there are not yet listed in your
-  local sidebar.
-- Only Linux is tested day to day.
+  local sidebar, and the Kubernetes, Terraform and AWS contexts are read only for local panes.
+- Agent states come from hooks for Claude Code (and Codex's turn ends); for other agents they are
+  guessed from the screen and can lag or be wrong.
+- Only Linux is tested day to day. macOS builds and reads processes through the kernel (sysctl,
+  libproc, lsof), but has not been tried on a real machine yet. Windows is not supported.
 
 ## Development
 
 ```sh
 cargo test                                    # unit and end-to-end tests
-cargo run --example headless -- -- target/debug/kraal < script.txt
 ```
-
-`examples/headless.rs` is a scriptable headless terminal used to check the UI end to end: it runs
-a command in a PTY, sends keys and mouse events, and prints the screen.
 
 ## License
 
