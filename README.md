@@ -143,7 +143,6 @@ nobody uses it daily yet; Windows is not supported. Known gaps:
 
 - Images in panes need a terminal that draws kitty graphics with Unicode placeholders (Ghostty,
   kitty).
-- Kubernetes, Terraform and AWS contexts are read for local panes only.
 - Agent states come from hooks for Claude Code, and for the end of Codex's turns; otherwise they
   are read from the screen and can lag.
 

@@ -43,6 +43,18 @@ kubeconfig files and the processes' command lines and environments; it never run
 itself. Commands are seen by looking a few times a second: one that ends in a split second can go
 unnoticed until the next.
 
+In an SSH pane, the shell on the server says what it works on at each prompt, once the shell
+integration is in its startup file there ([Over SSH](terminal.md#over-ssh)): the current context
+and namespace of its kubeconfig (`KUBECONFIG`, else `~/.kube/config`), the Terraform workspace of
+its directory (or `TF_WORKSPACE`), and `AWS_PROFILE` (or `AWS_DEFAULT_PROFILE`). That is what its
+commands get by default, whether or not one ran: a `--context` given to one command is not seen.
+Frames show these as for a local pane, tools get them in their variables, and the production
+guard counts them. They hold until the next prompt, and go when the SSH session ends. A server
+sends names only: kraal takes letters, digits and `-_.:/@+`, up to 200 characters, and shows
+anything else as unknown (`⎈ ?`, `tf:?`, `aws:?`), which may be production. A tool that runs here
+(`on = "local"`) gets those names in its variables, but not the server's `KUBECONFIG` or
+`AWS_PROFILE`. In a local pane, what kraal reads itself wins: a shell's report there is ignored.
+
 ## Hints
 
 `ctrl+b o` puts a short label on everything kraal recognises in the focused pane: links, paths

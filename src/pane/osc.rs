@@ -1,20 +1,30 @@
 //! Escape sequences kraal reads from pane output besides the emulator: notifications, the
-//! working directory (OSC 7), the shell's command marks (OSC 133), the clipboard (OSC 52).
+//! working directory (OSC 7), the shell's command marks (OSC 133), the clipboard (OSC 52), and
+//! kraal's own (OSC 7701).
 
 use std::path::PathBuf;
 
 use super::commands::Mark;
+use crate::context::RemoteContexts;
+
+/// What kraal answers a shell that asks whether its terminal is kraal (`OSC 7701 ; ?`): the
+/// shell integration asks over SSH, where kraal's variables do not reach.
+pub(super) const KRAAL_ANSWER: &str = "\x1b]7701;kraal\x07";
 
 pub(super) fn sanitize_title(s: &str) -> String {
     s.chars().filter(|c| !c.is_control()).take(120).collect()
 }
 
-/// OSC sequences kraal itself cares about, picked out of the output stream.
+/// OSC sequences kraal itself cares about, picked out of the output stream. `Query` asks whether
+/// the terminal is kraal (`OSC 7701 ; ?`); `Contexts` is what a shell works on
+/// (`OSC 7701 ; context ; k8s=… ; ns=… ; tf=… ; aws=…`).
 #[derive(Debug, Clone, PartialEq)]
 pub(super) enum Osc {
     Notify { title: String, body: String },
     Cwd { host: String, path: PathBuf },
     Mark(Mark),
+    Query,
+    Contexts(RemoteContexts),
 }
 
 #[derive(Default)]
@@ -103,6 +113,12 @@ pub(super) fn parse_osc(data: &[u8]) -> Option<Osc> {
             };
             Some(Osc::Mark(mark))
         }
+        // kraal's own: other terminals ignore an OSC number they do not know.
+        "7701" => match rest.split_once(';').unwrap_or((rest, "")) {
+            ("?", _) => Some(Osc::Query),
+            ("context", fields) => Some(Osc::Contexts(RemoteContexts::parse(fields))),
+            _ => None,
+        },
         _ => None,
     }
 }

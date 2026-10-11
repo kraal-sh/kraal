@@ -33,6 +33,33 @@ kraal integration uninstall zsh
 A startup file that is a link (dotfiles kept in a repository) stays a link: the file it points to
 changes, and the backup goes next to the link.
 
+### Over SSH
+
+The same lines work on a server, where kraal need not be installed: paste what
+`kraal integration show <shell>` prints into the shell's startup file there (`~/.zshrc`,
+`~/.bashrc`, or `~/.config/fish/conf.d/kraal.fish`). There, the shell marks its commands as in a
+local pane, and reports at each prompt the Kubernetes, Terraform and AWS contexts it works on (see
+[Contexts](tools.md#contexts)).
+
+SSH does not pass kraal's variables on, so an interactive shell started over SSH
+(`SSH_CONNECTION` set, on a terminal) asks its terminal whether it is kraal: `OSC 7701 ; ?`, then
+a request for the terminal's attributes (DA1), which every terminal answers. kraal answers the
+first; other terminals ignore it, and the lines then do nothing more. The question costs one
+round trip when the shell starts (two seconds at most if nothing answers), and keys typed during
+it are lost. Outside SSH and kraal, the lines do nothing at all.
+
+At each prompt the shell sends
+`OSC 7701 ; context ; k8s=<context> ; ns=<namespace> ; tf=<workspace> ; aws=<profile> BEL`: an
+empty value is none, `?` is what the shell could not read. It reads the kubeconfig's current
+context with `awk` (one process per prompt, only when there is a kubeconfig), never runs kubectl
+or terraform, and sends `?` instead of a name with other characters than letters, digits and
+`-_.:/@+`.
+
+Some shells do not report: one inside tmux or screen on the server, one started by `sudo -i` or
+`su -`, one on a server without these lines reached from the first. When such a shell marks its
+prompts (fish 4 does by itself), kraal forgets what the shell before it reported; otherwise that
+stays until the next report or the end of the session.
+
 ## Images
 
 Programs that draw images in the terminal work in panes, locally or over SSH: the kitty graphics
