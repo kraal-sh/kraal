@@ -636,6 +636,28 @@ mod tests {
         assert!(!taken());
     }
 
+    /// The exit status of a PTY child, or a failure that says what it was doing when it does not
+    /// end within 10 seconds.
+    fn wait_for(child: &mut Box<dyn portable_pty::Child + Send + Sync>, what: &str) -> portable_pty::ExitStatus {
+        let start = Instant::now();
+        loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                return status;
+            }
+            if start.elapsed() > Duration::from_secs(10) {
+                let pid = child.process_id().map(|p| p.to_string()).unwrap_or_default();
+                let ps = std::process::Command::new("ps")
+                    .args(["-o", "pid,ppid,pgid,sess,stat,wchan,command", "-p", &pid])
+                    .output()
+                    .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+                    .unwrap_or_default();
+                let _ = child.kill();
+                panic!("{what}: still running after 10 s:\n{ps}");
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
     #[test]
     fn a_command_whose_directory_went_runs_nowhere() {
         // As if the directory went between kraal's check and portable-pty's, which then starts
@@ -649,11 +671,11 @@ mod tests {
         let mut cmd = command_in(&program, &home.join("gone"), true);
         cmd.env("HOME", &home);
         let mut child = pair.slave.spawn_command(cmd).unwrap();
-        assert_eq!(child.wait().unwrap().exit_code(), 126);
+        assert_eq!(wait_for(&mut child, "in a gone directory").exit_code(), 126);
         assert!(!home.join("ran-here").exists(), "the command ran in HOME");
         // Where the directory is, the command runs there.
         let mut child = pair.slave.spawn_command(command_in(&program, &home, true)).unwrap();
-        assert!(child.wait().unwrap().success());
+        assert!(wait_for(&mut child, "in its directory").success());
         assert!(home.join("ran-here").exists());
         let _ = std::fs::remove_dir_all(&home);
         assert!(!findable(OsStr::new("no-such-program-kraal"), &home, std::env::var_os("PATH").as_deref()));
