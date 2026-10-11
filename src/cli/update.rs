@@ -27,7 +27,7 @@ pub fn update(check: bool, to: Option<String>, force: bool) -> Result<()> {
         bail!("this kraal was installed by {manager}: update it there");
     }
     let Some(asset) = asset_name(std::env::consts::OS, std::env::consts::ARCH) else {
-        bail!("no release is built for this machine: update with cargo install --git https://github.com/{REPO}");
+        bail!("no release is built for this machine: update with cargo install kraal");
     };
     let base = match std::env::var("KRAAL_DOWNLOAD_URL").ok().filter(|u| !u.is_empty()) {
         Some(url) => url,

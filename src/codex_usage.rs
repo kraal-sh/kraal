@@ -167,7 +167,9 @@ pub fn fetch(codex_bin: &str, home: &Path, timeout: Duration) -> anyhow::Result<
                 .and_then(|_| input.flush())
                 .map_err(|_| anyhow::anyhow!("Codex protocol write failed"))
         };
-        send(json!({"id":1,"method":"initialize","params":{"clientInfo":{"name":"kraal","version":"0.1.0"}}}))?;
+        send(
+            json!({"id":1,"method":"initialize","params":{"clientInfo":{"name":"kraal","version":env!("CARGO_PKG_VERSION")}}}),
+        )?;
         for id in [1, 2] {
             loop {
                 let line = output.next()?;
@@ -426,18 +428,19 @@ mod tests {
         let tmp = Temp::new();
         let path = script(
             &tmp,
-            r#"
+            &r#"
 [ "$1 $2 $3" = 'app-server --listen stdio://' ] || exit 1
 [ -d "$CODEX_HOME" ] || exit 2
 IFS= read -r line
-[ "$line" = '{"id":1,"method":"initialize","params":{"clientInfo":{"name":"kraal","version":"0.1.0"}}}' ] || exit 3
+[ "$line" = '{"id":1,"method":"initialize","params":{"clientInfo":{"name":"kraal","version":"VERSION"}}}' ] || exit 3
 printf '%s\n' '{"method":"notice"}' '{"id":99,"result":{}}' '{"id":1,"result":{}}'
 IFS= read -r line
 [ "$line" = '{"method":"initialized"}' ] || exit 4
 IFS= read -r line
 [ "$line" = '{"id":2,"method":"account/rateLimits/read","params":null}' ] || exit 5
 printf '%s\n' '{"id":2,"result":{"rateLimits":{"primary":{"usedPercent":42,"windowDurationMins":300}}}}'
-"#,
+"#
+            .replace("VERSION", env!("CARGO_PKG_VERSION")),
         );
         let r = fetch(path.to_str().unwrap(), &tmp.0, Duration::from_secs(2)).unwrap();
         assert_eq!(r.five_hour.unwrap().used_percent, 42.0);

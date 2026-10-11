@@ -1,7 +1,7 @@
 #!/bin/sh
 # Install kraal from its GitHub releases, for Linux and macOS:
 #
-#   curl -fsSL https://kraal.sh/install | sh
+#   curl -fsSL https://raw.githubusercontent.com/kraal-sh/kraal/main/install.sh | sh
 #
 # The archive's checksum is checked before anything is installed. Settings:
 #   KRAAL_VERSION       a release tag such as v0.1.0 (the latest by default)
@@ -19,7 +19,7 @@ fail() {
     exit 1
 }
 
-from_source="build it from source: cargo install --git https://github.com/$repo"
+from_source="build it from source: cargo install kraal"
 case "$(uname -s)" in
     Linux) os=unknown-linux-musl ;;
     Darwin) os=apple-darwin ;;
