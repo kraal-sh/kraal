@@ -2,6 +2,7 @@
 //! guard on input, pastes.
 
 mod actions;
+mod keyboard;
 mod mouse;
 mod pickers;
 mod prompts;
@@ -89,7 +90,7 @@ impl Server {
 
     fn client_event(&mut self, id: ClientId, ev: InputEvent) {
         if let InputEvent::Raw(raw) = &ev
-            && self.terminal_reply(raw)
+            && (self.keyboard_reply(id, raw) || self.terminal_reply(raw))
         {
             return;
         }
@@ -210,15 +211,17 @@ impl Server {
                 }
                 Mode::Normal
             }
-            // Only to a program that enabled the kitty protocol (flag 2 for releases): a shell
-            // would print the rest of the sequence after its first bytes.
+            // Only to a program that enabled the kitty protocol (flag 2 for releases, 8 for a
+            // modifier pressed alone): a shell would print the rest of the sequence after its
+            // first bytes.
             InputEvent::KittyKey { raw, release } => {
                 let Some(p) = self.client_focus(id) else { return Mode::Normal };
                 // Where typing goes (a broadcast), but never a question for these: other
                 // production panes do not get them.
                 let mut targets = self.input_targets(id, p);
                 targets.retain(|t| *t == p || (self.pane_production(*t).is_none() && !self.pane_context_reading(*t)));
-                let wanted = |flags: u8| if release { flags & 2 != 0 } else { flags != 0 };
+                let needs = crate::input::kitty_key_flag(&raw, release);
+                let wanted = |flags: u8| flags != 0 && flags & needs == needs;
                 for t in targets {
                     if let Some(pane) = self.panes.get_mut(&t)
                         && pane.exit_code.is_none()
@@ -270,7 +273,7 @@ impl Server {
             }
             _ => {}
         }
-        typed.push(k);
+        typed.push(self.keymap.leader_key(&typed, k));
         match self.keymap.lookup(&typed) {
             // The prefix pressed twice: the program gets the one pressed (there may be several).
             Lookup::Run(Command::Action(Action::SendPrefix)) => {

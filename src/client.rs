@@ -193,9 +193,12 @@ pub fn request_quick(socket: &Path, req: Request) -> Result<()> {
 struct TerminalGuard;
 
 const SETUP_NO_MOUSE: &str = "\x1b[?1049h\x1b[?25l";
-// `CSI > 1 u` asks the terminal for unambiguous keys (kitty keyboard protocol), so Shift+Enter,
-// Ctrl+Enter or Esc arrive distinct; terminals without the protocol ignore it.
-const KEYS_ON: &str = "\x1b[?2004h\x1b[?1004h\x1b[>1u";
+// `CSI > 5 u` asks the terminal for unambiguous keys (kitty keyboard protocol), so Shift+Enter,
+// Ctrl+Enter or Esc arrive distinct, and for their alternates, so a key with Ctrl or Alt also
+// says where it is on the keyboard; typed text still comes as text. Terminals without the
+// protocol ignore it. The server raises it for the leader menu by setting this same entry of the
+// terminal's stack, which the single pop when the client goes takes away.
+const KEYS_ON: &str = "\x1b[?2004h\x1b[?1004h\x1b[>5u";
 const KEYS_OFF: &str = "\x1b[<u\x1b[?1004l\x1b[?2004l";
 const MOUSE_ON: &str = "\x1b[?1000h\x1b[?1002h\x1b[?1006h";
 const MOUSE_OFF: &str = "\x1b[?1006l\x1b[?1003l\x1b[?1002l\x1b[?1000l";
@@ -211,14 +214,16 @@ fn set_modes(on: bool, mouse: bool) {
     let _ = out.flush();
 }
 
-/// Whether `keys` hold ctrl+c, as a terminal sends it with or without the kitty protocol.
+/// Whether `keys` hold ctrl+c, as a terminal sends it with or without the kitty protocol, and on
+/// a non-Latin layout (the key at the place of `c`).
 fn is_ctrl_c(keys: &[u8]) -> bool {
     let mut parser = crate::input::InputParser::new();
     let mut events = parser.feed(keys);
     events.extend(parser.flush());
+    let c = crate::input::KeyCode::Char('c');
     events.iter().any(|e| {
         matches!(e, crate::input::InputEvent::Key(k)
-            if k.code == crate::input::KeyCode::Char('c') && k.mods.ctrl && !k.mods.alt)
+            if k.mods.ctrl && !k.mods.alt && (k.code == c || k.by_place().is_some_and(|p| p.code == c)))
     })
 }
 const RESTORE: &str = "\x1b[?2026l\x1b[<u\x1b[?1006l\x1b[?1003l\x1b[?1002l\x1b[?1000l\x1b[?1004l\x1b[?2004l\x1b[0m\x1b[0 q\x1b[?25h\x1b[?1049l";
@@ -668,6 +673,8 @@ mod tests {
         assert!(is_ctrl_c(b"ab\x1b[99;5:1u"));
         assert!(!is_ctrl_c(b"c"));
         assert!(!is_ctrl_c(b"\x1b[99;7u"), "ctrl+alt+c is something else");
+        // A Russian layout: the key at the place of `c` types `с`.
+        assert!(is_ctrl_c(b"\x1b[1089::99;5u"));
     }
 
     #[test]

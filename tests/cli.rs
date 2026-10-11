@@ -2433,3 +2433,56 @@ fn an_account_switch_never_resends_a_prompt_by_itself_and_one_that_fails_can_be_
     assert!(!env.run(&["read", "-p", &plain]).replace('\n', "").contains(&on_beta));
     std::fs::set_permissions(beta.join("projects"), std::fs::Permissions::from_mode(0o755)).unwrap();
 }
+
+/// While the keys after the prefix are awaited, the client's terminal is asked for every key
+/// with its place on the keyboard (kitty keyboard protocol), and set back after: the AZERTY key
+/// that types `&`, at the place of `1`, goes to tab 1. A terminal that cannot send the typed text
+/// along is not asked again.
+#[test]
+fn the_leader_menu_reads_keys_by_their_place() {
+    let env = Env::new("byplace");
+    env.workspace(
+        "w",
+        "layout {\n    tab name=\"a\" {\n        pane name=\"a\"\n    }\n    tab name=\"b\" {\n        pane name=\"b\"\n    }\n}\n",
+    );
+    env.run(&["open", "w"]);
+    env.run(&["focus", "b"]);
+    let focused = || -> String {
+        let panes: serde_json::Value = serde_json::from_str(&env.run(&["panes", "--json"])).unwrap();
+        let shown = panes.as_array().unwrap().iter().find(|p| p["focused"] == true).cloned();
+        shown.and_then(|p| p["name"].as_str().map(String::from)).unwrap_or_default()
+    };
+    let count =
+        |client: &RawClient, what: &str| String::from_utf8_lossy(&client.screen.lock().unwrap()).matches(what).count();
+    let raised = "\x1b[=29;1u";
+    let lowered = "\x1b[=5;1u";
+
+    let mut client = RawClient::attach(&env, "w");
+    client.send(b"\x02");
+    client.wait_for_screen(&format!("{raised}\x1b[?u"));
+    client.send(b"\x1b[?29u");
+    client.send(b"\x1b[38::49;;38u");
+    client.wait_for_screen(lowered);
+    assert_eq!(focused(), "a", "the key at the place of 1 went to tab 1");
+    // Asked once: the next time, only raised.
+    client.send(b"\x02");
+    let start = Instant::now();
+    while count(&client, raised) < 2 {
+        assert!(start.elapsed() < Duration::from_secs(10), "not raised the second time");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(count(&client, "\x1b[?u"), 1);
+    client.send(b"\x1b");
+
+    // A terminal that grants every key as a sequence but not its text is set back at once, and
+    // not raised again.
+    let mut other = RawClient::attach(&env, "w");
+    other.send(b"\x02");
+    other.wait_for_screen(&format!("{raised}\x1b[?u"));
+    other.send(b"\x1b[?13u");
+    other.wait_for_screen(lowered);
+    other.send(b"\x1b");
+    other.send(b"\x02");
+    std::thread::sleep(Duration::from_millis(500));
+    assert_eq!(count(&other, raised), 1);
+}

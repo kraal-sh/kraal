@@ -151,11 +151,18 @@ back; drag to select and copy (double click selects a word, triple click a line)
 a link (OSC 8 links stay clickable, and plain URLs work too). Hold Shift to use your terminal's own
 selection.
 
-Keys reach programs unambiguously: kraal asks terminals that support the kitty keyboard protocol
-(Ghostty, kitty, WezTerm, foot…) for its first level (disambiguated keys) and passes it on to
-programs that ask for it, so Shift+Enter, Ctrl+Enter or Esc arrive as such (Claude Code's
-Shift+Enter makes a new line). Key release events and the protocol's other levels are not passed
-on yet.
+Keys reach programs unambiguously: kraal speaks the kitty keyboard protocol with terminals that
+support it (Ghostty, kitty, WezTerm, foot…) and gives each program what it asked for, so
+Shift+Enter, Ctrl+Enter or Esc arrive as such (Claude Code's Shift+Enter makes a new line), with
+the keys' alternates and the text they type for programs that want them. Typed text, accents and
+dead keys included, reaches programs as it was typed.
+
+Shortcuts work on every keyboard layout. Letters are read by the character they type, wherever
+the key is. The digit row is read by its place: on AZERTY, the key that types `&` is `1` after
+the prefix, without Shift. On a non-Latin layout, a key stands for the letter at its place on a
+US keyboard, so Ctrl+B is still the prefix on a Russian layout. A key the keymap binds by its
+character keeps that meaning. Terminals without the protocol send characters only, and shortcuts
+read them as such. Key release events are not passed on yet.
 
 ## Concepts
 

@@ -40,49 +40,103 @@ pub struct PaneInputModes {
 pub fn encode_key(key: &Key, modes: PaneInputModes) -> Vec<u8> {
     use KeyCode::*;
     if modes.kitty_flags != 0
-        && let Some(bytes) = encode_kitty(key.code, key.mods, modes.kitty_flags)
+        && let Some(bytes) = encode_kitty_key(key, modes.kitty_flags)
     {
         return bytes;
     }
     let cursor_key = matches!(key.code, Up | Down | Left | Right | Home | End) && key.mods.is_empty();
     let keypad = !modes.app_keypad && key.raw.starts_with(b"\x1bO") && matches!(key.code, Char(_) | Enter);
     if key.raw.is_empty() || cursor_key || keypad || is_extended_encoding(&key.raw) || has_lock_bits(&key.raw) {
-        encode_key_code(key.code, key.mods, modes)
+        // Ctrl with a letter of a non-Latin layout sends the control byte of the letter at its
+        // place, as terminals do without the protocol.
+        let code = match key.code {
+            Char(c) if key.mods.ctrl && control_byte(c).is_none() => key
+                .by_place()
+                .map(|k| k.code)
+                .filter(|code| matches!(code, Char(b) if b.is_ascii_alphabetic()))
+                .unwrap_or(key.code),
+            code => code,
+        };
+        encode_key_code(code, key.mods, modes)
     } else {
         key.raw.clone()
     }
 }
 
 /// Kitty keyboard protocol encoding for a pane that enabled it, for the keys whose legacy
-/// encoding is ambiguous or lossy (Shift+Enter, Ctrl+Enter, Alt+letters, Esc…). `None` means
-/// the legacy encoding is also what the protocol sends (plain text, arrows, function keys).
+/// encoding is ambiguous or lossy (Shift+Enter, Ctrl+Enter, Alt+letters, Esc…), and for every
+/// key with flag 8. `None` means the legacy encoding is also what the protocol sends (plain text,
+/// arrows, function keys).
+#[cfg(test)]
 pub fn encode_kitty(code: KeyCode, mods: Mods, flags: u8) -> Option<Vec<u8>> {
+    let (cp, m) = kitty_code(code, mods, flags)?;
+    Some(if m == 1 { format!("\x1b[{cp}u") } else { format!("\x1b[{cp};{m}u") }.into_bytes())
+}
+
+/// The key code and modifier field of [`encode_kitty`], when the key goes as a kitty sequence.
+fn kitty_code(code: KeyCode, mods: Mods, flags: u8) -> Option<(u32, u32)> {
     use KeyCode::*;
     let all_keys = flags & 8 != 0;
     let bits = u32::from(mods.shift) | (u32::from(mods.alt) << 1) | (u32::from(mods.ctrl) << 2);
     let m = 1 + bits;
-    let seq = |cp: u32, m: u32| -> Vec<u8> {
-        if m == 1 { format!("\x1b[{cp}u").into_bytes() } else { format!("\x1b[{cp};{m}u").into_bytes() }
-    };
     match code {
-        Esc => Some(seq(27, m)),
+        Esc => Some((27, m)),
         Enter | Tab | Backspace if all_keys || m != 1 => {
             let cp = match code {
                 Enter => 13,
                 Tab => 9,
                 _ => 127,
             };
-            Some(seq(cp, m))
+            Some((cp, m))
         }
-        BackTab if all_keys => Some(seq(9, 1 + (bits | 1))),
+        BackTab if all_keys => Some((9, 1 + (bits | 1))),
         Char(c) if all_keys || mods.ctrl || mods.alt => {
             // The key is reported unshifted, with shift as a modifier.
             let base = if c.is_ascii_uppercase() { c.to_ascii_lowercase() } else { c };
             let m = if c.is_ascii_uppercase() { 1 + (bits | 1) } else { m };
-            Some(seq(base as u32, m))
+            Some((base as u32, m))
         }
         _ => None,
     }
+}
+
+/// [`encode_kitty`] with what the pane's flags ask for beyond the key itself: its alternate keys
+/// (flag 4) and the text it types (flags 8 and 16). A key the terminal sent with the protocol
+/// goes on with the code and alternates the terminal gave; another one is described from what it
+/// is. The modifiers are Shift, Alt and Ctrl, without the lock keys, as for every program.
+fn encode_kitty_key(key: &Key, flags: u8) -> Option<Vec<u8>> {
+    let (cp, m) = kitty_code(key.code, key.mods, flags)?;
+    let (cp, shifted, base, text) = match super::decode::kitty_fields(&key.raw) {
+        Some(f) if f.key != 0 => (f.key, f.shifted, f.base, f.text),
+        _ => match key.code {
+            KeyCode::Char(c) => {
+                let shifted = if c as u32 == cp { 0 } else { c as u32 };
+                let text = if key.mods.ctrl || key.mods.alt { Vec::new() } else { vec![c] };
+                (cp, shifted, 0, text)
+            }
+            _ => (cp, 0, 0, Vec::new()),
+        },
+    };
+    let mut out = format!("\x1b[{cp}");
+    if flags & 4 != 0 && (shifted != 0 || base != 0) {
+        out.push(':');
+        if shifted != 0 {
+            out.push_str(&shifted.to_string());
+        }
+        if base != 0 {
+            out.push_str(&format!(":{base}"));
+        }
+    }
+    let text: Vec<String> =
+        if flags & (8 | 16) == 8 | 16 { text.iter().map(|c| (*c as u32).to_string()).collect() } else { Vec::new() };
+    if m != 1 || !text.is_empty() {
+        out.push_str(&format!(";{m}"));
+    }
+    if !text.is_empty() {
+        out.push_str(&format!(";{}", text.join(":")));
+    }
+    out.push('u');
+    Some(out.into_bytes())
 }
 
 /// Whether `raw` is a legacy CSI key, possibly ESC-prefixed (Alt), whose modifier carries Caps

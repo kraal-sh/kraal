@@ -41,7 +41,8 @@ impl Server {
     /// After anything that may have moved the focus: the panes that gained or lost it are told
     /// (mode 1004), and each client's terminal reports pointer motion only while the pane it
     /// shows asks for it (mode 1003). A pane has the focus while an attached client whose
-    /// terminal has the focus shows it.
+    /// terminal has the focus shows it. Each terminal's keyboard level follows its client's mode
+    /// too ([`Server::follow_keyboard`]).
     pub(super) fn follow_focus(&mut self) {
         let shown: std::collections::HashSet<PaneId> = self
             .clients
@@ -73,6 +74,7 @@ impl Server {
                 }
             }
         }
+        self.follow_keyboard();
     }
 
     fn report_focus(&mut self, pane: PaneId, gained: bool) {

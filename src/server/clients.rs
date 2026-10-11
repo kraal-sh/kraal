@@ -70,6 +70,8 @@ impl Server {
                 last_input: Instant::now(),
                 terminal_focused: true,
                 pointer_motion: false,
+                keys_full: None,
+                keys_by_place: false,
                 paste: None,
                 drag: None,
                 toast: None,

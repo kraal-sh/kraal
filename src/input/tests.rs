@@ -1247,3 +1247,151 @@ fn synthesised_keys_follow_the_kitty_protocol() {
     assert_eq!(encode_key(&shift_enter, kitty), b"\x1b[13;2u");
     assert_eq!(encode_key(&shift_enter, PaneInputModes::default()), b"\r");
 }
+
+// ---- kitty keyboard protocol, every key with its place and text ----
+
+/// The keys parsed from `bytes`, which must all be keys.
+fn keys(bytes: &[u8]) -> Vec<Key> {
+    parse_all(bytes)
+        .into_iter()
+        .map(|ev| match ev {
+            InputEvent::Key(k) => k,
+            other => panic!("{bytes:?}: {other:?}"),
+        })
+        .collect()
+}
+
+#[test]
+fn every_key_with_its_text() {
+    // AZERTY: the `&` key, at the place of `1`; `é` at the place of `2`; with Shift, `1`.
+    assert_eq!(single_key(b"\x1b[38::49;;38u"), (Char('&'), NONE));
+    assert_eq!(single_key(b"\x1b[233::50;;233u"), (Char('é'), NONE));
+    assert_eq!(single_key(b"\x1b[38:49:49;2;49u"), (Char('1'), SHIFT));
+    // A dead key's accent, AltGr and an input method show only in the text.
+    assert_eq!(single_key(b"\x1b[101;;234u"), (Char('ê'), NONE));
+    assert_eq!(single_key(b"\x1b[101;;8364u"), (Char('€'), NONE));
+    // The macOS Option key types a character: Alt is part of it.
+    assert_eq!(single_key(b"\x1b[101;3;233u"), (Char('é'), NONE));
+    // Caps Lock and Shift.
+    assert_eq!(single_key(b"\x1b[97;65;65u"), (Char('A'), SHIFT));
+    assert_eq!(single_key(b"\x1b[1099:1067:115;2;1067u"), (Char('Ы'), SHIFT));
+    // Plain keys, with or without their text.
+    assert_eq!(single_key(b"\x1b[97;;97u"), (Char('a'), NONE));
+    assert_eq!(single_key(b"\x1b[97u"), (Char('a'), NONE));
+    assert_eq!(single_key(b"\x1b[32;;32u"), (Char(' '), NONE));
+    assert_eq!(single_key(b"\x1b[13u"), (Enter, NONE));
+    assert_eq!(single_key(b"\x1b[9u"), (Tab, NONE));
+    assert_eq!(single_key(b"\x1b[127u"), (Backspace, NONE));
+    // A control character is no text.
+    assert_eq!(single_key(b"\x1b[13;;13u"), (Enter, NONE));
+    // Keys with Ctrl carry no text.
+    assert_eq!(single_key(b"\x1b[1080::98;5u"), (Char('и'), CTRL));
+    // Text of several characters is typed as it is, one key each.
+    let typed = keys(b"\x1b[97;;101:769u");
+    assert_eq!(typed.iter().map(|k| k.code).collect::<Vec<_>>(), [Char('e'), Char('\u{301}')]);
+    let sent: Vec<u8> = typed.iter().flat_map(|k| encode_key(k, PaneInputModes::default())).collect();
+    assert_eq!(sent, "e\u{301}".as_bytes());
+    // Keys around it are not taken with it.
+    let mixed = keys(b"x\x1b[101;;234uy");
+    assert_eq!(mixed.iter().map(|k| k.code).collect::<Vec<_>>(), [Char('x'), Char('ê'), Char('y')]);
+}
+
+#[test]
+fn keys_by_place() {
+    let place = |bytes: &[u8]| parse_key(bytes).by_place().map(|k| (k.code, k.mods));
+    // The digit row, without Shift: AZERTY's `&` and `é`.
+    assert_eq!(place(b"\x1b[38::49;;38u"), Some((Char('1'), NONE)));
+    assert_eq!(place(b"\x1b[233::50;;233u"), Some((Char('2'), NONE)));
+    assert_eq!(place(b"\x1b[38::49;5u"), Some((Char('1'), CTRL)));
+    // With Shift, the key types its digit: that is what it is.
+    assert_eq!(place(b"\x1b[38:49:49;2;49u"), None);
+    assert_eq!(place(b"\x1b[49;;49u"), None);
+    // A non-Latin layout: the letter at the place, Shift and Ctrl kept.
+    assert_eq!(place(b"\x1b[1099::115;;1099u"), Some((Char('s'), NONE)));
+    assert_eq!(place(b"\x1b[1099:1067:115;2;1067u"), Some((Char('S'), SHIFT)));
+    assert_eq!(place(b"\x1b[1080::98;5u"), Some((Char('b'), CTRL)));
+    // A Latin letter is the letter it types, wherever the key is (AZERTY's `a` is at `q`).
+    assert_eq!(place(b"\x1b[97::113;;97u"), None);
+    // Without the protocol's alternates, keys are what they type.
+    assert_eq!(place(b"&"), None);
+    assert_eq!(place("и".as_bytes()), None);
+    assert_eq!(place(b"\x1b[1080;5u"), None);
+}
+
+#[test]
+fn every_key_reaches_a_program_without_the_protocol_as_typed() {
+    let legacy = PaneInputModes::default();
+    for (seq, expected) in [
+        (&b"\x1b[38::49;;38u"[..], "&".as_bytes()),
+        (b"\x1b[233::50;;233u", "é".as_bytes()),
+        (b"\x1b[38:49:49;2;49u", b"1"),
+        (b"\x1b[101;;234u", "ê".as_bytes()),
+        (b"\x1b[101;;8364u", "€".as_bytes()),
+        (b"\x1b[101;3;233u", "é".as_bytes()),
+        (b"\x1b[97;65;65u", b"A"),
+        (b"\x1b[97;;97u", b"a"),
+        (b"\x1b[32;;32u", b" "),
+        (b"\x1b[13u", b"\r"),
+        (b"\x1b[13;2u", b"\r"),
+        (b"\x1b[9u", b"\t"),
+        (b"\x1b[127u", b"\x7f"),
+        (b"\x1b[27u", b"\x1b"),
+        (b"\x1b[99;5u", b"\x03"),
+        (b"\x1b[97;3u", b"\x1ba"),
+        // Ctrl with a Russian letter is the control character of the letter at its place.
+        (b"\x1b[1080::98;5u", b"\x02"),
+        (b"\x1b[1080;5u", "и".as_bytes()),
+    ] {
+        assert_eq!(encode_key(&parse_key(seq), legacy), expected, "{seq:?}");
+    }
+}
+
+#[test]
+fn every_key_reaches_a_program_with_the_protocol_as_it_asked() {
+    let pane = |flags: u8| PaneInputModes { kitty_flags: flags, ..Default::default() };
+    let cases: &[(&[u8], u8, &[u8])] = &[
+        // Disambiguated keys only: text stays text, a key with Ctrl is a sequence.
+        (b"\x1b[38::49;;38u", 1, b"&"),
+        (b"\x1b[101;;234u", 1, "ê".as_bytes()),
+        (b"\x1b[1080::98;5u", 1, b"\x1b[1080;5u"),
+        (b"\x1b[13;2u", 1, b"\x1b[13;2u"),
+        // With alternates, as the terminal gave them.
+        (b"\x1b[1080::98;5u", 5, b"\x1b[1080::98;5u"),
+        (b"\x1b[97:65;6u", 5, b"\x1b[97:65;6u"),
+        (b"\x1b[38::49;5u", 5, b"\x1b[38::49;5u"),
+        // Every key as a sequence: without the text flag, only the key; with it, the text too.
+        (b"\x1b[101;;234u", 9, b"\x1b[101u"),
+        (b"\x1b[101;;234u", 25, b"\x1b[101;1;234u"),
+        (b"\x1b[38::49;;38u", 29, b"\x1b[38::49;1;38u"),
+        // Caps Lock and Num Lock stay with kraal, as for every program: Caps Lock's `A` is
+        // Shift's, Ctrl+C with Num Lock on is Ctrl+C.
+        (b"\x1b[97;65;65u", 25, b"\x1b[97;2;65u"),
+        (b"\x1b[99;133u", 1, b"\x1b[99;5u"),
+        // Keys that came as plain text are described from what they are.
+        (b"a", 9, b"\x1b[97u"),
+        (b"a", 25, b"\x1b[97;1;97u"),
+        (b"A", 25, b"\x1b[97;2;65u"),
+        (b"A", 29, b"\x1b[97:65;2;65u"),
+        ("é".as_bytes(), 25, b"\x1b[233;1;233u"),
+        (b"\r", 9, b"\x1b[13u"),
+        (b"\x02", 25, b"\x1b[98;5u"),
+    ];
+    for &(seq, flags, expected) in cases {
+        assert_eq!(encode_key(&parse_key(seq), pane(flags)), expected, "{seq:?} with flags {flags}");
+    }
+}
+
+#[test]
+fn keys_only_some_programs_asked_for() {
+    let event = |bytes: &[u8]| match parse_all(bytes).as_slice() {
+        [InputEvent::KittyKey { raw, release }] => kitty_key_flag(raw, *release),
+        other => panic!("{bytes:?}: {other:?}"),
+    };
+    // Shift or Caps Lock pressed alone: only with every key as a sequence.
+    assert_eq!(event(b"\x1b[57441;2u"), 8);
+    assert_eq!(event(b"\x1b[57358;65u"), 8);
+    // A release: only with event types.
+    assert_eq!(event(b"\x1b[97;1:3u"), 2);
+    // Print Screen: any program with the protocol.
+    assert_eq!(event(b"\x1b[57361u"), 0);
+}

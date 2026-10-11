@@ -11,6 +11,45 @@
 
 use super::{ESC, F_TILDE, InputEvent, Key, KeyCode, Mods, MouseButton, MouseEvent, MouseKind, PASTE_END};
 
+/// What a kitty keyboard protocol key (`CSI key:shifted:base ; mods:event ; text u`) says, as
+/// received: the key's own code (unshifted), the one it gives with Shift, the key at its place on
+/// a US keyboard, and the text it typed. Absent fields are 0 or empty.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct KittyFields {
+    pub key: u32,
+    pub shifted: u32,
+    pub base: u32,
+    pub text: Vec<char>,
+}
+
+/// The fields of `raw` when it is a kitty protocol key (possibly after an Alt ESC).
+pub(super) fn kitty_fields(raw: &[u8]) -> Option<KittyFields> {
+    let raw = match raw.strip_prefix(&[ESC]) {
+        Some(rest) if rest.starts_with(&[ESC]) => rest,
+        _ => raw,
+    };
+    let body = raw.strip_prefix(b"\x1b[")?.strip_suffix(b"u")?;
+    if !body.first().is_some_and(u8::is_ascii_digit) {
+        return None;
+    }
+    let params = parse_params(body)?;
+    if params.is_empty() || params.len() > 3 {
+        return None;
+    }
+    Some(KittyFields {
+        key: param(&params, 0),
+        shifted: sub_param(&params, 0, 1),
+        base: sub_param(&params, 0, 2),
+        text: associated_text(&params).unwrap_or_default(),
+    })
+}
+
+/// The text a kitty protocol key typed (its third field), when it is printable text.
+fn associated_text(params: &[Vec<u32>]) -> Option<Vec<char>> {
+    let field = params.get(2).filter(|f| f.iter().any(|&cp| cp != 0))?;
+    field.iter().map(|&cp| char::from_u32(cp).filter(|c| !c.is_control())).collect()
+}
+
 const BEL: u8 = 0x07;
 /// Longest CSI sequence accepted before giving up and emitting it as raw bytes.
 pub(super) const MAX_CSI_LEN: usize = 256;
@@ -121,6 +160,7 @@ impl InputParser {
                 }
                 events.push(ev);
             }
+            Tok::Keys(keys) => events.extend(keys),
             Tok::PasteStart => self.paste = Some(Vec::new()),
             Tok::X10Release(mut ev) => {
                 let button = self.last_button.take().unwrap_or(MouseButton::Left);
@@ -137,6 +177,8 @@ const PASTE_PIECE: usize = 1 << 20;
 /// What a parse step produced.
 enum Tok {
     Event(InputEvent),
+    /// Several keys from one sequence: the text of a kitty protocol key, one key per character.
+    Keys(Vec<InputEvent>),
     /// `ESC [ 200 ~`: start of a bracketed paste.
     PasteStart,
     /// An X10 mouse release, which does not say which button was released.
@@ -495,7 +537,28 @@ fn csi_u(params: &[Vec<u32>], seq: &[u8]) -> Tok {
         return release_tok(seq);
     }
     let mods = Mods::from_xterm_param(param(params, 1));
+    // What the key typed wins over its code: a dead key's accent, AltGr, the macOS Option key
+    // and input methods show only there.
+    if let Some(text) = associated_text(params) {
+        return text_tok(&text, mods, seq);
+    }
     codepoint_key(param(params, 0), sub_param(params, 0, 1), mods, seq)
+}
+
+/// The keys for the text a kitty protocol key typed. One character is that key, as received
+/// (Alt is part of the text then: the macOS Option key types characters); several are typed
+/// text, one key each.
+fn text_tok(text: &[char], mods: Mods, seq: &[u8]) -> Tok {
+    match text {
+        [c] => key_tok(KeyCode::Char(*c), Mods { alt: false, ..mods }, seq),
+        _ => Tok::Keys(
+            text.iter()
+                .map(|c| {
+                    InputEvent::Key(make_key(KeyCode::Char(*c), Mods::NONE, c.encode_utf8(&mut [0; 4]).as_bytes()))
+                })
+                .collect(),
+        ),
+    }
 }
 
 fn codepoint_key(cp: u32, shifted: u32, mods: Mods, seq: &[u8]) -> Tok {

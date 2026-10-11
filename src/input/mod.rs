@@ -102,6 +102,39 @@ impl Key {
     pub fn new(code: KeyCode, mods: Mods) -> Key {
         Key { code, mods, raw: Vec::new() }
     }
+
+    /// The key at the same place on a US keyboard, when the terminal said where the key is
+    /// (kitty keyboard protocol, alternate keys) and a keymap should read it that way: on the
+    /// digit row without Shift (AZERTY's `&` is `1`), and on a non-Latin layout (Russian `и` is
+    /// `b`). Modifiers stay. None for a Latin letter: it is the letter it types, wherever it is.
+    pub fn by_place(&self) -> Option<Key> {
+        let KeyCode::Char(c) = self.code else { return None };
+        let base = decode::kitty_fields(&self.raw).and_then(|f| char::from_u32(f.base))?;
+        let code = if base.is_ascii_digit() {
+            if self.mods.shift || c.is_ascii_digit() {
+                return None;
+            }
+            base
+        } else if base.is_ascii_alphabetic() && !c.is_ascii() {
+            if self.mods.shift && !self.mods.ctrl { base.to_ascii_uppercase() } else { base.to_ascii_lowercase() }
+        } else {
+            return None;
+        };
+        Some(Key { code: KeyCode::Char(code), mods: self.mods, raw: self.raw.clone() })
+    }
+}
+
+/// The kitty keyboard flag a program must have enabled to get this [`InputEvent::KittyKey`]: 2
+/// for a release, 8 for a modifier or lock key pressed alone, 0 (any flag) for the other keys
+/// (Print Screen, media keys).
+pub fn kitty_key_flag(raw: &[u8], release: bool) -> u8 {
+    if release {
+        return 2;
+    }
+    match decode::kitty_fields(raw).map(|f| f.key) {
+        Some(57358..=57360 | 57441..=57454) => 8,
+        _ => 0,
+    }
 }
 
 /// A mouse button.

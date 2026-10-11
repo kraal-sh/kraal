@@ -283,6 +283,11 @@ pub struct Client {
     pub remote: bool,
     /// Its terminal reports every pointer motion (mode 1003), for a pane that asked for it.
     pub pointer_motion: bool,
+    /// Its terminal can send every key with its place and its text (kitty keyboard protocol):
+    /// unknown until it answers.
+    pub keys_full: Option<bool>,
+    /// Its terminal sends every key with its place, for the leader menu.
+    pub keys_by_place: bool,
     /// A paste arriving in pieces.
     pub(in crate::server) paste: Option<input::PasteFlow>,
 }

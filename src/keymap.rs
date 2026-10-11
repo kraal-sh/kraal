@@ -720,12 +720,42 @@ impl Keymap {
         warnings
     }
 
+    /// Whether `key` is the prefix: by the character it types, else by its place on the
+    /// keyboard (see [`Key::by_place`]) when no direct key takes it as typed.
     pub fn is_prefix(&self, key: &Key) -> bool {
-        self.prefix.iter().any(|p| p.matches(key))
+        let prefix = |k: &Key| self.prefix.iter().any(|p| p.matches(k));
+        prefix(key) || (self.direct_typed(key).is_none() && key.by_place().is_some_and(|k| prefix(&k)))
     }
 
+    /// The action of a direct key: by the character typed, else by the key's place when the
+    /// prefix does not take it as typed.
     pub fn direct(&self, key: &Key) -> Option<Action> {
+        self.direct_typed(key).or_else(|| {
+            let typed_prefix = self.prefix.iter().any(|p| p.matches(key));
+            key.by_place().filter(|_| !typed_prefix).and_then(|k| self.direct_typed(&k))
+        })
+    }
+
+    fn direct_typed(&self, key: &Key) -> Option<Action> {
         self.direct.iter().find(|(k, _)| k.matches(key)).map(|(_, a)| *a)
+    }
+
+    /// `key` as the keymap reads it after `typed`: as typed when a sequence goes on with it,
+    /// else as the key at its place on the keyboard (the digit row, a non-Latin layout) when one
+    /// does, so a binding written for a character never loses its key to another's place.
+    pub fn leader_key(&self, typed: &[Key], key: Key) -> Key {
+        let reads = |k: &Key| {
+            let mut keys = typed.to_vec();
+            keys.push(k.clone());
+            self.lookup(&keys) != Lookup::Nothing
+        };
+        if reads(&key) {
+            return key;
+        }
+        match key.by_place() {
+            Some(place) if reads(&place) => place,
+            _ => key,
+        }
     }
 
     /// What the keys typed after the leader so far lead to.
@@ -1071,5 +1101,32 @@ mod tests {
         assert_eq!(km.bind_tools(&c.tools).len(), 1, "R ctrl+m is R enter");
         let (_, warnings) = Keymap::build(&cfg("[keys.direct]\nnew_tab = [\"ctrl+b\"]\n").keys);
         assert!(warnings.iter().any(|w| w.contains("prefix")), "{warnings:?}");
+    }
+
+    #[test]
+    fn keys_by_their_place_on_the_keyboard() {
+        let received = |bytes: &[u8]| match crate::input::InputParser::new().feed(bytes).as_slice() {
+            [crate::input::InputEvent::Key(k)] => k.clone(),
+            other => panic!("{other:?}"),
+        };
+        // AZERTY: `&` at the place of `1` is tab 1 in a keymap that does not bind `&`.
+        let (km, _) = Keymap::build(&cfg("[keys.leader]\nnew_tab = [\"k\"]\n").keys);
+        let amp = received(b"\x1b[38::49;;38u");
+        let one = km.leader_key(&[], amp.clone());
+        assert_eq!(km.lookup(&[one]), Lookup::Run(Command::Action(Tab(1))));
+        // One that binds `&` keeps the key for it: a place never takes a key from a character.
+        let (classic, _) = Keymap::build(&cfg("[keys]\npreset = \"classic\"\n").keys);
+        let typed = classic.leader_key(&[], amp);
+        assert_eq!(classic.lookup(&[typed]), Lookup::Run(Command::Action(CloseTab)));
+        // A Russian layout: `л` at the place of `k`, Ctrl+`и` at the place of Ctrl+B.
+        let l = km.leader_key(&[], received(b"\x1b[1083::107;;1083u"));
+        assert_eq!(km.lookup(&[l]), Lookup::Run(Command::Action(NewTab)));
+        assert!(km.is_prefix(&received(b"\x1b[1080::98;5u")));
+        assert!(!km.is_prefix(&received(b"\x1b[1080;5u")), "without its place, a Russian letter is itself");
+        // Direct keys too: Alt+`т` at the place of Alt+N.
+        assert_eq!(km.direct(&received(b"\x1b[1090::110;3u")), Some(NewPane));
+        // A Latin letter is the letter it types, wherever it is: AZERTY's `a` at the place of `q`.
+        let a = km.leader_key(&[], received(b"\x1b[97::113;;97u"));
+        assert_eq!(a.code, KeyCode::Char('a'));
     }
 }
