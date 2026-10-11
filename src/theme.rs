@@ -18,6 +18,7 @@ pub struct ThemeConfig {
     pub accent: Option<String>,
     pub dim: Option<String>,
     pub sync: Option<String>,
+    pub production: Option<String>,
     /// "rounded", "plain", "thick", "double" or "ascii".
     pub frames: Option<String>,
 }
@@ -30,10 +31,14 @@ pub struct Theme {
     /// Normal interface text (tab names, details).
     pub text: Color,
     pub sync: Color,
+    /// Frames and badges of production panes.
+    pub production: Color,
     pub working: Color,
     pub blocked: Color,
     pub done: Color,
     pub idle: Color,
+    /// Background of the selected row of a list.
+    pub selection: Color,
     pub frames: Frames,
     /// Only ASCII in the interface: no box drawing, no symbols.
     pub ascii: bool,
@@ -76,10 +81,12 @@ impl Theme {
         dim: Color::DarkGray,
         text: Color::Gray,
         sync: Color::Magenta,
+        production: Color::Red,
         working: Color::Cyan,
         blocked: Color::Yellow,
         done: Color::Green,
         idle: Color::Gray,
+        selection: Color::Indexed(237),
         frames: Frames::Rounded,
         ascii: false,
     };
@@ -90,10 +97,12 @@ impl Theme {
         dim: Color::Gray,
         text: Color::White,
         sync: Color::LightMagenta,
+        production: Color::LightRed,
         working: Color::LightCyan,
         blocked: Color::LightRed,
         done: Color::LightGreen,
         idle: Color::White,
+        selection: Color::Blue,
         frames: Frames::Plain,
         ascii: false,
     };
@@ -123,6 +132,7 @@ impl Theme {
         color("accent", &cfg.accent, &mut t.accent);
         color("dim", &cfg.dim, &mut t.dim);
         color("sync", &cfg.sync, &mut t.sync);
+        color("production", &cfg.production, &mut t.production);
         if let Some(f) = &cfg.frames {
             t.frames = match f.as_str() {
                 "rounded" => Frames::Rounded,

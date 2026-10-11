@@ -5,8 +5,14 @@ use crate::layout::{Border, PaneId};
 
 pub enum Mode {
     Normal,
-    /// The prefix key was pressed; the next key is a command.
-    Prefix,
+    /// The leader key was pressed; `typed` are the keys after it so far, and the menu shows
+    /// what can follow. `miss` says a key led nowhere.
+    Leader {
+        typed: Vec<crate::input::Key>,
+        miss: Option<String>,
+    },
+    /// Resizing panes with the arrows until Enter or Esc.
+    Resize,
     /// Browsing the focused pane's scrollback.
     Scroll,
     /// Typing a search in the focused pane's scrollback.
@@ -19,24 +25,63 @@ pub enum Mode {
     Help {
         scroll: u16,
     },
-    Confirm {
-        message: String,
-        action: ConfirmAction,
+    /// The messages kraal showed (and the warnings it had), newest first.
+    Messages {
+        scroll: u16,
     },
+    Confirm(Question),
+    /// Labels over what can be acted on in a pane.
+    Hints(HintsMode),
+}
+
+/// A question with two buttons.
+pub struct Question {
+    pub message: String,
+    pub action: ConfirmAction,
+    /// The confirming button is selected (Enter confirms); Cancel is, at first.
+    pub yes: bool,
+    /// First line of the message shown, when it is too long for the box.
+    pub scroll: u16,
+}
+
+/// Hints in progress.
+pub struct HintsMode {
+    pub pane: PaneId,
+    pub hints: Vec<crate::hints::Hint>,
+    /// The label typed so far.
+    pub typed: String,
+    /// A label opens or runs its target instead of copying it.
+    pub act: bool,
+    /// The pane as it was when the labels were made: shown under them while the pane goes on.
+    pub snapshot: Option<Box<ratatui::buffer::Buffer>>,
 }
 
 impl Mode {
+    /// What the status bar says the client is doing; nothing in normal use.
     pub fn label(&self) -> &'static str {
         match self {
-            Mode::Normal => "NORMAL",
-            Mode::Prefix => "PREFIX",
-            Mode::Scroll => "SCROLL",
+            Mode::Normal => "",
+            Mode::Leader { .. } => "MENU",
+            Mode::Resize => "RESIZE",
+            Mode::Scroll => "COPY",
             Mode::Search { .. } => "SEARCH",
-            Mode::Picker(_) => "PICK",
+            Mode::Picker(_) => "CHOOSE",
             Mode::Prompt(_) => "INPUT",
             Mode::Help { .. } => "HELP",
-            Mode::Confirm { .. } => "CONFIRM",
+            Mode::Messages { .. } => "MESSAGES",
+            Mode::Confirm(_) => "CONFIRM",
+            Mode::Hints(_) => "HINTS",
         }
+    }
+
+    /// The leader menu, at its start.
+    pub fn leader() -> Mode {
+        Mode::Leader { typed: Vec::new(), miss: None }
+    }
+
+    /// A question, Cancel selected.
+    pub fn confirm(message: impl Into<String>, action: ConfirmAction) -> Mode {
+        Mode::Confirm(Question { message: message.into(), action, yes: false, scroll: 0 })
     }
 }
 
@@ -64,17 +109,105 @@ pub enum ConfirmAction {
         label: String,
         script: String,
     },
+    /// Remove exactly this worktree, if it is still in the state the user was shown.
     RemoveWorktree {
-        pane: PaneId,
+        worktree: crate::git::Worktree,
+        state: crate::git::WorktreeState,
     },
+    /// Start a tool on a production pane.
+    RunTool {
+        pane: Option<PaneId>,
+        name: String,
+        selection: Option<String>,
+        /// The production reason the user was asked about.
+        reason: crate::server::contexts::Production,
+        /// Where the tool was asked for (see `Server::tool_place`): it runs there or not at all.
+        place: Option<String>,
+    },
+    /// Trust the version of a repository runbook being prepared, then go on preparing it.
+    TrustRunbook,
+    /// Run the runbook being prepared (its plan is the message).
+    RunRunbook,
+    /// Run a block of the Markdown runbook in progress; `production` is the target's production
+    /// reason the question showed (what a yes approves).
+    RunBlock {
+        index: usize,
+        production: Option<crate::server::contexts::Production>,
+    },
+    /// Input about to reach production panes: approve them for synced typing and send it.
+    Production {
+        workspace: u32,
+        /// Panes and the production reason the user is asked about.
+        approve: Vec<(PaneId, crate::server::contexts::Production)>,
+        pending: PendingInput,
+    },
+}
+
+impl ConfirmAction {
+    /// The confirming button: what will happen.
+    pub fn verb(&self) -> String {
+        match self {
+            ConfirmAction::ClosePane(_) => "Close pane".into(),
+            ConfirmAction::CloseTab { .. } => "Close tab".into(),
+            ConfirmAction::CloseWorkspace(_) => "Close workspace".into(),
+            ConfirmAction::Job { label, .. } | ConfirmAction::GitJob { label, .. } => {
+                let mut l = label.clone();
+                if let Some(first) = l.get_mut(..1) {
+                    first.make_ascii_uppercase();
+                }
+                l
+            }
+            ConfirmAction::SwitchAccount { .. } => "Switch account".into(),
+            ConfirmAction::RemoveWorktree { .. } => "Remove worktree".into(),
+            ConfirmAction::RunTool { .. } => "Run tool".into(),
+            ConfirmAction::TrustRunbook => "Trust this version".into(),
+            ConfirmAction::RunRunbook => "Run".into(),
+            ConfirmAction::RunBlock { .. } => "Send to the pane".into(),
+            ConfirmAction::Production { .. } => "Send".into(),
+        }
+    }
+
+    /// Production is involved, or the action destroys something.
+    pub fn danger(&self, message: &str) -> bool {
+        matches!(self, ConfirmAction::Production { .. } | ConfirmAction::RemoveWorktree { .. })
+            || matches!(self, ConfirmAction::Job { label, .. } if label == "delete" || label.contains("replace"))
+            || message.contains("PRODUCTION")
+            || message.contains(" is production (")
+    }
+}
+
+/// Input held back until a production confirmation is answered: keys and pastes, in order (a
+/// key, a paste, or what was typed while a context was read), and the panes they were going to
+/// with what made them production then. It goes to those panes, not to wherever the focus is by
+/// the time of the answer, and all of it goes or none: not at all if one of them became another
+/// production meanwhile.
+pub struct PendingInput {
+    pub items: Vec<InputItem>,
+    pub targets: Vec<(PaneId, Option<crate::server::contexts::Production>)>,
+}
+
+/// A key or a paste on its way to panes.
+pub enum InputItem {
+    Key(crate::input::Key),
+    Paste(Vec<u8>),
+    /// A piece of a paste too big to hold whole, going out as it comes; the flag says the piece
+    /// before it ended with CR. Never asked about: such a paste never goes to production.
+    Piece(Vec<u8>, bool),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum PickerKind {
+    /// Every command, to search and run.
+    Commands,
     Workspace,
     Ssh,
     Pane,
     Agent,
+    Tool,
+    Runbook,
+    RunbookTarget,
+    RunbookParam,
+    RunbookSteps,
 }
 
 #[derive(Clone)]
@@ -105,6 +238,23 @@ pub enum PickAction {
         pane: PaneId,
         op: String,
     },
+    /// A runbook file to run.
+    Runbook(std::path::PathBuf),
+    /// Where the runbook being prepared runs: a server or `@group`.
+    RunbookTarget(String),
+    /// The value of the parameter being asked.
+    RunbookValue(String),
+    /// Run a block of the Markdown runbook in progress.
+    RunBlock(usize),
+    /// Back to the list of runbooks.
+    RunbookList,
+    /// Start a tool for a pane.
+    Tool {
+        pane: Option<PaneId>,
+        name: String,
+    },
+    /// Run a command of the keymap.
+    Command(crate::keymap::Command),
     /// Point a file manager panel at `~` (local) or `server:~`.
     FilesSet {
         pane: PaneId,
@@ -124,22 +274,80 @@ pub struct PickItem {
     pub dim: bool,
 }
 
+impl PickItem {
+    pub fn new(label: impl Into<String>, detail: impl Into<String>, action: PickAction) -> PickItem {
+        PickItem { label: label.into(), detail: detail.into(), action, state: None, dim: false }
+    }
+
+    pub fn dim(self) -> PickItem {
+        PickItem { dim: true, ..self }
+    }
+
+    pub fn with_state(self, state: Option<AgentState>) -> PickItem {
+        PickItem { state, ..self }
+    }
+}
+
 pub struct Picker {
     pub kind: PickerKind,
     pub title: String,
     pub query: String,
+    /// Cursor in `query`, in characters.
+    pub cursor: usize,
     pub items: Vec<PickItem>,
     /// Indices into `items` matching the query, best first.
     pub filtered: Vec<usize>,
     pub selected: usize,
+    /// The list of actions on the selected item is open, at this one.
+    pub actions: Option<usize>,
+    /// What the picker waits for (a list read off the event loop), by request: keys typed
+    /// meanwhile stay here instead of reaching a pane.
+    pub loading: Option<u32>,
 }
 
 impl Picker {
     pub fn new(kind: PickerKind, title: &str, items: Vec<PickItem>) -> Picker {
-        let mut p =
-            Picker { kind, title: title.into(), query: String::new(), items, filtered: Vec::new(), selected: 0 };
+        let mut p = Picker {
+            kind,
+            title: title.into(),
+            query: String::new(),
+            cursor: 0,
+            items,
+            filtered: Vec::new(),
+            selected: 0,
+            actions: None,
+            loading: None,
+        };
         p.refilter();
         p
+    }
+
+    /// What can be done with the selected item: the key, and what it does. The first is Enter.
+    pub fn action_keys(&self) -> &'static [(&'static str, &'static str)] {
+        match self.kind {
+            PickerKind::Ssh => &[
+                ("enter", "Connect"),
+                ("ctrl+t", "Connect in a new tab"),
+                ("ctrl+f", "Browse its files"),
+                ("ctrl+r", "Run a command on it"),
+                ("ctrl+o", "Forward one of its ports"),
+                ("ctrl+e", "Edit saved servers"),
+                ("ctrl+x", "Remove saved server"),
+            ],
+            PickerKind::Agent => &[
+                ("enter", "Start"),
+                ("ctrl+t", "Start in a new tab"),
+                ("ctrl+l", "Log in to this account"),
+                ("ctrl+x", "Remove account (its files are kept)"),
+            ],
+            PickerKind::Workspace => &[("enter", "Open"), ("ctrl+x", "Close workspace")],
+            PickerKind::Runbook => &[("enter", "Run"), ("ctrl+e", "Edit")],
+            PickerKind::RunbookSteps => &[("enter", "Run step"), ("ctrl+y", "Copy step")],
+            PickerKind::Commands => &[("enter", "Run")],
+            PickerKind::Pane => &[("enter", "Go to pane")],
+            PickerKind::Tool => &[("enter", "Start tool")],
+            _ => &[("enter", "Choose")],
+        }
     }
 
     pub fn refilter(&mut self) {
@@ -204,6 +412,8 @@ pub enum PromptAction {
     },
     RenamePane(PaneId),
     RenameWorkspace(u32),
+    /// The value is the new workspace's name.
+    NewWorkspace,
     OpenPreview,
     SaveWorkspace(u32),
     /// Files dropped on an SSH pane: the value is the destination. Cancelling pastes `raw`.
@@ -238,25 +448,179 @@ pub enum PromptAction {
     Tunnel {
         server: String,
     },
+    /// The value of the runbook parameter being asked.
+    RunbookValue,
+}
+
+impl PromptAction {
+    /// What Enter does, for the prompt's footer.
+    pub fn verb(&self) -> &'static str {
+        match self {
+            PromptAction::RenameTab { .. } | PromptAction::RenamePane(_) | PromptAction::RenameWorkspace(_) => "rename",
+            PromptAction::NewWorkspace | PromptAction::NewWorktree { .. } => "create",
+            PromptAction::OpenPreview => "open",
+            PromptAction::SaveWorkspace(_) => "save",
+            PromptAction::Upload { .. } | PromptAction::UploadPick { .. } => "upload",
+            PromptAction::Download => "download",
+            PromptAction::AddAccount { .. } => "add",
+            PromptAction::Commit { .. } => "commit",
+            PromptAction::RunOn { .. } => "run",
+            PromptAction::Tunnel { .. } => "forward",
+            PromptAction::RunbookValue => "next",
+        }
+    }
 }
 
 pub struct Prompt {
     pub title: String,
     pub value: String,
+    /// Cursor in `value`, in characters.
+    pub cursor: usize,
     pub action: PromptAction,
+    /// Why the value was not accepted; the prompt stays open to fix it.
+    pub error: Option<String>,
+    /// What is typed is not shown (a secret).
+    pub masked: bool,
 }
 
 impl Prompt {
     pub fn new(title: &str, value: &str, action: PromptAction) -> Prompt {
-        Prompt { title: title.into(), value: value.into(), action }
+        Prompt {
+            title: title.into(),
+            value: value.into(),
+            cursor: value.chars().count(),
+            action,
+            error: None,
+            masked: false,
+        }
     }
+}
+
+/// Edit a one-line text field with `k`: cursor moves, deletions, typing. Returns false when `k`
+/// is not an editing key. `cursor` counts characters.
+pub fn edit_line(text: &mut String, cursor: &mut usize, k: &crate::input::Key) -> bool {
+    use crate::input::KeyCode as K;
+    let chars: Vec<char> = text.chars().collect();
+    let mut at = (*cursor).min(chars.len());
+    let word_left = |at: usize| {
+        let mut i = at;
+        while i > 0 && !chars[i - 1].is_alphanumeric() {
+            i -= 1;
+        }
+        while i > 0 && chars[i - 1].is_alphanumeric() {
+            i -= 1;
+        }
+        i
+    };
+    let word_right = |at: usize| {
+        let mut i = at;
+        while i < chars.len() && !chars[i].is_alphanumeric() {
+            i += 1;
+        }
+        while i < chars.len() && chars[i].is_alphanumeric() {
+            i += 1;
+        }
+        i
+    };
+    let (ctrl, alt) = (k.mods.ctrl, k.mods.alt);
+    let mut next: Vec<char> = chars.clone();
+    match k.code {
+        K::Left if alt || ctrl => at = word_left(at),
+        K::Right if alt || ctrl => at = word_right(at),
+        K::Left => at = at.saturating_sub(1),
+        K::Right => at = (at + 1).min(chars.len()),
+        K::Home => at = 0,
+        K::End => at = chars.len(),
+        K::Backspace if alt || ctrl => {
+            let from = word_left(at);
+            next.drain(from..at);
+            at = from;
+        }
+        K::Backspace if at > 0 => {
+            next.remove(at - 1);
+            at -= 1;
+        }
+        K::Backspace => {}
+        K::Delete if at < chars.len() => {
+            next.remove(at);
+        }
+        K::Delete => {}
+        K::Char(c) if ctrl => match c {
+            'a' => at = 0,
+            'e' => at = chars.len(),
+            'b' => at = at.saturating_sub(1),
+            'f' => at = (at + 1).min(chars.len()),
+            'd' if at < chars.len() => {
+                next.remove(at);
+            }
+            'h' if at > 0 => {
+                next.remove(at - 1);
+                at -= 1;
+            }
+            'w' => {
+                // Back to the previous space or slash, like a shell.
+                let mut from = at;
+                while from > 0 && matches!(chars[from - 1], ' ' | '/') {
+                    from -= 1;
+                }
+                while from > 0 && !matches!(chars[from - 1], ' ' | '/') {
+                    from -= 1;
+                }
+                next.drain(from..at);
+                at = from;
+            }
+            'u' => {
+                next.drain(..at);
+                at = 0;
+            }
+            'k' => {
+                next.truncate(at);
+            }
+            _ => return false,
+        },
+        K::Char('b') if alt => at = word_left(at),
+        K::Char('f') if alt => at = word_right(at),
+        K::Char('d') if alt => {
+            let to = word_right(at);
+            next.drain(at..to);
+        }
+        K::Char(_) if alt => return false,
+        K::Char(_) if chars.len() >= MAX_FIELD => {}
+        K::Char(c) => {
+            next.insert(at, c);
+            at += 1;
+        }
+        _ => return false,
+    }
+    *text = next.into_iter().collect();
+    *cursor = at;
+    true
+}
+
+/// The longest a one-line field gets: a path, a command, a name.
+pub const MAX_FIELD: usize = 4096;
+
+/// Insert pasted text (its first line) at the cursor; refused whole when it does not fit.
+pub fn paste_line(text: &mut String, cursor: &mut usize, pasted: &str) -> Result<(), String> {
+    let line = pasted.lines().next().unwrap_or("");
+    if text.chars().count() + line.chars().count() > MAX_FIELD {
+        return Err(format!("Too long to paste: a field holds at most {MAX_FIELD} characters."));
+    }
+    let at: usize = text.char_indices().nth(*cursor).map(|(i, _)| i).unwrap_or(text.len());
+    text.insert_str(at, line);
+    *cursor += line.chars().count();
+    Ok(())
 }
 
 /// A mouse drag in progress.
 pub enum Drag {
     Border(Border),
+    /// Selecting text: `from` is where the button went down; `moved`, whether the selection
+    /// covers more than that press (a drag, or a double/triple click).
     Select {
         pane: PaneId,
+        from: (u16, u16),
+        moved: bool,
     },
     MoveFloat {
         pane: PaneId,
@@ -269,6 +633,7 @@ pub enum Drag {
     /// Press went to a program that handles the mouse itself; drag and release follow it.
     Forward {
         pane: PaneId,
+        button: crate::input::MouseButton,
     },
 }
 
@@ -312,6 +677,33 @@ mod tests {
         assert!(fuzzy_score("xyz", "tig").is_none());
         assert_eq!(fuzzy_score("", "anything"), Some(0));
         assert!(fuzzy_score("worker1", "admin@worker10.lan").is_some());
+    }
+
+    #[test]
+    fn line_editing() {
+        use crate::input::{Key, KeyCode, Mods};
+        let key = |code: KeyCode, mods: Mods| Key { code, mods, raw: Vec::new() };
+        let ch = |c: char| key(KeyCode::Char(c), Mods::NONE);
+        let ctrl = |c: char| key(KeyCode::Char(c), Mods::CTRL);
+        let (mut t, mut c) = (String::from("kraal web"), 9);
+        assert!(edit_line(&mut t, &mut c, &key(KeyCode::Left, Mods::ALT)));
+        assert_eq!(c, 6);
+        edit_line(&mut t, &mut c, &ch('X'));
+        assert_eq!((t.as_str(), c), ("kraal Xweb", 7));
+        edit_line(&mut t, &mut c, &ctrl('a'));
+        edit_line(&mut t, &mut c, &key(KeyCode::Delete, Mods::NONE));
+        assert_eq!(t, "raal Xweb");
+        edit_line(&mut t, &mut c, &ctrl('e'));
+        edit_line(&mut t, &mut c, &ctrl('w'));
+        assert_eq!(t, "raal ");
+        edit_line(&mut t, &mut c, &key(KeyCode::Home, Mods::NONE));
+        edit_line(&mut t, &mut c, &ctrl('k'));
+        assert_eq!((t.as_str(), c), ("", 0));
+        assert!(!edit_line(&mut t, &mut c, &key(KeyCode::Enter, Mods::NONE)));
+        let (mut t, mut c) = (String::from("é日"), 1);
+        paste_line(&mut t, &mut c, "ab\ncd").unwrap();
+        assert!(paste_line(&mut t, &mut c, &"x".repeat(MAX_FIELD)).is_err(), "refused whole");
+        assert_eq!((t.as_str(), c), ("éab日", 3));
     }
 
     #[test]
