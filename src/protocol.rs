@@ -66,6 +66,9 @@ pub enum ClientMsg {
         /// The client runs on another machine than the server (attached over ssh).
         #[serde(default)]
         remote: bool,
+        /// A pane to show first (an id or a name), in place of the workspace.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pane: Option<String>,
     },
     Resize {
         cols: u16,

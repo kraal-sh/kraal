@@ -16,6 +16,7 @@ jump = "bastion"     # optional ProxyJump, by name or user@host; a jump host wit
 identity = "~/.ssh/db"  # optional; more_identities = ["~/.ssh/other"] for keys tried after it
                         # ("IdentityFile=%d/.ssh/%h" passes ssh's option, tokens and all, not -i)
 groups = ["prod"]
+agents = "main"      # optional: list the agents of the kraal session "main" there (see below)
 ```
 
 It also knows the `ssh` panes of your workspace files (grouped by workspace) and the hosts of
@@ -102,3 +103,23 @@ kraal attach --host db                 # attach to db's kraal; ctrl+c gives up w
 
 Ctrl+click on a link in a remote session opens it on your machine. A `localhost` address there is
 the server's, not yours: kraal copies it and says so instead of opening the wrong page.
+
+### Agents on your servers
+
+The agents of a kraal session on a server show in your sidebar under AGENTS, after the server's
+name (`gpu › api`), with their state. `kraal attach --host gpu` sets `agents = "main"` (the
+session it attached to) on that server's entry in servers.toml; `kraal servers add … --agents
+main` or a line in the file does the same. Attaching leaves a value already there as it is, and
+`agents = "none"` turns it off. A server not in servers.toml yet is added, unless
+`auto_add = false`.
+
+Only the servers marked this way are watched, each over one ssh that stays open and runs
+`kraal agents --follow` there. That ssh never asks anything (BatchMode): the server must take
+your key without a prompt. A server that does not answer, or has no kraal (`kraal remote-install
+gpu`), is reported once, then tried again less and less often, at most a minute apart; its agents
+leave the list until it is back.
+
+A click on one, Enter in the pane finder (`ctrl+b p`), or `alt+a` when it waits for you opens a
+tab attached to that session, with the agent's pane shown; a tab already attached to it is used
+instead. An agent there that gets blocked or finishes is announced like a local one, unless a tab
+is attached to its session: that session's own notification then comes through the tab.

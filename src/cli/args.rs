@@ -28,12 +28,15 @@ pub struct Cli {
 pub enum Cmd {
     /// Attach to the session (starting it if needed), optionally opening a workspace. With
     /// --host, attach to the kraal running on that server, reconnecting by itself if the
-    /// connection drops.
+    /// connection drops; the sidebar then lists that session's agents.
     Attach {
         workspace: Option<String>,
         /// A server from `kraal servers`, or user@host[:port].
         #[arg(long)]
         host: Option<String>,
+        /// With --host: show this pane of the session first (an id or a name).
+        #[arg(long, requires = "host")]
+        pane: Option<String>,
     },
     /// Install this kraal binary on a server (same OS and architecture), for `attach --host`.
     RemoteInstall { server: String },
@@ -75,6 +78,10 @@ pub enum Cmd {
     Agents {
         #[arg(long)]
         json: bool,
+        /// Print the list as one JSON line, then again each time it changes; a session that is
+        /// not running has no agents until it starts.
+        #[arg(long)]
+        follow: bool,
     },
     /// Run a command in a new pane.
     Run(RunArgs),
@@ -476,6 +483,9 @@ pub enum ServersCmd {
         env: Option<String>,
         #[arg(long)]
         note: Option<String>,
+        /// The kraal session on the server whose agents the sidebar lists (e.g. main).
+        #[arg(long, value_name = "SESSION")]
+        agents: Option<String>,
     },
     /// Remove a server from the inventory.
     Rm { name: String },

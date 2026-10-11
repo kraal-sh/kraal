@@ -50,6 +50,11 @@ pub enum SideItem {
     Tunnel(u16),
     /// A local port a pane's program listens on.
     Port(u16),
+    /// An agent of a server's kraal session: the server, and its pane's id there.
+    Remote {
+        server: String,
+        pane: u32,
+    },
 }
 
 impl Server {
@@ -420,7 +425,9 @@ impl Server {
             }
         } else if normal && waiting > 0 {
             // Long commands that ended out of sight wait too: then they are panes, not agents.
-            let agents = self.panes.values().filter(|p| p.agent.state.needs_attention()).count() == waiting;
+            let agents = self.panes.values().filter(|p| p.agent.state.needs_attention()).count()
+                + self.remote_agents().filter(|(_, a)| a.state.needs_attention()).count()
+                == waiting;
             notice.push(Span::styled(
                 format!(
                     "{} {waiting} {}{} need{} you",
@@ -496,11 +503,13 @@ impl Server {
         out
     }
 
-    /// Agents across all workspaces: how many are blocked, done and working.
+    /// Agents across all workspaces and the servers watched: how many are blocked, done and
+    /// working.
     fn agent_counts(&self) -> Vec<Span<'static>> {
         let (mut blocked, mut working, mut done) = (0, 0, 0);
-        for p in self.panes.values() {
-            match p.agent.state {
+        let remote = self.remote_agents().map(|(_, a)| a.state);
+        for state in self.panes.values().map(|p| p.agent.state).chain(remote) {
+            match state {
                 AgentState::Blocked => blocked += 1,
                 AgentState::Working => working += 1,
                 AgentState::Done => done += 1,
@@ -608,7 +617,9 @@ impl Server {
         }
 
         // Agents, with their state and what runs them; the workspace when it is not this one.
-        if !agents.is_empty() {
+        // Then those of the servers watched, after their server's name.
+        let remote: Vec<(&str, &super::remote::RemoteAgent)> = self.remote_agents().collect();
+        if !agents.is_empty() || !remote.is_empty() {
             rows.push(SideRow::Blank);
             rows.push(SideRow::Section("AGENTS"));
             for (p, s, ws) in agents {
@@ -630,6 +641,17 @@ impl Server {
                     faint(detail, color),
                     false,
                 );
+            }
+            let path = if t.ascii { " > " } else { " › " };
+            for (server, a) in remote {
+                let color = t.state_color(a.state);
+                let item = SideItem::Remote { server: server.to_string(), pane: a.pane };
+                let name =
+                    vec![dot(t.icon(a.state), color), faint(format!("{server}{path}"), t.dim), strong(a.name.clone())];
+                let detail = format!("{}{sep}{}{sep}{}", a.state.label(), a.agent, a.workspace);
+                rows.push(SideRow::Entry { item: Some(item.clone()), line: Line::from(name), selected: false });
+                let detail = Line::from(vec![Span::raw("   "), faint(detail, color)]);
+                rows.push(SideRow::Entry { item: Some(item), line: detail, selected: false });
             }
         }
 

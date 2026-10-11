@@ -20,6 +20,7 @@ mod overlays;
 mod panes;
 mod persistence;
 mod reload;
+pub mod remote;
 mod render;
 mod requests;
 pub mod runbooks;
@@ -75,6 +76,8 @@ pub enum Event {
     Emit(&'static str, serde_json::Value),
     /// A job started with [`Server::background`] finished with this result.
     Job(u32, Box<dyn std::any::Any + Send>),
+    /// The agents a server's session has now, from the connection with this id.
+    RemoteAgents(u32, Vec<remote::RemoteAgent>),
     Shutdown,
 }
 
@@ -415,6 +418,8 @@ pub struct Server {
     /// Writes run logs and the run ledger, in order, off the event loop.
     run_logs: Sender<crate::runbooks::LogJob>,
     pub tunnels: Vec<net::Tunnel>,
+    /// Servers whose kraal session's agents are listed.
+    pub remotes: Vec<remote::Watch>,
     /// Ports mentioned in pane output, and those of them something listens on.
     port_candidates: HashMap<u16, PaneId>,
     pub ports: std::collections::BTreeMap<u16, PaneId>,
@@ -558,6 +563,7 @@ pub fn run(session: &str) -> Result<()> {
         sidebar_was_useful: false,
         broadcast_tip_shown: false,
         tunnels: Vec::new(),
+        remotes: Vec::new(),
         port_candidates: HashMap::new(),
         ports: Default::default(),
         git: HashMap::new(),
@@ -905,6 +911,7 @@ impl Server {
             self.refresh_ports();
         }
         self.check_tunnels();
+        self.check_remotes();
         if self.last_codex_poll.elapsed() > Duration::from_secs(300) {
             self.poll_codex_usage();
         }
@@ -944,6 +951,7 @@ impl Server {
                     done(self, result);
                 }
             }
+            Event::RemoteAgents(conn, list) => self.remote_list(conn, list),
             Event::Wake => {
                 let mut changed = false;
                 for p in self.panes.values_mut() {
@@ -1129,6 +1137,7 @@ impl Server {
             p.kill();
         }
         self.stop_tunnels();
+        self.stop_remotes();
         // Give writer threads a moment to deliver the exit messages.
         std::thread::sleep(Duration::from_millis(50));
     }

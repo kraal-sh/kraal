@@ -238,6 +238,7 @@ impl Server {
                 Err(e) => self.toast(id, format!("{e:#}")),
             },
             PickAction::FocusPane(pane) => self.reveal(id, pane),
+            PickAction::RemoteAgent { server, pane } => self.go_to_remote(id, &server, pane),
             PickAction::FilesSet { pane, side, target } => self.files_set(pane, side, &target),
             PickAction::Runbook(path) => return self.pick_runbook(id, &path),
             PickAction::RunbookTarget(spec) => return self.set_draft_target(id, &spec),
@@ -399,6 +400,16 @@ impl Server {
                     });
                 }
             }
+        }
+        // The agents of the servers watched: Enter attaches to their session.
+        for (server, a) in self.remote_agents() {
+            items.push(PickItem {
+                label: format!("{server} › {} › {}", a.workspace, a.name),
+                detail: format!("{} {} · kraal on {server}", a.agent, a.state.label()),
+                action: PickAction::RemoteAgent { server: server.to_string(), pane: a.pane },
+                state: Some(a.state),
+                dim: false,
+            });
         }
         Picker::new(PickerKind::Pane, "Find a pane", items)
     }

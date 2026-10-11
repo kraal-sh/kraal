@@ -29,7 +29,8 @@ waiting for you.
 
 - **Never hunt for the stuck agent.** Claude Code, Codex, OpenCode, Gemini and a dozen others are
   marked working, blocked or done, in the sidebar and on their pane, with a desktop notification.
-  `alt+a` jumps to the next one that needs you.
+  Those running in kraal on your servers are listed too. `alt+a` jumps to the next one that needs
+  you.
 - **Several agents on one repository.** Start an agent in its own worktree and branch, then
   review, commit, open a pull request or merge without leaving kraal.
 - **Every subscription you pay for.** A personal and a work Claude plan, two Codex plans: kraal
@@ -142,8 +143,7 @@ nobody uses it daily yet; Windows is not supported. Known gaps:
 
 - Images in panes need a terminal that draws kitty graphics with Unicode placeholders (Ghostty,
   kitty).
-- Agents running in a remote session are not listed in your local sidebar yet, and Kubernetes,
-  Terraform and AWS contexts are read for local panes only.
+- Kubernetes, Terraform and AWS contexts are read for local panes only.
 - Agent states come from hooks for Claude Code, and for the end of Codex's turns; otherwise they
   are read from the screen and can lag.
 

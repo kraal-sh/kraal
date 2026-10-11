@@ -6,9 +6,16 @@ use super::{ClientId, Server, frame_bytes};
 use crate::agent::AgentState;
 use crate::config::NotifyMode;
 use crate::layout::PaneId;
-use crate::pane::Pane;
 /// Warnings kept while no client is attached.
 const MAX_PENDING_WARNINGS: usize = 50;
+
+/// Something that needs the user: a pane here, or an agent of a server's kraal session (its
+/// pane's id there).
+#[derive(Debug, Clone, PartialEq)]
+pub enum Attention {
+    Pane(PaneId),
+    Remote { server: String, pane: u32 },
+}
 
 impl Server {
     /// Focused pane of the tab a client is looking at.
@@ -99,22 +106,41 @@ impl Server {
         }
     }
 
-    /// Panes needing attention: blocked agents first, then finished agents and long commands,
-    /// oldest first.
-    pub fn attention_queue(&self) -> Vec<PaneId> {
-        let mut v: Vec<(&Pane, bool, Instant)> = self
+    /// What needs attention: blocked agents first, then finished agents and long commands,
+    /// oldest first; agents of the servers watched among them.
+    pub fn attention_queue(&self) -> Vec<Attention> {
+        let mut v: Vec<(Attention, bool, Instant)> = self
             .panes
             .values()
             .filter_map(|p| {
                 if p.agent.state.needs_attention() {
-                    Some((p, p.agent.state != AgentState::Blocked, p.agent.since))
+                    Some((Attention::Pane(p.id), p.agent.state != AgentState::Blocked, p.agent.since))
                 } else {
-                    p.command_unseen().map(|at| (p, true, at))
+                    p.command_unseen().map(|at| (Attention::Pane(p.id), true, at))
                 }
             })
             .collect();
+        v.extend(self.remote_agents().filter(|(_, a)| a.state.needs_attention()).map(|(server, a)| {
+            (Attention::Remote { server: server.to_string(), pane: a.pane }, a.state != AgentState::Blocked, a.since)
+        }));
         v.sort_by_key(|(_, later, at)| (*later, *at));
-        v.into_iter().map(|(p, ..)| p.id).collect()
+        v.into_iter().map(|(a, ..)| a).collect()
+    }
+
+    /// Whether `client` is looking at what needs attention.
+    pub(super) fn attention_shown(&self, client: ClientId, a: &Attention) -> bool {
+        match a {
+            Attention::Pane(p) => self.client_focus(client) == Some(*p),
+            Attention::Remote { server, pane } => self.remote_shown(client, server, *pane),
+        }
+    }
+
+    /// Take `client` to what needs attention.
+    pub(super) fn go_to(&mut self, client: ClientId, a: Attention) {
+        match a {
+            Attention::Pane(p) => self.reveal(client, p),
+            Attention::Remote { server, pane } => self.go_to_remote(client, &server, pane),
+        }
     }
 
     /// Whether some attached client is looking at this pane right now.

@@ -220,6 +220,11 @@ pub enum PickAction {
     Ssh(String),
     SshGroup(String),
     FocusPane(PaneId),
+    /// An agent of a server's kraal session: the server, and its pane's id there.
+    RemoteAgent {
+        server: String,
+        pane: u32,
+    },
     AgentLaunch {
         agent: String,
         account: String,

@@ -86,8 +86,8 @@ fn run(cli: Cli) -> Result<()> {
     let done = |r: Result<Response>| r.map(|_| ());
     match cli.command {
         None => session::attach(&s.name, cli.workspace),
-        Some(Cmd::Attach { workspace, host: None }) => session::attach(&s.name, workspace),
-        Some(Cmd::Attach { workspace, host: Some(host) }) => remote::attach(&s.name, &host, workspace),
+        Some(Cmd::Attach { workspace, host: None, .. }) => session::attach(&s.name, workspace),
+        Some(Cmd::Attach { workspace, host: Some(host), pane }) => remote::attach(&s.name, &host, workspace, pane),
         Some(Cmd::RemoteInstall { server }) => remote::install(&server),
         Some(Cmd::Update { check, to, force }) => update::update(check, to, force),
         Some(Cmd::Proxy) => client::proxy(&s.name),
@@ -100,7 +100,8 @@ fn run(cli: Cli) -> Result<()> {
         Some(Cmd::Save { name, workspace }) => session::save(&s, name, workspace),
         Some(Cmd::ImportZellij { from, force }) => session::import_zellij(from, force),
         Some(Cmd::Panes { json }) => panes::list(&s, json, false),
-        Some(Cmd::Agents { json }) => panes::list(&s, json, true),
+        Some(Cmd::Agents { follow: true, .. }) => panes::follow_agents(&s),
+        Some(Cmd::Agents { json, .. }) => panes::list(&s, json, true),
         Some(Cmd::Run(args)) => panes::run(&s, args),
         Some(Cmd::Preview { path, place }) => panes::preview(&s, path, place),
         Some(Cmd::Send { pane, enter, production, text }) => panes::send(&s, pane, enter, production, text),

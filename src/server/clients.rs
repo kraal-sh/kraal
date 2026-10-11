@@ -95,7 +95,7 @@ impl Server {
             }
         };
         match msg {
-            ClientMsg::Attach { version, cols, rows, workspace, remote } => {
+            ClientMsg::Attach { version, cols, rows, workspace, remote, pane } => {
                 if let Some(c) = self.clients.get_mut(&id) {
                     c.remote = remote;
                 }
@@ -105,6 +105,13 @@ impl Server {
                     return;
                 }
                 self.attach(id, cols, rows, workspace);
+                // A pane asked for (an agent chosen from another kraal's sidebar) is shown.
+                if let Some(p) = pane {
+                    match self.resolve(&p) {
+                        Ok(p) => self.reveal(id, p),
+                        Err(e) => self.warnings.push(e),
+                    }
+                }
             }
             ClientMsg::Resize { cols, rows } => {
                 let (cols, rows) = clamp_size(cols, rows);

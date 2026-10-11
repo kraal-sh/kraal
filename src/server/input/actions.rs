@@ -185,9 +185,9 @@ impl Server {
             },
             Action::NextAttention => {
                 let queue = self.attention_queue();
-                let next = queue.iter().copied().find(|p| Some(*p) != focus).or(queue.first().copied());
+                let next = queue.iter().find(|a| !self.attention_shown(id, a)).or(queue.first()).cloned();
                 match next {
-                    Some(p) => self.reveal(id, p),
+                    Some(a) => self.go_to(id, a),
                     None => self.toast(id, "no agent needs you"),
                 }
             }

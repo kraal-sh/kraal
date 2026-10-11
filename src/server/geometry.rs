@@ -32,6 +32,7 @@ impl Server {
             || !self.tunnels.is_empty()
             || !self.ports.is_empty()
             || self.panes.values().any(|p| p.agent.kind.is_some())
+            || self.remote_agents().next().is_some()
     }
 
     /// Outer rectangle of every visible pane of a tab, in draw order (tiled, then floating).
