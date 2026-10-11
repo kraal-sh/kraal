@@ -1,8 +1,8 @@
 //! Run one command on many servers at once (`kraal exec @prod -- uptime`).
 
 use std::collections::VecDeque;
-use std::io::Read;
-use std::process::{Command, Stdio};
+use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -26,32 +26,45 @@ impl Outcome {
     }
 }
 
-/// Run `command` (a remote shell command line, as `ssh host command` takes it) on every server,
-/// `parallel` at a time. `ssh_options` gives each server's ssh options (without destination).
-/// `done` is called as each server finishes, in completion order.
-pub fn run_all(
-    servers: Vec<Server>,
-    command: &str,
-    ssh_options: &(dyn Fn(&Server) -> Vec<String> + Sync),
-    parallel: usize,
-    timeout: Duration,
-    done: &(dyn Fn(&Outcome) + Sync),
-) -> Vec<Outcome> {
+/// How to run a command on many servers.
+pub struct Plan<'a> {
+    /// A remote shell command line, as `ssh host command` takes it.
+    pub command: &'a str,
+    /// Each server's ssh options (without destination).
+    pub ssh_options: &'a (dyn Fn(&Server) -> Vec<String> + Sync),
+    pub parallel: usize,
+    pub timeout: Duration,
+    /// Set to stop: nothing more starts, and what runs is killed (with its descendants).
+    pub cancel: &'a AtomicBool,
+}
+
+/// Run `plan.command` on every server, `plan.parallel` at a time. `done` is called as each
+/// server finishes, in completion order. Servers not started because of a cancellation have no
+/// outcome.
+pub fn run_all(servers: Vec<Server>, plan: &Plan, done: &(dyn Fn(&Outcome) + Sync)) -> Vec<Outcome> {
+    run_all_with("ssh", servers, plan, done)
+}
+
+/// [`run_all`] with another `ssh` program (tests).
+fn run_all_with(ssh: &str, servers: Vec<Server>, plan: &Plan, done: &(dyn Fn(&Outcome) + Sync)) -> Vec<Outcome> {
     let queue = Arc::new(Mutex::new(servers.into_iter().collect::<VecDeque<_>>()));
     let results = Arc::new(Mutex::new(Vec::new()));
     std::thread::scope(|scope| {
-        for _ in 0..parallel.max(1) {
+        for _ in 0..plan.parallel.max(1) {
             let queue = queue.clone();
             let results = results.clone();
             scope.spawn(move || {
                 loop {
+                    if plan.cancel.load(Ordering::SeqCst) {
+                        break;
+                    }
                     let Some(server) = queue.lock().unwrap().pop_front() else { break };
-                    let mut args = ssh_options(&server);
+                    let mut args = (plan.ssh_options)(&server);
                     // Never wait for a password or a host key prompt: fail fast instead.
                     args.extend(["-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-T"].map(String::from));
                     args.push(server.destination());
-                    args.push(command.to_string());
-                    let outcome = run_one(&server.name, &args, timeout);
+                    args.push(plan.command.to_string());
+                    let outcome = run_one(ssh, &server.name, &args, plan.timeout, plan.cancel);
                     done(&outcome);
                     results.lock().unwrap().push(outcome);
                 }
@@ -61,7 +74,11 @@ pub fn run_all(
     Arc::try_unwrap(results).map(|m| m.into_inner().unwrap()).unwrap_or_default()
 }
 
-fn run_one(name: &str, ssh_args: &[String], timeout: Duration) -> Outcome {
+/// Output kept per server and stream; the rest is dropped (a noisy command on a big fleet must
+/// not exhaust memory).
+const OUTPUT_LIMIT: usize = 1 << 20;
+
+fn run_one(ssh: &str, name: &str, ssh_args: &[String], timeout: Duration, cancel: &AtomicBool) -> Outcome {
     let start = Instant::now();
     let mut outcome = Outcome {
         server: name.to_string(),
@@ -71,49 +88,23 @@ fn run_one(name: &str, ssh_args: &[String], timeout: Duration) -> Outcome {
         elapsed: Duration::ZERO,
         error: None,
     };
-    let child =
-        Command::new("ssh").args(ssh_args).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn();
-    let mut child = match child {
-        Ok(c) => c,
-        Err(e) => {
-            outcome.error = Some(format!("cannot run ssh: {e}"));
-            return outcome;
-        }
-    };
-    // Read both pipes on threads so a chatty command cannot block on a full pipe.
-    let mut out = child.stdout.take().unwrap();
-    let mut err = child.stderr.take().unwrap();
-    let out_t = std::thread::spawn(move || {
-        let mut b = Vec::new();
-        let _ = out.read_to_end(&mut b);
-        b
-    });
-    let err_t = std::thread::spawn(move || {
-        let mut b = Vec::new();
-        let _ = err.read_to_end(&mut b);
-        b
-    });
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                outcome.code = status.code();
-                break;
+    match crate::exec::run_cancellable(Command::new(ssh).args(ssh_args), timeout, OUTPUT_LIMIT, cancel) {
+        Ok(out) => {
+            outcome.code = out.code;
+            outcome.stdout = out.stdout_text();
+            outcome.stderr = out.stderr_text();
+            if out.truncated {
+                outcome.stderr.push_str(&format!("[kraal: output cut at {} KiB]\n", OUTPUT_LIMIT >> 10));
             }
-            Ok(None) if start.elapsed() > timeout => {
-                let _ = child.kill();
-                let _ = child.wait();
+            if out.timed_out {
                 outcome.error = Some(format!("timed out after {}s", timeout.as_secs()));
-                break;
             }
-            Ok(None) => std::thread::sleep(Duration::from_millis(20)),
-            Err(e) => {
-                outcome.error = Some(e.to_string());
-                break;
+            if out.cancelled {
+                outcome.error = Some("cancelled".into());
             }
         }
+        Err(e) => outcome.error = Some(format!("cannot run ssh: {e}")),
     }
-    outcome.stdout = String::from_utf8_lossy(&out_t.join().unwrap_or_default()).into_owned();
-    outcome.stderr = String::from_utf8_lossy(&err_t.join().unwrap_or_default()).into_owned();
     outcome.elapsed = start.elapsed();
     outcome
 }
@@ -157,21 +148,23 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("kraal-fleet-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let fake = dir.join("ssh");
-        std::fs::write(&fake, "#!/bin/sh\nfor a; do dest=$cmd; cmd=$a; done\ncase $dest in *bad*) echo oops >&2; exit 3;; esac\necho \"$dest says $cmd\"\n").unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
-        // SAFETY: tests in this module do not read PATH concurrently with this change.
-        let path = format!("{}:{}", dir.display(), std::env::var("PATH").unwrap_or_default());
-        unsafe { std::env::set_var("PATH", path) };
+        crate::testing::write_script(
+            &fake,
+            "#!/bin/sh\nfor a; do dest=$cmd; cmd=$a; done\ncase $dest in *bad*) echo oops >&2; exit 3;; esac\necho \"$dest says $cmd\"\n",
+        );
         let mk = |n: &str| Server { name: n.into(), host: format!("{n}.lan"), ..Default::default() };
         let seen = Mutex::new(Vec::new());
-        let results =
-            run_all(vec![mk("a"), mk("b"), mk("bad")], "uptime", &|_| Vec::new(), 2, Duration::from_secs(10), &|o| {
-                seen.lock().unwrap().push(o.server.clone())
-            });
+        let cancel = AtomicBool::new(false);
+        let plan = Plan {
+            command: "uptime",
+            ssh_options: &|_| Vec::new(),
+            parallel: 2,
+            timeout: Duration::from_secs(10),
+            cancel: &cancel,
+        };
+        let results = run_all_with(&fake.display().to_string(), vec![mk("a"), mk("b"), mk("bad")], &plan, &|o| {
+            seen.lock().unwrap().push(o.server.clone())
+        });
         assert_eq!(results.len(), 3);
         assert_eq!(seen.lock().unwrap().len(), 3);
         let a = results.iter().find(|o| o.server == "a").unwrap();
@@ -181,6 +174,57 @@ mod tests {
         assert_eq!((bad.ok(), bad.code), (false, Some(3)));
         assert!(format_outcome(bad, false).contains("✗ exit 3 bad"));
         assert!(format_outcome(bad, false).contains("  oops"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_cancelled_run_stops_everything_it_started() {
+        let dir = std::env::temp_dir().join(format!("kraal-fleet-cancel-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // A fake ssh that leaves a process behind it, and says which.
+        let fake = dir.join("ssh");
+        let pids = dir.join("pids");
+        crate::testing::write_script(
+            &fake,
+            &format!(
+                "#!/bin/sh
+sleep 30 &
+echo $! >> {}
+wait
+",
+                pids.display()
+            ),
+        );
+        let mk = |n: &str| Server { name: n.into(), host: format!("{n}.lan"), ..Default::default() };
+        let cancel = AtomicBool::new(false);
+        let plan = Plan {
+            command: "true",
+            ssh_options: &|_| Vec::new(),
+            parallel: 2,
+            timeout: Duration::from_secs(60),
+            cancel: &cancel,
+        };
+        let start = Instant::now();
+        let results = std::thread::scope(|s| {
+            s.spawn(|| {
+                std::thread::sleep(Duration::from_millis(500));
+                cancel.store(true, Ordering::SeqCst);
+            });
+            run_all_with(&fake.display().to_string(), vec![mk("a"), mk("b"), mk("c")], &plan, &|_| {})
+        });
+        assert!(start.elapsed() < Duration::from_secs(10));
+        assert_eq!(results.len(), 2, "the third never started");
+        assert!(results.iter().all(|o| o.error.as_deref() == Some("cancelled")), "{results:?}");
+        for pid in std::fs::read_to_string(&pids).unwrap().lines() {
+            let pid: libc::pid_t = pid.trim().parse().unwrap();
+            let start = Instant::now();
+            // SAFETY: signal 0 only checks that the process exists.
+            while unsafe { libc::kill(pid, 0) } == 0 && start.elapsed() < Duration::from_secs(5) {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            // SAFETY: as above.
+            assert_ne!(unsafe { libc::kill(pid, 0) }, 0, "sleep {pid} was left running");
+        }
         let _ = std::fs::remove_dir_all(dir);
     }
 }
