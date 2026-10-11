@@ -4,7 +4,7 @@
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 
 use super::ui::{ConfirmAction, Mode, PickAction, PickItem, Picker, PickerKind};
 use super::{ClientId, Server};
@@ -26,11 +26,24 @@ fn conversations_move(agent: &str) -> bool {
     accounts::agent_kind(agent).is_some_and(|k| k.shared.contains(&"projects"))
 }
 
+/// Why a pane waits for Enter before its agent starts again.
+pub(super) const AMBIGUOUS: &str =
+    "kraal cannot tell this command's options from a prompt it would send again: check it, Enter runs it as shown";
+
 impl Server {
     pub(super) fn reload_accounts(&mut self) {
         match Accounts::load() {
-            Ok(a) => self.accounts = a,
-            Err(e) => self.warnings.push(format!("{e:#}")),
+            Ok(a) => {
+                self.accounts = a;
+                self.accounts_error = None;
+            }
+            Err(e) => {
+                let e = format!("{e:#}");
+                if self.accounts_error.as_ref() != Some(&e) {
+                    self.warnings.push(e.clone());
+                    self.accounts_error = Some(e);
+                }
+            }
         }
     }
 
@@ -72,12 +85,65 @@ impl Server {
         })
     }
 
-    /// Rebuild an agent pane's spec so that starting it again resumes its conversation.
-    pub fn resume_spec(&self, spec: &PaneSpec, session: Option<&str>) -> PaneSpec {
-        let Some((agent, name)) = spec.account.as_deref().and_then(|k| k.split_once(':')) else { return spec.clone() };
-        let Some(a) = self.accounts.get(agent, name) else { return spec.clone() };
-        let session = session.or(spec.session.as_deref());
-        self.agent_spec(&a, spec.cwd.clone(), session, &[]).unwrap_or_else(|_| spec.clone())
+    /// Rebuild an agent pane's spec so that starting it again resumes its conversation, with
+    /// the options it was started with (never a prompt given on its command line: it would be
+    /// sent again). `session` is the conversation seen running; the id the pane was started
+    /// with counts only once a conversation exists under it (a pane that never ran starts the
+    /// conversation it was meant to). The flag says whether that may happen by itself (a
+    /// restore): not for a one-shot run (`claude -p`), which stays as it was, nor when a prompt
+    /// was left out or would be sent; those wait for Enter.
+    pub fn resume_spec(&self, spec: &PaneSpec, session: Option<&str>) -> (PaneSpec, bool) {
+        let Some((agent, name)) = spec.account.as_deref().and_then(|k| k.split_once(':')) else {
+            return (spec.clone(), false);
+        };
+        let (Some(a), Some(kind)) = (self.accounts.get(agent, name), accounts::agent_kind(agent)) else {
+            return (spec.clone(), false);
+        };
+        let Some((args, exact)) = accounts::resumable_args(kind, &accounts::launch_args(kind, &spec.command)) else {
+            return (spec.clone(), false);
+        };
+        // When its files cannot be read, the conversation may exist: resume it, but only on Enter.
+        let (reserved, readable) = match spec.session.as_deref().map(|id| (id, accounts::conversation_exists(&a, id))) {
+            Some((id, Ok(seen))) => ((seen != Some(false)).then_some(id), true),
+            Some((id, Err(_))) => (Some(id), false),
+            None => (None, true),
+        };
+        let exact = exact && readable;
+        let Some(session) = session.or(reserved) else { return (spec.clone(), exact) };
+        match self.agent_spec(&a, spec.cwd.clone(), Some(session), &args) {
+            Ok(fresh) => {
+                (PaneSpec { worktree: spec.worktree.clone(), close_on_exit: spec.close_on_exit, ..fresh }, exact)
+            }
+            Err(_) => (spec.clone(), false),
+        }
+    }
+
+    /// The spec to start pane `p` with again, if it is an agent that had a conversation: the
+    /// conversation is resumed rather than a new one started. Agents run as plain commands
+    /// (`kraal run -- claude`) too, when their conversation is known. The flag is false when the
+    /// command must be shown before it runs (see [`accounts::resumable_args`]).
+    pub fn restart_spec(&self, p: PaneId) -> Option<(PaneSpec, bool)> {
+        let pane = self.panes.get(&p)?;
+        let session = pane.agent.session_id.as_deref();
+        if pane.spec.account.is_some() {
+            return Some(self.resume_spec(&pane.spec, session));
+        }
+        let program = pane.spec.command.first()?.rsplit('/').next()?;
+        let kind = accounts::AGENTS.iter().find(|k| k.command == program)?;
+        let (command, exact) = accounts::resume_argv(kind, &pane.spec.command, session?)?;
+        Some((PaneSpec { command, ..pane.spec.clone() }, exact))
+    }
+
+    /// Whether pane `p`'s agent can be started again on its own, without showing its command
+    /// first: false when kraal could not tell its options from a prompt it would send again.
+    pub(super) fn restarts_by_itself(&self, p: PaneId) -> bool {
+        let Some(pane) = self.panes.get(&p) else { return false };
+        let Some(kind) =
+            pane.spec.account.as_deref().and_then(|k| k.split_once(':')).and_then(|(a, _)| accounts::agent_kind(a))
+        else {
+            return false;
+        };
+        accounts::resumable_args(kind, &accounts::launch_args(kind, &pane.spec.command)).is_some_and(|(_, exact)| exact)
     }
 
     /// Start `agent` in a new pane, on `account` or the one the rules and thresholds pick.
@@ -90,49 +156,121 @@ impl Server {
         placement: Placement,
         cwd: Option<PathBuf>,
     ) -> Result<PaneId> {
+        self.launch_agent_with(ws, target, agent, account, placement, cwd, &[])
+    }
+
+    /// [`Server::launch_agent`], giving the agent `args` too.
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_agent_with(
+        &mut self,
+        ws: u32,
+        target: Option<PaneId>,
+        agent: &str,
+        account: Option<&str>,
+        placement: Placement,
+        cwd: Option<PathBuf>,
+        args: &[String],
+    ) -> Result<PaneId> {
         accounts::agent_kind(agent)
             .with_context(|| format!("unknown agent {agent:?} (known: {})", accounts::agent_names()))?;
         let wi = self.ws_index(ws).context("no such workspace")?;
         let ws_name = self.workspaces[wi].name.clone();
-        let cwd = cwd.or_else(|| {
-            let focus =
-                target.or_else(|| self.workspaces[wi].tabs.get(self.workspaces[wi].active).and_then(|t| t.focus));
-            focus.and_then(|p| self.panes.get(&p)).filter(|p| p.ssh.is_none()).and_then(|p| p.current_cwd())
-        });
+        let cwd = self.agent_cwd(ws, target, cwd);
         let a = match account {
             Some(name) => {
                 self.accounts.get(agent, name).with_context(|| format!("{agent} has no account named {name:?}"))?
             }
-            None => self
-                .accounts
-                .choose(agent, Some(&ws_name), cwd.as_deref(), &self.usage, accounts::now())
-                .context("no account")?,
+            None => {
+                // Never a pick among accounts a rule may forbid here: git says first which
+                // repository this directory belongs to (callers that can wait do so).
+                if let Some(dir) = cwd.clone().filter(|d| self.accounts.undecided(agent, Some(d))) {
+                    self.ask_git_about(dir);
+                    bail!(
+                        "which account the rules allow here depends on this directory's repository; try again in a moment"
+                    );
+                }
+                self.accounts
+                    .choose(agent, Some(&ws_name), cwd.as_deref(), &self.usage, accounts::now())
+                    .context("no account allowed here: the matching rule in accounts.toml names none")?
+            }
         };
-        let spec = self.agent_spec(&a, cwd, None, &[])?;
+        let spec = self.agent_spec(&a, cwd, None, args)?;
         self.spawn_pane_in(ws, target, spec, placement, Some(a.agent.clone()))
     }
 
-    /// Continue an agent pane's conversation on another account.
+    /// Where an agent started in workspace `ws` next to `target` works: `cwd` if given, else the
+    /// directory of that pane (or the focused one), when it is on this machine.
+    pub(super) fn agent_cwd(&self, ws: u32, target: Option<PaneId>, cwd: Option<PathBuf>) -> Option<PathBuf> {
+        cwd.or_else(|| {
+            let wi = self.ws_index(ws)?;
+            let w = &self.workspaces[wi];
+            let focus = target.or_else(|| w.tabs.get(w.active).and_then(|t| t.focus));
+            focus.and_then(|p| self.panes.get(&p)).filter(|p| p.ssh.is_none()).and_then(|p| p.current_cwd())
+        })
+    }
+
+    /// Continue an agent pane's conversation on another account. The agent stops first: its
+    /// conversation is carried over once nothing writes it any more.
     pub fn switch_account(&mut self, pane: PaneId, to: &Account) -> Result<()> {
         let p = self.panes.get(&pane).context("no such pane")?;
         let from = self.pane_account(pane).context("this pane was not started from the agent manager")?;
         anyhow::ensure!(from.agent == to.agent, "{} cannot continue on a {} account", from.agent, to.agent);
         let kind = accounts::agent_kind(&to.agent).context("unknown agent")?;
-        // Claude conversations live in a shared directory, so they resume on any account.
+        accounts::resumable_args(kind, &accounts::launch_args(kind, &p.spec.command))
+            .context("a one-shot run (-p, exec) is not a conversation to continue")?;
         let session = p.agent.session_id.clone().or_else(|| p.spec.session.clone());
-        let resume = if kind.shared.contains(&"projects") { session } else { None };
-        let cwd = p.current_cwd().or_else(|| p.spec.cwd.clone());
-        let spec = self.agent_spec(to, cwd, resume.as_deref(), &[])?;
-        let pn = self.panes.get_mut(&pane).unwrap();
-        if pn.exit_code.is_some() {
-            pn.spec = spec;
-            pn.respawn(&self.env, &self.tx)?;
-        } else {
-            pn.restart_with = Some(spec);
+        // Refused before anything stops when the conversation cannot follow whole.
+        if let Some(id) = &session {
+            accounts::check_carry(&from, to, id)?;
+        }
+        let exited = p.exit_code.is_some();
+        self.switches.insert(pane, (from, to.clone(), session));
+        if exited {
+            self.finish_switch(pane);
+        } else if let Some(pn) = self.panes.get_mut(&pane) {
             pn.kill();
         }
-        self.mark_persist();
         Ok(())
+    }
+
+    /// The agent of a pane switching accounts has stopped (its pane shows it ended): carry its
+    /// conversation over and start it again on the new account. When the conversation cannot
+    /// follow, or the new agent cannot start, the pane stays as it is: Enter starts it again on
+    /// its account, rather than start a new conversation. When its command must be shown first
+    /// (a word kraal could not tell from a prompt), it waits for Enter on the new account.
+    pub(super) fn finish_switch(&mut self, pane: PaneId) {
+        let Some((from, to, session)) = self.switches.remove(&pane) else { return };
+        if !self.panes.contains_key(&pane) {
+            return;
+        }
+        let result = (|| -> Result<()> {
+            let p = self.panes.get(&pane).context("no such pane")?;
+            let kind = accounts::agent_kind(&to.agent).context("unknown agent")?;
+            let resume = match &session {
+                Some(id) => accounts::carry_conversation(&from, &to, id)
+                    .with_context(|| format!("the conversation could not follow to {}", accounts::label(&to)))?
+                    .then(|| id.clone()),
+                None => None,
+            };
+            let cwd = p.current_cwd().or_else(|| p.spec.cwd.clone());
+            let worktree = p.spec.worktree.clone();
+            // The options carry over; a prompt given on the command line is not sent again.
+            let (args, exact) = accounts::resumable_args(kind, &accounts::launch_args(kind, &p.spec.command))
+                .context("a one-shot run (-p, exec) is not a conversation to continue")?;
+            let spec = PaneSpec { worktree, ..self.agent_spec(&to, cwd, resume.as_deref(), &args)? };
+            if !exact {
+                return self.suspend_pane(pane, spec, AMBIGUOUS);
+            }
+            let pn = self.panes.get_mut(&pane).context("no such pane")?;
+            let old = std::mem::replace(&mut pn.spec, spec);
+            pn.respawn(&self.env, &self.tx).inspect_err(|_| pn.spec = old)
+        })();
+        if let Err(e) = result {
+            self.warnings.push(format!("{e:#}; the pane stays on {} (Enter starts it again)", accounts::label(&from)));
+        }
+        self.limit_alerts.remove(&pane);
+        self.mark_persist();
+        self.relayout();
     }
 
     /// Thresholds: alert, offer or switch when an agent's account is nearly used up.
@@ -140,6 +278,9 @@ impl Server {
         let now = accounts::now();
         let mode = self.accounts.limits.mode;
         let ids: Vec<PaneId> = self.panes.keys().copied().collect();
+        let panes = &self.panes;
+        self.screen_limits.retain(|p, _| panes.contains_key(p));
+        self.switches.retain(|p, _| panes.contains_key(p));
         for id in ids {
             let Some(a) = self.pane_account(id) else { continue };
             // Limit messages on screen are the freshest signal there is.
@@ -148,27 +289,42 @@ impl Server {
                 .get(&id)
                 .filter(|p| p.exit_code.is_none())
                 .and_then(|p| accounts::limit_from_screen(&p.text(None)));
-            if let Some((weekly, pct)) = screen_limit {
-                let mut u = self.usage.get(&a).cloned().unwrap_or_default();
-                let w = if weekly { &mut u.weekly } else { &mut u.five_hour };
-                if w.as_ref().is_none_or(|w| w.used_percent < pct) {
-                    *w = Some(accounts::Window { used_percent: pct, resets_at: w.as_ref().and_then(|w| w.resets_at) });
-                    u.observed_at = now;
-                    u.source = "screen".into();
-                    let _ = accounts::save_usage(&a.agent, &a.name, &u);
-                    self.usage.0.insert(accounts::key(&a.agent, &a.name), u);
+            // A message counts once, when it appears or changes: one left on screen neither
+            // renews a window that has reset nor holds a lower figure seen since.
+            let fresh = match screen_limit {
+                Some(seen) => self.screen_limits.insert(id, seen) != Some(seen),
+                None => {
+                    self.screen_limits.remove(&id);
+                    false
                 }
+            };
+            if let (true, Some((weekly, pct))) = (fresh, screen_limit) {
+                let mut u = self.usage.get(&a).cloned().unwrap_or_default();
+                u.observe_screen(weekly, pct, now);
+                let _ = accounts::save_usage(&a.agent, &a.name, &u);
+                self.usage.0.insert(accounts::key(&a.agent, &a.name), u);
             }
             let peak = self.usage.peak(&a, now);
             let threshold = self.accounts.threshold(&a) as f64;
             if peak < threshold {
                 self.limit_alerts.remove(&id);
+                self.limit_events.remove(&id);
                 continue;
             }
             let Some(p) = self.panes.get(&id) else { continue };
             let idle = matches!(p.agent.state, AgentState::Done | AgentState::Idle) || p.exit_code.is_some();
+            // Restarting an agent mid-turn loses its work: switch by itself only when the agent's
+            // own hooks said it finished, never on a guess from the screen; and never when its
+            // command must be shown before it runs again (it may send a prompt again).
+            let auto_ok = (p.agent.hooked || p.exit_code.is_some()) && self.restarts_by_itself(id);
+            let mode = if mode == LimitMode::Auto && !auto_ok { LimitMode::Ask } else { mode };
             let ws_name = self.workspace_of(id).map(|(wi, _)| self.workspaces[wi].name.clone());
             let cwd = p.current_cwd();
+            // Which accounts a rule allows here waits for git (asked now): the next check decides.
+            if let Some(dir) = cwd.clone().filter(|d| self.accounts.undecided(&a.agent, Some(d))) {
+                self.ask_git_about(dir);
+                continue;
+            }
             let alt = self.accounts.alternative(&a, ws_name.as_deref(), cwd.as_deref(), &self.usage, now);
             let reset = accounts::describe_reset(self.usage.get(&a).and_then(|u| u.next_reset(now)), now);
             let what = format!(
@@ -177,6 +333,16 @@ impl Server {
                 if reset.is_empty() { String::new() } else { format!(" ({reset})") }
             );
             let already = self.limit_alerts.get(&id).cloned();
+            if self.limit_events.insert(id) {
+                let fields = serde_json::json!({
+                    "agent": a.agent,
+                    "account": a.name,
+                    "percent": peak.round(),
+                    "threshold": threshold,
+                    "alternative": alt.as_ref().map(crate::accounts::label),
+                });
+                self.emit_pane("account.limit", id, fields);
+            }
             match (mode, &alt) {
                 (LimitMode::Auto, Some(alt)) if idle => {
                     let to = accounts::label(alt);
@@ -207,7 +373,7 @@ impl Server {
                     if let Some(c) = client {
                         self.reveal(c, id);
                         if let Some(cl) = self.clients.get_mut(&c) {
-                            cl.mode = Mode::Confirm { message, action };
+                            cl.mode = Mode::confirm(message, action);
                         }
                         self.limit_alerts.insert(id, LimitAlert::Asked);
                     } else if already.is_none() {
@@ -218,9 +384,12 @@ impl Server {
                 // In ask and auto modes, wait for the end of the turn rather than interrupting.
                 (LimitMode::Ask | LimitMode::Auto, Some(_)) => {}
                 _ if already.is_none() => {
-                    let hint = match &alt {
-                        Some(alt) => format!("ctrl+b A to continue on {}", accounts::label(alt)),
-                        None => "no other account under its threshold".to_string(),
+                    // The key from the keymap in use (`ctrl+b a c` by default).
+                    let key = self.keymap.hint(crate::keymap::Action::SwitchAccount);
+                    let hint = match (&alt, key) {
+                        (Some(alt), Some(key)) => format!("{key} to continue on {}", accounts::label(alt)),
+                        (Some(alt), None) => format!("{} is free to continue on", accounts::label(alt)),
+                        (None, _) => "no other account under its threshold".to_string(),
                     };
                     self.notify(&what, &hint, Some(id));
                     self.limit_alerts.insert(id, LimitAlert::Notified);
@@ -244,7 +413,10 @@ impl Server {
             if current.as_ref().is_some_and(|c| c.agent != kind.name) {
                 continue;
             }
-            let preferred = self.accounts.choose(kind.name, ws_name.as_deref(), cwd.as_deref(), &self.usage, now);
+            // Not marked before git has said which repository rules see here.
+            let preferred = (!self.accounts.undecided(kind.name, cwd.as_deref()))
+                .then(|| self.accounts.choose(kind.name, ws_name.as_deref(), cwd.as_deref(), &self.usage, now))
+                .flatten();
             for a in self.accounts.for_agent(kind.name) {
                 let u = self.usage.get(&a);
                 let mut detail = match u {
@@ -287,17 +459,16 @@ impl Server {
             if current.as_ref().is_some_and(|c| conversations_move(&c.agent)) {
                 "Continue this conversation on…"
             } else {
-                "Start a new conversation on… (this agent's conversations stay with their account)"
+                "Start a new conversation on… (conversations stay with their account)"
             }
         } else {
-            "Agents  (enter start here · ctrl+t new tab · ctrl+l log in again · ctrl+x forget)"
+            "Start an agent"
         };
         Picker::new(PickerKind::Agent, title, items)
     }
 
     /// Create an account and open its login in a floating pane.
     pub(super) fn add_account(&mut self, client: ClientId, agent: &str, name: &str) -> Result<()> {
-        let mut all = Accounts::load()?;
         let home = accounts::default_home_for(agent, name);
         let a = Account {
             name: name.into(),
@@ -306,9 +477,10 @@ impl Server {
             threshold: None,
             note: None,
         };
-        all.add(a.clone())?;
-        accounts::prepare_home(&a)?;
-        all.save()?;
+        Accounts::update(|all| {
+            all.add(a.clone())?;
+            accounts::prepare_home(&a)
+        })?;
         self.reload_accounts();
         self.open_login(client, &a)
     }

@@ -9,7 +9,6 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use serde::Deserialize;
 
-use crate::input::{Key, KeySpec};
 use crate::paths;
 
 pub const DEFAULT_CONFIG: &str = r##"# kraal configuration. Every setting is optional; this file shows the defaults.
@@ -54,10 +53,12 @@ preset = "default"
 # accent = "green"
 # dim = "darkgray"
 # sync = "magenta"
+# production = "red"
 # Pane frames: "rounded", "plain", "thick", "double" or "ascii".
 # frames = "rounded"
 
 [sidebar]
+# Shown when it has something to show (other workspaces, agents, ports, tunnels); false hides it.
 visible = true
 width = 28
 
@@ -68,76 +69,122 @@ mode = "terminal"
 on_blocked = true
 on_done = true
 
+[contexts]
+# Show in pane frames what a pane works on besides git:
+# the Kubernetes context of panes that ran kubectl, k9s, helm…,
+kubernetes = true
+# the Terraform workspace of panes in a directory where `terraform init` ran,
+terraform = true
+# and the AWS profile of panes that ran aws, terraform, cdk… with AWS_PROFILE set.
+aws = true
+
+[production]
+# A pane is production when its server, Kubernetes context or namespace, Terraform workspace or
+# AWS profile has one of these words in its name ("web-prod-1", "prod-eks", "db.prod.lan"), or
+# when its server has env = "prod" in servers.toml (a server with another env never is).
+# Production panes get a red frame and a PROD badge. [] turns all of this off.
+words = ["prod", "production", "prd"]
+# Ask before keys typed in sync reach production panes (once per pane, until sync stops).
+confirm_sync = true
+# Ask before pasting several lines into a production pane that would run them at once.
+confirm_paste = true
+
+# Tools: programs one key away, started where the focused pane is (ctrl+b T lists them).
+#   command  a shell command line (run by sh -c). The pane's context is in $KRAAL_CWD,
+#            $KRAAL_SERVER, $KRAAL_HOST, $KRAAL_REPO, $KRAAL_BRANCH, $KRAAL_KUBE_CONTEXT,
+#            $KRAAL_KUBE_NAMESPACE, $KRAAL_TF_WORKSPACE, $KRAAL_AWS_PROFILE, $KRAAL_SELECTION
+#            and $KRAAL_PRODUCTION ("1" or empty).
+#   on       "pane": on the pane's server over SSH, or here in its directory (default);
+#            "local": always on this machine, with the pane's KUBECONFIG and AWS_PROFILE.
+#   open     "floating" (default), "right", "down" or "tab".
+#   hold     keep the pane open after the command ends, to read its output (a failing
+#            command always stays open).
+#   when     what the pane needs for the tool to be offered: "git", "server", "local",
+#            "kubernetes", "terraform", "aws", "selection".
+#   key      a key after the prefix that starts the tool directly, e.g. "i".
+#   read_only  true when the tool only looks: it starts on a production pane without asking.
+#   enabled  false hides a tool.
+# Tools that run here are hidden when their program is not installed. One of your own:
+#   [tools.pods]
+#   description = "pods of the pane's cluster and namespace"
+#   command = "kubectl get pods -o wide"
+#   on = "local"
+#   when = ["kubernetes"]
+#   hold = true
+
+[tools.lazygit]
+description = "git: stage, commit, branches, history"
+command = "lazygit"
+on = "local"
+when = ["git"]
+
+[tools.k9s]
+description = "Kubernetes: the pane's cluster"
+command = 'k9s ${KRAAL_KUBE_CONTEXT:+--context "$KRAAL_KUBE_CONTEXT"} ${KRAAL_KUBE_NAMESPACE:+-n "$KRAAL_KUBE_NAMESPACE"}'
+on = "local"
+
+[tools.htop]
+description = "processes of the pane's machine"
+command = "htop"
+read_only = true
+
+[tools.logs]
+description = "system logs of the pane's machine"
+command = "journalctl -f -n 200"
+read_only = true
+
+[tools.docker]
+description = "containers of the pane's machine"
+command = "docker ps -a"
+hold = true
+read_only = true
+
+[tools.disk]
+description = "disk space of the pane's machine"
+command = "df -h"
+hold = true
+read_only = true
+
+[hints]
+# ctrl+b space labels what can be acted on in the focused pane: links, paths (with :line),
+# commits, addresses, IPs and known servers, Kubernetes pods, UUIDs. Type a label to copy it;
+# type it with Shift to act where the pane is: open a link (a port on the pane's server gets a
+# tunnel), edit a file at its line, `git show` a commit (or follow a container's logs), ssh to a
+# server, follow a pod's logs, type a UUID.
+# Letters labels are made of, easiest first.
+alphabet = "asdfqwerzxcvjklmiuopghtybn"
+# Patterns of your own; Shift+label runs `tool` with the match in $KRAAL_SELECTION:
+#   [hints.patterns.ticket]
+#   pattern = 'OPS-\d+'
+#   tool = "jira"
+
+[hooks]
+# Run a shell command when something happens. Keys are event types (`kraal events --list`), or a
+# prefix with ".*" ("agent.*"). The command gets $KRAAL_EVENT, $KRAAL_EVENT_JSON and the event's
+# fields as $KRAAL_<FIELD> ($KRAAL_PANE, $KRAAL_NAME, $KRAAL_SERVER, $KRAAL_CODE…), and can call
+# kraal (`kraal read $KRAAL_PANE`). Its output goes to ~/.local/state/kraal/hooks.log.
+#   "agent.blocked" = 'notify-send "$KRAAL_AGENT needs you" "$KRAAL_NAME"'
+#   "pane.failed" = 'curl -s -d "$KRAAL_NAME failed ($KRAAL_CODE)" ntfy.sh/my-topic'
+#   "ssh.connected" = 'logger -t kraal "ssh $KRAAL_HOST production=$KRAAL_PRODUCTION"'
+
 [keys]
-# Prefix key(s), tmux style. Press the prefix, then one of the [keys.prefixed] keys.
+# "kraal": the prefix opens a menu of commands grouped by what they act on: p panes, t tabs,
+# w workspaces, a agents, s servers, f files, r run, v view, b broadcast. Common ones need one
+# key (n new pane, x close, z zoom, arrows focus, 1-9 tabs, space search commands, h help).
+# "classic": tmux's single keys after the prefix (% " x z c n p o s…).
+preset = "kraal"
+# The prefix (leader) key(s). Pressing it twice sends it to the program.
 prefix = ["ctrl+b"]
 
-# Keys that act without the prefix. Map an action to a list of keys; [] disables it.
-[keys.direct]
-focus_or_tab_left = ["alt+h", "alt+left"]
-focus_or_tab_right = ["alt+l", "alt+right"]
-focus_up = ["alt+k", "alt+up"]
-focus_down = ["alt+j", "alt+down"]
-new_pane = ["alt+n"]
-toggle_floating = ["alt+f"]
-next_attention = ["alt+a"]
-workspace_picker = ["alt+o"]
-agent_picker = ["alt+g"]
+# Change a command's keys after the prefix: action = ["key", "key key"] (a space separates the
+# keys of a sequence: "p right" is p, then →); [] unbinds it. Names: `kraal config keys`.
+[keys.leader]
+# split_right = ["%", "p right"]
 
-# Keys that act after the prefix.
-[keys.prefixed]
-split_right = ["%", "|"]
-split_down = ['"', "-"]
-close_pane = ["x"]
-toggle_zoom = ["z"]
-toggle_floating = ["t"]
-new_floating = ["F"]
-files = ["f"]
-focus_left = ["h", "left"]
-focus_right = ["l", "right"]
-focus_up = ["k", "up"]
-focus_down = ["j", "down"]
-resize_left = ["H", "ctrl+left"]
-resize_right = ["L", "ctrl+right"]
-resize_up = ["K", "ctrl+up"]
-resize_down = ["J", "ctrl+down"]
-new_tab = ["c"]
-next_tab = ["n", "tab"]
-prev_tab = ["p", "shift+tab"]
-close_tab = ["&"]
-rename_tab = [","]
-rename_pane = ["."]
-rename_workspace = ["$"]
-tab_1 = ["1"]
-tab_2 = ["2"]
-tab_3 = ["3"]
-tab_4 = ["4"]
-tab_5 = ["5"]
-tab_6 = ["6"]
-tab_7 = ["7"]
-tab_8 = ["8"]
-tab_9 = ["9"]
-next_workspace = [")"]
-prev_workspace = ["("]
-workspace_picker = ["o", "w"]
-ssh_picker = ["s"]
-upload = ["U"]
-download = ["D"]
-pane_picker = ["g"]
-agent_picker = ["G"]
-switch_account = ["A"]
-git_actions = ["R"]
-next_attention = ["a"]
-toggle_sidebar = ["b"]
-toggle_sync = ["y"]
-mark_pane = ["m"]
-scroll_mode = ["[", "PageUp", "v"]
-search = ["/"]
-open_preview = ["e"]
-save_workspace = ["S"]
-detach = ["d", "q"]
-help = ["?"]
-send_prefix = ["ctrl+b"]
+# Keys that act without the prefix (in the "kraal" preset: alt+arrows focus, alt+n new pane,
+# alt+a next agent needing you).
+[keys.direct]
+# toggle_floating = ["alt+f"]
 "##;
 
 #[derive(Debug, Clone, Deserialize)]
@@ -153,7 +200,28 @@ pub struct Config {
     pub theme: crate::theme::ThemeConfig,
     pub sidebar: SidebarConfig,
     pub notifications: NotificationConfig,
-    pub keys: KeysConfig,
+    pub contexts: ContextsConfig,
+    pub production: ProductionConfig,
+    pub hints: crate::hints::HintsConfig,
+    #[serde(default)]
+    pub hooks: toml::Table,
+    #[serde(default)]
+    pub tools: BTreeMap<String, crate::tools::ToolDef>,
+    pub keys: crate::keymap::KeysConfig,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ContextsConfig {
+    pub kubernetes: bool,
+    pub terraform: bool,
+    pub aws: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ProductionConfig {
+    pub words: Vec<String>,
+    pub confirm_sync: bool,
+    pub confirm_paste: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -184,13 +252,6 @@ pub struct NotificationConfig {
     pub mode: NotifyMode,
     pub on_blocked: bool,
     pub on_done: bool,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct KeysConfig {
-    pub prefix: Vec<String>,
-    pub direct: BTreeMap<String, Vec<String>>,
-    pub prefixed: BTreeMap<String, Vec<String>>,
 }
 
 impl Default for Config {
@@ -250,254 +311,16 @@ fn merge(base: &mut toml::Value, over: toml::Value) {
     }
 }
 
-/// Everything a key can trigger. Declaration order is the order of the help screen.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub enum Action {
-    NewPane,
-    SplitRight,
-    SplitDown,
-    ClosePane,
-    ToggleZoom,
-    ToggleFloating,
-    NewFloating,
-    FocusLeft,
-    FocusRight,
-    FocusUp,
-    FocusDown,
-    FocusOrTabLeft,
-    FocusOrTabRight,
-    ResizeLeft,
-    ResizeRight,
-    ResizeUp,
-    ResizeDown,
-    NewTab,
-    NextTab,
-    PrevTab,
-    CloseTab,
-    RenameTab,
-    RenamePane,
-    RenameWorkspace,
-    Tab(u8),
-    NextWorkspace,
-    PrevWorkspace,
-    WorkspacePicker,
-    SshPicker,
-    Upload,
-    Download,
-    Files,
-    PanePicker,
-    AgentPicker,
-    SwitchAccount,
-    GitActions,
-    NextAttention,
-    ToggleSidebar,
-    ToggleSync,
-    MarkPane,
-    ScrollMode,
-    Search,
-    OpenPreview,
-    SaveWorkspace,
-    Detach,
-    Help,
-    SendPrefix,
-}
-
-impl Action {
-    pub fn parse(name: &str) -> Option<Action> {
-        use Action::*;
-        Some(match name {
-            "new_pane" => NewPane,
-            "split_right" => SplitRight,
-            "split_down" => SplitDown,
-            "close_pane" => ClosePane,
-            "toggle_zoom" => ToggleZoom,
-            "toggle_floating" => ToggleFloating,
-            "new_floating" => NewFloating,
-            "focus_left" => FocusLeft,
-            "focus_right" => FocusRight,
-            "focus_up" => FocusUp,
-            "focus_down" => FocusDown,
-            "focus_or_tab_left" => FocusOrTabLeft,
-            "focus_or_tab_right" => FocusOrTabRight,
-            "resize_left" => ResizeLeft,
-            "resize_right" => ResizeRight,
-            "resize_up" => ResizeUp,
-            "resize_down" => ResizeDown,
-            "new_tab" => NewTab,
-            "next_tab" => NextTab,
-            "prev_tab" => PrevTab,
-            "close_tab" => CloseTab,
-            "rename_tab" => RenameTab,
-            "rename_pane" => RenamePane,
-            "rename_workspace" => RenameWorkspace,
-            "next_workspace" => NextWorkspace,
-            "prev_workspace" => PrevWorkspace,
-            "workspace_picker" => WorkspacePicker,
-            "ssh_picker" => SshPicker,
-            "upload" => Upload,
-            "download" => Download,
-            "files" => Files,
-            "pane_picker" => PanePicker,
-            "agent_picker" => AgentPicker,
-            "switch_account" => SwitchAccount,
-            "git_actions" => GitActions,
-            "next_attention" => NextAttention,
-            "toggle_sidebar" => ToggleSidebar,
-            "toggle_sync" => ToggleSync,
-            "mark_pane" => MarkPane,
-            "scroll_mode" => ScrollMode,
-            "search" => Search,
-            "open_preview" => OpenPreview,
-            "save_workspace" => SaveWorkspace,
-            "detach" => Detach,
-            "help" => Help,
-            "send_prefix" => SendPrefix,
-            other => {
-                let n: u8 = other.strip_prefix("tab_")?.parse().ok()?;
-                if (1..=9).contains(&n) {
-                    Tab(n)
-                } else {
-                    return None;
-                }
-            }
-        })
-    }
-
-    /// Short description for the help screen.
-    pub fn describe(self) -> String {
-        use Action::*;
-        match self {
-            NewPane => "new pane".into(),
-            SplitRight => "split right".into(),
-            SplitDown => "split down".into(),
-            ClosePane => "close pane".into(),
-            ToggleZoom => "zoom pane (fullscreen)".into(),
-            ToggleFloating => "show/hide floating panes".into(),
-            NewFloating => "new floating pane".into(),
-            FocusLeft => "focus left".into(),
-            FocusRight => "focus right".into(),
-            FocusUp => "focus up".into(),
-            FocusDown => "focus down".into(),
-            FocusOrTabLeft => "focus left / previous tab".into(),
-            FocusOrTabRight => "focus right / next tab".into(),
-            ResizeLeft => "resize left".into(),
-            ResizeRight => "resize right".into(),
-            ResizeUp => "resize up".into(),
-            ResizeDown => "resize down".into(),
-            NewTab => "new tab".into(),
-            NextTab => "next tab".into(),
-            PrevTab => "previous tab".into(),
-            CloseTab => "close tab".into(),
-            RenameTab => "rename tab".into(),
-            RenamePane => "rename pane".into(),
-            RenameWorkspace => "rename workspace".into(),
-            Tab(n) => format!("go to tab {n}"),
-            NextWorkspace => "next workspace".into(),
-            PrevWorkspace => "previous workspace".into(),
-            WorkspacePicker => "workspaces".into(),
-            SshPicker => "servers: connect, open a group".into(),
-            Upload => "upload files to this pane's server".into(),
-            Download => "download from this pane's server".into(),
-            Files => "file manager (local ⇄ servers)".into(),
-            PanePicker => "find a pane".into(),
-            AgentPicker => "agents: start one on an account".into(),
-            SwitchAccount => "continue this agent on another account".into(),
-            GitActions => "worktree: review, commit, pull request, merge, remove".into(),
-            NextAttention => "next agent needing you".into(),
-            ToggleSidebar => "sidebar".into(),
-            ToggleSync => "sync typing: tab → workspace → off".into(),
-            MarkPane => "mark this pane for synced typing".into(),
-            ScrollMode => "scroll / copy mode".into(),
-            Search => "search the scrollback".into(),
-            OpenPreview => "preview a file".into(),
-            SaveWorkspace => "save workspace layout".into(),
-            Detach => "detach".into(),
-            Help => "help".into(),
-            SendPrefix => "send the prefix key".into(),
-        }
-    }
-}
-
-/// Resolved key bindings.
-#[derive(Debug, Clone, Default)]
-pub struct Keymap {
-    pub prefix: Vec<KeySpec>,
-    pub direct: Vec<(KeySpec, Action)>,
-    pub prefixed: Vec<(KeySpec, Action)>,
-}
-
-impl Keymap {
-    /// Build from config; returns the keymap and warnings about invalid entries.
-    pub fn build(cfg: &KeysConfig) -> (Keymap, Vec<String>) {
-        fn parse_list(list: &[String], ctx: &str, warnings: &mut Vec<String>) -> Vec<KeySpec> {
-            list.iter()
-                .filter_map(|s| match KeySpec::parse(s) {
-                    Ok(k) => Some(k),
-                    Err(e) => {
-                        warnings.push(format!("{ctx}: invalid key {s:?}: {e}"));
-                        None
-                    }
-                })
-                .collect()
-        }
-        fn table(map: &BTreeMap<String, Vec<String>>, ctx: &str, warnings: &mut Vec<String>) -> Vec<(KeySpec, Action)> {
-            let mut out = Vec::new();
-            for (name, keys) in map {
-                let Some(action) = Action::parse(name) else {
-                    warnings.push(format!("{ctx}: unknown action {name:?}"));
-                    continue;
-                };
-                for k in parse_list(keys, ctx, warnings) {
-                    out.push((k, action));
-                }
-            }
-            out
-        }
-        let mut warnings = Vec::new();
-        let prefix = parse_list(&cfg.prefix, "keys.prefix", &mut warnings);
-        let direct = table(&cfg.direct, "keys.direct", &mut warnings);
-        let prefixed = table(&cfg.prefixed, "keys.prefixed", &mut warnings);
-        (Keymap { prefix, direct, prefixed }, warnings)
-    }
-
-    pub fn is_prefix(&self, key: &Key) -> bool {
-        self.prefix.iter().any(|p| p.matches(key))
-    }
-
-    pub fn direct(&self, key: &Key) -> Option<Action> {
-        self.direct.iter().find(|(k, _)| k.matches(key)).map(|(_, a)| *a)
-    }
-
-    pub fn prefixed(&self, key: &Key) -> Option<Action> {
-        self.prefixed.iter().find(|(k, _)| k.matches(key)).map(|(_, a)| *a)
-    }
-
-    /// First key bound to an action, for hints (`"ctrl+b %"` style when prefixed).
-    pub fn hint(&self, action: Action) -> Option<String> {
-        if let Some((k, _)) = self.direct.iter().find(|(_, a)| *a == action) {
-            return Some(k.to_string());
-        }
-        let (k, _) = self.prefixed.iter().find(|(_, a)| *a == action)?;
-        Some(k.to_string())
-    }
-
-    pub fn prefix_label(&self) -> String {
-        self.prefix.first().map(|k| k.to_string()).unwrap_or_else(|| "prefix".into())
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn defaults_parse_and_bind() {
+    fn defaults_parse() {
         let cfg = Config::default();
         assert_eq!(cfg.scrollback, 10000);
-        let (km, warnings) = Keymap::build(&cfg.keys);
-        assert!(warnings.is_empty(), "{warnings:?}");
-        assert!(km.prefixed.iter().any(|(_, a)| *a == Action::Tab(9)));
-        assert!(km.direct.iter().any(|(_, a)| *a == Action::NextAttention));
+        assert_eq!(cfg.keys.preset, "kraal");
+        assert!(cfg.keys.leader.is_empty() && cfg.keys.direct.is_empty(), "the preset has the bindings");
     }
 
     #[test]
@@ -510,15 +333,20 @@ mod tests {
         assert_eq!(cfg.keys.prefix, vec!["ctrl+a".to_string()]);
         assert!(cfg.keys.direct["new_pane"].is_empty());
         // untouched defaults survive
-        assert_eq!(cfg.keys.direct["focus_up"], vec!["alt+k".to_string(), "alt+up".to_string()]);
+        assert_eq!(cfg.keys.preset, "kraal");
         assert!(cfg.sidebar.visible);
     }
 
     #[test]
-    fn every_default_action_name_is_known() {
-        let cfg = Config::default();
-        for name in cfg.keys.direct.keys().chain(cfg.keys.prefixed.keys()) {
-            assert!(Action::parse(name).is_some(), "{name}");
-        }
+    fn tools_parse() {
+        let cfg = Config::from_user_toml(
+            "[tools.lazygit]\nkey = \"i\"\n[tools.k9s]\nenabled = false\n[tools.mine]\ncommand = \"tig\"\nkey = \"x\"\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.tools["lazygit"].command, "lazygit", "user keys merge into a default tool");
+        assert!(!cfg.tools["k9s"].enabled);
+        assert!(crate::tools::check(&cfg.tools).is_empty());
+        assert!(Config::from_user_toml("[tools.bad]\ncommand = \"x\"\nwhen = [\"git\", \"nope\"]\n").is_err());
+        assert_eq!(cfg.production.words, vec!["prod", "production", "prd"]);
     }
 }

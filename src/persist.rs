@@ -1,8 +1,9 @@
 //! Session state on disk, so a server restart (or a reboot) brings the layout back.
 //!
-//! Processes cannot survive a restart; panes come back as fresh processes in their last working
-//! directory. Command panes (e.g. `ssh host`) rerun their command, and agents with a known
-//! session id are resumed (`claude --resume <id>`).
+//! Processes cannot survive a restart; panes come back as fresh shells in their last working
+//! directory. Interactive SSH panes reconnect and agents with a known session id are resumed
+//! (`claude --resume <id>`); other command panes wait for Enter rather than run again by
+//! themselves. Typing is never broadcast after a restart.
 
 use std::path::PathBuf;
 
@@ -15,10 +16,15 @@ use crate::paths;
 use crate::server::{FloatRect, Floating, Server, Tab};
 
 const VERSION: u32 = 1;
+const REVISION: u32 = 1;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct SessionSnapshot {
     pub version: u32,
+    /// Changes that older versions read without noticing: 1 = a tab without a name is saved
+    /// without one (before, as "tab N").
+    #[serde(default)]
+    pub revision: u32,
     pub workspaces: Vec<WorkspaceSnap>,
     #[serde(default)]
     pub tunnels: Vec<crate::server::net::TunnelSpec>,
@@ -78,10 +84,17 @@ pub fn snapshot(server: &Server) -> SessionSnapshot {
         {
             spec.cwd = Some(cwd);
         }
+        // An agent that exited keeps its conversation, not what kind of agent it was: the
+        // command it ran tells, so that a restart can still resume it.
+        let agent = p.agent.kind.clone().or_else(|| {
+            let program = spec.command.first()?.rsplit('/').next()?;
+            p.agent.session_id.as_ref()?;
+            crate::accounts::AGENTS.iter().find(|k| k.command == program).map(|k| k.name.to_string())
+        });
         PaneSnap {
             name: p.name.clone(),
             spec,
-            agent: p.agent.kind.clone(),
+            agent,
             agent_session: p.agent.session_id.clone(),
             stopped: p.exit_code.is_some(),
         }
@@ -102,8 +115,8 @@ pub fn snapshot(server: &Server) -> SessionSnapshot {
             definition: ws.definition.clone(),
             cwd: ws.cwd.clone(),
             active: ws.active,
-            // Marks are not kept, so marked sync does not survive a restart.
-            sync: if ws.sync == crate::server::SyncScope::Marked { crate::server::SyncScope::Off } else { ws.sync },
+            // Typing is never broadcast after a restart: it starts again only when asked.
+            sync: crate::server::SyncScope::Off,
             tabs: ws
                 .tabs
                 .iter()
@@ -119,7 +132,12 @@ pub fn snapshot(server: &Server) -> SessionSnapshot {
                 .collect(),
         })
         .collect();
-    SessionSnapshot { version: VERSION, workspaces, tunnels: server.tunnels.iter().map(|t| t.spec.clone()).collect() }
+    SessionSnapshot {
+        version: VERSION,
+        revision: REVISION,
+        workspaces,
+        tunnels: server.tunnels.iter().map(|t| t.spec.clone()).collect(),
+    }
 }
 
 pub fn save(session: &str, snap: &SessionSnapshot) -> Result<()> {
@@ -127,9 +145,7 @@ pub fn save(session: &str, snap: &SessionSnapshot) -> Result<()> {
     if let Some(dir) = path.parent() {
         paths::ensure_private_dir(dir)?;
     }
-    let tmp = path.with_extension("json.tmp");
-    paths::write_private(&tmp, &serde_json::to_vec_pretty(snap)?)?;
-    std::fs::rename(&tmp, &path)?;
+    paths::write_private(&path, &serde_json::to_vec_pretty(snap)?)?;
     Ok(())
 }
 
@@ -162,8 +178,14 @@ pub fn resume_command(agent: &str, session: &str) -> Option<String> {
 
 pub fn apply(server: &mut Server, snap: SessionSnapshot) -> Result<()> {
     for t in &snap.tunnels {
-        let remote = format!("{}:{}", t.remote_host, t.remote_port);
-        if let Err(e) = server.add_tunnel(&t.server, &remote, Some(t.local)) {
+        let host = if t.remote_host.contains(':') { format!("[{}]", t.remote_host) } else { t.remote_host.clone() };
+        let remote = format!("{host}:{}", t.remote_port);
+        // A tunnel through a connection kraal knows by no name goes through that same connection.
+        let added = match &t.via {
+            Some(via) => server.add_tunnel_to(via.clone(), &remote, Some(t.local)),
+            None => server.add_tunnel(&t.server, &remote, Some(t.local)),
+        };
+        if let Err(e) = added {
             server.warnings.push(format!("tunnel {}: {e:#}", t.describe()));
         }
     }
@@ -171,7 +193,7 @@ pub fn apply(server: &mut Server, snap: SessionSnapshot) -> Result<()> {
         let panes_before: std::collections::HashSet<PaneId> = server.panes.keys().copied().collect();
         let workspaces_before: Vec<u32> = server.workspaces.iter().map(|w| w.id).collect();
         let name = ws.name.clone();
-        if let Err(e) = apply_workspace(server, ws) {
+        if let Err(e) = apply_workspace(server, ws, snap.revision) {
             server.rollback(&panes_before, &workspaces_before);
             server.warnings.push(format!("could not restore workspace {name}: {e:#}"));
         }
@@ -180,15 +202,17 @@ pub fn apply(server: &mut Server, snap: SessionSnapshot) -> Result<()> {
     Ok(())
 }
 
-fn apply_workspace(server: &mut Server, ws: WorkspaceSnap) -> Result<()> {
-    let mut sync = ws.sync;
+fn apply_workspace(server: &mut Server, ws: WorkspaceSnap, revision: u32) -> Result<()> {
     {
         let id = server.new_workspace(ws.name, ws.definition);
         let wi = server.ws_index(id).unwrap();
         server.workspaces[wi].cwd = ws.cwd;
         for t in ws.tabs {
             let tab_id = server.alloc_id();
-            let mut tab = Tab::new(tab_id, t.name);
+            // Older versions saved a tab without a name as "tab N"; unnamed, it shows what its
+            // pane runs.
+            let old_default = revision == 0 && t.name.strip_prefix("tab ").is_some_and(|n| n.parse::<u32>().is_ok());
+            let mut tab = Tab::new(tab_id, if old_default { String::new() } else { t.name });
             if let Some(root) = &t.root {
                 tab.root = Some(build(server, root)?);
             }
@@ -210,10 +234,6 @@ fn apply_workspace(server: &mut Server, ws: WorkspaceSnap) -> Result<()> {
             if t.zoomed && !tab.is_floating(focus) {
                 tab.zoom = Some(focus);
             }
-            if t.sync {
-                // Snapshots from before workspace-wide sync.
-                sync = crate::server::SyncScope::Tab;
-            }
             server.workspaces[wi].tabs.push(tab);
         }
         if server.workspaces[wi].tabs.is_empty() {
@@ -221,7 +241,6 @@ fn apply_workspace(server: &mut Server, ws: WorkspaceSnap) -> Result<()> {
         } else {
             let n = server.workspaces[wi].tabs.len();
             server.workspaces[wi].active = ws.active.min(n - 1);
-            server.workspaces[wi].sync = sync;
         }
     }
     Ok(())
@@ -243,19 +262,34 @@ fn build(server: &mut Server, n: &NodeSnap) -> Result<Node> {
 }
 
 fn spawn(server: &mut Server, p: &PaneSnap) -> Result<PaneId> {
-    let mut spec = p.spec.clone();
-    if spec.account.is_some() {
-        // Agents started from the agent manager resume on their account.
-        spec = server.resume_spec(&spec, p.agent_session.as_deref());
-    } else if spec.command.is_empty()
-        && let (Some(agent), Some(session)) = (&p.agent, &p.agent_session)
-    {
-        spec.startup_input = resume_command(agent, session);
+    // An agent that was still waiting for its account waits again, and is resolved again.
+    if p.spec.pending_agent.is_some() {
+        let id = server.spawn_pane_suspended(p.name.clone(), p.spec.clone(), "choosing the account")?;
+        server.resolve_pending_agent(id);
+        return Ok(id);
     }
-    // Reconnecting SSH and resuming agents is safe; any other command (a deploy, a cleanup…) waits
-    // for Enter, and so does a command that had already finished.
-    let is_ssh = spec.command.first().is_some_and(|c| c.rsplit('/').next() == Some("ssh"));
-    let auto = is_ssh || spec.account.is_some();
+    let mut spec = p.spec.clone();
+    let mut resumed = false;
+    if spec.account.is_some() {
+        // Agents started from the agent manager resume on their account; a one-shot run or a
+        // prompt on the command line waits for Enter instead of running again by itself.
+        (spec, resumed) = server.resume_spec(&spec, p.agent_session.as_deref());
+    } else if let (Some(agent), Some(session)) = (&p.agent, &p.agent_session) {
+        if spec.command.is_empty() {
+            spec.startup_input = resume_command(agent, session);
+        } else if let Some(kind) = crate::accounts::agent_kind(agent)
+            && let Some((command, exact)) = crate::accounts::resume_argv(kind, &spec.command, session)
+        {
+            // An agent run as a plain command (`kraal run -- claude`) resumes too.
+            spec.command = command;
+            resumed = exact;
+        }
+    }
+    // Reconnecting an SSH shell and resuming agents is safe; any other command (a deploy, a
+    // cleanup, a tool run on a server…) waits for Enter, and so does one that had finished.
+    let ssh_shell = spec.command.first().is_some_and(|c| c.rsplit('/').next() == Some("ssh"))
+        && !crate::servers::ssh_runs_command(&spec.command[1..]);
+    let auto = ssh_shell || resumed;
     let id = if !spec.command.is_empty() && (p.stopped || !auto) {
         let why = if p.stopped { "it was not running before the restart" } else { "restored session" };
         server.spawn_pane_suspended(p.name.clone(), spec, why)?

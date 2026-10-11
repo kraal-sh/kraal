@@ -78,12 +78,10 @@ fn codex_config_path() -> PathBuf {
         .join("config.toml")
 }
 
+/// The command the agent's hooks run: a shell parses it, so the path is quoted whatever it holds.
 fn hook_command(agent: &str) -> Result<String> {
     let exe = std::env::current_exe()?;
-    let exe = exe.to_string_lossy();
-    let quoted =
-        if exe.contains([' ', '\'', '"']) { format!("'{}'", exe.replace('\'', "'\\''")) } else { exe.into_owned() };
-    Ok(format!("{quoted} hook {agent}"))
+    Ok(format!("{} hook {agent}", crate::shell::quote(&exe.to_string_lossy())))
 }
 
 fn is_ours(cmd: &str, agent: &str) -> bool {
@@ -153,10 +151,7 @@ fn write_with_backup(path: &Path, content: &str) -> Result<()> {
             path.with_extension(format!("{}.kraal-bak", path.extension().and_then(|e| e.to_str()).unwrap_or("")));
         std::fs::copy(path, &backup).with_context(|| format!("backing up {}", path.display()))?;
     }
-    let tmp = path.with_extension("kraal-tmp");
-    std::fs::write(&tmp, content)?;
-    std::fs::rename(&tmp, path)?;
-    Ok(())
+    crate::paths::write_atomic(path, content.as_bytes()).with_context(|| format!("writing {}", path.display()))
 }
 
 fn claude_has(v: &Value, event: &str) -> bool {
@@ -180,9 +175,11 @@ fn install_claude(path: &Path, accounts_path: &Path) -> Result<String> {
     // The status line reports each account's usage; the user's own one keeps running after it.
     let current = root.get("statusLine").and_then(|s| s.get("command")).and_then(Value::as_str).map(String::from);
     if !current.as_deref().is_some_and(is_our_statusline) {
-        let mut acc = crate::accounts::Accounts::load_from(accounts_path)?;
-        acc.claude.statusline = current;
-        acc.save()?;
+        // Under the accounts lock: another kraal may be adding an account meanwhile.
+        crate::accounts::Accounts::update_at(accounts_path, |acc| {
+            acc.claude.statusline = current;
+            Ok(())
+        })?;
     }
     let ours = cmd.trim_end_matches(" hook claude").to_string() + " statusline";
     let mut line = root.get("statusLine").cloned().filter(Value::is_object).unwrap_or_else(|| json!({}));
@@ -256,33 +253,106 @@ fn install_codex(path: &Path) -> Result<String> {
     let line = format!("notify = [{}, \"hook\", \"codex\"]", toml_string(&exe));
     // `notify` is a top-level key: it must come before the first [table].
     let mut lines: Vec<String> = text.lines().map(String::from).collect();
-    let first_table = lines.iter().position(|l| l.trim_start().starts_with('[')).unwrap_or(lines.len());
-    if let Some(i) = lines[..first_table].iter().position(|l| l.trim_start().starts_with("notify")) {
-        if lines[i].contains("kraal") {
-            lines[i] = line;
-        } else {
-            bail!("codex already has a notify command ({}); kraal does not replace it", lines[i].trim());
+    let first_table = first_table(&lines);
+    if let Some(span) = notify_span(&lines, first_table) {
+        let current = lines[span.clone()].join("\n");
+        if !current.contains("kraal") {
+            bail!("codex already has a notify command ({}); kraal does not replace it", current.trim());
         }
+        lines.splice(span, [line.clone()]);
     } else {
-        lines.insert(first_table, line);
+        lines.insert(first_table, line.clone());
         if first_table < lines.len() - 1 {
             lines.insert(first_table + 1, String::new());
         }
     }
-    write_with_backup(path, &(lines.join("\n") + "\n"))?;
+    let wanted = toml::Value::Array(vec![exe.into(), "hook".into(), "codex".into()]);
+    let manual = format!("add `{line}` to {}, before its first [table]", path.display());
+    write_codex_config(path, &text, &lines, Some(wanted), &manual)?;
     Ok(format!("codex: notify hook installed in {}", path.display()))
 }
 
 fn uninstall_codex(path: &Path) -> Result<String> {
     let text = std::fs::read_to_string(path).unwrap_or_default();
-    let before = text.lines().count();
-    let kept: Vec<&str> =
-        text.lines().filter(|l| !(l.trim_start().starts_with("notify") && l.contains("kraal"))).collect();
-    if kept.len() == before {
-        return Ok("codex: nothing to remove".into());
+    let mut lines: Vec<String> = text.lines().map(String::from).collect();
+    let first_table = first_table(&lines);
+    match notify_span(&lines, first_table) {
+        Some(span) if lines[span.clone()].iter().any(|l| l.contains("kraal")) => {
+            lines.drain(span);
+        }
+        _ => return Ok("codex: nothing to remove".into()),
     }
-    write_with_backup(path, &(kept.join("\n") + "\n"))?;
+    let manual = format!("remove the `notify = …` setting that runs kraal from {}", path.display());
+    write_codex_config(path, &text, &lines, None, &manual)?;
     Ok(format!("codex: notify hook removed from {}", path.display()))
+}
+
+/// Index of the first `[table]` line of a TOML file (or its length).
+fn first_table(lines: &[String]) -> usize {
+    lines.iter().position(|l| l.trim_start().starts_with('[')).unwrap_or(lines.len())
+}
+
+/// The lines of the top-level `notify = …` statement, which may span several lines (an array
+/// written one element per line).
+fn notify_span(lines: &[String], first_table: usize) -> Option<std::ops::Range<usize>> {
+    let start = lines[..first_table].iter().position(|l| {
+        let l = l.trim_start();
+        l.strip_prefix("notify").is_some_and(|rest| rest.trim_start().starts_with('='))
+    })?;
+    // Brackets outside strings and comments, until the array closes.
+    let mut depth = 0i32;
+    for (i, line) in lines.iter().enumerate().skip(start) {
+        let mut quote: Option<char> = None;
+        let mut escaped = false;
+        for c in line.chars() {
+            match quote {
+                Some(q) => {
+                    if escaped {
+                        escaped = false;
+                    } else if c == '\\' && q == '"' {
+                        escaped = true;
+                    } else if c == q {
+                        quote = None;
+                    }
+                }
+                None => match c {
+                    '"' | '\'' => quote = Some(c),
+                    '[' => depth += 1,
+                    ']' => depth -= 1,
+                    '#' => break,
+                    _ => {}
+                },
+            }
+        }
+        if depth <= 0 {
+            return Some(start..i + 1);
+        }
+    }
+    Some(start..lines.len())
+}
+
+/// Write Codex's configuration back only if, read as TOML, the edit changed `notify` to
+/// `wanted` and nothing else. The editing goes line by line; a layout it could misread (a
+/// string over several lines, say) is left as it is, and the user is told what to change.
+fn write_codex_config(
+    path: &Path,
+    original: &str,
+    lines: &[String],
+    wanted: Option<toml::Value>,
+    manual: &str,
+) -> Result<()> {
+    let text = lines.join("\n") + "\n";
+    let before: toml::Table = toml::from_str(original)
+        .with_context(|| format!("{} is not valid TOML; kraal leaves it alone: {manual}", path.display()))?;
+    let after: Option<toml::Table> = toml::from_str(&text).ok();
+    let only_notify = after.is_some_and(|mut after| {
+        let notify = after.remove("notify");
+        let mut rest = before.clone();
+        rest.remove("notify");
+        after == rest && notify == wanted
+    });
+    anyhow::ensure!(only_notify, "kraal cannot edit {} safely; {manual}", path.display());
+    write_with_backup(path, &text)
 }
 
 fn toml_string(s: &str) -> String {
@@ -388,6 +458,43 @@ mod tests {
         assert!(!std::fs::read_to_string(&path).unwrap().contains("notify"));
         std::fs::write(&path, "notify = [\"other\"]\n").unwrap();
         assert!(install_codex(&path).is_err());
+        // An array written over several lines is replaced, then removed, whole.
+        std::fs::write(
+            &path,
+            "model = \"o3\"\nnotify = [\n  \"/opt/kraal\",\n  \"hook\", \"codex\", # ours\n]\n\n[x]\ny = 1\n",
+        )
+        .unwrap();
+        install_codex(&path).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let parsed: toml::Value = toml::from_str(&text).unwrap();
+        assert_eq!(parsed["notify"].as_array().unwrap().len(), 3, "{text}");
+        assert_eq!(parsed["x"]["y"].as_integer(), Some(1));
+        std::fs::write(&path, "notify = [\n  \"/opt/kraal\",\n  \"hook\",\n]\nmodel = \"o3\"\n").unwrap();
+        uninstall_codex(&path).unwrap();
+        let parsed: toml::Value = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(parsed.get("notify").is_none() && parsed.get("model").is_some());
+        // A string over several lines that line editing could misread: nothing else is ever lost;
+        // the file stays as it was and the user is told what to change.
+        let tricky = "notify = [\"/opt/kraal\", \"hook\", \"codex\", \"\"\"\n[\n\"\"\"]\nmodel = \"o3\"\n";
+        std::fs::write(&path, tricky).unwrap();
+        let err = uninstall_codex(&path).unwrap_err().to_string();
+        assert!(err.contains("remove the `notify"), "{err}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), tricky);
+        let err = install_codex(&path).unwrap_err().to_string();
+        assert!(err.contains("add `notify = ["), "{err}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), tricky);
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn hook_commands_quote_the_path() {
+        let cmd = hook_command("claude").unwrap();
+        let exe = std::env::current_exe().unwrap();
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!("printf %s {}", cmd.trim_end_matches(" hook claude")))
+            .output()
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&out.stdout), exe.to_string_lossy());
     }
 }

@@ -23,6 +23,8 @@ pub struct AgentKind {
     pub default_home: &'static str,
     /// Arguments of the agent's own login command.
     pub login: &'static [&'static str],
+    /// Arguments of its command that says whether an account is logged in (exit status).
+    pub login_status: &'static [&'static str],
     /// Arguments that resume a conversation; `{session}` is replaced by its id.
     pub resume: &'static [&'static str],
     /// Flag that sets the id of a new conversation, so kraal knows it without reading files.
@@ -42,6 +44,7 @@ pub const AGENTS: &[AgentKind] = &[
         home_env: "CLAUDE_CONFIG_DIR",
         default_home: "~/.claude",
         login: &["auth", "login"],
+        login_status: &["auth", "status"],
         resume: &["--resume", "{session}"],
         session_flag: Some("--session-id"),
         shared: &[
@@ -64,6 +67,7 @@ pub const AGENTS: &[AgentKind] = &[
         home_env: "CODEX_HOME",
         default_home: "~/.codex",
         login: &["login"],
+        login_status: &["login", "status"],
         resume: &["resume", "{session}"],
         session_flag: None,
         // Codex keeps databases and locks in its home: nothing is shared.
@@ -198,20 +202,41 @@ impl Accounts {
         }
     }
 
-    pub fn save(&self) -> Result<()> {
-        if let Some(dir) = self.path.parent() {
-            std::fs::create_dir_all(dir)?;
-        }
+    fn text(&self) -> Result<String> {
         let file = File {
             limits: self.limits.clone(),
             claude: self.claude.clone(),
             accounts: self.accounts.clone(),
             rules: self.rules.clone(),
         };
-        let tmp = self.path.with_extension("toml.tmp");
-        std::fs::write(&tmp, format!("{HEADER}{}", toml::to_string_pretty(&file)?))?;
-        std::fs::rename(&tmp, &self.path)?;
-        Ok(())
+        Ok(format!("{HEADER}{}", toml::to_string_pretty(&file)?))
+    }
+
+    pub fn save(&self) -> Result<()> {
+        if let Some(dir) = self.path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        paths::write_atomic(&self.path, self.text()?.as_bytes())
+            .with_context(|| format!("writing {}", self.path.display()))
+    }
+
+    /// Load the accounts, change them with `f` and save them if they changed, with no other kraal
+    /// process updating them in between.
+    pub fn update<T>(f: impl FnOnce(&mut Accounts) -> Result<T>) -> Result<T> {
+        Self::update_at(&Self::path(), f)
+    }
+
+    /// [`Accounts::update`] on the accounts file at `path`.
+    pub fn update_at<T>(path: &Path, f: impl FnOnce(&mut Accounts) -> Result<T>) -> Result<T> {
+        paths::locked(path, || {
+            let mut all = Self::load_from(path)?;
+            let before = all.text()?;
+            let out = f(&mut all)?;
+            if all.text()? != before {
+                all.save()?;
+            }
+            Ok(out)
+        })?
     }
 
     /// Accounts of an agent, with an implicit "default" account for the agent's default home
@@ -220,7 +245,9 @@ impl Accounts {
         let mut out: Vec<Account> = self.accounts.iter().filter(|a| a.agent == agent).cloned().collect();
         if let Some(kind) = agent_kind(agent) {
             let default = paths::expand_tilde(kind.default_home);
-            if !out.iter().any(|a| paths::expand_tilde(&a.home) == default) {
+            // A listed account named "default" (from before the name was reserved) is not
+            // hidden behind the implicit one.
+            if !out.iter().any(|a| paths::expand_tilde(&a.home) == default || a.name == "default") {
                 out.insert(
                     0,
                     Account {
@@ -258,11 +285,15 @@ impl Accounts {
         a.threshold.unwrap_or(self.limits.threshold)
     }
 
-    pub fn add(&mut self, account: Account) -> Result<()> {
+    pub fn add(&mut self, mut account: Account) -> Result<()> {
         let kind = agent_kind(&account.agent)
             .with_context(|| format!("unknown agent {:?} (known: {})", account.agent, agent_names()))?;
+        account.home = absolute_home(&account.home)?;
         if !valid_name(&account.name) {
             bail!("invalid account name {:?} (letters, digits, - _ . only)", account.name);
+        }
+        if account.name == "default" && paths::expand_tilde(&account.home) != paths::expand_tilde(kind.default_home) {
+            bail!("\"default\" is the account in {}; give this one another name", kind.default_home);
         }
         if self.for_agent(kind.name).iter().any(|a| a.name == account.name && a.name != "default") {
             bail!("{} already has an account named {:?}", kind.name, account.name);
@@ -276,7 +307,25 @@ impl Accounts {
     pub fn remove(&mut self, agent: &str, name: &str) -> bool {
         let before = self.accounts.len();
         self.accounts.retain(|a| !(a.agent == agent && a.name == name));
-        self.rules.iter_mut().for_each(|r| r.accounts.retain(|n| n != name));
+        // A rule for every agent keeps the name while another agent has an account so named;
+        // where it then names none of this agent's accounts, a rule of this agent's own, with no
+        // account, keeps it from using any account there.
+        let shared = self.all().iter().any(|a| a.name == name);
+        let mine: Vec<String> = self.for_agent(agent).into_iter().map(|a| a.name).collect();
+        let mut refusals = Vec::new();
+        for (i, r) in self.rules.iter_mut().enumerate() {
+            if r.agent.as_deref() == Some(agent) || (r.agent.is_none() && !shared) {
+                r.accounts.retain(|n| n != name);
+            } else if r.agent.is_none()
+                && r.accounts.iter().any(|n| n == name)
+                && !r.accounts.iter().any(|n| mine.contains(n))
+            {
+                refusals.push((i, Rule { agent: Some(agent.to_string()), accounts: Vec::new(), ..r.clone() }));
+            }
+        }
+        for (i, rule) in refusals.into_iter().rev() {
+            self.rules.insert(i, rule);
+        }
         before != self.accounts.len()
     }
 
@@ -285,28 +334,51 @@ impl Accounts {
         self.rule_accounts(agent, workspace, cwd).unwrap_or_else(|| self.for_agent(agent))
     }
 
-    /// The accounts of the first rule matching this context, if any.
+    /// The accounts of the first rule matching this context, if any. A rule for every agent
+    /// concerns an agent when it names one of its accounts, or names no account of any agent
+    /// any more: then nothing is allowed here (rather than any account at all).
     pub fn rule_accounts(&self, agent: &str, workspace: Option<&str>, cwd: Option<&Path>) -> Option<Vec<Account>> {
         let all = self.for_agent(agent);
+        let everyone = self.all();
         for rule in &self.rules {
             if rule.agent.as_deref().is_some_and(|a| a != agent) {
                 continue;
             }
             let ws_ok = rule.workspace.as_deref().is_none_or(|w| Some(w) == workspace);
-            let path_ok =
-                rule.path.as_deref().is_none_or(|p| cwd.is_some_and(|c| c.starts_with(paths::expand_tilde(p))));
+            // A worktree of a repository counts as the repository (see `undecided`).
+            let path_ok = rule.path.as_deref().is_none_or(|p| {
+                let p = paths::expand_tilde(p);
+                cwd.is_some_and(|c| {
+                    c.starts_with(&p) || crate::git::known_project_path(c).is_some_and(|k| k.starts_with(&p))
+                })
+            });
             if rule.workspace.is_none() && rule.path.is_none() {
                 continue;
             }
             if ws_ok && path_ok {
                 let picked: Vec<Account> =
                     rule.accounts.iter().filter_map(|n| all.iter().find(|a| &a.name == n).cloned()).collect();
-                if !picked.is_empty() {
+                let dangling = !rule.accounts.iter().any(|n| everyone.iter().any(|a| &a.name == n));
+                if !picked.is_empty() || rule.agent.is_some() || dangling {
                     return Some(picked);
                 }
             }
         }
         None
+    }
+
+    /// Whether a rule could apply to `cwd` once git says which repository it belongs to (a
+    /// linked worktree, wherever it is, counts as its repository): then ask git first, off the
+    /// event loop, rather than choose among accounts a rule may forbid there.
+    pub fn undecided(&self, agent: &str, cwd: Option<&Path>) -> bool {
+        let Some(c) = cwd else { return false };
+        if crate::git::known_project_path(c).is_some() {
+            return false;
+        }
+        self.rules.iter().any(|r| {
+            r.agent.as_deref().is_none_or(|a| a == agent)
+                && r.path.as_deref().is_some_and(|p| !c.starts_with(paths::expand_tilde(p)))
+        })
     }
 
     /// The account to start with: the first candidate under its threshold, else the one that
@@ -326,7 +398,6 @@ impl Accounts {
         candidates.into_iter().min_by_key(|a| usage.get(a).and_then(|u| u.next_reset(now)).unwrap_or(i64::MAX))
     }
 
-    /// Another account of the same agent to continue on, if one is under its threshold.
     /// Another account of the same agent to continue on, under its threshold. When a rule
     /// covers this context, only its accounts are considered: work never moves to an account
     /// the rule does not list.
@@ -361,6 +432,15 @@ pub fn key(agent: &str, name: &str) -> String {
     format!("{agent}:{name}")
 }
 
+/// `home` as an account keeps it: a relative path means where the command was typed, and the
+/// server, which runs elsewhere, must find the same directory. `~/…` stays as written.
+pub fn absolute_home(home: &str) -> Result<String> {
+    if !paths::expand_tilde(home).is_relative() {
+        return Ok(home.to_string());
+    }
+    Ok(std::path::absolute(home).with_context(|| format!("locating {home}"))?.display().to_string())
+}
+
 /// Where a new account's home goes by default.
 pub fn default_home_for(agent: &str, name: &str) -> PathBuf {
     dirs::data_dir()
@@ -389,6 +469,11 @@ pub fn prepare_home(a: &Account) -> Result<Vec<String>> {
     for entry in kind.shared {
         let src = default.join(entry);
         let dst = home.join(entry);
+        // A shared directory not created yet (no conversation so far) is created now: linked
+        // later, it would be too late (the account would have started its own).
+        if !entry.contains('.') && !src.exists() {
+            std::fs::create_dir_all(&src).with_context(|| format!("creating {}", src.display()))?;
+        }
         if !src.exists() || dst.symlink_metadata().is_ok() {
             continue;
         }
@@ -437,11 +522,466 @@ pub fn launch(a: &Account, args: &[String], resume: Option<&str>, new_session: O
     Ok(l)
 }
 
+/// The arguments an agent was started with, without those [`launch`] adds (the conversation it
+/// resumes or the id it gives a new one): what to start it with again.
+pub fn launch_args(kind: &AgentKind, argv: &[String]) -> Vec<String> {
+    let rest = argv.get(1..).unwrap_or_default();
+    let resumes = rest.len() >= kind.resume.len()
+        && kind.resume.iter().zip(rest).all(|(t, a)| t.contains("{session}") || *t == a.as_str());
+    let skip = if resumes {
+        kind.resume.len()
+    } else if kind.session_flag.is_some_and(|f| rest.first().is_some_and(|a| a == f)) {
+        2
+    } else {
+        0
+    };
+    rest.get(skip..).unwrap_or_default().to_vec()
+}
+
+/// Options of the agents that take a value, or several (until the next option): to tell their
+/// values from a prompt given on the command line. From the agents' own `--help`.
+const CLAUDE_VALUE: &[&str] = &[
+    "--model",
+    "--fallback-model",
+    "--permission-mode",
+    "--permission-prompts",
+    "--append-system-prompt",
+    "--system-prompt",
+    "--system-prompt-snapshot",
+    "--settings",
+    "--setting-sources",
+    "--output-format",
+    "--input-format",
+    "--agents",
+    "--agent",
+    "--autocompact",
+    "--environment",
+    "--max-turns",
+    "--permission-prompt-tool",
+    "--session-id",
+    "--effort",
+    "--json-schema",
+    "--max-budget-usd",
+    "--debug-file",
+    "--plugin-dir",
+    "--plugin-url",
+    "--remote",
+    "--remote-control-session-name-prefix",
+    "-n",
+    "--name",
+];
+/// Options of the agents that take no value: a word after one of them is a prompt.
+const CLAUDE_FLAGS: &[&str] = &[
+    "--verbose",
+    "--dangerously-skip-permissions",
+    "--allow-dangerously-skip-permissions",
+    "--ax-screen-reader",
+    "--bare",
+    "--bg",
+    "--background",
+    "--brief",
+    "--chrome",
+    "--no-chrome",
+    "--desktop",
+    "--exclude-dynamic-system-prompt-sections",
+    "--forward-subagent-text",
+    "--ide",
+    "--include-hook-events",
+    "--strict-mcp-config",
+    "--include-partial-messages",
+    "--replay-user-messages",
+    "--restricted",
+    "--safe-mode",
+    "--tmux",
+    "--fork-session",
+    "--mcp-debug",
+    "--continue",
+    "-c",
+    "--no-session-persistence",
+    "--disable-slash-commands",
+];
+const CODEX_FLAGS: &[&str] = &[
+    "--oss",
+    "--search",
+    "--full-auto",
+    "--approve-for-me",
+    "--dangerously-bypass-approvals-and-sandbox",
+    "--dangerously-bypass-hook-trust",
+    "--yolo",
+    "--skip-git-repo-check",
+    "--strict-config",
+    "--worktree",
+    "--no-alt-screen",
+    "--no-daemon",
+];
+const CLAUDE_VALUES: &[&str] = &[
+    "--add-dir",
+    "--mcp-config",
+    "--allowedTools",
+    "--allowed-tools",
+    "--disallowedTools",
+    "--disallowed-tools",
+    "--betas",
+    "--file",
+    "--tools",
+];
+const CODEX_VALUE: &[&str] = &[
+    "-m",
+    "--model",
+    "-p",
+    "--profile",
+    "-c",
+    "--config",
+    "-s",
+    "--sandbox",
+    "-a",
+    "--ask-for-approval",
+    "-C",
+    "--cd",
+    "--add-dir",
+    "--local-provider",
+    "--enable",
+    "--disable",
+    "--remote",
+    "--remote-auth-token-env",
+];
+const CODEX_VALUES: &[&str] = &["-i", "--image"];
+/// Options that make a run of its own, not a conversation (`claude -p`).
+const CLAUDE_ONE_SHOT: &[&str] = &["-p", "--print", "-h", "--help", "-v", "--version"];
+const CODEX_ONE_SHOT: &[&str] = &["-h", "--help", "-V", "--version"];
+/// Claude subcommands: runs of their own, not a conversation.
+const CLAUDE_COMMANDS: &[&str] = &[
+    "agents",
+    "attach",
+    "auth",
+    "auto-mode",
+    "doctor",
+    "gateway",
+    "import",
+    "install",
+    "logs",
+    "mcp",
+    "plugin",
+    "plugins",
+    "purge",
+    "respawn",
+    "rm",
+    "setup-token",
+    "stop",
+    "kill",
+    "ultrareview",
+    "update",
+    "upgrade",
+];
+/// Codex subcommands: runs of their own, not a conversation.
+const CODEX_COMMANDS: &[&str] = &[
+    "exec",
+    "e",
+    "review",
+    "login",
+    "logout",
+    "mcp",
+    "mcp-server",
+    "plugin",
+    "app-server",
+    "exec-server",
+    "remote-control",
+    "completion",
+    "update",
+    "doctor",
+    "sandbox",
+    "debug",
+    "apply",
+    "a",
+    "queue",
+    "archive",
+    "unarchive",
+    "delete",
+    "migrate-rollouts",
+    "agents",
+    "proto",
+    "cloud",
+    "features",
+    "help",
+];
+/// Codex subcommands that open an interactive conversation of their own: `resume [ID] [PROMPT]`,
+/// and `fork [ID] [PROMPT]`, whose conversation is the fork's, not the one it was taken from.
+/// Their id and prompt choose what to start; resuming the conversation they made replaces both.
+const CODEX_CONVERSATIONS: &[&str] = &["resume", "fork"];
+/// Options of those subcommands that choose the conversation, without a value.
+const CODEX_CHOOSERS: &[&str] = &["--last", "--all"];
+
+/// What may be repeated when a conversation is resumed, of the arguments an agent was started
+/// with: its options, not a prompt given on the command line (resuming would send it again).
+/// `None` for a one-shot run (`claude -p`, `--help`, a Codex subcommand such as `exec`): it is
+/// not resumed. The flag is false when a prompt was left out, or when a word could not be told
+/// from a prompt (after an option kraal does not know, or one whose value is optional): then
+/// everything from that option on is kept exactly as given, since dropping a value breaks the
+/// command, and the command must be shown before it runs: it may send a prompt again. A Codex
+/// `resume` or `fork` is a conversation: what chose it (its id, `--last`) and its prompt go.
+pub fn resumable_args(kind: &AgentKind, args: &[String]) -> Option<(Vec<String>, bool)> {
+    type Table = &'static [&'static str];
+    let (one_shot, single, several, flags, commands, conversations): (Table, Table, Table, Table, Table, Table) =
+        match kind.name {
+            "claude" => (CLAUDE_ONE_SHOT, CLAUDE_VALUE, CLAUDE_VALUES, CLAUDE_FLAGS, CLAUDE_COMMANDS, &[]),
+            "codex" => (CODEX_ONE_SHOT, CODEX_VALUE, CODEX_VALUES, CODEX_FLAGS, CODEX_COMMANDS, CODEX_CONVERSATIONS),
+            _ => return None,
+        };
+    // A one-shot run says so anywhere among the options, even past one whose value kraal cannot
+    // tell from a prompt (`--debug api --print`): such a run is never taken for a conversation.
+    let options = &args[..args.iter().position(|a| a == "--").unwrap_or(args.len())];
+    if options.iter().any(|a| one_shot.contains(&a.split('=').next().unwrap_or(a))) {
+        return None;
+    }
+    let mut kept = Vec::new();
+    let mut exact = true;
+    // A word was seen where the subcommand would be (a prompt, or the subcommand itself).
+    let mut positional = false;
+    // In `codex resume|fork`: how many of its words (id, then prompt) were left out, and whether
+    // `--last` chose the conversation (then its first word may be a prompt too).
+    let mut conversation: Option<(usize, bool)> = None;
+    let mut i = 0;
+    while i < args.len() {
+        let a = &args[i];
+        if a == "--" {
+            // What follows is the prompt.
+            exact &= i + 1 == args.len();
+            break;
+        }
+        if a.starts_with('-') && a.len() > 1 {
+            let (name, attached) = match a.split_once('=') {
+                Some((n, _)) => (n, true),
+                None => (a.as_str(), false),
+            };
+            i += 1;
+            if let Some((_, last)) = conversation.as_mut()
+                && CODEX_CHOOSERS.contains(&name)
+            {
+                // The conversation resumed now is the one it made.
+                *last |= name == "--last";
+                continue;
+            }
+            kept.push(a.clone());
+            if flags.contains(&name) || (attached && single.contains(&name)) {
+                continue;
+            }
+            if single.contains(&name) {
+                kept.extend(args.get(i).cloned());
+                i += 1;
+            } else if several.contains(&name) {
+                // All its values, the first one possibly given with `=`.
+                while let Some(v) = args.get(i).filter(|v| !v.starts_with('-')) {
+                    kept.push(v.clone());
+                    i += 1;
+                }
+            } else if args.get(i).is_some_and(|v| !v.starts_with('-')) {
+                // An option kraal does not know (or one whose value is optional, such as
+                // `--debug [filter]` or `--worktree [name]`), then a word: its value or a prompt
+                // (or another value, after `--opt=value`), which only the agent's own parser
+                // knows. So is whether a later word is a subcommand (`--worktree update` names a
+                // worktree): the rest stays exactly as given, to be shown before it runs.
+                kept.extend(args[i..].iter().cloned());
+                exact = false;
+                break;
+            }
+        } else {
+            i += 1;
+            match conversation.as_mut() {
+                Some((words, last)) => {
+                    // Its id goes; a prompt after it (or after `--last`) is left out.
+                    if *words > 0 || *last {
+                        exact = false;
+                    }
+                    *words += 1;
+                }
+                None if !positional && conversations.contains(&a.as_str()) => conversation = Some((0, false)),
+                None if !positional && commands.contains(&a.as_str()) => return None,
+                None => {
+                    positional = true;
+                    exact = false;
+                }
+            }
+        }
+    }
+    Some((kept, exact))
+}
+
+/// A command line that started agent `kind` directly (`claude --model opus`, not through an
+/// account), rewritten to resume conversation `session` with the same options (see
+/// [`resumable_args`] for the flag). `None` when it cannot be done safely (an odd id, a
+/// one-shot run).
+pub fn resume_argv(kind: &AgentKind, argv: &[String], session: &str) -> Option<(Vec<String>, bool)> {
+    let safe = !session.is_empty() && session.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+    let program = argv.first()?;
+    if !safe || program.rsplit('/').next() != Some(kind.command) {
+        return None;
+    }
+    let mut rest: Vec<String> = Vec::new();
+    let args = argv[1..].iter();
+    match kind.name {
+        "claude" => {
+            // Whatever chose the conversation before goes: this one is resumed. `--resume`'s
+            // value is optional (alone, it opens a picker).
+            let mut args = args.peekable();
+            while let Some(a) = args.next() {
+                match a.as_str() {
+                    "--session-id" => {
+                        args.next();
+                    }
+                    "--resume" | "-r" => {
+                        args.next_if(|v| !v.starts_with('-'));
+                    }
+                    "--continue" | "-c" => {}
+                    _ if a.starts_with("--resume=") || a.starts_with("--session-id=") => {}
+                    _ => rest.push(a.clone()),
+                }
+            }
+        }
+        // `codex resume|fork …` is told by [`resumable_args`].
+        "codex" => rest.extend(args.cloned()),
+        _ => return None,
+    }
+    let (kept, exact) = resumable_args(kind, &rest)?;
+    let mut out = vec![program.clone()];
+    out.extend(kind.resume.iter().map(|t| t.replace("{session}", session)));
+    out.extend(kept);
+    Some((out, exact))
+}
+
+/// Whether conversation `session` exists for account `a`, when the agent's files tell (Claude
+/// keeps a transcript per conversation, once something was said in it); `None` when they do not
+/// (another agent, an odd id). An error when they could not be read: that is not "no".
+pub fn conversation_exists(a: &Account, session: &str) -> Result<Option<bool>> {
+    if a.agent != "claude" || !session.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
+        return Ok(None);
+    }
+    Ok(Some(transcript(a, session)?.is_some()))
+}
+
+/// Where conversation `session`'s transcript is in account `a`'s home, if anywhere. An error
+/// when a directory where it may be could not be read.
+fn transcript(a: &Account, session: &str) -> Result<Option<PathBuf>> {
+    let file = format!("{session}.jsonl");
+    let projects = paths::expand_tilde(&a.home).join("projects");
+    let dirs = match std::fs::read_dir(&projects) {
+        Ok(d) => d,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", projects.display())),
+    };
+    for dir in dirs {
+        let path = dir.with_context(|| format!("reading {}", projects.display()))?.path().join(&file);
+        match std::fs::metadata(&path) {
+            Ok(m) if m.is_file() => return Ok(Some(path)),
+            Ok(_) => {}
+            // A project directory without this conversation, or not a directory at all.
+            Err(e) if matches!(e.raw_os_error(), Some(libc::ENOENT) | Some(libc::ENOTDIR)) => {}
+            Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+        }
+    }
+    Ok(None)
+}
+
+/// Whether file `short` holds the start of file `long`.
+fn is_prefix(short: &Path, long: &Path) -> std::io::Result<bool> {
+    use std::io::Read;
+    let (mut a, mut b) = (std::fs::File::open(short)?, std::fs::File::open(long)?);
+    if a.metadata()?.len() > b.metadata()?.len() {
+        return Ok(false);
+    }
+    let (mut x, mut y) = (vec![0u8; 64 << 10], vec![0u8; 64 << 10]);
+    loop {
+        let n = a.read(&mut x)?;
+        if n == 0 {
+            return Ok(true);
+        }
+        b.read_exact(&mut y[..n])?;
+        if x[..n] != y[..n] {
+            return Ok(false);
+        }
+    }
+}
+
+/// What continuing conversation `session` on account `to` needs (Claude: accounts that keep
+/// their conversations apart each have a copy of the transcript, which only ever grows).
+enum Carry {
+    /// No transcript anywhere: nothing was said yet, there is nothing to continue.
+    Nothing,
+    /// `to` sees the newest transcript already (the same file, or a copy holding all of it).
+    There,
+    /// `to` needs the newest transcript, `from`'s, at that place.
+    Copy(PathBuf, PathBuf),
+}
+
+fn carry_plan(from: &Account, to: &Account, session: &str) -> Result<Carry> {
+    if from.agent != "claude" || to.agent != "claude" || conversation_exists(to, session)?.is_none() {
+        return Ok(Carry::Nothing);
+    }
+    let (src, dst) = (transcript(from, session)?, transcript(to, session)?);
+    let Some(src) = src else {
+        return Ok(if dst.is_some() { Carry::There } else { Carry::Nothing });
+    };
+    let Some(dst) = dst else {
+        let project = src.parent().and_then(|d| d.file_name()).context("an odd transcript path")?;
+        let dst = paths::expand_tilde(&to.home).join("projects").join(project).join(src.file_name().unwrap());
+        return Ok(Carry::Copy(src, dst));
+    };
+    let same = match (std::fs::canonicalize(&src), std::fs::canonicalize(&dst)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    };
+    if same || is_prefix(&src, &dst)? {
+        return Ok(Carry::There);
+    }
+    if is_prefix(&dst, &src)? {
+        return Ok(Carry::Copy(src, dst));
+    }
+    bail!(
+        "{} and {} each went on with this conversation on their own: continuing on one would lose \
+         what was said on the other",
+        label(from),
+        label(to)
+    )
+}
+
+/// Refuse early, before an agent is stopped for a switch, when its conversation cannot follow
+/// to `to` whole.
+pub fn check_carry(from: &Account, to: &Account, session: &str) -> Result<()> {
+    carry_plan(from, to, session).map(|_| ())
+}
+
+/// Give account `to` the newest transcript of conversation `session` of account `from` (call it
+/// once `from`'s agent stopped writing it). True when `to` can then resume it; an error when it
+/// cannot without losing part of it.
+pub fn carry_conversation(from: &Account, to: &Account, session: &str) -> Result<bool> {
+    let (src, dst) = match carry_plan(from, to, session)? {
+        Carry::Nothing => return Ok(false),
+        Carry::There => return Ok(true),
+        Carry::Copy(src, dst) => (src, dst),
+    };
+    let dir = dst.parent().context("an odd transcript path")?;
+    std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    let data = std::fs::read(&src).with_context(|| format!("reading {}", src.display()))?;
+    paths::write_private(&dst, &data).with_context(|| format!("copying the conversation to {}", dst.display()))?;
+    Ok(true)
+}
+
 /// The agent's own login command for an account.
 pub fn login(a: &Account) -> Result<Launch> {
     let kind = agent_kind(&a.agent).context("unknown agent")?;
+    agent_command(a, kind.login)
+}
+
+/// The agent's own command that tells whether an account is logged in.
+pub fn login_status(a: &Account) -> Result<Launch> {
+    let kind = agent_kind(&a.agent).context("unknown agent")?;
+    agent_command(a, kind.login_status)
+}
+
+/// The agent's program with `args`, in an account's environment.
+fn agent_command(a: &Account, args: &[&str]) -> Result<Launch> {
+    let kind = agent_kind(&a.agent).context("unknown agent")?;
     let mut l = launch(a, &[], None, None)?;
-    l.argv = std::iter::once(kind.command.to_string()).chain(kind.login.iter().map(|s| s.to_string())).collect();
+    l.argv = std::iter::once(kind.command.to_string()).chain(args.iter().map(|s| s.to_string())).collect();
     Ok(l)
 }
 
@@ -485,9 +1025,27 @@ impl Usage {
         self.five_hour.iter().chain(self.weekly.iter())
     }
 
-    /// Highest usage among windows that have not reset yet.
+    /// Highest usage among windows that have not reset yet. A window that does not say when it
+    /// resets counts until the end of its period after it was seen.
     pub fn peak(&self, now: i64) -> f64 {
-        self.windows().filter(|w| w.resets_at.is_none_or(|r| r > now)).map(|w| w.used_percent).fold(0.0, f64::max)
+        let live = |w: &Window, period: i64| w.resets_at.unwrap_or(self.observed_at + period) > now;
+        let five = self.five_hour.iter().filter(|w| live(w, 5 * 3600));
+        let week = self.weekly.iter().filter(|w| live(w, 7 * 24 * 3600));
+        five.chain(week).map(|w| w.used_percent).fold(0.0, f64::max)
+    }
+
+    /// A limit message seen on the agent's screen, saying `pct` percent of a window (weekly or
+    /// five-hour) is used: the latest word, up or down. A window that already reset says
+    /// nothing any more; the screen does not tell when this one resets, so at the latest when
+    /// its period ends (a full account is not full for ever).
+    pub fn observe_screen(&mut self, weekly: bool, pct: f64, now: i64) {
+        let w = if weekly { &mut self.weekly } else { &mut self.five_hour };
+        let current = w.as_ref().filter(|w| w.resets_at.is_none_or(|r| r > now));
+        let period = if weekly { 7 * 24 * 3600 } else { 5 * 3600 };
+        let resets_at = current.and_then(|w| w.resets_at).unwrap_or(now + period);
+        *w = Some(Window { used_percent: pct, resets_at: Some(resets_at) });
+        self.observed_at = now;
+        self.source = "screen".into();
     }
 
     /// When the fullest window resets.
@@ -508,9 +1066,7 @@ pub fn save_usage(agent: &str, name: &str, u: &Usage) -> Result<()> {
     if let Some(d) = path.parent() {
         paths::ensure_private_dir(d)?;
     }
-    let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, serde_json::to_vec(u)?)?;
-    std::fs::rename(tmp, path)?;
+    paths::write_private(&path, &serde_json::to_vec(u)?)?;
     Ok(())
 }
 
@@ -606,6 +1162,201 @@ pub fn describe_reset(resets_at: Option<i64>, now: i64) -> String {
 mod tests {
     use super::*;
 
+    #[test]
+    fn agents_started_directly_resume_with_their_arguments() {
+        let claude = agent_kind("claude").unwrap();
+        let argv = |s: &str| s.split(' ').map(String::from).collect::<Vec<_>>();
+        assert_eq!(
+            resume_argv(claude, &argv("/usr/bin/claude --model opus -c"), "abc").unwrap(),
+            (argv("/usr/bin/claude --resume abc --model opus"), true)
+        );
+        assert_eq!(
+            resume_argv(claude, &argv("claude --resume old"), "abc").unwrap(),
+            (argv("claude --resume abc"), true)
+        );
+        assert_eq!(
+            resume_argv(claude, &argv("claude -r --model opus"), "abc").unwrap(),
+            (argv("claude --resume abc --model opus"), true),
+            "a picker's -r has no value: the option after it stays"
+        );
+        assert!(resume_argv(claude, &argv("claude"), "x; rm -rf /").is_none());
+        assert!(resume_argv(claude, &argv("vim"), "abc").is_none());
+        let codex = agent_kind("codex").unwrap();
+        assert_eq!(resume_argv(codex, &argv("codex -m o3"), "abc").unwrap(), (argv("codex resume abc -m o3"), true));
+        assert!(resume_argv(codex, &argv("codex exec hi"), "abc").is_none());
+        assert!(resume_argv(codex, &argv("codex -m o3 exec hi"), "abc").is_none());
+        // A one-shot run is never resumed; a prompt is never sent again, and the pane then
+        // waits for Enter.
+        assert!(resume_argv(claude, &argv("claude -p deploy"), "abc").is_none());
+        assert!(resume_argv(claude, &argv("claude --model opus --print deploy"), "abc").is_none());
+        assert_eq!(
+            resume_argv(claude, &argv("claude --model opus deploy"), "abc").unwrap(),
+            (argv("claude --resume abc --model opus"), false)
+        );
+        assert_eq!(
+            resume_argv(claude, &argv("claude --add-dir a b --verbose -- deploy"), "abc").unwrap(),
+            (argv("claude --resume abc --add-dir a b --verbose"), false)
+        );
+        assert_eq!(
+            resume_argv(codex, &argv("codex -m o3 fix"), "abc").unwrap(),
+            (argv("codex resume abc -m o3"), false)
+        );
+        // Option values are kept: dropping one would break the command.
+        assert_eq!(
+            resume_argv(claude, &argv("claude --effort high"), "abc").unwrap(),
+            (argv("claude --resume abc --effort high"), true)
+        );
+        assert_eq!(
+            resume_argv(codex, &argv("codex --enable web_search"), "abc").unwrap(),
+            (argv("codex resume abc --enable web_search"), true)
+        );
+        assert_eq!(
+            resume_argv(claude, &argv("claude --verbose deploy"), "abc").unwrap(),
+            (argv("claude --resume abc --verbose"), false),
+            "a word after a flag that takes no value is a prompt"
+        );
+        // After an option kraal does not know, or one whose value is optional, everything stays
+        // as given (a value is never dropped), and the pane waits for Enter.
+        assert_eq!(
+            resume_argv(claude, &argv("claude --new-option x"), "abc").unwrap(),
+            (argv("claude --resume abc --new-option x"), false)
+        );
+        assert_eq!(
+            resume_argv(claude, &argv("claude --new-option a b --verbose c"), "abc").unwrap(),
+            (argv("claude --resume abc --new-option a b --verbose c"), false)
+        );
+        assert_eq!(
+            resume_argv(claude, &argv("claude --debug api deploy"), "abc").unwrap(),
+            (argv("claude --resume abc --debug api deploy"), false)
+        );
+        assert!(resume_argv(claude, &argv("claude --debug --verbose"), "abc").unwrap().1);
+        // Options that take several values keep them all.
+        assert_eq!(
+            resume_argv(claude, &argv("claude --file file_abc:doc.txt file_def:img.png"), "abc").unwrap(),
+            (argv("claude --resume abc --file file_abc:doc.txt file_def:img.png"), true)
+        );
+        // A flag the agent knows takes no value: the word after it is a prompt, never resent.
+        assert_eq!(
+            resume_argv(claude, &argv("claude --chrome Deploy"), "abc").unwrap(),
+            (argv("claude --resume abc --chrome"), false)
+        );
+        assert!(resume_argv(claude, &argv("claude --help"), "abc").is_none());
+        // A one-shot run says so anywhere among the options, even after one kraal cannot read.
+        assert!(resume_argv(claude, &argv("claude --debug api --print Deploy"), "abc").is_none());
+        assert!(resume_argv(claude, &argv("claude --brand-new x -p Deploy"), "abc").is_none());
+        // A subcommand runs on its own only where a subcommand goes: the first word that is not
+        // an option or an option's value.
+        assert!(resume_argv(claude, &argv("claude update"), "abc").is_none());
+        assert!(resume_argv(claude, &argv("claude mcp list"), "abc").is_none());
+        assert!(resume_argv(claude, &argv("claude --model opus update"), "abc").is_none());
+        assert!(resume_argv(claude, &argv("claude --verbose mcp list"), "abc").is_none());
+        // After an option whose value is optional or unknown, which word is the subcommand cannot
+        // be told: nothing is taken for a one-shot run, everything stays, and the command is shown
+        // before it runs. `--worktree update` names a worktree, `update` is not run.
+        assert_eq!(
+            resume_argv(claude, &argv("claude --worktree update Deploy"), "abc").unwrap(),
+            (argv("claude --resume abc --worktree update Deploy"), false)
+        );
+        assert_eq!(
+            resume_argv(claude, &argv("claude -w update Deploy"), "abc").unwrap(),
+            (argv("claude --resume abc -w update Deploy"), false)
+        );
+        assert_eq!(
+            resume_argv(codex, &argv("codex --brand-new x exec hi"), "abc").unwrap(),
+            (argv("codex resume abc --brand-new x exec hi"), false)
+        );
+        // A value given with `=` to an option that takes several keeps the ones after it.
+        assert_eq!(
+            resume_argv(claude, &argv("claude --file=file_abc:doc.txt file_def:img.png"), "abc").unwrap(),
+            (argv("claude --resume abc --file=file_abc:doc.txt file_def:img.png"), true)
+        );
+        assert_eq!(
+            resume_argv(claude, &argv("claude --model=opus Deploy"), "abc").unwrap(),
+            (argv("claude --resume abc --model=opus"), false)
+        );
+        // After `--opt=value` of an option kraal does not know, a word may be another value.
+        assert_eq!(
+            resume_argv(claude, &argv("claude --brand-new=a b"), "abc").unwrap(),
+            (argv("claude --resume abc --brand-new=a b"), false)
+        );
+        // A Codex fork or resume is a conversation: the one it made is resumed, without the id
+        // it was taken from or its prompt (never sent again).
+        assert_eq!(
+            resume_argv(codex, &argv("codex fork parent"), "child").unwrap(),
+            (argv("codex resume child"), true)
+        );
+        assert_eq!(
+            resume_argv(codex, &argv("codex fork parent Deploy"), "child").unwrap(),
+            (argv("codex resume child"), false)
+        );
+        assert_eq!(
+            resume_argv(codex, &argv("codex -m o3 fork --last --search Deploy"), "child").unwrap(),
+            (argv("codex resume child -m o3 --search"), false)
+        );
+        assert_eq!(
+            resume_argv(codex, &argv("codex fork --all -i a.png b.png parent"), "child").unwrap(),
+            (argv("codex resume child -i a.png b.png parent"), true),
+            "-i takes every word after it, as Codex's own parser does"
+        );
+        assert_eq!(
+            resume_argv(codex, &argv("codex resume old -m o3"), "abc").unwrap(),
+            (argv("codex resume abc -m o3"), true)
+        );
+        assert_eq!(resume_argv(codex, &argv("codex resume --last"), "abc").unwrap(), (argv("codex resume abc"), true));
+        assert_eq!(
+            resumable_args(codex, &argv("fork parent Deploy")).unwrap(),
+            (Vec::new(), false),
+            "started from an account, the same"
+        );
+    }
+
+    #[test]
+    fn conversations_are_found_by_their_transcript() {
+        let home = std::env::temp_dir().join(format!("kraal-conv-{}", std::process::id()));
+        let a = Account {
+            name: "t".into(),
+            agent: "claude".into(),
+            home: home.display().to_string(),
+            threshold: None,
+            note: None,
+        };
+        assert_eq!(conversation_exists(&a, "abc").unwrap(), Some(false));
+        std::fs::create_dir_all(home.join("projects/-home-me")).unwrap();
+        std::fs::write(home.join("projects/-home-me/abc.jsonl"), "").unwrap();
+        assert_eq!(conversation_exists(&a, "abc").unwrap(), Some(true));
+        assert_eq!(conversation_exists(&a, "other").unwrap(), Some(false));
+        // Files that cannot be read do not say "no conversation".
+        use std::os::unix::fs::PermissionsExt;
+        let projects = home.join("projects");
+        std::fs::set_permissions(&projects, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let unreadable = std::fs::read_dir(&projects).is_err(); // not when tests run as root
+        if unreadable {
+            assert!(conversation_exists(&a, "abc").is_err());
+        }
+        std::fs::set_permissions(&projects, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn login_status_commands() {
+        let a = Accounts::empty();
+        let argv = |agent: &str| login_status(&a.get(agent, "default").unwrap()).unwrap().argv;
+        assert_eq!(argv("claude"), vec!["claude", "auth", "status"]);
+        assert_eq!(argv("codex"), vec!["codex", "login", "status"]);
+    }
+
+    #[test]
+    fn launch_args_are_what_the_user_gave() {
+        let claude = agent_kind("claude").unwrap();
+        let argv = |s: &str| s.split(' ').map(String::from).collect::<Vec<_>>();
+        assert_eq!(launch_args(claude, &argv("claude --session-id abc --model opus")), argv("--model opus"));
+        assert_eq!(launch_args(claude, &argv("claude --resume abc --model opus")), argv("--model opus"));
+        assert!(launch_args(claude, &argv("claude")).is_empty());
+        let codex = agent_kind("codex").unwrap();
+        assert_eq!(launch_args(codex, &argv("codex resume abc -m o3")), argv("-m o3"));
+        assert_eq!(launch_args(codex, &argv("codex -m o3")), argv("-m o3"));
+    }
+
     fn acct(agent: &str, name: &str, home: &str) -> Account {
         Account { name: name.into(), agent: agent.into(), home: home.into(), threshold: None, note: None }
     }
@@ -627,6 +1378,19 @@ mod tests {
         let a = accounts();
         let names: Vec<String> = a.for_agent("claude").into_iter().map(|x| x.name).collect();
         assert_eq!(names, vec!["pro", "perso"]);
+        // "default" names the default home only.
+        let mut a = Accounts::empty();
+        assert!(a.add(acct("codex", "default", "/tmp/kraal-test-other")).is_err());
+        a.accounts.push(acct("codex", "default", "/tmp/kraal-test-other"));
+        assert_eq!(a.get("codex", "default").unwrap().home, "/tmp/kraal-test-other", "an older one stays reachable");
+    }
+
+    #[test]
+    fn account_homes_are_kept_absolute() {
+        assert_eq!(absolute_home("~/.claude-x").unwrap(), "~/.claude-x");
+        assert_eq!(absolute_home("/srv/x").unwrap(), "/srv/x");
+        let rel = absolute_home("agent-home").unwrap();
+        assert!(Path::new(&rel).is_absolute() && rel.ends_with("agent-home"), "{rel}");
     }
 
     #[test]
@@ -649,6 +1413,146 @@ mod tests {
         assert_eq!(a.alternative(&pro, None, None, &usage, now).unwrap().name, "perso");
         // A window that already reset does not count.
         assert_eq!(usage.peak(&pro, now + 601), 0.0);
+    }
+
+    #[test]
+    fn a_worktree_anywhere_waits_for_git_before_any_account() {
+        let dir = std::env::temp_dir().join(format!("kraal-rule-worktree-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let repo = dir.join("company/repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let git = |cwd: &Path, args: &[&str]| {
+            let ok = std::process::Command::new("git")
+                .arg("-C")
+                .arg(cwd)
+                .args(["-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false"])
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(ok.status.success(), "{args:?}: {}", String::from_utf8_lossy(&ok.stderr));
+        };
+        git(&repo, &["init", "-q", "-b", "main"]);
+        git(&repo, &["commit", "-q", "--allow-empty", "-m", "one"]);
+        // A linked worktree far from the repository, not in kraal's `<repo>.worktrees/`.
+        let feature = dir.join("elsewhere/feature");
+        git(&repo, &["worktree", "add", "-q", "-b", "feature", feature.to_str().unwrap()]);
+        let repo = std::fs::canonicalize(&repo).unwrap();
+        let feature = std::fs::canonicalize(&feature).unwrap();
+        let mut a = accounts();
+        a.rules = vec![Rule {
+            workspace: None,
+            path: Some(repo.display().to_string()),
+            agent: None,
+            accounts: vec!["pro".into()],
+        }];
+        let usage = UsageMap::default();
+        // Until git has said where the worktree belongs, no choice is made from the
+        // unrestricted list: the caller asks git first.
+        assert!(a.undecided("claude", Some(&feature)));
+        assert!(!a.undecided("claude", Some(&repo.join("src"))), "inside the rule's own path");
+        crate::git::project_path(&feature);
+        assert!(!a.undecided("claude", Some(&feature)));
+        assert_eq!(a.choose("claude", None, Some(&feature), &usage, 0).unwrap().name, "pro");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_conversation_follows_to_an_account_that_keeps_its_own() {
+        let dir = std::env::temp_dir().join(format!("kraal-carry-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (from, to) = (dir.join("perso"), dir.join("pro"));
+        std::fs::create_dir_all(from.join("projects/-work-app")).unwrap();
+        std::fs::create_dir_all(to.join("projects")).unwrap();
+        std::fs::write(from.join("projects/-work-app/abc-1.jsonl"), "{}\n").unwrap();
+        let a = acct("claude", "perso", from.to_str().unwrap());
+        let b = acct("claude", "pro", to.to_str().unwrap());
+        assert_eq!(conversation_exists(&b, "abc-1").unwrap(), Some(false));
+        assert!(carry_conversation(&a, &b, "abc-1").unwrap());
+        assert_eq!(conversation_exists(&b, "abc-1").unwrap(), Some(true));
+        assert!(carry_conversation(&a, &b, "abc-1").unwrap(), "again: already there");
+        assert!(!carry_conversation(&a, &b, "nope").unwrap(), "nothing to carry");
+        let codex = acct("codex", "pro", to.to_str().unwrap());
+        assert!(!carry_conversation(&codex, &codex, "abc-1").unwrap());
+        // The conversation went on on pro; switching back to perso takes all of it, never the
+        // older copy perso still has.
+        let (on_from, on_to) = (from.join("projects/-work-app/abc-1.jsonl"), to.join("projects/-work-app/abc-1.jsonl"));
+        std::fs::write(&on_to, "{}\n{\"more\":1}\n").unwrap();
+        assert!(carry_conversation(&b, &a, "abc-1").unwrap());
+        assert_eq!(std::fs::read_to_string(&on_from).unwrap(), "{}\n{\"more\":1}\n");
+        assert!(carry_conversation(&b, &a, "abc-1").unwrap(), "perso has all of it now");
+        assert!(carry_conversation(&a, &b, "abc-1").unwrap(), "pro has all of it too");
+        // Each went on on its own: neither copy holds the other, continuing would lose a part.
+        std::fs::write(&on_from, "{}\n{\"more\":1}\n{\"perso\":1}\n").unwrap();
+        std::fs::write(&on_to, "{}\n{\"more\":1}\n{\"pro\":1}\n").unwrap();
+        assert!(check_carry(&a, &b, "abc-1").is_err());
+        assert!(carry_conversation(&a, &b, "abc-1").is_err());
+        assert_eq!(std::fs::read_to_string(&on_to).unwrap(), "{}\n{\"more\":1}\n{\"pro\":1}\n", "untouched");
+        // A directory that cannot be read is an error, never "nothing to carry" (which would
+        // start a new conversation) nor "only the other copy" (an older one).
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::write(&on_from, "{}\n{\"more\":1}\n").unwrap();
+        std::fs::write(&on_to, "{}\n").unwrap();
+        for side in [from.join("projects"), to.join("projects")] {
+            std::fs::set_permissions(&side, std::fs::Permissions::from_mode(0o000)).unwrap();
+            if std::fs::read_dir(&side).is_err() {
+                assert!(check_carry(&a, &b, "abc-1").is_err(), "{}", side.display());
+                assert!(carry_conversation(&a, &b, "abc-1").is_err(), "{}", side.display());
+            }
+            std::fs::set_permissions(&side, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        assert_eq!(std::fs::read_to_string(&on_to).unwrap(), "{}\n", "untouched");
+        // Accounts sharing their conversations see one file: nothing to do.
+        let shared = dir.join("shared");
+        std::fs::create_dir_all(shared.join("projects")).unwrap();
+        std::os::unix::fs::symlink(from.join("projects"), shared.join("projects/../projects-link")).unwrap();
+        let c = acct("claude", "shared", shared.to_str().unwrap());
+        std::fs::remove_dir(shared.join("projects")).unwrap();
+        std::fs::rename(shared.join("projects-link"), shared.join("projects")).unwrap();
+        assert!(carry_conversation(&a, &c, "abc-1").unwrap());
+        assert!(check_carry(&c, &a, "abc-1").is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn what_the_screen_says_goes_up_or_down_and_ends() {
+        let mut u = Usage::default();
+        u.observe_screen(false, 100.0, 1_000);
+        assert_eq!(u.peak(1_000), 100.0);
+        u.observe_screen(false, 40.0, 2_000);
+        assert_eq!(u.peak(2_000), 40.0, "a lower figure seen since counts");
+        assert_eq!(u.five_hour.as_ref().unwrap().resets_at, Some(1_000 + 5 * 3600), "the same window");
+        assert_eq!(u.peak(1_000 + 5 * 3600 + 1), 0.0, "the window ends with its period");
+    }
+
+    #[test]
+    fn removing_an_account_keeps_other_agents_rules_and_narrows() {
+        let mut a = accounts();
+        a.accounts.push(acct("codex", "pro", "/tmp/kraal-test-codex-pro"));
+        a.rules.push(Rule {
+            workspace: Some("ops".into()),
+            path: None,
+            agent: Some("codex".into()),
+            accounts: vec!["pro".into()],
+        });
+        assert!(a.remove("claude", "pro"));
+        // Codex's rule and the shared one keep "pro": codex still has it.
+        let named: Vec<(Option<String>, Vec<String>)> =
+            a.rules.iter().map(|r| (r.agent.clone(), r.accounts.clone())).collect();
+        assert_eq!(
+            named,
+            vec![
+                (Some("claude".into()), vec![]),
+                (None, vec!["pro".into()]),
+                (Some("codex".into()), vec!["pro".into()])
+            ]
+        );
+        let usage = UsageMap::default();
+        assert_eq!(a.choose("codex", Some("work"), None, &usage, 0).unwrap().name, "pro");
+        // Claude used pro in "work": now no account there rather than any.
+        assert!(a.choose("claude", Some("work"), None, &usage, 0).is_none());
+        assert_eq!(a.choose("claude", None, None, &usage, 0).unwrap().name, "perso");
+        assert!(a.remove("codex", "pro"));
+        assert!(a.choose("codex", Some("ops"), None, &usage, 0).is_none(), "an emptied rule refuses");
     }
 
     #[test]
@@ -693,6 +1597,17 @@ mod tests {
         assert_eq!(u.five_hour.as_ref().unwrap().used_percent, 42.5);
         assert_eq!(u.weekly.as_ref().unwrap().used_percent, 71.0);
         assert!(usage_from_statusline(&serde_json::json!({"model":{}})).is_none());
+    }
+
+    #[test]
+    fn limits_without_a_reset_time_end() {
+        let u = Usage {
+            five_hour: Some(Window { used_percent: 100.0, resets_at: None }),
+            observed_at: 1_000,
+            ..Default::default()
+        };
+        assert_eq!(u.peak(1_000 + 3600), 100.0);
+        assert_eq!(u.peak(1_000 + 5 * 3600 + 1), 0.0, "five hours later it has reset");
     }
 
     #[test]

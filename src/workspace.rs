@@ -201,6 +201,50 @@ pub fn parse_workspace(name: &str, src: &str) -> Result<WorkspaceDef> {
     })
 }
 
+/// What [`valid_file_name`] accepts, said to the user.
+pub const FILE_NAME_RULE: &str =
+    "a workspace file name is one plain name: not empty, no \"/\" or control character, not starting with \".\"";
+
+/// Whether `name` can name a definition file (`<name>.kdl`) inside the definitions directory:
+/// one plain path component, so that it never reaches another directory, and no control
+/// character (a newline would split the list of saved workspaces).
+pub fn valid_file_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 200
+        && !name.starts_with('.')
+        && !name.contains(['/', '\\', '\0'])
+        && !name.chars().any(char::is_control)
+        && Path::new(name).components().count() == 1
+}
+
+/// The file name a workspace is saved under when none is given: its name when that is already
+/// one plain name ([`valid_file_name`]). A group running a command is named after the whole
+/// command, which may hold a `/` or be long: those become `_`, a name past 200 bytes is cut, and
+/// whenever the name had to change, a digest of the whole is added, so that two workspaces never
+/// share a file (`tail /var/log/a_b` and `tail /var/log/a/b` would otherwise both be
+/// `tail _var_log_a_b`).
+pub fn file_name_from(name: &str) -> String {
+    if valid_file_name(name) && name.trim() == name {
+        return name.to_string();
+    }
+    let replaced: String =
+        name.chars().map(|c| if matches!(c, '/' | '\\' | '\0') || c.is_control() { '_' } else { c }).collect();
+    // Trimmed first: a dot the spaces hid must not start the file name.
+    let trimmed = replaced.trim();
+    let out = match trimmed.strip_prefix('.') {
+        Some(rest) => format!("_{rest}"),
+        None if trimmed.is_empty() => "workspace".to_string(),
+        None => trimmed.to_string(),
+    };
+    let digest = format!("-{:016x}", crate::text::fnv64(name));
+    let mut cut = out.len().min(200 - digest.len());
+    while !out.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    let file = format!("{}{digest}", &out[..cut]);
+    if valid_file_name(&file) { file } else { format!("workspace{digest}") }
+}
+
 /// Load every `*.kdl` in `dir`, sorted by name. Unparseable files are returned as
 /// `Err` entries with the path.
 ///
@@ -694,8 +738,9 @@ impl Parser<'_> {
         if plugin {
             return None;
         }
-        if def.command.is_none() && !def.args.is_empty() {
-            self.warn(node_pos(node), "`args` without `command` ignored");
+        // `args` go to the command, or to the agent kraal starts (`agent="claude" { args "--model" "opus" }`).
+        if def.command.is_none() && def.agent.is_none() && !def.args.is_empty() {
+            self.warn(node_pos(node), "`args` without `command` or `agent` ignored");
             def.args.clear();
         }
         if let Some(raw) = preview {
@@ -887,6 +932,45 @@ fn quote(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn file_names_stay_in_their_directory() {
+        for ok in ["work", "my workspace", "a.b"] {
+            assert!(valid_file_name(ok), "{ok}");
+        }
+        for bad in ["", "..", ".", ".hidden", "../x", "a/b", "/etc/x", "a\\b", "a\nb", "tab\there"] {
+            assert!(!valid_file_name(bad), "{bad:?}");
+        }
+        // A workspace's own name always gives a file name, distinct for distinct long names.
+        let long =
+            |end: &str| format!("prod: journalctl --no-pager --directory=/var/log/journal {}{end}", "x".repeat(300));
+        for name in [
+            "work",
+            "prod: journalctl --directory=/var/log/journal",
+            ".",
+            "..",
+            "",
+            "a\nb",
+            " .ops",
+            "  ",
+            " . ",
+            "printf ok;\nsleep 600",
+            &long("a"),
+            &long("é"),
+        ] {
+            let file = file_name_from(name);
+            assert!(valid_file_name(&file), "{name:?} gave {file:?}");
+            assert!(!file.chars().any(char::is_control), "{name:?} gave {file:?}");
+        }
+        assert_eq!(file_name_from("work"), "work");
+        assert!(file_name_from("prod: tail /var/log/x").starts_with("prod: tail _var_log_x-"));
+        assert_ne!(file_name_from(&long("a")), file_name_from(&long("b")));
+        // Names that differ only where they had to change still get files of their own, and
+        // none of them takes the file of a workspace whose name needed no change.
+        let names = ["prod: tail /var/log/a_b", "prod: tail /var/log/a/b", "prod: tail _var_log_a_b"];
+        let files: std::collections::HashSet<String> = names.iter().map(|n| file_name_from(n)).collect();
+        assert_eq!(files.len(), names.len(), "{files:?}");
+    }
 
     const BARS: &str = r#"
     default_tab_template {
@@ -1336,7 +1420,7 @@ keybinds {
             "line 11: unexpected argument \"positional\" on `pane` ignored",
             "line 12: `focus` must be true or false, found \"maybe\"; ignored",
             "line 13: `split_direction` must be \"vertical\" or \"horizontal\", found \"diagonal\"; ignored",
-            "line 14: `args` without `command` ignored",
+            "line 14: `args` without `command` or `agent` ignored",
             "line 15: unsupported node `what` in `tab` ignored",
             "line 18: unknown top-level node `keybinds` ignored",
         ];
@@ -1397,6 +1481,9 @@ layout {
         }
         floating_panes {
             pane command="lazygit" cwd="sub" focus=true
+            pane agent="claude:pro" {
+                args "--model" "opus"
+            }
         }
     }
     tab name="fleet" {
@@ -1408,6 +1495,9 @@ layout {
 "#;
         let ws = parse_clean(src);
         assert_round_trip(&ws);
+        // An agent keeps the arguments it was saved with.
+        let agent = ws.panes().into_iter().find(|p| p.agent.as_deref() == Some("claude:pro")).unwrap();
+        assert_eq!(agent.args, ["--model", "opus"]);
     }
 
     #[test]

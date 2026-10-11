@@ -2,10 +2,9 @@
 use serde_json::{Value, json};
 use std::{
     fs::{self, File},
-    io::{BufRead, BufReader, Read, Seek, SeekFrom, Write},
+    io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     process::{Command, Stdio},
-    sync::mpsc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -123,59 +122,128 @@ pub fn parse_rpc_result(v: &Value) -> Option<RateLimits> {
         .and_then(snapshot)
 }
 /// Ask Codex via stdio. All error messages are fixed strings to avoid disclosing server data.
+/// Everything happens on the calling thread, each read waiting at most until the deadline:
+/// nothing is left blocked behind when Codex, or something it started, keeps the pipe open.
 pub fn fetch(codex_bin: &str, home: &Path, timeout: Duration) -> anyhow::Result<RateLimits> {
-    let mut child = Command::new(codex_bin)
-        .args(["app-server", "--listen", "stdio://"])
-        .env("CODEX_HOME", home)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|_| anyhow::anyhow!("could not start Codex app-server"))?;
+    let deadline = std::time::Instant::now() + timeout;
+    // In a process group of its own: when it does not answer in time, whatever it started
+    // (`codex` may be a wrapper) goes with it. On Linux it runs under `kraal supervise` (this
+    // very program, even once a newer one replaced it on disk), which also ends what it left
+    // behind however it left (see [`crate::exec::supervise`]). Unit tests are another program:
+    // they talk to Codex directly.
+    // Whatever it starts carries this tag, so that even a daemon that left its tree goes too.
+    let tag = crate::accounts::new_uuid();
+    let spawn = |supervised: bool| {
+        let mut command = if supervised {
+            let mut c = Command::new("/proc/self/exe");
+            c.arg("supervise").arg(codex_bin);
+            c
+        } else {
+            Command::new(codex_bin)
+        };
+        crate::exec::own_group(&mut command)
+            .args(["app-server", "--listen", "stdio://"])
+            .env("CODEX_HOME", home)
+            .env(crate::exec::TAG, &tag)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+    };
+    let mut supervised = cfg!(all(target_os = "linux", not(test)));
+    let mut child = match spawn(supervised) {
+        Ok(child) => child,
+        Err(_) if supervised => {
+            supervised = false;
+            spawn(false).map_err(|_| anyhow::anyhow!("could not start Codex app-server"))?
+        }
+        Err(_) => anyhow::bail!("could not start Codex app-server"),
+    };
     let mut input = child.stdin.take().unwrap();
-    let output = child.stdout.take().unwrap();
-    let (tx, rx) = mpsc::sync_channel(1);
-    std::thread::spawn(move || {
-        let result = (|| -> anyhow::Result<RateLimits> {
-            let mut reader = BufReader::new(output);
-            let mut send = |v: Value| -> anyhow::Result<()> {
-                writeln!(input, "{v}")
-                    .and_then(|_| input.flush())
-                    .map_err(|_| anyhow::anyhow!("Codex protocol write failed"))
-            };
-            send(json!({"id":1,"method":"initialize","params":{"clientInfo":{"name":"kraal","version":"0.1.0"}}}))?;
-            for id in [1, 2] {
-                loop {
-                    let mut line = Vec::new();
-                    let n = reader
-                        .by_ref()
-                        .take(1_048_577)
-                        .read_until(b'\n', &mut line)
-                        .map_err(|_| anyhow::anyhow!("Codex protocol read failed"))?;
-                    anyhow::ensure!(n > 0 && n <= 1_048_576, "invalid Codex protocol frame");
-                    let v: Value =
-                        serde_json::from_slice(&line).map_err(|_| anyhow::anyhow!("invalid Codex protocol JSON"))?;
-                    if v.get("id").and_then(Value::as_u64) != Some(id) {
-                        continue;
-                    }
-                    anyhow::ensure!(v.get("error").is_none(), "Codex rate limit request failed");
-                    if id == 2 {
-                        return parse_rpc_result(&v["result"])
-                            .ok_or_else(|| anyhow::anyhow!("missing Codex rate limits"));
-                    }
-                    break;
+    let mut output = Lines { pipe: child.stdout.take().unwrap(), buf: Vec::new(), deadline };
+    let result = (|| -> anyhow::Result<RateLimits> {
+        let mut send = |v: Value| -> anyhow::Result<()> {
+            writeln!(input, "{v}")
+                .and_then(|_| input.flush())
+                .map_err(|_| anyhow::anyhow!("Codex protocol write failed"))
+        };
+        send(json!({"id":1,"method":"initialize","params":{"clientInfo":{"name":"kraal","version":"0.1.0"}}}))?;
+        for id in [1, 2] {
+            loop {
+                let line = output.next()?;
+                let v: Value =
+                    serde_json::from_slice(&line).map_err(|_| anyhow::anyhow!("invalid Codex protocol JSON"))?;
+                if v.get("id").and_then(Value::as_u64) != Some(id) {
+                    continue;
                 }
-                send(json!({"method":"initialized"}))?;
-                send(json!({"id":2,"method":"account/rateLimits/read","params":null}))?;
+                anyhow::ensure!(v.get("error").is_none(), "Codex rate limit request failed");
+                if id == 2 {
+                    return parse_rpc_result(&v["result"]).ok_or_else(|| anyhow::anyhow!("missing Codex rate limits"));
+                }
+                break;
             }
-            unreachable!()
-        })();
-        let _ = tx.send(result);
-    });
-    let result = rx.recv_timeout(timeout).map_err(|_| anyhow::anyhow!("Codex app-server timed out"));
-    let _ = child.kill();
-    let _ = child.wait();
-    result?
+            send(json!({"method":"initialized"}))?;
+            send(json!({"id":2,"method":"account/rateLimits/read","params":null}))?;
+        }
+        unreachable!()
+    })();
+    // The supervisor ends everything below it (a moment to do so); then, and without one, a
+    // wrapper's helpers that left its group (`setsid`) or its tree (a daemon) go too.
+    if supervised {
+        // SAFETY: plain signal to our own child, not reaped yet.
+        unsafe {
+            libc::kill(child.id() as libc::pid_t, libc::SIGTERM);
+        }
+        let start = std::time::Instant::now();
+        while matches!(child.try_wait(), Ok(None)) && start.elapsed() < Duration::from_secs(3) {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+    crate::exec::kill_tree(&mut child);
+    crate::exec::kill_tagged(&tag);
+    result
+}
+
+/// Lines from Codex's stdout, each read waiting at most until `deadline`.
+struct Lines {
+    pipe: std::process::ChildStdout,
+    buf: Vec<u8>,
+    deadline: std::time::Instant,
+}
+
+impl Lines {
+    const MAX: usize = 1_048_576;
+
+    fn next(&mut self) -> anyhow::Result<Vec<u8>> {
+        use std::os::unix::io::AsRawFd;
+        loop {
+            if let Some(i) = self.buf.iter().position(|b| *b == b'\n') {
+                return Ok(self.buf.drain(..=i).collect());
+            }
+            anyhow::ensure!(self.buf.len() <= Self::MAX, "invalid Codex protocol frame");
+            let left = self.deadline.saturating_duration_since(std::time::Instant::now());
+            anyhow::ensure!(!left.is_zero(), "Codex app-server timed out");
+            let mut fd = libc::pollfd { fd: self.pipe.as_raw_fd(), events: libc::POLLIN, revents: 0 };
+            let ms = left.as_millis().clamp(1, i32::MAX as u128) as libc::c_int;
+            // SAFETY: one valid pollfd, owned by `self.pipe` for the duration of the call.
+            match unsafe { libc::poll(&mut fd, 1, ms) } {
+                0 => anyhow::bail!("Codex app-server timed out"),
+                n if n < 0 => {
+                    anyhow::ensure!(
+                        std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted,
+                        "Codex protocol read failed"
+                    );
+                }
+                _ => {
+                    // Readable: this read does not block.
+                    let mut chunk = [0u8; 64 << 10];
+                    let n = self.pipe.read(&mut chunk).map_err(|_| anyhow::anyhow!("Codex protocol read failed"))?;
+                    anyhow::ensure!(n > 0, "invalid Codex protocol frame");
+                    self.buf.extend_from_slice(&chunk[..n]);
+                }
+            }
+        }
+    }
 }
 /// Read at most five newest regular rollout files, with at most 256 KiB per file.
 /// Symlinks are skipped, including the sessions root, so traversal stays under sessions.
@@ -348,10 +416,8 @@ mod tests {
     }
     #[cfg(unix)]
     fn script(tmp: &Temp, body: &str) -> PathBuf {
-        use std::os::unix::fs::PermissionsExt;
         let path = tmp.0.join("fake-codex");
-        fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+        crate::testing::write_script(&path, &format!("#!/bin/sh\n{body}\n"));
         path
     }
     #[cfg(unix)]
@@ -389,6 +455,15 @@ printf '%s\n' '{"id":2,"result":{"rateLimits":{"primary":{"usedPercent":42,"wind
                 .contains("timed out")
         );
         assert!(start.elapsed() < Duration::from_secs(2));
+        // A wrapper's own child, holding the pipes, goes with it.
+        let path = script(&tmp, "sleep 30 &\necho $! > \"$CODEX_HOME/child\"\nwait");
+        assert!(fetch(path.to_str().unwrap(), &tmp.0, Duration::from_millis(500)).is_err());
+        let pid: i32 = std::fs::read_to_string(tmp.0.join("child")).unwrap().trim().parse().unwrap();
+        let gone = (0..100).any(|_| {
+            std::thread::sleep(Duration::from_millis(10));
+            !crate::process::running(pid)
+        });
+        assert!(gone, "the wrapper's child still runs");
         let path = script(
             &tmp,
             r#"IFS= read -r line
