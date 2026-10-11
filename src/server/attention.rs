@@ -85,21 +85,32 @@ impl Server {
         }
     }
 
-    /// Done agents in the client's focused pane become idle: the user has seen them.
+    /// Done agents and long commands in the client's focused pane have been seen.
     pub fn mark_seen_focused(&mut self, client: ClientId) {
         if let Some(p) = self.client_focus(client)
             && let Some(pane) = self.panes.get_mut(&p)
-            && pane.agent.mark_seen()
+            && (pane.agent.mark_seen() | pane.set_command_unseen(false))
         {
             self.mark_dirty();
         }
     }
 
-    /// Panes needing attention, blocked first, oldest first.
+    /// Panes needing attention: blocked agents first, then finished agents and long commands,
+    /// oldest first.
     pub fn attention_queue(&self) -> Vec<PaneId> {
-        let mut v: Vec<&Pane> = self.panes.values().filter(|p| p.agent.state.needs_attention()).collect();
-        v.sort_by_key(|p| (p.agent.state != AgentState::Blocked, p.agent.since));
-        v.into_iter().map(|p| p.id).collect()
+        let mut v: Vec<(&Pane, bool, Instant)> = self
+            .panes
+            .values()
+            .filter_map(|p| {
+                if p.agent.state.needs_attention() {
+                    Some((p, p.agent.state != AgentState::Blocked, p.agent.since))
+                } else {
+                    p.command_unseen().map(|at| (p, true, at))
+                }
+            })
+            .collect();
+        v.sort_by_key(|(_, later, at)| (*later, *at));
+        v.into_iter().map(|(p, ..)| p.id).collect()
     }
 
     /// Whether some attached client is looking at this pane right now.

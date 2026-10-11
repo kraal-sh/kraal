@@ -16,11 +16,13 @@ use crate::layout::PaneId;
 use crate::preview::Preview;
 use crate::server::Event;
 
+mod commands;
 mod guard;
 mod osc;
 mod pty;
 mod screen;
 
+pub use commands::{Finished, short_duration};
 use osc::sanitize_title;
 use osc::{Osc, OscScanner};
 pub use osc::{osc_notify, osc52};
@@ -122,10 +124,15 @@ impl std::fmt::Debug for SecretEnv {
 /// Things the server must act on after feeding output to a pane.
 #[derive(Debug, Clone)]
 pub enum PaneSignal {
-    Notification { title: String, body: String },
+    Notification {
+        title: String,
+        body: String,
+    },
     Clipboard(String),
     Bell,
     TitleChanged,
+    /// A command the shell marked (OSC 133) ended.
+    CommandDone(Finished),
 }
 
 pub enum Content {
@@ -246,7 +253,9 @@ impl Pane {
         // Keep history: move the old emulator over and reset its modes.
         std::mem::swap(&mut fresh.term, &mut old.term);
         std::mem::swap(&mut fresh.events, &mut old.events);
+        std::mem::swap(&mut fresh.commands, &mut old.commands);
         fresh.parser.advance(&mut fresh.term, &reset_sequence(self.cols));
+        fresh.count_scrolled();
         **old = fresh;
         // A new process: nothing of the old one's lifecycle carries over, but its conversation.
         self.exit_code = None;
@@ -315,7 +324,7 @@ impl Pane {
         self.rows = rows;
         if let Content::Term(t) = &mut self.content {
             let _ = t.master.resize(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 });
-            t.term.resize(Size { cols, rows });
+            t.resize_marked(Size { cols, rows });
         }
     }
 
@@ -324,17 +333,24 @@ impl Pane {
         self.last_output = Instant::now();
         let Content::Term(t) = &mut self.content else { return Vec::new() };
         let mut signals = Vec::new();
-        for osc in t.osc.scan(bytes) {
+        // The emulator gets the output up to each command mark, so that the mark lands where
+        // the shell put it.
+        let mut start = 0;
+        for (end, osc) in t.osc.scan(bytes) {
             match osc {
                 Osc::Notify { title, body } => signals.push(PaneSignal::Notification { title, body }),
                 Osc::Cwd { host, path } => {
                     self.reported_cwd = Some(path);
                     self.reported_host = host;
                 }
+                Osc::Mark(mark) => {
+                    t.advance(&bytes[start..end]);
+                    start = end;
+                    signals.extend(t.mark(mark).map(PaneSignal::CommandDone));
+                }
             }
         }
-        let bytes = t.guard.filter(bytes);
-        t.parser.advance(&mut t.term, &bytes);
+        t.advance(&bytes[start..]);
         self.drain_events(&mut signals);
         signals
     }
@@ -675,7 +691,7 @@ mod tests {
         let data = b"hello\x1b]777;notify;Claude;needs you\x07 and \x1b]9;done!\x1b\\ \x1b]9;4;1;50\x07";
         let mut found = Vec::new();
         for chunk in data.chunks(3) {
-            found.extend(s.scan(chunk));
+            found.extend(s.scan(chunk).into_iter().map(|(_, o)| o));
         }
         assert_eq!(
             found,
@@ -689,7 +705,8 @@ mod tests {
     #[test]
     fn osc7_cwd() {
         let mut s = OscScanner::default();
-        let found = s.scan(b"\x1b]7;file://laptop/home/me/My%20Dir\x07");
+        let found: Vec<Osc> =
+            s.scan(b"\x1b]7;file://laptop/home/me/My%20Dir\x07").into_iter().map(|(_, o)| o).collect();
         assert_eq!(found, vec![Osc::Cwd { host: "laptop".into(), path: PathBuf::from("/home/me/My Dir") }]);
     }
 

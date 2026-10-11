@@ -282,11 +282,12 @@ pub enum Cmd {
         #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
         command: Vec<std::ffi::OsString>,
     },
-    /// Install, remove or check the agent hooks that report exact states.
+    /// Install, remove or check the agent hooks that report exact states, or the shell lines
+    /// that mark prompts and commands (show prints those lines).
     Integration {
-        #[arg(value_parser = ["install", "uninstall", "status"])]
+        #[arg(value_parser = ["install", "uninstall", "status", "show"])]
         action: String,
-        /// claude, codex or all.
+        /// claude, codex, zsh, bash, fish, or all (the agents; status also checks the shells).
         #[arg(default_value = "all")]
         agent: String,
     },

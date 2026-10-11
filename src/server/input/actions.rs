@@ -259,6 +259,7 @@ impl Server {
                     return Mode::Search { query: String::new(), found: false };
                 }
             }
+            Action::CopyLastOutput => self.copy_last_output(id, focus),
             Action::OpenPreview => {
                 return Mode::Prompt(Prompt::new("Preview file (path)", "", PromptAction::OpenPreview));
             }

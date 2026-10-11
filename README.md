@@ -93,7 +93,7 @@ any keyboard layout.
 | agents | `a` start one on an account | `A`: `a` start, `g` go to the agent needing you, `c` change account |
 | tabs | `t` new tab | `T`: `t` new, `←`/`→` previous/next, `e` rename, `x` close |
 | panes | `p` find a pane | `P`: `p` find, `n` new, `→`/`↓` split, `e` rename, `r` resize with the arrows, `f` floating, `x` close |
-| view | `v` copy mode: scroll and select | `V`: `v` copy mode, `g` search the output, `o` links and paths, `f` floating panes, `l` sidebar, `j` message log |
+| view | `v` copy mode: scroll and select | `V`: `v` copy mode, `g` search the output, `o` links and paths, `c` copy the last command's output, `f` floating panes, `l` sidebar, `j` message log |
 | files | `f` file manager | `F`: `f` file manager, `p` preview a file, `u`/`d` upload/download |
 | run | `r` tools where the pane is | `R`: `r` tools, `b` runbooks, `g` git and worktrees |
 
@@ -392,6 +392,31 @@ pattern = 'OPS-\d+'
 tool = "jira"               # a [tools.jira] that opens the ticket
 ```
 
+## Shell commands
+
+A shell can mark where each prompt, command line and output starts, and how each command ended
+(the OSC 133 marks). kraal then knows the commands run in a pane:
+
+- in copy mode, `p` jumps to the prompt above and `P` to the one below; `o` selects the output of
+  the command at the cursor, `O` the whole command with its prompt;
+- `ctrl+b V c` copies the output of the pane's last command (the one running, or the last that
+  ran);
+- a command that failed shows its exit status in the pane's frame (`✗ 2`, with how long it ran
+  when that was 10 seconds or more), until the next one runs;
+- a command that ran 30 seconds or more and ends in a pane you are not looking at is announced
+  like an agent that finished, and waits in `alt+a`'s queue (`[notifications] long_command`, in
+  seconds; 0 turns it off);
+- each command that ends is a `command.finished` event.
+
+Shells do not send the marks by themselves (fish 4 does). kraal adds a few lines to your shell's
+startup file, active only in kraal's panes, when you ask:
+
+```sh
+kraal integration install zsh      # or bash (4.4 and later), fish; a backup is kept
+kraal integration show zsh         # the lines, for a startup file you keep yourself
+kraal integration uninstall zsh
+```
+
 ## Runbooks
 
 A runbook is a procedure kept as a file: yours in `~/.config/kraal/runbooks/`, a repository's in
@@ -473,7 +498,8 @@ Types: `workspace.opened/closed`, `pane.opened/exited/failed/closed`, `agent.wor
 idle`, `ssh.started/ended` (an `ssh` process appeared or ended in a pane, whether or not it got
 connected), `production.entered/left` (`entered` again when the reason changes),
 `notification`, `tunnel.up/down`, `port.opened/closed`, `account.limit`,
-`runbook.started/finished`.
+`runbook.started/finished`, `command.finished` (a command the shell marks ended: its `command`
+line, `exit` status and `seconds`; see [Shell commands](#shell-commands)).
 
 `seq` grows with each event and `boot` changes when the server restarts. The server keeps the last
 1024 events: a script that was too slow (kraal drops it rather than slow down) or restarted can

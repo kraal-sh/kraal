@@ -42,6 +42,7 @@ pub const TYPES: &[&str] = &[
     "account.limit",
     "runbook.started",
     "runbook.finished",
+    "command.finished",
 ];
 
 /// Events kept for subscribers that ask for what they missed.

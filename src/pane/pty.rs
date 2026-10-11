@@ -18,6 +18,7 @@ use anyhow::{Context, Result};
 use crossbeam_channel::Sender;
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize};
 
+use super::commands::Commands;
 use super::guard::KeyboardStackGuard;
 use super::*;
 use crate::layout::PaneId;
@@ -193,6 +194,8 @@ pub struct TermPane {
     pub pid: Option<u32>,
     pub(super) osc: OscScanner,
     pub(super) guard: KeyboardStackGuard,
+    /// The shell's commands, as it marks them.
+    pub(super) commands: Commands,
 }
 
 impl Drop for TermPane {
@@ -307,6 +310,7 @@ impl TermPane {
             pid,
             osc: OscScanner::default(),
             guard: KeyboardStackGuard::default(),
+            commands: Commands::new(env.scrollback),
         };
         if let Some(text) = &spec.startup_input {
             pane.write(text.clone().into_bytes());

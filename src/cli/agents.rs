@@ -330,14 +330,21 @@ pub(super) fn worktrees(s: &Session, action: WtCmd) -> Result<()> {
     }
 }
 
-/// `kraal integration`: install, remove or check kraal's hooks in agents' settings.
+/// `kraal integration`: install, remove or check kraal's hooks in agents' settings, and the
+/// lines that make shells mark their commands. `all` never edits a shell's startup file.
 pub(super) fn integration(action: &str, agent: &str) -> Result<()> {
-    let agents: Vec<&str> = if agent == "all" { vec!["claude", "codex"] } else { vec![agent] };
+    let agents: Vec<&str> = match (agent, action) {
+        ("all", "status") => ["claude", "codex"].iter().chain(integration::SHELLS).copied().collect(),
+        ("all", "show") => bail!("show what: zsh, bash or fish"),
+        ("all", _) => vec!["claude", "codex"],
+        _ => vec![agent],
+    };
     let mut failed = Vec::new();
     for a in agents {
         let r = match action {
             "install" => integration::install(a),
             "uninstall" => integration::uninstall(a),
+            "show" => integration::show(a),
             _ => integration::status(a),
         };
         match r {

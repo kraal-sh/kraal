@@ -349,13 +349,13 @@ impl Server {
             Mode::Scroll => {
                 out.push(badge_span(label, t.working));
                 out.push(Span::raw(" "));
-                out.extend(key_list(&[
-                    ("arrows", "move"),
-                    ("v", "select"),
-                    ("y", "copy"),
-                    ("/", "search"),
-                    ("esc", "exit"),
-                ]));
+                let prompts = self.client_focus(c.id).and_then(|p| self.panes.get(&p)).is_some_and(|p| p.has_prompts());
+                let mut list = vec![("arrows", "move"), ("v", "select"), ("y", "copy"), ("/", "search")];
+                if prompts {
+                    list.extend([("p P", "prompts"), ("o", "output")]);
+                }
+                list.push(("esc", "exit"));
+                out.extend(key_list(&list));
             }
             Mode::Search { query, found } => {
                 out.push(badge_span(label, t.working));
@@ -419,10 +419,13 @@ impl Server {
                 notice.extend(key_list(&list));
             }
         } else if normal && waiting > 0 {
+            // Long commands that ended out of sight wait too: then they are panes, not agents.
+            let agents = self.panes.values().filter(|p| p.agent.state.needs_attention()).count() == waiting;
             notice.push(Span::styled(
                 format!(
-                    "{} {waiting} agent{} need{} you",
+                    "{} {waiting} {}{} need{} you",
                     t.icon(AgentState::Blocked),
+                    if agents { "agent" } else { "pane" },
                     if waiting == 1 { "" } else { "s" },
                     if waiting == 1 { "s" } else { "" }
                 ),
@@ -848,6 +851,16 @@ impl Server {
             out.push(Span::styled(
                 format!(" {} {} {sep} {kind} ", th().icon(state), state.label()),
                 Style::default().fg(th().state_color(state)),
+            ));
+        }
+        // The last command the shell marked failed: its status, and how long it ran if that
+        // was long enough to matter.
+        if let Some((code, took)) = pane.last_failure() {
+            let took = took.filter(|d| d.as_secs() >= 10).map(|d| format!(" {}", crate::pane::short_duration(d)));
+            let mark = if th().ascii { "x" } else { "✗" };
+            out.push(Span::styled(
+                format!(" {mark} {code}{} ", took.unwrap_or_default()),
+                Style::default().fg(Color::LightRed),
             ));
         }
         let offset = pane.display_offset();

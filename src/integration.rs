@@ -1,5 +1,7 @@
 //! Agent hooks: `kraal hook <agent>` reports state changes to the server, and
-//! `kraal integration install <agent>` wires that command into the agent's configuration.
+//! `kraal integration install <agent>` wires that command into the agent's configuration. For
+//! shells, `kraal integration install <shell>` adds the lines that mark prompts and commands
+//! (OSC 133) to the shell's startup file.
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -92,7 +94,8 @@ pub fn install(agent: &str) -> Result<String> {
     match agent {
         "claude" => install_claude(&claude_settings_path(), &crate::accounts::Accounts::path()),
         "codex" => install_codex(&codex_config_path()),
-        _ => bail!("unknown agent {agent:?} (supported: claude, codex)"),
+        s if SHELLS.contains(&s) => install_shell(s, &shell_rc_path(s)),
+        _ => bail!("unknown agent or shell {agent:?} (supported: claude, codex, zsh, bash, fish)"),
     }
 }
 
@@ -100,12 +103,22 @@ pub fn uninstall(agent: &str) -> Result<String> {
     match agent {
         "claude" => uninstall_claude(&claude_settings_path(), &crate::accounts::Accounts::path()),
         "codex" => uninstall_codex(&codex_config_path()),
-        _ => bail!("unknown agent {agent:?} (supported: claude, codex)"),
+        s if SHELLS.contains(&s) => uninstall_shell(s, &shell_rc_path(s)),
+        _ => bail!("unknown agent or shell {agent:?} (supported: claude, codex, zsh, bash, fish)"),
     }
+}
+
+/// What `install` adds to a shell's startup file, for those who keep it themselves.
+pub fn show(shell: &str) -> Result<String> {
+    if !SHELLS.contains(&shell) {
+        bail!("nothing to show for {shell:?}: zsh, bash or fish");
+    }
+    Ok(shell_block(shell).trim_end().to_string())
 }
 
 pub fn status(agent: &str) -> Result<String> {
     match agent {
+        s if SHELLS.contains(&s) => Ok(shell_status(s, &shell_rc_path(s))),
         "claude" => {
             let path = claude_settings_path();
             let v = read_json(&path)?;
@@ -147,8 +160,8 @@ fn write_with_backup(path: &Path, content: &str) -> Result<()> {
         std::fs::create_dir_all(dir)?;
     }
     if path.exists() {
-        let backup =
-            path.with_extension(format!("{}.kraal-bak", path.extension().and_then(|e| e.to_str()).unwrap_or("")));
+        let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        let backup = path.with_file_name(format!("{name}.kraal-bak"));
         std::fs::copy(path, &backup).with_context(|| format!("backing up {}", path.display()))?;
     }
     crate::paths::write_atomic(path, content.as_bytes()).with_context(|| format!("writing {}", path.display()))
@@ -359,6 +372,177 @@ fn toml_string(s: &str) -> String {
     format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
 }
 
+/// Shells whose prompts and commands kraal can have marked.
+pub const SHELLS: &[&str] = &["zsh", "bash", "fish"];
+
+const BLOCK_START: &str = "# >>> kraal shell integration >>>";
+const BLOCK_END: &str = "# <<< kraal shell integration <<<";
+
+/// zsh: the mark of a prompt and of a finished command before each prompt (first of the hooks,
+/// to see the command's own status), of the command line when the line editor starts, of a
+/// command as it runs.
+const ZSH_MARKS: &str = r#"if [[ -n $KRAAL_PANE && -z $__kraal_marks ]]; then
+  typeset -g __kraal_marks=1 __kraal_ran=
+  __kraal_precmd() {
+    local s=$?
+    [[ -n $__kraal_ran ]] && printf '\e]133;D;%s\a' $s
+    __kraal_ran=
+    printf '\e]133;A\a'
+  }
+  __kraal_preexec() {
+    __kraal_ran=1
+    printf '\e]133;C\a'
+  }
+  __kraal_line_init() {
+    printf '\e]133;B\a'
+  }
+  precmd_functions=(__kraal_precmd $precmd_functions)
+  preexec_functions+=(__kraal_preexec)
+  autoload -Uz add-zle-hook-widget && add-zle-hook-widget line-init __kraal_line_init
+fi
+"#;
+
+/// bash: the prompt marks run first in PROMPT_COMMAND, the command line's mark is put back at the
+/// end of PS1 after whatever rewrites it, and PS0 (bash 4.4) marks a command as it runs.
+const BASH_MARKS: &str = r#"if [[ -n $KRAAL_PANE && -z $__kraal_marks ]]; then
+  __kraal_marks=1
+  __kraal_prompt() {
+    local s=$?
+    printf '\e]133;D;%s\a\e]133;A\a' "$s"
+    return $s
+  }
+  __kraal_input() {
+    [[ $PS1 == *'133;B'* ]] || PS1+='\[\e]133;B\a\]'
+  }
+  PROMPT_COMMAND=$'__kraal_prompt\n'"${PROMPT_COMMAND-}"$'\n__kraal_input'
+  PS0=$'\e]133;C\a'"${PS0-}"
+fi
+"#;
+
+/// fish: events around each prompt and command (fish has no hook where the command line starts).
+const FISH_MARKS: &str = r#"if set -q KRAAL_PANE; and not set -q __kraal_marks
+    set -g __kraal_marks 1
+    function __kraal_prompt --on-event fish_prompt
+        if set -q __kraal_status
+            printf '\e]133;D;%s\a' $__kraal_status
+            set -e __kraal_status
+        end
+        printf '\e]133;A\a'
+    end
+    function __kraal_preexec --on-event fish_preexec
+        printf '\e]133;C\a'
+    end
+    function __kraal_postexec --on-event fish_postexec
+        set -g __kraal_status $status
+    end
+end
+"#;
+
+fn shell_rc_path(shell: &str) -> PathBuf {
+    let home = dirs::home_dir().unwrap_or_default();
+    match shell {
+        "zsh" => std::env::var_os("ZDOTDIR").map(PathBuf::from).unwrap_or(home).join(".zshrc"),
+        "bash" => home.join(".bashrc"),
+        _ => std::env::var_os("XDG_CONFIG_HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| home.join(".config"))
+            .join("fish/conf.d/kraal.fish"),
+    }
+}
+
+fn shell_block(shell: &str) -> String {
+    let marks = match shell {
+        "zsh" => ZSH_MARKS,
+        "bash" => BASH_MARKS,
+        _ => FISH_MARKS,
+    };
+    format!(
+        "{BLOCK_START}\n# In kraal's panes, marks prompts and commands (OSC 133): `kraal integration uninstall {shell}` removes this.\n{marks}{BLOCK_END}\n"
+    )
+}
+
+/// `text` without kraal's block, and whether it had one.
+fn without_block(text: &str) -> (String, bool) {
+    let mut out = Vec::new();
+    let mut inside = false;
+    let mut found = false;
+    for line in text.lines() {
+        if line.trim_end() == BLOCK_START {
+            inside = true;
+            found = true;
+            // The blank line written before the block goes with it.
+            if out.last().is_some_and(|l: &&str| l.trim().is_empty()) {
+                out.pop();
+            }
+        } else if inside && line.trim_end() == BLOCK_END {
+            inside = false;
+        } else if !inside {
+            out.push(line);
+        }
+    }
+    let mut rest = out.join("\n");
+    if !rest.is_empty() {
+        rest.push('\n');
+    }
+    (rest, found)
+}
+
+fn install_shell(shell: &str, path: &Path) -> Result<String> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+    };
+    let (mut rest, _) = without_block(&text);
+    if !rest.is_empty() {
+        rest.push('\n');
+    }
+    rest.push_str(&shell_block(shell));
+    if shell == "fish" {
+        // A file of kraal's own, in fish's conf.d: nothing of the user's to keep a copy of.
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        crate::paths::write_atomic(path, rest.as_bytes()).with_context(|| format!("writing {}", path.display()))?;
+        return Ok(format!(
+            "fish: shell integration installed in {}; new shells in kraal mark their commands",
+            path.display()
+        ));
+    }
+    write_with_backup(path, &rest)?;
+    Ok(format!(
+        "{shell}: shell integration installed in {} (backup next to it); new shells in kraal mark their commands",
+        path.display()
+    ))
+}
+
+fn uninstall_shell(shell: &str, path: &Path) -> Result<String> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(format!("{shell}: nothing to remove")),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+    };
+    let (rest, found) = without_block(&text);
+    if !found {
+        return Ok(format!("{shell}: nothing to remove"));
+    }
+    if shell == "fish" && rest.trim().is_empty() {
+        std::fs::remove_file(path).with_context(|| format!("removing {}", path.display()))?;
+    } else {
+        write_with_backup(path, &rest)?;
+    }
+    Ok(format!("{shell}: shell integration removed from {}", path.display()))
+}
+
+fn shell_status(shell: &str, path: &Path) -> String {
+    let text = std::fs::read_to_string(path).unwrap_or_default();
+    if text.lines().any(|l| l.trim_end() == BLOCK_START) {
+        format!("{shell}: installed ({})", path.display())
+    } else {
+        format!("{shell}: not installed; `kraal integration install {shell}` marks its commands")
+    }
+}
+
 /// `kraal statusline`: record the usage Claude Code reports for this account, then run the user's
 /// own status line (or print a compact one). Never fails: the status line must always render.
 pub fn statusline() {
@@ -440,6 +624,72 @@ mod tests {
         assert_eq!(v["hooks"]["Stop"].as_array().unwrap().len(), 1);
         assert!(v["hooks"].get("PreToolUse").is_none());
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn shell_integration_goes_in_once_and_comes_out_whole() {
+        let dir = tmp("shells");
+        let rc = dir.join(".zshrc");
+        std::fs::write(&rc, "export EDITOR=vim\nalias ll='ls -l'").unwrap();
+        install_shell("zsh", &rc).unwrap();
+        install_shell("zsh", &rc).unwrap();
+        let text = std::fs::read_to_string(&rc).unwrap();
+        assert_eq!(text.matches(BLOCK_START).count(), 1, "{text}");
+        assert!(text.starts_with("export EDITOR=vim\nalias ll='ls -l'\n\n"), "{text}");
+        assert!(text.contains("133;D") && text.contains("add-zle-hook-widget"));
+        assert!(shell_status("zsh", &rc).contains("installed ("));
+        // Kept aside before each change, under a name of its own even for a dotfile.
+        assert!(dir.join(".zshrc.kraal-bak").exists());
+        std::fs::write(&rc, format!("{text}export LATER=1\n")).unwrap();
+        uninstall_shell("zsh", &rc).unwrap();
+        assert_eq!(std::fs::read_to_string(&rc).unwrap(), "export EDITOR=vim\nalias ll='ls -l'\nexport LATER=1\n");
+        assert!(uninstall_shell("zsh", &rc).unwrap().contains("nothing to remove"));
+        assert!(shell_status("zsh", &rc).contains("not installed"));
+        // fish: a file of its own in conf.d, created with its directory and removed whole.
+        let fish = dir.join("config/fish/conf.d/kraal.fish");
+        install_shell("fish", &fish).unwrap();
+        assert!(std::fs::read_to_string(&fish).unwrap().contains("fish_postexec"));
+        uninstall_shell("fish", &fish).unwrap();
+        assert!(!fish.exists());
+        // bash: what `show` prints is what `install` adds.
+        let bashrc = dir.join(".bashrc");
+        install_shell("bash", &bashrc).unwrap();
+        assert_eq!(std::fs::read_to_string(&bashrc).unwrap().trim_end(), show("bash").unwrap());
+        assert!(show("claude").is_err());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The shells themselves accept what is installed, and mark a command with its status.
+    #[test]
+    fn installed_shell_lines_mark_commands() {
+        for (shell, args) in [("bash", vec!["--norc", "-i"]), ("zsh", vec!["-f", "-i"])] {
+            if std::process::Command::new(shell).arg("-c").arg("true").output().is_err() {
+                continue;
+            }
+            let dir = tmp(&format!("marks-{shell}"));
+            let script = dir.join("marks");
+            let marks = shell_block(shell);
+            std::fs::write(&script, &marks).unwrap();
+            let input = format!(". {}\nfalse\nexit\n", script.display());
+            let mut child = std::process::Command::new(shell)
+                .args(&args)
+                .env("KRAAL_PANE", "1")
+                .env("PS1", "$ ")
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            use std::io::Write;
+            child.stdin.take().unwrap().write_all(input.as_bytes()).unwrap();
+            let out = child.wait_with_output().unwrap();
+            let all = String::from_utf8_lossy(&out.stdout).into_owned() + &String::from_utf8_lossy(&out.stderr);
+            assert!(all.contains("\x1b]133;A\x07"), "{shell}: {all:?}");
+            assert!(all.contains("\x1b]133;C\x07"), "{shell}: {all:?}");
+            assert!(all.contains("\x1b]133;D;1\x07"), "{shell}: {all:?}");
+            assert!(!all.contains("syntax error") && !all.contains("parse error"), "{shell}: {all:?}");
+            let _ = std::fs::remove_dir_all(dir);
+        }
     }
 
     #[test]

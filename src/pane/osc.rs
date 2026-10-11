@@ -1,7 +1,9 @@
 //! Escape sequences kraal reads from pane output besides the emulator: notifications, the
-//! working directory (OSC 7), the clipboard (OSC 52).
+//! working directory (OSC 7), the shell's command marks (OSC 133), the clipboard (OSC 52).
 
 use std::path::PathBuf;
+
+use super::commands::Mark;
 
 pub(super) fn sanitize_title(s: &str) -> String {
     s.chars().filter(|c| !c.is_control()).take(120).collect()
@@ -12,6 +14,7 @@ pub(super) fn sanitize_title(s: &str) -> String {
 pub(super) enum Osc {
     Notify { title: String, body: String },
     Cwd { host: String, path: PathBuf },
+    Mark(Mark),
 }
 
 #[derive(Default)]
@@ -30,9 +33,10 @@ pub(super) enum ScanState {
 }
 
 impl OscScanner {
-    pub(super) fn scan(&mut self, bytes: &[u8]) -> Vec<Osc> {
+    /// The sequences that end in `bytes`, each with the offset just past its end.
+    pub(super) fn scan(&mut self, bytes: &[u8]) -> Vec<(usize, Osc)> {
         let mut out = Vec::new();
-        for &b in bytes {
+        for (i, &b) in bytes.iter().enumerate() {
             self.state = match (self.state, b) {
                 (ScanState::Ground, 0x1b) => ScanState::Esc,
                 (ScanState::Ground, _) => ScanState::Ground,
@@ -43,7 +47,7 @@ impl OscScanner {
                 (ScanState::Esc, 0x1b) => ScanState::Esc,
                 (ScanState::Esc, _) => ScanState::Ground,
                 (ScanState::Osc, 0x07) => {
-                    out.extend(parse_osc(&self.buf));
+                    out.extend(parse_osc(&self.buf).map(|o| (i + 1, o)));
                     ScanState::Ground
                 }
                 (ScanState::Osc, 0x1b) => ScanState::OscEsc,
@@ -54,7 +58,7 @@ impl OscScanner {
                     ScanState::Osc
                 }
                 (ScanState::OscEsc, b'\\') => {
-                    out.extend(parse_osc(&self.buf));
+                    out.extend(parse_osc(&self.buf).map(|o| (i + 1, o)));
                     ScanState::Ground
                 }
                 (ScanState::OscEsc, b']') => {
@@ -85,6 +89,19 @@ pub(super) fn parse_osc(data: &[u8]) -> Option<Osc> {
             let slash = url.find('/')?;
             let path = &url[slash..];
             Some(Osc::Cwd { host: url[..slash].to_string(), path: PathBuf::from(percent_decode(path)) })
+        }
+        // FinalTerm marks: `A` prompt, `B` command line, `C` output, `D[;status]` end, each
+        // possibly followed by `key=value` options (aid, cl…) that kraal does not need.
+        "133" => {
+            let mut fields = rest.split(';');
+            let mark = match fields.next()? {
+                "A" => Mark::Prompt,
+                "B" => Mark::Input,
+                "C" => Mark::Output,
+                "D" => Mark::End(fields.next().and_then(|f| f.trim().parse().ok())),
+                _ => return None,
+            };
+            Some(Osc::Mark(mark))
         }
         _ => None,
     }

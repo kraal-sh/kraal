@@ -6,6 +6,7 @@
 mod agents;
 mod attention;
 mod clients;
+mod commands;
 mod contexts;
 mod definitions;
 pub mod events;
@@ -1000,6 +1001,7 @@ impl Server {
                         let _ = c.out.try_send(frame_bytes(&bytes));
                     }
                 }
+                PaneSignal::CommandDone(done) => self.command_done(id, done),
                 PaneSignal::Bell | PaneSignal::TitleChanged => {}
             }
         }

@@ -69,6 +69,10 @@ width = 28
 mode = "terminal"
 on_blocked = true
 on_done = true
+# A command that ran this many seconds or more and ends in a pane you are not looking at is
+# announced, and waits for you like an agent does. Needs shells that mark their commands
+# (`kraal integration install zsh`, bash or fish). 0 turns it off.
+long_command = 30
 
 [contexts]
 # Show in pane frames what a pane works on besides git:
@@ -259,6 +263,8 @@ pub struct NotificationConfig {
     pub mode: NotifyMode,
     pub on_blocked: bool,
     pub on_done: bool,
+    /// Seconds a command must run to be announced when it ends unseen; 0 never.
+    pub long_command: u64,
 }
 
 impl Default for Config {

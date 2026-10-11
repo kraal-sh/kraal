@@ -4,6 +4,7 @@ use alacritty_terminal::selection::SelectionType;
 
 use crate::input::{InputEvent, Key, KeyCode};
 use crate::layout::PaneId;
+use crate::server::commands::NO_MARKS;
 use crate::server::ui::Mode;
 use crate::server::{ClientId, Server};
 
@@ -70,6 +71,19 @@ impl Server {
                     }
                     (KeyCode::Char('N'), false) => {
                         pane.search_next(false);
+                    }
+                    // The commands the shell marked: p the prompt above, P the one below, o a
+                    // command's output, O the whole command with its prompt.
+                    (KeyCode::Char(c @ ('p' | 'P' | 'o' | 'O')), false) => {
+                        if !pane.has_prompts() {
+                            self.toast(id, NO_MARKS);
+                        } else if !match c {
+                            'p' | 'P' => pane.jump_to_prompt(c == 'p'),
+                            _ => pane.select_command(c == 'O'),
+                        } {
+                            let what = if c == 'p' || c == 'P' { "no prompt that way" } else { "no command here" };
+                            self.toast(id, what);
+                        }
                     }
                     (KeyCode::Esc, _) if pane.has_selection() => pane.clear_selection(),
                     (KeyCode::Esc, _) | (KeyCode::Char('q'), false) | (KeyCode::Char('c'), true) => {
