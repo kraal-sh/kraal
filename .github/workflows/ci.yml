@@ -1,7 +1,7 @@
 name: CI
 
-# Linux on every push and pull request. macOS when asked for (Actions, Run workflow) and for each
-# tag: its minutes count ten times on a private repository.
+# Linux on every push and pull request. macOS on pull requests, tags, and when asked for (Actions,
+# Run workflow); a push to main was already tested in its pull request.
 
 on:
   push:
@@ -24,7 +24,7 @@ jobs:
       - run: cargo test
 
   macos:
-    if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/')
+    if: github.event_name != 'push' || startsWith(github.ref, 'refs/tags/')
     runs-on: macos-latest
     timeout-minutes: 25
     steps:
