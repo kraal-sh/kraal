@@ -101,6 +101,23 @@ confirm_sync = true
 # Ask before pasting several lines into a production pane that would run them at once.
 confirm_paste = true
 
+[worktrees]
+# Worktrees kraal makes for agents (<repo>.worktrees/<name>). A repository can ship its own
+# preparation in .kraal/worktree.toml (same keys, run once you approve that version); these
+# are yours, for every repository.
+# Files copied from the main checkout into each new worktree, when they are there: paths in the
+# repository, with * and ? in the last part (".env*"). Links out of the repository are skipped.
+copy = []
+# Commands run in each new worktree, in its pane, before the agent starts (after the
+# repository's own); the first one that fails stops the setup.
+setup = []
+# Each worktree has a number in its repository (1, 2…). Its panes get $KRAAL_WORKTREE (its
+# name), $KRAAL_WORKTREE_INDEX and $KRAAL_PORT_OFFSET (that number times port_step), so two
+# worktrees can run the same dev server side by side.
+port_step = 10
+# With a base, they also get $PORT: port_base plus the offset (3010, 3020… for 3000).
+# port_base = 3000
+
 # Tools: programs one key away, started where the focused pane is (ctrl+b r lists them).
 #   command  a shell command line (run by sh -c). The pane's context is in $KRAAL_CWD,
 #            $KRAAL_SERVER, $KRAAL_HOST, $KRAAL_REPO, $KRAAL_BRANCH, $KRAAL_KUBE_CONTEXT,
@@ -221,6 +238,7 @@ pub struct Config {
     pub graphics: GraphicsConfig,
     pub contexts: ContextsConfig,
     pub production: ProductionConfig,
+    pub worktrees: WorktreesConfig,
     pub hints: crate::hints::HintsConfig,
     #[serde(default)]
     pub hooks: toml::Table,
@@ -247,6 +265,14 @@ pub struct ProductionConfig {
     pub words: Vec<String>,
     pub confirm_sync: bool,
     pub confirm_paste: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct WorktreesConfig {
+    pub copy: Vec<String>,
+    pub setup: Vec<String>,
+    pub port_step: u16,
+    pub port_base: Option<u16>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

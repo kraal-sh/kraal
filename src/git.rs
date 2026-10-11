@@ -20,6 +20,8 @@ pub struct GitInfo {
     pub untracked: bool,
     pub ahead: u32,
     pub behind: u32,
+    /// The number of the kraal worktree this is (see [`Worktree::index`]); 0 elsewhere.
+    pub worktree_index: u32,
 }
 
 impl GitInfo {
@@ -51,6 +53,10 @@ pub struct Worktree {
     pub branch: String,
     /// What the branch started from, and what reviews compare against.
     pub base: String,
+    /// Its number among the repository's kraal worktrees (1, 2…), kept while it exists: what
+    /// tells its ports from those of the others. 0 when it has none (made by an older kraal).
+    #[serde(default)]
+    pub index: u32,
 }
 
 impl Worktree {
@@ -86,6 +92,9 @@ pub fn status(cwd: &Path) -> Option<GitInfo> {
     let mut info = parse_status(&out)?;
     info.root = PathBuf::from(root.trim());
     info.untracked |= !listed;
+    if info.branch.starts_with("kraal/") {
+        info.worktree_index = worktree_index(cwd, &info.branch).unwrap_or(0);
+    }
     Some(info)
 }
 
@@ -116,7 +125,7 @@ pub fn parse_status(text: &str) -> Option<GitInfo> {
         }
     }
     let branch = branch.or(oid)?;
-    Some(GitInfo { root: PathBuf::new(), branch, dirty, untracked, ahead, behind })
+    Some(GitInfo { root: PathBuf::new(), branch, dirty, untracked, ahead, behind, worktree_index: 0 })
 }
 
 /// Top of the repository containing `cwd`. For a linked worktree, the main checkout.
@@ -264,14 +273,11 @@ pub fn worktrees_dir(repo: &Path) -> PathBuf {
     repo.with_file_name(format!("{name}.worktrees"))
 }
 
-/// Create a worktree on a new branch `kraal/<name>` from `base` (default: the current branch).
-pub fn add_worktree(cwd: &Path, name: &str, base: Option<&str>) -> Result<Worktree> {
-    if !valid_worktree_name(name) {
-        bail!("invalid worktree name {name:?} (letters, digits, - _ .)");
-    }
+/// The main checkout of the repository containing `cwd`, and what a new worktree made there
+/// starts from: `base`, by default the current branch. That is the one checked out where the
+/// user is, which may be another worktree than the main checkout; a detached HEAD is its commit.
+pub fn start_point(cwd: &Path, base: Option<&str>) -> Result<(PathBuf, String)> {
     let repo = main_checkout(cwd).context("not inside a git repository")?;
-    // The current branch is the one checked out where the user is, which may be another
-    // worktree than the main checkout; a detached HEAD is its commit.
     let base = match base {
         Some(b) => b.to_string(),
         None => match git(cwd, &["rev-parse", "--abbrev-ref", "HEAD"], Duration::from_secs(2))?.trim() {
@@ -279,6 +285,15 @@ pub fn add_worktree(cwd: &Path, name: &str, base: Option<&str>) -> Result<Worktr
             branch => branch.to_string(),
         },
     };
+    Ok((repo, base))
+}
+
+/// Create a worktree on a new branch `kraal/<name>` from `base` (default: the current branch).
+pub fn add_worktree(cwd: &Path, name: &str, base: Option<&str>) -> Result<Worktree> {
+    if !valid_worktree_name(name) {
+        bail!("invalid worktree name {name:?} (letters, digits, - _ .)");
+    }
+    let (repo, base) = start_point(cwd, base)?;
     let branch = format!("kraal/{name}");
     let path = worktrees_dir(&repo).join(name);
     if path.exists() {
@@ -286,9 +301,63 @@ pub fn add_worktree(cwd: &Path, name: &str, base: Option<&str>) -> Result<Worktr
     }
     let path_s = path.display().to_string();
     git(&repo, &["worktree", "add", "-b", &branch, &path_s, &base], Duration::from_secs(60))?;
-    // Remember the base with the branch, for reviews and merges in later sessions.
-    git(&repo, &["config", &format!("branch.{branch}.kraalbase"), &base], Duration::from_secs(5))?;
-    Ok(Worktree { repo, path, branch, base })
+    let index = record_worktree(&repo, &branch, &base)?;
+    Ok(Worktree { repo, path, branch, base, index })
+}
+
+/// Remember with the branch of a new worktree its base (for reviews and merges in later
+/// sessions) and its number: the smallest no other kraal worktree of `repo` has. Both go with
+/// the branch. Worktrees made at the same time by other kraal processes wait for each other here.
+fn record_worktree(repo: &Path, branch: &str, base: &str) -> Result<u32> {
+    let common = git(repo, &["rev-parse", "--path-format=absolute", "--git-common-dir"], Duration::from_secs(2))?;
+    let lock = PathBuf::from(common.trim()).join("kraal-worktrees");
+    crate::paths::locked(&lock, || {
+        set_config(repo, &format!("branch.{branch}.kraalbase"), base)?;
+        let used: std::collections::HashSet<u32> = list_worktrees(repo)?.iter().map(|w| w.index).collect();
+        let index = (1..).find(|n| !used.contains(n)).unwrap_or(1);
+        set_config(repo, &format!("branch.{branch}.kraalindex"), &index.to_string())?;
+        Ok(index)
+    })?
+}
+
+/// Set `key` in the configuration of `repo`. A git writing it at the same moment (another
+/// worktree being made) holds its lock for an instant: then try again.
+fn set_config(repo: &Path, key: &str, value: &str) -> Result<()> {
+    let mut tries = 0;
+    loop {
+        match git(repo, &["config", key, value], Duration::from_secs(5)) {
+            Ok(_) => return Ok(()),
+            Err(e) if tries < 40 && format!("{e:#}").contains(".lock") => {
+                tries += 1;
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+/// The number of the kraal worktree on `branch`, as recorded when it was created.
+pub fn worktree_index(repo: &Path, branch: &str) -> Option<u32> {
+    let out = git(repo, &["config", "--get", &format!("branch.{branch}.kraalindex")], Duration::from_secs(2)).ok()?;
+    out.trim().parse().ok().filter(|n| *n > 0)
+}
+
+/// The content of `path` in commit `rev` of `repo`, when it is a regular file there; `None`
+/// when nothing is at that path.
+pub fn file_at(repo: &Path, rev: &str, path: &str, cap: usize) -> Result<Option<String>> {
+    let entry = git(repo, &["ls-tree", "-z", rev, "--", path], Duration::from_secs(5))?;
+    // `<mode> <type> <id>\t<path>`
+    let Some((meta, _)) = entry.split('\0').next().and_then(|e| e.split_once('\t')) else { return Ok(None) };
+    let fields: Vec<&str> = meta.split(' ').collect();
+    let [mode, "blob", id] = fields[..] else { bail!("{path} in {rev} is not a file") };
+    if mode != "100644" && mode != "100755" {
+        bail!("{path} in {rev} is not a regular file");
+    }
+    let content = git(repo, &["cat-file", "blob", id], Duration::from_secs(5))?;
+    if content.len() > cap {
+        bail!("{path} in {rev} is larger than {} KiB", cap >> 10);
+    }
+    Ok(Some(content))
 }
 
 /// The branch a kraal worktree started from, as recorded when it was created.
@@ -417,6 +486,20 @@ pub fn remove_worktree(w: &Worktree, force: bool) -> Result<()> {
     Ok(())
 }
 
+/// The kraal worktrees of the repository containing `cwd`, each with what removing it would
+/// lose, or why that could not be told. One that would lose nothing is merged into its base and
+/// clean: removing it is safe.
+pub fn worktree_states(cwd: &Path) -> Result<Vec<(Worktree, Result<WorktreeState, String>)>> {
+    let list = list_worktrees(cwd)?;
+    Ok(list
+        .into_iter()
+        .map(|w| {
+            let state = worktree_state(&w).map_err(|e| format!("{e:#}"));
+            (w, state)
+        })
+        .collect())
+}
+
 /// The kraal worktrees of the repository containing `cwd`.
 pub fn list_worktrees(cwd: &Path) -> Result<Vec<Worktree>> {
     let repo = main_checkout(cwd).context("not inside a git repository")?;
@@ -431,7 +514,8 @@ pub fn list_worktrees(cwd: &Path) -> Result<Vec<Worktree>> {
             && let Some(p) = path.take()
         {
             let base = worktree_base(&repo, b).unwrap_or_default();
-            list.push(Worktree { repo: repo.clone(), path: p, branch: b.to_string(), base });
+            let index = worktree_index(&repo, b).unwrap_or(0);
+            list.push(Worktree { repo: repo.clone(), path: p, branch: b.to_string(), base, index });
         }
     }
     Ok(list)
@@ -502,6 +586,77 @@ mod tests {
         std::fs::rename(&repo, dir.join("moved")).unwrap();
         assert_eq!(find_project_path(&wt.join("src")), None);
         assert!(project_path_from_files(&wt.join("src")).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn worktrees_get_numbers_and_merged_ones_are_told_apart() {
+        if Command::new("git").arg("--version").output().is_err() {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("kraal-gitnum-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let repo = dir.join("app");
+        std::fs::create_dir_all(&repo).unwrap();
+        let run = |dir: &Path, args: &[&str]| {
+            let ok = Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(["-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false"])
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(ok.status.success(), "{args:?}: {}", String::from_utf8_lossy(&ok.stderr));
+        };
+        run(&repo, &["init", "-q", "-b", "main"]);
+        std::fs::write(repo.join("a.txt"), "1").unwrap();
+        run(&repo, &["add", "a.txt"]);
+        run(&repo, &["commit", "-q", "-m", "one"]);
+        // Made at the same time, each gets its own number.
+        let made: Vec<Worktree> = std::thread::scope(|s| {
+            let jobs: Vec<_> =
+                ["a", "b", "c"].iter().map(|n| s.spawn(|| add_worktree(&repo, n, None).unwrap())).collect();
+            jobs.into_iter().map(|j| j.join().unwrap()).collect()
+        });
+        let mut numbers: Vec<u32> = made.iter().map(|w| w.index).collect();
+        numbers.sort();
+        assert_eq!(numbers, vec![1, 2, 3]);
+        let by_name = |n: &str| made.iter().find(|w| w.name() == n).unwrap().clone();
+        let (a, b, c) = (by_name("a"), by_name("b"), by_name("c"));
+        assert_eq!(status(&b.path).unwrap().worktree_index, b.index, "git tells a pane's directory");
+        assert_eq!(status(&repo).unwrap().worktree_index, 0, "the main checkout has none");
+        let listed = list_worktrees(&repo).unwrap();
+        assert!(listed.iter().all(|w| made.contains(w)), "{listed:?}");
+        // A number is free again once its worktree is gone.
+        remove_worktree(&a, false).unwrap();
+        assert_eq!(add_worktree(&repo, "d", None).unwrap().index, a.index);
+        // b has a commit main does not have, c a change: neither is merged and clean.
+        std::fs::write(b.path.join("b.txt"), "b").unwrap();
+        run(&b.path, &["add", "b.txt"]);
+        run(&b.path, &["commit", "-q", "-m", "b"]);
+        std::fs::write(c.path.join("a.txt"), "changed").unwrap();
+        let clean = |name: &str| {
+            let states = worktree_states(&repo).unwrap();
+            let (_, state) = states.into_iter().find(|(w, _)| w.name() == name).unwrap();
+            state.unwrap().is_clean()
+        };
+        assert!(!clean("b") && !clean("c"));
+        assert!(clean("d"), "nothing done there: nothing to lose");
+        run(&repo, &["merge", "-q", "--no-ff", "-m", "merge b", "kraal/b"]);
+        assert!(clean("b"), "merged into its base");
+        assert!(!clean("c"));
+        // A repository file is read as committed, and only when it is a regular file.
+        std::fs::create_dir_all(repo.join(".kraal")).unwrap();
+        std::fs::write(repo.join(".kraal/worktree.toml"), "setup = []\n").unwrap();
+        std::os::unix::fs::symlink("/etc/passwd", repo.join(".kraal/link.toml")).unwrap();
+        run(&repo, &["add", ".kraal"]);
+        run(&repo, &["commit", "-q", "-m", "kraal"]);
+        assert_eq!(file_at(&repo, "main", ".kraal/worktree.toml", 1024).unwrap().as_deref(), Some("setup = []\n"));
+        assert_eq!(file_at(&repo, "main", ".kraal/none.toml", 1024).unwrap(), None);
+        assert_eq!(file_at(&repo, "main~1", ".kraal/worktree.toml", 1024).unwrap(), None, "not in that commit");
+        assert!(file_at(&repo, "main", ".kraal/link.toml", 1024).is_err(), "a link is not followed");
+        assert!(file_at(&repo, "main", ".kraal", 1024).is_err(), "a directory is no file");
+        assert!(file_at(&repo, "main", ".kraal/worktree.toml", 4).is_err(), "too large");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

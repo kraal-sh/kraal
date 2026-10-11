@@ -35,6 +35,7 @@ mod theme;
 mod tools;
 mod transfer;
 mod workspace;
+mod worktree_setup;
 
 fn main() {
     cli::main();

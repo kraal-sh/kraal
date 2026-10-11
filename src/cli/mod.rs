@@ -292,6 +292,9 @@ fn config_cmd(action: &str, markdown: bool) -> Result<()> {
             warnings.extend(hints::Custom::build(&cfg.hints, &cfg.tools).1);
             warnings.extend(server::events::read_hooks(&cfg.hooks).1);
             warnings.extend(theme::Theme::from_config(&cfg.theme).1);
+            if let Err(e) = crate::worktree_setup::Setup::of_user(&cfg.worktrees).check() {
+                warnings.push(format!("[worktrees] {e:#}"));
+            }
             for w in &warnings {
                 eprintln!("warning: {w}");
             }

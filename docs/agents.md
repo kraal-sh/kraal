@@ -40,10 +40,42 @@ closes. Account rules written for the repository also apply in its worktrees.
 
 ```sh
 kraal wt new fix-login --agent claude   # the same from the command line
-kraal wt list
+kraal wt list                      # with each worktree's number
 kraal wt rm fix-login              # refuses if it would lose changes or unmerged commits
 kraal wt rm fix-login --force      # removes anyway
+kraal wt prune                     # removes those merged into their base and clean (--dry-run)
 ```
+
+**Preparation.** A new worktree has no `.env` and no `node_modules`. A repository says how to
+prepare its worktrees in `.kraal/worktree.toml`, read from the commit the worktree starts from:
+
+```toml
+copy = [".env*", "config/master.key"]   # from the main checkout, when they are there
+setup = ["npm ci", "npm run db:migrate"]
+```
+
+`copy` takes paths in the repository, with `*` and `?` in the last part; a directory is copied
+whole, without the links in it. A file already in the worktree stays as it is, and nothing is
+copied through a link out of the repository, nor written through one. `setup` runs in the new
+worktree, in the agent's pane, before the agent starts; the first command that fails stops the
+setup, and the agent then waits for Enter. These commands come from the repository: like its
+runbooks, they run only once you have approved that version of the file (kraal shows them and
+asks again when the file changes). `kraal wt new` asks in the terminal; `--yes` approves,
+`--no-setup` skips the preparation. Your own `copy` and `setup`, for every repository, go in
+`[worktrees]` in the config; they run without asking, after the repository's.
+
+**Ports.** Each worktree has a number in its repository (1, 2…, reused once its worktree is
+gone). Panes opened in it get `$KRAAL_WORKTREE` (its name), `$KRAAL_WORKTREE_INDEX` and
+`$KRAAL_PORT_OFFSET` (the number times `port_step`, 10 by default), and `$PORT` when `[worktrees]`
+sets `port_base`, so the same dev server can run in several worktrees at once:
+`npm run dev -- --port $((5173 + KRAAL_PORT_OFFSET))`. The sidebar's PORTS section names the
+worktree a port is served from.
+
+**Cleanup.** `ctrl+b R g` › Remove merged worktrees, from any checkout of the repository, removes
+in one go the worktrees that would lose nothing (no changes, every commit in their base), after
+saying which panes it closes and why the others stay. `kraal wt prune` does the same, keeping the
+worktrees panes of the session work in. Neither ever forces a removal: a branch squashed into its
+base on the server still has commits its base does not have, and stays.
 
 ## Accounts
 

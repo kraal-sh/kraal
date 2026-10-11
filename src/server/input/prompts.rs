@@ -287,6 +287,10 @@ impl Server {
             }
             ConfirmAction::RunBlock { index, production } => return self.confirm_block(id, index, production, yes),
             ConfirmAction::TrustRunbook => return self.confirm_trust(id, yes),
+            ConfirmAction::TrustWorktreeSetup(new) => {
+                self.confirm_worktree_setup(id, *new, yes);
+                return Mode::Normal;
+            }
             ConfirmAction::RunTool { pane, name, selection, reason, place } => {
                 if !yes {
                     return Mode::Normal;
@@ -304,6 +308,7 @@ impl Server {
                     | ConfirmAction::RunRunbook
                     | ConfirmAction::RunBlock { .. }
                     | ConfirmAction::TrustRunbook
+                    | ConfirmAction::TrustWorktreeSetup(_)
                     | ConfirmAction::RunTool { .. } => {
                         unreachable!("answered above")
                     }
@@ -322,7 +327,7 @@ impl Server {
                     ConfirmAction::GitJob { label, script } => {
                         self.git_job(id, &label, script, crate::server::worktrees::JobEnd::CloseOnSuccess)
                     }
-                    ConfirmAction::RemoveWorktree { worktree, state } => self.remove_worktree(id, worktree, state),
+                    ConfirmAction::RemoveWorktrees(list) => self.remove_worktrees(id, list),
                     ConfirmAction::SwitchAccount { pane, agent, account } => {
                         let result = self
                             .accounts

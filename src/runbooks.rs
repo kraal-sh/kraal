@@ -416,19 +416,30 @@ fn trust_store() -> BTreeMap<String, String> {
 pub fn trusted(r: &Runbook) -> bool {
     match &r.source {
         Source::User => true,
-        Source::Repo(_) => trust_store().get(&r.path.display().to_string()) == Some(&r.content),
+        Source::Repo(_) => trusted_content(&r.path, &r.content),
     }
 }
 
 pub fn trust(r: &Runbook) -> Result<()> {
-    let path = trust_path();
-    if let Some(dir) = path.parent() {
+    trust_content(&r.path, &r.content)
+}
+
+/// Whether this exact content of the repository file `path` (a runbook, a worktree setup) was
+/// approved before.
+pub fn trusted_content(path: &Path, content: &str) -> bool {
+    trust_store().get(&path.display().to_string()).is_some_and(|c| c == content)
+}
+
+/// Approve this content of the repository file `path`: it runs from now on without asking.
+pub fn trust_content(path: &Path, content: &str) -> Result<()> {
+    let store_path = trust_path();
+    if let Some(dir) = store_path.parent() {
         paths::ensure_private_dir(dir)?;
     }
-    paths::locked(&path, || {
+    paths::locked(&store_path, || {
         let mut store = trust_store();
-        store.insert(r.path.display().to_string(), r.content.clone());
-        paths::write_private(&path, serde_json::to_string_pretty(&store)?.as_bytes())?;
+        store.insert(path.display().to_string(), content.to_string());
+        paths::write_private(&store_path, serde_json::to_string_pretty(&store)?.as_bytes())?;
         Ok(())
     })?
 }

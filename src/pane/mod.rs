@@ -173,6 +173,9 @@ pub struct Pane {
     /// The command has not been started yet (restored session, `start_suspended`, or it failed
     /// to start): Enter starts it.
     pub suspended: bool,
+    /// What runs is a new worktree's setup, not the command: the command starts in its place
+    /// once the setup succeeds, and waits for Enter when it fails.
+    pub preparing: bool,
     search: Option<SearchState>,
 }
 
@@ -222,6 +225,7 @@ impl Pane {
             close_at: None,
             restart_with: None,
             suspended: false,
+            preparing: false,
             search: None,
         })
     }
@@ -247,6 +251,7 @@ impl Pane {
             close_at: None,
             restart_with: None,
             suspended: false,
+            preparing: false,
             search: None,
         }
     }

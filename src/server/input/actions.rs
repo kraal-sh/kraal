@@ -167,7 +167,10 @@ impl Server {
                 Some(p) => return Mode::Picker(p),
                 None => {
                     let how = self.keymap.hint(Action::AgentPicker).unwrap_or_default();
-                    self.toast(id, format!("This pane is not in a kraal worktree ({how} starts an agent in one)."))
+                    self.toast(
+                        id,
+                        format!("This pane is not in a git repository ({how} starts an agent in a worktree)."),
+                    )
                 }
             },
             Action::ToolPicker => return Mode::Picker(self.tool_picker(focus)),

@@ -1,7 +1,8 @@
 //! Git in the server: branch and changes of each pane's directory (from a background thread),
-//! and worktrees that give an agent its own branch, with review, pull request and cleanup.
+//! and worktrees that give an agent its own branch, prepared before it starts, with review,
+//! pull request and cleanup.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -9,11 +10,19 @@ use crossbeam_channel::Sender;
 
 use super::ui::{ConfirmAction, Mode, PickAction, PickItem, Picker, PickerKind};
 use super::{ClientId, Event, Server};
-use crate::git::{self, GitInfo, Worktree};
+use crate::git::{self, GitInfo, Worktree, WorktreeState};
 use crate::layout::PaneId;
 use crate::pane::PaneSpec;
 use crate::protocol::Placement;
 use crate::shell;
+use crate::worktree_setup::{self, Plan, Prepared};
+
+/// A worktree about to be made for an agent, while the user is asked to trust its setup.
+pub struct NewWorktree {
+    ws: u32,
+    agent: String,
+    plan: Plan,
+}
 
 /// How a git job pane ends.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -93,7 +102,48 @@ impl Server {
         let repo = git::main_checkout(&info.root)?;
         let branch = format!("kraal/{name}");
         let base = git::worktree_base(&repo, &branch).unwrap_or_default();
-        Some(Worktree { repo, path: info.root.clone(), branch, base })
+        Some(Worktree { repo, path: info.root.clone(), branch, base, index: info.worktree_index })
+    }
+
+    /// Give a pane opened in a worktree that worktree's variables (its name, number and port
+    /// offset), unless it has them.
+    pub(super) fn add_worktree_env(&self, spec: &mut PaneSpec) {
+        if spec.env.iter().any(|(k, _)| k == "KRAAL_WORKTREE") {
+            return;
+        }
+        let found = match &spec.worktree {
+            Some(w) => Some((w.name(), w.index)),
+            None => spec.cwd.as_deref().and_then(|cwd| self.worktree_at(cwd)),
+        };
+        if let Some((name, index)) = found {
+            spec.env.extend(worktree_setup::env(&name, index, &self.config.worktrees));
+        }
+    }
+
+    /// The kraal worktree `cwd` is in, and its number, as known without asking git: from a pane
+    /// kraal started for one, or from what git said about a pane's directory.
+    fn worktree_at(&self, cwd: &Path) -> Option<(String, u32)> {
+        let started = self
+            .panes
+            .values()
+            .filter_map(|p| p.spec.worktree.as_ref())
+            .find(|w| w.index > 0 && cwd.starts_with(&w.path))
+            .map(|w| (w.name(), w.index));
+        started.or_else(|| {
+            self.git.values().flatten().filter(|g| g.worktree_index > 0 && cwd.starts_with(&g.root)).find_map(|g| {
+                let name = g.branch.strip_prefix("kraal/")?;
+                Some((name.to_string(), g.worktree_index))
+            })
+        })
+    }
+
+    /// The worktree a pane works in, for the sidebar: cheap, from what it was started with.
+    pub(super) fn pane_worktree_name(&self, pane: PaneId) -> Option<String> {
+        let spec = &self.panes.get(&pane)?.spec;
+        spec.worktree
+            .as_ref()
+            .map(Worktree::name)
+            .or_else(|| spec.env.iter().find(|(k, _)| k == "KRAAL_WORKTREE").map(|(_, v)| v.clone()))
     }
 
     /// Panes working inside a worktree's directory.
@@ -108,8 +158,9 @@ impl Server {
             .collect()
     }
 
-    /// Create a worktree from the focused pane's repository (in the background: git can be
-    /// slow), then start `agent` in it in a new tab.
+    /// Create a worktree from the focused pane's repository, prepare it as the repository and
+    /// the config say, then start `agent` in it in a new tab. Git runs in the background (it
+    /// can be slow); the repository's setup commands are approved first.
     pub(super) fn agent_in_worktree(&mut self, client: ClientId, agent: &str, name: &str) -> Result<()> {
         let ws = self.clients.get(&client).map(|c| c.workspace).context("no client")?;
         let cwd = self
@@ -119,43 +170,87 @@ impl Server {
             .and_then(|p| p.current_cwd())
             .context("no local directory to take the repository from")?;
         anyhow::ensure!(git::valid_worktree_name(name), "invalid worktree name {name:?} (letters, digits, - _ .)");
+        let user = worktree_setup::Setup::of_user(&self.config.worktrees);
         let (agent, name) = (agent.to_string(), name.to_string());
         self.toast(client, format!("creating worktree {name}…"));
-        let name_for_job = name.clone();
         self.background(
-            move || git::add_worktree(&cwd, &name_for_job, None),
-            move |server, created| {
-                let result = created.and_then(|wt| server.start_agent_in(ws, &agent, &name, wt));
-                if let Err(e) = result {
-                    server.toast(client, format!("{e:#}"));
+            move || Plan::new(&cwd, &name, None, user),
+            move |server, plan| match plan {
+                Ok(plan) if plan.needs_trust() => {
+                    let question = plan.trust_question();
+                    let new = Box::new(NewWorktree { ws, agent, plan });
+                    server.set_mode_if_idle(client, Mode::confirm(question, ConfirmAction::TrustWorktreeSetup(new)));
                 }
+                Ok(plan) => server.create_worktree(client, NewWorktree { ws, agent, plan }),
+                Err(e) => server.toast(client, format!("{e:#}")),
             },
         );
         Ok(())
     }
 
-    fn start_agent_in(&mut self, ws: u32, agent: &str, name: &str, wt: Worktree) -> Result<()> {
+    /// The answer to the question about a repository's worktree setup: a yes trusts this
+    /// version of it and makes the worktree; a no makes nothing.
+    pub(super) fn confirm_worktree_setup(&mut self, client: ClientId, new: NewWorktree, yes: bool) {
+        if !yes {
+            self.toast(client, format!("the worktree {} was not created", new.plan.name));
+            return;
+        }
+        if let Err(e) = new.plan.trust() {
+            self.warnings.push(format!("{e:#}"));
+        }
+        self.create_worktree(client, new);
+    }
+
+    fn create_worktree(&mut self, client: ClientId, new: NewWorktree) {
+        let NewWorktree { ws, agent, plan } = new;
+        self.background(
+            move || plan.create(),
+            move |server, created| {
+                let result = created.and_then(|p| server.start_agent_in(ws, &agent, p));
+                if let Err(e) = result {
+                    server.toast(client, format!("{e:#}"));
+                }
+            },
+        );
+    }
+
+    /// Start `agent` in its new worktree, in a tab named after it; the worktree's setup runs in
+    /// its pane first.
+    fn start_agent_in(&mut self, ws: u32, agent: &str, prepared: Prepared) -> Result<()> {
         let wi = self.ws_index(ws).context("the workspace was closed")?;
         let ws_name = self.workspaces[wi].name.clone();
+        let wt = prepared.worktree.clone();
+        let name = wt.name();
         // Account rules are written for the repository, not for its worktrees' directories.
         let account = self
             .accounts
             .choose(agent, Some(&ws_name), Some(&wt.repo), &self.usage, crate::accounts::now())
             .context("no account for this agent")?;
         let mut spec = self.agent_spec(&account, Some(wt.path.clone()), None, &[])?;
-        spec.worktree = Some(wt);
-        let id = self.spawn_pane_in(ws, None, spec, Placement::Tab, Some(format!("{agent} {name}")))?;
+        spec.worktree = Some(wt.clone());
+        let title = Some(format!("{agent} {name}"));
+        let id = match prepared.script() {
+            Some(script) => {
+                let setup = PaneSpec {
+                    command: vec!["sh".into(), "-c".into(), script],
+                    cwd: Some(wt.path.clone()),
+                    worktree: Some(wt),
+                    ..Default::default()
+                };
+                self.spawn_pane_after(ws, setup, spec, Placement::Tab, title)?
+            }
+            None => self.spawn_pane_in(ws, None, spec, Placement::Tab, title)?,
+        };
         if let Some((wi, ti)) = self.workspace_of(id) {
-            self.workspaces[wi].tabs[ti].name = name.to_string();
+            self.workspaces[wi].tabs[ti].name = name;
         }
         self.mark_persist();
         Ok(())
     }
 
-    /// What can be done with a worktree: review, commit, pull request, merge, remove.
+    /// What can be done with a worktree: review, commit, pull request, merge, remove; and in any
+    /// checkout of a repository, remove its merged worktrees.
     pub(super) fn worktree_picker(&self, pane: PaneId) -> Option<Picker> {
-        let w = self.pane_worktree(pane)?;
-        let base = if w.base.is_empty() { "the base branch".to_string() } else { w.base.clone() };
         let item = |label: &str, detail: String, op: &str| PickItem {
             label: label.into(),
             detail,
@@ -163,6 +258,17 @@ impl Server {
             state: None,
             dim: false,
         };
+        let prune = item(
+            "Remove merged worktrees",
+            "those with nothing to lose: no changes, every commit in their base".into(),
+            "prune",
+        );
+        let Some(w) = self.pane_worktree(pane) else {
+            let root = &self.pane_git(pane)?.root;
+            let repo = root.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            return Some(Picker::new(PickerKind::Pane, &format!("Worktrees of {repo}"), vec![prune]));
+        };
+        let base = if w.base.is_empty() { "the base branch".to_string() } else { w.base.clone() };
         let mut items = vec![
             item("Review changes", format!("diff against {base}, uncommitted changes included"), "review"),
             item("Commit everything", "stage all changes and commit (you write the message)".into(), "commit"),
@@ -172,10 +278,24 @@ impl Server {
         }
         items.push(item("Merge into base", format!("merge {} into {base} in {}", w.branch, w.repo.display()), "merge"));
         items.push(item("Remove worktree", format!("delete {} and its branch", w.path.display()), "remove"));
+        items.push(prune);
         Some(Picker::new(PickerKind::Pane, &format!("Worktree {}", w.name()), items))
     }
 
     pub(super) fn worktree_op(&mut self, client: ClientId, pane: PaneId, op: &str) -> Mode {
+        if op == "prune" {
+            let dir = self.pane_git(pane).map(|g| g.root.clone()).or_else(|| self.pane_worktree(pane).map(|w| w.repo));
+            let Some(dir) = dir else { return Mode::Normal };
+            // What removing each would lose is asked first (git may take a moment).
+            self.background(
+                move || git::worktree_states(&dir),
+                move |server, states| match states {
+                    Ok(states) => server.ask_prune_worktrees(client, states),
+                    Err(e) => server.toast(client, format!("{e:#}")),
+                },
+            );
+            return Mode::Normal;
+        }
         let Some(w) = self.pane_worktree(pane) else { return Mode::Normal };
         let path = shell::quote(&w.path.display().to_string());
         let repo = shell::quote(&w.repo.display().to_string());
@@ -259,14 +379,66 @@ impl Server {
         }
         self.set_mode_if_idle(
             client,
-            Mode::confirm(lines.join("\n"), ConfirmAction::RemoveWorktree { worktree: w, state }),
+            Mode::confirm(lines.join("\n"), ConfirmAction::RemoveWorktrees(vec![(w, state)])),
         );
     }
 
-    /// Remove the worktree the user confirmed, as it was then: close its panes, wait for their
-    /// processes to end, check nothing changed since the question (else ask again), remove.
-    pub(super) fn remove_worktree(&mut self, client: ClientId, w: Worktree, state: git::WorktreeState) {
-        let in_tree = self.panes_in(&w);
+    /// Offer to remove the worktrees that would lose nothing (no changes, every commit in their
+    /// base), saying which panes that closes and why the others stay.
+    fn ask_prune_worktrees(&mut self, client: ClientId, states: Vec<(Worktree, Result<WorktreeState, String>)>) {
+        let (mut merged, mut kept) = (Vec::new(), Vec::new());
+        for (w, state) in states {
+            match state {
+                Ok(s) if s.is_clean() => merged.push((w, s)),
+                Ok(s) => kept.push(format!("{} ({})", w.name(), s.describe())),
+                Err(e) => kept.push(format!("{} ({e})", w.name())),
+            }
+        }
+        if merged.is_empty() {
+            let why = if kept.is_empty() { String::new() } else { format!("; kept: {}", kept.join(", ")) };
+            self.toast(client, format!("no merged worktree to remove{why}"));
+            return;
+        }
+        let mut lines = vec![format!(
+            "Remove {} and {}? They have no changes, and their base has all their commits:",
+            plural(merged.len(), "merged worktree"),
+            if merged.len() == 1 { "its branch" } else { "their branches" }
+        )];
+        for (w, _) in &merged {
+            lines.push(format!("  {}  {}", w.name(), crate::paths::shorten_home(&w.path)));
+        }
+        let mut panes: Vec<PaneId> = Vec::new();
+        for p in merged.iter().flat_map(|(w, _)| self.panes_in(w)) {
+            if !panes.contains(&p) {
+                panes.push(p);
+            }
+        }
+        if !panes.is_empty() {
+            let names: Vec<String> = panes.iter().map(|p| self.pane_label(*p)).collect();
+            lines.push(format!(
+                "Closes {}: {}",
+                if panes.len() == 1 { "1 pane" } else { "these panes" },
+                names.join(", ")
+            ));
+        }
+        if !kept.is_empty() {
+            lines.push(format!("Kept: {}", kept.join(", ")));
+        }
+        self.set_mode_if_idle(client, Mode::confirm(lines.join("\n"), ConfirmAction::RemoveWorktrees(merged)));
+    }
+
+    /// Remove the worktrees the user confirmed, as they were then: close their panes, wait for
+    /// their processes to end, check nothing changed since the question (else ask again),
+    /// remove.
+    pub(super) fn remove_worktrees(&mut self, client: ClientId, list: Vec<(Worktree, WorktreeState)>) {
+        let Some((first, _)) = list.first() else { return };
+        let repo = first.repo.clone();
+        let mut in_tree: Vec<PaneId> = Vec::new();
+        for p in list.iter().flat_map(|(w, _)| self.panes_in(w)) {
+            if !in_tree.contains(&p) {
+                in_tree.push(p);
+            }
+        }
         let pids: Vec<u32> = in_tree.iter().filter_map(|p| self.panes.get(p)?.pid()).collect();
         // Closing the last panes would end the session before the removal ran: a shell in the
         // repository takes their place.
@@ -275,9 +447,9 @@ impl Server {
             && let Some((wi, _)) = self.workspace_of(in_tree[0])
         {
             let ws = self.workspaces[wi].id;
-            let spec = PaneSpec { cwd: Some(w.repo.clone()), ..Default::default() };
+            let spec = PaneSpec { cwd: Some(repo), ..Default::default() };
             if let Err(e) = self.spawn_pane_in(ws, None, spec, Placement::Tab, None) {
-                self.toast(client, format!("{e:#}: the worktree was not removed"));
+                self.toast(client, format!("{e:#}: nothing was removed"));
                 return;
             }
         }
@@ -285,43 +457,19 @@ impl Server {
             self.close_pane(p);
         }
         self.background(
-            move || {
-                anyhow::ensure!(
-                    crate::exec::wait_gone(&pids, Duration::from_secs(5)),
-                    "programs of {} are still running after their panes closed; nothing was removed",
-                    w.name()
-                );
-                // Whatever its panes started in another process group (a build, a test watcher)
-                // and that ignored the hang-up may still write there.
-                let busy = crate::process::working_in(&w.path);
-                if !busy.is_empty() {
-                    let names: Vec<String> = busy.iter().map(|(pid, name)| format!("{name} ({pid})")).collect();
-                    anyhow::bail!(
-                        "{} still runs or writes in {}: stop it, then remove the worktree; nothing was removed",
-                        names.join(", "),
-                        w.name()
-                    );
+            move || remove_unchanged(list, &pids),
+            move |server, (removed, errors): (Vec<Worktree>, Vec<String>)| {
+                let mut parts = Vec::new();
+                match removed.as_slice() {
+                    [] => {}
+                    [w] => parts.push(format!("removed {} and {}", w.path.display(), w.branch)),
+                    many => {
+                        let names: Vec<String> = many.iter().map(Worktree::name).collect();
+                        parts.push(format!("removed {} worktrees: {}", many.len(), names.join(", ")));
+                    }
                 }
-                let now = git::worktree_state(&w)?;
-                anyhow::ensure!(
-                    now == state,
-                    "{} changed since you confirmed ({}); ask again",
-                    w.name(),
-                    now.describe()
-                );
-                // Something started elsewhere may still be writing there: it must have settled.
-                std::thread::sleep(Duration::from_millis(500));
-                anyhow::ensure!(
-                    git::worktree_state(&w)? == state,
-                    "{} is still changing (something outside its panes writes there); nothing was removed",
-                    w.name()
-                );
-                // Losing changes or commits was shown and accepted; nothing else is lost.
-                git::remove_worktree(&w, !state.is_clean()).map(|()| w)
-            },
-            move |server, result| match result {
-                Ok(w) => server.toast(client, format!("removed {} and {}", w.path.display(), w.branch)),
-                Err(e) => server.toast(client, format!("{e:#}")),
+                parts.extend(errors);
+                server.toast(client, parts.join("; "));
             },
         );
     }
@@ -359,6 +507,67 @@ impl Server {
             })
             .collect()
     }
+}
+
+/// Remove each worktree of `list` once the programs `pids` of its panes are gone, if it is still
+/// as the user was shown; the worktrees removed, and why the others were not.
+fn remove_unchanged(list: Vec<(Worktree, WorktreeState)>, pids: &[u32]) -> (Vec<Worktree>, Vec<String>) {
+    if !crate::exec::wait_gone(pids, Duration::from_secs(5)) {
+        let names: Vec<String> = list.iter().map(|(w, _)| w.name()).collect();
+        let error =
+            format!("programs of {} are still running after their panes closed; nothing was removed", names.join(", "));
+        return (Vec::new(), vec![error]);
+    }
+    let unchanged = |w: &Worktree, state: &WorktreeState| -> Result<()> {
+        // Whatever its panes started in another process group (a build, a test watcher) and
+        // that ignored the hang-up may still write there.
+        let busy = crate::process::working_in(&w.path);
+        if !busy.is_empty() {
+            let names: Vec<String> = busy.iter().map(|(pid, name)| format!("{name} ({pid})")).collect();
+            anyhow::bail!(
+                "{} still runs or writes in {}: stop it, then remove the worktree; nothing was removed",
+                names.join(", "),
+                w.name()
+            );
+        }
+        let now = git::worktree_state(w)?;
+        anyhow::ensure!(now == *state, "{} changed since you confirmed ({}); ask again", w.name(), now.describe());
+        Ok(())
+    };
+    let mut errors = Vec::new();
+    let mut ready = Vec::new();
+    for (w, state) in list {
+        match unchanged(&w, &state) {
+            Ok(()) => ready.push((w, state)),
+            Err(e) => errors.push(format!("{e:#}")),
+        }
+    }
+    // Something started elsewhere may still be writing there: it must have settled.
+    if !ready.is_empty() {
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    let mut removed = Vec::new();
+    for (w, state) in ready {
+        let result = (|| -> Result<()> {
+            anyhow::ensure!(
+                git::worktree_state(&w)? == state,
+                "{} is still changing (something outside its panes writes there); nothing was removed",
+                w.name()
+            );
+            // Losing changes or commits was shown and accepted; nothing else is lost.
+            git::remove_worktree(&w, !state.is_clean())
+        })();
+        match result {
+            Ok(()) => removed.push(w),
+            Err(e) => errors.push(format!("{e:#}")),
+        }
+    }
+    (removed, errors)
+}
+
+/// `1 merged worktree`, `2 merged worktrees`.
+fn plural(n: usize, what: &str) -> String {
+    format!("{n} {what}{}", if n == 1 { "" } else { "s" })
 }
 
 /// The script that pushes a worktree's branch and opens its pull request, against the branch
@@ -442,6 +651,7 @@ mod tests {
             path: dir.join("gone"),
             branch: "kraal/x".into(),
             base: "origin/main".into(),
+            index: 1,
         };
         let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap_or_default());
         let status = std::process::Command::new("sh")
