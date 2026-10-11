@@ -1,0 +1,20 @@
+# Production
+
+A safety net for the panes where a mistake costs the most.
+
+A pane is production when its server, Kubernetes context or namespace, Terraform
+workspace or AWS profile has `prod`, `production` or `prd` as a word of its name (`web-prod-1`,
+`prod-eks`, `db.prod.lan`; not `products-api`), or when its server says `env = "prod"` in
+`servers.toml` (`kraal servers add … --env prod`; a server with another `env` never is). Production
+panes get a red frame and a PROD badge, their tab turns red, and kraal asks before:
+
+- broadcast typing reaches a production pane (once per pane and production reason, until the
+  broadcast stops; no stops it);
+- several lines are pasted into a production program that would run them as they arrive (a shell
+  in bracketed paste mode shows them first, so it is not asked);
+- a tool starts on a production pane, unless the tool says `read_only = true` (htop, logs…);
+- a runbook runs on production targets (its plan says which).
+
+Scripts and agents get no prompt: `kraal send` and `kraal keys` refuse a production pane unless
+given `--production`. The `[production]` section changes the words or turns the questions off.
+This guard is a safety net based on names, not a permission system.
