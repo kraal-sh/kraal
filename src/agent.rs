@@ -61,11 +61,13 @@ impl AgentState {
     }
 }
 
-/// Executable names of the agents kraal recognises.
+/// Executable names of the agents kraal recognises (or the name of the script an interpreter
+/// runs for them), and the name kraal gives each agent.
 const KNOWN_AGENTS: &[(&str, &str)] = &[
     ("claude", "claude"),
     ("codex", "codex"),
     ("opencode", "opencode"),
+    ("opencode2", "opencode"),
     ("gemini", "gemini"),
     ("aider", "aider"),
     ("cursor-agent", "cursor"),
@@ -78,7 +80,33 @@ const KNOWN_AGENTS: &[(&str, &str)] = &[
     ("qwen", "qwen"),
     ("kimi", "kimi"),
     ("droid", "droid"),
+    ("auggie", "auggie"),
+    ("kiro-cli", "kiro"),
+    ("kilo", "kilo"),
+    ("kilocode", "kilo"),
+    ("cline", "cline"),
+    ("codebuff", "codebuff"),
+    ("freebuff", "codebuff"),
+    ("qoder", "qoder"),
+    ("qodercli", "qoder"),
+    ("codebuddy", "codebuddy"),
+    ("junie", "junie"),
+    ("llxprt", "llxprt"),
+    ("kode", "kode"),
+    ("openhands", "openhands"),
+    ("vibe-rs", "vibe"),
+    // Mistral Vibe's Python launcher renames its process.
+    ("Vibe CLI", "vibe"),
 ];
+
+/// Names other programs use too: they count only as the script of the runtime an agent's
+/// package runs on (Letta's server is a Python `letta`, Letta Code a Node one).
+const SCRIPT_ONLY: &[(&str, &str, &str)] =
+    &[("cn", "node", "continue"), ("letta", "node", "letta"), ("vibe", "python", "vibe")];
+
+/// Agents that run as a subcommand of a broader program: the program, the words that must
+/// follow it, and the agent.
+const SUBCOMMANDS: &[(&str, &[&str], &str)] = &[("acli", &["rovodev", "run"], "rovodev"), ("q", &["chat"], "kiro")];
 
 const INTERPRETERS: &[&str] = &["node", "bun", "deno", "python", "python3", "uv", "npx", "sh", "bash", "zsh", "dash"];
 
@@ -86,18 +114,80 @@ const INTERPRETERS: &[&str] = &["node", "bun", "deno", "python", "python3", "uv"
 pub fn detect_agent(argv: &[String]) -> Option<&'static str> {
     let base = |s: &str| s.rsplit('/').next().unwrap_or(s).to_string();
     let first = base(argv.first()?);
-    let candidates: Vec<String> = if INTERPRETERS.iter().any(|i| first.starts_with(i)) {
+    // Cursor's launcher runs its bundled Node on the agent's script, under the name it was
+    // called by (`agent`, too common a word to go by).
+    if argv.iter().take(4).any(|a| a.contains("/cursor-agent/versions/") && a.ends_with("/index.js")) {
+        return Some("cursor");
+    }
+    if let Some((_, words, name)) = SUBCOMMANDS.iter().find(|(program, ..)| *program == first) {
+        let rest: Vec<&str> = argv.iter().skip(1).filter(|a| !a.starts_with('-')).map(String::as_str).collect();
+        return rest.starts_with(words).then_some(*name);
+    }
+    let interpreted = INTERPRETERS.iter().any(|i| first.starts_with(i));
+    let candidates: Vec<String> = if interpreted {
         argv.iter().skip(1).filter(|a| !a.starts_with('-')).take(2).map(|a| base(a)).collect()
     } else {
-        vec![first]
+        vec![first.clone()]
     };
+    let script_name =
+        |c: &str| [".js", ".mjs", ".cjs"].iter().find_map(|ext| c.strip_suffix(ext)).unwrap_or(c).to_string();
+    if interpreted
+        && let Some(script) = candidates.first().map(|c| script_name(c))
+        && let Some((.., name)) = SCRIPT_ONLY.iter().find(|(s, runtime, _)| *s == script && first.starts_with(runtime))
+    {
+        return Some(name);
+    }
     for c in candidates {
-        let c = c.trim_end_matches(".js").trim_end_matches(".mjs");
+        let c = script_name(&c);
         if let Some((_, name)) = KNOWN_AGENTS.iter().find(|(exe, _)| *exe == c) {
             return Some(name);
         }
     }
     None
+}
+
+/// What an agent shows at the bottom of its screen while it works, and while it waits for
+/// the user, beyond what many agents share (`esc to interrupt`, the questions in
+/// [`classify_screen`]). From each agent's source, or its documentation when it is closed.
+fn screen_patterns(agent: &str) -> (&'static [&'static str], &'static [&'static str]) {
+    const GEMINI_ASKS: &[&str] =
+        &["apply this change?", "allow execution of", "waiting for user confirmation", "no, suggest changes (esc)"];
+    match agent {
+        "claude" | "codex" => (&["esc to cancel"], &[]),
+        "gemini" | "llxprt" => (&["esc to cancel"], GEMINI_ASKS),
+        "qwen" => (
+            &["esc to cancel"],
+            &["apply this change?", "allow execution of", "yes, allow once", "no, suggest changes (esc)"],
+        ),
+        "opencode" | "kilo" => (
+            &["esc interrupt", "esc again to interrupt", "esc to cancel"],
+            &["permission required", "allow once", "allow always", "always allow", "type your own answer"],
+        ),
+        "crush" => (&[], &["permission required", "allow for session"]),
+        "goose" => (&["ctrl+c to interrupt"], &["would like to call the above tool", "do you allow this tool call?"]),
+        "pi" => (&["to interrupt)"], &[]),
+        "cline" => {
+            (&["esc to cancel"], &["cline needs permission", "approve tool call?", "cline is asking a question"])
+        }
+        "continue" => (&[], &["would you like to continue?"]),
+        "openhands" => (&["esc: pause"], &["action(s)?"]),
+        "kode" => (&[], &["allow this tool use?", "allow this command?", "allow this edit to"]),
+        "vibe" => (
+            &["esc/ctrl+c to interrupt"],
+            &["permission for the", "allow for remainder of this session", "waiting for approval"],
+        ),
+        "letta" => (&[], &["run this command?", "don't ask again for this project"]),
+        "kimi" => (&["working…"], &["approve once", "reject with feedback"]),
+        "aider" => (&[], &["(y)es/(n)o"]),
+        "copilot" => (
+            &["esc to cancel"],
+            &["for the rest of the running session", "no, and tell copilot what to do differently"],
+        ),
+        "cursor" => (&[], &["skip & tell the agent what to do instead"]),
+        "grok" => (&["send a message to interrupt"], &["no, reject (type to add feedback)", "reject once"]),
+        "kiro" => (&[], &["allow this action?"]),
+        _ => (&[], &[]),
+    }
 }
 
 /// Infer the state of an agent from the text currently on its screen.
@@ -107,6 +197,7 @@ pub fn classify_screen(agent: &str, screen: &str) -> Option<AgentState> {
     let tail: Vec<&str> = screen.lines().filter(|l| !l.trim().is_empty()).collect();
     let tail = tail[tail.len().saturating_sub(12)..].join("\n");
     let lower = tail.to_lowercase();
+    let (working, asks) = screen_patterns(agent);
     let blocked_common = [
         "do you want to proceed",
         "do you want to make this edit",
@@ -121,16 +212,10 @@ pub fn classify_screen(agent: &str, screen: &str) -> Option<AgentState> {
         "(y/n)",
         "[y/n]",
     ];
-    if blocked_common.iter().any(|p| lower.contains(p)) {
+    if blocked_common.iter().chain(asks).any(|p| lower.contains(p)) {
         return Some(AgentState::Blocked);
     }
-    let working = match agent {
-        "claude" | "codex" | "opencode" | "gemini" | "qwen" => {
-            lower.contains("esc to interrupt") || lower.contains("esc to cancel")
-        }
-        _ => lower.contains("esc to interrupt"),
-    };
-    if working {
+    if ["esc to interrupt"].iter().chain(working).any(|p| lower.contains(p)) {
         return Some(AgentState::Working);
     }
     None
@@ -186,9 +271,10 @@ impl AgentTracker {
                 self.set(AgentState::Idle);
                 true
             }
-            (Some(_), None) => {
-                // Hooked agents can run under a wrapper we don't recognise; keep them.
-                if self.hooked {
+            (Some(kind), None) => {
+                // Hooked agents can run under a wrapper we don't recognise; keep them, as long
+                // as their hooks say when the session ends (OpenCode's plugins cannot).
+                if self.hooked && !matches!(kind, "opencode" | "kilo") {
                     return false;
                 }
                 self.kind = None;
@@ -226,30 +312,66 @@ impl AgentTracker {
 }
 
 /// Whether an agent's hooks report every state change (working, blocked, done), so the screen
-/// heuristics can be switched off for it.
+/// heuristics can be switched off for it. Codex's notify, Cursor's and Augment's hooks have no
+/// event for a question to the user: the screen still tells that.
 pub fn hooks_cover_lifecycle(agent: &str) -> bool {
-    agent == "claude"
+    matches!(
+        agent,
+        "claude" | "gemini" | "qwen" | "droid" | "codebuddy" | "copilot" | "kimi" | "opencode" | "kilo" | "pi"
+    )
 }
 
-/// Map a Claude Code hook payload to a state change.
-pub fn claude_hook_state(payload: &serde_json::Value) -> Option<AgentState> {
-    let event = payload.get("hook_event_name")?.as_str()?;
-    Some(match event {
-        "SessionStart" => AgentState::Idle,
-        "UserPromptSubmit" | "PreToolUse" | "PostToolUse" | "PreCompact" | "SubagentStart" => AgentState::Working,
-        "Stop" => AgentState::Done,
-        "SessionEnd" => AgentState::Unknown,
-        "Notification" => {
-            let kind = payload.get("notification_type").and_then(|v| v.as_str()).unwrap_or("");
-            let msg = payload.get("message").and_then(|v| v.as_str()).unwrap_or("").to_lowercase();
-            let asks = matches!(kind, "permission_prompt" | "elicitation_dialog")
-                || ["permission", "approve", "question"].iter().any(|w| msg.contains(w));
-            if asks {
-                AgentState::Blocked
-            } else {
-                return None;
+/// Map an agent's hook payload to a state change. `event` is the hook's event, for agents that
+/// do not name it in the payload (Copilot's own format).
+pub fn hook_state(agent: &str, payload: &serde_json::Value, event: Option<&str>) -> Option<AgentState> {
+    use AgentState::*;
+    let field = |k: &str| payload.get(k).and_then(|v| v.as_str()).unwrap_or("");
+    let event = event.unwrap_or_else(|| field("hook_event_name"));
+    Some(match (agent, event) {
+        // Claude Code's events, and those of the agents that copied them.
+        ("claude" | "droid" | "codebuddy" | "qwen", _) => match event {
+            "SessionStart" => Idle,
+            "UserPromptSubmit" | "PreToolUse" | "PostToolUse" | "PreCompact" | "SubagentStart" => Working,
+            "Stop" | "StopFailure" => Done,
+            "SessionEnd" => Unknown,
+            "Notification" => {
+                let msg = field("message").to_lowercase();
+                let asks = matches!(field("notification_type"), "permission_prompt" | "elicitation_dialog")
+                    || ["permission", "approve", "question"].iter().any(|w| msg.contains(w));
+                return asks.then_some(Blocked);
             }
+            _ => return None,
+        },
+        ("gemini", "SessionStart") => Idle,
+        ("gemini", "BeforeAgent" | "BeforeTool" | "AfterTool" | "PreCompress") => Working,
+        ("gemini", "Notification") if field("notification_type") == "ToolPermission" => Blocked,
+        ("gemini", "AfterAgent") => Done,
+        ("gemini", "SessionEnd") => Unknown,
+        ("kimi", "SessionStart") => Idle,
+        ("kimi", "UserPromptSubmit" | "PermissionResult") => Working,
+        ("kimi", "PermissionRequest") => Blocked,
+        ("kimi", "Stop" | "StopFailure") => Done,
+        // Esc: the user is looking at it.
+        ("kimi", "Interrupt") => Idle,
+        ("kimi", "SessionEnd") => Unknown,
+        ("copilot", "sessionStart") => Idle,
+        ("copilot", "userPromptSubmitted" | "postToolUse") => Working,
+        ("copilot", "notification")
+            if matches!(field("notification_type"), "permission_prompt" | "elicitation_dialog") =>
+        {
+            Blocked
         }
+        ("copilot", "agentStop") => Done,
+        ("copilot", "sessionEnd") => Unknown,
+        ("cursor", "sessionStart") => Idle,
+        ("cursor", "beforeSubmitPrompt" | "postToolUse") => Working,
+        ("cursor", "stop") => Done,
+        ("cursor", "sessionEnd") => Unknown,
+        ("auggie", "SessionStart") => Idle,
+        ("auggie", "PreToolUse" | "PostToolUse") => Working,
+        ("auggie", "Stop") if field("agent_stop_cause") == "interrupted" => Idle,
+        ("auggie", "Stop") => Done,
+        ("auggie", "SessionEnd") => Unknown,
         _ => return None,
     })
 }
@@ -271,6 +393,69 @@ mod tests {
         assert_eq!(detect_agent(&argv("ssh claude@host")), None);
     }
 
+    /// Command lines as each agent's package or installer starts it.
+    #[test]
+    fn detects_agents_as_they_are_installed() {
+        let cases = [
+            // npm launchers: a Node script named after the agent.
+            ("node /usr/bin/gemini --yolo", Some("gemini")),
+            ("node /home/u/.npm-global/bin/qwen", Some("qwen")),
+            ("node /usr/local/bin/copilot --resume", Some("copilot")),
+            ("node /usr/bin/auggie", Some("auggie")),
+            ("node /usr/bin/kilocode", Some("kilo")),
+            ("node /usr/bin/cline", Some("cline")),
+            ("node /usr/bin/codebuff", Some("codebuff")),
+            ("node /usr/bin/llxprt", Some("llxprt")),
+            ("node /usr/bin/kode", Some("kode")),
+            ("node /usr/lib/node_modules/@opencode/cli/bin/opencode.cjs", Some("opencode")),
+            ("node /usr/bin/opencode2", Some("opencode")),
+            // Native binaries.
+            ("/home/u/.local/bin/droid", Some("droid")),
+            ("/home/u/.local/bin/kiro-cli", Some("kiro")),
+            ("/home/u/.kimi-code/bin/kimi", Some("kimi")),
+            ("/home/u/.local/bin/qodercli", Some("qoder")),
+            ("/usr/local/bin/codebuddy", Some("codebuddy")),
+            ("/home/u/.local/bin/junie", Some("junie")),
+            ("/home/u/.local/bin/openhands", Some("openhands")),
+            ("/usr/lib/python3.12/site-packages/vibe/_bin/vibe-rs", Some("vibe")),
+            // Python entry points.
+            ("/home/u/.local/share/uv/tools/aider-chat/bin/python3 /home/u/.local/bin/aider --model x", Some("aider")),
+            ("/home/u/.venv/bin/python /home/u/.venv/bin/vibe", Some("vibe")),
+            // Cursor's launcher, as `agent` (exec -a) and with its bundled Node.
+            (
+                "/home/u/.local/bin/agent --use-system-ca /home/u/.local/share/cursor-agent/versions/2026.10.01-e373342/index.js",
+                Some("cursor"),
+            ),
+            (
+                "/home/u/.local/share/cursor-agent/versions/2025.09.12-1/node /home/u/.local/share/cursor-agent/versions/2025.09.12-1/index.js",
+                Some("cursor"),
+            ),
+            // Agents behind a broader program's subcommand.
+            ("acli rovodev run", Some("rovodev")),
+            ("acli jira workitem view X-1", None),
+            ("q chat --resume", Some("kiro")),
+            ("q", None),
+            // Names other programs share count only on the agent's runtime.
+            ("node /usr/bin/cn", Some("continue")),
+            ("node /usr/bin/letta", Some("letta")),
+            ("/usr/bin/python3 /usr/local/bin/letta server", None),
+            ("cn", None),
+            ("vibe", None),
+            ("sh ./cn", None),
+            // Neither an editor nor a shell, nor `agent` alone.
+            ("nvim src/agent.rs", None),
+            ("bash", None),
+            ("agent", None),
+            ("node /srv/app/index.js", None),
+            ("cb", None),
+        ];
+        for (line, want) in cases {
+            assert_eq!(detect_agent(&argv(line)), want, "{line}");
+        }
+        // The process title Mistral Vibe gives itself: one word with a space in it.
+        assert_eq!(detect_agent(&["Vibe CLI".to_string()]), Some("vibe"));
+    }
+
     #[test]
     fn screen_classification() {
         assert_eq!(classify_screen("claude", "✻ Thinking… (esc to interrupt)"), Some(AgentState::Working));
@@ -282,6 +467,69 @@ mod tests {
         );
         let old = format!("esc to interrupt\n{}> ", "output\n".repeat(20));
         assert_eq!(classify_screen("claude", &old), None);
+    }
+
+    /// Screens built from the text each agent's source (or documentation) draws.
+    #[test]
+    fn screen_classification_per_agent() {
+        use AgentState::{Blocked, Working};
+        let cases: &[(&str, &str, Option<AgentState>)] = &[
+            ("gemini", "⠏ Reading files (esc to cancel, 12s)", Some(Working)),
+            (
+                "gemini",
+                "Allow execution of [Shell]?\n● 1. Allow once\n  2. Allow for this session\n  4. No, suggest changes (esc)",
+                Some(Blocked),
+            ),
+            ("gemini", "Apply this change?\n● 1. Allow once", Some(Blocked)),
+            ("llxprt", "Allow execution of: 'ls'?", Some(Blocked)),
+            ("qwen", "⠋ Thinking (3s · ↓ 120 tokens · esc to cancel)", Some(Working)),
+            ("qwen", "Allow execution of: 'npm test'?\n● 1. Yes, allow once", Some(Blocked)),
+            ("opencode", "┃ Build  claude-sonnet\n esc interrupt", Some(Working)),
+            ("opencode", "esc again to interrupt", Some(Working)),
+            (
+                "opencode",
+                "△ Permission required\n→ Allow once   Allow always   Reject\n⇆ select  enter confirm",
+                Some(Blocked),
+            ),
+            ("kilo", "△ Permission required\nAllow   Reject", Some(Blocked)),
+            ("crush", "Permission Required\n Allow   Allow for Session   Deny", Some(Blocked)),
+            ("goose", "◇ Goose would like to call the above tool, do you allow?\n│ ● Allow", Some(Blocked)),
+            ("goose", "Thinking...  (Ctrl+C to interrupt)", Some(Working)),
+            ("pi", "⠋ Working (escape to interrupt)", Some(Working)),
+            ("cline", "Thinking... (esc to cancel)", Some(Working)),
+            ("cline", "Cline needs permission\nApprove tool call?\n[y] Approve  [n] Deny", Some(Blocked)),
+            ("continue", "Would you like to continue?\n> Continue (tab)", Some(Blocked)),
+            ("continue", "⠋ (4s • esc to interrupt)", Some(Working)),
+            ("openhands", "⠋ Working (12s • ESC: pause)", Some(Working)),
+            ("openhands", "🔍 Confirm 2 action(s)?\n> Yes\n  No", Some(Blocked)),
+            ("kode", "Allow this command?\nEnter to confirm · Esc to reject", Some(Blocked)),
+            ("vibe", "Generating… (0s Esc/Ctrl+C to interrupt)", Some(Working)),
+            ("vibe", "Permission for the bash tool\n1. Allow once", Some(Blocked)),
+            ("letta", "Run this command?\n> Yes\n  Yes, and don't ask again for this project", Some(Blocked)),
+            ("kimi", "⠋ Working…", Some(Working)),
+            ("kimi", "▶ Run this command?\n> Approve once\n  Approve for this session\n  Reject", Some(Blocked)),
+            ("aider", "Run shell command? (Y)es/(N)o/(D)on't ask again [Yes]:", Some(Blocked)),
+            ("copilot", "Esc to cancel", Some(Working)),
+            (
+                "copilot",
+                "1. Yes\n2. Yes, and approve shell for the rest of the running session\n3. No, and tell Copilot what to do differently (Esc)",
+                Some(Blocked),
+            ),
+            ("cursor", "  Skip & tell the agent what to do instead", Some(Blocked)),
+            ("grok", "Thinking… · send a message to interrupt", Some(Working)),
+            (
+                "kiro",
+                "Allow this action? Use 't' to trust (always allow) this tool for the session. [y/n/t]:",
+                Some(Blocked),
+            ),
+            // An agent's own words do not count for another, and a quiet prompt says nothing.
+            ("claude", "esc interrupt", None),
+            ("aider", "> ", None),
+            ("opencode", "┃ Ask anything", None),
+        ];
+        for (agent, screen, want) in cases {
+            assert_eq!(classify_screen(agent, screen), *want, "{agent}: {screen}");
+        }
     }
 
     #[test]
@@ -310,16 +558,84 @@ mod tests {
     #[test]
     fn claude_hooks_map() {
         let v = |s: &str| serde_json::from_str::<serde_json::Value>(s).unwrap();
-        assert_eq!(claude_hook_state(&v(r#"{"hook_event_name":"Stop"}"#)), Some(AgentState::Done));
+        let claude = |s: &str| hook_state("claude", &v(s), None);
+        assert_eq!(claude(r#"{"hook_event_name":"Stop"}"#), Some(AgentState::Done));
         assert_eq!(
-            claude_hook_state(&v(
-                r#"{"hook_event_name":"Notification","message":"Claude needs your permission to use Bash"}"#
-            )),
+            claude(r#"{"hook_event_name":"Notification","message":"Claude needs your permission to use Bash"}"#),
+            Some(AgentState::Blocked)
+        );
+        assert_eq!(claude(r#"{"hook_event_name":"Notification","message":"Claude is waiting for your input"}"#), None);
+    }
+
+    /// Payloads as each agent's hook reference describes them.
+    #[test]
+    fn other_agents_hooks_map() {
+        let v = |s: &str| serde_json::from_str::<serde_json::Value>(s).unwrap();
+        let state = |agent: &str, s: &str| hook_state(agent, &v(s), None);
+        // Gemini CLI: a tool waiting for approval is a notification of its own type.
+        assert_eq!(
+            state("gemini", r#"{"hook_event_name":"BeforeAgent","prompt":"fix it"}"#),
+            Some(AgentState::Working)
+        );
+        let permission = r#"{"hook_event_name":"Notification","notification_type":"ToolPermission","message":"Tool Shell requires execution","details":{"type":"exec"}}"#;
+        assert_eq!(state("gemini", permission), Some(AgentState::Blocked));
+        assert_eq!(
+            state("gemini", r#"{"hook_event_name":"AfterAgent","stop_hook_active":false}"#),
+            Some(AgentState::Done)
+        );
+        assert_eq!(state("gemini", r#"{"hook_event_name":"SessionEnd","reason":"exit"}"#), Some(AgentState::Unknown));
+        assert_eq!(state("gemini", r#"{"hook_event_name":"Stop"}"#), None);
+        // Qwen Code: Claude's names, its own messages; idle notifications say nothing new.
+        let qwen = r#"{"hook_event_name":"Notification","notification_type":"permission_prompt","title":"Permission needed","message":"Qwen Code needs your permission to use run_shell_command"}"#;
+        assert_eq!(state("qwen", qwen), Some(AgentState::Blocked));
+        let idle = r#"{"hook_event_name":"Notification","notification_type":"idle_prompt","title":"Waiting for input","message":"Qwen Code is waiting for your input"}"#;
+        assert_eq!(state("qwen", idle), None);
+        assert_eq!(state("qwen", r#"{"hook_event_name":"StopFailure"}"#), Some(AgentState::Done));
+        // Factory's droid: cancelling a turn is an idle notification, not a stop.
+        let droid = r#"{"hook_event_name":"Notification","notification_type":"permission_prompt","message":"Droid is waiting for permission"}"#;
+        assert_eq!(state("droid", droid), Some(AgentState::Blocked));
+        assert_eq!(
+            state(
+                "droid",
+                r#"{"hook_event_name":"Notification","notification_type":"idle_prompt","message":"Droid is waiting for input"}"#
+            ),
+            None
+        );
+        // Kimi Code: approval requests, their answers and Esc have events of their own.
+        assert_eq!(
+            state("kimi", r#"{"hook_event_name":"PermissionRequest","tool_name":"Shell"}"#),
             Some(AgentState::Blocked)
         );
         assert_eq!(
-            claude_hook_state(&v(r#"{"hook_event_name":"Notification","message":"Claude is waiting for your input"}"#)),
-            None
+            state("kimi", r#"{"hook_event_name":"PermissionResult","decision":"approved"}"#),
+            Some(AgentState::Working)
         );
+        assert_eq!(state("kimi", r#"{"hook_event_name":"Interrupt","reason":"cancelled"}"#), Some(AgentState::Idle));
+        // Copilot names the event in its configuration only: kraal passes it along.
+        let copilot = |event: &str, s: &str| hook_state("copilot", &v(s), Some(event));
+        assert_eq!(copilot("userPromptSubmitted", r#"{"sessionId":"s","prompt":"fix it"}"#), Some(AgentState::Working));
+        let asks = r#"{"sessionId":"s","hook_event_name":"Notification","notification_type":"permission_prompt","message":"x"}"#;
+        assert_eq!(copilot("notification", asks), Some(AgentState::Blocked));
+        let finished = r#"{"sessionId":"s","hook_event_name":"Notification","notification_type":"shell_completed"}"#;
+        assert_eq!(copilot("notification", finished), None);
+        assert_eq!(copilot("agentStop", r#"{"sessionId":"s","stopReason":"end_turn"}"#), Some(AgentState::Done));
+        // Cursor and Augment: turns, no questions.
+        assert_eq!(
+            state("cursor", r#"{"hook_event_name":"stop","status":"completed","loop_count":0}"#),
+            Some(AgentState::Done)
+        );
+        assert_eq!(
+            state("cursor", r#"{"hook_event_name":"beforeSubmitPrompt","prompt":"x"}"#),
+            Some(AgentState::Working)
+        );
+        assert_eq!(
+            state("auggie", r#"{"hook_event_name":"Stop","agent_stop_cause":"end_turn"}"#),
+            Some(AgentState::Done)
+        );
+        assert_eq!(
+            state("auggie", r#"{"hook_event_name":"Stop","agent_stop_cause":"interrupted"}"#),
+            Some(AgentState::Idle)
+        );
+        assert!(!hooks_cover_lifecycle("cursor") && !hooks_cover_lifecycle("codex") && hooks_cover_lifecycle("gemini"));
     }
 }

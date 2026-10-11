@@ -4,17 +4,53 @@ kraal knows which panes run an agent and what each one is doing, gives each agen
 
 ## States
 
-kraal recognises agents by their process (`claude`, `codex`, `opencode`, `gemini`, `aider`,
-`cursor-agent`, `amp`, `goose`, …) and infers their state from the screen. For exact states,
-install the hooks:
+kraal recognises 30 coding agents by their process, run directly or through Node or Python as
+npm and pip install them: Claude Code (`claude`), Codex (`codex`), OpenCode (`opencode`), Gemini
+CLI (`gemini`), Qwen Code (`qwen`), GitHub Copilot CLI (`copilot`), Cursor CLI (`cursor-agent`
+or `agent`), Factory's droid (`droid`), Augment (`auggie`), Kiro CLI (`kiro-cli`, `q chat`),
+Kimi Code (`kimi`), Kilo (`kilo`), Cline (`cline`), Continue (`cn`), Amp (`amp`), Aider
+(`aider`), Goose (`goose`), Crush (`crush`), pi (`pi`), Grok (`grok`), Codebuff (`codebuff`),
+Qoder (`qoder`), CodeBuddy (`codebuddy`), Junie (`junie`), LLxprt Code (`llxprt`), Kode
+(`kode`), OpenHands (`openhands`), Mistral Vibe (`vibe`), Letta Code (`letta`) and Rovo Dev
+(`acli rovodev run`). It infers their state from the screen: the interrupt hint an agent shows
+while it works, the permission prompt or question it shows while it waits for you.
+
+For exact states, install kraal's hooks in the agent:
 
 ```sh
 kraal integration install claude   # adds hooks to ~/.claude/settings.json (backup kept)
-kraal integration install codex    # sets `notify` in ~/.codex/config.toml
+kraal integration install gemini
+kraal integration install all      # Claude Code, Codex, and every agent below used here
 kraal integration status
 ```
 
-The hooks do nothing outside kraal. States are shown as coloured dots, with the state written
+| Agent | `install …` | What kraal changes |
+|---|---|---|
+| Claude Code | `claude` | hooks and status line in `~/.claude/settings.json` |
+| Gemini CLI | `gemini` | hooks in `~/.gemini/settings.json` |
+| Qwen Code | `qwen` | hooks in `~/.qwen/settings.json` |
+| GitHub Copilot CLI | `copilot` | a file of its own, `~/.copilot/hooks/kraal.json` |
+| OpenCode 1 | `opencode` | a plugin of its own, `~/.config/opencode/plugins/kraal.js` |
+| Kilo | `kilo` | a plugin of its own, `~/.config/kilo/plugin/kraal.js` |
+| droid | `droid` | `~/.factory/hooks.json` (the hooks of `settings.json` when they are kept there) |
+| CodeBuddy | `codebuddy` | hooks in `~/.codebuddy/settings.json` |
+| Kimi Code | `kimi` | `[[hooks]]` tables in `~/.kimi-code/config.toml` |
+| pi | `pi` | an extension of its own, `~/.pi/agent/extensions/kraal.ts` |
+| Codex | `codex` | `notify` in `~/.codex/config.toml`: the end of each turn |
+| Cursor CLI | `cursor` | `~/.cursor/hooks.json`: the start and end of each turn |
+| Augment | `auggie` | hooks in `~/.augment/settings.json`: tool calls and the end of each turn |
+
+The hooks of the last three say nothing when the agent asks you something: that still comes from
+the screen. The other agents have no hook that tells their state; theirs always comes from the
+screen. A file kraal edits is copied next to it first (`.kraal-bak`), only kraal's entries are
+added, and `kraal integration uninstall <agent>` takes out those alone; a file of kraal's own is
+removed whole. Agents read their hooks when a session starts, and Gemini CLI runs them only in
+folders you trust. `all` covers Claude Code and Codex, and each other agent whose directory
+exists (`~/.gemini`, `~/.copilot`, …).
+
+The hooks do nothing outside kraal. Some agents run another agent's hooks (Cursor and Continue
+run Claude Code's): kraal ignores a hook for an agent other than the one running in its pane.
+States are shown as coloured dots, with the state written
 next to them in the sidebar and in pane frames: yellow working, red blocked (waiting for you), green
 done (not seen yet), `○` idle. A blocked or finished agent you are not
 looking at triggers a desktop notification through your terminal (OSC 777/9) or `notify-send`.

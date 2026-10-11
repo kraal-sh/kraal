@@ -318,7 +318,8 @@ pub enum Cmd {
     Integration {
         #[arg(value_parser = ["install", "uninstall", "status", "show"])]
         action: String,
-        /// claude, codex, zsh, bash, fish, or all (the agents; status also checks the shells).
+        /// claude, codex, gemini, qwen, droid, codebuddy, auggie, cursor, copilot, kimi, opencode,
+        /// kilo, pi, zsh, bash, fish, or all (the agents used here; status also checks the shells).
         #[arg(default_value = "all")]
         agent: String,
     },
