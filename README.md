@@ -10,7 +10,7 @@ kraal is a multiplexer in the tradition of tmux and Zellij that runs inside your
   panes, tabs, splits, commands, directories (templates, swap layouts and plugin panes are
   skipped with a warning).
 - **Agent awareness** (from herdr): kraal knows which panes run Claude Code, Codex and other
-  agents, and whether each one is working, waiting for you, or done — in the sidebar, the tab bar
+  agents, and whether each one is working, waiting for you, or done, in the sidebar, the tab bar
   and as desktop notifications. One key jumps to the next agent that needs you.
 - **Your servers at hand**: an inventory of every machine you SSH to (filled from your
   workspaces, `~/.ssh/config`, and every `ssh` you type), grouped, with a picker that opens one
@@ -180,7 +180,7 @@ groups = ["prod"]
 ```
 
 It also knows the `ssh` panes of your workspace files (grouped by workspace) and the hosts of
-`~/.ssh/config`. When you `ssh` somewhere new — from the picker or typed in any pane — kraal saves
+`~/.ssh/config`. When you `ssh` somewhere new, from the picker or typed in any pane, kraal saves
 it in the group `discovered`.
 
 ```sh
@@ -218,7 +218,7 @@ Each panel shows this machine or any server (`o` to choose). `space` marks, `c` 
 other panel (it asks first when that would replace files there, and what you did not agree to
 replace is never replaced, even if it appears during the copy: that copy then waits in a hidden
 `.kraal-stage-…` directory in the destination, and kraal never removes one it cannot tell is over
-— a move's, the only copy of what it moved, is named instead; a directory is put in place by a
+(a move's, the only copy of what it moved, is named instead); a directory is put in place by a
 rename that keeps it whole (owner, permissions, ACLs), which on a server takes GNU coreutils 8.30
 or later: elsewhere such a copy says so before it starts), `m` moves, `d` deletes, `enter`
 opens a directory or previews a local file, `s` opens a shell there, `/` filters. Selected files
@@ -486,8 +486,8 @@ Enter runs it as shown. The same goes for Enter on an ended agent and for an acc
 
 ## Agent accounts
 
-Each account is a separate config directory for an agent — `CLAUDE_CONFIG_DIR` for Claude Code,
-`CODEX_HOME` for Codex — logged in with the agent's own login. kraal never reads or stores
+Each account is a separate config directory for an agent (`CLAUDE_CONFIG_DIR` for Claude Code,
+`CODEX_HOME` for Codex), logged in with the agent's own login. kraal never reads or stores
 credentials; it chooses which directory a pane starts with and reads the usage the agents report.
 
 ```sh

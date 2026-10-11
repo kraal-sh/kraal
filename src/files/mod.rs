@@ -72,7 +72,7 @@ impl Location {
         }
     }
 
-    /// "edge-proxy:/var/log" or "/home/me" — the syntax of `kraal cp`.
+    /// "edge-proxy:/var/log" or "/home/me": the syntax of `kraal cp`.
     pub fn display(&self) -> String {
         match self {
             Location::Local(path) => path.display().to_string(),
