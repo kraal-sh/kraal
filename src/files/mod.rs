@@ -24,6 +24,7 @@ mod listing;
 mod tests;
 mod view;
 
+pub(crate) use listing::remote_dir_arg;
 use listing::{Listing, Ssh, home_dir, list};
 use view::{Geometry, buffer_rows, footer_layout, geometry};
 
@@ -204,6 +205,9 @@ pub enum FilesAction {
     Delete(Vec<Location>),
     /// Open a local file in a preview pane (Enter / F3 on a local file).
     Preview(PathBuf),
+    /// Open the file under the cursor in the local editor (key `e`, F4); a server's file is
+    /// saved back to it.
+    Edit(Location),
     /// Open an SSH or local shell pane in this directory (key `s`).
     Shell(Location),
     /// Let the user pick a server for a panel (key `o` or `:`); the server answers with `set_location`.
@@ -668,6 +672,7 @@ impl FilesPane {
                     Err(why) => FilesAction::Refused(why),
                 };
             }
+            FileKey::Char('e') | FileKey::F(4) => return self.edit(side),
             FileKey::Char('s') => return FilesAction::Shell(self.panel(side).location.clone()),
             FileKey::Char('o' | ':') => return FilesAction::PickLocation(side),
             FileKey::Char('r') => self.refresh(),
@@ -820,6 +825,19 @@ impl FilesPane {
             None => {}
         }
         FilesAction::None
+    }
+
+    /// `e`: the file under the cursor, to edit.
+    fn edit(&self, side: Side) -> FilesAction {
+        let panel = self.panel(side);
+        match panel.current() {
+            None => FilesAction::None,
+            Some(entry) if !entry.exact => FilesAction::Refused(INEXACT.into()),
+            Some(entry) if entry.is_dir => {
+                FilesAction::Refused(format!("{} is a directory: e edits a file", entry.name))
+            }
+            Some(entry) => FilesAction::Edit(panel.location.join(&entry.name)),
+        }
     }
 
     /// Goes to the parent directory, with the cursor on the directory left.

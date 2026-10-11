@@ -209,6 +209,18 @@ pub enum Cmd {
     },
     /// Open a two-panel file manager: `kraal files ~/Dev db:/var/log`.
     Files { left: Option<String>, right: Option<String> },
+    /// Edit a server's file in your $EDITOR, in a floating pane of kraal; each save goes back to
+    /// the server: `kraal edit db:/etc/app.conf`.
+    Edit {
+        /// SERVER:PATH (a path relative to the home directory there, or absolute).
+        target: String,
+        /// Open the editor at this line.
+        #[arg(long)]
+        line: Option<u32>,
+        /// The server is production and you mean to edit there.
+        #[arg(long)]
+        production: bool,
+    },
     /// Your servers: list, add, remove, import from workspaces, edit (~/.config/kraal/servers.toml).
     Servers {
         #[command(subcommand)]

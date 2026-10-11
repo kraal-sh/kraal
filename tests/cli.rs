@@ -3173,3 +3173,294 @@ fn install_script_installs_a_checked_release() {
     assert!(String::from_utf8_lossy(&wrong.stderr).contains("does not match its checksum"));
     assert!(!dir.join("kraal").exists(), "nothing installed");
 }
+
+/// A throwaway sshd on 127.0.0.1:2305 with its own host and user keys, and an `ssh` that uses
+/// only them (never ~/.ssh): a server reached for real. `None` where no sshd can run here.
+#[cfg(target_os = "linux")]
+struct Sshd {
+    child: std::process::Child,
+    /// Holds the port for this test, against other test runs on this machine.
+    _lock: std::fs::File,
+    /// Where that `ssh` is, to put first in PATH.
+    bin: PathBuf,
+}
+
+#[cfg(target_os = "linux")]
+impl Sshd {
+    fn start(dir: &Path) -> Option<Sshd> {
+        use std::os::fd::AsRawFd;
+        let sshd = ["/usr/sbin/sshd", "/usr/bin/sshd"].into_iter().map(PathBuf::from).find(|p| p.exists())?;
+        let ssh =
+            ["/usr/bin/ssh", "/bin/ssh", "/usr/local/bin/ssh"].into_iter().map(PathBuf::from).find(|p| p.exists())?;
+        std::fs::create_dir_all(dir).unwrap();
+        let lock = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open("/tmp/kraal-test-sshd-2305.lock")
+            .unwrap();
+        // SAFETY: flock on a descriptor we own; released when it is closed.
+        unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) };
+        for key in ["host_key", "user_key"] {
+            let made =
+                Command::new("ssh-keygen").args(["-q", "-t", "ed25519", "-N", "", "-f"]).arg(dir.join(key)).status();
+            if !made.is_ok_and(|s| s.success()) {
+                return None;
+            }
+        }
+        std::fs::copy(dir.join("user_key.pub"), dir.join("authorized_keys")).unwrap();
+        let user = String::from_utf8(Command::new("id").arg("-un").output().unwrap().stdout).unwrap();
+        let d = dir.display();
+        std::fs::write(
+            dir.join("sshd_config"),
+            format!(
+                "Port 2305\nListenAddress 127.0.0.1\nHostKey {d}/host_key\nPidFile {d}/sshd.pid\n\
+                 AuthorizedKeysFile {d}/authorized_keys\nStrictModes no\nUsePAM no\nPasswordAuthentication no\n\
+                 KbdInteractiveAuthentication no\nPubkeyAuthentication yes\nAllowUsers {}\n",
+                user.trim()
+            ),
+        )
+        .unwrap();
+        let host_key = std::fs::read_to_string(dir.join("host_key.pub")).unwrap();
+        std::fs::write(dir.join("known_hosts"), format!("[127.0.0.1]:2305 {host_key}")).unwrap();
+        std::fs::write(
+            dir.join("ssh_config"),
+            format!(
+                "Host *\n  UserKnownHostsFile {d}/known_hosts\n  GlobalKnownHostsFile /dev/null\n  \
+                 StrictHostKeyChecking yes\n  IdentityFile {d}/user_key\n  IdentitiesOnly yes\n  \
+                 IdentityAgent none\n  LogLevel ERROR\n"
+            ),
+        )
+        .unwrap();
+        let bin = dir.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        write_script(&bin.join("ssh"), &format!("#!/bin/sh\nexec '{}' -F '{d}/ssh_config' \"$@\"\n", ssh.display()));
+        let log = dir.join("sshd.log");
+        let child =
+            Command::new(&sshd).arg("-D").arg("-f").arg(dir.join("sshd_config")).arg("-E").arg(&log).spawn().ok()?;
+        let mut sshd = Sshd { child, _lock: lock, bin };
+        let start = Instant::now();
+        loop {
+            let said = std::fs::read_to_string(&log).unwrap_or_default();
+            if said.contains("Server listening") {
+                return Some(sshd);
+            }
+            if sshd.child.try_wait().ok().flatten().is_some() || start.elapsed() > Duration::from_secs(10) {
+                eprintln!("sshd did not start: {said}");
+                return None;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for Sshd {
+    fn drop(&mut self) {
+        // SAFETY: the pid of the child this test started, not reaped yet.
+        unsafe { libc::kill(self.child.id() as i32, libc::SIGTERM) };
+        let _ = self.child.wait();
+    }
+}
+
+/// A file of a server opens in the local editor, each save goes back to the server (its mode
+/// kept), a change made on the server meanwhile is never overwritten unasked, and each answer
+/// does what it says. The server is a real sshd; the editor is a script told what to do.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_server_file_is_edited_in_the_local_editor() {
+    use std::os::unix::fs::PermissionsExt;
+    let env = Env::new("redit");
+    let Some(sshd) = Sshd::start(&env.root.join("sshd")) else {
+        eprintln!("skipped: no sshd can run here");
+        return;
+    };
+    let user = String::from_utf8(Command::new("id").arg("-un").output().unwrap().stdout).unwrap();
+    let entry = |name: &str| {
+        format!("[[server]]\nname = \"{name}\"\nhost = \"127.0.0.1\"\nport = 2305\nuser = \"{}\"\n", user.trim())
+    };
+    std::fs::write(env.root.join("config/kraal/servers.toml"), format!("{}\n{}", entry("box"), entry("box-prod")))
+        .unwrap();
+    let downloads = env.root.join("downloads");
+    let cfg = env.root.join("config/kraal/config.toml");
+    let mut text = std::fs::read_to_string(&cfg).unwrap();
+    text.push_str(&format!("\n[servers]\nmultiplex = false\ndownload_dir = \"{}\"\n", downloads.display()));
+    std::fs::write(&cfg, text).unwrap();
+    // The editor says which file it edits, runs each step it is given (`$f` is the file), and
+    // ends when told.
+    let root = env.root.display().to_string();
+    let editor = env.root.join("editor");
+    write_script(
+        &editor,
+        &format!(
+            "#!/bin/sh\nfor f; do :; done\nprintf '%s' \"$f\" > '{root}/editing.tmp' && mv '{root}/editing.tmp' '{root}/editing'\n\
+             n=0\nwhile :; do\n  if [ -e '{root}/step'$n ]; then . '{root}/step'$n; n=$((n + 1)); fi\n  \
+             if [ -e '{root}/quit' ]; then rm -f '{root}/quit' '{root}/editing' '{root}/step'*; exit 0; fi\n  sleep 0.05\ndone\n"
+        ),
+    );
+    let path = format!("{}:{}", sshd.bin.display(), std::env::var("PATH").unwrap_or_default());
+    let kraal = |args: &[&str]| env.cmd(args).env("PATH", &path).env("EDITOR", &editor).output().unwrap();
+    let wait_until = |what: &str, ok: &dyn Fn() -> bool| {
+        let start = Instant::now();
+        while !ok() {
+            assert!(start.elapsed() < Duration::from_secs(15), "timed out waiting: {what}");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    };
+    let read = |p: &Path| std::fs::read_to_string(p).unwrap_or_default();
+    let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o7777;
+    let step = |n: u32, script: &str| {
+        let tmp = env.root.join("step.tmp");
+        std::fs::write(&tmp, script).unwrap();
+        std::fs::rename(&tmp, env.root.join(format!("step{n}"))).unwrap();
+    };
+    // Open `target`: the editor's copy.
+    let open = |target: &str, extra: &[&str]| -> PathBuf {
+        let mut args = vec!["edit"];
+        args.extend_from_slice(extra);
+        args.push(target);
+        let out = kraal(&args);
+        assert!(out.status.success(), "kraal edit {target}: {}", String::from_utf8_lossy(&out.stderr));
+        let editing = env.root.join("editing");
+        wait_until("the editor starts", &|| editing.exists());
+        PathBuf::from(read(&editing))
+    };
+    // End the editor: its private copy goes.
+    let quit = |local: &Path| {
+        std::fs::write(env.root.join("quit"), "").unwrap();
+        let dir = local.parent().unwrap().to_path_buf();
+        wait_until("the private copy is removed", &|| !dir.exists());
+    };
+
+    env.workspace("w", "layout {\n    pane name=\"sh\"\n}\n");
+    let out = kraal(&["open", "w"]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let mut client = RawClient::attach(&env, "w");
+    std::thread::sleep(Duration::from_millis(500));
+    let srv = env.root.join("srv").join("it's a \"dir\" $(touch pwned)");
+    std::fs::create_dir_all(&srv).unwrap();
+
+    // Each save goes to the server, through a new file renamed in place with the old one's mode.
+    let notes = srv.join("notes 'q' $HOME;.conf");
+    std::fs::write(&notes, "hello\n").unwrap();
+    std::fs::set_permissions(&notes, std::fs::Permissions::from_mode(0o640)).unwrap();
+    let local = open(&format!("box:{}", notes.display()), &[]);
+    assert!(local.starts_with(env.root.join("run")), "the copy is in the private runtime directory: {local:?}");
+    assert_eq!(read(&local), "hello\n");
+    assert_eq!(mode(&local), 0o600);
+    assert_eq!(mode(local.parent().unwrap()), 0o700);
+    step(0, "printf 'added\\n' >> \"$f\"");
+    wait_until("the first save reaches the server", &|| read(&notes) == "hello\nadded\n");
+    assert_eq!(mode(&notes), 0o640, "the mode is kept");
+    client.wait_for_screen("saved to box");
+    step(1, "printf 'more\\n' >> \"$f\"");
+    wait_until("the second save reaches the server", &|| read(&notes) == "hello\nadded\nmore\n");
+    quit(&local);
+    let names: Vec<String> =
+        std::fs::read_dir(&srv).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+    assert_eq!(names, vec!["notes 'q' $HOME;.conf".to_string()], "nothing else is left there");
+    assert!(!env.root.join("srv/pwned").exists());
+
+    // Changed on the server meanwhile: nothing is sent; kept as a local file, later saves go there.
+    let file = srv.join("conflict.txt");
+    std::fs::write(&file, "v1\n").unwrap();
+    let local = open(&format!("box:{}", file.display()), &[]);
+    std::fs::write(&file, "theirs\n").unwrap();
+    client.screen.lock().unwrap().clear();
+    step(0, "printf 'mine\\n' > \"$f\"");
+    client.wait_for_screen("Keep your version as a local file");
+    assert_eq!(read(&file), "theirs\n");
+    client.send(b"\r");
+    let kept = downloads.join("conflict.txt");
+    wait_until("the copy is kept", &|| read(&kept) == "mine\n");
+    assert_eq!(mode(&kept), 0o600);
+    step(1, "printf 'mine2\\n' > \"$f\"");
+    wait_until("the next save goes to the kept file", &|| read(&kept) == "mine2\n");
+    quit(&local);
+    assert_eq!(read(&file), "theirs\n", "the server's change stays");
+
+    // Replaced, once asked.
+    let file = srv.join("over.txt");
+    std::fs::write(&file, "v1\n").unwrap();
+    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o604)).unwrap();
+    let local = open(&format!("box:{}", file.display()), &[]);
+    std::fs::write(&file, "theirs\n").unwrap();
+    client.screen.lock().unwrap().clear();
+    step(0, "printf 'mine\\n' > \"$f\"");
+    client.wait_for_screen("Replace it with your version");
+    // Typing does not answer it.
+    client.send(b"replace");
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(read(&file), "theirs\n");
+    for key in [&b"\x1b[B"[..], b"\x1b[B", b"\r"] {
+        client.send(key);
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    wait_until("the server's version is replaced", &|| read(&file) == "mine\n");
+    assert_eq!(mode(&file), 0o604);
+    quit(&local);
+
+    // The server's version kept: the editor's copy becomes it, and nothing is sent.
+    let file = srv.join("theirs.txt");
+    std::fs::write(&file, "v1\n").unwrap();
+    let local = open(&format!("box:{}", file.display()), &[]);
+    std::fs::write(&file, "theirs\n").unwrap();
+    client.screen.lock().unwrap().clear();
+    step(0, "printf 'mine\\n' > \"$f\"");
+    client.wait_for_screen("Keep the version of box");
+    client.send(b"\x1b[B");
+    std::thread::sleep(Duration::from_millis(100));
+    client.send(b"\r");
+    wait_until("the editor's copy is the server's version", &|| read(&local) == "theirs\n");
+    quit(&local);
+    assert_eq!(read(&file), "theirs\n");
+    assert!(!downloads.join("theirs.txt").exists());
+
+    // Production asks first: from the command line, --production says yes.
+    let file = srv.join("prod.txt");
+    std::fs::write(&file, "v1\n").unwrap();
+    let target = format!("box-prod:{}", file.display());
+    let refused = kraal(&["edit", &target]);
+    assert!(!refused.status.success());
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("production"));
+    let local = open(&target, &["--production", "--line", "1"]);
+    step(0, "printf 'v2\\n' > \"$f\"");
+    wait_until("a production file is saved once allowed", &|| read(&file) == "v2\n");
+    quit(&local);
+
+    // From the file manager: `e` on a server's file, asked first on a production server.
+    let dir = env.root.join("fm");
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("fm.txt");
+    std::fs::write(&file, "v1\n").unwrap();
+    client.screen.lock().unwrap().clear();
+    let out = kraal(&["files", &env.root.display().to_string(), &format!("box-prod:{}", dir.display())]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    client.wait_for_screen("fm.txt");
+    for key in [&b"\t"[..], b"\x1b[B", b"e"] {
+        client.send(key);
+        std::thread::sleep(Duration::from_millis(150));
+    }
+    client.wait_for_screen("Careful");
+    assert!(!env.root.join("editing").exists(), "nothing opens before the answer");
+    client.send(b"y");
+    let editing = env.root.join("editing");
+    wait_until("the editor starts", &|| editing.exists());
+    let local = PathBuf::from(read(&editing));
+    step(0, "printf 'v2\\n' > \"$f\"");
+    wait_until("a save from the file manager's editor", &|| read(&file) == "v2\n");
+    quit(&local);
+
+    // What cannot be edited is said.
+    for (target, why) in [
+        (format!("box:{}", srv.display()), "directory"),
+        (format!("box:{}", env.root.join("nope").display()), "no such file"),
+        (env.root.join("editor").display().to_string(), "not on a server"),
+    ] {
+        let out = kraal(&["edit", &target]);
+        assert!(!out.status.success());
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(err.contains(why), "{target}: {err}");
+    }
+    drop(sshd);
+}

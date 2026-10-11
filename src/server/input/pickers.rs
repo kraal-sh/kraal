@@ -179,6 +179,8 @@ impl Server {
                         );
                     }
                 }
+                // A question that may come while the user types elsewhere: typing does not answer it.
+                _ if p.kind == PickerKind::EditConflict => {}
                 _ => {
                     let before = p.query.clone();
                     if crate::server::ui::edit_line(&mut p.query, &mut p.cursor, &k) && p.query != before {
@@ -187,6 +189,7 @@ impl Server {
                     }
                 }
             },
+            InputEvent::Paste(_) if p.kind == PickerKind::EditConflict => {}
             InputEvent::Paste(data) => {
                 // A search field: what does not fit is simply not pasted.
                 let _ = crate::server::ui::paste_line(&mut p.query, &mut p.cursor, &String::from_utf8_lossy(&data));
@@ -240,6 +243,7 @@ impl Server {
             PickAction::FocusPane(pane) => self.reveal(id, pane),
             PickAction::RemoteAgent { server, pane } => self.go_to_remote(id, &server, pane),
             PickAction::FilesSet { pane, side, target } => self.files_set(pane, side, &target),
+            PickAction::EditAnswer { edit, answer } => self.answer_edit(id, edit, answer),
             PickAction::Runbook(path) => return self.pick_runbook(id, &path),
             PickAction::RunbookTarget(spec) => return self.set_draft_target(id, &spec),
             PickAction::RunbookValue(v) => return self.set_draft_value(id, v),

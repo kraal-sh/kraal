@@ -123,6 +123,8 @@ pub enum ConfirmAction {
         /// Where the tool was asked for (see `Server::tool_place`): it runs there or not at all.
         place: Option<String>,
     },
+    /// Edit a file of a production server in the local editor.
+    Edit(Box<super::edits::EditTarget>),
     /// Trust the version of a repository runbook being prepared, then go on preparing it.
     TrustRunbook,
     /// Run the runbook being prepared (its plan is the message).
@@ -161,6 +163,7 @@ impl ConfirmAction {
             ConfirmAction::RemoveWorktrees(_) => "Remove worktrees".into(),
             ConfirmAction::TrustWorktreeSetup(_) => "Trust this version".into(),
             ConfirmAction::RunTool { .. } => "Run tool".into(),
+            ConfirmAction::Edit(_) => "Edit".into(),
             ConfirmAction::TrustRunbook => "Trust this version".into(),
             ConfirmAction::RunRunbook => "Run".into(),
             ConfirmAction::RunBlock { .. } => "Send to the pane".into(),
@@ -209,6 +212,8 @@ pub enum PickerKind {
     RunbookTarget,
     RunbookParam,
     RunbookSteps,
+    /// What to do with an edited file whose server's version changed meanwhile.
+    EditConflict,
 }
 
 #[derive(Clone)]
@@ -261,6 +266,11 @@ pub enum PickAction {
     },
     /// Run a command of the keymap.
     Command(crate::keymap::Command),
+    /// The answer about an edited file whose server's version changed meanwhile.
+    EditAnswer {
+        edit: u32,
+        answer: super::edits::Answer,
+    },
     /// Point a file manager panel at `~` (local) or `server:~`.
     FilesSet {
         pane: PaneId,

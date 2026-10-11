@@ -1,10 +1,12 @@
 //! Hints mode: labels over what can be acted on in the focused pane; a label copies it, or,
-//! after Tab, acts on it where the pane is (opens a link, edits a file, shows a commit…).
+//! after Tab, acts on it where the pane is (opens a link, edits a file, shows a commit…). A
+//! file of an SSH pane's server opens in the local editor, and each save goes back there.
 
 use std::collections::HashSet;
 
 use anyhow::Result;
 
+use super::edits::EditTarget;
 use super::ui::{HintsMode, Mode};
 use super::{ClientId, Server};
 use crate::hints::{self, Kind, Match};
@@ -13,6 +15,18 @@ use crate::layout::PaneId;
 use crate::protocol::Placement;
 use crate::shell;
 use crate::tools::{Open, ToolDef, Where};
+
+/// A path seen in a pane on a server, as that server reads it: in the pane's directory there
+/// when the shell reported it (OSC 7), else in the home directory.
+fn remote_path(file: &str, cwd: Option<&std::path::Path>) -> String {
+    match cwd {
+        Some(dir) if !file.starts_with('/') && !file.starts_with('~') => {
+            let dir = dir.display().to_string();
+            format!("{}/{}", dir.trim_end_matches('/'), file.strip_prefix("./").unwrap_or(file))
+        }
+        _ => file.to_string(),
+    }
+}
 
 fn is_loopback(host: &str) -> bool {
     matches!(host, "localhost" | "127.0.0.1" | "0.0.0.0" | "::1" | "::" | "")
@@ -117,6 +131,10 @@ impl Server {
                 self.open_ssh(ws, Some(pane), &server, Placement::Auto)?;
             }
             Kind::Path => {
+                // A file of an SSH pane's server opens here, and is saved back there.
+                if let Some(server) = self.pane_server_entry(pane) {
+                    return Ok(self.edit_hinted(id, pane, server, &m.text));
+                }
                 let (file, line) = hints::split_line(&m.text);
                 let file = match file.strip_prefix("~/") {
                     Some(rest) => format!("\"$HOME\"/{}", shell::quote(rest)),
@@ -154,6 +172,24 @@ impl Server {
             },
         }
         Ok(Mode::Normal)
+    }
+
+    /// Edit `text` (`path[:line]`), a path seen in `pane` on `server`, in the local editor.
+    fn edit_hinted(&mut self, id: ClientId, pane: PaneId, server: crate::servers::Server, text: &str) -> Mode {
+        let (file, line) = hints::split_line(text);
+        let cwd = self.panes.get(&pane).and_then(|p| p.remote_cwd());
+        let mut ssh = self.ssh_options(&server);
+        ssh.push(server.destination());
+        let target = EditTarget {
+            server: server.name.clone(),
+            ssh,
+            path: remote_path(file, cwd.as_deref()),
+            line,
+            ws: self.clients.get(&id).map(|c| c.workspace),
+            near: Some(pane),
+        };
+        let production = self.pane_production(pane);
+        self.edit_request(id, target, production)
     }
 
     /// Open a URL on the client's machine. A URL to the loopback of the pane's server
@@ -212,5 +248,23 @@ impl Server {
         let ws = self.clients.get(&id).map(|c| c.workspace).unwrap_or(0);
         self.spawn_pane_in(ws, Some(pane), spec, Placement::Floating, Some(label.to_string()))?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::remote_path;
+    use std::path::Path;
+
+    #[test]
+    fn a_path_on_a_server_is_read_where_its_pane_is() {
+        let cwd = Some(Path::new("/srv/app/"));
+        assert_eq!(remote_path("src/main.rs", cwd), "/srv/app/src/main.rs");
+        assert_eq!(remote_path("./conf/x.yml", cwd), "/srv/app/conf/x.yml");
+        assert_eq!(remote_path("../shared/.env", cwd), "/srv/app/../shared/.env");
+        assert_eq!(remote_path("/etc/hosts", cwd), "/etc/hosts");
+        assert_eq!(remote_path("~/notes", cwd), "~/notes");
+        // Without a reported directory, the home directory there.
+        assert_eq!(remote_path("src/main.rs", None), "src/main.rs");
     }
 }

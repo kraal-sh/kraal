@@ -294,6 +294,7 @@ impl FilesPane {
             Hint { label: "c", text: format!("copy {arrow}"), key: Some(FileKey::Char('c')) },
             Hint::new("m", "move", Some(FileKey::Char('m'))),
             Hint::new("d", "delete", Some(FileKey::Char('d'))),
+            Hint::new("e", "edit", Some(FileKey::Char('e'))),
             Hint::new("s", "shell", Some(FileKey::Char('s'))),
             Hint::new("o", "server", Some(FileKey::Char('o'))),
             Hint::new("r", "refresh", Some(FileKey::Char('r'))),

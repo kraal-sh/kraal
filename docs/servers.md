@@ -1,6 +1,6 @@
 # Servers
 
-Every machine you SSH to, at hand: an inventory, file transfers in every direction, commands and logs across a fleet, tunnels, and kraal itself on a server.
+Every machine you SSH to, at hand: an inventory, file transfers in every direction, its files in your own editor, commands and logs across a fleet, tunnels, and kraal itself on a server.
 
 ## The inventory
 
@@ -65,12 +65,35 @@ replace is never replaced, even if it appears during the copy: that copy then wa
 (a move's, the only copy of what it moved, is named instead); a directory is put in place by a
 rename that keeps it whole (owner, permissions, ACLs), which on a server takes GNU coreutils 8.30
 or later: elsewhere such a copy says so before it starts), `m` moves, `d` deletes, `enter`
-opens a directory or previews a local file, `s` opens a shell there, `/` filters. Selected files
-carry a ✓. Transfers run in a small window that closes itself when done.
+opens a directory or previews a local file, `e` edits a file in your `$EDITOR` (a server's too,
+see below), `s` opens a shell there, `/` filters. Selected files carry a ✓. Transfers run in a
+small window that closes itself when done.
 
 Drop a file from your file manager on an SSH pane and kraal offers to upload it to that server
 (`ctrl+p` pastes the path instead). `ctrl+b S d` downloads a path from the pane's server
 (the selected text is prefilled), into `~/Downloads` by default.
+
+## Editing a file on a server
+
+```sh
+kraal edit db:/etc/app.conf            # in your $EDITOR, in a floating pane
+kraal edit db:app/.env --line 12       # a path relative to the home directory there
+```
+
+`e` on a server's file in the file manager does the same, and so does Tab then the label of a
+path in an SSH pane ([hints](tools.md#hints)): the path is on that pane's server, in its
+directory when the shell there reports it. kraal reads the file into a private directory, sends
+it back each time you save and once more when the editor ends, then removes its copy; each save
+says so in a message. The editor must stay in the foreground until you are done (`code --wait`).
+
+Nothing is written blindly: kraal keeps a hash of what it read, made on the server, and checks it
+before each save. If the file changed there meanwhile, it asks: keep your version as a local file
+(in `download_dir`; your next saves go there), keep the server's version (the editor's copy
+becomes it), or replace it with yours. A save writes a new file next to the old one, with its
+mode (and owner when you may give it), then renames it over it. kraal edits regular files of up
+to 16 MiB that you may write, following symbolic links to them, without sudo. On a production
+server it asks first, and `kraal edit` refuses unless given `--production`. If kraal stops while
+you edit, what was not saved is kept in `download_dir`.
 
 ## Fleet tools
 
