@@ -42,15 +42,19 @@ kraal is a multiplexer in the tradition of tmux and Zellij that runs inside your
   Mouse support, floating panes, zoom, scrollback search, rich preview panes.
 
 ```
- prod   1 web01 ▲   2 agents ✓   +                                       ▲1 ✓1  main
- WORKSPACES              ┏ web01 ━━━━━━━━━━━━━━━━━━━━━━━━┓╭ api ───── ▲ claude blocked ╮
- ▸ prod ▲1               ┃admin@web01:~$                 ┃│ Do you want to proceed?      │
-     ▲ claude api        ┃                               ┃│ ❯ 1. Yes                     │
-     ✓ codex docs        ┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛╰──────────────────────────────╯
-   staging               ╭ web02 ────────────────────────╮╭ docs ──────── ✓ codex done ╮
- NOT RUNNING             │admin@web02:~$                 ││ ● Updated README.md          │
-   lab                   │                               ││ >                            │
- ▲ 1 agent needs you  alt+a go                                                ctrl+b menu
+╭─ WORKSPACES ─────────╮  1 web01 ●   2 agents ●   +                            ●1 ●1   ctrl+b menu
+│ ● prod               │ ╭ web01 ───────────────────────────╮ ╭ api ────────── ● blocked · claude ─╮
+│   2 tabs · 4 panes   │ │admin@web01:~$ uptime             │ │ Do you want to proceed?            │
+│ ● staging            │ │ 10:12:04 up 41 days,  2 users    │ │ ❯ 1. Yes                           │
+│   1 tab · 2 panes    │ │admin@web01:~$                    │ │   2. No                            │
+│ ○ lab                │ │                                  │ │                                    │
+│   not running        │ │                                  │ ╰────────────────────────────────────╯
+├─ AGENTS ─────────────┤ │                                  │
+│ ● api                │ │                                  │ ╭ docs ───────────── ● done · codex ─╮
+│   blocked · claude   │ │                                  │ │ • Updated README.md                │
+│ ● docs               │ │                                  │ │ ▌                                  │
+│   done · codex       │ │                                  │ │                                    │
+╰──────────────────────╯ ╰──────────────────────────────────╯ ╰────────────────────────────────────╯
 ```
 
 ## Install
@@ -310,7 +314,7 @@ unnoticed until the next.
 workspace or AWS profile has `prod`, `production` or `prd` as a word of its name (`web-prod-1`,
 `prod-eks`, `db.prod.lan`; not `products-api`), or when its server says `env = "prod"` in
 `servers.toml` (`kraal servers add … --env prod`; a server with another `env` never is). Production
-panes get a red frame and a PROD badge, and kraal asks before:
+panes get a red frame and a PROD badge, their tab turns red, and kraal asks before:
 
 - broadcast typing reaches a production pane (once per pane and production reason, until the
   broadcast stops; no stops it);
@@ -474,8 +478,9 @@ kraal integration install codex    # sets `notify` in ~/.codex/config.toml
 kraal integration status
 ```
 
-The hooks do nothing outside kraal. States are shown with icons: `●` working, `▲` blocked
-(waiting for you), `✓` done (not seen yet), `○` idle. A blocked or finished agent you are not
+The hooks do nothing outside kraal. States are shown as coloured dots, with the state written
+next to them in the sidebar and in pane frames: yellow working, red blocked (waiting for you), green
+done (not seen yet), `○` idle. A blocked or finished agent you are not
 looking at triggers a desktop notification through your terminal (OSC 777/9) or `notify-send`.
 
 When the server restarts, panes that ran an agent with a known session resume it
