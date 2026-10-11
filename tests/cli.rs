@@ -58,7 +58,8 @@ impl Env {
         let start = Instant::now();
         loop {
             let screen = self.run(&["read", "-p", pane]);
-            if screen.contains(text) {
+            // A narrow pane wraps long lines: the text may run over two rows.
+            if screen.contains(text) || screen.lines().collect::<String>().contains(text) {
                 return screen;
             }
             assert!(start.elapsed() < Duration::from_secs(10), "timed out waiting for {text:?} in:\n{screen}");
