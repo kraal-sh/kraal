@@ -384,17 +384,124 @@ pub const SHELLS: &[&str] = &["zsh", "bash", "fish"];
 const BLOCK_START: &str = "# >>> kraal shell integration >>>";
 const BLOCK_END: &str = "# <<< kraal shell integration <<<";
 
+/// Whether the terminal is kraal, asked by a shell over SSH (where kraal's variables do not reach)
+/// through `sh`: kraal answers `OSC 7701 ; ?`, which other terminals ignore, and every terminal
+/// answers the request for its attributes (DA1) that follows, which tells when to stop reading.
+/// Two seconds without an answer is a no. It reads the terminal, so it runs before the line
+/// editor starts, once per shell.
+const DETECT: &str = r#"exec </dev/tty >/dev/tty 2>/dev/null || exit 1
+s=$(stty -g) || exit 1
+trap "stty $s; exit 1" HUP INT TERM
+stty -echo -icanon min 0 time 20 || exit 1
+e=$(printf "\033")
+printf "\033]7701;?\007\033[c"
+r=
+while c=$(dd bs=256 count=1 2>/dev/null) && [ -n "$c" ]; do
+  r=$r$c
+  case $r in *"$e[?"*c) break ;; esac
+done
+stty "$s"
+case $r in *"$e]7701;kraal"*) exit 0 ;; esac
+exit 1"#;
+
+/// The current context of kubeconfig files and its namespace, read by `awk` as kubectl merges
+/// the files: the first `current-context` set wins, and so does the first definition of a
+/// context. It reads block YAML as kubectl, kubectx and the clouds' tools write it; anything else
+/// (JSON) is unknown, and so is a name kraal would not take. It goes between single quotes in
+/// all three shells: no single quote (`\047` instead) and no double backslash.
+const KUBE_AWK: &str = r#"
+function unq(v) {
+  sub(/^[ \t]+/, "", v); sub(/[ \t]+#.*$/, "", v); sub(/[ \t]+$/, "", v)
+  if (v ~ /^".*"$/ || v ~ /^\047.*\047$/) v = substr(v, 2, length(v) - 2)
+  return v
+}
+function val(l) { sub(/^[^:]*:/, "", l); return unq(l) }
+function flush() { if (name != "" && !(name in ns)) ns[name] = space; name = ""; space = "" }
+function ok(v) { return length(v) <= 200 && v ~ "^[-A-Za-z0-9._:/@+]*$" }
+FNR == 1 { flush(); top = ""; item = -1; head = 1 }
+head && /[^ \t]/ && !/^[ \t]*#/ { head = 0; if ($0 ~ /^[ \t]*[{[]/) bad = 1 }
+/^[^ \t#-]/ {
+  flush(); top = $0; sub(/:.*/, "", top)
+  if (top == "current-context" && cur == "") cur = val($0)
+  next
+}
+top != "contexts" { next }
+{
+  match($0, /^ */); n = RLENGTH; l = substr($0, n + 1)
+  if (l == "" || l ~ /^#/) next
+  if (l ~ /^-( |$)/ && (item < 0 || n == item)) {
+    flush(); item = n; body = 0; key = -1
+    l = substr(l, 2); match(l, /^ */); n += 1 + RLENGTH; l = substr(l, RLENGTH + 1)
+    if (l == "") next
+  }
+  if (key < 0) key = n
+  if (n == key) { body = (l ~ /^context:[ \t]*$/); deep = -1; if (l ~ /^name:/) name = val(l) }
+  else if (body && n > key) { if (deep < 0) deep = n; if (n == deep && l ~ /^namespace:/) space = val(l) }
+}
+END {
+  flush()
+  if (bad) print "k8s=?"
+  else if (cur == "") print "k8s="
+  else if (!ok(cur) || !ok(ns[cur])) print "k8s=?"
+  else print "k8s=" cur ";ns=" ns[cur]
+}
+"#;
+
+/// zsh and bash: what the shell works on, reported at each prompt over SSH (`OSC 7701`), as the
+/// commands it starts see it: the kubeconfig's current context and namespace, the Terraform
+/// workspace of its directory (or `TF_WORKSPACE`), `AWS_PROFILE`. Only the kubeconfig costs a
+/// process (`awk`), and only when there is one. A name with other characters than kraal takes
+/// is sent as `?`, never as it is.
+const SH_CONTEXT: &str = r#"  __kraal_context() {
+    local k='k8s=' t= a=${AWS_PROFILE:-${AWS_DEFAULT_PROFILE-}} d=${TF_DATA_DIR:-.terraform} f bad=
+    local r=${KUBECONFIG:-$HOME/.kube/config}
+    local -a fs=()
+    while [[ -n $r ]]; do
+      f=${r%%:*}
+      [[ $r == *:* ]] && r=${r#*:} || r=
+      [[ -n $f && -e $f ]] || continue
+      if [[ -f $f && -r $f ]]; then fs+=("$f"); else bad=1; fi
+    done
+    if [[ -n $bad ]]; then
+      k='k8s=?'
+    elif (( ${#fs[@]} )); then
+      k=$(LC_ALL=C command awk '@KUBE_AWK@' "${fs[@]}" 2>/dev/null) || k='k8s=?'
+    fi
+    if [[ -n ${TF_WORKSPACE-} ]]; then
+      t=$TF_WORKSPACE
+    elif [[ -d $d ]]; then
+      if [[ -f $d/environment && -r $d/environment ]]; then
+        IFS= read -r t <"$d/environment"
+        t=${t:-default}
+      elif [[ -e $d/environment ]]; then
+        t='?'
+      else
+        t=default
+      fi
+    fi
+    [[ -z $t || ( ${#t} -le 200 && $t != *[!-A-Za-z0-9._:/@+]* ) ]] || t='?'
+    [[ -z $a || ( ${#a} -le 200 && $a != *[!-A-Za-z0-9._:/@+]* ) ]] || a='?'
+    printf '\e]7701;context;%s;tf=%s;aws=%s\a' "$k" "$t" "$a"
+  }"#;
+
 /// zsh: the mark of a prompt and of a finished command before each prompt (first of the hooks,
 /// to see the command's own status), of the command line when the line editor starts, of a
-/// command as it runs.
-const ZSH_MARKS: &str = r#"if [[ -n $KRAAL_PANE && -z $__kraal_marks ]]; then
+/// command as it runs. In kraal's panes, and over SSH when the terminal says it is kraal.
+const ZSH_MARKS: &str = r#"if [[ -z $__kraal_marks ]] && {
+  [[ -n $KRAAL_PANE ]] || {
+    [[ -o interactive && -n $SSH_CONNECTION && $TERM != (dumb|linux) && -t 0 && -t 1 ]] &&
+      command sh -c '@DETECT@' && __kraal_remote=1
+  }
+}; then
   typeset -g __kraal_marks=1 __kraal_ran=
   __kraal_precmd() {
     local s=$?
     [[ -n $__kraal_ran ]] && printf '\e]133;D;%s\a' $s
     __kraal_ran=
+    [[ -n $__kraal_remote ]] && __kraal_context
     printf '\e]133;A\a'
   }
+@SH_CONTEXT@
   __kraal_preexec() {
     __kraal_ran=1
     printf '\e]133;C\a'
@@ -410,14 +517,23 @@ fi
 
 /// bash: the prompt marks run first in PROMPT_COMMAND, the command line's mark is put back at the
 /// end of PS1 after whatever rewrites it, and PS0 (bash 4.4) marks a command as it runs. A
-/// PROMPT_COMMAND array (bash 5.1) stays one, with kraal's hooks first and last.
-const BASH_MARKS: &str = r#"if [[ -n $KRAAL_PANE && -z $__kraal_marks ]]; then
+/// PROMPT_COMMAND array (bash 5.1) stays one, with kraal's hooks first and last. In kraal's
+/// panes, and over SSH when the terminal says it is kraal.
+const BASH_MARKS: &str = r#"if [[ -z $__kraal_marks ]] && {
+  [[ -n $KRAAL_PANE ]] || {
+    [[ $- == *i* && -n $SSH_CONNECTION && $TERM != dumb && $TERM != linux && -t 0 && -t 1 ]] &&
+      command sh -c '@DETECT@' && __kraal_remote=1
+  }
+}; then
   __kraal_marks=1
   __kraal_prompt() {
     local s=$?
-    printf '\e]133;D;%s\a\e]133;A\a' "$s"
+    printf '\e]133;D;%s\a' "$s"
+    [[ -n $__kraal_remote ]] && __kraal_context
+    printf '\e]133;A\a'
     return $s
   }
+@SH_CONTEXT@
   __kraal_input() {
     [[ $PS1 == *'133;B'* ]] || PS1+='\[\e]133;B\a\]'
   }
@@ -430,14 +546,29 @@ const BASH_MARKS: &str = r#"if [[ -n $KRAAL_PANE && -z $__kraal_marks ]]; then
 fi
 "#;
 
-/// fish: events around each prompt and command (fish has no hook where the command line starts).
-const FISH_MARKS: &str = r#"if set -q KRAAL_PANE; and not set -q __kraal_marks
+/// fish: events around each prompt and command (fish has no hook where the command line starts),
+/// and over SSH what the shell works on, as for zsh and bash. In kraal's panes, and over SSH
+/// when the terminal says it is kraal.
+const FISH_MARKS: &str = r#"if not set -q __kraal_marks
+    and begin
+        set -q KRAAL_PANE
+        or begin
+            status is-interactive
+            and set -q SSH_CONNECTION
+            and not contains -- "$TERM" dumb linux
+            and test -t 0
+            and test -t 1
+            and command sh -c '@DETECT@'
+            and set -g __kraal_remote 1
+        end
+    end
     set -g __kraal_marks 1
     function __kraal_prompt --on-event fish_prompt
         if set -q __kraal_status
             printf '\e]133;D;%s\a' $__kraal_status
             set -e __kraal_status
         end
+        set -q __kraal_remote; and __kraal_context
         printf '\e]133;A\a'
     end
     function __kraal_preexec --on-event fish_preexec
@@ -445,6 +576,50 @@ const FISH_MARKS: &str = r#"if set -q KRAAL_PANE; and not set -q __kraal_marks
     end
     function __kraal_postexec --on-event fish_postexec
         set -g __kraal_status $status
+    end
+    function __kraal_context
+        set -l k 'k8s='
+        set -l t
+        set -l a $AWS_PROFILE
+        test -n "$a"; or set a $AWS_DEFAULT_PROFILE
+        set -l d .terraform
+        test -n "$TF_DATA_DIR"; and set d $TF_DATA_DIR
+        set -l kc $KUBECONFIG
+        test -n "$kc"; or set kc $HOME/.kube/config
+        set -l fs
+        set -l bad
+        for f in (string split : -- $kc)
+            test -n "$f"; and test -e "$f"; or continue
+            if test -f "$f"; and test -r "$f"
+                set -a fs $f
+            else
+                set bad 1
+            end
+        end
+        if set -q bad[1]
+            set k 'k8s=?'
+        else if set -q fs[1]
+            set k (env LC_ALL=C awk '@KUBE_AWK@' $fs 2>/dev/null); or set k 'k8s=?'
+        end
+        if test -n "$TF_WORKSPACE"
+            set t $TF_WORKSPACE
+        else if test -d "$d"
+            if test -f "$d/environment"; and test -r "$d/environment"
+                read t <"$d/environment"
+                test -n "$t"; or set t default
+            else if test -e "$d/environment"
+                set t '?'
+            else
+                set t default
+            end
+        end
+        if test -n "$t"; and not string match -qr -- '^[-A-Za-z0-9._:/@+]{1,200}$' "$t"
+            set t '?'
+        end
+        if test -n "$a"; and not string match -qr -- '^[-A-Za-z0-9._:/@+]{1,200}$' "$a"
+            set a '?'
+        end
+        printf '\e]7701;context;%s;tf=%s;aws=%s\a' "$k" "$t" "$a"
     end
 end
 "#;
@@ -467,8 +642,9 @@ fn shell_block(shell: &str) -> String {
         "bash" => BASH_MARKS,
         _ => FISH_MARKS,
     };
+    let marks = marks.replace("@SH_CONTEXT@", SH_CONTEXT).replace("@DETECT@", DETECT).replace("@KUBE_AWK@", KUBE_AWK);
     format!(
-        "{BLOCK_START}\n# In kraal's panes, marks prompts and commands (OSC 133): `kraal integration uninstall {shell}` removes this.\n{marks}{BLOCK_END}\n"
+        "{BLOCK_START}\n# In kraal's panes, marks prompts and commands (OSC 133); over SSH, also reports the Kubernetes,\n# Terraform and AWS contexts (OSC 7701). Inert elsewhere. `kraal integration uninstall {shell}` removes this.\n{marks}{BLOCK_END}\n"
     )
 }
 
@@ -719,6 +895,301 @@ mod tests {
             assert!(!all.contains("syntax error") && !all.contains("parse error"), "{shell}: {all:?}");
             let _ = std::fs::remove_dir_all(dir);
         }
+    }
+
+    /// What the shells' awk program says of kubeconfig files.
+    fn kube_report(files: &[&Path]) -> Option<String> {
+        let out = std::process::Command::new("awk").arg(KUBE_AWK).args(files).env("LC_ALL", "C").output().ok()?;
+        Some(String::from_utf8_lossy(&out.stdout).trim_end().to_string())
+    }
+
+    /// The shells read a kubeconfig as kraal does for local panes, and send `?` for what they
+    /// cannot read or kraal would not take.
+    #[test]
+    fn the_shells_read_kubeconfigs_as_kraal_does() {
+        if kube_report(&[]).is_none() {
+            return; // no awk here
+        }
+        let dir = tmp("kubeawk");
+        let file = |name: &str, text: &str| {
+            let p = dir.join(name);
+            std::fs::write(&p, text).unwrap();
+            p
+        };
+        let kubectl = "apiVersion: v1\nclusters:\n- cluster:\n    server: https://1.2.3.4\n  name: prod\ncontexts:\n\
+            - context:\n    cluster: prod\n    namespace: payments\n    user: admin\n  name: prod-eks\n\
+            - name: \"dev\"\n  context:\n    cluster: dev\n    user: me\n\
+            current-context: prod-eks # set by kubectx\nkind: Config\nusers:\n- name: admin\n  user:\n    token: secret\n";
+        let minikube = "contexts:\n- context:\n    cluster: minikube\n    extensions:\n    - extension:\n        \
+            namespace: trap\n        provider: minikube.sigs.k8s.io\n      name: context_info\n    namespace: default\n    \
+            user: minikube\n  name: minikube\ncurrent-context: minikube\n";
+        let indented = "# kept by hand\ncontexts:\n  - context:\n      # the team's\n      namespace: web\n    \
+            name: 'a'\ncurrent-context: 'a'\n";
+        let cases = [
+            (vec![file("kubectl", kubectl)], "k8s=prod-eks;ns=payments"),
+            (vec![file("minikube", minikube)], "k8s=minikube;ns=default"),
+            (vec![file("indented", indented)], "k8s=a;ns=web"),
+            (vec![file("dev", &kubectl.replace("current-context: prod-eks", "current-context: dev"))], "k8s=dev;ns="),
+            (vec![file("none", "contexts:\n- name: a\n  context: {}\n")], "k8s="),
+            // The first file that sets a current context wins, and the first definition.
+            (
+                vec![
+                    file("first", "contexts:\n- name: b\n  context:\n    namespace: nb\ncurrent-context: \"\"\n"),
+                    file("second", "contexts:\n- name: b\n  context:\n    namespace: other\ncurrent-context: b\n"),
+                ],
+                "k8s=b;ns=nb",
+            ),
+        ];
+        for (files, want) in &cases {
+            let paths: Vec<&Path> = files.iter().map(|p| p.as_path()).collect();
+            assert_eq!(kube_report(&paths).unwrap(), *want, "{files:?}");
+            // What kraal reads of the same files, for a local pane.
+            let parsed: Vec<_> =
+                files.iter().map(|p| crate::context::parse_kubeconfig(&std::fs::read_to_string(p).unwrap())).collect();
+            let kraal = crate::context::merge_kubeconfigs(&parsed).resolve(&Default::default());
+            let kraal =
+                kraal.map_or("k8s=".into(), |k| format!("k8s={};ns={}", k.context, k.namespace.unwrap_or_default()));
+            assert_eq!(kraal, *want, "kraal reads {files:?} otherwise");
+        }
+        // What the shell cannot read, or kraal would not take, is unknown.
+        let json = file("json", r#"{"current-context": "prod", "contexts": []}"#);
+        let spaced = file("spaced", "current-context: prod eks\n");
+        let escape = file("escape", "current-context: a\x1b]133;A\x07b\n");
+        let separator = file("separator", "current-context: a;aws=dev\n");
+        let long = file("long", &format!("current-context: {}\n", "a".repeat(201)));
+        let ns = file("ns", "contexts:\n- name: a\n  context:\n    namespace: \"x y\"\ncurrent-context: a\n");
+        for f in [&json, &spaced, &escape, &separator, &long, &ns] {
+            assert_eq!(kube_report(&[f]).unwrap(), "k8s=?", "{f:?}");
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A shell on a terminal that the test plays (`script` gives it one): it answers the shell's
+    /// questions as kraal does, or as another terminal, and keeps what the shell writes.
+    #[cfg(target_os = "linux")]
+    struct PlayedTerminal {
+        child: std::process::Child,
+        input: std::process::ChildStdin,
+        out: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+        answered: usize,
+        kraal: bool,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl PlayedTerminal {
+        fn start(command: &str, home: &Path, env: &[(&str, &str)], kraal: bool) -> Option<PlayedTerminal> {
+            use std::io::Read;
+            let mut cmd = std::process::Command::new("script");
+            cmd.args(["-qfc", &format!("stty cols 120 rows 30; exec {command}"), "/dev/null"])
+                .env_clear()
+                .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+                .env("HOME", home)
+                .env("TERM", "xterm-256color")
+                .env("SHELL", "/bin/sh")
+                .env("LANG", "C.UTF-8")
+                .env("XDG_CONFIG_HOME", home.join(".config"))
+                .env("XDG_DATA_HOME", home.join(".local/share"))
+                .env("XDG_CACHE_HOME", home.join(".cache"))
+                .env("XDG_RUNTIME_DIR", home)
+                .envs(env.iter().copied())
+                .current_dir(home)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::null());
+            let mut child = cmd.spawn().ok()?;
+            let input = child.stdin.take()?;
+            let mut stdout = child.stdout.take()?;
+            let out = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let kept = out.clone();
+            std::thread::spawn(move || {
+                let mut buf = [0u8; 4096];
+                while let Ok(n) = stdout.read(&mut buf) {
+                    if n == 0 {
+                        break;
+                    }
+                    kept.lock().unwrap().extend_from_slice(&buf[..n]);
+                }
+            });
+            Some(PlayedTerminal { child, input, out, answered: 0, kraal })
+        }
+
+        fn write(&mut self, bytes: &[u8]) {
+            use std::io::Write;
+            self.input.write_all(bytes).unwrap();
+            self.input.flush().unwrap();
+        }
+
+        /// Answer what the shell asked since the last time, in order: kraal's question (as kraal
+        /// only) and the attributes (DA1, which every terminal answers).
+        fn answer(&mut self) {
+            let out = self.out.lock().unwrap().clone();
+            let find = |hay: &[u8], needle: &[u8]| hay.windows(needle.len()).position(|w| w == needle);
+            loop {
+                let rest = &out[self.answered..];
+                let kraal = find(rest, b"\x1b]7701;?\x07").map(|at| (at, 9, true));
+                let da1 =
+                    [find(rest, b"\x1b[c").map(|at| (at, 3, false)), find(rest, b"\x1b[0c").map(|at| (at, 4, false))];
+                let Some((at, len, ours)) = da1.into_iter().chain([kraal]).flatten().min() else { break };
+                self.answered += at + len;
+                if !ours {
+                    self.write(b"\x1b[?62;22c");
+                } else if self.kraal {
+                    self.write(b"\x1b]7701;kraal\x07");
+                }
+            }
+        }
+
+        fn text(&self) -> String {
+            String::from_utf8_lossy(&self.out.lock().unwrap()).into_owned()
+        }
+
+        /// Wait until what the shell wrote since `from` (a length of [`PlayedTerminal::text`])
+        /// has `want`.
+        fn wait_for(&mut self, from: usize, want: &str) -> String {
+            let start = std::time::Instant::now();
+            loop {
+                self.answer();
+                let text = self.text();
+                if text.get(from..).is_some_and(|t| t.contains(want)) {
+                    return text;
+                }
+                assert!(
+                    start.elapsed() < std::time::Duration::from_secs(10),
+                    "no {want:?} in {:?}",
+                    &text[from.min(text.len())..]
+                );
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        }
+
+        /// Type a command line, and wait for what it prints.
+        fn run(&mut self, line: &str, want: &str) -> String {
+            let from = self.text().len();
+            self.write(format!("{line}\r").as_bytes());
+            self.wait_for(from, want)
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    impl Drop for PlayedTerminal {
+        fn drop(&mut self) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+
+    /// `shell` with what `kraal integration show` prints in its startup file, in a home of its
+    /// own, on a terminal the test plays, `env` added to its environment. Started: its startup
+    /// files are read (what is typed while the shell asks the terminal is lost, as for anyone
+    /// typing that early).
+    #[cfg(target_os = "linux")]
+    fn start_shell(shell: &str, home: &Path, env: &[(&str, &str)], kraal: bool) -> Option<PlayedTerminal> {
+        let block = show(shell).unwrap();
+        let command = match shell {
+            "bash" => {
+                std::fs::write(home.join(".bashrc"), format!("PS1='$ '\n{block}\necho STARTED\n")).unwrap();
+                format!("bash --rcfile {}/.bashrc -i", home.display())
+            }
+            "zsh" => {
+                std::fs::write(home.join(".zshrc"), format!("PS1='$ '\n{block}\necho STARTED\n")).unwrap();
+                "zsh --no-globalrcs -i".to_string()
+            }
+            _ => {
+                let conf = home.join(".config/fish/conf.d");
+                std::fs::create_dir_all(&conf).unwrap();
+                std::fs::write(conf.join("kraal.fish"), format!("{block}\n")).unwrap();
+                std::fs::write(home.join(".config/fish/config.fish"), "set -g fish_greeting\necho STARTED\n").unwrap();
+                "fish -i".to_string()
+            }
+        };
+        let mut env = env.to_vec();
+        let zdotdir = home.display().to_string();
+        env.push(("ZDOTDIR", &zdotdir));
+        let mut t = PlayedTerminal::start(&command, home, &env, kraal)?;
+        t.wait_for(0, "STARTED");
+        Some(t)
+    }
+
+    /// Over SSH, the shell asks whether the terminal is kraal; kraal says yes, and the shell marks
+    /// its commands and reports at each prompt what it works on, sending `?` for what kraal would
+    /// not take. Another terminal is asked and nothing more; outside SSH and kraal, nothing.
+    #[cfg(target_os = "linux")]
+    fn reports_over_ssh(shell: &str) {
+        if std::process::Command::new(shell).arg("-c").arg("true").output().is_err()
+            || std::process::Command::new("script").arg("--version").output().is_err()
+        {
+            return;
+        }
+        let home = tmp(&format!("remote-{shell}"));
+        let kube = "contexts:\n- context:\n    namespace: payments\n  name: prod-eks\n- context: {}\n  name: dev\n\
+            current-context: prod-eks\n";
+        std::fs::create_dir_all(home.join(".kube")).unwrap();
+        std::fs::write(home.join(".kube/config"), kube).unwrap();
+        std::fs::write(home.join("dev.yaml"), kube.replace("current-context: prod-eks", "current-context: dev"))
+            .unwrap();
+        std::fs::write(home.join("evil.yaml"), "current-context: a\x1b]133;A\x07b\n").unwrap();
+        std::fs::create_dir_all(home.join("infra/.terraform")).unwrap();
+        std::fs::write(home.join("infra/.terraform/environment"), "prod").unwrap();
+        let export = |k: &str, v: &str| match shell {
+            "fish" => format!("set -gx {k} {v}"),
+            _ => format!("export {k}={v}"),
+        };
+        let ssh = [("SSH_CONNECTION", "10.0.0.1 50000 10.0.0.5 22")];
+
+        // Over SSH, on kraal.
+        let mut t = start_shell(shell, &home, &ssh, true).expect("a terminal");
+        t.wait_for(0, "\x1b]7701;context;k8s=prod-eks;ns=payments;tf=;aws=\x07\x1b]133;A\x07");
+        t.run("echo \"m=$__kraal_marks r=$__kraal_remote\"", "m=1 r=1");
+        t.run("cd infra", "\x1b]7701;context;k8s=prod-eks;ns=payments;tf=prod;aws=\x07");
+        t.run(&export("AWS_PROFILE", "ops"), ";tf=prod;aws=ops\x07");
+        t.run(&export("KUBECONFIG", "$HOME/dev.yaml"), "\x1b]7701;context;k8s=dev;ns=;tf=prod;aws=ops\x07");
+        t.run(&export("TF_WORKSPACE", "blue"), ";tf=blue;aws=ops\x07");
+        // What kraal would not take is sent as `?`, never as it is.
+        t.run(&export("AWS_PROFILE", "'a;b'"), ";tf=blue;aws=?\x07");
+        let text = t.run(&export("KUBECONFIG", "$HOME/evil.yaml"), "\x1b]7701;context;k8s=?;tf=blue;aws=?\x07");
+        assert!(!text.contains("a\x1b]133;A\x07b"), "{shell}: a name went to the terminal as it is: {text:?}");
+        assert!(!text.contains("syntax error") && !text.contains("parse error"), "{shell}: {text:?}");
+        drop(t);
+
+        // Over SSH, on another terminal: asked, and nothing more.
+        let mut t = start_shell(shell, &home, &ssh, false).expect("a terminal");
+        let text = t.run("echo \"m=$__kraal_marks r=$__kraal_remote\"", "m= r=");
+        assert!(text.contains("\x1b]7701;?\x07"), "{shell}: {text:?}");
+        assert!(!text.contains("\x1b]7701;context"), "{shell}: {text:?}");
+        drop(t);
+
+        // Neither over SSH nor in kraal: not even asked.
+        let mut t = start_shell(shell, &home, &[], true).expect("a terminal");
+        let text = t.run("echo \"m=$__kraal_marks r=$__kraal_remote\"", "m= r=");
+        assert!(!text.contains("\x1b]7701"), "{shell}: {text:?}");
+        drop(t);
+
+        // In a local kraal pane, even over SSH: marks, without the question or reports (kraal
+        // reads the contexts of its own panes itself).
+        let mut t = start_shell(shell, &home, &[ssh[0], ("KRAAL_PANE", "1")], true).expect("a terminal");
+        t.run("echo \"m=$__kraal_marks r=$__kraal_remote\"", "m=1 r=");
+        let text = t.run("cd infra", "\x1b]133;A\x07");
+        assert!(!text.contains("\x1b]7701"), "{shell}: {text:?}");
+        drop(t);
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn bash_reports_its_contexts_over_ssh_to_kraal_only() {
+        reports_over_ssh("bash");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn zsh_reports_its_contexts_over_ssh_to_kraal_only() {
+        reports_over_ssh("zsh");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn fish_reports_its_contexts_over_ssh_to_kraal_only() {
+        reports_over_ssh("fish");
     }
 
     #[test]

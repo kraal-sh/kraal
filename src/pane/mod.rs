@@ -138,6 +138,8 @@ pub enum PaneSignal {
     TitleChanged,
     /// A command the shell marked (OSC 133) ended.
     CommandDone(Finished),
+    /// A shell reported the contexts it works on (OSC 7701): they count over SSH only.
+    Contexts(crate::context::RemoteContexts),
 }
 
 pub enum Content {
@@ -168,6 +170,13 @@ pub struct Pane {
     /// What the commands run here last worked on (Kubernetes, AWS, Terraform), as seen from
     /// their command lines and environments.
     pub seen: crate::context::Seen,
+    /// The contexts a shell over SSH reported at its last prompt, with the process they came
+    /// through (the `ssh` in the foreground then): they go when it leaves the foreground.
+    pub reported: Option<(u32, crate::context::RemoteContexts)>,
+    /// A report came since the last command started. A prompt without one is from a shell that
+    /// does not report (the one ssh came back to, or a `sudo -i` on the server): what was
+    /// reported no longer holds. (A shell may mark a prompt twice: fish 4 marks its own.)
+    reported_since_command: bool,
     /// When to close the pane automatically.
     pub close_at: Option<Instant>,
     /// Replace the spec and restart once the current process exits (account switch).
@@ -225,6 +234,8 @@ impl Pane {
             reported_cwd: None,
             reported_host: String::new(),
             seen: Default::default(),
+            reported: None,
+            reported_since_command: false,
             ssh: None,
             close_at: None,
             restart_with: None,
@@ -252,6 +263,8 @@ impl Pane {
             reported_cwd: None,
             reported_host: String::new(),
             seen: Default::default(),
+            reported: None,
+            reported_since_command: false,
             ssh: None,
             close_at: None,
             restart_with: None,
@@ -276,6 +289,8 @@ impl Pane {
         fresh.marked(|t| t.parser.advance(&mut t.term, &reset));
         **old = fresh;
         // A new process: nothing of the old one's lifecycle carries over, but its conversation.
+        self.reported = None;
+        self.reported_since_command = false;
         self.exit_code = None;
         self.suspended = false;
         self.close_at = None;
@@ -365,6 +380,22 @@ impl Pane {
                     t.advance(&bytes[start..end]);
                     start = end;
                     signals.extend(t.mark(mark).map(PaneSignal::CommandDone));
+                    match mark {
+                        commands::Mark::Output => self.reported_since_command = false,
+                        commands::Mark::Prompt if !self.reported_since_command => self.reported = None,
+                        _ => {}
+                    }
+                }
+                // The answer goes after the replies to what the program asked before, and
+                // before those to what it asks after (the shell reads up to the next one).
+                Osc::Query => {
+                    t.advance(&bytes[start..end]);
+                    start = end;
+                    t.events.borrow_mut().push(TermEvent::PtyWrite(osc::KRAAL_ANSWER.into()));
+                }
+                Osc::Contexts(contexts) => {
+                    self.reported_since_command = true;
+                    signals.push(PaneSignal::Contexts(contexts));
                 }
             }
         }
@@ -698,6 +729,77 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
         assert!(seen.contains("got\x1b[1;1R"), "the reply never reached the program: {seen:?}");
+    }
+
+    /// A shell over SSH asks whether its terminal is kraal, then for the terminal's attributes:
+    /// kraal's answer comes first, as the shell reads up to the attributes.
+    #[test]
+    fn kraal_answers_the_question_whether_it_is_kraal_before_the_attributes() {
+        let (tx, _rx) = crossbeam_channel::bounded(64);
+        let env = PaneEnv {
+            socket: "/nonexistent".into(),
+            session: "t".into(),
+            shell: "sh".into(),
+            scrollback: 100,
+            graphics: Default::default(),
+        };
+        let spec = PaneSpec {
+            command: vec![
+                "sh".into(),
+                "-c".into(),
+                "stty raw -echo; printf '\\033[c\\033]7701;?\\007\\033[c'; r=$(dd bs=1 count=23 2>/dev/null); \
+                 printf 'got%s.' \"$r\" | od -An -c; sleep 1"
+                    .into(),
+            ],
+            ..Default::default()
+        };
+        let mut pane = Pane::spawn(1, None, spec, 80, 5, &env, &tx).unwrap();
+        let start = Instant::now();
+        let mut seen = String::new();
+        while !seen.contains('.') && start.elapsed() < std::time::Duration::from_secs(5) {
+            while let Some(data) = pane.take_output() {
+                seen.push_str(&String::from_utf8_lossy(&data));
+                pane.feed(&data);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        // `od -c` spells ESC as 033 and BEL as \a.
+        let seen: String = seen.split_whitespace().collect();
+        assert!(seen.contains("got033[?6c033]7701;kraal\\a033[?6c."), "{seen:?}");
+    }
+
+    #[test]
+    fn kraal_sequences_are_read_and_a_prompt_without_a_report_ends_it() {
+        let mut s = OscScanner::default();
+        let data = b"\x1b]7701;?\x07x\x1b]7701;context;k8s=prod;ns=web;tf=;aws=ops\x1b\\\x1b]7701;kraal\x07";
+        let found: Vec<Osc> = data.chunks(5).flat_map(|c| s.scan(c)).map(|(_, o)| o).collect();
+        let reported = crate::context::RemoteContexts::parse("k8s=prod;ns=web;aws=ops");
+        assert_eq!(found, vec![Osc::Query, Osc::Contexts(reported.clone())], "an answer is not a question");
+
+        let (tx, _rx) = crossbeam_channel::bounded(64);
+        let env = PaneEnv {
+            socket: "/nonexistent".into(),
+            session: "t".into(),
+            shell: "sh".into(),
+            scrollback: 100,
+            graphics: Default::default(),
+        };
+        let spec = PaneSpec { command: vec!["sleep".into(), "5".into()], ..Default::default() };
+        let mut pane = Pane::spawn(1, None, spec, 40, 5, &env, &tx).unwrap();
+        let signals = pane.feed(b"\x1b]133;D;0\x07\x1b]7701;context;k8s=prod;ns=web;aws=ops\x07");
+        let got: Vec<_> =
+            signals.into_iter().filter_map(|s| if let PaneSignal::Contexts(c) = s { Some(c) } else { None }).collect();
+        assert_eq!(got, vec![reported.clone()]);
+        // The server took it (over SSH); the prompt that follows the report keeps it, marked
+        // twice as fish 4 does, and so does an empty command line.
+        pane.reported = Some((1, reported));
+        pane.feed(b"\x1b]133;A\x07\x1b]133;A;click_events=1\x1b\\$ \x1b]133;B\x07\r\n\x1b]133;A\x07$ ");
+        assert!(pane.reported.is_some());
+        // A command runs (`ssh` ends, `sudo -i`), then a prompt from a shell that does not
+        // report: what was reported no longer holds.
+        pane.feed(b"exit\r\n\x1b]133;C\x07\x1b]133;D;0\x07\x1b]133;A\x07$ ");
+        assert!(pane.reported.is_none());
+        pane.kill();
     }
 
     #[test]

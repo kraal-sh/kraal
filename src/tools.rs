@@ -301,16 +301,17 @@ impl ToolDef {
             spec.cwd = if ctx.server.is_none() { ctx.cwd.clone() } else { None };
             spec.env = ctx.variables(false);
             // Local tools act on the pane's cluster and cloud account: the ones its commands used,
-            // not whatever kraal itself inherited.
+            // not whatever kraal itself inherited. Those a shell on a server reported are named
+            // in the variables only: its kubeconfig and profiles are files on the server.
             match ctx.kubeconfig.as_deref() {
                 Some("") => spec.env_remove.push("KUBECONFIG".into()),
                 Some(k) => spec.env.push(("KUBECONFIG".into(), k.to_string())),
                 None => {}
             }
-            if let Some(p) = &ctx.aws_profile {
-                spec.env.push(("AWS_PROFILE".into(), p.clone()));
-            } else if ctx.aws_default {
-                spec.env_remove.extend(["AWS_PROFILE".into(), "AWS_DEFAULT_PROFILE".into()]);
+            match &ctx.aws_profile {
+                Some(p) if ctx.server.is_none() => spec.env.push(("AWS_PROFILE".into(), p.clone())),
+                None if ctx.aws_default => spec.env_remove.extend(["AWS_PROFILE".into(), "AWS_DEFAULT_PROFILE".into()]),
+                _ => {}
             }
         }
         spec
@@ -593,5 +594,21 @@ mod tests {
         let spec = local_only.spec(&ctx, &ssh);
         assert_eq!(spec.command[0], "sh");
         assert_eq!(spec.cwd, None, "an SSH pane's remote directory is not a local one");
+
+        // What a shell on the server reported: named in the variables, here and there, but the
+        // profile is the server's, not one to use here.
+        ctx.kubeconfig = None;
+        ctx.kube = Some(KubeContext { context: "prod-eks".into(), namespace: Some("payments".into()) });
+        ctx.aws_profile = Some("ops".into());
+        let here = local_only.spec(&ctx, &ssh);
+        assert!(here.env.contains(&("KRAAL_KUBE_CONTEXT".into(), "prod-eks".into())), "{:?}", here.env);
+        assert!(here.env.contains(&("KRAAL_AWS_PROFILE".into(), "ops".into())), "{:?}", here.env);
+        assert!(!here.env.iter().any(|(k, _)| k == "AWS_PROFILE" || k == "KUBECONFIG"), "{:?}", here.env);
+        assert!(here.env_remove.is_empty(), "{:?}", here.env_remove);
+        let script = unwrap_sh_c(&t.spec(&ctx, &ssh).command[3]);
+        assert!(script.contains("KRAAL_KUBE_CONTEXT=prod-eks KRAAL_KUBE_NAMESPACE=payments"), "{script}");
+        // On a local pane, the profile its tools used is the one tools use.
+        ctx.server = None;
+        assert!(local_only.spec(&ctx, &ssh).env.contains(&("AWS_PROFILE".into(), "ops".into())));
     }
 }

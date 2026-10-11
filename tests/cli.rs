@@ -1922,6 +1922,137 @@ fn a_production_directory_left_and_come_back_to_is_still_guarded() {
     assert!(refused("echo back"), "back in the directory, b is production again at once");
 }
 
+/// The pane named `name`, as `kraal panes --json` lists it.
+#[cfg(target_os = "linux")]
+fn pane_json(env: &Env, name: &str) -> serde_json::Value {
+    let panes: serde_json::Value = serde_json::from_str(&env.run(&["panes", "--json"])).unwrap();
+    panes.as_array().unwrap().iter().find(|p| p["name"] == name).cloned().unwrap()
+}
+
+/// Wait until the pane named `name` shows `contexts` and is production for `why` (or not).
+#[cfg(target_os = "linux")]
+fn wait_for_contexts(env: &Env, name: &str, contexts: &[&str], why: Option<&str>) {
+    let start = Instant::now();
+    loop {
+        let pane = pane_json(env, name);
+        if pane["contexts"] == serde_json::json!(contexts) && pane["production"] == serde_json::json!(why) {
+            return;
+        }
+        assert!(start.elapsed() < Duration::from_secs(10), "never {contexts:?} ({why:?}): {pane}");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// A shell on a server with what `kraal integration show` prints in its startup file reports
+/// what it works on: its pane shows it, and is guarded like a local one, until the session ends.
+/// The `ssh` here is `script`, which gives the shell a terminal of its own and relays it as ssh
+/// does; the shell finds kraal by asking it, through that relay.
+#[cfg(target_os = "linux")]
+fn contexts_over_ssh_hold_until_the_session_ends(shell: &str) {
+    let script = ["/usr/bin/script", "/bin/script"].into_iter().map(Path::new).find(|p| p.exists());
+    let Some(script) = script else { return };
+    if Command::new(shell).arg("-c").arg("true").output().is_err() {
+        return;
+    }
+    let env = Env::new(&format!("sshctx-{shell}"));
+    let config = env.root.join("config/kraal/config.toml");
+    let text = std::fs::read_to_string(&config).unwrap();
+    std::fs::write(&config, format!("{text}[servers]\nauto_add = false\n")).unwrap();
+    // The server's home: a kubeconfig on production, and the shell integration.
+    let remote = env.root.join("remote");
+    std::fs::create_dir_all(remote.join(".kube")).unwrap();
+    let kube = "contexts:\n- context:\n    namespace: payments\n  name: prod-eks\n- name: dev\n  context: {}\n\
+        current-context: prod-eks\n";
+    std::fs::write(remote.join(".kube/config"), kube).unwrap();
+    std::fs::write(remote.join("dev.yaml"), kube.replace("current-context: prod-eks", "current-context: dev")).unwrap();
+    let block = env.run(&["integration", "show", shell]);
+    let r = remote.display();
+    let start = match shell {
+        "bash" => {
+            std::fs::write(remote.join(".bashrc"), format!("PS1='remote$ '\n{block}\n")).unwrap();
+            format!("bash --rcfile {r}/.bashrc -i")
+        }
+        "zsh" => {
+            std::fs::write(remote.join(".zshrc"), format!("PS1='remote$ '\n{block}\n")).unwrap();
+            format!("env ZDOTDIR={r} zsh --no-globalrcs -i")
+        }
+        _ => {
+            let fish = remote.join(".config/fish");
+            std::fs::create_dir_all(fish.join("conf.d")).unwrap();
+            std::fs::write(fish.join("conf.d/kraal.fish"), format!("{block}\n")).unwrap();
+            let prompt = "set -g fish_greeting\nfunction fish_prompt\n    printf 'remote$ '\nend\n";
+            std::fs::write(fish.join("config.fish"), prompt).unwrap();
+            format!("env XDG_CONFIG_HOME={r}/.config XDG_DATA_HOME={r}/.local/share fish -i")
+        }
+    };
+    let export = |k: &str, v: &str| match shell {
+        "fish" => format!("set -gx {k} {v}"),
+        _ => format!("export {k}={v}"),
+    };
+    let login = env.root.join("login");
+    write_script(
+        &login,
+        &format!(
+            "#!/bin/sh\nexec env -i PATH=/usr/bin:/bin HOME={r} TERM=xterm-256color \
+             SSH_CONNECTION='10.0.0.1 50000 10.0.0.5 22' {start}\n"
+        ),
+    );
+    let bin = env.root.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    std::os::unix::fs::symlink(script, bin.join("ssh")).unwrap();
+    env.workspace("w", "layout {\n    pane name=\"ops\"\n}\n");
+    env.run(&["open", "w"]);
+    env.wait_for_text("ops", "$");
+    // `ssh -q -f -c <cipher> bastion`, as kraal reads it; `script` writes its log to ./bastion.
+    let connect = format!(
+        "cd {} && SHELL=/bin/sh {} -q -f -c {} bastion",
+        env.root.display(),
+        bin.join("ssh").display(),
+        login.display()
+    );
+    env.run(&["send", "-p", "ops", "--enter", &connect]);
+    wait_for_contexts(&env, "ops", &["⎈ prod-eks/payments"], Some("Kubernetes context prod-eks on bastion"));
+    assert_eq!(pane_json(&env, "ops")["server"], "bastion");
+    env.wait_for_text("ops", "remote$");
+    let out = env.try_run(&["send", "-p", "ops", "--enter", "echo hi"]);
+    assert!(String::from_utf8_lossy(&out.stderr).contains("is production"), "{}", String::from_utf8_lossy(&out.stderr));
+    // Another kubeconfig on the server: the next prompt says so.
+    env.run(&["send", "-p", "ops", "--production", "--enter", &export("KUBECONFIG", "$HOME/dev.yaml")]);
+    wait_for_contexts(&env, "ops", &["⎈ dev"], None);
+    // A command that runs and ends keeps it.
+    env.run(&["send", "-p", "ops", "--enter", "true"]);
+    env.run(&["send", "-p", "ops", "--enter", &export("AWS_PROFILE", "prd-admin")]);
+    wait_for_contexts(&env, "ops", &["⎈ dev", "aws:prd-admin"], Some("AWS profile prd-admin on bastion"));
+    // The session ends: what it reported goes with it.
+    env.run(&["send", "-p", "ops", "--production", "--enter", "exit"]);
+    wait_for_contexts(&env, "ops", &[], None);
+    assert!(pane_json(&env, "ops")["server"].is_null());
+    // A local shell's report is not taken: kraal reads local contexts itself.
+    env.run(&["send", "-p", "ops", "--enter", "printf '\\033]7701;context;k8s=prod-x\\007'; echo printed"]);
+    env.wait_for_text("ops", "printed");
+    std::thread::sleep(Duration::from_millis(1000));
+    wait_for_contexts(&env, "ops", &[], None);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn contexts_bash_reports_over_ssh_hold_until_the_session_ends() {
+    contexts_over_ssh_hold_until_the_session_ends("bash");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn contexts_zsh_reports_over_ssh_hold_until_the_session_ends() {
+    contexts_over_ssh_hold_until_the_session_ends("zsh");
+}
+
+/// fish 4 marks its prompts itself too: twice marked, a prompt keeps what was reported.
+#[cfg(target_os = "linux")]
+#[test]
+fn contexts_fish_reports_over_ssh_hold_until_the_session_ends() {
+    contexts_over_ssh_hold_until_the_session_ends("fish");
+}
+
 /// When a long paste turns out to go into production while its last pieces wait for a context
 /// read, the rest of it does not go, and neither does what was typed after it: an Enter would
 /// run the part of it that went.

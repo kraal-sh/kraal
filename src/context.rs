@@ -637,6 +637,78 @@ pub fn terraform_dir_workspace(dir: &Path, data_dir: Option<&str>) -> Option<Str
     Some(if ws.is_empty() { "default".into() } else { ws })
 }
 
+// ---- contexts reported over SSH ----------------------------------------------------------
+
+/// The longest name kraal takes from a report.
+pub const REPORTED_MAX: usize = 200;
+
+/// One context a shell reported.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum Reported<T> {
+    /// Nothing to report: no kubeconfig or no current context, not a Terraform directory, the
+    /// default AWS profile.
+    #[default]
+    None,
+    Known(T),
+    /// The shell could not tell (a kubeconfig it cannot read), or said something kraal does not
+    /// take. It may well be production.
+    Unknown,
+}
+
+impl<T> Reported<T> {
+    pub fn known(&self) -> Option<&T> {
+        match self {
+            Reported::Known(v) => Some(v),
+            _ => None,
+        }
+    }
+}
+
+/// What a shell on a server says it works on, at each prompt (`kraal integration show`): the
+/// contexts kraal reads itself for local panes. The text comes from the server: kraal only takes
+/// names made of a few safe characters, and never runs them.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RemoteContexts {
+    pub kube: Reported<KubeContext>,
+    pub terraform: Reported<String>,
+    pub aws: Reported<String>,
+}
+
+/// A name from a report: empty is none; `?`, a name longer than [`REPORTED_MAX`] or with other
+/// characters than ASCII letters, digits and `-_.:/@+` is unknown.
+fn reported_name(v: &str) -> Reported<String> {
+    let safe = |b: u8| b.is_ascii_alphanumeric() || b"-_.:/@+".contains(&b);
+    match v {
+        "" => Reported::None,
+        _ if v.len() <= REPORTED_MAX && v.bytes().all(safe) => Reported::Known(v.to_string()),
+        _ => Reported::Unknown,
+    }
+}
+
+impl RemoteContexts {
+    /// The fields of a report: `k8s=prod-eks;ns=payments;tf=prod;aws=ops`. A key left out is
+    /// none, a key given twice is unknown, and keys kraal does not know are skipped.
+    pub fn parse(fields: &str) -> RemoteContexts {
+        let mut values: HashMap<&str, Reported<String>> = HashMap::new();
+        for field in fields.split(';').filter(|f| !f.is_empty()).take(16) {
+            let (key, value) = field.split_once('=').unwrap_or((field, "?"));
+            let value = if values.contains_key(key) { Reported::Unknown } else { reported_name(value) };
+            values.insert(key, value);
+        }
+        let mut take = |key| values.remove(key).unwrap_or_default();
+        let (context, namespace) = (take("k8s"), take("ns"));
+        let kube = match (context, namespace) {
+            (Reported::Known(context), Reported::None) => Reported::Known(KubeContext { context, namespace: None }),
+            (Reported::Known(context), Reported::Known(ns)) => {
+                Reported::Known(KubeContext { context, namespace: Some(ns) })
+            }
+            (Reported::None, _) => Reported::None,
+            _ => Reported::Unknown,
+        };
+        RemoteContexts { kube, terraform: take("tf"), aws: take("aws") }
+    }
+}
+
 // ---- production --------------------------------------------------------------------------
 
 /// Whether a name says production: one of `words` is a whole word of it, ignoring case and
@@ -865,6 +937,43 @@ users:
         std::os::unix::fs::symlink("/dev/zero", dir.join(".terraform/environment")).unwrap();
         assert_eq!(terraform_dir_workspace(&dir, None), None);
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn reported_contexts_are_sanitized() {
+        let known = |s: &str| Reported::Known(s.to_string());
+        let kube = |c: &str, ns: Option<&str>| {
+            Reported::Known(KubeContext { context: c.into(), namespace: ns.map(String::from) })
+        };
+        let r = RemoteContexts::parse("k8s=prod-eks;ns=payments;tf=prod;aws=ops");
+        assert_eq!(r.kube, kube("prod-eks", Some("payments")));
+        assert_eq!((r.terraform, r.aws), (known("prod"), known("ops")));
+        // Empty is none; a namespace alone is no context.
+        let r = RemoteContexts::parse("k8s=;ns=payments;tf=;aws=");
+        assert_eq!(r, RemoteContexts::default());
+        assert_eq!(RemoteContexts::parse("k8s=dev").kube, kube("dev", None));
+        // What clouds and OpenShift name contexts.
+        let arn = "arn:aws:eks:eu-west-1:123456789012:cluster/prod-eks";
+        assert_eq!(RemoteContexts::parse(&format!("k8s={arn}")).kube, kube(arn, None));
+        let os = "payments/api-cluster-example-com:6443/admin@corp";
+        assert_eq!(RemoteContexts::parse(&format!("k8s={os}")).kube, kube(os, None));
+        // What the shell could not tell, or kraal does not take, is unknown: never "none".
+        assert_eq!(RemoteContexts::parse("k8s=?").kube, Reported::Unknown);
+        assert_eq!(RemoteContexts::parse("k8s=dev;ns=?").kube, Reported::Unknown, "a namespace not known");
+        for bad in ["a b", "a`id`", "$(id)", "x\u{1b}[31m", "é", "a|b", "a\\b", "a'b", "a\"b"] {
+            assert_eq!(RemoteContexts::parse(&format!("aws={bad}")).aws, Reported::Unknown, "{bad:?}");
+        }
+        let long = "a".repeat(REPORTED_MAX + 1);
+        assert_eq!(RemoteContexts::parse(&format!("tf={long}")).terraform, Reported::Unknown);
+        let longest = "a".repeat(REPORTED_MAX);
+        assert_eq!(RemoteContexts::parse(&format!("tf={longest}")).terraform, known(&longest));
+        // A key given twice is unknown, whichever comes first; a key without a value too.
+        assert_eq!(RemoteContexts::parse("aws=dev;aws=prod").aws, Reported::Unknown);
+        assert_eq!(RemoteContexts::parse("tf").terraform, Reported::Unknown);
+        // Keys kraal does not know, and empty fields, are skipped.
+        let r = RemoteContexts::parse(";;future=x;aws=ops;");
+        assert_eq!(r.aws, known("ops"));
+        assert_eq!(r.kube, Reported::None);
     }
 
     #[test]

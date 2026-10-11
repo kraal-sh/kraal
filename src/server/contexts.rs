@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use super::Server;
 use crate::config::ContextsConfig;
-use crate::context::{self, KubeContext, TfSeen};
+use crate::context::{self, KubeContext, RemoteContexts, Reported, TfSeen};
 use crate::layout::PaneId;
 use crate::pane::Pane;
 use crate::tools::ToolContext;
@@ -135,7 +135,130 @@ fn spec_env(pane: &Pane, name: &str) -> Option<String> {
     pane.spec.env.iter().find(|(k, _)| k == name).map(|(_, v)| v.clone())
 }
 
+/// The contexts a shell on a server reported, kept to those the config shows.
+fn shown(cfg: &ContextsConfig, r: &RemoteContexts) -> RemoteContexts {
+    let keep = |on: bool, v: &Reported<String>| if on { v.clone() } else { Reported::None };
+    RemoteContexts {
+        kube: if cfg.kubernetes { r.kube.clone() } else { Reported::None },
+        terraform: keep(cfg.terraform, &r.terraform),
+        aws: keep(cfg.aws, &r.aws),
+    }
+}
+
+/// Frame labels of contexts a shell on a server reported, as for a local pane's; what it could
+/// not tell is `?`, which may be production.
+fn reported_labels(r: &RemoteContexts, ascii: bool, words: &[String]) -> Vec<(String, bool)> {
+    let mut out = Vec::new();
+    match &r.terraform {
+        Reported::Known(ws) => out.push((format!("tf:{ws}"), context::names_production(ws, words))),
+        Reported::Unknown => out.push(("tf:?".into(), true)),
+        Reported::None => {}
+    }
+    match &r.kube {
+        Reported::Known(k) => {
+            let prod = context::names_production(&k.context, words)
+                || k.namespace.as_deref().is_some_and(|ns| context::names_production(ns, words));
+            out.push((k.label(ascii), prod));
+        }
+        Reported::Unknown => out.push((if ascii { "k8s:?" } else { "⎈ ?" }.to_string(), true)),
+        Reported::None => {}
+    }
+    match &r.aws {
+        Reported::Known(p) => out.push((format!("aws:{p}"), context::names_production(p, words))),
+        Reported::Unknown => out.push(("aws:?".into(), true)),
+        Reported::None => {}
+    }
+    out
+}
+
+/// Why contexts a shell on `server` reported may be production, if they may. Each reason is
+/// about that connection and what was reported: an approval given for one is not taken for
+/// another.
+fn reported_production(r: &RemoteContexts, server: &crate::servers::Server, words: &[String]) -> Option<Production> {
+    let on = if server.name.is_empty() { &server.host } else { &server.name };
+    let what = |about: String| format!("server {server:?} reported {about}");
+    match &r.kube {
+        Reported::Known(k) if context::names_production(&k.context, words) => {
+            return Some(Production::new(format!("Kubernetes context {} on {on}", k.context), what(format!("{k:?}"))));
+        }
+        Reported::Known(k) => {
+            if let Some(ns) = k.namespace.as_ref().filter(|ns| context::names_production(ns, words)) {
+                return Some(Production::new(
+                    format!("Kubernetes namespace {ns} in {} on {on}", k.context),
+                    what(format!("{k:?}")),
+                ));
+            }
+        }
+        Reported::Unknown => {
+            return Some(Production::new(format!("an unknown Kubernetes context on {on}"), what("kube ?".into())));
+        }
+        Reported::None => {}
+    }
+    match &r.terraform {
+        Reported::Known(ws) if context::names_production(ws, words) => {
+            return Some(Production::new(format!("Terraform workspace {ws} on {on}"), what(format!("tf {ws}"))));
+        }
+        Reported::Unknown => {
+            return Some(Production::new(format!("an unknown Terraform workspace on {on}"), what("tf ?".into())));
+        }
+        _ => {}
+    }
+    match &r.aws {
+        Reported::Known(p) if context::names_production(p, words) => {
+            Some(Production::new(format!("AWS profile {p} on {on}"), what(format!("aws {p}"))))
+        }
+        Reported::Unknown => Some(Production::new(format!("an unknown AWS profile on {on}"), what("aws ?".into()))),
+        _ => None,
+    }
+}
+
 impl Server {
+    /// A shell in pane `id` reported its contexts. They count over SSH only: they belong to the
+    /// `ssh` in the pane's foreground, and go with it. In a local pane, kraal reads the contexts
+    /// itself and the report is ignored.
+    pub(super) fn contexts_reported(&mut self, id: PaneId, contexts: RemoteContexts) {
+        // The first report can come before the scan that sees `ssh` start.
+        if let Some(argv) = self.panes.get(&id).filter(|p| p.ssh.is_none()).and_then(|p| p.foreground_argv())
+            && super::ssh::runs_ssh(&argv)
+        {
+            self.observe_ssh(id, &argv[1..]);
+        }
+        let Some(p) = self.panes.get_mut(&id) else { return };
+        let report = match p.foreground_pid() {
+            Some(session) if p.ssh.is_some() && p.exit_code.is_none() => Some((session, contexts)),
+            _ => None,
+        };
+        if p.reported != report {
+            p.reported = report;
+            self.mark_dirty();
+        }
+    }
+
+    /// Forget the contexts reported in panes whose SSH session ended: its `ssh` left the
+    /// foreground, or the pane's process exited.
+    pub(super) fn forget_ended_reports(&mut self) {
+        let mut changed = false;
+        for p in self.panes.values_mut() {
+            if let Some((session, _)) = &p.reported
+                && (p.ssh.is_none() || p.exit_code.is_some() || p.foreground_pid() != Some(*session))
+            {
+                p.reported = None;
+                changed = true;
+            }
+        }
+        if changed {
+            self.mark_dirty();
+        }
+    }
+
+    /// The contexts a shell over SSH reported in the pane, while its session lasts, as far as
+    /// the config shows them.
+    pub(super) fn pane_reported(&self, id: PaneId) -> Option<RemoteContexts> {
+        let p = self.panes.get(&id)?;
+        let (_, r) = p.reported.as_ref().filter(|_| p.ssh.is_some() && p.exit_code.is_none())?;
+        Some(shown(&self.config.contexts, r))
+    }
+
     fn pane_kubeconfig(&self, pane: &Pane) -> Option<String> {
         if !self.config.contexts.kubernetes || pane.ssh.is_some() {
             return None;
@@ -217,8 +340,13 @@ impl Server {
         )
     }
 
+    /// The Kubernetes context of the pane: that of its tools here, or the one its shell on a
+    /// server reported.
     pub fn pane_kube(&self, id: PaneId) -> Option<KubeContext> {
         let p = self.panes.get(&id)?;
+        if p.ssh.is_some() {
+            return self.pane_reported(id)?.kube.known().cloned();
+        }
         self.kube.get(&self.pane_kubeconfig(p)?)?.resolve(&p.seen.kube_flags)
     }
 
@@ -340,7 +468,10 @@ impl Server {
 
     pub fn pane_terraform(&self, id: PaneId) -> Option<String> {
         let p = self.panes.get(&id)?;
-        if !self.config.contexts.terraform || p.ssh.is_some() {
+        if p.ssh.is_some() {
+            return self.pane_reported(id)?.terraform.known().cloned();
+        }
+        if !self.config.contexts.terraform {
             return None;
         }
         let cwd = p.current_cwd();
@@ -412,7 +543,10 @@ impl Server {
 
     pub fn pane_aws(&self, id: PaneId) -> Option<String> {
         let p = self.panes.get(&id)?;
-        if !self.config.contexts.aws || p.ssh.is_some() {
+        if p.ssh.is_some() {
+            return self.pane_reported(id)?.aws.known().cloned();
+        }
+        if !self.config.contexts.aws {
             return None;
         }
         match &p.seen.aws_profile {
@@ -456,9 +590,12 @@ impl Server {
         if words.is_empty() {
             return None;
         }
+        // On a server, the server first, then what its shell reported.
         if let Some(s) = self.pane_server_entry(id) {
-            return context::server_production(&s, words)
-                .then(|| Production::new(format!("server {}", s.name), format!("server {s:?}")));
+            if context::server_production(&s, words) {
+                return Some(Production::new(format!("server {}", s.name), format!("server {s:?}")));
+            }
+            return self.pane_reported(id).and_then(|r| reported_production(&r, &s, words));
         }
         // A read that does not answer comes first: the context known before it may be gone.
         if let Some(stalled) = self.pane_kube_stalled(id) {
@@ -501,6 +638,9 @@ impl Server {
     pub fn context_labels(&self, id: PaneId) -> Vec<(String, bool)> {
         let ascii = crate::theme::current().ascii;
         let words = &self.config.production.words;
+        if let Some(r) = self.pane_reported(id) {
+            return reported_labels(&r, ascii, words);
+        }
         let mut out = Vec::new();
         if let Some(ws) = self.pane_terraform(id) {
             out.push((format!("tf:{ws}"), context::names_production(&ws, words)));
@@ -531,7 +671,7 @@ impl Server {
             kubeconfig: self.pane_kubeconfig(p),
             terraform: self.pane_terraform(id),
             aws_profile: self.pane_aws(id),
-            aws_default: matches!(p.seen.aws_profile, Some(None)),
+            aws_default: p.ssh.is_none() && matches!(p.seen.aws_profile, Some(None)),
             selection: p.selection_text(),
             production: self.pane_production(id).map(|p| p.why),
             extra: Vec::new(),
@@ -566,6 +706,50 @@ mod tests {
         assert_eq!(read.get(&dir(9999)), Some(&Some("prod".into())), "a Terraform directory stays");
         assert!(read.contains_key(&dir(10000)), "a wanted directory stays");
         assert_eq!(read.len(), 2, "the unused others go");
+    }
+
+    #[test]
+    fn contexts_reported_over_ssh_are_shown_and_guarded_like_local_ones() {
+        let words: Vec<String> = ["prod", "production", "prd"].map(String::from).to_vec();
+        let bastion = crate::servers::Server { name: "bastion".into(), host: "10.0.0.5".into(), ..Default::default() };
+        let r = RemoteContexts::parse("k8s=arn:aws:eks:eu-west-1:1:cluster/prod-eks;ns=payments;tf=blue;aws=ops");
+        assert_eq!(
+            reported_labels(&r, false, &words),
+            vec![("tf:blue".to_string(), false), ("⎈ prod-eks/payments".to_string(), true), ("aws:ops".into(), false)]
+        );
+        let why = reported_production(&r, &bastion, &words).unwrap();
+        assert_eq!(why.to_string(), "Kubernetes context arn:aws:eks:eu-west-1:1:cluster/prod-eks on bastion");
+        // A production namespace names its cluster; a workspace, a profile.
+        let r = RemoteContexts::parse("k8s=dev;ns=prod");
+        assert_eq!(
+            reported_production(&r, &bastion, &words).unwrap().to_string(),
+            "Kubernetes namespace prod in dev on bastion"
+        );
+        let r = RemoteContexts::parse("tf=prod;aws=ops");
+        assert_eq!(
+            reported_production(&r, &bastion, &words).unwrap().to_string(),
+            "Terraform workspace prod on bastion"
+        );
+        let r = RemoteContexts::parse("aws=prd-admin");
+        assert_eq!(reported_production(&r, &bastion, &words).unwrap().to_string(), "AWS profile prd-admin on bastion");
+        assert_eq!(reported_production(&RemoteContexts::parse("k8s=dev;tf=default;aws=ops"), &bastion, &words), None);
+        // What the server could not tell may be production: `?`, and asked about.
+        let r = RemoteContexts::parse("k8s=?;tf=?;aws=x y");
+        assert_eq!(
+            reported_labels(&r, true, &words),
+            vec![("tf:?".to_string(), true), ("k8s:?".to_string(), true), ("aws:?".to_string(), true)]
+        );
+        let why = reported_production(&r, &bastion, &words).unwrap();
+        assert_eq!(why.to_string(), "an unknown Kubernetes context on bastion");
+        // The same words on another server are another approval.
+        let other = crate::servers::Server { name: "bastion".into(), host: "10.0.0.6".into(), ..Default::default() };
+        let prod = RemoteContexts::parse("k8s=prod");
+        assert_ne!(reported_production(&prod, &bastion, &words), reported_production(&prod, &other, &words));
+        assert_eq!(reported_production(&prod, &bastion, &words), reported_production(&prod, &bastion, &words));
+        // Contexts the config hides are not reported either.
+        let cfg = ContextsConfig { kubernetes: false, terraform: true, aws: false };
+        let r = shown(&cfg, &RemoteContexts::parse("k8s=prod;tf=prod;aws=prod"));
+        assert_eq!((r.kube, r.terraform, r.aws), (Reported::None, Reported::Known("prod".into()), Reported::None));
     }
 
     #[test]

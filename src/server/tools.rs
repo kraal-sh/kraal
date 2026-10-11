@@ -60,13 +60,14 @@ impl Server {
     }
 
     /// Where a tool asked for in `pane` runs: its directory here, or its server and directory
-    /// there, with the kubeconfig and flags its commands use. A tool runs where it was asked
-    /// for or not at all: the pane may move while the tool is checked, or while its question
-    /// waits for an answer.
+    /// there, with the kubeconfig and flags its commands use, or the contexts its shell there
+    /// reported. A tool runs where it was asked for or not at all: the pane may move while the
+    /// tool is checked, or while its question waits for an answer.
     pub(super) fn tool_place(&self, pane: PaneId) -> String {
         let ctx = self.tool_context(pane);
         let flags = self.panes.get(&pane).map(|p| p.seen.kube_flags.clone());
-        format!("{:?}", (ctx.cwd, ctx.remote_cwd, ctx.server, ctx.kubeconfig, flags))
+        let reported = self.pane_reported(pane);
+        format!("{:?}", (ctx.cwd, ctx.remote_cwd, ctx.server, ctx.kubeconfig, flags, reported))
     }
 
     /// [`Server::tool_request`], `accepted` being the production reason the user already said yes

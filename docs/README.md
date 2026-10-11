@@ -12,7 +12,7 @@ New here? Start with the [README](../README.md): install, quick start and a tour
 | [Tools, contexts and hints](tools.md) | tools where the pane is, Kubernetes, Terraform and AWS contexts, hints |
 | [Production](production.md) | how kraal tells production panes, and what it asks before touching them |
 | [Runbooks](runbooks.md) | procedures as TOML steps or Markdown documents |
-| [Shell integration and images](terminal.md) | commands marked by your shell (OSC 133), images in panes |
+| [Shell integration and images](terminal.md) | commands marked by your shell (OSC 133), here and over SSH, images in panes |
 | [Scripting, events and hooks](scripting.md) | driving kraal from scripts and agents, the event stream, hooks |
 | [Configuration](configuration.md) | `config.toml`, reloading, themes |
 

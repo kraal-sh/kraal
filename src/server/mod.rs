@@ -817,7 +817,7 @@ impl Server {
             let before = pane.agent.state;
             let argv = pane.foreground_argv();
             if let Some(a) = &argv
-                && a.first().is_some_and(|c| c.rsplit('/').next() == Some("ssh"))
+                && ssh::runs_ssh(a)
             {
                 ssh_seen.push((id, a[1..].to_vec()));
             } else if argv.is_some() && pane.ssh.is_some() {
@@ -872,6 +872,7 @@ impl Server {
         }
         self.forget_ended_ssh(ssh_ended);
         self.tick_edits();
+        self.forget_ended_reports();
         self.diff_pane_states();
         self.hooks.reap();
         self.check_run_timeouts();
@@ -1031,6 +1032,7 @@ impl Server {
                     }
                 }
                 PaneSignal::CommandDone(done) => self.command_done(id, done),
+                PaneSignal::Contexts(contexts) => self.contexts_reported(id, contexts),
                 PaneSignal::Bell | PaneSignal::TitleChanged => {}
             }
         }

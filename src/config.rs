@@ -95,6 +95,7 @@ kubernetes = true
 # the Terraform workspace of panes in a directory where `terraform init` ran,
 terraform = true
 # and the AWS profile of panes that ran aws, terraform, cdk… with AWS_PROFILE set.
+# Over SSH, those the shell on the server reports (`kraal integration show <shell>` there).
 aws = true
 
 [production]

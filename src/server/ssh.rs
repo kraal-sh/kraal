@@ -167,6 +167,9 @@ impl Server {
         let known = servers::is_known(&self.known_servers, &s);
         if let Some(k) = self.known_servers.iter().find(|k| servers::is_known(std::slice::from_ref(k), &s)) {
             s.name = k.server.name.clone();
+        } else if s.name.is_empty() {
+            // Named as the inventory would name it, even when it is not added there.
+            s.name = servers::short_name(&s.host);
         }
         if let Some(p) = self.panes.get_mut(&pane)
             && p.ssh.as_ref().is_none_or(|old| !old.same_connection(&s))
@@ -269,6 +272,11 @@ impl Server {
         }
         Ok(removed)
     }
+}
+
+/// Whether a command line runs `ssh`.
+pub(super) fn runs_ssh(argv: &[String]) -> bool {
+    argv.first().is_some_and(|c| c.rsplit('/').next() == Some("ssh"))
 }
 
 /// The workspace of a group running `remote`: `journalctl -fu nginx` on @prod gets its own,
