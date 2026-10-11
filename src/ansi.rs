@@ -76,15 +76,22 @@ impl Encoder {
         };
 
         let mut updates: Vec<(u16, u16, &Cell)> = prev.diff(next);
-        // Cells whose link changed but whose text did not must be drawn again too.
+        // Cells whose link changed but whose text did not must be drawn again too. The second
+        // column of a wide character is drawn with it: its first column is redrawn instead.
         if !full && self.prev_links != *links {
             let have: std::collections::HashSet<(u16, u16)> = updates.iter().map(|(x, y, _)| (*x, *y)).collect();
+            let lead = |(x, y): (u16, u16)| {
+                let wide = x > 0 && unicode_width::UnicodeWidthStr::width(next[(x - 1, y)].symbol()) > 1;
+                if wide { (x - 1, y) } else { (x, y) }
+            };
             let mut extra: Vec<(u16, u16)> = links
                 .iter()
                 .filter(|(pos, uri)| self.prev_links.get(pos) != Some(uri))
                 .map(|(pos, _)| *pos)
                 .chain(self.prev_links.keys().filter(|pos| !links.contains_key(pos)).copied())
-                .filter(|pos| !have.contains(pos) && next.area.contains((pos.0, pos.1).into()))
+                .filter(|pos| next.area.contains((pos.0, pos.1).into()))
+                .map(lead)
+                .filter(|pos| !have.contains(pos))
                 .collect();
             extra.sort_unstable();
             extra.dedup();
@@ -96,6 +103,10 @@ impl Encoder {
         let mut at: Option<(u16, u16)> = None;
         let mut link: Option<&Arc<str>> = None;
         for (x, y, cell) in updates {
+            // Covered by the wide character just drawn.
+            if at.is_some_and(|(ax, ay)| ay == y && x < ax) {
+                continue;
+            }
             let want = links.get(&(x, y));
             if want != link {
                 if link.is_some() {
@@ -336,6 +347,24 @@ mod tests {
         enc.encode(&buf, None, &Links::new(), &mut out);
         let s = text(&out);
         assert!(s.contains("here") && !s.contains("example.org"), "{s:?}");
+    }
+
+    #[test]
+    fn a_new_link_on_a_wide_character_keeps_it_whole() {
+        let area = Rect::new(0, 0, 6, 1);
+        let mut buf = Buffer::empty(area);
+        buf.set_string(0, 0, "日x", Style::default());
+        let link = |uri: &str| {
+            let uri: Arc<str> = Arc::from(uri);
+            Links::from([((0, 0), uri.clone()), ((1, 0), uri)])
+        };
+        let mut enc = Encoder::new();
+        enc.encode(&buf, None, &link("https://a.example"), &mut Vec::new());
+        let mut out = Vec::new();
+        enc.encode(&buf, None, &link("https://b.example"), &mut out);
+        let s = text(&out);
+        assert!(s.contains("b.example\x1b\\\x1b[1;1H日"), "{s:?}");
+        assert!(!s.contains("\x1b[1;2H"), "nothing is written over its second column: {s:?}");
     }
 
     #[test]
