@@ -45,8 +45,8 @@ waiting for you.
 - **Runbooks that stop at the first failure.** Procedures kept as files run server by server
   after showing their plan, and log everything. Your Markdown docs run block by block.
 - **Close the terminal, keep working.** Sessions keep running when the window closes or the
-  connection drops. After a reboot, kraal rebuilds the layout, reconnects SSH shells and resumes
-  agent conversations.
+  connection drops. After a reboot, kraal rebuilds the layout with each pane's scrollback,
+  reconnects SSH shells and resumes agent conversations.
 - **One binary, any modern terminal.** Linux and macOS. The kitty keyboard protocol (Shift+Enter
   reaches Claude Code), images in panes (kitty graphics and sixel), shell integration, the mouse.
 

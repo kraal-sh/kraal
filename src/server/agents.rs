@@ -287,12 +287,13 @@ impl Server {
         self.switches.retain(|p, _| panes.contains_key(p));
         for id in ids {
             let Some(a) = self.pane_account(id) else { continue };
-            // Limit messages on screen are the freshest signal there is.
+            // Limit messages on screen are the freshest signal there is (one saved before a
+            // restart is not).
             let screen_limit = self
                 .panes
                 .get(&id)
                 .filter(|p| p.exit_code.is_none())
-                .and_then(|p| accounts::limit_from_screen(&p.text(None)));
+                .and_then(|p| accounts::limit_from_screen(&p.live_text()));
             // A message counts once, when it appears or changes: one left on screen neither
             // renews a window that has reset nor holds a lower figure seen since.
             let fresh = match screen_limit {

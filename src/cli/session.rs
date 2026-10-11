@@ -30,10 +30,20 @@ pub(super) fn forget(s: &Session) -> Result<()> {
         bail!("session {session} is running; `kraal kill` it first");
     }
     let p = paths::session_state_path(session);
-    match std::fs::remove_file(&p) {
-        Ok(()) => println!("forgot {}", p.display()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => println!("nothing saved for {session}"),
+    let state = match std::fs::remove_file(&p) {
+        Ok(()) => true,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
         Err(e) => return Err(e.into()),
+    };
+    let scrollback = crate::persist::forget_scrollback(session)?;
+    if state {
+        println!("forgot {}", p.display());
+    }
+    if scrollback {
+        println!("forgot {}", paths::scrollback_dir(session).display());
+    }
+    if !state && !scrollback {
+        println!("nothing saved for {session}");
     }
     Ok(())
 }

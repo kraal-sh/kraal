@@ -399,6 +399,11 @@ pub fn session_state_path(session: &str) -> PathBuf {
     state_dir().join("sessions").join(format!("{session}.json"))
 }
 
+/// Where the panes' saved scrollback of `session` goes, one file per pane.
+pub fn scrollback_dir(session: &str) -> PathBuf {
+    state_dir().join("scrollback").join(session)
+}
+
 pub fn log_path(session: &str) -> PathBuf {
     state_dir().join(format!("server-{session}.log"))
 }
