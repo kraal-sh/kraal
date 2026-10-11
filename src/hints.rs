@@ -28,7 +28,7 @@ pub enum Kind {
 }
 
 impl Kind {
-    /// What Shift+label does, for the status bar.
+    /// What Shift+label does, for the top bar.
     pub fn action(self) -> &'static str {
         match self {
             Kind::Url => "open",

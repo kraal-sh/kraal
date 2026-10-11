@@ -1,4 +1,4 @@
-//! Composes what one client sees: tab bar, sidebar, panes with frames, status bar, overlays.
+//! Composes what one client sees: the sidebar, the top bar, panes in their frames, overlays.
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
@@ -24,6 +24,21 @@ pub enum BarItem {
     Workspace,
     Tab(usize),
     NewTab,
+    /// A label a click does nothing on.
+    Text,
+}
+
+/// One row of the sidebar.
+enum SideRow {
+    /// The line that opens a section, with its name.
+    Section(&'static str),
+    /// A row of an entry: what clicking it does, and whether it is the current one.
+    Entry {
+        item: Option<SideItem>,
+        line: Line<'static>,
+        selected: bool,
+    },
+    Blank,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -50,14 +65,13 @@ impl Server {
         let rows = c.rows;
         let cols = c.cols;
 
-        self.draw_tab_bar(id, &mut buf);
         let sw = if sidebar { self.sidebar_width(cols) } else { 0 };
         if sw > 0 {
-            self.draw_sidebar(id, Rect::new(0, 1, sw, rows - 2), &mut buf);
+            self.draw_sidebar(id, Rect::new(0, 0, sw, rows), &mut buf);
         }
+        self.draw_top_bar(id, &mut buf);
         let mut links = crate::ansi::Links::new();
         let mut cursor = self.draw_panes(id, &mut buf, &mut links);
-        self.draw_status(id, Rect::new(0, rows - 1, cols, 1), &mut buf);
 
         let c = &self.clients[&id];
         let overlay_cursor = match &c.mode {
@@ -115,10 +129,14 @@ impl Server {
             Mode::Leader { .. } | Mode::Help { .. } | Mode::Messages { .. } | Mode::Confirm(_) | Mode::Hints(_) => {
                 cursor = None
             }
-            Mode::Search { query, .. } => {
-                // After the badge, " " and "/" in the status bar.
-                let x = (c.mode.label().len() as u16 + 4 + query.width() as u16).min(c.cols.saturating_sub(1));
-                cursor = Some(Cursor { x, y: c.rows - 1, shape: crate::ansi::CursorShape::Bar, blinking: true });
+            Mode::Search { .. } => {
+                // After the query, in the top bar.
+                cursor = self.top_bar(c).cursor.map(|x| Cursor {
+                    x: x.min(c.cols.saturating_sub(1)),
+                    y: 0,
+                    shape: crate::ansi::CursorShape::Bar,
+                    blinking: true,
+                });
             }
             _ => {}
         }
@@ -135,9 +153,9 @@ impl Server {
     /// Where a pane's content is drawn for a client.
     pub(super) fn pane_inner_rect(&self, id: ClientId, pane: PaneId) -> Option<Rect> {
         let wi = self.ws_index(self.clients.get(&id)?.workspace)?;
-        let (_, outer, _) =
+        let (_, outer, floating) =
             self.tab_rects(self.workspaces[wi].tab(), self.layout_area).into_iter().find(|(p, _, _)| *p == pane)?;
-        Some(self.inner(outer))
+        Some(self.inner(outer, floating))
     }
 
     /// Hint labels over the matches of `pane`: the label on the first cells, the rest of the
@@ -146,10 +164,11 @@ impl Server {
         let c = &self.clients[&id];
         let Some(wi) = self.ws_index(c.workspace) else { return };
         let tab = self.workspaces[wi].tab();
-        let Some((_, outer, _)) = self.tab_rects(tab, self.layout_area).into_iter().find(|(p, _, _)| *p == pane) else {
+        let Some((_, outer, floating)) = self.tab_rects(tab, self.layout_area).into_iter().find(|(p, _, _)| *p == pane)
+        else {
             return;
         };
-        let inner = self.inner(outer).intersection(buf.area);
+        let (_, inner) = self.placed(outer, floating, buf.area);
         let typed = typed.to_ascii_lowercase();
         let label_style = Style::default().fg(Color::Black).bg(Color::Yellow).add_modifier(Modifier::BOLD);
         for h in hints {
@@ -180,35 +199,70 @@ impl Server {
         }
     }
 
-    // ---- tab bar ----------------------------------------------------------------------
+    // ---- top bar ----------------------------------------------------------------------
 
-    /// Clickable items of the tab bar with their column ranges and labels. When the tabs do not
-    /// fit, the active one stays in view and the hidden ones are counted at the edges.
-    pub fn tab_bar_items(&self, c: &Client) -> Vec<(u16, u16, BarItem, Vec<Span<'static>>)> {
-        let mut out = Vec::new();
-        let Some(wi) = self.ws_index(c.workspace) else { return out };
+    /// The one bar, on the first row, right of the sidebar. Left: the workspace when there is no
+    /// sidebar to show it, a broadcast in progress (never hidden), then the tabs, or the keys of
+    /// the mode in use instead. Right: a message, what the focused pane works on when it has no
+    /// frame, agents across workspaces, the menu key, and the session unless it is the default
+    /// one. When room runs out, the right side gives way first.
+    pub fn top_bar(&self, c: &Client) -> TopBar {
+        let mut bar = TopBar::default();
+        let Some(wi) = self.ws_index(c.workspace) else { return bar };
         let ws = &self.workspaces[wi];
-        let mut x = 0u16;
-        let badge = format!(" {} ", crate::text::truncate(&ws.name, 20));
-        let w = badge.width() as u16;
-        out.push((
-            x,
-            w,
-            BarItem::Workspace,
-            vec![Span::styled(badge, Style::default().fg(Color::Black).bg(th().accent).add_modifier(Modifier::BOLD))],
-        ));
-        x += w + 1;
-        let mut tabs: Vec<(u16, Vec<Span<'static>>)> = Vec::new();
+        let cols = c.cols;
+        let sw = if self.sidebar_shown(c) { self.sidebar_width(cols) } else { 0 };
+        let mut x = if sw > 0 { sw + 1 } else { 0 };
+        if sw == 0 {
+            // A broadcast in progress always shows, if need be with a shorter workspace name.
+            let broadcasting = ws.sync != super::SyncScope::Off && ws.tab().focus.is_some();
+            let name_room = if broadcasting { (cols as usize / 4).clamp(1, 20) } else { 20 };
+            let name = format!(" {} ", crate::text::truncate(&ws.name, name_room));
+            let w = name.width() as u16;
+            let style = Style::default().fg(th().accent).add_modifier(Modifier::BOLD);
+            bar.items.push((x, w, BarItem::Workspace, vec![Span::styled(name, style)]));
+            x += w + 1;
+        }
+        let room = cols.saturating_sub(x).min(cols / 2 + 8);
+        if let Some(spans) = self.broadcast_spans(c, room) {
+            let w = spans_width(&spans).min(cols.saturating_sub(x));
+            bar.items.push((x, w, BarItem::Text, spans));
+            x += w + 1;
+        }
+        if let Some((spans, cursor)) = self.mode_spans(c, cols.saturating_sub(x)) {
+            let w = spans_width(&spans).min(cols.saturating_sub(x));
+            bar.cursor = cursor.map(|at| x.saturating_add(at));
+            bar.items.push((x, w, BarItem::Text, spans));
+            bar.right = self.bar_right(c, cols.saturating_sub(x + w + 1));
+            return bar;
+        }
+        let tabs = self.tab_labels(ws);
+        // The active tab keeps its room, with the counts of hidden ones around it.
+        let active = tabs.get(ws.active).map_or(0, |t| t.0);
+        bar.right = self.bar_right(c, cols.saturating_sub(x + active + 9));
+        let limit = cols.saturating_sub(spans_width(&bar.right) + 1);
+        place_tabs(&mut bar.items, x, limit, tabs, ws.active);
+        bar
+    }
+
+    /// The label of each tab with its width: number and name (the active tab filled in), then the
+    /// strongest agent state, zoom, broadcast, a bell. A tab with a production pane is red.
+    fn tab_labels(&self, ws: &super::Workspace) -> Vec<(u16, Vec<Span<'static>>)> {
+        let mut tabs = Vec::new();
         for (i, tab) in ws.tabs.iter().enumerate() {
             let active = i == ws.active;
+            let prod = tab.panes().iter().any(|p| self.pane_production_shown(*p).is_some());
             let mut spans = Vec::new();
-            let base = if active {
-                Style::default().fg(Color::Black).bg(Color::Gray).add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(Color::Gray)
+            let base = match (active, prod) {
+                (true, true) => Style::default().fg(Color::Black).bg(th().production).add_modifier(Modifier::BOLD),
+                (true, false) => Style::default().fg(Color::Black).bg(th().accent).add_modifier(Modifier::BOLD),
+                (false, true) => Style::default().fg(th().production),
+                (false, false) => Style::default().fg(Color::Gray),
             };
-            spans.push(Span::styled(format!(" {} ", i + 1), base.fg(if active { Color::Black } else { th().dim })));
-            spans.push(Span::styled(crate::text::truncate(&self.tab_label(tab), 24), base));
+            let number = if active || prod { base } else { base.fg(th().dim) };
+            spans.push(Span::styled(format!(" {} ", i + 1), number));
+            spans.push(Span::styled(format!("{} ", crate::text::truncate(&self.tab_label(tab), 24)), base));
+            let mark = |text: &str, color: Color| Span::styled(format!(" {text}"), Style::default().fg(color));
             // Strongest agent state of the tab.
             let state = tab
                 .panes()
@@ -224,10 +278,10 @@ impl Server {
                 });
             if let Some(s) = state.filter(|s| matches!(s, AgentState::Blocked | AgentState::Done | AgentState::Working))
             {
-                spans.push(Span::styled(format!(" {}", th().icon(s)), base.fg(th().state_color(s))));
+                spans.push(mark(th().icon(s), th().state_color(s)));
             }
             if tab.zoom.is_some() {
-                spans.push(Span::styled(" Z", base.fg(Color::LightBlue)));
+                spans.push(mark("Z", Color::LightBlue));
             }
             let synced = match ws.sync {
                 super::SyncScope::Tab => active,
@@ -236,62 +290,207 @@ impl Server {
                 super::SyncScope::Off => false,
             };
             if synced {
-                spans.push(Span::styled(" S", base.fg(th().sync)));
+                spans.push(mark("S", th().sync));
             }
             if tab.panes().iter().any(|p| self.panes.get(p).is_some_and(|p| p.bell)) && !active {
-                spans.push(Span::styled(" !", base.fg(Color::Red)));
+                spans.push(mark("!", Color::Red));
             }
-            spans.push(Span::styled(" ", base));
-            let w: u16 = spans.iter().map(|s| s.content.width() as u16).sum();
-            tabs.push((w, spans));
+            tabs.push((spans_width(&spans), spans));
         }
-        // The window of tabs shown: the active one, then neighbours while they fit.
-        let limit = c.cols.saturating_sub(self.tab_bar_right_width() + 1);
-        let room = limit.saturating_sub(x + 4);
-        let active = ws.active.min(tabs.len().saturating_sub(1));
-        let (mut lo, mut hi) = (active, active);
-        let mut used = tabs.get(active).map_or(0, |t| t.0 + 1);
-        loop {
-            let marks = |lo: usize, hi: usize| if lo > 0 { 4 } else { 0 } + if hi + 1 < tabs.len() { 4 } else { 0 };
-            let mut grew = false;
-            if hi + 1 < tabs.len() && used + tabs[hi + 1].0 + 1 + marks(lo, hi + 1) <= room {
-                hi += 1;
-                used += tabs[hi].0 + 1;
-                grew = true;
+        tabs
+    }
+
+    /// A broadcast in progress, within `room` columns: how many panes get the keys, how many of
+    /// them are production panes, and how to stop. With less room the shortcut and the words go
+    /// first; the count and PROD stay.
+    fn broadcast_spans(&self, c: &Client, room: u16) -> Option<Vec<Span<'static>>> {
+        let ws = self.ws_index(c.workspace).map(|i| &self.workspaces[i])?;
+        if ws.sync == super::SyncScope::Off {
+            return None;
+        }
+        let targets = ws.sync_targets(ws.tab().focus?);
+        let n = targets.len();
+        let prod = targets.iter().filter(|p| self.pane_production_shown(**p).is_some()).count();
+        let prod_text = if prod > 0 { format!(", {prod} PROD") } else { String::new() };
+        let full = format!("BROADCAST → {n} pane{}{prod_text}", if n == 1 { "" } else { "s" });
+        let stop = self.keymap.hint(Action::BroadcastOff).or_else(|| self.keymap.hint(Action::BroadcastToggle));
+        let stop_w = stop.as_ref().map_or(0, |k| k.width() + " stop".len());
+        let room = room as usize;
+        let tiny = format!("B{n}{}", if prod > 0 { " PROD" } else { "" });
+        let what =
+            [full, format!("BROADCAST {n}{prod_text}")].into_iter().find(|w| w.width() + 2 <= room).unwrap_or(tiny);
+        let color = if prod > 0 { th().production } else { th().sync };
+        let mut out = vec![badge_span(&what, color)];
+        if let Some(stop) = stop.filter(|_| what.width() + 3 + stop_w <= room) {
+            out.push(Span::raw(" "));
+            out.extend(key_list(&[(&stop, "stop")]));
+        }
+        Some(out)
+    }
+
+    /// The keys of the mode in use, shown in place of the tabs within `room` columns; for a
+    /// search, also the column of its cursor. The leader menu, pickers and dialogs say what they
+    /// are themselves.
+    fn mode_spans(&self, c: &Client, room: u16) -> Option<(Vec<Span<'static>>, Option<u16>)> {
+        let t = th();
+        let label = c.mode.label();
+        let mut out = Vec::new();
+        let mut cursor = None;
+        match &c.mode {
+            Mode::Resize => {
+                out.push(badge_span(label, t.accent));
+                out.push(Span::raw(" "));
+                out.extend(key_list(&[("←↓↑→", "resize"), ("⏎", "done"), ("esc", "done")]));
             }
-            if lo > 0 && used + tabs[lo - 1].0 + 1 + marks(lo - 1, hi) <= room {
-                lo -= 1;
-                used += tabs[lo].0 + 1;
-                grew = true;
+            Mode::Scroll => {
+                out.push(badge_span(label, t.working));
+                out.push(Span::raw(" "));
+                out.extend(key_list(&[
+                    ("arrows", "move"),
+                    ("v", "select"),
+                    ("y", "copy"),
+                    ("/", "search"),
+                    ("esc", "exit"),
+                ]));
             }
-            if !grew {
-                break;
+            Mode::Search { query, found } => {
+                out.push(badge_span(label, t.working));
+                out.push(Span::raw(" "));
+                out.push(Span::styled("/", Style::default().fg(t.working).add_modifier(Modifier::BOLD)));
+                // A long query shows its end, where the typing is.
+                let shown = (room as usize / 2).saturating_sub(spans_width(&out) as usize).max(8);
+                out.push(Span::raw(crate::text::truncate_start(query, shown)));
+                cursor = Some(spans_width(&out));
+                out.push(Span::raw("  "));
+                if !query.is_empty() && !found {
+                    out.push(Span::styled("no match", Style::default().fg(t.production)));
+                } else {
+                    out.extend(key_list(&[("↑↓", "older/newer"), ("⏎", "keep"), ("esc", "cancel")]));
+                }
+            }
+            Mode::Hints(crate::server::ui::HintsMode { hints, act, .. }) => {
+                out.push(badge_span(if *act { "HINTS: ACT" } else { "HINTS: COPY" }, t.blocked));
+                out.push(Span::raw(" "));
+                if *act {
+                    let mut acts: Vec<&str> = Vec::new();
+                    for h in hints {
+                        let a = h.m.kind.action();
+                        if !acts.contains(&a) {
+                            acts.push(a);
+                        }
+                    }
+                    out.push(dim_span(&format!("type a label to {} · ", acts.join(", "))));
+                    out.extend(key_list(&[("tab", "copy instead"), ("esc", "cancel")]));
+                } else {
+                    out.push(dim_span("type a label to copy it · "));
+                    out.extend(key_list(&[("tab", "act on it instead"), ("esc", "cancel")]));
+                }
+            }
+            _ => return None,
+        }
+        Some((out, cursor))
+    }
+
+    /// The right side of the top bar, within `room` columns, most important first: a message,
+    /// the focused pane's details, agents, the menu key, the session. A message too long is cut;
+    /// the other pieces show whole or not at all.
+    fn bar_right(&self, c: &Client, room: u16) -> Vec<Span<'static>> {
+        let t = th();
+        let normal = matches!(c.mode, Mode::Normal);
+        let waiting = self.attention_queue().len();
+        let mut notice = Vec::new();
+        if let Some((msg, _)) = &c.toast {
+            notice.push(Span::styled(msg.clone(), Style::default().fg(t.blocked)));
+        } else if normal && c.welcome && waiting == 0 {
+            // Until the menu is opened once.
+            notice.push(Span::styled("Welcome to kraal", Style::default().fg(t.accent).add_modifier(Modifier::BOLD)));
+            let find = self.keymap.hint(Action::CommandPalette);
+            let help = self.keymap.hint(Action::Help);
+            let list: Vec<(&str, &str)> = [(find.as_deref(), "find any command"), (help.as_deref(), "help")]
+                .into_iter()
+                .filter_map(|(k, what)| Some((k?, what)))
+                .collect();
+            if !list.is_empty() {
+                notice.push(Span::raw("  "));
+                notice.extend(key_list(&list));
+            }
+        } else if normal && waiting > 0 {
+            notice.push(Span::styled(
+                format!(
+                    "{} {waiting} agent{} need{} you",
+                    t.icon(AgentState::Blocked),
+                    if waiting == 1 { "" } else { "s" },
+                    if waiting == 1 { "s" } else { "" }
+                ),
+                Style::default().fg(t.blocked),
+            ));
+            if let Some(k) = self.keymap.hint(Action::NextAttention) {
+                notice.push(Span::raw(" "));
+                notice.extend(key_list(&[(&k, "go")]));
             }
         }
-        let more = |n: usize, left: bool| {
-            let text = if left { format!("‹{n} ") } else { format!(" {n}›") };
-            vec![Span::styled(text, Style::default().fg(th().dim))]
+        let menu = if normal { key_list(&[(&self.keymap.prefix_label(), "menu")]) } else { Vec::new() };
+        let session = if self.session == "main" {
+            Vec::new()
+        } else {
+            vec![Span::styled(self.session.clone(), Style::default().fg(t.dim))]
         };
-        if lo > 0 {
-            out.push((x, 3, BarItem::Tab(lo - 1), more(lo, true)));
-            x += 4;
+        let mut pieces = [notice, self.focused_details(c), self.agent_counts(), menu, session];
+        // Two columns between pieces, one free at the right edge.
+        let room = room.saturating_sub(1);
+        let mut used = 0u32;
+        let mut keep = [false; 5];
+        for (i, p) in pieces.iter_mut().enumerate() {
+            if p.is_empty() {
+                continue;
+            }
+            let gap = if used > 0 { 2 } else { 0 };
+            if i == 0 && spans_width(p) > room && room >= 12 {
+                *p = fit_spans(std::mem::take(p), room);
+            }
+            let w = u32::from(spans_width(p));
+            if used + gap + w <= u32::from(room) {
+                keep[i] = true;
+                used += gap + w;
+            }
         }
-        for (i, (w, spans)) in tabs.into_iter().enumerate().skip(lo).take(hi + 1 - lo) {
-            out.push((x, w, BarItem::Tab(i), spans));
-            x += w + 1;
+        let mut out = Vec::new();
+        for (p, kept) in pieces.into_iter().zip(keep) {
+            if kept {
+                if !out.is_empty() {
+                    out.push(Span::raw("  "));
+                }
+                out.extend(p);
+            }
         }
-        if hi + 1 < ws.tabs.len() {
-            out.push((x, 3, BarItem::Tab(hi + 1), more(ws.tabs.len() - hi - 1, false)));
-            x += 4;
-        }
-        if x + 3 <= limit {
-            out.push((x, 3, BarItem::NewTab, vec![Span::styled(" + ", Style::default().fg(th().dim))]));
+        if !out.is_empty() {
+            out.push(Span::raw(" "));
         }
         out
     }
 
-    /// The right side of the tab bar: agents across all workspaces, then the session name.
-    fn tab_bar_right(&self) -> Vec<Span<'static>> {
+    /// What the focused pane works on, when it has no frame to show it (pane frames off).
+    fn focused_details(&self, c: &Client) -> Vec<Span<'static>> {
+        let Some(wi) = self.ws_index(c.workspace) else { return Vec::new() };
+        let tab = self.workspaces[wi].tab();
+        let Some(f) = tab.focus else { return Vec::new() };
+        let Some((_, outer, floating)) = self.tab_rects(tab, self.layout_area).into_iter().find(|(p, ..)| *p == f)
+        else {
+            return Vec::new();
+        };
+        if floating || self.inner(outer, false).y > outer.y {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        if self.pane_production_shown(f).is_some() {
+            out.push(badge_span("PROD", th().production));
+        }
+        out.extend(self.pane_details(f));
+        out
+    }
+
+    /// Agents across all workspaces: how many are blocked, done and working.
+    fn agent_counts(&self) -> Vec<Span<'static>> {
         let (mut blocked, mut working, mut done) = (0, 0, 0);
         for p in self.panes.values() {
             match p.agent.state {
@@ -301,228 +500,257 @@ impl Server {
                 _ => {}
             }
         }
-        let mut right: Vec<Span<'static>> = Vec::new();
+        let mut out: Vec<Span<'static>> = Vec::new();
         for (n, s) in [(blocked, AgentState::Blocked), (done, AgentState::Done), (working, AgentState::Working)] {
             if n > 0 {
-                right.push(Span::styled(
-                    format!("{}{n} ", th().icon(s)),
+                if !out.is_empty() {
+                    out.push(Span::raw(" "));
+                }
+                out.push(Span::styled(
+                    format!("{}{n}", th().icon(s)),
                     Style::default().fg(th().state_color(s)).add_modifier(Modifier::BOLD),
                 ));
             }
         }
-        right.push(Span::styled(format!(" {} ", self.session), Style::default().fg(th().dim)));
-        right
-    }
-
-    fn tab_bar_right_width(&self) -> u16 {
-        self.tab_bar_right().iter().map(|s| s.content.width() as u16).sum()
+        out
     }
 
     pub fn tab_bar_hit(&self, id: ClientId, col: u16) -> Option<BarItem> {
         let c = self.clients.get(&id)?;
-        self.tab_bar_items(c).into_iter().find(|(x, w, ..)| col >= *x && col < x + w).map(|(_, _, item, _)| item)
+        self.top_bar(c).items.into_iter().find(|(x, w, ..)| col >= *x && col < x + w).map(|(_, _, item, _)| item)
     }
 
-    fn draw_tab_bar(&self, id: ClientId, buf: &mut Buffer) {
+    fn draw_top_bar(&self, id: ClientId, buf: &mut Buffer) {
         let c = &self.clients[&id];
-        let width = c.cols;
-        for (x, w, _, spans) in self.tab_bar_items(c) {
+        let bar = self.top_bar(c);
+        for (x, w, _, spans) in bar.items {
             buf.set_line(x, 0, &Line::from(spans), w);
         }
-        let right = self.tab_bar_right();
-        let rw: u16 = right.iter().map(|s| s.content.width() as u16).sum();
-        if rw < width {
-            buf.set_line(width - rw, 0, &Line::from(right), rw);
+        let rw = spans_width(&bar.right);
+        if rw > 0 && rw < c.cols {
+            buf.set_line(c.cols - rw, 0, &Line::from(bar.right), rw);
         }
     }
 
     // ---- sidebar ----------------------------------------------------------------------
 
-    /// Sidebar lines, top to bottom, with what clicking each one does.
-    pub fn sidebar_rows(&self, c: &Client) -> Vec<(Option<SideItem>, Line<'static>)> {
-        let mut rows = Vec::new();
-        rows.push((
-            None,
-            Line::from(Span::styled(" WORKSPACES", Style::default().fg(th().dim).add_modifier(Modifier::BOLD))),
-        ));
+    /// The sidebar's rows from the top of the screen, `height` rows in all. Each section opens on
+    /// a line that carries its name, the first one on the top border; its entries take two rows,
+    /// a name after a state dot and a detail below. Accounts sit at the bottom when there is room.
+    fn sidebar_rows(&self, c: &Client, height: u16) -> Vec<SideRow> {
+        let t = th();
+        let mut rows = vec![SideRow::Section("WORKSPACES")];
+        let entry = |rows: &mut Vec<SideRow>,
+                     item: SideItem,
+                     dot: Span<'static>,
+                     name: Span<'static>,
+                     detail: Span<'static>,
+                     selected: bool| {
+            rows.push(SideRow::Entry { item: Some(item.clone()), line: Line::from(vec![dot, name]), selected });
+            rows.push(SideRow::Entry { item: Some(item), line: Line::from(vec![Span::raw("   "), detail]), selected });
+        };
+        let dot = |icon: &str, color: Color| Span::styled(format!(" {icon} "), Style::default().fg(color));
+        let strong = |text: String| Span::styled(text, Style::default().fg(t.text).add_modifier(Modifier::BOLD));
+        let faint = |text: String, color: Color| Span::styled(text, Style::default().fg(color));
+        let plural = |n: usize, what: &str| format!("{n} {what}{}", if n == 1 { "" } else { "s" });
+        let sep = if t.ascii { " - " } else { " · " };
+        let urgency = |s: &AgentState| match s {
+            AgentState::Blocked => 4,
+            AgentState::Done => 3,
+            AgentState::Working => 2,
+            AgentState::Idle => 1,
+            AgentState::Unknown => 0,
+        };
+
+        // Workspaces: open ones with their most urgent agent, then those defined but not running.
+        let mut agents = Vec::new();
         for ws in &self.workspaces {
-            let current = ws.id == c.workspace;
             let panes = ws.panes();
-            let agents: Vec<PaneId> =
-                panes.iter().copied().filter(|p| self.panes.get(p).is_some_and(|p| p.agent.kind.is_some())).collect();
-            let mut spans = vec![
-                Span::styled(
-                    if current { format!(" {} ", th().pointer()) } else { "   ".into() },
-                    Style::default().fg(th().accent),
-                ),
-                Span::styled(
-                    ws.name.clone(),
-                    if current {
-                        Style::default().add_modifier(Modifier::BOLD)
-                    } else {
-                        Style::default().fg(Color::Gray)
-                    },
-                ),
-            ];
-            for s in [AgentState::Blocked, AgentState::Done] {
-                let n = agents.iter().filter(|p| self.panes[p].agent.state == s).count();
-                if n > 0 {
-                    spans.push(Span::styled(
-                        format!(" {}{n}", th().icon(s)),
-                        Style::default().fg(th().state_color(s)).add_modifier(Modifier::BOLD),
-                    ));
-                }
-            }
-            rows.push((Some(super::render::SideItem::Workspace(ws.id)), Line::from(spans)));
-            for p in agents {
+            let states: Vec<(PaneId, AgentState)> = panes
+                .iter()
+                .filter_map(|p| {
+                    self.panes.get(p).filter(|pane| pane.agent.kind.is_some()).map(|pane| (*p, pane.agent.state))
+                })
+                .collect();
+            let (icon, color) = match states.iter().map(|(_, s)| *s).max_by_key(urgency) {
+                Some(s) => (t.icon(s), t.state_color(s)),
+                None => (t.icon(AgentState::Working), t.dim),
+            };
+            let detail = format!("{}{sep}{}", plural(ws.tabs.len(), "tab"), plural(panes.len(), "pane"));
+            entry(
+                &mut rows,
+                SideItem::Workspace(ws.id),
+                dot(icon, color),
+                strong(ws.name.clone()),
+                faint(detail, t.dim),
+                ws.id == c.workspace,
+            );
+            agents.extend(states.into_iter().map(|(p, s)| (p, s, ws)));
+        }
+        for n in self.def_names.iter().filter(|n| !self.workspaces.iter().any(|w| &w.name == *n)) {
+            let name = faint(n.clone(), t.dim);
+            let detail = faint("not running".into(), t.dim);
+            entry(
+                &mut rows,
+                SideItem::Definition(n.clone()),
+                dot(t.icon(AgentState::Idle), t.dim),
+                name,
+                detail,
+                false,
+            );
+        }
+
+        // Agents, with their state and what runs them; the workspace when it is not this one.
+        if !agents.is_empty() {
+            rows.push(SideRow::Blank);
+            rows.push(SideRow::Section("AGENTS"));
+            for (p, s, ws) in agents {
                 let pane = &self.panes[&p];
-                let s = pane.agent.state;
                 let kind = match &pane.spec.account {
                     Some(a) => a.replace(':', "·"),
                     None => pane.agent.kind.clone().unwrap_or_default(),
                 };
-                rows.push((
-                    Some(SideItem::Pane(p)),
-                    Line::from(vec![
-                        Span::raw("     "),
-                        Span::styled(format!("{} ", th().icon(s)), Style::default().fg(th().state_color(s))),
-                        Span::styled(format!("{kind} "), Style::default().fg(th().state_color(s))),
-                        Span::styled(pane.display_name(), Style::default().fg(Color::Gray)),
-                    ]),
-                ));
+                let mut detail = format!("{}{sep}{kind}", s.label());
+                if ws.id != c.workspace {
+                    detail = format!("{detail}{sep}{}", ws.name);
+                }
+                let color = t.state_color(s);
+                entry(
+                    &mut rows,
+                    SideItem::Pane(p),
+                    dot(t.icon(s), color),
+                    strong(pane.display_name()),
+                    faint(detail, color),
+                    false,
+                );
             }
         }
+
         // Tunnels kraal keeps open, and dev servers seen in panes.
         if !self.tunnels.is_empty() {
-            rows.push((None, Line::raw("")));
-            rows.push((
-                None,
-                Line::from(Span::styled(" TUNNELS", Style::default().fg(th().dim).add_modifier(Modifier::BOLD))),
-            ));
-            for t in &self.tunnels {
-                let (icon, color) = match t.state {
-                    super::net::TunnelState::Up => (th().icon(AgentState::Working), th().done),
-                    super::net::TunnelState::Connecting => (th().icon(AgentState::Idle), th().blocked),
-                    super::net::TunnelState::Down => (th().icon(AgentState::Blocked), Color::LightRed),
+            rows.push(SideRow::Blank);
+            rows.push(SideRow::Section("TUNNELS"));
+            for tunnel in &self.tunnels {
+                let (icon, color) = match tunnel.state {
+                    super::net::TunnelState::Up => (t.icon(AgentState::Working), t.done),
+                    super::net::TunnelState::Connecting => (t.icon(AgentState::Idle), t.working),
+                    super::net::TunnelState::Down => (t.icon(AgentState::Blocked), t.blocked),
                 };
-                rows.push((
-                    Some(SideItem::Tunnel(t.spec.local)),
-                    Line::from(vec![
-                        Span::styled(format!("   {icon} "), Style::default().fg(color)),
-                        Span::styled(
-                            format!(":{} ", t.spec.local),
-                            Style::default().fg(th().text).add_modifier(Modifier::BOLD),
-                        ),
-                        Span::styled(
-                            format!("{}:{}", t.spec.server, t.spec.remote_port),
-                            Style::default().fg(th().dim),
-                        ),
-                    ]),
-                ));
+                let detail = format!("{}:{}", tunnel.spec.server, tunnel.spec.remote_port);
+                let name = strong(format!(":{}", tunnel.spec.local));
+                entry(
+                    &mut rows,
+                    SideItem::Tunnel(tunnel.spec.local),
+                    dot(icon, color),
+                    name,
+                    faint(detail, t.dim),
+                    false,
+                );
             }
         }
         if !self.ports.is_empty() {
-            rows.push((None, Line::raw("")));
-            rows.push((
-                None,
-                Line::from(Span::styled(" PORTS", Style::default().fg(th().dim).add_modifier(Modifier::BOLD))),
-            ));
+            rows.push(SideRow::Blank);
+            rows.push(SideRow::Section("PORTS"));
             for (port, pane) in &self.ports {
                 let name = self.panes.get(pane).map(|p| p.display_name()).unwrap_or_default();
-                rows.push((
-                    Some(SideItem::Port(*port)),
-                    Line::from(vec![
-                        Span::styled(
-                            format!("   :{port} "),
-                            Style::default().fg(th().accent).add_modifier(Modifier::BOLD),
-                        ),
-                        Span::styled(name, Style::default().fg(th().dim)),
-                    ]),
-                ));
+                let icon = t.icon(AgentState::Working);
+                entry(
+                    &mut rows,
+                    SideItem::Port(*port),
+                    dot(icon, t.accent),
+                    strong(format!(":{port}")),
+                    faint(name, t.dim),
+                    false,
+                );
             }
         }
-        // Usage of the agent accounts kraal has heard about.
+
+        // Usage of the agent accounts kraal has heard about, one row each, at the bottom.
         let now = crate::accounts::now();
-        let accounts: Vec<(String, f64, bool)> = self
+        let accounts: Vec<Line<'static>> = self
             .accounts
             .all()
             .into_iter()
             .filter_map(|a| {
-                let u = self.usage.get(&a)?;
-                let peak = u.peak(now);
-                Some((crate::accounts::label(&a), peak, peak >= self.accounts.threshold(&a) as f64))
+                let peak = self.usage.get(&a)?.peak(now);
+                let color = if peak >= self.accounts.threshold(&a) as f64 {
+                    t.blocked
+                } else if peak >= 70.0 {
+                    t.working
+                } else {
+                    t.text
+                };
+                Some(Line::from(vec![
+                    Span::styled(format!("   {} ", crate::accounts::label(&a)), Style::default().fg(Color::Gray)),
+                    Span::styled(format!("{peak:.0}%"), Style::default().fg(color).add_modifier(Modifier::BOLD)),
+                ]))
             })
             .collect();
-        if !accounts.is_empty() {
-            rows.push((None, Line::raw("")));
-            rows.push((
-                None,
-                Line::from(Span::styled(" ACCOUNTS", Style::default().fg(th().dim).add_modifier(Modifier::BOLD))),
-            ));
-            for (label, peak, full) in accounts {
-                let color = if full {
-                    Color::Yellow
-                } else if peak >= 70.0 {
-                    Color::LightYellow
-                } else {
-                    Color::Gray
-                };
-                rows.push((
-                    None,
-                    Line::from(vec![
-                        Span::styled(format!("   {label} "), Style::default().fg(Color::Gray)),
-                        Span::styled(format!("{peak:.0}%"), Style::default().fg(color).add_modifier(Modifier::BOLD)),
-                    ]),
-                ));
-            }
-        }
-        let defined: Vec<&String> =
-            self.def_names.iter().filter(|n| !self.workspaces.iter().any(|w| &w.name == *n)).collect();
-        if !defined.is_empty() {
-            rows.push((None, Line::raw("")));
-            rows.push((
-                None,
-                Line::from(Span::styled(" NOT RUNNING", Style::default().fg(th().dim).add_modifier(Modifier::BOLD))),
-            ));
-            for n in defined {
-                rows.push((
-                    Some(SideItem::Definition(n.clone())),
-                    Line::from(Span::styled(format!("   {n}"), Style::default().fg(th().dim))),
-                ));
-            }
+        // They end on the last row before the bottom border, and give way when there is no room.
+        let top = (height as usize).saturating_sub(2).saturating_sub(accounts.len());
+        if !accounts.is_empty() && rows.len() <= top {
+            rows.resize_with(top, || SideRow::Blank);
+            rows.push(SideRow::Section("ACCOUNTS"));
+            rows.extend(accounts.into_iter().map(|line| SideRow::Entry { item: None, line, selected: false }));
         }
         rows
     }
 
     pub fn sidebar_hit(&self, id: ClientId, row: u16) -> Option<SideItem> {
         let c = self.clients.get(&id)?;
-        let i = row.checked_sub(1)? as usize;
-        self.sidebar_rows(c).into_iter().nth(i).and_then(|(item, _)| item)
+        // The last row is the box's bottom border, whatever would follow there.
+        if row.saturating_add(1) >= c.rows {
+            return None;
+        }
+        match self.sidebar_rows(c, c.rows).into_iter().nth(row as usize)? {
+            SideRow::Entry { item, .. } => item,
+            _ => None,
+        }
     }
 
+    /// The sidebar: one box over the whole height, its sections split by lines across it.
     fn draw_sidebar(&self, id: ClientId, area: Rect, buf: &mut Buffer) {
+        if area.width < 4 || area.height < 3 {
+            return;
+        }
         let c = &self.clients[&id];
-        let inner_w = area.width.saturating_sub(1);
-        for (i, (_, line)) in self.sidebar_rows(c).into_iter().enumerate() {
+        let set = th().border(false);
+        let line = Style::default().fg(th().dim);
+        Block::default().borders(Borders::ALL).border_set(set).border_style(line).render(area, buf);
+        let (left, right) = th().tees();
+        let width = area.width - 2;
+        for (i, row) in self.sidebar_rows(c, area.height).into_iter().enumerate() {
             let y = area.y + i as u16;
-            if y >= area.y + area.height {
+            if y + 1 >= area.bottom() {
                 break;
             }
-            buf.set_line(area.x, y, &line, inner_w);
-        }
-        // Next to pane frames, the line starts and stops half a cell in, level with their top and
-        // bottom edges, instead of running past their rounded corners.
-        let framed = self.config.pane_frames && !th().ascii && th().frames != crate::theme::Frames::Ascii;
-        let last = area.y + area.height - 1;
-        for y in area.y..=last {
-            let symbol = match y {
-                _ if !framed || area.height < 2 => th().vline(),
-                y if y == area.y => "╷",
-                y if y == last => "╵",
-                _ => th().vline(),
-            };
-            if let Some(cell) = buf.cell_mut((area.x + area.width - 1, y)) {
-                cell.set_symbol(symbol).set_fg(th().dim);
+            match row {
+                SideRow::Section(name) => {
+                    if i > 0 {
+                        buf[(area.x, y)].set_symbol(left).set_style(line);
+                        for x in area.x + 1..area.right() - 1 {
+                            buf[(x, y)].set_symbol(set.horizontal_top).set_style(line);
+                        }
+                        buf[(area.right() - 1, y)].set_symbol(right).set_style(line);
+                    }
+                    let title = Line::from(vec![
+                        Span::styled(set.horizontal_top, line),
+                        Span::styled(
+                            format!(" {name} "),
+                            Style::default().fg(Color::Gray).add_modifier(Modifier::BOLD),
+                        ),
+                    ]);
+                    buf.set_line(area.x + 1, y, &title, width);
+                }
+                SideRow::Entry { line: text, selected, .. } => {
+                    if selected {
+                        for x in area.x + 1..area.right() - 1 {
+                            buf[(x, y)].set_bg(th().selection);
+                        }
+                    }
+                    buf.set_line(area.x + 1, y, &text, width);
+                }
+                SideRow::Blank => {}
             }
         }
     }
@@ -546,28 +774,27 @@ impl Server {
         let show_floating = tab.show_floating;
         let floating_focus = focus.is_some_and(|f| tab.is_floating(f));
         let mut cursor = None;
-        // A pane alone in its tab needs no heavier frame to show it has the focus.
-        let alone = rects.len() == 1;
         for (pid, outer, floating) in rects {
-            let outer = outer.intersection(clip);
-            if outer.is_empty() {
+            let (tile, inner) = self.placed(outer, floating, clip);
+            if tile.is_empty() {
                 continue;
             }
             if floating {
-                Clear.render(outer, buf);
+                Clear.render(tile, buf);
+                // A floating pane hides the links of what is under it.
+                links.retain(|(x, y), _| !tile.contains((*x, *y).into()));
             }
             let focused = focus == Some(pid) && (!floating_focus || show_floating);
-            let inner = self.inner(outer);
-            if inner != outer {
-                let emphasis = focused && !alone;
-                self.draw_frame(pid, outer, emphasis, synced.contains(&pid), floating, marked.contains(&pid), buf);
+            if inner != tile {
+                let (sync, mark) = (synced.contains(&pid), marked.contains(&pid));
+                self.draw_frame(pid, tile, focused, sync, floating, mark, buf);
+            }
+            // A smaller client may see only the frame's top.
+            if inner.is_empty() {
+                continue;
             }
             let Some(pane) = self.panes.get_mut(&pid) else { continue };
             let content = Rect::new(inner.x, inner.y, inner.width.min(pane.cols), inner.height.min(pane.rows));
-            if floating {
-                // A floating pane hides the links of what is under it.
-                links.retain(|(x, y), _| !outer.contains((*x, *y).into()));
-            }
             if let crate::pane::Content::Files(f) = &mut pane.content {
                 f.set_viewer(id);
             }
@@ -597,11 +824,43 @@ impl Server {
         cursor
     }
 
+    /// What a pane works on: git, contexts (production ones in red), the agent and its state,
+    /// how far back it is scrolled.
+    fn pane_details(&self, pid: PaneId) -> Vec<Span<'static>> {
+        let Some(pane) = self.panes.get(&pid) else { return Vec::new() };
+        let mut out = Vec::new();
+        if let Some(g) = self.pane_git(pid) {
+            let color = if g.dirty || g.untracked { Color::Yellow } else { th().dim };
+            out.push(Span::styled(format!(" {} ", g.label(th().ascii)), Style::default().fg(color)));
+        }
+        for (label, is_prod) in self.context_labels(pid) {
+            let color = if is_prod { th().production } else { th().dim };
+            out.push(Span::styled(format!(" {label} "), Style::default().fg(color)));
+        }
+        if let Some(kind) = &pane.agent.kind {
+            let state = pane.agent.state;
+            let kind = pane.spec.account.as_ref().map(|a| a.replace(':', "·")).unwrap_or_else(|| kind.clone());
+            let sep = if th().ascii { "-" } else { "·" };
+            out.push(Span::styled(
+                format!(" {} {} {sep} {kind} ", th().icon(state), state.label()),
+                Style::default().fg(th().state_color(state)),
+            ));
+        }
+        let offset = pane.display_offset();
+        if offset > 0 {
+            out.push(Span::styled(format!(" ↑{offset} "), Style::default().fg(Color::LightBlue)));
+        }
+        out
+    }
+
+    /// A pane's frame: its name on the top border, what it works on at the right of it. The
+    /// focused pane's frame is in the accent colour, a production one in red, a broadcast target
+    /// in the broadcast colour.
     #[allow(clippy::too_many_arguments)]
     fn draw_frame(
         &self,
         pid: PaneId,
-        outer: Rect,
+        tile: Rect,
         focused: bool,
         sync: bool,
         floating: bool,
@@ -609,7 +868,6 @@ impl Server {
         buf: &mut Buffer,
     ) {
         let Some(pane) = self.panes.get(&pid) else { return };
-        let state = pane.agent.state;
         let prod = self.pane_production_shown(pid).is_some();
         let color = if prod {
             th().production
@@ -617,8 +875,6 @@ impl Server {
             th().sync
         } else if focused {
             th().accent
-        } else if pane.agent.kind.is_some() && state == AgentState::Blocked {
-            Color::Yellow
         } else {
             th().dim
         };
@@ -631,10 +887,7 @@ impl Server {
             },
         )];
         if prod {
-            title.push(Span::styled(
-                " PROD ",
-                Style::default().fg(Color::Black).bg(th().production).add_modifier(Modifier::BOLD),
-            ));
+            title.push(badge_span("PROD", th().production));
             if sync {
                 title.push(Span::styled(" sync ", Style::default().fg(th().sync).add_modifier(Modifier::BOLD)));
             }
@@ -645,196 +898,18 @@ impl Server {
         if marked {
             title.insert(0, Span::styled(" ◆", Style::default().fg(th().sync).add_modifier(Modifier::BOLD)));
         }
-        let mut right = Vec::new();
-        if let Some(g) = self.pane_git(pid) {
-            let color = if g.dirty || g.untracked { Color::Yellow } else { th().dim };
-            right.push(Span::styled(format!(" {} ", g.label(th().ascii)), Style::default().fg(color)));
-        }
-        for (label, is_prod) in self.context_labels(pid) {
-            let color = if is_prod { th().production } else { th().dim };
-            right.push(Span::styled(format!(" {label} "), Style::default().fg(color)));
-        }
-        if let Some(kind) = &pane.agent.kind {
-            let kind = pane.spec.account.as_ref().map(|a| a.replace(':', "·")).unwrap_or_else(|| kind.clone());
-            right.push(Span::styled(
-                format!(" {} {kind} {} ", th().icon(state), state.label()),
-                Style::default().fg(th().state_color(state)),
-            ));
-        }
-        let offset = pane.display_offset();
-        if offset > 0 {
-            right.push(Span::styled(format!(" ↑{offset} "), Style::default().fg(Color::LightBlue)));
-        }
-        let mut block = Block::default()
+        let tw = spans_width(&title);
+        Block::default()
             .borders(Borders::ALL)
-            .border_set(th().border(focused))
+            .border_set(th().border(false))
             .border_style(Style::default().fg(color))
-            .title(Line::from(title));
-        if !right.is_empty() {
-            block = block.title(Line::from(right).right_aligned());
-        }
-        block.render(outer, buf);
-    }
-
-    // ---- status bar -------------------------------------------------------------------
-
-    /// The bottom line: what the client is doing and the keys that matter now. In normal use it
-    /// stays quiet: a broadcast in progress (never hidden), a message, agents needing you, and how
-    /// to open the menu.
-    fn draw_status(&self, id: ClientId, area: Rect, buf: &mut Buffer) {
-        let c = &self.clients[&id];
-        let t = th();
-        let badge = |text: &str, color: Color| {
-            Span::styled(format!(" {text} "), Style::default().fg(Color::Black).bg(color).add_modifier(Modifier::BOLD))
-        };
-        let key =
-            |k: &str| Span::styled(overlays::shown_key(k), Style::default().fg(t.accent).add_modifier(Modifier::BOLD));
-        let text = |s: &str| Span::styled(s.to_string(), Style::default().fg(t.dim));
-        let keys = |list: &[(&str, &str)]| -> Vec<Span<'static>> {
-            let mut out = Vec::new();
-            for (i, (k, what)) in list.iter().enumerate() {
-                if i > 0 {
-                    out.push(text(" · "));
-                }
-                out.push(key(k));
-                out.push(text(&format!(" {what}")));
-            }
-            out
-        };
-        let mut left: Vec<Span<'static>> = Vec::new();
-        let mut right: Vec<Span<'static>> = Vec::new();
-        // A broadcast stays in view whatever else happens.
-        if let Some(ws) = self.ws_index(c.workspace).map(|i| &self.workspaces[i])
-            && ws.sync != super::SyncScope::Off
-            && let Some(f) = ws.tab().focus
-        {
-            let targets = ws.sync_targets(f);
-            let n = targets.len();
-            let prod = targets.iter().filter(|p| self.pane_production_shown(**p).is_some()).count();
-            let prod_text = if prod > 0 { format!(", {prod} PROD") } else { String::new() };
-            let full = format!("BROADCAST → {n} pane{}{prod_text}", if n == 1 { "" } else { "s" });
-            let stop = self.keymap.hint(Action::BroadcastOff).or_else(|| self.keymap.hint(Action::BroadcastToggle));
-            let stop_w = stop.as_ref().map_or(0, |k| k.width() + " stop  ".len());
-            // On a narrow screen, the count and PROD stay; the words and the shortcut go first.
-            let room = area.width as usize / 2 + 8;
-            let what = if full.width() + 2 <= room { full } else { format!("BROADCAST {n}{prod_text}") };
-            let color = if prod > 0 { t.production } else { t.sync };
-            left.push(badge(&what, color));
-            left.push(Span::raw(" "));
-            if let Some(stop) = stop.filter(|_| what.width() + 3 + stop_w <= room) {
-                left.extend(keys(&[(&stop, "stop")]));
-                left.push(Span::raw("  "));
-            }
-        }
-        let label = c.mode.label();
-        match &c.mode {
-            Mode::Normal => {
-                let waiting = self.attention_queue().len();
-                if let Some((msg, _)) = &c.toast {
-                    left.push(Span::styled(msg.clone(), Style::default().fg(t.blocked)));
-                } else if c.welcome && waiting == 0 {
-                    // Until the menu is opened once.
-                    left.push(Span::styled(
-                        "Welcome to kraal",
-                        Style::default().fg(t.accent).add_modifier(Modifier::BOLD),
-                    ));
-                    left.push(text("   "));
-                    let find = self.keymap.hint(Action::CommandPalette);
-                    let help = self.keymap.hint(Action::Help);
-                    let list: Vec<(&str, &str)> = [(find.as_deref(), "find any command"), (help.as_deref(), "help")]
-                        .into_iter()
-                        .filter_map(|(k, what)| Some((k?, what)))
-                        .collect();
-                    left.extend(keys(&list));
-                } else {
-                    if waiting > 0 {
-                        left.push(Span::styled(
-                            format!(
-                                "{} {waiting} agent{} need{} you",
-                                t.icon(AgentState::Blocked),
-                                if waiting == 1 { "" } else { "s" },
-                                if waiting == 1 { "s" } else { "" }
-                            ),
-                            Style::default().fg(t.blocked),
-                        ));
-                        if let Some(k) = self.keymap.hint(Action::NextAttention) {
-                            left.push(text("  "));
-                            left.extend(keys(&[(&k, "go")]));
-                        }
-                    }
-                }
-                right.extend(keys(&[(&self.keymap.prefix_label(), "menu")]));
-            }
-            Mode::Leader { typed, .. } => {
-                // The keys typed so far; the menu says the rest. A message that comes meanwhile
-                // shows here.
-                left.push(badge(label, t.accent));
-                left.push(Span::raw(" "));
-                let mut seq = vec![self.keymap.prefix_label()];
-                seq.extend(
-                    typed.iter().map(|k| crate::keymap::pretty(&crate::input::KeySpec::new(k.code, k.mods), t.ascii)),
-                );
-                left.push(Span::styled(seq.join(" "), Style::default().fg(t.text)));
-                if let Some((msg, _)) = &c.toast {
-                    left.push(Span::raw("   "));
-                    left.push(Span::styled(msg.clone(), Style::default().fg(t.blocked)));
-                }
-            }
-            Mode::Resize => {
-                left.push(badge(label, t.accent));
-                left.push(Span::raw(" "));
-                left.extend(keys(&[("←↓↑→", "resize"), ("⏎", "done"), ("esc", "done")]));
-            }
-            Mode::Scroll => {
-                left.push(badge(label, t.working));
-                left.push(Span::raw(" "));
-                left.extend(keys(&[
-                    ("arrows", "move"),
-                    ("v", "select"),
-                    ("y", "copy"),
-                    ("/", "search"),
-                    ("esc", "exit"),
-                ]));
-            }
-            Mode::Search { query, found } => {
-                left.push(badge(label, t.working));
-                left.push(Span::raw(" "));
-                left.push(Span::styled("/", Style::default().fg(t.working).add_modifier(Modifier::BOLD)));
-                left.push(Span::raw(query.clone()));
-                left.push(Span::raw("  "));
-                if !query.is_empty() && !found {
-                    left.push(Span::styled("no match", Style::default().fg(t.production)));
-                } else {
-                    left.extend(keys(&[("↑↓", "older/newer"), ("⏎", "keep"), ("esc", "cancel")]));
-                }
-            }
-            Mode::Hints(crate::server::ui::HintsMode { hints, act, .. }) => {
-                left.push(badge(if *act { "HINTS: ACT" } else { "HINTS: COPY" }, t.blocked));
-                left.push(Span::raw(" "));
-                if *act {
-                    let mut acts: Vec<&str> = Vec::new();
-                    for h in hints {
-                        let a = h.m.kind.action();
-                        if !acts.contains(&a) {
-                            acts.push(a);
-                        }
-                    }
-                    left.push(text(&format!("type a label to {} · ", acts.join(", "))));
-                    left.extend(keys(&[("tab", "copy instead"), ("esc", "cancel")]));
-                } else {
-                    left.push(text("type a label to copy it · "));
-                    left.extend(keys(&[("tab", "act on it instead"), ("esc", "cancel")]));
-                }
-            }
-            // Pickers, prompts and dialogs say what they are themselves.
-            _ => {}
-        }
-        let rw: u16 = right.iter().map(|s| s.content.width() as u16).sum();
-        // Two columns between what is on the left and what is on the right.
-        let lw = area.width.saturating_sub(rw + 3);
-        buf.set_line(area.x, area.y, &Line::from(left), lw);
-        if rw > 0 && rw + 1 < area.width {
-            buf.set_line(area.x + area.width - rw - 1, area.y, &Line::from(right), rw);
+            .title(Line::from(title))
+            .render(tile, buf);
+        // The details end one line cell before the corner, and only show whole.
+        let right = self.pane_details(pid);
+        let rw = spans_width(&right);
+        if rw > 0 && u32::from(tw) + u32::from(rw) + 4 <= u32::from(tile.width) {
+            buf.set_line(tile.right() - 2 - rw, tile.y, &Line::from(right), rw);
         }
     }
 
@@ -979,5 +1054,120 @@ impl Server {
                 ])
             })
             .collect()
+    }
+}
+
+/// One entry of the top bar: column, width, what a click does, and the label.
+pub type BarEntry = (u16, u16, BarItem, Vec<Span<'static>>);
+
+/// What the top bar shows: entries from the left, the right side, and the column of the cursor
+/// while a search is typed.
+#[derive(Default)]
+pub struct TopBar {
+    pub items: Vec<BarEntry>,
+    pub right: Vec<Span<'static>>,
+    pub cursor: Option<u16>,
+}
+
+/// The window of tabs shown from column `x` to `limit`: the active one, then neighbours while
+/// they fit. The hidden ones are counted at the edges.
+fn place_tabs(out: &mut Vec<BarEntry>, mut x: u16, limit: u16, tabs: Vec<(u16, Vec<Span<'static>>)>, active: usize) {
+    let room = limit.saturating_sub(x + 4);
+    let active = active.min(tabs.len().saturating_sub(1));
+    let (mut lo, mut hi) = (active, active);
+    let mut used = tabs.get(active).map_or(0, |t| t.0 + 1);
+    loop {
+        let marks = |lo: usize, hi: usize| if lo > 0 { 4 } else { 0 } + if hi + 1 < tabs.len() { 4 } else { 0 };
+        let mut grew = false;
+        if hi + 1 < tabs.len() && used + tabs[hi + 1].0 + 1 + marks(lo, hi + 1) <= room {
+            hi += 1;
+            used += tabs[hi].0 + 1;
+            grew = true;
+        }
+        if lo > 0 && used + tabs[lo - 1].0 + 1 + marks(lo - 1, hi) <= room {
+            lo -= 1;
+            used += tabs[lo].0 + 1;
+            grew = true;
+        }
+        if !grew {
+            break;
+        }
+    }
+    let more = |n: usize, left: bool| {
+        let text = if left { format!("‹{n} ") } else { format!(" {n}›") };
+        vec![Span::styled(text, Style::default().fg(th().dim))]
+    };
+    let n = tabs.len();
+    if lo > 0 {
+        out.push((x, 3, BarItem::Tab(lo - 1), more(lo, true)));
+        x += 4;
+    }
+    for (i, (w, spans)) in tabs.into_iter().enumerate().skip(lo).take(hi + 1 - lo) {
+        out.push((x, w, BarItem::Tab(i), spans));
+        x += w + 1;
+    }
+    if hi + 1 < n {
+        out.push((x, 3, BarItem::Tab(hi + 1), more(n - hi - 1, false)));
+        x += 4;
+    }
+    if x + 3 <= limit {
+        out.push((x, 3, BarItem::NewTab, vec![Span::styled(" + ", Style::default().fg(th().dim))]));
+    }
+}
+
+fn spans_width(spans: &[Span]) -> u16 {
+    spans.iter().map(|s| s.content.width()).sum::<usize>().min(u16::MAX as usize) as u16
+}
+
+/// `spans` cut to `max` columns, ending with "…".
+fn fit_spans(spans: Vec<Span<'static>>, max: u16) -> Vec<Span<'static>> {
+    let mut out = Vec::new();
+    let mut left = max as usize;
+    for s in spans {
+        let w = s.content.width();
+        if w <= left {
+            left -= w;
+            out.push(s);
+        } else {
+            if left > 0 {
+                out.push(Span::styled(crate::text::truncate(&s.content, left), s.style));
+            }
+            break;
+        }
+    }
+    out
+}
+
+fn badge_span(text: &str, color: Color) -> Span<'static> {
+    Span::styled(format!(" {text} "), Style::default().fg(Color::Black).bg(color).add_modifier(Modifier::BOLD))
+}
+
+fn dim_span(text: &str) -> Span<'static> {
+    Span::styled(text.to_string(), Style::default().fg(th().dim))
+}
+
+/// Keys and what they do: "esc close · ⏎ open".
+fn key_list(list: &[(&str, &str)]) -> Vec<Span<'static>> {
+    let mut out = Vec::new();
+    for (i, (k, what)) in list.iter().enumerate() {
+        if i > 0 {
+            out.push(dim_span(" · "));
+        }
+        out.push(Span::styled(overlays::shown_key(k), Style::default().fg(th().accent).add_modifier(Modifier::BOLD)));
+        out.push(dim_span(&format!(" {what}")));
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn messages_too_long_are_cut() {
+        let spans = vec![Span::raw("deploy "), Span::raw("failed on web01")];
+        let cut = fit_spans(spans, 12);
+        assert_eq!(spans_width(&cut), 12);
+        assert_eq!(cut.iter().map(|s| s.content.as_ref()).collect::<String>(), "deploy fail…");
     }
 }

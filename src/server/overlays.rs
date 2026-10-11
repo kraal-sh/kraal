@@ -219,7 +219,7 @@ fn menu_columns(items: &[MenuItem], lines: usize, cap: usize) -> Vec<(usize, usi
 
 pub(super) fn menu_layout(items: &[MenuItem], full: Rect) -> MenuLayout {
     let mut layout = MenuLayout { area: Rect::default(), cells: Vec::new() };
-    // One column between the box and the right edge; the tab bar and the status line stay free.
+    // One column between the box and the right edge, down to the bottom; the top bar stays free.
     let max_w = full.width.saturating_sub(2) as usize;
     let max_lines = (full.height as usize).saturating_sub(6).max(1);
     if items.is_empty() || max_w < 12 || full.height < 6 {
@@ -244,7 +244,7 @@ pub(super) fn menu_layout(items: &[MenuItem], full: Rect) -> MenuLayout {
     let widths = menu_columns(items, lines, cap);
     let w = total(lines, cap).min(max_w) as u16;
     let h = (lines as u16 + 4).min(full.height - 1);
-    layout.area = Rect::new(full.x + full.width - w - 1, full.y + full.height - 1 - h, w, h);
+    layout.area = Rect::new(full.x + full.width - w - 1, full.y + full.height - h, w, h);
     let right = layout.area.right() - 2;
     let mut x = layout.area.x + 2;
     for (c, (key_w, width)) in widths.iter().enumerate() {
@@ -710,9 +710,9 @@ mod tests {
             let items = menu_items(&km.menu(&[]));
             let full = Rect::new(0, 0, size.0, size.1);
             let layout = menu_layout(&items, full);
-            // Against the right edge, above the status line, below the tab bar.
+            // Against the right edge and the bottom, below the top bar.
             assert_eq!(layout.area.right(), full.right() - 1, "{preset} {size:?}");
-            assert_eq!(layout.area.bottom(), full.bottom() - 1, "{preset} {size:?}");
+            assert_eq!(layout.area.bottom(), full.bottom(), "{preset} {size:?}");
             assert!(layout.area.y >= 1, "{preset} {size:?}: {:?}", layout.area);
             // Every entry is there, inside the box, and a click finds it.
             let inside = Rect::new(layout.area.x + 1, layout.area.y + 1, layout.area.width - 2, layout.area.height - 2);

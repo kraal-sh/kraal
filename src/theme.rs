@@ -82,8 +82,8 @@ impl Theme {
         text: Color::Gray,
         sync: Color::Magenta,
         production: Color::Red,
-        working: Color::Cyan,
-        blocked: Color::Yellow,
+        working: Color::Yellow,
+        blocked: Color::LightRed,
         done: Color::Green,
         idle: Color::Gray,
         selection: Color::Indexed(237),
@@ -159,9 +159,14 @@ impl Theme {
         }
     }
 
+    /// The mark of an agent state: a dot in its colour, hollow when idle.
     pub fn icon(&self, s: AgentState) -> &'static str {
         if !self.ascii {
-            return s.icon();
+            return match s {
+                AgentState::Unknown => "·",
+                AgentState::Idle => "○",
+                AgentState::Working | AgentState::Blocked | AgentState::Done => "●",
+            };
         }
         match s {
             AgentState::Unknown => ".",
@@ -190,8 +195,14 @@ impl Theme {
         self.border(false)
     }
 
-    pub fn vline(&self) -> &'static str {
-        if self.ascii { "|" } else { "│" }
+    /// Where a line across a box meets its left and right sides.
+    pub fn tees(&self) -> (&'static str, &'static str) {
+        match self.frames {
+            Frames::Ascii => ("+", "+"),
+            Frames::Thick => ("┣", "┫"),
+            Frames::Double => ("╠", "╣"),
+            Frames::Rounded | Frames::Plain => ("├", "┤"),
+        }
     }
 
     pub fn hline(&self) -> &'static str {

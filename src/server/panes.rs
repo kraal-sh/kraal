@@ -39,7 +39,7 @@ impl Server {
     /// Spawn a pane process with a provisional size; call [`Server::relayout`] afterwards.
     pub fn spawn_pane(&mut self, name: Option<String>, spec: PaneSpec) -> Result<PaneId> {
         let id = self.alloc_id();
-        let inner = self.inner(self.layout_area);
+        let inner = self.inner(self.layout_area, false);
         if let Some([left, right]) = spec.files.clone() {
             let fm = self.file_manager(&left, &right);
             self.panes.insert(id, Pane::files(id, name, spec, fm));
@@ -69,7 +69,7 @@ impl Server {
     /// A command pane that does not run its command yet: it shows `reason`, and Enter starts it.
     pub fn spawn_pane_suspended(&mut self, name: Option<String>, spec: PaneSpec, reason: &str) -> Result<PaneId> {
         let id = self.alloc_id();
-        let inner = self.inner(self.layout_area);
+        let inner = self.inner(self.layout_area, false);
         let mut pane =
             Pane::spawn(id, name, placeholder(&spec, reason), inner.width, inner.height, &self.env, &self.tx)?;
         pane.ssh = self.ssh_target_of(&spec);

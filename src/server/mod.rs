@@ -503,7 +503,7 @@ pub fn run(session: &str) -> Result<()> {
         clients: HashMap::new(),
         next_id: 1,
         primary: None,
-        layout_area: Rect::new(0, 1, 120, 38),
+        layout_area: Rect::new(0, 1, 120, 39),
         waits: Vec::new(),
         persist_dirty: false,
         last_persist: Instant::now(),

@@ -57,7 +57,7 @@ pub struct HintsMode {
 }
 
 impl Mode {
-    /// What the status bar says the client is doing; nothing in normal use.
+    /// What the top bar says the client is doing; nothing in normal use.
     pub fn label(&self) -> &'static str {
         match self {
             Mode::Normal => "",
@@ -614,7 +614,8 @@ pub fn paste_line(text: &mut String, cursor: &mut usize, pasted: &str) -> Result
 
 /// A mouse drag in progress.
 pub enum Drag {
-    Border(Border),
+    /// Moving a split: the border, and how far before it the pointer took hold of it.
+    Border(Border, u16),
     /// Selecting text: `from` is where the button went down; `moved`, whether the selection
     /// covers more than that press (a drag, or a double/triple click).
     Select {

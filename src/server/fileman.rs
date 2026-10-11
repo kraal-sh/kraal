@@ -66,14 +66,14 @@ impl Server {
     }
 
     /// The size this client sees the file manager at: a smaller terminal shows less of it, and
-    /// clicks, pages and the wheel are counted in what it shows. As the pane is drawn: its place
-    /// clipped to the client's screen, then the frame taken off.
+    /// clicks, pages and the wheel are counted in what it shows. As the pane is drawn: its frame
+    /// clipped to the client's screen, then the content inside it.
     pub(super) fn files_view(&self, client: ClientId, pane: PaneId) -> Option<(u16, u16)> {
         let c = self.clients.get(&client)?;
         let wi = self.ws_index(c.workspace)?;
-        let (_, outer, _) =
+        let (_, outer, floating) =
             self.tab_rects(self.workspaces[wi].tab(), self.layout_area).into_iter().find(|(p, _, _)| *p == pane)?;
-        let inner = self.inner(outer.intersection(ratatui::layout::Rect::new(0, 0, c.cols, c.rows)));
+        let (_, inner) = self.placed(outer, floating, ratatui::layout::Rect::new(0, 0, c.cols, c.rows));
         let p = self.panes.get(&pane)?;
         Some((inner.width.min(p.cols), inner.height.min(p.rows)))
     }

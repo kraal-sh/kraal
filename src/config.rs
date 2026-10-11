@@ -20,7 +20,8 @@ pub const DEFAULT_CONFIG: &str = r##"# kraal configuration. Every setting is opt
 # Lines of scrollback kept per pane.
 scrollback = 10000
 
-# Draw a frame with a title around every pane.
+# A frame around every pane, with its name and what it works on; one cell of space between
+# panes. Without, panes touch and their details go in the top bar.
 pane_frames = true
 
 # Capture the mouse: click to focus, drag borders, wheel to scroll, drag to select and copy.
@@ -54,7 +55,7 @@ preset = "default"
 # dim = "darkgray"
 # sync = "magenta"
 # production = "red"
-# Pane frames: "rounded", "plain", "thick", "double" or "ascii".
+# Pane frames and the sidebar: "rounded", "plain", "thick", "double" or "ascii".
 # frames = "rounded"
 
 [sidebar]

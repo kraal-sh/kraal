@@ -5,13 +5,14 @@ use ratatui::layout::Rect;
 use super::{Server, Tab};
 use crate::layout::PaneId;
 impl Server {
-    /// Main pane area for a client of the given size.
+    /// Main pane area for a client of the given size: below the top bar, one column of space
+    /// right of the sidebar.
     pub fn main_area(&self, cols: u16, rows: u16, sidebar: bool) -> Rect {
         let top = 1;
-        let bottom = 1;
-        let height = rows.saturating_sub(top + bottom).max(1);
-        let sw = if sidebar { self.sidebar_width(cols) } else { 0 };
-        Rect::new(sw, top, cols.saturating_sub(sw).max(1), height)
+        let height = rows.saturating_sub(top).max(1);
+        let left = if sidebar { self.sidebar_width(cols) } else { 0 };
+        let left = if left > 0 { left + 1 } else { 0 };
+        Rect::new(left, top, cols.saturating_sub(left).max(1), height)
     }
 
     pub fn sidebar_width(&self, cols: u16) -> u16 {
@@ -52,12 +53,36 @@ impl Server {
         out
     }
 
-    /// Inner (content) rectangle of a pane drawn at `outer`.
-    pub fn inner(&self, outer: Rect) -> Rect {
-        if self.config.pane_frames && outer.width >= 4 && outer.height >= 3 {
-            Rect::new(outer.x + 1, outer.y + 1, outer.width - 2, outer.height - 2)
+    /// Where a tiled pane's frame goes: its place, less one column of space when a pane is to its
+    /// right and one row when a pane is below.
+    pub fn tile(&self, outer: Rect) -> Rect {
+        if !self.config.pane_frames {
+            return outer;
+        }
+        let area = self.layout_area;
+        let right = u16::from(outer.right() < area.right() && outer.width > 1);
+        let below = u16::from(outer.bottom() < area.bottom() && outer.height > 1);
+        Rect::new(outer.x, outer.y, outer.width - right, outer.height - below)
+    }
+
+    /// Where a pane's content goes inside its place: inside its frame, a box for a floating
+    /// pane, a tile for the others.
+    pub fn inner(&self, outer: Rect, floating: bool) -> Rect {
+        self.inside_frame(if floating { outer } else { self.tile(outer) })
+    }
+
+    /// A pane's frame and content as a screen of `screen` size shows them: the frame clipped to
+    /// the screen, the content inside what shows of the frame.
+    pub fn placed(&self, outer: Rect, floating: bool, screen: Rect) -> (Rect, Rect) {
+        let frame = if floating { outer } else { self.tile(outer) }.intersection(screen);
+        (frame, self.inside_frame(frame))
+    }
+
+    fn inside_frame(&self, frame: Rect) -> Rect {
+        if self.config.pane_frames && frame.width >= 4 && frame.height >= 3 {
+            Rect::new(frame.x + 1, frame.y + 1, frame.width - 2, frame.height - 2)
         } else {
-            outer
+            frame
         }
     }
 
@@ -75,10 +100,10 @@ impl Server {
                     tiled.insert(z, area);
                 }
                 for (id, r) in tiled {
-                    sizes.push((id, self.inner(r)));
+                    sizes.push((id, self.inner(r, false)));
                 }
                 for f in &tab.floating {
-                    sizes.push((f.pane, self.inner(f.rect.to_rect(area))));
+                    sizes.push((f.pane, self.inner(f.rect.to_rect(area), true)));
                 }
             }
         }

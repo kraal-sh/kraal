@@ -18,7 +18,7 @@ impl Server {
             return None;
         }
         let c = self.clients.get(&id)?;
-        let (cols, rows, sidebar) = (c.cols, c.rows, self.sidebar_shown(c));
+        let (cols, sidebar) = (c.cols, self.sidebar_shown(c));
         let area = self.layout_area;
 
         // A drag in progress owns the mouse until release.
@@ -41,29 +41,7 @@ impl Server {
 
         let sw = if sidebar { self.sidebar_width(cols) } else { 0 };
         let press_left = matches!(m.kind, MouseKind::Press(MouseButton::Left));
-        if m.row == 0 {
-            if press_left {
-                match self.tab_bar_hit(id, m.col) {
-                    Some(BarItem::Tab(i)) => {
-                        if let Some((_, wi)) = self.current_ws(id) {
-                            self.workspaces[wi].active = i;
-                            self.mark_seen_focused(id);
-                        }
-                    }
-                    Some(BarItem::NewTab) => return Some(self.action(id, Action::NewTab)),
-                    Some(BarItem::Workspace) => {
-                        let ws = self.clients[&id].workspace;
-                        return Some(Mode::Picker(self.workspace_picker(ws)));
-                    }
-                    None => {}
-                }
-                self.mark_dirty();
-            }
-            return None;
-        }
-        if m.row + 1 >= rows {
-            return None;
-        }
+        // The sidebar runs the whole height, beside the top bar.
         if m.col < sw {
             if press_left {
                 match self.sidebar_hit(id, m.row) {
@@ -88,20 +66,41 @@ impl Server {
             return None;
         }
 
+        if m.row == 0 {
+            // In copy mode and search, the bar shows their keys, not the tabs.
+            if press_left && !scroll_mode {
+                match self.tab_bar_hit(id, m.col) {
+                    Some(BarItem::Tab(i)) => {
+                        if let Some((_, wi)) = self.current_ws(id) {
+                            self.workspaces[wi].active = i;
+                            self.mark_seen_focused(id);
+                        }
+                    }
+                    Some(BarItem::NewTab) => return Some(self.action(id, Action::NewTab)),
+                    Some(BarItem::Workspace) => {
+                        let ws = self.clients[&id].workspace;
+                        return Some(Mode::Picker(self.workspace_picker(ws)));
+                    }
+                    Some(BarItem::Text) | None => {}
+                }
+                self.mark_dirty();
+            }
+            return None;
+        }
         let (_, wi) = self.current_ws(id)?;
         let rects = self.tab_rects(self.workspaces[wi].tab(), area);
         let hit = rects.iter().rev().find(|(_, r, _)| contains(*r, m.col, m.row)).copied();
 
         match m.kind {
             MouseKind::ScrollUp | MouseKind::ScrollDown => {
-                let (p, r, _) = hit?;
-                let inner = self.inner(r);
+                let (p, r, floating) = hit?;
+                let inner = self.inner(r, floating);
                 self.wheel(id, p, m, inner, scroll_mode);
             }
             // Pointer motion and horizontal scrolling, for a program that asked for them.
             MouseKind::Move | MouseKind::ScrollLeft | MouseKind::ScrollRight if !scroll_mode => {
-                let (p, r, _) = hit?;
-                let inner = self.inner(r);
+                let (p, r, floating) = hit?;
+                let inner = self.inner(r, floating);
                 if !contains(inner, m.col, m.row) {
                     return None;
                 }
@@ -119,18 +118,25 @@ impl Server {
                 }
             }
             MouseKind::Press(button) => {
-                // Borders of tiled panes.
+                // Borders of tiled panes; ctrl+click on a frame's top marks the pane instead.
                 if button == MouseButton::Left
+                    && !m.mods.ctrl
                     && hit.is_none_or(|(_, _, floating)| !floating)
                     && let Some(b) = self.border_at(wi, m.col, m.row)
                 {
+                    let along = match b.axis {
+                        crate::layout::Axis::Row => m.col,
+                        crate::layout::Axis::Column => m.row,
+                    };
+                    let grab = b.pos.saturating_sub(along);
                     if let Some(c) = self.clients.get_mut(&id) {
-                        c.drag = Some(Drag::Border(b));
+                        c.drag = Some(Drag::Border(b, grab));
                     }
                     return None;
                 }
                 let (p, r, floating) = hit?;
-                if button == MouseButton::Left && m.mods.ctrl && m.row == r.y && self.config.pane_frames {
+                let inner = self.inner(r, floating);
+                if button == MouseButton::Left && m.mods.ctrl && m.row == r.y && inner.y > r.y {
                     self.toggle_mark(id, p);
                     return None;
                 }
@@ -156,7 +162,6 @@ impl Server {
                         return None;
                     }
                 }
-                let inner = self.inner(r);
                 if !contains(inner, m.col, m.row) {
                     return None;
                 }
@@ -273,15 +278,16 @@ impl Server {
         let area = self.layout_area;
         let (_, wi) = self.current_ws(id)?;
         match drag {
-            Drag::Border(b) => {
+            Drag::Border(b, grab) => {
                 let pos = match b.axis {
                     crate::layout::Axis::Row => m.col,
                     crate::layout::Axis::Column => m.row,
                 };
                 let Some(root) = &mut self.workspaces[wi].tab_mut().root else { return None };
-                // The grabbed frame line sits one cell before the next child.
-                let target = if pos >= b.pos { pos } else { pos + 1 };
-                let moved = root.drag_border(&b, target);
+                // The border keeps its distance to the pointer: a click alone moves nothing, even
+                // next to a pane narrower than a drag would leave it.
+                let target = pos.saturating_add(grab);
+                let moved = target != b.pos && root.drag_border(&b, target);
                 // Borders move as we drag: refresh the one we hold.
                 let fresh = root.borders(area).into_iter().find(|nb| nb.path == b.path && nb.index == b.index);
                 if moved {
@@ -291,14 +297,14 @@ impl Server {
                     self.mark_persist();
                     return None;
                 }
-                fresh.map(Drag::Border)
+                fresh.map(|b| Drag::Border(b, grab))
             }
             Drag::Select { pane, from, moved } => {
                 // A click that does not move selects nothing: it only focuses the pane, and the
                 // clipboard keeps what it had.
                 let moved = moved || (m.col, m.row) != from;
                 let rects = self.tab_rects(self.workspaces[wi].tab(), area);
-                let r = rects.iter().find(|(p, ..)| *p == pane).map(|(_, r, _)| self.inner(*r))?;
+                let r = rects.iter().find(|(p, ..)| *p == pane).map(|(_, r, f)| self.inner(*r, *f))?;
                 let pn = self.panes.get_mut(&pane)?;
                 if moved {
                     let col = m.col.saturating_sub(r.x).min(r.width.saturating_sub(1));
@@ -364,7 +370,7 @@ impl Server {
             }
             Drag::Forward { pane, button } => {
                 let rects = self.tab_rects(self.workspaces[wi].tab(), area);
-                let r = rects.iter().find(|(p, ..)| *p == pane).map(|(_, r, _)| self.inner(*r))?;
+                let r = rects.iter().find(|(p, ..)| *p == pane).map(|(_, r, f)| self.inner(*r, *f))?;
                 let pn = self.panes.get_mut(&pane)?;
                 let col = m.col.saturating_sub(r.x).min(r.width.saturating_sub(1));
                 let row = m.row.saturating_sub(r.y).min(r.height.saturating_sub(1));
@@ -376,7 +382,8 @@ impl Server {
         }
     }
 
-    /// A tiled border under the cursor (the frame lines on both sides of a split count).
+    /// A tiled border under the cursor: with frames, the space between two tiles or the frame
+    /// on either side of it; without, the first column or row after the split.
     pub(super) fn border_at(&self, wi: usize, col: u16, row: u16) -> Option<crate::layout::Border> {
         let tab = self.workspaces[wi].tab();
         if tab.zoom.is_some() {
@@ -389,7 +396,7 @@ impl Server {
                 crate::layout::Axis::Row => (col, row),
                 crate::layout::Axis::Column => (row, col),
             };
-            let on_line = if frames { along + 1 == b.pos || along == b.pos } else { along == b.pos };
+            let on_line = if frames { along >= b.pos.saturating_sub(2) && along <= b.pos } else { along == b.pos };
             on_line && across >= b.span.0 && across < b.span.1
         })
     }
