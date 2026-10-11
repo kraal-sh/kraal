@@ -148,8 +148,9 @@ pub(super) fn remote_command(path: &str) -> String {
 }
 
 /// Prints `MARKER`, the resolved directory, then the entries. With GNU find: `F`, then
-/// `type\ttarget-type\tsize\tmtime\tname` records. Elsewhere: `S`, then the same records with an
-/// `ls` date in UTC, built by the shell entry by entry so that names come from the shell itself,
+/// `type\ttarget-type\tsize\tmtime\tname` records. Elsewhere: `S`, then the same records with the
+/// exact time where BSD `stat` gives it (macOS), else an `ls` date in UTC, built by the shell entry
+/// by entry so that names come from the shell itself,
 /// not from parsing `ls` (where `a -> b` could be a name or a link). Records end with NUL, which
 /// cannot appear in names.
 pub(super) fn remote_script(path: &str) -> String {
@@ -165,8 +166,10 @@ pub(super) fn remote_script(path: &str) -> String {
          [ -e \"$f\" ] || [ -L \"$f\" ] || continue; \
          if [ -L \"$f\" ]; then k=l; elif [ -d \"$f\" ]; then k=d; else k=f; fi; \
          if [ -d \"$f\" ]; then t=d; else t=f; fi; \
+         m=$(stat -f %m -- \"$f\" 2>/dev/null); \
          set -- $(LC_ALL=C TZ=UTC0 ls -ldn -- \"$f\" 2>/dev/null); \
-         printf '%s%s\\t%s\\t%s %s %s\\t%s\\0' \"$k\" \"$t\" \"$5\" \"$6\" \"$7\" \"$8\" \"$f\"; done",
+         case $m in ''|*[!0-9]*) d=\"$6 $7 $8\";; *) d=\"@$m\";; esac; \
+         printf '%s%s\\t%s\\t%s\\t%s\\0' \"$k\" \"$t\" \"$5\" \"$d\" \"$f\"; done",
         "fi",
         "exit 0",
     ]
@@ -254,7 +257,8 @@ pub(super) fn parse_find_record(record: &[u8]) -> Option<Entry> {
     })
 }
 
-/// Parses one record of the shell fallback: `kt\tsize\tMon DD HH:MM|YYYY\tname`.
+/// Parses one record of the shell fallback: `kt\tsize\tMon DD HH:MM|YYYY\tname`, or `@seconds`
+/// in place of the date.
 pub(super) fn parse_shell_record(record: &[u8], now: i64) -> Option<Entry> {
     let mut fields = record.splitn(4, |&b| b == b'\t');
     let (kind, size, date, name) = (fields.next()?, fields.next()?, fields.next()?, fields.next()?);
@@ -263,9 +267,10 @@ pub(super) fn parse_shell_record(record: &[u8], now: i64) -> Option<Entry> {
     }
     let date = std::str::from_utf8(date).ok()?;
     let mut parts = date.split_whitespace();
-    let mtime = match (parts.next(), parts.next(), parts.next()) {
+    let mtime = match (date.strip_prefix('@'), parts.next(), parts.next(), parts.next()) {
+        (Some(secs), ..) => secs.parse().unwrap_or(0),
         // `ls` ran with TZ=UTC0: its wall-clock time is UTC, whatever the server's time zone.
-        (Some(m), Some(d), Some(t)) => ls_time(m, d, t, now).unwrap_or(0),
+        (None, Some(m), Some(d), Some(t)) => ls_time(m, d, t, now).unwrap_or(0),
         _ => 0,
     };
     Some(Entry {

@@ -25,7 +25,7 @@ impl TempDir {
         let dir = std::env::temp_dir().join(format!("kraal-files-{}-{name}-{id}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
-        TempDir(dir)
+        TempDir(dir.canonicalize().unwrap())
     }
 
     fn write(&self, name: &str, contents: &str) -> PathBuf {
@@ -323,6 +323,9 @@ fn shell_fallback_lists_exact_names() {
     assert_eq!(parse_shell_record(record, now).unwrap().size, 0, "devices have no size");
     let bad = parse_shell_record(b"ff\t1\tJan 5 2024\tbad\xff", now).unwrap();
     assert!(!bad.exact, "a name that is not UTF-8 is marked");
+    // Where BSD stat gives the exact time (macOS), it is taken as it is.
+    let exact = parse_shell_record(b"ff\t4\t@1791748955\tnotes", now).unwrap();
+    assert_eq!((exact.size, exact.mtime), (4, 1791748955));
 }
 
 #[test]
