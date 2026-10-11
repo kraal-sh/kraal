@@ -272,6 +272,11 @@ impl Server {
         }
         typed.push(k);
         match self.keymap.lookup(&typed) {
+            // The prefix pressed twice: the program gets the one pressed (there may be several).
+            Lookup::Run(Command::Action(Action::SendPrefix)) => {
+                self.send_prefix(id, typed.last().cloned());
+                Mode::Normal
+            }
             Lookup::Run(command) => self.command(id, command),
             Lookup::More => Mode::Leader { typed, miss: None },
             Lookup::Nothing => {

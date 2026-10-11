@@ -256,6 +256,43 @@ fn run_send_read_and_close() {
     }
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn config_reload_applies_new_keys_and_keeps_the_old_ones_when_the_file_is_broken() {
+    let env = Env::new("reload");
+    env.workspace("w", "layout {\n    pane name=\"first\"\n}\n");
+    env.run(&["open", "w"]);
+    let mut client = env.client();
+    let mut typed = |bytes: &[u8]| std::io::Write::write_all(client.stdin.as_mut().unwrap(), bytes).unwrap();
+    let panes = || {
+        let v: serde_json::Value = serde_json::from_str(&env.run(&["panes", "--json"])).unwrap();
+        v.as_array().map_or(0, Vec::len)
+    };
+    let wait_for = |n: usize| {
+        let start = Instant::now();
+        while panes() != n {
+            assert!(start.elapsed() < Duration::from_secs(5), "expected {n} panes");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    };
+    // A key the preset leaves free opens a tab once the configuration says so.
+    let path = env.root.join("config/kraal/config.toml");
+    let base = std::fs::read_to_string(&path).unwrap();
+    std::fs::write(&path, format!("{base}[keys.leader]\nnew_tab = [\"y\"]\n")).unwrap();
+    let out = env.try_run(&["config", "reload"]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    typed(b"\x02y");
+    wait_for(2);
+    // A file that cannot be read is an error, and the keys in use stay.
+    std::fs::write(&path, "keys = [").unwrap();
+    let out = env.try_run(&["config", "reload"]);
+    assert!(!out.status.success(), "a broken file was accepted");
+    typed(b"\x02y");
+    wait_for(3);
+    let _ = client.kill();
+    let _ = client.wait();
+}
+
 #[test]
 fn command_panes_stay_after_exit_and_wait_reports_it() {
     let env = Env::new("exit");
@@ -801,7 +838,7 @@ fn config_check_reports_tool_problems() {
     let out = env.try_run(&["config", "check"]);
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(out.status.success(), "{err}");
-    assert!(err.contains("tools.mine: key \"r g\" is already \"Git and worktrees\""), "{err}");
+    assert!(err.contains("tools.mine: key \"R g\" is already \"Git and worktrees\""), "{err}");
     assert!(err.contains("tools.both: when"), "{err}");
     // A workspace file that cannot be read is an error, not a warning.
     env.workspace("broken", "layout {\n    pane {\n");
@@ -1086,8 +1123,8 @@ fn keys_typed_while_runbooks_load_stay_in_the_list() {
     std::fs::write(env.root.join("config/kraal/runbooks/hello.toml"), "steps = [\"echo hello\"]\n").unwrap();
     env.run(&["open", "w"]);
     let mut client = env.client();
-    // ctrl+b r b opens the runbooks, and the rest comes in the same breath.
-    std::io::Write::write_all(client.stdin.as_mut().unwrap(), b"\x02rbecho leaked\r").unwrap();
+    // ctrl+b R b opens the runbooks, and the rest comes in the same breath.
+    std::io::Write::write_all(client.stdin.as_mut().unwrap(), b"\x02Rbecho leaked\r").unwrap();
     std::thread::sleep(Duration::from_millis(800));
     std::io::Write::write_all(client.stdin.as_mut().unwrap(), b"\x1b").unwrap();
     std::thread::sleep(Duration::from_millis(300));
@@ -1290,7 +1327,7 @@ fn a_tool_asks_when_the_kubeconfig_just_switched_to_production() {
     let mut client = env.client();
     // Switched to production, then the tool at once: before the next look at the file.
     std::fs::write(&kube, config("prod-eks")).unwrap();
-    std::io::Write::write_all(client.stdin.as_mut().unwrap(), b"\x02rm").unwrap();
+    std::io::Write::write_all(client.stdin.as_mut().unwrap(), b"\x02Rm").unwrap();
     std::thread::sleep(Duration::from_millis(1500));
     assert!(!marked.exists(), "the tool ran on production without asking");
     // It asked: yes runs it.
@@ -1368,7 +1405,7 @@ fn a_tool_waits_for_its_check_and_runs_only_where_it_was_asked() {
 
     // Given up while it waits: the keys stay in the list, and nothing starts.
     touch();
-    typed(b"\x02rm");
+    typed(b"\x02Rm");
     std::thread::sleep(Duration::from_millis(400));
     typed(b"zz");
     std::thread::sleep(Duration::from_millis(300));
@@ -1380,7 +1417,7 @@ fn a_tool_waits_for_its_check_and_runs_only_where_it_was_asked() {
 
     // The pane moves while the tool waits: it does not start somewhere else.
     touch();
-    typed(b"\x02rm");
+    typed(b"\x02Rm");
     std::thread::sleep(Duration::from_millis(400));
     env.run(&["send", "-p", "k", "-e", "cd /tmp"]);
     std::thread::sleep(Duration::from_millis(4500));
@@ -1388,7 +1425,7 @@ fn a_tool_waits_for_its_check_and_runs_only_where_it_was_asked() {
 
     // Otherwise it runs once the kubeconfig has been read.
     touch();
-    typed(b"\x02rm");
+    typed(b"\x02Rm");
     let start = Instant::now();
     while !marked.exists() {
         assert!(start.elapsed() < Duration::from_secs(10), "the tool runs after the check");
@@ -1422,7 +1459,7 @@ fn broadcast_waits_while_a_pane_context_is_read_again() {
     let mut client = env.client();
     let mut typed = |bytes: &[u8]| std::io::Write::write_all(client.stdin.as_mut().unwrap(), bytes).unwrap();
     env.run(&["focus", "a"]);
-    typed(b"\x02bt");
+    typed(b"\x02b");
     std::thread::sleep(Duration::from_millis(500));
     // `kubectx prod-x`: the next scan (within 3.4 s) starts a read that lasts 4.8 s.
     std::fs::write(env.root.join("kube.yaml.slow"), "").unwrap();
@@ -1467,7 +1504,7 @@ fn a_no_drops_everything_typed_while_a_context_was_read() {
     let mut client = env.client();
     let mut typed = |bytes: &[u8]| std::io::Write::write_all(client.stdin.as_mut().unwrap(), bytes).unwrap();
     env.run(&["focus", "a"]);
-    typed(b"\x02bt");
+    typed(b"\x02b");
     std::thread::sleep(Duration::from_millis(500));
     std::fs::write(env.root.join("kube.yaml.slow"), "").unwrap();
     std::fs::write(&kube, kubeconfig_text("prod-x")).unwrap();
@@ -1513,7 +1550,7 @@ fn a_yes_waits_for_a_context_read_and_holds_only_if_nothing_changed() {
     let mut client = env.client();
     let mut typed = |bytes: &[u8]| std::io::Write::write_all(client.stdin.as_mut().unwrap(), bytes).unwrap();
     env.run(&["focus", "a"]);
-    typed(b"\x02bt");
+    typed(b"\x02b");
     std::thread::sleep(Duration::from_millis(500));
     // b is production: the paste is asked about.
     typed(b"\x1b[200~echo answered-early\x1b[201~");
@@ -1565,7 +1602,7 @@ fn input_that_waited_goes_where_it_was_typed() {
     let mut client = env.client();
     let mut typed = |bytes: &[u8]| std::io::Write::write_all(client.stdin.as_mut().unwrap(), bytes).unwrap();
     env.run(&["focus", "a"]);
-    typed(b"\x02bt");
+    typed(b"\x02b");
     std::thread::sleep(Duration::from_millis(500));
     // The same context written again: a read that changes nothing, and lasts.
     std::fs::write(env.root.join("kube.yaml.slow"), "").unwrap();
@@ -1610,7 +1647,7 @@ fn a_yes_during_a_read_that_does_not_answer_sends_nothing() {
     let mut client = env.client();
     let mut typed = |bytes: &[u8]| std::io::Write::write_all(client.stdin.as_mut().unwrap(), bytes).unwrap();
     env.run(&["focus", "a"]);
-    typed(b"\x02bt");
+    typed(b"\x02b");
     std::thread::sleep(Duration::from_millis(500));
     // b is production: the paste is asked about.
     typed(b"\x1b[200~echo stalled-yes\x1b[201~");
@@ -1663,7 +1700,7 @@ fn a_yes_during_a_terraform_read_that_does_not_answer_sends_nothing() {
     let mut client = env.client();
     let mut typed = |bytes: &[u8]| std::io::Write::write_all(client.stdin.as_mut().unwrap(), bytes).unwrap();
     env.run(&["focus", "a"]);
-    typed(b"\x02bt");
+    typed(b"\x02b");
     std::thread::sleep(Duration::from_millis(500));
     // b is production: the paste is asked about.
     typed(b"\x1b[200~echo stalled-tf-yes\x1b[201~");
@@ -1710,7 +1747,7 @@ fn a_yes_during_a_read_of_the_directory_a_pane_is_in_that_does_not_answer_sends_
     let mut client = env.client();
     let mut typed = |bytes: &[u8]| std::io::Write::write_all(client.stdin.as_mut().unwrap(), bytes).unwrap();
     env.run(&["focus", "a"]);
-    typed(b"\x02bt");
+    typed(b"\x02b");
     std::thread::sleep(Duration::from_millis(500));
     // b is production: the paste is asked about.
     typed(b"\x1b[200~echo stalled-dir-yes\x1b[201~");
@@ -2256,11 +2293,11 @@ fn copy_mode_releases_the_button_the_program_saw_pressed() {
     std::thread::sleep(Duration::from_millis(300));
     let mut client = RawClient::attach(&env, "w");
     client.wait_for_screen("app");
-    // The right button goes down over the program, copy mode starts (ctrl+b v c), the wheel
+    // The right button goes down over the program, copy mode starts (ctrl+b v), the wheel
     // turns: the program is told the right button is up, and nothing more.
     client.send(b"\x1b[<2;110;20M");
     env.wait_for_text("app", "<2;");
-    client.send(b"\x02vc");
+    client.send(b"\x02v");
     std::thread::sleep(Duration::from_millis(200));
     client.send(b"\x1b[<64;110;20M");
     let screen = env.wait_for_text("app", "m");
@@ -2357,7 +2394,7 @@ fn an_account_switch_never_resends_a_prompt_by_itself_and_one_that_fails_can_be_
     let odd = agent(&["--brand-new-flag", "Deploy now"]);
     env.wait_for_text(&odd, &on_alpha);
     env.run(&["focus", &odd]);
-    client.send(b"\x02ac");
+    client.send(b"\x02Ac");
     client.wait_for_screen("beta");
     client.send(b"beta");
     std::thread::sleep(Duration::from_millis(200));
@@ -2382,7 +2419,7 @@ fn an_account_switch_never_resends_a_prompt_by_itself_and_one_that_fails_can_be_
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(beta.join("projects"), std::fs::Permissions::from_mode(0o555)).unwrap();
     env.run(&["focus", &plain]);
-    client.send(b"\x02ac");
+    client.send(b"\x02Ac");
     client.wait_for_screen("beta");
     client.send(b"beta");
     std::thread::sleep(Duration::from_millis(200));

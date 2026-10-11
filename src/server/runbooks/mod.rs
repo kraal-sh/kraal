@@ -186,7 +186,13 @@ pub(super) fn list_choices(cmd: &str, cwd: Option<&Path>, env: &[(String, String
 impl Server {
     // ---- picking -------------------------------------------------------------------------
 
-    /// `ctrl+b r`: the steps of the Markdown runbook in progress, or the list of runbooks.
+    /// How to open the runbooks with the keys in use (`ctrl+b R b` by default).
+    pub(super) fn runbooks_key(&self) -> String {
+        self.keymap.hint(crate::keymap::Action::Runbooks).unwrap_or_else(|| "the Runbooks command".into())
+    }
+
+    /// The Runbooks command: the steps of the Markdown runbook in progress, or the list of
+    /// runbooks.
     pub(super) fn runbooks_action(&mut self, client: ClientId) -> Mode {
         if let Some(s) = self.md_sessions.get(&client)
             && self.panes.contains_key(&s.target)

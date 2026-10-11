@@ -384,7 +384,7 @@ impl Server {
                 // In ask and auto modes, wait for the end of the turn rather than interrupting.
                 (LimitMode::Ask | LimitMode::Auto, Some(_)) => {}
                 _ if already.is_none() => {
-                    // The key from the keymap in use (`ctrl+b a c` by default).
+                    // The key from the keymap in use (`ctrl+b A c` by default).
                     let key = self.keymap.hint(crate::keymap::Action::SwitchAccount);
                     let hint = match (&alt, key) {
                         (Some(alt), Some(key)) => format!("{key} to continue on {}", accounts::label(alt)),

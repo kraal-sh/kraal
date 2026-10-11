@@ -1,11 +1,13 @@
 //! What keys do: every command kraal has, the presets that bind them, and the lookups the
 //! server, its menu, its help and its command search share.
 //!
-//! Commands are reached with a leader key (`ctrl+b` by default) followed by a short sequence. The
-//! "kraal" preset groups them by what they act on (`p` panes, `t` tabs, `w` workspaces, `a`
-//! agents, `s` servers, `f` files, `r` run, `v` view, `b` broadcast) and shows a menu of what can
-//! follow; the "classic" preset keeps tmux's single keys. A few frequent commands also have
-//! direct keys that need no leader.
+//! Commands are reached with a leader key (`ctrl+b` by default) followed by a short sequence, and
+//! a menu shows what can follow. The "kraal" preset gives each theme a letter: the lowercase
+//! letter runs the theme's main action (`s` connects to a server), the uppercase one opens the
+//! theme's menu (`S`: upload, download, edit the servers). Inside every menu the same letters do
+//! the same things (`n` new, `x` close, `e` rename, arrows for previous and next). The "classic"
+//! preset keeps tmux's single keys. A few frequent commands also have direct keys that need no
+//! leader.
 
 use std::collections::BTreeMap;
 
@@ -86,7 +88,7 @@ const ACTIONS: &[(Action, &str, &str)] = &[
     (SplitDown, "split_down", "Split down"),
     (ClosePane, "close_pane", "Close pane"),
     (ToggleZoom, "toggle_zoom", "Zoom pane"),
-    (ToggleFloating, "toggle_floating", "Show or hide floating panes"),
+    (ToggleFloating, "toggle_floating", "Floating panes: show or hide"),
     (NewFloating, "new_floating", "New floating pane"),
     (FocusLeft, "focus_left", "Focus left"),
     (FocusRight, "focus_right", "Focus right"),
@@ -122,20 +124,20 @@ const ACTIONS: &[(Action, &str, &str)] = &[
     (Download, "download", "Download from this pane's server"),
     (Files, "files", "File manager"),
     (OpenPreview, "open_preview", "Preview a file"),
-    (ToolPicker, "tools", "Tools where this pane is"),
+    (ToolPicker, "tools", "Tools here (where this pane is)"),
     (Runbooks, "runbooks", "Runbooks"),
     (GitActions, "git_actions", "Git and worktrees"),
     (ScrollMode, "scroll_mode", "Copy mode: scroll and select"),
     (Search, "search", "Search the output"),
-    (Hints, "hints", "Hints: links, paths, commits on screen"),
+    (Hints, "hints", "Open a link or path (hints on screen)"),
     (ToggleSidebar, "toggle_sidebar", "Sidebar"),
-    (Messages, "messages", "Messages"),
-    (SelectForBroadcast, "select_for_broadcast", "Select this pane for broadcast"),
-    (BroadcastSelected, "broadcast_selected", "Broadcast to the selected panes"),
+    (Messages, "messages", "Message log"),
+    (SelectForBroadcast, "select_for_broadcast", "Mark for broadcast (this pane)"),
+    (BroadcastSelected, "broadcast_selected", "Broadcast to the marked panes"),
     (BroadcastTab, "broadcast_tab", "Broadcast to this tab"),
     (BroadcastWorkspace, "broadcast_workspace", "Broadcast to this workspace"),
     (BroadcastOff, "broadcast_off", "Stop broadcasting"),
-    (BroadcastToggle, "broadcast_toggle", "Broadcast to this tab, or stop"),
+    (BroadcastToggle, "broadcast_toggle", "Broadcast on/off (this tab)"),
     (CommandPalette, "command_palette", "Search commands"),
     (Help, "help", "Help"),
     (Detach, "detach", "Detach (programs keep running)"),
@@ -195,14 +197,18 @@ pub enum Command {
 
 type Table = &'static [(&'static str, &'static [&'static str])];
 
+/// A menu of a preset: its name in the configuration (`menu_<id>`), the key that opens it, its
+/// title, and its main action (the one its theme's lowercase letter runs).
+type MenuDef = (&'static str, &'static str, &'static str, Action);
+
 /// A set of default bindings.
 pub struct Preset {
     pub name: &'static str,
-    /// Sequences after the leader (keys separated by spaces), in menu order.
+    /// Sequences after the leader (keys separated by spaces), in menu order. `{id}` stands for
+    /// the key of menu `id`, `{prefix}` for the prefix key.
     leader: Table,
     direct: Table,
-    /// Titles of the menus a first key opens.
-    groups: &'static [(&'static str, &'static str)],
+    menus: &'static [MenuDef],
     /// What a tool's `key` follows.
     tool_menu: &'static str,
 }
@@ -210,14 +216,27 @@ pub struct Preset {
 pub const KRAAL: Preset = Preset {
     name: "kraal",
     leader: &[
-        ("command_palette", &["space"]),
-        ("new_pane", &["n", "p n"]),
+        // The main action of each theme; its uppercase letter opens the theme's menu.
+        ("ssh_picker", &["s", "{servers} s", "{servers} enter"]),
+        ("broadcast_toggle", &["b", "{broadcast} b", "{broadcast} enter"]),
+        ("workspace_picker", &["w", "{workspaces} w", "{workspaces} enter"]),
+        ("agent_picker", &["a", "{agents} a", "{agents} enter"]),
+        ("new_tab", &["t", "{tabs} t", "{tabs} n", "{tabs} enter"]),
+        ("pane_picker", &["p", "{panes} p", "{panes} enter"]),
+        ("scroll_mode", &["v", "{view} v", "{view} enter"]),
+        ("files", &["f", "{files} f", "{files} enter"]),
+        ("tools", &["r", "{run} r", "{run} enter"]),
+        // Verbs and fixed keys.
+        ("new_pane", &["n", "{panes} n"]),
+        ("close_pane", &["x", "{panes} x"]),
+        ("toggle_zoom", &["z"]),
+        ("select_for_broadcast", &["m", "{broadcast} m"]),
+        ("hints", &["o", "{view} o"]),
+        ("search", &["g", "/", "{view} g"]),
         ("focus_left", &["left"]),
         ("focus_down", &["down"]),
         ("focus_up", &["up"]),
         ("focus_right", &["right"]),
-        ("close_pane", &["x", "p x"]),
-        ("toggle_zoom", &["z", "p z"]),
         ("tab_1", &["1"]),
         ("tab_2", &["2"]),
         ("tab_3", &["3"]),
@@ -227,50 +246,40 @@ pub const KRAAL: Preset = Preset {
         ("tab_7", &["7"]),
         ("tab_8", &["8"]),
         ("tab_9", &["9"]),
+        ("command_palette", &["space"]),
         ("help", &["h", "?"]),
         ("detach", &["d"]),
-        ("send_prefix", &["ctrl+b"]),
-        ("pane_picker", &["p p", "p enter"]),
-        ("split_right", &["p right"]),
-        ("split_down", &["p down"]),
-        ("rename_pane", &["p e"]),
-        ("resize_mode", &["p r"]),
-        ("new_floating", &["p f"]),
-        ("new_tab", &["t n"]),
-        ("next_tab", &["t right"]),
-        ("prev_tab", &["t left"]),
-        ("rename_tab", &["t e"]),
-        ("close_tab", &["t x"]),
-        ("workspace_picker", &["w w", "w enter"]),
-        ("new_workspace", &["w n"]),
-        ("next_workspace", &["w right"]),
-        ("prev_workspace", &["w left"]),
-        ("rename_workspace", &["w e"]),
-        ("save_workspace", &["w s"]),
-        ("close_workspace", &["w x"]),
-        ("agent_picker", &["a a", "a enter"]),
-        ("next_attention", &["a n"]),
-        ("switch_account", &["a c"]),
-        ("ssh_picker", &["s s", "s enter"]),
-        ("upload", &["s u", "f u"]),
-        ("download", &["s d", "f d"]),
-        ("edit_servers", &["s e"]),
-        ("files", &["f f", "f enter"]),
-        ("open_preview", &["f p"]),
-        ("tools", &["r r", "r enter"]),
-        ("runbooks", &["r b"]),
-        ("git_actions", &["r g"]),
-        ("scroll_mode", &["v c"]),
-        ("search", &["v s"]),
-        ("hints", &["v h"]),
-        ("toggle_floating", &["v f"]),
-        ("toggle_sidebar", &["v b"]),
-        ("messages", &["v m"]),
-        ("select_for_broadcast", &["b m"]),
-        ("broadcast_selected", &["b s"]),
-        ("broadcast_tab", &["b t"]),
-        ("broadcast_workspace", &["b w"]),
-        ("broadcast_off", &["b o"]),
+        ("send_prefix", &["{prefix}"]),
+        // The rest of each menu.
+        ("split_right", &["{panes} right"]),
+        ("split_down", &["{panes} down"]),
+        ("rename_pane", &["{panes} e"]),
+        ("resize_mode", &["{panes} r"]),
+        ("new_floating", &["{panes} f"]),
+        ("prev_tab", &["{tabs} left"]),
+        ("next_tab", &["{tabs} right"]),
+        ("rename_tab", &["{tabs} e"]),
+        ("close_tab", &["{tabs} x"]),
+        ("new_workspace", &["{workspaces} n"]),
+        ("prev_workspace", &["{workspaces} left"]),
+        ("next_workspace", &["{workspaces} right"]),
+        ("rename_workspace", &["{workspaces} e"]),
+        ("save_workspace", &["{workspaces} s"]),
+        ("close_workspace", &["{workspaces} x"]),
+        ("next_attention", &["{agents} g"]),
+        ("switch_account", &["{agents} c"]),
+        ("upload", &["{servers} u", "{files} u"]),
+        ("download", &["{servers} d", "{files} d"]),
+        ("edit_servers", &["{servers} e"]),
+        ("open_preview", &["{files} p"]),
+        ("runbooks", &["{run} b"]),
+        ("git_actions", &["{run} g"]),
+        ("toggle_floating", &["{view} f"]),
+        ("toggle_sidebar", &["{view} l"]),
+        ("messages", &["{view} j"]),
+        ("broadcast_workspace", &["{broadcast} w"]),
+        ("broadcast_selected", &["{broadcast} s"]),
+        ("broadcast_off", &["{broadcast} o"]),
     ],
     direct: &[
         ("focus_or_tab_left", &["alt+left"]),
@@ -280,18 +289,18 @@ pub const KRAAL: Preset = Preset {
         ("new_pane", &["alt+n"]),
         ("next_attention", &["alt+a"]),
     ],
-    groups: &[
-        ("p", "Panes"),
-        ("t", "Tabs"),
-        ("w", "Workspaces"),
-        ("a", "Agents"),
-        ("s", "Servers"),
-        ("f", "Files"),
-        ("r", "Run"),
-        ("v", "View"),
-        ("b", "Broadcast"),
+    menus: &[
+        ("servers", "S", "Servers", SshPicker),
+        ("broadcast", "B", "Broadcast", BroadcastToggle),
+        ("workspaces", "W", "Workspaces", WorkspacePicker),
+        ("agents", "A", "Agents", AgentPicker),
+        ("tabs", "T", "Tabs", NewTab),
+        ("panes", "P", "Panes", PanePicker),
+        ("view", "V", "View", ScrollMode),
+        ("files", "F", "Files", Files),
+        ("run", "R", "Run", ToolPicker),
     ],
-    tool_menu: "r",
+    tool_menu: "{run}",
 };
 
 /// tmux's keys, as kraal had them first.
@@ -353,7 +362,7 @@ pub const CLASSIC: Preset = Preset {
         ("command_palette", &[":"]),
         ("detach", &["d", "q"]),
         ("help", &["?"]),
-        ("send_prefix", &["ctrl+b"]),
+        ("send_prefix", &["{prefix}"]),
     ],
     direct: &[
         ("focus_or_tab_left", &["alt+h", "alt+left"]),
@@ -366,7 +375,7 @@ pub const CLASSIC: Preset = Preset {
         ("workspace_picker", &["alt+o"]),
         ("agent_picker", &["alt+g"]),
     ],
-    groups: &[],
+    menus: &[],
     tool_menu: "",
 };
 
@@ -378,7 +387,8 @@ pub struct KeysConfig {
     /// "kraal" or "classic".
     pub preset: String,
     pub prefix: Vec<String>,
-    /// Per action, replacing the preset's: sequences after the prefix.
+    /// Per action, replacing the preset's: sequences after the prefix. `menu_<id>` gives the
+    /// keys that open a menu (`menu_servers = ["M"]`).
     #[serde(default)]
     pub leader: BTreeMap<String, Vec<String>>,
     /// The earlier name of `leader`.
@@ -405,6 +415,17 @@ pub struct MenuEntry {
     /// It opens a further menu.
     pub group: bool,
     pub command: Option<Command>,
+    /// The main action of a theme, whose menu its uppercase letter opens.
+    pub main: bool,
+}
+
+/// A menu of the keymap: the keys that open it after the prefix, its title, and its main action.
+#[derive(Debug, Clone)]
+pub struct Menu {
+    pub id: &'static str,
+    pub keys: Vec<KeySpec>,
+    pub title: &'static str,
+    pub main: Action,
 }
 
 /// `text` without a leading `word` (any case) and the space after it, capitalised.
@@ -424,28 +445,56 @@ pub struct Keymap {
     pub direct: Vec<(KeySpec, Action)>,
     /// Sequences after the prefix, in menu order.
     pub leader: Vec<(Vec<KeySpec>, Command)>,
-    groups: Vec<(KeySpec, &'static str)>,
-    tool_menu: Vec<KeySpec>,
+    pub menus: Vec<Menu>,
+    /// What a tool's key follows: each key of the tool menu, or nothing (tools then follow the
+    /// prefix directly).
+    tool_menu: Vec<Vec<KeySpec>>,
 }
 
-fn parse_sequence(text: &str) -> Result<Vec<KeySpec>, String> {
-    let keys: Vec<KeySpec> = text
-        .split_whitespace()
-        .map(|k| KeySpec::parse(k).map_err(|e| format!("{k:?}: {e}")))
-        .collect::<Result<_, _>>()?;
-    if keys.is_empty() {
+/// The sequences `text` stands for. `{id}` is each key of menu `id` (none when the menu has no
+/// key), `{prefix}` each prefix key.
+fn expand(text: &str, menus: &[Menu], prefix: &[KeySpec]) -> Result<Vec<Vec<KeySpec>>, String> {
+    let mut out: Vec<Vec<KeySpec>> = vec![Vec::new()];
+    let mut empty = true;
+    for token in text.split_whitespace() {
+        empty = false;
+        let named = token.strip_prefix('{').and_then(|t| t.strip_suffix('}'));
+        let choices: Vec<KeySpec> = match named {
+            Some("prefix") => prefix.to_vec(),
+            Some(id) => menus
+                .iter()
+                .find(|m| m.id == id)
+                .map(|m| m.keys.clone())
+                .ok_or_else(|| format!("{token:?}: no such menu"))?,
+            None => vec![KeySpec::parse(token).map_err(|e| format!("{token:?}: {e}"))?],
+        };
+        out = out
+            .into_iter()
+            .flat_map(|seq| {
+                choices.iter().map(move |k| {
+                    let mut seq = seq.clone();
+                    seq.push(k.clone());
+                    seq
+                })
+            })
+            .collect();
+    }
+    if empty {
         return Err("empty".into());
     }
-    Ok(keys)
+    Ok(out)
 }
 
 /// Bindings of `table`, with the user's entries replacing the preset's for their actions.
+/// Entries naming a menu (`menu_<id>`) are not actions: [`Keymap::build`] reads them.
 fn bindings(
     preset: Table,
     user: &[&BTreeMap<String, Vec<String>>],
     ctx: &str,
+    (menus, prefix): (&[Menu], &[KeySpec]),
     warnings: &mut Vec<String>,
 ) -> Vec<(Vec<KeySpec>, Action)> {
+    let is_menu = |name: &str| name.starts_with("menu_");
     let overridden: Vec<&str> = user.iter().flat_map(|m| m.keys()).map(String::as_str).collect();
     let mut out = Vec::new();
     let mut add = |name: &str, seqs: &[String], warnings: &mut Vec<String>| {
@@ -454,8 +503,8 @@ fn bindings(
             return;
         };
         for s in seqs {
-            match parse_sequence(s) {
-                Ok(keys) => out.push((keys, action)),
+            match expand(s, menus, prefix) {
+                Ok(all) => out.extend(all.into_iter().map(|keys| (keys, action))),
                 Err(e) => warnings.push(format!("{ctx}.{name}: invalid key {e}")),
             }
         }
@@ -465,12 +514,86 @@ fn bindings(
         add(name, &seqs, warnings);
     }
     for map in user {
-        for (name, seqs) in *map {
+        for (name, seqs) in map.iter().filter(|(n, _)| !is_menu(n)) {
             add(name, seqs, warnings);
         }
     }
     out
 }
+
+/// A section of the reference: its title, and rows of keys with what they do.
+pub type Section = (String, Vec<(String, String)>);
+
+/// Keys and what they do in lists, text fields, questions and modes: fixed, the same in every
+/// preset.
+pub const MODE_KEYS: &[(&str, &[(&str, &str)])] = &[
+    (
+        "In lists",
+        &[
+            ("type", "filter"),
+            ("↑ ↓", "move"),
+            ("⏎", "choose"),
+            ("tab", "more actions on the selected item"),
+            ("esc", "close"),
+        ],
+    ),
+    (
+        "In text fields",
+        &[
+            ("← → home end", "move (alt+← → by word)"),
+            ("ctrl+w ctrl+u ctrl+k", "delete a word, to the start, to the end"),
+            ("⏎ / esc", "accept / cancel"),
+        ],
+    ),
+    (
+        "In questions",
+        &[
+            ("y / n", "yes / no"),
+            ("← → tab", "move between the answers"),
+            ("⏎", "the selected answer"),
+            ("↑ ↓", "scroll a long question"),
+            ("esc", "no"),
+        ],
+    ),
+    (
+        "Copy mode",
+        &[
+            ("arrows hjkl", "move"),
+            ("w b e", "next word, previous word, end of word"),
+            ("0 $ home end", "start, end of the line"),
+            ("g G", "top, bottom"),
+            ("pageup pagedown", "a page up, down (ctrl+u ctrl+d: half a page)"),
+            ("v V ctrl+v", "select characters, lines, a block"),
+            ("y or ⏎", "copy and leave"),
+            ("/ n N", "search, next, previous"),
+            ("esc q", "leave"),
+        ],
+    ),
+    (
+        "Searching the output",
+        &[
+            ("type", "the text to find"),
+            ("↑ ↓", "older, newer match"),
+            ("⏎", "keep the match and go on in copy mode"),
+            ("esc", "cancel"),
+        ],
+    ),
+    ("Resizing", &[("arrows hjkl", "move the border"), ("⏎ or esc", "done")]),
+    (
+        "Hints",
+        &[("a label", "copy what it marks, or act on it"), ("tab", "switch between copy and act"), ("esc", "cancel")],
+    ),
+    (
+        "Mouse",
+        &[
+            ("click", "focus a pane, tab, workspace or agent"),
+            ("drag a border", "resize panes"),
+            ("drag in a pane", "select and copy (double: word, triple: line)"),
+            ("ctrl+click", "open a link; on a frame's top: mark for broadcast"),
+            ("shift + mouse", "your terminal's own selection"),
+        ],
+    ),
+];
 
 /// Whether two bindings would catch the same key press (`ctrl+m` and `enter` do).
 fn same_key(a: &KeySpec, b: &KeySpec) -> bool {
@@ -497,16 +620,38 @@ impl Keymap {
                 KeySpec::parse(s).map_err(|e| warnings.push(format!("keys.prefix: invalid key {s:?}: {e}"))).ok()
             })
             .collect();
-        let direct: Vec<(KeySpec, Action)> = bindings(preset.direct, &[&cfg.direct], "keys.direct", &mut warnings)
-            .into_iter()
-            .filter_map(|(mut keys, a)| {
-                if keys.len() > 1 {
-                    warnings.push(format!("keys.direct.{}: one key, not a sequence", a.name()));
-                    return None;
-                }
-                Some((keys.remove(0), a))
-            })
-            .collect();
+        // The menus first: the leader's sequences name them.
+        let user = [&cfg.prefixed, &cfg.leader];
+        let mut menus = Vec::new();
+        for &(id, key, title, main) in preset.menus {
+            let name = format!("menu_{id}");
+            let keys = match user.iter().rev().find_map(|m| m.get(&name)) {
+                Some(list) => list
+                    .iter()
+                    .filter_map(|k| {
+                        KeySpec::parse(k).map_err(|e| warnings.push(format!("keys.leader.{name}: {e}"))).ok()
+                    })
+                    .collect(),
+                None => KeySpec::parse(key).into_iter().collect(),
+            };
+            menus.push(Menu { id, keys, title, main });
+        }
+        for name in user.iter().flat_map(|m| m.keys()).filter(|n| n.starts_with("menu_")) {
+            if !menus.iter().any(|m| name[5..] == *m.id) {
+                warnings.push(format!("keys.leader: no menu {name:?} in the {} preset", preset.name));
+            }
+        }
+        let direct: Vec<(KeySpec, Action)> =
+            bindings(preset.direct, &[&cfg.direct], "keys.direct", (&menus, &prefix), &mut warnings)
+                .into_iter()
+                .filter_map(|(mut keys, a)| {
+                    if keys.len() > 1 {
+                        warnings.push(format!("keys.direct.{}: one key, not a sequence", a.name()));
+                        return None;
+                    }
+                    Some((keys.remove(0), a))
+                })
+                .collect();
         // A direct key that is also the prefix, or bound twice, would shadow the other.
         let mut kept: Vec<(KeySpec, Action)> = Vec::new();
         for (k, a) in direct {
@@ -518,12 +663,15 @@ impl Keymap {
                 kept.push((k, a));
             }
         }
-        let mut km = Keymap { preset: preset.name, prefix, direct: kept, ..Keymap::default() };
-        for (keys, a) in bindings(preset.leader, &[&cfg.prefixed, &cfg.leader], "keys.leader", &mut warnings) {
+        let leader = bindings(preset.leader, &user, "keys.leader", (&menus, &prefix), &mut warnings);
+        let tool_menu = match preset.tool_menu {
+            "" => vec![Vec::new()],
+            t => expand(t, &menus, &prefix).unwrap_or_default(),
+        };
+        let mut km = Keymap { preset: preset.name, prefix, direct: kept, menus, tool_menu, ..Keymap::default() };
+        for (keys, a) in leader {
             km.add(keys, Command::Action(a), &mut warnings);
         }
-        km.groups = preset.groups.iter().filter_map(|(k, t)| Some((KeySpec::parse(k).ok()?, *t))).collect();
-        km.tool_menu = parse_sequence(preset.tool_menu).unwrap_or_default();
         (km, warnings)
     }
 
@@ -557,11 +705,13 @@ impl Keymap {
             let Some(key) = &t.key else { continue };
             match KeySpec::parse(key) {
                 Ok(k) => {
-                    let mut keys = self.tool_menu.clone();
-                    keys.push(k);
-                    let mut why = Vec::new();
-                    if !self.add(keys, Command::Tool(name.clone()), &mut why) {
-                        warnings.extend(why.into_iter().map(|w| format!("tools.{name}: {w}")));
+                    for menu in self.tool_menu.clone() {
+                        let mut keys = menu;
+                        keys.push(k.clone());
+                        let mut why = Vec::new();
+                        if !self.add(keys, Command::Tool(name.clone()), &mut why) {
+                            warnings.extend(why.into_iter().map(|w| format!("tools.{name}: {w}")));
+                        }
                     }
                 }
                 Err(e) => warnings.push(format!("tools.{name}: invalid key {key:?}: {e}")),
@@ -615,25 +765,101 @@ impl Keymap {
                     Command::Action(a) => a.label(),
                     Command::Tool(t) => t.clone(),
                 };
-                // The menu's name is not repeated: in Broadcast, "Broadcast to this tab" is "To this tab".
+                // The menu's name is not repeated: in Broadcast, "Broadcast to this workspace" is
+                // "To this workspace".
                 match within.and_then(|title| strip_word(&label, title)) {
                     Some(rest) => rest,
                     None => label,
                 }
             };
-            out.push(MenuEntry { key, label, group, command: (!group).then(|| cmd.clone()) });
+            let main = typed.is_empty() && !group && matches!(cmd, Command::Action(a) if self.is_main(*a));
+            out.push(MenuEntry { key, label, group, command: (!group).then(|| cmd.clone()), main });
         }
-        // The menus first (they are the map of what kraal does), then the commands.
-        out.sort_by_key(|e| !e.group);
+        // The main actions of the themes, then the other commands, then the menus.
+        out.sort_by_key(|e| (e.group, !e.main));
         out
+    }
+
+    /// Whether `action` is the main action of one of the menus.
+    pub fn is_main(&self, action: Action) -> bool {
+        self.menus.iter().any(|m| m.main == action && !m.keys.is_empty())
     }
 
     /// The title of the menu `keys` open, if it has one.
     pub fn group_title(&self, keys: &[KeySpec]) -> Option<&'static str> {
         match keys {
-            [k] => self.groups.iter().find(|(g, _)| g == k).map(|(_, t)| *t),
+            [k] => self.menus.iter().find(|m| m.keys.contains(k)).map(|m| m.title),
             _ => None,
         }
+    }
+
+    /// `ctrl+b B`: how to open menu `id`.
+    pub fn menu_hint(&self, id: &str) -> Option<String> {
+        let key = self.menus.iter().find(|m| m.id == id)?.keys.first()?;
+        Some(format!("{} {key}", self.prefix_label()))
+    }
+
+    /// The whole reference, for the help screen and `kraal config keys`: sections of (keys,
+    /// what they do). The keys after the prefix come first, then each menu, the keys without the
+    /// prefix, and the fixed keys of lists, fields, questions and modes.
+    pub fn reference(&self, ascii: bool) -> Vec<Section> {
+        let p = self.prefix_label();
+        let seq = |keys: &[KeySpec]| {
+            let mut parts = vec![p.clone()];
+            parts.extend(keys.iter().map(|k| pretty(k, ascii)));
+            parts.join(" ")
+        };
+        let root = format!("After {p}");
+        // Each section, with the commands it lists (a command shows once per section).
+        let mut sections: Vec<(Section, Vec<Command>)> = vec![((root.clone(), Vec::new()), Vec::new())];
+        for (keys, cmd) in &self.leader {
+            let title = match keys.len() {
+                1 => root.clone(),
+                _ => match self.group_title(&keys[..1]) {
+                    Some(t) => format!("{t} ({p} {})", pretty(&keys[0], ascii)),
+                    None => format!("{p} {} …", pretty(&keys[0], ascii)),
+                },
+            };
+            let row = match cmd {
+                Command::Action(Tab(n)) if *n > 1 && keys.len() == 1 => None,
+                Command::Action(FocusDown | FocusRight | FocusUp) if keys.len() == 1 => None,
+                Command::Action(FocusLeft) if keys.len() == 1 => Some((
+                    format!("{p} {}", if ascii { "arrows" } else { "←↓↑→" }),
+                    "Focus the pane on that side".to_string(),
+                )),
+                Command::Action(Tab(_)) if keys.len() == 1 => Some((format!("{p} 1…9"), "Go to tab 1-9".to_string())),
+                Command::Action(a) => Some((seq(keys), a.describe())),
+                Command::Tool(t) => Some((seq(keys), format!("Tool: {t}"))),
+            };
+            let Some(row) = row else { continue };
+            match sections.iter_mut().find(|((t, _), _)| *t == title) {
+                Some(((_, rows), seen)) => {
+                    if !seen.contains(cmd) {
+                        seen.push(cmd.clone());
+                        rows.push(row);
+                    }
+                }
+                None => sections.push(((title, vec![row]), vec![cmd.clone()])),
+            }
+        }
+        let mut out: Vec<Section> =
+            sections.into_iter().map(|(section, _)| section).filter(|(_, rows)| !rows.is_empty()).collect();
+        let direct: Vec<(String, String)> = self.direct.iter().map(|(k, a)| (k.to_string(), a.describe())).collect();
+        if !direct.is_empty() {
+            out.push(("Without the prefix".into(), direct));
+        }
+        for (title, rows) in MODE_KEYS {
+            let shown = |k: &str| {
+                if !ascii {
+                    return k.to_string();
+                }
+                [('⏎', "enter"), ('↑', "up"), ('↓', "down"), ('←', "left"), ('→', "right")]
+                    .iter()
+                    .fold(k.to_string(), |s, (from, to)| s.replace(*from, to))
+            };
+            out.push((title.to_string(), rows.iter().map(|(k, w)| (shown(k), w.to_string())).collect()));
+        }
+        out
     }
 
     /// `ctrl+b p r`, or the direct key: how to reach an action, for hints and help.
@@ -718,32 +944,103 @@ mod tests {
     }
 
     #[test]
-    fn sequences_menus_and_hints() {
+    fn a_theme_letter_runs_its_main_action_and_its_capital_opens_its_menu() {
         let (km, _) = Keymap::build(&cfg("").keys);
         assert_eq!(km.preset, "kraal");
-        assert_eq!(km.lookup(&[key('p')]), Lookup::More);
+        let run = |a: Action| Lookup::Run(Command::Action(a));
+        for (c, a) in [
+            ('s', SshPicker),
+            ('b', BroadcastToggle),
+            ('w', WorkspacePicker),
+            ('a', AgentPicker),
+            ('t', NewTab),
+            ('p', PanePicker),
+            ('v', ScrollMode),
+            ('f', Files),
+            ('r', ToolPicker),
+        ] {
+            assert_eq!(km.lookup(&[key(c)]), run(a), "{c}");
+            // The same letter inside its menu does the same.
+            let menu = key(c.to_ascii_uppercase());
+            assert_eq!(km.lookup(std::slice::from_ref(&menu)), Lookup::More, "{c}");
+            assert_eq!(km.lookup(&[menu, key(c)]), run(a), "{c} in its menu");
+        }
+        for (c, a) in [('n', NewPane), ('x', ClosePane), ('z', ToggleZoom), ('m', SelectForBroadcast), ('o', Hints)] {
+            assert_eq!(km.lookup(&[key(c)]), run(a), "{c}");
+        }
+        assert_eq!(km.lookup(&[key('g')]), run(Search));
+        assert_eq!(km.lookup(&[key('/')]), run(Search));
+        assert_eq!(km.lookup(&[key('?')]), run(Help));
         let right = Key { code: KeyCode::Right, mods: Mods::NONE, raw: Vec::new() };
-        assert_eq!(km.lookup(&[key('p'), right]), Lookup::Run(Command::Action(SplitRight)));
-        assert_eq!(km.lookup(&[key('n')]), Lookup::Run(Command::Action(NewPane)));
+        assert_eq!(km.lookup(&[key('P'), right]), run(SplitRight));
         assert_eq!(km.lookup(&[key('q')]), Lookup::Nothing);
+        // The same verbs in every menu.
+        for menu in ['P', 'T', 'W'] {
+            assert!(matches!(km.lookup(&[key(menu), key('x')]), Lookup::Run(_)), "{menu} x");
+            assert!(matches!(km.lookup(&[key(menu), key('e')]), Lookup::Run(_)), "{menu} e");
+        }
+    }
+
+    #[test]
+    fn the_menu_lists_main_actions_then_keys_then_menus() {
+        let (km, _) = Keymap::build(&cfg("").keys);
         let root = km.menu(&[]);
-        let panes = root.iter().find(|e| e.key == KeySpec::parse("p").unwrap()).unwrap();
+        let first_plain = root.iter().position(|e| !e.main).unwrap();
+        let first_menu = root.iter().position(|e| e.group).unwrap();
+        assert!(root[..first_plain].iter().all(|e| e.main) && first_plain == 9, "{root:?}");
+        assert!(root[first_plain..first_menu].iter().all(|e| !e.main && !e.group));
+        assert!(root[first_menu..].iter().all(|e| e.group));
+        assert_eq!(root[0].label, "Connect to a server");
+        let panes = root.iter().find(|e| e.key == KeySpec::parse("P").unwrap()).unwrap();
         assert!(panes.group && panes.label == "Panes");
-        assert!(root.iter().any(|e| e.label == "New pane" && !e.group));
-        let p = km.menu(&[key('p')]);
-        assert!(p.iter().any(|e| e.label == "Resize panes"));
-        let b: Vec<String> = km.menu(&[key('b')]).into_iter().map(|e| e.label).collect();
-        assert!(b.contains(&"To this tab".to_string()) && b.contains(&"Stop broadcasting".to_string()), "{b:?}");
-        assert_eq!(km.hint(SplitRight).as_deref(), Some("ctrl+b p right"));
+        assert!(km.menu(&[key('P')]).iter().any(|e| e.label == "Resize panes"));
+        let b: Vec<String> = km.menu(&[key('B')]).into_iter().map(|e| e.label).collect();
+        assert_eq!(b[0], "On/off");
+        assert!(b.contains(&"To this workspace".to_string()) && b.contains(&"Stop broadcasting".to_string()), "{b:?}");
+        assert_eq!(km.hint(SplitRight).as_deref(), Some("ctrl+b P right"));
+        assert_eq!(km.hint(SshPicker).as_deref(), Some("ctrl+b s"));
         assert_eq!(km.hint(NewPane).as_deref(), Some("alt+n"));
+        assert_eq!(km.menu_hint("broadcast").as_deref(), Some("ctrl+b B"));
+        // The reference covers the menus and the modes.
+        let reference = km.reference(false);
+        assert!(reference.iter().any(|(t, _)| t == "Servers (ctrl+b S)"), "{reference:?}");
+        assert!(reference.iter().any(|(t, _)| t == "Copy mode"));
+    }
+
+    #[test]
+    fn the_prefix_twice_sends_it_whatever_it_is() {
+        let (km, warnings) = Keymap::build(&cfg("[keys]\nprefix = [\"ctrl+a\", \"ctrl+space\"]\n").keys);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        let ctrl = |c: char| Key { code: KeyCode::Char(c), mods: Mods::CTRL, raw: Vec::new() };
+        assert_eq!(km.lookup(&[ctrl('a')]), Lookup::Run(Command::Action(SendPrefix)));
+        assert_eq!(km.lookup(&[ctrl(' ')]), Lookup::Run(Command::Action(SendPrefix)));
+        assert_eq!(km.lookup(&[ctrl('b')]), Lookup::Nothing);
+    }
+
+    #[test]
+    fn menus_move_like_actions() {
+        let (km, warnings) = Keymap::build(&cfg("[keys.leader]\nmenu_servers = [\"M\"]\nmenu_view = []\n").keys);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(km.lookup(&[key('M'), key('u')]), Lookup::Run(Command::Action(Upload)));
+        assert_eq!(km.lookup(&[key('S')]), Lookup::Nothing);
+        assert_eq!(km.group_title(&[KeySpec::parse("M").unwrap()]), Some("Servers"));
+        // Without its menu, the View theme keeps its single keys.
+        assert_eq!(km.lookup(&[key('V')]), Lookup::Nothing);
+        assert_eq!(km.lookup(&[key('v')]), Lookup::Run(Command::Action(ScrollMode)));
+        assert!(!km.is_main(ScrollMode));
+        let (_, warnings) = Keymap::build(&cfg("[keys.leader]\nmenu_nope = [\"N\"]\n").keys);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        // A menu on a key taken by an action is reported.
+        let (_, warnings) = Keymap::build(&cfg("[keys.leader]\nmenu_tabs = [\"n\"]\n").keys);
+        assert!(!warnings.is_empty());
     }
 
     #[test]
     fn user_bindings_replace_the_preset_and_collisions_are_reported() {
-        let (km, warnings) = Keymap::build(&cfg("[keys.leader]\nsplit_right = [\"%\"]\nnew_tab = [\"p\"]\n").keys);
+        let (km, warnings) = Keymap::build(&cfg("[keys.leader]\nsplit_right = [\"%\"]\nnew_tab = [\"P\"]\n").keys);
         assert_eq!(km.lookup(&[key('%')]), Lookup::Run(Command::Action(SplitRight)));
         assert!(km.all_hints(&Command::Action(SplitRight)).iter().all(|h| !h.contains("right")));
-        assert_eq!(warnings.len(), 1, "p is the Panes menu: {warnings:?}");
+        assert_eq!(warnings.len(), 1, "P is the Panes menu: {warnings:?}");
         // The older table name still works.
         let (km, warnings) = Keymap::build(&cfg("[keys.prefixed]\ntoggle_sync = [\"y\"]\n").keys);
         assert!(warnings.is_empty(), "{warnings:?}");
@@ -757,8 +1054,8 @@ mod tests {
         let c = cfg("[tools.lazygit]\nkey = \"l\"\n[tools.mine]\ncommand = \"tig\"\nkey = \"g\"\n");
         let (mut km, _) = Keymap::build(&c.keys);
         let warnings = km.bind_tools(&c.tools);
-        assert_eq!(warnings.len(), 1, "r g is git: {warnings:?}");
-        assert_eq!(km.lookup(&[key('r'), key('l')]), Lookup::Run(Command::Tool("lazygit".into())));
+        assert_eq!(warnings.len(), 1, "R g is git: {warnings:?}");
+        assert_eq!(km.lookup(&[key('R'), key('l')]), Lookup::Run(Command::Tool("lazygit".into())));
         // Classic: a tool key follows the prefix directly, and may not take a command's key.
         let classic_cfg = cfg(
             "[keys]\npreset = \"classic\"\n[tools.lazygit]\nkey = \"i\"\n[tools.mine]\ncommand = \"tig\"\nkey = \"l\"\n",
@@ -771,7 +1068,7 @@ mod tests {
         // Keys that send the same byte collide (ctrl+m is enter).
         let c = cfg("[tools.mine]\ncommand = \"tig\"\nkey = \"ctrl+m\"\n");
         let (mut km, _) = Keymap::build(&c.keys);
-        assert_eq!(km.bind_tools(&c.tools).len(), 1, "r ctrl+m is r enter");
+        assert_eq!(km.bind_tools(&c.tools).len(), 1, "R ctrl+m is R enter");
         let (_, warnings) = Keymap::build(&cfg("[keys.direct]\nnew_tab = [\"ctrl+b\"]\n").keys);
         assert!(warnings.iter().any(|w| w.contains("prefix")), "{warnings:?}");
     }

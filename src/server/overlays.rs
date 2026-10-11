@@ -123,6 +123,23 @@ pub(super) struct MenuItem {
     pub(super) group: bool,
     /// The key a click on the entry presses (none for an entry standing for several keys).
     pub(super) press: Option<KeySpec>,
+    /// Main actions (0), other keys (1) and menus (2) go in columns of their own when they fit.
+    pub(super) section: u8,
+}
+
+/// Commands the menu's footer names instead of a line of their own.
+fn in_footer(e: &MenuEntry) -> bool {
+    matches!(e.command, Some(Command::Action(Action::Help | Action::Detach | Action::SendPrefix)))
+}
+
+/// The keys of the menu's footer, besides how to leave: help and detach.
+pub(super) fn menu_footer(entries: &[MenuEntry]) -> Vec<(String, String)> {
+    let ascii = th().ascii;
+    entries
+        .iter()
+        .filter(|e| in_footer(e) && !matches!(e.command, Some(Command::Action(Action::SendPrefix))))
+        .map(|e| (crate::keymap::pretty(&e.key, ascii), e.label.to_lowercase()))
+        .collect()
 }
 
 /// The entries of a menu, in the keymap's order.
@@ -137,7 +154,7 @@ pub(super) fn menu_items(entries: &[MenuEntry]) -> Vec<MenuItem> {
     let tab = |e: &MenuEntry| matches!(e.command, Some(Command::Action(Action::Tab(_))));
     let mut items: Vec<MenuItem> = Vec::new();
     let (mut focus_done, mut tab_done) = (false, false);
-    for e in entries {
+    for e in entries.iter().filter(|e| !in_footer(e)) {
         if focus(e) {
             if !std::mem::replace(&mut focus_done, true) {
                 // In the order of hjkl.
@@ -157,19 +174,27 @@ pub(super) fn menu_items(entries: &[MenuEntry]) -> Vec<MenuItem> {
                 } else {
                     found.iter().map(|x| crate::keymap::pretty(&x.key, ascii)).collect::<Vec<_>>().join("/")
                 };
-                items.push(MenuItem { key, label: "Focus".into(), group: false, press: None });
+                items.push(MenuItem { key, label: "Focus".into(), group: false, press: None, section: 1 });
             }
             continue;
         }
         if tab(e) {
             if !std::mem::replace(&mut tab_done, true) {
                 let n = entries.iter().filter(|x| tab(x)).count();
-                items.push(MenuItem { key: format!("1-{n}"), label: "Go to tab".into(), group: false, press: None });
+                let key = format!("1-{n}");
+                items.push(MenuItem { key, label: "Go to tab".into(), group: false, press: None, section: 1 });
             }
             continue;
         }
         let key = crate::keymap::pretty(&e.key, ascii);
-        items.push(MenuItem { key, label: e.label.clone(), group: e.group, press: Some(e.key.clone()) });
+        let section = if e.group {
+            2
+        } else if e.main {
+            0
+        } else {
+            1
+        };
+        items.push(MenuItem { key, label: e.label.clone(), group: e.group, press: Some(e.key.clone()), section });
     }
     items
 }
@@ -202,19 +227,43 @@ const MENU_GAP: usize = 3;
 /// Shortest a label gets when the screen is too narrow for the menu.
 const MENU_LABEL_MIN: usize = 6;
 
-/// Widths of the key and of the whole column, entries going down `lines` rows before the next
-/// column, labels shortened to `cap` (menu names stay whole: they are short).
-fn menu_columns(items: &[MenuItem], lines: usize, cap: usize) -> Vec<(usize, usize)> {
-    let mut out = vec![(0, 0); items.len().div_ceil(lines)];
-    for (n, it) in items.iter().enumerate() {
-        out[n / lines].0 = out[n / lines].0.max(columns(&it.key));
+/// Widths of the key and of the whole of each column (indices into `items`), labels shortened to
+/// `cap` (menu names stay whole: they are short).
+fn column_widths(items: &[MenuItem], cols: &[Vec<usize>], cap: usize) -> Vec<(usize, usize)> {
+    cols.iter()
+        .map(|col| {
+            let key_w = col.iter().map(|&i| columns(&items[i].key)).max().unwrap_or(0);
+            let width = col
+                .iter()
+                .map(|&i| {
+                    let it = &items[i];
+                    let label = if it.group { columns(&it.label) } else { columns(&it.label).min(cap) };
+                    key_w + 2 + label + usize::from(it.group)
+                })
+                .max()
+                .unwrap_or(0);
+            (key_w, width)
+        })
+        .collect()
+}
+
+/// Entries going down `lines` rows before the next column, like `ls`.
+fn flow(n: usize, lines: usize) -> Vec<Vec<usize>> {
+    (0..n).collect::<Vec<_>>().chunks(lines.max(1)).map(<[usize]>::to_vec).collect()
+}
+
+/// One column per section (main actions, other keys, menus), when each fits the height.
+fn by_section(items: &[MenuItem], max_lines: usize) -> Option<Vec<Vec<usize>>> {
+    let mut cols: Vec<Vec<usize>> = Vec::new();
+    let mut last = None;
+    for (i, it) in items.iter().enumerate() {
+        if last != Some(it.section) {
+            cols.push(Vec::new());
+            last = Some(it.section);
+        }
+        cols.last_mut()?.push(i);
     }
-    for (n, it) in items.iter().enumerate() {
-        let c = &mut out[n / lines];
-        let label = if it.group { columns(&it.label) } else { columns(&it.label).min(cap) };
-        c.1 = c.1.max(c.0 + 2 + label + usize::from(it.group));
-    }
-    out
+    (cols.len() > 1 && cols.iter().all(|c| c.len() <= max_lines)).then_some(cols)
 }
 
 pub(super) fn menu_layout(items: &[MenuItem], full: Rect) -> MenuLayout {
@@ -226,32 +275,42 @@ pub(super) fn menu_layout(items: &[MenuItem], full: Rect) -> MenuLayout {
         return layout;
     }
     // Frame and padding: two columns on each side.
-    let total = |lines: usize, cap: usize| {
-        let w = menu_columns(items, lines, cap);
+    let total = |cols: &[Vec<usize>], cap: usize| {
+        let w = column_widths(items, cols, cap);
         w.iter().map(|c| c.1).sum::<usize>() + MENU_GAP * (w.len() - 1) + 4
     };
-    // Up to three columns while the width allows, more when the height needs them.
-    let fewest = items.len().div_ceil(max_lines);
-    let most = fewest.max(3).min(items.len());
-    let lines = (fewest..=most)
-        .rev()
-        .map(|c| items.len().div_ceil(c))
-        .find(|&l| total(l, usize::MAX) <= max_w)
-        .unwrap_or(items.len().div_ceil(fewest));
     // Labels get shorter only when even that is too wide.
     let longest = items.iter().map(|i| columns(&i.label)).max().unwrap_or(0);
-    let cap = (MENU_LABEL_MIN..=longest.max(MENU_LABEL_MIN)).rev().find(|&c| total(lines, c) <= max_w).unwrap_or(0);
-    let widths = menu_columns(items, lines, cap);
-    let w = total(lines, cap).min(max_w) as u16;
+    let fit =
+        |cols: &[Vec<usize>]| (MENU_LABEL_MIN..=longest.max(MENU_LABEL_MIN)).rev().find(|&c| total(cols, c) <= max_w);
+    // The sections side by side when they fit; else the entries flow down up to three columns
+    // while the width allows, more when the height needs them.
+    let (cols, cap) = match by_section(items, max_lines).and_then(|cols| fit(&cols).map(|cap| (cols, cap))) {
+        Some(found) => found,
+        None => {
+            let fewest = items.len().div_ceil(max_lines);
+            let most = fewest.max(3).min(items.len());
+            let lines = (fewest..=most)
+                .rev()
+                .map(|c| items.len().div_ceil(c))
+                .find(|&l| total(&flow(items.len(), l), usize::MAX) <= max_w)
+                .unwrap_or(items.len().div_ceil(fewest));
+            let cols = flow(items.len(), lines);
+            let cap = fit(&cols).unwrap_or(0);
+            (cols, cap)
+        }
+    };
+    let lines = cols.iter().map(Vec::len).max().unwrap_or(1);
+    let widths = column_widths(items, &cols, cap);
+    let w = total(&cols, cap).min(max_w) as u16;
     let h = (lines as u16 + 4).min(full.height - 1);
     layout.area = Rect::new(full.x + full.width - w - 1, full.y + full.height - h, w, h);
     let right = layout.area.right() - 2;
     let mut x = layout.area.x + 2;
     for (c, (key_w, width)) in widths.iter().enumerate() {
-        for line in 0..lines {
-            let n = c * lines + line;
+        for (line, &n) in cols[c].iter().enumerate() {
             // The bottom border, a blank line and the keys of the box come after the entries.
-            if n >= items.len() || line as u16 + 4 >= h || x >= right {
+            if line as u16 + 4 >= h || x >= right {
                 continue;
             }
             let area = Rect::new(x, layout.area.y + 1 + line as u16, (*width as u16).min(right - x), 1);
@@ -262,12 +321,12 @@ pub(super) fn menu_layout(items: &[MenuItem], full: Rect) -> MenuLayout {
     layout
 }
 
-/// The leader menu: `title` says where it is; its last line, how to leave, or why a key did
-/// nothing (`miss`).
+/// The leader menu: `title` says where it is; its last line, the `footer` keys and how to leave,
+/// or why a key did nothing (`miss`).
 pub(super) fn draw_menu(
     items: &[MenuItem],
     layout: &MenuLayout,
-    title: &str,
+    (title, footer): (&str, &[(String, String)]),
     back: bool,
     miss: Option<&str>,
     buf: &mut Buffer,
@@ -300,10 +359,14 @@ pub(super) fn draw_menu(
         buf.set_line(cell.area.x, cell.area.y, &Line::from(spans), cell.area.width);
     }
     let footer_y = inner.y + inner.height - 1;
+    let mut keys: Vec<(&str, &str)> = footer.iter().map(|(k, w)| (k.as_str(), w.as_str())).collect();
+    if back {
+        keys.push(("⌫", "back"));
+    }
+    keys.push(("esc", "close"));
     let line = match miss {
         Some(m) => Line::from(Span::styled(m.to_string(), Style::default().fg(t.blocked))),
-        None if back => key_line(&[("esc", "close"), ("⌫", "back")], "", inner.width.saturating_sub(2)),
-        None => key_line(&[("esc", "close")], "", inner.width.saturating_sub(2)),
+        None => key_line(&keys, "", inner.width.saturating_sub(2)),
     };
     buf.set_line(inner.x + 1, footer_y, &line, inner.width.saturating_sub(2));
 }
@@ -689,7 +752,8 @@ mod tests {
             }
             draw_picker(&picker, area, &mut buf);
             draw_prompt(&prompt, area, &mut buf);
-            draw_menu(&menu, &menu_layout(&menu, area), "ctrl+b", false, Some("q does nothing here"), &mut buf);
+            let layout = menu_layout(&menu, area);
+            draw_menu(&menu, &layout, ("ctrl+b", &[]), false, Some("q does nothing here"), &mut buf);
             draw_viewer("Help", &lines, 99, &[("esc", "close")], area, &mut buf);
         }
     }
@@ -724,13 +788,39 @@ mod tests {
                 assert!(inside.contains(Position::new(cell.area.right() - 1, cell.area.y)), "{preset} {size:?}");
             }
             let mut buf = Buffer::empty(full);
-            draw_menu(&items, &layout, "ctrl+b", false, None, &mut buf);
+            let footer = menu_footer(&km.menu(&[]));
+            draw_menu(&items, &layout, ("ctrl+b", &footer), false, None, &mut buf);
             let text = screen(&buf, layout.area);
             for cell in &layout.cells {
                 let key = &items[cell.item].key;
                 assert!(text.contains(key.as_str()), "{preset} {size:?}: {key}\n{text}");
             }
+            assert!(text.contains("help") && text.contains("esc close"), "{preset} {size:?}\n{text}");
         }
+    }
+
+    #[test]
+    fn the_kraal_menu_reads_as_three_columns() {
+        let (km, _) = crate::keymap::Keymap::build(&crate::config::Config::default().keys);
+        let items = menu_items(&km.menu(&[]));
+        let full = Rect::new(0, 0, 100, 30);
+        let layout = menu_layout(&items, full);
+        let column = |section: u8| -> Vec<u16> {
+            let mut xs: Vec<u16> =
+                layout.cells.iter().filter(|c| items[c.item].section == section).map(|c| c.area.x).collect();
+            xs.dedup();
+            xs
+        };
+        // Main actions, other keys and menus each in one column, in that order.
+        let (main, keys, menus) = (column(0), column(1), column(2));
+        assert!(main.len() == 1 && keys.len() == 1 && menus.len() == 1, "{main:?} {keys:?} {menus:?}");
+        assert!(main[0] < keys[0] && keys[0] < menus[0]);
+        let mut buf = Buffer::empty(full);
+        let footer = menu_footer(&km.menu(&[]));
+        draw_menu(&items, &layout, ("ctrl+b", &footer), false, None, &mut buf);
+        let text = screen(&buf, layout.area);
+        assert!(text.contains("s  Connect to a server") && text.contains("S  Servers…"), "{text}");
+        assert!(text.contains("h help") && text.contains("d detach"), "{text}");
     }
 
     #[test]

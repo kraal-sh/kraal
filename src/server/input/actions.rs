@@ -10,6 +10,19 @@ use crate::server::ui::{ConfirmAction, Mode, Prompt, PromptAction};
 use crate::server::{ClientId, Server, Tab};
 
 impl Server {
+    /// Give the focused pane a prefix key: `key` as pressed, or the first prefix.
+    pub(super) fn send_prefix(&mut self, id: ClientId, key: Option<crate::input::Key>) {
+        let key = key.or_else(|| {
+            let spec = self.keymap.prefix.first()?;
+            Some(crate::input::Key { code: spec.code, mods: spec.mods, raw: Vec::new() })
+        });
+        if let (Some(p), Some(key)) = (self.client_focus(id), key)
+            && let Some(pane) = self.panes.get_mut(&p)
+        {
+            pane.write_input(encode_key(&key, pane.input_modes()));
+        }
+    }
+
     pub(super) fn action(&mut self, id: ClientId, action: Action) -> Mode {
         let Some((ws, wi)) = self.current_ws(id) else { return Mode::Normal };
         let focus = self.workspaces[wi].tab().focus;
@@ -204,7 +217,7 @@ impl Server {
                 };
                 if scope == SyncScope::Marked && ws.marked.is_empty() {
                     let how = self.keymap.hint(Action::SelectForBroadcast).unwrap_or_default();
-                    self.toast(id, format!("Select the panes first ({how} in each)."));
+                    self.toast(id, format!("Mark the panes first ({how} in each)."));
                     return Mode::Normal;
                 }
                 ws.sync = scope;
@@ -212,6 +225,14 @@ impl Server {
                     ws.marked.clear();
                     ws.sync_approved.clear();
                     self.toast(id, "Broadcast stopped: typing goes to the focused pane only.");
+                } else if action == Action::BroadcastToggle && !std::mem::replace(&mut self.broadcast_tip_shown, true) {
+                    // Once per server run: the key that starts it also stops it.
+                    let again = self.keymap.hint(Action::BroadcastToggle).unwrap_or_default();
+                    let msg = match self.keymap.menu_hint("broadcast") {
+                        Some(more) => format!("{again} again stops it; {more} for more."),
+                        None => format!("{again} again stops it."),
+                    };
+                    self.toast(id, msg);
                 }
                 self.mark_dirty();
             }
@@ -288,14 +309,7 @@ impl Server {
                 );
             }
             Action::EditServers => self.edit_servers(id),
-            Action::SendPrefix => {
-                if let (Some(p), Some(spec)) = (focus, self.keymap.prefix.first().cloned())
-                    && let Some(pane) = self.panes.get_mut(&p)
-                {
-                    let key = crate::input::Key { code: spec.code, mods: spec.mods, raw: Vec::new() };
-                    pane.write_input(encode_key(&key, pane.input_modes()));
-                }
-            }
+            Action::SendPrefix => self.send_prefix(id, None),
         }
         self.mark_persist();
         // What changed (the tab shown, the focus, floating panes) changed for every client

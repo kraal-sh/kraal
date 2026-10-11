@@ -23,7 +23,8 @@ impl Server {
         }
         let Some(target) = self.client_focus(client).filter(|p| self.panes.get(p).is_some_and(|p| p.is_terminal()))
         else {
-            self.toast(client, "focus the terminal pane the steps should run in, then ctrl+b r");
+            let key = self.runbooks_key();
+            self.toast(client, format!("focus the terminal pane the steps should run in, then {key}"));
             return Mode::Normal;
         };
         let ws = self.clients.get(&client).map(|c| c.workspace).unwrap_or(0);
@@ -174,7 +175,7 @@ impl Server {
         let target = s.target;
         let Some(pane) = self.panes.get(&target).filter(|p| p.exit_code.is_none() && p.is_terminal()) else {
             self.md_sessions.remove(&client);
-            return Err("the pane the steps ran in is gone; focus another one and ctrl+b r".into());
+            return Err(format!("the pane the steps ran in is gone; focus another one and {}", self.runbooks_key()));
         };
         let label = self.pane_label(target);
         if pane.ssh.is_none() && !pane.shell_waiting() {
@@ -262,7 +263,11 @@ impl Server {
         s.sent.insert(index);
         let left = total - s.sent.len();
         let label = self.pane_label(target);
-        let next = if left > 0 { " · ctrl+b r: next step" } else { " · that was the last step" };
+        let next = if left > 0 {
+            format!(" · {}: next step", self.runbooks_key())
+        } else {
+            " · that was the last step".into()
+        };
         self.toast(client, format!("step {}/{total} sent to {label}{next}", index + 1));
         Mode::Normal
     }

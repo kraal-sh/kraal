@@ -150,7 +150,7 @@ pub(super) fn run(action: RunbookCmd, socket: &std::path::Path, own_pane: Option
         RunbookCmd::Run { name, on, params, yes, dry_run, wait } => {
             let r = find_runbook(&name)?;
             let runbooks::Body::Steps(steps) = &r.body else {
-                anyhow::bail!("{name} is a document: open it in kraal with ctrl+b r and run its steps there");
+                anyhow::bail!("{name} is a document: open it in kraal (ctrl+b R b) and run its steps there");
             };
             let mut values = Vec::new();
             for p in &params {

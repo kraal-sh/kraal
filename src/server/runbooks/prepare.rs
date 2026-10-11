@@ -85,7 +85,8 @@ impl Server {
             lines.push(format!("  {}. {}", i + 1, first_line(st)));
         }
         if steps.len() > 8 {
-            lines.push(format!("  … and {} more steps (ctrl+b r, ctrl+e shows the file)", steps.len() - 8));
+            let key = self.runbooks_key();
+            lines.push(format!("  … and {} more steps ({key}, ctrl+e shows the file)", steps.len() - 8));
         }
         for p in d.steps.params.iter().filter_map(|p| p.choices_command.as_ref()) {
             lines.push(format!("  and lists choices with: {}", first_line(p)));
@@ -360,7 +361,7 @@ impl Server {
     ) -> Result<(String, String)> {
         let r = runbooks::load(path, runbooks::source_of(path))?;
         let Body::Steps(steps) = &r.body else {
-            bail!("{} is a document: open it in kraal with ctrl+b r and run its steps there", r.name)
+            bail!("{} is a document: open it in kraal with {} and run its steps there", r.name, self.runbooks_key())
         };
         let steps = (**steps).clone();
         let targets = match (target, steps.on) {

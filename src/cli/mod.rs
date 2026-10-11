@@ -145,7 +145,17 @@ fn run(cli: Cli) -> Result<()> {
         // Run by `main` before the session is read.
         Some(Cmd::Supervise { .. }) => Ok(()),
         Some(Cmd::Integration { action, agent }) => agents::integration(&action, &agent),
-        Some(Cmd::Config { action }) => config_cmd(&action),
+        Some(Cmd::Config { action, .. }) if action == "reload" => {
+            // The server keeps its configuration when the file cannot be read: that is an error.
+            if let Response::Text(warnings) = s.request(Request::ReloadConfig)? {
+                for w in warnings.lines() {
+                    eprintln!("warning: {w}");
+                }
+            }
+            println!("config reloaded");
+            Ok(())
+        }
+        Some(Cmd::Config { action, markdown }) => config_cmd(&action, markdown),
     }
 }
 
@@ -211,25 +221,66 @@ fn resolve_targets(known: &[servers::Known], targets: &[String]) -> Result<Vec<s
     Ok(out)
 }
 
-/// `kraal config`: print the defaults or the path, or check the configuration.
-fn config_cmd(action: &str) -> Result<()> {
+/// `kraal config keys`: every key, grouped as the help shows them, then the names that
+/// `[keys.leader]` and `[keys.direct]` take, with what each does and its keys now.
+fn print_keys(keymap: &crate::keymap::Keymap, markdown: bool) {
+    use crate::keymap::{Action, Command};
+    let cell = |s: &str| s.replace('|', "\\|");
+    let mut names: Vec<(String, String, String)> = Action::all()
+        .map(|a| {
+            let name = match a {
+                Action::Tab(_) => "tab_1 … tab_9".to_string(),
+                _ => a.name(),
+            };
+            (name, a.describe(), keymap.all_hints(&Command::Action(a)).join(", "))
+        })
+        .collect();
+    for m in &keymap.menus {
+        let keys = m.keys.iter().map(|k| format!("{} {k}", keymap.prefix_label())).collect::<Vec<_>>().join(", ");
+        names.push((format!("menu_{}", m.id), format!("The {} menu", m.title), keys));
+    }
+    let title = format!("kraal keys: preset {}, prefix {}", keymap.preset, keymap.prefix_label());
+    if markdown {
+        println!("# {title}\n");
+        for (section, rows) in keymap.reference(false) {
+            println!("## {section}\n\n| Keys | What it does |\n|---|---|");
+            for (k, what) in rows {
+                println!("| `{}` | {} |", cell(&k), cell(&what));
+            }
+            println!();
+        }
+        println!("## Names for `[keys.leader]` and `[keys.direct]`\n\n| Name | What it does | Keys |\n|---|---|---|");
+        for (name, what, keys) in names {
+            println!("| `{name}` | {} | {} |", cell(&what), cell(&keys));
+        }
+        return;
+    }
+    println!("{title}\n");
+    for (section, rows) in keymap.reference(false) {
+        println!("{section}");
+        let w = rows.iter().map(|(k, _)| crate::text::columns(k)).max().unwrap_or(0).min(28);
+        for (k, what) in rows {
+            let pad = w.saturating_sub(crate::text::columns(&k));
+            println!("  {k}{}  {what}", " ".repeat(pad));
+        }
+        println!();
+    }
+    println!("Names for [keys.leader] and [keys.direct]");
+    for (name, what, keys) in names {
+        println!("  {name:<22} {what:<40} {keys}");
+    }
+}
+
+/// `kraal config`: print the defaults, the path or the keys, or check the configuration.
+fn config_cmd(action: &str, markdown: bool) -> Result<()> {
     match action {
         "default" => print!("{}", config::DEFAULT_CONFIG),
         "path" => println!("{}", paths::config_path().display()),
         "keys" => {
-            // Every command: its name in [keys.leader], what it does, and its keys now.
             let cfg = config::Config::load()?;
             let (mut keymap, _) = crate::keymap::Keymap::build(&cfg.keys);
             let _ = keymap.bind_tools(&cfg.tools);
-            println!("preset {} · prefix {}\n", keymap.preset, keymap.prefix_label());
-            for a in crate::keymap::Action::all() {
-                let keys = keymap.all_hints(&crate::keymap::Command::Action(a));
-                let name = match a {
-                    crate::keymap::Action::Tab(_) => "tab_1 … tab_9".to_string(),
-                    _ => a.name(),
-                };
-                println!("{name:<22} {:<38} {}", a.describe(), keys.join(", "));
-            }
+            print_keys(&keymap, markdown);
         }
         _ => {
             let cfg = config::Config::load()?;

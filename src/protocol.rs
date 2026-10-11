@@ -254,6 +254,8 @@ pub enum Request {
         workspace: Option<String>,
         name: Option<String>,
     },
+    /// Read the configuration file again; answered with its warnings, one per line.
+    ReloadConfig,
     KillServer,
 }
 

@@ -114,9 +114,12 @@ impl Server {
                     let named = self.keymap.group_title(&specs).unwrap_or("…");
                     title = format!("{title} {} · {named}", keys.join(" "));
                 }
-                let items = overlays::menu_items(&self.keymap.menu(typed));
+                let entries = self.keymap.menu(typed);
+                let items = overlays::menu_items(&entries);
+                let footer = overlays::menu_footer(&entries);
                 let layout = overlays::menu_layout(&items, full);
-                overlays::draw_menu(&items, &layout, &title, !typed.is_empty(), miss.as_deref(), &mut buf);
+                let back = !typed.is_empty();
+                overlays::draw_menu(&items, &layout, (&title, &footer), back, miss.as_deref(), &mut buf);
                 // Links under the menu would open from it.
                 links.retain(|&(x, y), _| !layout.area.contains(ratatui::layout::Position::new(x, y)));
                 None
@@ -313,7 +316,8 @@ impl Server {
         let prod = targets.iter().filter(|p| self.pane_production_shown(**p).is_some()).count();
         let prod_text = if prod > 0 { format!(", {prod} PROD") } else { String::new() };
         let full = format!("BROADCAST → {n} pane{}{prod_text}", if n == 1 { "" } else { "s" });
-        let stop = self.keymap.hint(Action::BroadcastOff).or_else(|| self.keymap.hint(Action::BroadcastToggle));
+        // The toggle stops any broadcast, and its key is usually the shorter.
+        let stop = self.keymap.hint(Action::BroadcastToggle).or_else(|| self.keymap.hint(Action::BroadcastOff));
         let stop_w = stop.as_ref().map_or(0, |k| k.width() + " stop".len());
         let room = room as usize;
         let tiny = format!("B{n}{}", if prod > 0 { " PROD" } else { "" });
@@ -915,13 +919,11 @@ impl Server {
 
     // ---- help and messages -------------------------------------------------------------
 
-    /// The reference, from the keymap in use: commands by menu, direct keys, then the keys of
-    /// lists, dialogs and modes, and the mouse.
+    /// The reference, from the keymap in use: the keys after the prefix, each menu, the direct
+    /// keys, then the keys of lists, dialogs and modes, and the mouse.
     pub(super) fn help_lines(&self) -> Vec<Line<'static>> {
-        use crate::keymap::Command;
         let km = &self.keymap;
         let p = km.prefix_label();
-        let ascii = th().ascii;
         let mut out = vec![
             Line::from(vec![
                 Span::raw("Press "),
@@ -932,90 +934,12 @@ impl Server {
                 Some(k) => format!("Search every command with {k}. Keys preset: {}.", km.preset),
                 None => format!("Keys preset: {}.", km.preset),
             }),
-            Line::raw(""),
         ];
-        let seq = |keys: &[crate::input::KeySpec]| -> String {
-            let mut parts = vec![p.clone()];
-            parts.extend(keys.iter().map(|k| crate::keymap::pretty(k, ascii)));
-            parts.join(" ")
-        };
-        // Sections: commands with one key, then each menu.
-        let mut sections: Vec<(String, Vec<(String, String)>)> = vec![("Common".into(), Vec::new())];
-        let mut seen: Vec<Command> = Vec::new();
-        for (keys, cmd) in &km.leader {
-            if seen.contains(cmd) {
-                continue;
-            }
-            seen.push(cmd.clone());
-            use crate::keymap::Action::{FocusDown, FocusLeft, FocusRight, FocusUp};
-            let what = match cmd {
-                Command::Action(crate::keymap::Action::Tab(n)) if *n > 1 => continue,
-                Command::Action(FocusDown | FocusRight | FocusUp) if keys.len() == 1 => continue,
-                Command::Action(FocusLeft) if keys.len() == 1 => "Focus the pane on that side".to_string(),
-                Command::Action(crate::keymap::Action::Tab(_)) => "Go to tab 1-9".to_string(),
-                Command::Action(a) => a.describe(),
-                Command::Tool(t) => format!("Tool: {t}"),
-            };
-            let title = match keys.len() {
-                1 => "Common".to_string(),
-                _ => km.group_title(&keys[..1]).map(str::to_string).unwrap_or_else(|| format!("{} …", keys[0])),
-            };
-            let shown = match cmd {
-                Command::Action(crate::keymap::Action::Tab(_)) => format!("{p} 1…9"),
-                Command::Action(FocusLeft) if keys.len() == 1 => {
-                    format!("{p} {}", if ascii { "arrows" } else { "←↓↑→" })
-                }
-                _ => seq(keys),
-            };
-            match sections.iter_mut().find(|(t, _)| *t == title) {
-                Some((_, v)) => v.push((shown, what)),
-                None => sections.push((title, vec![(shown, what)])),
-            }
+        if !km.menus.is_empty() {
+            out.push(Line::from(format!("Lowercase: a theme's main action ({p} s). Capital: its menu ({p} S).")));
         }
-        let direct: Vec<(String, String)> = km.direct.iter().map(|(k, a)| (k.to_string(), a.describe())).collect();
-        if !direct.is_empty() {
-            sections.push(("Without the prefix".into(), direct));
-        }
-        let fixed =
-            |rows: &[(&str, &str)]| rows.iter().map(|(k, w)| (k.to_string(), w.to_string())).collect::<Vec<_>>();
-        sections.push((
-            "In lists".into(),
-            fixed(&[
-                ("type", "filter"),
-                ("↑ ↓", "move"),
-                ("⏎", "choose"),
-                ("tab", "more actions on the selected item"),
-                ("esc", "close"),
-            ]),
-        ));
-        sections.push((
-            "In text fields".into(),
-            fixed(&[
-                ("← → home end", "move (alt+← → by word)"),
-                ("ctrl+w ctrl+u ctrl+k", "delete a word, to the start, to the end"),
-                ("⏎ / esc", "accept / cancel"),
-            ]),
-        ));
-        sections.push((
-            "Copy mode".into(),
-            fixed(&[
-                ("arrows hjkl w b", "move"),
-                ("v V ctrl+v", "select characters, lines, a block"),
-                ("y or ⏎", "copy and leave"),
-                ("/ n N", "search, next, previous"),
-                ("esc q", "leave"),
-            ]),
-        ));
-        sections.push((
-            "Mouse".into(),
-            fixed(&[
-                ("click", "focus a pane, tab, workspace or agent"),
-                ("drag a border", "resize panes"),
-                ("drag in a pane", "select and copy (double: word, triple: line)"),
-                ("ctrl+click", "open a link; on a title: select for broadcast"),
-                ("shift + mouse", "your terminal's own selection"),
-            ]),
-        ));
+        out.push(Line::raw(""));
+        let sections = km.reference(th().ascii);
         let key_w = sections.iter().flat_map(|(_, v)| v.iter().map(|(k, _)| k.width())).max().unwrap_or(10).min(26);
         for (title, rows) in sections {
             if rows.is_empty() {

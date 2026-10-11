@@ -290,10 +290,14 @@ pub enum Cmd {
         #[arg(default_value = "all")]
         agent: String,
     },
-    /// Configuration helpers.
+    /// Configuration helpers: `default` prints every setting, `path` where the file is, `check`
+    /// validates it, `keys` prints every key, `reload` makes the running server read it again.
     Config {
-        #[arg(value_parser = ["default", "path", "check", "keys"])]
+        #[arg(value_parser = ["default", "path", "check", "keys", "reload"])]
         action: String,
+        /// With `keys`: Markdown tables, to keep or print.
+        #[arg(long)]
+        markdown: bool,
     },
     /// Run a session server in the foreground (normally started automatically).
     #[command(hide = true)]

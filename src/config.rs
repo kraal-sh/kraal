@@ -90,7 +90,7 @@ confirm_sync = true
 # Ask before pasting several lines into a production pane that would run them at once.
 confirm_paste = true
 
-# Tools: programs one key away, started where the focused pane is (ctrl+b T lists them).
+# Tools: programs one key away, started where the focused pane is (ctrl+b r lists them).
 #   command  a shell command line (run by sh -c). The pane's context is in $KRAAL_CWD,
 #            $KRAAL_SERVER, $KRAAL_HOST, $KRAAL_REPO, $KRAAL_BRANCH, $KRAAL_KUBE_CONTEXT,
 #            $KRAAL_KUBE_NAMESPACE, $KRAAL_TF_WORKSPACE, $KRAAL_AWS_PROFILE, $KRAAL_SELECTION
@@ -102,7 +102,8 @@ confirm_paste = true
 #            command always stays open).
 #   when     what the pane needs for the tool to be offered: "git", "server", "local",
 #            "kubernetes", "terraform", "aws", "selection".
-#   key      a key after the prefix that starts the tool directly, e.g. "i".
+#   key      a key that starts the tool directly: after the prefix and R (the Run menu), or
+#            right after the prefix in the classic preset, e.g. "i".
 #   read_only  true when the tool only looks: it starts on a production pane without asking.
 #   enabled  false hides a tool.
 # Tools that run here are hidden when their program is not installed. One of your own:
@@ -147,7 +148,7 @@ hold = true
 read_only = true
 
 [hints]
-# ctrl+b space labels what can be acted on in the focused pane: links, paths (with :line),
+# ctrl+b o labels what can be acted on in the focused pane: links, paths (with :line),
 # commits, addresses, IPs and known servers, Kubernetes pods, UUIDs. Type a label to copy it;
 # type it with Shift to act where the pane is: open a link (a port on the pane's server gets a
 # tunnel), edit a file at its line, `git show` a commit (or follow a container's logs), ssh to a
@@ -169,18 +170,23 @@ alphabet = "asdfqwerzxcvjklmiuopghtybn"
 #   "ssh.connected" = 'logger -t kraal "ssh $KRAAL_HOST production=$KRAAL_PRODUCTION"'
 
 [keys]
-# "kraal": the prefix opens a menu of commands grouped by what they act on: p panes, t tabs,
-# w workspaces, a agents, s servers, f files, r run, v view, b broadcast. Common ones need one
-# key (n new pane, x close, z zoom, arrows focus, 1-9 tabs, space search commands, h help).
+# "kraal": after the prefix, a theme's letter runs its main action and the same letter in
+# capitals opens its menu: s connect to a server (S servers), b broadcast on/off (B), w choose a
+# workspace (W), a start an agent (A), t new tab (T), p find a pane (P), v copy mode (V view),
+# f file manager (F), r tools here (R run). Inside every menu: n new, x close, e rename, arrows
+# previous and next. Other keys: n new pane, x close, z zoom, m mark for broadcast, o open a
+# link or path, g search the output, arrows focus, 1-9 tabs, space search commands, h help.
 # "classic": tmux's single keys after the prefix (% " x z c n p o s…).
 preset = "kraal"
-# The prefix (leader) key(s). Pressing it twice sends it to the program.
+# The prefix (leader) key(s). Pressing one twice sends it to the program.
 prefix = ["ctrl+b"]
 
 # Change a command's keys after the prefix: action = ["key", "key key"] (a space separates the
-# keys of a sequence: "p right" is p, then →); [] unbinds it. Names: `kraal config keys`.
+# keys of a sequence: "P right" is P, then →); [] unbinds it. A menu moves the same way:
+# menu_servers = ["M"] (menus: servers, broadcast, workspaces, agents, tabs, panes, view, files,
+# run). Every name and key: `kraal config keys`. Apply changes with `kraal config reload`.
 [keys.leader]
-# split_right = ["%", "p right"]
+# split_right = ["%", "P right"]
 
 # Keys that act without the prefix (in the "kraal" preset: alt+arrows focus, alt+n new pane,
 # alt+a next agent needing you).

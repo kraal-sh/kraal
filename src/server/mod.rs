@@ -17,6 +17,7 @@ pub mod net;
 mod overlays;
 mod panes;
 mod persistence;
+mod reload;
 mod render;
 mod requests;
 pub mod runbooks;
@@ -416,6 +417,8 @@ pub struct Server {
     focus_reported: std::collections::HashSet<PaneId>,
     /// Whether the sidebar had something to show at the last tick.
     sidebar_was_useful: bool,
+    /// Whether a client was told how to stop the broadcast its key started.
+    pub broadcast_tip_shown: bool,
 }
 
 /// Finishes a background job on the server thread with its result.
@@ -534,6 +537,7 @@ pub fn run(session: &str) -> Result<()> {
         focus_reported: Default::default(),
         held_input: Vec::new(),
         sidebar_was_useful: false,
+        broadcast_tip_shown: false,
         tunnels: Vec::new(),
         port_candidates: HashMap::new(),
         ports: Default::default(),

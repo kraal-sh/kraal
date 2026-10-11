@@ -79,26 +79,38 @@ kraal integration install     # optional: exact agent states via Claude Code / C
 
 One key to remember: **`ctrl+b`** opens a menu of commands. Press it, let go, and the menu
 shows what each next key does; press that key (or click it).
-Commands are grouped by what they act on, so a key means the same thing everywhere (`n` new,
-`e` rename, `x` close, arrows move, Enter opens the group's list):
 
-| After `ctrl+b` | |
+One rule: after `ctrl+b`, **a theme's letter runs its main action, and the same letter in
+capitals opens the theme's menu**. `ctrl+b s` connects to a server; `ctrl+b S` opens the Servers
+menu (upload, download, edit the list). Letters are taken for what they mean, so the rule holds on
+any keyboard layout.
+
+| Theme | `ctrl+b` + letter | `ctrl+b` + capital: the menu |
+|---|---|---|
+| servers | `s` connect (or a group in a grid) | `S`: `s` connect, `u` upload, `d` download, `e` edit the list |
+| broadcast | `b` typing goes to the whole tab, `b` again stops | `B`: `b` this tab, `w` the whole workspace, `m` mark this pane, `s` the marked panes, `o` stop |
+| workspaces | `w` choose one | `W`: `w` choose, `n` new, `←`/`→` previous/next, `e` rename, `s` save the layout, `x` close |
+| agents | `a` start one on an account | `A`: `a` start, `g` go to the agent needing you, `c` change account |
+| tabs | `t` new tab | `T`: `t` new, `←`/`→` previous/next, `e` rename, `x` close |
+| panes | `p` find a pane | `P`: `p` find, `n` new, `→`/`↓` split, `e` rename, `r` resize with the arrows, `f` floating, `x` close |
+| view | `v` copy mode: scroll and select | `V`: `v` copy mode, `g` search the output, `o` links and paths, `f` floating panes, `l` sidebar, `j` message log |
+| files | `f` file manager | `F`: `f` file manager, `p` preview a file, `u`/`d` upload/download |
+| run | `r` tools where the pane is | `R`: `r` tools, `b` runbooks, `g` git and worktrees |
+
+Inside every menu the same letters do the same things: `n` new, `x` close, `e` rename, arrows
+previous and next, and the theme's letter its main action again.
+
+| Other keys after `ctrl+b` | |
 |---|---|
 | `n` · `x` · `z` | new pane · close pane · zoom pane |
+| `m` | mark this pane for broadcast |
+| `o` | open a link, a path, a commit on screen (hints) |
+| `g` (or `/`) | search the output |
 | arrows · `1`…`9` | focus the pane on that side · go to a tab |
 | `space` | search every command by what it does (and see its keys) |
-| `h` | help: every key, from your configuration |
+| `h` (or `?`) | help: every key, from your configuration |
 | `d` | detach (programs keep running) |
-| `p` | **panes**: `→`/`↓` split, `e` rename, `r` resize with the arrows, `f` floating, `p` find |
-| `t` | **tabs**: `n` new, `←`/`→` previous/next, `e` rename, `x` close |
-| `w` | **workspaces**: `w` choose, `n` new, `←`/`→`, `e` rename, `s` save layout, `x` close |
-| `a` | **agents**: `a` start one on an account, `n` next agent needing you, `c` change account |
-| `s` | **servers**: `s` connect (or a group in a grid), `u` upload, `d` download, `e` edit |
-| `f` | **files**: `f` file manager, `u`/`d` upload/download, `p` preview a file |
-| `r` | **run**: `r` tools, `b` runbooks, `g` git and worktrees |
-| `v` | **view**: `c` copy mode, `s` search the output, `h` hints, `f` floating panes, `b` sidebar, `m` messages |
-| `b` | **broadcast** typing: `m` select this pane, `s` to the selected ones, `t` this tab, `w` this workspace, `o` stop |
-| `ctrl+b` | type `ctrl+b` itself |
+| `ctrl+b` | type `ctrl+b` itself (whatever your prefix is, pressing it twice sends it) |
 
 Without the prefix: `alt+arrows` move the focus (left/right at the edge go to the next tab),
 `alt+n` opens a new pane, `alt+a` jumps to the next agent that needs you.
@@ -107,10 +119,31 @@ In lists, type to filter, `↑↓` move, Enter chooses, **Tab shows what else ca
 selected item (connect in a new tab, browse its files, run a command…), Esc closes. Text fields edit
 like a shell line (arrows, `home`/`end`, `alt+←→`, `ctrl+w`, `ctrl+u`, `ctrl+k`). Questions show
 two buttons, Cancel first: `y` answers yes, `n` or Esc no, Enter takes the selected button.
-`ctrl+b v m` lists the messages kraal showed, warnings included.
+`ctrl+b V j` lists the messages kraal showed, warnings included.
 
 Used to tmux? `[keys] preset = "classic"` brings back tmux-style single keys (`%` `"` `c` `n` `p`
-`o` `s`…), still with the menu. Any command can be rebound (`kraal config keys` lists them all).
+`o` `s`…), still with the menu.
+
+**Your own keys.** Every command and every menu can move, in `~/.config/kraal/config.toml`:
+
+```toml
+[keys]
+prefix = ["ctrl+b"]          # several are fine: ["ctrl+b", "ctrl+space"]
+
+[keys.leader]                # after the prefix; a space separates a sequence ("P right")
+broadcast_toggle = ["y"]     # replaces the command's keys
+rename_tab = []              # [] removes them
+menu_servers = ["M"]         # a menu moves too: servers, broadcast, workspaces, agents, tabs,
+                             # panes, view, files, run
+
+[keys.direct]                # one key, without the prefix
+new_pane = ["alt+n"]
+```
+
+`kraal config keys` prints every key, menu and mode, with the names to use here (`--markdown`
+for a sheet to keep or print); `kraal config check` reports a key bound twice or a sequence that
+hides another; `kraal config reload` applies the file to the running session (keys, theme,
+sidebar, mouse, frames, tools, hints, hooks; new panes take a new shell or scrollback length).
 
 The mouse works too: click to focus panes, tabs, workspaces and agents (a click on the workspace
 name opens the list); drag borders to resize; drag floating panes by their title; wheel to scroll
@@ -162,7 +195,7 @@ layout {
 
 `split_direction="vertical"` places children side by side, `"horizontal"` stacks them. Sizes are
 percentages or cells. kraal adds two pane properties: `agent="<name>"` starts an agent in a shell,
-and `preview="<path>"` shows a file. `ctrl+b w s` or `kraal save <name>` writes the current layout
+and `preview="<path>"` shows a file. `ctrl+b W s` or `kraal save <name>` writes the current layout
 back as a file (`<name>.kdl` in the definitions directory; the file it replaces is kept as
 `.kdl.bak`). An agent started on an account is saved as `agent="claude:pro"` with its arguments,
 and a command that has not run yet keeps `start_suspended=true`.
@@ -196,7 +229,7 @@ kraal ssh db                           # plain ssh, resolved from the inventory
 kraal ssh prod --group                 # every server of "prod" in a grid of panes
 ```
 
-`ctrl+b s s` opens the same list: Enter connects (or opens a whole group); Tab shows the other
+`ctrl+b s` opens the same list: Enter connects (or opens a whole group); Tab shows the other
 actions: connect in a new tab, browse its files, run a command, forward a port, edit the list,
 remove a saved server.
 
@@ -216,7 +249,7 @@ system, and refuses when the destination is the source itself, even seen through
 server that shares this machine's files. On a server, a move between two file systems is refused:
 copy, then delete.
 
-`ctrl+b f f` opens a two-panel file manager (Midnight Commander style) on the focused pane's
+`ctrl+b f` opens a two-panel file manager (Midnight Commander style) on the focused pane's
 directory and, for an SSH pane, its server; `kraal files ~/Dev db:/var/log` from the command line.
 Each panel shows this machine or any server (`o` to choose). `space` marks, `c` copies to the
 other panel (it asks first when that would replace files there, and what you did not agree to
@@ -229,7 +262,7 @@ opens a directory or previews a local file, `s` opens a shell there, `/` filters
 carry a ✓. Transfers run in a small window that closes itself when done.
 
 Drop a file from your file manager on an SSH pane and kraal offers to upload it to that server
-(`ctrl+p` pastes the path instead). `ctrl+b s d` downloads a path from the pane's server
+(`ctrl+p` pastes the path instead). `ctrl+b S d` downloads a path from the pane's server
 (the selected text is prefilled), into `~/Downloads` by default.
 
 ## Git and worktrees
@@ -237,10 +270,10 @@ Drop a file from your file manager on an SSH pane and kraal offers to upload it 
 Panes in a git repository show their branch in their frame (`⎇ main*? ↑2`: `*` changes, `?`
 untracked files, commits ahead).
 
-The agent picker (`ctrl+b a a`) offers to start an agent **in a new worktree**: kraal creates a branch
+The agent picker (`ctrl+b a`) offers to start an agent **in a new worktree**: kraal creates a branch
 `kraal/<name>` and a directory next to the repository (`<repo>.worktrees/<name>`), and starts the
 agent there in its own tab. Several agents can work on the same repository without stepping on each
-other. `ctrl+b r g` in that tab reviews the changes (your pager, delta included), commits them, opens
+other. `ctrl+b R g` in that tab reviews the changes (your pager, delta included), commits them, opens
 a pull request (`gh`), merges into the base branch or removes the worktree. Removing says first
 what would be lost (uncommitted changes, commits the base does not have) and which panes it
 closes. Account rules written for the repository also apply in its worktrees.
@@ -264,7 +297,7 @@ kraal tunnel list
 kraal tunnel rm 15432                            # by local port (`#7` for the tunnel with id 7)
 ```
 
-In the server picker (`ctrl+b s s`), Tab then "Run a command" runs one on the selected server or
+In the server picker (`ctrl+b s`), Tab then "Run a command" runs one on the selected server or
 group, and "Forward one of its ports" opens a tunnel. Tunnels come back after a restart and reconnect when the network
 drops; the sidebar lists them (click copies `localhost:PORT`, ctrl+click opens it in the browser).
 
@@ -273,7 +306,7 @@ sidebar under PORTS; a click opens them.
 
 ## Tools and contexts
 
-`ctrl+b r r` lists tools and starts one in a floating pane **where the focused pane is**: on its
+`ctrl+b r` lists tools and starts one in a floating pane **where the focused pane is**: on its
 server over SSH (the shared connection makes it instant), or here in its directory. From an SSH pane
 on `web01`, `htop` shows web01's processes; from a local pane in a repository, `lazygit` opens on
 that repository. kraal ships lazygit, k9s, htop, logs (`journalctl -f`), docker and disk; tools that
@@ -286,7 +319,7 @@ command = "kubectl get pods -o wide"
 on = "local"               # always here, with the pane's KUBECONFIG and AWS_PROFILE
 when = ["kubernetes"]      # only offered where a Kubernetes context is known
 hold = true                # keep the output on screen
-key = "i"                  # ctrl+b r i starts it directly
+key = "i"                  # ctrl+b R i starts it directly
 
 [tools.show]
 command = 'git show "$KRAAL_SELECTION"'
@@ -329,7 +362,7 @@ This guard is a safety net based on names, not a permission system.
 
 ## Hints
 
-`ctrl+b v h` puts a short label on everything kraal recognises in the focused pane: links, paths
+`ctrl+b o` puts a short label on everything kraal recognises in the focused pane: links, paths
 (`src/main.rs:42`), commits, `host:port` addresses, IPs and known servers, Kubernetes pods, UUIDs.
 The pane holds still meanwhile. Type a label to copy that text; press Tab first to act on it
 instead, where the pane is:
@@ -355,7 +388,7 @@ tool = "jira"               # a [tools.jira] that opens the ticket
 ## Runbooks
 
 A runbook is a procedure kept as a file: yours in `~/.config/kraal/runbooks/`, a repository's in
-its `.kraal/runbooks/` (shared with the code). `ctrl+b r b` lists both; `kraal runbook new <name>`
+its `.kraal/runbooks/` (shared with the code). `ctrl+b R b` lists both; `kraal runbook new <name>`
 starts one from a template.
 
 **Steps (TOML).** Steps, parameters, and where it runs:
@@ -404,9 +437,9 @@ kraal runbook run deploy --dry-run                           # the plan only
 kraal runbook new restart-api --markdown --repo
 ```
 
-**Documents (Markdown).** A Markdown runbook is read like any document. `ctrl+b r b` opens it next to
+**Documents (Markdown).** A Markdown runbook is read like any document. `ctrl+b R b` opens it next to
 the focused pane and lists its shell blocks (```` ```sh ````, `bash`, `console`…); enter sends a
-block to that pane and runs it, and `ctrl+b r b` again offers the next one. kraal refuses while a
+block to that pane and runs it, and `ctrl+b R b` again offers the next one. kraal refuses while a
 program other than the shell runs in that pane (the block would go to it). It knows a block was
 sent, not whether it succeeded: watch the pane. Your existing procedure docs become runnable
 without being rewritten.
@@ -582,14 +615,17 @@ preset = "kraal"         # or "classic" for tmux-style keys
 prefix = ["ctrl+b"]
 
 [keys.leader]            # keys after the prefix; a space separates a sequence
-split_right = ["%", "p right"]
+split_right = ["%", "P right"]
 
 [keys.direct]            # keys without the prefix
 toggle_floating = ["alt+f"]
 ```
 
 `kraal config check` validates the config, every workspace file, `accounts.toml` and
-`servers.toml`; it fails when one cannot be read.
+`servers.toml`; it fails when one cannot be read. `kraal config reload` makes the running session
+read the config again: keys, theme, sidebar, mouse, pane frames, notifications, tools, hints, hooks,
+production words and contexts apply at once; panes already open keep their shell and scrollback
+length.
 
 Themes: `[theme]` takes a `preset` (`default`, `high-contrast`, `ascii` for terminals or fonts
 without box drawing) and optional `accent`, `dim`, `sync`, `production` colours (names, `#rrggbb`,

@@ -750,7 +750,7 @@ pub fn recover_interrupted(session: &str) -> Vec<String> {
     runs.into_iter().map(|r| r.name).collect()
 }
 
-pub const TEMPLATE_TOML: &str = r#"# A kraal runbook: `kraal runbook run <name>`, or ctrl+b r.
+pub const TEMPLATE_TOML: &str = r#"# A kraal runbook: `kraal runbook run <name>`, or ctrl+b R b.
 description = "Check the nginx configuration, reload it, check the service"
 
 # Where it runs: "local" (this machine), "pane" (where the focused pane is) or "server"
@@ -779,7 +779,7 @@ steps = [
 
 pub const TEMPLATE_MD: &str = r#"# Restart the API
 
-Run each block in turn: ctrl+b r, pick this runbook, then enter on a step.
+Run each block in turn: ctrl+b R b, pick this runbook, then enter on a step.
 
 ## Check the service
 

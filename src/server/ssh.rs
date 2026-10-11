@@ -195,11 +195,12 @@ impl Server {
                         ssh.name = name.clone();
                     }
                     let ids: Vec<super::ClientId> = server.clients.keys().copied().collect();
+                    let see = match server.keymap.hint(crate::keymap::Action::SshPicker) {
+                        Some(k) => format!(" · {k} to see it"),
+                        None => String::new(),
+                    };
                     for c in ids {
-                        server.toast(
-                            c,
-                            format!("new server saved as \"{name}\" (group discovered) · ctrl+b s to see it"),
-                        );
+                        server.toast(c, format!("new server saved as \"{name}\" (group discovered){see}"));
                     }
                 }
                 Err(e) => server.warnings.push(format!("could not save server {address}: {e:#}")),
