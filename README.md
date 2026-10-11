@@ -59,11 +59,23 @@ kraal is a multiplexer in the tradition of tmux and Zellij that runs inside your
 
 ## Install
 
-kraal is a single Rust binary. Linux is the primary target; macOS should work.
+kraal is a single binary for Linux (x86_64, arm64) and macOS (Apple Silicon, Intel). Linux is the
+primary target; macOS has not been tried on a real Mac yet.
+
+```sh
+curl -fsSL https://kraal.sh/install | sh    # the latest release, checked, into ~/.local/bin
+kraal                                       # start (or attach to) the default session
+```
+
+The script takes the archive for your machine from the
+[releases](https://github.com/kraal-sh/kraal/releases) and checks it against its checksum before
+installing anything. `KRAAL_VERSION=v0.1.0` picks a release, `KRAAL_INSTALL_DIR` another folder.
+Later, `kraal update` replaces kraal with the latest release the same way (`--check` only says
+whether there is one, `--to v0.2.0` picks one); a server already running keeps the old version
+until `kraal kill`. Or build from source:
 
 ```sh
 cargo install --git https://github.com/kraal-sh/kraal
-kraal                         # start (or attach to) the default session
 ```
 
 ## Quick start
