@@ -374,7 +374,7 @@ impl Server {
         }
     }
 
-    fn resolve(&self, r: &str) -> Result<PaneId, String> {
+    pub(super) fn resolve(&self, r: &str) -> Result<PaneId, String> {
         if let Ok(id) = r.parse::<PaneId>() {
             return if self.panes.contains_key(&id) { Ok(id) } else { Err(format!("no pane with id {id}")) };
         }

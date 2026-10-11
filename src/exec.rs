@@ -234,13 +234,38 @@ pub fn last_line(mut pipe: impl Read + Send + 'static) -> Arc<std::sync::Mutex<S
 /// `stop` is set: a process that inherited the pipe and outlived what was stopped (a helper
 /// that left its group) never keeps the reader for good.
 pub fn read_lines_until(
-    mut pipe: impl Read + std::os::fd::AsRawFd + Send + 'static,
+    pipe: impl Read + std::os::fd::AsRawFd + Send + 'static,
     stop: Arc<AtomicBool>,
     mut on_line: impl FnMut(&str) + Send + 'static,
 ) {
-    const KEEP: usize = 1024;
+    read_bounded_lines(pipe, stop, 1024, move |line, _| on_line(String::from_utf8_lossy(line).trim_end()));
+}
+
+/// [`read_lines_until`] for lines of up to `max` bytes: a longer one is given as `None`, never
+/// cut (a piece of a JSON document is not one).
+pub fn read_long_lines_until(
+    pipe: impl Read + std::os::fd::AsRawFd + Send + 'static,
+    stop: Arc<AtomicBool>,
+    max: usize,
+    mut on_line: impl FnMut(Option<&str>) + Send + 'static,
+) {
+    read_bounded_lines(pipe, stop, max, move |line, whole| {
+        let text = String::from_utf8_lossy(line);
+        on_line(whole.then(|| text.trim_end()))
+    });
+}
+
+/// Read `pipe` line by line until it ends or `stop` is set, keeping at most `keep` bytes of each
+/// line; `on_line` gets what was kept and whether that is the whole line.
+fn read_bounded_lines(
+    mut pipe: impl Read + std::os::fd::AsRawFd + Send + 'static,
+    stop: Arc<AtomicBool>,
+    keep: usize,
+    mut on_line: impl FnMut(&[u8], bool) + Send + 'static,
+) {
     std::thread::spawn(move || {
         let mut line: Vec<u8> = Vec::new();
+        let mut whole = true;
         let mut buf = [0u8; 4096];
         while !stop.load(Ordering::Relaxed) {
             let mut fds = libc::pollfd { fd: pipe.as_raw_fd(), events: libc::POLLIN, revents: 0 };
@@ -261,15 +286,18 @@ pub fn read_lines_until(
             };
             for &b in &buf[..n] {
                 if b == b'\n' {
-                    on_line(String::from_utf8_lossy(&line).trim_end());
+                    on_line(&line, whole);
                     line.clear();
-                } else if line.len() < KEEP {
+                    whole = true;
+                } else if line.len() < keep {
                     line.push(b);
+                } else {
+                    whole = false;
                 }
             }
         }
         if !line.is_empty() {
-            on_line(String::from_utf8_lossy(&line).trim_end());
+            on_line(&line, whole);
         }
     });
 }
@@ -490,6 +518,19 @@ mod tests {
         let mut c = Command::new("sh");
         c.arg("-c").arg(script);
         c
+    }
+
+    #[test]
+    fn a_line_too_long_is_dropped_whole() {
+        let (reader, mut writer) = std::io::pipe().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        read_long_lines_until(reader, Arc::new(AtomicBool::new(false)), 8, move |l| {
+            let _ = tx.send(l.map(str::to_string));
+        });
+        std::io::Write::write_all(&mut writer, b"[1,2]\n0123456789abc\nok\n").unwrap();
+        drop(writer);
+        let got: Vec<Option<String>> = rx.iter().collect();
+        assert_eq!(got, [Some("[1,2]".to_string()), None, Some("ok".to_string())]);
     }
 
     #[cfg(target_os = "linux")]

@@ -48,6 +48,10 @@ pub struct Server {
     pub env: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
+    /// The kraal session on this server whose agents the sidebar lists (`kraal attach --host`
+    /// sets it); `none` turns that off for good.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agents: Option<String>,
 }
 
 /// Where a known server comes from.
@@ -146,6 +150,11 @@ impl Server {
             }
         }
         out
+    }
+
+    /// The kraal session whose agents are listed, if any (a name a session can have).
+    pub fn agents_session(&self) -> Option<&str> {
+        self.agents.as_deref().filter(|s| !is_none(s) && paths::valid_session_name(s))
     }
 
     /// The keys ssh offers, in order.
@@ -353,6 +362,7 @@ pub fn parse_ssh_args(args: &[String]) -> Option<Server> {
         groups: Vec::new(),
         env: None,
         note: None,
+        agents: None,
     })
 }
 
@@ -544,8 +554,8 @@ struct File {
 }
 
 const HEADER: &str = "# kraal servers. Each [[server]] needs a name and a host; user, port, jump (ProxyJump),\n\
-# identity, groups, env (\"prod\", \"staging\"…) and note are optional. kraal adds servers here\n\
-# when you ssh somewhere new.\n\n";
+# identity, groups, env (\"prod\", \"staging\"…), note and agents (the kraal session there whose\n\
+# agents the sidebar lists) are optional. kraal adds servers here when you ssh somewhere new.\n\n";
 
 pub struct Inventory {
     pub servers: Vec<Server>,
@@ -646,6 +656,26 @@ impl Inventory {
         let name = server.name.clone();
         self.servers.push(server);
         Ok(name)
+    }
+
+    /// Have the agents of the kraal session `session` on `s` listed: its entry gets `agents`,
+    /// unless it already names a session (or `none`); a server the inventory does not have is
+    /// added when `add`. Returns the entry's name, if there is one.
+    pub fn watch_agents(&mut self, s: &Server, session: &str, add: bool) -> Result<Option<String>> {
+        let found = self
+            .servers
+            .iter()
+            .position(|x| x.name == s.name && x.host.eq_ignore_ascii_case(&s.host))
+            .or_else(|| self.servers.iter().position(|x| x.same_address(s)));
+        match found {
+            Some(i) => {
+                let entry = &mut self.servers[i];
+                entry.agents.get_or_insert_with(|| session.to_string());
+                Ok(Some(entry.name.clone()))
+            }
+            None if add => self.add(Server { agents: Some(session.to_string()), ..s.clone() }).map(Some),
+            None => Ok(None),
+        }
     }
 
     pub fn remove(&mut self, name: &str) -> bool {
@@ -1208,6 +1238,48 @@ mod tests {
         let k = known(&inv, &[def], &[]);
         let r = resolve(&k, "web-ops").unwrap();
         assert_eq!((r.host.as_str(), r.user.as_deref()), ("web.lan", Some("deploy")));
+    }
+
+    #[test]
+    fn servers_whose_agents_are_listed() {
+        let dir = std::env::temp_dir().join(format!("kraal-servers-agents-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("servers.toml");
+        std::fs::write(
+            &path,
+            "[[server]]\nname = \"gpu\"\nhost = \"gpu.lan\"\n\n\
+             [[server]]\nname = \"db\"\nhost = \"db.lan\"\nagents = \"work\"\n\n\
+             [[server]]\nname = \"web\"\nhost = \"web.lan\"\nagents = \"none\"\n",
+        )
+        .unwrap();
+        let mut inv = Inventory::load_from(&path).unwrap();
+        let session = |inv: &Inventory, name: &str| inv.get(name).and_then(|s| s.agents_session()).map(str::to_string);
+        assert_eq!(session(&inv, "gpu"), None);
+        assert_eq!(session(&inv, "db").as_deref(), Some("work"));
+        assert_eq!(session(&inv, "web"), None, "none turns it off");
+        let bad = Server { agents: Some("../x".into()), ..Default::default() };
+        assert_eq!(bad.agents_session(), None, "only a name a session can have");
+        // Attaching marks the entry, by name or by address; a session already named, or none,
+        // stays as written.
+        let gpu = inv.get("gpu").unwrap().clone();
+        assert_eq!(inv.watch_agents(&gpu, "main", false).unwrap().as_deref(), Some("gpu"));
+        assert_eq!(session(&inv, "gpu").as_deref(), Some("main"));
+        let db = Server { name: "db.lan".into(), host: "db.lan".into(), ..Default::default() };
+        assert_eq!(inv.watch_agents(&db, "main", false).unwrap().as_deref(), Some("db"));
+        assert_eq!(session(&inv, "db").as_deref(), Some("work"));
+        let web = inv.get("web").unwrap().clone();
+        inv.watch_agents(&web, "main", true).unwrap();
+        assert_eq!(session(&inv, "web"), None);
+        // A server the inventory does not have is added only when asked.
+        let new = parse_ssh_args(&argv("ops@build.lan")).unwrap();
+        assert_eq!(inv.watch_agents(&new, "main", false).unwrap(), None);
+        assert_eq!(inv.servers.len(), 3);
+        let name = inv.watch_agents(&new, "main", true).unwrap().unwrap();
+        assert_eq!(session(&inv, &name).as_deref(), Some("main"));
+        inv.save().unwrap();
+        let again = Inventory::load_from(&path).unwrap();
+        assert_eq!(session(&again, &name).as_deref(), Some("main"));
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

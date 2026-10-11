@@ -10,7 +10,7 @@ use crate::{client, config, paths, workspace};
 
 pub(super) fn attach(session: &str, workspace: Option<String>) -> Result<()> {
     let cfg = config::Config::load().unwrap_or_default();
-    client::attach(client::Target::Local { session: session.to_string() }, workspace, cfg.mouse)
+    client::attach(client::Target::Local { session: session.to_string() }, workspace, cfg.mouse, || {})
 }
 
 /// `kraal kill`: stop the session's server (its layout is saved first).

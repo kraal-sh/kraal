@@ -8,7 +8,7 @@ use super::{Session, known_servers, resolve_targets};
 use crate::protocol::{Placement, Request, Response};
 use crate::{client, config, fleet, paths, server, servers, transfer, workspace};
 
-pub(super) fn attach(session: &str, host: &str, workspace: Option<String>) -> Result<()> {
+pub(super) fn attach(session: &str, host: &str, workspace: Option<String>, pane: Option<String>) -> Result<()> {
     let cfg = config::Config::load().unwrap_or_default();
     let known = known_servers(&cfg)?;
     let s = servers::resolve(&known, host).with_context(|| format!("not a server: {host}"))?;
@@ -16,8 +16,16 @@ pub(super) fn attach(session: &str, host: &str, workspace: Option<String>) -> Re
         ssh: remote_ssh_args(&known, &s),
         session: session.to_string(),
         label: s.name.clone(),
+        pane,
     };
-    client::attach(target, workspace, cfg.mouse)
+    // Once a kraal there answered, the sidebar lists that session's agents from then on.
+    let remember = || {
+        let marked = servers::Inventory::update(|inv| inv.watch_agents(&s, session, cfg.servers.auto_add));
+        if let Err(e) = marked {
+            eprintln!("kraal: the agents of {} will not be listed: {e:#}", s.name);
+        }
+    };
+    client::attach(target, workspace, cfg.mouse, remember)
 }
 
 /// ssh arguments (up to the destination) for kraal's own connection to a server: no shared
@@ -151,9 +159,12 @@ pub(super) fn servers(action: ServersCmd) -> Result<()> {
             }
             Ok(())
         }
-        ServersCmd::Add { destination, name, group, jump, identity, env, note } => {
+        ServersCmd::Add { destination, name, group, jump, identity, env, note, agents } => {
             let (user, host, port) = servers::parse_destination(&destination)
                 .with_context(|| format!("not a destination: {destination}"))?;
+            if let Some(a) = agents.as_deref().filter(|a| !paths::valid_session_name(a)) {
+                bail!("invalid session name {a:?}");
+            }
             let s = servers::Server {
                 name: name.unwrap_or_default(),
                 host,
@@ -166,8 +177,18 @@ pub(super) fn servers(action: ServersCmd) -> Result<()> {
                 groups: group,
                 env,
                 note,
+                agents: agents.clone(),
             };
-            let name = servers::Inventory::update(|inv| inv.add(s))?;
+            let name = servers::Inventory::update(|inv| {
+                let name = inv.add(s)?;
+                // A server saved already gets the session asked for too.
+                if let Some(a) = agents
+                    && let Some(entry) = inv.servers.iter_mut().find(|x| x.name == name)
+                {
+                    entry.agents = Some(a);
+                }
+                Ok(name)
+            })?;
             println!("saved {name} in {}", paths::shorten_home(&servers::Inventory::path()));
             Ok(())
         }

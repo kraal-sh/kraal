@@ -269,7 +269,16 @@ pub enum Target {
         ssh: Vec<String>,
         session: String,
         label: String,
+        /// A pane of that session to show on the first connection (an id or a name).
+        pane: Option<String>,
     },
+}
+
+/// The command line that runs `kraal ARGS` on a server: the `kraal` in its `PATH`, else the one
+/// `kraal remote-install` puts in `~/.local/bin`. It goes through sh: the login shell on the
+/// server may not be a POSIX one. `args` must be quoted already.
+pub fn remote_kraal(args: &str) -> String {
+    crate::shell::sh_c(&format!("k=$(command -v kraal || echo \"$HOME/.local/bin/kraal\"); exec \"$k\" {args}"))
 }
 
 struct Conn {
@@ -318,11 +327,8 @@ fn connect(target: &Target) -> Result<Conn> {
             })
         }
         Target::Remote { ssh, session, .. } => {
-            // The session name is validated (letters, digits, - _ .), so it needs no quoting. The
-            // script goes through sh: the login shell on the server may not be a POSIX one.
-            let remote = crate::shell::sh_c(&format!(
-                "k=$(command -v kraal || echo \"$HOME/.local/bin/kraal\"); exec \"$k\" proxy -s {session}"
-            ));
+            // The session name is validated (letters, digits, - _ .), so it needs no quoting.
+            let remote = remote_kraal(&format!("proxy -s {session}"));
             let mut child = std::process::Command::new("ssh")
                 .args(ssh)
                 .arg(remote)
@@ -376,6 +382,10 @@ fn greet(target: &Target, workspace: &Option<String>) -> Result<Greeted, String>
         rows,
         workspace: workspace.clone(),
         remote: matches!(target, Target::Remote { .. }),
+        pane: match target {
+            Target::Remote { pane, .. } => pane.clone(),
+            Target::Local { .. } => None,
+        },
     };
     if protocol::write_json(&mut conn.writer, &hello).is_err() {
         return Err(conn.why_lost("could not talk to the server"));
@@ -471,8 +481,9 @@ fn read_keys(fd: std::os::unix::io::RawFd, pause: &KeysPause, mut forward: impl 
 }
 
 /// Attach the current terminal to a session. Remote sessions reconnect by themselves when the
-/// connection drops; their programs keep running on the server meanwhile.
-pub fn attach(target: Target, workspace: Option<String>, mouse: bool) -> Result<()> {
+/// connection drops; their programs keep running on the server meanwhile. `attached` runs once
+/// the session first answered, before the terminal changes.
+pub fn attach(mut target: Target, workspace: Option<String>, mouse: bool, attached: impl FnOnce()) -> Result<()> {
     if std::env::var_os("KRAAL_PANE").is_some() {
         bail!("already inside kraal (unset KRAAL_PANE to nest anyway)");
     }
@@ -483,6 +494,11 @@ pub fn attach(target: Target, workspace: Option<String>, mouse: bool) -> Result<
     // Fail before touching the terminal when the first connection is impossible; ssh asks what
     // it has to ask in the terminal as it is.
     let first = greet(&target, &workspace).map_err(anyhow::Error::msg)?;
+    // The pane asked for is shown once: a reconnection leaves the session where it is.
+    if let Target::Remote { pane, .. } = &mut target {
+        *pane = None;
+    }
+    attached();
 
     // Being told to go (terminal closed, kill): leave the terminal usable, as a normal exit
     // does (destructors do not run on a signal). Set up before the terminal changes.

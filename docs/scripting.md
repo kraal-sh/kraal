@@ -15,6 +15,7 @@ kraal keys -p tests ctrl+c                       # press keys
 kraal read -p tests --lines 50                   # read the screen or scrollback
 kraal wait -p api --until blocked,done --timeout 600
 kraal agents --json                              # every agent and its state
+kraal agents --follow                            # the same, one JSON line again at each change
 kraal preview docs/design.md --floating
 kraal notify "deploy" "finished"
 ```
