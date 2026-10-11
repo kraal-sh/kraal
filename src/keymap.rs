@@ -758,7 +758,8 @@ impl Keymap {
         if reads(&key) {
             return key;
         }
-        match key.by_place() {
+        let place = key.by_place().or_else(|| digit_row(&key));
+        match place {
             Some(place) if reads(&place) => place,
             _ => key,
         }
@@ -952,6 +953,31 @@ pub fn pretty(key: &KeySpec, ascii: bool) -> String {
     key.to_string()
 }
 
+/// The digit a key of the digit row types on AZERTY keyboards (French and Belgian) without
+/// Shift, when the terminal did not say where the key is: a key typed right after the prefix
+/// can arrive before kraal asks the terminal for places.
+fn digit_row(key: &Key) -> Option<Key> {
+    let KeyCode::Char(c) = key.code else { return None };
+    // A key whose place the terminal gave is read by it; Shift types the digit itself.
+    if key.has_place() || key.mods.ctrl || key.mods.alt || key.mods.shift {
+        return None;
+    }
+    let digit = match c {
+        '&' => '1',
+        'é' => '2',
+        '"' => '3',
+        '\'' => '4',
+        '(' => '5',
+        '-' | '§' => '6',
+        'è' => '7',
+        '_' | '!' => '8',
+        'ç' => '9',
+        'à' => '0',
+        _ => return None,
+    };
+    Some(Key { code: KeyCode::Char(digit), mods: crate::input::Mods::NONE, raw: key.raw.clone() })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1134,5 +1160,14 @@ mod tests {
         // A Latin letter is the letter it types, wherever it is: AZERTY's `a` at the place of `q`.
         let a = km.leader_key(&[], received(b"\x1b[97::113;;97u"));
         assert_eq!(a.code, KeyCode::Char('a'));
+        // Before the terminal says where keys are, AZERTY's digit row still reads as digits,
+        // unless the character itself is bound.
+        let one = km.leader_key(&[], received(b"&"));
+        assert_eq!(km.lookup(&[one]), Lookup::Run(Command::Action(Tab(1))));
+        let typed = classic.leader_key(&[], received(b"&"));
+        assert_eq!(classic.lookup(&[typed]), Lookup::Run(Command::Action(CloseTab)));
+        // Not when the terminal said where the key is: Shift+7 on a US keyboard types `&`.
+        let shifted = km.leader_key(&[], received(b"\x1b[55:38:55;2;38u"));
+        assert_ne!(km.lookup(&[shifted]), Lookup::Run(Command::Action(Tab(1))));
     }
 }

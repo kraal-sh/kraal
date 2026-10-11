@@ -164,7 +164,13 @@ fn write_with_backup(path: &Path, content: &str) -> Result<()> {
         let backup = path.with_file_name(format!("{name}.kraal-bak"));
         std::fs::copy(path, &backup).with_context(|| format!("backing up {}", path.display()))?;
     }
-    crate::paths::write_atomic(path, content.as_bytes()).with_context(|| format!("writing {}", path.display()))
+    // A symlink (dotfiles kept in a repository) stays one: the file it points to changes.
+    let target = match std::fs::symlink_metadata(path) {
+        Ok(m) if m.file_type().is_symlink() => std::fs::canonicalize(path)
+            .with_context(|| format!("{} is a link to a file that is not there", path.display()))?,
+        _ => path.to_path_buf(),
+    };
+    crate::paths::write_atomic(&target, content.as_bytes()).with_context(|| format!("writing {}", target.display()))
 }
 
 fn claude_has(v: &Value, event: &str) -> bool {
@@ -403,7 +409,8 @@ fi
 "#;
 
 /// bash: the prompt marks run first in PROMPT_COMMAND, the command line's mark is put back at the
-/// end of PS1 after whatever rewrites it, and PS0 (bash 4.4) marks a command as it runs.
+/// end of PS1 after whatever rewrites it, and PS0 (bash 4.4) marks a command as it runs. A
+/// PROMPT_COMMAND array (bash 5.1) stays one, with kraal's hooks first and last.
 const BASH_MARKS: &str = r#"if [[ -n $KRAAL_PANE && -z $__kraal_marks ]]; then
   __kraal_marks=1
   __kraal_prompt() {
@@ -414,7 +421,11 @@ const BASH_MARKS: &str = r#"if [[ -n $KRAAL_PANE && -z $__kraal_marks ]]; then
   __kraal_input() {
     [[ $PS1 == *'133;B'* ]] || PS1+='\[\e]133;B\a\]'
   }
-  PROMPT_COMMAND=$'__kraal_prompt\n'"${PROMPT_COMMAND-}"$'\n__kraal_input'
+  if (( BASH_VERSINFO[0] * 100 + BASH_VERSINFO[1] >= 501 )) && [[ ${PROMPT_COMMAND@a} == *a* ]]; then
+    PROMPT_COMMAND=(__kraal_prompt "${PROMPT_COMMAND[@]}" __kraal_input)
+  else
+    PROMPT_COMMAND=$'__kraal_prompt\n'"${PROMPT_COMMAND-}"$'\n__kraal_input'
+  fi
   PS0=$'\e]133;C\a'"${PS0-}"
 fi
 "#;
@@ -461,13 +472,20 @@ fn shell_block(shell: &str) -> String {
     )
 }
 
-/// `text` without kraal's block, and whether it had one.
-fn without_block(text: &str) -> (String, bool) {
+/// `text` without kraal's block, and whether it had one. A block whose end marker is missing (or
+/// a second start inside one) is refused: what follows its start belongs to the user.
+fn without_block(text: &str, path: &Path) -> Result<(String, bool)> {
     let mut out = Vec::new();
     let mut inside = false;
     let mut found = false;
-    for line in text.lines() {
+    for (n, line) in text.lines().enumerate() {
         if line.trim_end() == BLOCK_START {
+            anyhow::ensure!(
+                !inside,
+                "{}: kraal's block is not closed before line {}; remove it by hand, from `{BLOCK_START}` to `{BLOCK_END}`",
+                path.display(),
+                n + 1
+            );
             inside = true;
             found = true;
             // The blank line written before the block goes with it.
@@ -480,11 +498,16 @@ fn without_block(text: &str) -> (String, bool) {
             out.push(line);
         }
     }
+    anyhow::ensure!(
+        !inside,
+        "{}: kraal's block has no `{BLOCK_END}` line; add it at the end of the block, or remove the block by hand",
+        path.display()
+    );
     let mut rest = out.join("\n");
     if !rest.is_empty() {
         rest.push('\n');
     }
-    (rest, found)
+    Ok((rest, found))
 }
 
 fn install_shell(shell: &str, path: &Path) -> Result<String> {
@@ -493,7 +516,7 @@ fn install_shell(shell: &str, path: &Path) -> Result<String> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
         Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
     };
-    let (mut rest, _) = without_block(&text);
+    let (mut rest, _) = without_block(&text, path)?;
     if !rest.is_empty() {
         rest.push('\n');
     }
@@ -522,7 +545,7 @@ fn uninstall_shell(shell: &str, path: &Path) -> Result<String> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(format!("{shell}: nothing to remove")),
         Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
     };
-    let (rest, found) = without_block(&text);
+    let (rest, found) = without_block(&text, path)?;
     if !found {
         return Ok(format!("{shell}: nothing to remove"));
     }
@@ -690,6 +713,80 @@ mod tests {
             assert!(!all.contains("syntax error") && !all.contains("parse error"), "{shell}: {all:?}");
             let _ = std::fs::remove_dir_all(dir);
         }
+    }
+
+    #[test]
+    fn a_shell_file_whose_block_is_cut_is_left_alone() {
+        let dir = tmp("cut");
+        let rc = dir.join(".zshrc");
+        let cut = format!("export A=1\n{BLOCK_START}\nold kraal lines\nexport MINE=1\nalias x=y\n");
+        std::fs::write(&rc, &cut).unwrap();
+        let err = install_shell("zsh", &rc).unwrap_err().to_string();
+        assert!(err.contains(BLOCK_END), "{err}");
+        let err = uninstall_shell("zsh", &rc).unwrap_err().to_string();
+        assert!(err.contains(BLOCK_END), "{err}");
+        assert_eq!(std::fs::read_to_string(&rc).unwrap(), cut);
+        // A second start inside the block is refused too.
+        let twice = format!("{BLOCK_START}\na\n{BLOCK_START}\nb\n{BLOCK_END}\nexport MINE=1\n");
+        std::fs::write(&rc, &twice).unwrap();
+        assert!(uninstall_shell("zsh", &rc).is_err());
+        assert_eq!(std::fs::read_to_string(&rc).unwrap(), twice);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_linked_shell_file_stays_a_link() {
+        let dir = tmp("linked");
+        let real = dir.join("dotfiles/zshrc");
+        std::fs::create_dir_all(real.parent().unwrap()).unwrap();
+        std::fs::write(&real, "export EDITOR=vim\n").unwrap();
+        let rc = dir.join(".zshrc");
+        std::os::unix::fs::symlink(&real, &rc).unwrap();
+        install_shell("zsh", &rc).unwrap();
+        assert!(std::fs::symlink_metadata(&rc).unwrap().file_type().is_symlink());
+        assert!(std::fs::read_to_string(&real).unwrap().contains(BLOCK_START));
+        assert_eq!(std::fs::read_to_string(dir.join(".zshrc.kraal-bak")).unwrap(), "export EDITOR=vim\n");
+        uninstall_shell("zsh", &rc).unwrap();
+        assert!(std::fs::symlink_metadata(&rc).unwrap().file_type().is_symlink());
+        assert_eq!(std::fs::read_to_string(&real).unwrap(), "export EDITOR=vim\n");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// bash 5.1 runs every element of a PROMPT_COMMAND array: kraal's command-line mark comes
+    /// after all of them, even one that sets PS1.
+    #[test]
+    fn bash_keeps_a_prompt_command_array() {
+        let version = std::process::Command::new("bash")
+            .arg("-c")
+            .arg("echo $(( BASH_VERSINFO[0] * 100 + BASH_VERSINFO[1] ))")
+            .output();
+        let Ok(version) = version else { return };
+        if String::from_utf8_lossy(&version.stdout).trim().parse::<u32>().unwrap_or(0) < 501 {
+            return;
+        }
+        let dir = tmp("bash-array");
+        let script = dir.join("marks");
+        std::fs::write(&script, shell_block("bash")).unwrap();
+        for setup in ["PROMPT_COMMAND=(true 'PS1=\"$ \"')", "PROMPT_COMMAND='PS1=\"$ \"'"] {
+            let input = format!("{setup}\n. {}\ntrue\nexit\n", script.display());
+            let mut child = std::process::Command::new("bash")
+                .args(["--norc", "-i"])
+                .env("KRAAL_PANE", "1")
+                .env("PS1", "$ ")
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            use std::io::Write;
+            child.stdin.take().unwrap().write_all(input.as_bytes()).unwrap();
+            let out = child.wait_with_output().unwrap();
+            let all = String::from_utf8_lossy(&out.stdout).into_owned() + &String::from_utf8_lossy(&out.stderr);
+            assert!(all.contains("\x1b]133;B\x07"), "{setup}: {all:?}");
+            assert!(all.contains("\x1b]133;A\x07"), "{setup}: {all:?}");
+        }
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

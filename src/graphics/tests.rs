@@ -274,10 +274,11 @@ fn the_oldest_images_go_when_the_quota_is_reached() {
     assert_eq!(feed(&mut g, &mut t, &rgb_image("a=T,i=2", 2, 2)), b"\x1b_Gi=2;ENOSPC:image storage is full\x1b\\");
     assert_eq!(s.used(), 0, "nothing is left held");
     // With room for one, the second replaces the first.
+    // What one picture counts: its PNG and the cost of keeping it.
     let one = {
         let probe = Arc::new(Shared::new(true, usize::MAX));
-        let png = Picture::from_rgba(2, 2, [200, 10, 10, 255].repeat(4), &probe).unwrap();
-        png.png.len()
+        let _png = Picture::from_rgba(2, 2, [200, 10, 10, 255].repeat(4), &probe).unwrap();
+        probe.used()
     };
     let s = Arc::new(Shared::new(true, one + one / 2));
     s.set_available(true);
@@ -356,4 +357,123 @@ fn terminal_replies_reach_the_server_whole() {
             "\x1b[6;20;9t".to_string()
         ]
     );
+}
+
+/// A quota that holds `n` pictures of `w × h` sent as RGB.
+fn quota_for(n: usize, w: u32, h: u32) -> Arc<Shared> {
+    let probe = Arc::new(Shared::new(true, usize::MAX));
+    let _png = Picture::from_rgba(w, h, [200, 10, 10, 255].repeat((w * h) as usize), &probe).unwrap();
+    let s = Arc::new(Shared::new(true, probe.used() * n + probe.used() / 2));
+    s.set_available(true);
+    s.set_cell(10, 20);
+    s
+}
+
+#[test]
+fn cropped_placements_count_in_the_quota() {
+    // Room for three pictures: the upload, and two parts of it at most.
+    let s = quota_for(3, 8, 8);
+    let mut g = PaneGraphics::new(s.clone());
+    let mut t = term(40, 10);
+    feed(&mut g, &mut t, &rgb_image("a=t,i=1,q=2", 8, 8));
+    let quota = s.used() * 3 + s.used() / 2;
+    for x in 0..20 {
+        feed(&mut g, &mut t, format!("\x1b_Ga=p,i=1,x={},w=4,C=1,q=2\x1b\\", x % 4).as_bytes());
+        assert!(s.used() <= quota, "placement {x}: {} over {quota}", s.used());
+    }
+    assert!(g.shown().count() <= 3);
+}
+
+#[test]
+fn placements_are_bounded_and_those_written_over_are_forgotten() {
+    let mut g = PaneGraphics::new(shared(true));
+    let mut t = term(20, 4);
+    feed(&mut g, &mut t, &rgb_image("a=t,i=1,q=2", 2, 2));
+    // The same cell, placed over and over: what was written over goes.
+    for _ in 0..200 {
+        feed(&mut g, &mut t, b"\x1b[H\x1b_Ga=p,i=1,c=1,r=1,C=1,q=2\x1b\\");
+    }
+    assert!(g.shown().count() <= 2 * SWEEP_START, "{} images kept", g.shown().count());
+    // One per line: those still in the screen or its history stay, the others go.
+    let mut g = PaneGraphics::new(shared(true));
+    let mut t = term(20, 4);
+    feed(&mut g, &mut t, &rgb_image("a=t,i=1,q=2", 2, 2));
+    for _ in 0..2 * SWEEP_START {
+        feed(&mut g, &mut t, b"\x1b_Ga=p,i=1,c=1,r=1,q=2\x1b\\\r\n");
+    }
+    assert_eq!(g.shown().count(), 2 * SWEEP_START, "all in the history");
+    let mut short = Term::new(Config { scrolling_history: 2, ..Config::default() }, &Size(20, 4), VoidListener);
+    let mut g = PaneGraphics::new(shared(true));
+    feed(&mut g, &mut short, &rgb_image("a=t,i=1,q=2", 2, 2));
+    for _ in 0..2 * SWEEP_START {
+        feed(&mut g, &mut short, b"\x1b_Ga=p,i=1,c=1,r=1,q=2\x1b\\\r\n");
+    }
+    assert!(g.shown().count() < SWEEP_START, "{} kept with a history of 2 lines", g.shown().count());
+    // A program's own placeholders: placements of one image are bounded.
+    let mut g = PaneGraphics::new(shared(true));
+    feed(&mut g, &mut t, &rgb_image("a=t,i=7,q=2", 2, 2));
+    for p in 1..=200 {
+        feed(&mut g, &mut t, format!("\x1b_Ga=p,U=1,i=7,p={p},c=1,r=1,q=2\x1b\\").as_bytes());
+    }
+    let (_, shown) = g.shown().next().unwrap();
+    assert_eq!(shown.placements.len(), MAX_PLACEMENTS);
+    assert_eq!(shown.placements.last().map(|p| p.0), Some(200), "the newest stay");
+}
+
+#[test]
+fn the_alternate_screen_keeps_the_main_screens_images() {
+    let mut g = PaneGraphics::new(shared(true));
+    let mut t = term(20, 4);
+    feed(&mut g, &mut t, &rgb_image("a=t,i=1,q=2", 2, 2));
+    feed(&mut g, &mut t, b"\x1b_Ga=p,i=1,c=1,r=1,q=2\x1b\\");
+    let main: Vec<u32> = g.shown().map(|(k, _)| k).collect();
+    // On the alternate screen, many images over the same cell: the main screen's stays.
+    feed(&mut g, &mut t, b"\x1b[?1049h");
+    for _ in 0..100 {
+        feed(&mut g, &mut t, b"\x1b[H\x1b_Ga=p,i=1,c=1,r=1,C=1,q=2\x1b\\");
+    }
+    assert!(g.shown().any(|(k, _)| k == main[0]));
+    // Back on the main screen, the alternate screen's images go at the next look.
+    feed(&mut g, &mut t, b"\x1b[?1049l");
+    g.sweep_at = 0;
+    feed(&mut g, &mut t, b"\x1b[3;1H\x1b_Ga=p,i=1,c=1,r=1,q=2\x1b\\");
+    assert_eq!(g.shown().count(), 2, "the main screen's two");
+}
+
+#[test]
+fn a_removed_placement_goes_from_the_terminal_and_a_closed_pane_counts_as_a_change() {
+    let s = shared(true);
+    let mut g = PaneGraphics::new(s.clone());
+    let mut t = term(20, 4);
+    feed(&mut g, &mut t, &rgb_image("a=T,U=1,i=1,p=7,c=2,r=1,q=2", 2, 2));
+    feed(&mut g, &mut t, b"\x1b_Ga=p,U=1,i=1,p=8,c=2,r=1,q=2\x1b\\");
+    let live = |g: &PaneGraphics| -> HashMap<u32, Live> {
+        g.shown().map(|(k, s)| (k, (s.generation, s.picture.clone(), s.placements.clone()))).collect()
+    };
+    let mut sent = HashMap::new();
+    let mut out = Vec::new();
+    assert!(!update_terminal(&mut sent, live(&g), usize::MAX, &mut out));
+    let kid = *sent.keys().next().unwrap();
+    // Placement 7 removed: the terminal loses the image's placements and gets 8 again.
+    feed(&mut g, &mut t, b"\x1b_Ga=d,d=i,i=1,p=7\x1b\\");
+    let mut out = Vec::new();
+    update_terminal(&mut sent, live(&g), usize::MAX, &mut out);
+    let text = String::from_utf8(out).unwrap();
+    assert_eq!(
+        text,
+        format!("\x1b_Ga=d,d=i,i={kid},q=2\x1b\\\x1b_Ga=p,U=1,i={kid},p=8,c=2,r=1,q=2\x1b\\"),
+        "no transmission again"
+    );
+    // The last one removed: the image goes from the terminal.
+    feed(&mut g, &mut t, b"\x1b_Ga=d,d=i,i=1,p=8\x1b\\");
+    assert_eq!(g.shown().count(), 0);
+    let mut out = Vec::new();
+    update_terminal(&mut sent, live(&g), usize::MAX, &mut out);
+    assert_eq!(out, format!("\x1b_Ga=d,d=I,i={kid},q=2\x1b\\").into_bytes());
+    // A pane that closes with images on show is a change clients see.
+    feed(&mut g, &mut t, &rgb_image("a=T,i=2,c=1,r=1,q=2", 2, 2));
+    let before = s.version();
+    drop(g);
+    assert_ne!(s.version(), before);
+    assert_eq!(s.used(), 0);
 }

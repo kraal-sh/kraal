@@ -5,7 +5,12 @@
 //! pane's first line, so that it stays on its text as that scrolls into the history. While the
 //! history fills up, its growth gives the lines that scrolled; once it is full, it stays the same
 //! length. Then kraal lifts the view one line while output runs: the emulator moves a lifted view
-//! along with its text, and how far it moved is how many lines scrolled.
+//! along with its text, and how far it moved is how many lines scrolled. Without a history, the
+//! lines above the cursor, written already, show how far the screen scrolled.
+//!
+//! When the text moves in a way kraal cannot follow (a scroll region below the first line, a
+//! rewrap to a new width, a history cleared), the marks lose their places but the commands stay,
+//! with how each ended and how long it ran.
 
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
@@ -35,11 +40,28 @@ pub enum Mark {
     End(Option<i32>),
 }
 
-/// A place in a pane's text: its line counted from the pane's first line, and its column.
+/// A place in a pane's text: its line counted from the pane's first line, and its column. The
+/// column is one past the last one when the cursor waited there to wrap: the line was full.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Spot {
     line: i64,
     col: usize,
+}
+
+impl Spot {
+    /// A place lost: the text moved in a way kraal could not follow.
+    const GONE: Spot = Spot { line: i64::MIN, col: 0 };
+
+    fn gone(self) -> bool {
+        self.line == i64::MIN
+    }
+}
+
+/// The text of the screen's lines and where the cursor was, to tell how far the screen scrolled
+/// when there is no history to count with.
+struct Screen {
+    rows: Vec<Vec<char>>,
+    cursor: Point,
 }
 
 /// One command, from its prompt on.
@@ -108,8 +130,15 @@ impl Commands {
         Commands { history_max: history_max.min(100_000), ..Commands::default() }
     }
 
-    fn forget(&mut self) {
-        self.list.clear();
+    /// Lose the places of the marks: the commands stay, with how they ended and how long they
+    /// ran, but none points at a line any more.
+    fn unplace(&mut self) {
+        for c in &mut self.list {
+            c.prompt = Spot::GONE;
+            for spot in [&mut c.input, &mut c.output, &mut c.end].into_iter().flatten() {
+                *spot = Spot::GONE;
+            }
+        }
         self.lifted = None;
     }
 }
@@ -139,11 +168,13 @@ impl TermPane {
 
     /// Change the grid with `change`, keeping count of the lines it scrolls so that the marks
     /// stay on their lines.
-    fn marked(&mut self, change: impl FnOnce(&mut Self)) {
+    pub(super) fn marked(&mut self, change: impl FnOnce(&mut Self)) {
         if self.commands.list.is_empty() {
             change(self);
+            self.guard.take_top_margin();
             return;
         }
+        let screen = (self.commands.history_max == 0 && !self.alt_screen()).then(|| self.screen());
         if !self.alt_screen() && self.commands.lifted.is_none() {
             let grid = self.term.grid();
             let (offset, history) = (grid.display_offset(), grid.history_size());
@@ -158,26 +189,75 @@ impl TermPane {
         }
         change(self);
         if !self.alt_screen() {
-            self.count_scrolled();
+            self.count_scrolled(screen);
         }
+        // A region below the first line scrolls its lines without putting them in the history:
+        // nothing tells how far they went.
+        if self.guard.take_top_margin() {
+            self.commands.unplace();
+        }
+    }
+
+    /// The text of the screen's lines, one character per cell, and the cursor.
+    fn screen(&self) -> Screen {
+        let grid = self.term.grid();
+        let rows = (0..self.term.screen_lines() as i32)
+            .map(|l| {
+                let row = &grid[Line(l)];
+                (0..self.term.columns()).map(|c| row[Column(c)].c).collect()
+            })
+            .collect();
+        Screen { rows, cursor: grid.cursor.point }
+    }
+
+    /// How far the screen scrolled since `before`, read from the text that was above the cursor
+    /// then (written already, it only moves): the one shift that puts it where it is now. None
+    /// when no shift, or more than one, fits, or when there was no such text to read.
+    fn shift_since(&self, before: &Screen) -> Option<usize> {
+        let now = self.screen();
+        let cursor = before.cursor.line.0.max(0) as usize;
+        let col = before.cursor.column.0;
+        let rows = &before.rows[..cursor.min(before.rows.len())];
+        let typed = before.rows.get(cursor).map(|r| &r[..col.min(r.len())]).unwrap_or_default();
+        let written = |r: &[char]| r.iter().any(|c| *c != ' ');
+        let mut found = None;
+        for shift in 0..=cursor {
+            // Blank lines fit any shift: only written text tells one from another.
+            if !rows.iter().skip(shift).any(|r| written(r)) && !written(typed) {
+                continue;
+            }
+            let rows_fit = rows.iter().enumerate().skip(shift).all(|(i, r)| now.rows.get(i - shift) == Some(r));
+            let typed_fits = now.rows.get(cursor - shift).is_some_and(|r| r.starts_with(typed));
+            if rows_fit && typed_fits {
+                if found.is_some() {
+                    return None;
+                }
+                found = Some(shift);
+            }
+        }
+        found
     }
 
     fn alt_screen(&self) -> bool {
         self.term.mode().contains(TermMode::ALT_SCREEN)
     }
 
-    /// Count the lines that scrolled into the history since the last count, and put a lifted
-    /// view back at the bottom. Marks that cannot be placed any more are dropped: the history
-    /// was cleared, or more lines went through it than it holds.
-    pub(super) fn count_scrolled(&mut self) {
+    /// Count the lines that scrolled into the history since the last count (or, without a
+    /// history, since the screen was `before`), and put a lifted view back at the bottom. Marks
+    /// that cannot be placed any more lose their places: the history was cleared, or more lines
+    /// went through it than it holds.
+    fn count_scrolled(&mut self, before: Option<Screen>) {
         if self.commands.list.is_empty() {
             return;
         }
+        let shifted = before.and_then(|b| self.shift_since(&b));
         let grid = self.term.grid();
         let (history, offset) = (grid.history_size(), grid.display_offset());
         let c = &mut self.commands;
         let lifted = c.lifted.take();
-        let moved = if history < c.history_max && history >= c.history_seen {
+        let moved = if c.history_max == 0 {
+            shifted
+        } else if history < c.history_max && history >= c.history_seen {
             Some(history - c.history_seen)
         } else {
             match lifted {
@@ -188,7 +268,7 @@ impl TermPane {
         c.history_seen = history;
         match moved {
             Some(n) => c.scrolled += n as i64,
-            None => c.forget(),
+            None => c.unplace(),
         }
         if let Some((_, true)) = lifted {
             self.term.grid_mut().scroll_display(Scroll::Bottom);
@@ -199,18 +279,23 @@ impl TermPane {
         }
     }
 
-    /// The emulator resized: the text may have moved between the screen and the history, and
-    /// rewrapped. Marks keep their distance to the cursor, exact when only the height changed.
+    /// The emulator resized: the text may have moved between the screen and the history. Marks
+    /// keep their distance to the cursor when only the height changed; a new width rewraps the
+    /// lines, and they lose their places.
     pub(super) fn resize_marked(&mut self, size: super::pty::Size) {
         let before = self.term.grid().cursor.point.line.0;
+        let width = self.term.columns();
         let alt = self.alt_screen();
         self.term.resize(size);
+        // The emulator's scroll region is the whole screen again.
+        self.guard.screen_resized();
         if self.commands.list.is_empty() {
             return;
         }
-        if alt {
-            // The primary screen rewraps out of sight: nothing tells where its lines went.
-            self.commands.forget();
+        if alt || usize::from(size.cols) != width {
+            // Rewrapped (on the alternate screen, the primary one changes out of sight).
+            self.commands.unplace();
+            self.commands.history_seen = self.term.grid().history_size();
             return;
         }
         let after = self.term.grid().cursor.point.line.0;
@@ -223,7 +308,7 @@ impl TermPane {
     pub(super) fn mark(&mut self, mark: Mark) -> Option<Finished> {
         // A synchronized update holds output back: what came before the mark must be on the grid.
         if self.parser.sync_timeout().sync_timeout().is_some() {
-            self.parser.stop_sync(&mut self.term);
+            self.marked(|t| t.parser.stop_sync(&mut t.term));
         }
         // Full screen programs have no commands; the primary screen's are out of sight.
         if self.alt_screen() {
@@ -233,8 +318,7 @@ impl TermPane {
             self.commands.history_seen = self.term.grid().history_size();
             self.commands.lifted = None;
         }
-        let at = self.term.grid().cursor.point;
-        let spot = Spot { line: self.commands.scrolled + i64::from(at.line.0), col: at.column.0 };
+        let spot = self.cursor_spot();
         let now = Instant::now();
         match mark {
             Mark::Prompt => {
@@ -260,7 +344,7 @@ impl TermPane {
                 if self.commands.list.back().is_some_and(|c| c.running()) {
                     return None;
                 }
-                if !self.commands.list.back().is_some_and(|c| !c.ran()) {
+                if self.commands.list.back().is_none_or(|c| c.ran()) {
                     // A shell that only marks commands: the command starts here.
                     self.commands.list.push_back(Command::new(spot));
                     if self.commands.list.len() > MAX_COMMANDS {
@@ -288,18 +372,32 @@ impl TermPane {
         None
     }
 
-    /// Where a spot is on the grid now, if its line is still there.
+    /// The cursor as a spot: past the last column while it waits to wrap.
+    fn cursor_spot(&self) -> Spot {
+        let cursor = &self.term.grid().cursor;
+        let col = cursor.point.column.0 + usize::from(cursor.input_needs_wrap);
+        Spot { line: self.commands.scrolled + i64::from(cursor.point.line.0), col }
+    }
+
+    /// Where a spot is on the grid now, if its line is still there. A spot past the last column
+    /// is where the next line starts.
     fn point(&self, spot: Spot) -> Option<Point> {
-        let line = spot.line - self.commands.scrolled;
+        if spot.gone() {
+            return None;
+        }
+        let columns = self.term.columns();
+        let (line, col) = if spot.col >= columns { (spot.line + 1, 0) } else { (spot.line, spot.col) };
+        let line = line - self.commands.scrolled;
         let top = -(self.term.grid().history_size() as i64);
         let bottom = self.term.screen_lines() as i64;
-        (top..bottom)
-            .contains(&line)
-            .then(|| Point::new(Line(line as i32), Column(spot.col.min(self.term.columns().saturating_sub(1)))))
+        (top..bottom).contains(&line).then(|| Point::new(Line(line as i32), Column(col)))
     }
 
     /// The point just before `spot`: the end of the previous line when it starts a line.
     fn before(&self, spot: Spot) -> Option<Point> {
+        if spot.gone() {
+            return None;
+        }
         if spot.col > 0 {
             return self.point(Spot { line: spot.line, col: spot.col - 1 });
         }
@@ -309,7 +407,7 @@ impl TermPane {
 
     /// The text from `from` up to `to` (not included); None when nothing of it is left.
     fn text_between(&self, from: Spot, to: Spot) -> Option<String> {
-        if (to.line, to.col) <= (from.line, from.col) {
+        if from.gone() || to.gone() || (to.line, to.col) <= (from.line, from.col) {
             return None;
         }
         let start = self.point(from).or_else(|| self.point(Spot { line: self.top_line(), col: 0 }))?;
@@ -325,11 +423,11 @@ impl TermPane {
     /// The output of a command so far: up to its end, or to the cursor while it runs. Lines
     /// gone from the history are left out.
     fn output_text(&self, c: &Command) -> Option<String> {
-        let from = c.output?;
-        let to = c.end.unwrap_or_else(|| {
-            let at = self.term.grid().cursor.point;
-            Spot { line: self.commands.scrolled + i64::from(at.line.0), col: at.column.0 }
-        });
+        let from = c.output.filter(|s| !s.gone())?;
+        let to = c.end.unwrap_or_else(|| self.cursor_spot());
+        if to.gone() {
+            return None;
+        }
         if (to.line, to.col) <= (from.line, from.col) {
             return Some(String::new());
         }
@@ -398,8 +496,8 @@ impl Pane {
     pub fn select_command(&mut self, whole: bool) -> bool {
         let Some(t) = self.term_mut() else { return false };
         let at = t.term.vi_mode_cursor.point.line;
-        let Some(c) = t.commands.list.iter().rev().find(|c| c.ran() && t.point(c.prompt).is_none_or(|p| p.line <= at))
-        else {
+        let above = |c: &&Command| !c.prompt.gone() && t.point(c.prompt).is_none_or(|p| p.line <= at);
+        let Some(c) = t.commands.list.iter().rev().find(|c| c.ran() && above(c)) else {
             return false;
         };
         let first = if whole { c.prompt } else { c.output.unwrap_or(c.prompt) };
@@ -603,6 +701,98 @@ mod tests {
         p.scroll(2);
         p.feed(b"more\r\n");
         assert_eq!(p.display_offset(), 3, "a view scrolled back stays on its text");
+        p.kill();
+    }
+
+    #[test]
+    fn output_held_by_a_synchronized_update_counts_when_it_lands() {
+        let (mut p, _rx) = pane(4, 20);
+        for i in 0..40 {
+            p.feed(format!("filler {i}\r\n").as_bytes());
+        }
+        p.feed(command("first", &["one"], 0).as_bytes());
+        // Held, then flushed by the mark that ends the command.
+        p.feed(b"\x1b]133;A\x07$ \x1b]133;B\x07second\r\n\x1b]133;C\x07\x1b[?2026h");
+        p.feed(b"o1\r\no2\r\no3\r\no4\r\no5\r\n\x1b]133;D;0\x07\x1b[?2026l");
+        // Held, then flushed when the update times out.
+        p.feed(b"\x1b]133;A\x07$ \x1b]133;B\x07third\r\n\x1b]133;C\x07\x1b[?2026h");
+        p.feed(b"t1\r\nt2\r\nt3\r\nt4\r\nt5\r\n");
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(p.poll_sync_timeout().is_some());
+        p.feed(b"\x1b[?2026l\x1b]133;D;0\x07\x1b]133;A\x07$ ");
+        p.copy_mode(true);
+        assert!(p.jump_to_prompt(true));
+        assert_eq!(cursor_line_text(&p), "$ third");
+        assert!(p.jump_to_prompt(true));
+        assert_eq!(cursor_line_text(&p), "$ second");
+        assert!(p.jump_to_prompt(true));
+        assert_eq!(cursor_line_text(&p), "$ first");
+        p.copy_mode(false);
+        p.kill();
+    }
+
+    #[test]
+    fn a_region_below_the_first_line_loses_the_places_not_the_commands() {
+        let (mut p, _rx) = pane(5, 10);
+        for i in 0..30 {
+            p.feed(format!("filler {i}\r\n").as_bytes());
+        }
+        p.feed(command("make", &["error"], 3).as_bytes());
+        // Lines scroll inside rows 2 to 5: none goes into the history.
+        p.feed(b"\x1b[2;5r\x1b[5;1Ha\r\nb\r\nc\r\n\x1b[r\x1b[5;1H\x1b]133;A\x07$ ");
+        p.copy_mode(true);
+        assert!(!p.jump_to_prompt(true), "no prompt left on a wrong line: {}", cursor_line_text(&p));
+        p.copy_mode(false);
+        assert_eq!(p.last_failure().map(|f| f.0), Some(3));
+        // Marks after it are placed again.
+        p.feed(b"\x1b]133;B\x07ls\r\n\x1b]133;C\x07x\r\n\x1b]133;D;0\x07\x1b]133;A\x07$ ");
+        p.copy_mode(true);
+        assert!(p.jump_to_prompt(true));
+        assert_eq!(cursor_line_text(&p), "$ ls");
+        p.copy_mode(false);
+        p.kill();
+    }
+
+    #[test]
+    fn without_a_history_the_screen_says_how_far_it_scrolled() {
+        let (mut p, _rx) = pane(6, 0);
+        p.feed(b"intro\r\n");
+        p.feed(command("first", &["one", "two"], 0).as_bytes());
+        p.feed(command("second", &["x", "y", "z"], 0).as_bytes());
+        p.feed(b"\x1b]133;A\x07$ ");
+        p.copy_mode(true);
+        assert!(p.jump_to_prompt(true));
+        assert_eq!(cursor_line_text(&p), "$ second");
+        assert!(!p.jump_to_prompt(true), "the first prompt scrolled away");
+        assert!(p.select_command(false));
+        assert_eq!(p.selection_text().unwrap().trim_end(), "x\ny\nz");
+        p.copy_mode(false);
+        assert_eq!(p.last_command_output(), Some((Some("second".into()), "x\ny\nz".into())));
+        p.kill();
+    }
+
+    #[test]
+    fn a_new_width_loses_the_places_and_keeps_how_commands_ended() {
+        let (mut p, _rx) = pane(6, 50);
+        p.feed(command("ls", &["a long line that the new width will wrap"], 2).as_bytes());
+        p.feed(b"\x1b]133;A\x07$ ");
+        p.resize(12, 6);
+        p.copy_mode(true);
+        assert!(!p.jump_to_prompt(true));
+        p.copy_mode(false);
+        assert_eq!(p.last_failure().map(|f| f.0), Some(2));
+        assert_eq!(p.last_command_output(), None, "nothing copied from a wrong line");
+        p.feed(b"\x1b]133;B\x07pwd\r\n\x1b]133;C\x07/\r\n\x1b]133;D;0\x07\x1b]133;A\x07$ ");
+        assert_eq!(p.last_command_output(), Some((Some("pwd".into()), "/".into())));
+        p.kill();
+    }
+
+    #[test]
+    fn output_that_fills_its_last_line_is_copied_whole() {
+        let (mut p, _rx) = pane(6, 50);
+        let full = "x".repeat(30);
+        p.feed(format!("\x1b]133;A\x07$ \x1b]133;B\x07cmd\r\n\x1b]133;C\x07{full}\x1b]133;D;0\x07\r\n").as_bytes());
+        assert_eq!(p.last_command_output(), Some((Some("cmd".into()), full)));
         p.kill();
     }
 

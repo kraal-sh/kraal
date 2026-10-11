@@ -106,15 +106,21 @@ fn kitty_code(code: KeyCode, mods: Mods, flags: u8) -> Option<(u32, u32)> {
 /// is. The modifiers are Shift, Alt and Ctrl, without the lock keys, as for every program.
 fn encode_kitty_key(key: &Key, flags: u8) -> Option<Vec<u8>> {
     let (cp, m) = kitty_code(key.code, key.mods, flags)?;
-    let (cp, shifted, base, text) = match super::decode::kitty_fields(&key.raw) {
-        Some(f) if f.key != 0 => (f.key, f.shifted, f.base, f.text),
+    let (cp, m, shifted, base, text) = match super::decode::kitty_fields(&key.raw) {
+        // The modifiers as the terminal sent them (Alt that typed a character included), without
+        // the lock keys. A program that does not get the text learns the case from Shift.
+        Some(f) if f.key != 0 => {
+            let gets_text = flags & (8 | 16) == 8 | 16 && !f.text.is_empty();
+            let shift = if gets_text { f.mods & 1 } else { u32::from(key.mods.shift) };
+            (f.key, 1 + ((f.mods & 62) | shift), f.shifted, f.base, f.text)
+        }
         _ => match key.code {
             KeyCode::Char(c) => {
                 let shifted = if c as u32 == cp { 0 } else { c as u32 };
                 let text = if key.mods.ctrl || key.mods.alt { Vec::new() } else { vec![c] };
-                (cp, shifted, 0, text)
+                (cp, m, shifted, 0, text)
             }
-            _ => (cp, 0, 0, Vec::new()),
+            _ => (cp, m, 0, 0, Vec::new()),
         },
     };
     let mut out = format!("\x1b[{cp}");

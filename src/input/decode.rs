@@ -19,6 +19,9 @@ pub(super) struct KittyFields {
     pub key: u32,
     pub shifted: u32,
     pub base: u32,
+    /// The modifier bits as the terminal sent them (Shift 1, Alt 2, Ctrl 4, Super 8, Hyper 16,
+    /// Meta 32, Caps Lock 64, Num Lock 128).
+    pub mods: u32,
     pub text: Vec<char>,
 }
 
@@ -40,6 +43,7 @@ pub(super) fn kitty_fields(raw: &[u8]) -> Option<KittyFields> {
         key: param(&params, 0),
         shifted: sub_param(&params, 0, 1),
         base: sub_param(&params, 0, 2),
+        mods: param(&params, 1).saturating_sub(1),
         text: associated_text(&params).unwrap_or_default(),
     })
 }
@@ -540,6 +544,11 @@ fn csi_u(params: &[Vec<u32>], seq: &[u8]) -> Tok {
     // What the key typed wins over its code: a dead key's accent, AltGr, the macOS Option key
     // and input methods show only there.
     if let Some(text) = associated_text(params) {
+        // Text with no key (an input method's commit) is text, not key presses: it goes in as
+        // pasted text would, and the leader menu does not read it as keys.
+        if param(params, 0) == 0 {
+            return Tok::Event(InputEvent::Paste(text.iter().collect::<String>().into_bytes()));
+        }
         return text_tok(&text, mods, seq);
     }
     codepoint_key(param(params, 0), sub_param(params, 0, 1), mods, seq)
@@ -550,7 +559,11 @@ fn csi_u(params: &[Vec<u32>], seq: &[u8]) -> Tok {
 /// text, one key each.
 fn text_tok(text: &[char], mods: Mods, seq: &[u8]) -> Tok {
     match text {
-        [c] => key_tok(KeyCode::Char(*c), Mods { alt: false, ..mods }, seq),
+        // The text says what was typed, Caps Lock included: for a letter its case wins over Shift.
+        [c] => {
+            let shift = if c.is_alphabetic() { c.is_uppercase() } else { mods.shift };
+            key_tok(KeyCode::Char(*c), Mods { alt: false, shift, ..mods }, seq)
+        }
         _ => Tok::Keys(
             text.iter()
                 .map(|c| {

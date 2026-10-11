@@ -200,15 +200,17 @@ const SETUP_NO_MOUSE: &str = "\x1b[?1049h\x1b[?25l";
 // terminal's stack, which the single pop when the client goes takes away.
 const KEYS_ON: &str = "\x1b[?2004h\x1b[?1004h\x1b[>5u";
 const KEYS_OFF: &str = "\x1b[<u\x1b[?1004l\x1b[?2004l";
-const MOUSE_ON: &str = "\x1b[?1000h\x1b[?1002h\x1b[?1006h";
-const MOUSE_OFF: &str = "\x1b[?1006l\x1b[?1003l\x1b[?1002l\x1b[?1000l";
+pub(crate) const MOUSE_ON: &str = "\x1b[?1000h\x1b[?1002h\x1b[?1006h";
+pub(crate) const MOUSE_OFF: &str = "\x1b[?1006l\x1b[?1003l\x1b[?1002l\x1b[?1000l";
 
 /// Turn the terminal's input modes on (kitty keys, bracketed paste, focus reports, the mouse
 /// when asked) while a server answers, and off while kraal waits for one.
 fn set_modes(on: bool, mouse: bool) {
     let mut out = std::io::stdout();
     let _ = out.write_all(if on { KEYS_ON } else { KEYS_OFF }.as_bytes());
-    if mouse {
+    // Off whatever the setting was when attaching: the server turns the mouse on or off when its
+    // configuration is read again.
+    if mouse || !on {
         let _ = out.write_all(if on { MOUSE_ON } else { MOUSE_OFF }.as_bytes());
     }
     let _ = out.flush();
@@ -721,7 +723,6 @@ mod tests {
         assert_eq!(got_keys + left_for_ssh, 20);
         assert!(!got.lock().unwrap().windows(6).any(|w| w == b"secret"));
         // Closing the typing end: the reader sees the end.
-        drop(write);
         drop(typing);
         reader.join().unwrap();
         drop(keyboard_end);

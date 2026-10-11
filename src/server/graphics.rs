@@ -2,11 +2,10 @@
 //! images the panes show, ahead of the frames that use them.
 
 use std::collections::HashMap;
-use std::sync::Arc;
 
 use super::clients::frame_bytes;
 use super::{ClientId, Server};
-use crate::graphics::{self, Picture};
+use crate::graphics;
 
 /// Image data sent with one frame at most; the rest follows with the next frames.
 const BUDGET: usize = 4 << 20;
@@ -131,7 +130,7 @@ impl Server {
         self.images.get(&id).is_some_and(|ci| ci.capable)
     }
 
-    /// What a client's terminal needs before the next frame: images it does not have, new
+    /// What a client's terminal needs before the next frame: images it does not have, changed
     /// placements, and the deletion of images no pane shows any more. Within a budget; true
     /// when more is left for the next frames.
     pub(super) fn graphics_updates(&mut self, id: ClientId) -> (Vec<u8>, bool) {
@@ -141,8 +140,7 @@ impl Server {
         if !ci.capable || ci.version == Some(version) {
             return (out, false);
         }
-        type Live = (u64, Arc<Picture>, Vec<(u32, u16, u16)>);
-        let live: HashMap<u32, Live> = self
+        let live: HashMap<u32, graphics::Live> = self
             .panes
             .values()
             .filter_map(|p| p.term())
@@ -150,30 +148,7 @@ impl Server {
             .map(|(kid, s)| (kid, (s.generation, s.picture.clone(), s.placements.clone())))
             .collect();
         let Some(ci) = self.images.get_mut(&id) else { return (out, false) };
-        let gone: Vec<u32> = ci.sent.keys().filter(|k| !live.contains_key(k)).copied().collect();
-        for kid in gone {
-            graphics::delete(kid, &mut out);
-            ci.sent.remove(&kid);
-        }
-        let mut more = false;
-        for (kid, (generation, picture, placements)) in live {
-            let had = ci.sent.get(&kid).copied();
-            if had == Some(generation) {
-                continue;
-            }
-            if had.is_none() {
-                // One large image may go alone; then the others wait.
-                if !out.is_empty() && out.len() + picture.png.len() * 4 / 3 > BUDGET {
-                    more = true;
-                    continue;
-                }
-                graphics::transmit(kid, &picture, &mut out);
-            }
-            for (placement, cols, rows) in placements {
-                graphics::place(kid, placement, cols, rows, &mut out);
-            }
-            ci.sent.insert(kid, generation);
-        }
+        let more = graphics::update_terminal(&mut ci.sent, live, BUDGET, &mut out);
         if !more {
             ci.version = Some(version);
         }

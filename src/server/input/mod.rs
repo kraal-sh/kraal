@@ -278,9 +278,11 @@ impl Server {
         }
         typed.push(self.keymap.leader_key(&typed, k));
         match self.keymap.lookup(&typed) {
-            // The prefix pressed twice: the program gets the one pressed (there may be several).
+            // The program gets the prefix: the one pressed when it was pressed twice (there may be
+            // several), the first one when send_prefix has another key.
             Lookup::Run(Command::Action(Action::SendPrefix)) => {
-                self.send_prefix(id, typed.last().cloned());
+                let pressed = typed.last().filter(|k| self.keymap.is_prefix(k)).cloned();
+                self.send_prefix(id, pressed);
                 Mode::Normal
             }
             Lookup::Run(command) => self.command(id, command),

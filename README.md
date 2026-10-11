@@ -408,6 +408,9 @@ A shell can mark where each prompt, command line and output starts, and how each
   seconds; 0 turns it off);
 - each command that ends is a `command.finished` event.
 
+A new pane width, or a program that scrolls only part of the screen, moves lines in ways kraal
+cannot follow: the earlier prompts can no longer be jumped to, but how each command ended stays.
+
 Shells do not send the marks by themselves (fish 4 does). kraal adds a few lines to your shell's
 startup file, active only in kraal's panes, when you ask:
 
@@ -416,6 +419,9 @@ kraal integration install zsh      # or bash (4.4 and later), fish; a backup is 
 kraal integration show zsh         # the lines, for a startup file you keep yourself
 kraal integration uninstall zsh
 ```
+
+A startup file that is a link (dotfiles kept in a repository) stays a link: the file it points to
+changes, and the backup goes next to the link.
 
 ## Runbooks
 

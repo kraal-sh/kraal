@@ -1,6 +1,6 @@
 //! `kraal config reload`: read config.toml again while the server runs.
 
-use super::{Server, events};
+use super::{Server, events, frame_bytes};
 use crate::config::Config;
 use crate::keymap::Keymap;
 
@@ -25,9 +25,17 @@ impl Server {
         crate::theme::set(theme);
         self.keymap = keymap;
         self.hint_patterns = hint_patterns;
-        self.hooks = events::Hooks::new(hook_list);
+        // Hooks that are running keep their supervision; the new list applies to the next events.
+        self.hooks.list = hook_list;
         self.env.shell = config.shell();
         self.env.scrollback = config.scrollback;
+        // Attached terminals report the mouse, or stop, as the new setting says.
+        if config.mouse != self.config.mouse {
+            let modes = if config.mouse { crate::client::MOUSE_ON } else { crate::client::MOUSE_OFF };
+            for c in self.clients.values().filter(|c| c.attached) {
+                let _ = c.out.try_send(frame_bytes(modes.as_bytes()));
+            }
+        }
         self.config = config;
         // Workspace folders, the sidebar's width and pane frames may have changed.
         self.scan_definitions();

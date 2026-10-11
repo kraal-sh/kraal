@@ -1272,8 +1272,10 @@ fn every_key_with_its_text() {
     assert_eq!(single_key(b"\x1b[101;;8364u"), (Char('€'), NONE));
     // The macOS Option key types a character: Alt is part of it.
     assert_eq!(single_key(b"\x1b[101;3;233u"), (Char('é'), NONE));
-    // Caps Lock and Shift.
+    // Caps Lock and Shift. With both, the letter is lowercase, as typed.
     assert_eq!(single_key(b"\x1b[97;65;65u"), (Char('A'), SHIFT));
+    assert_eq!(single_key(b"\x1b[115:83;66;115u"), (Char('s'), NONE));
+    assert_eq!(single_key(b"\x1b[1099::115;65;1067u"), (Char('Ы'), SHIFT));
     assert_eq!(single_key(b"\x1b[1099:1067:115;2;1067u"), (Char('Ы'), SHIFT));
     // Plain keys, with or without their text.
     assert_eq!(single_key(b"\x1b[97;;97u"), (Char('a'), NONE));
@@ -1309,6 +1311,8 @@ fn keys_by_place() {
     // A non-Latin layout: the letter at the place, Shift and Ctrl kept.
     assert_eq!(place(b"\x1b[1099::115;;1099u"), Some((Char('s'), NONE)));
     assert_eq!(place(b"\x1b[1099:1067:115;2;1067u"), Some((Char('S'), SHIFT)));
+    // Caps Lock alone: the case of what was typed.
+    assert_eq!(place(b"\x1b[1099::115;65;1067u"), Some((Char('S'), SHIFT)));
     assert_eq!(place(b"\x1b[1080::98;5u"), Some((Char('b'), CTRL)));
     // A Latin letter is the letter it types, wherever the key is (AZERTY's `a` is at `q`).
     assert_eq!(place(b"\x1b[97::113;;97u"), None);
@@ -1365,7 +1369,7 @@ fn every_key_reaches_a_program_with_the_protocol_as_it_asked() {
         (b"\x1b[38::49;;38u", 29, b"\x1b[38::49;1;38u"),
         // Caps Lock and Num Lock stay with kraal, as for every program: Caps Lock's `A` is
         // Shift's, Ctrl+C with Num Lock on is Ctrl+C.
-        (b"\x1b[97;65;65u", 25, b"\x1b[97;2;65u"),
+        (b"\x1b[97;65;65u", 25, b"\x1b[97;1;65u"),
         (b"\x1b[99;133u", 1, b"\x1b[99;5u"),
         // Keys that came as plain text are described from what they are.
         (b"a", 9, b"\x1b[97u"),
@@ -1394,4 +1398,30 @@ fn keys_only_some_programs_asked_for() {
     assert_eq!(event(b"\x1b[97;1:3u"), 2);
     // Print Screen: any program with the protocol.
     assert_eq!(event(b"\x1b[57361u"), 0);
+}
+
+#[test]
+fn a_program_with_the_protocol_gets_the_modifiers_as_sent() {
+    let modes = PaneInputModes { kitty_flags: 29, ..Default::default() };
+    // The macOS Option key typing `é`: Alt stays in the key the program gets.
+    let key = parse_key(b"\x1b[101;3;233u");
+    assert_eq!(encode_key(&key, modes), b"\x1b[101;3;233u");
+    // Caps Lock alone is left out: no Shift is made up, the text says the case.
+    let key = parse_key(b"\x1b[97;65;65u");
+    assert_eq!(encode_key(&key, modes), b"\x1b[97;1;65u");
+}
+
+#[test]
+fn text_from_an_input_method_is_text() {
+    // No key, two characters: one piece of text, as a paste, not two key presses.
+    assert_eq!(parse_all(b"\x1b[0;;49:97u"), vec![InputEvent::Paste(b"1a".to_vec())]);
+}
+
+#[test]
+fn caps_lock_reaches_a_program_without_text_as_shift() {
+    // Flags 1 and 8 without 16: the program learns the case from Shift.
+    let modes = PaneInputModes { kitty_flags: 9, ..Default::default() };
+    assert_eq!(encode_key(&parse_key(b"\x1b[97;65;65u"), modes), b"\x1b[97;2u");
+    // Caps Lock and Shift together type a lowercase letter: no Shift then.
+    assert_eq!(encode_key(&parse_key(b"\x1b[115:83;66;115u"), modes), b"\x1b[115u");
 }

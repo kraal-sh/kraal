@@ -103,6 +103,11 @@ impl Key {
         Key { code, mods, raw: Vec::new() }
     }
 
+    /// Whether the terminal said where this key is (kitty keyboard protocol, alternate keys).
+    pub fn has_place(&self) -> bool {
+        decode::kitty_fields(&self.raw).is_some_and(|f| f.base != 0)
+    }
+
     /// The key at the same place on a US keyboard, when the terminal said where the key is
     /// (kitty keyboard protocol, alternate keys) and a keymap should read it that way: on the
     /// digit row without Shift (AZERTY's `&` is `1`), and on a non-Latin layout (Russian `и` is
@@ -116,7 +121,8 @@ impl Key {
             }
             base
         } else if base.is_ascii_alphabetic() && !c.is_ascii() {
-            if self.mods.shift && !self.mods.ctrl { base.to_ascii_uppercase() } else { base.to_ascii_lowercase() }
+            // The case of what was typed, Caps Lock included.
+            if c.is_uppercase() && !self.mods.ctrl { base.to_ascii_uppercase() } else { base.to_ascii_lowercase() }
         } else {
             return None;
         };

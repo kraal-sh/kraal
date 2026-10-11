@@ -261,8 +261,8 @@ impl Pane {
         std::mem::swap(&mut fresh.commands, &mut old.commands);
         // The images its scrollback shows stay with it.
         std::mem::swap(&mut fresh.graphics, &mut old.graphics);
-        fresh.parser.advance(&mut fresh.term, &reset_sequence(self.cols));
-        fresh.count_scrolled();
+        let reset = reset_sequence(self.cols);
+        fresh.marked(|t| t.parser.advance(&mut t.term, &reset));
         **old = fresh;
         // A new process: nothing of the old one's lifecycle carries over, but its conversation.
         self.exit_code = None;
@@ -392,7 +392,7 @@ impl Pane {
         let Content::Term(t) = &mut self.content else { return None };
         match t.parser.sync_timeout().sync_timeout() {
             Some(deadline) if deadline <= Instant::now() => {
-                t.parser.stop_sync(&mut t.term);
+                t.marked(|t| t.parser.stop_sync(&mut t.term));
                 let mut signals = Vec::new();
                 self.drain_events(&mut signals);
                 Some(signals)

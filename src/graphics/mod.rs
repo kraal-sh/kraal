@@ -14,15 +14,15 @@ pub mod sixel;
 #[cfg(test)]
 mod tests;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use alacritty_terminal::event::EventListener;
 use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::index::{Column, Line};
-use alacritty_terminal::term::Term;
 use alacritty_terminal::term::cell::Cell;
+use alacritty_terminal::term::{Term, TermMode};
 use alacritty_terminal::vte::ansi::{Color as AColor, Handler, Rgb};
 use base64::Engine;
 use ratatui::buffer::Buffer;
@@ -48,6 +48,13 @@ const MAX_PNG: usize = 24 << 20;
 const MAX_CELLS: usize = DIACRITICS.len();
 /// Cell size assumed until the outer terminal says.
 const DEFAULT_CELL: (u16, u16) = (10, 20);
+/// Images a pane shows at once, and placements of one image: beyond, the oldest go.
+const MAX_SHOWN: usize = 1024;
+const MAX_PLACEMENTS: usize = 64;
+/// Bytes counted for each picture besides its PNG, so that many tiny images fill the quota too.
+const PICTURE_COST: usize = 1024;
+/// Placed images a pane holds before kraal looks for those whose cells are all gone.
+const SWEEP_START: usize = 32;
 
 const LENIENT: base64::engine::GeneralPurpose = base64::engine::GeneralPurpose::new(
     &base64::alphabet::STANDARD,
@@ -143,7 +150,7 @@ pub struct Picture {
 
 impl Picture {
     fn new(png: Vec<u8>, width: u32, height: u32, shared: &Arc<Shared>) -> Arc<Picture> {
-        shared.used.fetch_add(png.len(), Ordering::Relaxed);
+        shared.used.fetch_add(png.len() + PICTURE_COST, Ordering::Relaxed);
         Arc::new(Picture { png, width, height, shared: shared.clone() })
     }
 
@@ -179,7 +186,7 @@ impl Picture {
 
 impl Drop for Picture {
     fn drop(&mut self) {
-        self.shared.used.fetch_sub(self.png.len(), Ordering::Relaxed);
+        self.shared.used.fetch_sub(self.png.len() + PICTURE_COST, Ordering::Relaxed);
     }
 }
 
@@ -205,6 +212,8 @@ pub struct Shown {
     origin: u32,
     /// Placed by kraal at the cursor, as opposed to a program's own placeholders.
     direct: bool,
+    /// Placed while the alternate screen was up: its cells went with it.
+    alt: bool,
     stamp: u64,
 }
 
@@ -234,6 +243,17 @@ pub struct PaneGraphics {
     /// Placements the program named (image id, placement id) → kraal's id.
     named: HashMap<(u32, u32), u32>,
     clock: u64,
+    /// How many placed images trigger the next look for those whose cells are gone.
+    sweep_at: usize,
+}
+
+impl Drop for PaneGraphics {
+    fn drop(&mut self) {
+        // What this pane showed goes from the clients' terminals with the next frame.
+        if !self.shown.is_empty() {
+            self.shared.changed();
+        }
+    }
 }
 
 impl PaneGraphics {
@@ -248,6 +268,7 @@ impl PaneGraphics {
             virtual_ids: HashMap::new(),
             named: HashMap::new(),
             clock: 0,
+            sweep_at: SWEEP_START,
         }
     }
 
@@ -446,13 +467,15 @@ impl PaneGraphics {
         picture: Arc<Picture>,
         term: &mut Term<T>,
     ) -> Result<(), String> {
+        if id == 0 && cmd.virtual_ {
+            return Err("EINVAL:a placeholder needs an image id".into());
+        }
+        // A part of the image is a new picture: it counts in the quota like any.
         let picture = crop(picture, cmd, &self.shared)?;
+        self.make_room()?;
         let (cols, rows) = cells_for(&picture, cmd.cols, cmd.rows, self.shared.cell());
         let stamp = self.tick();
         if cmd.virtual_ {
-            if id == 0 {
-                return Err("EINVAL:a placeholder needs an image id".into());
-            }
             let kid = *self.virtual_ids.entry(id).or_insert_with(|| self.shared.new_id());
             let shown = self.shown.entry(kid).or_insert_with(|| Shown {
                 picture: picture.clone(),
@@ -460,13 +483,18 @@ impl PaneGraphics {
                 generation: 0,
                 origin: id,
                 direct: false,
+                alt: false,
                 stamp,
             });
             shown.picture = picture;
             shown.placements.retain(|(p, _, _)| *p != cmd.placement);
             shown.placements.push((cmd.placement, cols, rows));
+            if shown.placements.len() > MAX_PLACEMENTS {
+                shown.placements.remove(0);
+            }
             shown.generation += 1;
             shown.stamp = stamp;
+            self.limit_shown();
             self.shared.changed();
             return Ok(());
         }
@@ -475,17 +503,28 @@ impl PaneGraphics {
             && cmd.placement != 0
             && let Some(old) = self.named.remove(&(id, cmd.placement))
         {
-            self.shown.remove(&old);
+            self.remove_shown(old);
         }
+        self.sweep(term);
         let kid = self.shared.new_id();
+        let alt = term.mode().contains(TermMode::ALT_SCREEN);
         let drawn = write_cells(term, kid, cols, rows, if cmd.no_move { After::Stay } else { After::Right });
         self.shown.insert(
             kid,
-            Shown { picture, placements: vec![(0, drawn.0, drawn.1)], generation: 0, origin: id, direct: true, stamp },
+            Shown {
+                picture,
+                placements: vec![(0, drawn.0, drawn.1)],
+                generation: 0,
+                origin: id,
+                direct: true,
+                alt,
+                stamp,
+            },
         );
         if id != 0 && cmd.placement != 0 {
             self.named.insert((id, cmd.placement), kid);
         }
+        self.limit_shown();
         self.shared.changed();
         Ok(())
     }
@@ -543,7 +582,7 @@ impl PaneGraphics {
                     if let Some(p) = Placeholder::of_cell(cell)
                         && self.shown.get(&p.id).is_some_and(|s| s.direct)
                     {
-                        self.shown.remove(&p.id);
+                        self.remove_shown(p.id);
                     }
                 }
             }
@@ -558,13 +597,17 @@ impl PaneGraphics {
         match place {
             Some(p) => {
                 if let Some(kid) = self.named.remove(&(id, p)) {
-                    self.shown.remove(&kid);
+                    self.remove_shown(kid);
                 }
-                if let Some(kid) = self.virtual_ids.get(&id)
-                    && let Some(s) = self.shown.get_mut(kid)
+                if let Some(&kid) = self.virtual_ids.get(&id)
+                    && let Some(s) = self.shown.get_mut(&kid)
                 {
                     s.placements.retain(|(pid, _, _)| *pid != p);
                     s.generation += 1;
+                    // Without placements nothing shows it: it goes, from the terminals too.
+                    if s.placements.is_empty() {
+                        self.remove_shown(kid);
+                    }
                 }
             }
             None => {
@@ -587,20 +630,58 @@ impl PaneGraphics {
             let oldest_upload = self.uploads.iter().min_by_key(|(_, u)| u.stamp).map(|(id, u)| (u.stamp, *id));
             let oldest_shown = self.shown.iter().min_by_key(|(_, s)| s.stamp).map(|(id, s)| (s.stamp, *id));
             match (oldest_upload, oldest_shown) {
-                (Some((a, id)), Some((b, _))) if a <= b => {
-                    self.uploads.remove(&id);
-                }
-                (_, Some((_, kid))) => {
-                    self.shown.remove(&kid);
-                    self.shared.changed();
-                }
-                (Some((_, id)), None) => {
-                    self.uploads.remove(&id);
-                }
+                (Some((a, id)), Some((b, _))) if a <= b => self.remove_upload(id),
+                (_, Some((_, kid))) => self.remove_shown(kid),
+                (Some((_, id)), None) => self.remove_upload(id),
                 (None, None) => return Err("ENOSPC:image storage is full".into()),
             }
         }
         Ok(())
+    }
+
+    /// An image on show goes, with the names that led to it.
+    fn remove_shown(&mut self, kid: u32) {
+        if self.shown.remove(&kid).is_some() {
+            self.named.retain(|_, k| *k != kid);
+            self.virtual_ids.retain(|_, k| *k != kid);
+            self.shared.changed();
+        }
+    }
+
+    /// An image kept for later placements goes, with its number.
+    fn remove_upload(&mut self, id: u32) {
+        self.uploads.remove(&id);
+        self.numbers.retain(|_, i| *i != id);
+    }
+
+    /// No more than [`MAX_SHOWN`] images on show: the oldest go.
+    fn limit_shown(&mut self) {
+        while self.shown.len() > MAX_SHOWN {
+            let Some(oldest) = self.shown.iter().min_by_key(|(_, s)| s.stamp).map(|(k, _)| *k) else { return };
+            self.remove_shown(oldest);
+        }
+    }
+
+    /// Images placed at the cursor whose cells are all gone (written over, or out of the
+    /// history) are forgotten. kraal reads the grid through each time their number doubles, so
+    /// the cost stays in proportion to what was placed. The images of the screen that is not up
+    /// (main or alternate) are left alone, except that the alternate screen's go with it.
+    fn sweep<T: EventListener>(&mut self, term: &Term<T>) {
+        if self.shown.values().filter(|s| s.direct).count() < self.sweep_at {
+            return;
+        }
+        let alt = term.mode().contains(TermMode::ALT_SCREEN);
+        let seen = placed_ids(term);
+        let gone: Vec<u32> = self
+            .shown
+            .iter()
+            .filter(|(kid, s)| s.direct && ((s.alt == alt && !seen.contains(kid)) || (s.alt && !alt)))
+            .map(|(kid, _)| *kid)
+            .collect();
+        for kid in gone {
+            self.remove_shown(kid);
+        }
+        self.sweep_at = (2 * self.shown.values().filter(|s| s.direct).count()).max(SWEEP_START);
     }
 
     // ---- sixel ---------------------------------------------------------------------------
@@ -614,14 +695,25 @@ impl PaneGraphics {
         if self.make_room().is_err() {
             return;
         }
+        self.sweep(term);
         let (cols, rows) = cells_for(&picture, 0, 0, self.shared.cell());
         let kid = self.shared.new_id();
+        let alt = term.mode().contains(TermMode::ALT_SCREEN);
         let drawn = write_cells(term, kid, cols, rows, After::NextLine);
         let stamp = self.tick();
         self.shown.insert(
             kid,
-            Shown { picture, placements: vec![(0, drawn.0, drawn.1)], generation: 0, origin: 0, direct: true, stamp },
+            Shown {
+                picture,
+                placements: vec![(0, drawn.0, drawn.1)],
+                generation: 0,
+                origin: 0,
+                direct: true,
+                alt,
+                stamp,
+            },
         );
+        self.limit_shown();
         self.shared.changed();
     }
 
@@ -684,6 +776,25 @@ pub fn placeholder(kid: u32, row: usize, col: usize) -> String {
 
 fn diacritic_index(c: char) -> Option<usize> {
     DIACRITICS.iter().position(|d| *d == c)
+}
+
+/// The images whose placeholder cells are in the grid of the screen that is up, history
+/// included.
+fn placed_ids<T: EventListener>(term: &Term<T>) -> HashSet<u32> {
+    let grid = term.grid();
+    let mut ids = HashSet::new();
+    for line in -(grid.history_size() as i32)..grid.screen_lines() as i32 {
+        let row = &grid[Line(line)];
+        for col in 0..grid.columns() {
+            let cell = &row[Column(col)];
+            if cell.c == PLACEHOLDER
+                && let Some(p) = Placeholder::of_cell(cell)
+            {
+                ids.insert(p.id);
+            }
+        }
+    }
+    ids
 }
 
 /// What a placeholder cell says: the image id (colour and third diacritic), row and column.
@@ -960,6 +1071,52 @@ pub fn place(kid: u32, placement: u32, cols: u16, rows: u16, out: &mut Vec<u8>) 
 /// Forget image `kid` in the outer terminal.
 pub fn delete(kid: u32, out: &mut Vec<u8>) {
     out.extend_from_slice(format!("\x1b_Ga=d,d=I,i={kid},q=2\x1b\\").as_bytes());
+}
+
+/// Remove the placements of image `kid` in the outer terminal, keeping the image.
+pub fn unplace(kid: u32, out: &mut Vec<u8>) {
+    out.extend_from_slice(format!("\x1b_Ga=d,d=i,i={kid},q=2\x1b\\").as_bytes());
+}
+
+/// An image the panes show, for a client's terminal: the generation of its placements, the
+/// picture, and the placements (placement id, columns, rows).
+pub type Live = (u64, Arc<Picture>, Vec<(u32, u16, u16)>);
+
+/// Bring a terminal that has the images of `sent` (with the generation of their placements) up
+/// to `live`, writing the commands to `out`: images no pane shows go, new ones are sent, and an
+/// image whose placements changed loses them all and gets the current ones, so that a placement
+/// removed in kraal goes from the terminal too. New images stop at `budget` bytes, one large
+/// image excepted; true when some had to wait.
+pub fn update_terminal(
+    sent: &mut HashMap<u32, u64>,
+    live: HashMap<u32, Live>,
+    budget: usize,
+    out: &mut Vec<u8>,
+) -> bool {
+    let gone: Vec<u32> = sent.keys().filter(|k| !live.contains_key(k)).copied().collect();
+    for kid in gone {
+        delete(kid, out);
+        sent.remove(&kid);
+    }
+    let mut more = false;
+    for (kid, (generation, picture, placements)) in live {
+        match sent.get(&kid) {
+            Some(had) if *had == generation => continue,
+            Some(_) => unplace(kid, out),
+            None => {
+                if !out.is_empty() && out.len() + picture.png.len() * 4 / 3 > budget {
+                    more = true;
+                    continue;
+                }
+                transmit(kid, &picture, out);
+            }
+        }
+        for (placement, cols, rows) in placements {
+            place(kid, placement, cols, rows, out);
+        }
+        sent.insert(kid, generation);
+    }
+    more
 }
 
 /// The query that tells whether the outer terminal shows images (its answer carries

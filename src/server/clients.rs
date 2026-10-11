@@ -159,6 +159,10 @@ impl Server {
             c.welcome = welcome;
             // Ask the outer terminal for its colours so panes querying them get real values.
             let _ = c.out.try_send(frame_bytes(b"\x1b]10;?\x07\x1b]11;?\x07"));
+            // The mouse as the server's configuration says, which may have been read again since
+            // the client read its own (a reconnection keeps the client's first reading).
+            let mouse = if self.config.mouse { crate::client::MOUSE_ON } else { crate::client::MOUSE_OFF };
+            let _ = c.out.try_send(frame_bytes(mouse.as_bytes()));
         }
         self.probe_graphics(id);
         self.primary = Some(id);

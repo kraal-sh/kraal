@@ -67,7 +67,11 @@ impl Server {
             let Some(c) = self.clients.get_mut(&id) else { continue };
             if c.pointer_motion != wants {
                 // Leaving 1003 stops tracking altogether: back to 1002 (motion with a button held).
-                let mode: &[u8] = if wants { b"\x1b[?1003h" } else { b"\x1b[?1003l\x1b[?1002h" };
+                let mode: &[u8] = match (wants, self.config.mouse) {
+                    (true, _) => b"\x1b[?1003h",
+                    (false, true) => b"\x1b[?1003l\x1b[?1002h",
+                    (false, false) => b"\x1b[?1003l",
+                };
                 // Recorded once on its way only: a full queue means trying again next time.
                 if c.out.try_send(frame_bytes(mode)).is_ok() {
                     c.pointer_motion = wants;

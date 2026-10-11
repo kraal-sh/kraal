@@ -525,7 +525,7 @@ mod tests {
             let spec = t.spec(&ctx, &ssh);
             assert!(!spec.command.iter().any(|w| w.contains("hush")), "{:?}", spec.command);
             assert!(!format!("{spec:?}").contains("hush"));
-            assert!(serde_json::to_string(&spec).unwrap().find("hush").is_none());
+            assert!(!serde_json::to_string(&spec).unwrap().contains("hush"));
             let done = run(&spec, true);
             assert!(done.status.success(), "{done:?}");
             assert_eq!(std::fs::read_to_string(&out).unwrap(), secret);

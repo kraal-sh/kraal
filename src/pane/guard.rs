@@ -8,6 +8,9 @@
 //! two stacks (the primary and the alternate screen each have one) as the emulator changes them,
 //! and turns the final byte of a push past a limit no real program reaches into CAN, which makes
 //! the emulator abandon that sequence.
+//!
+//! It also follows the scroll region's top margin on the primary screen, for the command marks:
+//! a region that starts below the first line scrolls without filling the history.
 
 use alacritty_terminal::vte::{Params, Parser, Perform};
 
@@ -23,6 +26,10 @@ pub(super) struct KeyboardStackGuard {
     /// Depth of the primary and alternate screens' stacks.
     depth: [u32; 2],
     alt: bool,
+    /// The scroll region starts below the first line.
+    margin: bool,
+    /// A top margin was in force on the primary screen since [`KeyboardStackGuard::take_top_margin`].
+    margin_seen: bool,
 }
 
 /// What the bytes just read do to the stacks, in order.
@@ -37,6 +44,8 @@ enum Change {
     AltScreen(bool),
     /// RIS: both stacks emptied, back on the primary screen.
     Reset,
+    /// DECSTBM: whether the scroll region now starts below the first line.
+    Margin(bool),
 }
 
 impl Perform for Seen {
@@ -54,6 +63,16 @@ impl Perform for Seen {
                     self.0.push(Change::AltScreen(action == 'h'));
                 }
             }
+            ('r', []) => {
+                // As the emulator reads it: 0 or nothing is the first line, the bottom must be
+                // below the top.
+                let mut it = params.iter().map(|p| p[0]);
+                let top = it.next().filter(|t| *t != 0).unwrap_or(1);
+                let bottom = it.next().filter(|b| *b != 0);
+                if bottom.is_none_or(|b| top < b) {
+                    self.0.push(Change::Margin(top > 1));
+                }
+            }
             _ => {}
         }
     }
@@ -69,6 +88,7 @@ impl KeyboardStackGuard {
     /// `bytes` as the emulator should get them: the same, but for the final byte of a push the
     /// stack has no room for.
     pub(super) fn filter(&mut self, bytes: &[u8]) -> Vec<u8> {
+        self.note_margin();
         let mut out = Vec::with_capacity(bytes.len());
         // A push is dispatched on its final `u`: everything else is read in runs, and each `u`
         // alone, to know whether it is the one.
@@ -108,10 +128,30 @@ impl KeyboardStackGuard {
                 Change::Reset => {
                     self.depth = [0, 0];
                     self.alt = false;
+                    self.margin = false;
                 }
+                Change::Margin(on) => self.margin = on,
             }
+            self.note_margin();
         }
         refused
+    }
+
+    fn note_margin(&mut self) {
+        if self.margin && !self.alt {
+            self.margin_seen = true;
+        }
+    }
+
+    /// Whether a scroll region starting below the first line was in force on the primary screen
+    /// since the last call (or still is).
+    pub(super) fn take_top_margin(&mut self) -> bool {
+        std::mem::take(&mut self.margin_seen) || (self.margin && !self.alt)
+    }
+
+    /// The emulator resized: its scroll region is the whole screen again.
+    pub(super) fn screen_resized(&mut self) {
+        self.margin = false;
     }
 }
 
