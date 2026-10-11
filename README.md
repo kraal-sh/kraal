@@ -60,7 +60,7 @@ kraal is a multiplexer in the tradition of tmux and Zellij that runs inside your
 ## Install
 
 kraal is a single binary for Linux (x86_64, arm64) and macOS (Apple Silicon, Intel). Linux is the
-primary target; macOS has not been tried on a real Mac yet.
+primary target; macOS passes the test suite but is not used day to day yet.
 
 ```sh
 curl -fsSL https://kraal.sh/install | sh    # the latest release, checked, into ~/.local/bin
@@ -711,8 +711,9 @@ kraal is young. Known gaps:
   local sidebar, and the Kubernetes, Terraform and AWS contexts are read only for local panes.
 - Agent states come from hooks for Claude Code (and Codex's turn ends); for other agents they are
   guessed from the screen and can lag or be wrong.
-- Only Linux is tested day to day. macOS builds and reads processes through the kernel (sysctl,
-  libproc, lsof), but has not been tried on a real machine yet. Windows is not supported.
+- Only Linux is used day to day. macOS reads processes through the kernel (sysctl, libproc, lsof)
+  and passes the whole test suite on GitHub's macOS machines, but nobody uses it daily yet.
+  Windows is not supported.
 
 ## Development
 
