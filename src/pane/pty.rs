@@ -680,7 +680,16 @@ mod tests {
         let mut child = pair.slave.spawn_command(cmd).unwrap();
         assert_eq!(wait_for(&mut child, "in a gone directory").exit_code(), 126);
         assert!(!home.join("ran-here").exists(), "the command ran in HOME");
-        // Where the directory is, the command runs there.
+        // Where the directory is, the command runs there. In a terminal of its own: macOS does not
+        // hand out one whose first program ended.
+        let pair = portable_pty::native_pty_system()
+            .openpty(PtySize { rows: 5, cols: 20, pixel_width: 0, pixel_height: 0 })
+            .unwrap();
+        let mut reader = pair.master.try_clone_reader().unwrap();
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 1024];
+            while matches!(std::io::Read::read(&mut reader, &mut buf), Ok(n) if n > 0) {}
+        });
         let mut child = pair.slave.spawn_command(command_in(&program, &home, true)).unwrap();
         assert!(wait_for(&mut child, "in its directory").success());
         assert!(home.join("ran-here").exists());

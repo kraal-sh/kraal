@@ -11,7 +11,9 @@ struct Env {
 
 impl Env {
     fn new(name: &str) -> Env {
-        let root = std::env::temp_dir().join(format!("kraal-e2e-{}-{name}", std::process::id()));
+        // Under /tmp: macOS's temporary directory is too long for the sockets kraal makes there,
+        // and kraal would fall back to a directory every test shares.
+        let root = PathBuf::from("/tmp").join(format!("kraal-e2e-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         for d in ["run", "state", "config/kraal/workspaces"] {
             std::fs::create_dir_all(root.join(d)).unwrap();
@@ -67,7 +69,23 @@ impl Env {
         }
     }
 
-    /// The pid of this test's server (Linux: from /proc).
+    /// The pid of this test's server: a `server --session <name>` process whose environment has
+    /// this test's runtime directory.
+    #[cfg(not(target_os = "linux"))]
+    fn server_pid(&self) -> Option<i32> {
+        let want = format!("XDG_RUNTIME_DIR={}", self.root.join("run").display());
+        let found = Command::new("pgrep").args(["-f", &format!("server --session {}$", self.session)]).output().ok()?;
+        String::from_utf8_lossy(&found.stdout).lines().filter_map(|l| l.trim().parse::<i32>().ok()).find(|pid| {
+            // `ps -E` shows the environment after the command.
+            Command::new("ps")
+                .args(["-E", "-ww", "-o", "command=", "-p", &pid.to_string()])
+                .output()
+                .is_ok_and(|o| String::from_utf8_lossy(&o.stdout).contains(&want))
+        })
+    }
+
+    /// The pid of this test's server, from /proc.
+    #[cfg(target_os = "linux")]
     fn server_pid(&self) -> Option<i32> {
         let want = format!("XDG_RUNTIME_DIR={}", self.root.join("run").display());
         std::fs::read_dir("/proc").ok()?.filter_map(|e| e.ok()).find_map(|e| {
