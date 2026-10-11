@@ -433,9 +433,9 @@ mod imp {
     }
 
     pub fn running(pid: libc::pid_t) -> bool {
-        // A zombie has ended: only its exit status is left, for its parent to read. When the
-        // kernel says nothing about the process (another user's), it counts as running.
-        exists(pid) && short_info(pid).is_none_or(|info| info.pbsi_status != libc::SZOMB)
+        // A zombie still exists for kill(), but proc_pidinfo no longer describes it. kraal only
+        // looks at its user's processes, which proc_pidinfo describes while they run.
+        exists(pid) && short_info(pid).is_some_and(|info| info.pbsi_status != libc::SZOMB)
     }
 
     /// The kernel's short description of a process (state, group, session), when it gives one.
