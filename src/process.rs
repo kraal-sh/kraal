@@ -433,7 +433,26 @@ mod imp {
     }
 
     pub fn running(pid: libc::pid_t) -> bool {
-        exists(pid)
+        // A zombie has ended: only its exit status is left, for its parent to read. When the
+        // kernel says nothing about the process (another user's), it counts as running.
+        exists(pid) && short_info(pid).is_none_or(|info| info.pbsi_status != libc::SZOMB)
+    }
+
+    /// The kernel's short description of a process (state, group, session), when it gives one.
+    fn short_info(pid: libc::pid_t) -> Option<libc::proc_bsdshortinfo> {
+        // SAFETY: an all-zero proc_bsdshortinfo is valid; proc_pidinfo writes at most `size` bytes.
+        let mut info: libc::proc_bsdshortinfo = unsafe { std::mem::zeroed() };
+        let size = std::mem::size_of::<libc::proc_bsdshortinfo>() as libc::c_int;
+        let n = unsafe {
+            libc::proc_pidinfo(
+                pid,
+                libc::PROC_PIDT_SHORTBSDINFO,
+                0,
+                (&mut info as *mut libc::proc_bsdshortinfo).cast::<libc::c_void>(),
+                size,
+            )
+        };
+        (n == size).then_some(info)
     }
 
     pub fn session_members(sid: libc::pid_t) -> Vec<libc::pid_t> {
@@ -447,21 +466,7 @@ mod imp {
             .filter(|p| *p > 0)
             // SAFETY: getsid only reads the process table.
             .filter(|p| unsafe { libc::getsid(*p) } == sid)
-            .filter(|p| {
-                let mut info: libc::proc_bsdshortinfo = unsafe { std::mem::zeroed() };
-                let size = std::mem::size_of::<libc::proc_bsdshortinfo>() as libc::c_int;
-                // SAFETY: proc_pidinfo writes at most `size` bytes into `info`.
-                let n = unsafe {
-                    libc::proc_pidinfo(
-                        *p,
-                        libc::PROC_PIDT_SHORTBSDINFO,
-                        0,
-                        (&mut info as *mut libc::proc_bsdshortinfo).cast::<libc::c_void>(),
-                        size,
-                    )
-                };
-                n == size && info.pbsi_status != libc::SZOMB
-            })
+            .filter(|p| short_info(*p).is_some_and(|info| info.pbsi_status != libc::SZOMB))
             .collect()
     }
 
@@ -686,14 +691,12 @@ mod tests {
         assert!(running(pid));
         let mut child = std::process::Command::new("true").spawn().unwrap();
         let child_pid = child.id() as libc::pid_t;
-        // Exited but not reaped yet: Linux tells it apart from a running process.
-        if cfg!(target_os = "linux") {
-            let start = std::time::Instant::now();
-            while running(child_pid) && start.elapsed() < std::time::Duration::from_secs(5) {
-                std::thread::sleep(std::time::Duration::from_millis(10));
-            }
-            assert!(!running(child_pid));
+        // Exited but not reaped yet: told apart from a running process.
+        let start = std::time::Instant::now();
+        while running(child_pid) && start.elapsed() < std::time::Duration::from_secs(5) {
+            std::thread::sleep(std::time::Duration::from_millis(10));
         }
+        assert!(!running(child_pid), "a zombie does not run");
         child.wait().unwrap();
         assert!(!running(child_pid));
     }
