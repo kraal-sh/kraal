@@ -53,7 +53,7 @@ instead, where the pane is:
 | What | Tab, then the label |
 |---|---|
 | link | open it in your browser |
-| path | open it in `$EDITOR`, at its line |
+| path | open it in `$EDITOR`, at its line; in an SSH pane, the server's file in your local `$EDITOR`, each save sent back ([details](servers.md#editing-a-file-on-a-server)) |
 | commit (or container id) | `git show` in the pane's repository (or `docker logs -f`) |
 | `host:port` | open it; a port of the pane's server is reached through a new tunnel |
 | IP, server | ssh to it |

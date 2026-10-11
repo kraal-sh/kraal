@@ -1,10 +1,11 @@
 //! The two-panel file manager pane: opening it, and acting on what it asks for (copy, move,
-//! delete, preview, shell, choosing a server for a panel).
+//! delete, preview, edit, shell, choosing a server for a panel).
 
 use std::sync::Arc;
 
 use anyhow::Result;
 
+use super::edits::EditTarget;
 use super::ui::{ConfirmAction, Mode, PickAction, PickItem, Picker, PickerKind};
 use super::{ClientId, Event, FloatRect, Server};
 use crate::files::{FileKey, FilesAction, FilesPane, Location, Remote, Side};
@@ -129,7 +130,7 @@ impl Server {
                 sources.iter().chain([dest]).collect()
             }
             FilesAction::Delete(targets) => targets.iter().collect(),
-            FilesAction::Shell(loc) => vec![loc],
+            FilesAction::Shell(loc) | FilesAction::Edit(loc) => vec![loc],
             _ => Vec::new(),
         };
         if places.iter().any(|l| l.exact_display().is_none()) {
@@ -247,6 +248,33 @@ impl Server {
                     self.toast(client, format!("{e:#}"));
                 }
                 Mode::Normal
+            }
+            FilesAction::Edit(Location::Local(path)) => {
+                let Some(ws) = self.clients.get(&client).map(|c| c.workspace) else { return Mode::Normal };
+                let command = super::edits::editor_command(&path, None);
+                let name = path.file_name().map(|n| n.to_string_lossy().into_owned());
+                let spec = PaneSpec { command, close_on_exit: true, keep_on_failure: true, ..Default::default() };
+                if let Err(e) = self.spawn_pane_in(ws, Some(pane), spec, Placement::Floating, name) {
+                    self.toast(client, format!("{e:#}"));
+                }
+                Mode::Normal
+            }
+            FilesAction::Edit(Location::Remote(r)) => {
+                let Some(ws) = self.clients.get(&client).map(|c| c.workspace) else { return Mode::Normal };
+                let production = self
+                    .known_servers
+                    .iter()
+                    .find(|k| k.server.name == r.server)
+                    .and_then(|k| self.server_production(&k.server));
+                let target = EditTarget {
+                    server: r.server,
+                    ssh: r.ssh_args,
+                    path: r.path,
+                    line: None,
+                    ws: Some(ws),
+                    near: Some(pane),
+                };
+                self.edit_request(client, target, production)
             }
             FilesAction::PickLocation(side) => Mode::Picker(self.location_picker(pane, side)),
             FilesAction::Refused(why) => {

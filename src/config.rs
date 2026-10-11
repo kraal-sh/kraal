@@ -50,7 +50,8 @@ auto_add = true
 multiplex = true
 # Opening a whole group puts at most this many servers per tab.
 max_panes_per_tab = 9
-# Where downloads from a server go by default.
+# Where downloads from a server go by default, and your version of a server's file you edited
+# when you keep it here (`kraal edit`).
 download_dir = "~/Downloads"
 
 [theme]

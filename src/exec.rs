@@ -453,6 +453,11 @@ pub fn run_interactive(cmd: &mut Command, input: Stdio, timeout: Duration, limit
     run_from(cmd, input, timeout, limit, &AtomicBool::new(false), false)
 }
 
+/// [`run`] with `input` as stdin (what to send through ssh, say).
+pub fn run_with_input(cmd: &mut Command, input: Stdio, timeout: Duration, limit: usize) -> std::io::Result<Output> {
+    run_from(cmd, input, timeout, limit, &AtomicBool::new(false), true)
+}
+
 /// [`run`], also stopping (like a timeout) as soon as `cancel` is set.
 pub fn run_cancellable(
     cmd: &mut Command,

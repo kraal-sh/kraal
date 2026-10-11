@@ -1,5 +1,5 @@
 //! Servers from the command line: attach and install remotely, the inventory, ssh, fan-out,
-//! copies, file manager and tunnels.
+//! copies, file manager, remote edits and tunnels.
 
 use anyhow::{Context, Result, bail};
 
@@ -395,6 +395,14 @@ pub(super) fn files(s: &Session, left: Option<String>, right: Option<String>) ->
         .unwrap_or_else(|| std::env::current_dir().map(|d| d.display().to_string()).unwrap_or_else(|_| home()));
     let right = right.map(abs).unwrap_or_else(home);
     s.request(Request::OpenFiles { left, right, near: s.own_pane() })?;
+    Ok(())
+}
+
+/// `kraal edit`: a server's file in the local editor, in a floating pane of the session (next
+/// to this pane inside kraal); kraal sends each save back.
+pub(super) fn edit(s: &Session, target: String, line: Option<u32>, production: bool) -> Result<()> {
+    s.ensure_server()?;
+    s.request(Request::EditRemote { target, line, near: s.own_pane(), production })?;
     Ok(())
 }
 

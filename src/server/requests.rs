@@ -317,6 +317,47 @@ impl Server {
                     .map(|p| Response::Pane(Box::new(self.pane_info(p))))
                     .map_err(|e| format!("{e:#}"))
             }
+            Request::EditRemote { target, line, near, production } => {
+                let near = match near.as_deref().map(|n| self.resolve(n)).transpose() {
+                    Ok(n) => n,
+                    Err(e) => return Some(Err(e)),
+                };
+                let (server, path) = match crate::transfer::parse_endpoint(&target, &self.known_servers) {
+                    Ok(crate::transfer::Endpoint::Remote { server, path }) => (server, path),
+                    Ok(crate::transfer::Endpoint::Local(_)) => {
+                        return Some(Err(format!("{target} is not on a server: kraal edit takes SERVER:PATH")));
+                    }
+                    Err(e) => return Some(Err(format!("{e:#}"))),
+                };
+                if path.is_empty() {
+                    return Some(Err("which file? kraal edit takes SERVER:PATH".into()));
+                }
+                if !production && let Some(why) = self.server_production(&server) {
+                    return Some(Err(format!(
+                        "{} is production ({why}): pass --production to edit there",
+                        server.name
+                    )));
+                }
+                // A workspace made now would be dropped as empty before the file is read: one is
+                // made, if needed, when the editor opens.
+                let ws = match near.and_then(|n| self.workspace_of(n)) {
+                    Some((wi, _)) => Some(self.workspaces[wi].id),
+                    None => self
+                        .primary
+                        .and_then(|p| self.clients.get(&p))
+                        .map(|c| c.workspace)
+                        .or_else(|| self.workspaces.first().map(|w| w.id)),
+                };
+                // Told about saves and asked about changes: a client showing that workspace.
+                let shows = |c: &&super::Client| c.attached && Some(c.workspace) == ws;
+                let viewer = self.primary.filter(|p| self.clients.get(p).is_some_and(|c| shows(&c)));
+                let viewer = viewer.or_else(|| self.clients.values().find(shows).map(|c| c.id)).or(self.primary);
+                let mut ssh = self.ssh_options(&server);
+                ssh.push(server.destination());
+                let target = super::edits::EditTarget { server: server.name.clone(), ssh, path, line, ws, near };
+                self.start_edit(viewer, target, Some(client));
+                return None;
+            }
             Request::TunnelAdd { server, remote, local } => self
                 .add_tunnel(&server, &remote, local)
                 .map(|t| Response::Tunnels(vec![t]))

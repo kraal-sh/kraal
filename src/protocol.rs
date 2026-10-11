@@ -252,6 +252,16 @@ pub enum Request {
         right: String,
         near: Option<String>,
     },
+    /// Edit a server's file (`server:path`) in the local editor, in a floating pane; each save
+    /// goes back to the server. A production server is refused unless `production` says the
+    /// caller knows. Answered once the editor is open.
+    EditRemote {
+        target: String,
+        line: Option<u32>,
+        near: Option<String>,
+        #[serde(default)]
+        production: bool,
+    },
     /// Write the current layout of a workspace as a KDL definition file.
     SaveWorkspace {
         workspace: Option<String>,

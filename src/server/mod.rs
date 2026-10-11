@@ -9,6 +9,7 @@ mod clients;
 mod commands;
 mod contexts;
 mod definitions;
+mod edits;
 pub mod events;
 mod fileman;
 mod geometry;
@@ -404,6 +405,8 @@ pub struct Server {
     md_sessions: HashMap<ClientId, runbooks::MdSession>,
     /// What to do with the result of each background job.
     jobs: HashMap<u32, JobDone>,
+    /// Files of servers being edited in the local editor.
+    edits: Vec<edits::Edit>,
     /// Links to open on a client once their tunnel is up: (client, tunnel id, URL).
     pending_opens: Vec<(ClientId, u32, String)>,
     /// Preview panes being read again.
@@ -587,6 +590,7 @@ pub fn run(session: &str) -> Result<()> {
         run_output: HashMap::new(),
         md_sessions: HashMap::new(),
         jobs: HashMap::new(),
+        edits: Vec::new(),
         preview_loads: Default::default(),
         pending_opens: Vec::new(),
         persister: spawn_persister(persist_tx),
@@ -867,6 +871,7 @@ impl Server {
             }
         }
         self.forget_ended_ssh(ssh_ended);
+        self.tick_edits();
         self.diff_pane_states();
         self.hooks.reap();
         self.check_run_timeouts();
@@ -1099,6 +1104,7 @@ impl Server {
     }
 
     fn shutdown(&mut self) {
+        self.end_edits();
         // The last state goes through the writer, after anything it still has to write (the
         // panes' scrollback first), and the server waits for it.
         self.save_scrollback(true);

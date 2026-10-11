@@ -312,6 +312,7 @@ impl Server {
                     | ConfirmAction::RunTool { .. } => {
                         unreachable!("answered above")
                     }
+                    ConfirmAction::Edit(target) => self.start_edit(Some(id), *target, None),
                     ConfirmAction::ClosePane(p) => self.close_pane(p),
                     ConfirmAction::CloseTab { workspace, tab } => {
                         if let Some(wi) = self.ws_index(workspace)

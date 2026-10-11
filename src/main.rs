@@ -8,6 +8,7 @@ mod client;
 mod codex_usage;
 mod config;
 mod context;
+mod edit;
 mod exec;
 mod files;
 mod fleet;

@@ -176,8 +176,9 @@ pub(super) fn remote_script(path: &str) -> String {
     .join("; ")
 }
 
-/// A shell word for the remote directory: `~` stays expandable, the rest is quoted.
-pub(super) fn remote_dir_arg(path: &str) -> String {
+/// A shell word for a remote path (a directory to list, a file to edit): `~` stays expandable,
+/// the rest is quoted.
+pub(crate) fn remote_dir_arg(path: &str) -> String {
     if path.is_empty() || path == "~" {
         return "\"$HOME\"".to_owned();
     }

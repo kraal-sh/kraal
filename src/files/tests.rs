@@ -571,6 +571,26 @@ fn remote_entries_are_copied_but_not_previewed() {
 }
 
 #[test]
+fn e_edits_the_file_under_the_cursor() {
+    let mut pane = FilesPane::new(remote("/etc"), local(RIGHT), noop());
+    let mut odd = file("caf\u{fffd}.conf", 1);
+    odd.exact = false;
+    inject(&mut pane, Side::Left, remote("/etc"), vec![dir("nginx"), file("hosts", 10), odd]);
+    assert_eq!(pane.key(FileKey::Char('e')), FilesAction::None, "not `..`");
+    pane.key(FileKey::Down);
+    assert!(matches!(pane.key(FileKey::Char('e')), FilesAction::Refused(why) if why.contains("directory")));
+    pane.key(FileKey::Down);
+    assert_eq!(pane.key(FileKey::Char('e')), FilesAction::Refused(INEXACT.into()));
+    pane.key(FileKey::Down);
+    assert_eq!(pane.key(FileKey::Char('e')), FilesAction::Edit(remote("/etc/hosts")));
+    assert_eq!(pane.key(FileKey::F(4)), FilesAction::Edit(remote("/etc/hosts")));
+    // A local file too.
+    let mut pane = sample();
+    pane.key(FileKey::End);
+    assert_eq!(pane.key(FileKey::Char('e')), FilesAction::Edit(local("/srv/kraal-test/left/b.txt")));
+}
+
+#[test]
 fn navigation_keys_move_the_cursor() {
     let mut pane = sample();
     let many = (0..100).map(|i| file(&format!("f{i:03}"), i)).collect();
