@@ -375,12 +375,24 @@ pub fn ssh_control_dir() -> Option<PathBuf> {
     Some(short)
 }
 
+/// An XDG base directory: `$var` when it is an absolute path, else `~/<fallback>`. The same on
+/// macOS as on Linux: terminal tools keep their files there, not in `~/Library`.
+fn xdg_dir(var: &str, fallback: &str) -> PathBuf {
+    std::env::var_os(var)
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+        .or_else(|| dirs::home_dir().map(|h| h.join(fallback)))
+        .unwrap_or_else(std::env::temp_dir)
+}
+
 /// `~/.local/state/kraal`
 pub fn state_dir() -> PathBuf {
-    dirs::state_dir()
-        .or_else(|| dirs::home_dir().map(|h| h.join(".local/state")))
-        .unwrap_or_else(std::env::temp_dir)
-        .join("kraal")
+    xdg_dir("XDG_STATE_HOME", ".local/state").join("kraal")
+}
+
+/// `~/.local/share`
+pub fn data_home() -> PathBuf {
+    xdg_dir("XDG_DATA_HOME", ".local/share")
 }
 
 pub fn session_state_path(session: &str) -> PathBuf {
@@ -393,10 +405,7 @@ pub fn log_path(session: &str) -> PathBuf {
 
 /// `~/.config/kraal`
 pub fn config_dir() -> PathBuf {
-    dirs::config_dir()
-        .or_else(|| dirs::home_dir().map(|h| h.join(".config")))
-        .unwrap_or_else(std::env::temp_dir)
-        .join("kraal")
+    xdg_dir("XDG_CONFIG_HOME", ".config").join("kraal")
 }
 
 pub fn config_path() -> PathBuf {
@@ -524,7 +533,8 @@ mod tests {
     fn a_path_is_checked_as_it_is_used_and_a_short_link_of_ours_may_stand_for_a_deep_one() {
         use std::os::unix::fs::PermissionsExt;
         let private = |d: &Path| std::fs::set_permissions(d, std::fs::Permissions::from_mode(0o700)).unwrap();
-        let root = std::env::temp_dir().join(format!("kraal-spelt-{}", std::process::id()));
+        // Under /tmp: the sockets must fit, and macOS's temporary directory is long.
+        let root = PathBuf::from("/tmp").join(format!("kraal-spelt-{}", std::process::id()));
         std::fs::create_dir_all(&root).unwrap();
         private(&root);
         let root = root.canonicalize().unwrap();
@@ -565,7 +575,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
-    #[cfg(unix)]
+    /// Linux only: the paths of older kraal sockets went up to Linux's limit.
+    #[cfg(target_os = "linux")]
     #[test]
     fn every_socket_a_released_kraal_made_is_found() {
         use std::os::unix::fs::PermissionsExt;
@@ -644,7 +655,7 @@ mod tests {
     #[test]
     fn a_runtime_directory_others_could_swap_is_not_used() {
         use std::os::unix::fs::PermissionsExt;
-        let root = std::env::temp_dir().join(format!("kraal-swap-{}", std::process::id()));
+        let root = PathBuf::from("/tmp").join(format!("kraal-swap-{}", std::process::id()));
         let shared = root.join("shared");
         let xdg = shared.join("xdg");
         std::fs::create_dir_all(&xdg).unwrap();

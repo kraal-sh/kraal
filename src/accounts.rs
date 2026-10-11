@@ -443,11 +443,7 @@ pub fn absolute_home(home: &str) -> Result<String> {
 
 /// Where a new account's home goes by default.
 pub fn default_home_for(agent: &str, name: &str) -> PathBuf {
-    dirs::data_dir()
-        .or_else(|| dirs::home_dir().map(|h| h.join(".local/share")))
-        .unwrap_or_else(std::env::temp_dir)
-        .join("kraal/accounts")
-        .join(format!("{agent}-{name}"))
+    paths::data_home().join("kraal/accounts").join(format!("{agent}-{name}"))
 }
 
 /// Create an account home: shared entries are symlinked from the agent's default home, a few
