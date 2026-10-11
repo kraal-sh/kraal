@@ -27,7 +27,7 @@ close the window. It also knows what each pane is doing: the server it is
 on, the branch, whether that server is production, the agent working there and whether it is
 waiting for you.
 
-- **Never hunt for the stuck agent.** Claude Code, Codex, OpenCode, Gemini and a dozen others are
+- **Never hunt for the stuck agent.** Claude Code, Codex, OpenCode, Gemini and 26 others are
   marked working, blocked or done, in the sidebar and on their pane, with a desktop notification.
   Those running in kraal on your servers are listed too. `alt+a` jumps to the next one that needs
   you.
@@ -65,7 +65,7 @@ Linux and macOS, x86_64 and arm64. The script checks the archive's checksum and 
 
 ```sh
 kraal                              # start a session, or attach to the running one
-kraal integration install claude   # exact agent states from Claude Code's hooks (codex too)
+kraal integration install claude   # exact agent states from Claude Code's hooks (gemini, copilot, opencode… too)
 ```
 
 Press `ctrl+b` and let go: a menu shows what each next key does. `ctrl+b d` detaches, and
@@ -143,8 +143,8 @@ nobody uses it daily yet; Windows is not supported. Known gaps:
 
 - Images in panes need a terminal that draws kitty graphics with Unicode placeholders (Ghostty,
   kitty).
-- Agent states come from hooks for Claude Code, and for the end of Codex's turns; otherwise they
-  are read from the screen and can lag.
+- Agent states come from hooks for Claude Code and nine other agents, and for the start or end of
+  Codex's, Cursor's and Augment's turns; otherwise they are read from the screen and can lag.
 
 Bug reports and ideas are welcome in the [issues](https://github.com/kraal-sh/kraal/issues).
 

@@ -186,6 +186,12 @@ impl Server {
                 Err(e) => Err(e),
             },
             Request::AgentReport { pane, agent, state, session_id, message } => self.resolve(&pane).map(|p| {
+                // Some agents run other agents' hooks (Cursor and Continue run Claude Code's):
+                // a report that names another agent than the one running here is not about it.
+                let running = self.panes[&p].foreground_argv().as_deref().and_then(crate::agent::detect_agent);
+                if running.is_some_and(|r| r != agent) {
+                    return Response::Ok;
+                }
                 let before = self.panes[&p].agent.state;
                 let pn = self.panes.get_mut(&p).unwrap();
                 let a = &mut pn.agent;

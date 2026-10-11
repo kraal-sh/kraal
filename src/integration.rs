@@ -1,5 +1,6 @@
 //! Agent hooks: `kraal hook <agent>` reports state changes to the server, and
-//! `kraal integration install <agent>` wires that command into the agent's configuration. For
+//! `kraal integration install <agent>` wires that command into the agent's configuration: its
+//! hooks, its notify command, or a plugin of kraal's own where the agent loads plugins. For
 //! shells, `kraal integration install <shell>` adds the lines that mark prompts and commands
 //! (OSC 133) to the shell's startup file.
 
@@ -7,22 +8,128 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 
-use crate::agent::{AgentState, claude_hook_state};
+use crate::agent::{AgentState, hook_state};
 use crate::client;
 use crate::protocol::Request;
 
-/// Claude Code events kraal listens to.
-const CLAUDE_EVENTS: &[(&str, bool)] = &[
-    ("SessionStart", false),
-    ("UserPromptSubmit", false),
-    ("PreToolUse", true),
-    ("PostToolUse", true),
-    ("Notification", false),
-    ("Stop", false),
-    ("SessionEnd", false),
+/// The agents whose hooks kraal installs.
+pub const AGENTS: &[&str] = &[
+    "claude",
+    "codex",
+    "gemini",
+    "qwen",
+    "droid",
+    "codebuddy",
+    "auggie",
+    "cursor",
+    "copilot",
+    "kimi",
+    "opencode",
+    "kilo",
+    "pi",
 ];
+
+/// Hooks laid out as Claude Code lays them out, in a JSON file: each event holds a list of
+/// groups, `{ "matcher": …, "hooks": [{ "type": "command", "command": …, "timeout": … }] }`.
+struct NestedHooks {
+    agent: &'static str,
+    /// The events kraal listens to, with the matcher tool events take (every tool).
+    events: &'static [(&'static str, Option<&'static str>)],
+    /// In the agent's unit: seconds, or milliseconds for Gemini CLI and Augment.
+    timeout: u64,
+}
+
+const CLAUDE_EVENTS: &[(&str, Option<&str>)] = &[
+    ("SessionStart", None),
+    ("UserPromptSubmit", None),
+    ("PreToolUse", Some("*")),
+    ("PostToolUse", Some("*")),
+    ("Notification", None),
+    ("Stop", None),
+    ("SessionEnd", None),
+];
+
+const NESTED: &[NestedHooks] = &[
+    NestedHooks { agent: "claude", events: CLAUDE_EVENTS, timeout: 5 },
+    // Factory's droid and Tencent's CodeBuddy Code take Claude Code's hooks as they are.
+    NestedHooks { agent: "droid", events: CLAUDE_EVENTS, timeout: 5 },
+    NestedHooks { agent: "codebuddy", events: CLAUDE_EVENTS, timeout: 5 },
+    NestedHooks {
+        agent: "gemini",
+        events: &[
+            ("SessionStart", None),
+            ("BeforeAgent", None),
+            ("BeforeTool", Some("*")),
+            ("AfterTool", Some("*")),
+            ("Notification", None),
+            ("AfterAgent", None),
+            ("SessionEnd", None),
+        ],
+        timeout: 5000,
+    },
+    NestedHooks {
+        agent: "qwen",
+        events: &[
+            ("SessionStart", None),
+            ("UserPromptSubmit", None),
+            ("PreToolUse", Some("*")),
+            ("PostToolUse", Some("*")),
+            ("Notification", None),
+            ("Stop", None),
+            ("StopFailure", None),
+            ("SessionEnd", None),
+        ],
+        timeout: 5,
+    },
+    // Augment's tool hooks match every tool without a matcher.
+    NestedHooks {
+        agent: "auggie",
+        events: &[
+            ("SessionStart", None),
+            ("PreToolUse", None),
+            ("PostToolUse", None),
+            ("Stop", None),
+            ("SessionEnd", None),
+        ],
+        timeout: 5000,
+    },
+];
+
+fn nested(agent: &str) -> &'static NestedHooks {
+    NESTED.iter().find(|n| n.agent == agent).expect("an agent with nested hooks")
+}
+
+/// Cursor's hooks (`~/.cursor/hooks.json`): none of them asks for an answer kraal would have to
+/// give, unlike its permission hooks.
+const CURSOR_EVENTS: &[&str] = &["sessionStart", "beforeSubmitPrompt", "postToolUse", "stop", "sessionEnd"];
+
+/// Copilot CLI's events, with the matcher (on the notification's type) of those that take one.
+const COPILOT_EVENTS: &[(&str, Option<&str>)] = &[
+    ("sessionStart", None),
+    ("userPromptSubmitted", None),
+    ("postToolUse", None),
+    ("notification", Some("permission_prompt|elicitation_dialog")),
+    ("agentStop", None),
+    ("sessionEnd", None),
+];
+
+/// Kimi Code's events: approval requests and Esc have their own.
+const KIMI_EVENTS: &[&str] = &[
+    "SessionStart",
+    "UserPromptSubmit",
+    "PermissionRequest",
+    "PermissionResult",
+    "Stop",
+    "StopFailure",
+    "Interrupt",
+    "SessionEnd",
+];
+
+/// Agents whose hooks pass a JSON payload on stdin.
+const JSON_PAYLOADS: &[&str] =
+    &["claude", "gemini", "qwen", "droid", "codebuddy", "auggie", "cursor", "copilot", "kimi"];
 
 /// Entry point of `kraal hook <agent>`. Never fails loudly and never prints: agents treat hook
 /// output and exit codes as instructions.
@@ -33,17 +140,23 @@ pub fn run_hook(agent: &str, arg: Option<String>) {
     let pane = pane.to_string_lossy().into_owned();
     let socket = PathBuf::from(socket);
     let report = match agent {
-        "claude" => {
+        a if JSON_PAYLOADS.contains(&a) => {
             let mut input = String::new();
             let _ = std::io::stdin().take(1 << 20).read_to_string(&mut input);
             let Ok(payload) = serde_json::from_str::<Value>(&input) else { return };
-            let state = claude_hook_state(&payload);
-            let session_id = payload.get("session_id").and_then(Value::as_str).map(String::from);
-            let message = payload.get("message").and_then(Value::as_str).map(String::from);
+            // Cursor runs Claude Code's hooks too, with payloads of its own.
+            if a == "claude" && payload.get("cursor_version").is_some() {
+                return;
+            }
+            // Copilot's hooks name their event on kraal's command line.
+            let state = hook_state(a, &payload, arg.as_deref());
+            let field = |k: &str| payload.get(k).and_then(Value::as_str).map(String::from);
+            let session_id = field("session_id").or_else(|| field("sessionId"));
+            let message = field("message");
             if state.is_none() && session_id.is_none() {
                 return;
             }
-            Request::AgentReport { pane, agent: "claude".into(), state, session_id, message }
+            Request::AgentReport { pane, agent: a.into(), state, session_id, message }
         }
         "codex" => {
             // Codex passes its notification as the last argument.
@@ -80,6 +193,65 @@ fn codex_config_path() -> PathBuf {
         .join("config.toml")
 }
 
+/// An agent's own directory: kraal's `all` covers the agents whose directory exists.
+fn agent_dir(agent: &str) -> PathBuf {
+    let home = dirs::home_dir().unwrap_or_default();
+    let var = |name: &str| std::env::var_os(name).filter(|v| !v.is_empty()).map(PathBuf::from);
+    let config = var("XDG_CONFIG_HOME").unwrap_or_else(|| home.join(".config"));
+    match agent {
+        "claude" => claude_settings_path().parent().map(Path::to_path_buf).unwrap_or_default(),
+        "codex" => codex_config_path().parent().map(Path::to_path_buf).unwrap_or_default(),
+        "gemini" => var("GEMINI_CLI_HOME").unwrap_or(home).join(".gemini"),
+        "qwen" => home.join(".qwen"),
+        "droid" => home.join(".factory"),
+        "codebuddy" => home.join(".codebuddy"),
+        "auggie" => home.join(".augment"),
+        "cursor" => home.join(".cursor"),
+        "copilot" => var("COPILOT_HOME").unwrap_or_else(|| home.join(".copilot")),
+        "kimi" => var("KIMI_CODE_HOME").unwrap_or_else(|| home.join(".kimi-code")),
+        "opencode" => config.join("opencode"),
+        "kilo" => config.join("kilo"),
+        // pi
+        _ => var("PI_CODING_AGENT_DIR").unwrap_or_else(|| home.join(".pi/agent")),
+    }
+}
+
+/// The file kraal changes for an agent, and for nested hooks whether its events are the
+/// file's top level (rather than its `hooks` key).
+fn agent_file(agent: &str) -> (PathBuf, bool) {
+    let dir = agent_dir(agent);
+    let file = match agent {
+        "claude" => return (claude_settings_path(), false),
+        "codex" => return (codex_config_path(), false),
+        // Droid reads `hooks.json`, or the `hooks` of its settings when there is no such file.
+        "droid" => {
+            let settings = dir.join("settings.json");
+            if !dir.join("hooks.json").exists() && read_json(&settings).is_ok_and(|v| v.get("hooks").is_some()) {
+                return (settings, false);
+            }
+            return (dir.join("hooks.json"), true);
+        }
+        "cursor" => "hooks.json",
+        "copilot" => "hooks/kraal.json",
+        "kimi" => "config.toml",
+        "opencode" => "plugins/kraal.js",
+        "kilo" => "plugin/kraal.js",
+        "pi" => "extensions/kraal.ts",
+        // Gemini CLI, Qwen Code, CodeBuddy, Augment
+        _ => "settings.json",
+    };
+    (dir.join(file), false)
+}
+
+/// The agents `all` covers: Claude Code and Codex, and every other one used on this machine.
+pub fn agents_here() -> Vec<&'static str> {
+    AGENTS.iter().copied().filter(|a| matches!(*a, "claude" | "codex") || agent_dir(a).is_dir()).collect()
+}
+
+fn unknown(agent: &str) -> anyhow::Error {
+    anyhow::anyhow!("unknown agent or shell {agent:?} (supported: {}, {})", AGENTS.join(", "), SHELLS.join(", "))
+}
+
 /// The command the agent's hooks run: a shell parses it, so the path is quoted whatever it holds.
 fn hook_command(agent: &str) -> Result<String> {
     let exe = std::env::current_exe()?;
@@ -91,20 +263,41 @@ fn is_ours(cmd: &str, agent: &str) -> bool {
 }
 
 pub fn install(agent: &str) -> Result<String> {
+    if let Some(s) = SHELLS.iter().find(|s| **s == agent) {
+        return install_shell(s, &shell_rc_path(s));
+    }
+    if !AGENTS.contains(&agent) {
+        return Err(unknown(agent));
+    }
+    let (path, top_level) = agent_file(agent);
+    let exe = std::env::current_exe()?.to_string_lossy().into_owned();
     match agent {
-        "claude" => install_claude(&claude_settings_path(), &crate::accounts::Accounts::path()),
-        "codex" => install_codex(&codex_config_path()),
-        s if SHELLS.contains(&s) => install_shell(s, &shell_rc_path(s)),
-        _ => bail!("unknown agent or shell {agent:?} (supported: claude, codex, zsh, bash, fish)"),
+        "claude" => install_claude(&path, &crate::accounts::Accounts::path()),
+        "codex" => install_codex(&path),
+        "cursor" => install_cursor(&path),
+        "kimi" => install_kimi(&path),
+        "copilot" => install_own(agent, &path, &copilot_hooks(&exe), "hooks"),
+        "opencode" | "kilo" => install_own(agent, &path, &opencode_plugin(agent, &exe), "plugin"),
+        "pi" => install_own(agent, &path, &pi_extension(&exe), "extension"),
+        _ => install_nested(nested(agent), &path, top_level),
     }
 }
 
 pub fn uninstall(agent: &str) -> Result<String> {
+    if let Some(s) = SHELLS.iter().find(|s| **s == agent) {
+        return uninstall_shell(s, &shell_rc_path(s));
+    }
+    if !AGENTS.contains(&agent) {
+        return Err(unknown(agent));
+    }
+    let (path, top_level) = agent_file(agent);
     match agent {
-        "claude" => uninstall_claude(&claude_settings_path(), &crate::accounts::Accounts::path()),
-        "codex" => uninstall_codex(&codex_config_path()),
-        s if SHELLS.contains(&s) => uninstall_shell(s, &shell_rc_path(s)),
-        _ => bail!("unknown agent or shell {agent:?} (supported: claude, codex, zsh, bash, fish)"),
+        "claude" => uninstall_claude(&path, &crate::accounts::Accounts::path()),
+        "codex" => uninstall_codex(&path),
+        "cursor" => uninstall_cursor(&path),
+        "kimi" => uninstall_kimi(&path),
+        "copilot" | "opencode" | "kilo" | "pi" => uninstall_own(agent, &path),
+        _ => uninstall_nested(nested(agent), &path, top_level),
     }
 }
 
@@ -117,33 +310,48 @@ pub fn show(shell: &str) -> Result<String> {
 }
 
 pub fn status(agent: &str) -> Result<String> {
-    match agent {
-        s if SHELLS.contains(&s) => Ok(shell_status(s, &shell_rc_path(s))),
-        "claude" => {
-            let path = claude_settings_path();
-            let v = read_json(&path)?;
-            let installed: Vec<&str> =
-                CLAUDE_EVENTS.iter().filter(|(e, _)| claude_has(&v, e)).map(|(e, _)| *e).collect();
-            Ok(match installed.len() {
-                0 => format!("claude: not installed ({})", path.display()),
-                n if n == CLAUDE_EVENTS.len() => format!("claude: installed ({})", path.display()),
-                _ => format!(
-                    "claude: partially installed ({}); run `kraal integration install claude`",
-                    installed.join(", ")
-                ),
-            })
-        }
-        "codex" => {
-            let path = codex_config_path();
-            let text = std::fs::read_to_string(&path).unwrap_or_default();
-            Ok(if text.lines().any(|l| l.trim_start().starts_with("notify") && l.contains("kraal")) {
-                format!("codex: installed ({})", path.display())
-            } else {
-                format!("codex: not installed ({})", path.display())
-            })
-        }
-        _ => bail!("unknown agent {agent:?}"),
+    if let Some(s) = SHELLS.iter().find(|s| **s == agent) {
+        return Ok(shell_status(s, &shell_rc_path(s)));
     }
+    if !AGENTS.contains(&agent) {
+        return Err(unknown(agent));
+    }
+    let (path, top_level) = agent_file(agent);
+    status_line(agent, &path, top_level)
+}
+
+fn status_line(agent: &str, path: &Path, top_level: bool) -> Result<String> {
+    let (installed, wanted): (Vec<&str>, Vec<&str>) = match agent {
+        "codex" => {
+            let text = std::fs::read_to_string(path).unwrap_or_default();
+            let ours = text.lines().any(|l| l.trim_start().starts_with("notify") && l.contains("kraal"));
+            (if ours { vec!["notify"] } else { vec![] }, vec!["notify"])
+        }
+        "copilot" | "opencode" | "kilo" | "pi" => {
+            let ours = std::fs::read_to_string(path).is_ok_and(|t| is_own(&t, agent));
+            (if ours { vec!["plugin"] } else { vec![] }, vec!["plugin"])
+        }
+        "cursor" => {
+            let v = read_json(path)?;
+            let events = v.get("hooks");
+            (CURSOR_EVENTS.iter().copied().filter(|e| flat_has(events, e, "cursor")).collect(), CURSOR_EVENTS.to_vec())
+        }
+        "kimi" => (kimi_events(path)?, KIMI_EVENTS.to_vec()),
+        _ => {
+            let n = nested(agent);
+            let v = read_json(path)?;
+            let events = if top_level { Some(&v) } else { v.get("hooks") };
+            let all: Vec<&str> = n.events.iter().map(|(e, _)| *e).collect();
+            (all.iter().copied().filter(|e| nested_has(events, e, agent)).collect(), all)
+        }
+    };
+    Ok(match installed.len() {
+        0 => format!("{agent}: not installed ({})", path.display()),
+        n if n == wanted.len() => format!("{agent}: installed ({})", path.display()),
+        _ => {
+            format!("{agent}: partially installed ({}); run `kraal integration install {agent}`", installed.join(", "))
+        }
+    })
 }
 
 fn read_json(path: &Path) -> Result<Value> {
@@ -173,14 +381,87 @@ fn write_with_backup(path: &Path, content: &str) -> Result<()> {
     crate::paths::write_atomic(&target, content.as_bytes()).with_context(|| format!("writing {}", target.display()))
 }
 
-fn claude_has(v: &Value, event: &str) -> bool {
-    v.pointer(&format!("/hooks/{event}")).and_then(Value::as_array).is_some_and(|groups| {
-        groups.iter().any(|g| {
-            g.get("hooks").and_then(Value::as_array).is_some_and(|hs| {
-                hs.iter().any(|h| h.get("command").and_then(Value::as_str).is_some_and(|c| is_ours(c, "claude")))
-            })
-        })
+fn runs_ours(hook: &Value, agent: &str) -> bool {
+    hook.get("command").and_then(Value::as_str).is_some_and(|c| is_ours(c, agent))
+}
+
+/// Whether kraal's hook is in `event`'s groups of an event map laid out as Claude Code's.
+fn nested_has(events: Option<&Value>, event: &str, agent: &str) -> bool {
+    events.and_then(|e| e.get(event)).and_then(Value::as_array).is_some_and(|groups| {
+        groups
+            .iter()
+            .any(|g| g.get("hooks").and_then(Value::as_array).is_some_and(|hs| hs.iter().any(|h| runs_ours(h, agent))))
     })
+}
+
+/// Put kraal's hook in each event of `spec`, once: stale entries (an old binary path) go first.
+/// The user's own hooks stay where they are.
+fn add_nested(events: &mut Map<String, Value>, spec: &NestedHooks, cmd: &str) -> Result<usize> {
+    let mut added = 0;
+    for (event, matcher) in spec.events {
+        let groups = events.entry(event.to_string()).or_insert_with(|| json!([]));
+        let groups = groups.as_array_mut().with_context(|| format!("hooks.{event} is not an array"))?;
+        for g in groups.iter_mut() {
+            if let Some(hs) = g.get_mut("hooks").and_then(Value::as_array_mut) {
+                hs.retain(|h| !runs_ours(h, spec.agent));
+            }
+        }
+        groups.retain(|g| g.get("hooks").and_then(Value::as_array).is_none_or(|hs| !hs.is_empty()));
+        let mut group = json!({ "hooks": [{ "type": "command", "command": cmd, "timeout": spec.timeout }] });
+        if let Some(m) = matcher {
+            group["matcher"] = json!(m);
+        }
+        groups.push(group);
+        added += 1;
+    }
+    Ok(added)
+}
+
+/// Take kraal's hooks out of an event map, and the groups and events left empty.
+fn remove_nested(events: &mut Map<String, Value>, agent: &str) -> usize {
+    let mut removed = 0;
+    for (_, groups) in events.iter_mut() {
+        let Some(groups) = groups.as_array_mut() else { continue };
+        for g in groups.iter_mut() {
+            if let Some(hs) = g.get_mut("hooks").and_then(Value::as_array_mut) {
+                let before = hs.len();
+                hs.retain(|h| !runs_ours(h, agent));
+                removed += before - hs.len();
+            }
+        }
+        groups.retain(|g| g.get("hooks").and_then(Value::as_array).is_none_or(|hs| !hs.is_empty()));
+    }
+    events.retain(|_, groups| groups.as_array().is_none_or(|a| !a.is_empty()));
+    removed
+}
+
+/// The event map of a settings file: its `hooks` key, or the file itself.
+fn event_map<'a>(v: &'a mut Value, path: &Path, top_level: bool) -> Result<&'a mut Map<String, Value>> {
+    let root = v.as_object_mut().with_context(|| format!("{} is not a JSON object", path.display()))?;
+    if top_level {
+        return Ok(root);
+    }
+    root.entry("hooks").or_insert_with(|| json!({})).as_object_mut().context("\"hooks\" is not an object")
+}
+
+fn install_nested(spec: &NestedHooks, path: &Path, top_level: bool) -> Result<String> {
+    let mut v = read_json(path)?;
+    let added = add_nested(event_map(&mut v, path, top_level)?, spec, &hook_command(spec.agent)?)?;
+    write_with_backup(path, &(serde_json::to_string_pretty(&v)? + "\n"))?;
+    Ok(format!("{}: {added} hooks installed in {} (backup next to it)", spec.agent, path.display()))
+}
+
+fn uninstall_nested(spec: &NestedHooks, path: &Path, top_level: bool) -> Result<String> {
+    let mut v = read_json(path)?;
+    let removed = match if top_level { v.as_object_mut() } else { v.get_mut("hooks").and_then(Value::as_object_mut) } {
+        Some(events) => remove_nested(events, spec.agent),
+        None => 0,
+    };
+    if removed == 0 {
+        return Ok(format!("{}: nothing to remove", spec.agent));
+    }
+    write_with_backup(path, &(serde_json::to_string_pretty(&v)? + "\n"))?;
+    Ok(format!("{}: removed {removed} hooks from {}", spec.agent, path.display()))
 }
 
 fn is_our_statusline(cmd: &str) -> bool {
@@ -205,26 +486,7 @@ fn install_claude(path: &Path, accounts_path: &Path) -> Result<String> {
     line["type"] = json!("command");
     line["command"] = json!(ours);
     root.insert("statusLine".into(), line);
-    let hooks = root.entry("hooks").or_insert_with(|| json!({}));
-    let hooks = hooks.as_object_mut().context("\"hooks\" is not an object")?;
-    let mut added = 0;
-    for (event, needs_matcher) in CLAUDE_EVENTS {
-        let groups = hooks.entry(event.to_string()).or_insert_with(|| json!([]));
-        let groups = groups.as_array_mut().with_context(|| format!("hooks.{event} is not an array"))?;
-        // Drop stale kraal entries (e.g. an old binary path), then add ours.
-        for g in groups.iter_mut() {
-            if let Some(hs) = g.get_mut("hooks").and_then(Value::as_array_mut) {
-                hs.retain(|h| !h.get("command").and_then(Value::as_str).is_some_and(|c| is_ours(c, "claude")));
-            }
-        }
-        groups.retain(|g| g.get("hooks").and_then(Value::as_array).is_none_or(|hs| !hs.is_empty()));
-        let mut group = json!({ "hooks": [{ "type": "command", "command": cmd, "timeout": 5 }] });
-        if *needs_matcher {
-            group["matcher"] = json!("*");
-        }
-        groups.push(group);
-        added += 1;
-    }
+    let added = add_nested(event_map(&mut v, path, false)?, nested("claude"), &cmd)?;
     write_with_backup(path, &(serde_json::to_string_pretty(&v)? + "\n"))?;
     Ok(format!("claude: {added} hooks installed in {} (backup next to it)", path.display()))
 }
@@ -246,24 +508,332 @@ fn uninstall_claude(path: &Path, accounts_path: &Path) -> Result<String> {
         removed += 1;
     }
     if let Some(hooks) = v.get_mut("hooks").and_then(Value::as_object_mut) {
-        for (_, groups) in hooks.iter_mut() {
-            let Some(groups) = groups.as_array_mut() else { continue };
-            for g in groups.iter_mut() {
-                if let Some(hs) = g.get_mut("hooks").and_then(Value::as_array_mut) {
-                    let before = hs.len();
-                    hs.retain(|h| !h.get("command").and_then(Value::as_str).is_some_and(|c| is_ours(c, "claude")));
-                    removed += before - hs.len();
-                }
-            }
-            groups.retain(|g| g.get("hooks").and_then(Value::as_array).is_none_or(|hs| !hs.is_empty()));
-        }
-        hooks.retain(|_, groups| groups.as_array().is_none_or(|a| !a.is_empty()));
+        removed += remove_nested(hooks, "claude");
     }
     if removed == 0 {
         return Ok("claude: nothing to remove".into());
     }
     write_with_backup(path, &(serde_json::to_string_pretty(&v)? + "\n"))?;
     Ok(format!("claude: removed {removed} hooks from {}", path.display()))
+}
+
+/// Whether kraal's hook is in an event of Cursor's hooks, a plain list of commands.
+fn flat_has(events: Option<&Value>, event: &str, agent: &str) -> bool {
+    events.and_then(|e| e.get(event)).and_then(Value::as_array).is_some_and(|hs| hs.iter().any(|h| runs_ours(h, agent)))
+}
+
+fn install_cursor(path: &Path) -> Result<String> {
+    let mut v = read_json(path)?;
+    let cmd = hook_command("cursor")?;
+    let root = v.as_object_mut().with_context(|| format!("{} is not a JSON object", path.display()))?;
+    root.entry("version").or_insert(json!(1));
+    let events = root.entry("hooks").or_insert_with(|| json!({}));
+    let events = events.as_object_mut().context("\"hooks\" is not an object")?;
+    for event in CURSOR_EVENTS {
+        let hooks = events.entry(event.to_string()).or_insert_with(|| json!([]));
+        let hooks = hooks.as_array_mut().with_context(|| format!("hooks.{event} is not an array"))?;
+        hooks.retain(|h| !runs_ours(h, "cursor"));
+        hooks.push(json!({ "command": cmd }));
+    }
+    write_with_backup(path, &(serde_json::to_string_pretty(&v)? + "\n"))?;
+    Ok(format!("cursor: {} hooks installed in {} (backup next to it)", CURSOR_EVENTS.len(), path.display()))
+}
+
+fn uninstall_cursor(path: &Path) -> Result<String> {
+    let mut v = read_json(path)?;
+    let mut removed = 0;
+    if let Some(events) = v.get_mut("hooks").and_then(Value::as_object_mut) {
+        for (_, hooks) in events.iter_mut() {
+            if let Some(hooks) = hooks.as_array_mut() {
+                let before = hooks.len();
+                hooks.retain(|h| !runs_ours(h, "cursor"));
+                removed += before - hooks.len();
+            }
+        }
+        events.retain(|_, hooks| hooks.as_array().is_none_or(|a| !a.is_empty()));
+    }
+    if removed == 0 {
+        return Ok("cursor: nothing to remove".into());
+    }
+    write_with_backup(path, &(serde_json::to_string_pretty(&v)? + "\n"))?;
+    Ok(format!("cursor: removed {removed} hooks from {}", path.display()))
+}
+
+/// Whether a file kraal put in an agent's directory is still kraal's own.
+fn is_own(text: &str, agent: &str) -> bool {
+    text.contains("kraal")
+        && (text.contains(&format!("kraal integration uninstall {agent}")) || text.contains(&format!(" hook {agent} ")))
+}
+
+/// A file of kraal's own where the agent loads every file it finds (hooks, plugins,
+/// extensions): written whole, removed whole, nothing of the user's to keep a copy of.
+fn install_own(agent: &str, path: &Path, content: &str, what: &str) -> Result<String> {
+    if let Ok(text) = std::fs::read_to_string(path)
+        && !is_own(&text, agent)
+    {
+        bail!("{} is not kraal's; kraal leaves it alone", path.display());
+    }
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    crate::paths::write_atomic(path, content.as_bytes()).with_context(|| format!("writing {}", path.display()))?;
+    Ok(format!("{agent}: {what} installed in {}; it takes effect in new sessions", path.display()))
+}
+
+fn uninstall_own(agent: &str, path: &Path) -> Result<String> {
+    match std::fs::read_to_string(path) {
+        Ok(text) if is_own(&text, agent) => {
+            std::fs::remove_file(path).with_context(|| format!("removing {}", path.display()))?;
+            Ok(format!("{agent}: removed {}", path.display()))
+        }
+        Ok(_) => bail!("{} is not kraal's; kraal leaves it alone", path.display()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(format!("{agent}: nothing to remove")),
+        Err(e) => Err(e).with_context(|| format!("reading {}", path.display())),
+    }
+}
+
+/// Copilot CLI loads every `*.json` in its hooks directory. Its own format does not name the
+/// event in the payload: kraal's command line does.
+fn copilot_hooks(exe: &str) -> String {
+    let cmd = format!("{} hook copilot", crate::shell::quote(exe));
+    let hooks: Map<String, Value> = COPILOT_EVENTS
+        .iter()
+        .map(|(event, matcher)| {
+            let mut hook = json!({ "type": "command", "bash": format!("{cmd} {event}"), "timeoutSec": 5 });
+            if let Some(m) = matcher {
+                hook["matcher"] = json!(m);
+            }
+            (event.to_string(), json!([hook]))
+        })
+        .collect();
+    serde_json::to_string_pretty(&json!({ "version": 1, "hooks": hooks })).unwrap_or_default() + "\n"
+}
+
+/// A plugin for OpenCode 1 (and Kilo, its fork): working while a session is busy, blocked
+/// while a permission or a question waits, done when every session is idle again. Subagents
+/// run sessions of their own, hence the counting.
+fn opencode_plugin(agent: &str, exe: &str) -> String {
+    let name = if agent == "kilo" { "Kilo" } else { "OpenCode" };
+    // Kilo registers a default export with an id; OpenCode 1 every exported function.
+    let export = if agent == "kilo" { "export default { id: \"kraal\", server: KraalPlugin };\n" } else { "" };
+    let declare = if agent == "kilo" { "const KraalPlugin" } else { "export const KraalPlugin" };
+    format!(
+        r#"// kraal: tells the kraal pane {name} runs in whether it works, waits for you or is done.
+// `kraal integration uninstall {agent}` removes this file.
+const kraal = {exe};
+
+{declare} = async ({{ $ }}) => {{
+  if (!process.env.KRAAL_PANE) return {{}};
+  const busy = new Set();
+  const asking = new Map();
+  let last = "done";
+  let queue = Promise.resolve();
+  const report = () => {{
+    const state = asking.size ? "blocked" : busy.size ? "working" : "done";
+    if (state === last) return;
+    last = state;
+    queue = queue.then(() => $`${{kraal}} hook {agent} ${{state}}`.quiet().nothrow()).catch(() => {{}});
+  }};
+  const settle = (session) => {{
+    busy.delete(session);
+    for (const [id, s] of asking) if (s === session) asking.delete(id);
+  }};
+  return {{
+    event: async ({{ event }}) => {{
+      const p = event.properties ?? {{}};
+      switch (event.type) {{
+        case "session.status":
+          if (p.status?.type === "idle") settle(p.sessionID);
+          else busy.add(p.sessionID);
+          break;
+        case "session.idle":
+          settle(p.sessionID);
+          break;
+        case "permission.asked":
+        case "permission.updated":
+        case "question.asked":
+          asking.set(p.id, p.sessionID);
+          break;
+        case "permission.replied":
+        case "question.replied":
+        case "question.rejected":
+          asking.delete(p.requestID ?? p.permissionID);
+          break;
+        default:
+          return;
+      }}
+      report();
+    }},
+  }};
+}};
+{export}"#,
+        exe = serde_json::to_string(exe).unwrap_or_default(),
+    )
+}
+
+/// An extension for pi: it asks nothing by itself, so a question is an extension's prompt.
+fn pi_extension(exe: &str) -> String {
+    format!(
+        r#"// kraal: tells the kraal pane pi runs in whether it works, waits for you or is done.
+// `kraal integration uninstall pi` removes this file.
+const kraal = {exe};
+
+export default function (pi: any) {{
+  if (!process.env.KRAAL_PANE) return;
+  let running = false;
+  let queue: Promise<unknown> = Promise.resolve();
+  const report = (state: string) => {{
+    queue = queue.then(() => pi.exec(kraal, ["hook", "pi", state])).catch(() => {{}});
+    return queue;
+  }};
+  pi.on("session_start", () => {{ report("idle"); }});
+  pi.on("agent_start", () => {{ running = true; report("working"); }});
+  pi.on("ui_prompt_start", () => {{ report("blocked"); }});
+  pi.on("ui_prompt_end", () => {{ report(running ? "working" : "idle"); }});
+  pi.on("agent_settled", () => {{ running = false; report("done"); }});
+  pi.on("session_shutdown", (event: any) => (event?.reason === "quit" ? report("unknown") : undefined));
+}}
+"#,
+        exe = serde_json::to_string(exe).unwrap_or_default(),
+    )
+}
+
+/// Kimi Code's `[[hooks]]` tables, one per event: kraal's go at the end of the file, and only
+/// they are ever taken out.
+fn install_kimi(path: &Path) -> Result<String> {
+    let text = read_text(path)?;
+    let cmd = hook_command("kimi")?;
+    let mut lines = without_toml_hooks(&text, "kimi");
+    while lines.last().is_some_and(|l| l.trim().is_empty()) {
+        lines.pop();
+    }
+    let mut wanted = Vec::new();
+    for event in KIMI_EVENTS {
+        if !lines.is_empty() {
+            lines.push(String::new());
+        }
+        lines.push("[[hooks]]".into());
+        lines.push(format!("event = {}", toml_string(event)));
+        lines.push(format!("command = {}", toml_string(&cmd)));
+        lines.push("timeout = 5".into());
+        let mut t = toml::Table::new();
+        t.insert("event".into(), (*event).into());
+        t.insert("command".into(), cmd.clone().into());
+        t.insert("timeout".into(), 5.into());
+        wanted.push(toml::Value::Table(t));
+    }
+    let manual = format!(
+        "add a [[hooks]] table with `command = {}` for each of {} to {}",
+        toml_string(&cmd),
+        KIMI_EVENTS.join(", "),
+        path.display()
+    );
+    write_toml_hooks(path, &text, &lines, "kimi", &wanted, &manual)?;
+    Ok(format!("kimi: {} hooks installed in {} (backup next to it)", KIMI_EVENTS.len(), path.display()))
+}
+
+fn uninstall_kimi(path: &Path) -> Result<String> {
+    let text = read_text(path)?;
+    let mut lines = without_toml_hooks(&text, "kimi");
+    if lines.join("\n") == text.lines().collect::<Vec<_>>().join("\n") {
+        return Ok("kimi: nothing to remove".into());
+    }
+    while lines.last().is_some_and(|l| l.trim().is_empty()) {
+        lines.pop();
+    }
+    let manual = format!("remove the [[hooks]] tables that run kraal from {}", path.display());
+    write_toml_hooks(path, &text, &lines, "kimi", &[], &manual)?;
+    Ok(format!("kimi: hooks removed from {}", path.display()))
+}
+
+/// The events of the `[[hooks]]` tables that run kraal.
+fn kimi_events(path: &Path) -> Result<Vec<&'static str>> {
+    let mut t: toml::Table =
+        toml::from_str(&read_text(path)?).with_context(|| format!("parsing {}", path.display()))?;
+    let ours = take_toml_hooks(&mut t, "kimi");
+    Ok(KIMI_EVENTS
+        .iter()
+        .copied()
+        .filter(|e| ours.iter().any(|h| h.get("event").and_then(|v| v.as_str()) == Some(e)))
+        .collect())
+}
+
+fn read_text(path: &Path) -> Result<String> {
+    match std::fs::read_to_string(path) {
+        Ok(t) => Ok(t),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+        Err(e) => Err(e).with_context(|| format!("reading {}", path.display())),
+    }
+}
+
+/// `text` without the `[[hooks]]` tables that run kraal. A table ends where the next one
+/// starts; the comments and blank lines just before that belong to what follows.
+fn without_toml_hooks(text: &str, agent: &str) -> Vec<String> {
+    let lines: Vec<&str> = text.lines().collect();
+    let header = |l: &str| l.split('#').next().unwrap_or("").replace(' ', "").trim().to_string();
+    let runs_ours = |l: &str| {
+        toml::from_str::<toml::Table>(l)
+            .ok()
+            .and_then(|t| t.get("command").and_then(|c| c.as_str()).map(|c| is_ours(c, agent)))
+            .unwrap_or(false)
+    };
+    let mut out: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < lines.len() {
+        if header(lines[i]) == "[[hooks]]" {
+            let end = (i + 1..lines.len()).find(|&j| lines[j].trim_start().starts_with('[')).unwrap_or(lines.len());
+            let mut last = end;
+            while last > i + 1 && (lines[last - 1].trim().is_empty() || lines[last - 1].trim_start().starts_with('#')) {
+                last -= 1;
+            }
+            if lines[i + 1..last].iter().any(|l| runs_ours(l)) {
+                if out.last().is_some_and(|l| l.trim().is_empty()) {
+                    out.pop();
+                }
+                i = last;
+                continue;
+            }
+        }
+        out.push(lines[i].to_string());
+        i += 1;
+    }
+    out
+}
+
+/// Take the entries of the top-level `hooks` array that run kraal out of a TOML document.
+fn take_toml_hooks(t: &mut toml::Table, agent: &str) -> Vec<toml::Value> {
+    let Some(toml::Value::Array(hooks)) = t.get_mut("hooks") else { return Vec::new() };
+    let (ours, rest): (Vec<_>, Vec<_>) = std::mem::take(hooks)
+        .into_iter()
+        .partition(|h| h.get("command").and_then(|c| c.as_str()).is_some_and(|c| is_ours(c, agent)));
+    if rest.is_empty() {
+        t.remove("hooks");
+    } else {
+        *hooks = rest;
+    }
+    ours
+}
+
+/// Write a TOML file back only if, read as TOML, kraal's hooks are now `wanted` and nothing
+/// else changed: the editing goes line by line, and a layout it could misread is left as it is.
+fn write_toml_hooks(
+    path: &Path,
+    original: &str,
+    lines: &[String],
+    agent: &str,
+    wanted: &[toml::Value],
+    manual: &str,
+) -> Result<()> {
+    let text = lines.join("\n") + "\n";
+    let mut before: toml::Table = toml::from_str(original)
+        .with_context(|| format!("{} is not valid TOML; kraal leaves it alone: {manual}", path.display()))?;
+    take_toml_hooks(&mut before, agent);
+    let only_ours = toml::from_str::<toml::Table>(&text).is_ok_and(|mut after| {
+        let ours = take_toml_hooks(&mut after, agent);
+        after == before && ours == wanted
+    });
+    anyhow::ensure!(only_ours, "kraal cannot edit {} safely; {manual}", path.display());
+    write_with_backup(path, &text)
 }
 
 fn install_codex(path: &Path) -> Result<String> {
@@ -812,7 +1382,7 @@ mod tests {
         assert_eq!(v["model"], "opus");
         let stop = v["hooks"]["Stop"].as_array().unwrap();
         assert_eq!(stop.len(), 2, "user hook kept, ours added once: {stop:?}");
-        assert!(claude_has(&v, "PreToolUse"));
+        assert!(nested_has(v.get("hooks"), "PreToolUse", "claude"));
         assert_eq!(v["hooks"]["PreToolUse"][0]["matcher"], "*");
         // Key order is preserved.
         let text = std::fs::read_to_string(&path).unwrap();
@@ -1308,6 +1878,170 @@ mod tests {
         assert!(err.contains("add `notify = ["), "{err}");
         assert_eq!(std::fs::read_to_string(&path).unwrap(), tricky);
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Gemini CLI, Qwen Code, droid, CodeBuddy and Augment: Claude Code's layout, each with its
+    /// own events and timeout unit; the user's settings and hooks stay.
+    #[test]
+    fn nested_hooks_go_in_once_and_come_out_alone() {
+        let dir = tmp("nested");
+        for spec in NESTED.iter().filter(|n| n.agent != "claude") {
+            let path = dir.join(format!("{}.json", spec.agent));
+            let mine = r#"{"model":"x","hooks":{"AfterAgent":[{"hooks":[{"type":"command","command":"notify-send done"}]}],"Stop":[{"hooks":[{"type":"command","command":"say done"}]}]}}"#;
+            std::fs::write(&path, mine).unwrap();
+            install_nested(spec, &path, false).unwrap();
+            install_nested(spec, &path, false).unwrap();
+            let v = read_json(&path).unwrap();
+            assert_eq!(v["model"], "x");
+            for (event, matcher) in spec.events {
+                let groups = v["hooks"][event].as_array().unwrap();
+                let ours: Vec<&Value> = groups.iter().filter(|g| runs_ours(&g["hooks"][0], spec.agent)).collect();
+                assert_eq!(ours.len(), 1, "{} {event}: {groups:?}", spec.agent);
+                assert_eq!(ours[0]["hooks"][0]["timeout"], spec.timeout);
+                assert_eq!(ours[0].get("matcher").and_then(Value::as_str), *matcher);
+            }
+            assert!(status_line(spec.agent, &path, false).unwrap().contains(": installed ("));
+            uninstall_nested(spec, &path, false).unwrap();
+            assert_eq!(read_json(&path).unwrap(), serde_json::from_str::<Value>(mine).unwrap(), "{}", spec.agent);
+            assert!(uninstall_nested(spec, &path, false).unwrap().contains("nothing to remove"));
+        }
+        // Gemini's timeouts are milliseconds, and its own events.
+        let g = nested("gemini");
+        assert_eq!(g.timeout, 5000);
+        assert!(g.events.iter().any(|(e, _)| *e == "AfterAgent") && !g.events.iter().any(|(e, _)| *e == "Stop"));
+        // droid's own hooks.json holds the events at its top level.
+        let hooks = dir.join("factory/hooks.json");
+        install_nested(nested("droid"), &hooks, true).unwrap();
+        let v = read_json(&hooks).unwrap();
+        assert!(v.get("hooks").is_none() && nested_has(Some(&v), "Notification", "droid"), "{v}");
+        uninstall_nested(nested("droid"), &hooks, true).unwrap();
+        assert_eq!(read_json(&hooks).unwrap(), json!({}));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn cursor_hooks_keep_the_users() {
+        let dir = tmp("cursor");
+        let path = dir.join("hooks.json");
+        let mine = r#"{"version":1,"hooks":{"afterFileEdit":[{"command":"./hooks/format.sh"}],"stop":[{"command":"./hooks/audit.sh"}]}}"#;
+        std::fs::write(&path, mine).unwrap();
+        install_cursor(&path).unwrap();
+        install_cursor(&path).unwrap();
+        let v = read_json(&path).unwrap();
+        assert_eq!(v["hooks"]["stop"].as_array().unwrap().len(), 2, "{v}");
+        assert!(CURSOR_EVENTS.iter().all(|e| flat_has(v.get("hooks"), e, "cursor")));
+        // None of the hooks whose answer Cursor waits for.
+        assert!(v["hooks"].get("preToolUse").is_none() && v["hooks"].get("beforeShellExecution").is_none());
+        uninstall_cursor(&path).unwrap();
+        assert_eq!(read_json(&path).unwrap(), serde_json::from_str::<Value>(mine).unwrap());
+        // A file that was not there gets the version Cursor wants.
+        let fresh = dir.join("new/hooks.json");
+        install_cursor(&fresh).unwrap();
+        assert_eq!(read_json(&fresh).unwrap()["version"], 1);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Copilot's hooks, OpenCode's and Kilo's plugins, pi's extension: files of kraal's own.
+    #[test]
+    fn own_files_are_written_and_removed_whole() {
+        let dir = tmp("own");
+        let exe = "/opt/my tools/kraal";
+        let copilot = dir.join("copilot/hooks/kraal.json");
+        install_own("copilot", &copilot, &copilot_hooks(exe), "hooks").unwrap();
+        let v = read_json(&copilot).unwrap();
+        assert_eq!(v["version"], 1);
+        assert_eq!(v["hooks"]["agentStop"][0]["bash"], "'/opt/my tools/kraal' hook copilot agentStop");
+        assert_eq!(v["hooks"]["notification"][0]["matcher"], "permission_prompt|elicitation_dialog");
+        assert!(v["hooks"].get("preToolUse").is_none() && v["hooks"].get("permissionRequest").is_none());
+        for (agent, path, content) in [
+            ("opencode", dir.join("opencode/plugins/kraal.js"), opencode_plugin("opencode", exe)),
+            ("kilo", dir.join("kilo/plugin/kraal.js"), opencode_plugin("kilo", exe)),
+            ("pi", dir.join("pi/extensions/kraal.ts"), pi_extension(exe)),
+        ] {
+            assert!(content.contains(r#"const kraal = "/opt/my tools/kraal";"#), "{content}");
+            install_own(agent, &path, &content, "plugin").unwrap();
+            install_own(agent, &path, &content, "plugin").unwrap();
+            assert!(std::fs::read_to_string(&path).unwrap().contains(&format!("kraal integration uninstall {agent}")));
+            uninstall_own(agent, &path).unwrap();
+            assert!(!path.exists());
+            assert!(uninstall_own(agent, &path).unwrap().contains("nothing to remove"));
+        }
+        assert!(opencode_plugin("opencode", exe).contains("export const KraalPlugin"));
+        assert!(opencode_plugin("kilo", exe).contains("export default { id: \"kraal\", server: KraalPlugin }"));
+        // A file of the same name that is not kraal's is left alone.
+        let theirs = dir.join("opencode/plugins/kraal.js");
+        std::fs::write(&theirs, "export const Mine = async () => ({})\n").unwrap();
+        assert!(install_own("opencode", &theirs, &opencode_plugin("opencode", exe), "plugin").is_err());
+        assert!(uninstall_own("opencode", &theirs).is_err());
+        assert_eq!(std::fs::read_to_string(&theirs).unwrap(), "export const Mine = async () => ({})\n");
+        uninstall_own("copilot", &copilot).unwrap();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The plugins are valid JavaScript (and the extension valid once its types are gone), when
+    /// Node is there to say so.
+    #[test]
+    fn plugins_parse() {
+        if std::process::Command::new("node").arg("--version").output().is_err() {
+            return;
+        }
+        let dir = tmp("parse");
+        let pi =
+            pi_extension("/opt/kraal").replace(": any", "").replace(": string", "").replace(": Promise<unknown>", "");
+        for (name, code) in [
+            ("opencode.mjs", opencode_plugin("opencode", "/opt/kraal")),
+            ("kilo.mjs", opencode_plugin("kilo", "/opt/kraal")),
+            ("pi.mjs", pi),
+        ] {
+            let file = dir.join(name);
+            std::fs::write(&file, code).unwrap();
+            let out = std::process::Command::new("node").arg("--check").arg(&file).output().unwrap();
+            assert!(out.status.success(), "{name}: {}", String::from_utf8_lossy(&out.stderr));
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn kimi_hooks_are_tables_of_their_own() {
+        let dir = tmp("kimi");
+        let path = dir.join("config.toml");
+        let mine = "default_model = \"kimi-k2\"\n\n[[hooks]]\nevent = \"Stop\"\ncommand = \"notify-send done\"\n\n# my theme\n[theme]\nname = \"dark\"\n";
+        std::fs::write(&path, mine).unwrap();
+        install_kimi(&path).unwrap();
+        install_kimi(&path).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let parsed: toml::Table = toml::from_str(&text).unwrap();
+        let hooks = parsed["hooks"].as_array().unwrap();
+        assert_eq!(hooks.len(), KIMI_EVENTS.len() + 1, "{text}");
+        // Only the four fields Kimi Code accepts.
+        for h in hooks {
+            assert!(
+                h.as_table().unwrap().keys().all(|k| ["event", "command", "matcher", "timeout"].contains(&k.as_str()))
+            );
+        }
+        assert_eq!(parsed["theme"]["name"].as_str(), Some("dark"));
+        assert_eq!(kimi_events(&path).unwrap(), KIMI_EVENTS);
+        uninstall_kimi(&path).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), mine);
+        assert!(uninstall_kimi(&path).unwrap().contains("nothing to remove"));
+        // An inline `hooks = [...]` cannot take tables after it: the file stays as it was.
+        let inline = "hooks = [{ event = \"Stop\", command = \"say done\" }]\n";
+        std::fs::write(&path, inline).unwrap();
+        let err = install_kimi(&path).unwrap_err().to_string();
+        assert!(err.contains("add a [[hooks]] table"), "{err}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), inline);
+        // A file that was not there.
+        let fresh = dir.join("fresh/config.toml");
+        install_kimi(&fresh).unwrap();
+        assert!(std::fs::read_to_string(&fresh).unwrap().starts_with("[[hooks]]\nevent = \"SessionStart\""));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn unknown_agents_are_refused() {
+        let err = install("aider").unwrap_err().to_string();
+        assert!(err.contains("gemini") && err.contains("fish"), "{err}");
+        assert!(status("vim").is_err());
     }
 
     #[test]

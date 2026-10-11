@@ -370,6 +370,75 @@ fn hooks_drive_agent_state() {
     assert!(!timeout.status.success());
 }
 
+/// Other agents' hooks, as each one calls `kraal hook`; and a hook for another agent than the
+/// one a pane runs (Cursor runs Claude Code's hooks) changes nothing there.
+#[test]
+fn other_agents_hooks_drive_their_state() {
+    let env = Env::new("hooks-other");
+    env.workspace("w", "layout {\n    pane name=\"gemini\"\n    pane name=\"copilot\"\n    pane name=\"cursor\"\n}\n");
+    env.run(&["open", "w"]);
+    let socket = env.root.join("run/kraal/hooks-other.sock");
+    let hook = |pane: &str, args: &[&str], payload: &str| {
+        let mut c = env.cmd(&[&["hook"], args].concat());
+        c.env("KRAAL_PANE", pane).env("KRAAL_SOCKET", &socket).stdin(std::process::Stdio::piped());
+        let mut child = c.spawn().unwrap();
+        use std::io::Write;
+        child.stdin.take().unwrap().write_all(payload.as_bytes()).unwrap();
+        let out = child.wait_with_output().unwrap();
+        assert!(out.status.success() && out.stdout.is_empty() && out.stderr.is_empty(), "hooks must stay silent");
+    };
+    let wait = |pane: &str, state: &str| {
+        assert_eq!(env.run(&["wait", "-p", pane, "--until", state, "--timeout", "3"]).trim(), state, "{pane}");
+    };
+    hook("gemini", &["gemini"], r#"{"hook_event_name":"BeforeAgent","session_id":"g-1","prompt":"fix it"}"#);
+    wait("gemini", "working");
+    hook(
+        "gemini",
+        &["gemini"],
+        r#"{"hook_event_name":"Notification","session_id":"g-1","notification_type":"ToolPermission","message":"Tool Shell requires execution","details":{"type":"exec"}}"#,
+    );
+    wait("gemini", "blocked");
+    hook("gemini", &["gemini"], r#"{"hook_event_name":"AfterAgent","session_id":"g-1"}"#);
+    wait("gemini", "done");
+    // Copilot's own format names the event on the command line only.
+    hook("copilot", &["copilot", "userPromptSubmitted"], r#"{"sessionId":"c-1","timestamp":1,"cwd":"/","prompt":"x"}"#);
+    wait("copilot", "working");
+    hook(
+        "copilot",
+        &["copilot", "notification"],
+        r#"{"sessionId":"c-1","hook_event_name":"Notification","notification_type":"permission_prompt","message":"Copilot needs permission"}"#,
+    );
+    wait("copilot", "blocked");
+    hook("copilot", &["copilot", "agentStop"], r#"{"sessionId":"c-1","stopReason":"end_turn"}"#);
+    wait("copilot", "done");
+    // A pane running Cursor's CLI.
+    let bin = env.root.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let cursor = bin.join("cursor-agent");
+    write_script(&cursor, "#!/bin/sh\necho started\nsleep 30\n");
+    env.run(&["send", "-p", "cursor", "--enter", &cursor.display().to_string()]);
+    env.wait_for_text("cursor", "started");
+    hook(
+        "cursor",
+        &["claude"],
+        r#"{"hook_event_name":"UserPromptSubmit","session_id":"x","cursor_version":"2026.10.01"}"#,
+    );
+    hook("cursor", &["claude"], r#"{"hook_event_name":"UserPromptSubmit","session_id":"x"}"#);
+    let panes: serde_json::Value = serde_json::from_str(&env.run(&["panes", "--json"])).unwrap();
+    let cursor_pane = panes.as_array().unwrap().iter().find(|p| p["name"] == "cursor").unwrap();
+    assert_ne!(cursor_pane["agent"], "claude", "{cursor_pane}");
+    hook(
+        "cursor",
+        &["cursor"],
+        r#"{"hook_event_name":"stop","conversation_id":"c","status":"completed","loop_count":0}"#,
+    );
+    wait("cursor", "done");
+    let panes: serde_json::Value = serde_json::from_str(&env.run(&["panes", "--json"])).unwrap();
+    let cursor_pane = panes.as_array().unwrap().iter().find(|p| p["name"] == "cursor").unwrap();
+    assert_eq!(cursor_pane["agent"], "cursor", "{cursor_pane}");
+    env.run(&["keys", "-p", "cursor", "ctrl+c"]);
+}
+
 #[test]
 fn agents_resume_after_a_restart_but_never_replay_a_one_shot_run() {
     let env = Env::new("resume");
