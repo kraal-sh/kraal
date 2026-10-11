@@ -38,6 +38,8 @@ impl Server {
 
     /// Spawn a pane process with a provisional size; call [`Server::relayout`] afterwards.
     pub fn spawn_pane(&mut self, name: Option<String>, spec: PaneSpec) -> Result<PaneId> {
+        let mut spec = spec;
+        self.add_worktree_env(&mut spec);
         let id = self.alloc_id();
         let inner = self.inner(self.layout_area, false);
         if let Some([left, right]) = spec.files.clone() {
@@ -68,6 +70,8 @@ impl Server {
 
     /// A command pane that does not run its command yet: it shows `reason`, and Enter starts it.
     pub fn spawn_pane_suspended(&mut self, name: Option<String>, spec: PaneSpec, reason: &str) -> Result<PaneId> {
+        let mut spec = spec;
+        self.add_worktree_env(&mut spec);
         let id = self.alloc_id();
         let inner = self.inner(self.layout_area, false);
         let mut pane =
@@ -91,6 +95,28 @@ impl Server {
         pane.suspended = true;
         self.persist_dirty = true;
         Ok(())
+    }
+
+    /// A pane in workspace `ws` that runs `prelude` (a new worktree's setup) before its own
+    /// command, `spec`: the command starts in its place once the prelude succeeds, and waits for
+    /// Enter when it fails.
+    pub fn spawn_pane_after(
+        &mut self,
+        ws: u32,
+        prelude: PaneSpec,
+        spec: PaneSpec,
+        placement: crate::protocol::Placement,
+        name: Option<String>,
+    ) -> Result<PaneId> {
+        let id = self.spawn_pane_in(ws, None, prelude, placement, name)?;
+        let mut spec = spec;
+        self.add_worktree_env(&mut spec);
+        if let Some(p) = self.panes.get_mut(&id) {
+            // A prelude that could not start waits for Enter: Enter starts the command instead.
+            p.preparing = !p.suspended;
+            p.spec = spec;
+        }
+        Ok(id)
     }
 
     /// Spawn a pane and place it in workspace `ws` relative to `target` (default: the focused pane).
@@ -181,6 +207,22 @@ impl Server {
             }
             self.finish_switch(id);
             self.mark_dirty();
+            return;
+        }
+        let Some(pane) = self.panes.get_mut(&id) else { return };
+        if pane.preparing {
+            pane.preparing = false;
+            let result = if code == Some(0) {
+                pane.respawn(&self.env, &self.tx)
+            } else {
+                let spec = pane.spec.clone();
+                self.suspend_pane(id, spec, "the worktree's setup did not succeed; Enter starts this anyway")
+            };
+            if let Err(e) = result {
+                self.warnings.push(format!("{e:#}"));
+            }
+            self.mark_dirty();
+            self.relayout();
             return;
         }
         let Some(pane) = self.panes.get_mut(&id) else { return };

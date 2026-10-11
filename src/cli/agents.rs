@@ -5,7 +5,7 @@ use anyhow::{Context, Result, bail};
 use super::Session;
 use super::args::{AccountsCmd, WtCmd};
 use crate::protocol::{PaneInfo, Placement, Request, Response};
-use crate::{accounts, codex_usage, git, integration, paths, server};
+use crate::{accounts, codex_usage, git, integration, paths, server, worktree_setup};
 
 pub(super) fn accounts(action: AccountsCmd) -> Result<()> {
     let all = accounts::Accounts::load()?;
@@ -234,7 +234,7 @@ pub(super) fn agent(
     }
     // Here, in this pane: its workspace's account rules still apply.
     let workspace = if inside { own_workspace(s) } else { None };
-    exec_agent(&agent, account.as_deref(), workspace.as_deref(), &args)
+    exec_agent(&agent, account.as_deref(), workspace.as_deref(), &args, &[])
 }
 
 /// The workspace of the pane this command runs in.
@@ -244,8 +244,14 @@ fn own_workspace(s: &Session) -> Option<String> {
     list.into_iter().find(|p| p.id.to_string() == pane).map(|p| p.workspace)
 }
 
-/// Start an agent on the chosen account in this terminal.
-fn exec_agent(agent: &str, account: Option<&str>, workspace: Option<&str>, args: &[String]) -> Result<()> {
+/// Start an agent on the chosen account in this terminal, with `env` besides the account's.
+fn exec_agent(
+    agent: &str,
+    account: Option<&str>,
+    workspace: Option<&str>,
+    args: &[String],
+    env: &[(String, String)],
+) -> Result<()> {
     let all = accounts::Accounts::load()?;
     accounts::agent_kind(agent)
         .with_context(|| format!("unknown agent {agent:?} (known: {})", accounts::agent_names()))?;
@@ -266,16 +272,46 @@ fn exec_agent(agent: &str, account: Option<&str>, workspace: Option<&str>, args:
             .context("no account allowed here: the matching rule in accounts.toml names none")?,
     };
     let session = accounts::agent_kind(agent).and_then(|k| k.session_flag).map(|_| accounts::new_uuid());
-    run_with(&accounts::launch(&a, args, None, session.as_deref())?, true).map(|_| ())
+    let mut launch = accounts::launch(&a, args, None, session.as_deref())?;
+    launch.env.extend(env.iter().cloned());
+    run_with(&launch, true).map(|_| ())
 }
 
 /// `kraal wt`: git worktrees for agents.
 pub(super) fn worktrees(s: &Session, action: WtCmd) -> Result<()> {
     let cwd = std::env::current_dir()?;
     match action {
-        WtCmd::New { name, agent, base } => {
-            let w = git::add_worktree(&cwd, &name, base.as_deref())?;
+        WtCmd::New { name, agent, base, yes, no_setup } => {
+            use std::io::{BufRead, IsTerminal, Write};
+            let cfg = crate::config::Config::load()?;
+            let user = worktree_setup::Setup::of_user(&cfg.worktrees);
+            let mut plan = worktree_setup::Plan::new(&cwd, &name, base.as_deref(), user)?;
+            if no_setup {
+                plan = plan.without_setup();
+            }
+            // The repository's commands run once this version of its file is approved.
+            if plan.needs_trust() {
+                println!("{}", plan.trust_question());
+                if !yes {
+                    anyhow::ensure!(
+                        std::io::stdin().is_terminal(),
+                        "add --yes to trust it and run it, or --no-setup to make the worktree without it"
+                    );
+                    eprint!("Trust this version and run it? [y/N] ");
+                    std::io::stderr().flush()?;
+                    let mut line = String::new();
+                    std::io::stdin().lock().read_line(&mut line)?;
+                    if !matches!(line.trim(), "y" | "Y" | "yes") {
+                        bail!("cancelled; nothing was created");
+                    }
+                }
+                plan.trust()?;
+            }
+            let prepared = plan.create()?;
+            let w = &prepared.worktree;
             println!("{} on {} (from {})", w.path.display(), w.branch, w.base);
+            let env = worktree_setup::env(&w.name(), w.index, &cfg.worktrees);
+            prepared.run_here(&env)?;
             if let Some(agent) = agent {
                 if std::env::var_os("KRAAL_SOCKET").is_some() {
                     s.request(Request::OpenAgent {
@@ -288,7 +324,7 @@ pub(super) fn worktrees(s: &Session, action: WtCmd) -> Result<()> {
                     })?;
                 } else {
                     std::env::set_current_dir(&w.path)?;
-                    return exec_agent(&agent, None, None, &[]);
+                    return exec_agent(&agent, None, None, &[], &env);
                 }
             }
             Ok(())
@@ -296,8 +332,50 @@ pub(super) fn worktrees(s: &Session, action: WtCmd) -> Result<()> {
         WtCmd::List => {
             for w in git::list_worktrees(&cwd)? {
                 let state = git::status(&w.path).map(|g| g.label(false)).unwrap_or_default();
-                println!("{:<24} {:<32} {}", w.name(), state, paths::shorten_home(&w.path));
+                let number = if w.index > 0 { format!("#{}", w.index) } else { String::new() };
+                println!("{:<24} {number:<4} {:<32} {}", w.name(), state, paths::shorten_home(&w.path));
             }
+            Ok(())
+        }
+        WtCmd::Prune { dry_run } => {
+            // Panes of the running session that work in a worktree keep it: close them first.
+            let panes = match s.request(Request::ListPanes) {
+                Ok(Response::Panes(panes)) => panes,
+                _ => Vec::new(),
+            };
+            let mut failed = 0;
+            for (w, state) in git::worktree_states(&cwd)? {
+                let inside: Vec<String> = panes
+                    .iter()
+                    .filter(|p| p.cwd.as_ref().is_some_and(|c| c.starts_with(&w.path)))
+                    .map(|p| p.name.clone().unwrap_or_else(|| p.id.to_string()))
+                    .collect();
+                let kept = match state {
+                    Err(e) => Some(e),
+                    Ok(s) if !s.is_clean() => Some(format!("it has {}", s.describe())),
+                    Ok(_) if !inside.is_empty() => Some(format!("panes work in it ({})", inside.join(", "))),
+                    Ok(_) => None,
+                };
+                if let Some(why) = kept {
+                    println!("kept {}: {why}", w.name());
+                } else if dry_run {
+                    println!("would remove {} and {}", w.path.display(), w.branch);
+                } else {
+                    // Checked again as it is removed: nothing with changes or unmerged commits goes.
+                    match git::remove_worktree(&w, false) {
+                        Ok(()) => println!("removed {} and {}", w.path.display(), w.branch),
+                        Err(e) => {
+                            eprintln!("kept {}: {e:#}", w.name());
+                            failed += 1;
+                        }
+                    }
+                }
+            }
+            anyhow::ensure!(
+                failed == 0,
+                "{failed} worktree{} could not be removed",
+                if failed == 1 { "" } else { "s" }
+            );
             Ok(())
         }
         WtCmd::Rm { name, force } => {

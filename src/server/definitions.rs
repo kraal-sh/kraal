@@ -295,6 +295,7 @@ impl Server {
                 };
                 let started = server.agent_spec(&a, cwd, None, &pending.args).and_then(|mut agent| {
                     agent.close_on_exit = pending.close_on_exit;
+                    crate::worktree_setup::carry_env(&spec.env, &mut agent.env);
                     if pending.suspended {
                         server.suspend_pane(id, agent, "start_suspended")
                     } else {

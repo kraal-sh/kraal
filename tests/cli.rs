@@ -2050,6 +2050,245 @@ fn worktrees_for_agents() {
     assert!(!path.exists());
 }
 
+/// A git repository at `repo` with one commit of `files`, and a function running git in it.
+fn git_repo(repo: &Path, files: &[(&str, &str)]) -> impl Fn(&[&str]) {
+    let dir = repo.to_path_buf();
+    let git = move |args: &[&str]| {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(&dir)
+            .args(["-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false"])
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+    };
+    for (path, text) in files {
+        let path = repo.join(path);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, text).unwrap();
+    }
+    git(&["init", "-q", "-b", "main"]);
+    git(&["add", "."]);
+    git(&["commit", "-q", "-m", "init"]);
+    git
+}
+
+#[test]
+fn worktrees_are_prepared_numbered_and_pruned_from_the_command_line() {
+    let env = Env::new("wtcli");
+    let repo = env.root.join("app");
+    let git = git_repo(
+        &repo,
+        &[
+            (".gitignore", ".env*\nsetup.log\n"),
+            (
+                ".kraal/worktree.toml",
+                "copy = [\".env*\"]\nsetup = ['echo \"$KRAAL_WORKTREE #$KRAAL_WORKTREE_INDEX on $PORT\" > setup.log']\n",
+            ),
+        ],
+    );
+    std::fs::write(repo.join(".env"), "A=1\n").unwrap();
+    std::fs::write(env.root.join("secret"), "private\n").unwrap();
+    std::os::unix::fs::symlink(env.root.join("secret"), repo.join(".env.prod")).unwrap();
+    let config = env.root.join("config/kraal/config.toml");
+    let mut text = std::fs::read_to_string(&config).unwrap();
+    text.push_str("\n[worktrees]\nport_base = 3000\n");
+    std::fs::write(&config, text).unwrap();
+    let wt = |args: &[&str]| env.cmd(&[&["wt"], args].concat()).current_dir(&repo).output().unwrap();
+    let text =
+        |out: &Output| format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    let dir = env.root.join("app.worktrees");
+
+    // Not approved yet, and nobody to ask: nothing is made.
+    let out = wt(&["new", "one"]);
+    assert!(!out.status.success() && text(&out).contains("--yes") && text(&out).contains("1. echo"), "{}", text(&out));
+    assert!(!dir.join("one").exists());
+    // Left as git makes it.
+    assert!(wt(&["new", "one", "--no-setup"]).status.success());
+    assert!(!dir.join("one/.env").exists());
+    // Approved: the files are copied, never through a link out of the repository, and the
+    // commands run with the worktree's number and port.
+    let out = wt(&["new", "two", "--yes"]);
+    assert!(out.status.success(), "{}", text(&out));
+    assert_eq!(std::fs::read_to_string(dir.join("two/setup.log")).unwrap(), "two #2 on 3020\n");
+    assert_eq!(std::fs::read_to_string(dir.join("two/.env")).unwrap(), "A=1\n");
+    assert!(!dir.join("two/.env.prod").exists());
+    assert!(text(&out).contains("not copied: .env.prod (a link out of the repository)"), "{}", text(&out));
+    // That version runs again without asking.
+    let out = wt(&["new", "three"]);
+    assert!(out.status.success(), "{}", text(&out));
+    assert_eq!(std::fs::read_to_string(dir.join("three/setup.log")).unwrap(), "three #3 on 3030\n");
+    // Changed: asked again. A failing command fails the command; the worktree stays.
+    std::fs::write(repo.join(".kraal/worktree.toml"), "setup = [\"exit 3\"]\n").unwrap();
+    git(&["commit", "-q", "-am", "fail"]);
+    assert!(!wt(&["new", "four"]).status.success());
+    assert!(!dir.join("four").exists());
+    let out = wt(&["new", "four", "--yes"]);
+    assert!(!out.status.success() && text(&out).contains("the setup of four failed (exit 3)"), "{}", text(&out));
+    assert!(dir.join("four").exists());
+    let list = String::from_utf8(wt(&["list"]).stdout).unwrap();
+    assert!(list.lines().any(|l| l.starts_with("two") && l.contains("#2")), "{list}");
+
+    // Merged and clean ones go; one with a change or a commit of its own stays, and says why.
+    std::fs::write(dir.join("three/notes.txt"), "draft\n").unwrap();
+    let in_two = |args: &[&str]| {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(dir.join("two"))
+            .args(["-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false"])
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    };
+    std::fs::write(dir.join("two/feature.txt"), "x\n").unwrap();
+    in_two(&["add", "feature.txt"]);
+    in_two(&["commit", "-q", "-m", "feature"]);
+    let out = wt(&["prune", "--dry-run"]);
+    let said = text(&out);
+    assert!(said.contains("would remove") && said.contains("kraal/one") && said.contains("kraal/four"), "{said}");
+    assert!(said.contains("kept three: it has 1 uncommitted change"), "{said}");
+    assert!(said.contains("kept two: it has 1 unmerged commit"), "{said}");
+    assert!(dir.join("one").exists(), "a dry run removes nothing");
+    let out = wt(&["prune"]);
+    assert!(out.status.success(), "{}", text(&out));
+    assert!(!dir.join("one").exists() && !dir.join("four").exists());
+    assert!(dir.join("two/feature.txt").exists() && dir.join("three/notes.txt").exists());
+    let list = String::from_utf8(wt(&["list"]).stdout).unwrap();
+    assert!(!list.contains("one") && list.contains("two") && list.contains("three"), "{list}");
+}
+
+/// From the agent picker: the worktree is made once its repository's setup is approved, the
+/// setup runs in the agent's pane, and the agent starts there with the worktree's number. A
+/// setup that fails leaves the agent waiting for Enter; a no makes nothing. Merged worktrees
+/// are then removed in one go, their panes closed.
+#[cfg(target_os = "linux")]
+#[test]
+fn an_agent_worktree_is_prepared_in_its_pane_once_trusted() {
+    let env = Env::new("wtsetup");
+    let repo = env.root.join("app");
+    let git = git_repo(
+        &repo,
+        &[
+            (".gitignore", ".env\n"),
+            (
+                ".kraal/worktree.toml",
+                "copy = [\".env\"]\nsetup = ['echo \"preparing $KRAAL_WORKTREE\"', \"test -f .env\"]\n",
+            ),
+        ],
+    );
+    std::fs::write(repo.join(".env"), "A=1\n").unwrap();
+    let bin = env.root.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    write_script(
+        &bin.join("claude"),
+        "#!/bin/sh\necho \"agent in $KRAAL_WORKTREE #$KRAAL_WORKTREE_INDEX port $PORT\"\nexec sleep 100\n",
+    );
+    let home = env.root.join("alpha-home");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::write(
+        env.root.join("config/kraal/accounts.toml"),
+        format!(
+            "[[account]]\nname = \"alpha\"\nagent = \"claude\"\nhome = {:?}\n\n[[rule]]\nworkspace = \"w\"\naccounts = [\"alpha\"]\n",
+            home.display().to_string()
+        ),
+    )
+    .unwrap();
+    let config = env.root.join("config/kraal/config.toml");
+    let mut text = std::fs::read_to_string(&config).unwrap();
+    text.push_str("\n[worktrees]\nport_base = 3000\n");
+    std::fs::write(&config, text).unwrap();
+    env.workspace("w", &format!("layout {{\n    pane name=\"shell\" cwd={:?}\n}}\n", repo.display().to_string()));
+    let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap_or_default());
+    let out = env.cmd(&["open", "w"]).env("PATH", &path).output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let mut client = RawClient::attach(&env, "w");
+    // The agent picker offers worktrees once git has seen the repository.
+    client.wait_for_screen("⎇ main");
+    let new_worktree = |client: &mut RawClient, name: &str| {
+        env.run(&["focus", "shell"]);
+        client.screen.lock().unwrap().clear();
+        client.send(b"\x02a");
+        client.wait_for_screen("in a new worktree");
+        client.send(b"claude in a new worktree");
+        std::thread::sleep(Duration::from_millis(200));
+        client.send(b"\r");
+        client.wait_for_screen("Name of the worktree");
+        client.send(name.as_bytes());
+        client.send(b"\r");
+        client.wait_for_screen("Trust the worktree setup");
+    };
+    let dir = env.root.join("app.worktrees");
+    // The pane comes once git has made the worktree.
+    let wait_for = |pane: &str, text: &str| -> String {
+        let start = Instant::now();
+        loop {
+            let out = env.try_run(&["read", "-p", pane]);
+            let screen = String::from_utf8_lossy(&out.stdout).into_owned();
+            if out.status.success() && screen.contains(text) {
+                return screen;
+            }
+            assert!(start.elapsed() < Duration::from_secs(15), "timed out waiting for {text:?} in {pane}:\n{screen}");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    };
+
+    new_worktree(&mut client, "feat");
+    assert!(!dir.join("feat").exists(), "nothing is made before the answer");
+    client.send(b"y");
+    let screen = wait_for("claude feat", "agent in feat #1 port 3010");
+    assert!(screen.contains("preparing feat") && screen.contains("copied from the main checkout: .env"), "{screen}");
+
+    std::fs::write(repo.join(".kraal/worktree.toml"), "setup = [\"echo about to fail\", \"exit 3\"]\n").unwrap();
+    git(&["commit", "-q", "-am", "fail"]);
+    new_worktree(&mut client, "bad");
+    client.send(b"y");
+    let screen = wait_for("claude bad", "Enter starts this anyway");
+    assert!(screen.contains("about to fail") && !screen.contains("agent in"), "{screen}");
+    env.run(&["focus", "claude bad"]);
+    client.send(b"\r");
+    wait_for("claude bad", "agent in bad #2 port 3020");
+
+    std::fs::write(repo.join(".kraal/worktree.toml"), "setup = [\"echo changed\"]\n").unwrap();
+    git(&["commit", "-q", "-am", "changed"]);
+    new_worktree(&mut client, "no");
+    client.screen.lock().unwrap().clear();
+    client.send(b"n");
+    client.wait_for_screen("was not created");
+    assert!(!dir.join("no").exists());
+
+    // Both worktrees have nothing to lose: they go, with their agents' panes.
+    env.run(&["focus", "shell"]);
+    client.screen.lock().unwrap().clear();
+    client.send(b"\x02Rg");
+    client.wait_for_screen("Remove merged worktrees");
+    client.send(b"\r");
+    client.wait_for_screen("Closes these panes");
+    client.send(b"y");
+    let start = Instant::now();
+    while dir.join("feat").exists() || dir.join("bad").exists() {
+        assert!(start.elapsed() < Duration::from_secs(15), "the merged worktrees are still there");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let panes = env.run(&["panes"]);
+    assert!(!panes.contains("claude feat") && !panes.contains("claude bad"), "{panes}");
+
+    // From the command line inside the session: prepared there, and the agent opened in the
+    // session gets the worktree's number (the first, free again).
+    let socket = env.root.join("run/kraal/wtsetup.sock");
+    let out = env
+        .cmd(&["wt", "new", "cli", "--agent", "claude", "--yes"])
+        .env("PATH", &path)
+        .env("KRAAL_SOCKET", &socket)
+        .current_dir(&repo)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(String::from_utf8_lossy(&out.stdout).contains("changed"), "the setup ran there");
+    wait_for("claude", "agent in cli #1 port 3010");
+}
+
 #[test]
 fn closing_or_adding_tabs_keeps_the_one_shown() {
     let env = Env::new("tabs");

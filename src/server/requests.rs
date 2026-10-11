@@ -267,25 +267,34 @@ impl Server {
                     Err(e) => return Some(Err(e)),
                 };
                 // The account rules may depend on which repository the directory belongs to (a
-                // worktree anywhere counts as its repository): git is asked first, off the loop,
+                // worktree anywhere counts as its repository), and a kraal worktree not seen yet
+                // gives its number to the agent's variables: git is asked first, off the loop,
                 // and the agent starts once it has answered.
-                if account.is_none() {
-                    let ws = self.agent_workspace(near);
-                    let dir = ws.and_then(|ws| self.agent_cwd(ws, near, cwd.clone()));
-                    if let Some(dir) = dir.filter(|d| self.accounts.undecided(&agent, Some(d))) {
-                        self.background(
-                            move || {
-                                crate::git::project_path(&dir);
-                            },
-                            move |server, ()| {
-                                let result = server.open_agent(near, &agent, None, placement, cwd, &args);
-                                server.send_msg(client, &ServerMsg::Response { result });
-                                server.clients.remove(&client);
-                                server.drop_empty_workspaces();
-                            },
-                        );
-                        return None;
-                    }
+                let ws = self.agent_workspace(near);
+                let dir = ws.and_then(|ws| self.agent_cwd(ws, near, cwd.clone()));
+                let undecided =
+                    account.is_none() && dir.as_ref().is_some_and(|d| self.accounts.undecided(&agent, Some(d)));
+                let new_worktree = dir
+                    .as_ref()
+                    .is_some_and(|d| crate::worktree_setup::in_worktrees_dir(d) && !self.git.contains_key(d));
+                if let Some(dir) = dir.filter(|_| undecided || new_worktree) {
+                    self.background(
+                        move || {
+                            crate::git::project_path(&dir);
+                            let info = new_worktree.then(|| crate::git::status(&dir)).flatten();
+                            (dir, info)
+                        },
+                        move |server, (dir, info)| {
+                            if info.is_some() {
+                                server.git_result(dir, info.map(Box::new));
+                            }
+                            let result = server.open_agent(near, &agent, account.as_deref(), placement, cwd, &args);
+                            server.send_msg(client, &ServerMsg::Response { result });
+                            server.clients.remove(&client);
+                            server.drop_empty_workspaces();
+                        },
+                    );
+                    return None;
                 }
                 self.open_agent(near, &agent, account.as_deref(), placement, cwd, &args)
             }

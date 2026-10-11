@@ -112,7 +112,10 @@ impl Server {
         let Some(session) = session.or(reserved) else { return (spec.clone(), exact) };
         match self.agent_spec(&a, spec.cwd.clone(), Some(session), &args) {
             Ok(fresh) => {
-                (PaneSpec { worktree: spec.worktree.clone(), close_on_exit: spec.close_on_exit, ..fresh }, exact)
+                let mut fresh =
+                    PaneSpec { worktree: spec.worktree.clone(), close_on_exit: spec.close_on_exit, ..fresh };
+                crate::worktree_setup::carry_env(&spec.env, &mut fresh.env);
+                (fresh, exact)
             }
             Err(_) => (spec.clone(), false),
         }
@@ -257,7 +260,8 @@ impl Server {
             // The options carry over; a prompt given on the command line is not sent again.
             let (args, exact) = accounts::resumable_args(kind, &accounts::launch_args(kind, &p.spec.command))
                 .context("a one-shot run (-p, exec) is not a conversation to continue")?;
-            let spec = PaneSpec { worktree, ..self.agent_spec(&to, cwd, resume.as_deref(), &args)? };
+            let mut spec = PaneSpec { worktree, ..self.agent_spec(&to, cwd, resume.as_deref(), &args)? };
+            crate::worktree_setup::carry_env(&p.spec.env, &mut spec.env);
             if !exact {
                 return self.suspend_pane(pane, spec, AMBIGUOUS);
             }

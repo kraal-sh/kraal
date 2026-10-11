@@ -109,11 +109,10 @@ pub enum ConfirmAction {
         label: String,
         script: String,
     },
-    /// Remove exactly this worktree, if it is still in the state the user was shown.
-    RemoveWorktree {
-        worktree: crate::git::Worktree,
-        state: crate::git::WorktreeState,
-    },
+    /// Remove exactly these worktrees, those still in the state the user was shown.
+    RemoveWorktrees(Vec<(crate::git::Worktree, crate::git::WorktreeState)>),
+    /// Trust this version of a repository's worktree setup, then make the worktree.
+    TrustWorktreeSetup(Box<crate::server::worktrees::NewWorktree>),
     /// Start a tool on a production pane.
     RunTool {
         pane: Option<PaneId>,
@@ -158,7 +157,9 @@ impl ConfirmAction {
                 l
             }
             ConfirmAction::SwitchAccount { .. } => "Switch account".into(),
-            ConfirmAction::RemoveWorktree { .. } => "Remove worktree".into(),
+            ConfirmAction::RemoveWorktrees(list) if list.len() == 1 => "Remove worktree".into(),
+            ConfirmAction::RemoveWorktrees(_) => "Remove worktrees".into(),
+            ConfirmAction::TrustWorktreeSetup(_) => "Trust this version".into(),
             ConfirmAction::RunTool { .. } => "Run tool".into(),
             ConfirmAction::TrustRunbook => "Trust this version".into(),
             ConfirmAction::RunRunbook => "Run".into(),
@@ -169,7 +170,7 @@ impl ConfirmAction {
 
     /// Production is involved, or the action destroys something.
     pub fn danger(&self, message: &str) -> bool {
-        matches!(self, ConfirmAction::Production { .. } | ConfirmAction::RemoveWorktree { .. })
+        matches!(self, ConfirmAction::Production { .. } | ConfirmAction::RemoveWorktrees(_))
             || matches!(self, ConfirmAction::Job { label, .. } if label == "delete" || label.contains("replace"))
             || message.contains("PRODUCTION")
             || message.contains(" is production (")

@@ -336,8 +336,9 @@ pub enum TunnelCmd {
 
 #[derive(Subcommand)]
 pub enum WtCmd {
-    /// Create a worktree from the current repository; with --agent, start that agent in it
-    /// (in a new tab inside kraal).
+    /// Create a worktree from the current repository and prepare it (.kraal/worktree.toml and
+    /// [worktrees] in the config: files copied, setup commands); with --agent, start that agent
+    /// in it (in a new tab inside kraal).
     New {
         name: String,
         #[arg(long)]
@@ -345,8 +346,14 @@ pub enum WtCmd {
         /// Branch to start from (default: the current one).
         #[arg(long)]
         base: Option<String>,
+        /// Trust the repository's setup commands without asking, when they are new or changed.
+        #[arg(long)]
+        yes: bool,
+        /// Copy nothing and run no setup command.
+        #[arg(long)]
+        no_setup: bool,
     },
-    /// List this repository's kraal worktrees.
+    /// List this repository's kraal worktrees, with their number.
     List,
     /// Remove a worktree and delete its branch.
     Rm {
@@ -354,6 +361,13 @@ pub enum WtCmd {
         /// Even with uncommitted changes or an unmerged branch.
         #[arg(long)]
         force: bool,
+    },
+    /// Remove the worktrees merged into their base and clean (no changes, every commit in their
+    /// base), with their branches; says why the others stay.
+    Prune {
+        /// Only say what would be removed.
+        #[arg(long)]
+        dry_run: bool,
     },
 }
 

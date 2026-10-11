@@ -659,7 +659,11 @@ impl Server {
             rows.push(SideRow::Blank);
             rows.push(SideRow::Section("PORTS"));
             for (port, pane) in &self.ports {
-                let name = self.panes.get(pane).map(|p| p.display_name()).unwrap_or_default();
+                let mut name = self.panes.get(pane).map(|p| p.display_name()).unwrap_or_default();
+                // Which worktree it serves, when that is not the pane's name already.
+                if let Some(wt) = self.pane_worktree_name(*pane).filter(|w| !name.split_whitespace().any(|n| n == w)) {
+                    name = format!("{name}{sep}{wt}");
+                }
                 let icon = t.icon(AgentState::Working);
                 entry(
                     &mut rows,
