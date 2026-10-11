@@ -2882,6 +2882,10 @@ mod tests {
 
     #[test]
     fn a_retried_directory_copy_takes_its_name_once() {
+        // Without GNU mv 8.30 (macOS, BSD) a directory is refused before anything is put.
+        if !mv_keeps_here() {
+            return;
+        }
         let t = Tmp::new("retry-dir");
         t.write("in/tree/a", "a");
         t.write("in/tree/sub/b", "b");

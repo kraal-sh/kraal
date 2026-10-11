@@ -460,6 +460,8 @@ mod tests {
         }
         let dir = std::env::temp_dir().join(format!("kraal-gitfiles-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir = dir.canonicalize().unwrap();
         let repo = dir.join("repo");
         std::fs::create_dir_all(&repo).unwrap();
         let git = |args: &[&str]| {
@@ -509,6 +511,8 @@ mod tests {
             return;
         }
         let dir = std::env::temp_dir().join(format!("kraal-git-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir = dir.canonicalize().unwrap();
         let repo = dir.join("app");
         std::fs::create_dir_all(&repo).unwrap();
         let run = |args: &[&str]| {

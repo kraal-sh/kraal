@@ -348,7 +348,7 @@ impl Server {
 mod tests {
     #[test]
     fn choices_are_listed_where_asked_or_not_at_all() {
-        let gone = std::env::temp_dir().join(format!("kraal-gone-{}", std::process::id()));
+        let gone = std::env::temp_dir().join(format!("kraal-choices-gone-{}", std::process::id()));
         let refused = super::list_choices("pwd", Some(&gone), &[]).unwrap_err().to_string();
         assert!(refused.contains("does not exist"), "{refused}");
         let here = std::env::temp_dir().canonicalize().unwrap();

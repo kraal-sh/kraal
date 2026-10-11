@@ -523,7 +523,12 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let pidfile = dir.join("pid");
         // A wrapper that starts a daemon (out of its group, session and tree) and exits at once.
-        let script = format!("setsid sh -c 'echo $$ > {}; exec sleep 30' & exit 0", pidfile.display());
+        let script = format!(
+            "daemon() {{ if command -v setsid >/dev/null; then setsid sh -c 'echo $$ > {f}; exec sleep 30'; \
+             else perl -MPOSIX -e 'POSIX::setsid(); open(F, \">{f}\"); print F $$; close F; exec \"sleep\", \"30\"'; fi; }}; \
+             daemon & exit 0",
+            f = pidfile.display()
+        );
         let tag = format!("test-{}", std::process::id());
         let mut child = own_group(&mut sh(&script)).env(TAG, &tag).stdin(Stdio::null()).spawn().unwrap();
         child.wait().unwrap();

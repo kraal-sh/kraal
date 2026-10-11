@@ -708,7 +708,13 @@ mod tests {
             let out = child.wait_with_output().unwrap();
             let all = String::from_utf8_lossy(&out.stdout).into_owned() + &String::from_utf8_lossy(&out.stderr);
             assert!(all.contains("\x1b]133;A\x07"), "{shell}: {all:?}");
-            assert!(all.contains("\x1b]133;C\x07"), "{shell}: {all:?}");
+            // Bash marks where output starts from 4.4 on (PS0); macOS ships 3.2.
+            let old_bash = shell == "bash"
+                && std::process::Command::new("bash")
+                    .args(["-c", "(( BASH_VERSINFO[0] * 100 + BASH_VERSINFO[1] < 404 ))"])
+                    .status()
+                    .is_ok_and(|s| s.success());
+            assert!(old_bash || all.contains("\x1b]133;C\x07"), "{shell}: {all:?}");
             assert!(all.contains("\x1b]133;D;1\x07"), "{shell}: {all:?}");
             assert!(!all.contains("syntax error") && !all.contains("parse error"), "{shell}: {all:?}");
             let _ = std::fs::remove_dir_all(dir);

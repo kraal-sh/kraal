@@ -666,8 +666,11 @@ mod tests {
         while group_running(pgid) && start.elapsed() < std::time::Duration::from_secs(5) {
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
-        // SAFETY: signal 0 only checks the group still has a member.
-        assert_eq!(unsafe { libc::kill(-pgid, 0) }, 0, "the zombie is still in its group");
+        // SAFETY: signal 0 only checks the group still has a member. Linux counts the zombie
+        // leader as one; macOS does not.
+        if cfg!(target_os = "linux") {
+            assert_eq!(unsafe { libc::kill(-pgid, 0) }, 0, "the zombie is still in its group");
+        }
         assert!(!group_running(pgid));
         child.wait().unwrap();
         assert!(!group_running(pgid));
