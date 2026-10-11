@@ -1310,8 +1310,16 @@ fn runbooks_run_locally_and_on_servers() {
         text.contains("cut-started") && text.contains("interrupted") && text.contains("unfinished: this machine"),
         "{text}"
     );
-    let left: Vec<_> = std::fs::read_dir(&runs).unwrap().filter_map(|e| e.ok()).map(|e| e.file_name()).collect();
-    assert!(left.iter().all(|n| n.to_string_lossy().ends_with(".log")), "{left:?}");
+    // The restarted server may be writing its run ledger (a temporary file, then a rename).
+    let start = Instant::now();
+    loop {
+        let left: Vec<_> = std::fs::read_dir(&runs).unwrap().filter_map(|e| e.ok()).map(|e| e.file_name()).collect();
+        if left.iter().all(|n| n.to_string_lossy().ends_with(".log")) {
+            break;
+        }
+        assert!(start.elapsed() < Duration::from_secs(5), "{left:?}");
+        std::thread::sleep(Duration::from_millis(50));
+    }
 }
 
 /// Keys typed while the runbooks are being listed go to the list, not to the shell under it.
