@@ -62,7 +62,7 @@ kraal is a multiplexer in the tradition of tmux and Zellij that runs inside your
 kraal is a single Rust binary. Linux is the primary target; macOS should work.
 
 ```sh
-cargo install --path .        # from a checkout
+cargo install --git https://github.com/kraal-sh/kraal
 kraal                         # start (or attach to) the default session
 ```
 
