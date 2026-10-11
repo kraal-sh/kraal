@@ -510,9 +510,19 @@ impl Server {
             }
             buf.set_line(area.x, y, &line, inner_w);
         }
-        for y in area.y..area.y + area.height {
+        // Next to pane frames, the line starts and stops half a cell in, level with their top and
+        // bottom edges, instead of running past their rounded corners.
+        let framed = self.config.pane_frames && !th().ascii && th().frames != crate::theme::Frames::Ascii;
+        let last = area.y + area.height - 1;
+        for y in area.y..=last {
+            let symbol = match y {
+                _ if !framed || area.height < 2 => th().vline(),
+                y if y == area.y => "╷",
+                y if y == last => "╵",
+                _ => th().vline(),
+            };
             if let Some(cell) = buf.cell_mut((area.x + area.width - 1, y)) {
-                cell.set_symbol(th().vline()).set_fg(th().dim);
+                cell.set_symbol(symbol).set_fg(th().dim);
             }
         }
     }
