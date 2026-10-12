@@ -104,7 +104,8 @@ fn act(rng: &mut Rng, f: &mut Fixture, recent: &[u8]) {
             p.rest();
         }
         2 => p.scroll(rng.range(0, 60) as i32 - 30),
-        3 => p.scroll(rng.number() as i32),
+        // Farther than kraal ever scrolls at once (lines, pages, halves of the screen).
+        3 => p.scroll((rng.number() % 200_000) as i32 - 100_000),
         4 => p.scroll_page(rng.one_in(2)),
         5 => {
             if rng.one_in(2) {
