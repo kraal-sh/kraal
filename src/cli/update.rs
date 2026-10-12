@@ -110,21 +110,29 @@ fn version_of(tag: &str) -> &str {
 /// The package manager that owns `exe`, if any: it would put its own copy back.
 fn package_manager(exe: &Path) -> Option<&'static str> {
     let path = exe.to_string_lossy();
-    let cargo_bin = std::env::var_os("CARGO_HOME")
-        .map(PathBuf::from)
-        .or_else(|| dirs::home_dir().map(|h| h.join(".cargo")))
-        .map(|c| c.join("bin"));
     if path.contains("/Cellar/") || path.contains("/homebrew/") {
         Some("Homebrew: update it there")
     } else if path.starts_with("/nix/store/") {
         Some("Nix: update it there")
     } else if path.starts_with("/usr/bin/") {
         Some("your system's package manager: update it there")
-    } else if cargo_bin.is_some_and(|bin| exe.parent() == Some(bin.as_path())) {
+    } else if installed_by_cargo(exe) {
         Some("Cargo: update it with cargo install kraal")
     } else {
         None
     }
+}
+
+/// Whether Cargo installed `exe`: the root it installs into (the folder above `bin`) records it
+/// in `.crates.toml`, whatever that root (`cargo install --root`) and however it is reached.
+fn installed_by_cargo(exe: &Path) -> bool {
+    let Some(name) = exe.file_name().and_then(|n| n.to_str()) else { return false };
+    let Some(root) = exe.parent().filter(|bin| bin.ends_with("bin")).and_then(Path::parent) else { return false };
+    let Ok(records) = std::fs::read_to_string(root.join(".crates.toml")) else { return false };
+    let Ok(records) = records.parse::<toml::Table>() else { return false };
+    // `[v1]`: each package installed, with the programs it put in `bin`.
+    let Some(v1) = records.get("v1").and_then(toml::Value::as_table) else { return false };
+    v1.values().filter_map(toml::Value::as_array).flatten().any(|program| program.as_str() == Some(name))
 }
 
 fn fetch(url: &str, to: &Path) -> Result<()> {
@@ -204,11 +212,31 @@ mod tests {
             package_manager(Path::new("/opt/homebrew/Cellar/kraal/0.1.0/bin/kraal")),
             Some("Homebrew: update it there")
         );
-        let home = dirs::home_dir().unwrap();
-        if std::env::var_os("CARGO_HOME").is_none() {
-            let cargo = home.join(".cargo/bin/kraal");
-            assert_eq!(package_manager(&cargo), Some("Cargo: update it with cargo install kraal"));
-        }
         assert_eq!(package_manager(Path::new("/home/me/.local/bin/kraal")), None);
+    }
+
+    #[test]
+    fn a_kraal_cargo_installed_is_left_to_cargo_wherever_it_is() {
+        let root = std::env::temp_dir().join(format!("kraal-cargo-root-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        // `cargo install --root <root>/local kraal`, beside another program Cargo installed.
+        let local = root.join("local");
+        std::fs::create_dir_all(local.join("bin")).unwrap();
+        let exe = local.join("bin/kraal");
+        std::fs::write(&exe, "").unwrap();
+        assert_eq!(package_manager(&exe), None, "nothing says Cargo installed it");
+        let records = |more: &str| {
+            let rg = "\"ripgrep 14.1.0 (registry+https://github.com/rust-lang/crates.io-index)\" = [\"rg\"]";
+            std::fs::write(local.join(".crates.toml"), format!("[v1]\n{rg}\n{more}")).unwrap();
+        };
+        records("");
+        assert_eq!(package_manager(&exe), None, "Cargo installed another program there");
+        records("\"kraal 0.2.0 (registry+https://github.com/rust-lang/crates.io-index)\" = [\"kraal\"]\n");
+        let cargo = Some("Cargo: update it with cargo install kraal");
+        assert_eq!(package_manager(&exe), cargo);
+        // Reached through a link to that root, as a Cargo home that is a link may be.
+        std::os::unix::fs::symlink(&local, root.join("link")).unwrap();
+        assert_eq!(package_manager(&root.join("link/bin/kraal")), cargo);
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
