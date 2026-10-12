@@ -703,6 +703,11 @@ impl Pane {
         }
     }
 
+    /// Whether the program asked for every pointer motion (mode 1003).
+    pub fn wants_pointer_motion(&self) -> bool {
+        self.term().is_some_and(|t| t.term.mode().contains(TermMode::MOUSE_MOTION))
+    }
+
     pub fn wants_mouse(&self) -> bool {
         self.term().is_some_and(|t| t.term.mode().intersects(TermMode::MOUSE_MODE))
     }

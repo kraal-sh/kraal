@@ -529,6 +529,8 @@ pub struct Server {
     focus_reported: std::collections::HashSet<PaneId>,
     /// The other panes' turn at output was skipped for a frame due (see `pump_output`).
     turn_skipped: bool,
+    /// What a client typed last only went to programs (see `client_events`).
+    typed_quietly: bool,
     /// Counts what may have changed what the chrome (bars, sidebar, frames) shows, besides the
     /// panes' output: everything but output read and keys that only went to programs.
     chrome_gen: u64,
@@ -736,6 +738,7 @@ pub fn run(session: &str) -> Result<()> {
         held_input: Vec::new(),
         sidebar_was_useful: false,
         turn_skipped: false,
+        typed_quietly: false,
         chrome_gen: 0,
         facts: Default::default(),
         broadcast_tip_shown: false,
@@ -1300,8 +1303,10 @@ impl Server {
     /// yet: its output is read, and the focus followed, later in the loop.
     fn handle_and_follow(&mut self, ev: Event) {
         let wake_up = matches!(ev, Event::PaneReady(_));
+        self.typed_quietly = false;
         self.handle(ev);
-        if !wake_up {
+        // Output, and keys that only went to programs, move no focus.
+        if !wake_up && !std::mem::take(&mut self.typed_quietly) {
             self.follow_focus();
         }
     }

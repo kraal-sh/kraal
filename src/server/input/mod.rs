@@ -99,6 +99,7 @@ impl Server {
         if !quiet {
             self.chrome_changed();
         }
+        self.typed_quietly = quiet;
     }
 
     /// Act on one thing a client typed: whether it only went to programs, changing nothing on
@@ -196,7 +197,9 @@ impl Server {
             }
         }
         // Each key may move the focus: a pane left and found again in one read is told both.
-        self.follow_focus();
+        if shown {
+            self.follow_focus();
+        }
         !shown
     }
 
@@ -511,6 +514,12 @@ impl Server {
     /// first when they would reach production panes not approved yet: then all of them wait for
     /// the answer, as one.
     fn send_to_targets(&mut self, focused: PaneId, targets: &[PaneId], items: Vec<InputItem>) -> Mode {
+        // Keys typed into one's own pane alone are never asked about (see `production_guard`):
+        // no context needs looking at for them.
+        if targets.iter().all(|t| *t == focused) && !items.iter().any(|i| matches!(i, InputItem::Paste(_))) {
+            self.send_items(targets, items);
+            return Mode::Normal;
+        }
         let named = targets.iter().map(|t| (*t, self.pane_production(*t))).collect();
         let pending = PendingInput { items, targets: named };
         if let Some(ask) = self.production_guard(focused, targets, &pending) {

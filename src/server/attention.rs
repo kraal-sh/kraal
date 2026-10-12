@@ -51,13 +51,13 @@ impl Server {
     /// terminal has the focus shows it. Each terminal's keyboard level follows its client's mode
     /// too ([`Server::follow_keyboard`]).
     pub(super) fn follow_focus(&mut self) {
-        let shown: std::collections::HashSet<PaneId> = self
-            .clients
-            .values()
-            .filter(|c| c.attached && c.terminal_focused)
-            .filter_map(|c| self.client_focus(c.id))
-            .collect();
-        if shown != self.focus_reported {
+        let shown = || {
+            self.clients.values().filter(|c| c.attached && c.terminal_focused).filter_map(|c| self.client_focus(c.id))
+        };
+        let same = shown().all(|p| self.focus_reported.contains(&p))
+            && self.focus_reported.iter().all(|p| shown().any(|q| q == *p));
+        if !same {
+            let shown: std::collections::HashSet<PaneId> = shown().collect();
             for p in self.focus_reported.difference(&shown).copied().collect::<Vec<_>>() {
                 self.report_focus(p, false);
             }
@@ -66,23 +66,32 @@ impl Server {
             }
             self.focus_reported = shown;
         }
-        let ids: Vec<ClientId> = self.clients.values().filter(|c| c.attached).map(|c| c.id).collect();
-        for id in ids {
-            let wants = self.config.mouse
-                && matches!(self.clients[&id].mode, super::ui::Mode::Normal)
-                && self.client_focus(id).and_then(|p| self.panes.get(&p)).is_some_and(|p| p.input_modes().mouse_motion);
+        // The clients whose terminal must report pointer motion, or stop.
+        let motion: Vec<(ClientId, bool)> = self
+            .clients
+            .values()
+            .filter(|c| c.attached)
+            .filter_map(|c| {
+                let wants = self.config.mouse
+                    && matches!(c.mode, super::ui::Mode::Normal)
+                    && self
+                        .client_focus(c.id)
+                        .and_then(|p| self.panes.get(&p))
+                        .is_some_and(|p| p.wants_pointer_motion());
+                (c.pointer_motion != wants).then_some((c.id, wants))
+            })
+            .collect();
+        for (id, wants) in motion {
             let Some(c) = self.clients.get_mut(&id) else { continue };
-            if c.pointer_motion != wants {
-                // Leaving 1003 stops tracking altogether: back to 1002 (motion with a button held).
-                let mode: &[u8] = match (wants, self.config.mouse) {
-                    (true, _) => b"\x1b[?1003h",
-                    (false, true) => b"\x1b[?1003l\x1b[?1002h",
-                    (false, false) => b"\x1b[?1003l",
-                };
-                // Recorded once on its way only: a full queue means trying again next time.
-                if c.out.try_send(frame_bytes(mode)).is_ok() {
-                    c.pointer_motion = wants;
-                }
+            // Leaving 1003 stops tracking altogether: back to 1002 (motion with a button held).
+            let mode: &[u8] = match (wants, self.config.mouse) {
+                (true, _) => b"\x1b[?1003h",
+                (false, true) => b"\x1b[?1003l\x1b[?1002h",
+                (false, false) => b"\x1b[?1003l",
+            };
+            // Recorded once on its way only: a full queue means trying again next time.
+            if c.out.try_send(frame_bytes(mode)).is_ok() {
+                c.pointer_motion = wants;
             }
         }
         self.follow_keyboard();
