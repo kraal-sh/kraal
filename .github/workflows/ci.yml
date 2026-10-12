@@ -21,6 +21,8 @@ jobs:
           components: rustfmt, clippy
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
+      # The scripts people run: the runner's image has shellcheck, the macOS one does not.
+      - run: shellcheck install.sh tests/compat.sh examples/scripts/*.sh
       - run: cargo test
 
   macos:
