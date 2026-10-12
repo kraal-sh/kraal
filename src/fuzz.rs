@@ -680,3 +680,178 @@ pub fn sixel(rng: &mut Rng, out: &mut Vec<u8>) {
     }
     out.extend_from_slice(rng.one_of(&[&b"\x1b\\"[..], b"\x1b\\", b"\x18", b"\x07", b""]));
 }
+
+/// The files kraal reads (the config, the server inventory, the accounts, runbooks, a
+/// worktree's setup, the paste buffers, a saved session, kubeconfigs), as written or damaged any
+/// way: read without a panic, and what is read used as kraal uses it.
+#[cfg(test)]
+mod files {
+    use super::{Rng, run};
+
+    const TOKENS: &[&[u8]] = &[
+        b"\n",
+        b"=",
+        b"[",
+        b"]",
+        b"\"",
+        b"{",
+        b"}",
+        b",",
+        b"#",
+        b"[[servers]]",
+        b"\nname = \"x\"",
+        b"-1",
+        b"99999999999999999999",
+        b"true",
+        b"'''",
+        b"\\u0000",
+        b"null",
+        b":",
+        b"\n  - ",
+    ];
+
+    fn damaged(rng: &mut Rng, sample: &str) -> String {
+        let mut text = sample.as_bytes().to_vec();
+        for _ in 0..rng.range(0, 3) {
+            rng.mutate(&mut text, TOKENS);
+        }
+        String::from_utf8_lossy(&text).into_owned()
+    }
+
+    /// A file holding `text`, named with `extension`.
+    fn temp_file(text: &str, extension: &str) -> std::path::PathBuf {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!("kraal-fuzz-{}-{n}.{extension}", std::process::id()));
+        std::fs::write(&path, text).unwrap();
+        path
+    }
+
+    #[test]
+    fn fuzz_files_config() {
+        run("files_config", 100, |rng| {
+            let user = damaged(
+                rng,
+                "scrollback = 500\nshell = \"zsh\"\n[graphics]\nquota_mb = 0\n[worktrees]\ncopy = [\".env\"]\nsetup = [\"npm ci\"]\n",
+            );
+            let _ = crate::config::Config::from_user_toml(&user);
+            let _ = crate::config::Config::from_user_toml(&damaged(rng, crate::config::DEFAULT_CONFIG));
+        });
+    }
+
+    #[test]
+    fn fuzz_files_servers() {
+        run("files_servers", 100, |rng| {
+            let text = damaged(
+                rng,
+                "[[servers]]\nname = \"web-1\"\nhost = \"10.0.0.1\"\nuser = \"deploy\"\nport = 2222\njump = \"bastion\"\ngroup = \"prod\"\n\n[[servers]]\nname = \"bastion\"\nhost = \"b.example.net\"\nidentities = [\"~/.ssh/id\"]\n",
+            );
+            let path = temp_file(&text, "toml");
+            if let Ok(inv) = crate::servers::Inventory::load_from(&path) {
+                let known = crate::servers::known(&inv, &[], &["h".into()]);
+                for k in &known {
+                    let _ = crate::servers::ssh_args(&k.server, &known, rng.one_in(2));
+                    let _ = k.server.destination();
+                }
+                let _ = crate::servers::groups(&known);
+                let _ = crate::servers::resolve(&known, &damaged(rng, "deploy@web-1:2222"));
+            }
+            let _ = std::fs::remove_file(&path);
+            let words: Vec<String> =
+                damaged(rng, "-p 2222 -J bastion -i key deploy@web-1 ls -l").split(' ').map(String::from).collect();
+            let _ = crate::servers::parse_ssh_args(&words);
+            let _ = crate::servers::ssh_runs_command(&words);
+            let _ = crate::servers::parse_destination(&damaged(rng, "user@[::1]:22"));
+        });
+    }
+
+    #[test]
+    fn fuzz_files_accounts() {
+        run("files_accounts", 100, |rng| {
+            let text = damaged(
+                rng,
+                "[[claude]]\nname = \"work\"\nhome = \"~/.claude-work\"\n\n[[codex]]\nname = \"me\"\n\n[[rules]]\nworkspace = \"api*\"\nagent = \"claude\"\naccounts = [\"work\"]\n",
+            );
+            let path = temp_file(&text, "toml");
+            if let Ok(accounts) = crate::accounts::Accounts::load_from(&path) {
+                let _ = format!("{accounts:?}");
+            }
+            let _ = std::fs::remove_file(&path);
+        });
+    }
+
+    #[test]
+    fn fuzz_files_runbooks() {
+        run("files_runbooks", 100, |rng| {
+            let steps = damaged(
+                rng,
+                "description = \"x\"\nshell = \"bash\"\ntimeout = \"10m\"\nsteps = [\"echo $NAME\", \"ls\"]\n[[params]]\nname = \"NAME\"\nsecret = true\n",
+            );
+            let md =
+                damaged(rng, "# Deploy\n\nSome text.\n\n```bash\nmake deploy\n```\n\n```console\n$ ls\nfile\n```\n");
+            for path in [temp_file(&steps, "toml"), temp_file(&md, "md")] {
+                if let Ok(runbook) = crate::runbooks::load(&path, crate::runbooks::Source::User) {
+                    let _ = runbook.description();
+                    if let crate::runbooks::Body::Steps(s) = &runbook.body {
+                        let _ = s.timeout();
+                        let _ = crate::runbooks::script(&s.steps, s.stop_on_failure);
+                    }
+                }
+                let _ = std::fs::remove_file(&path);
+            }
+            let _ = crate::worktree_setup::Setup::parse(&damaged(
+                rng,
+                "copy = [\".env\", \"config/*.local\"]\nsetup = [\"npm ci\"]\n",
+            ));
+        });
+    }
+
+    #[test]
+    fn fuzz_files_buffers() {
+        run("files_buffers", 100, |rng| {
+            let mut buffers = crate::buffers::Buffers::new(rng.range(0, 50), rng.range(0, 1 << 20));
+            let saved = damaged(
+                rng,
+                "{\"version\":1,\"buffers\":[{\"name\":\"a\",\"text\":\"hello\",\"id\":3},{\"name\":null,\"text\":\"x\"}]}",
+            );
+            let _ = buffers.load_json(saved.as_bytes());
+            let _ = buffers.to_json();
+        });
+    }
+
+    #[test]
+    fn fuzz_files_session() {
+        run("files_session", 100, |rng| {
+            let snap = damaged(
+                rng,
+                r#"{"version":1,"revision":1,"workspaces":[{"name":"w","definition":null,"cwd":"/tmp","active":3,"tabs":[{"name":"t","root":{"Split":{"axis":"Row","children":[[{"Pane":{"name":null,"spec":{"command":["ssh","h"]},"agent":"claude","agent_session":"a b","scrollback":"1-2-3.ans"}},1.0],[{"Pane":{"name":"x","spec":{},"agent":null,"agent_session":null,"scrollback":"../x"}},-2.0]],"stacked":true,"open":7}},"floating":[],"focus":9,"show_floating":true,"zoomed":true,"sync":false}]}]}"#,
+            );
+            if let Ok(snap) = serde_json::from_str::<crate::persist::SessionSnapshot>(&snap) {
+                let _ = crate::persist::scrollback_files(&snap);
+                for ws in &snap.workspaces {
+                    for t in &ws.tabs {
+                        for (p, rect) in &t.floating {
+                            let _ = rect.to_rect(ratatui::layout::Rect::new(
+                                0,
+                                0,
+                                rng.below(300) as u16,
+                                rng.below(100) as u16,
+                            ));
+                            let _ = crate::persist::resume_command(
+                                p.agent.as_deref().unwrap_or(""),
+                                p.agent_session.as_deref().unwrap_or(""),
+                            );
+                        }
+                    }
+                }
+            }
+            let contexts = damaged(rng, "k8s=prod;ns=web;tf=;aws=ops");
+            let _ = crate::context::RemoteContexts::parse(&contexts);
+            let kube = damaged(
+                rng,
+                "apiVersion: v1\ncurrent-context: prod\ncontexts:\n- name: prod\n  context:\n    cluster: c\n    namespace: web\n",
+            );
+            let _ = crate::context::parse_kubeconfig(&kube);
+        });
+    }
+}
