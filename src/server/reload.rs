@@ -5,7 +5,8 @@ use crate::config::Config;
 use crate::keymap::Keymap;
 
 impl Server {
-    /// Read the configuration again and apply it: keys, theme, sidebar, mouse, pane frames,
+    /// Read the configuration again and apply it: keys, theme, sidebar, bottom bar (when its
+    /// setting changed: a toggle for the session holds until then), mouse, pane frames,
     /// notifications, tools, hints, hooks, production words, contexts, saving scrollback and the
     /// paste buffers' limits and file. Panes
     /// already open keep their shell and scrollback length; new panes take the new ones. When the
@@ -37,10 +38,13 @@ impl Server {
                 let _ = c.out.try_send(frame_bytes(modes.as_bytes()));
             }
         }
+        if config.bar.keys != self.config.bar.keys {
+            self.bottom_bar = config.bar.keys != crate::config::BarKeys::Off;
+        }
         let persisted = self.config.buffers.persist;
         self.config = config;
         self.reconfigure_buffers(persisted);
-        // Workspace folders, the sidebar's width and pane frames may have changed.
+        // Workspace folders, the sidebar's width, the bottom bar and pane frames may have changed.
         self.scan_definitions();
         self.relayout();
         self.mark_dirty();

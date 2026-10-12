@@ -70,6 +70,13 @@ preset = "default"
 visible = true
 width = 28
 
+[bar]
+# The last row, across the whole width: what can be done in the focused pane (its server's files,
+# its agent's account, its repository's worktrees…) with the keys that do it, and the menu key.
+# "off" gives the row to the panes, and the menu key goes to the top bar. ctrl+b V k shows or
+# hides it for the session.
+keys = "context"
+
 [notifications]
 # "terminal" (OSC 777 / OSC 9, shown by Ghostty, iTerm2, kitty…), "system" (notify-send),
 # "both" or "off".
@@ -260,6 +267,7 @@ pub struct Config {
     #[serde(default)]
     pub theme: crate::theme::ThemeConfig,
     pub sidebar: SidebarConfig,
+    pub bar: BarConfig,
     pub notifications: NotificationConfig,
     pub graphics: GraphicsConfig,
     pub contexts: ContextsConfig,
@@ -330,6 +338,21 @@ pub struct ServersConfig {
 pub struct SidebarConfig {
     pub visible: bool,
     pub width: u16,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct BarConfig {
+    pub keys: BarKeys,
+}
+
+/// What the bottom bar shows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum BarKeys {
+    /// The focused pane's actions.
+    Context,
+    /// Nothing: there is no bottom bar.
+    Off,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -431,11 +454,14 @@ mod tests {
         .unwrap();
         assert!(!cfg.pane_frames);
         assert!(!Config::from_user_toml("save_scrollback = false\n").unwrap().save_scrollback);
+        assert_eq!(Config::from_user_toml("[bar]\nkeys = \"off\"\n").unwrap().bar.keys, BarKeys::Off);
+        assert!(Config::from_user_toml("[bar]\nkeys = \"pills\"\n").is_err());
         assert_eq!(cfg.keys.prefix, vec!["ctrl+a".to_string()]);
         assert!(cfg.keys.direct["new_pane"].is_empty());
         // untouched defaults survive
         assert_eq!(cfg.keys.preset, "kraal");
         assert!(cfg.sidebar.visible);
+        assert_eq!(cfg.bar.keys, BarKeys::Context);
     }
 
     #[test]

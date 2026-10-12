@@ -77,6 +77,7 @@ pub enum Action {
     Buffers,
     Hints,
     ToggleSidebar,
+    ToggleBottomBar,
     Messages,
     SelectForBroadcast,
     BroadcastSelected,
@@ -151,6 +152,7 @@ const ACTIONS: &[(Action, &str, &str)] = &[
     (Buffers, "buffers", "Paste buffers: what was copied, to paste again"),
     (Hints, "hints", "Open a link or path (hints on screen)"),
     (ToggleSidebar, "toggle_sidebar", "Sidebar"),
+    (ToggleBottomBar, "toggle_bottom_bar", "Bottom bar: the focused pane's actions and their keys"),
     (Messages, "messages", "Message log"),
     (SelectForBroadcast, "select_for_broadcast", "Mark for broadcast (this pane)"),
     (BroadcastSelected, "broadcast_selected", "Broadcast to the marked panes"),
@@ -309,6 +311,7 @@ const KRAAL: Preset = Preset {
         ("git_actions", &["{run} g"]),
         ("toggle_floating", &["{view} f"]),
         ("toggle_sidebar", &["{view} l"]),
+        ("toggle_bottom_bar", &["{view} k"]),
         ("messages", &["{view} j"]),
         ("broadcast_workspace", &["{broadcast} w"]),
         ("broadcast_selected", &["{broadcast} s"]),
@@ -651,7 +654,7 @@ const MODE_KEYS: &[(&str, &[(&str, &str)])] = &[
     (
         "Mouse",
         &[
-            ("click", "focus a pane, tab, workspace or agent; open a folded pane"),
+            ("click", "focus a pane, tab, workspace or agent; open a folded pane; run an action of the bottom bar"),
             ("drag a border", "resize panes"),
             ("drag in a pane", "select and copy (double: word, triple: line)"),
             ("ctrl+click", "open a link; on a frame's top: mark for broadcast"),
@@ -907,11 +910,7 @@ impl Keymap {
     /// prefix, and the fixed keys of lists, fields, questions and modes.
     pub fn reference(&self, ascii: bool) -> Vec<Section> {
         let p = self.prefix_label();
-        let seq = |keys: &[KeySpec]| {
-            let mut parts = vec![p.clone()];
-            parts.extend(keys.iter().map(|k| pretty(k, ascii)));
-            parts.join(" ")
-        };
+        let seq = |keys: &[KeySpec]| self.after_prefix(keys, |k| pretty(k, ascii));
         let root = format!("After {p}");
         // Each section, with the commands it lists (a command shows once per section).
         let mut sections: Vec<(Section, Vec<Command>)> = vec![((root.clone(), Vec::new()), Vec::new())];
@@ -973,12 +972,19 @@ impl Keymap {
         self.leader_hint(&Command::Action(action))
     }
 
+    /// [`Keymap::hint`] as menus show keys: `ctrl+b P →`.
+    pub fn shown_hint(&self, action: Action, ascii: bool) -> Option<String> {
+        if let Some((k, _)) = self.direct.iter().find(|(_, a)| *a == action) {
+            return Some(pretty(k, ascii));
+        }
+        let (seq, _) = self.leader.iter().find(|(_, c)| *c == Command::Action(action))?;
+        Some(self.after_prefix(seq, |k| pretty(k, ascii)))
+    }
+
     /// The leader sequence of a command, with the prefix.
     pub fn leader_hint(&self, command: &Command) -> Option<String> {
         let (seq, _) = self.leader.iter().find(|(_, c)| c == command)?;
-        let mut parts = vec![self.prefix_label()];
-        parts.extend(seq.iter().map(KeySpec::to_string));
-        Some(parts.join(" "))
+        Some(self.after_prefix(seq, KeySpec::to_string))
     }
 
     /// Every way to reach `command`: direct keys, then leader sequences.
@@ -987,13 +993,15 @@ impl Keymap {
             Command::Action(a) => self.direct.iter().filter(|(_, x)| x == a).map(|(k, _)| k.to_string()).collect(),
             Command::Tool(_) => Vec::new(),
         };
-        let prefix = self.prefix_label();
         out.extend(
-            self.leader.iter().filter(|(_, c)| c == command).map(|(seq, _)| {
-                format!("{prefix} {}", seq.iter().map(KeySpec::to_string).collect::<Vec<_>>().join(" "))
-            }),
+            self.leader.iter().filter(|(_, c)| c == command).map(|(seq, _)| self.after_prefix(seq, KeySpec::to_string)),
         );
         out
+    }
+
+    /// A leader sequence after the prefix, each key as `show` writes it.
+    fn after_prefix(&self, seq: &[KeySpec], show: impl Fn(&KeySpec) -> String) -> String {
+        std::iter::once(self.prefix_label()).chain(seq.iter().map(show)).collect::<Vec<_>>().join(" ")
     }
 
     /// The prefix as hints show it: its first key.
@@ -1130,6 +1138,11 @@ mod tests {
         assert_eq!(b[0], "On/off");
         assert!(b.contains(&"To this workspace".to_string()) && b.contains(&"Stop broadcasting".to_string()), "{b:?}");
         assert_eq!(km.hint(SplitRight).as_deref(), Some("ctrl+b P right"));
+        assert_eq!(km.shown_hint(SplitRight, false).as_deref(), Some("ctrl+b P →"));
+        assert_eq!(km.shown_hint(SplitRight, true).as_deref(), Some("ctrl+b P right"));
+        assert_eq!(km.shown_hint(NewPane, false).as_deref(), Some("alt+n"));
+        assert_eq!(km.hint(ToggleBottomBar).as_deref(), Some("ctrl+b V k"));
+        assert!(km.menu(&[key('V')]).iter().any(|e| e.label == "Bottom bar"));
         assert_eq!(km.hint(SshPicker).as_deref(), Some("ctrl+b s"));
         assert_eq!(km.hint(NewPane).as_deref(), Some("alt+n"));
         assert_eq!(km.menu_hint("broadcast").as_deref(), Some("ctrl+b B"));

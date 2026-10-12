@@ -5,7 +5,7 @@ New here? Start with the [README](../README.md): install, quick start and a tour
 | Page | What it covers |
 |---|---|
 | [Install](install.md) | the install script and its settings, updates, Cargo, archives |
-| [Keys](keys.md) | the `ctrl+b` menu and its one rule, your own keys, mouse, paste buffers, keyboard layouts |
+| [Keys](keys.md) | the `ctrl+b` menu and its one rule, the bottom bar, your own keys, mouse, paste buffers, keyboard layouts |
 | [Sessions and workspaces](workspaces.md) | sessions, workspaces, tabs and panes; persistence; workspace files |
 | [Servers](servers.md) | the inventory, file transfers, the file manager, editing a server's files, fleet tools, tunnels, remote sessions |
 | [Coding agents](agents.md) | agent states and hooks, worktrees, several accounts per agent |

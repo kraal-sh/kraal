@@ -240,6 +240,10 @@ impl Server {
                 }
                 self.relayout();
             }
+            Action::ToggleBottomBar => {
+                self.bottom_bar = !self.bottom_bar;
+                self.relayout();
+            }
             Action::SelectForBroadcast => {
                 if let Some(p) = focus {
                     self.toggle_mark(id, p);

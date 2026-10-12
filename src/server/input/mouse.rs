@@ -7,6 +7,7 @@ use alacritty_terminal::selection::SelectionType;
 use crate::input::{MouseButton, MouseEvent, MouseKind, encode_alternate_scroll, encode_mouse};
 use crate::keymap::Action;
 use crate::layout::PaneId;
+use crate::server::bottom_bar::Click;
 use crate::server::render::{BarItem, SideItem};
 use crate::server::ui::{Drag, Mode};
 use crate::server::{ClientId, Server};
@@ -18,7 +19,7 @@ impl Server {
             return None;
         }
         let c = self.clients.get(&id)?;
-        let (cols, sidebar) = (c.cols, self.sidebar_shown(c));
+        let (cols, rows, sidebar) = (c.cols, c.rows, self.sidebar_shown(c));
         let area = self.layout_area;
 
         // A drag in progress owns the mouse until release.
@@ -41,7 +42,21 @@ impl Server {
 
         let sw = if sidebar { self.sidebar_width(cols) } else { 0 };
         let press_left = matches!(m.kind, MouseKind::Press(MouseButton::Left));
-        // The sidebar runs the whole height, beside the top bar.
+        // The bottom bar runs the whole width, under the sidebar.
+        if self.bottom_bar && m.row + 1 == rows {
+            // In copy mode and search, it shows no keys.
+            if press_left && !scroll_mode {
+                return match self.bottom_bar_hit(id, m.col)? {
+                    Click::Run(action) => Some(self.action(id, action)),
+                    Click::Menu => {
+                        self.dismiss_welcome(id);
+                        Some(Mode::leader())
+                    }
+                };
+            }
+            return None;
+        }
+        // The sidebar runs from the top, beside the top bar.
         if m.col < sw {
             if press_left {
                 match self.sidebar_hit(id, m.row) {
