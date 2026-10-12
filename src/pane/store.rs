@@ -25,19 +25,34 @@ struct Shelf {
     lines: History,
     /// Batches handed over and not stored yet.
     pending: usize,
-    /// Rows stored, to take the place of the next ones handed over in the emulator's grid.
+    /// Rows stored, to take the place of the next ones handed over in the emulator's grid; none
+    /// are kept while the pane rests.
     spare: Vec<Row<Cell>>,
+    resting: bool,
     /// A batch could not be encoded (a bug): its lines are lost.
     failed: bool,
 }
 
 /// Rows moved out of the emulator, oldest first, and the lines they make.
-#[derive(Default)]
 pub(super) struct Batch {
     pub(super) rows: Vec<Row<Cell>>,
     pub(super) lines: Vec<Piece>,
     /// Then the oldest lines go while they take more rows than this.
     pub(super) trim: usize,
+    /// And the memory freed goes back to the system (see `release_memory`).
+    pub(super) release: bool,
+}
+
+impl Batch {
+    /// No rows: the oldest lines go while they take more rows than `trim`.
+    pub(super) fn trim(trim: usize) -> Batch {
+        Batch { rows: Vec::new(), lines: Vec::new(), trim, release: false }
+    }
+
+    /// No rows: the memory freed goes back to the system.
+    pub(super) fn release() -> Batch {
+        Batch { release: true, ..Batch::trim(usize::MAX) }
+    }
 }
 
 /// A line of a batch: its rows, and whether its last one wraps onto the next line (it was cut).
@@ -101,14 +116,20 @@ impl Store {
     /// Add to `out` up to `n` rows `columns` wide that were stored.
     pub(super) fn take_spare(&self, columns: usize, n: usize, out: &mut Vec<Row<Cell>>) {
         let mut shelf = lock(&self.shelf);
+        shelf.resting = false;
         shelf.spare.retain(|r| r.len() == columns);
         let at = shelf.spare.len().saturating_sub(n);
         out.extend(shelf.spare.drain(at..));
     }
 
-    /// Let go of the rows kept for the next batches.
+    /// Let go of the rows kept for the next batches, and keep none until the next.
     pub(super) fn free_spare(&self) {
-        lock(&self.shelf).spare = Vec::new();
+        let spare = {
+            let mut shelf = lock(&self.shelf);
+            shelf.resting = true;
+            std::mem::take(&mut shelf.spare)
+        };
+        drop(spare);
     }
 }
 
@@ -125,8 +146,16 @@ fn worker() -> Option<&'static Sender<Job>> {
             let (tx, rx) = crossbeam_channel::unbounded::<Job>();
             let thread = std::thread::Builder::new().name("scrollback".into()).spawn(move || {
                 let mut encoder = Encoder::default();
-                for job in rx {
+                let mut release = false;
+                while let Ok(job) = rx.recv() {
+                    // Only when asked (a pane rests, a long view went): while output goes on, the
+                    // memory would be asked for again at once.
+                    release |= job.batch.release;
                     job.run(&mut encoder);
+                    if release && rx.is_empty() {
+                        super::release_memory();
+                        release = false;
+                    }
                 }
             });
             thread.ok().map(|_| tx)
@@ -136,7 +165,7 @@ fn worker() -> Option<&'static Sender<Job>> {
 
 impl Job {
     fn run(self, encoder: &mut Encoder) {
-        let Job { store, batch: Batch { mut rows, lines, trim } } = self;
+        let Job { store, batch: Batch { mut rows, lines, trim, .. } } = self;
         let width = rows.first().map_or(0, |r| r.len());
         // Encoded before taking the lock: reading the lines waits only for the copy.
         let mut records = Vec::new();
@@ -173,9 +202,11 @@ impl Job {
             *encoder = Encoder::default();
         }
         shelf.pending -= 1;
-        rows.truncate(SPARE.saturating_sub(shelf.spare.len()));
+        let kept = if shelf.resting { 0 } else { SPARE.saturating_sub(shelf.spare.len()) };
+        let freed = rows.split_off(kept.min(rows.len()));
         shelf.spare.append(&mut rows);
         drop(shelf);
         store.stored.notify_all();
+        drop(freed);
     }
 }

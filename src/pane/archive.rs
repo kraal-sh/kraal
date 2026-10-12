@@ -55,6 +55,10 @@ const MAX_LINE_ROWS: usize = 1000;
 const MAX_BACKLOG: usize = 8;
 /// Rows of output between two looks at the scrollback's bounds while there is a lens.
 const LENS_BATCH: usize = 64;
+/// Rows moved at once beyond which the emulator's rows go with them (see `compact`).
+const MANY: usize = 2 * BATCH;
+/// No character before this one is wide.
+const WIDE_FROM: char = '\u{1100}';
 
 pub(super) struct Archive {
     store: Arc<Store>,
@@ -168,7 +172,7 @@ impl Archive {
             // The emulator keeps the history as it does alone: what is older goes first.
             self.due = history + BATCH;
             let trim = self.limit.saturating_sub(history + BATCH + term.screen_lines());
-            self.store.send(Batch { trim, ..Batch::default() });
+            self.store.send(Batch::trim(trim));
             return;
         }
         let moved = self.compact(term, seen, self.keep);
@@ -180,8 +184,8 @@ impl Archive {
         let history = term.grid().history_size();
         if self.window.1 > self.limit || self.store.backlog() > MAX_BACKLOG {
             // More than the scrollback holds within the window: most of it would be kept only
-            // to be dropped. Or more than the store keeps up with. Until the output stops (see
-            // `rest`).
+            // to be dropped. Or more than the store keeps up with. Until the output pauses (see
+            // `calm`).
             self.flood = true;
             self.due = history + BATCH;
         } else if history > self.high {
@@ -228,8 +232,18 @@ impl Archive {
         // between nine tenths of its limit and all of it; with rows in use staying, until a
         // batch more.
         let held = if left > self.high { left + BATCH + screen } else { self.high };
-        let mut batch = Batch { rows: Vec::with_capacity(moved), lines, trim: self.limit.saturating_sub(held) };
-        if moved > 0 {
+        let trim = self.limit.saturating_sub(held);
+        let mut batch = Batch { rows: Vec::with_capacity(moved), lines, trim, release: false };
+        if moved > MANY {
+            // Many rows (after a flood, or a look far back): the emulator lets go of the rows it
+            // keeps ahead too, rather than get as many new ones.
+            let grid = term.grid_mut();
+            batch.rows.extend((top..line).map(|l| std::mem::take(&mut grid[Line(l)])));
+            grid.update_history(left);
+            grid.truncate();
+            grid.update_history(self.limit);
+            *seen -= moved as i64;
+        } else if moved > 0 {
             if self.spare.len() < moved {
                 self.store.take_spare(columns, moved - self.spare.len(), &mut self.spare);
             }
@@ -296,7 +310,7 @@ impl Archive {
     }
 
     /// Lay out the archived lines from the one numbered `at` (the oldest without it) at the top of
-    /// the emulator's history, a few screens of them: a lens on them. Whether line `at` is the
+    /// the emulator's history, two screens of them: a lens on them. Whether line `at` is the
     /// grid's top line now.
     fn open_lens<T>(&mut self, term: &mut Term<T>, at: Option<u64>) -> bool {
         if self.limit == 0 || term.mode().contains(TermMode::ALT_SCREEN) {
@@ -325,7 +339,7 @@ impl Archive {
         let mut picked = Vec::new();
         let mut count = 0;
         for line in lines.from(at) {
-            if count >= screen + PAGE {
+            if count >= 2 * screen {
                 break;
             }
             let rows = line.rows_at(width);
@@ -350,8 +364,10 @@ impl Archive {
         grid.update_history(own);
         grid.update_history(self.limit);
         keep_on_grid(term);
-        // Many rows that showed a long history went.
-        self.freed |= lens.rows > EMULATOR_ROWS;
+        if lens.rows > EMULATOR_ROWS {
+            // Many rows that showed a long history went: their memory goes back.
+            self.store.send(Batch::release());
+        }
     }
 
     /// Lay out at least `rows` rows more of the archived lines above the lens (or above the
@@ -820,6 +836,8 @@ impl TermPane {
             self.term.grid_mut().truncate();
             self.archive.spare = Vec::new();
             self.archive.store.free_spare();
+            // Once the rows handed over are let go of.
+            self.archive.store.send(Batch::release());
             self.archive.freed = true;
         }
         std::mem::take(&mut self.archive.freed)
@@ -935,8 +953,17 @@ impl<T: EventListener> Handler for Feed<'_, T> {
         self.term.grid_mut().update_history(self.archive.limit);
     }
 
+    #[inline]
+    fn input(&mut self, c: char) {
+        // A character pushes a row only when it wraps: after the last column was written, or a
+        // wide one at the last column.
+        if self.term.grid().cursor.input_needs_wrap || c >= WIDE_FROM {
+            self.room();
+        }
+        self.term.input(c);
+    }
+
     pushing! {
-        input(c: char);
         linefeed();
         newline();
         scroll_up(rows: usize);
@@ -1730,8 +1757,9 @@ mod tests {
         t.term.grid_mut().update_history(100_000);
         t.parse(log.as_bytes());
         t.rest();
-        // Once the archive has them all.
+        // Once the archive has them all, and gave the memory of the rows back.
         drop(t.archive.lines());
+        std::thread::sleep(std::time::Duration::from_millis(200));
         b.pane.copy_mode(true);
         let start = std::time::Instant::now();
         for _ in 0..60 {
@@ -1757,7 +1785,37 @@ mod tests {
                     .into_bytes()
             })
             .collect();
-        for (name, input) in [("seq 3M", &seq), ("log 300k", &log)] {
+        // As the compare harness writes its coloured file: a colour every word, long lines.
+        let words =
+            ["error", "warning:", "Compiling", "src/server/render.rs:412:9", "fn", "0x7ffd3a2c", "Ok(())", "αβγ"];
+        let mut colours = Vec::new();
+        let mut n: u64 = 0x9e37_79b9_7f4a_7c15;
+        let mut next = || {
+            n ^= n << 13;
+            n ^= n >> 7;
+            n ^= n << 17;
+            n
+        };
+        while colours.len() < 50_000_000 {
+            let len = 100 + (next() % 500) as usize;
+            let mut visible = 0;
+            while visible < len {
+                match next() % 6 {
+                    0 => colours.extend_from_slice(format!("\x1b[38;5;{}m", next() % 256).as_bytes()),
+                    1 => colours.extend_from_slice(format!("\x1b[38;2;{};{};{}m", next() % 256, 7, 9).as_bytes()),
+                    2 => colours.extend_from_slice(format!("\x1b[1;3{}m", next() % 8).as_bytes()),
+                    3 => colours.extend_from_slice(b"\x1b[0m"),
+                    4 => colours.extend_from_slice(format!("\x1b[48;5;{}m", 232 + next() % 24).as_bytes()),
+                    _ => {}
+                }
+                let w = words[(next() % words.len() as u64) as usize];
+                colours.extend_from_slice(w.as_bytes());
+                colours.push(b' ');
+                visible += w.chars().count() + 1;
+            }
+            colours.extend_from_slice(b"\x1b[0m\r\n");
+        }
+        for (name, input) in [("seq 3M", &seq), ("log 300k", &log), ("colours 50 MB", &colours)] {
             // Plain, flooded, and output too slow to be a flood (all of it moves to the archive).
             for (how, archived, slow) in [("plain", false, false), ("flood", true, false), ("steady", true, true)] {
                 let mut term = Term::new(config.clone(), &size, Listener::default());
