@@ -573,3 +573,111 @@ fn fuzz_pane_shows_what_the_emulator_shows() {
         }
     });
 }
+
+/// The keyboard mode stacks as alacritty keeps them: one per screen, the alternate screen's in
+/// front while it is up, both emptied by a reset.
+#[derive(Default)]
+struct Stacks {
+    depth: [usize; 2],
+    alt: bool,
+    deepest: usize,
+}
+
+impl alacritty_terminal::vte::ansi::Handler for Stacks {
+    fn push_keyboard_mode(&mut self, _: alacritty_terminal::vte::ansi::KeyboardModes) {
+        let d = &mut self.depth[usize::from(self.alt)];
+        *d += 1;
+        self.deepest = self.deepest.max(*d);
+    }
+
+    fn pop_keyboard_modes(&mut self, n: u16) {
+        let d = &mut self.depth[usize::from(self.alt)];
+        *d = d.saturating_sub(usize::from(n));
+    }
+
+    fn set_private_mode(&mut self, mode: alacritty_terminal::vte::ansi::PrivateMode) {
+        use alacritty_terminal::vte::ansi::{NamedPrivateMode, PrivateMode};
+        if mode == PrivateMode::Named(NamedPrivateMode::SwapScreenAndSetRestoreCursor) {
+            self.alt = true;
+        }
+    }
+
+    fn unset_private_mode(&mut self, mode: alacritty_terminal::vte::ansi::PrivateMode) {
+        use alacritty_terminal::vte::ansi::{NamedPrivateMode, PrivateMode};
+        if mode == PrivateMode::Named(NamedPrivateMode::SwapScreenAndSetRestoreCursor) {
+            self.alt = false;
+        }
+    }
+
+    fn reset_state(&mut self) {
+        self.depth = [0, 0];
+        self.alt = false;
+    }
+}
+
+/// What the guard lets through never takes a stack deeper than its limit, as alacritty's own
+/// parser reads it (synchronized updates included), however the output wraps the pushes.
+#[test]
+fn fuzz_pane_keyboard_stacks_stay_bounded() {
+    fuzz::run("pane_keyboard_stacks_stay_bounded", 12, |rng| {
+        let mut guard = super::guard::KeyboardStackGuard::default();
+        let mut stacks = Stacks::default();
+        let mut parser: Processor = Processor::new();
+        let push: &[&[u8]] = &[b"\x1b[>1u", b"\x1b[>u", b"\x1b[>31u", b"\x1b[>1;2u", b"\x1b[?1049h", b"\x1b[?1049l"];
+        for _ in 0..rng.range(1, 6) {
+            let mut output = Vec::new();
+            for _ in 0..rng.range(100, 3000) {
+                match rng.below(8) {
+                    0..5 => output.extend_from_slice(rng.one_of(push)),
+                    5 => output.extend_from_slice(rng.one_of(&[
+                        &b"\x1b[<u"[..],
+                        b"\x1b[<3u",
+                        b"\x1bc",
+                        b"\x1b[?2026h",
+                        b"\x1b[?2026l",
+                    ])),
+                    _ => fuzz::terminal_piece(rng, &mut output, false),
+                }
+            }
+            for chunk in rng.chunks(&output) {
+                parser.advance(&mut stacks, &guard.filter(chunk));
+            }
+            if rng.one_in(2) {
+                parser.stop_sync(&mut stacks);
+            }
+            assert!(stacks.deepest <= 1024, "a stack {} deep", stacks.deepest);
+        }
+    });
+}
+
+/// The OSC sequences kraal reads itself, from any bytes: no panic, what they say cleaned and
+/// checked.
+#[test]
+fn fuzz_pane_osc() {
+    fuzz::run("pane_osc", 200, |rng| {
+        let mut scanner = super::osc::OscScanner::default();
+        let output = fuzz::terminal_output(rng, 20_000, false);
+        for chunk in rng.chunks(&output) {
+            for (end, osc) in scanner.scan(chunk) {
+                assert!(end <= chunk.len());
+                match osc {
+                    super::osc::Osc::Notify { title, body } => {
+                        assert!(title.chars().count() <= 300 && body.chars().count() <= 300);
+                        assert!(!title.chars().chain(body.chars()).any(char::is_control));
+                    }
+                    super::osc::Osc::Attached(Some((server, session))) => {
+                        assert!(crate::servers::valid_name(&server) && crate::paths::valid_session_name(&session));
+                    }
+                    _ => {}
+                }
+            }
+        }
+        let mut body = rng
+            .pick(&["7;file://h/a%20b", "133;D;1", "777;notify;t;b", "7701;context;k8s=a", "9;x"])
+            .as_bytes()
+            .to_vec();
+        rng.mutate(&mut body, &[b";", b"%", b"%2", b"=", b"7701", b"\xff"]);
+        let _ = super::osc::parse_osc(&body);
+        let _ = super::osc::percent_decode(&String::from_utf8_lossy(&body));
+    });
+}
