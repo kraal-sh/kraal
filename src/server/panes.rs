@@ -7,7 +7,7 @@ use anyhow::{Context, Result};
 
 use super::{ClientId, FloatRect, Floating, Server, SyncScope, Tab, Workspace};
 use crate::layout::{Axis, Node, PaneId};
-use crate::pane::{Pane, PaneSpec};
+use crate::pane::{Pane, PaneSpec, ProcessHold};
 use crate::protocol::{self, ServerMsg};
 impl Server {
     pub fn new_workspace(&mut self, name: String, definition: Option<PathBuf>) -> u32 {
@@ -82,6 +82,52 @@ impl Server {
         self.panes.insert(id, pane);
         self.persist_dirty = true;
         Ok(id)
+    }
+
+    /// Run `f` with the programs of the panes it sets up held, then start them (see
+    /// `crate::pane::batch`): the panes of a workspace are all set up first, instead of the
+    /// server competing for the processors with the programs it started already.
+    pub(super) fn with_batch<T>(&mut self, f: impl FnOnce(&mut Server) -> T) -> T {
+        let batch = crate::pane::batch();
+        let result = f(self);
+        drop(batch);
+        // The outermost batch starts them all.
+        if !crate::pane::batching() {
+            self.launch_pending();
+        }
+        result
+    }
+
+    /// Start the programs of the panes set up during a batch, in the order the panes were made,
+    /// off this thread (see `crate::pane::launcher`).
+    fn launch_pending(&mut self) {
+        let mut ids: Vec<PaneId> = self.panes.keys().copied().collect();
+        ids.sort_unstable();
+        for id in ids {
+            let Some(pending) = self.panes.get_mut(&id).and_then(Pane::take_pending) else { continue };
+            // Without the launcher thread, here.
+            if let Err(e) = self.launches.send(pending) {
+                e.into_inner().start();
+            }
+        }
+    }
+
+    /// The program of pane `id` (`process`), started after the pane was set up, could not start
+    /// (`why`). Unless the pane is gone or runs another program since, it waits for Enter,
+    /// saying why, as one whose program could not start when it was made does.
+    pub(super) fn pane_failed(&mut self, id: PaneId, process: &ProcessHold, why: &str) {
+        let Some(pane) = self.panes.get_mut(&id) else { return };
+        if !pane.process_hold().is_some_and(|p| p.is(process)) {
+            return;
+        }
+        let reason = format!("cannot start: {}", why.lines().next().unwrap_or("cannot start"));
+        // A prelude (a worktree's setup) that could not start: Enter starts the command.
+        pane.preparing = false;
+        let spec = pane.spec.clone();
+        if let Err(e) = self.suspend_pane(id, spec, &reason) {
+            self.warnings.push(format!("{reason}; {e:#}"));
+        }
+        self.mark_dirty();
     }
 
     /// Make pane `id` wait for Enter to run `spec`, saying why (`reason`).

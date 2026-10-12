@@ -67,6 +67,9 @@ pub enum Event {
     PaneReady(PaneId),
     /// Pane id, pid of the process that exited, exit code.
     PaneExited(PaneId, Option<u32>, Option<i32>),
+    /// The program of a pane (id, process), started after the pane was set up, could not
+    /// start: why.
+    PaneFailed(PaneId, crate::pane::ProcessHold, String),
     Connection(UnixStream),
     ClientFrame(ClientId, u8, Vec<u8>),
     ClientGone(ClientId),
@@ -432,6 +435,8 @@ pub struct Server {
     /// them, on their repositories and on the configuration's directories.
     dirwatch: dirwatch::DirWatch,
     git_requests: Sender<PathBuf>,
+    /// Starts the programs of the panes of a batch (see `crate::pane::launcher`).
+    launches: Sender<crate::pane::Pending>,
     /// Current Kubernetes context per `KUBECONFIG` value in use.
     pub kube: HashMap<String, crate::context::KubeFile>,
     kube_cache: crate::context::KubeCache,
@@ -546,6 +551,9 @@ fn due(now: Instant, last: Instant, every: Duration) -> bool {
 /// Run a session server in the foreground until it is told to exit.
 pub fn run(session: &str) -> Result<()> {
     let ready = take_ready_pipe();
+    // What this process inherited stays out of the panes' programs.
+    crate::pane::close_inherited();
+    crate::pane::reserve_descriptors();
     let socket = paths::socket_path(session);
     paths::private_runtime_dir().context("checking the runtime directory")?;
     if socket.exists() {
@@ -692,6 +700,7 @@ pub fn run(session: &str) -> Result<()> {
         git: HashMap::new(),
         dirwatch: dirwatch::DirWatch::new(watcher),
         git_requests: worktrees::spawn_git_worker(git_tx),
+        launches: crate::pane::launcher(),
         kube: HashMap::new(),
         kube_cache: Default::default(),
         tf_dirs: Default::default(),
@@ -1227,6 +1236,7 @@ impl Server {
                 // What ended may have committed, checked out or merged.
                 self.git_soon_everywhere();
             }
+            Event::PaneFailed(id, process, why) => self.pane_failed(id, &process, &why),
             Event::Connection(stream) => {
                 self.contact();
                 self.new_connection(stream)

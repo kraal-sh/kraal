@@ -150,7 +150,8 @@ impl Server {
     }
 
     pub(super) fn apply_snapshot(&mut self, snap: SessionSnapshot) -> Result<()> {
-        persist::apply(self, snap)
+        // Every pane is set up before the programs start.
+        self.with_batch(|server| persist::apply(server, snap))
     }
 
     /// The question before a restart, with what it stops.

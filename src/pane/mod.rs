@@ -23,13 +23,16 @@ mod osc;
 mod pty;
 mod screen;
 mod scrollback;
+mod spawn;
+
+pub use spawn::{batch, batching, close_inherited, reserve_descriptors};
 
 pub use commands::{Finished, short_duration};
 use osc::sanitize_title;
 use osc::{Osc, OscScanner};
 pub use osc::{osc_notify, osc52};
 use pty::Size;
-pub use pty::{ProcessHold, TermPane};
+pub use pty::{Pending, ProcessHold, TermPane, launcher};
 #[cfg(test)]
 pub use screen::render_term;
 pub use screen::set_outer_colors;
@@ -631,7 +634,7 @@ impl Pane {
         let Some(t) = self.term() else { return };
         t.process.signal_group(signal);
         #[cfg(unix)]
-        if let Some(fg) = self.foreground_pid().filter(|fg| Some(*fg) != t.pid) {
+        if let Some(fg) = self.foreground_pid().filter(|fg| Some(*fg) != t.pid()) {
             // SAFETY: plain syscall to the terminal's current foreground group.
             unsafe {
                 libc::kill(-(fg as libc::pid_t), signal);
@@ -640,7 +643,13 @@ impl Pane {
     }
 
     pub fn pid(&self) -> Option<u32> {
-        self.term().and_then(|t| t.pid)
+        self.term().and_then(|t| t.pid())
+    }
+
+    /// The program of this pane, set up in a batch and not started yet (see [`batch`]), to
+    /// start elsewhere.
+    pub fn take_pending(&mut self) -> Option<Pending> {
+        self.term_mut()?.take_pending()
     }
 
     /// A hold on the pane's current process (see [`ProcessHold`]).
@@ -666,7 +675,7 @@ impl Pane {
     /// Whether something other than the pane's shell is in the foreground.
     pub fn has_foreground_job(&self) -> bool {
         let Some(t) = self.term() else { return false };
-        match (t.master.process_group_leader(), t.pid) {
+        match (t.master.process_group_leader(), t.pid()) {
             (Some(pg), Some(pid)) => pg as u32 != pid,
             _ => false,
         }

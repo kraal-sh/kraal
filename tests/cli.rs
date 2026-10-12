@@ -1123,6 +1123,37 @@ fn missing_command_does_not_break_the_workspace() {
     assert!(env.run(&["workspaces"]).contains("open"));
 }
 
+/// A program found but that cannot run (its interpreter is missing) is known only once the pane
+/// started it: the pane then waits for Enter all the same, saying why, and the others run.
+#[test]
+fn a_program_that_cannot_run_after_all_waits_for_enter() {
+    let env = Env::new("cantrun");
+    let broken = env.root.join("broken");
+    write_script(&broken, "#!/no/such/interpreter\n");
+    env.workspace(
+        "w",
+        &format!(
+            "layout {{\n    pane split_direction=\"vertical\" {{\n        pane name=\"ok\"\n        pane name=\"bad\" command={:?}\n    }}\n}}\n",
+            broken.display().to_string()
+        ),
+    );
+    env.run(&["open", "w"]);
+    env.wait_for_text("bad", "cannot start");
+    env.wait_for_text("bad", "No such file or directory");
+    let start = Instant::now();
+    loop {
+        let v: serde_json::Value = serde_json::from_str(&env.run(&["panes", "--json"])).unwrap();
+        let bad = v.as_array().unwrap().iter().find(|p| p["name"] == "bad").cloned().expect("the pane is kept");
+        if bad["suspended"] == true {
+            break;
+        }
+        assert!(start.elapsed() < Duration::from_secs(5), "{bad}");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    env.run(&["send", "-p", "ok", "-e", "echo still-here"]);
+    env.wait_for_text("ok", "still-here");
+}
+
 #[test]
 fn restore_suspends_commands_but_reconnects_ssh() {
     let env = Env::new("restoresafe");
