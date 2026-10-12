@@ -58,6 +58,11 @@ const MAX_PLACEMENTS: usize = 64;
 const PICTURE_COST: usize = 1024;
 /// Placed images a pane holds before kraal looks for those whose cells are all gone.
 const SWEEP_START: usize = 32;
+/// Pixels of a pane's images decoded per second: a few bytes of output describe a picture of 40
+/// million pixels (a sixel size, a crop of a large image), and the work each takes is in
+/// proportion to its pixels. Past it, the pane's images are refused (kitty) or dropped (sixel)
+/// until the next second; one image, however large, always fits in a second that spent nothing.
+const PIXELS_PER_SECOND: u64 = 100_000_000;
 
 const LENIENT: base64::engine::GeneralPurpose = base64::engine::GeneralPurpose::new(
     &base64::alphabet::STANDARD,
@@ -252,6 +257,44 @@ struct Upload {
     stamp: u64,
 }
 
+/// The pixels a pane's images took to decode in the current second (see [`PIXELS_PER_SECOND`]).
+struct Budget {
+    since: std::time::Instant,
+    spent: u64,
+    limit: u64,
+}
+
+impl Budget {
+    fn new() -> Budget {
+        Budget { since: std::time::Instant::now(), spent: 0, limit: PIXELS_PER_SECOND }
+    }
+
+    fn renew(&mut self) {
+        if self.since.elapsed() >= std::time::Duration::from_secs(1) {
+            self.since = std::time::Instant::now();
+            self.spent = 0;
+        }
+    }
+
+    /// Whether nothing more may be decoded this second.
+    fn spent(&mut self) -> bool {
+        self.renew();
+        self.spent >= self.limit
+    }
+
+    /// Count `pixels` decoded; whether they fit, when asked before.
+    fn spend(&mut self, pixels: u64) -> bool {
+        self.renew();
+        if self.spent > 0 && self.spent.saturating_add(pixels) > self.limit {
+            return false;
+        }
+        self.spent = self.spent.saturating_add(pixels);
+        true
+    }
+}
+
+const BUSY: &str = "EBUSY:too many images at once";
+
 /// A transmission arriving in chunks.
 struct Pending {
     command: Command,
@@ -277,6 +320,7 @@ pub struct PaneGraphics {
     sweep_at: usize,
     /// Images with cells in the part of the history kept outside the emulator.
     pub archived: HashSet<u32>,
+    budget: Budget,
 }
 
 impl Drop for PaneGraphics {
@@ -302,6 +346,7 @@ impl PaneGraphics {
             clock: 0,
             sweep_at: SWEEP_START,
             archived: HashSet::new(),
+            budget: Budget::new(),
         }
     }
 
@@ -453,7 +498,7 @@ impl PaneGraphics {
     }
 
     /// The picture a transmission carries.
-    fn load(&self, cmd: &mut Command) -> Result<Arc<Picture>, String> {
+    fn load(&mut self, cmd: &mut Command) -> Result<Arc<Picture>, String> {
         if cmd.medium != b'd' {
             // Files and shared memory would be this machine's, not the program's when it runs
             // elsewhere (over ssh): programs fall back to sending the data.
@@ -468,13 +513,20 @@ impl PaneGraphics {
         }
         match cmd.format {
             100 => {
+                if self.budget.spent() {
+                    return Err(BUSY.into());
+                }
                 let img = decode_png(&data)?;
+                self.budget.spend(u64::from(img.width()) * u64::from(img.height()));
                 Picture::checked(data, img.width(), img.height(), &self.shared)
             }
             24 | 32 => {
                 let (w, h) = (cmd.width, cmd.height);
                 if w == 0 || h == 0 || w > MAX_SIDE || h > MAX_SIDE || u64::from(w) * u64::from(h) > MAX_PIXELS {
                     return Err("EINVAL:bad image size".into());
+                }
+                if !self.budget.spend(u64::from(w) * u64::from(h)) {
+                    return Err(BUSY.into());
                 }
                 let bpp = if cmd.format == 24 { 3 } else { 4 };
                 if data.len() != w as usize * h as usize * bpp {
@@ -504,7 +556,7 @@ impl PaneGraphics {
             return Err("EINVAL:a placeholder needs an image id".into());
         }
         // A part of the image is a new picture: it counts in the quota like any.
-        let picture = crop(picture, cmd, &self.shared)?;
+        let picture = crop(picture, cmd, &self.shared, &mut self.budget)?;
         self.make_room()?;
         let (cols, rows) = cells_for(&picture, cmd.cols, cmd.rows, self.shared.cell());
         let stamp = self.tick();
@@ -729,10 +781,11 @@ impl PaneGraphics {
     // ---- sixel ---------------------------------------------------------------------------
 
     fn sixel<T: EventListener>(&mut self, data: &[u8], term: &mut Term<T>) {
-        if !self.shared.available() {
+        if !self.shared.available() || self.budget.spent() {
             return;
         }
         let Some(img) = sixel::decode(data) else { return };
+        self.budget.spend(u64::from(img.width) * u64::from(img.height));
         let Ok(picture) = Picture::from_rgba(img.width, img.height, img.pixels, &self.shared) else { return };
         if self.make_room().is_err() {
             return;
@@ -939,7 +992,12 @@ impl Placeholder {
 }
 
 /// The part of the picture a command asks for (`x`, `y`, `w`, `h` in pixels).
-fn crop(picture: Arc<Picture>, cmd: &Command, shared: &Arc<Shared>) -> Result<Arc<Picture>, String> {
+fn crop(
+    picture: Arc<Picture>,
+    cmd: &Command,
+    shared: &Arc<Shared>,
+    budget: &mut Budget,
+) -> Result<Arc<Picture>, String> {
     let (x, y) = (cmd.x.min(picture.width), cmd.y.min(picture.height));
     let w = if cmd.w == 0 { picture.width - x } else { cmd.w.min(picture.width - x) };
     let h = if cmd.h == 0 { picture.height - y } else { cmd.h.min(picture.height - y) };
@@ -948,6 +1006,10 @@ fn crop(picture: Arc<Picture>, cmd: &Command, shared: &Arc<Shared>) -> Result<Ar
     }
     if w == 0 || h == 0 {
         return Err("EINVAL:empty source rectangle".into());
+    }
+    // The whole picture is decoded for any part of it.
+    if !budget.spend(u64::from(picture.width) * u64::from(picture.height)) {
+        return Err(BUSY.into());
     }
     let part = picture.decode()?.crop_imm(x, y, w, h).to_rgba8();
     Picture::from_rgba(w, h, part.into_raw(), shared)

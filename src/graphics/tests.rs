@@ -382,6 +382,31 @@ fn quota_for(n: usize, w: u32, h: u32) -> Arc<Shared> {
     s
 }
 
+/// Each placement of a part of a picture decodes it whole: a few bytes of output that ask for
+/// many parts of a large picture get decoded no more pixels a second than the pane's budget.
+#[test]
+fn parts_of_a_large_picture_are_decoded_at_a_bounded_rate() {
+    let s = shared(true);
+    let mut t = term(80, 24);
+    let mut g = PaneGraphics::new(s.clone());
+    g.budget.limit = 250_000;
+    feed(&mut g, &mut t, &rgb_image("a=t,i=7", 500, 500));
+    let part = |g: &mut PaneGraphics, t: &mut Term<VoidListener>, x: u32| {
+        let reply = feed(g, t, format!("\x1b_Ga=p,i=7,x={x},y=1,w=10,h=10\x1b\\").as_bytes());
+        String::from_utf8_lossy(&reply).contains("EBUSY")
+    };
+    // The picture took the second's pixels.
+    assert!((0..20).all(|x| part(&mut g, &mut t, x)));
+    // A second later, one part fits, not the next.
+    g.budget.since -= std::time::Duration::from_secs(1);
+    assert!(!part(&mut g, &mut t, 3));
+    assert!(part(&mut g, &mut t, 4));
+    // Sixel images wait too.
+    let before = g.shown.len();
+    feed(&mut g, &mut t, b"\x1bPq\"1;1;400;400#1~~~\x1b\\");
+    assert_eq!(g.shown.len(), before);
+}
+
 #[test]
 fn cropped_placements_count_in_the_quota() {
     // Room for three pictures: the upload, and two parts of it at most.
