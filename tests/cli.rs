@@ -202,12 +202,23 @@ impl RawClient {
 
     /// Attach, saying which kraal is installed (a local client says its own).
     fn attach_installed(env: &Env, workspace: &str, installed: Option<&str>) -> RawClient {
+        let installed = installed.map(|v| format!(r#","installed":"{v}""#)).unwrap_or_default();
+        RawClient::attach_with(env, workspace, &installed)
+    }
+
+    /// Attach as a client that follows a live restart, as kraal's own does.
+    #[cfg(target_os = "linux")]
+    fn attach_following(env: &Env, workspace: &str) -> RawClient {
+        RawClient::attach_with(env, workspace, r#","live":true"#)
+    }
+
+    /// Attach, with `extra` fields in the hello.
+    fn attach_with(env: &Env, workspace: &str, extra: &str) -> RawClient {
         use std::io::Read;
         let socket = env.root.join("run/kraal").join(format!("{}.sock", env.session));
         let mut stream = std::os::unix::net::UnixStream::connect(socket).unwrap();
-        let installed = installed.map(|v| format!(r#","installed":"{v}""#)).unwrap_or_default();
         let hello = format!(
-            r#"{{"type":"attach","version":2,"cols":120,"rows":40,"workspace":"{workspace}","remote":false{installed}}}"#
+            r#"{{"type":"attach","version":2,"cols":120,"rows":40,"workspace":"{workspace}","remote":false{extra}}}"#
         );
         raw_frame(&mut stream, 0, hello.as_bytes());
         let screen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -3629,7 +3640,7 @@ fn the_menu_restarts_the_session_after_asking() {
     // Live: nothing stops, and the session is the same process after.
     #[cfg(target_os = "linux")]
     {
-        let mut client = RawClient::attach(&env, "w");
+        let mut client = RawClient::attach_following(&env, "w");
         client.wait_for_message("\"attached\"");
         client.send(b"\x02Wr");
         client.wait_for_screen("Restart session menurestart live on the kraal installed now?");
@@ -4323,7 +4334,7 @@ fn a_refused_live_restart_leaves_the_server_as_it_was() {
     std::fs::create_dir_all(&to).unwrap();
     std::fs::write(from.join("payload.txt"), "data").unwrap();
     env.run(&["files", &from.display().to_string(), &to.display().to_string()]);
-    let mut client = RawClient::attach(&env, "w");
+    let mut client = RawClient::attach_following(&env, "w");
     client.wait_for_screen("payload.txt");
     for key in [&b"\x1b[B"[..], b"c"] {
         client.send(key);
@@ -4459,5 +4470,286 @@ fn tunnels_and_waiting_commands_are_carried_over_a_live_restart() {
     while alive(ssh) {
         assert!(start.elapsed() < Duration::from_secs(5), "the tunnel's ssh still runs");
         std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// Whether process `pid` is a zombie: ended, and not reaped.
+#[cfg(target_os = "linux")]
+fn zombie(pid: i32) -> bool {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap_or_default();
+    stat.rsplit_once(')').is_some_and(|(_, rest)| rest.trim_start().starts_with('Z'))
+}
+
+/// Add `text` to this test's config.
+#[cfg(target_os = "linux")]
+fn configure(env: &Env, text: &str) {
+    let cfg = env.root.join("config/kraal/config.toml");
+    let mut all = std::fs::read_to_string(&cfg).unwrap();
+    all.push_str(text);
+    std::fs::write(&cfg, all).unwrap();
+}
+
+/// A layout nested deeper than JSON is read by default (a split in a split, 40 times) restarts
+/// live, and comes back whole after a restart that is not live.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_deeply_nested_layout_restarts_live_and_cold() {
+    let env = Env::new("deep");
+    env.workspace("w", "layout {\n    pane name=\"p0\"\n}\n");
+    env.run(&["open", "w"]);
+    env.run(&["run", "--name", "counter", "--", "sh", "-c", COUNTER]);
+    let pid = counter_pid(&env, "counter");
+    let server = parent_of(pid).expect("the server");
+    let mut last = "counter".to_string();
+    for i in 1..=40 {
+        let way = if i % 2 == 1 { "--right" } else { "--down" };
+        let name = format!("p{i}");
+        env.run(&["run", way, "-t", &last, "--name", &name, "--", "sleep", "600"]);
+        last = name;
+    }
+    let count =
+        || serde_json::from_str::<serde_json::Value>(&env.run(&["panes", "--json"])).unwrap().as_array().unwrap().len();
+    assert_eq!(count(), 42);
+    let out = env.run(&["restart", "--live"]);
+    assert!(out.contains("restarted session deep live"), "{out}");
+    assert_eq!(parent_of(pid), Some(server));
+    still_counting(&env, "counter");
+    assert_eq!(count(), 42);
+    env.run(&["restart", "--cold", "--yes"]);
+    assert_eq!(count(), 42, "the layout came back");
+}
+
+/// The binary a live restart runs is the very file it tried, even when another one (here, one
+/// that could not take over) is renamed over its path meanwhile.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_live_restart_runs_the_binary_it_tried() {
+    let env = Env::new("tried");
+    // A hook keeps the restart waiting a moment after it has tried the binary.
+    configure(&env, "\n[hooks]\nnotification = \"sleep 3\"\n");
+    let bin = env.root.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let kraal = bin.join("kraal");
+    assert!(Command::new("cp").arg(env!("CARGO_BIN_EXE_kraal")).arg(&kraal).status().unwrap().success());
+    env.workspace("w", "layout {\n    pane name=\"sh\"\n}\n");
+    env.run(&["open", "w"]);
+    env.run(&["run", "--name", "counter", "--", "sh", "-c", COUNTER]);
+    let pid = counter_pid(&env, "counter");
+    let server = parent_of(pid).expect("the server");
+    env.run(&["notify", "a hook runs"]);
+    // Run from that copy, `kraal restart` restarts on it.
+    let restart = env.cmd_with(&kraal, &["restart", "--live"]).stdout(std::process::Stdio::piped()).spawn().unwrap();
+    std::thread::sleep(Duration::from_millis(800));
+    write_script(&bin.join("old"), "#!/bin/sh\nexit 1\n");
+    std::fs::rename(bin.join("old"), &kraal).unwrap();
+    let out = restart.wait_with_output().unwrap();
+    let said = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success() && said.contains("restarted session tried live"), "{said}");
+    assert_eq!(parent_of(pid), Some(server));
+    still_counting(&env, "counter");
+}
+
+/// Input a program has not read yet would be lost in the exec: the restart waits for it, then
+/// is refused, and the program keeps it.
+#[cfg(target_os = "linux")]
+#[test]
+fn input_a_program_has_not_read_holds_a_live_restart_back() {
+    let env = Env::new("unread");
+    env.workspace("w", "layout {\n    pane name=\"sh\"\n}\n");
+    env.run(&["open", "w"]);
+    env.run(&["run", "--name", "counter", "--", "sh", "-c", COUNTER]);
+    let pid = counter_pid(&env, "counter");
+    let server = parent_of(pid).expect("the server");
+    env.run(&["run", "--name", "deaf", "--", "sh", "-c", "stty raw -echo; exec sleep 600"]);
+    let chunk = "x".repeat(60_000);
+    for _ in 0..4 {
+        env.run(&["send", "-p", "deaf", &chunk]);
+    }
+    let out = env.try_run(&["restart", "--live"]);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success() && err.contains("has input it has not read yet"), "{err}");
+    assert_eq!(parent_of(pid), Some(server));
+    still_counting(&env, "counter");
+}
+
+/// A command one of the server's threads runs (git, for the panes' branches) is waited for, and
+/// none starts until the exec: none is left behind as a zombie nothing reaps.
+#[cfg(target_os = "linux")]
+#[test]
+fn commands_the_server_runs_are_not_left_behind() {
+    let env = Env::new("helpers");
+    let bin = env.root.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let (pids, running) = (env.root.join("git-pids"), env.root.join("git-running"));
+    write_script(
+        &bin.join("git"),
+        &format!(
+            "#!/bin/sh\necho $$ >> '{}'\ntouch '{}'\nsleep 1.5\nrm -f '{}'\n",
+            pids.display(),
+            running.display(),
+            running.display()
+        ),
+    );
+    let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap_or_default());
+    env.workspace("w", "layout {\n    pane name=\"sh\"\n}\n");
+    let out = env.cmd(&["open", "w"]).env("PATH", &path).output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let start = Instant::now();
+    while !running.exists() {
+        assert!(start.elapsed() < Duration::from_secs(15), "git never ran");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let out = env.run(&["restart", "--live"]);
+    assert!(out.contains("restarted session helpers live"), "{out}");
+    std::thread::sleep(Duration::from_millis(2500));
+    let ran: Vec<i32> = std::fs::read_to_string(&pids).unwrap().lines().filter_map(|l| l.trim().parse().ok()).collect();
+    let left: Vec<i32> = ran.iter().copied().filter(|p| zombie(*p)).collect();
+    std::thread::sleep(Duration::from_millis(300));
+    let left: Vec<i32> = left.into_iter().filter(|p| zombie(*p)).collect();
+    assert!(left.is_empty(), "left behind: {left:?}");
+}
+
+/// A command connected when a live restart starts, which sends its request a moment later, is
+/// answered.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_command_sent_while_a_live_restart_starts_is_answered() {
+    use std::io::Read;
+    let env = Env::new("asked");
+    env.workspace("w", "layout {\n    pane name=\"sh\"\n}\n");
+    env.run(&["open", "w"]);
+    let socket = env.root.join("run/kraal/asked.sock");
+    let mut stream = std::os::unix::net::UnixStream::connect(&socket).unwrap();
+    std::thread::sleep(Duration::from_millis(200));
+    let restart = env.cmd(&["restart", "--live"]).stdout(std::process::Stdio::piped()).spawn().unwrap();
+    std::thread::sleep(Duration::from_millis(600));
+    raw_frame(&mut stream, 0, br#"{"type":"request","version":2,"request":{"cmd":"ping"}}"#);
+    stream.set_read_timeout(Some(Duration::from_secs(15))).unwrap();
+    let mut header = [0u8; 5];
+    stream.read_exact(&mut header).expect("an answer");
+    let mut payload = vec![0u8; u32::from_le_bytes(header[..4].try_into().unwrap()) as usize];
+    stream.read_exact(&mut payload).unwrap();
+    assert!(String::from_utf8_lossy(&payload).contains("pong"), "{}", String::from_utf8_lossy(&payload));
+    let out = restart.wait_with_output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stdout));
+}
+
+/// A program that has written half an escape sequence when a live restart starts (a query whose
+/// end comes later) gets its answer: the restart waits until the sequence is whole.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_sequence_cut_in_two_is_never_handed_over() {
+    let env = Env::new("halfway");
+    env.workspace("w", "layout {\n    pane name=\"sh\"\n}\n");
+    env.run(&["open", "w"]);
+    let started = env.root.join("started");
+    let query = env.root.join("query");
+    write_script(
+        &query,
+        &format!(
+            "#!/bin/sh\nstty raw -echo\nprintf '\\033['\ntouch '{}'\nsleep 2\nprintf '6n'\n\
+             r=$(timeout --foreground 5 dd bs=1 count=6 2>/dev/null)\nstty sane\n\
+             if [ -n \"$r\" ]; then echo GOT-REPLY; else echo NO-REPLY; fi\nexec sleep 600\n",
+            started.display()
+        ),
+    );
+    env.run(&["run", "--name", "query", "--", &query.display().to_string()]);
+    let start = Instant::now();
+    while !started.exists() {
+        assert!(start.elapsed() < Duration::from_secs(10), "the program did not start");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let out = env.run(&["restart", "--live"]);
+    assert!(out.contains("restarted session halfway live"), "{out}");
+    let screen = env.wait_for_text("query", "REPLY");
+    assert!(screen.contains("GOT-REPLY"), "{screen}");
+}
+
+/// A client from before live restarts (one that does not say it follows them) is told to attach
+/// again, rather than to wait for a server that does not go away; one that follows comes back.
+#[cfg(target_os = "linux")]
+#[test]
+fn clients_that_do_not_follow_a_live_restart_are_told_to_attach_again() {
+    let env = Env::new("olderclient");
+    env.workspace("w", "layout {\n    pane name=\"sh\"\n}\n");
+    env.run(&["open", "w"]);
+    let older = RawClient::attach(&env, "w");
+    let following = RawClient::attach_following(&env, "w");
+    older.wait_for_message("\"attached\"");
+    following.wait_for_message("\"attached\"");
+    let out = env.run(&["restart", "--live"]);
+    assert!(out.contains("restarted session olderclient live"), "{out}");
+    older.wait_for_message("kraal restarted live: run kraal to attach again");
+    assert!(!older.messages.lock().unwrap().iter().any(|m| m.contains("reattach")), "{:?}", older.messages);
+    following.wait_for_message(r#""reattach":"w","live":true"#);
+    following.wait_for_message(r#""type":"hold","on":true"#);
+}
+
+/// The menu's restart that is not live runs the kraal installed now, which may be one from
+/// before live restarts: it knows no `--cold`, and its restart happens all the same.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_menu_restarts_with_a_kraal_from_before_live_restarts() {
+    let env = Env::new("prelive");
+    let bin = env.root.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let kraal = bin.join("kraal");
+    assert!(Command::new("cp").arg(env!("CARGO_BIN_EXE_kraal")).arg(&kraal).status().unwrap().success());
+    env.workspace("w", "layout {\n    pane name=\"sh\"\n}\n");
+    let out = env.cmd_with(&kraal, &["open", "w"]).output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    // Installed now: a kraal that knows neither `--cold` nor live restarts.
+    write_script(
+        &bin.join("old"),
+        &format!(
+            "#!/bin/sh\nfor a; do case $a in --cold|--handoff-check) echo \"error: unexpected argument '$a' found\" >&2; exit 2;; esac; done\n\
+             exec '{}' \"$@\"\n",
+            env!("CARGO_BIN_EXE_kraal")
+        ),
+    );
+    std::fs::rename(bin.join("old"), &kraal).unwrap();
+    let mut client = RawClient::attach_following(&env, "w");
+    client.wait_for_message("\"attached\"");
+    client.send(b"\x02Wr");
+    client.wait_for_screen("No live restart now (one stops nothing): the kraal installed cannot take over");
+    client.send(b"y");
+    client.wait_for_message(r#""type":"exit""#);
+}
+
+/// A closed pane whose program ignored the hangup is still reaped once it ends, after a live
+/// restart too: no zombie is left.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_closed_panes_program_is_reaped_after_a_live_restart() {
+    let env = Env::new("orphan");
+    env.workspace("w", "layout {\n    pane name=\"sh\"\n}\n");
+    env.run(&["open", "w"]);
+    let (pidfile, stop) = (env.root.join("pid"), env.root.join("stop"));
+    let script = format!(
+        "trap '' HUP; echo $$ > '{}'; while [ ! -e '{}' ]; do sleep 0.1; done",
+        pidfile.display(),
+        stop.display()
+    );
+    env.run(&["run", "--name", "stubborn", "--", "sh", "-c", &script]);
+    let start = Instant::now();
+    let pid: i32 = loop {
+        if let Some(p) = std::fs::read_to_string(&pidfile).ok().and_then(|s| s.trim().parse().ok()) {
+            break p;
+        }
+        assert!(start.elapsed() < Duration::from_secs(10), "it did not start");
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    env.run(&["close", "stubborn"]);
+    std::thread::sleep(Duration::from_millis(500));
+    // SAFETY: signal 0 only checks that the process exists.
+    assert!(unsafe { libc::kill(pid, 0) } == 0 && !zombie(pid), "it ignores the hangup");
+    let out = env.run(&["restart", "--live"]);
+    assert!(out.contains("restarted session orphan live"), "{out}");
+    std::fs::write(&stop, "").unwrap();
+    let start = Instant::now();
+    // SAFETY: as above.
+    while unsafe { libc::kill(pid, 0) } == 0 {
+        assert!(start.elapsed() < Duration::from_secs(10), "left as a zombie: {}", zombie(pid));
+        std::thread::sleep(Duration::from_millis(50));
     }
 }

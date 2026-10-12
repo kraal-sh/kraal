@@ -408,6 +408,83 @@ impl Pane {
     pub fn input_pending(&self) -> usize {
         self.term().map_or(0, |t| t.input_pending())
     }
+
+    /// Whether the program's output stops in the middle of a sequence (see [`Sequence`]).
+    pub fn mid_sequence(&self) -> bool {
+        self.term().is_some_and(|t| t.sequence != Sequence::Ground)
+    }
+}
+
+/// Where a program's output stands, as the emulator's parser reads it: between sequences, or
+/// in the middle of one (an escape sequence, a string, a character of several bytes). A live
+/// restart hands a pane over only between sequences: the next emulator starts there, and the
+/// end of a sequence cut in two would reach it as text (a query left unanswered).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Sequence {
+    #[default]
+    Ground,
+    /// The rest of a character of several bytes (UTF-8): how many bytes.
+    Utf8(u8),
+    Escape,
+    EscapeIntermediate,
+    Csi,
+    Osc,
+    /// DCS, and SOS, PM and APC (images): strings that end with ST.
+    Str,
+}
+
+impl Sequence {
+    /// Read `bytes`, as vte reads them.
+    pub(super) fn feed(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            *self = self.next(b);
+        }
+    }
+
+    fn next(self, b: u8) -> Sequence {
+        use Sequence::*;
+        match b {
+            // Cancel and substitute end any sequence; escape starts one, and ends a string.
+            0x18 | 0x1a => return Ground,
+            0x1b => return Escape,
+            _ => {}
+        }
+        match self {
+            Ground => match b {
+                0xc2..=0xdf => Utf8(1),
+                0xe0..=0xef => Utf8(2),
+                0xf0..=0xf4 => Utf8(3),
+                _ => Ground,
+            },
+            Utf8(n) => match b {
+                0x80..=0xbf if n > 1 => Utf8(n - 1),
+                0x80..=0xbf => Ground,
+                // Not a continuation: the character is dropped, and this byte read afresh.
+                _ => Ground.next(b),
+            },
+            Escape => match b {
+                0x20..=0x2f => EscapeIntermediate,
+                b'[' => Csi,
+                b']' => Osc,
+                b'P' | b'X' | b'^' | b'_' => Str,
+                0x30..=0x7e => Ground,
+                _ => Escape,
+            },
+            EscapeIntermediate => match b {
+                0x30..=0x7e => Ground,
+                _ => EscapeIntermediate,
+            },
+            Csi => match b {
+                0x40..=0x7e => Ground,
+                _ => Csi,
+            },
+            Osc => match b {
+                0x07 => Ground,
+                _ => Osc,
+            },
+            Str => Str,
+        }
+    }
 }
 
 /// What [`Pane::drain`] found.
@@ -489,6 +566,50 @@ mod tests {
         );
         before.kill();
         after.kill();
+    }
+
+    #[test]
+    fn sequences_cut_in_two_are_seen() {
+        let after = |bytes: &[u8]| {
+            let mut s = Sequence::default();
+            s.feed(bytes);
+            s
+        };
+        for done in [
+            &b"plain text\r\n"[..],
+            b"\x1b[6n",
+            b"\x1b[38;2;1;2;3m",
+            b"\x1b]0;title\x07",
+            b"\x1b]8;;x\x1b\\",
+            b"\x1b(B",
+            b"\x1b7",
+            b"\x1bP$qm\x1b\\",
+            b"\x1b_Ga=q;AAAA\x1b\\",
+            "日本".as_bytes(),
+            b"\x1b[1\x18",
+            b"\x1b[\x1b[0m",
+        ] {
+            assert_eq!(after(done), Sequence::Ground, "{done:?}");
+        }
+        for cut in [
+            &b"\x1b"[..],
+            b"\x1b[",
+            b"\x1b[6",
+            b"\x1b[?10",
+            b"\x1b]0;tit",
+            b"\x1b]8;;x\x1b",
+            b"\x1b(",
+            b"\x1bP$q",
+            b"\x1b_Ga=q;AA",
+            &"日".as_bytes()[..2],
+            b"a\xe2\x94",
+        ] {
+            assert_ne!(after(cut), Sequence::Ground, "{cut:?}");
+        }
+        // The rest, read later, ends it.
+        let mut s = after(b"\x1b[");
+        s.feed(b"6n");
+        assert_eq!(s, Sequence::Ground);
     }
 
     #[test]

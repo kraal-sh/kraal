@@ -125,6 +125,7 @@ pub fn parse_rpc_result(v: &Value) -> Option<RateLimits> {
 /// Everything happens on the calling thread, each read waiting at most until the deadline:
 /// nothing is left blocked behind when Codex, or something it started, keeps the pipe open.
 pub fn fetch(codex_bin: &str, home: &Path, timeout: Duration) -> anyhow::Result<RateLimits> {
+    let _running = crate::exec::child_running();
     let deadline = std::time::Instant::now() + timeout;
     // In a process group of its own: when it does not answer in time, whatever it started
     // (`codex` may be a wrapper) goes with it. On Linux it runs under `kraal supervise` (this

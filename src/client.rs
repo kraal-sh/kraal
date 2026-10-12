@@ -85,7 +85,8 @@ fn exchange(stream: &mut UnixStream, req: Request) -> Result<Response> {
                     ServerMsg::Open { .. }
                     | ServerMsg::Event { .. }
                     | ServerMsg::Events { .. }
-                    | ServerMsg::Attached { .. } => continue,
+                    | ServerMsg::Attached { .. }
+                    | ServerMsg::Hold { .. } => continue,
                 }
             }
             Some(_) => continue,
@@ -149,11 +150,16 @@ pub fn restart_server(session: &str) -> Result<Saved> {
 /// The pid and kraal release of the server behind `socket`, given up on quickly when it does
 /// not answer.
 pub fn ping(socket: &Path) -> Result<(u32, String)> {
+    identify(socket).map(|(pid, version, _)| (pid, version))
+}
+
+/// [`ping`], with when the server started (see `Response::Pong`), when it says.
+pub fn identify(socket: &Path) -> Result<(u32, String, Option<u64>)> {
     let mut stream = UnixStream::connect(socket)?;
     stream.set_read_timeout(Some(Duration::from_secs(2)))?;
     stream.set_write_timeout(Some(Duration::from_secs(2)))?;
     match exchange(&mut stream, Request::Ping)? {
-        Response::Pong { pid, version, .. } => Ok((pid, version)),
+        Response::Pong { pid, version, boot, .. } => Ok((pid, version, boot)),
         _ => bail!("unexpected answer from the server"),
     }
 }
@@ -179,17 +185,19 @@ pub fn kraal_program() -> String {
     installed_exe().map(|p| p.display().to_string()).unwrap_or_else(|_| "kraal".into())
 }
 
-/// Run `kraal -s <session> restart --yes --cold` from `exe` on its own, out of any terminal, pane
-/// and session: it outlives the pane or the server that starts it (a live restart needs none of
-/// that). What it says goes to the session's log.
-pub fn restart_detached(exe: &Path, session: &str) -> Result<()> {
+/// Start `kraal -s <session> restart --yes` from `exe` on its own, out of any terminal, pane and
+/// session: it outlives the pane or the server that starts it. What it says goes to the
+/// session's log. `--cold` only when `cold`: a kraal from before live restarts does not know
+/// it (its restart is never live).
+pub fn restart_detached(exe: &Path, session: &str, cold: bool) -> Result<std::process::Child> {
     let log = paths::log_path(session);
     if let Some(dir) = log.parent() {
         paths::ensure_private_dir(dir)?;
     }
     let out = crate::runbooks::open_private_append(&log)?;
     let mut cmd = std::process::Command::new(exe);
-    cmd.args(["-s", session, "restart", "--yes", "--cold"])
+    cmd.args(["-s", session, "restart", "--yes"])
+        .args(cold.then_some("--cold"))
         .stdin(std::process::Stdio::null())
         .stdout(out.try_clone()?)
         .stderr(out)
@@ -205,7 +213,24 @@ pub fn restart_detached(exe: &Path, session: &str) -> Result<()> {
             Ok(())
         });
     }
-    let child = cmd.spawn().with_context(|| format!("starting {}", exe.display()))?;
+    cmd.spawn().with_context(|| format!("starting {}", exe.display()))
+}
+
+/// Whether the restart [`restart_detached`] started is under way: it did not fail at once
+/// (a kraal that does not know how), within `limit`. It is reaped once it ends.
+pub fn restart_under_way(mut child: std::process::Child, session: &str, limit: Duration) -> Result<(), String> {
+    let start = Instant::now();
+    while start.elapsed() < limit {
+        match child.try_wait() {
+            Ok(Some(status)) if !status.success() => {
+                let log = paths::log_path(session);
+                return Err(format!("the restart did not happen ({status}); see {}", log.display()));
+            }
+            Ok(Some(_)) => return Ok(()),
+            Ok(None) => std::thread::sleep(Duration::from_millis(20)),
+            Err(_) => break,
+        }
+    }
     crate::exec::reap_later(child);
     Ok(())
 }
@@ -337,6 +362,9 @@ fn is_ctrl_c(keys: &[u8]) -> bool {
     })
 }
 const RESTORE: &str = "\x1b[?2026l\x1b[<u\x1b[?1006l\x1b[?1003l\x1b[?1002l\x1b[?1000l\x1b[?1004l\x1b[?2004l\x1b[0m\x1b[0 q\x1b[?25h\x1b[?1049l";
+
+/// What is held of what is typed during a live restart, at most.
+const MAX_HELD_KEYS: usize = 16 << 20;
 
 /// Set when the client is going: the output loop writes nothing more.
 static LEAVING: AtomicBool = AtomicBool::new(false);
@@ -500,6 +528,7 @@ fn greet(target: &Target, workspace: &Option<String>) -> Result<Greeted, String>
         },
         // A local client is the kraal installed on the server's machine; a remote one may not be.
         installed: matches!(target, Target::Local { .. }).then(|| protocol::KRAAL_VERSION.to_string()),
+        live: true,
     };
     if protocol::write_json(&mut conn.writer, &hello).is_err() {
         return Err(conn.why_lost("could not talk to the server"));
@@ -649,25 +678,43 @@ pub fn attach(mut target: Target, mut workspace: Option<String>, mouse: bool, at
     let writer: Arc<Mutex<Option<Box<dyn Write + Send>>>> = Arc::new(Mutex::new(None));
     let quit = Arc::new(AtomicBool::new(false));
     let pause = Arc::new(KeysPause::default());
+    // What is typed while the server replaces itself (a live restart), for the next one.
+    let held: Arc<Mutex<Option<Vec<u8>>>> = Arc::new(Mutex::new(None));
 
     // Keyboard → server. While disconnected, ctrl+c gives up.
     {
-        let writer = writer.clone();
-        let quit = quit.clone();
-        let pause = pause.clone();
+        let (writer, quit, pause, held) = (writer.clone(), quit.clone(), pause.clone(), held.clone());
         std::thread::Builder::new().name("stdin".into()).spawn(move || {
             read_keys(0, &pause, |keys| {
                 let Ok(mut w) = writer.lock() else { return };
-                match w.as_mut() {
-                    Some(w) => {
-                        let _ = protocol::write_frame(w, protocol::BYTES, keys);
+                if w.is_none() && is_ctrl_c(keys) {
+                    quit.store(true, Ordering::SeqCst);
+                    return;
+                }
+                if let Ok(mut h) = held.lock()
+                    && let Some(kept) = h.as_mut()
+                {
+                    if kept.len() + keys.len() <= MAX_HELD_KEYS {
+                        kept.extend_from_slice(keys);
                     }
-                    None if is_ctrl_c(keys) => quit.store(true, Ordering::SeqCst),
-                    None => {}
+                    return;
+                }
+                if let Some(w) = w.as_mut() {
+                    let _ = protocol::write_frame(w, protocol::BYTES, keys);
                 }
             });
         })?;
     }
+    // Send what was held to the server (the same one, or the next).
+    let release = |writer: &Mutex<Option<Box<dyn Write + Send>>>| {
+        let Ok(mut w) = writer.lock() else { return };
+        let Some(kept) = held.lock().ok().and_then(|mut h| h.take()) else { return };
+        if let Some(w) = w.as_mut()
+            && !kept.is_empty()
+        {
+            let _ = protocol::write_frame(w, protocol::BYTES, &kept);
+        }
+    };
     // Window size changes → server.
     {
         let writer = writer.clone();
@@ -717,6 +764,7 @@ pub fn attach(mut target: Target, mut workspace: Option<String>, mouse: bool, at
         let lost = match session {
             Ok(Greeted { conn: mut c, mut frames, first }) => {
                 *writer.lock().unwrap() = Some(std::mem::replace(&mut c.writer, Box::new(std::io::sink())));
+                release(&writer);
                 delay = Duration::from_secs(1);
                 let mut out = std::io::stdout().lock();
                 let mut next = Some(Ok(Some(first)));
@@ -743,6 +791,12 @@ pub fn attach(mut target: Target, mut workspace: Option<String>, mouse: bool, at
                                 break "the session restarts".to_string();
                             }
                             Ok(ServerMsg::Attached { version }) => server_version = Some(version),
+                            Ok(ServerMsg::Hold { on: true }) => {
+                                if let Ok(mut h) = held.lock() {
+                                    h.get_or_insert_with(Vec::new);
+                                }
+                            }
+                            Ok(ServerMsg::Hold { on: false }) => release(&writer),
                             Ok(ServerMsg::Open { url }) => {
                                 let _ = crate::pane::open_url(&url);
                             }

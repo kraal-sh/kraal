@@ -45,6 +45,7 @@ impl Server {
                 pid: std::process::id(),
                 session: self.session.clone(),
                 version: env!("CARGO_PKG_VERSION").into(),
+                boot: Some(self.events.boot()),
             }),
             Request::ListPanes => {
                 let mut v: Vec<PaneId> = Vec::new();

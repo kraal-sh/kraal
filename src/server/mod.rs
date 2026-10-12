@@ -302,6 +302,8 @@ pub struct Client {
     pub(in crate::server) paste: Option<input::PasteFlow>,
     /// The process that connected, where the system tells.
     pub peer: Option<u32>,
+    /// It follows a live restart, holding what is typed meanwhile (see `upgrade`).
+    pub follows_live: bool,
 }
 
 /// A line of the messages log.

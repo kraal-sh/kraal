@@ -97,6 +97,11 @@ pub struct SavedLog {
 }
 
 impl EventLog {
+    /// When the server started (a live restart keeps it).
+    pub fn boot(&self) -> u64 {
+        self.boot
+    }
+
     pub fn save(&self) -> SavedLog {
         SavedLog { boot: self.boot, seq: self.seq, kept: self.kept.iter().cloned().collect() }
     }

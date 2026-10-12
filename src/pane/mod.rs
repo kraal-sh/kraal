@@ -367,6 +367,7 @@ impl Pane {
     pub fn feed(&mut self, bytes: &[u8]) -> Vec<PaneSignal> {
         self.last_output = Instant::now();
         let Content::Term(t) = &mut self.content else { return Vec::new() };
+        t.sequence.feed(bytes);
         let mut signals = Vec::new();
         // The emulator gets the output up to each command mark, so that the mark lands where
         // the shell put it.

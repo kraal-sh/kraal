@@ -363,9 +363,116 @@ pub fn last_stderr_line(out: &Output) -> String {
 
 /// Let a short-lived child run, and reap it when it ends (no zombie left behind).
 pub fn reap_later(mut child: Child) {
+    let pid = child.id();
+    reaping_starts(pid);
     std::thread::spawn(move || {
         let _ = child.wait();
+        reaping_ends(pid);
     });
+}
+
+/// Children this process is to reap, which threads wait for (panes' programs, those of closed
+/// panes still running, short-lived helpers): a live restart hands them over, as exec keeps
+/// them this process's children but not the threads that wait for them.
+static REAPING: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
+
+pub fn reaping_starts(pid: u32) {
+    REAPING.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(pid);
+}
+
+pub fn reaping_ends(pid: u32) {
+    REAPING.lock().unwrap_or_else(std::sync::PoisonError::into_inner).retain(|p| *p != pid);
+}
+
+/// The children being waited for to be reaped (see [`reaping_starts`]).
+pub fn reaping() -> Vec<u32> {
+    REAPING.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
+}
+
+/// Reap child `pid` when it ends, known by its pid alone (one a live restart handed over).
+pub fn reap_pid_later(pid: u32) {
+    reaping_starts(pid);
+    std::thread::spawn(move || {
+        #[cfg(unix)]
+        loop {
+            let mut status = 0;
+            // SAFETY: waitpid on a child of ours writes `status`.
+            let r = unsafe { libc::waitpid(pid as libc::pid_t, &mut status, 0) };
+            if r >= 0 || std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
+                break;
+            }
+        }
+        reaping_ends(pid);
+    });
+}
+
+/// How many commands threads of this process run now (see [`child_running`]), and whether a
+/// thread holds them off (a live restart: the descriptors it keeps open for its exec must not
+/// go to a command started meanwhile, and a command running then would be left behind).
+struct Gate {
+    held_by: Option<std::thread::ThreadId>,
+    running: usize,
+}
+
+static GATE: (std::sync::Mutex<Gate>, std::sync::Condvar) =
+    (std::sync::Mutex::new(Gate { held_by: None, running: 0 }), std::sync::Condvar::new());
+
+/// A command running (see [`child_running`]).
+pub struct ChildRunning(());
+
+impl Drop for ChildRunning {
+    fn drop(&mut self) {
+        let mut gate = GATE.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        gate.running -= 1;
+        GATE.1.notify_all();
+    }
+}
+
+/// Say a command runs until the guard goes, waiting while another thread holds commands off.
+pub fn child_running() -> ChildRunning {
+    let me = std::thread::current().id();
+    let mut gate = GATE.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    while gate.held_by.is_some_and(|t| t != me) {
+        gate = GATE.1.wait(gate).unwrap_or_else(std::sync::PoisonError::into_inner);
+    }
+    gate.running += 1;
+    ChildRunning(())
+}
+
+/// How many commands run (see [`child_running`]).
+pub fn children_running() -> usize {
+    GATE.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner).running
+}
+
+/// Commands held off (see [`hold_children`]) until this goes.
+pub struct ChildrenHeld(());
+
+impl Drop for ChildrenHeld {
+    fn drop(&mut self) {
+        GATE.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner).held_by = None;
+        GATE.1.notify_all();
+    }
+}
+
+/// Hold off the commands of other threads, once those running have ended (`None` when they
+/// have not within `limit`). This thread's own still run.
+pub fn hold_children(limit: Duration) -> Option<ChildrenHeld> {
+    let mut gate = GATE.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if gate.held_by.is_some() {
+        return None;
+    }
+    gate.held_by = Some(std::thread::current().id());
+    let deadline = Instant::now() + limit;
+    while gate.running > 0 {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            gate.held_by = None;
+            GATE.1.notify_all();
+            return None;
+        }
+        gate = GATE.1.wait_timeout(gate, left).unwrap_or_else(std::sync::PoisonError::into_inner).0;
+    }
+    Some(ChildrenHeld(()))
 }
 
 /// Wait until these processes have exited, and the process groups they lead are empty (what
@@ -528,6 +635,8 @@ fn run_from(
     if group {
         own_group(cmd);
     }
+    // From its start to its end: a live restart waits for it, and holds it off.
+    let _running = child_running();
     cmd.stdin(input).stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut child = cmd.spawn()?;
     let drains = Drains::start(&mut child, limit);

@@ -159,9 +159,20 @@ impl Server {
     /// starts the next one, which every attached client waits for.
     pub(super) fn restart(&mut self, client: ClientId) {
         let started =
-            crate::client::installed_exe().and_then(|exe| crate::client::restart_detached(&exe, &self.session));
+            crate::client::installed_exe().and_then(|exe| crate::client::restart_detached(&exe, &self.session, false));
         match started {
-            Ok(()) => self.toast(client, "restarting the session…"),
+            Ok(child) => {
+                self.toast(client, "restarting the session…");
+                let session = self.session.clone();
+                self.background(
+                    move || crate::client::restart_under_way(child, &session, Duration::from_secs(2)),
+                    move |server, result| {
+                        if let Err(why) = result {
+                            server.toast(client, why);
+                        }
+                    },
+                );
+            }
             Err(e) => self.toast(client, format!("cannot restart: {e:#}")),
         }
     }

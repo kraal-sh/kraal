@@ -48,19 +48,21 @@ A live restart moves a running server to another kraal binary (the one `kraal re
 the menu, the one installed where the server was started from) and stops nothing: the server
 replaces itself in place, the new kraal takes over the panes' terminals, and every program in them
 keeps running, with the same pid (a build, a `tail -f`, an editor, an agent in the middle of a
-turn). Each pane shows what it showed, colours,
-cursor and modes included; a full-screen program is made to draw itself again. Pane ids, tunnels
-and their ssh stay. Commands run meanwhile wait for the new kraal. Attached clients come back by
-themselves to the workspace they showed (a client of an older kraal exits instead: `kraal`
-attaches again); `kraal events` ends, and started again with `--since`, it gets what it missed,
-as the numbering goes on.
+turn). Each pane shows what it showed, colours, cursor and modes included; a full-screen program
+is made to draw itself again. Pane ids, tunnels and their ssh stay. Commands run meanwhile are
+answered by one server or the other, and what is typed in an attached terminal reaches the
+programs once it is back. Attached clients come back by themselves to the workspace they showed (a
+client of an older kraal exits instead: `kraal` attaches again); `kraal events` ends, and started
+again with `--since`, it gets what it missed, as the numbering goes on.
 
-The new binary is tried first: there is no live restart on one that cannot take over (an older
-kraal), nor while something cannot be carried over (a runbook run, a transfer, a file open in the
-local editor, an agent switching accounts, a `kraal wait`), and the reason is given. A hook or
-background work still running is waited for a few seconds. Should the exec itself fail, the server
-goes on as before. What the server hands over goes through a file readable by you alone in
-`~/.local/state/kraal/`, deleted as soon as it is read. Linux only for now.
+The binary is tried first, and that very file is run, even if another one is renamed over it
+meanwhile: there is no live restart on one that cannot take over (an older kraal), nor while
+something cannot be carried over (a runbook run, a transfer, a file open in the local editor, an
+agent switching accounts, a `kraal wait`), and the reason is given. What ends by itself is waited
+for a few seconds: a hook, background work, a program that has not read what was typed to it, or
+that is in the middle of writing an escape sequence. Should anything fail before the exec, or the
+exec itself, the server goes on as before. What the server hands over goes through a file readable
+by you alone in `~/.local/state/kraal/`, deleted as soon as it is read. Linux only for now.
 
 ## Workspace files
 

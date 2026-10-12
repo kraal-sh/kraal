@@ -120,6 +120,10 @@ pub enum ClientMsg {
         /// (a local client is that binary): the server says when it is newer than its own.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         installed: Option<String>,
+        /// The client follows a live restart (see [`ServerMsg::Exit`]) and holds what is typed
+        /// when asked to (see [`ServerMsg::Hold`]); an older one is told to attach again.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        live: bool,
     },
     Resize {
         cols: u16,
@@ -148,6 +152,12 @@ pub enum ServerMsg {
         /// it not happen) the session goes on.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         live: bool,
+    },
+    /// Keep what is typed (`on`) rather than send it, until told otherwise or attached again:
+    /// the server is about to replace itself (a live restart), and would lose it. Only to a
+    /// client that said it follows live restarts.
+    Hold {
+        on: bool,
     },
     /// The first answer to an attach: the server's kraal release. A server that does not send
     /// it is older than this message.
@@ -367,6 +377,10 @@ pub enum Response {
         pid: u32,
         session: String,
         version: String,
+        /// When the session's server started, which a live restart keeps (see `kraal events`):
+        /// a restart that is not live changes it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        boot: Option<u64>,
     },
     Pane(Box<PaneInfo>),
     Panes(Vec<PaneInfo>),
@@ -487,6 +501,11 @@ mod tests {
         let upgrade = serde_json::to_value(Request::Upgrade { check: true, binary: None }).unwrap();
         assert_eq!(upgrade, serde_json::json!({"cmd": "upgrade", "check": true}));
         let hello = r#"{"type":"attach","version":2,"cols":80,"rows":24,"workspace":null,"remote":false}"#;
-        assert!(matches!(serde_json::from_str::<ClientMsg>(hello), Ok(ClientMsg::Attach { installed: None, .. })));
+        assert!(matches!(
+            serde_json::from_str::<ClientMsg>(hello),
+            Ok(ClientMsg::Attach { installed: None, live: false, .. })
+        ));
+        let pong = r#"{"kind":"pong","data":{"pid":1,"session":"s","version":"0.2.0"}}"#;
+        assert!(matches!(serde_json::from_str::<Response>(pong), Ok(Response::Pong { boot: None, .. })));
     }
 }

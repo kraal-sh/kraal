@@ -80,6 +80,7 @@ impl Server {
                 last_click: None,
                 welcome: false,
                 remote: false,
+                follows_live: false,
                 peer,
             },
         );
@@ -98,9 +99,10 @@ impl Server {
             }
         };
         match msg {
-            ClientMsg::Attach { version, cols, rows, workspace, remote, pane, installed } => {
+            ClientMsg::Attach { version, cols, rows, workspace, remote, pane, installed, live } => {
                 if let Some(c) = self.clients.get_mut(&id) {
                     c.remote = remote;
+                    c.follows_live = live;
                 }
                 let (cols, rows) = clamp_size(cols, rows);
                 if version != protocol::PROTOCOL_VERSION {

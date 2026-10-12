@@ -134,9 +134,11 @@ impl Drop for Process {
         let Some(mut child) = self.child.get_mut().unwrap_or_else(|e| e.into_inner()).take() else { return };
         // One still running (its pane went first) is reaped when it ends, off this thread. The
         // reaper exists before any pane's program does, so this cannot fail for want of a thread.
-        if !matches!(child.try_wait(), Ok(Some(_)))
-            && let Some(reaper) = REAPER.get()
-        {
+        if matches!(child.try_wait(), Ok(Some(_))) {
+            if let Some(pid) = self.pid {
+                crate::exec::reaping_ends(pid);
+            }
+        } else if let Some(reaper) = REAPER.get() {
             let _ = reaper.send(child);
         }
     }
@@ -165,7 +167,13 @@ fn start_reaper() -> Result<()> {
                 Err(crossbeam_channel::RecvTimeoutError::Disconnected) if waiting.is_empty() => return,
                 Err(_) => {}
             }
-            waiting.retain_mut(|c| matches!(c.try_wait(), Ok(None)));
+            waiting.retain_mut(|c| {
+                let running = matches!(c.try_wait(), Ok(None));
+                if !running && let Some(pid) = c.process_id() {
+                    crate::exec::reaping_ends(pid);
+                }
+                running
+            });
         }
     })?;
     // Another thread may have started one first: this one then ends with its channel.
@@ -191,6 +199,10 @@ pub struct TermPane {
     /// Tells the reader to stop, even if the program never writes again (it may outlive the
     /// pane, ignoring the hangup).
     reader_stop: Arc<AtomicBool>,
+    /// Set once a reader has seen the end of the output (a reader told to stop has not).
+    eof: Arc<Eof>,
+    /// Where the program's output stands: between sequences or in one.
+    pub(super) sequence: super::live::Sequence,
     pub pid: Option<u32>,
     pub(super) osc: OscScanner,
     pub(super) guard: KeyboardStackGuard,
@@ -274,6 +286,9 @@ impl TermPane {
         drop(pair.slave);
         let pid = child.process_id();
         let process = Arc::new(Process { pid, child: Mutex::new(Some(child)) });
+        if let Some(pid) = pid {
+            crate::exec::reaping_starts(pid);
+        }
         // A failure from here on must not leave the program running: it is killed, and reaped
         // when `process` goes (by the reaper, once the kill has taken effect).
         let held = process.clone();
@@ -300,6 +315,7 @@ impl TermPane {
         start_reaper().context("starting the thread that reaps panes' programs")?;
         let child: PaneChild = Box::new(AdoptedChild { pid });
         let process = Arc::new(Process { pid: Some(pid), child: Mutex::new(Some(child)) });
+        crate::exec::reaping_starts(pid);
         TermPane::assemble(id, Box::new(AdoptedPty { fd }), process, watch, size, env, tx)
     }
 
@@ -318,13 +334,13 @@ impl TermPane {
         if watch {
             let wait_tx = tx.clone();
             let waited = process.clone();
-            let eof_rx = io.eof;
+            let eof = io.eof.clone();
             let started = std::thread::Builder::new().name(format!("pane-{id}-wait")).spawn(move || {
                 // Wait for the end without reaping: that is left to whoever drops the process last.
                 let code = wait_exited(waited.pid);
                 // Report the exit after the last output, so waits and logs see all of it. A program
                 // left in the background can keep the terminal open: then do not wait forever.
-                let _ = eof_rx.recv_timeout(std::time::Duration::from_secs(2));
+                eof.wait(std::time::Duration::from_secs(2));
                 let _ = wait_tx.send(Event::PaneExited(id, waited.pid, code));
             });
             if let Err(e) = started {
@@ -349,6 +365,8 @@ impl TermPane {
             pid: process.pid,
             process,
             reader_stop: io.stop,
+            eof: io.eof,
+            sequence: Default::default(),
             osc: OscScanner::default(),
             guard: KeyboardStackGuard::default(),
             commands: Commands::new(env.scrollback),
@@ -364,7 +382,7 @@ impl TermPane {
 
     /// Read the PTY again after [`TermPane::stop_reading`].
     pub(super) fn resume_reading(&mut self, id: PaneId, tx: &Sender<Event>) -> Result<()> {
-        let (output, stop, _eof) = start_reader(id, &*self.master, tx)?;
+        let (output, stop) = start_reader(id, &*self.master, tx, &self.eof)?;
         self.output = output;
         self.reader_stop = stop;
         Ok(())
@@ -467,14 +485,15 @@ struct Io {
     input: Sender<Vec<u8>>,
     input_pending: Arc<AtomicUsize>,
     output: crossbeam_channel::Receiver<Vec<u8>>,
-    /// Closed when the reader has seen the end of the output.
-    eof: crossbeam_channel::Receiver<()>,
+    /// Set when the reader has seen the end of the output.
+    eof: Arc<Eof>,
     stop: Arc<AtomicBool>,
 }
 
 fn start_io(id: PaneId, master: &(dyn MasterPty + Send), tx: &Sender<Event>) -> Result<Io> {
     let mut writer = master.take_writer()?;
-    let (out_rx, stop, eof_rx) = start_reader(id, master, tx)?;
+    let eof = Arc::new(Eof::default());
+    let (out_rx, stop) = start_reader(id, master, tx, &eof)?;
     let (in_tx, in_rx) = crossbeam_channel::unbounded::<Vec<u8>>();
     let input_pending = Arc::new(AtomicUsize::new(0));
     let pending = input_pending.clone();
@@ -490,27 +509,51 @@ fn start_io(id: PaneId, master: &(dyn MasterPty + Send), tx: &Sender<Event>) -> 
         stop.store(true, Ordering::Relaxed);
         return Err(e.into());
     }
-    Ok(Io { input: in_tx, input_pending, output: out_rx, eof: eof_rx, stop })
+    Ok(Io { input: in_tx, input_pending, output: out_rx, eof, stop })
 }
 
-/// The thread that reads a PTY's output: the channel it goes to, the flag that stops it, and
-/// a channel closed when it has seen the end.
-type Reading = (crossbeam_channel::Receiver<Vec<u8>>, Arc<AtomicBool>, crossbeam_channel::Receiver<()>);
+/// Whether a PTY's output has ended, as its readers saw it: a reader stopped (and replaced, see
+/// [`TermPane::resume_reading`]) has not seen it.
+#[derive(Default)]
+pub(super) struct Eof {
+    seen: Mutex<bool>,
+    told: std::sync::Condvar,
+}
 
-fn start_reader(id: PaneId, master: &(dyn MasterPty + Send), tx: &Sender<Event>) -> Result<Reading> {
+impl Eof {
+    fn set(&self) {
+        *self.seen.lock().unwrap_or_else(|e| e.into_inner()) = true;
+        self.told.notify_all();
+    }
+
+    /// Wait until the end was seen, at most `limit`.
+    fn wait(&self, limit: std::time::Duration) {
+        let seen = self.seen.lock().unwrap_or_else(|e| e.into_inner());
+        let _ = self.told.wait_timeout_while(seen, limit, |seen| !*seen);
+    }
+}
+
+/// The thread that reads a PTY's output: the channel it goes to, and the flag that stops it.
+/// `eof` is set when it sees the end.
+type Reading = (crossbeam_channel::Receiver<Vec<u8>>, Arc<AtomicBool>);
+
+fn start_reader(id: PaneId, master: &(dyn MasterPty + Send), tx: &Sender<Event>, eof: &Arc<Eof>) -> Result<Reading> {
     let reader = PtyReader::new(master)?;
     let stop = Arc::new(AtomicBool::new(false));
     let ready_tx = tx.clone();
     let (out_tx, out_rx) = crossbeam_channel::bounded::<Vec<u8>>(4);
-    let (eof_tx, eof_rx) = crossbeam_channel::bounded::<()>(0);
-    let stopped = stop.clone();
+    let (stopped, eof) = (stop.clone(), eof.clone());
     std::thread::Builder::new().name(format!("pane-{id}-read")).spawn(move || {
-        let _eof = eof_tx;
         let mut reader = reader;
         let mut buf = vec![0u8; 64 * 1024];
         loop {
             match reader.read(&mut buf, &stopped) {
-                Ok(0) | Err(_) => break,
+                // Told to stop: another reader may take over; the output has not ended.
+                Ok(0) if stopped.load(Ordering::Relaxed) => break,
+                Ok(0) | Err(_) => {
+                    eof.set();
+                    break;
+                }
                 Ok(n) => {
                     if out_tx.send(buf[..n].to_vec()).is_err() {
                         return;
@@ -521,7 +564,7 @@ fn start_reader(id: PaneId, master: &(dyn MasterPty + Send), tx: &Sender<Event>)
             }
         }
     })?;
-    Ok((out_rx, stop, eof_rx))
+    Ok((out_rx, stop))
 }
 
 /// The PTY of a program taken over by a live restart: the descriptor the kraal before kept
@@ -972,5 +1015,50 @@ mod tests {
             std::thread::sleep(Duration::from_millis(20));
         }
         assert!(!taken(), "ended, and not left a zombie");
+    }
+
+    /// A live restart that did not happen stops a pane's reader, then starts another: stopping
+    /// is not the end of the output (the exit would be told without waiting for its last
+    /// output), and the reader after it tells the end when it comes.
+    #[test]
+    fn a_reader_stopped_and_replaced_still_tells_when_the_output_ends() {
+        let dir = std::env::temp_dir().join(format!("kraal-reread-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let go = dir.join("go");
+        let (tx, rx) = crossbeam_channel::bounded(1024);
+        let env = PaneEnv {
+            socket: "/nonexistent".into(),
+            session: "t".into(),
+            shell: "sh".into(),
+            scrollback: 100,
+            graphics: Default::default(),
+        };
+        let script = format!("while [ ! -e '{}' ]; do sleep 0.05; done; echo LAST", go.display());
+        let spec = PaneSpec { command: vec!["sh".into(), "-c".into(), script], ..Default::default() };
+        let mut pane = super::Pane::spawn(1, None, spec, 80, 24, &env, &tx).unwrap();
+        let ended = |pane: &super::Pane| *pane.term().unwrap().eof.seen.lock().unwrap();
+        pane.stop_reading();
+        let start = Instant::now();
+        while !matches!(pane.drain(), crate::pane::Drained::Stopped) {
+            assert!(start.elapsed() < Duration::from_secs(5), "the reader did not stop");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!ended(&pane), "a reader told to stop is not the end of the output");
+        pane.resume_reading(&tx).unwrap();
+        std::fs::write(&go, "").unwrap();
+        let mut seen = Vec::new();
+        let start = Instant::now();
+        while !(ended(&pane) && rx.try_iter().any(|e| matches!(e, Event::PaneExited(..)))) {
+            assert!(start.elapsed() < Duration::from_secs(10), "the end was not told");
+            while let Some(data) = pane.take_output() {
+                seen.extend_from_slice(&data);
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        while let Some(data) = pane.take_output() {
+            seen.extend_from_slice(&data);
+        }
+        assert!(String::from_utf8_lossy(&seen).contains("LAST"), "{:?}", String::from_utf8_lossy(&seen));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

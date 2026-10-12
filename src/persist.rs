@@ -236,7 +236,13 @@ pub fn load(session: &str) -> Result<Option<SessionSnapshot>> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
     };
-    let snap: SessionSnapshot = serde_json::from_slice(&data).with_context(|| format!("parsing {}", path.display()))?;
+    // As deep as the layout is: each split nests a few levels, more than serde_json's default
+    // limit allows past a few dozen splits.
+    let mut de = serde_json::Deserializer::from_slice(&data);
+    de.disable_recursion_limit();
+    let snap = SessionSnapshot::deserialize(&mut de)
+        .and_then(|snap| de.end().map(|()| snap))
+        .with_context(|| format!("parsing {}", path.display()))?;
     if snap.version != VERSION {
         anyhow::bail!("unsupported state version {}", snap.version);
     }

@@ -1,25 +1,33 @@
-//! Live restart: the server replaces itself with the kraal binary now installed, and no program
-//! in its panes stops.
+//! Live restart: the server replaces itself with another kraal binary, and no program in its
+//! panes stops.
 //!
 //! `exec` keeps the process, so the panes' programs stay its children, and their PTYs stay open
-//! when their descriptors are not closed on exec. First the server checks that the new binary
-//! runs and reads this hand-off's format, stops reading the PTYs (what was read is drawn first),
-//! and writes a private hand-off file: the session's state with each pane's id, and for each
-//! terminal pane its PTY's descriptor, its program, and what its emulator shows (text with its
-//! attributes, cursors, modes). The new server reads it (and deletes it), keeps listening on
-//! the same socket, rebuilds every pane on its PTY and program, and has full-screen programs
-//! draw themselves again. Attached clients are told, and come back once it answers.
+//! when their descriptors are not closed on exec. The binary is opened once, tried (it runs and
+//! reads this hand-off's format), and that very file is run, unless it changed meanwhile. Before
+//! the exec, the server stops taking connections (they wait for the next server) and answers
+//! the commands it has read; it waits for the commands its threads run, and holds off new ones;
+//! it stops reading the PTYs (what was read is drawn first), and goes on only when every
+//! program's output stands between two sequences and its input has been taken. It writes a
+//! private hand-off file: the session's state with each pane's id, and for each terminal pane
+//! its PTY's descriptor, its program, and what its emulator shows (text with its attributes,
+//! cursors, modes), read back first to be sure the next server reads it. The new server reads it
+//! (and deletes it), keeps listening on the same socket, rebuilds every pane on its PTY and
+//! program, and has full-screen programs draw themselves again. Attached clients hold what is
+//! typed meanwhile, and come back once it answers.
 //!
 //! What cannot be carried over is refused, with the reason: a runbook run, a transfer, a file
-//! open in the local editor, an account switch, a `kraal wait`, and a hook or background work
-//! still running after a few seconds. Tunnels keep their ssh; those that list remote sessions'
-//! agents are started again.
+//! open in the local editor, an account switch, a `kraal wait`; and what does not end within a
+//! few seconds (a hook, background work, a command being answered, input a program does not
+//! read, a sequence cut in two). The server then goes on as before. Tunnels keep their ssh;
+//! those that list remote sessions' agents are started again.
 
 use std::collections::HashMap;
-use std::ffi::OsStr;
-use std::os::fd::{FromRawFd, OwnedFd, RawFd};
+use std::ffi::{CString, OsStr};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
@@ -29,7 +37,7 @@ use serde::{Deserialize, Serialize};
 use super::events::{EventLog, SavedLog};
 use super::net::{LiveTunnel, TunnelState};
 use super::ui::{ConfirmAction, Mode};
-use super::{ClientId, Server};
+use super::{ClientId, Event, Server};
 use crate::layout::PaneId;
 use crate::pane::{Drained, LivePane, Pane};
 use crate::persist::{self, PaneSnap, SavedScrollback, SessionSnapshot};
@@ -38,8 +46,10 @@ use crate::protocol::{Response, ServerMsg};
 /// The format of the hand-off file. A kraal takes over only from one whose format it reads.
 pub const HANDOFF_VERSION: u32 = 1;
 
-/// How long a live restart waits for background work to end before it gives up.
+/// How long a live restart waits for what is in its way to end before it gives up.
 const IDLE_WAIT: Duration = Duration::from_secs(5);
+/// How long the hand-off may take to reach the disk.
+const WRITE_WAIT: Duration = Duration::from_secs(5);
 
 /// What a server hands over to the one that replaces it.
 #[derive(Serialize, Deserialize)]
@@ -50,6 +60,8 @@ pub struct Handoff {
     session: String,
     /// The listening socket, kept open: a client connecting meanwhile waits for the new server.
     listener: RawFd,
+    /// The binary run, kept open to be run: the new server closes it.
+    binary: RawFd,
     next_id: u32,
     layout_area: (u16, u16, u16, u16),
     sidebar_was_useful: bool,
@@ -64,12 +76,15 @@ pub struct Handoff {
     port_candidates: Vec<(u16, PaneId)>,
     /// Connections accepted and not handled yet.
     connections: Vec<RawFd>,
+    /// Children no pane has any more (a closed pane's program that ignored the hangup), still to
+    /// be reaped when they end.
+    reaping: Vec<u32>,
 }
 
 impl Handoff {
     /// The descriptors it names: they stay open over the exec.
     fn fds(&self) -> Vec<RawFd> {
-        let mut fds = vec![self.listener];
+        let mut fds = vec![self.listener, self.binary];
         fds.extend(self.panes.iter().map(|p| p.fd));
         fds.extend(self.tunnels.iter().filter_map(|t| t.stderr));
         fds.extend(&self.connections);
@@ -84,6 +99,16 @@ impl Handoff {
         // SAFETY: the hand-off gives this process the descriptor, which nothing else owns.
         socket.then(|| unsafe { std::os::unix::net::UnixListener::from_raw_fd(self.listener) })
     }
+}
+
+/// A hand-off as the next server reads it: as deep as the layout is (each split nests a few
+/// levels), which serde_json's default limit would refuse past a few dozen splits.
+fn parse_handoff(data: &[u8]) -> serde_json::Result<Handoff> {
+    let mut de = serde_json::Deserializer::from_slice(data);
+    de.disable_recursion_limit();
+    let h = Handoff::deserialize(&mut de)?;
+    de.end()?;
+    Ok(h)
 }
 
 /// What `kraal server --handoff-check` prints when it reads hand-off format `version`.
@@ -115,16 +140,74 @@ fn binary_to_run(asked: Option<PathBuf>) -> Result<PathBuf, String> {
     Ok(exe)
 }
 
-/// Whether `exe` runs here and takes over this hand-off's format.
-fn check_binary(exe: &Path) -> Result<(), String> {
-    let mut cmd = std::process::Command::new(exe);
+/// What identifies a file's content: it is the same file, and was not written since (its
+/// change time is not compared: it changes too when the file loses its name to a newer one).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Stamp {
+    dev: u64,
+    ino: u64,
+    size: u64,
+    mtime: (i64, i64),
+}
+
+impl Stamp {
+    fn of(file: &std::fs::File) -> std::io::Result<Stamp> {
+        use std::os::unix::fs::MetadataExt;
+        let m = file.metadata()?;
+        Ok(Stamp { dev: m.dev(), ino: m.ino(), size: m.size(), mtime: (m.mtime(), m.mtime_nsec()) })
+    }
+}
+
+/// The kraal binary a live restart runs, opened once: the file tried is the file run, whatever
+/// its path names by then (an update renames another one over it).
+struct Binary {
+    path: PathBuf,
+    file: std::fs::File,
+    /// What it was when opened: it must still be that when run.
+    stamp: Stamp,
+}
+
+impl Binary {
+    fn open(asked: Option<PathBuf>) -> Result<Binary, String> {
+        let path = binary_to_run(asked)?;
+        let file = std::fs::File::open(&path).map_err(|e| format!("cannot open {}: {e}", path.display()))?;
+        let stamp = Stamp::of(&file).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+        Ok(Binary { path, file, stamp })
+    }
+
+    fn fd(&self) -> RawFd {
+        self.file.as_raw_fd()
+    }
+
+    /// Whether the file is still what was opened (not written to since).
+    fn unchanged(&self) -> bool {
+        Stamp::of(&self.file).is_ok_and(|s| s == self.stamp)
+    }
+}
+
+/// Whether `binary` runs here and takes over this hand-off's format: the very file opened, run
+/// through this process's descriptor of it.
+fn check_binary(binary: &Binary) -> Result<(), String> {
+    use std::os::unix::process::CommandExt;
+    let fd = binary.fd();
+    let mut cmd = std::process::Command::new(format!("/proc/self/fd/{fd}"));
     cmd.args(["server", "--handoff-check", &HANDOFF_VERSION.to_string()]);
+    // SAFETY: fcntl is async-signal-safe. A script reads itself through the descriptor: it
+    // stays open in the command, and only there.
+    unsafe {
+        cmd.pre_exec(move || {
+            if libc::fcntl(fd, libc::F_SETFD, 0) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
     let out = crate::exec::run(&mut cmd, Duration::from_secs(10), 4096)
-        .map_err(|e| format!("cannot run {}: {e}", exe.display()))?;
+        .map_err(|e| format!("cannot run {}: {e}", binary.path.display()))?;
     if out.success() && out.stdout_text().trim() == check_answer(HANDOFF_VERSION) {
         return Ok(());
     }
-    Err(format!("the kraal installed cannot take over live ({}: an older kraal, or not one)", exe.display()))
+    Err(format!("the kraal installed cannot take over live ({}: an older kraal, or not one)", binary.path.display()))
 }
 
 fn handoff_path(session: &str) -> PathBuf {
@@ -144,11 +227,10 @@ fn set_inherited(fd: RawFd, inherited: bool) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Replace this process with `exe`, a server of `session` that takes over from `handoff`.
-/// Returns only when that failed, with why.
-fn exec(exe: &Path, session: &str, handoff: &Path) -> std::io::Error {
-    use std::ffi::CString;
-    let arg0 = std::env::args_os().next().unwrap_or_else(|| exe.as_os_str().to_owned());
+/// Replace this process with `binary` (through its descriptor: that very file), a server of
+/// `session` that takes over from `handoff`. Returns only when that failed, with why.
+fn exec(binary: &Binary, session: &str, handoff: &Path) -> std::io::Error {
+    let arg0 = std::env::args_os().next().unwrap_or_else(|| binary.path.as_os_str().to_owned());
     let args: [&OsStr; 6] = [
         &arg0,
         OsStr::new("--handoff"),
@@ -157,16 +239,60 @@ fn exec(exe: &Path, session: &str, handoff: &Path) -> std::io::Error {
         OsStr::new("--session"),
         OsStr::new(session),
     ];
-    let c = |s: &OsStr| CString::new(s.as_bytes());
-    let (Ok(program), Ok(argv)) = (c(exe.as_os_str()), args.iter().map(|a| c(a)).collect::<Result<Vec<_>, _>>()) else {
+    let Ok(argv) = args.iter().map(|a| CString::new(a.as_bytes())).collect::<Result<Vec<_>, _>>() else {
         return std::io::Error::new(std::io::ErrorKind::InvalidInput, "a path holds a NUL byte");
     };
-    let mut ptrs: Vec<*const libc::c_char> = argv.iter().map(|a| a.as_ptr()).collect();
-    ptrs.push(std::ptr::null());
-    // SAFETY: NUL-terminated strings in a NULL-terminated array, alive across the call; execv
-    // returns only when it failed.
-    unsafe { libc::execv(program.as_ptr(), ptrs.as_ptr()) };
-    std::io::Error::last_os_error()
+    let env: Vec<CString> = std::env::vars_os()
+        .filter_map(|(k, v)| CString::new([k.as_bytes(), b"=", v.as_bytes()].concat()).ok())
+        .collect();
+    let mut argv_ptrs: Vec<*const libc::c_char> = argv.iter().map(|a| a.as_ptr()).collect();
+    argv_ptrs.push(std::ptr::null());
+    let mut env_ptrs: Vec<*const libc::c_char> = env.iter().map(|a| a.as_ptr()).collect();
+    env_ptrs.push(std::ptr::null());
+    #[cfg(target_os = "linux")]
+    {
+        // SAFETY: NUL-terminated strings in NULL-terminated arrays, alive across the call;
+        // fexecve returns only when it failed.
+        unsafe { libc::fexecve(binary.fd(), argv_ptrs.as_ptr(), env_ptrs.as_ptr()) };
+        std::io::Error::last_os_error()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (argv_ptrs, env_ptrs);
+        std::io::Error::new(std::io::ErrorKind::Unsupported, "a live restart is only available on Linux")
+    }
+}
+
+/// Run `work` on a thread of its own, waiting `limit` at most: what it gave, or `None` when it
+/// took longer (then `abandoned` gets what it gives once done).
+fn within<T: Send + 'static>(
+    limit: Duration,
+    work: impl FnOnce() -> T + Send + 'static,
+    abandoned: impl FnOnce(T) + Send + 'static,
+) -> Option<T> {
+    let (tx, rx) = std::sync::mpsc::sync_channel::<T>(1);
+    let given_up = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let late = given_up.clone();
+    let spawned = std::thread::Builder::new().name("handoff".into()).spawn(move || {
+        let result = work();
+        if late.load(std::sync::atomic::Ordering::SeqCst) {
+            abandoned(result);
+        } else if let Err(std::sync::mpsc::TrySendError::Full(r) | std::sync::mpsc::TrySendError::Disconnected(r)) =
+            tx.try_send(result)
+        {
+            abandoned(r);
+        }
+    });
+    if spawned.is_err() {
+        return None;
+    }
+    let got = rx.recv_timeout(limit).ok();
+    if got.is_none() {
+        given_up.store(true, std::sync::atomic::Ordering::SeqCst);
+        // Done just then: it is here after all.
+        return rx.try_recv().ok();
+    }
+    got
 }
 
 /// Read the hand-off at `path` (deleted at once: it holds what the panes showed) for
@@ -175,7 +301,7 @@ pub fn read_handoff(path: &Path, session: &str) -> Result<Handoff> {
     let data = crate::paths::read_regular(path, 1 << 30);
     let _ = std::fs::remove_file(path);
     let data = data.with_context(|| format!("reading {}", path.display()))?;
-    let h: Handoff = serde_json::from_slice(&data).with_context(|| format!("parsing {}", path.display()))?;
+    let h = parse_handoff(&data).with_context(|| format!("parsing {}", path.display()))?;
     if h.version != HANDOFF_VERSION {
         bail!("hand-off format {} (this kraal reads {HANDOFF_VERSION})", h.version);
     }
@@ -184,6 +310,10 @@ pub fn read_handoff(path: &Path, session: &str) -> Result<Handoff> {
     }
     for fd in h.fds() {
         let _ = set_inherited(fd, false);
+    }
+    // SAFETY: the binary this runs from, open for the exec and of no use now.
+    unsafe {
+        libc::close(h.binary);
     }
     Ok(h)
 }
@@ -214,6 +344,30 @@ pub(super) enum Asker {
     Menu(ClientId),
 }
 
+impl Asker {
+    fn request(self) -> Option<ClientId> {
+        match self {
+            Asker::Request(c) => Some(c),
+            Asker::Menu(_) => None,
+        }
+    }
+}
+
+/// Why a live restart did not happen.
+enum NotNow {
+    /// Something that ends by itself is in the way: it is tried again for a while.
+    Busy(String),
+    /// It cannot happen.
+    Refused(String),
+}
+
+/// What is held while a live restart is prepared: connections not handled yet, which go to the
+/// next server, and events read meanwhile, handled should it not happen.
+struct Held {
+    connections: Vec<UnixStream>,
+    events: Vec<Event>,
+}
+
 impl Server {
     /// `kraal restart` asks for a live restart on `binary` (the server's own kraal by default),
     /// or with `check` whether one can happen now. Answered when it does not happen, with why
@@ -225,8 +379,8 @@ impl Server {
         if let Some(why) = self.upgrade_refusal() {
             return Some(Err(why));
         }
-        let exe = match binary_to_run(binary) {
-            Ok(exe) => exe,
+        let exe = match Binary::open(binary) {
+            Ok(exe) => Arc::new(exe),
             Err(e) => return Some(Err(e)),
         };
         if check {
@@ -251,7 +405,7 @@ impl Server {
             return self.cold_restart_question(&why);
         }
         let started = self.background(
-            || binary_to_run(None).and_then(|exe| check_binary(&exe)),
+            || Binary::open(None).and_then(|exe| check_binary(&exe)),
             move |server, tried| {
                 let mode = match tried {
                     Ok(()) => Mode::confirm(
@@ -277,14 +431,14 @@ impl Server {
         if self.upgrading {
             return self.toast(client, "a live restart is already under way");
         }
-        match binary_to_run(None) {
-            Ok(exe) => self.start_upgrade(Asker::Menu(client), exe),
+        match Binary::open(None) {
+            Ok(exe) => self.start_upgrade(Asker::Menu(client), Arc::new(exe)),
             Err(why) => self.toast(client, format!("no live restart: {why}")),
         }
     }
 
     /// Try `exe`, then hand over to it once nothing in the way is left (see `upgrade_now`).
-    fn start_upgrade(&mut self, asker: Asker, exe: PathBuf) {
+    fn start_upgrade(&mut self, asker: Asker, exe: Arc<Binary>) {
         self.upgrading = true;
         let checked = exe.clone();
         let started = self.background(
@@ -342,27 +496,48 @@ impl Server {
         None
     }
 
-    /// What a live restart waits for, a few seconds at most: work that usually ends by itself
-    /// in a moment.
-    fn upgrade_busy(&self) -> Option<&'static str> {
+    /// What a live restart waits for, a few seconds at most: what usually ends by itself in a
+    /// moment.
+    fn upgrade_busy(&self) -> Option<String> {
         if self.hooks.running() > 0 {
-            return Some("a hook is running");
+            return Some("a hook is running".into());
         }
-        if !self.jobs.is_empty() {
-            return Some("background work is still running");
+        if !self.jobs.is_empty() || crate::exec::children_running() > 0 {
+            return Some("background work is still running".into());
         }
         if !self.held_input.is_empty() {
-            return Some("typed input waits for a pane's context to be read");
+            return Some("typed input waits for a pane's context to be read".into());
         }
         if self.tunnels.iter().any(|t| t.state == TunnelState::Connecting) {
-            return Some("a tunnel is connecting");
+            return Some("a tunnel is connecting".into());
+        }
+        self.pane_busy()
+    }
+
+    /// A pane a live restart cannot take as it is now: a program that has not taken its input,
+    /// or whose output stops in the middle of a sequence.
+    fn pane_busy(&self) -> Option<String> {
+        let mut ids: Vec<&PaneId> = self.panes.keys().collect();
+        ids.sort();
+        for id in ids {
+            let p = &self.panes[id];
+            // A program that ended reads nothing more, and writes nothing more.
+            if p.exit_code.is_some() {
+                continue;
+            }
+            if p.input_pending() > 0 {
+                return Some(format!("{} has input it has not read yet", self.pane_label(*id)));
+            }
+            if p.mid_sequence() {
+                return Some(format!("{} is in the middle of writing an escape sequence", self.pane_label(*id)));
+            }
         }
         None
     }
 
-    fn upgrade_when_idle(&mut self, asker: Asker, exe: PathBuf, deadline: Instant) {
+    fn upgrade_when_idle(&mut self, asker: Asker, exe: Arc<Binary>, deadline: Instant) {
         // The command that asked gave up (ctrl+c): nothing happens.
-        if let Asker::Request(client) = asker
+        if let Some(client) = asker.request()
             && !self.clients.contains_key(&client)
         {
             self.upgrading = false;
@@ -371,21 +546,23 @@ impl Server {
         if let Some(why) = self.upgrade_refusal() {
             return self.upgrade_failed(asker, why);
         }
-        if let Some(why) = self.upgrade_busy() {
-            if Instant::now() >= deadline {
-                return self.upgrade_failed(asker, format!("{why}: try again in a moment"));
-            }
-            let started = self.background(
-                || std::thread::sleep(Duration::from_millis(50)),
-                move |server, ()| server.upgrade_when_idle(asker, exe, deadline),
-            );
-            if !started {
-                self.upgrade_failed(asker, why.to_string());
-            }
-            return;
+        let busy = match self.upgrade_busy() {
+            Some(why) => why,
+            None => match self.upgrade_now(asker, &exe) {
+                NotNow::Busy(why) => why,
+                NotNow::Refused(why) => return self.upgrade_failed(asker, why),
+            },
+        };
+        if Instant::now() >= deadline {
+            return self.upgrade_failed(asker, format!("{busy}: try again in a moment"));
         }
-        let why = self.upgrade_now(&exe);
-        self.upgrade_failed(asker, why);
+        let started = self.background(
+            || std::thread::sleep(Duration::from_millis(50)),
+            move |server, ()| server.upgrade_when_idle(asker, exe, deadline),
+        );
+        if !started {
+            self.upgrade_failed(asker, busy);
+        }
     }
 
     fn upgrade_failed(&mut self, asker: Asker, why: String) {
@@ -400,72 +577,122 @@ impl Server {
     }
 
     /// Hand everything over to `exe` and become it. Returns only when that did not happen, with
-    /// why; the server then goes on as before. From now on connections wait for the next server
-    /// (in the socket's backlog), and those accepted but not handled yet go to it too.
-    fn upgrade_now(&mut self, exe: &Path) -> String {
-        let held = self.hold_connections();
-        let fds: Vec<RawFd> = held.0.iter().map(std::os::fd::AsRawFd::as_raw_fd).collect();
-        let why = self.hand_over(exe, fds);
-        self.release_connections(held);
+    /// why; the server then goes on as before.
+    fn upgrade_now(&mut self, asker: Asker, exe: &Binary) -> NotNow {
+        // Commands run by other threads end first, and none starts until the exec: it would
+        // get the descriptors kept open for it, and be left behind.
+        let Some(children) = crate::exec::hold_children(Duration::from_millis(500)) else {
+            return NotNow::Busy("background work is still running".into());
+        };
+        let held = match self.quiesce(asker) {
+            Ok(held) => held,
+            Err(why) => return NotNow::Busy(why),
+        };
+        let why = self.hand_over(exe, &held);
+        drop(children);
+        self.release(held);
         why
     }
 
-    /// Stop accepting connections, and take those waiting to be handled out of the events, with
-    /// the other events read meanwhile.
-    fn hold_connections(&mut self) -> (Vec<std::os::unix::net::UnixStream>, Vec<super::Event>) {
+    /// Stop taking connections (they wait for the next server in the socket's backlog), have
+    /// attached clients hold what is typed, and answer the commands already read. Connections
+    /// accepted and not handled yet are kept for the next server.
+    fn quiesce(&mut self, asker: Asker) -> Result<Held, String> {
         use std::sync::atomic::Ordering;
         self.accepting.paused.store(true, Ordering::SeqCst);
         let start = Instant::now();
         while !self.accepting.parked.load(Ordering::SeqCst) && start.elapsed() < Duration::from_secs(1) {
             std::thread::sleep(Duration::from_millis(5));
         }
-        let mut connections = Vec::new();
-        let mut events = Vec::new();
-        while let Ok(ev) = self.events_rx.try_recv() {
-            match ev {
-                super::Event::Connection(stream) => connections.push(stream),
-                other => events.push(other),
-            }
+        let holding: Vec<ClientId> =
+            self.clients.values().filter(|c| c.attached && c.follows_live).map(|c| c.id).collect();
+        for id in &holding {
+            self.send_msg(*id, &ServerMsg::Hold { on: true });
         }
-        (connections, events)
+        let mut held = Held { connections: Vec::new(), events: Vec::new() };
+        // A moment for what was typed before the clients heard to arrive.
+        let settle = Instant::now() + Duration::from_millis(50);
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            while let Ok(ev) = self.events_rx.try_recv() {
+                match ev {
+                    Event::Connection(stream) => held.connections.push(stream),
+                    other => {
+                        self.handle(other);
+                        self.follow_focus();
+                    }
+                }
+            }
+            // A command whose request was not read yet, or is being answered.
+            let answering = self.clients.values().any(|c| !c.attached && Some(c.id) != asker.request());
+            if !answering && Instant::now() >= settle {
+                return Ok(held);
+            }
+            if Instant::now() >= deadline {
+                self.release(held);
+                return Err("a command is still being answered".into());
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
     }
 
-    /// The live restart did not happen: what was held is handled, and connections accepted again.
-    fn release_connections(&mut self, (connections, events): (Vec<std::os::unix::net::UnixStream>, Vec<super::Event>)) {
-        for ev in events {
+    /// The live restart did not happen: what was held is handled, attached clients send what
+    /// they held, and connections are accepted again.
+    fn release(&mut self, held: Held) {
+        for ev in held.events {
             self.handle(ev);
         }
-        for stream in connections {
+        for stream in held.connections {
             self.new_connection(stream);
+        }
+        let holding: Vec<ClientId> =
+            self.clients.values().filter(|c| c.attached && c.follows_live).map(|c| c.id).collect();
+        for id in holding {
+            self.send_msg(id, &ServerMsg::Hold { on: false });
         }
         self.accepting.paused.store(false, std::sync::atomic::Ordering::SeqCst);
     }
 
-    fn hand_over(&mut self, exe: &Path, connections: Vec<RawFd>) -> String {
+    /// Stop reading the PTYs and write the hand-off, then exec. Returns only when that did not
+    /// happen (the PTYs are read again then).
+    fn hand_over(&mut self, exe: &Binary, held: &Held) -> NotNow {
         // What the PTYs hold stays there from now on, and what was read is drawn: nothing read
         // is lost in the exec.
         let ids: Vec<PaneId> = self.panes.keys().copied().collect();
         for id in &ids {
             self.panes[id].stop_reading();
         }
-        if let Err(why) = self.drain_panes(&ids) {
-            self.resume_panes();
-            return why;
+        let why = self.prepare_and_exec(exe, held, &ids);
+        self.resume_panes();
+        why
+    }
+
+    fn prepare_and_exec(&mut self, exe: &Binary, held: &Held, ids: &[PaneId]) -> NotNow {
+        if let Err(why) = self.drain_panes(ids) {
+            return NotNow::Busy(why);
         }
         // Drawing it may have started something (a hook).
-        let started = (self.hooks.running() > 0).then(|| "a hook started: try again in a moment".to_string());
-        if let Some(why) = self.upgrade_refusal().or(started) {
-            self.resume_panes();
-            return why;
+        if let Some(why) = self.upgrade_refusal() {
+            return NotNow::Refused(why);
         }
-        for id in &ids {
+        if self.hooks.running() > 0 {
+            return NotNow::Busy("a hook started".into());
+        }
+        for id in ids {
             let signals = self.panes.get_mut(id).map(|p| p.end_sync()).unwrap_or_default();
             self.pane_signals(*id, signals);
         }
-        // Input and answers on their way reach the programs.
+        // Input and answers on their way reach the programs; a program that does not take
+        // them is waited for (they would be lost), and so is one in the middle of a sequence
+        // (the next emulator could not read its end).
         let start = Instant::now();
-        while self.panes.values().any(|p| p.input_pending() > 0) && start.elapsed() < Duration::from_secs(1) {
+        while self.panes.values().any(|p| p.exit_code.is_none() && p.input_pending() > 0)
+            && start.elapsed() < Duration::from_secs(1)
+        {
             std::thread::sleep(Duration::from_millis(5));
+        }
+        if let Some(why) = self.pane_busy() {
+            return NotNow::Busy(why);
         }
         // The state is saved as always: should the new server not start, `kraal` brings the
         // layout back.
@@ -475,18 +702,38 @@ impl Server {
         if self.run_logs.send(crate::runbooks::LogJob::Flush(done)).is_ok() {
             let _ = flushed.recv_timeout(Duration::from_secs(3));
         }
-        let mut handoff = self.handoff();
-        handoff.connections = connections;
+        let mut handoff = self.handoff(exe);
+        handoff.connections = held.connections.iter().map(|c| c.as_raw_fd()).collect();
         let fds = handoff.fds();
         let path = handoff_path(&self.session);
-        let written = serde_json::to_vec(&handoff).map_err(std::io::Error::other).and_then(|data| {
-            crate::paths::ensure_private_dir(&crate::paths::state_dir())?;
-            crate::paths::write_private(&path, &data)
-        });
-        if let Err(e) = written {
+        // Written off this thread, and read back as the next server reads it: should either
+        // fail, or the disk not answer, nothing happens.
+        let data = match serde_json::to_vec(&handoff) {
+            Ok(data) => data,
+            Err(e) => return NotNow::Refused(format!("cannot write down the session: {e}")),
+        };
+        if let Err(e) = parse_handoff(&data) {
+            return NotNow::Refused(format!("the session cannot be handed over: {e}"));
+        }
+        let (target, stale) = (path.clone(), path.clone());
+        let written = within(
+            WRITE_WAIT,
+            move || {
+                crate::paths::ensure_private_dir(&crate::paths::state_dir())?;
+                crate::paths::write_private(&target, &data)
+            },
+            move |_| {
+                let _ = std::fs::remove_file(&stale);
+            },
+        );
+        match written {
+            Some(Ok(())) => {}
+            Some(Err(e)) => return NotNow::Refused(format!("cannot write {}: {e}", path.display())),
+            None => return NotNow::Refused(format!("{} does not answer", crate::paths::state_dir().display())),
+        }
+        if !exe.unchanged() {
             let _ = std::fs::remove_file(&path);
-            self.resume_panes();
-            return format!("cannot write {}: {e}", path.display());
+            return NotNow::Refused(format!("{} changed while it was tried: try again", exe.path.display()));
         }
         // The ssh that list remote sessions' agents would lose their pipes: the next server
         // starts them again.
@@ -494,15 +741,14 @@ impl Server {
         self.remotes.clear();
         self.tell_restarting();
         let why = match fds.iter().try_for_each(|fd| set_inherited(*fd, true)) {
-            Ok(()) => format!("could not run {}: {}", exe.display(), exec(exe, &self.session, &path)),
+            Ok(()) => format!("could not run {}: {}", exe.path.display(), exec(exe, &self.session, &path)),
             Err(e) => format!("cannot keep the panes' terminals open: {e}"),
         };
         for fd in &fds {
             let _ = set_inherited(*fd, false);
         }
         let _ = std::fs::remove_file(&path);
-        self.resume_panes();
-        why
+        NotNow::Refused(why)
     }
 
     /// Feed the panes what their readers read before they stopped.
@@ -544,19 +790,21 @@ impl Server {
         self.mark_dirty();
     }
 
-    fn handoff(&mut self) -> Handoff {
+    fn handoff(&mut self, exe: &Binary) -> Handoff {
         let mut state = persist::snapshot(self, true);
         // Tunnels go with their ssh, below.
         state.tunnels.clear();
         let mut ids: Vec<PaneId> = self.panes.keys().copied().collect();
         ids.sort();
-        let panes = ids.iter().filter_map(|id| self.panes.get_mut(id)?.live()).collect();
+        let panes: Vec<LivePane> = ids.iter().filter_map(|id| self.panes.get_mut(id)?.live()).collect();
+        let pane_pids: Vec<u32> = panes.iter().map(|p| p.pid).collect();
         let a = self.layout_area;
         Handoff {
             version: HANDOFF_VERSION,
             from: env!("CARGO_PKG_VERSION").into(),
             session: self.session.clone(),
             listener: self.listener_fd,
+            binary: exe.fd(),
             next_id: self.next_id,
             layout_area: (a.x, a.y, a.width, a.height),
             sidebar_was_useful: self.sidebar_was_useful,
@@ -569,19 +817,25 @@ impl Server {
             ports: self.ports.iter().map(|(port, pane)| (*port, *pane)).collect(),
             port_candidates: self.port_candidates.iter().map(|(port, pane)| (*port, *pane)).collect(),
             connections: Vec::new(),
+            // The panes' own go with them.
+            reaping: crate::exec::reaping().into_iter().filter(|pid| !pane_pids.contains(pid)).collect(),
         }
     }
 
-    /// Tell the attached clients the server restarts, and which workspace each shows, so that
-    /// they come back to it; what they were sent is on its way before the exec drops them.
+    /// Tell the attached clients the server restarts: one that follows a live restart comes
+    /// back to the workspace it shows; an older one leaves, saying how to come back. What they
+    /// were sent is on its way before the exec drops them.
     fn tell_restarting(&mut self) {
         let ids: Vec<ClientId> = self.clients.values().filter(|c| c.attached).map(|c| c.id).collect();
         for id in ids {
             let ws = self.clients.get(&id).and_then(|c| self.ws_index(c.workspace));
             let workspace = ws.map(|wi| self.workspaces[wi].name.clone()).unwrap_or_default();
-            // A client from before live restarts leaves, and says how to come back.
             let reason = "kraal restarted live: run kraal to attach again".to_string();
-            self.send_msg(id, &ServerMsg::Exit { reason, reattach: Some(workspace), live: true });
+            let msg = match self.clients.get(&id).is_some_and(|c| c.follows_live) {
+                true => ServerMsg::Exit { reason, reattach: Some(workspace), live: true },
+                false => ServerMsg::exit(reason),
+            };
+            self.send_msg(id, &msg);
         }
         let start = Instant::now();
         while self.clients.values().any(|c| !c.out.is_empty()) && start.elapsed() < Duration::from_millis(500) {
@@ -601,6 +855,11 @@ impl Server {
         self.pane_states = h.pane_states.into_iter().map(|(id, s, p)| (id, (s, p))).collect();
         self.ports = h.ports.into_iter().collect();
         self.port_candidates = h.port_candidates.into_iter().collect();
+        for pid in h.reaping {
+            if crate::exec::is_child(pid) {
+                crate::exec::reap_pid_later(pid);
+            }
+        }
         for t in h.tunnels {
             // SAFETY: the hand-off gives this process the descriptor, which nothing else owns.
             let stderr = t.stderr.map(|fd| unsafe { OwnedFd::from_raw_fd(fd) });
@@ -633,12 +892,9 @@ impl Server {
         for (_, lp) in live {
             // SAFETY: as above.
             drop(unsafe { OwnedFd::from_raw_fd(lp.fd) });
-            let pid = lp.pid as libc::pid_t;
-            std::thread::spawn(move || {
-                let mut status = 0;
-                // SAFETY: waitpid on a child of ours writes `status`.
-                unsafe { libc::waitpid(pid, &mut status, 0) };
-            });
+            if crate::exec::is_child(lp.pid) {
+                crate::exec::reap_pid_later(lp.pid);
+            }
         }
         self.relayout();
         // Full-screen programs draw themselves again: a size change, then back.
@@ -663,7 +919,7 @@ impl Server {
         }
         for fd in h.connections {
             // SAFETY: as above.
-            self.new_connection(unsafe { std::os::unix::net::UnixStream::from_raw_fd(fd) });
+            self.new_connection(unsafe { UnixStream::from_raw_fd(fd) });
         }
         let text = format!("restarted live from kraal {}: {kept} panes kept running", h.from);
         eprintln!("kraal: {text}");
@@ -712,10 +968,102 @@ mod tests {
     }
 
     #[test]
-    fn an_exec_that_fails_returns_why() {
-        let missing = std::env::temp_dir().join(format!("kraal-no-such-binary-{}", std::process::id()));
-        let err = exec(&missing, "s", Path::new("/nonexistent/handoff.json"));
-        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+    fn the_binary_run_is_the_file_tried_unless_it_was_written_to() {
+        let dir = std::env::temp_dir().join(format!("kraal-binary-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("kraal");
+        std::fs::write(&path, "one").unwrap();
+        let opened = Binary::open(Some(path.clone())).unwrap();
+        // Another file renamed over its path: what was opened is still what was tried.
+        std::fs::write(dir.join("other"), "two").unwrap();
+        std::fs::rename(dir.join("other"), &path).unwrap();
+        assert!(opened.unchanged());
+        // Written to in place: no longer.
+        let again = Binary::open(Some(path.clone())).unwrap();
+        std::thread::sleep(Duration::from_millis(20));
+        std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+        std::fs::write(&path, "three").unwrap();
+        assert!(!again.unchanged());
+        // Not something that runs: the exec fails, and says why; this process goes on.
+        let err = exec(&again, "s", Path::new("/nonexistent/handoff.json"));
+        assert!(matches!(err.kind(), std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::Unsupported), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_hand_off_is_read_however_deep_its_layout() {
+        let mut node = persist::NodeSnap::Pane(Box::new(
+            serde_json::from_str(r#"{"name":null,"spec":{},"agent":null,"agent_session":null}"#).unwrap(),
+        ));
+        for i in 0..200 {
+            let axis = if i % 2 == 0 { crate::layout::Axis::Row } else { crate::layout::Axis::Column };
+            let leaf = persist::NodeSnap::Pane(Box::new(
+                serde_json::from_str(r#"{"name":null,"spec":{},"agent":null,"agent_session":null}"#).unwrap(),
+            ));
+            node = persist::NodeSnap::Split { axis, children: vec![(leaf, 0.5), (node, 0.5)] };
+        }
+        let state = SessionSnapshot {
+            version: 1,
+            revision: 1,
+            workspaces: vec![persist::WorkspaceSnap {
+                name: "w".into(),
+                definition: None,
+                cwd: None,
+                active: 0,
+                tabs: vec![persist::TabSnap {
+                    name: String::new(),
+                    root: Some(node),
+                    floating: Vec::new(),
+                    focus: None,
+                    show_floating: false,
+                    zoomed: false,
+                    sync: false,
+                }],
+                sync: Default::default(),
+            }],
+            tunnels: Vec::new(),
+        };
+        let h = Handoff {
+            version: HANDOFF_VERSION,
+            from: "x".into(),
+            session: "s".into(),
+            listener: -1,
+            binary: -1,
+            next_id: 1,
+            layout_area: (0, 0, 80, 24),
+            sidebar_was_useful: false,
+            state,
+            panes: Vec::new(),
+            tunnels: Vec::new(),
+            events: EventLog::default().save(),
+            announced: Vec::new(),
+            pane_states: Vec::new(),
+            ports: Vec::new(),
+            port_candidates: Vec::new(),
+            connections: Vec::new(),
+            reaping: Vec::new(),
+        };
+        let data = serde_json::to_vec(&h).unwrap();
+        assert!(serde_json::from_slice::<Handoff>(&data).is_err(), "too deep for the default reader");
+        assert!(parse_handoff(&data).is_ok());
+    }
+
+    #[test]
+    fn work_that_takes_too_long_is_left_to_clean_up_after_itself() {
+        assert_eq!(within(Duration::from_secs(5), || 7, |_| {}), Some(7));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let late = within(
+            Duration::from_millis(50),
+            || {
+                std::thread::sleep(Duration::from_millis(300));
+                8
+            },
+            move |v| {
+                let _ = tx.send(v);
+            },
+        );
+        assert_eq!(late, None);
+        assert_eq!(rx.recv_timeout(Duration::from_secs(5)), Ok(8), "what it did once done is undone");
     }
 
     #[test]

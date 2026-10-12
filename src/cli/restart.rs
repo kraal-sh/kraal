@@ -76,7 +76,8 @@ pub(super) fn restart(s: &Session, yes: bool, how: How) -> Result<()> {
         }
     }
     if inside(session) {
-        client::restart_detached(&client::installed_exe()?, session)?;
+        let helper = client::restart_detached(&client::installed_exe()?, session, how == How::Cold)?;
+        client::restart_under_way(helper, session, Duration::from_secs(1)).map_err(anyhow::Error::msg)?;
         println!("restarting session {session}…");
         return Ok(());
     }
@@ -186,16 +187,18 @@ impl Running {
     /// Restart it live on this kraal: the release it runs then.
     fn restart_live(&self) -> Result<String, Live> {
         let exe = client::installed_exe().map_err(Live::Failed)?;
+        let before = client::identify(&self.socket).map_err(Live::Failed)?;
         client::upgrade(&self.socket, false, Some(exe)).map_err(Live::Refused)?;
-        // It answers again once the new kraal has taken everything over, as the same process.
-        let before = self.server.as_ref().map(|(pid, _)| *pid);
+        // It answers again once the new kraal has taken everything over: the same process, and
+        // the same session (a server that could not take over starts afresh in that process).
         let start = Instant::now();
         loop {
-            if let Ok((pid, version)) = client::ping(&self.socket) {
-                if Some(pid) != before {
+            if let Ok((pid, version, boot)) = client::identify(&self.socket) {
+                if pid != before.0 || boot != before.2 {
                     return Err(Live::Failed(anyhow!(
-                        "session {} restarted, but not live: its programs stopped",
-                        self.name
+                        "session {} restarted, but not live: its programs stopped (see {})",
+                        self.name,
+                        paths::log_path(&self.name).display()
                     )));
                 }
                 return Ok(version);
