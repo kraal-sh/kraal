@@ -353,6 +353,22 @@ fn image_is_shown_as_an_image_where_the_terminal_can() {
 }
 
 #[test]
+fn an_image_beyond_the_images_memory_is_drawn_with_half_blocks() {
+    let dir = TempDir::new("quota");
+    let path = png(&dir, "tiny.png", 2, &[RED, GREEN, BLUE, WHITE]);
+    // Less memory for images than any picture takes.
+    let shared = std::sync::Arc::new(crate::graphics::Shared::new(true, 100));
+    shared.set_cell(10, 20);
+    let mut preview = Preview::open(&path);
+    preview.set_graphics(shared.clone());
+    preview.apply(super::Loaded::read(&path, true));
+    assert_eq!(shared.used(), 0, "nothing beyond the quota");
+    let (mut buf, text) = render(&mut preview, 10, 4);
+    assert!(!preview.show_image(buf.area, (10, 4), &mut buf));
+    assert!(text.iter().all(|row| row.contains('▀')), "{text:?}");
+}
+
+#[test]
 fn image_sniffed_without_extension_and_decode_errors() {
     let dir = TempDir::new("sniff");
     let real = png(&dir, "real.png", 1, &[RED]);
