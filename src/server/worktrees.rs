@@ -55,20 +55,29 @@ impl Server {
     /// Ask the git thread about the directories of local terminal panes that are due (see
     /// [`super::dirwatch::DirWatch::periodic`]), and forget those no pane is in any more.
     pub(super) fn refresh_git(&mut self, now: Instant) {
-        let panes: Vec<(PathBuf, Instant)> = self
+        // Each local pane's directory, with the time of its last output while its program runs.
+        let panes: Vec<(PathBuf, Option<Instant>)> = self
             .panes
             .values()
-            .filter(|p| p.is_terminal() && p.ssh.is_none() && p.exit_code.is_none())
-            .filter_map(|p| Some((p.current_cwd()?, p.last_output)))
+            .filter(|p| p.ssh.is_none())
+            .filter_map(|p| {
+                let running = p.is_terminal() && p.exit_code.is_none();
+                Some((p.current_cwd()?, running.then_some(p.last_output)))
+            })
             .collect();
         let mut live = std::collections::HashSet::new();
+        let mut shown = std::collections::HashSet::new();
         for (dir, output) in panes {
-            if self.dirwatch.periodic(&dir, output, now) {
-                self.ask_git(dir.clone(), false);
+            if let Some(output) = output {
+                if self.dirwatch.periodic(&dir, output, now) {
+                    self.ask_git(dir.clone(), false);
+                }
+                live.insert(dir.clone());
             }
-            live.insert(dir);
+            shown.insert(dir);
         }
         self.dirwatch.retain(&live);
+        forget_git_unshown(&mut self.git, &shown);
     }
 
     /// Ask the git thread about `dir` (its branch, and the repository account rules see it in),
@@ -667,6 +676,16 @@ fn remove_unchanged(list: Vec<(Worktree, WorktreeState)>, pids: &[u32]) -> (Vec<
     (removed, errors)
 }
 
+/// Forget what git said about directories no pane is in any more (`shown` are those panes are
+/// in): kept, it would grow with every directory a shell ever went to. One a pane goes back to
+/// is asked about again.
+fn forget_git_unshown(
+    git: &mut std::collections::HashMap<PathBuf, Option<GitInfo>>,
+    shown: &std::collections::HashSet<PathBuf>,
+) {
+    git.retain(|dir, _| shown.contains(dir));
+}
+
 /// The kraal worktree git described with `info`, if it is one.
 fn worktree_of(info: &GitInfo) -> Option<Worktree> {
     if !info.branch.starts_with("kraal/") || info.main.as_os_str().is_empty() {
@@ -718,6 +737,21 @@ fn pr_base_script(base: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn what_git_said_goes_with_the_last_pane_in_its_directory() {
+        let dir = |i: usize| PathBuf::from(format!("/x/{i}"));
+        let mut git: std::collections::HashMap<PathBuf, Option<GitInfo>> = std::collections::HashMap::new();
+        // A shell that went through a thousand directories, two panes left in two of them.
+        for i in 0..1000 {
+            git.insert(dir(i), None);
+        }
+        let shown: std::collections::HashSet<PathBuf> = [dir(3), dir(999)].into_iter().collect();
+        forget_git_unshown(&mut git, &shown);
+        let mut kept: Vec<PathBuf> = git.into_keys().collect();
+        kept.sort();
+        assert_eq!(kept, vec![dir(3), dir(999)]);
+    }
 
     #[test]
     fn pull_requests_go_into_the_branch_on_the_server() {

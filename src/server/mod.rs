@@ -549,6 +549,8 @@ pub struct Server {
     pub buffers: crate::buffers::Buffers,
     /// The buffers changed since they were last written (when they are kept across restarts).
     buffers_dirty: bool,
+    /// Panes closed since the last tick: the memory they held goes back to the system with it.
+    panes_closed: bool,
 }
 
 /// Finishes a background job on the server thread with its result.
@@ -764,6 +766,7 @@ pub fn run(session: &str) -> Result<()> {
         broadcast_tip_shown: false,
         buffers,
         buffers_dirty: false,
+        panes_closed: false,
         tunnels: Vec::new(),
         remotes: Vec::new(),
         port_candidates: HashMap::new(),
@@ -1196,7 +1199,9 @@ impl Server {
         let mut ssh_ended = Vec::new();
         let mut read_contexts = false;
         let ids: Vec<PaneId> = self.panes.keys().copied().collect();
-        let mut freed = false;
+        // Freed, the memory of panes closed stays with the allocator, the server as large as it
+        // was at its busiest, until it is given back.
+        let mut freed = std::mem::take(&mut self.panes_closed);
         for id in ids {
             let Some(pane) = self.panes.get_mut(&id) else { continue };
             if pane.last_output.elapsed() > Duration::from_secs(1) {

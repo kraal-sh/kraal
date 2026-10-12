@@ -445,7 +445,12 @@ impl Server {
         let ids: Vec<PaneId> = self.panes.keys().copied().collect();
         for id in ids {
             self.announce_pane(id);
-            let ssh = self.panes.get(&id).and_then(|p| p.ssh.as_ref().map(|s| s.name.clone()));
+            // A pane keeps its server once its ssh has ended (a drop: Enter connects again).
+            let ssh = self
+                .panes
+                .get(&id)
+                .filter(|p| p.exit_code.is_none())
+                .and_then(|p| p.ssh.as_ref().map(|s| s.name.clone()));
             let prod = self.pane_production_shown(id);
             let (old_ssh, old_prod) = self.pane_states.get(&id).cloned().unwrap_or_default();
             if ssh != old_ssh {
@@ -471,6 +476,22 @@ impl Server {
         let panes = &self.panes;
         self.pane_states.retain(|id, _| panes.contains_key(id));
         self.announced.retain(|id| panes.contains_key(id));
+    }
+
+    /// A pane closes (described by `fields`): the SSH connection and the production said of it
+    /// end with it, so that what keeps count of either from the events is told.
+    pub(super) fn end_pane_states(&mut self, id: PaneId, fields: &Map<String, Value>) {
+        let Some((ssh, prod)) = self.pane_states.remove(&id) else { return };
+        if let Some(server) = ssh {
+            let mut m = fields.clone();
+            m.insert("server".into(), json!(server));
+            self.emit("ssh.ended", Value::Object(m));
+        }
+        if let Some(previous) = prod {
+            let mut m = fields.clone();
+            m.insert("previous".into(), json!(previous));
+            self.emit("production.left", Value::Object(m));
+        }
     }
 }
 

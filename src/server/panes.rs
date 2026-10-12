@@ -337,8 +337,10 @@ impl Server {
         }
         self.announce_pane(id);
         let fields = self.pane_fields(id);
+        self.end_pane_states(id, &fields);
         let Some(mut pane) = self.panes.remove(&id) else { return };
         pane.kill();
+        self.panes_closed = true;
         if let Some((wi, ti)) = self.workspace_of(id) {
             let ws = &mut self.workspaces[wi];
             ws.marked.remove(&id);
