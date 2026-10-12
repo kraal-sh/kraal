@@ -245,6 +245,7 @@ impl History {
         self.text.clear();
         self.widths.clear();
         self.runs.clear();
+        let (text, widths, out) = (&mut self.text, &mut self.widths, &mut self.runs);
         let mut glyphs = 0usize;
         let mut runs = Runs::default();
         // The run being counted: its first cell, and its length.
@@ -253,13 +254,13 @@ impl History {
         for (i, row) in rows.iter().enumerate() {
             let end = if i + 1 == rows.len() { last_end } else { row.len() };
             let cells = &row[..end];
-            self.text.reserve(cells.len());
+            text.reserve(cells.len());
             for (col, cell) in cells.iter().enumerate() {
                 let c = cell.c;
                 if cell.extra.is_none() && !cell.flags.intersects(LAYOUT) && (' '..'\x7f').contains(&c) {
-                    self.text.push(c as u8);
+                    text.push(c as u8);
                     if explicit {
-                        self.widths.push(0);
+                        widths.push(0);
                     }
                 } else {
                     if cell.flags.intersects(SPACERS | Flags::WIDE_CHAR) && !explicit && !laid_out(rows, i, col) {
@@ -268,13 +269,13 @@ impl History {
                     if cell.flags.intersects(SPACERS) && !explicit {
                         continue;
                     }
-                    push_char(&mut self.text, c);
+                    push_char(text, c);
                     let zerowidth = cell.zerowidth().unwrap_or_default();
                     for z in zerowidth {
-                        push_char(&mut self.text, *z);
+                        push_char(text, *z);
                     }
                     if explicit {
-                        put_varint(&mut self.widths, zerowidth.len() << 3 | usize::from(layout_bits(cell.flags)));
+                        put_varint(widths, zerowidth.len() << 3 | usize::from(layout_bits(cell.flags)));
                     } else if !follows_rules(c, cell.flags.contains(Flags::WIDE_CHAR), zerowidth) {
                         return None;
                     }
@@ -284,7 +285,7 @@ impl History {
                     Some(f) if same_look(f, cell) => n += 1,
                     _ => {
                         if let Some(f) = first {
-                            runs.add(n, f, &mut self.runs);
+                            runs.add(n, f, out);
                         }
                         (first, n) = (Some(cell), 1);
                     }
@@ -292,7 +293,7 @@ impl History {
             }
         }
         if let Some(f) = first {
-            runs.add(n, f, &mut self.runs);
+            runs.add(n, f, out);
         }
         if runs.count == 1 && !runs.styled {
             self.runs.clear();

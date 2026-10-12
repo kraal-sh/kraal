@@ -1,13 +1,16 @@
-//! A pane's history in two parts. The emulator keeps the newest rows, as many as fit in the rows
-//! it allocates for its history anyway, at full width; [`History`] keeps the older lines,
-//! compact. Output moves rows from the first to the second as it pushes them up. They come back,
-//! laid out at the pane's width then, when the view, the copy-mode cursor, a search or a
-//! command's mark goes above what the emulator holds. Resizing reflows only what the emulator
-//! holds.
+//! A pane's history in two parts. The emulator keeps the newest rows, a couple of screens of
+//! them, at full width; [`History`] keeps the older lines, compact. Output moves rows from the
+//! first to the second as it pushes them up. They come back, laid out at the pane's width then,
+//! when the view, the copy-mode cursor, a search or a command's mark goes above what the emulator
+//! holds. Resizing reflows only what the emulator holds.
 //!
 //! Rows move between the parts only above everything in use: the view, the selection and the
 //! copy-mode cursor, with a screen to spare. Both parts together hold no more rows than the
 //! pane's scrollback, as the emulator alone did, and at least all but a batch of them.
+//!
+//! A flood of output, more rows within a second than the scrollback holds, stays in the emulator
+//! as it would without the archive (most of it goes before anyone looks), and moves to the
+//! archive once the output pauses.
 
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
@@ -367,8 +370,10 @@ impl TermPane {
     pub(super) fn settle(&mut self) {
         if self.term.grid().history_size() > self.archive.high && !self.archive.flood {
             let keep = self.archive.keep;
-            self.archive.compact(&mut self.term, &mut self.commands.history_seen, keep);
+            let moved = self.archive.compact(&mut self.term, &mut self.commands.history_seen, keep);
             self.archive.due = self.archive.high;
+            // Many rows brought back for a look at the history went again.
+            self.archive.freed |= moved > EMULATOR_ROWS;
         }
     }
 
@@ -1270,13 +1275,17 @@ mod tests {
             })
             .collect();
         for (name, input) in [("seq 3M", &seq), ("log 300k", &log)] {
-            for archived in [false, true, false, true] {
+            // Plain, flooded, and output too slow to be a flood (all of it moves to the archive).
+            for (how, archived, slow) in [("plain", false, false), ("flood", true, false), ("steady", true, true)] {
                 let mut term = Term::new(config.clone(), &size, Listener::default());
                 let mut archive = Archive::new(10_000, 47);
                 let mut seen = 0;
                 let mut parser: Processor = Processor::new();
                 let start = std::time::Instant::now();
                 for chunk in input.chunks(64 << 10) {
+                    if slow {
+                        archive.window = (std::time::Instant::now(), 0);
+                    }
                     if archived {
                         parser.advance(&mut Feed { term: &mut term, archive: &mut archive, seen: &mut seen }, chunk);
                     } else {
@@ -1285,9 +1294,7 @@ mod tests {
                 }
                 let took = start.elapsed();
                 eprintln!(
-                    "{name}: {} {:?}, emulator history {}, archive {} lines",
-                    if archived { "archive" } else { "plain  " },
-                    took,
+                    "{name}: {how} {took:?}, emulator history {}, archive {} lines",
                     term.grid().history_size(),
                     archive.lines.len()
                 );
