@@ -656,6 +656,20 @@ pub(super) fn utf8_len(lead: u8) -> usize {
     }
 }
 
+/// Delete `count` characters at the cursor (`CSI P`). The second half of a wide character whose
+/// first half went is half of nothing: a blank. alacritty 0.26 keeps it, reads the cell before it
+/// for a cursor on it (before the row's start at its first column), and blanks that cell when
+/// something is written over it.
+pub(super) fn delete_chars<T: EventListener>(term: &mut Term<T>, count: usize) {
+    term.delete_chars(count);
+    let cursor = term.grid().cursor.point;
+    let cell = &mut term.grid_mut()[cursor];
+    if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
+        cell.flags.remove(Flags::WIDE_CHAR_SPACER);
+        cell.c = ' ';
+    }
+}
+
 /// How many bytes at the end of `bytes` start a UTF-8 character without ending it.
 pub(super) fn incomplete_char(bytes: &[u8]) -> usize {
     let start = bytes.len().saturating_sub(3);
@@ -1108,16 +1122,7 @@ impl<T: EventListener> Handler for Feed<'_, T> {
     }
 
     fn delete_chars(&mut self, count: usize) {
-        self.term.delete_chars(count);
-        // The second half of a wide character whose first half went is half of nothing: a blank.
-        // alacritty 0.26 keeps it, and reads the cell before it for a cursor on it, before the
-        // row's start at its first column.
-        let cursor = self.term.grid().cursor.point;
-        let cell = &mut self.term.grid_mut()[cursor];
-        if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
-            cell.flags.remove(Flags::WIDE_CHAR_SPACER);
-            cell.c = ' ';
-        }
+        delete_chars(self.term, count);
     }
 
     #[inline]
