@@ -333,7 +333,23 @@ pub fn to_kdl(ws: &WorkspaceDef) -> String {
 type SizedNode = (LayoutNode, Option<SizeSpec>);
 
 /// Parses the KDL text, trying v2 first and then v1 (Zellij's dialect).
+/// Blocks nested deeper than any layout nests them: the KDL parser (kdl 6) reads a block within
+/// a block by calling itself, and a file nested a couple of thousand deep overflows the stack.
+const MAX_NESTING: usize = 100;
+
 fn parse_kdl(src: &str) -> Result<KdlDocument> {
+    // Braces in strings and comments count too: no layout has a hundred left open.
+    let mut depth = 0usize;
+    for b in src.bytes() {
+        match b {
+            b'{' => {
+                depth += 1;
+                anyhow::ensure!(depth <= MAX_NESTING, "invalid KDL: blocks nested more than {MAX_NESTING} deep");
+            }
+            b'}' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+    }
     let v2_err = match KdlDocument::parse_v2(src) {
         Ok(doc) => return Ok(doc),
         Err(e) => e,
@@ -1760,5 +1776,26 @@ layout {
                 assert_eq!(again, ws, "written back:\n{written}\nfrom\n{text}");
             }
         });
+    }
+
+    /// A file nesting blocks thousands deep is refused, not read until the stack overflows (on a
+    /// thread of the default size, as tests and kraal's threads have).
+    #[test]
+    fn deeply_nested_blocks_are_refused() {
+        std::thread::Builder::new()
+            .stack_size(2 << 20)
+            .spawn(|| {
+                let deep = format!("layout {{ {} }}", "pane { ".repeat(5000) + &"} ".repeat(5000));
+                let err = parse_workspace("deep", &deep).unwrap_err();
+                assert!(err.to_string().contains("nested"), "{err}");
+                let fine = format!(
+                    "layout {{ {} }}",
+                    "pane split_direction=\"vertical\" { ".repeat(20) + "pane" + &" }".repeat(20)
+                );
+                assert!(parse_workspace("fine", &fine).is_ok());
+            })
+            .unwrap()
+            .join()
+            .unwrap();
     }
 }
