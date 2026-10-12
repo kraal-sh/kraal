@@ -340,19 +340,11 @@ impl Reference {
         self.cut.extend_from_slice(bytes);
         let cut = super::archive::incomplete_char(&self.cut);
         self.cut.drain(..self.cut.len() - cut);
-        self.parser.advance(&mut self.term, &bytes[..alone]);
-        self.parser.advance(&mut self.term, &bytes[alone..]);
-        // As kraal blanks the half of a wide character left at the cursor by a deletion: the
-        // emulator alone would read before the row for a cursor there at its first column.
-        let cursor = self.term.grid().cursor.point;
-        let cell = &mut self.term.grid_mut()[cursor];
-        if cell.flags.contains(alacritty_terminal::term::cell::Flags::WIDE_CHAR_SPACER) && cursor.column.0 == 0 {
-            cell.flags.remove(alacritty_terminal::term::cell::Flags::WIDE_CHAR_SPACER);
-            cell.c = ' ';
-        }
+        self.parser.advance(&mut Plain(&mut self.term), &bytes[..alone]);
+        self.parser.advance(&mut Plain(&mut self.term), &bytes[alone..]);
     }
 }
-/// Every row of the history and the screen, oldest first.
+
 /// The text of every row of the history and the screen, oldest first.
 fn all_rows<T>(term: &Term<T>) -> Vec<String> {
     let top = -(term.grid().history_size() as i32);
@@ -444,8 +436,13 @@ fn fuzz_pane_shows_what_the_emulator_shows() {
                 // hold of its own (a couple of screens and a batch), and drops whole lines where
                 // the emulator alone drops rows. (A narrower screen rewraps rows the emulator
                 // alone cut at the old width. Behind the alternate screen, the primary one is
-                // resized without what the archive holds.)
-                if r.term.grid().history_size() + 1300 > scrollback || r.term.mode().contains(TermMode::ALT_SCREEN) {
+                // resized without what the archive holds. Once resized, the emulator alone keeps
+                // the rows it rewrapped, kraal lines it laid out whole: they may wrap apart at
+                // the next size.)
+                if resized
+                    || r.term.grid().history_size() + 1300 > scrollback
+                    || r.term.mode().contains(TermMode::ALT_SCREEN)
+                {
                     break;
                 }
                 let (cols, rows) = (r.term.columns(), r.term.screen_lines());
@@ -485,12 +482,18 @@ fn fuzz_pane_shows_what_the_emulator_shows() {
             let output = passed_on(rng, 5000, resizes);
             for chunk in rng.chunks(&output) {
                 fuzz::trace(|| format!("feed {:?}", chunk.escape_ascii().to_string()));
+                if std::env::var_os("KRAAL_FUZZ_EACH_BYTE").is_some() {
+                    // To find where they part: a byte at a time, compared after each.
+                    for (i, byte) in chunk.iter().enumerate() {
+                        f.pane.feed(&[*byte]);
+                        r.feed(&[*byte]);
+                        let what = format!("after {:?} at step {step}", chunk[..=i].escape_ascii().to_string());
+                        same_screen(f.pane.term().unwrap(), &r, resized, &what);
+                    }
+                    continue;
+                }
                 f.pane.feed(chunk);
                 r.feed(chunk);
-                if std::env::var_os("KRAAL_FUZZ_EACH_READ").is_some() {
-                    // To find the read where they part, compared after each.
-                    same_screen(f.pane.term().unwrap(), &r, resized, &format!("after a read at step {step}"));
-                }
             }
             if rng.one_in(3) {
                 f.pane.rest();
@@ -680,4 +683,235 @@ fn fuzz_pane_osc() {
         let _ = super::osc::parse_osc(&body);
         let _ = super::osc::percent_decode(&String::from_utf8_lossy(&body));
     });
+}
+
+/// The emulator alone, but for deleting characters as kraal does (it blanks the half of a wide
+/// character left alone, see `archive::delete_chars`).
+struct Plain<'a>(&'a mut Term<Listener>);
+
+mod plain {
+    use alacritty_terminal::vte::ansi::{
+        Attr, CharsetIndex, ClearMode, CursorShape, CursorStyle, Handler, Hyperlink, KeyboardModes,
+        KeyboardModesApplyBehavior, LineClearMode, Mode, ModifyOtherKeys, PrivateMode, Rgb, ScpCharPath, ScpUpdateMode,
+        StandardCharset, TabulationClearMode, cursor_icon::CursorIcon,
+    };
+
+    use super::Plain;
+
+    impl Handler for Plain<'_> {
+        fn delete_chars(&mut self, count: usize) {
+            crate::pane::archive::delete_chars(self.0, count)
+        }
+
+        fn linefeed(&mut self) {
+            Handler::linefeed(&mut *self.0)
+        }
+        fn newline(&mut self) {
+            Handler::newline(&mut *self.0)
+        }
+        fn scroll_up(&mut self, rows: usize) {
+            Handler::scroll_up(&mut *self.0, rows)
+        }
+        fn delete_lines(&mut self, rows: usize) {
+            Handler::delete_lines(&mut *self.0, rows)
+        }
+        fn put_tab(&mut self, count: u16) {
+            Handler::put_tab(&mut *self.0, count)
+        }
+        fn clear_line(&mut self, mode: LineClearMode) {
+            Handler::clear_line(&mut *self.0, mode)
+        }
+        fn erase_chars(&mut self, count: usize) {
+            Handler::erase_chars(&mut *self.0, count)
+        }
+        fn insert_blank(&mut self, count: usize) {
+            Handler::insert_blank(&mut *self.0, count)
+        }
+        fn set_scrolling_region(&mut self, top: usize, bottom: Option<usize>) {
+            Handler::set_scrolling_region(&mut *self.0, top, bottom)
+        }
+        fn scroll_down(&mut self, rows: usize) {
+            Handler::scroll_down(&mut *self.0, rows)
+        }
+        fn insert_blank_lines(&mut self, rows: usize) {
+            Handler::insert_blank_lines(&mut *self.0, rows)
+        }
+        fn reverse_index(&mut self) {
+            Handler::reverse_index(&mut *self.0)
+        }
+        fn unset_private_mode(&mut self, mode: PrivateMode) {
+            Handler::unset_private_mode(&mut *self.0, mode)
+        }
+        fn decaln(&mut self) {
+            Handler::decaln(&mut *self.0)
+        }
+        fn set_title(&mut self, title: Option<String>) {
+            Handler::set_title(&mut *self.0, title)
+        }
+        fn set_cursor_style(&mut self, style: Option<CursorStyle>) {
+            Handler::set_cursor_style(&mut *self.0, style)
+        }
+        fn set_cursor_shape(&mut self, shape: CursorShape) {
+            Handler::set_cursor_shape(&mut *self.0, shape)
+        }
+        fn goto(&mut self, line: i32, col: usize) {
+            Handler::goto(&mut *self.0, line, col)
+        }
+        fn goto_line(&mut self, line: i32) {
+            Handler::goto_line(&mut *self.0, line)
+        }
+        fn goto_col(&mut self, col: usize) {
+            Handler::goto_col(&mut *self.0, col)
+        }
+        fn move_up(&mut self, rows: usize) {
+            Handler::move_up(&mut *self.0, rows)
+        }
+        fn move_down(&mut self, rows: usize) {
+            Handler::move_down(&mut *self.0, rows)
+        }
+        fn identify_terminal(&mut self, intermediate: Option<char>) {
+            Handler::identify_terminal(&mut *self.0, intermediate)
+        }
+        fn device_status(&mut self, arg: usize) {
+            Handler::device_status(&mut *self.0, arg)
+        }
+        fn move_forward(&mut self, cols: usize) {
+            Handler::move_forward(&mut *self.0, cols)
+        }
+        fn move_backward(&mut self, cols: usize) {
+            Handler::move_backward(&mut *self.0, cols)
+        }
+        fn move_down_and_cr(&mut self, rows: usize) {
+            Handler::move_down_and_cr(&mut *self.0, rows)
+        }
+        fn move_up_and_cr(&mut self, rows: usize) {
+            Handler::move_up_and_cr(&mut *self.0, rows)
+        }
+        fn backspace(&mut self) {
+            Handler::backspace(&mut *self.0)
+        }
+        fn carriage_return(&mut self) {
+            Handler::carriage_return(&mut *self.0)
+        }
+        fn bell(&mut self) {
+            Handler::bell(&mut *self.0)
+        }
+        fn substitute(&mut self) {
+            Handler::substitute(&mut *self.0)
+        }
+        fn set_horizontal_tabstop(&mut self) {
+            Handler::set_horizontal_tabstop(&mut *self.0)
+        }
+        fn move_backward_tabs(&mut self, count: u16) {
+            Handler::move_backward_tabs(&mut *self.0, count)
+        }
+        fn move_forward_tabs(&mut self, count: u16) {
+            Handler::move_forward_tabs(&mut *self.0, count)
+        }
+        fn save_cursor_position(&mut self) {
+            Handler::save_cursor_position(&mut *self.0)
+        }
+        fn restore_cursor_position(&mut self) {
+            Handler::restore_cursor_position(&mut *self.0)
+        }
+        fn clear_tabs(&mut self, mode: TabulationClearMode) {
+            Handler::clear_tabs(&mut *self.0, mode)
+        }
+        fn set_tabs(&mut self, interval: u16) {
+            Handler::set_tabs(&mut *self.0, interval)
+        }
+        fn terminal_attribute(&mut self, attr: Attr) {
+            Handler::terminal_attribute(&mut *self.0, attr)
+        }
+        fn set_mode(&mut self, mode: Mode) {
+            Handler::set_mode(&mut *self.0, mode)
+        }
+        fn unset_mode(&mut self, mode: Mode) {
+            Handler::unset_mode(&mut *self.0, mode)
+        }
+        fn report_mode(&mut self, mode: Mode) {
+            Handler::report_mode(&mut *self.0, mode)
+        }
+        fn report_private_mode(&mut self, mode: PrivateMode) {
+            Handler::report_private_mode(&mut *self.0, mode)
+        }
+        fn set_keypad_application_mode(&mut self) {
+            Handler::set_keypad_application_mode(&mut *self.0)
+        }
+        fn unset_keypad_application_mode(&mut self) {
+            Handler::unset_keypad_application_mode(&mut *self.0)
+        }
+        fn set_active_charset(&mut self, index: CharsetIndex) {
+            Handler::set_active_charset(&mut *self.0, index)
+        }
+        fn configure_charset(&mut self, index: CharsetIndex, charset: StandardCharset) {
+            Handler::configure_charset(&mut *self.0, index, charset)
+        }
+        fn set_color(&mut self, index: usize, color: Rgb) {
+            Handler::set_color(&mut *self.0, index, color)
+        }
+        fn dynamic_color_sequence(&mut self, prefix: String, index: usize, terminator: &str) {
+            Handler::dynamic_color_sequence(&mut *self.0, prefix, index, terminator)
+        }
+        fn reset_color(&mut self, index: usize) {
+            Handler::reset_color(&mut *self.0, index)
+        }
+        fn clipboard_store(&mut self, clipboard: u8, data: &[u8]) {
+            Handler::clipboard_store(&mut *self.0, clipboard, data)
+        }
+        fn clipboard_load(&mut self, clipboard: u8, terminator: &str) {
+            Handler::clipboard_load(&mut *self.0, clipboard, terminator)
+        }
+        fn push_title(&mut self) {
+            Handler::push_title(&mut *self.0)
+        }
+        fn pop_title(&mut self) {
+            Handler::pop_title(&mut *self.0)
+        }
+        fn text_area_size_pixels(&mut self) {
+            Handler::text_area_size_pixels(&mut *self.0)
+        }
+        fn text_area_size_chars(&mut self) {
+            Handler::text_area_size_chars(&mut *self.0)
+        }
+        fn set_hyperlink(&mut self, link: Option<Hyperlink>) {
+            Handler::set_hyperlink(&mut *self.0, link)
+        }
+        fn set_mouse_cursor_icon(&mut self, icon: CursorIcon) {
+            Handler::set_mouse_cursor_icon(&mut *self.0, icon)
+        }
+        fn report_keyboard_mode(&mut self) {
+            Handler::report_keyboard_mode(&mut *self.0)
+        }
+        fn push_keyboard_mode(&mut self, mode: KeyboardModes) {
+            Handler::push_keyboard_mode(&mut *self.0, mode)
+        }
+        fn pop_keyboard_modes(&mut self, count: u16) {
+            Handler::pop_keyboard_modes(&mut *self.0, count)
+        }
+        fn set_keyboard_mode(&mut self, mode: KeyboardModes, behavior: KeyboardModesApplyBehavior) {
+            Handler::set_keyboard_mode(&mut *self.0, mode, behavior)
+        }
+        fn set_modify_other_keys(&mut self, mode: ModifyOtherKeys) {
+            Handler::set_modify_other_keys(&mut *self.0, mode)
+        }
+        fn report_modify_other_keys(&mut self) {
+            Handler::report_modify_other_keys(&mut *self.0)
+        }
+        fn set_scp(&mut self, char_path: ScpCharPath, update_mode: ScpUpdateMode) {
+            Handler::set_scp(&mut *self.0, char_path, update_mode)
+        }
+        fn clear_screen(&mut self, mode: ClearMode) {
+            Handler::clear_screen(&mut *self.0, mode)
+        }
+        fn reset_state(&mut self) {
+            Handler::reset_state(&mut *self.0)
+        }
+        fn input(&mut self, c: char) {
+            Handler::input(&mut *self.0, c)
+        }
+        fn set_private_mode(&mut self, mode: PrivateMode) {
+            Handler::set_private_mode(&mut *self.0, mode)
+        }
+    }
 }
