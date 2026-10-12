@@ -36,6 +36,7 @@ impl Server {
             Ok(a) => {
                 self.accounts = a;
                 self.accounts_error = None;
+                self.follow_renamed_accounts();
             }
             Err(e) => {
                 let e = format!("{e:#}");
@@ -45,6 +46,32 @@ impl Server {
                 }
             }
         }
+    }
+
+    /// Panes started on an account renamed since go on under its new name.
+    fn follow_renamed_accounts(&mut self) {
+        let mut renamed = false;
+        for pane in self.panes.values_mut() {
+            let Some(key) = &pane.spec.account else { continue };
+            let Some(a) = self.accounts.launched_on(key, &pane.spec.env) else { continue };
+            let now = accounts::key(&a.agent, &a.name);
+            if &now != key {
+                pane.spec.account = Some(now);
+                renamed = true;
+            }
+        }
+        if renamed {
+            self.mark_dirty();
+            self.mark_persist();
+        }
+    }
+
+    /// Rename account `old` of `agent` to `new` ([`accounts::rename`]).
+    pub(super) fn rename_account(&mut self, agent: &str, old: &str, new: &str) -> Result<()> {
+        accounts::rename(agent, old, new)?;
+        self.reload_accounts();
+        self.reload_usage();
+        Ok(())
     }
 
     pub(super) fn reload_usage(&mut self) {
@@ -92,10 +119,10 @@ impl Server {
     /// restore): not for a one-shot run (`claude -p`), which stays as it was, nor when a prompt
     /// was left out or would be sent; those wait for Enter.
     pub fn resume_spec(&self, spec: &PaneSpec, session: Option<&str>) -> (PaneSpec, bool) {
-        let Some((agent, name)) = spec.account.as_deref().and_then(|k| k.split_once(':')) else {
+        let Some(a) = spec.account.as_deref().and_then(|k| self.accounts.launched_on(k, &spec.env)) else {
             return (spec.clone(), false);
         };
-        let (Some(a), Some(kind)) = (self.accounts.get(agent, name), accounts::agent_kind(agent)) else {
+        let Some(kind) = accounts::agent_kind(&a.agent) else {
             return (spec.clone(), false);
         };
         let Some((args, exact)) = accounts::resumable_args(kind, &accounts::launch_args(kind, &spec.command)) else {

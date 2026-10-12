@@ -303,6 +303,22 @@ impl Accounts {
         })
     }
 
+    /// The account an agent started by [`launch`] runs on, from what its pane keeps: the account
+    /// `key` names, else, when none has that name any more (it was renamed), the one in the home
+    /// `env` gave the agent.
+    pub fn launched_on(&self, key: &str, env: &[(String, String)]) -> Option<Account> {
+        let (agent, name) = key.split_once(':')?;
+        if let Some(a) = self.get(agent, name) {
+            return Some(a);
+        }
+        let kind = agent_kind(agent)?;
+        let home = match env.iter().find(|(k, _)| k == kind.home_env) {
+            Some((_, home)) => PathBuf::from(home),
+            None => paths::expand_tilde(kind.default_home),
+        };
+        self.by_home(agent, &home)
+    }
+
     pub fn threshold(&self, a: &Account) -> u8 {
         a.threshold.unwrap_or(self.limits.threshold)
     }
@@ -311,12 +327,7 @@ impl Accounts {
         let kind = agent_kind(&account.agent)
             .with_context(|| format!("unknown agent {:?} (known: {})", account.agent, agent_names()))?;
         account.home = absolute_home(&account.home)?;
-        if !valid_name(&account.name) {
-            bail!("invalid account name {:?} (letters, digits, - _ . only)", account.name);
-        }
-        if account.name == "default" && paths::expand_tilde(&account.home) != paths::expand_tilde(kind.default_home) {
-            bail!("\"default\" is the account in {}; give this one another name", kind.default_home);
-        }
+        check_name(kind, &account.name, &account.home)?;
         if self.for_agent(kind.name).iter().any(|a| a.name == account.name && a.name != "default") {
             bail!("{} already has an account named {:?}", kind.name, account.name);
         }
@@ -350,6 +361,64 @@ impl Accounts {
             self.rules.insert(i, rule);
         }
         before != self.accounts.len()
+    }
+
+    /// Account `name` of `agent`, when it can be renamed; an error says why not.
+    pub fn renamable(&self, agent: &str, name: &str) -> Result<Account> {
+        let a = self.get(agent, name).with_context(|| format!("{agent} has no account named {name:?}"))?;
+        if !self.accounts.contains(&a) {
+            bail!(
+                "{} is {agent}'s own home ({}): it is always called \"default\" and cannot be renamed",
+                label(&a),
+                a.home
+            );
+        }
+        Ok(a)
+    }
+
+    /// Rename account `old` of `agent` to `new`, in the rules too. Its home stays where it is.
+    fn rename(&mut self, agent: &str, old: &str, new: &str) -> Result<()> {
+        let account = self.renamable(agent, old)?;
+        let kind = agent_kind(agent).with_context(|| format!("unknown agent {agent:?} (known: {})", agent_names()))?;
+        check_name(kind, new, &account.home)?;
+        if self.get(agent, new).is_some() {
+            bail!("{agent} already has an account named {new:?}");
+        }
+        for a in self.accounts.iter_mut().filter(|a| a.agent == agent && a.name == old) {
+            a.name = new.to_string();
+        }
+        self.rename_in_rules(agent, old, new);
+        Ok(())
+    }
+
+    /// Rules that name account `old` of `agent` name `new` instead. A rule for every agent names
+    /// the other agents' accounts of the same names too: when one of them has an account named
+    /// `old` or `new`, that rule stays theirs (without `old` if none of them has it), and this
+    /// agent gets a rule of its own just before it.
+    fn rename_in_rules(&mut self, agent: &str, old: &str, new: &str) {
+        let others: Vec<String> = self.all().into_iter().filter(|a| a.agent != agent).map(|a| a.name).collect();
+        let theirs = |name: &str| others.iter().any(|n| n == name);
+        let split = theirs(old) || theirs(new);
+        let renamed = |names: &[String]| -> Vec<String> {
+            names.iter().map(|n| if n == old { new.to_string() } else { n.clone() }).collect()
+        };
+        let mut own = Vec::new();
+        for (i, r) in self.rules.iter_mut().enumerate() {
+            if !r.accounts.iter().any(|n| n == old) || r.agent.as_deref().is_some_and(|a| a != agent) {
+                continue;
+            }
+            if r.agent.is_some() || !split {
+                r.accounts = renamed(&r.accounts);
+                continue;
+            }
+            own.push((i, Rule { agent: Some(agent.to_string()), accounts: renamed(&r.accounts), ..r.clone() }));
+            if !theirs(old) {
+                r.accounts.retain(|n| n != old);
+            }
+        }
+        for (i, rule) in own.into_iter().rev() {
+            self.rules.insert(i, rule);
+        }
     }
 
     /// Accounts to try, in order, for an agent started in `workspace` and `cwd`.
@@ -444,6 +513,32 @@ pub fn agent_names() -> String {
 
 fn valid_name(name: &str) -> bool {
     !name.is_empty() && name.chars().all(|c| c.is_alphanumeric() || matches!(c, '-' | '_' | '.'))
+}
+
+/// Refuse `name` for an account of `kind` in `home`: one kraal cannot use, or `default` for
+/// another home than the agent's own.
+fn check_name(kind: &AgentKind, name: &str, home: &str) -> Result<()> {
+    if !valid_name(name) {
+        bail!("invalid account name {name:?} (letters, digits, - _ . only)");
+    }
+    if name == "default" && paths::expand_tilde(home) != paths::expand_tilde(kind.default_home) {
+        bail!("\"default\" is the account in {}; give this one another name", kind.default_home);
+    }
+    Ok(())
+}
+
+/// Rename account `old` of `agent` to `new` in accounts.toml, with the rules that name it and
+/// its usage. Its home stays where it is: agents running on it go on.
+pub fn rename(agent: &str, old: &str, new: &str) -> Result<()> {
+    rename_in(&Accounts::path(), &usage_dir(), agent, old, new)
+}
+
+/// [`rename`] in the accounts file `file`, with the usage saved in `usage`.
+fn rename_in(file: &Path, usage: &Path, agent: &str, old: &str, new: &str) -> Result<()> {
+    Accounts::update_at(file, |all| {
+        all.rename(agent, old, new)?;
+        move_usage(usage, agent, old, new)
+    })
 }
 
 /// How an account is shown, e.g. `claude·pro`.
@@ -1094,10 +1189,34 @@ impl Usage {
     }
 }
 
+fn usage_dir() -> PathBuf {
+    paths::state_dir().join("usage")
+}
+
+/// An account's usage file in the usage directory.
+fn usage_file(agent: &str, name: &str) -> String {
+    format!("{agent}-{name}.json")
+}
+
 /// Where an account's latest usage is saved: the status line command Claude runs and the server
 /// write it, the server and `kraal accounts` read it, and it outlives a restart.
 fn usage_path(agent: &str, name: &str) -> PathBuf {
-    paths::state_dir().join("usage").join(format!("{agent}-{name}.json"))
+    usage_dir().join(usage_file(agent, name))
+}
+
+/// Give account `old`'s usage, in directory `dir`, to its new name `new`. With none seen yet,
+/// the new name has none either: never that of a removed account once so named.
+fn move_usage(dir: &Path, agent: &str, old: &str, new: &str) -> Result<()> {
+    let (from, to) = (dir.join(usage_file(agent, old)), dir.join(usage_file(agent, new)));
+    if from.exists() {
+        return std::fs::rename(&from, &to).with_context(|| format!("moving {} to {}", from.display(), to.display()));
+    }
+    match std::fs::remove_file(&to) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+            Err(e).with_context(|| format!("removing {}", to.display()))
+        }
+        _ => Ok(()),
+    }
 }
 
 pub fn save_usage(agent: &str, name: &str, u: &Usage) -> Result<()> {
@@ -1592,6 +1711,82 @@ mod tests {
         assert_eq!(a.choose("claude", None, None, &usage, 0).unwrap().name, "perso");
         assert!(a.remove("codex", "pro"));
         assert!(a.choose("codex", Some("ops"), None, &usage, 0).is_none(), "an emptied rule refuses");
+    }
+
+    #[test]
+    fn renaming_an_account_takes_its_rules_and_usage_along() {
+        let dir = std::env::temp_dir().join(format!("kraal-rename-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (file, usage) = (dir.join("accounts.toml"), dir.join("usage"));
+        std::fs::create_dir_all(&usage).unwrap();
+        let rule = |workspace: &str, agent: Option<&str>, accounts: &[&str]| Rule {
+            workspace: Some(workspace.into()),
+            path: None,
+            agent: agent.map(String::from),
+            accounts: accounts.iter().map(|n| n.to_string()).collect(),
+        };
+        let mut a = accounts();
+        a.path = file.clone();
+        a.accounts.push(acct("codex", "pro", "/tmp/kraal-test-codex-pro"));
+        a.rules = vec![
+            rule("work", None, &["pro"]),
+            rule("ops", Some("claude"), &["pro", "perso"]),
+            rule("ci", Some("codex"), &["pro"]),
+            rule("home", None, &["perso"]),
+        ];
+        a.save().unwrap();
+        std::fs::write(usage.join("claude-pro.json"), "pro's").unwrap();
+        // A removed account's usage, under the name perso takes.
+        std::fs::write(usage.join("claude-me.json"), "stale").unwrap();
+
+        rename_in(&file, &usage, "claude", "pro", "work").unwrap();
+        rename_in(&file, &usage, "claude", "perso", "me").unwrap();
+        let a = Accounts::load_from(&file).unwrap();
+        let names: Vec<String> = a.all().iter().map(label).collect();
+        assert_eq!(names, ["claude·work", "claude·me", "codex·default", "codex·pro"]);
+        // Codex's pro keeps the rules naming it; claude's work gets its own before the shared one.
+        assert_eq!(
+            a.rules,
+            vec![
+                rule("work", Some("claude"), &["work"]),
+                rule("work", None, &["pro"]),
+                rule("ops", Some("claude"), &["work", "me"]),
+                rule("ci", Some("codex"), &["pro"]),
+                rule("home", None, &["me"]),
+            ]
+        );
+        let none = UsageMap::default();
+        assert_eq!(a.choose("claude", Some("work"), None, &none, 0).unwrap().name, "work");
+        assert_eq!(a.choose("codex", Some("work"), None, &none, 0).unwrap().name, "pro");
+        assert_eq!(std::fs::read_to_string(usage.join("claude-work.json")).unwrap(), "pro's");
+        assert!(!usage.join("claude-pro.json").exists());
+        assert!(!usage.join("claude-me.json").exists(), "me has seen no usage yet");
+
+        let text = std::fs::read_to_string(&file).unwrap();
+        let refused = |agent: &str, old: &str, new: &str, why: &str| {
+            let e = format!("{:#}", rename_in(&file, &usage, agent, old, new).unwrap_err());
+            assert!(e.contains(why), "{old} to {new}: {e}");
+            assert_eq!(std::fs::read_to_string(&file).unwrap(), text, "{old} to {new} changed the file");
+        };
+        refused("claude", "work", "me", "already has an account named");
+        refused("claude", "work", "my work", "invalid account name");
+        refused("claude", "work", "default", "is the account in ~/.claude");
+        refused("codex", "default", "mine", "cannot be renamed");
+        refused("claude", "gone", "here", "no account named");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_pane_follows_its_account_renamed() {
+        let mut a = accounts();
+        let env = |account: &Account| launch(account, &[], None, None).unwrap().env;
+        let (pro, perso) = (env(&a.get("claude", "pro").unwrap()), env(&a.get("claude", "perso").unwrap()));
+        a.rename("claude", "pro", "work").unwrap();
+        a.rename("claude", "perso", "me").unwrap();
+        assert_eq!(a.launched_on("claude:pro", &pro).unwrap().name, "work");
+        assert_eq!(a.launched_on("claude:perso", &perso).unwrap().name, "me", "in the default home");
+        assert_eq!(a.launched_on("claude:work", &[]).unwrap().name, "work", "its name first");
+        assert!(a.launched_on("codex:gone", &[("CODEX_HOME".into(), "/tmp/kraal-test-nowhere".into())]).is_none());
     }
 
     #[test]

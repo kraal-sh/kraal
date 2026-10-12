@@ -187,6 +187,12 @@ impl Server {
                     return Err((PromptAction::AddAccount { agent }, format!("{e:#}")));
                 }
             }
+            PromptAction::RenameAccount { agent, account } => {
+                if let Err(e) = self.rename_account(&agent, &account, &value) {
+                    return Err((PromptAction::RenameAccount { agent, account }, format!("{e:#}")));
+                }
+                self.toast(id, format!("renamed {agent}·{account} to {agent}·{value}"));
+            }
             PromptAction::SaveWorkspace(ws) => {
                 if !workspace::valid_file_name(&value) {
                     return Err((p.action, format!("{}: the layout is not saved yet.", workspace::FILE_NAME_RULE)));

@@ -3969,6 +3969,99 @@ fn an_account_switch_never_resends_a_prompt_by_itself_and_one_that_fails_can_be_
     std::fs::set_permissions(beta.join("projects"), std::fs::Permissions::from_mode(0o755)).unwrap();
 }
 
+/// An account renamed from the agent picker, then from the command line: its rule and its usage
+/// follow, and the agent running on it goes on under the new name.
+#[test]
+fn a_renamed_account_keeps_its_rules_its_usage_and_its_agents() {
+    let env = Env::new("renameacct");
+    let bin = env.root.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    write_script(&bin.join("claude"), "#!/bin/sh\necho \"home=${CLAUDE_CONFIG_DIR:-default}\"\nexec sleep 100\n");
+    let home = env.root.join("alpha-home");
+    std::fs::create_dir_all(&home).unwrap();
+    let file = env.root.join("config/kraal/accounts.toml");
+    std::fs::write(
+        &file,
+        format!(
+            "[[account]]\nname = \"alpha\"\nagent = \"claude\"\nhome = {:?}\n\n[[rule]]\nworkspace = \"w\"\naccounts = [\"alpha\"]\n",
+            home.display().to_string()
+        ),
+    )
+    .unwrap();
+    let usage = env.root.join("state/kraal/usage");
+    std::fs::create_dir_all(&usage).unwrap();
+    std::fs::write(usage.join("claude-alpha.json"), r#"{"observed_at":0,"source":"statusline"}"#).unwrap();
+    let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap_or_default());
+    env.workspace("w", "layout {\n    pane name=\"shell\"\n}\n");
+    let out = env.cmd(&["open", "w"]).env("PATH", &path).output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let socket = env.root.join("run/kraal/renameacct.sock");
+    let out = env
+        .cmd(&["agent", "claude", "--account", "alpha", "--tab"])
+        .env("PATH", &path)
+        .env("KRAAL_SOCKET", &socket)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let panes: serde_json::Value = serde_json::from_str(&env.run(&["panes", "--json"])).unwrap();
+    let agent = panes.as_array().unwrap().iter().find(|p| p["command"][0] == "claude").unwrap()["id"].to_string();
+    env.wait_for_text(&agent, &format!("home={}", home.display()));
+    let (mut events, seen) = env.follow(&["events", "--since", "0", "agent.*"]);
+    let hook = |payload: &str| {
+        let mut c = env.cmd(&["hook", "claude"]);
+        c.env("KRAAL_PANE", &agent).env("KRAAL_SOCKET", &socket).stdin(std::process::Stdio::piped());
+        let mut child = c.spawn().unwrap();
+        use std::io::Write;
+        child.stdin.take().unwrap().write_all(payload.as_bytes()).unwrap();
+        assert!(child.wait().unwrap().success());
+    };
+    // The account the next event of type `ty` names.
+    let account_said = |ty: &str| -> String {
+        loop {
+            let line = seen.recv_timeout(Duration::from_secs(10)).expect("an agent event");
+            let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+            if v["type"] == ty {
+                return v["account"].as_str().unwrap().to_string();
+            }
+        }
+    };
+    hook(r#"{"hook_event_name":"UserPromptSubmit","session_id":"s-1"}"#);
+    assert_eq!(account_said("agent.working"), "claude:alpha");
+    let mut client = RawClient::attach(&env, "w");
+
+    // Tab on the account in the agent picker, then its fourth action, Rename, and the new name.
+    // The client is sent what changed since the frame before: a word is looked for only where
+    // it is drawn over blank cells or other letters.
+    client.send(b"\x02a");
+    client.wait_for_screen("Start an agent");
+    client.send(b"alpha");
+    std::thread::sleep(Duration::from_millis(200));
+    client.send(b"\t");
+    client.wait_for_screen("Rename");
+    client.send(b"\x1b[B\x1b[B\x1b[B\r\x15gamma\r");
+    let named = |name: &str| std::fs::read_to_string(&file).unwrap().contains(&format!("name = \"{name}\""));
+    wait_until(Duration::from_secs(10), "renamed from the picker", || named("gamma"));
+    let text = std::fs::read_to_string(&file).unwrap();
+    assert!(text.contains("accounts = [\"gamma\"]") && !text.contains("alpha\""), "{text}");
+    assert!(usage.join("claude-gamma.json").exists() && !usage.join("claude-alpha.json").exists());
+    hook(r#"{"hook_event_name":"Stop","session_id":"s-1"}"#);
+    assert_eq!(account_said("agent.done"), "claude:gamma");
+
+    // From the command line: the session reads accounts.toml again when it changes.
+    assert_eq!(env.run(&["accounts", "rename", "claude:gamma", "zulu"]).trim(), "renamed claude·gamma to claude·zulu");
+    client.wait_for_screen("zulu");
+    hook(r#"{"hook_event_name":"UserPromptSubmit","session_id":"s-1"}"#);
+    assert_eq!(account_said("agent.working"), "claude:zulu");
+    assert!(std::fs::read_to_string(&file).unwrap().contains("accounts = [\"zulu\"]"));
+    assert!(usage.join("claude-zulu.json").exists());
+    let out = env.try_run(&["accounts", "rename", "claude:default", "mine"]);
+    assert!(String::from_utf8_lossy(&out.stderr).contains("cannot be renamed") && !out.status.success());
+    let screen = env.run(&["read", "-p", &agent]);
+    assert!(screen.contains(&format!("home={}", home.display())), "the agent went on: {screen}");
+    let _ = events.kill();
+    let _ = events.wait();
+}
+
 /// While the keys after the prefix are awaited, the client's terminal is asked for every key
 /// with its place on the keyboard (kitty keyboard protocol), and set back after: the AZERTY key
 /// that types `&`, at the place of `1`, goes to tab 1. A terminal that cannot send the typed text

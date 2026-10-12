@@ -98,6 +98,20 @@ impl Server {
                         return Mode::Normal;
                     }
                 }
+                (KeyCode::Char('r'), true) if p.kind == PickerKind::Agent => {
+                    if let Some(PickAction::AgentLaunch { agent, account }) = p.current().map(|i| i.action.clone()) {
+                        match self.accounts.renamable(&agent, &account) {
+                            Ok(a) => {
+                                return Mode::Prompt(Prompt::new(
+                                    &format!("New name for {}", crate::accounts::label(&a)),
+                                    &a.name,
+                                    PromptAction::RenameAccount { agent, account },
+                                ));
+                            }
+                            Err(e) => self.toast(id, format!("{e:#}")),
+                        }
+                    }
+                }
                 (KeyCode::Char('x'), true) if p.kind == PickerKind::Agent => {
                     if let Some(PickAction::AgentLaunch { agent, account }) = p.current().map(|i| i.action.clone()) {
                         let result = crate::accounts::Accounts::update(|all| Ok(all.remove(&agent, &account)));

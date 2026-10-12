@@ -1110,30 +1110,12 @@ impl Server {
             }
         }
 
-        // Usage of the agent accounts kraal has heard about, one row each, at the bottom.
-        let now = crate::accounts::now();
-        let accounts: Vec<Line<'static>> = self
-            .accounts
-            .all()
-            .into_iter()
-            .filter_map(|a| {
-                let peak = self.usage.get(&a)?.peak(now);
-                let color = if peak >= self.accounts.threshold(&a) as f64 {
-                    t.blocked
-                } else if peak >= 70.0 {
-                    t.working
-                } else {
-                    t.text
-                };
-                Some(Line::from(vec![
-                    Span::styled(format!("   {} ", crate::accounts::label(&a)), Style::default().fg(Color::Gray)),
-                    Span::styled(format!("{peak:.0}%"), Style::default().fg(color).add_modifier(Modifier::BOLD)),
-                ]))
-            })
-            .collect();
+        // Every account of the agents, one row each, at the bottom.
+        let inside = usize::from(self.sidebar_width(c.cols).saturating_sub(2));
+        let accounts = account_lines(&self.accounts, &self.usage, inside, crate::accounts::now());
         // They end on the last row before the bottom border, and give way when there is no room.
         let top = (height as usize).saturating_sub(2).saturating_sub(accounts.len());
-        if !accounts.is_empty() && rows.len() <= top {
+        if rows.len() <= top {
             rows.resize_with(top, || SideRow::Blank);
             rows.push(SideRow::Section("ACCOUNTS"));
             rows.extend(accounts.into_iter().map(|line| SideRow::Entry { item: None, line, selected: false }));
@@ -1722,6 +1704,42 @@ fn fit_spans(spans: Vec<Span<'static>>, max: u16) -> Vec<Span<'static>> {
     out
 }
 
+/// The sidebar's rows of the agents' accounts, `width` columns wide: each one's usage, or that
+/// none was seen yet.
+fn account_lines(
+    accounts: &crate::accounts::Accounts,
+    usage: &crate::accounts::UsageMap,
+    width: usize,
+    now: i64,
+) -> Vec<Line<'static>> {
+    let t = th();
+    accounts
+        .all()
+        .into_iter()
+        .map(|a| {
+            let name = Span::styled(format!("   {} ", crate::accounts::label(&a)), Style::default().fg(Color::Gray));
+            let used = match usage.get(&a) {
+                Some(u) => {
+                    let peak = u.peak(now);
+                    let color = if peak >= accounts.threshold(&a) as f64 {
+                        t.blocked
+                    } else if peak >= 70.0 {
+                        t.working
+                    } else {
+                        t.text
+                    };
+                    Span::styled(format!("{peak:.0}%"), Style::default().fg(color).add_modifier(Modifier::BOLD))
+                }
+                None => {
+                    let unused = "not used yet";
+                    dim_span(if name.content.width() + unused.len() <= width { unused } else { "-" })
+                }
+            };
+            Line::from(vec![name, used])
+        })
+        .collect()
+}
+
 fn badge_span(text: &str, color: Color) -> Span<'static> {
     Span::styled(format!(" {text} "), Style::default().fg(Color::Black).bg(color).add_modifier(Modifier::BOLD))
 }
@@ -1766,5 +1784,27 @@ mod tests {
         let cut = fit_spans(spans, 12);
         assert_eq!(spans_width(&cut), 12);
         assert_eq!(cut.iter().map(|s| s.content.as_ref()).collect::<String>(), "deploy fail…");
+    }
+
+    #[test]
+    fn every_account_is_listed_used_or_not() {
+        use crate::accounts::{Account, Accounts, Usage, UsageMap, Window};
+        let mut accounts = Accounts::empty();
+        let home = "/tmp/kraal-test-patron".to_string();
+        accounts
+            .add(Account { name: "patron.bzh".into(), agent: "claude".into(), home, threshold: None, note: None })
+            .unwrap();
+        let mut usage = UsageMap::default();
+        let window = Some(Window { used_percent: 42.0, resets_at: None });
+        usage.0.insert("claude:default".into(), Usage { five_hour: window, observed_at: 1_000, ..Default::default() });
+        let rows = |width| -> Vec<String> {
+            let lines = account_lines(&accounts, &usage, width, 1_000);
+            lines.iter().map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect()).collect()
+        };
+        assert_eq!(rows(26), ["   claude·default 42%", "   claude·patron.bzh -", "   codex·default -"]);
+        assert_eq!(
+            rows(40),
+            ["   claude·default 42%", "   claude·patron.bzh not used yet", "   codex·default not used yet"]
+        );
     }
 }
