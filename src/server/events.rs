@@ -202,6 +202,11 @@ impl Hooks {
         });
     }
 
+    /// Whether hooks run (they are looked at every tick, to be stopped in time).
+    pub fn busy(&self) -> bool {
+        !self.running.is_empty()
+    }
+
     /// kraal is stopping: so do the hooks.
     pub fn stop_all(&mut self) {
         for h in &mut self.running {

@@ -43,8 +43,15 @@ impl Server {
         }
         let panes = &self.panes;
         self.scrollback.retain(|id, _| panes.contains_key(id));
-        // Written by its own thread: the disk (fsync) never holds up the event loop.
         let snap = persist::snapshot(self);
+        // The state the last save wrote, and that save worked: there is nothing to write.
+        let text = serde_json::to_vec(&snap).ok();
+        let failed = self.persisting.lock().map_or(true, |p| p.state_failed);
+        if text.is_some() && text == self.persisted && !failed {
+            return;
+        }
+        self.persisted = text;
+        // Written by its own thread: the disk (fsync) never holds up the event loop.
         if let Ok(mut p) = self.persisting.lock() {
             p.saves += 1;
         }
@@ -217,6 +224,8 @@ pub(super) struct Persisting {
     saves: usize,
     /// Scrollback files the writer could not write: their panes are saved again.
     failed: Vec<String>,
+    /// The last state written could not be: the next one is written even when the same.
+    state_failed: bool,
 }
 
 impl Persisting {
@@ -254,6 +263,9 @@ pub(super) fn spawn_persister(events: Sender<Event>, shared: Arc<Mutex<Persistin
                             continue;
                         }
                         last = persist::save(session, snap).map_err(|e| format!("{e:#}"));
+                        if let Ok(mut s) = shared.lock() {
+                            s.state_failed = last.is_err();
+                        }
                         match &last {
                             Err(e) => {
                                 let _ = events.send(Event::Warning(format!("saving session state: {e}")));

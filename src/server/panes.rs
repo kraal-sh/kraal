@@ -320,6 +320,7 @@ impl Server {
                 self.send_msg(c, &ServerMsg::exit("all panes closed"));
             }
             let _ = self.persister.send(super::persistence::Persist::Delete(self.session.clone()));
+            self.persisted = None;
             self.persist_dirty = false;
             self.quitting = true;
             return;

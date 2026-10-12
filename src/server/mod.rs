@@ -14,6 +14,7 @@ mod edits;
 pub mod events;
 mod fileman;
 mod geometry;
+mod gitwatch;
 mod graphics;
 mod hints;
 mod input;
@@ -81,6 +82,8 @@ pub enum Event {
     Job(u32, Box<dyn std::any::Any + Send>),
     /// The agents a server's session has now, from the connection with this id.
     RemoteAgents(u32, Vec<remote::RemoteAgent>),
+    /// Watched directories changed (see [`crate::watch`]).
+    Watched(Vec<crate::watch::Change>),
     Shutdown,
 }
 
@@ -371,6 +374,12 @@ pub struct Server {
     persist_dirty: bool,
     last_persist: Instant,
     last_tick: Instant,
+    /// Nothing happened for a while: the tick comes with the scan only (see [`Server::next_tick`]).
+    idle: bool,
+    /// When a client last said something (a key, a request, a connection).
+    last_contact: Instant,
+    /// When the contexts, the accounts' usage and the listening ports were last read.
+    last_scan: Instant,
     next_render: Option<Instant>,
     /// When an image that stopped moving may be drawn as sixel where it stopped. Kept apart from
     /// `next_render`, which it would hold back: other changes are drawn meanwhile.
@@ -403,7 +412,6 @@ pub struct Server {
     /// Name of the workspace whose definition is being started (for account rules).
     starting_workspace: Option<String>,
     pub usage: crate::accounts::UsageMap,
-    last_usage_load: Instant,
     last_codex_poll: Instant,
     limit_alerts: HashMap<PaneId, agents::LimitAlert>,
     /// The limit message each agent pane shows, as already counted: a message staying on
@@ -415,9 +423,9 @@ pub struct Server {
     limit_events: std::collections::HashSet<PaneId>,
     /// Branch and changes per directory (None: not a repository).
     pub git: HashMap<PathBuf, Option<crate::git::GitInfo>>,
-    git_pending: std::collections::HashSet<PathBuf>,
+    /// When to ask git about them again, and the watches on their repositories.
+    gitwatch: gitwatch::GitWatch,
     git_requests: Sender<PathBuf>,
-    last_git_scan: Instant,
     /// Current Kubernetes context per `KUBECONFIG` value in use.
     pub kube: HashMap<String, crate::context::KubeFile>,
     kube_cache: crate::context::KubeCache,
@@ -459,6 +467,8 @@ pub struct Server {
     persister: Sender<persistence::Persist>,
     /// What that thread and the event loop share beside the jobs.
     persisting: Arc<Mutex<persistence::Persisting>>,
+    /// The state the last save sent wrote (compact JSON).
+    persisted: Option<Vec<u8>>,
     /// What is saved of each pane's scrollback.
     pub scrollback: HashMap<PaneId, persist::SavedScrollback>,
     /// Starts the names of the scrollback files this server makes, so that none is a file an
@@ -502,13 +512,26 @@ pub struct Server {
 /// Finishes a background job on the server thread with its result.
 type JobDone = Box<dyn FnOnce(&mut Server, Box<dyn std::any::Any + Send>)>;
 
+/// The periodic work (agents, previews, runbooks...) runs this often while something happens:
+/// output, keys, requests, or work that needs watching (see [`Server::busy`]).
 const TICK: Duration = Duration::from_millis(400);
+/// Once nothing has for this long, it runs only with the scan.
+const ACTIVE_FOR: Duration = Duration::from_secs(3);
+/// The contexts, the accounts' usage and the ports something listens on are read again this
+/// often, whatever happens.
+const SCAN_EVERY: Duration = Duration::from_secs(3);
 const FRAME: Duration = Duration::from_millis(16);
 const INPUT_FLUSH: Duration = Duration::from_millis(30);
 /// A pane whose last output is younger than this is printing without a pause...
 const STREAM_PAUSE: Duration = Duration::from_millis(2);
 /// ...and its output is looked for this often (frames are drawn no sooner).
 const WATCH_STREAMS: Duration = Duration::from_millis(1);
+
+/// Whether what was last done at `last` is due again at `now`, done `every` so often: a little
+/// early rather than a whole tick late.
+fn due(now: Instant, last: Instant, every: Duration) -> bool {
+    now.saturating_duration_since(last) + Duration::from_millis(50) >= every
+}
 
 /// Run a session server in the foreground until it is told to exit.
 pub fn run(session: &str) -> Result<()> {
@@ -579,6 +602,12 @@ pub fn run(session: &str) -> Result<()> {
     }
 
     let git_tx = tx.clone();
+    let watch_tx = tx.clone();
+    // Where nothing can be watched, git is asked about repositories every few seconds instead.
+    let watcher = crate::watch::Watcher::new(move |changes| {
+        let _ = watch_tx.send(Event::Watched(changes));
+    })
+    .ok();
     let env = PaneEnv {
         socket: socket.clone(),
         session: session.to_string(),
@@ -606,6 +635,9 @@ pub fn run(session: &str) -> Result<()> {
         persist_dirty: false,
         last_persist: Instant::now(),
         last_tick: Instant::now(),
+        idle: false,
+        last_contact: Instant::now(),
+        last_scan: Instant::now() - SCAN_EVERY,
         next_render: None,
         image_wake: None,
         quitting: false,
@@ -624,7 +656,6 @@ pub fn run(session: &str) -> Result<()> {
         accounts: crate::accounts::Accounts::empty(),
         starting_workspace: None,
         usage: Default::default(),
-        last_usage_load: Instant::now(),
         last_codex_poll: Instant::now() - Duration::from_secs(3600),
         limit_alerts: HashMap::new(),
         screen_limits: HashMap::new(),
@@ -647,9 +678,8 @@ pub fn run(session: &str) -> Result<()> {
         port_candidates: HashMap::new(),
         ports: Default::default(),
         git: HashMap::new(),
-        git_pending: Default::default(),
+        gitwatch: gitwatch::GitWatch::new(watcher),
         git_requests: worktrees::spawn_git_worker(git_tx),
-        last_git_scan: Instant::now() - Duration::from_secs(10),
         kube: HashMap::new(),
         kube_cache: Default::default(),
         tf_dirs: Default::default(),
@@ -672,6 +702,7 @@ pub fn run(session: &str) -> Result<()> {
         pending_opens: Vec::new(),
         persister: spawn_persister(persist_tx, persisting.clone()),
         persisting,
+        persisted: None,
         scrollback: HashMap::new(),
         scrollback_tag: format!("{}-{}", crate::accounts::now(), std::process::id()),
         run_logs: {
@@ -853,9 +884,12 @@ impl Server {
     }
 
     fn next_deadline(&self) -> Instant {
-        let mut d = self.last_tick + TICK;
+        let mut d = self.next_tick();
         for r in [self.next_render, self.image_wake].into_iter().flatten() {
             d = d.min(r);
+        }
+        if let Some(g) = self.gitwatch.next() {
+            d = d.min(g);
         }
         for c in self.clients.values() {
             if let Some(p) = c.pending_since {
@@ -917,15 +951,77 @@ impl Server {
         }
         self.finish_exits();
         self.release_held();
-        if now >= self.last_tick + TICK {
+        self.git_due(now);
+        if now >= self.next_tick() {
             self.last_tick = now;
-            self.tick();
+            self.tick(now);
+            self.idle = self.quiet(now);
         }
         self.check_waits();
     }
 
+    /// When the next tick comes: [`TICK`] after the last while something happens, else when
+    /// the scan is due.
+    fn next_tick(&self) -> Instant {
+        if self.idle { self.last_scan + SCAN_EVERY } else { self.last_tick + TICK }
+    }
+
+    /// Something happens: the periodic work comes at its usual pace again (at once when it was
+    /// waiting longer than that).
+    fn wake(&mut self) {
+        self.idle = false;
+    }
+
+    /// Whether nothing happened for [`ACTIVE_FOR`] (no output, no key, no request) and nothing
+    /// needs watching: the periodic work can wait for the scan.
+    fn quiet(&self, now: Instant) -> bool {
+        let recent = |t: Instant| now.saturating_duration_since(t) < ACTIVE_FOR;
+        !recent(self.last_contact)
+            && !self.panes.values().any(|p| recent(p.last_output))
+            && !self.clients.values().any(|c| recent(c.last_input))
+            && !self.busy()
+    }
+
+    /// Work that is looked at every tick and cannot wait: running runbooks and hooks, edits,
+    /// tunnels and remote sessions, previews (their file changing), panes about to close,
+    /// conditions waited for, held input, and agents whose state is guessed from their screen
+    /// while they work.
+    fn busy(&self) -> bool {
+        !self.runs.is_empty()
+            || !self.launching.is_empty()
+            || !self.stray_groups.is_empty()
+            || !self.edits.is_empty()
+            || !self.tunnels.is_empty()
+            || !self.remotes.is_empty()
+            || !self.pending_opens.is_empty()
+            || !self.preview_loads.is_empty()
+            || !self.held_input.is_empty()
+            || !self.waits.is_empty()
+            || !self.exiting.is_empty()
+            || self.hooks.busy()
+            || self.panes.values().any(|p| {
+                p.close_at.is_some()
+                    || matches!(p.content, crate::pane::Content::Preview(_))
+                    || (p.agent.kind.is_some()
+                        && !p.agent.hooked
+                        && matches!(
+                            p.agent.state,
+                            crate::agent::AgentState::Working | crate::agent::AgentState::Blocked
+                        ))
+            })
+    }
+
     /// Periodic work: agent detection, preview reloads, persistence.
-    fn tick(&mut self) {
+    fn tick(&mut self, now: Instant) {
+        // Contexts first: their reads run on threads of their own meanwhile, and are mostly
+        // done when the tick ends (their answers then wake nothing).
+        let scan = due(now, self.last_scan, SCAN_EVERY);
+        if scan {
+            self.last_scan = now;
+            self.refresh_kube();
+            self.refresh_tf_dirs();
+            self.reload_usage();
+        }
         let mut changed = Vec::new();
         let mut reloads = Vec::new();
         let mut ssh_seen = Vec::new();
@@ -1045,16 +1141,11 @@ impl Server {
                 p.copy_mode(false);
             }
         }
-        if self.last_usage_load.elapsed() > Duration::from_secs(3) {
-            self.reload_usage();
+        if scan {
             self.check_limits();
-        }
-        if self.last_git_scan.elapsed() > Duration::from_secs(3) {
-            self.refresh_git();
-            self.refresh_kube();
-            self.refresh_tf_dirs();
             self.refresh_ports();
         }
+        self.refresh_git(now);
         self.check_tunnels();
         self.check_remotes();
         if self.last_codex_poll.elapsed() > Duration::from_secs(300) {
@@ -1066,10 +1157,10 @@ impl Server {
             self.close_pane(id);
         }
         self.save_scrollback(false);
-        if self.persist_dirty || self.last_persist.elapsed() > Duration::from_secs(30) {
+        if self.persist_dirty || due(now, self.last_persist, Duration::from_secs(30)) {
             self.persist_unless_writing();
         }
-        if self.last_def_scan.elapsed() > Duration::from_secs(5) {
+        if due(now, self.last_def_scan, Duration::from_secs(5)) {
             self.scan_definitions();
         }
     }
@@ -1087,16 +1178,27 @@ impl Server {
     fn handle(&mut self, ev: Event) {
         match ev {
             Event::PaneReady(id) => {
+                self.wake();
                 if self.ready_set.insert(id) {
                     self.ready.push_back(id);
                 }
             }
             Event::PaneExited(id, pid, code) => {
+                self.wake();
                 self.exiting.insert(id, (pid, code, Instant::now() + Duration::from_secs(1)));
                 self.finish_exits();
+                // What ended may have committed, checked out or merged.
+                self.git_soon_everywhere();
             }
-            Event::Connection(stream) => self.new_connection(stream),
-            Event::ClientFrame(id, kind, payload) => self.client_frame(id, kind, payload),
+            Event::Connection(stream) => {
+                self.contact();
+                self.new_connection(stream)
+            }
+            Event::ClientFrame(id, kind, payload) => {
+                self.contact();
+                self.client_frame(id, kind, payload)
+            }
+            Event::Watched(changes) => self.git_changed(&changes),
             Event::ClientGone(id) => self.drop_client(id),
             Event::Git(dir, info) => self.git_result(dir, info),
             Event::Warning(w) => self.warnings.push(w),
@@ -1123,6 +1225,12 @@ impl Server {
         // Whatever was to fill a new workspace and could not start leaves no empty workspace
         // behind (one is never shown without a tab).
         self.drop_empty_workspaces();
+    }
+
+    /// A client said something.
+    fn contact(&mut self) {
+        self.last_contact = Instant::now();
+        self.wake();
     }
 
     fn pane_output(&mut self, id: PaneId, data: &[u8]) {

@@ -2640,6 +2640,74 @@ fn git_repo(repo: &Path, files: &[(&str, &str)]) -> impl Fn(&[&str]) {
     git
 }
 
+/// What git says of a pane's directory follows what is done in its repository from elsewhere,
+/// promptly, while the pane prints nothing: a checkout, a commit.
+#[test]
+fn git_in_frames_follows_changes_made_elsewhere() {
+    let env = Env::new("gitwatch");
+    let repo = env.root.join("repo");
+    let git = git_repo(&repo, &[("a.txt", "1")]);
+    // An upstream, for the commits ahead of it.
+    git(&["config", "remote.origin.url", "/nowhere"]);
+    git(&["config", "remote.origin.fetch", "+refs/heads/*:refs/remotes/origin/*"]);
+    git(&["update-ref", "refs/remotes/origin/main", "HEAD"]);
+    env.workspace("w", &format!("layout {{\n    pane name=\"a\" cwd={:?}\n}}\n", repo.display().to_string()));
+    env.run(&["open", "w"]);
+    let client = RawClient::attach(&env, "w");
+    client.wait_for_screen("main");
+    env.wait_for_text("a", "$");
+    // Long enough for the server to be idle.
+    std::thread::sleep(Duration::from_secs(4));
+    let start = Instant::now();
+    git(&["checkout", "-q", "-b", "qqbranch", "--track", "origin/main"]);
+    client.wait_for_screen("qqbranch");
+    assert!(start.elapsed() < Duration::from_secs(2), "a checkout showed after {:?}", start.elapsed());
+    // A commit replaces the branch's ref, not the index.
+    std::thread::sleep(Duration::from_secs(2));
+    let start = Instant::now();
+    git(&["commit", "-q", "--allow-empty", "-m", "two"]);
+    client.wait_for_screen("↑1");
+    assert!(start.elapsed() < Duration::from_secs(2), "a commit showed after {:?}", start.elapsed());
+}
+
+/// An idle server sleeps: no thread of it wakes up again and again while nothing happens.
+#[cfg(target_os = "linux")]
+#[test]
+fn an_idle_server_sleeps() {
+    let env = Env::new("sleeps");
+    env.workspace("w", "layout {\n    pane name=\"a\"\n    pane name=\"b\"\n}\n");
+    env.run(&["open", "w"]);
+    let client = RawClient::attach(&env, "w");
+    env.wait_for_text("a", "$");
+    env.wait_for_text("b", "$");
+    let pid = env.server_pid().expect("the server's pid");
+    let switches = || -> u64 {
+        let tasks = std::fs::read_dir(format!("/proc/{pid}/task")).unwrap();
+        tasks
+            .flatten()
+            .filter_map(|t| std::fs::read_to_string(t.path().join("status")).ok())
+            .flat_map(|s| {
+                s.lines()
+                    .filter(|l| l.contains("ctxt_switches"))
+                    .filter_map(|l| l.split_whitespace().last()?.parse::<u64>().ok())
+                    .collect::<Vec<_>>()
+            })
+            .sum()
+    };
+    // Past the requests above, and what they started.
+    std::thread::sleep(Duration::from_secs(4));
+    let before = switches();
+    std::thread::sleep(Duration::from_secs(6));
+    let woke = switches() - before;
+    // Its periodic work every 3 s, and what that starts: not the readers of the panes, nor
+    // anything else.
+    assert!(woke <= 20, "{woke} wake-ups in 6 s");
+    // Still there when something happens.
+    env.run(&["send", "-p", "a", "-e", "echo still-awake"]);
+    env.wait_for_text("a", "still-awake");
+    drop(client);
+}
+
 #[test]
 fn worktrees_are_prepared_numbered_and_pruned_from_the_command_line() {
     let env = Env::new("wtcli");

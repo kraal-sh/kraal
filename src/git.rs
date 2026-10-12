@@ -29,6 +29,9 @@ pub struct GitInfo {
     /// The directory git was asked about, its symbolic links resolved, as git gives paths
     /// (`root`, `main`, the worktrees it lists): what a directory is compared with them as.
     pub real: PathBuf,
+    /// Where git writes what changes this (HEAD, the index, the branch and its upstream): the
+    /// directories to watch to know when to ask again. Empty when git could not say.
+    pub watch: Vec<PathBuf>,
 }
 
 impl GitInfo {
@@ -104,6 +107,7 @@ pub fn status(cwd: &Path) -> Option<GitInfo> {
         Err(_) => git_dir.clone(),
     };
     let mut info = parse_status(&out)?;
+    info.watch = watched_dirs(&git_dir, &common, &info.branch, upstream(&out));
     info.untracked |= !listed;
     info.real = real_path(cwd);
     info.main = main_of(&root, &common);
@@ -136,6 +140,38 @@ fn main_of(top: &Path, common: &Path) -> PathBuf {
         Some(n) if n == ".git" => common.parent().map(Path::to_path_buf).unwrap_or_else(|| top.to_path_buf()),
         _ => top.to_path_buf(),
     }
+}
+
+/// The upstream branch `git status --porcelain=v2 --branch` names, e.g. `origin/main`.
+fn upstream(status: &str) -> Option<&str> {
+    status.lines().find_map(|l| l.strip_prefix("# branch.upstream "))
+}
+
+/// The directories git writes to when what `status` shows changes: the git directory (HEAD,
+/// the index), the common one (packed refs), and those holding the branch's ref and its
+/// upstream's, which are replaced, never written in place. Directories not there are left out:
+/// creating one changes its parent, which is watched.
+fn watched_dirs(git_dir: &Path, common: &Path, branch: &str, upstream: Option<&str>) -> Vec<PathBuf> {
+    let mut dirs = vec![git_dir.to_path_buf()];
+    let mut add = |d: PathBuf| {
+        if !dirs.contains(&d) && d.is_dir() {
+            dirs.push(d);
+        }
+    };
+    add(common.to_path_buf());
+    let heads = common.join("refs/heads");
+    add(heads.clone());
+    // `kraal/name` lives in `refs/heads/kraal`.
+    if let Some(parent) = heads.join(branch).parent().filter(|p| p.starts_with(&heads)) {
+        add(parent.to_path_buf());
+    }
+    if let Some(up) = upstream {
+        let remotes = common.join("refs/remotes");
+        if let Some(parent) = remotes.join(up).parent().filter(|p| p.starts_with(&remotes)) {
+            add(parent.to_path_buf());
+        }
+    }
+    dirs
 }
 
 /// Parse `git status --porcelain=v2 --branch` output.
@@ -176,6 +212,7 @@ pub fn parse_status(text: &str) -> Option<GitInfo> {
         main: PathBuf::new(),
         base: String::new(),
         real: PathBuf::new(),
+        watch: Vec::new(),
     })
 }
 
@@ -827,6 +864,56 @@ mod tests {
         let d = parse_status("# branch.oid 3f58e39c80027dcb\n# branch.head (detached)\n").unwrap();
         assert_eq!((d.branch.as_str(), d.dirty), ("3f58e39", false));
         assert!(parse_status("").is_none());
+    }
+
+    #[test]
+    fn status_names_the_directories_git_writes_to() {
+        if Command::new("git").arg("--version").output().is_err() {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("kraal-gitdirs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir = dir.canonicalize().unwrap();
+        let repo = dir.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let git = |args: &[&str]| {
+            let ok = Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(["-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false"])
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(ok.status.success(), "{args:?}: {}", String::from_utf8_lossy(&ok.stderr));
+        };
+        git(&["init", "-q", "-b", "main"]);
+        git(&["commit", "-q", "--allow-empty", "-m", "one"]);
+        let common = repo.join(".git");
+        let info = status(&repo).unwrap();
+        assert_eq!(info.watch, vec![common.clone(), common.join("refs/heads")]);
+        // A linked worktree on `kraal/x`, tracking `origin/x`: its own git directory, the common
+        // one, and those of both refs.
+        let wt = dir.join("wt");
+        git(&["worktree", "add", "-q", "-b", "kraal/x", wt.to_str().unwrap()]);
+        git(&["update-ref", "refs/remotes/origin/x", "HEAD"]);
+        git(&["config", "remote.origin.url", "/nowhere"]);
+        git(&["config", "remote.origin.fetch", "+refs/heads/*:refs/remotes/origin/*"]);
+        git(&["config", "branch.kraal/x.remote", "origin"]);
+        git(&["config", "branch.kraal/x.merge", "refs/heads/x"]);
+        let info = status(&wt).unwrap();
+        assert_eq!(
+            info.watch,
+            vec![
+                common.join("worktrees/wt"),
+                common.clone(),
+                common.join("refs/heads"),
+                common.join("refs/heads/kraal"),
+                common.join("refs/remotes/origin"),
+            ]
+        );
+        assert!(status(&dir).is_none(), "not a repository");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -36,6 +36,7 @@ mod text;
 mod theme;
 mod tools;
 mod transfer;
+mod watch;
 mod workspace;
 mod worktree_setup;
 
