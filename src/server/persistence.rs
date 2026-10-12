@@ -136,7 +136,7 @@ impl Server {
     pub(super) fn restore(&mut self) {
         // What a kraal killed while it wrote left: the temporary files of its writes, off the
         // event loop.
-        let removing = std::thread::Builder::new().name("temps".into()).spawn(|| {
+        let removing = crate::threads::named("temps").spawn(|| {
             for dir in paths::written_dirs() {
                 let _ = paths::remove_files_in(&dir, paths::abandoned_temp);
             }
@@ -304,7 +304,7 @@ pub(super) fn spawn_persister(
     shared: Arc<Mutex<Persisting>>,
 ) -> std::io::Result<Sender<Persist>> {
     let (tx, rx) = crossbeam_channel::unbounded::<Persist>();
-    std::thread::Builder::new().name("persist".into()).spawn(move || {
+    crate::threads::named("persist").spawn(move || {
         let mut last: Result<(), String> = Ok(());
         // Scrollback files whose last write failed, and why.
         let mut failing: HashMap<String, String> = HashMap::new();

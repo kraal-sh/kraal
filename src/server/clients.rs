@@ -34,7 +34,7 @@ impl Server {
         // Without a thread to read or write it, the connection is closed (dropped).
         let Ok(out) = Outbox::start(stream, id) else { return };
         let tx = self.tx.clone();
-        let reading = std::thread::Builder::new().name(format!("client-{id}-read")).spawn(move || {
+        let reading = crate::threads::named(format!("client-{id}-read")).spawn(move || {
             let mut r = std::io::BufReader::with_capacity(64 * 1024, read_half);
             let mut first = true;
             while let Ok(Some((kind, payload))) = protocol::read_frame(&mut r) {
@@ -296,7 +296,7 @@ impl Outbox {
         let out =
             Outbox { queue: tx, queued: Arc::new(AtomicUsize::new(0)), socket: Arc::new(stream), last: Arc::default() };
         let (queued, socket, last) = (out.queued.clone(), out.socket.clone(), out.last.clone());
-        std::thread::Builder::new().name(format!("client-{id}-write")).spawn(move || {
+        crate::threads::named(format!("client-{id}-write")).spawn(move || {
             let mut w = &*socket;
             let written = rx.iter().all(|data| {
                 let written = w.write_all(&data).and_then(|_| w.flush()).is_ok();

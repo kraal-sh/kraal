@@ -765,7 +765,7 @@ pub fn attach(mut target: Target, mut workspace: Option<String>, mouse: bool, at
     {
         use signal_hook::consts::{SIGHUP, SIGINT, SIGQUIT, SIGTERM};
         let mut signals = signal_hook::iterator::Signals::new([SIGTERM, SIGHUP, SIGINT, SIGQUIT])?;
-        std::thread::Builder::new().name("signals".into()).spawn(move || {
+        crate::threads::named("signals").spawn(move || {
             if let Some(sig) = signals.forever().next() {
                 LEAVING.store(true, Ordering::SeqCst);
                 let pid = SSH_PID.load(Ordering::SeqCst);
@@ -801,7 +801,7 @@ pub fn attach(mut target: Target, mut workspace: Option<String>, mouse: bool, at
         let writer = writer.clone();
         let quit = quit.clone();
         let pause = pause.clone();
-        std::thread::Builder::new().name("stdin".into()).spawn(move || {
+        crate::threads::named("stdin").spawn(move || {
             read_keys(0, &pause, |keys| {
                 let Ok(mut w) = writer.lock() else { return };
                 match w.as_mut() {
@@ -818,7 +818,7 @@ pub fn attach(mut target: Target, mut workspace: Option<String>, mouse: bool, at
     {
         let writer = writer.clone();
         let mut signals = signal_hook::iterator::Signals::new([signal_hook::consts::SIGWINCH])?;
-        std::thread::Builder::new().name("winch".into()).spawn(move || {
+        crate::threads::named("winch").spawn(move || {
             for _ in signals.forever() {
                 if let Ok((cols, rows)) = crossterm::terminal::size()
                     && let Ok(mut w) = writer.lock()

@@ -37,6 +37,7 @@ mod shell;
 mod testing;
 mod text;
 mod theme;
+mod threads;
 mod tools;
 mod transfer;
 mod unknown_keys;

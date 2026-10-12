@@ -1475,7 +1475,7 @@ fn run_statusline(cmd: &str, input: Vec<u8>, timeout: std::time::Duration) -> st
     use std::io::Write;
     let (reader, mut writer) = std::io::pipe()?;
     // Fed from a thread: a command that does not read it all never blocks kraal.
-    std::thread::Builder::new().name("statusline".into()).spawn(move || writer.write_all(&input))?;
+    crate::threads::named("statusline").spawn(move || writer.write_all(&input))?;
     let mut sh = std::process::Command::new("sh");
     sh.args(["-c", cmd]);
     crate::exec::run_with_input(&mut sh, reader.into(), timeout, 64 << 10)

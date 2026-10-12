@@ -172,7 +172,7 @@ fn worker() -> Option<&'static Sender<Work>> {
     WORKER
         .get_or_init(|| {
             let (tx, rx) = crossbeam_channel::unbounded::<Work>();
-            let thread = std::thread::Builder::new().name("scrollback".into()).spawn(move || {
+            let thread = crate::threads::named("scrollback").spawn(move || {
                 let mut encoder = Encoder::default();
                 let mut release = false;
                 while let Ok(work) = rx.recv() {

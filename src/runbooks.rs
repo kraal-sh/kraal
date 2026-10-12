@@ -750,7 +750,7 @@ pub enum LogJob {
 /// failures are passed to `warn`.
 pub fn spawn_log_writer(warn: impl Fn(String) + Send + 'static) -> std::io::Result<crossbeam_channel::Sender<LogJob>> {
     let (tx, rx) = crossbeam_channel::unbounded::<LogJob>();
-    std::thread::Builder::new().name("run-logs".into()).spawn(move || {
+    crate::threads::named("run-logs").spawn(move || {
         for job in rx {
             let failed = match job {
                 LogJob::Append(log, text) => {

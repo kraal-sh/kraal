@@ -37,7 +37,7 @@ pub enum JobEnd {
 /// Start the thread that runs `git status` for directories the server asks about.
 pub fn spawn_git_worker(tx: Sender<Event>) -> std::io::Result<Sender<PathBuf>> {
     let (req_tx, req_rx) = crossbeam_channel::unbounded::<PathBuf>();
-    std::thread::Builder::new().name("git".into()).spawn(move || {
+    crate::threads::named("git").spawn(move || {
         for dir in req_rx {
             let info = git::status(&dir);
             // Account rules see a worktree as its repository: found here, off the event loop

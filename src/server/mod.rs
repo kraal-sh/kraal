@@ -666,7 +666,7 @@ pub fn run(session: &str) -> Result<()> {
     let logs_tx = tx.clone();
     {
         let tx = tx.clone();
-        std::thread::Builder::new().name("accept".into()).spawn(move || {
+        crate::threads::named("accept").spawn(move || {
             for stream in listener.incoming() {
                 match stream {
                     Ok(s) => {
@@ -686,7 +686,7 @@ pub fn run(session: &str) -> Result<()> {
             signal_hook::consts::SIGINT,
             signal_hook::consts::SIGHUP,
         ])?;
-        std::thread::Builder::new().name("signals".into()).spawn(move || {
+        crate::threads::named("signals").spawn(move || {
             if signals.forever().next().is_some() {
                 let _ = tx.send(Event::Shutdown);
             }
@@ -874,7 +874,7 @@ impl Server {
             }),
         );
         let tx = self.tx.clone();
-        let spawned = std::thread::Builder::new().name("job".into()).spawn(move || {
+        let spawned = crate::threads::named("job").spawn(move || {
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(work));
             let _ = tx.send(Event::Job(id, result.map(|value| Box::new(value) as Box<dyn std::any::Any + Send>)));
         });

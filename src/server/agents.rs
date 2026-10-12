@@ -532,7 +532,7 @@ impl Server {
             return;
         }
         let tx = self.tx.clone();
-        let polling = std::thread::Builder::new().name("codex-usage".into()).spawn(move || {
+        let polling = crate::threads::named("codex-usage").spawn(move || {
             for a in list {
                 let home = crate::paths::expand_tilde(&a.home);
                 if !home.is_dir() {

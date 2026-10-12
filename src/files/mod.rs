@@ -14,7 +14,6 @@ use std::mem;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
-use std::thread;
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
@@ -790,7 +789,7 @@ impl FilesPane {
         let (request, cancel) = panel.supersede();
         let location = panel.location.clone();
         let (done, wake, ssh) = (Arc::clone(&self.done), Arc::clone(&self.wake), self.ssh.clone());
-        let spawned = thread::Builder::new().name("kraal-files".to_owned()).spawn(move || {
+        let spawned = crate::threads::named("kraal-files").spawn(move || {
             let result = list(&location, &ssh, &cancel);
             if cancel.load(Ordering::Relaxed) {
                 return;
