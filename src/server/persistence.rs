@@ -206,8 +206,9 @@ impl Server {
     /// Restart the session: a helper started from the kraal installed now stops this server and
     /// starts the next one, which every attached client waits for.
     pub(super) fn restart(&mut self, client: ClientId) {
-        let started =
-            crate::client::installed_exe().and_then(|exe| crate::client::restart_detached(&exe, &self.session));
+        let started = crate::client::installed_exe()
+            .and_then(|exe| crate::client::restart_detached(&exe, &self.session))
+            .map(crate::exec::reap_later);
         match started {
             Ok(()) => self.toast(client, "restarting the session…"),
             Err(e) => self.toast(client, format!("cannot restart: {e:#}")),

@@ -4671,6 +4671,48 @@ fn restart_keeps_the_session_and_brings_its_clients_back() {
     let _ = client.wait();
 }
 
+/// A restart run in place of the shell of the session's last pane (`exec`): the command stays
+/// until the restart has the session, which would otherwise end with that pane, its layout
+/// deleted, and the session comes back.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_restart_from_the_last_pane_outlives_it() {
+    let env = Env::new("lastpane");
+    env.workspace("w", "layout {\n    pane name=\"only\"\n}\n");
+    env.run(&["open", "w"]);
+    let pidfile = env.root.join("pane.pid");
+    env.run(&["send", "-p", "only", "--enter", &format!("echo $$ > '{}'", pidfile.display())]);
+    let mut pane = PathBuf::new();
+    wait_until(Duration::from_secs(10), "the shell never said its pid", || {
+        let pid = std::fs::read_to_string(&pidfile).unwrap_or_default();
+        pane = PathBuf::from(format!("/proc/{}", pid.trim()));
+        pid.ends_with('\n')
+    });
+    let cmdline = |process: &Path| std::fs::read(process.join("cmdline")).unwrap_or_default();
+    let kraal = env!("CARGO_BIN_EXE_kraal");
+    let go = env.root.join("go");
+    let line = format!("while [ ! -e '{}' ]; do sleep 0.1; done; exec '{kraal}' restart --yes", go.display());
+    env.run(&["send", "-p", "only", "--enter", &line]);
+    // With the server stopped, the restart waits for it, and nothing can end the command in the
+    // pane meanwhile but the command itself.
+    let server = env.server_pid().expect("the server runs");
+    let stopped = Stopped::stop(server);
+    std::fs::write(&go, "").unwrap();
+    let helper = [kraal.as_bytes(), b"\0-s\0lastpane\0restart\0--yes\0"].concat();
+    let started = || std::fs::read_dir("/proc").unwrap().flatten().any(|e| cmdline(&e.path()) == helper);
+    wait_until(Duration::from_secs(20), "the restart never started", started);
+    let command = [kraal.as_bytes(), b"\0restart\0--yes\0"].concat();
+    for _ in 0..30 {
+        assert_eq!(cmdline(&pane), command, "the command left the pane before the restart had the session");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    drop(stopped);
+    wait_until(Duration::from_secs(30), "the session did not come back", || {
+        env.server_pid().is_some_and(|p| p != server)
+    });
+    assert!(env.run(&["panes"]).contains("only"));
+}
+
 /// Run `cmd` in a terminal (`script`, from util-linux), typing `input` into it; what the
 /// terminal showed.
 #[cfg(target_os = "linux")]

@@ -29,7 +29,7 @@ back as above. First it lists the panes whose programs would stop (a shell at it
 nothing; an agent in the middle of a turn loses that turn) and asks; `--yes` does not ask. A
 session that cannot be saved (a full disk) is not restarted: it keeps running, and the restart
 says why. Attached terminals wait for the new server and come back to the workspace they showed.
-Run from a pane of the session, the restart goes on once that pane has closed.
+Run from a pane of the session, the command stays in that pane until the restart closes it.
 
 Each pane also shows again what it showed, scrollback and colours included, down to a dim
 `kraal: restored from <time>` line; what runs in it now writes below that line. Copy mode and

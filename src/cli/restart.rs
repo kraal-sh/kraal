@@ -14,7 +14,8 @@ use crate::protocol::{self, Request, Response};
 use crate::{client, paths, persist, process};
 
 /// `kraal restart`: say what stops, ask, then restart. Inside one of the session's panes, which
-/// the restart closes, a helper of its own does it.
+/// the restart closes, a helper of its own does it, and this command stays until then: the
+/// pane, were it the session's last, would end the session first, its layout deleted.
 pub(super) fn restart(s: &Session, yes: bool) -> Result<()> {
     let session = &s.name;
     let socket = paths::socket_path(session);
@@ -38,8 +39,14 @@ pub(super) fn restart(s: &Session, yes: bool) -> Result<()> {
         }
     }
     if inside(session) {
-        client::restart_detached(&client::installed_exe()?, session)?;
+        let mut helper = client::restart_detached(&client::installed_exe()?, session)?;
         println!("restarting session {session}…");
+        // Every step of the helper has a deadline. The server ends this command with its pane
+        // once the restart has the session.
+        if !helper.wait()?.success() {
+            bail!("session {session} was not restarted; see {}", paths::log_path(session).display());
+        }
+        println!("restarted session {session}");
         return Ok(());
     }
     let saved = client::restart_server(session)?;

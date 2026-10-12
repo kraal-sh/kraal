@@ -269,10 +269,10 @@ pub fn installed_exe() -> Result<PathBuf> {
     }
 }
 
-/// Run `kraal -s <session> restart --yes` from `exe` on its own, out of any terminal, pane and
+/// Start `kraal -s <session> restart --yes` from `exe` on its own, out of any terminal, pane and
 /// session: it outlives the pane or the server that starts it. What it says goes to the
 /// session's log.
-pub fn restart_detached(exe: &Path, session: &str) -> Result<()> {
+pub fn restart_detached(exe: &Path, session: &str) -> Result<std::process::Child> {
     let log = paths::log_path(session);
     if let Some(dir) = log.parent() {
         paths::ensure_private_dir(dir)?;
@@ -295,9 +295,7 @@ pub fn restart_detached(exe: &Path, session: &str) -> Result<()> {
             Ok(())
         });
     }
-    let child = cmd.spawn().with_context(|| format!("starting {}", exe.display()))?;
-    crate::exec::reap_later(child);
-    Ok(())
+    cmd.spawn().with_context(|| format!("starting {}", exe.display()))
 }
 
 /// How long stopping a server may take, from asking it to its exit: a restart waits up to 10 s
