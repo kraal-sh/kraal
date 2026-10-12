@@ -299,7 +299,7 @@ pub struct BuffersConfig {
     /// Numbered buffers kept at most.
     pub limit: usize,
     /// MB all buffers hold together at most.
-    pub max_mb: usize,
+    max_mb: usize,
     /// Keep them across restarts, in a private file.
     pub persist: bool,
 }

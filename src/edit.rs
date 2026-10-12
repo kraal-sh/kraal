@@ -45,7 +45,7 @@ const IDENTIFY: &str =
 /// resolved) and its name there.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RemoteFile {
-    pub dir: String,
+    dir: String,
     pub name: String,
 }
 
@@ -93,7 +93,7 @@ impl std::error::Error for NotPermitted {}
 
 /// Whether `name` is one plain name in a directory: what a server says a file is called can
 /// only ever name a file in the directory it is put in.
-pub fn plain_name(name: &str) -> bool {
+fn plain_name(name: &str) -> bool {
     !name.is_empty() && name != "." && name != ".." && !name.contains(['/', '\0'])
 }
 
@@ -199,14 +199,14 @@ fn save_function() -> String {
 
 /// What reads the file at `path` (absolute, `~/…`, or relative to the home directory): see
 /// [`open_function`].
-pub fn open_script(path: &str) -> String {
+fn open_script(path: &str) -> String {
     let f = crate::files::remote_dir_arg(path);
     [IDENTIFY.to_string(), open_function(false), format!("f={f}"), "o".into()].join("\n")
 }
 
 /// What reads `len` bytes as the new version of `file`, written if the file is still the one
 /// `expected` identifies: see [`save_function`].
-pub fn save_script(file: &RemoteFile, expected: &str, len: usize) -> String {
+fn save_script(file: &RemoteFile, expected: &str, len: usize) -> String {
     let q = crate::shell::quote_always;
     [
         IDENTIFY.to_string(),
@@ -222,7 +222,7 @@ pub fn save_script(file: &RemoteFile, expected: &str, len: usize) -> String {
 }
 
 /// The file [`open_script`] printed, or why it cannot be edited.
-pub fn parse_opened(out: &[u8]) -> Result<Opened> {
+fn parse_opened(out: &[u8]) -> Result<Opened> {
     let unexpected = || anyhow::anyhow!("the server's answer is not the file kraal asked for");
     let start = find(out, OPENED).ok_or_else(unexpected)? + OPENED.len();
     let mut fields = out[start..].splitn(5, |&b| b == 0);
@@ -254,7 +254,7 @@ pub fn parse_opened(out: &[u8]) -> Result<Opened> {
 }
 
 /// What [`save_script`] printed.
-pub fn parse_saved(out: &[u8]) -> Result<Saved> {
+fn parse_saved(out: &[u8]) -> Result<Saved> {
     let field = |marker: &[u8]| {
         let start = find(out, marker)? + marker.len();
         let value = out[start..].split(|&b| b == 0).next()?;

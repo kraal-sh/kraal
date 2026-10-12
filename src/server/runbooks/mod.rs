@@ -40,9 +40,9 @@ pub enum Target {
 #[derive(Clone, Copy)]
 pub(in crate::server) struct Asker {
     /// The client whose workspace gets the run's tab (and who hears if it does not start).
-    pub client: Option<ClientId>,
+    client: Option<ClientId>,
     /// A `kraal runbook run` waiting for the run's number as its answer.
-    pub reply: Option<ClientId>,
+    reply: Option<ClientId>,
 }
 
 /// A runbook being prepared: trust, target and parameters are asked one at a time, then the
@@ -50,12 +50,12 @@ pub(in crate::server) struct Asker {
 pub struct Draft {
     /// Tells this draft from a later one of the same client (late background results).
     id: u32,
-    pub runbook: Runbook,
+    runbook: Runbook,
     pub steps: Steps,
     /// The focused pane when it started: its context fills defaults and `on = "pane"`.
     pub pane: Option<PaneId>,
     pub targets: Option<Vec<Target>>,
-    pub values: Vec<(String, String)>,
+    values: Vec<(String, String)>,
     /// The user approved this version of a repository runbook.
     trusted: bool,
     /// Choices of the parameter being asked, once its `choices_command` ran.
@@ -131,7 +131,7 @@ pub struct StrayGroup {
 pub struct Run {
     pub id: u32,
     pub name: String,
-    pub tab: u32,
+    tab: u32,
     pub items: Vec<RunItem>,
     /// Targets running at the same time.
     pub rolling: usize,
@@ -144,12 +144,12 @@ pub struct Run {
 
 /// A Markdown runbook open for a client: its blocks run in `target`.
 pub struct MdSession {
-    pub runbook: Runbook,
+    runbook: Runbook,
     pub title: String,
-    pub blocks: Vec<Block>,
+    blocks: Vec<Block>,
     pub target: PaneId,
     /// Blocks sent to the pane.
-    pub sent: HashSet<usize>,
+    sent: HashSet<usize>,
     /// The production reason the user agreed to run steps under, for `target`.
     approved: Option<crate::server::contexts::Production>,
     /// The user agreed to type steps into a pane on a server.

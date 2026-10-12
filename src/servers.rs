@@ -167,7 +167,7 @@ impl Server {
     }
 
     /// The keys ssh offers, in order.
-    pub fn identities(&self) -> impl Iterator<Item = &String> {
+    fn identities(&self) -> impl Iterator<Item = &String> {
         self.identity.iter().chain(&self.more_identities)
     }
 
@@ -638,7 +638,7 @@ impl Inventory {
 
     /// An existing entry for the same machine and account, as written (`box:22` is not `box`,
     /// whose port ~/.ssh/config may set).
-    pub fn find_target(&self, s: &Server) -> Option<&Server> {
+    fn find_target(&self, s: &Server) -> Option<&Server> {
         self.servers.iter().find(|x| x.same_address(s))
     }
 

@@ -7,7 +7,7 @@ use crate::layout::{Node, PaneId};
 impl Server {
     /// Main pane area for a client of the given size: below the top bar, one column of space
     /// right of the sidebar.
-    pub fn main_area(&self, cols: u16, rows: u16, sidebar: bool) -> Rect {
+    fn main_area(&self, cols: u16, rows: u16, sidebar: bool) -> Rect {
         let top = 1;
         let height = rows.saturating_sub(top).max(1);
         let left = if sidebar { self.sidebar_width(cols) } else { 0 };
@@ -70,13 +70,13 @@ impl Server {
 
     /// Every tiled pane of `root` in `area`, in order: the frame of each pane shown whole, and
     /// the row of each pane folded in a stack (marked `true`).
-    pub fn tiled_rects(&self, root: &Node, area: Rect) -> Vec<(PaneId, Rect, bool)> {
+    fn tiled_rects(&self, root: &Node, area: Rect) -> Vec<(PaneId, Rect, bool)> {
         root.tiles(area, self.config.pane_frames)
     }
 
     /// Where a tiled pane's frame goes: its place, less one column of space when a pane is to its
     /// right and one row when a pane is below.
-    pub fn tile(&self, outer: Rect) -> Rect {
+    fn tile(&self, outer: Rect) -> Rect {
         if self.config.pane_frames { crate::layout::framed(outer, self.layout_area) } else { outer }
     }
 

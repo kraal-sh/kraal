@@ -58,7 +58,7 @@ impl Server {
     }
 
     /// Spawn every pane of a definition into a new workspace.
-    pub fn start_definition(&mut self, def: &WorkspaceDef, path: Option<PathBuf>) -> Result<u32> {
+    fn start_definition(&mut self, def: &WorkspaceDef, path: Option<PathBuf>) -> Result<u32> {
         // Every pane is set up before the programs start.
         self.with_batch(|server| {
             server.starting_workspace = Some(def.name.clone());

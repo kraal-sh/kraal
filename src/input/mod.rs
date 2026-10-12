@@ -41,19 +41,19 @@ impl Mods {
     pub const CTRL: Mods = Mods { shift: false, alt: false, ctrl: true };
 
     /// True when no modifier is held.
-    pub fn is_empty(self) -> bool {
+    fn is_empty(self) -> bool {
         !(self.shift || self.alt || self.ctrl)
     }
 
     /// Decode an xterm modifier parameter (`1 + bits`: shift 1, alt 2, ctrl 4, meta 8).
     /// Meta is folded into alt; higher bits (kitty's hyper, caps/num lock) are ignored.
-    pub fn from_xterm_param(param: u32) -> Mods {
+    fn from_xterm_param(param: u32) -> Mods {
         let bits = param.saturating_sub(1);
         Mods { shift: bits & 1 != 0, alt: bits & (2 | 8) != 0, ctrl: bits & 4 != 0 }
     }
 
     /// The xterm modifier parameter for these modifiers (`1` when none).
-    pub fn xterm_param(self) -> u32 {
+    fn xterm_param(self) -> u32 {
         1 + u32::from(self.shift) + 2 * u32::from(self.alt) + 4 * u32::from(self.ctrl)
     }
 }

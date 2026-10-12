@@ -88,10 +88,10 @@ pub struct Hint {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PatternDef {
-    pub pattern: String,
+    pattern: String,
     /// The tool Shift+label runs, with the match in `$KRAAL_SELECTION`.
     #[serde(default)]
-    pub tool: Option<String>,
+    tool: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

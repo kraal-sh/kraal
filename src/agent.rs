@@ -217,7 +217,7 @@ fn screen_patterns(agent: &str) -> (&'static [&'static str], &'static [&'static 
 }
 
 /// Infer the state of an agent from the text currently on its screen.
-pub fn classify_screen(agent: &str, screen: &str) -> Option<AgentState> {
+fn classify_screen(agent: &str, screen: &str) -> Option<AgentState> {
     // Agents draw their status and prompts at the bottom; older output higher up may quote
     // the same words.
     let tail: Vec<&str> = screen.lines().filter(|l| !l.trim().is_empty()).collect();

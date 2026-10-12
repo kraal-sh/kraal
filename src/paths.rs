@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 const SOCKET_PATH_MAX: usize = 103;
 /// Longest session name kraal accepts. Never lowered: a session named when it was allowed must
 /// stay reachable by its name.
-pub const SESSION_NAME_MAX: usize = 64;
+const SESSION_NAME_MAX: usize = 64;
 /// Longest socket file name before `.sock`: a longer session name gets a shortened one.
 const SOCKET_STEM_MAX: usize = 32;
 /// Room for the runtime base directory: `<base>/kraal/<stem>.sock` must fit.
