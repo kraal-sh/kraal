@@ -100,6 +100,11 @@ impl Node {
         self.stack_of(id).map_or(id, |(_, open)| open)
     }
 
+    /// The pane shown in the first place: the pane there, or the open pane of a stack there.
+    pub fn first_shown(&self) -> Option<PaneId> {
+        self.places().first().map(|&(_, open)| open)
+    }
+
     /// Open pane `id` in its stack, folding the one open before. Whether anything changed.
     pub fn expand(&mut self, id: PaneId) -> bool {
         match self {
@@ -712,6 +717,10 @@ mod tests {
         assert_eq!(r[&3], Rect::new(50, 0, 50, 40));
         assert_eq!(n.leaves(), vec![1, 2, 3, 4]);
         assert_eq!((n.holder(2), n.holder(1)), (3, 1));
+        assert_eq!(n.first_shown(), Some(1));
+        let stack_first =
+            Node::Split { axis: Axis::Row, children: vec![(stack(&[2, 3, 4], 3), 1.0), (Node::Leaf(1), 1.0)] };
+        assert_eq!(stack_first.first_shown(), Some(3), "the open pane, not the first");
         assert_eq!(n.stack_of(4), Some((&[2, 3, 4][..], 3)));
         assert_eq!(n.stack_of(1), None);
         assert_eq!(n.borders(area()).len(), 1);

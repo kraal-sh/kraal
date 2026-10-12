@@ -929,6 +929,18 @@ fn stacks_and_layouts_from_the_keys() {
 }
 
 #[test]
+fn a_stack_opens_on_its_expanded_pane_without_a_focus_given() {
+    let env = Env::new("expanded");
+    let stack = "pane stacked=true {\n        pane name=\"a\"\n        pane name=\"b\" expanded=true\n    }";
+    env.workspace("w", &format!("layout {{\n    {stack}\n}}\n"));
+    env.run(&["open", "w"]);
+    let panes: serde_json::Value = serde_json::from_str(&env.run(&["panes", "--json"])).unwrap();
+    let focused: Vec<&str> =
+        panes.as_array().unwrap().iter().filter(|p| p["focused"] == true).filter_map(|p| p["name"].as_str()).collect();
+    assert_eq!(focused, ["b"]);
+}
+
+#[test]
 fn commands_run_in_a_pane_stay_in_its_session() {
     let a = Env::new("sessa");
     a.workspace("w", "layout {\n    pane name=\"one\"\n}\n");
