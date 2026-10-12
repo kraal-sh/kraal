@@ -593,6 +593,24 @@ fn reload_follows_file_changes() {
 }
 
 #[test]
+fn a_change_of_the_file_is_told() {
+    let dir = TempDir::new("told");
+    let path = dir.write("notes.txt", "first\n");
+    let preview = Preview::open(&path);
+    let (tx, rx) = crossbeam_channel::unbounded();
+    preview.on_change(move || {
+        let _ = tx.send(());
+    });
+    let mut preview = preview;
+    preview.apply(super::Loaded::read(&path, false));
+    // Nothing changed: nothing is told.
+    assert!(rx.recv_timeout(std::time::Duration::from_millis(1500)).is_err());
+    fs::write(&path, "second version\n").unwrap();
+    rx.recv_timeout(std::time::Duration::from_secs(5)).expect("the change was told");
+    assert!(preview.modified_since_load());
+}
+
+#[test]
 fn big_markdown_says_it_is_cut() {
     let dir = TempDir::new("bigmd");
     let mut body = String::from("# Title\n\n");

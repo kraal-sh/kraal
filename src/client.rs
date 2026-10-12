@@ -26,22 +26,36 @@ pub fn ensure_server(session: &str) -> Result<PathBuf> {
         paths::ensure_private_dir(dir)?;
     }
     let out = crate::runbooks::open_private_append(&log)?;
+    // The server writes a byte to this pipe once it listens, instead of being asked again and
+    // again whether it does.
+    let (ready, ready_end) = std::io::pipe().context("creating a pipe")?;
+    let ready_fd = std::os::fd::AsRawFd::as_raw_fd(&ready_end);
     let mut cmd = std::process::Command::new(exe);
     cmd.args(["server", "--session", session])
+        .env(READY_FD_VAR, ready_fd.to_string())
         .stdin(std::process::Stdio::null())
         .stdout(out.try_clone()?)
         .stderr(out)
         .current_dir(dirs::home_dir().unwrap_or_else(|| "/".into()));
-    // Detach from the terminal so closing it does not take the server down.
+    // Detach from the terminal so closing it does not take the server down, and keep the end
+    // of the pipe the server writes to open across exec (in the child only).
     unsafe {
         use std::os::unix::process::CommandExt;
-        cmd.pre_exec(|| {
+        cmd.pre_exec(move || {
             libc::setsid();
+            if libc::fcntl(ready_fd, libc::F_SETFD, 0) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
             Ok(())
         });
     }
     let mut child = cmd.spawn().context("starting the kraal server")?;
+    drop(ready_end);
     let start = Instant::now();
+    if wait_ready(&ready, Duration::from_secs(5)) {
+        return Ok(socket);
+    }
+    // It closed the pipe without a word: it failed, or another server took the session first.
     while start.elapsed() < Duration::from_secs(5) {
         if UnixStream::connect(&socket).is_ok() {
             return Ok(socket);
@@ -52,6 +66,37 @@ pub fn ensure_server(session: &str) -> Result<PathBuf> {
         std::thread::sleep(Duration::from_millis(20));
     }
     bail!("the server did not start in time; see {}", log.display())
+}
+
+/// The environment variable that gives a new server the descriptor of the pipe it says on that
+/// it listens (see [`crate::server::run`]).
+pub const READY_FD_VAR: &str = "KRAAL_READY_FD";
+
+/// Wait until the server writes its byte to `ready`: `true` then; `false` when it closed its end
+/// without writing (it exited) or `limit` passed.
+fn wait_ready(ready: &std::io::PipeReader, limit: Duration) -> bool {
+    use std::os::fd::AsRawFd;
+    let start = Instant::now();
+    loop {
+        let left = limit.saturating_sub(start.elapsed());
+        if left.is_zero() {
+            return false;
+        }
+        let mut pfd = libc::pollfd { fd: ready.as_raw_fd(), events: libc::POLLIN, revents: 0 };
+        // SAFETY: one valid pollfd.
+        match unsafe { libc::poll(&mut pfd, 1, left.as_millis().min(i32::MAX as u128) as i32) } {
+            0 => return false,
+            n if n < 0 => {
+                if std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
+                    return false;
+                }
+            }
+            _ => {
+                let mut byte = [0u8; 1];
+                return matches!((&*ready).read(&mut byte), Ok(1));
+            }
+        }
+    }
 }
 
 /// Socket for control commands: `$KRAAL_SOCKET` inside a pane unless a session is named.
@@ -480,23 +525,40 @@ fn greet(target: &Target, workspace: &Option<String>) -> Result<Greeted, String>
 
 /// Whether keyboard reading is paused (ssh is asking something in the terminal). Each pause has
 /// a number, and the reader says which pause it has seen: `pause` waits for that very one, so a
-/// reader still busy with an earlier read is never taken for a stopped one.
-#[derive(Default)]
+/// reader still busy with an earlier read is never taken for a stopped one. A byte written to
+/// `wake` after each change wakes the reader to look, so it never wakes up by itself.
 struct KeysPause {
     paused: AtomicBool,
     epoch: AtomicU64,
     parked: AtomicU64,
+    wake: (std::io::PipeReader, std::io::PipeWriter),
 }
 
 impl KeysPause {
+    fn new() -> std::io::Result<KeysPause> {
+        let (r, w) = std::io::pipe()?;
+        for fd in [std::os::fd::AsRawFd::as_raw_fd(&r), std::os::fd::AsRawFd::as_raw_fd(&w)] {
+            // Neither end ever blocks: the reader empties it, a full pipe already wakes it.
+            // SAFETY: plain fcntl on a descriptor this owns.
+            unsafe { libc::fcntl(fd, libc::F_SETFL, libc::fcntl(fd, libc::F_GETFL) | libc::O_NONBLOCK) };
+        }
+        Ok(KeysPause {
+            paused: AtomicBool::new(false),
+            epoch: AtomicU64::new(0),
+            parked: AtomicU64::new(0),
+            wake: (r, w),
+        })
+    }
+
     /// Stop reading the keyboard; `true` once the reader has stopped, so what is typed next (a
     /// password for ssh) is never read as keys for kraal. The reader only reads what is waiting
-    /// and never blocks, so it stops within its poll interval; `false` means it did not, and the
+    /// and never blocks, so it stops as soon as it is woken; `false` means it did not, and the
     /// terminal must not be handed over.
     fn pause(&self) -> bool {
         // Paused before the number changes: a reader that sees the new number sees the pause.
         self.paused.store(true, Ordering::SeqCst);
         let epoch = self.epoch.fetch_add(1, Ordering::SeqCst) + 1;
+        self.wake();
         let start = Instant::now();
         while self.parked.load(Ordering::SeqCst) != epoch {
             if start.elapsed() > Duration::from_secs(5) {
@@ -509,27 +571,50 @@ impl KeysPause {
 
     fn resume(&self) {
         self.paused.store(false, Ordering::SeqCst);
+        self.wake();
+    }
+
+    fn wake(&self) {
+        let _ = (&self.wake.1).write(b"w");
+    }
+
+    /// Forget the wake-ups seen: the flags they were for are read next.
+    fn drain(&self) {
+        let mut buf = [0u8; 64];
+        while matches!((&self.wake.0).read(&mut buf), Ok(n) if n > 0) {}
     }
 }
 
 /// Read `fd` (the keyboard) into `forward` until it ends. Nothing is read while paused: the
 /// reader parks before it would read, and it reads only the bytes already waiting, so a read
-/// never blocks it past a pause.
+/// never blocks it past a pause. It sleeps until a key comes or the pause changes.
 fn read_keys(fd: std::os::unix::io::RawFd, pause: &KeysPause, mut forward: impl FnMut(&[u8])) {
+    use std::os::fd::AsRawFd;
     let mut buf = [0u8; 16 * 1024];
+    let wake = pause.wake.0.as_raw_fd();
     loop {
         if pause.paused.load(Ordering::SeqCst) {
             pause.parked.store(pause.epoch.load(Ordering::SeqCst), Ordering::SeqCst);
-            std::thread::sleep(Duration::from_millis(20));
+            // Until resumed, only the wake-up is listened to.
+            let mut pfd = libc::pollfd { fd: wake, events: libc::POLLIN, revents: 0 };
+            // SAFETY: one valid pollfd.
+            unsafe { libc::poll(&mut pfd, 1, -1) };
+            pause.drain();
             continue;
         }
-        let mut pfd = libc::pollfd { fd, events: libc::POLLIN, revents: 0 };
-        // SAFETY: one valid pollfd.
-        let ready = unsafe { libc::poll(&mut pfd, 1, 100) };
+        let mut pfd = [
+            libc::pollfd { fd, events: libc::POLLIN, revents: 0 },
+            libc::pollfd { fd: wake, events: libc::POLLIN, revents: 0 },
+        ];
+        // SAFETY: two valid pollfds.
+        let ready = unsafe { libc::poll(pfd.as_mut_ptr(), 2, -1) };
         if ready < 0 && std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
             return;
         }
-        if ready <= 0 || pause.paused.load(Ordering::SeqCst) {
+        if pfd[1].revents != 0 {
+            pause.drain();
+        }
+        if ready <= 0 || pfd[0].revents == 0 || pause.paused.load(Ordering::SeqCst) {
             continue;
         }
         let mut waiting: libc::c_int = 0;
@@ -539,7 +624,7 @@ fn read_keys(fd: std::os::unix::io::RawFd, pause: &KeysPause, mut forward: impl 
         }
         if waiting <= 0 {
             // Ready with nothing to read: the end (a closed pipe, a hung-up terminal).
-            if pfd.revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0 {
+            if pfd[0].revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0 {
                 return;
             }
             continue;
@@ -613,7 +698,7 @@ pub fn attach(mut target: Target, mut workspace: Option<String>, mouse: bool, at
     // The current connection's writer; None while reconnecting.
     let writer: Arc<Mutex<Option<Box<dyn Write + Send>>>> = Arc::new(Mutex::new(None));
     let quit = Arc::new(AtomicBool::new(false));
-    let pause = Arc::new(KeysPause::default());
+    let pause = Arc::new(KeysPause::new().context("creating a pipe")?);
 
     // Keyboard → server. While disconnected, ctrl+c gives up.
     {
@@ -858,7 +943,7 @@ mod tests {
         let (keyboard_end, mut typing) = std::os::unix::net::UnixStream::pair().unwrap();
         let keyboard = keyboard_end.as_raw_fd();
         let mut write = |bytes: &[u8]| typing.write_all(bytes).unwrap();
-        let pause = Arc::new(KeysPause::default());
+        let pause = Arc::new(KeysPause::new().unwrap());
         let got = Arc::new(Mutex::new(Vec::new()));
         let reader = {
             let (pause, got) = (pause.clone(), got.clone());
@@ -897,5 +982,70 @@ mod tests {
         drop(typing);
         reader.join().unwrap();
         drop(keyboard_end);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn the_keyboard_reader_sleeps_until_a_key_or_a_pause() {
+        use std::os::unix::io::AsRawFd;
+        let (keyboard_end, mut typing) = std::os::unix::net::UnixStream::pair().unwrap();
+        let keyboard = keyboard_end.as_raw_fd();
+        let pause = Arc::new(KeysPause::new().unwrap());
+        let (got_tx, got_rx) = crossbeam_channel::unbounded::<Vec<u8>>();
+        let (tid_tx, tid_rx) = crossbeam_channel::bounded(1);
+        let reader = {
+            let pause = pause.clone();
+            std::thread::spawn(move || {
+                // SAFETY: gettid has no preconditions.
+                let _ = tid_tx.send(unsafe { libc::gettid() });
+                read_keys(keyboard, &pause, |k| {
+                    let _ = got_tx.send(k.to_vec());
+                })
+            })
+        };
+        let switches = crate::testing::thread_switches(tid_rx.recv().unwrap());
+        std::thread::sleep(Duration::from_millis(50));
+        let before = switches();
+        std::thread::sleep(Duration::from_millis(700));
+        assert_eq!(switches(), before, "the reader woke up while nothing was typed");
+        typing.write_all(b"a").unwrap();
+        assert_eq!(got_rx.recv_timeout(Duration::from_secs(2)).unwrap(), b"a");
+        // A pause is seen at once, without a key to wake the reader; so is the end of it.
+        let start = Instant::now();
+        assert!(pause.pause());
+        assert!(start.elapsed() < Duration::from_millis(500), "{:?}", start.elapsed());
+        // Once it went to sleep (it says it parked just before).
+        std::thread::sleep(Duration::from_millis(50));
+        let parked = switches();
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(switches(), parked, "a paused reader sleeps too");
+        pause.resume();
+        typing.write_all(b"b").unwrap();
+        assert_eq!(got_rx.recv_timeout(Duration::from_secs(2)).unwrap(), b"b");
+        drop(typing);
+        reader.join().unwrap();
+        drop(keyboard_end);
+    }
+
+    #[test]
+    fn a_new_server_is_waited_for_until_it_says_it_listens() {
+        let (ready, mut end) = std::io::pipe().unwrap();
+        let writer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            end.write_all(b"1").unwrap();
+        });
+        let start = Instant::now();
+        assert!(wait_ready(&ready, Duration::from_secs(5)));
+        assert!(start.elapsed() < Duration::from_secs(2));
+        writer.join().unwrap();
+        // A server that goes without a word is not waited for.
+        let (ready, end) = std::io::pipe().unwrap();
+        drop(end);
+        let start = Instant::now();
+        assert!(!wait_ready(&ready, Duration::from_secs(5)));
+        assert!(start.elapsed() < Duration::from_secs(1));
+        // Nor one that says nothing in time.
+        let (ready, _end) = std::io::pipe().unwrap();
+        assert!(!wait_ready(&ready, Duration::from_millis(50)));
     }
 }

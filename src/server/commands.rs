@@ -21,6 +21,10 @@ impl Server {
         });
         self.emit_pane("command.finished", pane, fields);
         self.mark_dirty_pane(pane);
+        // It may have changed what git says there (a commit, a checkout, an edit).
+        if let Some(dir) = self.panes.get(&pane).filter(|p| p.ssh.is_none()).and_then(|p| p.current_cwd()) {
+            self.git_soon(&dir);
+        }
         if !announced(self.config.notifications.long_command, done.duration, self.pane_watched(pane)) {
             return;
         }

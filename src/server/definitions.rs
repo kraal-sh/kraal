@@ -14,6 +14,12 @@ use crate::workspace::{self, LayoutNode, PaneKind, SizeSpec, WorkspaceDef};
 impl Server {
     pub(super) fn scan_definitions(&mut self) {
         self.last_def_scan = Instant::now();
+        // Their changes are told, and those of accounts.toml and of the accounts' usage,
+        // wherever they can be.
+        let mut dirs = self.config.workspace_dirs();
+        dirs.push(paths::config_dir());
+        dirs.push(paths::state_dir().join("usage"));
+        self.dirwatch.watch_config(&dirs);
         let defs: Vec<WorkspaceDef> = self.definitions().into_iter().filter_map(|(_, d)| d.ok()).collect();
         let names: Vec<String> = defs.iter().map(|d| d.name.clone()).collect();
         if names != self.def_names {
@@ -53,15 +59,18 @@ impl Server {
 
     /// Spawn every pane of a definition into a new workspace.
     pub fn start_definition(&mut self, def: &WorkspaceDef, path: Option<PathBuf>) -> Result<u32> {
-        self.starting_workspace = Some(def.name.clone());
-        let before: std::collections::HashSet<PaneId> = self.panes.keys().copied().collect();
-        let workspaces_before: Vec<u32> = self.workspaces.iter().map(|w| w.id).collect();
-        let result = self.start_definition_inner(def, path);
-        self.starting_workspace = None;
-        if result.is_err() {
-            self.rollback(&before, &workspaces_before);
-        }
-        result
+        // Every pane is set up before the programs start.
+        self.with_batch(|server| {
+            server.starting_workspace = Some(def.name.clone());
+            let before: std::collections::HashSet<PaneId> = server.panes.keys().copied().collect();
+            let workspaces_before: Vec<u32> = server.workspaces.iter().map(|w| w.id).collect();
+            let result = server.start_definition_inner(def, path);
+            server.starting_workspace = None;
+            if result.is_err() {
+                server.rollback(&before, &workspaces_before);
+            }
+            result
+        })
     }
 
     pub(super) fn start_definition_inner(&mut self, def: &WorkspaceDef, path: Option<PathBuf>) -> Result<u32> {

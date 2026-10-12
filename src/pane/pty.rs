@@ -17,7 +17,7 @@ use alacritty_terminal::term::{Config as TermConfig, Term};
 use alacritty_terminal::vte::ansi::Processor;
 use anyhow::{Context, Result};
 use crossbeam_channel::Sender;
-use portable_pty::{Child, CommandBuilder, MasterPty, PtySize};
+use portable_pty::{CommandBuilder, MasterPty, PtySize};
 
 use super::commands::Commands;
 use super::guard::KeyboardStackGuard;
@@ -58,16 +58,38 @@ pub(super) const MAX_PENDING_INPUT: usize = 16 << 20;
 /// The pane's process. It is reaped only when the pane lets it go: until then (a zombie once it
 /// ended) its pid, and the number of the process group it leads, belong to nothing else, so a
 /// signal sent to them cannot reach another program.
+#[derive(Default)]
 pub(super) struct Process {
-    pub(super) pid: Option<u32>,
+    /// Set once it started (a pane set up in a batch starts its program a moment later).
+    pid: std::sync::OnceLock<u32>,
     child: Mutex<Option<PaneChild>>,
 }
 
 impl Process {
+    /// The process `child` is.
+    #[cfg(test)]
+    pub(super) fn of(child: PaneChild) -> Process {
+        let process = Process::default();
+        process.started(child);
+        process
+    }
+
+    /// The program started: this is its process.
+    fn started(&self, child: PaneChild) {
+        if let Some(pid) = child.process_id() {
+            let _ = self.pid.set(pid);
+        }
+        *self.child.lock().unwrap_or_else(|e| e.into_inner()) = Some(child);
+    }
+
+    pub(super) fn pid(&self) -> Option<u32> {
+        self.pid.get().copied()
+    }
+
     /// Send `signal` to the process and its group (the pane's session leads one, with what it
     /// started in the foreground).
     pub(super) fn signal_group(&self, signal: i32) {
-        let Some(pid) = self.pid else { return };
+        let Some(pid) = self.pid() else { return };
         let child = self.child.lock().unwrap_or_else(|e| e.into_inner());
         if child.is_none() {
             return;
@@ -86,7 +108,7 @@ impl Process {
     /// background jobs in groups of their own too. What left the session (a daemon, `setsid`)
     /// is not the pane's anymore.
     pub(super) fn hang_up_session(&self) {
-        let Some(pid) = self.pid else { return };
+        let Some(pid) = self.pid() else { return };
         let child = self.child.lock().unwrap_or_else(|e| e.into_inner());
         if child.is_none() {
             return;
@@ -121,7 +143,7 @@ impl ProcessHold {
     /// Whether anything still runs in the process group the process leads, the process itself
     /// included; an ended, unreaped process does not count.
     pub fn group_running(&self) -> bool {
-        self.0.pid.is_some_and(|pid| crate::process::group_running(pid as libc::pid_t))
+        self.0.pid().is_some_and(|pid| crate::process::group_running(pid as libc::pid_t))
     }
 
     /// Send `signal` to the process and its group.
@@ -143,7 +165,7 @@ impl Drop for Process {
     }
 }
 
-type PaneChild = Box<dyn Child + Send + Sync>;
+use super::spawn::{Launch, PaneChild};
 
 static REAPER: std::sync::OnceLock<crossbeam_channel::Sender<PaneChild>> = std::sync::OnceLock::new();
 
@@ -191,7 +213,12 @@ pub struct TermPane {
     /// Tells the reader to stop, even if the program never writes again (it may outlive the
     /// pane, ignoring the hangup).
     reader_stop: ReaderStop,
-    pub pid: Option<u32>,
+    /// The program, until it is started (see [`super::spawn::batch`]), and what its waiter
+    /// thread is then given.
+    pending: Option<(Launch, Waiter)>,
+    /// Gone with the pane: tells a program not started yet that it is not to be (see
+    /// [`Pending::start`]).
+    here: Arc<()>,
     pub(super) osc: OscScanner,
     pub(super) guard: KeyboardStackGuard,
     /// The shell's commands, as it marks them.
@@ -267,38 +294,12 @@ impl TermPane {
         for (k, v) in spec.env.iter().chain(&spec.secret_env.0) {
             cmd.env(k, v);
         }
-        let child: PaneChild = pair
-            .slave
-            .spawn_command(cmd)
-            .with_context(|| format!("starting {:?}", spec.command.first().unwrap_or(&env.shell)))?;
-        drop(pair.slave);
-        let pid = child.process_id();
-        let process = Arc::new(Process { pid, child: Mutex::new(Some(child)) });
-        // A failure from here on must not leave the program running: it is killed, and reaped
-        // when `process` goes (by the reaper, once the kill has taken effect).
-        let io = match start_io(id, &*pair.master, tx) {
-            Ok(io) => io,
-            Err(e) => {
-                process.signal_group(libc::SIGKILL);
-                return Err(e);
-            }
-        };
-        let wait_tx = tx.clone();
-        let waited = process.clone();
-        let eof_rx = io.eof;
-        let started = std::thread::Builder::new().name(format!("pane-{id}-wait")).spawn(move || {
-            // Wait for the end without reaping: that is left to whoever drops the process last.
-            let code = wait_exited(waited.pid);
-            // Report the exit after the last output, so waits and logs see all of it. A program
-            // left in the background can keep the terminal open: then do not wait forever.
-            let _ = eof_rx.recv_timeout(std::time::Duration::from_secs(2));
-            let _ = wait_tx.send(Event::PaneExited(id, waited.pid, code));
-        });
-        if let Err(e) = started {
-            io.stop.stop();
-            process.signal_group(libc::SIGKILL);
-            return Err(e.into());
-        }
+        // Ready to start: a program that cannot be found fails here. It starts below, or after
+        // the other panes of its batch are set up (see `super::spawn::batch`).
+        let what = spec.command.first().unwrap_or(&env.shell).clone();
+        let launch =
+            super::spawn::prepare(&*pair.master, pair.slave, cmd).with_context(|| format!("starting {what:?}"))?;
+        let io = start_io(id, &*pair.master, tx)?;
 
         let events = Rc::new(RefCell::new(Vec::new()));
         // Programs may enable the kitty keyboard protocol (Claude Code does, for Shift+Enter).
@@ -313,9 +314,10 @@ impl TermPane {
             input_pending: io.input_pending,
             input_dropped: false,
             output: io.output,
-            process,
+            process: Arc::new(Process::default()),
             reader_stop: io.stop,
-            pid,
+            pending: Some((launch, Waiter { id, tx: tx.clone(), eof: io.eof, what })),
+            here: Arc::new(()),
             osc: OscScanner::default(),
             guard: KeyboardStackGuard::default(),
             commands: Commands::new(env.scrollback),
@@ -324,7 +326,23 @@ impl TermPane {
         if let Some(text) = &spec.startup_input {
             pane.write(text.clone().into_bytes());
         }
+        if !super::spawn::batching()
+            && let Some((launch, waiting)) = pane.pending.take()
+        {
+            watch(&pane.process, waiting, launch.run())?;
+        }
         Ok(pane)
+    }
+
+    /// The process id of the pane's program, once it started.
+    pub fn pid(&self) -> Option<u32> {
+        self.process.pid()
+    }
+
+    /// The program, set up in a batch and not started yet, to start elsewhere.
+    pub(super) fn take_pending(&mut self) -> Option<Pending> {
+        let (launch, waiting) = self.pending.take()?;
+        Some(Pending { launch, process: self.process.clone(), waiting, pane: Arc::downgrade(&self.here) })
     }
 
     /// Hang up, as closing a terminal does: SIGHUP to the program, its foreground job, and the
@@ -334,7 +352,7 @@ impl TermPane {
         self.process.hang_up_session();
         #[cfg(unix)]
         if let Some(fg) = self.master.process_group_leader()
-            && Some(fg as u32) != self.pid
+            && Some(fg as u32) != self.pid()
         {
             // SAFETY: plain syscall to the terminal's current foreground group.
             unsafe {
@@ -486,6 +504,77 @@ fn read_output(mut reader: PtyReader, out: &Output, stop: &AtomicBool, tell: imp
             Some(_) => {}
         }
     }
+}
+
+/// What the waiter thread of a pane is given once its program started.
+struct Waiter {
+    id: PaneId,
+    tx: Sender<Event>,
+    /// Closed when the reader has seen the end of the output.
+    eof: crossbeam_channel::Receiver<()>,
+    /// The program, as errors name it.
+    what: String,
+}
+
+/// The program `started` (or not) is `process`'s: watch it end. A failure leaves nothing
+/// running.
+fn watch(process: &Arc<Process>, waiting: Waiter, started: Result<PaneChild>) -> Result<()> {
+    let Waiter { id, tx, eof, what } = waiting;
+    process.started(started.with_context(|| format!("starting {what:?}"))?);
+    let waited = process.clone();
+    let started = std::thread::Builder::new().name(format!("pane-{id}-wait")).spawn(move || {
+        // Wait for the end without reaping: that is left to whoever drops the process last.
+        let code = wait_exited(waited.pid());
+        // Report the exit after the last output, so waits and logs see all of it. A program
+        // left in the background can keep the terminal open: then do not wait forever.
+        let _ = eof.recv_timeout(std::time::Duration::from_secs(2));
+        let _ = tx.send(Event::PaneExited(id, waited.pid(), code));
+    });
+    if let Err(e) = started {
+        // It is killed, and reaped when the process goes (by the reaper, once the kill has
+        // taken effect).
+        process.signal_group(libc::SIGKILL);
+        return Err(e.into());
+    }
+    Ok(())
+}
+
+/// The program of a pane set up in a batch, to start on any thread (see [`launcher`]).
+pub struct Pending {
+    launch: Launch,
+    process: Arc<Process>,
+    waiting: Waiter,
+    pane: std::sync::Weak<()>,
+}
+
+impl Pending {
+    /// Start the program, unless its pane is gone, and watch it end. One that cannot start is
+    /// said to the server ([`Event::PaneFailed`]): its pane then waits for Enter, as one whose
+    /// program could not start when it was made does.
+    pub fn start(self) {
+        let Pending { launch, process, waiting, pane } = self;
+        if pane.strong_count() == 0 {
+            return;
+        }
+        let (id, tx) = (waiting.id, waiting.tx.clone());
+        if let Err(e) = watch(&process, waiting, launch.run()) {
+            let _ = tx.send(Event::PaneFailed(id, ProcessHold(process), format!("{e:#}")));
+        }
+    }
+}
+
+/// Start the thread that starts the programs of the panes of a batch, one after the other in
+/// the order they are given. Each start waits for its program to run: off the server's thread,
+/// which shows the first prompts meanwhile. What is sent once the thread is gone (it could not
+/// be started) is for the sender to start.
+pub fn launcher() -> Sender<Pending> {
+    let (tx, rx) = crossbeam_channel::unbounded::<Pending>();
+    let _ = std::thread::Builder::new().name("pane-launch".into()).spawn(move || {
+        for pending in rx {
+            pending.start();
+        }
+    });
+    tx
 }
 
 /// The threads that move bytes between a pane's PTY and kraal.
@@ -683,6 +772,41 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
+    fn a_reader_sleeps_while_the_program_is_silent() {
+        let pair = portable_pty::native_pty_system()
+            .openpty(PtySize { rows: 5, cols: 20, pixel_width: 0, pixel_height: 0 })
+            .unwrap();
+        let mut writer = pair.master.take_writer().unwrap();
+        let stop = ReaderStop::new(pair.master.tty_name());
+        let mut reader = PtyReader::new(&*pair.master, stop.wakes()).unwrap();
+        let stopped = stop.flag.clone();
+        let (tid_tx, tid_rx) = crossbeam_channel::bounded(1);
+        let (read_tx, read_rx) = crossbeam_channel::unbounded();
+        let thread = std::thread::spawn(move || {
+            // SAFETY: gettid has no preconditions.
+            let _ = tid_tx.send(unsafe { libc::gettid() });
+            let mut buf = [0u8; 64];
+            while let Some(n) = reader.read(&mut buf, &stopped) {
+                let _ = read_tx.send(buf[..n].to_vec());
+            }
+        });
+        let tid = tid_rx.recv().unwrap();
+        let switches = crate::testing::thread_switches(tid);
+        std::thread::sleep(Duration::from_millis(50));
+        let before = switches();
+        std::thread::sleep(Duration::from_millis(700));
+        assert_eq!(switches(), before, "the reader woke up while nothing happened");
+        // Output wakes it at once (the slave echoes what is typed into the master).
+        writer.write_all(b"x").unwrap();
+        let got = read_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(got.contains(&b'x'));
+        stop.stop();
+        thread.join().unwrap();
+        drop(pair.slave);
+    }
+
+    #[test]
     fn output_is_taken_in_batches_and_the_server_told_once_per_batch() {
         let pair = portable_pty::native_pty_system()
             .openpty(PtySize { rows: 5, cols: 20, pixel_width: 0, pixel_height: 0 })
@@ -753,7 +877,7 @@ mod tests {
         cmd.args(["-c", "trap '' TERM HUP; sleep 30 & exit 0"]);
         let child = pair.slave.spawn_command(cmd).unwrap();
         let pid = child.process_id().unwrap();
-        let process = Arc::new(Process { pid: Some(pid), child: Mutex::new(Some(child)) });
+        let process = Arc::new(Process::of(child));
         let hold = ProcessHold::new(&process);
         // SAFETY: signal 0 only checks that the pid is taken.
         let taken = || unsafe { libc::kill(pid as libc::pid_t, 0) == 0 };
@@ -789,7 +913,7 @@ mod tests {
         cmd.args(["-c", "exit 0"]);
         let child = pair.slave.spawn_command(cmd).unwrap();
         let pid = child.process_id().unwrap();
-        let process = Process { pid: Some(pid), child: Mutex::new(Some(child)) };
+        let process = Process::of(child);
         // SAFETY: signal 0 only checks that the pid is taken.
         let taken = || unsafe { libc::kill(pid as libc::pid_t, 0) == 0 };
         assert_eq!(wait_exited(Some(pid)), Some(0));
@@ -902,7 +1026,7 @@ mod tests {
         cmd.args(["-c", &format!("set -m; sleep 30 & echo $! > {}; wait", pidfile.display())]);
         let child = pair.slave.spawn_command(cmd).unwrap();
         let pid = child.process_id().unwrap();
-        let process = Process { pid: Some(pid), child: Mutex::new(Some(child)) };
+        let process = Process::of(child);
         let start = Instant::now();
         let job: libc::pid_t = loop {
             if let Some(j) = std::fs::read_to_string(&pidfile).ok().and_then(|s| s.trim().parse().ok()) {
@@ -939,7 +1063,7 @@ mod tests {
         let child = pair.slave.spawn_command(cmd).unwrap();
         let pid = child.process_id().unwrap();
         // Still running when its pane goes (a failed start, or a pane closed under it).
-        drop(Process { pid: Some(pid), child: Mutex::new(Some(child)) });
+        drop(Process::of(child));
         // SAFETY: signal 0 only checks that the pid is taken (a zombie takes it too).
         let taken = || unsafe { libc::kill(pid as libc::pid_t, 0) == 0 };
         assert!(taken());
@@ -948,5 +1072,65 @@ mod tests {
             std::thread::sleep(Duration::from_millis(20));
         }
         assert!(!taken(), "ended, and not left a zombie");
+    }
+
+    #[test]
+    fn a_program_held_in_a_batch_starts_later_if_its_pane_is_still_there() {
+        let dir = std::env::temp_dir().join(format!("kraal-held-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        crate::testing::write_script(&dir.join("broken"), "#!/no/such/interpreter\n");
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let env = PaneEnv {
+            socket: "/nonexistent".into(),
+            session: "t".into(),
+            shell: "sh".into(),
+            scrollback: 100,
+            graphics: Default::default(),
+        };
+        let spec = |name: &str| PaneSpec {
+            command: vec!["sh".into(), "-c".into(), format!("touch '{}'; sleep 30", dir.join(name).display())],
+            ..Default::default()
+        };
+        let batch = super::super::spawn::batch();
+        let mut kept = TermPane::spawn(1, &spec("kept"), 20, 5, &env, &tx).unwrap();
+        let mut gone = TermPane::spawn(2, &spec("gone"), 20, 5, &env, &tx).unwrap();
+        let broken = PaneSpec { command: vec![dir.join("broken").display().to_string()], ..Default::default() };
+        let mut failed = TermPane::spawn(3, &broken, 20, 5, &env, &tx).unwrap();
+        drop(batch);
+        assert_eq!(kept.pid(), None, "held while the batch was");
+        let (k, g, f) = (kept.take_pending().unwrap(), gone.take_pending().unwrap(), failed.take_pending().unwrap());
+        assert!(kept.take_pending().is_none(), "started once");
+        drop(gone);
+        // On another thread, as the launcher starts them.
+        std::thread::spawn(move || {
+            g.start();
+            k.start();
+            f.start();
+        })
+        .join()
+        .unwrap();
+        assert!(kept.pid().is_some());
+        let start = Instant::now();
+        while !dir.join("kept").exists() && start.elapsed() < Duration::from_secs(5) {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(dir.join("kept").exists(), "started");
+        assert!(!dir.join("gone").exists(), "not started: its pane went first");
+        let (process, why) = loop {
+            match rx.recv_timeout(Duration::from_secs(5)) {
+                Ok(Event::PaneFailed(id, process, why)) => {
+                    assert_eq!(id, 3);
+                    break (process, why);
+                }
+                Ok(_) => {}
+                Err(_) => panic!("the failure is said"),
+            }
+        };
+        assert!(process.is(&ProcessHold::new(&failed.process)), "said of its process");
+        assert!(why.contains("No such file or directory"), "{why}");
+        assert_eq!(failed.pid(), None);
+        kept.process.signal_group(libc::SIGKILL);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

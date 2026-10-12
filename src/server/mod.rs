@@ -10,6 +10,7 @@ mod clients;
 mod commands;
 mod contexts;
 mod definitions;
+mod dirwatch;
 mod edits;
 pub mod events;
 mod fileman;
@@ -66,6 +67,9 @@ pub enum Event {
     PaneReady(PaneId),
     /// Pane id, pid of the process that exited, exit code.
     PaneExited(PaneId, Option<u32>, Option<i32>),
+    /// The program of a pane (id, process), started after the pane was set up, could not
+    /// start: why.
+    PaneFailed(PaneId, crate::pane::ProcessHold, String),
     Connection(UnixStream),
     ClientFrame(ClientId, u8, Vec<u8>),
     ClientGone(ClientId),
@@ -81,6 +85,8 @@ pub enum Event {
     Job(u32, Box<dyn std::any::Any + Send>),
     /// The agents a server's session has now, from the connection with this id.
     RemoteAgents(u32, Vec<remote::RemoteAgent>),
+    /// Watched directories changed (see [`crate::watch`]).
+    Watched(Vec<crate::watch::Change>),
     Shutdown,
 }
 
@@ -371,6 +377,17 @@ pub struct Server {
     persist_dirty: bool,
     last_persist: Instant,
     last_tick: Instant,
+    /// Nothing happened for a while: the tick comes with the scan, or seldom (see
+    /// [`Server::next_tick`]).
+    idle: bool,
+    /// The scan must come every [`SCAN_EVERY`] (see [`Server::scan_needed`]).
+    scan_polled: bool,
+    /// Kubeconfigs are in use: they are read at every scan.
+    kube_polled: bool,
+    /// When a client last said something (a key, a request, a connection).
+    last_contact: Instant,
+    /// When the contexts, the accounts' usage and the listening ports were last read.
+    last_scan: Instant,
     next_render: Option<Instant>,
     /// When an image that stopped moving may be drawn as sixel where it stopped. Kept apart from
     /// `next_render`, which it would hold back: other changes are drawn meanwhile.
@@ -403,7 +420,6 @@ pub struct Server {
     /// Name of the workspace whose definition is being started (for account rules).
     starting_workspace: Option<String>,
     pub usage: crate::accounts::UsageMap,
-    last_usage_load: Instant,
     last_codex_poll: Instant,
     limit_alerts: HashMap<PaneId, agents::LimitAlert>,
     /// The limit message each agent pane shows, as already counted: a message staying on
@@ -415,9 +431,12 @@ pub struct Server {
     limit_events: std::collections::HashSet<PaneId>,
     /// Branch and changes per directory (None: not a repository).
     pub git: HashMap<PathBuf, Option<crate::git::GitInfo>>,
-    git_pending: std::collections::HashSet<PathBuf>,
+    /// The directories panes are in: when to ask git about them again, and the watches on
+    /// them, on their repositories and on the configuration's directories.
+    dirwatch: dirwatch::DirWatch,
     git_requests: Sender<PathBuf>,
-    last_git_scan: Instant,
+    /// Starts the programs of the panes of a batch (see `crate::pane::launcher`).
+    launches: Sender<crate::pane::Pending>,
     /// Current Kubernetes context per `KUBECONFIG` value in use.
     pub kube: HashMap<String, crate::context::KubeFile>,
     kube_cache: crate::context::KubeCache,
@@ -459,6 +478,8 @@ pub struct Server {
     persister: Sender<persistence::Persist>,
     /// What that thread and the event loop share beside the jobs.
     persisting: Arc<Mutex<persistence::Persisting>>,
+    /// The state the last save sent wrote (compact JSON).
+    persisted: Option<Vec<u8>>,
     /// What is saved of each pane's scrollback.
     pub scrollback: HashMap<PaneId, persist::SavedScrollback>,
     /// Starts the names of the scrollback files this server makes, so that none is a file an
@@ -502,7 +523,18 @@ pub struct Server {
 /// Finishes a background job on the server thread with its result.
 type JobDone = Box<dyn FnOnce(&mut Server, Box<dyn std::any::Any + Send>)>;
 
+/// The periodic work (agents, previews, runbooks...) runs this often while something happens:
+/// output, keys, requests, or work that needs watching (see [`Server::busy`]).
 const TICK: Duration = Duration::from_millis(400);
+/// Once nothing has for this long, it runs only with the scan...
+const ACTIVE_FOR: Duration = Duration::from_secs(3);
+/// ...or this often when nothing needs one (see [`Server::scan_needed`]): what changes meanwhile
+/// is told (see [`dirwatch`]), and the first key or request after a quiet spell runs the tick
+/// before anything else.
+const IDLE_EVERY: Duration = Duration::from_secs(30);
+/// The contexts, the accounts' usage and the ports something listens on are read again this
+/// often when they have to be looked at.
+const SCAN_EVERY: Duration = Duration::from_secs(3);
 const FRAME: Duration = Duration::from_millis(16);
 const INPUT_FLUSH: Duration = Duration::from_millis(30);
 /// A pane whose last output is younger than this is printing without a pause...
@@ -510,8 +542,18 @@ const STREAM_PAUSE: Duration = Duration::from_millis(2);
 /// ...and its output is looked for this often (frames are drawn no sooner).
 const WATCH_STREAMS: Duration = Duration::from_millis(1);
 
+/// Whether what was last done at `last` is due again at `now`, done `every` so often: a little
+/// early rather than a whole tick late.
+fn due(now: Instant, last: Instant, every: Duration) -> bool {
+    now.saturating_duration_since(last) + Duration::from_millis(50) >= every
+}
+
 /// Run a session server in the foreground until it is told to exit.
 pub fn run(session: &str) -> Result<()> {
+    let ready = take_ready_pipe();
+    // What this process inherited stays out of the panes' programs.
+    crate::pane::close_inherited();
+    crate::pane::reserve_descriptors();
     let socket = paths::socket_path(session);
     paths::private_runtime_dir().context("checking the runtime directory")?;
     if socket.exists() {
@@ -521,6 +563,12 @@ pub fn run(session: &str) -> Result<()> {
         let _ = std::fs::remove_file(&socket);
     }
     let listener = UnixListener::bind(&socket).with_context(|| format!("binding {}", socket.display()))?;
+    // Connections wait in the listener's queue from now on: the client that started this server
+    // may connect.
+    if let Some(mut ready) = ready {
+        use std::io::Write;
+        let _ = ready.write_all(b"1");
+    }
 
     let (config, mut warnings) = match Config::load() {
         Ok(c) => (c, Vec::new()),
@@ -572,6 +620,12 @@ pub fn run(session: &str) -> Result<()> {
     }
 
     let git_tx = tx.clone();
+    let watch_tx = tx.clone();
+    // Where nothing can be watched, git is asked about repositories every few seconds instead.
+    let watcher = crate::watch::Watcher::new(move |changes| {
+        let _ = watch_tx.send(Event::Watched(changes));
+    })
+    .ok();
     let env = PaneEnv {
         socket: socket.clone(),
         session: session.to_string(),
@@ -599,6 +653,11 @@ pub fn run(session: &str) -> Result<()> {
         persist_dirty: false,
         last_persist: Instant::now(),
         last_tick: Instant::now(),
+        idle: false,
+        scan_polled: true,
+        kube_polled: false,
+        last_contact: Instant::now(),
+        last_scan: Instant::now() - SCAN_EVERY,
         next_render: None,
         image_wake: None,
         quitting: false,
@@ -617,7 +676,6 @@ pub fn run(session: &str) -> Result<()> {
         accounts: crate::accounts::Accounts::empty(),
         starting_workspace: None,
         usage: Default::default(),
-        last_usage_load: Instant::now(),
         last_codex_poll: Instant::now() - Duration::from_secs(3600),
         limit_alerts: HashMap::new(),
         screen_limits: HashMap::new(),
@@ -640,9 +698,9 @@ pub fn run(session: &str) -> Result<()> {
         port_candidates: HashMap::new(),
         ports: Default::default(),
         git: HashMap::new(),
-        git_pending: Default::default(),
+        dirwatch: dirwatch::DirWatch::new(watcher),
         git_requests: worktrees::spawn_git_worker(git_tx),
-        last_git_scan: Instant::now() - Duration::from_secs(10),
+        launches: crate::pane::launcher(),
         kube: HashMap::new(),
         kube_cache: Default::default(),
         tf_dirs: Default::default(),
@@ -665,6 +723,7 @@ pub fn run(session: &str) -> Result<()> {
         pending_opens: Vec::new(),
         persister: spawn_persister(persist_tx, persisting.clone()),
         persisting,
+        persisted: None,
         scrollback: HashMap::new(),
         scrollback_tag: format!("{}-{}", crate::accounts::now(), std::process::id()),
         run_logs: {
@@ -681,6 +740,31 @@ pub fn run(session: &str) -> Result<()> {
     server.shutdown();
     let _ = std::fs::remove_file(&socket);
     result
+}
+
+/// The pipe the client that started this server waits on (see `client::ensure_server`), taken
+/// out of the environment so that nothing this server starts sees it. Only the write end of a
+/// pipe is taken: a stale or odd value names nothing to write to.
+fn take_ready_pipe() -> Option<std::fs::File> {
+    use std::os::fd::FromRawFd;
+    let value = std::env::var_os(crate::client::READY_FD_VAR)?;
+    // SAFETY: the server has not started any thread yet.
+    unsafe { std::env::remove_var(crate::client::READY_FD_VAR) };
+    let fd: libc::c_int = value.to_str()?.parse().ok().filter(|fd| *fd > 2)?;
+    // SAFETY: fstat and fcntl only look at the descriptor, and fail on one that is not open.
+    unsafe {
+        let mut st: libc::stat = std::mem::zeroed();
+        if libc::fstat(fd, &mut st) != 0 || st.st_mode & libc::S_IFMT != libc::S_IFIFO {
+            return None;
+        }
+        let flags = libc::fcntl(fd, libc::F_GETFL);
+        if flags < 0 || flags & libc::O_ACCMODE != libc::O_WRONLY {
+            return None;
+        }
+        libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
+        // SAFETY: the client gave this descriptor to this process alone.
+        Some(std::fs::File::from_raw_fd(fd))
+    }
 }
 
 impl Server {
@@ -821,9 +905,12 @@ impl Server {
     }
 
     fn next_deadline(&self) -> Instant {
-        let mut d = self.last_tick + TICK;
+        let mut d = self.next_tick();
         for r in [self.next_render, self.image_wake].into_iter().flatten() {
             d = d.min(r);
+        }
+        if let Some(g) = self.dirwatch.next() {
+            d = d.min(g);
         }
         for c in self.clients.values() {
             if let Some(p) = c.pending_since {
@@ -885,27 +972,99 @@ impl Server {
         }
         self.finish_exits();
         self.release_held();
-        if now >= self.last_tick + TICK {
+        self.git_due(now);
+        if now >= self.next_tick() {
             self.last_tick = now;
-            self.tick();
+            self.tick(now);
+            self.idle = self.quiet(now);
+            self.scan_polled = self.scan_needed();
         }
         self.check_waits();
     }
 
+    /// When the next tick comes: [`TICK`] after the last while something happens, else when
+    /// the scan is due, else [`IDLE_EVERY`] after the last.
+    fn next_tick(&self) -> Instant {
+        match (self.idle, self.scan_polled) {
+            (false, _) => self.last_tick + TICK,
+            (true, true) => self.last_scan + SCAN_EVERY,
+            (true, false) => self.last_tick + IDLE_EVERY,
+        }
+    }
+
+    /// Whether what the scan reads has to be looked at every [`SCAN_EVERY`]: contexts in use or
+    /// that cannot be watched, ports mentioned, repositories that cannot be watched, or the
+    /// directories of the configuration and of the accounts' usage.
+    fn scan_needed(&self) -> bool {
+        self.contexts_polled()
+            || self.dirwatch.polled()
+            || !self.dirwatch.config_watched()
+            || !self.port_candidates.is_empty()
+            || !self.ports.is_empty()
+    }
+
+    /// Something happens: the periodic work comes at its usual pace again (at once when it was
+    /// waiting longer than that).
+    fn wake(&mut self) {
+        self.idle = false;
+    }
+
+    /// Whether nothing happened for [`ACTIVE_FOR`] (no output, no key, no request) and nothing
+    /// needs watching: the periodic work can wait.
+    fn quiet(&self, now: Instant) -> bool {
+        let recent = |t: Instant| now.saturating_duration_since(t) < ACTIVE_FOR;
+        !recent(self.last_contact)
+            && !self.panes.values().any(|p| recent(p.last_output))
+            && !self.clients.values().any(|c| recent(c.last_input))
+            && !self.busy()
+    }
+
+    /// Work that is looked at every tick and cannot wait: running runbooks and hooks, edits,
+    /// tunnels and remote sessions, previews being read, panes about to close, conditions waited
+    /// for, held input, and agents whose state is guessed from their screen while they work.
+    fn busy(&self) -> bool {
+        !self.runs.is_empty()
+            || !self.launching.is_empty()
+            || !self.stray_groups.is_empty()
+            || !self.edits.is_empty()
+            || !self.tunnels.is_empty()
+            || !self.remotes.is_empty()
+            || !self.pending_opens.is_empty()
+            || !self.preview_loads.is_empty()
+            || !self.held_input.is_empty()
+            || !self.waits.is_empty()
+            || !self.exiting.is_empty()
+            || self.hooks.busy()
+            || self.panes.values().any(|p| {
+                p.close_at.is_some()
+                    || (p.agent.kind.is_some()
+                        && !p.agent.hooked
+                        && matches!(
+                            p.agent.state,
+                            crate::agent::AgentState::Working | crate::agent::AgentState::Blocked
+                        ))
+            })
+    }
+
     /// Periodic work: agent detection, preview reloads, persistence.
-    fn tick(&mut self) {
+    fn tick(&mut self, now: Instant) {
+        // Contexts first: their reads run on threads of their own meanwhile, and are mostly
+        // done when the tick ends (their answers then wake nothing).
+        let scan = due(now, self.last_scan, SCAN_EVERY);
+        if scan {
+            self.last_scan = now;
+            self.refresh_kube();
+            self.refresh_tf_dirs();
+            self.reload_usage();
+        }
         let mut changed = Vec::new();
-        let mut reloads = Vec::new();
         let mut ssh_seen = Vec::new();
         let mut ssh_ended = Vec::new();
         let mut read_contexts = false;
         let ids: Vec<PaneId> = self.panes.keys().copied().collect();
         for id in ids {
             let Some(pane) = self.panes.get_mut(&id) else { continue };
-            if let crate::pane::Content::Preview(p) = &mut pane.content {
-                if p.modified_since_load() && self.preview_loads.insert(id) {
-                    reloads.push((id, p.path().to_path_buf()));
-                }
+            if let crate::pane::Content::Preview(_) = &pane.content {
                 continue;
             }
             if pane.exit_code.is_some() {
@@ -958,24 +1117,7 @@ impl Server {
             self.refresh_kube();
             self.refresh_tf_dirs();
         }
-        // Changed previews are read again off the event loop (images take a while to decode).
-        let images = self.env.graphics.enabled();
-        for (id, path) in reloads {
-            let started = self.background(
-                move || crate::preview::Loaded::read(&path, images),
-                move |server, loaded| {
-                    server.preview_loads.remove(&id);
-                    if let Some(crate::pane::Content::Preview(p)) = server.panes.get_mut(&id).map(|p| &mut p.content) {
-                        p.apply(loaded);
-                        server.mark_dirty();
-                    }
-                },
-            );
-            // No thread to read it: the next tick tries again.
-            if !started {
-                self.preview_loads.remove(&id);
-            }
-        }
+        self.check_previews();
         self.forget_ended_ssh(ssh_ended);
         self.save_buffers();
         self.tick_edits();
@@ -1013,16 +1155,11 @@ impl Server {
                 p.copy_mode(false);
             }
         }
-        if self.last_usage_load.elapsed() > Duration::from_secs(3) {
-            self.reload_usage();
+        if scan {
             self.check_limits();
-        }
-        if self.last_git_scan.elapsed() > Duration::from_secs(3) {
-            self.refresh_git();
-            self.refresh_kube();
-            self.refresh_tf_dirs();
             self.refresh_ports();
         }
+        self.refresh_git(now);
         self.check_tunnels();
         self.check_remotes();
         if self.last_codex_poll.elapsed() > Duration::from_secs(300) {
@@ -1034,10 +1171,10 @@ impl Server {
             self.close_pane(id);
         }
         self.save_scrollback(false);
-        if self.persist_dirty || self.last_persist.elapsed() > Duration::from_secs(30) {
+        if self.persist_dirty || due(now, self.last_persist, Duration::from_secs(30)) {
             self.persist_unless_writing();
         }
-        if self.last_def_scan.elapsed() > Duration::from_secs(5) {
+        if due(now, self.last_def_scan, Duration::from_secs(5)) {
             self.scan_definitions();
         }
     }
@@ -1052,19 +1189,63 @@ impl Server {
         }
     }
 
+    /// Read again, off the event loop (images take a while to decode), the previews whose file
+    /// changed since it was read, or that are to be read (just opened, `r`).
+    fn check_previews(&mut self) {
+        let reloads: Vec<(PaneId, PathBuf)> = self
+            .panes
+            .values()
+            .filter_map(|p| match &p.content {
+                crate::pane::Content::Preview(v) if v.modified_since_load() => Some((p.id, v.path().to_path_buf())),
+                _ => None,
+            })
+            .filter(|(id, _)| !self.preview_loads.contains(id))
+            .collect();
+        let images = self.env.graphics.enabled();
+        for (id, path) in reloads {
+            self.preview_loads.insert(id);
+            let started = self.background(
+                move || crate::preview::Loaded::read(&path, images),
+                move |server, loaded| {
+                    server.preview_loads.remove(&id);
+                    if let Some(crate::pane::Content::Preview(p)) = server.panes.get_mut(&id).map(|p| &mut p.content) {
+                        p.apply(loaded);
+                        server.mark_dirty();
+                    }
+                },
+            );
+            // No thread to read it: the next tick tries again.
+            if !started {
+                self.preview_loads.remove(&id);
+            }
+        }
+    }
+
     fn handle(&mut self, ev: Event) {
         match ev {
             Event::PaneReady(id) => {
+                self.wake();
                 if self.ready_set.insert(id) {
                     self.ready.push_back(id);
                 }
             }
             Event::PaneExited(id, pid, code) => {
+                self.wake();
                 self.exiting.insert(id, (pid, code, Instant::now() + Duration::from_secs(1)));
                 self.finish_exits();
+                // What ended may have committed, checked out or merged.
+                self.git_soon_everywhere();
             }
-            Event::Connection(stream) => self.new_connection(stream),
-            Event::ClientFrame(id, kind, payload) => self.client_frame(id, kind, payload),
+            Event::PaneFailed(id, process, why) => self.pane_failed(id, &process, &why),
+            Event::Connection(stream) => {
+                self.contact();
+                self.new_connection(stream)
+            }
+            Event::ClientFrame(id, kind, payload) => {
+                self.contact();
+                self.client_frame(id, kind, payload)
+            }
+            Event::Watched(changes) => self.watched(&changes),
             Event::ClientGone(id) => self.drop_client(id),
             Event::Git(dir, info) => self.git_result(dir, info),
             Event::Warning(w) => self.warnings.push(w),
@@ -1076,6 +1257,8 @@ impl Server {
             }
             Event::RemoteAgents(conn, list) => self.remote_list(conn, list),
             Event::Wake => {
+                // A preview's file changed, or a file listing is ready.
+                self.check_previews();
                 let mut changed = false;
                 for p in self.panes.values_mut() {
                     if let crate::pane::Content::Files(f) = &mut p.content {
@@ -1091,6 +1274,35 @@ impl Server {
         // Whatever was to fill a new workspace and could not start leaves no empty workspace
         // behind (one is never shown without a tab).
         self.drop_empty_workspaces();
+    }
+
+    /// A client said something. After a quiet spell, the tick runs first: what it is about to
+    /// act on (the processes in the panes, the definitions, the contexts read when they need
+    /// to be) is as fresh as when the server ticks all the time.
+    fn contact(&mut self) {
+        let now = Instant::now();
+        self.last_contact = now;
+        if self.idle {
+            self.idle = false;
+            self.last_tick = now;
+            self.tick(now);
+        }
+    }
+
+    /// The watcher saw changes: in repositories (git is asked again), in the directories panes
+    /// are in (their Terraform workspace is read again), in the configuration's directories or
+    /// the accounts' usage (read again).
+    fn watched(&mut self, changes: &[crate::watch::Change]) {
+        let touched = self.dirwatch.changed(changes, Instant::now());
+        if !touched.dirs.is_empty() {
+            self.tf_touched(touched.dirs);
+            self.scan_polled = true;
+        }
+        if touched.config {
+            self.scan_definitions();
+            self.reload_usage();
+            self.check_limits();
+        }
     }
 
     fn pane_output(&mut self, id: PaneId, data: &[u8]) {

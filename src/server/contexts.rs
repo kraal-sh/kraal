@@ -80,7 +80,17 @@ pub(super) struct TfDirs {
     /// Being read: since when, and the read's number (see `KubeCache`).
     reading: HashMap<TfDir, (Instant, u64)>,
     reads: u64,
+    /// When each was last read, and the directories panes are in whose entries changed since
+    /// (see [`Server::refresh_tf_dirs`]).
+    started: HashMap<TfDir, Instant>,
+    touched: HashSet<PathBuf>,
+    /// At the last scan, some directory was read, or is being read.
+    polled: bool,
 }
+
+/// A directory known not to be a Terraform one, whose entries are watched, is read again at
+/// least this often (see [`Server::refresh_tf_dirs`]).
+const TF_QUIET_EVERY: Duration = Duration::from_secs(60);
 
 /// A Terraform directory as a reason names it, with its data directory.
 fn tf_place((dir, data_dir): &TfDir) -> String {
@@ -275,6 +285,7 @@ impl Server {
     /// path that is not a file, must not stop the server, nor the other panes' contexts.
     pub(super) fn refresh_kube(&mut self) {
         let values: HashSet<String> = self.panes.values().filter_map(|p| self.pane_kubeconfig(p)).collect();
+        self.kube_polled = !values.is_empty();
         self.kube.retain(|v, _| values.contains(v));
         self.kube_cache.retain_told(|v| values.contains(v));
         for value in values {
@@ -422,8 +433,15 @@ impl Server {
     /// those Terraform runs worked on. What a run found holds while the pane stays in the
     /// directory it ran from: once it left, the run is forgotten (the directory's own workspace,
     /// still remembered, counts when it comes back).
+    ///
+    /// A directory a pane is in, known not to be a Terraform one, is not read again while its
+    /// entries are watched and have not changed, nothing printed there, and it was read not long
+    /// ago: becoming one (`terraform init`) adds an entry. One on a network file system, where
+    /// other machines' changes go untold, is read at every scan.
     pub(super) fn refresh_tf_dirs(&mut self) {
         let mut wanted: HashSet<TfDir> = HashSet::new();
+        // When panes last printed in each directory.
+        let mut output: HashMap<PathBuf, Instant> = HashMap::new();
         let terraform = self.config.contexts.terraform;
         for p in self.panes.values_mut() {
             if let Some(TfSeen::Dir { from, dir, data_dir }) = &p.seen.tf_workspace {
@@ -434,8 +452,14 @@ impl Server {
                 }
             }
             let shell_here = p.is_terminal() && p.ssh.is_none() && p.exit_code.is_none();
-            if terraform && shell_here && !matches!(p.seen.tf_workspace, Some(TfSeen::Env(_))) {
-                wanted.extend(p.current_cwd().map(|cwd| (cwd, None)));
+            if terraform
+                && shell_here
+                && !matches!(p.seen.tf_workspace, Some(TfSeen::Env(_)))
+                && let Some(cwd) = p.current_cwd()
+            {
+                let at = output.entry(cwd.clone()).or_insert(p.last_output);
+                *at = (*at).max(p.last_output);
+                wanted.insert((cwd, None));
             }
         }
         // What a directory was found to be is kept after the panes left it: coming back, a pane
@@ -443,12 +467,24 @@ impl Server {
         // unguarded until then). Only when many are kept do the unused ones that are not
         // Terraform directories go; a Terraform directory is never forgotten (there are few).
         forget_unused(&mut self.tf_dirs.read, &wanted);
+        let now = Instant::now();
+        let tf = &mut self.tf_dirs;
+        tf.started.retain(|k, _| wanted.contains(k));
+        tf.touched.retain(|d| wanted.contains(&(d.clone(), None)));
+        tf.polled = false;
         for key in wanted {
             if self.tf_dirs.reading.contains_key(&key) {
+                self.tf_dirs.polled = true;
                 continue;
             }
+            if self.tf_quiet(&key, output.get(&key.0).copied(), now) {
+                continue;
+            }
+            self.tf_dirs.polled = true;
+            self.tf_dirs.started.insert(key.clone(), now);
+            self.tf_dirs.touched.remove(&key.0);
             self.tf_dirs.reads += 1;
-            self.tf_dirs.reading.insert(key.clone(), (Instant::now(), self.tf_dirs.reads));
+            self.tf_dirs.reading.insert(key.clone(), (now, self.tf_dirs.reads));
             let (read, done) = (key.clone(), key.clone());
             let started = self.background(
                 move || context::terraform_dir_workspace(&read.0, read.1.as_deref()),
@@ -464,6 +500,31 @@ impl Server {
                 self.tf_dirs.reading.remove(&key);
             }
         }
+    }
+
+    /// Whether `key` can go unread at this scan (see [`Server::refresh_tf_dirs`]), panes having
+    /// last printed in its directory at `output`.
+    fn tf_quiet(&self, key: &TfDir, output: Option<Instant>, now: Instant) -> bool {
+        let (dir, data_dir) = key;
+        let Some(started) = self.tf_dirs.started.get(key) else { return false };
+        data_dir.is_none()
+            && self.tf_dirs.read.get(key) == Some(&None)
+            && self.dirwatch.entries_watched(dir)
+            && !self.tf_dirs.touched.contains(dir)
+            && output.is_none_or(|o| o <= *started)
+            && now.saturating_duration_since(*started) < TF_QUIET_EVERY
+    }
+
+    /// The entries of these directories panes are in changed: their Terraform workspace is read
+    /// at the next scan.
+    pub(super) fn tf_touched(&mut self, dirs: Vec<PathBuf>) {
+        self.tf_dirs.touched.extend(dirs);
+    }
+
+    /// Whether the contexts must be read at every scan: kubeconfigs are in use, or a Terraform
+    /// directory is read each time.
+    pub(super) fn contexts_polled(&self) -> bool {
+        self.kube_polled || self.tf_dirs.polled || !self.tf_dirs.touched.is_empty()
     }
 
     pub fn pane_terraform(&self, id: PaneId) -> Option<String> {

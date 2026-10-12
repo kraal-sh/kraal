@@ -102,6 +102,8 @@ impl Server {
                 }
                 if gained {
                     self.mark_seen_focused(id);
+                    // Back from another window, where files may have been edited.
+                    self.git_soon_for(id);
                 }
                 // The pane is told now, so that leaving and coming back are both told, in order.
                 self.follow_focus();

@@ -48,7 +48,6 @@ impl Server {
     }
 
     pub(super) fn reload_usage(&mut self) {
-        self.last_usage_load = Instant::now();
         self.usage = UsageMap::load(&self.accounts.all());
     }
 

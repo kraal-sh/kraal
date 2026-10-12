@@ -1123,6 +1123,37 @@ fn missing_command_does_not_break_the_workspace() {
     assert!(env.run(&["workspaces"]).contains("open"));
 }
 
+/// A program found but that cannot run (its interpreter is missing) is known only once the pane
+/// started it: the pane then waits for Enter all the same, saying why, and the others run.
+#[test]
+fn a_program_that_cannot_run_after_all_waits_for_enter() {
+    let env = Env::new("cantrun");
+    let broken = env.root.join("broken");
+    write_script(&broken, "#!/no/such/interpreter\n");
+    env.workspace(
+        "w",
+        &format!(
+            "layout {{\n    pane split_direction=\"vertical\" {{\n        pane name=\"ok\"\n        pane name=\"bad\" command={:?}\n    }}\n}}\n",
+            broken.display().to_string()
+        ),
+    );
+    env.run(&["open", "w"]);
+    env.wait_for_text("bad", "cannot start");
+    env.wait_for_text("bad", "No such file or directory");
+    let start = Instant::now();
+    loop {
+        let v: serde_json::Value = serde_json::from_str(&env.run(&["panes", "--json"])).unwrap();
+        let bad = v.as_array().unwrap().iter().find(|p| p["name"] == "bad").cloned().expect("the pane is kept");
+        if bad["suspended"] == true {
+            break;
+        }
+        assert!(start.elapsed() < Duration::from_secs(5), "{bad}");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    env.run(&["send", "-p", "ok", "-e", "echo still-here"]);
+    env.wait_for_text("ok", "still-here");
+}
+
 #[test]
 fn restore_suspends_commands_but_reconnects_ssh() {
     let env = Env::new("restoresafe");
@@ -1355,6 +1386,36 @@ fn events_stream_and_hooks() {
     let out = env.try_run(&["events", "pane.exitd"]);
     assert!(!out.status.success());
     assert!(String::from_utf8_lossy(&out.stderr).contains("no such event"));
+}
+
+/// A directory a quiet pane is in that becomes a Terraform one (`terraform init` run from
+/// elsewhere) is guarded as soon as it is: the change is told, not looked for now and then.
+#[test]
+fn a_directory_that_becomes_a_terraform_one_is_guarded() {
+    let env = Env::new("tfnew");
+    let tf = env.root.join("infra");
+    std::fs::create_dir_all(&tf).unwrap();
+    env.workspace("w", &format!("layout {{\n    pane name=\"t\" cwd={:?}\n}}\n", tf.display().to_string()));
+    env.run(&["open", "w"]);
+    env.wait_for_text("t", "$");
+    let production = || {
+        let panes: serde_json::Value = serde_json::from_str(&env.run(&["panes", "--json"])).unwrap();
+        let t = panes.as_array().unwrap().iter().find(|p| p["name"] == "t").cloned().unwrap();
+        t["production"].as_str().map(String::from)
+    };
+    // Known not to be a Terraform directory, and quiet.
+    std::thread::sleep(Duration::from_secs(4));
+    assert_eq!(production(), None);
+    std::fs::create_dir_all(tf.join(".terraform")).unwrap();
+    std::fs::write(tf.join(".terraform/environment"), "prod\n").unwrap();
+    let start = Instant::now();
+    while production().is_none() {
+        assert!(start.elapsed() < Duration::from_secs(5), "never seen as production");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert_eq!(production().as_deref(), Some("Terraform workspace prod"));
+    let out = env.try_run(&["send", "-p", "t", "echo", "hi"]);
+    assert!(!out.status.success(), "sent to production");
 }
 
 #[test]
@@ -2640,6 +2701,86 @@ fn git_repo(repo: &Path, files: &[(&str, &str)]) -> impl Fn(&[&str]) {
     git
 }
 
+/// What git says of a pane's directory follows what is done in its repository from elsewhere,
+/// promptly, while the pane prints nothing: a checkout, a commit.
+#[test]
+fn git_in_frames_follows_changes_made_elsewhere() {
+    let env = Env::new("gitwatch");
+    let repo = env.root.join("repo");
+    let git = git_repo(&repo, &[("a.txt", "1")]);
+    // An upstream, for the commits ahead of it.
+    git(&["config", "remote.origin.url", "/nowhere"]);
+    git(&["config", "remote.origin.fetch", "+refs/heads/*:refs/remotes/origin/*"]);
+    git(&["update-ref", "refs/remotes/origin/main", "HEAD"]);
+    env.workspace("w", &format!("layout {{\n    pane name=\"a\" cwd={:?}\n}}\n", repo.display().to_string()));
+    env.run(&["open", "w"]);
+    let client = RawClient::attach(&env, "w");
+    client.wait_for_screen("main");
+    env.wait_for_text("a", "$");
+    // Long enough for the server to be idle.
+    std::thread::sleep(Duration::from_secs(4));
+    let start = Instant::now();
+    git(&["checkout", "-q", "-b", "qqbranch", "--track", "origin/main"]);
+    client.wait_for_screen("qqbranch");
+    assert!(start.elapsed() < Duration::from_secs(2), "a checkout showed after {:?}", start.elapsed());
+    // A commit replaces the branch's ref, not the index.
+    std::thread::sleep(Duration::from_secs(2));
+    let start = Instant::now();
+    git(&["commit", "-q", "--allow-empty", "-m", "two"]);
+    client.wait_for_screen("↑1");
+    assert!(start.elapsed() < Duration::from_secs(2), "a commit showed after {:?}", start.elapsed());
+}
+
+/// An idle server sleeps: no thread of it wakes up again and again while nothing happens.
+#[cfg(target_os = "linux")]
+#[test]
+fn an_idle_server_sleeps() {
+    let env = Env::new("sleeps");
+    // In a directory where nothing happens (the home directory may be busy: its changes are
+    // looked at).
+    let quiet = env.root.join("quiet");
+    std::fs::create_dir_all(&quiet).unwrap();
+    env.workspace(
+        "w",
+        &format!(
+            "layout {{\n    pane name=\"a\" cwd={0:?}\n    pane name=\"b\" cwd={0:?}\n}}\n",
+            quiet.display().to_string()
+        ),
+    );
+    env.run(&["open", "w"]);
+    let client = RawClient::attach(&env, "w");
+    env.wait_for_text("a", "$");
+    env.wait_for_text("b", "$");
+    let pid = env.server_pid().expect("the server's pid");
+    // The times its threads went to sleep (not those another program took the processor from
+    // them while they ran: that depends on the machine's load).
+    let switches = || -> u64 {
+        let tasks = std::fs::read_dir(format!("/proc/{pid}/task")).unwrap();
+        tasks
+            .flatten()
+            .filter_map(|t| std::fs::read_to_string(t.path().join("status")).ok())
+            .flat_map(|s| {
+                s.lines()
+                    .filter(|l| l.starts_with("voluntary_ctxt_switches"))
+                    .filter_map(|l| l.split_whitespace().last()?.parse::<u64>().ok())
+                    .collect::<Vec<_>>()
+            })
+            .sum()
+    };
+    // Past the requests above, and what they started.
+    std::thread::sleep(Duration::from_secs(4));
+    let before = switches();
+    std::thread::sleep(Duration::from_secs(6));
+    let woke = switches() - before;
+    // At most its periodic work, and what that starts: not the readers of the panes, nor
+    // anything else.
+    assert!(woke <= 6, "{woke} wake-ups in 6 s");
+    // Still there when something happens.
+    env.run(&["send", "-p", "a", "-e", "echo still-awake"]);
+    env.wait_for_text("a", "still-awake");
+    drop(client);
+}
+
 #[test]
 fn worktrees_are_prepared_numbered_and_pruned_from_the_command_line() {
     let env = Env::new("wtcli");
@@ -3454,6 +3595,24 @@ fn a_preview_shows_its_image_as_each_terminal_can() {
     plain.wait_for_screen("▀");
     let seen = String::from_utf8_lossy(&plain.screen.lock().unwrap()).into_owned();
     assert!(!seen.contains("\x1b_Ga=t") && !seen.contains("\x1bP0;1;0q") && !seen.contains('\u{10EEEE}'));
+}
+
+/// A preview follows its file, also when nothing else happens in the session.
+#[test]
+fn a_preview_follows_its_file_in_a_quiet_session() {
+    let env = Env::new("pfollow");
+    let notes = env.root.join("notes.txt");
+    std::fs::write(&notes, "first-version\n").unwrap();
+    env.workspace("w", &format!("layout {{\n    pane name=\"n\" preview=\"{}\"\n}}\n", notes.display()));
+    env.run(&["open", "w"]);
+    let client = RawClient::attach(&env, "w");
+    client.wait_for_screen("first-version");
+    // Long enough for the server to be idle.
+    std::thread::sleep(Duration::from_secs(4));
+    std::fs::write(&notes, "second-version\n").unwrap();
+    let start = Instant::now();
+    client.wait_for_screen("second-version");
+    assert!(start.elapsed() < Duration::from_secs(3), "shown after {:?}", start.elapsed());
 }
 
 /// Drive the agent of pane `pane` in `env`'s session through Claude's hooks.

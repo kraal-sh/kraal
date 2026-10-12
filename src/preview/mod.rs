@@ -190,6 +190,8 @@ impl Drop for Preview {
 struct Watch {
     seen: Mutex<Option<Option<Stamp>>>,
     stop: AtomicBool,
+    /// Called when what the watcher sees changes (see [`Preview::on_change`]).
+    changed: Mutex<Option<Box<dyn Fn() + Send>>>,
 }
 
 impl Watch {
@@ -201,7 +203,12 @@ impl Watch {
         let spawned = std::thread::Builder::new().name("kraal-preview".into()).spawn(move || {
             while !w.stop.load(Ordering::Relaxed) {
                 let stamp = Stamp::of(&path);
-                *w.seen.lock().unwrap_or_else(PoisonError::into_inner) = Some(stamp);
+                let before = w.seen.lock().unwrap_or_else(PoisonError::into_inner).replace(stamp);
+                if before.is_some_and(|b| b != stamp)
+                    && let Some(tell) = w.changed.lock().unwrap_or_else(PoisonError::into_inner).as_ref()
+                {
+                    tell();
+                }
                 std::thread::sleep(WATCH_EVERY);
             }
         });
@@ -259,6 +266,12 @@ impl Preview {
     /// Shows text kraal holds rather than a file.
     pub fn in_memory(&self) -> bool {
         self.in_memory
+    }
+
+    /// Call `tell` (on the watcher's thread) when the file changes after it was read: the
+    /// server reads it again then, instead of looking at it all the time.
+    pub fn on_change(&self, tell: impl Fn() + Send + 'static) {
+        *self.watch.changed.lock().unwrap_or_else(PoisonError::into_inner) = Some(Box::new(tell));
     }
 
     /// Show images as images (on terminals that can) rather than half blocks.

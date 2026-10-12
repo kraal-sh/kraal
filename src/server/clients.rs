@@ -184,8 +184,11 @@ impl Server {
         self.primary = Some(id);
         self.relayout();
         self.mark_seen_focused(id);
+        self.git_soon_for(id);
         self.show_warnings();
         self.mark_dirty();
+        // The first frame goes at once: nothing else is coming to batch it with.
+        self.next_render = Some(Instant::now());
     }
 
     pub fn detach(&mut self, id: ClientId, reason: &str) {

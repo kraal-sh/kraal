@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use crossbeam_channel::Sender;
 
+use super::dirwatch::SOON_EVERY;
 use super::ui::{ConfirmAction, Mode, PickAction, PickItem, Picker, PickerKind};
 use super::{ClientId, Event, Server};
 use crate::git::{self, GitInfo, Worktree, WorktreeState};
@@ -51,31 +52,88 @@ pub fn spawn_git_worker(tx: Sender<Event>) -> Sender<PathBuf> {
 }
 
 impl Server {
-    /// Ask the git thread about the directories of local terminal panes, every few seconds.
-    pub(super) fn refresh_git(&mut self) {
-        self.last_git_scan = Instant::now();
-        let dirs: Vec<PathBuf> = self
+    /// Ask the git thread about the directories of local terminal panes that are due (see
+    /// [`super::dirwatch::DirWatch::periodic`]), and forget those no pane is in any more.
+    pub(super) fn refresh_git(&mut self, now: Instant) {
+        let panes: Vec<(PathBuf, Instant)> = self
             .panes
             .values()
             .filter(|p| p.is_terminal() && p.ssh.is_none() && p.exit_code.is_none())
-            .filter_map(|p| p.current_cwd())
+            .filter_map(|p| Some((p.current_cwd()?, p.last_output)))
             .collect();
-        for d in dirs {
-            self.ask_git_about(d);
+        let mut live = std::collections::HashSet::new();
+        for (dir, output) in panes {
+            if self.dirwatch.periodic(&dir, output, now) {
+                self.ask_git(dir.clone(), false);
+            }
+            live.insert(dir);
         }
+        self.dirwatch.retain(&live);
     }
 
     /// Ask the git thread about `dir` (its branch, and the repository account rules see it in),
     /// unless it is already asked.
     pub(super) fn ask_git_about(&mut self, dir: PathBuf) {
-        if self.git_pending.insert(dir.clone()) {
+        self.ask_git(dir, false);
+    }
+
+    /// Ask about `dir`; when it is being asked already and `again` (something changed since),
+    /// once more after the answer.
+    fn ask_git(&mut self, dir: PathBuf, again: bool) {
+        if self.dirwatch.asking(&dir, again, Instant::now()) {
             let _ = self.git_requests.send(dir);
         }
     }
 
+    /// Something may have changed in `dir` (a command ended there): ask git about it soon.
+    pub(super) fn git_soon(&mut self, dir: &Path) {
+        self.dirwatch.soon(dir, Duration::ZERO, SOON_EVERY, Instant::now());
+    }
+
+    /// Ask soon about every directory panes are in (a pane's program ended: a git job, a
+    /// commit, a checkout).
+    pub(super) fn git_soon_everywhere(&mut self) {
+        let now = Instant::now();
+        let dirs: Vec<PathBuf> = self.dirwatch.dirs().cloned().collect();
+        for d in dirs {
+            self.dirwatch.soon(&d, Duration::ZERO, SOON_EVERY, now);
+        }
+    }
+
+    /// The user is back (the terminal got the focus, a client attached): what it shows of git
+    /// may have changed meanwhile, from elsewhere. The directories of its workspace's panes are
+    /// asked about soon.
+    pub(super) fn git_soon_for(&mut self, client: ClientId) {
+        let Some(ws) = self.clients.get(&client).map(|c| c.workspace) else { return };
+        let Some(wi) = self.ws_index(ws) else { return };
+        let dirs: Vec<PathBuf> = self.workspaces[wi]
+            .panes()
+            .iter()
+            .filter_map(|p| self.panes.get(p))
+            .filter(|p| p.is_terminal() && p.ssh.is_none() && p.exit_code.is_none())
+            .filter_map(|p| p.current_cwd())
+            // Those never asked about are at the next tick.
+            .filter(|d| self.git.contains_key(d))
+            .collect();
+        let now = Instant::now();
+        for d in dirs {
+            self.dirwatch.soon(&d, Duration::ZERO, SOON_EVERY, now);
+        }
+    }
+
+    /// Ask about the directories whose time came (see [`Server::git_soon`]).
+    pub(super) fn git_due(&mut self, now: Instant) {
+        if self.dirwatch.next().is_some_and(|t| t <= now) {
+            for dir in self.dirwatch.take_due(now) {
+                self.ask_git(dir, true);
+            }
+        }
+    }
+
     pub(super) fn git_result(&mut self, dir: PathBuf, info: Option<Box<GitInfo>>) {
-        self.git_pending.remove(&dir);
         let info = info.map(|b| *b);
+        let watch = info.as_ref().map(|i| i.watch.as_slice()).unwrap_or_default();
+        self.dirwatch.answered(&dir, info.is_some(), watch, Instant::now());
         if self.git.get(&dir) != Some(&info) {
             self.git.insert(dir, info);
             self.mark_dirty();
@@ -524,8 +582,7 @@ impl Server {
         if let Err(e) = self.spawn_pane_in(ws, None, spec, Placement::Floating, Some(format!("⎇ {label}"))) {
             self.toast(client, format!("{e:#}"));
         }
-        // Branch states change after these: look again soon.
-        self.last_git_scan = Instant::now() - Duration::from_secs(10);
+        // Branch states change after these: git is asked again when its pane's program ends.
     }
 
     /// Worktree items for the agent picker: start an agent on a new branch of this repository.

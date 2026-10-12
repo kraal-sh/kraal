@@ -508,6 +508,10 @@ impl Server {
 
     /// Keep only the mentioned ports that something listens on.
     pub(super) fn refresh_ports(&mut self) {
+        // No port mentioned, none listed: nothing to look up.
+        if self.port_candidates.is_empty() && self.ports.is_empty() {
+            return;
+        }
         let listening = listening_ports();
         let mut ports: BTreeMap<u16, PaneId> = BTreeMap::new();
         for (port, pane) in &self.port_candidates {
