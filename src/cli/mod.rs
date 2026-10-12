@@ -311,8 +311,8 @@ fn config_cmd(action: &str, markdown: bool) -> Result<()> {
             print_keys(&keymap, markdown);
         }
         _ => {
-            let cfg = config::Config::load()?;
-            for w in config_warnings(&cfg) {
+            let (cfg, unknown_keys) = config::Config::load_with_warnings()?;
+            for w in unknown_keys.into_iter().chain(config_warnings(&cfg)) {
                 eprintln!("warning: {w}");
             }
             // Warnings are advice; a file kraal cannot read at all is an error.
@@ -330,11 +330,28 @@ fn config_cmd(action: &str, markdown: bool) -> Result<()> {
                     }
                 }
             }
-            if let Err(e) = crate::accounts::Accounts::load() {
-                eprintln!("error: {e:#}");
-                errors += 1;
+            let (accounts, inventory) = (crate::accounts::Accounts::path(), servers::Inventory::path());
+            let checked = [
+                (&accounts, crate::accounts::Accounts::check(&accounts)),
+                (&inventory, servers::Inventory::check(&inventory)),
+            ];
+            for (path, checked) in checked {
+                match checked {
+                    Ok(warnings) => warnings.iter().for_each(|w| eprintln!("warning: {}: {w}", path.display())),
+                    Err(e) => {
+                        eprintln!("error: {e:#}");
+                        errors += 1;
+                    }
+                }
             }
-            if let Err(e) = servers::Inventory::load() {
+            // Your runbooks, and what the repository this runs in ships.
+            let repo = runbooks::current_repo();
+            let (_, unreadable) = crate::runbooks::all(repo.as_deref());
+            for e in &unreadable {
+                eprintln!("error: {e}");
+            }
+            errors += unreadable.len();
+            if let Some(Err(e)) = repo.as_deref().map(crate::worktree_setup::check_repo_file) {
                 eprintln!("error: {e:#}");
                 errors += 1;
             }

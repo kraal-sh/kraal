@@ -382,20 +382,32 @@ impl Default for Config {
 impl Config {
     /// Load the user's config merged over the defaults. Missing file = defaults.
     pub fn load() -> Result<Config> {
+        Self::load_with_warnings().map(|(config, _)| config)
+    }
+
+    /// [`Config::load`], and a warning for each key of the file that kraal does not read.
+    pub fn load_with_warnings() -> Result<(Config, Vec<String>)> {
         let path = paths::config_path();
         let user = match std::fs::read_to_string(&path) {
             Ok(s) => s,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Config::default()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((Config::default(), Vec::new())),
             Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
         };
-        Self::from_user_toml(&user).with_context(|| format!("in {}", path.display()))
+        Self::parse(&user).with_context(|| format!("in {}", path.display()))
     }
 
+    #[cfg(test)]
     pub fn from_user_toml(user: &str) -> Result<Config> {
+        Self::parse(user).map(|(config, _)| config)
+    }
+
+    /// What a user's file gives, merged over the defaults, and a warning for each of its keys
+    /// that kraal does not read: the defaults set none, so one that is found is the user's.
+    pub fn parse(user: &str) -> Result<(Config, Vec<String>)> {
         let mut base: toml::Value = toml::from_str(DEFAULT_CONFIG)?;
         let user: toml::Value = toml::from_str(user)?;
         merge(&mut base, user);
-        Ok(base.try_into()?)
+        Ok(crate::unknown_keys::deserialize(base)?)
     }
 
     pub fn shell(&self) -> String {
@@ -446,16 +458,6 @@ mod tests {
         assert_eq!((cfg.buffers.limit, cfg.buffers.max_bytes()), (50, 32 << 20));
     }
 
-    /// The hooks the default configuration shows, commented out, run once their `#` is gone.
-    #[test]
-    fn the_hooks_shown_as_examples_name_events() {
-        let examples: Vec<&str> = DEFAULT_CONFIG.lines().filter_map(|line| line.strip_prefix("#   ")).collect();
-        let hooks: String =
-            examples.iter().filter(|line| line.starts_with('"')).map(|line| format!("{line}\n")).collect();
-        let (hooks, warnings) = crate::server::events::read_hooks(&hooks.parse().unwrap());
-        assert!(!hooks.is_empty() && warnings.is_empty(), "{warnings:?}");
-    }
-
     #[test]
     fn user_config_merges_over_defaults() {
         let cfg = Config::from_user_toml(
@@ -472,6 +474,62 @@ mod tests {
         assert_eq!(cfg.keys.preset, "kraal");
         assert!(cfg.sidebar.visible);
         assert_eq!(cfg.bar.keys, BarKeys::Context);
+    }
+
+    /// The defaults, with the settings they show commented out (`# accent = "green"`) set too.
+    fn defaults_with_their_examples() -> String {
+        let setting = |line: &str| toml::from_str::<toml::Table>(line).is_ok_and(|t| !t.is_empty());
+        DEFAULT_CONFIG
+            .lines()
+            .map(|line| line.strip_prefix('#').map(str::trim_start).filter(|l| setting(l)).unwrap_or(line))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn every_key_the_defaults_show_is_read() {
+        let everything = defaults_with_their_examples();
+        for user in ["", DEFAULT_CONFIG, &everything] {
+            let (_, warnings) = Config::parse(user).unwrap();
+            assert_eq!(warnings, [] as [&str; 0]);
+        }
+        // The examples were set: top-level keys, sections, and the tables whose keys are free.
+        let cfg = Config::from_user_toml(&everything).unwrap();
+        assert_eq!((cfg.shell.as_deref(), cfg.worktrees.port_base), (Some("/bin/zsh"), Some(3000)));
+        assert_eq!((cfg.theme.accent.as_deref(), cfg.theme.frames.as_deref()), (Some("green"), Some("rounded")));
+        assert_eq!(cfg.tools["pods"].command, "kubectl get pods -o wide");
+        assert!(cfg.hints.patterns.contains_key("ticket"));
+        assert_eq!(cfg.keys.leader["split_right"], ["%", "P right"]);
+        assert_eq!(cfg.keys.direct["toggle_floating"], ["alt+f"]);
+        // The hooks shown as examples name events.
+        let (hooks, warnings) = crate::server::events::read_hooks(&cfg.hooks);
+        assert_eq!((hooks.len(), warnings), (3, Vec::new()));
+    }
+
+    #[test]
+    fn unknown_keys_are_warnings_and_the_rest_of_the_file_applies() {
+        let (cfg, warnings) = Config::parse(
+            "scrolback = 500\npane_frames = false\n[bar]\nkyes = \"off\"\n[sidbar]\nwidth = 40\n\
+             [theme]\nacent = \"green\"\n[keys]\npreset = \"classic\"\nprefx = [\"ctrl+a\"]\n\
+             [keys.leader]\nsplit_right = [\"%\"]\n[hooks]\n\"agent.blocked\" = \"true\"\n\
+             [future]\nsetting = 1\n",
+        )
+        .unwrap();
+        assert_eq!(
+            warnings,
+            [
+                "bar.kyes: unknown key (did you mean keys?)",
+                // A key only another version of kraal reads: nothing to suggest.
+                "future: unknown key",
+                "keys.prefx: unknown key (did you mean prefix?)",
+                "scrolback: unknown key (did you mean scrollback?)",
+                "sidbar: unknown key (did you mean sidebar?)",
+                "theme.acent: unknown key (did you mean accent?)",
+            ]
+        );
+        assert!(!cfg.pane_frames);
+        assert_eq!((cfg.scrollback, cfg.bar.keys, cfg.sidebar.width), (10000, BarKeys::Context, 28));
+        assert_eq!((cfg.keys.preset.as_str(), &cfg.keys.prefix), ("classic", &vec!["ctrl+b".to_string()]));
     }
 
     #[test]

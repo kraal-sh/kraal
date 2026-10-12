@@ -587,18 +587,31 @@ impl Inventory {
     }
 
     pub fn load_from(path: &Path) -> Result<Inventory> {
-        let servers: Vec<Server> = match std::fs::read_to_string(path) {
-            Ok(text) => toml::from_str::<File>(&text).with_context(|| format!("parsing {}", path.display()))?.servers,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Self::read(path).map(|(inventory, _)| inventory)
+    }
+
+    /// What `kraal config check` says of the inventory at `path`: a warning for each key that
+    /// kraal does not read, an error when the file cannot be read.
+    pub fn check(path: &Path) -> Result<Vec<String>> {
+        Self::read(path).map(|(_, warnings)| warnings)
+    }
+
+    fn read(path: &Path) -> Result<(Inventory, Vec<String>)> {
+        let (file, warnings) = match std::fs::read_to_string(path) {
+            Ok(text) => {
+                crate::unknown_keys::from_toml::<File>(&text).with_context(|| format!("parsing {}", path.display()))?
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Default::default(),
             Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
         };
+        let servers = file.servers;
         // A name picks one server: two servers with one name would make it pick either.
         for (i, s) in servers.iter().enumerate() {
             if servers[..i].iter().any(|o| o.name == s.name) {
                 bail!("{}: two servers are named {:?}; rename one", path.display(), s.name);
             }
         }
-        Ok(Inventory { servers, path: path.to_path_buf() })
+        Ok((Inventory { servers, path: path.to_path_buf() }, warnings))
     }
 
     fn text(&self) -> Result<String> {
@@ -1340,6 +1353,44 @@ mod tests {
             .unwrap();
         let err = Inventory::load_from(&path).err().unwrap().to_string();
         assert!(err.contains("two servers are named \"db\""), "{err}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn keys_the_inventory_does_not_read_are_warnings() {
+        let dir = std::env::temp_dir().join(format!("kraal-servers-unknown-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("servers.toml");
+        std::fs::write(
+            &path,
+            "[defaults]\nuser = \"ops\"\n\n[[server]]\nname = \"db\"\nhost = \"a\"\n\n\
+             [[server]]\nname = \"web\"\nhost = \"b\"\njmp = \"db\"\nrole = \"front\"\n",
+        )
+        .unwrap();
+        let (inv, warnings) = Inventory::read(&path).unwrap();
+        assert_eq!(
+            warnings,
+            ["defaults: unknown key", "server[1].jmp: unknown key (did you mean jump?)", "server[1].role: unknown key"]
+        );
+        assert_eq!((inv.servers.len(), inv.servers[1].jump.as_deref()), (2, None));
+        // What kraal writes, every field set, it reads.
+        let full = Server {
+            name: "web".into(),
+            host: "web.example.com".into(),
+            user: Some("deploy".into()),
+            port: Some(2222),
+            jump: Some("bastion".into()),
+            identity: Some("~/.ssh/id_ed25519".into()),
+            more_identities: vec!["~/.ssh/id_rsa".into()],
+            proxy: Some("none".into()),
+            groups: vec!["web".into()],
+            env: Some("prod".into()),
+            note: Some("front".into()),
+            agents: Some("main".into()),
+        };
+        Inventory { servers: vec![full.clone()], path: path.clone() }.save().unwrap();
+        let (inv, warnings) = Inventory::read(&path).unwrap();
+        assert_eq!((inv.servers, warnings), (vec![full], Vec::new()));
         let _ = std::fs::remove_dir_all(dir);
     }
 }

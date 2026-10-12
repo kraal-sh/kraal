@@ -50,7 +50,7 @@ fn read_hidden() -> Result<String> {
 }
 
 /// The repository of the current directory, for its runbooks.
-fn current_repo() -> Option<std::path::PathBuf> {
+pub(super) fn current_repo() -> Option<std::path::PathBuf> {
     git::status(&std::env::current_dir().ok()?).map(|g| g.root)
 }
 
