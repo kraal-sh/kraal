@@ -85,7 +85,6 @@ impl Mode {
     }
 }
 
-#[allow(clippy::enum_variant_names)]
 pub enum ConfirmAction {
     ClosePane(PaneId),
     CloseTab {

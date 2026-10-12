@@ -23,8 +23,10 @@ use crate::servers;
 use crate::shell;
 
 /// Where one copy of a runbook runs.
-// A run has a handful of targets: a box around the server would only add an indirection.
-#[allow(clippy::large_enum_variant)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "a run has a handful of targets: a box around the server would only add an indirection"
+)]
 #[derive(Debug, Clone)]
 pub enum Target {
     /// This machine.

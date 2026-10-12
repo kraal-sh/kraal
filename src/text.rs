@@ -137,8 +137,10 @@ pub fn unix_seconds(time: SystemTime) -> i64 {
 
 /// The local time of `secs` since the epoch, as `localtime_r` gives it.
 fn local_tm(secs: i64) -> Option<libc::tm> {
-    // The libc crate warns that musl's time_t will become 64-bit: it is already for musl 1.2.
-    #[allow(deprecated)]
+    #[allow(
+        deprecated,
+        reason = "on musl, the libc crate warns that time_t will become 64-bit: it has been since musl 1.2"
+    )]
     let t = libc::time_t::try_from(secs).ok()?;
     // SAFETY: localtime_r only writes to the struct we own.
     let mut tm: libc::tm = unsafe { std::mem::zeroed() };

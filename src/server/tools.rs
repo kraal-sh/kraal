@@ -113,7 +113,7 @@ impl Server {
 
     /// Run the tool, or ask first when the pane is production for a reason not accepted yet.
     /// `stalled` is the pane's kubeconfig not answering the read made for this tool.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments, reason = "the tool's request and what was decided about it so far")]
     fn tool_decide(
         &mut self,
         client: ClientId,
