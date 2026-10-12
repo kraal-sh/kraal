@@ -1,5 +1,9 @@
 //! Composes what one client sees: the sidebar, the top bar, panes in their frames, overlays.
 
+use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
+use std::rc::Rc;
+
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
@@ -58,6 +62,35 @@ pub enum SideItem {
     },
 }
 
+/// What the chrome shows of a pane: its name, why it is production, what it works on.
+#[derive(PartialEq)]
+pub(super) struct Facts {
+    name: String,
+    production: Option<String>,
+    details: Vec<Span<'static>>,
+}
+
+/// The facts of each pane, with what they were worked out from (the chrome's generation and
+/// the pane's output count, see `Server::pane_facts`), and a number that changes with them.
+#[derive(Default)]
+pub(super) struct FactsCache {
+    panes: RefCell<HashMap<PaneId, FactsEntry>>,
+    versions: Cell<u64>,
+}
+
+struct FactsEntry {
+    from: (u64, u64),
+    version: u64,
+    facts: Rc<Facts>,
+}
+
+impl FactsCache {
+    /// Forget the panes that are gone.
+    pub(super) fn keep(&self, alive: impl Fn(PaneId) -> bool) {
+        self.panes.borrow_mut().retain(|id, _| alive(*id));
+    }
+}
+
 /// What a client's last frame was made of: the panes drawn from their screen rows with nothing
 /// over them, where, and the versions of the rows drawn; what its chrome was drawn from, when
 /// nothing went over it.
@@ -65,6 +98,28 @@ pub enum SideItem {
 pub struct FrameMemo {
     panes: Vec<(PaneId, Rect, Vec<u64>)>,
     chrome: Option<Chrome>,
+    /// The look of each pane's frame, with what it was made from.
+    looks: HashMap<PaneId, (LookInputs, Rc<FrameLook>)>,
+}
+
+/// What a part of the chrome (the top bar, the sidebar) is made from, besides the client: the
+/// chrome's generation, and the facts of the panes it shows, by version. The same make the same.
+#[derive(PartialEq, Default)]
+struct Inputs {
+    chrome: u64,
+    panes: Vec<(PaneId, u64)>,
+}
+
+/// What a frame's look is made from (see `Server::frame_look`).
+#[derive(PartialEq, Clone, Copy)]
+struct LookInputs {
+    chrome: u64,
+    version: u64,
+    tile: Rect,
+    focused: bool,
+    sync: bool,
+    floating: bool,
+    marked: bool,
 }
 
 /// What a frame's chrome is drawn from: the same draws the same cells.
@@ -75,11 +130,13 @@ struct Chrome {
     side: Rect,
     places: Vec<(PaneId, Rect, Rect, Rect, bool)>,
     sidebar: Vec<SideRow>,
+    sidebar_from: Inputs,
     bar: TopBar,
-    frames: Vec<Option<FrameLook>>,
+    bar_from: Inputs,
+    frames: Vec<Option<Rc<FrameLook>>>,
     /// The rows of the panes folded in stacks, and their frames' looks.
     folds: Vec<(PaneId, Rect)>,
-    fold_looks: Vec<Option<FrameLook>>,
+    fold_looks: Vec<Option<Rc<FrameLook>>>,
 }
 
 impl Chrome {
@@ -202,6 +259,38 @@ struct Placed {
 }
 
 impl Server {
+    /// What the chrome shows of pane `id`, with its version. Worked out again only when
+    /// something it comes from may have changed: anything but output (`chrome_gen`), the pane's
+    /// output, or time while a context is read (one that does not answer soon becomes unknown).
+    fn pane_facts(&self, id: PaneId) -> Option<(u64, Rc<Facts>)> {
+        let pane = self.panes.get(&id)?;
+        let from = (self.chrome_gen, pane.fed);
+        let timed = self.contexts_reading();
+        if !timed
+            && let Some(e) = self.facts.panes.borrow().get(&id)
+            && e.from == from
+        {
+            return Some((e.version, e.facts.clone()));
+        }
+        let facts = Facts {
+            name: pane.display_name(),
+            production: self.pane_production_shown(id),
+            details: self.pane_details(id),
+        };
+        let mut panes = self.facts.panes.borrow_mut();
+        if let Some(e) = panes.get_mut(&id)
+            && *e.facts == facts
+        {
+            e.from = from;
+            return Some((e.version, e.facts.clone()));
+        }
+        let version = self.facts.versions.get() + 1;
+        self.facts.versions.set(version);
+        let facts = Rc::new(facts);
+        panes.insert(id, FactsEntry { from, version, facts: facts.clone() });
+        Some((version, facts))
+    }
+
     /// Compose what client `id` sees into `buf`, which holds its last frame: the rows of panes
     /// that did not change since are left as they are (and returned, so that the encoder does
     /// not compare them), everything else is drawn again.
@@ -232,13 +321,31 @@ impl Server {
             .map_or_else(Vec::new, |wi| self.stack_rows(self.workspaces[wi].tab(), self.layout_area));
         let placed = self.place_panes(id, (full, side), &folds, (!covered).then_some(&memo));
         let c = &self.clients[&id];
-        let (frames, fold_looks) = self.frame_looks(id, &placed, &folds);
+        let mut looks = HashMap::with_capacity(memo.looks.len());
+        let (frames, fold_looks) = self.frame_looks(id, &placed, &folds, (&memo.looks, &mut looks));
+        memo.looks = looks;
+        // The bar and the sidebar made from the same inputs as the last frame's are the same:
+        // they are taken from it rather than made again.
+        let mut last = memo.chrome.take();
+        let bar_from = self.bar_inputs(c);
+        let (bar, bar_same) = match last.as_mut().filter(|l| l.bar_from == bar_from) {
+            Some(l) => (std::mem::take(&mut l.bar), true),
+            None => (self.top_bar(c), false),
+        };
+        let sidebar_from = if sw > 0 { self.sidebar_inputs(side.height) } else { Inputs::default() };
+        let (sidebar, sidebar_same) = match last.as_mut().filter(|l| sw > 0 && l.sidebar_from == sidebar_from) {
+            Some(l) => (std::mem::take(&mut l.sidebar), true),
+            None if sw > 0 => (self.sidebar_rows(c, side.height), false),
+            None => (Vec::new(), false),
+        };
         let chrome = Chrome {
             theme: th(),
             side,
             places: placed.iter().map(|p| (p.pane, p.tile, p.inner, p.content, p.versions.is_some())).collect(),
-            sidebar: if sw > 0 { self.sidebar_rows(c, side.height) } else { Vec::new() },
-            bar: self.top_bar(c),
+            sidebar,
+            sidebar_from,
+            bar,
+            bar_from,
             frames,
             folds,
             fold_looks,
@@ -247,24 +354,29 @@ impl Server {
         // over it then or does now, and it is laid out the same: then the cells between the
         // panes are blank in both.
         let cached = !covered && apart(&placed, &chrome.folds, side);
-        let last = memo.chrome.take().filter(|last| cached && last.same_places(&chrome));
+        let last = last.filter(|last| cached && last.same_places(&chrome));
+        let differs = |now: &Option<Rc<FrameLook>>, then: &Option<Rc<FrameLook>>| match (now, then) {
+            (Some(a), Some(b)) => !Rc::ptr_eq(a, b) && a != b,
+            (a, b) => a.is_some() != b.is_some(),
+        };
         let (kept, sidebar_changed, bar_changed, frames_changed, folds_changed) = match &last {
             Some(last) => {
                 let mut changed = Changed::new(full);
-                let sidebar_changed = last.sidebar != chrome.sidebar;
+                let sidebar_changed = !sidebar_same && last.sidebar != chrome.sidebar;
                 if sidebar_changed {
                     changed.rect(side);
                 }
-                let bar_changed = last.bar != chrome.bar;
+                let bar_changed = !bar_same && last.bar != chrome.bar;
                 if bar_changed {
                     changed.rect(Rect::new(side.right(), 0, cols.saturating_sub(side.right()), 1));
                 }
-                let frames: Vec<bool> = chrome.frames.iter().zip(&last.frames).map(|(now, then)| now != then).collect();
+                let frames: Vec<bool> =
+                    chrome.frames.iter().zip(&last.frames).map(|(now, then)| differs(now, then)).collect();
                 for (p, _) in placed.iter().zip(&frames).filter(|(_, f)| **f) {
                     changed.border(p.tile);
                 }
                 let folds: Vec<bool> =
-                    chrome.fold_looks.iter().zip(&last.fold_looks).map(|(now, then)| now != then).collect();
+                    chrome.fold_looks.iter().zip(&last.fold_looks).map(|(now, then)| differs(now, then)).collect();
                 for ((_, row), _) in chrome.folds.iter().zip(&folds).filter(|(_, f)| **f) {
                     changed.row(row.y, row.x, row.right());
                 }
@@ -489,7 +601,7 @@ impl Server {
         let mut tabs = Vec::new();
         for (i, tab) in ws.tabs.iter().enumerate() {
             let active = i == ws.active;
-            let prod = tab.panes().iter().any(|p| self.pane_production_shown(*p).is_some());
+            let prod = tab.panes().iter().any(|p| self.pane_facts(*p).is_some_and(|(_, f)| f.production.is_some()));
             let mut spans = Vec::new();
             let base = match (active, prod) {
                 (true, true) => Style::default().fg(Color::Black).bg(th().production).add_modifier(Modifier::BOLD),
@@ -548,7 +660,7 @@ impl Server {
         }
         let targets = ws.sync_targets(ws.tab().focus?);
         let n = targets.len();
-        let prod = targets.iter().filter(|p| self.pane_production_shown(**p).is_some()).count();
+        let prod = targets.iter().filter(|p| self.pane_facts(**p).is_some_and(|(_, f)| f.production.is_some())).count();
         let prod_text = if prod > 0 { format!(", {prod} PROD") } else { String::new() };
         let full = format!("BROADCAST → {n} pane{}{prod_text}", if n == 1 { "" } else { "s" });
         // The toggle stops any broadcast, and its key is usually the shorter.
@@ -725,11 +837,12 @@ impl Server {
         if floating || self.inner(frame).y > frame.y {
             return Vec::new();
         }
+        let Some((_, facts)) = self.pane_facts(f) else { return Vec::new() };
         let mut out = Vec::new();
-        if self.pane_production_shown(f).is_some() {
+        if facts.production.is_some() {
             out.push(badge_span("PROD", th().production));
         }
-        out.extend(self.pane_details(f));
+        out.extend(facts.details.iter().cloned());
         out
     }
 
@@ -1079,8 +1192,8 @@ impl Server {
         buf: &mut Buffer,
         links: &mut crate::ansi::Links,
         placed: &[Placed],
-        (looks, frames): (&[Option<FrameLook>], &[bool]),
-        folds: (&[(PaneId, Rect)], &[Option<FrameLook>], &[bool]),
+        (looks, frames): (&[Option<Rc<FrameLook>>], &[bool]),
+        folds: (&[(PaneId, Rect)], &[Option<Rc<FrameLook>>], &[bool]),
     ) -> Option<Cursor> {
         let c = &self.clients[&id];
         let wi = self.ws_index(c.workspace)?;
@@ -1203,12 +1316,14 @@ impl Server {
 
     /// The frames of the panes `placed` that have one, and of the panes folded in stacks
     /// (`folds`: their rows, each the top of a frame), as client `id` sees them.
+    #[allow(clippy::type_complexity)]
     fn frame_looks(
         &self,
         id: ClientId,
         placed: &[Placed],
         folds: &[(PaneId, Rect)],
-    ) -> (Vec<Option<FrameLook>>, Vec<Option<FrameLook>>) {
+        (last, now): (&HashMap<PaneId, (LookInputs, Rc<FrameLook>)>, &mut HashMap<PaneId, (LookInputs, Rc<FrameLook>)>),
+    ) -> (Vec<Option<Rc<FrameLook>>>, Vec<Option<Rc<FrameLook>>>) {
         let Some(wi) = self.clients.get(&id).and_then(|c| self.ws_index(c.workspace)) else {
             return (placed.iter().map(|_| None).collect(), folds.iter().map(|_| None).collect());
         };
@@ -1220,6 +1335,18 @@ impl Server {
             (_, Some(f)) => ws.sync_targets(f),
         };
         let floating_focus = focus.is_some_and(|f| tab.is_floating(f));
+        // A look made from the same as the last frame's is that one.
+        let mut look = |pane: PaneId, tile: Rect, focused: bool, floating: bool| {
+            let (version, _) = self.pane_facts(pane)?;
+            let (sync, marked) = (synced.contains(&pane), ws.marked.contains(&pane));
+            let from = LookInputs { chrome: self.chrome_gen, version, tile, focused, sync, floating, marked };
+            let look = match last.get(&pane) {
+                Some((then, look)) if *then == from => look.clone(),
+                _ => Rc::new(self.frame_look(pane, tile, focused, sync, floating, marked)?),
+            };
+            now.insert(pane, (from, look.clone()));
+            Some(look)
+        };
         let frames = placed
             .iter()
             .map(|p| {
@@ -1227,18 +1354,41 @@ impl Server {
                     return None;
                 }
                 let focused = focus == Some(p.pane) && (!floating_focus || tab.show_floating);
-                let (sync, mark) = (synced.contains(&p.pane), ws.marked.contains(&p.pane));
-                self.frame_look(p.pane, p.tile, focused, sync, p.floating, mark)
+                look(p.pane, p.tile, focused, p.floating)
             })
             .collect();
-        let folded = folds
-            .iter()
-            .map(|(pane, row)| {
-                let (sync, mark) = (synced.contains(pane), ws.marked.contains(pane));
-                self.frame_look(*pane, Rect::new(row.x, row.y, row.width, 3), false, sync, false, mark)
-            })
-            .collect();
+        let folded =
+            folds.iter().map(|(pane, row)| look(*pane, Rect::new(row.x, row.y, row.width, 3), false, false)).collect();
         (frames, folded)
+    }
+
+    /// What client `c`'s top bar is made from: the chrome's generation and the facts of the
+    /// panes of its workspace; in copy mode, also the output of the focused pane (its prompts
+    /// show there).
+    fn bar_inputs(&self, c: &Client) -> Inputs {
+        let mut panes: Vec<(PaneId, u64)> = self
+            .ws_index(c.workspace)
+            .map(|wi| self.workspaces[wi].panes())
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|p| Some((p, self.pane_facts(p)?.0)))
+            .collect();
+        if matches!(c.mode, Mode::Scroll)
+            && let Some(p) = self.client_focus(c.id).and_then(|p| self.panes.get(&p))
+        {
+            panes.push((p.id, p.fed));
+        }
+        Inputs { chrome: self.chrome_gen, panes }
+    }
+
+    /// What a sidebar `height` rows high is made from: the chrome's generation and the facts of
+    /// all panes.
+    fn sidebar_inputs(&self, height: u16) -> Inputs {
+        let mut panes: Vec<(PaneId, u64)> =
+            self.panes.keys().filter_map(|p| Some((*p, self.pane_facts(*p)?.0))).collect();
+        panes.sort_unstable();
+        panes.push((0, u64::from(height)));
+        Inputs { chrome: self.chrome_gen, panes }
     }
 
     /// A pane's frame: its name on the top border, what it works on at the right of it. The
@@ -1253,8 +1403,8 @@ impl Server {
         floating: bool,
         marked: bool,
     ) -> Option<FrameLook> {
-        let pane = self.panes.get(&pid)?;
-        let prod = self.pane_production_shown(pid).is_some();
+        let (_, facts) = self.pane_facts(pid)?;
+        let prod = facts.production.is_some();
         let color = if prod {
             th().production
         } else if sync {
@@ -1265,7 +1415,7 @@ impl Server {
             th().dim
         };
         let mut title = vec![Span::styled(
-            format!(" {} ", pane.display_name()),
+            format!(" {} ", facts.name),
             if focused {
                 Style::default().fg(color).add_modifier(Modifier::BOLD)
             } else {
@@ -1284,7 +1434,7 @@ impl Server {
         if marked {
             title.insert(0, Span::styled(" ◆", Style::default().fg(th().sync).add_modifier(Modifier::BOLD)));
         }
-        Some(FrameLook { tile, color, title, details: self.pane_details(pid) })
+        Some(FrameLook { tile, color, title, details: facts.details.clone() })
     }
 
     fn draw_frame(look: &FrameLook, buf: &mut Buffer) {

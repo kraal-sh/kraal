@@ -529,6 +529,11 @@ pub struct Server {
     focus_reported: std::collections::HashSet<PaneId>,
     /// The other panes' turn at output was skipped for a frame due (see `pump_output`).
     turn_skipped: bool,
+    /// Counts what may have changed what the chrome (bars, sidebar, frames) shows, besides the
+    /// panes' output: everything but output read and keys that only went to programs.
+    chrome_gen: u64,
+    /// What the chrome shows of each pane, while it holds (see `Server::pane_facts`).
+    facts: render::FactsCache,
     /// Whether the sidebar had something to show at the last tick.
     sidebar_was_useful: bool,
     /// Whether a client was told how to stop the broadcast its key started.
@@ -731,6 +736,8 @@ pub fn run(session: &str) -> Result<()> {
         held_input: Vec::new(),
         sidebar_was_useful: false,
         turn_skipped: false,
+        chrome_gen: 0,
+        facts: Default::default(),
         broadcast_tip_shown: false,
         buffers,
         buffers_dirty: false,
@@ -1063,11 +1070,17 @@ impl Server {
             self.pane_signals(id, signals);
             self.mark_dirty_pane(id);
         }
+        if !self.exiting.is_empty() || !self.held_input.is_empty() {
+            self.chrome_changed();
+        }
         self.finish_exits();
         self.release_held();
         self.git_due(now);
         if now >= self.next_tick() {
             self.last_tick = now;
+            // What it looks at (agents, processes, contexts, usage) and the time it shows.
+            self.chrome_changed();
+            self.facts.keep(|id| self.panes.contains_key(&id));
             self.unparsed.retain(|id, _| self.panes.contains_key(id));
             self.tick(now);
             self.idle = self.quiet(now);
@@ -1326,6 +1339,10 @@ impl Server {
     }
 
     fn handle(&mut self, ev: Event) {
+        // Typed bytes say themselves whether they changed anything (`client_input`).
+        if !matches!(ev, Event::PaneReady(_) | Event::ClientFrame(_, crate::protocol::BYTES, _)) {
+            self.chrome_changed();
+        }
         match ev {
             Event::PaneReady(id) => {
                 self.wake();
@@ -1450,6 +1467,10 @@ impl Server {
 
     /// Act on what feeding output to pane `id` asked for.
     fn pane_signals(&mut self, id: PaneId, signals: Vec<PaneSignal>) {
+        // A title, a bell, a command ended, contexts reported: shown around the panes.
+        if !signals.is_empty() {
+            self.chrome_changed();
+        }
         for s in signals {
             match s {
                 PaneSignal::Notification { title, body } => {
@@ -1484,6 +1505,7 @@ impl Server {
         for c in self.clients.values_mut() {
             c.dirty = true;
         }
+        self.chrome_changed();
         self.schedule_render();
     }
 
@@ -1491,7 +1513,13 @@ impl Server {
         if let Some(c) = self.clients.get_mut(&id) {
             c.dirty = true;
         }
+        self.chrome_changed();
         self.schedule_render();
+    }
+
+    /// What the chrome shows may have changed: it is worked out again for the next frame.
+    pub(super) fn chrome_changed(&mut self) {
+        self.chrome_gen = self.chrome_gen.wrapping_add(1);
     }
 
     fn mark_dirty_pane(&mut self, pane: PaneId) {

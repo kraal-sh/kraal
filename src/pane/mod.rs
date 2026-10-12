@@ -223,6 +223,8 @@ pub struct Pane {
     /// Set when the process exited; the pane stays open for command panes.
     pub exit_code: Option<Option<i32>>,
     pub last_output: Instant,
+    /// Counts the output parsed: what the chrome shows of the pane may have changed with it.
+    pub fed: u64,
     pub bell: bool,
     /// Current directory reported by the shell (OSC 7), and the machine it is on.
     pub reported_cwd: Option<PathBuf>,
@@ -322,6 +324,7 @@ impl Pane {
             agent: AgentTracker::default(),
             exit_code: None,
             last_output: Instant::now(),
+            fed: 0,
             bell: false,
             reported_cwd: None,
             reported_host: String::new(),
@@ -353,6 +356,7 @@ impl Pane {
             agent: AgentTracker::default(),
             exit_code: None,
             last_output: Instant::now(),
+            fed: 0,
             bell: false,
             reported_cwd: None,
             reported_host: String::new(),
@@ -468,6 +472,7 @@ impl Pane {
     /// Feed process output. Returns signals for the server.
     pub fn feed(&mut self, bytes: &[u8]) -> Vec<PaneSignal> {
         self.last_output = Instant::now();
+        self.fed = self.fed.wrapping_add(1);
         let Content::Term(t) = &mut self.content else { return Vec::new() };
         let mut signals = Vec::new();
         // The emulator gets the output up to each command mark, so that the mark lands where
@@ -600,6 +605,7 @@ impl Pane {
         let Content::Term(t) = &mut self.content else { return None };
         match t.parser.sync_timeout().sync_timeout() {
             Some(deadline) if deadline <= Instant::now() => {
+                self.fed = self.fed.wrapping_add(1);
                 t.marked(|t| t.stop_sync());
                 let mut signals = Vec::new();
                 self.drain_events(&mut signals);
