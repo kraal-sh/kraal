@@ -2,6 +2,8 @@
 //! and sixel images (`ESC P … q … ESC \`). Everything else passes through untouched, in order,
 //! for the emulator; a sequence cut across reads is held until it is complete.
 
+use std::borrow::Cow;
+
 const ESC: u8 = 0x1b;
 const CAN: u8 = 0x18;
 const SUB: u8 = 0x1a;
@@ -15,9 +17,9 @@ pub const MAX_SIXEL: usize = 48 << 20;
 const MAX_DCS_PARAMS: usize = 64;
 
 #[derive(Debug, PartialEq)]
-pub enum Piece {
-    /// Output for the emulator.
-    Text(Vec<u8>),
+pub enum Piece<'a> {
+    /// Output for the emulator: the read itself when it holds no image.
+    Text(Cow<'a, [u8]>),
     /// A kitty graphics command: what follows `ESC _ G`, up to the terminator.
     Kitty(Vec<u8>),
     /// A sixel image: the DCS parameters, then the sixel data.
@@ -55,14 +57,42 @@ pub struct Scanner {
 
 impl Scanner {
     /// Split `bytes`, continuing what earlier calls left unfinished.
-    pub fn split(&mut self, bytes: &[u8]) -> Vec<Piece> {
+    pub fn split<'a>(&mut self, bytes: &'a [u8]) -> Vec<Piece<'a>> {
         let mut out = Vec::new();
+        // An ESC the last read ended with, and that starts nothing to take out, is text.
+        if self.state == State::Esc
+            && self.buf == [ESC]
+            && bytes.first().is_some_and(|b| !matches!(*b, b'_' | b'P' | ESC))
+        {
+            out.push(Piece::Text(Cow::Owned(vec![ESC])));
+            self.buf.clear();
+            self.state = State::Ground;
+        }
+        // Most reads hold no image: they go on whole, without a copy, but for an ESC they end
+        // with (it may start one).
+        if self.state == State::Ground
+            && memchr::memchr_iter(ESC, bytes).all(|at| !matches!(bytes.get(at + 1), Some(b'_' | b'P')))
+        {
+            let text = match bytes.last() {
+                Some(&ESC) => {
+                    self.buf.clear();
+                    self.buf.push(ESC);
+                    self.state = State::Esc;
+                    &bytes[..bytes.len() - 1]
+                }
+                _ => bytes,
+            };
+            if !text.is_empty() {
+                out.push(Piece::Text(Cow::Borrowed(text)));
+            }
+            return out;
+        }
         let mut text = Vec::new();
         let mut i = 0;
         while i < bytes.len() {
             // Plain text runs to the next ESC in one go.
             if self.state == State::Ground {
-                match bytes[i..].iter().position(|b| *b == ESC) {
+                match memchr::memchr(ESC, &bytes[i..]) {
                     Some(n) => {
                         text.extend_from_slice(&bytes[i..i + n]);
                         i += n;
@@ -197,8 +227,8 @@ impl Scanner {
     }
 }
 
-fn flush(text: &mut Vec<u8>, out: &mut Vec<Piece>) {
+fn flush(text: &mut Vec<u8>, out: &mut Vec<Piece<'_>>) {
     if !text.is_empty() {
-        out.push(Piece::Text(std::mem::take(text)));
+        out.push(Piece::Text(Cow::Owned(std::mem::take(text))));
     }
 }

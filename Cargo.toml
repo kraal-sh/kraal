@@ -24,6 +24,7 @@ dirs = "6"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp"] }
 kdl = { version = "6", features = ["v1-fallback"] }
 libc = "0.2"
+memchr = "2"
 miniz_oxide = "0.8"
 signal-hook = "0.3"
 portable-pty = "0.9"

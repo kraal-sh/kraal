@@ -76,19 +76,19 @@ fn image_sequences_are_taken_out_wherever_reads_cut_them() {
         let mut merged: Vec<Piece> = Vec::new();
         for p in pieces {
             match (merged.last_mut(), p) {
-                (Some(Piece::Text(a)), Piece::Text(b)) => a.extend(b),
+                (Some(Piece::Text(a)), Piece::Text(b)) => a.to_mut().extend_from_slice(&b),
                 (_, p) => merged.push(p),
             }
         }
         assert_eq!(
             merged,
             vec![
-                Piece::Text(b"a".to_vec()),
+                Piece::Text(b"a".to_vec().into()),
                 Piece::Kitty(b"f=100,a=T;QUJD".to_vec()),
-                Piece::Text(b"b".to_vec()),
+                Piece::Text(b"b".to_vec().into()),
                 Piece::Sixel { params: b"0;1".to_vec(), data: b"#0~~-".to_vec() },
                 // A DCS that is not sixel, and the rest, go to the emulator as they came.
-                Piece::Text(b"c\x1b[1md\x1bPzz\x1b\\e".to_vec()),
+                Piece::Text(b"c\x1b[1md\x1bPzz\x1b\\e".to_vec().into()),
             ],
             "chunks of {size}"
         );
@@ -96,17 +96,30 @@ fn image_sequences_are_taken_out_wherever_reads_cut_them() {
 }
 
 #[test]
+fn reads_without_images_go_on_whole() {
+    let mut s = Scanner::default();
+    let pieces = s.split(b"plain \x1b[1mtext\x1b");
+    assert!(matches!(&pieces[..], [Piece::Text(std::borrow::Cow::Borrowed(_))]));
+    assert_eq!(pieces, vec![Piece::Text(b"plain \x1b[1mtext".to_vec().into())]);
+    // The ESC the read ended with was held: it starts no image, so it goes on first.
+    let pieces = s.split(b"[0m\x1b\x1b[1m");
+    assert_eq!(pieces, vec![Piece::Text(b"\x1b".to_vec().into()), Piece::Text(b"[0m\x1b\x1b[1m".to_vec().into())]);
+    // Reads with images are split as before.
+    assert_eq!(s.split(b"a\x1b_Gq=2;\x1b\\b").len(), 3);
+}
+
+#[test]
 fn a_cancelled_or_oversized_command_is_dropped() {
     let mut s = Scanner::default();
-    assert_eq!(s.split(b"x\x1b_Ga=T\x18y"), vec![Piece::Text(b"xy".to_vec())]);
+    assert_eq!(s.split(b"x\x1b_Ga=T\x18y"), vec![Piece::Text(b"xy".to_vec().into())]);
     let mut s = Scanner::default();
     let mut huge = b"\x1b_Ga=T;".to_vec();
     huge.resize(MAX_APC + 100, b'A');
     huge.extend_from_slice(b"\x1b\\z");
-    assert_eq!(s.split(&huge), vec![Piece::Text(b"z".to_vec())]);
+    assert_eq!(s.split(&huge), vec![Piece::Text(b"z".to_vec().into())]);
     // An ESC inside a command starts a new sequence.
     let mut s = Scanner::default();
-    assert_eq!(s.split(b"\x1b_Ga=T\x1b[1m"), vec![Piece::Text(b"\x1b[1m".to_vec())]);
+    assert_eq!(s.split(b"\x1b_Ga=T\x1b[1m"), vec![Piece::Text(b"\x1b[1m".to_vec().into())]);
 }
 
 #[test]

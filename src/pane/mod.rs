@@ -209,6 +209,8 @@ pub struct Pane {
     restored: Option<String>,
     /// The kraal session of a server that a kraal client running here says it shows.
     attachment: Option<RemoteAttachment>,
+    /// Finds the local ports the output mentions (dev servers).
+    pub ports: crate::server::net::PortScanner,
 }
 
 /// A kraal client in a pane, attached to a server's session (`kraal attach --host`), as it
@@ -285,6 +287,7 @@ impl Pane {
             search: None,
             restored: None,
             attachment: None,
+            ports: Default::default(),
         })
     }
 
@@ -315,6 +318,7 @@ impl Pane {
             search: None,
             restored: None,
             attachment: None,
+            ports: Default::default(),
         }
     }
 
