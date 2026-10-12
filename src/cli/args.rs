@@ -5,6 +5,7 @@
     reason = "the doc comments are clap's help text, printed as written: `[...]` is optional, `<...>` a value"
 )]
 
+use std::ffi::OsString;
 use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand};
@@ -27,6 +28,40 @@ pub struct Cli {
     pub command: Option<Cmd>,
     /// Workspace to open when attaching.
     pub workspace: Option<String>,
+}
+
+impl Cli {
+    /// This process's command line. Those that start the processes that stay are read here
+    /// ([`Cli::plain`]): clap first builds its parser for every command, half a megabyte of code
+    /// that would then stay in the memory of every client and server. Any other is clap's to
+    /// read, or to refuse.
+    pub fn read() -> Cli {
+        let args: Vec<OsString> = std::env::args_os().skip(1).collect();
+        Cli::plain(&args).unwrap_or_else(Cli::parse)
+    }
+
+    /// What clap reads from `args` (the program's name left out) when they are
+    /// `[-s SESSION] [attach [WORKSPACE]]`, or `server --session SESSION` as
+    /// [`crate::client::ensure_server`] starts a server; None for anything else.
+    fn plain(args: &[OsString]) -> Option<Cli> {
+        let args: Vec<&str> = args.iter().map(|a| a.to_str()).collect::<Option<_>>()?;
+        // To clap, a word that starts with a dash is an option, never a value.
+        let value = |word: &str| (!word.starts_with('-')).then(|| word.to_owned());
+        if let ["server", "--session", session] = args.as_slice() {
+            return Some(Cli { session: Some(value(session)?), command: Some(Cmd::Server), workspace: None });
+        }
+        let (session, rest) = match args.as_slice() {
+            ["-s" | "--session", session, rest @ ..] => (Some(value(session)?), rest),
+            rest => (None, rest),
+        };
+        let command = match rest {
+            [] => None,
+            ["attach"] => Some(Cmd::Attach { workspace: None, host: None, pane: None }),
+            ["attach", workspace] => Some(Cmd::Attach { workspace: Some(value(workspace)?), host: None, pane: None }),
+            _ => return None,
+        };
+        Some(Cli { session, command, workspace: None })
+    }
 }
 
 #[derive(Subcommand)]
@@ -653,4 +688,83 @@ pub struct RunArgs {
     pub close_on_exit: bool,
     #[arg(trailing_var_arg = true, required = true)]
     pub command: Vec<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn words(line: &[&str]) -> Vec<OsString> {
+        line.iter().map(OsString::from).collect()
+    }
+
+    /// What a command line says, of what [`Cli::plain`] reads.
+    fn said(cli: &Cli) -> String {
+        let command = match &cli.command {
+            None => "no command".to_owned(),
+            Some(Cmd::Attach { workspace, host, pane }) => format!("attach {workspace:?} {host:?} {pane:?}"),
+            Some(Cmd::Server) => "server".to_owned(),
+            Some(_) => "another command".to_owned(),
+        };
+        format!("session {:?}, {command}, workspace {:?}", cli.session, cli.workspace)
+    }
+
+    /// The command lines read without clap say what clap reads from them.
+    #[test]
+    fn plain_command_lines_are_read_as_clap_reads_them() {
+        let lines: [&[&str]; 14] = [
+            &[],
+            &["attach"],
+            &["attach", "work"],
+            &["attach", "attach"],
+            &["attach", ""],
+            &["-s", "dev"],
+            &["-s", "attach"],
+            &["-s", ""],
+            &["--session", "dev"],
+            &["-s", "dev", "attach"],
+            &["--session", "dev", "attach", "work"],
+            &["server", "--session", "dev"],
+            &["server", "--session", "server"],
+            &["server", "--session", ""],
+        ];
+        for line in lines {
+            let plain = Cli::plain(&words(line)).unwrap_or_else(|| panic!("{line:?} is not read"));
+            let clap = Cli::try_parse_from(words(&[&["kraal"], line].concat()))
+                .unwrap_or_else(|e| panic!("clap refuses {line:?}: {e}"));
+            assert_eq!(said(&plain), said(&clap), "{line:?}");
+        }
+    }
+
+    /// Any other is left to clap: other commands, options, and words clap takes for options.
+    #[test]
+    fn other_command_lines_are_left_to_clap() {
+        let lines: [&[&str]; 20] = [
+            &["work"],
+            &["ls"],
+            &["--version"],
+            &["attach", "--host", "web"],
+            &["attach", "work", "--pane", "1"],
+            &["attach", "-x"],
+            &["attach", "one", "two"],
+            &["attach", "-s", "dev"],
+            &["-s"],
+            &["-s", "-x"],
+            &["-sdev"],
+            &["--session=dev"],
+            &["-s", "dev", "ls"],
+            &["-s", "dev", "work"],
+            &["-s", "dev", "server"],
+            &["server"],
+            &["server", "--session"],
+            &["server", "--session", "-x"],
+            &["server", "--session", "dev", "more"],
+            &["server", "-s", "dev"],
+        ];
+        for line in lines {
+            assert!(Cli::plain(&words(line)).is_none(), "{line:?}");
+        }
+        let not_text: OsString = std::os::unix::ffi::OsStringExt::from_vec(vec![0xff]);
+        assert!(Cli::plain(&[OsString::from("attach"), not_text]).is_none());
+    }
 }

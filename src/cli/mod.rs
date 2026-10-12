@@ -15,7 +15,6 @@ mod update;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
-use clap::Parser;
 
 use self::args::{AccountsCmd, Cli, Cmd, ServersCmd};
 use crate::protocol::{Placement, Request, Response};
@@ -27,7 +26,7 @@ pub fn main() {
         eprintln!("kraal: run by a test, {theirs}");
         std::process::exit(1);
     }
-    let cli = Cli::parse();
+    let cli = Cli::read();
     // Plain CLI commands should die quietly when piped into `head`; the server and the attached
     // client handle broken sockets themselves.
     if !matches!(cli.command, None | Some(Cmd::Attach { .. }) | Some(Cmd::Server)) {
