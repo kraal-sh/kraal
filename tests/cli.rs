@@ -4922,6 +4922,33 @@ fn paste_buffers_stay_in_memory_unless_kept_on_purpose() {
 }
 
 #[test]
+fn paste_buffers_that_could_not_be_kept_are_written_later() {
+    let env = Env::new("buffail");
+    let config = env.root.join("config/kraal/config.toml");
+    let base = std::fs::read_to_string(&config).unwrap();
+    std::fs::write(&config, format!("{base}[buffers]\npersist = true\n")).unwrap();
+    env.workspace("w", "layout {\n    pane name=\"main\"\n}\n");
+    env.run(&["open", "w"]);
+    // A file where the buffers' directory goes: nothing can be written there.
+    let dir = env.root.join("state/kraal/buffers");
+    std::fs::write(&dir, "in the way").unwrap();
+    assert!(set_buffer(&env, &["notes"], "kept-later").status.success());
+    // Long enough for the write to be tried, and to fail.
+    std::thread::sleep(Duration::from_millis(1500));
+    std::fs::remove_file(&dir).unwrap();
+    env.run(&["kill"]);
+    env.run(&["open", "w"]);
+    assert_eq!(env.run(&["buffer", "show", "notes"]), "kept-later");
+    // Still impossible when the server stops: said.
+    std::fs::remove_dir_all(&dir).unwrap();
+    std::fs::write(&dir, "in the way").unwrap();
+    assert!(set_buffer(&env, &["notes"], "changed").status.success());
+    let out = env.try_run(&["kill"]);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success() && err.contains("the paste buffers could not be saved"), "{err}");
+}
+
+#[test]
 fn paste_buffers_reach_production_only_on_purpose() {
     let env = Env::new("bufprod");
     let tf = env.root.join("infra");

@@ -134,7 +134,7 @@ impl Server {
         let path = crate::paths::buffers_path(&self.session);
         if !self.config.buffers.persist {
             if path.exists() {
-                let _ = self.persister.send(Persist::Buffers(path, None));
+                self.write_buffers(None);
             }
             return;
         }
@@ -151,13 +151,25 @@ impl Server {
         }
     }
 
-    /// Write the buffers that changed to their file, when they are kept across restarts.
-    pub(super) fn save_buffers(&mut self) {
-        if !std::mem::take(&mut self.buffers_dirty) || !self.config.buffers.persist {
-            return;
+    /// Write the buffers that changed to their file, when they are kept across restarts. A file
+    /// whose last write failed is written (or deleted, when they are not kept any more) again a
+    /// while later, or at once when the server is `stopping`.
+    pub(super) fn save_buffers(&mut self, stopping: bool) {
+        let retry = self.persisting.lock().is_ok_and(|mut p| p.retry_buffers(stopping));
+        let changed = std::mem::take(&mut self.buffers_dirty);
+        let persist = self.config.buffers.persist;
+        if retry || (changed && persist) {
+            self.write_buffers(persist.then(|| self.buffers.to_json()));
         }
-        let path = crate::paths::buffers_path(&self.session);
-        let _ = self.persister.send(Persist::Buffers(path, Some(self.buffers.to_json())));
+    }
+
+    /// Have the writer put `data` in the buffers' file, or delete it (`None`): only the latest
+    /// waits for it.
+    fn write_buffers(&self, data: Option<Vec<u8>>) {
+        let file = (crate::paths::buffers_path(&self.session), data);
+        if self.persisting.lock().is_ok_and(|mut p| p.offer_buffers(file)) {
+            let _ = self.persister.send(Persist::Buffers);
+        }
     }
 
     /// The `[buffers]` settings changed: new limits apply at once, and the file is written or
@@ -166,14 +178,12 @@ impl Server {
         let cfg = self.config.buffers.clone();
         self.buffers.set_limits(cfg.limit, cfg.max_bytes());
         match (persisted, cfg.persist) {
-            (true, false) => {
-                let _ = self.persister.send(Persist::Buffers(crate::paths::buffers_path(&self.session), None));
-            }
+            (true, false) => self.write_buffers(None),
             // Written again: the new limits may have dropped some.
             (_, true) => self.buffers_dirty = true,
             _ => {}
         }
-        self.save_buffers();
+        self.save_buffers(false);
     }
 }
 

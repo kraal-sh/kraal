@@ -1174,7 +1174,7 @@ impl Server {
         }
         self.check_previews();
         self.forget_ended_ssh(ssh_ended);
-        self.save_buffers();
+        self.save_buffers(false);
         self.tick_edits();
         self.forget_ended_reports();
         self.diff_pane_states();
@@ -1544,7 +1544,7 @@ impl Server {
         // panes' scrollback first), and the server waits for it.
         self.save_scrollback(true);
         self.persist();
-        self.save_buffers();
+        self.save_buffers(true);
         let (done, written) = crossbeam_channel::bounded(1);
         let saved = match self.persister.send(persistence::Persist::Stop(done)) {
             Ok(()) => written
