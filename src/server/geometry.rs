@@ -28,6 +28,18 @@ impl Server {
         u16::from(self.bottom_bar)
     }
 
+    /// What the panes and everything drawn over them use of a screen of `cols × rows`: all of it
+    /// but the bottom bar's row.
+    pub fn screen_above_bar(&self, cols: u16, rows: u16) -> Rect {
+        Rect::new(0, 0, cols, rows.saturating_sub(self.bottom_rows()))
+    }
+
+    /// [`Server::screen_above_bar`] of client `id`.
+    pub(super) fn client_screen(&self, id: super::ClientId) -> Rect {
+        let (cols, rows) = self.clients.get(&id).map_or((80, 24), |c| (c.cols, c.rows));
+        self.screen_above_bar(cols, rows)
+    }
+
     pub fn sidebar_width(&self, cols: u16) -> u16 {
         let w = self.config.sidebar.width;
         if cols < w * 3 { 0 } else { w }

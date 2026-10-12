@@ -74,7 +74,7 @@ impl Server {
         let wi = self.ws_index(c.workspace)?;
         let (_, frame, _) =
             self.tab_rects(self.workspaces[wi].tab(), self.layout_area).into_iter().find(|(p, _, _)| *p == pane)?;
-        let (_, inner) = self.placed(frame, ratatui::layout::Rect::new(0, 0, c.cols, c.rows));
+        let (_, inner) = self.placed(frame, self.screen_above_bar(c.cols, c.rows));
         let p = self.panes.get(&pane)?;
         Some((inner.width.min(p.cols), inner.height.min(p.rows)))
     }

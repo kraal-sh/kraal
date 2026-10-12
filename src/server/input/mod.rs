@@ -332,9 +332,8 @@ impl Server {
         let k = match ev {
             InputEvent::Key(k) => k,
             InputEvent::Mouse(m) => {
-                let (cols, rows) = self.clients.get(&id).map(|c| (c.cols, c.rows)).unwrap_or((80, 24));
                 let items = crate::server::overlays::menu_items(&self.keymap.menu(&typed));
-                let layout = crate::server::overlays::menu_layout(&items, ratatui::layout::Rect::new(0, 0, cols, rows));
+                let layout = crate::server::overlays::menu_layout(&items, self.client_screen(id));
                 let on_menu = layout.area.contains(ratatui::layout::Position::new(m.col, m.row));
                 return match m.kind {
                     MouseKind::Press(crate::input::MouseButton::Left) if on_menu => {
@@ -432,8 +431,7 @@ impl Server {
             InputEvent::Mouse(MouseEvent { kind: MouseKind::Press(_), .. }) => return Some(Mode::Normal),
             _ => return None,
         };
-        let (cols, rows) = self.clients.get(&id).map(|c| (c.cols, c.rows)).unwrap_or((80, 24));
-        let max = crate::server::overlays::viewer_max_scroll(lines, ratatui::layout::Rect::new(0, 0, cols, rows));
+        let max = crate::server::overlays::viewer_max_scroll(lines, self.client_screen(id));
         Some(Mode::Help { scroll: scroll.min(max) })
     }
 

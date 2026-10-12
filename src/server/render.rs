@@ -358,15 +358,19 @@ impl Server {
         let sidebar = self.sidebar_shown(c);
         let rows = c.rows;
         let cols = c.cols;
-        // The panes and the sidebar end above the bottom bar.
-        let screen = Rect::new(0, 0, cols, rows - self.bottom_rows());
+        // The panes, the sidebar and what goes over them end above the bottom bar.
+        let screen = self.screen_above_bar(cols, rows);
         let bottom_row = Rect::new(0, screen.bottom(), cols, self.bottom_rows());
         let sw = if sidebar { self.sidebar_width(cols) } else { 0 };
         let side = Rect::new(0, 0, sw, if sw > 0 { screen.height } else { 0 });
 
-        let folds = self
+        // A client shorter than the one the layout is for sees no folded row below its screen.
+        let folds: Vec<(PaneId, Rect)> = self
             .ws_index(c.workspace)
-            .map_or_else(Vec::new, |wi| self.stack_rows(self.workspaces[wi].tab(), self.layout_area));
+            .map_or_else(Vec::new, |wi| self.stack_rows(self.workspaces[wi].tab(), self.layout_area))
+            .into_iter()
+            .filter(|(_, row)| row.y < screen.bottom())
+            .collect();
         let placed = self.place_panes(id, (screen, side), &folds, (!covered).then_some(&mut memo));
         let c = &self.clients[&id];
         let mut looks = Vec::with_capacity(memo.looks.len());
@@ -489,20 +493,20 @@ impl Server {
 
         let c = &self.clients[&id];
         let overlay_cursor = match &c.mode {
-            Mode::Picker(p) => Some(overlays::draw_picker(p, full, buf)),
-            Mode::Prompt(p) => Some(overlays::draw_prompt(p, full, buf)),
+            Mode::Picker(p) => Some(overlays::draw_picker(p, screen, buf)),
+            Mode::Prompt(p) => Some(overlays::draw_prompt(p, screen, buf)),
             Mode::Help { scroll } => {
                 let keys = [("↑↓", "scroll"), ("esc", "close")];
-                overlays::draw_viewer("Help", &self.help_lines(), *scroll, &keys, full, buf);
+                overlays::draw_viewer("Help", &self.help_lines(), *scroll, &keys, screen, buf);
                 None
             }
             Mode::Messages { scroll } => {
                 let keys = [("↑↓", "scroll"), ("esc", "close")];
-                overlays::draw_viewer("Messages", &self.message_lines(), *scroll, &keys, full, buf);
+                overlays::draw_viewer("Messages", &self.message_lines(), *scroll, &keys, screen, buf);
                 None
             }
             Mode::Confirm(q) => {
-                overlays::draw_confirm(q, full, buf);
+                overlays::draw_confirm(q, screen, buf);
                 None
             }
             Mode::Hints(h) => {
@@ -531,7 +535,7 @@ impl Server {
                 let entries = self.keymap.menu(typed);
                 let items = overlays::menu_items(&entries);
                 let footer = overlays::menu_footer(&entries);
-                let layout = overlays::menu_layout(&items, full);
+                let layout = overlays::menu_layout(&items, screen);
                 let back = !typed.is_empty();
                 overlays::draw_menu(&items, &layout, (&title, &footer), back, miss.as_deref(), buf);
                 // Links under the menu would open from it.
@@ -584,7 +588,7 @@ impl Server {
         let Some((_, frame, _)) = self.tab_rects(tab, self.layout_area).into_iter().find(|(p, _, _)| *p == pane) else {
             return;
         };
-        let (_, inner) = self.placed(frame, buf.area);
+        let (_, inner) = self.placed(frame, self.screen_above_bar(c.cols, c.rows));
         let typed = typed.to_ascii_lowercase();
         let label_style = Style::default().fg(Color::Black).bg(Color::Yellow).add_modifier(Modifier::BOLD);
         for h in hints {
