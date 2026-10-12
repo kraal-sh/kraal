@@ -387,6 +387,8 @@ pub struct Server {
     next_id: u32,
     /// The client whose terminal size drives pane sizes.
     pub primary: Option<ClientId>,
+    /// The primary client's main area: the panes are sized for it, and each client draws them
+    /// from where its own panes start (see [`Server::client_area`]).
     pub layout_area: Rect,
     waits: Vec<PendingWait>,
     persist_dirty: bool,

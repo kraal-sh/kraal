@@ -136,6 +136,8 @@ struct RawClient {
     screen: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
     /// The messages the server sent, as JSON.
     messages: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    /// Its terminal's columns and rows.
+    size: (usize, usize),
 }
 
 impl RawClient {
@@ -145,12 +147,22 @@ impl RawClient {
 
     /// Attach, saying which kraal is installed (a local client says its own).
     fn attach_installed(env: &Env, workspace: &str, installed: Option<&str>) -> RawClient {
+        RawClient::attach_as(env, workspace, (120, 40), installed)
+    }
+
+    /// Attach from a terminal of `size` (columns, rows).
+    fn attach_sized(env: &Env, workspace: &str, size: (usize, usize)) -> RawClient {
+        RawClient::attach_as(env, workspace, size, None)
+    }
+
+    fn attach_as(env: &Env, workspace: &str, size: (usize, usize), installed: Option<&str>) -> RawClient {
         use std::io::Read;
         let socket = env.root.join("run/kraal").join(format!("{}.sock", env.session));
         let mut stream = std::os::unix::net::UnixStream::connect(socket).unwrap();
         let installed = installed.map(|v| format!(r#","installed":"{v}""#)).unwrap_or_default();
+        let (cols, rows) = size;
         let hello = format!(
-            r#"{{"type":"attach","version":2,"cols":120,"rows":40,"workspace":"{workspace}","remote":false{installed}}}"#
+            r#"{{"type":"attach","version":2,"cols":{cols},"rows":{rows},"workspace":"{workspace}","remote":false{installed}}}"#
         );
         raw_frame(&mut stream, 0, hello.as_bytes());
         let screen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -169,7 +181,14 @@ impl RawClient {
                 }
             }
         });
-        RawClient { stream, screen, messages }
+        RawClient { stream, screen, messages, size }
+    }
+
+    /// Its terminal takes another size: the server draws the whole screen again.
+    fn resize(&mut self, size: (usize, usize)) {
+        self.size = size;
+        let (cols, rows) = size;
+        raw_frame(&mut self.stream, 0, format!(r#"{{"type":"resize","cols":{cols},"rows":{rows}}}"#).as_bytes());
     }
 
     /// Wait until the server has sent a message containing `text`.
@@ -4999,9 +5018,9 @@ fn terminal_after(bytes: &[u8], cols: usize, rows: usize) -> Vec<String> {
 }
 
 impl RawClient {
-    /// The text of each row its terminal (120×40) shows.
+    /// The text of each row its terminal shows.
     fn rows(&self) -> Vec<String> {
-        text_after(&self.screen.lock().unwrap(), 120, 40)
+        text_after(&self.screen.lock().unwrap(), self.size.0, self.size.1)
     }
 
     /// Wait until its terminal shows `text` on a row; the rows then. Unlike
@@ -5139,6 +5158,68 @@ fn frames_drawn_over_the_last_one_end_as_a_whole_frame() {
     // A pane closed: the others take its place.
     env.run(&["close", "img"]);
     same(&client, "pane closed");
+}
+
+/// The panes have one size, that of the terminal typed in last, and every attached terminal has
+/// its own sidebar: shown, hidden with the key, or left out where the terminal is too narrow for
+/// it. Each terminal draws the panes beside its own sidebar: never over it, and never leaving its
+/// place empty.
+#[test]
+fn each_terminal_draws_the_panes_beside_its_own_sidebar() {
+    let env = Env::new("beside");
+    env.workspace("w", "layout {\n    pane name=\"shell\"\n}\n");
+    env.run(&["open", "w"]);
+    // The columns of the sidebar and the space after it, down to the accounts (whose usage may
+    // come while the test runs).
+    let side = |rows: &[String]| -> Vec<String> {
+        let side = rows.iter().map(|r| r.chars().take(29).collect::<String>());
+        side.take_while(|r| !r.contains("ACCOUNTS")).collect()
+    };
+    // The columns the pane's frame starts and ends at, on its first row (the sidebar has no
+    // corner there). A frame wider than what is left of the screen is closed at the last column.
+    let frame = |rows: &[String]| {
+        let at = |corner: char| rows[1].chars().position(|c| c == corner);
+        (at('╭'), at('╮'))
+    };
+    let shows = |client: &RawClient, columns: (usize, usize), when: &str| {
+        let columns = (Some(columns.0), Some(columns.1));
+        let rows = client.wait_for_rows(when, |rows| frame(rows) == columns);
+        // And it stays so.
+        client.settle();
+        assert_eq!(frame(&client.rows()), columns, "{when}:\n{}", client.rows().join("\n"));
+        rows
+    };
+    let mut wide = RawClient::attach(&env, "w");
+    let sidebar = side(&shows(&wide, (29, 119), "the pane beside the sidebar"));
+    assert!(sidebar[0].starts_with("╭─ WORKSPACES"), "{sidebar:?}");
+
+    // A second terminal hides its sidebar: the panes are laid out for it, from its first column.
+    // The first one keeps its sidebar, and shows of the panes what fits beside it.
+    let mut bare = RawClient::attach(&env, "w");
+    bare.send(b"\x02Vl");
+    shows(&bare, (0, 119), "the pane from the first column");
+    assert_eq!(side(&shows(&wide, (29, 119), "the pane beside the sidebar still")), sidebar);
+    // Typed in, the first terminal has the panes laid out beside its sidebar: the other one
+    // shows them from its first column all the same, with room left at its right.
+    wide.send(b"echo typed-in-wide\r");
+    shows(&bare, (0, 90), "the narrower pane from the first column");
+    assert_eq!(side(&shows(&wide, (29, 119), "the pane laid out beside the sidebar")), sidebar);
+
+    // A terminal too narrow for a sidebar has none, and the panes are laid out for it.
+    let mut narrow = RawClient::attach_sized(&env, "w", (80, 24));
+    let rows = shows(&narrow, (0, 79), "the pane over the whole width");
+    assert!(rows[0].starts_with(" w "), "the workspace is named in the top bar: {:?}", rows[0]);
+    shows(&bare, (0, 79), "the narrow terminal's pane from the first column");
+    assert_eq!(side(&shows(&wide, (29, 108), "the narrow terminal's pane beside the sidebar")), sidebar);
+    // And it shows the panes of a wider one from its first column, as far as its last.
+    wide.send(b"echo typed-again\r");
+    narrow.wait_for_row("typed-again");
+    shows(&narrow, (0, 79), "the wide terminal's pane from the first column");
+    shows(&bare, (0, 90), "the wide terminal's pane");
+    assert_eq!(side(&shows(&wide, (29, 119), "the pane beside the sidebar again")), sidebar);
+    // Once wide enough, it has the sidebar too.
+    narrow.resize((120, 40));
+    assert_eq!(side(&shows(&narrow, (29, 119), "the sidebar once there is room")), sidebar);
 }
 
 /// The rows a pane shows far back come from its compact history: a client drawn incrementally
@@ -5624,7 +5705,7 @@ fn images_reach_a_terminal_that_draws_sixel() {
     assert_eq!(seen(&client).matches("\x1bP0;1;0q").count(), drawn);
     // The font changed with the window: the image waits for the new cell size, then takes it.
     let asked = seen(&client).matches("\x1b[16t").count();
-    raw_frame(&mut client.stream, 0, br#"{"type":"resize","cols":120,"rows":40}"#);
+    client.resize((120, 40));
     let start = Instant::now();
     while seen(&client).matches("\x1b[16t").count() == asked {
         assert!(start.elapsed() < Duration::from_secs(10), "the cell size is asked again");

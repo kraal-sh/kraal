@@ -2,7 +2,7 @@
 
 use ratatui::layout::Rect;
 
-use super::{Server, Tab};
+use super::{Client, ClientId, Server, Tab};
 use crate::layout::{Node, PaneId};
 /// A layout worked out: the tiles of the tree `root` in `area`, with frames or not.
 pub(super) struct Tiling {
@@ -13,14 +13,30 @@ pub(super) struct Tiling {
 }
 
 impl Server {
-    /// Main pane area for a client of the given size: below the top bar, above the bottom bar,
-    /// one column of space right of the sidebar.
-    fn main_area(&self, cols: u16, rows: u16, sidebar: bool) -> Rect {
+    /// Main pane area of client `c`: below the top bar, above the bottom bar, one column of space
+    /// right of the sidebar.
+    fn main_area(&self, c: &Client) -> Rect {
         let top = 1;
-        let height = rows.saturating_sub(top + self.bottom_rows()).max(1);
-        let left = if sidebar { self.sidebar_width(cols) } else { 0 };
-        let left = if left > 0 { left + 1 } else { 0 };
-        Rect::new(left, top, cols.saturating_sub(left).max(1), height)
+        let height = c.rows.saturating_sub(top + self.bottom_rows()).max(1);
+        let left = self.panes_left(c);
+        Rect::new(left, top, c.cols.saturating_sub(left).max(1), height)
+    }
+
+    /// The column client `c`'s panes start at: after its sidebar and a column of space.
+    fn panes_left(&self, c: &Client) -> u16 {
+        match self.sidebar_cols(c) {
+            0 => 0,
+            sidebar => sidebar + 1,
+        }
+    }
+
+    /// Where client `id` sees the layout. The panes have one size, worked out for the primary
+    /// client: every client draws them from where its own panes start, so one whose sidebar or
+    /// terminal is not the primary's sees the same layout beside its own sidebar, cut where its
+    /// screen ends.
+    pub(super) fn client_area(&self, id: ClientId) -> Rect {
+        let left = self.clients.get(&id).map_or(self.layout_area.x, |c| self.panes_left(c));
+        Rect { x: left, ..self.layout_area }
     }
 
     /// Rows the bottom bar takes, at the bottom of every client's screen.
@@ -35,11 +51,13 @@ impl Server {
     }
 
     /// [`Server::screen_above_bar`] of client `id`.
-    pub(super) fn client_screen(&self, id: super::ClientId) -> Rect {
+    pub(super) fn client_screen(&self, id: ClientId) -> Rect {
         let (cols, rows) = self.clients.get(&id).map_or((80, 24), |c| (c.cols, c.rows));
         self.screen_above_bar(cols, rows)
     }
 
+    /// The sidebar's width on a screen of `cols` columns: none on a screen less than three times
+    /// as wide as it, where it would leave the panes too little.
     pub fn sidebar_width(&self, cols: u16) -> u16 {
         let w = self.config.sidebar.width;
         if cols < w * 3 { 0 } else { w }
@@ -47,7 +65,7 @@ impl Server {
 
     /// Whether a client sees the sidebar: as it chose, else when there is more to show than the
     /// one workspace it is in (other workspaces, agents, ports, tunnels).
-    pub fn sidebar_shown(&self, c: &super::Client) -> bool {
+    pub fn sidebar_shown(&self, c: &Client) -> bool {
         c.sidebar.unwrap_or_else(|| self.config.sidebar.visible && self.sidebar_useful())
     }
 
@@ -60,13 +78,19 @@ impl Server {
             || self.remote_agents().next().is_some()
     }
 
+    /// The columns client `c`'s sidebar takes: none when it has none, or a screen too narrow for
+    /// one.
+    pub(super) fn sidebar_cols(&self, c: &Client) -> u16 {
+        if self.sidebar_shown(c) { self.sidebar_width(c.cols) } else { 0 }
+    }
+
     /// Where every visible pane of a tab goes, in draw order (tiled, then floating): its frame,
     /// or its whole place when it has none. Panes folded in a stack show only a row
     /// ([`Server::stack_rows`]).
     pub fn tab_rects(&self, tab: &Tab, area: Rect) -> Vec<(PaneId, Rect, bool)> {
         let mut out = Vec::new();
         if let Some(z) = tab.zoom.filter(|z| !tab.is_floating(*z)) {
-            out.push((z, self.tile(area), false));
+            out.push((z, area, false));
         } else if let Some(root) = &tab.root {
             out.extend(
                 self.tiled_rects(root, area).into_iter().filter(|(.., folded)| !folded).map(|(p, r, _)| (p, r, false)),
@@ -113,12 +137,6 @@ impl Server {
         tiles
     }
 
-    /// Where a tiled pane's frame goes: its place, less one column of space when a pane is to its
-    /// right.
-    fn tile(&self, outer: Rect) -> Rect {
-        if self.config.pane_frames { crate::layout::framed(outer, self.layout_area) } else { outer }
-    }
-
     /// Where a pane's content goes: inside its frame.
     pub fn inner(&self, frame: Rect) -> Rect {
         if self.config.pane_frames && frame.width >= 4 && frame.height >= 3 {
@@ -138,7 +156,7 @@ impl Server {
     /// Recompute the layout area from the primary client and resize every pane.
     pub fn relayout(&mut self) {
         if let Some(c) = self.primary.and_then(|p| self.clients.get(&p)) {
-            self.layout_area = self.main_area(c.cols, c.rows, self.sidebar_shown(c));
+            self.layout_area = self.main_area(c);
         }
         let area = self.layout_area;
         let mut sizes = Vec::new();
@@ -161,7 +179,7 @@ impl Server {
                     }
                 }
                 if let Some(z) = tab.zoom {
-                    tiled.insert(z, self.tile(area));
+                    tiled.insert(z, area);
                 }
                 for (id, r) in tiled {
                     sizes.push((id, self.inner(r)));

@@ -485,7 +485,7 @@ pub fn neighbour(rects: &HashMap<PaneId, Rect>, from: PaneId, dir: Dir, recent: 
 /// Where the frame of a place inside `area` goes: the place, less one column of space when a
 /// place is to its right. Rows of places touch, frame on frame: a cell is about twice as tall as
 /// it is wide, so a row of space would look twice as wide as that column.
-pub fn framed(place: Rect, area: Rect) -> Rect {
+fn framed(place: Rect, area: Rect) -> Rect {
     let right = u16::from(place.right() < area.right() && place.width > 1);
     Rect::new(place.x, place.y, place.width - right, place.height)
 }
