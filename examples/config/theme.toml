@@ -1,0 +1,24 @@
+# The look: the high-contrast preset, colours of your own, thick frames, a wider sidebar.
+# Copy it to ~/.config/kraal/config.toml, or add its tables to yours: a config only holds
+# what it changes. `kraal config check` validates it, and `kraal config reload` applies it
+# to the running session at once.
+# Needs nothing. A colour is a name (green, lightblue), "#rrggbb" or a palette index (0-255).
+
+# A frame around each pane names it and says what it works on (branch, server, cluster).
+# false gives that room to the panes: the top bar then shows the focused pane's details.
+pane_frames = true
+
+[theme]
+preset = "high-contrast"      # or "default", or "ascii" where box drawing does not show
+accent = "#ffb000"            # what is focused or selected, and the keys in menus
+dim = "gray"                  # the other frames and secondary text
+sync = "magenta"              # the mark of panes a broadcast types in
+production = "lightred"       # frames and badges of production panes
+frames = "thick"              # "rounded", "plain", "thick", "double" or "ascii"
+
+[sidebar]
+visible = true                # shown once it has something to show
+width = 32
+
+[bar]
+keys = "context"              # the last row: what the focused pane can do; "off": no such row

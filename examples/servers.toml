@@ -1,0 +1,40 @@
+# An inventory: a group, a jump host, production servers, and a workstation whose kraal
+# session you attach to from elsewhere (`kraal attach --host workstation`).
+# Copy it to ~/.config/kraal/servers.toml, or add its entries with `kraal servers edit`:
+# `kraal servers` lists them, and ctrl+b s connects to one or to a whole group.
+# Needs your own hosts in place of these. kraal rewrites the file when it saves a server you
+# ssh to: the comments go then.
+
+[[server]]
+name = "bastion"
+host = "bastion.example.com"
+user = "ops"
+
+[[server]]
+name = "web-staging-1"
+host = "web-staging-1.example.com"
+user = "deploy"
+groups = ["web"]
+
+[[server]]
+name = "web-staging-2"
+host = "web-staging-2.example.com"
+user = "deploy"
+groups = ["web"]
+
+[[server]]
+name = "web-prod-1"             # production by its name: "prod" is one of [production] words
+host = "web-prod-1.example.com"
+user = "deploy"
+groups = ["web"]
+
+[[server]]
+name = "db-1"
+host = "192.0.2.5"
+jump = "bastion"                # reached through the server "bastion" (ProxyJump)
+env = "prod"                    # production, whatever its name says
+
+[[server]]
+name = "workstation"
+host = "workstation.example.com"
+agents = "main"                 # the agents of its kraal session "main" show in your sidebar

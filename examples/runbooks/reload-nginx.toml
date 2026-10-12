@@ -1,0 +1,27 @@
+# Reload nginx on a group of servers, one at a time, stopping at the first that fails.
+# Copy it to ~/.config/kraal/runbooks/reload-nginx.toml, then in a pane of kraal run
+# `kraal runbook run reload-nginx --on @web -p SITE=shop`, or press `ctrl+b R b`.
+# kraal shows the plan (servers, parameters, steps, which servers are production) and asks;
+# `--dry-run` shows the plan only. Each run is logged in ~/.local/state/kraal/runs.
+# Needs servers in a group (examples/servers.toml has "web") where you may sudo.
+description = "Check a site's nginx configuration, reload nginx, check that it answers"
+
+on = "server"                 # servers or a @group, chosen at each run
+rolling = 1                   # one server at a time; 0 runs them all at once
+stop_on_failure = true        # a failure ends the run: the servers still waiting are skipped
+timeout = "2m"                # a server that takes longer is stopped and counts as failed
+
+# Shell code, run in order in one shell on each server: a command that fails fails its step.
+steps = [
+  'sudo nginx -t',
+  'grep -q "server_name $SITE" /etc/nginx/sites-enabled/*',
+  'sudo systemctl reload nginx',
+  'curl -fsS -o /dev/null -H "Host: $SITE.example.com" http://localhost/',
+]
+
+# Asked for before the plan is shown, or given with -p; the steps get it as $SITE.
+[[param]]
+name = "SITE"
+prompt = "Site to check"
+choices = ["shop", "blog", "docs"]    # what the question offers
+default = "shop"

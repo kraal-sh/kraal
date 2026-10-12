@@ -1,0 +1,21 @@
+# How kraal prepares the worktrees it makes for agents, in every repository of yours: files
+# copied from the main checkout, commands run first, and a port of its own for each worktree.
+# Copy it to ~/.config/kraal/config.toml, or add its table to yours; `kraal config check`
+# validates it. Then, in a repository: `kraal wt new fix-login --agent claude`.
+# Needs git, and direnv for the setup command. A repository adds its own preparation in
+# .kraal/worktree.toml (examples/repository), which runs before yours once you approved it.
+
+[worktrees]
+# Copied from the main checkout into each new worktree, when they are there: paths in the
+# repository, with * and ? in the last part. A file already in the worktree stays as it is.
+copy = [".env*", ".tool-versions"]
+
+# Run in the new worktree before the agent starts, after the repository's own commands.
+# The first command that fails stops the rest.
+setup = ["direnv allow"]
+
+# Each worktree has a number in its repository (1, 2, 3). Its panes get $KRAAL_WORKTREE,
+# $KRAAL_WORKTREE_INDEX and $KRAAL_PORT_OFFSET (the number times port_step), and with a
+# port_base $PORT too: 3010 in the first worktree, 3020 in the second.
+port_step = 10
+port_base = 3000

@@ -1,0 +1,28 @@
+# Two tools of your own, one key away where the focused pane is, and a hint that runs one.
+# Copy it to ~/.config/kraal/config.toml, or add its tables to yours. `kraal config check`
+# validates it and `kraal config reload` applies it; `ctrl+b r` lists the tools.
+# Needs kubectl and the aws CLI on this machine: both tools run here (on = "local"), with
+# the kubeconfig and the AWS profile of the focused pane.
+
+[tools.pods]
+description = "pods of the pane's cluster and namespace"
+command = 'kubectl get pods -o wide ${KRAAL_KUBE_CONTEXT:+--context "$KRAAL_KUBE_CONTEXT"} ${KRAAL_KUBE_NAMESPACE:+-n "$KRAAL_KUBE_NAMESPACE"}'
+on = "local"                  # here, even from an SSH pane; "pane" runs on the pane's server
+when = ["kubernetes"]         # refused, with the reason, where no Kubernetes context is known
+hold = true                   # the pane stays open once the command ends, to read it
+read_only = true              # it only looks: no question on a production pane
+key = "i"                     # ctrl+b R i starts it (ctrl+b i in the classic preset)
+
+[tools.instance]
+description = "the EC2 instance whose id is selected"
+command = 'aws ec2 describe-instances --instance-ids "$KRAAL_SELECTION" --output table'
+on = "local"
+when = ["selection"]          # needs text selected in the pane, or a hint's match
+hold = true
+read_only = true
+
+# `ctrl+b o` labels what kraal recognises on screen, and these patterns of yours. Type a
+# label to copy its text; press Tab first to run the pattern's tool on it.
+[hints.patterns.instance]
+pattern = 'i-[0-9a-f]{17}'
+tool = "instance"

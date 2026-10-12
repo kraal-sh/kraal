@@ -1,0 +1,31 @@
+# A runbook that ships with the code: everyone who clones the repository gets the same
+# deploy procedure.
+# Commit it as .kraal/runbooks/deploy.toml. In a checkout, in a pane of kraal, run
+# `kraal runbook run deploy -p VERSION=v1.4.2`, or press `ctrl+b R b`. kraal runs nothing
+# from a repository before you approved that version of the file, and asks again when it
+# changes. Needs tags named v* and a script/deploy in the repository.
+description = "Deploy a tagged version to staging, check it, then to production"
+
+on = "local"                  # this machine, in the repository
+stop_on_failure = true        # a step that fails ends the run: production is not reached
+timeout = "15m"
+
+steps = [
+  'git fetch --tags --quiet',
+  'git rev-parse --verify --quiet "refs/tags/$VERSION^{commit}" >/dev/null',
+  'script/deploy staging "$VERSION"',
+  'curl -fsS -m 10 https://staging.example.com/healthz',
+  'script/deploy production "$VERSION"',
+]
+
+# Asked for before the plan is shown, with the latest tags to choose from.
+[[param]]
+name = "VERSION"
+prompt = "Version to deploy"
+choices_command = "git tag --list 'v*' --sort=-v:refname | head -10"
+
+# script/deploy reads this one from its environment.
+[[param]]
+name = "DEPLOY_TOKEN"
+prompt = "Deploy token"
+secret = true                 # typed hidden, masked in the plan, the log and events
