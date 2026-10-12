@@ -55,7 +55,11 @@ waiting for you.
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/kraal-sh/kraal/main/install.sh | sh
-# or, with Rust 1.88 or later:
+```
+
+Or, with Rust 1.88 or later:
+
+```sh
 cargo install kraal
 ```
 
