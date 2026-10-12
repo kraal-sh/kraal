@@ -314,7 +314,7 @@ impl Widths {
         if matches!(cell.diff_option, CellDiffOption::ForcedWidth(_)) {
             return cell.cell_width();
         }
-        // ratatui: a byte is a column, nothing none.
+        // ratatui counts a column for a one-byte symbol, none for an empty one.
         if s.len() <= 1 {
             return s.len() as u16;
         }

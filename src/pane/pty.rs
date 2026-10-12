@@ -232,8 +232,8 @@ pub struct TermPane {
     /// Counts the changes made to the emulator's grid (see `TermPane::marked`): the screen
     /// needs no look while it stays the same.
     pub(super) changes: u64,
-    /// The process's directory as read for a frame: the frame, the process, the directory.
-    pub(super) cwd_seen: RefCell<Option<(u64, u32, Option<std::path::PathBuf>)>>,
+    /// The process's directory as last read for a frame.
+    pub(super) cwd_seen: RefCell<Option<super::CwdSeen>>,
 }
 
 /// A PTY of `cols × rows`, with its size in pixels from the outer terminal's cells: programs

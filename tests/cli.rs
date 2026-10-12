@@ -3349,6 +3349,7 @@ fn frames_drawn_over_the_last_one_end_as_a_whole_frame() {
     std::fs::write(env.root.join("state/kraal/welcomed"), "").unwrap();
     env.workspace("w", "layout {\n    pane name=\"main\"\n}\n");
     env.workspace("w2", "layout {\n    pane name=\"other\"\n}\n");
+    env.workspace("w3", "layout {\n    pane name=\"third\"\n}\n");
     env.run(&["open", "w"]);
     let colors = "printf '\\033[1;31mred \\033[42;4mgreen\\033[0m \\346\\227\\245\\346\\234\\254 \
                   \\033]8;;https://example.org\\033\\\\link\\033]8;;\\033\\\\ e\\314\\201 done\\n'; exec cat";
@@ -3409,15 +3410,24 @@ fn frames_drawn_over_the_last_one_end_as_a_whole_frame() {
     same(&client, "new tab");
     env.run(&["focus", "colors"]);
     same(&client, "tab back");
+    // Colors stacked with the pane below it: lines folded to a row, renamed there, then open.
+    client.send(b"\x02Ps\x1b[B");
+    same(&client, "stacked");
+    env.run(&["rename", "-p", "lines", "folded"]);
+    same(&client, "folded pane renamed");
+    client.send(b"\x1b[1;3B");
+    same(&client, "other pane of the stack open");
     // The menu over the panes, then closed.
     client.send(b"\x02");
     client.settle();
     client.send(b"\x1b");
     same(&client, "menu closed");
-    // A second workspace: the sidebar shows.
+    // A second workspace: the sidebar shows; a third: the sidebar changes.
     env.run(&["open", "w2"]);
     std::thread::sleep(Duration::from_millis(600));
     same(&client, "sidebar");
+    env.run(&["open", "w3"]);
+    same(&client, "sidebar changed");
     // A pane closed: the others take its place.
     env.run(&["close", "img"]);
     same(&client, "pane closed");

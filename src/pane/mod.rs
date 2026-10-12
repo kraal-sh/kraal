@@ -68,6 +68,19 @@ impl Drop for Frame {
     }
 }
 
+/// How long frames take a quiet shell's directory as read.
+const CWD_SHOWN: std::time::Duration = std::time::Duration::from_millis(400);
+
+/// A process's directory as read for a frame: which frame, which process, after how many
+/// changes to the pane's grid, when.
+pub(super) struct CwdSeen {
+    frame: u64,
+    pid: u32,
+    changes: u64,
+    at: Instant,
+    cwd: Option<PathBuf>,
+}
+
 /// Every mode a program may have left set, back to how a fresh terminal starts, without RIS
 /// (which would clear the scrollback a restarted pane keeps): the alternate screen, the kitty
 /// keyboard stacks of both screens and the alternate screen's saved cursor, the scrolling region
@@ -734,9 +747,12 @@ impl Pane {
         program.is_none_or(|p| is_shell(&p))
     }
 
-    /// Best-known working directory on this machine: OSC 7, else the shell's (read once per
-    /// frame while frames are drawn, see [`Frame`]).
+    /// Best-known working directory on this machine: OSC 7, else the shell's.
     /// A directory reported by a shell on another machine (over ssh) does not count.
+    ///
+    /// For frames (see [`Frame`]), the shell's is read once per frame, and is taken to be the
+    /// same while the pane prints nothing, for [`CWD_SHOWN`]: a shell that changes directory
+    /// prints its prompt.
     pub fn current_cwd(&self) -> Option<PathBuf> {
         if let Some(p) = &self.reported_cwd
             && !self.reported_remotely()
@@ -746,16 +762,18 @@ impl Pane {
         let t = self.term()?;
         let pid = t.pid()?;
         let frame = FRAME.with(std::cell::Cell::get);
-        if frame != 0
-            && let Some((f, p, cwd)) = &*t.cwd_seen.borrow()
-            && (*f, *p) == (frame, pid)
+        if frame == 0 {
+            return crate::process::cwd(pid);
+        }
+        if let Some(seen) = &*t.cwd_seen.borrow()
+            && seen.pid == pid
+            && (seen.frame == frame || (seen.changes == t.changes && seen.at.elapsed() < CWD_SHOWN))
         {
-            return cwd.clone();
+            return seen.cwd.clone();
         }
         let cwd = crate::process::cwd(pid);
-        if frame != 0 {
-            *t.cwd_seen.borrow_mut() = Some((frame, pid, cwd.clone()));
-        }
+        *t.cwd_seen.borrow_mut() =
+            Some(CwdSeen { frame, pid, changes: t.changes, at: Instant::now(), cwd: cwd.clone() });
         cwd
     }
 
