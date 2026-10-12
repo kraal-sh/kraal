@@ -61,6 +61,12 @@ impl Pane {
         Some(encode(&t.term, t.archive.lens_rows(), &t.archive.lines(), MAX_SAVED_BYTES))
     }
 
+    /// Whether the rows the history handed over to the archive are all stored: reading it then
+    /// stores none on this thread.
+    pub fn history_stored(&self) -> bool {
+        self.term().is_none_or(|t| t.archive.stored())
+    }
+
     /// Show the last `lines` lines of `saved` (as [`Pane::scrollback_ansi`] wrote it), then a dim
     /// line saying when it was saved (`saved_at`, seconds since the epoch): the program's output
     /// comes below. Whether there was anything to show.

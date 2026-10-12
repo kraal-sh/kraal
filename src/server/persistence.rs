@@ -92,8 +92,9 @@ impl Server {
         let mut due: Vec<(Option<Instant>, PaneId)> = self
             .panes
             .values()
-            // A pane waiting for Enter shows what was restored in it, saved already.
-            .filter(|p| p.is_terminal() && !p.suspended)
+            // A pane waiting for Enter shows what was restored in it, saved already. One whose
+            // history is being stored is saved next time, rather than store it here.
+            .filter(|p| p.is_terminal() && !p.suspended && (all || p.history_stored()))
             .filter_map(|p| {
                 let saved = self.scrollback.get(&p.id);
                 let taken = saved.map(|s| s.taken);

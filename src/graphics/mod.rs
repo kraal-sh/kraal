@@ -695,12 +695,18 @@ impl PaneGraphics {
         }
     }
 
+    /// Whether the next image placed looks for those whose cells are gone (see `sweep`): only
+    /// then are those of the archived history needed.
+    pub fn sweep_due(&self) -> bool {
+        self.shown.values().filter(|s| s.direct).count() >= self.sweep_at
+    }
+
     /// Images placed at the cursor whose cells are all gone (written over, or out of the
     /// history) are forgotten. kraal reads the grid through each time their number doubles, so
     /// the cost stays in proportion to what was placed. The images of the screen that is not up
     /// (main or alternate) are left alone, except that the alternate screen's go with it.
     fn sweep<T: EventListener>(&mut self, term: &Term<T>) {
-        if self.shown.values().filter(|s| s.direct).count() < self.sweep_at {
+        if !self.sweep_due() {
             return;
         }
         let alt = term.mode().contains(TermMode::ALT_SCREEN);

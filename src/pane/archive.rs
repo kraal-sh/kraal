@@ -132,6 +132,11 @@ impl Archive {
         self.store.lines()
     }
 
+    /// Whether the rows handed over are stored: reading the lines stores none.
+    pub(super) fn stored(&self) -> bool {
+        self.store.backlog() == 0
+    }
+
     /// Rows of the emulator's history the lens shows.
     pub(super) fn lens_rows(&self) -> usize {
         self.lens.as_ref().map_or(0, |l| l.rows)
@@ -258,7 +263,7 @@ impl Archive {
         if moved == 0 && left <= self.high {
             return 0;
         }
-        let mut batch = Batch { rows: Vec::with_capacity(moved), lines, trim, release: false };
+        let mut batch = Batch { rows: Vec::with_capacity(moved), lines, trim };
         if moved > MANY {
             // Many rows (after a flood, or a look far back): the emulator lets go of the rows it
             // keeps ahead too, rather than get as many new ones.
@@ -391,7 +396,7 @@ impl Archive {
         keep_on_grid(term);
         if lens.rows > EMULATOR_ROWS {
             // Many rows that showed a long history went: their memory goes back.
-            self.store.send(Batch::release());
+            self.store.release();
         }
     }
 
@@ -898,8 +903,7 @@ impl TermPane {
             self.term.grid_mut().truncate();
             self.archive.spare = Vec::new();
             self.archive.store.free_spare();
-            // Once the rows handed over are let go of.
-            self.archive.store.send(Batch::release());
+            self.archive.store.release();
             self.archive.freed = true;
         }
         std::mem::take(&mut self.archive.freed)
@@ -934,6 +938,10 @@ impl TermPane {
 
     /// The text of the archive's last `rows` rows at the pane's width, as grid rows read.
     pub(super) fn archived_rows(&self, rows: usize) -> Vec<String> {
+        if rows == 0 {
+            // Without waiting for the rows handed to the store.
+            return Vec::new();
+        }
         let width = self.term.columns();
         let mut lines = Vec::new();
         let mut count = 0;
@@ -1150,7 +1158,7 @@ mod tests {
                 session: "t".into(),
                 shell: "sh".into(),
                 scrollback,
-                graphics: Default::default(),
+                graphics: Arc::new(crate::graphics::Shared::new(true, 64 << 20)),
             };
             let spec = PaneSpec { command: vec!["sleep".into(), "30".into()], ..Default::default() };
             let pane = Pane::spawn(1, None, spec, COLS, rows, &env, &tx).unwrap();
@@ -1318,6 +1326,33 @@ mod tests {
         assert!(b.pane.refresh_screen(COLS, ROWS).is_some());
         let grid = b.term().term.grid();
         assert!(grid.display_offset() <= grid.history_size(), "{} > {}", grid.display_offset(), grid.history_size());
+    }
+
+    /// What reads the screen (each tick for agents) or places an image, while the archive is
+    /// busy (another thread reads it, the rows of a long output are stored), goes on at once.
+    #[test]
+    fn the_screen_and_images_are_read_without_the_archive() {
+        let mut b = Both::new();
+        b.feed(sample(1000).as_bytes());
+        let store = b.term().archive.store.clone();
+        let (held_tx, held_rx) = crossbeam_channel::bounded(0);
+        let (done_tx, done_rx) = crossbeam_channel::bounded::<()>(0);
+        let reader = std::thread::spawn(move || {
+            let lines = store.lines();
+            held_tx.send(()).unwrap();
+            let _ = done_rx.recv_timeout(Duration::from_secs(3));
+            drop(lines);
+        });
+        held_rx.recv().unwrap();
+        let start = Instant::now();
+        assert!(b.pane.text(None).contains("line 995"));
+        let screen = start.elapsed();
+        b.pane.feed(b"\x1b_Ga=q,i=1;AAAA\x1b\\");
+        let image = start.elapsed() - screen;
+        let _ = done_tx.send(());
+        reader.join().unwrap();
+        assert!(screen < Duration::from_secs(1), "the screen waited {screen:?}");
+        assert!(image < Duration::from_secs(1), "the image waited {image:?}");
     }
 
     #[test]
