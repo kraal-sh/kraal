@@ -112,7 +112,7 @@ pub struct FrameMemo {
     panes: Vec<(PaneId, Rect, Vec<u64>)>,
     chrome: Option<Chrome>,
     /// The look of each pane's frame, with what it was made from, in the order drawn.
-    looks: Vec<(PaneId, LookInputs, Rc<FrameLook>)>,
+    looks: Looks,
 }
 
 /// What a part of the chrome (the top bar, the sidebar) is made from, besides the client: the
@@ -122,6 +122,12 @@ struct Inputs {
     chrome: u64,
     panes: Vec<(PaneId, u64)>,
 }
+
+/// The looks of the frames of a frame's panes, with what each was made from.
+type Looks = Vec<(PaneId, LookInputs, Rc<FrameLook>)>;
+
+/// The look of each pane's frame, in order; none for a pane without one.
+type Frames = Vec<Option<Rc<FrameLook>>>;
 
 /// What a frame's look is made from (see `Server::frame_look`).
 #[derive(PartialEq, Clone, Copy)]
@@ -146,10 +152,10 @@ struct Chrome {
     sidebar_from: Inputs,
     bar: TopBar,
     bar_from: Inputs,
-    frames: Vec<Option<Rc<FrameLook>>>,
+    frames: Frames,
     /// The rows of the panes folded in stacks, and their frames' looks.
     folds: Vec<(PaneId, Rect)>,
-    fold_looks: Vec<Option<Rc<FrameLook>>>,
+    fold_looks: Frames,
 }
 
 impl Chrome {
@@ -1376,14 +1382,13 @@ impl Server {
 
     /// The frames of the panes `placed` that have one, and of the panes folded in stacks
     /// (`folds`: their rows, each the top of a frame), as client `id` sees them.
-    #[allow(clippy::type_complexity)]
     fn frame_looks(
         &self,
         id: ClientId,
         placed: &[Placed],
         folds: &[(PaneId, Rect)],
-        (last, now): (&[(PaneId, LookInputs, Rc<FrameLook>)], &mut Vec<(PaneId, LookInputs, Rc<FrameLook>)>),
-    ) -> (Vec<Option<Rc<FrameLook>>>, Vec<Option<Rc<FrameLook>>>) {
+        (last, now): (&Looks, &mut Looks),
+    ) -> (Frames, Frames) {
         let Some(wi) = self.clients.get(&id).and_then(|c| self.ws_index(c.workspace)) else {
             return (placed.iter().map(|_| None).collect(), folds.iter().map(|_| None).collect());
         };

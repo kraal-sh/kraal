@@ -4,6 +4,14 @@ use ratatui::layout::Rect;
 
 use super::{Server, Tab};
 use crate::layout::{Node, PaneId};
+/// A layout worked out: the tiles of the tree `root` in `area`, with frames or not.
+pub(super) struct Tiling {
+    root: Node,
+    area: Rect,
+    frames: bool,
+    tiles: Vec<(PaneId, Rect, bool)>,
+}
+
 impl Server {
     /// Main pane area for a client of the given size: below the top bar, one column of space
     /// right of the sidebar.
@@ -73,10 +81,10 @@ impl Server {
     fn tiled_rects(&self, root: &Node, area: Rect) -> Vec<(PaneId, Rect, bool)> {
         let frames = self.config.pane_frames;
         // Frames ask for the same layouts over and over: the last few are remembered, by value.
-        let mut known = self.tiles.borrow_mut();
-        if let Some(i) = known.iter().position(|(n, a, f, _)| *a == area && *f == frames && n == root) {
+        let mut known = self.tilings.borrow_mut();
+        if let Some(i) = known.iter().position(|t| t.area == area && t.frames == frames && t.root == *root) {
             let hit = known.remove(i);
-            let tiles = hit.3.clone();
+            let tiles = hit.tiles.clone();
             known.push(hit);
             return tiles;
         }
@@ -84,7 +92,7 @@ impl Server {
         if known.len() >= 8 {
             known.remove(0);
         }
-        known.push((root.clone(), area, frames, tiles.clone()));
+        known.push(Tiling { root: root.clone(), area, frames, tiles: tiles.clone() });
         tiles
     }
 
