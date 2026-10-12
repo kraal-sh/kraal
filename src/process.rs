@@ -88,6 +88,17 @@ pub fn descendants(pid: u32) -> Vec<u32> {
     found
 }
 
+/// The parent of a process.
+pub fn ppid(pid: u32) -> Option<u32> {
+    imp::ppid(pid)
+}
+
+/// Whether the process that had this id and start time (see [`start_time`]) still runs: not
+/// another one that got its id since.
+pub fn still_running(pid: u32, started: u64) -> bool {
+    libc::pid_t::try_from(pid).is_ok_and(running) && start_time(pid) == Some(started)
+}
+
 /// Every process running on this machine that the system shows us.
 pub fn pids() -> Vec<u32> {
     imp::pids()

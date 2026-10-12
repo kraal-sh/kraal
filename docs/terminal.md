@@ -53,7 +53,10 @@ At each prompt the shell sends
 empty value is none, `?` is what the shell could not read. It reads the kubeconfig's current
 context with `awk` (one process per prompt, only when there is a kubeconfig), never runs kubectl
 or terraform, and sends `?` instead of a name with other characters than letters, digits and
-`-_.:/@+`.
+`-_.:/@+`. It reads YAML as kubectl, kubectx and the clouds' tools write it, comments and a
+context written on one line (`context: {namespace: web}`) included; a kubeconfig written another
+way (JSON, anchors and merge keys, braces over several lines) is `?`, never a context without its
+namespace.
 
 Some shells do not report: one inside tmux or screen on the server, one started by `sudo -i` or
 `su -`, one on a server without these lines reached from the first. When such a shell marks its

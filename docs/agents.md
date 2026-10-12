@@ -35,21 +35,28 @@ kraal integration status
 | droid | `droid` | `~/.factory/hooks.json` (the hooks of `settings.json` when they are kept there) |
 | CodeBuddy | `codebuddy` | hooks in `~/.codebuddy/settings.json` |
 | Kimi Code | `kimi` | `[[hooks]]` tables in `~/.kimi-code/config.toml` |
-| pi | `pi` | an extension of its own, `~/.pi/agent/extensions/kraal.ts` |
+| pi (0.84.4 or later) | `pi` | an extension of its own, `~/.pi/agent/extensions/kraal.ts` |
 | Codex | `codex` | `notify` in `~/.codex/config.toml`: the end of each turn |
 | Cursor CLI | `cursor` | `~/.cursor/hooks.json`: the start and end of each turn |
-| Augment | `auggie` | hooks in `~/.augment/settings.json`: tool calls and the end of each turn |
+| Augment | `auggie` | hooks in `~/.augment/settings.json` that run a script of kraal's own, `~/.augment/kraal-hook.sh`: tool calls and the end of each turn |
 
-The hooks of the last three say nothing when the agent asks you something: that still comes from
-the screen. The other agents have no hook that tells their state; theirs always comes from the
-screen. A file kraal edits is copied next to it first (`.kraal-bak`), only kraal's entries are
-added, and `kraal integration uninstall <agent>` takes out those alone; a file of kraal's own is
-removed whole. Agents read their hooks when a session starts, and Gemini CLI runs them only in
-folders you trust. `all` covers Claude Code and Codex, and each other agent whose directory
-exists (`~/.gemini`, `~/.copilot`, …).
+Codex's, Cursor's and Augment's hooks say nothing when the agent asks you something, and Gemini
+CLI's nothing when you decline a tool or cancel one: that still comes from the screen. The other
+agents have no hook that tells their state; theirs always comes from the screen. A turn that
+finished stays done until you look at the pane, even when the agent then says it waits for a
+prompt. A file kraal edits is copied next to it first (`.kraal-bak`), only kraal's entries are
+added, and `kraal integration uninstall <agent>` takes out those alone. A file of kraal's own is
+written and removed whole; one of the same name that kraal cannot read, or that is not kraal's,
+is left alone, and one you edited is copied next to it before it changes or goes. Agents read
+their hooks when a session starts, and Gemini CLI runs them only in folders you trust. `all`
+covers Claude Code and Codex, and each other agent whose directory exists (`~/.gemini`,
+`~/.copilot`, …).
 
 The hooks do nothing outside kraal. Some agents run another agent's hooks (Cursor and Continue
-run Claude Code's): kraal ignores a hook for an agent other than the one running in its pane.
+run Claude Code's): kraal ignores a hook for an agent other than the one running in its pane. An
+agent whose hooks report is followed even under a wrapper kraal does not recognise
+(`bash -c 'opencode; …'`): until its hooks say the session ended, or, for OpenCode and Kilo,
+whose plugins cannot say it, until the process the plugin runs in ends.
 States are shown as coloured dots, with the state written
 next to them in the sidebar and in pane frames: yellow working, red blocked (waiting for you), green
 done (not seen yet), `○` idle. A blocked or finished agent you are not

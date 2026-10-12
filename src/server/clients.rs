@@ -22,6 +22,7 @@ impl Server {
             return;
         }
         let id = self.alloc_id();
+        let peer = crate::process::socket_peer(&stream).ok().and_then(|(pid, _)| u32::try_from(pid).ok());
         let Ok(read_half) = stream.try_clone() else { return };
         let (out_tx, out_rx) = crossbeam_channel::bounded::<Vec<u8>>(64);
         let mut write_half = stream;
@@ -78,6 +79,7 @@ impl Server {
                 last_click: None,
                 welcome: false,
                 remote: false,
+                peer,
             },
         );
     }

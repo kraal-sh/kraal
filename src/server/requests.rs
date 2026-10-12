@@ -192,6 +192,13 @@ impl Server {
                 if running.is_some_and(|r| r != agent) {
                     return Response::Ok;
                 }
+                // The hook's parent: the agent itself when it runs its hooks directly.
+                let reporter = self
+                    .clients
+                    .get(&client)
+                    .and_then(|c| c.peer)
+                    .and_then(crate::process::ppid)
+                    .and_then(|pid| Some((pid, crate::process::start_time(pid)?)));
                 let before = self.panes[&p].agent.state;
                 let pn = self.panes.get_mut(&p).unwrap();
                 let a = &mut pn.agent;
@@ -199,16 +206,20 @@ impl Server {
                     // The agent session ended.
                     a.hooked = false;
                     a.kind = None;
+                    a.reporter = None;
                     a.set(AgentState::Unknown);
                 } else {
                     a.kind = Some(agent.clone());
                     // Only hooks that report every transition replace the screen heuristics;
                     // Codex's notify, for one, only says when a turn ends.
                     a.hooked = crate::agent::hooks_cover_lifecycle(&agent);
+                    a.reporter = reporter;
                     if let Some(id) = session_id {
                         a.session_id = Some(id);
                     }
-                    if let Some(s) = state {
+                    // An agent waiting for a prompt says nothing of whether its last result
+                    // was seen: a finished turn stays to be looked at.
+                    if let Some(s) = state.filter(|s| !(*s == AgentState::Idle && a.state == AgentState::Done)) {
                         a.set(s);
                     }
                     if message.is_some() {

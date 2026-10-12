@@ -296,6 +296,8 @@ pub struct Client {
     pub keys_by_place: bool,
     /// A paste arriving in pieces.
     pub(in crate::server) paste: Option<input::PasteFlow>,
+    /// The process that connected, where the system tells.
+    pub peer: Option<u32>,
 }
 
 /// A line of the messages log.
@@ -829,7 +831,7 @@ impl Server {
                 read_contexts |= contexts::observe_tools(&self.config.contexts, pane, a);
             }
             let agent = argv.as_deref().and_then(detect_agent);
-            let mut moved = pane.agent.set_process(agent);
+            let mut moved = pane.agent.set_process(agent, crate::process::still_running);
             if pane.agent.kind.is_some() {
                 let screen = pane.live_text();
                 let quiet = pane.last_output.elapsed();

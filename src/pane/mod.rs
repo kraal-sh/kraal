@@ -382,7 +382,12 @@ impl Pane {
                     signals.extend(t.mark(mark).map(PaneSignal::CommandDone));
                     match mark {
                         commands::Mark::Output => self.reported_since_command = false,
-                        commands::Mark::Prompt if !self.reported_since_command => self.reported = None,
+                        commands::Mark::Prompt if !self.reported_since_command => {
+                            // A report read earlier in this output is just as old: the server
+                            // must not take it after this.
+                            self.reported = None;
+                            signals.retain(|s| !matches!(s, PaneSignal::Contexts(_)));
+                        }
                         _ => {}
                     }
                 }
@@ -799,6 +804,32 @@ mod tests {
         // report: what was reported no longer holds.
         pane.feed(b"exit\r\n\x1b]133;C\x07\x1b]133;D;0\x07\x1b]133;A\x07$ ");
         assert!(pane.reported.is_none());
+        pane.kill();
+    }
+
+    /// The report, the command and the prompt without a report, read at once: the report is as
+    /// gone as when they come in several reads.
+    #[test]
+    fn a_prompt_without_a_report_ends_one_read_in_the_same_output() {
+        let (tx, _rx) = crossbeam_channel::bounded(64);
+        let env = PaneEnv {
+            socket: "/nonexistent".into(),
+            session: "t".into(),
+            shell: "sh".into(),
+            scrollback: 100,
+            graphics: Default::default(),
+        };
+        let spec = PaneSpec { command: vec!["sleep".into(), "5".into()], ..Default::default() };
+        let mut pane = Pane::spawn(1, None, spec, 40, 5, &env, &tx).unwrap();
+        let contexts = |signals: Vec<PaneSignal>| signals.into_iter().any(|s| matches!(s, PaneSignal::Contexts(_)));
+        let output: &[u8] =
+            b"\x1b]133;D;0\x07\x1b]7701;context;k8s=prod;ns=web;aws=ops\x07\x1b]133;A\x07$ \x1b]133;B\x07\
+            exit\r\n\x1b]133;C\x07\x1b]133;D;0\x07\x1b]133;A\x07$ ";
+        assert!(!contexts(pane.feed(output)), "a report the prompt after it ended");
+        assert!(pane.reported.is_none());
+        // A report after the prompt that ends the one before stays.
+        let next: &[u8] = b"exit\r\n\x1b]133;C\x07\x1b]133;D;0\x07\x1b]133;A\x07\x1b]7701;context;k8s=dev;tf=;aws=\x07";
+        assert!(contexts(pane.feed(next)));
         pane.kill();
     }
 

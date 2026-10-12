@@ -425,12 +425,23 @@ struct RawContextBody {
     namespace: Option<String>,
 }
 
+/// A kubeconfig with its merge keys (`<<: *defaults`) merged, as kubectl reads them: serde
+/// leaves them out, and a namespace with them.
+fn merged_yaml(text: &str) -> Result<std::borrow::Cow<'_, str>, serde_yaml_ng::Error> {
+    if !text.contains("<<") {
+        return Ok(std::borrow::Cow::Borrowed(text));
+    }
+    let mut value: serde_yaml_ng::Value = serde_yaml_ng::from_str(text)?;
+    value.apply_merge()?;
+    Ok(std::borrow::Cow::Owned(serde_yaml_ng::to_string(&value)?))
+}
+
 /// Read the parts of a kubeconfig kraal shows (YAML or JSON, as kubectl takes).
 pub fn parse_kubeconfig(text: &str) -> KubeFile {
     if text.trim().is_empty() {
         return KubeFile::default();
     }
-    let raw: RawKubeconfig = match serde_yaml_ng::from_str(text) {
+    let raw: RawKubeconfig = match merged_yaml(text).and_then(|t| serde_yaml_ng::from_str(&t)) {
         Ok(r) => r,
         Err(e) => return KubeFile { unreadable: Some(e.to_string()), ..Default::default() },
     };
@@ -994,5 +1005,21 @@ users:
         s.env = Some("prod".into());
         s.groups.clear();
         assert!(server_production(&s, &words));
+    }
+
+    /// Anchors, aliases and merge keys (`<<`), as kubectl reads them.
+    #[test]
+    fn kubeconfig_anchors_and_merge_keys() {
+        let defaults = "x: &c\n  namespace: prod\n  user: u\ncontexts:\n";
+        let merged = parse_kubeconfig(&format!(
+            "{defaults}- name: a\n  context:\n    <<: *c\n    cluster: c\n- name: b\n  context:\n    <<: *c\n    namespace: web\n\
+             - name: n\n  context: *c\n- name: 2024\n  context: {{}}\ncurrent-context: a\n"
+        ));
+        let ns = |name: &str| merged.namespaces.get(name).cloned().flatten();
+        assert_eq!(merged.unreadable, None);
+        assert_eq!(ns("a").as_deref(), Some("prod"));
+        assert_eq!(ns("b").as_deref(), Some("web"), "a key of the context's own wins");
+        assert_eq!(ns("n").as_deref(), Some("prod"));
+        assert!(merged.namespaces.contains_key("2024"), "{merged:?}");
     }
 }

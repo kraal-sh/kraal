@@ -51,9 +51,11 @@ commands get by default, whether or not one ran: a `--context` given to one comm
 Frames show these as for a local pane, tools get them in their variables, and the production
 guard counts them. They hold until the next prompt, and go when the SSH session ends. A server
 sends names only: kraal takes letters, digits and `-_.:/@+`, up to 200 characters, and shows
-anything else as unknown (`⎈ ?`, `tf:?`, `aws:?`), which may be production. A tool that runs here
-(`on = "local"`) gets those names in its variables, but not the server's `KUBECONFIG` or
-`AWS_PROFILE`. In a local pane, what kraal reads itself wins: a shell's report there is ignored.
+anything else as unknown (`⎈ ?`, `tf:?`, `aws:?`), which may be production; so is a kubeconfig the
+shell does not follow (anchors, merge keys, JSON), rather than read without its namespace. A tool
+that runs here (`on = "local"`) gets those names in its variables, but not the server's
+`KUBECONFIG` or `AWS_PROFILE`. In a local pane, what kraal reads itself wins: a shell's report
+there is ignored.
 
 ## Hints
 
