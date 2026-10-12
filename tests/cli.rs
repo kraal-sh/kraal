@@ -2778,6 +2778,31 @@ fn wait_for_context(env: &Env, context: &str) {
     }
 }
 
+/// Wait until the server reads `file` again, a kubeconfig that was just changed and whose reads
+/// `<file>.slow` makes last: the next scan starts that read (within 3.4 s, later on a loaded
+/// machine), and what is typed from here on finds it under way.
+#[cfg(target_os = "linux")]
+fn wait_for_slow_read(file: &Path) {
+    let reading = slow_read_marker(file);
+    wait_until(PATIENCE, "the changed kubeconfig is never read again", || reading.exists());
+}
+
+/// Wait until that read of `file` has ended, then for the server to have taken what it said.
+#[cfg(target_os = "linux")]
+fn wait_for_slow_read_to_end(file: &Path) {
+    let reading = slow_read_marker(file);
+    wait_until(PATIENCE, "the read of the kubeconfig never ended", || !reading.exists());
+    std::thread::sleep(Duration::from_millis(1500));
+}
+
+/// What sits next to `file` while the server reads it slowly.
+#[cfg(target_os = "linux")]
+fn slow_read_marker(file: &Path) -> PathBuf {
+    let mut reading = file.as_os_str().to_owned();
+    reading.push(".reading");
+    PathBuf::from(reading)
+}
+
 /// A tool that acts waits for the pane's kubeconfig to be read again, in a list that keeps
 /// the keys typed meanwhile (Esc gives up: nothing starts), and runs where it was asked for or
 /// not at all.
@@ -2865,7 +2890,7 @@ fn broadcast_waits_while_a_pane_context_is_read_again() {
     // `kubectx prod-x`: the next scan (within 3.4 s) starts a read that lasts 4.8 s.
     std::fs::write(env.root.join("kube.yaml.slow"), "").unwrap();
     std::fs::write(&kube, kubeconfig_text("prod-x")).unwrap();
-    std::thread::sleep(Duration::from_millis(3900));
+    wait_for_slow_read(&kube);
     typed(b"echo hello-bcast");
     std::thread::sleep(Duration::from_millis(600));
     for pane in ["a", "b"] {
@@ -2873,7 +2898,7 @@ fn broadcast_waits_while_a_pane_context_is_read_again() {
         assert!(!screen.contains("hello-bcast"), "typed while {pane}'s context was read:\n{screen}");
     }
     // The read ends, says production: the keys are asked about, not sent.
-    std::thread::sleep(Duration::from_millis(5000));
+    wait_for_slow_read_to_end(&kube);
     let screen = env.run(&["read", "-p", "b"]);
     assert!(!screen.contains("hello-bcast"), "keys reached a production pane unasked:\n{screen}");
     typed(b"y");
@@ -2909,10 +2934,10 @@ fn a_no_drops_everything_typed_while_a_context_was_read() {
     std::thread::sleep(Duration::from_millis(500));
     std::fs::write(env.root.join("kube.yaml.slow"), "").unwrap();
     std::fs::write(&kube, kubeconfig_text("prod-x")).unwrap();
-    std::thread::sleep(Duration::from_millis(3900));
+    wait_for_slow_read(&kube);
     // A whole command, Enter included, typed while the read goes on.
     typed(b" echo should-not-run\r");
-    std::thread::sleep(Duration::from_millis(5600));
+    wait_for_slow_read_to_end(&kube);
     // The read said production: the question is about all of it. No.
     typed(b"n");
     std::thread::sleep(Duration::from_millis(1500));
@@ -2959,7 +2984,7 @@ fn a_yes_waits_for_a_context_read_and_holds_only_if_nothing_changed() {
     // Meanwhile c becomes production, and its read lasts.
     std::fs::write(env.root.join("kube-c.yaml.slow"), "").unwrap();
     std::fs::write(&kube_c, kubeconfig_text("prod-x")).unwrap();
-    std::thread::sleep(Duration::from_millis(3900));
+    wait_for_slow_read(&kube_c);
     // Yes, before c's read ends: it was not production when asked.
     typed(b"y");
     std::thread::sleep(Duration::from_millis(6000));
@@ -2972,7 +2997,7 @@ fn a_yes_waits_for_a_context_read_and_holds_only_if_nothing_changed() {
     typed(b"\x1b[200~echo answered-again\x1b[201~");
     std::thread::sleep(Duration::from_millis(500));
     std::fs::write(&kube_c, kubeconfig_text("prod-x")).unwrap();
-    std::thread::sleep(Duration::from_millis(3900));
+    wait_for_slow_read(&kube_c);
     typed(b"y");
     for pane in ["a", "b", "c"] {
         env.wait_for_text(pane, "echo answered-again");
@@ -3008,7 +3033,7 @@ fn input_that_waited_goes_where_it_was_typed() {
     // The same context written again: a read that changes nothing, and lasts.
     std::fs::write(env.root.join("kube.yaml.slow"), "").unwrap();
     std::fs::write(&kube, kubeconfig_text("dev")).unwrap();
-    std::thread::sleep(Duration::from_millis(3900));
+    wait_for_slow_read(&kube);
     typed(b"echo typed-in-one");
     std::thread::sleep(Duration::from_millis(300));
     // Tab two is shown before the read ends.
@@ -3359,7 +3384,7 @@ fn a_long_paste_cut_for_production_takes_the_enter_after_it_along() {
     // rest of the paste, then an Enter, wait for it.
     std::fs::write(env.root.join("kube.yaml.slow"), "").unwrap();
     std::fs::write(&kube, kubeconfig_text("prod-x")).unwrap();
-    std::thread::sleep(Duration::from_millis(3900));
+    wait_for_slow_read(&kube);
     for _ in 0..16 {
         client.send(&piece);
     }

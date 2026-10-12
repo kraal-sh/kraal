@@ -612,14 +612,21 @@ impl KubeCache {
 
 /// Tests (debug builds only) make the read of a kubeconfig, or of a Terraform `environment` file,
 /// as slow as a stalled network disk: `KRAAL_TEST_SLOW_KUBECONFIG_MS` long while a `<file>.slow`
-/// marker sits next to it.
+/// marker sits next to it. A `<file>.reading` marker is there while such a read goes on: a test
+/// waits for it, where the scan that starts the read comes when the machine's load lets it.
 #[cfg(debug_assertions)]
 fn slow_for_tests(path: &Path) {
     let Some(ms) = std::env::var("KRAAL_TEST_SLOW_KUBECONFIG_MS").ok().and_then(|v| v.parse().ok()) else { return };
-    let mut marker = path.as_os_str().to_owned();
-    marker.push(".slow");
-    if Path::new(&marker).exists() {
+    let beside = |suffix: &str| {
+        let mut marker = path.as_os_str().to_owned();
+        marker.push(suffix);
+        std::path::PathBuf::from(marker)
+    };
+    if beside(".slow").exists() {
+        let reading = beside(".reading");
+        let _ = std::fs::write(&reading, "");
         std::thread::sleep(std::time::Duration::from_millis(ms));
+        let _ = std::fs::remove_file(reading);
     }
 }
 
