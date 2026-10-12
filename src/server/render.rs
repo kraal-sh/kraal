@@ -79,9 +79,22 @@ pub(super) struct FactsCache {
 }
 
 struct FactsEntry {
-    from: (u64, u64),
+    from: FactsFrom,
+    /// The frame they were last found to hold in.
+    checked: u64,
     version: u64,
     facts: Rc<Facts>,
+}
+
+/// What a pane's facts are worked out from, besides time while a context is read: the chrome's
+/// generation (anything but output), and what of the pane's output can change them without
+/// saying so (the OSC sequences kraal reads, the scroll, the directory its shell went to).
+#[derive(PartialEq)]
+struct FactsFrom {
+    chrome: u64,
+    oscs: u64,
+    offset: usize,
+    cwd: u64,
 }
 
 impl FactsCache {
@@ -264,16 +277,30 @@ struct Placed {
 
 impl Server {
     /// What the chrome shows of pane `id`, with its version. Worked out again only when
-    /// something it comes from may have changed: anything but output (`chrome_gen`), the pane's
-    /// output, or time while a context is read (one that does not answer soon becomes unknown).
+    /// something it comes from may have changed (see `FactsFrom`), and while a context is read
+    /// (one that does not answer soon becomes unknown).
     fn pane_facts(&self, id: PaneId) -> Option<(u64, Rc<Facts>)> {
         let pane = self.panes.get(&id)?;
-        let from = (self.chrome_gen, pane.fed);
+        let frame = crate::pane::frame();
         let timed = self.contexts_reading();
+        // Once in a frame: it shows one moment.
+        if let Some(e) = self.facts.panes.borrow().get(&id)
+            && frame != 0
+            && e.checked == frame
+        {
+            return Some((e.version, e.facts.clone()));
+        }
+        let from = FactsFrom {
+            chrome: self.chrome_gen,
+            oscs: pane.oscs,
+            offset: pane.display_offset(),
+            cwd: pane.cwd_version(),
+        };
         if !timed
-            && let Some(e) = self.facts.panes.borrow().get(&id)
+            && let Some(e) = self.facts.panes.borrow_mut().get_mut(&id)
             && e.from == from
         {
+            e.checked = frame;
             return Some((e.version, e.facts.clone()));
         }
         let facts = Facts {
@@ -286,12 +313,13 @@ impl Server {
             && *e.facts == facts
         {
             e.from = from;
+            e.checked = frame;
             return Some((e.version, e.facts.clone()));
         }
         let version = self.facts.versions.get() + 1;
         self.facts.versions.set(version);
         let facts = Rc::new(facts);
-        panes.insert(id, FactsEntry { from, version, facts: facts.clone() });
+        panes.insert(id, FactsEntry { from, checked: frame, version, facts: facts.clone() });
         Some((version, facts))
     }
 
