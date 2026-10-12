@@ -33,3 +33,29 @@ pub fn thread_switches(tid: libc::pid_t) -> impl Fn() -> u64 {
             .sum()
     }
 }
+
+/// Wait until thread `tid` of this process sleeps: it waits for something, where a thread that
+/// was just given work may still be running, or waiting for a processor on a loaded machine.
+/// Its switches are counted from then on, not from a guess of when it got there.
+#[cfg(target_os = "linux")]
+pub fn wait_asleep(tid: libc::pid_t) {
+    let start = std::time::Instant::now();
+    loop {
+        let status = std::fs::read_to_string(format!("/proc/self/task/{tid}/status")).unwrap();
+        if status.lines().any(|l| l.starts_with("State:") && l.contains("(sleeping)")) {
+            return;
+        }
+        assert!(start.elapsed() < std::time::Duration::from_secs(20), "thread {tid} never went to sleep:\n{status}");
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+}
+
+/// How long thread `tid` of this process has waited for a processor while it could run, since
+/// it started: the part of a delay that the machine's load explains, and no slowness of the
+/// thread. Zero where the kernel does not count it.
+#[cfg(target_os = "linux")]
+pub fn waited_for_a_processor(tid: libc::pid_t) -> std::time::Duration {
+    let counted = std::fs::read_to_string(format!("/proc/self/task/{tid}/schedstat")).unwrap_or_default();
+    let waited = counted.split_whitespace().nth(1).and_then(|ns| ns.parse().ok());
+    std::time::Duration::from_nanos(waited.unwrap_or(0))
+}
