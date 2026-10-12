@@ -26,8 +26,8 @@ scrollback = 10000
 # saved.
 save_scrollback = true
 
-# A frame around every pane, with its name and what it works on; one cell of space between
-# panes. Without, panes touch and their details go in the top bar.
+# A frame around every pane, with its name and what it works on; a column of space between panes
+# side by side. Without, panes touch and their details go in the top bar.
 pane_frames = true
 
 # Capture the mouse: click to focus, drag borders, wheel to scroll, drag to select and copy.

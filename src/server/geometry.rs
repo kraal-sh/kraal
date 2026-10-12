@@ -97,7 +97,7 @@ impl Server {
     }
 
     /// Where a tiled pane's frame goes: its place, less one column of space when a pane is to its
-    /// right and one row when a pane is below.
+    /// right.
     fn tile(&self, outer: Rect) -> Rect {
         if self.config.pane_frames { crate::layout::framed(outer, self.layout_area) } else { outer }
     }

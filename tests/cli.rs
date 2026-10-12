@@ -922,9 +922,9 @@ fn stacks_and_layouts_from_the_keys() {
     client.send(b"\x1b[<0;61;2M\x1b[<0;61;2m");
     until("bravo clicked", &|| focused() == "bravo");
     assert_eq!(size("charlie"), (78, 36), "opening a pane resizes nothing");
-    // Out of the stack again: above charlie, each half of the height.
+    // Out of the stack again: above charlie, each half of the height, frame on frame.
     client.send(b"\x02Pu");
-    until("unstacked", &|| size("bravo") == (78, 17) && size("charlie") == (78, 17));
+    until("unstacked", &|| size("bravo") == (78, 18) && size("charlie") == (78, 17));
     assert_eq!(focused(), "bravo");
 
     // The layouts, in turn: even columns, even rows, the main pane left, the others stacked.

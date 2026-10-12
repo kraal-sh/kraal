@@ -402,8 +402,7 @@ impl Server {
         }
     }
 
-    /// A tiled border under the cursor: with frames, the space between two tiles or the frame
-    /// on either side of it; without, the first column or row after the split.
+    /// A tiled border under the cursor (see [`crate::layout::Border::grabbed_at`]).
     pub(super) fn border_at(&self, wi: usize, col: u16, row: u16) -> Option<crate::layout::Border> {
         let tab = self.workspaces[wi].tab();
         if tab.zoom.is_some() {
@@ -411,14 +410,7 @@ impl Server {
         }
         let root = tab.root.as_ref()?;
         let frames = self.config.pane_frames;
-        root.borders(self.layout_area).into_iter().find(|b| {
-            let (along, across) = match b.axis {
-                crate::layout::Axis::Row => (col, row),
-                crate::layout::Axis::Column => (row, col),
-            };
-            let on_line = if frames { along >= b.pos.saturating_sub(2) && along <= b.pos } else { along == b.pos };
-            on_line && across >= b.span.0 && across < b.span.1
-        })
+        root.borders(self.layout_area).into_iter().find(|b| b.grabbed_at(col, row, frames))
     }
 }
 
