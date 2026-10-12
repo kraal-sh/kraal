@@ -10,6 +10,8 @@
 //! over the cells (see [`paint`]); for the others, the cells render blank.
 
 mod diacritics;
+#[cfg(test)]
+mod fuzz;
 pub mod paint;
 pub mod quantize;
 mod scan;
