@@ -4,16 +4,26 @@ How kraal is organised, and how a workspace is declared once in a file and opene
 
 ## Concepts
 
-- A **session** is one background server (`kraal -s work` for another one). It owns the processes;
-  clients attach and detach.
-- A session holds **workspaces** (listed in the sidebar, which shows up once there is more than
-  the one workspace to see: other workspaces, agents, ports, tunnels), each with **tabs** (named
+- A **session** is one background server. It owns the processes; clients attach and detach.
+  `kraal` uses the session `main`; `kraal -s work` (or `KRAAL_SESSION_NAME=work` in the
+  environment) another one, and inside a pane every command uses that pane's session.
+- A session holds **workspaces** (listed in the sidebar, which shows up once it has something to
+  list: another workspace, a workspace file, agents, ports, tunnels), each with **tabs** (named
   after their focused pane until you rename them), each with **panes**:
   tiled (some may share a place as a stack, one open at a time), or floating on top.
 - A pane is a terminal (a shell, or a command such as `ssh host`), or a **preview** of a file:
   rendered Markdown, an image, text, or a directory listing. Previews reload when the file changes.
 - A **command pane** stays open when its program exits, showing the exit code: press Enter to run
   it again (handy when an SSH connection drops) or `x` to close it.
+
+| Command | |
+|---|---|
+| `kraal` | attaches to the session, starting it if needed |
+| `kraal shop` (or `kraal attach shop`) | the same, on the workspace `shop`, opened from its file if it is not open |
+| `kraal ls` | lists the sessions: running, with the kraal each one runs, or saved |
+| `kraal kill` | stops the session's server and its programs; the layout is saved |
+| `kraal restart` | restarts the server on the kraal installed now (see below) |
+| `kraal forget` | deletes what a stopped session saved |
 
 ## Persistence
 
@@ -29,19 +39,21 @@ with every program in it, as `kraal kill` does, and each attached terminal ends 
 `[kraal: stopped; kraal starts it again with its layout]`. A session that cannot be saved is not
 stopped: it keeps running, and the quit says why (`kraal kill` stops it all the same).
 
-When the last pane of the last workspace ends (`exit` in the last shell), the session ends with it,
-as in tmux and Zellij: nothing runs any more, so nothing is asked, the attached terminals end, and
-the next `kraal` starts a new session. A command pane that stays open to show how its program
-ended has not ended: the session goes on until that pane is closed.
+When the last pane of the last workspace ends (`exit` in the last shell), the session ends with
+it: nothing runs any more, so nothing is asked, the attached terminals end with
+`[kraal: the last pane closed, so kraal stopped]`, nothing stays saved, and the next `kraal`
+starts a new session. A command pane that stays open to show how its program ended has not ended:
+the session goes on until that pane is closed.
 
 `kraal restart` (or `ctrl+b W r`) restarts a session's server on the kraal installed now, after an
 update for instance: the server saves the session and stops, and a new one starts and brings it
 back as above. First it lists the programs that would stop (a shell at its prompt runs nothing; an
-agent in the middle of a turn loses that turn; jobs left in the background stop) and asks; `--yes`
-does not ask. A session that cannot be saved (a full disk) is not restarted: it keeps running, and
-the restart says why. Attached terminals wait for the new server and come back to the workspace
-they showed. Run from a pane of the session, the command stays in that pane until the restart
-closes it.
+agent in the middle of a turn loses that turn; jobs left in the background stop) and asks, yes by
+default when nothing would stop; `kraal restart --yes` does not ask. Without a terminal to ask on
+(a script), it restarts when nothing would stop and fails otherwise. A session that cannot be
+saved (a full disk) is not restarted: it keeps running, and the restart says why. Attached
+terminals wait for the new server and come back to the workspace they showed. Run from a pane of
+the session, the command stays in that pane until the restart closes it.
 
 Each pane also shows again what it showed, scrollback and colours included, down to a dim
 `kraal: restored from <time>` line; what runs in it now writes below that line. Copy mode and
@@ -60,7 +72,8 @@ not saved unless `[buffers] persist = true` ([Configuration](configuration.md)).
 
 ## Workspace files
 
-Workspaces live in `~/.config/kraal/workspaces/*.kdl`, in KDL:
+Workspaces live in `~/.config/kraal/workspaces/*.kdl` (and in the directories `workspace_dirs`
+names in the configuration), in KDL:
 
 ```kdl
 layout {
@@ -80,11 +93,25 @@ layout {
 }
 ```
 
-`split_direction="vertical"` places children side by side, `"horizontal"` one above the other.
-Sizes are percentages or cells. Besides a command, a pane can say `agent="<name>"` to start an
-agent in a shell, or `preview="<path>"` to show a file.
+`layout` holds tabs, or panes directly when one tab is enough. What they take:
 
-`stacked=true` makes a pane's children a stack, as in Zellij: they share its place, one open and
+| Command | |
+|---|---|
+| `cwd "~/Dev/api"` in `layout`, `cwd="docs"` on a tab or a pane | where panes start; a relative one is taken from the one around it |
+| `name="db"` on a tab or a pane | its name; a pane without one is named after what runs in it |
+| `focus=true` on a tab or a pane | the tab shown, the pane focused, when the workspace opens |
+| `split_direction="vertical"` on a tab or a pane with panes in it | they go side by side; `"horizontal"` (the default), one above the other |
+| `size="60%"` or `size=40` on a pane | its share of the split it is in, in percent or in cells |
+| `command="ssh"` with `{ args "-p" "2222" "host"; }` | the program the pane runs instead of a shell, and its arguments |
+| `start_suspended=true` · `close_on_exit=true` | the command waits for Enter before it runs · the pane closes when it exits |
+| `agent="claude"` (or `"claude:pro"`), with `args` if needed | a shell that starts that agent, on the account the rules pick (or the one named) |
+| `preview="README.md"` | a preview of that file instead of a terminal |
+| `stacked=true` on a pane with panes in it | they are a stack (below) |
+| `floating_panes { pane … }` in a tab | panes floating over the others |
+
+What kraal does not know in a file is left out, and `kraal config check` says which line.
+
+`stacked=true` makes a pane's children a stack: they share its place, one open and
 the others folded to the top line of their frame ([Stacks and layouts](keys.md#stacks-and-layouts)).
 The focused child is the one open, else the one marked `expanded=true`, else the first:
 
@@ -100,6 +127,16 @@ layout {
     }
 }
 ```
+
+From the command line:
+
+| Command | |
+|---|---|
+| `kraal workspaces` | the open workspaces with their tabs, panes and agents, and the files not open (`--json` for scripts) |
+| `kraal open shop` | starts the workspace `shop` from its file, or switches to it, without attaching |
+| `kraal save` | writes the layout of the workspace on screen to its file |
+| `kraal save --workspace shop` | the same for the workspace you name |
+| `kraal save shop-2` | writes it under that name |
 
 `ctrl+b W s` or `kraal save` writes the layout back to the workspace's file, stacks included. A
 workspace that has none yet gets one in the definitions directory: `<its name>.kdl`, or the name

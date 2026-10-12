@@ -15,14 +15,19 @@ Qoder (`qoder`), CodeBuddy (`codebuddy`), Junie (`junie`), LLxprt Code (`llxprt`
 (`acli rovodev run`). It infers their state from the screen: the interrupt hint an agent shows
 while it works, the permission prompt or question it shows while it waits for you.
 
-For exact states, install kraal's hooks in the agent:
+For exact states, install kraal's hooks in the agent. For Claude Code, this adds hooks to
+`~/.claude/settings.json` and keeps a backup:
 
 ```sh
-kraal integration install claude   # adds hooks to ~/.claude/settings.json (backup kept)
-kraal integration install gemini
-kraal integration install all      # Claude Code, Codex, and every agent below used here
-kraal integration status
+kraal integration install claude
 ```
+
+| Command | |
+|---|---|
+| `kraal integration install gemini` | the same for another agent of the table below |
+| `kraal integration install all` | Claude Code, Codex, and every agent below used here |
+| `kraal integration status` | says what is installed, for the agents and for [your shells](terminal.md#shell-commands) |
+| `kraal integration uninstall claude` | takes kraal's entries out again |
 
 | Agent | `install …` | What kraal changes |
 |---|---|---|
@@ -54,9 +59,10 @@ covers Claude Code and Codex, and each other agent whose directory exists (`~/.g
 
 The hooks do nothing outside kraal. Some agents run another agent's hooks (Cursor and Continue
 run Claude Code's): kraal ignores a hook for an agent other than the one running in its pane. An
-agent whose hooks report is followed even under a wrapper kraal does not recognise
-(`bash -c 'opencode; …'`): until its hooks say the session ended, or, for OpenCode and Kilo,
-whose plugins cannot say it, until the process the plugin runs in ends.
+agent whose hooks tell every state (those of the table but Gemini CLI, Codex, Cursor CLI and
+Augment) is followed even under a wrapper kraal does not recognise (`bash -c 'opencode; …'`):
+until its hooks say the session ended, or, for OpenCode and Kilo, whose plugins cannot say it,
+until the process the plugin runs in ends.
 States are shown as coloured dots, with the state written
 next to them in the sidebar and in pane frames: yellow working, red blocked (waiting for you), green
 done (not seen yet), `○` idle. A blocked or finished agent you are not
@@ -67,11 +73,13 @@ The agents of kraal sessions on your servers are listed too, after the server's 
 `kraal agents` lists them with their server, and their changes of state are `agent.*` events with
 a `server` field, for scripts and hooks: see [Scripting](scripting.md).
 
-When the server restarts, panes that ran an agent with a known session resume it
-(`claude --resume <id>`, `codex resume <id>`). A prompt given on the command line is never sent
-again, and a one-shot run (`claude -p`, `codex exec`) is not resumed. When kraal cannot tell an
-option's value from a prompt (an option it does not know), the pane shows the command and waits:
-Enter runs it as shown. The same goes for Enter on an ended agent and for an account switch.
+When the server restarts, panes that ran Claude Code or Codex with a known session resume it
+(`claude --resume <id>`, `codex resume <id>`), with the options they were started with. A prompt
+given on the command line is never sent again: the pane then shows the command that resumes,
+without the prompt, and waits for Enter. A one-shot run (`claude -p`, `codex exec`) is not
+resumed: it waits for Enter as any other command does. When kraal cannot tell an option's value
+from a prompt (an option it does not know), the pane also shows the command and waits: Enter runs
+it as shown. The same goes for Enter on an ended agent and for an account switch.
 
 ## Worktrees
 
@@ -87,19 +95,25 @@ what would be lost (uncommitted changes, commits the base does not have, ignored
 own) and which panes it closes. Account rules written for the repository also apply in its
 worktrees.
 
-```sh
-kraal wt new fix-login --agent claude   # the same from the command line
-kraal wt list                      # with each worktree's number
-kraal wt rm fix-login              # refuses if it would lose changes, unmerged commits or ignored files
-kraal wt rm fix-login --force      # removes anyway
-kraal wt prune                     # removes those merged into their base and clean (--dry-run)
-kraal wt prune --discard-ignored   # also those whose only leftovers are ignored files
-```
+| Command | |
+|---|---|
+| `kraal wt new fix-login --agent claude` | the same from the command line (without `--agent`, the worktree alone) |
+| `kraal wt new fix-login --base main` | from that branch instead of the one checked out |
+| `kraal wt list` | this repository's worktrees, with each one's number |
+| `kraal wt rm fix-login` | removes one with its branch; refuses if it would lose changes, unmerged commits or ignored files, or while panes work in it |
+| `kraal wt rm fix-login --discard-ignored` | removes it with ignored files of its own |
+| `kraal wt rm fix-login --force` | removes anyway, closing the panes that work in it |
+| `kraal wt prune` | removes those merged into their base and clean |
+| `kraal wt prune --dry-run` | only says which ones would go |
+| `kraal wt prune --discard-ignored` | also those whose only leftovers are ignored files |
+
+A worktree's name takes letters, digits, `-`, `_` and `.`. The agent kraal starts in one is
+Claude Code or Codex, the two it has accounts for; any other runs there once you start it.
 
 **Preparation.** A new worktree has no `.env` and no `node_modules`. A repository says how to
 prepare its worktrees in `.kraal/worktree.toml`, read from the commit the worktree starts from:
 
-```toml
+```toml worktree
 copy = [".env*", "config/master.key"]   # from the main checkout, when they are there
 setup = ["npm ci", "npm run db:migrate"]
 ```
@@ -108,7 +122,9 @@ setup = ["npm ci", "npm run db:migrate"]
 whole, without the links in it. A file already in the worktree stays as it is, and nothing is
 copied through a link out of the repository, nor written through one. `setup` runs in the new
 worktree, in the agent's pane, before the agent starts; the first command that fails stops the
-setup, and the agent then waits for Enter. These commands come from the repository: like its
+setup, and the agent then waits for Enter. With `kraal wt new`, the setup runs in the terminal
+you typed it in: a command that fails there fails `kraal wt new`, the worktree stays, and the
+agent is not started. These commands come from the repository: like its
 runbooks, they run only once you have approved that version of the file (kraal shows them and
 asks again when the file changes), with control and invisible characters written out (`\u{1b}`,
 `\r`), so what you approve is what runs. `kraal wt new` asks in the terminal; `--yes` approves,
@@ -120,8 +136,8 @@ repository's.
 it checks out (another branch, a detached HEAD) and reused once the worktree is gone. Panes opened
 in it get `$KRAAL_WORKTREE` (its name), `$KRAAL_WORKTREE_INDEX` and `$KRAAL_PORT_OFFSET` (the
 number times `port_step`, 10 by default), and `$PORT` when `[worktrees]` sets `port_base`, even
-when opened with `kraal run --cwd` in a worktree the session has not seen yet, so the same dev
-server can run in several worktrees at once:
+when `kraal run` opens them with `--cwd` in a worktree the session has not seen yet, so the same
+dev server can run in several worktrees at once:
 `npm run dev -- --port $((5173 + KRAAL_PORT_OFFSET))`. The sidebar's PORTS section names the
 worktree a port is served from.
 
@@ -152,27 +168,43 @@ Each account is a separate config directory for an agent (`CLAUDE_CONFIG_DIR` fo
 `CODEX_HOME` for Codex), logged in with the agent's own login. kraal never reads or stores
 credentials; it chooses which directory a pane starts with and reads the usage the agents report.
 
+Accounts are for Claude Code and Codex. A second Claude subscription, named `pro`, in a new
+directory where kraal then runs `claude auth login`:
+
 ```sh
-kraal accounts add claude pro          # new directory, then `claude auth login` in it
-kraal accounts add codex work          # new directory, then `codex login` in it
-kraal accounts                         # every account: logged in?, 5-hour and weekly usage
-kraal agent claude                     # start Claude on the account the rules pick
-kraal agent codex --account work --right
-kraal accounts limits --threshold 85 --mode ask
-kraal accounts rename claude:pro work  # rules and usage follow, the directory stays
+kraal accounts add claude pro
 ```
 
-Your existing setup is the `default` account of each agent. New Claude accounts share
+| Command | |
+|---|---|
+| `kraal accounts add codex work` | the same for Codex, with `codex login` |
+| `kraal accounts add claude team --home ~/claude-team --no-login --threshold 80` | in a directory you choose (`~/.local/share/kraal/accounts/claude-team` otherwise), without logging in now, with a threshold of its own |
+| `kraal accounts` | every account: logged in or not, 5-hour and weekly usage (`kraal accounts list --json` for scripts) |
+| `kraal accounts login claude:pro` | logs an account in again |
+| `kraal accounts rename claude:pro work` | renames it: rules and usage follow, the directory stays |
+| `kraal accounts rm claude:work` | forgets it; its directory is kept |
+| `kraal accounts limits --threshold 85 --mode ask` | sets the threshold and what happens there (below) |
+| `kraal agent claude` | starts Claude Code on the account the rules pick, in a new pane (in this terminal outside kraal) |
+| `kraal agent codex --account work --right` | on that account, in a split on the right (`--down`, `--floating` and `--tab` place it too; `--here` runs it in this terminal even inside kraal) |
+| `kraal agent claude -- --model opus` | what follows `--` goes to the agent |
+
+Your existing setup is the `default` account of each agent (`kraal accounts add` with `--home`
+set to the agent's own directory gives it another name). New Claude accounts share
 `CLAUDE.md`, `settings.json`, skills, plugins, memory and conversations with it, so a conversation
 can continue on another account; Codex accounts share nothing, as Codex keeps databases in its home.
+An agent kraal starts on an account gets `$KRAAL_ACCOUNT` (`claude:pro`), and not the API keys of
+your environment (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`…), which would bill another account.
 
-The agent picker (`ctrl+b a`) lists every account; Tab on one shows what can be done with it: start
-it, log in again, rename it or remove it. Renaming changes the rules that name the account and
-keeps its usage; its directory stays where it is, and agents running on it go on, shown under the
-new name. A rule for every agent that also names another agent's account of the old or the new
-name stays theirs: the renamed account gets a rule of its own just before it. `default`, the
-agent's own home, keeps its name. The sidebar lists every account at the bottom, with its usage
-once some is seen.
+The agent picker (`ctrl+b a`) lists every account, and offers to add one; Tab on an account shows
+what can be done with it, each also on its own key: start it in a new tab (`ctrl+t`), log in again
+(`ctrl+l`), rename it (`ctrl+r`) or remove it (`ctrl+x`). Renaming changes the rules that name the
+account and keeps its usage; its directory stays where it is, and agents running on it go on,
+shown under the new name. A rule for every agent that also names another agent's account of the
+old or the new name stays theirs: the renamed account gets a rule of its own just before it.
+`default`, the agent's own home, keeps its name. The sidebar lists every account at the bottom
+(`claude·pro 42%`): the higher of its 5-hour and weekly usage, in yellow from 70% and in red at
+its threshold, or `not used yet`. `ctrl+b A c` moves the focused pane's agent to another account
+of the same agent.
 
 **Usage.** Claude Code passes the 5-hour and weekly usage to its status line;
 `kraal integration install claude` puts a small status line in front of yours that records it,
@@ -182,7 +214,7 @@ limit") count too.
 
 **Rules and thresholds** live in `~/.config/kraal/accounts.toml` (`kraal accounts edit`):
 
-```toml
+```toml accounts
 [limits]
 threshold = 90        # percent of the 5-hour or weekly window
 mode = "ask"          # notify | ask | auto
@@ -193,14 +225,21 @@ agent = "claude"
 accounts = ["pro", "default"]   # in order of preference
 ```
 
-A new agent starts on the first account of the matching rule that is under its threshold; when
+The file also holds the accounts themselves, one `[[account]]` each (`name`, `agent`, `home`,
+and a `threshold` of its own if it has one), which `kraal accounts add` writes.
+
+The first rule that matches decides. A new agent starts on the first account of that rule that is
+under its threshold (when all are over, the one whose usage resets first); when
 the matching rule names no account that exists any more, no account is used there (rather than
-any). The name `default` is the account in the agent's own home (`~/.claude`, `~/.codex`). When
+any). Without a matching rule, every account of the agent may be used, `default` first. The name
+`default` is the account in the agent's own home (`~/.claude`, `~/.codex`). When
 the account of a running agent reaches its threshold, kraal notifies you (`notify`), offers to
 continue the conversation on another account once the agent finished its turn (`ask`), or does it
 by itself at the end of the turn (`auto`). `auto` only switches when the agent's own hooks said
-its turn ended (`kraal integration install`); without them, kraal asks instead, since restarting
-an agent mid-turn would lose its work. A Claude conversation continues on the other account; a
+its turn ended, which Claude Code's do (`kraal integration install claude`) and Codex's cannot;
+otherwise kraal asks instead, since restarting an agent mid-turn would lose its work. Limits are
+watched for the agents kraal started on an account (the picker, `kraal agent`, a workspace file),
+not for one you typed in a shell. A Claude conversation continues on the other account; a
 Codex one cannot (its history stays in its account's directory), so switching starts a new one.
 Workspace files can say `agent="claude"` (rules apply) or `agent="claude:pro"`.
 

@@ -124,12 +124,12 @@ layout {
 
 Every pane knows its session, so scripts and agents drive kraal from inside it:
 
-```sh
-kraal run --right --name tests -- cargo test     # a new pane; prints its id
-kraal wait -p api --until blocked,done           # until the agent in "api" needs you
-kraal exec @prod -- uptime                       # on every server of a group, in parallel
-kraal events agent.blocked pane.failed           # what happens, as JSON lines
-```
+| Command | |
+|---|---|
+| `kraal run --right --name tests -- cargo test` | a new pane; prints its id |
+| `kraal wait -p api --until blocked,done` | until the agent in "api" needs you |
+| `kraal exec @prod -- uptime` | on every server of a group, in parallel |
+| `kraal events agent.blocked pane.failed` | what happens, as JSON lines |
 
 `[hooks]` runs a command on any event: ping your phone when an agent is blocked, log every SSH
 connection to production. [Scripting, events and hooks](docs/scripting.md)
@@ -146,7 +146,8 @@ connection to production. [Scripting, events and hooks](docs/scripting.md)
 [Runbooks](docs/runbooks.md) ·
 [Shell integration and images](docs/terminal.md) ·
 [Scripting, events and hooks](docs/scripting.md) ·
-[Configuration](docs/configuration.md)
+[Configuration](docs/configuration.md) ·
+[Compatibility](docs/compatibility.md)
 
 ## The name
 
@@ -169,8 +170,11 @@ Bug reports and ideas are welcome in the [issues](https://github.com/kraal-sh/kr
 
 ## Development
 
+The unit and end-to-end tests, which also check these pages against the program (every command
+line, key, setting and example they quote):
+
 ```sh
-cargo test        # unit and end-to-end tests
+cargo test
 ```
 
 ## License

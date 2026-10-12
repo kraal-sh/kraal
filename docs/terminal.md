@@ -22,16 +22,23 @@ A new pane width, or a program that scrolls only part of the screen, moves lines
 cannot follow: the earlier prompts can no longer be jumped to, but how each command ended stays.
 
 Shells do not send the marks by themselves (fish 4 does). kraal adds a few lines to your shell's
-startup file, active only in kraal's panes, when you ask:
+startup file, active only in kraal's panes, when you ask (here for zsh; `bash`, 4.4 and later,
+and `fish` work the same):
 
 ```sh
-kraal integration install zsh      # or bash (4.4 and later), fish; a backup is kept
-kraal integration show zsh         # the lines, for a startup file you keep yourself
-kraal integration uninstall zsh
+kraal integration install zsh
 ```
 
-A startup file that is a link (dotfiles kept in a repository) stays a link: the file it points to
-changes, and the backup goes next to the link.
+| Command | |
+|---|---|
+| `kraal integration show zsh` | prints the lines, for a startup file you keep yourself |
+| `kraal integration status zsh` | says whether they are installed |
+| `kraal integration uninstall zsh` | takes them out again |
+
+The startup file is copied next to itself first (`.kraal-bak`); fish gets a file of kraal's own
+(`~/.config/fish/conf.d/kraal.fish`), so there is nothing to copy. A startup file that is a link
+(dotfiles kept in a repository) stays a link: the file it points to changes, and the backup goes
+next to the link.
 
 ### Over SSH
 
@@ -58,7 +65,7 @@ context written on one line (`context: {namespace: web}`) included; a kubeconfig
 way (JSON, anchors and merge keys, braces over several lines) is `?`, never a context without its
 namespace.
 
-Some shells do not report: one inside tmux or screen on the server, one started by `sudo -i` or
+Some shells do not report: one inside another multiplexer on the server, one started by `sudo -i` or
 `su -`, one on a server without these lines reached from the first. When such a shell marks its
 prompts (fish 4 does by itself), kraal forgets what the shell before it reported; otherwise that
 stays until the next report or the end of the session.
@@ -79,7 +86,7 @@ way it has:
 | --- | --- |
 | Ghostty, kitty | kitty graphics over Unicode placeholders: the terminal moves and cuts them itself |
 | One whose device attributes report sixel: foot, WezTerm, Konsole, iTerm2, mlterm, Windows Terminal 1.22 or later, xterm started with `-ti vt340` | sixel, drawn by kraal over the image's cells |
-| Others, such as Alacritty or Terminal.app | none: the image's cells stay blank, and programs in panes are told no images can be shown, as a terminal without them would; previews draw their image with half blocks |
+| Others, such as Alacritty or Terminal.app | none: the image's cells stay blank, and programs in panes are told no images can be shown, as a terminal without them would (unless another terminal attached to the session draws them); previews draw their image with half blocks |
 
 With sixel:
 
@@ -103,8 +110,10 @@ And everywhere:
   large one takes its place in the pane at once, what follows it goes on, and it shows when it is
   decoded (a fraction of a second for the largest).
 - `[graphics] memory_mb` (256 by default) bounds the memory all panes keep for images, the data
-  of those still to decode included; the oldest go first. A preview whose image does not fit in what is left draws it with half blocks. The
+  of those still to decode included. A pane that adds an image past it loses its own oldest
+  images, never another pane's, and the image is refused when it has none left to give up. A
+  preview whose image does not fit in what is left draws it with half blocks. The
   images ready to draw as sixel take at most a quarter of that again. `enabled = false` turns
   images off: their sequences then reach the emulator, which ignores them, and previews draw their
-  image with half blocks.
+  image with half blocks. Both settings are read when the session starts.
 - Not supported: animations, images under the text (negative z-index), offsets within a cell.

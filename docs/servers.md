@@ -6,7 +6,7 @@ Every machine you SSH to, at hand: an inventory, file transfers in every directi
 
 kraal keeps an inventory in `~/.config/kraal/servers.toml`:
 
-```toml
+```toml servers
 [[server]]
 name = "db"
 host = "db.lan"
@@ -15,44 +15,62 @@ port = 2222          # optional; without it, ~/.ssh/config decides (so 22 is not
 jump = "bastion"     # optional ProxyJump, by name or user@host; a jump host with its own key works too; "none" turns off one from ~/.ssh/config
 identity = "~/.ssh/db"  # optional; more_identities = ["~/.ssh/other"] for keys tried after it
                         # ("IdentityFile=%d/.ssh/%h" passes ssh's option, tokens and all, not -i)
-groups = ["prod"]
+groups = ["staging"]
+env = "staging"      # optional: its stage; "prod" makes it production (see Production)
+note = "primary"     # optional: your own text, kept
 agents = "main"      # optional: list the agents of the kraal session "main" there (see below)
 ```
 
-It also knows the `ssh` panes of your workspace files (grouped by workspace) and the hosts of
-`~/.ssh/config`. When you `ssh` somewhere new, from the picker or typed in any pane, kraal saves
-it in the group `discovered`.
+Only `name` and `host` are needed, and a name is given once. kraal writes this file again when it
+changes it (a server added, removed or discovered): the entries stay as they are, comments do
+not.
 
-```sh
-kraal servers                          # everything kraal knows, with where it comes from
-kraal servers add admin@db.lan:2222 --name db --group prod
-kraal servers import                   # copy the servers of your workspace files into the inventory
-kraal servers edit                     # open servers.toml in $VISUAL or $EDITOR
-kraal ssh db                           # plain ssh, resolved from the inventory
-kraal ssh prod --group                 # every server of "prod" in a grid of panes
-```
+It also knows the `ssh` panes of your workspace files (grouped by workspace) and the hosts of
+`~/.ssh/config` (the group `ssh-config`; `ssh_config_hosts = false` in the configuration leaves
+them out). When you `ssh` somewhere new, from the picker or typed in any pane, kraal saves
+it in the group `discovered`, unless `[servers] auto_add = false`.
+
+| Command | |
+|---|---|
+| `kraal servers` | everything kraal knows, with where it comes from (`kraal servers list --group prod` for one group, `--json` for scripts) |
+| `kraal servers add admin@db.lan:2222 --name db --group prod` | adds a server; `--jump bastion`, `--identity ~/.ssh/db`, `--env prod`, `--note` and `--agents main` set the fields above |
+| `kraal servers rm db` | removes one |
+| `kraal servers import` | copies the servers of your workspace files into the inventory |
+| `kraal servers edit` | opens servers.toml in `$VISUAL` or `$EDITOR` |
+| `kraal ssh db` | plain ssh, resolved from the inventory; inside kraal, `--right`, `--down`, `--floating` or `--tab` open it in a new pane instead |
+| `kraal ssh prod --group` | every server of "prod" in a grid of panes, in a workspace of that name |
+
+`kraal servers add` leaves an address that is already saved as it is, but for `--agents`: change
+its other fields with `kraal servers edit`.
 
 `ctrl+b s` opens the same list: Enter connects (or opens a whole group); Tab shows the other
-actions: connect in a new tab, browse its files, run a command, forward a port, edit the list,
-remove a saved server.
+actions, each also on its own key: connect in a new tab (`ctrl+t`), browse its files (`ctrl+f`),
+run a command on it (`ctrl+r`), forward one of its ports (`ctrl+o`), edit the list (`ctrl+e`),
+remove a saved server (`ctrl+x`).
+
+kraal's own connections to a server (a pane opened from the picker or `kraal ssh`, a transfer, a
+tool, the file manager) share one SSH connection, so the second one starts at once and asks for
+no password; `[servers] multiplex = false` turns that off. An `ssh` you type yourself is yours.
 
 ## Copying files
 
-Copying files works in every direction and reuses the SSH connection of open panes:
+Copying files works in every direction and reuses the SSH connection kraal has to the server:
 
-```sh
-kraal cp report.pdf db:/tmp/           # upload (files and directories)
-kraal cp db:/var/log/app.log .         # download
-kraal cp web:/srv/data db:~/backup/    # server to server, streamed through this machine
-kraal cp --move a.tar db:/srv/         # copy, then delete what was copied
-kraal cp --dry-run …                   # show the rsync/tar/ssh commands
-kraal rm db:/tmp/old.tar               # delete, locally or on a server
-```
+| Command | |
+|---|---|
+| `kraal cp report.pdf db:/tmp/` | upload (files and directories) |
+| `kraal cp db:/var/log/app.log .` | download |
+| `kraal cp web:/srv/data db:~/backup/` | server to server, streamed through this machine |
+| `kraal cp --move a.tar db:/srv/` | copy, then delete what was copied |
+| `kraal cp --no-replace report.pdf db:/tmp/` | refuses, saying what is there, when the copy would replace something in the destination (`--allow report.pdf` lets that name be replaced all the same) |
+| `kraal cp --dry-run …` | only shows the rsync, tar and ssh commands |
+| `kraal rm db:/tmp/old.tar` | deletes files and directories, here or on a server, without asking |
 
 A move deletes only what rsync copied (a file is compared by content), renames instead on one file
 system, and refuses when the destination is the source itself, even seen through a link or a
 server that shares this machine's files. On a server, a move between two file systems is refused:
-copy, then delete.
+copy, then delete. A copy that was interrupted keeps what it had in a `.kraal-partial-…`
+directory in the destination, and the same command again goes on from it.
 
 ## The file manager
 
@@ -64,10 +82,12 @@ replace is never replaced, even if it appears during the copy: that copy then wa
 `.kraal-stage-…` directory in the destination, and kraal never removes one it cannot tell is over
 (a move's, the only copy of what it moved, is named instead); a directory is put in place by a
 rename that keeps it whole (owner, permissions, ACLs), which on a server takes GNU coreutils 8.30
-or later: elsewhere such a copy says so before it starts), `m` moves, `d` deletes, `enter`
-opens a directory or previews a local file, `e` edits a file in your `$VISUAL` or `$EDITOR` (a
-server's too, see below), `s` opens a shell there, `/` filters. Selected files carry a ✓.
-Transfers run in a small window that closes itself when done.
+or later: elsewhere such a copy is refused before it starts), `m` moves and `d` deletes (both ask
+first), `enter` opens a directory or previews a local file, `e` edits a file in your `$VISUAL` or
+`$EDITOR` (a server's too, see below), `s` opens a shell there, `/` filters, `.` shows hidden
+files, `r` reads the directory again, `tab` goes to the other panel, `backspace` to the directory
+above, and `q` closes. Selected files carry a ✓. Transfers run in a small window that closes
+itself once done, and stays open to show why when one failed.
 
 Drop a file from your file manager on an SSH pane and kraal offers to upload it to that server
 (`ctrl+p` pastes the path instead). `ctrl+b S d` downloads a path from the pane's server
@@ -75,11 +95,11 @@ Drop a file from your file manager on an SSH pane and kraal offers to upload it 
 
 ## Editing a file on a server
 
-```sh
-kraal edit db:/etc/app.conf            # in your $VISUAL or $EDITOR, in a floating pane
-kraal edit db:app/.env --line 12       # a path relative to the home directory there
-kraal edit db:/etc/nginx/nginx.conf --sudo   # as root, through sudo there
-```
+| Command | |
+|---|---|
+| `kraal edit db:/etc/app.conf` | opens the file in your `$VISUAL` or `$EDITOR`, in a floating pane |
+| `kraal edit db:app/.env --line 12` | a path relative to the home directory there, at that line |
+| `kraal edit db:/etc/nginx/nginx.conf --sudo` | as root, through sudo there |
 
 `e` on a server's file in the file manager does the same, and so does Tab then the label of a
 path in an SSH pane ([hints](tools.md#hints)): the path is on that pane's server, in its
@@ -109,19 +129,22 @@ asks for more than a password (a one-time code), or that requires a terminal, is
 
 ## Fleet tools
 
-```sh
-kraal exec @prod -- uptime                       # run on every server of a group, in parallel
-kraal exec web01 db -- 'df -h | grep /dev'       # or on named servers; --json for scripts
-kraal ssh @prod --group -- journalctl -fu nginx  # one pane per server running it, in a grid
-kraal tunnel add db 5432                         # localhost:5432 → db's 5432, kept open
-kraal tunnel add bastion db.internal:5432 --local 15432
-kraal tunnel list
-kraal tunnel rm 15432                            # by local port (`#7` for the tunnel with id 7)
-```
+| Command | |
+|---|---|
+| `kraal exec @prod -- uptime` | runs a command on every server of a group, in parallel, and shows each result |
+| `kraal exec web01 db -- 'df -h /var'` | or on named servers |
+| `kraal exec @prod --parallel 4 --timeout 10 --json -- uptime` | four servers at a time (16 by default), ten seconds each (60 by default), results as JSON |
+| `kraal ssh @prod --group -- journalctl -fu nginx` | one pane per server running it, in a grid |
+| `kraal tunnel add db 5432` | `localhost:5432` goes to db's 5432, and stays open |
+| `kraal tunnel add bastion db.internal:5432 --local 15432` | a port of a machine that server reaches, on the local port you choose |
+| `kraal tunnel list` | the tunnels and their state |
+| `kraal tunnel rm 15432` | closes one, by its local port |
 
-In the server picker (`ctrl+b s`), Tab then "Run a command" runs one on the selected server or
-group, and "Forward one of its ports" opens a tunnel. Tunnels come back after a restart and reconnect when the network
-drops; the sidebar lists them (click copies `localhost:PORT`, ctrl+click opens it in the browser).
+`kraal exec` never asks for a password (the servers must take your key), and fails when a server
+did. In the server picker (`ctrl+b s`), Tab then "Run a command on it" runs one on the selected
+server or group, and "Forward one of its ports" opens a tunnel. Tunnels come back after a restart
+and reconnect when the network drops; the sidebar lists them (click copies `localhost:PORT`,
+ctrl+click opens it in the browser).
 
 Ports that programs in your panes announce (`http://localhost:5173`) and listen on show up in the
 sidebar under PORTS; a click opens them.
@@ -131,12 +154,16 @@ sidebar under PORTS; a click opens them.
 Run kraal on a server and attach to it from your machine; the session reconnects by itself when
 the network drops, and its programs keep running on the server meanwhile:
 
-```sh
-kraal remote-install db                # copy this binary to db:~/.local/bin (same OS and CPU)
-kraal attach --host db                 # attach to db's kraal; ctrl+c gives up while reconnecting
-```
+| Command | |
+|---|---|
+| `kraal remote-install db` | copies this binary to `~/.local/bin` on db (same OS and CPU) |
+| `kraal attach --host db` | attaches to db's kraal; ctrl+c gives up while reconnecting |
+| `kraal attach --host db --pane api` | the same, showing that pane of the session first |
+| `kraal -s work attach --host deploy@db.lan:2222` | another session there, on a server named by its address |
 
-Ctrl+click on a link in a remote session opens it on your machine. A `localhost` address there is
+Attach from a terminal of your own: inside a kraal pane, `kraal attach` refuses to nest (the
+sidebar's agents and `alt+a` open such a tab for you, see below). Ctrl+click on a link in a
+remote session opens it on your machine. A `localhost` address there is
 the server's, not yours: kraal copies it and says so instead of opening the wrong page.
 
 ### Agents on your servers

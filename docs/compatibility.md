@@ -60,10 +60,11 @@ release's checksums, and runs `tests/compat.rs` with each: this kraal drives a s
 cannot do, kill, and a restart onto this kraal), and their commands drive a session of this kraal.
 CI runs it on Linux and macOS (attaching in a terminal is tested on Linux only).
 
-```sh
-tests/compat.sh                    # 0.2.0 and the latest release
-tests/compat.sh v0.2.0             # one release
-tests/compat.sh --build v0.2.0     # built from its tag instead (git fetch --tags first)
-```
+| Command | |
+|---|---|
+| `tests/compat.sh` | 0.2.0 and the latest release |
+| `tests/compat.sh v0.2.0` | one release |
+| `tests/compat.sh --build v0.2.0` | built from its tag instead (`git fetch --tags` first) |
 
-Raising the oldest supported release means changing `OLDEST` in `tests/compat.sh` and this page.
+Raising the oldest supported release means changing `OLDEST` in `tests/compat.sh` and this page;
+`cargo test` fails while the two differ.
