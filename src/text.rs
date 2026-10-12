@@ -171,9 +171,15 @@ pub fn local_minutes(secs: i64) -> String {
     s
 }
 
-/// How far local time is ahead of UTC at `secs`, in seconds.
 #[cfg(test)]
-#[allow(clippy::unnecessary_cast)] // `c_long` is not i64 everywhere.
-pub fn utc_offset(secs: i64) -> i64 {
-    local_tm(secs).map_or(0, |tm| tm.tm_gmtoff as i64)
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_wall_clock_time_read_as_local_shows_as_itself() {
+        // 2024-02-29 00:59:59 in UTC, then the instant that reads so in local time.
+        let wall = 1_709_168_399;
+        let offset = local_tm(wall).map_or(0, |tm| tm.tm_gmtoff);
+        assert_eq!(local_minutes(wall - offset), "2024-02-29 00:59");
+    }
 }

@@ -522,11 +522,6 @@ impl FilesPane {
         format!("files · {} ⇄ {}", left.location.short_display(), right.location.short_display())
     }
 
-    #[cfg(test)]
-    pub fn active(&self) -> Side {
-        self.active
-    }
-
     pub fn location(&self, side: Side) -> &Location {
         &self.panel(side).location
     }

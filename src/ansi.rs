@@ -121,16 +121,11 @@ impl Encoder {
         }
     }
 
-    /// Append the bytes that turn the previous frame into `next` to `out`.
-    #[cfg(test)]
-    pub fn encode(&mut self, next: &Buffer, cursor: Option<Cursor>, links: &Links, out: &mut Vec<u8>) {
-        self.encode_with_images(next, &[], cursor, links, &[], &[], out);
-    }
-
-    /// [`Encoder::encode`], with images drawn at the cursor (sixel): `erase` goes before the
-    /// cells are drawn, `images` after them, all in the same synchronized update. The cells of
-    /// `kept` are taken to be unchanged since the previous frame (where they can be skipped
-    /// without changing what the diff finds around them).
+    /// Append the bytes that turn the previous frame into `next` to `out`, with images drawn at
+    /// the cursor (sixel): `erase` goes before the cells are drawn, `images` after them, all in
+    /// the same synchronized update. The cells of `kept` are taken to be unchanged since the
+    /// previous frame (where they can be skipped without changing what the diff finds around
+    /// them).
     #[allow(clippy::too_many_arguments)]
     pub fn encode_with_images(
         &mut self,
@@ -528,6 +523,11 @@ mod tests {
     use ratatui::layout::Rect;
     use ratatui::style::Style;
 
+    /// A frame without images, nothing kept from the previous one.
+    fn encode(enc: &mut Encoder, next: &Buffer, cursor: Option<Cursor>, links: &Links, out: &mut Vec<u8>) {
+        enc.encode_with_images(next, &[], cursor, links, &[], &[], out);
+    }
+
     fn text(out: &[u8]) -> String {
         String::from_utf8_lossy(out).into_owned()
     }
@@ -539,14 +539,14 @@ mod tests {
         buf.set_string(0, 0, "hello", Style::default().fg(Color::Red));
         let mut enc = Encoder::new();
         let mut out = Vec::new();
-        enc.encode(&buf, None, &Links::new(), &mut out);
+        encode(&mut enc, &buf, None, &Links::new(), &mut out);
         let s = text(&out);
         assert!(s.contains("\x1b[2J"));
         assert!(s.contains("\x1b[31mhello"));
 
         buf.set_string(1, 0, "a", Style::default().fg(Color::Red));
         let mut out = Vec::new();
-        enc.encode(&buf, None, &Links::new(), &mut out);
+        encode(&mut enc, &buf, None, &Links::new(), &mut out);
         let s = text(&out);
         assert!(!s.contains("\x1b[2J"));
         assert!(s.contains("\x1b[1;2H\x1b[31ma"));
@@ -560,7 +560,7 @@ mod tests {
         buf.set_string(0, 0, "a", Style::default().add_modifier(Modifier::BOLD));
         buf.set_string(1, 0, "b", Style::default());
         let mut out = Vec::new();
-        Encoder::new().encode(&buf, None, &Links::new(), &mut out);
+        encode(&mut Encoder::new(), &buf, None, &Links::new(), &mut out);
         let s = text(&out);
         assert!(s.contains("\x1b[1ma\x1b[0mb"), "{s:?}");
     }
@@ -571,7 +571,7 @@ mod tests {
         let mut buf = Buffer::empty(area);
         buf.set_string(0, 0, "日x", Style::default());
         let mut out = Vec::new();
-        Encoder::new().encode(&buf, None, &Links::new(), &mut out);
+        encode(&mut Encoder::new(), &buf, None, &Links::new(), &mut out);
         let s = text(&out);
         assert!(s.contains("日x"), "{s:?}");
     }
@@ -582,11 +582,11 @@ mod tests {
         let mut enc = Encoder::new();
         let cur = Cursor { x: 2, y: 3, shape: CursorShape::Bar, blinking: false };
         let mut out = Vec::new();
-        enc.encode(&buf, Some(cur), &Links::new(), &mut out);
+        encode(&mut enc, &buf, Some(cur), &Links::new(), &mut out);
         let s = text(&out);
         assert!(s.contains("\x1b[6 q\x1b[4;3H\x1b[?25h"));
         let mut out = Vec::new();
-        enc.encode(&buf, Some(cur), &Links::new(), &mut out);
+        encode(&mut enc, &buf, Some(cur), &Links::new(), &mut out);
         assert!(!text(&out).contains(" q"));
     }
 
@@ -602,13 +602,13 @@ mod tests {
         }
         let mut enc = Encoder::new();
         let mut out = Vec::new();
-        enc.encode(&buf, None, &links, &mut out);
+        encode(&mut enc, &buf, None, &links, &mut out);
         let s = text(&out);
         assert!(s.contains("\x1b]8;;https://example.org\x1b\\\x1b[1;4Hhere\x1b]8;;\x1b\\"), "{s:?}");
         assert!(s.find("go").unwrap() < s.find("]8;;https").unwrap(), "text before the link is not linked");
         // Same text, link removed: the cells are drawn again without it.
         let mut out = Vec::new();
-        enc.encode(&buf, None, &Links::new(), &mut out);
+        encode(&mut enc, &buf, None, &Links::new(), &mut out);
         let s = text(&out);
         assert!(s.contains("here") && !s.contains("example.org"), "{s:?}");
     }
@@ -623,9 +623,9 @@ mod tests {
             Links::from([((0, 0), uri.clone()), ((1, 0), uri)])
         };
         let mut enc = Encoder::new();
-        enc.encode(&buf, None, &link("https://a.example"), &mut Vec::new());
+        encode(&mut enc, &buf, None, &link("https://a.example"), &mut Vec::new());
         let mut out = Vec::new();
-        enc.encode(&buf, None, &link("https://b.example"), &mut out);
+        encode(&mut enc, &buf, None, &link("https://b.example"), &mut out);
         let s = text(&out);
         assert!(s.contains("b.example\x1b\\\x1b[1;1H日"), "{s:?}");
         assert!(!s.contains("\x1b[1;2H"), "nothing is written over its second column: {s:?}");
@@ -657,10 +657,10 @@ mod tests {
         assert!(at("IMAGE") < at("\x1b[2;1H\x1b[?25h") && !s.contains('a') && !s.contains('c'), "{s:?}");
         // A wide character whose second half is erased is drawn again whole.
         buf.set_string(0, 1, "日", Style::default());
-        enc.encode(&buf, None, &Links::new(), &mut Vec::new());
+        encode(&mut enc, &buf, None, &Links::new(), &mut Vec::new());
         enc.redraw(Rect::new(1, 1, 1, 1), &buf);
         let mut out = Vec::new();
-        enc.encode(&buf, None, &Links::new(), &mut out);
+        encode(&mut enc, &buf, None, &Links::new(), &mut out);
         assert!(text(&out).contains("\x1b[2;1H日"), "{:?}", text(&out));
     }
 
@@ -705,7 +705,7 @@ mod tests {
             buf.set_string(0, y, "some text over the whole row", Style::default().fg(Color::Green));
         }
         let mut enc = Encoder::new();
-        enc.encode(&buf, None, &Links::new(), &mut Vec::new());
+        encode(&mut enc, &buf, None, &Links::new(), &mut Vec::new());
         buf[(7, 3)].set_char('X');
         let mut out = Vec::new();
         enc.encode_with_images(&buf, &kept_but(area, (7, 8, 3)), None, &Links::new(), &[], &[], &mut out);
@@ -722,7 +722,7 @@ mod tests {
         let mut buf = Buffer::empty(area);
         buf.set_string(0, 0, "abcdef", Style::default());
         let mut enc = Encoder::new();
-        enc.encode(&buf, None, &Links::new(), &mut Vec::new());
+        encode(&mut enc, &buf, None, &Links::new(), &mut Vec::new());
         enc.redraw(Rect::new(2, 0, 2, 1), &buf);
         let mut out = Vec::new();
         enc.encode_with_images(&buf, &kept_but(area, (0, 0, 9)), None, &Links::new(), &[], &[], &mut out);
@@ -824,11 +824,11 @@ mod tests {
                 links.insert((0, 0), Arc::from("https://example.org"));
             }
             let (mut told, mut whole) = (Encoder::new(), Encoder::new());
-            told.encode(&prev, None, &Links::new(), &mut Vec::new());
-            whole.encode(&prev, None, &Links::new(), &mut Vec::new());
+            encode(&mut told, &prev, None, &Links::new(), &mut Vec::new());
+            encode(&mut whole, &prev, None, &Links::new(), &mut Vec::new());
             let (mut a, mut b) = (Vec::new(), Vec::new());
             told.encode_with_images(&next, &kept, None, &links, &[], &[], &mut a);
-            whole.encode(&next, None, &links, &mut b);
+            encode(&mut whole, &next, None, &links, &mut b);
             assert_eq!(text(&a), text(&b), "case {case}: kept {kept:?}");
         }
         // A wide character made narrow redraws the column it covered, which is kept.
@@ -836,12 +836,12 @@ mod tests {
         let mut buf = Buffer::empty(area);
         buf.set_string(0, 0, "ab日cdef", Style::default().bg(Color::Blue));
         let (mut told, mut whole) = (Encoder::new(), Encoder::new());
-        told.encode(&buf, None, &Links::new(), &mut Vec::new());
-        whole.encode(&buf, None, &Links::new(), &mut Vec::new());
+        encode(&mut told, &buf, None, &Links::new(), &mut Vec::new());
+        encode(&mut whole, &buf, None, &Links::new(), &mut Vec::new());
         buf[(2, 0)].set_char('x');
         let (mut a, mut b) = (Vec::new(), Vec::new());
         told.encode_with_images(&buf, &[Kept { y: 0, x0: 3, x1: 8 }], None, &Links::new(), &[], &[], &mut a);
-        whole.encode(&buf, None, &Links::new(), &mut b);
+        encode(&mut whole, &buf, None, &Links::new(), &mut b);
         assert_eq!(text(&a), text(&b));
         assert!(text(&a).contains("\x1b[1;3H\x1b[44mx\x1b[49m "), "{:?}", text(&a));
     }

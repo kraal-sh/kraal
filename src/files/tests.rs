@@ -55,6 +55,12 @@ fn noop() -> Arc<dyn Fn() + Send + Sync> {
     Arc::new(|| {})
 }
 
+/// A pane whose remote listings run a program that cannot exist, so that a test never connects
+/// anywhere.
+fn offline(left: Location, right: Location) -> FilesPane {
+    FilesPane::with_ssh(left, right, noop(), Ssh { program: "kraal-test-no-ssh".to_owned(), timeout: SSH_TIMEOUT })
+}
+
 fn file(name: &str, size: u64) -> Entry {
     Entry { name: name.to_owned(), is_dir: false, is_link: false, size, mtime: 1_700_000_000, exact: true }
 }
@@ -99,7 +105,7 @@ fn inject_error(pane: &mut FilesPane, side: Side, message: &str) {
 
 /// Left: two directories, two files and a hidden file; right: empty.
 fn sample() -> FilesPane {
-    let mut pane = FilesPane::new(local(LEFT), local(RIGHT), noop());
+    let mut pane = offline(local(LEFT), local(RIGHT));
     let entries = vec![file("b.txt", 2048), dir("sub"), file(".hidden", 1), file("A.md", 1024), dir("Docs")];
     inject(&mut pane, Side::Left, local(LEFT), entries);
     inject(&mut pane, Side::Right, local(RIGHT), Vec::new());
@@ -330,11 +336,10 @@ fn shell_fallback_lists_exact_names() {
 
 #[test]
 fn formats_times_and_sizes() {
-    // Dates show in local time; a wall-clock time read as local shows as itself.
+    // Dates show in local time.
     let shown = local_minutes(1_700_000_000);
     assert_eq!((shown.len(), &local_datetime(1_700_000_000)[..16]), (16, shown.as_str()));
-    let wall = days_from_civil(2024, 2, 29) * 86_400 + 3_599;
-    assert_eq!(local_minutes(wall - utc_offset(wall)), "2024-02-29 00:59");
+    assert_eq!(days_from_civil(2024, 2, 29), 19_782);
     for days in [-800_000, -1, 0, 59, 11_016, 2_932_896] {
         let (y, m, d) = civil_from_days(days);
         assert_eq!(days_from_civil(y, m, d), days);
@@ -529,12 +534,12 @@ fn keys_map_to_actions() {
     assert_eq!(pane.key(FileKey::F(3)), preview);
     // Tab switches panels; the right one is empty.
     assert_eq!(pane.key(FileKey::Tab), FilesAction::None);
-    assert_eq!(pane.active(), Side::Right);
+    assert_eq!(pane.active, Side::Right);
     assert_eq!(pane.hints()[4].text, "copy ←");
     assert_eq!(pane.key(FileKey::Char('c')), FilesAction::None);
     assert_eq!(pane.key(FileKey::Char('o')), FilesAction::PickLocation(Side::Right));
     pane.key(FileKey::Tab);
-    assert_eq!(pane.active(), Side::Left);
+    assert_eq!(pane.active, Side::Left);
     for key in [FileKey::Char('q'), FileKey::Esc, FileKey::F(10)] {
         assert_eq!(pane.key(key), FilesAction::Close, "{key:?}");
     }
@@ -552,7 +557,7 @@ fn keys_map_to_actions() {
 
 #[test]
 fn remote_entries_are_copied_but_not_previewed() {
-    let mut pane = FilesPane::new(remote("/var/log"), local(RIGHT), noop());
+    let mut pane = offline(remote("/var/log"), local(RIGHT));
     let mut link = dir("current");
     link.is_link = true;
     inject(&mut pane, Side::Left, remote("/var/log"), vec![file("syslog", 10), link]);
@@ -572,7 +577,7 @@ fn remote_entries_are_copied_but_not_previewed() {
 
 #[test]
 fn e_edits_the_file_under_the_cursor() {
-    let mut pane = FilesPane::new(remote("/etc"), local(RIGHT), noop());
+    let mut pane = offline(remote("/etc"), local(RIGHT));
     let mut odd = file("caf\u{fffd}.conf", 1);
     odd.exact = false;
     inject(&mut pane, Side::Left, remote("/etc"), vec![dir("nginx"), file("hosts", 10), odd]);
@@ -676,7 +681,7 @@ fn narrow_areas_show_the_active_panel() {
 
 #[test]
 fn renders_loading_and_error_states() {
-    let mut pane = FilesPane::new(local(LEFT), remote("/var/log"), noop());
+    let mut pane = offline(local(LEFT), remote("/var/log"));
     let (_, text) = render(&mut pane, 80, 12);
     assert!(text[3].starts_with(" loading…") && text[3].contains("│ loading…"), "{text:#?}");
     // A refresh keeps the old entries and says so in the header.
@@ -745,9 +750,9 @@ fn mouse_selects_panels_and_entries() {
     let mut pane = sample();
     render(&mut pane, 80, 12);
     assert_eq!(pane.click(50, 3, false), FilesAction::None);
-    assert_eq!(pane.active(), Side::Right);
+    assert_eq!(pane.active, Side::Right);
     assert_eq!(pane.click(5, 4, false), FilesAction::None);
-    assert_eq!(pane.active(), Side::Left);
+    assert_eq!(pane.active, Side::Left);
     assert_eq!(cursor_name(&pane, Side::Left), "sub");
     assert_eq!(pane.click(5, 9, false), FilesAction::None, "below the last row");
     assert_eq!(cursor_name(&pane, Side::Left), "sub");
@@ -756,7 +761,7 @@ fn mouse_selects_panels_and_entries() {
     assert_eq!(pane.click(39, 6, true), FilesAction::None, "the separator");
     // Hints are buttons.
     assert_eq!(pane.click(2, 11, false), FilesAction::None);
-    assert_eq!(pane.active(), Side::Right);
+    assert_eq!(pane.active, Side::Right);
     let hints = pane.hints();
     let (start, _, _) = footer_layout(&hints, 80).into_iter().find(|&(_, _, i)| hints[i].label == "d").unwrap();
     assert_eq!(pane.click(start, 11, false), FilesAction::None, "nothing to delete on the right");
@@ -777,7 +782,7 @@ fn wheel_scrolls_the_panel_under_the_mouse() {
     inject(&mut pane, Side::Right, local(RIGHT), many);
     render(&mut pane, 80, 12); // 8 listing rows
     pane.scroll(60, 5);
-    assert_eq!(pane.active(), Side::Left, "the wheel does not change the active panel");
+    assert_eq!(pane.active, Side::Left, "the wheel does not change the active panel");
     assert_eq!(pane.panel(Side::Right).scroll_offset(0, 8), 5);
     assert_eq!(pane.panel(Side::Right).cursor, 5, "the cursor stays visible");
     pane.scroll(60, 1000);
@@ -894,7 +899,7 @@ fn a_newer_listing_supersedes_an_older_one() {
     let two = TempDir::new("second");
     one.write("one", "");
     two.write("two", "");
-    let mut pane = FilesPane::new(Location::Local(one.0.clone()), Location::Local(one.0.clone()), noop());
+    let mut pane = offline(Location::Local(one.0.clone()), Location::Local(one.0.clone()));
     pane.set_location(Side::Left, Location::Local(two.0.clone()));
     settle(&mut pane);
     // Wait for the first listing's thread too: its result must be dropped.
@@ -1029,7 +1034,7 @@ fn ssh_failures_and_timeouts_are_shown() {
     assert!(text[3].starts_with(" ssh: connect to host srv port 22:"), "{text:#?}");
     assert_eq!(buf[(1, 3)].fg, Color::Red);
     // A missing destination or program is an error too.
-    let mut pane = FilesPane::new(remote("/"), remote("/"), noop());
+    let mut pane = offline(remote("/"), remote("/"));
     let Location::Remote(mut lost) = remote("/") else { panic!() };
     lost.ssh_args.clear();
     pane.set_location(Side::Right, Location::Remote(lost));

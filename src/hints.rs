@@ -52,20 +52,6 @@ pub struct Row {
     pub links: Vec<(usize, usize, String)>,
 }
 
-impl Row {
-    /// A row of plain text (tests).
-    #[cfg(test)]
-    pub fn plain(text: &str) -> Row {
-        let mut cols = Vec::new();
-        let mut c = 0u16;
-        for ch in text.chars() {
-            cols.push(c);
-            c += ch.width().unwrap_or(0).max(1) as u16;
-        }
-        Row { text: text.to_string(), cols, links: Vec::new() }
-    }
-}
-
 /// The port and the rest (`/path?query`) of a URL to the local machine (`http://localhost:5173/x`).
 pub fn loopback_port(url: &str) -> Option<(u16, String)> {
     let rest = url.split_once("://")?.1;
@@ -366,9 +352,20 @@ pub fn split_line(path: &str) -> (&str, Option<u32>) {
 mod tests {
     use super::*;
 
+    /// A row of plain text, without links.
+    fn plain(text: &str) -> Row {
+        let mut cols = Vec::new();
+        let mut c = 0u16;
+        for ch in text.chars() {
+            cols.push(c);
+            c += ch.width().unwrap_or(0).max(1) as u16;
+        }
+        Row { text: text.to_string(), cols, links: Vec::new() }
+    }
+
     fn kinds(line: &str) -> Vec<(String, Kind)> {
         let servers: HashSet<String> = ["web-prod-1".to_string(), "db.lan".to_string()].into();
-        find(&[Row::plain(line)], &servers, &Custom::default()).into_iter().map(|m| (m.text, m.kind)).collect()
+        find(&[plain(line)], &servers, &Custom::default()).into_iter().map(|m| (m.text, m.kind)).collect()
     }
 
     #[test]
@@ -398,7 +395,7 @@ mod tests {
             vec![("deploy@web-prod-1".into(), Kind::Server), ("db.lan".into(), Kind::Server)]
         );
         let servers: HashSet<String> = ["web".to_string()].into();
-        assert!(find(&[Row::plain("the web server and admin@web")], &servers, &Custom::default()).len() == 1);
+        assert!(find(&[plain("the web server and admin@web")], &servers, &Custom::default()).len() == 1);
         assert_eq!(loopback_port("http://localhost:5173/app?x=1"), Some((5173, "/app?x=1".into())));
         assert_eq!(loopback_port("https://[::1]:8443"), Some((8443, String::new())));
         assert_eq!(loopback_port("http://localhost:3000?x=1"), Some((3000, "?x=1".into())));
@@ -421,14 +418,14 @@ mod tests {
         };
         let (custom, warnings) = Custom::build(&cfg, &BTreeMap::new());
         assert_eq!(warnings.len(), 2, "a bad regex and an unknown tool: {warnings:?}");
-        let m = find(&[Row::plain("fix OPS-1234 now")], &HashSet::new(), &custom);
+        let m = find(&[plain("fix OPS-1234 now")], &HashSet::new(), &custom);
         assert_eq!(m[0].text, "OPS-1234");
         assert_eq!(m[0].kind, Kind::Custom(0));
     }
 
     #[test]
     fn hyperlinks_win() {
-        let mut row = Row::plain("see the docs here");
+        let mut row = plain("see the docs here");
         row.links.push((8, 11, "https://example.com/docs".into()));
         let m = find(&[row], &HashSet::new(), &Custom::default());
         assert_eq!(m.len(), 1);
@@ -437,18 +434,17 @@ mod tests {
 
     #[test]
     fn columns_follow_wide_characters() {
-        let m = find(&[Row::plain("日本 https://x.org")], &HashSet::new(), &Custom::default());
+        let m = find(&[plain("日本 https://x.org")], &HashSet::new(), &Custom::default());
         assert_eq!((m[0].col, m[0].width), (5, 13));
     }
 
     #[test]
     fn labels_are_unique_per_text_and_bottom_first() {
-        let rows: Vec<Row> =
-            ["https://a.org", "https://b.org", "https://a.org"].iter().map(|s| Row::plain(s)).collect();
+        let rows: Vec<Row> = ["https://a.org", "https://b.org", "https://a.org"].iter().map(|s| plain(s)).collect();
         let hints = label(find(&rows, &HashSet::new(), &Custom::default()), "asdf");
         let labels: Vec<(&str, &str)> = hints.iter().map(|h| (h.m.text.as_str(), h.label.as_str())).collect();
         assert_eq!(labels, vec![("https://a.org", "a"), ("https://b.org", "s"), ("https://a.org", "a")]);
-        let many: Vec<Row> = (0..30).map(|i| Row::plain(&format!("https://h{i}.org"))).collect();
+        let many: Vec<Row> = (0..30).map(|i| plain(&format!("https://h{i}.org"))).collect();
         let hints = label(find(&many, &HashSet::new(), &Custom::default()), "ab");
         assert_eq!(hints.len(), 4, "two letters of two: 4 labels");
         assert!(hints.iter().all(|h| h.label.len() == 2));

@@ -15,6 +15,13 @@ use super::spans::line_text;
 use super::{CODE_BLOCK, DIR_NAME, INLINE_CODE, Preview, PreviewKind, gutter, indicator, link_url};
 use crate::text::human_size;
 
+/// A preview read now, on this thread.
+fn loaded(path: &Path) -> Preview {
+    let mut preview = Preview::open(path);
+    preview.apply(super::Loaded::read(path, false));
+    preview
+}
+
 /// A unique scratch directory removed on drop.
 struct TempDir(PathBuf);
 
@@ -86,7 +93,7 @@ const WHITE: [u8; 4] = [255, 255, 255, 255];
 fn markdown_headings_are_styled_and_ruled() {
     let dir = TempDir::new("headings");
     let path = dir.write("README.md", "# Title\n\nHello *world* and **bold**\n\n## Sub\n\n### Third\n");
-    let mut preview = Preview::loaded(&path);
+    let mut preview = loaded(&path);
     assert_eq!(preview.kind(), PreviewKind::Markdown);
     assert_eq!(preview.title(), "README.md");
     let (buf, text) = render(&mut preview, 30, 12);
@@ -110,7 +117,7 @@ fn markdown_headings_are_styled_and_ruled() {
 fn markdown_inline_code_and_strikethrough() {
     let dir = TempDir::new("inline");
     let path = dir.write("a.md", "use `foo()` not ~~bar~~");
-    let mut preview = Preview::loaded(&path);
+    let mut preview = loaded(&path);
     let (buf, text) = render(&mut preview, 40, 3);
     assert_eq!(text[0], "use foo() not bar");
     assert_eq!(buf[(4, 0)].bg, INLINE_CODE.bg.unwrap());
@@ -153,7 +160,7 @@ fn markdown_task_lists() {
 fn markdown_code_blocks_have_label_and_background() {
     let dir = TempDir::new("code");
     let path = dir.write("c.md", "Text\n\n```rust\nfn main() {\n\tx();\n}\n```\n");
-    let mut preview = Preview::loaded(&path);
+    let mut preview = loaded(&path);
     let (buf, text) = render(&mut preview, 24, 8);
     assert_eq!(text[0], "Text");
     assert_eq!(text[2], "   rust");
@@ -228,7 +235,7 @@ fn markdown_rewraps_per_width() {
     let dir = TempDir::new("wrap");
     let words = "lorem ipsum dolor sit amet consectetur adipiscing elit sed do eiusmod tempor";
     let path = dir.write("w.md", words);
-    let mut preview = Preview::loaded(&path);
+    let mut preview = loaded(&path);
     let (_, wide) = render(&mut preview, 80, 10);
     assert_eq!(wide[0], words);
     let (_, narrow) = render(&mut preview, 20, 10);
@@ -260,7 +267,7 @@ fn markdown_survives_odd_input_at_tiny_widths() {
 fn image_renders_half_blocks() {
     let dir = TempDir::new("image");
     let path = png(&dir, "tiny.png", 2, &[RED, GREEN, BLUE, WHITE]);
-    let mut preview = Preview::loaded(&path);
+    let mut preview = loaded(&path);
     assert_eq!(preview.kind(), PreviewKind::Image);
     assert_eq!(preview.visible_text(), "[image 2×2 png]");
     let (buf, text) = render(&mut preview, 2, 1);
@@ -275,7 +282,7 @@ fn image_renders_half_blocks() {
 fn image_is_scaled_and_centered() {
     let dir = TempDir::new("center");
     let path = png(&dir, "tiny.png", 2, &[RED, GREEN, BLUE, WHITE]);
-    let mut preview = Preview::loaded(&path);
+    let mut preview = loaded(&path);
     // 10×2 cells = 10×4 pixels: the square image becomes 4×4, centered.
     let (buf, text) = render(&mut preview, 10, 2);
     assert_eq!(text, ["   ▀▀▀▀", "   ▀▀▀▀"]);
@@ -286,7 +293,7 @@ fn image_is_scaled_and_centered() {
     assert_eq!(buf[(6, 1)].bg, Color::Rgb(255, 255, 255));
     // A wide image in a tall area is centered vertically.
     let wide = png(&dir, "wide.png", 4, &[RED, RED, RED, RED]);
-    let mut preview = Preview::loaded(&wide);
+    let mut preview = loaded(&wide);
     let (_, text) = render(&mut preview, 4, 5);
     assert_eq!(text, ["", "", "▀▀▀▀", "", ""]);
 }
@@ -296,7 +303,7 @@ fn image_transparency_and_odd_heights() {
     let clear = [0, 0, 0, 0];
     let dir = TempDir::new("alpha");
     let path = png(&dir, "a.png", 2, &[clear, RED, GREEN, clear, BLUE, BLUE]);
-    let mut preview = Preview::loaded(&path);
+    let mut preview = loaded(&path);
     let (buf, text) = render(&mut preview, 2, 2);
     assert_eq!(text, ["▄▀", "▀▀"]);
     assert_eq!(buf[(0, 0)].fg, Color::Rgb(0, 255, 0));
@@ -311,7 +318,7 @@ fn image_is_shown_as_an_image_where_the_terminal_can() {
     let path = png(&dir, "tiny.png", 2, &[RED, GREEN, BLUE, WHITE]);
     let area = Rect::new(0, 0, 10, 4);
     // Images turned off: half blocks only.
-    let mut plain = Preview::loaded(&path);
+    let mut plain = loaded(&path);
     assert!(!plain.show_image(area, (10, 4), &mut Buffer::empty(area)));
     let shared = std::sync::Arc::new(crate::graphics::Shared::new(true, 64 << 20));
     shared.set_cell(10, 20);
@@ -373,9 +380,9 @@ fn image_sniffed_without_extension_and_decode_errors() {
     let dir = TempDir::new("sniff");
     let real = png(&dir, "real.png", 1, &[RED]);
     let disguised = dir.write("blob.dat", fs::read(real).unwrap());
-    assert_eq!(Preview::loaded(&disguised).kind(), PreviewKind::Image);
+    assert_eq!(loaded(&disguised).kind(), PreviewKind::Image);
     let broken = dir.write("broken.png", b"not an image at all");
-    let mut preview = Preview::loaded(&broken);
+    let mut preview = loaded(&broken);
     assert_eq!(preview.kind(), PreviewKind::Image);
     let (buf, text) = render(&mut preview, 40, 4);
     assert!(text.join(" ").contains("broken.png"), "{text:?}");
@@ -391,7 +398,7 @@ fn directory_listing_order_and_styles() {
     dir.write("b.txt", vec![b'x'; 1536]);
     dir.write("a.txt", "hi");
     dir.write(".env", "");
-    let mut preview = Preview::loaded(&dir.0);
+    let mut preview = loaded(&dir.0);
     assert_eq!(preview.kind(), PreviewKind::Directory);
     let (buf, text) = render(&mut preview, 30, 8);
     let expected = [
@@ -421,7 +428,7 @@ fn human_sizes() {
 fn text_has_gutter_and_expanded_tabs() {
     let dir = TempDir::new("text");
     let path = dir.write("main.rs", "fn main() {\n\tprintln!(\"hi\");\r\n}\n");
-    let mut preview = Preview::loaded(&path);
+    let mut preview = loaded(&path);
     assert_eq!(preview.kind(), PreviewKind::Text);
     let (buf, text) = render(&mut preview, 40, 5);
     assert_eq!(text[0], "  1 │ fn main() {");
@@ -438,10 +445,10 @@ fn text_has_gutter_and_expanded_tabs() {
 #[test]
 fn text_shows_control_characters_and_empty_files() {
     let dir = TempDir::new("ctrl");
-    let mut preview = Preview::loaded(&dir.write("c.txt", "a\x1bb"));
+    let mut preview = loaded(&dir.write("c.txt", "a\x1bb"));
     let (_, text) = render(&mut preview, 20, 2);
     assert_eq!(text[0], "  1 │ a\u{241b}b");
-    let mut empty = Preview::loaded(&dir.write("empty", ""));
+    let mut empty = loaded(&dir.write("empty", ""));
     assert_eq!(empty.kind(), PreviewKind::Text);
     let (_, text) = render(&mut empty, 20, 2);
     assert_eq!(text[0], "(empty file)");
@@ -450,13 +457,13 @@ fn text_shows_control_characters_and_empty_files() {
 #[test]
 fn binary_detection() {
     let dir = TempDir::new("binary");
-    let mut nul = Preview::loaded(&dir.write("data", b"abc\0def"));
+    let mut nul = loaded(&dir.write("data", b"abc\0def"));
     assert_eq!(nul.kind(), PreviewKind::Binary);
     let (_, text) = render(&mut nul, 40, 2);
     assert_eq!(text[0], "binary file, 7 bytes");
-    let latin1 = Preview::loaded(&dir.write("latin1.txt", b"caf\xe9"));
+    let latin1 = loaded(&dir.write("latin1.txt", b"caf\xe9"));
     assert_eq!(latin1.kind(), PreviewKind::Binary);
-    let big = Preview::loaded(&dir.write("big", vec![0u8; 2048]));
+    let big = loaded(&dir.write("big", vec![0u8; 2048]));
     assert_eq!(big.visible_text(), "binary file, 2048 bytes (2.0 KiB)");
 }
 
@@ -464,7 +471,7 @@ fn binary_detection() {
 fn scrolling_is_clamped() {
     let dir = TempDir::new("scroll");
     let body: String = (1..=100).map(|i| format!("line {i}\n")).collect();
-    let mut preview = Preview::loaded(&dir.write("long.txt", body));
+    let mut preview = loaded(&dir.write("long.txt", body));
     let (_, text) = render(&mut preview, 30, 10);
     assert_eq!(text[0], "  1 │ line 1");
     assert!(text[9].ends_with(" 0%"), "{:?}", text[9]);
@@ -493,12 +500,12 @@ fn scrolling_is_clamped() {
 fn scrolling_before_render_and_on_images() {
     let dir = TempDir::new("prerender");
     let body: String = (1..=50).map(|i| format!("{i}\n")).collect();
-    let mut preview = Preview::loaded(&dir.write("n.txt", body));
+    let mut preview = loaded(&dir.write("n.txt", body));
     preview.bottom();
     preview.scroll(3);
     let (_, text) = render(&mut preview, 20, 10);
     assert_eq!(text[0], " 41 │ 41");
-    let mut image = Preview::loaded(&png(&dir, "i.png", 1, &[RED]));
+    let mut image = loaded(&png(&dir, "i.png", 1, &[RED]));
     image.scroll(10);
     image.bottom();
     image.page_down();
@@ -519,7 +526,7 @@ fn zero_sized_and_offscreen_areas_do_not_panic() {
     ];
     let mut buf = Buffer::empty(Rect::new(0, 0, 5, 5));
     for path in &paths {
-        let mut preview = Preview::loaded(path);
+        let mut preview = loaded(path);
         for area in [
             Rect::new(0, 0, 0, 0),
             Rect::new(0, 0, 0, 5),
@@ -551,7 +558,7 @@ fn render_stays_inside_area() {
     let area = Rect::new(5, 3, 17, 6);
     for path in &paths {
         let mut buf = Buffer::filled(outer, ratatui::buffer::Cell::new("X"));
-        let mut preview = Preview::loaded(path);
+        let mut preview = loaded(path);
         preview.bottom();
         preview.render(area, &mut buf);
         for y in outer.top()..outer.bottom() {
@@ -566,7 +573,7 @@ fn render_stays_inside_area() {
 
 #[test]
 fn unreadable_path_renders_red_error() {
-    let mut preview = Preview::loaded(Path::new("/definitely/not/here.txt"));
+    let mut preview = loaded(Path::new("/definitely/not/here.txt"));
     assert_eq!(preview.kind(), PreviewKind::Text);
     assert_eq!(preview.title(), "here.txt");
     let (buf, text) = render(&mut preview, 30, 5);
@@ -634,7 +641,7 @@ fn big_markdown_says_it_is_cut() {
         body.push_str("a line of text that repeats\n\n");
     }
     let path = dir.write("big.md", body.as_str());
-    let mut preview = Preview::loaded(&path);
+    let mut preview = loaded(&path);
     preview.bottom();
     let (_, text) = render(&mut preview, 60, 4);
     assert!(text.iter().any(|l| l.contains("truncated, file is")), "{text:?}");
@@ -642,12 +649,12 @@ fn big_markdown_says_it_is_cut() {
 
 #[test]
 fn titles() {
-    assert_eq!(Preview::loaded(Path::new("/tmp/x/README.md")).title(), "README.md");
-    assert_eq!(Preview::loaded(Path::new("/")).title(), "/");
+    assert_eq!(loaded(Path::new("/tmp/x/README.md")).title(), "README.md");
+    assert_eq!(loaded(Path::new("/")).title(), "/");
     let dir = TempDir::new("title");
     let name = dir.0.file_name().unwrap().to_string_lossy().into_owned();
     fs::create_dir(dir.0.join("sub")).unwrap();
-    assert_eq!(Preview::loaded(&dir.0.join("sub/..")).title(), name);
+    assert_eq!(loaded(&dir.0.join("sub/..")).title(), name);
 }
 
 #[test]

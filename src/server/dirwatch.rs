@@ -293,13 +293,6 @@ impl DirWatch {
     pub(super) fn dirs(&self) -> impl Iterator<Item = &PathBuf> {
         self.dirs.keys()
     }
-
-    #[cfg(test)]
-    fn watched_paths(&self) -> Vec<PathBuf> {
-        let mut v: Vec<PathBuf> = self.watches.keys().cloned().collect();
-        v.sort();
-        v
-    }
 }
 
 #[cfg(test)]
@@ -308,6 +301,13 @@ mod tests {
 
     fn dir(name: &str) -> PathBuf {
         PathBuf::from("/x").join(name)
+    }
+
+    /// The directories `g` watches, sorted.
+    fn watched_paths(g: &DirWatch) -> Vec<PathBuf> {
+        let mut v: Vec<PathBuf> = g.watches.keys().cloned().collect();
+        v.sort();
+        v
     }
 
     /// A watcher whose changes come out of the returned channel.
@@ -412,7 +412,7 @@ mod tests {
             assert!(g.asking(d, false, t0));
             g.answered(d, true, std::slice::from_ref(w), t0);
         }
-        assert_eq!(g.watched_paths(), vec![a.clone(), git_dir.clone(), a_sub.clone(), b.clone(), other_git.clone()]);
+        assert_eq!(watched_paths(&g), vec![a.clone(), git_dir.clone(), a_sub.clone(), b.clone(), other_git.clone()]);
         assert!(!g.polled());
         // Watched: not asked about again before long, output or not.
         assert!(!g.periodic(&a, t0, t0 + ACTIVE_EVERY));
@@ -431,11 +431,11 @@ mod tests {
         assert_eq!(due, vec![a.clone(), a_sub.clone()]);
         // A pane left `b`: neither it nor its repository is watched any more.
         g.retain(&[a.clone(), a_sub.clone()].into_iter().collect());
-        assert_eq!(g.watched_paths(), vec![a.clone(), git_dir.clone(), a_sub.clone()]);
+        assert_eq!(watched_paths(&g), vec![a.clone(), git_dir.clone(), a_sub.clone()]);
         // The git directory goes (the repository deleted): no watch is left on it.
         std::fs::remove_dir_all(&git_dir).unwrap();
         let start = Instant::now();
-        while g.watched_paths().contains(&git_dir) {
+        while watched_paths(&g).contains(&git_dir) {
             assert!(start.elapsed() < Duration::from_secs(5), "the watch did not go");
             if let Ok(changes) = rx.recv_timeout(Duration::from_millis(100)) {
                 g.changed(&changes, now);
@@ -475,13 +475,13 @@ mod tests {
         // Nothing there yet: what is there is watched, for the directory to come.
         g.watch_config(std::slice::from_ref(&workspaces));
         assert!(g.config_watched());
-        assert_eq!(g.watched_paths(), vec![root.clone()]);
+        assert_eq!(watched_paths(&g), vec![root.clone()]);
         std::fs::create_dir_all(&workspaces).unwrap();
         let changes = rx.recv_timeout(Duration::from_secs(5)).unwrap();
         assert!(g.changed(&changes, Instant::now()).config);
         // Asked again (the server does after such a change): the directory itself now.
         g.watch_config(std::slice::from_ref(&workspaces));
-        assert_eq!(g.watched_paths(), vec![workspaces.clone()]);
+        assert_eq!(watched_paths(&g), vec![workspaces.clone()]);
         while rx.recv_timeout(Duration::from_millis(200)).is_ok() {}
         std::fs::write(workspaces.join("w.kdl"), "layout {}\n").unwrap();
         let changes = rx.recv_timeout(Duration::from_secs(5)).unwrap();
