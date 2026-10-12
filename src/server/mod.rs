@@ -344,6 +344,9 @@ pub struct Server {
     last_persist: Instant,
     last_tick: Instant,
     next_render: Option<Instant>,
+    /// When an image that stopped moving may be drawn as sixel where it stopped. Kept apart from
+    /// `next_render`, which it would hold back: other changes are drawn meanwhile.
+    image_wake: Option<Instant>,
     quitting: bool,
     /// `kraal kill` requests, answered once the last state is written (or not).
     kill_waiters: Vec<ClientId>,
@@ -559,6 +562,7 @@ pub fn run(session: &str) -> Result<()> {
         last_persist: Instant::now(),
         last_tick: Instant::now(),
         next_render: None,
+        image_wake: None,
         quitting: false,
         kill_waiters: Vec::new(),
         restarting: false,
@@ -717,6 +721,10 @@ impl Server {
             if self.quitting {
                 break;
             }
+            if self.image_wake.is_some_and(|t| t <= Instant::now()) {
+                self.image_wake = None;
+                self.next_render = Some(Instant::now());
+            }
             if self.next_render.is_some_and(|t| t <= Instant::now()) {
                 self.render_clients();
             }
@@ -755,7 +763,7 @@ impl Server {
 
     fn next_deadline(&self) -> Instant {
         let mut d = self.last_tick + TICK;
-        if let Some(r) = self.next_render {
+        for r in [self.next_render, self.image_wake].into_iter().flatten() {
             d = d.min(r);
         }
         for c in self.clients.values() {
@@ -1152,9 +1160,8 @@ impl Server {
         if again {
             self.next_render = Some(Instant::now() + FRAME);
         }
-        if let Some(at) = wake {
-            self.next_render = Some(self.next_render.map_or(at, |r| r.min(at)));
-        }
+        // The clients that wait for it are rendered with every frame until then.
+        self.image_wake = wake;
     }
 
     fn shutdown(&mut self) {
