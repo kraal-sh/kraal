@@ -241,6 +241,13 @@ fn every_workspace_opens_as_it_is_written() {
     let fleet = panes("fleet");
     assert_eq!(fleet[0]["server"], "web-staging-1");
     assert!(fleet[0]["production"].is_null() && fleet[1]["production"].is_null(), "{fleet:?}");
+    // Their group is the one their entries give: the workspace adds none to the inventory's.
+    let group = |name: &str| -> Vec<String> {
+        let members = json(&quiet(kraal(&env, &["servers", "list", "--group", name, "--json"])));
+        members.iter().map(|server| server["name"].as_str().unwrap().to_string()).collect()
+    };
+    assert_eq!(group("web"), ["web-staging-1", "web-staging-2", "web-prod-1"]);
+    assert!(group("fleet").is_empty());
 }
 
 /// Every runbook is listed as what it is, and every steps runbook shows its plan: on a group

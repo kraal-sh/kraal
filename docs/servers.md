@@ -25,10 +25,14 @@ Only `name` and `host` are needed, and a name is given once. kraal writes this f
 changes it (a server added, removed or discovered): the entries stay as they are, comments do
 not.
 
-It also knows the `ssh` panes of your workspace files (grouped by workspace) and the hosts of
-`~/.ssh/config` (the group `ssh-config`; `ssh_config_hosts = false` in the configuration leaves
-them out). When you `ssh` somewhere new, from the picker or typed in any pane, kraal saves
-it in the group `discovered`, unless `[servers] auto_add = false`.
+It also knows the `ssh` panes of your workspace files (in a group named after the workspace) and
+the hosts of `~/.ssh/config` (the group `ssh-config`; `ssh_config_hosts = false` in the
+configuration leaves them out). A server of the inventory stays as its entry gives it: a
+workspace pane that connects to it takes the entry's name and groups, and adds none, so the
+group of a workspace holds only the servers the inventory does not have. To run something on all
+the servers of a workspace, give their entries a group of their own. When you `ssh` somewhere
+new, from the picker or typed in any pane, kraal saves it in the group `discovered`, unless
+`[servers] auto_add = false`.
 
 | Command | |
 |---|---|
