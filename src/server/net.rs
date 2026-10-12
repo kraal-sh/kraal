@@ -179,45 +179,39 @@ pub struct PortScanner {
     /// The last bytes of the output read so far, for a host the read cut.
     tail: [u8; LONGEST_HOST],
     tail_len: usize,
-    /// A mention whose digits ran to the end of the last read: the port so far and its digits.
+    /// A mention whose digits ran to the end of the last read: the port so far and its digits,
+    /// given once the output shows where they end.
     digits: Option<(u32, u8)>,
 }
 
 impl PortScanner {
     /// Read `text`, the output that follows what was read before, calling `found` with the
-    /// ports it mentions (1024 and up). A port cut by the end of `text` is given as far as it
-    /// goes, then again whole if more digits follow.
+    /// ports it mentions (1024 and up). A port whose digits run to the end of `text` is given
+    /// once what follows ends it: a part of it would be another port.
     pub fn scan(&mut self, text: &[u8], mut found: impl FnMut(u16)) {
-        let mut report = |port: u32, n: u8| {
-            if n > 0
-                && let Ok(p) = u16::try_from(port)
-                && p >= 1024
-            {
-                found(p);
-            }
-        };
         if let Some((port, n)) = self.digits.take() {
-            let (port, n, used) = read_digits(text, port, n);
-            if used == text.len() && n < PORT_DIGITS {
-                self.digits = Some((port, n));
-            }
-            // Without new digits, it was given already.
-            if used > 0 {
-                report(port, n);
-            }
+            self.read_port(text, port, n, &mut found);
         }
         for colon in memchr::memchr_iter(b':', text) {
-            if !self.host_before(text, colon) {
-                continue;
+            if self.host_before(text, colon) {
+                self.read_port(&text[colon + 1..], 0, 0, &mut found);
             }
-            let rest = &text[colon + 1..];
-            let (port, n, used) = read_digits(rest, 0, 0);
-            if used == rest.len() && n < PORT_DIGITS {
-                self.digits = Some((port, n));
-            }
-            report(port, n);
         }
         self.keep_tail(text);
+    }
+
+    /// Read the digits at the start of `text` that continue a port of `n` digits so far: give
+    /// the port if they end in `text`, else keep it for the next read.
+    fn read_port(&mut self, text: &[u8], port: u32, n: u8, found: &mut impl FnMut(u16)) {
+        let (port, n, used) = read_digits(text, port, n);
+        if used == text.len() && n < PORT_DIGITS {
+            self.digits = Some((port, n));
+        } else if n > 0
+            && let Ok(p) = u16::try_from(port)
+            && p >= 1024
+        {
+            found(p);
+        }
     }
 
     /// Whether a local host ends just before `text[colon]`, counting what was read before.
@@ -592,7 +586,7 @@ mod tests {
 
     #[test]
     fn a_port_cut_between_reads_is_found() {
-        let text = b"Local: http://localhost:5173/ and 127.0.0.1:8000\n[::1]:9000 at last localhost:4000";
+        let text = b"Local: http://localhost:5173/ and 127.0.0.1:8000\n[::1]:9000 at last localhost:4000\n";
         let whole = ports_in_text(text);
         assert_eq!(whole, vec![5173, 8000, 9000, 4000]);
         // Every cut, and reads of one byte each.
@@ -600,9 +594,12 @@ mod tests {
             assert_eq!(ports_read_in(text, &[cut]), whole, "cut at {cut}");
         }
         assert_eq!(ports_read_in(text, &(1..text.len()).collect::<Vec<_>>()), whole);
-        // Digits a read cuts are completed by the next one.
-        assert_eq!(ports_read_in(b"localhost:8080 localhost:3000", &[11, 12]), vec![8080, 3000]);
-        assert_eq!(ports_read_in(b"[::]:1234567", &[6, 7, 9]), vec![1234, 12345]);
+        // Digits a read cuts are completed by the next one, and only the whole port is given.
+        assert_eq!(ports_read_in(b"localhost:8080 localhost:3000 ", &[11, 12]), vec![8080, 3000]);
+        assert_eq!(ports_read_in(b"[::]:1234567", &[6, 7, 9]), vec![12345]);
+        assert_eq!(ports_read_in(b"http://localhost:12345/", &[21]), vec![12345]);
+        // Until what follows ends it, a port may go on.
+        assert!(ports_read_in(b"localhost:4000", &[]).is_empty());
     }
 
     #[test]
