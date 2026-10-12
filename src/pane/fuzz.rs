@@ -136,6 +136,7 @@ fn act(rng: &mut Rng, f: &mut Fixture, recent: &[u8]) {
             } else {
                 String::from_utf8_lossy(&rng.text(10)).into_owned()
             };
+            crate::fuzz::trace(|| format!("search {query:?}"));
             p.search(&query);
             for _ in 0..rng.below(6) {
                 p.search_next(rng.one_in(2));
@@ -461,7 +462,7 @@ fn fuzz_pane_shows_what_the_emulator_shows() {
                 if let Some(t) = f.pane.term_mut() {
                     t.marked(|t| t.stop_sync());
                 }
-                r.parser.stop_sync(&mut r.term);
+                r.parser.stop_sync(&mut Plain(&mut r.term));
                 f.pane.resize(cols, rows);
                 r.term.resize(Size { cols, rows });
                 resized = true;
@@ -504,7 +505,7 @@ fn fuzz_pane_shows_what_the_emulator_shows() {
                     t.marked(|t| t.stop_sync());
                 }
                 let r = &mut r;
-                r.parser.stop_sync(&mut r.term);
+                r.parser.stop_sync(&mut Plain(&mut r.term));
             }
             fuzz::trace(|| {
                 let t = f.pane.term_mut().unwrap();
@@ -685,9 +686,9 @@ fn fuzz_pane_osc() {
     });
 }
 
-/// The emulator alone, but for deleting characters as kraal does (it blanks the half of a wide
-/// character left alone, see `archive::delete_chars`).
-struct Plain<'a>(&'a mut Term<Listener>);
+/// The emulator alone, but for the edits that may split a wide character, which kraal mends
+/// (see `archive::mended`).
+pub(super) struct Plain<'a>(pub(super) &'a mut Term<Listener>);
 
 mod plain {
     use alacritty_terminal::vte::ansi::{
@@ -696,11 +697,14 @@ mod plain {
         StandardCharset, TabulationClearMode, cursor_icon::CursorIcon,
     };
 
+    use alacritty_terminal::term::TermMode;
+
     use super::Plain;
+    use crate::pane::archive::mended;
 
     impl Handler for Plain<'_> {
         fn delete_chars(&mut self, count: usize) {
-            crate::pane::archive::delete_chars(self.0, count)
+            mended(self.0, |t| Handler::delete_chars(t, count))
         }
 
         fn linefeed(&mut self) {
@@ -719,13 +723,13 @@ mod plain {
             Handler::put_tab(&mut *self.0, count)
         }
         fn clear_line(&mut self, mode: LineClearMode) {
-            Handler::clear_line(&mut *self.0, mode)
+            mended(self.0, |t| Handler::clear_line(t, mode))
         }
         fn erase_chars(&mut self, count: usize) {
-            Handler::erase_chars(&mut *self.0, count)
+            mended(self.0, |t| Handler::erase_chars(t, count))
         }
         fn insert_blank(&mut self, count: usize) {
-            Handler::insert_blank(&mut *self.0, count)
+            mended(self.0, |t| Handler::insert_blank(t, count))
         }
         fn set_scrolling_region(&mut self, top: usize, bottom: Option<usize>) {
             Handler::set_scrolling_region(&mut *self.0, top, bottom)
@@ -902,13 +906,17 @@ mod plain {
             Handler::set_scp(&mut *self.0, char_path, update_mode)
         }
         fn clear_screen(&mut self, mode: ClearMode) {
-            Handler::clear_screen(&mut *self.0, mode)
+            mended(self.0, |t| Handler::clear_screen(t, mode))
         }
         fn reset_state(&mut self) {
             Handler::reset_state(&mut *self.0)
         }
         fn input(&mut self, c: char) {
-            Handler::input(&mut *self.0, c)
+            if self.0.mode().contains(TermMode::INSERT) {
+                mended(self.0, |t| Handler::input(t, c))
+            } else {
+                Handler::input(&mut *self.0, c)
+            }
         }
         fn set_private_mode(&mut self, mode: PrivateMode) {
             Handler::set_private_mode(&mut *self.0, mode)

@@ -1333,6 +1333,34 @@ mod tests {
         assert_eq!(pane.text(None).lines().next(), Some(" 本"));
     }
 
+    /// A wide character an edit splits (characters inserted, erased or deleted at its second
+    /// half, the line erased from there, a character inserted there) goes whole, as when one is
+    /// written over it. alacritty kept its first half, and its search, going on from a match
+    /// ending with it, found that match again for ever.
+    #[test]
+    fn a_wide_character_an_edit_splits_goes_whole() {
+        for (edit, left) in [
+            ("\x1b[2@", "abcdef"),
+            ("\x1b[X", "abcdef"),
+            ("\x1b[K", "abcdef"),
+            ("\x1b[P", "abcdef"),
+            ("\x1b[4hy\x1b[4l", "abcdef y"),
+        ] {
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let mut pane = fed_pane(20, 3, 100);
+                pane.feed(format!("abcdef\u{1f980}\x1b[8G{edit}").as_bytes());
+                pane.search("\u{1f980}");
+                pane.search_next(true);
+                let _ = tx.send(pane.text(None));
+            });
+            let text = rx
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .unwrap_or_else(|_| panic!("{edit:?}: the search goes on for ever"));
+            assert_eq!(text.lines().next().map(str::trim_end), Some(left), "{edit:?}");
+        }
+    }
+
     #[test]
     fn shells_are_told_from_other_programs() {
         for shell in ["zsh", "-zsh", "/bin/bash", "/usr/bin/fish", "sh"] {

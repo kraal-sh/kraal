@@ -656,17 +656,31 @@ pub(super) fn utf8_len(lead: u8) -> usize {
     }
 }
 
-/// Delete `count` characters at the cursor (`CSI P`). The second half of a wide character whose
-/// first half went is half of nothing: a blank. alacritty 0.26 keeps it, reads the cell before it
-/// for a cursor on it (before the row's start at its first column), and blanks that cell when
-/// something is written over it.
-pub(super) fn delete_chars<T: EventListener>(term: &mut Term<T>, count: usize) {
-    term.delete_chars(count);
-    let cursor = term.grid().cursor.point;
-    let cell = &mut term.grid_mut()[cursor];
-    if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
-        cell.flags.remove(Flags::WIDE_CHAR_SPACER);
-        cell.c = ' ';
+/// Make `edit` to the cursor's row (deleting, inserting or erasing characters, erasing part of
+/// the line or the screen, a character inserted), then blank the half it left of a wide
+/// character. alacritty 0.26 keeps it whole on one side: a cursor on a second half alone at the
+/// first column is drawn from the cell before the row's start (a panic), and its search, going
+/// on from a match ending with a first half alone, finds that match again for ever.
+pub(super) fn mended<T>(term: &mut Term<T>, edit: impl FnOnce(&mut Term<T>)) {
+    edit(term);
+    let line = term.grid().cursor.point.line;
+    let row = &mut term.grid_mut()[line];
+    let last = row.len() - 1;
+    for c in 0..=last {
+        let flags = row[Column(c)].flags;
+        let half = if flags.contains(Flags::WIDE_CHAR) {
+            c < last && !row[Column(c + 1)].flags.contains(Flags::WIDE_CHAR_SPACER)
+        } else if flags.contains(Flags::WIDE_CHAR_SPACER) {
+            c == 0 || !row[Column(c - 1)].flags.contains(Flags::WIDE_CHAR)
+        } else {
+            // It says a wide character did not fit at the end of the row: anywhere else, nothing.
+            flags.contains(Flags::LEADING_WIDE_CHAR_SPACER) && c < last
+        };
+        if half {
+            let cell = &mut row[Column(c)];
+            cell.clear_wide();
+            cell.flags.remove(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER);
+        }
     }
 }
 
@@ -1096,7 +1110,7 @@ impl<T: EventListener> Handler for Feed<'_, T> {
             }
             _ => {}
         }
-        self.term.clear_screen(mode);
+        mended(self.term, |t| t.clear_screen(mode));
     }
 
     fn reset_state(&mut self) {
@@ -1122,7 +1136,19 @@ impl<T: EventListener> Handler for Feed<'_, T> {
     }
 
     fn delete_chars(&mut self, count: usize) {
-        delete_chars(self.term, count);
+        mended(self.term, |t| t.delete_chars(count));
+    }
+
+    fn insert_blank(&mut self, count: usize) {
+        mended(self.term, |t| t.insert_blank(count));
+    }
+
+    fn erase_chars(&mut self, count: usize) {
+        mended(self.term, |t| t.erase_chars(count));
+    }
+
+    fn clear_line(&mut self, mode: LineClearMode) {
+        mended(self.term, |t| t.clear_line(mode));
     }
 
     #[inline]
@@ -1132,7 +1158,12 @@ impl<T: EventListener> Handler for Feed<'_, T> {
         if self.term.grid().cursor.input_needs_wrap || c >= WIDE_FROM {
             self.room();
         }
-        self.term.input(c);
+        if self.term.mode().contains(TermMode::INSERT) {
+            // The characters after it move right, as with `insert_blank`.
+            mended(self.term, |t| t.input(c));
+        } else {
+            self.term.input(c);
+        }
     }
 
     pushing! {
@@ -1144,9 +1175,6 @@ impl<T: EventListener> Handler for Feed<'_, T> {
 
     forward! {
         put_tab(count: u16);
-        clear_line(mode: LineClearMode);
-        erase_chars(count: usize);
-        insert_blank(count: usize);
         set_scrolling_region(top: usize, bottom: Option<usize>);
         scroll_down(rows: usize);
         insert_blank_lines(rows: usize);
@@ -1262,7 +1290,7 @@ mod tests {
         fn feed(&mut self, bytes: &[u8]) {
             self.pane.feed(bytes);
             self.pane.rest();
-            self.parser.advance(&mut self.reference, bytes);
+            self.parser.advance(&mut super::super::fuzz::Plain(&mut self.reference), bytes);
         }
 
         fn term(&self) -> &TermPane {
