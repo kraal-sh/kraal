@@ -1498,12 +1498,17 @@ impl Server {
             out.feed(data);
         }
         let Some(pane) = self.panes.get_mut(&id) else { return };
+        let first = pane.prints(data.len());
         let signals = pane.feed(data);
         if pane.has_image_work() {
             self.prepare_images();
         }
         self.pane_signals(id, signals);
         self.mark_dirty_pane(id);
+        // A program's first picture is no stream of output to pace: it is drawn at once.
+        if first && self.on_screen(id) {
+            self.render_now();
+        }
         if !self.echo.is_empty()
             && let Some(until) = self.echo.remove(&id)
             && Instant::now() <= until
