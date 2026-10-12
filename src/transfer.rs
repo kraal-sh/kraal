@@ -284,14 +284,40 @@ fn open_lock(path: &Path) -> std::io::Result<std::fs::File> {
         .open(path)
 }
 
+/// The lock file `path`, created if needed and locked (waiting for the run that holds it when
+/// `wait`); `None` when another run holds it and `wait` is false. A lock file goes with the
+/// run that held it last, or every transfer ever made would leave one: one removed while this
+/// waited for it is not the lock of the next runs any more, so the file there is locked instead.
+fn hold_lock(path: &Path, wait: bool) -> std::io::Result<Option<std::fs::File>> {
+    use std::os::unix::fs::MetadataExt;
+    loop {
+        let file = open_lock(path)?;
+        if !flock(&file, wait)? {
+            return Ok(None);
+        }
+        let held = file.metadata()?;
+        if std::fs::symlink_metadata(path).is_ok_and(|now| (now.dev(), now.ino()) == (held.dev(), held.ino())) {
+            return Ok(Some(file));
+        }
+    }
+}
+
 /// A run of a transfer with partial files, between its start and its end (see [`Partial`]).
 struct PartialRun<'a> {
     partial: &'a Partial,
-    /// Held for the run.
-    _lock: std::fs::File,
+    /// Held for the run, and removed at its end (see [`hold_lock`]).
+    lock: PathBuf,
+    _held: std::fs::File,
     note: PathBuf,
     /// An earlier run of this transfer did not finish.
     had: bool,
+}
+
+impl Drop for PartialRun<'_> {
+    fn drop(&mut self) {
+        // While it is still held: a run waiting for it then locks a new file.
+        let _ = std::fs::remove_file(&self.lock);
+    }
 }
 
 impl<'a> PartialRun<'a> {
@@ -299,16 +325,24 @@ impl<'a> PartialRun<'a> {
         let dir = notes_dir();
         crate::paths::ensure_private_dir(&dir).with_context(|| format!("preparing {}", dir.display()))?;
         let key = format!("{:016x}", partial.key);
-        let lock = open_lock(&dir.join(format!("{key}.lock")))?;
-        if !flock(&lock, false)? {
-            eprintln!("the same copy is already running in another kraal: waiting for it to end");
-            flock(&lock, true)?;
-        }
+        let lock = dir.join(format!("{key}.lock"));
+        let held = match hold_lock(&lock, false)? {
+            Some(held) => held,
+            None => {
+                eprintln!("the same copy is already running in another kraal: waiting for it to end");
+                loop {
+                    if let Some(held) = hold_lock(&lock, true)? {
+                        break held;
+                    }
+                }
+            }
+        };
         let note = dir.join(format!("{key}.note"));
         let had = note.exists();
-        crate::paths::write_private(&note, note_text(partial).as_bytes())
-            .with_context(|| format!("writing {}", note.display()))?;
-        Ok(PartialRun { partial, _lock: lock, note, had })
+        let run = PartialRun { partial, lock, _held: held, note, had };
+        crate::paths::write_private(&run.note, note_text(partial).as_bytes())
+            .with_context(|| format!("writing {}", run.note.display()))?;
+        Ok(run)
     }
 
     /// The run succeeded: remove the partial directories of the runs into the same place that did
@@ -346,10 +380,10 @@ impl<'a> PartialRun<'a> {
                 continue;
             }
             // A run that is still going holds its lock: its partial files are left alone.
-            let Ok(lock) = open_lock(&dir.join(format!("{key:016x}.lock"))) else { continue };
-            if flock(&lock, false).unwrap_or(false) {
+            let lock = dir.join(format!("{key:016x}.lock"));
+            if let Ok(Some(file)) = hold_lock(&lock, false) {
                 add(tops.as_deref().unwrap_or(own), partial_name(key), Some(path));
-                held.push(lock);
+                held.push((lock, file));
             }
         }
         let mut own_done = true;
@@ -371,6 +405,10 @@ impl<'a> PartialRun<'a> {
         }
         if own_done {
             let _ = std::fs::remove_file(&self.note);
+        }
+        // The locks of the runs looked at go too, while held (see [`hold_lock`]).
+        for (lock, _held) in held {
+            let _ = std::fs::remove_file(lock);
         }
     }
 }
@@ -2624,6 +2662,46 @@ mod tests {
         first.finish();
         rx.recv_timeout(std::time::Duration::from_secs(5)).expect("it starts once the first is done");
         waiter.join().unwrap();
+        assert_eq!(locks(), 0, "and neither leaves its lock");
+    }
+
+    /// The lock files in this test's notes directory.
+    fn locks() -> usize {
+        let files = std::fs::read_dir(notes_dir()).into_iter().flatten().flatten();
+        files.filter(|e| e.file_name().to_string_lossy().ends_with(".lock")).count()
+    }
+
+    #[test]
+    fn copies_leave_no_lock_behind() {
+        let t = Tmp::new("locks");
+        let partial = |key: u64, dir: &str| {
+            let dir = t.0.join(dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            Partial {
+                key,
+                place: format!("here {}", dir.display()),
+                tops: vec![crate::shell::quote_always(&dir.display().to_string())],
+                runner: Step::new("sh", vec!["-c".into()]),
+                remote: false,
+            }
+        };
+        // Copies to many places over the weeks, some failing: each holds a lock while it runs.
+        for i in 0..6 {
+            let p = partial(i, &format!("out{i}"));
+            let run = PartialRun::start(&p).unwrap();
+            assert_eq!(locks(), 1, "held while it runs");
+            if i % 2 == 0 {
+                run.finish();
+            } else {
+                drop(run);
+            }
+        }
+        assert_eq!(locks(), 0);
+        // The lock an interrupted run left, found by a copy to the same place, goes too.
+        leave_note(&partial(10, "out0"));
+        std::fs::write(notes_dir().join(format!("{:016x}.lock", 10)), "").unwrap();
+        PartialRun::start(&partial(11, "out0")).unwrap().finish();
+        assert_eq!(locks(), 0);
     }
 
     #[test]
