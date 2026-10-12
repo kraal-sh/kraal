@@ -5112,6 +5112,8 @@ fn a_quit_that_cannot_save_the_session_leaves_it_running() {
     client.send(b"\x02q");
     client.wait_for_row("Quit kraal?");
     client.send(b"y");
+    client.wait_for_rows("the question gone", |rows| !rows.iter().any(|r| r.contains("Quit kraal?")));
+    client.send(b"\x02Vj");
     client.wait_for_row("not quitting: the layout could not be saved");
     std::fs::set_permissions(&sessions, std::fs::Permissions::from_mode(0o700)).unwrap();
     assert_eq!(env.server_pid(), Some(pid), "the session stopped");

@@ -208,11 +208,13 @@ impl Server {
     }
 
     /// Quit: the server stops once the session is saved, as for `kraal kill`, and its clients
-    /// end. A session that cannot be saved keeps running, and the client is told why.
-    pub(super) fn quit(&mut self, client: ClientId) {
+    /// end. A session that cannot be saved keeps running and says why, first among the warnings:
+    /// those of the failed save, which come after, say the same, and must not hide the answer to
+    /// the key just pressed.
+    pub(super) fn quit(&mut self) {
         match self.save_now() {
             Ok(()) => self.quitting = true,
-            Err(e) => self.toast(client, format!("not quitting: {e}")),
+            Err(e) => self.warnings.insert(0, format!("not quitting: {e}")),
         }
     }
 
