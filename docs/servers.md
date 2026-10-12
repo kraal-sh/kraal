@@ -21,9 +21,9 @@ note = "primary"     # optional: your own text, kept
 agents = "main"      # optional: list the agents of the kraal session "main" there (see below)
 ```
 
-Only `name` and `host` are needed, and a name is given once. kraal writes this file again when it
-changes it (a server added, removed or discovered): the entries stay as they are, comments do
-not.
+Only `name` and `host` are needed, and a name is given once. When kraal changes this file (a
+server added, removed or discovered), it edits what changes and leaves the rest as you wrote it:
+your comments, your order, and the keys only another version of kraal reads.
 
 It also knows the `ssh` panes of your workspace files (in a group named after the workspace) and
 the hosts of `~/.ssh/config` (the group `ssh-config`; `ssh_config_hosts = false` in the

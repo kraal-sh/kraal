@@ -240,7 +240,8 @@ accounts = ["pro", "default"]   # in order of preference
 ```
 
 The file also holds the accounts themselves, one `[[account]]` each (`name`, `agent`, `home`,
-and a `threshold` of its own if it has one), which `kraal accounts add` writes.
+and a `threshold` of its own if it has one), which `kraal accounts add` writes. kraal edits what
+it changes there and leaves the rest as you wrote it, comments included.
 
 The first rule that matches decides. A new agent starts on the first account of that rule that is
 under its threshold (when all are over, the one whose usage resets first); when

@@ -1612,6 +1612,58 @@ fn server_inventory_and_copy_plans() {
     assert!(!env.run(&["servers"]).contains("bastion"));
 }
 
+/// The commands that write servers.toml and accounts.toml edit the file the user wrote: its
+/// comments, its order and the keys this kraal does not read are there after each of them.
+#[test]
+fn commands_that_write_the_inventories_keep_what_the_user_wrote() {
+    let env = Env::new("keepfile");
+    let config = env.root.join("config/kraal");
+    let run = |args: &[&str]| {
+        let out = env.cmd(args).env("HOME", env.root.join("home")).output().unwrap();
+        assert!(out.status.success(), "kraal {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+    };
+    let read = |file: &Path| std::fs::read_to_string(file).unwrap();
+
+    let servers = config.join("servers.toml");
+    let by_hand = "# Ours. Ask ops first.\n\n\
+                   [[server]]\nhost = \"bastion.example.com\"  # the way in\nname = \"bastion\"\ncolor = \"red\"\n";
+    std::fs::write(&servers, by_hand).unwrap();
+    run(&["servers", "add", "deploy@web.example.com", "--group", "web"]);
+    let web = "\n[[server]]\nname = \"web\"\nhost = \"web.example.com\"\nuser = \"deploy\"\ngroups = [\"web\"]\n";
+    assert_eq!(read(&servers), format!("{by_hand}{web}"));
+    // What `kraal attach --host bastion` writes too: the session whose agents to list.
+    run(&["servers", "add", "bastion.example.com", "--agents", "main"]);
+    let watched = by_hand.replace("color = \"red\"\n", "color = \"red\"\nagents = \"main\"\n");
+    assert_eq!(read(&servers), format!("{watched}{web}"));
+    env.workspace("lab", "layout {\n    pane name=\"db\" command=\"ssh\" { args \"admin@db.example.com\"; }\n}\n");
+    run(&["servers", "import"]);
+    let db = "\n[[server]]\nname = \"db\"\nhost = \"db.example.com\"\nuser = \"admin\"\ngroups = [\"lab\"]\n";
+    assert_eq!(read(&servers), format!("{watched}{web}{db}"));
+    run(&["servers", "rm", "web"]);
+    assert_eq!(read(&servers), format!("{watched}{db}"));
+    // A file kraal cannot read is not written over.
+    std::fs::write(&servers, "# mine\n[[server]\n").unwrap();
+    assert!(!env.try_run(&["servers", "add", "ops@other.example.com"]).status.success());
+    assert_eq!(read(&servers), "# mine\n[[server]\n");
+
+    let accounts = config.join("accounts.toml");
+    let by_hand = "# The team's accounts.\n\n[limits]\nmode = \"ask\"  # never by itself\nthreshold = 85\nwarn_at = 70\n\n\
+                   # Work first.\n[[rule]]\nworkspace = \"work\"\naccounts = [\"work\", \"default\"]\n";
+    std::fs::write(&accounts, by_hand).unwrap();
+    run(&["accounts", "limits", "--threshold", "80"]);
+    let limited = by_hand.replace("threshold = 85", "threshold = 80");
+    assert_eq!(read(&accounts), limited);
+    let home = env.root.join("codex-work").display().to_string();
+    run(&["accounts", "add", "codex", "work", "--home", &home, "--no-login"]);
+    let account = format!("\n[[account]]\nname = \"work\"\nagent = \"codex\"\nhome = \"{home}\"\n");
+    assert_eq!(read(&accounts), format!("{limited}{account}"));
+    run(&["accounts", "rename", "codex:work", "job"]);
+    let renamed = format!("{limited}{account}").replace("[\"work\", \"default\"]", "[\"job\", \"default\"]");
+    assert_eq!(read(&accounts), renamed.replace("name = \"work\"", "name = \"job\""));
+    run(&["accounts", "rm", "codex:job"]);
+    assert_eq!(read(&accounts), limited.replace("[\"work\", \"default\"]", "[\"default\"]"));
+}
+
 #[test]
 fn moves_never_lose_the_source() {
     let env = Env::new("move");

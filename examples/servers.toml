@@ -2,8 +2,8 @@
 # session you attach to from elsewhere (`kraal attach --host workstation`).
 # Copy it to ~/.config/kraal/servers.toml, or add its entries with `kraal servers edit`:
 # `kraal servers` lists them, and ctrl+b s connects to one or to a whole group.
-# Needs your own hosts in place of these. kraal rewrites the file when it saves a server you
-# ssh to: the comments go then.
+# Needs your own hosts in place of these. kraal adds the servers you ssh to at the end, and
+# leaves the rest of the file as you wrote it.
 
 [[server]]
 name = "bastion"
