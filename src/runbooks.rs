@@ -16,6 +16,8 @@ use serde::Deserialize;
 use crate::paths;
 use crate::shell;
 
+/// Where a runbook comes from: the user's own run as they are, a repository's only once the
+/// user approved its content ([`trusted`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Source {
     /// `~/.config/kraal/runbooks`.
@@ -26,6 +28,8 @@ pub enum Source {
 
 #[derive(Debug, Clone)]
 pub struct Runbook {
+    /// The file name without its extension; `<repo>/<name>` for a repository's runbook named
+    /// like one of the user's ([`all`]).
     pub name: String,
     pub path: PathBuf,
     pub source: Source,
@@ -36,7 +40,9 @@ pub struct Runbook {
 
 #[derive(Debug, Clone)]
 pub enum Body {
+    /// A `.toml` runbook.
     Steps(Box<Steps>),
+    /// A `.md` runbook: its first heading, and its shell blocks.
     Markdown { title: String, blocks: Vec<Block> },
 }
 
@@ -51,6 +57,7 @@ impl Runbook {
     }
 }
 
+/// Where the steps of a TOML runbook run (`on`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum On {
@@ -63,6 +70,7 @@ pub enum On {
     Server,
 }
 
+/// A TOML runbook, as its file says.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Steps {
@@ -73,6 +81,8 @@ pub struct Steps {
     /// Servers run at the same time; 0 runs them all at once.
     #[serde(default = "one")]
     pub rolling: usize,
+    /// Whether the first failure stops the run: the rest of its target's steps ([`script`]) and
+    /// the targets still waiting. Without it, every step and every target runs.
     #[serde(default = "yes")]
     pub stop_on_failure: bool,
     /// Directory for local runs (`~` and paths relative to the repository work).
@@ -84,7 +94,9 @@ pub struct Steps {
     /// Longest a target may run (`90`, `30s`, `10m`, `2h`); it is stopped and counts as failed.
     #[serde(default)]
     pub timeout: Option<String>,
+    /// Shell code, run in order.
     pub steps: Vec<String>,
+    /// Asked for before the plan is shown, given to the steps as variables.
     #[serde(default, rename = "param")]
     pub params: Vec<Param>,
 }
@@ -104,11 +116,13 @@ fn default_shell() -> String {
 pub struct Param {
     /// The variable the steps read (`$VERSION`).
     pub name: String,
+    /// The question asked; the name when there is none.
     #[serde(default)]
     pub prompt: Option<String>,
     /// May use the pane's `$KRAAL_*` variables (`$KRAAL_BRANCH`).
     #[serde(default)]
     pub default: Option<String>,
+    /// The values to choose from. With neither these nor a `choices_command`, any value goes.
     #[serde(default)]
     pub choices: Vec<String>,
     /// A command whose output lines are the choices (`git tag --sort=-v:refname | head`).
@@ -129,6 +143,7 @@ impl Param {
 pub struct Block {
     /// The heading the block is under.
     pub heading: String,
+    /// The commands, without a console transcript's prompts and output.
     pub code: String,
 }
 
@@ -404,6 +419,7 @@ pub fn command(shell: &str, script: &str) -> String {
 
 // ---- trusting repository runbooks -------------------------------------------------------
 
+/// The repository files the user approved, by path, each with the exact content approved.
 fn trust_path() -> PathBuf {
     paths::state_dir().join("trusted-runbooks.json")
 }
@@ -451,6 +467,7 @@ pub fn local_time(t: SystemTime) -> String {
     crate::text::local_datetime(crate::text::unix_seconds(t))
 }
 
+/// Where run logs go, with the ledger of the runs in progress.
 pub fn runs_dir() -> PathBuf {
     paths::state_dir().join("runs")
 }
@@ -511,11 +528,15 @@ pub struct OutputLog {
     pub path: PathBuf,
     /// The first write that failed: what follows it is missing.
     error: Option<String>,
+    /// The line being read, written once it ends.
     line: Vec<u8>,
     /// A `\r` came: the next character starts the line over.
     cr: bool,
+    /// Where the output is in an escape sequence, which can span two reads.
     seq: Seq,
+    /// Bytes in the file, at most [`MAX_OUTPUT`].
     written: u64,
+    /// [`MAX_OUTPUT`] was reached: the rest of the output is dropped.
     cut: bool,
 }
 
@@ -625,13 +646,11 @@ pub fn fold_output(log: &Path, header: &str, output: Option<&Path>) -> std::io::
 
 /// What the run log writer does, in the order asked.
 pub enum LogJob {
+    /// Text for a run log.
     Append(PathBuf, String),
     /// A finished target: its header, then its output file, moved into the log.
-    Fold {
-        log: PathBuf,
-        header: String,
-        output: PathBuf,
-    },
+    Fold { log: PathBuf, header: String, output: PathBuf },
+    /// The runs a session has in progress, for its ledger ([`save_ledger`]).
     Ledger(String, Vec<LedgerRun>),
     /// Write the ledger and say whether it worked.
     LedgerSync(String, Vec<LedgerRun>, Box<dyn FnOnce(Result<(), String>) + Send>),
@@ -680,8 +699,9 @@ pub fn spawn_log_writer(warn: impl Fn(String) + Send + 'static) -> crossbeam_cha
     tx
 }
 
-/// The runs in progress, on disk. After a crash or a kill, the next start says in their logs
-/// that they were interrupted, with the output their targets had written.
+/// A run in progress, as the ledger keeps it on disk: after a crash or a kill, the next start
+/// says in its log that it was interrupted, with the output its targets had written
+/// ([`recover_interrupted`]).
 #[derive(Debug, Clone, Default, serde::Serialize, Deserialize)]
 pub struct LedgerRun {
     pub id: u32,
@@ -690,11 +710,14 @@ pub struct LedgerRun {
     pub targets: Vec<LedgerTarget>,
 }
 
+/// A target of a run in progress: a server, or this machine.
 #[derive(Debug, Clone, Default, serde::Serialize, Deserialize)]
 pub struct LedgerTarget {
+    /// What the log calls it.
     pub label: String,
     /// Still to finish (waiting or running).
     pub pending: bool,
+    /// The file its output goes to until it finishes and is folded into the log.
     pub output: Option<PathBuf>,
 }
 
@@ -702,6 +725,7 @@ fn ledger_path(session: &str) -> PathBuf {
     runs_dir().join(format!(".active-{session}.json"))
 }
 
+/// Save the runs `session` has in progress; with none, the ledger goes.
 pub fn save_ledger(session: &str, runs: &[LedgerRun]) -> Result<()> {
     let path = ledger_path(session);
     if runs.is_empty() {
@@ -759,6 +783,7 @@ pub fn recover_interrupted(session: &str) -> Vec<String> {
     runs.into_iter().map(|r| r.name).collect()
 }
 
+/// What `kraal runbook new` writes for a TOML runbook.
 pub const TEMPLATE_TOML: &str = r#"# A kraal runbook: `kraal runbook run <name>`, or ctrl+b R b.
 description = "Check the nginx configuration, reload it, check the service"
 
@@ -786,6 +811,7 @@ steps = [
 # choices_command = "git tag --sort=-v:refname | head -20"
 "#;
 
+/// What `kraal runbook new --markdown` writes.
 pub const TEMPLATE_MD: &str = r#"# Restart the API
 
 Run each block in turn: ctrl+b R b, pick this runbook, then enter on a step.

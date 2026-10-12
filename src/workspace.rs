@@ -142,7 +142,7 @@ impl LayoutNode {
 /// A tab: a tiled layout plus floating panes.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TabDef {
-    /// Tab title.
+    /// Tab title (Zellij `name`).
     pub name: Option<String>,
     /// Whether this tab should be active when the workspace opens.
     pub focus: bool,

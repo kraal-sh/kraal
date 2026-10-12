@@ -15,6 +15,8 @@ use serde::Deserialize;
 
 use crate::input::{Key, KeyCode, KeySpec};
 
+/// A command kraal has, whatever reaches it: keys, the menu, the command search. [`ACTIONS`]
+/// gives each its name in the configuration and its description.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Action {
     NewPane,
@@ -167,7 +169,8 @@ impl Action {
         if let Some(&(a, _, _)) = ACTIONS.iter().find(|(_, n, _)| *n == name) {
             return Some(a);
         }
-        // Names of earlier versions.
+        // Names from before 0.1.0, which no release documented: a configuration written then
+        // keeps its bindings. They can go in any release.
         match name {
             "toggle_sync" => return Some(BroadcastToggle),
             "mark_pane" => return Some(SelectForBroadcast),
@@ -213,6 +216,7 @@ pub enum Command {
     Tool(String),
 }
 
+/// A preset's bindings: an action's name in the configuration, and its key sequences.
 type Table = &'static [(&'static str, &'static [&'static str])];
 
 /// A menu of a preset: its name in the configuration (`menu_<id>`), the key that opens it, its
@@ -221,10 +225,12 @@ type MenuDef = (&'static str, &'static str, &'static str, Action);
 
 /// A set of default bindings.
 pub struct Preset {
+    /// What `keys.preset` names it by.
     pub name: &'static str,
     /// Sequences after the leader (keys separated by spaces), in menu order. `{id}` stands for
     /// the key of menu `id`, `{prefix}` for the prefix key.
     leader: Table,
+    /// Single keys that need no leader.
     direct: Table,
     menus: &'static [MenuDef],
     /// Menus further in: the sequence that opens one, and its title.
@@ -426,14 +432,18 @@ pub const PRESETS: [&Preset; 2] = [&KRAAL, &CLASSIC];
 pub struct KeysConfig {
     /// "kraal" or "classic".
     pub preset: String,
+    /// The keys that start a leader sequence; hints show the first one.
     pub prefix: Vec<String>,
     /// Per action, replacing the preset's: sequences after the prefix. `menu_<id>` gives the
     /// keys that open a menu (`menu_servers = ["M"]`).
     #[serde(default)]
     pub leader: BTreeMap<String, Vec<String>>,
-    /// The earlier name of `leader`.
+    /// `leader` as it was named before 0.1.0, still read with it (`leader` wins for a menu's
+    /// keys): a configuration written then keeps its bindings. No release documented it; it can
+    /// go in any release.
     #[serde(default)]
     pub prefixed: BTreeMap<String, Vec<String>>,
+    /// Per action, replacing the preset's: single keys that need no leader.
     #[serde(default)]
     pub direct: BTreeMap<String, Vec<String>>,
 }
@@ -441,30 +451,38 @@ pub struct KeysConfig {
 /// What the keys typed after the leader lead to.
 #[derive(Debug, PartialEq)]
 pub enum Lookup {
+    /// A whole sequence, which runs this.
     Run(Command),
     /// A menu: more keys to come.
     More,
+    /// No sequence goes on this way.
     Nothing,
 }
 
 /// One line of the leader menu.
 #[derive(Debug, Clone, PartialEq)]
 pub struct MenuEntry {
+    /// The key to type next.
     pub key: KeySpec,
+    /// What it does, without the name of the menu it is in.
     pub label: String,
     /// It opens a further menu.
     pub group: bool,
+    /// What it runs; `None` for a further menu.
     pub command: Option<Command>,
     /// The main action of a theme, whose menu its uppercase letter opens.
     pub main: bool,
 }
 
-/// A menu of the keymap: the keys that open it after the prefix, its title, and its main action.
+/// A menu of the keymap, opened by a key after the prefix.
 #[derive(Debug, Clone)]
 pub struct Menu {
+    /// Its name in the configuration, after `menu_`.
     pub id: &'static str,
+    /// The keys that open it after the prefix; none when the user took them all away.
     pub keys: Vec<KeySpec>,
     pub title: &'static str,
+    /// The action its theme's lowercase letter runs; the leader menu lists these first.
     pub main: Action,
 }
 
@@ -480,8 +498,11 @@ fn strip_word(text: &str, word: &str) -> Option<String> {
 /// Resolved key bindings.
 #[derive(Debug, Clone, Default)]
 pub struct Keymap {
+    /// The name of the preset it was built from.
     pub preset: &'static str,
+    /// The keys that start a leader sequence; hints show the first one.
     pub prefix: Vec<KeySpec>,
+    /// Single keys that need no leader, none of them a prefix key or bound twice.
     pub direct: Vec<(KeySpec, Action)>,
     /// Sequences after the prefix, in menu order.
     pub leader: Vec<(Vec<KeySpec>, Command)>,
@@ -975,6 +996,7 @@ impl Keymap {
         out
     }
 
+    /// The prefix as hints show it: its first key.
     pub fn prefix_label(&self) -> String {
         self.prefix.first().map(|k| k.to_string()).unwrap_or_else(|| "prefix".into())
     }

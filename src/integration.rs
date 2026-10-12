@@ -34,6 +34,7 @@ pub const AGENTS: &[&str] = &[
 /// Hooks laid out as Claude Code lays them out, in a JSON file: each event holds a list of
 /// groups, `{ "matcher": …, "hooks": [{ "type": "command", "command": …, "timeout": … }] }`.
 struct NestedHooks {
+    /// The agent, as `kraal hook <agent>` names it.
     agent: &'static str,
     /// The events kraal listens to, with the matcher tool events take (every tool).
     events: &'static [(&'static str, Option<&'static str>)],
@@ -41,6 +42,7 @@ struct NestedHooks {
     timeout: u64,
 }
 
+/// Claude Code's events kraal listens to.
 const CLAUDE_EVENTS: &[(&str, Option<&str>)] = &[
     ("SessionStart", None),
     ("UserPromptSubmit", None),
@@ -51,6 +53,7 @@ const CLAUDE_EVENTS: &[(&str, Option<&str>)] = &[
     ("SessionEnd", None),
 ];
 
+/// The agents whose hooks are laid out as Claude Code's.
 const NESTED: &[NestedHooks] = &[
     NestedHooks { agent: "claude", events: CLAUDE_EVENTS, timeout: 5 },
     // Factory's droid and Tencent's CodeBuddy Code take Claude Code's hooks as they are.
@@ -262,18 +265,23 @@ fn hook_command(agent: &str) -> Result<String> {
 /// Augment runs a script by its path, not a command line: the one kraal puts in its directory.
 const AUGGIE_SCRIPT: &str = "kraal-hook.sh";
 
-/// Whether a hook's command is kraal's, as this kraal writes it or an older one did.
+/// Whether a hook's command is kraal's: as this kraal writes it, or as kraal 0.2.0 wrote
+/// Augment's (`<kraal> hook auggie`), so that installing again replaces it and uninstalling
+/// removes it.
 fn is_ours(cmd: &str, agent: &str) -> bool {
     (cmd.contains("kraal") && cmd.ends_with(&format!(" hook {agent}")))
         || (agent == "auggie" && cmd.ends_with(&format!("/{AUGGIE_SCRIPT}")))
 }
 
-/// Whether a hook's command is kraal's as this kraal writes it: Augment does not run the
-/// command line older ones gave it.
+/// Whether a hook's command is kraal's as this kraal writes it. Augment does not run the command
+/// line kraal 0.2.0 gave its hooks: those count as not installed. Once 0.2.0 is no longer
+/// supported (docs/compatibility.md), [`is_ours`] can stop taking them, and this check becomes
+/// that one.
 fn is_current(cmd: &str, agent: &str) -> bool {
     is_ours(cmd, agent) && (agent != "auggie" || cmd.ends_with(&format!("/{AUGGIE_SCRIPT}")))
 }
 
+/// `kraal integration install <agent or shell>`. Returns what was done, for the user.
 pub fn install(agent: &str) -> Result<String> {
     if let Some(s) = SHELLS.iter().find(|s| **s == agent) {
         return install_shell(s, &shell_rc_path(s));
@@ -306,6 +314,8 @@ fn own_file(agent: &str) -> Result<String> {
     })
 }
 
+/// `kraal integration uninstall <agent or shell>`: takes out only what kraal put in. Returns
+/// what was done, for the user.
 pub fn uninstall(agent: &str) -> Result<String> {
     if let Some(s) = SHELLS.iter().find(|s| **s == agent) {
         return uninstall_shell(s, &shell_rc_path(s));
@@ -333,6 +343,7 @@ pub fn show(shell: &str) -> Result<String> {
     Ok(shell_block(shell).trim_end().to_string())
 }
 
+/// Whether kraal's hooks or shell lines are in place for `agent`, as a line for the user.
 pub fn status(agent: &str) -> Result<String> {
     if let Some(s) = SHELLS.iter().find(|s| **s == agent) {
         return Ok(shell_status(s, &shell_rc_path(s)));
@@ -378,6 +389,7 @@ fn status_line(agent: &str, path: &Path, top_level: bool) -> Result<String> {
     })
 }
 
+/// A JSON file; `{}` when it is missing or blank.
 fn read_json(path: &Path) -> Result<Value> {
     match std::fs::read_to_string(path) {
         Ok(s) if s.trim().is_empty() => Ok(json!({})),
@@ -387,6 +399,8 @@ fn read_json(path: &Path) -> Result<Value> {
     }
 }
 
+/// Replace a file of the user's (an agent's settings, a shell's startup file) atomically, after
+/// copying what it held to `<name>.kraal-bak`.
 fn write_with_backup(path: &Path, content: &str) -> Result<()> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
@@ -827,6 +841,7 @@ fn kimi_events(path: &Path) -> Result<Vec<&'static str>> {
         .collect())
 }
 
+/// A file's text; empty when it is missing.
 fn read_text(path: &Path) -> Result<String> {
     match std::fs::read_to_string(path) {
         Ok(t) => Ok(t),
@@ -1013,6 +1028,10 @@ fn write_codex_config(
     write_with_backup(path, &text)
 }
 
+/// `s` as a TOML basic string, escaping only `\` and `"`: a control character (a newline in a
+/// path) goes through as it is, which TOML refuses. Its callers read their edit back as TOML
+/// before writing it ([`write_codex_config`], [`write_toml_hooks`]), so such a value stops the
+/// edit rather than breaking the file.
 fn toml_string(s: &str) -> String {
     format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
 }
