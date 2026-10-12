@@ -256,18 +256,21 @@ fn check_grid(p: &Pane) {
 /// What the pane holds stays within its limits.
 fn check_bounds(p: &mut Pane, scrollback: usize) {
     let Some(t) = p.term_mut() else { return };
-    let width = t.term.columns();
     let own = t.own_history();
-    let archived: usize = t.archive.lines().oldest_first().map(|l| l.rows_at(width)).sum();
-    let lens = t.archive.lens_rows();
-    // The emulator keeps a couple of screens and a batch of its own beyond what the archive
-    // trims to, and the lens is a copy.
+    // The archive holds whole lines, trimmed to the scrollback at the width they were laid out
+    // at (at a new width, when they are next brought back): at least a row each. The emulator
+    // keeps a couple of screens and a batch of its own beyond what the archive trims to, and the
+    // lens is a copy.
+    let lines = t.archive.lines().len();
     let screens = t.term.screen_lines();
     assert!(
-        archived + own <= scrollback + 2 * screens.max(32) + 1300,
-        "history of {archived} archived and {own} rows, for a scrollback of {scrollback} ({lens} in the lens)"
+        lines + own <= scrollback + 2 * screens.max(32) + 1300,
+        "a history of {lines} archived lines and {own} rows, for a scrollback of {scrollback}"
     );
-    assert!(t.archive.lines().bytes() <= (scrollback + 1) * (width * 64 + 64), "the archive outgrew its rows");
+    // A line is kept as its text and the changes of attributes along it: a few bytes a cell at
+    // most, for rows of the widest pane.
+    let bytes = t.archive.lines().bytes();
+    assert!(bytes <= (scrollback + 1300) * 300 * 64, "{bytes} bytes for {lines} archived lines");
 }
 
 #[test]
@@ -288,6 +291,19 @@ fn fuzz_pane_output() {
                             assert!(title.chars().count() <= 300 && body.chars().count() <= 300);
                         }
                     }
+                    fuzz::trace(|| {
+                        let t = f.pane.term().unwrap();
+                        let g = t.term.grid();
+                        format!(
+                            "  read offset {} history {} alt {} vi {}: {:?}",
+                            g.display_offset(),
+                            g.history_size(),
+                            t.term.mode().contains(TermMode::ALT_SCREEN),
+                            t.term.mode().contains(TermMode::VI),
+                            chunk.escape_ascii().to_string().chars().take(200).collect::<String>()
+                        )
+                    });
+                    check_grid(&f.pane);
                 }
             } else {
                 act(rng, &mut f, &recent);
