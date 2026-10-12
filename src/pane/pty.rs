@@ -208,6 +208,9 @@ pub struct TermPane {
     /// Bytes sent to the PTY not written yet: a program that stops reading its input cannot
     /// make kraal hold an unbounded amount of it.
     pub(super) input_pending: Arc<AtomicUsize>,
+    /// The PTY does not wait when it is full: input is written to it at once, from the server's
+    /// thread, while nothing waits for the writer thread (see [`start_io`]).
+    direct: bool,
     /// Input was dropped because of that, since the server last asked.
     pub input_dropped: bool,
     /// Output read from the PTY, waiting to be parsed.
@@ -328,6 +331,7 @@ impl TermPane {
             master: pair.master,
             input: io.input,
             input_pending: io.input_pending,
+            direct: io.direct,
             input_dropped: false,
             output: io.output,
             process: Arc::new(Process::default()),
@@ -382,12 +386,24 @@ impl TermPane {
         }
     }
 
-    pub(super) fn write(&mut self, bytes: Vec<u8>) {
+    /// Send `bytes` to the program: written at once as far as the PTY takes them, when nothing
+    /// waits for the writer thread, which writes the rest (in order) as the program reads.
+    pub(super) fn write(&mut self, mut bytes: Vec<u8>) {
         if bytes.len() > self.input_room() {
             self.input_dropped = true;
             return;
         }
-        self.input_pending.fetch_add(bytes.len(), Ordering::Relaxed);
+        if self.input_pending.load(Ordering::Acquire) == 0
+            && self.direct
+            && let Some(fd) = self.master.as_raw_fd()
+        {
+            let done = write_now(fd, &bytes);
+            if done == bytes.len() {
+                return;
+            }
+            bytes.drain(..done);
+        }
+        self.input_pending.fetch_add(bytes.len(), Ordering::AcqRel);
         let _ = self.input.send(bytes);
     }
 
@@ -633,6 +649,8 @@ pub fn launcher() -> Sender<Pending> {
 struct Io {
     input: Sender<Vec<u8>>,
     input_pending: Arc<AtomicUsize>,
+    /// The PTY does not wait: input can be written to it from the server's thread.
+    direct: bool,
     output: Arc<Output>,
     /// Closed when the reader has seen the end of the output.
     eof: crossbeam_channel::Receiver<()>,
@@ -640,9 +658,17 @@ struct Io {
     writer_stop: WriterStop,
 }
 
+/// Start the reader and the writer threads of a PTY. On Linux the PTY is made not to wait
+/// (`O_NONBLOCK`): a key is then written from the server's thread without handing it to the
+/// writer, which only writes what the PTY had no room for, and the reader waits in `poll`.
 fn start_io(id: PaneId, master: &(dyn MasterPty + Send), tx: &Sender<Event>) -> Result<Io> {
     let stop = ReaderStop::new(master.tty_name());
+    #[cfg(target_os = "linux")]
+    let direct = master.as_raw_fd().is_some_and(set_nonblocking);
+    #[cfg(not(target_os = "linux"))]
+    let direct = false;
     let reader = PtyReader::new(master, stop.wakes())?;
+    let polled = if direct { Some(reader.duplicate()?) } else { None };
     let writer = master.take_writer()?;
     let ready_tx = tx.clone();
     let output = Arc::new(Output::default());
@@ -655,16 +681,19 @@ fn start_io(id: PaneId, master: &(dyn MasterPty + Send), tx: &Sender<Event>) -> 
         // it also looks for panes with output now and then.
         read_output(reader, &out, &stopped, || ready_tx.try_send(Event::PaneReady(id)).is_ok());
     })?;
-    let (input, writer_stop) = start_writer(id, writer, master.tty_name()).inspect_err(|_| stop.stop())?;
+    let (input, writer_stop) =
+        start_writer(id, writer, master.tty_name(), polled).inspect_err(|_| stop.stop())?;
     let input_pending = writer_stop.pending.clone();
-    Ok(Io { input, input_pending, output, eof: eof_rx, stop, writer_stop })
+    Ok(Io { input, input_pending, direct, output, eof: eof_rx, stop, writer_stop })
 }
 
-/// Start the thread that writes what is sent to `writer`, the PTY `tty` is the other end of.
+/// Start the thread that writes what is sent to `writer`, the PTY `tty` is the other end of;
+/// `polled`, a copy of a PTY that does not wait, is where it waits for room.
 fn start_writer(
     id: PaneId,
     mut writer: Box<dyn Write + Send>,
     tty: Option<PathBuf>,
+    polled: Option<std::fs::File>,
 ) -> std::io::Result<(Sender<Vec<u8>>, WriterStop)> {
     let (in_tx, in_rx) = crossbeam_channel::unbounded::<Vec<u8>>();
     let (gone_tx, gone) = crossbeam_channel::bounded::<()>(0);
@@ -674,10 +703,11 @@ fn start_writer(
         let _gone = gone_tx;
         for data in in_rx {
             // What waits once the pane went is no one's.
-            if stopped.load(Ordering::Acquire) || writer.write_all(&data).and_then(|_| writer.flush()).is_err() {
+            if stopped.load(Ordering::Acquire) || write_waiting(&mut writer, polled.as_ref(), &stopped, &data).is_err() {
                 break;
             }
-            pending.fetch_sub(data.len(), Ordering::Relaxed);
+            // Written: once nothing is left, the server writes again itself.
+            pending.fetch_sub(data.len(), Ordering::AcqRel);
         }
         // Before it is said gone: letting go of it writes an end of input to the PTY, which
         // may wait for room too.
@@ -721,6 +751,74 @@ fn drop_input(tty: &Path, gone: &crossbeam_channel::Receiver<()>) {
     let mut buf = [0u8; 4096];
     while gone.recv_timeout(Duration::from_millis(1)) == Err(crossbeam_channel::RecvTimeoutError::Timeout) {
         while matches!(input.read(&mut buf), Ok(n) if n > 0) {}
+    }
+}
+
+/// Make descriptor `fd` (and its copies) not wait.
+#[cfg(target_os = "linux")]
+fn set_nonblocking(fd: std::os::fd::RawFd) -> bool {
+    // SAFETY: plain calls on a descriptor the PTY owns.
+    unsafe {
+        let flags = libc::fcntl(fd, libc::F_GETFL);
+        flags >= 0 && libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) == 0
+    }
+}
+
+/// Write what descriptor `fd` takes of `data` without waiting: how much it took. An error is
+/// left for the writer thread to meet with the rest.
+fn write_now(fd: std::os::fd::RawFd, data: &[u8]) -> usize {
+    let mut done = 0;
+    while done < data.len() {
+        let rest = &data[done..];
+        // SAFETY: writes from a live slice to a descriptor the pane owns.
+        let n = unsafe { libc::write(fd, rest.as_ptr().cast(), rest.len()) };
+        match n {
+            n if n > 0 => done += n as usize,
+            n if n < 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted => {}
+            _ => break,
+        }
+    }
+    done
+}
+
+/// Write all of `data` to a PTY, waiting for room until told to stop (`stopped`): in `poll` on
+/// `polled` (a copy of the PTY) when the PTY does not wait itself.
+fn write_waiting(
+    writer: &mut impl Write,
+    polled: Option<&std::fs::File>,
+    stopped: &AtomicBool,
+    mut data: &[u8],
+) -> std::io::Result<()> {
+    use std::io::ErrorKind;
+    while !data.is_empty() {
+        match writer.write(data) {
+            Ok(0) => return Err(ErrorKind::WriteZero.into()),
+            Ok(n) => data = &data[n..],
+            Err(e) if e.kind() == ErrorKind::Interrupted => {}
+            Err(e) if e.kind() == ErrorKind::WouldBlock && stopped.load(Ordering::Acquire) => return Err(e),
+            Err(e) if e.kind() == ErrorKind::WouldBlock => match polled {
+                Some(file) => {
+                    poll_one(file, libc::POLLOUT, 200)?;
+                }
+                None => std::thread::sleep(Duration::from_millis(1)),
+            },
+            Err(e) => return Err(e),
+        }
+    }
+    writer.flush()
+}
+
+/// Wait up to `wait_ms` (-1: as long as it takes) for `events` on `file`: whether they came.
+fn poll_one(file: &std::fs::File, events: libc::c_short, wait_ms: i32) -> std::io::Result<bool> {
+    use std::os::fd::AsRawFd;
+    let mut fds = libc::pollfd { fd: file.as_raw_fd(), events, revents: 0 };
+    // SAFETY: one valid pollfd.
+    match unsafe { libc::poll(&mut fds, 1, wait_ms) } {
+        n if n < 0 => {
+            let e = std::io::Error::last_os_error();
+            if e.kind() == std::io::ErrorKind::Interrupted { Ok(false) } else { Err(e) }
+        }
+        n => Ok(n > 0),
     }
 }
 
@@ -796,6 +894,13 @@ impl PtyReader {
                 Ok(_) if stop.load(Ordering::Acquire) => return None,
                 Ok(n) => return Some(n),
                 Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                // A PTY that does not wait (see `start_io`): the reader waits for it here, as
+                // it would in `read`.
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    if self.woken {
+                        poll_one(&self.file, libc::POLLIN, -1).ok()?;
+                    }
+                }
                 Err(_) => return None,
             }
         }
@@ -803,16 +908,12 @@ impl PtyReader {
 
     /// Whether output (or the end) came within `wait`.
     fn ready(&self, wait: Duration) -> std::io::Result<bool> {
-        use std::os::fd::AsRawFd;
-        let mut fds = libc::pollfd { fd: self.file.as_raw_fd(), events: libc::POLLIN, revents: 0 };
-        // SAFETY: one valid pollfd.
-        match unsafe { libc::poll(&mut fds, 1, wait.as_millis() as i32) } {
-            n if n < 0 => {
-                let e = std::io::Error::last_os_error();
-                if e.kind() == std::io::ErrorKind::Interrupted { Ok(false) } else { Err(e) }
-            }
-            n => Ok(n > 0),
-        }
+        poll_one(&self.file, libc::POLLIN, wait.as_millis() as i32)
+    }
+
+    /// Another descriptor of the PTY, to wait on.
+    fn duplicate(&self) -> Result<std::fs::File> {
+        self.file.try_clone().context("duplicating the pty")
     }
 }
 
@@ -1265,6 +1366,59 @@ mod tests {
             std::thread::sleep(Duration::from_millis(20));
         }
         assert!(!taken(), "ended, and not left a zombie");
+    }
+
+    #[test]
+    fn input_a_program_does_not_read_yet_waits_for_it_in_order() {
+        let dir = std::env::temp_dir().join(format!("kraal-input-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let got = dir.join("got");
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let env = PaneEnv {
+            socket: "/nonexistent".into(),
+            session: "t".into(),
+            shell: "sh".into(),
+            scrollback: 100,
+            graphics: Default::default(),
+        };
+        const N: usize = 300_000;
+        // Raw, so that the terminal passes each byte on as it is.
+        let script =
+            format!("stty raw -echo; echo ready; sleep 0.5; head -c {} > '{}'; echo done", N + 3, got.display());
+        let spec = PaneSpec { command: vec!["sh".into(), "-c".into(), script], ..Default::default() };
+        let mut pane = TermPane::spawn(1, &spec, 20, 5, &env, &tx).unwrap();
+        let mut seen = Vec::new();
+        let mut wait_for = |pane: &TermPane, what: &str| {
+            let start = Instant::now();
+            let mut buf = Vec::new();
+            while !String::from_utf8_lossy(&seen).contains(what) {
+                assert!(start.elapsed() < Duration::from_secs(10), "{what}: {:?}", String::from_utf8_lossy(&seen));
+                if pane.output.take(&mut buf, false) {
+                    seen.extend_from_slice(&buf);
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        };
+        wait_for(&pane, "ready");
+        let data: Vec<u8> = (0..N).map(|i| b'a' + (i % 26) as u8).collect();
+        let start = Instant::now();
+        pane.write(data.clone());
+        pane.write(b"END".to_vec());
+        // Far more than the PTY holds: the rest waits for the writer thread, not the server.
+        assert!(start.elapsed() < Duration::from_millis(200), "{:?}", start.elapsed());
+        let pending = pane.input_pending.load(Ordering::Acquire);
+        assert!(pending > 0);
+        #[cfg(target_os = "linux")]
+        assert!(pending < N + 3, "what the PTY had room for was written at once");
+        wait_for(&pane, "done");
+        let mut want = data;
+        want.extend_from_slice(b"END");
+        let written = std::fs::read(&got).unwrap();
+        assert_eq!(written.len(), want.len());
+        assert!(written == want, "every byte, in order");
+        assert_eq!(pane.input_pending.load(Ordering::Acquire), 0);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

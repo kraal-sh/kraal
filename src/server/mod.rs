@@ -301,7 +301,7 @@ impl Workspace {
 
 pub struct Client {
     pub id: ClientId,
-    pub out: Sender<Vec<u8>>,
+    pub out: clients::Outbox,
     pub attached: bool,
     pub cols: u16,
     pub rows: u16,
@@ -357,7 +357,7 @@ const MAX_MESSAGES: usize = 200;
 /// A control request waiting for a pane condition.
 struct PendingWait {
     client: ClientId,
-    out: Sender<Vec<u8>>,
+    out: clients::Outbox,
     pane: PaneId,
     until: Vec<String>,
     deadline: Option<Instant>,

@@ -11,7 +11,6 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use crossbeam_channel::Sender;
 use serde_json::{Map, Value, json};
 
 use super::{ClientId, Server};
@@ -71,7 +70,7 @@ fn now_ms() -> u64 {
 
 pub struct Subscriber {
     pub client: ClientId,
-    pub out: Sender<Vec<u8>>,
+    pub out: super::clients::Outbox,
     pub filters: Vec<String>,
 }
 
