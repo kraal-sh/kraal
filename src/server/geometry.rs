@@ -71,7 +71,21 @@ impl Server {
     /// Every tiled pane of `root` in `area`, in order: the frame of each pane shown whole, and
     /// the row of each pane folded in a stack (marked `true`).
     fn tiled_rects(&self, root: &Node, area: Rect) -> Vec<(PaneId, Rect, bool)> {
-        root.tiles(area, self.config.pane_frames)
+        let frames = self.config.pane_frames;
+        // Frames ask for the same layouts over and over: the last few are remembered, by value.
+        let mut known = self.tiles.borrow_mut();
+        if let Some(i) = known.iter().position(|(n, a, f, _)| *a == area && *f == frames && n == root) {
+            let hit = known.remove(i);
+            let tiles = hit.3.clone();
+            known.push(hit);
+            return tiles;
+        }
+        let tiles = root.tiles(area, frames);
+        if known.len() >= 8 {
+            known.remove(0);
+        }
+        known.push((root.clone(), area, frames, tiles.clone()));
+        tiles
     }
 
     /// Where a tiled pane's frame goes: its place, less one column of space when a pane is to its

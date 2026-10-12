@@ -536,6 +536,9 @@ pub struct Server {
     chrome_gen: u64,
     /// What the chrome shows of each pane, while it holds (see `Server::pane_facts`).
     facts: render::FactsCache,
+    /// The last layouts worked out, most recent last (see `Server::tiled_rects`).
+    #[allow(clippy::type_complexity)]
+    tiles: std::cell::RefCell<Vec<(Node, Rect, bool, Vec<(PaneId, Rect, bool)>)>>,
     /// Whether the sidebar had something to show at the last tick.
     sidebar_was_useful: bool,
     /// Whether a client was told how to stop the broadcast its key started.
@@ -741,6 +744,7 @@ pub fn run(session: &str) -> Result<()> {
         typed_quietly: false,
         chrome_gen: 0,
         facts: Default::default(),
+        tiles: Default::default(),
         broadcast_tip_shown: false,
         buffers,
         buffers_dirty: false,
