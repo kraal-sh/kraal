@@ -81,8 +81,11 @@ fn exchange(stream: &mut UnixStream, req: Request) -> Result<Response> {
                 let msg: ServerMsg = serde_json::from_slice(&payload)?;
                 match msg {
                     ServerMsg::Response { result } => return result.map_err(|e| anyhow::anyhow!(e)),
-                    ServerMsg::Exit { reason } => bail!("{reason}"),
-                    ServerMsg::Open { .. } | ServerMsg::Event { .. } | ServerMsg::Events { .. } => continue,
+                    ServerMsg::Exit { reason, .. } => bail!("{reason}"),
+                    ServerMsg::Open { .. }
+                    | ServerMsg::Event { .. }
+                    | ServerMsg::Events { .. }
+                    | ServerMsg::Attached { .. } => continue,
                 }
             }
             Some(_) => continue,
@@ -103,6 +106,76 @@ pub enum Saved {
 /// version refuses every request, so when asking fails it gets SIGTERM, which every version
 /// handles the same way: save the layout, then exit.
 pub fn kill_server(socket: &Path) -> Result<Saved> {
+    stop_server(socket, false)
+}
+
+/// Restart the session's server on this kraal: the server saves the session and stops, telling
+/// its attached clients to wait for the next one, which starts from this binary and restores
+/// the session. Whether the layout was saved, as for `kraal kill`.
+pub fn restart_server(session: &str) -> Result<Saved> {
+    let saved = stop_server(&paths::socket_path(session), true)?;
+    ensure_server(session)?;
+    Ok(saved)
+}
+
+/// The pid and kraal release of the server behind `socket`, given up on quickly when it does
+/// not answer.
+pub fn ping(socket: &Path) -> Result<(u32, String)> {
+    let mut stream = UnixStream::connect(socket)?;
+    stream.set_read_timeout(Some(Duration::from_secs(2)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(2)))?;
+    match exchange(&mut stream, Request::Ping)? {
+        Response::Pong { pid, version, .. } => Ok((pid, version)),
+        _ => bail!("unexpected answer from the server"),
+    }
+}
+
+/// The kraal binary installed where this one was started from. Once an update has replaced the
+/// file, Linux names the running one `<path> (deleted)`: the file now at `<path>` is meant.
+pub fn installed_exe() -> Result<PathBuf> {
+    let exe = std::env::current_exe().context("locating the kraal binary")?;
+    if exe.exists() {
+        return Ok(exe);
+    }
+    let name = exe.to_string_lossy();
+    match name.strip_suffix(" (deleted)").map(PathBuf::from) {
+        Some(path) if path.exists() => Ok(path),
+        _ => bail!("{name} is not there any more"),
+    }
+}
+
+/// Run `kraal -s <session> restart --yes` from `exe` on its own, out of any terminal, pane and
+/// session: it outlives the pane or the server that starts it. What it says goes to the
+/// session's log.
+pub fn restart_detached(exe: &Path, session: &str) -> Result<()> {
+    let log = paths::log_path(session);
+    if let Some(dir) = log.parent() {
+        paths::ensure_private_dir(dir)?;
+    }
+    let out = crate::runbooks::open_private_append(&log)?;
+    let mut cmd = std::process::Command::new(exe);
+    cmd.args(["-s", session, "restart", "--yes"])
+        .stdin(std::process::Stdio::null())
+        .stdout(out.try_clone()?)
+        .stderr(out)
+        .current_dir(dirs::home_dir().unwrap_or_else(|| "/".into()));
+    for var in ["KRAAL_PANE", "KRAAL_SOCKET", "KRAAL_SESSION", "KRAAL_SESSION_NAME"] {
+        cmd.env_remove(var);
+    }
+    // SAFETY: setsid is async-signal-safe.
+    unsafe {
+        use std::os::unix::process::CommandExt;
+        cmd.pre_exec(|| {
+            libc::setsid();
+            Ok(())
+        });
+    }
+    let child = cmd.spawn().with_context(|| format!("starting {}", exe.display()))?;
+    crate::exec::reap_later(child);
+    Ok(())
+}
+
+fn stop_server(socket: &Path, restart: bool) -> Result<Saved> {
     let mut stream = UnixStream::connect(socket)
         .with_context(|| format!("no kraal server at {} (is it running?)", socket.display()))?;
     let (pid, uid) = process::socket_peer(&stream).context("finding the server process")?;
@@ -110,7 +183,7 @@ pub fn kill_server(socket: &Path) -> Result<Saved> {
     if uid != unsafe { libc::getuid() } {
         bail!("{} belongs to another user", socket.display());
     }
-    let saved = match exchange(&mut stream, Request::KillServer) {
+    let saved = match exchange(&mut stream, Request::KillServer { restart }) {
         Ok(Response::Text(why)) => Saved::No(why),
         Ok(_) => Saved::Yes,
         Err(_) => {
@@ -174,7 +247,7 @@ pub fn subscribe(
                     }
                 }
             }
-            ServerMsg::Exit { reason } => bail!("{reason}"),
+            ServerMsg::Exit { reason, .. } => bail!("{reason}"),
             _ => {}
         }
     }
@@ -285,6 +358,8 @@ struct Conn {
     reader: Box<dyn Read + Send>,
     writer: Box<dyn Write + Send>,
     child: Option<std::process::Child>,
+    /// The server's process, when it runs on this machine.
+    server: Option<libc::pid_t>,
     /// The last thing ssh said on stderr (host key, authentication, remote errors).
     ssh_said: Arc<Mutex<String>>,
 }
@@ -319,10 +394,12 @@ fn connect(target: &Target) -> Result<Conn> {
         Target::Local { session } => {
             let socket = ensure_server(session)?;
             let s = UnixStream::connect(&socket)?;
+            let server = process::socket_peer(&s).ok().map(|(pid, _)| pid);
             Ok(Conn {
                 reader: Box::new(s.try_clone()?),
                 writer: Box::new(s),
                 child: None,
+                server,
                 ssh_said: Default::default(),
             })
         }
@@ -346,7 +423,7 @@ fn connect(target: &Target) -> Result<Conn> {
                 Some(stderr) => crate::exec::last_line(stderr),
                 None => Default::default(),
             };
-            Ok(Conn { reader, writer, child: Some(child), ssh_said })
+            Ok(Conn { reader, writer, child: Some(child), server: None, ssh_said })
         }
     }
 }
@@ -386,6 +463,8 @@ fn greet(target: &Target, workspace: &Option<String>) -> Result<Greeted, String>
             Target::Remote { pane, .. } => pane.clone(),
             Target::Local { .. } => None,
         },
+        // A local client is the kraal installed on the server's machine; a remote one may not be.
+        installed: matches!(target, Target::Local { .. }).then(|| protocol::KRAAL_VERSION.to_string()),
     };
     if protocol::write_json(&mut conn.writer, &hello).is_err() {
         return Err(conn.why_lost("could not talk to the server"));
@@ -483,7 +562,7 @@ fn read_keys(fd: std::os::unix::io::RawFd, pause: &KeysPause, mut forward: impl 
 /// Attach the current terminal to a session. Remote sessions reconnect by themselves when the
 /// connection drops; their programs keep running on the server meanwhile. `attached` runs once
 /// the session first answered, before the terminal changes.
-pub fn attach(mut target: Target, workspace: Option<String>, mouse: bool, attached: impl FnOnce()) -> Result<()> {
+pub fn attach(mut target: Target, mut workspace: Option<String>, mouse: bool, attached: impl FnOnce()) -> Result<()> {
     if std::env::var_os("KRAAL_PANE").is_some() {
         bail!("already inside kraal (unset KRAAL_PANE to nest anyway)");
     }
@@ -572,6 +651,9 @@ pub fn attach(mut target: Target, workspace: Option<String>, mouse: bool, attach
 
     let mut greeted = Some(first);
     let mut delay = Duration::from_secs(1);
+    // What the server said it runs, and the server that said it is restarting.
+    let mut server_version = None;
+    let mut restarting = None;
     let reason = 'session: loop {
         let session = match greeted.take() {
             Some(s) => Ok(s),
@@ -612,7 +694,14 @@ pub fn attach(mut target: Target, workspace: Option<String>, mouse: bool, attach
                             }
                         }
                         Ok(Some((_, payload))) => match serde_json::from_slice::<ServerMsg>(&payload) {
-                            Ok(ServerMsg::Exit { reason }) => break 'session reason,
+                            Ok(ServerMsg::Exit { reason, reattach: None }) => break 'session reason,
+                            // The next server shows the same workspace.
+                            Ok(ServerMsg::Exit { reattach: Some(ws), .. }) => {
+                                workspace = Some(ws).filter(|w| !w.is_empty());
+                                restarting = Some(c.server);
+                                break "the session restarts".to_string();
+                            }
+                            Ok(ServerMsg::Attached { version }) => server_version = Some(version),
                             Ok(ServerMsg::Open { url }) => {
                                 let _ = crate::pane::open_url(&url);
                             }
@@ -627,6 +716,13 @@ pub fn attach(mut target: Target, workspace: Option<String>, mouse: bool, attach
             }
             Err(lost) => lost,
         };
+        if let (Some(old), Target::Local { session }) = (restarting.take(), &target) {
+            set_modes(false, mouse);
+            match wait_restarted(session, old, &quit) {
+                Ok(()) => continue 'session,
+                Err(why) => break 'session why,
+            }
+        }
         let Target::Remote { label, .. } = &target else {
             break 'session format!("the server went away ({lost})");
         };
@@ -650,7 +746,41 @@ pub fn attach(mut target: Target, workspace: Option<String>, mouse: bool, attach
     };
     drop(guard);
     eprintln!("[kraal: {reason}]");
+    if let Target::Local { session } = &target {
+        // A session left running on an older kraal is said once more, here.
+        let socket = paths::socket_path(session);
+        let running = server_version
+            .filter(|_| UnixStream::connect(&socket).is_ok())
+            .or_else(|| ping(&socket).ok().map(|(_, v)| v));
+        if let Some(older) = running.filter(|v| protocol::newer(protocol::KRAAL_VERSION, v)) {
+            eprintln!(
+                "kraal {} is installed; session {session} runs {older}: `kraal -s {session} restart` restarts it",
+                protocol::KRAAL_VERSION
+            );
+        }
+    }
     Ok(())
+}
+
+/// Wait until the server that is restarting (`old`) has gone and the next one listens, saying
+/// so on the bottom line; ctrl+c gives up.
+fn wait_restarted(session: &str, old: Option<libc::pid_t>, quit: &AtomicBool) -> Result<(), String> {
+    let start = Instant::now();
+    loop {
+        if quit.load(Ordering::SeqCst) {
+            return Err("gave up waiting for the session to restart".into());
+        }
+        let gone = old.is_none_or(|pid| !process::running(pid));
+        if gone && UnixStream::connect(paths::socket_path(session)).is_ok() {
+            return Ok(());
+        }
+        if start.elapsed() > Duration::from_secs(60) {
+            let log = paths::log_path(session);
+            return Err(format!("the session did not come back after its restart; see {}", log.display()));
+        }
+        status_line("kraal: the session restarts… ctrl+c to quit");
+        std::thread::sleep(Duration::from_millis(100));
+    }
 }
 
 /// `kraal proxy`: relay a client's frames between stdin/stdout and the local session socket.

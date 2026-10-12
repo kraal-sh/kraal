@@ -13,6 +13,53 @@ use crate::agent::AgentState;
 
 pub const PROTOCOL_VERSION: u32 = 2;
 
+/// This kraal's release.
+pub const KRAAL_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Whether release `a` (`0.2.1`, `v0.3.0-rc.1`) comes after release `b`, as semver orders them:
+/// a pre-release comes before its release. A version that cannot be read is never newer.
+pub fn newer(a: &str, b: &str) -> bool {
+    use std::cmp::Ordering;
+    fn parse(v: &str) -> Option<([u64; 3], Vec<&str>)> {
+        let v = v.trim();
+        let v = v.strip_prefix('v').unwrap_or(v);
+        let v = v.split('+').next().unwrap_or(v);
+        let (core, pre) = match v.split_once('-') {
+            Some((core, pre)) => (core, pre.split('.').collect()),
+            None => (v, Vec::new()),
+        };
+        let mut nums = [0u64; 3];
+        let parts: Vec<&str> = core.split('.').collect();
+        if parts.len() > 3 {
+            return None;
+        }
+        for (n, p) in nums.iter_mut().zip(parts) {
+            *n = p.parse().ok()?;
+        }
+        Some((nums, pre))
+    }
+    let (Some((a_nums, a_pre)), Some((b_nums, b_pre))) = (parse(a), parse(b)) else { return false };
+    let pre = || {
+        if a_pre.is_empty() || b_pre.is_empty() {
+            // The release comes after its pre-releases.
+            return b_pre.len().min(1).cmp(&a_pre.len().min(1));
+        }
+        for (x, y) in a_pre.iter().zip(&b_pre) {
+            let order = match (x.parse::<u64>(), y.parse::<u64>()) {
+                (Ok(x), Ok(y)) => x.cmp(&y),
+                (Ok(_), Err(_)) => Ordering::Less,
+                (Err(_), Ok(_)) => Ordering::Greater,
+                (Err(_), Err(_)) => x.cmp(y),
+            };
+            if order != Ordering::Equal {
+                return order;
+            }
+        }
+        a_pre.len().cmp(&b_pre.len())
+    };
+    a_nums.cmp(&b_nums).then_with(pre) == Ordering::Greater
+}
+
 pub const JSON: u8 = 0;
 pub const BYTES: u8 = 1;
 
@@ -69,6 +116,10 @@ pub enum ClientMsg {
         /// A pane to show first (an id or a name), in place of the workspace.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pane: Option<String>,
+        /// The release of the kraal installed on the server's machine, as the client knows it
+        /// (a local client is that binary): the server says when it is newer than its own.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        installed: Option<String>,
     },
     Resize {
         cols: u16,
@@ -88,6 +139,15 @@ pub enum ServerMsg {
     /// The interactive session ended (detach, server shutdown, …).
     Exit {
         reason: String,
+        /// The server restarts (`kraal restart`): the workspace the client showed, to attach to
+        /// again once the next server listens.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reattach: Option<String>,
+    },
+    /// The first answer to an attach: the server's kraal release. A server that does not send
+    /// it is older than this message.
+    Attached {
+        version: String,
     },
     Response {
         result: Result<Response, String>,
@@ -104,6 +164,13 @@ pub enum ServerMsg {
     Events {
         events: Vec<serde_json::Value>,
     },
+}
+
+impl ServerMsg {
+    /// The end of an interactive session that does not come back by itself.
+    pub fn exit(reason: impl Into<String>) -> ServerMsg {
+        ServerMsg::Exit { reason: reason.into(), reattach: None }
+    }
 }
 
 /// Where a new pane goes.
@@ -269,7 +336,12 @@ pub enum Request {
     },
     /// Read the configuration file again; answered with its warnings, one per line.
     ReloadConfig,
-    KillServer,
+    /// Save the session and stop. With `restart`, attached clients wait for the next server
+    /// (older servers read it as a plain stop).
+    KillServer {
+        #[serde(default)]
+        restart: bool,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -338,4 +410,63 @@ pub struct WorkspaceInfo {
     pub working: usize,
     pub blocked: usize,
     pub done: usize,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn releases_compare_as_semver() {
+        assert!(newer("0.2.1", "0.2.0"));
+        assert!(newer("0.10.0", "0.9.9"));
+        assert!(newer("v1.0.0", "0.99.0"));
+        assert!(!newer("0.2.0", "0.2.0"));
+        assert!(!newer("0.2.0", "0.2.1"));
+        assert!(newer("0.3.0", "0.3.0-rc.1"));
+        assert!(!newer("0.3.0-rc.1", "0.3.0"));
+        assert!(newer("0.3.0-rc.10", "0.3.0-rc.9"));
+        assert!(newer("0.3.0-rc.1", "0.3.0-beta.2"));
+        assert!(newer("0.3.0-rc.1.1", "0.3.0-rc.1"));
+        assert!(newer("0.2.1+build.5", "0.2.0"));
+        assert!(newer("0.3", "0.2.9"));
+        assert!(!newer("garbage", "0.2.0") && !newer("0.2.0", "garbage") && !newer("", ""));
+        assert!(!newer(KRAAL_VERSION, KRAAL_VERSION));
+    }
+
+    #[test]
+    fn older_and_newer_peers_read_what_they_know() {
+        // A kraal before these fields reads the messages as it always did.
+        #[derive(Deserialize)]
+        #[serde(tag = "cmd", rename_all = "snake_case")]
+        enum OldRequest {
+            KillServer,
+        }
+        #[derive(Deserialize)]
+        #[serde(tag = "type", rename_all = "snake_case")]
+        enum OldServerMsg {
+            Exit { reason: String },
+        }
+        let kill = serde_json::to_string(&Request::KillServer { restart: true }).unwrap();
+        assert!(matches!(serde_json::from_str::<OldRequest>(&kill), Ok(OldRequest::KillServer)), "{kill}");
+        let exit =
+            serde_json::to_string(&ServerMsg::Exit { reason: "bye".into(), reattach: Some("w".into()) }).unwrap();
+        assert!(
+            matches!(serde_json::from_str::<OldServerMsg>(&exit), Ok(OldServerMsg::Exit { reason }) if reason == "bye")
+        );
+        let attached = serde_json::to_string(&ServerMsg::Attached { version: "0.2.1".into() }).unwrap();
+        assert_eq!(attached, r#"{"type":"attached","version":"0.2.1"}"#);
+        assert!(serde_json::from_str::<OldServerMsg>(&attached).is_err(), "an older client skips it");
+        // And this kraal reads what older ones send.
+        assert!(matches!(
+            serde_json::from_str::<Request>(r#"{"cmd":"kill_server"}"#),
+            Ok(Request::KillServer { restart: false })
+        ));
+        assert!(matches!(
+            serde_json::from_str::<ServerMsg>(r#"{"type":"exit","reason":"detached"}"#),
+            Ok(ServerMsg::Exit { reattach: None, .. })
+        ));
+        let hello = r#"{"type":"attach","version":2,"cols":80,"rows":24,"workspace":null,"remote":false}"#;
+        assert!(matches!(serde_json::from_str::<ClientMsg>(hello), Ok(ClientMsg::Attach { installed: None, .. })));
+    }
 }

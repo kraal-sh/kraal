@@ -281,6 +281,8 @@ pub struct Client {
     pub terminal_focused: bool,
     pub drag: Option<ui::Drag>,
     pub toast: Option<(String, Instant)>,
+    /// A message to show once the one shown now goes.
+    pub notice: Option<String>,
     /// Click bookkeeping for double/triple click selection.
     pub last_click: Option<(Instant, u16, u16, u8)>,
     /// The first session's welcome note is showing.
@@ -340,6 +342,8 @@ pub struct Server {
     quitting: bool,
     /// `kraal kill` requests, answered once the last state is written (or not).
     kill_waiters: Vec<ClientId>,
+    /// The server stops for `kraal restart`: attached clients wait for the next one.
+    restarting: bool,
     /// Colours of the outer terminal, learnt from OSC 10/11 replies.
     pub outer_colors: Option<(String, String)>,
     /// What each client's terminal can show of the panes' images, and has been sent.
@@ -542,6 +546,7 @@ pub fn run(session: &str) -> Result<()> {
         next_render: None,
         quitting: false,
         kill_waiters: Vec::new(),
+        restarting: false,
         outer_colors: None,
         images: HashMap::new(),
         warnings,
@@ -767,8 +772,12 @@ impl Server {
         let expired: Vec<ClientId> =
             self.clients.values().filter(|c| c.toast.as_ref().is_some_and(|(_, t)| *t <= now)).map(|c| c.id).collect();
         for id in expired {
-            if let Some(c) = self.clients.get_mut(&id) {
+            let notice = self.clients.get_mut(&id).and_then(|c| {
                 c.toast = None;
+                c.notice.take()
+            });
+            if let Some(text) = notice {
+                self.toast(id, text);
             }
             self.mark_dirty_client(id);
         }
@@ -1141,7 +1150,18 @@ impl Server {
         self.hooks.stop_all();
         let ids: Vec<ClientId> = self.clients.keys().copied().collect();
         for id in ids {
-            self.send_msg(id, &ServerMsg::Exit { reason: "server exited".into() });
+            // On a restart, attached clients come back to the workspace they show; one older
+            // than that says how to come back.
+            let shown = self.clients.get(&id).filter(|c| c.attached).map(|c| c.workspace);
+            let reattach = shown.filter(|_| self.restarting).map(|ws| {
+                let wi = self.ws_index(ws).unwrap_or(0);
+                self.workspaces.get(wi).map(|w| w.name.clone()).unwrap_or_default()
+            });
+            let msg = match reattach {
+                Some(_) => ServerMsg::Exit { reason: "kraal restarted: run kraal to attach again".into(), reattach },
+                None => ServerMsg::exit("server exited"),
+            };
+            self.send_msg(id, &msg);
         }
         for p in self.panes.values_mut() {
             p.kill();

@@ -92,5 +92,5 @@ case ":$PATH:" in
     *) say "$dir is not in your PATH: add it, or run $dir/kraal" ;;
 esac
 if [ "$had" = 1 ]; then
-    say "A kraal server already running keeps the old version until: kraal kill"
+    say "A kraal session already running keeps the old version until: kraal restart (kraal ls says which)"
 fi

@@ -22,6 +22,13 @@ again. After a restart of the server or a reboot, the processes are gone, but kr
 layout, reconnects SSH shells and resumes agent conversations; other commands wait for Enter
 before they run again.
 
+`kraal restart` (or `ctrl+b W r`) restarts a session's server on the kraal installed now, after an
+update for instance: the server saves the session and stops, and a new one starts and brings it
+back as above. First it lists the panes whose programs would stop (a shell at its prompt runs
+nothing; an agent in the middle of a turn loses that turn) and asks; `--yes` does not ask.
+Attached terminals wait for the new server and come back to the workspace they showed. Run from a
+pane of the session, the restart goes on once that pane has closed.
+
 Each pane also shows again what it showed, scrollback and colours included, down to a dim
 `kraal: restored from <time>` line; what runs in it now writes below that line. Copy mode and
 search reach the restored text. A full-screen program (an editor, `htop`) is not saved: its pane

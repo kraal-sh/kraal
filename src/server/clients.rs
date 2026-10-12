@@ -76,6 +76,7 @@ impl Server {
                 paste: None,
                 drag: None,
                 toast: None,
+                notice: None,
                 last_click: None,
                 welcome: false,
                 remote: false,
@@ -97,16 +98,19 @@ impl Server {
             }
         };
         match msg {
-            ClientMsg::Attach { version, cols, rows, workspace, remote, pane } => {
+            ClientMsg::Attach { version, cols, rows, workspace, remote, pane, installed } => {
                 if let Some(c) = self.clients.get_mut(&id) {
                     c.remote = remote;
                 }
                 let (cols, rows) = clamp_size(cols, rows);
                 if version != protocol::PROTOCOL_VERSION {
-                    self.send_msg(id, &ServerMsg::Exit { reason: version_mismatch(version) });
+                    self.send_msg(id, &ServerMsg::exit(version_mismatch(version)));
                     return;
                 }
                 self.attach(id, cols, rows, workspace);
+                if let Some(installed) = installed {
+                    self.version_notice(id, &installed);
+                }
                 // A pane asked for (an agent chosen from another kraal's sidebar) is shown.
                 if let Some(p) = pane {
                     match self.resolve(&p) {
@@ -153,12 +157,14 @@ impl Server {
             let ws = self.new_workspace("main".into(), None);
             if let Err(e) = self.spawn_pane_in(ws, None, PaneSpec::default(), crate::protocol::Placement::Tab, None) {
                 self.drop_empty_workspaces();
-                self.send_msg(id, &ServerMsg::Exit { reason: format!("cannot start a shell: {e:#}") });
+                self.send_msg(id, &ServerMsg::exit(format!("cannot start a shell: {e:#}")));
                 return;
             }
         }
         let ws = target.unwrap_or_else(|| self.workspaces[0].id);
         let welcome = !crate::paths::state_dir().join("welcomed").exists();
+        // Before anything is drawn: what this server is.
+        self.send_msg(id, &ServerMsg::Attached { version: protocol::KRAAL_VERSION.into() });
         if let Some(c) = self.clients.get_mut(&id) {
             c.attached = true;
             c.cols = cols;
@@ -183,7 +189,7 @@ impl Server {
 
     pub fn detach(&mut self, id: ClientId, reason: &str) {
         self.graphics_farewell(id);
-        self.send_msg(id, &ServerMsg::Exit { reason: reason.to_string() });
+        self.send_msg(id, &ServerMsg::exit(reason));
         self.drop_client(id);
     }
 

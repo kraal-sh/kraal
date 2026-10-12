@@ -5,7 +5,8 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use crossbeam_channel::Sender;
 
-use super::{Event, Server};
+use super::ui::{ConfirmAction, Mode};
+use super::{ClientId, Event, Server};
 use crate::layout::PaneId;
 use crate::paths;
 use crate::persist::{self, SavedScrollback, SessionSnapshot};
@@ -112,6 +113,48 @@ impl Server {
 
     pub(super) fn apply_snapshot(&mut self, snap: SessionSnapshot) -> Result<()> {
         persist::apply(self, snap)
+    }
+
+    /// The question before a restart, with what it stops.
+    pub(super) fn ask_restart(&self) -> Mode {
+        let mut message = format!(
+            "Restart session {} on the kraal installed now? The layout, the scrollback, SSH shells and agents come back.",
+            self.session
+        );
+        let stops = self.restart_stops();
+        if !stops.is_empty() {
+            message.push_str("\nThese programs stop:");
+            for line in stops {
+                message.push_str("\n  ");
+                message.push_str(&line);
+            }
+        }
+        Mode::confirm(message, ConfirmAction::Restart)
+    }
+
+    /// What a restart stops, a line per pane, in the order of the workspaces.
+    fn restart_stops(&self) -> Vec<String> {
+        let ids: Vec<PaneId> = self.workspaces.iter().flat_map(|w| w.panes()).collect();
+        ids.into_iter()
+            .filter_map(|id| {
+                let pane = self.panes.get(&id)?;
+                let program = if pane.shell_waiting() { None } else { pane.foreground_argv() };
+                let info = self.pane_info(id);
+                let what = persist::stops_on_restart(&info, program.as_deref())?;
+                Some(persist::stopping_line(&info, &what))
+            })
+            .collect()
+    }
+
+    /// Restart the session: a helper started from the kraal installed now stops this server and
+    /// starts the next one, which every attached client waits for.
+    pub(super) fn restart(&mut self, client: ClientId) {
+        let started =
+            crate::client::installed_exe().and_then(|exe| crate::client::restart_detached(&exe, &self.session));
+        match started {
+            Ok(()) => self.toast(client, "restarting the session…"),
+            Err(e) => self.toast(client, format!("cannot restart: {e:#}")),
+        }
     }
 }
 

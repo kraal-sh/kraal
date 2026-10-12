@@ -11,7 +11,8 @@ use anyhow::{Context, Result, bail};
 const REPO: &str = "kraal-sh/kraal";
 const DOWNLOAD: Duration = Duration::from_secs(300);
 
-pub fn update(check: bool, to: Option<String>, force: bool) -> Result<()> {
+/// `restart`: what to do with the sessions left on an older kraal (`None`: ask).
+pub fn update(check: bool, to: Option<String>, force: bool, restart: Option<bool>) -> Result<()> {
     let current = env!("CARGO_PKG_VERSION");
     if check {
         let latest = latest_tag()?;
@@ -34,7 +35,7 @@ pub fn update(check: bool, to: Option<String>, force: bool) -> Result<()> {
         None => release_url(to.as_deref()),
     };
     let tmp = tempdir()?;
-    let result = (|| -> Result<()> {
+    let result = (|| -> Result<Option<String>> {
         let archive = tmp.join(&asset);
         let sum = tmp.join(format!("{asset}.sha256"));
         fetch(&format!("{base}/{asset}"), &archive)?;
@@ -53,15 +54,17 @@ pub fn update(check: bool, to: Option<String>, force: bool) -> Result<()> {
         let version = String::from_utf8_lossy(&out.stdout).split_whitespace().nth(1).unwrap_or_default().to_string();
         if version == current && !force {
             println!("kraal {current} is already installed");
-            return Ok(());
+            return Ok(None);
         }
         replace(&new, &exe)?;
         println!("kraal {current} → {version} ({})", exe.display());
-        println!("A kraal server already running keeps the old version until: kraal kill");
-        Ok(())
+        Ok(Some(version))
     })();
     let _ = std::fs::remove_dir_all(&tmp);
-    result
+    match result? {
+        Some(version) => super::restart::after_update(&exe, &version, restart),
+        None => Ok(()),
+    }
 }
 
 /// The archive name of a release for this OS and architecture (`std::env::consts`).

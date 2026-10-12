@@ -23,9 +23,15 @@ installing anything, into `~/.local/bin`. Settings:
 ## Updates
 
 `kraal update` replaces kraal with the latest release the same way: `--check` only says whether
-there is one, `--to v0.2.0` picks one. A server already running keeps the old version until
-`kraal kill`. A kraal installed by a package manager (Homebrew, Nix, your distribution) is
-updated there instead.
+there is one, `--to v0.2.0` picks one. A kraal installed by a package manager (Homebrew, Nix,
+your distribution) is updated there instead.
+
+A session's server keeps the version it started with. After installing, `kraal update` lists the
+sessions still on an older kraal, with the programs a restart would stop in them, and offers to
+[restart](workspaces.md#persistence) them: no by default when programs would stop, and without a
+terminal to ask on; `--restart` or `--no-restart` answer beforehand. Later, `kraal ls` shows the
+version each session runs, attaching to a session on an older kraal says so, and
+`kraal restart` (or `ctrl+b W r`) restarts it.
 
 ## With Cargo
 
