@@ -3247,6 +3247,37 @@ fn a_long_paste_keeps_going_where_it_started_and_never_into_production() {
 }
 
 #[test]
+fn a_paste_held_until_its_end_goes_where_it_started() {
+    let env = Env::new("heldpaste");
+    let (got, other_got) = (env.root.join("pasted"), env.root.join("other-pasted"));
+    env.workspace("w", "layout {\n    pane name=\"main\"\n}\n");
+    env.run(&["open", "w"]);
+    let take = |file: &Path| format!("stty raw -echo; cat > {}", file.display());
+    env.run(&["run", "--name", "sink", "--", "sh", "-c", &take(&got)]);
+    env.run(&["run", "--name", "other", "--", "sh", "-c", &take(&other_got)]);
+    env.run(&["focus", "sink"]);
+    let mut client = RawClient::attach(&env, "w");
+    // Less than kraal holds back (8 MiB): it goes whole once it ends.
+    let line = "x".repeat(99) + "\n";
+    client.send(b"\x1b[200~");
+    for chunk in line.repeat(10_000).as_bytes().chunks(64 << 10) {
+        client.send(chunk);
+    }
+    std::thread::sleep(Duration::from_millis(300));
+    // The focus moves before its end: all of it still goes where it started.
+    env.run(&["focus", "other"]);
+    client.send(b"end\x1b[201~");
+    let size = |f: &Path| std::fs::metadata(f).map(|m| m.len()).unwrap_or(0);
+    let start = Instant::now();
+    while size(&got) < 1_000_003 && size(&other_got) == 0 {
+        assert!(start.elapsed() < Duration::from_secs(10), "only {} bytes arrived", size(&got));
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!((size(&got), size(&other_got)), (1_000_003, 0));
+}
+
+#[test]
 fn copy_mode_releases_the_button_the_program_saw_pressed() {
     let env = Env::new("copyrelease");
     env.workspace("w", "layout {\n    pane name=\"main\"\n}\n");
