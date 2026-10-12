@@ -1262,6 +1262,21 @@ mod tests {
         assert_eq!(screen::lines_text(&pane.term().unwrap().term, 0, 12), screen::lines_text(&reference, 0, 12));
     }
 
+    /// A view scrolled up while a region below the first line scrolls: alacritty moves the view
+    /// up with it although no row goes into the history. It stays within the history.
+    #[test]
+    fn a_view_scrolled_up_stays_in_the_history_while_a_region_scrolls() {
+        use alacritty_terminal::grid::Dimensions;
+        let mut pane = fed_pane(10, 5, 100);
+        pane.feed(b"a\r\nb\r\nc\r\nd\r\ne\r\nf\r\ng\r\n");
+        pane.scroll(2);
+        pane.feed(b"\x1b[2;5r\x1b[5;1H\n\n\n\n\n\n\n\n\n\n");
+        let grid = pane.term().unwrap().term.grid();
+        assert!(grid.display_offset() <= grid.history_size());
+        let mut buf = Buffer::empty(Rect::new(0, 0, 10, 5));
+        pane.render(Rect::new(0, 0, 10, 5), &mut buf, &mut crate::ansi::Links::new());
+    }
+
     #[test]
     fn shells_are_told_from_other_programs() {
         for shell in ["zsh", "-zsh", "/bin/bash", "/usr/bin/fish", "sh"] {

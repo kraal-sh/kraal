@@ -178,7 +178,7 @@ impl TermPane {
         if self.commands.list.is_empty() {
             change(self);
             self.guard.take_top_margin();
-            self.keep_vi_cursor();
+            self.keep_on_grid();
             return;
         }
         let screen = (self.commands.history_max == 0 && !self.alt_screen()).then(|| self.screen());
@@ -203,12 +203,14 @@ impl TermPane {
         if self.guard.take_top_margin() {
             self.commands.unplace();
         }
-        self.keep_vi_cursor();
+        self.keep_on_grid();
     }
 
-    /// Output may take away the rows the copy-mode cursor is on (the alternate screen has no
-    /// history): it stays on the grid, where the emulator can read it.
-    fn keep_vi_cursor(&mut self) {
+    /// Output may take away the rows the view and the copy-mode cursor are on (the alternate
+    /// screen has no history), or move the view past the history (an image placed in a scroll
+    /// region too): both stay on the grid, where the emulator can read them.
+    fn keep_on_grid(&mut self) {
+        super::archive::keep_view_in_history(&mut self.term);
         if self.term.mode().contains(TermMode::VI) {
             let (top, bottom, last) = (self.term.topmost_line(), self.term.bottommost_line(), self.term.last_column());
             let cursor = &mut self.term.vi_mode_cursor.point;
