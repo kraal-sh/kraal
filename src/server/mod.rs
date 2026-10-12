@@ -579,8 +579,13 @@ const BUSY_AFTER: u8 = 3;
 /// How long after a key the output of the pane it went to is drawn at once, as its echo.
 const ECHO_WAIT: Duration = Duration::from_millis(250);
 /// Output is parsed this much at a time, so that what comes meanwhile (a key, its echo) does not
-/// wait for all that a program printed to be parsed.
+/// wait for all that a program printed to be parsed...
 const PARSE_SLICE: usize = 8 * 1024;
+/// ...and this much while someone types (see `TYPING`): a key and its echo each wait for a
+/// slice at most.
+const TYPING_SLICE: usize = 1024;
+/// How long after a key someone counts as typing.
+const TYPING: Duration = Duration::from_secs(1);
 
 /// Whether what was last done at `last` is due again at `now`, done `every` so often: a little
 /// early rather than a whole tick late.
@@ -974,9 +979,11 @@ impl Server {
     /// something waits in `rx`: then the rest is parsed before any more of the pane's output,
     /// and the pane stays in the queue for it.
     fn parse_output(&mut self, id: PaneId, data: &[u8], rx: &Receiver<Event>) -> bool {
+        let typing = self.clients.values().any(|c| c.attached && c.last_input.elapsed() < TYPING);
+        let slice = if typing { TYPING_SLICE } else { PARSE_SLICE };
         let mut at = 0;
         while at < data.len() {
-            let end = (at + PARSE_SLICE).min(data.len());
+            let end = (at + slice).min(data.len());
             self.pane_output(id, &data[at..end]);
             at = end;
             if at < data.len() && !rx.is_empty() && self.panes.contains_key(&id) {
