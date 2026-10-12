@@ -16,11 +16,14 @@ use super::{ClientId, Server};
 use crate::graphics::paint::{self, Drawn, Motion, Painted};
 use crate::graphics::quantize::{self, Indexed};
 use crate::graphics::{self, Picture};
+use crate::layout::PaneId;
 
 /// Image data sent with one frame at most; the rest follows with the next frames.
 const BUDGET: usize = 4 << 20;
 /// Pictures fitted for sixel at once, each on a thread of its own.
 const FITTING: usize = 4;
+/// The panes' pictures prepared at once, each on a thread of its own (a pane's one at a time).
+const PREPARING: usize = 2;
 /// How long an image that moved stays put before it is drawn again as sixel.
 const STILL: Duration = Duration::from_millis(100);
 
@@ -388,6 +391,33 @@ impl Server {
             self.fit_later(picture, width, height);
         }
         (erase, draw, wake)
+    }
+
+    /// Prepare the panes' pictures that wait for it off the loop, [`PREPARING`] at once at most.
+    pub(super) fn prepare_images(&mut self) {
+        while self.preparing < PREPARING {
+            let Some((id, work)) = self.panes.iter_mut().find_map(|(id, p)| Some((*id, p.take_image_work()?))) else {
+                return;
+            };
+            self.preparing += 1;
+            if !self.background(work, move |server, prepared| server.image_prepared(id, prepared)) {
+                self.preparing -= 1;
+                if let Some(p) = self.panes.get_mut(&id) {
+                    p.image_prepared(Err("ENOMEM:no thread to prepare the image".into()));
+                }
+                return;
+            }
+        }
+    }
+
+    /// A pane's picture was prepared: it shows, and the next one waiting is prepared.
+    fn image_prepared(&mut self, id: PaneId, prepared: graphics::Prepared) {
+        self.preparing -= 1;
+        if let Some(p) = self.panes.get_mut(&id) {
+            p.image_prepared(prepared);
+            self.mark_dirty_pane(id);
+        }
+        self.prepare_images();
     }
 
     /// Fit `picture` in a box of `width × height` pixels on another thread; the clients are

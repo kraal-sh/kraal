@@ -2,6 +2,7 @@
 //! emulator its output feeds.
 
 use std::cell::RefCell;
+use std::collections::VecDeque;
 use std::ffi::OsStr;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -215,6 +216,9 @@ pub struct TermPane {
     direct: bool,
     /// Input was dropped because of that, since the server last asked.
     pub input_dropped: bool,
+    /// Replies to the program held back by one that an image being prepared owes (`None`): it
+    /// gets them in the order it asked.
+    owed: VecDeque<Option<Vec<u8>>>,
     /// Output read from the PTY, waiting to be parsed.
     pub(super) output: Arc<Output>,
     pub(super) process: Arc<Process>,
@@ -336,6 +340,7 @@ impl TermPane {
             input_pending: io.input_pending,
             direct: io.direct,
             input_dropped: false,
+            owed: VecDeque::new(),
             output: io.output,
             process: Arc::new(Process::default()),
             reader_stop: io.stop,
@@ -413,6 +418,58 @@ impl TermPane {
     /// The most input the program can be sent at once now: a larger write is dropped whole.
     pub(super) fn input_room(&self) -> usize {
         MAX_PENDING_INPUT.saturating_sub(self.input_pending.load(Ordering::Relaxed))
+    }
+
+    /// Send the program a reply, after those it is owed already.
+    pub(super) fn reply(&mut self, reply: Vec<u8>) {
+        if self.owed.is_empty() {
+            self.write(reply);
+        } else {
+            self.owed.push_back(Some(reply));
+        }
+    }
+
+    /// An image being prepared owes the program a reply: the replies that follow wait for it.
+    pub(super) fn owe_reply(&mut self) {
+        self.owed.push_back(None);
+    }
+
+    /// The reply owed first is given (none when the program is not to hear of the outcome): it
+    /// goes, then those it held back, up to the next one owed.
+    pub(super) fn pay_reply(&mut self, reply: Option<Vec<u8>>) {
+        self.owed.pop_front();
+        let held = self.owed.iter().take_while(|r| r.is_some()).count();
+        let ready: Vec<Vec<u8>> = reply.into_iter().chain(self.owed.drain(..held).flatten()).collect();
+        for reply in ready {
+            self.write(reply);
+        }
+    }
+
+    /// Answer what the program asked the emulator so far (its attributes, the cursor, colours,
+    /// the window's size): replies to what it asks next go after these. Its other events are
+    /// left for the pane.
+    pub(super) fn answer_queries(&mut self) {
+        let events: Vec<TermEvent> = self.events.borrow_mut().drain(..).collect();
+        let mut others = Vec::new();
+        for event in events {
+            let reply = match event {
+                TermEvent::PtyWrite(s) => self.graphics.device_attributes(&s),
+                TermEvent::ColorRequest(index, format) => {
+                    format(self.term.colors()[index].unwrap_or_else(|| default_color(index)))
+                }
+                TermEvent::TextAreaSizeRequest(format) => {
+                    let (cell_width, cell_height) = self.graphics.shared().cell();
+                    let (num_lines, num_cols) = (self.term.screen_lines() as u16, self.term.columns() as u16);
+                    format(WindowSize { num_lines, num_cols, cell_width, cell_height })
+                }
+                other => {
+                    others.push(other);
+                    continue;
+                }
+            };
+            self.reply(reply.into_bytes());
+        }
+        self.events.borrow_mut().extend(others);
     }
 
     /// The grid point under a cell of the pane, clamped to the grid: the pane may be drawn

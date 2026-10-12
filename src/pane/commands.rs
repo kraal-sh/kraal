@@ -21,6 +21,7 @@ use alacritty_terminal::selection::{Selection, SelectionType};
 use alacritty_terminal::term::TermMode;
 
 use super::{Content, Pane, TermPane};
+use crate::graphics::Answer;
 
 /// Commands kept per pane, the oldest dropped first.
 const MAX_COMMANDS: usize = 1000;
@@ -155,16 +156,20 @@ impl TermPane {
                     self.marked(|t| t.parse(&text));
                 }
                 image => self.marked(|t| {
-                    // Text held for a synchronized update goes first: the image comes after it.
+                    // Text held for a synchronized update goes first: the image comes after it,
+                    // and so do the replies to what was asked before it.
                     if t.parser.sync_timeout().sync_timeout().is_some() {
                         t.stop_sync();
                     }
+                    t.answer_queries();
                     // Images shown in the archived history are still placed.
                     if t.graphics.sweep_due() {
                         t.graphics.archived = t.archive.lines().images().collect();
                     }
-                    if let Some(reply) = t.graphics.handle(image, &mut t.term) {
-                        t.write(reply);
+                    match t.graphics.handle(image, &mut t.term) {
+                        Answer::Now(Some(reply)) => t.reply(reply),
+                        Answer::Now(None) => {}
+                        Answer::Later => t.owe_reply(),
                     }
                 }),
             }

@@ -1,8 +1,11 @@
 //! Picks image sequences out of a pane's output: kitty graphics commands (`ESC _ G … ESC \`)
 //! and sixel images (`ESC P … q … ESC \`). Everything else passes through untouched, in order,
-//! for the emulator; a sequence cut across reads is held until it is complete.
+//! for the emulator; a sequence cut across reads is held until it is complete. A sixel image is
+//! measured as it comes: its cells are taken as soon as it ends, before it is decoded.
 
 use std::borrow::Cow;
+
+use super::sixel;
 
 const ESC: u8 = 0x1b;
 const CAN: u8 = 0x18;
@@ -22,8 +25,9 @@ pub enum Piece<'a> {
     Text(Cow<'a, [u8]>),
     /// A kitty graphics command: what follows `ESC _ G`, up to the terminator.
     Kitty(Vec<u8>),
-    /// A sixel image: the DCS parameters, then the sixel data.
-    Sixel { params: Vec<u8>, data: Vec<u8> },
+    /// A sixel image: the DCS parameters, the sixel data, and the size it draws (see
+    /// [`sixel::Measure`]).
+    Sixel { params: Vec<u8>, data: Vec<u8>, size: Option<(u32, u32)> },
 }
 
 #[derive(Default, Clone, Copy, PartialEq, Debug)]
@@ -51,6 +55,8 @@ pub struct Scanner {
     /// it turns out not to be an image), or its body.
     buf: Vec<u8>,
     params: Vec<u8>,
+    /// The sixel image being read, measured so far.
+    sixel: sixel::Measure,
     /// The body outgrew its limit: it is read to its end and dropped.
     overflow: bool,
 }
@@ -90,7 +96,8 @@ impl Scanner {
         let mut text = Vec::new();
         let mut i = 0;
         while i < bytes.len() {
-            // Plain text runs to the next ESC in one go.
+            // Plain text runs to the next ESC in one go, and so does the body of an image, which
+            // only ESC (its end), CAN or SUB stop.
             if self.state == State::Ground {
                 match memchr::memchr(ESC, &bytes[i..]) {
                     Some(n) => {
@@ -101,6 +108,13 @@ impl Scanner {
                         text.extend_from_slice(&bytes[i..]);
                         break;
                     }
+                }
+            } else if matches!(self.state, State::Kitty | State::Sixel) {
+                let end = memchr::memchr3(ESC, CAN, SUB, &bytes[i..]).map_or(bytes.len(), |n| i + n);
+                self.body(&bytes[i..end]);
+                i = end;
+                if i == bytes.len() {
+                    break;
                 }
             }
             let b = bytes[i];
@@ -126,15 +140,9 @@ impl Scanner {
                 State::Kitty | State::Sixel => {
                     if b == ESC {
                         self.state = if self.state == State::Kitty { State::KittyEsc } else { State::SixelEsc };
-                    } else if b == CAN || b == SUB {
-                        self.abort();
                     } else {
-                        let limit = if self.state == State::Kitty { MAX_APC } else { MAX_SIXEL };
-                        if self.buf.len() < limit {
-                            self.buf.push(b);
-                        } else {
-                            self.overflow = true;
-                        }
+                        // CAN or SUB: the sequence is cancelled.
+                        self.abort();
                     }
                 }
                 State::KittyEsc | State::SixelEsc => {
@@ -146,7 +154,9 @@ impl Scanner {
                                 out.push(Piece::Kitty(body));
                             } else {
                                 flush(&mut text, &mut out);
-                                out.push(Piece::Sixel { params: std::mem::take(&mut self.params), data: body });
+                                let params = std::mem::take(&mut self.params);
+                                let size = std::mem::take(&mut self.sixel).size();
+                                out.push(Piece::Sixel { params, data: body, size });
                             }
                         }
                         self.abort();
@@ -165,6 +175,7 @@ impl Scanner {
                     }
                     b'q' => {
                         self.buf.clear();
+                        self.sixel = sixel::Measure::default();
                         self.overflow = false;
                         self.state = State::Sixel;
                     }
@@ -180,6 +191,20 @@ impl Scanner {
         }
         flush(&mut text, &mut out);
         out
+    }
+
+    /// More of an image's body: kept within its limit, beyond which the image is read to its end
+    /// and dropped.
+    fn body(&mut self, run: &[u8]) {
+        let limit = if self.state == State::Kitty { MAX_APC } else { MAX_SIXEL };
+        if self.overflow || self.buf.len() + run.len() > limit {
+            self.overflow = true;
+            return;
+        }
+        self.buf.extend_from_slice(run);
+        if self.state == State::Sixel {
+            self.sixel.read(run);
+        }
     }
 
     fn after_esc(&mut self, b: u8, text: &mut Vec<u8>) {

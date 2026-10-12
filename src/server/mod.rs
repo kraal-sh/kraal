@@ -416,6 +416,8 @@ pub struct Server {
     images: HashMap<ClientId, graphics::ClientImages>,
     /// Images ready to draw as sixel.
     fitted: graphics::Fitted,
+    /// The panes' pictures being prepared off the loop (see `prepare_images`).
+    preparing: usize,
     /// Warnings not shown yet: they go to the clients and the messages log.
     pub warnings: Vec<String>,
     /// Why `accounts.toml` could not be read last time, so that it is said once, not every scan.
@@ -732,6 +734,7 @@ pub fn run(session: &str) -> Result<()> {
         outer_colors: None,
         images: HashMap::new(),
         fitted: Default::default(),
+        preparing: 0,
         warnings,
         accounts_error: None,
         messages: Default::default(),
@@ -1473,6 +1476,9 @@ impl Server {
         }
         let Some(pane) = self.panes.get_mut(&id) else { return };
         let signals = pane.feed(data);
+        if pane.has_image_work() {
+            self.prepare_images();
+        }
         self.pane_signals(id, signals);
         self.mark_dirty_pane(id);
         if !self.echo.is_empty()

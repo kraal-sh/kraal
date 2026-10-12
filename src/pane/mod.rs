@@ -400,6 +400,7 @@ impl Pane {
         std::mem::swap(&mut fresh.commands, &mut old.commands);
         // The images its scrollback shows stay with it.
         std::mem::swap(&mut fresh.graphics, &mut old.graphics);
+        fresh.graphics.restarted();
         let reset = reset_sequence(self.cols);
         fresh.marked(|t| t.parse(&reset));
         **old = fresh;
@@ -591,6 +592,27 @@ impl Pane {
         }
     }
 
+    /// Whether a picture of this pane waits to be prepared off the server's loop, and none is
+    /// being prepared.
+    pub fn has_image_work(&self) -> bool {
+        self.term().is_some_and(|t| t.graphics.has_work())
+    }
+
+    /// The work of the next picture of this pane to prepare off the server's loop, when one
+    /// waits and none is being prepared.
+    pub fn take_image_work(&mut self) -> Option<crate::graphics::Work> {
+        self.term_mut()?.graphics.next_work()
+    }
+
+    /// The picture of this pane being prepared is done: it shows, and the program gets the reply
+    /// it was owed.
+    pub fn image_prepared(&mut self, prepared: crate::graphics::Prepared) {
+        let Some(t) = self.term_mut() else { return };
+        if let Some(crate::graphics::Owed(reply)) = t.graphics.prepared(prepared) {
+            t.pay_reply(reply);
+        }
+    }
+
     /// The output read from the PTY since the last call, put in `into` (what it held is
     /// dropped, its room reused): false when there was none. Then the server is told of the
     /// next output, unless it `comes_back` for it on its own.
@@ -632,10 +654,10 @@ impl Pane {
 
     fn drain_events(&mut self, signals: &mut Vec<PaneSignal>) {
         let Content::Term(t) = &mut self.content else { return };
+        t.answer_queries();
         let events: Vec<TermEvent> = t.events.borrow_mut().drain(..).collect();
         for ev in events {
             match ev {
-                TermEvent::PtyWrite(s) => t.write(t.graphics.device_attributes(&s).into_bytes()),
                 TermEvent::Title(s) => {
                     self.title = sanitize_title(&s);
                     signals.push(PaneSignal::TitleChanged);
@@ -649,15 +671,6 @@ impl Pane {
                     signals.push(PaneSignal::Bell);
                 }
                 TermEvent::ClipboardStore(_, text) => signals.push(PaneSignal::Clipboard(text)),
-                TermEvent::ColorRequest(index, format) => {
-                    let rgb = t.term.colors()[index].unwrap_or_else(|| default_color(index));
-                    t.write(format(rgb).into_bytes());
-                }
-                TermEvent::TextAreaSizeRequest(format) => {
-                    let (cell_width, cell_height) = t.graphics.shared().cell();
-                    let size = WindowSize { num_lines: self.rows, num_cols: self.cols, cell_width, cell_height };
-                    t.write(format(size).into_bytes());
-                }
                 _ => {}
             }
         }
@@ -1044,6 +1057,53 @@ mod tests {
         // `od -c` spells ESC as 033 and BEL as \a.
         let seen: String = seen.split_whitespace().collect();
         assert!(seen.contains("got033[?6c033]7701;kraal\\a033[?6c."), "{seen:?}");
+    }
+
+    /// A program asks for the attributes, sends an image too large to prepare at once, and asks
+    /// again: it reads the replies in that order, the image's once it is prepared.
+    #[test]
+    fn replies_wait_for_that_of_an_image_being_prepared() {
+        use base64::Engine;
+        let (tx, _rx) = crossbeam_channel::bounded(64);
+        let graphics = std::sync::Arc::new(crate::graphics::Shared::new(true, 64 << 20));
+        graphics.set_available(true);
+        let env = PaneEnv {
+            socket: "/nonexistent".into(),
+            session: "t".into(),
+            shell: "sh".into(),
+            scrollback: 100,
+            graphics,
+        };
+        let png = crate::graphics::encode_png(300, 300, &[9, 9, 9, 255].repeat(300 * 300)).unwrap();
+        let image = base64::engine::general_purpose::STANDARD.encode(png);
+        let spec = PaneSpec {
+            command: vec![
+                "sh".into(),
+                "-c".into(),
+                format!(
+                    "stty raw -echo; printf '\\033[c\\033_Ga=T,i=7,f=100;{image}\\033\\\\\\033[c'; \
+                     r=$(dd bs=1 count=33 2>/dev/null); printf 'got%s.' \"$r\" | tr '\\033' E; sleep 1"
+                ),
+            ],
+            ..Default::default()
+        };
+        let mut pane = Pane::spawn(1, None, spec, 80, 5, &env, &tx).unwrap();
+        let start = Instant::now();
+        let mut seen = String::new();
+        while !seen.contains('.') && start.elapsed() < std::time::Duration::from_secs(5) {
+            while let Some(data) = pane.take_output() {
+                seen.push_str(&String::from_utf8_lossy(&data));
+                pane.feed(&data);
+            }
+            // Prepared once the program asked again.
+            if seen.matches("\x1b[c").count() == 2
+                && let Some(work) = pane.take_image_work()
+            {
+                pane.image_prepared(work());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(seen.contains("gotE[?62;4;22cE_Gi=7;OKE\\E[?62;4;22c."), "{seen:?}");
     }
 
     #[test]
