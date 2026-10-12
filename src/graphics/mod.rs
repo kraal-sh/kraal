@@ -259,6 +259,8 @@ pub struct PaneGraphics {
     clock: u64,
     /// How many placed images trigger the next look for those whose cells are gone.
     sweep_at: usize,
+    /// Images with cells in the part of the history kept outside the emulator.
+    pub archived: HashSet<u32>,
 }
 
 impl Drop for PaneGraphics {
@@ -283,6 +285,7 @@ impl PaneGraphics {
             named: HashMap::new(),
             clock: 0,
             sweep_at: SWEEP_START,
+            archived: HashSet::new(),
         }
     }
 
@@ -685,7 +688,10 @@ impl PaneGraphics {
             return;
         }
         let alt = term.mode().contains(TermMode::ALT_SCREEN);
-        let seen = placed_ids(term);
+        let mut seen = placed_ids(term);
+        if !alt {
+            seen.extend(&self.archived);
+        }
         let gone: Vec<u32> = self
             .shown
             .iter()
@@ -808,6 +814,11 @@ pub fn placeholder(kid: u32, row: usize, col: usize) -> String {
 
 fn diacritic_index(c: char) -> Option<usize> {
     DIACRITICS.iter().position(|d| *d == c)
+}
+
+/// The image a placeholder cell of a pane's grid shows, by kraal's id.
+pub fn image_of_cell(cell: &Cell) -> Option<u32> {
+    Placeholder::of_cell(cell).map(|p| p.id)
 }
 
 /// The images whose placeholder cells are in the grid of the screen that is up, history

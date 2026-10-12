@@ -112,8 +112,9 @@ pub struct Commands {
     /// Lines that scrolled into the history while marks were kept: grid line `l` is pane line
     /// `scrolled + l`.
     scrolled: i64,
-    /// Length of the primary screen's history when last counted.
-    history_seen: usize,
+    /// Length of the primary screen's history when last counted, less the rows the archive took
+    /// from its top since and plus those it put back (see `archive.rs`).
+    pub(super) history_seen: i64,
     /// The view's offset when kraal started counting with it, and whether kraal lifted it from
     /// the bottom (to put back). Kept while the alternate screen is in front: the primary
     /// screen's view only moves again once it is back.
@@ -151,13 +152,15 @@ impl TermPane {
             match piece {
                 crate::graphics::Piece::Text(text) => {
                     let text = self.guard.filter(&text);
-                    self.marked(|t| t.parser.advance(&mut t.term, &text));
+                    self.marked(|t| t.parse(&text));
                 }
                 image => self.marked(|t| {
                     // Text held for a synchronized update goes first: the image comes after it.
                     if t.parser.sync_timeout().sync_timeout().is_some() {
-                        t.parser.stop_sync(&mut t.term);
+                        t.stop_sync();
                     }
+                    // Images shown in the archived history are still placed.
+                    t.graphics.archived = t.archive.lines.images().collect();
                     if let Some(reply) = t.graphics.handle(image, &mut t.term) {
                         t.write(reply);
                     }
@@ -257,15 +260,15 @@ impl TermPane {
         let lifted = c.lifted.take();
         let moved = if c.history_max == 0 {
             shifted
-        } else if history < c.history_max && history >= c.history_seen {
-            Some(history - c.history_seen)
+        } else if history < c.history_max && history as i64 >= c.history_seen {
+            Some((history as i64 - c.history_seen) as usize)
         } else {
             match lifted {
                 Some((from, _)) if offset >= from && offset < c.history_max => Some(offset - from),
                 _ => None,
             }
         };
-        c.history_seen = history;
+        c.history_seen = history as i64;
         match moved {
             Some(n) => c.scrolled += n as i64,
             None => c.unplace(),
@@ -295,12 +298,12 @@ impl TermPane {
         if alt || usize::from(size.cols) != width {
             // Rewrapped (on the alternate screen, the primary one changes out of sight).
             self.commands.unplace();
-            self.commands.history_seen = self.term.grid().history_size();
+            self.commands.history_seen = self.term.grid().history_size() as i64;
             return;
         }
         let after = self.term.grid().cursor.point.line.0;
         self.commands.scrolled += i64::from(before - after);
-        self.commands.history_seen = self.term.grid().history_size();
+        self.commands.history_seen = self.term.grid().history_size() as i64;
         self.commands.lifted = None;
     }
 
@@ -308,14 +311,14 @@ impl TermPane {
     pub(super) fn mark(&mut self, mark: Mark) -> Option<Finished> {
         // A synchronized update holds output back: what came before the mark must be on the grid.
         if self.parser.sync_timeout().sync_timeout().is_some() {
-            self.marked(|t| t.parser.stop_sync(&mut t.term));
+            self.marked(|t| t.stop_sync());
         }
         // Full screen programs have no commands; the primary screen's are out of sight.
         if self.alt_screen() {
             return None;
         }
         if self.commands.list.is_empty() {
-            self.commands.history_seen = self.term.grid().history_size();
+            self.commands.history_seen = self.term.grid().history_size() as i64;
             self.commands.lifted = None;
         }
         let spot = self.cursor_spot();
@@ -420,6 +423,16 @@ impl TermPane {
         self.commands.scrolled - self.term.grid().history_size() as i64
     }
 
+    /// Bring the rows down to `spot` back from the archive when it is above the emulator's
+    /// history. Whether it is on the grid now.
+    fn bring_back(&mut self, spot: Spot) -> bool {
+        if !spot.gone() && spot.line < self.top_line() {
+            let above = (self.top_line() - spot.line) as usize;
+            self.reveal(self.term.grid().history_size() + above);
+        }
+        self.point(spot).is_some()
+    }
+
     /// The output of a command so far: up to its end, or to the cursor while it runs. Lines
     /// gone from the history are left out.
     fn output_text(&self, c: &Command) -> Option<String> {
@@ -461,10 +474,13 @@ impl Pane {
     }
 
     /// The last command's line and output: the one running, or the last that ran.
-    pub fn last_command_output(&self) -> Option<(Option<String>, String)> {
-        let t = self.term()?;
-        let c = t.commands.list.iter().rev().find(|c| c.ran())?;
-        Some((c.text.clone(), t.output_text(c)?))
+    pub fn last_command_output(&mut self) -> Option<(Option<String>, String)> {
+        let t = self.term_mut()?;
+        let c = t.commands.list.iter().rev().find(|c| c.ran())?.clone();
+        if let Some(from) = c.output {
+            t.bring_back(from);
+        }
+        Some((c.text.clone(), t.output_text(&c)?))
     }
 
     /// When a long command ended here unseen.
@@ -484,9 +500,22 @@ impl Pane {
     pub fn jump_to_prompt(&mut self, up: bool) -> bool {
         let Some(t) = self.term_mut() else { return false };
         let at = t.term.vi_mode_cursor.point.line;
-        let prompts = t.commands.list.iter().filter_map(|c| t.point(c.prompt)).map(|p| p.line);
-        let target = if up { prompts.filter(|l| *l < at).max() } else { prompts.filter(|l| *l > at).min() };
-        let Some(line) = target else { return false };
+        let target = |t: &TermPane| {
+            let prompts = t.commands.list.iter().filter_map(|c| t.point(c.prompt)).map(|p| p.line);
+            if up { prompts.filter(|l| *l < at).max() } else { prompts.filter(|l| *l > at).min() }
+        };
+        let mut found = target(t);
+        if found.is_none() && up {
+            // The prompt above may have gone to the archive.
+            let top = t.top_line();
+            let archived = t.commands.list.iter().rev().map(|c| c.prompt).find(|p| !p.gone() && p.line < top);
+            if let Some(prompt) = archived
+                && t.bring_back(prompt)
+            {
+                found = target(t);
+            }
+        }
+        let Some(line) = found else { return false };
         t.term.vi_goto_point(Point::new(line, Column(0)));
         true
     }
@@ -497,10 +526,11 @@ impl Pane {
         let Some(t) = self.term_mut() else { return false };
         let at = t.term.vi_mode_cursor.point.line;
         let above = |c: &&Command| !c.prompt.gone() && t.point(c.prompt).is_none_or(|p| p.line <= at);
-        let Some(c) = t.commands.list.iter().rev().find(|c| c.ran() && above(c)) else {
+        let Some(c) = t.commands.list.iter().rev().find(|c| c.ran() && above(c)).cloned() else {
             return false;
         };
         let first = if whole { c.prompt } else { c.output.unwrap_or(c.prompt) };
+        t.bring_back(first);
         let start = t.point(first).or_else(|| t.point(Spot { line: t.top_line(), col: 0 }));
         let end = match c.end {
             Some(end) => t.before(end),

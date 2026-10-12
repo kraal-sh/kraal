@@ -17,8 +17,10 @@ use crate::layout::PaneId;
 use crate::preview::Preview;
 use crate::server::Event;
 
+mod archive;
 mod commands;
 mod guard;
+mod history;
 mod osc;
 mod pty;
 mod screen;
@@ -335,12 +337,13 @@ impl Pane {
         let mut fresh = TermPane::spawn(self.id, &self.spec, self.cols, self.rows, env, tx)?;
         // Keep history: move the old emulator over and reset its modes.
         std::mem::swap(&mut fresh.term, &mut old.term);
+        std::mem::swap(&mut fresh.archive, &mut old.archive);
         std::mem::swap(&mut fresh.events, &mut old.events);
         std::mem::swap(&mut fresh.commands, &mut old.commands);
         // The images its scrollback shows stay with it.
         std::mem::swap(&mut fresh.graphics, &mut old.graphics);
         let reset = reset_sequence(self.cols);
-        fresh.marked(|t| t.parser.advance(&mut t.term, &reset));
+        fresh.marked(|t| t.parse(&reset));
         **old = fresh;
         // A new process: nothing of the old one's lifecycle carries over, but its conversation.
         self.reported = None;
@@ -416,7 +419,9 @@ impl Pane {
         self.rows = rows;
         if let Content::Term(t) = &mut self.content {
             let _ = t.master.resize(pty::pty_size(cols, rows, t.graphics.shared()));
+            t.before_resize(usize::from(rows));
             t.resize_marked(Size { cols, rows });
+            t.after_resize();
         }
     }
 
@@ -540,7 +545,7 @@ impl Pane {
         let Content::Term(t) = &mut self.content else { return None };
         match t.parser.sync_timeout().sync_timeout() {
             Some(deadline) if deadline <= Instant::now() => {
-                t.marked(|t| t.parser.stop_sync(&mut t.term));
+                t.marked(|t| t.stop_sync());
                 let mut signals = Vec::new();
                 self.drain_events(&mut signals);
                 Some(signals)
@@ -585,6 +590,7 @@ impl Pane {
     pub fn write_input(&mut self, bytes: Vec<u8>) {
         if let Content::Term(t) = &mut self.content {
             t.term.scroll_display(Scroll::Bottom);
+            t.settle();
             t.write(bytes);
         }
     }

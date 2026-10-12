@@ -19,7 +19,15 @@ use crate::ansi::{Cursor, CursorShape};
 impl Pane {
     pub fn scroll(&mut self, lines: i32) {
         match &mut self.content {
-            Content::Term(t) => t.term.scroll_display(Scroll::Delta(lines)),
+            Content::Term(t) => {
+                if lines > 0 {
+                    t.reveal(t.term.grid().display_offset() + lines as usize);
+                }
+                t.term.scroll_display(Scroll::Delta(lines));
+                if t.term.grid().display_offset() == 0 {
+                    t.settle();
+                }
+            }
             Content::Preview(p) => p.scroll(-lines),
             Content::Files(f) => f.scroll_active(-lines),
         }
@@ -27,7 +35,12 @@ impl Pane {
 
     pub fn scroll_page(&mut self, up: bool) {
         match &mut self.content {
-            Content::Term(t) => t.term.scroll_display(if up { Scroll::PageUp } else { Scroll::PageDown }),
+            Content::Term(t) => {
+                if up {
+                    t.reveal(t.term.grid().display_offset() + t.term.screen_lines());
+                }
+                t.term.scroll_display(if up { Scroll::PageUp } else { Scroll::PageDown });
+            }
             Content::Preview(p) => {
                 if up {
                     p.page_up()
@@ -43,7 +56,10 @@ impl Pane {
 
     pub fn scroll_to_bottom(&mut self) {
         match &mut self.content {
-            Content::Term(t) => t.term.scroll_display(Scroll::Bottom),
+            Content::Term(t) => {
+                t.term.scroll_display(Scroll::Bottom);
+                t.settle();
+            }
             Content::Preview(p) => p.bottom(),
             Content::Files(f) => {
                 f.key(crate::files::FileKey::End);
@@ -53,7 +69,10 @@ impl Pane {
 
     pub fn scroll_to_top(&mut self) {
         match &mut self.content {
-            Content::Term(t) => t.term.scroll_display(Scroll::Top),
+            Content::Term(t) => {
+                t.reveal_all();
+                t.term.scroll_display(Scroll::Top);
+            }
             Content::Preview(p) => p.top(),
             Content::Files(f) => {
                 f.key(crate::files::FileKey::Home);
@@ -152,6 +171,7 @@ impl Pane {
             if !on {
                 t.term.selection = None;
                 t.term.scroll_display(Scroll::Bottom);
+                t.settle();
             }
         }
     }
@@ -163,7 +183,22 @@ impl Pane {
     /// Move the copy-mode cursor, keeping it in view and extending the selection.
     pub fn vi_motion(&mut self, motion: ViMotion) {
         if let Some(t) = self.term_mut() {
-            t.term.vi_motion(motion);
+            // A screen of history above the cursor, for the motion to go to.
+            let mut more = t.term.screen_lines();
+            t.reveal((-t.term.vi_mode_cursor.point.line.0).max(0) as usize + more);
+            let (cursor, selection) = (t.term.vi_mode_cursor, t.term.selection.clone());
+            loop {
+                t.term.vi_motion(motion);
+                // Stopped at the top of what the emulator holds: the history goes on above.
+                if t.term.vi_mode_cursor.point.line > t.term.topmost_line()
+                    || !t.reveal(t.term.grid().history_size() + more)
+                {
+                    break;
+                }
+                t.term.vi_mode_cursor = cursor;
+                t.term.selection = selection.clone();
+                more *= 4;
+            }
             let point = t.term.vi_mode_cursor.point;
             t.term.scroll_to_point(point);
         }
@@ -172,6 +207,9 @@ impl Pane {
     /// Move the copy-mode cursor by whole screens or half screens (negative = up).
     pub fn vi_scroll(&mut self, lines: i32) {
         if let Some(t) = self.term_mut() {
+            if lines > 0 {
+                t.reveal(t.term.grid().display_offset() + lines as usize);
+            }
             t.term.scroll_display(Scroll::Delta(lines));
             let screen = t.term.screen_lines() as i32;
             let offset = t.term.grid().display_offset() as i32;
@@ -184,6 +222,9 @@ impl Pane {
     /// Top or bottom of the scrollback.
     pub fn vi_edge(&mut self, top: bool) {
         if let Some(t) = self.term_mut() {
+            if top {
+                t.reveal_all();
+            }
             let line = if top { t.term.topmost_line() } else { t.term.bottommost_line() };
             let p = Point::new(line, Column(0));
             t.term.vi_goto_point(p);
@@ -219,8 +260,13 @@ impl Pane {
         if query.is_empty() || self.term().is_none() {
             return false;
         }
-        let Ok(regex) = RegexSearch::new(&regex_escape(query)) else { return false };
-        self.search = Some(SearchState { regex, current: None });
+        let pattern = regex_escape(query);
+        let Ok(regex) = RegexSearch::new(&pattern) else { return false };
+        // The archived history is searched as the emulator searches its own: smart case.
+        let archived =
+            regex::RegexBuilder::new(&pattern).case_insensitive(!query.chars().any(char::is_uppercase)).build();
+        let Ok(archived) = archived else { return false };
+        self.search = Some(SearchState { regex, archived, current: None });
         self.search_next(true)
     }
 
@@ -228,6 +274,16 @@ impl Pane {
     pub fn search_next(&mut self, older: bool) -> bool {
         let Content::Term(t) = &mut self.content else { return false };
         let Some(state) = &mut self.search else { return false };
+        // A match the text has since scrolled away with is no place to start from.
+        let term = &t.term;
+        let on_grid = |p: &Point| p.line >= term.topmost_line() && p.line <= term.bottommost_line();
+        if state.current.as_ref().is_some_and(|m| !on_grid(m.start()) || !on_grid(m.end())) {
+            state.current = None;
+        }
+        // A match on the first line the emulator holds: the line before is in the archive.
+        if older && state.current.as_ref().is_some_and(|m| m.start().line == t.term.topmost_line()) {
+            t.reveal(t.term.grid().history_size() + 1);
+        }
         let term = &mut t.term;
         let origin = match &state.current {
             Some(m) if older => *m.start(),
@@ -239,12 +295,27 @@ impl Pane {
         };
         let (dir, side) = if older { (Direction::Left, Side::Left) } else { (Direction::Right, Side::Right) };
         // Step off the current match so the same one is not found again.
-        let origin = match (&state.current, older) {
+        let stepped = match (&state.current, older) {
             (Some(_), true) => origin.sub(term, alacritty_terminal::index::Boundary::None, 1),
             (Some(_), false) => origin.add(term, alacritty_terminal::index::Boundary::None, 1),
             (None, _) => origin,
         };
-        let Some(m) = term.search_next(&mut state.regex, origin, dir, side, None) else {
+        // Stepping off the last cell goes round to the first.
+        let round = if older { stepped > origin } else { stepped < origin };
+        let origin = stepped;
+        let mut found = term.search_next(&mut state.regex, origin, dir, side, None);
+        // Before going round to the other end, the lines in the archive, which come before the
+        // emulator's.
+        let wrapped =
+            round || found.as_ref().is_none_or(|m| if older { *m.start() > origin } else { *m.end() < origin });
+        if wrapped && let Some(lines) = archived_match(&t.archive.lines, &state.archived, older) {
+            t.reveal_lines(lines);
+            let term = &mut t.term;
+            let from = if older { origin } else { Point::new(term.topmost_line(), Column(0)) };
+            found = term.search_next(&mut state.regex, from, dir, side, None).or(found);
+        }
+        let term = &mut t.term;
+        let Some(m) = found else {
             state.current = None;
             return false;
         };
@@ -279,15 +350,18 @@ impl Pane {
             Content::Term(t) => {
                 let grid = t.term.grid();
                 let screen = grid.screen_lines() as i32;
-                let (start, end) = match lines {
-                    None => (0, screen),
+                let history = grid.history_size() as i32;
+                let (start, end, archived) = match lines {
+                    None => (0, screen, 0),
                     Some(n) => {
                         let bottom = last_nonblank_line(&t.term).unwrap_or(0) + 1;
-                        let top = (bottom - n as i32).max(-(grid.history_size() as i32));
-                        (top, bottom)
+                        let n = n.min(i32::MAX as usize) as i32;
+                        // Rows older than the emulator's come from the archive.
+                        ((bottom - n).max(-history), bottom, (n - bottom - history).max(0) as usize)
                     }
                 };
-                lines_text(&t.term, start, end)
+                let rows = (start..end).map(|l| row_text(&t.term, Line(l)));
+                join_rows(t.archived_rows(archived).into_iter().chain(rows))
             }
         }
     }
@@ -335,7 +409,20 @@ impl Pane {
 
 pub(super) struct SearchState {
     regex: RegexSearch,
+    /// The same, for the archived lines.
+    archived: regex::Regex,
     current: Option<Match>,
+}
+
+/// How many of the newest archived lines to bring back for the nearest match there: the newest
+/// line that matches when going to older lines, the oldest otherwise (going round to the top).
+fn archived_match(lines: &super::history::History, regex: &regex::Regex, older: bool) -> Option<usize> {
+    let hit = |line: super::history::Line| regex.is_match(&line.searched());
+    if older {
+        lines.newest_first().position(hit).map(|i| i + 1)
+    } else {
+        lines.oldest_first().position(hit).map(|i| lines.len() - i)
+    }
 }
 
 /// Escape regex metacharacters so a plain query matches literally.
@@ -376,9 +463,14 @@ pub fn url_in_text(line: &str, col: usize) -> Option<String> {
 
 /// The text of grid lines `start..end`, a line each, without the blank ones at the end.
 pub(super) fn lines_text<T>(term: &Term<T>, start: i32, end: i32) -> String {
+    join_rows((start..end).map(|l| row_text(term, Line(l))))
+}
+
+/// Rows' text, a line each, without the blank ones at the end.
+fn join_rows(rows: impl Iterator<Item = String>) -> String {
     let mut out = String::new();
-    for l in start..end {
-        out.push_str(&row_text(term, Line(l)));
+    for row in rows {
+        out.push_str(&row);
         out.push('\n');
     }
     let trimmed = out.trim_end_matches('\n').len();
