@@ -85,9 +85,9 @@ pub struct Hint {
     pub m: Match,
 }
 
-/// A pattern of the `[hints.patterns]` config section.
+/// A pattern of the `[hints.patterns]` config section. As for a tool, a key this kraal does not
+/// know is warned about, and the pattern loads without it.
 #[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct PatternDef {
     pattern: String,
     /// The tool that acting on a match runs (Tab, then its label), with the match in

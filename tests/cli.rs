@@ -1886,11 +1886,15 @@ fn unknown_config_keys_are_warnings_and_never_stop_a_session() {
         let path = env.root.join("config/kraal/config.toml");
         let base = std::fs::read_to_string(&path).unwrap();
         let write = |more: &str| {
-            let text = format!("{base}future_setting = 1\n[keys]\npreset = \"{preset}\"\n{more}");
+            // A tool with a key of another kraal's is in the file too: it loads without it.
+            let tool = "[tools.pods]\ncommand = \"true\"\nread_onyl = true\n";
+            let text = format!("{base}future_setting = 1\n[keys]\npreset = \"{preset}\"\n{tool}{more}");
             std::fs::write(&path, text).unwrap();
         };
         write("");
-        assert_eq!(config_check(&env, &env.root), (true, "warning: future_setting: unknown key\n".into()));
+        let unknown = "warning: future_setting: unknown key\n\
+                       warning: tools.pods.read_onyl: unknown key (did you mean read_only?)\n";
+        assert_eq!(config_check(&env, &env.root), (true, unknown.into()));
 
         // The session starts with the shell the file sets, and says it to who attaches.
         env.workspace("w", "layout {\n    pane name=\"first\"\n}\n");
@@ -1910,7 +1914,7 @@ fn unknown_config_keys_are_warnings_and_never_stop_a_session() {
         assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
         assert_eq!(
             String::from_utf8_lossy(&out.stderr),
-            "warning: bar.kyes: unknown key (did you mean keys?)\nwarning: future_setting: unknown key\n"
+            format!("warning: bar.kyes: unknown key (did you mean keys?)\n{unknown}")
         );
         wait_until(Duration::from_secs(10), "the reload did not apply", || rows() == with_bar + 1);
     }

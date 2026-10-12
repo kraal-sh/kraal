@@ -532,6 +532,36 @@ mod tests {
         assert_eq!((cfg.keys.preset.as_str(), &cfg.keys.prefix), ("classic", &vec!["ctrl+b".to_string()]));
     }
 
+    /// A tool or a hint pattern with a key of another kraal's loads with the keys this one
+    /// knows: one such key never costs the whole configuration.
+    #[test]
+    fn an_unknown_key_of_a_tool_or_a_pattern_is_a_warning_too() {
+        let (cfg, warnings) = Config::parse(
+            "[tools.pods]\ncommand = \"kubectl get pods\"\nread_onyl = true\nconfirm = \"always\"\n\
+             [tools.lazygit]\nkey = \"i\"\nhodl = true\n\
+             [hints.patterns.ticket]\npattern = 'OPS-\\d+'\ntol = \"pods\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            warnings,
+            [
+                "hints.patterns.ticket.tol: unknown key (did you mean tool?)",
+                "tools.lazygit.hodl: unknown key (did you mean hold?)",
+                "tools.pods.confirm: unknown key",
+                "tools.pods.read_onyl: unknown key (did you mean read_only?)",
+            ]
+        );
+        assert_eq!((cfg.tools["pods"].command.as_str(), cfg.tools["pods"].read_only), ("kubectl get pods", false));
+        assert_eq!(
+            (cfg.tools["lazygit"].command.as_str(), cfg.tools["lazygit"].key.as_deref()),
+            ("lazygit", Some("i"))
+        );
+        let (patterns, _) = crate::hints::Custom::build(&cfg.hints, &cfg.tools);
+        assert_eq!(patterns.patterns.len(), 1, "the pattern is there, without a tool");
+        // A value kraal cannot read is still an error.
+        assert!(Config::parse("[tools.pods]\ncommand = \"x\"\nhold = \"yes\"\n").is_err());
+    }
+
     #[test]
     fn tools_parse() {
         let cfg = Config::from_user_toml(
