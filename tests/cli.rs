@@ -1570,6 +1570,43 @@ fn events_stream_and_hooks() {
     assert!(String::from_utf8_lossy(&out.stderr).contains("no such event"));
 }
 
+/// Each `ssh.started` has its `ssh.ended`, as a reader keeping count of the connections needs:
+/// when the connection drops (the pane stays, Enter connects again) and when the pane closes.
+#[test]
+fn every_ssh_that_starts_ends() {
+    let env = Env::new("sshends");
+    let bin = env.root.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    // A connection to `drop` drops after a moment; the others stay.
+    let ssh = bin.join("ssh");
+    write_script(
+        &ssh,
+        "#!/bin/sh\necho \"connected $*\"\n[ \"$1\" = admin@drop ] && sleep 1 && exit 255\nexec sleep 1000\n",
+    );
+    let ssh = ssh.display().to_string();
+    env.workspace("w", "layout {\n    pane name=\"main\"\n}\n");
+    env.run(&["open", "w"]);
+    let (mut events, lines) = env.follow(&["events", "--since", "0", "ssh.*"]);
+    let mut seen: Vec<String> = Vec::new();
+    let mut wait = |what: &str| {
+        while !seen.iter().any(|s| s == what) {
+            let line = lines.recv_timeout(Duration::from_secs(10)).unwrap_or_else(|_| panic!("no {what}: {seen:?}"));
+            let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+            seen.push(format!("{} {}", v["type"].as_str().unwrap(), v["name"].as_str().unwrap()));
+        }
+    };
+    env.run(&["run", "--name", "dropped", "--", &ssh, "admin@drop"]);
+    wait("ssh.started dropped");
+    wait("ssh.ended dropped");
+    env.wait_for_text("dropped", "connected admin@drop");
+    env.run(&["run", "--name", "closed", "--", &ssh, "admin@db"]);
+    wait("ssh.started closed");
+    env.run(&["close", "closed"]);
+    wait("ssh.ended closed");
+    let _ = events.kill();
+    let _ = events.wait();
+}
+
 /// A directory a quiet pane is in that becomes a Terraform one (`terraform init` run from
 /// elsewhere) is guarded as soon as it is: the change is told, not looked for now and then.
 #[test]
