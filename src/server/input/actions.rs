@@ -359,6 +359,7 @@ impl Server {
                 );
             }
             Action::Restart => return self.ask_restart(),
+            Action::Quit => return self.ask_quit(),
             Action::EditServers => self.edit_servers(id),
             Action::SendPrefix => self.send_prefix(id, None),
         }

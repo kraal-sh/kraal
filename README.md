@@ -75,9 +75,11 @@ kraal
 ```
 
 This starts a session, or attaches to the one already running. Press `ctrl+b` and let go: a menu
-shows what each next key does. `ctrl+b s` connects to a server, `ctrl+b a` starts an agent,
-`ctrl+b d` detaches, and `kraal` brings you back where you were. The bar at the bottom shows what
-can be done in the focused pane, and its keys.
+shows what each next key does. `ctrl+b s` connects to a server, `ctrl+b a` starts an agent. The
+bar at the bottom shows what can be done in the focused pane, and its keys.
+
+To leave, `ctrl+b d` detaches: programs keep running, and `kraal` brings you back where you were.
+`ctrl+b q` quits: programs stop, and the layout is saved for the next `kraal`.
 
 kraal reads each agent's state from its screen. To get exact states from the agent itself, install
 its hooks once (here Claude Code; `kraal integration status` lists the others):

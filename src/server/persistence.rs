@@ -176,30 +176,46 @@ impl Server {
             "Restart session {} on the kraal installed now? The layout, the scrollback, SSH shells and agents come back.",
             self.session
         );
-        let stops = self.restart_stops();
-        if !stops.is_empty() {
-            message.push_str("\nThese programs stop:");
-            for line in stops {
-                message.push_str("\n  ");
-                message.push_str(&line);
-            }
+        if let Some(stops) = self.stops() {
+            message.push('\n');
+            message.push_str(&stops);
         }
         Mode::confirm(message, ConfirmAction::Restart)
     }
 
-    /// What a restart stops, a line per program, in the order of the workspaces.
-    fn restart_stops(&self) -> Vec<String> {
-        let ids: Vec<PaneId> = self.workspaces.iter().flat_map(|w| w.panes()).collect();
+    /// The question before quitting, with what stops.
+    pub(super) fn ask_quit(&self) -> Mode {
+        let message = match self.stops() {
+            Some(stops) => format!("Quit kraal? {stops}\nThe layout is saved for next time."),
+            None => "Quit kraal? The layout is saved for next time.".into(),
+        };
+        Mode::confirm(message, ConfirmAction::Quit)
+    }
+
+    /// What stopping the server (to restart, or to quit) stops, as a question says it: a line
+    /// per program, in the order of the workspaces. `None` when nothing does.
+    fn stops(&self) -> Option<String> {
         let mut lines = Vec::new();
-        for id in ids {
+        for id in self.workspaces.iter().flat_map(|w| w.panes()) {
             let Some(pane) = self.panes.get(&id) else { continue };
             let program = if pane.shell_waiting() { None } else { pane.foreground_argv() };
             let info = self.pane_info(id);
-            for what in persist::stops_on_restart(&info, program.as_deref(), &pane.background_jobs()) {
-                lines.push(persist::stopping_line(&info, &what));
+            for what in persist::stops_with_server(&info, program.as_deref(), &pane.background_jobs()) {
+                lines.push(format!("\n  {}", persist::stopping_line(&info, &what)));
             }
         }
-        lines
+        (!lines.is_empty()).then(|| format!("These programs stop:{}", lines.concat()))
+    }
+
+    /// Quit: the server stops once the session is saved, as for `kraal kill`, and its clients
+    /// end. A session that cannot be saved keeps running and says why, first among the warnings:
+    /// those of the failed save, which come after, say the same, and must not hide the answer to
+    /// the key just pressed.
+    pub(super) fn quit(&mut self) {
+        match self.save_now() {
+            Ok(()) => self.quitting = true,
+            Err(e) => self.warnings.insert(0, format!("not quitting: {e}")),
+        }
     }
 
     /// Restart the session: a helper started from the kraal installed now stops this server and

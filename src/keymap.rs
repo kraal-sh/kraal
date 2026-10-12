@@ -88,6 +88,7 @@ pub enum Action {
     CommandPalette,
     Help,
     Detach,
+    Quit,
     SendPrefix,
 }
 
@@ -163,6 +164,7 @@ const ACTIONS: &[(Action, &str, &str)] = &[
     (CommandPalette, "command_palette", "Search commands"),
     (Help, "help", "Help"),
     (Detach, "detach", "Detach (programs keep running)"),
+    (Quit, "quit", "Quit (programs stop; the layout is saved)"),
     (SendPrefix, "send_prefix", "Send the prefix key"),
 ];
 
@@ -301,6 +303,9 @@ const KRAAL: Preset = Preset {
         ("save_workspace", &["{workspaces} s"]),
         ("close_workspace", &["{workspaces} x"]),
         ("restart", &["{workspaces} r"]),
+        // Next to `d` detach, and in the Workspaces menu after the restart (menus list in this
+        // order).
+        ("quit", &["q", "{workspaces} q"]),
         ("next_attention", &["{agents} g"]),
         ("switch_account", &["{agents} c"]),
         ("upload", &["{servers} u", "{files} u"]),
@@ -407,6 +412,7 @@ const CLASSIC: Preset = Preset {
         ("save_workspace", &["S"]),
         ("command_palette", &[":"]),
         ("detach", &["d", "q"]),
+        ("quit", &["Q"]),
         ("help", &["?"]),
         ("send_prefix", &["{prefix}"]),
         ("copy_last_output", &["Y"]),
@@ -1113,7 +1119,6 @@ mod tests {
         assert!(km.menu(&[key('V')]).iter().any(|e| e.label == "Paste buffers"));
         let right = Key { code: KeyCode::Right, mods: Mods::NONE, raw: Vec::new() };
         assert_eq!(km.lookup(&[key('P'), right]), run(SplitRight));
-        assert_eq!(km.lookup(&[key('q')]), Lookup::Nothing);
         // The same verbs in every menu.
         for menu in ['P', 'T', 'W'] {
             assert!(matches!(km.lookup(&[key(menu), key('x')]), Lookup::Run(_)), "{menu} x");
@@ -1153,6 +1158,23 @@ mod tests {
         let reference = km.reference(false);
         assert!(reference.iter().any(|(t, _)| t == "Servers (ctrl+b S)"), "{reference:?}");
         assert!(reference.iter().any(|(t, _)| t == "Copy mode"));
+    }
+
+    #[test]
+    fn quit_is_next_to_detach_and_beside_the_restart() {
+        let run = |a: Action| Lookup::Run(Command::Action(a));
+        let (km, _) = Keymap::build(&cfg("").keys);
+        assert_eq!(km.lookup(&[key('d')]), run(Detach));
+        assert_eq!(km.lookup(&[key('q')]), run(Quit));
+        assert_eq!(km.lookup(&[key('W'), key('q')]), run(Quit));
+        assert_eq!(km.hint(Quit).as_deref(), Some("ctrl+b q"));
+        let workspaces: Vec<String> = km.menu(&[key('W')]).into_iter().map(|e| e.label).collect();
+        assert!(workspaces.ends_with(&["Restart the session".into(), "Quit".into()]), "{workspaces:?}");
+        // Classic: `q` detaches too, and `Q` quits.
+        let (classic, _) = Keymap::build(&cfg("[keys]\npreset = \"classic\"\n").keys);
+        assert_eq!(classic.lookup(&[key('q')]), run(Detach));
+        assert_eq!(classic.lookup(&[key('Q')]), run(Quit));
+        assert_eq!(classic.hint(Quit).as_deref(), Some("ctrl+b Q"));
     }
 
     #[test]

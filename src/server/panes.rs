@@ -5,10 +5,10 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 
-use super::{ClientId, FloatRect, Floating, Server, SyncScope, Tab, Workspace};
+use super::{FloatRect, Floating, Server, SyncScope, Tab, Workspace};
 use crate::layout::{Axis, Node, PaneId};
 use crate::pane::{Pane, PaneSpec, ProcessHold};
-use crate::protocol::{self, ServerMsg};
+use crate::protocol;
 impl Server {
     pub fn new_workspace(&mut self, name: String, definition: Option<PathBuf>) -> u32 {
         let id = self.alloc_id();
@@ -365,11 +365,8 @@ impl Server {
         self.persist_dirty = true;
         self.emit("pane.closed", serde_json::Value::Object(fields));
         self.runbook_pane_closed(id);
+        // The session ends with its last pane; the server tells its clients as it stops.
         if self.workspaces.is_empty() {
-            let ids: Vec<ClientId> = self.clients.keys().copied().collect();
-            for c in ids {
-                self.send_msg(c, &ServerMsg::exit("all panes closed"));
-            }
             // Nothing is left to restore, unless workspaces this server could not restore are.
             if self.unrestored.is_empty() {
                 let _ = self.persister.send(super::persistence::Persist::Delete(self.session.clone()));

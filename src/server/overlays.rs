@@ -125,23 +125,28 @@ pub(super) struct MenuItem {
     pub(super) section: u8,
 }
 
-/// Commands the menu's footer names instead of a line of their own.
-fn in_footer(e: &MenuEntry) -> bool {
-    matches!(e.command, Some(Command::Action(Action::Help | Action::Detach | Action::SendPrefix)))
+/// Commands the first menu's footer names instead of a line of their own; in a menu further in
+/// (quit in the Workspaces menu), they are lines like the others.
+fn in_footer(e: &MenuEntry, root: bool) -> bool {
+    root && matches!(
+        e.command,
+        Some(Command::Action(Action::Help | Action::Detach | Action::Quit | Action::SendPrefix))
+    )
 }
 
-/// The keys of the menu's footer, besides how to leave: help and detach.
-pub(super) fn menu_footer(entries: &[MenuEntry]) -> Vec<(String, String)> {
+/// The keys of the menu's footer, besides how to leave: help, detach and quit in the first menu
+/// (`root`).
+pub(super) fn menu_footer(entries: &[MenuEntry], root: bool) -> Vec<(String, String)> {
     let ascii = th().ascii;
     entries
         .iter()
-        .filter(|e| in_footer(e) && !matches!(e.command, Some(Command::Action(Action::SendPrefix))))
+        .filter(|e| in_footer(e, root) && !matches!(e.command, Some(Command::Action(Action::SendPrefix))))
         .map(|e| (crate::keymap::pretty(&e.key, ascii), e.label.to_lowercase()))
         .collect()
 }
 
-/// The entries of a menu, in the keymap's order.
-pub(super) fn menu_items(entries: &[MenuEntry]) -> Vec<MenuItem> {
+/// The entries of a menu, in the keymap's order; `root` for the first one.
+pub(super) fn menu_items(entries: &[MenuEntry], root: bool) -> Vec<MenuItem> {
     let ascii = th().ascii;
     let focus = |e: &MenuEntry| {
         matches!(
@@ -152,7 +157,7 @@ pub(super) fn menu_items(entries: &[MenuEntry]) -> Vec<MenuItem> {
     let tab = |e: &MenuEntry| matches!(e.command, Some(Command::Action(Action::Tab(_))));
     let mut items: Vec<MenuItem> = Vec::new();
     let (mut focus_done, mut tab_done) = (false, false);
-    for e in entries.iter().filter(|e| !in_footer(e)) {
+    for e in entries.iter().filter(|e| !in_footer(e, root)) {
         if focus(e) {
             if !std::mem::replace(&mut focus_done, true) {
                 // In the order of hjkl.
@@ -742,7 +747,7 @@ mod tests {
         let prompt =
             Prompt::new("Rename tab", "a long name that goes on and on", super::super::ui::PromptAction::NewWorkspace);
         let (km, _) = crate::keymap::Keymap::build(&crate::config::Config::default().keys);
-        let menu = menu_items(&km.menu(&[]));
+        let menu = menu_items(&km.menu(&[]), true);
         let lines: Vec<Line<'static>> = (0..50).map(|i| entry("ctrl+b p r", &format!("line {i}"), 12)).collect();
         for (action, yes) in [(ConfirmAction::ClosePane(1), true), (ConfirmAction::TrustRunbook, false)] {
             let q = Question { message: message.repeat(5), action, yes, scroll: 99 };
@@ -791,7 +796,7 @@ mod tests {
         {
             let cfg = crate::config::Config::from_user_toml(&format!("[keys]\npreset = \"{preset}\"\n")).unwrap();
             let (km, _) = crate::keymap::Keymap::build(&cfg.keys);
-            let items = menu_items(&km.menu(&[]));
+            let items = menu_items(&km.menu(&[]), true);
             let full = Rect::new(0, 0, size.0, size.1);
             let layout = menu_layout(&items, full);
             // Against the right edge and the bottom, below the top bar.
@@ -808,7 +813,7 @@ mod tests {
                 assert!(inside.contains(Position::new(cell.area.right() - 1, cell.area.y)), "{preset} {size:?}");
             }
             let mut buf = Buffer::empty(full);
-            let footer = menu_footer(&km.menu(&[]));
+            let footer = menu_footer(&km.menu(&[]), true);
             draw_menu(&items, &layout, ("ctrl+b", &footer), false, None, &mut buf);
             let text = screen(&buf, layout.area);
             for cell in &layout.cells {
@@ -822,7 +827,7 @@ mod tests {
     #[test]
     fn the_kraal_menu_reads_as_three_columns() {
         let (km, _) = crate::keymap::Keymap::build(&crate::config::Config::default().keys);
-        let items = menu_items(&km.menu(&[]));
+        let items = menu_items(&km.menu(&[]), true);
         let full = Rect::new(0, 0, 100, 30);
         let layout = menu_layout(&items, full);
         let column = |section: u8| -> Vec<u16> {
@@ -836,11 +841,33 @@ mod tests {
         assert!(main.len() == 1 && keys.len() == 1 && menus.len() == 1, "{main:?} {keys:?} {menus:?}");
         assert!(main[0] < keys[0] && keys[0] < menus[0]);
         let mut buf = Buffer::empty(full);
-        let footer = menu_footer(&km.menu(&[]));
+        let footer = menu_footer(&km.menu(&[]), true);
         draw_menu(&items, &layout, ("ctrl+b", &footer), false, None, &mut buf);
         let text = screen(&buf, layout.area);
         assert!(text.contains("s  Connect to a server") && text.contains("S  Servers…"), "{text}");
-        assert!(text.contains("h help") && text.contains("d detach"), "{text}");
+        assert!(text.contains("h help · d detach · q quit · esc close"), "{text}");
+    }
+
+    #[test]
+    fn quit_is_in_the_footer_of_the_first_menu_and_a_line_further_in() {
+        let full = Rect::new(0, 0, 120, 40);
+        for (preset, keys) in [("kraal", "d detach · q quit"), ("classic", "d detach · Q quit")] {
+            let cfg = crate::config::Config::from_user_toml(&format!("[keys]\npreset = \"{preset}\"\n")).unwrap();
+            let (km, _) = crate::keymap::Keymap::build(&cfg.keys);
+            let root = km.menu(&[]);
+            let items = menu_items(&root, true);
+            assert!(items.iter().all(|i| i.label != "Quit"), "{preset}");
+            let layout = menu_layout(&items, full);
+            let mut buf = Buffer::empty(full);
+            draw_menu(&items, &layout, ("ctrl+b", &menu_footer(&root, true)), false, None, &mut buf);
+            let text = screen(&buf, layout.area);
+            assert!(text.contains(keys), "{preset}\n{text}");
+        }
+        let (km, _) = crate::keymap::Keymap::build(&crate::config::Config::default().keys);
+        let w = crate::input::Key { code: crate::input::KeyCode::Char('W'), mods: Default::default(), raw: Vec::new() };
+        let workspaces = km.menu(&[w]);
+        assert!(menu_footer(&workspaces, false).is_empty());
+        assert!(menu_items(&workspaces, false).iter().any(|i| i.key == "q" && i.label == "Quit"));
     }
 
     #[test]

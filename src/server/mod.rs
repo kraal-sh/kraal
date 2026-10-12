@@ -1672,6 +1672,12 @@ impl Server {
         if let Err(e) = &saved {
             eprintln!("kraal: {e}");
         }
+        // A client older than `reattach` says how to come back after a restart.
+        let reason = if self.restarting {
+            "kraal restarted: run kraal to attach again".to_string()
+        } else {
+            self.stop_message(&saved)
+        };
         // `kraal kill` says whether this last state, the one a restart brings back, is saved,
         // and what each pane showed.
         let answer = match saved {
@@ -1691,18 +1697,14 @@ impl Server {
         self.hooks.stop_all();
         let ids: Vec<ClientId> = self.clients.keys().copied().collect();
         for id in ids {
-            // On a restart, attached clients come back to the workspace they show; one older
-            // than that says how to come back.
+            // On a restart, attached clients come back to the workspace they show.
             let shown = self.clients.get(&id).filter(|c| c.attached).map(|c| c.workspace);
             let reattach = shown.filter(|_| self.restarting).map(|ws| {
                 let wi = self.ws_index(ws).unwrap_or(0);
                 self.workspaces.get(wi).map(|w| w.name.clone()).unwrap_or_default()
             });
-            let msg = match reattach {
-                Some(_) => ServerMsg::Exit { reason: "kraal restarted: run kraal to attach again".into(), reattach },
-                None => ServerMsg::exit("server exited"),
-            };
-            self.send_msg(id, &msg);
+            self.graphics_farewell(id);
+            self.send_msg(id, &ServerMsg::Exit { reason: reason.clone(), reattach });
         }
         for p in self.panes.values_mut() {
             p.kill();
@@ -1711,6 +1713,22 @@ impl Server {
         self.stop_remotes();
         // Give writer threads a moment to deliver the exit messages.
         std::thread::sleep(Duration::from_millis(50));
+    }
+
+    /// What the clients are told when the server stops for good, `saved` saying whether the
+    /// session was: why, and how it comes back.
+    fn stop_message(&self, saved: &Result<(), String>) -> String {
+        if self.workspaces.is_empty() {
+            return "the last pane closed, so kraal stopped".into();
+        }
+        let start = match self.session.as_str() {
+            "main" => "kraal".to_string(),
+            session => format!("kraal -s {session}"),
+        };
+        match saved {
+            Ok(()) => format!("stopped; {start} starts it again with its layout"),
+            Err(e) => format!("stopped, but {e}"),
+        }
     }
 }
 

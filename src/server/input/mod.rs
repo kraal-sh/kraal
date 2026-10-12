@@ -332,7 +332,7 @@ impl Server {
         let k = match ev {
             InputEvent::Key(k) => k,
             InputEvent::Mouse(m) => {
-                let items = crate::server::overlays::menu_items(&self.keymap.menu(&typed));
+                let items = crate::server::overlays::menu_items(&self.keymap.menu(&typed), typed.is_empty());
                 let layout = crate::server::overlays::menu_layout(&items, self.client_screen(id));
                 let on_menu = layout.area.contains(ratatui::layout::Position::new(m.col, m.row));
                 return match m.kind {
