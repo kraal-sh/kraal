@@ -9,6 +9,7 @@ use alacritty_terminal::event::EventListener;
 use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::index::{Column, Line, Point};
 use alacritty_terminal::selection::SelectionRange;
+use alacritty_terminal::term::color::{self, Colors};
 use alacritty_terminal::term::{Term, TermDamage};
 use ratatui::buffer::{Buffer, Cell};
 use ratatui::layout::Rect;
@@ -44,8 +45,10 @@ pub struct ScreenCache {
     /// Rows with image placeholders: what they show depends on the images too.
     images: Vec<bool>,
     /// The emulator's cells the rows were drawn from: a cell that is the same again looks the
-    /// same, unless all of them are drawn again (see `refresh`).
+    /// same, while the palette, the view, the selection and the size do (see `refresh`).
     raw: Vec<alacritty_terminal::term::cell::Cell>,
+    /// The palette the rows were drawn with.
+    colors: Colors,
 }
 
 impl ScreenCache {
@@ -62,6 +65,13 @@ impl ScreenCache {
         if !all && self.changes == Some(changes) {
             return;
         }
+        // What every cell looks like may have changed, the cells unchanged: each is drawn again.
+        let colors = *term.colors();
+        let restyled = resized
+            || offset != self.offset
+            || selection != self.selection
+            || (0..color::COUNT).any(|i| colors[i] != self.colors[i]);
+        self.colors = colors;
         self.changes = Some(changes);
         self.moved = moved;
         let mut lines = Vec::new();
@@ -100,14 +110,15 @@ impl ScreenCache {
         // moves the rest of a row, a character over half of a wide one clears the other half).
         for y in lines {
             if y < rows {
-                self.draw_row(term, y, all, resized);
+                self.draw_row(term, y, restyled, resized);
             }
         }
     }
 
     /// Draw row `y` from the grid, every cell (`all`: what they look like may have changed with
-    /// them unchanged) or those that changed since; its version changes when what it shows did
-    /// (always when `fresh`).
+    /// them unchanged) or those that changed since (whatever the emulator says of the rows: a
+    /// scroll redraws only what it moved); its version changes when what it shows did (always
+    /// when `fresh`).
     fn draw_row<T>(&mut self, term: &Term<T>, y: usize, all: bool, fresh: bool) {
         let cols = self.cols;
         let line = Line(y as i32 - self.offset as i32);
