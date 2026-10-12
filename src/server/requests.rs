@@ -12,7 +12,10 @@ use crate::protocol::{self, Request, Response, ServerMsg, WorkspaceInfo};
 type Reply = Option<Result<Response, String>>;
 
 impl Server {
-    /// Handle one request. `None` means the answer comes later (waits).
+    /// Handle one request. `None` means the answer comes later, once what the request waits for
+    /// is done: a `kraal wait` condition met, a remote file fetched and its editor open, a
+    /// runbook run started, the server stopped, or the git details read of the directory a new
+    /// pane or agent opens in. A subscription is answered by its stream of events.
     pub(super) fn request(&mut self, client: ClientId, req: Request) -> Reply {
         let reply = self.answer(client, req);
         // A request that created a workspace for a pane that then failed to start leaves it
