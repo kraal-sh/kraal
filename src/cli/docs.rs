@@ -411,93 +411,17 @@ fn the_tables_of_keys_are_the_menu() {
 
 // ---- settings and examples ---------------------------------------------------------------
 
-/// Settings the default configuration shows commented out: they have no default.
-const UNSET: [&str; 8] = [
-    "shell",
-    "theme.accent",
-    "theme.dim",
-    "theme.sync",
-    "theme.production",
-    "theme.frames",
-    "worktrees.port_base",
-    "hints.patterns",
-];
-
-/// Tables whose keys are names the user gives or chooses among (a tool, an event, a command):
-/// reading the configuration checks those.
-const NAMED: [&str; 5] = ["tools", "hints.patterns", "hooks", "keys.leader", "keys.direct"];
-
-/// Every setting, as a configuration that sets them all.
-fn settings() -> toml::Table {
-    let mut all: toml::Table = DEFAULT_CONFIG.parse().unwrap();
-    for name in UNSET {
-        let (table, key) = name.rsplit_once('.').map_or((None, name), |(table, key)| (Some(table), key));
-        let table = match table {
-            Some(table) => all[table].as_table_mut().unwrap(),
-            None => &mut all,
-        };
-        table.insert(key.into(), toml::Value::Boolean(true));
-    }
-    all
-}
-
-/// The settings of `given` that `known` does not have, by their path (`sidebar.width`).
-fn unknown(given: &toml::Table, known: &toml::Table, path: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    for (key, value) in given {
-        let path = if path.is_empty() { key.clone() } else { format!("{path}.{key}") };
-        match (value, known.get(key)) {
-            (_, None) => out.push(path),
-            (toml::Value::Table(given), Some(toml::Value::Table(known))) if !NAMED.contains(&path.as_str()) => {
-                out.extend(unknown(given, known, &path));
-            }
-            _ => {}
-        }
-    }
-    out
-}
-
-/// The keys of `given` (a file as a page shows it) that `kept` (the file as kraal writes it back)
-/// lost: kraal did not read them. `path` is the keys down to `given`, a space before each.
-fn dropped(given: &toml::Value, kept: Option<&toml::Value>, path: &str) -> Vec<String> {
-    match (given, kept) {
-        (_, None) => vec![format!("kraal does not read{path}")],
-        (toml::Value::Table(given), Some(kept)) => {
-            given.iter().flat_map(|(key, value)| dropped(value, kept.get(key), &format!("{path} {key}"))).collect()
-        }
-        (toml::Value::Array(given), Some(kept)) => {
-            given.iter().enumerate().flat_map(|(i, value)| dropped(value, kept.get(i), path)).collect()
-        }
-        _ => Vec::new(),
-    }
-}
-
-/// What is wrong with a `config.toml` a page shows: what `kraal config check` would say, and the
-/// settings kraal does not have (it reads past them).
-fn config_problems(text: &str, table: &toml::Table) -> Vec<String> {
-    let config = match Config::from_user_toml(text) {
-        Ok(config) => config,
-        Err(e) => return vec![format!("{e:#}")],
-    };
-    let unknown = unknown(table, &settings(), "").into_iter().map(|name| format!("no setting {name}"));
-    super::config_warnings(&config).into_iter().chain(unknown).collect()
-}
-
-/// What is wrong with a file a page shows, once written at `path`: kraal reads it with `load`
-/// and writes it back with `save`, as it does when it changes the file.
-fn file_problems<T>(
-    table: &toml::Table,
-    path: &Path,
-    load: impl Fn(&Path) -> anyhow::Result<T>,
-    save: impl Fn(&T) -> anyhow::Result<()>,
-) -> Vec<String> {
-    match load(path).and_then(|file| save(&file)) {
-        Ok(()) => {
-            let kept: toml::Table = std::fs::read_to_string(path).unwrap().parse().unwrap();
-            dropped(&toml::Value::Table(table.clone()), Some(&toml::Value::Table(kept)), "")
-        }
+/// What `kraal config check` would say of a `config.toml` a page shows.
+fn config_problems(text: &str) -> Vec<String> {
+    match Config::parse(text) {
+        Ok((config, unknown_keys)) => unknown_keys.into_iter().chain(super::config_warnings(&config)).collect(),
         Err(e) => vec![format!("{e:#}")],
     }
+}
+
+/// What a check found in a file a page shows: its warnings, or why the file cannot be read.
+fn problems(checked: anyhow::Result<Vec<String>>) -> Vec<String> {
+    checked.unwrap_or_else(|e| vec![format!("{e:#}")])
 }
 
 /// Each TOML example says after `toml` which file it shows (GitHub colours it all the same), and
@@ -507,27 +431,41 @@ fn the_toml_examples_are_read_whole() {
     let dir = std::env::temp_dir().join(format!("kraal-docs-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("example.toml");
-    let failed = |read: anyhow::Result<()>| read.err().map(|e| format!("{e:#}")).into_iter().collect();
     let mut wrong = Vec::new();
     for (quote, file) in blocks(&pages(), "toml") {
-        let table: toml::Table = quote.text.parse().unwrap_or_else(|e| panic!("{}: {e}", quote.at));
         std::fs::write(&path, &quote.text).unwrap();
-        let problems: Vec<String> = match file {
-            "config" => config_problems(&quote.text, &table),
-            "servers" => {
-                file_problems(&table, &path, crate::servers::Inventory::load_from, crate::servers::Inventory::save)
-            }
-            "accounts" => {
-                file_problems(&table, &path, crate::accounts::Accounts::load_from, crate::accounts::Accounts::save)
-            }
-            "runbook" => failed(crate::runbooks::load(&path, crate::runbooks::Source::User).map(drop)),
-            "worktree" => failed(crate::worktree_setup::Setup::parse(&quote.text).map(drop)),
+        let found: Vec<String> = match file {
+            "config" => config_problems(&quote.text),
+            "servers" => problems(crate::servers::Inventory::check(&path)),
+            "accounts" => problems(crate::accounts::Accounts::check(&path)),
+            "runbook" => problems(crate::runbooks::load(&path, crate::runbooks::Source::User).map(|_| Vec::new())),
+            "worktree" => problems(crate::worktree_setup::Setup::parse(&quote.text).map(|_| Vec::new())),
             other => vec![format!("`toml {other}`: say config, servers, accounts, runbook or worktree")],
         };
-        wrong.extend(problems.into_iter().map(|problem| format!("{}: {problem}", quote.at)));
+        wrong.extend(found.into_iter().map(|problem| format!("{}: {problem}", quote.at)));
     }
     std::fs::remove_dir_all(&dir).unwrap();
     assert!(wrong.is_empty(), "examples kraal would not read as written:\n{}", wrong.join("\n"));
+}
+
+/// `[keys.leader]` as it was named before 0.1.0, which no release documented.
+const UNDOCUMENTED: &str = "keys.prefixed";
+
+/// The settings kraal reads under `path` that `shown` does not set, by their path
+/// (`sidebar.width`). A table whose keys are names the user gives (a tool, an event) is one
+/// setting.
+fn not_shown(shown: &toml::Table, path: &mut Vec<&'static str>) -> Vec<String> {
+    let mut out = Vec::new();
+    for key in crate::unknown_keys::keys_of::<Config>(path) {
+        path.push(key);
+        match shown.get(*key) {
+            Some(toml::Value::Table(table)) => out.extend(not_shown(table, path)),
+            Some(_) => {}
+            None => out.push(path.join(".")),
+        }
+        path.pop();
+    }
+    out
 }
 
 /// docs/configuration.md is the reference: its examples together set every setting.
@@ -539,7 +477,8 @@ fn the_reference_names_every_setting() {
     for (quote, _) in blocks(&reference, "toml").filter(|(_, file)| *file == "config") {
         merge(&mut named, quote.text.parse().unwrap());
     }
-    let missing = unknown(&settings(), &named, "");
+    let mut missing = not_shown(&named, &mut Vec::new());
+    missing.retain(|setting| setting != UNDOCUMENTED);
     assert!(missing.is_empty(), "settings docs/configuration.md does not show: {missing:?}");
 }
 

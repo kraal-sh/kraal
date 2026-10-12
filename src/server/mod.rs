@@ -644,10 +644,8 @@ pub fn run(session: &str) -> Result<()> {
         let _ = ready.write_all(b"1");
     }
 
-    let (config, mut warnings) = match Config::load() {
-        Ok(c) => (c, Vec::new()),
-        Err(e) => (Config::default(), vec![format!("config: {e:#}")]),
-    };
+    let (config, mut warnings) =
+        Config::load_with_warnings().unwrap_or_else(|e| (Config::default(), vec![format!("config: {e:#}")]));
     let (mut keymap, kw) = Keymap::build(&config.keys);
     warnings.extend(kw);
     warnings.extend(keymap.bind_tools(&config.tools));

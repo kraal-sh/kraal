@@ -16,6 +16,13 @@ hints, hooks, production words, contexts, saving scrollback and the paste buffer
 once; panes already open keep their shell and scrollback length, and `[graphics]` waits for the
 session's next start. When the file cannot be read, nothing changes and the command says why.
 
+The check also reads your runbooks and, run in a repository, its `.kraal/worktree.toml` and its
+runbooks. A key kraal does not know in `config.toml`, `servers.toml` or `accounts.toml` (a typo,
+or a setting of another version of kraal) is a warning that names it, `bar.kyes: unknown key (did
+you mean keys?)`, and the rest of the file applies; a session says the same of `config.toml` when
+it starts or reloads it. A tool, a hint pattern, a runbook and `.kraal/worktree.toml` refuse a
+key they do not know.
+
 ## Panes and the screen
 
 ```toml config

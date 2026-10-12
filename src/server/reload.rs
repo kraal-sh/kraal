@@ -12,8 +12,7 @@ impl Server {
     /// already open keep their shell and scrollback length; new panes take the new ones. When the
     /// file cannot be read, nothing changes. Returns the warnings.
     pub(super) fn reload_config(&mut self) -> Result<Vec<String>, String> {
-        let config = Config::load().map_err(|e| format!("config: {e:#}"))?;
-        let mut warnings = Vec::new();
+        let (config, mut warnings) = Config::load_with_warnings().map_err(|e| format!("config: {e:#}"))?;
         let (mut keymap, w) = Keymap::build(&config.keys);
         warnings.extend(w);
         warnings.extend(keymap.bind_tools(&config.tools));

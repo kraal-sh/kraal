@@ -52,6 +52,17 @@ impl Setup {
     }
 }
 
+/// What `kraal config check` says of the repository's file as the checkout at `root` has it: an
+/// error when kraal would refuse to prepare a worktree from it. A checkout without one is fine.
+pub fn check_repo_file(root: &Path) -> Result<()> {
+    let path = root.join(FILE);
+    match paths::read_regular_text(&path, FILE_MAX as u64) {
+        Ok(text) => Setup::parse(&text).map(drop).with_context(|| format!("in {}", path.display())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e).with_context(|| format!("reading {}", path.display())),
+    }
+}
+
 /// A path in the repository, with wildcards in its last part only.
 fn check_pattern(p: &str) -> Result<()> {
     ensure!(p.len() <= 1024, "copy: {:?}…: longer than 1024 bytes", p.chars().take(40).collect::<String>());

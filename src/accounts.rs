@@ -200,18 +200,31 @@ impl Accounts {
     }
 
     pub fn load_from(path: &Path) -> Result<Accounts> {
-        let file: File = match std::fs::read_to_string(path) {
-            Ok(text) => toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => File::default(),
+        Self::read(path).map(|(accounts, _)| accounts)
+    }
+
+    /// What `kraal config check` says of the accounts file at `path`: a warning for each key
+    /// that kraal does not read, an error when the file cannot be read.
+    pub fn check(path: &Path) -> Result<Vec<String>> {
+        Self::read(path).map(|(_, warnings)| warnings)
+    }
+
+    fn read(path: &Path) -> Result<(Accounts, Vec<String>)> {
+        let (file, warnings) = match std::fs::read_to_string(path) {
+            Ok(text) => {
+                crate::unknown_keys::from_toml::<File>(&text).with_context(|| format!("parsing {}", path.display()))?
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Default::default(),
             Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
         };
-        Ok(Accounts {
+        let accounts = Accounts {
             limits: file.limits,
             claude: file.claude,
             accounts: file.accounts,
             rules: file.rules,
             path: path.to_path_buf(),
-        })
+        };
+        Ok((accounts, warnings))
     }
 
     pub fn empty() -> Accounts {
@@ -1873,6 +1886,50 @@ mod tests {
         let b = Accounts::load_from(&path).unwrap();
         assert_eq!(b.limits.mode, Mode::Ask);
         assert_eq!(b.accounts.len(), 1);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn keys_the_accounts_file_does_not_read_are_warnings() {
+        let dir = std::env::temp_dir().join(format!("kraal-accounts-unknown-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("accounts.toml");
+        std::fs::write(
+            &path,
+            "[limits]\ntreshold = 80\n\n[[account]]\nname = \"pro\"\nagent = \"claude\"\nhome = \"/tmp/x\"\n\
+             notes = \"team plan\"\n\n[[rule]]\nworkspce = \"shop\"\naccounts = [\"pro\"]\n",
+        )
+        .unwrap();
+        let (a, warnings) = Accounts::read(&path).unwrap();
+        assert_eq!(
+            warnings,
+            [
+                "account[0].notes: unknown key (did you mean note?)",
+                "limits.treshold: unknown key (did you mean threshold?)",
+                "rule[0].workspce: unknown key (did you mean workspace?)",
+            ]
+        );
+        assert_eq!((a.limits.threshold, a.accounts.len(), a.rules[0].workspace.as_deref()), (90, 1, None));
+        // What kraal writes, every field set, it reads.
+        let mut full = Accounts::empty();
+        full.path = path.clone();
+        full.limits = Limits { threshold: 80, mode: Mode::Auto };
+        full.claude.statusline = Some("my-statusline".into());
+        full.accounts =
+            vec![Account { threshold: Some(70), note: Some("team plan".into()), ..acct("claude", "pro", "/tmp/x") }];
+        full.rules = vec![Rule {
+            workspace: Some("shop".into()),
+            path: Some("~/src/shop".into()),
+            agent: Some("claude".into()),
+            accounts: vec!["pro".into()],
+        }];
+        full.save().unwrap();
+        let (again, warnings) = Accounts::read(&path).unwrap();
+        assert_eq!(warnings, [] as [&str; 0]);
+        assert_eq!(
+            (again.accounts, again.rules, again.claude.statusline),
+            (full.accounts, full.rules, full.claude.statusline)
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 

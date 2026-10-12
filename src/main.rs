@@ -38,6 +38,7 @@ mod text;
 mod theme;
 mod tools;
 mod transfer;
+mod unknown_keys;
 mod watch;
 mod workspace;
 mod worktree_setup;
