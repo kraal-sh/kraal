@@ -995,12 +995,9 @@ impl Server {
     /// Paste a buffer chosen in the list, as if the terminal pasted it.
     fn paste_buffer(&mut self, id: ClientId, buffer: u64) -> Mode {
         let Some(text) = self.picked_buffer(id, buffer) else { return Mode::Normal };
-        let takes = self
-            .client_focus(id)
-            .and_then(|p| self.panes.get(&p))
-            .is_some_and(|p| p.is_terminal() && p.exit_code.is_none());
-        if !takes {
-            self.toast(id, "this pane runs no program to paste into");
+        let Some(focused) = self.client_focus(id) else { return Mode::Normal };
+        if let Err(e) = self.buffer_paste(focused, &text) {
+            self.toast(id, e);
             return Mode::Normal;
         }
         self.paste(id, text.into_bytes())

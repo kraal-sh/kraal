@@ -114,9 +114,17 @@ impl Server {
     /// `kraal buffer paste`: the buffer goes to the pane as a paste, bracketed when its program
     /// asked for that. Whether the pane may get it (production) is the caller's to check.
     pub(super) fn paste_buffer_to(&mut self, pane: PaneId, key: Option<&str>) -> Result<Response, String> {
-        let text = self.buffers.get(key)?.text.clone();
+        let bytes = self.buffer_paste(pane, &self.buffers.get(key)?.text)?;
+        self.panes.get_mut(&pane).ok_or("no such pane")?.write_input(bytes);
+        Ok(Response::Ok)
+    }
+
+    /// The paste of `text` that `pane` gets, bracketed when its program asked for that. Refused
+    /// when it runs no program, or when its program cannot be sent that much at once now: the
+    /// paste would be dropped whole.
+    pub(super) fn buffer_paste(&self, pane: PaneId, text: &str) -> Result<Vec<u8>, String> {
         let label = self.pane_label(pane);
-        let pn = self.panes.get_mut(&pane).ok_or("no such pane")?;
+        let pn = self.panes.get(&pane).ok_or("no such pane")?;
         if !pn.is_terminal() {
             return Err(format!("{label} runs no program to paste into"));
         }
@@ -124,8 +132,12 @@ impl Server {
             return Err("the pane's program has exited".into());
         }
         let bytes = crate::input::encode_paste(text.as_bytes(), pn.input_modes());
-        pn.write_input(bytes);
-        Ok(Response::Ok)
+        let room = pn.input_room();
+        if bytes.len() > room {
+            let (most, size) = (human_size(room as u64), human_size(bytes.len() as u64));
+            return Err(format!("{label} takes a paste of {most} at most now: this one is {size}"));
+        }
+        Ok(bytes)
     }
 
     /// Take back the buffers kept by the last server, when they are kept; otherwise make sure no

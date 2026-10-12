@@ -380,12 +380,17 @@ impl TermPane {
     }
 
     pub(super) fn write(&mut self, bytes: Vec<u8>) {
-        if self.input_pending.load(Ordering::Relaxed) + bytes.len() > MAX_PENDING_INPUT {
+        if bytes.len() > self.input_room() {
             self.input_dropped = true;
             return;
         }
         self.input_pending.fetch_add(bytes.len(), Ordering::Relaxed);
         let _ = self.input.send(bytes);
+    }
+
+    /// The most input the program can be sent at once now: a larger write is dropped whole.
+    pub(super) fn input_room(&self) -> usize {
+        MAX_PENDING_INPUT.saturating_sub(self.input_pending.load(Ordering::Relaxed))
     }
 
     /// The grid point under a cell of the pane, clamped to the grid: the pane may be drawn

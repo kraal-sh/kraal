@@ -4980,6 +4980,42 @@ fn paste_buffers_that_could_not_be_kept_are_written_later() {
 }
 
 #[test]
+fn a_paste_buffer_goes_whole_or_not_at_all() {
+    let env = Env::new("bufbig");
+    env.workspace("w", "layout {\n    pane name=\"main\"\n}\n");
+    env.run(&["open", "w"]);
+    let got = env.root.join("pasted");
+    let script = format!("stty raw -echo; printf READY; exec cat > {}", got.display());
+    env.run(&["run", "--name", "sink", "--", "sh", "-c", &script]);
+    env.wait_for_text("sink", "READY");
+    // Within the buffers' 32 MB, more than a program can be sent at once (16 MiB).
+    assert!(set_buffer(&env, &["big"], &"y".repeat(17 << 20)).status.success());
+    let out = env.try_run(&["buffer", "paste", "big", "-p", "sink"]);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success() && err.contains("at most"), "{err}");
+    // What fits goes.
+    assert!(set_buffer(&env, &["small"], "fits").status.success());
+    env.run(&["buffer", "paste", "small", "-p", "sink"]);
+    let size = || std::fs::metadata(&got).map(|m| m.len()).unwrap_or(0);
+    let start = Instant::now();
+    while size() < 4 {
+        assert!(start.elapsed() < Duration::from_secs(10), "the small paste never arrived");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    // Chosen in the list: said too.
+    env.run(&["focus", "sink"]);
+    let mut client = RawClient::attach(&env, "w");
+    client.send(b"\x02=");
+    client.wait_for_screen("Paste buffers");
+    client.send(b"\x1b[B");
+    std::thread::sleep(Duration::from_millis(150));
+    client.send(b"\r");
+    client.wait_for_screen("at most now");
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(size(), 4, "nothing of the large paste went");
+}
+
+#[test]
 fn paste_buffers_reach_production_only_on_purpose() {
     let env = Env::new("bufprod");
     let tf = env.root.join("infra");
