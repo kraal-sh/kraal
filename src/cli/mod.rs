@@ -3,6 +3,8 @@
 mod agents;
 mod args;
 mod buffers;
+#[cfg(test)]
+mod docs;
 mod panes;
 mod remote;
 mod restart;
@@ -282,6 +284,21 @@ fn print_keys(keymap: &crate::keymap::Keymap, markdown: bool) {
     }
 }
 
+/// What `kraal config check` warns about in a configuration that could be read: its keys, tools,
+/// hints, hooks, theme and worktree setup.
+fn config_warnings(cfg: &config::Config) -> Vec<String> {
+    let (mut keymap, mut warnings) = crate::keymap::Keymap::build(&cfg.keys);
+    warnings.extend(keymap.bind_tools(&cfg.tools));
+    warnings.extend(tools::check(&cfg.tools));
+    warnings.extend(hints::Custom::build(&cfg.hints, &cfg.tools).1);
+    warnings.extend(server::events::read_hooks(&cfg.hooks).1);
+    warnings.extend(theme::Theme::from_config(&cfg.theme).1);
+    if let Err(e) = crate::worktree_setup::Setup::of_user(&cfg.worktrees).check() {
+        warnings.push(format!("[worktrees] {e:#}"));
+    }
+    warnings
+}
+
 /// `kraal config`: print the defaults, the path or the keys, or check the configuration.
 fn config_cmd(action: &str, markdown: bool) -> Result<()> {
     match action {
@@ -295,16 +312,7 @@ fn config_cmd(action: &str, markdown: bool) -> Result<()> {
         }
         _ => {
             let cfg = config::Config::load()?;
-            let (mut keymap, mut warnings) = crate::keymap::Keymap::build(&cfg.keys);
-            warnings.extend(keymap.bind_tools(&cfg.tools));
-            warnings.extend(tools::check(&cfg.tools));
-            warnings.extend(hints::Custom::build(&cfg.hints, &cfg.tools).1);
-            warnings.extend(server::events::read_hooks(&cfg.hooks).1);
-            warnings.extend(theme::Theme::from_config(&cfg.theme).1);
-            if let Err(e) = crate::worktree_setup::Setup::of_user(&cfg.worktrees).check() {
-                warnings.push(format!("[worktrees] {e:#}"));
-            }
-            for w in &warnings {
+            for w in config_warnings(&cfg) {
                 eprintln!("warning: {w}");
             }
             // Warnings are advice; a file kraal cannot read at all is an error.
