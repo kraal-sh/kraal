@@ -29,7 +29,7 @@ pub enum Kind {
 }
 
 impl Kind {
-    /// What Shift+label does, for the top bar.
+    /// What acting on it does (Tab, then its label), for the top bar.
     pub fn action(self) -> &'static str {
         match self {
             Kind::Url => "open",
@@ -90,7 +90,8 @@ pub struct Hint {
 #[serde(deny_unknown_fields)]
 pub struct PatternDef {
     pattern: String,
-    /// The tool Shift+label runs, with the match in `$KRAAL_SELECTION`.
+    /// The tool that acting on a match runs (Tab, then its label), with the match in
+    /// `$KRAAL_SELECTION`.
     #[serde(default)]
     tool: Option<String>,
 }
