@@ -53,6 +53,14 @@ impl Server {
                 }
                 Ok(Response::Panes(v.into_iter().map(|p| self.pane_info(p)).collect()))
             }
+            Request::ListAgents => {
+                let mut v: Vec<PaneId> = Vec::new();
+                for ws in &self.workspaces {
+                    v.extend(ws.panes());
+                }
+                let local = v.into_iter().filter(|p| self.panes[p].agent.kind.is_some()).map(|p| self.pane_info(p));
+                Ok(Response::Panes(local.chain(self.remote_agent_infos()).collect()))
+            }
             Request::ListWorkspaces => Ok(Response::Workspaces(self.workspace_infos())),
             Request::OpenWorkspace { name } => {
                 self.open_workspace(&name).map(|_| Response::Ok).map_err(|e| format!("{e:#}"))

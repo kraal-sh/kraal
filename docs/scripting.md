@@ -14,13 +14,21 @@ kraal send -p tests --enter "cargo test"         # type into a pane
 kraal keys -p tests ctrl+c                       # press keys
 kraal read -p tests --lines 50                   # read the screen or scrollback
 kraal wait -p api --until blocked,done --timeout 600
-kraal agents --json                              # every agent and its state
-kraal agents --follow                            # the same, one JSON line again at each change
+kraal agents --json                              # every agent and its state, servers' too
+kraal agents --follow                            # this session's, one JSON line again at each change
 kraal preview docs/design.md --floating
 kraal notify "deploy" "finished"
 ```
 
 Panes are referred to by id, by name, or as `workspace:name`.
+
+`kraal agents` also lists the agents of the kraal sessions on your servers that kraal watches (see
+[Agents on your servers](servers.md#agents-on-your-servers)), after this session's own, as
+`gpu › api` in the workspace column. In `--json`, such an agent has `"kind": "remote"`, `server`
+(the server's name) and `session` (the kraal session there), and its `id` is its pane's id in that
+session, not a pane here: `kraal -s main read -p 3` runs on the server, `kraal attach --host gpu
+--pane 3` shows it here. `kraal agents --follow` lists this session's own agents only: it is what
+another kraal watching this session reads.
 
 ## Events
 
@@ -42,6 +50,15 @@ connected), `production.entered/left` (`entered` again when the reason changes),
 `notification`, `tunnel.up/down`, `port.opened/closed`, `account.limit`,
 `runbook.started/finished`, `command.finished` (a command the shell marks ended: its `command`
 line, `exit` status and `seconds`; see [Shell commands](terminal.md#shell-commands)).
+
+An agent of a server's session watched here changes state as a local one does: `agent.working`,
+`agent.blocked`, `agent.done` and `agent.idle` come for it too, with `server` and `session` (and
+`pane`, its id in that session; `previous` is null the first time it is seen). An `agent.*` hook
+that acts on the pane checks `$KRAAL_SERVER` first: it is empty for an agent of this session.
+
+```
+{"v":1,"seq":1204,"boot":1760184000000,"type":"agent.blocked","pane":3,"name":"api","workspace":"dev","agent":"claude","previous":"working","server":"gpu","session":"main",…}
+```
 
 `seq` grows with each event and `boot` changes when the server restarts. The server keeps the last
 1024 events: a script that was too slow (kraal drops it rather than slow down) or restarted can

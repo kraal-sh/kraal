@@ -139,10 +139,19 @@ main` or a line in the file does the same. Attaching leaves a value already ther
 Only the servers marked this way are watched, each over one ssh that stays open and runs
 `kraal agents --follow` there. That ssh never asks anything (BatchMode): the server must take
 your key without a prompt. A server that does not answer, or has no kraal (`kraal remote-install
-gpu`), is reported once, then tried again less and less often, at most a minute apart; its agents
-leave the list until it is back.
+gpu`), is reported once, then tried again less and less often, at most a minute apart (a
+connection that drops within a minute counts as a failure, even after listing the agents); its
+agents leave the list until it is back.
 
 A click on one, Enter in the pane finder (`ctrl+b p`), or `alt+a` when it waits for you opens a
 tab attached to that session, with the agent's pane shown; a tab already attached to it is used
-instead. An agent there that gets blocked or finishes is announced like a local one, unless a tab
-is attached to its session: that session's own notification then comes through the tab.
+instead, however it was started, and shows that pane, whatever another terminal attached to that
+session shows (with an older kraal on the server, the session is only asked to show it). An agent
+there that gets blocked or finishes is announced like a local one, unless a tab is attached to its
+session: that session's own notification then comes through the tab, once. `kraal agents` lists
+these agents too, and their changes of state are `agent.*` events (see
+[Scripting](scripting.md#events)).
+
+A server's entry gets `agents` only when it reaches the account attached to the same way (user,
+port, key, jump host): `kraal attach --host bob@gpu` adds an entry of its own (`gpu-bob`) beside
+`gpu` for alice. A config.toml that cannot be read leaves servers.toml as it is.

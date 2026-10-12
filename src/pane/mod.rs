@@ -190,6 +190,23 @@ pub struct Pane {
     search: Option<SearchState>,
     /// The line that marks where text saved before a restart ends, once it was given back.
     restored: Option<String>,
+    /// The kraal session of a server that a kraal client running here says it shows.
+    attachment: Option<RemoteAttachment>,
+}
+
+/// A kraal client in a pane, attached to a server's session (`kraal attach --host`), as it
+/// says itself.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RemoteAttachment {
+    /// The server, by its name in the inventory.
+    pub server: String,
+    pub session: String,
+    /// That session tells which of its panes this client shows: an older kraal there does not.
+    pub reports: bool,
+    /// The pane it shows there, as last told.
+    pub shows: Option<u32>,
+    /// The foreground process group when the client said so: it holds while that client runs.
+    group: Option<i32>,
 }
 
 /// Environment given to every pane process.
@@ -247,6 +264,7 @@ impl Pane {
             preparing: false,
             search: None,
             restored: None,
+            attachment: None,
         })
     }
 
@@ -276,6 +294,7 @@ impl Pane {
             preparing: false,
             search: None,
             restored: None,
+            attachment: None,
         }
     }
 
@@ -405,6 +424,22 @@ impl Pane {
                 Osc::Contexts(contexts) => {
                     self.reported_since_command = true;
                     signals.push(PaneSignal::Contexts(contexts));
+                }
+                Osc::Attached(to) => {
+                    let group = t.master.process_group_leader();
+                    self.attachment = to.map(|(server, session)| RemoteAttachment {
+                        server,
+                        session,
+                        reports: false,
+                        shows: None,
+                        group,
+                    });
+                }
+                Osc::Shows(pane) => {
+                    if let Some(a) = &mut self.attachment {
+                        a.reports = true;
+                        a.shows = pane;
+                    }
                 }
             }
         }
@@ -570,6 +605,14 @@ impl Pane {
     /// A hold on the pane's current process (see [`ProcessHold`]).
     pub fn process_hold(&self) -> Option<ProcessHold> {
         self.term().map(|t| ProcessHold::new(&t.process))
+    }
+
+    /// The server's session a kraal client running here shows, while the client that said so
+    /// is still the one in the foreground (one that was killed says nothing more).
+    pub fn attachment(&self) -> Option<&RemoteAttachment> {
+        let a = self.attachment.as_ref()?;
+        let group = self.term()?.master.process_group_leader();
+        (self.exit_code.is_none() && a.group.is_some() && a.group == group).then_some(a)
     }
 
     /// Command line of the foreground process group leader.
@@ -901,6 +944,49 @@ mod tests {
                 Osc::Notify { title: String::new(), body: "done!".into() },
             ]
         );
+    }
+
+    #[test]
+    fn a_notification_sent_both_ways_at_once_is_one() {
+        // What kraal itself sends a terminal for one notification, read in pieces.
+        let mut s = OscScanner::default();
+        let twice =
+            [crate::pane::osc_notify("claude · api", "needs your input"), crate::pane::osc_notify("x", "y")].concat();
+        let mut found = Vec::new();
+        for chunk in twice.chunks(5) {
+            found.extend(s.scan(chunk).into_iter().map(|(_, o)| o));
+        }
+        assert_eq!(
+            found,
+            vec![
+                Osc::Notify { title: "claude · api".into(), body: "needs your input".into() },
+                Osc::Notify { title: "x".into(), body: "y".into() },
+            ]
+        );
+        // Apart, or saying something else, they are two.
+        let apart = b"\x1b]777;notify;a;b\x07 \x1b]9;a: b\x07\x1b]777;notify;c;d\x07\x1b]9;other\x07";
+        assert_eq!(s.scan(apart).len(), 4);
+    }
+
+    #[test]
+    fn a_kraal_attached_to_a_server_says_so() {
+        let mut s = OscScanner::default();
+        let found: Vec<Osc> = s
+            .scan(b"\x1b]7701;attach;gpu;main\x07\x1b]7701;shows;12\x1b\\\x1b]7701;shows;\x07\x1b]7701;attach\x07")
+            .into_iter()
+            .map(|(_, o)| o)
+            .collect();
+        assert_eq!(
+            found,
+            vec![
+                Osc::Attached(Some(("gpu".into(), "main".into()))),
+                Osc::Shows(Some(12)),
+                Osc::Shows(None),
+                Osc::Attached(None),
+            ]
+        );
+        // Names that are no server's or session's are not taken.
+        assert!(s.scan(b"\x1b]7701;attach;g pu;main\x07\x1b]7701;attach;gpu;../x\x07").is_empty());
     }
 
     #[test]

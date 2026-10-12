@@ -297,6 +297,9 @@ pub struct Client {
     pub keys_full: Option<bool>,
     /// Its terminal sends every key with its place, for the leader menu.
     pub keys_by_place: bool,
+    /// It asked to be told which pane it shows (a kraal attached here from a pane of another
+    /// kraal): the pane it was last told, until it changes.
+    pub told_shown: Option<Option<PaneId>>,
     /// A paste arriving in pieces.
     pub(in crate::server) paste: Option<input::PasteFlow>,
     /// The process that connected, where the system tells.
@@ -1107,7 +1110,14 @@ impl Server {
             let (mut bytes, more) = self.graphics_updates(id);
             // Or, for a terminal that draws sixel, the images' visible parts go over the cells.
             let (erase, images, still) = self.paint_images(id, &mut buf);
+            let shown = self.client_focus(id);
             let Some(c) = self.clients.get_mut(&id) else { continue };
+            // A kraal that asked is told which pane it shows, when that changed.
+            let tell = c.told_shown.is_some_and(|told| told != shown);
+            if tell {
+                let pane = shown.map(|p| p.to_string()).unwrap_or_default();
+                bytes.extend_from_slice(format!("\x1b]7701;shows;{pane}\x07").as_bytes());
+            }
             c.encoder.encode_with_images(&buf, cursor, &links, &erase, &images, &mut bytes);
             c.dirty = more || still.is_some();
             again |= more;
@@ -1115,6 +1125,7 @@ impl Server {
                 wake = Some(wake.map_or(at, |w| w.min(at)));
             }
             match c.out.try_send(frame_bytes(&bytes)) {
+                Ok(()) if tell => c.told_shown = Some(shown),
                 Ok(()) => {}
                 Err(TrySendError::Full(_)) => {
                     c.encoder.invalidate();

@@ -192,6 +192,9 @@ pub enum Placement {
 pub enum Request {
     Ping,
     ListPanes,
+    /// The panes running an agent, then the agents of the servers' sessions watched (those
+    /// have `session`).
+    ListAgents,
     ListWorkspaces,
     OpenWorkspace {
         name: String,
@@ -388,6 +391,10 @@ pub struct PaneInfo {
     /// The server the pane is connected to.
     #[serde(default)]
     pub server: Option<String>,
+    /// For an agent of a kraal session on a server (`server`): that session. `id` is then its
+    /// pane's id there, and `kind` is `remote`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<String>,
     /// Why the pane is production (`server web-prod-1`), if it is.
     #[serde(default)]
     pub production: Option<String>,

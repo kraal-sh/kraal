@@ -9,16 +9,24 @@ use super::{Session, pane_ref};
 use crate::protocol::{PaneInfo, Request, Response};
 use crate::{client, paths, server};
 
-/// `kraal panes` and `kraal agents`.
+/// `kraal panes` and `kraal agents`: the agents of the servers' sessions watched too, after
+/// this session's own (an older server, still running, lists its own only).
 pub(super) fn list(s: &Session, json: bool, agents: bool) -> Result<()> {
-    let Response::Panes(list) = s.request(Request::ListPanes)? else { bail!("unexpected answer") };
+    let answer = if agents {
+        s.request(Request::ListAgents).or_else(|_| s.request(Request::ListPanes))
+    } else {
+        s.request(Request::ListPanes)
+    };
+    let Response::Panes(list) = answer? else { bail!("unexpected answer") };
     let list: Vec<PaneInfo> = list.into_iter().filter(|p| !agents || p.agent.is_some()).collect();
     print_panes(&list, json, agents)
 }
 
-/// `kraal agents --follow`: the agents as one JSON line (what `--json` lists), then again each
-/// time that changes: at once for what events say (a state), within two seconds otherwise (an
-/// agent that quit). It ends when what reads it goes away (another kraal's ssh, listing them).
+/// `kraal agents --follow`: this session's own agents as one JSON line (what `--json` lists of
+/// them), then again each time that changes: at once for what events say (a state), within two
+/// seconds otherwise (an agent that quit). It ends when what reads it goes away (another kraal's
+/// ssh, listing them). The agents of servers this session watches are not in it: another kraal
+/// watching this one would show them as this session's.
 pub(super) fn follow_agents(s: &Session) -> Result<()> {
     use std::io::Write;
     let socket = s.socket();
@@ -91,7 +99,12 @@ fn print_panes(list: &[PaneInfo], json: bool, agents: bool) -> Result<()> {
         };
         let extra = if p.production.is_some() { format!("PROD {extra}") } else { extra };
         if agents {
-            println!("{:>4}{mark} {:<14} {:<24} {extra}", p.id, p.workspace, name);
+            // An agent of a server's session: its pane's id there, after the server's name.
+            let workspace = match (&p.session, &p.server) {
+                (Some(_), Some(server)) => format!("{server} › {}", p.workspace),
+                _ => p.workspace.clone(),
+            };
+            println!("{:>4}{mark} {:<14} {:<24} {extra}", p.id, workspace, name);
         } else {
             println!("{:>4}{mark} {:<14} {:<12} {:<24} {extra}", p.id, p.workspace, p.tab, name);
         }

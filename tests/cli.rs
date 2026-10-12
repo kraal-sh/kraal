@@ -3395,6 +3395,30 @@ fn agents_follow_prints_the_list_each_time_it_changes() {
     }
 }
 
+/// A fake ssh, first in the PATH returned: it runs the command "on the server", that is here, as
+/// the kraal of `remote` (with its own directories); "down.lan" does not answer. Every call is
+/// logged in the file returned.
+#[cfg(unix)]
+fn fake_ssh(local: &Env, remote: &Env) -> (PathBuf, String) {
+    let bin = local.root.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_kraal"), bin.join("kraal")).unwrap();
+    let log = local.root.join("ssh.log");
+    write_script(
+        &bin.join("ssh"),
+        &format!(
+            "#!/bin/sh\necho \"$*\" >> {log}\nfor a; do cmd=$a; done\n\
+             case \"$*\" in *down.lan*) echo 'ssh: connect to host down.lan port 22: Connection refused' >&2; exit 255;; esac\n\
+             unset KRAAL KRAAL_SOCKET KRAAL_SESSION KRAAL_PANE\n\
+             export XDG_RUNTIME_DIR={r}/run XDG_STATE_HOME={r}/state XDG_CONFIG_HOME={r}/config\n\
+             exec sh -c \"$cmd\"\n",
+            log = log.display(),
+            r = remote.root.display()
+        ),
+    );
+    (log, format!("{}:{}", bin.display(), std::env::var("PATH").unwrap_or_default()))
+}
+
 #[cfg(unix)]
 #[test]
 fn agents_of_a_remote_session_are_listed_and_reached() {
@@ -3413,25 +3437,7 @@ fn agents_of_a_remote_session_are_listed_and_reached() {
     let api = remote_api()["id"].to_string();
     assert_eq!(remote_api()["focused"], false);
 
-    // A fake ssh: runs the command "on the server", that is here, as the server's kraal (with its
-    // own directories); "down.lan" does not answer. Every call is logged.
-    let bin = local.root.join("bin");
-    std::fs::create_dir_all(&bin).unwrap();
-    std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_kraal"), bin.join("kraal")).unwrap();
-    let log = local.root.join("ssh.log");
-    write_script(
-        &bin.join("ssh"),
-        &format!(
-            "#!/bin/sh\necho \"$*\" >> {log}\nfor a; do cmd=$a; done\n\
-             case \"$*\" in *down.lan*) echo 'ssh: connect to host down.lan port 22: Connection refused' >&2; exit 255;; esac\n\
-             unset KRAAL KRAAL_SOCKET KRAAL_SESSION KRAAL_PANE\n\
-             export XDG_RUNTIME_DIR={r}/run XDG_STATE_HOME={r}/state XDG_CONFIG_HOME={r}/config\n\
-             exec sh -c \"$cmd\"\n",
-            log = log.display(),
-            r = remote.root.display()
-        ),
-    );
-    let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap_or_default());
+    let (log, path) = fake_ssh(&local, &remote);
     let inventory = local.root.join("config/kraal/servers.toml");
     std::fs::write(
         &inventory,
@@ -3458,15 +3464,41 @@ fn agents_of_a_remote_session_are_listed_and_reached() {
     std::thread::sleep(Duration::from_secs(3));
     let tries = ssh_log().matches("down.lan").count();
     assert!(tries <= 2, "a server that is down is not hammered: {tries} tries in about 3 s");
-    assert!(local.run(&["agents"]).trim().is_empty(), "kraal agents lists this session's own agents only");
 
-    // Blocked there: announced here.
-    let (mut events, notified) = local.follow(&["events", "notification"]);
+    // `kraal agents` lists them too, after the server's name, with their id there.
+    let listed = local.run(&["agents"]);
+    assert!(listed.lines().any(|l| l.contains("gpu › w") && l.contains("api") && l.contains("working")), "{listed}");
+    let agents: serde_json::Value = serde_json::from_str(&local.run(&["agents", "--json"])).unwrap();
+    let there = agents.as_array().unwrap().iter().find(|a| a["server"] == "gpu").cloned().unwrap();
+    assert_eq!((there["session"].as_str(), there["kind"].as_str()), (Some("rremote"), Some("remote")), "{there}");
+    assert_eq!((there["id"].to_string(), there["agent"].as_str()), (api.clone(), Some("claude")), "{there}");
+    // What another kraal watching this one reads lists this session's own agents only.
+    let (mut follow, lines) = local.follow(&["agents", "--follow"]);
+    assert_eq!(lines.recv_timeout(Duration::from_secs(10)).expect("a list").trim(), "[]");
+    let _ = follow.kill();
+    let _ = follow.wait();
+
+    // Blocked there: told and announced here, as a local agent is.
+    let (mut events, notified) = local.follow(&["events", "notification", "agent.*"]);
     claude_hook(&remote, "api", r#"{"hook_event_name":"Notification","message":"Claude needs your permission"}"#);
-    let line = notified.recv_timeout(Duration::from_secs(10)).expect("a notification");
-    let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+    let mut seen = std::collections::HashMap::new();
+    while seen.len() < 2 {
+        let line = notified.recv_timeout(Duration::from_secs(10)).expect("an event");
+        let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+        seen.insert(v["type"].as_str().unwrap().to_string(), v);
+    }
+    let v = &seen["notification"];
     let said = (v["title"].as_str(), v["body"].as_str());
-    assert_eq!(said, (Some("claude · api on gpu"), Some("needs your input")), "{line}");
+    assert_eq!(said, (Some("claude · api on gpu"), Some("needs your input")), "{v}");
+    let v = &seen["agent.blocked"];
+    assert_eq!(
+        (v["server"].as_str(), v["session"].as_str(), v["pane"].to_string()),
+        (Some("gpu"), Some("rremote"), api.clone())
+    );
+    assert_eq!(
+        (v["name"].as_str(), v["agent"].as_str(), v["previous"].as_str()),
+        (Some("api"), Some("claude"), Some("working"))
+    );
     let _ = events.kill();
     let _ = events.wait();
     client.wait_for_screen("blocked · claude · w");
@@ -3487,13 +3519,22 @@ fn agents_of_a_remote_session_are_listed_and_reached() {
         assert!(start.elapsed() < Duration::from_secs(10), "the agent's pane is not shown there: {}", remote_api());
         std::thread::sleep(Duration::from_millis(50));
     }
-    // Again: the tab already attached is used, and that session asked to show the pane.
-    client.send(b"\x1ba");
+    // The tab shows another pane there; again: the tab already attached is used, and the
+    // client in it asked to show the agent's pane.
+    remote.run(&["focus", "other"]);
     let start = Instant::now();
-    while !ssh_log().contains(&format!("-s rremote focus {api}")) {
-        assert!(start.elapsed() < Duration::from_secs(10), "{}", ssh_log());
+    while remote_api()["focused"] != false {
+        assert!(start.elapsed() < Duration::from_secs(10), "{}", remote_api());
         std::thread::sleep(Duration::from_millis(50));
     }
+    std::thread::sleep(Duration::from_millis(500));
+    client.send(b"\x1ba");
+    let start = Instant::now();
+    while remote_api()["focused"] != true {
+        assert!(start.elapsed() < Duration::from_secs(10), "the agent's pane is not shown again: {}", remote_api());
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(!ssh_log().contains(" focus "), "asked through the tab, not over another connection: {}", ssh_log());
     assert_eq!(local_panes().len(), 2, "{:?}", local_panes());
 
     // Attaching to a server makes kraal list that session's agents from then on.
@@ -3519,7 +3560,101 @@ fn agents_of_a_remote_session_are_listed_and_reached() {
         std::thread::sleep(Duration::from_millis(50));
     }
     assert!(std::fs::read_to_string(&inventory).unwrap().contains("agents = \"main\""), "the others stay as written");
+
+    // A configuration that cannot be read does not say that servers may be added: none is,
+    // though the attach works.
+    let broken = local.root.join("broken");
+    std::fs::create_dir_all(broken.join("kraal")).unwrap();
+    std::fs::copy(&inventory, broken.join("kraal/servers.toml")).unwrap();
+    std::fs::write(broken.join("kraal/config.toml"), "[servers]\nauto_add = false\nmouse = [\n").unwrap();
+    let before = std::fs::read_to_string(broken.join("kraal/servers.toml")).unwrap();
+    let config = format!("XDG_CONFIG_HOME={}", broken.display());
+    let args = ["run", "-n", "new", "--", "env", "-u", "KRAAL_PANE", &config, kraal, "-s", "rremote", "attach"];
+    local.run(&[&args[..], &["--host", "new.lan"]].concat());
+    local.wait_for_text("new", "api");
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(ssh_log().contains("new.lan"));
+    assert_eq!(std::fs::read_to_string(broken.join("kraal/servers.toml")).unwrap(), before);
     drop(client);
+}
+
+/// A tab attached to a server's session by hand is the one used, and each agent waiting there is
+/// shown in it in turn: in the tab, whatever another terminal attached to that session shows.
+#[cfg(unix)]
+#[test]
+fn a_tab_attached_to_a_server_shows_each_agent_there_in_turn() {
+    let local = Env::new("tlocal");
+    let remote = Env::new("tremote");
+    // Two workspaces there, an agent shown in each, both waiting for an answer.
+    remote.workspace("one", "layout {\n    pane name=\"api\"\n}\n");
+    remote.workspace("two", "layout {\n    pane name=\"web\"\n}\n");
+    remote.run(&["open", "one"]);
+    remote.run(&["open", "two"]);
+    for (pane, n, word) in [("api", 1, "ONE"), ("web", 2, "TWO")] {
+        remote.run(&["send", "-p", pane, "--enter", &format!("echo IN-$(({n}))-{word}")]);
+        remote.wait_for_text(pane, &format!("IN-{n}-{word}"));
+        for event in ["SessionStart", "UserPromptSubmit", "Notification"] {
+            let payload = format!(
+                r#"{{"hook_event_name":"{event}","session_id":"s-{n}","message":"Claude needs your permission"}}"#
+            );
+            claude_hook(&remote, pane, &payload);
+        }
+    }
+    let (_log, path) = fake_ssh(&local, &remote);
+    std::fs::write(
+        local.root.join("config/kraal/servers.toml"),
+        "[[server]]\nname = \"gpu\"\nhost = \"gpu.lan\"\nagents = \"tremote\"\n",
+    )
+    .unwrap();
+    local.workspace("w", "layout {\n    pane name=\"main\"\n}\n");
+    let out = local.cmd(&["open", "w"]).env("PATH", &path).output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    // Attached by hand, with a command line of its own.
+    let kraal = env!("CARGO_BIN_EXE_kraal");
+    local.run(&[
+        "run",
+        "--tab",
+        "-n",
+        "by-hand",
+        "--",
+        "env",
+        "-u",
+        "KRAAL_PANE",
+        kraal,
+        "-s",
+        "tremote",
+        "attach",
+        "--host",
+        "gpu",
+    ]);
+    local.wait_for_text("by-hand", "IN-1-ONE");
+    let mut client = RawClient::attach(&local, "w");
+    client.wait_for_screen("gpu › ");
+    client.wait_for_screen("blocked · claude · two");
+    // Another terminal attached there, used last: what that session is asked without saying
+    // which client goes to that one.
+    let mut other = RawClient::attach(&remote, "one");
+    std::thread::sleep(Duration::from_millis(500));
+    let shown = |word: &str, not: &str| {
+        let start = Instant::now();
+        loop {
+            let screen = local.run(&["read", "-p", "by-hand"]);
+            if screen.contains(word) && !screen.contains(not) {
+                break;
+            }
+            assert!(start.elapsed() < Duration::from_secs(10), "{word} is not what the tab shows:\n{screen}");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    };
+    for (word, not) in [("IN-1-ONE", "IN-2-TWO"), ("IN-2-TWO", "IN-1-ONE"), ("IN-1-ONE", "IN-2-TWO")] {
+        // The terminal there gained the focus: it is the one used last there.
+        other.send(b"\x1b[I");
+        std::thread::sleep(Duration::from_millis(200));
+        client.send(b"\x1ba");
+        shown(word, not);
+    }
+    let panes: serde_json::Value = serde_json::from_str(&local.run(&["panes", "--json"])).unwrap();
+    assert_eq!(panes.as_array().unwrap().len(), 2, "no other tab attached: {panes}");
 }
 
 /// A release as GitHub serves it, made from this build: `kraal-<target>.tar.gz` and its

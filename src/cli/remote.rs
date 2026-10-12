@@ -9,7 +9,15 @@ use crate::protocol::{Placement, Request, Response};
 use crate::{client, config, fleet, paths, server, servers, transfer, workspace};
 
 pub(super) fn attach(session: &str, host: &str, workspace: Option<String>, pane: Option<String>) -> Result<()> {
-    let cfg = config::Config::load().unwrap_or_default();
+    // A configuration that cannot be read does not say what the user allows (`auto_add`):
+    // servers.toml is left as it is then.
+    let (cfg, may_update) = match config::Config::load() {
+        Ok(cfg) => (cfg, true),
+        Err(e) => {
+            eprintln!("kraal: {e:#}; servers.toml is left as it is");
+            (config::Config::default(), false)
+        }
+    };
     let known = known_servers(&cfg)?;
     let s = servers::resolve(&known, host).with_context(|| format!("not a server: {host}"))?;
     let target = client::Target::Remote {
@@ -20,6 +28,9 @@ pub(super) fn attach(session: &str, host: &str, workspace: Option<String>, pane:
     };
     // Once a kraal there answered, the sidebar lists that session's agents from then on.
     let remember = || {
+        if !may_update {
+            return;
+        }
         let marked = servers::Inventory::update(|inv| inv.watch_agents(&s, session, cfg.servers.auto_add));
         if let Err(e) = marked {
             eprintln!("kraal: the agents of {} will not be listed: {e:#}", s.name);

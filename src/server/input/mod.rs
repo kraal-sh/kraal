@@ -90,7 +90,7 @@ impl Server {
 
     fn client_event(&mut self, id: ClientId, ev: InputEvent) {
         if let InputEvent::Raw(raw) = &ev
-            && (self.keyboard_reply(id, raw) || self.terminal_reply(id, raw))
+            && (self.keyboard_reply(id, raw) || self.attached_request(id, raw) || self.terminal_reply(id, raw))
         {
             return;
         }
@@ -163,6 +163,28 @@ impl Server {
         self.mark_dirty_client(id);
         // Each key may move the focus: a pane left and found again in one read is told both.
         self.follow_focus();
+    }
+
+    /// What a client attached from a pane of another kraal asks of this session, in what it
+    /// sends as typed: to be told which pane it shows (`OSC 7701 ; report`), or to show one
+    /// (`OSC 7701 ; show ; <pane id>`). An older kraal drops these, as any OSC typed.
+    fn attached_request(&mut self, id: ClientId, raw: &[u8]) -> bool {
+        let Some(rest) = raw.strip_prefix(b"\x1b]7701;") else { return false };
+        let rest = rest.strip_suffix(b"\x07").or_else(|| rest.strip_suffix(b"\x1b\\")).unwrap_or(rest);
+        if rest == b"report" {
+            if let Some(c) = self.clients.get_mut(&id) {
+                c.told_shown = Some(None);
+            }
+            self.mark_dirty_client(id);
+        } else if let Some(pane) = rest.strip_prefix(b"show;") {
+            let pane = std::str::from_utf8(pane).ok().and_then(|p| p.parse::<PaneId>().ok());
+            if let Some(p) = pane.filter(|p| self.panes.contains_key(p)) {
+                self.reveal(id, p);
+            }
+        } else {
+            return false;
+        }
+        true
     }
 
     /// Replies from the outer terminal to queries the server sent (colours, DA, CPR).

@@ -18,7 +18,7 @@ use super::{ClientId, Event, Server};
 use crate::agent::AgentState;
 use crate::layout::PaneId;
 use crate::pane::PaneSpec;
-use crate::protocol::Placement;
+use crate::protocol::{PaneInfo, Placement};
 use crate::servers;
 
 /// A longer line is not a list kraal printed: it is dropped.
@@ -30,6 +30,9 @@ const MAX_NAME: usize = 48;
 /// At most ten lists a second are taken from a server (the next one waits): `kraal agents
 /// --follow` says less, and a server saying more never keeps the event loop busy.
 const LIST_GAP: Duration = Duration::from_millis(100);
+/// A connection that stays up this long works: the next one after it waits as after a first
+/// failure.
+const HEALTHY: Duration = Duration::from_secs(60);
 
 /// An agent of a kraal session on a server.
 #[derive(Debug, Clone)]
@@ -69,6 +72,9 @@ struct Listed {
     state: String,
     #[serde(default)]
     focused: bool,
+    /// Set on an agent that session lists of yet another server's session: not its own.
+    #[serde(default)]
+    session: Option<String>,
 }
 
 /// Text from a server, safe to draw: control characters made visible, formatting ones (bidi
@@ -84,6 +90,7 @@ pub fn parse_list(line: &str, now: Instant) -> Option<Vec<RemoteAgent>> {
     let listed: Vec<Listed> = serde_json::from_str(line).ok()?;
     let agents = listed
         .into_iter()
+        .filter(|p| p.session.is_none())
         .filter_map(|p| {
             let agent = p.agent.filter(|a| !a.trim().is_empty())?;
             let name = p.name.filter(|n| !n.trim().is_empty()).unwrap_or(p.title);
@@ -119,6 +126,8 @@ pub struct Watch {
     seen: HashMap<u32, AgentState>,
     /// A list came since kraal started watching: until then, nothing is announced.
     heard: bool,
+    /// When its ssh started, while it runs.
+    started: Option<Instant>,
     retry_at: Option<Instant>,
     failures: u32,
     /// Why its agents cannot be listed was said already (once is enough).
@@ -137,19 +146,18 @@ impl Watch {
             said: Default::default(),
             seen: HashMap::new(),
             heard: false,
+            started: None,
             retry_at: None,
             failures: 0,
             warned: false,
         }
     }
 
-    /// Stop its ssh with what that started, and the readers of its output; how ssh ended, if
-    /// it ran.
+    /// Stop its ssh with what that started, and the readers of its output, never waiting for
+    /// it; how ssh ended, if it had.
     fn stop(&mut self) -> Option<std::process::ExitStatus> {
         self.stop_reading.store(true, Ordering::SeqCst);
-        let mut c = self.child.take()?;
-        crate::exec::kill_group(&mut c);
-        c.try_wait().ok().flatten()
+        crate::exec::kill_group_nowait(self.child.take()?)
     }
 
     /// Take the list a connection just gave: each agent keeps the time it got into its state.
@@ -171,7 +179,6 @@ impl Watch {
         };
         self.seen = list.iter().map(|a| (a.pane, a.state)).collect();
         self.heard = true;
-        self.failures = 0;
         let changed = self.agents.len() != list.len() || self.agents.iter().zip(&list).any(|(a, b)| !a.same(b));
         self.agents = list;
         (changed, moved)
@@ -182,8 +189,13 @@ impl Watch {
         !std::mem::take(&mut self.agents).is_empty()
     }
 
-    /// Wait before the next try: longer after each failure, at most a minute.
+    /// Wait before the next try: longer after each failure, at most a minute. A connection that
+    /// held for [`HEALTHY`] was no failure: the count starts again. One that ended sooner was,
+    /// whatever it listed first.
     fn back_off(&mut self) {
+        if self.started.take().is_some_and(|t| t.elapsed() >= HEALTHY) {
+            self.failures = 0;
+        }
         self.failures += 1;
         self.retry_at = Some(Instant::now() + Duration::from_secs((2u64 << self.failures.min(5)).min(60)));
     }
@@ -324,6 +336,7 @@ impl Server {
                     });
                 }
                 w.child = Some(c);
+                w.started = Some(Instant::now());
             }
             Err(e) => {
                 if !std::mem::replace(&mut w.warned, true) {
@@ -335,14 +348,27 @@ impl Server {
         }
     }
 
-    /// The agents a server's session has now: shown, and those that just became blocked (or
-    /// finished) announced as a local agent would be.
+    /// The agents a server's session has now: shown, each change of state told as a local
+    /// agent's is (`agent.*`, with the server and its session), and those that just became
+    /// blocked (or finished) announced as a local agent would be.
     pub(super) fn remote_list(&mut self, conn: u32, list: Vec<RemoteAgent>) {
         let Some(w) = self.remotes.iter_mut().find(|w| w.conn == conn && w.child.is_some()) else { return };
         let (changed, announce) = w.take(list);
         let (server, session) = (w.server.name.clone(), w.session.clone());
         if changed {
             self.mark_dirty();
+        }
+        for (a, before) in announce.iter().filter(|(a, _)| a.state != AgentState::Unknown) {
+            let fields = serde_json::json!({
+                "pane": a.pane,
+                "name": a.name,
+                "workspace": a.workspace,
+                "agent": a.agent,
+                "previous": before.map(|b| b.label()),
+                "server": server,
+                "session": session,
+            });
+            self.emit(&format!("agent.{}", a.state.label()), fields);
         }
         // A session shown in a tab here tells of its agents itself, through that tab.
         if self.attach_pane(&server, &session).is_some() {
@@ -367,22 +393,62 @@ impl Server {
         self.remotes.iter().flat_map(|w| w.agents.iter().map(move |a| (w.server.name.as_str(), a)))
     }
 
-    /// The pane here that shows `session` on `server` (`kraal attach --host` running in it).
+    /// The agents of the servers watched, as `kraal agents` lists them: each with its server,
+    /// its session there, and its pane's id there.
+    pub(super) fn remote_agent_infos(&self) -> Vec<PaneInfo> {
+        let info = |w: &Watch, a: &RemoteAgent| PaneInfo {
+            id: a.pane,
+            name: Some(a.name.clone()),
+            title: String::new(),
+            workspace: a.workspace.clone(),
+            tab: String::new(),
+            kind: "remote".into(),
+            command: Vec::new(),
+            cwd: None,
+            agent: Some(a.agent.clone()),
+            state: a.state,
+            exit_code: None,
+            suspended: false,
+            keyboard: 0,
+            server: Some(w.server.name.clone()),
+            session: Some(w.session.clone()),
+            production: None,
+            contexts: Vec::new(),
+            focused: a.focused,
+            floating: false,
+            cols: 0,
+            rows: 0,
+        };
+        self.remotes.iter().flat_map(|w| w.agents.iter().map(move |a| info(w, a))).collect()
+    }
+
+    /// The pane here that shows `session` on `server`: one whose kraal client said it is
+    /// attached to it, however it was started; or, for a client that says nothing (a kraal of
+    /// before), one that runs `kraal -s <session> attach --host <server>`, as a click starts it.
     pub(super) fn attach_pane(&self, server: &str, session: &str) -> Option<PaneId> {
         let want = ["-s", session, "attach", "--host", server];
-        self.panes
-            .values()
-            .filter(|p| p.exit_code.is_none() && !p.suspended)
-            .find(|p| p.spec.command.get(1..6).is_some_and(|a| a.iter().map(String::as_str).eq(want)))
+        let runs =
+            |p: &crate::pane::Pane| p.spec.command.get(1..6).is_some_and(|a| a.iter().map(String::as_str).eq(want));
+        let live = || self.panes.values().filter(|p| p.exit_code.is_none() && !p.suspended);
+        live()
+            .find(|p| p.attachment().is_some_and(|a| a.server == server && a.session == session))
+            .or_else(|| live().find(|p| p.attachment().is_none() && runs(p)))
             .map(|p| p.id)
     }
 
     /// Whether `client` shows that agent now: the tab attached to its session has the focus, and
-    /// its pane is the one shown there.
+    /// that tab shows the agent's pane, as the session says. A session whose kraal does not say
+    /// what a client shows tells only the pane each of its workspaces shows.
     pub(super) fn remote_shown(&self, client: ClientId, server: &str, pane: u32) -> bool {
         let Some(w) = self.remotes.iter().find(|w| w.server.name == server) else { return false };
-        let focused = w.agents.iter().any(|a| a.pane == pane && a.focused);
-        focused && self.client_focus(client).is_some_and(|f| self.attach_pane(server, &w.session) == Some(f))
+        let Some(tab) = self.attach_pane(server, &w.session) else { return false };
+        if self.client_focus(client) != Some(tab) {
+            return false;
+        }
+        match self.panes.get(&tab).and_then(|p| p.attachment()).filter(|a| a.reports) {
+            Some(a) => a.shows == Some(pane),
+            None => w.agents.iter().any(|a| a.pane == pane && a.focused),
+        }
     }
 
     /// Take `client` to an agent of a server: the tab attached to its session, with its pane
@@ -395,7 +461,15 @@ impl Server {
         let (target, session) = (w.server.clone(), w.session.clone());
         if let Some(p) = self.attach_pane(server, &session) {
             self.reveal(client, p);
-            self.focus_remote(client, &target, &session, pane);
+            let tab = self.panes.get_mut(&p);
+            match tab {
+                // Asked through that tab, of the client in it: another one attached to that
+                // session (a terminal elsewhere) keeps what it shows.
+                Some(t) if t.attachment().is_some_and(|a| a.reports) => {
+                    t.write_input(format!("\x1b]7701;show;{pane}\x07").into_bytes());
+                }
+                _ => self.focus_remote(client, &target, &session, pane),
+            }
             return;
         }
         let Some(ws) = self.clients.get(&client).map(|c| c.workspace) else { return };
@@ -469,6 +543,9 @@ mod tests {
         let many: Vec<String> =
             (0..500).map(|i| format!(r#"{{"id":{i},"name":"a{i}","agent":"claude","state":"idle"}}"#)).collect();
         assert_eq!(parse_list(&format!("[{}]", many.join(",")), now).unwrap().len(), MAX_AGENTS);
+        // An agent of yet another server, as a newer `kraal agents` lists it, is not that one's.
+        let relayed = r#"[{"id":7,"agent":"claude","state":"blocked","kind":"remote","server":"x","session":"main"}]"#;
+        assert!(parse_list(relayed, now).unwrap().is_empty());
         assert!(parse_list("kraal: no kraal server", now).is_none());
         assert!(parse_list(r#"{"id":1}"#, now).is_none());
         assert_eq!(parse_list("[]", now).unwrap().len(), 0);
@@ -511,6 +588,44 @@ mod tests {
             states(&moved),
             [(1, AgentState::Working, Some(AgentState::Blocked)), (3, AgentState::Blocked, None)]
         );
+    }
+
+    #[test]
+    fn a_connection_that_keeps_dropping_is_tried_less_and_less_often() {
+        let mut w = Watch::new(servers::Server { name: "gpu".into(), ..Default::default() }, "main".into());
+        let waits = |w: &Watch| w.retry_at.unwrap().saturating_duration_since(Instant::now()).as_secs_f32();
+        // Each connection lists the agents, then drops at once: still a failure.
+        for expected in [4.0, 8.0, 16.0, 32.0, 60.0, 60.0] {
+            w.take(Vec::new());
+            assert!(!w.lost());
+            w.back_off();
+            let wait = waits(&w);
+            assert!(wait > expected - 1.0 && wait <= expected, "{wait} s, not {expected}");
+        }
+        // One that held a while worked: the next wait is the first one again.
+        w.started = Some(Instant::now() - HEALTHY);
+        w.take(Vec::new());
+        w.back_off();
+        assert!(waits(&w) <= 4.0, "{}", waits(&w));
+    }
+
+    #[test]
+    fn stopping_a_watch_leaves_nothing_running() {
+        let mut w = Watch::new(servers::Server { name: "gpu".into(), ..Default::default() }, "main".into());
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "sleep 30 & sleep 30"]);
+        let child = crate::exec::own_group(&mut cmd).spawn().unwrap();
+        let pid = child.id() as libc::pid_t;
+        w.child = Some(child);
+        w.stop();
+        assert!(w.child.is_none());
+        // Its group is killed, and the child reaped, by the time the next tick looks.
+        let start = Instant::now();
+        // SAFETY: signal 0 only checks that the process or its group exists.
+        while unsafe { libc::kill(pid, 0) == 0 || libc::kill(-pid, 0) == 0 } {
+            assert!(start.elapsed() < Duration::from_secs(5), "still running");
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 
     #[test]
