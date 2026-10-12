@@ -19,6 +19,8 @@ use std::thread;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 
+#[cfg(test)]
+mod fuzz;
 mod listing;
 #[cfg(test)]
 mod tests;

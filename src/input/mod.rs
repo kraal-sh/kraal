@@ -10,6 +10,8 @@
 
 mod decode;
 mod encode;
+#[cfg(test)]
+mod fuzz;
 mod keyspec;
 #[cfg(test)]
 mod tests;

@@ -20,6 +20,8 @@ use crate::server::Event;
 mod archive;
 mod cache;
 mod commands;
+#[cfg(test)]
+mod fuzz;
 mod guard;
 mod history;
 mod osc;
@@ -475,7 +477,7 @@ impl Pane {
         self.rows = rows;
         if let Content::Term(t) = &mut self.content {
             let _ = t.master.resize(pty::pty_size(cols, rows, t.graphics.shared()));
-            t.before_resize(usize::from(rows));
+            t.before_resize(Size { cols, rows });
             t.resize_marked(Size { cols, rows });
             t.after_resize();
         }
@@ -1123,6 +1125,252 @@ mod tests {
         // A plain shell starts at home instead.
         let mut shell = Pane::spawn(3, None, PaneSpec { cwd: gone, ..Default::default() }, 20, 5, &env, &tx).unwrap();
         shell.kill();
+    }
+
+    /// A pane whose program never starts: what the test feeds it is all it prints.
+    pub(super) fn fed_pane(cols: u16, rows: u16, scrollback: usize) -> Pane {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let env = PaneEnv {
+            socket: "/nonexistent".into(),
+            session: "t".into(),
+            shell: "sh".into(),
+            scrollback,
+            graphics: Default::default(),
+        };
+        let _batch = spawn::batch();
+        Pane::spawn(1, None, PaneSpec { command: vec!["true".into()], ..Default::default() }, cols, rows, &env, &tx)
+            .unwrap()
+    }
+
+    #[test]
+    fn copy_mode_goes_to_the_middle_of_a_one_row_pane() {
+        let mut pane = fed_pane(10, 1, 100);
+        pane.feed(b"one");
+        pane.copy_mode(true);
+        pane.vi_motion(alacritty_terminal::vi_mode::ViMotion::Middle);
+        assert_eq!(pane.term().unwrap().term.vi_mode_cursor.point.line, alacritty_terminal::index::Line(0));
+    }
+
+    /// A full-screen program starting while the copy-mode cursor is up in the history: the
+    /// alternate screen has none, and the cursor comes down onto it.
+    #[test]
+    fn the_copy_mode_cursor_stays_on_the_alternate_screen() {
+        let mut pane = fed_pane(10, 3, 100);
+        pane.feed("line\r\n".repeat(20).as_bytes());
+        pane.copy_mode(true);
+        pane.vi_edge(true);
+        pane.feed(b"\x1b[?1049hfull screen");
+        let mut buf = Buffer::empty(Rect::new(0, 0, 10, 3));
+        pane.render(Rect::new(0, 0, 10, 3), &mut buf, &mut crate::ansi::Links::new());
+        assert_eq!(pane.term().unwrap().term.vi_mode_cursor.point.line, alacritty_terminal::index::Line(0));
+    }
+
+    /// A character cut across two reads keeps the one after it: the parser drops that one when
+    /// the next read holds the rest, it, and the start of another character.
+    #[test]
+    fn a_character_cut_across_reads_keeps_the_next() {
+        let mut pane = fed_pane(20, 2, 100);
+        for read in [&b"\xc3"[..], b"\xa9 \xc3", b"\xa0x\xc3", b"\xa9y\xff", b"\xe6\x97", b"\xa5z"] {
+            pane.feed(read);
+        }
+        assert_eq!(pane.text(None).lines().next(), Some("é àxéy\u{fffd}日z"));
+    }
+
+    /// A selection made upwards to the last column, then made a block: it copies its cells, not
+    /// from past the end of the rows.
+    #[test]
+    fn a_block_selection_at_the_last_column_copies_its_cells() {
+        use alacritty_terminal::selection::SelectionType;
+        let mut pane = fed_pane(6, 4, 100);
+        pane.feed(b"abcdef\r\nghijkl\r\nmnopqr");
+        pane.selection_start(5, 2, SelectionType::Simple);
+        pane.selection_update(5, 0);
+        pane.copy_mode(true);
+        pane.vi_select(SelectionType::Block);
+        assert_eq!(pane.selection_text().as_deref(), Some("f\nl\nr"));
+        pane.selection_start(5, 2, SelectionType::Block);
+        pane.selection_update(5, 0);
+        assert_eq!(pane.selection_text().as_deref(), Some("f\nl\nr"));
+    }
+
+    /// A full-screen program starting while the view shows archived lines: the alternate screen
+    /// has no history, nor those lines.
+    #[test]
+    fn the_alternate_screen_comes_up_over_a_view_far_back() {
+        let mut pane = fed_pane(20, 5, 3000);
+        pane.feed("line\r\n".repeat(2000).as_bytes());
+        pane.rest();
+        pane.scroll_to_top();
+        assert!(pane.term().unwrap().archive.lens_rows() > 0);
+        pane.feed(b"\x1b[?1049hfull screen");
+        assert!(pane.text(Some(10)).ends_with("full screen\n"));
+        assert_eq!(pane.term().unwrap().own_history(), 0);
+        pane.feed(b"\x1b[?1049l");
+        assert!(pane.text(Some(3000)).starts_with("line\n"));
+    }
+
+    /// A motion far down from the top of a long history, past the lines laid out to show it: the
+    /// rows the copy-mode cursor moves from stay while those below are laid out.
+    #[test]
+    fn copy_mode_goes_down_a_paragraph_from_the_top_of_a_long_history() {
+        use alacritty_terminal::grid::Dimensions;
+        use alacritty_terminal::vi_mode::ViMotion;
+        let mut pane = fed_pane(26, 16, 3000);
+        pane.feed("words and no blank line\r\n".repeat(2500).as_bytes());
+        pane.rest();
+        pane.copy_mode(true);
+        pane.vi_edge(true);
+        for _ in 0..3 {
+            pane.vi_motion(ViMotion::ParagraphDown);
+            let t = &pane.term().unwrap().term;
+            let line = t.vi_mode_cursor.point.line;
+            assert!(line >= t.topmost_line() && line <= t.bottommost_line(), "{line:?}");
+        }
+    }
+
+    /// A command line ending where a wide character wrapped, on a pane's first line: the text
+    /// read takes that character from the line below, not from above the grid.
+    #[test]
+    fn a_line_cut_before_a_wide_character_is_read_whole() {
+        use alacritty_terminal::selection::SelectionType;
+        let mut pane = fed_pane(10, 3, 0);
+        pane.feed("\x1b]133;A\x07$ \x1b]133;B\x07abcdefg日\r\x1b]133;C\x07".as_bytes());
+        pane.feed(b"\r\n\x1b]133;D;0\x07");
+        assert_eq!(pane.last_command().and_then(|c| c.text.clone()).as_deref(), Some("abcdefg日"));
+        for kind in [SelectionType::Simple, SelectionType::Block, SelectionType::Lines] {
+            pane.selection_start(2, 0, kind);
+            pane.selection_update(9, 0);
+            let want = if kind == SelectionType::Lines { "$ abcdefg日\n" } else { "abcdefg日" };
+            assert_eq!(pane.selection_text().as_deref(), Some(want), "{kind:?}");
+        }
+    }
+
+    /// A resting pane made wider and taller shows what the emulator alone would: the lines it
+    /// wrapped take fewer rows, and the screen fills from the history, archived lines included.
+    #[test]
+    fn a_wider_screen_fills_from_the_archive() {
+        let config = TermConfig { scrolling_history: 3000, ..TermConfig::default() };
+        let mut reference = Term::new(config, &pty::Size { cols: 20, rows: 5 }, Listener::default());
+        let mut pane = fed_pane(20, 5, 3000);
+        let text: String = (0..300).map(|i| format!("line {i} {}\r\n", "x".repeat(i % 50))).collect();
+        pane.feed(text.as_bytes());
+        let mut parser: Processor = Processor::new();
+        parser.advance(&mut reference, text.as_bytes());
+        pane.rest();
+        pane.resize(60, 12);
+        reference.resize(pty::Size { cols: 60, rows: 12 });
+        assert_eq!(screen::lines_text(&pane.term().unwrap().term, 0, 12), screen::lines_text(&reference, 0, 12));
+    }
+
+    /// A view scrolled up while a region below the first line scrolls: alacritty moves the view
+    /// up with it although no row goes into the history. It stays within the history.
+    #[test]
+    fn a_view_scrolled_up_stays_in_the_history_while_a_region_scrolls() {
+        use alacritty_terminal::grid::Dimensions;
+        let mut pane = fed_pane(10, 5, 100);
+        pane.feed(b"a\r\nb\r\nc\r\nd\r\ne\r\nf\r\ng\r\n");
+        pane.scroll(2);
+        pane.feed(b"\x1b[2;5r\x1b[5;1H\n\n\n\n\n\n\n\n\n\n");
+        let grid = pane.term().unwrap().term.grid();
+        assert!(grid.display_offset() <= grid.history_size());
+        let mut buf = Buffer::empty(Rect::new(0, 0, 10, 5));
+        pane.render(Rect::new(0, 0, 10, 5), &mut buf, &mut crate::ansi::Links::new());
+    }
+
+    /// A full-screen program starting while kraal holds the view a line up to count the lines
+    /// that scroll (the shell marks its commands): the view is at the bottom when it exits.
+    #[test]
+    fn the_view_is_at_the_bottom_after_a_full_screen_program() {
+        let mut pane = fed_pane(20, 5, 100);
+        pane.feed(b"\x1b]133;A\x07$ \x1b]133;B\x07ls\r\n\x1b]133;C\x07a\r\nb\r\nc\r\nd\r\ne\r\n\x1b]133;D;0\x07");
+        pane.feed(b"\x1b]133;A\x07$ \x1b]133;B\x07vim\r\n\x1b]133;C\x07\x1b[2;5r\x1b[?1049hfull screen");
+        pane.feed(b"\x1b[r\x1b[?1049l");
+        assert_eq!(pane.display_offset(), 0);
+        pane.feed(b"\x1b]133;D;0\x07\x1b]133;A\x07$ ");
+        assert_eq!(pane.display_offset(), 0);
+    }
+
+    /// `$` at the end of a wrapped line that a scroll moved down to the bottom row: the line ends
+    /// there, nothing below the screen.
+    #[test]
+    fn copy_mode_goes_to_the_end_of_a_line_wrapped_at_the_bottom() {
+        use alacritty_terminal::vi_mode::ViMotion;
+        let mut pane = fed_pane(10, 3, 100);
+        pane.feed(b"abcdefghijklmno\x1b[2T");
+        pane.copy_mode(true);
+        pane.vi_motion(ViMotion::Low);
+        pane.vi_motion(ViMotion::Last);
+        pane.vi_motion(ViMotion::Last);
+        let point = pane.term().unwrap().term.vi_mode_cursor.point;
+        assert_eq!((point.line.0, point.column.0), (2, 9));
+    }
+
+    /// `$` on the bottom row where a deletion moved the mark of a wrapped line, or where a wide
+    /// character did not fit: the line ends there all the same.
+    #[test]
+    fn copy_mode_goes_to_the_end_of_a_bottom_row_whatever_marks_it() {
+        use alacritty_terminal::vi_mode::ViMotion;
+        for output in ["abcdefghijklmno\x1b[2T\x1b[3;1H\x1b[3P", "abcdefghi日\x1b[2T"] {
+            let mut pane = fed_pane(10, 3, 100);
+            pane.feed(output.as_bytes());
+            pane.copy_mode(true);
+            pane.vi_motion(ViMotion::Low);
+            pane.vi_motion(ViMotion::Last);
+            pane.vi_motion(ViMotion::Last);
+            assert_eq!(pane.term().unwrap().term.vi_mode_cursor.point.line.0, 2, "{output:?}");
+        }
+    }
+
+    /// A wide character at the start of a line, its first half deleted (`CSI P`): what is left
+    /// of it is no half of a character any more, and the cursor on it draws.
+    #[test]
+    fn half_a_wide_character_deleted_leaves_a_blank() {
+        let mut pane = fed_pane(10, 3, 100);
+        pane.feed("日本\r\x1b[P".as_bytes());
+        let mut buf = Buffer::empty(Rect::new(0, 0, 10, 3));
+        pane.render(Rect::new(0, 0, 10, 3), &mut buf, &mut crate::ansi::Links::new());
+        assert!(pane.cursor(Rect::new(0, 0, 10, 3)).is_some());
+        assert_eq!(pane.text(None).lines().next(), Some(" 本"));
+    }
+
+    /// A wide character an edit splits (characters inserted, erased or deleted at its second
+    /// half, the line erased from there, a character inserted there) goes whole, as when one is
+    /// written over it. alacritty kept its first half, and its search, going on from a match
+    /// ending with it, found that match again for ever.
+    #[test]
+    fn a_wide_character_an_edit_splits_goes_whole() {
+        for (edit, left) in [
+            ("\x1b[2@", "abcdef"),
+            ("\x1b[X", "abcdef"),
+            ("\x1b[K", "abcdef"),
+            ("\x1b[P", "abcdef"),
+            ("\x1b[4hy\x1b[4l", "abcdef y"),
+        ] {
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let mut pane = fed_pane(20, 3, 100);
+                pane.feed(format!("abcdef\u{1f980}\x1b[8G{edit}").as_bytes());
+                pane.search("\u{1f980}");
+                pane.search_next(true);
+                let _ = tx.send(pane.text(None));
+            });
+            let text = rx
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .unwrap_or_else(|_| panic!("{edit:?}: the search goes on for ever"));
+            assert_eq!(text.lines().next().map(str::trim_end), Some(left), "{edit:?}");
+        }
+    }
+
+    /// A tab one column wide, a combining mark after it: the mark goes on the cell that keeps
+    /// the tab, which is drawn as a blank all the same, never as a tab sent to the client.
+    #[test]
+    fn a_tab_with_a_combining_mark_is_drawn_blank() {
+        let mut pane = fed_pane(10, 3, 100);
+        pane.feed("1234567\t\u{301}x".as_bytes());
+        let mut buf = Buffer::empty(Rect::new(0, 0, 10, 3));
+        pane.render(Rect::new(0, 0, 10, 3), &mut buf, &mut crate::ansi::Links::new());
+        assert_eq!(buf[(7, 0)].symbol(), " \u{301}");
+        assert!(buf.content().iter().all(|c| !c.symbol().contains('\t')));
     }
 
     #[test]

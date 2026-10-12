@@ -118,7 +118,7 @@ pub struct Commands {
     /// The view's offset when kraal started counting with it, and whether kraal lifted it from
     /// the bottom (to put back). Kept while the alternate screen is in front: the primary
     /// screen's view only moves again once it is back.
-    lifted: Option<(usize, bool)>,
+    pub(super) lifted: Option<(usize, bool)>,
     /// The emulator's history limit.
     history_max: usize,
     /// When a long command ended in this pane, until someone looks at it.
@@ -178,6 +178,7 @@ impl TermPane {
         if self.commands.list.is_empty() {
             change(self);
             self.guard.take_top_margin();
+            self.keep_on_grid();
             return;
         }
         let screen = (self.commands.history_max == 0 && !self.alt_screen()).then(|| self.screen());
@@ -201,6 +202,20 @@ impl TermPane {
         // nothing tells how far they went.
         if self.guard.take_top_margin() {
             self.commands.unplace();
+        }
+        self.keep_on_grid();
+    }
+
+    /// Output may take away the rows the view and the copy-mode cursor are on (the alternate
+    /// screen has no history), or move the view past the history (an image placed in a scroll
+    /// region too): both stay on the grid, where the emulator can read them.
+    fn keep_on_grid(&mut self) {
+        super::archive::keep_view_in_history(&mut self.term);
+        if self.term.mode().contains(TermMode::VI) {
+            let (top, bottom, last) = (self.term.topmost_line(), self.term.bottommost_line(), self.term.last_column());
+            let cursor = &mut self.term.vi_mode_cursor.point;
+            cursor.line = cursor.line.clamp(top, bottom);
+            cursor.column = cursor.column.min(last);
         }
     }
 
@@ -418,7 +433,7 @@ impl TermPane {
         }
         let start = self.point(from).or_else(|| self.point(Spot { line: self.top_line(), col: 0 }))?;
         let end = self.before(to)?;
-        (start <= end).then(|| self.term.bounds_to_string(start, end))
+        (start <= end).then(|| super::screen::bounds_text(&self.term, start, end))
     }
 
     /// The pane line of the oldest line still in the history.

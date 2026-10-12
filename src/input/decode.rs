@@ -86,6 +86,12 @@ impl InputParser {
         self.run(false)
     }
 
+    /// The bytes waiting for the rest of a sequence, and those of a paste waiting for its end.
+    #[cfg(test)]
+    pub(super) fn waiting(&self) -> (usize, usize) {
+        (self.buf.len(), self.paste.as_ref().map_or(0, Vec::len))
+    }
+
     /// True if [`flush`](Self::flush) would produce something: an incomplete sequence, or paste
     /// content received while the paste end marker has not arrived yet.
     pub fn has_pending(&self) -> bool {

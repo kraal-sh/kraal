@@ -102,6 +102,7 @@ impl Pane {
                 && let Some(sel) = &mut t.term.selection
             {
                 sel.update(p, Side::Right);
+                whole_cells(sel);
             }
         }
     }
@@ -111,12 +112,33 @@ impl Pane {
             let p = t.viewport_point(col, row);
             if let Some(sel) = &mut t.term.selection {
                 sel.update(p, Side::Right);
+                whole_cells(sel);
             }
         }
     }
 
     pub fn selection_text(&self) -> Option<String> {
-        self.term()?.term.selection_to_string().filter(|s| !s.is_empty())
+        let term = &self.term()?.term;
+        let selection = term.selection.as_ref()?;
+        let range = selection.to_range(term)?;
+        // As the emulator reads it (`Term::selection_to_string`), but for the wide character
+        // wrapped from the end of a line (see `bounds_text`).
+        let text = match selection.ty {
+            SelectionType::Block => {
+                let (from, to) = (range.start.column, range.end.column);
+                let lines = range.start.line.0..=range.end.line.0;
+                let rows: Vec<String> = lines
+                    .map(|l| {
+                        let wrapped = l == range.end.line.0 || from.0 != 0;
+                        line_text(term, Line(l), from, to, wrapped).trim_end().to_string()
+                    })
+                    .collect();
+                rows.join("\n")
+            }
+            SelectionType::Lines => bounds_text(term, range.start, range.end) + "\n",
+            _ => bounds_text(term, range.start, range.end),
+        };
+        Some(text).filter(|s| !s.is_empty())
     }
 
     /// The rows on screen (as scrolled), with the column of each character, for hints.
@@ -193,23 +215,31 @@ impl Pane {
     pub fn vi_motion(&mut self, motion: ViMotion) {
         let searching = self.search.is_some();
         if let Some(t) = self.term_mut() {
+            // The emulator puts the middle of a one-row screen above it, off the grid.
+            let motion = if motion == ViMotion::Middle && t.term.screen_lines() < 2 { ViMotion::High } else { motion };
             // A screen of history above and below the cursor, for the motion to go to.
             let mut more = t.term.screen_lines();
             t.reveal((-t.term.vi_mode_cursor.point.line.0).max(0) as usize + more);
             t.reveal_below(t.term.vi_mode_cursor.point.line, more);
             loop {
                 let (cursor, selection) = (t.term.vi_mode_cursor, t.term.selection.clone());
-                t.term.vi_motion(motion);
+                vi_move(&mut t.term, motion);
                 let line = t.term.vi_mode_cursor.point.line;
                 if t.beyond_lens(line) {
                     // Past the lines laid out far back: those after them come first.
                     t.term.vi_mode_cursor = cursor;
                     t.term.selection = selection;
                     t.reveal_below(cursor.point.line, more * 4);
-                } else if line <= t.term.topmost_line() && t.reveal(t.term.grid().history_size() + more) {
-                    // Stopped at the top of what the emulator holds: the history goes on above.
+                } else if line <= t.term.topmost_line() {
+                    // Stopped at the top of what the emulator holds: the history may go on above.
+                    // The motion starts again from where it started, put back before the rows
+                    // move (bringing them back may take the lens's out first).
                     t.term.vi_mode_cursor = cursor;
                     t.term.selection = selection;
+                    if !t.reveal(t.term.grid().history_size() + more) {
+                        vi_move(&mut t.term, motion);
+                        break;
+                    }
                 } else {
                     break;
                 }
@@ -267,6 +297,7 @@ impl Pane {
                 Some(sel) => {
                     let mut sel = sel.clone();
                     sel.ty = kind;
+                    whole_cells(&mut sel);
                     t.term.selection = Some(sel);
                 }
                 None => {
@@ -468,6 +499,35 @@ impl Pane {
     }
 }
 
+/// Move the copy-mode cursor as the emulator does. A line that wraps onto the next ends at the
+/// bottom of the screen at the latest: alacritty 0.26 looks below the grid for the end of a line
+/// (`$`) when the bottom row says it wraps, or for the wide character a cell of it says went to the
+/// next row (a scroll can move such a row to the bottom, a deletion, `CSI P`, the marks along it).
+fn vi_move<T: alacritty_terminal::event::EventListener>(term: &mut Term<T>, motion: ViMotion) {
+    let bottom = term.bottommost_line();
+    let marks = Flags::WRAPLINE | Flags::LEADING_WIDE_CHAR_SPACER;
+    let row = &mut term.grid_mut()[bottom];
+    let marked: Vec<(usize, Flags)> =
+        (0..row.len()).map(|c| (c, row[Column(c)].flags & marks)).filter(|(_, f)| !f.is_empty()).collect();
+    for (c, f) in &marked {
+        row[Column(*c)].flags.remove(*f);
+    }
+    term.vi_motion(motion);
+    let row = &mut term.grid_mut()[bottom];
+    for (c, f) in marked {
+        row[Column(c)].flags.insert(f);
+    }
+}
+
+/// A block selection takes whole cells, as copy mode makes it: one that starts at the right of
+/// a cell begins at the next column (alacritty 0.26), past the last for a cell of the last
+/// column, where the emulator reads beyond the row.
+fn whole_cells(sel: &mut Selection) {
+    if sel.ty == SelectionType::Block {
+        sel.include_all();
+    }
+}
+
 pub(super) struct SearchState {
     regex: RegexSearch,
     /// The same, for the archived lines.
@@ -527,6 +587,37 @@ fn join_rows(rows: impl Iterator<Item = String>) -> String {
     out.truncate(trimmed);
     out.push('\n');
     out
+}
+
+/// The text from `start` to `end` (included), as the emulator reads it
+/// (`Term::bounds_to_string`), but for a wide character wrapped from the end of the last line:
+/// alacritty 0.26 takes the first character of the line above for it, from past the top of the
+/// grid on its first line.
+pub(super) fn bounds_text<T>(term: &Term<T>, start: Point, end: Point) -> String {
+    if end.column < term.last_column() || !ends_wrapped_wide(term, end.line) {
+        return term.bounds_to_string(start, end);
+    }
+    let mut text = term.bounds_to_string(start, Point::new(end.line, end.column - 1));
+    if end.line < term.bottommost_line() {
+        text.push(term.grid()[end.line + 1i32][Column(0)].c);
+    }
+    text
+}
+
+/// The text of `line` from column `from` to `to`, without the newline, the wide character
+/// wrapped from its end included when `wrapped` (see [`bounds_text`]).
+fn line_text<T>(term: &Term<T>, line: Line, from: Column, to: Column, wrapped: bool) -> String {
+    if wrapped {
+        return bounds_text(term, Point::new(line, from), Point::new(line, to));
+    }
+    let to = if to == term.last_column() && ends_wrapped_wide(term, line) { to - 1 } else { to };
+    term.bounds_to_string(Point::new(line, from), Point::new(line, to))
+}
+
+/// Whether a wide character that did not fit at the end of `line` wrapped onto the next.
+fn ends_wrapped_wide<T>(term: &Term<T>, line: Line) -> bool {
+    let last = term.last_column();
+    last.0 > 0 && term.grid()[line][last].flags.contains(Flags::LEADING_WIDE_CHAR_SPACER)
 }
 
 pub(super) fn row_text<T>(term: &Term<T>, line: Line) -> String {
@@ -625,17 +716,18 @@ pub(super) fn draw_cell(
         out.set_symbol("");
         return;
     }
+    // alacritty keeps a tab where it moved the cursor from, for copying: drawn, a blank (sent
+    // to the client's terminal, it would move its cursor).
+    let c = if cell.c == '\0' || cell.c == '\t' { ' ' } else { cell.c };
     if cell.flags.contains(Flags::LEADING_WIDE_CHAR_SPACER) {
         out.set_symbol(" ");
     } else if let Some(zw) = cell.zerowidth() {
         let mut s = String::with_capacity(8);
-        s.push(cell.c);
+        s.push(c);
         s.extend(zw);
         out.set_symbol(&s);
-    } else if cell.c == '\0' || cell.c == '\t' {
-        out.set_symbol(" ");
     } else {
-        out.set_char(cell.c);
+        out.set_char(c);
     }
     // A wide char at the last column cannot be drawn.
     if cell.flags.contains(Flags::WIDE_CHAR) && last {

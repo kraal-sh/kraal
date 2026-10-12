@@ -462,4 +462,42 @@ printf '%s\n' '{"id":1,"error":{"message":"secret@example.com token123"}}'"#,
         let path = script(&tmp, "exit 0");
         assert!(fetch(path.to_str().unwrap(), &tmp.0, Duration::from_secs(2)).is_err());
     }
+
+    /// What Codex's app-server and its session files say of the limits, any of it.
+    #[test]
+    fn fuzz_codex_usage() {
+        crate::fuzz::run("codex_usage", 300, |rng| {
+            let stamp = |rng: &mut crate::fuzz::Rng| -> String {
+                match rng.below(4) {
+                    0 => format!(
+                        "\"{}\"",
+                        rng.pick(&[
+                            "2025-01-31T23:59:59Z",
+                            "2025-02-29T00:00:00+01:00",
+                            "9999-12-31T23:59:59.999-23:59"
+                        ])
+                    ),
+                    1 => (rng.number() as i64).to_string(),
+                    2 => "\"0000-00-00T00:00:00Z\"".into(),
+                    _ => format!("\"{}\"", String::from_utf8_lossy(&rng.text(30)).replace(['"', '\\'], "")),
+                }
+            };
+            let window = |rng: &mut crate::fuzz::Rng| -> String {
+                format!(
+                    "{{\"usedPercent\":{},\"windowDurationMins\":{},\"resetsAt\":{}}}",
+                    rng.number() as f64 / 7.0,
+                    rng.number(),
+                    stamp(rng)
+                )
+            };
+            let (a, b) = (window(rng), window(rng));
+            let mut text = format!("{{\"rateLimits\":{{\"primary\":{a},\"secondary\":{b}}}}}").into_bytes();
+            if rng.one_in(2) {
+                rng.mutate(&mut text, &[b"{", b"}", b"\"", b":", b"rateLimitsByLimitId", b"codex", b"-"]);
+            }
+            let v: Value = serde_json::from_slice(&text).unwrap_or_default();
+            let _ = parse_rpc_result(&v);
+            let _ = rfc3339(&String::from_utf8_lossy(&rng.bytes(30)));
+        });
+    }
 }

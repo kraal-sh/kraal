@@ -214,7 +214,7 @@ impl Archive {
         let history = term.grid().history_size();
         match self.room_beside(history, history + BATCH, screen) {
             0 => {
-                self.page_in(term, seen, usize::MAX);
+                self.page_in(term, seen, usize::MAX, (0, 0));
             }
             room => self.store.send(Batch::trim(room)),
         }
@@ -255,7 +255,7 @@ impl Archive {
         if trim == 0 {
             // The emulator may fill up before the next look: rows moved would go at once. It
             // holds the whole history instead, as it does alone, the archive's rows too.
-            self.page_in(term, seen, usize::MAX);
+            self.page_in(term, seen, usize::MAX, (0, 0));
             self.due = self.next_look(term.grid().history_size());
             return 0;
         }
@@ -294,9 +294,16 @@ impl Archive {
     }
 
     /// Bring back at least `wanted` rows (whole lines, the newest first) above the emulator's
-    /// history, laid out at its width. Returns the rows brought back; `seen` goes up by as many.
-    pub(super) fn page_in<T: EventListener>(&mut self, term: &mut Term<T>, seen: &mut i64, wanted: usize) -> usize {
-        if wanted == 0 || self.lens.is_some() || term.mode().contains(TermMode::ALT_SCREEN) {
+    /// history, laid out at its width, and lines that take at least `rows` rows at width `at`.
+    /// Returns the rows brought back; `seen` goes up by as many.
+    pub(super) fn page_in<T: EventListener>(
+        &mut self,
+        term: &mut Term<T>,
+        seen: &mut i64,
+        wanted: usize,
+        (at, rows): (usize, usize),
+    ) -> usize {
+        if (wanted == 0 && rows == 0) || self.lens.is_some() || term.mode().contains(TermMode::ALT_SCREEN) {
             return 0;
         }
         let mut lines = self.store.lines();
@@ -312,14 +319,15 @@ impl Archive {
         let room = self.limit.saturating_sub(grid.history_size());
         // The newest lines, with the rows each takes.
         let mut picked = Vec::new();
-        let mut count = 0;
+        let (mut count, mut counted) = (0, 0);
         for line in lines.newest_first() {
-            let rows = line.rows_at(width);
-            if count >= wanted || count + rows > room {
+            let taken = line.rows_at(width);
+            if (count >= wanted && counted >= rows) || count + taken > room {
                 break;
             }
-            count += rows;
-            picked.push((line, rows));
+            count += taken;
+            counted += if counted < rows { line.rows_at(at) } else { 0 };
+            picked.push((line, taken));
         }
         if count == 0 {
             return 0;
@@ -565,12 +573,17 @@ impl Archive {
         }
     }
 
-    /// Lines the lens shows far above the view go (a page of rows stays above it).
+    /// Lines the lens shows far above the view and the copy-mode cursor go (a page of rows stays
+    /// above them).
     fn lens_trim<T>(&mut self, term: &mut Term<T>) {
         let Some(lens) = &mut self.lens else { return };
+        let mut top = -(term.grid().display_offset() as i32);
+        if term.mode().contains(TermMode::VI) {
+            top = top.min(term.vi_mode_cursor.point.line.0);
+        }
         let grid = term.grid_mut();
         let history = grid.history_size();
-        let above = history.saturating_sub(grid.display_offset());
+        let above = (history as i64 + i64::from(top)).max(0) as usize;
         let mut cut = 0;
         while lens.sizes.len() > 1 && above - cut >= PAGE + lens.sizes[0] {
             cut += lens.sizes.pop_front().expect("more than one");
@@ -633,6 +646,55 @@ pub(super) fn keep_view_in_history<T: EventListener>(term: &mut Term<T>) {
     }
 }
 
+/// The length of the UTF-8 character `lead` starts (1 for any other byte).
+pub(super) fn utf8_len(lead: u8) -> usize {
+    match lead {
+        0xc2..=0xdf => 2,
+        0xe0..=0xef => 3,
+        0xf0..=0xf4 => 4,
+        _ => 1,
+    }
+}
+
+/// Make `edit` to the cursor's row (deleting, inserting or erasing characters, erasing part of
+/// the line or the screen, a character inserted), then blank the half it left of a wide
+/// character. alacritty 0.26 keeps it whole on one side: a cursor on a second half alone at the
+/// first column is drawn from the cell before the row's start (a panic), and its search, going
+/// on from a match ending with a first half alone, finds that match again for ever.
+pub(super) fn mended<T>(term: &mut Term<T>, edit: impl FnOnce(&mut Term<T>)) {
+    edit(term);
+    let line = term.grid().cursor.point.line;
+    let row = &mut term.grid_mut()[line];
+    let last = row.len() - 1;
+    for c in 0..=last {
+        let flags = row[Column(c)].flags;
+        let half = if flags.contains(Flags::WIDE_CHAR) {
+            c < last && !row[Column(c + 1)].flags.contains(Flags::WIDE_CHAR_SPACER)
+        } else if flags.contains(Flags::WIDE_CHAR_SPACER) {
+            c == 0 || !row[Column(c - 1)].flags.contains(Flags::WIDE_CHAR)
+        } else {
+            // It says a wide character did not fit at the end of the row: anywhere else, nothing.
+            flags.contains(Flags::LEADING_WIDE_CHAR_SPACER) && c < last
+        };
+        if half {
+            let cell = &mut row[Column(c)];
+            cell.clear_wide();
+            cell.flags.remove(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER);
+        }
+    }
+}
+
+/// How many bytes at the end of `bytes` start a UTF-8 character without ending it.
+pub(super) fn incomplete_char(bytes: &[u8]) -> usize {
+    let start = bytes.len().saturating_sub(3);
+    match (start..bytes.len()).rev().find(|i| bytes[*i] & 0xc0 != 0x80) {
+        Some(i) if matches!(std::str::from_utf8(&bytes[i..]), Err(e) if e.valid_up_to() == 0 && e.error_len().is_none()) => {
+            bytes.len() - i
+        }
+        _ => 0,
+    }
+}
+
 /// Rows went from the top of the grid: the copy-mode cursor stays on it, and a selection that
 /// was on them goes.
 fn keep_on_grid<T>(term: &mut Term<T>) {
@@ -686,14 +748,36 @@ impl TermPane {
         }
         self.archive.last = now;
         self.archive.rested = false;
-        let mut feed = Feed { term: &mut self.term, archive: &mut self.archive, seen: &mut self.commands.history_seen };
-        self.parser.advance(&mut feed, bytes);
+        // The parser (vte 0.15) drops a character that follows one cut by the end of the last
+        // read, when the next holds the rest of it, that character, and one cut or invalid after:
+        // the rest of the cut character goes to it alone.
+        let need = self.cut.first().map_or(0, |b| utf8_len(*b).saturating_sub(self.cut.len()));
+        let alone =
+            if need > 0 && bytes.len() > need && bytes[..need].iter().all(|b| b & 0xc0 == 0x80) { need } else { 0 };
+        let mut tail = std::mem::take(&mut self.cut);
+        tail.extend_from_slice(&bytes[bytes.len().saturating_sub(3)..]);
+        self.cut = tail.split_off(tail.len() - incomplete_char(&tail));
+        let mut feed = Feed {
+            term: &mut self.term,
+            archive: &mut self.archive,
+            seen: &mut self.commands.history_seen,
+            lifted: &mut self.commands.lifted,
+        };
+        if alone > 0 {
+            self.parser.advance(&mut feed, &bytes[..alone]);
+        }
+        self.parser.advance(&mut feed, &bytes[alone..]);
         self.parsed();
     }
 
     /// Give the emulator the output a synchronized update holds.
     pub(super) fn stop_sync(&mut self) {
-        let mut feed = Feed { term: &mut self.term, archive: &mut self.archive, seen: &mut self.commands.history_seen };
+        let mut feed = Feed {
+            term: &mut self.term,
+            archive: &mut self.archive,
+            seen: &mut self.commands.history_seen,
+            lifted: &mut self.commands.lifted,
+        };
         self.parser.stop_sync(&mut feed);
         self.parsed();
     }
@@ -744,7 +828,7 @@ impl TermPane {
         let history = self.term.grid().history_size();
         if rows > history {
             let wanted = (rows - history).max(PAGE);
-            self.archive.page_in(&mut self.term, &mut self.commands.history_seen, wanted);
+            self.archive.page_in(&mut self.term, &mut self.commands.history_seen, wanted, (0, 0));
         }
     }
 
@@ -909,16 +993,24 @@ impl TermPane {
         std::mem::take(&mut self.archive.freed)
     }
 
-    /// The screen changed size: rows it gains come from the history, brought back first. A lens
-    /// goes, to show the same line again after.
-    pub(super) fn before_resize(&mut self, rows: usize) {
+    /// The screen changes size to `size`: rows it gains come from the history, brought back
+    /// first. A wider screen takes fewer rows for the lines it wrapped, and the emulator fills it
+    /// from its history as it rewraps them: those are brought back too, counted at the new width.
+    /// A lens goes, to show the same line again after.
+    pub(super) fn before_resize(&mut self, size: super::pty::Size) {
         self.view_moved();
         self.archive.reopen = self.drop_lens();
-        let (screen, history) = (self.term.screen_lines(), self.term.grid().history_size());
-        if rows > screen + history {
+        let grid = self.term.grid();
+        let (screen, history, width) = (grid.screen_lines(), grid.history_size(), grid.columns());
+        let (rows, cols) = (usize::from(size.rows), usize::from(size.cols));
+        let gained = rows.saturating_sub(screen);
+        let wraps = |l: usize| grid[Line(l as i32)][Column(width - 1)].flags.contains(Flags::WRAPLINE);
+        // The emulator's own history rewraps into fewer rows too: it is not counted on.
+        let wider = if cols > width { gained + (0..screen).filter(|l| wraps(*l)).count() } else { 0 };
+        if gained > history || wider > 0 {
             // Those rows only, not a page: every pane grows at once when the window does.
-            let wanted = rows - screen - history;
-            self.archive.page_in(&mut self.term, &mut self.commands.history_seen, wanted);
+            let wanted = gained.saturating_sub(history);
+            self.archive.page_in(&mut self.term, &mut self.commands.history_seen, wanted, (cols, wider));
         }
     }
 
@@ -966,6 +1058,9 @@ pub(super) struct Feed<'a, T> {
     pub(super) term: &'a mut Term<T>,
     pub(super) archive: &'a mut Archive,
     pub(super) seen: &'a mut i64,
+    /// The primary screen's view as kraal lifted it to count the lines that scroll (see
+    /// `commands.rs`).
+    pub(super) lifted: &'a mut Option<(usize, bool)>,
 }
 
 impl<T: EventListener> Feed<'_, T> {
@@ -1015,15 +1110,7 @@ impl<T: EventListener> Handler for Feed<'_, T> {
             }
             _ => {}
         }
-        self.term.clear_screen(mode);
-    }
-
-    fn set_private_mode(&mut self, mode: PrivateMode) {
-        if mode == PrivateMode::Named(NamedPrivateMode::SwapScreenAndSetRestoreCursor) {
-            // The lens is on the history of the screen going away.
-            self.archive.drop_lens(self.term);
-        }
-        self.term.set_private_mode(mode);
+        mended(self.term, |t| t.clear_screen(mode));
     }
 
     fn reset_state(&mut self) {
@@ -1033,6 +1120,37 @@ impl<T: EventListener> Handler for Feed<'_, T> {
         self.term.grid_mut().update_history(self.archive.limit);
     }
 
+    fn set_private_mode(&mut self, mode: PrivateMode) {
+        // The lens is laid out in the primary screen's history: it goes before the alternate
+        // screen comes up, which has none. A view kraal lifted goes back down: the lines that
+        // scroll are not counted on the alternate screen.
+        if mode == PrivateMode::Named(NamedPrivateMode::SwapScreenAndSetRestoreCursor)
+            && !self.term.mode().contains(TermMode::ALT_SCREEN)
+        {
+            self.archive.drop_lens(self.term);
+            if let Some((_, true)) = self.lifted.take() {
+                self.term.grid_mut().scroll_display(Scroll::Bottom);
+            }
+        }
+        self.term.set_private_mode(mode);
+    }
+
+    fn delete_chars(&mut self, count: usize) {
+        mended(self.term, |t| t.delete_chars(count));
+    }
+
+    fn insert_blank(&mut self, count: usize) {
+        mended(self.term, |t| t.insert_blank(count));
+    }
+
+    fn erase_chars(&mut self, count: usize) {
+        mended(self.term, |t| t.erase_chars(count));
+    }
+
+    fn clear_line(&mut self, mode: LineClearMode) {
+        mended(self.term, |t| t.clear_line(mode));
+    }
+
     #[inline]
     fn input(&mut self, c: char) {
         // A character pushes a row only when it wraps: after the last column was written, or a
@@ -1040,7 +1158,12 @@ impl<T: EventListener> Handler for Feed<'_, T> {
         if self.term.grid().cursor.input_needs_wrap || c >= WIDE_FROM {
             self.room();
         }
-        self.term.input(c);
+        if self.term.mode().contains(TermMode::INSERT) {
+            // The characters after it move right, as with `insert_blank`.
+            mended(self.term, |t| t.input(c));
+        } else {
+            self.term.input(c);
+        }
     }
 
     pushing! {
@@ -1052,13 +1175,9 @@ impl<T: EventListener> Handler for Feed<'_, T> {
 
     forward! {
         put_tab(count: u16);
-        clear_line(mode: LineClearMode);
-        erase_chars(count: usize);
-        insert_blank(count: usize);
         set_scrolling_region(top: usize, bottom: Option<usize>);
         scroll_down(rows: usize);
         insert_blank_lines(rows: usize);
-        delete_chars(count: usize);
         reverse_index();
         unset_private_mode(mode: PrivateMode);
         decaln();
@@ -1171,7 +1290,7 @@ mod tests {
         fn feed(&mut self, bytes: &[u8]) {
             self.pane.feed(bytes);
             self.pane.rest();
-            self.parser.advance(&mut self.reference, bytes);
+            self.parser.advance(&mut super::super::fuzz::Plain(&mut self.reference), bytes);
         }
 
         fn term(&self) -> &TermPane {
@@ -1807,7 +1926,8 @@ mod tests {
         for piece in corpus.split_inclusive(|b| *b == b'\x07' || *b == b'\\' || *b == b'm') {
             p1.advance(&mut plain, piece);
             for byte in piece {
-                p2.advance(&mut Feed { term: &mut fed, archive: &mut archive, seen: &mut seen }, &[*byte]);
+                let lifted = &mut None;
+                p2.advance(&mut Feed { term: &mut fed, archive: &mut archive, seen: &mut seen, lifted }, &[*byte]);
             }
             for l in -(plain.grid().history_size() as i32)..ROWS as i32 {
                 assert_eq!(
@@ -2008,7 +2128,11 @@ mod tests {
                         archive.window = (std::time::Instant::now(), 0);
                     }
                     if archived {
-                        parser.advance(&mut Feed { term: &mut term, archive: &mut archive, seen: &mut seen }, chunk);
+                        let lifted = &mut None;
+                        parser.advance(
+                            &mut Feed { term: &mut term, archive: &mut archive, seen: &mut seen, lifted },
+                            chunk,
+                        );
                     } else {
                         parser.advance(&mut term, chunk);
                     }

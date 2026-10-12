@@ -1040,4 +1040,46 @@ mod tests {
             );
         }
     }
+
+    /// Frames and messages as a peer may send them, any of them: read bounded, never a panic.
+    #[test]
+    fn fuzz_protocol() {
+        crate::fuzz::run("protocol", 300, |rng| {
+            let mut wire = Vec::new();
+            for _ in 0..rng.range(1, 6) {
+                let payload: Vec<u8> = match rng.below(4) {
+                    0 => serde_json::to_vec(&ClientMsg::Attach {
+                        version: PROTOCOL_VERSION,
+                        cols: rng.number() as u16,
+                        rows: rng.number() as u16,
+                        workspace: None,
+                        remote: rng.one_in(2),
+                        pane: None,
+                        installed: None,
+                        features: client_features(),
+                    })
+                    .unwrap(),
+                    1 => br#"{"type":"exit","reason":"x"}"#.to_vec(),
+                    2 => br#"{"cmd":"kill_server"}"#.to_vec(),
+                    _ => {
+                        let n = rng.size(64);
+                        rng.bytes(n)
+                    }
+                };
+                write_frame(&mut wire, rng.below(3) as u8, &payload).unwrap();
+            }
+            if rng.one_in(2) {
+                rng.mutate(&mut wire, &[&[0xff, 0xff, 0xff, 0x7f], &[0, 0, 0, 0], b"{", b"\""]);
+            }
+            let mut r = std::io::Cursor::new(wire);
+            while let Ok(Some((_, payload))) = read_frame(&mut r) {
+                assert!(payload.len() <= MAX_FRAME);
+                let _ = serde_json::from_slice::<ClientMsg>(&payload);
+                let _ = serde_json::from_slice::<ServerMsg>(&payload);
+                let _ = serde_json::from_slice::<Request>(&payload);
+            }
+            let v = String::from_utf8_lossy(&rng.text(20)).into_owned();
+            let _ = newer(&v, KRAAL_VERSION) || newer(KRAAL_VERSION, &v);
+        });
+    }
 }

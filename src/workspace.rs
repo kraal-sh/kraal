@@ -332,20 +332,169 @@ pub fn to_kdl(ws: &WorkspaceDef) -> String {
 /// A layout node with its size in the parent split.
 type SizedNode = (LayoutNode, Option<SizeSpec>);
 
+/// Blocks nested deeper than any layout nests them: both parsers read a block within a block
+/// by calling themselves, and a file nested a couple of thousand deep overflows the stack (some
+/// sixty in a debug build, on a thread of the default size).
+const MAX_NESTING: usize = 32;
+
+/// Blocks commented out (`/-`) within blocks commented out, deeper than any layout has them:
+/// both parsers read such a block again for each one around it, in a time that doubles with
+/// each (a kilobyte nesting twenty takes seconds, a few kilobytes hours).
+const MAX_COMMENTED_NESTING: usize = 6;
+
 /// Parses the KDL text, trying v2 first and then v1 (Zellij's dialect).
 fn parse_kdl(src: &str) -> Result<KdlDocument> {
-    let v2_err = match KdlDocument::parse_v2(src) {
-        Ok(doc) => return Ok(doc),
-        Err(e) => e,
+    // The parsers read strings their own way, and v2 goes on past an error: braces count as
+    // each dialect reads them, and as plain bytes.
+    for reading in [Reading::Bytes, Reading::V1, Reading::V2] {
+        check_nesting(src.as_bytes(), reading)?;
+    }
+    // A parser that panics (kdl 4.7's v1 does on `(true` ending a line) does not read the file.
+    let v2_err = match std::panic::catch_unwind(|| KdlDocument::parse_v2(src)) {
+        Ok(Ok(doc)) => return Ok(doc),
+        Ok(Err(e)) => Some(e),
+        Err(_) => None,
     };
-    let v1_err = match KdlDocument::parse_v1(src) {
-        Ok(doc) => return Ok(doc),
-        Err(e) => e,
+    let v1_err = match std::panic::catch_unwind(|| KdlDocument::parse_v1(src)) {
+        Ok(Ok(doc)) => return Ok(doc),
+        Ok(Err(e)) => Some(e),
+        Err(_) => None,
     };
     // Neither dialect fits: report the parser that got further, which most likely
     // matches the dialect the author intended. Ties go to v1, Zellij's dialect.
-    let err = if error_offset(&v2_err) > error_offset(&v1_err) { &v2_err } else { &v1_err };
+    let err = match (&v2_err, &v1_err) {
+        (Some(v2), Some(v1)) => {
+            if error_offset(v2) > error_offset(v1) {
+                v2
+            } else {
+                v1
+            }
+        }
+        (Some(e), None) | (None, Some(e)) => e,
+        (None, None) => anyhow::bail!("invalid KDL"),
+    };
     Err(anyhow!("invalid KDL: {}", describe_error(src, err)))
+}
+
+/// How [`check_nesting`] reads a KDL text.
+#[derive(Clone, Copy, PartialEq)]
+enum Reading {
+    /// Every byte is what it is: no strings, no comments.
+    Bytes,
+    /// Strings go on over lines; `"""` is an empty string and another.
+    V1,
+    /// A line ends a string, unless `"""` and the line's end opened it.
+    V2,
+}
+
+/// Refuses blocks nested deeper than the parsers take ([`MAX_NESTING`],
+/// [`MAX_COMMENTED_NESTING`]), reading strings and comments as `reading` says. A `/-` counts for
+/// the block that follows in its node, even when it comments out only an argument before it.
+fn check_nesting(src: &[u8], reading: Reading) -> Result<()> {
+    // Whether each open block is commented out, and how many are.
+    let mut open: Vec<bool> = Vec::new();
+    let mut commented = 0;
+    // A `/-` waiting for what it comments out (on a line below, maybe), or in its node.
+    let (mut slashdash, mut target) = (false, false);
+    // A `\` ending the line: the node goes on.
+    let mut continued = false;
+    let words = reading != Reading::Bytes;
+    let mut i = 0;
+    while i < src.len() {
+        let b = src[i];
+        let next = src.get(i + 1).copied();
+        i += 1;
+        match b {
+            b'"' if words => i = string_end(src, i, None, reading),
+            b'#' | b'r' if words => {
+                if let Some(hashes) = raw_hashes(src, i - 1) {
+                    i = string_end(src, i + usize::from(b == b'r') + hashes, Some(hashes), reading);
+                }
+            }
+            b'/' if words && next == Some(b'/') => {
+                i = src[i..].iter().position(|&c| c == b'\n').map_or(src.len(), |n| i + n);
+                continue;
+            }
+            b'/' if words && next == Some(b'*') => {
+                let mut depth = 1;
+                i += 1;
+                while i < src.len() && depth > 0 {
+                    match &src[i..src.len().min(i + 2)] {
+                        b"/*" => (depth, i) = (depth + 1, i + 2),
+                        b"*/" => (depth, i) = (depth - 1, i + 2),
+                        _ => i += 1,
+                    }
+                }
+                continue;
+            }
+            b'/' if next == Some(b'-') => {
+                (slashdash, target) = (true, false);
+                i += 1;
+                continue;
+            }
+            b'{' => {
+                open.push(slashdash);
+                commented += usize::from(slashdash);
+                anyhow::ensure!(open.len() <= MAX_NESTING, "invalid KDL: blocks nested more than {MAX_NESTING} deep");
+                anyhow::ensure!(
+                    commented <= MAX_COMMENTED_NESTING,
+                    "invalid KDL: blocks commented out (/-) nested more than {MAX_COMMENTED_NESTING} deep"
+                );
+                slashdash = false;
+            }
+            b'}' => {
+                commented -= open.pop().map_or(0, usize::from);
+                slashdash = false;
+            }
+            b';' if target => slashdash = false,
+            b'\n' if target && !continued => slashdash = false,
+            b'\\' => continued = true,
+            _ => {}
+        }
+        if !b.is_ascii_whitespace() {
+            target |= slashdash;
+            continued &= b == b'\\';
+        }
+    }
+    Ok(())
+}
+
+/// The hashes of the raw string starting at `at` (`r"`, `r#"`, `#"`, `##"`...), if one does.
+fn raw_hashes(src: &[u8], at: usize) -> Option<usize> {
+    let r = src[at] == b'r';
+    // An `r` ending a name starts no string.
+    if r && at > 0 && !b" \t\r\n=({};".contains(&src[at - 1]) {
+        return None;
+    }
+    let after = at + usize::from(r);
+    let hashes = src[after..].iter().take_while(|&&c| c == b'#').count();
+    (src.get(after + hashes) == Some(&b'"') && (r || hashes > 0)).then_some(hashes)
+}
+
+/// Where the string ends whose text starts at `from`, past its opening quote, as `reading` reads
+/// it: past its closing quote, or at the end of its line (v2) or of the text. `raw` gives the
+/// hashes of a raw string, which escapes nothing.
+fn string_end(src: &[u8], from: usize, raw: Option<usize>, reading: Reading) -> usize {
+    let rest = &src[from..];
+    let multiline = reading == Reading::V2
+        && rest.starts_with(b"\"\"")
+        && rest[2..].iter().find(|c| !b" \t\r".contains(c)).is_none_or(|&c| c == b'\n');
+    let quotes = if multiline { 3 } else { 1 };
+    let mut end = vec![b'"'; quotes];
+    end.resize(quotes + raw.unwrap_or(0), b'#');
+    let mut i = from + quotes - 1;
+    while i < src.len() {
+        if raw.is_none() && src[i] == b'\\' {
+            i += 2;
+        } else if src[i..].starts_with(&end) {
+            return i + end.len();
+        } else if src[i] == b'\n' && reading == Reading::V2 && !multiline {
+            return i;
+        } else {
+            i += 1;
+        }
+    }
+    src.len()
 }
 
 fn error_offset(err: &KdlError) -> usize {
@@ -1712,5 +1861,137 @@ layout {
         assert_eq!(leaf(&children[1].0).name.as_deref(), Some("d"));
         ws.warnings.clear();
         assert_round_trip(&ws);
+    }
+
+    /// Workspace files as users write them, damaged any way: read without a panic, and what is read
+    /// written back reads the same.
+    #[test]
+    fn fuzz_workspace_files() {
+        let samples = [
+            zellij_fleet(),
+            "layout {\n    pane split_direction=\"vertical\" {\n        pane size=\"30%\" command=\"htop\"\n        pane stacked=true {\n            pane name=\"a\" cwd=\"~/x\"\n            pane name=\"b\" expanded=true\n        }\n    }\n}\n".to_string(),
+            "layout {\n    cwd \"/srv\"\n    tab name=\"t\" focus=true {\n        pane size=3 borderless=true\n        pane split_direction=\"horizontal\" { pane; pane; }\n    }\n    floating_panes { pane x=1 y=\"10%\" width=40 height=\"50%\" }\n}\n".to_string(),
+        ];
+        let tokens: &[&[u8]] = &[
+            b"pane ",
+            b"{",
+            b"}",
+            b"\n",
+            b"size=",
+            b"\"",
+            b"=",
+            b"split_direction=\"vertical\"",
+            b"stacked=true",
+            b"tab ",
+            b"layout {",
+            b"cwd=\"..\"",
+            b"r#\"",
+            b"#\"",
+            b"\"#",
+            b"\"\"\"",
+            b"\"}\"",
+            b"/*",
+            b"*/",
+            b"//",
+            b"\\",
+            b"/-",
+            b"/-pane {",
+            b";",
+            b"100%",
+            b"0",
+            b"-1",
+            b"999999999999",
+        ];
+        crate::fuzz::run("workspace_files", 100, |rng| {
+            let mut text = rng.pick(&samples).clone().into_bytes();
+            for _ in 0..rng.range(1, 4) {
+                rng.mutate(&mut text, tokens);
+            }
+            let text = String::from_utf8_lossy(&text);
+            crate::fuzz::trace(|| format!("{text:?}"));
+            if let Ok(mut ws) = parse_workspace("fuzz", &text) {
+                let _ = ws.panes();
+                let written = to_kdl(&ws);
+                let again = parse_workspace("fuzz", &written)
+                    .unwrap_or_else(|e| panic!("what was written does not read: {e:#}\n{written}\nfrom\n{text}"));
+                // What was not understood is said once, when read, and not written back.
+                ws.warnings.clear();
+                assert_eq!(again, ws, "written back:\n{written}\nfrom\n{text}");
+            }
+        });
+    }
+
+    /// A file one of the parsers panics on is an error, not a panic of the server that reads it.
+    #[test]
+    fn a_file_a_parser_panics_on_does_not_read() {
+        let err = parse_workspace("broken", "layout {\n(true\n").unwrap_err();
+        assert!(err.to_string().starts_with("invalid KDL"), "{err}");
+    }
+
+    /// A file nesting blocks thousands deep is refused, not read until the stack overflows (on a
+    /// thread of the default size, as tests and kraal's threads have), braces in its strings and
+    /// comments whatever they say.
+    #[test]
+    fn deeply_nested_blocks_are_refused() {
+        std::thread::Builder::new()
+            .stack_size(2 << 20)
+            .spawn(|| {
+                // A brace closed in a string or a comment closes nothing.
+                for open in
+                    ["pane {", "pane \"}\" {", "pane r#\"}\"# {", "pane #\"}\"# {", "pane /* } */ {", "pane { // }\n"]
+                {
+                    let deep = format!("layout {{ {} }}", open.repeat(5000) + &"} ".repeat(5000));
+                    let err = parse_workspace("deep", &deep).unwrap_err();
+                    assert!(err.to_string().contains("nested"), "{open}: {err}");
+                }
+                let fine = format!(
+                    "layout {{ {} }}",
+                    "pane split_direction=\"vertical\" { ".repeat(20) + "pane" + &" }".repeat(20)
+                );
+                assert!(parse_workspace("fine", &fine).is_ok());
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    /// Blocks commented out (`/-`) within blocks commented out take both parsers a time that
+    /// doubles with each: past a few, the file is refused at once. Layouts have a few, beside
+    /// each other more than within.
+    #[test]
+    fn blocks_commented_out_deep_within_each_other_are_refused() {
+        let deep = format!("layout {{\n{}}}\n", "/-pane {\n    pane\n".repeat(24) + &"}\n".repeat(24));
+        let err = parse_workspace("deep", &deep).unwrap_err();
+        assert!(err.to_string().contains("commented out"), "{err}");
+        // Behind a string left open: v1 reads it on to the end, v2 to the line's end, and v2 reads
+        // on past the error.
+        for open in ["tab name=\"x {", "tab name=\"\"\" {"] {
+            let hidden = format!("layout {{\n{open}\n{}", "/-pane {\n    pane\n".repeat(24));
+            let err = parse_workspace("hidden", &hidden).unwrap_err();
+            assert!(err.to_string().contains("commented out"), "{open}: {err}");
+        }
+        let fine = r#"
+layout {
+    /-tab name="old" {
+        pane
+    }
+    tab {
+        /-pane command="x"
+        pane split_direction="vertical" {
+            /-pane {
+                /-pane {
+                    pane
+                }
+            }
+            pane cwd="/-x" {
+                pane
+                /-pane
+            }
+            pane
+        }
+    }
+}
+"#;
+        assert!(parse_workspace("fine", fine).is_ok(), "{:?}", parse_workspace("fine", fine));
     }
 }

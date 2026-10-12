@@ -88,7 +88,8 @@ pub(super) struct History {
     first: u64,
     lines: usize,
     /// The pane's width, and the rows the lines take at `counted` columns: counted again when
-    /// needed after the width changed, not at each resize.
+    /// needed after the width changed, not at each resize. A line added or dropped while the
+    /// width is another leaves no count (`UNCOUNTED`): the width may come back.
     width: usize,
     rows: usize,
     counted: usize,
@@ -118,6 +119,9 @@ impl Block {
         Line::parse(&self.data[start..end])
     }
 }
+
+/// No width: the rows are counted again at the pane's.
+const UNCOUNTED: usize = usize::MAX;
 
 impl History {
     #[cfg(test)]
@@ -194,6 +198,8 @@ impl History {
         self.lines += 1;
         if self.counted == self.width {
             self.rows += rows;
+        } else {
+            self.counted = UNCOUNTED;
         }
     }
 }
@@ -342,7 +348,7 @@ impl History {
     fn drop_oldest(&mut self) {
         let Some(block) = self.blocks.front_mut() else { return };
         let line = block.line(block.first);
-        let rows = if self.counted == self.width { line.rows_at(self.width) } else { 0 };
+        let rows = (self.counted == self.width).then(|| line.rows_at(self.width));
         if line.flags & IMAGE != 0 {
             forget_images(&mut self.images, &line);
         }
@@ -352,7 +358,7 @@ impl History {
         }
         self.first += 1;
         self.lines -= 1;
-        self.rows -= rows;
+        self.uncount(rows);
     }
 
     /// The newest line.
@@ -366,7 +372,7 @@ impl History {
         let Some(block) = self.blocks.back_mut() else { return };
         let Some(start) = block.starts.pop() else { return };
         let line = Line::parse(&block.data[start as usize..]);
-        let rows = if self.counted == self.width { line.rows_at(self.width) } else { 0 };
+        let rows = (self.counted == self.width).then(|| line.rows_at(self.width));
         if line.flags & IMAGE != 0 {
             forget_images(&mut self.images, &line);
         }
@@ -375,7 +381,16 @@ impl History {
             self.blocks.pop_back();
         }
         self.lines -= 1;
-        self.rows -= rows;
+        self.uncount(rows);
+    }
+
+    /// A line taking `rows` rows at the pane's width went, or one went while the rows were
+    /// counted at another (None).
+    fn uncount(&mut self, rows: Option<usize>) {
+        match rows {
+            Some(rows) => self.rows -= rows,
+            None => self.counted = UNCOUNTED,
+        }
     }
 
     /// The lines, newest first.
@@ -1069,6 +1084,27 @@ mod tests {
         let grid: Vec<String> =
             (0..back.len() as i32).map(|l| super::super::screen::row_text(&narrow, GridLine(l - top))).collect();
         assert_eq!(texts, grid);
+    }
+
+    /// Lines stored at the width a pane had before a resize, after the rows were counted at the
+    /// new one, then the pane back at that width: the rows are counted again, not taken from the
+    /// count made before (which left those lines out, and went below zero as they were dropped).
+    #[test]
+    fn rows_are_counted_again_after_lines_came_at_another_width() {
+        let t = term(10, 3, 0, b"abcdefghij");
+        let line = [&t.grid()[GridLine(0)][..]];
+        let mut h = History::default();
+        h.push(&line, false, usize::MAX);
+        h.set_width(5);
+        assert_eq!(h.rows(), 2);
+        h.push(&line, false, usize::MAX);
+        h.drop_oldest();
+        h.push(&line, false, usize::MAX);
+        h.set_width(5);
+        assert_eq!(h.rows(), 4);
+        h.drop_newest();
+        h.drop_newest();
+        assert_eq!(h.rows(), 0);
     }
 
     #[test]

@@ -651,4 +651,40 @@ mod tests {
         let ssh = why_not("gpu", "ssh: connect to host gpu.lan port 22: Connection refused\u{1b}[2J", None);
         assert!(ssh.ends_with("Connection refused␛[2J"), "what the server said is shown, made visible: {ssh}");
     }
+
+    /// Lines a server's `kraal agents --follow` may print, any of them: read bounded and cleaned.
+    #[test]
+    fn fuzz_remote_lists() {
+        crate::fuzz::run("remote_lists", 300, |rng| {
+            let now = Instant::now();
+            let text = |rng: &mut crate::fuzz::Rng| -> String {
+                serde_json::to_string(&String::from_utf8_lossy(&rng.text(200))).unwrap()
+            };
+            let mut items = Vec::new();
+            for _ in 0..rng.size(80) {
+                let (name, title, workspace) = (text(rng), text(rng), text(rng));
+                let agent = if rng.one_in(4) { "null".to_string() } else { text(rng) };
+                let state = *rng.pick(&["\"idle\"", "\"working\"", "\"blocked\"", "\"done\"", "\"\"", "3", "null"]);
+                let session = if rng.one_in(8) { ",\"session\":\"x\"" } else { "" };
+                items.push(format!(
+                    "{{\"id\":{},\"name\":{name},\"title\":{title},\"workspace\":{workspace},\"agent\":{agent},\"state\":{state},\"focused\":{}{session}}}",
+                    rng.number() % (u64::from(u32::MAX) + 2),
+                    rng.one_in(2)
+                ));
+            }
+            let mut line = format!("[{}]", items.join(",")).into_bytes();
+            if rng.one_in(3) {
+                rng.mutate(&mut line, &[b"[", b"]", b"{", b"}", b",", b"\"", b"\\u202e", b"\\u001b"]);
+            }
+            if let Some(list) = parse_list(&String::from_utf8_lossy(&line), now) {
+                assert!(list.len() <= MAX_AGENTS);
+                for a in &list {
+                    for s in [&a.name, &a.workspace, &a.agent] {
+                        assert!(crate::text::columns(s) <= MAX_NAME, "{s:?}");
+                        assert!(!s.chars().any(|c| c.is_control() || ('\u{202a}'..='\u{202e}').contains(&c)), "{s:?}");
+                    }
+                }
+            }
+        });
+    }
 }

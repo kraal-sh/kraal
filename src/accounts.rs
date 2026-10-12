@@ -1160,7 +1160,7 @@ impl Usage {
     /// Highest usage among windows that have not reset yet. A window that does not say when it
     /// resets counts until the end of its period after it was seen.
     pub fn peak(&self, now: i64) -> f64 {
-        let live = |w: &Window, period: i64| w.resets_at.unwrap_or(self.observed_at + period) > now;
+        let live = |w: &Window, period: i64| w.resets_at.unwrap_or(self.observed_at.saturating_add(period)) > now;
         let five = self.five_hour.iter().filter(|w| live(w, 5 * 3600));
         let week = self.weekly.iter().filter(|w| live(w, 7 * 24 * 3600));
         five.chain(week).map(|w| w.used_percent).fold(0.0, f64::max)
@@ -1174,7 +1174,7 @@ impl Usage {
         let w = if weekly { &mut self.weekly } else { &mut self.five_hour };
         let current = w.as_ref().filter(|w| w.resets_at.is_none_or(|r| r > now));
         let period = if weekly { 7 * 24 * 3600 } else { 5 * 3600 };
-        let resets_at = current.and_then(|w| w.resets_at).unwrap_or(now + period);
+        let resets_at = current.and_then(|w| w.resets_at).unwrap_or(now.saturating_add(period));
         *w = Some(Window { used_percent: pct, resets_at: Some(resets_at) });
         self.observed_at = now;
         self.source = "screen".into();
@@ -1306,7 +1306,8 @@ pub fn limit_from_screen(screen: &str) -> Option<(bool, f64)> {
 /// 12m"; empty when it is not known.
 pub fn describe_reset(resets_at: Option<i64>, now: i64) -> String {
     let Some(r) = resets_at else { return String::new() };
-    let secs = (r - now).max(0);
+    // What an agent says: any number.
+    let secs = r.saturating_sub(now).max(0);
     if secs >= 86_400 {
         format!("resets in {}d{}h", secs / 86_400, (secs % 86_400) / 3600)
     } else if secs >= 3600 {
@@ -1873,5 +1874,76 @@ mod tests {
         assert_eq!(b.limits.mode, Mode::Ask);
         assert_eq!(b.accounts.len(), 1);
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// An agent may say anything of when its limits reset, and a usage file anything of when it was
+    /// seen: nothing overflows working out how long that is.
+    #[test]
+    fn usage_any_time_says_is_shown() {
+        let now = 1_700_000_000;
+        for at in [i64::MIN, i64::MAX, -1] {
+            assert!(describe_reset(Some(at), now).starts_with("resets in"));
+            assert!(describe_reset(Some(now), at).starts_with("resets in"));
+            let usage = Usage {
+                five_hour: Some(Window { used_percent: 10.0, resets_at: None }),
+                weekly: None,
+                observed_at: at,
+                source: String::new(),
+            };
+            let _ = usage.peak(now);
+        }
+    }
+
+    /// What agents say of their usage (Claude Code's status line payload, the usage files kraal keeps,
+    /// limit messages on a screen), any of it: read and shown without panicking.
+    #[test]
+    fn fuzz_accounts_usage() {
+        crate::fuzz::run("accounts_usage", 300, |rng| {
+            let number = |rng: &mut crate::fuzz::Rng| -> String {
+                match rng.below(5) {
+                    0 => (rng.number() as i64).to_string(),
+                    1 => format!("{}.5", rng.number() as i64),
+                    2 => format!("{:e}", rng.number() as f64 * 1e300),
+                    3 => "null".into(),
+                    _ => (rng.below(200) as f64 - 50.0).to_string(),
+                }
+            };
+            let window = |rng: &mut crate::fuzz::Rng| -> String {
+                format!("{{\"used_percentage\":{},\"resets_at\":{}}}", number(rng), number(rng))
+            };
+            let (a, b) = (window(rng), window(rng));
+            let mut payload = format!("{{\"rate_limits\":{{\"five_hour\":{a},\"seven_day\":{b}}}}}").into_bytes();
+            if rng.one_in(3) {
+                rng.mutate(&mut payload, &[b"{", b"}", b":", b",", b"\"", b"9e999", b"-"]);
+            }
+            let now = rng.number() as i64 >> rng.below(40);
+            let value: serde_json::Value = serde_json::from_slice(&payload).unwrap_or_default();
+            if let Some(usage) = usage_from_statusline(&value) {
+                let _ = usage.peak(now);
+                let _ = describe_reset(usage.next_reset(now), now);
+                for w in usage.five_hour.iter().chain(usage.weekly.iter()) {
+                    let _ = describe_reset(w.resets_at, now);
+                }
+                let _ = crate::server::usage_text(&usage, now);
+            }
+            // A usage file, as kraal wrote it or damaged.
+            let mut saved = serde_json::to_vec(&Usage {
+                five_hour: Some(Window { used_percent: 50.0, resets_at: Some(rng.number() as i64) }),
+                weekly: None,
+                observed_at: rng.number() as i64,
+                source: "statusline".into(),
+            })
+            .unwrap();
+            rng.mutate(&mut saved, &[b"9223372036854775807", b"-9223372036854775808", b"null"]);
+            if let Ok(mut usage) = serde_json::from_slice::<Usage>(&saved) {
+                let _ = usage.peak(now);
+                let _ = usage.next_reset(now);
+                usage.observe_screen(rng.one_in(2), 85.0, now);
+                let _ = crate::server::usage_text(&usage, now);
+            }
+            let screen = String::from_utf8_lossy(&rng.text(400)).into_owned()
+                + *rng.pick(&["You've used 85% of your weekly limit", "used 1e309% of your session limit", "used -5%"]);
+            let _ = limit_from_screen(&screen);
+        });
     }
 }

@@ -981,4 +981,99 @@ mod tests {
         let Node::Split { children, .. } = &g else { panic!() };
         assert_eq!(children.iter().map(|(row, _)| row.leaves().len()).collect::<Vec<_>>(), [3, 2]);
     }
+
+    /// Layouts as kraal builds them (any tree, any weights a file or a drag gives), laid out in any
+    /// area and changed any way: no panic, the places inside the area.
+    #[test]
+    fn fuzz_layouts() {
+        fn tree(rng: &mut crate::fuzz::Rng, depth: u32, next: &mut PaneId) -> Node {
+            let leaf = |next: &mut PaneId| {
+                *next += 1;
+                *next
+            };
+            match rng.below(if depth > 3 { 2 } else { 4 }) {
+                0 => Node::Leaf(leaf(next)),
+                1 => {
+                    // A stack holds two panes at least: kraal makes none of fewer.
+                    let panes: Vec<PaneId> = (0..rng.range(2, 5)).map(|_| leaf(next)).collect();
+                    let open = if rng.one_in(4) { 9999 } else { panes[0] };
+                    Node::Stack { panes, open }
+                }
+                _ => Node::Split {
+                    axis: if rng.one_in(2) { Axis::Row } else { Axis::Column },
+                    children: (0..rng.size(5))
+                        .map(|_| {
+                            let w = *rng.pick(&[1.0, 0.0, -1.0, 1e-30, 1e30, f32::MAX, 0.5]);
+                            (tree(rng, depth + 1, next), w)
+                        })
+                        .collect(),
+                },
+            }
+        }
+        crate::fuzz::run("layouts", 500, |rng| {
+            let mut next = 0;
+            let mut root = tree(rng, 0, &mut next);
+            // As kraal makes every tree (a session file's too): no split of one child.
+            root.normalize();
+            let area = |rng: &mut crate::fuzz::Rng| {
+                let (w, h) = (rng.below(300) as u16, rng.below(120) as u16);
+                Rect::new(rng.below(10) as u16, rng.below(10) as u16, w, h)
+            };
+            for _ in 0..rng.range(1, 20) {
+                let a = area(rng);
+                let ids = root.leaves();
+                let id = if ids.is_empty() { 1 } else { *rng.pick(&ids) };
+                match rng.below(12) {
+                    0 => {
+                        next += 1;
+                        root.split(id, if rng.one_in(2) { Axis::Row } else { Axis::Column }, next);
+                    }
+                    1 => {
+                        next += 1;
+                        root.join(id, next);
+                    }
+                    2 => {
+                        let onto = if ids.is_empty() { 1 } else { *rng.pick(&ids) };
+                        root.stack(id, onto, rng.one_in(2));
+                    }
+                    3 => {
+                        root.unstack(id);
+                    }
+                    4 => {
+                        root.remove(id);
+                    }
+                    5 => {
+                        let dir = *rng.pick(&[Dir::Left, Dir::Right, Dir::Up, Dir::Down]);
+                        root.resize(id, dir, rng.range(0, 400) as i32 - 200, a);
+                    }
+                    6 => {
+                        if let Some(b) = root.borders(a).first().cloned() {
+                            root.drag_border(&b, rng.below(400) as u16);
+                        }
+                    }
+                    7 => root.normalize(),
+                    8 => {
+                        root.expand(id);
+                    }
+                    9 => {
+                        if let Some(preset) = rng.pick(&Preset::ALL).build(&ids, ids.first().copied()) {
+                            root = preset;
+                        }
+                    }
+                    _ => {
+                        let rects = root.layout(a);
+                        for r in rects.values() {
+                            assert!(a.union(*r) == a || r.area() == 0, "{r:?} out of {a:?}");
+                        }
+                        let _ = root.tiles(a, rng.one_in(2));
+                        let dir = *rng.pick(&[Dir::Left, Dir::Right, Dir::Up, Dir::Down]);
+                        let _ = neighbour(&rects, id, dir, &ids);
+                        if let Some((panes, open)) = root.stack_of(id) {
+                            let _ = fold(a, panes, open);
+                        }
+                    }
+                }
+            }
+        });
+    }
 }
