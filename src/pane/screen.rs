@@ -411,6 +411,19 @@ impl Pane {
         }
     }
 
+    /// A terminal pane's screen, row by row, brought up to date with what it printed: None for
+    /// other panes, and when `width × height` is not the whole screen.
+    pub fn refresh_screen(&mut self, width: u16, height: u16) -> Option<&super::ScreenCache> {
+        let t = self.term_mut()?;
+        t.screen.refresh(&mut t.term, (t.changes, t.moved));
+        (t.screen.size() == (width, height)).then_some(&t.screen)
+    }
+
+    /// The screen rows as [`Pane::refresh_screen`] last brought them up to date.
+    pub fn screen_cache(&self) -> Option<&super::ScreenCache> {
+        self.term().map(|t| &t.screen)
+    }
+
     /// Render the pane content into `area` (which matches the pane size).
     pub fn render(&mut self, area: Rect, buf: &mut Buffer, links: &mut crate::ansi::Links) {
         match &mut self.content {
@@ -574,70 +587,90 @@ pub fn render_term<T: EventListener>(
         }
         let cell = indexed.cell;
         if let Some(links) = links.as_deref_mut()
-            && let Some(h) = cell.hyperlink()
+            && let Some(h) = link_of(cell)
         {
             let uri = h.uri();
-            // Only well-formed, printable links are passed on.
-            if uri.len() <= 2048 && !uri.chars().any(|c| c.is_control()) {
-                let arc = uris.entry(uri.to_string()).or_insert_with(|| std::sync::Arc::from(uri)).clone();
-                links.insert((area.x + x, area.y + y), arc);
-            }
+            let arc = uris.entry(uri.to_string()).or_insert_with(|| std::sync::Arc::from(uri)).clone();
+            links.insert((area.x + x, area.y + y), arc);
         }
         let Some(out) = buf.cell_mut((area.x + x, area.y + y)) else { continue };
-        if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
-            out.set_symbol("");
-            continue;
-        }
-        if cell.flags.contains(Flags::LEADING_WIDE_CHAR_SPACER) {
-            out.set_symbol(" ");
-        } else if let Some(zw) = cell.zerowidth() {
-            let mut s = String::with_capacity(8);
-            s.push(cell.c);
-            s.extend(zw);
-            out.set_symbol(&s);
-        } else if cell.c == '\0' || cell.c == '\t' {
-            out.set_symbol(" ");
-        } else {
-            out.set_char(cell.c);
-        }
-        // A wide char at the last column cannot be drawn.
-        if cell.flags.contains(Flags::WIDE_CHAR) && x + 1 >= area.width {
-            out.set_symbol(" ");
-        }
-        out.fg = convert_color(cell.fg, colors);
-        out.bg = convert_color(cell.bg, colors);
-        out.underline_color = cell.underline_color().map(|c| convert_color(c, colors)).unwrap_or(Color::Reset);
-        let mut m = Modifier::empty();
-        let f = cell.flags;
-        if f.contains(Flags::BOLD) {
-            m |= Modifier::BOLD;
-        }
-        if f.contains(Flags::DIM) {
-            m |= Modifier::DIM;
-        }
-        if f.contains(Flags::ITALIC) {
-            m |= Modifier::ITALIC;
-        }
-        if f.intersects(Flags::ALL_UNDERLINES) {
-            m |= Modifier::UNDERLINED;
-        }
-        if f.contains(Flags::STRIKEOUT) {
-            m |= Modifier::CROSSED_OUT;
-        }
-        if f.contains(Flags::HIDDEN) {
-            m |= Modifier::HIDDEN;
-        }
-        let mut inverse = f.contains(Flags::INVERSE);
-        if let Some(sel) = &selection
-            && sel.contains(point)
-        {
-            inverse = !inverse;
-        }
-        if inverse {
-            m |= Modifier::REVERSED;
-        }
-        out.modifier = m;
+        draw_cell(cell, point, x + 1 >= area.width, colors, selection.as_ref(), out);
     }
+}
+
+/// The link on `cell`, when it is one to pass on: well-formed and printable.
+pub(super) fn link_of(
+    cell: &alacritty_terminal::term::cell::Cell,
+) -> Option<alacritty_terminal::term::cell::Hyperlink> {
+    let h = cell.hyperlink()?;
+    let uri = h.uri();
+    (uri.len() <= 2048 && !uri.chars().any(|c| c.is_control())).then_some(h)
+}
+
+/// Draw the emulator's `cell` at `point` into `out`, which holds what it held before (a blank
+/// cell in a new frame). `last` says whether it is in the last column drawn: a wide character
+/// cannot be drawn there.
+pub(super) fn draw_cell(
+    cell: &alacritty_terminal::term::cell::Cell,
+    point: Point,
+    last: bool,
+    colors: &alacritty_terminal::term::color::Colors,
+    selection: Option<&alacritty_terminal::selection::SelectionRange>,
+    out: &mut ratatui::buffer::Cell,
+) {
+    if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
+        out.set_symbol("");
+        return;
+    }
+    if cell.flags.contains(Flags::LEADING_WIDE_CHAR_SPACER) {
+        out.set_symbol(" ");
+    } else if let Some(zw) = cell.zerowidth() {
+        let mut s = String::with_capacity(8);
+        s.push(cell.c);
+        s.extend(zw);
+        out.set_symbol(&s);
+    } else if cell.c == '\0' || cell.c == '\t' {
+        out.set_symbol(" ");
+    } else {
+        out.set_char(cell.c);
+    }
+    // A wide char at the last column cannot be drawn.
+    if cell.flags.contains(Flags::WIDE_CHAR) && last {
+        out.set_symbol(" ");
+    }
+    out.fg = convert_color(cell.fg, colors);
+    out.bg = convert_color(cell.bg, colors);
+    out.underline_color = cell.underline_color().map(|c| convert_color(c, colors)).unwrap_or(Color::Reset);
+    let mut m = Modifier::empty();
+    let f = cell.flags;
+    if f.contains(Flags::BOLD) {
+        m |= Modifier::BOLD;
+    }
+    if f.contains(Flags::DIM) {
+        m |= Modifier::DIM;
+    }
+    if f.contains(Flags::ITALIC) {
+        m |= Modifier::ITALIC;
+    }
+    if f.intersects(Flags::ALL_UNDERLINES) {
+        m |= Modifier::UNDERLINED;
+    }
+    if f.contains(Flags::STRIKEOUT) {
+        m |= Modifier::CROSSED_OUT;
+    }
+    if f.contains(Flags::HIDDEN) {
+        m |= Modifier::HIDDEN;
+    }
+    let mut inverse = f.contains(Flags::INVERSE);
+    if let Some(sel) = selection
+        && sel.contains(point)
+    {
+        inverse = !inverse;
+    }
+    if inverse {
+        m |= Modifier::REVERSED;
+    }
+    out.modifier = m;
 }
 
 pub(super) fn convert_color(c: AColor, colors: &alacritty_terminal::term::color::Colors) -> Color {

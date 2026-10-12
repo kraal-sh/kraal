@@ -18,6 +18,7 @@ use crate::preview::Preview;
 use crate::server::Event;
 
 mod archive;
+mod cache;
 mod commands;
 mod guard;
 mod history;
@@ -30,6 +31,7 @@ mod store;
 
 pub use spawn::{batch, batching, close_inherited, reserve_descriptors};
 
+pub use cache::ScreenCache;
 pub use commands::{Finished, short_duration};
 use osc::sanitize_title;
 use osc::{Osc, OscScanner};
@@ -41,6 +43,43 @@ pub use screen::render_term;
 pub use screen::set_outer_colors;
 use screen::{SearchState, default_color};
 pub use scrollback::MAX_SAVED_BYTES;
+
+thread_local! {
+    /// The frames being drawn, numbered from 1 (0: none).
+    static FRAME: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Frames being drawn, while it lives: a frame shows one moment, and what it asks of the panes
+/// many times (their directory) is read once.
+pub struct Frame(());
+
+impl Frame {
+    pub fn start() -> Frame {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        FRAME.with(|f| f.set(n));
+        Frame(())
+    }
+}
+
+impl Drop for Frame {
+    fn drop(&mut self) {
+        FRAME.with(|f| f.set(0));
+    }
+}
+
+/// How long frames take a quiet shell's directory as read.
+const CWD_SHOWN: std::time::Duration = std::time::Duration::from_millis(400);
+
+/// A process's directory as read for a frame: which frame, which process, after how many
+/// changes to the pane's grid, when.
+pub(super) struct CwdSeen {
+    frame: u64,
+    pid: u32,
+    changes: u64,
+    at: Instant,
+    cwd: Option<PathBuf>,
+}
 
 /// Every mode a program may have left set, back to how a fresh terminal starts, without RIS
 /// (which would clear the scrollback a restarted pane keeps): the alternate screen, the kitty
@@ -710,13 +749,32 @@ impl Pane {
 
     /// Best-known working directory on this machine: OSC 7, else the shell's.
     /// A directory reported by a shell on another machine (over ssh) does not count.
+    ///
+    /// For frames (see [`Frame`]), the shell's is read once per frame, and is taken to be the
+    /// same while the pane prints nothing, for [`CWD_SHOWN`]: a shell that changes directory
+    /// prints its prompt.
     pub fn current_cwd(&self) -> Option<PathBuf> {
         if let Some(p) = &self.reported_cwd
             && !self.reported_remotely()
         {
             return Some(p.clone());
         }
-        crate::process::cwd(self.pid()?)
+        let t = self.term()?;
+        let pid = t.pid()?;
+        let frame = FRAME.with(std::cell::Cell::get);
+        if frame == 0 {
+            return crate::process::cwd(pid);
+        }
+        if let Some(seen) = &*t.cwd_seen.borrow()
+            && seen.pid == pid
+            && (seen.frame == frame || (seen.changes == t.changes && seen.at.elapsed() < CWD_SHOWN))
+        {
+            return seen.cwd.clone();
+        }
+        let cwd = crate::process::cwd(pid);
+        *t.cwd_seen.borrow_mut() =
+            Some(CwdSeen { frame, pid, changes: t.changes, at: Instant::now(), cwd: cwd.clone() });
+        cwd
     }
 
     /// The directory a shell on another machine reported (a remote shell that sends OSC 7).

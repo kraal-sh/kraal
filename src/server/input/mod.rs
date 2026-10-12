@@ -134,8 +134,18 @@ impl Server {
             }
             ev => ev,
         };
+        // Typing: drawn at once, and so is what the program echoes.
+        let typed =
+            matches!(ev, InputEvent::Key(_) | InputEvent::Raw(_) | InputEvent::KittyKey { .. } | InputEvent::Paste(_));
+        let quiet = self.goes_quietly(id, &ev);
         let Some(c) = self.clients.get_mut(&id) else { return };
         let mode = std::mem::replace(&mut c.mode, Mode::Normal);
+        if typed
+            && matches!(mode, Mode::Normal)
+            && let Some(p) = self.client_focus(id)
+        {
+            self.echo.insert(p, Instant::now() + super::ECHO_WAIT);
+        }
         let next = match mode {
             Mode::Normal => self.on_normal(id, ev),
             Mode::Leader { typed, miss } => self.on_leader(id, typed, miss, ev),
@@ -158,11 +168,18 @@ impl Server {
             Mode::Confirm(q) => self.on_confirm(id, q, ev),
             Mode::Hints(h) => self.on_hints(id, h, ev),
         };
+        // A key that only went to programs changes nothing on screen until they answer.
+        let shown = !(quiet && matches!(next, Mode::Normal));
         if let Some(c) = self.clients.get_mut(&id) {
             c.mode = next;
-            c.dirty = true;
+            c.dirty |= shown;
         }
-        self.mark_dirty_client(id);
+        if shown {
+            self.mark_dirty_client(id);
+            if typed {
+                self.render_now();
+            }
+        }
         // Each key may move the focus: a pane left and found again in one read is told both.
         self.follow_focus();
     }
@@ -187,6 +204,32 @@ impl Server {
             return false;
         }
         true
+    }
+
+    /// Whether `ev` only goes to the programs of the focused pane (and of those typing goes to),
+    /// with nothing to draw for it: a key that is no command, typed into terminal panes none of
+    /// which is scrolled back, without a selection to clear in the focused one.
+    fn goes_quietly(&self, id: ClientId, ev: &InputEvent) -> bool {
+        if !self.clients.get(&id).is_some_and(|c| matches!(c.mode, Mode::Normal)) {
+            return false;
+        }
+        let Some(focus) = self.client_focus(id) else { return false };
+        let at_bottom = |p: &PaneId| self.panes.get(p).is_some_and(|p| p.display_offset() == 0);
+        let typing =
+            |p: &crate::pane::Pane| p.is_terminal() && p.exit_code.is_none() && !p.has_selection() && !p.in_copy_mode();
+        if !self.panes.get(&focus).is_some_and(typing) || !at_bottom(&focus) {
+            return false;
+        }
+        match ev {
+            InputEvent::Key(k) => {
+                !self.keymap.is_prefix(k)
+                    && self.keymap.direct(k).is_none()
+                    && self.input_targets(id, focus).iter().all(at_bottom)
+            }
+            InputEvent::KittyKey { .. } => self.input_targets(id, focus).iter().all(at_bottom),
+            InputEvent::Raw(_) => true,
+            _ => false,
+        }
     }
 
     /// Replies from the outer terminal to queries the server sent (colours, DA, CPR).

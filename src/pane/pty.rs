@@ -227,6 +227,16 @@ pub struct TermPane {
     /// The shell's commands, as it marks them.
     pub(super) commands: Commands,
     pub graphics: crate::graphics::PaneGraphics,
+    /// The screen as last drawn, for frames.
+    pub screen: super::cache::ScreenCache,
+    /// Counts the changes made to the emulator's grid (see `TermPane::marked`): the screen
+    /// needs no look while it stays the same.
+    pub(super) changes: u64,
+    /// Counts the times the archive moved rows on the grid, which the emulator's damage does
+    /// not tell (see `archive.rs`): the screen is looked at whole again.
+    pub(super) moved: u64,
+    /// The process's directory as last read for a frame.
+    pub(super) cwd_seen: RefCell<Option<super::CwdSeen>>,
 }
 
 /// A PTY of `cols × rows`, with its size in pixels from the outer terminal's cells: programs
@@ -326,6 +336,10 @@ impl TermPane {
             guard: KeyboardStackGuard::default(),
             commands: Commands::new(env.scrollback),
             graphics: crate::graphics::PaneGraphics::new(env.graphics.clone()),
+            screen: Default::default(),
+            changes: 0,
+            moved: 0,
+            cwd_seen: Default::default(),
         };
         if let Some(text) = &spec.startup_input {
             pane.write(text.clone().into_bytes());

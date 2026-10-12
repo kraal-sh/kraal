@@ -172,6 +172,7 @@ impl TermPane {
     /// Change the grid with `change`, keeping count of the lines it scrolls so that the marks
     /// stay on their lines.
     pub(super) fn marked(&mut self, change: impl FnOnce(&mut Self)) {
+        self.changes = self.changes.wrapping_add(1);
         if self.commands.list.is_empty() {
             change(self);
             self.guard.take_top_margin();
@@ -288,6 +289,7 @@ impl TermPane {
         let before = self.term.grid().cursor.point.line.0;
         let width = self.term.columns();
         let alt = self.alt_screen();
+        self.changes = self.changes.wrapping_add(1);
         self.term.resize(size);
         // The emulator's scroll region is the whole screen again.
         self.guard.screen_resized();

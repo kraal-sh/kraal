@@ -11,7 +11,7 @@ use super::overlays;
 use super::ui::Mode;
 use super::{Client, ClientId, Server};
 use crate::agent::AgentState;
-use crate::ansi::Cursor;
+use crate::ansi::{Cursor, Kept};
 use crate::keymap::Action;
 use crate::layout::PaneId;
 
@@ -29,6 +29,7 @@ pub enum BarItem {
 }
 
 /// One row of the sidebar.
+#[derive(PartialEq)]
 enum SideRow {
     /// The line that opens a section, with its name.
     Section(&'static str),
@@ -57,43 +58,273 @@ pub enum SideItem {
     },
 }
 
-impl Server {
-    pub fn compose(&mut self, id: ClientId) -> (Buffer, Option<Cursor>, crate::ansi::Links) {
-        let c = &self.clients[&id];
-        let full = Rect::new(0, 0, c.cols.max(1), c.rows.max(1));
-        let mut buf = Buffer::empty(full);
-        if c.rows < 3 || c.cols < 10 {
-            buf.set_string(0, 0, "kraal: terminal too small", Style::default().fg(Color::Yellow));
-            return (buf, None, Default::default());
+/// What a client's last frame was made of: the panes drawn from their screen rows with nothing
+/// over them, where, and the versions of the rows drawn; what its chrome was drawn from, when
+/// nothing went over it.
+#[derive(Default)]
+pub struct FrameMemo {
+    panes: Vec<(PaneId, Rect, Vec<u64>)>,
+    chrome: Option<Chrome>,
+}
+
+/// What a frame's chrome is drawn from: the same draws the same cells.
+struct Chrome {
+    theme: crate::theme::Theme,
+    /// The sidebar's place, and each pane's tile, inner place and content, and whether only its
+    /// screen rows are drawn there.
+    side: Rect,
+    places: Vec<(PaneId, Rect, Rect, Rect, bool)>,
+    sidebar: Vec<SideRow>,
+    bar: TopBar,
+    frames: Vec<Option<FrameLook>>,
+    /// The rows of the panes folded in stacks, and their frames' looks.
+    folds: Vec<(PaneId, Rect)>,
+    fold_looks: Vec<Option<FrameLook>>,
+}
+
+impl Chrome {
+    /// Laid out as `other`: the same things go to the same places, in the same colours.
+    fn same_places(&self, other: &Chrome) -> bool {
+        self.theme == other.theme && self.side == other.side && self.places == other.places && self.folds == other.folds
+    }
+}
+
+/// What a pane's frame shows: its place, its colour, its title and what it works on.
+#[derive(PartialEq)]
+struct FrameLook {
+    tile: Rect,
+    color: Color,
+    title: Vec<Span<'static>>,
+    details: Vec<Span<'static>>,
+}
+
+/// The panes are drawn apart, on their own cells: none floats, no tile (or row of a pane folded
+/// in a stack, `folds`) overlaps another, the sidebar (`side`) or the top bar.
+fn apart(placed: &[Placed], folds: &[(PaneId, Rect)], side: Rect) -> bool {
+    let places: Vec<Rect> = placed.iter().map(|p| p.tile).chain(folds.iter().map(|(_, r)| *r)).collect();
+    !placed.iter().any(|p| p.floating)
+        && places
+            .iter()
+            .enumerate()
+            .all(|(i, r)| r.y > 0 && !r.intersects(side) && places[i + 1..].iter().all(|q| !q.intersects(*r)))
+}
+
+/// The rows of pane contents the frame already has.
+fn kept_rows(placed: &[Placed]) -> Vec<Kept> {
+    let mut kept: Vec<Kept> = placed
+        .iter()
+        .filter_map(|p| Some((p, p.rows.as_ref()?)))
+        .flat_map(|(p, rows)| {
+            let c = p.content;
+            rows.iter().enumerate().filter(|(_, k)| **k).map(move |(r, _)| Kept {
+                y: c.y + r as u16,
+                x0: c.x,
+                x1: c.right(),
+            })
+        })
+        .collect();
+    kept.sort_unstable_by_key(|k| (k.y, k.x0));
+    kept
+}
+
+/// The cells of a screen to draw again, row by row.
+struct Changed {
+    area: Rect,
+    rows: Vec<Vec<(u16, u16)>>,
+}
+
+impl Changed {
+    fn new(area: Rect) -> Changed {
+        Changed { area, rows: vec![Vec::new(); usize::from(area.height)] }
+    }
+
+    fn row(&mut self, y: u16, x0: u16, x1: u16) {
+        let (x0, x1) = (x0.max(self.area.x), x1.min(self.area.right()));
+        if let Some(row) = y.checked_sub(self.area.y).and_then(|r| self.rows.get_mut(usize::from(r)))
+            && x0 < x1
+        {
+            row.push((x0, x1));
         }
+    }
+
+    fn rect(&mut self, r: Rect) {
+        for y in r.top()..r.bottom() {
+            self.row(y, r.left(), r.right());
+        }
+    }
+
+    /// The edges of `r`.
+    fn border(&mut self, r: Rect) {
+        if r.is_empty() {
+            return;
+        }
+        self.row(r.top(), r.left(), r.right());
+        self.row(r.bottom() - 1, r.left(), r.right());
+        for y in r.top() + 1..r.bottom().saturating_sub(1) {
+            self.row(y, r.left(), r.left() + 1);
+            self.row(y, r.right() - 1, r.right());
+        }
+    }
+
+    /// Every other cell, row by row.
+    fn kept(mut self) -> Vec<Kept> {
+        let mut kept = Vec::new();
+        for (i, row) in self.rows.iter_mut().enumerate() {
+            let y = self.area.y + i as u16;
+            row.sort_unstable();
+            let mut x = self.area.left();
+            for &(x0, x1) in row.iter() {
+                if x0 > x {
+                    kept.push(Kept { y, x0: x, x1: x0 });
+                }
+                x = x.max(x1);
+            }
+            if x < self.area.right() {
+                kept.push(Kept { y, x0: x, x1: self.area.right() });
+            }
+        }
+        kept
+    }
+}
+
+/// A pane as a frame shows it.
+struct Placed {
+    pane: PaneId,
+    tile: Rect,
+    inner: Rect,
+    floating: bool,
+    /// Where its content goes.
+    content: Rect,
+    /// Drawn from its screen rows: for each row, whether the frame already has it.
+    rows: Option<Vec<bool>>,
+    /// The versions of its rows, when nothing else is drawn over them.
+    versions: Option<Vec<u64>>,
+}
+
+impl Server {
+    /// Compose what client `id` sees into `buf`, which holds its last frame: the rows of panes
+    /// that did not change since are left as they are (and returned, so that the encoder does
+    /// not compare them), everything else is drawn again.
+    pub fn compose(&mut self, id: ClientId, buf: &mut Buffer) -> (Option<Cursor>, crate::ansi::Links, Vec<Kept>) {
+        let Some(c) = self.clients.get_mut(&id) else { return (None, Default::default(), Vec::new()) };
+        let full = Rect::new(0, 0, c.cols.max(1), c.rows.max(1));
+        let mut memo = std::mem::take(&mut c.memo);
+        if buf.area != full {
+            *buf = Buffer::empty(full);
+            memo = FrameMemo::default();
+        }
+        if c.rows < 3 || c.cols < 10 {
+            buf.reset();
+            buf.set_string(0, 0, "kraal: terminal too small", Style::default().fg(Color::Yellow));
+            return (None, Default::default(), Vec::new());
+        }
+        // Pickers, dialogs and menus go over the panes.
+        let covered = !matches!(c.mode, Mode::Normal | Mode::Resize | Mode::Scroll | Mode::Search { .. });
+        let c = &self.clients[&id];
         let sidebar = self.sidebar_shown(c);
         let rows = c.rows;
         let cols = c.cols;
-
         let sw = if sidebar { self.sidebar_width(cols) } else { 0 };
-        if sw > 0 {
-            self.draw_sidebar(id, Rect::new(0, 0, sw, rows), &mut buf);
+        let side = Rect::new(0, 0, sw, if sw > 0 { rows } else { 0 });
+
+        let folds = self
+            .ws_index(c.workspace)
+            .map_or_else(Vec::new, |wi| self.stack_rows(self.workspaces[wi].tab(), self.layout_area));
+        let placed = self.place_panes(id, (full, side), &folds, (!covered).then_some(&memo));
+        let c = &self.clients[&id];
+        let (frames, fold_looks) = self.frame_looks(id, &placed, &folds);
+        let chrome = Chrome {
+            theme: th(),
+            side,
+            places: placed.iter().map(|p| (p.pane, p.tile, p.inner, p.content, p.versions.is_some())).collect(),
+            sidebar: if sw > 0 { self.sidebar_rows(c, side.height) } else { Vec::new() },
+            bar: self.top_bar(c),
+            frames,
+            folds,
+            fold_looks,
+        };
+        // The chrome is drawn again where it differs from the last frame's, when nothing went
+        // over it then or does now, and it is laid out the same: then the cells between the
+        // panes are blank in both.
+        let cached = !covered && apart(&placed, &chrome.folds, side);
+        let last = memo.chrome.take().filter(|last| cached && last.same_places(&chrome));
+        let (kept, sidebar_changed, bar_changed, frames_changed, folds_changed) = match &last {
+            Some(last) => {
+                let mut changed = Changed::new(full);
+                let sidebar_changed = last.sidebar != chrome.sidebar;
+                if sidebar_changed {
+                    changed.rect(side);
+                }
+                let bar_changed = last.bar != chrome.bar;
+                if bar_changed {
+                    changed.rect(Rect::new(side.right(), 0, cols.saturating_sub(side.right()), 1));
+                }
+                let frames: Vec<bool> = chrome.frames.iter().zip(&last.frames).map(|(now, then)| now != then).collect();
+                for (p, _) in placed.iter().zip(&frames).filter(|(_, f)| **f) {
+                    changed.border(p.tile);
+                }
+                let folds: Vec<bool> =
+                    chrome.fold_looks.iter().zip(&last.fold_looks).map(|(now, then)| now != then).collect();
+                for ((_, row), _) in chrome.folds.iter().zip(&folds).filter(|(_, f)| **f) {
+                    changed.row(row.y, row.x, row.right());
+                }
+                for p in &placed {
+                    match (&p.rows, p.versions.is_some()) {
+                        (Some(rows), true) => {
+                            for (r, _) in rows.iter().enumerate().filter(|(_, k)| !**k) {
+                                changed.row(p.content.y + r as u16, p.content.x, p.content.right());
+                            }
+                        }
+                        _ => changed.rect(p.inner),
+                    }
+                }
+                (changed.kept(), sidebar_changed, bar_changed, frames, folds)
+            }
+            None => (kept_rows(&placed), true, true, vec![true; placed.len()], vec![true; chrome.folds.len()]),
+        };
+        clear_except(buf, &kept);
+
+        if sw > 0 && sidebar_changed {
+            Self::draw_sidebar(&chrome.sidebar, side, buf);
         }
-        self.draw_top_bar(id, &mut buf);
+        if bar_changed {
+            Self::draw_top_bar(&chrome.bar, cols, buf);
+        }
         let mut links = crate::ansi::Links::new();
-        let mut cursor = self.draw_panes(id, &mut buf, &mut links);
+        let mut cursor = self.draw_panes(
+            id,
+            buf,
+            &mut links,
+            &placed,
+            (&chrome.frames, &frames_changed),
+            (&chrome.folds, &chrome.fold_looks, &folds_changed),
+        );
+        if !covered {
+            memo.panes = placed.into_iter().filter_map(|p| Some((p.pane, p.content, p.versions?))).collect();
+        } else {
+            memo.panes.clear();
+        }
+        memo.chrome = cached.then_some(chrome);
+        if let Some(c) = self.clients.get_mut(&id) {
+            c.memo = memo;
+        }
 
         let c = &self.clients[&id];
         let overlay_cursor = match &c.mode {
-            Mode::Picker(p) => Some(overlays::draw_picker(p, full, &mut buf)),
-            Mode::Prompt(p) => Some(overlays::draw_prompt(p, full, &mut buf)),
+            Mode::Picker(p) => Some(overlays::draw_picker(p, full, buf)),
+            Mode::Prompt(p) => Some(overlays::draw_prompt(p, full, buf)),
             Mode::Help { scroll } => {
                 let keys = [("↑↓", "scroll"), ("esc", "close")];
-                overlays::draw_viewer("Help", &self.help_lines(), *scroll, &keys, full, &mut buf);
+                overlays::draw_viewer("Help", &self.help_lines(), *scroll, &keys, full, buf);
                 None
             }
             Mode::Messages { scroll } => {
                 let keys = [("↑↓", "scroll"), ("esc", "close")];
-                overlays::draw_viewer("Messages", &self.message_lines(), *scroll, &keys, full, &mut buf);
+                overlays::draw_viewer("Messages", &self.message_lines(), *scroll, &keys, full, buf);
                 None
             }
             Mode::Confirm(q) => {
-                overlays::draw_confirm(q, full, &mut buf);
+                overlays::draw_confirm(q, full, buf);
                 None
             }
             Mode::Hints(h) => {
@@ -103,10 +334,10 @@ impl Server {
                 match &h.snapshot {
                     Some(snap) if place == Some(snap.area) => {
                         buf.merge(snap);
-                        self.draw_hints(id, h.pane, &h.hints, &h.typed, &mut buf);
+                        self.draw_hints(id, h.pane, &h.hints, &h.typed, buf);
                     }
                     Some(_) => {}
-                    None => self.draw_hints(id, h.pane, &h.hints, &h.typed, &mut buf),
+                    None => self.draw_hints(id, h.pane, &h.hints, &h.typed, buf),
                 }
                 None
             }
@@ -124,7 +355,7 @@ impl Server {
                 let footer = overlays::menu_footer(&entries);
                 let layout = overlays::menu_layout(&items, full);
                 let back = !typed.is_empty();
-                overlays::draw_menu(&items, &layout, (&title, &footer), back, miss.as_deref(), &mut buf);
+                overlays::draw_menu(&items, &layout, (&title, &footer), back, miss.as_deref(), buf);
                 // Links under the menu would open from it.
                 links.retain(|&(x, y), _| !layout.area.contains(ratatui::layout::Position::new(x, y)));
                 None
@@ -155,7 +386,7 @@ impl Server {
         ) {
             links.clear();
         }
-        (buf, cursor, links)
+        (cursor, links, kept)
     }
 
     /// Where a pane's content is drawn for a client.
@@ -535,15 +766,13 @@ impl Server {
         self.top_bar(c).items.into_iter().find(|(x, w, ..)| col >= *x && col < x + w).map(|(_, _, item, _)| item)
     }
 
-    fn draw_top_bar(&self, id: ClientId, buf: &mut Buffer) {
-        let c = &self.clients[&id];
-        let bar = self.top_bar(c);
-        for (x, w, _, spans) in bar.items {
-            buf.set_line(x, 0, &Line::from(spans), w);
+    fn draw_top_bar(bar: &TopBar, cols: u16, buf: &mut Buffer) {
+        for (x, w, _, spans) in &bar.items {
+            buf.set_line(*x, 0, &Line::from(spans.clone()), *w);
         }
         let rw = spans_width(&bar.right);
-        if rw > 0 && rw < c.cols {
-            buf.set_line(c.cols - rw, 0, &Line::from(bar.right), rw);
+        if rw > 0 && rw < cols {
+            buf.set_line(cols - rw, 0, &Line::from(bar.right.clone()), rw);
         }
     }
 
@@ -741,17 +970,16 @@ impl Server {
     }
 
     /// The sidebar: one box over the whole height, its sections split by lines across it.
-    fn draw_sidebar(&self, id: ClientId, area: Rect, buf: &mut Buffer) {
+    fn draw_sidebar(rows: &[SideRow], area: Rect, buf: &mut Buffer) {
         if area.width < 4 || area.height < 3 {
             return;
         }
-        let c = &self.clients[&id];
         let set = th().border(false);
         let line = Style::default().fg(th().dim);
         Block::default().borders(Borders::ALL).border_set(set).border_style(line).render(area, buf);
         let (left, right) = th().tees();
         let width = area.width - 2;
-        for (i, row) in self.sidebar_rows(c, area.height).into_iter().enumerate() {
+        for (i, row) in rows.iter().enumerate() {
             let y = area.y + i as u16;
             if y + 1 >= area.bottom() {
                 break;
@@ -775,12 +1003,12 @@ impl Server {
                     buf.set_line(area.x + 1, y, &title, width);
                 }
                 SideRow::Entry { line: text, selected, .. } => {
-                    if selected {
+                    if *selected {
                         for x in area.x + 1..area.right() - 1 {
                             buf[(x, y)].set_bg(th().selection);
                         }
                     }
-                    buf.set_line(area.x + 1, y, &text, width);
+                    buf.set_line(area.x + 1, y, text, width);
                 }
                 SideRow::Blank => {}
             }
@@ -789,62 +1017,126 @@ impl Server {
 
     // ---- panes ------------------------------------------------------------------------
 
-    fn draw_panes(&mut self, id: ClientId, buf: &mut Buffer, links: &mut crate::ansi::Links) -> Option<Cursor> {
+    /// The panes client `id` sees, in drawing order, and for those drawn from their screen rows,
+    /// which rows its last frame already has: with `memo` (nothing is to go over the panes), the
+    /// rows of a pane at the same place with the same versions, when nothing else is drawn on
+    /// its content (`side` is the sidebar's place) and they show no image.
+    fn place_panes(
+        &mut self,
+        id: ClientId,
+        (screen, side): (Rect, Rect),
+        folds: &[(PaneId, Rect)],
+        memo: Option<&FrameMemo>,
+    ) -> Vec<Placed> {
+        let Some(wi) = self.clients.get(&id).and_then(|c| self.ws_index(c.workspace)) else { return Vec::new() };
+        let rects = self.tab_rects(self.workspaces[wi].tab(), self.layout_area);
+        let mut placed: Vec<Placed> = rects
+            .into_iter()
+            .map(|(pane, frame, floating)| {
+                let (tile, inner) = self.placed(frame, screen);
+                Placed { pane, tile, inner, floating, content: inner, rows: None, versions: None }
+            })
+            .filter(|p| !p.tile.is_empty())
+            .collect();
+        // The rows of panes folded in stacks (`folds`) are drawn too.
+        let folded = folds.iter().map(|(p, r)| (*p, r.intersection(screen)));
+        let tiles: Vec<(PaneId, Rect)> = placed.iter().map(|p| (p.pane, p.tile)).chain(folded).collect();
+        for p in &mut placed {
+            let Some(pane) = self.panes.get_mut(&p.pane) else { continue };
+            p.content = Rect::new(p.inner.x, p.inner.y, p.inner.width.min(pane.cols), p.inner.height.min(pane.rows));
+            if p.inner.is_empty() {
+                continue;
+            }
+            let content = p.content;
+            let exited = pane.exit_code.is_some();
+            let Some(rows) = pane.refresh_screen(content.width, content.height) else { continue };
+            let alone = memo.is_some()
+                && !p.floating
+                && !exited
+                && content.y > 0
+                && !content.intersects(side)
+                && tiles.iter().all(|(q, t)| *q == p.pane || !t.intersects(content));
+            let versions = rows.versions();
+            let same = memo.and_then(|m| m.panes.iter().find(|(q, r, _)| *q == p.pane && *r == content));
+            p.rows = Some(match same {
+                Some((_, _, old)) if alone => {
+                    versions.iter().enumerate().map(|(r, v)| old.get(r) == Some(v) && !rows.has_images(r)).collect()
+                }
+                _ => vec![false; versions.len()],
+            });
+            p.versions = alone.then(|| versions.to_vec());
+        }
+        placed
+    }
+
+    /// Draw the rows of the panes folded in stacks (`folds`: where, their frames' looks, and
+    /// whether to draw each), then the panes `placed`: their frames (`looks`) where `frames` says
+    /// to, and the rows of their content the frame does not have yet.
+    #[allow(clippy::type_complexity)]
+    fn draw_panes(
+        &mut self,
+        id: ClientId,
+        buf: &mut Buffer,
+        links: &mut crate::ansi::Links,
+        placed: &[Placed],
+        (looks, frames): (&[Option<FrameLook>], &[bool]),
+        folds: (&[(PaneId, Rect)], &[Option<FrameLook>], &[bool]),
+    ) -> Option<Cursor> {
         let c = &self.clients[&id];
         let wi = self.ws_index(c.workspace)?;
-        let area = self.layout_area;
-        let clip = buf.area;
         let images = self.can_show_images(id);
-        let ws = &self.workspaces[wi];
-        let tab = ws.tab();
-        let rects = self.tab_rects(tab, area);
-        let folded = self.stack_rows(tab, area);
+        let tab = self.workspaces[wi].tab();
         let focus = tab.focus;
-        let synced: Vec<PaneId> = match (ws.sync, focus) {
-            (super::SyncScope::Off, _) | (_, None) => Vec::new(),
-            (_, Some(f)) => ws.sync_targets(f),
-        };
-        let marked = ws.marked.clone();
         let show_floating = tab.show_floating;
         let floating_focus = focus.is_some_and(|f| tab.is_floating(f));
         // A pane folded in a stack shows the top line of its frame, and nothing else.
-        for (pid, row) in folded {
+        for (((_, row), look), _) in folds.0.iter().zip(folds.1).zip(folds.2).filter(|(_, f)| **f) {
             let mut whole = Buffer::empty(Rect::new(row.x, row.y, row.width, 3));
-            let (sync, mark) = (synced.contains(&pid), marked.contains(&pid));
-            self.draw_frame(pid, whole.area, false, sync, false, mark, &mut whole);
+            if let Some(look) = look {
+                Self::draw_frame(look, &mut whole);
+            }
             for x in row.x..row.right() {
-                if clip.contains((x, row.y).into()) {
+                if buf.area.contains((x, row.y).into()) {
                     buf[(x, row.y)] = whole[(x, row.y)].clone();
                 }
             }
         }
         let mut cursor = None;
-        for (pid, frame, floating) in rects {
-            let (tile, inner) = self.placed(frame, clip);
-            if tile.is_empty() {
-                continue;
-            }
+        for (i, p) in placed.iter().enumerate() {
+            let (pid, tile, inner, floating, content) = (p.pane, p.tile, p.inner, p.floating, p.content);
             if floating {
                 Clear.render(tile, buf);
                 // A floating pane hides the links of what is under it.
                 links.retain(|(x, y), _| !tile.contains((*x, *y).into()));
             }
             let focused = focus == Some(pid) && (!floating_focus || show_floating);
-            if inner != tile {
-                let (sync, mark) = (synced.contains(&pid), marked.contains(&pid));
-                self.draw_frame(pid, tile, focused, sync, floating, mark, buf);
+            if let Some(look) = looks.get(i).and_then(Option::as_ref)
+                && frames.get(i).copied().unwrap_or(true)
+            {
+                Self::draw_frame(look, buf);
             }
             // A smaller client may see only the frame's top.
             if inner.is_empty() {
                 continue;
             }
             let Some(pane) = self.panes.get_mut(&pid) else { continue };
-            let content = Rect::new(inner.x, inner.y, inner.width.min(pane.cols), inner.height.min(pane.rows));
-            if let crate::pane::Content::Files(f) = &mut pane.content {
-                f.set_viewer(id);
+            match (&p.rows, pane.screen_cache()) {
+                (Some(kept), Some(screen)) => {
+                    screen.draw(content, buf, |r| !kept[r], links);
+                    // Only rows with image placeholders change with the images.
+                    let rows: Vec<u16> = (0..content.height).filter(|r| screen.has_images(usize::from(*r))).collect();
+                    for r in rows {
+                        pane.show_images(Rect::new(content.x, content.y + r, content.width, 1), buf, images);
+                    }
+                }
+                _ => {
+                    if let crate::pane::Content::Files(f) = &mut pane.content {
+                        f.set_viewer(id);
+                    }
+                    pane.render(content, buf, links);
+                    pane.show_images(content, buf, images);
+                }
             }
-            pane.render(content, buf, links);
-            pane.show_images(content, buf, images);
             if let Some(code) = pane.exit_code {
                 let msg = match code {
                     _ if pane.suspended => " not started · enter run · x close ".to_string(),
@@ -909,11 +1201,50 @@ impl Server {
         out
     }
 
+    /// The frames of the panes `placed` that have one, and of the panes folded in stacks
+    /// (`folds`: their rows, each the top of a frame), as client `id` sees them.
+    fn frame_looks(
+        &self,
+        id: ClientId,
+        placed: &[Placed],
+        folds: &[(PaneId, Rect)],
+    ) -> (Vec<Option<FrameLook>>, Vec<Option<FrameLook>>) {
+        let Some(wi) = self.clients.get(&id).and_then(|c| self.ws_index(c.workspace)) else {
+            return (placed.iter().map(|_| None).collect(), folds.iter().map(|_| None).collect());
+        };
+        let ws = &self.workspaces[wi];
+        let tab = ws.tab();
+        let focus = tab.focus;
+        let synced: Vec<PaneId> = match (ws.sync, focus) {
+            (super::SyncScope::Off, _) | (_, None) => Vec::new(),
+            (_, Some(f)) => ws.sync_targets(f),
+        };
+        let floating_focus = focus.is_some_and(|f| tab.is_floating(f));
+        let frames = placed
+            .iter()
+            .map(|p| {
+                if p.inner == p.tile {
+                    return None;
+                }
+                let focused = focus == Some(p.pane) && (!floating_focus || tab.show_floating);
+                let (sync, mark) = (synced.contains(&p.pane), ws.marked.contains(&p.pane));
+                self.frame_look(p.pane, p.tile, focused, sync, p.floating, mark)
+            })
+            .collect();
+        let folded = folds
+            .iter()
+            .map(|(pane, row)| {
+                let (sync, mark) = (synced.contains(pane), ws.marked.contains(pane));
+                self.frame_look(*pane, Rect::new(row.x, row.y, row.width, 3), false, sync, false, mark)
+            })
+            .collect();
+        (frames, folded)
+    }
+
     /// A pane's frame: its name on the top border, what it works on at the right of it. The
     /// focused pane's frame is in the accent colour, a production one in red, a broadcast target
     /// in the broadcast colour.
-    #[allow(clippy::too_many_arguments)]
-    fn draw_frame(
+    fn frame_look(
         &self,
         pid: PaneId,
         tile: Rect,
@@ -921,9 +1252,8 @@ impl Server {
         sync: bool,
         floating: bool,
         marked: bool,
-        buf: &mut Buffer,
-    ) {
-        let Some(pane) = self.panes.get(&pid) else { return };
+    ) -> Option<FrameLook> {
+        let pane = self.panes.get(&pid)?;
         let prod = self.pane_production_shown(pid).is_some();
         let color = if prod {
             th().production
@@ -954,18 +1284,22 @@ impl Server {
         if marked {
             title.insert(0, Span::styled(" ◆", Style::default().fg(th().sync).add_modifier(Modifier::BOLD)));
         }
-        let tw = spans_width(&title);
+        Some(FrameLook { tile, color, title, details: self.pane_details(pid) })
+    }
+
+    fn draw_frame(look: &FrameLook, buf: &mut Buffer) {
+        let tile = look.tile;
+        let tw = spans_width(&look.title);
         Block::default()
             .borders(Borders::ALL)
             .border_set(th().border(false))
-            .border_style(Style::default().fg(color))
-            .title(Line::from(title))
+            .border_style(Style::default().fg(look.color))
+            .title(Line::from(look.title.clone()))
             .render(tile, buf);
         // The details end one line cell before the corner, and only show whole.
-        let right = self.pane_details(pid);
-        let rw = spans_width(&right);
+        let rw = spans_width(&look.details);
         if rw > 0 && u32::from(tw) + u32::from(rw) + 4 <= u32::from(tile.width) {
-            buf.set_line(tile.right() - 2 - rw, tile.y, &Line::from(right), rw);
+            buf.set_line(tile.right() - 2 - rw, tile.y, &Line::from(look.details.clone()), rw);
         }
     }
 
@@ -1038,7 +1372,7 @@ pub type BarEntry = (u16, u16, BarItem, Vec<Span<'static>>);
 
 /// What the top bar shows: entries from the left, the right side, and the column of the cursor
 /// while a search is typed.
-#[derive(Default)]
+#[derive(Default, PartialEq)]
 pub struct TopBar {
     pub items: Vec<BarEntry>,
     pub right: Vec<Span<'static>>,
@@ -1091,6 +1425,27 @@ fn place_tabs(out: &mut Vec<BarEntry>, mut x: u16, limit: u16, tabs: Vec<(u16, V
     }
 }
 
+/// Blank every cell of `buf` but those `kept` (sorted by row, then column).
+fn clear_except(buf: &mut Buffer, kept: &[Kept]) {
+    let area = buf.area;
+    let width = usize::from(area.width);
+    let mut from = 0;
+    for k in kept {
+        if k.y < area.y || k.x0 < area.x {
+            continue;
+        }
+        let row = usize::from(k.y - area.y) * width;
+        let (start, end) = (row + usize::from(k.x0 - area.x), row + usize::from(k.x1 - area.x));
+        if let Some(cells) = buf.content.get_mut(from..start) {
+            cells.iter_mut().for_each(ratatui::buffer::Cell::reset);
+        }
+        from = from.max(end);
+    }
+    if let Some(cells) = buf.content.get_mut(from..) {
+        cells.iter_mut().for_each(ratatui::buffer::Cell::reset);
+    }
+}
+
 fn spans_width(spans: &[Span]) -> u16 {
     spans.iter().map(|s| s.content.width()).sum::<usize>().min(u16::MAX as usize) as u16
 }
@@ -1138,6 +1493,19 @@ fn key_list(list: &[(&str, &str)]) -> Vec<Span<'static>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_cells_kept_are_all_but_those_changed() {
+        let mut changed = Changed::new(Rect::new(0, 0, 10, 4));
+        changed.row(0, 2, 4);
+        changed.row(0, 3, 6);
+        changed.border(Rect::new(5, 1, 3, 3));
+        changed.rect(Rect::new(8, 3, 5, 1));
+        let k = |y, x0, x1| Kept { y, x0, x1 };
+        let want =
+            vec![k(0, 0, 2), k(0, 6, 10), k(1, 0, 5), k(1, 8, 10), k(2, 0, 5), k(2, 6, 7), k(2, 8, 10), k(3, 0, 5)];
+        assert_eq!(changed.kept(), want);
+    }
 
     #[test]
     fn messages_too_long_are_cut() {
