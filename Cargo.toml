@@ -29,7 +29,7 @@ miniz_oxide = "0.8"
 signal-hook = "0.3"
 portable-pty = "0.9"
 pulldown-cmark = { version = "0.13", default-features = false }
-ratatui = { version = "0.30", default-features = false, features = ["std", "underline-color", "layout-cache"] }
+ratatui = { version = "0.30", default-features = false, features = ["std", "underline-color"] }
 regex = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }

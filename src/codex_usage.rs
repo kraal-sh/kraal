@@ -8,25 +8,22 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+use crate::accounts::now;
+
+#[derive(Debug, Clone)]
 pub struct Window {
     pub used_percent: f64,
-    pub window_minutes: Option<u64>,
     /// Unix seconds.
     pub resets_at: Option<i64>,
 }
-#[derive(Debug, Clone, PartialEq, Default, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Default)]
 pub struct RateLimits {
     /// The window of about five hours, if reported.
     pub five_hour: Option<Window>,
     /// The weekly window, if reported.
     pub weekly: Option<Window>,
-    pub plan: Option<String>,
     /// Unix seconds when observed.
     pub observed_at: i64,
-}
-fn now() -> i64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64)
 }
 fn field<'a>(v: &'a Value, names: &[&str]) -> Option<&'a Value> {
     names.iter().find_map(|n| v.get(n).filter(|v| !v.is_null()))
@@ -90,11 +87,7 @@ fn snapshot(v: &Value) -> Option<RateLimits> {
     if !v.is_object() {
         return None;
     }
-    let mut out = RateLimits {
-        observed_at: now(),
-        plan: field(v, &["planType", "plan_type", "plan"]).and_then(Value::as_str).map(str::to_owned),
-        ..Default::default()
-    };
+    let mut out = RateLimits { observed_at: now(), ..Default::default() };
     for key in ["primary", "secondary"] {
         let Some(w) = v.get(key) else { continue };
         let Some(used_percent) = field(w, &["usedPercent", "used_percent"]).and_then(Value::as_f64) else {
@@ -102,11 +95,7 @@ fn snapshot(v: &Value) -> Option<RateLimits> {
         };
         let window_minutes =
             field(w, &["windowDurationMins", "window_duration_mins", "window_minutes"]).and_then(Value::as_u64);
-        let window = Window {
-            used_percent,
-            window_minutes,
-            resets_at: field(w, &["resetsAt", "resets_at"]).and_then(timestamp),
-        };
+        let window = Window { used_percent, resets_at: field(w, &["resetsAt", "resets_at"]).and_then(timestamp) };
         match window_minutes {
             Some(1..=1440) => out.five_hour = Some(window),
             Some(7200..) => out.weekly = Some(window),
@@ -335,7 +324,6 @@ mod tests {
     fn rpc_schema_and_classification() {
         let v = json!({"accountId":"ignored", "rateLimits":{"planType":"plus", "primary":{"usedPercent":80,"windowDurationMins":10080,"resetsAt":1700000000},"secondary":{"usedPercent":12,"windowDurationMins":300,"resetsAt":"1970-01-01T01:00:00+01:00"}},"rateLimitsByLimitId":null});
         let r = parse_rpc_result(&v).unwrap();
-        assert_eq!(r.plan.as_deref(), Some("plus"));
         assert_eq!(r.five_hour.as_ref().unwrap().used_percent, 12.0);
         assert_eq!(r.five_hour.unwrap().resets_at, Some(0));
         assert_eq!(r.weekly.unwrap().used_percent, 80.0);
