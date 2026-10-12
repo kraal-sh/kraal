@@ -201,19 +201,76 @@ impl Env {
 
     /// What the server says of itself (its answer to a ping), asked as any release asks.
     fn pong(&self) -> serde_json::Value {
+        self.ask(serde_json::json!({ "cmd": "ping" }))["result"]["Ok"]["data"].clone()
+    }
+
+    /// The server's answer to `request`, asked through its socket as any release asks.
+    fn ask(&self, request: serde_json::Value) -> serde_json::Value {
         let mut stream = std::os::unix::net::UnixStream::connect(self.socket()).unwrap();
         stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-        let ping = br#"{"type":"request","version":2,"request":{"cmd":"ping"}}"#;
-        let mut frame = (ping.len() as u32).to_le_bytes().to_vec();
+        let message = serde_json::json!({ "type": "request", "version": 2, "request": request }).to_string();
+        let mut frame = (message.len() as u32).to_le_bytes().to_vec();
         frame.push(0);
-        frame.extend_from_slice(ping);
+        frame.extend_from_slice(message.as_bytes());
         stream.write_all(&frame).unwrap();
         let mut header = [0u8; 5];
         stream.read_exact(&mut header).unwrap();
         let mut payload = vec![0u8; u32::from_le_bytes(header[..4].try_into().unwrap()) as usize];
         stream.read_exact(&mut payload).unwrap();
-        let answer: serde_json::Value = serde_json::from_slice(&payload).unwrap();
-        answer["result"]["Ok"]["data"].clone()
+        serde_json::from_slice(&payload).unwrap()
+    }
+
+    /// `kraal events` from `kraal`, too slow for the session: it reads one event, then nothing
+    /// while far more happens than is kept waiting for a reader, then all it is given. The lines
+    /// it read then, how it ended and what it said.
+    fn slow_reader(&self, kraal: &Kraal) -> (Vec<serde_json::Value>, Option<i32>, String) {
+        use std::io::BufRead;
+        let notify = |title: &str, body: &str| {
+            let answer = self.ask(serde_json::json!({ "cmd": "notify", "title": title, "body": body }));
+            assert!(answer["result"]["Ok"].is_object(), "{answer}");
+        };
+        notify("first", "");
+        let mut child = self
+            .cmd(kraal, &["events", "--since", "0", "notification"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let out = child.stdout.take().unwrap();
+        let (tx, lines) = std::sync::mpsc::channel();
+        let (go, asked) = std::sync::mpsc::channel::<()>();
+        std::thread::spawn(move || {
+            let mut out = std::io::BufReader::new(out).lines().map_while(Result::ok);
+            if let Some(first) = out.next() {
+                let _ = tx.send(first);
+            }
+            let _ = asked.recv();
+            for line in out {
+                if tx.send(line).is_err() {
+                    break;
+                }
+            }
+        });
+        let first = lines.recv_timeout(Duration::from_secs(10)).expect("the event from before");
+        assert!(first.contains(r#""title":"first""#), "{first}");
+        let body = "x".repeat(16 << 10);
+        for i in 0..300 {
+            notify(&i.to_string(), &body);
+        }
+        go.send(()).unwrap();
+        let mut read = Vec::new();
+        loop {
+            match lines.recv_timeout(Duration::from_secs(20)) {
+                Ok(line) => read.push(serde_json::from_str(&line).unwrap()),
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                Err(_) => {
+                    let _ = child.kill();
+                    panic!("kraal {}: the stream never ended, {} lines read", kraal.version, read.len());
+                }
+            }
+        }
+        let out = child.wait_with_output().unwrap();
+        (read, out.status.code(), String::from_utf8_lossy(&out.stderr).into_owned())
     }
 
     /// Whether the server lists `feature` (one this kraal has and the oldest release does not).
@@ -352,4 +409,38 @@ fn a_session_of_another_release_restarts_on_this_kraal() {
     env.wait_for_text(&this, "first", "after-42");
     let ls = env.run(&this, &["ls"]);
     assert!(ls.contains(&format!("running  {}", this.version)), "{ls}");
+}
+
+/// A reader of the events too slow for the session is dropped by either release. A session of
+/// this kraal tells the other release's `kraal events` so, in messages every release reads: a
+/// last line, then the reason it fails with. A session of a release that drops its readers
+/// without a word ends this kraal's `kraal events` as it always did.
+#[test]
+#[ignore = "needs KRAAL_OLD, another release's kraal: tests/compat.sh runs it"]
+fn a_reader_too_slow_for_the_events_ends_with_either_release() {
+    let (old, this) = (Kraal::old(), Kraal::this());
+    // What a reader read before it was dropped: the events in order, then the last line if any.
+    let in_order = |read: &[serde_json::Value]| {
+        let told = read.last().is_some_and(|l| l["type"] == "events.dropped");
+        let events = &read[..read.len() - usize::from(told)];
+        let titles: Vec<&str> = events.iter().filter_map(|e| e["title"].as_str()).collect();
+        assert_eq!(titles, (0..events.len()).map(|i| i.to_string()).collect::<Vec<_>>());
+        assert!(!events.is_empty() && events.len() < 300, "{} events read: never dropped", events.len());
+        told
+    };
+    let env = Env::new("compat-slow-old");
+    env.run(&this, &["open", "w"]);
+    let (read, status, said) = env.slow_reader(&old);
+    assert!(in_order(&read), "kraal {} was not told: {:?}", old.version, read.last().map(|l| &l["type"]));
+    assert_eq!(status, Some(1), "{said}");
+    assert!(said.contains("too slow") && said.contains("--since"), "{said}");
+    let env = Env::new("compat-slow-new");
+    env.run(&old, &["open", "w"]);
+    let (read, status, said) = env.slow_reader(&this);
+    if in_order(&read) {
+        assert_eq!(status, Some(1), "{said}");
+        assert!(said.contains("too slow"), "{said}");
+    } else {
+        assert_eq!((status, said.as_str()), (Some(0), ""), "a session of kraal {}", old.version);
+    }
 }

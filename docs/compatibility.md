@@ -32,6 +32,9 @@ A few things do less instead of failing:
 - When you restart a session that runs 0.2.0, the terminals attached to it end instead of waiting
   for the next server: run `kraal` again there. From later releases on, they come back by
   themselves.
+- A session that runs 0.3.0 or older drops a `kraal events` reader that is too slow, or that reads
+  nothing for ten seconds while events wait for it, without telling it: the stream ends as it
+  does with the session ([Events](scripting.md#events)).
 
 ## For contributors: how the protocol changes
 

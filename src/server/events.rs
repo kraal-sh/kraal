@@ -2,8 +2,8 @@
 //! `[hooks]` of the config.
 //!
 //! Every event carries `seq`, increasing within a server's life, and `boot`, which changes when
-//! the server restarts. The last events are kept, so a subscriber that was dropped (too slow)
-//! or reconnects can ask for what it missed with `since`.
+//! the server restarts. The last events are kept, so a subscriber that was dropped (too slow,
+//! which it is told) or reconnects can ask for what it missed with `since`.
 
 use std::collections::{HashMap, VecDeque};
 use std::io::Write;
@@ -70,7 +70,9 @@ fn now_ms() -> u64 {
 
 pub struct Subscriber {
     pub client: ClientId,
-    pub out: super::clients::Outbox,
+    /// Where its events go; `None` once it was dropped for being too slow. It stays listed, and
+    /// counted as a connection, until it has read that and its connection ends.
+    pub out: Option<super::clients::Outbox>,
     pub filters: Vec<String>,
 }
 
@@ -274,6 +276,22 @@ fn rotate(log: &Path) {
     }
 }
 
+/// What a subscriber dropped for being too slow reads last, after the events it was sent: a line
+/// for what reads its output, with the cursor to come back with (`since`, `boot`), then the end
+/// of its stream and why. Every release reads both: `kraal events` prints the first and fails
+/// with the second.
+fn dropped_frames(boot: u64, since: u64) -> Vec<u8> {
+    let event = json!({ "v": 1, "type": "events.dropped", "boot": boot, "since": since, "reason": "too slow" });
+    let reason = format!(
+        "too slow to follow the events, so kraal dropped this reader: `kraal events --since {since} --boot {boot}` goes on from there"
+    );
+    let mut frames = Vec::new();
+    for msg in [ServerMsg::Event { event }, ServerMsg::exit(reason)] {
+        let _ = protocol::write_json(&mut frames, &msg);
+    }
+    frames
+}
+
 /// A frame of replayed events.
 fn events_frame(events: Vec<Value>) -> Result<Vec<u8>, String> {
     let mut frame = Vec::new();
@@ -289,9 +307,15 @@ impl Server {
         if !self.subscribers.is_empty() {
             let mut frame = Vec::new();
             if protocol::write_json(&mut frame, &ServerMsg::Event { event: Value::Object(event.clone()) }).is_ok() {
-                // A subscriber too slow to keep up is dropped rather than slowing the session;
-                // it can come back with `since` and replay what it missed.
-                self.subscribers.retain(|s| !selected(&s.filters, ty) || s.out.try_send(frame.clone()).is_ok());
+                // A subscriber too slow to keep up (its queue is full) is dropped rather than
+                // slowing the session. It is told, after what it was sent, and can come back
+                // with `since` for what it missed: this event and those after it.
+                let (boot, since) = (self.events.boot, self.events.seq - 1);
+                for s in self.subscribers.iter_mut().filter(|s| selected(&s.filters, ty)) {
+                    if let Some(out) = s.out.take_if(|out| out.try_send(frame.clone()).is_err()) {
+                        out.end_with(dropped_frames(boot, since));
+                    }
+                }
             }
         }
         let commands: Vec<String> =
@@ -436,7 +460,8 @@ impl Server {
                 return Err("the event stream could not start: try again".into());
             }
         }
-        self.subscribers.push(Subscriber { client, out: c.out, filters });
+        c.out.wait_for_reader();
+        self.subscribers.push(Subscriber { client, out: Some(c.out), filters });
         Ok(())
     }
 
