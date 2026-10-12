@@ -25,7 +25,7 @@ pub fn ensure_server(session: &str) -> Result<PathBuf> {
     if let Some(dir) = log.parent() {
         paths::ensure_private_dir(dir)?;
     }
-    let out = crate::runbooks::open_private_append(&log)?;
+    let out = paths::open_private_append(&log)?;
     // The server writes a byte to this pipe once it listens, instead of being asked again and
     // again whether it does.
     let (ready, ready_end) = std::io::pipe().context("creating a pipe")?;
@@ -277,7 +277,7 @@ pub fn restart_detached(exe: &Path, session: &str) -> Result<std::process::Child
     if let Some(dir) = log.parent() {
         paths::ensure_private_dir(dir)?;
     }
-    let out = crate::runbooks::open_private_append(&log)?;
+    let out = paths::open_private_append(&log)?;
     let mut cmd = std::process::Command::new(exe);
     cmd.args(["-s", session, "restart", "--yes"])
         .stdin(std::process::Stdio::null())

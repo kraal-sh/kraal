@@ -152,14 +152,8 @@ impl Server {
             Ok(Some(s)) => s,
             Ok(None) => return,
             Err(e) => {
-                // Keep the unreadable file aside rather than overwrite it with this new session.
-                let path = paths::session_state_path(&self.session);
-                let aside = path.with_extension(format!("json.unreadable-{}", crate::accounts::now()));
-                let _ = std::fs::rename(&path, &aside);
-                self.warnings.push(format!(
-                    "could not restore the previous session ({e:#}); kept it as {}",
-                    paths::shorten_home(&aside)
-                ));
+                let kept = keep_aside(&paths::session_state_path(&self.session));
+                self.warnings.push(format!("could not restore the previous session ({e:#}); {kept}"));
                 return;
             }
         };
@@ -394,9 +388,34 @@ fn flush_answer(
     }
 }
 
+/// Move the state at `path`, which could not be restored, aside rather than overwrite it with
+/// this new session; what became of it, to tell the user.
+fn keep_aside(path: &std::path::Path) -> String {
+    let aside = path.with_extension(format!("json.unreadable-{}", crate::accounts::now()));
+    match std::fs::rename(path, &aside) {
+        Ok(()) => format!("kept it as {}", paths::shorten_home(&aside)),
+        Err(e) => format!("it could not be kept aside ({e}): saving this session replaces it"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_unreadable_state_is_kept_aside_or_said_not_to_be() {
+        let dir = std::env::temp_dir().join(format!("kraal-unreadable-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let state = dir.join("main.json");
+        std::fs::write(&state, "{").unwrap();
+        let kept = keep_aside(&state);
+        assert!(kept.starts_with("kept it as ") && !state.exists(), "{kept}");
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+        let lost = keep_aside(&state);
+        assert!(lost.starts_with("it could not be kept aside"), "{lost}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
 
     #[test]
     fn a_slow_disk_keeps_one_text_per_file_waiting() {

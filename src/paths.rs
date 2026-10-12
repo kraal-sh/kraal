@@ -283,11 +283,30 @@ pub fn remove_files_in(dir: &Path, remove: impl Fn(&str) -> bool) -> std::io::Re
 }
 
 /// Write a file atomically, keeping the permissions it has (0644 when it is new): the user's
-/// configuration files.
+/// configuration files. A symlink (dotfiles kept in a repository) stays one: the file it
+/// points to is replaced.
 pub fn write_atomic(path: &Path, data: &[u8]) -> std::io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
-    let mode = std::fs::metadata(path).map(|m| m.permissions().mode() & 0o7777).unwrap_or(0o644);
-    write_with_mode(path, data, mode)
+    let target = match std::fs::symlink_metadata(path) {
+        Ok(m) if m.file_type().is_symlink() => std::fs::canonicalize(path).map_err(|e| {
+            std::io::Error::new(e.kind(), format!("{} is a link to a file that is not there", path.display()))
+        })?,
+        _ => path.to_path_buf(),
+    };
+    let mode = std::fs::metadata(&target).map(|m| m.permissions().mode() & 0o7777).unwrap_or(0o644);
+    write_with_mode(&target, data, mode)
+}
+
+/// Open `path` for appending, creating it private (0600): a log can hold secrets (a command, what
+/// it printed). A link in its place is refused, and a file an older kraal made readable by
+/// others is made private.
+pub fn open_private_append(path: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    let mut opts = std::fs::OpenOptions::new();
+    opts.append(true).create(true).mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    let file = opts.open(path)?;
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    Ok(file)
 }
 
 /// Read a regular file of at most `cap` bytes (symlinks followed). Anything else is refused at
@@ -909,6 +928,48 @@ mod tests {
             .filter(|e| e.file_name().to_string_lossy().ends_with(".tmp"))
             .collect();
         assert!(left.is_empty(), "no temporary file left behind");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_private_log_is_never_opened_through_a_link() {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("kraal-private-log-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("main.log");
+        std::fs::write(&log, "old\n").unwrap();
+        std::fs::set_permissions(&log, std::fs::Permissions::from_mode(0o644)).unwrap();
+        open_private_append(&log).unwrap().write_all(b"new\n").unwrap();
+        assert_eq!(std::fs::read_to_string(&log).unwrap(), "old\nnew\n");
+        assert_eq!(std::fs::metadata(&log).unwrap().permissions().mode() & 0o777, 0o600);
+        let elsewhere = dir.join("elsewhere");
+        let link = dir.join("link.log");
+        std::os::unix::fs::symlink(&elsewhere, &link).unwrap();
+        assert!(open_private_append(&link).is_err());
+        assert!(!elsewhere.exists(), "nothing is written where the link points");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_linked_configuration_file_stays_a_link() {
+        let dir = std::env::temp_dir().join(format!("kraal-linked-config-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("dotfiles")).unwrap();
+        let real = dir.join("dotfiles/servers.toml");
+        std::fs::write(&real, "old").unwrap();
+        let link = dir.join("servers.toml");
+        std::os::unix::fs::symlink("dotfiles/servers.toml", &link).unwrap();
+        write_atomic(&link, b"new").unwrap();
+        assert!(std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink());
+        assert_eq!(std::fs::read_to_string(&real).unwrap(), "new");
+        // A link to nothing is refused, not replaced by a file.
+        let dangling = dir.join("accounts.toml");
+        std::os::unix::fs::symlink("dotfiles/gone.toml", &dangling).unwrap();
+        let refused = write_atomic(&dangling, b"x").unwrap_err();
+        assert!(refused.to_string().contains("not there"), "{refused}");
+        assert!(std::fs::symlink_metadata(&dangling).unwrap().file_type().is_symlink());
         let _ = std::fs::remove_dir_all(dir);
     }
 

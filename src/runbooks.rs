@@ -498,14 +498,6 @@ pub fn create_log(name: &str, id: u32, header: &str) -> Result<PathBuf> {
     bail!("could not find a free name for the log of {name} in {}", dir.display())
 }
 
-/// Open `path` for appending, creating it private (0600) if needed.
-pub fn open_private_append(path: &Path) -> std::io::Result<std::fs::File> {
-    let mut opts = std::fs::OpenOptions::new();
-    opts.append(true).create(true);
-    std::os::unix::fs::OpenOptionsExt::mode(&mut opts, 0o600);
-    opts.open(path)
-}
-
 /// Most of one target's output a run log keeps.
 const MAX_OUTPUT: u64 = 16 << 20;
 /// A line longer than this is written in pieces.
@@ -542,7 +534,7 @@ pub struct OutputLog {
 
 impl OutputLog {
     pub fn create(path: PathBuf) -> std::io::Result<OutputLog> {
-        let file = open_private_append(&path)?;
+        let file = paths::open_private_append(&path)?;
         Ok(OutputLog { file, path, error: None, line: Vec::new(), cr: false, seq: Seq::Text, written: 0, cut: false })
     }
 
@@ -632,7 +624,7 @@ impl OutputLog {
 /// Append `header` to the run log, then a finished target's output, deleting its file.
 fn fold_output(log: &Path, header: &str, output: Option<&Path>) -> std::io::Result<()> {
     use std::io::Write;
-    let mut f = open_private_append(log)?;
+    let mut f = paths::open_private_append(log)?;
     f.write_all(header.as_bytes())?;
     if let Some(output) = output {
         let mut out = std::fs::File::open(output)?;
@@ -669,7 +661,7 @@ pub fn spawn_log_writer(warn: impl Fn(String) + Send + 'static) -> crossbeam_cha
             let failed = match job {
                 LogJob::Append(log, text) => {
                     use std::io::Write;
-                    let written = open_private_append(&log).and_then(|mut f| f.write_all(text.as_bytes()));
+                    let written = paths::open_private_append(&log).and_then(|mut f| f.write_all(text.as_bytes()));
                     written.err().map(|e| (log, e.to_string()))
                 }
                 LogJob::Fold { log, header, output } => fold_output(&log, &header, Some(&output))

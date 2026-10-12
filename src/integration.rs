@@ -410,13 +410,7 @@ fn write_with_backup(path: &Path, content: &str) -> Result<()> {
         let backup = path.with_file_name(format!("{name}.kraal-bak"));
         std::fs::copy(path, &backup).with_context(|| format!("backing up {}", path.display()))?;
     }
-    // A symlink (dotfiles kept in a repository) stays one: the file it points to changes.
-    let target = match std::fs::symlink_metadata(path) {
-        Ok(m) if m.file_type().is_symlink() => std::fs::canonicalize(path)
-            .with_context(|| format!("{} is a link to a file that is not there", path.display()))?,
-        _ => path.to_path_buf(),
-    };
-    crate::paths::write_atomic(&target, content.as_bytes()).with_context(|| format!("writing {}", target.display()))
+    crate::paths::write_atomic(path, content.as_bytes()).with_context(|| format!("writing {}", path.display()))
 }
 
 fn runs_ours(hook: &Value, agent: &str) -> bool {

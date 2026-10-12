@@ -265,19 +265,7 @@ fn open_log(log: &Path) -> std::io::Result<std::fs::File> {
     if let Some(dir) = log.parent() {
         crate::paths::ensure_private_dir(dir)?;
     }
-    let mut opts = std::fs::OpenOptions::new();
-    opts.append(true).create(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-        opts.mode(0o600).custom_flags(libc::O_NOFOLLOW);
-        let f = opts.open(log)?;
-        // A log an older kraal created readable by others.
-        f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
-        Ok(f)
-    }
-    #[cfg(not(unix))]
-    opts.open(log)
+    crate::paths::open_private_append(log)
 }
 
 fn rotate(log: &Path) {
