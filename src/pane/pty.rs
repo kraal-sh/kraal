@@ -683,6 +683,41 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
+    fn a_reader_sleeps_while_the_program_is_silent() {
+        let pair = portable_pty::native_pty_system()
+            .openpty(PtySize { rows: 5, cols: 20, pixel_width: 0, pixel_height: 0 })
+            .unwrap();
+        let mut writer = pair.master.take_writer().unwrap();
+        let stop = ReaderStop::new(pair.master.tty_name());
+        let mut reader = PtyReader::new(&*pair.master, stop.wakes()).unwrap();
+        let stopped = stop.flag.clone();
+        let (tid_tx, tid_rx) = crossbeam_channel::bounded(1);
+        let (read_tx, read_rx) = crossbeam_channel::unbounded();
+        let thread = std::thread::spawn(move || {
+            // SAFETY: gettid has no preconditions.
+            let _ = tid_tx.send(unsafe { libc::gettid() });
+            let mut buf = [0u8; 64];
+            while let Some(n) = reader.read(&mut buf, &stopped) {
+                let _ = read_tx.send(buf[..n].to_vec());
+            }
+        });
+        let tid = tid_rx.recv().unwrap();
+        let switches = crate::testing::thread_switches(tid);
+        std::thread::sleep(Duration::from_millis(50));
+        let before = switches();
+        std::thread::sleep(Duration::from_millis(700));
+        assert_eq!(switches(), before, "the reader woke up while nothing happened");
+        // Output wakes it at once (the slave echoes what is typed into the master).
+        writer.write_all(b"x").unwrap();
+        let got = read_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(got.contains(&b'x'));
+        stop.stop();
+        thread.join().unwrap();
+        drop(pair.slave);
+    }
+
+    #[test]
     fn output_is_taken_in_batches_and_the_server_told_once_per_batch() {
         let pair = portable_pty::native_pty_system()
             .openpty(PtySize { rows: 5, cols: 20, pixel_width: 0, pixel_height: 0 })

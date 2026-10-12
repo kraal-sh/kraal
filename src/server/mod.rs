@@ -512,6 +512,7 @@ const WATCH_STREAMS: Duration = Duration::from_millis(1);
 
 /// Run a session server in the foreground until it is told to exit.
 pub fn run(session: &str) -> Result<()> {
+    let ready = take_ready_pipe();
     let socket = paths::socket_path(session);
     paths::private_runtime_dir().context("checking the runtime directory")?;
     if socket.exists() {
@@ -521,6 +522,12 @@ pub fn run(session: &str) -> Result<()> {
         let _ = std::fs::remove_file(&socket);
     }
     let listener = UnixListener::bind(&socket).with_context(|| format!("binding {}", socket.display()))?;
+    // Connections wait in the listener's queue from now on: the client that started this server
+    // may connect.
+    if let Some(mut ready) = ready {
+        use std::io::Write;
+        let _ = ready.write_all(b"1");
+    }
 
     let (config, mut warnings) = match Config::load() {
         Ok(c) => (c, Vec::new()),
@@ -681,6 +688,31 @@ pub fn run(session: &str) -> Result<()> {
     server.shutdown();
     let _ = std::fs::remove_file(&socket);
     result
+}
+
+/// The pipe the client that started this server waits on (see `client::ensure_server`), taken
+/// out of the environment so that nothing this server starts sees it. Only the write end of a
+/// pipe is taken: a stale or odd value names nothing to write to.
+fn take_ready_pipe() -> Option<std::fs::File> {
+    use std::os::fd::FromRawFd;
+    let value = std::env::var_os(crate::client::READY_FD_VAR)?;
+    // SAFETY: the server has not started any thread yet.
+    unsafe { std::env::remove_var(crate::client::READY_FD_VAR) };
+    let fd: libc::c_int = value.to_str()?.parse().ok().filter(|fd| *fd > 2)?;
+    // SAFETY: fstat and fcntl only look at the descriptor, and fail on one that is not open.
+    unsafe {
+        let mut st: libc::stat = std::mem::zeroed();
+        if libc::fstat(fd, &mut st) != 0 || st.st_mode & libc::S_IFMT != libc::S_IFIFO {
+            return None;
+        }
+        let flags = libc::fcntl(fd, libc::F_GETFL);
+        if flags < 0 || flags & libc::O_ACCMODE != libc::O_WRONLY {
+            return None;
+        }
+        libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
+        // SAFETY: the client gave this descriptor to this process alone.
+        Some(std::fs::File::from_raw_fd(fd))
+    }
 }
 
 impl Server {
