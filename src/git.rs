@@ -131,7 +131,7 @@ pub fn status(cwd: &Path) -> Option<GitInfo> {
 }
 
 /// `path` with its symbolic links resolved (itself when it cannot be).
-fn real_path(path: &Path) -> PathBuf {
+pub fn real_path(path: &Path) -> PathBuf {
     path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
 }
 

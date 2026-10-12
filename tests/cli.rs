@@ -2156,6 +2156,81 @@ fn a_repository_runbook_runs_only_once_approved() {
     assert!(out.status.success(), "{}", text(&out));
 }
 
+/// An approval is of a file in its repository, however the way there is spelled: through a link
+/// to the checkout or not (`/tmp` is one on macOS), on the command line or in a plan another
+/// program asks for, and in a store written by 0.3.0 under the spelling used then. A link that
+/// comes to lead to another repository carries no approval there.
+#[test]
+fn a_runbook_approval_does_not_depend_on_how_its_repository_is_reached() {
+    let env = Env::new("rblink");
+    let (ran, link) = (env.root.join("ran"), env.root.join("link"));
+    let runbook = format!("steps = [\"echo ran >> {}\"]\n", ran.display());
+    let repository = |dir: &str| {
+        let repo = env.root.join(dir).join("app");
+        let _ = git_repo(&repo, &[(".kraal/runbooks/deploy.toml", &runbook)]);
+        repo
+    };
+    let (first, second) = (repository("first"), repository("second"));
+    std::os::unix::fs::symlink(env.root.join("first"), &link).unwrap();
+    // The file where its repository really is, and as a path through the link spells it.
+    let file = |repo: &Path| repo.join(".kraal/runbooks/deploy.toml").display().to_string();
+    let (real, spelled) = (file(&first.canonicalize().unwrap()), file(&link.join("app")));
+    env.workspace("w", "layout {\n    pane name=\"main\"\n}\n");
+    env.run(&["open", "w"]);
+    let kraal = |dir: &Path, args: &[&str]| {
+        let mut c = env.cmd(&[&["runbook"], args].concat());
+        let out = c.current_dir(dir).stdin(std::process::Stdio::null()).output().unwrap();
+        (
+            out.status.success(),
+            format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr)),
+        )
+    };
+    // A plan of the file at `path`, asked for and run as another program would.
+    let run_plan = |path: &str| {
+        let request =
+            serde_json::json!({ "cmd": "runbook_plan", "path": path, "target": null, "params": [], "pane": null });
+        let plan = raw_request(&env, request);
+        let token = plan["Ok"]["data"]["token"].as_str().unwrap_or_else(|| panic!("no plan: {plan}")).to_string();
+        raw_request(&env, serde_json::json!({ "cmd": "runbook_run", "token": token }))
+    };
+    let store = env.root.join("state/kraal/trusted-runbooks.json");
+    let approved = || -> Vec<String> {
+        let store: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&store).unwrap()).unwrap();
+        store.as_object().unwrap().keys().cloned().collect()
+    };
+
+    // Approved in the checkout: approved through the link too, and recorded once.
+    let (ok, said) = kraal(&first, &["trust", "deploy"]);
+    assert!(ok, "{said}");
+    assert_eq!(approved(), std::slice::from_ref(&real));
+    let answer = run_plan(&spelled);
+    assert!(answer["Ok"].is_object(), "{answer}");
+    let (ok, said) = kraal(&link.join("app"), &["run", "deploy", "--yes", "--wait"]);
+    assert!(ok, "{said}");
+
+    // A store written by 0.3.0 under the spelling through the link still approves the file; the
+    // next approval leaves the file one entry, under its real place.
+    let mut written = serde_json::Map::new();
+    written.insert(spelled.clone(), serde_json::Value::String(runbook.clone()));
+    std::fs::write(&store, serde_json::Value::Object(written).to_string()).unwrap();
+    let (ok, said) = kraal(&first, &["run", "deploy", "--yes", "--wait"]);
+    assert!(ok, "{said}");
+    let answer = run_plan(&real);
+    assert!(answer["Ok"].is_object(), "{answer}");
+    let (ok, said) = kraal(&first, &["trust", "deploy"]);
+    assert!(ok, "{said}");
+    assert_eq!(approved(), std::slice::from_ref(&real));
+
+    // The link comes to lead to another repository, with the same file: nothing is approved
+    // there.
+    std::fs::remove_file(&link).unwrap();
+    std::os::unix::fs::symlink(second.parent().unwrap(), &link).unwrap();
+    let answer = run_plan(&spelled);
+    assert!(answer["Err"].as_str().is_some_and(|e| e.contains("is not approved")), "{answer}");
+    let (ok, said) = kraal(&link.join("app"), &["run", "deploy", "--yes", "--wait"]);
+    assert!(!ok && said.contains("is not approved"), "{said}");
+}
+
 /// In a terminal, `kraal runbook run` asks before a repository runbook nobody approved: the
 /// question shows the file, with what a terminal would hide written out, names the approval,
 /// and comes before the plan's.

@@ -23,7 +23,7 @@ use crate::worktree_setup::visible;
 pub enum Source {
     /// `~/.config/kraal/runbooks`.
     User,
-    /// `<repository>/.kraal/runbooks`.
+    /// `<repository>/.kraal/runbooks`: the repository, where it really is ([`load`]).
     Repo(PathBuf),
 }
 
@@ -32,6 +32,7 @@ pub struct Runbook {
     /// The file name without its extension; `<repo>/<name>` for a repository's runbook named
     /// like one of the user's ([`all`]).
     pub name: String,
+    /// The file: a repository's in that repository's real directory ([`load`]).
     pub path: PathBuf,
     pub source: Source,
     /// The file as read, to know whether a repository runbook changed since it was trusted.
@@ -313,7 +314,19 @@ pub fn repo_dir(root: &Path) -> PathBuf {
 /// a FIFO, a huge file), which must not hang or exhaust the server that lists them.
 const RUNBOOK_MAX: u64 = 1 << 20;
 
+/// The runbook in the file at `path`. A repository's is known by its place in the real directory
+/// of its repository, however the way there was spelled (through a link, `/tmp` on macOS): what
+/// is approved, read and run is one file in one place, which a link that changes later cannot
+/// turn into another.
 pub fn load(path: &Path, source: Source) -> Result<Runbook> {
+    let (path, source) = match (source, path.file_name()) {
+        (Source::Repo(root), Some(file)) => {
+            let root = crate::git::real_path(&root);
+            (repo_dir(&root).join(file), Source::Repo(root))
+        }
+        (source, _) => (path.to_path_buf(), source),
+    };
+    let path = path.as_path();
     let content = paths::read_regular_text(path, RUNBOOK_MAX).with_context(|| format!("reading {}", path.display()))?;
     let name = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
     let body = match path.extension().and_then(|e| e.to_str()) {
@@ -434,9 +447,10 @@ pub fn command(shell: &str, script: &str) -> String {
     if shell == "sh" { script.to_string() } else { format!("exec {} -c {}", shell::quote(shell), shell::quote(script)) }
 }
 
-// ---- trusting repository runbooks -------------------------------------------------------
+// ---- trusting repository files ----------------------------------------------------------
 
-/// The repository files the user approved, by path, each with the exact content approved.
+/// The repository files the user approved, by path ([`approval_key`]), each with the exact
+/// content approved.
 fn trust_path() -> PathBuf {
     paths::state_dir().join("trusted-runbooks.json")
 }
@@ -445,16 +459,42 @@ fn trust_store() -> BTreeMap<String, String> {
     std::fs::read_to_string(trust_path()).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default()
 }
 
+/// What the approval of `file` (its path inside its repository: `.kraal/…`) of the repository
+/// in the real directory `repo` is recorded under: one path for one file, whichever way a
+/// caller came to it. What is inside the repository is not resolved: the file is that
+/// repository's wherever its `.kraal` leads.
+fn approval_key(repo: &Path, file: &Path) -> String {
+    repo.join(file).display().to_string()
+}
+
+/// Whether the store's `key` names `file` of the repository in the real directory `repo` under
+/// another spelling of the way there: what 0.3.0 recorded when it was reached through a link.
+fn other_spelling(key: &str, repo: &Path, file: &Path) -> bool {
+    let key = Path::new(key);
+    // The directory the key gives the repository: what comes before the file's place in it.
+    let spelled = key.ancestors().nth(file.components().count()).filter(|_| key.ends_with(file));
+    spelled.is_some_and(|spelled| spelled != repo && crate::git::real_path(spelled) == repo)
+}
+
 /// Whether this exact content of a repository runbook was approved before.
 pub fn trusted(r: &Runbook) -> bool {
     match &r.source {
         Source::User => true,
-        Source::Repo(_) => trusted_content(&r.path, &r.content),
+        Source::Repo(root) => trusted_content(root, file_in_repo(r, root), &r.content),
     }
 }
 
+/// Approve this content of a repository runbook.
 pub fn trust(r: &Runbook) -> Result<()> {
-    trust_content(&r.path, &r.content)
+    match &r.source {
+        Source::User => Ok(()),
+        Source::Repo(root) => trust_content(root, file_in_repo(r, root), &r.content),
+    }
+}
+
+/// Where a runbook of the repository `root` is inside it (`.kraal/runbooks/deploy.toml`).
+fn file_in_repo<'a>(r: &'a Runbook, root: &Path) -> &'a Path {
+    r.path.strip_prefix(root).unwrap_or(&r.path)
 }
 
 /// Why the runbook `name` of the repository `root` does not run, and how to approve it: said
@@ -467,21 +507,31 @@ pub fn not_approved(name: &str, root: &Path) -> String {
     )
 }
 
-/// Whether this exact content of the repository file `path` (a runbook, a worktree setup) was
-/// approved before.
-pub fn trusted_content(path: &Path, content: &str) -> bool {
-    trust_store().get(&path.display().to_string()).is_some_and(|c| c == content)
+/// Whether this exact content of `file` (its path inside its repository: a runbook, the
+/// worktree setup) of the repository `repo` was approved before. The repository is the one in
+/// the directory `repo` really is, however it is spelled: an approval never depends on the
+/// way taken to the file, and never goes to another repository a link came to lead to.
+pub fn trusted_content(repo: &Path, file: &Path, content: &str) -> bool {
+    let (repo, store) = (crate::git::real_path(repo), trust_store());
+    store.get(&approval_key(&repo, file)).is_some_and(|approved| approved == content)
+        // Recorded by 0.3.0 under the spelling used then: it counts while that spelling leads
+        // here, as it did for 0.3.0. Only entries of this very content are looked at.
+        || store.iter().any(|(key, approved)| approved == content && other_spelling(key, &repo, file))
 }
 
-/// Approve this content of the repository file `path`: it runs from now on without asking.
-pub fn trust_content(path: &Path, content: &str) -> Result<()> {
+/// Approve this content of `file` of the repository `repo` ([`trusted_content`]): it runs from
+/// now on without asking. The file has one approved content: what was recorded for it under
+/// another spelling goes.
+pub fn trust_content(repo: &Path, file: &Path, content: &str) -> Result<()> {
+    let repo = crate::git::real_path(repo);
     let store_path = trust_path();
     if let Some(dir) = store_path.parent() {
         paths::ensure_private_dir(dir)?;
     }
     paths::locked(&store_path, || {
         let mut store = trust_store();
-        store.insert(path.display().to_string(), content.to_string());
+        store.retain(|key, _| !other_spelling(key, &repo, file));
+        store.insert(approval_key(&repo, file), content.to_string());
         paths::write_private(&store_path, serde_json::to_string_pretty(&store)?.as_bytes())?;
         Ok(())
     })?
@@ -987,5 +1037,46 @@ mod tests {
         assert_eq!(Source::User.shown(content), content, "the user's own file is shown as it is");
         let shown = Source::Repo(PathBuf::from("/repo")).shown(content);
         assert_eq!(shown, "# Notes\n```sh\nrm -rf ~ \\u{1b}[2K\\rls\n\\u{202e}dne\n```\n");
+    }
+
+    #[test]
+    fn a_repository_runbook_is_known_by_its_real_place() {
+        let dir = std::env::temp_dir().join(format!("kraal-rb-real-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        for repo in ["real/app", "other/app"] {
+            std::fs::create_dir_all(repo_dir(&dir.join(repo))).unwrap();
+            std::fs::write(repo_dir(&dir.join(repo)).join("deploy.toml"), "steps = [\"true\"]\n").unwrap();
+        }
+        std::os::unix::fs::symlink(dir.join("real"), dir.join("link")).unwrap();
+        let (real, other) =
+            (dir.join("real/app").canonicalize().unwrap(), dir.join("other/app").canonicalize().unwrap());
+        let spelled = dir.join("link/app");
+        // Read through the link: the repository and the file are where they really are.
+        let through = repo_dir(&spelled).join("deploy.toml");
+        let r = load(&through, source_of(&through)).unwrap();
+        assert_eq!(
+            (r.source.clone(), r.path.clone()),
+            (Source::Repo(real.clone()), repo_dir(&real).join("deploy.toml"))
+        );
+        let file = file_in_repo(&r, &real);
+        assert_eq!(file, Path::new(".kraal/runbooks/deploy.toml"));
+        assert_eq!(approval_key(&real, file), r.path.display().to_string());
+        // A key written through the link names this file; no other key does.
+        assert!(other_spelling(&approval_key(&spelled, file), &real, file));
+        let others = [
+            approval_key(&real, file),
+            approval_key(&other, file),
+            approval_key(&spelled, Path::new(".kraal/runbooks/other.toml")),
+            approval_key(&spelled, Path::new(".kraal/worktree.toml")),
+            approval_key(&dir.join("gone/app"), file),
+        ];
+        for key in others {
+            assert!(!other_spelling(&key, &real, file), "{key}");
+        }
+        // The link comes to lead elsewhere: what was written through it names this file no more.
+        std::fs::remove_file(dir.join("link")).unwrap();
+        std::os::unix::fs::symlink(dir.join("other"), dir.join("link")).unwrap();
+        assert!(!other_spelling(&approval_key(&spelled, file), &real, file));
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

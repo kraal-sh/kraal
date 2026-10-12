@@ -91,6 +91,10 @@ act of its own:
 new or changed is refused, and the message names the command that approves it. Listing a runbook,
 showing it and `--dry-run` only read its file.
 
+An approval is of that file in that repository, where the repository really is: reaching the
+checkout through a link changes nothing, and a link that comes to lead to another checkout takes
+no approval there.
+
 What runs is the plan you read, kept for ten minutes: a runbook edited meanwhile does not change
 it, and the run is refused when a pane it targets has moved (another server, another directory)
 or gone since.
