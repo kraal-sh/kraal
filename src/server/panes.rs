@@ -365,9 +365,12 @@ impl Server {
             for c in ids {
                 self.send_msg(c, &ServerMsg::exit("all panes closed"));
             }
-            let _ = self.persister.send(super::persistence::Persist::Delete(self.session.clone()));
-            self.persisted = None;
-            self.persist_dirty = false;
+            // Nothing is left to restore, unless workspaces this server could not restore are.
+            if self.unrestored.is_empty() {
+                let _ = self.persister.send(super::persistence::Persist::Delete(self.session.clone()));
+                self.persisted = None;
+                self.persist_dirty = false;
+            }
             self.quitting = true;
             return;
         }

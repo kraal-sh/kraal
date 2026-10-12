@@ -150,6 +150,31 @@ pub fn session_members(sid: libc::pid_t) -> Vec<libc::pid_t> {
     imp::session_members(sid)
 }
 
+/// The jobs left in the background of the terminal of the session `leader` leads (a shell's
+/// `&`): the process groups of the session, but the leader's own and the one in the terminal's
+/// foreground, with processes that have the terminal open; each by the command line of one of
+/// those, its leader when it is one. Hanging the session up stops them. What keeps off the
+/// terminal (a prompt's daemon, `nohup`) is no job of the user's.
+pub fn background_jobs(leader: u32) -> Vec<Vec<String>> {
+    let (Ok(sid), Some(terminal)) = (libc::pid_t::try_from(leader), imp::terminal_of(leader)) else {
+        return Vec::new();
+    };
+    let foreground = foreground_group(leader).and_then(|g| libc::pid_t::try_from(g).ok());
+    // The process shown for each job, by group.
+    let mut shown: std::collections::BTreeMap<libc::pid_t, libc::pid_t> = Default::default();
+    for pid in session_members(sid) {
+        let Some(group) = imp::group_of(pid).filter(|g| *g != sid && Some(*g) != foreground) else { continue };
+        if !imp::open_files(pid as u32).contains(&terminal) {
+            continue;
+        }
+        let process = shown.entry(group).or_insert(pid);
+        if pid == group {
+            *process = pid;
+        }
+    }
+    shown.into_values().filter_map(|pid| argv(pid as u32)).collect()
+}
+
 /// Whether a process with this id exists, zombies included.
 #[cfg_attr(target_os = "linux", allow(dead_code))]
 fn exists(pid: libc::pid_t) -> bool {
@@ -295,6 +320,19 @@ mod imp {
                 (session == sid && !matches!(fields[0], b"Z" | b"X")).then_some(pid)
             })
             .collect()
+    }
+
+    pub fn group_of(pid: libc::pid_t) -> Option<libc::pid_t> {
+        // After the command name: state, parent, process group.
+        let stat = std::fs::read(format!("/proc/{pid}/stat")).ok()?;
+        let end = stat.iter().rposition(|b| *b == b')')?;
+        let rest = String::from_utf8_lossy(&stat[end + 1..]).into_owned();
+        rest.split_whitespace().nth(2)?.parse().ok()
+    }
+
+    /// The terminal a pane's program runs on: its standard input.
+    pub fn terminal_of(pid: u32) -> Option<PathBuf> {
+        std::fs::read_link(format!("/proc/{pid}/fd/0")).ok().filter(|t| t.starts_with("/dev/"))
     }
 
     pub fn group_running(pgid: libc::pid_t) -> bool {
@@ -501,6 +539,10 @@ mod imp {
             .collect()
     }
 
+    pub fn group_of(pid: libc::pid_t) -> Option<libc::pid_t> {
+        short_info(pid).and_then(|info| libc::pid_t::try_from(info.pbsi_pgid).ok())
+    }
+
     pub fn group_running(pgid: libc::pid_t) -> bool {
         let mut pids = vec![0 as libc::pid_t; 1024];
         let size = (pids.len() * std::mem::size_of::<libc::pid_t>()) as libc::c_int;
@@ -525,7 +567,8 @@ mod imp {
         })
     }
 
-    pub fn start_time(pid: u32) -> Option<u64> {
+    /// The kernel's description of a process, when it gives one.
+    fn bsd_info(pid: u32) -> Option<libc::proc_bsdinfo> {
         let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
         let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
         // SAFETY: proc_pidinfo writes at most `size` bytes into `info`.
@@ -538,23 +581,32 @@ mod imp {
                 size,
             )
         };
-        (n == size).then(|| info.pbi_start_tvsec * 1_000_000 + info.pbi_start_tvusec)
+        (n == size).then_some(info)
+    }
+
+    pub fn start_time(pid: u32) -> Option<u64> {
+        bsd_info(pid).map(|info| info.pbi_start_tvsec * 1_000_000 + info.pbi_start_tvusec)
     }
 
     pub fn foreground_group(pid: u32) -> Option<u32> {
-        let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
-        let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
-        // SAFETY: proc_pidinfo writes at most `size` bytes into `info`.
-        let n = unsafe {
-            libc::proc_pidinfo(
-                pid as libc::c_int,
-                libc::PROC_PIDTBSDINFO,
-                0,
-                (&mut info as *mut libc::proc_bsdinfo).cast::<libc::c_void>(),
-                size,
-            )
-        };
-        (n == size).then_some(info.e_tpgid)
+        bsd_info(pid).map(|info| info.e_tpgid)
+    }
+
+    /// The terminal a process runs on: its controlling terminal.
+    pub fn terminal_of(pid: u32) -> Option<PathBuf> {
+        let tdev = bsd_info(pid)?.e_tdev;
+        // No terminal: NODEV.
+        if tdev == u32::MAX {
+            return None;
+        }
+        // SAFETY: devname gives a pointer to a NUL-terminated name it keeps, or null.
+        let name = unsafe { libc::devname(tdev as libc::dev_t, libc::S_IFCHR) };
+        if name.is_null() {
+            return None;
+        }
+        // SAFETY: not null, NUL-terminated, read before any other call to devname.
+        let name = unsafe { std::ffi::CStr::from_ptr(name) };
+        Some(Path::new("/dev").join(name.to_str().ok()?))
     }
 
     pub fn machine_id() -> Option<String> {
@@ -676,6 +728,14 @@ mod imp {
 
     pub fn group_running(_pgid: libc::pid_t) -> bool {
         true
+    }
+
+    pub fn group_of(_pid: libc::pid_t) -> Option<libc::pid_t> {
+        None
+    }
+
+    pub fn terminal_of(_pid: u32) -> Option<PathBuf> {
+        None
     }
 
     pub fn session_members(_sid: libc::pid_t) -> Vec<libc::pid_t> {

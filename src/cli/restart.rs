@@ -5,6 +5,7 @@
 use std::collections::HashMap;
 use std::io::{BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 
@@ -13,7 +14,8 @@ use crate::protocol::{self, Request, Response};
 use crate::{client, paths, persist, process};
 
 /// `kraal restart`: say what stops, ask, then restart. Inside one of the session's panes, which
-/// the restart closes, a helper of its own does it.
+/// the restart closes, a helper of its own does it, and this command stays until then: the
+/// pane, were it the session's last, would end the session first, its layout deleted.
 pub(super) fn restart(s: &Session, yes: bool) -> Result<()> {
     let session = &s.name;
     let socket = paths::socket_path(session);
@@ -37,8 +39,14 @@ pub(super) fn restart(s: &Session, yes: bool) -> Result<()> {
         }
     }
     if inside(session) {
-        client::restart_detached(&client::installed_exe()?, session)?;
+        let mut helper = client::restart_detached(&client::installed_exe()?, session)?;
         println!("restarting session {session}…");
+        // Every step of the helper has a deadline. The server ends this command with its pane
+        // once the restart has the session.
+        if !helper.wait()?.success() {
+            bail!("session {session} was not restarted; see {}", paths::log_path(session).display());
+        }
+        println!("restarted session {session}");
         return Ok(());
     }
     let saved = client::restart_server(session)?;
@@ -122,30 +130,43 @@ impl Running {
         }
     }
 
-    /// What restarting it stops, a line per pane. The pane this command runs in is left out:
-    /// it comes back as it is.
+    /// What restarting it stops, a line per program. The pane this command runs in is left
+    /// out: it comes back as it is.
     fn stops(&self) -> Vec<String> {
         let unknown = || vec!["whatever runs in its panes (its server does not say)".to_string()];
         let Some((pid, _)) = &self.server else { return unknown() };
-        let Ok(Response::Panes(panes)) = client::request(&self.socket, Request::ListPanes) else { return unknown() };
+        let listed = client::request_within(&self.socket, Request::ListPanes, LIST_PANES_TIMEOUT);
+        let Ok(Response::Panes(panes)) = listed else { return unknown() };
         let own = own_pane(&self.name);
-        let programs = pane_programs(*pid, &self.socket);
-        panes
-            .iter()
-            .filter(|p| Some(p.id) != own)
-            .filter_map(|p| {
-                let what = persist::stops_on_restart(p, programs.get(&p.id).map(Vec::as_slice))?;
-                Some(persist::stopping_line(p, &what))
-            })
-            .collect()
+        let running = in_panes(*pid, &self.socket);
+        let mut lines = Vec::new();
+        for p in panes.iter().filter(|p| Some(p.id) != own) {
+            let here = running.get(&p.id);
+            let program = here.and_then(|r| r.program.as_deref());
+            let jobs = here.map_or(&[][..], |r| &r.jobs);
+            for what in persist::stops_on_restart(p, program, jobs) {
+                lines.push(persist::stopping_line(p, &what));
+            }
+        }
+        lines
     }
 }
 
-/// What runs in each pane of the server `server` (listening on `socket`), by pane id, when it is
-/// not a shell waiting at its prompt: the program in the foreground of the pane's terminal, or
-/// the pane's own program. Read from the processes, which every kraal version starts the same
-/// way, so that a server older than this question is asked nothing it cannot answer.
-fn pane_programs(server: u32, socket: &Path) -> HashMap<u32, Vec<String>> {
+/// How long the server of a session to restart has to list its panes.
+const LIST_PANES_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// What runs in a pane besides a shell at its prompt.
+struct InPane {
+    /// The program in the foreground of its terminal, or the pane's own program.
+    program: Option<Vec<String>>,
+    /// The jobs in the background of its terminal.
+    jobs: Vec<Vec<String>>,
+}
+
+/// What runs in each pane of the server `server` (listening on `socket`), by pane id. Read from
+/// the processes, which every kraal version starts the same way, so that a server older than
+/// this question is asked nothing it cannot answer.
+fn in_panes(server: u32, socket: &Path) -> HashMap<u32, InPane> {
     use std::os::unix::fs::MetadataExt;
     let Ok(listening) = std::fs::metadata(socket) else { return HashMap::new() };
     let ours =
@@ -163,9 +184,7 @@ fn pane_programs(server: u32, socket: &Path) -> HashMap<u32, Vec<String>> {
             Some(group) => process::argv(group),
             None => process::argv(pid).filter(|argv| !crate::pane::is_shell(&argv[0])),
         };
-        if let Some(argv) = program {
-            out.insert(id, argv);
-        }
+        out.insert(id, InPane { program, jobs: process::background_jobs(pid) });
     }
     out
 }

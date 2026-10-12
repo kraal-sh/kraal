@@ -343,29 +343,63 @@ pub fn locked<T>(path: &Path, f: impl FnOnce() -> T) -> std::io::Result<T> {
     let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
     let lock =
         std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(dir.join(format!(".{name}.lock")))?;
-    #[cfg(unix)]
-    {
-        use std::os::fd::AsRawFd;
-        // Another kraal holds it for a moment at most; never wait for good.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
-        // SAFETY: flock on a descriptor we own; released when `lock` is closed.
-        while unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-            let e = std::io::Error::last_os_error();
-            if e.kind() != std::io::ErrorKind::WouldBlock && e.kind() != std::io::ErrorKind::Interrupted {
-                return Err(e);
-            }
-            if std::time::Instant::now() > deadline {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::TimedOut,
-                    format!("another kraal is changing {}; try again", path.display()),
-                ));
-            }
-            std::thread::sleep(std::time::Duration::from_millis(20));
+    // Another kraal holds it for a moment at most; never wait for good.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    while !try_lock(&lock)? {
+        if std::time::Instant::now() > deadline {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!("another kraal is changing {}; try again", path.display()),
+            ));
         }
+        std::thread::sleep(std::time::Duration::from_millis(20));
     }
     let out = f();
     drop(lock);
     Ok(out)
+}
+
+/// Lock `file` for this process alone, without waiting: false when another holds it. The lock
+/// goes when the file is closed, by this process or as it ends, however it ends.
+fn try_lock(file: &std::fs::File) -> std::io::Result<bool> {
+    use std::os::fd::AsRawFd;
+    loop {
+        // SAFETY: flock on a descriptor we own.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+            return Ok(true);
+        }
+        let e = std::io::Error::last_os_error();
+        match e.kind() {
+            std::io::ErrorKind::WouldBlock => return Ok(false),
+            std::io::ErrorKind::Interrupted => continue,
+            _ => return Err(e),
+        }
+    }
+}
+
+/// A session held by one process: its server, from before it listens until it is gone, or
+/// `kraal forget` while it deletes what the session saved. A session so never has two servers,
+/// nor loses its files to `forget` while a server restores them, which a check that its socket
+/// answers cannot promise (a server not listening yet, a socket deleted).
+pub struct SessionLock {
+    /// Locked while open.
+    _file: std::fs::File,
+}
+
+impl SessionLock {
+    /// Hold `session`, unless another process does (`None`).
+    pub fn acquire(session: &str) -> std::io::Result<Option<SessionLock>> {
+        use std::os::unix::fs::OpenOptionsExt;
+        let path = private_runtime_dir()?.join(format!("{session}.lock"));
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(path)?;
+        Ok(try_lock(&file)?.then_some(SessionLock { _file: file }))
+    }
 }
 
 /// The socket of `session`: where its server listens, or a new one will. A server an older kraal

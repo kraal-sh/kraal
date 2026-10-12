@@ -494,6 +494,8 @@ pub struct Server {
     persisted: Option<Vec<u8>>,
     /// What is saved of each pane's scrollback.
     pub scrollback: HashMap<PaneId, persist::SavedScrollback>,
+    /// The saved workspaces that could not be restored: saved again as they were.
+    pub unrestored: Vec<persist::WorkspaceSnap>,
     /// Starts the names of the scrollback files this server makes, so that none is a file an
     /// earlier server's state names.
     scrollback_tag: String,
@@ -578,7 +580,12 @@ pub fn run(session: &str) -> Result<()> {
     crate::pane::reserve_descriptors();
     let socket = paths::socket_path(session);
     paths::private_runtime_dir().context("checking the runtime directory")?;
+    // Held until this server is gone: the socket, and the session's files, are its alone.
+    let _held = paths::SessionLock::acquire(session)
+        .context("locking the session")?
+        .with_context(|| format!("another kraal holds session {session:?}: its server, or kraal forget"))?;
     if socket.exists() {
+        // A server an older kraal started holds no lock.
         if UnixStream::connect(&socket).is_ok() {
             anyhow::bail!("session {session:?} is already running");
         }
@@ -752,6 +759,7 @@ pub fn run(session: &str) -> Result<()> {
         persisting,
         persisted: None,
         scrollback: HashMap::new(),
+        unrestored: Vec::new(),
         scrollback_tag: format!("{}-{}", crate::accounts::now(), std::process::id()),
         run_logs: {
             let warn = logs_tx;
@@ -1540,18 +1548,7 @@ impl Server {
 
     fn shutdown(&mut self) {
         self.end_edits();
-        // The last state goes through the writer, after anything it still has to write (the
-        // panes' scrollback first), and the server waits for it.
-        self.save_scrollback(true);
-        self.persist();
-        self.save_buffers(true);
-        let (done, written) = crossbeam_channel::bounded(1);
-        let saved = match self.persister.send(persistence::Persist::Stop(done)) {
-            Ok(()) => written
-                .recv_timeout(Duration::from_secs(10))
-                .unwrap_or_else(|_| Err("the layout could not be saved: its writer did not finish in time".into())),
-            Err(_) => Err("the layout could not be saved: its writer is gone".into()),
-        };
+        let saved = self.save_now();
         if let Err(e) = &saved {
             eprintln!("kraal: {e}");
         }

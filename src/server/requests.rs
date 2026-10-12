@@ -375,10 +375,16 @@ impl Server {
                 self.paste_buffer_to(p, buffer.as_deref())
             }),
             Request::BufferDelete { buffer, all } => self.delete_buffer(buffer.as_deref(), all),
-            // Answered when the server stops, once its last state is written or has failed to
-            // be: `kraal kill` then says whether the layout a restart brings back is saved.
             Request::ReloadConfig => self.reload_config().map(|warnings| Response::Text(warnings.join("\n"))),
+            // Answered when the server stops, once its last state is written or has failed to
+            // be: `kraal kill` then says whether the layout a restart brings back is saved. A
+            // restart stops every program only once that layout is on disk.
             Request::KillServer { restart } => {
+                if restart && let Err(e) = self.save_now() {
+                    let why = format!("not restarting: {e}");
+                    self.warnings.push(why.clone());
+                    return Some(Err(why));
+                }
                 self.quitting = true;
                 self.restarting |= restart;
                 self.kill_waiters.push(client);

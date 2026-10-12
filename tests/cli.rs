@@ -304,6 +304,48 @@ fn wait_gone(path: &Path) {
     }
 }
 
+/// Wait until `done`, failing the test with `what` after `limit`.
+fn wait_until(limit: Duration, what: &str, mut done: impl FnMut() -> bool) {
+    let start = Instant::now();
+    while !done() {
+        assert!(start.elapsed() < limit, "{what}");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// How `child` ended and what it printed, once it has: still running after `limit`, it is
+/// killed and the test fails.
+fn finish(mut child: std::process::Child, limit: Duration) -> Output {
+    let start = Instant::now();
+    while child.try_wait().unwrap().is_none() {
+        if start.elapsed() > limit {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("still running after {limit:?}");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    child.wait_with_output().unwrap()
+}
+
+/// A process this test stopped (SIGSTOP), continued when the test ends, however it ends.
+struct Stopped(libc::pid_t);
+
+impl Stopped {
+    fn stop(pid: libc::pid_t) -> Stopped {
+        // SAFETY: plain syscall to a process this test started.
+        assert_eq!(unsafe { libc::kill(pid, libc::SIGSTOP) }, 0);
+        Stopped(pid)
+    }
+}
+
+impl Drop for Stopped {
+    fn drop(&mut self) {
+        // SAFETY: plain syscall to a process this test started.
+        unsafe { libc::kill(self.0, libc::SIGCONT) };
+    }
+}
+
 #[test]
 fn run_send_read_and_close() {
     let env = Env::new("basic");
@@ -1013,6 +1055,126 @@ fn kill_says_when_the_layout_was_not_saved() {
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(!out.status.success() && err.contains("could not be saved"), "{err}");
     assert!(env.server_pid().is_none(), "the server stopped anyway");
+}
+
+/// A session has one server: another one started for it while it runs refuses to, even when
+/// the first one's socket is gone (a cleaner of /tmp may remove it), so that two servers never
+/// write the same session.
+#[test]
+fn a_session_never_has_two_servers() {
+    let env = Env::new("oneserver");
+    env.workspace("w", "layout {\n    pane name=\"one\"\n}\n");
+    env.run(&["open", "w"]);
+    let first = env.server_pid().expect("the server runs");
+    let socket = env.root.join("run/kraal/oneserver.sock");
+    let aside = env.root.join("run/kraal/aside.sock");
+    std::fs::rename(&socket, &aside).unwrap();
+    let second = env.cmd(&["server"]).stderr(std::process::Stdio::piped()).spawn().unwrap();
+    let out = finish(second, Duration::from_secs(10));
+    std::fs::rename(&aside, &socket).unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success() && err.contains("holds session \"oneserver\""), "{err}");
+    assert_eq!(env.server_pid(), Some(first));
+    env.run(&["panes"]);
+}
+
+/// `kraal forget` deletes nothing of a session whose server runs, even one whose socket is gone:
+/// a server holds its session, and `forget` must hold it too.
+#[test]
+fn forget_leaves_a_running_session_alone() {
+    let env = Env::new("forgetheld");
+    env.workspace("w", "layout {\n    pane name=\"one\"\n}\n");
+    env.run(&["open", "w"]);
+    wait_until(Duration::from_secs(10), "the layout was never saved", || env.state_file().exists());
+    let socket = env.root.join("run/kraal/forgetheld.sock");
+    let aside = env.root.join("run/kraal/aside.sock");
+    std::fs::rename(&socket, &aside).unwrap();
+    let out = env.try_run(&["forget"]);
+    std::fs::rename(&aside, &socket).unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success() && err.contains("is running"), "{err}");
+    assert!(env.state_file().exists(), "the layout was deleted");
+}
+
+/// A workspace that cannot be restored (its shell is gone) stays saved as it was, scrollback
+/// included, while the server saves the others; it comes back once it can.
+#[test]
+fn a_workspace_that_cannot_be_restored_stays_saved() {
+    let env = Env::new("unrestored");
+    env.workspace("shells", "layout {\n    pane name=\"shell\"\n}\n");
+    env.workspace("jobs", "layout {\n    pane name=\"job\" command=\"sh\" { args \"-c\" \"exec sleep 4246\"; }\n}\n");
+    env.run(&["open", "shells"]);
+    env.run(&["open", "jobs"]);
+    env.run(&["send", "-p", "shell", "--enter", "echo kept-$((4*4))"]);
+    env.wait_for_text("shell", "kept-16");
+    env.run(&["kill"]);
+    let names = || -> Vec<String> {
+        let panes: serde_json::Value = serde_json::from_str(&env.run(&["panes", "--json"])).unwrap();
+        panes.as_array().unwrap().iter().map(|p| p["name"].as_str().unwrap_or_default().to_string()).collect()
+    };
+    // Without its shell, that workspace cannot come back; the other one does, and is saved.
+    let shell = env.root.join("sh");
+    let away = env.root.join("sh.away");
+    std::fs::rename(&shell, &away).unwrap();
+    env.run(&["open", "jobs"]);
+    assert_eq!(names(), ["job"]);
+    env.run(&["kill"]);
+    let state = std::fs::read_to_string(env.state_file()).unwrap();
+    assert!(state.contains("\"shells\""), "the workspace was dropped: {state}");
+    std::fs::rename(&away, &shell).unwrap();
+    env.run(&["open", "jobs"]);
+    let mut back = names();
+    back.sort();
+    assert_eq!(back, ["job", "shell"]);
+    env.wait_for_text("shell", "kept-16");
+}
+
+/// A restart stops the session's programs only once the layout it brings back is saved: when it
+/// cannot be, the session keeps running as it is, and the restart says why.
+#[test]
+fn a_restart_that_cannot_save_the_session_leaves_it_running() {
+    use std::os::unix::fs::PermissionsExt;
+    let env = Env::new("unsavedrestart");
+    env.workspace("w", "layout {\n    pane name=\"one\"\n}\n");
+    env.run(&["open", "w"]);
+    wait_until(Duration::from_secs(10), "the layout was never saved", || env.state_file().exists());
+    let pid = env.server_pid().expect("the server runs");
+    let sessions = env.root.join("state/kraal/sessions");
+    std::fs::set_permissions(&sessions, std::fs::Permissions::from_mode(0o500)).unwrap();
+    // A pane opened since the last save: the layout on disk is not the session's any more.
+    env.run(&["run", "--name", "two", "--target", "one", "--", "sh"]);
+    let out = env.try_run(&["restart", "--yes"]);
+    std::fs::set_permissions(&sessions, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success() && err.contains("not restarting: the layout could not be saved"), "{err}");
+    assert_eq!(env.server_pid(), Some(pid), "the session stopped");
+    // Once it can be saved, the restart brings back the pane opened since.
+    let said = env.run(&["restart", "--yes"]);
+    assert!(said.contains("restarted session unsavedrestart"), "{said}");
+    assert_ne!(env.server_pid(), Some(pid));
+    assert!(env.run(&["panes"]).contains("two"));
+}
+
+/// `kraal kill` and `kraal restart` give up on a server that does not answer (stopped, here) in
+/// a bounded time, instead of waiting for it for good.
+#[test]
+fn stopping_a_server_that_does_not_answer_gives_up_in_time() {
+    let env = Env::new("frozen");
+    env.workspace("w", "layout {\n    pane name=\"one\"\n}\n");
+    env.run(&["open", "w"]);
+    let stopped = Stopped::stop(env.server_pid().expect("the server runs"));
+    let quiet = |args: &[&str]| {
+        let mut c = env.cmd(args);
+        c.stdout(std::process::Stdio::null()).stderr(std::process::Stdio::piped());
+        c.spawn().unwrap()
+    };
+    let (kill, restart) = (quiet(&["kill"]), quiet(&["restart", "--yes"]));
+    let outs = [finish(kill, Duration::from_secs(60)), finish(restart, Duration::from_secs(60))];
+    drop(stopped);
+    for out in outs {
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(!out.status.success() && err.contains("is still running after"), "{err}");
+    }
 }
 
 #[test]
@@ -4507,6 +4669,78 @@ fn restart_keeps_the_session_and_brings_its_clients_back() {
     attached();
     let _ = client.kill();
     let _ = client.wait();
+}
+
+/// A restart run in place of the shell of the session's last pane (`exec`): the command stays
+/// until the restart has the session, which would otherwise end with that pane, its layout
+/// deleted, and the session comes back.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_restart_from_the_last_pane_outlives_it() {
+    let env = Env::new("lastpane");
+    env.workspace("w", "layout {\n    pane name=\"only\"\n}\n");
+    env.run(&["open", "w"]);
+    let pidfile = env.root.join("pane.pid");
+    env.run(&["send", "-p", "only", "--enter", &format!("echo $$ > '{}'", pidfile.display())]);
+    let mut pane = PathBuf::new();
+    wait_until(Duration::from_secs(10), "the shell never said its pid", || {
+        let pid = std::fs::read_to_string(&pidfile).unwrap_or_default();
+        pane = PathBuf::from(format!("/proc/{}", pid.trim()));
+        pid.ends_with('\n')
+    });
+    let cmdline = |process: &Path| std::fs::read(process.join("cmdline")).unwrap_or_default();
+    let kraal = env!("CARGO_BIN_EXE_kraal");
+    let go = env.root.join("go");
+    let line = format!("while [ ! -e '{}' ]; do sleep 0.1; done; exec '{kraal}' restart --yes", go.display());
+    env.run(&["send", "-p", "only", "--enter", &line]);
+    // With the server stopped, the restart waits for it, and nothing can end the command in the
+    // pane meanwhile but the command itself.
+    let server = env.server_pid().expect("the server runs");
+    let stopped = Stopped::stop(server);
+    std::fs::write(&go, "").unwrap();
+    let helper = [kraal.as_bytes(), b"\0-s\0lastpane\0restart\0--yes\0"].concat();
+    let started = || std::fs::read_dir("/proc").unwrap().flatten().any(|e| cmdline(&e.path()) == helper);
+    wait_until(Duration::from_secs(20), "the restart never started", started);
+    let command = [kraal.as_bytes(), b"\0restart\0--yes\0"].concat();
+    for _ in 0..30 {
+        assert_eq!(cmdline(&pane), command, "the command left the pane before the restart had the session");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    drop(stopped);
+    wait_until(Duration::from_secs(30), "the session did not come back", || {
+        env.server_pid().is_some_and(|p| p != server)
+    });
+    assert!(env.run(&["panes"]).contains("only"));
+}
+
+/// A job left in the background of a shell stops with a restart (the terminal hangs up): it is
+/// said with what stops, and the restart needs a yes for it. What the shell runs off its
+/// terminal (a prompt's daemon) is not the user's job.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_restart_says_it_stops_the_jobs_in_the_background() {
+    let env = Env::new("bgjobs");
+    env.workspace("w", "layout {\n    pane name=\"shell\"\n}\n");
+    env.run(&["open", "w"]);
+    let pid = env.server_pid().expect("the server runs");
+    let jobs = "sleep 4247 & (exec sleep 4248 </dev/null >/dev/null 2>&1) &";
+    env.run(&["send", "-p", "shell", "--enter", jobs]);
+    let running = |argv: &[u8]| {
+        std::fs::read_dir("/proc")
+            .unwrap()
+            .flatten()
+            .any(|e| std::fs::read(e.path().join("cmdline")).is_ok_and(|c| c == argv))
+    };
+    wait_until(Duration::from_secs(10), "the jobs never started", || {
+        running(b"sleep\x004247\x00") && running(b"sleep\x004248\x00")
+    });
+    let out = env.try_run(&["restart"]);
+    let said = String::from_utf8_lossy(&out.stdout);
+    assert!(!out.status.success(), "{said}");
+    assert!(said.contains("These programs stop:\n  sleep 4247 (in the background)  (pane "), "{said}");
+    assert!(!said.contains("4248"), "{said}");
+    assert!(String::from_utf8_lossy(&out.stderr).contains("add --yes"));
+    assert_eq!(env.server_pid(), Some(pid));
 }
 
 /// Run `cmd` in a terminal (`script`, from util-linux), typing `input` into it; what the

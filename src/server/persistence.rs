@@ -36,7 +36,7 @@ impl Server {
     pub(super) fn persist(&mut self) {
         self.persist_dirty = false;
         self.last_persist = Instant::now();
-        if self.workspaces.is_empty() {
+        if self.workspaces.is_empty() && self.unrestored.is_empty() {
             return;
         }
         // Turned off: nothing is saved, and what was goes once this state is written.
@@ -58,6 +58,22 @@ impl Server {
             p.saves += 1;
         }
         let _ = self.persister.send(Persist::Save(self.session.clone(), snap));
+    }
+
+    /// Have the session written as it is now, the panes' scrollback first, and wait until it
+    /// is (10 s at most): whether all of it is on disk. The event loop waits meanwhile, as the
+    /// server is about to stop.
+    pub(super) fn save_now(&mut self) -> Result<(), String> {
+        self.save_scrollback(true);
+        self.persist();
+        self.save_buffers(true);
+        let (done, written) = crossbeam_channel::bounded(1);
+        self.persister
+            .send(Persist::Flush(done))
+            .map_err(|_| "the layout could not be saved: its writer is gone".to_string())?;
+        written
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap_or_else(|_| Err("the layout could not be saved: its writer did not finish in time".into()))
     }
 
     /// Save the scrollback of panes that printed since it was last saved, or whose last save
@@ -173,25 +189,27 @@ impl Server {
         Mode::confirm(message, ConfirmAction::Restart)
     }
 
-    /// What a restart stops, a line per pane, in the order of the workspaces.
+    /// What a restart stops, a line per program, in the order of the workspaces.
     fn restart_stops(&self) -> Vec<String> {
         let ids: Vec<PaneId> = self.workspaces.iter().flat_map(|w| w.panes()).collect();
-        ids.into_iter()
-            .filter_map(|id| {
-                let pane = self.panes.get(&id)?;
-                let program = if pane.shell_waiting() { None } else { pane.foreground_argv() };
-                let info = self.pane_info(id);
-                let what = persist::stops_on_restart(&info, program.as_deref())?;
-                Some(persist::stopping_line(&info, &what))
-            })
-            .collect()
+        let mut lines = Vec::new();
+        for id in ids {
+            let Some(pane) = self.panes.get(&id) else { continue };
+            let program = if pane.shell_waiting() { None } else { pane.foreground_argv() };
+            let info = self.pane_info(id);
+            for what in persist::stops_on_restart(&info, program.as_deref(), &pane.background_jobs()) {
+                lines.push(persist::stopping_line(&info, &what));
+            }
+        }
+        lines
     }
 
     /// Restart the session: a helper started from the kraal installed now stops this server and
     /// starts the next one, which every attached client waits for.
     pub(super) fn restart(&mut self, client: ClientId) {
-        let started =
-            crate::client::installed_exe().and_then(|exe| crate::client::restart_detached(&exe, &self.session));
+        let started = crate::client::installed_exe()
+            .and_then(|exe| crate::client::restart_detached(&exe, &self.session))
+            .map(crate::exec::reap_later);
         match started {
             Ok(()) => self.toast(client, "restarting the session…"),
             Err(e) => self.toast(client, format!("cannot restart: {e:#}")),
@@ -214,8 +232,8 @@ pub(super) enum Persist {
     /// The session ended with its last pane: nothing is left to restore.
     Delete(String),
     /// Everything asked before is written: say whether the last save of the state, of each
-    /// pane's scrollback and of the paste buffers worked, and stop.
-    Stop(Sender<Result<(), String>>),
+    /// pane's scrollback and of the paste buffers worked.
+    Flush(Sender<Result<(), String>>),
 }
 
 /// What the event loop and the writer share beside the jobs, so that a disk slow to write never
@@ -347,9 +365,8 @@ pub(super) fn spawn_persister(events: Sender<Event>, shared: Arc<Mutex<Persistin
                         last = Ok(());
                         failing.clear();
                     }
-                    Persist::Stop(done) => {
-                        let _ = done.send(stop_answer(&last, &failing, buffers_failing.as_deref()));
-                        return;
+                    Persist::Flush(done) => {
+                        let _ = done.send(flush_answer(&last, &failing, buffers_failing.as_deref()));
                     }
                 }
             }
@@ -358,9 +375,9 @@ pub(super) fn spawn_persister(events: Sender<Event>, shared: Arc<Mutex<Persistin
     tx
 }
 
-/// What the writer says when the server stops: whether the state, each pane's scrollback and
-/// the paste buffers are saved, said whole.
-fn stop_answer(
+/// What the writer says when asked whether everything is written: whether the state, each
+/// pane's scrollback and the paste buffers are saved, said whole.
+fn flush_answer(
     last: &Result<(), String>,
     failing: &HashMap<String, String>,
     buffers_failing: Option<&str>,
@@ -427,15 +444,15 @@ mod tests {
     }
 
     #[test]
-    fn stopping_says_what_could_not_be_saved() {
+    fn the_writer_says_what_could_not_be_saved() {
         let none = HashMap::new();
-        assert_eq!(stop_answer(&Ok(()), &none, None), Ok(()));
+        assert_eq!(flush_answer(&Ok(()), &none, None), Ok(()));
         let one = HashMap::from([("a.ans".to_string(), "No space left on device".to_string())]);
-        let said = stop_answer(&Ok(()), &one, None).unwrap_err();
+        let said = flush_answer(&Ok(()), &one, None).unwrap_err();
         assert_eq!(said, "the scrollback of a pane could not be saved: No space left on device");
-        let state = stop_answer(&Err("read-only file system".into()), &one, None).unwrap_err();
+        let state = flush_answer(&Err("read-only file system".into()), &one, None).unwrap_err();
         assert_eq!(state, "the layout could not be saved: read-only file system");
-        let buffers = stop_answer(&Ok(()), &none, Some("Not a directory")).unwrap_err();
+        let buffers = flush_answer(&Ok(()), &none, Some("Not a directory")).unwrap_err();
         assert_eq!(buffers, "the paste buffers could not be saved: Not a directory");
     }
 }
