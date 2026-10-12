@@ -1388,25 +1388,20 @@ impl Server {
         }
     }
 
-    /// Exits whose last output has been read, or that waited long enough: a little of what is
-    /// left is read each time, never the endless output of a program left in the background.
+    /// Exits whose last output has been read (its reader saw the end of it), or that waited
+    /// long enough: a program left in the background can keep the terminal open, and print
+    /// without end. A little of what is left is read each time.
     fn finish_exits(&mut self) {
         let ids: Vec<PaneId> = self.exiting.keys().copied().collect();
         let mut data = std::mem::take(&mut self.output_buf);
         for id in ids {
             let mut left: usize = 64 * 1024;
-            let drained = loop {
-                if left == 0 {
-                    break false;
-                }
-                if !self.panes.get(&id).is_some_and(|p| p.take_output_into(&mut data, false)) {
-                    break true;
-                }
+            while left > 0 && self.panes.get(&id).is_some_and(|p| p.take_output_into(&mut data, false)) {
                 self.pane_output(id, &data);
                 left = left.saturating_sub(data.len());
-            };
+            }
             let Some(&(pid, code, until)) = self.exiting.get(&id) else { continue };
-            if drained || Instant::now() >= until || !self.panes.contains_key(&id) {
+            if self.panes.get(&id).is_none_or(|p| p.output_finished()) || Instant::now() >= until {
                 self.exiting.remove(&id);
                 self.pane_exited(id, pid, code);
             }

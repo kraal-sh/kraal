@@ -466,6 +466,15 @@ struct Waiting {
     /// The server was told there is output, and has not found it all taken since: it comes
     /// back for more without being told again.
     told: bool,
+    /// The reader saw the end of the output: nothing comes after `bytes`.
+    ended: bool,
+}
+
+impl Waiting {
+    /// Whether the server must be told of what changed, which counts it told.
+    fn tell(&mut self) -> bool {
+        !std::mem::replace(&mut self.told, true)
+    }
 }
 
 /// Output waiting beyond which the reader stops reading (and the program waits on its writes).
@@ -496,6 +505,12 @@ impl Output {
         self.lock().bytes.is_empty()
     }
 
+    /// Whether all the output was taken: the reader saw its end, and nothing waits.
+    pub(super) fn finished(&self) -> bool {
+        let w = self.lock();
+        w.ended && w.bytes.is_empty()
+    }
+
     /// Add a read once there is room for it (None when told to stop meanwhile): whether the
     /// server must be told, which counts it told.
     fn add(&self, read: &[u8], stop: &AtomicBool) -> Option<bool> {
@@ -507,7 +522,14 @@ impl Output {
             w = self.taken.wait_timeout(w, Duration::from_millis(200)).ok()?.0;
         }
         w.bytes.extend_from_slice(read);
-        Some(!std::mem::replace(&mut w.told, true))
+        Some(w.tell())
+    }
+
+    /// The reader saw the end of the output: whether the server must be told.
+    fn end(&self) -> bool {
+        let mut w = self.lock();
+        w.ended = true;
+        w.tell()
     }
 
     /// Telling the server failed: the next read tries again.
@@ -517,7 +539,8 @@ impl Output {
 }
 
 /// Read a PTY until its end or until told to stop, adding its output to `out`, and telling the
-/// server (`tell`) of output it does not know of yet.
+/// server (`tell`) of output it does not know of yet, and of the end: it may wait for it to act
+/// on the program's exit.
 fn read_output(mut reader: PtyReader, out: &Output, stop: &AtomicBool, tell: impl Fn() -> bool) {
     let mut buf = vec![0u8; 64 * 1024];
     while let Some(n) = reader.read(&mut buf, stop) {
@@ -526,6 +549,9 @@ fn read_output(mut reader: PtyReader, out: &Output, stop: &AtomicBool, tell: imp
             Some(true) if !tell() => out.untell(),
             Some(_) => {}
         }
+    }
+    if out.end() && !tell() {
+        out.untell();
     }
 }
 
@@ -873,6 +899,47 @@ mod tests {
         tty.write_all(b"four").unwrap();
         assert_eq!(wait_for(2), 2);
         stop.stop();
+    }
+
+    /// The program prints more than waits for the server and ends while the server is busy: its
+    /// exit is told before the reader, holding a read until there is room for it, saw the end.
+    /// (On macOS a program that wrote to a terminal does not end before its output is read.)
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn the_output_of_a_program_that_ended_is_all_taken_before_it_is_finished() {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let env = PaneEnv {
+            socket: "/nonexistent".into(),
+            session: "t".into(),
+            shell: "sh".into(),
+            scrollback: 100,
+            graphics: Default::default(),
+        };
+        let printed = MAX_WAITING + 8192;
+        let script = format!("head -c {} /dev/zero | tr '\\0' x; printf end", printed - 3);
+        let spec = PaneSpec { command: vec!["sh".into(), "-c".into(), script], ..Default::default() };
+        let pane = TermPane::spawn(1, &spec, 40, 5, &env, &tx).unwrap();
+        let start = Instant::now();
+        let limit = Duration::from_secs(10);
+        while !matches!(rx.recv_timeout(limit), Ok(Event::PaneExited(..))) {
+            assert!(start.elapsed() < limit, "the exit is told");
+        }
+        // Taking makes room: the reader adds what it held a moment later. Looked at as soon as
+        // the server may, the output is not finished meanwhile.
+        let (mut taken, mut read) = (Vec::new(), Vec::new());
+        loop {
+            let took = pane.output.take(&mut read, false);
+            let finished = pane.output.finished();
+            if took {
+                taken.extend_from_slice(&read);
+            }
+            if finished {
+                break;
+            }
+            assert!(start.elapsed() < limit, "the reader sees the end");
+        }
+        assert_eq!(taken.len(), printed);
+        assert!(taken.ends_with(b"end"));
     }
 
     #[test]
