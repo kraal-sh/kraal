@@ -260,7 +260,7 @@ impl Server {
         }
         let tab_id = self.alloc_id();
         let mut tab = Tab::new(tab_id, format!("▶ {name}"));
-        tab.root = Some(crate::server::ssh::grid(&ids));
+        tab.root = Some(crate::layout::grid(&ids));
         tab.set_focus(ids[0]);
         let wi = self.ws_index(ws).context("workspace vanished")?;
         self.workspaces[wi].tabs.push(tab);

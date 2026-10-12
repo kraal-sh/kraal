@@ -91,17 +91,22 @@ impl Server {
         let (_, wi) = self.current_ws(id)?;
         let rects = self.tab_rects(self.workspaces[wi].tab(), area);
         let hit = rects.iter().rev().find(|(_, r, _)| contains(*r, m.col, m.row)).copied();
+        // The row of a pane folded in a stack, unless a floating pane covers it.
+        let folded = match hit {
+            Some((.., true)) => None,
+            _ => self.stack_rows(self.workspaces[wi].tab(), area).into_iter().find(|(_, r)| contains(*r, m.col, m.row)),
+        };
 
         match m.kind {
             MouseKind::ScrollUp | MouseKind::ScrollDown => {
-                let (p, r, floating) = hit?;
-                let inner = self.inner(r, floating);
+                let (p, r, _) = hit?;
+                let inner = self.inner(r);
                 self.wheel(id, p, m, inner, scroll_mode);
             }
             // Pointer motion and horizontal scrolling, for a program that asked for them.
             MouseKind::Move | MouseKind::ScrollLeft | MouseKind::ScrollRight if !scroll_mode => {
-                let (p, r, floating) = hit?;
-                let inner = self.inner(r, floating);
+                let (p, r, _) = hit?;
+                let inner = self.inner(r);
                 if !contains(inner, m.col, m.row) {
                     return None;
                 }
@@ -119,11 +124,13 @@ impl Server {
                 }
             }
             MouseKind::Press(button) => {
-                // Borders of tiled panes; ctrl+click on a frame's top marks the pane instead.
+                // Borders of tiled panes; ctrl+click on a frame's top marks the pane instead. A
+                // folded pane's row is that pane's, but for its ends, on the borders beside it.
                 if button == MouseButton::Left
                     && !m.mods.ctrl
                     && hit.is_none_or(|(_, _, floating)| !floating)
                     && let Some(b) = self.border_at(wi, m.col, m.row)
+                    && (folded.is_none() || b.axis == crate::layout::Axis::Row)
                 {
                     let along = match b.axis {
                         crate::layout::Axis::Row => m.col,
@@ -135,8 +142,19 @@ impl Server {
                     }
                     return None;
                 }
+                if let Some((p, _)) = folded {
+                    if button == MouseButton::Left && m.mods.ctrl {
+                        self.toggle_mark(id, p);
+                    } else {
+                        // It opens, and the pane open in its stack folds.
+                        self.workspaces[wi].tab_mut().set_focus(p);
+                        self.mark_seen_focused(id);
+                        self.mark_dirty();
+                    }
+                    return None;
+                }
                 let (p, r, floating) = hit?;
-                let inner = self.inner(r, floating);
+                let inner = self.inner(r);
                 if button == MouseButton::Left && m.mods.ctrl && m.row == r.y && inner.y > r.y {
                     self.toggle_mark(id, p);
                     return None;
@@ -292,6 +310,7 @@ impl Server {
                 // Borders move as we drag: refresh the one we hold.
                 let fresh = root.borders(area).into_iter().find(|nb| nb.path == b.path && nb.index == b.index);
                 if moved {
+                    self.workspaces[wi].tab_mut().preset = None;
                     self.relayout();
                 }
                 if released {
@@ -305,7 +324,7 @@ impl Server {
                 // clipboard keeps what it had.
                 let moved = moved || (m.col, m.row) != from;
                 let rects = self.tab_rects(self.workspaces[wi].tab(), area);
-                let r = rects.iter().find(|(p, ..)| *p == pane).map(|(_, r, f)| self.inner(*r, *f))?;
+                let r = rects.iter().find(|(p, ..)| *p == pane).map(|(_, r, _)| self.inner(*r))?;
                 let pn = self.panes.get_mut(&pane)?;
                 if moved {
                     let col = m.col.saturating_sub(r.x).min(r.width.saturating_sub(1));
@@ -371,7 +390,7 @@ impl Server {
             }
             Drag::Forward { pane, button } => {
                 let rects = self.tab_rects(self.workspaces[wi].tab(), area);
-                let r = rects.iter().find(|(p, ..)| *p == pane).map(|(_, r, f)| self.inner(*r, *f))?;
+                let r = rects.iter().find(|(p, ..)| *p == pane).map(|(_, r, _)| self.inner(*r))?;
                 let pn = self.panes.get_mut(&pane)?;
                 let col = m.col.saturating_sub(r.x).min(r.width.saturating_sub(1));
                 let row = m.row.saturating_sub(r.y).min(r.height.saturating_sub(1));

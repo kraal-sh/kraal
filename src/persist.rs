@@ -15,7 +15,7 @@ use std::time::Instant;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::layout::{Axis, Node, PaneId};
+use crate::layout::{Axis, Node, PaneId, Preset};
 use crate::pane::PaneSpec;
 use crate::paths;
 use crate::server::{FloatRect, Floating, Server, Tab};
@@ -56,12 +56,22 @@ pub struct TabSnap {
     pub show_floating: bool,
     pub zoomed: bool,
     pub sync: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preset: Option<Preset>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 pub enum NodeSnap {
     Pane(Box<PaneSnap>),
-    Split { axis: Axis, children: Vec<(NodeSnap, f32)> },
+    /// A stack is a split of its panes marked `stacked`, with the index of the one open.
+    Split {
+        axis: Axis,
+        children: Vec<(NodeSnap, f32)>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        stacked: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        open: Option<usize>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -122,9 +132,18 @@ pub fn snapshot(server: &Server) -> SessionSnapshot {
     fn node(n: &Node, f: &dyn Fn(PaneId) -> PaneSnap) -> NodeSnap {
         match n {
             Node::Leaf(id) => NodeSnap::Pane(Box::new(f(*id))),
-            Node::Split { axis, children } => {
-                NodeSnap::Split { axis: *axis, children: children.iter().map(|(c, w)| (node(c, f), *w)).collect() }
-            }
+            Node::Split { axis, children } => NodeSnap::Split {
+                axis: *axis,
+                children: children.iter().map(|(c, w)| (node(c, f), *w)).collect(),
+                stacked: false,
+                open: None,
+            },
+            Node::Stack { panes, open } => NodeSnap::Split {
+                axis: Axis::Column,
+                children: panes.iter().map(|p| (NodeSnap::Pane(Box::new(f(*p))), 1.0)).collect(),
+                stacked: true,
+                open: panes.iter().position(|p| p == open),
+            },
         }
     }
     let workspaces = server
@@ -157,6 +176,7 @@ pub fn snapshot(server: &Server) -> SessionSnapshot {
                         show_floating: t.show_floating && !floating.is_empty(),
                         zoomed: t.zoom.is_some(),
                         sync: false,
+                        preset: t.preset,
                     }
                 })
                 .collect(),
@@ -363,6 +383,7 @@ fn apply_workspace(server: &mut Server, ws: WorkspaceSnap, revision: u32) -> Res
             // pane runs.
             let old_default = revision == 0 && t.name.strip_prefix("tab ").is_some_and(|n| n.parse::<u32>().is_ok());
             let mut tab = Tab::new(tab_id, if old_default { String::new() } else { t.name });
+            tab.preset = t.preset;
             if let Some(root) = &t.root {
                 tab.root = Some(build(server, root)?);
             }
@@ -399,7 +420,17 @@ fn apply_workspace(server: &mut Server, ws: WorkspaceSnap, revision: u32) -> Res
 fn build(server: &mut Server, n: &NodeSnap) -> Result<Node> {
     Ok(match n {
         NodeSnap::Pane(p) => Node::Leaf(spawn(server, p)?),
-        NodeSnap::Split { axis, children } => {
+        NodeSnap::Split { children, stacked: true, open, .. } => {
+            let mut panes = Vec::new();
+            for (c, _) in children {
+                panes.extend(build(server, c)?.leaves());
+            }
+            let open = open.and_then(|i| panes.get(i)).or(panes.first()).copied().context("an empty stack")?;
+            let mut node = Node::Stack { panes, open };
+            node.normalize();
+            node
+        }
+        NodeSnap::Split { axis, children, .. } => {
             let mut out = Vec::new();
             for (c, w) in children {
                 out.push((build(server, c)?, *w));

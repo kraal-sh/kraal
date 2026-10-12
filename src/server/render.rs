@@ -161,9 +161,9 @@ impl Server {
     /// Where a pane's content is drawn for a client.
     pub(super) fn pane_inner_rect(&self, id: ClientId, pane: PaneId) -> Option<Rect> {
         let wi = self.ws_index(self.clients.get(&id)?.workspace)?;
-        let (_, outer, floating) =
+        let (_, frame, _) =
             self.tab_rects(self.workspaces[wi].tab(), self.layout_area).into_iter().find(|(p, _, _)| *p == pane)?;
-        Some(self.inner(outer, floating))
+        Some(self.inner(frame))
     }
 
     /// Hint labels over the matches of `pane`: the label on the first cells, the rest of the
@@ -172,11 +172,10 @@ impl Server {
         let c = &self.clients[&id];
         let Some(wi) = self.ws_index(c.workspace) else { return };
         let tab = self.workspaces[wi].tab();
-        let Some((_, outer, floating)) = self.tab_rects(tab, self.layout_area).into_iter().find(|(p, _, _)| *p == pane)
-        else {
+        let Some((_, frame, _)) = self.tab_rects(tab, self.layout_area).into_iter().find(|(p, _, _)| *p == pane) else {
             return;
         };
-        let (_, inner) = self.placed(outer, floating, buf.area);
+        let (_, inner) = self.placed(frame, buf.area);
         let typed = typed.to_ascii_lowercase();
         let label_style = Style::default().fg(Color::Black).bg(Color::Yellow).add_modifier(Modifier::BOLD);
         for h in hints {
@@ -488,11 +487,11 @@ impl Server {
         let Some(wi) = self.ws_index(c.workspace) else { return Vec::new() };
         let tab = self.workspaces[wi].tab();
         let Some(f) = tab.focus else { return Vec::new() };
-        let Some((_, outer, floating)) = self.tab_rects(tab, self.layout_area).into_iter().find(|(p, ..)| *p == f)
+        let Some((_, frame, floating)) = self.tab_rects(tab, self.layout_area).into_iter().find(|(p, ..)| *p == f)
         else {
             return Vec::new();
         };
-        if floating || self.inner(outer, false).y > outer.y {
+        if floating || self.inner(frame).y > frame.y {
             return Vec::new();
         }
         let mut out = Vec::new();
@@ -799,6 +798,7 @@ impl Server {
         let ws = &self.workspaces[wi];
         let tab = ws.tab();
         let rects = self.tab_rects(tab, area);
+        let folded = self.stack_rows(tab, area);
         let focus = tab.focus;
         let synced: Vec<PaneId> = match (ws.sync, focus) {
             (super::SyncScope::Off, _) | (_, None) => Vec::new(),
@@ -807,9 +807,20 @@ impl Server {
         let marked = ws.marked.clone();
         let show_floating = tab.show_floating;
         let floating_focus = focus.is_some_and(|f| tab.is_floating(f));
+        // A pane folded in a stack shows the top line of its frame, and nothing else.
+        for (pid, row) in folded {
+            let mut whole = Buffer::empty(Rect::new(row.x, row.y, row.width, 3));
+            let (sync, mark) = (synced.contains(&pid), marked.contains(&pid));
+            self.draw_frame(pid, whole.area, false, sync, false, mark, &mut whole);
+            for x in row.x..row.right() {
+                if clip.contains((x, row.y).into()) {
+                    buf[(x, row.y)] = whole[(x, row.y)].clone();
+                }
+            }
+        }
         let mut cursor = None;
-        for (pid, outer, floating) in rects {
-            let (tile, inner) = self.placed(outer, floating, clip);
+        for (pid, frame, floating) in rects {
+            let (tile, inner) = self.placed(frame, clip);
             if tile.is_empty() {
                 continue;
             }

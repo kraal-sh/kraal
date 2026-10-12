@@ -3,7 +3,7 @@
 use super::plural;
 use crate::input::encode_key;
 use crate::keymap::Action;
-use crate::layout::{Dir, PaneId, neighbour};
+use crate::layout::{Dir, PaneId, Preset, neighbour};
 use crate::pane::PaneSpec;
 use crate::protocol::Placement;
 use crate::server::ui::{ConfirmAction, Mode, Prompt, PromptAction};
@@ -83,6 +83,7 @@ impl Server {
                     } else if focus.is_some_and(|f| tab.is_floating(f)) {
                         let tiled = tab.recent.iter().copied().find(|p| !tab.is_floating(*p));
                         tab.focus = tiled.or_else(|| tab.root.as_ref().map(|r| r.leaves()[0]));
+                        tab.expand_focus();
                     }
                 }
             }
@@ -116,6 +117,46 @@ impl Server {
                     _ => Dir::Down,
                 };
                 self.resize_focused(wi, dir);
+            }
+            Action::NextLayout => {
+                let tab = self.workspaces[wi].tab_mut();
+                match tab.root.as_ref().and_then(|root| Preset::next(tab.preset, root, tab.focus)) {
+                    Some((preset, tree)) => {
+                        tab.root = Some(tree);
+                        tab.preset = Some(preset);
+                        tab.zoom = None;
+                        self.relayout();
+                        self.toast(id, format!("Layout: {}", preset.describe()));
+                    }
+                    None => self.toast(id, "One pane fills the tab: there is no layout to choose."),
+                }
+            }
+            Action::StackLeft | Action::StackRight | Action::StackUp | Action::StackDown => {
+                let dir = match action {
+                    Action::StackLeft => Dir::Left,
+                    Action::StackRight => Dir::Right,
+                    Action::StackUp => Dir::Up,
+                    _ => Dir::Down,
+                };
+                if let Err(why) = self.stack_focused(wi, dir) {
+                    self.toast(id, why);
+                }
+            }
+            Action::Unstack => {
+                let tab = self.workspaces[wi].tab_mut();
+                let unstacked = match (focus, &mut tab.root) {
+                    (Some(f), Some(root)) => root.unstack(f).then_some(f),
+                    _ => None,
+                };
+                match unstacked {
+                    Some(f) => {
+                        tab.preset = None;
+                        tab.zoom = None;
+                        tab.set_focus(f);
+                        self.relayout();
+                    }
+                    None => self.toast(id, "This pane is not in a stack."),
+                }
             }
             Action::NextTab => self.switch_tab(wi, 1),
             Action::PrevTab => self.switch_tab(wi, -1),
@@ -298,7 +339,7 @@ impl Server {
             Action::Messages => return Mode::Messages { scroll: 0 },
             Action::CommandPalette => return Mode::Picker(self.command_picker()),
             Action::ResizeMode => {
-                let tiled = self.workspaces[wi].tab().root.as_ref().is_some_and(|r| r.leaves().len() > 1);
+                let tiled = self.workspaces[wi].tab().root.as_ref().is_some_and(|r| r.places().len() > 1);
                 if !tiled {
                     self.toast(id, "One pane fills the tab: there is nothing to resize.");
                     return Mode::Normal;
@@ -365,8 +406,19 @@ impl Server {
             return false;
         }
         let Some(root) = &tab.root else { return false };
+        // Up and down go through the panes of a stack before leaving it.
+        let in_stack = root.stack_of(f).filter(|_| matches!(dir, Dir::Up | Dir::Down)).and_then(|(panes, _)| {
+            let i = panes.iter().position(|p| *p == f)?;
+            let j = if dir == Dir::Up { i.checked_sub(1)? } else { i + 1 };
+            panes.get(j).copied()
+        });
+        if let Some(n) = in_stack {
+            tab.set_focus(n);
+            self.mark_dirty();
+            return true;
+        }
         let rects = root.layout(area);
-        match neighbour(&rects, f, dir, &tab.recent) {
+        match neighbour(&rects, root.holder(f), dir, &tab.recent) {
             Some(n) => {
                 tab.set_focus(n);
                 self.mark_dirty();
@@ -374,6 +426,25 @@ impl Server {
             }
             None => false,
         }
+    }
+
+    /// Stack the focused pane with the pane on side `dir`: it moves into that pane's place, after
+    /// the panes there when it comes from below or the right, before them otherwise, and keeps
+    /// the focus.
+    pub(super) fn stack_focused(&mut self, wi: usize, dir: Dir) -> Result<(), &'static str> {
+        let area = self.layout_area;
+        let tab = self.workspaces[wi].tab_mut();
+        let Some(f) = tab.focus.filter(|f| !tab.is_floating(*f)) else { return Err("Floating panes do not stack.") };
+        let Some(root) = &mut tab.root else { return Err("Floating panes do not stack.") };
+        let onto = neighbour(&root.layout(area), root.holder(f), dir, &tab.recent).ok_or("No pane on that side.")?;
+        if !root.stack(f, onto, matches!(dir, Dir::Left | Dir::Up)) {
+            return Err("No pane on that side.");
+        }
+        tab.preset = None;
+        tab.zoom = None;
+        tab.set_focus(f);
+        self.relayout();
+        Ok(())
     }
 
     pub(super) fn resize_focused(&mut self, wi: usize, dir: Dir) {
@@ -392,6 +463,7 @@ impl Server {
             fl.rect.x = fl.rect.x.min(1.0 - fl.rect.w);
             fl.rect.y = fl.rect.y.min(1.0 - fl.rect.h);
         } else if let Some(root) = &mut tab.root {
+            tab.preset = None;
             let cells = if matches!(dir, Dir::Left | Dir::Right) { 4 } else { 2 };
             if !root.resize(f, dir, cells, area) {
                 // No border on that side: shrink from the opposite one instead.

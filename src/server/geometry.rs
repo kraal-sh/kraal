@@ -3,7 +3,7 @@
 use ratatui::layout::Rect;
 
 use super::{Server, Tab};
-use crate::layout::PaneId;
+use crate::layout::{Node, PaneId};
 impl Server {
     /// Main pane area for a client of the given size: below the top bar, one column of space
     /// right of the sidebar.
@@ -35,16 +35,17 @@ impl Server {
             || self.remote_agents().next().is_some()
     }
 
-    /// Outer rectangle of every visible pane of a tab, in draw order (tiled, then floating).
+    /// Where every visible pane of a tab goes, in draw order (tiled, then floating): its frame,
+    /// or its whole place when it has none. Panes folded in a stack show only a row
+    /// ([`Server::stack_rows`]).
     pub fn tab_rects(&self, tab: &Tab, area: Rect) -> Vec<(PaneId, Rect, bool)> {
         let mut out = Vec::new();
         if let Some(z) = tab.zoom.filter(|z| !tab.is_floating(*z)) {
-            out.push((z, area, false));
+            out.push((z, self.tile(area), false));
         } else if let Some(root) = &tab.root {
-            let rects = root.layout(area);
-            for id in root.leaves() {
-                out.push((id, rects[&id], false));
-            }
+            out.extend(
+                self.tiled_rects(root, area).into_iter().filter(|(.., folded)| !folded).map(|(p, r, _)| (p, r, false)),
+            );
         }
         if tab.show_floating {
             for f in &tab.floating {
@@ -54,37 +55,45 @@ impl Server {
         out
     }
 
+    /// The rows of the panes folded in the stacks of a tab, as it shows them.
+    pub fn stack_rows(&self, tab: &Tab, area: Rect) -> Vec<(PaneId, Rect)> {
+        match &tab.root {
+            Some(root) if tab.zoom.is_none_or(|z| tab.is_floating(z)) => self
+                .tiled_rects(root, area)
+                .into_iter()
+                .filter(|(.., folded)| *folded)
+                .map(|(p, r, _)| (p, r))
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// Every tiled pane of `root` in `area`, in order: the frame of each pane shown whole, and
+    /// the row of each pane folded in a stack (marked `true`).
+    pub fn tiled_rects(&self, root: &Node, area: Rect) -> Vec<(PaneId, Rect, bool)> {
+        root.tiles(area, self.config.pane_frames)
+    }
+
     /// Where a tiled pane's frame goes: its place, less one column of space when a pane is to its
     /// right and one row when a pane is below.
     pub fn tile(&self, outer: Rect) -> Rect {
-        if !self.config.pane_frames {
-            return outer;
-        }
-        let area = self.layout_area;
-        let right = u16::from(outer.right() < area.right() && outer.width > 1);
-        let below = u16::from(outer.bottom() < area.bottom() && outer.height > 1);
-        Rect::new(outer.x, outer.y, outer.width - right, outer.height - below)
+        if self.config.pane_frames { crate::layout::framed(outer, self.layout_area) } else { outer }
     }
 
-    /// Where a pane's content goes inside its place: inside its frame, a box for a floating
-    /// pane, a tile for the others.
-    pub fn inner(&self, outer: Rect, floating: bool) -> Rect {
-        self.inside_frame(if floating { outer } else { self.tile(outer) })
-    }
-
-    /// A pane's frame and content as a screen of `screen` size shows them: the frame clipped to
-    /// the screen, the content inside what shows of the frame.
-    pub fn placed(&self, outer: Rect, floating: bool, screen: Rect) -> (Rect, Rect) {
-        let frame = if floating { outer } else { self.tile(outer) }.intersection(screen);
-        (frame, self.inside_frame(frame))
-    }
-
-    fn inside_frame(&self, frame: Rect) -> Rect {
+    /// Where a pane's content goes: inside its frame.
+    pub fn inner(&self, frame: Rect) -> Rect {
         if self.config.pane_frames && frame.width >= 4 && frame.height >= 3 {
             Rect::new(frame.x + 1, frame.y + 1, frame.width - 2, frame.height - 2)
         } else {
             frame
         }
+    }
+
+    /// A pane's frame and content as a screen of `screen` size shows them: the frame clipped to
+    /// the screen, the content inside what shows of the frame.
+    pub fn placed(&self, frame: Rect, screen: Rect) -> (Rect, Rect) {
+        let frame = frame.intersection(screen);
+        (frame, self.inner(frame))
     }
 
     /// Recompute the layout area from the primary client and resize every pane.
@@ -96,15 +105,30 @@ impl Server {
         let mut sizes = Vec::new();
         for ws in &self.workspaces {
             for tab in &ws.tabs {
-                let mut tiled = tab.root.as_ref().map(|r| r.layout(area)).unwrap_or_default();
+                let mut tiled = std::collections::HashMap::new();
+                if let Some(root) = &tab.root {
+                    let frames: std::collections::HashMap<PaneId, Rect> = self
+                        .tiled_rects(root, area)
+                        .into_iter()
+                        .filter(|(.., folded)| !folded)
+                        .map(|(p, r, _)| (p, r))
+                        .collect();
+                    // A folded pane has the size of the one open in its stack: opening it
+                    // resizes nothing.
+                    for id in root.leaves() {
+                        if let Some(r) = frames.get(&root.holder(id)) {
+                            tiled.insert(id, *r);
+                        }
+                    }
+                }
                 if let Some(z) = tab.zoom {
-                    tiled.insert(z, area);
+                    tiled.insert(z, self.tile(area));
                 }
                 for (id, r) in tiled {
-                    sizes.push((id, self.inner(r, false)));
+                    sizes.push((id, self.inner(r)));
                 }
                 for f in &tab.floating {
-                    sizes.push((f.pane, self.inner(f.rect.to_rect(area), true)));
+                    sizes.push((f.pane, self.inner(f.rect.to_rect(area))));
                 }
             }
         }

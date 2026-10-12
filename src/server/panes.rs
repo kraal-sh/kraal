@@ -41,7 +41,7 @@ impl Server {
         let mut spec = spec;
         self.add_worktree_env(&mut spec);
         let id = self.alloc_id();
-        let inner = self.inner(self.layout_area, false);
+        let inner = self.inner(self.layout_area);
         if let Some([left, right]) = spec.files.clone() {
             let fm = self.file_manager(&left, &right);
             self.panes.insert(id, Pane::files(id, name, spec, fm));
@@ -73,7 +73,7 @@ impl Server {
         let mut spec = spec;
         self.add_worktree_env(&mut spec);
         let id = self.alloc_id();
-        let inner = self.inner(self.layout_area, false);
+        let inner = self.inner(self.layout_area);
         let mut pane =
             Pane::spawn(id, name, placeholder(&spec, reason), inner.width, inner.height, &self.env, &self.tx)?;
         pane.ssh = self.ssh_target_of(&spec);
@@ -173,17 +173,30 @@ impl Server {
                         Placement::Down => Axis::Column,
                         _ => {
                             let rects = root.layout(area);
-                            let r = rects.get(&t).copied().unwrap_or(area);
+                            let r = rects.get(&root.holder(t)).copied().unwrap_or(area);
                             // Cells are about twice as tall as wide.
                             if r.width >= r.height * 2 { Axis::Row } else { Axis::Column }
                         }
                     };
-                    root.split(t, axis, id);
+                    // A new pane next to a stacked one goes in its stack; a split by hand
+                    // splits the stack's place.
+                    let split = matches!(placement, Placement::Right | Placement::Down);
+                    if split || !root.join(t, id) {
+                        root.split(t, axis, id);
+                    }
+                    if split {
+                        tab.preset = None;
+                    }
                 }
                 (Some(root), None) => {
                     let first = root.leaves()[0];
                     root.split(first, Axis::Row, id);
                 }
+            }
+            // The arrangement the tab keeps takes the new pane in.
+            if let Some(preset) = tab.preset {
+                tab.focus = Some(id);
+                tab.arrange(preset);
             }
             tab.zoom = None;
         }

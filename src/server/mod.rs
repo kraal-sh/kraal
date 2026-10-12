@@ -129,6 +129,9 @@ pub struct Tab {
     pub zoom: Option<PaneId>,
     /// Most recently focused first.
     pub recent: Vec<PaneId>,
+    /// The arrangement the tiled panes were put in, kept as panes come and go until they are
+    /// resized, split or stacked by hand.
+    pub preset: Option<crate::layout::Preset>,
 }
 
 impl Tab {
@@ -142,6 +145,7 @@ impl Tab {
             show_floating: false,
             zoom: None,
             recent: Vec::new(),
+            preset: None,
         }
     }
 
@@ -170,9 +174,29 @@ impl Tab {
                 let f = self.floating.remove(i);
                 self.floating.push(f);
             }
-        } else if self.zoom.is_some_and(|z| z != id) {
-            self.zoom = Some(id);
+        } else {
+            self.expand_focus();
+            if self.zoom.is_some_and(|z| z != id) {
+                self.zoom = Some(id);
+            }
         }
+    }
+
+    /// Open the focused pane in its stack, if it is folded in one.
+    fn expand_focus(&mut self) {
+        if let (Some(f), Some(root)) = (self.focus, &mut self.root) {
+            root.expand(f);
+        }
+    }
+
+    /// Put the tiled panes in `preset`, in their order, the focus kept.
+    pub fn arrange(&mut self, preset: crate::layout::Preset) {
+        if let Some(root) = &self.root
+            && let Some(tree) = preset.build(&root.leaves(), self.focus)
+        {
+            self.root = Some(tree);
+        }
+        self.preset = Some(preset);
     }
 
     /// Remove a pane; returns false if the tab is now empty.
@@ -180,9 +204,12 @@ impl Tab {
         self.floating.retain(|f| f.pane != id);
         if let Some(root) = &mut self.root
             && root.contains(id)
-            && !root.remove(id)
         {
-            self.root = None;
+            if !root.remove(id) {
+                self.root = None;
+            } else if let Some(preset) = self.preset {
+                self.arrange(preset);
+            }
         }
         if self.zoom == Some(id) {
             self.zoom = None;
@@ -196,6 +223,7 @@ impl Tab {
             {
                 self.show_floating = self.show_floating && !self.floating.is_empty();
             }
+            self.expand_focus();
         }
         if self.floating.is_empty() {
             self.show_floating = false;
@@ -1220,5 +1248,55 @@ impl Server {
         self.stop_remotes();
         // Give writer threads a moment to deliver the exit messages.
         std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::layout::Preset;
+
+    #[test]
+    fn a_folded_pane_opens_when_it_gets_the_focus() {
+        let mut tab = Tab::new(1, String::new());
+        tab.root = Some(Node::Split {
+            axis: crate::layout::Axis::Row,
+            children: vec![(Node::Leaf(1), 1.0), (Node::Stack { panes: vec![2, 3, 4], open: 2 }, 1.0)],
+        });
+        let open = |tab: &Tab| tab.root.as_ref().map(|r| r.holder(4));
+        tab.set_focus(4);
+        assert_eq!(open(&tab), Some(4));
+        // Away from the stack, it stays as it was.
+        tab.set_focus(1);
+        assert_eq!(open(&tab), Some(4));
+        tab.set_focus(3);
+        assert_eq!(open(&tab), Some(3));
+        // The focus goes back to the pane focused before, which opens.
+        tab.set_focus(2);
+        assert!(tab.remove(2));
+        assert_eq!((tab.focus, open(&tab)), (Some(3), Some(3)));
+        tab.set_focus(4);
+        tab.set_focus(1);
+        assert!(tab.remove(1));
+        assert_eq!((tab.focus, open(&tab)), (Some(4), Some(4)));
+    }
+
+    #[test]
+    fn a_tab_keeps_its_arrangement_as_panes_go() {
+        let mut tab = Tab::new(1, String::new());
+        tab.root = Some(Node::Leaf(1));
+        for p in [2, 3, 4] {
+            tab.root.as_mut().unwrap().split(p - 1, crate::layout::Axis::Row, p);
+        }
+        tab.set_focus(4);
+        tab.arrange(Preset::MainLeftStacked);
+        let root = tab.root.clone().unwrap();
+        assert_eq!(root.stack_of(2), Some((&[2, 3, 4][..], 4)));
+        assert!(tab.remove(3));
+        assert_eq!(tab.root, Preset::MainLeftStacked.build(&[1, 2, 4], Some(4)));
+        // With no arrangement kept, the space of a pane that goes is its neighbour's.
+        tab.preset = None;
+        assert!(tab.remove(1));
+        assert_eq!(tab.root.as_ref().and_then(|r| r.stack_of(2)), Some((&[2, 4][..], 4)));
     }
 }

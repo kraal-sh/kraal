@@ -35,6 +35,12 @@ pub enum Action {
     ResizeRight,
     ResizeUp,
     ResizeDown,
+    NextLayout,
+    StackLeft,
+    StackRight,
+    StackUp,
+    StackDown,
+    Unstack,
     PanePicker,
     RenamePane,
     NewTab,
@@ -104,6 +110,12 @@ const ACTIONS: &[(Action, &str, &str)] = &[
     (ResizeRight, "resize_right", "Resize right"),
     (ResizeUp, "resize_up", "Resize up"),
     (ResizeDown, "resize_down", "Resize down"),
+    (NextLayout, "next_layout", "Next layout (even columns, even rows, main pane left or on top, grid)"),
+    (StackLeft, "stack_left", "Stack with the pane on the left"),
+    (StackRight, "stack_right", "Stack with the pane on the right"),
+    (StackUp, "stack_up", "Stack with the pane above"),
+    (StackDown, "stack_down", "Stack with the pane below"),
+    (Unstack, "unstack", "Unstack (take the pane out of its stack)"),
     (PanePicker, "pane_picker", "Find a pane"),
     (RenamePane, "rename_pane", "Rename pane"),
     (NewTab, "new_tab", "New tab"),
@@ -215,6 +227,8 @@ pub struct Preset {
     leader: Table,
     direct: Table,
     menus: &'static [MenuDef],
+    /// Menus further in: the sequence that opens one, and its title.
+    submenus: &'static [(&'static str, &'static str)],
     /// What a tool's `key` follows.
     tool_menu: &'static str,
 }
@@ -262,6 +276,12 @@ pub const KRAAL: Preset = Preset {
         ("rename_pane", &["{panes} e"]),
         ("resize_mode", &["{panes} r"]),
         ("new_floating", &["{panes} f"]),
+        ("next_layout", &["{panes} l"]),
+        ("stack_left", &["{panes} s left"]),
+        ("stack_down", &["{panes} s down"]),
+        ("stack_up", &["{panes} s up"]),
+        ("stack_right", &["{panes} s right"]),
+        ("unstack", &["{panes} u"]),
         ("prev_tab", &["{tabs} left"]),
         ("next_tab", &["{tabs} right"]),
         ("rename_tab", &["{tabs} e"]),
@@ -310,6 +330,7 @@ pub const KRAAL: Preset = Preset {
         ("files", "F", "Files", Files),
         ("run", "R", "Run", ToolPicker),
     ],
+    submenus: &[("{panes} s", "Stack with")],
     tool_menu: "{run}",
 };
 
@@ -332,6 +353,12 @@ pub const CLASSIC: Preset = Preset {
         ("resize_right", &["L", "ctrl+right"]),
         ("resize_up", &["K", "ctrl+up"]),
         ("resize_down", &["J", "ctrl+down"]),
+        ("next_layout", &["E"]),
+        ("stack_left", &["M h", "M left"]),
+        ("stack_down", &["M j", "M down"]),
+        ("stack_up", &["M k", "M up"]),
+        ("stack_right", &["M l", "M right"]),
+        ("unstack", &["u"]),
         ("new_tab", &["c"]),
         ("next_tab", &["n", "tab"]),
         ("prev_tab", &["p", "shift+tab"]),
@@ -388,6 +415,7 @@ pub const CLASSIC: Preset = Preset {
         ("agent_picker", &["alt+g"]),
     ],
     menus: &[],
+    submenus: &[("M", "Stack with")],
     tool_menu: "",
 };
 
@@ -461,6 +489,8 @@ pub struct Keymap {
     /// What a tool's key follows: each key of the tool menu, or nothing (tools then follow the
     /// prefix directly).
     tool_menu: Vec<Vec<KeySpec>>,
+    /// Sequences that open a menu further in, with its title.
+    submenus: Vec<(Vec<KeySpec>, &'static str)>,
 }
 
 /// The sequences `text` stands for. `{id}` is each key of menu `id` (none when the menu has no
@@ -600,7 +630,7 @@ pub const MODE_KEYS: &[(&str, &[(&str, &str)])] = &[
     (
         "Mouse",
         &[
-            ("click", "focus a pane, tab, workspace or agent"),
+            ("click", "focus a pane, tab, workspace or agent; open a folded pane"),
             ("drag a border", "resize panes"),
             ("drag in a pane", "select and copy (double: word, triple: line)"),
             ("ctrl+click", "open a link; on a frame's top: mark for broadcast"),
@@ -682,7 +712,13 @@ impl Keymap {
             "" => vec![Vec::new()],
             t => expand(t, &menus, &prefix).unwrap_or_default(),
         };
-        let mut km = Keymap { preset: preset.name, prefix, direct: kept, menus, tool_menu, ..Keymap::default() };
+        let submenus = preset
+            .submenus
+            .iter()
+            .flat_map(|(seq, title)| expand(seq, &menus, &prefix).unwrap_or_default().into_iter().map(|k| (k, *title)))
+            .collect();
+        let mut km =
+            Keymap { preset: preset.name, prefix, direct: kept, menus, tool_menu, submenus, ..Keymap::default() };
         for (keys, a) in leader {
             km.add(keys, Command::Action(a), &mut warnings);
         }
@@ -832,10 +868,11 @@ impl Keymap {
 
     /// The title of the menu `keys` open, if it has one.
     pub fn group_title(&self, keys: &[KeySpec]) -> Option<&'static str> {
-        match keys {
+        let menu = match keys {
             [k] => self.menus.iter().find(|m| m.keys.contains(k)).map(|m| m.title),
             _ => None,
-        }
+        };
+        menu.or_else(|| self.submenus.iter().find(|(seq, _)| seq == keys).map(|(_, title)| *title))
     }
 
     /// `ctrl+b B`: how to open menu `id`.
@@ -1183,5 +1220,44 @@ mod tests {
         // Not when the terminal said where the key is: Shift+7 on a US keyboard types `&`.
         let shifted = km.leader_key(&[], received(b"\x1b[55:38:55;2;38u"));
         assert_ne!(km.lookup(&[shifted]), Lookup::Run(Command::Action(Tab(1))));
+    }
+
+    #[test]
+    fn stacks_and_layouts_are_in_the_panes_menu() {
+        let arrow = |code: KeyCode| Key { code, mods: Mods::NONE, raw: Vec::new() };
+        let run = |a: Action| Lookup::Run(Command::Action(a));
+        let (km, _) = Keymap::build(&cfg("").keys);
+        assert_eq!(km.lookup(&[key('P'), key('l')]), run(NextLayout));
+        assert_eq!(km.lookup(&[key('P'), key('u')]), run(Unstack));
+        assert_eq!(km.lookup(&[key('P'), key('s')]), Lookup::More);
+        for (code, a) in [
+            (KeyCode::Left, StackLeft),
+            (KeyCode::Down, StackDown),
+            (KeyCode::Up, StackUp),
+            (KeyCode::Right, StackRight),
+        ] {
+            assert_eq!(km.lookup(&[key('P'), key('s'), arrow(code)]), run(a));
+        }
+        // The keys after `s` have a menu of their own, saying what they stack with.
+        let panes = km.menu(&[key('P')]);
+        let s = panes.iter().find(|e| e.key == KeySpec::parse("s").unwrap()).unwrap();
+        assert!(s.group && s.label == "Stack with", "{s:?}");
+        assert!(panes.iter().any(|e| e.label == "Next layout") && panes.iter().any(|e| e.label == "Unstack"));
+        let sides: Vec<String> = km.menu(&[key('P'), key('s')]).into_iter().map(|e| e.label).collect();
+        assert_eq!(sides, ["The pane on the left", "The pane below", "The pane above", "The pane on the right"]);
+        assert_eq!(km.hint(StackUp).as_deref(), Some("ctrl+b P s up"));
+        let reference = km.reference(false);
+        let (_, rows) = reference.iter().find(|(t, _)| t == "Panes (ctrl+b P)").unwrap();
+        assert!(rows.iter().any(|(k, w)| k == "ctrl+b P s ←" && w == "Stack with the pane on the left"), "{rows:?}");
+        assert!(rows.iter().any(|(k, w)| k == "ctrl+b P l" && w.starts_with("Next layout")), "{rows:?}");
+        // Classic: a key to go through layouts, `M` and a side to stack, `u` to unstack.
+        let (classic, warnings) = Keymap::build(&cfg("[keys]\npreset = \"classic\"\n").keys);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(classic.lookup(&[key('E')]), run(NextLayout));
+        assert_eq!(classic.lookup(&[key('u')]), run(Unstack));
+        assert_eq!(classic.lookup(&[key('M'), key('h')]), run(StackLeft));
+        assert_eq!(classic.lookup(&[key('M'), arrow(KeyCode::Down)]), run(StackDown));
+        let m = classic.menu(&[]).into_iter().find(|e| e.key == KeySpec::parse("M").unwrap()).unwrap();
+        assert!(m.group && m.label == "Stack with", "{m:?}");
     }
 }

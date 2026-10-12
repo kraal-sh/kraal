@@ -7,7 +7,8 @@
 //!
 //! kraal extends panes with two properties: `preview="notes.md"` (show a rendered
 //! file instead of a terminal) and `agent="claude"` (the pane runs a coding agent).
-//! Zellij rejects unknown properties, so files using them are kraal-only.
+//! Zellij rejects unknown properties, so files using them are kraal-only. Stacks are
+//! Zellij's: `pane stacked=true { ... }`, with `expanded=true` on the pane open in it.
 
 use std::fmt::{self, Write as _};
 use std::path::{Path, PathBuf};
@@ -100,6 +101,13 @@ pub enum LayoutNode {
         /// Children in order, with their size along `axis` (`None` shares the remaining space).
         children: Vec<(LayoutNode, Option<SizeSpec>)>,
     },
+    /// Two or more panes sharing one place (Zellij `stacked=true`): one shown whole, the others
+    /// as a title line.
+    Stack {
+        panes: Vec<PaneDef>,
+        /// Index of the pane shown whole (Zellij `expanded=true`).
+        expanded: usize,
+    },
 }
 
 impl LayoutNode {
@@ -118,6 +126,7 @@ impl LayoutNode {
                     child.collect_panes(out);
                 }
             }
+            Self::Stack { panes, .. } => out.extend(panes),
         }
     }
 
@@ -125,6 +134,7 @@ impl LayoutNode {
         match self {
             Self::Pane(pane) => vec![pane],
             Self::Split { children, .. } => children.into_iter().flat_map(|(child, _)| child.into_panes()).collect(),
+            Self::Stack { panes, .. } => panes,
         }
     }
 }
@@ -306,7 +316,7 @@ pub fn to_kdl(ws: &WorkspaceDef) -> String {
         if !tab.floating.is_empty() {
             w.line(2, "floating_panes {");
             for pane in &tab.floating {
-                w.pane(pane, None, base, 3);
+                w.pane(pane, None, base, 3, false);
             }
             w.line(2, "}");
         }
@@ -401,6 +411,11 @@ fn show(value: &KdlValue) -> String {
         KdlValue::Bool(b) => b.to_string(),
         KdlValue::Null => "null".to_owned(),
     }
+}
+
+/// Whether `node` has the property `key` set to true.
+fn is_set(node: &KdlNode, key: &str) -> bool {
+    node.entries().iter().any(|e| entry_key(e) == Some(key) && scalar_text(e.value()).as_deref() == Some("true"))
 }
 
 fn parse_size(value: &KdlValue) -> Option<SizeSpec> {
@@ -680,6 +695,7 @@ impl Parser<'_> {
         let mut cwd_raw = None;
         let mut preview = None;
         let mut plugin = false;
+        let mut stacked = false;
         for entry in node.entries() {
             match entry_key(entry) {
                 Some("name") => def.name = self.string(entry),
@@ -696,6 +712,11 @@ impl Parser<'_> {
                 }
                 Some("preview") => preview = self.path(entry),
                 Some("agent") => def.agent = self.string(entry),
+                Some("stacked") => stacked = self.flag(entry).unwrap_or(stacked),
+                // Read by the stack holding the pane.
+                Some("expanded") => {
+                    self.flag(entry);
+                }
                 Some("plugin") => plugin = true,
                 // Cosmetics and floating-pane geometry, which kraal does not model.
                 Some("borderless" | "x" | "y" | "width" | "height" | "pinned") => {}
@@ -706,11 +727,16 @@ impl Parser<'_> {
 
         let mut children = Vec::new();
         let mut container = false;
+        let mut expanded = None;
         for item in child_nodes(node) {
             match item.name().value() {
                 "pane" => {
                     container = true;
+                    let before = children.len();
                     children.extend(self.pane(item, cwd.as_deref()));
+                    if children.len() > before && expanded.is_none() && is_set(item, "expanded") {
+                        expanded = Some(before);
+                    }
                 }
                 "plugin" => plugin = true,
                 "args" => self.args(item, &mut def.args),
@@ -731,6 +757,9 @@ impl Parser<'_> {
                     node_pos(node),
                     "`command`, `args`, `preview` and `agent` on a pane with child panes are ignored",
                 );
+            }
+            if stacked {
+                return self.stack(node, children, expanded).map(|node| (node, size));
             }
             // A container whose children were all plugins disappears with them.
             return collapse(axis, children).map(|node| (node, size));
@@ -753,6 +782,30 @@ impl Parser<'_> {
         }
         def.cwd = cwd;
         Some((LayoutNode::Pane(def), size))
+    }
+
+    /// The stack of a `stacked=true` pane: its children, `expanded` being the index of the one
+    /// shown whole. Panes nested deeper join it.
+    fn stack(&mut self, node: &KdlNode, children: Vec<SizedNode>, expanded: Option<usize>) -> Option<LayoutNode> {
+        let mut panes = Vec::new();
+        let mut open = 0;
+        for (i, (child, _)) in children.into_iter().enumerate() {
+            if expanded == Some(i) {
+                open = panes.len();
+            }
+            match child {
+                LayoutNode::Pane(pane) => panes.push(pane),
+                nested => {
+                    self.warn(node_pos(node), "nested panes inside a stacked pane are flattened");
+                    panes.extend(nested.into_panes());
+                }
+            }
+        }
+        match panes.len() {
+            0 => None,
+            1 => panes.pop().map(LayoutNode::Pane),
+            _ => Some(LayoutNode::Stack { panes, expanded: open }),
+        }
     }
 
     fn args(&mut self, node: &KdlNode, out: &mut Vec<String>) {
@@ -816,7 +869,17 @@ impl Writer {
 
     fn node(&mut self, node: &LayoutNode, size: Option<SizeSpec>, base: Option<&Path>, depth: usize) {
         match node {
-            LayoutNode::Pane(pane) => self.pane(pane, size, base, depth),
+            LayoutNode::Pane(pane) => self.pane(pane, size, base, depth, false),
+            LayoutNode::Stack { panes, expanded } => {
+                let mut head = String::from("pane stacked=true");
+                push_size(&mut head, size);
+                head.push_str(" {");
+                self.line(depth, &head);
+                for (i, pane) in panes.iter().enumerate() {
+                    self.pane(pane, None, base, depth + 1, i == *expanded);
+                }
+                self.line(depth, "}");
+            }
             LayoutNode::Split { axis, children } => {
                 let mut head = String::from("pane");
                 push_str(&mut head, "split_direction", Some(axis.zellij_name()));
@@ -831,13 +894,14 @@ impl Writer {
         }
     }
 
-    fn pane(&mut self, pane: &PaneDef, size: Option<SizeSpec>, base: Option<&Path>, depth: usize) {
+    fn pane(&mut self, pane: &PaneDef, size: Option<SizeSpec>, base: Option<&Path>, depth: usize, expanded: bool) {
         let mut head = String::from("pane");
         push_str(&mut head, "name", pane.name.as_deref());
         push_str(&mut head, "command", pane.command.as_deref());
         push_cwd(&mut head, pane.cwd.as_deref(), base);
         push_size(&mut head, size);
         push_flag(&mut head, "focus", pane.focus);
+        push_flag(&mut head, "expanded", expanded);
         push_flag(&mut head, "start_suspended", pane.start_suspended);
         push_flag(&mut head, "close_on_exit", pane.close_on_exit);
         if let PaneKind::Preview(path) = &pane.kind {
@@ -1049,14 +1113,14 @@ layout {{
     fn leaf(node: &LayoutNode) -> &PaneDef {
         match node {
             LayoutNode::Pane(pane) => pane,
-            LayoutNode::Split { .. } => panic!("expected a pane, got {node:?}"),
+            _ => panic!("expected a pane, got {node:?}"),
         }
     }
 
     fn split(node: &LayoutNode) -> (Axis, &[(LayoutNode, Option<SizeSpec>)]) {
         match node {
             LayoutNode::Split { axis, children } => (*axis, children),
-            LayoutNode::Pane(_) => panic!("expected a split, got {node:?}"),
+            _ => panic!("expected a split, got {node:?}"),
         }
     }
 
@@ -1396,7 +1460,7 @@ layout {
         pane command="ssh"
     }
     tab name="t" color="red" {
-        pane command="ls" stacked=true {
+        pane command="ls" sticky=true {
             args "-l"
             bogus
         }
@@ -1415,7 +1479,7 @@ keybinds {
             "line 2: unsupported node `mystery` in `layout` ignored",
             "line 3: `pane_template` is not supported; ignored",
             "line 6: unsupported property `color` on `tab` ignored",
-            "line 7: unsupported property `stacked` on `pane` ignored",
+            "line 7: unsupported property `sticky` on `pane` ignored",
             "line 9: unsupported node `bogus` in `pane` ignored",
             "line 11: unexpected argument \"positional\" on `pane` ignored",
             "line 12: `focus` must be true or false, found \"maybe\"; ignored",
@@ -1593,5 +1657,60 @@ layout {
             assert_round_trip(&ws);
             println!("{}: {} tabs, {} panes", ws.name, ws.tabs.len(), ws.panes().len());
         }
+    }
+
+    #[test]
+    fn stacked_panes() {
+        let src = r#"
+layout {
+    pane split_direction="vertical" {
+        pane name="editor" size="60%"
+        pane stacked=true {
+            pane name="logs"
+            pane name="tests" expanded=true
+            pane name="shell" command="htop"
+        }
+    }
+}
+"#;
+        let ws = parse_clean(src);
+        let (_, children) = split(&ws.tabs[0].root);
+        let LayoutNode::Stack { panes, expanded } = &children[1].0 else { panic!("{:?}", children[1]) };
+        let names: Vec<_> = panes.iter().map(|p| p.name.as_deref().unwrap_or_default()).collect();
+        assert_eq!((names, *expanded), (vec!["logs", "tests", "shell"], 1));
+        assert_eq!(ws.panes().len(), 4);
+        assert_round_trip(&ws);
+        let text = to_kdl(&ws);
+        assert!(text.contains("pane stacked=true {"), "{text}");
+        assert!(text.contains("pane name=\"tests\" expanded=true"), "{text}");
+        assert!(!text.contains("name=\"logs\" expanded"), "{text}");
+
+        // Without a pane marked, the first one is open; deeper panes join the stack; a stack of
+        // one pane is that pane.
+        let mut ws = parse(
+            r#"
+layout {
+    pane stacked=true {
+        pane name="a"
+        pane split_direction="vertical" {
+            pane name="b"
+            pane name="c" expanded=true
+        }
+    }
+    pane stacked=true {
+        pane name="d"
+    }
+}
+"#,
+        );
+        assert_eq!(ws.warnings.len(), 1, "{:?}", ws.warnings);
+        assert!(ws.warnings[0].contains("flattened"), "{:?}", ws.warnings);
+        let (axis, children) = split(&ws.tabs[0].root);
+        assert_eq!(axis, Axis::Column);
+        let LayoutNode::Stack { panes, expanded } = &children[0].0 else { panic!("{:?}", children[0]) };
+        assert_eq!((panes.len(), *expanded), (3, 0));
+        assert_eq!(leaf(&children[1].0).name.as_deref(), Some("d"));
+        ws.warnings.clear();
+        assert_round_trip(&ws);
     }
 }
