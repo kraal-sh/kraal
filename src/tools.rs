@@ -260,8 +260,8 @@ impl ToolDef {
                 script.push_str(&format!(" {k}={}", shell::quote(&v)));
             }
             script.push_str(&format!(" sh -c {}", shell::quote(&self.command)));
+            // Every script goes through sh: the login shell on the server may not be a POSIX one.
             spec.command = if ctx.secrets.is_empty() {
-                // Through sh: the login shell on the server may not be a POSIX one.
                 ssh_command(server, &[shell::sh_c(&script)])
             } else {
                 // The values go through ssh's input into a private file on the server, which the
@@ -272,9 +272,9 @@ impl ToolDef {
                 let receive = "umask 077; f=$(mktemp) || exit 1; \
                      (sleep 120; rm -f \"$f\") </dev/null >/dev/null 2>&1 & \
                      if ! cat > \"$f\"; then rm -f \"$f\"; exit 1; fi; echo \"$f\"";
-                upload.push(format!("sh -c {}", shell::quote(receive)));
+                upload.push(shell::sh_c(receive));
                 let inner = format!("set -a; . \"$1\"; rm -f \"$1\"; set +a; {script}");
-                let main = ssh_command(server, &[format!("sh -c {} kraal", shell::quote(&inner))]);
+                let main = ssh_command(server, &[format!("{} kraal", shell::sh_c(&inner))]);
                 let wrapper = format!(
                     "{}f=$(printf '%s' \"${SECRET_VAR}\" | {}) || exit 1; unset {SECRET_VAR}; \
                      case $f in *[!A-Za-z0-9._/-]*|[!/]*|'') echo 'kraal: could not hand over the secret values' >&2; exit 1;; esac; \
@@ -491,9 +491,8 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("kraal-secrets-{}", std::process::id()));
         let tmp = dir.join("tmp");
         std::fs::create_dir_all(&tmp).unwrap();
-        // A stand-in for ssh: it runs the remote command line as a login shell would.
+        // A stand-in for ssh: it runs the remote command line as the login shell would.
         let fake = dir.join("ssh");
-        crate::testing::write_script(&fake, "#!/bin/sh\nshift\nexec sh -c \"$*\"\n");
         let ssh = |s: &Server, remote: &[String]| {
             let mut v = vec![fake.display().to_string(), s.destination()];
             v.extend(remote.iter().cloned());
@@ -501,7 +500,8 @@ mod tests {
         };
         let secret = "it's a \"$hush\" `x`";
         let out = dir.join("out");
-        let t = tool(&format!("command = \"printf '%s' \\\"$TOKEN\\\" > {}\"", out.display()));
+        // A backslash in the command: fish reads `\\` inside single quotes as one.
+        let t = tool(&format!("command = '''printf '%s\\\\n' \"$TOKEN\" > {}'''", out.display()));
         let run = |spec: &crate::pane::PaneSpec, with_secrets: bool| {
             let mut c = std::process::Command::new(&spec.command[0]);
             c.args(&spec.command[1..]).env("TMPDIR", &tmp).envs(spec.env.iter().cloned());
@@ -516,15 +516,21 @@ mod tests {
             ..Default::default()
         };
         let local_ctx = ToolContext { secrets: vec![("TOKEN".into(), secret.into())], ..Default::default() };
-        for ctx in [remote_ctx, local_ctx] {
+        let logins =
+            ["sh", "bash", "zsh", "fish", "tcsh", "csh"].into_iter().filter(|s| crate::transfer::have_program(s));
+        let runs = logins.map(|login| (Some(login), &remote_ctx)).chain([(None, &local_ctx)]);
+        for (login, ctx) in runs {
+            if let Some(login) = login {
+                crate::testing::write_script(&fake, &format!("#!/bin/sh\nshift\nexec {login} -c \"$*\"\n"));
+            }
             let _ = std::fs::remove_file(&out);
-            let spec = t.spec(&ctx, &ssh);
+            let spec = t.spec(ctx, &ssh);
             assert!(!spec.command.iter().any(|w| w.contains("hush")), "{:?}", spec.command);
             assert!(!format!("{spec:?}").contains("hush"));
             assert!(!serde_json::to_string(&spec).unwrap().contains("hush"));
             let done = run(&spec, true);
-            assert!(done.status.success(), "{done:?}");
-            assert_eq!(std::fs::read_to_string(&out).unwrap(), secret);
+            assert!(done.status.success(), "through {login:?}: {done:?}");
+            assert_eq!(std::fs::read_to_string(&out).unwrap(), format!("{secret}\\n"), "through {login:?}");
             assert_eq!(std::fs::read_dir(&tmp).unwrap().count(), 0, "the uploaded values are deleted");
             // Restored without its values (they are not kept), it refuses to run.
             let _ = std::fs::remove_file(&out);
