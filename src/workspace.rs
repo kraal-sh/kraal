@@ -1713,4 +1713,52 @@ layout {
         ws.warnings.clear();
         assert_round_trip(&ws);
     }
+
+    /// Workspace files as users write them, damaged any way: read without a panic, and what is read
+    /// written back reads the same.
+    #[test]
+    fn fuzz_workspace_files() {
+        let samples = [
+            zellij_fleet(),
+            "layout {\n    pane split_direction=\"vertical\" {\n        pane size=\"30%\" command=\"htop\"\n        pane stacked=true {\n            pane name=\"a\" cwd=\"~/x\"\n            pane name=\"b\" expanded=true\n        }\n    }\n}\n".to_string(),
+            "layout {\n    cwd \"/srv\"\n    tab name=\"t\" focus=true {\n        pane size=3 borderless=true\n        pane split_direction=\"horizontal\" { pane; pane; }\n    }\n    floating_panes { pane x=1 y=\"10%\" width=40 height=\"50%\" }\n}\n".to_string(),
+        ];
+        let tokens: &[&[u8]] = &[
+            b"pane ",
+            b"{",
+            b"}",
+            b"\n",
+            b"size=",
+            b"\"",
+            b"=",
+            b"split_direction=\"vertical\"",
+            b"stacked=true",
+            b"tab ",
+            b"layout {",
+            b"cwd=\"..\"",
+            b"r#\"",
+            b"/-",
+            b";",
+            b"100%",
+            b"0",
+            b"-1",
+            b"999999999999",
+        ];
+        crate::fuzz::run("workspace_files", 100, |rng| {
+            let mut text = rng.pick(&samples).clone().into_bytes();
+            for _ in 0..rng.range(1, 4) {
+                rng.mutate(&mut text, tokens);
+            }
+            let text = String::from_utf8_lossy(&text);
+            if let Ok(mut ws) = parse_workspace("fuzz", &text) {
+                let _ = ws.panes();
+                let written = to_kdl(&ws);
+                let again = parse_workspace("fuzz", &written)
+                    .unwrap_or_else(|e| panic!("what was written does not read: {e:#}\n{written}\nfrom\n{text}"));
+                // What was not understood is said once, when read, and not written back.
+                ws.warnings.clear();
+                assert_eq!(again, ws, "written back:\n{written}\nfrom\n{text}");
+            }
+        });
+    }
 }
