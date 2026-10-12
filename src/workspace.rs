@@ -349,17 +349,30 @@ fn parse_kdl(src: &str) -> Result<KdlDocument> {
     for reading in [Reading::Bytes, Reading::V1, Reading::V2] {
         check_nesting(src.as_bytes(), reading)?;
     }
-    let v2_err = match KdlDocument::parse_v2(src) {
-        Ok(doc) => return Ok(doc),
-        Err(e) => e,
+    // A parser that panics (kdl 4.7's v1 does on `(true` ending a line) does not read the file.
+    let v2_err = match std::panic::catch_unwind(|| KdlDocument::parse_v2(src)) {
+        Ok(Ok(doc)) => return Ok(doc),
+        Ok(Err(e)) => Some(e),
+        Err(_) => None,
     };
-    let v1_err = match KdlDocument::parse_v1(src) {
-        Ok(doc) => return Ok(doc),
-        Err(e) => e,
+    let v1_err = match std::panic::catch_unwind(|| KdlDocument::parse_v1(src)) {
+        Ok(Ok(doc)) => return Ok(doc),
+        Ok(Err(e)) => Some(e),
+        Err(_) => None,
     };
     // Neither dialect fits: report the parser that got further, which most likely
     // matches the dialect the author intended. Ties go to v1, Zellij's dialect.
-    let err = if error_offset(&v2_err) > error_offset(&v1_err) { &v2_err } else { &v1_err };
+    let err = match (&v2_err, &v1_err) {
+        (Some(v2), Some(v1)) => {
+            if error_offset(v2) > error_offset(v1) {
+                v2
+            } else {
+                v1
+            }
+        }
+        (Some(e), None) | (None, Some(e)) => e,
+        (None, None) => anyhow::bail!("invalid KDL"),
+    };
     Err(anyhow!("invalid KDL: {}", describe_error(src, err)))
 }
 
@@ -1906,6 +1919,13 @@ layout {
                 assert_eq!(again, ws, "written back:\n{written}\nfrom\n{text}");
             }
         });
+    }
+
+    /// A file one of the parsers panics on is an error, not a panic of the server that reads it.
+    #[test]
+    fn a_file_a_parser_panics_on_does_not_read() {
+        let err = parse_workspace("broken", "layout {\n(true\n").unwrap_err();
+        assert!(err.to_string().starts_with("invalid KDL"), "{err}");
     }
 
     /// A file nesting blocks thousands deep is refused, not read until the stack overflows (on a
