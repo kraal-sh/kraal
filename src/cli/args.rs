@@ -522,7 +522,7 @@ pub enum RunbookCmd {
         /// Where to run it: a server, user@host or @group.
         #[arg(long)]
         on: Option<String>,
-        /// A parameter, NAME=value (repeat for several).
+        /// A parameter, NAME=value (repeat for several): one of its choices when it has some.
         #[arg(short, long = "param")]
         params: Vec<String>,
         /// Run without asking about the plan. It approves nothing: a repository's runbook that

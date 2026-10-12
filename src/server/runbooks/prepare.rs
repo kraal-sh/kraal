@@ -8,6 +8,7 @@ use anyhow::{Context, Result, bail};
 
 use super::{Draft, PLAN_LIFETIME, Target, first_line, list_choices};
 use crate::layout::PaneId;
+use crate::protocol::{Response, ServerMsg};
 use crate::runbooks::{self, Body, On, Source};
 use crate::server::ui::{ConfirmAction, Mode, PickAction, PickItem, Picker, PickerKind, Prompt, PromptAction};
 use crate::server::{ClientId, Server};
@@ -350,15 +351,20 @@ impl Server {
     }
 
     /// `kraal runbook run`: resolve everything now (file, targets, parameters) and keep it, with
-    /// where each target is; return the plan's text and a token that runs it, or refuses if a
-    /// target is no longer where the plan said.
+    /// where each target is; the client `reply` gets the plan's text and a token that runs it,
+    /// or refuses if a target is no longer where the plan said. Each value is held to what the
+    /// picker offers for its parameter ([`Server::param_question`]): the choices its file gives,
+    /// and those a command lists, unless the runbook is a repository's nobody approved yet.
+    /// No command of that one runs: the plan says which values wait, and its run holds them to
+    /// their lists if it is approved by then ([`Server::run_prepared`]).
     pub(in crate::server) fn prepare_runbook(
         &mut self,
         path: &Path,
         target: Option<&str>,
         params: Vec<(String, String)>,
         pane: Option<PaneId>,
-    ) -> Result<(String, String)> {
+        reply: ClientId,
+    ) -> Result<()> {
         let r = runbooks::load(path, runbooks::source_of(path))?;
         let Body::Steps(steps) = &r.body else {
             bail!("{} is a document: open it in kraal with {} and run its steps there", r.name, self.runbooks_key())
@@ -390,12 +396,72 @@ impl Server {
         if !missing.is_empty() {
             bail!("missing parameters: {} (-p NAME=value)", missing.join(", "));
         }
-        let text = self.plan(&d, true);
+        for (p, (_, value)) in d.steps.params.iter().zip(&d.values) {
+            p.accept(value, &p.choices)?;
+        }
+        if !d.trusted {
+            let why = "its choices are listed once the runbook is approved";
+            let waiting = d.listed().iter().map(|(p, ..)| format!("{} is taken as given: {why}", p.name)).collect();
+            self.send_plan(reply, d, waiting);
+            return Ok(());
+        }
+        self.hold_to_listed(d, move |server, held| match held {
+            Ok((d, unchecked)) => server.send_plan(reply, d, unchecked),
+            Err(e) => server.answer_runbook(reply, Err(e)),
+        })
+    }
+
+    /// Hold the values of a draft made for the command line to the choices its parameters'
+    /// commands list, off the loop, then call `then` with the draft, or with the value that is
+    /// refused. A command that fails or lists nothing constrains nothing, as in the picker,
+    /// which then asks for text: `then` gets a line that says so for each that failed.
+    fn hold_to_listed(
+        &mut self,
+        d: Draft,
+        then: impl FnOnce(&mut Server, Result<(Draft, Vec<String>)>) + 'static,
+    ) -> Result<()> {
+        let listed = d.listed();
+        if listed.is_empty() {
+            then(self, Ok((d, Vec::new())));
+            return Ok(());
+        }
+        let (name, cwd, vars) = (d.runbook.name.clone(), self.draft_cwd(&d), self.draft_vars(&d));
+        let started = self.background(
+            move || -> Result<Vec<String>> {
+                let mut unchecked = Vec::new();
+                for (p, cmd, value) in listed {
+                    match list_choices(&cmd, cwd.as_deref(), &vars) {
+                        Ok(choices) => p.accept(&value, &choices)?,
+                        Err(e) => unchecked.push(format!("{} is taken as given: {e:#}", p.name)),
+                    }
+                }
+                Ok(unchecked)
+            },
+            move |server, held| then(server, held.map(|unchecked| (d, unchecked))),
+        );
+        anyhow::ensure!(started, "cannot list the choices of {name}");
+        Ok(())
+    }
+
+    /// Keep a draft resolved for the command line, for ten minutes, and send `reply` its plan:
+    /// the text, which ends with what was not checked of its values, and the token that runs it.
+    fn send_plan(&mut self, reply: ClientId, mut d: Draft, unchecked: Vec<String>) {
+        let mut text = self.plan(&d, true);
+        for line in unchecked {
+            text.push('\n');
+            text.push_str(&line);
+        }
         d.reviewed = Some(self.identities(&d));
         let token = crate::accounts::new_uuid();
         self.plans.retain(|_, (made, _)| made.elapsed() < PLAN_LIFETIME);
         self.plans.insert(token.clone(), (Instant::now(), d));
-        Ok((text, token))
+        self.answer_runbook(reply, Ok(Response::Plan { text, token }));
+    }
+
+    /// Answer the `kraal runbook run` that waits for its plan, or for its run to start.
+    fn answer_runbook(&mut self, reply: ClientId, answer: Result<Response>) {
+        self.send_msg(reply, &ServerMsg::Response { result: answer.map_err(|e| format!("{e:#}")) });
+        self.clients.remove(&reply);
     }
 
     /// Run a plan prepared by [`Server::prepare_runbook`] for the CLI client `reply`, which gets
@@ -407,7 +473,24 @@ impl Server {
         if made.elapsed() > PLAN_LIFETIME {
             bail!("the plan is more than 10 minutes old: review the runbook again");
         }
+        // Until here, `trusted` says whether the runbook was approved when its plan was made:
+        // whether the commands that list choices ran for it.
+        let listed = d.trusted;
         d.trusted = runbooks::trusted(&d.runbook);
-        self.launch_runbook(d, super::Asker { client: None, reply: Some(reply) })
+        let asker = super::Asker { client: None, reply: Some(reply) };
+        // One that is still not approved is refused there, before any of its commands runs.
+        if listed || !d.trusted {
+            return self.launch_runbook(d, asker);
+        }
+        // Approved since its plan: the values that waited for it are held to their lists now.
+        self.hold_to_listed(d, move |server, held| {
+            let launched = held.and_then(|(d, unchecked)| {
+                server.warnings.extend(unchecked.iter().map(|line| format!("{}: {line}", d.runbook.name)));
+                server.launch_runbook(d, asker)
+            });
+            if let Err(e) = launched {
+                server.answer_runbook(reply, Err(e));
+            }
+        })
     }
 }

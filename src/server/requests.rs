@@ -14,8 +14,9 @@ type Reply = Option<Result<Response, String>>;
 impl Server {
     /// Handle one request. `None` means the answer comes later, once what the request waits for
     /// is done: a `kraal wait` condition met, a remote file fetched and its editor open, a
-    /// runbook run started, the server stopped, or the git details read of the directory a new
-    /// pane or agent opens in. A subscription is answered by its stream of events.
+    /// runbook's plan made or its run started, the server stopped, or the git details read of
+    /// the directory a new pane or agent opens in. A subscription is answered by its stream of
+    /// events.
     pub(super) fn request(&mut self, client: ClientId, req: Request) -> Reply {
         let reply = self.answer(client, req);
         // A request that created a workspace for a pane that then failed to start leaves it
@@ -31,9 +32,11 @@ impl Server {
                     Ok(p) => p,
                     Err(e) => return Some(Err(e)),
                 };
-                self.prepare_runbook(&path, target.as_deref(), params, pane)
-                    .map(|(text, token)| Response::Plan { text, token })
-                    .map_err(|e| format!("{e:#}"))
+                // Answered once the choices a parameter's command lists are known.
+                match self.prepare_runbook(&path, target.as_deref(), params, pane, client) {
+                    Ok(()) => return None,
+                    Err(e) => Err(format!("{e:#}")),
+                }
             }
             // Answered once the run is on record and its targets have started.
             Request::RunbookRun { token } => match self.run_prepared(&token, client) {

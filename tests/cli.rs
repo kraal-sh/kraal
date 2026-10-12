@@ -2436,6 +2436,117 @@ fn runbooks_run_locally_and_on_servers() {
     }
 }
 
+/// `kraal runbook run` takes for a parameter what the list of runbooks would: one of its
+/// choices when it has some, written in its file or listed by its command, and anything
+/// otherwise. A refusal names the choices and comes in place of the plan, so `--dry-run` fails
+/// too. The command of a repository runbook nobody approved does not run: its plan says which
+/// value waits, its run is refused, and once the runbook is approved a run of that plan holds
+/// the value to the list.
+#[test]
+fn a_runbook_value_is_one_its_question_offers() {
+    let env = Env::new("rbchoice");
+    let (ran, listed) = (env.root.join("ran"), env.root.join("listed"));
+    let runbooks = env.root.join("config/kraal/runbooks");
+    std::fs::create_dir_all(&runbooks).unwrap();
+    let step = format!("steps = [\"echo $V > {}\"]\n", ran.display());
+    let write = |name: &str, param: &str| {
+        let text = format!("{step}[[param]]\nname = \"V\"\n{param}");
+        std::fs::write(runbooks.join(format!("{name}.toml")), text).unwrap();
+    };
+    write("site", "choices = [\"shop\", \"blog\"]\ndefault = \"shop\"\n");
+    write("odd", "choices = [\"shop\", \"blog\"]\ndefault = \"docs\"\n");
+    write("tag", &format!("choices_command = \"echo x >> {}; echo v1; echo v2\"\n", listed.display()));
+    std::fs::write(
+        runbooks.join("flaky.toml"),
+        "steps = [\"true\"]\n[[param]]\nname = \"A\"\nchoices_command = \"echo no >&2; exit 3\"\n[[param]]\nname = \"B\"\nchoices_command = \"true\"\n",
+    )
+    .unwrap();
+    env.workspace("w", "layout {\n    pane name=\"main\"\n}\n");
+    env.run(&["open", "w"]);
+    // Whether it succeeded, what it printed, and its error.
+    let kraal = |dir: &Path, args: &[&str]| {
+        let mut c = env.cmd(&[&["runbook", "run"], args].concat());
+        let out = c.current_dir(dir).stdin(std::process::Stdio::null()).output().unwrap();
+        let text = |bytes: &[u8]| String::from_utf8_lossy(bytes).into_owned();
+        (out.status.success(), text(&out.stdout), text(&out.stderr))
+    };
+
+    // Choices written in the file: no plan for another value, and nothing runs.
+    let (ok, plan, why) = kraal(&env.root, &["site", "--dry-run", "-p", "V=nope"]);
+    assert!(!ok && plan.is_empty(), "{plan}");
+    assert!(why.contains("V=nope is not one of its choices: shop, blog"), "{why}");
+    let (ok, _, why) = kraal(&env.root, &["site", "--yes", "--wait", "-p", "V=nope"]);
+    assert!(!ok && why.contains("V=nope is not one of its choices") && !ran.exists(), "{why}");
+    for (args, value) in [(&["-p", "V=blog"][..], "V=blog"), (&[], "V=shop")] {
+        let (ok, plan, why) = kraal(&env.root, &[&["site", "--dry-run"], args].concat());
+        assert!(ok && plan.contains(value), "{args:?}: {plan}{why}");
+    }
+    // A default is a value like another.
+    let (ok, _, why) = kraal(&env.root, &["odd", "--dry-run"]);
+    assert!(!ok && why.contains("V=docs is not one of its choices: shop, blog"), "{why}");
+
+    // Choices listed by a command, once for a plan: its run does not list them again.
+    let (ok, _, why) = kraal(&env.root, &["tag", "--dry-run", "-p", "V=v3"]);
+    assert!(!ok && why.contains("V=v3 is not one of its choices: v1, v2"), "{why}");
+    let (ok, said, why) = kraal(&env.root, &["tag", "--yes", "--wait", "-p", "V=v2"]);
+    assert!(ok && said.contains("finished: 1 ok"), "{said}{why}");
+    assert_eq!(std::fs::read_to_string(&ran).unwrap(), "v2\n");
+    assert_eq!(std::fs::read_to_string(&listed).unwrap(), "x\nx\n");
+    // A command that fails, or lists nothing, leaves the question a field: the plan says which
+    // value was not checked.
+    let (ok, plan, why) = kraal(&env.root, &["flaky", "--dry-run", "-p", "A=any", "-p", "B=thing"]);
+    assert!(ok, "{why}");
+    assert!(plan.contains("A is taken as given: \"echo no >&2; exit 3\" failed: no"), "{plan}");
+    assert!(!plan.contains("B is taken"), "{plan}");
+
+    // A repository's runbook, not approved: its command does not run. The plan says so, and a
+    // run is refused for the approval it lacks.
+    let repo = env.root.join("app");
+    let deploy =
+        format!("{step}[[param]]\nname = \"V\"\nchoices_command = \"echo x >> {}; echo v1\"\n", listed.display());
+    let _ = git_repo(&repo, &[(".kraal/runbooks/deploy.toml", &deploy)]);
+    let file = repo.join(".kraal/runbooks/deploy.toml");
+    for left in [&ran, &listed] {
+        std::fs::remove_file(left).unwrap();
+    }
+    // What any program can send: a plan asked for, then run by its token.
+    let plan = |value: &str| {
+        let params = serde_json::json!([["V", value]]);
+        let request =
+            serde_json::json!({ "cmd": "runbook_plan", "path": file, "target": null, "params": params, "pane": null });
+        let plan = raw_request(&env, request);
+        plan["Ok"]["data"]["token"].as_str().unwrap_or_else(|| panic!("no plan: {plan}")).to_string()
+    };
+    let run = |token: &str| raw_request(&env, serde_json::json!({ "cmd": "runbook_run", "token": token }));
+    let (ok, shown, why) = kraal(&repo, &["deploy", "--dry-run", "-p", "V=nope"]);
+    assert!(ok, "{why}");
+    assert!(shown.contains("V is taken as given: its choices are listed once the runbook is approved"), "{shown}");
+    let answer = run(&plan("v1"));
+    assert!(answer["Err"].as_str().is_some_and(|e| e.contains("is not approved")), "{answer}");
+    let (other, known) = (plan("nope"), plan("v1"));
+    assert!(!listed.exists() && !ran.exists());
+    // A refusal quotes the choices its file gives: a terminal acts on none of it.
+    let erasing = "steps = [\"true\"]\n[[param]]\nname = \"V\"\nchoices = [\"a\\u001b[2J\"]\n";
+    std::fs::write(repo.join(".kraal/runbooks/pick.toml"), erasing).unwrap();
+    let (ok, _, why) = kraal(&repo, &["pick", "--dry-run", "-p", "V=b"]);
+    assert!(!ok && why.contains("V=b is not one of its choices: a\\u{1b}[2J") && !why.contains('\x1b'), "{why:?}");
+
+    // Approved: its list holds from now on, for the plans made before too.
+    let trust = env.cmd(&["runbook", "trust", "deploy"]).current_dir(&repo).output().unwrap();
+    assert!(trust.status.success(), "{}", String::from_utf8_lossy(&trust.stderr));
+    let (ok, _, why) = kraal(&repo, &["deploy", "--dry-run", "-p", "V=nope"]);
+    assert!(!ok && why.contains("V=nope is not one of its choices: v1"), "{why}");
+    let answer = run(&other);
+    assert!(answer["Err"].as_str().is_some_and(|e| e.contains("V=nope is not one of its choices: v1")), "{answer}");
+    assert!(!ran.exists());
+    let answer = run(&known);
+    assert!(answer["Ok"].is_object(), "{answer}");
+    wait_until(Duration::from_secs(10), "the plan made before the approval never ran", || {
+        std::fs::read_to_string(&ran).is_ok_and(|said| said == "v1\n")
+    });
+    assert_eq!(std::fs::read_to_string(&listed).unwrap(), "x\nx\nx\n");
+}
+
 /// Keys typed while the runbooks are being listed go to the list, not to the shell under it.
 #[cfg(target_os = "linux")]
 #[test]
@@ -2535,7 +2646,7 @@ fn a_repository_runbook_runs_only_once_approved() {
     let out = kraal(&["run", "deploy", "--yes", "--wait"]);
     assert!(out.status.success(), "{}", text(&out));
     assert_eq!(std::fs::read_to_string(&ran).unwrap(), "one\n");
-    assert!(!listed.exists(), "the command line asks for no choice");
+    assert!(listed.exists(), "approved, it lists the choices its value is held to");
     std::fs::remove_file(&ran).unwrap();
     let answer = run_plan(&before);
     assert!(answer["Ok"].is_object(), "{answer}");
@@ -2543,14 +2654,16 @@ fn a_repository_runbook_runs_only_once_approved() {
         std::fs::read_to_string(&ran).is_ok_and(|t| t == "one\n")
     });
 
-    // Changed since: that version was never approved.
+    // Changed since: that version was never approved, and lists no more than it runs.
     std::fs::write(&file, version("two")).unwrap();
+    std::fs::remove_file(&listed).unwrap();
     let out = kraal(&["run", "deploy", "--yes", "--wait"]);
     assert!(!out.status.success() && text(&out).contains("`kraal runbook trust deploy`"), "{}", text(&out));
     let answer = run_plan(&plan());
     assert!(refused(&answer), "{answer}");
     std::thread::sleep(Duration::from_millis(300));
     assert_eq!(std::fs::read_to_string(&ran).unwrap(), "one\n");
+    assert!(!listed.exists());
     let out = kraal(&["trust", "deploy"]);
     assert!(out.status.success(), "{}", text(&out));
     let out = kraal(&["run", "deploy", "--yes", "--wait"]);

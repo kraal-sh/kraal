@@ -213,7 +213,9 @@ pub(super) fn run(action: RunbookCmd, socket: &std::path::Path, own_pane: Option
                 }
             }
             let prepare = Request::RunbookPlan { path: r.path.clone(), target: on, params: values, pane: own_pane };
-            let Response::Plan { text, token } = client::request(socket, prepare)? else {
+            // A refusal may quote the file too: the choices of a parameter.
+            let refused = |e: anyhow::Error| anyhow::anyhow!(r.source.shown(&format!("{e:#}")));
+            let Response::Plan { text, token } = client::request(socket, prepare).map_err(refused)? else {
                 anyhow::bail!("unexpected answer from the server")
             };
             println!("{}", r.source.shown(&text));

@@ -18,7 +18,8 @@ steps = [
   'script/deploy production "$VERSION"',
 ]
 
-# Asked for before the plan is shown, with the latest tags to choose from.
+# Asked for before the plan is shown, with the latest tags to choose from; -p takes one of
+# them too.
 [[param]]
 name = "VERSION"
 prompt = "Version to deploy"

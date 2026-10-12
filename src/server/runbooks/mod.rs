@@ -18,7 +18,7 @@ use crate::layout::PaneId;
 use crate::pane::PaneSpec;
 use crate::paths;
 use crate::protocol::Placement;
-use crate::runbooks::{self, Block, Body, On, Runbook, Source, Steps};
+use crate::runbooks::{self, Block, Body, On, Param, Runbook, Source, Steps};
 use crate::servers;
 
 /// Where one copy of a runbook runs.
@@ -67,6 +67,13 @@ impl Draft {
     fn new(runbook: Runbook, steps: Steps, pane: Option<PaneId>, targets: Option<Vec<Target>>) -> Draft {
         let trusted = runbooks::trusted(&runbook);
         Draft { id: 0, runbook, steps, pane, targets, values: Vec::new(), trusted, choices: None, reviewed: None }
+    }
+
+    /// The parameters whose choices a command lists, each with that command and its value, in
+    /// a draft that has all its values.
+    fn listed(&self) -> Vec<(Param, String, String)> {
+        let params = self.steps.params.iter().zip(&self.values).filter(|(p, _)| p.choices.is_empty());
+        params.filter_map(|(p, (_, value))| Some((p.clone(), p.choices_command.clone()?, value.clone()))).collect()
     }
 
     /// `NAME=value` lines, secrets masked.
