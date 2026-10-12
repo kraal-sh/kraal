@@ -1,12 +1,15 @@
 //! Starting a pane's program, and holding the programs of many panes to start them after.
 //!
-//! portable-pty starts a program with `std::process::Command`, which forks the server: the more
-//! memory the server has, the longer each fork. On Linux a pane's program is started here with
-//! `posix_spawn` instead, which does not copy it. Either way the start waits for the program to
-//! run, so that a failure is said at once. The panes of a workspace are set up while a batch is
-//! held (see [`batch`]): all of them first, then their programs are started one after the other
-//! on a thread of their own (see `super::pty::launcher`), while the server shows the first
-//! prompts.
+//! A program is started here set up as portable-pty sets it up, but not by portable-pty: its
+//! child closes every descriptor beyond the standard ones before exec, std's own pipe included,
+//! so a program that cannot run (its interpreter missing) looks started and only prints std's
+//! "fatal runtime error" in its pane. On Linux the program starts with `posix_spawn`, which does
+//! not copy the server's memory (the more the server has, the longer each fork); elsewhere with
+//! std's fork and exec, the server's descriptors marked close-on-exec rather than closed. Either
+//! way the start waits for the program to run, so that a failure is said at once. The panes of a
+//! workspace are set up while a batch is held (see [`batch`]): all of them first, then their
+//! programs are started one after the other on a thread of their own (see
+//! `super::pty::launcher`), while the server shows the first prompts.
 
 use std::cell::Cell;
 
@@ -51,19 +54,18 @@ pub struct Launch {
 }
 
 enum How {
-    #[cfg(target_os = "linux")]
-    Spawn(linux::Prepared),
+    Spawn(native::Prepared),
+    /// What only portable-pty starts: a terminal without a name, or an environment that is not
+    /// all text.
     Portable(CommandBuilder),
 }
 
 /// Get `cmd` ready to start with the terminal of `master` (whose slave end is `slave`) as its
 /// controlling terminal: what would make it fail to be found fails now.
 pub(super) fn prepare(master: &dyn MasterPty, slave: Box<dyn SlavePty + Send>, cmd: CommandBuilder) -> Result<Launch> {
-    #[cfg(target_os = "linux")]
-    if let Some(tty) = master.tty_name().filter(|_| linux::environment_is_text()) {
-        return Ok(Launch { how: How::Spawn(linux::Prepared::new(&cmd, &tty)?), slave });
+    if let Some(tty) = master.tty_name().filter(|_| native::environment_is_text()) {
+        return Ok(Launch { how: How::Spawn(native::Prepared::new(&cmd, &tty)?), slave });
     }
-    let _ = master;
     Ok(Launch { how: How::Portable(cmd), slave })
 }
 
@@ -73,6 +75,8 @@ impl Launch {
         let child = match self.how {
             #[cfg(target_os = "linux")]
             How::Spawn(prepared) => Box::new(prepared.spawn()?) as PaneChild,
+            #[cfg(not(target_os = "linux"))]
+            How::Spawn(prepared) => Box::new(prepared.fork()?) as PaneChild,
             How::Portable(cmd) => self.slave.spawn_command(cmd)?,
         };
         drop(self.slave);
@@ -80,14 +84,15 @@ impl Launch {
     }
 }
 
-#[cfg(target_os = "linux")]
-mod linux {
+mod native {
     use std::ffi::{CString, OsStr, OsString};
     use std::os::unix::ffi::OsStrExt;
     use std::path::{Component, Path, PathBuf};
 
     use anyhow::{Context, Result, bail};
-    use portable_pty::{Child, ChildKiller, CommandBuilder, ExitStatus};
+    use portable_pty::CommandBuilder;
+    #[cfg(target_os = "linux")]
+    use portable_pty::{Child, ChildKiller, ExitStatus};
 
     /// Where `exe` is, looked for as portable-pty does (and with the same errors): relative to
     /// `dir` when it starts with `./` or `../`, on `path` (relative entries to `dir`) when it is a
@@ -165,7 +170,7 @@ mod linux {
         CString::new(s.as_bytes()).with_context(|| format!("{s:?} holds a NUL byte"))
     }
 
-    /// What `posix_spawn` is given, made as portable-pty makes its command.
+    /// What the program is started with, made as portable-pty makes its command.
     pub(super) struct Prepared {
         program: CString,
         argv: Vec<CString>,
@@ -174,6 +179,7 @@ mod linux {
         tty: CString,
         /// For a program that turns out not to be one the kernel runs (a script without `#!`):
         /// `/bin/sh` runs it, as `execvp` does.
+        #[cfg(target_os = "linux")]
         script: Vec<CString>,
     }
 
@@ -200,16 +206,85 @@ mod linux {
             }
             let program = cstring(program.as_os_str())?;
             let argv: Vec<CString> = argv.iter().map(|a| cstring(a)).collect::<Result<_>>()?;
-            let mut script = vec![CString::new("/bin/sh").expect("no NUL"), program.clone()];
-            script.extend(argv.iter().skip(1).cloned());
-            Ok(Prepared { program, argv, env, dir: cstring(dir.as_os_str())?, tty: cstring(tty.as_os_str())?, script })
+            #[cfg(target_os = "linux")]
+            let script = {
+                let mut script = vec![CString::new("/bin/sh").expect("no NUL"), program.clone()];
+                script.extend(argv.iter().skip(1).cloned());
+                script
+            };
+            Ok(Prepared {
+                program,
+                argv,
+                env,
+                dir: cstring(dir.as_os_str())?,
+                tty: cstring(tty.as_os_str())?,
+                #[cfg(target_os = "linux")]
+                script,
+            })
         }
 
-        /// Start the program, set up as portable-pty sets it up: default signal handling and no
-        /// signal blocked, a session of its own whose controlling terminal is the pane's (opened
-        /// as its standard descriptors), the directory, and nothing else of the server's open.
-        /// A program the kernel does not run (a script without `#!`) runs with `/bin/sh`, as
-        /// `execvp` runs it.
+        /// Start the program with std's fork and exec, set up as portable-pty sets it up
+        /// (default signal handling and no signal blocked, a session of its own whose
+        /// controlling terminal is the pane's, as its standard descriptors, the directory), and
+        /// nothing else of the server's open: its descriptors are marked close-on-exec in the
+        /// child, std's pipe (close-on-exec already) left open to say why exec failed. A program
+        /// the kernel does not run (a script without `#!`) runs with `/bin/sh`, as `execvp`
+        /// runs it.
+        #[cfg(any(not(target_os = "linux"), test))]
+        pub(super) fn fork(self) -> Result<std::process::Child> {
+            use std::os::unix::fs::OpenOptionsExt;
+            use std::os::unix::process::CommandExt;
+            let os = |c: &CString| OsStr::from_bytes(c.as_bytes()).to_owned();
+            // Not as the server's controlling terminal.
+            let tty = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .custom_flags(libc::O_NOCTTY)
+                .open(os(&self.tty))
+                .context("opening the pane's terminal")?;
+            let mut cmd = std::process::Command::new(os(&self.program));
+            cmd.arg0(os(&self.argv[0])).args(self.argv[1..].iter().map(os));
+            cmd.env_clear().envs(self.env.iter().map(|entry| {
+                let entry = entry.as_bytes();
+                let (k, v) = entry.split_at(entry.iter().position(|b| *b == b'=').unwrap_or(entry.len()));
+                (OsStr::from_bytes(k).to_owned(), OsStr::from_bytes(v.get(1..).unwrap_or_default()).to_owned())
+            }));
+            cmd.current_dir(os(&self.dir));
+            cmd.stdin(tty.try_clone()?).stdout(tty.try_clone()?).stderr(tty);
+            // What is opened from now on is std's (its pipe) or close-on-exec already.
+            let last = super::open_descriptors().into_iter().max().unwrap_or(1024);
+            // SAFETY: the child only makes async-signal-safe calls (signal, sigprocmask, setsid,
+            // ioctl, fcntl) before exec.
+            unsafe {
+                cmd.pre_exec(move || {
+                    for sig in 1..32 {
+                        if sig != libc::SIGKILL && sig != libc::SIGSTOP {
+                            libc::signal(sig, libc::SIG_DFL);
+                        }
+                    }
+                    let mut none: libc::sigset_t = std::mem::zeroed();
+                    libc::sigemptyset(&mut none);
+                    libc::sigprocmask(libc::SIG_SETMASK, &none, std::ptr::null_mut());
+                    if libc::setsid() == -1 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    if libc::ioctl(0, libc::TIOCSCTTY as _, 0) == -1 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    for fd in 3..=last {
+                        let flags = libc::fcntl(fd, libc::F_GETFD);
+                        if flags >= 0 && flags & libc::FD_CLOEXEC == 0 {
+                            libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC);
+                        }
+                    }
+                    Ok(())
+                });
+            }
+            Ok(cmd.spawn()?)
+        }
+
+        /// Start the program, set up as [`Prepared::fork`] sets it up, with `posix_spawn`.
+        #[cfg(target_os = "linux")]
         pub(super) fn spawn(self) -> Result<Forked> {
             match self.spawn_program(&self.program, &self.argv) {
                 Err(e) if e.raw_os_error() == Some(libc::ENOEXEC) => {
@@ -219,6 +294,7 @@ mod linux {
             }
         }
 
+        #[cfg(target_os = "linux")]
         fn spawn_program(&self, program: &CString, argv: &[CString]) -> std::io::Result<Forked> {
             let pointers = |s: &[CString]| -> Vec<*mut libc::c_char> {
                 s.iter().map(|s| s.as_ptr().cast_mut()).chain(std::iter::once(std::ptr::null_mut())).collect()
@@ -275,6 +351,7 @@ mod linux {
 
     /// A pane's program started by [`Prepared::spawn`]; reaped by [`Child::try_wait`] or
     /// [`Child::wait`].
+    #[cfg(target_os = "linux")]
     #[derive(Debug)]
     pub(super) struct Forked {
         pid: u32,
@@ -282,6 +359,7 @@ mod linux {
     }
 
     /// The exit status `waitpid` gave.
+    #[cfg(target_os = "linux")]
     fn exit_status(status: libc::c_int) -> ExitStatus {
         if libc::WIFSIGNALED(status) {
             ExitStatus::with_signal(&format!("signal {}", libc::WTERMSIG(status)))
@@ -290,6 +368,7 @@ mod linux {
         }
     }
 
+    #[cfg(target_os = "linux")]
     impl Child for Forked {
         fn try_wait(&mut self) -> std::io::Result<Option<ExitStatus>> {
             if let Some(s) = &self.status {
@@ -331,6 +410,7 @@ mod linux {
         }
     }
 
+    #[cfg(target_os = "linux")]
     impl ChildKiller for Forked {
         /// As portable-pty does: SIGHUP, a moment to go, then SIGKILL.
         fn kill(&mut self) -> std::io::Result<()> {
@@ -360,9 +440,11 @@ mod linux {
     }
 
     /// Signals a [`Forked`] child from elsewhere.
+    #[cfg(target_os = "linux")]
     #[derive(Debug)]
     struct Killer(u32);
 
+    #[cfg(target_os = "linux")]
     impl ChildKiller for Killer {
         fn kill(&mut self) -> std::io::Result<()> {
             // SAFETY: plain syscall.
@@ -401,14 +483,7 @@ pub fn reserve_descriptors() {
 /// inherited stays out of the programs it starts, whatever starts them. Done once, as the
 /// server starts, before any thread.
 pub fn close_inherited() {
-    #[cfg(target_os = "linux")]
-    let dir = "/proc/self/fd";
-    #[cfg(not(target_os = "linux"))]
-    let dir = "/dev/fd";
-    let Ok(entries) = std::fs::read_dir(dir) else { return };
-    let fds: Vec<libc::c_int> =
-        entries.filter_map(|e| e.ok()?.file_name().to_str()?.parse().ok()).filter(|fd| *fd > 2).collect();
-    for fd in fds {
+    for fd in open_descriptors().into_iter().filter(|fd| *fd > 2) {
         // SAFETY: plain fcntl; one closed meanwhile (the directory's own) fails harmlessly.
         unsafe {
             let flags = libc::fcntl(fd, libc::F_GETFD);
@@ -417,6 +492,16 @@ pub fn close_inherited() {
             }
         }
     }
+}
+
+/// The descriptors this process has open (none when they cannot be listed).
+fn open_descriptors() -> Vec<libc::c_int> {
+    #[cfg(target_os = "linux")]
+    let dir = "/proc/self/fd";
+    #[cfg(not(target_os = "linux"))]
+    let dir = "/dev/fd";
+    let Ok(entries) = std::fs::read_dir(dir) else { return Vec::new() };
+    entries.filter_map(|e| e.ok()?.file_name().to_str()?.parse().ok()).collect()
 }
 
 #[cfg(test)]
@@ -440,19 +525,37 @@ mod tests {
         native_pty_system().openpty(PtySize { rows: 50, cols: 200, pixel_width: 0, pixel_height: 0 }).unwrap()
     }
 
-    /// How a program is started in the tests: here, or by portable-pty.
-    #[derive(Clone, Copy)]
+    /// How a program is started in the tests: here (`posix_spawn` on Linux), with std's fork
+    /// and exec (as elsewhere), or by portable-pty.
+    #[derive(Clone, Copy, Debug)]
     enum Way {
         Here,
+        Fork,
         Portable,
     }
 
+    /// The ways kraal starts programs.
+    const OURS: [Way; 2] = [Way::Here, Way::Fork];
+
     /// Start `cmd` with the terminal of `master` (slave end `slave`) the `way` asked.
-    fn started(master: &dyn MasterPty, slave: Box<dyn SlavePty + Send>, cmd: CommandBuilder, way: Way) -> PaneChild {
+    fn start(
+        master: &dyn MasterPty,
+        slave: Box<dyn SlavePty + Send>,
+        cmd: CommandBuilder,
+        way: Way,
+    ) -> Result<PaneChild> {
         match way {
-            Way::Here => prepare(master, slave, cmd).unwrap().run().unwrap(),
-            Way::Portable => slave.spawn_command(cmd).unwrap(),
+            Way::Here => prepare(master, slave, cmd)?.run(),
+            Way::Fork => match prepare(master, slave, cmd)?.how {
+                How::Spawn(prepared) => Ok(Box::new(prepared.fork()?)),
+                How::Portable(_) => panic!("not started here"),
+            },
+            Way::Portable => slave.spawn_command(cmd),
         }
+    }
+
+    fn started(master: &dyn MasterPty, slave: Box<dyn SlavePty + Send>, cmd: CommandBuilder, way: Way) -> PaneChild {
+        start(master, slave, cmd, way).unwrap()
     }
 
     /// Run `cmd` in a terminal of its own: what it printed, and its exit code.
@@ -487,32 +590,39 @@ mod tests {
         assert_eq!(code, 3);
         assert!(portable.contains("KRAAL_SPAWN_TEST=yes\n"), "{portable}");
         assert!(portable.contains(&format!("{}\nzero one\n", dir.display())), "{portable}");
-        assert_eq!(run(cmd(), Way::Here), (portable, 3), "the same environment, directory and arguments");
+        for way in OURS {
+            assert_eq!(
+                run(cmd(), way),
+                (portable.clone(), 3),
+                "{way:?}: the same environment, directory and arguments"
+            );
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn a_program_gets_its_terminal_and_session() {
-        let pair = pty();
-        let mut cmd = CommandBuilder::new("sleep");
-        cmd.arg("5");
-        let mut child = started(&*pair.master, pair.slave, cmd, Way::Here);
-        let pid = child.process_id().unwrap() as libc::pid_t;
-        // A session of its own, led by it, in the foreground of the terminal.
-        // SAFETY: plain syscall.
-        assert_eq!(unsafe { libc::getsid(pid) }, pid);
-        assert_eq!(pair.master.process_group_leader(), Some(pid));
-        child.kill().unwrap();
-        assert!(child.try_wait().unwrap().is_some(), "ended and reaped");
+        for way in OURS {
+            let pair = pty();
+            let mut cmd = CommandBuilder::new("sleep");
+            cmd.arg("5");
+            let mut child = started(&*pair.master, pair.slave, cmd, way);
+            let pid = child.process_id().unwrap() as libc::pid_t;
+            // A session of its own, led by it, in the foreground of the terminal.
+            // SAFETY: plain syscall.
+            assert_eq!(unsafe { libc::getsid(pid) }, pid, "{way:?}");
+            assert_eq!(pair.master.process_group_leader(), Some(pid), "{way:?}");
+            child.kill().unwrap();
+            let _ = child.wait();
+        }
     }
 
     #[test]
-    #[cfg(target_os = "linux")]
     fn a_program_that_cannot_be_found_or_run_is_said() {
         use std::ffi::OsStr;
         use std::path::Path;
 
-        use super::linux::find_program;
+        use super::native::find_program;
 
         let pair = pty();
         let err = prepare(&*pair.master, pair.slave, CommandBuilder::new("no-such-program-kraal")).err();
@@ -526,18 +636,20 @@ mod tests {
         assert_eq!(found, dir.join("x"));
         // Found and executable, but its interpreter is not there: only starting it tells.
         crate::testing::write_script(&dir.join("broken"), "#!/no/such/interpreter\n");
-        let mut cmd = CommandBuilder::new("./broken");
-        cmd.cwd(&dir);
-        let pair = pty();
-        let err = prepare(&*pair.master, pair.slave, cmd).unwrap().run().expect_err("cannot run");
-        assert!(format!("{err:#}").contains("No such file or directory"), "{err:#}");
-        // A script without `#!` runs with /bin/sh, as execvp runs it.
         crate::testing::write_script(&dir.join("plain"), "echo from-plain-script\n");
-        let mut cmd = CommandBuilder::new("./plain");
-        cmd.cwd(&dir);
-        let (out, code) = run(cmd, Way::Here);
-        assert_eq!(code, 0);
-        assert!(out.contains("from-plain-script"), "{out}");
+        for way in OURS {
+            let mut cmd = CommandBuilder::new("./broken");
+            cmd.cwd(&dir);
+            let pair = pty();
+            let err = start(&*pair.master, pair.slave, cmd, way).map(|_| ()).expect_err("cannot run");
+            assert!(format!("{err:#}").contains("No such file or directory"), "{way:?}: {err:#}");
+            // A script without `#!` runs with /bin/sh, as execvp runs it.
+            let mut cmd = CommandBuilder::new("./plain");
+            cmd.cwd(&dir);
+            let (out, code) = run(cmd, way);
+            assert_eq!(code, 0, "{way:?}");
+            assert!(out.contains("from-plain-script"), "{way:?}: {out}");
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -555,17 +667,23 @@ mod tests {
     }
 
     #[test]
-    #[cfg(all(target_os = "linux", target_env = "gnu"))]
     fn nothing_of_the_server_stays_open_in_the_program() {
         // A descriptor without close-on-exec, as one the server inherited would be.
         let file = std::fs::File::open("/dev/null").unwrap();
         // SAFETY: a copy of a descriptor this test owns, closed below.
-        let fd = unsafe { libc::fcntl(std::os::fd::AsRawFd::as_raw_fd(&file), libc::F_DUPFD, 300) };
-        assert!(fd >= 300);
-        let mut cmd = CommandBuilder::new("sh");
-        cmd.args(["-c", &format!("[ -e /proc/$$/fd/{fd} ] && echo leaked || echo closed")]);
-        let (out, _) = run(cmd, Way::Here);
-        assert!(out.contains("closed"), "{out}");
+        let fd = unsafe { libc::fcntl(std::os::fd::AsRawFd::as_raw_fd(&file), libc::F_DUPFD, 200) };
+        assert!(fd >= 200);
+        for way in OURS {
+            // `posix_spawn` closes them where it can (glibc); elsewhere on Linux the server
+            // marks what it inherited close-on-exec as it starts (see `close_inherited`).
+            if matches!(way, Way::Here) && cfg!(all(target_os = "linux", not(target_env = "gnu"))) {
+                continue;
+            }
+            let mut cmd = CommandBuilder::new("sh");
+            cmd.args(["-c", &format!("[ -e /dev/fd/{fd} ] && echo leaked || echo closed")]);
+            let (out, _) = run(cmd, way);
+            assert!(out.contains("closed"), "{way:?}: {out}");
+        }
         // SAFETY: closing the copy made above.
         unsafe { libc::close(fd) };
     }
