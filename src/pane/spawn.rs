@@ -572,7 +572,9 @@ mod tests {
         let code = child.wait().unwrap().exit_code();
         let out = rx.recv_timeout(Duration::from_secs(10)).unwrap();
         drop(pair.master);
-        (String::from_utf8_lossy(&out).replace("\r\n", "\n"), code)
+        // The terminal turns each line end into "\r\n", and a macOS terminal sends "\r\r\n" when
+        // its output queue fills in the middle of one: carriage returns say nothing here.
+        (String::from_utf8_lossy(&out).replace('\r', ""), code)
     }
 
     #[test]
