@@ -143,8 +143,8 @@ nobody uses it daily yet; Windows is not supported. Known gaps:
 
 - Images in panes need a terminal that draws kitty graphics with Unicode placeholders (Ghostty,
   kitty).
-- Agent states come from hooks for Claude Code and nine other agents, and for the start or end of
-  Codex's, Cursor's and Augment's turns; otherwise they are read from the screen and can lag.
+- Agent states come from hooks for Claude Code and eight other agents, and for what Gemini CLI's,
+  Codex's, Cursor's and Augment's hooks tell; otherwise they are read from the screen and can lag.
 
 Bug reports and ideas are welcome in the [issues](https://github.com/kraal-sh/kraal/issues).
 

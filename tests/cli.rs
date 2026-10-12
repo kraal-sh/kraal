@@ -390,6 +390,13 @@ fn other_agents_hooks_drive_their_state() {
     let wait = |pane: &str, state: &str| {
         assert_eq!(env.run(&["wait", "-p", pane, "--until", state, "--timeout", "3"]).trim(), state, "{pane}");
     };
+    // Gemini CLI's hooks leave a declined question to the screen: it runs in its pane, busy.
+    let bin = env.root.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let gemini = bin.join("gemini");
+    write_script(&gemini, "#!/bin/sh\necho started\nwhile :; do sleep 0.3; printf .; done\n");
+    env.run(&["send", "-p", "gemini", "--enter", &gemini.display().to_string()]);
+    env.wait_for_text("gemini", "started");
     hook("gemini", &["gemini"], r#"{"hook_event_name":"BeforeAgent","session_id":"g-1","prompt":"fix it"}"#);
     wait("gemini", "working");
     hook(
@@ -412,8 +419,6 @@ fn other_agents_hooks_drive_their_state() {
     hook("copilot", &["copilot", "agentStop"], r#"{"sessionId":"c-1","stopReason":"end_turn"}"#);
     wait("copilot", "done");
     // A pane running Cursor's CLI.
-    let bin = env.root.join("bin");
-    std::fs::create_dir_all(&bin).unwrap();
     let cursor = bin.join("cursor-agent");
     write_script(&cursor, "#!/bin/sh\necho started\nsleep 30\n");
     env.run(&["send", "-p", "cursor", "--enter", &cursor.display().to_string()]);
@@ -437,6 +442,83 @@ fn other_agents_hooks_drive_their_state() {
     let cursor_pane = panes.as_array().unwrap().iter().find(|p| p["name"] == "cursor").unwrap();
     assert_eq!(cursor_pane["agent"], "cursor", "{cursor_pane}");
     env.run(&["keys", "-p", "cursor", "ctrl+c"]);
+    env.run(&["keys", "-p", "gemini", "ctrl+c"]);
+}
+
+/// droid tells a cancelled turn by waiting for a prompt, without a stop: the pane is idle again.
+/// It says the same after a turn that finished, which stays done until it is seen.
+#[test]
+fn a_cancelled_turn_ends_idle_and_a_finished_one_stays_done() {
+    let env = Env::new("hooks-idle");
+    env.workspace("w", "layout {\n    pane name=\"droid\"\n}\n");
+    env.run(&["open", "w"]);
+    let socket = env.root.join("run/kraal/hooks-idle.sock");
+    let hook = |payload: &str| {
+        let mut c = env.cmd(&["hook", "droid"]);
+        c.env("KRAAL_PANE", "droid").env("KRAAL_SOCKET", &socket).stdin(std::process::Stdio::piped());
+        let mut child = c.spawn().unwrap();
+        use std::io::Write;
+        child.stdin.take().unwrap().write_all(payload.as_bytes()).unwrap();
+        assert!(child.wait_with_output().unwrap().status.success());
+    };
+    let wait = |state: &str| {
+        assert_eq!(env.run(&["wait", "-p", "droid", "--until", state, "--timeout", "3"]).trim(), state);
+    };
+    let prompt = r#"{"hook_event_name":"UserPromptSubmit","session_id":"d-1","prompt":"fix it"}"#;
+    let waiting = r#"{"hook_event_name":"Notification","session_id":"d-1","notification_type":"idle_prompt","message":"Droid is waiting for input"}"#;
+    hook(prompt);
+    wait("working");
+    hook(waiting);
+    wait("idle");
+    hook(prompt);
+    hook(r#"{"hook_event_name":"Stop","session_id":"d-1"}"#);
+    wait("done");
+    hook(waiting);
+    let still = env.try_run(&["wait", "-p", "droid", "--until", "idle", "--timeout", "0.5"]);
+    assert!(!still.status.success(), "a finished turn nobody looked at went idle");
+    wait("done");
+}
+
+/// OpenCode's plugin reports its changes only, never its end: run under a wrapper kraal does not
+/// recognise (`sh -c 'opencode; …'`), the agent stays while the process its plugin reported
+/// from runs, and goes when that process ends.
+#[test]
+fn a_hooked_agent_under_a_wrapper_stays_while_its_process_runs() {
+    let env = Env::new("hooks-wrapped");
+    env.workspace("w", "layout {\n    pane name=\"oc\"\n}\n");
+    env.run(&["open", "w"]);
+    let bin = env.root.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let opencode = bin.join("opencode");
+    let go = env.root.join("go");
+    // Stands for OpenCode: its plugin runs `kraal hook opencode <state>` as a child of its own.
+    write_script(
+        &opencode,
+        &format!(
+            "#!/bin/sh\n'{}' hook opencode working\necho reported\nwhile [ ! -e '{}' ]; do sleep 0.1; done\n",
+            env!("CARGO_BIN_EXE_kraal"),
+            go.display()
+        ),
+    );
+    let wrapped = format!("sh -c '{}; echo finished; sleep 30'", opencode.display());
+    env.run(&["send", "-p", "oc", "--enter", &wrapped]);
+    env.wait_for_text("oc", "reported");
+    let agent = || {
+        let panes: serde_json::Value = serde_json::from_str(&env.run(&["panes", "--json"])).unwrap();
+        let pane = panes.as_array().unwrap().iter().find(|p| p["name"] == "oc").cloned().unwrap();
+        (pane["agent"].as_str().map(String::from), pane["state"].as_str().map(String::from))
+    };
+    // A few scans of the foreground (the wrapper, no agent) later, still there.
+    std::thread::sleep(Duration::from_millis(1500));
+    assert_eq!(agent(), (Some("opencode".into()), Some("working".into())));
+    std::fs::write(&go, "").unwrap();
+    env.wait_for_text("oc", "finished");
+    let start = Instant::now();
+    while agent().0.is_some() {
+        assert!(start.elapsed() < Duration::from_secs(5), "the agent outlived its process");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    env.run(&["keys", "-p", "oc", "ctrl+c"]);
 }
 
 #[test]

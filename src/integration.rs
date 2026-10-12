@@ -151,7 +151,8 @@ pub fn run_hook(agent: &str, arg: Option<String>) {
             // Copilot's hooks name their event on kraal's command line.
             let state = hook_state(a, &payload, arg.as_deref());
             let field = |k: &str| payload.get(k).and_then(Value::as_str).map(String::from);
-            let session_id = field("session_id").or_else(|| field("sessionId"));
+            // Cursor and Augment name it a conversation.
+            let session_id = field("session_id").or_else(|| field("sessionId")).or_else(|| field("conversation_id"));
             let message = field("message");
             if state.is_none() && session_id.is_none() {
                 return;
@@ -258,8 +259,19 @@ fn hook_command(agent: &str) -> Result<String> {
     Ok(format!("{} hook {agent}", crate::shell::quote(&exe.to_string_lossy())))
 }
 
+/// Augment runs a script by its path, not a command line: the one kraal puts in its directory.
+const AUGGIE_SCRIPT: &str = "kraal-hook.sh";
+
+/// Whether a hook's command is kraal's, as this kraal writes it or an older one did.
 fn is_ours(cmd: &str, agent: &str) -> bool {
-    cmd.contains("kraal") && cmd.ends_with(&format!(" hook {agent}"))
+    (cmd.contains("kraal") && cmd.ends_with(&format!(" hook {agent}")))
+        || (agent == "auggie" && cmd.ends_with(&format!("/{AUGGIE_SCRIPT}")))
+}
+
+/// Whether a hook's command is kraal's as this kraal writes it: Augment does not run the
+/// command line older ones gave it.
+fn is_current(cmd: &str, agent: &str) -> bool {
+    is_ours(cmd, agent) && (agent != "auggie" || cmd.ends_with(&format!("/{AUGGIE_SCRIPT}")))
 }
 
 pub fn install(agent: &str) -> Result<String> {
@@ -270,17 +282,28 @@ pub fn install(agent: &str) -> Result<String> {
         return Err(unknown(agent));
     }
     let (path, top_level) = agent_file(agent);
-    let exe = std::env::current_exe()?.to_string_lossy().into_owned();
     match agent {
         "claude" => install_claude(&path, &crate::accounts::Accounts::path()),
         "codex" => install_codex(&path),
         "cursor" => install_cursor(&path),
         "kimi" => install_kimi(&path),
-        "copilot" => install_own(agent, &path, &copilot_hooks(&exe), "hooks"),
-        "opencode" | "kilo" => install_own(agent, &path, &opencode_plugin(agent, &exe), "plugin"),
-        "pi" => install_own(agent, &path, &pi_extension(&exe), "extension"),
-        _ => install_nested(nested(agent), &path, top_level),
+        "copilot" => install_own(agent, &path, &own_file(agent)?, "hooks"),
+        "opencode" | "kilo" => install_own(agent, &path, &own_file(agent)?, "plugin"),
+        "pi" => install_own(agent, &path, &own_file(agent)?, "extension"),
+        "auggie" => install_auggie(&path, &agent_dir(agent).join(AUGGIE_SCRIPT), &own_file(agent)?),
+        _ => install_nested(nested(agent), &path, top_level, &hook_command(agent)?),
     }
+}
+
+/// What kraal writes in the file of its own it puts in an agent's directory.
+fn own_file(agent: &str) -> Result<String> {
+    let exe = std::env::current_exe()?.to_string_lossy().into_owned();
+    Ok(match agent {
+        "copilot" => copilot_hooks(&exe),
+        "pi" => pi_extension(&exe),
+        "auggie" => auggie_script(&exe),
+        _ => opencode_plugin(agent, &exe),
+    })
 }
 
 pub fn uninstall(agent: &str) -> Result<String> {
@@ -296,7 +319,8 @@ pub fn uninstall(agent: &str) -> Result<String> {
         "codex" => uninstall_codex(&path),
         "cursor" => uninstall_cursor(&path),
         "kimi" => uninstall_kimi(&path),
-        "copilot" | "opencode" | "kilo" | "pi" => uninstall_own(agent, &path),
+        "copilot" | "opencode" | "kilo" | "pi" => uninstall_own(agent, &path, &own_file(agent)?),
+        "auggie" => uninstall_auggie(&path, &agent_dir(agent).join(AUGGIE_SCRIPT), &own_file(agent)?),
         _ => uninstall_nested(nested(agent), &path, top_level),
     }
 }
@@ -385,12 +409,12 @@ fn runs_ours(hook: &Value, agent: &str) -> bool {
     hook.get("command").and_then(Value::as_str).is_some_and(|c| is_ours(c, agent))
 }
 
-/// Whether kraal's hook is in `event`'s groups of an event map laid out as Claude Code's.
+/// Whether kraal's hook, as this kraal writes it, is in `event`'s groups of an event map laid
+/// out as Claude Code's.
 fn nested_has(events: Option<&Value>, event: &str, agent: &str) -> bool {
+    let current = |h: &Value| h.get("command").and_then(Value::as_str).is_some_and(|c| is_current(c, agent));
     events.and_then(|e| e.get(event)).and_then(Value::as_array).is_some_and(|groups| {
-        groups
-            .iter()
-            .any(|g| g.get("hooks").and_then(Value::as_array).is_some_and(|hs| hs.iter().any(|h| runs_ours(h, agent))))
+        groups.iter().any(|g| g.get("hooks").and_then(Value::as_array).is_some_and(|hs| hs.iter().any(current)))
     })
 }
 
@@ -444,11 +468,40 @@ fn event_map<'a>(v: &'a mut Value, path: &Path, top_level: bool) -> Result<&'a m
     root.entry("hooks").or_insert_with(|| json!({})).as_object_mut().context("\"hooks\" is not an object")
 }
 
-fn install_nested(spec: &NestedHooks, path: &Path, top_level: bool) -> Result<String> {
+fn install_nested(spec: &NestedHooks, path: &Path, top_level: bool, cmd: &str) -> Result<String> {
     let mut v = read_json(path)?;
-    let added = add_nested(event_map(&mut v, path, top_level)?, spec, &hook_command(spec.agent)?)?;
+    let added = add_nested(event_map(&mut v, path, top_level)?, spec, cmd)?;
     write_with_backup(path, &(serde_json::to_string_pretty(&v)? + "\n"))?;
     Ok(format!("{}: {added} hooks installed in {} (backup next to it)", spec.agent, path.display()))
+}
+
+/// Augment's hooks run kraal's script, which runs `kraal hook auggie`: the script first, then
+/// the hooks that run it.
+fn install_auggie(settings: &Path, script: &Path, content: &str) -> Result<String> {
+    install_own("auggie", script, content, "hook script")?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(script, std::fs::Permissions::from_mode(0o755))
+            .with_context(|| format!("making {} executable", script.display()))?;
+    }
+    install_nested(nested("auggie"), settings, false, &script.to_string_lossy())
+}
+
+/// The hooks first, then the script they ran.
+fn uninstall_auggie(settings: &Path, script: &Path, content: &str) -> Result<String> {
+    let hooks = uninstall_nested(nested("auggie"), settings, false)?;
+    let own = uninstall_own("auggie", script, content)?;
+    Ok(if own.ends_with("nothing to remove") { hooks } else { format!("{hooks}; {own}") })
+}
+
+/// The script Augment's hooks run.
+fn auggie_script(exe: &str) -> String {
+    format!(
+        "#!/bin/sh\n# kraal: tells the kraal pane Augment runs in whether it works or is done.\n\
+         # `kraal integration uninstall auggie` removes this file and the hooks that run it.\nexec {} hook auggie\n",
+        crate::shell::quote(exe)
+    )
 }
 
 fn uninstall_nested(spec: &NestedHooks, path: &Path, top_level: bool) -> Result<String> {
@@ -565,31 +618,50 @@ fn is_own(text: &str, agent: &str) -> bool {
         && (text.contains(&format!("kraal integration uninstall {agent}")) || text.contains(&format!(" hook {agent} ")))
 }
 
+/// What a file kraal puts in an agent's directory holds now: nothing (no such file), or text
+/// that is kraal's own. A file kraal cannot read, or that is not kraal's, is refused: it may be
+/// the user's.
+fn own_text(agent: &str, path: &Path) -> Result<Option<String>> {
+    match std::fs::symlink_metadata(path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+        Ok(_) => {}
+    }
+    let text =
+        std::fs::read_to_string(path).with_context(|| format!("reading {}; kraal leaves it alone", path.display()))?;
+    anyhow::ensure!(is_own(&text, agent), "{} is not kraal's; kraal leaves it alone", path.display());
+    Ok(Some(text))
+}
+
 /// A file of kraal's own where the agent loads every file it finds (hooks, plugins,
-/// extensions): written whole, removed whole, nothing of the user's to keep a copy of.
+/// extensions): written whole, removed whole. One kraal wrote before is copied next to it
+/// (`.kraal-bak`) when it changes, in case it was edited.
 fn install_own(agent: &str, path: &Path, content: &str, what: &str) -> Result<String> {
-    if let Ok(text) = std::fs::read_to_string(path)
-        && !is_own(&text, agent)
-    {
-        bail!("{} is not kraal's; kraal leaves it alone", path.display());
+    match own_text(agent, path)? {
+        Some(text) if text == content => {}
+        Some(_) => write_with_backup(path, content)?,
+        None => {
+            if let Some(dir) = path.parent() {
+                std::fs::create_dir_all(dir)?;
+            }
+            crate::paths::write_atomic(path, content.as_bytes())
+                .with_context(|| format!("writing {}", path.display()))?;
+        }
     }
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
-    }
-    crate::paths::write_atomic(path, content.as_bytes()).with_context(|| format!("writing {}", path.display()))?;
     Ok(format!("{agent}: {what} installed in {}; it takes effect in new sessions", path.display()))
 }
 
-fn uninstall_own(agent: &str, path: &Path) -> Result<String> {
-    match std::fs::read_to_string(path) {
-        Ok(text) if is_own(&text, agent) => {
-            std::fs::remove_file(path).with_context(|| format!("removing {}", path.display()))?;
-            Ok(format!("{agent}: removed {}", path.display()))
-        }
-        Ok(_) => bail!("{} is not kraal's; kraal leaves it alone", path.display()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(format!("{agent}: nothing to remove")),
-        Err(e) => Err(e).with_context(|| format!("reading {}", path.display())),
+/// Remove a file of kraal's own; one that is not what this kraal writes (edited, or from another
+/// version) is copied next to it first.
+fn uninstall_own(agent: &str, path: &Path, content: &str) -> Result<String> {
+    let Some(text) = own_text(agent, path)? else { return Ok(format!("{agent}: nothing to remove")) };
+    if text != content {
+        let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        std::fs::write(path.with_file_name(format!("{name}.kraal-bak")), &text)
+            .with_context(|| format!("backing up {}", path.display()))?;
     }
+    std::fs::remove_file(path).with_context(|| format!("removing {}", path.display()))?;
+    Ok(format!("{agent}: removed {}", path.display()))
 }
 
 /// Copilot CLI loads every `*.json` in its hooks directory. Its own format does not name the
@@ -837,7 +909,7 @@ fn write_toml_hooks(
 }
 
 fn install_codex(path: &Path) -> Result<String> {
-    let text = std::fs::read_to_string(path).unwrap_or_default();
+    let text = read_text(path)?;
     let exe = std::env::current_exe()?.to_string_lossy().into_owned();
     let line = format!("notify = [{}, \"hook\", \"codex\"]", toml_string(&exe));
     // `notify` is a top-level key: it must come before the first [table].
@@ -862,7 +934,7 @@ fn install_codex(path: &Path) -> Result<String> {
 }
 
 fn uninstall_codex(path: &Path) -> Result<String> {
-    let text = std::fs::read_to_string(path).unwrap_or_default();
+    let text = read_text(path)?;
     let mut lines: Vec<String> = text.lines().map(String::from).collect();
     let first_table = first_table(&lines);
     match notify_span(&lines, first_table) {
@@ -976,42 +1048,74 @@ exit 1"#;
 
 /// The current context of kubeconfig files and its namespace, read by `awk` as kubectl merges
 /// the files: the first `current-context` set wins, and so does the first definition of a
-/// context. It reads block YAML as kubectl, kubectx and the clouds' tools write it; anything else
-/// (JSON) is unknown, and so is a name kraal would not take. It goes between single quotes in
-/// all three shells: no single quote (`\047` instead) and no double backslash.
+/// context. It reads block YAML as kubectl, kubectx and the clouds' tools write it, comments
+/// included, and a context's body written on one line (`context: {namespace: web}`); what it
+/// does not follow (JSON, anchors and aliases, a body over several lines in braces) is unknown,
+/// and so is a name kraal would not take: a namespace is never taken for absent when it may be
+/// there. It goes between single quotes in all three shells: no single quote (`\047` instead)
+/// and no double backslash.
 const KUBE_AWK: &str = r#"
 function unq(v) {
-  sub(/^[ \t]+/, "", v); sub(/[ \t]+#.*$/, "", v); sub(/[ \t]+$/, "", v)
+  sub(/^[ \t]+/, "", v); if (v ~ /^#/) v = ""; sub(/[ \t]+#.*$/, "", v); sub(/[ \t]+$/, "", v)
   if (v ~ /^".*"$/ || v ~ /^\047.*\047$/) v = substr(v, 2, length(v) - 2)
   return v
 }
 function val(l) { sub(/^[^:]*:/, "", l); return unq(l) }
-function flush() { if (name != "" && !(name in ns)) ns[name] = space; name = ""; space = "" }
+function key(l) { sub(/:([ \t].*)?$/, "", l); return unq(l) }
+function flow(v,  n, i, p, f) {
+  if (v ~ /^[{][ \t]*[}]$/) return ""
+  if (v !~ /^[{].*[}]$/) return "?"
+  v = substr(v, 2, length(v) - 2)
+  if (v ~ /[][{}&*!]/) return "?"
+  n = split(v, p, ","); f = ""
+  for (i = 1; i <= n; i++) if (key(p[i]) == "namespace") f = val(p[i])
+  return f
+}
+function flush() {
+  if (merge && space == "") space = "?"
+  if (name != "" && !(name in ns)) ns[name] = space
+  name = ""; space = ""; merge = 0; more = 0
+}
 function ok(v) { return length(v) <= 200 && v ~ "^[-A-Za-z0-9._:/@+]*$" }
+{ sub(/\r$/, "") }
 FNR == 1 { flush(); top = ""; item = -1; head = 1 }
 head && /[^ \t]/ && !/^[ \t]*#/ { head = 0; if ($0 ~ /^[ \t]*[{[]/) bad = 1 }
 /^[^ \t#-]/ {
-  flush(); top = $0; sub(/:.*/, "", top)
-  if (top == "current-context" && cur == "") cur = val($0)
+  flush(); top = key($0); v = val($0)
+  if (top == "current-context" && cur == "") cur = v
+  if (top == "contexts" && v != "" && v != "[]" && v != "null" && v != "~") bad = 1
   next
 }
+top == "current-context" && /^[ \t]+[^ \t#]/ { bad = 1 }
 top != "contexts" { next }
 {
   match($0, /^ */); n = RLENGTH; l = substr($0, n + 1)
   if (l == "" || l ~ /^#/) next
   if (l ~ /^-( |$)/ && (item < 0 || n == item)) {
-    flush(); item = n; body = 0; key = -1
+    flush(); item = n; body = 0; at = -1
     l = substr(l, 2); match(l, /^ */); n += 1 + RLENGTH; l = substr(l, RLENGTH + 1)
-    if (l == "") next
+    if (l == "" || l ~ /^#/) next
+    if (l ~ /^[{*]/) lost = 1
   }
-  if (key < 0) key = n
-  if (n == key) { body = (l ~ /^context:[ \t]*$/); deep = -1; if (l ~ /^name:/) name = val(l) }
-  else if (body && n > key) { if (deep < 0) deep = n; if (n == deep && l ~ /^namespace:/) space = val(l) }
+  if (at < 0) at = n
+  if (n == at) {
+    k = key(l); body = 0; deep = -1; more = 0
+    if (k == "name") name = val(l)
+    else if (k == "context") { v = val(l); if (v == "") body = 1; else space = flow(v) }
+  } else if (body && n > at) {
+    if (deep < 0) deep = n
+    if (n == deep) {
+      k = key(l); more = 0
+      if (k == "namespace") { space = val(l); more = (space == "") }
+      else if (k == "<<") merge = 1
+    } else if (more) space = "?"
+  }
 }
 END {
   flush()
   if (bad) print "k8s=?"
   else if (cur == "") print "k8s="
+  else if (!(cur in ns) && lost) print "k8s=?"
   else if (!ok(cur) || !ok(ns[cur])) print "k8s=?"
   else print "k8s=" cur ";ns=" ns[cur]
 }
@@ -1030,12 +1134,14 @@ const SH_CONTEXT: &str = r#"  __kraal_context() {
       f=${r%%:*}
       [[ $r == *:* ]] && r=${r#*:} || r=
       [[ -n $f && -e $f ]] || continue
+      # awk takes `name=value` for an assignment and `-` for its input: never a file's name.
+      [[ $f == /* ]] || f=./$f
       if [[ -f $f && -r $f ]]; then fs+=("$f"); else bad=1; fi
     done
     if [[ -n $bad ]]; then
       k='k8s=?'
     elif (( ${#fs[@]} )); then
-      k=$(LC_ALL=C command awk '@KUBE_AWK@' "${fs[@]}" 2>/dev/null) || k='k8s=?'
+      k=$(LC_ALL=C command awk '@KUBE_AWK@' "${fs[@]}" </dev/null 2>/dev/null) || k='k8s=?'
     fi
     if [[ -n ${TF_WORKSPACE-} ]]; then
       t=$TF_WORKSPACE
@@ -1160,6 +1266,8 @@ const FISH_MARKS: &str = r#"if not set -q __kraal_marks
         set -l bad
         for f in (string split : -- $kc)
             test -n "$f"; and test -e "$f"; or continue
+            # awk takes `name=value` for an assignment and `-` for its input: never a file's name.
+            string match -q -- '/*' $f; or set f ./$f
             if test -f "$f"; and test -r "$f"
                 set -a fs $f
             else
@@ -1169,7 +1277,7 @@ const FISH_MARKS: &str = r#"if not set -q __kraal_marks
         if set -q bad[1]
             set k 'k8s=?'
         else if set -q fs[1]
-            set k (env LC_ALL=C awk '@KUBE_AWK@' $fs 2>/dev/null); or set k 'k8s=?'
+            set k (env LC_ALL=C awk '@KUBE_AWK@' $fs </dev/null 2>/dev/null); or set k 'k8s=?'
         end
         if test -n "$TF_WORKSPACE"
             set t $TF_WORKSPACE
@@ -1263,11 +1371,12 @@ fn install_shell(shell: &str, path: &Path) -> Result<String> {
         Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
     };
     let (mut rest, _) = without_block(&text, path)?;
+    let theirs = !rest.trim().is_empty();
     if !rest.is_empty() {
         rest.push('\n');
     }
     rest.push_str(&shell_block(shell));
-    if shell == "fish" {
+    if shell == "fish" && !theirs {
         // A file of kraal's own, in fish's conf.d: nothing of the user's to keep a copy of.
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
@@ -1420,6 +1529,14 @@ mod tests {
         assert!(std::fs::read_to_string(&fish).unwrap().contains("fish_postexec"));
         uninstall_shell("fish", &fish).unwrap();
         assert!(!fish.exists());
+        // One that holds lines of the user's keeps them, and is copied first.
+        std::fs::write(&fish, "set -gx EDITOR vim\n").unwrap();
+        install_shell("fish", &fish).unwrap();
+        assert!(std::fs::read_to_string(&fish).unwrap().starts_with("set -gx EDITOR vim\n\n# >>> kraal"));
+        let backup = dir.join("config/fish/conf.d/kraal.fish.kraal-bak");
+        assert_eq!(std::fs::read_to_string(&backup).unwrap(), "set -gx EDITOR vim\n");
+        uninstall_shell("fish", &fish).unwrap();
+        assert_eq!(std::fs::read_to_string(&fish).unwrap(), "set -gx EDITOR vim\n");
         // bash: what `show` prints is what `install` adds.
         let bashrc = dir.join(".bashrc");
         install_shell("bash", &bashrc).unwrap();
@@ -1495,10 +1612,24 @@ mod tests {
             user: minikube\n  name: minikube\ncurrent-context: minikube\n";
         let indented = "# kept by hand\ncontexts:\n  - context:\n      # the team's\n      namespace: web\n    \
             name: 'a'\ncurrent-context: 'a'\n";
+        // Comments after the keys, a context's body on one line, Windows line ends.
+        let commented = "contexts: # all of them\n- name: shared # the team's\n  context: # team defaults\n    \
+            cluster: shared\n    user: operator\n    namespace: prod\ncurrent-context: shared # kubectx\n";
+        let inline = "contexts:\n- name: a\n  context: {cluster: c, namespace: \"web\", user: u} # one line\n\
+            - context: {cluster: c}\n  name: b\n- context: { }\n  name: c\ncurrent-context: a\n";
         let cases = [
             (vec![file("kubectl", kubectl)], "k8s=prod-eks;ns=payments"),
             (vec![file("minikube", minikube)], "k8s=minikube;ns=default"),
             (vec![file("indented", indented)], "k8s=a;ns=web"),
+            (vec![file("commented", commented)], "k8s=shared;ns=prod"),
+            (vec![file("inline", inline)], "k8s=a;ns=web"),
+            (vec![file("inline-b", &inline.replace("current-context: a", "current-context: b"))], "k8s=b;ns="),
+            (vec![file("inline-c", &inline.replace("current-context: a", "current-context: c"))], "k8s=c;ns="),
+            (vec![file("crlf", &kubectl.replace('\n', "\r\n"))], "k8s=prod-eks;ns=payments"),
+            (
+                vec![file("unset", "contexts:\n- name: a\n  context:\n    namespace: x\ncurrent-context: # none\n")],
+                "k8s=",
+            ),
             (vec![file("dev", &kubectl.replace("current-context: prod-eks", "current-context: dev"))], "k8s=dev;ns="),
             (vec![file("none", "contexts:\n- name: a\n  context: {}\n")], "k8s="),
             // The first file that sets a current context wins, and the first definition.
@@ -1528,8 +1659,75 @@ mod tests {
         let separator = file("separator", "current-context: a;aws=dev\n");
         let long = file("long", &format!("current-context: {}\n", "a".repeat(201)));
         let ns = file("ns", "contexts:\n- name: a\n  context:\n    namespace: \"x y\"\ncurrent-context: a\n");
-        for f in [&json, &spaced, &escape, &separator, &long, &ns] {
+        // Ways of writing a namespace the shell does not follow: never taken for no namespace.
+        let alias =
+            file("alias", "x: &c\n  namespace: prod\ncontexts:\n- name: a\n  context: *c\ncurrent-context: a\n");
+        let merge = file(
+            "merge",
+            "x: &c\n  namespace: prod\ncontexts:\n- name: a\n  context:\n    <<: *c\n    user: u\ncurrent-context: a\n",
+        );
+        let wrapped = file(
+            "wrapped",
+            "contexts:\n- name: a\n  context: {cluster: c,\n    namespace: prod}\ncurrent-context: a\n",
+        );
+        let below = file("below", "contexts:\n- name: a\n  context:\n    namespace:\n      prod\ncurrent-context: a\n");
+        let list = file("list", "contexts: [{name: a, context: {namespace: prod}}]\ncurrent-context: a\n");
+        let item = file("item", "contexts:\n- {name: a, context: {namespace: prod}}\ncurrent-context: a\n");
+        let current = file("current", "current-context:\n  prod\n");
+        for f in
+            [&json, &spaced, &escape, &separator, &long, &ns, &alias, &merge, &wrapped, &below, &list, &item, &current]
+        {
             assert_eq!(kube_report(&[f]).unwrap(), "k8s=?", "{f:?}");
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// What `__kraal_context` of `shell` reports in `dir` (its home too), with `KUBECONFIG` set
+    /// to `kubeconfig`.
+    fn context_report(shell: &str, dir: &Path, kubeconfig: &str) -> Option<String> {
+        let block = dir.join("block");
+        std::fs::write(&block, shell_block(shell)).unwrap();
+        let (args, source): (&[&str], _) = match shell {
+            "bash" => (&["--norc", "--noprofile", "-c"], "."),
+            "zsh" => (&["-f", "-c"], "."),
+            _ => (&["--no-config", "-c"], "source"),
+        };
+        let out = std::process::Command::new(shell)
+            .args(args)
+            .arg(format!("{source} ./block; __kraal_context"))
+            .env_clear()
+            .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+            .env("HOME", dir)
+            .env("KRAAL_PANE", "1")
+            .env("KUBECONFIG", kubeconfig)
+            .current_dir(dir)
+            .output()
+            .ok()?;
+        let text = String::from_utf8_lossy(&out.stdout);
+        let start = text.find("\x1b]7701;context;")? + "\x1b]7701;context;".len();
+        Some(text[start..].split(';').next()?.to_string() + ";" + text[start..].split(';').nth(1)?)
+    }
+
+    /// The names in `KUBECONFIG` are files for awk, whatever they look like: never a variable it
+    /// sets (`cur=dev`), nor its input (`-`).
+    #[test]
+    fn the_shells_give_awk_kubeconfigs_as_files() {
+        let dir = tmp("kube-operands");
+        let config = "contexts:\n- name: prod\n  context:\n    namespace: web\ncurrent-context: prod\n";
+        std::fs::write(dir.join("real.yaml"), config).unwrap();
+        std::fs::write(dir.join("cur=dev"), "").unwrap();
+        std::fs::write(dir.join("-"), config).unwrap();
+        for shell in SHELLS {
+            if std::process::Command::new(shell).arg("-c").arg("true").output().is_err() {
+                continue;
+            }
+            for kubeconfig in ["real.yaml:cur=dev", "-", "cur=dev:real.yaml"] {
+                assert_eq!(
+                    context_report(shell, &dir, kubeconfig).as_deref(),
+                    Some("k8s=prod;ns=web"),
+                    "{shell} with {kubeconfig}"
+                );
+            }
         }
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -1889,8 +2087,12 @@ mod tests {
             let path = dir.join(format!("{}.json", spec.agent));
             let mine = r#"{"model":"x","hooks":{"AfterAgent":[{"hooks":[{"type":"command","command":"notify-send done"}]}],"Stop":[{"hooks":[{"type":"command","command":"say done"}]}]}}"#;
             std::fs::write(&path, mine).unwrap();
-            install_nested(spec, &path, false).unwrap();
-            install_nested(spec, &path, false).unwrap();
+            let cmd = match spec.agent {
+                "auggie" => format!("/home/u/.augment/{AUGGIE_SCRIPT}"),
+                agent => hook_command(agent).unwrap(),
+            };
+            install_nested(spec, &path, false, &cmd).unwrap();
+            install_nested(spec, &path, false, &cmd).unwrap();
             let v = read_json(&path).unwrap();
             assert_eq!(v["model"], "x");
             for (event, matcher) in spec.events {
@@ -1911,11 +2113,51 @@ mod tests {
         assert!(g.events.iter().any(|(e, _)| *e == "AfterAgent") && !g.events.iter().any(|(e, _)| *e == "Stop"));
         // droid's own hooks.json holds the events at its top level.
         let hooks = dir.join("factory/hooks.json");
-        install_nested(nested("droid"), &hooks, true).unwrap();
+        install_nested(nested("droid"), &hooks, true, &hook_command("droid").unwrap()).unwrap();
         let v = read_json(&hooks).unwrap();
         assert!(v.get("hooks").is_none() && nested_has(Some(&v), "Notification", "droid"), "{v}");
         uninstall_nested(nested("droid"), &hooks, true).unwrap();
         assert_eq!(read_json(&hooks).unwrap(), json!({}));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Augment runs a script, not a command line: kraal's own, which its hooks name; an older
+    /// kraal's command line is replaced, and the user's hooks stay.
+    #[test]
+    fn augment_hooks_run_a_script_of_kraals() {
+        let dir = tmp("auggie");
+        let settings = dir.join("settings.json");
+        let script = dir.join(AUGGIE_SCRIPT);
+        let mine = r#"{"model":"x","hooks":{"Stop":[{"hooks":[{"type":"command","command":"/home/u/notify.sh","timeout":1000}]}]}}"#;
+        let old = r#"{"model":"x","hooks":{"Stop":[{"hooks":[{"type":"command","command":"/home/u/notify.sh","timeout":1000}]},{"hooks":[{"type":"command","command":"'/opt/kraal' hook auggie","timeout":5000}]}]}}"#;
+        std::fs::write(&settings, old).unwrap();
+        assert!(status_line("auggie", &settings, false).unwrap().contains("not installed"), "Augment cannot run it");
+        let content = auggie_script("/opt/my tools/kraal");
+        install_auggie(&settings, &script, &content).unwrap();
+        install_auggie(&settings, &script, &content).unwrap();
+        assert!(content.starts_with("#!/bin/sh\n") && content.ends_with("exec '/opt/my tools/kraal' hook auggie\n"));
+        assert_eq!(std::fs::read_to_string(&script).unwrap(), content);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(std::fs::metadata(&script).unwrap().permissions().mode() & 0o777, 0o755);
+        }
+        let v = read_json(&settings).unwrap();
+        let stop = v["hooks"]["Stop"].as_array().unwrap();
+        assert_eq!(stop.len(), 2, "{stop:?}");
+        assert_eq!(stop[1]["hooks"][0]["command"], script.display().to_string());
+        assert!(status_line("auggie", &settings, false).unwrap().contains(": installed ("));
+        // The script runs, and runs kraal with what it was given.
+        let out = std::process::Command::new("sh").arg(&script).output();
+        assert!(out.is_ok_and(|o| String::from_utf8_lossy(&o.stderr).contains("/opt/my tools/kraal")));
+        uninstall_auggie(&settings, &script, &content).unwrap();
+        assert!(!script.exists());
+        assert_eq!(read_json(&settings).unwrap(), serde_json::from_str::<Value>(mine).unwrap());
+        // A script of the same name that is not kraal's is left alone, and so are the settings.
+        std::fs::write(&script, "#!/bin/sh\necho mine\n").unwrap();
+        assert!(install_auggie(&settings, &script, &content).is_err());
+        assert_eq!(std::fs::read_to_string(&script).unwrap(), "#!/bin/sh\necho mine\n");
+        assert_eq!(read_json(&settings).unwrap(), serde_json::from_str::<Value>(mine).unwrap());
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -1962,19 +2204,65 @@ mod tests {
             install_own(agent, &path, &content, "plugin").unwrap();
             install_own(agent, &path, &content, "plugin").unwrap();
             assert!(std::fs::read_to_string(&path).unwrap().contains(&format!("kraal integration uninstall {agent}")));
-            uninstall_own(agent, &path).unwrap();
+            uninstall_own(agent, &path, &content).unwrap();
             assert!(!path.exists());
-            assert!(uninstall_own(agent, &path).unwrap().contains("nothing to remove"));
+            assert!(uninstall_own(agent, &path, &content).unwrap().contains("nothing to remove"));
         }
         assert!(opencode_plugin("opencode", exe).contains("export const KraalPlugin"));
         assert!(opencode_plugin("kilo", exe).contains("export default { id: \"kraal\", server: KraalPlugin }"));
         // A file of the same name that is not kraal's is left alone.
         let theirs = dir.join("opencode/plugins/kraal.js");
+        let plugin = opencode_plugin("opencode", exe);
         std::fs::write(&theirs, "export const Mine = async () => ({})\n").unwrap();
-        assert!(install_own("opencode", &theirs, &opencode_plugin("opencode", exe), "plugin").is_err());
-        assert!(uninstall_own("opencode", &theirs).is_err());
+        assert!(install_own("opencode", &theirs, &plugin, "plugin").is_err());
+        assert!(uninstall_own("opencode", &theirs, &plugin).is_err());
         assert_eq!(std::fs::read_to_string(&theirs).unwrap(), "export const Mine = async () => ({})\n");
-        uninstall_own("copilot", &copilot).unwrap();
+        uninstall_own("copilot", &copilot, &copilot_hooks(exe)).unwrap();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A file kraal cannot read may be anyone's: it is never replaced nor removed. One of kraal's
+    /// own that was edited is kept aside before it changes or goes.
+    #[test]
+    fn own_files_kraal_cannot_read_or_that_were_edited_are_kept() {
+        let dir = tmp("own-kept");
+        let path = dir.join("opencode/plugins/kraal.js");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let plugin = opencode_plugin("opencode", "/opt/kraal");
+        let binary = b"\xff\xfe kraal integration uninstall opencode\n".to_vec();
+        std::fs::write(&path, &binary).unwrap();
+        assert!(install_own("opencode", &path, &plugin, "plugin").is_err());
+        assert!(uninstall_own("opencode", &path, &plugin).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), binary);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::write(&path, "mine\n").unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+            // Root reads it anyway: then it is simply not kraal's.
+            assert!(install_own("opencode", &path, &plugin, "plugin").is_err());
+            assert!(uninstall_own("opencode", &path, &plugin).is_err());
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), "mine\n");
+        }
+        let backup = dir.join("opencode/plugins/kraal.js.kraal-bak");
+        let edited = plugin.replace("const busy", "// mine\n  const busy");
+        std::fs::write(&path, &edited).unwrap();
+        install_own("opencode", &path, &plugin, "plugin").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), plugin);
+        assert_eq!(std::fs::read_to_string(&backup).unwrap(), edited);
+        std::fs::remove_file(&backup).unwrap();
+        install_own("opencode", &path, &plugin, "plugin").unwrap();
+        assert!(!backup.exists(), "nothing changed, nothing to keep");
+        std::fs::write(&path, &edited).unwrap();
+        uninstall_own("opencode", &path, &plugin).unwrap();
+        assert!(!path.exists());
+        assert_eq!(std::fs::read_to_string(&backup).unwrap(), edited);
+        // Codex's configuration, unreadable as text, is not taken for an empty one.
+        let codex = dir.join("config.toml");
+        std::fs::write(&codex, b"model = \"\xff\"\n").unwrap();
+        assert!(install_codex(&codex).is_err());
+        assert_eq!(std::fs::read(&codex).unwrap(), b"model = \"\xff\"\n");
         let _ = std::fs::remove_dir_all(dir);
     }
 

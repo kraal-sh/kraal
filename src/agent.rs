@@ -114,9 +114,7 @@ const INTERPRETERS: &[&str] = &["node", "bun", "deno", "python", "python3", "uv"
 pub fn detect_agent(argv: &[String]) -> Option<&'static str> {
     let base = |s: &str| s.rsplit('/').next().unwrap_or(s).to_string();
     let first = base(argv.first()?);
-    // Cursor's launcher runs its bundled Node on the agent's script, under the name it was
-    // called by (`agent`, too common a word to go by).
-    if argv.iter().take(4).any(|a| a.contains("/cursor-agent/versions/") && a.ends_with("/index.js")) {
+    if runs_cursor(argv) {
         return Some("cursor");
     }
     if let Some((_, words, name)) = SUBCOMMANDS.iter().find(|(program, ..)| *program == first) {
@@ -144,6 +142,32 @@ pub fn detect_agent(argv: &[String]) -> Option<&'static str> {
         }
     }
     None
+}
+
+/// Cursor's launcher runs its bundled Node on the agent's script, under the name it was called
+/// by (`agent`, too common a word to go by): Node, by that name or its own, with Cursor's script
+/// for the script it runs. A pager or an editor showing that script is not Cursor.
+fn runs_cursor(argv: &[String]) -> bool {
+    const CURSOR: &str = "/cursor-agent/versions/";
+    let Some(program) = argv.first() else { return false };
+    let name = program.rsplit('/').next().unwrap_or(program);
+    if !(matches!(name, "agent" | "cursor-agent" | "node") || program.contains(CURSOR)) {
+        return false;
+    }
+    // Node's options before the script, with the value those that take one have.
+    let mut args = argv.iter().skip(1);
+    while let Some(a) = args.next() {
+        match a.as_str() {
+            "-r" | "--require" | "--import" | "--loader" | "--experimental-loader" | "--env-file" => {
+                args.next();
+            }
+            "--" => return args.next().is_some_and(|s| s.contains(CURSOR) && s.ends_with("/index.js")),
+            "-e" | "--eval" | "-p" | "--print" | "-" => return false,
+            _ if a.starts_with('-') => {}
+            script => return script.contains(CURSOR) && script.ends_with("/index.js"),
+        }
+    }
+    false
 }
 
 /// What an agent shows at the bottom of its screen while it works, and while it waits for
@@ -231,6 +255,9 @@ pub struct AgentTracker {
     pub hooked: bool,
     pub session_id: Option<String>,
     pub message: Option<String>,
+    /// The process that ran the agent's last hook (its id and start time): the agent itself when
+    /// it runs its hooks directly, as OpenCode's and Kilo's plugins do.
+    pub reporter: Option<(u32, u64)>,
 }
 
 impl Default for AgentTracker {
@@ -242,6 +269,7 @@ impl Default for AgentTracker {
             hooked: false,
             session_id: None,
             message: None,
+            reporter: None,
         }
     }
 }
@@ -260,24 +288,33 @@ impl AgentTracker {
         true
     }
 
-    /// The foreground process changed. Returns true if the agent appeared or went away.
-    pub fn set_process(&mut self, agent: Option<&str>) -> bool {
+    /// The foreground process changed (`agent` is what runs there, if kraal recognises it).
+    /// `running` tells whether a process (id, start time) still runs. Returns true if the agent
+    /// appeared or went away.
+    pub fn set_process(&mut self, agent: Option<&str>, running: impl FnOnce(u32, u64) -> bool) -> bool {
         match (self.kind.as_deref(), agent) {
             (Some(a), Some(b)) if a == b => false,
             (None, None) => false,
             (_, Some(b)) => {
                 self.kind = Some(b.to_string());
                 self.hooked = false;
+                self.reporter = None;
                 self.set(AgentState::Idle);
                 true
             }
             (Some(kind), None) => {
-                // Hooked agents can run under a wrapper we don't recognise; keep them, as long
-                // as their hooks say when the session ends (OpenCode's plugins cannot).
-                if self.hooked && !matches!(kind, "opencode" | "kilo") {
+                // Hooked agents can run under a wrapper kraal does not recognise: keep them while
+                // their hooks say when the session ends, and OpenCode and Kilo, whose plugins
+                // cannot, while the process their plugin reported from runs.
+                let stays = match kind {
+                    "opencode" | "kilo" => self.reporter.is_some_and(|(pid, start)| running(pid, start)),
+                    _ => true,
+                };
+                if self.hooked && stays {
                     return false;
                 }
                 self.kind = None;
+                self.reporter = None;
                 self.set(AgentState::Unknown);
                 true
             }
@@ -313,12 +350,10 @@ impl AgentTracker {
 
 /// Whether an agent's hooks report every state change (working, blocked, done), so the screen
 /// heuristics can be switched off for it. Codex's notify, Cursor's and Augment's hooks have no
-/// event for a question to the user: the screen still tells that.
+/// event for a question to the user, and Gemini CLI's none when one is declined or a tool
+/// cancelled: the screen still tells that.
 pub fn hooks_cover_lifecycle(agent: &str) -> bool {
-    matches!(
-        agent,
-        "claude" | "gemini" | "qwen" | "droid" | "codebuddy" | "copilot" | "kimi" | "opencode" | "kilo" | "pi"
-    )
+    matches!(agent, "claude" | "qwen" | "droid" | "codebuddy" | "copilot" | "kimi" | "opencode" | "kilo" | "pi")
 }
 
 /// Map an agent's hook payload to a state change. `event` is the hook's event, for agents that
@@ -334,6 +369,11 @@ pub fn hook_state(agent: &str, payload: &serde_json::Value, event: Option<&str>)
             "UserPromptSubmit" | "PreToolUse" | "PostToolUse" | "PreCompact" | "SubagentStart" => Working,
             "Stop" | "StopFailure" => Done,
             "SessionEnd" => Unknown,
+            // Waiting for a prompt, which droid and Qwen Code say as soon as a turn ends: what
+            // ends a cancelled one, which has no Stop. A turn that finished stays done until
+            // seen (see the server's report handling). Claude Code and CodeBuddy say it only
+            // after a minute of nothing, which may be a question still waiting.
+            "Notification" if field("notification_type") == "idle_prompt" && matches!(agent, "droid" | "qwen") => Idle,
             "Notification" => {
                 let msg = field("message").to_lowercase();
                 let asks = matches!(field("notification_type"), "permission_prompt" | "elicitation_dialog")
@@ -365,6 +405,7 @@ pub fn hook_state(agent: &str, payload: &serde_json::Value, event: Option<&str>)
         ("copilot", "sessionEnd") => Unknown,
         ("cursor", "sessionStart") => Idle,
         ("cursor", "beforeSubmitPrompt" | "postToolUse") => Working,
+        ("cursor", "stop") if field("status") == "aborted" => Idle,
         ("cursor", "stop") => Done,
         ("cursor", "sessionEnd") => Unknown,
         ("auggie", "SessionStart") => Idle,
@@ -430,6 +471,15 @@ mod tests {
                 "/home/u/.local/share/cursor-agent/versions/2025.09.12-1/node /home/u/.local/share/cursor-agent/versions/2025.09.12-1/index.js",
                 Some("cursor"),
             ),
+            (
+                "node --use-system-ca /home/u/.local/share/cursor-agent/versions/2026.10.01-e373342/index.js",
+                Some("cursor"),
+            ),
+            // Cursor's script in a pager or an editor, or as an argument of another script.
+            ("less /home/u/.local/share/cursor-agent/versions/2026.10.01-e373342/index.js", None),
+            ("vim -R /home/u/.local/share/cursor-agent/versions/2026.10.01-e373342/index.js", None),
+            ("node /srv/app/index.js /home/u/.local/share/cursor-agent/versions/2026.10.01-e373342/index.js", None),
+            ("agent -e /home/u/.local/share/cursor-agent/versions/2026.10.01-e373342/index.js", None),
             // Agents behind a broader program's subcommand.
             ("acli rovodev run", Some("rovodev")),
             ("acli jira workitem view X-1", None),
@@ -535,7 +585,7 @@ mod tests {
     #[test]
     fn heuristics_reach_done_after_quiet_working() {
         let mut t = AgentTracker::default();
-        t.set_process(Some("claude"));
+        t.set_process(Some("claude"), |_, _| false);
         assert_eq!(t.state, AgentState::Idle);
         t.observe("esc to interrupt", Duration::ZERO);
         assert_eq!(t.state, AgentState::Working);
@@ -548,7 +598,7 @@ mod tests {
     #[test]
     fn hooks_override_heuristics() {
         let mut t = AgentTracker::default();
-        t.set_process(Some("claude"));
+        t.set_process(Some("claude"), |_, _| false);
         t.hooked = true;
         t.set(AgentState::Working);
         assert!(!t.observe("> ", Duration::from_secs(10)));
@@ -585,22 +635,21 @@ mod tests {
         );
         assert_eq!(state("gemini", r#"{"hook_event_name":"SessionEnd","reason":"exit"}"#), Some(AgentState::Unknown));
         assert_eq!(state("gemini", r#"{"hook_event_name":"Stop"}"#), None);
-        // Qwen Code: Claude's names, its own messages; idle notifications say nothing new.
+        // Qwen Code: Claude's names, its own messages; it waits for a prompt as soon as a turn
+        // ends, a cancelled one (which has no Stop) included.
         let qwen = r#"{"hook_event_name":"Notification","notification_type":"permission_prompt","title":"Permission needed","message":"Qwen Code needs your permission to use run_shell_command"}"#;
         assert_eq!(state("qwen", qwen), Some(AgentState::Blocked));
         let idle = r#"{"hook_event_name":"Notification","notification_type":"idle_prompt","title":"Waiting for input","message":"Qwen Code is waiting for your input"}"#;
-        assert_eq!(state("qwen", idle), None);
+        assert_eq!(state("qwen", idle), Some(AgentState::Idle));
         assert_eq!(state("qwen", r#"{"hook_event_name":"StopFailure"}"#), Some(AgentState::Done));
         // Factory's droid: cancelling a turn is an idle notification, not a stop.
         let droid = r#"{"hook_event_name":"Notification","notification_type":"permission_prompt","message":"Droid is waiting for permission"}"#;
         assert_eq!(state("droid", droid), Some(AgentState::Blocked));
-        assert_eq!(
-            state(
-                "droid",
-                r#"{"hook_event_name":"Notification","notification_type":"idle_prompt","message":"Droid is waiting for input"}"#
-            ),
-            None
-        );
+        let cancelled = r#"{"hook_event_name":"Notification","notification_type":"idle_prompt","message":"Droid is waiting for input"}"#;
+        assert_eq!(state("droid", cancelled), Some(AgentState::Idle));
+        // Claude Code says it after a minute of nothing, a question still waiting maybe.
+        let claude_idle = r#"{"hook_event_name":"Notification","notification_type":"idle_prompt","message":"Claude is waiting for your input"}"#;
+        assert_eq!(state("claude", claude_idle), None);
         // Kimi Code: approval requests, their answers and Esc have events of their own.
         assert_eq!(
             state("kimi", r#"{"hook_event_name":"PermissionRequest","tool_name":"Shell"}"#),
@@ -628,6 +677,7 @@ mod tests {
             state("cursor", r#"{"hook_event_name":"beforeSubmitPrompt","prompt":"x"}"#),
             Some(AgentState::Working)
         );
+        assert_eq!(state("cursor", r#"{"hook_event_name":"stop","status":"aborted"}"#), Some(AgentState::Idle));
         assert_eq!(
             state("auggie", r#"{"hook_event_name":"Stop","agent_stop_cause":"end_turn"}"#),
             Some(AgentState::Done)
@@ -636,6 +686,30 @@ mod tests {
             state("auggie", r#"{"hook_event_name":"Stop","agent_stop_cause":"interrupted"}"#),
             Some(AgentState::Idle)
         );
-        assert!(!hooks_cover_lifecycle("cursor") && !hooks_cover_lifecycle("codex") && hooks_cover_lifecycle("gemini"));
+        assert!(!hooks_cover_lifecycle("cursor") && !hooks_cover_lifecycle("codex") && hooks_cover_lifecycle("qwen"));
+        // Gemini CLI has no hook for a tool declined or cancelled: the screen tells that.
+        assert!(!hooks_cover_lifecycle("gemini"));
+    }
+
+    /// OpenCode under a wrapper kraal does not recognise (`bash -c 'opencode; …'`): it stays
+    /// while the process its plugin reported from runs, and goes with it.
+    #[test]
+    fn a_hooked_opencode_under_a_wrapper_stays_while_it_runs() {
+        let hooked = |kind: &str, reporter| AgentTracker {
+            kind: Some(kind.into()),
+            hooked: true,
+            reporter,
+            state: AgentState::Working,
+            ..Default::default()
+        };
+        let mut t = hooked("opencode", Some((42, 7)));
+        assert!(!t.set_process(None, |pid, start| (pid, start) == (42, 7)));
+        assert_eq!((t.kind.as_deref(), t.state), (Some("opencode"), AgentState::Working));
+        assert!(t.set_process(None, |_, _| false), "its process ended");
+        assert_eq!((t.kind.as_deref(), t.state), (None, AgentState::Unknown));
+        // Nothing to go by: it goes, as Kilo does. Hooks that say when the session ends keep
+        // the others.
+        assert!(hooked("kilo", None).set_process(None, |_, _| true));
+        assert!(!hooked("claude", None).set_process(None, |_, _| false));
     }
 }
