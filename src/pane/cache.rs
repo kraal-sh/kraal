@@ -43,9 +43,9 @@ pub struct ScreenCache {
     links: Vec<Vec<(u16, Arc<str>)>>,
     /// Rows with image placeholders: what they show depends on the images too.
     images: Vec<bool>,
-    /// A row being drawn.
-    row: Vec<Cell>,
-    row_links: Vec<(u16, Arc<str>)>,
+    /// The emulator's cells the rows were drawn from: a cell that is the same again looks the
+    /// same, unless all of them are drawn again (see `refresh`).
+    raw: Vec<alacritty_terminal::term::cell::Cell>,
 }
 
 impl ScreenCache {
@@ -81,6 +81,8 @@ impl ScreenCache {
             self.rows = rows;
             self.cells.clear();
             self.cells.resize(cols * rows, Cell::EMPTY);
+            self.raw.clear();
+            self.raw.resize(cols * rows, Default::default());
             self.versions.clear();
             self.versions.resize(rows, 0);
             self.changed.clear();
@@ -98,26 +100,45 @@ impl ScreenCache {
         // moves the rest of a row, a character over half of a wide one clears the other half).
         for y in lines {
             if y < rows {
-                self.draw_row(term, y, resized);
+                self.draw_row(term, y, all, resized);
             }
         }
     }
 
-    /// Draw row `y` from the grid; its version changes when its cells did (always when `fresh`).
-    fn draw_row<T>(&mut self, term: &Term<T>, y: usize, fresh: bool) {
+    /// Draw row `y` from the grid, every cell (`all`: what they look like may have changed with
+    /// them unchanged) or those that changed since; its version changes when what it shows did
+    /// (always when `fresh`).
+    fn draw_row<T>(&mut self, term: &Term<T>, y: usize, all: bool, fresh: bool) {
         let cols = self.cols;
         let line = Line(y as i32 - self.offset as i32);
         let grid = term.grid();
         let colors = term.colors();
         let selection = self.selection.as_ref();
-        self.row.clear();
-        self.row.resize(cols, Cell::EMPTY);
-        self.row_links.clear();
-        let mut images = false;
-        let mut uris: Vec<Arc<str>> = Vec::new();
-        for (x, out) in self.row.iter_mut().enumerate() {
+        let at = y * cols;
+        // The columns that changed, from the first to the last.
+        let mut changed: Option<(usize, usize)> = fresh.then_some((0, cols.saturating_sub(1)));
+        let mut links = fresh;
+        for x in 0..cols {
             let cell = &grid[line][Column(x)];
-            if let Some(h) = link_of(cell) {
+            let raw = &mut self.raw[at + x];
+            if !all && *raw == *cell {
+                continue;
+            }
+            links |= raw.hyperlink().is_some() || cell.hyperlink().is_some();
+            raw.clone_from(cell);
+            let mut drawn = Cell::EMPTY;
+            draw_cell(cell, Point::new(line, Column(x)), x + 1 >= cols, colors, selection, &mut drawn);
+            if self.cells[at + x] != drawn {
+                self.cells[at + x] = drawn;
+                changed = Some(changed.map_or((x, x), |(a, b)| (a.min(x), b.max(x))));
+            }
+        }
+        let row = &self.cells[at..at + cols];
+        if links {
+            let mut uris: Vec<Arc<str>> = Vec::new();
+            let mut found = Vec::new();
+            for (x, cell) in self.raw[at..at + cols].iter().enumerate() {
+                let Some(h) = link_of(cell) else { continue };
                 let uri = match uris.iter().find(|u| ***u == *h.uri()) {
                     Some(u) => u.clone(),
                     None => {
@@ -126,23 +147,15 @@ impl ScreenCache {
                         u
                     }
                 };
-                self.row_links.push((x as u16, uri));
+                found.push((x as u16, uri));
             }
-            draw_cell(cell, Point::new(line, Column(x)), x + 1 >= cols, colors, selection, out);
-            images |= out.symbol().starts_with(crate::graphics::PLACEHOLDER);
+            self.links[y] = found;
         }
-        let cells = &mut self.cells[y * cols..(y + 1) * cols];
-        if fresh || cells != self.row.as_slice() {
-            // The columns that changed, from the first to the last.
-            let differ = |x: &usize| cells[*x] != self.row[*x];
-            let from = if fresh { 0 } else { (0..cols).find(differ).unwrap_or(0) };
-            let to = if fresh { cols } else { (0..cols).rev().find(differ).map_or(cols, |x| x + 1) };
-            cells.swap_with_slice(&mut self.row);
-            self.changed[y] = (if fresh { 0 } else { self.versions[y] }, from as u16, to as u16);
+        if let Some((from, to)) = changed {
+            self.images[y] = row.iter().any(|c| c.symbol().starts_with(crate::graphics::PLACEHOLDER));
+            self.changed[y] = (if fresh { 0 } else { self.versions[y] }, from as u16, to as u16 + 1);
             self.versions[y] = new_version();
         }
-        std::mem::swap(&mut self.links[y], &mut self.row_links);
-        self.images[y] = images;
     }
 
     /// The size the rows are drawn at.
