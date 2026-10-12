@@ -915,3 +915,75 @@ mod plain {
         }
     }
 }
+
+/// What a pane saves of its text comes back as it was: saved, given to a new pane, saved again,
+/// it is the same, but for the line saying it was restored. A damaged file is read without a
+/// panic.
+#[test]
+fn fuzz_pane_scrollback_files() {
+    fuzz::run("pane_scrollback_files", 20, |rng| {
+        let (cols, rows) = (rng.range(2, 120) as u16, rng.range(1, 40) as u16);
+        let disabled = || Arc::new(crate::graphics::Shared::new(false, 0));
+        let mut f = fixture(cols, rows, 3000, disabled());
+        for _ in 0..rng.range(1, 6) {
+            let output = passed_on(rng, 4000, false);
+            for chunk in rng.chunks(&output) {
+                f.pane.feed(chunk);
+            }
+        }
+        // Back on the primary screen, the update and the reads all in.
+        f.pane.feed(b"\x1b[?1049l\x1b[?2026l");
+        f.pane.rest();
+        let Some(saved) = f.pane.scrollback_ansi() else { return };
+        let mut again = fixture(cols, rows, 3000, disabled());
+        again.pane.restore_scrollback(&saved, None, 3000 + usize::from(rows));
+        let resaved = again.pane.scrollback_ansi().unwrap();
+        // The new pane's own lines: the restored ones, then the line that says so.
+        let text = String::from_utf8_lossy(&resaved);
+        let kept = text.rsplit_once("\r\n").map_or("", |(k, _)| k);
+        let want = String::from_utf8_lossy(&saved);
+        // The text of each line: blanks the cursor had moved past end the last line saved, not
+        // the line given back, and a coloured end may come back as coloured blanks.
+        let plain = |l: &str| {
+            let mut out = String::new();
+            let mut chars = l.chars();
+            while let Some(c) = chars.next() {
+                if c == '\u{1b}' {
+                    // `CSI … m`, `CSI K`, and links (`OSC 8 … ESC \`).
+                    match chars.next() {
+                        Some('[') => while chars.next().is_some_and(|c| !c.is_ascii_alphabetic()) {},
+                        Some(']') => while chars.next().is_some_and(|c| c != '\u{1b}') {},
+                        _ => {}
+                    }
+                } else {
+                    out.push(c);
+                }
+            }
+            out.trim_end().to_string()
+        };
+        let lines = |t: &str| {
+            let mut lines: Vec<String> = t.split("\r\n").map(plain).collect();
+            while lines.last().is_some_and(String::is_empty) {
+                lines.pop();
+            }
+            lines
+        };
+        let (kept, want) = (lines(kept), lines(&want));
+        let n = kept.len().min(want.len());
+        if let Some(i) = (1..=n).find(|i| kept[kept.len() - i] != want[want.len() - i]) {
+            panic!(
+                "line {i} from the end of {} saved, {} saved again:\n{:?}\n{:?}",
+                want.len(),
+                kept.len(),
+                want[want.len() - i],
+                kept[kept.len() - i]
+            );
+        }
+        // A damaged file.
+        let mut damaged = saved;
+        rng.mutate(&mut damaged, &[b"\x1b[", b"\x1b]8;;", b"\r\n", b"m", b"\x1b\\", b"\x07", b"\x1bP"]);
+        let mut other = fixture(cols, rows, rng.range(0, 3000), disabled());
+        other.pane.restore_scrollback(&damaged, Some(rng.number() as i64), rng.size(5000));
+        let _ = other.pane.scrollback_ansi();
+    });
+}
