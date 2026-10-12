@@ -716,17 +716,18 @@ pub(super) fn draw_cell(
         out.set_symbol("");
         return;
     }
+    // alacritty keeps a tab where it moved the cursor from, for copying: drawn, a blank (sent
+    // to the client's terminal, it would move its cursor).
+    let c = if cell.c == '\0' || cell.c == '\t' { ' ' } else { cell.c };
     if cell.flags.contains(Flags::LEADING_WIDE_CHAR_SPACER) {
         out.set_symbol(" ");
     } else if let Some(zw) = cell.zerowidth() {
         let mut s = String::with_capacity(8);
-        s.push(cell.c);
+        s.push(c);
         s.extend(zw);
         out.set_symbol(&s);
-    } else if cell.c == '\0' || cell.c == '\t' {
-        out.set_symbol(" ");
     } else {
-        out.set_char(cell.c);
+        out.set_char(c);
     }
     // A wide char at the last column cannot be drawn.
     if cell.flags.contains(Flags::WIDE_CHAR) && last {

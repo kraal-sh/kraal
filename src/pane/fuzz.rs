@@ -215,6 +215,7 @@ fn draw_and_compare(p: &mut Pane) {
     p.render(area, &mut full, &mut full_links);
     assert_eq!(cached, full, "the cached screen differs from the screen");
     assert_eq!(cached_links, full_links);
+    no_controls(&full);
     p.show_images(area, &mut full, true);
     let _ = p.images();
 }
@@ -356,7 +357,15 @@ fn view<T: alacritty_terminal::event::EventListener>(term: &Term<T>) -> Buffer {
     let area = Rect::new(0, 0, term.columns() as u16, term.screen_lines() as u16);
     let mut buf = Buffer::empty(area);
     render_term(term, area, &mut buf, None);
+    no_controls(&buf);
     buf
+}
+
+/// What is drawn holds no control character: sent to the client's terminal, it would act there.
+fn no_controls(buf: &Buffer) {
+    if let Some(cell) = buf.content().iter().find(|c| c.symbol().chars().any(char::is_control)) {
+        panic!("a control character drawn: {:?}", cell.symbol());
+    }
 }
 
 /// The pane's screen is the emulator's, unless either holds a synchronized update back. Once

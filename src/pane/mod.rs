@@ -1361,6 +1361,18 @@ mod tests {
         }
     }
 
+    /// A tab one column wide, a combining mark after it: the mark goes on the cell that keeps
+    /// the tab, which is drawn as a blank all the same, never as a tab sent to the client.
+    #[test]
+    fn a_tab_with_a_combining_mark_is_drawn_blank() {
+        let mut pane = fed_pane(10, 3, 100);
+        pane.feed("1234567\t\u{301}x".as_bytes());
+        let mut buf = Buffer::empty(Rect::new(0, 0, 10, 3));
+        pane.render(Rect::new(0, 0, 10, 3), &mut buf, &mut crate::ansi::Links::new());
+        assert_eq!(buf[(7, 0)].symbol(), " \u{301}");
+        assert!(buf.content().iter().all(|c| !c.symbol().contains('\t')));
+    }
+
     #[test]
     fn shells_are_told_from_other_programs() {
         for shell in ["zsh", "-zsh", "/bin/bash", "/usr/bin/fish", "sh"] {
