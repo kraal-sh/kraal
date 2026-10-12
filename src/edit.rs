@@ -176,8 +176,15 @@ fn save_function() -> String {
         "set -- $(printf %s \"$n\" | cksum)",
         "m=./.kraal-edit-lock-$1",
         "i=0",
+        "f=0",
+        // Not made and not there: none can be made here, unless another save let go of its lock
+        // between the two looks. So it is tried again at once, and said after three in a row.
         "until mkdir -- \"$m\" 2>/dev/null; do \
-         if [ ! -d \"$m\" ]; then echo 'no lock can be made next to it' >&2; exit 3; fi; \
+         if [ ! -d \"$m\" ]; then \
+         f=$((f + 1)); \
+         if [ \"$f\" -gt 2 ]; then echo 'no lock can be made next to it' >&2; exit 3; fi; \
+         continue; fi; \
+         f=0; \
          i=$((i + 1)); \
          if [ \"$i\" -gt 100 ]; then echo \"another save of this file is under way; if none is, remove $(pwd -P)/${m#./}\" >&2; exit 3; fi; \
          sleep 0.1 2>/dev/null || { sleep 1; i=$((i + 9)); }; \

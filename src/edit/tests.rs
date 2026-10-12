@@ -437,6 +437,37 @@ fn a_save_waits_for_the_lock_of_another() {
     assert!(Here::leftovers(&t.home()).is_empty());
 }
 
+/// A lock another save let go of between the time this one failed to make it and the time it
+/// looked at it is not "no lock can be made": the save takes it. Where none can be made, that is
+/// said, and the file is left as it was.
+#[test]
+fn a_save_takes_a_lock_let_go_of_while_it_looked() {
+    let t = Here::new("letgo");
+    let file = t.home().join("f.txt");
+    std::fs::write(&file, "v1\n").unwrap();
+    let opened = t.open("~/f.txt").unwrap();
+    // A `mkdir` there that fails for the lock, leaving nothing, as often as `~/.held` says: what
+    // a save sees of a lock held when it tried, and gone when it looks.
+    crate::testing::write_script(
+        &t.dir.join("bin/mkdir"),
+        "#!/bin/sh\nfor a; do last=$a; done\nread -r held < \"$HOME/.held\"\n\
+         case $last in ./.kraal-edit-lock-*) if [ \"$held\" -gt 0 ]; then echo $((held - 1)) > \"$HOME/.held\"; exit 1; fi ;; esac\n\
+         exec /bin/mkdir \"$@\"\n",
+    );
+    let held = |times: u32| std::fs::write(t.home().join(".held"), format!("{times}\n")).unwrap();
+    held(2);
+    let saved = t.save(&opened, &opened.identity, b"v2\n").unwrap();
+    assert!(matches!(saved, Saved::Written(_)), "{saved:?}");
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "v2\n");
+    assert_eq!(std::fs::read_to_string(t.home().join(".held")).unwrap(), "0\n", "the lock was never asked for");
+    let Saved::Written(identity) = saved else { unreachable!() };
+    held(1000);
+    let err = t.save(&opened, &identity, b"v3\n").unwrap_err();
+    assert!(format!("{err:#}").contains("no lock can be made next to it"), "{err:#}");
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "v2\n");
+    assert!(Here::leftovers(&t.home()).is_empty());
+}
+
 /// The server's version is written over the editor's copy only while the copy is as it was when
 /// the user chose it: a save made since is left alone.
 #[test]
