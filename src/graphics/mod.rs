@@ -292,9 +292,9 @@ impl PaneGraphics {
 
     /// Output for the emulator, with images taken out. Without image support configured, all
     /// of it goes to the emulator, which ignores these sequences.
-    pub fn split(&mut self, bytes: &[u8]) -> Vec<Piece> {
+    pub fn split<'a>(&mut self, bytes: &'a [u8]) -> Vec<Piece<'a>> {
         if !self.shared.enabled {
-            return vec![Piece::Text(bytes.to_vec())];
+            return vec![Piece::Text(bytes.into())];
         }
         self.scanner.split(bytes)
     }
@@ -305,7 +305,7 @@ impl PaneGraphics {
     }
 
     /// Act on an image sequence; returns the reply for the program, if any.
-    pub fn handle<T: EventListener>(&mut self, piece: Piece, term: &mut Term<T>) -> Option<Vec<u8>> {
+    pub fn handle<T: EventListener>(&mut self, piece: Piece<'_>, term: &mut Term<T>) -> Option<Vec<u8>> {
         match piece {
             Piece::Text(_) => None,
             Piece::Kitty(body) => self.kitty(&body, term),

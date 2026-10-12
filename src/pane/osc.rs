@@ -50,50 +50,62 @@ pub(super) enum ScanState {
     OscEsc,
 }
 
+/// Longest OSC body kept; the rest is dropped.
+const MAX_OSC: usize = 8192;
+
 impl OscScanner {
-    /// The sequences that end in `bytes`, each with the offset just past its end.
+    /// The sequences that end in `bytes`, each with the offset just past its end. Text and the
+    /// body of a sequence are passed over in runs, to the next byte that matters.
     pub(super) fn scan(&mut self, bytes: &[u8]) -> Vec<(usize, Osc)> {
         let mut out = Vec::new();
-        for (i, &b) in bytes.iter().enumerate() {
-            // Something between a notification and the next sequence.
-            let between = match self.state {
-                ScanState::Ground => b != 0x1b,
-                ScanState::Esc => b != b']',
-                _ => false,
-            };
-            if between {
-                self.echo = None;
-            }
-            self.state = match (self.state, b) {
-                (ScanState::Ground, 0x1b) => ScanState::Esc,
-                (ScanState::Ground, _) => ScanState::Ground,
-                (ScanState::Esc, b']') => {
-                    self.buf.clear();
-                    ScanState::Osc
-                }
-                (ScanState::Esc, 0x1b) => ScanState::Esc,
-                (ScanState::Esc, _) => ScanState::Ground,
-                (ScanState::Osc, 0x07) => {
-                    out.extend(self.finish().map(|o| (i + 1, o)));
-                    ScanState::Ground
-                }
-                (ScanState::Osc, 0x1b) => ScanState::OscEsc,
-                (ScanState::Osc, b) => {
-                    if self.buf.len() < 8192 {
-                        self.buf.push(b);
+        let mut i = 0;
+        while i < bytes.len() {
+            match self.state {
+                ScanState::Ground => {
+                    let next = memchr::memchr(0x1b, &bytes[i..]);
+                    // Something between a notification and the next sequence.
+                    if next != Some(0) {
+                        self.echo = None;
                     }
-                    ScanState::Osc
+                    let Some(n) = next else { break };
+                    i += n + 1;
+                    self.state = ScanState::Esc;
                 }
-                (ScanState::OscEsc, b'\\') => {
-                    out.extend(self.finish().map(|o| (i + 1, o)));
-                    ScanState::Ground
+                ScanState::Osc => {
+                    let rest = &bytes[i..];
+                    let end = memchr::memchr2(0x07, 0x1b, rest);
+                    let body = &rest[..end.unwrap_or(rest.len())];
+                    let room = MAX_OSC.saturating_sub(self.buf.len());
+                    self.buf.extend_from_slice(&body[..body.len().min(room)]);
+                    let Some(n) = end else { break };
+                    i += n + 1;
+                    self.state = if rest[n] == 0x07 {
+                        out.extend(self.finish().map(|o| (i, o)));
+                        ScanState::Ground
+                    } else {
+                        ScanState::OscEsc
+                    };
                 }
-                (ScanState::OscEsc, b']') => {
-                    self.buf.clear();
-                    ScanState::Osc
+                state => {
+                    let b = bytes[i];
+                    i += 1;
+                    if state == ScanState::Esc && b != b']' {
+                        self.echo = None;
+                    }
+                    self.state = match (state, b) {
+                        (ScanState::Esc | ScanState::OscEsc, b']') => {
+                            self.buf.clear();
+                            ScanState::Osc
+                        }
+                        (ScanState::Esc, 0x1b) => ScanState::Esc,
+                        (ScanState::OscEsc, b'\\') => {
+                            out.extend(self.finish().map(|o| (i, o)));
+                            ScanState::Ground
+                        }
+                        _ => ScanState::Ground,
+                    };
                 }
-                (ScanState::OscEsc, _) => ScanState::Ground,
-            };
+            }
         }
         out
     }
@@ -196,4 +208,100 @@ pub fn osc_notify(title: &str, body: &str) -> Vec<u8> {
     let t = clean(title).replace(';', ",");
     let b = clean(body).replace(';', ",");
     format!("\x1b]777;notify;{t};{b}\x07\x1b]9;{t}: {b}\x07").into_bytes()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The scanner as it was, one byte at a time.
+    fn scan_every_byte(s: &mut OscScanner, bytes: &[u8]) -> Vec<(usize, Osc)> {
+        let mut out = Vec::new();
+        for (i, &b) in bytes.iter().enumerate() {
+            let between = match s.state {
+                ScanState::Ground => b != 0x1b,
+                ScanState::Esc => b != b']',
+                _ => false,
+            };
+            if between {
+                s.echo = None;
+            }
+            s.state = match (s.state, b) {
+                (ScanState::Ground, 0x1b) => ScanState::Esc,
+                (ScanState::Ground, _) => ScanState::Ground,
+                (ScanState::Esc | ScanState::OscEsc, b']') => {
+                    s.buf.clear();
+                    ScanState::Osc
+                }
+                (ScanState::Esc, 0x1b) => ScanState::Esc,
+                (ScanState::Esc, _) => ScanState::Ground,
+                (ScanState::Osc, 0x07) => {
+                    out.extend(s.finish().map(|o| (i + 1, o)));
+                    ScanState::Ground
+                }
+                (ScanState::Osc, 0x1b) => ScanState::OscEsc,
+                (ScanState::Osc, b) => {
+                    if s.buf.len() < MAX_OSC {
+                        s.buf.push(b);
+                    }
+                    ScanState::Osc
+                }
+                (ScanState::OscEsc, b'\\') => {
+                    out.extend(s.finish().map(|o| (i + 1, o)));
+                    ScanState::Ground
+                }
+                (ScanState::OscEsc, _) => ScanState::Ground,
+            };
+        }
+        out
+    }
+
+    /// Reading text and sequence bodies in runs finds the same sequences at the same offsets,
+    /// however the reads cut them, as reading every byte.
+    #[test]
+    fn runs_find_what_bytes_find() {
+        let long = format!("\x1b]9;{}\x07", "x".repeat(MAX_OSC + 10));
+        let pieces: &[&[u8]] = &[
+            b"\x1b",
+            b"]",
+            b"\\",
+            b"\x07",
+            b"text ",
+            b"133;A",
+            b"133;D;1",
+            b"7;file://h/tmp",
+            b"9;hi",
+            b";",
+            b"7701;?",
+            b"777;notify;t;b",
+            b"\x1b]133;C\x07",
+            b"\x1b]7;file://host/a%20b\x1b\\",
+            b"\x1b]777;notify;t;b\x07",
+            b"\x1b]9;t: b\x07",
+            b"9;t: b",
+            long.as_bytes(),
+        ];
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut next = move |n: usize| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % n as u64) as usize
+        };
+        for _ in 0..300 {
+            let mut output = Vec::new();
+            for _ in 0..60 {
+                output.extend_from_slice(pieces[next(pieces.len())]);
+            }
+            let (mut runs, mut bytes) = (OscScanner::default(), OscScanner::default());
+            let mut at = 0;
+            while at < output.len() {
+                let end = (at + 1 + next(30)).min(output.len());
+                let read = &output[at..end];
+                assert_eq!(runs.scan(read), scan_every_byte(&mut bytes, read));
+                assert!(runs.state == bytes.state && runs.buf == bytes.buf && runs.echo == bytes.echo);
+                at = end;
+            }
+        }
+    }
 }

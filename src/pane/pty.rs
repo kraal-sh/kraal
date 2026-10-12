@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use alacritty_terminal::event::{Event as TermEvent, EventListener};
 use alacritty_terminal::grid::Dimensions;
@@ -184,13 +185,12 @@ pub struct TermPane {
     pub(super) input_pending: Arc<AtomicUsize>,
     /// Input was dropped because of that, since the server last asked.
     pub input_dropped: bool,
-    /// Output read from the PTY, waiting to be parsed. Small and bounded: a program printing
-    /// faster than kraal parses is slowed down here, alone, without delaying other panes.
-    pub(super) output: crossbeam_channel::Receiver<Vec<u8>>,
+    /// Output read from the PTY, waiting to be parsed.
+    pub(super) output: Arc<Output>,
     pub(super) process: Arc<Process>,
     /// Tells the reader to stop, even if the program never writes again (it may outlive the
     /// pane, ignoring the hangup).
-    reader_stop: Arc<AtomicBool>,
+    reader_stop: ReaderStop,
     pub pid: Option<u32>,
     pub(super) osc: OscScanner,
     pub(super) guard: KeyboardStackGuard,
@@ -208,7 +208,7 @@ pub(super) fn pty_size(cols: u16, rows: u16, graphics: &crate::graphics::Shared)
 
 impl Drop for TermPane {
     fn drop(&mut self) {
-        self.reader_stop.store(true, Ordering::Relaxed);
+        self.reader_stop.stop();
     }
 }
 
@@ -295,7 +295,7 @@ impl TermPane {
             let _ = wait_tx.send(Event::PaneExited(id, waited.pid, code));
         });
         if let Err(e) = started {
-            io.stop.store(true, Ordering::Relaxed);
+            io.stop.stop();
             process.signal_group(libc::SIGKILL);
             return Err(e.into());
         }
@@ -409,40 +409,109 @@ fn findable(program: &OsStr, dir: &Path, path: Option<&OsStr>) -> bool {
     path.is_some_and(|path| std::env::split_paths(path).any(|d| executable(&dir.join(d).join(program))))
 }
 
+/// Output read from a PTY and not parsed yet. The reader adds each read to it; the server takes
+/// all of it at once. Bounded: a program printing faster than kraal parses is slowed down
+/// here, alone, without delaying other panes.
+#[derive(Default)]
+pub(super) struct Output {
+    waiting: Mutex<Waiting>,
+    /// The server took what was waiting: a reader waiting for room goes on.
+    taken: std::sync::Condvar,
+}
+
+#[derive(Default)]
+struct Waiting {
+    bytes: Vec<u8>,
+    /// The server was told there is output, and has not found it all taken since: it comes
+    /// back for more without being told again.
+    told: bool,
+}
+
+/// Output waiting beyond which the reader stops reading (and the program waits on its writes).
+const MAX_WAITING: usize = 64 * 1024;
+
+impl Output {
+    fn lock(&self) -> std::sync::MutexGuard<'_, Waiting> {
+        self.waiting.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Swap what is waiting into `into` (its own bytes are dropped, its room kept for the
+    /// reader); false when nothing was waiting. The server is then told of the next output,
+    /// unless it `comes_back` for it on its own.
+    pub(super) fn take(&self, into: &mut Vec<u8>, comes_back: bool) -> bool {
+        into.clear();
+        let mut w = self.lock();
+        if w.bytes.is_empty() {
+            w.told &= comes_back;
+            return false;
+        }
+        std::mem::swap(&mut w.bytes, into);
+        drop(w);
+        self.taken.notify_one();
+        true
+    }
+
+    pub(super) fn is_empty(&self) -> bool {
+        self.lock().bytes.is_empty()
+    }
+
+    /// Add a read once there is room for it (None when told to stop meanwhile): whether the
+    /// server must be told, which counts it told.
+    fn add(&self, read: &[u8], stop: &AtomicBool) -> Option<bool> {
+        let mut w = self.lock();
+        while w.bytes.len() >= MAX_WAITING {
+            if stop.load(Ordering::Acquire) {
+                return None;
+            }
+            w = self.taken.wait_timeout(w, Duration::from_millis(200)).ok()?.0;
+        }
+        w.bytes.extend_from_slice(read);
+        Some(!std::mem::replace(&mut w.told, true))
+    }
+
+    /// Telling the server failed: the next read tries again.
+    fn untell(&self) {
+        self.lock().told = false;
+    }
+}
+
+/// Read a PTY until its end or until told to stop, adding its output to `out`, and telling the
+/// server (`tell`) of output it does not know of yet.
+fn read_output(mut reader: PtyReader, out: &Output, stop: &AtomicBool, tell: impl Fn() -> bool) {
+    let mut buf = vec![0u8; 64 * 1024];
+    while let Some(n) = reader.read(&mut buf, stop) {
+        match out.add(&buf[..n], stop) {
+            None => return,
+            Some(true) if !tell() => out.untell(),
+            Some(_) => {}
+        }
+    }
+}
+
 /// The threads that move bytes between a pane's PTY and kraal.
 struct Io {
     input: Sender<Vec<u8>>,
     input_pending: Arc<AtomicUsize>,
-    output: crossbeam_channel::Receiver<Vec<u8>>,
+    output: Arc<Output>,
     /// Closed when the reader has seen the end of the output.
     eof: crossbeam_channel::Receiver<()>,
-    stop: Arc<AtomicBool>,
+    stop: ReaderStop,
 }
 
 fn start_io(id: PaneId, master: &(dyn MasterPty + Send), tx: &Sender<Event>) -> Result<Io> {
-    let reader = PtyReader::new(master)?;
+    let stop = ReaderStop::new(master.tty_name());
+    let reader = PtyReader::new(master, stop.wakes())?;
     let mut writer = master.take_writer()?;
-    let stop = Arc::new(AtomicBool::new(false));
     let ready_tx = tx.clone();
-    let (out_tx, out_rx) = crossbeam_channel::bounded::<Vec<u8>>(4);
+    let output = Arc::new(Output::default());
+    let out = output.clone();
     let (eof_tx, eof_rx) = crossbeam_channel::bounded::<()>(0);
-    let stopped = stop.clone();
+    let stopped = stop.flag.clone();
     std::thread::Builder::new().name(format!("pane-{id}-read")).spawn(move || {
         let _eof = eof_tx;
-        let mut reader = reader;
-        let mut buf = vec![0u8; 64 * 1024];
-        loop {
-            match reader.read(&mut buf, &stopped) {
-                Ok(0) | Err(_) => break,
-                Ok(n) => {
-                    if out_tx.send(buf[..n].to_vec()).is_err() {
-                        return;
-                    }
-                    // A lost wake-up is harmless: the server also polls panes with output.
-                    let _ = ready_tx.try_send(Event::PaneReady(id));
-                }
-            }
-        }
+        // The server takes all that waits when told. Telling may fail when its queue is full:
+        // it also looks for panes with output now and then.
+        read_output(reader, &out, &stopped, || ready_tx.try_send(Event::PaneReady(id)).is_ok());
     })?;
     let (in_tx, in_rx) = crossbeam_channel::unbounded::<Vec<u8>>();
     let input_pending = Arc::new(AtomicUsize::new(0));
@@ -456,20 +525,58 @@ fn start_io(id: PaneId, master: &(dyn MasterPty + Send), tx: &Sender<Event>) -> 
         }
     });
     if let Err(e) = started {
-        stop.store(true, Ordering::Relaxed);
+        stop.stop();
         return Err(e.into());
     }
-    Ok(Io { input: in_tx, input_pending, output: out_rx, eof: eof_rx, stop })
+    Ok(Io { input: in_tx, input_pending, output, eof: eof_rx, stop })
 }
 
-/// Reads a PTY's output, giving up as soon as it is told to stop, even while the program is
-/// silent: a blocked `read` would otherwise keep the PTY open for as long as the program lives.
+/// Tells a pane's reader to stop, even while the program is silent: a blocked reader would
+/// otherwise keep the PTY open for as long as the program lives (it may outlive the pane,
+/// ignoring the hangup). The reader waits in `read` (a `poll` before each read slows down a
+/// program that prints many small pieces, like `seq`): a byte written to the PTY's other end
+/// wakes it.
+pub(super) struct ReaderStop {
+    flag: Arc<AtomicBool>,
+    /// The PTY's other end, where the byte goes.
+    tty: Option<PathBuf>,
+}
+
+impl ReaderStop {
+    fn new(tty: Option<PathBuf>) -> ReaderStop {
+        ReaderStop { flag: Arc::new(AtomicBool::new(false)), tty }
+    }
+
+    pub(super) fn stop(&self) {
+        use std::os::unix::fs::OpenOptionsExt;
+        self.flag.store(true, Ordering::Release);
+        let Some(tty) = &self.tty else { return };
+        // Not as a controlling terminal, and without waiting: a full PTY wakes the reader anyway.
+        let opened = std::fs::OpenOptions::new().write(true).custom_flags(libc::O_NOCTTY | libc::O_NONBLOCK).open(tty);
+        if let Ok(mut tty) = opened {
+            use std::os::fd::AsRawFd;
+            // Output stopped (XOFF) would hold the byte back.
+            // SAFETY: plain call on a descriptor the File owns.
+            unsafe { libc::tcflow(tty.as_raw_fd(), libc::TCOON) };
+            let _ = tty.write(b"\0");
+        }
+    }
+
+    /// Whether a byte can wake the reader: otherwise it checks for a stop now and then.
+    fn wakes(&self) -> bool {
+        self.tty.is_some()
+    }
+}
+
+/// Reads a PTY's output, until its end or until told to stop.
 struct PtyReader {
     file: std::fs::File,
+    /// A stop wakes the reader (see [`ReaderStop`]): it can wait in `read`.
+    woken: bool,
 }
 
 impl PtyReader {
-    fn new(master: &(dyn MasterPty + Send)) -> Result<PtyReader> {
+    fn new(master: &(dyn MasterPty + Send), woken: bool) -> Result<PtyReader> {
         use std::os::fd::FromRawFd;
         let fd = master.as_raw_fd().context("the pty has no descriptor")?;
         // SAFETY: dup of a descriptor we own; the copy is owned by the File.
@@ -478,28 +585,40 @@ impl PtyReader {
             return Err(std::io::Error::last_os_error()).context("duplicating the pty");
         }
         // SAFETY: `copy` is a fresh descriptor nothing else owns.
-        Ok(PtyReader { file: unsafe { std::fs::File::from_raw_fd(copy) } })
+        Ok(PtyReader { file: unsafe { std::fs::File::from_raw_fd(copy) }, woken })
     }
 
-    fn read(&mut self, buf: &mut [u8], stop: &AtomicBool) -> std::io::Result<usize> {
-        use std::os::fd::AsRawFd;
+    /// The next output, as much as the PTY has, waiting for it; None at the end or once told to
+    /// stop (what woke the reader then is dropped).
+    fn read(&mut self, buf: &mut [u8], stop: &AtomicBool) -> Option<usize> {
         loop {
-            if stop.load(Ordering::Relaxed) {
-                return Ok(0);
+            if stop.load(Ordering::Acquire) {
+                return None;
             }
-            let mut fds = libc::pollfd { fd: self.file.as_raw_fd(), events: libc::POLLIN, revents: 0 };
-            // SAFETY: one valid pollfd.
-            match unsafe { libc::poll(&mut fds, 1, 200) } {
-                0 => continue,
-                n if n < 0 => {
-                    let e = std::io::Error::last_os_error();
-                    if e.kind() == std::io::ErrorKind::Interrupted {
-                        continue;
-                    }
-                    return Err(e);
-                }
-                _ => return self.file.read(buf),
+            if !self.woken && !self.ready(Duration::from_millis(200)).ok()? {
+                continue;
             }
+            match self.file.read(buf) {
+                Ok(0) => return None,
+                Ok(_) if stop.load(Ordering::Acquire) => return None,
+                Ok(n) => return Some(n),
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => return None,
+            }
+        }
+    }
+
+    /// Whether output (or the end) came within `wait`.
+    fn ready(&self, wait: Duration) -> std::io::Result<bool> {
+        use std::os::fd::AsRawFd;
+        let mut fds = libc::pollfd { fd: self.file.as_raw_fd(), events: libc::POLLIN, revents: 0 };
+        // SAFETY: one valid pollfd.
+        match unsafe { libc::poll(&mut fds, 1, wait.as_millis() as i32) } {
+            n if n < 0 => {
+                let e = std::io::Error::last_os_error();
+                if e.kind() == std::io::ErrorKind::Interrupted { Ok(false) } else { Err(e) }
+            }
+            n => Ok(n > 0),
         }
     }
 }
@@ -546,17 +665,67 @@ mod tests {
         let pair = portable_pty::native_pty_system()
             .openpty(PtySize { rows: 5, cols: 20, pixel_width: 0, pixel_height: 0 })
             .unwrap();
-        let mut reader = PtyReader::new(&*pair.master).unwrap();
-        let stop = Arc::new(AtomicBool::new(false));
-        let stopped = stop.clone();
-        let (done_tx, done_rx) = crossbeam_channel::bounded(1);
+        // Woken by a byte from the other end, or (without its name) checking now and then.
+        for tty in [pair.master.tty_name(), None] {
+            let stop = ReaderStop::new(tty);
+            let mut reader = PtyReader::new(&*pair.master, stop.wakes()).unwrap();
+            let stopped = stop.flag.clone();
+            let (done_tx, done_rx) = crossbeam_channel::bounded(1);
+            std::thread::spawn(move || {
+                let mut buf = [0u8; 64];
+                let _ = done_tx.send(reader.read(&mut buf, &stopped));
+            });
+            std::thread::sleep(Duration::from_millis(50));
+            assert!(done_rx.is_empty());
+            stop.stop();
+            assert_eq!(done_rx.recv_timeout(Duration::from_secs(2)), Ok(None));
+        }
+    }
+
+    #[test]
+    fn output_is_taken_in_batches_and_the_server_told_once_per_batch() {
+        let pair = portable_pty::native_pty_system()
+            .openpty(PtySize { rows: 5, cols: 20, pixel_width: 0, pixel_height: 0 })
+            .unwrap();
+        let stop = ReaderStop::new(pair.master.tty_name());
+        let reader = PtyReader::new(&*pair.master, stop.wakes()).unwrap();
+        let out = Arc::new(Output::default());
+        let told = Arc::new(AtomicUsize::new(0));
+        let (o, t, f) = (out.clone(), told.clone(), stop.flag.clone());
         std::thread::spawn(move || {
-            let mut buf = [0u8; 64];
-            let _ = done_tx.send(reader.read(&mut buf, &stopped).map_err(|e| e.kind()));
+            read_output(reader, &o, &f, || {
+                t.fetch_add(1, Ordering::SeqCst);
+                true
+            })
         });
+        let mut tty = std::fs::OpenOptions::new().write(true).open(pair.master.tty_name().unwrap()).unwrap();
+        let wait_for = |n: usize| {
+            let start = Instant::now();
+            while told.load(Ordering::SeqCst) < n && start.elapsed() < Duration::from_secs(2) {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            told.load(Ordering::SeqCst)
+        };
+        tty.write_all(b"one").unwrap();
+        assert_eq!(wait_for(1), 1);
+        // More output before the server came: it is not told again, and takes all of it.
+        tty.write_all(b" two").unwrap();
         std::thread::sleep(Duration::from_millis(50));
-        stop.store(true, Ordering::Relaxed);
-        assert_eq!(done_rx.recv_timeout(Duration::from_secs(2)), Ok(Ok(0)));
+        assert_eq!(told.load(Ordering::SeqCst), 1);
+        let mut got = Vec::new();
+        assert!(out.take(&mut got, false));
+        assert!(String::from_utf8_lossy(&got).ends_with("one two"), "{got:?}");
+        // Found empty by a server that comes back on its own: it is not told.
+        assert!(!out.take(&mut got, true) && got.is_empty());
+        tty.write_all(b"three").unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(told.load(Ordering::SeqCst), 1);
+        assert!(out.take(&mut got, true) && got == b"three");
+        // Found empty otherwise: the next output is told again.
+        assert!(!out.take(&mut got, false));
+        tty.write_all(b"four").unwrap();
+        assert_eq!(wait_for(2), 2);
+        stop.stop();
     }
 
     #[test]

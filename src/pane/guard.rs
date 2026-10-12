@@ -11,6 +11,12 @@
 //!
 //! It also follows the scroll region's top margin on the primary screen, for the command marks:
 //! a region that starts below the first line scrolls without filling the history.
+//!
+//! Only escape sequences matter, and ESC puts the parser in the same state whatever it was
+//! reading: so the parser is given each sequence from its ESC, and plain text, along with
+//! common sequences that can change none of this (colours, cursor moves), is skipped.
+
+use std::borrow::Cow;
 
 use alacritty_terminal::vte::{Params, Parser, Perform};
 
@@ -18,6 +24,9 @@ use alacritty_terminal::vte::{Params, Parser, Perform};
 const MAX_DEPTH: u32 = 1024;
 /// Cancel: ends the sequence being read without acting on it, in any state.
 const CAN: u8 = 0x18;
+/// Substitute: ends it too.
+const SUB: u8 = 0x1a;
+const ESC: u8 = 0x1b;
 
 #[derive(Default)]
 pub(super) struct KeyboardStackGuard {
@@ -30,6 +39,65 @@ pub(super) struct KeyboardStackGuard {
     margin: bool,
     /// A top margin was in force on the primary screen since [`KeyboardStackGuard::take_top_margin`].
     margin_seen: bool,
+    /// The parser was given the end of the last read, a sequence it may still be reading: the
+    /// next read goes to it up to its first ESC.
+    unfinished: bool,
+}
+
+/// What the bytes from an ESC are, for the guard.
+#[derive(Debug, PartialEq)]
+enum Sequence {
+    /// Bytes to pass over: a sequence that changes nothing followed, up to where the parser is
+    /// back in the ground state or at the ESC that ends it.
+    Skip(usize),
+    /// A control sequence of this length, ending in the ground state, that may change something.
+    Read(usize),
+    /// Anything else (strings, controls inside a sequence, a sequence the read cut): the parser
+    /// reads it, up to the next ESC.
+    Other,
+}
+
+/// Recognise the sequence at the start of `s` (which starts with ESC) as the parser reads it.
+/// Only CSI `u` (keyboard pushes and pops), `h` and `l` (the alternate screen), `r` (the scroll
+/// region) and ESC `c` (reset) concern the guard; a CSI sequence of parameter and intermediate
+/// bytes and another final byte, an ESC sequence, an OSC, SOS, PM or APC string change nothing
+/// it follows. DCS strings, controls inside a sequence and sequences cut by the end of the read
+/// go to the parser.
+fn sequence(s: &[u8]) -> Sequence {
+    match s.get(1) {
+        Some(b'[') => {
+            let body = s[2..].iter().position(|b| !(0x20..=0x3f).contains(b));
+            match body.map(|n| (n + 2, s[n + 2])) {
+                Some((at, b'u' | b'h' | b'l' | b'r')) => Sequence::Read(at + 1),
+                Some((at, 0x40..=0x7e)) => Sequence::Skip(at + 1),
+                _ => Sequence::Other,
+            }
+        }
+        Some(0x20..=0x2f) => match s[1..].iter().position(|b| !(0x20..=0x2f).contains(b)) {
+            Some(n) if (0x30..=0x7e).contains(&s[n + 1]) => Sequence::Skip(n + 2),
+            _ => Sequence::Other,
+        },
+        // An OSC string ends with BEL, CAN or SUB, or at the ESC of its terminator.
+        Some(b']') => {
+            let body = &s[2..];
+            let end = memchr::memchr3(0x07, CAN, ESC, body);
+            match memchr::memchr(SUB, &body[..end.unwrap_or(body.len())]).or(end) {
+                Some(n) if body[n] == ESC => Sequence::Skip(n + 2),
+                Some(n) => Sequence::Skip(n + 3),
+                None => Sequence::Other,
+            }
+        }
+        // SOS, PM and APC strings end with CAN or SUB, or at an ESC.
+        Some(b'X' | b'^' | b'_') => match memchr::memchr3(CAN, SUB, ESC, &s[2..]) {
+            Some(n) if s[n + 2] == ESC => Sequence::Skip(n + 2),
+            Some(n) => Sequence::Skip(n + 3),
+            None => Sequence::Other,
+        },
+        Some(b'c') => Sequence::Read(2),
+        Some(b'P') => Sequence::Other,
+        Some(0x30..=0x7e) => Sequence::Skip(2),
+        _ => Sequence::Other,
+    }
 }
 
 /// What the bytes just read do to the stacks, in order.
@@ -87,26 +155,58 @@ impl Perform for Seen {
 impl KeyboardStackGuard {
     /// `bytes` as the emulator should get them: the same, but for the final byte of a push the
     /// stack has no room for.
-    pub(super) fn filter(&mut self, bytes: &[u8]) -> Vec<u8> {
+    pub(super) fn filter<'a>(&mut self, bytes: &'a [u8]) -> Cow<'a, [u8]> {
         self.note_margin();
-        let mut out = Vec::with_capacity(bytes.len());
-        // A push is dispatched on its final `u`: everything else is read in runs, and each `u`
-        // alone, to know whether it is the one.
-        let mut start = 0;
-        for at in bytes.iter().enumerate().filter(|(_, b)| **b == b'u').map(|(i, _)| i) {
-            self.read(&bytes[start..at]);
-            out.extend_from_slice(&bytes[start..at]);
-            self.parser.advance(&mut self.seen, b"u");
-            let refused = self.apply();
-            out.push(if refused { CAN } else { b'u' });
-            start = at + 1;
+        let mut refused = Vec::new();
+        let mut at = 0;
+        if std::mem::take(&mut self.unfinished) {
+            at = memchr::memchr(ESC, bytes).unwrap_or(bytes.len());
+            self.read(&bytes[..at], 0, &mut refused);
+            self.unfinished = at == bytes.len();
         }
-        self.read(&bytes[start..]);
-        out.extend_from_slice(&bytes[start..]);
-        out
+        while let Some(n) = memchr::memchr(ESC, &bytes[at..]) {
+            let esc = at + n;
+            match sequence(&bytes[esc..]) {
+                Sequence::Skip(len) => at = esc + len,
+                Sequence::Read(len) => {
+                    self.read(&bytes[esc..esc + len], esc, &mut refused);
+                    at = esc + len;
+                }
+                Sequence::Other => {
+                    let end = memchr::memchr(ESC, &bytes[esc + 1..]).map_or(bytes.len(), |n| esc + 1 + n);
+                    self.read(&bytes[esc..end], esc, &mut refused);
+                    self.unfinished = end == bytes.len();
+                    at = end;
+                }
+            }
+        }
+        if refused.is_empty() {
+            return Cow::Borrowed(bytes);
+        }
+        let mut out = bytes.to_vec();
+        for i in refused {
+            out[i] = CAN;
+        }
+        Cow::Owned(out)
     }
 
-    fn read(&mut self, bytes: &[u8]) {
+    /// Give the parser `bytes` (found at `offset` in the read), noting where the pushes it
+    /// refuses end. A push is dispatched on its final `u`: the bytes are read in runs, and each
+    /// `u` alone, to know whether it is the one.
+    fn read(&mut self, bytes: &[u8], offset: usize, refused: &mut Vec<usize>) {
+        let mut start = 0;
+        for at in memchr::memchr_iter(b'u', bytes) {
+            self.read_run(&bytes[start..at]);
+            self.parser.advance(&mut self.seen, b"u");
+            if self.apply() {
+                refused.push(offset + at);
+            }
+            start = at + 1;
+        }
+        self.read_run(&bytes[start..]);
+    }
+
+    fn read_run(&mut self, bytes: &[u8]) {
         if !bytes.is_empty() {
             self.parser.advance(&mut self.seen, bytes);
             self.apply();
@@ -170,14 +270,133 @@ mod tests {
         assert_eq!(out.windows(5).filter(|w| *w == b"\x1b[>1u").count(), MAX_DEPTH as usize);
         assert_eq!(out.len(), push.len(), "nothing is removed, the last byte of a push changes");
         // Popping makes room again; other sequences and text are untouched, even when cut.
-        let mut out = g.filter(b"\x1b[<2u\x1b[>1u\x1b[>1u\x1b[>1");
-        out.extend(g.filter(b"u hello \x1b[1;31mred\x1b[0m"));
+        let mut out = g.filter(b"\x1b[<2u\x1b[>1u\x1b[>1u\x1b[>1").into_owned();
+        out.extend_from_slice(&g.filter(b"u hello \x1b[1;31mred\x1b[0m"));
         assert_eq!(out, b"\x1b[<2u\x1b[>1u\x1b[>1u\x1b[>1\x18 hello \x1b[1;31mred\x1b[0m");
         // The alternate screen has its own stack; RIS empties both.
         let out = g.filter(b"\x1b[?1049h\x1b[>1u\x1b[?1049l\x1b[>1u");
-        assert_eq!(out, b"\x1b[?1049h\x1b[>1u\x1b[?1049l\x1b[>1\x18");
+        assert_eq!(&*out, b"\x1b[?1049h\x1b[>1u\x1b[?1049l\x1b[>1\x18");
         let out = g.filter(b"\x1bc\x1b[>1u");
-        assert_eq!(out, b"\x1bc\x1b[>1u");
+        assert_eq!(&*out, b"\x1bc\x1b[>1u");
+        // Output with nothing to change is not copied.
+        assert!(matches!(g.filter(b"plain \x1b[1mtext\x1b]0;title\x07\x1b[>1u"), Cow::Borrowed(_)));
+    }
+
+    #[test]
+    fn sequences_are_recognised_as_the_parser_reads_them() {
+        use Sequence::*;
+        for (bytes, want) in [
+            (&b"\x1b[1;31mtext"[..], Skip(7)),
+            (b"\x1b[?25l", Read(6)),
+            (b"\x1b[>1u", Read(5)),
+            (b"\x1b[2;20r", Read(7)),
+            (b"\x1b[1;3", Other),
+            (b"\x1b[1\n;3m", Other),
+            (b"\x1b(B", Skip(3)),
+            (b"\x1b7", Skip(2)),
+            (b"\x1bc", Read(2)),
+            (b"\x1b]0;title\x07text", Skip(10)),
+            (b"\x1b]0;title\x1b\\", Skip(9)),
+            (b"\x1b]0;ti\x1atle\x07", Skip(7)),
+            (b"\x1b]0;title", Other),
+            (b"\x1b_Gkitty\x18", Skip(9)),
+            (b"\x1bP1$q\x1b\\", Other),
+            (b"\x1b", Other),
+            (b"\x1b\x1b[>1u", Other),
+        ] {
+            assert_eq!(sequence(bytes), want, "{bytes:?}");
+        }
+    }
+
+    /// The guard as it was: the parser reads every byte.
+    fn filter_every_byte(g: &mut KeyboardStackGuard, bytes: &[u8]) -> Vec<u8> {
+        g.note_margin();
+        let mut refused = Vec::new();
+        g.read(bytes, 0, &mut refused);
+        let mut out = bytes.to_vec();
+        for i in refused {
+            out[i] = CAN;
+        }
+        out
+    }
+
+    /// Skipping text and sequences changes nothing: on random output cut in random reads, the
+    /// guard refuses the same pushes and follows the stacks and the margin as one that reads
+    /// every byte.
+    #[test]
+    fn skipping_what_cannot_matter_changes_nothing() {
+        const PIECES: &[&[u8]] = &[
+            b"\x1b",
+            b"[",
+            b"]",
+            b">",
+            b"<",
+            b"?",
+            b"1",
+            b"0",
+            b"1049",
+            b";",
+            b"u",
+            b"h",
+            b"l",
+            b"r",
+            b"c",
+            b"P",
+            b"_",
+            b"X",
+            b"^",
+            b"\\",
+            b"m",
+            b"$",
+            b"(",
+            b" ",
+            b"text",
+            b"\x07",
+            b"\x18",
+            b"\x1a",
+            b"\0",
+            b"\x7f",
+            b"\x9c",
+            b"\xe6\x97\xa5",
+            b"\xe6",
+            b"\n",
+            b"\x1b[>1u",
+            b"\x1b[<u",
+            b"\x1b[?1049h",
+            b"\x1b[?1049l",
+            b"\x1b[3r",
+            b"\x1b[r",
+            b"\x1bc",
+            b"\x1b]0;t\x07",
+            b"\x1b[1;31m",
+        ];
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move |n: usize| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % n as u64) as usize
+        };
+        for round in 0..300 {
+            let mut fast = KeyboardStackGuard::default();
+            let mut slow = KeyboardStackGuard::default();
+            // Close to the limit, so that pushes get refused.
+            let near = b"\x1b[>1u".repeat(MAX_DEPTH as usize - 3);
+            assert_eq!(&*fast.filter(&near), filter_every_byte(&mut slow, &near));
+            let mut output = Vec::new();
+            for _ in 0..400 {
+                output.extend_from_slice(PIECES[next(PIECES.len())]);
+            }
+            let mut at = 0;
+            while at < output.len() {
+                let end = (at + 1 + next(40)).min(output.len());
+                let read = &output[at..end];
+                assert_eq!(&*fast.filter(read), filter_every_byte(&mut slow, read), "round {round}");
+                assert_eq!((fast.depth, fast.alt, fast.margin), (slow.depth, slow.alt, slow.margin));
+                assert_eq!(fast.take_top_margin(), slow.take_top_margin());
+                at = end;
+            }
+        }
     }
 
     /// The guard and the emulator read the same sequences: a push the emulator would make is
@@ -195,9 +414,13 @@ mod tests {
             b"\x1b\x7f[>1u",
             b"\x1b\x1b[>1u",
             b"\x1b]0;title\x1b[>1u",
+            b"\x1b]0;title\x07\x1b[>1u",
+            b"\x1b]0;ti\x18tle\x1b[>1u",
             b"\x1bP1$q\x1b[>1u",
             b"\x1b_kitty\x1b[>1u",
+            b"\x1b_kit\x1aty\x1b[>1u",
             b"\xe6\x97\xa5\x1b[>1u",
+            b"\x1b[1;31mred\x1b(B\x1b[>1u",
         ] {
             let mut g = KeyboardStackGuard::default();
             let mut term = Term::new(config.clone(), &size, super::super::pty::Listener::default());

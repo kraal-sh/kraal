@@ -164,29 +164,106 @@ pub fn parse_remote(s: &str) -> Result<(String, u16)> {
 
 pub use crate::process::listening_ports;
 
-/// Local ports mentioned in program output: `localhost:5173`, `127.0.0.1:8000`, `0.0.0.0:3000`,
-/// `[::1]:8080`, `http://localhost:4000/`.
-pub fn ports_in_text(text: &[u8]) -> Vec<u16> {
-    let mut out = Vec::new();
-    for needle in [&b"localhost:"[..], b"127.0.0.1:", b"0.0.0.0:", b"[::1]:", b"[::]:"] {
-        let mut start = 0;
-        while let Some(i) = find(&text[start..], needle) {
-            let at = start + i + needle.len();
-            let digits: Vec<u8> = text[at..].iter().take(5).take_while(|b| b.is_ascii_digit()).copied().collect();
-            if let Ok(p) = std::str::from_utf8(&digits).unwrap_or("").parse::<u16>()
-                && p >= 1024
-                && !out.contains(&p)
-            {
-                out.push(p);
-            }
-            start = at;
-        }
-    }
-    out
+/// Hosts that name this machine, as they come before `:port`.
+const LOCAL_HOSTS: [&[u8]; 5] = [b"localhost", b"127.0.0.1", b"0.0.0.0", b"[::1]", b"[::]"];
+/// The longest of them.
+const LONGEST_HOST: usize = 9;
+/// Digits read after the colon (more are not looked at).
+const PORT_DIGITS: u8 = 5;
+
+/// Finds the local ports a pane's output mentions (`localhost:5173`, `127.0.0.1:8000`,
+/// `0.0.0.0:3000`, `[::1]:8080`, `http://localhost:4000/`) as it is read, in one pass over each
+/// read: a mention cut between two reads is found too.
+#[derive(Debug, Default)]
+pub struct PortScanner {
+    /// The last bytes of the output read so far, for a host the read cut.
+    tail: [u8; LONGEST_HOST],
+    tail_len: usize,
+    /// A mention whose digits ran to the end of the last read: the port so far and its digits.
+    digits: Option<(u32, u8)>,
 }
 
-fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
-    hay.windows(needle.len()).position(|w| w == needle)
+impl PortScanner {
+    /// Read `text`, the output that follows what was read before, calling `found` with the
+    /// ports it mentions (1024 and up). A port cut by the end of `text` is given as far as it
+    /// goes, then again whole if more digits follow.
+    pub fn scan(&mut self, text: &[u8], mut found: impl FnMut(u16)) {
+        let mut report = |port: u32, n: u8| {
+            if n > 0
+                && let Ok(p) = u16::try_from(port)
+                && p >= 1024
+            {
+                found(p);
+            }
+        };
+        if let Some((port, n)) = self.digits.take() {
+            let (port, n, used) = read_digits(text, port, n);
+            if used == text.len() && n < PORT_DIGITS {
+                self.digits = Some((port, n));
+            }
+            // Without new digits, it was given already.
+            if used > 0 {
+                report(port, n);
+            }
+        }
+        for colon in memchr::memchr_iter(b':', text) {
+            if !self.host_before(text, colon) {
+                continue;
+            }
+            let rest = &text[colon + 1..];
+            let (port, n, used) = read_digits(rest, 0, 0);
+            if used == rest.len() && n < PORT_DIGITS {
+                self.digits = Some((port, n));
+            }
+            report(port, n);
+        }
+        self.keep_tail(text);
+    }
+
+    /// Whether a local host ends just before `text[colon]`, counting what was read before.
+    fn host_before(&self, text: &[u8], colon: usize) -> bool {
+        // The byte before the colon rules out almost everything at once.
+        let last = if colon > 0 { Some(text[colon - 1]) } else { self.tail[..self.tail_len].last().copied() };
+        if !matches!(last, Some(b't' | b'1' | b'0' | b']')) {
+            return false;
+        }
+        if colon >= LONGEST_HOST {
+            let before = &text[colon - LONGEST_HOST..colon];
+            return LOCAL_HOSTS.iter().any(|h| before.ends_with(h));
+        }
+        let mut joined = [0u8; 2 * LONGEST_HOST];
+        let (old, new) = (&self.tail[..self.tail_len], &text[..colon]);
+        joined[..old.len()].copy_from_slice(old);
+        joined[old.len()..old.len() + new.len()].copy_from_slice(new);
+        let before = &joined[..old.len() + new.len()];
+        LOCAL_HOSTS.iter().any(|h| before.ends_with(h))
+    }
+
+    fn keep_tail(&mut self, text: &[u8]) {
+        if text.len() >= LONGEST_HOST {
+            self.tail.copy_from_slice(&text[text.len() - LONGEST_HOST..]);
+            self.tail_len = LONGEST_HOST;
+            return;
+        }
+        let keep = (LONGEST_HOST - text.len()).min(self.tail_len);
+        self.tail.copy_within(self.tail_len - keep..self.tail_len, 0);
+        self.tail[keep..keep + text.len()].copy_from_slice(text);
+        self.tail_len = keep + text.len();
+    }
+}
+
+/// The digits at the start of `text` that continue a port of `n` digits so far, up to
+/// [`PORT_DIGITS`]: the port, its digits, and how many bytes of `text` they took.
+fn read_digits(text: &[u8], mut port: u32, mut n: u8) -> (u32, u8, usize) {
+    let mut used = 0;
+    while n < PORT_DIGITS
+        && let Some(d) = text.get(used).filter(|b| b.is_ascii_digit())
+    {
+        port = port * 10 + u32::from(d - b'0');
+        n += 1;
+        used += 1;
+    }
+    (port, n, used)
 }
 
 impl Server {
@@ -422,12 +499,11 @@ impl Server {
 
     /// Remember ports a pane's output mentions (dev servers); kept while something listens.
     pub(super) fn note_ports(&mut self, pane: PaneId, data: &[u8]) {
-        if self.panes.get(&pane).is_some_and(|p| p.ssh.is_some()) {
-            return;
-        }
-        for p in ports_in_text(data) {
-            self.port_candidates.insert(p, pane);
-        }
+        let Some(p) = self.panes.get_mut(&pane).filter(|p| p.ssh.is_none()) else { return };
+        let candidates = &mut self.port_candidates;
+        p.ports.scan(data, |port| {
+            candidates.insert(port, pane);
+        });
     }
 
     /// Keep only the mentioned ports that something listens on.
@@ -473,11 +549,56 @@ impl Server {
 mod tests {
     use super::*;
 
+    /// The ports `text` mentions, read at once.
+    fn ports_in_text(text: &[u8]) -> Vec<u16> {
+        let mut out = Vec::new();
+        PortScanner::default().scan(text, |p| {
+            if !out.contains(&p) {
+                out.push(p);
+            }
+        });
+        out
+    }
+
     #[test]
     fn ports_in_output() {
         let text = b"  VITE ready\n  -> Local:   http://localhost:5173/\n  Network: http://0.0.0.0:5173\nlistening on 127.0.0.1:8000, also [::1]:9000 and localhost:22";
         assert_eq!(ports_in_text(text), vec![5173, 8000, 9000]);
         assert!(ports_in_text(b"no ports here: localhost:abc").is_empty());
+        // Five digits at most are read, and a port is at most 65535.
+        assert_eq!(ports_in_text(b"localhost:123456 localhost:99999 [::]:08080"), vec![12345, 8080]);
+        assert!(ports_in_text(b"localhost:\n:5173 localhost5173 127.0.0.2:8000").is_empty());
+    }
+
+    /// The ports found when the output comes in reads cut at `cuts`.
+    fn ports_read_in(text: &[u8], cuts: &[usize]) -> Vec<u16> {
+        let mut scanner = PortScanner::default();
+        let mut found = Vec::new();
+        let mut start = 0;
+        for &end in cuts.iter().chain([&text.len()]) {
+            scanner.scan(&text[start..end], |p| {
+                if !found.contains(&p) {
+                    found.push(p);
+                }
+            });
+            start = end;
+        }
+        found
+    }
+
+    #[test]
+    fn a_port_cut_between_reads_is_found() {
+        let text = b"Local: http://localhost:5173/ and 127.0.0.1:8000\n[::1]:9000 at last localhost:4000";
+        let whole = ports_in_text(text);
+        assert_eq!(whole, vec![5173, 8000, 9000, 4000]);
+        // Every cut, and reads of one byte each.
+        for cut in 0..=text.len() {
+            assert_eq!(ports_read_in(text, &[cut]), whole, "cut at {cut}");
+        }
+        assert_eq!(ports_read_in(text, &(1..text.len()).collect::<Vec<_>>()), whole);
+        // Digits a read cuts are completed by the next one.
+        assert_eq!(ports_read_in(b"localhost:8080 localhost:3000", &[11, 12]), vec![8080, 3000]);
+        assert_eq!(ports_read_in(b"[::]:1234567", &[6, 7, 9]), vec![1234, 12345]);
     }
 
     #[test]

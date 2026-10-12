@@ -209,6 +209,8 @@ pub struct Pane {
     restored: Option<String>,
     /// The kraal session of a server that a kraal client running here says it shows.
     attachment: Option<RemoteAttachment>,
+    /// Finds the local ports the output mentions (dev servers).
+    pub ports: crate::server::net::PortScanner,
 }
 
 /// A kraal client in a pane, attached to a server's session (`kraal attach --host`), as it
@@ -285,6 +287,7 @@ impl Pane {
             search: None,
             restored: None,
             attachment: None,
+            ports: Default::default(),
         })
     }
 
@@ -315,6 +318,7 @@ impl Pane {
             search: None,
             restored: None,
             attachment: None,
+            ports: Default::default(),
         }
     }
 
@@ -506,9 +510,17 @@ impl Pane {
         }
     }
 
-    /// The next chunk of output read from the PTY, if any.
+    /// The output read from the PTY since the last call, put in `into` (what it held is
+    /// dropped, its room reused): false when there was none. Then the server is told of the
+    /// next output, unless it `comes_back` for it on its own.
+    pub fn take_output_into(&self, into: &mut Vec<u8>, comes_back: bool) -> bool {
+        self.term().is_some_and(|t| t.output.take(into, comes_back))
+    }
+
+    #[cfg(test)]
     pub fn take_output(&self) -> Option<Vec<u8>> {
-        self.term()?.output.try_recv().ok()
+        let mut out = Vec::new();
+        self.take_output_into(&mut out, false).then_some(out)
     }
 
     pub fn has_output(&self) -> bool {
