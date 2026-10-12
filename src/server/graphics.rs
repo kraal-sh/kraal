@@ -31,7 +31,9 @@ pub(super) struct ClientImages {
     answered: bool,
     name: Option<String>,
     capable: bool,
-    /// Its device attributes say it draws sixel, and it told its cell size.
+    /// Its device attributes say it draws sixel...
+    says_sixel: bool,
+    /// ...and it told its cell size: images are drawn on it as sixel.
     sixel: bool,
     /// Its cell size in pixels, once it said (and since the last resize, for sixel).
     cell: Option<(u16, u16)>,
@@ -50,6 +52,18 @@ impl ClientImages {
         self.sent.clear();
         self.version = None;
         self.painted.clear();
+    }
+
+    /// What its answers so far make of it, in whatever order they came. Asking its cell size
+    /// again (after a resize) does not stop sixel meanwhile.
+    fn settle(&mut self) {
+        self.capable |= self.answered && self.name.as_deref().is_some_and(graphics::draws_placeholders);
+        self.sixel = self.says_sixel && (self.sixel || self.cell.is_some());
+    }
+
+    /// How it shows images: when that changes, it is sent all of them again.
+    fn shows(&self) -> (bool, bool) {
+        (self.capable, self.sixel)
     }
 
     /// Images are drawn as sixel there (placeholders win when it does both).
@@ -187,34 +201,30 @@ impl Server {
         if answer.is_some() || name.is_some() || sixel.is_some() {
             // Any graphics reply is the terminal's own business: never a program's input.
             let Some(ci) = self.images.get_mut(&id) else { return true };
-            let before = (ci.capable, ci.sixel);
+            let before = ci.shows();
             if answer == Some(true) {
                 ci.answered = true;
             }
             if name.is_some() {
                 ci.name = name;
             }
-            // Its cell size is answered before: a terminal that does not say cannot be drawn on.
             if let Some(sixel) = sixel {
-                ci.sixel = sixel && ci.cell.is_some();
+                ci.says_sixel = sixel;
             }
-            if ci.answered && ci.name.as_deref().is_some_and(graphics::draws_placeholders) {
-                ci.capable = true;
-            }
-            if (ci.capable, ci.sixel) != before {
-                ci.forget();
-                self.update_availability();
-                if let Some(c) = self.clients.get_mut(&id) {
-                    c.dirty = true;
-                }
+            ci.settle();
+            if ci.shows() != before {
+                self.images_shown_otherwise(id);
             }
             return true;
         }
         if let Some((w, h)) = graphics::cell_size_answer(reply).filter(|(w, h)| *w > 0 && *h > 0) {
             if let Some(ci) = self.images.get_mut(&id) {
-                let redraw = ci.draws_sixel() && ci.cell != Some((w, h));
+                let (before, redraw) = (ci.shows(), ci.draws_sixel() && ci.cell != Some((w, h)));
                 ci.cell = Some((w, h));
-                if redraw {
+                ci.settle();
+                if ci.shows() != before {
+                    self.images_shown_otherwise(id);
+                } else if redraw {
                     self.mark_dirty_client(id);
                 }
             }
@@ -255,6 +265,16 @@ impl Server {
         if let Some(cell) = self.primary.and_then(|p| self.images.get(&p)).and_then(|ci| ci.cell) {
             self.env.graphics.set_cell(cell.0, cell.1);
         }
+    }
+
+    /// A client's terminal shows images otherwise now: it is sent all of them again, the way it
+    /// shows them, and programs are told whether they can send images.
+    fn images_shown_otherwise(&mut self, id: ClientId) {
+        if let Some(ci) = self.images.get_mut(&id) {
+            ci.forget();
+        }
+        self.update_availability();
+        self.mark_dirty_client(id);
     }
 
     /// Programs may send images while an attached client can show them.
@@ -385,6 +405,36 @@ impl Server {
         );
         if !started {
             self.fitted.pending.remove(&key);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn says_sixel(ci: &mut ClientImages) {
+        ci.says_sixel = true;
+        ci.settle();
+    }
+
+    fn tells_cell(ci: &mut ClientImages) {
+        ci.cell = Some((10, 20));
+        ci.settle();
+    }
+
+    #[test]
+    fn sixel_is_drawn_once_both_answers_came_in_either_order() {
+        for answers in [[says_sixel as fn(&mut ClientImages), tells_cell], [tells_cell, says_sixel]] {
+            let mut ci = ClientImages::default();
+            answers[0](&mut ci);
+            assert!(!ci.draws_sixel(), "not on one answer");
+            answers[1](&mut ci);
+            assert!(ci.draws_sixel());
+            // Its cell size asked again after a resize: still drawn on, once it answers.
+            ci.cell = None;
+            ci.settle();
+            assert!(ci.draws_sixel());
         }
     }
 }

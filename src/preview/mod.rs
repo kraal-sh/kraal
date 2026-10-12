@@ -322,12 +322,9 @@ impl Preview {
             && let Some(png) = image.png.take()
         {
             let (width, height) = image.pixels.dimensions();
-            self.picture = Some(TerminalImage {
-                kid: shared.new_id(),
-                picture: crate::graphics::Picture::new(png, width, height, shared),
-                cells: None,
-                generation: 0,
-            });
+            // Beyond the memory kept for images, it is drawn with half blocks.
+            self.picture = crate::graphics::Picture::within_quota(png, width, height, shared)
+                .map(|picture| TerminalImage { kid: shared.new_id(), picture, cells: None, generation: 0 });
         }
     }
 

@@ -18,6 +18,8 @@ const SCROLLBACK_EVERY: Duration = Duration::from_secs(10);
 /// What saving scrollback may take of a tick, a pane at least: reading the panes' text is the
 /// event loop's work, writing it the writer thread's.
 const SCROLLBACK_BUDGET: Duration = Duration::from_millis(4);
+/// The paste buffers' file is written again this long after a write of it failed.
+const BUFFERS_RETRY: Duration = Duration::from_secs(10);
 
 impl Server {
     /// [`Server::persist`], unless the writer has not written the last state yet (a slow disk):
@@ -206,28 +208,37 @@ pub(super) enum Persist {
         session: String,
         file: String,
     },
-    /// The paste buffers, into their private file; `None` deletes it.
-    Buffers(std::path::PathBuf, Option<Vec<u8>>),
+    /// The paste buffers' file, as [`Persisting`] last has it, if an earlier job did not write
+    /// it already.
+    Buffers,
     /// The session ended with its last pane: nothing is left to restore.
     Delete(String),
-    /// Everything asked before is written: say whether the last save of the state and of each
-    /// pane's scrollback worked, and stop.
+    /// Everything asked before is written: say whether the last save of the state, of each
+    /// pane's scrollback and of the paste buffers worked, and stop.
     Stop(Sender<Result<(), String>>),
 }
 
 /// What the event loop and the writer share beside the jobs, so that a disk slow to write never
-/// piles up what waits for it: a pane's latest text only, and one state at a time.
+/// piles up what waits for it: a pane's latest text only, the latest paste buffers, and one
+/// state at a time.
 #[derive(Default)]
 pub(super) struct Persisting {
     /// The text each scrollback file is to have, waiting for the writer.
     texts: HashMap<String, Vec<u8>>,
+    /// What the paste buffers' file is to be, waiting for the writer.
+    buffers: Option<BuffersFile>,
     /// States sent to the writer and not written yet.
     saves: usize,
     /// Scrollback files the writer could not write: their panes are saved again.
     failed: Vec<String>,
     /// The last state written could not be: the next one is written even when the same.
     state_failed: bool,
+    /// When the last write of the paste buffers' file failed: it is written again.
+    buffers_failed: Option<Instant>,
 }
+
+/// The paste buffers' file and what it is to hold; `None` deletes it.
+type BuffersFile = (std::path::PathBuf, Option<Vec<u8>>);
 
 impl Persisting {
     /// `text` is what `file` is to have: the text it was to have before, if not written yet,
@@ -240,6 +251,18 @@ impl Persisting {
     fn take(&mut self, file: &str) -> Option<Vec<u8>> {
         self.texts.remove(file)
     }
+
+    /// What the paste buffers' file is to be: what it was to be before, if not written yet, is
+    /// dropped, and the job that was to write it writes this. Whether a job is needed.
+    pub(super) fn offer_buffers(&mut self, file: BuffersFile) -> bool {
+        self.buffers.replace(file).is_none()
+    }
+
+    /// Whether the paste buffers' file is to be written again: its last write failed, at least
+    /// [`BUFFERS_RETRY`] ago or right before the server stops.
+    pub(super) fn retry_buffers(&mut self, stopping: bool) -> bool {
+        self.buffers_failed.take_if(|at| stopping || at.elapsed() >= BUFFERS_RETRY).is_some()
+    }
 }
 
 /// The only writer of session state, so writes land in order: a late save never overwrites the
@@ -250,6 +273,8 @@ pub(super) fn spawn_persister(events: Sender<Event>, shared: Arc<Mutex<Persistin
         let mut last: Result<(), String> = Ok(());
         // Scrollback files whose last write failed, and why.
         let mut failing: HashMap<String, String> = HashMap::new();
+        // Why the last write of the paste buffers' file failed.
+        let mut buffers_failing: Option<String> = None;
         while let Ok(first) = rx.recv() {
             let mut queue = vec![first];
             queue.extend(rx.try_iter());
@@ -297,10 +322,23 @@ pub(super) fn spawn_persister(events: Sender<Event>, shared: Arc<Mutex<Persistin
                             }
                         }
                     }
-                    Persist::Buffers(..) if queue[i + 1..].iter().any(|j| matches!(j, Persist::Buffers(..))) => {}
-                    Persist::Buffers(path, data) => {
-                        if let Err(e) = super::buffers::write_file(path, data.as_deref()) {
-                            let _ = events.send(Event::Warning(format!("keeping the paste buffers: {e}")));
+                    Persist::Buffers => {
+                        let Some((path, data)) = shared.lock().ok().and_then(|mut s| s.buffers.take()) else {
+                            continue;
+                        };
+                        let written = super::buffers::write_file(&path, data.as_deref());
+                        if let Ok(mut s) = shared.lock() {
+                            s.buffers_failed = written.is_err().then(Instant::now);
+                        }
+                        match written {
+                            Ok(()) => buffers_failing = None,
+                            Err(e) => {
+                                // Said once, not at every try while the disk stays full.
+                                if buffers_failing.is_none() {
+                                    let _ = events.send(Event::Warning(format!("keeping the paste buffers: {e}")));
+                                }
+                                buffers_failing = Some(e.to_string());
+                            }
                         }
                     }
                     Persist::Delete(session) => {
@@ -310,7 +348,7 @@ pub(super) fn spawn_persister(events: Sender<Event>, shared: Arc<Mutex<Persistin
                         failing.clear();
                     }
                     Persist::Stop(done) => {
-                        let _ = done.send(stop_answer(&last, &failing));
+                        let _ = done.send(stop_answer(&last, &failing, buffers_failing.as_deref()));
                         return;
                     }
                 }
@@ -320,16 +358,21 @@ pub(super) fn spawn_persister(events: Sender<Event>, shared: Arc<Mutex<Persistin
     tx
 }
 
-/// What the writer says when the server stops: whether the state and each pane's scrollback
-/// are saved, said whole.
-fn stop_answer(last: &Result<(), String>, failing: &HashMap<String, String>) -> Result<(), String> {
+/// What the writer says when the server stops: whether the state, each pane's scrollback and
+/// the paste buffers are saved, said whole.
+fn stop_answer(
+    last: &Result<(), String>,
+    failing: &HashMap<String, String>,
+    buffers_failing: Option<&str>,
+) -> Result<(), String> {
     if let Err(e) = last {
         return Err(format!("the layout could not be saved: {e}"));
     }
-    match failing.values().next() {
-        Some(e) if failing.len() == 1 => Err(format!("the scrollback of a pane could not be saved: {e}")),
-        Some(e) => Err(format!("the scrollback of {} panes could not be saved: {e}", failing.len())),
-        None => Ok(()),
+    match (failing.values().next(), buffers_failing) {
+        (Some(e), _) if failing.len() == 1 => Err(format!("the scrollback of a pane could not be saved: {e}")),
+        (Some(e), _) => Err(format!("the scrollback of {} panes could not be saved: {e}", failing.len())),
+        (None, Some(e)) => Err(format!("the paste buffers could not be saved: {e}")),
+        (None, None) => Ok(()),
     }
 }
 
@@ -355,13 +398,44 @@ mod tests {
     }
 
     #[test]
+    fn a_slow_disk_keeps_the_latest_paste_buffers_waiting() {
+        let mut p = Persisting::default();
+        let path = std::path::PathBuf::from("main.json");
+        // Buffers changed again and again while the writer is stuck: one job, the latest data.
+        let mut jobs = 0;
+        for i in 0..100u8 {
+            jobs += usize::from(p.offer_buffers((path.clone(), Some(vec![i; 1 << 20]))));
+        }
+        let waiting = p.buffers.as_ref().and_then(|(_, data)| data.as_ref()).map(|d| (d.len(), d[0]));
+        assert_eq!((waiting, jobs), (Some((1 << 20, 99)), 1));
+        // Turned off meanwhile: the file goes, nothing older is written.
+        assert!(!p.offer_buffers((path.clone(), None)));
+        assert_eq!(p.buffers.take(), Some((path.clone(), None)));
+        assert!(p.offer_buffers((path, None)), "once taken, the next needs a job");
+    }
+
+    #[test]
+    fn a_failed_write_of_the_paste_buffers_is_tried_again() {
+        let mut p = Persisting::default();
+        assert!(!p.retry_buffers(true), "nothing failed");
+        p.buffers_failed = Some(Instant::now());
+        assert!(!p.retry_buffers(false), "not at once");
+        assert!(p.retry_buffers(true), "at once when the server stops");
+        assert!(!p.retry_buffers(true), "once");
+        p.buffers_failed = Instant::now().checked_sub(BUFFERS_RETRY);
+        assert!(p.retry_buffers(false));
+    }
+
+    #[test]
     fn stopping_says_what_could_not_be_saved() {
         let none = HashMap::new();
-        assert_eq!(stop_answer(&Ok(()), &none), Ok(()));
+        assert_eq!(stop_answer(&Ok(()), &none, None), Ok(()));
         let one = HashMap::from([("a.ans".to_string(), "No space left on device".to_string())]);
-        let said = stop_answer(&Ok(()), &one).unwrap_err();
+        let said = stop_answer(&Ok(()), &one, None).unwrap_err();
         assert_eq!(said, "the scrollback of a pane could not be saved: No space left on device");
-        let state = stop_answer(&Err("read-only file system".into()), &one).unwrap_err();
+        let state = stop_answer(&Err("read-only file system".into()), &one, None).unwrap_err();
         assert_eq!(state, "the layout could not be saved: read-only file system");
+        let buffers = stop_answer(&Ok(()), &none, Some("Not a directory")).unwrap_err();
+        assert_eq!(buffers, "the paste buffers could not be saved: Not a directory");
     }
 }

@@ -43,11 +43,16 @@ struct ProductionAsk {
 
 /// A bracketed paste that arrives in pieces (a long one, or one slow to come) is still one paste:
 /// it is held until its end, then pasted like any other, asked about as a whole when it goes to
-/// production. Only one too big to hold goes out as it comes, and never to production.
+/// production. Only one too big to hold goes out as it comes, and never to production. Either
+/// way it goes to the panes it started going to, wherever the focus moves meanwhile.
 pub(in crate::server) enum PasteFlow {
-    Held(Vec<u8>),
-    /// Going out as it comes, to the panes it started going to (none of them production then:
-    /// it stops if one becomes production); `after_cr`: the last piece ended with CR.
+    Held {
+        focused: PaneId,
+        targets: Vec<PaneId>,
+        data: Vec<u8>,
+    },
+    /// Going out as it comes (none of its panes was production when it started: it stops if
+    /// one becomes production); `after_cr`: the last piece ended with CR.
     Streaming {
         focused: PaneId,
         targets: Vec<PaneId>,
@@ -122,7 +127,7 @@ impl Server {
             InputEvent::Paste(_) if !normal && self.clients.get(&id).is_some_and(|c| c.paste.is_some()) => {
                 // Something else took the keyboard while the paste was coming.
                 match self.clients.get_mut(&id).and_then(|c| c.paste.take()) {
-                    Some(PasteFlow::Held(_)) => self.toast(id, "the paste was interrupted: nothing was pasted"),
+                    Some(PasteFlow::Held { .. }) => self.toast(id, "the paste was interrupted: nothing was pasted"),
                     Some(PasteFlow::Streaming { .. }) => {
                         // Pieces still waiting for a context read are part of the rest.
                         self.held_input.retain(|h| !(h.client == id && matches!(h.item, InputItem::Piece(..))));
@@ -826,17 +831,28 @@ impl Server {
         self.mark_dirty();
     }
 
+    /// A paste starts: it goes to the focused pane and to those typing is broadcast to now.
+    fn paste_start(&self, id: ClientId) -> PasteFlow {
+        match self.client_focus(id) {
+            Some(focused) => PasteFlow::Held { focused, targets: self.input_targets(id, focused), data: Vec::new() },
+            None => PasteFlow::Dropped,
+        }
+    }
+
     /// A piece of a paste still coming (see [`PasteFlow`]).
-    fn paste_piece(&mut self, id: ClientId, data: Vec<u8>) {
-        let flow = self.clients.get_mut(&id).and_then(|c| c.paste.take()).unwrap_or(PasteFlow::Held(Vec::new()));
+    fn paste_piece(&mut self, id: ClientId, piece: Vec<u8>) {
+        let flow = match self.clients.get_mut(&id).and_then(|c| c.paste.take()) {
+            Some(flow) => flow,
+            None => self.paste_start(id),
+        };
         let next = match flow {
-            PasteFlow::Held(mut held) if held.len() + data.len() <= PASTE_HOLD => {
-                held.extend_from_slice(&data);
-                PasteFlow::Held(held)
+            PasteFlow::Held { focused, targets, mut data } if data.len() + piece.len() <= PASTE_HOLD => {
+                data.extend_from_slice(&piece);
+                PasteFlow::Held { focused, targets, data }
             }
-            PasteFlow::Held(held) => self.paste_overflow(id, &held, &data),
+            PasteFlow::Held { focused, targets, data } => self.paste_overflow(id, focused, targets, &data, &piece),
             PasteFlow::Streaming { focused, targets, after_cr } => {
-                self.paste_stream(id, focused, targets, &data, after_cr)
+                self.paste_stream(id, focused, targets, &piece, after_cr)
             }
             PasteFlow::Dropped => PasteFlow::Dropped,
         };
@@ -846,31 +862,39 @@ impl Server {
     }
 
     /// The end of a paste: all of it when it came in pieces.
-    fn paste_end(&mut self, id: ClientId, data: Vec<u8>) -> Mode {
-        match self.clients.get_mut(&id).and_then(|c| c.paste.take()) {
-            None if data.is_empty() => Mode::Normal,
-            None => self.paste_or_upload(id, data),
-            Some(PasteFlow::Held(mut held)) if held.len() + data.len() <= PASTE_HOLD => {
-                held.extend_from_slice(&data);
-                if held.is_empty() { Mode::Normal } else { self.paste_or_upload(id, held) }
+    fn paste_end(&mut self, id: ClientId, last: Vec<u8>) -> Mode {
+        let flow = match self.clients.get_mut(&id).and_then(|c| c.paste.take()) {
+            Some(flow) => flow,
+            None if last.is_empty() => return Mode::Normal,
+            None => self.paste_start(id),
+        };
+        match flow {
+            PasteFlow::Held { focused, targets, mut data } if data.len() + last.len() <= PASTE_HOLD => {
+                data.extend_from_slice(&last);
+                if data.is_empty() { Mode::Normal } else { self.paste_or_upload(id, focused, &targets, data) }
             }
-            Some(PasteFlow::Held(held)) => {
-                self.paste_overflow(id, &held, &data);
+            PasteFlow::Held { focused, targets, data } => {
+                self.paste_overflow(id, focused, targets, &data, &last);
                 Mode::Normal
             }
-            Some(PasteFlow::Streaming { focused, targets, after_cr }) => {
-                self.paste_stream(id, focused, targets, &data, after_cr);
+            PasteFlow::Streaming { focused, targets, after_cr } => {
+                self.paste_stream(id, focused, targets, &last, after_cr);
                 Mode::Normal
             }
-            Some(PasteFlow::Dropped) => Mode::Normal,
+            PasteFlow::Dropped => Mode::Normal,
         }
     }
 
     /// A paste too big to hold: it goes out as it comes, unless it goes to production, where it
     /// would have been asked about as a whole: then none of it goes.
-    fn paste_overflow(&mut self, id: ClientId, held: &[u8], more: &[u8]) -> PasteFlow {
-        let Some(p) = self.client_focus(id) else { return PasteFlow::Dropped };
-        let targets = self.input_targets(id, p);
+    fn paste_overflow(
+        &mut self,
+        id: ClientId,
+        focused: PaneId,
+        targets: Vec<PaneId>,
+        held: &[u8],
+        more: &[u8],
+    ) -> PasteFlow {
         // A paste this big cannot wait for a context being read: it counts as production.
         if targets.iter().any(|t| self.pane_production(*t).is_some() || self.pane_context_reading(*t)) {
             self.toast(
@@ -879,7 +903,7 @@ impl Server {
             );
             return PasteFlow::Dropped;
         }
-        match self.paste_stream(id, p, targets, held, false) {
+        match self.paste_stream(id, focused, targets, held, false) {
             PasteFlow::Streaming { focused, targets, after_cr } => {
                 self.paste_stream(id, focused, targets, more, after_cr)
             }
@@ -926,10 +950,10 @@ impl Server {
         PasteFlow::Streaming { focused, targets, after_cr: next_cr }
     }
 
-    /// Paste into the focused pane, or offer an upload when files were dropped on an SSH pane.
-    fn paste_or_upload(&mut self, id: ClientId, data: Vec<u8>) -> Mode {
-        if let Some(p) = self.client_focus(id)
-            && let Some(server) = self.pane_server(p)
+    /// Paste into the panes the paste started going to (see [`Server::paste_to`]), or offer an
+    /// upload when files were dropped on an SSH pane.
+    fn paste_or_upload(&mut self, id: ClientId, focused: PaneId, targets: &[PaneId], data: Vec<u8>) -> Mode {
+        if let Some(server) = self.pane_server(focused)
             && let Some(paths) = crate::transfer::dropped_paths(&String::from_utf8_lossy(&data))
         {
             let n = paths.len();
@@ -941,10 +965,10 @@ impl Server {
             return Mode::Prompt(Prompt::new(
                 &format!("Upload {what} to"),
                 &format!("{}:~/", server.name),
-                PromptAction::Upload { paths, raw: data, pane: p },
+                PromptAction::Upload { paths, raw: data, pane: focused },
             ));
         }
-        self.paste(id, data)
+        self.paste_to(id, focused, targets, data)
     }
 
     /// Paste `data` as the terminal would: into the focused pane and those typing is broadcast
@@ -952,21 +976,28 @@ impl Server {
     fn paste(&mut self, id: ClientId, data: Vec<u8>) -> Mode {
         let Some(p) = self.client_focus(id) else { return Mode::Normal };
         let targets = self.input_targets(id, p);
-        if self.hold_input(id, p, &targets, InputItem::Paste(data.clone())) {
+        self.paste_to(id, p, &targets, data)
+    }
+
+    /// Paste `data` into `targets`, `focused` among them, through the production guard: none
+    /// of it when one of them closed since the paste started.
+    fn paste_to(&mut self, id: ClientId, focused: PaneId, targets: &[PaneId], data: Vec<u8>) -> Mode {
+        if !targets.iter().all(|t| self.panes.contains_key(t)) {
+            self.toast(id, "a pane closed during the paste: nothing was pasted");
             return Mode::Normal;
         }
-        self.send_to_targets(p, &targets, vec![InputItem::Paste(data)])
+        if self.hold_input(id, focused, targets, InputItem::Paste(data.clone())) {
+            return Mode::Normal;
+        }
+        self.send_to_targets(focused, targets, vec![InputItem::Paste(data)])
     }
 
     /// Paste a buffer chosen in the list, as if the terminal pasted it.
     fn paste_buffer(&mut self, id: ClientId, buffer: u64) -> Mode {
         let Some(text) = self.picked_buffer(id, buffer) else { return Mode::Normal };
-        let takes = self
-            .client_focus(id)
-            .and_then(|p| self.panes.get(&p))
-            .is_some_and(|p| p.is_terminal() && p.exit_code.is_none());
-        if !takes {
-            self.toast(id, "this pane runs no program to paste into");
+        let Some(focused) = self.client_focus(id) else { return Mode::Normal };
+        if let Err(e) = self.buffer_paste(focused, &text) {
+            self.toast(id, e);
             return Mode::Normal;
         }
         self.paste(id, text.into_bytes())

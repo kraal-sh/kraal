@@ -644,6 +644,11 @@ impl Pane {
         }
     }
 
+    /// The most input [`Pane::write_input`] takes at once now: more is dropped whole.
+    pub fn input_room(&self) -> usize {
+        self.term().map_or(0, |t| t.input_room())
+    }
+
     pub fn input_modes(&self) -> PaneInputModes {
         let Some(t) = self.term() else { return PaneInputModes::default() };
         let m = *t.term.mode();

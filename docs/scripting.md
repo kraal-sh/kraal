@@ -56,7 +56,8 @@ Numbered buffers rotate: 0 is always the newest, and the oldest go past `[buffer
 `max_mb`. Named buffers stay until deleted; a name is one word (letters, digits, `- _ . : @ +`),
 never a number. Setting a name again replaces that buffer. `kraal buffer paste` sends the text as a
 paste, bracketed when the program asked for it; like `kraal send`, it refuses a production pane
-unless given `--production` ([Production](production.md)).
+unless given `--production` ([Production](production.md)). A paste goes whole or not at all: one
+larger than the program can be sent at once (16 MiB, less what it has not read yet) is refused.
 
 Buffers hold text, in the server's memory only unless `[buffers] persist = true`
 ([Configuration](configuration.md)).

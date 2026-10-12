@@ -3,7 +3,7 @@
 use super::plural;
 use crate::input::encode_key;
 use crate::keymap::Action;
-use crate::layout::{Dir, PaneId, Preset, neighbour};
+use crate::layout::{Dir, Node, PaneId, Preset, neighbour};
 use crate::pane::PaneSpec;
 use crate::protocol::Placement;
 use crate::server::ui::{ConfirmAction, Mode, Prompt, PromptAction};
@@ -82,7 +82,7 @@ impl Server {
                         }
                     } else if focus.is_some_and(|f| tab.is_floating(f)) {
                         let tiled = tab.recent.iter().copied().find(|p| !tab.is_floating(*p));
-                        tab.focus = tiled.or_else(|| tab.root.as_ref().map(|r| r.leaves()[0]));
+                        tab.focus = tiled.or_else(|| tab.root.as_ref().and_then(Node::first_shown));
                         tab.expand_focus();
                     }
                 }

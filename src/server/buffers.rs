@@ -114,9 +114,17 @@ impl Server {
     /// `kraal buffer paste`: the buffer goes to the pane as a paste, bracketed when its program
     /// asked for that. Whether the pane may get it (production) is the caller's to check.
     pub(super) fn paste_buffer_to(&mut self, pane: PaneId, key: Option<&str>) -> Result<Response, String> {
-        let text = self.buffers.get(key)?.text.clone();
+        let bytes = self.buffer_paste(pane, &self.buffers.get(key)?.text)?;
+        self.panes.get_mut(&pane).ok_or("no such pane")?.write_input(bytes);
+        Ok(Response::Ok)
+    }
+
+    /// The paste of `text` that `pane` gets, bracketed when its program asked for that. Refused
+    /// when it runs no program, or when its program cannot be sent that much at once now: the
+    /// paste would be dropped whole.
+    pub(super) fn buffer_paste(&self, pane: PaneId, text: &str) -> Result<Vec<u8>, String> {
         let label = self.pane_label(pane);
-        let pn = self.panes.get_mut(&pane).ok_or("no such pane")?;
+        let pn = self.panes.get(&pane).ok_or("no such pane")?;
         if !pn.is_terminal() {
             return Err(format!("{label} runs no program to paste into"));
         }
@@ -124,8 +132,12 @@ impl Server {
             return Err("the pane's program has exited".into());
         }
         let bytes = crate::input::encode_paste(text.as_bytes(), pn.input_modes());
-        pn.write_input(bytes);
-        Ok(Response::Ok)
+        let room = pn.input_room();
+        if bytes.len() > room {
+            let (most, size) = (human_size(room as u64), human_size(bytes.len() as u64));
+            return Err(format!("{label} takes a paste of {most} at most now: this one is {size}"));
+        }
+        Ok(bytes)
     }
 
     /// Take back the buffers kept by the last server, when they are kept; otherwise make sure no
@@ -134,7 +146,7 @@ impl Server {
         let path = crate::paths::buffers_path(&self.session);
         if !self.config.buffers.persist {
             if path.exists() {
-                let _ = self.persister.send(Persist::Buffers(path, None));
+                self.write_buffers(None);
             }
             return;
         }
@@ -151,13 +163,25 @@ impl Server {
         }
     }
 
-    /// Write the buffers that changed to their file, when they are kept across restarts.
-    pub(super) fn save_buffers(&mut self) {
-        if !std::mem::take(&mut self.buffers_dirty) || !self.config.buffers.persist {
-            return;
+    /// Write the buffers that changed to their file, when they are kept across restarts. A file
+    /// whose last write failed is written (or deleted, when they are not kept any more) again a
+    /// while later, or at once when the server is `stopping`.
+    pub(super) fn save_buffers(&mut self, stopping: bool) {
+        let retry = self.persisting.lock().is_ok_and(|mut p| p.retry_buffers(stopping));
+        let changed = std::mem::take(&mut self.buffers_dirty);
+        let persist = self.config.buffers.persist;
+        if retry || (changed && persist) {
+            self.write_buffers(persist.then(|| self.buffers.to_json()));
         }
-        let path = crate::paths::buffers_path(&self.session);
-        let _ = self.persister.send(Persist::Buffers(path, Some(self.buffers.to_json())));
+    }
+
+    /// Have the writer put `data` in the buffers' file, or delete it (`None`): only the latest
+    /// waits for it.
+    fn write_buffers(&self, data: Option<Vec<u8>>) {
+        let file = (crate::paths::buffers_path(&self.session), data);
+        if self.persisting.lock().is_ok_and(|mut p| p.offer_buffers(file)) {
+            let _ = self.persister.send(Persist::Buffers);
+        }
     }
 
     /// The `[buffers]` settings changed: new limits apply at once, and the file is written or
@@ -166,14 +190,12 @@ impl Server {
         let cfg = self.config.buffers.clone();
         self.buffers.set_limits(cfg.limit, cfg.max_bytes());
         match (persisted, cfg.persist) {
-            (true, false) => {
-                let _ = self.persister.send(Persist::Buffers(crate::paths::buffers_path(&self.session), None));
-            }
+            (true, false) => self.write_buffers(None),
             // Written again: the new limits may have dropped some.
             (_, true) => self.buffers_dirty = true,
             _ => {}
         }
-        self.save_buffers();
+        self.save_buffers(false);
     }
 }
 

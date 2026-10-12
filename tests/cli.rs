@@ -929,6 +929,18 @@ fn stacks_and_layouts_from_the_keys() {
 }
 
 #[test]
+fn a_stack_opens_on_its_expanded_pane_without_a_focus_given() {
+    let env = Env::new("expanded");
+    let stack = "pane stacked=true {\n        pane name=\"a\"\n        pane name=\"b\" expanded=true\n    }";
+    env.workspace("w", &format!("layout {{\n    {stack}\n}}\n"));
+    env.run(&["open", "w"]);
+    let panes: serde_json::Value = serde_json::from_str(&env.run(&["panes", "--json"])).unwrap();
+    let focused: Vec<&str> =
+        panes.as_array().unwrap().iter().filter(|p| p["focused"] == true).filter_map(|p| p["name"].as_str()).collect();
+    assert_eq!(focused, ["b"]);
+}
+
+#[test]
 fn commands_run_in_a_pane_stay_in_its_session() {
     let a = Env::new("sessa");
     a.workspace("w", "layout {\n    pane name=\"one\"\n}\n");
@@ -3247,6 +3259,37 @@ fn a_long_paste_keeps_going_where_it_started_and_never_into_production() {
 }
 
 #[test]
+fn a_paste_held_until_its_end_goes_where_it_started() {
+    let env = Env::new("heldpaste");
+    let (got, other_got) = (env.root.join("pasted"), env.root.join("other-pasted"));
+    env.workspace("w", "layout {\n    pane name=\"main\"\n}\n");
+    env.run(&["open", "w"]);
+    let take = |file: &Path| format!("stty raw -echo; cat > {}", file.display());
+    env.run(&["run", "--name", "sink", "--", "sh", "-c", &take(&got)]);
+    env.run(&["run", "--name", "other", "--", "sh", "-c", &take(&other_got)]);
+    env.run(&["focus", "sink"]);
+    let mut client = RawClient::attach(&env, "w");
+    // Less than kraal holds back (8 MiB): it goes whole once it ends.
+    let line = "x".repeat(99) + "\n";
+    client.send(b"\x1b[200~");
+    for chunk in line.repeat(10_000).as_bytes().chunks(64 << 10) {
+        client.send(chunk);
+    }
+    std::thread::sleep(Duration::from_millis(300));
+    // The focus moves before its end: all of it still goes where it started.
+    env.run(&["focus", "other"]);
+    client.send(b"end\x1b[201~");
+    let size = |f: &Path| std::fs::metadata(f).map(|m| m.len()).unwrap_or(0);
+    let start = Instant::now();
+    while size(&got) < 1_000_003 && size(&other_got) == 0 {
+        assert!(start.elapsed() < Duration::from_secs(10), "only {} bytes arrived", size(&got));
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!((size(&got), size(&other_got)), (1_000_003, 0));
+}
+
+#[test]
 fn copy_mode_releases_the_button_the_program_saw_pressed() {
     let env = Env::new("copyrelease");
     env.workspace("w", "layout {\n    pane name=\"main\"\n}\n");
@@ -3736,6 +3779,27 @@ fn images_reach_a_terminal_that_draws_sixel() {
     assert!(!seen(&client).contains("\x1b[4X"));
     env.run(&["send", "-p", "img", "printf '\\033[H\\033[2J'\r"]);
     client.wait_for_screen("\x1b[4X");
+}
+
+#[test]
+fn a_terminal_that_tells_its_cell_size_last_draws_sixel_too() {
+    let env = Env::new("sixellate");
+    env.workspace("w", "layout {\n    pane name=\"img\"\n}\n");
+    env.run(&["open", "w"]);
+    env.wait_for_text("img", "$");
+    let script = env.root.join("img.sh");
+    write_script(
+        &script,
+        "#!/bin/sh\nprintf '\\033_Ga=T,f=24,s=2,v=2,c=4,r=2,q=2;AAAAAAAAAAAAAAAA\\033\\\\'\necho shown\n",
+    );
+    let mut client = RawClient::attach(&env, "w");
+    client.wait_for_screen("\x1b[c");
+    // Its device attributes before its cell size, though asked after it.
+    client.send(b"\x1bP>|foot(1.21.0)\x1b\\\x1b[?62;4;22c\x1b[6;20;10t");
+    std::thread::sleep(Duration::from_millis(300));
+    env.run(&["send", "-p", "img", &format!("{}\r", script.display())]);
+    env.wait_for_text("img", "shown");
+    client.wait_for_screen("\x1bP0;1;0q");
 }
 
 #[test]
@@ -4919,6 +4983,94 @@ fn paste_buffers_stay_in_memory_unless_kept_on_purpose() {
     wait_gone(&file);
     assert!(!file.exists());
     assert_eq!(env.run(&["buffer", "show", "secret"]), "hunter2", "still there until the server stops");
+}
+
+#[test]
+fn paste_buffers_that_could_not_be_kept_are_written_later() {
+    let env = Env::new("buffail");
+    let config = env.root.join("config/kraal/config.toml");
+    let base = std::fs::read_to_string(&config).unwrap();
+    std::fs::write(&config, format!("{base}[buffers]\npersist = true\n")).unwrap();
+    env.workspace("w", "layout {\n    pane name=\"main\"\n}\n");
+    env.run(&["open", "w"]);
+    // A file where the buffers' directory goes: nothing can be written there.
+    let dir = env.root.join("state/kraal/buffers");
+    std::fs::write(&dir, "in the way").unwrap();
+    assert!(set_buffer(&env, &["notes"], "kept-later").status.success());
+    // Long enough for the write to be tried, and to fail.
+    std::thread::sleep(Duration::from_millis(1500));
+    std::fs::remove_file(&dir).unwrap();
+    env.run(&["kill"]);
+    env.run(&["open", "w"]);
+    assert_eq!(env.run(&["buffer", "show", "notes"]), "kept-later");
+    // Still impossible when the server stops: said.
+    std::fs::remove_dir_all(&dir).unwrap();
+    std::fs::write(&dir, "in the way").unwrap();
+    assert!(set_buffer(&env, &["notes"], "changed").status.success());
+    let out = env.try_run(&["kill"]);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success() && err.contains("the paste buffers could not be saved"), "{err}");
+}
+
+#[test]
+fn copies_of_the_paste_buffers_a_killed_server_was_writing_go() {
+    let env = Env::new("buftemp");
+    env.workspace("w", "layout {\n    pane name=\"main\"\n}\n");
+    // What a server killed while it wrote left: temporary copies, named after its pid.
+    let mut gone = Command::new("true").spawn().unwrap();
+    let dead = gone.id();
+    gone.wait().unwrap();
+    let (buffers, sessions) = (env.root.join("state/kraal/buffers"), env.root.join("state/kraal/sessions"));
+    let temp = |dir: &Path, session: &str| dir.join(format!(".{session}.json.{dead}.0.tmp"));
+    for dir in [&buffers, &sessions] {
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(temp(dir, "buftemp"), "hunter2").unwrap();
+    }
+    std::fs::write(temp(&buffers, "other"), "another session's").unwrap();
+    // `kraal forget` deletes them with the rest of the session, and nothing of another.
+    env.run(&["forget"]);
+    assert!(!temp(&buffers, "buftemp").exists() && !temp(&sessions, "buftemp").exists());
+    assert!(temp(&buffers, "other").exists());
+    // A server that starts deletes all of them, buffers kept or not.
+    env.run(&["open", "w"]);
+    wait_gone(&temp(&buffers, "other"));
+    assert!(!temp(&buffers, "other").exists());
+}
+
+#[test]
+fn a_paste_buffer_goes_whole_or_not_at_all() {
+    let env = Env::new("bufbig");
+    env.workspace("w", "layout {\n    pane name=\"main\"\n}\n");
+    env.run(&["open", "w"]);
+    let got = env.root.join("pasted");
+    let script = format!("stty raw -echo; printf READY; exec cat > {}", got.display());
+    env.run(&["run", "--name", "sink", "--", "sh", "-c", &script]);
+    env.wait_for_text("sink", "READY");
+    // Within the buffers' 32 MB, more than a program can be sent at once (16 MiB).
+    assert!(set_buffer(&env, &["big"], &"y".repeat(17 << 20)).status.success());
+    let out = env.try_run(&["buffer", "paste", "big", "-p", "sink"]);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success() && err.contains("at most"), "{err}");
+    // What fits goes.
+    assert!(set_buffer(&env, &["small"], "fits").status.success());
+    env.run(&["buffer", "paste", "small", "-p", "sink"]);
+    let size = || std::fs::metadata(&got).map(|m| m.len()).unwrap_or(0);
+    let start = Instant::now();
+    while size() < 4 {
+        assert!(start.elapsed() < Duration::from_secs(10), "the small paste never arrived");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    // Chosen in the list: said too.
+    env.run(&["focus", "sink"]);
+    let mut client = RawClient::attach(&env, "w");
+    client.send(b"\x02=");
+    client.wait_for_screen("Paste buffers");
+    client.send(b"\x1b[B");
+    std::thread::sleep(Duration::from_millis(150));
+    client.send(b"\r");
+    client.wait_for_screen("at most now");
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(size(), 4, "nothing of the large paste went");
 }
 
 #[test]

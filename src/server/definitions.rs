@@ -93,7 +93,8 @@ impl Server {
                     focus = Some(id);
                 }
             }
-            let first = tab.panes().first().copied();
+            // Without a pane given the focus, the first place's: a stack keeps its expanded pane.
+            let first = tab.root.as_ref().and_then(Node::first_shown);
             if let Some(f) = focus.or(first) {
                 tab.set_focus(f);
             }

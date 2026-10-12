@@ -159,10 +159,26 @@ pub struct Picture {
 }
 
 impl Picture {
-    /// A PNG of `width × height` pixels, counted in the quota while it lives.
-    pub fn new(png: Vec<u8>, width: u32, height: u32, shared: &Arc<Shared>) -> Arc<Picture> {
+    /// A PNG of `width × height` pixels, counted in the quota while it lives: the pane that keeps
+    /// it makes room for it (see [`PaneGraphics::make_room`]).
+    fn new(png: Vec<u8>, width: u32, height: u32, shared: &Arc<Shared>) -> Arc<Picture> {
         shared.used.fetch_add(png.len() + PICTURE_COST, Ordering::Relaxed);
         Arc::new(Picture { png, width, height, shared: shared.clone() })
+    }
+
+    /// [`Picture::new`] for a picture that cannot make room for itself (a preview's: the panes'
+    /// images are not its to drop): only when it fits in what the quota has left.
+    pub fn within_quota(png: Vec<u8>, width: u32, height: u32, shared: &Arc<Shared>) -> Option<Arc<Picture>> {
+        let cost = png.len() + PICTURE_COST;
+        let mut used = shared.used.load(Ordering::Relaxed);
+        loop {
+            let total = used.checked_add(cost).filter(|total| *total <= shared.quota)?;
+            match shared.used.compare_exchange_weak(used, total, Ordering::Relaxed, Ordering::Relaxed) {
+                Ok(_) => break,
+                Err(now) => used = now,
+            }
+        }
+        Some(Arc::new(Picture { png, width, height, shared: shared.clone() }))
     }
 
     fn checked(png: Vec<u8>, width: u32, height: u32, shared: &Arc<Shared>) -> Result<Arc<Picture>, String> {
