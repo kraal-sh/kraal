@@ -1277,6 +1277,19 @@ mod tests {
         pane.render(Rect::new(0, 0, 10, 5), &mut buf, &mut crate::ansi::Links::new());
     }
 
+    /// A full-screen program starting while kraal holds the view a line up to count the lines
+    /// that scroll (the shell marks its commands): the view is at the bottom when it exits.
+    #[test]
+    fn the_view_is_at_the_bottom_after_a_full_screen_program() {
+        let mut pane = fed_pane(20, 5, 100);
+        pane.feed(b"\x1b]133;A\x07$ \x1b]133;B\x07ls\r\n\x1b]133;C\x07a\r\nb\r\nc\r\nd\r\ne\r\n\x1b]133;D;0\x07");
+        pane.feed(b"\x1b]133;A\x07$ \x1b]133;B\x07vim\r\n\x1b]133;C\x07\x1b[2;5r\x1b[?1049hfull screen");
+        pane.feed(b"\x1b[r\x1b[?1049l");
+        assert_eq!(pane.display_offset(), 0);
+        pane.feed(b"\x1b]133;D;0\x07\x1b]133;A\x07$ ");
+        assert_eq!(pane.display_offset(), 0);
+    }
+
     #[test]
     fn shells_are_told_from_other_programs() {
         for shell in ["zsh", "-zsh", "/bin/bash", "/usr/bin/fish", "sh"] {

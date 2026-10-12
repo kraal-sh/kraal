@@ -118,7 +118,7 @@ pub struct Commands {
     /// The view's offset when kraal started counting with it, and whether kraal lifted it from
     /// the bottom (to put back). Kept while the alternate screen is in front: the primary
     /// screen's view only moves again once it is back.
-    lifted: Option<(usize, bool)>,
+    pub(super) lifted: Option<(usize, bool)>,
     /// The emulator's history limit.
     history_max: usize,
     /// When a long command ended in this pane, until someone looks at it.

@@ -729,7 +729,12 @@ impl TermPane {
         let mut tail = std::mem::take(&mut self.cut);
         tail.extend_from_slice(&bytes[bytes.len().saturating_sub(3)..]);
         self.cut = tail.split_off(tail.len() - incomplete_char(&tail));
-        let mut feed = Feed { term: &mut self.term, archive: &mut self.archive, seen: &mut self.commands.history_seen };
+        let mut feed = Feed {
+            term: &mut self.term,
+            archive: &mut self.archive,
+            seen: &mut self.commands.history_seen,
+            lifted: &mut self.commands.lifted,
+        };
         if alone > 0 {
             self.parser.advance(&mut feed, &bytes[..alone]);
         }
@@ -739,7 +744,12 @@ impl TermPane {
 
     /// Give the emulator the output a synchronized update holds.
     pub(super) fn stop_sync(&mut self) {
-        let mut feed = Feed { term: &mut self.term, archive: &mut self.archive, seen: &mut self.commands.history_seen };
+        let mut feed = Feed {
+            term: &mut self.term,
+            archive: &mut self.archive,
+            seen: &mut self.commands.history_seen,
+            lifted: &mut self.commands.lifted,
+        };
         self.parser.stop_sync(&mut feed);
         self.parsed();
     }
@@ -1020,6 +1030,9 @@ pub(super) struct Feed<'a, T> {
     pub(super) term: &'a mut Term<T>,
     pub(super) archive: &'a mut Archive,
     pub(super) seen: &'a mut i64,
+    /// The primary screen's view as kraal lifted it to count the lines that scroll (see
+    /// `commands.rs`).
+    pub(super) lifted: &'a mut Option<(usize, bool)>,
 }
 
 impl<T: EventListener> Feed<'_, T> {
@@ -1081,11 +1094,15 @@ impl<T: EventListener> Handler for Feed<'_, T> {
 
     fn set_private_mode(&mut self, mode: PrivateMode) {
         // The lens is laid out in the primary screen's history: it goes before the alternate
-        // screen comes up, which has none.
+        // screen comes up, which has none. A view kraal lifted goes back down: the lines that
+        // scroll are not counted on the alternate screen.
         if mode == PrivateMode::Named(NamedPrivateMode::SwapScreenAndSetRestoreCursor)
             && !self.term.mode().contains(TermMode::ALT_SCREEN)
         {
             self.archive.drop_lens(self.term);
+            if let Some((_, true)) = self.lifted.take() {
+                self.term.grid_mut().scroll_display(Scroll::Bottom);
+            }
         }
         self.term.set_private_mode(mode);
     }
@@ -1864,7 +1881,8 @@ mod tests {
         for piece in corpus.split_inclusive(|b| *b == b'\x07' || *b == b'\\' || *b == b'm') {
             p1.advance(&mut plain, piece);
             for byte in piece {
-                p2.advance(&mut Feed { term: &mut fed, archive: &mut archive, seen: &mut seen }, &[*byte]);
+                let lifted = &mut None;
+                p2.advance(&mut Feed { term: &mut fed, archive: &mut archive, seen: &mut seen, lifted }, &[*byte]);
             }
             for l in -(plain.grid().history_size() as i32)..ROWS as i32 {
                 assert_eq!(
@@ -2065,7 +2083,11 @@ mod tests {
                         archive.window = (std::time::Instant::now(), 0);
                     }
                     if archived {
-                        parser.advance(&mut Feed { term: &mut term, archive: &mut archive, seen: &mut seen }, chunk);
+                        let lifted = &mut None;
+                        parser.advance(
+                            &mut Feed { term: &mut term, archive: &mut archive, seen: &mut seen, lifted },
+                            chunk,
+                        );
                     } else {
                         parser.advance(&mut term, chunk);
                     }
