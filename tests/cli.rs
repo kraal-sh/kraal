@@ -1447,6 +1447,8 @@ fn runbooks_run_locally_and_on_servers() {
     unsafe { libc::kill(pid, libc::SIGKILL) };
     wait_gone(&PathBuf::from(format!("/proc/{pid}")));
     let _ = std::fs::remove_file(env.root.join("run/kraal/runbooks.sock"));
+    // Killed while it wrote its run ledger, it would leave the temporary file of that write.
+    std::fs::write(runs.join(format!("..active-runbooks.json.{pid}.38.tmp")), "[]").unwrap();
     env.run(&["open", "w"]);
     let text = std::fs::read_to_string(&log).unwrap();
     assert!(
@@ -3646,7 +3648,14 @@ fn a_tab_attached_to_a_server_shows_each_agent_there_in_turn() {
             std::thread::sleep(Duration::from_millis(50));
         }
     };
-    for (word, not) in [("IN-1-ONE", "IN-2-TWO"), ("IN-2-TWO", "IN-1-ONE"), ("IN-1-ONE", "IN-2-TWO")] {
+    // The client here looks at that tab (opened last, it is the one its workspace shows), which
+    // shows the agent of `one`: that one is seen already, so alt+a goes to the other, then back.
+    // Each time, the tab must come to show what it did not show before alt+a.
+    let panes: serde_json::Value = serde_json::from_str(&local.run(&["panes", "--json"])).unwrap();
+    let tab = panes.as_array().unwrap().iter().find(|p| p["name"] == "by-hand").cloned().unwrap();
+    assert_eq!(tab["focused"], true, "{tab}");
+    for (word, not) in [("IN-2-TWO", "IN-1-ONE"), ("IN-1-ONE", "IN-2-TWO"), ("IN-2-TWO", "IN-1-ONE")] {
+        shown(not, word);
         // The terminal there gained the focus: it is the one used last there.
         other.send(b"\x1b[I");
         std::thread::sleep(Duration::from_millis(200));

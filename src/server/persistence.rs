@@ -108,6 +108,13 @@ impl Server {
 
     /// Recreate the layout saved by a previous server, if any.
     pub(super) fn restore(&mut self) {
+        // What a kraal killed while it wrote left: the temporary files of its writes, off the
+        // event loop.
+        let _ = std::thread::Builder::new().name("temps".into()).spawn(|| {
+            for dir in paths::written_dirs() {
+                let _ = paths::remove_files_in(&dir, paths::abandoned_temp);
+            }
+        });
         let interrupted = crate::runbooks::recover_interrupted(&self.session);
         if !interrupted.is_empty() {
             self.warnings.push(format!(

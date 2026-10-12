@@ -131,6 +131,31 @@ pub fn private_runtime_dir() -> std::io::Result<PathBuf> {
     Ok(dir)
 }
 
+/// Whether `name` is the temporary file of an atomic write ([`write_private`], [`write_atomic`])
+/// whose process no longer runs: `.<file>.<pid>.<n>.tmp` ([`temp_beside`]), left by a kraal that
+/// was killed while it wrote. A file a running process is writing never counts.
+pub fn abandoned_temp(name: &str) -> bool {
+    let Some(inner) = name.strip_prefix('.').and_then(|n| n.strip_suffix(".tmp")) else { return false };
+    let mut parts = inner.rsplitn(3, '.');
+    let (Some(n), Some(pid), Some(file)) = (parts.next(), parts.next(), parts.next()) else { return false };
+    let number = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    if file.is_empty() || !number(n) || !number(pid) {
+        return false;
+    }
+    let Ok(pid) = pid.parse::<libc::pid_t>() else { return false };
+    // SAFETY: signal 0 only checks that the process exists; another user's says EPERM.
+    pid > 0
+        && pid as u32 != std::process::id()
+        && unsafe { libc::kill(pid, 0) } != 0
+        && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+}
+
+/// The directories of kraal's own that its atomic writes go to.
+pub fn written_dirs() -> Vec<PathBuf> {
+    let state = state_dir();
+    vec![state.join("sessions"), state.join("runs"), state.join("usage"), state, workspaces_dir(), config_dir()]
+}
+
 /// A temporary path next to `path` that no other writer uses at the same time, in this process
 /// (a counter) or another (the pid).
 fn temp_beside(path: &Path) -> PathBuf {
@@ -841,6 +866,41 @@ mod tests {
             .filter(|e| e.file_name().to_string_lossy().ends_with(".tmp"))
             .collect();
         assert!(left.is_empty(), "no temporary file left behind");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn temporary_files_of_writers_gone_are_removed_and_no_others() {
+        let dir = std::env::temp_dir().join(format!("kraal-abandoned-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // A process that ran and ended (and was reaped): what it was writing is abandoned.
+        let mut gone = std::process::Command::new("true").spawn().unwrap();
+        let dead = gone.id();
+        gone.wait().unwrap();
+        let me = std::process::id();
+        let abandoned = [format!("..active-main.json.{dead}.38.tmp"), format!(".servers.toml.{dead}.0.tmp")];
+        let kept = [
+            format!(".main.json.{me}.3.tmp"),
+            ".main.json.1.0.tmp".to_string(),
+            format!("main.json.{dead}.0.tmp"),
+            format!(".main.json.{dead}.x.tmp"),
+            format!("..{dead}.0.tmp"),
+            "notes.txt".to_string(),
+        ];
+        for name in abandoned.iter().chain(&kept) {
+            std::fs::write(dir.join(name), "x").unwrap();
+        }
+        // Never a link, nor what it leads to.
+        let link = format!(".link.{dead}.0.tmp");
+        std::os::unix::fs::symlink(dir.join("notes.txt"), dir.join(&link)).unwrap();
+        assert_eq!(remove_files_in(&dir, abandoned_temp).unwrap(), kept.len() + 1);
+        for name in &abandoned {
+            assert!(!dir.join(name).exists(), "{name}");
+        }
+        for name in kept.iter().chain([&link]) {
+            assert!(std::fs::symlink_metadata(dir.join(name)).is_ok(), "{name}");
+        }
         let _ = std::fs::remove_dir_all(dir);
     }
 }
