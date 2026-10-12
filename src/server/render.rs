@@ -111,8 +111,8 @@ impl FactsCache {
 pub struct FrameMemo {
     panes: Vec<(PaneId, Rect, Vec<u64>)>,
     chrome: Option<Chrome>,
-    /// The look of each pane's frame, with what it was made from.
-    looks: HashMap<PaneId, (LookInputs, Rc<FrameLook>)>,
+    /// The look of each pane's frame, with what it was made from, in the order drawn.
+    looks: Vec<(PaneId, LookInputs, Rc<FrameLook>)>,
 }
 
 /// What a part of the chrome (the top bar, the sidebar) is made from, besides the client: the
@@ -186,7 +186,10 @@ fn kept_rows(placed: &[Placed]) -> Vec<Kept> {
         .filter_map(|p| Some((p, p.rows.as_ref()?)))
         .flat_map(|(p, rows)| {
             let c = p.content;
-            rows.iter().enumerate().flat_map(move |(r, span)| {
+            // No row to draw: all of them are kept.
+            let all = (rows.is_empty()).then(|| vec![None; usize::from(c.height)]);
+            let rows = all.unwrap_or_else(|| rows.clone());
+            rows.into_iter().enumerate().flat_map(move |(r, span)| {
                 let y = c.y + r as u16;
                 // A row is kept but for the columns drawn again.
                 let (from, to) = span.map_or((c.width, c.width), |(a, b)| (a.min(c.width), b.min(c.width)));
@@ -351,9 +354,9 @@ impl Server {
         let folds = self
             .ws_index(c.workspace)
             .map_or_else(Vec::new, |wi| self.stack_rows(self.workspaces[wi].tab(), self.layout_area));
-        let placed = self.place_panes(id, (full, side), &folds, (!covered).then_some(&memo));
+        let placed = self.place_panes(id, (full, side), &folds, (!covered).then_some(&mut memo));
         let c = &self.clients[&id];
-        let mut looks = HashMap::with_capacity(memo.looks.len());
+        let mut looks = Vec::with_capacity(memo.looks.len());
         let (frames, fold_looks) = self.frame_looks(id, &placed, &folds, (&memo.looks, &mut looks));
         memo.looks = looks;
         // The bar and the sidebar made from the same inputs as the last frame's are the same:
@@ -1174,7 +1177,7 @@ impl Server {
         id: ClientId,
         (screen, side): (Rect, Rect),
         folds: &[(PaneId, Rect)],
-        memo: Option<&FrameMemo>,
+        mut memo: Option<&mut FrameMemo>,
     ) -> Vec<Placed> {
         let Some(wi) = self.clients.get(&id).and_then(|c| self.ws_index(c.workspace)) else { return Vec::new() };
         let rects = self.tab_rects(self.workspaces[wi].tab(), self.layout_area);
@@ -1189,7 +1192,7 @@ impl Server {
         // The rows of panes folded in stacks (`folds`) are drawn too.
         let folded = folds.iter().map(|(p, r)| (*p, r.intersection(screen)));
         let tiles: Vec<(PaneId, Rect)> = placed.iter().map(|p| (p.pane, p.tile)).chain(folded).collect();
-        for p in &mut placed {
+        for (i, p) in placed.iter_mut().enumerate() {
             let Some(pane) = self.panes.get_mut(&p.pane) else { continue };
             p.content = Rect::new(p.inner.x, p.inner.y, p.inner.width.min(pane.cols), p.inner.height.min(pane.rows));
             if p.inner.is_empty() {
@@ -1205,10 +1208,17 @@ impl Server {
                 && !content.intersects(side)
                 && tiles.iter().all(|(q, t)| *q == p.pane || !t.intersects(content));
             let versions = rows.versions();
-            let same = memo.and_then(|m| m.panes.iter().find(|(q, r, _)| *q == p.pane && *r == content));
+            // Where the pane was in the last frame, most often.
+            let mut same = memo.as_deref_mut().and_then(|m| {
+                let at = |e: &(PaneId, Rect, Vec<u64>)| e.0 == p.pane && e.1 == content;
+                let i = if m.panes.get(i).is_some_and(at) { i } else { m.panes.iter().position(at)? };
+                Some(std::mem::take(&mut m.panes[i].2))
+            });
             let whole = Some((0, content.width));
-            p.rows = Some(match same {
-                Some((_, _, old)) if alone => versions
+            p.rows = Some(match &same {
+                // Nothing new: no row to draw (an empty list).
+                Some(old) if alone && old == versions && !rows.any_images() => Vec::new(),
+                Some(old) if alone => versions
                     .iter()
                     .enumerate()
                     .map(|(r, v)| match old.get(r) {
@@ -1221,7 +1231,13 @@ impl Server {
                     .collect(),
                 _ => vec![whole; versions.len()],
             });
-            p.versions = alone.then(|| versions.to_vec());
+            p.versions = alone.then(|| match same.take() {
+                Some(mut old) if old.len() == versions.len() => {
+                    old.copy_from_slice(versions);
+                    old
+                }
+                _ => versions.to_vec(),
+            });
         }
         placed
     }
@@ -1366,7 +1382,7 @@ impl Server {
         id: ClientId,
         placed: &[Placed],
         folds: &[(PaneId, Rect)],
-        (last, now): (&HashMap<PaneId, (LookInputs, Rc<FrameLook>)>, &mut HashMap<PaneId, (LookInputs, Rc<FrameLook>)>),
+        (last, now): (&[(PaneId, LookInputs, Rc<FrameLook>)], &mut Vec<(PaneId, LookInputs, Rc<FrameLook>)>),
     ) -> (Vec<Option<Rc<FrameLook>>>, Vec<Option<Rc<FrameLook>>>) {
         let Some(wi) = self.clients.get(&id).and_then(|c| self.ws_index(c.workspace)) else {
             return (placed.iter().map(|_| None).collect(), folds.iter().map(|_| None).collect());
@@ -1384,11 +1400,14 @@ impl Server {
             let (version, _) = self.pane_facts(pane)?;
             let (sync, marked) = (synced.contains(&pane), ws.marked.contains(&pane));
             let from = LookInputs { chrome: self.chrome_gen, version, tile, focused, sync, floating, marked };
-            let look = match last.get(&pane) {
-                Some((then, look)) if *then == from => look.clone(),
+            // Where it was in the last frame, most often.
+            let i = now.len();
+            let then = last.get(i).filter(|l| l.0 == pane).or_else(|| last.iter().find(|l| l.0 == pane));
+            let look = match then {
+                Some((_, then, look)) if *then == from => look.clone(),
                 _ => Rc::new(self.frame_look(pane, tile, focused, sync, floating, marked)?),
             };
-            now.insert(pane, (from, look.clone()));
+            now.push((pane, from, look.clone()));
             Some(look)
         };
         let frames = placed

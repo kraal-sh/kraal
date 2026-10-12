@@ -179,6 +179,11 @@ impl ScreenCache {
         self.images.get(y).copied().unwrap_or(false)
     }
 
+    /// Whether what some row shows depends on images.
+    pub fn any_images(&self) -> bool {
+        self.images.iter().any(|i| *i)
+    }
+
     /// Copy the columns of each row `rows` says to (from, to) into `buf` at `area` (the size of
     /// the rows), and add every row's links to `links`.
     pub fn draw(
