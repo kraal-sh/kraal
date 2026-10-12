@@ -214,7 +214,7 @@ impl Archive {
         let history = term.grid().history_size();
         match self.room_beside(history, history + BATCH, screen) {
             0 => {
-                self.page_in(term, seen, usize::MAX);
+                self.page_in(term, seen, usize::MAX, (0, 0));
             }
             room => self.store.send(Batch::trim(room)),
         }
@@ -255,7 +255,7 @@ impl Archive {
         if trim == 0 {
             // The emulator may fill up before the next look: rows moved would go at once. It
             // holds the whole history instead, as it does alone, the archive's rows too.
-            self.page_in(term, seen, usize::MAX);
+            self.page_in(term, seen, usize::MAX, (0, 0));
             self.due = self.next_look(term.grid().history_size());
             return 0;
         }
@@ -294,9 +294,16 @@ impl Archive {
     }
 
     /// Bring back at least `wanted` rows (whole lines, the newest first) above the emulator's
-    /// history, laid out at its width. Returns the rows brought back; `seen` goes up by as many.
-    pub(super) fn page_in<T: EventListener>(&mut self, term: &mut Term<T>, seen: &mut i64, wanted: usize) -> usize {
-        if wanted == 0 || self.lens.is_some() || term.mode().contains(TermMode::ALT_SCREEN) {
+    /// history, laid out at its width, and lines that take at least `rows` rows at width `at`.
+    /// Returns the rows brought back; `seen` goes up by as many.
+    pub(super) fn page_in<T: EventListener>(
+        &mut self,
+        term: &mut Term<T>,
+        seen: &mut i64,
+        wanted: usize,
+        (at, rows): (usize, usize),
+    ) -> usize {
+        if (wanted == 0 && rows == 0) || self.lens.is_some() || term.mode().contains(TermMode::ALT_SCREEN) {
             return 0;
         }
         let mut lines = self.store.lines();
@@ -312,14 +319,15 @@ impl Archive {
         let room = self.limit.saturating_sub(grid.history_size());
         // The newest lines, with the rows each takes.
         let mut picked = Vec::new();
-        let mut count = 0;
+        let (mut count, mut counted) = (0, 0);
         for line in lines.newest_first() {
-            let rows = line.rows_at(width);
-            if count >= wanted || count + rows > room {
+            let taken = line.rows_at(width);
+            if (count >= wanted && counted >= rows) || count + taken > room {
                 break;
             }
-            count += rows;
-            picked.push((line, rows));
+            count += taken;
+            counted += if counted < rows { line.rows_at(at) } else { 0 };
+            picked.push((line, taken));
         }
         if count == 0 {
             return 0;
@@ -782,7 +790,7 @@ impl TermPane {
         let history = self.term.grid().history_size();
         if rows > history {
             let wanted = (rows - history).max(PAGE);
-            self.archive.page_in(&mut self.term, &mut self.commands.history_seen, wanted);
+            self.archive.page_in(&mut self.term, &mut self.commands.history_seen, wanted, (0, 0));
         }
     }
 
@@ -947,16 +955,24 @@ impl TermPane {
         std::mem::take(&mut self.archive.freed)
     }
 
-    /// The screen changed size: rows it gains come from the history, brought back first. A lens
-    /// goes, to show the same line again after.
-    pub(super) fn before_resize(&mut self, rows: usize) {
+    /// The screen changes size to `size`: rows it gains come from the history, brought back
+    /// first. A wider screen takes fewer rows for the lines it wrapped, and the emulator fills it
+    /// from its history as it rewraps them: those are brought back too, counted at the new width.
+    /// A lens goes, to show the same line again after.
+    pub(super) fn before_resize(&mut self, size: super::pty::Size) {
         self.view_moved();
         self.archive.reopen = self.drop_lens();
-        let (screen, history) = (self.term.screen_lines(), self.term.grid().history_size());
-        if rows > screen + history {
+        let grid = self.term.grid();
+        let (screen, history, width) = (grid.screen_lines(), grid.history_size(), grid.columns());
+        let (rows, cols) = (usize::from(size.rows), usize::from(size.cols));
+        let gained = rows.saturating_sub(screen);
+        let wraps = |l: usize| grid[Line(l as i32)][Column(width - 1)].flags.contains(Flags::WRAPLINE);
+        // The emulator's own history rewraps into fewer rows too: it is not counted on.
+        let wider = if cols > width { gained + (0..screen).filter(|l| wraps(*l)).count() } else { 0 };
+        if gained > history || wider > 0 {
             // Those rows only, not a page: every pane grows at once when the window does.
-            let wanted = rows - screen - history;
-            self.archive.page_in(&mut self.term, &mut self.commands.history_seen, wanted);
+            let wanted = gained.saturating_sub(history);
+            self.archive.page_in(&mut self.term, &mut self.commands.history_seen, wanted, (cols, wider));
         }
     }
 

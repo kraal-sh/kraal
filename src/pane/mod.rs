@@ -475,7 +475,7 @@ impl Pane {
         self.rows = rows;
         if let Content::Term(t) = &mut self.content {
             let _ = t.master.resize(pty::pty_size(cols, rows, t.graphics.shared()));
-            t.before_resize(usize::from(rows));
+            t.before_resize(Size { cols, rows });
             t.resize_marked(Size { cols, rows });
             t.after_resize();
         }
@@ -1241,6 +1241,23 @@ mod tests {
             let want = if kind == SelectionType::Lines { "$ abcdefg日\n" } else { "abcdefg日" };
             assert_eq!(pane.selection_text().as_deref(), Some(want), "{kind:?}");
         }
+    }
+
+    /// A resting pane made wider and taller shows what the emulator alone would: the lines it
+    /// wrapped take fewer rows, and the screen fills from the history, archived lines included.
+    #[test]
+    fn a_wider_screen_fills_from_the_archive() {
+        let config = TermConfig { scrolling_history: 3000, ..TermConfig::default() };
+        let mut reference = Term::new(config, &pty::Size { cols: 20, rows: 5 }, Listener::default());
+        let mut pane = fed_pane(20, 5, 3000);
+        let text: String = (0..300).map(|i| format!("line {i} {}\r\n", "x".repeat(i % 50))).collect();
+        pane.feed(text.as_bytes());
+        let mut parser: Processor = Processor::new();
+        parser.advance(&mut reference, text.as_bytes());
+        pane.rest();
+        pane.resize(60, 12);
+        reference.resize(pty::Size { cols: 60, rows: 12 });
+        assert_eq!(screen::lines_text(&pane.term().unwrap().term, 0, 12), screen::lines_text(&reference, 0, 12));
     }
 
     #[test]
