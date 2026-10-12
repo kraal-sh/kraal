@@ -401,8 +401,11 @@ impl Pane {
                     Some(n) => {
                         let bottom = last_nonblank_line(&t.term).unwrap_or(0) + 1;
                         let n = n.min(i32::MAX as usize) as i32;
-                        // Rows older than the emulator's come from the archive.
-                        ((bottom - n).max(-history), bottom, (n - bottom - history).max(0) as usize)
+                        // Rows older than the emulator's come from the archive, which holds the
+                        // history of the primary screen only.
+                        let archived =
+                            if t.term.mode().contains(TermMode::ALT_SCREEN) { 0 } else { n - bottom - history };
+                        ((bottom - n).max(-history), bottom, archived.max(0) as usize)
                     }
                 };
                 let rows = (start..end).map(|l| row_text(&t.term, Line(l)));

@@ -367,12 +367,8 @@ mod tests {
                         }
                     }
                 }
-                // A region below the top scrolling under a view scrolled back takes the view
-                // further back than there is history (alacritty's grid then trips its own debug
-                // checks, whoever draws it): the view goes back down.
-                if t.grid().display_offset() > t.grid().history_size() {
-                    t.scroll_display(Scroll::Bottom);
-                }
+                // As a pane does after parsing.
+                crate::pane::archive::keep_view_in_history(&mut t);
                 cache.refresh(&mut t, (changes, 0));
                 let ((cached, cached_links), (full, full_links)) = both(&cache, &t);
                 assert_eq!(cached, full, "case {case} step {step}");

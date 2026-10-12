@@ -160,7 +160,9 @@ impl TermPane {
                         t.stop_sync();
                     }
                     // Images shown in the archived history are still placed.
-                    t.graphics.archived = t.archive.lines().images().collect();
+                    if t.graphics.sweep_due() {
+                        t.graphics.archived = t.archive.lines().images().collect();
+                    }
                     if let Some(reply) = t.graphics.handle(image, &mut t.term) {
                         t.write(reply);
                     }

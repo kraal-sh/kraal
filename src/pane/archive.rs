@@ -4,9 +4,12 @@
 //! thread that encodes them (see `store.rs`). Resizing reflows only what the emulator holds.
 //!
 //! Rows move only above everything in use: the view, the selection and the copy-mode cursor, with
-//! a screen to spare. Both parts together hold no more rows than the pane's scrollback, as the
-//! emulator alone did, and at least all but what the emulator holds of its own at most (a couple
-//! of screens and a batch).
+//! a screen to spare. Both parts together hold the pane's scrollback, as the emulator alone did:
+//! until the next move they may hold more, by the rows the emulator gains meanwhile at most (a
+//! couple of screens and a batch), rather than let go of rows the emulator alone would keep.
+//! Rows move only while the emulator cannot fill up before the next move: it would then drop
+//! rows newer than the archive's. It holds the whole history instead, the archive's rows brought
+//! back.
 //!
 //! A flood of output, more rows within a second than the scrollback holds (or than the archive
 //! keeps up with), stays in the emulator as it would without the archive (most of it goes before
@@ -30,8 +33,8 @@ use alacritty_terminal::term::cell::{Cell, Flags};
 use alacritty_terminal::term::{Term, TermMode};
 use alacritty_terminal::vte::ansi::{
     Attr, CharsetIndex, ClearMode, Color, CursorShape, CursorStyle, Handler, Hyperlink, KeyboardModes,
-    KeyboardModesApplyBehavior, LineClearMode, Mode, ModifyOtherKeys, NamedColor, PrivateMode, Rgb, ScpCharPath,
-    ScpUpdateMode, StandardCharset, TabulationClearMode, cursor_icon::CursorIcon,
+    KeyboardModesApplyBehavior, LineClearMode, Mode, ModifyOtherKeys, NamedColor, NamedPrivateMode, PrivateMode, Rgb,
+    ScpCharPath, ScpUpdateMode, StandardCharset, TabulationClearMode, cursor_icon::CursorIcon,
 };
 
 use super::history;
@@ -129,6 +132,11 @@ impl Archive {
         self.store.lines()
     }
 
+    /// Whether the rows handed over are stored: reading the lines stores none.
+    pub(super) fn stored(&self) -> bool {
+        self.store.backlog() == 0
+    }
+
     /// Rows of the emulator's history the lens shows.
     pub(super) fn lens_rows(&self) -> usize {
         self.lens.as_ref().map_or(0, |l| l.rows)
@@ -144,22 +152,40 @@ impl Archive {
         // The emulator keeps a couple of screens of history, to scroll back to without the
         // archive (and all a resize reflows), and up to a batch more before the oldest move out.
         // Output adds up to a screen of rows before the next look at the history's length: with
-        // it, the history stays within the rows the emulator allocates first.
-        self.high = EMULATOR_ROWS.saturating_sub(screen).max(BATCH).min(2 * screen.max(32) + BATCH);
+        // it, the history stays within the rows the emulator allocates first, and within the
+        // scrollback (see `room_beside`).
+        let high = EMULATOR_ROWS.saturating_sub(screen).max(BATCH).min(2 * screen.max(32) + BATCH);
+        self.high = high.min(self.limit.saturating_sub(screen));
         self.keep = self.high.saturating_sub(BATCH).max(self.high / 2);
         self.due = self.high;
+    }
+
+    /// The length of the emulator's history at the next look at it, when it holds `own` rows of
+    /// its own now: `high`, or a batch more while rows in use stay.
+    fn next_look(&self, own: usize) -> usize {
+        if own > self.high { own + BATCH } else { self.high }
+    }
+
+    /// The rows the archive keeps while the emulator holds `own` rows of its own, and may hold
+    /// `next` and a screen of them at the next look: all the scrollback leaves beside them (both
+    /// parts may hold more than the scrollback meanwhile, by the rows the emulator gains). None
+    /// when the emulator may fill up before then: it would drop rows of its own newer than the
+    /// archive's.
+    fn room_beside(&self, own: usize, next: usize, screen: usize) -> usize {
+        if next + screen <= self.limit { self.limit - own } else { 0 }
     }
 
     /// The output about to be parsed may push up to a screen of rows into the history: move the
     /// oldest out if the emulator holds too many.
     fn make_room<T: EventListener>(&mut self, term: &mut Term<T>, seen: &mut i64) {
-        let history = term.grid().history_size();
+        let screen = term.screen_lines();
         if self.lens.is_some() {
             // The emulator keeps the history as it does alone below the lens; the oldest lines
             // go as rows come, as they would from the emulator alone, a few at a time.
+            let history = term.grid().history_size();
             self.due = history + LENS_BATCH;
             let own = history - self.lens_rows();
-            let trim = self.limit.saturating_sub(own + LENS_BATCH + term.screen_lines());
+            let trim = self.room_beside(own, own + LENS_BATCH, screen);
             let first = {
                 let mut lines = self.store.lines();
                 lines.trim(trim, false);
@@ -168,32 +194,31 @@ impl Archive {
             self.lens_cut(term, first);
             return;
         }
-        if self.flood {
-            // The emulator keeps the history as it does alone: what is older goes first.
-            self.due = history + BATCH;
-            let trim = self.limit.saturating_sub(history + BATCH + term.screen_lines());
-            self.store.send(Batch::trim(trim));
-            return;
-        }
-        let moved = self.compact(term, seen, self.keep);
-        let now = Instant::now();
-        if now.duration_since(self.window.0) > FLOOD_WINDOW {
-            self.window = (now, 0);
-        }
-        self.window.1 += moved;
-        let history = term.grid().history_size();
-        if self.window.1 > self.limit || self.store.backlog() > MAX_BACKLOG {
+        if !self.flood {
+            let moved = self.compact(term, seen, self.keep);
+            let now = Instant::now();
+            if now.duration_since(self.window.0) > FLOOD_WINDOW {
+                self.window = (now, 0);
+            }
+            self.window.1 += moved;
+            if self.window.1 <= self.limit && self.store.backlog() <= MAX_BACKLOG {
+                return;
+            }
             // More than the scrollback holds within the window: most of it would be kept only
             // to be dropped. Or more than the store keeps up with. Until the output pauses (see
             // `calm`).
             self.flood = true;
-            self.due = history + BATCH;
-        } else if history > self.high {
-            // Rows in use stay: look again after a batch.
-            self.due = history + BATCH;
-        } else {
-            self.due = self.high;
         }
+        // The emulator keeps the history as it does alone: what is older goes first, or comes
+        // back to it once it may fill up (as in `compact`).
+        let history = term.grid().history_size();
+        match self.room_beside(history, history + BATCH, screen) {
+            0 => {
+                self.page_in(term, seen, usize::MAX);
+            }
+            room => self.store.send(Batch::trim(room)),
+        }
+        self.due = term.grid().history_size() + BATCH;
     }
 
     /// Hand the oldest lines of the emulator's history to the store, as long as the rows of each
@@ -225,15 +250,20 @@ impl Archive {
         }
         let moved = (line - top) as usize;
         let left = history - moved;
+        let next = self.next_look(left);
+        let trim = self.room_beside(left, next, screen);
+        if trim == 0 {
+            // The emulator may fill up before the next look: rows moved would go at once. It
+            // holds the whole history instead, as it does alone, the archive's rows too.
+            self.page_in(term, seen, usize::MAX);
+            self.due = self.next_look(term.grid().history_size());
+            return 0;
+        }
+        self.due = next;
         if moved == 0 && left <= self.high {
             return 0;
         }
-        // Both parts within the scrollback while the emulator's fills up again, as tmux keeps
-        // between nine tenths of its limit and all of it; with rows in use staying, until a
-        // batch more.
-        let held = if left > self.high { left + BATCH + screen } else { self.high };
-        let trim = self.limit.saturating_sub(held);
-        let mut batch = Batch { rows: Vec::with_capacity(moved), lines, trim, release: false };
+        let mut batch = Batch { rows: Vec::with_capacity(moved), lines, trim };
         if moved > MANY {
             // Many rows (after a flood, or a look far back): the emulator lets go of the rows it
             // keeps ahead too, rather than get as many new ones.
@@ -366,7 +396,7 @@ impl Archive {
         keep_on_grid(term);
         if lens.rows > EMULATOR_ROWS {
             // Many rows that showed a long history went: their memory goes back.
-            self.store.send(Batch::release());
+            self.store.release();
         }
     }
 
@@ -594,6 +624,15 @@ fn first_in_use<T>(term: &Term<T>) -> i32 {
     line - grid.screen_lines() as i32
 }
 
+/// A region below the top line that scrolls takes a view scrolled back further up, as if its
+/// rows went into the history (alacritty's grid), though none did: the view goes no higher than
+/// the top of the history, where rows can be read.
+pub(super) fn keep_view_in_history<T: EventListener>(term: &mut Term<T>) {
+    if term.grid().display_offset() > term.grid().history_size() {
+        term.scroll_display(Scroll::Top);
+    }
+}
+
 /// Rows went from the top of the grid: the copy-mode cursor stays on it, and a selection that
 /// was on them goes.
 fn keep_on_grid<T>(term: &mut Term<T>) {
@@ -649,13 +688,20 @@ impl TermPane {
         self.archive.rested = false;
         let mut feed = Feed { term: &mut self.term, archive: &mut self.archive, seen: &mut self.commands.history_seen };
         self.parser.advance(&mut feed, bytes);
-        self.view_moved();
+        self.parsed();
     }
 
     /// Give the emulator the output a synchronized update holds.
     pub(super) fn stop_sync(&mut self) {
         let mut feed = Feed { term: &mut self.term, archive: &mut self.archive, seen: &mut self.commands.history_seen };
         self.parser.stop_sync(&mut feed);
+        self.parsed();
+    }
+
+    /// Output was parsed: the view is brought back within the history, and rows that moved
+    /// under it are told.
+    fn parsed(&mut self) {
+        keep_view_in_history(&mut self.term);
         self.view_moved();
     }
 
@@ -830,7 +876,6 @@ impl TermPane {
         if self.term.grid().history_size() > self.archive.high && !self.archive.flood {
             let keep = self.archive.keep;
             let moved = self.archive.compact(&mut self.term, &mut self.commands.history_seen, keep);
-            self.archive.due = self.archive.high;
             // Many rows brought back for a look at the history went again.
             self.archive.freed |= moved > EMULATOR_ROWS;
         }
@@ -858,8 +903,7 @@ impl TermPane {
             self.term.grid_mut().truncate();
             self.archive.spare = Vec::new();
             self.archive.store.free_spare();
-            // Once the rows handed over are let go of.
-            self.archive.store.send(Batch::release());
+            self.archive.store.release();
             self.archive.freed = true;
         }
         std::mem::take(&mut self.archive.freed)
@@ -894,6 +938,10 @@ impl TermPane {
 
     /// The text of the archive's last `rows` rows at the pane's width, as grid rows read.
     pub(super) fn archived_rows(&self, rows: usize) -> Vec<String> {
+        if rows == 0 {
+            // Without waiting for the rows handed to the store.
+            return Vec::new();
+        }
         let width = self.term.columns();
         let mut lines = Vec::new();
         let mut count = 0;
@@ -970,6 +1018,14 @@ impl<T: EventListener> Handler for Feed<'_, T> {
         self.term.clear_screen(mode);
     }
 
+    fn set_private_mode(&mut self, mode: PrivateMode) {
+        if mode == PrivateMode::Named(NamedPrivateMode::SwapScreenAndSetRestoreCursor) {
+            // The lens is on the history of the screen going away.
+            self.archive.drop_lens(self.term);
+        }
+        self.term.set_private_mode(mode);
+    }
+
     fn reset_state(&mut self) {
         self.archive.lines().clear();
         self.archive.lens = None;
@@ -1004,7 +1060,6 @@ impl<T: EventListener> Handler for Feed<'_, T> {
         insert_blank_lines(rows: usize);
         delete_chars(count: usize);
         reverse_index();
-        set_private_mode(mode: PrivateMode);
         unset_private_mode(mode: PrivateMode);
         decaln();
         set_title(title: Option<String>);
@@ -1092,18 +1147,23 @@ mod tests {
 
     impl Both {
         fn new() -> Both {
+            Both::sized(SCROLLBACK, ROWS)
+        }
+
+        /// A pane `rows` high that keeps `scrollback` rows of history.
+        fn sized(scrollback: usize, rows: u16) -> Both {
             let (tx, _rx) = crossbeam_channel::bounded(64);
             let env = PaneEnv {
                 socket: "/nonexistent".into(),
                 session: "t".into(),
                 shell: "sh".into(),
-                scrollback: SCROLLBACK,
-                graphics: Default::default(),
+                scrollback,
+                graphics: Arc::new(crate::graphics::Shared::new(true, 64 << 20)),
             };
             let spec = PaneSpec { command: vec!["sleep".into(), "30".into()], ..Default::default() };
-            let pane = Pane::spawn(1, None, spec, COLS, ROWS, &env, &tx).unwrap();
-            let config = TermConfig { scrolling_history: SCROLLBACK, kitty_keyboard: true, ..TermConfig::default() };
-            let reference = Term::new(config, &Size { cols: COLS, rows: ROWS }, Listener::default());
+            let pane = Pane::spawn(1, None, spec, COLS, rows, &env, &tx).unwrap();
+            let config = TermConfig { scrolling_history: scrollback, kitty_keyboard: true, ..TermConfig::default() };
+            let reference = Term::new(config, &Size { cols: COLS, rows }, Listener::default());
             Both { pane, reference, parser: Processor::new() }
         }
 
@@ -1154,6 +1214,13 @@ mod tests {
         fn resize(&mut self, cols: u16, rows: u16) {
             self.pane.resize(cols, rows);
             self.reference.resize(Size { cols, rows });
+        }
+
+        /// The reference keeps the rows output pushes past the scrollback, as the pane does
+        /// until the next move, rather than let go of them at once: views far up compare.
+        fn room_past_the_scrollback(&mut self) {
+            let limit = self.term().archive.limit;
+            self.reference.grid_mut().update_history(limit + 2 * EMULATOR_ROWS);
         }
     }
 
@@ -1221,6 +1288,92 @@ mod tests {
     }
 
     #[test]
+    fn output_that_stops_leaves_the_whole_scrollback() {
+        // Short and long scrollbacks, short and tall panes.
+        for (scrollback, rows) in [(100, 24), (40, 24), (20, 24), (400, 50), (SCROLLBACK, ROWS)] {
+            let mut b = Both::sized(scrollback, rows);
+            let lines: String = (0..scrollback + 3 * usize::from(rows)).map(|i| format!("line {i}\r\n")).collect();
+            b.feed(lines.as_bytes());
+            assert_eq!(b.history(), scrollback, "{scrollback} rows of scrollback, {rows} high");
+            let all = b.pane.text(Some(scrollback + usize::from(rows)));
+            assert_eq!(all, b.reference_text_all(), "{scrollback} rows of scrollback, {rows} high");
+        }
+    }
+
+    #[test]
+    fn a_flood_that_stops_leaves_the_whole_scrollback() {
+        let lines = |n: std::ops::Range<usize>| n.map(|i| format!("line {i}\r\n")).collect::<String>();
+        let mut b = Both::new();
+        b.feed(lines(0..500).as_bytes());
+        // A flood (more rows within a second than the scrollback holds): once the emulator may
+        // fill up, the archive's rows come back to it rather than go.
+        b.pane.term_mut().unwrap().archive.flood = true;
+        let flood = lines(500..3450);
+        b.pane.feed(flood.as_bytes());
+        b.parser.advance(&mut b.reference, flood.as_bytes());
+        assert!(b.pane.rest());
+        assert_eq!(b.history(), SCROLLBACK);
+        assert_eq!(b.pane.text(Some(SCROLLBACK + ROWS as usize)), b.reference_text_all());
+    }
+
+    #[test]
+    fn a_region_scrolling_under_a_view_scrolled_back_keeps_it_within_the_history() {
+        let mut b = Both::new();
+        b.feed(sample(100).as_bytes());
+        b.pane.scroll(1);
+        // The region below the top line scrolls: no row goes into the history.
+        b.feed(format!("\x1b[2;{ROWS}r\x1b[{ROWS};1H{}", "\n".repeat(100)).as_bytes());
+        assert!(b.pane.refresh_screen(COLS, ROWS).is_some());
+        let grid = b.term().term.grid();
+        assert!(grid.display_offset() <= grid.history_size(), "{} > {}", grid.display_offset(), grid.history_size());
+    }
+
+    /// What reads the screen (each tick for agents) or places an image, while the archive is
+    /// busy (another thread reads it, the rows of a long output are stored), goes on at once.
+    #[test]
+    fn the_screen_and_images_are_read_without_the_archive() {
+        let mut b = Both::new();
+        b.feed(sample(1000).as_bytes());
+        let store = b.term().archive.store.clone();
+        let (held_tx, held_rx) = crossbeam_channel::bounded(0);
+        let (done_tx, done_rx) = crossbeam_channel::bounded::<()>(0);
+        let reader = std::thread::spawn(move || {
+            let lines = store.lines();
+            held_tx.send(()).unwrap();
+            let _ = done_rx.recv_timeout(Duration::from_secs(3));
+            drop(lines);
+        });
+        held_rx.recv().unwrap();
+        let start = Instant::now();
+        assert!(b.pane.text(None).contains("line 995"));
+        let screen = start.elapsed();
+        b.pane.feed(b"\x1b_Ga=q,i=1;AAAA\x1b\\");
+        let image = start.elapsed() - screen;
+        let _ = done_tx.send(());
+        reader.join().unwrap();
+        assert!(screen < Duration::from_secs(1), "the screen waited {screen:?}");
+        assert!(image < Duration::from_secs(1), "the image waited {image:?}");
+    }
+
+    #[test]
+    fn a_full_screen_program_shown_while_the_view_is_far_back_leaves_the_history_as_it_was() {
+        let mut b = Both::new();
+        b.feed(sample(4000).as_bytes());
+        let kept = b.history();
+        let before = b.pane.text(Some(kept + ROWS as usize));
+        b.pane.scroll(1500);
+        assert!(b.term().archive.lens.is_some());
+        b.feed(b"\x1b[?1049h\x1b[Hfull screen");
+        // Its screen alone: the history is the other screen's.
+        assert_eq!(b.pane.text(Some(50)), "full screen\n");
+        b.resize(COLS + 3, ROWS + 2);
+        b.resize(COLS, ROWS);
+        b.feed(b"\x1b[?1049l");
+        assert_eq!(b.history(), kept);
+        assert_eq!(b.pane.text(Some(kept + ROWS as usize)), before);
+    }
+
+    #[test]
     fn a_flood_stays_in_the_emulator_until_it_stops() {
         let mut b = Both::new();
         b.feed(sample(1000).as_bytes());
@@ -1254,6 +1407,7 @@ mod tests {
     #[test]
     fn scrolling_back_shows_what_the_emulator_showed() {
         let mut b = Both::new();
+        b.room_past_the_scrollback();
         b.feed(sample(4000).as_bytes());
         let kept = b.history();
         // Line by line near the bottom, then page by page to the top, and back down.
@@ -1443,6 +1597,7 @@ mod tests {
     #[test]
     fn the_top_of_a_long_history_is_laid_out_alone() {
         let mut b = Both::new();
+        b.room_past_the_scrollback();
         b.feed(sample(4000).as_bytes());
         let kept = b.history();
         let read = b.pane.text(Some(kept + ROWS as usize));
@@ -1457,10 +1612,11 @@ mod tests {
         assert_eq!(b.pane.text(Some(kept + ROWS as usize)), read);
         assert_eq!(b.pane.scrollback_ansi().unwrap(), saved);
         assert_eq!(b.history(), kept);
-        // Output keeps the view on its text.
+        // Output keeps the view on its text, and the rows it pushed past the scrollback until
+        // the next move.
         b.feed(b"one more\r\nand another\r\n");
         assert_eq!(view(&b.term().term), view(&b.reference));
-        assert!((kept - 20..=SCROLLBACK).contains(&b.history()));
+        assert_eq!(b.history(), kept + 2);
         for _ in 0..3 {
             b.pane.scroll_page(false);
             b.reference.scroll_display(Scroll::PageDown);

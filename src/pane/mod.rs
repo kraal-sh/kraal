@@ -588,6 +588,12 @@ impl Pane {
         self.term().is_some_and(|t| !t.output.is_empty())
     }
 
+    /// Whether the output of the pane's program was all taken: its reader saw the end, and
+    /// nothing waits. Always for a pane that is no terminal.
+    pub fn output_finished(&self) -> bool {
+        self.term().is_none_or(|t| t.output.finished())
+    }
+
     /// Flush a synchronized update whose timeout expired: the signals of what it held (replies
     /// to queries are sent to the program right away), or None when nothing was due.
     pub fn poll_sync_timeout(&mut self) -> Option<Vec<PaneSignal>> {
