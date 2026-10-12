@@ -258,6 +258,10 @@ impl Pane {
             if env.graphics.enabled() {
                 preview.set_graphics(env.graphics.clone());
             }
+            let tx = tx.clone();
+            preview.on_change(move || {
+                let _ = tx.try_send(Event::Wake);
+            });
             Content::Preview(Box::new(preview))
         } else {
             Content::Term(Box::new(TermPane::spawn(id, &spec, cols, rows, env, tx)?))

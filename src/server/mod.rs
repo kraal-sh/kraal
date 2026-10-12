@@ -1011,9 +1011,8 @@ impl Server {
     }
 
     /// Work that is looked at every tick and cannot wait: running runbooks and hooks, edits,
-    /// tunnels and remote sessions, previews (their file changing), panes about to close,
-    /// conditions waited for, held input, and agents whose state is guessed from their screen
-    /// while they work.
+    /// tunnels and remote sessions, previews being read, panes about to close, conditions waited
+    /// for, held input, and agents whose state is guessed from their screen while they work.
     fn busy(&self) -> bool {
         !self.runs.is_empty()
             || !self.launching.is_empty()
@@ -1029,7 +1028,6 @@ impl Server {
             || self.hooks.busy()
             || self.panes.values().any(|p| {
                 p.close_at.is_some()
-                    || matches!(p.content, crate::pane::Content::Preview(_))
                     || (p.agent.kind.is_some()
                         && !p.agent.hooked
                         && matches!(
@@ -1051,17 +1049,13 @@ impl Server {
             self.reload_usage();
         }
         let mut changed = Vec::new();
-        let mut reloads = Vec::new();
         let mut ssh_seen = Vec::new();
         let mut ssh_ended = Vec::new();
         let mut read_contexts = false;
         let ids: Vec<PaneId> = self.panes.keys().copied().collect();
         for id in ids {
             let Some(pane) = self.panes.get_mut(&id) else { continue };
-            if let crate::pane::Content::Preview(p) = &mut pane.content {
-                if p.modified_since_load() && self.preview_loads.insert(id) {
-                    reloads.push((id, p.path().to_path_buf()));
-                }
+            if let crate::pane::Content::Preview(_) = &pane.content {
                 continue;
             }
             if pane.exit_code.is_some() {
@@ -1114,24 +1108,7 @@ impl Server {
             self.refresh_kube();
             self.refresh_tf_dirs();
         }
-        // Changed previews are read again off the event loop (images take a while to decode).
-        let images = self.env.graphics.enabled();
-        for (id, path) in reloads {
-            let started = self.background(
-                move || crate::preview::Loaded::read(&path, images),
-                move |server, loaded| {
-                    server.preview_loads.remove(&id);
-                    if let Some(crate::pane::Content::Preview(p)) = server.panes.get_mut(&id).map(|p| &mut p.content) {
-                        p.apply(loaded);
-                        server.mark_dirty();
-                    }
-                },
-            );
-            // No thread to read it: the next tick tries again.
-            if !started {
-                self.preview_loads.remove(&id);
-            }
-        }
+        self.check_previews();
         self.forget_ended_ssh(ssh_ended);
         self.save_buffers();
         self.tick_edits();
@@ -1203,6 +1180,38 @@ impl Server {
         }
     }
 
+    /// Read again, off the event loop (images take a while to decode), the previews whose file
+    /// changed since it was read, or that are to be read (just opened, `r`).
+    fn check_previews(&mut self) {
+        let reloads: Vec<(PaneId, PathBuf)> = self
+            .panes
+            .values()
+            .filter_map(|p| match &p.content {
+                crate::pane::Content::Preview(v) if v.modified_since_load() => Some((p.id, v.path().to_path_buf())),
+                _ => None,
+            })
+            .filter(|(id, _)| !self.preview_loads.contains(id))
+            .collect();
+        let images = self.env.graphics.enabled();
+        for (id, path) in reloads {
+            self.preview_loads.insert(id);
+            let started = self.background(
+                move || crate::preview::Loaded::read(&path, images),
+                move |server, loaded| {
+                    server.preview_loads.remove(&id);
+                    if let Some(crate::pane::Content::Preview(p)) = server.panes.get_mut(&id).map(|p| &mut p.content) {
+                        p.apply(loaded);
+                        server.mark_dirty();
+                    }
+                },
+            );
+            // No thread to read it: the next tick tries again.
+            if !started {
+                self.preview_loads.remove(&id);
+            }
+        }
+    }
+
     fn handle(&mut self, ev: Event) {
         match ev {
             Event::PaneReady(id) => {
@@ -1238,6 +1247,8 @@ impl Server {
             }
             Event::RemoteAgents(conn, list) => self.remote_list(conn, list),
             Event::Wake => {
+                // A preview's file changed, or a file listing is ready.
+                self.check_previews();
                 let mut changed = false;
                 for p in self.panes.values_mut() {
                     if let crate::pane::Content::Files(f) = &mut p.content {

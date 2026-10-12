@@ -3566,6 +3566,24 @@ fn a_preview_shows_its_image_as_each_terminal_can() {
     assert!(!seen.contains("\x1b_Ga=t") && !seen.contains("\x1bP0;1;0q") && !seen.contains('\u{10EEEE}'));
 }
 
+/// A preview follows its file, also when nothing else happens in the session.
+#[test]
+fn a_preview_follows_its_file_in_a_quiet_session() {
+    let env = Env::new("pfollow");
+    let notes = env.root.join("notes.txt");
+    std::fs::write(&notes, "first-version\n").unwrap();
+    env.workspace("w", &format!("layout {{\n    pane name=\"n\" preview=\"{}\"\n}}\n", notes.display()));
+    env.run(&["open", "w"]);
+    let client = RawClient::attach(&env, "w");
+    client.wait_for_screen("first-version");
+    // Long enough for the server to be idle.
+    std::thread::sleep(Duration::from_secs(4));
+    std::fs::write(&notes, "second-version\n").unwrap();
+    let start = Instant::now();
+    client.wait_for_screen("second-version");
+    assert!(start.elapsed() < Duration::from_secs(3), "shown after {:?}", start.elapsed());
+}
+
 /// Drive the agent of pane `pane` in `env`'s session through Claude's hooks.
 fn claude_hook(env: &Env, pane: &str, payload: &str) {
     use std::io::Write;
