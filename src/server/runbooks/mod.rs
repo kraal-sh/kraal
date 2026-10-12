@@ -20,7 +20,6 @@ use crate::paths;
 use crate::protocol::Placement;
 use crate::runbooks::{self, Block, Body, On, Runbook, Source, Steps};
 use crate::servers;
-use crate::shell;
 
 /// Where one copy of a runbook runs.
 #[expect(
@@ -337,8 +336,8 @@ impl Server {
     /// Edit a runbook file in a floating pane.
     pub(super) fn edit_runbook(&mut self, client: ClientId, path: &Path) {
         let Some(ws) = self.clients.get(&client).map(|c| c.workspace) else { return };
-        let cmd = format!("${{EDITOR:-vi}} {}", shell::quote(&path.display().to_string()));
-        let spec = PaneSpec { command: vec!["sh".into(), "-c".into(), cmd], close_on_exit: true, ..Default::default() };
+        let spec =
+            PaneSpec { command: crate::edit::editor_argv(path, None), close_on_exit: true, ..Default::default() };
         let name = path.file_name().map(|n| n.to_string_lossy().into_owned());
         if let Err(e) = self.spawn_pane_in(ws, None, spec, Placement::Floating, name) {
             self.toast(client, format!("{e:#}"));

@@ -475,9 +475,7 @@ impl Server {
             self.toast(id, format!("{e:#}"));
             return;
         }
-        let editor = std::env::var("VISUAL").or_else(|_| std::env::var("EDITOR")).unwrap_or_else(|_| "vi".into());
-        let mut command: Vec<String> = editor.split_whitespace().map(String::from).collect();
-        command.push(path.display().to_string());
+        let command = crate::edit::editor_argv(&path, None);
         let Some(ws) = self.clients.get(&id).map(|c| c.workspace) else { return };
         let spec = PaneSpec { command, close_on_exit: true, ..Default::default() };
         if let Err(e) = self.spawn_pane_in(ws, None, spec, Placement::Floating, Some("servers.toml".into())) {

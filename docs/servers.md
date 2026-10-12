@@ -27,7 +27,7 @@ it in the group `discovered`.
 kraal servers                          # everything kraal knows, with where it comes from
 kraal servers add admin@db.lan:2222 --name db --group prod
 kraal servers import                   # copy the servers of your workspace files into the inventory
-kraal servers edit                     # open servers.toml in $EDITOR
+kraal servers edit                     # open servers.toml in $VISUAL or $EDITOR
 kraal ssh db                           # plain ssh, resolved from the inventory
 kraal ssh prod --group                 # every server of "prod" in a grid of panes
 ```
@@ -65,9 +65,9 @@ replace is never replaced, even if it appears during the copy: that copy then wa
 (a move's, the only copy of what it moved, is named instead); a directory is put in place by a
 rename that keeps it whole (owner, permissions, ACLs), which on a server takes GNU coreutils 8.30
 or later: elsewhere such a copy says so before it starts), `m` moves, `d` deletes, `enter`
-opens a directory or previews a local file, `e` edits a file in your `$EDITOR` (a server's too,
-see below), `s` opens a shell there, `/` filters. Selected files carry a ✓. Transfers run in a
-small window that closes itself when done.
+opens a directory or previews a local file, `e` edits a file in your `$VISUAL` or `$EDITOR` (a
+server's too, see below), `s` opens a shell there, `/` filters. Selected files carry a ✓.
+Transfers run in a small window that closes itself when done.
 
 Drop a file from your file manager on an SSH pane and kraal offers to upload it to that server
 (`ctrl+p` pastes the path instead). `ctrl+b S d` downloads a path from the pane's server
@@ -76,7 +76,7 @@ Drop a file from your file manager on an SSH pane and kraal offers to upload it 
 ## Editing a file on a server
 
 ```sh
-kraal edit db:/etc/app.conf            # in your $EDITOR, in a floating pane
+kraal edit db:/etc/app.conf            # in your $VISUAL or $EDITOR, in a floating pane
 kraal edit db:app/.env --line 12       # a path relative to the home directory there
 kraal edit db:/etc/nginx/nginx.conf --sudo   # as root, through sudo there
 ```

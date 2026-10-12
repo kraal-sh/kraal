@@ -234,8 +234,8 @@ pub enum Cmd {
     },
     /// Open a two-panel file manager: `kraal files ~/Dev db:/var/log`.
     Files { left: Option<String>, right: Option<String> },
-    /// Edit a server's file in your $EDITOR, in a floating pane of kraal; each save goes back to
-    /// the server: `kraal edit db:/etc/app.conf`.
+    /// Edit a server's file in your $VISUAL or $EDITOR, in a floating pane of kraal; each save
+    /// goes back to the server: `kraal edit db:/etc/app.conf`.
     Edit {
         /// SERVER:PATH (a path relative to the home directory there, or absolute).
         target: String,
@@ -499,7 +499,7 @@ pub enum AccountsCmd {
         #[arg(long, value_parser = ["notify", "ask", "auto"])]
         mode: Option<String>,
     },
-    /// Edit accounts.toml (accounts, rules, limits) in $EDITOR.
+    /// Edit accounts.toml (accounts, rules, limits) in $VISUAL or $EDITOR.
     Edit,
 }
 
@@ -541,7 +541,7 @@ pub enum RunbookCmd {
         #[arg(long)]
         repo: bool,
     },
-    /// Open a runbook in $EDITOR.
+    /// Open a runbook in $VISUAL or $EDITOR.
     Edit { name: String },
 }
 
@@ -579,7 +579,7 @@ pub enum ServersCmd {
     Rm { name: String },
     /// Copy the servers found in your workspace files into the inventory.
     Import,
-    /// Open the inventory in $EDITOR.
+    /// Open the inventory in $VISUAL or $EDITOR.
     Edit,
 }
 

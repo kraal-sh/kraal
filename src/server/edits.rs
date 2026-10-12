@@ -3,7 +3,7 @@
 //! meanwhile (see `crate::edit` for what runs there). Reading and writing files, here and on the
 //! server, happens in background jobs: a slow disk or server never stops the event loop.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -105,16 +105,6 @@ enum Checked {
     KeepFailed(std::io::Error),
     /// Its content went to the server.
     Sent(Vec<u8>, anyhow::Result<Saved>),
-}
-
-/// `$EDITOR` (vi without one) on `path`, at `line`: what an editor's pane runs.
-pub(super) fn editor_command(path: &Path, line: Option<u32>) -> Vec<String> {
-    let mut command = vec!["sh".to_string(), "-c".into(), "exec ${EDITOR:-vi} \"$@\"".into(), "kraal-edit".into()];
-    if let Some(line) = line {
-        command.push(format!("+{line}"));
-    }
-    command.push(path.display().to_string());
-    command
 }
 
 /// A name as shown in one line: control characters as `?`.
@@ -337,7 +327,7 @@ impl Server {
     /// The editor on the private copy of the file, in a floating pane.
     fn open_editor(&mut self, client: Option<ClientId>, target: EditTarget, ready: Ready) -> anyhow::Result<PaneId> {
         let Ready { channel, opened, dir, local } = ready;
-        let command = editor_command(&local, target.line);
+        let command = edit::editor_argv(&local, target.line);
         // It ends with the editor, and does not come back after a restart (nor do transfer
         // windows): its copy is gone by then.
         let spec = PaneSpec {

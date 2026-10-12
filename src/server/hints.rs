@@ -136,12 +136,8 @@ impl Server {
                     return Ok(self.edit_hinted(id, pane, server, &m.text));
                 }
                 let (file, line) = hints::split_line(&m.text);
-                let file = match file.strip_prefix("~/") {
-                    Some(rest) => format!("\"$HOME\"/{}", shell::quote(rest)),
-                    None => shell::quote(file),
-                };
-                let at = line.map(|l| format!(" +{l}")).unwrap_or_default();
-                self.run_here(id, pane, "edit", format!("${{EDITOR:-vi}}{at} {file}"), &m.text)?;
+                let editor = crate::edit::editor_argv(&crate::paths::expand_tilde(file), line);
+                self.run_here(id, pane, "edit", shell::join(&editor), &m.text)?;
             }
             Kind::Hash => {
                 let h = shell::quote(&m.text);
