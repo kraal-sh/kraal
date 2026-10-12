@@ -33,6 +33,7 @@ mod worktrees;
 use std::collections::HashMap;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -421,6 +422,8 @@ pub struct Server {
     preview_loads: std::collections::HashSet<PaneId>,
     /// The thread that writes the session state.
     persister: Sender<persistence::Persist>,
+    /// What that thread and the event loop share beside the jobs.
+    persisting: Arc<Mutex<persistence::Persisting>>,
     /// What is saved of each pane's scrollback.
     pub scrollback: HashMap<PaneId, persist::SavedScrollback>,
     /// Starts the names of the scrollback files this server makes, so that none is a file an
@@ -488,6 +491,7 @@ pub fn run(session: &str) -> Result<()> {
 
     let (tx, rx) = crossbeam_channel::bounded::<Event>(4096);
     let persist_tx = tx.clone();
+    let persisting = Arc::new(Mutex::new(persistence::Persisting::default()));
     let logs_tx = tx.clone();
     {
         let tx = tx.clone();
@@ -603,7 +607,8 @@ pub fn run(session: &str) -> Result<()> {
         edits: Vec::new(),
         preview_loads: Default::default(),
         pending_opens: Vec::new(),
-        persister: spawn_persister(persist_tx),
+        persister: spawn_persister(persist_tx, persisting.clone()),
+        persisting,
         scrollback: HashMap::new(),
         scrollback_tag: format!("{}-{}", crate::accounts::now(), std::process::id()),
         run_logs: {
@@ -943,7 +948,7 @@ impl Server {
         }
         self.save_scrollback(false);
         if self.persist_dirty || self.last_persist.elapsed() > Duration::from_secs(30) {
-            self.persist();
+            self.persist_unless_writing();
         }
         if self.last_def_scan.elapsed() > Duration::from_secs(5) {
             self.scan_definitions();
@@ -1140,16 +1145,17 @@ impl Server {
         let saved = match self.persister.send(persistence::Persist::Stop(done)) {
             Ok(()) => written
                 .recv_timeout(Duration::from_secs(10))
-                .unwrap_or_else(|_| Err("its writer did not finish in time".into())),
-            Err(_) => Err("its writer is gone".into()),
+                .unwrap_or_else(|_| Err("the layout could not be saved: its writer did not finish in time".into())),
+            Err(_) => Err("the layout could not be saved: its writer is gone".into()),
         };
         if let Err(e) = &saved {
-            eprintln!("kraal: the session state was not saved: {e}");
+            eprintln!("kraal: {e}");
         }
-        // `kraal kill` says whether this last state, the one a restart brings back, is saved.
+        // `kraal kill` says whether this last state, the one a restart brings back, is saved,
+        // and what each pane showed.
         let answer = match saved {
             Ok(()) => Ok(crate::protocol::Response::Ok),
-            Err(e) => Ok(crate::protocol::Response::Text(format!("the layout could not be saved: {e}"))),
+            Err(e) => Ok(crate::protocol::Response::Text(e)),
         };
         for id in std::mem::take(&mut self.kill_waiters) {
             self.send_msg(id, &ServerMsg::Response { result: answer.clone() });

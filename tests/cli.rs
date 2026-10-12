@@ -1111,6 +1111,37 @@ fn scrollback_survives_a_server_restart() {
     assert!(!dir.exists());
 }
 
+/// A pane whose scrollback could not be written is saved again once it can be, though it
+/// printed nothing since; `kraal kill` says when it still cannot be.
+#[test]
+fn scrollback_that_could_not_be_written_is_saved_later() {
+    let env = Env::new("scrollfail");
+    env.workspace("w", "layout {\n    pane name=\"shell\"\n}\n");
+    // A file where the session's scrollback directory goes: nothing can be written there.
+    let dir = env.root.join("state/kraal/scrollback/scrollfail");
+    std::fs::create_dir_all(dir.parent().unwrap()).unwrap();
+    std::fs::write(&dir, "in the way").unwrap();
+    env.run(&["open", "w"]);
+    env.run(&["send", "-p", "shell", "--enter", "echo once-$((5*5))"]);
+    env.wait_for_text("shell", "once-25");
+    // Long enough for a save of everything it printed to be tried, and to fail.
+    std::thread::sleep(Duration::from_secs(11));
+    assert!(std::fs::read_to_string(env.state_file()).unwrap().contains(".ans\""), "the state names its file");
+    std::fs::remove_file(&dir).unwrap();
+    env.run(&["kill"]);
+    env.run(&["open", "w"]);
+    let screen = env.run(&["read", "-p", "shell"]);
+    assert!(screen.contains("once-25") && screen.contains("kraal: restored from"), "{screen}");
+    // Still impossible when the server stops: said.
+    std::fs::rename(&dir, env.root.join("aside")).unwrap();
+    std::fs::write(&dir, "in the way").unwrap();
+    env.run(&["send", "-p", "shell", "--enter", "echo twice-$((6*6))"]);
+    env.wait_for_text_since_restore("shell", "twice-36");
+    let out = env.try_run(&["kill"]);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success() && err.contains("the scrollback of a pane could not be saved"), "{err}");
+}
+
 /// A server that dies without stopping (a crash) saved what its panes showed shortly before.
 #[cfg(target_os = "linux")]
 #[test]

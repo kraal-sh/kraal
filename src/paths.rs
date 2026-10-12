@@ -172,6 +172,75 @@ pub fn write_private(path: &Path, data: &[u8]) -> std::io::Result<()> {
     write_with_mode(path, data, 0o600)
 }
 
+/// Make the names created, renamed or removed in `dir` survive a crash of the machine, as far
+/// as its file system allows (some cannot sync a directory).
+pub fn sync_dir(dir: &Path) {
+    if let Ok(d) = std::fs::File::open(dir) {
+        let _ = d.sync_all();
+    }
+}
+
+/// Remove the regular files of ours in `dir` whose names `remove` picks, through the directory
+/// as opened: a link in its place (to a directory elsewhere) is refused, and so is a directory
+/// that is not ours, and a link or directory in it is left alone. How many files are left.
+pub fn remove_files_in(dir: &Path, remove: impl Fn(&str) -> bool) -> std::io::Result<usize> {
+    use std::ffi::CStr;
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    let d = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW).open(dir)?;
+    // SAFETY: getuid cannot fail.
+    let uid = unsafe { libc::getuid() };
+    if d.metadata()?.uid() != uid {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!("{} is not a directory owned by you", dir.display()),
+        ));
+    }
+    let fd = d.as_raw_fd();
+    let mut names = Vec::new();
+    // SAFETY: the copy of the descriptor belongs to the stream, which closedir closes; each
+    // entry is read before the next call to readdir.
+    unsafe {
+        let copy = libc::dup(fd);
+        if copy < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let stream = libc::fdopendir(copy);
+        if stream.is_null() {
+            libc::close(copy);
+            return Err(std::io::Error::last_os_error());
+        }
+        loop {
+            let entry = libc::readdir(stream);
+            if entry.is_null() {
+                break;
+            }
+            names.push(CStr::from_ptr((*entry).d_name.as_ptr()).to_owned());
+        }
+        libc::closedir(stream);
+    }
+    let mut left = 0;
+    for name in names {
+        let text = name.to_string_lossy();
+        if text == "." || text == ".." {
+            continue;
+        }
+        // SAFETY: `st` is ours to fill; the name is looked up in `fd`, links not followed.
+        let ours = unsafe {
+            let mut st: libc::stat = std::mem::zeroed();
+            libc::fstatat(fd, name.as_ptr(), &mut st, libc::AT_SYMLINK_NOFOLLOW) == 0
+                && st.st_mode & libc::S_IFMT == libc::S_IFREG
+                && st.st_uid == uid
+        };
+        // SAFETY: removes that name from `fd`, never a directory.
+        let removed = ours && remove(&text) && unsafe { libc::unlinkat(fd, name.as_ptr(), 0) } == 0;
+        if !removed {
+            left += 1;
+        }
+    }
+    Ok(left)
+}
+
 /// Write a file atomically, keeping the permissions it has (0644 when it is new): the user's
 /// configuration files.
 pub fn write_atomic(path: &Path, data: &[u8]) -> std::io::Result<()> {

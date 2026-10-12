@@ -19,6 +19,8 @@ pub const MAX_SAVED_BYTES: usize = 4 << 20;
 const MAX_WRAPPED_ROWS: i32 = 1000;
 /// Links longer than this are saved as plain text.
 const MAX_LINK: usize = 2048;
+/// Zero-width characters saved with a cell: more only lengthen a sequence no terminal draws.
+const MAX_ZEROWIDTH: usize = 16;
 
 /// The attributes saved with the text, and their SGR parameters.
 const ATTRIBUTES: [(Flags, &str); 11] = [
@@ -71,7 +73,8 @@ impl Pane {
             Some(at) => format!("kraal: restored from {}", crate::text::local_minutes(at)),
             None => "kraal: restored".to_string(),
         };
-        bytes.extend_from_slice(format!("\x1b[0m\r\n\x1b[2m{marker}\x1b[0m\r\n").as_bytes());
+        // A link a damaged file left open ends here too: SGR 0 does not end it.
+        bytes.extend_from_slice(format!("\x1b]8;;\x1b\\\x1b[0m\r\n\x1b[2m{marker}\x1b[0m\r\n").as_bytes());
         t.advance(&bytes);
         // Nothing in it asks for an answer: whatever the emulator made of it is not the program's.
         t.events.borrow_mut().clear();
@@ -113,7 +116,9 @@ fn marker_row<T>(term: &Term<T>, marker: &str) -> Option<i32> {
 
 /// The text of `term`'s primary grid, history first, up to its last line with something on it:
 /// lines separated by CR LF, each starting and ending with default attributes, at most
-/// `max_bytes` of the newest.
+/// `max_bytes` of the newest. Never more than a few times `max_bytes` is encoded to find them,
+/// and something always shows in it when something shows in `term`: a newest line too long to
+/// fit is cut to its end.
 fn encode<T>(term: &Term<T>, max_bytes: usize) -> Vec<u8> {
     let grid = term.grid();
     let cols = grid.columns();
@@ -132,12 +137,20 @@ fn encode<T>(term: &Term<T>, max_bytes: usize) -> Vec<u8> {
             start -= 1;
         }
         let rows: Vec<&[Cell]> = (start..=end).map(|l| &grid[Line(l)][..]).collect();
-        let line = encode_line(&rows);
-        size += line.len() + 2;
-        if size > max_bytes {
-            break;
+        // Each line but the newest ends with CR LF.
+        let room = max_bytes.saturating_sub(size + if lines.is_empty() { 0 } else { 2 });
+        match encode_line(&rows, room) {
+            Some(line) => {
+                size += line.len() + if lines.is_empty() { 0 } else { 2 };
+                lines.push(line);
+            }
+            None => {
+                if lines.is_empty() {
+                    lines.push(line_end(&rows, room));
+                }
+                break;
+            }
         }
-        lines.push(line);
         end = start - 1;
     }
     lines.reverse();
@@ -145,14 +158,56 @@ fn encode<T>(term: &Term<T>, max_bytes: usize) -> Vec<u8> {
 }
 
 /// One line of text, over the rows it wraps on: all of each row but the last, which ends at its
-/// last cell with something in it.
-fn encode_line(rows: &[&[Cell]]) -> Vec<u8> {
+/// last cell with something in it. None as soon as it takes more than `limit` bytes.
+fn encode_line(rows: &[&[Cell]], limit: usize) -> Option<Vec<u8>> {
+    encode_rows(rows, true, limit)
+}
+
+/// The end of a line that takes more than `limit` bytes: its last rows that fit, or else the
+/// end of its last row's text alone.
+fn line_end(rows: &[&[Cell]], limit: usize) -> Vec<u8> {
+    // A row saved alone starts and ends with default attributes: it takes at least what it
+    // takes among the rows around it, so rows that fit one by one fit together.
+    let mut from = rows.len();
+    let mut size = 0;
+    while from > 0 {
+        let last = from == rows.len();
+        let Some(row) = encode_rows(&rows[from - 1..from], last, limit - size) else { break };
+        size += row.len();
+        from -= 1;
+    }
+    while from < rows.len() {
+        if let Some(line) = encode_line(&rows[from..], limit) {
+            return line;
+        }
+        from += 1;
+    }
+    let mut text = Vec::new();
+    let row = rows[rows.len() - 1];
+    for cell in &row[..visible(row).0] {
+        if !cell.flags.intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER) {
+            push_cell_text(&mut text, cell, cell.c == crate::graphics::PLACEHOLDER);
+        }
+    }
+    let mut cut = text.len().saturating_sub(limit);
+    // Not inside a character.
+    while cut < text.len() && text[cut] & 0xc0 == 0x80 {
+        cut += 1;
+    }
+    text.split_off(cut)
+}
+
+/// [`encode_line`] over `rows`, the last one whole unless `trim_last`.
+fn encode_rows(rows: &[&[Cell]], trim_last: bool, limit: usize) -> Option<Vec<u8>> {
     let mut out = Vec::new();
     let mut pen = Pen::plain();
     let mut link: Option<Hyperlink> = None;
     for (i, row) in rows.iter().enumerate() {
-        let (count, fill) = if i + 1 < rows.len() { (row.len(), None) } else { visible(row) };
+        let (count, fill) = if i + 1 < rows.len() || !trim_last { (row.len(), None) } else { visible(row) };
         for cell in &row[..count] {
+            if out.len() > limit {
+                return None;
+            }
             if cell.flags.intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER) {
                 continue;
             }
@@ -172,10 +227,7 @@ fn encode_line(rows: &[&[Cell]]) -> Vec<u8> {
                 p.write(&mut out);
                 pen = p;
             }
-            push_char(&mut out, if image || cell.c == '\t' || cell.c.is_control() { ' ' } else { cell.c });
-            for z in cell.zerowidth().filter(|_| !image).unwrap_or_default() {
-                push_char(&mut out, *z);
-            }
+            push_cell_text(&mut out, cell, image);
         }
         // A row filled to its edge with a colour: an erase fills it again, whatever the width.
         if let Some(bg) = fill {
@@ -196,7 +248,7 @@ fn encode_line(rows: &[&[Cell]]) -> Vec<u8> {
     if pen != Pen::plain() {
         out.extend_from_slice(b"\x1b[0m");
     }
-    out
+    (out.len() <= limit).then_some(out)
 }
 
 /// How many cells of the last row of a line are saved, and the colour its end is filled with,
@@ -217,6 +269,14 @@ fn visible(row: &[Cell]) -> (usize, Option<Color>) {
     match row.get(text) {
         Some(first) if first.bg != default_bg && row[text..].iter().all(|c| c.bg == first.bg) => (text, Some(first.bg)),
         _ => (end, None),
+    }
+}
+
+/// A cell's character and what combines with it; blank for an image's.
+fn push_cell_text(out: &mut Vec<u8>, cell: &Cell, image: bool) {
+    push_char(out, if image || cell.c == '\t' || cell.c.is_control() { ' ' } else { cell.c });
+    for z in cell.zerowidth().filter(|_| !image).unwrap_or_default().iter().take(MAX_ZEROWIDTH) {
+        push_char(out, *z);
     }
 }
 
@@ -517,6 +577,42 @@ mod tests {
     }
 
     #[test]
+    fn a_newest_line_too_long_to_save_keeps_its_end() {
+        let mut t = term(10, 5, 1000);
+        feed(&mut t, b"older\r\n");
+        // One line over 51 rows, each cell a link of its own: about 500 KiB once encoded.
+        let mut line = String::new();
+        for i in 0..500 {
+            line.push_str(&format!("\x1b]8;;https://example.org/{i}/{}\x1b\\{}", "x".repeat(1000), i % 10));
+        }
+        line.push_str("\x1b]8;;\x1b\\END");
+        feed(&mut t, line.as_bytes());
+        let limit = 100_000;
+        let saved = encode(&t, limit);
+        assert!(!saved.is_empty(), "the pane's text is not saved as nothing");
+        assert!(saved.len() <= limit, "{}", saved.len());
+        let mut after = term(10, 5, 1000);
+        feed(&mut after, &clean(&saved, 1000));
+        let text = logical_lines(&after);
+        assert!(text.ends_with("789END\n") && !text.contains("older"), "{text:?}");
+        assert!(cell_at(&after, "END").hyperlink().is_none());
+        // Even a single row too long for the limit keeps the end of its text.
+        let mut wide = term(40, 3, 10);
+        feed(&mut wide, "\x1b[31mabcdefghij\x1b[0m klmnopqrstuvwxyz 日本".as_bytes());
+        assert_eq!(String::from_utf8(encode(&wide, 9)).unwrap(), "yz 日本");
+    }
+
+    #[test]
+    fn a_cell_saves_a_bounded_number_of_combining_characters() {
+        let mut t = term(10, 3, 10);
+        let combining: String = std::iter::repeat_n('\u{301}', 5000).collect();
+        feed(&mut t, format!("e{combining}x").as_bytes());
+        let saved = String::from_utf8(encode(&t, MAX_SAVED_BYTES)).unwrap();
+        assert_eq!(saved.chars().filter(|c| *c == '\u{301}').count(), MAX_ZEROWIDTH, "{}", saved.len());
+        assert!(saved.starts_with('e') && saved.ends_with('x'));
+    }
+
+    #[test]
     fn only_text_attributes_and_links_are_given_back() {
         let hostile = b"ok\x1b]0;title\x07\x1b[6n\x1b]52;c;aGk=\x07\x1b[?1049h\x1b[2J\x1bP$qm\x1b\\\x07\x1b[1;31mred\
                         \x1b[K\x1b[2K\x1b]8;;https://x.org\x1b\\l\x1b]8;;\x1b\\\x1b[>1u\x1bc";
@@ -620,6 +716,29 @@ mod tests {
         assert_eq!(pane.scrollback_ansi(), None);
         pane.feed(b"\x1b[?1049l");
         assert_eq!(pane.scrollback_ansi().as_deref(), Some(&b"shell text"[..]));
+        pane.kill();
+    }
+
+    #[test]
+    fn a_link_left_open_in_a_saved_file_ends_before_the_new_output() {
+        let (tx, _rx) = crossbeam_channel::bounded(64);
+        let env = PaneEnv {
+            socket: "/nonexistent".into(),
+            session: "t".into(),
+            shell: "sh".into(),
+            scrollback: 100,
+            graphics: Default::default(),
+        };
+        let spec = PaneSpec { command: vec!["sleep".into(), "5".into()], ..Default::default() };
+        let mut pane = Pane::spawn(1, None, spec, 60, 4, &env, &tx).unwrap();
+        assert!(pane.restore_scrollback(b"\x1b]8;;https://example.org\x1b\\old", Some(0), 100));
+        pane.feed(b"new");
+        let t = pane.term().unwrap();
+        assert!(t.term.grid()[Line(0)][Column(0)].hyperlink().is_some(), "the saved link is kept");
+        assert_eq!(screen::row_text(&t.term, Line(2)), "new");
+        for line in 1..3 {
+            assert!(t.term.grid()[Line(line)][Column(0)].hyperlink().is_none(), "row {line} has the saved link");
+        }
         pane.kill();
     }
 }

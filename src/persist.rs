@@ -9,7 +9,7 @@
 //! session's scrollback directory, named by the state and given back to the pane replacing it.
 
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use anyhow::{Context, Result};
@@ -85,6 +85,8 @@ pub struct SavedScrollback {
     pub file: Option<String>,
     /// When it was read from the pane: output since is not in it.
     pub taken: Instant,
+    /// Writing it failed: it is saved again, whether the pane printed since or not.
+    pub retry: bool,
 }
 
 pub fn snapshot(server: &Server) -> SessionSnapshot {
@@ -158,25 +160,41 @@ pub fn snapshot(server: &Server) -> SessionSnapshot {
     }
 }
 
+/// Write the state, in place once a crash of the machine cannot undo it (and so the scrollback
+/// files it names before it, which are written first).
 pub fn save(session: &str, snap: &SessionSnapshot) -> Result<()> {
     let path = paths::session_state_path(session);
-    if let Some(dir) = path.parent() {
-        paths::ensure_private_dir(dir)?;
-    }
+    let dir = path.parent().context("no directory for the state")?;
+    durable_dir(dir)?;
     paths::write_private(&path, &serde_json::to_vec_pretty(snap)?)?;
+    paths::sync_dir(dir);
     Ok(())
 }
 
-/// Write a pane's scrollback, as [`crate::pane::Pane::scrollback_ansi`] gives it.
+/// Write a pane's scrollback, as [`crate::pane::Pane::scrollback_ansi`] gives it, in place once
+/// a crash of the machine cannot undo it: before the state names it.
 pub fn save_scrollback(session: &str, file: &str, text: &[u8]) -> Result<()> {
     let dir = paths::scrollback_dir(session);
-    paths::ensure_private_dir(&dir)?;
+    durable_dir(&dir)?;
     paths::write_private(&dir.join(file), text)?;
+    paths::sync_dir(&dir);
+    Ok(())
+}
+
+/// [`paths::ensure_private_dir`], each directory it makes recorded in its parent for good.
+fn durable_dir(dir: &Path) -> Result<()> {
+    let missing: Vec<&Path> = dir.ancestors().take_while(|d| !d.as_os_str().is_empty() && !d.exists()).collect();
+    paths::ensure_private_dir(dir)?;
+    for made in missing.iter().rev() {
+        if let Some(parent) = made.parent() {
+            paths::sync_dir(parent);
+        }
+    }
     Ok(())
 }
 
 /// The scrollback files `snap` names.
-fn scrollback_files(snap: &SessionSnapshot) -> HashSet<&str> {
+pub fn scrollback_files(snap: &SessionSnapshot) -> HashSet<&str> {
     fn walk<'a>(n: &'a NodeSnap, out: &mut HashSet<&'a str>) {
         match n {
             NodeSnap::Pane(p) => out.extend(p.scrollback.as_deref()),
@@ -196,16 +214,33 @@ fn scrollback_files(snap: &SessionSnapshot) -> HashSet<&str> {
 /// Delete the scrollback files of `session` that `snap`, just written, does not name: those of
 /// panes closed since, and of writes cut short.
 pub fn clean_scrollback(session: &str, snap: &SessionSnapshot) {
-    let dir = paths::scrollback_dir(session);
-    let Ok(entries) = std::fs::read_dir(&dir) else { return };
+    clean_scrollback_in(&paths::scrollback_dir(session), snap);
+}
+
+/// [`clean_scrollback`] in `dir`: only files kraal makes there, and never through a link that
+/// stands in its place (with files of another directory).
+fn clean_scrollback_in(dir: &Path, snap: &SessionSnapshot) {
     let keep = scrollback_files(snap);
-    for e in entries.flatten() {
-        if !keep.contains(e.file_name().to_string_lossy().as_ref()) {
-            let _ = std::fs::remove_file(e.path());
-        }
-    }
     // Gone once nothing is left in it.
-    let _ = std::fs::remove_dir(&dir);
+    if matches!(paths::remove_files_in(dir, |name| made_by_kraal(name) && !keep.contains(name)), Ok(0)) {
+        let _ = std::fs::remove_dir(dir);
+    }
+}
+
+/// Whether kraal names a file so in a scrollback directory: a pane's text
+/// (`<time>-<pid>-<pane>.ans`), or one being written (`.<that name>.<pid>.<n>.tmp`).
+fn made_by_kraal(name: &str) -> bool {
+    let number = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    if let Some(stem) = name.strip_suffix(".ans") {
+        let parts: Vec<&str> = stem.split('-').collect();
+        return parts.len() == 3 && parts.iter().all(|p| number(p));
+    }
+    let Some(inner) = name.strip_prefix('.').and_then(|n| n.strip_suffix(".tmp")) else { return false };
+    let mut parts = inner.rsplitn(3, '.');
+    match (parts.next(), parts.next(), parts.next()) {
+        (Some(n), Some(pid), Some(file)) => number(n) && number(pid) && !file.starts_with('.') && made_by_kraal(file),
+        _ => false,
+    }
 }
 
 /// Delete all that is saved of the panes' scrollback of `session`. Whether there was any.
@@ -436,7 +471,8 @@ fn restore_scrollback(server: &mut Server, id: PaneId, p: &PaneSnap) {
     if pane.restore_scrollback(&text, saved_at, lines)
         && !server.scrollback.values().any(|s| s.file.as_deref() == Some(file))
     {
-        server.scrollback.insert(id, SavedScrollback { file: Some(file.to_string()), taken: Instant::now() });
+        let saved = SavedScrollback { file: Some(file.to_string()), taken: Instant::now(), retry: false };
+        server.scrollback.insert(id, saved);
     }
 }
 
@@ -516,5 +552,62 @@ mod tests {
         for bad in ["", "../x.ans", "a/b", ".hidden", "/etc/passwd"] {
             assert!(!scrollback_name(bad), "{bad}");
         }
+    }
+
+    #[test]
+    fn cleaning_up_deletes_only_what_kraal_wrote_in_its_own_directory() {
+        let root = std::env::temp_dir().join(format!("kraal-clean-scrollback-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let names = |snap_names: &[&str]| {
+            let mut snap: SessionSnapshot = serde_json::from_str(
+                r#"{"version":1,"workspaces":[{"name":"w","definition":null,"cwd":null,"active":0,"tabs":[
+                {"name":"","root":null,"floating":[],"focus":0,"show_floating":false,"zoomed":false,"sync":false}]}]}"#,
+            )
+            .unwrap();
+            for name in snap_names {
+                let pane = PaneSnap {
+                    name: None,
+                    spec: PaneSpec::default(),
+                    agent: None,
+                    agent_session: None,
+                    stopped: false,
+                    scrollback: Some(name.to_string()),
+                };
+                let rect = FloatRect { x: 0.0, y: 0.0, w: 1.0, h: 1.0 };
+                snap.workspaces[0].tabs[0].floating.push((pane, rect));
+            }
+            snap
+        };
+        // A link in place of the session's directory: what it leads to is not kraal's.
+        let elsewhere = root.join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        for f in ["notes.txt", "1-2-3.ans"] {
+            std::fs::write(elsewhere.join(f), "mine").unwrap();
+        }
+        let link = root.join("link");
+        std::os::unix::fs::symlink(&elsewhere, &link).unwrap();
+        clean_scrollback_in(&link, &names(&[]));
+        assert!(elsewhere.join("notes.txt").exists() && elsewhere.join("1-2-3.ans").exists());
+        assert!(link.exists());
+        // In its own directory: the files of panes gone and of writes cut short go, the others stay.
+        let dir = root.join("dir");
+        std::fs::create_dir_all(&dir).unwrap();
+        for f in ["1-2-3.ans", "4-5-6.ans", ".4-5-6.ans.77.0.tmp", "notes.txt", "x.ans", ".x.ans.1.2.tmp"] {
+            std::fs::write(dir.join(f), "text").unwrap();
+        }
+        std::os::unix::fs::symlink(elsewhere.join("1-2-3.ans"), dir.join("7-8-9.ans")).unwrap();
+        clean_scrollback_in(&dir, &names(&["1-2-3.ans"]));
+        let mut left: Vec<String> =
+            std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+        left.sort();
+        assert_eq!(left, [".x.ans.1.2.tmp", "1-2-3.ans", "7-8-9.ans", "notes.txt", "x.ans"]);
+        assert!(elsewhere.join("1-2-3.ans").exists(), "a link is not followed");
+        // Nothing left: the directory goes.
+        let empty = root.join("empty");
+        std::fs::create_dir_all(&empty).unwrap();
+        std::fs::write(empty.join("1-2-3.ans"), "text").unwrap();
+        clean_scrollback_in(&empty, &names(&[]));
+        assert!(!empty.exists());
+        std::fs::remove_dir_all(&root).unwrap();
     }
 }
