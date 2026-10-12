@@ -847,6 +847,13 @@ pub fn resolve(known: &[Known], spec: &str) -> Option<Server> {
     Some(Server { name: short_name(&probe.host), ..probe })
 }
 
+/// Whether `name`, given where another kind of name goes (a workspace's), reads as a server:
+/// `user@host`, or the name of a server kraal knows. Whoever gave it most likely meant the
+/// server.
+pub fn names_server(known: &[Known], name: &str) -> bool {
+    name.contains('@') || known.iter().any(|k| k.server.name == name)
+}
+
 /// Whether kraal knows `s`: an entry has its address, or `s` is a bare host that names an entry
 /// (ssh config aliases included).
 pub fn is_known(known: &[Known], s: &Server) -> bool {

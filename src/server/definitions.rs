@@ -79,8 +79,8 @@ impl Server {
             return Ok(ws.id);
         }
         let path = self.find_definition(name).with_context(|| {
-            let dirs: Vec<String> = self.config.workspace_dirs().iter().map(|d| paths::shorten_home(d)).collect();
-            format!("no workspace named {name:?} in {}", dirs.join(", "))
+            let names_server = crate::servers::names_server(&self.known_servers, name);
+            workspace::unknown(name, &self.config.workspace_dirs(), names_server)
         })?;
         self.open_definition(&path)
     }

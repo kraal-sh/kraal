@@ -1317,6 +1317,76 @@ fn unknown_panes_and_workspaces_are_errors() {
     assert!(String::from_utf8_lossy(&out.stderr).contains("no workspace named"));
 }
 
+/// A name given where a workspace's goes that names no workspace but reads as a server
+/// (`user@host`, or a server kraal knows) is answered with the command that was meant, and
+/// kraal attaches nowhere; any other name gets the plain answer. No session is started only to
+/// say that a name is unknown.
+#[test]
+fn a_server_given_where_a_workspace_goes_is_told_how_to_attach_to_it() {
+    let env = Env::new("hostname");
+    std::fs::write(env.root.join("config/kraal/servers.toml"), "[[server]]\nname = \"db\"\nhost = \"db.lan\"\n")
+        .unwrap();
+    let said = |name: &str| {
+        let out = env.try_run(&["open", name]);
+        assert!(!out.status.success(), "{name}");
+        String::from_utf8_lossy(&out.stderr).into_owned()
+    };
+    let meant = |name: &str| format!("; to attach to kraal on that server: kraal attach --host {name}");
+    let open_says = |when: &str| {
+        for name in ["fpa@anvil", "db"] {
+            let said = said(name);
+            assert!(said.contains(&format!("no workspace named {name:?} in ")), "{when}: {said}");
+            assert!(said.trim_end().ends_with(&meant(name)), "{when}: {said}");
+        }
+        let plain = said("nothing");
+        assert!(plain.contains("no workspace named \"nothing\" in ") && !plain.contains("--host"), "{when}: {plain}");
+    };
+
+    open_says("without a session");
+    assert_eq!(env.server_pid(), None, "a session was started only to say that a name is unknown");
+
+    // A session running: its server answers the same, and a terminal is not attached to it.
+    env.workspace("w", "layout {\n    pane name=\"shell\"\n}\n");
+    env.run(&["open", "w"]);
+    open_says("with a session");
+    let refused = RawClient::attach(&env, "fpa@anvil");
+    refused.wait_for_message(&meant("fpa@anvil"));
+    assert!(!refused.messages.lock().unwrap().iter().any(|m| m.contains("\"attached\"")));
+    // Any other unknown name attaches all the same, with the plain message.
+    let client = RawClient::attach(&env, "nothing");
+    client.wait_for_message("\"attached\"");
+    let rows = client.wait_for_row("no workspace named \"nothing\"");
+    assert!(!rows.iter().any(|r| r.contains("--host")), "{rows:?}");
+    // A workspace named like a server is a workspace.
+    env.workspace("db", "layout {\n    pane name=\"data\"\n}\n");
+    env.run(&["open", "db"]);
+    let named = RawClient::attach(&env, "db");
+    named.wait_for_message("\"attached\"");
+    named.wait_for_row("data");
+}
+
+/// `kraal attach fpa@anvil` and `kraal fpa@anvil`, typed for `kraal attach --host fpa@anvil`:
+/// the terminal gets the answer and is not attached to the local session, running or not.
+#[cfg(target_os = "linux")]
+#[test]
+fn attaching_to_a_server_given_as_a_workspace_says_what_was_meant() {
+    let env = Env::new("hostattach");
+    let forms: [&[&str]; 2] = [&["attach", "fpa@anvil"], &["fpa@anvil"]];
+    let check = |when: &str| {
+        for args in forms {
+            let shown = in_terminal(env.cmd(args), b"");
+            // Said in the terminal as it is: the screen is not taken and given back.
+            assert!(shown.starts_with("kraal: no workspace named \"fpa@anvil\" in "), "{when}, {args:?}: {shown:?}");
+            assert!(shown.contains("to attach to kraal on that server: kraal attach --host fpa@anvil"), "{shown}");
+        }
+    };
+    check("without a session");
+    assert_eq!(env.server_pid(), None, "a session was started only to say that a name is unknown");
+    env.workspace("w", "layout {\n    pane name=\"shell\"\n}\n");
+    env.run(&["open", "w"]);
+    check("with a session");
+}
+
 /// Outside a pane, a command that acts on a pane and is given none says how it takes one: the
 /// option for those that take an option, the argument for the one that takes an argument.
 #[test]

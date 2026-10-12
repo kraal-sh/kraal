@@ -163,6 +163,11 @@ the network drops, and its programs keep running on the server meanwhile:
 | `kraal attach --host db --pane api` | the same, showing that pane of the session first |
 | `kraal -s work attach --host deploy@db.lan:2222` | another session there, on a server named by its address |
 
+`--host` is what names another machine: without it, the name after `kraal attach`, `kraal` or
+`kraal open` is a workspace of this machine's session. When no workspace has that name and it
+reads as a server (`user@host`, or the name of a server kraal knows), kraal attaches nowhere and
+says what to type: for `kraal attach fpa@anvil`, `kraal attach --host fpa@anvil`.
+
 Attach from a terminal of your own: inside a kraal pane, `kraal attach` refuses to nest (the
 sidebar's agents and `alt+a` open such a tab for you, see below). Ctrl+click on a link in a
 remote session opens it on your machine. A `localhost` address there is

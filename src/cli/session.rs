@@ -9,8 +9,36 @@ use crate::protocol::{self, Request, Response};
 use crate::{client, config, paths, workspace};
 
 pub(super) fn attach(session: &str, workspace: Option<String>) -> Result<()> {
-    let cfg = config::Config::load().unwrap_or_default();
-    client::attach(client::Target::Local { session: session.to_string() }, workspace, cfg.mouse, || {})
+    let cfg = config::Config::load();
+    // A server's name where a workspace's goes: said without starting a session for it, as its
+    // server would say it.
+    if let (Some(name), Ok(cfg)) = (&workspace, &cfg)
+        && let Some((unknown, true)) = unknown_without_a_session(session, name, cfg)
+    {
+        bail!(unknown);
+    }
+    let mouse = cfg.unwrap_or_default().mouse;
+    client::attach(client::Target::Local { session: session.to_string() }, workspace, mouse, || {})
+}
+
+/// What to say of `name`, given where a workspace's name goes, and whether it reads as a
+/// server's, when no workspace can have that name and no session is there to say so: none runs
+/// and none is saved, so every workspace would come from a definition, and none defines it.
+/// `None` otherwise: the session's server knows its workspaces.
+fn unknown_without_a_session(session: &str, name: &str, cfg: &config::Config) -> Option<(String, bool)> {
+    // A runtime directory kraal refuses is refused where the session is reached, and comes
+    // first: no socket is looked for in it here.
+    paths::private_runtime_dir().ok()?;
+    let session_there = std::os::unix::net::UnixStream::connect(paths::socket_path(session)).is_ok()
+        || paths::session_state_path(session).exists();
+    let dirs = cfg.workspace_dirs();
+    let defined =
+        || dirs.iter().flat_map(|dir| workspace::load_dir(dir)).any(|(_, def)| def.is_ok_and(|def| def.name == name));
+    if session_there || defined() {
+        return None;
+    }
+    let names_server = crate::servers::names_server(&super::known_servers(cfg).unwrap_or_default(), name);
+    Some((workspace::unknown(name, &dirs, names_server), names_server))
 }
 
 /// `kraal kill`: stop the session's server (its layout is saved first).
@@ -86,6 +114,12 @@ pub(super) fn workspaces(s: &Session, json: bool) -> Result<()> {
 }
 
 pub(super) fn open(s: &Session, name: String) -> Result<()> {
+    // No session is started only to say that the name is unknown.
+    if let Ok(cfg) = config::Config::load()
+        && let Some((unknown, _)) = unknown_without_a_session(&s.name, &name, &cfg)
+    {
+        bail!(unknown);
+    }
     client::ensure_server(&s.name)?;
     s.request(Request::OpenWorkspace { name: name.clone() })?;
     println!("workspace {name} is open; `kraal attach {name}` to see it");
