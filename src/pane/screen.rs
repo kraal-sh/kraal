@@ -22,10 +22,14 @@ impl Pane {
             Content::Term(t) => {
                 if lines > 0 {
                     t.reveal(t.term.grid().display_offset() + lines as usize);
+                } else {
+                    t.reveal_below_view(lines.unsigned_abs() as usize);
                 }
                 t.term.scroll_display(Scroll::Delta(lines));
                 if t.term.grid().display_offset() == 0 {
                     t.settle();
+                } else if lines > 0 {
+                    t.went_up(self.search.is_some());
                 }
             }
             Content::Preview(p) => p.scroll(-lines),
@@ -38,8 +42,13 @@ impl Pane {
             Content::Term(t) => {
                 if up {
                     t.reveal(t.term.grid().display_offset() + t.term.screen_lines());
+                } else {
+                    t.reveal_below_view(t.term.screen_lines());
                 }
                 t.term.scroll_display(if up { Scroll::PageUp } else { Scroll::PageDown });
+                if up {
+                    t.went_up(self.search.is_some());
+                }
             }
             Content::Preview(p) => {
                 if up {
@@ -70,7 +79,7 @@ impl Pane {
     pub fn scroll_to_top(&mut self) {
         match &mut self.content {
             Content::Term(t) => {
-                t.reveal_all();
+                t.reveal_top();
                 t.term.scroll_display(Scroll::Top);
             }
             Content::Preview(p) => p.top(),
@@ -182,33 +191,44 @@ impl Pane {
 
     /// Move the copy-mode cursor, keeping it in view and extending the selection.
     pub fn vi_motion(&mut self, motion: ViMotion) {
+        let searching = self.search.is_some();
         if let Some(t) = self.term_mut() {
-            // A screen of history above the cursor, for the motion to go to.
+            // A screen of history above and below the cursor, for the motion to go to.
             let mut more = t.term.screen_lines();
             t.reveal((-t.term.vi_mode_cursor.point.line.0).max(0) as usize + more);
-            let (cursor, selection) = (t.term.vi_mode_cursor, t.term.selection.clone());
+            t.reveal_below(t.term.vi_mode_cursor.point.line, more);
             loop {
+                let (cursor, selection) = (t.term.vi_mode_cursor, t.term.selection.clone());
                 t.term.vi_motion(motion);
-                // Stopped at the top of what the emulator holds: the history goes on above.
-                if t.term.vi_mode_cursor.point.line > t.term.topmost_line()
-                    || !t.reveal(t.term.grid().history_size() + more)
-                {
+                let line = t.term.vi_mode_cursor.point.line;
+                if t.beyond_lens(line) {
+                    // Past the lines laid out far back: those after them come first.
+                    t.term.vi_mode_cursor = cursor;
+                    t.term.selection = selection;
+                    t.reveal_below(cursor.point.line, more * 4);
+                } else if line <= t.term.topmost_line() && t.reveal(t.term.grid().history_size() + more) {
+                    // Stopped at the top of what the emulator holds: the history goes on above.
+                    t.term.vi_mode_cursor = cursor;
+                    t.term.selection = selection;
+                } else {
                     break;
                 }
-                t.term.vi_mode_cursor = cursor;
-                t.term.selection = selection.clone();
                 more *= 4;
             }
             let point = t.term.vi_mode_cursor.point;
             t.term.scroll_to_point(point);
+            t.went_up(searching);
         }
     }
 
     /// Move the copy-mode cursor by whole screens or half screens (negative = up).
     pub fn vi_scroll(&mut self, lines: i32) {
+        let searching = self.search.is_some();
         if let Some(t) = self.term_mut() {
             if lines > 0 {
                 t.reveal(t.term.grid().display_offset() + lines as usize);
+            } else {
+                t.reveal_below_view(lines.unsigned_abs() as usize);
             }
             t.term.scroll_display(Scroll::Delta(lines));
             let screen = t.term.screen_lines() as i32;
@@ -216,6 +236,9 @@ impl Pane {
             let mut p = t.term.vi_mode_cursor.point;
             p.line = Line((p.line.0 - lines).clamp(-offset, screen - 1 - offset));
             t.term.vi_goto_point(p);
+            if lines > 0 {
+                t.went_up(searching);
+            }
         }
     }
 
@@ -223,12 +246,15 @@ impl Pane {
     pub fn vi_edge(&mut self, top: bool) {
         if let Some(t) = self.term_mut() {
             if top {
-                t.reveal_all();
+                t.reveal_top();
             }
             let line = if top { t.term.topmost_line() } else { t.term.bottommost_line() };
             let p = Point::new(line, Column(0));
             t.term.vi_goto_point(p);
             t.term.scroll_to_point(p);
+            if !top {
+                t.settle();
+            }
         }
     }
 
@@ -274,6 +300,9 @@ impl Pane {
     pub fn search_next(&mut self, older: bool) -> bool {
         let Content::Term(t) = &mut self.content else { return false };
         let Some(state) = &mut self.search else { return false };
+        // The history is searched whole on the grid: the view comes back far back when nothing
+        // matches.
+        let back = t.close_lens();
         // A match the text has since scrolled away with is no place to start from.
         let term = &t.term;
         let on_grid = |p: &Point| p.line >= term.topmost_line() && p.line <= term.bottommost_line();
@@ -308,7 +337,8 @@ impl Pane {
         // emulator's.
         let wrapped =
             round || found.as_ref().is_none_or(|m| if older { *m.start() > origin } else { *m.end() < origin });
-        if wrapped && let Some(lines) = archived_match(&t.archive.lines, &state.archived, older) {
+        let archived = wrapped.then(|| t.archived_match(&state.archived, older)).flatten();
+        if let Some(lines) = archived {
             t.reveal_lines(lines);
             // The line that matched is the first the emulator holds now: it alone is searched.
             let term = &mut t.term;
@@ -329,6 +359,9 @@ impl Pane {
         let term = &mut t.term;
         let Some(m) = found else {
             state.current = None;
+            if let Some(at) = back {
+                t.show_line(at);
+            }
             return false;
         };
         let mut sel = Selection::new(SelectionType::Simple, *m.start(), Side::Left);
@@ -362,7 +395,7 @@ impl Pane {
             Content::Term(t) => {
                 let grid = t.term.grid();
                 let screen = grid.screen_lines() as i32;
-                let history = grid.history_size() as i32;
+                let history = t.own_history() as i32;
                 let (start, end, archived) = match lines {
                     None => (0, screen, 0),
                     Some(n) => {
@@ -424,17 +457,6 @@ pub(super) struct SearchState {
     /// The same, for the archived lines.
     archived: regex::Regex,
     current: Option<Match>,
-}
-
-/// How many of the newest archived lines to bring back for the nearest match there: the newest
-/// line that matches when going to older lines, the oldest otherwise (going round to the top).
-fn archived_match(lines: &super::history::History, regex: &regex::Regex, older: bool) -> Option<usize> {
-    let hit = |line: super::history::Line| regex.is_match(&line.searched());
-    if older {
-        lines.newest_first().position(hit).map(|i| i + 1)
-    } else {
-        lines.oldest_first().position(hit).map(|i| lines.len() - i)
-    }
 }
 
 /// Escape regex metacharacters so a plain query matches literally.

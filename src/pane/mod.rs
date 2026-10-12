@@ -26,6 +26,7 @@ mod pty;
 mod screen;
 mod scrollback;
 mod spawn;
+mod store;
 
 pub use spawn::{batch, batching, close_inherited, reserve_descriptors};
 

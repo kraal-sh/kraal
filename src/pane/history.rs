@@ -84,6 +84,8 @@ const NONE: u8 = 0xff;
 #[derive(Default)]
 pub(super) struct History {
     blocks: VecDeque<Block>,
+    /// The number of the oldest line, and how many there are.
+    first: u64,
     lines: usize,
     /// The pane's width, and the rows the lines take at `counted` columns: counted again when
     /// needed after the width changed, not at each resize.
@@ -92,10 +94,6 @@ pub(super) struct History {
     counted: usize,
     /// The images whose cells are here, with the number of lines holding them.
     images: HashMap<u32, usize>,
-    // Reused while encoding.
-    text: Vec<u8>,
-    widths: Vec<u8>,
-    runs: Vec<u8>,
 }
 
 struct Block {
@@ -122,6 +120,7 @@ impl Block {
 }
 
 impl History {
+    #[cfg(test)]
     pub(super) fn len(&self) -> usize {
         self.lines
     }
@@ -153,6 +152,7 @@ impl History {
 
     pub(super) fn clear(&mut self) {
         self.blocks.clear();
+        self.first += self.lines as u64;
         self.lines = 0;
         self.rows = 0;
         self.counted = self.width;
@@ -164,23 +164,66 @@ impl History {
         self.images.keys().copied()
     }
 
-    /// Add the newest line: the emulator's `rows`, each but the last wrapped onto the next. With
-    /// `wraps`, the last one is too: the line goes on in the next one added. The cells of the last
-    /// row from `extent` on are all alike (it may be its length).
+    /// Add the newest line, encoded here (see [`Encoder::encode`]).
+    #[cfg(test)]
     pub(super) fn push(&mut self, rows: &[&[Cell]], wraps: bool, extent: usize) {
         let Some(last) = rows.last() else { return };
-        self.width = last.len();
+        let mut record = Vec::new();
+        let images = Encoder::default().encode(rows, wraps, extent, &mut record);
+        // Laid out again at the same width, the line takes the rows it took.
+        assert_eq!(Line::parse(&record).rows_at(last.len()), rows.len());
+        self.append(&record, rows.len(), last.len(), &images);
+    }
+
+    /// Add the newest line, as [`Encoder::encode`] wrote it: it took `rows` rows `width` wide, and
+    /// shows `images`.
+    pub(super) fn append(&mut self, record: &[u8], rows: usize, width: usize, images: &[u32]) {
+        self.width = width;
+        if self.blocks.back().is_none_or(|b| b.data.len() + record.len() > b.data.capacity() && b.len() > 0) {
+            self.blocks.push_back(Block::new(record.len()));
+        }
+        let block = self.blocks.back_mut().expect("a block was just added");
+        block.starts.push(block.data.len() as u32);
+        block.data.extend_from_slice(record);
+        for id in images {
+            *self.images.entry(*id).or_default() += 1;
+        }
+        if self.lines == 0 {
+            (self.rows, self.counted) = (0, self.width);
+        }
+        self.lines += 1;
+        if self.counted == self.width {
+            self.rows += rows;
+        }
+    }
+}
+
+/// Encodes lines as [`History`] keeps them, on whichever thread.
+#[derive(Default)]
+pub(super) struct Encoder {
+    text: Vec<u8>,
+    widths: Vec<u8>,
+    runs: Vec<u8>,
+}
+
+impl Encoder {
+    /// Add to `out` the record of a line: the emulator's `rows`, each but the last wrapped onto
+    /// the next. With `wraps`, the last one is too: the line goes on in the next one added. The
+    /// cells of the last row from `extent` on are all alike (it may be its length). Returns the
+    /// images it shows.
+    pub(super) fn encode(&mut self, rows: &[&[Cell]], wraps: bool, extent: usize, out: &mut Vec<u8>) -> Vec<u32> {
+        let Some(last) = rows.last() else { return Vec::new() };
         let (mut end, fill) = if wraps { (last.len(), None) } else { trim(last, extent) };
         if end == 0 && rows.len() > 1 {
             // A row the line wrapped onto, blank since: a cell of it keeps it a row of the line.
             end = 1;
         }
         let mut flags = 0;
-        let (glyphs, runs) = match self.encode(rows, end, false) {
+        let (glyphs, runs) = match self.cells(rows, end, false) {
             Some(counts) => counts,
             None => {
                 flags |= WIDTHS;
-                self.encode(rows, end, true).unwrap_or_default()
+                self.cells(rows, end, true).unwrap_or_default()
             }
         };
         if runs > 0 {
@@ -192,22 +235,14 @@ impl History {
         if wraps {
             flags |= WRAPS;
         }
+        let mut images = Vec::new();
         if flags & WIDTHS == 0 && self.text.is_ascii() {
             flags |= ASCII;
         } else if has_placeholder(&self.text) {
             flags |= IMAGE;
-            let ids = rows.iter().flat_map(|r| r.iter()).filter_map(crate::graphics::image_of_cell).collect();
-            for id in dedup(ids) {
-                *self.images.entry(id).or_default() += 1;
-            }
+            images = dedup(rows.iter().flat_map(|r| r.iter()).filter_map(crate::graphics::image_of_cell).collect());
         }
-        let size = self.text.len() + self.widths.len() + self.runs.len() + 32;
-        if self.blocks.back().is_none_or(|b| b.data.len() + size > b.data.capacity() && b.len() > 0) {
-            self.blocks.push_back(Block::new(size));
-        }
-        let block = self.blocks.back_mut().expect("a block was just added");
-        block.starts.push(block.data.len() as u32);
-        let out = &mut block.data;
+        out.reserve(self.text.len() + self.widths.len() + self.runs.len() + 32);
         put_varint(out, self.text.len());
         out.push(flags);
         out.extend_from_slice(&self.text);
@@ -223,25 +258,13 @@ impl History {
         if let Some(bg) = fill {
             put_color(out, bg);
         }
-        if self.lines == 0 {
-            (self.rows, self.counted) = (0, self.width);
-        }
-        #[cfg(test)]
-        {
-            // Laid out again at the same width, the line takes the rows it took.
-            let block = self.blocks.back().expect("just added");
-            assert_eq!(block.line(block.starts.len() - 1).rows_at(self.width), rows.len());
-        }
-        self.lines += 1;
-        if self.counted == self.width {
-            self.rows += rows.len();
-        }
+        images
     }
 
     /// Write the text, the widths when `explicit`, and the runs of a line into the scratch
     /// buffers; returns the number of characters and of runs (none when all look plain). None
     /// when the line needs its widths written down (only checked without them).
-    fn encode(&mut self, rows: &[&[Cell]], last_end: usize, explicit: bool) -> Option<(usize, usize)> {
+    fn cells(&mut self, rows: &[&[Cell]], last_end: usize, explicit: bool) -> Option<(usize, usize)> {
         self.text.clear();
         self.widths.clear();
         self.runs.clear();
@@ -301,7 +324,9 @@ impl History {
         }
         Some((glyphs, runs.count))
     }
+}
 
+impl History {
     /// Drop the oldest lines while they take more than `rows` rows. Until they are counted at the
     /// pane's width, only while there are more lines than that (each takes a row at least); `exact`
     /// counts them.
@@ -325,6 +350,7 @@ impl History {
         if block.len() == 0 {
             self.blocks.pop_front();
         }
+        self.first += 1;
         self.lines -= 1;
         self.rows -= rows;
     }
@@ -360,6 +386,45 @@ impl History {
     /// The lines, oldest first.
     pub(super) fn oldest_first(&self) -> impl Iterator<Item = Line<'_>> {
         self.blocks.iter().flat_map(|b| (b.first..b.starts.len()).map(move |i| b.line(i)))
+    }
+
+    /// The number of the oldest line, and one past the newest: lines are numbered as they come
+    /// and keep their numbers while older ones go.
+    pub(super) fn span(&self) -> std::ops::Range<u64> {
+        self.first..self.first + self.lines as u64
+    }
+
+    /// The lines numbered `from` on, oldest first.
+    pub(super) fn from(&self, from: u64) -> impl Iterator<Item = Line<'_>> {
+        let (block, at) = self.locate(from);
+        self.blocks.range(block..).enumerate().flat_map(move |(i, b)| {
+            let start = if i == 0 { at } else { b.first };
+            (start..b.starts.len()).map(move |i| b.line(i))
+        })
+    }
+
+    /// The lines before the one numbered `end`, newest first.
+    pub(super) fn before(&self, end: u64) -> impl Iterator<Item = Line<'_>> {
+        let (block, at) = self.locate(end);
+        // In `end`'s own block, the lines before it; then whole blocks.
+        let (blocks, stop) = if block < self.blocks.len() { (block + 1, Some(at)) } else { (block, None) };
+        self.blocks.range(..blocks).rev().enumerate().flat_map(move |(i, b)| {
+            let stop = if i == 0 { stop.unwrap_or(b.starts.len()) } else { b.starts.len() };
+            (b.first..stop).rev().map(move |i| b.line(i))
+        })
+    }
+
+    /// The block and the index in it of the line numbered `seq` (one past the last block for
+    /// lines past the newest).
+    fn locate(&self, seq: u64) -> (usize, usize) {
+        let mut left = seq.saturating_sub(self.first) as usize;
+        for (i, b) in self.blocks.iter().enumerate() {
+            if left < b.len() {
+                return (i, b.first + left);
+            }
+            left -= b.len();
+        }
+        (self.blocks.len(), 0)
     }
 }
 
@@ -579,7 +644,7 @@ pub(super) struct Line<'a> {
 }
 
 impl<'a> Line<'a> {
-    fn parse(bytes: &'a [u8]) -> Line<'a> {
+    pub(super) fn parse(bytes: &'a [u8]) -> Line<'a> {
         let mut r = Reader { bytes, at: 0 };
         let len = r.varint();
         let flags = r.byte();
@@ -806,7 +871,7 @@ impl<'a> Iterator for Glyphs<'a> {
     }
 }
 
-/// Reads what [`History::push`] wrote. Past the end it reads zeros: nothing is ever cut short,
+/// Reads what [`Encoder::encode`] wrote. Past the end it reads zeros: nothing is ever cut short,
 /// but a mistake here must not bring the server down.
 struct Reader<'a> {
     bytes: &'a [u8],
@@ -1060,15 +1125,21 @@ mod tests {
             let wrapped = t.grid()[GridLine(0)][alacritty_terminal::index::Column(168)].flags.contains(Flags::WRAPLINE);
             let rows: Vec<&[Cell]> = (0..if wrapped { 3 } else { 1 }).map(|l| &t.grid()[GridLine(l)][..]).collect();
             let extent = rows.last().unwrap().iter().rposition(|c| c.c != ' ').map_or(0, |i| i + 2);
-            let mut h = History::default();
-            let start = std::time::Instant::now();
-            for _ in 0..200_000 {
-                h.push(&rows, false, extent);
-                if h.len() > 10_000 {
-                    h.trim(5_000, false);
+            for extent in [extent, usize::MAX] {
+                let mut h = History::default();
+                let mut encoder = Encoder::default();
+                let mut record = Vec::new();
+                let start = std::time::Instant::now();
+                for _ in 0..200_000 {
+                    record.clear();
+                    let images = encoder.encode(&rows, false, extent, &mut record);
+                    h.append(&record, rows.len(), 169, &images);
+                    if h.len() > 10_000 {
+                        h.trim(5_000, false);
+                    }
                 }
+                eprintln!("{} rows, read to {extent}: {:?} per line", rows.len(), start.elapsed() / 200_000);
             }
-            eprintln!("{} rows: {:?} per line", rows.len(), start.elapsed() / 200_000);
         }
     }
 

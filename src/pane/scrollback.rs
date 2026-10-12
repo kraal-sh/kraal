@@ -58,7 +58,7 @@ impl Pane {
         if t.term.mode().contains(TermMode::ALT_SCREEN) {
             return None;
         }
-        Some(encode(&t.term, &t.archive.lines, MAX_SAVED_BYTES))
+        Some(encode(&t.term, t.archive.lens_rows(), &t.archive.lines(), MAX_SAVED_BYTES))
     }
 
     /// Show the last `lines` lines of `saved` (as [`Pane::scrollback_ansi`] wrote it), then a dim
@@ -115,15 +115,16 @@ fn marker_row<T>(term: &Term<T>, marker: &str) -> Option<i32> {
     found
 }
 
-/// The text of `term`'s primary grid, the lines `older` than its history first, up to its last
-/// line with something on it: lines separated by CR LF, each starting and ending with default
+/// The text of `term`'s primary grid (but the `lens` rows at the top of its history, see
+/// `archive.rs`), the lines `older` than its history first, up to its last line with something
+/// on it: lines separated by CR LF, each starting and ending with default
 /// attributes, at most `max_bytes` of the newest. Never more than a few times `max_bytes` is
 /// encoded to find them, and something always shows in it when something shows in `term`: a
 /// newest line too long to fit is cut to its end.
-pub(super) fn encode<T>(term: &Term<T>, older: &History, max_bytes: usize) -> Vec<u8> {
+pub(super) fn encode<T>(term: &Term<T>, lens: usize, older: &History, max_bytes: usize) -> Vec<u8> {
     let grid = term.grid();
     let cols = grid.columns();
-    let top = -(grid.history_size() as i32);
+    let top = -((grid.history_size() - lens) as i32);
     let mut bottom = grid.screen_lines() as i32 - 1;
     while bottom >= top && matches!(visible(&grid[Line(bottom)][..]), (0, None)) {
         bottom -= 1;
@@ -519,7 +520,7 @@ mod tests {
              \x1b[7minverse\x1b[0m\r\nlast"
                 .as_bytes(),
         );
-        let saved = encode(&before, &History::default(), MAX_SAVED_BYTES);
+        let saved = encode(&before, 0, &History::default(), MAX_SAVED_BYTES);
         let text = String::from_utf8(saved.clone()).unwrap();
         let mut after = term(13, 3, 100);
         feed(&mut after, &clean(&saved, 100));
@@ -556,7 +557,7 @@ mod tests {
         let mut before = term(5, 3, 10);
         // `日` cannot start in the last column: the emulator leaves a spacer there and wraps.
         feed(&mut before, "abcd日e".as_bytes());
-        let saved = encode(&before, &History::default(), MAX_SAVED_BYTES);
+        let saved = encode(&before, 0, &History::default(), MAX_SAVED_BYTES);
         assert_eq!(String::from_utf8(saved.clone()).unwrap(), "abcd日e");
         let mut wide = term(10, 3, 10);
         feed(&mut wide, &clean(&saved, 10));
@@ -568,8 +569,8 @@ mod tests {
         let mut t = term(10, 5, 10);
         // Spaces in a colour show nothing either.
         feed(&mut t, b"one\r\n\r\ntwo\r\n\x1b[31m   \x1b[0m\r\n");
-        assert_eq!(encode(&t, &History::default(), MAX_SAVED_BYTES), b"one\r\n\r\ntwo");
-        assert!(encode(&term(10, 5, 10), &History::default(), MAX_SAVED_BYTES).is_empty());
+        assert_eq!(encode(&t, 0, &History::default(), MAX_SAVED_BYTES), b"one\r\n\r\ntwo");
+        assert!(encode(&term(10, 5, 10), 0, &History::default(), MAX_SAVED_BYTES).is_empty());
     }
 
     #[test]
@@ -577,13 +578,13 @@ mod tests {
         let mut t = term(10, 5, 1000);
         let lines: String = (1..=500).map(|i| format!("line {i}\r\n")).collect();
         feed(&mut t, lines.as_bytes());
-        let saved = encode(&t, &History::default(), 100);
+        let saved = encode(&t, 0, &History::default(), 100);
         assert!(saved.len() <= 100);
         let text = String::from_utf8(saved.clone()).unwrap();
         assert!(text.ends_with("line 499\r\nline 500"), "{text:?}");
         assert!(!text.contains("line 1\r"));
         // On restore, the lines that fit in the new pane's history.
-        let all = encode(&t, &History::default(), MAX_SAVED_BYTES);
+        let all = encode(&t, 0, &History::default(), MAX_SAVED_BYTES);
         assert_eq!(clean(&all, 2), b"line 499\r\nline 500");
         assert_eq!(clean(b"one", 2), b"one");
         assert!(clean(&all, 0).is_empty());
@@ -593,7 +594,7 @@ mod tests {
     fn a_line_wrapped_over_many_rows_is_saved_whole_up_to_a_point() {
         let mut t = term(10, 5, 3000);
         feed(&mut t, "x".repeat(10 * 1500).as_bytes());
-        let saved = encode(&t, &History::default(), MAX_SAVED_BYTES);
+        let saved = encode(&t, 0, &History::default(), MAX_SAVED_BYTES);
         let text = String::from_utf8(saved).unwrap();
         let parts: Vec<&str> = text.split("\r\n").collect();
         assert_eq!(parts.len(), 2);
@@ -612,7 +613,7 @@ mod tests {
         line.push_str("\x1b]8;;\x1b\\END");
         feed(&mut t, line.as_bytes());
         let limit = 100_000;
-        let saved = encode(&t, &History::default(), limit);
+        let saved = encode(&t, 0, &History::default(), limit);
         assert!(!saved.is_empty(), "the pane's text is not saved as nothing");
         assert!(saved.len() <= limit, "{}", saved.len());
         let mut after = term(10, 5, 1000);
@@ -623,7 +624,7 @@ mod tests {
         // Even a single row too long for the limit keeps the end of its text.
         let mut wide = term(40, 3, 10);
         feed(&mut wide, "\x1b[31mabcdefghij\x1b[0m klmnopqrstuvwxyz 日本".as_bytes());
-        assert_eq!(String::from_utf8(encode(&wide, &History::default(), 9)).unwrap(), "yz 日本");
+        assert_eq!(String::from_utf8(encode(&wide, 0, &History::default(), 9)).unwrap(), "yz 日本");
     }
 
     #[test]
@@ -631,7 +632,7 @@ mod tests {
         let mut t = term(10, 3, 10);
         let combining: String = std::iter::repeat_n('\u{301}', 5000).collect();
         feed(&mut t, format!("e{combining}x").as_bytes());
-        let saved = String::from_utf8(encode(&t, &History::default(), MAX_SAVED_BYTES)).unwrap();
+        let saved = String::from_utf8(encode(&t, 0, &History::default(), MAX_SAVED_BYTES)).unwrap();
         assert_eq!(saved.chars().filter(|c| *c == '\u{301}').count(), MAX_ZEROWIDTH, "{}", saved.len());
         assert!(saved.starts_with('e') && saved.ends_with('x'));
     }

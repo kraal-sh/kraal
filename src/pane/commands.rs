@@ -160,11 +160,10 @@ impl TermPane {
                         t.stop_sync();
                     }
                     // Images shown in the archived history are still placed.
-                    t.graphics.archived = t.archive.lines.images().collect();
+                    t.graphics.archived = t.archive.lines().images().collect();
                     if let Some(reply) = t.graphics.handle(image, &mut t.term) {
                         t.write(reply);
                     }
-                    t.archive.forget_extents(t.term.screen_lines(), t.term.grid().history_size());
                 }),
             }
         }
@@ -255,8 +254,7 @@ impl TermPane {
             return;
         }
         let shifted = before.and_then(|b| self.shift_since(&b));
-        let grid = self.term.grid();
-        let (history, offset) = (grid.history_size(), grid.display_offset());
+        let (history, offset) = (self.own_history(), self.term.grid().display_offset());
         let c = &mut self.commands;
         let lifted = c.lifted.take();
         let moved = if c.history_max == 0 {
@@ -299,12 +297,12 @@ impl TermPane {
         if alt || usize::from(size.cols) != width {
             // Rewrapped (on the alternate screen, the primary one changes out of sight).
             self.commands.unplace();
-            self.commands.history_seen = self.term.grid().history_size() as i64;
+            self.commands.history_seen = self.own_history() as i64;
             return;
         }
         let after = self.term.grid().cursor.point.line.0;
         self.commands.scrolled += i64::from(before - after);
-        self.commands.history_seen = self.term.grid().history_size() as i64;
+        self.commands.history_seen = self.own_history() as i64;
         self.commands.lifted = None;
     }
 
@@ -319,7 +317,7 @@ impl TermPane {
             return None;
         }
         if self.commands.list.is_empty() {
-            self.commands.history_seen = self.term.grid().history_size() as i64;
+            self.commands.history_seen = self.own_history() as i64;
             self.commands.lifted = None;
         }
         let spot = self.cursor_spot();
@@ -392,7 +390,7 @@ impl TermPane {
         let columns = self.term.columns();
         let (line, col) = if spot.col >= columns { (spot.line + 1, 0) } else { (spot.line, spot.col) };
         let line = line - self.commands.scrolled;
-        let top = -(self.term.grid().history_size() as i64);
+        let top = -(self.own_history() as i64);
         let bottom = self.term.screen_lines() as i64;
         (top..bottom).contains(&line).then(|| Point::new(Line(line as i32), Column(col)))
     }
@@ -421,15 +419,16 @@ impl TermPane {
 
     /// The pane line of the oldest line still in the history.
     fn top_line(&self) -> i64 {
-        self.commands.scrolled - self.term.grid().history_size() as i64
+        self.commands.scrolled - self.own_history() as i64
     }
 
     /// Bring the rows down to `spot` back from the archive when it is above the emulator's
     /// history. Whether it is on the grid now.
     fn bring_back(&mut self, spot: Spot) -> bool {
         if !spot.gone() && spot.line < self.top_line() {
-            let above = (self.top_line() - spot.line) as usize;
-            self.reveal(self.term.grid().history_size() + above);
+            self.fill_lens();
+            let above = (self.top_line() - spot.line).max(0) as usize;
+            self.bring_back_rows(self.term.grid().history_size() + above);
         }
         self.point(spot).is_some()
     }
@@ -500,6 +499,8 @@ impl Pane {
     /// whether there was one.
     pub fn jump_to_prompt(&mut self, up: bool) -> bool {
         let Some(t) = self.term_mut() else { return false };
+        // Marks are found on the history whole.
+        t.fill_lens();
         let at = t.term.vi_mode_cursor.point.line;
         let target = |t: &TermPane| {
             let prompts = t.commands.list.iter().filter_map(|c| t.point(c.prompt)).map(|p| p.line);
@@ -525,6 +526,7 @@ impl Pane {
     /// prompt and command line too. Returns whether there was one.
     pub fn select_command(&mut self, whole: bool) -> bool {
         let Some(t) = self.term_mut() else { return false };
+        t.fill_lens();
         let at = t.term.vi_mode_cursor.point.line;
         let above = |c: &&Command| !c.prompt.gone() && t.point(c.prompt).is_none_or(|p| p.line <= at);
         let Some(c) = t.commands.list.iter().rev().find(|c| c.ran() && above(c)).cloned() else {
