@@ -1563,7 +1563,7 @@ impl Server {
             out.push(Line::from(format!("Lowercase: a theme's main action ({p} s). Capital: its menu ({p} S).")));
         }
         out.push(Line::raw(""));
-        let sections = km.reference(th().ascii);
+        let sections = km.reference(th().ascii, false);
         let key_w = sections.iter().flat_map(|(_, v)| v.iter().map(|(k, _)| k.width())).max().unwrap_or(10).min(26);
         for (title, rows) in sections {
             if rows.is_empty() {

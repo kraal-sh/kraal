@@ -259,8 +259,8 @@ fn print_opened(answer: &Response) {
     }
 }
 
-/// `kraal config keys`: every key, grouped as the help shows them, then the names that
-/// `[keys.leader]` and `[keys.direct]` take, with what each does and its keys now.
+/// `kraal config keys`: every key, grouped and ordered as the help shows them, then the names
+/// that `[keys.leader]` and `[keys.direct]` take, with what each does and its keys now.
 fn print_keys(keymap: &crate::keymap::Keymap, markdown: bool) {
     use crate::keymap::{Action, Command};
     let cell = |s: &str| s.replace('|', "\\|");
@@ -280,7 +280,7 @@ fn print_keys(keymap: &crate::keymap::Keymap, markdown: bool) {
     let title = format!("kraal keys: preset {}, prefix {}", keymap.preset, keymap.prefix_label());
     if markdown {
         println!("# {title}\n");
-        for (section, rows) in keymap.reference(false) {
+        for (section, rows) in keymap.reference(false, true) {
             println!("## {section}\n\n| Keys | What it does |\n|---|---|");
             for (k, what) in rows {
                 println!("| `{}` | {} |", cell(&k), cell(&what));
@@ -294,7 +294,7 @@ fn print_keys(keymap: &crate::keymap::Keymap, markdown: bool) {
         return;
     }
     println!("{title}\n");
-    for (section, rows) in keymap.reference(false) {
+    for (section, rows) in keymap.reference(false, true) {
         println!("{section}");
         let w = rows.iter().map(|(k, _)| crate::text::columns(k)).max().unwrap_or(0).min(28);
         for (k, what) in rows {
