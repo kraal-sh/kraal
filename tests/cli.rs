@@ -147,22 +147,24 @@ impl RawClient {
 
     /// Attach, saying which kraal is installed (a local client says its own).
     fn attach_installed(env: &Env, workspace: &str, installed: Option<&str>) -> RawClient {
-        RawClient::attach_as(env, workspace, (120, 40), installed)
+        RawClient::attach_as(env, Some(workspace), (120, 40), installed)
     }
 
-    /// Attach from a terminal of `size` (columns, rows).
-    fn attach_sized(env: &Env, workspace: &str, size: (usize, usize)) -> RawClient {
+    /// Attach from a terminal of `size` (columns, rows), asking for a workspace or, as `kraal`
+    /// alone does, for none.
+    fn attach_sized(env: &Env, workspace: Option<&str>, size: (usize, usize)) -> RawClient {
         RawClient::attach_as(env, workspace, size, None)
     }
 
-    fn attach_as(env: &Env, workspace: &str, size: (usize, usize), installed: Option<&str>) -> RawClient {
+    fn attach_as(env: &Env, workspace: Option<&str>, size: (usize, usize), installed: Option<&str>) -> RawClient {
         use std::io::Read;
         let socket = env.root.join("run/kraal").join(format!("{}.sock", env.session));
         let mut stream = std::os::unix::net::UnixStream::connect(socket).unwrap();
         let installed = installed.map(|v| format!(r#","installed":"{v}""#)).unwrap_or_default();
         let (cols, rows) = size;
+        let workspace = serde_json::json!(workspace);
         let hello = format!(
-            r#"{{"type":"attach","version":2,"cols":{cols},"rows":{rows},"workspace":"{workspace}","remote":false{installed}}}"#
+            r#"{{"type":"attach","version":2,"cols":{cols},"rows":{rows},"workspace":{workspace},"remote":false{installed}}}"#
         );
         raw_frame(&mut stream, 0, hello.as_bytes());
         let screen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -5023,6 +5025,15 @@ impl RawClient {
         text_after(&self.screen.lock().unwrap(), self.size.0, self.size.1)
     }
 
+    /// The text of each row its terminal showed after the first frame drawn for it.
+    fn first_frame(&self) -> Vec<String> {
+        let end = "\x1b[?2026l";
+        self.wait_for_screen(end);
+        let screen = self.screen.lock().unwrap();
+        let drawn = screen.windows(end.len()).position(|w| w == end.as_bytes()).unwrap() + end.len();
+        text_after(&screen[..drawn], self.size.0, self.size.1)
+    }
+
     /// Wait until its terminal shows `text` on a row; the rows then. Unlike
     /// [`RawClient::wait_for_screen`], this finds text drawn over cells that already had some of
     /// it, which a frame leaves out.
@@ -5149,15 +5160,117 @@ fn frames_drawn_over_the_last_one_end_as_a_whole_frame() {
     client.settle();
     client.send(b"\x1b");
     same(&client, "menu closed");
-    // A second workspace: the sidebar shows; a third: the sidebar changes.
+    // A second workspace, then a third: the sidebar lists them as open.
     env.run(&["open", "w2"]);
-    std::thread::sleep(Duration::from_millis(600));
     same(&client, "sidebar");
     env.run(&["open", "w3"]);
     same(&client, "sidebar changed");
     // A pane closed: the others take its place.
     env.run(&["close", "img"]);
     same(&client, "pane closed");
+}
+
+/// The columns a pane's frame starts and ends at on the row under the top bar, where the sidebar
+/// has no corner: those of the first pane there. A frame wider than what is left of the screen
+/// is closed at the last column.
+fn frame_columns(rows: &[String]) -> (Option<usize>, Option<usize>) {
+    let at = |corner: char| rows[1].chars().position(|c| c == corner);
+    (at('╭'), at('╮'))
+}
+
+/// The sidebar is there from the first screen of a new session, with one workspace and nothing
+/// else to list. The key hides it and shows it again in the terminal it is typed in, `[sidebar]
+/// visible` says for the terminals that did not choose, and a terminal less than three times as
+/// wide as the sidebar has none: its panes keep the whole width.
+#[test]
+fn the_sidebar_is_there_from_the_first_screen() {
+    let env = Env::new("sidebar");
+    let shown = |rows: &[String]| rows[0].starts_with("╭─ WORKSPACES");
+    // Without the sidebar, the top bar names the workspace.
+    let hidden = |rows: &[String]| rows[0].starts_with(" main ");
+    let shows = |client: &RawClient, what: &str| client.wait_for_rows(what, shown);
+    let hides = |client: &RawClient, what: &str| client.wait_for_rows(what, hidden);
+    let size = || {
+        let panes: serde_json::Value = serde_json::from_str(&env.run(&["panes", "--json"])).unwrap();
+        (panes[0]["cols"].as_u64().unwrap(), panes[0]["rows"].as_u64().unwrap())
+    };
+    let config = env.root.join("config/kraal/config.toml");
+    let defaults = std::fs::read_to_string(&config).unwrap();
+    let configure = |sidebar: &str| {
+        std::fs::write(&config, format!("{defaults}{sidebar}")).unwrap();
+        env.run(&["config", "reload"]);
+    };
+
+    // A session started by a command that opens nothing: the first terminal gets the workspace
+    // `main` and a shell, and its first frame has the sidebar, the pane beside it.
+    env.run(&["tunnel", "list"]);
+    let mut client = RawClient::attach_sized(&env, None, (120, 40));
+    let rows = client.first_frame();
+    assert!(shown(&rows) && rows[1].starts_with("│ ● main"), "{}", rows.join("\n"));
+    assert_eq!(frame_columns(&rows), (Some(29), Some(119)), "{}", rows.join("\n"));
+    assert_eq!(size(), (89, 36));
+    // What has nothing to list has no section.
+    client.settle();
+    let rows = client.rows();
+    assert!(rows[2].starts_with("│   1 tab · 1 pane"), "{}", rows.join("\n"));
+    let sections = rows.iter().filter(|r| r.starts_with("├─ ")).collect::<Vec<_>>();
+    assert!(sections.iter().all(|s| s.starts_with("├─ ACCOUNTS")), "{sections:?}");
+
+    // The key hides it in the terminal it is typed in, which gives its room to the panes, and
+    // shows it again. Another terminal keeps its own.
+    let other = RawClient::attach(&env, "main");
+    shows(&other, "the sidebar of a second terminal");
+    client.send(b"\x02Vl");
+    let rows = hides(&client, "the sidebar hidden with the key");
+    assert_eq!(frame_columns(&rows), (Some(0), Some(119)), "{}", rows.join("\n"));
+    assert_eq!(size(), (118, 36));
+    other.settle();
+    assert!(shown(&other.rows()), "{}", other.rows().join("\n"));
+    client.send(b"\x02Vl");
+    shows(&client, "the sidebar shown again with the key");
+    // A zoomed pane takes the room of the panes, beside the sidebar.
+    env.run(&["run", "--name", "second", "--right", "--", "sh"]);
+    client.wait_for_rows("two panes side by side", |rows| frame_columns(rows).1.is_some_and(|end| end < 119));
+    client.send(b"\x02z");
+    let rows = client.wait_for_rows("the zoomed pane", |rows| frame_columns(rows) == (Some(29), Some(119)));
+    assert!(shown(&rows), "{}", rows.join("\n"));
+    env.run(&["close", "second"]);
+
+    // `visible = false` hides it where no one chose: the terminal that asked for it keeps it, a
+    // terminal attaching then has none, and the key shows it there too.
+    configure("[sidebar]\nvisible = false\n");
+    hides(&other, "the sidebar hidden by the configuration");
+    client.settle();
+    assert!(shown(&client.rows()), "{}", client.rows().join("\n"));
+    let mut late = RawClient::attach(&env, "main");
+    hides(&late, "no sidebar for a terminal attaching");
+    late.send(b"\x02Vl");
+    shows(&late, "the sidebar asked for with the key");
+    // So wide that no terminal has room for it, it is left out, whoever asked.
+    configure("[sidebar]\nwidth = 30000\n");
+    hides(&client, "no room for the sidebar");
+
+    // A terminal less than three times as wide as the sidebar (28 columns) has none, and its pane
+    // the whole width; one column more and the sidebar is there.
+    configure("");
+    let mut narrow = RawClient::attach_sized(&env, Some("main"), (80, 24));
+    let rows = hides(&narrow, "no sidebar in 80 columns");
+    assert_eq!(frame_columns(&rows), (Some(0), Some(79)), "{}", rows.join("\n"));
+    assert_eq!(size(), (78, 20));
+    for (cols, frame) in [(60, (0, 59)), (83, (0, 82)), (84, (29, 83)), (80, (0, 79))] {
+        narrow.resize((cols, 24));
+        let what = format!("the pane of a terminal of {cols} columns");
+        let rows = narrow.wait_for_rows(&what, |rows| frame_columns(rows) == (Some(frame.0), Some(frame.1)));
+        assert_eq!(shown(&rows), cols == 84, "{}", rows.join("\n"));
+    }
+
+    // What a terminal chose is its own, and is not saved: after a restart, the configuration
+    // says again.
+    client.send(b"\x02Vl");
+    hides(&client, "the sidebar hidden before a restart");
+    env.run(&["restart", "--yes"]);
+    let back = RawClient::attach_sized(&env, None, (120, 40));
+    shows(&back, "the sidebar after a restart");
 }
 
 /// The panes have one size, that of the terminal typed in last, and every attached terminal has
@@ -5175,18 +5288,12 @@ fn each_terminal_draws_the_panes_beside_its_own_sidebar() {
         let side = rows.iter().map(|r| r.chars().take(29).collect::<String>());
         side.take_while(|r| !r.contains("ACCOUNTS")).collect()
     };
-    // The columns the pane's frame starts and ends at, on its first row (the sidebar has no
-    // corner there). A frame wider than what is left of the screen is closed at the last column.
-    let frame = |rows: &[String]| {
-        let at = |corner: char| rows[1].chars().position(|c| c == corner);
-        (at('╭'), at('╮'))
-    };
     let shows = |client: &RawClient, columns: (usize, usize), when: &str| {
         let columns = (Some(columns.0), Some(columns.1));
-        let rows = client.wait_for_rows(when, |rows| frame(rows) == columns);
+        let rows = client.wait_for_rows(when, |rows| frame_columns(rows) == columns);
         // And it stays so.
         client.settle();
-        assert_eq!(frame(&client.rows()), columns, "{when}:\n{}", client.rows().join("\n"));
+        assert_eq!(frame_columns(&client.rows()), columns, "{when}:\n{}", client.rows().join("\n"));
         rows
     };
     let mut wide = RawClient::attach(&env, "w");
@@ -5206,7 +5313,7 @@ fn each_terminal_draws_the_panes_beside_its_own_sidebar() {
     assert_eq!(side(&shows(&wide, (29, 119), "the pane laid out beside the sidebar")), sidebar);
 
     // A terminal too narrow for a sidebar has none, and the panes are laid out for it.
-    let mut narrow = RawClient::attach_sized(&env, "w", (80, 24));
+    let mut narrow = RawClient::attach_sized(&env, Some("w"), (80, 24));
     let rows = shows(&narrow, (0, 79), "the pane over the whole width");
     assert!(rows[0].starts_with(" w "), "the workspace is named in the top bar: {:?}", rows[0]);
     shows(&bare, (0, 79), "the narrow terminal's pane from the first column");

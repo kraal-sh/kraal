@@ -36,8 +36,8 @@ workspace_dirs = []      # more directories of workspace files, after ~/.config/
 ssh_config_hosts = true  # offer the hosts of ~/.ssh/config in the server picker
 
 [sidebar]
-visible = true           # shown when it has something to list; false hides it
-width = 28
+visible = true           # false hides it
+width = 28               # in terminals at least three times as wide
 
 [bar]
 keys = "context"         # the focused pane's actions on the last row; "off": none

@@ -325,7 +325,8 @@ pub struct Client {
     /// The last frame composed for it, kept to compose the next one over it.
     pub(in crate::server) frame: ratatui::buffer::Buffer,
     pub(in crate::server) memo: render::FrameMemo,
-    /// The sidebar shows when it has something to say; once toggled, as the client chose.
+    /// Whether it has the sidebar, once it showed or hid it itself: `[sidebar] visible` says
+    /// until then.
     pub sidebar: Option<bool>,
     pub dirty: bool,
     pub last_input: Instant,
@@ -555,8 +556,6 @@ pub struct Server {
     facts: render::FactsCache,
     /// The last layouts worked out, most recent last (see `Server::tiled_rects`).
     tilings: std::cell::RefCell<Vec<geometry::Tiling>>,
-    /// Whether the sidebar had something to show at the last tick.
-    sidebar_was_useful: bool,
     /// Whether the bottom bar shows: as `[bar] keys` says, until toggled for the session.
     pub bottom_bar: bool,
     /// Whether a client was told how to stop the broadcast its key started.
@@ -771,7 +770,6 @@ pub fn run(session: &str) -> Result<()> {
         exiting: Default::default(),
         focus_reported: Default::default(),
         held_input: Vec::new(),
-        sidebar_was_useful: false,
         bottom_bar,
         turn_skipped: false,
         typed_quietly: false,
@@ -826,8 +824,6 @@ pub fn run(session: &str) -> Result<()> {
     server.scan_definitions();
     server.load_buffers();
     server.restore();
-    // The sidebar shows what it has from the start: the first tick has no change to draw.
-    server.sidebar_was_useful = server.sidebar_useful();
     let result = server.event_loop(&rx);
     server.shutdown();
     let _ = std::fs::remove_file(&socket);
@@ -1287,18 +1283,6 @@ impl Server {
         self.hooks.reap();
         self.check_run_timeouts();
         self.show_warnings();
-        // The sidebar appears (or goes) with what it has to show.
-        let useful = self.sidebar_useful();
-        if useful != self.sidebar_was_useful {
-            self.sidebar_was_useful = useful;
-            // A client that chose to show it or not keeps what it has on screen.
-            let follows = self.config.sidebar.visible;
-            for c in self.clients.values_mut().filter(|c| follows && c.sidebar.is_none()) {
-                c.encoder.invalidate();
-            }
-            self.relayout();
-            self.mark_dirty();
-        }
         self.echo.retain(|_, until| *until > now);
         // Wake-ups can be dropped when the event queue is full; catch those panes here.
         let waiting: Vec<PaneId> = self.panes.values().filter(|p| p.has_output()).map(|p| p.id).collect();

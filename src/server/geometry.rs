@@ -60,22 +60,13 @@ impl Server {
     /// as wide as it, where it would leave the panes too little.
     pub fn sidebar_width(&self, cols: u16) -> u16 {
         let w = self.config.sidebar.width;
-        if cols < w * 3 { 0 } else { w }
+        if cols / 3 < w { 0 } else { w }
     }
 
-    /// Whether a client sees the sidebar: as it chose, else when there is more to show than the
-    /// one workspace it is in (other workspaces, agents, ports, tunnels).
+    /// Whether a client has the sidebar: as `[sidebar] visible` says, until it shows or hides it
+    /// itself.
     pub fn sidebar_shown(&self, c: &Client) -> bool {
-        c.sidebar.unwrap_or_else(|| self.config.sidebar.visible && self.sidebar_useful())
-    }
-
-    pub(super) fn sidebar_useful(&self) -> bool {
-        self.workspaces.len() > 1
-            || !self.def_files.is_empty()
-            || !self.tunnels.is_empty()
-            || !self.ports.is_empty()
-            || self.panes.values().any(|p| p.agent.kind.is_some())
-            || self.remote_agents().next().is_some()
+        c.sidebar.unwrap_or(self.config.sidebar.visible)
     }
 
     /// The columns client `c`'s sidebar takes: none when it has none, or a screen too narrow for
