@@ -1062,8 +1062,12 @@ impl Server {
         let mut ssh_ended = Vec::new();
         let mut read_contexts = false;
         let ids: Vec<PaneId> = self.panes.keys().copied().collect();
+        let mut freed = false;
         for id in ids {
             let Some(pane) = self.panes.get_mut(&id) else { continue };
+            if pane.last_output.elapsed() > Duration::from_secs(1) {
+                freed |= pane.rest();
+            }
             if let crate::pane::Content::Preview(_) = &pane.content {
                 continue;
             }
@@ -1102,6 +1106,9 @@ impl Server {
             if moved {
                 changed.push((id, Some(before)));
             }
+        }
+        if freed {
+            crate::pane::release_memory();
         }
         for (id, before) in changed {
             if let Some(before) = before {

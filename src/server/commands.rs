@@ -44,7 +44,7 @@ impl Server {
     /// Copy the output of the focused pane's last command (the one running, or the last that
     /// ran).
     pub(super) fn copy_last_output(&mut self, id: ClientId, focus: Option<PaneId>) {
-        let found = focus.and_then(|p| self.panes.get(&p)).and_then(|p| p.last_command_output());
+        let found = focus.and_then(|p| self.panes.get_mut(&p)).and_then(|p| p.last_command_output());
         match found {
             Some((_, output)) if output.is_empty() => self.toast(id, "the last command printed nothing"),
             Some((command, output)) => {

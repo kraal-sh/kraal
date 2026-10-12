@@ -19,6 +19,7 @@ use anyhow::{Context, Result};
 use crossbeam_channel::Sender;
 use portable_pty::{CommandBuilder, MasterPty, PtySize};
 
+use super::archive::Archive;
 use super::commands::Commands;
 use super::guard::KeyboardStackGuard;
 use super::*;
@@ -198,6 +199,8 @@ fn start_reaper() -> Result<()> {
 
 pub struct TermPane {
     pub term: Term<Listener>,
+    /// The part of the history the emulator no longer holds.
+    pub(super) archive: Archive,
     pub(super) events: Rc<RefCell<Vec<TermEvent>>>,
     pub(super) parser: Processor,
     pub(super) master: Box<dyn MasterPty + Send>,
@@ -307,6 +310,7 @@ impl TermPane {
         let term = Term::new(config, &Size { cols, rows }, Listener(events.clone()));
         let mut pane = TermPane {
             term,
+            archive: Archive::new(env.scrollback, usize::from(rows)),
             events,
             parser: Processor::new(),
             master: pair.master,
