@@ -1099,25 +1099,33 @@ mod tests {
                 })
             })
         };
-        let switches = crate::testing::thread_switches(tid_rx.recv().unwrap());
-        std::thread::sleep(Duration::from_millis(50));
+        let tid = tid_rx.recv().unwrap();
+        let switches = crate::testing::thread_switches(tid);
+        // Once it sleeps (it was just started).
+        crate::testing::wait_asleep(tid);
         let before = switches();
         std::thread::sleep(Duration::from_millis(700));
         assert_eq!(switches(), before, "the reader woke up while nothing was typed");
         typing.write_all(b"a").unwrap();
-        assert_eq!(got_rx.recv_timeout(Duration::from_secs(2)).unwrap(), b"a");
-        // A pause is seen at once, without a key to wake the reader; so is the end of it.
-        let start = Instant::now();
+        assert_eq!(got_rx.recv_timeout(Duration::from_secs(10)).unwrap(), b"a");
+        // A pause is seen at once, without a key to wake the reader; so is the end of it. The time
+        // the reader, or this thread asking it, waited for a processor is the machine's, not the
+        // reader's.
+        // SAFETY: gettid has no preconditions.
+        let here = unsafe { libc::gettid() };
+        let waited = || crate::testing::waited_for_a_processor(tid) + crate::testing::waited_for_a_processor(here);
+        let (start, waited_before) = (Instant::now(), waited());
         assert!(pause.pause());
-        assert!(start.elapsed() < Duration::from_millis(500), "{:?}", start.elapsed());
+        let took = start.elapsed().saturating_sub(waited().saturating_sub(waited_before));
+        assert!(took < Duration::from_millis(500), "{took:?} of {:?}", start.elapsed());
         // Once it went to sleep (it says it parked just before).
-        std::thread::sleep(Duration::from_millis(50));
+        crate::testing::wait_asleep(tid);
         let parked = switches();
         std::thread::sleep(Duration::from_millis(300));
         assert_eq!(switches(), parked, "a paused reader sleeps too");
         pause.resume();
         typing.write_all(b"b").unwrap();
-        assert_eq!(got_rx.recv_timeout(Duration::from_secs(2)).unwrap(), b"b");
+        assert_eq!(got_rx.recv_timeout(Duration::from_secs(10)).unwrap(), b"b");
         drop(typing);
         reader.join().unwrap();
         drop(keyboard_end);

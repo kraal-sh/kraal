@@ -1839,7 +1839,7 @@ mod tests {
                     return text;
                 }
                 assert!(
-                    start.elapsed() < std::time::Duration::from_secs(10),
+                    start.elapsed() < crate::testing::PATIENCE,
                     "no {want:?} in {:?}",
                     &text[from.min(text.len())..]
                 );
@@ -2356,14 +2356,19 @@ mod tests {
 
     #[test]
     fn the_users_status_line_never_holds_kraal() {
-        use std::time::{Duration, Instant};
         let read = run_statusline("printf '[%s]' \"$(head -c 5)\"", b"opus 4".to_vec(), STATUSLINE_TIMEOUT).unwrap();
         assert_eq!(read.stdout_text(), "[opus ]");
-        // One that reads nothing of a large input, then one that never ends.
+        // One that reads nothing of a large input.
         let large = vec![b'x'; 1 << 20];
-        let start = Instant::now();
-        assert_eq!(run_statusline("echo line", large.clone(), STATUSLINE_TIMEOUT).unwrap().stdout_text(), "line\n");
-        let stuck = run_statusline("sleep 30", large, Duration::from_millis(200)).unwrap();
-        assert!(stuck.timed_out && start.elapsed() < Duration::from_secs(5), "{:?}", start.elapsed());
+        let unread = run_statusline("echo line", large.clone(), STATUSLINE_TIMEOUT).unwrap();
+        assert!(unread.stdout_text() == "line\n" && !unread.timed_out);
+        // Then one that never ends: stopped at its limit, long before the mark it would leave
+        // ten seconds in. Held by it, or by its input, kraal would find the mark there.
+        let dir = tmp("statusline");
+        let mark = dir.join("mark");
+        let never_ends = format!("sleep 10; : > {}; sleep 30", crate::shell::quote(&mark.display().to_string()));
+        let stuck = run_statusline(&never_ends, large, std::time::Duration::from_millis(200)).unwrap();
+        assert!(stuck.timed_out && !mark.exists(), "timed out: {}, mark: {}", stuck.timed_out, mark.exists());
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

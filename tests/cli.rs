@@ -8,6 +8,12 @@ use std::time::{Duration, Instant};
 
 use common::{Env, claude_hook, git_repo, wait_until, write_script};
 
+/// How long a test waits for what it expects to show before it fails. Far longer than it takes:
+/// a machine busy with other work (a CI runner, the suite run beside other suites) is slower by
+/// tens of seconds where programs are started and talk to each other, and a wait that ends when
+/// its condition holds costs nothing when it does.
+const PATIENCE: Duration = Duration::from_secs(60);
+
 impl Env {
     fn workspace(&self, name: &str, kdl: &str) {
         std::fs::write(self.root.join("config/kraal/workspaces").join(format!("{name}.kdl")), kdl).unwrap();
@@ -39,7 +45,7 @@ impl Env {
             if seen.contains(text) || seen.lines().collect::<String>().contains(text) {
                 return seen.to_string();
             }
-            assert!(start.elapsed() < Duration::from_secs(10), "timed out waiting for {text:?} in:\n{screen}");
+            assert!(start.elapsed() < PATIENCE, "timed out waiting for {text:?} in:\n{screen}");
             std::thread::sleep(Duration::from_millis(50));
         }
     }
@@ -170,11 +176,7 @@ impl RawClient {
     fn wait_for_message(&self, text: &str) {
         let start = Instant::now();
         while !self.messages.lock().unwrap().iter().any(|m| m.contains(text)) {
-            assert!(
-                start.elapsed() < Duration::from_secs(15),
-                "{text:?} never sent: {:?}",
-                self.messages.lock().unwrap()
-            );
+            assert!(start.elapsed() < PATIENCE, "{text:?} never sent: {:?}", self.messages.lock().unwrap());
             std::thread::sleep(Duration::from_millis(50));
         }
     }
@@ -196,9 +198,17 @@ impl RawClient {
     fn wait_for_screen(&self, text: &str) {
         let start = Instant::now();
         while !String::from_utf8_lossy(&self.screen.lock().unwrap()).contains(text) {
-            assert!(start.elapsed() < Duration::from_secs(10), "{text:?} never shown");
+            assert!(start.elapsed() < PATIENCE, "{text:?} never shown");
             std::thread::sleep(Duration::from_millis(50));
         }
+    }
+}
+
+impl Drop for RawClient {
+    fn drop(&mut self) {
+        // The thread that keeps what the server sends holds the connection too: closed for both,
+        // so that the server sees this client go when the test lets go of it.
+        let _ = self.stream.shutdown(std::net::Shutdown::Both);
     }
 }
 
@@ -218,7 +228,7 @@ fn wait_production(env: &Env, name: &str) {
         if pane["production"].is_string() {
             return;
         }
-        assert!(start.elapsed() < Duration::from_secs(10), "never seen as production: {pane}");
+        assert!(start.elapsed() < PATIENCE, "never seen as production: {pane}");
         std::thread::sleep(Duration::from_millis(100));
     }
 }
@@ -1973,7 +1983,7 @@ fn a_directory_that_becomes_a_terraform_one_is_guarded() {
     std::fs::write(tf.join(".terraform/environment"), "prod\n").unwrap();
     let start = Instant::now();
     while production().is_none() {
-        assert!(start.elapsed() < Duration::from_secs(5), "never seen as production");
+        assert!(start.elapsed() < PATIENCE, "never seen as production");
         std::thread::sleep(Duration::from_millis(100));
     }
     assert_eq!(production().as_deref(), Some("Terraform workspace prod"));
@@ -2000,7 +2010,7 @@ fn production_panes_refuse_unasked_cli_input() {
             assert_eq!(ops["contexts"][0], "tf:prod");
             break;
         }
-        assert!(start.elapsed() < Duration::from_secs(10), "never seen as production: {ops}");
+        assert!(start.elapsed() < PATIENCE, "never seen as production: {ops}");
         std::thread::sleep(Duration::from_millis(100));
     }
     let out = env.try_run(&["send", "-p", "ops", "echo", "hi"]);
@@ -2720,7 +2730,7 @@ fn a_tool_asks_when_the_kubeconfig_just_switched_to_production() {
         if panes.contains("dev") {
             break;
         }
-        assert!(start.elapsed() < Duration::from_secs(20), "the pane's context is read: {panes}");
+        assert!(start.elapsed() < PATIENCE, "the pane's context is read: {panes}");
         std::thread::sleep(Duration::from_millis(100));
     }
     let mut client = env.client();
@@ -2771,9 +2781,34 @@ fn wait_for_context(env: &Env, context: &str) {
         if panes.contains(context) {
             return;
         }
-        assert!(start.elapsed() < Duration::from_secs(20), "the pane's context is read: {panes}");
+        assert!(start.elapsed() < PATIENCE, "the pane's context is read: {panes}");
         std::thread::sleep(Duration::from_millis(100));
     }
+}
+
+/// Wait until the server reads `file` again, a kubeconfig that was just changed and whose reads
+/// `<file>.slow` makes last: the next scan starts that read (within 3.4 s, later on a loaded
+/// machine), and what is typed from here on finds it under way.
+#[cfg(target_os = "linux")]
+fn wait_for_slow_read(file: &Path) {
+    let reading = slow_read_marker(file);
+    wait_until(PATIENCE, "the changed kubeconfig is never read again", || reading.exists());
+}
+
+/// Wait until that read of `file` has ended, then for the server to have taken what it said.
+#[cfg(target_os = "linux")]
+fn wait_for_slow_read_to_end(file: &Path) {
+    let reading = slow_read_marker(file);
+    wait_until(PATIENCE, "the read of the kubeconfig never ended", || !reading.exists());
+    std::thread::sleep(Duration::from_millis(1500));
+}
+
+/// What sits next to `file` while the server reads it slowly.
+#[cfg(target_os = "linux")]
+fn slow_read_marker(file: &Path) -> PathBuf {
+    let mut reading = file.as_os_str().to_owned();
+    reading.push(".reading");
+    PathBuf::from(reading)
 }
 
 /// A tool that acts waits for the pane's kubeconfig to be read again, in a list that keeps
@@ -2863,7 +2898,7 @@ fn broadcast_waits_while_a_pane_context_is_read_again() {
     // `kubectx prod-x`: the next scan (within 3.4 s) starts a read that lasts 4.8 s.
     std::fs::write(env.root.join("kube.yaml.slow"), "").unwrap();
     std::fs::write(&kube, kubeconfig_text("prod-x")).unwrap();
-    std::thread::sleep(Duration::from_millis(3900));
+    wait_for_slow_read(&kube);
     typed(b"echo hello-bcast");
     std::thread::sleep(Duration::from_millis(600));
     for pane in ["a", "b"] {
@@ -2871,7 +2906,7 @@ fn broadcast_waits_while_a_pane_context_is_read_again() {
         assert!(!screen.contains("hello-bcast"), "typed while {pane}'s context was read:\n{screen}");
     }
     // The read ends, says production: the keys are asked about, not sent.
-    std::thread::sleep(Duration::from_millis(5000));
+    wait_for_slow_read_to_end(&kube);
     let screen = env.run(&["read", "-p", "b"]);
     assert!(!screen.contains("hello-bcast"), "keys reached a production pane unasked:\n{screen}");
     typed(b"y");
@@ -2907,10 +2942,10 @@ fn a_no_drops_everything_typed_while_a_context_was_read() {
     std::thread::sleep(Duration::from_millis(500));
     std::fs::write(env.root.join("kube.yaml.slow"), "").unwrap();
     std::fs::write(&kube, kubeconfig_text("prod-x")).unwrap();
-    std::thread::sleep(Duration::from_millis(3900));
+    wait_for_slow_read(&kube);
     // A whole command, Enter included, typed while the read goes on.
     typed(b" echo should-not-run\r");
-    std::thread::sleep(Duration::from_millis(5600));
+    wait_for_slow_read_to_end(&kube);
     // The read said production: the question is about all of it. No.
     typed(b"n");
     std::thread::sleep(Duration::from_millis(1500));
@@ -2957,7 +2992,7 @@ fn a_yes_waits_for_a_context_read_and_holds_only_if_nothing_changed() {
     // Meanwhile c becomes production, and its read lasts.
     std::fs::write(env.root.join("kube-c.yaml.slow"), "").unwrap();
     std::fs::write(&kube_c, kubeconfig_text("prod-x")).unwrap();
-    std::thread::sleep(Duration::from_millis(3900));
+    wait_for_slow_read(&kube_c);
     // Yes, before c's read ends: it was not production when asked.
     typed(b"y");
     std::thread::sleep(Duration::from_millis(6000));
@@ -2970,7 +3005,7 @@ fn a_yes_waits_for_a_context_read_and_holds_only_if_nothing_changed() {
     typed(b"\x1b[200~echo answered-again\x1b[201~");
     std::thread::sleep(Duration::from_millis(500));
     std::fs::write(&kube_c, kubeconfig_text("prod-x")).unwrap();
-    std::thread::sleep(Duration::from_millis(3900));
+    wait_for_slow_read(&kube_c);
     typed(b"y");
     for pane in ["a", "b", "c"] {
         env.wait_for_text(pane, "echo answered-again");
@@ -3006,7 +3041,7 @@ fn input_that_waited_goes_where_it_was_typed() {
     // The same context written again: a read that changes nothing, and lasts.
     std::fs::write(env.root.join("kube.yaml.slow"), "").unwrap();
     std::fs::write(&kube, kubeconfig_text("dev")).unwrap();
-    std::thread::sleep(Duration::from_millis(3900));
+    wait_for_slow_read(&kube);
     typed(b"echo typed-in-one");
     std::thread::sleep(Duration::from_millis(300));
     // Tab two is shown before the read ends.
@@ -3175,18 +3210,25 @@ fn a_production_directory_left_and_come_back_to_is_still_guarded() {
     std::fs::create_dir_all(infra.join(".terraform")).unwrap();
     std::fs::write(infra.join(".terraform/environment"), "prod-a\n").unwrap();
     env.workspace("w", &format!("layout {{\n    pane name=\"b\" cwd=\"{}\" command=\"sh\"\n}}\n", infra.display()));
-    env.run(&["open", "w"]);
+    // A read of the environment file takes ten minutes while `environment.slow` exists: longer
+    // than this test waits for anything.
+    let out = env.cmd(&["open", "w"]).env("KRAAL_TEST_SLOW_KUBECONFIG_MS", "600000").output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     wait_for_context(&env, "tf:prod-a");
     env.wait_for_text("b", "$");
     let refused = |text: &str| !env.cmd(&["send", "-p", "b", "-e", text]).output().unwrap().status.success();
     assert!(refused("echo here"), "b is production");
     env.run(&["send", "-p", "b", "-e", "--production", "cd /"]);
+    wait_for_contexts(&env, "b", &[], None);
     // A scan (every 3 s) passes while no pane is in the directory.
     std::thread::sleep(Duration::from_millis(4000));
     assert!(!refused("echo away"), "away from the directory, b is not production");
+    // The directory cannot be read again in time from here on: what is said of it once the pane
+    // is back is what was known, however long the pane takes to get there.
+    std::fs::write(infra.join(".terraform/environment.slow"), "").unwrap();
     env.run(&["send", "-p", "b", "-e", &format!("cd {}", infra.display())]);
-    std::thread::sleep(Duration::from_millis(300));
-    assert!(refused("echo back"), "back in the directory, b is production again at once");
+    wait_for_contexts(&env, "b", &["tf:prod-a"], Some("Terraform workspace prod-a"));
+    assert!(refused("echo back"), "back in the directory, b is production again");
 }
 
 /// The pane named `name`, as `kraal panes --json` lists it.
@@ -3205,7 +3247,7 @@ fn wait_for_contexts(env: &Env, name: &str, contexts: &[&str], why: Option<&str>
         if pane["contexts"] == serde_json::json!(contexts) && pane["production"] == serde_json::json!(why) {
             return;
         }
-        assert!(start.elapsed() < Duration::from_secs(10), "never {contexts:?} ({why:?}): {pane}");
+        assert!(start.elapsed() < PATIENCE, "never {contexts:?} ({why:?}): {pane}");
         std::thread::sleep(Duration::from_millis(100));
     }
 }
@@ -3350,7 +3392,7 @@ fn a_long_paste_cut_for_production_takes_the_enter_after_it_along() {
     // rest of the paste, then an Enter, wait for it.
     std::fs::write(env.root.join("kube.yaml.slow"), "").unwrap();
     std::fs::write(&kube, kubeconfig_text("prod-x")).unwrap();
-    std::thread::sleep(Duration::from_millis(3900));
+    wait_for_slow_read(&kube);
     for _ in 0..16 {
         client.send(&piece);
     }
@@ -3613,26 +3655,33 @@ fn an_idle_server_sleeps() {
     env.wait_for_text("a", "$");
     env.wait_for_text("b", "$");
     let pid = env.server_pid().expect("the server's pid");
-    // The times its threads went to sleep (not those another program took the processor from
-    // them while they ran: that depends on the machine's load).
-    let switches = || -> u64 {
+    // The times each of its threads went to sleep (not those another program took the processor
+    // from them while they ran: that depends on the machine's load).
+    let sleeps = || -> std::collections::HashMap<std::ffi::OsString, u64> {
         let tasks = std::fs::read_dir(format!("/proc/{pid}/task")).unwrap();
         tasks
             .flatten()
-            .filter_map(|t| std::fs::read_to_string(t.path().join("status")).ok())
-            .flat_map(|s| {
-                s.lines()
-                    .filter(|l| l.starts_with("voluntary_ctxt_switches"))
-                    .filter_map(|l| l.split_whitespace().last()?.parse::<u64>().ok())
-                    .collect::<Vec<_>>()
+            .filter_map(|t| {
+                let status = std::fs::read_to_string(t.path().join("status")).ok()?;
+                let line = status.lines().find(|l| l.starts_with("voluntary_ctxt_switches"))?;
+                Some((t.file_name(), line.split_whitespace().last()?.parse().ok()?))
             })
-            .sum()
+            .collect()
     };
     // Past the requests above, and what they started.
     std::thread::sleep(Duration::from_secs(4));
-    let before = switches();
-    std::thread::sleep(Duration::from_secs(6));
-    let woke = switches() - before;
+    let start = Instant::now();
+    let woke: u64 = loop {
+        let before = sleeps();
+        std::thread::sleep(Duration::from_secs(6));
+        let after = sleeps();
+        // A thread that ended meanwhile was still finishing what those requests started, as on
+        // a loaded machine: the server was not idle yet, and is looked at again.
+        if before.keys().all(|thread| after.contains_key(thread)) {
+            break after.iter().map(|(thread, now)| now - before.get(thread).copied().unwrap_or(0)).sum();
+        }
+        assert!(start.elapsed() < Duration::from_secs(60), "the server's threads keep ending: {after:?}");
+    };
     // At most its periodic work, and what that starts: not the readers of the panes, nor
     // anything else.
     assert!(woke <= 6, "{woke} wake-ups in 6 s");
@@ -6003,14 +6052,14 @@ fn install_script_installs_a_checked_release() {
     assert!(!dir.join("kraal").exists(), "nothing installed");
 }
 
-/// A throwaway sshd on 127.0.0.1 (port 2305 unless said otherwise) with its own host and user
-/// keys, and an `ssh` that uses only them (never ~/.ssh): a server reached for real. `None` where
-/// no sshd can run here.
+/// A throwaway sshd on 127.0.0.1 with its own host and user keys, and an `ssh` that uses only
+/// them (never ~/.ssh): a server reached for real. `None` where no sshd can run here.
 #[cfg(target_os = "linux")]
 struct Sshd {
     child: std::process::Child,
-    /// Holds the port for this test, against other test runs on this machine.
-    _lock: std::fs::File,
+    /// Where it listens: a port of its own, so that no test waits for the server of another
+    /// one, in this run of the tests or in another on this machine.
+    port: u16,
     /// Where that `ssh` is, to put first in PATH.
     bin: PathBuf,
 }
@@ -6018,23 +6067,10 @@ struct Sshd {
 #[cfg(target_os = "linux")]
 impl Sshd {
     fn start(dir: &Path) -> Option<Sshd> {
-        Sshd::start_on(dir, 2305)
-    }
-
-    fn start_on(dir: &Path, port: u16) -> Option<Sshd> {
-        use std::os::fd::AsRawFd;
         let sshd = ["/usr/sbin/sshd", "/usr/bin/sshd"].into_iter().map(PathBuf::from).find(|p| p.exists())?;
         let ssh =
             ["/usr/bin/ssh", "/bin/ssh", "/usr/local/bin/ssh"].into_iter().map(PathBuf::from).find(|p| p.exists())?;
         std::fs::create_dir_all(dir).unwrap();
-        let lock = std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .open(format!("/tmp/kraal-test-sshd-{port}.lock"))
-            .unwrap();
-        // SAFETY: flock on a descriptor we own; released when it is closed.
-        unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) };
         for key in ["host_key", "user_key"] {
             let made =
                 Command::new("ssh-keygen").args(["-q", "-t", "ed25519", "-N", "", "-f"]).arg(dir.join(key)).status();
@@ -6045,18 +6081,7 @@ impl Sshd {
         std::fs::copy(dir.join("user_key.pub"), dir.join("authorized_keys")).unwrap();
         let user = String::from_utf8(Command::new("id").arg("-un").output().unwrap().stdout).unwrap();
         let d = dir.display();
-        std::fs::write(
-            dir.join("sshd_config"),
-            format!(
-                "Port {port}\nListenAddress 127.0.0.1\nHostKey {d}/host_key\nPidFile {d}/sshd.pid\n\
-                 AuthorizedKeysFile {d}/authorized_keys\nStrictModes no\nUsePAM no\nPasswordAuthentication no\n\
-                 KbdInteractiveAuthentication no\nPubkeyAuthentication yes\nAllowUsers {}\n",
-                user.trim()
-            ),
-        )
-        .unwrap();
         let host_key = std::fs::read_to_string(dir.join("host_key.pub")).unwrap();
-        std::fs::write(dir.join("known_hosts"), format!("[127.0.0.1]:{port} {host_key}")).unwrap();
         std::fs::write(
             dir.join("ssh_config"),
             format!(
@@ -6068,22 +6093,54 @@ impl Sshd {
         .unwrap();
         let bin = dir.join("bin");
         std::fs::create_dir_all(&bin).unwrap();
-        write_script(&bin.join("ssh"), &format!("#!/bin/sh\nexec '{}' -F '{d}/ssh_config' \"$@\"\n", ssh.display()));
+        // kraal gives a server a few seconds to answer. This one is on this machine, as slow as
+        // the tests beside it make it, and that limit is not what its tests are about: its `ssh`
+        // waits as long as they do (of an option given twice, ssh takes the first).
+        write_script(
+            &bin.join("ssh"),
+            &format!(
+                "#!/bin/sh\nexec '{}' -F '{d}/ssh_config' -o ConnectTimeout={} \"$@\"\n",
+                ssh.display(),
+                PATIENCE.as_secs()
+            ),
+        );
         let log = dir.join("sshd.log");
-        let child =
-            Command::new(&sshd).arg("-D").arg("-f").arg(dir.join("sshd_config")).arg("-E").arg(&log).spawn().ok()?;
-        let mut sshd = Sshd { child, _lock: lock, bin };
-        let start = Instant::now();
         loop {
-            let said = std::fs::read_to_string(&log).unwrap_or_default();
-            if said.contains("Server listening") {
-                return Some(sshd);
+            // A port the system says is free. Another program may take it before sshd does:
+            // sshd says so, and another one is asked for.
+            let port = std::net::TcpListener::bind(("127.0.0.1", 0)).ok()?.local_addr().ok()?.port();
+            std::fs::write(
+                dir.join("sshd_config"),
+                format!(
+                    "Port {port}\nListenAddress 127.0.0.1\nHostKey {d}/host_key\nPidFile {d}/sshd.pid\n\
+                     AuthorizedKeysFile {d}/authorized_keys\nStrictModes no\nUsePAM no\nPasswordAuthentication no\n\
+                     KbdInteractiveAuthentication no\nPubkeyAuthentication yes\nAllowUsers {}\n",
+                    user.trim()
+                ),
+            )
+            .unwrap();
+            std::fs::write(dir.join("known_hosts"), format!("[127.0.0.1]:{port} {host_key}")).unwrap();
+            let _ = std::fs::remove_file(&log);
+            let config = dir.join("sshd_config");
+            let child = Command::new(&sshd).arg("-D").arg("-f").arg(config).arg("-E").arg(&log).spawn().ok()?;
+            let mut sshd = Sshd { child, port, bin: bin.clone() };
+            let start = Instant::now();
+            let said = || std::fs::read_to_string(&log).unwrap_or_default();
+            loop {
+                if said().contains("Server listening") {
+                    return Some(sshd);
+                }
+                // What it said last is read once it has ended.
+                let ended = sshd.child.try_wait().ok().flatten().is_some();
+                if ended && said().contains("Address already in use") {
+                    break;
+                }
+                if ended || start.elapsed() > PATIENCE {
+                    eprintln!("sshd did not start: {}", said());
+                    return None;
+                }
+                std::thread::sleep(Duration::from_millis(50));
             }
-            if sshd.child.try_wait().ok().flatten().is_some() || start.elapsed() > Duration::from_secs(10) {
-                eprintln!("sshd did not start: {said}");
-                return None;
-            }
-            std::thread::sleep(Duration::from_millis(50));
         }
     }
 }
@@ -6091,9 +6148,12 @@ impl Sshd {
 #[cfg(target_os = "linux")]
 impl Drop for Sshd {
     fn drop(&mut self) {
-        // SAFETY: the pid of the child this test started, not reaped yet.
-        unsafe { libc::kill(self.child.id() as i32, libc::SIGTERM) };
-        let _ = self.child.wait();
+        // One that could not start has ended, and its pid may be another program's by now.
+        if let Ok(None) = self.child.try_wait() {
+            // SAFETY: the pid of the child this test started, not reaped yet.
+            unsafe { libc::kill(self.child.id() as i32, libc::SIGTERM) };
+            let _ = self.child.wait();
+        }
     }
 }
 
@@ -6111,7 +6171,11 @@ fn a_server_file_is_edited_in_the_local_editor() {
     };
     let user = String::from_utf8(Command::new("id").arg("-un").output().unwrap().stdout).unwrap();
     let entry = |name: &str| {
-        format!("[[server]]\nname = \"{name}\"\nhost = \"127.0.0.1\"\nport = 2305\nuser = \"{}\"\n", user.trim())
+        format!(
+            "[[server]]\nname = \"{name}\"\nhost = \"127.0.0.1\"\nport = {}\nuser = \"{}\"\n",
+            sshd.port,
+            user.trim()
+        )
     };
     std::fs::write(env.root.join("config/kraal/servers.toml"), format!("{}\n{}", entry("box"), entry("box-prod")))
         .unwrap();
@@ -6138,7 +6202,7 @@ fn a_server_file_is_edited_in_the_local_editor() {
     let wait_until = |what: &str, ok: &dyn Fn() -> bool| {
         let start = Instant::now();
         while !ok() {
-            assert!(start.elapsed() < Duration::from_secs(15), "timed out waiting: {what}");
+            assert!(start.elapsed() < PATIENCE, "timed out waiting: {what}");
             std::thread::sleep(Duration::from_millis(50));
         }
     };
@@ -6624,7 +6688,7 @@ fn the_paste_buffers_list_deletes_and_stays_open() {
     client.send(b"\x1b");
 }
 
-/// A session, a real sshd (on its own port) as the server `box`, and a local editor told what
+/// A session, a real sshd as the server `box`, and a local editor told what
 /// to do, for the tests of editing a server's file. The commands kraal runs there find a `sudo`
 /// that takes the password `pass word` (and runs them as this user), and wait 2 seconds once
 /// the file `slow` exists.
@@ -6639,13 +6703,17 @@ struct EditBench {
 
 #[cfg(target_os = "linux")]
 impl EditBench {
-    fn new(name: &str, port: u16) -> Option<EditBench> {
+    fn new(name: &str) -> Option<EditBench> {
         let env = Env::new(name);
-        let sshd = Sshd::start_on(&env.root.join("sshd"), port)?;
+        let sshd = Sshd::start(&env.root.join("sshd"))?;
         let user = String::from_utf8(Command::new("id").arg("-un").output().unwrap().stdout).unwrap();
         std::fs::write(
             env.root.join("config/kraal/servers.toml"),
-            format!("[[server]]\nname = \"box\"\nhost = \"127.0.0.1\"\nport = {port}\nuser = \"{}\"\n", user.trim()),
+            format!(
+                "[[server]]\nname = \"box\"\nhost = \"127.0.0.1\"\nport = {}\nuser = \"{}\"\n",
+                sshd.port,
+                user.trim()
+            ),
         )
         .unwrap();
         let cfg = env.root.join("config/kraal/config.toml");
@@ -6703,7 +6771,7 @@ impl EditBench {
     fn wait_until(&self, what: &str, ok: &dyn Fn() -> bool) {
         let start = Instant::now();
         while !ok() {
-            assert!(start.elapsed() < Duration::from_secs(15), "timed out waiting: {what}");
+            assert!(start.elapsed() < PATIENCE, "timed out waiting: {what}");
             std::thread::sleep(Duration::from_millis(50));
         }
     }
@@ -6742,7 +6810,7 @@ fn read(p: &Path) -> String {
 #[test]
 fn a_server_file_is_edited_as_root_through_sudo() {
     use std::os::unix::fs::PermissionsExt;
-    let Some(b) = EditBench::new("rsudo", 2311) else {
+    let Some(b) = EditBench::new("rsudo") else {
         eprintln!("skipped: no sshd can run here");
         return;
     };
@@ -6804,7 +6872,7 @@ fn a_server_file_is_edited_as_root_through_sudo() {
 #[cfg(target_os = "linux")]
 #[test]
 fn keeping_the_servers_version_never_drops_a_later_save() {
-    let Some(b) = EditBench::new("rkeep", 2311) else {
+    let Some(b) = EditBench::new("rkeep") else {
         eprintln!("skipped: no sshd can run here");
         return;
     };
