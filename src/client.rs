@@ -1014,6 +1014,8 @@ mod tests {
         let start = Instant::now();
         assert!(pause.pause());
         assert!(start.elapsed() < Duration::from_millis(500), "{:?}", start.elapsed());
+        // Once it went to sleep (it says it parked just before).
+        std::thread::sleep(Duration::from_millis(50));
         let parked = switches();
         std::thread::sleep(Duration::from_millis(300));
         assert_eq!(switches(), parked, "a paused reader sleeps too");

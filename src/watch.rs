@@ -1,6 +1,7 @@
-//! Changes in directories and files, told by the kernel rather than looked for: inotify on
-//! Linux, kqueue on macOS. One thread sleeps on the kernel's queue and passes on which watches
-//! saw something. Elsewhere nothing can be watched: callers keep looking for themselves.
+//! Changes in directories, told by the kernel rather than looked for: inotify on Linux, kqueue
+//! on macOS. One thread sleeps on the kernel's queue and passes on which watches saw something.
+//! Elsewhere nothing can be watched, and a network file system does not tell what other machines
+//! change (see [`local`]): callers then keep looking for themselves.
 
 use std::io;
 use std::path::Path;
@@ -30,15 +31,62 @@ impl Watcher {
         Ok(Watcher { imp: imp::Watcher::new(changed)? })
     }
 
-    /// Watch `path`: a directory's entries (added, removed, renamed into or out of it; on Linux
-    /// also written), or a file's content. Watching the same path again may give the same id;
-    /// each `add` takes its own `remove`.
+    /// Watch the entries of directory `path`: added, removed, renamed into or out of it (not
+    /// what is written to its files: what git writes, it renames into place). Watching the same
+    /// path again may give the same id; each `add` takes its own `remove`.
     pub fn add(&mut self, path: &Path) -> io::Result<WatchId> {
         self.imp.add(path)
     }
 
     pub fn remove(&mut self, id: WatchId) {
         self.imp.remove(id)
+    }
+}
+
+/// Whether `path` is on a file system that tells about every change made to it: not a network
+/// one, where another machine's changes go untold. `false` when it cannot be told.
+pub fn local(path: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    let Ok(c) = std::ffi::CString::new(path.as_os_str().as_bytes()) else { return false };
+    // SAFETY: statfs fills the zeroed struct for a NUL-terminated path.
+    let mut st: libc::statfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statfs(c.as_ptr(), &mut st) } != 0 {
+        return false;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        // NFS, SMB and CIFS (three), FUSE (sshfs and the like), Coda, AFS (two), Ceph, 9P (WSL's
+        // Windows drives), OCFS2, GFS2, Lustre, NCP, OrangeFS, GPFS, VirtualBox shared folders.
+        const REMOTE: [u32; 17] = [
+            0x6969,
+            0x517B,
+            0xFF53_4D42,
+            0xFE53_4D42,
+            0x6573_5546,
+            0x7375_7245,
+            0x5346_414F,
+            0x6B41_4653,
+            0x00C3_6400,
+            0x0102_1997,
+            0x7461_636F,
+            0x0116_1970,
+            0x0BD0_0BD0,
+            0x564C,
+            0x2003_0528,
+            0x4750_4653,
+            0x786F_4256,
+        ];
+        !REMOTE.contains(&(st.f_type as u32))
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let name: Vec<u8> = st.f_fstypename.iter().take_while(|c| **c != 0).map(|c| *c as u8).collect();
+        st.f_flags & libc::MNT_LOCAL as u32 != 0 && !name.windows(4).any(|w| w == b"fuse")
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = st;
+        false
     }
 }
 
@@ -85,16 +133,15 @@ mod imp {
 
     use super::{Change, WatchId};
 
-    /// What is reported: entries of a directory added, removed, moved, written, and the watched
-    /// thing itself going.
+    /// What is reported: entries of a directory added, removed, moved, and the directory itself
+    /// going. Anything but a directory is refused.
     const MASK: u32 = libc::IN_CREATE
         | libc::IN_DELETE
         | libc::IN_MOVED_FROM
         | libc::IN_MOVED_TO
-        | libc::IN_CLOSE_WRITE
-        | libc::IN_MODIFY
         | libc::IN_DELETE_SELF
-        | libc::IN_MOVE_SELF;
+        | libc::IN_MOVE_SELF
+        | libc::IN_ONLYDIR;
 
     pub struct Watcher {
         fd: OwnedFd,
@@ -192,9 +239,9 @@ mod imp {
 
     use super::{Change, WatchId};
 
-    /// What is reported: a directory's entries changing (`NOTE_WRITE`), a file written or
-    /// grown, and the watched thing itself going.
-    const NOTES: u32 = libc::NOTE_WRITE | libc::NOTE_EXTEND | libc::NOTE_DELETE | libc::NOTE_RENAME | libc::NOTE_REVOKE;
+    /// What is reported: a directory's entries changing (`NOTE_WRITE`), and the directory itself
+    /// going.
+    const NOTES: u32 = libc::NOTE_WRITE | libc::NOTE_DELETE | libc::NOTE_RENAME | libc::NOTE_REVOKE;
 
     pub struct Watcher {
         queue: Arc<OwnedFd>,
@@ -367,6 +414,12 @@ mod tests {
         }
         drop(w);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_local_directory_is_told_from_one_that_cannot_be_trusted() {
+        assert!(local(&std::env::temp_dir()));
+        assert!(!local(Path::new("/no/such/directory/kraal")), "what cannot be looked at is not trusted");
     }
 
     #[test]

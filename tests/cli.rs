@@ -1357,6 +1357,36 @@ fn events_stream_and_hooks() {
     assert!(String::from_utf8_lossy(&out.stderr).contains("no such event"));
 }
 
+/// A directory a quiet pane is in that becomes a Terraform one (`terraform init` run from
+/// elsewhere) is guarded as soon as it is: the change is told, not looked for now and then.
+#[test]
+fn a_directory_that_becomes_a_terraform_one_is_guarded() {
+    let env = Env::new("tfnew");
+    let tf = env.root.join("infra");
+    std::fs::create_dir_all(&tf).unwrap();
+    env.workspace("w", &format!("layout {{\n    pane name=\"t\" cwd={:?}\n}}\n", tf.display().to_string()));
+    env.run(&["open", "w"]);
+    env.wait_for_text("t", "$");
+    let production = || {
+        let panes: serde_json::Value = serde_json::from_str(&env.run(&["panes", "--json"])).unwrap();
+        let t = panes.as_array().unwrap().iter().find(|p| p["name"] == "t").cloned().unwrap();
+        t["production"].as_str().map(String::from)
+    };
+    // Known not to be a Terraform directory, and quiet.
+    std::thread::sleep(Duration::from_secs(4));
+    assert_eq!(production(), None);
+    std::fs::create_dir_all(tf.join(".terraform")).unwrap();
+    std::fs::write(tf.join(".terraform/environment"), "prod\n").unwrap();
+    let start = Instant::now();
+    while production().is_none() {
+        assert!(start.elapsed() < Duration::from_secs(5), "never seen as production");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert_eq!(production().as_deref(), Some("Terraform workspace prod"));
+    let out = env.try_run(&["send", "-p", "t", "echo", "hi"]);
+    assert!(!out.status.success(), "sent to production");
+}
+
 #[test]
 fn production_panes_refuse_unasked_cli_input() {
     let env = Env::new("prodguard");
@@ -2675,12 +2705,24 @@ fn git_in_frames_follows_changes_made_elsewhere() {
 #[test]
 fn an_idle_server_sleeps() {
     let env = Env::new("sleeps");
-    env.workspace("w", "layout {\n    pane name=\"a\"\n    pane name=\"b\"\n}\n");
+    // In a directory where nothing happens (the home directory may be busy: its changes are
+    // looked at).
+    let quiet = env.root.join("quiet");
+    std::fs::create_dir_all(&quiet).unwrap();
+    env.workspace(
+        "w",
+        &format!(
+            "layout {{\n    pane name=\"a\" cwd={0:?}\n    pane name=\"b\" cwd={0:?}\n}}\n",
+            quiet.display().to_string()
+        ),
+    );
     env.run(&["open", "w"]);
     let client = RawClient::attach(&env, "w");
     env.wait_for_text("a", "$");
     env.wait_for_text("b", "$");
     let pid = env.server_pid().expect("the server's pid");
+    // The times its threads went to sleep (not those another program took the processor from
+    // them while they ran: that depends on the machine's load).
     let switches = || -> u64 {
         let tasks = std::fs::read_dir(format!("/proc/{pid}/task")).unwrap();
         tasks
@@ -2688,7 +2730,7 @@ fn an_idle_server_sleeps() {
             .filter_map(|t| std::fs::read_to_string(t.path().join("status")).ok())
             .flat_map(|s| {
                 s.lines()
-                    .filter(|l| l.contains("ctxt_switches"))
+                    .filter(|l| l.starts_with("voluntary_ctxt_switches"))
                     .filter_map(|l| l.split_whitespace().last()?.parse::<u64>().ok())
                     .collect::<Vec<_>>()
             })
@@ -2699,9 +2741,9 @@ fn an_idle_server_sleeps() {
     let before = switches();
     std::thread::sleep(Duration::from_secs(6));
     let woke = switches() - before;
-    // Its periodic work every 3 s, and what that starts: not the readers of the panes, nor
+    // At most its periodic work, and what that starts: not the readers of the panes, nor
     // anything else.
-    assert!(woke <= 20, "{woke} wake-ups in 6 s");
+    assert!(woke <= 6, "{woke} wake-ups in 6 s");
     // Still there when something happens.
     env.run(&["send", "-p", "a", "-e", "echo still-awake"]);
     env.wait_for_text("a", "still-awake");

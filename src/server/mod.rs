@@ -10,11 +10,11 @@ mod clients;
 mod commands;
 mod contexts;
 mod definitions;
+mod dirwatch;
 mod edits;
 pub mod events;
 mod fileman;
 mod geometry;
-mod gitwatch;
 mod graphics;
 mod hints;
 mod input;
@@ -374,8 +374,13 @@ pub struct Server {
     persist_dirty: bool,
     last_persist: Instant,
     last_tick: Instant,
-    /// Nothing happened for a while: the tick comes with the scan only (see [`Server::next_tick`]).
+    /// Nothing happened for a while: the tick comes with the scan, or seldom (see
+    /// [`Server::next_tick`]).
     idle: bool,
+    /// The scan must come every [`SCAN_EVERY`] (see [`Server::scan_needed`]).
+    scan_polled: bool,
+    /// Kubeconfigs are in use: they are read at every scan.
+    kube_polled: bool,
     /// When a client last said something (a key, a request, a connection).
     last_contact: Instant,
     /// When the contexts, the accounts' usage and the listening ports were last read.
@@ -423,8 +428,9 @@ pub struct Server {
     limit_events: std::collections::HashSet<PaneId>,
     /// Branch and changes per directory (None: not a repository).
     pub git: HashMap<PathBuf, Option<crate::git::GitInfo>>,
-    /// When to ask git about them again, and the watches on their repositories.
-    gitwatch: gitwatch::GitWatch,
+    /// The directories panes are in: when to ask git about them again, and the watches on
+    /// them, on their repositories and on the configuration's directories.
+    dirwatch: dirwatch::DirWatch,
     git_requests: Sender<PathBuf>,
     /// Current Kubernetes context per `KUBECONFIG` value in use.
     pub kube: HashMap<String, crate::context::KubeFile>,
@@ -515,10 +521,14 @@ type JobDone = Box<dyn FnOnce(&mut Server, Box<dyn std::any::Any + Send>)>;
 /// The periodic work (agents, previews, runbooks...) runs this often while something happens:
 /// output, keys, requests, or work that needs watching (see [`Server::busy`]).
 const TICK: Duration = Duration::from_millis(400);
-/// Once nothing has for this long, it runs only with the scan.
+/// Once nothing has for this long, it runs only with the scan...
 const ACTIVE_FOR: Duration = Duration::from_secs(3);
+/// ...or this often when nothing needs one (see [`Server::scan_needed`]): what changes meanwhile
+/// is told (see [`dirwatch`]), and the first key or request after a quiet spell runs the tick
+/// before anything else.
+const IDLE_EVERY: Duration = Duration::from_secs(30);
 /// The contexts, the accounts' usage and the ports something listens on are read again this
-/// often, whatever happens.
+/// often when they have to be looked at.
 const SCAN_EVERY: Duration = Duration::from_secs(3);
 const FRAME: Duration = Duration::from_millis(16);
 const INPUT_FLUSH: Duration = Duration::from_millis(30);
@@ -636,6 +646,8 @@ pub fn run(session: &str) -> Result<()> {
         last_persist: Instant::now(),
         last_tick: Instant::now(),
         idle: false,
+        scan_polled: true,
+        kube_polled: false,
         last_contact: Instant::now(),
         last_scan: Instant::now() - SCAN_EVERY,
         next_render: None,
@@ -678,7 +690,7 @@ pub fn run(session: &str) -> Result<()> {
         port_candidates: HashMap::new(),
         ports: Default::default(),
         git: HashMap::new(),
-        gitwatch: gitwatch::GitWatch::new(watcher),
+        dirwatch: dirwatch::DirWatch::new(watcher),
         git_requests: worktrees::spawn_git_worker(git_tx),
         kube: HashMap::new(),
         kube_cache: Default::default(),
@@ -888,7 +900,7 @@ impl Server {
         for r in [self.next_render, self.image_wake].into_iter().flatten() {
             d = d.min(r);
         }
-        if let Some(g) = self.gitwatch.next() {
+        if let Some(g) = self.dirwatch.next() {
             d = d.min(g);
         }
         for c in self.clients.values() {
@@ -956,14 +968,30 @@ impl Server {
             self.last_tick = now;
             self.tick(now);
             self.idle = self.quiet(now);
+            self.scan_polled = self.scan_needed();
         }
         self.check_waits();
     }
 
     /// When the next tick comes: [`TICK`] after the last while something happens, else when
-    /// the scan is due.
+    /// the scan is due, else [`IDLE_EVERY`] after the last.
     fn next_tick(&self) -> Instant {
-        if self.idle { self.last_scan + SCAN_EVERY } else { self.last_tick + TICK }
+        match (self.idle, self.scan_polled) {
+            (false, _) => self.last_tick + TICK,
+            (true, true) => self.last_scan + SCAN_EVERY,
+            (true, false) => self.last_tick + IDLE_EVERY,
+        }
+    }
+
+    /// Whether what the scan reads has to be looked at every [`SCAN_EVERY`]: contexts in use or
+    /// that cannot be watched, ports mentioned, repositories that cannot be watched, or the
+    /// directories of the configuration and of the accounts' usage.
+    fn scan_needed(&self) -> bool {
+        self.contexts_polled()
+            || self.dirwatch.polled()
+            || !self.dirwatch.config_watched()
+            || !self.port_candidates.is_empty()
+            || !self.ports.is_empty()
     }
 
     /// Something happens: the periodic work comes at its usual pace again (at once when it was
@@ -973,7 +1001,7 @@ impl Server {
     }
 
     /// Whether nothing happened for [`ACTIVE_FOR`] (no output, no key, no request) and nothing
-    /// needs watching: the periodic work can wait for the scan.
+    /// needs watching: the periodic work can wait.
     fn quiet(&self, now: Instant) -> bool {
         let recent = |t: Instant| now.saturating_duration_since(t) < ACTIVE_FOR;
         !recent(self.last_contact)
@@ -1198,7 +1226,7 @@ impl Server {
                 self.contact();
                 self.client_frame(id, kind, payload)
             }
-            Event::Watched(changes) => self.git_changed(&changes),
+            Event::Watched(changes) => self.watched(&changes),
             Event::ClientGone(id) => self.drop_client(id),
             Event::Git(dir, info) => self.git_result(dir, info),
             Event::Warning(w) => self.warnings.push(w),
@@ -1227,10 +1255,33 @@ impl Server {
         self.drop_empty_workspaces();
     }
 
-    /// A client said something.
+    /// A client said something. After a quiet spell, the tick runs first: what it is about to
+    /// act on (the processes in the panes, the definitions, the contexts read when they need
+    /// to be) is as fresh as when the server ticks all the time.
     fn contact(&mut self) {
-        self.last_contact = Instant::now();
-        self.wake();
+        let now = Instant::now();
+        self.last_contact = now;
+        if self.idle {
+            self.idle = false;
+            self.last_tick = now;
+            self.tick(now);
+        }
+    }
+
+    /// The watcher saw changes: in repositories (git is asked again), in the directories panes
+    /// are in (their Terraform workspace is read again), in the configuration's directories or
+    /// the accounts' usage (read again).
+    fn watched(&mut self, changes: &[crate::watch::Change]) {
+        let touched = self.dirwatch.changed(changes, Instant::now());
+        if !touched.dirs.is_empty() {
+            self.tf_touched(touched.dirs);
+            self.scan_polled = true;
+        }
+        if touched.config {
+            self.scan_definitions();
+            self.reload_usage();
+            self.check_limits();
+        }
     }
 
     fn pane_output(&mut self, id: PaneId, data: &[u8]) {

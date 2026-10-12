@@ -14,6 +14,12 @@ use crate::workspace::{self, LayoutNode, PaneKind, SizeSpec, WorkspaceDef};
 impl Server {
     pub(super) fn scan_definitions(&mut self) {
         self.last_def_scan = Instant::now();
+        // Their changes are told, and those of accounts.toml and of the accounts' usage,
+        // wherever they can be.
+        let mut dirs = self.config.workspace_dirs();
+        dirs.push(paths::config_dir());
+        dirs.push(paths::state_dir().join("usage"));
+        self.dirwatch.watch_config(&dirs);
         let defs: Vec<WorkspaceDef> = self.definitions().into_iter().filter_map(|(_, d)| d.ok()).collect();
         let names: Vec<String> = defs.iter().map(|d| d.name.clone()).collect();
         if names != self.def_names {
