@@ -44,7 +44,9 @@ impl Server {
             servers.insert(k.server.name.clone());
             servers.insert(k.server.host.clone());
         }
-        let found = hints::find(&rows, &servers, &self.hint_patterns);
+        // A local pane's files can be looked at: on a server, they cannot.
+        let dir = self.panes.get(&pane).filter(|p| p.ssh.is_none()).and_then(|p| p.current_cwd());
+        let found = hints::find(&rows, &servers, &self.hint_patterns, dir.as_deref());
         let hints = hints::label(found, &self.config.hints.alphabet);
         if hints.is_empty() {
             self.toast(id, "nothing to act on in this pane");

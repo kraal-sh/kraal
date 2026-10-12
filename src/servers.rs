@@ -655,6 +655,12 @@ impl Inventory {
         self.servers.iter().find(|x| x.same_address(s))
     }
 
+    /// The entry saved for the address of `s`, as written: the one [`Inventory::add`] keeps
+    /// rather than add `s`.
+    pub fn saved_mut(&mut self, s: &Server) -> Option<&mut Server> {
+        self.servers.iter_mut().find(|x| x.same_address(s))
+    }
+
     /// Add a server, choosing a free name if needed. Returns the stored entry's name.
     pub fn add(&mut self, server: Server) -> Result<String> {
         if let Some(existing) = self.find_target(&server).filter(|_| !server.host.is_empty()) {
@@ -839,6 +845,13 @@ pub fn resolve(known: &[Known], spec: &str) -> Option<Server> {
         return Some(s);
     }
     Some(Server { name: short_name(&probe.host), ..probe })
+}
+
+/// Whether `name`, given where another kind of name goes (a workspace's), reads as a server:
+/// `user@host`, or the name of a server kraal knows. Whoever gave it most likely meant the
+/// server.
+pub fn names_server(known: &[Known], name: &str) -> bool {
+    name.contains('@') || known.iter().any(|k| k.server.name == name)
 }
 
 /// Whether kraal knows `s`: an entry has its address, or `s` is a bare host that names an entry

@@ -301,6 +301,15 @@ pub fn load_file(path: &Path) -> Result<WorkspaceDef> {
     parse_workspace(&name, &src).with_context(|| format!("parsing {}", path.display()))
 }
 
+/// What to say when no workspace is named `name`: none is open under that name, and no file of
+/// `dirs` defines one. When the name reads as a server's (`names_server`: someone typed `kraal
+/// attach fpa@anvil`), it says how to attach to the kraal there, which is what was meant.
+pub fn unknown(name: &str, dirs: &[PathBuf], names_server: bool) -> String {
+    let dirs: Vec<String> = dirs.iter().map(|dir| crate::paths::shorten_home(dir)).collect();
+    let plain = format!("no workspace named {name:?} in {}", dirs.join(", "));
+    if names_server { format!("{plain}; to attach to kraal on that server: kraal attach --host {name}") } else { plain }
+}
+
 /// Serialise back to KDL (v1 syntax, Zellij-compatible, kraal extensions as
 /// properties), so that `parse_workspace(name, &to_kdl(&ws))` round-trips.
 ///

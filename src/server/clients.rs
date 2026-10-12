@@ -172,6 +172,12 @@ impl Server {
         if let Some(name) = workspace {
             match self.open_workspace(&name) {
                 Ok(ws) => target = Some(ws),
+                // A server's name where a workspace's goes (`kraal attach fpa@anvil`): this
+                // session is not what was meant, and the answer says how to reach that one.
+                Err(e) if crate::servers::names_server(&self.known_servers, &name) => {
+                    self.send_msg(id, &ServerMsg::exit(format!("{e:#}")));
+                    return;
+                }
                 Err(e) => self.warnings.push(format!("{e:#}")),
             }
         }

@@ -429,7 +429,7 @@ pub enum Request {
         remote: String,
         local: Option<u16>,
     },
-    /// Close a tunnel by its local port or id.
+    /// Close a tunnel by its local port.
     TunnelRemove {
         key: String,
     },

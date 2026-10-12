@@ -90,6 +90,12 @@ first to act on it instead, where the pane is (Tab again goes back to copying, E
 | pod | `kubectl logs -f` with the pane's context and namespace |
 | UUID | type it into the pane |
 
+A name with a number after a colon reads two ways: a file and its line (`lib.rs:42`), or a host
+and its port (`db.lan:5432`). In a local pane kraal looks in the pane's directory: it is a path
+when that file is there, an address when it is not. In an SSH pane it cannot look: it is an
+address when it names one of your servers, a path otherwise. With a directory or a column
+(`src/lib.rs:42`, `lib.rs:42:7`), it is always a path.
+
 Your own patterns run a tool with the match in `$KRAAL_SELECTION` (without `tool`, the label only
 copies), and `[hints] alphabet` chooses the letters labels are made of:
 

@@ -130,23 +130,24 @@ impl Running {
         }
     }
 
-    /// What restarting it stops, a line per program. The pane this command runs in is left
-    /// out: it comes back as it is.
+    /// What restarting it stops, a line per program, the same wherever this command runs: in a
+    /// pane of the session, only the command itself (with what runs it) is left out of what
+    /// stops there.
     fn stops(&self) -> Vec<String> {
         let unknown = || vec!["whatever runs in its panes (its server does not say)".to_string()];
         let Some((pid, _)) = &self.server else { return unknown() };
         let listed = client::request_within(&self.socket, Request::ListPanes, LIST_PANES_TIMEOUT);
         let Ok(Response::Panes(panes)) = listed else { return unknown() };
-        let own = own_pane(&self.name);
         let running = in_panes(*pid, &self.socket);
         let mut lines = Vec::new();
-        for p in panes.iter().filter(|p| Some(p.id) != own) {
+        for p in &panes {
             let here = running.get(&p.id);
-            let program = here.and_then(|r| r.program.as_deref());
             let jobs = here.map_or(&[][..], |r| &r.jobs);
-            for what in persist::stops_with_server(p, program, jobs) {
-                lines.push(persist::stopping_line(p, &what));
-            }
+            let stops = match here {
+                Some(InPane { asks: true, .. }) => persist::jobs_stopping_with_server(p, jobs),
+                _ => persist::stops_with_server(p, here.and_then(|r| r.program.as_deref()), jobs),
+            };
+            lines.extend(stops.iter().map(|what| persist::stopping_line(p, what)));
         }
         lines
     }
@@ -159,8 +160,11 @@ const LIST_PANES_TIMEOUT: Duration = Duration::from_secs(5);
 struct InPane {
     /// The program in the foreground of its terminal, or the pane's own program.
     program: Option<Vec<String>>,
-    /// The jobs in the background of its terminal.
+    /// The jobs in the background of its terminal, but this command when it is one of them.
     jobs: Vec<Vec<String>>,
+    /// This command is what runs in the foreground of its terminal (itself, or what runs it: a
+    /// script, an agent): no program that stops.
+    asks: bool,
 }
 
 /// What runs in each pane of the server `server` (listening on `socket`), by pane id. Read from
@@ -171,6 +175,8 @@ fn in_panes(server: u32, socket: &Path) -> HashMap<u32, InPane> {
     let Ok(listening) = std::fs::metadata(socket) else { return HashMap::new() };
     let ours =
         |path: &str| std::fs::metadata(path).is_ok_and(|m| m.dev() == listening.dev() && m.ino() == listening.ino());
+    // This command and what runs it, up to the program of the pane it runs in, if it does.
+    let asking = process::lineage(std::process::id());
     let mut out = HashMap::new();
     for pid in process::children(server) {
         // Its other children (hooks, tunnels) may have a pane's variables from wherever the
@@ -180,11 +186,13 @@ fn in_panes(server: u32, socket: &Path) -> HashMap<u32, InPane> {
             continue;
         }
         let Some(id) = env.get("KRAAL_PANE").and_then(|v| v.parse::<u32>().ok()) else { continue };
-        let program = match process::foreground_group(pid).filter(|g| *g != pid) {
+        let foreground = process::foreground_group(pid).filter(|g| *g != pid);
+        let program = match foreground {
             Some(group) => process::argv(group),
             None => process::argv(pid).filter(|argv| !crate::pane::is_shell(&argv[0])),
         };
-        out.insert(id, InPane { program, jobs: process::background_jobs(pid) });
+        let asks = asking.contains(&foreground.unwrap_or(pid));
+        out.insert(id, InPane { program, jobs: process::background_jobs(pid, &asking), asks });
     }
     out
 }
@@ -202,11 +210,6 @@ fn print_stops(stops: &[String]) {
 /// Whether this command runs in a pane of `session`.
 fn inside(session: &str) -> bool {
     std::env::var("KRAAL_SESSION").is_ok_and(|s| s == session) && std::env::var_os("KRAAL_PANE").is_some()
-}
-
-/// The pane this command runs in, when it is one of `session`'s.
-fn own_pane(session: &str) -> Option<u32> {
-    inside(session).then(|| std::env::var("KRAAL_PANE").ok()?.parse().ok()).flatten()
 }
 
 /// Ask `question` on the terminal; Enter answers `default`. `None` without a terminal: there

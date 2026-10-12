@@ -797,6 +797,40 @@ fn save_writes_a_definition_that_reopens() {
     assert!(!env.root.join("config/kraal/escape.kdl").exists());
 }
 
+/// `kraal save` run in a pane saves that pane's workspace, as every command run in a pane acts
+/// where it runs: not the workspace a terminal shows, nor the first one. `--workspace` names
+/// another, and outside a pane the one on screen is saved.
+#[test]
+fn save_in_a_pane_saves_the_workspace_of_that_pane() {
+    let env = Env::new("savehere");
+    let dir = env.root.join("config/kraal/workspaces");
+    env.workspace("w", "layout {\n    pane name=\"first\"\n}\n");
+    env.workspace("v", "layout {\n    pane name=\"second\"\n}\n");
+    env.run(&["open", "w"]);
+    env.run(&["open", "v"]);
+    // A terminal shows w, and the command runs in the pane of v.
+    let client = RawClient::attach(&env, "w");
+    client.wait_for_message("\"attached\"");
+    let panes: serde_json::Value = serde_json::from_str(&env.run(&["panes", "--json"])).unwrap();
+    let second = panes.as_array().unwrap().iter().find(|p| p["name"] == "second").unwrap()["id"].to_string();
+    let in_pane = |args: &[&str]| {
+        let out = env.cmd(args).env("KRAAL_PANE", &second).env("KRAAL_SESSION", &env.session).output().unwrap();
+        assert!(out.status.success(), "kraal {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+    let saved = |name: &str| std::fs::read_to_string(dir.join(name)).unwrap_or_default();
+
+    assert!(in_pane(&["save"]).trim().ends_with("/v.kdl"));
+    // Saving over a definition keeps the one before beside it.
+    assert_eq!(names_in(&dir), ["v.kdl", "v.kdl.bak", "w.kdl"]);
+    assert!(in_pane(&["save", "copy"]).trim().ends_with("/copy.kdl"));
+    assert!(saved("copy.kdl").contains("name=\"second\"") && !saved("copy.kdl").contains("first"));
+    assert!(in_pane(&["save", "named", "--workspace", "w"]).trim().ends_with("/named.kdl"));
+    assert!(saved("named.kdl").contains("name=\"first\""), "{}", saved("named.kdl"));
+    // Outside a pane: the workspace on screen.
+    assert!(env.run(&["save"]).trim().ends_with("/w.kdl"));
+}
+
 /// `kraal workspaces --json`, a line each: name, file, and whether it is open.
 fn listed_workspaces(env: &Env) -> Vec<String> {
     let list: serde_json::Value = serde_json::from_str(&env.run(&["workspaces", "--json"])).unwrap();
@@ -1281,6 +1315,148 @@ fn unknown_panes_and_workspaces_are_errors() {
     assert!(String::from_utf8_lossy(&out.stderr).contains("no pane named"));
     let out = env.try_run(&["open", "missing"]);
     assert!(String::from_utf8_lossy(&out.stderr).contains("no workspace named"));
+}
+
+/// A name given where a workspace's goes that names no workspace but reads as a server
+/// (`user@host`, or a server kraal knows) is answered with the command that was meant, and
+/// kraal attaches nowhere; any other name gets the plain answer. No session is started only to
+/// say that a name is unknown.
+#[test]
+fn a_server_given_where_a_workspace_goes_is_told_how_to_attach_to_it() {
+    let env = Env::new("hostname");
+    std::fs::write(env.root.join("config/kraal/servers.toml"), "[[server]]\nname = \"db\"\nhost = \"db.lan\"\n")
+        .unwrap();
+    let said = |name: &str| {
+        let out = env.try_run(&["open", name]);
+        assert!(!out.status.success(), "{name}");
+        String::from_utf8_lossy(&out.stderr).into_owned()
+    };
+    let meant = |name: &str| format!("; to attach to kraal on that server: kraal attach --host {name}");
+    let open_says = |when: &str| {
+        for name in ["fpa@anvil", "db"] {
+            let said = said(name);
+            assert!(said.contains(&format!("no workspace named {name:?} in ")), "{when}: {said}");
+            assert!(said.trim_end().ends_with(&meant(name)), "{when}: {said}");
+        }
+        let plain = said("nothing");
+        assert!(plain.contains("no workspace named \"nothing\" in ") && !plain.contains("--host"), "{when}: {plain}");
+    };
+
+    open_says("without a session");
+    assert_eq!(env.server_pid(), None, "a session was started only to say that a name is unknown");
+
+    // A session running: its server answers the same, and a terminal is not attached to it.
+    env.workspace("w", "layout {\n    pane name=\"shell\"\n}\n");
+    env.run(&["open", "w"]);
+    open_says("with a session");
+    let refused = RawClient::attach(&env, "fpa@anvil");
+    refused.wait_for_message(&meant("fpa@anvil"));
+    assert!(!refused.messages.lock().unwrap().iter().any(|m| m.contains("\"attached\"")));
+    // Any other unknown name attaches all the same, with the plain message.
+    let client = RawClient::attach(&env, "nothing");
+    client.wait_for_message("\"attached\"");
+    let rows = client.wait_for_row("no workspace named \"nothing\"");
+    assert!(!rows.iter().any(|r| r.contains("--host")), "{rows:?}");
+    // A workspace named like a server is a workspace.
+    env.workspace("db", "layout {\n    pane name=\"data\"\n}\n");
+    env.run(&["open", "db"]);
+    let named = RawClient::attach(&env, "db");
+    named.wait_for_message("\"attached\"");
+    named.wait_for_row("data");
+}
+
+/// `kraal attach fpa@anvil` and `kraal fpa@anvil`, typed for `kraal attach --host fpa@anvil`:
+/// the terminal gets the answer and is not attached to the local session, running or not.
+#[cfg(target_os = "linux")]
+#[test]
+fn attaching_to_a_server_given_as_a_workspace_says_what_was_meant() {
+    let env = Env::new("hostattach");
+    let forms: [&[&str]; 2] = [&["attach", "fpa@anvil"], &["fpa@anvil"]];
+    let check = |when: &str| {
+        for args in forms {
+            let shown = in_terminal(env.cmd(args), b"");
+            // Said in the terminal as it is: the screen is not taken and given back.
+            assert!(shown.starts_with("kraal: no workspace named \"fpa@anvil\" in "), "{when}, {args:?}: {shown:?}");
+            assert!(shown.contains("to attach to kraal on that server: kraal attach --host fpa@anvil"), "{shown}");
+        }
+    };
+    check("without a session");
+    assert_eq!(env.server_pid(), None, "a session was started only to say that a name is unknown");
+    env.workspace("w", "layout {\n    pane name=\"shell\"\n}\n");
+    env.run(&["open", "w"]);
+    check("with a session");
+}
+
+/// Outside a pane, a command that acts on a pane and is given none says how it takes one: the
+/// option for those that take an option, the argument for the one that takes an argument.
+#[test]
+fn a_command_given_no_pane_says_how_it_takes_one() {
+    let env = Env::new("whichpane");
+    let said = |args: &[&str]| {
+        let out = env.try_run(args);
+        assert!(!out.status.success(), "{args:?}");
+        String::from_utf8_lossy(&out.stderr).into_owned()
+    };
+    let with_option: [&[&str]; 6] =
+        [&["send", "hi"], &["keys", "enter"], &["read"], &["wait"], &["rename", "x"], &["buffer", "paste"]];
+    for args in with_option {
+        assert!(said(args).contains("which pane? pass --pane"), "{args:?}: {}", said(args));
+        // What the message names is taken: the command gets as far as looking for the session.
+        let named = said(&[args, &["--pane", "1"][..]].concat());
+        assert!(named.contains("no kraal server"), "{args:?}: {named}");
+    }
+    let close = said(&["close"]);
+    assert!(close.contains("which pane? name it after `kraal close`") && !close.contains("--pane"), "{close}");
+    assert!(said(&["close", "1"]).contains("no kraal server"));
+}
+
+/// `kraal servers add` for an address already saved leaves its entry as it is, and says what it
+/// did: it never says "saved" for options it dropped. `--agents` is the one thing it sets there.
+#[test]
+fn adding_a_saved_server_again_never_claims_a_save() {
+    let env = Env::new("readd");
+    let file = env.root.join("config/kraal/servers.toml");
+    let add = |args: &[&str]| env.try_run(&[&["servers", "add", "admin@db.lan"], args].concat());
+    let said =
+        |out: &Output| format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    let saved = || std::fs::read_to_string(&file).unwrap();
+
+    let out = add(&["--name", "db", "--group", "data"]);
+    assert!(out.status.success() && said(&out).starts_with("saved db in "), "{}", said(&out));
+    let first = saved();
+    // An option that would change the entry is refused, by its name, and nothing is written.
+    let options: [&[&str]; 7] = [
+        &["--env", "prod"],
+        &["--group", "web"],
+        &["--jump", "bastion"],
+        &["--identity", "~/.ssh/db"],
+        &["--note", "primary"],
+        &["--name", "other"],
+        &["--env", "prod", "--agents", "main"],
+    ];
+    for option in options {
+        let out = add(option);
+        let said = said(&out);
+        assert!(!out.status.success(), "{option:?}: {said}");
+        assert!(said.contains("admin@db.lan is already saved as db") && said.contains(option[0]), "{option:?}: {said}");
+        assert!(said.contains("`kraal servers edit`") && !said.contains("saved db in"), "{option:?}: {said}");
+        assert_eq!(saved(), first, "{option:?}");
+    }
+    // What the entry already has changes nothing, and is not refused.
+    for same in [&[][..], &["--name", "db", "--group", "data"]] {
+        let out = add(same);
+        assert!(out.status.success() && said(&out).starts_with("db is already saved in "), "{}", said(&out));
+        assert_eq!(saved(), first);
+    }
+    // The session whose agents are listed is set on a saved server too, and said.
+    let out = add(&["--agents", "main"]);
+    assert!(out.status.success(), "{}", said(&out));
+    assert!(said(&out).starts_with("db is already saved in ") && said(&out).contains("session main"), "{}", said(&out));
+    assert_eq!(saved(), format!("{first}agents = \"main\"\n"));
+    // With another port it is another address: a new entry, with what it was given.
+    let out = env.try_run(&["servers", "add", "admin@db.lan:2222", "--env", "prod"]);
+    assert!(out.status.success() && said(&out).starts_with("saved db-admin in "), "{}", said(&out));
+    assert_eq!(saved().matches("env = \"prod\"").count(), 1);
 }
 
 #[test]
@@ -3722,6 +3898,47 @@ fn an_exit_is_seen_even_when_something_left_behind_keeps_printing() {
     assert!(env.run(&["panes"]).contains("first"));
 }
 
+/// `name.ext:123` reads as a file and its line, or as a host and its port. In a local pane the
+/// file is looked for: a host and its port is offered to open, never as a file to edit, and a
+/// file that is there opens in the editor at its line.
+#[test]
+fn hints_tell_a_host_and_its_port_from_a_file_and_its_line() {
+    let env = Env::new("hostport");
+    let dir = env.root.join("proj");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("notes.md"), "a file\n").unwrap();
+    std::fs::write(dir.join("seen"), "redis.lan:6379\nnotes.md:12\n").unwrap();
+    // An editor that says what it was given.
+    let (editor, edited) = (env.root.join("editor"), env.root.join("edited"));
+    write_script(&editor, &format!("#!/bin/sh\necho \"$@\" > {}\n", edited.display()));
+    let config = env.root.join("config/kraal/config.toml");
+    let text = std::fs::read_to_string(&config).unwrap();
+    // Labels in the order of the screen, from the bottom: x for the last line, y above it.
+    std::fs::write(&config, format!("{text}[hints]\nalphabet = \"xy\"\n")).unwrap();
+    env.workspace("w", &format!("layout {{\n    pane name=\"shell\" cwd={:?}\n}}\n", dir.display().to_string()));
+    let out = env.cmd(&["open", "w"]).env("VISUAL", &editor).output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    env.run(&["send", "-p", "shell", "--enter", "cat seen"]);
+    let mut client = RawClient::attach(&env, "w");
+    client.wait_for_row("notes.md:12");
+    let act = |client: &mut RawClient, label: &[u8]| {
+        client.send(b"\x02o");
+        client.wait_for_row("HINTS: COPY");
+        client.send(b"\t");
+        client.wait_for_row("HINTS: ACT");
+        client.send(label);
+    };
+
+    act(&mut client, b"y");
+    client.wait_for_message("http://redis.lan:6379");
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(!edited.exists(), "an editor opened on {:?}", std::fs::read_to_string(&edited));
+    act(&mut client, b"x");
+    wait_until(Duration::from_secs(10), "the editor never opened", || {
+        std::fs::read_to_string(&edited).is_ok_and(|args| args.trim() == "+12 notes.md")
+    });
+}
+
 #[cfg(unix)]
 #[test]
 fn tunnels_are_up_when_ssh_listens_and_survive_a_restart() {
@@ -3799,6 +4016,27 @@ fn tunnels_are_up_when_ssh_listens_and_survive_a_restart() {
         assert!(start.elapsed() < Duration::from_secs(5), "the closed tunnel's ssh still runs");
         std::thread::sleep(Duration::from_millis(20));
     }
+    // The local port is what names a tunnel, and the list shows it: of two tunnels to the same
+    // port of two servers, each is closed by its own. A tunnel has no other name.
+    let to_wanted = |list: &str| -> Vec<(String, u16)> {
+        let lines = list.lines().filter(|l| l.contains(&format!(":{wanted} → localhost:")));
+        lines
+            .map(|l| {
+                let (server, local) = l.split_once(" → localhost:").unwrap();
+                (server.split_whitespace().last().unwrap().to_string(), local.trim().parse().unwrap())
+            })
+            .collect()
+    };
+    let both = to_wanted(&run(&["tunnel", "list"]));
+    assert_eq!(both.len(), 2, "{both:?}");
+    let out = env.cmd(&["tunnel", "rm", "#1"]).env("PATH", &path).output().unwrap();
+    let said = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !out.status.success() && said.contains("not a local port: #1") && said.contains("kraal tunnel list"),
+        "{said}"
+    );
+    run(&["tunnel", "rm", &both[1].1.to_string()]);
+    assert_eq!(to_wanted(&run(&["tunnel", "list"])), [both[0].clone()]);
 
     // A tunnel through a connection kraal knows by no name comes back through that connection.
     run(&["kill"]);
@@ -5595,6 +5833,75 @@ fn a_restart_from_the_last_pane_outlives_it() {
         env.server_pid().is_some_and(|p| p != server)
     });
     assert!(env.run(&["panes"]).contains("only"));
+}
+
+/// `kraal restart` run in a pane of the session says what stops as it does from anywhere else:
+/// the jobs in the background of its own pane too. Only the command itself and what runs it (a
+/// script) are not programs that stop, in the foreground or in the background.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_restart_from_a_pane_says_what_stops_in_that_pane_too() {
+    let env = Env::new("ownjobs");
+    env.workspace("w", "layout {\n    pane name=\"shell\"\n}\n");
+    env.run(&["open", "w"]);
+    let pid = env.server_pid().expect("the server runs");
+    let running = |argv: &[u8]| {
+        std::fs::read_dir("/proc")
+            .unwrap()
+            .flatten()
+            .any(|e| std::fs::read(e.path().join("cmdline")).is_ok_and(|c| c == argv))
+    };
+    env.run(&["send", "-p", "shell", "--enter", "sleep 4251 &"]);
+    wait_until(Duration::from_secs(10), "the job never started", || running(b"sleep\x004251\x00"));
+    // Without a terminal to ask on, the command says what stops and goes no further.
+    let said = env.root.join("said");
+    let restart = format!("'{}' restart </dev/null >'{}' 2>&1", env!("CARGO_BIN_EXE_kraal"), said.display());
+    let script = env.root.join("restart.sh");
+    write_script(&script, &format!("#!/bin/sh\n{restart}\n"));
+    let stops = |typed: &str| -> Vec<String> {
+        let _ = std::fs::remove_file(&said);
+        env.run(&["send", "-p", "shell", "--enter", typed]);
+        let mut text = String::new();
+        wait_until(Duration::from_secs(10), "the restart did not stop at what it would stop", || {
+            text = std::fs::read_to_string(&said).unwrap_or_default();
+            text.contains("add --yes")
+        });
+        text.lines().filter_map(|line| line.strip_prefix("  ")).map(String::from).collect()
+    };
+    // The pane's shell may have its own standard input elsewhere while the command runs: dash
+    // does that for a command given `< file`, and this line does it in any shell. The jobs are
+    // those of the shell's terminal all the same.
+    let elsewhere = |command: &str| format!("exec 3<&0 </dev/null; {command}; exec <&3 3<&-");
+    let typed = [
+        restart.clone(),
+        format!("sh '{}'", script.display()),
+        format!("{restart} &"),
+        elsewhere(&format!("'{}' restart >'{}' 2>&1", env!("CARGO_BIN_EXE_kraal"), said.display())),
+    ];
+    for typed in typed {
+        let stops = stops(&typed);
+        assert_eq!(stops.len(), 1, "{typed}: {stops:?}");
+        assert!(stops[0].starts_with("sleep 4251 (in the background)  (pane "), "{typed}: {stops:?}");
+    }
+    // The same list as from outside the session.
+    let outside = || {
+        let out = env.try_run(&["restart"]);
+        assert!(!out.status.success());
+        let said = String::from_utf8_lossy(&out.stdout).into_owned();
+        said.lines().filter_map(|line| line.strip_prefix("  ")).map(String::from).collect::<Vec<_>>()
+    };
+    let stops = outside();
+    assert_eq!(stops.len(), 1, "{stops:?}");
+    assert!(stops[0].starts_with("sleep 4251 (in the background)  (pane "), "{stops:?}");
+    // And from outside while that shell runs a program with its standard input elsewhere.
+    env.run(&["send", "-p", "shell", "--enter", &elsewhere("sleep 4253")]);
+    wait_until(Duration::from_secs(10), "the program never started", || running(b"sleep\x004253\x00"));
+    let stops = outside();
+    assert_eq!(stops.len(), 2, "{stops:?}");
+    assert!(stops[0].starts_with("sleep 4253  (pane "), "{stops:?}");
+    assert!(stops[1].starts_with("sleep 4251 (in the background)  (pane "), "{stops:?}");
+    assert_eq!(env.server_pid(), Some(pid));
+    assert!(running(b"sleep\x004251\x00"));
 }
 
 /// A job left in the background of a shell stops with a restart (the terminal hangs up): it is

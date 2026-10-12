@@ -192,6 +192,7 @@ pub enum Cmd {
     /// Save a workspace's current layout to its definition file, or as `<name>.kdl`.
     Save {
         name: Option<String>,
+        /// The workspace to save (default: inside a pane, its workspace; else the one on screen).
         #[arg(short, long)]
         workspace: Option<String>,
     },
@@ -410,11 +411,10 @@ pub enum TunnelCmd {
         #[arg(short, long)]
         local: Option<u16>,
     },
+    /// List the tunnels: state, server and port, and the local port each one is on.
     List,
-    /// Close a tunnel: by local port, or `#ID`.
-    Rm {
-        port: String,
-    },
+    /// Close a tunnel, by its local port (`kraal tunnel list` shows it).
+    Rm { port: String },
 }
 
 #[derive(Subcommand)]

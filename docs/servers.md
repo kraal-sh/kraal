@@ -40,8 +40,10 @@ it in the group `discovered`, unless `[servers] auto_add = false`.
 | `kraal ssh db` | plain ssh, resolved from the inventory; inside kraal, `--right`, `--down`, `--floating` or `--tab` open it in a new pane instead |
 | `kraal ssh prod --group` | every server of "prod" in a grid of panes, in a workspace of that name |
 
-`kraal servers add` leaves an address that is already saved as it is, but for `--agents`: change
-its other fields with `kraal servers edit`.
+`kraal servers add` leaves an address that is already saved as it is, and says so. `--agents` is
+the one field it sets there; given another option that would change the entry, it fails, names
+the option and changes nothing: change those fields with `kraal servers edit`. The same host
+with another user or port is another address, and gets an entry of its own.
 
 `ctrl+b s` opens the same list: Enter connects (or opens a whole group); Tab shows the other
 actions, each also on its own key: connect in a new tab (`ctrl+t`), browse its files (`ctrl+f`),
@@ -137,8 +139,8 @@ asks for more than a password (a one-time code), or that requires a terminal, is
 | `kraal ssh @prod --group -- journalctl -fu nginx` | one pane per server running it, in a grid |
 | `kraal tunnel add db 5432` | `localhost:5432` goes to db's 5432, and stays open |
 | `kraal tunnel add bastion db.internal:5432 --local 15432` | a port of a machine that server reaches, on the local port you choose |
-| `kraal tunnel list` | the tunnels and their state |
-| `kraal tunnel rm 15432` | closes one, by its local port |
+| `kraal tunnel list` | the tunnels: their state, the server and its port, and the local port each one is on |
+| `kraal tunnel rm 15432` | closes one, by its local port: the list shows it, and no two tunnels share one |
 
 `kraal exec` never asks for a password (the servers must take your key), and fails when a server
 did. In the server picker (`ctrl+b s`), Tab then "Run a command on it" runs one on the selected
@@ -160,6 +162,11 @@ the network drops, and its programs keep running on the server meanwhile:
 | `kraal attach --host db` | attaches to db's kraal; ctrl+c gives up while reconnecting |
 | `kraal attach --host db --pane api` | the same, showing that pane of the session first |
 | `kraal -s work attach --host deploy@db.lan:2222` | another session there, on a server named by its address |
+
+`--host` is what names another machine: without it, the name after `kraal attach`, `kraal` or
+`kraal open` is a workspace of this machine's session. When no workspace has that name and it
+reads as a server (`user@host`, or the name of a server kraal knows), kraal attaches nowhere and
+says what to type: for `kraal attach fpa@anvil`, `kraal attach --host fpa@anvil`.
 
 Attach from a terminal of your own: inside a kraal pane, `kraal attach` refuses to nest (the
 sidebar's agents and `alt+a` open such a tab for you, see below). Ctrl+click on a link in a

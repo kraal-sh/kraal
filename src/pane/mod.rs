@@ -885,7 +885,7 @@ impl Pane {
     /// The command lines of the jobs in the background of the pane's terminal (see
     /// [`crate::process::background_jobs`]).
     pub fn background_jobs(&self) -> Vec<Vec<String>> {
-        self.pid().map(crate::process::background_jobs).unwrap_or_default()
+        self.pid().map(|pid| crate::process::background_jobs(pid, &[])).unwrap_or_default()
     }
 }
 

@@ -25,7 +25,9 @@ they act on the session `main`, or the one `-s` or `$KRAAL_SESSION_NAME` names.
 | `kraal preview docs/design.md --floating` | shows a file or a directory in a new pane |
 | `kraal notify "deploy" "finished"` | a desktop notification through the attached terminal |
 
-Panes are referred to by id, by name, or as `workspace:name`.
+Panes are referred to by id, by name, or as `workspace:name`. Most commands take theirs with
+`--pane` (`-p`), `kraal close` and `kraal focus` as their argument; outside a pane, one that is
+given none says which it takes.
 
 `kraal run` and `kraal preview` put the new pane where you say: `--right` or `--down` split a
 pane (the one `--target` names, else the one the command runs in, else the focused one),

@@ -747,6 +747,13 @@ pub fn attach(mut target: Target, mut workspace: Option<String>, mouse: bool, at
     // Fail before touching the terminal when the first connection is impossible; ssh asks what
     // it has to ask in the terminal as it is.
     let first = greet(&target, &workspace).map_err(anyhow::Error::msg)?;
+    // So does a session that refuses at once (a kraal of another generation, a name that is no
+    // workspace of its own): nothing was attached.
+    if let (protocol::JSON, Ok(ServerMsg::Exit { reason, reattach: None })) =
+        (first.first.0, serde_json::from_slice(&first.first.1))
+    {
+        bail!(reason);
+    }
     // The pane asked for is shown once: a reconnection leaves the session where it is.
     if let Target::Remote { pane, .. } = &mut target {
         *pane = None;
