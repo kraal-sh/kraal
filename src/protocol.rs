@@ -125,6 +125,13 @@ pub enum ClientMsg {
         /// to attach again.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         follows_live: bool,
+        /// After a live restart: the pane what the client held was typed for (see
+        /// [`ServerMsg::Hold`]), shown first, and how many bytes it holds. They are sent only if
+        /// that pane is there to take them ([`ServerMsg::Attached`]), never to another one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        typed_for: Option<u32>,
+        #[serde(default, skip_serializing_if = "is_zero")]
+        typed: u64,
     },
     Resize {
         cols: u16,
@@ -169,11 +176,18 @@ pub enum ServerMsg {
         /// request given up on is not taken for the next one's.
         #[serde(default)]
         attempt: u32,
+        /// The pane what is held is typed for: the one focused.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pane: Option<u32>,
     },
     /// The first answer to an attach: the server's kraal release. A server that does not send
     /// it is older than this message.
     Attached {
         version: String,
+        /// The pane asked for with `typed_for` (see [`ClientMsg::Attach`]), when it is there
+        /// and takes what is typed: shown, and focused.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        shown: Option<u32>,
     },
     Response {
         result: Result<Response, String>,
@@ -190,6 +204,10 @@ pub enum ServerMsg {
     Events {
         events: Vec<serde_json::Value>,
     },
+}
+
+fn is_zero(n: &u64) -> bool {
+    *n == 0
 }
 
 impl ServerMsg {
@@ -510,7 +528,7 @@ mod tests {
                 matches!(serde_json::from_str::<OldServerMsg>(&exit), Ok(OldServerMsg::Exit { reason }) if reason == "bye")
             );
         }
-        let attached = serde_json::to_string(&ServerMsg::Attached { version: "0.2.1".into() }).unwrap();
+        let attached = serde_json::to_string(&ServerMsg::Attached { version: "0.2.1".into(), shown: None }).unwrap();
         assert_eq!(attached, r#"{"type":"attached","version":"0.2.1"}"#);
         assert!(serde_json::from_str::<OldServerMsg>(&attached).is_err(), "an older client skips it");
         // And this kraal reads what older ones send.

@@ -387,8 +387,8 @@ fn is_ctrl_c(keys: &[u8]) -> bool {
 }
 const RESTORE: &str = "\x1b[?2026l\x1b[<u\x1b[?1006l\x1b[?1003l\x1b[?1002l\x1b[?1000l\x1b[?1004l\x1b[?2004l\x1b[0m\x1b[0 q\x1b[?25h\x1b[?1049l";
 
-/// What is held of what is typed during a live restart, at most: past that, the keyboard is
-/// not read until it is sent (the terminal holds the rest).
+/// What is held of what is typed during a live restart, about at most: past that, the keyboard
+/// is not read until it is sent (the terminal keeps the rest).
 const MAX_HELD_KEYS: usize = 16 << 20;
 /// How long an escape alone waits for the rest of a sequence, as the server waits for it.
 const ESCAPE_ALONE: Duration = Duration::from_millis(50);
@@ -401,6 +401,8 @@ struct Holding {
     asked: bool,
     /// Which time it asked, said in the answer.
     attempt: u32,
+    /// The pane what is kept is typed for (the server says which): it goes there or nowhere.
+    target: Option<u32>,
     /// What is kept, since the server was told it is.
     kept: Option<Vec<u8>>,
     /// What was sent, read as the server reads it: whether it ends between two keys.
@@ -444,18 +446,42 @@ impl Holding {
         (keys[..at].to_vec(), true)
     }
 
-    /// The server needs nothing held any more (it said so, or it is another one): what was kept,
-    /// to send.
+    /// The same server needs nothing held any more: what was kept, to send.
     fn release(&mut self) -> Vec<u8> {
         self.asked = false;
+        self.target = None;
         let kept = self.kept.take().unwrap_or_default();
         let _ = self.sent.feed(&kept);
         kept
     }
 
-    /// Room for `more` bytes: once full, nothing more is read until what is kept is sent.
-    fn has_room(&self, more: usize) -> bool {
-        self.kept.as_ref().is_none_or(|k| k.is_empty() || k.len() + more <= MAX_HELD_KEYS)
+    /// Connecting (again): the server reads afresh. What to tell it: the pane what is kept was
+    /// typed for, and how much there is.
+    fn reattach(&mut self) -> Option<(u32, u64)> {
+        self.sent = crate::input::InputParser::new();
+        self.asked = false;
+        let kept = self.kept.as_ref().map_or(0, |k| k.len() as u64);
+        self.target.map(|pane| (pane, kept))
+    }
+
+    /// The server answered a connection (`shown`: the pane it shows of the one asked for, ready
+    /// to take what is typed). What was kept goes now if that is its pane; otherwise it is
+    /// dropped (the server says so), never sent to another pane.
+    fn settle(&mut self, shown: Option<u32>) -> Vec<u8> {
+        let fits = self.target.is_some() && shown == self.target;
+        match fits {
+            true => self.release(),
+            false => {
+                self.kept = None;
+                self.release()
+            }
+        }
+    }
+
+    /// Whether more may be read from the keyboard: once full, nothing is until what is kept
+    /// is sent.
+    fn has_room(&self) -> bool {
+        self.kept.as_ref().is_none_or(|k| k.len() < MAX_HELD_KEYS)
     }
 }
 
@@ -464,41 +490,33 @@ type Writer = Mutex<Option<Box<dyn Write + Send>>>;
 /// Send what was typed (`keys`, from the keyboard) to the server, or keep it (see [`Holding`]).
 /// While disconnected, ctrl+c gives up (`quit`).
 fn forward_keys(keys: &[u8], writer: &Writer, holding: &Mutex<Holding>, quit: &AtomicBool) {
-    loop {
-        let Ok(mut w) = writer.lock() else { return };
-        if w.is_none() && is_ctrl_c(keys) {
-            quit.store(true, Ordering::SeqCst);
-            return;
-        }
-        let Ok(mut h) = holding.lock() else { return };
-        if !h.has_room(keys.len()) {
-            drop(h);
-            drop(w);
-            std::thread::sleep(Duration::from_millis(20));
-            continue;
-        }
-        let (send, held) = h.typed(keys, Instant::now());
-        let attempt = h.attempt;
-        drop(h);
-        if let Some(w) = w.as_mut() {
-            if !send.is_empty() {
-                let _ = protocol::write_frame(w, protocol::BYTES, &send);
-            }
-            if held {
-                let _ = protocol::write_json(w, &ClientMsg::Held { attempt });
-            }
-        }
+    let Ok(mut w) = writer.lock() else { return };
+    if w.is_none() && is_ctrl_c(keys) {
+        quit.store(true, Ordering::SeqCst);
         return;
+    }
+    let Ok(mut h) = holding.lock() else { return };
+    let (send, held) = h.typed(keys, Instant::now());
+    let attempt = h.attempt;
+    drop(h);
+    if let Some(w) = w.as_mut() {
+        if !send.is_empty() {
+            let _ = protocol::write_frame(w, protocol::BYTES, &send);
+        }
+        if held {
+            let _ = protocol::write_json(w, &ClientMsg::Held { attempt });
+        }
     }
 }
 
-/// The server asks to hold what is typed (`attempt`): from the next point between two keys,
-/// said once reached (now, or as keys come).
-fn hold_keys(writer: &Writer, holding: &Mutex<Holding>, attempt: u32) {
+/// The server asks to hold what is typed (`attempt`, for `pane`): from the next point between
+/// two keys, said once reached (now, or as keys come).
+fn hold_keys(writer: &Writer, holding: &Mutex<Holding>, attempt: u32, pane: Option<u32>) {
     let Ok(mut w) = writer.lock() else { return };
     let Ok(mut h) = holding.lock() else { return };
     h.asked = true;
     h.attempt = attempt;
+    h.target = pane;
     // Held already: said again.
     let (send, held) = match h.kept {
         Some(_) => (Vec::new(), true),
@@ -515,15 +533,15 @@ fn hold_keys(writer: &Writer, holding: &Mutex<Holding>, attempt: u32) {
     }
 }
 
-/// Send what was held to the server (the same one, or the next: `fresh`, which has read
-/// nothing yet).
-fn release_keys(writer: &Writer, holding: &Mutex<Holding>, fresh: bool) {
+/// Send what was held to the server: the same one, told it holds nothing any more, or one just
+/// connected to, which said what it shows (`shown`, see [`Holding::settle`]).
+fn release_keys(writer: &Writer, holding: &Mutex<Holding>, shown: Option<Option<u32>>) {
     let Ok(mut w) = writer.lock() else { return };
     let Ok(mut h) = holding.lock() else { return };
-    if fresh {
-        h.sent = crate::input::InputParser::new();
-    }
-    let kept = h.release();
+    let kept = match shown {
+        Some(shown) => h.settle(shown),
+        None => h.release(),
+    };
     drop(h);
     if let Some(w) = w.as_mut()
         && !kept.is_empty()
@@ -678,15 +696,18 @@ struct Greeted {
 /// Connect, say hello, and wait for the server's first answer (returned, still to be shown).
 /// Until then, over ssh, ssh has the terminal: it may ask for a password or about a host key,
 /// and the terminal is in its usual mode, where ctrl+c ends kraal. `Err` says why it failed.
-fn greet(target: &Target, workspace: &Option<String>) -> Result<Greeted, String> {
+/// `typed_for`: after a live restart, the pane what is held was typed for, and how much there
+/// is (see [`Holding::reattach`]).
+fn greet(target: &Target, workspace: &Option<String>, typed_for: Option<(u32, u64)>) -> Result<Greeted, String> {
     let mut conn = connect(target).map_err(|e| format!("{e:#}"))?;
     let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
-    // The workspace asked for is asked again after a reconnection.
+    // The workspace asked for is asked again after a reconnection; after a live restart, the
+    // pane shows instead.
     let hello = ClientMsg::Attach {
         version: protocol::PROTOCOL_VERSION,
         cols,
         rows,
-        workspace: workspace.clone(),
+        workspace: workspace.clone().filter(|_| typed_for.is_none()),
         remote: matches!(target, Target::Remote { .. }),
         pane: match target {
             Target::Remote { pane, .. } => pane.clone(),
@@ -695,6 +716,8 @@ fn greet(target: &Target, workspace: &Option<String>) -> Result<Greeted, String>
         // A local client is the kraal installed on the server's machine; a remote one may not be.
         installed: matches!(target, Target::Local { .. }).then(|| protocol::KRAAL_VERSION.to_string()),
         follows_live: true,
+        typed_for: typed_for.map(|(pane, _)| pane),
+        typed: typed_for.map_or(0, |(_, typed)| typed),
     };
     if protocol::write_json(&mut conn.writer, &hello).is_err() {
         return Err(conn.why_lost("could not talk to the server"));
@@ -744,12 +767,22 @@ impl KeysPause {
 
 /// Read `fd` (the keyboard) into `forward` until it ends; `forward` gets nothing when nothing
 /// came for a moment. Nothing is read while paused: the reader parks before it would read, and
-/// it reads only the bytes already waiting, so a read never blocks it past a pause.
-fn read_keys(fd: std::os::unix::io::RawFd, pause: &KeysPause, mut forward: impl FnMut(&[u8])) {
+/// it reads only the bytes already waiting, so a read never blocks it past a pause. Nothing is
+/// read either while there is no `room` (the terminal keeps what is typed meanwhile).
+fn read_keys(
+    fd: std::os::unix::io::RawFd,
+    pause: &KeysPause,
+    mut room: impl FnMut() -> bool,
+    mut forward: impl FnMut(&[u8]),
+) {
     let mut buf = [0u8; 16 * 1024];
     loop {
         if pause.paused.load(Ordering::SeqCst) {
             pause.parked.store(pause.epoch.load(Ordering::SeqCst), Ordering::SeqCst);
+            std::thread::sleep(Duration::from_millis(20));
+            continue;
+        }
+        if !room() {
             std::thread::sleep(Duration::from_millis(20));
             continue;
         }
@@ -805,7 +838,7 @@ pub fn attach(mut target: Target, mut workspace: Option<String>, mouse: bool, at
     }
     // Fail before touching the terminal when the first connection is impossible; ssh asks what
     // it has to ask in the terminal as it is.
-    let first = greet(&target, &workspace).map_err(anyhow::Error::msg)?;
+    let first = greet(&target, &workspace, None).map_err(anyhow::Error::msg)?;
     // The pane asked for is shown once: a reconnection leaves the session where it is.
     if let Target::Remote { pane, .. } = &mut target {
         *pane = None;
@@ -854,7 +887,17 @@ pub fn attach(mut target: Target, mut workspace: Option<String>, mouse: bool, at
     {
         let (writer, quit, pause, holding) = (writer.clone(), quit.clone(), pause.clone(), holding.clone());
         std::thread::Builder::new().name("stdin".into()).spawn(move || {
-            read_keys(0, &pause, |keys| forward_keys(keys, &writer, &holding, &quit));
+            let mut told = false;
+            let room = || {
+                let room = holding.lock().is_ok_and(|h| h.has_room());
+                // Said once: nothing typed is lost.
+                if !room && !std::mem::replace(&mut told, true) {
+                    status_line("kraal: what you type is kept, and sent once the session is back");
+                }
+                told &= !room;
+                room
+            };
+            read_keys(0, &pause, room, |keys| forward_keys(keys, &writer, &holding, &quit));
         })?;
     }
     // Window size changes → server.
@@ -889,7 +932,8 @@ pub fn attach(mut target: Target, mut workspace: Option<String>, mouse: bool, at
                 // already (see below).
                 if pause.pause() {
                     let _ = crossterm::terminal::disable_raw_mode();
-                    let greeted = greet(&target, &workspace);
+                    let typed_for = holding.lock().ok().and_then(|mut h| h.reattach());
+                    let greeted = greet(&target, &workspace, typed_for);
                     let _ = crossterm::terminal::enable_raw_mode();
                     if greeted.is_ok() {
                         set_modes(true, mouse);
@@ -906,7 +950,12 @@ pub fn attach(mut target: Target, mut workspace: Option<String>, mouse: bool, at
         let lost = match session {
             Ok(Greeted { conn: mut c, mut frames, first }) => {
                 *writer.lock().unwrap() = Some(std::mem::replace(&mut c.writer, Box::new(std::io::sink())));
-                release_keys(&writer, &holding, true);
+                // What was held goes to the pane it was typed for, if this server shows it.
+                let shown = match serde_json::from_slice::<ServerMsg>(&first.1) {
+                    Ok(ServerMsg::Attached { shown, .. }) if first.0 == protocol::JSON => shown,
+                    _ => None,
+                };
+                release_keys(&writer, &holding, Some(shown));
                 delay = Duration::from_secs(1);
                 let mut out = std::io::stdout().lock();
                 let mut next = Some(Ok(Some(first)));
@@ -922,9 +971,11 @@ pub fn attach(mut target: Target, mut workspace: Option<String>, mouse: bool, at
                         }
                         Ok(Some((_, payload))) => match serde_json::from_slice::<ServerMsg>(&payload) {
                             Ok(ServerMsg::Exit { reason, reattach: None, .. }) => break 'session reason,
-                            // The next server shows the same workspace.
-                            Ok(ServerMsg::Exit { reattach: Some(ws), live: true, .. }) => {
-                                workspace = Some(ws).filter(|w| !w.is_empty());
+                            // The next server shows the pane focused (see `Holding::target`): a
+                            // workspace named would be opened again from its definition, should
+                            // none of its panes have been taken over.
+                            Ok(ServerMsg::Exit { live: true, .. }) => {
+                                workspace = None;
                                 live_restart = Some(Instant::now());
                             }
                             Ok(ServerMsg::Exit { reattach: Some(ws), .. }) => {
@@ -932,9 +983,11 @@ pub fn attach(mut target: Target, mut workspace: Option<String>, mouse: bool, at
                                 restarting = Some(c.server);
                                 break "the session restarts".to_string();
                             }
-                            Ok(ServerMsg::Attached { version }) => server_version = Some(version),
-                            Ok(ServerMsg::Hold { on: true, attempt }) => hold_keys(&writer, &holding, attempt),
-                            Ok(ServerMsg::Hold { on: false, .. }) => release_keys(&writer, &holding, false),
+                            Ok(ServerMsg::Attached { version, .. }) => server_version = Some(version),
+                            Ok(ServerMsg::Hold { on: true, attempt, pane }) => {
+                                hold_keys(&writer, &holding, attempt, pane)
+                            }
+                            Ok(ServerMsg::Hold { on: false, .. }) => release_keys(&writer, &holding, None),
                             Ok(ServerMsg::Open { url }) => {
                                 let _ = crate::pane::open_url(&url);
                             }
@@ -1092,10 +1145,12 @@ mod tests {
         assert!(h.release().is_empty());
     }
 
-    /// Typed into a full hold, the keys wait (and the keyboard is not read meanwhile) until
-    /// what is held is sent: none is lost.
+    /// A full hold stops reading the keyboard (the terminal keeps what is typed meanwhile), and
+    /// the reader still parks when asked, so the connection can be made again: once what is
+    /// held is sent, the rest is read, and nothing is lost.
     #[test]
-    fn keys_held_past_the_limit_wait_rather_than_go() {
+    fn a_full_hold_stops_reading_the_keyboard_and_still_parks() {
+        use std::os::unix::io::AsRawFd;
         #[derive(Clone, Default)]
         struct Sent(Arc<Mutex<Vec<u8>>>);
         impl Write for Sent {
@@ -1113,23 +1168,53 @@ mod tests {
         {
             let mut h = holding.lock().unwrap();
             h.asked = true;
-            h.kept = Some(vec![b'x'; MAX_HELD_KEYS - 1]);
+            h.kept = Some(vec![b'x'; MAX_HELD_KEYS]);
         }
-        let done = Arc::new(AtomicBool::new(false));
-        let typing = {
-            let (writer, holding, done) = (writer.clone(), holding.clone(), done.clone());
+        let (keyboard_end, mut typing) = std::os::unix::net::UnixStream::pair().unwrap();
+        let keyboard = keyboard_end.as_raw_fd();
+        let pause = Arc::new(KeysPause::default());
+        let reader = {
+            let (writer, holding, pause) = (writer.clone(), holding.clone(), pause.clone());
             std::thread::spawn(move || {
-                forward_keys(b"yz", &writer, &holding, &AtomicBool::new(false));
-                done.store(true, Ordering::SeqCst);
+                let quit = AtomicBool::new(false);
+                read_keys(
+                    keyboard,
+                    &pause,
+                    || holding.lock().unwrap().has_room(),
+                    |k| forward_keys(k, &writer, &holding, &quit),
+                )
             })
         };
+        typing.write_all(b"later").unwrap();
         std::thread::sleep(Duration::from_millis(300));
-        assert!(!done.load(Ordering::SeqCst), "taken past the limit");
-        assert_eq!(holding.lock().unwrap().kept.as_ref().map(Vec::len), Some(MAX_HELD_KEYS - 1));
-        release_keys(&writer, &holding, false);
-        typing.join().unwrap();
-        let all = sent.0.lock().unwrap();
-        assert!(all.len() > MAX_HELD_KEYS && all.ends_with(b"yz"), "{}", all.len());
+        assert_eq!(holding.lock().unwrap().kept.as_ref().map(Vec::len), Some(MAX_HELD_KEYS));
+        assert!(pause.pause(), "the reader did not park");
+        pause.resume();
+        release_keys(&writer, &holding, None);
+        let start = Instant::now();
+        while !sent.0.lock().unwrap().ends_with(b"later") {
+            assert!(start.elapsed() < Duration::from_secs(5), "the rest was not read");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(sent.0.lock().unwrap().len() > MAX_HELD_KEYS);
+        drop(typing);
+        reader.join().unwrap();
+        drop(keyboard_end);
+    }
+
+    /// After a live restart what was held goes to the pane it was typed for, once the server
+    /// shows that pane; otherwise it is dropped, never sent elsewhere.
+    #[test]
+    fn what_was_held_goes_to_its_pane_or_nowhere() {
+        let mut h = Holding { asked: true, target: Some(7), kept: Some(b"ls\r".to_vec()), ..Default::default() };
+        assert_eq!(h.reattach(), Some((7, 3)));
+        assert_eq!(h.settle(Some(7)), b"ls\r");
+        let mut h = Holding { asked: true, target: Some(7), kept: Some(b"ls\r".to_vec()), ..Default::default() };
+        assert_eq!(h.reattach(), Some((7, 3)));
+        assert!(h.settle(Some(8)).is_empty(), "another pane");
+        let mut h = Holding { asked: true, target: Some(7), kept: Some(b"ls\r".to_vec()), ..Default::default() };
+        assert!(h.settle(None).is_empty(), "not there");
+        assert!(h.kept.is_none() && h.target.is_none() && !h.asked);
     }
 
     #[test]
@@ -1144,7 +1229,9 @@ mod tests {
         let got = Arc::new(Mutex::new(Vec::new()));
         let reader = {
             let (pause, got) = (pause.clone(), got.clone());
-            std::thread::spawn(move || read_keys(keyboard, &pause, |k| got.lock().unwrap().extend_from_slice(k)))
+            std::thread::spawn(move || {
+                read_keys(keyboard, &pause, || true, |k| got.lock().unwrap().extend_from_slice(k))
+            })
         };
         // Keys typed just before a pause are read or left for ssh; nothing typed after it is read.
         let mut left_for_ssh = 0;

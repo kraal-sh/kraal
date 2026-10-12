@@ -46,7 +46,7 @@ impl Server {
                 session: self.session.clone(),
                 version: env!("CARGO_PKG_VERSION").into(),
                 boot: Some(self.events.boot()),
-                live: self.live_restart.clone(),
+                live: self.live_report(),
             }),
             Request::ListPanes => {
                 let mut v: Vec<PaneId> = Vec::new();
@@ -428,6 +428,9 @@ impl Server {
 
     /// Input from the CLI reaches a production pane only when the caller says it means to.
     fn allow_input(&self, pane: PaneId, production: bool) -> Result<(), String> {
+        if self.panes.get(&pane).is_some_and(|p| p.recovered == Some(crate::pane::Recovered::Unknown)) {
+            return Err(format!("{} is read-only: nothing says which pane it was", self.pane_label(pane)));
+        }
         match self.pane_production(pane) {
             Some(why) if !production => {
                 Err(format!("{} is production ({why}); add --production to send to it", self.pane_label(pane)))

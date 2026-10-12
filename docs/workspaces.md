@@ -51,10 +51,12 @@ keeps running, with the same pid (a build, a `tail -f`, an editor, an agent in t
 turn). Each pane shows what it showed, colours, cursor and modes included; a full-screen program
 is made to draw itself again, and keeps the keyboard modes it had pushed. Pane ids, tunnels and
 their ssh stay. Commands run meanwhile are answered whole by one server or the other. An attached
-terminal holds what is typed from a point between two keys, and sends it once it is back: nothing
-typed is lost or cut in two. Attached clients come back by themselves to the workspace they showed
-(a client of an older kraal is told to leave first: `kraal` attaches again); `kraal events` ends,
-and started again with `--since`, it gets what it missed, as the numbering goes on.
+terminal holds what is typed from a point between two keys, and sends it once it is back, to the
+pane it was typed for: nothing typed is lost or cut in two, and should that pane not be there,
+what was typed for it is dropped, and said so, rather than sent to another one. Attached clients
+come back by themselves to the pane they showed. A terminal attached with a kraal from before
+live restarts could do neither: while one is attached, there is no live restart. `kraal events`
+ends, and started again with `--since`, it gets what it missed, as the numbering goes on.
 
 The binary is copied and tried first, and that very copy is run, whatever is written to the file
 or renamed over it meanwhile: there is no live restart on one that cannot take over (an older
@@ -67,12 +69,14 @@ background on a pane's terminal counts too). Should anything fail before the exe
 itself, the server goes on as before. What the server hands over goes through a file readable by
 you alone in `~/.local/state/kraal/`, deleted as soon as it is read. Linux only for now.
 
-Once the exec is done, no terminal is closed under a program. A pane the new kraal cannot take
-over at once (no file descriptor or thread to spare) keeps its program running on its terminal,
-and shows in workspace `recovered` once it is taken over; `kraal restart` lists it, and there is
-no other live restart until then. Should the new kraal not read what was handed over, the layout
-comes back as after a restart that is not live, and the terminals that were kept open show in
-workspace `recovered`, their programs running on.
+Once the exec is done, no terminal is closed under a program, and nothing is started in its
+place. A pane the new kraal cannot take over at once (no file descriptor or thread to spare)
+keeps its program running on its terminal, and shows in workspace `recovered` once it is taken
+over; `kraal restart` lists it, and there is no other live restart until then. Should the new
+kraal not read what was handed over, it keeps the terminals that were kept open, and nothing
+else: they show in workspace `recovered`, under the pane ids their programs know (read-only
+when that is unknown), their programs running on. No layout comes back and no state is saved
+over the one from before, so a restart once you are done with them brings the layout back.
 
 ## Workspace files
 

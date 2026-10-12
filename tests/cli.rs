@@ -4703,11 +4703,11 @@ fn a_program_left_on_an_ended_panes_terminal_counts() {
 fn a_pane_not_taken_over_keeps_its_program_and_spares_the_others() {
     let env = Env::new("partial");
     let unadoptable = env.root.join("unadoptable");
-    std::fs::write(&unadoptable, "stuck\n").unwrap();
+    std::fs::write(&unadoptable, "stuck\nlate once\n").unwrap();
     env.workspace("w", "layout {\n    pane name=\"sh\"\n}\n");
     let out = env.cmd(&["open", "w"]).env("KRAAL_TEST_UNADOPTABLE", &unadoptable).output().unwrap();
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
-    let names = ["before", "stuck", "after"];
+    let names = ["before", "stuck", "after", "late"];
     for name in names {
         env.run(&["run", "--name", name, "--", "sh", "-c", COUNTER]);
     }
@@ -4717,11 +4717,16 @@ fn a_pane_not_taken_over_keeps_its_program_and_spares_the_others() {
     let (said, err) = (String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
     assert!(out.status.success() && said.contains("restarted session partial live"), "{said}{err}");
     assert!(err.contains("not taken over yet (a test says it cannot be)"), "{err}");
+    // Taken over at the second try, elsewhere: said too.
+    let late = pane_json(&env, "late");
+    assert_eq!(late["workspace"], "recovered");
+    assert!(err.contains(&format!("pane {}: taken over late", late["id"])), "{err}");
     for pid in &pids {
         assert_eq!(parent_of(*pid), Some(server));
     }
     still_counting(&env, "before");
     still_counting(&env, "after");
+    still_counting(&env, "late");
     std::thread::sleep(Duration::from_millis(500));
     assert!(!zombie(pids[1]) && parent_of(pids[1]) == Some(server), "its program runs on");
     // Not while it waits to be taken over.
@@ -4730,7 +4735,7 @@ fn a_pane_not_taken_over_keeps_its_program_and_spares_the_others() {
     assert!(!out.status.success() && err.contains("was not taken over yet"), "{err}");
     std::fs::write(&unadoptable, "").unwrap();
     let start = Instant::now();
-    while !env.run(&["panes", "--json"]).contains("recovered") {
+    while !env.run(&["panes", "--json"]).contains("\"stuck\"") {
         assert!(start.elapsed() < Duration::from_secs(10), "{}", env.run(&["panes"]));
         std::thread::sleep(Duration::from_millis(100));
     }
@@ -4749,34 +4754,119 @@ fn a_pane_not_taken_over_keeps_its_program_and_spares_the_others() {
 fn programs_run_on_when_the_hand_off_cannot_be_read() {
     let env = Env::new("unreadable");
     env.workspace("w", "layout {\n    pane name=\"sh\"\n}\n");
-    let out = env.cmd(&["open", "w"]).env("KRAAL_TEST_UNREADABLE_HANDOFF", "1").output().unwrap();
+    // One terminal is not taken over at once: kept as it was handed over meanwhile.
+    let unadoptable = env.root.join("unadoptable");
+    let out = env
+        .cmd(&["open", "w"])
+        .env("KRAAL_TEST_UNREADABLE_HANDOFF", "1")
+        .env("KRAAL_TEST_UNADOPTABLE", &unadoptable)
+        .output()
+        .unwrap();
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     env.run(&["run", "--name", "counter", "--", "sh", "-c", COUNTER]);
     let pid = counter_pid(&env, "counter");
+    let id = pane_json(&env, "counter")["id"].to_string();
+    env.run(&["run", "--name", "waiting", "--", "sleep", "600"]);
+    std::fs::write(&unadoptable, format!("#{}\n", pane_json(&env, "waiting")["id"])).unwrap();
     let server = parent_of(pid).expect("the server");
+    let children = || -> Vec<i32> {
+        let list = std::fs::read_to_string(format!("/proc/{server}/task/{server}/children")).unwrap_or_default();
+        let mut pids: Vec<i32> = list.split_whitespace().filter_map(|p| p.parse().ok()).collect();
+        pids.sort();
+        pids
+    };
+    let before = children();
+    env.run(&["panes"]);
+    let state = env.root.join("state/kraal/sessions/unreadable.json");
+    let start = Instant::now();
+    while !state.exists() {
+        assert!(start.elapsed() < Duration::from_secs(10), "the state was not saved");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    std::thread::sleep(Duration::from_millis(300));
+    let saved = std::fs::read(&state).unwrap();
     let out = env.try_run(&["restart", "--live"]);
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(!out.status.success() && err.contains("run on, in workspace recovered"), "{err}");
     std::thread::sleep(Duration::from_millis(500));
     assert!(parent_of(pid) == Some(server) && !zombie(pid), "its program runs on");
+    // Its pane keeps the id its programs know, and shows it counting on.
+    let pane = pane_json_by_id(&env, &id);
+    assert_eq!(pane["workspace"], "recovered", "{pane}");
+    env.wait_for_text(&id, "tick");
+    // Nothing else came back, and nothing was started: no layout, no program, no hook.
     let panes: serde_json::Value = serde_json::from_str(&env.run(&["panes", "--json"])).unwrap();
-    let recovered: Vec<String> = panes
-        .as_array()
-        .unwrap()
-        .iter()
-        .filter(|p| p["workspace"] == "recovered")
-        .map(|p| p["id"].to_string())
+    assert!(panes.as_array().unwrap().iter().all(|p| p["workspace"] == "recovered"), "{panes}");
+    assert!(children().iter().all(|p| before.contains(p)), "{:?} then {:?}", before, children());
+    // The terminals kept, the one not taken over yet too, go to nothing it starts from now on.
+    let fds = std::fs::read_dir(format!("/proc/{server}/fd")).unwrap().flatten();
+    let ptys: Vec<String> = fds
+        .filter(|e| std::fs::read_link(e.path()).is_ok_and(|l| l.to_string_lossy().ends_with("ptmx")))
+        .map(|e| e.file_name().to_string_lossy().into_owned())
         .collect();
-    assert!(!recovered.is_empty(), "{panes}");
-    // The counter shows there again, counting on.
-    let start = Instant::now();
-    let counting = |id: &str| env.run(&["read", "-p", id]).contains("tick");
-    while !recovered.iter().any(|id| counting(id)) {
-        assert!(start.elapsed() < Duration::from_secs(10), "{panes}");
-        std::thread::sleep(Duration::from_millis(100));
+    assert!(!ptys.is_empty());
+    for fd in ptys {
+        let info = std::fs::read_to_string(format!("/proc/{server}/fdinfo/{fd}")).unwrap();
+        let flags = info.lines().find_map(|l| l.strip_prefix("flags:")).unwrap().trim();
+        assert!(u32::from_str_radix(flags, 8).unwrap() & 0o2000000 != 0, "fd {fd} is not closed on exec: {info}");
     }
-    // The layout came back too.
-    assert_eq!(pane_json(&env, "counter")["workspace"], "w");
+    // The saved state stays as it was, for a restart; there is no live restart meanwhile.
+    std::thread::sleep(Duration::from_millis(500));
+    env.run(&["panes"]);
+    assert_eq!(std::fs::read(&state).unwrap(), saved, "the saved state was written over");
+    let out = env.try_run(&["restart", "--live"]);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success() && err.contains("could not take over as they were"), "{err}");
+}
+
+/// The pane `id` as `kraal panes --json` lists it.
+#[cfg(target_os = "linux")]
+fn pane_json_by_id(env: &Env, id: &str) -> serde_json::Value {
+    let panes: serde_json::Value = serde_json::from_str(&env.run(&["panes", "--json"])).unwrap();
+    let id: u64 = id.parse().unwrap();
+    panes.as_array().unwrap().iter().find(|p| p["id"] == id).cloned().unwrap_or_default()
+}
+
+/// What a client held during a live restart goes to the pane it was typed for, which keeps the
+/// focus even when a pane before it in its tab was left out; never to another pane: when its
+/// pane was not taken over, it is dropped, and the client is told.
+#[cfg(all(target_os = "linux", debug_assertions))]
+#[test]
+fn held_keys_go_to_their_pane_or_nowhere() {
+    let env = Env::new("heldfor");
+    let unadoptable = env.root.join("unadoptable");
+    std::fs::write(&unadoptable, "first\nlost\n").unwrap();
+    // A tab of a pane left out before the tab shown, a pane left out before the one focused.
+    env.workspace(
+        "w",
+        "layout {\n    tab name=\"one\" {\n        pane name=\"lost\"\n    }\n    tab name=\"two\" focus=true {\n        \
+         pane split_direction=\"vertical\" {\n            pane name=\"first\"\n            pane name=\"ed\"\n            \
+         pane name=\"last\"\n        }\n    }\n    tab name=\"three\" {\n        pane name=\"end\"\n    }\n}\n",
+    );
+    let out = env.cmd(&["open", "w"]).env("KRAAL_TEST_UNADOPTABLE", &unadoptable).output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let (ed, lost) = (pane_json(&env, "ed")["id"].to_string(), pane_json(&env, "lost")["id"].to_string());
+    env.run(&["focus", "ed"]);
+    let client = RawClient::attach_following(&env, "w");
+    client.wait_for_message("\"attached\"");
+    std::thread::sleep(Duration::from_millis(300));
+    let out = env.run(&["restart", "--live"]);
+    assert!(out.contains("restarted session heldfor live"), "{out}");
+    client.wait_for_message(&format!(r#""type":"hold","on":true,"attempt":1,"pane":{ed}"#));
+    // The tab shown and the focus stay on their panes.
+    assert_eq!(pane_json(&env, "ed")["focused"], true, "{}", env.run(&["panes", "--json"]));
+    // Coming back with what it held: for its pane, which shows, and takes it.
+    let back = RawClient::attach_with(&env, "w", &format!(r#","follows_live":true,"typed_for":{ed},"typed":24"#), None);
+    back.wait_for_message(&format!(r#""shown":{ed}"#));
+    let mut back = back;
+    back.send(b"echo FOR-ED-$((6*7))\r");
+    env.wait_for_text("ed", "FOR-ED-42");
+    // For a pane not taken over: nothing shows to take it, and the client is told.
+    let other =
+        RawClient::attach_with(&env, "w", &format!(r#","follows_live":true,"typed_for":{lost},"typed":5"#), None);
+    other.wait_for_message("\"attached\"");
+    assert!(!other.messages.lock().unwrap().iter().any(|m| m.contains("shown")), "{:?}", other.messages);
+    other.wait_for_screen("during the restart: dropped");
 }
 
 /// What a client sent just before it holds what is typed (over a slow connection, it arrives a
@@ -4957,11 +5047,12 @@ fn a_sequence_cut_in_two_is_never_handed_over() {
     assert!(screen.contains("GOT-REPLY"), "{screen}");
 }
 
-/// A client from before live restarts (one that does not say it follows them) is told to attach
-/// again, rather than to wait for a server that does not go away; one that follows comes back.
+/// A client from before live restarts (one that does not say it follows them) would neither
+/// hold what is typed nor come back: while one is attached there is no live restart, and it is
+/// left as it is. Once it has gone, the restart happens, and one that follows comes back.
 #[cfg(target_os = "linux")]
 #[test]
-fn clients_that_do_not_follow_a_live_restart_are_told_to_attach_again() {
+fn a_client_that_cannot_follow_a_live_restart_holds_it_back() {
     let env = Env::new("olderclient");
     env.workspace("w", "layout {\n    pane name=\"sh\"\n}\n");
     env.run(&["open", "w"]);
@@ -4969,12 +5060,16 @@ fn clients_that_do_not_follow_a_live_restart_are_told_to_attach_again() {
     let following = RawClient::attach_following(&env, "w");
     older.wait_for_message("\"attached\"");
     following.wait_for_message("\"attached\"");
+    let out = env.try_run(&["restart", "--live"]);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success() && err.contains("a kraal from before live restarts"), "{err}");
+    assert!(!older.messages.lock().unwrap().iter().any(|m| m.contains("exit")), "{:?}", older.messages);
+    let _ = older.stream.lock().unwrap().shutdown(std::net::Shutdown::Both);
+    std::thread::sleep(Duration::from_millis(300));
     let out = env.run(&["restart", "--live"]);
     assert!(out.contains("restarted session olderclient live"), "{out}");
-    older.wait_for_message("kraal restarts live: run kraal to attach again");
-    assert!(!older.messages.lock().unwrap().iter().any(|m| m.contains("reattach")), "{:?}", older.messages);
-    following.wait_for_message(r#""reattach":"w","live":true"#);
     following.wait_for_message(r#""type":"hold","on":true"#);
+    following.wait_for_message(r#""reattach":"w","live":true"#);
 }
 
 /// The menu's restart that is not live runs the kraal installed now, which may be one from

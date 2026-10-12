@@ -468,8 +468,13 @@ pub struct Server {
     unadopted: Vec<upgrade::LeftOver>,
     /// When they were last tried.
     unadopted_tried: Instant,
-    /// What the last live restart took over.
-    live_restart: Option<crate::protocol::LiveRestart>,
+    /// Live restarts since the session's server started.
+    live_restarts: u32,
+    /// What became of each pane the last live restart handed over: the report says it.
+    outcomes: std::collections::BTreeMap<PaneId, upgrade::Outcome>,
+    /// The hand-off could not be read: this server keeps the terminals it was handed as they
+    /// are, and writes no state over the saved one.
+    recovering: bool,
 }
 
 /// Stops the thread that accepts connections for a while: `parked` once it has.
@@ -498,7 +503,7 @@ pub fn run(session: &str, handoff: Option<&std::path::Path>) -> Result<()> {
             // The saved layout comes back, and the terminals kept open with it, their programs
             // running on.
             eprintln!("kraal: cannot take over from the previous server: {e:#}");
-            salvaged = upgrade::salvage();
+            salvaged = upgrade::salvage(&socket);
             None
         }
     });
@@ -677,15 +682,16 @@ pub fn run(session: &str, handoff: Option<&std::path::Path>) -> Result<()> {
         hold_attempts: 0,
         unadopted: Vec::new(),
         unadopted_tried: Instant::now(),
-        live_restart: None,
+        live_restarts: 0,
+        outcomes: Default::default(),
+        recovering: false,
     };
     server.scan_definitions();
     match taken {
         Some(h) => server.take_over(h),
-        None => {
-            server.restore();
-            server.take_salvaged(salvaged);
-        }
+        // Nothing runs on: the saved layout comes back.
+        None if salvaged.is_empty() => server.restore(),
+        None => server.take_salvaged(salvaged),
     }
     let result = server.event_loop(&rx);
     server.shutdown();

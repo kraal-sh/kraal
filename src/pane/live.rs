@@ -401,6 +401,7 @@ impl Pane {
             preparing: live.preparing,
             search: None,
             restored: live.restored.clone(),
+            recovered: None,
         })
     }
 
@@ -659,6 +660,22 @@ mod tests {
             before.kill();
             after.kill();
         }
+    }
+
+    /// A terminal kept from a hand-off that could not be read is never started again (nothing
+    /// says what ran in it), and takes no input when its pane is unknown.
+    #[test]
+    fn a_kept_terminal_is_never_started_again() {
+        let (tx, _rx) = crossbeam_channel::bounded(64);
+        let spec = PaneSpec { command: vec!["sleep".into(), "5".into()], ..Default::default() };
+        let mut pane = Pane::spawn(1, None, spec, 20, 5, &env(), &tx).unwrap();
+        pane.recovered = Some(Recovered::Known);
+        assert!(pane.takes_typing());
+        assert!(pane.respawn(&env(), &tx).is_err());
+        pane.recovered = Some(Recovered::Unknown);
+        assert!(!pane.takes_typing());
+        assert!(pane.respawn(&env(), &tx).is_err());
+        pane.kill();
     }
 
     #[test]

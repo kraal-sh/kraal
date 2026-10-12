@@ -116,7 +116,18 @@ impl Server {
             }
         };
         match msg {
-            ClientMsg::Attach { version, cols, rows, workspace, remote, pane, installed, follows_live } => {
+            ClientMsg::Attach {
+                version,
+                cols,
+                rows,
+                workspace,
+                remote,
+                pane,
+                installed,
+                follows_live,
+                typed_for,
+                typed,
+            } => {
                 if let Some(c) = self.clients.get_mut(&id) {
                     c.remote = remote;
                     c.follows_live = follows_live;
@@ -126,7 +137,16 @@ impl Server {
                     self.send_msg(id, &ServerMsg::exit(version_mismatch(version)));
                     return;
                 }
-                self.attach(id, cols, rows, workspace);
+                // What was typed during a live restart goes to the pane it was typed for, or
+                // nowhere: that pane is shown, when it is there.
+                let shown = typed_for.filter(|p| self.panes.get(p).is_some_and(|p| p.takes_typing()));
+                self.attach(id, cols, rows, workspace, shown);
+                if let Some(p) = typed_for.filter(|p| self.panes.contains_key(p)) {
+                    self.reveal(id, p);
+                }
+                if let Some(p) = typed_for.filter(|_| shown.is_none() && typed > 0) {
+                    self.toast(id, format!("pane {p} cannot take what was typed for it during the restart: dropped"));
+                }
                 if let Some(installed) = installed {
                     self.version_notice(id, &installed);
                 }
@@ -169,7 +189,7 @@ impl Server {
         }
     }
 
-    pub(super) fn attach(&mut self, id: ClientId, cols: u16, rows: u16, workspace: Option<String>) {
+    pub(super) fn attach(&mut self, id: ClientId, cols: u16, rows: u16, workspace: Option<String>, shown: Option<u32>) {
         let mut target = None;
         if let Some(name) = workspace {
             match self.open_workspace(&name) {
@@ -188,7 +208,7 @@ impl Server {
         let ws = target.unwrap_or_else(|| self.workspaces[0].id);
         let welcome = !crate::paths::state_dir().join("welcomed").exists();
         // Before anything is drawn: what this server is.
-        self.send_msg(id, &ServerMsg::Attached { version: protocol::KRAAL_VERSION.into() });
+        self.send_msg(id, &ServerMsg::Attached { version: protocol::KRAAL_VERSION.into(), shown });
         if let Some(c) = self.clients.get_mut(&id) {
             c.attached = true;
             c.cols = cols;

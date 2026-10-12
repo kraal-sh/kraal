@@ -21,7 +21,8 @@ impl Server {
     pub(super) fn persist(&mut self) {
         self.persist_dirty = false;
         self.last_persist = Instant::now();
-        if self.workspaces.is_empty() {
+        // The saved state is the one from before a hand-off that could not be read.
+        if self.workspaces.is_empty() || self.recovering {
             return;
         }
         // Turned off: nothing is saved, and what was goes once this state is written.

@@ -3,11 +3,14 @@
 //!
 //! `exec` keeps the process, so the panes' programs stay its children, and their PTYs stay open
 //! when their descriptors are not closed on exec. The binary is copied once into a sealed
-//! memory file, tried (it runs and reads this very hand-off format), and that copy is run. Before
-//! the exec, the server stops taking connections (they wait for the next server), answers the
-//! commands it has read and waits until what they were sent is written; attached clients hold
-//! what is typed from a point between two keys and say so (an older client is told to attach
-//! again), and none may be in a paste or a kraal menu. It waits for the commands its threads
+//! memory file and tried (it runs and reads this very hand-off format), off the event loop and
+//! within a time limit, and that copy is run. Before the exec, the server stops taking
+//! connections (they wait for the next server), answers the commands it has read and waits
+//! until what they were sent is written; attached clients hold what is typed from a point
+//! between two keys, for the pane focused, and say so (a terminal attached with an older kraal,
+//! which cannot, holds the restart back), and none may be in a paste or a kraal menu. What a
+//! client held goes, once it is back, to the pane it was typed for or nowhere, and it is told.
+//! It waits for the commands its threads
 //! run, and holds off new ones; it stops reading the PTYs (what was read is drawn first), and
 //! goes on only when the output of every terminal still in use stands between two sequences and
 //! its input has been taken. It writes a private hand-off file of its own: the session's state
@@ -23,10 +26,13 @@
 //! read, a sequence cut in two, a paste still coming). The server then goes on as before.
 //! Tunnels keep their ssh; those that list remote sessions' agents are started again.
 //!
-//! After the exec, nothing is closed under a program: a pane that cannot be taken over is left
-//! out of the layout alone, its PTY kept open and its program running, and is taken over later
-//! into workspace "recovered"; a hand-off that cannot be read leaves every PTY it kept open to
-//! be taken over the same way. `kraal restart` says what was not taken over as it was.
+//! After the exec, nothing is closed under a program, and nothing is started in its place: a
+//! pane that cannot be taken over is left out of the layout alone, its PTY kept open and its
+//! program running, and is taken over later into workspace "recovered". A hand-off that cannot
+//! be read leaves the terminals it kept, and only them, as they are, in workspace "recovered":
+//! under the pane ids their programs know, or read-only when unknown; the saved state stays as
+//! it was. What became of each pane handed over is kept (`Outcome`), and `kraal restart` says
+//! what was not taken over as it was.
 
 use std::collections::HashMap;
 use std::ffi::{CString, OsStr};
@@ -46,12 +52,12 @@ use super::net::{LiveTunnel, TunnelState};
 use super::ui::{ConfirmAction, Mode};
 use super::{ClientId, Event, Server};
 use crate::layout::PaneId;
-use crate::pane::{Drained, LivePane, Pane};
+use crate::pane::{Drained, LivePane, Pane, Recovered};
 use crate::persist::{self, SavedScrollback, SessionSnapshot};
 use crate::protocol::{Response, ServerMsg};
 
 /// The format of the hand-off file. A kraal takes over only from one whose format it reads.
-pub const HANDOFF_VERSION: u32 = 2;
+pub const HANDOFF_VERSION: u32 = 3;
 
 /// How long a live restart waits for what is in its way to end before it gives up.
 const IDLE_WAIT: Duration = Duration::from_secs(5);
@@ -59,6 +65,8 @@ const IDLE_WAIT: Duration = Duration::from_secs(5);
 const CLIENTS_WAIT: Duration = Duration::from_secs(2);
 /// How long the hand-off may take to reach the disk.
 const WRITE_WAIT: Duration = Duration::from_secs(5);
+/// How long copying and trying the kraal to restart on may take.
+const BINARY_WAIT: Duration = Duration::from_secs(15);
 
 /// What a server hands over to the one that replaces it.
 #[derive(Serialize, Deserialize)]
@@ -230,6 +238,16 @@ fn check_binary(binary: &Binary) -> Result<(), String> {
     Err(format!("the kraal installed cannot take over live ({}: an older kraal, or not one)", binary.path.display()))
 }
 
+/// The kraal to restart on (see `Binary`), copied and tried within a while, off the event loop:
+/// a file system that does not answer is given up on, and the copy goes whenever that work ends.
+fn prepare_binary(asked: Option<PathBuf>) -> Result<Binary, String> {
+    let work = move || Binary::open(asked).and_then(|exe| check_binary(&exe).map(|()| exe));
+    match within(BINARY_WAIT, work, drop) {
+        Some(prepared) => prepared,
+        None => Err("the kraal to restart on does not answer (its file system may hang)".into()),
+    }
+}
+
 /// A hand-off file of its own for each attempt: one given up on (its disk too slow) and written
 /// late never takes the place of the next one's.
 fn handoff_path(session: &str) -> PathBuf {
@@ -312,7 +330,7 @@ fn within<T: Send + 'static>(
     let (tx, rx) = std::sync::mpsc::sync_channel::<T>(1);
     let given_up = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let late = given_up.clone();
-    let spawned = std::thread::Builder::new().name("handoff".into()).spawn(move || {
+    let spawned = std::thread::Builder::new().name("live-restart".into()).spawn(move || {
         let result = work();
         if late.load(std::sync::atomic::Ordering::SeqCst) {
             abandoned(result);
@@ -363,18 +381,26 @@ pub fn read_handoff(path: &Path, session: &str) -> Result<Handoff> {
 }
 
 /// What can be taken of a hand-off that cannot be read: the terminals it kept open, each with
-/// the program leading its session, to take over as they are (see `Server::take_salvaged`).
-/// Every other descriptor it kept open is closed (clients connect again, the socket is made
-/// again), and the other children are reaped once they end.
-pub fn salvage() -> Vec<LivePane> {
+/// the program leading its session and the pane it knows (its `KRAAL_PANE`, when it is this
+/// session's), to keep as they are (see `Server::take_salvaged`). They are closed on exec from
+/// now on, as everything this server starts must not get them. Every other descriptor it kept
+/// open is closed (clients connect again, the socket is made again), and the other children are
+/// reaped once they end.
+pub fn salvage(socket: &Path) -> Vec<Salvaged> {
     let dir = if cfg!(target_os = "linux") { "/proc/self/fd" } else { "/dev/fd" };
     let fds: Vec<RawFd> = std::fs::read_dir(dir)
         .map(|d| d.flatten().filter_map(|e| e.file_name().to_str()?.parse().ok()).filter(|fd| *fd > 2).collect())
         .unwrap_or_default();
-    let mut terminals = Vec::new();
+    let mut terminals: Vec<Salvaged> = Vec::new();
     for fd in fds {
         match salvage_terminal(fd) {
-            Some(live) => terminals.push(live),
+            Some(live) => {
+                let _ = set_inherited(fd, false);
+                let env = crate::process::environ(live.pid, &["KRAAL_PANE", "KRAAL_SOCKET"]);
+                let ours = env.get("KRAAL_SOCKET").is_some_and(|s| Path::new(s) == socket);
+                let pane = env.get("KRAAL_PANE").and_then(|p| p.parse().ok()).filter(|_| ours && live.pid > 0);
+                terminals.push(Salvaged { live, pane });
+            }
             // SAFETY: nothing in this process uses these yet (the directory's own is closed
             // already).
             None => unsafe {
@@ -382,7 +408,7 @@ pub fn salvage() -> Vec<LivePane> {
             },
         }
     }
-    let leaders: Vec<u32> = terminals.iter().map(|t| t.pid).collect();
+    let leaders: Vec<u32> = terminals.iter().map(|t| t.live.pid).collect();
     for pid in crate::process::children(std::process::id()) {
         if !leaders.contains(&pid) && crate::exec::is_child(pid) {
             crate::exec::reap_pid_later(pid);
@@ -466,13 +492,9 @@ impl Server {
         if let Some(why) = self.upgrade_refusal() {
             return Some(Err(why));
         }
-        let exe = match Binary::open(binary) {
-            Ok(exe) => Arc::new(exe),
-            Err(e) => return Some(Err(e)),
-        };
         if check {
             let started = self.background(
-                move || check_binary(&exe),
+                move || prepare_binary(binary).map(drop),
                 move |server, result| {
                     server.send_msg(client, &ServerMsg::Response { result: result.map(|()| Response::Ok) });
                     server.clients.remove(&client);
@@ -480,7 +502,7 @@ impl Server {
             );
             return (!started).then(|| Err("cannot start trying the binary".into()));
         }
-        self.start_upgrade(Asker::Request(client), exe);
+        self.start_upgrade(Asker::Request(client), binary);
         None
     }
 
@@ -492,7 +514,7 @@ impl Server {
             return self.cold_restart_question(&why);
         }
         let started = self.background(
-            || Binary::open(None).and_then(|exe| check_binary(&exe)),
+            || prepare_binary(None).map(drop),
             move |server, tried| {
                 let mode = match tried {
                     Ok(()) => Mode::confirm(
@@ -518,20 +540,17 @@ impl Server {
         if self.upgrading {
             return self.toast(client, "a live restart is already under way");
         }
-        match Binary::open(None) {
-            Ok(exe) => self.start_upgrade(Asker::Menu(client), Arc::new(exe)),
-            Err(why) => self.toast(client, format!("no live restart: {why}")),
-        }
+        self.start_upgrade(Asker::Menu(client), None);
     }
 
-    /// Try `exe`, then hand over to it once nothing in the way is left (see `upgrade_now`).
-    fn start_upgrade(&mut self, asker: Asker, exe: Arc<Binary>) {
+    /// Copy and try the kraal to restart on (`asked`, else the one installed), off the event
+    /// loop, then hand over to it once nothing in the way is left (see `upgrade_now`).
+    fn start_upgrade(&mut self, asker: Asker, asked: Option<PathBuf>) {
         self.upgrading = true;
-        let checked = exe.clone();
         let started = self.background(
-            move || check_binary(&checked),
-            move |server, result| match result {
-                Ok(()) => server.upgrade_when_idle(asker, exe, Instant::now() + IDLE_WAIT),
+            move || prepare_binary(asked),
+            move |server, prepared| match prepared {
+                Ok(exe) => server.upgrade_when_idle(asker, Arc::new(exe), Instant::now() + IDLE_WAIT),
                 Err(why) => server.upgrade_failed(asker, why),
             },
         );
@@ -560,6 +579,12 @@ impl Server {
         if !self.switches.is_empty() {
             return Some("an agent is switching accounts: try again once it has".into());
         }
+        if self.recovering {
+            return Some(format!(
+                "this server keeps terminals it could not take over as they were (workspace {RECOVERED}): \
+                 restart it once you are done with them"
+            ));
+        }
         let mut ids: Vec<&PaneId> = self.panes.keys().collect();
         ids.sort();
         for id in ids {
@@ -579,6 +604,10 @@ impl Server {
         }
         if let Some(w) = self.waits.first() {
             return Some(format!("`kraal wait` is waiting on {}: try again once it ends", self.pane_label(w.pane)));
+        }
+        // It would neither hold what is typed nor come back: what it is sending would be lost.
+        if self.clients.values().any(|c| c.attached && !c.follows_live) {
+            return Some("a terminal is attached with a kraal from before live restarts: detach it first".into());
         }
         if let Some(left) = self.unadopted.first() {
             return Some(format!(
@@ -715,20 +744,18 @@ impl Server {
         let attempt = self.hold_attempts;
         let deadline = Instant::now() + CLIENTS_WAIT;
         loop {
-            // Clients that attach meanwhile are told too.
-            let attached: Vec<(ClientId, bool)> = self
+            // Clients that attach meanwhile are asked too; one from before live restarts holds
+            // the restart back (see `upgrade_refusal`). The keys held are for the pane focused.
+            let asked: Vec<ClientId> = self
                 .clients
                 .values()
-                .filter(|c| c.attached && !told.contains(&c.id))
-                .map(|c| (c.id, c.follows_live))
+                .filter(|c| c.attached && c.follows_live && !told.contains(&c.id))
+                .map(|c| c.id)
                 .collect();
-            for (id, follows) in attached {
+            for id in asked {
                 told.insert(id);
-                let msg = match follows {
-                    true => ServerMsg::Hold { on: true, attempt },
-                    false => ServerMsg::exit("kraal restarts live: run kraal to attach again"),
-                };
-                self.send_msg(id, &msg);
+                let pane = self.client_focus(id);
+                self.send_msg(id, &ServerMsg::Hold { on: true, attempt, pane });
             }
             while let Ok(ev) = self.events_rx.try_recv() {
                 match ev {
@@ -764,7 +791,7 @@ impl Server {
             return Some("a command is still being answered".into());
         }
         if self.clients.values().any(|c| c.attached && !c.follows_live) {
-            return Some("a client from before live restarts has not gone yet".into());
+            return Some("a terminal is attached with a kraal from before live restarts".into());
         }
         if self.clients.values().any(|c| c.attached && c.held != Some(attempt)) {
             return Some("a client has not stopped sending what is typed".into());
@@ -806,7 +833,7 @@ impl Server {
                     c.pending_since = Some(Instant::now());
                 }
             }
-            self.send_msg(id, &ServerMsg::Hold { on: false, attempt: 0 });
+            self.send_msg(id, &ServerMsg::Hold { on: false, attempt: 0, pane: None });
         }
         self.accepting.paused.store(false, std::sync::atomic::Ordering::SeqCst);
     }
@@ -974,7 +1001,7 @@ impl Server {
             connections: Vec::new(),
             // The panes' own go with them.
             reaping: crate::exec::reaping().into_iter().filter(|pid| !pane_pids.contains(pid)).collect(),
-            live_restarts: self.live_restart.as_ref().map_or(0, |l| l.count),
+            live_restarts: self.live_restarts,
         }
     }
 
@@ -1027,65 +1054,40 @@ impl Server {
             self.adopt_tunnel(t, stderr);
         }
         let mut live: HashMap<PaneId, LivePane> = h.panes.into_iter().map(|p| (p.id, p)).collect();
-        let (mut kept, mut not_kept) = (0, Vec::new());
+        self.live_restarts = h.live_restarts + 1;
+        self.outcomes.clear();
         // Nothing opens: the workspaces are the same ones, their events said already, and the
         // hooks run for them already. A pane that cannot be taken over is left out of its
-        // place, and alone: its program runs on, on its terminal, kept open to try again.
+        // place, and alone: its program runs on, on its terminal, kept open to try again. No
+        // pane is started in the place of one handed over.
         let hooks = std::mem::take(&mut self.hooks.list);
         persist::apply_layout(self, h.state.workspaces, h.state.revision, true, &mut |server, p| {
             let Some(lp) = p.id.and_then(|id| live.remove(&id)) else {
                 return match p.id {
-                    // A preview or a file manager, opened again where it was.
+                    // A preview or a file manager, opened again where it was (no program runs
+                    // in either).
                     Some(id) if p.spec.preview.is_some() || p.spec.files.is_some() => {
                         server.spawn_pane_as(id, p.name.clone(), p.spec.clone())
                     }
-                    _ if p.spec.preview.is_some() || p.spec.files.is_some() => {
-                        server.spawn_pane(p.name.clone(), p.spec.clone())
-                    }
-                    _ => persist::spawn(server, p),
+                    _ => Err(anyhow::anyhow!("nothing was handed over for it")),
                 };
             };
             let id = lp.id;
-            let mut not_as_it_was = |server: &mut Server, line: String| {
-                server.warnings.push(line.clone());
-                not_kept.push(line);
-            };
-            match server.adopt_live(lp, p.name.clone(), p.scrollback.clone()) {
-                Ok(true) => {
-                    kept += 1;
-                    Ok(id)
-                }
-                Ok(false) => {
-                    let line =
-                        format!("pane {id}: its terminal is kept, but its program is not this server's to wait for");
-                    not_as_it_was(server, line);
-                    Ok(id)
-                }
-                Err(NotAdopted::NoTerminal) => {
-                    not_as_it_was(server, format!("pane {id}: its terminal was gone; it starts again"));
-                    persist::spawn(server, p)
-                }
-                Err(NotAdopted::Later(left)) => {
-                    let why = format!("pane {id} could not be taken over yet ({}): its program runs on", left.why);
-                    server.unadopted.push(*left);
-                    Err(anyhow::anyhow!(why))
-                }
-            }
+            let outcome = server.adopt_live(lp, p.name.clone(), p.scrollback.clone(), None);
+            let placed = matches!(outcome, Outcome::Kept | Outcome::TerminalOnly);
+            server.set_outcome(id, outcome);
+            if placed { Ok(id) } else { Err(anyhow::anyhow!("pane {id} was not taken over")) }
         });
         self.hooks.list = hooks;
         self.events = EventLog::restore(h.events);
         // What has no place any more is never closed: its program may still use its terminal.
         for (_, live) in live {
-            self.warnings
-                .push(format!("pane {} had no place in the layout: it shows in workspace {RECOVERED}", live.id));
+            let id = live.id;
             let why = "it had no place in the layout".to_string();
-            self.unadopted.push(LeftOver { live, name: None, why });
+            self.set_outcome(id, Outcome::Waiting(why.clone()));
+            self.unadopted.push(LeftOver { live, name: None, why, recovered: None });
         }
         self.adopt_left_over();
-        not_kept.extend(self.unadopted.iter().map(|l| {
-            format!("pane {}: not taken over yet ({}); it shows in workspace recovered once it is", l.live.id, l.why)
-        }));
-        self.live_restart = Some(crate::protocol::LiveRestart { count: h.live_restarts + 1, kept, not_kept });
         self.relayout();
         // Full-screen programs draw themselves again: a size change, then back.
         let nudged: Vec<PaneId> =
@@ -1111,23 +1113,49 @@ impl Server {
             // SAFETY: as above.
             self.new_connection(unsafe { UnixStream::from_raw_fd(fd) });
         }
-        let report = self.live_restart.as_ref().map_or(0, |l| l.not_kept.len());
-        let text =
-            format!("restarted live from kraal {}: {kept} panes kept running, {report} not as they were", h.from);
+        let report =
+            self.live_report().unwrap_or(crate::protocol::LiveRestart { count: 0, kept: 0, not_kept: Vec::new() });
+        let text = format!(
+            "restarted live from kraal {}: {} panes kept running, {} not as they were",
+            h.from,
+            report.kept,
+            report.not_kept.len()
+        );
         eprintln!("kraal: {text}");
-        self.log_message(&text, report > 0);
+        self.log_message(&text, !report.not_kept.is_empty());
     }
 
-    /// The pane `live` describes, made on its PTY and its program (whether the program was
-    /// taken too: one that is not this process's child, or no longer the one it was, is left
-    /// alone). One that cannot be made now comes back as it was, its PTY open and its program
-    /// untouched.
+    /// What the last live restart took over, told from what became of each pane.
+    pub(super) fn live_report(&self) -> Option<crate::protocol::LiveRestart> {
+        (self.live_restarts > 0).then(|| crate::protocol::LiveRestart {
+            count: self.live_restarts,
+            kept: self.outcomes.values().filter(|o| **o == Outcome::Kept).count() as u32,
+            not_kept: self.outcomes.iter().filter_map(|(id, o)| o.line(*id)).collect(),
+        })
+    }
+
+    /// Pane `id` handed over came to `outcome`: said once, when it is not as it was.
+    fn set_outcome(&mut self, id: PaneId, outcome: Outcome) {
+        if let Some(line) = outcome.line(id)
+            && self.outcomes.get(&id) != Some(&outcome)
+        {
+            self.warnings.push(line);
+        }
+        self.outcomes.insert(id, outcome);
+    }
+
+    /// The pane `live` describes, made on its PTY and its program (the outcome says whether the
+    /// program was taken too: one that is not this process's child, or no longer the one it
+    /// was, is left alone). One that cannot be made now goes to the panes to take over later,
+    /// its PTY open and its program untouched. `recovered`: a terminal kept from a hand-off
+    /// that could not be read.
     fn adopt_live(
         &mut self,
         live: LivePane,
         name: Option<String>,
         scrollback: Option<String>,
-    ) -> Result<bool, NotAdopted> {
+        recovered: Option<Recovered>,
+    ) -> Outcome {
         let id = live.id;
         // SAFETY: plain syscalls on a descriptor the hand-off names.
         if unsafe { libc::isatty(live.fd) } != 1 {
@@ -1136,12 +1164,11 @@ impl Server {
                 // SAFETY: the hand-off gives this process the descriptor, which nothing else owns.
                 drop(unsafe { OwnedFd::from_raw_fd(live.fd) });
             }
-            return Err(NotAdopted::NoTerminal);
+            return Outcome::NoTerminal;
         }
         #[cfg(debug_assertions)]
-        if unadoptable(name.as_deref()) {
-            let why = "a test says it cannot be".into();
-            return Err(NotAdopted::Later(Box::new(LeftOver { live, name, why })));
+        if unadoptable(name.as_deref(), id) {
+            return self.adopt_later(LeftOver { live, name, why: "a test says it cannot be".into(), recovered });
         }
         // SAFETY: plain syscall on a pid the hand-off names.
         let group = unsafe { libc::getpgid(live.pid as libc::pid_t) };
@@ -1151,73 +1178,151 @@ impl Server {
         let copy = unsafe { libc::fcntl(live.fd, libc::F_DUPFD_CLOEXEC, 0) };
         if copy < 0 {
             let why = format!("{}", std::io::Error::last_os_error());
-            return Err(NotAdopted::Later(Box::new(LeftOver { live, name, why })));
+            return self.adopt_later(LeftOver { live, name, why, recovered });
         }
         // SAFETY: a fresh descriptor nothing else owns.
         let copy = unsafe { OwnedFd::from_raw_fd(copy) };
-        let pane = match Pane::adopt(&live, copy, ours, name.clone(), &self.env, &self.tx) {
+        let mut pane = match Pane::adopt(&live, copy, ours, name.clone(), &self.env, &self.tx) {
             Ok(pane) => pane,
-            Err(e) => return Err(NotAdopted::Later(Box::new(LeftOver { live, name, why: format!("{e:#}") }))),
+            Err(e) => return self.adopt_later(LeftOver { live, name, why: format!("{e:#}"), recovered }),
         };
         // SAFETY: the hand-off gives this process the descriptor; the pane has its copy.
         drop(unsafe { OwnedFd::from_raw_fd(live.fd) });
+        pane.recovered = recovered;
         self.panes.insert(id, pane);
         if let Some(file) = scrollback {
             self.scrollback.insert(id, SavedScrollback { file: Some(file), taken: Instant::now() });
         }
+        if let Some(recovered) = recovered {
+            return Outcome::Salvaged { known: recovered == Recovered::Known };
+        }
         if live.suspended && live.spec.pending_agent.is_some() {
             self.resolve_pending_agent(id);
         }
-        Ok(ours)
+        if ours { Outcome::Kept } else { Outcome::TerminalOnly }
     }
 
-    /// Take over the terminals a hand-off that could not be read kept open (see `salvage`):
-    /// each shows in workspace "recovered", its program running on.
-    pub(super) fn take_salvaged(&mut self, salvaged: Vec<LivePane>) {
-        if salvaged.is_empty() {
-            return;
-        }
-        let mut not_kept = Vec::new();
-        for mut live in salvaged {
-            live.id = self.alloc_id();
-            not_kept.push(format!("pane {}: its terminal shows in workspace {RECOVERED}", live.id));
+    /// `left` is taken over later: its PTY stays open, its program runs.
+    fn adopt_later(&mut self, left: LeftOver) -> Outcome {
+        let why = left.why.clone();
+        self.unadopted.push(left);
+        Outcome::Waiting(why)
+    }
+
+    /// Keep the terminals a hand-off that could not be read kept open (see `salvage`), as they
+    /// are: nothing else is made, no layout and no program; no state is written over the saved
+    /// one. Each terminal shows in workspace "recovered" under the id its programs know, or,
+    /// when that is unknown, read-only.
+    pub(super) fn take_salvaged(&mut self, salvaged: Vec<Salvaged>) {
+        self.recovering = true;
+        self.live_restarts = 1;
+        // Their ids first: nothing else may take them.
+        let known: Vec<PaneId> = salvaged.iter().filter_map(|s| s.pane).collect();
+        self.next_id = self.next_id.max(known.iter().max().map_or(0, |id| id + 1));
+        let mut seen = std::collections::HashSet::new();
+        for Salvaged { mut live, pane } in salvaged {
+            let recovered = match pane.filter(|id| seen.insert(*id)) {
+                Some(id) => {
+                    live.id = id;
+                    Recovered::Known
+                }
+                None => {
+                    live.id = self.alloc_id();
+                    Recovered::Unknown
+                }
+            };
             let why = "the hand-off could not be read".to_string();
-            self.unadopted.push(LeftOver { live, name: None, why });
+            self.unadopted.push(LeftOver { live, name: None, why, recovered: Some(recovered) });
         }
-        self.adopt_left_over();
         self.warnings.push(format!(
-            "the previous server's state could not be taken over: what ran in its panes runs on, in workspace {RECOVERED}"
+            "the previous server's state could not be read: what ran in its panes runs on, as it is, in workspace \
+             {RECOVERED}; its saved layout is kept for a restart"
         ));
-        self.live_restart = Some(crate::protocol::LiveRestart { count: 1, kept: 0, not_kept });
+        self.adopt_left_over();
     }
 
     /// Try again to take over the panes a live restart could not take yet: each one taken shows
-    /// in a tab of its own in workspace "recovered".
+    /// in a tab of its own in workspace "recovered" (no hook runs for it: it opens nothing).
     pub(super) fn adopt_left_over(&mut self) {
         self.unadopted_tried = Instant::now();
         for left in std::mem::take(&mut self.unadopted) {
-            let LeftOver { live, name, .. } = left;
+            let LeftOver { live, name, why, recovered } = left;
             let id = live.id;
-            match self.adopt_live(live, name, None) {
-                Ok(_) => {
-                    let ws = match self.workspaces.iter().find(|w| w.name == RECOVERED) {
-                        Some(w) => w.id,
-                        None => self.new_workspace(RECOVERED.into(), None),
-                    };
-                    let Some(wi) = self.ws_index(ws) else { continue };
-                    let mut tab = super::Tab::new(self.alloc_id(), String::new());
-                    tab.root = Some(crate::layout::Node::Leaf(id));
-                    tab.set_focus(id);
-                    self.workspaces[wi].tabs.push(tab);
-                    self.log_message(&format!("pane {id} was taken over: it shows in workspace {RECOVERED}"), false);
-                    self.relayout();
-                    self.mark_dirty();
-                }
-                Err(NotAdopted::NoTerminal) => {}
-                Err(NotAdopted::Later(left)) => self.unadopted.push(*left),
+            let outcome = match self.adopt_live(live, name, None, recovered) {
+                Outcome::Kept | Outcome::TerminalOnly => Outcome::Recovered(why),
+                other => other,
+            };
+            let placed = matches!(outcome, Outcome::Recovered(_) | Outcome::Salvaged { .. });
+            self.set_outcome(id, outcome);
+            if !placed {
+                continue;
             }
+            let hooks = std::mem::take(&mut self.hooks.list);
+            let ws = match self.workspaces.iter().find(|w| w.name == RECOVERED) {
+                Some(w) => w.id,
+                None => self.new_workspace(RECOVERED.into(), None),
+            };
+            self.hooks.list = hooks;
+            let Some(wi) = self.ws_index(ws) else { continue };
+            let mut tab = super::Tab::new(self.alloc_id(), String::new());
+            tab.root = Some(crate::layout::Node::Leaf(id));
+            tab.set_focus(id);
+            self.workspaces[wi].tabs.push(tab);
+            self.relayout();
+            self.mark_dirty();
         }
     }
+}
+
+/// What became of a pane a live restart handed over: one each (see `Server::outcomes`), what
+/// the report, its counts and the warnings are told from.
+#[derive(Debug, Clone, PartialEq)]
+pub(super) enum Outcome {
+    /// Taken over in its place, with its program.
+    Kept,
+    /// Taken over in its place; its program is not this server's child, to wait for.
+    TerminalOnly,
+    /// What was handed over for it was no terminal: there was nothing to take over.
+    NoTerminal,
+    /// Not taken over yet (why): its terminal stays open and its program runs, not read until
+    /// it is taken over.
+    Waiting(String),
+    /// Taken over after it could not be at first (why), in workspace recovered.
+    Recovered(String),
+    /// Kept from a hand-off that could not be read, in workspace recovered: under its own id
+    /// (`known`), or read-only.
+    Salvaged { known: bool },
+}
+
+impl Outcome {
+    /// What the report says of pane `id`, unless it was taken over as it was.
+    fn line(&self, id: PaneId) -> Option<String> {
+        Some(match self {
+            Outcome::Kept => return None,
+            Outcome::TerminalOnly => {
+                format!("pane {id}: its terminal is kept, but its program is not this server's to wait for")
+            }
+            Outcome::NoTerminal => format!("pane {id}: no terminal was handed over for it; it is gone"),
+            Outcome::Waiting(why) => format!(
+                "pane {id}: not taken over yet ({why}); its program runs on, and it shows in workspace {RECOVERED} once it is"
+            ),
+            Outcome::Recovered(why) => format!("pane {id}: taken over late ({why}); it shows in workspace {RECOVERED}"),
+            Outcome::Salvaged { known: true } => {
+                format!("pane {id}: kept as it is (the hand-off could not be read), in workspace {RECOVERED}")
+            }
+            Outcome::Salvaged { known: false } => format!(
+                "pane {id}: a terminal kept as it is (the hand-off could not be read), whose pane is unknown: \
+                 read-only, in workspace {RECOVERED}"
+            ),
+        })
+    }
+}
+
+/// A terminal kept from a hand-off that could not be read (see `salvage`), with the pane its
+/// programs know, when that can be read from them.
+pub struct Salvaged {
+    live: LivePane,
+    pane: Option<PaneId>,
 }
 
 /// Where panes a live restart took over late show.
@@ -1228,23 +1333,28 @@ pub(super) struct LeftOver {
     live: LivePane,
     name: Option<String>,
     why: String,
+    recovered: Option<Recovered>,
 }
 
-/// Why a pane handed over is not taken over.
-enum NotAdopted {
-    /// It has no terminal: no program uses it, and it starts again as after a restart.
-    NoTerminal,
-    /// It cannot be now (no descriptor or thread to spare): it is tried again.
-    Later(Box<LeftOver>),
-}
-
-/// Debug builds: whether a test asks that pane `name` cannot be taken over for now (the file
-/// `KRAAL_TEST_UNADOPTABLE` names lists such panes, a name a line).
+/// Debug builds: whether a test asks that pane `name` (or `#ID`) cannot be taken over for now
+/// (the file `KRAAL_TEST_UNADOPTABLE` names lists such panes, one a line; `NAME once`: only the
+/// first time it is tried).
 #[cfg(debug_assertions)]
-fn unadoptable(name: Option<&str>) -> bool {
+fn unadoptable(name: Option<&str>, id: PaneId) -> bool {
+    static TRIED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
     let Some(file) = std::env::var_os("KRAAL_TEST_UNADOPTABLE") else { return false };
     let listed = std::fs::read_to_string(file).unwrap_or_default();
-    name.is_some_and(|name| listed.lines().any(|l| l == name))
+    let by_id = format!("#{id}");
+    let names: Vec<&str> = name.into_iter().chain([by_id.as_str()]).collect();
+    listed.lines().any(|l| match l.split_once(' ') {
+        Some((n, "once")) if names.contains(&n) => {
+            let mut tried = TRIED.lock().unwrap_or_else(|e| e.into_inner());
+            let first = !tried.iter().any(|t| t == n);
+            tried.push(n.into());
+            first
+        }
+        _ => names.contains(&l),
+    })
 }
 
 #[cfg(test)]

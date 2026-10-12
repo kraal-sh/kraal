@@ -192,6 +192,18 @@ pub struct Pane {
     search: Option<SearchState>,
     /// The line that marks where text saved before a restart ends, once it was given back.
     restored: Option<String>,
+    /// A terminal a live restart kept although it could not read what was handed over: it is
+    /// never started again.
+    pub recovered: Option<Recovered>,
+}
+
+/// What is known of a terminal kept as it was over a live restart (see [`Pane::recovered`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Recovered {
+    /// Its pane: the id is the one its programs know, and it takes input as before.
+    Known,
+    /// Not which pane it was: it shows its output, and takes no input.
+    Unknown,
 }
 
 /// Environment given to every pane process.
@@ -245,6 +257,7 @@ impl Pane {
             preparing: false,
             search: None,
             restored: None,
+            recovered: None,
         })
     }
 
@@ -274,11 +287,15 @@ impl Pane {
             preparing: false,
             search: None,
             restored: None,
+            recovered: None,
         }
     }
 
     /// Restart the command of an exited pane, keeping its scrollback.
     pub fn respawn(&mut self, env: &PaneEnv, tx: &Sender<Event>) -> Result<()> {
+        if self.recovered.is_some() {
+            anyhow::bail!("a terminal kept over a live restart is not started again: close it");
+        }
         let Content::Term(old) = &mut self.content else { return Ok(()) };
         let mut fresh = TermPane::spawn(self.id, &self.spec, self.cols, self.rows, env, tx)?;
         // Keep history: move the old emulator over and reset its modes.
@@ -484,7 +501,15 @@ impl Pane {
         }
     }
 
+    /// Whether what is typed goes to a running program in it.
+    pub fn takes_typing(&self) -> bool {
+        self.is_terminal() && self.exit_code.is_none() && self.recovered != Some(Recovered::Unknown)
+    }
+
     pub fn write_input(&mut self, bytes: Vec<u8>) {
+        if self.recovered == Some(Recovered::Unknown) {
+            return;
+        }
         if let Content::Term(t) = &mut self.content {
             t.term.scroll_display(Scroll::Bottom);
             t.write(bytes);

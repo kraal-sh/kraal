@@ -330,7 +330,8 @@ impl TermPane {
     }
 
     /// The threads that read and write the PTY, the one that waits for the program to end
-    /// (`watch`), and the emulator.
+    /// (`watch`), and the emulator. The reader reads only once all of them run: a pane that
+    /// cannot be made has read nothing of its program's output.
     fn assemble(
         id: PaneId,
         master: Box<dyn MasterPty + Send>,
@@ -358,6 +359,7 @@ impl TermPane {
                 return Err(e.into());
             }
         }
+        io.parked.go();
 
         let events = Rc::new(RefCell::new(Vec::new()));
         // Programs may enable the kitty keyboard protocol (Claude Code does, for Shift+Enter).
@@ -397,7 +399,8 @@ impl TermPane {
     pub(super) fn resume_reading(&mut self, id: PaneId, tx: &Sender<Event>) -> Result<()> {
         let started = start_reader(id, &*self.master, tx, &self.eof);
         self.eof.pause(false);
-        let (output, stop) = started?;
+        let ((output, stop), parked) = started?;
+        parked.go();
         self.output = output;
         self.reader_stop = stop;
         Ok(())
@@ -517,12 +520,14 @@ struct Io {
     /// Set when the reader has seen the end of the output.
     eof: Arc<Eof>,
     stop: Arc<AtomicBool>,
+    /// The reader, not reading yet.
+    parked: Parked,
 }
 
 fn start_io(id: PaneId, master: &(dyn MasterPty + Send), tx: &Sender<Event>) -> Result<Io> {
     let mut writer = master.take_writer()?;
     let eof = Arc::new(Eof::default());
-    let (out_rx, stop) = start_reader(id, master, tx, &eof)?;
+    let ((out_rx, stop), parked) = start_reader(id, master, tx, &eof)?;
     let (in_tx, in_rx) = crossbeam_channel::unbounded::<Vec<u8>>();
     let input_pending = Arc::new(AtomicUsize::new(0));
     let input_closed = Arc::new(AtomicBool::new(false));
@@ -540,7 +545,16 @@ fn start_io(id: PaneId, master: &(dyn MasterPty + Send), tx: &Sender<Event>) -> 
         stop.store(true, Ordering::Relaxed);
         return Err(e.into());
     }
-    Ok(Io { input: in_tx, input_pending, input_closed, output: out_rx, eof, stop })
+    Ok(Io { input: in_tx, input_pending, input_closed, output: out_rx, eof, stop, parked })
+}
+
+/// A reader that does not read yet: it does once told, and never if this goes first.
+struct Parked(crossbeam_channel::Sender<()>);
+
+impl Parked {
+    fn go(self) {
+        let _ = self.0.send(());
+    }
 }
 
 /// Whether a PTY's output has ended, as its readers saw it: a reader stopped (and replaced, see
@@ -603,13 +617,23 @@ impl Eof {
 /// `eof` is set when it sees the end.
 type Reading = (crossbeam_channel::Receiver<Vec<u8>>, Arc<AtomicBool>);
 
-fn start_reader(id: PaneId, master: &(dyn MasterPty + Send), tx: &Sender<Event>, eof: &Arc<Eof>) -> Result<Reading> {
+/// A reader of the PTY, parked: it reads nothing until told to.
+fn start_reader(
+    id: PaneId,
+    master: &(dyn MasterPty + Send),
+    tx: &Sender<Event>,
+    eof: &Arc<Eof>,
+) -> Result<(Reading, Parked)> {
     let reader = PtyReader::new(master)?;
     let stop = Arc::new(AtomicBool::new(false));
     let ready_tx = tx.clone();
     let (out_tx, out_rx) = crossbeam_channel::bounded::<Vec<u8>>(4);
+    let (go, told) = crossbeam_channel::bounded::<()>(1);
     let (stopped, eof) = (stop.clone(), eof.clone());
     std::thread::Builder::new().name(format!("pane-{id}-read")).spawn(move || {
+        if told.recv().is_err() {
+            return;
+        }
         let mut reader = reader;
         let mut buf = vec![0u8; 64 * 1024];
         loop {
@@ -630,7 +654,7 @@ fn start_reader(id: PaneId, master: &(dyn MasterPty + Send), tx: &Sender<Event>,
             }
         }
     })?;
-    Ok((out_rx, stop))
+    Ok(((out_rx, stop), Parked(go)))
 }
 
 /// The PTY of a program taken over by a live restart: the descriptor the kraal before kept
@@ -1126,6 +1150,39 @@ mod tests {
         }
         assert!(String::from_utf8_lossy(&seen).contains("LAST"), "{:?}", String::from_utf8_lossy(&seen));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A reader is started parked: one never told to read (its pane could not be made whole)
+    /// leaves what the program wrote to the next one.
+    #[test]
+    fn a_reader_never_told_to_read_reads_nothing() {
+        start_reaper().unwrap();
+        let pair = portable_pty::native_pty_system()
+            .openpty(PtySize { rows: 5, cols: 20, pixel_width: 0, pixel_height: 0 })
+            .unwrap();
+        let mut cmd = CommandBuilder::new("sh");
+        cmd.args(["-c", "printf FIRST; sleep 5"]);
+        let child = pair.slave.spawn_command(cmd).unwrap();
+        drop(pair.slave);
+        let process = Process { pid: child.process_id(), child: Mutex::new(Some(child)) };
+        std::thread::sleep(Duration::from_millis(300));
+        let (tx, _rx) = crossbeam_channel::bounded(64);
+        let eof = Arc::new(Eof::default());
+        let ((first, _), parked) = start_reader(1, &*pair.master, &tx, &eof).unwrap();
+        drop(parked);
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(first.try_recv().is_err(), "read before it was told to");
+        let ((next, _), parked) = start_reader(1, &*pair.master, &tx, &eof).unwrap();
+        parked.go();
+        let mut seen = Vec::new();
+        let start = Instant::now();
+        while !seen.ends_with(b"FIRST") {
+            assert!(start.elapsed() < Duration::from_secs(5), "{:?}", String::from_utf8_lossy(&seen));
+            if let Ok(data) = next.recv_timeout(Duration::from_millis(100)) {
+                seen.extend_from_slice(&data);
+            }
+        }
+        process.signal_group(libc::SIGKILL);
     }
 
     /// A program that writes its last output and ends while its PTY is not read (a live restart

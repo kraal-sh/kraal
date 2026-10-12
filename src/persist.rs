@@ -315,7 +315,8 @@ pub fn apply(server: &mut Server, snap: SessionSnapshot) -> Result<()> {
 /// Make the workspaces of a state again, each pane with `make`. After a restart that is not
 /// live, a workspace that cannot be made whole is not made at all. After a live one (`live`),
 /// every pane that can be made is, in its place, and the others are left out (`make` keeps
-/// their programs running): no pane already made is stopped for another one.
+/// their programs running, and says so): no pane already made is stopped for another one, and
+/// the focus and the tab shown stay on the panes they were on.
 pub fn apply_layout(
     server: &mut Server,
     workspaces: Vec<WorkspaceSnap>,
@@ -327,12 +328,10 @@ pub fn apply_layout(
         let panes_before: std::collections::HashSet<PaneId> = server.panes.keys().copied().collect();
         let workspaces_before: Vec<u32> = server.workspaces.iter().map(|w| w.id).collect();
         let name = ws.name.clone();
-        let mut left_out = Vec::new();
-        if let Err(e) = apply_workspace(server, ws, revision, live, make, &mut left_out) {
+        if let Err(e) = apply_workspace(server, ws, revision, live, make) {
             server.rollback(&panes_before, &workspaces_before);
             server.warnings.push(format!("could not restore workspace {name}: {e:#}"));
         }
-        server.warnings.extend(left_out);
     }
     server.relayout();
 }
@@ -343,20 +342,20 @@ fn apply_workspace(
     revision: u32,
     live: bool,
     make: &mut MakePane,
-    left_out: &mut Vec<String>,
 ) -> Result<()> {
     {
         let id = server.new_workspace(ws.name, ws.definition);
         let wi = server.ws_index(id).unwrap();
         server.workspaces[wi].cwd = ws.cwd;
-        for t in ws.tabs {
+        let mut active = None;
+        for (index, t) in ws.tabs.into_iter().enumerate() {
             let tab_id = server.alloc_id();
             // Older versions saved a tab without a name as "tab N"; unnamed, it shows what its
             // pane runs.
             let old_default = revision == 0 && t.name.strip_prefix("tab ").is_some_and(|n| n.parse::<u32>().is_ok());
-            let mut tab = Tab::new(tab_id, if old_default { String::new() } else { t.name });
+            let mut tab = Tab::new(tab_id, if old_default { String::new() } else { t.name.clone() });
             if let Some(root) = &t.root {
-                tab.root = build(server, root, live, make, left_out)?;
+                tab.root = build(server, root, live, make)?;
             }
             for (p, rect) in &t.floating {
                 // Transfer windows are not worth bringing back (a live restart keeps them as
@@ -366,10 +365,7 @@ fn apply_workspace(
                 }
                 let pane = match make(server, p) {
                     Ok(pane) => pane,
-                    Err(e) if live => {
-                        left_out.push(format!("{e:#}"));
-                        continue;
-                    }
+                    Err(_) if live => continue,
                     Err(e) => return Err(e),
                 };
                 tab.floating.push(Floating { pane, rect: *rect });
@@ -378,11 +374,19 @@ fn apply_workspace(
             if panes.is_empty() {
                 continue;
             }
-            let focus = t.focus.and_then(|i| panes.get(i).copied()).unwrap_or(panes[0]);
+            let focus = match live {
+                // The pane it was, wherever it is now that others may be left out.
+                true => kept_focus(&t, &panes),
+                false => t.focus.and_then(|i| panes.get(i).copied()),
+            }
+            .unwrap_or(panes[0]);
             tab.show_floating = t.show_floating && !tab.floating.is_empty();
             tab.set_focus(focus);
             if t.zoomed && !tab.is_floating(focus) {
                 tab.zoom = Some(focus);
+            }
+            if index == ws.active {
+                active = Some(server.workspaces[wi].tabs.len());
             }
             server.workspaces[wi].tabs.push(tab);
         }
@@ -390,34 +394,47 @@ fn apply_workspace(
             server.workspaces.remove(wi);
         } else {
             let n = server.workspaces[wi].tabs.len();
-            server.workspaces[wi].active = ws.active.min(n - 1);
+            server.workspaces[wi].active = active.unwrap_or(ws.active).min(n - 1);
         }
     }
     Ok(())
 }
 
+/// The pane tab `t` had the focus on, among the panes made of it (`made`), when it was made:
+/// the state names each pane by its id after a live restart.
+fn kept_focus(t: &TabSnap, made: &[PaneId]) -> Option<PaneId> {
+    fn walk(n: &NodeSnap, out: &mut Vec<Option<PaneId>>) {
+        match n {
+            NodeSnap::Pane(p) => out.push(p.id),
+            NodeSnap::Split { children, .. } => children.iter().for_each(|(c, _)| walk(c, out)),
+        }
+    }
+    let mut ids = Vec::new();
+    if let Some(root) = &t.root {
+        walk(root, &mut ids);
+    }
+    ids.extend(t.floating.iter().map(|(p, _)| p.id));
+    t.focus.and_then(|i| ids.get(i).copied().flatten()).filter(|id| made.contains(id))
+}
+
 /// The layout `n` describes, each pane made with `make`. A pane that cannot be made fails the
-/// whole, or, `live`, is left out (why goes to `left_out`).
+/// whole, or, `live`, is left out.
 fn build<S>(
     server: &mut S,
     n: &NodeSnap,
     live: bool,
     make: &mut dyn FnMut(&mut S, &PaneSnap) -> Result<PaneId>,
-    left_out: &mut Vec<String>,
 ) -> Result<Option<Node>> {
     Ok(match n {
         NodeSnap::Pane(p) => match make(server, p) {
             Ok(id) => Some(Node::Leaf(id)),
-            Err(e) if live => {
-                left_out.push(format!("{e:#}"));
-                None
-            }
+            Err(_) if live => None,
             Err(e) => return Err(e),
         },
         NodeSnap::Split { axis, children } => {
             let mut out = Vec::new();
             for (c, w) in children {
-                if let Some(node) = build(server, c, live, make, left_out)? {
+                if let Some(node) = build(server, c, live, make)? {
                     out.push((node, *w));
                 }
             }
@@ -528,13 +545,35 @@ mod tests {
             made.push(name);
             Ok(made.len() as PaneId)
         };
-        let (mut made, mut left_out) = (Vec::new(), Vec::new());
-        let node = build(&mut made, &tree, true, &mut make, &mut left_out).unwrap().unwrap();
+        let mut made = Vec::new();
+        let node = build(&mut made, &tree, true, &mut make).unwrap().unwrap();
         assert_eq!(made, ["a", "c"]);
         assert_eq!(node.leaves(), [1, 2]);
-        assert_eq!(left_out, ["pane bad: no descriptor to spare"]);
         let mut made = Vec::new();
-        assert!(build(&mut made, &tree, false, &mut make, &mut Vec::new()).is_err());
+        assert!(build(&mut made, &tree, false, &mut make).is_err());
+    }
+
+    /// After a live restart the focus stays on the pane it was on, even when one before it in
+    /// its tab was left out; none when that pane itself was.
+    #[test]
+    fn the_focus_stays_on_its_pane_when_another_is_left_out() {
+        let pane = |id: PaneId| {
+            let snap = serde_json::json!({"name": null, "spec": {}, "agent": null, "agent_session": null, "id": id});
+            NodeSnap::Pane(Box::new(serde_json::from_value(snap).unwrap()))
+        };
+        let root = NodeSnap::Split { axis: Axis::Row, children: vec![(pane(1), 0.3), (pane(2), 0.3), (pane(3), 0.3)] };
+        let tab = TabSnap {
+            name: String::new(),
+            root: Some(root),
+            floating: Vec::new(),
+            focus: Some(1),
+            show_floating: false,
+            zoomed: false,
+            sync: false,
+        };
+        assert_eq!(kept_focus(&tab, &[2, 3]), Some(2), "pane 1 left out");
+        assert_eq!(kept_focus(&tab, &[1, 2, 3]), Some(2));
+        assert_eq!(kept_focus(&tab, &[1, 3]), None, "the focused pane left out");
     }
 
     #[test]
