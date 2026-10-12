@@ -213,9 +213,10 @@ pub struct TermPane {
     /// Output read from the PTY, waiting to be parsed.
     pub(super) output: Arc<Output>,
     pub(super) process: Arc<Process>,
-    /// Tells the reader to stop, even if the program never writes again (it may outlive the
-    /// pane, ignoring the hangup).
+    /// Tell the reader and the writer to stop, even if the program never writes again or
+    /// never reads its input (it may outlive the pane, ignoring the hangup).
     reader_stop: ReaderStop,
+    writer_stop: WriterStop,
     /// The program, until it is started (see [`super::spawn::batch`]), and what its waiter
     /// thread is then given.
     pending: Option<(Launch, Waiter)>,
@@ -249,6 +250,7 @@ pub(super) fn pty_size(cols: u16, rows: u16, graphics: &crate::graphics::Shared)
 impl Drop for TermPane {
     fn drop(&mut self) {
         self.reader_stop.stop();
+        self.writer_stop.stop();
     }
 }
 
@@ -330,6 +332,7 @@ impl TermPane {
             output: io.output,
             process: Arc::new(Process::default()),
             reader_stop: io.stop,
+            writer_stop: io.writer_stop,
             pending: Some((launch, Waiter { id, tx: tx.clone(), eof: io.eof, what })),
             here: Arc::new(()),
             osc: OscScanner::default(),
@@ -634,12 +637,13 @@ struct Io {
     /// Closed when the reader has seen the end of the output.
     eof: crossbeam_channel::Receiver<()>,
     stop: ReaderStop,
+    writer_stop: WriterStop,
 }
 
 fn start_io(id: PaneId, master: &(dyn MasterPty + Send), tx: &Sender<Event>) -> Result<Io> {
     let stop = ReaderStop::new(master.tty_name());
     let reader = PtyReader::new(master, stop.wakes())?;
-    let mut writer = master.take_writer()?;
+    let writer = master.take_writer()?;
     let ready_tx = tx.clone();
     let output = Arc::new(Output::default());
     let out = output.clone();
@@ -651,22 +655,73 @@ fn start_io(id: PaneId, master: &(dyn MasterPty + Send), tx: &Sender<Event>) -> 
         // it also looks for panes with output now and then.
         read_output(reader, &out, &stopped, || ready_tx.try_send(Event::PaneReady(id)).is_ok());
     })?;
+    let (input, writer_stop) = start_writer(id, writer, master.tty_name()).inspect_err(|_| stop.stop())?;
+    let input_pending = writer_stop.pending.clone();
+    Ok(Io { input, input_pending, output, eof: eof_rx, stop, writer_stop })
+}
+
+/// Start the thread that writes what is sent to `writer`, the PTY `tty` is the other end of.
+fn start_writer(
+    id: PaneId,
+    mut writer: Box<dyn Write + Send>,
+    tty: Option<PathBuf>,
+) -> std::io::Result<(Sender<Vec<u8>>, WriterStop)> {
     let (in_tx, in_rx) = crossbeam_channel::unbounded::<Vec<u8>>();
-    let input_pending = Arc::new(AtomicUsize::new(0));
-    let pending = input_pending.clone();
-    let started = std::thread::Builder::new().name(format!("pane-{id}-write")).spawn(move || {
+    let (gone_tx, gone) = crossbeam_channel::bounded::<()>(0);
+    let stop = WriterStop { flag: Arc::default(), pending: Arc::default(), tty, gone };
+    let (stopped, pending) = (stop.flag.clone(), stop.pending.clone());
+    std::thread::Builder::new().name(format!("pane-{id}-write")).spawn(move || {
+        let _gone = gone_tx;
         for data in in_rx {
-            if writer.write_all(&data).and_then(|_| writer.flush()).is_err() {
+            // What waits once the pane went is no one's.
+            if stopped.load(Ordering::Acquire) || writer.write_all(&data).and_then(|_| writer.flush()).is_err() {
                 break;
             }
             pending.fetch_sub(data.len(), Ordering::Relaxed);
         }
-    });
-    if let Err(e) = started {
-        stop.stop();
-        return Err(e.into());
+        // Before it is said gone: letting go of it writes an end of input to the PTY, which
+        // may wait for room too.
+        drop(writer);
+    })?;
+    Ok((in_tx, stop))
+}
+
+/// Tells a pane's writer to stop, even while the program reads none of its input: a write
+/// waiting for room would otherwise keep the PTY open for as long as the program lives (it may
+/// outlive the pane, ignoring the hangup). The input waiting in the PTY is read from its other
+/// end, and dropped, until the writer is gone.
+pub(super) struct WriterStop {
+    flag: Arc<AtomicBool>,
+    /// Bytes sent to the writer and not written yet.
+    pending: Arc<AtomicUsize>,
+    /// The PTY's other end.
+    tty: Option<PathBuf>,
+    /// Closed once the writer is gone.
+    gone: crossbeam_channel::Receiver<()>,
+}
+
+impl WriterStop {
+    fn stop(&self) {
+        self.flag.store(true, Ordering::Release);
+        // One with nothing to write ends with its channel.
+        if self.pending.load(Ordering::Relaxed) == 0 {
+            return;
+        }
+        let Some(tty) = self.tty.clone() else { return };
+        let gone = self.gone.clone();
+        let _ = std::thread::Builder::new().name("pane-input-drop".into()).spawn(move || drop_input(&tty, &gone));
     }
-    Ok(Io { input: in_tx, input_pending, output, eof: eof_rx, stop })
+}
+
+/// Read and drop the input waiting at `tty`, a PTY's other end, until `gone` closes.
+fn drop_input(tty: &Path, gone: &crossbeam_channel::Receiver<()>) {
+    use std::os::unix::fs::OpenOptionsExt;
+    let opened = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NOCTTY | libc::O_NONBLOCK).open(tty);
+    let Ok(mut input) = opened else { return };
+    let mut buf = [0u8; 4096];
+    while gone.recv_timeout(Duration::from_millis(1)) == Err(crossbeam_channel::RecvTimeoutError::Timeout) {
+        while matches!(input.read(&mut buf), Ok(n) if n > 0) {}
+    }
 }
 
 /// Tells a pane's reader to stop, even while the program is silent: a blocked reader would
@@ -940,6 +995,54 @@ mod tests {
         }
         assert_eq!(taken.len(), printed);
         assert!(taken.ends_with(b"end"));
+    }
+
+    /// A program that ignores the hangup and reads none of its input, sent more than its
+    /// terminal holds: once its pane goes, nothing keeps the PTY open.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn a_pane_that_goes_lets_go_of_a_pty_whose_program_reads_no_input() {
+        use std::os::unix::fs::OpenOptionsExt;
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let env = PaneEnv {
+            socket: "/nonexistent".into(),
+            session: "t".into(),
+            shell: "sh".into(),
+            scrollback: 100,
+            graphics: Default::default(),
+        };
+        let script = "trap '' HUP; stty raw -echo; echo ready; exec sleep 30".to_string();
+        let spec = PaneSpec { command: vec!["sh".into(), "-c".into(), script], ..Default::default() };
+        let mut pane = TermPane::spawn(1, &spec, 20, 5, &env, &tx).unwrap();
+        let start = Instant::now();
+        let mut seen = Vec::new();
+        let mut read = Vec::new();
+        while !String::from_utf8_lossy(&seen).contains("ready") {
+            if pane.output.take(&mut read, false) {
+                seen.extend_from_slice(&read);
+            }
+            assert!(start.elapsed() < Duration::from_secs(5), "the program never started");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        pane.write(vec![b'x'; 1 << 20]);
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(pane.input_pending.load(Ordering::Relaxed) > 0, "the writer waits for room");
+        let (tty, pid) = (pane.master.tty_name().unwrap(), pane.pid().unwrap());
+        drop(pane);
+        // Once the PTY is closed, its other end can be written to no more.
+        let writable = || {
+            let opened =
+                std::fs::OpenOptions::new().write(true).custom_flags(libc::O_NOCTTY | libc::O_NONBLOCK).open(&tty);
+            opened.and_then(|mut end| end.write(b"x")).is_ok()
+        };
+        let start = Instant::now();
+        while writable() && start.elapsed() < Duration::from_secs(5) {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let open = writable();
+        // SAFETY: plain syscall to the program's group, which ignores the hangup.
+        unsafe { libc::kill(-(pid as libc::pid_t), libc::SIGKILL) };
+        assert!(!open, "the PTY stays open");
     }
 
     #[test]
