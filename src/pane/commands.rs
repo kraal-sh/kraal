@@ -178,6 +178,7 @@ impl TermPane {
         if self.commands.list.is_empty() {
             change(self);
             self.guard.take_top_margin();
+            self.keep_vi_cursor();
             return;
         }
         let screen = (self.commands.history_max == 0 && !self.alt_screen()).then(|| self.screen());
@@ -201,6 +202,18 @@ impl TermPane {
         // nothing tells how far they went.
         if self.guard.take_top_margin() {
             self.commands.unplace();
+        }
+        self.keep_vi_cursor();
+    }
+
+    /// Output may take away the rows the copy-mode cursor is on (the alternate screen has no
+    /// history): it stays on the grid, where the emulator can read it.
+    fn keep_vi_cursor(&mut self) {
+        if self.term.mode().contains(TermMode::VI) {
+            let (top, bottom, last) = (self.term.topmost_line(), self.term.bottommost_line(), self.term.last_column());
+            let cursor = &mut self.term.vi_mode_cursor.point;
+            cursor.line = cursor.line.clamp(top, bottom);
+            cursor.column = cursor.column.min(last);
         }
     }
 
@@ -418,7 +431,7 @@ impl TermPane {
         }
         let start = self.point(from).or_else(|| self.point(Spot { line: self.top_line(), col: 0 }))?;
         let end = self.before(to)?;
-        (start <= end).then(|| self.term.bounds_to_string(start, end))
+        (start <= end).then(|| super::screen::bounds_text(&self.term, start, end))
     }
 
     /// The pane line of the oldest line still in the history.

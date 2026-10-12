@@ -1125,6 +1125,124 @@ mod tests {
         shell.kill();
     }
 
+    /// A pane whose program never starts: what the test feeds it is all it prints.
+    pub(super) fn fed_pane(cols: u16, rows: u16, scrollback: usize) -> Pane {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let env = PaneEnv {
+            socket: "/nonexistent".into(),
+            session: "t".into(),
+            shell: "sh".into(),
+            scrollback,
+            graphics: Default::default(),
+        };
+        let _batch = spawn::batch();
+        Pane::spawn(1, None, PaneSpec { command: vec!["true".into()], ..Default::default() }, cols, rows, &env, &tx)
+            .unwrap()
+    }
+
+    #[test]
+    fn copy_mode_goes_to_the_middle_of_a_one_row_pane() {
+        let mut pane = fed_pane(10, 1, 100);
+        pane.feed(b"one");
+        pane.copy_mode(true);
+        pane.vi_motion(alacritty_terminal::vi_mode::ViMotion::Middle);
+        assert_eq!(pane.term().unwrap().term.vi_mode_cursor.point.line, alacritty_terminal::index::Line(0));
+    }
+
+    /// A full-screen program starting while the copy-mode cursor is up in the history: the
+    /// alternate screen has none, and the cursor comes down onto it.
+    #[test]
+    fn the_copy_mode_cursor_stays_on_the_alternate_screen() {
+        let mut pane = fed_pane(10, 3, 100);
+        pane.feed("line\r\n".repeat(20).as_bytes());
+        pane.copy_mode(true);
+        pane.vi_edge(true);
+        pane.feed(b"\x1b[?1049hfull screen");
+        let mut buf = Buffer::empty(Rect::new(0, 0, 10, 3));
+        pane.render(Rect::new(0, 0, 10, 3), &mut buf, &mut crate::ansi::Links::new());
+        assert_eq!(pane.term().unwrap().term.vi_mode_cursor.point.line, alacritty_terminal::index::Line(0));
+    }
+
+    /// A character cut across two reads keeps the one after it: the parser drops that one when
+    /// the next read holds the rest, it, and the start of another character.
+    #[test]
+    fn a_character_cut_across_reads_keeps_the_next() {
+        let mut pane = fed_pane(20, 2, 100);
+        for read in [&b"\xc3"[..], b"\xa9 \xc3", b"\xa0x\xc3", b"\xa9y\xff", b"\xe6\x97", b"\xa5z"] {
+            pane.feed(read);
+        }
+        assert_eq!(pane.text(None).lines().next(), Some("é àxéy\u{fffd}日z"));
+    }
+
+    /// A selection made upwards to the last column, then made a block: it copies its cells, not
+    /// from past the end of the rows.
+    #[test]
+    fn a_block_selection_at_the_last_column_copies_its_cells() {
+        use alacritty_terminal::selection::SelectionType;
+        let mut pane = fed_pane(6, 4, 100);
+        pane.feed(b"abcdef\r\nghijkl\r\nmnopqr");
+        pane.selection_start(5, 2, SelectionType::Simple);
+        pane.selection_update(5, 0);
+        pane.copy_mode(true);
+        pane.vi_select(SelectionType::Block);
+        assert_eq!(pane.selection_text().as_deref(), Some("f\nl\nr"));
+        pane.selection_start(5, 2, SelectionType::Block);
+        pane.selection_update(5, 0);
+        assert_eq!(pane.selection_text().as_deref(), Some("f\nl\nr"));
+    }
+
+    /// A full-screen program starting while the view shows archived lines: the alternate screen
+    /// has no history, nor those lines.
+    #[test]
+    fn the_alternate_screen_comes_up_over_a_view_far_back() {
+        let mut pane = fed_pane(20, 5, 3000);
+        pane.feed("line\r\n".repeat(2000).as_bytes());
+        pane.rest();
+        pane.scroll_to_top();
+        assert!(pane.term().unwrap().archive.lens_rows() > 0);
+        pane.feed(b"\x1b[?1049hfull screen");
+        assert!(pane.text(Some(10)).ends_with("full screen\n"));
+        assert_eq!(pane.term().unwrap().own_history(), 0);
+        pane.feed(b"\x1b[?1049l");
+        assert!(pane.text(Some(3000)).starts_with("line\n"));
+    }
+
+    /// A motion far down from the top of a long history, past the lines laid out to show it: the
+    /// rows the copy-mode cursor moves from stay while those below are laid out.
+    #[test]
+    fn copy_mode_goes_down_a_paragraph_from_the_top_of_a_long_history() {
+        use alacritty_terminal::grid::Dimensions;
+        use alacritty_terminal::vi_mode::ViMotion;
+        let mut pane = fed_pane(26, 16, 3000);
+        pane.feed("words and no blank line\r\n".repeat(2500).as_bytes());
+        pane.rest();
+        pane.copy_mode(true);
+        pane.vi_edge(true);
+        for _ in 0..3 {
+            pane.vi_motion(ViMotion::ParagraphDown);
+            let t = &pane.term().unwrap().term;
+            let line = t.vi_mode_cursor.point.line;
+            assert!(line >= t.topmost_line() && line <= t.bottommost_line(), "{line:?}");
+        }
+    }
+
+    /// A command line ending where a wide character wrapped, on a pane's first line: the text
+    /// read takes that character from the line below, not from above the grid.
+    #[test]
+    fn a_line_cut_before_a_wide_character_is_read_whole() {
+        use alacritty_terminal::selection::SelectionType;
+        let mut pane = fed_pane(10, 3, 0);
+        pane.feed("\x1b]133;A\x07$ \x1b]133;B\x07abcdefg日\r\x1b]133;C\x07".as_bytes());
+        pane.feed(b"\r\n\x1b]133;D;0\x07");
+        assert_eq!(pane.last_command().and_then(|c| c.text.clone()).as_deref(), Some("abcdefg日"));
+        for kind in [SelectionType::Simple, SelectionType::Block, SelectionType::Lines] {
+            pane.selection_start(2, 0, kind);
+            pane.selection_update(9, 0);
+            let want = if kind == SelectionType::Lines { "$ abcdefg日\n" } else { "abcdefg日" };
+            assert_eq!(pane.selection_text().as_deref(), Some(want), "{kind:?}");
+        }
+    }
+
     #[test]
     fn shells_are_told_from_other_programs() {
         for shell in ["zsh", "-zsh", "/bin/bash", "/usr/bin/fish", "sh"] {

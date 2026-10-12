@@ -203,6 +203,8 @@ pub struct TermPane {
     pub(super) archive: Archive,
     pub(super) events: Rc<RefCell<Vec<TermEvent>>>,
     pub(super) parser: Processor,
+    /// The start of a character the last output ended with, cut there.
+    pub(super) cut: Vec<u8>,
     pub(super) master: Box<dyn MasterPty + Send>,
     pub(super) input: Sender<Vec<u8>>,
     /// Bytes sent to the PTY not written yet: a program that stops reading its input cannot
@@ -328,6 +330,7 @@ impl TermPane {
             archive: Archive::new(env.scrollback, usize::from(rows)),
             events,
             parser: Processor::new(),
+            cut: Vec::new(),
             master: pair.master,
             input: io.input,
             input_pending: io.input_pending,

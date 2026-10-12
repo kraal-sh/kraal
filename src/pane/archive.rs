@@ -565,12 +565,17 @@ impl Archive {
         }
     }
 
-    /// Lines the lens shows far above the view go (a page of rows stays above it).
+    /// Lines the lens shows far above the view and the copy-mode cursor go (a page of rows stays
+    /// above them).
     fn lens_trim<T>(&mut self, term: &mut Term<T>) {
         let Some(lens) = &mut self.lens else { return };
+        let mut top = -(term.grid().display_offset() as i32);
+        if term.mode().contains(TermMode::VI) {
+            top = top.min(term.vi_mode_cursor.point.line.0);
+        }
         let grid = term.grid_mut();
         let history = grid.history_size();
-        let above = history.saturating_sub(grid.display_offset());
+        let above = (history as i64 + i64::from(top)).max(0) as usize;
         let mut cut = 0;
         while lens.sizes.len() > 1 && above - cut >= PAGE + lens.sizes[0] {
             cut += lens.sizes.pop_front().expect("more than one");
@@ -633,6 +638,27 @@ pub(super) fn keep_view_in_history<T: EventListener>(term: &mut Term<T>) {
     }
 }
 
+/// The length of the UTF-8 character `lead` starts (1 for any other byte).
+fn utf8_len(lead: u8) -> usize {
+    match lead {
+        0xc2..=0xdf => 2,
+        0xe0..=0xef => 3,
+        0xf0..=0xf4 => 4,
+        _ => 1,
+    }
+}
+
+/// How many bytes at the end of `bytes` start a UTF-8 character without ending it.
+fn incomplete_char(bytes: &[u8]) -> usize {
+    let start = bytes.len().saturating_sub(3);
+    match (start..bytes.len()).rev().find(|i| bytes[*i] & 0xc0 != 0x80) {
+        Some(i) if matches!(std::str::from_utf8(&bytes[i..]), Err(e) if e.valid_up_to() == 0 && e.error_len().is_none()) => {
+            bytes.len() - i
+        }
+        _ => 0,
+    }
+}
+
 /// Rows went from the top of the grid: the copy-mode cursor stays on it, and a selection that
 /// was on them goes.
 fn keep_on_grid<T>(term: &mut Term<T>) {
@@ -686,8 +712,20 @@ impl TermPane {
         }
         self.archive.last = now;
         self.archive.rested = false;
+        // The parser (vte 0.15) drops a character that follows one cut by the end of the last
+        // read, when the next holds the rest of it, that character, and one cut or invalid after:
+        // the rest of the cut character goes to it alone.
+        let need = self.cut.first().map_or(0, |b| utf8_len(*b).saturating_sub(self.cut.len()));
+        let alone =
+            if need > 0 && bytes.len() > need && bytes[..need].iter().all(|b| b & 0xc0 == 0x80) { need } else { 0 };
+        let mut tail = std::mem::take(&mut self.cut);
+        tail.extend_from_slice(&bytes[bytes.len().saturating_sub(3)..]);
+        self.cut = tail.split_off(tail.len() - incomplete_char(&tail));
         let mut feed = Feed { term: &mut self.term, archive: &mut self.archive, seen: &mut self.commands.history_seen };
-        self.parser.advance(&mut feed, bytes);
+        if alone > 0 {
+            self.parser.advance(&mut feed, &bytes[..alone]);
+        }
+        self.parser.advance(&mut feed, &bytes[alone..]);
         self.parsed();
     }
 
@@ -1018,19 +1056,22 @@ impl<T: EventListener> Handler for Feed<'_, T> {
         self.term.clear_screen(mode);
     }
 
-    fn set_private_mode(&mut self, mode: PrivateMode) {
-        if mode == PrivateMode::Named(NamedPrivateMode::SwapScreenAndSetRestoreCursor) {
-            // The lens is on the history of the screen going away.
-            self.archive.drop_lens(self.term);
-        }
-        self.term.set_private_mode(mode);
-    }
-
     fn reset_state(&mut self) {
         self.archive.lines().clear();
         self.archive.lens = None;
         self.term.reset_state();
         self.term.grid_mut().update_history(self.archive.limit);
+    }
+
+    fn set_private_mode(&mut self, mode: PrivateMode) {
+        // The lens is laid out in the primary screen's history: it goes before the alternate
+        // screen comes up, which has none.
+        if mode == PrivateMode::Named(NamedPrivateMode::SwapScreenAndSetRestoreCursor)
+            && !self.term.mode().contains(TermMode::ALT_SCREEN)
+        {
+            self.archive.drop_lens(self.term);
+        }
+        self.term.set_private_mode(mode);
     }
 
     #[inline]
