@@ -87,8 +87,9 @@ pub(super) fn save(s: &Session, name: Option<String>, workspace: Option<String>)
 
 /// The sessions whose server listens, with its socket.
 pub(super) fn live_sockets() -> Vec<(String, PathBuf)> {
-    let mut out = Vec::new();
-    // Sessions an older kraal started may still listen where it put them.
+    let mut out: Vec<(String, PathBuf)> = Vec::new();
+    // Sessions an older kraal started may still listen where it put them. Both places can be
+    // the same directory (macOS without XDG_RUNTIME_DIR): a session is listed once.
     let dirs = std::iter::once(paths::runtime_dir()).chain(paths::legacy_runtime_dir());
     for rd in dirs.filter_map(|d| std::fs::read_dir(d).ok()) {
         for e in rd.flatten() {
@@ -99,7 +100,10 @@ pub(super) fn live_sockets() -> Vec<(String, PathBuf)> {
             {
                 // A long session name has a shortened socket name: the saved session says which.
                 let stem = stem.to_string_lossy();
-                out.push((paths::session_of_socket(&stem).unwrap_or_else(|| stem.into_owned()), p.clone()));
+                let name = paths::session_of_socket(&stem).unwrap_or_else(|| stem.into_owned());
+                if !out.iter().any(|(n, _)| *n == name) {
+                    out.push((name, p.clone()));
+                }
             }
         }
     }
