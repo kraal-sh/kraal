@@ -6,7 +6,8 @@
 //!
 //! Rows move between the parts only above everything in use: the view, the selection and the
 //! copy-mode cursor, with a screen to spare. Both parts together hold no more rows than the
-//! pane's scrollback, as the emulator alone did, and at least all but a batch of them.
+//! pane's scrollback, as the emulator alone did, and at least all but what the emulator holds
+//! of its own at most (a couple of screens and a batch).
 //!
 //! A flood of output, more rows within a second than the scrollback holds, stays in the emulator
 //! as it would without the archive (most of it goes before anyone looks), and moves to the
@@ -61,6 +62,8 @@ pub(super) struct Archive {
     last: Instant,
     /// A flood's rows moved here, freeing the emulator's.
     freed: bool,
+    /// Since the output stopped, the emulator keeps no history of its own.
+    rested: bool,
     extents: Extents,
 }
 
@@ -135,6 +138,7 @@ impl Archive {
             window: (Instant::now(), 0),
             last: Instant::now(),
             freed: false,
+            rested: false,
             extents,
         };
         archive.fit(screen);
@@ -332,6 +336,7 @@ impl TermPane {
             self.calm();
         }
         self.archive.last = now;
+        self.archive.rested = false;
         let mut feed = Feed { term: &mut self.term, archive: &mut self.archive, seen: &mut self.commands.history_seen };
         self.parser.advance(&mut feed, bytes);
     }
@@ -387,10 +392,17 @@ impl TermPane {
         }
     }
 
-    /// The pane's output stopped: as [`TermPane::calm`]. Whether memory was freed since last
-    /// asked.
+    /// The pane's output stopped: as [`TermPane::calm`], and the emulator keeps no history of
+    /// its own until output comes again, nor the rows it allocates ahead for it. Whether memory
+    /// was freed since last asked.
     pub(super) fn rest(&mut self) -> bool {
         self.calm();
+        if !self.archive.rested && !self.term.mode().contains(TermMode::ALT_SCREEN) {
+            self.archive.rested = true;
+            self.archive.compact(&mut self.term, &mut self.commands.history_seen, 0);
+            self.term.grid_mut().truncate();
+            self.archive.freed = true;
+        }
         std::mem::take(&mut self.archive.freed)
     }
 
@@ -556,11 +568,12 @@ macro_rules! changing {
 impl<T: EventListener> Handler for Feed<'_, T> {
     #[inline]
     fn input(&mut self, c: char) {
-        self.room();
+        // The history is full (a flood): nothing moves out until the output pauses.
         if self.archive.extents.lost {
             self.term.input(c);
             return;
         }
+        self.room();
         let before = self.before();
         self.term.input(c);
         self.wrote(before);
@@ -575,11 +588,11 @@ impl<T: EventListener> Handler for Feed<'_, T> {
 
     #[inline]
     fn linefeed(&mut self) {
-        self.room();
         if self.archive.extents.lost {
             self.term.linefeed();
             return;
         }
+        self.room();
         let (_, history) = self.before();
         self.term.linefeed();
         self.fed(history);
@@ -651,7 +664,9 @@ impl<T: EventListener> Handler for Feed<'_, T> {
         self.term.clear_screen(mode);
         self.changed(history);
         if saved {
+            // No history left to follow wrongly: rows are followed again from here.
             self.archive.extents.history.clear();
+            self.archive.extents.lost = false;
         }
     }
 
@@ -857,7 +872,8 @@ mod tests {
         assert!(t.term.grid().history_size() <= t.archive.high, "{}", t.term.grid().history_size());
         assert!(!t.archive.lines.is_empty());
         let kept = b.history();
-        assert!((SCROLLBACK - BATCH..=SCROLLBACK).contains(&kept), "{kept}");
+        let high = b.term().archive.high;
+        assert!((SCROLLBACK - high..=SCROLLBACK).contains(&kept), "{kept}");
         // `kraal read --lines`: the same text, through the archive.
         let all = b.pane.text(Some(kept + ROWS as usize));
         assert_eq!(all, reference_text(&b.reference, kept));
@@ -919,7 +935,7 @@ mod tests {
         b.pane.scroll_to_bottom();
         assert!(b.term().term.grid().history_size() <= b.term().archive.high);
         let kept = b.history();
-        assert!(kept >= SCROLLBACK - BATCH);
+        assert!(kept >= SCROLLBACK - b.term().archive.high);
         b.pane.scroll_to_top();
         b.reference.scroll_display(Scroll::Bottom);
         b.reference.scroll_display(Scroll::Delta(kept as i32));
