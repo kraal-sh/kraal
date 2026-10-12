@@ -1305,6 +1305,22 @@ mod tests {
         assert_eq!((point.line.0, point.column.0), (2, 9));
     }
 
+    /// `$` on the bottom row where a deletion moved the mark of a wrapped line, or where a wide
+    /// character did not fit: the line ends there all the same.
+    #[test]
+    fn copy_mode_goes_to_the_end_of_a_bottom_row_whatever_marks_it() {
+        use alacritty_terminal::vi_mode::ViMotion;
+        for output in ["abcdefghijklmno\x1b[2T\x1b[3;1H\x1b[3P", "abcdefghi日\x1b[2T"] {
+            let mut pane = fed_pane(10, 3, 100);
+            pane.feed(output.as_bytes());
+            pane.copy_mode(true);
+            pane.vi_motion(ViMotion::Low);
+            pane.vi_motion(ViMotion::Last);
+            pane.vi_motion(ViMotion::Last);
+            assert_eq!(pane.term().unwrap().term.vi_mode_cursor.point.line.0, 2, "{output:?}");
+        }
+    }
+
     /// A wide character at the start of a line, its first half deleted (`CSI P`): what is left
     /// of it is no half of a character any more, and the cursor on it draws.
     #[test]

@@ -500,17 +500,22 @@ impl Pane {
 }
 
 /// Move the copy-mode cursor as the emulator does. A line that wraps onto the next ends at the
-/// bottom of the screen at the latest: alacritty 0.26 looks for the end of a wrapped line (`$`)
-/// below the grid when the bottom line says it wraps (a scroll moved it there).
+/// bottom of the screen at the latest: alacritty 0.26 looks below the grid for the end of a line
+/// (`$`) when the bottom row says it wraps, or for the wide character a cell of it says went to the
+/// next row (a scroll can move such a row to the bottom, a deletion, `CSI P`, the marks along it).
 fn vi_move<T: alacritty_terminal::event::EventListener>(term: &mut Term<T>, motion: ViMotion) {
-    let (bottom, last) = (term.bottommost_line(), term.last_column());
-    let wraps = term.grid()[bottom][last].flags.contains(Flags::WRAPLINE);
-    if wraps {
-        term.grid_mut()[bottom][last].flags.remove(Flags::WRAPLINE);
+    let bottom = term.bottommost_line();
+    let marks = Flags::WRAPLINE | Flags::LEADING_WIDE_CHAR_SPACER;
+    let row = &mut term.grid_mut()[bottom];
+    let marked: Vec<(usize, Flags)> =
+        (0..row.len()).map(|c| (c, row[Column(c)].flags & marks)).filter(|(_, f)| !f.is_empty()).collect();
+    for (c, f) in &marked {
+        row[Column(*c)].flags.remove(*f);
     }
     term.vi_motion(motion);
-    if wraps {
-        term.grid_mut()[bottom][last].flags.insert(Flags::WRAPLINE);
+    let row = &mut term.grid_mut()[bottom];
+    for (c, f) in marked {
+        row[Column(c)].flags.insert(f);
     }
 }
 
