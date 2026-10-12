@@ -33,11 +33,14 @@ Each pane also shows again what it showed, scrollback and colours included, down
 `kraal: restored from <time>` line; what runs in it now writes below that line. Copy mode and
 search reach the restored text. A full-screen program (an editor, `htop`) is not saved: its pane
 comes back with the text from before it started. kraal saves this text when the server stops, and
-every 10 seconds or so while a pane prints, so a crash loses little.
+every 10 seconds or so while a pane prints, so a crash loses little. A pane whose text could not be
+written (a full disk) is saved again later, printing or not, and `kraal kill` says when it still
+could not be.
 
 This text is written to disk, readable by you alone, in `~/.local/state/kraal/scrollback/<session>/`,
 and it can hold secrets (a token printed by a command, a password echoed by mistake):
-`save_scrollback = false` in the config stops saving it and deletes what was saved.
+`save_scrollback = false` in the config stops saving it and deletes what was saved (kraal deletes
+only the files it wrote there, and nothing through a link put in place of that directory).
 `kraal forget` deletes the saved layout and scrollback of a stopped session.
 
 ## Workspace files

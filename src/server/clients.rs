@@ -73,6 +73,7 @@ impl Server {
                 pointer_motion: false,
                 keys_full: None,
                 keys_by_place: false,
+                told_shown: None,
                 paste: None,
                 drag: None,
                 toast: None,

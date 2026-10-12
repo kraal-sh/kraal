@@ -131,6 +131,31 @@ pub fn private_runtime_dir() -> std::io::Result<PathBuf> {
     Ok(dir)
 }
 
+/// Whether `name` is the temporary file of an atomic write ([`write_private`], [`write_atomic`])
+/// whose process no longer runs: `.<file>.<pid>.<n>.tmp` ([`temp_beside`]), left by a kraal that
+/// was killed while it wrote. A file a running process is writing never counts.
+pub fn abandoned_temp(name: &str) -> bool {
+    let Some(inner) = name.strip_prefix('.').and_then(|n| n.strip_suffix(".tmp")) else { return false };
+    let mut parts = inner.rsplitn(3, '.');
+    let (Some(n), Some(pid), Some(file)) = (parts.next(), parts.next(), parts.next()) else { return false };
+    let number = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    if file.is_empty() || !number(n) || !number(pid) {
+        return false;
+    }
+    let Ok(pid) = pid.parse::<libc::pid_t>() else { return false };
+    // SAFETY: signal 0 only checks that the process exists; another user's says EPERM.
+    pid > 0
+        && pid as u32 != std::process::id()
+        && unsafe { libc::kill(pid, 0) } != 0
+        && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+}
+
+/// The directories of kraal's own that its atomic writes go to.
+pub fn written_dirs() -> Vec<PathBuf> {
+    let state = state_dir();
+    vec![state.join("sessions"), state.join("runs"), state.join("usage"), state, workspaces_dir(), config_dir()]
+}
+
 /// A temporary path next to `path` that no other writer uses at the same time, in this process
 /// (a counter) or another (the pid).
 fn temp_beside(path: &Path) -> PathBuf {
@@ -170,6 +195,75 @@ fn write_with_mode(path: &Path, data: &[u8], mode: u32) -> std::io::Result<()> {
 /// Write a file only we can read (state can hold paths and commands), atomically.
 pub fn write_private(path: &Path, data: &[u8]) -> std::io::Result<()> {
     write_with_mode(path, data, 0o600)
+}
+
+/// Make the names created, renamed or removed in `dir` survive a crash of the machine, as far
+/// as its file system allows (some cannot sync a directory).
+pub fn sync_dir(dir: &Path) {
+    if let Ok(d) = std::fs::File::open(dir) {
+        let _ = d.sync_all();
+    }
+}
+
+/// Remove the regular files of ours in `dir` whose names `remove` picks, through the directory
+/// as opened: a link in its place (to a directory elsewhere) is refused, and so is a directory
+/// that is not ours, and a link or directory in it is left alone. How many files are left.
+pub fn remove_files_in(dir: &Path, remove: impl Fn(&str) -> bool) -> std::io::Result<usize> {
+    use std::ffi::CStr;
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    let d = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW).open(dir)?;
+    // SAFETY: getuid cannot fail.
+    let uid = unsafe { libc::getuid() };
+    if d.metadata()?.uid() != uid {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!("{} is not a directory owned by you", dir.display()),
+        ));
+    }
+    let fd = d.as_raw_fd();
+    let mut names = Vec::new();
+    // SAFETY: the copy of the descriptor belongs to the stream, which closedir closes; each
+    // entry is read before the next call to readdir.
+    unsafe {
+        let copy = libc::dup(fd);
+        if copy < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let stream = libc::fdopendir(copy);
+        if stream.is_null() {
+            libc::close(copy);
+            return Err(std::io::Error::last_os_error());
+        }
+        loop {
+            let entry = libc::readdir(stream);
+            if entry.is_null() {
+                break;
+            }
+            names.push(CStr::from_ptr((*entry).d_name.as_ptr()).to_owned());
+        }
+        libc::closedir(stream);
+    }
+    let mut left = 0;
+    for name in names {
+        let text = name.to_string_lossy();
+        if text == "." || text == ".." {
+            continue;
+        }
+        // SAFETY: `st` is ours to fill; the name is looked up in `fd`, links not followed.
+        let ours = unsafe {
+            let mut st: libc::stat = std::mem::zeroed();
+            libc::fstatat(fd, name.as_ptr(), &mut st, libc::AT_SYMLINK_NOFOLLOW) == 0
+                && st.st_mode & libc::S_IFMT == libc::S_IFREG
+                && st.st_uid == uid
+        };
+        // SAFETY: removes that name from `fd`, never a directory.
+        let removed = ours && remove(&text) && unsafe { libc::unlinkat(fd, name.as_ptr(), 0) } == 0;
+        if !removed {
+            left += 1;
+        }
+    }
+    Ok(left)
 }
 
 /// Write a file atomically, keeping the permissions it has (0644 when it is new): the user's
@@ -772,6 +866,41 @@ mod tests {
             .filter(|e| e.file_name().to_string_lossy().ends_with(".tmp"))
             .collect();
         assert!(left.is_empty(), "no temporary file left behind");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn temporary_files_of_writers_gone_are_removed_and_no_others() {
+        let dir = std::env::temp_dir().join(format!("kraal-abandoned-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // A process that ran and ended (and was reaped): what it was writing is abandoned.
+        let mut gone = std::process::Command::new("true").spawn().unwrap();
+        let dead = gone.id();
+        gone.wait().unwrap();
+        let me = std::process::id();
+        let abandoned = [format!("..active-main.json.{dead}.38.tmp"), format!(".servers.toml.{dead}.0.tmp")];
+        let kept = [
+            format!(".main.json.{me}.3.tmp"),
+            ".main.json.1.0.tmp".to_string(),
+            format!("main.json.{dead}.0.tmp"),
+            format!(".main.json.{dead}.x.tmp"),
+            format!("..{dead}.0.tmp"),
+            "notes.txt".to_string(),
+        ];
+        for name in abandoned.iter().chain(&kept) {
+            std::fs::write(dir.join(name), "x").unwrap();
+        }
+        // Never a link, nor what it leads to.
+        let link = format!(".link.{dead}.0.tmp");
+        std::os::unix::fs::symlink(dir.join("notes.txt"), dir.join(&link)).unwrap();
+        assert_eq!(remove_files_in(&dir, abandoned_temp).unwrap(), kept.len() + 1);
+        for name in &abandoned {
+            assert!(!dir.join(name).exists(), "{name}");
+        }
+        for name in kept.iter().chain([&link]) {
+            assert!(std::fs::symlink_metadata(dir.join(name)).is_ok(), "{name}");
+        }
         let _ = std::fs::remove_dir_all(dir);
     }
 }

@@ -64,6 +64,8 @@ looking at triggers a desktop notification through your terminal (OSC 777/9) or 
 
 The agents of kraal sessions on your servers are listed too, after the server's name, and
 `alt+a` goes to them as well: see [Agents on your servers](servers.md#agents-on-your-servers).
+`kraal agents` lists them with their server, and their changes of state are `agent.*` events with
+a `server` field, for scripts and hooks: see [Scripting](scripting.md).
 
 When the server restarts, panes that ran an agent with a known session resume it
 (`claude --resume <id>`, `codex resume <id>`). A prompt given on the command line is never sent

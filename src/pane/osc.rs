@@ -17,7 +17,10 @@ pub(super) fn sanitize_title(s: &str) -> String {
 
 /// OSC sequences kraal itself cares about, picked out of the output stream. `Query` asks whether
 /// the terminal is kraal (`OSC 7701 ; ?`); `Contexts` is what a shell works on
-/// (`OSC 7701 ; context ; k8s=… ; ns=… ; tf=… ; aws=…`).
+/// (`OSC 7701 ; context ; k8s=… ; ns=… ; tf=… ; aws=…`). `Attached` is a kraal client attached
+/// to a server's session saying so (`OSC 7701 ; attach ; <server> ; <session>`, nothing after
+/// `attach` once it is not), and `Shows` the pane of that session it shows
+/// (`OSC 7701 ; shows ; <pane id>`), which that session tells it.
 #[derive(Debug, Clone, PartialEq)]
 pub(super) enum Osc {
     Notify { title: String, body: String },
@@ -25,12 +28,17 @@ pub(super) enum Osc {
     Mark(Mark),
     Query,
     Contexts(RemoteContexts),
+    Attached(Option<(String, String)>),
+    Shows(Option<u32>),
 }
 
 #[derive(Default)]
 pub(super) struct OscScanner {
     state: ScanState,
     buf: Vec<u8>,
+    /// What an OSC 9 says of the OSC 777 notification that just ended, until anything else
+    /// comes: a program that sends both for one notification (kraal does) is heard once.
+    echo: Option<String>,
 }
 
 #[derive(Default, Clone, Copy, PartialEq)]
@@ -47,6 +55,15 @@ impl OscScanner {
     pub(super) fn scan(&mut self, bytes: &[u8]) -> Vec<(usize, Osc)> {
         let mut out = Vec::new();
         for (i, &b) in bytes.iter().enumerate() {
+            // Something between a notification and the next sequence.
+            let between = match self.state {
+                ScanState::Ground => b != 0x1b,
+                ScanState::Esc => b != b']',
+                _ => false,
+            };
+            if between {
+                self.echo = None;
+            }
             self.state = match (self.state, b) {
                 (ScanState::Ground, 0x1b) => ScanState::Esc,
                 (ScanState::Ground, _) => ScanState::Ground,
@@ -57,7 +74,7 @@ impl OscScanner {
                 (ScanState::Esc, 0x1b) => ScanState::Esc,
                 (ScanState::Esc, _) => ScanState::Ground,
                 (ScanState::Osc, 0x07) => {
-                    out.extend(parse_osc(&self.buf).map(|o| (i + 1, o)));
+                    out.extend(self.finish().map(|o| (i + 1, o)));
                     ScanState::Ground
                 }
                 (ScanState::Osc, 0x1b) => ScanState::OscEsc,
@@ -68,7 +85,7 @@ impl OscScanner {
                     ScanState::Osc
                 }
                 (ScanState::OscEsc, b'\\') => {
-                    out.extend(parse_osc(&self.buf).map(|o| (i + 1, o)));
+                    out.extend(self.finish().map(|o| (i + 1, o)));
                     ScanState::Ground
                 }
                 (ScanState::OscEsc, b']') => {
@@ -79,6 +96,20 @@ impl OscScanner {
             };
         }
         out
+    }
+
+    /// The sequence just read, unless it is the OSC 9 copy of the notification before it.
+    fn finish(&mut self) -> Option<Osc> {
+        let echo = self.echo.take();
+        let osc = parse_osc(&self.buf)?;
+        if let Osc::Notify { title, body } = &osc {
+            if self.buf.starts_with(b"777;") {
+                self.echo = Some(format!("{title}: {body}"));
+            } else if echo.as_deref() == Some(body.as_str()) {
+                return None;
+            }
+        }
+        Some(osc)
     }
 }
 
@@ -117,6 +148,13 @@ pub(super) fn parse_osc(data: &[u8]) -> Option<Osc> {
         "7701" => match rest.split_once(';').unwrap_or((rest, "")) {
             ("?", _) => Some(Osc::Query),
             ("context", fields) => Some(Osc::Contexts(RemoteContexts::parse(fields))),
+            ("attach", "") => Some(Osc::Attached(None)),
+            ("attach", fields) => {
+                let (server, session) = fields.split_once(';')?;
+                let ok = crate::servers::valid_name(server) && crate::paths::valid_session_name(session);
+                ok.then(|| Osc::Attached(Some((server.to_string(), session.to_string()))))
+            }
+            ("shows", pane) => Some(Osc::Shows(pane.parse().ok())),
             _ => None,
         },
         _ => None,

@@ -631,12 +631,17 @@ impl Inventory {
     }
 
     /// Add a server, choosing a free name if needed. Returns the stored entry's name.
-    pub fn add(&mut self, mut server: Server) -> Result<String> {
+    pub fn add(&mut self, server: Server) -> Result<String> {
+        if let Some(existing) = self.find_target(&server).filter(|_| !server.host.is_empty()) {
+            return Ok(existing.name.clone());
+        }
+        self.insert(server)
+    }
+
+    /// Add a server under a free name, whatever other entries reach its address.
+    fn insert(&mut self, mut server: Server) -> Result<String> {
         if server.host.is_empty() {
             bail!("a server needs a host");
-        }
-        if let Some(existing) = self.find_target(&server) {
-            return Ok(existing.name.clone());
         }
         if server.name.is_empty() {
             server.name = short_name(&server.host);
@@ -660,20 +665,23 @@ impl Inventory {
 
     /// Have the agents of the kraal session `session` on `s` listed: its entry gets `agents`,
     /// unless it already names a session (or `none`); a server the inventory does not have is
-    /// added when `add`. Returns the entry's name, if there is one.
+    /// added when `add`. Returns the entry's name, if there is one. The entry is the one that
+    /// reaches the same account the same way: one of the same name on that machine may be
+    /// another account's, and one reached through another key or jump host another machine.
     pub fn watch_agents(&mut self, s: &Server, session: &str, add: bool) -> Result<Option<String>> {
         let found = self
             .servers
             .iter()
-            .position(|x| x.name == s.name && x.host.eq_ignore_ascii_case(&s.host))
-            .or_else(|| self.servers.iter().position(|x| x.same_address(s)));
+            .position(|x| x.name == s.name && x.same_connection(s))
+            .or_else(|| self.servers.iter().position(|x| x.same_connection(s)));
         match found {
             Some(i) => {
                 let entry = &mut self.servers[i];
                 entry.agents.get_or_insert_with(|| session.to_string());
                 Ok(Some(entry.name.clone()))
             }
-            None if add => self.add(Server { agents: Some(session.to_string()), ..s.clone() }).map(Some),
+            // Beside an entry for the same address reached otherwise, never in its place.
+            None if add => self.insert(Server { agents: Some(session.to_string()), ..s.clone() }).map(Some),
             None => Ok(None),
         }
     }
@@ -1279,6 +1287,35 @@ mod tests {
         inv.save().unwrap();
         let again = Inventory::load_from(&path).unwrap();
         assert_eq!(session(&again, &name).as_deref(), Some("main"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn another_account_on_a_known_machine_gets_an_entry_of_its_own() {
+        let dir = std::env::temp_dir().join(format!("kraal-servers-accounts-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("servers.toml");
+        std::fs::write(&path, "[[server]]\nname = \"gpu\"\nhost = \"gpu.lan\"\nuser = \"alice\"\n").unwrap();
+        let mut inv = Inventory::load_from(&path).unwrap();
+        // `attach --host bob@gpu.lan` resolves to a server named after the machine, like alice's.
+        let known = [Known { server: inv.servers[0].clone(), source: Source::Inventory }];
+        let bob = resolve(&known, "bob@gpu.lan").unwrap();
+        assert_eq!((bob.name.as_str(), bob.user.as_deref()), ("gpu", Some("bob")));
+        assert_eq!(inv.watch_agents(&bob, "work", false).unwrap(), None);
+        assert_eq!(inv.get("gpu").unwrap().agents, None, "alice's entry is not bob's");
+        let name = inv.watch_agents(&bob, "work", true).unwrap().unwrap();
+        assert_eq!(name, "gpu-bob");
+        let added = inv.get(&name).unwrap();
+        assert_eq!((added.user.as_deref(), added.agents.as_deref()), (Some("bob"), Some("work")));
+        assert_eq!(inv.get("gpu").unwrap().agents, None);
+        // The same account through another key may be another machine: an entry of its own too.
+        let other = Server { identity: Some("~/.ssh/other".into()), ..inv.get("gpu").unwrap().clone() };
+        assert_eq!(inv.watch_agents(&other, "main", false).unwrap(), None);
+        assert_eq!(inv.get("gpu").unwrap().agents, None);
+        // Alice's own attach marks hers.
+        let alice = resolve(&known, "alice@gpu.lan").unwrap();
+        assert_eq!(inv.watch_agents(&alice, "main", false).unwrap().as_deref(), Some("gpu"));
+        assert_eq!(inv.get("gpu").unwrap().agents.as_deref(), Some("main"));
         let _ = std::fs::remove_dir_all(dir);
     }
 

@@ -93,6 +93,25 @@ pub fn kill_group(child: &mut Child) {
     let _ = child.wait();
 }
 
+/// [`kill_group`] without waiting for the child to end: one stuck in the kernel (a file system
+/// that does not answer) ends when the kernel lets it, and a thread of its own reaps it then.
+/// How it ended, if it had already.
+pub fn kill_group_nowait(mut child: Child) -> Option<std::process::ExitStatus> {
+    #[cfg(unix)]
+    // SAFETY: plain syscall on a process group we created.
+    unsafe {
+        libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL);
+    }
+    let _ = child.kill();
+    match child.try_wait() {
+        Ok(Some(status)) => Some(status),
+        _ => {
+            reap_later(child);
+            None
+        }
+    }
+}
+
 /// [`kill_group`], and also what the child started that left its group or session (`setsid`):
 /// for a program that may start daemons of its own (a wrapper script around an agent).
 pub fn kill_tree(child: &mut Child) {

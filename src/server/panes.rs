@@ -380,6 +380,7 @@ impl Server {
             suspended: p.suspended,
             keyboard: p.input_modes().kitty_flags,
             server: p.ssh.as_ref().map(|s| s.name.clone()),
+            session: None,
             production: self.pane_production_shown(id),
             contexts: self.context_labels(id).into_iter().map(|(l, _)| l).collect(),
             focused,

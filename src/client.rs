@@ -649,6 +649,15 @@ pub fn attach(mut target: Target, mut workspace: Option<String>, mouse: bool, at
         })?;
     }
 
+    // In a pane of another kraal, attached to a server's session: that kraal is told which
+    // session this is, and that session which of its panes this shows, so that the kraal outside
+    // knows what is on screen here and can ask for another pane (OSC 7701).
+    let nested = match &target {
+        Target::Remote { label, session, .. } if std::env::var_os("KRAAL_SOCKET").is_some() => {
+            Some(format!("\x1b]7701;attach;{label};{session}\x07"))
+        }
+        _ => None,
+    };
     let mut greeted = Some(first);
     let mut delay = Duration::from_secs(1);
     // What the server said it runs, and the server that said it is restarting.
@@ -679,9 +688,14 @@ pub fn attach(mut target: Target, mut workspace: Option<String>, mouse: bool, at
         };
         let lost = match session {
             Ok(Greeted { conn: mut c, mut frames, first }) => {
-                *writer.lock().unwrap() = Some(std::mem::replace(&mut c.writer, Box::new(std::io::sink())));
-                delay = Duration::from_secs(1);
+                let mut to_server = std::mem::replace(&mut c.writer, Box::new(std::io::sink()));
                 let mut out = std::io::stdout().lock();
+                if let Some(said) = &nested {
+                    let _ = protocol::write_frame(&mut to_server, protocol::BYTES, b"\x1b]7701;report\x07");
+                    let _ = out.write_all(said.as_bytes()).and_then(|_| out.flush());
+                }
+                *writer.lock().unwrap() = Some(to_server);
+                delay = Duration::from_secs(1);
                 let mut next = Some(Ok(Some(first)));
                 let lost = loop {
                     match next.take().unwrap_or_else(|| protocol::read_frame(&mut frames)) {
@@ -712,6 +726,9 @@ pub fn attach(mut target: Target, mut workspace: Option<String>, mouse: bool, at
                     }
                 };
                 *writer.lock().unwrap() = None;
+                if nested.is_some() {
+                    let _ = out.write_all(NOT_ATTACHED).and_then(|_| out.flush());
+                }
                 lost
             }
             Err(lost) => lost,
@@ -744,6 +761,10 @@ pub fn attach(mut target: Target, mut workspace: Option<String>, mouse: bool, at
         status_line(&format!("kraal: reconnecting to {label}… (ssh may ask for a password; ctrl+c to quit)"));
         delay = (delay * 2).min(Duration::from_secs(15));
     };
+    if nested.is_some() {
+        let mut out = std::io::stdout();
+        let _ = out.write_all(NOT_ATTACHED).and_then(|_| out.flush());
+    }
     drop(guard);
     eprintln!("[kraal: {reason}]");
     if let Target::Local { session } = &target {
@@ -782,6 +803,10 @@ fn wait_restarted(session: &str, old: Option<libc::pid_t>, quit: &AtomicBool) ->
         std::thread::sleep(Duration::from_millis(100));
     }
 }
+
+/// What a client attached to a server's session from a pane of another kraal tells that kraal
+/// once it is not (the connection dropped, or it ends).
+const NOT_ATTACHED: &[u8] = b"\x1b]7701;attach\x07";
 
 /// `kraal proxy`: relay a client's frames between stdin/stdout and the local session socket.
 /// Remote attach runs it on the server through ssh.
