@@ -68,6 +68,11 @@ impl Drop for Frame {
     }
 }
 
+/// The frame being drawn (0: none).
+pub fn frame() -> u64 {
+    FRAME.with(std::cell::Cell::get)
+}
+
 /// How long frames take a quiet shell's directory as read.
 const CWD_SHOWN: std::time::Duration = std::time::Duration::from_millis(400);
 
@@ -79,6 +84,8 @@ pub(super) struct CwdSeen {
     changes: u64,
     at: Instant,
     cwd: Option<PathBuf>,
+    /// Counts the reads that found another directory than the read before.
+    version: u64,
 }
 
 /// Every mode a program may have left set, back to how a fresh terminal starts, without RIS
@@ -223,6 +230,11 @@ pub struct Pane {
     /// Set when the process exited; the pane stays open for command panes.
     pub exit_code: Option<Option<i32>>,
     pub last_output: Instant,
+    /// Counts the output parsed.
+    pub fed: u64,
+    /// Counts the OSC sequences kraal reads in the output (directories, command marks, contexts
+    /// reported): what the chrome shows of the pane may change with them.
+    pub oscs: u64,
     pub bell: bool,
     /// Current directory reported by the shell (OSC 7), and the machine it is on.
     pub reported_cwd: Option<PathBuf>,
@@ -322,6 +334,8 @@ impl Pane {
             agent: AgentTracker::default(),
             exit_code: None,
             last_output: Instant::now(),
+            fed: 0,
+            oscs: 0,
             bell: false,
             reported_cwd: None,
             reported_host: String::new(),
@@ -353,6 +367,8 @@ impl Pane {
             agent: AgentTracker::default(),
             exit_code: None,
             last_output: Instant::now(),
+            fed: 0,
+            oscs: 0,
             bell: false,
             reported_cwd: None,
             reported_host: String::new(),
@@ -468,12 +484,14 @@ impl Pane {
     /// Feed process output. Returns signals for the server.
     pub fn feed(&mut self, bytes: &[u8]) -> Vec<PaneSignal> {
         self.last_output = Instant::now();
+        self.fed = self.fed.wrapping_add(1);
         let Content::Term(t) = &mut self.content else { return Vec::new() };
         let mut signals = Vec::new();
         // The emulator gets the output up to each command mark, so that the mark lands where
         // the shell put it.
         let mut start = 0;
         for (end, osc) in t.osc.scan(bytes) {
+            self.oscs = self.oscs.wrapping_add(1);
             match osc {
                 Osc::Notify { title, body } => signals.push(PaneSignal::Notification { title, body }),
                 Osc::Cwd { host, path } => {
@@ -600,6 +618,7 @@ impl Pane {
         let Content::Term(t) = &mut self.content else { return None };
         match t.parser.sync_timeout().sync_timeout() {
             Some(deadline) if deadline <= Instant::now() => {
+                self.fed = self.fed.wrapping_add(1);
                 t.marked(|t| t.stop_sync());
                 let mut signals = Vec::new();
                 self.drain_events(&mut signals);
@@ -682,6 +701,11 @@ impl Pane {
             .map(|(_, b)| b)
             .sum(),
         }
+    }
+
+    /// Whether the program asked for every pointer motion (mode 1003).
+    pub fn wants_pointer_motion(&self) -> bool {
+        self.term().is_some_and(|t| t.term.mode().contains(TermMode::MOUSE_MOTION))
     }
 
     pub fn wants_mouse(&self) -> bool {
@@ -772,20 +796,50 @@ impl Pane {
         }
         let t = self.term()?;
         let pid = t.pid()?;
-        let frame = FRAME.with(std::cell::Cell::get);
-        if frame == 0 {
+        if frame() == 0 {
             return crate::process::cwd(pid);
         }
-        if let Some(seen) = &*t.cwd_seen.borrow()
-            && seen.pid == pid
-            && (seen.frame == frame || (seen.changes == t.changes && seen.at.elapsed() < CWD_SHOWN))
+        Self::see_cwd(t, pid);
+        t.cwd_seen.borrow().as_ref().and_then(|seen| seen.cwd.clone())
+    }
+
+    /// What frames show of the pane's directory, by version: it changes when the directory
+    /// read for a frame is another one. A shell that reports its directory says so in its
+    /// output instead (see `oscs`).
+    pub fn cwd_version(&self) -> u64 {
+        if self.reported_cwd.is_some() && !self.reported_remotely() {
+            return 0;
+        }
+        let Some((t, pid)) = self.term().and_then(|t| Some((t, t.pid()?))) else { return 0 };
+        if frame() != 0 {
+            Self::see_cwd(t, pid);
+        }
+        t.cwd_seen.borrow().as_ref().map_or(0, |seen| seen.version)
+    }
+
+    /// Read the directory of process `pid` for the frame being drawn, unless what was read
+    /// holds for it (see `current_cwd`).
+    fn see_cwd(t: &TermPane, pid: u32) {
+        let frame = frame();
+        let mut seen = t.cwd_seen.borrow_mut();
+        if let Some(s) = &mut *seen
+            && s.pid == pid
         {
-            return seen.cwd.clone();
+            if s.frame == frame {
+                return;
+            }
+            if s.changes == t.changes && s.at.elapsed() < CWD_SHOWN {
+                s.frame = frame;
+                return;
+            }
         }
         let cwd = crate::process::cwd(pid);
-        *t.cwd_seen.borrow_mut() =
-            Some(CwdSeen { frame, pid, changes: t.changes, at: Instant::now(), cwd: cwd.clone() });
-        cwd
+        let version = match &*seen {
+            Some(s) if s.pid == pid && s.cwd == cwd => s.version,
+            Some(s) => s.version.wrapping_add(1),
+            None => 0,
+        };
+        *seen = Some(CwdSeen { frame, pid, changes: t.changes, at: Instant::now(), cwd, version });
     }
 
     /// The directory a shell on another machine reported (a remote shell that sends OSC 7).

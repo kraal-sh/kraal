@@ -527,6 +527,12 @@ impl Server {
         self.kube_polled || self.tf_dirs.polled || !self.tf_dirs.touched.is_empty()
     }
 
+    /// Whether a context is being read: what a pane's frame says of it then changes with time
+    /// alone (a read that does not answer soon makes it unknown).
+    pub(super) fn contexts_reading(&self) -> bool {
+        self.kube_cache.any_reading() || !self.tf_dirs.reading.is_empty()
+    }
+
     pub fn pane_terraform(&self, id: PaneId) -> Option<String> {
         let p = self.panes.get(&id)?;
         if p.ssh.is_some() {

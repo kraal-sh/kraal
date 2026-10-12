@@ -301,7 +301,7 @@ impl Workspace {
 
 pub struct Client {
     pub id: ClientId,
-    pub out: Sender<Vec<u8>>,
+    pub out: clients::Outbox,
     pub attached: bool,
     pub cols: u16,
     pub rows: u16,
@@ -357,7 +357,7 @@ const MAX_MESSAGES: usize = 200;
 /// A control request waiting for a pane condition.
 struct PendingWait {
     client: ClientId,
-    out: Sender<Vec<u8>>,
+    out: clients::Outbox,
     pane: PaneId,
     until: Vec<String>,
     deadline: Option<Instant>,
@@ -512,6 +512,9 @@ pub struct Server {
     ready_set: std::collections::HashSet<PaneId>,
     /// Room for the output being parsed, reused from one read to the next.
     output_buf: Vec<u8>,
+    /// Output taken from panes and not parsed yet: parsing stopped for something that came
+    /// (a key), and goes on before any more of their output (see `pump_output`).
+    unparsed: HashMap<PaneId, Vec<u8>>,
     /// Panes printing without a pause that had no output waiting: looked at again at
     /// `watch_at`, without their readers waking the server meanwhile.
     watched: Vec<PaneId>,
@@ -526,6 +529,15 @@ pub struct Server {
     focus_reported: std::collections::HashSet<PaneId>,
     /// The other panes' turn at output was skipped for a frame due (see `pump_output`).
     turn_skipped: bool,
+    /// What a client typed last only went to programs (see `client_events`).
+    typed_quietly: bool,
+    /// Counts what may have changed what the chrome (bars, sidebar, frames) shows, besides the
+    /// panes' output: everything but output read and keys that only went to programs.
+    chrome_gen: u64,
+    /// What the chrome shows of each pane, while it holds (see `Server::pane_facts`).
+    facts: render::FactsCache,
+    /// The last layouts worked out, most recent last (see `Server::tiled_rects`).
+    tilings: std::cell::RefCell<Vec<geometry::Tiling>>,
     /// Whether the sidebar had something to show at the last tick.
     sidebar_was_useful: bool,
     /// Whether a client was told how to stop the broadcast its key started.
@@ -565,6 +577,14 @@ const BUSY_FRAME_GAP: Duration = Duration::from_millis(8);
 const BUSY_AFTER: u8 = 3;
 /// How long after a key the output of the pane it went to is drawn at once, as its echo.
 const ECHO_WAIT: Duration = Duration::from_millis(250);
+/// Output is parsed this much at a time, so that what comes meanwhile (a key, its echo) does not
+/// wait for all that a program printed to be parsed...
+const PARSE_SLICE: usize = 8 * 1024;
+/// ...and this much while someone types (see `TYPING`): a key and its echo each wait for a
+/// slice at most.
+const TYPING_SLICE: usize = 1024;
+/// How long after a key someone counts as typing.
+const TYPING: Duration = Duration::from_secs(1);
 
 /// Whether what was last done at `last` is due again at `now`, done `every` so often: a little
 /// early rather than a whole tick late.
@@ -717,6 +737,7 @@ pub fn run(session: &str) -> Result<()> {
         ready: Default::default(),
         ready_set: Default::default(),
         output_buf: Vec::new(),
+        unparsed: HashMap::new(),
         watched: Vec::new(),
         watch_at: None,
         exiting: Default::default(),
@@ -724,6 +745,10 @@ pub fn run(session: &str) -> Result<()> {
         held_input: Vec::new(),
         sidebar_was_useful: false,
         turn_skipped: false,
+        typed_quietly: false,
+        chrome_gen: 0,
+        facts: Default::default(),
+        tilings: Default::default(),
         broadcast_tip_shown: false,
         buffers,
         buffers_dirty: false,
@@ -902,7 +927,8 @@ impl Server {
     /// turn, one chunk each. Stops early when a control event arrives or a frame is due, but the
     /// others always get a chunk: a pane printing without a pause keeps the queue busy, and must
     /// not starve the rest. A frame due once the focused panes are read (the echo of a key) goes
-    /// before the others' output, every other time at most.
+    /// before the others' output, every other time at most. A chunk is parsed a slice at a time:
+    /// one that comes while it is parsed (a key) waits for a slice, not for all of it.
     fn pump_output(&mut self, budget: Duration, rx: &Receiver<Event>) {
         let start = Instant::now();
         let focused: Vec<PaneId> =
@@ -918,14 +944,17 @@ impl Server {
         for p in focused {
             let mut first = true;
             while std::mem::take(&mut first) || more(self, budget / 2) {
-                if !self.take_output(p, &mut data) {
+                if !self.take_output(p, &mut data, true) {
                     break;
                 }
-                self.pane_output(p, &data);
+                if !self.parse_output(p, &data, rx, false) {
+                    break;
+                }
             }
         }
         // A frame due (an echo) goes before the others' turn, but not twice in a row: a pane
-        // printing in the focus, with frames always due, must not starve the others.
+        // printing in the focus, with frames always due, must not starve the others. Their turn
+        // is then a slice: the frame waits no longer than that.
         let now = Instant::now();
         let due = [self.next_render, self.image_wake].into_iter().flatten().any(|t| t <= now);
         let skip = due && !self.turn_skipped;
@@ -933,8 +962,8 @@ impl Server {
         let mut served = skip;
         while !std::mem::replace(&mut served, true) || more(self, budget) {
             let Some(id) = self.ready.pop_front() else { break };
-            if self.take_output(id, &mut data) {
-                self.pane_output(id, &data);
+            if self.take_output(id, &mut data, true) {
+                self.parse_output(id, &data, rx, due);
                 self.ready.push_back(id);
             } else if self.streaming(id) {
                 self.watched.push(id);
@@ -946,15 +975,44 @@ impl Server {
         self.output_buf = data;
     }
 
+    /// Parse output `data` of pane `id`, a slice at a time, until it is all parsed (true) or
+    /// something waits in `rx` (after one slice with `one`): then the rest is parsed before any
+    /// more of the pane's output, and the pane stays in the queue for it.
+    fn parse_output(&mut self, id: PaneId, data: &[u8], rx: &Receiver<Event>, one: bool) -> bool {
+        let typing = self.clients.values().any(|c| c.attached && c.last_input.elapsed() < TYPING);
+        let slice = if typing { TYPING_SLICE } else { PARSE_SLICE };
+        let mut at = 0;
+        while at < data.len() {
+            let end = (at + slice).min(data.len());
+            self.pane_output(id, &data[at..end]);
+            at = end;
+            if at < data.len() && (one || !rx.is_empty()) && self.panes.contains_key(&id) {
+                self.unparsed.insert(id, data[at..].to_vec());
+                if self.ready_set.insert(id) {
+                    self.ready.push_back(id);
+                }
+                return false;
+            }
+        }
+        true
+    }
+
     /// Whether pane `id` printed just now: the server then comes back for its output on its own
     /// (every [`WATCH_STREAMS`]) instead of being woken for each read of it.
     fn streaming(&self, id: PaneId) -> bool {
         self.panes.get(&id).is_some_and(|p| p.last_output.elapsed() < STREAM_PAUSE)
     }
 
-    /// Take pane `id`'s waiting output into `data`; false when there was none.
-    fn take_output(&self, id: PaneId, data: &mut Vec<u8>) -> bool {
-        self.panes.get(&id).is_some_and(|p| p.take_output_into(data, self.streaming(id)))
+    /// Take pane `id`'s waiting output into `data`, what was left unparsed first; false when
+    /// there was none. With `watch`, a pane printing without a pause is looked at again on its
+    /// own (see `streaming`).
+    fn take_output(&mut self, id: PaneId, data: &mut Vec<u8>, watch: bool) -> bool {
+        if let Some(rest) = self.unparsed.remove(&id) {
+            *data = rest;
+            return true;
+        }
+        let comes_back = watch && self.streaming(id);
+        self.panes.get(&id).is_some_and(|p| p.take_output_into(data, comes_back))
     }
 
     fn next_deadline(&self) -> Instant {
@@ -1026,11 +1084,18 @@ impl Server {
             self.pane_signals(id, signals);
             self.mark_dirty_pane(id);
         }
+        if !self.exiting.is_empty() || !self.held_input.is_empty() {
+            self.chrome_changed();
+        }
         self.finish_exits();
         self.release_held();
         self.git_due(now);
         if now >= self.next_tick() {
             self.last_tick = now;
+            // What it looks at (agents, processes, contexts, usage) and the time it shows.
+            self.chrome_changed();
+            self.facts.keep(|id| self.panes.contains_key(&id));
+            self.unparsed.retain(|id, _| self.panes.contains_key(id));
             self.tick(now);
             self.idle = self.quiet(now);
             self.scan_polled = self.scan_needed();
@@ -1249,8 +1314,10 @@ impl Server {
     /// yet: its output is read, and the focus followed, later in the loop.
     fn handle_and_follow(&mut self, ev: Event) {
         let wake_up = matches!(ev, Event::PaneReady(_));
+        self.typed_quietly = false;
         self.handle(ev);
-        if !wake_up {
+        // Output, and keys that only went to programs, move no focus.
+        if !wake_up && !std::mem::take(&mut self.typed_quietly) {
             self.follow_focus();
         }
     }
@@ -1288,6 +1355,10 @@ impl Server {
     }
 
     fn handle(&mut self, ev: Event) {
+        // Typed bytes say themselves whether they changed anything (`client_input`).
+        if !matches!(ev, Event::PaneReady(_) | Event::ClientFrame(_, crate::protocol::BYTES, _)) {
+            self.chrome_changed();
+        }
         match ev {
             Event::PaneReady(id) => {
                 self.wake();
@@ -1396,13 +1467,14 @@ impl Server {
         let mut data = std::mem::take(&mut self.output_buf);
         for id in ids {
             let mut left: usize = 64 * 1024;
-            while left > 0 && self.panes.get(&id).is_some_and(|p| p.take_output_into(&mut data, false)) {
+            while left > 0 && self.take_output(id, &mut data, false) {
                 self.pane_output(id, &data);
                 left = left.saturating_sub(data.len());
             }
             let Some(&(pid, code, until)) = self.exiting.get(&id) else { continue };
             if self.panes.get(&id).is_none_or(|p| p.output_finished()) || Instant::now() >= until {
                 self.exiting.remove(&id);
+                self.unparsed.remove(&id);
                 self.pane_exited(id, pid, code);
             }
         }
@@ -1411,6 +1483,10 @@ impl Server {
 
     /// Act on what feeding output to pane `id` asked for.
     fn pane_signals(&mut self, id: PaneId, signals: Vec<PaneSignal>) {
+        // A title, a bell, a command ended, contexts reported: shown around the panes.
+        if !signals.is_empty() {
+            self.chrome_changed();
+        }
         for s in signals {
             match s {
                 PaneSignal::Notification { title, body } => {
@@ -1445,6 +1521,7 @@ impl Server {
         for c in self.clients.values_mut() {
             c.dirty = true;
         }
+        self.chrome_changed();
         self.schedule_render();
     }
 
@@ -1452,7 +1529,13 @@ impl Server {
         if let Some(c) = self.clients.get_mut(&id) {
             c.dirty = true;
         }
+        self.chrome_changed();
         self.schedule_render();
+    }
+
+    /// What the chrome shows may have changed: it is worked out again for the next frame.
+    pub(super) fn chrome_changed(&mut self) {
+        self.chrome_gen = self.chrome_gen.wrapping_add(1);
     }
 
     fn mark_dirty_pane(&mut self, pane: PaneId) {

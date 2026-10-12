@@ -4,6 +4,14 @@ use ratatui::layout::Rect;
 
 use super::{Server, Tab};
 use crate::layout::{Node, PaneId};
+/// A layout worked out: the tiles of the tree `root` in `area`, with frames or not.
+pub(super) struct Tiling {
+    root: Node,
+    area: Rect,
+    frames: bool,
+    tiles: Vec<(PaneId, Rect, bool)>,
+}
+
 impl Server {
     /// Main pane area for a client of the given size: below the top bar, one column of space
     /// right of the sidebar.
@@ -71,7 +79,21 @@ impl Server {
     /// Every tiled pane of `root` in `area`, in order: the frame of each pane shown whole, and
     /// the row of each pane folded in a stack (marked `true`).
     fn tiled_rects(&self, root: &Node, area: Rect) -> Vec<(PaneId, Rect, bool)> {
-        root.tiles(area, self.config.pane_frames)
+        let frames = self.config.pane_frames;
+        // Frames ask for the same layouts over and over: the last few are remembered, by value.
+        let mut known = self.tilings.borrow_mut();
+        if let Some(i) = known.iter().position(|t| t.area == area && t.frames == frames && t.root == *root) {
+            let hit = known.remove(i);
+            let tiles = hit.tiles.clone();
+            known.push(hit);
+            return tiles;
+        }
+        let tiles = root.tiles(area, frames);
+        if known.len() >= 8 {
+            known.remove(0);
+        }
+        known.push(Tiling { root: root.clone(), area, frames, tiles: tiles.clone() });
+        tiles
     }
 
     /// Where a tiled pane's frame goes: its place, less one column of space when a pane is to its

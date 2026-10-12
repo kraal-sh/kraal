@@ -9,6 +9,7 @@ use alacritty_terminal::event::EventListener;
 use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::index::{Column, Line, Point};
 use alacritty_terminal::selection::SelectionRange;
+use alacritty_terminal::term::color::{self, Colors};
 use alacritty_terminal::term::{Term, TermDamage};
 use ratatui::buffer::{Buffer, Cell};
 use ratatui::layout::Rect;
@@ -36,13 +37,18 @@ pub struct ScreenCache {
     moved: u64,
     cells: Vec<Cell>,
     versions: Vec<u64>,
+    /// For each row, the version it had before its last change, and the columns that change
+    /// touched (from, to): what a client sent that version needs to be sent of it.
+    changed: Vec<(u64, u16, u16)>,
     /// The links of each row: column and target.
     links: Vec<Vec<(u16, Arc<str>)>>,
     /// Rows with image placeholders: what they show depends on the images too.
     images: Vec<bool>,
-    /// A row being drawn.
-    row: Vec<Cell>,
-    row_links: Vec<(u16, Arc<str>)>,
+    /// The emulator's cells the rows were drawn from: a cell that is the same again looks the
+    /// same, while the palette, the view, the selection and the size do (see `refresh`).
+    raw: Vec<alacritty_terminal::term::cell::Cell>,
+    /// The palette the rows were drawn with.
+    colors: Colors,
 }
 
 impl ScreenCache {
@@ -59,6 +65,13 @@ impl ScreenCache {
         if !all && self.changes == Some(changes) {
             return;
         }
+        // What every cell looks like may have changed, the cells unchanged: each is drawn again.
+        let colors = *term.colors();
+        let restyled = resized
+            || offset != self.offset
+            || selection != self.selection
+            || (0..color::COUNT).any(|i| colors[i] != self.colors[i]);
+        self.colors = colors;
         self.changes = Some(changes);
         self.moved = moved;
         let mut lines = Vec::new();
@@ -78,8 +91,12 @@ impl ScreenCache {
             self.rows = rows;
             self.cells.clear();
             self.cells.resize(cols * rows, Cell::EMPTY);
+            self.raw.clear();
+            self.raw.resize(cols * rows, Default::default());
             self.versions.clear();
             self.versions.resize(rows, 0);
+            self.changed.clear();
+            self.changed.resize(rows, (0, 0, 0));
             self.links.clear();
             self.links.resize_with(rows, Vec::new);
             self.images.clear();
@@ -89,28 +106,50 @@ impl ScreenCache {
             lines.clear();
             lines.extend(0..rows);
         }
+        // Damaged rows are drawn whole: the emulator's columns miss some changes (insert mode
+        // moves the rest of a row, a character over half of a wide one clears the other half).
         for y in lines {
             if y < rows {
-                self.draw_row(term, y, resized);
+                self.draw_row(term, y, restyled, resized);
             }
         }
     }
 
-    /// Draw row `y` from the grid; its version changes when its cells did (always when `fresh`).
-    fn draw_row<T>(&mut self, term: &Term<T>, y: usize, fresh: bool) {
+    /// Draw row `y` from the grid, every cell (`all`: what they look like may have changed with
+    /// them unchanged) or those that changed since (whatever the emulator says of the rows: a
+    /// scroll redraws only what it moved); its version changes when what it shows did (always
+    /// when `fresh`).
+    fn draw_row<T>(&mut self, term: &Term<T>, y: usize, all: bool, fresh: bool) {
         let cols = self.cols;
         let line = Line(y as i32 - self.offset as i32);
         let grid = term.grid();
         let colors = term.colors();
         let selection = self.selection.as_ref();
-        self.row.clear();
-        self.row.resize(cols, Cell::EMPTY);
-        self.row_links.clear();
-        let mut images = false;
-        let mut uris: Vec<Arc<str>> = Vec::new();
-        for (x, out) in self.row.iter_mut().enumerate() {
+        let at = y * cols;
+        // The columns that changed, from the first to the last.
+        let mut changed: Option<(usize, usize)> = fresh.then_some((0, cols.saturating_sub(1)));
+        let mut links = fresh;
+        for x in 0..cols {
             let cell = &grid[line][Column(x)];
-            if let Some(h) = link_of(cell) {
+            let raw = &mut self.raw[at + x];
+            if !all && *raw == *cell {
+                continue;
+            }
+            links |= raw.hyperlink().is_some() || cell.hyperlink().is_some();
+            raw.clone_from(cell);
+            let mut drawn = Cell::EMPTY;
+            draw_cell(cell, Point::new(line, Column(x)), x + 1 >= cols, colors, selection, &mut drawn);
+            if self.cells[at + x] != drawn {
+                self.cells[at + x] = drawn;
+                changed = Some(changed.map_or((x, x), |(a, b)| (a.min(x), b.max(x))));
+            }
+        }
+        let row = &self.cells[at..at + cols];
+        if links {
+            let mut uris: Vec<Arc<str>> = Vec::new();
+            let mut found = Vec::new();
+            for (x, cell) in self.raw[at..at + cols].iter().enumerate() {
+                let Some(h) = link_of(cell) else { continue };
                 let uri = match uris.iter().find(|u| ***u == *h.uri()) {
                     Some(u) => u.clone(),
                     None => {
@@ -119,18 +158,15 @@ impl ScreenCache {
                         u
                     }
                 };
-                self.row_links.push((x as u16, uri));
+                found.push((x as u16, uri));
             }
-            draw_cell(cell, Point::new(line, Column(x)), x + 1 >= cols, colors, selection, out);
-            images |= out.symbol().starts_with(crate::graphics::PLACEHOLDER);
+            self.links[y] = found;
         }
-        let cells = &mut self.cells[y * cols..(y + 1) * cols];
-        if fresh || cells != self.row.as_slice() {
-            cells.swap_with_slice(&mut self.row);
+        if let Some((from, to)) = changed {
+            self.images[y] = row.iter().any(|c| c.symbol().starts_with(crate::graphics::PLACEHOLDER));
+            self.changed[y] = (if fresh { 0 } else { self.versions[y] }, from as u16, to as u16 + 1);
             self.versions[y] = new_version();
         }
-        std::mem::swap(&mut self.links[y], &mut self.row_links);
-        self.images[y] = images;
     }
 
     /// The size the rows are drawn at.
@@ -142,14 +178,32 @@ impl ScreenCache {
         &self.versions
     }
 
+    /// The columns (from, to) of row `y` that differ from what it showed at version `was`,
+    /// when that was the version before its last change; None otherwise (all of it may).
+    pub fn changed_since(&self, y: usize, was: u64) -> Option<(u16, u16)> {
+        let (before, from, to) = *self.changed.get(y)?;
+        (before == was && before != 0).then_some((from, to))
+    }
+
     /// Whether what row `y` shows depends on images.
     pub fn has_images(&self, y: usize) -> bool {
         self.images.get(y).copied().unwrap_or(false)
     }
 
-    /// Copy the rows `rows` says to into `buf` at `area` (the size of the rows), and add every
-    /// row's links to `links`.
-    pub fn draw(&self, area: Rect, buf: &mut Buffer, rows: impl Fn(usize) -> bool, links: &mut crate::ansi::Links) {
+    /// Whether what some row shows depends on images.
+    pub fn any_images(&self) -> bool {
+        self.images.iter().any(|i| *i)
+    }
+
+    /// Copy the columns of each row `rows` says to (from, to) into `buf` at `area` (the size of
+    /// the rows), and add every row's links to `links`.
+    pub fn draw(
+        &self,
+        area: Rect,
+        buf: &mut Buffer,
+        rows: impl Fn(usize) -> Option<(u16, u16)>,
+        links: &mut crate::ansi::Links,
+    ) {
         let (bx, by, bw) = (usize::from(buf.area.x), usize::from(buf.area.y), usize::from(buf.area.width));
         let (x, y) = (usize::from(area.x), usize::from(area.y));
         if area.width as usize != self.cols || area.height as usize != self.rows || buf.area.union(area) != buf.area {
@@ -157,10 +211,11 @@ impl ScreenCache {
         }
         let cols = self.cols;
         for r in 0..self.rows {
-            if rows(r) {
+            if let Some((from, to)) = rows(r) {
+                let (from, to) = (usize::from(from).min(cols), usize::from(to).min(cols));
                 let at = (y + r - by) * bw + (x - bx);
-                if let Some(dst) = buf.content.get_mut(at..at + cols) {
-                    dst.clone_from_slice(&self.cells[r * cols..(r + 1) * cols]);
+                if let Some(dst) = buf.content.get_mut(at + from..at + to) {
+                    dst.clone_from_slice(&self.cells[r * cols + from..r * cols + to]);
                 }
             }
             for (cx, uri) in &self.links[r] {
@@ -195,7 +250,7 @@ mod tests {
         let screen = Rect::new(0, 0, area.width + 2, area.height + 3);
         let (mut cached, mut full) = (Buffer::empty(screen), Buffer::empty(screen));
         let (mut cached_links, mut full_links) = (crate::ansi::Links::new(), crate::ansi::Links::new());
-        cache.draw(area, &mut cached, |_| true, &mut cached_links);
+        cache.draw(area, &mut cached, |_| Some((0, cache.cols as u16)), &mut cached_links);
         render_term(term, area, &mut full, Some(&mut full_links));
         ((cached, cached_links), (full, full_links))
     }
@@ -375,7 +430,18 @@ mod tests {
                 assert_eq!(cached_links, full_links, "case {case} step {step}");
                 for (r, (old, new)) in versions.iter().zip(cache.versions()).enumerate() {
                     let y = r as u16 + 2;
-                    assert_eq!(old == new, row(&was, y) == row(&cached, y), "case {case} step {step} row {r}");
+                    let (before, now) = (row(&was, y), row(&cached, y));
+                    assert_eq!(old == new, before == now, "case {case} step {step} row {r}");
+                    // Outside the columns said to have changed, the row is as it was.
+                    if old != new
+                        && let Some((from, to)) = cache.changed_since(r, *old)
+                    {
+                        let told = usize::from(from) + 1..usize::from(to) + 1;
+                        let outside = (0..now.len()).filter(|x| !told.contains(x));
+                        assert!(outside.clone().all(|x| before[x] == now[x]), "case {case} step {step} row {r}");
+                        assert!(told.clone().next().is_some_and(|x| before[x] != now[x]), "from the first change");
+                        assert!(told.last().is_some_and(|x| before[x] != now[x]), "to the last");
+                    }
                 }
                 was = cached;
                 versions = cache.versions().to_vec();

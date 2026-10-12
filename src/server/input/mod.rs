@@ -79,25 +79,36 @@ impl Server {
             self.primary = Some(id);
             self.relayout();
         }
-        for ev in events {
-            self.client_event(id, ev);
-        }
+        self.client_events(id, events);
     }
 
     pub(super) fn flush_client_input(&mut self, id: ClientId) {
         let Some(c) = self.clients.get_mut(&id) else { return };
         c.pending_since = None;
         let events = c.parser.flush();
-        for ev in events {
-            self.client_event(id, ev);
-        }
+        self.client_events(id, events);
     }
 
-    fn client_event(&mut self, id: ClientId, ev: InputEvent) {
+    /// Act on what a client typed. Unless it all went quietly to programs, what the chrome
+    /// shows may have changed.
+    fn client_events(&mut self, id: ClientId, events: Vec<InputEvent>) {
+        let mut quiet = true;
+        for ev in events {
+            quiet &= self.client_event(id, ev);
+        }
+        if !quiet {
+            self.chrome_changed();
+        }
+        self.typed_quietly = quiet;
+    }
+
+    /// Act on one thing a client typed: whether it only went to programs, changing nothing on
+    /// screen until they answer.
+    fn client_event(&mut self, id: ClientId, ev: InputEvent) -> bool {
         if let InputEvent::Raw(raw) = &ev
             && (self.keyboard_reply(id, raw) || self.attached_request(id, raw) || self.terminal_reply(id, raw))
         {
-            return;
+            return false;
         }
         match &ev {
             InputEvent::FocusGained | InputEvent::FocusLost => {
@@ -112,7 +123,7 @@ impl Server {
                 }
                 // The pane is told now, so that leaving and coming back are both told, in order.
                 self.follow_focus();
-                return;
+                return false;
             }
             _ => {}
         }
@@ -121,7 +132,7 @@ impl Server {
         let ev = match ev {
             InputEvent::PastePiece(data) if normal => {
                 self.paste_piece(id, data);
-                return;
+                return false;
             }
             InputEvent::PastePiece(data) => InputEvent::Paste(data),
             InputEvent::Paste(_) if !normal && self.clients.get(&id).is_some_and(|c| c.paste.is_some()) => {
@@ -135,7 +146,7 @@ impl Server {
                     }
                     _ => {}
                 }
-                return;
+                return false;
             }
             ev => ev,
         };
@@ -143,7 +154,7 @@ impl Server {
         let typed =
             matches!(ev, InputEvent::Key(_) | InputEvent::Raw(_) | InputEvent::KittyKey { .. } | InputEvent::Paste(_));
         let quiet = self.goes_quietly(id, &ev);
-        let Some(c) = self.clients.get_mut(&id) else { return };
+        let Some(c) = self.clients.get_mut(&id) else { return false };
         let mode = std::mem::replace(&mut c.mode, Mode::Normal);
         if typed
             && matches!(mode, Mode::Normal)
@@ -186,7 +197,10 @@ impl Server {
             }
         }
         // Each key may move the focus: a pane left and found again in one read is told both.
-        self.follow_focus();
+        if shown {
+            self.follow_focus();
+        }
+        !shown
     }
 
     /// What a client attached from a pane of another kraal asks of this session, in what it
@@ -500,6 +514,12 @@ impl Server {
     /// first when they would reach production panes not approved yet: then all of them wait for
     /// the answer, as one.
     fn send_to_targets(&mut self, focused: PaneId, targets: &[PaneId], items: Vec<InputItem>) -> Mode {
+        // Keys typed into one's own pane alone are never asked about (see `production_guard`):
+        // no context needs looking at for them.
+        if targets.iter().all(|t| *t == focused) && !items.iter().any(|i| matches!(i, InputItem::Paste(_))) {
+            self.send_items(targets, items);
+            return Mode::Normal;
+        }
         let named = targets.iter().map(|t| (*t, self.pane_production(*t))).collect();
         let pending = PendingInput { items, targets: named };
         if let Some(ask) = self.production_guard(focused, targets, &pending) {

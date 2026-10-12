@@ -157,8 +157,16 @@ pub fn write_frame(w: &mut impl Write, kind: u8, payload: &[u8]) -> io::Result<(
     let mut header = [0u8; 5];
     header[..4].copy_from_slice(&(payload.len() as u32).to_le_bytes());
     header[4] = kind;
-    w.write_all(&header)?;
-    w.write_all(payload)?;
+    // A small frame (a key) goes in one write: the reader is not woken by a header alone.
+    if payload.len() <= 4096 {
+        let mut frame = Vec::with_capacity(header.len() + payload.len());
+        frame.extend_from_slice(&header);
+        frame.extend_from_slice(payload);
+        w.write_all(&frame)?;
+    } else {
+        w.write_all(&header)?;
+        w.write_all(payload)?;
+    }
     w.flush()
 }
 

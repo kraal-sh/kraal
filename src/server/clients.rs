@@ -2,13 +2,18 @@
 
 use std::io::Write;
 use std::os::unix::net::UnixStream;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
+
+use crossbeam_channel::{SendTimeoutError, TrySendError};
 
 use super::{Client, ClientId, Event, Mode, Server};
 use crate::ansi::Encoder;
 use crate::input::InputParser;
 use crate::pane::PaneSpec;
 use crate::protocol::{self, ClientMsg, ServerMsg};
+
 /// Clients connected at once (attached terminals, CLI commands, event streams).
 const MAX_CLIENTS: usize = 256;
 
@@ -24,20 +29,9 @@ impl Server {
         let id = self.alloc_id();
         let peer = crate::process::socket_peer(&stream).ok().and_then(|(pid, _)| u32::try_from(pid).ok());
         let Ok(read_half) = stream.try_clone() else { return };
-        let (out_tx, out_rx) = crossbeam_channel::bounded::<Vec<u8>>(64);
-        let mut write_half = stream;
-        // A client that stops reading is let go rather than holding its writer forever.
-        let _ = write_half.set_write_timeout(Some(Duration::from_secs(10)));
-        // And one that connects without saying anything.
+        // One that connects without saying anything is let go.
         let _ = read_half.set_read_timeout(Some(Duration::from_secs(10)));
-        let _ = std::thread::Builder::new().name(format!("client-{id}-write")).spawn(move || {
-            for data in out_rx {
-                if write_half.write_all(&data).and_then(|_| write_half.flush()).is_err() {
-                    break;
-                }
-            }
-            let _ = write_half.shutdown(std::net::Shutdown::Both);
-        });
+        let out = Outbox::start(stream, id);
         let tx = self.tx.clone();
         let _ = std::thread::Builder::new().name(format!("client-{id}-read")).spawn(move || {
             let mut r = std::io::BufReader::with_capacity(64 * 1024, read_half);
@@ -57,7 +51,7 @@ impl Server {
             id,
             Client {
                 id,
-                out: out_tx,
+                out,
                 attached: false,
                 cols: 80,
                 rows: 24,
@@ -265,4 +259,160 @@ pub fn frame_bytes(bytes: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(bytes.len() + 5);
     let _ = protocol::write_frame(&mut out, protocol::BYTES, bytes);
     out
+}
+
+/// Where what goes to a client is sent. Written to its socket at once, from the server's
+/// thread, as far as the socket takes it without waiting and when nothing waits before it;
+/// the rest is queued, in order, for the client's writer thread.
+#[derive(Clone)]
+pub struct Outbox {
+    queue: crossbeam_channel::Sender<Vec<u8>>,
+    /// Messages queued and not written yet.
+    queued: Arc<AtomicUsize>,
+    socket: Arc<UnixStream>,
+}
+
+impl Outbox {
+    /// The outbox of a client connected on `stream`, and its writer thread.
+    fn start(stream: UnixStream, id: ClientId) -> Outbox {
+        let (tx, rx) = crossbeam_channel::bounded::<Vec<u8>>(64);
+        // A client that stops reading is let go rather than holding its writer forever.
+        let _ = stream.set_write_timeout(Some(Duration::from_secs(10)));
+        let out = Outbox { queue: tx, queued: Arc::new(AtomicUsize::new(0)), socket: Arc::new(stream) };
+        let (queued, socket) = (out.queued.clone(), out.socket.clone());
+        let _ = std::thread::Builder::new().name(format!("client-{id}-write")).spawn(move || {
+            let mut w = &*socket;
+            for data in rx {
+                if w.write_all(&data).and_then(|_| w.flush()).is_err() {
+                    break;
+                }
+                // Written: once nothing is left, the server writes again itself.
+                queued.fetch_sub(1, Ordering::AcqRel);
+            }
+            let _ = socket.shutdown(std::net::Shutdown::Both);
+        });
+        out
+    }
+
+    pub fn try_send(&self, data: Vec<u8>) -> Result<(), TrySendError<Vec<u8>>> {
+        let Some(rest) = self.write_now(data) else { return Ok(()) };
+        self.queued.fetch_add(1, Ordering::AcqRel);
+        self.queue.try_send(rest).inspect_err(|_| {
+            self.queued.fetch_sub(1, Ordering::AcqRel);
+        })
+    }
+
+    pub fn send_timeout(&self, data: Vec<u8>, wait: Duration) -> Result<(), SendTimeoutError<Vec<u8>>> {
+        let Some(rest) = self.write_now(data) else { return Ok(()) };
+        self.queued.fetch_add(1, Ordering::AcqRel);
+        self.queue.send_timeout(rest, wait).inspect_err(|_| {
+            self.queued.fetch_sub(1, Ordering::AcqRel);
+        })
+    }
+
+    /// Messages waiting for the writer thread.
+    pub fn len(&self) -> usize {
+        self.queued.load(Ordering::Acquire)
+    }
+
+    /// Write `data` to the socket as far as it takes it now, unless something waits for the
+    /// writer thread: what is left to queue. A message cut there goes on through the queue,
+    /// which is empty then and has room for it.
+    #[cfg(target_os = "linux")]
+    fn write_now(&self, data: Vec<u8>) -> Option<Vec<u8>> {
+        use std::os::fd::AsRawFd;
+        if self.len() > 0 {
+            return Some(data);
+        }
+        let flags = libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL;
+        let mut done = 0;
+        while done < data.len() {
+            let rest = &data[done..];
+            // SAFETY: sends from a live slice on a socket the outbox holds.
+            let n = unsafe { libc::send(self.socket.as_raw_fd(), rest.as_ptr().cast(), rest.len(), flags) };
+            match n {
+                n if n > 0 => done += n as usize,
+                n if n < 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted => {}
+                _ => break,
+            }
+        }
+        match done {
+            _ if done == data.len() => None,
+            0 => Some(data),
+            _ => Some(data[done..].to_vec()),
+        }
+    }
+
+    /// Everything goes through the writer thread: macOS does not let a send be told not to wait
+    /// (`MSG_DONTWAIT` waits all the same, up to the socket's timeout), and the socket itself
+    /// must wait for that thread and the reader.
+    #[cfg(not(target_os = "linux"))]
+    fn write_now(&self, data: Vec<u8>) -> Option<Vec<u8>> {
+        Some(data)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Read;
+
+    use super::*;
+
+    /// Wait until `out` has nothing queued.
+    fn drained(out: &Outbox) {
+        let start = Instant::now();
+        while out.len() > 0 {
+            assert!(start.elapsed() < Duration::from_secs(5));
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn what_a_client_does_not_read_yet_waits_for_it_in_order() {
+        use std::os::fd::AsRawFd;
+        let (server_end, mut client_end) = UnixStream::pair().unwrap();
+        // A small send buffer, as macOS gives a socket: messages are cut often.
+        let size: libc::c_int = 8 * 1024;
+        // SAFETY: sets an int option on a socket the test holds.
+        let set = unsafe {
+            libc::setsockopt(
+                server_end.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_SNDBUF,
+                (&size as *const libc::c_int).cast(),
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            )
+        };
+        assert_eq!(set, 0);
+        let out = Outbox::start(server_end, 1);
+        // Small enough to go at once (through the writer thread where a send cannot be told not
+        // to wait).
+        out.try_send(b"first".to_vec()).unwrap();
+        #[cfg(target_os = "linux")]
+        assert_eq!(out.len(), 0);
+        let mut first = [0u8; 5];
+        client_end.read_exact(&mut first).unwrap();
+        assert_eq!(&first, b"first");
+        drained(&out);
+        // Far more than the socket holds: cut where it is full, the rest queued, nothing waits.
+        let messages: Vec<Vec<u8>> = (0..40u8).map(|i| vec![b'a' + i % 26; 64 * 1024 + usize::from(i)]).collect();
+        let start = Instant::now();
+        for m in &messages {
+            out.try_send(m.clone()).unwrap();
+        }
+        assert!(start.elapsed() < Duration::from_millis(500), "{:?}", start.elapsed());
+        assert!(out.len() > 0);
+        let want: Vec<u8> = messages.concat();
+        let mut got = vec![0u8; want.len()];
+        client_end.read_exact(&mut got).unwrap();
+        assert!(got == want, "every byte, in order");
+        drained(&out);
+        out.try_send(b"last".to_vec()).unwrap();
+        #[cfg(target_os = "linux")]
+        assert_eq!(out.len(), 0, "written at once again");
+        drop(out);
+        let mut rest = Vec::new();
+        client_end.read_to_end(&mut rest).unwrap();
+        assert_eq!(rest, b"last", "and the connection closed after it");
+    }
 }

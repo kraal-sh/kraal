@@ -262,27 +262,31 @@ fn compared(prev: &[Cell], next: &Buffer, kept: &[Kept]) -> Vec<(usize, usize)> 
     let mut within = |cell: &Cell, i: usize, end: usize| {
         i + cell.symbol().len().max(1) <= end || i + usize::from(widths.of(cell)).max(1) <= end
     };
-    let mut skips: Vec<(usize, usize)> = kept
+    let mut runs: Vec<(usize, usize)> = kept
         .iter()
         .filter(|k| usize::from(k.y) < height && k.x0 < k.x1 && usize::from(k.x1) <= width)
         .map(|k| {
             let row = usize::from(k.y) * width;
             (row + usize::from(k.x0), row + usize::from(k.x1))
         })
-        .filter(|&(a, b)| {
-            (a.saturating_sub(WIDEST)..a).all(|i| within(&next.content[i], i, a) && within(&prev[i], i, a))
-                && (a.max(b.saturating_sub(WIDEST))..b).all(|i| within(&next.content[i], i, b))
-        })
         .collect();
-    skips.sort_unstable();
-    let mut out = Vec::with_capacity(skips.len() + 1);
+    runs.sort_unstable();
+    // Runs that meet are one: the cells kept are the same in both frames, so only the ends of
+    // a run can change what the diff finds (whole rows kept one after the other are one run).
+    let mut joined: Vec<(usize, usize)> = Vec::with_capacity(runs.len());
+    for (a, b) in runs {
+        match joined.last_mut() {
+            Some(last) if a <= last.1 => last.1 = last.1.max(b),
+            _ => joined.push((a, b)),
+        }
+    }
+    let skips = joined.into_iter().filter(|&(a, b)| {
+        (a.saturating_sub(WIDEST)..a).all(|i| within(&next.content[i], i, a) && within(&prev[i], i, a))
+            && (a.max(b.saturating_sub(WIDEST))..b).all(|i| within(&next.content[i], i, b))
+    });
+    let mut out = Vec::new();
     let mut from = 0;
     for (a, b) in skips {
-        // Overlapping runs: the one already skipped counts.
-        if a < from {
-            from = from.max(b);
-            continue;
-        }
         if a > from {
             out.push((from, a));
         }
@@ -810,6 +814,23 @@ mod tests {
             diff_ranges(Some(&prev.content), &next, &compared(&prev.content, &next, &kept), &mut skipping);
             assert_eq!(skipping, want, "case {case}: kept {kept:?}");
         }
+    }
+
+    /// Kept runs that meet, row after row, are skipped as one: only the cell typed is compared.
+    #[test]
+    fn rows_kept_one_after_the_other_leave_only_what_changed() {
+        let area = Rect::new(0, 0, 10, 4);
+        let mut prev = Buffer::empty(area);
+        prev.set_string(0, 0, "│ab│", Style::default());
+        let mut next = prev.clone();
+        next[(3, 2)].set_char('x');
+        let kept: Vec<Kept> = (0..4)
+            .flat_map(|y| match y {
+                2 => vec![Kept { y, x0: 0, x1: 3 }, Kept { y, x0: 4, x1: 10 }],
+                _ => vec![Kept { y, x0: 0, x1: 5 }, Kept { y, x0: 5, x1: 10 }],
+            })
+            .collect();
+        assert_eq!(compared(&prev.content, &next, &kept), vec![(23, 24)]);
     }
 
     /// The bytes sent do not depend on which unchanged cells are said to be kept, links and

@@ -494,6 +494,8 @@ pub struct KubeCache {
     files: Arc<Mutex<HashMap<PathBuf, Cached>>>,
     /// `KUBECONFIG` values being read: since when, and the read's number.
     reading: Arc<Mutex<HashMap<String, (Instant, u64)>>>,
+    /// How many values are being read, known without the lock.
+    readings: Arc<std::sync::atomic::AtomicUsize>,
     /// Reads are numbered: a context read twice the same way can be told from one that changed
     /// in between, or that is read again (what a production approval was given for).
     numbers: Arc<std::sync::atomic::AtomicU64>,
@@ -512,16 +514,24 @@ impl KubeCache {
         }
         let number = self.number();
         reading.insert(kubeconfig.to_string(), (Instant::now(), number));
+        self.readings.store(reading.len(), std::sync::atomic::Ordering::Release);
         Some(number)
     }
 
     pub fn end(&self, kubeconfig: &str) {
-        self.reading.lock().unwrap_or_else(PoisonError::into_inner).remove(kubeconfig);
+        let mut reading = self.reading.lock().unwrap_or_else(PoisonError::into_inner);
+        reading.remove(kubeconfig);
+        self.readings.store(reading.len(), std::sync::atomic::Ordering::Release);
     }
 
     /// A number for a read made outside [`KubeCache::begin`].
     pub fn number(&self) -> u64 {
         1 + self.numbers.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Whether some value is being read.
+    pub fn any_reading(&self) -> bool {
+        self.readings.load(std::sync::atomic::Ordering::Acquire) > 0
     }
 
     /// Since when `kubeconfig` is being read, and that read's number, if it is.
@@ -909,6 +919,9 @@ users:
         let f = cache.merged(&value);
         cache.end(&value);
         assert!(cache.reading(&value).is_none());
+        assert!(cache.any_reading(), "/elsewhere still is");
+        cache.end("/elsewhere");
+        assert!(!cache.any_reading());
         assert!(f.unreadable.is_some(), "{f:?}");
         assert!(start.elapsed() < std::time::Duration::from_secs(1));
         let _ = std::fs::remove_dir_all(dir);
