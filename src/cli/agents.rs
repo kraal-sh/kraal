@@ -235,15 +235,8 @@ pub(super) fn agent(
         return Ok(());
     }
     // Here, in this pane: its workspace's account rules still apply.
-    let workspace = if inside { own_workspace(s) } else { None };
+    let workspace = if inside { s.own_workspace() } else { None };
     exec_agent(&agent, account.as_deref(), workspace.as_deref(), &args, &[])
-}
-
-/// The workspace of the pane this command runs in.
-fn own_workspace(s: &Session) -> Option<String> {
-    let pane = s.own_pane()?;
-    let Ok(Response::Panes(list)) = s.request(Request::ListPanes) else { return None };
-    list.into_iter().find(|p| p.id.to_string() == pane).map(|p| p.workspace)
 }
 
 /// Start an agent on the chosen account in this terminal, with `env` besides the account's.

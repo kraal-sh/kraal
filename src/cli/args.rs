@@ -192,6 +192,7 @@ pub enum Cmd {
     /// Save a workspace's current layout to its definition file, or as `<name>.kdl`.
     Save {
         name: Option<String>,
+        /// The workspace to save (default: inside a pane, its workspace; else the one on screen).
         #[arg(short, long)]
         workspace: Option<String>,
     },

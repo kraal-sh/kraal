@@ -92,7 +92,10 @@ pub(super) fn open(s: &Session, name: String) -> Result<()> {
     Ok(())
 }
 
+/// `kraal save`: the workspace named, else the one of the pane this runs in, else (outside a
+/// pane) the one on screen, which the server knows.
 pub(super) fn save(s: &Session, name: Option<String>, workspace: Option<String>) -> Result<()> {
+    let workspace = workspace.or_else(|| s.own_workspace());
     if let Response::Path(p) = s.request(Request::SaveWorkspace { workspace, name })? {
         println!("saved {}", p.display());
     }

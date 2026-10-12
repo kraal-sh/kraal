@@ -64,6 +64,14 @@ impl Session {
         std::env::var("KRAAL_PANE").ok().filter(|_| same)
     }
 
+    /// The workspace of the pane this command runs in ([`Session::own_pane`]): where a command
+    /// that names no workspace acts, rather than the one a terminal happens to show.
+    fn own_workspace(&self) -> Option<String> {
+        let pane = self.own_pane()?;
+        let Ok(Response::Panes(list)) = self.request(Request::ListPanes) else { return None };
+        list.into_iter().find(|p| p.id.to_string() == pane).map(|p| p.workspace)
+    }
+
     fn request(&self, r: Request) -> Result<Response> {
         client::request(&self.socket(), r)
     }

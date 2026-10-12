@@ -136,7 +136,7 @@ From the command line:
 |---|---|
 | `kraal workspaces` | the open workspaces with their tabs, panes and agents, and the files not open (`--json` for scripts) |
 | `kraal open shop` | starts the workspace `shop` from its file, or switches to it, without attaching |
-| `kraal save` | writes the layout of the workspace on screen to its file |
+| `kraal save` | writes the layout of a workspace to its file: in a pane, that pane's workspace; outside one, the workspace on screen |
 | `kraal save --workspace shop` | the same for the workspace you name |
 | `kraal save shop-2` | writes it under that name |
 

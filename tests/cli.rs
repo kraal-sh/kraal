@@ -797,6 +797,40 @@ fn save_writes_a_definition_that_reopens() {
     assert!(!env.root.join("config/kraal/escape.kdl").exists());
 }
 
+/// `kraal save` run in a pane saves that pane's workspace, as every command run in a pane acts
+/// where it runs: not the workspace a terminal shows, nor the first one. `--workspace` names
+/// another, and outside a pane the one on screen is saved.
+#[test]
+fn save_in_a_pane_saves_the_workspace_of_that_pane() {
+    let env = Env::new("savehere");
+    let dir = env.root.join("config/kraal/workspaces");
+    env.workspace("w", "layout {\n    pane name=\"first\"\n}\n");
+    env.workspace("v", "layout {\n    pane name=\"second\"\n}\n");
+    env.run(&["open", "w"]);
+    env.run(&["open", "v"]);
+    // A terminal shows w, and the command runs in the pane of v.
+    let client = RawClient::attach(&env, "w");
+    client.wait_for_message("\"attached\"");
+    let panes: serde_json::Value = serde_json::from_str(&env.run(&["panes", "--json"])).unwrap();
+    let second = panes.as_array().unwrap().iter().find(|p| p["name"] == "second").unwrap()["id"].to_string();
+    let in_pane = |args: &[&str]| {
+        let out = env.cmd(args).env("KRAAL_PANE", &second).env("KRAAL_SESSION", &env.session).output().unwrap();
+        assert!(out.status.success(), "kraal {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+    let saved = |name: &str| std::fs::read_to_string(dir.join(name)).unwrap_or_default();
+
+    assert!(in_pane(&["save"]).trim().ends_with("/v.kdl"));
+    // Saving over a definition keeps the one before beside it.
+    assert_eq!(names_in(&dir), ["v.kdl", "v.kdl.bak", "w.kdl"]);
+    assert!(in_pane(&["save", "copy"]).trim().ends_with("/copy.kdl"));
+    assert!(saved("copy.kdl").contains("name=\"second\"") && !saved("copy.kdl").contains("first"));
+    assert!(in_pane(&["save", "named", "--workspace", "w"]).trim().ends_with("/named.kdl"));
+    assert!(saved("named.kdl").contains("name=\"first\""), "{}", saved("named.kdl"));
+    // Outside a pane: the workspace on screen.
+    assert!(env.run(&["save"]).trim().ends_with("/w.kdl"));
+}
+
 /// `kraal workspaces --json`, a line each: name, file, and whether it is open.
 fn listed_workspaces(env: &Env) -> Vec<String> {
     let list: serde_json::Value = serde_json::from_str(&env.run(&["workspaces", "--json"])).unwrap();
