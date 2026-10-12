@@ -771,15 +771,18 @@ impl Server {
 
     /// Parse waiting pane output for up to `budget`: the panes clients are looking at first,
     /// for at most half of it, then the others in turn, one chunk each. Stops early when a
-    /// control event arrives, but the others always get a chunk: a pane printing without a
-    /// pause keeps the queue busy (its own wake-ups), and must not starve the rest.
+    /// control event arrives or a frame is due, but the others always get a chunk: a pane
+    /// printing without a pause keeps the queue busy, and must not starve the rest.
     fn pump_output(&mut self, budget: Duration, rx: &Receiver<Event>) {
         let start = Instant::now();
         let focused: Vec<PaneId> =
             self.clients.values().filter(|c| c.attached).filter_map(|c| self.client_focus(c.id)).collect();
         let mut data = std::mem::take(&mut self.output_buf);
+        let more = |s: &Server, budget: Duration| {
+            start.elapsed() < budget && rx.is_empty() && s.next_render.is_none_or(|t| t > Instant::now())
+        };
         for p in focused {
-            while start.elapsed() < budget / 2 && rx.is_empty() {
+            while more(self, budget / 2) {
                 if !self.take_output(p, &mut data) {
                     break;
                 }
@@ -787,7 +790,7 @@ impl Server {
             }
         }
         let mut served = false;
-        while !std::mem::replace(&mut served, true) || (start.elapsed() < budget && rx.is_empty()) {
+        while !std::mem::replace(&mut served, true) || more(self, budget) {
             let Some(id) = self.ready.pop_front() else { break };
             if self.take_output(id, &mut data) {
                 self.pane_output(id, &data);
