@@ -71,12 +71,19 @@ again for Cargo's. [More ways](docs/install.md)
 ## Quick start
 
 ```sh
-kraal                              # start a session, or attach to the running one
-kraal integration install claude   # exact agent states from Claude Code's hooks (gemini, copilot, opencode… too)
+kraal
 ```
 
-Press `ctrl+b` and let go: a menu shows what each next key does. `ctrl+b d` detaches, and
-`kraal` brings you back where you were.
+This starts a session, or attaches to the one already running. Press `ctrl+b` and let go: a menu
+shows what each next key does. `ctrl+b s` connects to a server, `ctrl+b a` starts an agent,
+`ctrl+b d` detaches, and `kraal` brings you back where you were.
+
+kraal reads each agent's state from its screen. To get exact states from the agent itself, install
+its hooks once (here Claude Code; `kraal integration status` lists the others):
+
+```sh
+kraal integration install claude
+```
 
 ## Keys you can guess
 
