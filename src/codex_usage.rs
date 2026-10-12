@@ -416,13 +416,11 @@ mod tests {
         }
         assert_eq!(from_rollouts(&tmp.0).unwrap().five_hour.unwrap().used_percent, 5.0);
     }
-    #[cfg(unix)]
     fn script(tmp: &Temp, body: &str) -> PathBuf {
         let path = tmp.0.join("fake-codex");
         crate::testing::write_script(&path, &format!("#!/bin/sh\n{body}\n"));
         path
     }
-    #[cfg(unix)]
     #[test]
     fn fetch_protocol() {
         let tmp = Temp::new();
@@ -445,7 +443,6 @@ printf '%s\n' '{"id":2,"result":{"rateLimits":{"primary":{"usedPercent":42,"wind
         let r = fetch(path.to_str().unwrap(), &tmp.0, Duration::from_secs(2)).unwrap();
         assert_eq!(r.five_hour.unwrap().used_percent, 42.0);
     }
-    #[cfg(unix)]
     #[test]
     fn fetch_timeout_and_redacted_errors() {
         let tmp = Temp::new();

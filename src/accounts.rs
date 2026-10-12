@@ -449,6 +449,7 @@ pub fn default_home_for(agent: &str, name: &str) -> PathBuf {
 /// Create an account home: shared entries are symlinked from the agent's default home, a few
 /// files are copied. Credentials are never touched; the agent's login creates them.
 pub fn prepare_home(a: &Account) -> Result<Vec<String>> {
+    use std::os::unix::fs::PermissionsExt;
     let kind = agent_kind(&a.agent).context("unknown agent")?;
     let home = paths::expand_tilde(&a.home);
     let default = paths::expand_tilde(kind.default_home);
@@ -457,11 +458,7 @@ pub fn prepare_home(a: &Account) -> Result<Vec<String>> {
         return Ok(notes);
     }
     std::fs::create_dir_all(&home).with_context(|| format!("creating {}", home.display()))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700));
-    }
+    let _ = std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700));
     for entry in kind.shared {
         let src = default.join(entry);
         let dst = home.join(entry);
@@ -473,7 +470,6 @@ pub fn prepare_home(a: &Account) -> Result<Vec<String>> {
         if !src.exists() || dst.symlink_metadata().is_ok() {
             continue;
         }
-        #[cfg(unix)]
         std::os::unix::fs::symlink(&src, &dst).with_context(|| format!("linking {}", dst.display()))?;
         notes.push(format!("shared {entry}"));
     }

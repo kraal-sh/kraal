@@ -391,15 +391,9 @@ fn dest_path(dest: &Path, rel: &Path) -> std::io::Result<PathBuf> {
 /// A new file at `target` with the content and permissions of `src`; never over something
 /// there, nor through a link.
 fn copy_file(src: &Path, target: &Path, meta: &std::fs::Metadata) -> std::io::Result<()> {
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
     let mut opts = std::fs::OpenOptions::new();
-    opts.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-        opts.mode(meta.permissions().mode() & 0o777);
-    }
-    #[cfg(not(unix))]
-    let _ = meta;
+    opts.write(true).create_new(true).mode(meta.permissions().mode() & 0o777);
     let mut out = opts.open(target)?;
     std::io::copy(&mut std::fs::File::open(src)?, &mut out)?;
     Ok(())

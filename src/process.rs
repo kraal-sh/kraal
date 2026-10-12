@@ -676,76 +676,10 @@ mod imp {
     }
 }
 
+// kraal supports Linux and macOS only (docs/install.md): `imp`, here and in watch.rs, exists
+// for these two. Elsewhere the build fails with this reason, not only with unresolved names.
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-mod imp {
-    use super::*;
-
-    /// Open files are not looked at here: only working directories count.
-    pub fn open_files(_pid: u32) -> Vec<PathBuf> {
-        Vec::new()
-    }
-
-    pub fn args_and_env(_pid: u32) -> Option<(Vec<String>, Vec<String>)> {
-        None
-    }
-
-    pub fn cwd(_pid: u32) -> Option<PathBuf> {
-        None
-    }
-
-    pub fn socket_peer(_fd: std::os::unix::io::RawFd) -> std::io::Result<(libc::pid_t, libc::uid_t)> {
-        Err(std::io::ErrorKind::Unsupported.into())
-    }
-
-    pub fn running(pid: libc::pid_t) -> bool {
-        exists(pid)
-    }
-
-    /// Without a way to tell zombies apart: any member counts.
-    pub fn start_time(_pid: u32) -> Option<u64> {
-        None
-    }
-
-    pub fn machine_id() -> Option<String> {
-        None
-    }
-
-    pub fn boot_id() -> String {
-        String::new()
-    }
-
-    pub fn pids() -> Vec<u32> {
-        Vec::new()
-    }
-
-    pub fn ppid(_pid: u32) -> Option<u32> {
-        None
-    }
-
-    pub fn foreground_group(_pid: u32) -> Option<u32> {
-        None
-    }
-
-    pub fn group_running(_pgid: libc::pid_t) -> bool {
-        true
-    }
-
-    pub fn group_of(_pid: libc::pid_t) -> Option<libc::pid_t> {
-        None
-    }
-
-    pub fn terminal_of(_pid: u32) -> Option<PathBuf> {
-        None
-    }
-
-    pub fn session_members(_sid: libc::pid_t) -> Vec<libc::pid_t> {
-        Vec::new()
-    }
-
-    pub fn listening_ports() -> HashSet<u16> {
-        HashSet::new()
-    }
-}
+compile_error!("kraal builds for Linux and macOS only");
 
 #[cfg(test)]
 mod tests {

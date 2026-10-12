@@ -478,13 +478,10 @@ fn install_nested(spec: &NestedHooks, path: &Path, top_level: bool, cmd: &str) -
 /// Augment's hooks run kraal's script, which runs `kraal hook auggie`: the script first, then
 /// the hooks that run it.
 fn install_auggie(settings: &Path, script: &Path, content: &str) -> Result<String> {
+    use std::os::unix::fs::PermissionsExt;
     install_own("auggie", script, content, "hook script")?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(script, std::fs::Permissions::from_mode(0o755))
-            .with_context(|| format!("making {} executable", script.display()))?;
-    }
+    std::fs::set_permissions(script, std::fs::Permissions::from_mode(0o755))
+        .with_context(|| format!("making {} executable", script.display()))?;
     install_nested(nested("auggie"), settings, false, &script.to_string_lossy())
 }
 
@@ -1979,7 +1976,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    #[cfg(unix)]
     #[test]
     fn a_linked_shell_file_stays_a_link() {
         let dir = tmp("linked");
@@ -2125,6 +2121,7 @@ mod tests {
     /// kraal's command line is replaced, and the user's hooks stay.
     #[test]
     fn augment_hooks_run_a_script_of_kraals() {
+        use std::os::unix::fs::PermissionsExt;
         let dir = tmp("auggie");
         let settings = dir.join("settings.json");
         let script = dir.join(AUGGIE_SCRIPT);
@@ -2137,11 +2134,7 @@ mod tests {
         install_auggie(&settings, &script, &content).unwrap();
         assert!(content.starts_with("#!/bin/sh\n") && content.ends_with("exec '/opt/my tools/kraal' hook auggie\n"));
         assert_eq!(std::fs::read_to_string(&script).unwrap(), content);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            assert_eq!(std::fs::metadata(&script).unwrap().permissions().mode() & 0o777, 0o755);
-        }
+        assert_eq!(std::fs::metadata(&script).unwrap().permissions().mode() & 0o777, 0o755);
         let v = read_json(&settings).unwrap();
         let stop = v["hooks"]["Stop"].as_array().unwrap();
         assert_eq!(stop.len(), 2, "{stop:?}");
@@ -2225,6 +2218,7 @@ mod tests {
     /// own that was edited is kept aside before it changes or goes.
     #[test]
     fn own_files_kraal_cannot_read_or_that_were_edited_are_kept() {
+        use std::os::unix::fs::PermissionsExt;
         let dir = tmp("own-kept");
         let path = dir.join("opencode/plugins/kraal.js");
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -2234,17 +2228,13 @@ mod tests {
         assert!(install_own("opencode", &path, &plugin, "plugin").is_err());
         assert!(uninstall_own("opencode", &path, &plugin).is_err());
         assert_eq!(std::fs::read(&path).unwrap(), binary);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::write(&path, "mine\n").unwrap();
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
-            // Root reads it anyway: then it is simply not kraal's.
-            assert!(install_own("opencode", &path, &plugin, "plugin").is_err());
-            assert!(uninstall_own("opencode", &path, &plugin).is_err());
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
-            assert_eq!(std::fs::read_to_string(&path).unwrap(), "mine\n");
-        }
+        std::fs::write(&path, "mine\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        // Root reads it anyway: then it is simply not kraal's.
+        assert!(install_own("opencode", &path, &plugin, "plugin").is_err());
+        assert!(uninstall_own("opencode", &path, &plugin).is_err());
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "mine\n");
         let backup = dir.join("opencode/plugins/kraal.js.kraal-bak");
         let edited = plugin.replace("const busy", "// mine\n  const busy");
         std::fs::write(&path, &edited).unwrap();

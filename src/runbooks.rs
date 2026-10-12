@@ -464,7 +464,6 @@ pub fn create_log(name: &str, id: u32, header: &str) -> Result<PathBuf> {
     std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
     let mut opts = std::fs::OpenOptions::new();
     opts.write(true).create_new(true);
-    #[cfg(unix)]
     std::os::unix::fs::OpenOptionsExt::mode(&mut opts, 0o600);
     // Another session may have started a run with the same name and number in the same second.
     for n in 1..=100 {
@@ -486,7 +485,6 @@ pub fn create_log(name: &str, id: u32, header: &str) -> Result<PathBuf> {
 pub fn open_private_append(path: &Path) -> std::io::Result<std::fs::File> {
     let mut opts = std::fs::OpenOptions::new();
     opts.append(true).create(true);
-    #[cfg(unix)]
     std::os::unix::fs::OpenOptionsExt::mode(&mut opts, 0o600);
     opts.open(path)
 }
@@ -866,7 +864,6 @@ mod tests {
         assert_eq!(expand_vars("v-$KRAAL_BRANCH-${KRAAL_B}", &vars), "v-main-x");
     }
 
-    #[cfg(unix)]
     #[test]
     fn a_runbook_directory_cannot_hang_the_listing() {
         let dir = std::env::temp_dir().join(format!("kraal-rbdir-{}", std::process::id()));

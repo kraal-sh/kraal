@@ -1,7 +1,7 @@
 //! Changes in directories, told by the kernel rather than looked for: inotify on Linux, kqueue
 //! on macOS. One thread sleeps on the kernel's queue and passes on which watches saw something.
-//! Elsewhere nothing can be watched, and a network file system does not tell what other machines
-//! change (see [`local`]): callers then keep looking for themselves.
+//! A network file system does not tell what other machines change (see [`local`]): callers then
+//! keep looking for themselves.
 
 use std::io;
 use std::path::Path;
@@ -82,11 +82,6 @@ pub fn local(path: &Path) -> bool {
     {
         let name: Vec<u8> = st.f_fstypename.iter().take_while(|c| **c != 0).map(|c| *c as u8).collect();
         st.f_flags & libc::MNT_LOCAL as u32 != 0 && !name.windows(4).any(|w| w == b"fuse")
-    }
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    {
-        let _ = st;
-        false
     }
 }
 
@@ -335,28 +330,6 @@ mod imp {
         pub fn remove(&mut self, id: WatchId) {
             self.open.remove(&id);
         }
-    }
-}
-
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
-mod imp {
-    use std::io;
-    use std::path::Path;
-
-    use super::{Change, WatchId};
-
-    pub struct Watcher;
-
-    impl Watcher {
-        pub fn new(_changed: impl FnMut(Vec<Change>) + Send + 'static) -> io::Result<Watcher> {
-            Err(io::ErrorKind::Unsupported.into())
-        }
-
-        pub fn add(&mut self, _path: &Path) -> io::Result<WatchId> {
-            Err(io::ErrorKind::Unsupported.into())
-        }
-
-        pub fn remove(&mut self, _id: WatchId) {}
     }
 }
 

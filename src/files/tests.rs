@@ -304,7 +304,6 @@ fn shell_fallback_lists_exact_names() {
     std::fs::create_dir(tmp.0.join("a -> b")).unwrap();
     std::fs::write(tmp.0.join("line\nbreak"), "12345").unwrap();
     std::fs::write(tmp.0.join(".hidden"), "").unwrap();
-    #[cfg(unix)]
     std::os::unix::fs::symlink("a -> b", tmp.0.join("link")).unwrap();
     let script = remote_script(tmp.0.to_str().unwrap());
     let fallback = script.replace("if find . -maxdepth 0 -printf '' >/dev/null 2>&1", "if false");
@@ -842,11 +841,8 @@ fn lists_a_local_directory_in_the_background() {
     tmp.write(".hidden", "");
     tmp.mkdir("sub");
     tmp.write("sub/inner", "x");
-    #[cfg(unix)]
-    {
-        std::os::unix::fs::symlink(tmp.0.join("sub"), tmp.0.join("link")).unwrap();
-        std::os::unix::fs::symlink(tmp.0.join("nowhere"), tmp.0.join("dangling")).unwrap();
-    }
+    std::os::unix::fs::symlink(tmp.0.join("sub"), tmp.0.join("link")).unwrap();
+    std::os::unix::fs::symlink(tmp.0.join("nowhere"), tmp.0.join("dangling")).unwrap();
     let wakes = Arc::new(AtomicUsize::new(0));
     let counter = Arc::clone(&wakes);
     let wake: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
@@ -857,21 +853,14 @@ fn lists_a_local_directory_in_the_background() {
     settle(&mut pane);
     assert!(wakes.load(Ordering::Relaxed) >= 2);
     assert!(!pane.poll(), "nothing left to apply");
-    let expected: &[&str] = if cfg!(unix) {
-        &["..", "link", "sub", "a.txt", "b c.txt", "dangling"]
-    } else {
-        &["..", "sub", "a.txt", "b c.txt"]
-    };
-    assert_eq!(rows(&pane, Side::Left), expected);
+    assert_eq!(rows(&pane, Side::Left), ["..", "link", "sub", "a.txt", "b c.txt", "dangling"]);
     assert_eq!(rows(&pane, Side::Right), ["..", "inner"]);
     let entries = &pane.panel(Side::Left).entries;
     let find = |name: &str| entries.iter().find(|e| e.name == name).unwrap();
     assert_eq!(find("a.txt").size, 5);
     assert!((find("a.txt").mtime - unix_seconds(SystemTime::now())).abs() < 3600);
-    if cfg!(unix) {
-        assert!(find("link").is_dir && find("link").is_link);
-        assert!(!find("dangling").is_dir && find("dangling").is_link);
-    }
+    assert!(find("link").is_dir && find("link").is_link);
+    assert!(!find("dangling").is_dir && find("dangling").is_link);
     let (_, text) = render(&mut pane, 100, 12);
     assert!(text.iter().any(|row| row.starts_with(" a.txt") && row.contains("5 B")), "{text:#?}");
     // Into `sub` and back up.
@@ -948,7 +937,6 @@ fn fake_pane(left: Location, right: Location, timeout: Duration) -> FilesPane {
     FilesPane::with_ssh(left, right, noop(), Ssh { program: "sh".to_owned(), timeout })
 }
 
-#[cfg(unix)]
 #[test]
 fn lists_a_remote_directory_through_ssh() {
     let tools = TempDir::new("ssh");
@@ -988,7 +976,6 @@ fn lists_a_remote_directory_through_ssh() {
     assert_eq!(remote_path(pane.location(Side::Left)), format!("{}/dir it's $HOME", home.text()));
 }
 
-#[cfg(unix)]
 #[test]
 fn remote_listing_falls_back_to_ls() {
     let tools = TempDir::new("ls-tools");
@@ -1021,7 +1008,6 @@ fn remote_listing_falls_back_to_ls() {
     assert!((find("sp ace").mtime - unix_seconds(SystemTime::now())).abs() < 2 * 86_400);
 }
 
-#[cfg(unix)]
 #[test]
 fn ssh_failures_and_timeouts_are_shown() {
     let tools = TempDir::new("fail");

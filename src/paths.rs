@@ -50,41 +50,33 @@ fn safe_chain(path: &Path) -> bool {
 }
 
 fn safe_chain_at(path: &Path, depth: usize) -> bool {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        use std::path::Component;
-        if depth > 8 || !path.is_absolute() {
+    use std::os::unix::fs::MetadataExt;
+    use std::path::Component;
+    if depth > 8 || !path.is_absolute() {
+        return false;
+    }
+    // SAFETY: getuid cannot fail.
+    let uid = unsafe { libc::getuid() };
+    let mut at = PathBuf::new();
+    for part in path.components() {
+        match part {
+            Component::RootDir => at.push("/"),
+            Component::Normal(name) => at.push(name),
+            // `.` and `..` would go through links: each step of the path is named.
+            _ => return false,
+        }
+        let Ok(m) = std::fs::symlink_metadata(&at) else { return false };
+        let owner_ok = m.uid() == uid || m.uid() == 0;
+        let ok = if m.file_type().is_symlink() {
+            owner_ok && at.canonicalize().is_ok_and(|target| safe_chain_at(&target, depth + 1))
+        } else {
+            m.is_dir() && owner_ok && (m.mode() & 0o022 == 0 || m.mode() & 0o1000 != 0)
+        };
+        if !ok {
             return false;
         }
-        // SAFETY: getuid cannot fail.
-        let uid = unsafe { libc::getuid() };
-        let mut at = PathBuf::new();
-        for part in path.components() {
-            match part {
-                Component::RootDir => at.push("/"),
-                Component::Normal(name) => at.push(name),
-                // `.` and `..` would go through links: each step of the path is named.
-                _ => return false,
-            }
-            let Ok(m) = std::fs::symlink_metadata(&at) else { return false };
-            let owner_ok = m.uid() == uid || m.uid() == 0;
-            let ok = if m.file_type().is_symlink() {
-                owner_ok && at.canonicalize().is_ok_and(|target| safe_chain_at(&target, depth + 1))
-            } else {
-                m.is_dir() && owner_ok && (m.mode() & 0o022 == 0 || m.mode() & 0o1000 != 0)
-            };
-            if !ok {
-                return false;
-            }
-        }
-        true
     }
-    #[cfg(not(unix))]
-    {
-        let _ = (path, depth);
-        true
-    }
+    true
 }
 
 /// Directory holding one control socket per running session.
@@ -101,21 +93,18 @@ fn runtime_dir_in(xdg: Option<PathBuf>) -> PathBuf {
 /// private (0700). Refuses symlinks and directories owned by someone else: a socket in such a
 /// place could be read or replaced by another user.
 pub fn ensure_private_dir(dir: &std::path::Path) -> std::io::Result<()> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
     std::fs::create_dir_all(dir)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::{MetadataExt, PermissionsExt};
-        let meta = std::fs::symlink_metadata(dir)?;
-        let uid = unsafe { libc::getuid() };
-        if !meta.is_dir() || meta.uid() != uid {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::PermissionDenied,
-                format!("{} is not a directory owned by you; refusing to use it", dir.display()),
-            ));
-        }
-        if meta.mode() & 0o077 != 0 {
-            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
-        }
+    let meta = std::fs::symlink_metadata(dir)?;
+    let uid = unsafe { libc::getuid() };
+    if !meta.is_dir() || meta.uid() != uid {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!("{} is not a directory owned by you; refusing to use it", dir.display()),
+        ));
+    }
+    if meta.mode() & 0o077 != 0 {
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
     }
     Ok(())
 }
@@ -196,14 +185,11 @@ fn temp_beside(path: &Path) -> PathBuf {
 /// cannot redirect the data.
 fn write_with_mode(path: &Path, data: &[u8], mode: u32) -> std::io::Result<()> {
     use std::io::Write;
-    #[cfg(unix)]
     use std::os::unix::fs::OpenOptionsExt;
     let tmp = temp_beside(path);
     let mut opts = std::fs::OpenOptions::new();
     opts.write(true).create_new(true);
-    #[cfg(unix)]
     opts.mode(mode).custom_flags(libc::O_NOFOLLOW);
-    let _ = mode;
     let written = opts.open(&tmp).and_then(|mut f| {
         f.write_all(data)?;
         f.sync_all()
@@ -294,13 +280,8 @@ pub fn remove_files_in(dir: &Path, remove: impl Fn(&str) -> bool) -> std::io::Re
 /// Write a file atomically, keeping the permissions it has (0644 when it is new): the user's
 /// configuration files.
 pub fn write_atomic(path: &Path, data: &[u8]) -> std::io::Result<()> {
-    #[cfg(unix)]
-    let mode = {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::metadata(path).map(|m| m.permissions().mode() & 0o7777).unwrap_or(0o644)
-    };
-    #[cfg(not(unix))]
-    let mode = 0o644;
+    use std::os::unix::fs::PermissionsExt;
+    let mode = std::fs::metadata(path).map(|m| m.permissions().mode() & 0o7777).unwrap_or(0o644);
     write_with_mode(path, data, mode)
 }
 
@@ -312,7 +293,6 @@ pub fn read_regular(path: &Path, cap: u64) -> std::io::Result<Vec<u8>> {
     let mut opts = std::fs::OpenOptions::new();
     opts.read(true);
     // Opening a FIFO without a writer would wait; without blocking, its type is checked first.
-    #[cfg(unix)]
     std::os::unix::fs::OpenOptionsExt::custom_flags(&mut opts, libc::O_NONBLOCK);
     let file = opts.open(path)?;
     let meta = file.metadata()?;
@@ -466,21 +446,13 @@ fn legacy_runtime_dir_in(xdg: Option<PathBuf>, tmp: PathBuf) -> PathBuf {
 /// Whether `socket` is ours, in a directory of ours only we can enter: a socket elsewhere could
 /// be another user's, standing in for a session.
 fn ours_and_private(socket: &Path) -> bool {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::{FileTypeExt, MetadataExt};
-        let uid = unsafe { libc::getuid() };
-        let dir_ok = socket
-            .parent()
-            .and_then(|d| std::fs::symlink_metadata(d).ok())
-            .is_some_and(|m| m.is_dir() && m.uid() == uid && m.mode() & 0o077 == 0);
-        dir_ok && std::fs::symlink_metadata(socket).is_ok_and(|m| m.file_type().is_socket() && m.uid() == uid)
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = socket;
-        false
-    }
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+    let uid = unsafe { libc::getuid() };
+    let dir_ok = socket
+        .parent()
+        .and_then(|d| std::fs::symlink_metadata(d).ok())
+        .is_some_and(|m| m.is_dir() && m.uid() == uid && m.mode() & 0o077 == 0);
+    dir_ok && std::fs::symlink_metadata(socket).is_ok_and(|m| m.file_type().is_socket() && m.uid() == uid)
 }
 
 /// `<dir>/<session>.sock`, or, when that is too long for a socket, a shorter name: the start of
@@ -647,7 +619,6 @@ mod tests {
         assert!(fallback_runtime_base().as_os_str().len() <= RUNTIME_BASE_MAX);
     }
 
-    #[cfg(unix)]
     #[test]
     fn a_session_an_older_kraal_started_stays_reachable() {
         use std::os::unix::fs::PermissionsExt;
@@ -692,7 +663,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
-    #[cfg(unix)]
     #[test]
     fn a_path_is_checked_as_it_is_used_and_a_short_link_of_ours_may_stand_for_a_deep_one() {
         use std::os::unix::fs::PermissionsExt;
@@ -788,7 +758,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
-    #[cfg(unix)]
     #[test]
     fn a_long_session_name_an_older_kraal_used_stays_reachable() {
         use std::os::unix::fs::PermissionsExt;
@@ -815,7 +784,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
-    #[cfg(unix)]
     #[test]
     fn a_runtime_directory_others_could_swap_is_not_used() {
         use std::os::unix::fs::PermissionsExt;
@@ -845,7 +813,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
-    #[cfg(unix)]
     #[test]
     fn only_small_regular_files_are_read() {
         let dir = std::env::temp_dir().join(format!("kraal-regular-{}", std::process::id()));
@@ -870,7 +837,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    #[cfg(unix)]
     #[test]
     fn private_writes_replace_links_and_loose_files() {
         use std::os::unix::fs::PermissionsExt;
@@ -892,7 +858,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    #[cfg(unix)]
     #[test]
     fn atomic_writes_keep_permissions_and_locked_updates_lose_nothing() {
         use std::os::unix::fs::PermissionsExt;

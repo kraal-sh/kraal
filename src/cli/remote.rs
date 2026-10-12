@@ -528,7 +528,6 @@ mod tests {
         assert!(check_expected([at(&moved)].iter(), &[listed], &ssh).is_err());
     }
 
-    #[cfg(unix)]
     #[test]
     fn remote_install_keeps_the_old_binary_unless_the_copy_works() {
         let home = std::env::temp_dir().join(format!("kraal-install-{}", std::process::id()));

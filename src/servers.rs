@@ -1066,7 +1066,6 @@ mod tests {
 
     /// Whatever ssh command line kraal saw, the options it writes back make ssh go the same way
     /// with the same keys, ~/.ssh/config included: checked with the local `ssh -G`.
-    #[cfg(unix)]
     #[test]
     fn observed_routes_and_keys_are_what_ssh_uses() {
         let ssh_g = |config: &Path, args: &[String]| -> Option<Vec<String>> {
