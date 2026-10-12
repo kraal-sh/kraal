@@ -906,14 +906,14 @@ fn stacks_and_layouts_from_the_keys() {
     };
     let mut client = RawClient::attach(&env, "w");
     client.wait_for_message("\"attached\"");
-    // 120×40: the panes take rows 1 to 39, a third of the width each.
-    until("three columns", &|| size("alpha") == (37, 37));
+    // 120×40: the panes take rows 1 to 38, between the bars, a third of the width each.
+    until("three columns", &|| size("alpha") == (37, 36));
     env.run(&["focus", "bravo"]);
 
     // Bravo goes right, onto charlie: bravo open in two thirds of the width, charlie folded to
     // the row under it, of the same size.
     client.send(b"\x02Ps\x1b[C");
-    until("stacked", &|| size("bravo") == (78, 36) && size("charlie") == (78, 36));
+    until("stacked", &|| size("bravo") == (78, 35) && size("charlie") == (78, 35));
     assert_eq!(focused(), "bravo");
     // Down goes to the next pane of the stack, which opens.
     client.send(b"\x1b[1;3B");
@@ -921,21 +921,21 @@ fn stacks_and_layouts_from_the_keys() {
     // Bravo is folded to the top row of the stack now: a click on it opens it.
     client.send(b"\x1b[<0;61;2M\x1b[<0;61;2m");
     until("bravo clicked", &|| focused() == "bravo");
-    assert_eq!(size("charlie"), (78, 36), "opening a pane resizes nothing");
-    // Out of the stack again: above charlie, each half of the height.
+    assert_eq!(size("charlie"), (78, 35), "opening a pane resizes nothing");
+    // Out of the stack again: above charlie, each half of the height, frame on frame.
     client.send(b"\x02Pu");
     until("unstacked", &|| size("bravo") == (78, 17) && size("charlie") == (78, 17));
     assert_eq!(focused(), "bravo");
 
     // The layouts, in turn: even columns, even rows, the main pane left, the others stacked.
     client.send(b"\x02Pl");
-    until("columns", &|| size("alpha") == (37, 37) && size("charlie") == (38, 37));
+    until("columns", &|| size("alpha") == (37, 36) && size("charlie") == (38, 36));
     client.send(b"\x02Pl");
     until("rows", &|| size("alpha").0 == 118 && size("charlie").0 == 118);
     client.send(b"\x02Pl");
-    until("main left", &|| size("alpha") == (69, 37) && size("bravo").0 == 46);
+    until("main left", &|| size("alpha") == (69, 36) && size("bravo").0 == 46);
     client.send(b"\x02Pl");
-    until("main left, stacked", &|| size("bravo") == (46, 36) && size("charlie") == (46, 36));
+    until("main left, stacked", &|| size("bravo") == (46, 35) && size("charlie") == (46, 35));
     assert_eq!(focused(), "bravo");
 
     // A restart brings the stack and the layout back.
@@ -945,10 +945,10 @@ fn stacks_and_layouts_from_the_keys() {
     assert!(state.contains("\"stacked\": true") && state.contains("\"preset\": \"main-left-stacked\""), "{state}");
     env.run(&["open", "w"]);
     until("restored", &|| panes().len() == 3);
-    until("stacked again", &|| size("bravo") == (46, 36) && size("charlie") == (46, 36) && size("alpha") == (69, 37));
+    until("stacked again", &|| size("bravo") == (46, 35) && size("charlie") == (46, 35) && size("alpha") == (69, 36));
     // The layout is still the tab's: a pane that comes joins the stack.
     env.run(&["run", "-t", "alpha", "--name", "delta", "--", "sh"]);
-    until("delta stacked", &|| panes().len() == 4 && size("delta") == (46, 35) && size("bravo") == (46, 35));
+    until("delta stacked", &|| panes().len() == 4 && size("delta") == (46, 34) && size("bravo") == (46, 34));
 
     // Saved, the stack is `stacked=true`, with the pane open `expanded=true`, and opens as one.
     env.run(&["save", "copy", "--workspace", "w"]);
@@ -967,7 +967,7 @@ fn stacks_and_layouts_from_the_keys() {
         sizes.sort();
         sizes
     };
-    until("the copy opens stacked", &|| copies() == [(46, 35), (46, 35), (46, 35), (69, 37)]);
+    until("the copy opens stacked", &|| copies() == [(46, 34), (46, 34), (46, 34), (69, 36)]);
 }
 
 #[test]
@@ -3134,9 +3134,8 @@ fn an_agent_worktree_is_prepared_in_its_pane_once_trusted() {
     std::fs::write(repo.join(".kraal/worktree.toml"), "setup = [\"echo changed\"]\n").unwrap();
     git(&["commit", "-q", "-am", "changed"]);
     new_worktree(&mut client, "no");
-    client.screen.lock().unwrap().clear();
     client.send(b"n");
-    client.wait_for_screen("was not created");
+    client.wait_for_row("the worktree no was not created");
     assert!(!dir.join("no").exists());
 
     // Both worktrees have nothing to lose: they go, with their agents' panes.
@@ -3494,14 +3493,43 @@ fn a_pane_is_told_when_the_terminal_loses_and_regains_the_focus() {
     env.wait_for_text("app", "^[[I^[[O^[[I^[[O^[[I");
 }
 
+/// A terminal of `cols × rows` after `bytes`.
+fn emulate(
+    bytes: &[u8],
+    cols: usize,
+    rows: usize,
+) -> alacritty_terminal::Term<alacritty_terminal::event::VoidListener> {
+    use alacritty_terminal::term::{Config, Term, test::TermSize};
+    let mut term = Term::new(Config::default(), &TermSize::new(cols, rows), alacritty_terminal::event::VoidListener);
+    let mut parser: alacritty_terminal::vte::ansi::Processor = alacritty_terminal::vte::ansi::Processor::new();
+    parser.advance(&mut term, bytes);
+    term
+}
+
+/// The text of each row a terminal of `cols × rows` shows after `bytes`.
+fn text_after(bytes: &[u8], cols: usize, rows: usize) -> Vec<String> {
+    use alacritty_terminal::index::{Column, Line};
+    use alacritty_terminal::term::cell::Flags;
+    let term = emulate(bytes, cols, rows);
+    let grid = term.grid();
+    (0..rows)
+        .map(|y| {
+            let row = &grid[Line(y as i32)];
+            (0..cols)
+                .map(|x| &row[Column(x)])
+                .filter(|c| !c.flags.contains(Flags::WIDE_CHAR_SPACER))
+                .map(|c| c.c)
+                .collect()
+        })
+        .collect()
+}
+
 /// What a terminal of `cols × rows` shows after `bytes`: each row's cells (text, colours,
 /// attributes, link) and the cursor.
 fn terminal_after(bytes: &[u8], cols: usize, rows: usize) -> Vec<String> {
     use alacritty_terminal::index::{Column, Line};
-    use alacritty_terminal::term::{Config, Term, TermMode, test::TermSize};
-    let mut term = Term::new(Config::default(), &TermSize::new(cols, rows), alacritty_terminal::event::VoidListener);
-    let mut parser: alacritty_terminal::vte::ansi::Processor = alacritty_terminal::vte::ansi::Processor::new();
-    parser.advance(&mut term, bytes);
+    use alacritty_terminal::term::TermMode;
+    let term = emulate(bytes, cols, rows);
     let grid = term.grid();
     let mut out: Vec<String> = (0..rows)
         .map(|y| {
@@ -3529,6 +3557,31 @@ fn terminal_after(bytes: &[u8], cols: usize, rows: usize) -> Vec<String> {
 }
 
 impl RawClient {
+    /// The text of each row its terminal (120×40) shows.
+    fn rows(&self) -> Vec<String> {
+        text_after(&self.screen.lock().unwrap(), 120, 40)
+    }
+
+    /// Wait until its terminal shows `text` on a row; the rows then. Unlike
+    /// [`RawClient::wait_for_screen`], this finds text drawn over cells that already had some of
+    /// it, which a frame leaves out.
+    fn wait_for_row(&self, text: &str) -> Vec<String> {
+        self.wait_for_rows(text, |rows| rows.iter().any(|r| r.contains(text)))
+    }
+
+    /// Wait until the rows its terminal shows are `what` says (`done`); the rows then.
+    fn wait_for_rows(&self, what: &str, done: impl Fn(&[String]) -> bool) -> Vec<String> {
+        let start = Instant::now();
+        loop {
+            let rows = self.rows();
+            if done(&rows) {
+                return rows;
+            }
+            assert!(start.elapsed() < Duration::from_secs(10), "never {what}:\n{}", rows.join("\n"));
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
     /// Wait until nothing more is drawn for a while; how much was drawn.
     fn settle(&self) -> usize {
         let mut seen = self.screen.lock().unwrap().len();
@@ -3659,7 +3712,7 @@ fn rows_brought_back_from_the_history_are_drawn() {
     env.run(&["send", "-p", "log", "seq 1 4000; echo ENDS\r"]);
     let mut client = RawClient::attach(&env, "w");
     client.wait_for_screen("ENDS");
-    // The pane's rows, below the top bar (it shows the client's mode), compared.
+    // The pane's rows, between the bars (they show the client's mode), compared.
     let same = |client: &RawClient, step: &str| {
         client.settle();
         let fresh = RawClient::attach(&env, "w");
@@ -3667,7 +3720,7 @@ fn rows_brought_back_from_the_history_are_drawn() {
         client.settle();
         let (a, b) = (client.screen.lock().unwrap().clone(), fresh.screen.lock().unwrap().clone());
         let (a, b) = (terminal_after(&a, 120, 40), terminal_after(&b, 120, 40));
-        for (y, (a, b)) in a.iter().zip(&b).enumerate().take(40).skip(1) {
+        for (y, (a, b)) in a.iter().zip(&b).enumerate().take(39).skip(1) {
             assert_eq!(a, b, "{step}: row {y} differs");
         }
         drop(fresh);
@@ -3698,6 +3751,54 @@ fn rows_brought_back_from_the_history_are_drawn() {
     client.send(b"\x1b");
     std::thread::sleep(Duration::from_millis(100));
     same(&client, "back at the bottom");
+}
+
+/// The last row shows what can be done in the focused pane, with its keys, and the menu key at
+/// the right end; `ctrl+b V k` gives the row to the panes, and the menu key goes to the top bar.
+#[test]
+fn the_bottom_bar_shows_the_focused_panes_actions() {
+    let env = Env::new("bottombar");
+    std::fs::create_dir_all(env.root.join("state/kraal")).unwrap();
+    std::fs::write(env.root.join("state/kraal/welcomed"), "").unwrap();
+    // A fake ssh: a shell "on the server".
+    let ssh = env.root.join("bin/ssh");
+    std::fs::create_dir_all(ssh.parent().unwrap()).unwrap();
+    write_script(&ssh, "#!/bin/sh\nexec sh\n");
+    env.workspace("w", "layout {\n    pane name=\"main\"\n}\n");
+    env.run(&["open", "w"]);
+    let height = |name: &str| -> u64 {
+        let panes: serde_json::Value = serde_json::from_str(&env.run(&["panes", "--json"])).unwrap();
+        panes.as_array().unwrap().iter().find(|p| p["name"] == name).unwrap()["rows"].as_u64().unwrap()
+    };
+    let mut client = RawClient::attach(&env, "w");
+    let shown = client.wait_for_row("alt+n new pane");
+    let last = shown[39].trim();
+    assert!(last.starts_with("alt+n new pane  ctrl+b P → split  ctrl+b s connect to a server"), "{last}");
+    assert!(last.ends_with("ctrl+b menu") && !shown[0].contains("menu"), "{shown:?}");
+    assert_eq!(height("main"), 36, "the panes end above the bar");
+
+    env.run(&["run", "--name", "web", "--", &ssh.display().to_string(), "web-prod-1"]);
+    env.run(&["focus", "web"]);
+    let shown = client.wait_for_row("web-prod-1 ▸ ctrl+b f its files  ctrl+b r tools there  ctrl+b S d download");
+    assert!(shown[39].trim_end().ends_with("ctrl+b menu"), "{shown:?}");
+
+    // A click on the menu key opens the menu (mouse columns count from 1).
+    let col = shown[39].chars().count() - "menu ".len() + 1;
+    client.send(format!("\x1b[<0;{col};40M\x1b[<0;{col};40m").as_bytes());
+    client.wait_for_row("Connect to a server");
+    client.send(b"\x1b");
+
+    // Off for the session: the panes get the row, the menu key goes to the top bar.
+    client.send(b"\x02Vk");
+    let shown = client.wait_for_rows("the menu key on top", |rows| rows[0].contains("ctrl+b menu"));
+    assert!(!shown[39].contains("its files"), "{shown:?}");
+    let start = Instant::now();
+    while height("main") != 37 {
+        assert!(start.elapsed() < Duration::from_secs(10), "the panes never got the row");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    client.send(b"\x02Vk");
+    client.wait_for_row("web-prod-1 ▸ ctrl+b f its files");
 }
 
 #[test]

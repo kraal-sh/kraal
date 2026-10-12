@@ -12,6 +12,9 @@ save_scrollback = true   # panes show their text again after a restart; it is wr
 visible = true
 width = 28
 
+[bar]
+keys = "context"         # the focused pane's actions on the last row; "off": none
+
 [notifications]
 mode = "terminal"        # terminal, system, both, off
 
@@ -28,9 +31,9 @@ toggle_floating = ["alt+f"]
 
 `kraal config check` validates the config, every workspace file, `accounts.toml` and
 `servers.toml`; it fails when one cannot be read. `kraal config reload` makes the running session
-read the config again: keys, theme, sidebar, mouse, pane frames, notifications, tools, hints, hooks,
-production words, contexts, saving scrollback and the paste buffers' settings apply at once; panes
-already open keep their shell and scrollback length.
+read the config again: keys, theme, sidebar, bottom bar, mouse, pane frames, notifications, tools,
+hints, hooks, production words, contexts, saving scrollback and the paste buffers' settings apply at
+once; panes already open keep their shell and scrollback length.
 
 `save_scrollback` saves what each pane shows, its scrollback included, in
 `~/.local/state/kraal/scrollback`, so that panes show it again after a restart (see

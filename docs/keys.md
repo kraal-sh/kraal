@@ -22,7 +22,7 @@ any keyboard layout.
 | agents | `a` start one on an account | `A`: `a` start, `g` go to the agent needing you, `c` change account |
 | tabs | `t` new tab | `T`: `t` new, `←`/`→` previous/next, `e` rename, `x` close |
 | panes | `p` find a pane | `P`: `p` find, `n` new, `→`/`↓` split, `e` rename, `r` resize with the arrows, `f` floating, `l` next layout, `s` then an arrow stack with the pane on that side, `u` unstack, `x` close |
-| view | `v` copy mode: scroll and select | `V`: `v` copy mode, `g` search the output, `o` links and paths, `c` copy the last command's output, `p` paste buffers, `f` floating panes, `l` sidebar, `j` message log |
+| view | `v` copy mode: scroll and select | `V`: `v` copy mode, `g` search the output, `o` links and paths, `c` copy the last command's output, `p` paste buffers, `f` floating panes, `l` sidebar, `k` bottom bar, `j` message log |
 | files | `f` file manager | `F`: `f` file manager, `p` preview a file, `u`/`d` upload/download |
 | run | `r` tools where the pane is | `R`: `r` tools, `b` runbooks, `g` git and worktrees |
 
@@ -47,6 +47,24 @@ Without the prefix: `alt+arrows` move the focus (left/right at the edge go to th
 
 `[keys] preset = "classic"` switches to single-key commands (`%` `"` `c` `n` `p`
 `o` `s` `=`…), still with the menu.
+
+## The bottom bar
+
+The last row shows what can be done in the focused pane, the most useful first, each with the
+keys that do it in your keymap, and the menu key at the right end:
+
+| Focused pane | |
+|---|---|
+| on a server (its name in red in production) | its files `ctrl+b f`, the tools there `ctrl+b r`, download `ctrl+b S d`, upload `ctrl+b S u` |
+| an agent (its name and state) | switch its account `ctrl+b A c` (one kraal started), review its worktree `ctrl+b R g` (when it works in one), the next agent needing you `alt+a`, a new agent `ctrl+b a` |
+| in a git repository | git and worktrees `ctrl+b R g`, tools `ctrl+b r`, new pane `alt+n`, split `ctrl+b P →`, start an agent `ctrl+b a` |
+| a shell | new pane, split, connect to a server `ctrl+b s`, start an agent |
+| a preview | its own keys: `↑↓` scroll, `r` reload, `q` close |
+
+A click on an action runs it, and a click on the menu key opens the menu. When the terminal is
+narrow, actions give way from the right. `ctrl+b V k` hides the bar, or shows it again, for the
+session; `[bar] keys = "off"` in the configuration hides it for good. Without it, the panes take
+the row and the menu key goes to the top bar.
 
 ## Stacks and layouts
 
@@ -96,12 +114,14 @@ new_pane = ["alt+n"]
 `kraal config keys` prints every key, menu and mode, with the names to use here (`--markdown`
 for a sheet to keep or print); `kraal config check` reports a key bound twice or a sequence that
 hides another; `kraal config reload` applies the file to the running session (keys, theme,
-sidebar, mouse, frames, tools, hints, hooks; new panes take a new shell or scrollback length).
+sidebar, bottom bar, mouse, frames, tools, hints, hooks; new panes take a new shell or scrollback
+length).
 
 ## Mouse
 
 The mouse works too: click to focus panes, tabs, workspaces and agents (a click on the workspace
-name opens the list, a click on a folded pane's row opens it); drag borders to resize; drag floating panes by their title; wheel to scroll
+name opens the list, a click on a folded pane's row opens it), or to run an action of the bottom
+bar; drag borders to resize; drag floating panes by their title; wheel to scroll
 back; drag to select and copy (double click selects a word, triple click a line); Ctrl+click opens
 a link (OSC 8 links stay clickable, and plain URLs work too). Hold Shift to use your terminal's own
 selection.

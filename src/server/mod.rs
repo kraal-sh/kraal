@@ -5,6 +5,7 @@
 
 mod agents;
 mod attention;
+mod bottom_bar;
 mod buffers;
 mod clients;
 mod commands;
@@ -540,6 +541,8 @@ pub struct Server {
     tilings: std::cell::RefCell<Vec<geometry::Tiling>>,
     /// Whether the sidebar had something to show at the last tick.
     sidebar_was_useful: bool,
+    /// Whether the bottom bar shows: as `[bar] keys` says, until toggled for the session.
+    pub bottom_bar: bool,
     /// Whether a client was told how to stop the broadcast its key started.
     pub broadcast_tip_shown: bool,
     /// What was copied, to paste again, and named text (`kraal buffer`).
@@ -634,6 +637,7 @@ pub fn run(session: &str) -> Result<()> {
     let (theme, tw) = crate::theme::Theme::from_config(&config.theme);
     crate::theme::set(theme);
     warnings.extend(tw);
+    let bottom_bar = config.bar.keys != crate::config::BarKeys::Off;
 
     let (tx, rx) = crossbeam_channel::bounded::<Event>(4096);
     let persist_tx = tx.clone();
@@ -697,7 +701,8 @@ pub fn run(session: &str) -> Result<()> {
         clients: HashMap::new(),
         next_id: 1,
         primary: None,
-        layout_area: Rect::new(0, 1, 120, 39),
+        // A 120×40 terminal's, until a client attaches.
+        layout_area: Rect::new(0, 1, 120, 39 - u16::from(bottom_bar)),
         waits: Vec::new(),
         persist_dirty: false,
         last_persist: Instant::now(),
@@ -744,6 +749,7 @@ pub fn run(session: &str) -> Result<()> {
         focus_reported: Default::default(),
         held_input: Vec::new(),
         sidebar_was_useful: false,
+        bottom_bar,
         turn_skipped: false,
         typed_quietly: false,
         chrome_gen: 0,

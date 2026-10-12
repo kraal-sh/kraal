@@ -11,6 +11,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Widget};
 use unicode_width::UnicodeWidthStr;
 
+use super::bottom_bar::BottomBar;
 use super::overlays;
 use super::ui::Mode;
 use super::{Client, ClientId, Server};
@@ -115,8 +116,8 @@ pub struct FrameMemo {
     looks: Looks,
 }
 
-/// What a part of the chrome (the top bar, the sidebar) is made from, besides the client: the
-/// chrome's generation, and the facts of the panes it shows, by version. The same make the same.
+/// What a part of the chrome (a bar, the sidebar) is made from, besides the client: the chrome's
+/// generation, and the facts of the panes it shows, by version. The same make the same.
 #[derive(PartialEq, Default)]
 struct Inputs {
     chrome: u64,
@@ -152,6 +153,8 @@ struct Chrome {
     sidebar_from: Inputs,
     bar: TopBar,
     bar_from: Inputs,
+    bottom: BottomBar,
+    bottom_from: Inputs,
     frames: Frames,
     /// The rows of the panes folded in stacks, and their frames' looks.
     folds: Vec<(PaneId, Rect)>,
@@ -175,7 +178,8 @@ struct FrameLook {
 }
 
 /// The panes are drawn apart, on their own cells: none floats, no tile (or row of a pane folded
-/// in a stack, `folds`) overlaps another, the sidebar (`side`) or the top bar.
+/// in a stack, `folds`) overlaps another, the sidebar (`side`) or the top bar (their screen ends
+/// above the bottom bar).
 fn apart(placed: &[Placed], folds: &[(PaneId, Rect)], side: Rect) -> bool {
     let places: Vec<Rect> = placed.iter().map(|p| p.tile).chain(folds.iter().map(|(_, r)| *r)).collect();
     !placed.iter().any(|p| p.floating)
@@ -354,18 +358,21 @@ impl Server {
         let sidebar = self.sidebar_shown(c);
         let rows = c.rows;
         let cols = c.cols;
+        // The panes and the sidebar end above the bottom bar.
+        let screen = Rect::new(0, 0, cols, rows - self.bottom_rows());
+        let bottom_row = Rect::new(0, screen.bottom(), cols, self.bottom_rows());
         let sw = if sidebar { self.sidebar_width(cols) } else { 0 };
-        let side = Rect::new(0, 0, sw, if sw > 0 { rows } else { 0 });
+        let side = Rect::new(0, 0, sw, if sw > 0 { screen.height } else { 0 });
 
         let folds = self
             .ws_index(c.workspace)
             .map_or_else(Vec::new, |wi| self.stack_rows(self.workspaces[wi].tab(), self.layout_area));
-        let placed = self.place_panes(id, (full, side), &folds, (!covered).then_some(&mut memo));
+        let placed = self.place_panes(id, (screen, side), &folds, (!covered).then_some(&mut memo));
         let c = &self.clients[&id];
         let mut looks = Vec::with_capacity(memo.looks.len());
         let (frames, fold_looks) = self.frame_looks(id, &placed, &folds, (&memo.looks, &mut looks));
         memo.looks = looks;
-        // The bar and the sidebar made from the same inputs as the last frame's are the same:
+        // The bars and the sidebar made from the same inputs as the last frame's are the same:
         // they are taken from it rather than made again.
         let mut last = memo.chrome.take();
         let bar_from = self.bar_inputs(c);
@@ -379,6 +386,12 @@ impl Server {
             None if sw > 0 => (self.sidebar_rows(c, side.height), false),
             None => (Vec::new(), false),
         };
+        let bottom_from = if self.bottom_bar { self.bottom_inputs(c) } else { Inputs::default() };
+        let (bottom, bottom_same) = match last.as_mut().filter(|l| self.bottom_bar && l.bottom_from == bottom_from) {
+            Some(l) => (std::mem::take(&mut l.bottom), true),
+            None if self.bottom_bar => (self.bottom_bar(c), false),
+            None => (BottomBar::default(), false),
+        };
         let chrome = Chrome {
             theme: th(),
             side,
@@ -387,6 +400,8 @@ impl Server {
             sidebar_from,
             bar,
             bar_from,
+            bottom,
+            bottom_from,
             frames,
             folds,
             fold_looks,
@@ -400,7 +415,7 @@ impl Server {
             (Some(a), Some(b)) => !Rc::ptr_eq(a, b) && a != b,
             (a, b) => a.is_some() != b.is_some(),
         };
-        let (kept, sidebar_changed, bar_changed, frames_changed, folds_changed) = match &last {
+        let (kept, sidebar_changed, bar_changed, bottom_changed, frames_changed, folds_changed) = match &last {
             Some(last) => {
                 let mut changed = Changed::new(full);
                 let sidebar_changed = !sidebar_same && last.sidebar != chrome.sidebar;
@@ -410,6 +425,10 @@ impl Server {
                 let bar_changed = !bar_same && last.bar != chrome.bar;
                 if bar_changed {
                     changed.rect(Rect::new(side.right(), 0, cols.saturating_sub(side.right()), 1));
+                }
+                let bottom_changed = !bottom_same && last.bottom != chrome.bottom;
+                if bottom_changed {
+                    changed.rect(bottom_row);
                 }
                 let frames: Vec<bool> =
                     chrome.frames.iter().zip(&last.frames).map(|(now, then)| differs(now, then)).collect();
@@ -434,9 +453,9 @@ impl Server {
                         _ => changed.rect(p.inner),
                     }
                 }
-                (changed.kept(), sidebar_changed, bar_changed, frames, folds)
+                (changed.kept(), sidebar_changed, bar_changed, bottom_changed, frames, folds)
             }
-            None => (kept_rows(&placed), true, true, vec![true; placed.len()], vec![true; chrome.folds.len()]),
+            None => (kept_rows(&placed), true, true, true, vec![true; placed.len()], vec![true; chrome.folds.len()]),
         };
         clear_except(buf, &kept);
 
@@ -445,6 +464,9 @@ impl Server {
         }
         if bar_changed {
             Self::draw_top_bar(&chrome.bar, cols, buf);
+        }
+        if bottom_changed {
+            chrome.bottom.draw(bottom_row.y, buf);
         }
         let mut links = crate::ansi::Links::new();
         let mut cursor = self.draw_panes(
@@ -595,11 +617,11 @@ impl Server {
 
     // ---- top bar ----------------------------------------------------------------------
 
-    /// The one bar, on the first row, right of the sidebar. Left: the workspace when there is no
+    /// The top bar, on the first row, right of the sidebar. Left: the workspace when there is no
     /// sidebar to show it, a broadcast in progress (never hidden), then the tabs, or the keys of
     /// the mode in use instead. Right: a message, what the focused pane works on when it has no
-    /// frame, agents across workspaces, the menu key, and the session unless it is the default
-    /// one. When room runs out, the right side gives way first.
+    /// frame, agents across workspaces, the menu key unless the bottom bar shows it, and the
+    /// session unless it is the default one. When room runs out, the right side gives way first.
     pub fn top_bar(&self, c: &Client) -> TopBar {
         let mut bar = TopBar::default();
         let Some(wi) = self.ws_index(c.workspace) else { return bar };
@@ -829,7 +851,8 @@ impl Server {
                 notice.extend(key_list(&[(&k, "go")]));
             }
         }
-        let menu = if normal { key_list(&[(&self.keymap.prefix_label(), "menu")]) } else { Vec::new() };
+        let menu =
+            if normal && !self.bottom_bar { key_list(&[(&self.keymap.prefix_label(), "menu")]) } else { Vec::new() };
         let session = if self.session == "main" {
             Vec::new()
         } else {
@@ -1116,11 +1139,12 @@ impl Server {
 
     pub fn sidebar_hit(&self, id: ClientId, row: u16) -> Option<SideItem> {
         let c = self.clients.get(&id)?;
+        let height = c.rows.saturating_sub(self.bottom_rows());
         // The last row is the box's bottom border, whatever would follow there.
-        if row.saturating_add(1) >= c.rows {
+        if row.saturating_add(1) >= height {
             return None;
         }
-        match self.sidebar_rows(c, c.rows).into_iter().nth(row as usize)? {
+        match self.sidebar_rows(c, height).into_iter().nth(row as usize)? {
             SideRow::Entry { item, .. } => item,
             _ => None,
         }
@@ -1449,6 +1473,13 @@ impl Server {
         Inputs { chrome: self.chrome_gen, panes }
     }
 
+    /// What client `c`'s bottom bar is made from: the chrome's generation and the facts of its
+    /// focused pane. (A client of another width starts its frames afresh.)
+    fn bottom_inputs(&self, c: &Client) -> Inputs {
+        let focus = self.client_focus(c.id).and_then(|p| Some((p, self.pane_facts(p)?.0)));
+        Inputs { chrome: self.chrome_gen, panes: focus.into_iter().collect() }
+    }
+
     /// What a sidebar `height` rows high is made from: the chrome's generation and the facts of
     /// all panes.
     fn sidebar_inputs(&self, height: u16) -> Inputs {
@@ -1664,7 +1695,7 @@ fn clear_except(buf: &mut Buffer, kept: &[Kept]) {
     }
 }
 
-fn spans_width(spans: &[Span]) -> u16 {
+pub(super) fn spans_width(spans: &[Span]) -> u16 {
     spans.iter().map(|s| s.content.width()).sum::<usize>().min(u16::MAX as usize) as u16
 }
 
@@ -1696,7 +1727,7 @@ fn dim_span(text: &str) -> Span<'static> {
 }
 
 /// Keys and what they do: "esc close · ⏎ open".
-fn key_list(list: &[(&str, &str)]) -> Vec<Span<'static>> {
+pub(super) fn key_list(list: &[(&str, &str)]) -> Vec<Span<'static>> {
     let mut out = Vec::new();
     for (i, (k, what)) in list.iter().enumerate() {
         if i > 0 {

@@ -51,6 +51,21 @@ pub struct Border {
     pub span: (u16, u16),
 }
 
+impl Border {
+    /// Whether a press at (`col`, `row`) takes this border: with frames, on the frames either
+    /// side of it and on the column of space between tiles side by side ([`framed`]); without,
+    /// on the first column or row after it.
+    pub fn grabbed_at(&self, col: u16, row: u16, frames: bool) -> bool {
+        let (along, across) = match self.axis {
+            Axis::Row => (col, row),
+            Axis::Column => (row, col),
+        };
+        let space = u16::from(self.axis == Axis::Row);
+        let from = if frames { self.pos.saturating_sub(1 + space) } else { self.pos };
+        (from..=self.pos).contains(&along) && (self.span.0..self.span.1).contains(&across)
+    }
+}
+
 impl Node {
     pub fn leaves(&self) -> Vec<PaneId> {
         let mut out = Vec::new();
@@ -129,7 +144,7 @@ impl Node {
 
     /// Every pane in `area`, in order: the frame of each pane shown whole, and the row of each
     /// pane folded in a stack (marked `true`; one without room has none). With `gaps`, a frame
-    /// leaves space before the places right of it and below it ([`framed`]).
+    /// leaves a column of space before the places right of it ([`framed`]).
     pub fn tiles(&self, area: Rect, gaps: bool) -> Vec<(PaneId, Rect, bool)> {
         let places = self.layout(area);
         let mut out = Vec::new();
@@ -468,11 +483,11 @@ pub fn neighbour(rects: &HashMap<PaneId, Rect>, from: PaneId, dir: Dir, recent: 
 }
 
 /// Where the frame of a place inside `area` goes: the place, less one column of space when a
-/// place is to its right and one row when one is below.
+/// place is to its right. Rows of places touch, frame on frame: a cell is about twice as tall as
+/// it is wide, so a row of space would look twice as wide as that column.
 pub fn framed(place: Rect, area: Rect) -> Rect {
     let right = u16::from(place.right() < area.right() && place.width > 1);
-    let below = u16::from(place.bottom() < area.bottom() && place.height > 1);
-    Rect::new(place.x, place.y, place.width - right, place.height - below)
+    Rect::new(place.x, place.y, place.width - right, place.height)
 }
 
 /// Rows a stack's open pane keeps before the folded ones get theirs: a frame and a line.
@@ -745,18 +760,56 @@ mod tests {
     }
 
     #[test]
-    fn a_stack_keeps_the_space_after_it_and_none_inside() {
+    fn tiles_keep_a_column_between_them_and_their_rows_touch() {
+        let mut n = Node::Leaf(1);
+        n.split(1, Axis::Row, 2);
+        n.split(2, Axis::Column, 3);
+        let want = vec![
+            (1, Rect::new(0, 0, 49, 40), false),
+            (2, Rect::new(50, 0, 50, 20), false),
+            (3, Rect::new(50, 20, 50, 20), false),
+        ];
+        assert_eq!(n.tiles(area(), true), want);
+        assert_eq!(n.tiles(area(), false)[0], (1, Rect::new(0, 0, 50, 40), false), "without frames, no space");
+    }
+
+    #[test]
+    fn a_border_is_grabbed_on_the_frames_either_side_of_it() {
+        let mut n = Node::Leaf(1);
+        n.split(1, Axis::Row, 2);
+        n.split(2, Axis::Column, 3);
+        let borders = n.borders(area());
+        let grabbed = |col, row, frames| {
+            borders.iter().filter(|b| b.grabbed_at(col, row, frames)).map(|b| b.axis).collect::<Vec<_>>()
+        };
+        // Between the columns: the left frame, the space, the right frame.
+        for col in [48, 49, 50] {
+            assert_eq!(grabbed(col, 10, true), [Axis::Row], "{col}");
+        }
+        assert!(grabbed(47, 10, true).is_empty() && grabbed(51, 10, true).is_empty());
+        // Between the rows, which touch: the bottom of the upper frame, the top of the lower one.
+        for row in [19, 20] {
+            assert_eq!(grabbed(70, row, true), [Axis::Column], "{row}");
+        }
+        assert!(grabbed(70, 18, true).is_empty() && grabbed(70, 21, true).is_empty());
+        assert!(grabbed(30, 20, true).is_empty(), "not beside the split");
+        // Without frames, the first column or row after the split.
+        assert_eq!((grabbed(50, 10, false), grabbed(70, 20, false)), (vec![Axis::Row], vec![Axis::Column]));
+        assert!(grabbed(49, 10, false).is_empty() && grabbed(70, 19, false).is_empty());
+    }
+
+    #[test]
+    fn a_stack_folds_its_panes_inside_its_place() {
         let mut n = Node::Split { axis: Axis::Column, children: vec![(stack(&[1, 2], 2), 1.0), (Node::Leaf(3), 1.0)] };
         let tiles = n.tiles(area(), true);
-        assert_eq!(tiles[0], (2, Rect::new(0, 1, 100, 18), false));
+        assert_eq!(tiles[0], (2, Rect::new(0, 1, 100, 19), false));
         assert_eq!(tiles[1], (1, Rect::new(0, 0, 100, 1), true));
         assert_eq!(tiles[2], (3, Rect::new(0, 20, 100, 20), false));
         n.expand(1);
         let tiles = n.tiles(area(), true);
-        assert_eq!(tiles[0], (1, Rect::new(0, 0, 100, 18), false));
-        assert_eq!(tiles[1], (2, Rect::new(0, 18, 100, 1), true), "right under the frame, the space after it");
-        // Without frames, no space at all.
-        assert_eq!(n.tiles(area(), false)[1], (2, Rect::new(0, 19, 100, 1), true));
+        assert_eq!(tiles[0], (1, Rect::new(0, 0, 100, 19), false));
+        assert_eq!(tiles[1], (2, Rect::new(0, 19, 100, 1), true), "under the frame, right above the next row");
+        assert_eq!(n.tiles(area(), false), tiles, "rows touch, with frames or not");
     }
 
     #[test]

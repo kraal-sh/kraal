@@ -13,14 +13,19 @@ pub(super) struct Tiling {
 }
 
 impl Server {
-    /// Main pane area for a client of the given size: below the top bar, one column of space
-    /// right of the sidebar.
+    /// Main pane area for a client of the given size: below the top bar, above the bottom bar,
+    /// one column of space right of the sidebar.
     fn main_area(&self, cols: u16, rows: u16, sidebar: bool) -> Rect {
         let top = 1;
-        let height = rows.saturating_sub(top).max(1);
+        let height = rows.saturating_sub(top + self.bottom_rows()).max(1);
         let left = if sidebar { self.sidebar_width(cols) } else { 0 };
         let left = if left > 0 { left + 1 } else { 0 };
         Rect::new(left, top, cols.saturating_sub(left).max(1), height)
+    }
+
+    /// Rows the bottom bar takes, at the bottom of every client's screen.
+    pub fn bottom_rows(&self) -> u16 {
+        u16::from(self.bottom_bar)
     }
 
     pub fn sidebar_width(&self, cols: u16) -> u16 {
@@ -97,7 +102,7 @@ impl Server {
     }
 
     /// Where a tiled pane's frame goes: its place, less one column of space when a pane is to its
-    /// right and one row when a pane is below.
+    /// right.
     fn tile(&self, outer: Rect) -> Rect {
         if self.config.pane_frames { crate::layout::framed(outer, self.layout_area) } else { outer }
     }
