@@ -148,19 +148,16 @@ impl Buffers {
         let Some(key) = key else {
             return if self.list.is_empty() { Err("no paste buffers yet".into()) } else { Ok(0) };
         };
-        match key.parse::<usize>() {
-            Ok(n) => {
-                let numbered: Vec<usize> = (0..self.list.len()).filter(|i| self.list[*i].name.is_none()).collect();
-                numbered.get(n).copied().ok_or_else(|| match numbered.len() {
-                    0 => format!("no buffer {n}: there is no numbered buffer"),
-                    1 => format!("no buffer {n}: there is one numbered buffer, 0"),
-                    count => format!("no buffer {n}: numbered buffers go from 0 (the newest) to {}", count - 1),
-                })
-            }
-            Err(_) => {
-                self.list.iter().position(|b| b.name.as_deref() == Some(key)).ok_or(format!("no buffer named {key:?}"))
-            }
+        if !is_number(key) {
+            let named = self.list.iter().position(|b| b.name.as_deref() == Some(key));
+            return named.ok_or(format!("no buffer named {key:?}"));
         }
+        let numbered: Vec<usize> = (0..self.list.len()).filter(|i| self.list[*i].name.is_none()).collect();
+        key.parse::<usize>().ok().and_then(|n| numbered.get(n).copied()).ok_or_else(|| match numbered.len() {
+            0 => format!("no buffer {key}: there is no numbered buffer"),
+            1 => format!("no buffer {key}: there is one numbered buffer, 0"),
+            count => format!("no buffer {key}: numbered buffers go from 0 (the newest) to {}", count - 1),
+        })
     }
 
     /// Delete the buffer a command names; the newest without one.
@@ -213,13 +210,19 @@ pub fn check_name(name: &str) -> Result<(), String> {
     if name.is_empty() || name.chars().count() > NAME_MAX {
         return Err(format!("a buffer name has 1 to {NAME_MAX} characters"));
     }
-    if name.chars().all(|c| c.is_ascii_digit()) {
+    if is_number(name) {
         return Err(format!("{name:?} is a number: numbers name the numbered buffers"));
     }
     if !name.chars().all(|c| c.is_alphanumeric() || matches!(c, '-' | '_' | '.' | ':' | '@' | '+')) {
         return Err(format!("{name:?}: a buffer name has letters, digits and - _ . : @ + only"));
     }
     Ok(())
+}
+
+/// Whether a command's key is the number of a numbered buffer: ASCII digits only, so that a
+/// name such as `+0` never stands for buffer 0.
+fn is_number(key: &str) -> bool {
+    !key.is_empty() && key.bytes().all(|b| b.is_ascii_digit())
 }
 
 /// The text on one line, as a list shows it: its lines joined by `sep`, control characters
@@ -371,6 +374,18 @@ mod tests {
         b.copy("x", 0);
         b.copy("y", 0);
         assert_eq!(b.clear(), 2);
+    }
+
+    #[test]
+    fn a_name_that_parses_as_a_number_names_its_own_buffer() {
+        let mut b = Buffers::new(10, 1000);
+        b.copy("numbered", 0);
+        b.set(Some("+0"), "named".into(), 1).unwrap();
+        assert_eq!(b.get(Some("+0")).unwrap().text, "named");
+        assert_eq!(b.delete(Some("+0")).unwrap().text, "named");
+        assert_eq!(b.get(Some("0")).unwrap().text, "numbered", "the numbered buffer is still there");
+        assert!(b.get(Some("+0")).unwrap_err().contains("no buffer named"));
+        assert!(b.get(Some("99999999999999999999999")).unwrap_err().contains("one numbered buffer"));
     }
 
     #[test]
