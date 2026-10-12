@@ -52,8 +52,9 @@ printed, so do not echo them.
 |---|---|
 | `kraal runbook list` | yours and those of the repository you are in (`kraal runbook list --json` for scripts) |
 | `kraal runbook show reload-nginx` | its file and what it would run |
+| `kraal runbook trust deploy` | approves a repository's runbook as it is now (see [Repository runbooks](#repository-runbooks)) |
 | `kraal runbook run reload-nginx --on @prod -p TICKET=OPS-12` | shows the full plan, asks, then runs it; `--on` takes a server, `user@host` or `@group` |
-| `kraal runbook run reload-nginx --on @prod --yes --wait` | for scripts: does not ask, waits for the end, and fails if a server did |
+| `kraal runbook run reload-nginx --on @prod --yes --wait` | for scripts: does not ask about the plan, waits for the end, and fails if a server did |
 | `kraal runbook run deploy --dry-run` | the plan only |
 | `kraal runbook new restart-api --markdown --repo` | a new one from a template: a Markdown document, in the repository you are in |
 | `kraal runbook edit reload-nginx` | opens it in `$VISUAL` or `$EDITOR` |
@@ -73,9 +74,27 @@ become runnable without being rewritten.
 
 ## Repository runbooks
 
-A runbook from a repository runs nothing (not even a `choices_command`) before you have approved
-that version of it; kraal asks again when it changes. On the command line, the plan says that the
-runbook is new or changed, and your yes approves it; so does `--yes`, without a question. What
-runs is the plan you read, kept for ten minutes: a runbook edited meanwhile does not change it,
-and the run is refused when a pane it targets has moved (another server, another directory) or
-gone since.
+A runbook from a repository is a file someone else may have written, and it runs commands on
+your machine and your servers. It runs nothing (not even a `choices_command`) before you have
+approved that version of it, and it needs your approval again when it changes. Approving is an
+act of its own:
+
+- In kraal, the list of runbooks asks whether to trust it, with what it runs, before anything
+  else; a Markdown one asks before its first block is sent.
+- In a terminal, `kraal runbook run deploy` shows the file and asks whether to trust this version,
+  before the plan.
+- `kraal runbook trust deploy` approves the file as it is now, without a question: for scripts,
+  and once you have read it (`kraal runbook show deploy`, which writes out what a terminal would
+  hide or act on, like `\u{1b}`).
+
+`--yes` answers the plan and approves nothing: with it, or without a terminal, a runbook that is
+new or changed is refused, and the message names the command that approves it. Listing a runbook,
+showing it and `--dry-run` only read its file.
+
+An approval is of that file in that repository, where the repository really is: reaching the
+checkout through a link changes nothing, and a link that comes to lead to another checkout takes
+no approval there.
+
+What runs is the plan you read, kept for ten minutes: a runbook edited meanwhile does not change
+it, and the run is refused when a pane it targets has moved (another server, another directory)
+or gone since.

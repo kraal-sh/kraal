@@ -78,7 +78,7 @@ impl Server {
         };
         let mut lines = vec![
             format!("Trust the runbook {} from the repository {root}?", d.runbook.name),
-            "It is new, or changed since you last ran it. It runs:".into(),
+            "It is new, or changed since you approved it. It runs:".into(),
         ];
         let steps: Vec<&String> = d.steps.steps.iter().filter(|s| !s.trim().is_empty()).collect();
         for (i, st) in steps.iter().enumerate().take(8) {
@@ -295,10 +295,10 @@ impl Server {
             lines.push(format!("PRODUCTION: {}", prod.join(", ")));
         }
         if let Source::Repo(root) = &d.runbook.source
-            && !runbooks::trusted(&d.runbook)
+            && !d.trusted
         {
             lines.push(format!(
-                "From the repository {}: new or changed since you last ran it. Read the steps.",
+                "From the repository {}: new, or changed since you approved it. It runs once this version is approved.",
                 paths::shorten_home(root)
             ));
         }
@@ -399,14 +399,15 @@ impl Server {
     }
 
     /// Run a plan prepared by [`Server::prepare_runbook`] for the CLI client `reply`, which gets
-    /// the run's number once its targets have started (or why they did not). Seeing the full
-    /// plan of a repository runbook and saying yes trusts that version.
+    /// the run's number once its targets have started (or why they did not). Asking for a plan
+    /// to run approves nothing (whoever asks may have shown it to nobody): a repository
+    /// runbook runs if the version planned is approved by now.
     pub(in crate::server) fn run_prepared(&mut self, token: &str, reply: ClientId) -> Result<()> {
         let (made, mut d) = self.plans.remove(token).context("no such plan: review the runbook again")?;
         if made.elapsed() > PLAN_LIFETIME {
             bail!("the plan is more than 10 minutes old: review the runbook again");
         }
-        d.trusted = true;
+        d.trusted = runbooks::trusted(&d.runbook);
         self.launch_runbook(d, super::Asker { client: None, reply: Some(reply) })
     }
 }

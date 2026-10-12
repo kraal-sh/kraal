@@ -113,24 +113,20 @@ impl Plan {
         Ok(Plan { name: name.to_string(), repo, base, repo_file, user })
     }
 
-    /// What the approval of the repository's file is recorded under.
-    fn trust_key(&self) -> PathBuf {
-        self.repo.join(FILE)
-    }
-
     fn repo_setup(&self) -> Option<&Setup> {
         self.repo_file.as_ref().map(|(_, s)| s)
     }
 
-    /// The repository's commands run only once the user approved this version of its file.
+    /// The repository's commands run only once the user approved this version of its file: the
+    /// file of the main checkout, wherever that really is.
     pub fn needs_trust(&self) -> bool {
         let Some((text, setup)) = &self.repo_file else { return false };
-        setup.commands().next().is_some() && !crate::runbooks::trusted_content(&self.trust_key(), text)
+        setup.commands().next().is_some() && !crate::runbooks::trusted_content(&self.repo, Path::new(FILE), text)
     }
 
     pub fn trust(&self) -> Result<()> {
         match &self.repo_file {
-            Some((text, _)) => crate::runbooks::trust_content(&self.trust_key(), text),
+            Some((text, _)) => crate::runbooks::trust_content(&self.repo, Path::new(FILE), text),
             None => Ok(()),
         }
     }

@@ -192,7 +192,7 @@ impl Server {
             && !runbooks::trusted(&s.runbook)
         {
             let root = paths::shorten_home(root);
-            concerns.push(format!("From the repository {root}: new or changed since you last ran it."));
+            concerns.push(format!("From the repository {root}: new, or changed since you approved it."));
         }
         if let Some(why) = self.pane_production(target)
             && s.approved.as_ref() != Some(&why)

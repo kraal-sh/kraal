@@ -49,6 +49,34 @@ fn read_hidden() -> Result<String> {
     line
 }
 
+/// Ask `question` on the terminal: only a yes is one.
+fn confirmed(question: &str) -> Result<bool> {
+    use std::io::Write;
+    eprint!("{question} [y/N] ");
+    std::io::stderr().flush()?;
+    Ok(matches!(read_line()?.trim(), "y" | "Y" | "yes"))
+}
+
+/// Before the runbook `name` runs: a repository's must be approved as it is now. Approving is an
+/// act of its own, which answering the plan (`--yes`) is not: where someone can `answer`, the
+/// file is shown and the question asked; otherwise the run is refused, with the way to approve.
+fn approve(r: &runbooks::Runbook, name: &str, answer: bool) -> Result<()> {
+    let runbooks::Source::Repo(root) = &r.source else { return Ok(()) };
+    if runbooks::trusted(r) {
+        return Ok(());
+    }
+    anyhow::ensure!(answer, runbooks::not_approved(name, root));
+    println!(
+        "{name} comes from the repository {}. This version of it is new, or changed since you approved it:\n\n{}",
+        paths::shorten_home(root),
+        r.source.shown(&r.content)
+    );
+    if !confirmed("Trust this version?")? {
+        anyhow::bail!("cancelled; {name} is not approved");
+    }
+    runbooks::trust(r)
+}
+
 /// The repository of the current directory, for its runbooks.
 pub(super) fn current_repo() -> Option<std::path::PathBuf> {
     git::status(&std::env::current_dir().ok()?).map(|g| g.root)
@@ -65,7 +93,7 @@ fn find_runbook(name: &str) -> Result<runbooks::Runbook> {
 }
 
 pub(super) fn run(action: RunbookCmd, socket: &std::path::Path, own_pane: Option<String>) -> Result<()> {
-    use std::io::{BufRead, IsTerminal, Write};
+    use std::io::{IsTerminal, Write};
     match action {
         RunbookCmd::List { json } => {
             let (list, errors) = runbooks::all(current_repo().as_deref());
@@ -104,14 +132,29 @@ pub(super) fn run(action: RunbookCmd, socket: &std::path::Path, own_pane: Option
                     runbooks::Source::Repo(root) => format!("  [{}]", paths::shorten_home(root)),
                     runbooks::Source::User => String::new(),
                 };
-                println!("{:<24} {:<8} {}{from}", r.name, kind, r.description());
+                let (name, description) = (r.source.shown(&r.name), r.source.shown(&r.description()));
+                println!("{name:<24} {kind:<8} {description}{from}");
             }
             Ok(())
         }
         RunbookCmd::Show { name } => {
             let r = find_runbook(&name)?;
             println!("{}\n", r.path.display());
-            print!("{}", r.content);
+            print!("{}", r.source.shown(&r.content));
+            Ok(())
+        }
+        RunbookCmd::Trust { name } => {
+            let r = find_runbook(&name)?;
+            match &r.source {
+                runbooks::Source::User => println!("{name} is one of your own runbooks: it needs no approval"),
+                runbooks::Source::Repo(root) => {
+                    runbooks::trust(&r)?;
+                    println!(
+                        "{name}, from the repository {}, is approved as it is now: kraal asks again when it changes",
+                        paths::shorten_home(root)
+                    );
+                }
+            }
             Ok(())
         }
         RunbookCmd::New { name, markdown, repo } => {
@@ -155,11 +198,15 @@ pub(super) fn run(action: RunbookCmd, socket: &std::path::Path, own_pane: Option
                 let (k, v) = p.split_once('=').with_context(|| format!("{p:?}: use NAME=value"))?;
                 values.push((k.to_string(), v.to_string()));
             }
-            // Ask for parameters that have no value and no default, when someone can answer.
             let interactive = std::io::stdin().is_terminal();
+            // A plan runs nothing: it needs no approval.
+            if !dry_run {
+                approve(&r, &name, interactive && !yes)?;
+            }
+            // Ask for parameters that have no value and no default, when someone can answer.
             for p in &steps.params {
                 if p.default.is_none() && !values.iter().any(|(k, _)| k == &p.name) && interactive {
-                    eprint!("{}: ", p.prompt());
+                    eprint!("{}: ", r.source.shown(&p.prompt()));
                     std::io::stderr().flush()?;
                     let line = if p.secret { read_hidden()? } else { read_line()? };
                     values.push((p.name.clone(), line.trim().to_string()));
@@ -169,17 +216,13 @@ pub(super) fn run(action: RunbookCmd, socket: &std::path::Path, own_pane: Option
             let Response::Plan { text, token } = client::request(socket, prepare)? else {
                 anyhow::bail!("unexpected answer from the server")
             };
-            println!("{text}");
+            println!("{}", r.source.shown(&text));
             if dry_run {
                 return Ok(());
             }
             if !yes {
                 anyhow::ensure!(interactive, "add --yes to run it without asking");
-                eprint!("Run it? [y/N] ");
-                std::io::stderr().flush()?;
-                let mut line = String::new();
-                std::io::stdin().lock().read_line(&mut line)?;
-                if !matches!(line.trim(), "y" | "Y" | "yes") {
+                if !confirmed("Run it?")? {
                     anyhow::bail!("cancelled");
                 }
             }
