@@ -4845,14 +4845,22 @@ fn a_pane_opened_in_an_unseen_worktree_gets_its_variables() {
     let mut text = std::fs::read_to_string(&config).unwrap();
     text.push_str("\n[worktrees]\nport_base = 3000\n");
     std::fs::write(&config, text).unwrap();
-    let out = env.cmd(&["wt", "new", "x", "--no-setup"]).current_dir(&repo).output().unwrap();
-    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    for name in ["x", "y"] {
+        let out = env.cmd(&["wt", "new", name, "--no-setup"]).current_dir(&repo).output().unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    }
     let wt = env.root.join("app.worktrees/x");
     env.workspace("w", "layout {\n    pane name=\"sh\"\n}\n");
     env.run(&["open", "w"]);
     let probe = "echo \"idx=$KRAAL_WORKTREE_INDEX offset=$KRAAL_PORT_OFFSET port=$PORT\"; exec sleep 60";
     env.run(&["run", "--name", "probe", "--cwd", &wt.display().to_string(), "--", "sh", "-c", probe]);
     env.wait_for_text("probe", "idx=1 offset=10 port=3010");
+    // Reached through a symbolic link (as /var is /private/var on macOS), while git gives the
+    // worktree's path with its links resolved.
+    std::os::unix::fs::symlink(&env.root, env.root.join("link")).unwrap();
+    let through = env.root.join("link/app.worktrees/y");
+    env.run(&["run", "--name", "linked", "--cwd", &through.display().to_string(), "--", "sh", "-c", probe]);
+    env.wait_for_text("linked", "idx=2 offset=20 port=3020");
 }
 
 /// `kraal wt prune` removes a branch merged by squash (its commits are not in the base's

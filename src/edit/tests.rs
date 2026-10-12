@@ -470,6 +470,24 @@ fn as_root_through_sudo_the_password_is_given_once() {
     std::fs::write(&file, "a\n").unwrap();
     std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o640)).unwrap();
 
+    // A home reached through a symbolic link (as /var is on macOS): the path is in it as the
+    // user knows it, its links not resolved.
+    let linked = t.dir.join("linked-home");
+    std::os::unix::fs::symlink(t.home(), &linked).unwrap();
+    let via_link = t.dir.join("fake-ssh-linked");
+    let (home, bin) = (linked.display().to_string(), t.dir.join("bin").display().to_string());
+    crate::testing::write_script(
+        &via_link,
+        &format!(
+            "#!/bin/sh\nfor a; do last=$a; done\ncd {h} && HOME={h} PATH={b}:$PATH exec sh -c \"$last\"\n",
+            h = crate::shell::quote(&home),
+            b = crate::shell::quote(&bin)
+        ),
+    );
+    let s = Session::start_with(&via_link.display().to_string(), &["server".to_string()], "etc/app.conf").unwrap();
+    assert_eq!(s.path, format!("{home}/etc/app.conf"));
+    drop(s);
+
     let mut s = t.session("etc/app.conf").unwrap();
     assert!(s.needs_password);
     assert_eq!(s.path, file.display().to_string(), "made absolute in the user's home there");

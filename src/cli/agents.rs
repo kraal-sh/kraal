@@ -345,7 +345,7 @@ pub(super) fn worktrees(s: &Session, action: WtCmd) -> Result<()> {
             for (w, state) in git::worktree_states(&cwd)? {
                 let inside: Vec<String> = panes
                     .iter()
-                    .filter(|p| p.cwd.as_ref().is_some_and(|c| c.starts_with(&w.path)))
+                    .filter(|p| p.cwd.as_ref().is_some_and(|c| git::is_within(c, &w.path)))
                     .map(|p| p.name.clone().unwrap_or_else(|| p.id.to_string()))
                     .collect();
                 let kept = match &state {
@@ -392,7 +392,7 @@ pub(super) fn worktrees(s: &Session, action: WtCmd) -> Result<()> {
             // Panes of the running session that work inside it go first, or stop us.
             if let Ok(Response::Panes(panes)) = s.request(Request::ListPanes) {
                 let inside: Vec<&PaneInfo> =
-                    panes.iter().filter(|p| p.cwd.as_ref().is_some_and(|c| c.starts_with(&w.path))).collect();
+                    panes.iter().filter(|p| p.cwd.as_ref().is_some_and(|c| git::is_within(c, &w.path))).collect();
                 if !inside.is_empty() && !force {
                     let names: Vec<String> =
                         inside.iter().map(|p| p.name.clone().unwrap_or_else(|| p.id.to_string())).collect();

@@ -116,25 +116,42 @@ impl Server {
         }
     }
 
-    /// The kraal worktree `cwd` is in, and its number, as known without asking git: from a pane
-    /// kraal started for one, or from what git said about a pane's directory.
+    /// The kraal worktree `cwd` is in, and its number, as known without asking git: what git
+    /// said about that very directory, else from a pane kraal started for one, or from what git
+    /// said about a pane's directory.
     fn worktree_at(&self, cwd: &Path) -> Option<(String, u32)> {
+        // Its branch's name, or with another checked out (a detached HEAD), its own.
+        let named = |g: &GitInfo| {
+            let name = match g.branch.strip_prefix("kraal/") {
+                Some(name) => name.to_string(),
+                None => g.root.file_name()?.to_string_lossy().into_owned(),
+            };
+            Some((name, g.worktree_index))
+        };
+        if let Some(Some(g)) = self.git.get(cwd)
+            && g.worktree_index > 0
+        {
+            return named(g);
+        }
         let started = self
             .panes
             .values()
             .filter_map(|p| p.spec.worktree.as_ref())
-            .find(|w| w.index > 0 && cwd.starts_with(&w.path))
+            .find(|w| w.index > 0 && self.dir_within(cwd, &w.path))
             .map(|w| (w.name(), w.index));
         started.or_else(|| {
-            self.git.values().flatten().filter(|g| g.worktree_index > 0 && cwd.starts_with(&g.root)).find_map(|g| {
-                // Its branch's name, or with another checked out (a detached HEAD), its own.
-                let name = match g.branch.strip_prefix("kraal/") {
-                    Some(name) => name.to_string(),
-                    None => g.root.file_name()?.to_string_lossy().into_owned(),
-                };
-                Some((name, g.worktree_index))
-            })
+            self.git
+                .values()
+                .flatten()
+                .filter(|g| g.worktree_index > 0 && self.dir_within(cwd, &g.root))
+                .find_map(named)
         })
+    }
+
+    /// Whether `dir` is `root` or inside it, `root` as git gives paths (symbolic links resolved):
+    /// `dir` as it is, or as the git thread found it resolved. Nothing is asked of the disk here.
+    fn dir_within(&self, dir: &Path, root: &Path) -> bool {
+        dir.starts_with(root) || self.git.get(dir).and_then(Option::as_ref).is_some_and(|g| g.real.starts_with(root))
     }
 
     /// Whether the variables of a pane to open in `cwd` are still to be found: it may be in a
@@ -158,7 +175,7 @@ impl Server {
             .values()
             .filter(|p| {
                 p.spec.worktree.as_ref().is_some_and(|pw| pw.path == w.path)
-                    || (p.ssh.is_none() && p.current_cwd().is_some_and(|c| c.starts_with(&w.path)))
+                    || (p.ssh.is_none() && p.current_cwd().is_some_and(|c| self.dir_within(&c, &w.path)))
             })
             .map(|p| p.id)
             .collect()

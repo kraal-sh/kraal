@@ -404,16 +404,16 @@ fn helper_script() -> String {
 }
 
 /// What starts a sudo session as the user: it makes `path` absolute there (`~` is the user's
-/// home, a relative path is in it), says whether sudo needs a password and which path that is,
-/// then runs [`helper_script`] through sudo, which reads the password from its input first when
-/// it needs one.
+/// home, a relative path is in it: `$HOME` as the user knows it, its links not resolved), says
+/// whether sudo needs a password and which path that is, then runs [`helper_script`] through
+/// sudo, which reads the password from its input first when it needs one.
 fn launch_script(path: &str, nonce: &str) -> String {
     let q = crate::shell::quote_always;
     [
         format!("x={}", q(nonce)),
         format!("h={}", q(&helper_script())),
         format!("f={}", crate::files::remote_dir_arg(path)),
-        "case $f in /*) ;; *) f=$(pwd -P)/$f ;; esac".into(),
+        "case $f in /*) ;; *) f=${HOME:-$(pwd)}/$f ;; esac".into(),
         "if sudo -n true 2>/dev/null; then a=ready; set -- -n; else a=password; set -- -S -p ''; fi".into(),
         "printf 'KRAAL:SUDO:%s\\0%s\\0%s\\0' \"$x\" \"$a\" \"$f\"".into(),
         "exec sudo \"$@\" -- sh -c \"$h\" kraal-edit \"$x\"".into(),

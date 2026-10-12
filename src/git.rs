@@ -26,6 +26,9 @@ pub struct GitInfo {
     pub main: PathBuf,
     /// On a kraal worktree's branch: the base it was made from, when recorded.
     pub base: String,
+    /// The directory git was asked about, its symbolic links resolved, as git gives paths
+    /// (`root`, `main`, the worktrees it lists): what a directory is compared with them as.
+    pub real: PathBuf,
 }
 
 impl GitInfo {
@@ -102,6 +105,7 @@ pub fn status(cwd: &Path) -> Option<GitInfo> {
     };
     let mut info = parse_status(&out)?;
     info.untracked |= !listed;
+    info.real = real_path(cwd);
     info.main = main_of(&root, &common);
     // Recorded with the worktree, whatever its branch is now (by older kraals, with its branch).
     let kraal_branch = info.branch.starts_with("kraal/").then_some(info.branch.as_str());
@@ -112,6 +116,17 @@ pub fn status(cwd: &Path) -> Option<GitInfo> {
     }
     info.root = root;
     Some(info)
+}
+
+/// `path` with its symbolic links resolved (itself when it cannot be).
+fn real_path(path: &Path) -> PathBuf {
+    path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
+}
+
+/// Whether `dir` is `root` or inside it, however each is spelled: git gives paths with their
+/// symbolic links resolved (`/private/var/…` on macOS), a shell or the user may not.
+pub fn is_within(dir: &Path, root: &Path) -> bool {
+    dir.starts_with(root) || real_path(dir).starts_with(real_path(root))
 }
 
 /// The main checkout of the repository whose working tree is `top`, and whose git directory
@@ -160,6 +175,7 @@ pub fn parse_status(text: &str) -> Option<GitInfo> {
         worktree_index: 0,
         main: PathBuf::new(),
         base: String::new(),
+        real: PathBuf::new(),
     })
 }
 
@@ -1081,6 +1097,23 @@ mod tests {
         std::fs::write(dir.join(file), text).unwrap();
         run_git(dir, &["add", file]);
         run_git(dir, &["commit", "-q", "-m", file]);
+    }
+
+    /// A directory reached through a symbolic link is inside the worktree git names with its
+    /// links resolved (as `/var` is `/private/var` on macOS), and git says where it is.
+    #[test]
+    fn a_directory_through_a_link_is_in_its_worktree() {
+        let Some((dir, repo)) = test_repo("gitlink") else { return };
+        let w = add_worktree(&repo, "x", None).unwrap();
+        std::fs::create_dir_all(w.path.join("src")).unwrap();
+        std::os::unix::fs::symlink(&dir, dir.join("link")).unwrap();
+        let through = dir.join("link/app.worktrees/x/src");
+        assert!(!through.starts_with(&w.path), "spelled otherwise");
+        assert!(is_within(&through, &w.path) && is_within(&w.path.join("src"), &dir.join("link/app.worktrees/x")));
+        assert!(!is_within(&dir.join("link/app"), &w.path));
+        let info = status(&through).unwrap();
+        assert_eq!((info.real, info.root, info.worktree_index), (w.path.join("src"), w.path.clone(), 1));
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     /// A worktree keeps its number while it exists, whatever it has checked out: one made after
