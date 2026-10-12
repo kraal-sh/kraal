@@ -2,6 +2,7 @@
 //! each given a short label to type.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::path::Path;
 use std::sync::OnceLock;
 
 use regex::Regex;
@@ -194,7 +195,30 @@ fn glued(text: &str, start: usize) -> bool {
     text[..start].chars().last().is_some_and(|c| c.is_alphanumeric() || matches!(c, '/' | ':' | '_' | '-' | '.'))
 }
 
-fn candidates(text: &str, servers: &HashSet<String>, custom: &Custom) -> Vec<Candidate> {
+/// Whether `s`, which the pattern of paths took for a file and its line (`lib.rs:42`), is a
+/// host and its port (`db.lan:5432`): both are a name, a dot, a name, a colon and a number.
+///
+/// - It is a file with a directory or a column (`src/lib.rs:42`, `lib.rs:42:7`), with a
+///   character no host name has (an upper-case letter, `_`), or with a number no port has.
+/// - Else, where files can be looked at (`dir`, the directory of a local pane), it is a file if
+///   that file is there, and a host if not.
+/// - Where they cannot (a pane on a server), it is a host only if `servers` knows it: a file
+///   taken for a host would be opened as a link.
+fn host_and_port(s: &str, servers: &HashSet<String>, dir: Option<&Path>) -> bool {
+    let Some((name, port)) = s.split_once(':') else { return false };
+    let host_label = |label: &str| {
+        !label.is_empty() && label.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+    };
+    if !name.split('.').all(host_label) || !port.parse::<u16>().is_ok_and(|p| p > 0) {
+        return false;
+    }
+    match dir {
+        Some(dir) => !dir.join(name).is_file(),
+        None => servers.contains(name),
+    }
+}
+
+fn candidates(text: &str, servers: &HashSet<String>, custom: &Custom, dir: Option<&Path>) -> Vec<Candidate> {
     let b = builtin();
     let mut out = Vec::new();
     let mut push = |start: usize, end: usize, kind: Kind, rank: u8| {
@@ -227,7 +251,8 @@ fn candidates(text: &str, servers: &HashSet<String>, custom: &Custom) -> Vec<Can
         let s = m.as_str();
         if !glued(text, m.start()) && s.len() > 2 && s.chars().any(|c| c.is_alphabetic()) {
             let s = s.trim_end_matches(['.', ',', ':']);
-            push(m.start(), m.start() + s.len(), Kind::Path, 4);
+            let kind = if host_and_port(s, servers, dir) { Kind::Address } else { Kind::Path };
+            push(m.start(), m.start() + s.len(), kind, 4);
         }
     }
     for m in b.pod.find_iter(text) {
@@ -270,11 +295,12 @@ fn candidates(text: &str, servers: &HashSet<String>, custom: &Custom) -> Vec<Can
 }
 
 /// Everything recognised on the screen, top to bottom. Overlaps keep the earliest, then longest,
-/// then most specific match.
-pub fn find(rows: &[Row], servers: &HashSet<String>, custom: &Custom) -> Vec<Match> {
+/// then most specific match. `dir` is the directory of the pane when its files can be looked at
+/// (a local pane): a name there tells a file and its line from a host and its port.
+pub fn find(rows: &[Row], servers: &HashSet<String>, custom: &Custom, dir: Option<&Path>) -> Vec<Match> {
     let mut out = Vec::new();
     for (r, row) in rows.iter().enumerate() {
-        let mut cands = candidates(&row.text, servers, custom);
+        let mut cands = candidates(&row.text, servers, custom, dir);
         // Hyperlinks (OSC 8) are what the program meant: they come first.
         let byte_at = |ci: usize| row.text.char_indices().nth(ci).map(|(b, _)| b).unwrap_or(row.text.len());
         let mut links = Vec::new();
@@ -363,9 +389,10 @@ mod tests {
         Row { text: text.to_string(), cols, links: Vec::new() }
     }
 
+    /// What is found in `line`, shown by a pane whose files cannot be looked at.
     fn kinds(line: &str) -> Vec<(String, Kind)> {
         let servers: HashSet<String> = ["web-prod-1".to_string(), "db.lan".to_string()].into();
-        find(&[plain(line)], &servers, &Custom::default()).into_iter().map(|m| (m.text, m.kind)).collect()
+        find(&[plain(line)], &servers, &Custom::default(), None).into_iter().map(|m| (m.text, m.kind)).collect()
     }
 
     #[test]
@@ -395,7 +422,7 @@ mod tests {
             vec![("deploy@web-prod-1".into(), Kind::Server), ("db.lan".into(), Kind::Server)]
         );
         let servers: HashSet<String> = ["web".to_string()].into();
-        assert!(find(&[plain("the web server and admin@web")], &servers, &Custom::default()).len() == 1);
+        assert!(find(&[plain("the web server and admin@web")], &servers, &Custom::default(), None).len() == 1);
         assert_eq!(loopback_port("http://localhost:5173/app?x=1"), Some((5173, "/app?x=1".into())));
         assert_eq!(loopback_port("https://[::1]:8443"), Some((8443, String::new())));
         assert_eq!(loopback_port("http://localhost:3000?x=1"), Some((3000, "?x=1".into())));
@@ -404,6 +431,68 @@ mod tests {
         assert_eq!(kinds("error in lib.rs:12"), vec![("lib.rs:12".into(), Kind::Path)]);
         assert_eq!(kinds("/etc/nginx/nginx.conf"), vec![("/etc/nginx/nginx.conf".into(), Kind::Path)]);
         assert!(kinds("1/2 and/or 2026/10/11 deadbeef 1234567").is_empty(), "{:?}", kinds("1/2 and/or 2026/10/11"));
+    }
+
+    /// `name.ext:123` is a file and its line, or a host and its port: a file that is there is
+    /// never taken for a host, nor a host for a file where the files can be looked at.
+    #[test]
+    fn a_host_and_its_port_is_told_from_a_file_and_its_line() {
+        let dir = std::env::temp_dir().join(format!("kraal-hints-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        for file in ["lib.rs", "notes.md", "db.lan", "src/main.rs"] {
+            std::fs::write(dir.join(file), "").unwrap();
+        }
+        let servers: HashSet<String> = ["db.lan".to_string(), "cache.internal".to_string()].into();
+        // The one thing found in `text`, by a pane in `dir` or one whose files cannot be seen.
+        let found = |text: &str, dir: Option<&Path>| -> (String, Kind) {
+            let all = find(&[plain(text)], &servers, &Custom::default(), dir);
+            assert_eq!(all.len(), 1, "{text}: {all:?}");
+            (all[0].text.clone(), all[0].kind)
+        };
+        let (local, remote) = (Some(dir.as_path()), None);
+
+        // In a local pane, the file being there decides, even named like a known server.
+        for file in ["lib.rs:42", "notes.md:3", "db.lan:5432"] {
+            assert_eq!(found(file, local), (file.to_string(), Kind::Path));
+        }
+        for host in ["redis.lan:6379", "example.com:443", "my-host.local:8080", "cache.internal:11211", "gone.rs:42"] {
+            assert_eq!(found(host, local), (host.to_string(), Kind::Address));
+        }
+        // In a pane on a server, a known server is a host, and anything else stays a file.
+        for host in ["db.lan:5432", "cache.internal:11211"] {
+            assert_eq!(found(host, remote), (host.to_string(), Kind::Address));
+        }
+        for file in ["lib.rs:42", "notes.md:3", "redis.lan:6379", "gone.rs:42"] {
+            assert_eq!(found(file, remote), (file.to_string(), Kind::Path));
+        }
+        // A file by its look, there or not: a directory, a column, a character no host name has,
+        // a number no port has.
+        let files = [
+            "src/main.rs:10:5",
+            "src/gone.rs:10",
+            "./gone.rs:7",
+            "/etc/hosts:3",
+            "~/gone.rs:3",
+            "lib.rs:42:7",
+            "gone.rs:10:5",
+            "db.lan:5432:1",
+            "Gone.rs:42",
+            "gone_test.go:12",
+            "gone.rs:0",
+            "gone.rs:70000",
+        ];
+        for file in files {
+            assert_eq!(found(file, local), (file.to_string(), Kind::Path), "in a local pane");
+            assert_eq!(found(file, remote), (file.to_string(), Kind::Path), "in a pane on a server");
+        }
+        // As a program prints them, in a sentence or before its message.
+        assert_eq!(found("connecting to redis.lan:6379.", local), ("redis.lan:6379".into(), Kind::Address));
+        assert_eq!(found("lib.rs:42: unused variable", local), ("lib.rs:42".into(), Kind::Path));
+        assert_eq!(found("error at db.lan:5432, retrying", remote), ("db.lan:5432".into(), Kind::Address));
+        // Addresses that were never files stay what they were.
+        assert_eq!(found("on localhost:5173", local), ("localhost:5173".into(), Kind::Address));
+        assert_eq!(found("on 10.0.0.5:8080", local), ("10.0.0.5:8080".into(), Kind::Address));
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -418,7 +507,7 @@ mod tests {
         };
         let (custom, warnings) = Custom::build(&cfg, &BTreeMap::new());
         assert_eq!(warnings.len(), 2, "a bad regex and an unknown tool: {warnings:?}");
-        let m = find(&[plain("fix OPS-1234 now")], &HashSet::new(), &custom);
+        let m = find(&[plain("fix OPS-1234 now")], &HashSet::new(), &custom, None);
         assert_eq!(m[0].text, "OPS-1234");
         assert_eq!(m[0].kind, Kind::Custom(0));
     }
@@ -427,25 +516,25 @@ mod tests {
     fn hyperlinks_win() {
         let mut row = plain("see the docs here");
         row.links.push((8, 11, "https://example.com/docs".into()));
-        let m = find(&[row], &HashSet::new(), &Custom::default());
+        let m = find(&[row], &HashSet::new(), &Custom::default(), None);
         assert_eq!(m.len(), 1);
         assert_eq!((m[0].text.as_str(), m[0].col, m[0].width), ("https://example.com/docs", 8, 4));
     }
 
     #[test]
     fn columns_follow_wide_characters() {
-        let m = find(&[plain("日本 https://x.org")], &HashSet::new(), &Custom::default());
+        let m = find(&[plain("日本 https://x.org")], &HashSet::new(), &Custom::default(), None);
         assert_eq!((m[0].col, m[0].width), (5, 13));
     }
 
     #[test]
     fn labels_are_unique_per_text_and_bottom_first() {
         let rows: Vec<Row> = ["https://a.org", "https://b.org", "https://a.org"].iter().map(|s| plain(s)).collect();
-        let hints = label(find(&rows, &HashSet::new(), &Custom::default()), "asdf");
+        let hints = label(find(&rows, &HashSet::new(), &Custom::default(), None), "asdf");
         let labels: Vec<(&str, &str)> = hints.iter().map(|h| (h.m.text.as_str(), h.label.as_str())).collect();
         assert_eq!(labels, vec![("https://a.org", "a"), ("https://b.org", "s"), ("https://a.org", "a")]);
         let many: Vec<Row> = (0..30).map(|i| plain(&format!("https://h{i}.org"))).collect();
-        let hints = label(find(&many, &HashSet::new(), &Custom::default()), "ab");
+        let hints = label(find(&many, &HashSet::new(), &Custom::default(), None), "ab");
         assert_eq!(hints.len(), 4, "two letters of two: 4 labels");
         assert!(hints.iter().all(|h| h.label.len() == 2));
         assert_eq!(split_line("src/a.rs:42:7"), ("src/a.rs", Some(42)));

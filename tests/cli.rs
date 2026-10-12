@@ -3722,6 +3722,47 @@ fn an_exit_is_seen_even_when_something_left_behind_keeps_printing() {
     assert!(env.run(&["panes"]).contains("first"));
 }
 
+/// `name.ext:123` reads as a file and its line, or as a host and its port. In a local pane the
+/// file is looked for: a host and its port is offered to open, never as a file to edit, and a
+/// file that is there opens in the editor at its line.
+#[test]
+fn hints_tell_a_host_and_its_port_from_a_file_and_its_line() {
+    let env = Env::new("hostport");
+    let dir = env.root.join("proj");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("notes.md"), "a file\n").unwrap();
+    std::fs::write(dir.join("seen"), "redis.lan:6379\nnotes.md:12\n").unwrap();
+    // An editor that says what it was given.
+    let (editor, edited) = (env.root.join("editor"), env.root.join("edited"));
+    write_script(&editor, &format!("#!/bin/sh\necho \"$@\" > {}\n", edited.display()));
+    let config = env.root.join("config/kraal/config.toml");
+    let text = std::fs::read_to_string(&config).unwrap();
+    // Labels in the order of the screen, from the bottom: x for the last line, y above it.
+    std::fs::write(&config, format!("{text}[hints]\nalphabet = \"xy\"\n")).unwrap();
+    env.workspace("w", &format!("layout {{\n    pane name=\"shell\" cwd={:?}\n}}\n", dir.display().to_string()));
+    let out = env.cmd(&["open", "w"]).env("VISUAL", &editor).output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    env.run(&["send", "-p", "shell", "--enter", "cat seen"]);
+    let mut client = RawClient::attach(&env, "w");
+    client.wait_for_row("notes.md:12");
+    let act = |client: &mut RawClient, label: &[u8]| {
+        client.send(b"\x02o");
+        client.wait_for_row("HINTS: COPY");
+        client.send(b"\t");
+        client.wait_for_row("HINTS: ACT");
+        client.send(label);
+    };
+
+    act(&mut client, b"y");
+    client.wait_for_message("http://redis.lan:6379");
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(!edited.exists(), "an editor opened on {:?}", std::fs::read_to_string(&edited));
+    act(&mut client, b"x");
+    wait_until(Duration::from_secs(10), "the editor never opened", || {
+        std::fs::read_to_string(&edited).is_ok_and(|args| args.trim() == "+12 notes.md")
+    });
+}
+
 #[cfg(unix)]
 #[test]
 fn tunnels_are_up_when_ssh_listens_and_survive_a_restart() {
