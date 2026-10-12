@@ -714,4 +714,43 @@ mod tests {
         assert!(hooked("kilo", None).set_process(None, |_, _| true));
         assert!(!hooked("claude", None).set_process(None, |_, _| false));
     }
+
+    /// The payloads agents' hooks pass, any of them, and the screens agents draw: read without a
+    /// panic.
+    #[test]
+    fn fuzz_agent_hooks() {
+        crate::fuzz::run("agent_hooks", 300, |rng| {
+            let agent = *rng.pick(&[
+                "claude",
+                "gemini",
+                "qwen",
+                "droid",
+                "codebuddy",
+                "auggie",
+                "cursor",
+                "copilot",
+                "kimi",
+                "codex",
+                "x",
+            ]);
+            let event =
+                *rng.pick(&["SessionStart", "Notification", "Stop", "PreToolUse", "AfterAgent", "", "SessionEnd"]);
+            let mut payload = format!(
+                "{{\"hook_event_name\":\"{event}\",\"notification_type\":\"{}\",\"message\":{},\"session_id\":\"x\"}}",
+                rng.pick(&["permission_prompt", "idle_prompt", "ToolPermission", ""]),
+                serde_json::to_string(&String::from_utf8_lossy(&rng.text(80))).unwrap()
+            )
+            .into_bytes();
+            if rng.one_in(2) {
+                rng.mutate(&mut payload, &[b"{", b"}", b"\"", b":", b"null"]);
+            }
+            let value: serde_json::Value = serde_json::from_slice(&payload).unwrap_or_default();
+            let arg = rng.one_in(3).then(|| String::from_utf8_lossy(&rng.text(20)).into_owned());
+            let _ = hook_state(agent, &value, arg.as_deref());
+            let _ = AgentState::parse(&String::from_utf8_lossy(&rng.text(10)));
+            let words: Vec<String> =
+                (0..rng.size(6)).map(|_| String::from_utf8_lossy(&rng.text(12)).into_owned()).collect();
+            let _ = detect_agent(&words);
+        });
+    }
 }
