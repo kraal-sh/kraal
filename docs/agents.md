@@ -159,11 +159,20 @@ kraal accounts                         # every account: logged in?, 5-hour and w
 kraal agent claude                     # start Claude on the account the rules pick
 kraal agent codex --account work --right
 kraal accounts limits --threshold 85 --mode ask
+kraal accounts rename claude:pro work  # rules and usage follow, the directory stays
 ```
 
 Your existing setup is the `default` account of each agent. New Claude accounts share
 `CLAUDE.md`, `settings.json`, skills, plugins, memory and conversations with it, so a conversation
 can continue on another account; Codex accounts share nothing, as Codex keeps databases in its home.
+
+The agent picker (`ctrl+b a`) lists every account; Tab on one shows what can be done with it: start
+it, log in again, rename it or remove it. Renaming changes the rules that name the account and
+keeps its usage; its directory stays where it is, and agents running on it go on, shown under the
+new name. A rule for every agent that also names another agent's account of the old or the new
+name stays theirs: the renamed account gets a rule of its own just before it. `default`, the
+agent's own home, keeps its name. The sidebar lists every account at the bottom, with its usage
+once some is seen.
 
 **Usage.** Claude Code passes the 5-hour and weekly usage to its status line;
 `kraal integration install claude` puts a small status line in front of yours that records it,

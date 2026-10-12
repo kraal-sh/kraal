@@ -82,6 +82,12 @@ pub(super) fn accounts(action: AccountsCmd) -> Result<()> {
             println!("forgot {} (its directory {} is kept)", accounts::label(&a), a.home);
             Ok(())
         }
+        AccountsCmd::Rename { account, name } => {
+            let a = find_account(&all, &account)?;
+            accounts::rename(&a.agent, &a.name, &name)?;
+            println!("renamed {} to {}·{name}", accounts::label(&a), a.agent);
+            Ok(())
+        }
         AccountsCmd::Refresh => {
             for a in all.for_agent("codex") {
                 let home = paths::expand_tilde(&a.home);

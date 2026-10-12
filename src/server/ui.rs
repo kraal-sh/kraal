@@ -360,6 +360,7 @@ impl Picker {
                 ("enter", "Start"),
                 ("ctrl+t", "Start in a new tab"),
                 ("ctrl+l", "Log in to this account"),
+                ("ctrl+r", "Rename account"),
                 ("ctrl+x", "Remove account (its files are kept)"),
             ],
             PickerKind::Workspace => &[("enter", "Open"), ("ctrl+x", "Close workspace")],
@@ -460,6 +461,11 @@ pub enum PromptAction {
     AddAccount {
         agent: String,
     },
+    /// The value is the account's new name.
+    RenameAccount {
+        agent: String,
+        account: String,
+    },
     /// The value is the worktree's name.
     NewWorktree {
         agent: String,
@@ -484,7 +490,10 @@ impl PromptAction {
     /// What Enter does, for the prompt's footer.
     pub fn verb(&self) -> &'static str {
         match self {
-            PromptAction::RenameTab { .. } | PromptAction::RenamePane(_) | PromptAction::RenameWorkspace(_) => "rename",
+            PromptAction::RenameTab { .. }
+            | PromptAction::RenamePane(_)
+            | PromptAction::RenameWorkspace(_)
+            | PromptAction::RenameAccount { .. } => "rename",
             PromptAction::NewWorkspace | PromptAction::NewWorktree { .. } => "create",
             PromptAction::OpenPreview => "open",
             PromptAction::SaveWorkspace(_) => "save",

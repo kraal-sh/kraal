@@ -487,6 +487,9 @@ pub enum AccountsCmd {
     Login { account: String },
     /// Forget an account (its directory is kept).
     Rm { account: String },
+    /// Rename an account (`kraal accounts rename claude:pro work`): its rules and usage follow, its
+    /// directory stays.
+    Rename { account: String, name: String },
     /// Ask Codex accounts for their current usage now.
     Refresh,
     /// Set the usage threshold (percent) and what happens there: notify, ask or auto.
