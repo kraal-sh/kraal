@@ -94,6 +94,8 @@ pub enum ConfirmAction {
     CloseWorkspace(u32),
     /// Restart the session on the kraal installed now.
     Restart,
+    /// Stop the session, its layout saved.
+    Quit,
     /// Run `kraal <args>` in a job pane.
     Job {
         label: String,
@@ -153,6 +155,7 @@ impl ConfirmAction {
             ConfirmAction::CloseTab { .. } => "Close tab".into(),
             ConfirmAction::CloseWorkspace(_) => "Close workspace".into(),
             ConfirmAction::Restart => "Restart".into(),
+            ConfirmAction::Quit => "Quit".into(),
             ConfirmAction::Job { label, .. } | ConfirmAction::GitJob { label, .. } => {
                 let mut l = label.clone();
                 if let Some(first) = l.get_mut(..1) {

@@ -17,11 +17,22 @@ How kraal is organised, and how a workspace is declared once in a file and opene
 
 ## Persistence
 
-Sessions keep running when you close the terminal or lose the connection: `kraal` attaches
-again. After a restart of the server or a reboot, the processes are gone, but kraal rebuilds the
-layout, reconnects SSH shells and resumes agent conversations; other commands wait for Enter
-before they run again. A workspace that cannot be brought back (its shell gone, say) stays saved
-as it was, and comes back at a later start.
+Sessions keep running when you close the terminal, lose the connection or detach (`ctrl+b d`):
+`kraal` attaches again. After a restart of the server, a quit or a reboot, the processes are gone,
+but kraal rebuilds the layout, reconnects SSH shells and resumes agent conversations; other
+commands wait for Enter before they run again. A workspace that cannot be brought back (its shell
+gone, say) stays saved as it was, and comes back at a later start.
+
+`ctrl+b q` (or `ctrl+b W q`; `Q` in the classic preset) quits: it lists the programs that would
+stop, as a restart does, and asks, Cancel selected. Then the server saves the session and stops
+with every program in it, as `kraal kill` does, and each attached terminal ends with
+`[kraal: stopped; kraal starts it again with its layout]`. A session that cannot be saved is not
+stopped: it keeps running, and the quit says why (`kraal kill` stops it all the same).
+
+When the last pane of the last workspace ends (`exit` in the last shell), the session ends with it,
+as in tmux and Zellij: nothing runs any more, so nothing is asked, the attached terminals end, and
+the next `kraal` starts a new session. A command pane that stays open to show how its program
+ended has not ended: the session goes on until that pane is closed.
 
 `kraal restart` (or `ctrl+b W r`) restarts a session's server on the kraal installed now, after an
 update for instance: the server saves the session and stops, and a new one starts and brings it

@@ -5053,6 +5053,108 @@ fn the_menu_restarts_the_session_after_asking() {
     env.wait_for_text_since_restore("job", "restored session");
 }
 
+/// `ctrl+b q` asks first, Cancel selected, saying what stops (a short question when nothing
+/// would); a yes saves the layout and stops the session, every attached client is told how it
+/// comes back, and the next start brings the layout back.
+#[test]
+fn the_menu_quits_after_asking_and_keeps_the_layout() {
+    let env = Env::new("menuquit");
+    env.workspace("w", "layout {\n    pane name=\"shell\"\n}\n");
+    env.run(&["open", "w"]);
+    let pid = env.server_pid().expect("the server runs");
+    let mut client = RawClient::attach(&env, "w");
+    let other = RawClient::attach(&env, "w");
+    client.wait_for_message("\"attached\"");
+    other.wait_for_message("\"attached\"");
+    client.send(b"\x02");
+    client.wait_for_row("d detach · q quit");
+    client.send(b"q");
+    let rows = client.wait_for_row("Quit kraal? The layout is saved for next time.");
+    assert!(!rows.iter().any(|r| r.contains("These programs stop")), "a shell at its prompt:\n{}", rows.join("\n"));
+    client.send(b"\r");
+    client.wait_for_rows("the question gone", |rows| !rows.iter().any(|r| r.contains("Quit kraal?")));
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(env.server_pid(), Some(pid), "Enter takes Cancel, selected first");
+
+    env.run(&["run", "--name", "job", "--", "sh", "-c", "echo started; exec sleep 4249"]);
+    env.wait_for_text("job", "started");
+    client.send(b"\x02q");
+    client.wait_for_row("Quit kraal? These programs stop:");
+    let rows = client.wait_for_row("The layout is saved for next time.");
+    let listed = rows.iter().any(|r| r.contains("sleep 4249 (pane ") && r.contains("\"job\" in w)"));
+    assert!(listed, "{}", rows.join("\n"));
+    client.send(b"y");
+    let said = "stopped; kraal -s menuquit starts it again with its layout";
+    client.wait_for_message(said);
+    other.wait_for_message(said);
+    wait_until(Duration::from_secs(10), "the server still runs", || env.server_pid().is_none());
+    env.run(&["open", "w"]);
+    let panes = env.run(&["panes"]);
+    assert!(panes.contains("shell") && panes.contains("job"), "{panes}");
+}
+
+/// A quit stops the session's programs only once its layout is saved: when it cannot be, the
+/// session keeps running, and the quit says why.
+#[test]
+fn a_quit_that_cannot_save_the_session_leaves_it_running() {
+    use std::os::unix::fs::PermissionsExt;
+    let env = Env::new("unsavedquit");
+    env.workspace("w", "layout {\n    pane name=\"one\"\n}\n");
+    env.run(&["open", "w"]);
+    wait_until(Duration::from_secs(10), "the layout was never saved", || env.state_file().exists());
+    let pid = env.server_pid().expect("the server runs");
+    let sessions = env.root.join("state/kraal/sessions");
+    std::fs::set_permissions(&sessions, std::fs::Permissions::from_mode(0o500)).unwrap();
+    // A pane opened since the last save: the layout on disk is not the session's any more.
+    env.run(&["run", "--name", "two", "--target", "one", "--", "sh"]);
+    let mut client = RawClient::attach(&env, "w");
+    client.wait_for_message("\"attached\"");
+    client.send(b"\x02q");
+    client.wait_for_row("Quit kraal?");
+    client.send(b"y");
+    client.wait_for_row("not quitting: the layout could not be saved");
+    std::fs::set_permissions(&sessions, std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert_eq!(env.server_pid(), Some(pid), "the session stopped");
+    assert!(!client.messages.lock().unwrap().iter().any(|m| m.contains(r#""type":"exit""#)));
+}
+
+/// `exit` in the last shell of the last workspace ends the session, as in tmux and Zellij:
+/// without a question, every attached terminal leaves, and nothing is left to restore.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_session_ends_with_its_last_pane() {
+    let env = Env::new("lastexit");
+    env.workspace("w", "layout {\n    pane name=\"only\"\n}\n");
+    env.run(&["open", "w"]);
+    wait_until(Duration::from_secs(10), "the layout was never saved", || env.state_file().exists());
+    let client = RawClient::attach(&env, "w");
+    client.wait_for_message("\"attached\"");
+    let mut terminal = env.client();
+    env.run(&["send", "-p", "only", "--enter", "exit"]);
+    client.wait_for_message("the last pane closed, so kraal stopped");
+    wait_until(Duration::from_secs(10), "the attached terminal stayed", || terminal.try_wait().unwrap().is_some());
+    wait_until(Duration::from_secs(10), "the server still runs", || env.server_pid().is_none());
+    assert!(!env.state_file().exists(), "an ended session was kept");
+}
+
+/// A command pane stays open when its program ends, to show how it ended: it has not ended, and
+/// the session goes on until it is closed.
+#[test]
+fn a_command_pane_left_open_keeps_its_session() {
+    let env = Env::new("keptopen");
+    env.workspace("w", "layout {\n    pane name=\"job\" command=\"sh\" { args \"-c\" \"sleep 0.3; exit 3\"; }\n}\n");
+    env.run(&["open", "w"]);
+    let pid = env.server_pid().expect("the server runs");
+    let client = RawClient::attach(&env, "w");
+    client.wait_for_message("\"attached\"");
+    env.run(&["wait", "-p", "job", "--until", "exit", "--timeout", "10"]);
+    std::thread::sleep(Duration::from_millis(500));
+    assert_eq!(env.server_pid(), Some(pid), "the session ended");
+    assert!(!client.messages.lock().unwrap().iter().any(|m| m.contains(r#""type":"exit""#)));
+    env.run(&["close", "job"]);
+    client.wait_for_message("the last pane closed, so kraal stopped");
+}
+
 /// `kraal restart` says what would stop before asking; a client attached in a terminal waits for
 /// the next server and comes back to its workspace; an idle shell comes back; and a restart run
 /// from a pane of the session itself outlives that pane.

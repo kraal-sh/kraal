@@ -535,10 +535,11 @@ impl Server {
                     title = format!("{title} {} · {named}", keys.join(" "));
                 }
                 let entries = self.keymap.menu(typed);
-                let items = overlays::menu_items(&entries);
-                let footer = overlays::menu_footer(&entries);
+                let root = typed.is_empty();
+                let items = overlays::menu_items(&entries, root);
+                let footer = overlays::menu_footer(&entries, root);
                 let layout = overlays::menu_layout(&items, screen);
-                let back = !typed.is_empty();
+                let back = !root;
                 overlays::draw_menu(&items, &layout, (&title, &footer), back, miss.as_deref(), buf);
                 // Links under the menu would open from it.
                 links.retain(|&(x, y), _| !layout.area.contains(ratatui::layout::Position::new(x, y)));

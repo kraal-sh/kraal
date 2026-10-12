@@ -18,7 +18,7 @@ any keyboard layout.
 |---|---|---|
 | servers | `s` connect (or a group in a grid) | `S`: `s` connect, `u` upload, `d` download, `e` edit the list |
 | broadcast | `b` typing goes to the whole tab, `b` again stops | `B`: `b` this tab, `w` the whole workspace, `m` mark this pane, `s` the marked panes, `o` stop |
-| workspaces | `w` choose one | `W`: `w` choose, `n` new, `←`/`→` previous/next, `e` rename, `s` save the layout, `r` restart the session (on the kraal installed now), `x` close |
+| workspaces | `w` choose one | `W`: `w` choose, `n` new, `←`/`→` previous/next, `e` rename, `s` save the layout, `r` restart the session (on the kraal installed now), `q` quit, `x` close |
 | agents | `a` start one on an account | `A`: `a` start, `g` go to the agent needing you, `c` change account |
 | tabs | `t` new tab | `T`: `t` new, `←`/`→` previous/next, `e` rename, `x` close |
 | panes | `p` find a pane | `P`: `p` find, `n` new, `→`/`↓` split, `e` rename, `r` resize with the arrows, `f` floating, `l` next layout, `s` then an arrow stack with the pane on that side, `u` unstack, `x` close |
@@ -40,13 +40,14 @@ previous and next, and the theme's letter its main action again.
 | `space` | search every command by what it does (and see its keys) |
 | `h` (or `?`) | help: every key, from your configuration |
 | `d` | detach (programs keep running) |
+| `q` | quit (programs stop; the layout is saved for the next `kraal`), after asking |
 | `ctrl+b` | type `ctrl+b` itself (whatever your prefix is, pressing it twice sends it) |
 
 Without the prefix: `alt+arrows` move the focus (left/right at the edge go to the next tab),
 `alt+n` opens a new pane, `alt+a` jumps to the next agent that needs you.
 
 `[keys] preset = "classic"` switches to single-key commands (`%` `"` `c` `n` `p`
-`o` `s` `=`…), still with the menu.
+`o` `s` `=`…), still with the menu; there `d` or `q` detaches and `Q` quits.
 
 ## The bottom bar
 

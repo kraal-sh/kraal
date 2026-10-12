@@ -144,7 +144,7 @@ impl Running {
             let here = running.get(&p.id);
             let program = here.and_then(|r| r.program.as_deref());
             let jobs = here.map_or(&[][..], |r| &r.jobs);
-            for what in persist::stops_on_restart(p, program, jobs) {
+            for what in persist::stops_with_server(p, program, jobs) {
                 lines.push(persist::stopping_line(p, &what));
             }
         }

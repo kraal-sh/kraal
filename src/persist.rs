@@ -305,13 +305,13 @@ pub fn load(session: &str) -> Result<Option<SessionSnapshot>> {
     Ok(Some(snap))
 }
 
-/// What a restart stops in a pane, given what runs in it other than a shell at its prompt
-/// (`program`, its command line) and the jobs in the background of its terminal (`jobs`). A
-/// shell at its prompt comes back in its directory, an SSH shell reconnects and an agent resumes
-/// its conversation (a turn in progress stops); any other program stops, and a pane's own
-/// command waits for Enter after the restart. Every job in the background stops: the terminal
-/// hangs up.
-pub fn stops_on_restart(
+/// What stopping the server (to restart, or to quit) stops in a pane, given what runs in it other
+/// than a shell at its prompt (`program`, its command line) and the jobs in the background of its
+/// terminal (`jobs`). At the next start, a shell at its prompt comes back in its directory, an SSH
+/// shell reconnects and an agent resumes its conversation (a turn in progress stops); any other
+/// program stops, and a pane's own command waits for Enter. Every job in the background stops:
+/// the terminal hangs up.
+pub fn stops_with_server(
     pane: &crate::protocol::PaneInfo,
     program: Option<&[String]>,
     jobs: &[Vec<String>],
@@ -323,7 +323,8 @@ pub fn stops_on_restart(
     stops_in_foreground(pane, program).into_iter().chain(background).collect()
 }
 
-/// What a restart stops in the foreground of a running terminal pane (see [`stops_on_restart`]).
+/// What stopping the server stops in the foreground of a running terminal pane (see
+/// [`stops_with_server`]).
 fn stops_in_foreground(pane: &crate::protocol::PaneInfo, program: Option<&[String]>) -> Option<String> {
     if let Some(agent) = &pane.agent {
         return (pane.state == crate::agent::AgentState::Working)
@@ -343,7 +344,7 @@ fn command_line(argv: &[String]) -> String {
     crate::text::truncate(&crate::shell::join(argv), 60)
 }
 
-/// A line of the list of what a restart stops: the pane, then `what`.
+/// A line of the list of what stopping the server stops: the pane, then `what`.
 pub fn stopping_line(pane: &crate::protocol::PaneInfo, what: &str) -> String {
     match &pane.name {
         Some(name) => format!("{what}  (pane {} \"{name}\" in {})", pane.id, pane.workspace),
@@ -551,7 +552,8 @@ mod tests {
             serde_json::from_value(info).unwrap()
         };
         let argv = |words: &[&str]| words.iter().map(|w| w.to_string()).collect::<Vec<_>>();
-        let stops = |pane: &crate::protocol::PaneInfo, program: Option<&[String]>| stops_on_restart(pane, program, &[]);
+        let stops =
+            |pane: &crate::protocol::PaneInfo, program: Option<&[String]>| stops_with_server(pane, program, &[]);
         let none: Vec<String> = Vec::new();
         let shell = pane(serde_json::json!({}));
         assert_eq!(stops(&shell, None), none, "a shell at its prompt");
@@ -594,10 +596,10 @@ mod tests {
         // or a shell at its prompt included; a pane whose program ended has none.
         let jobs = [argv(&["sleep", "600"]), argv(&["tail", "-f", "log"])];
         let both = ["sleep 600 (in the background)", "tail -f log (in the background)"];
-        assert_eq!(stops_on_restart(&shell, None, &jobs), both);
-        assert_eq!(stops_on_restart(&idle, Some(&argv(&["claude"])), &jobs), both);
-        assert_eq!(stops_on_restart(&shell, Some(&sleep), &jobs[1..]), ["sleep 1000", both[1]]);
-        assert_eq!(stops_on_restart(&ended, None, &jobs), none);
+        assert_eq!(stops_with_server(&shell, None, &jobs), both);
+        assert_eq!(stops_with_server(&idle, Some(&argv(&["claude"])), &jobs), both);
+        assert_eq!(stops_with_server(&shell, Some(&sleep), &jobs[1..]), ["sleep 1000", both[1]]);
+        assert_eq!(stops_with_server(&ended, None, &jobs), none);
     }
 
     #[test]
