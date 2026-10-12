@@ -66,6 +66,8 @@ impl Server {
                 pending_since: None,
                 mode: Mode::Normal,
                 encoder: Encoder::new(),
+                frame: Default::default(),
+                memo: Default::default(),
                 sidebar: None,
                 dirty: false,
                 last_input: Instant::now(),

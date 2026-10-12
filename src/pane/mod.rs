@@ -18,6 +18,7 @@ use crate::preview::Preview;
 use crate::server::Event;
 
 mod archive;
+mod cache;
 mod commands;
 mod guard;
 mod history;
@@ -30,6 +31,7 @@ mod store;
 
 pub use spawn::{batch, batching, close_inherited, reserve_descriptors};
 
+pub use cache::ScreenCache;
 pub use commands::{Finished, short_duration};
 use osc::sanitize_title;
 use osc::{Osc, OscScanner};
@@ -41,6 +43,30 @@ pub use screen::render_term;
 pub use screen::set_outer_colors;
 use screen::{SearchState, default_color};
 pub use scrollback::MAX_SAVED_BYTES;
+
+thread_local! {
+    /// The frames being drawn, numbered from 1 (0: none).
+    static FRAME: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Frames being drawn, while it lives: a frame shows one moment, and what it asks of the panes
+/// many times (their directory) is read once.
+pub struct Frame(());
+
+impl Frame {
+    pub fn start() -> Frame {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        FRAME.with(|f| f.set(n));
+        Frame(())
+    }
+}
+
+impl Drop for Frame {
+    fn drop(&mut self) {
+        FRAME.with(|f| f.set(0));
+    }
+}
 
 /// Every mode a program may have left set, back to how a fresh terminal starts, without RIS
 /// (which would clear the scrollback a restarted pane keeps): the alternate screen, the kitty
@@ -708,7 +734,8 @@ impl Pane {
         program.is_none_or(|p| is_shell(&p))
     }
 
-    /// Best-known working directory on this machine: OSC 7, else the shell's.
+    /// Best-known working directory on this machine: OSC 7, else the shell's (read once per
+    /// frame while frames are drawn, see [`Frame`]).
     /// A directory reported by a shell on another machine (over ssh) does not count.
     pub fn current_cwd(&self) -> Option<PathBuf> {
         if let Some(p) = &self.reported_cwd
@@ -716,7 +743,20 @@ impl Pane {
         {
             return Some(p.clone());
         }
-        crate::process::cwd(self.pid()?)
+        let t = self.term()?;
+        let pid = t.pid()?;
+        let frame = FRAME.with(std::cell::Cell::get);
+        if frame != 0
+            && let Some((f, p, cwd)) = &*t.cwd_seen.borrow()
+            && (*f, *p) == (frame, pid)
+        {
+            return cwd.clone();
+        }
+        let cwd = crate::process::cwd(pid);
+        if frame != 0 {
+            *t.cwd_seen.borrow_mut() = Some((frame, pid, cwd.clone()));
+        }
+        cwd
     }
 
     /// The directory a shell on another machine reported (a remote shell that sends OSC 7).

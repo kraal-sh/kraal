@@ -2,13 +2,14 @@
 //!
 //! The server renders each client view into a [`Buffer`]; [`Encoder`] diffs it against the last
 //! frame sent to that client and emits only the changed cells, wrapped in synchronized-output
-//! markers so the outer terminal never shows a half-drawn frame.
+//! markers so the outer terminal never shows a half-drawn frame. Cells the server knows did not
+//! change ([`Kept`]) are not even compared.
 
 use std::collections::HashMap;
 use std::io::Write;
 use std::sync::Arc;
 
-use ratatui::buffer::{Buffer, Cell};
+use ratatui::buffer::{Buffer, Cell, CellDiffOption, CellWidth};
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier};
 
@@ -35,11 +36,24 @@ pub struct Cursor {
 /// OSC 8 hyperlinks by cell position: programs' links stay clickable in the outer terminal.
 pub type Links = HashMap<(u16, u16), Arc<str>>;
 
+/// Cells of row `y`, from column `x0` to `x1` (excluded), that hold in the frame to encode what
+/// they held in the previous one: the encoder does not compare them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Kept {
+    pub y: u16,
+    pub x0: u16,
+    pub x1: u16,
+}
+
 #[derive(Default)]
 pub struct Encoder {
+    /// What the terminal shows: the last frame encoded, with the cells to draw again whatever
+    /// they hold marked [`STALE`].
     prev: Option<Buffer>,
     prev_links: Links,
     last_cursor_style: Option<(CursorShape, bool)>,
+    /// Cells were marked to draw again since the last frame: the next one compares every cell.
+    redrawn: bool,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -53,6 +67,17 @@ struct Pen {
 impl Pen {
     const RESET: Pen = Pen { fg: Color::Reset, bg: Color::Reset, underline: Color::Reset, modifier: Modifier::empty() };
 }
+
+/// Modifiers that show on a blank cell, as ratatui's diff counts them.
+const VISIBLE_ON_BLANK: Modifier = Modifier::REVERSED
+    .union(Modifier::UNDERLINED)
+    .union(Modifier::SLOW_BLINK)
+    .union(Modifier::RAPID_BLINK)
+    .union(Modifier::CROSSED_OUT);
+
+/// The widest cell the diff looks for around the cells it skips: a cell may be wider than two
+/// columns (a character with halfwidth sound marks), never in practice this wide.
+const WIDEST: usize = 16;
 
 impl Encoder {
     pub fn new() -> Self {
@@ -82,6 +107,7 @@ impl Encoder {
     pub fn redraw(&mut self, area: Rect, next: &Buffer) {
         let Some(prev) = self.prev.as_mut().filter(|p| p.area == next.area) else { return };
         let area = area.intersection(prev.area);
+        self.redrawn = true;
         for p in area.positions() {
             prev[p].set_symbol(STALE);
         }
@@ -98,14 +124,18 @@ impl Encoder {
     /// Append the bytes that turn the previous frame into `next` to `out`.
     #[cfg(test)]
     pub fn encode(&mut self, next: &Buffer, cursor: Option<Cursor>, links: &Links, out: &mut Vec<u8>) {
-        self.encode_with_images(next, cursor, links, &[], &[], out);
+        self.encode_with_images(next, &[], cursor, links, &[], &[], out);
     }
 
     /// [`Encoder::encode`], with images drawn at the cursor (sixel): `erase` goes before the
-    /// cells are drawn, `images` after them, all in the same synchronized update.
+    /// cells are drawn, `images` after them, all in the same synchronized update. The cells of
+    /// `kept` are taken to be unchanged since the previous frame (where they can be skipped
+    /// without changing what the diff finds around them).
+    #[allow(clippy::too_many_arguments)]
     pub fn encode_with_images(
         &mut self,
         next: &Buffer,
+        kept: &[Kept],
         cursor: Option<Cursor>,
         links: &Links,
         erase: &[u8],
@@ -114,17 +144,22 @@ impl Encoder {
     ) {
         out.extend_from_slice(b"\x1b[?2026h\x1b[?25l");
         let full = self.redraws_all(next.area);
-        let blank;
+        let redrawn = std::mem::take(&mut self.redrawn);
         let prev = if full {
             out.extend_from_slice(b"\x1b[0m\x1b[H\x1b[2J");
-            blank = Buffer::empty(next.area);
-            &blank
+            None
         } else {
             out.extend_from_slice(erase);
-            self.prev.as_ref().unwrap()
+            self.prev.as_ref().map(|p| p.content.as_slice())
         };
-
-        let mut updates: Vec<(u16, u16, &Cell)> = prev.diff(next);
+        // The cells to compare: all of them, but those kept when the previous frame is known.
+        let len = next.content.len();
+        let ranges = match prev {
+            Some(prev) if !redrawn => compared(prev, next, kept),
+            _ => vec![(0, len)],
+        };
+        let mut updates: Vec<(u16, u16, &Cell)> = Vec::new();
+        diff_ranges(prev, next, &ranges, &mut updates);
         // Cells whose link changed but whose text did not must be drawn again too. The second
         // column of a wide character is drawn with it: its first column is redrawn instead.
         if !full && self.prev_links != *links {
@@ -179,7 +214,9 @@ impl Encoder {
         if pen != Pen::RESET {
             out.extend_from_slice(b"\x1b[0m");
         }
-        self.prev_links = links.clone();
+        if self.prev_links != *links {
+            self.prev_links = links.clone();
+        }
         out.extend_from_slice(images);
 
         if let Some(c) = cursor {
@@ -199,7 +236,179 @@ impl Encoder {
             let _ = write!(out, "\x1b[{};{}H\x1b[?25h", c.y + 1, c.x + 1);
         }
         out.extend_from_slice(b"\x1b[?2026l");
-        self.prev = Some(next.clone());
+        // The terminal now shows `next`: only the cells compared can differ from it.
+        match self.prev.as_mut() {
+            Some(p) if !full => {
+                for &(a, b) in &ranges {
+                    p.content[a..b].clone_from_slice(&next.content[a..b]);
+                }
+            }
+            Some(p) if p.content.len() == len => {
+                p.area = next.area;
+                p.content.clone_from_slice(&next.content);
+            }
+            _ => self.prev = Some(next.clone()),
+        }
+    }
+}
+
+/// The ranges of cells (as indexes in the buffers' content) to compare: everything but the
+/// cells `kept`, in order. A run of kept cells is compared all the same when skipping it could
+/// change what the diff finds around it: when it starts within reach of a wide cell before it,
+/// in either frame, or ends within reach of one in it (ratatui's diff skips the columns a wide
+/// cell covers, and redraws those of a wide cell made narrow).
+fn compared(prev: &[Cell], next: &Buffer, kept: &[Kept]) -> Vec<(usize, usize)> {
+    let len = next.content.len();
+    let width = usize::from(next.area.width);
+    let height = usize::from(next.area.height);
+    let mut widths = Widths::default();
+    // Whether the cell at `i` reaches no further than `end`. A symbol is never wider than its
+    // length in bytes: most cells need no width.
+    let mut within = |cell: &Cell, i: usize, end: usize| {
+        i + cell.symbol().len().max(1) <= end || i + usize::from(widths.of(cell)).max(1) <= end
+    };
+    let mut skips: Vec<(usize, usize)> = kept
+        .iter()
+        .filter(|k| usize::from(k.y) < height && k.x0 < k.x1 && usize::from(k.x1) <= width)
+        .map(|k| {
+            let row = usize::from(k.y) * width;
+            (row + usize::from(k.x0), row + usize::from(k.x1))
+        })
+        .filter(|&(a, b)| {
+            (a.saturating_sub(WIDEST)..a).all(|i| within(&next.content[i], i, a) && within(&prev[i], i, a))
+                && (a.max(b.saturating_sub(WIDEST))..b).all(|i| within(&next.content[i], i, b))
+        })
+        .collect();
+    skips.sort_unstable();
+    let mut out = Vec::with_capacity(skips.len() + 1);
+    let mut from = 0;
+    for (a, b) in skips {
+        // Overlapping runs: the one already skipped counts.
+        if a < from {
+            from = from.max(b);
+            continue;
+        }
+        if a > from {
+            out.push((from, a));
+        }
+        from = b;
+    }
+    if from < len {
+        out.push((from, len));
+    }
+    out
+}
+
+/// Cell widths as ratatui's diff counts them. The last symbol longer than a byte is remembered:
+/// frames repeat a few (the lines of borders) over and over.
+#[derive(Default)]
+struct Widths {
+    symbol: [u8; 16],
+    len: usize,
+    width: u16,
+}
+
+impl Widths {
+    fn of(&mut self, cell: &Cell) -> u16 {
+        let s = cell.symbol();
+        if matches!(cell.diff_option, CellDiffOption::ForcedWidth(_)) {
+            return cell.cell_width();
+        }
+        // ratatui: a byte is a column, nothing none.
+        if s.len() <= 1 {
+            return s.len() as u16;
+        }
+        if s.len() == self.len && self.symbol[..s.len()] == *s.as_bytes() {
+            return self.width;
+        }
+        let width = cell.cell_width();
+        if s.len() <= self.symbol.len() {
+            self.symbol[..s.len()].copy_from_slice(s.as_bytes());
+            self.len = s.len();
+            self.width = width;
+        }
+        width
+    }
+}
+
+/// Whether ratatui's diff passes over a cell without looking at it.
+#[allow(deprecated)]
+fn skipped(cell: &Cell) -> bool {
+    matches!(cell.diff_option, CellDiffOption::Skip) || (cell.skip && matches!(cell.diff_option, CellDiffOption::None))
+}
+
+/// The cells of `next` to draw over `prev` (None: a blank screen) within `ranges` of cell
+/// indexes, in order, as ratatui's `BufferDiff` finds them over the whole buffers when the cells
+/// between the ranges are equal in both (see [`compared`]): a changed wide character covers the
+/// columns after it, those of a wide character made narrow are drawn again when its style shows
+/// on blanks, and those of an emoji with a variation selector when their text differs.
+fn diff_ranges<'a>(
+    prev: Option<&[Cell]>,
+    next: &'a Buffer,
+    ranges: &[(usize, usize)],
+    out: &mut Vec<(u16, u16, &'a Cell)>,
+) {
+    let cells = &next.content;
+    let len = cells.len();
+    let blank = Cell::EMPTY;
+    let old = |i: usize| prev.map_or(&blank, |p| &p[i]);
+    let width = usize::from(next.area.width.max(1));
+    let at = |i: usize| ((i % width) as u16 + next.area.x, (i / width) as u16 + next.area.y);
+    let mut widths = Widths::default();
+    let mut pos = 0;
+    for &(a, b) in ranges {
+        pos = pos.max(a);
+        while pos < b.min(len) {
+            let i = pos;
+            pos += 1;
+            let cur = &cells[i];
+            let previous = old(i);
+            match cur.diff_option {
+                CellDiffOption::Skip => continue,
+                _ if skipped(cur) => continue,
+                CellDiffOption::ForcedWidth(w) => {
+                    pos = pos.saturating_add(usize::from(w.get()).saturating_sub(1));
+                    if cur != previous {
+                        let (x, y) = at(i);
+                        out.push((x, y, cur));
+                    }
+                    continue;
+                }
+                CellDiffOption::None | CellDiffOption::AlwaysUpdate => {}
+            }
+            let w = usize::from(widths.of(cur));
+            if matches!(cur.diff_option, CellDiffOption::None) && cur == previous {
+                pos += w.saturating_sub(1);
+                continue;
+            }
+            let previous_w = usize::from(widths.of(previous));
+            let (x, y) = at(i);
+            out.push((x, y, cur));
+            // The columns after it to look at: (from, to, whatever they hold).
+            let trailing = if w > 1 && cur.symbol().contains('\u{FE0F}') {
+                Some((i + 1, (i + w).min(len), false))
+            } else if w > 1 {
+                pos += w - 1;
+                None
+            } else if previous_w > w && (previous.bg != Color::Reset || previous.modifier.intersects(VISIBLE_ON_BLANK))
+            {
+                Some((i + 1, i + previous_w, true))
+            } else {
+                None
+            };
+            if let Some((mut j, mut end, force)) = trailing {
+                while j < end && j < len {
+                    let k = j;
+                    j += usize::from(widths.of(&cells[k])).max(1);
+                    end = end.max(j).min(len);
+                    if !skipped(&cells[k]) && (force || old(k).symbol() != cells[k].symbol()) {
+                        let (x, y) = at(k);
+                        out.push((x, y, &cells[k]));
+                    }
+                }
+                pos = end;
+            }
+        }
     }
 }
 
@@ -214,45 +423,52 @@ fn write_symbol(out: &mut Vec<u8>, cell: &Cell) -> u16 {
 }
 
 fn write_style(out: &mut Vec<u8>, pen: &mut Pen, cell: &Cell) {
-    let mut params: Vec<String> = Vec::new();
+    // The parameters go straight into `out`: the sequence opens with the first one.
+    let start = out.len();
+    let param = |out: &mut Vec<u8>| out.extend_from_slice(if out.len() == start { b"\x1b[" } else { b";" });
     if cell.modifier != pen.modifier {
         let removed = pen.modifier - cell.modifier;
         if !removed.is_empty() {
-            params.push("0".into());
+            param(out);
+            out.push(b'0');
             *pen = Pen::RESET;
         }
         let added = cell.modifier - pen.modifier;
         for (m, code) in [
-            (Modifier::BOLD, "1"),
-            (Modifier::DIM, "2"),
-            (Modifier::ITALIC, "3"),
-            (Modifier::UNDERLINED, "4"),
-            (Modifier::SLOW_BLINK, "5"),
-            (Modifier::RAPID_BLINK, "6"),
-            (Modifier::REVERSED, "7"),
-            (Modifier::HIDDEN, "8"),
-            (Modifier::CROSSED_OUT, "9"),
+            (Modifier::BOLD, b'1'),
+            (Modifier::DIM, b'2'),
+            (Modifier::ITALIC, b'3'),
+            (Modifier::UNDERLINED, b'4'),
+            (Modifier::SLOW_BLINK, b'5'),
+            (Modifier::RAPID_BLINK, b'6'),
+            (Modifier::REVERSED, b'7'),
+            (Modifier::HIDDEN, b'8'),
+            (Modifier::CROSSED_OUT, b'9'),
         ] {
             if added.contains(m) {
-                params.push(code.into());
+                param(out);
+                out.push(code);
             }
         }
         pen.modifier = cell.modifier;
     }
     if cell.fg != pen.fg {
-        params.push(color_param(cell.fg, Layer::Fg));
+        param(out);
+        color_param(out, cell.fg, Layer::Fg);
         pen.fg = cell.fg;
     }
     if cell.bg != pen.bg {
-        params.push(color_param(cell.bg, Layer::Bg));
+        param(out);
+        color_param(out, cell.bg, Layer::Bg);
         pen.bg = cell.bg;
     }
     if cell.underline_color != pen.underline {
-        params.push(color_param(cell.underline_color, Layer::Underline));
+        param(out);
+        color_param(out, cell.underline_color, Layer::Underline);
         pen.underline = cell.underline_color;
     }
-    if !params.is_empty() {
-        let _ = write!(out, "\x1b[{}m", params.join(";"));
+    if out.len() > start {
+        out.push(b'm');
     }
 }
 
@@ -285,27 +501,25 @@ fn named_index(c: Color) -> Option<u8> {
     })
 }
 
-fn color_param(c: Color, layer: Layer) -> String {
-    match (layer, c) {
-        (Layer::Fg, Color::Reset) => "39".into(),
-        (Layer::Bg, Color::Reset) => "49".into(),
-        (Layer::Underline, Color::Reset) => "59".into(),
-        (Layer::Fg, Color::Indexed(i)) => format!("38;5;{i}"),
-        (Layer::Bg, Color::Indexed(i)) => format!("48;5;{i}"),
-        (Layer::Underline, Color::Indexed(i)) => format!("58;5;{i}"),
-        (Layer::Fg, Color::Rgb(r, g, b)) => format!("38;2;{r};{g};{b}"),
-        (Layer::Bg, Color::Rgb(r, g, b)) => format!("48;2;{r};{g};{b}"),
-        (Layer::Underline, Color::Rgb(r, g, b)) => format!("58;2;{r};{g};{b}"),
+/// The SGR parameters that set colour `c` on `layer`, appended to `out`.
+fn color_param(out: &mut Vec<u8>, c: Color, layer: Layer) {
+    let _ = match (layer, c) {
+        (Layer::Fg, Color::Reset) => write!(out, "39"),
+        (Layer::Bg, Color::Reset) => write!(out, "49"),
+        (Layer::Underline, Color::Reset) => write!(out, "59"),
+        (Layer::Fg, Color::Indexed(i)) => write!(out, "38;5;{i}"),
+        (Layer::Bg, Color::Indexed(i)) => write!(out, "48;5;{i}"),
+        (Layer::Underline, Color::Indexed(i)) => write!(out, "58;5;{i}"),
+        (Layer::Fg, Color::Rgb(r, g, b)) => write!(out, "38;2;{r};{g};{b}"),
+        (Layer::Bg, Color::Rgb(r, g, b)) => write!(out, "48;2;{r};{g};{b}"),
+        (Layer::Underline, Color::Rgb(r, g, b)) => write!(out, "58;2;{r};{g};{b}"),
+        (Layer::Underline, named) => write!(out, "58;5;{}", named_index(named).unwrap_or(7)),
         (layer, named) => {
             let i = named_index(named).unwrap_or(7);
-            let (base, bright) = match layer {
-                Layer::Fg => (30, 90),
-                Layer::Bg => (40, 100),
-                Layer::Underline => return format!("58;5;{i}"),
-            };
-            if i < 8 { (base + i).to_string() } else { (bright + i - 8).to_string() }
+            let (base, bright) = if matches!(layer, Layer::Fg) { (30, 90) } else { (40, 100) };
+            if i < 8 { write!(out, "{}", base + i) } else { write!(out, "{}", bright + i - 8) }
         }
-    }
+    };
 }
 
 #[cfg(test)]
@@ -425,7 +639,7 @@ mod tests {
         let mut enc = Encoder::new();
         assert!(enc.redraws_all(area));
         let mut out = Vec::new();
-        enc.encode_with_images(&buf, None, &Links::new(), b"ERASE", b"IMAGE", &mut out);
+        enc.encode_with_images(&buf, &[], None, &Links::new(), b"ERASE", b"IMAGE", &mut out);
         let s = text(&out);
         // The screen is cleared: nothing to erase. Images go over the cells.
         assert!(!s.contains("ERASE") && s.find("abc") < s.find("IMAGE"), "{s:?}");
@@ -436,7 +650,7 @@ mod tests {
         assert!(enc.rewrites(&buf, Rect::new(1, 1, 1, 1)) && !enc.rewrites(&buf, Rect::new(2, 0, 4, 2)));
         let cursor = Cursor { x: 0, y: 1, shape: CursorShape::Block, blinking: false };
         let mut out = Vec::new();
-        enc.encode_with_images(&buf, Some(cursor), &Links::new(), b"ERASE", b"IMAGE", &mut out);
+        enc.encode_with_images(&buf, &[], Some(cursor), &Links::new(), b"ERASE", b"IMAGE", &mut out);
         let s = text(&out);
         let at = |t: &str| s.find(t).unwrap_or_else(|| panic!("{t:?} in {s:?}"));
         assert!(at("\x1b[?2026h") < at("ERASE") && at("ERASE") < at("\x1b[1;2Hb") && at("b") < at("IMAGE"), "{s:?}");
@@ -452,9 +666,183 @@ mod tests {
 
     #[test]
     fn colors_map_to_sgr() {
-        assert_eq!(color_param(Color::LightBlue, Layer::Fg), "94");
-        assert_eq!(color_param(Color::Green, Layer::Bg), "42");
-        assert_eq!(color_param(Color::Indexed(200), Layer::Fg), "38;5;200");
-        assert_eq!(color_param(Color::Rgb(1, 2, 3), Layer::Bg), "48;2;1;2;3");
+        let param = |c: Color, layer: Layer| {
+            let mut out = Vec::new();
+            color_param(&mut out, c, layer);
+            text(&out)
+        };
+        assert_eq!(param(Color::LightBlue, Layer::Fg), "94");
+        assert_eq!(param(Color::Green, Layer::Bg), "42");
+        assert_eq!(param(Color::Indexed(200), Layer::Fg), "38;5;200");
+        assert_eq!(param(Color::Rgb(1, 2, 3), Layer::Bg), "48;2;1;2;3");
+        assert_eq!(param(Color::Cyan, Layer::Underline), "58;5;6");
+        assert_eq!(param(Color::Reset, Layer::Underline), "59");
+    }
+
+    /// Every cell of a row but those from `x0` to `x1`, as kept runs.
+    fn kept_but(area: Rect, (x0, x1, y): (u16, u16, u16)) -> Vec<Kept> {
+        let mut kept = Vec::new();
+        for row in area.top()..area.bottom() {
+            if row != y {
+                kept.push(Kept { y: row, x0: area.left(), x1: area.right() });
+                continue;
+            }
+            if x0 > area.left() {
+                kept.push(Kept { y: row, x0: area.left(), x1: x0 });
+            }
+            if x1 < area.right() {
+                kept.push(Kept { y: row, x0: x1, x1: area.right() });
+            }
+        }
+        kept
+    }
+
+    #[test]
+    fn a_frame_after_one_cell_changed_sends_that_cell_alone() {
+        let area = Rect::new(0, 0, 30, 6);
+        let mut buf = Buffer::empty(area);
+        for y in 0..6 {
+            buf.set_string(0, y, "some text over the whole row", Style::default().fg(Color::Green));
+        }
+        let mut enc = Encoder::new();
+        enc.encode(&buf, None, &Links::new(), &mut Vec::new());
+        buf[(7, 3)].set_char('X');
+        let mut out = Vec::new();
+        enc.encode_with_images(&buf, &kept_but(area, (7, 8, 3)), None, &Links::new(), &[], &[], &mut out);
+        assert_eq!(text(&out), "\x1b[?2026h\x1b[?25l\x1b[4;8H\x1b[32mX\x1b[0m\x1b[?2026l");
+        // Nothing changed: nothing is drawn.
+        let mut out = Vec::new();
+        enc.encode_with_images(&buf, &kept_but(area, (0, 0, 9)), None, &Links::new(), &[], &[], &mut out);
+        assert_eq!(text(&out), "\x1b[?2026h\x1b[?25l\x1b[?2026l");
+    }
+
+    #[test]
+    fn cells_to_draw_again_are_compared_even_when_kept() {
+        let area = Rect::new(0, 0, 6, 2);
+        let mut buf = Buffer::empty(area);
+        buf.set_string(0, 0, "abcdef", Style::default());
+        let mut enc = Encoder::new();
+        enc.encode(&buf, None, &Links::new(), &mut Vec::new());
+        enc.redraw(Rect::new(2, 0, 2, 1), &buf);
+        let mut out = Vec::new();
+        enc.encode_with_images(&buf, &kept_but(area, (0, 0, 9)), None, &Links::new(), &[], &[], &mut out);
+        assert!(text(&out).contains("\x1b[1;3Hcd"), "{:?}", text(&out));
+    }
+
+    struct Rng(u64);
+
+    impl Rng {
+        fn below(&mut self, n: u64) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0 % n
+        }
+
+        /// A cell of a few kinds: narrow, blank, wide, an emoji with a variation selector, with
+        /// combining marks, wider than two columns; plain, on a background, reversed, coloured.
+        fn cell(&mut self, cell: &mut Cell) {
+            const SYMBOLS: [&str; 8] = ["a", "b", " ", "", "日", "\u{2764}\u{fe0f}", "e\u{301}", "a\u{ff9e}\u{ff9e}"];
+            let styles = [
+                Style::default(),
+                Style::default().bg(Color::Red),
+                Style::default().add_modifier(Modifier::REVERSED),
+                Style::default().fg(Color::Indexed(3)),
+            ];
+            cell.reset();
+            cell.set_symbol(SYMBOLS[self.below(SYMBOLS.len() as u64) as usize]);
+            cell.set_style(styles[self.below(styles.len() as u64) as usize]);
+        }
+
+        /// A frame of random cells and a few changed in the next one, with runs of cells equal
+        /// in both said to be kept at random.
+        fn frames(&mut self) -> (Buffer, Buffer, Vec<Kept>) {
+            let area = Rect::new(0, 0, 2 + self.below(10) as u16, 1 + self.below(4) as u16);
+            let mut prev = Buffer::empty(area);
+            for i in 0..prev.content.len() {
+                if self.below(3) > 0 {
+                    self.cell(&mut prev.content[i]);
+                }
+            }
+            // ratatui's diff reads past the end of a frame whose last cells were wide and are
+            // made narrow: frames never end that way (the last column of a pane takes no wide
+            // character).
+            let len = prev.content.len();
+            for cell in &mut prev.content[len.saturating_sub(2)..] {
+                cell.set_symbol("z");
+            }
+            let mut next = prev.clone();
+            for _ in 0..self.below(6) {
+                let i = self.below(next.content.len() as u64) as usize;
+                self.cell(&mut next.content[i]);
+            }
+            let mut kept = Vec::new();
+            for y in area.top()..area.bottom() {
+                let mut x = area.left();
+                while x < area.right() {
+                    let end = (x + 1 + self.below(4) as u16).min(area.right());
+                    if (x..end).all(|cx| prev[(cx, y)] == next[(cx, y)]) && self.below(2) == 0 {
+                        kept.push(Kept { y, x0: x, x1: end });
+                    }
+                    x = end;
+                }
+            }
+            (prev, next, kept)
+        }
+    }
+
+    /// Random frames and changes: the cells drawn are those ratatui's own diff finds, whether
+    /// the unchanged cells are said to be kept or not.
+    #[test]
+    fn the_cells_drawn_are_those_ratatuis_diff_finds() {
+        let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
+        for case in 0..5000 {
+            let (prev, next, kept) = rng.frames();
+            let want = prev.diff(&next);
+            let len = next.content.len();
+            let mut whole = Vec::new();
+            diff_ranges(Some(&prev.content), &next, &[(0, len)], &mut whole);
+            assert_eq!(whole, want, "case {case}");
+            let mut blank = Vec::new();
+            diff_ranges(None, &next, &[(0, len)], &mut blank);
+            assert_eq!(blank, Buffer::empty(next.area).diff(&next), "case {case}");
+            let mut skipping = Vec::new();
+            diff_ranges(Some(&prev.content), &next, &compared(&prev.content, &next, &kept), &mut skipping);
+            assert_eq!(skipping, want, "case {case}: kept {kept:?}");
+        }
+    }
+
+    /// The bytes sent do not depend on which unchanged cells are said to be kept, links and
+    /// wide characters made narrow included.
+    #[test]
+    fn kept_cells_change_nothing_sent() {
+        let mut rng = Rng(0x1234_5678_9abc_def1);
+        for case in 0..2000 {
+            let (prev, next, kept) = rng.frames();
+            let mut links = Links::new();
+            if rng.below(2) == 0 {
+                links.insert((0, 0), Arc::from("https://example.org"));
+            }
+            let (mut told, mut whole) = (Encoder::new(), Encoder::new());
+            told.encode(&prev, None, &Links::new(), &mut Vec::new());
+            whole.encode(&prev, None, &Links::new(), &mut Vec::new());
+            let (mut a, mut b) = (Vec::new(), Vec::new());
+            told.encode_with_images(&next, &kept, None, &links, &[], &[], &mut a);
+            whole.encode(&next, None, &links, &mut b);
+            assert_eq!(text(&a), text(&b), "case {case}: kept {kept:?}");
+        }
+        // A wide character made narrow redraws the column it covered, which is kept.
+        let area = Rect::new(0, 0, 8, 1);
+        let mut buf = Buffer::empty(area);
+        buf.set_string(0, 0, "ab日cdef", Style::default().bg(Color::Blue));
+        let (mut told, mut whole) = (Encoder::new(), Encoder::new());
+        told.encode(&buf, None, &Links::new(), &mut Vec::new());
+        whole.encode(&buf, None, &Links::new(), &mut Vec::new());
+        buf[(2, 0)].set_char('x');
+        let (mut a, mut b) = (Vec::new(), Vec::new());
+        told.encode_with_images(&buf, &[Kept { y: 0, x0: 3, x1: 8 }], None, &Links::new(), &[], &[], &mut a);
+        whole.encode(&buf, None, &Links::new(), &mut b);
+        assert_eq!(text(&a), text(&b));
+        assert!(text(&a).contains("\x1b[1;3H\x1b[44mx\x1b[49m "), "{:?}", text(&a));
     }
 }

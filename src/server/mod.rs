@@ -310,6 +310,9 @@ pub struct Client {
     pub pending_since: Option<Instant>,
     pub mode: Mode,
     pub encoder: Encoder,
+    /// The last frame composed for it, kept to compose the next one over it.
+    pub(in crate::server) frame: ratatui::buffer::Buffer,
+    pub(in crate::server) memo: render::FrameMemo,
     /// The sidebar shows when it has something to say; once toggled, as the client chose.
     pub sidebar: Option<bool>,
     pub dirty: bool,
@@ -392,6 +395,12 @@ pub struct Server {
     /// When an image that stopped moving may be drawn as sixel where it stopped. Kept apart from
     /// `next_render`, which it would hold back: other changes are drawn meanwhile.
     image_wake: Option<Instant>,
+    /// When the last frames were drawn.
+    last_frame: Instant,
+    /// Frames in a row that output was already waiting for (see [`Server::schedule_render`]).
+    streak: u8,
+    /// Panes just typed into, until when their output is drawn at once (it is the echo).
+    echo: HashMap<PaneId, Instant>,
     quitting: bool,
     /// `kraal kill` requests, answered once the last state is written (or not).
     kill_waiters: Vec<ClientId>,
@@ -541,6 +550,14 @@ const INPUT_FLUSH: Duration = Duration::from_millis(30);
 const STREAM_PAUSE: Duration = Duration::from_millis(2);
 /// ...and its output is looked for this often (frames are drawn no sooner).
 const WATCH_STREAMS: Duration = Duration::from_millis(1);
+/// The least time between frames for output: output after a quiet spell is drawn at once, more
+/// of it that soon waits so that a burst makes one frame.
+const FRAME_GAP: Duration = Duration::from_millis(2);
+/// The same while output keeps coming: frame after frame found it waiting ([`BUSY_AFTER`]).
+const BUSY_FRAME_GAP: Duration = Duration::from_millis(8);
+const BUSY_AFTER: u8 = 3;
+/// How long after a key the output of the pane it went to is drawn at once, as its echo.
+const ECHO_WAIT: Duration = Duration::from_millis(250);
 
 /// Whether what was last done at `last` is due again at `now`, done `every` so often: a little
 /// early rather than a whole tick late.
@@ -660,6 +677,9 @@ pub fn run(session: &str) -> Result<()> {
         last_scan: Instant::now() - SCAN_EVERY,
         next_render: None,
         image_wake: None,
+        last_frame: Instant::now(),
+        streak: 0,
+        echo: HashMap::new(),
         quitting: false,
         kill_waiters: Vec::new(),
         restarting: false,
@@ -854,9 +874,11 @@ impl Server {
     }
 
     /// Parse waiting pane output for up to `budget`: the panes clients are looking at first,
-    /// for at most half of it, then the others in turn, one chunk each. Stops early when a
-    /// control event arrives or a frame is due, but the others always get a chunk: a pane
-    /// printing without a pause keeps the queue busy, and must not starve the rest.
+    /// a chunk each whatever else waits, then more for at most half of it, then the others in
+    /// turn, one chunk each. Stops early when a control event arrives or a frame is due, but the
+    /// others always get a chunk: a pane printing without a pause keeps the queue busy, and must
+    /// not starve the rest. A frame due once the focused panes are read (the echo of a key) goes
+    /// before the others' output.
     fn pump_output(&mut self, budget: Duration, rx: &Receiver<Event>) {
         let start = Instant::now();
         let focused: Vec<PaneId> =
@@ -870,14 +892,16 @@ impl Server {
                 && [s.next_render, s.image_wake].into_iter().flatten().all(|t| t > now)
         };
         for p in focused {
-            while more(self, budget / 2) {
+            let mut first = true;
+            while std::mem::take(&mut first) || more(self, budget / 2) {
                 if !self.take_output(p, &mut data) {
                     break;
                 }
                 self.pane_output(p, &data);
             }
         }
-        let mut served = false;
+        let now = Instant::now();
+        let mut served = [self.next_render, self.image_wake].into_iter().flatten().any(|t| t <= now);
         while !std::mem::replace(&mut served, true) || more(self, budget) {
             let Some(id) = self.ready.pop_front() else { break };
             if self.take_output(id, &mut data) {
@@ -1143,6 +1167,7 @@ impl Server {
             self.relayout();
             self.mark_dirty();
         }
+        self.echo.retain(|_, until| *until > now);
         // Wake-ups can be dropped when the event queue is full; catch those panes here.
         let waiting: Vec<PaneId> = self.panes.values().filter(|p| p.has_output()).map(|p| p.id).collect();
         for id in waiting {
@@ -1321,6 +1346,12 @@ impl Server {
         let signals = pane.feed(data);
         self.pane_signals(id, signals);
         self.mark_dirty_pane(id);
+        if !self.echo.is_empty()
+            && let Some(until) = self.echo.remove(&id)
+            && Instant::now() <= until
+        {
+            self.render_now();
+        }
     }
 
     /// Exits whose last output has been read, or that waited long enough: a little of what is
@@ -1405,14 +1436,26 @@ impl Server {
         self.schedule_render();
     }
 
+    /// Draw what changed: at once after a quiet spell, else when the last frame is
+    /// [`FRAME_GAP`] old, or [`BUSY_FRAME_GAP`] while output keeps coming.
     fn schedule_render(&mut self) {
-        if self.next_render.is_none() {
-            self.next_render = Some(Instant::now() + Duration::from_millis(2));
+        if self.next_render.is_some() {
+            return;
         }
+        let now = Instant::now();
+        self.streak = if now < self.last_frame + FRAME_GAP { self.streak.saturating_add(1) } else { 0 };
+        let gap = if self.streak >= BUSY_AFTER { BUSY_FRAME_GAP } else { FRAME_GAP };
+        self.next_render = Some((self.last_frame + gap).max(now));
+    }
+
+    /// Draw as soon as the event loop gets to it: what was just typed, and its echo.
+    pub(super) fn render_now(&mut self) {
+        self.next_render = Some(Instant::now());
     }
 
     fn render_clients(&mut self) {
         self.next_render = None;
+        let _frame = crate::pane::Frame::start();
         let ids: Vec<ClientId> = self.clients.values().filter(|c| c.attached && c.dirty).map(|c| c.id).collect();
         let mut again = false;
         // The earliest a moving image may be drawn where it stopped.
@@ -1423,7 +1466,10 @@ impl Server {
                 again = true;
                 continue;
             }
-            let (mut buf, cursor, links) = self.compose(id);
+            self.last_frame = Instant::now();
+            // The frame is composed over the last one.
+            let mut buf = self.clients.get_mut(&id).map(|c| std::mem::take(&mut c.frame)).unwrap_or_default();
+            let (cursor, links, kept) = self.compose(id, &mut buf);
             // Images the client's terminal does not have yet go first.
             let (mut bytes, more) = self.graphics_updates(id);
             // Or, for a terminal that draws sixel, the images' visible parts go over the cells.
@@ -1436,7 +1482,8 @@ impl Server {
                 let pane = shown.map(|p| p.to_string()).unwrap_or_default();
                 bytes.extend_from_slice(format!("\x1b]7701;shows;{pane}\x07").as_bytes());
             }
-            c.encoder.encode_with_images(&buf, cursor, &links, &erase, &images, &mut bytes);
+            c.encoder.encode_with_images(&buf, &kept, cursor, &links, &erase, &images, &mut bytes);
+            c.frame = buf;
             c.dirty = more || still.is_some();
             again |= more;
             if let Some(at) = still {

@@ -3289,6 +3289,140 @@ fn a_pane_is_told_when_the_terminal_loses_and_regains_the_focus() {
     env.wait_for_text("app", "^[[I^[[O^[[I^[[O^[[I");
 }
 
+/// What a terminal of `cols × rows` shows after `bytes`: each row's cells (text, colours,
+/// attributes, link) and the cursor.
+fn terminal_after(bytes: &[u8], cols: usize, rows: usize) -> Vec<String> {
+    use alacritty_terminal::index::{Column, Line};
+    use alacritty_terminal::term::{Config, Term, TermMode, test::TermSize};
+    let mut term = Term::new(Config::default(), &TermSize::new(cols, rows), alacritty_terminal::event::VoidListener);
+    let mut parser: alacritty_terminal::vte::ansi::Processor = alacritty_terminal::vte::ansi::Processor::new();
+    parser.advance(&mut term, bytes);
+    let grid = term.grid();
+    let mut out: Vec<String> = (0..rows)
+        .map(|y| {
+            let row = &grid[Line(y as i32)];
+            (0..cols)
+                .map(|x| {
+                    let c = &row[Column(x)];
+                    let link = c.hyperlink().map(|h| h.uri().to_string());
+                    let text: String =
+                        std::iter::once(c.c).chain(c.zerowidth().into_iter().flatten().copied()).collect();
+                    format!("{text:?} {:?} {:?} {:?} {:?} {link:?}", c.fg, c.bg, c.flags, c.underline_color())
+                })
+                .collect::<Vec<_>>()
+                .join(" | ")
+        })
+        .collect();
+    let cursor = grid.cursor.point;
+    out.push(format!(
+        "cursor {} {} shown {}",
+        cursor.line.0,
+        cursor.column.0,
+        term.mode().contains(TermMode::SHOW_CURSOR)
+    ));
+    out
+}
+
+impl RawClient {
+    /// Wait until nothing more is drawn for a while; how much was drawn.
+    fn settle(&self) -> usize {
+        let mut seen = self.screen.lock().unwrap().len();
+        let start = Instant::now();
+        loop {
+            std::thread::sleep(Duration::from_millis(300));
+            let now = self.screen.lock().unwrap().len();
+            if now == seen {
+                return now;
+            }
+            seen = now;
+            assert!(start.elapsed() < Duration::from_secs(10), "the screen never settles");
+        }
+    }
+}
+
+/// Frames are drawn over the last one, with the rows that did not change left out: whatever
+/// happens, a client ends up showing what a client attaching then is shown whole.
+#[test]
+fn frames_drawn_over_the_last_one_end_as_a_whole_frame() {
+    let env = Env::new("incremental");
+    std::fs::create_dir_all(env.root.join("state/kraal")).unwrap();
+    std::fs::write(env.root.join("state/kraal/welcomed"), "").unwrap();
+    env.workspace("w", "layout {\n    pane name=\"main\"\n}\n");
+    env.workspace("w2", "layout {\n    pane name=\"other\"\n}\n");
+    env.run(&["open", "w"]);
+    let colors = "printf '\\033[1;31mred \\033[42;4mgreen\\033[0m \\346\\227\\245\\346\\234\\254 \
+                  \\033]8;;https://example.org\\033\\\\link\\033]8;;\\033\\\\ e\\314\\201 done\\n'; exec cat";
+    env.run(&["run", "--name", "colors", "--right", "--", "sh", "-c", colors]);
+    env.run(&["run", "--name", "lines", "--down", "--", "sh", "-c", "seq 1 200; exec cat"]);
+    let mut client = RawClient::attach(&env, "w");
+    client.wait_for_screen("done");
+    let same = |client: &RawClient, step: &str| {
+        client.settle();
+        let fresh = RawClient::attach(&env, "w");
+        fresh.settle();
+        client.settle();
+        let (a, b) = (client.screen.lock().unwrap().clone(), fresh.screen.lock().unwrap().clone());
+        let (a, b) = (terminal_after(&a, 120, 40), terminal_after(&b, 120, 40));
+        for (y, (a, b)) in a.iter().zip(&b).enumerate() {
+            assert_eq!(a, b, "{step}: row {y} differs");
+        }
+        drop(fresh);
+        client.settle();
+    };
+    same(&client, "start");
+    // Typing into a program: its echo, one cell at a time.
+    env.run(&["focus", "colors"]);
+    client.settle();
+    let before = client.settle();
+    client.send(b"x");
+    client.wait_for_screen("x");
+    let typed = client.settle() - before;
+    assert!(typed < 100, "a frame for one character sent {typed} bytes");
+    for b in b"yz 123" {
+        client.send(&[*b]);
+    }
+    same(&client, "typing");
+    // Output scrolling one pane.
+    env.run(&["send", "-p", "lines", "more\r"]);
+    same(&client, "scrolling");
+    // Image placeholders without an image draw as blanks.
+    env.run(&[
+        "run",
+        "--name",
+        "img",
+        "--right",
+        "--",
+        "sh",
+        "-c",
+        "printf 'img:\\364\\216\\273\\256 end\\n'; exec cat",
+    ]);
+    same(&client, "placeholders");
+    // A floating pane over the others, then gone.
+    env.run(&["run", "--name", "float", "--floating", "--", "sh", "-c", "echo FLOAT; exec cat"]);
+    client.wait_for_screen("FLOAT");
+    same(&client, "floating");
+    env.run(&["close", "float"]);
+    same(&client, "floating closed");
+    // Another tab, and back.
+    env.run(&["run", "--name", "tab2", "--tab", "--", "sh", "-c", "echo TAB2; exec cat"]);
+    client.wait_for_screen("TAB2");
+    same(&client, "new tab");
+    env.run(&["focus", "colors"]);
+    same(&client, "tab back");
+    // The menu over the panes, then closed.
+    client.send(b"\x02");
+    client.settle();
+    client.send(b"\x1b");
+    same(&client, "menu closed");
+    // A second workspace: the sidebar shows.
+    env.run(&["open", "w2"]);
+    std::thread::sleep(Duration::from_millis(600));
+    same(&client, "sidebar");
+    // A pane closed: the others take its place.
+    env.run(&["close", "img"]);
+    same(&client, "pane closed");
+}
+
 #[test]
 fn a_pane_printing_without_a_pause_does_not_starve_the_others() {
     let env = Env::new("starve");
