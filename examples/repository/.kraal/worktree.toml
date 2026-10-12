@@ -1,0 +1,21 @@
+# How this repository prepares the worktrees kraal makes for agents, with `kraal wt new` or
+# "in a new worktree" in the agent picker (`ctrl+b a`).
+# Commit it as .kraal/worktree.toml at the top of your repository. kraal reads it from the
+# commit a worktree starts from, shows its commands and asks before it runs them, and asks
+# again whenever the file changes. `kraal config check` in the repository validates it.
+# Needs what the commands use, here npm.
+
+# Files that git does not track and a fresh worktree lacks, copied from the main checkout
+# when they are there. Paths in the repository, with * and ? in the last part.
+copy = [
+  ".env.local",
+  "config/*.key",
+]
+
+# Run in the new worktree, in order, before the agent starts; the first one that fails
+# stops the rest. $PORT and $KRAAL_PORT_OFFSET differ in each worktree (see [worktrees] in
+# the config), so every worktree can run its own dev server.
+setup = [
+  "npm ci --prefer-offline --no-audit",
+  "npm run db:prepare",
+]

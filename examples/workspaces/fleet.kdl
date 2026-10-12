@@ -1,0 +1,22 @@
+// SSH panes on a group of servers, side by side, one of them production.
+// Copy it to ~/.config/kraal/workspaces/fleet.kdl, then open it with `kraal fleet`.
+// `ctrl+b b` types in every pane of the tab at once; the production pane has a red frame,
+// and kraal asks before broadcast keys or a paste of several lines reach it.
+// Needs servers you can ssh to: put yours in place of the example.com hosts. With
+// examples/servers.toml in place, each pane takes the name, groups and env of its entry.
+layout {
+    tab name="web" {
+        pane split_direction="vertical" {
+            pane split_direction="horizontal" {
+                pane name="web-staging-1" command="ssh" { args "deploy@web-staging-1.example.com"; }
+                pane name="web-staging-2" command="ssh" { args "deploy@web-staging-2.example.com"; }
+            }
+            // "prod" in a server's name is enough to make its pane production.
+            pane name="web-prod-1" command="ssh" { args "deploy@web-prod-1.example.com"; }
+        }
+    }
+    // A tab on this machine, for notes or for commands on the whole fleet.
+    tab name="local" {
+        pane name="shell"
+    }
+}

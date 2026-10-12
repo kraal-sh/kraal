@@ -53,7 +53,8 @@ if [ -z "$tags" ]; then
     [ "$latest" = "$OLDEST" ] || tags="$tags $latest"
 fi
 if [ "$list" = 1 ]; then
-    echo $tags
+    # Tags given as arguments each came after a space.
+    echo "${tags# }"
     exit 0
 fi
 
@@ -90,7 +91,9 @@ download() {
     curl -fsSL --proto '=https' -o "$tmp/SHA256SUMS" "$base/SHA256SUMS" || fail "could not download $base/SHA256SUMS"
     want=$(awk -v a="$name.tar.gz" '$2 == a { print $1 }' "$tmp/SHA256SUMS")
     got=$(sha256 "$tmp/$name.tar.gz")
-    [ -n "$want" ] && [ "$want" = "$got" ] || fail "$name.tar.gz of $1 does not match its checksum"
+    if [ -z "$want" ] || [ "$want" != "$got" ]; then
+        fail "$name.tar.gz of $1 does not match its checksum"
+    fi
     tar -xzf "$tmp/$name.tar.gz" -C "$tmp"
     mkdir -p "$dir/$1"
     mv "$tmp/$name/kraal" "$dir/$1/kraal"

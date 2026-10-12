@@ -1,7 +1,7 @@
-//! The pages against the program: what README.md and docs/ quote (command lines, keys, settings,
-//! event types, examples) is read from the pages and given to the program's own parsers, so that
-//! a page which no longer matches the program fails here, and so does a command, an option, a
-//! setting or an event type that no page names.
+//! The pages against the program: what README.md, docs/ and examples/ quote (command lines, keys,
+//! settings, event types, examples) is read from them and given to the program's own parsers, so
+//! that a page which no longer matches the program fails here, and so does a command, an option,
+//! a setting or an event type that no page names. tests/examples.rs runs the examples themselves.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -37,15 +37,27 @@ struct Page {
     links: Vec<(String, String)>,
 }
 
+/// The files under `dir`, in order.
+fn files(dir: &Path) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    for entry in std::fs::read_dir(dir).unwrap() {
+        let path = entry.unwrap().path();
+        if path.is_dir() {
+            found.extend(files(&path));
+        } else {
+            found.push(path);
+        }
+    }
+    found.sort();
+    found
+}
+
+/// README.md, then the Markdown of docs/ and of examples/.
 fn pages() -> Vec<Page> {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let mut docs: Vec<PathBuf> = std::fs::read_dir(root.join("docs"))
-        .unwrap()
-        .map(|entry| entry.unwrap().path())
-        .filter(|path| path.extension().is_some_and(|e| e == "md"))
-        .collect();
-    docs.sort();
-    std::iter::once(root.join("README.md")).chain(docs).map(|path| page(root, &path)).collect()
+    let written = ["docs", "examples"].into_iter().flat_map(|dir| files(&root.join(dir)));
+    let markdown = written.filter(|path| path.extension().is_some_and(|e| e == "md"));
+    std::iter::once(root.join("README.md")).chain(markdown).map(|path| page(root, &path)).collect()
 }
 
 fn page(root: &Path, path: &Path) -> Page {
@@ -126,7 +138,8 @@ fn blocks<'a>(pages: &'a [Page], language: &'a str) -> impl Iterator<Item = (&'a
 // ---- command lines -----------------------------------------------------------------------
 
 /// The commands of a shell line, each as its words: quotes are read, `#` starts a comment, a
-/// pipe or `;` starts the next command, and what a redirection names is left out.
+/// pipe, `;` or a parenthesis (`$(…)`) starts the next command, and what a redirection names is
+/// left out.
 fn commands(line: &str) -> Vec<Vec<String>> {
     let line = line.trim_start();
     let mut out = vec![Vec::new()];
@@ -145,13 +158,13 @@ fn commands(line: &str) -> Vec<Vec<String>> {
             }
             Some('\\') => word.get_or_insert_default().extend(chars.next()),
             Some('#') if word.is_none() => break,
-            Some(c) if !c.is_whitespace() && !"|;<>".contains(c) => word.get_or_insert_default().push(c),
+            Some(c) if !c.is_whitespace() && !"|;()<>".contains(c) => word.get_or_insert_default().push(c),
             _ => {
                 if let Some(word) = word.take().filter(|_| !std::mem::take(&mut redirected)) {
                     out.last_mut().unwrap().push(word);
                 }
                 match c {
-                    Some('|' | ';') => out.push(Vec::new()),
+                    Some('|' | ';' | '(' | ')') => out.push(Vec::new()),
                     Some('<' | '>') => redirected = true,
                     Some(_) => {}
                     None => break,
@@ -162,6 +175,9 @@ fn commands(line: &str) -> Vec<Vec<String>> {
     out
 }
 
+/// What a script writes before a command it runs.
+const BEFORE_A_COMMAND: [&str; 8] = ["if", "elif", "while", "until", "then", "do", "!", "exec"];
+
 /// The `kraal` command lines of a quote: a span that starts with `kraal`, and each line of a
 /// shell block or a transcript that runs it.
 fn command_lines(quote: &Quote) -> Vec<Vec<String>> {
@@ -170,7 +186,8 @@ fn command_lines(quote: &Quote) -> Vec<Vec<String>> {
         Some("sh" | "console" | "") => quote.text.lines().flat_map(commands).collect(),
         Some(_) => Vec::new(),
     };
-    runs.into_iter().filter(|words| words.first().is_some_and(|w| w == "kraal")).collect()
+    let run = |words: Vec<String>| words.into_iter().skip_while(|w| BEFORE_A_COMMAND.contains(&w.as_str())).collect();
+    runs.into_iter().map(run).filter(|words: &Vec<String>| words.first().is_some_and(|w| w == "kraal")).collect()
 }
 
 /// The values a command's first argument chooses from (`kraal config` takes `check`, `keys`…).
@@ -243,6 +260,10 @@ fn shell_lines_split_into_commands() {
         ["kraal,send,-p,tests,--enter,cargo \"test\""]
     );
     assert_eq!(words("kraal tunnel rm #7"), ["kraal,tunnel,rm"]);
+    assert_eq!(words("state=$(kraal wait -p \"$pane\")"), ["state=$", "kraal,wait,-p,$pane", ""]);
+    let script =
+        Quote { at: String::new(), block: Some("sh".into()), text: "if ! kraal ssh db -- true; then\n".into() };
+    assert_eq!(command_lines(&script), [["kraal", "ssh", "db", "--", "true"]]);
     let named = |line: &str| named(&commands(line).remove(0)).join(", ");
     assert_eq!(named("kraal -s main read -p 3"), "kraal --session, kraal read, kraal read --pane");
     assert_eq!(
@@ -252,20 +273,42 @@ fn shell_lines_split_into_commands() {
     assert_eq!(named("kraal config keys --markdown"), "kraal config, kraal config keys, kraal config --markdown");
 }
 
-/// The spans the default configuration quotes in its comments: `kraal config default` is a page
-/// too.
-fn default_config_quotes() -> Vec<Quote> {
-    let comments = DEFAULT_CONFIG.lines().enumerate().filter(|(_, line)| line.starts_with('#'));
-    let spans = comments.flat_map(|(i, line)| line.split('`').skip(1).step_by(2).map(move |span| (i + 1, span)));
-    spans
-        .map(|(line, span)| Quote { at: format!("kraal config default:{line}"), block: None, text: span.into() })
-        .collect()
+/// The spans a file that is not a page quotes in its comments: the lines that start with `#` or
+/// `//`, and those of a `<!--` comment.
+fn comment_quotes(name: &str, text: &str) -> Vec<Quote> {
+    let mut quotes = Vec::new();
+    let mut html = false;
+    for (i, line) in text.lines().enumerate() {
+        let line = line.trim_start();
+        html = (html || line.starts_with("<!--")) && !line.starts_with("-->");
+        if html || line.starts_with('#') || line.starts_with("//") {
+            let spans = line.split('`').skip(1).step_by(2);
+            quotes.extend(spans.map(|span| Quote { at: format!("{name}:{}", i + 1), block: None, text: span.into() }));
+        }
+    }
+    quotes
+}
+
+/// What is quoted outside the pages: in the comments of the default configuration (`kraal config
+/// default` is a page too) and of the examples, and the scripts of the examples, line by line.
+fn other_quotes() -> Vec<Quote> {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut quotes = comment_quotes("kraal config default", DEFAULT_CONFIG);
+    for path in files(&root.join("examples")) {
+        let name = path.strip_prefix(root).unwrap().display().to_string();
+        let text = std::fs::read_to_string(&path).unwrap();
+        quotes.extend(comment_quotes(&name, &text));
+        if path.extension().is_some_and(|e| e == "sh") {
+            quotes.push(Quote { at: name, block: Some("sh".into()), text });
+        }
+    }
+    quotes
 }
 
 #[test]
 fn the_command_lines_quoted_parse() {
     let mut wrong = Vec::new();
-    for quote in quotes(&pages()).chain(&default_config_quotes()) {
+    for quote in quotes(&pages()).chain(&other_quotes()) {
         for words in command_lines(quote) {
             let Err(e) = Cli::try_parse_from(&words) else { continue };
             // A span may name a command without its arguments, and `…` stands for some.
@@ -345,7 +388,7 @@ fn the_key_sequences_quoted_are_bound() {
     let keymap = keymap();
     let prefix = keymap.prefix_label();
     let mut unbound = Vec::new();
-    for quote in quotes(&pages()).filter(|quote| quote.block.is_none()) {
+    for quote in quotes(&pages()).chain(&other_quotes()).filter(|quote| quote.block.is_none()) {
         let after = quote.text.strip_prefix(&prefix).filter(|rest| rest.is_empty() || rest.starts_with(' '));
         // A span that is not all keys (`alt+arrows`) is not a sequence to look up.
         let bound = match after {
@@ -500,6 +543,19 @@ fn the_workspace_examples_have_no_warning() {
         let workspace = crate::workspace::parse_workspace("example", &quote.text);
         let workspace = workspace.unwrap_or_else(|e| panic!("{}: {e:#}", quote.at));
         assert!(workspace.warnings.is_empty(), "{}: {:?}", quote.at, workspace.warnings);
+    }
+}
+
+/// The workspace README.md shows is one of the examples, as it is.
+#[test]
+fn the_workspace_of_the_readme_is_an_example() {
+    let readme: Vec<Page> = pages().into_iter().filter(|page| page.name == "README.md").collect();
+    let example = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/workspaces/release.kdl");
+    let example = std::fs::read_to_string(example).unwrap();
+    let shown: Vec<&Quote> = blocks(&readme, "kdl").map(|(quote, _)| quote).collect();
+    assert!(!shown.is_empty(), "README.md shows no workspace");
+    for quote in shown {
+        assert!(example.contains(&quote.text), "{}: not what examples/workspaces/release.kdl has", quote.at);
     }
 }
 

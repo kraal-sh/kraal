@@ -1,0 +1,21 @@
+// A first workspace: two tabs, a split and a live Markdown preview.
+// Copy it to ~/.config/kraal/workspaces/first.kdl, then open it with `kraal first`
+// (from a pane of kraal: `kraal open first`, or `ctrl+b w`).
+// Needs nothing installed. The pane on the right shows ~/notes.md rendered, and again each
+// time the file changes: write it from the shell on the left.
+layout {
+    cwd "~"
+    tab name="notes" focus=true {
+        pane split_direction="vertical" {
+            pane name="shell" size="55%" focus=true
+            pane name="notes" preview="notes.md"
+        }
+    }
+    tab name="system" {
+        pane split_direction="horizontal" {
+            // A command pane stays open when its program ends: Enter runs it again.
+            pane name="disk" command="df" { args "-h"; }
+            pane name="shell"
+        }
+    }
+}

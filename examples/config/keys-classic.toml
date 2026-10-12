@@ -1,0 +1,24 @@
+# The classic preset (one key after the prefix for most commands), with ctrl+a as the prefix
+# and a few keys moved.
+# Copy it to ~/.config/kraal/config.toml, or add its tables to yours: a config only holds
+# what it changes. `kraal config check` validates it, `kraal config reload` applies it to
+# the running session, and `kraal config keys` prints every key and every action's name.
+# Needs nothing.
+
+[keys]
+preset = "classic"
+prefix = ["ctrl+a"]           # pressed twice, it goes to the program
+
+# After the prefix. An action takes the keys listed, in place of the preset's.
+[keys.leader]
+split_right = ["|", "\\"]     # the preset has % and |
+split_down = ["-", "_"]       # the preset has " and -
+files = ["e"]                 # the file manager, which leaves f free
+open_preview = []             # [] unbinds: e was the preset's key for it
+toggle_zoom = ["z", "space"]  # a second key
+hints = ["f"]                 # labels on links, paths and commits, which had space
+
+# Without the prefix.
+[keys.direct]
+next_tab = ["alt+."]
+prev_tab = ["alt+,"]

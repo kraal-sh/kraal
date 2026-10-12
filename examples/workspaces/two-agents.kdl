@@ -1,0 +1,22 @@
+// Two agents at work side by side, each in its own checkout, and a stack of helper panes.
+// Copy it to ~/.config/kraal/workspaces/two-agents.kdl, then open it with `kraal two-agents`.
+// The sidebar shows each agent's state; `alt+a` goes to the next one that waits for you.
+// Needs claude and codex installed, and checkouts in ~/src/shop and ~/src/shop-docs.
+layout {
+    pane split_direction="vertical" {
+        pane split_direction="horizontal" size="60%" {
+            // agent:account starts the agent on that account, here the one it already has.
+            // After `kraal accounts add claude work`, write agent="claude:work".
+            pane name="api" agent="claude:default" cwd="~/src/shop" focus=true
+            // Without an account, the rules of accounts.toml choose one.
+            pane name="docs" agent="codex" cwd="~/src/shop-docs"
+        }
+        // A stack: the panes share one place, one open and the others folded to a title.
+        pane stacked=true cwd="~/src/shop" {
+            // start_suspended waits for Enter before the first run.
+            pane name="tests" command="make" start_suspended=true { args "test"; }
+            pane name="logs" command="tail" { args "-F" "log/development.log"; }
+            pane name="shell" expanded=true
+        }
+    }
+}

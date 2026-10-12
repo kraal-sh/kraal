@@ -1,0 +1,20 @@
+# Commands kraal runs when something happens: an agent waits for you, a command pane fails,
+# an ssh starts on a production server.
+# Copy it to ~/.config/kraal/config.toml, or add its table to yours. `kraal config check`
+# validates it and `kraal config reload` applies it; what a hook prints goes to
+# ~/.local/state/kraal/hooks.log.
+# Needs curl and a topic of yours on ntfy.sh, notify-send, and logger.
+
+# A key is an event type (`kraal events --list`) or a prefix ("agent.*"). sh runs the
+# command, with the event's fields in $KRAAL_<FIELD> and the whole event in $KRAAL_EVENT_JSON.
+# At most 20 hooks start per second, and one that runs for 10 minutes is stopped.
+[hooks]
+# An agent asks a question or a permission: tell your phone.
+"agent.blocked" = 'curl -fsS -d "$KRAAL_AGENT needs you: $KRAAL_NAME" https://ntfy.sh/my-kraal-topic'
+
+# A command pane ended with an error (tests, a build, a dropped ssh): tell the desktop.
+"pane.failed" = 'notify-send "$KRAAL_NAME failed" "exit code $KRAAL_CODE, in $KRAAL_WORKSPACE"'
+
+# An ssh started in a pane on a production server: note it in the system log.
+# $KRAAL_PRODUCTION is "1" or empty.
+"ssh.started" = '[ -z "$KRAAL_PRODUCTION" ] || logger -t kraal "ssh to production: $KRAAL_HOST"'
