@@ -140,14 +140,24 @@ pub fn snapshot(server: &Server) -> SessionSnapshot {
             tabs: ws
                 .tabs
                 .iter()
-                .map(|t| TabSnap {
-                    name: t.name.clone(),
-                    root: t.root.as_ref().map(|r| node(r, &pane_snap)),
-                    floating: t.floating.iter().map(|f| (pane_snap(f.pane), f.rect)).collect(),
-                    focus: t.focus.and_then(|f| t.panes().iter().position(|p| *p == f)),
-                    show_floating: t.show_floating,
-                    zoomed: t.zoom.is_some(),
-                    sync: false,
+                .map(|t| {
+                    // A paste buffer shown in a window is not saved: it may hold a secret.
+                    let floating: Vec<&crate::server::Floating> = t
+                        .floating
+                        .iter()
+                        .filter(|f| !server.panes.get(&f.pane).is_some_and(|p| p.shows_text()))
+                        .collect();
+                    let mut kept = t.root.as_ref().map(|r| r.leaves()).unwrap_or_default();
+                    kept.extend(floating.iter().map(|f| f.pane));
+                    TabSnap {
+                        name: t.name.clone(),
+                        root: t.root.as_ref().map(|r| node(r, &pane_snap)),
+                        floating: floating.iter().map(|f| (pane_snap(f.pane), f.rect)).collect(),
+                        focus: t.focus.and_then(|f| kept.iter().position(|p| *p == f)),
+                        show_floating: t.show_floating && !floating.is_empty(),
+                        zoomed: t.zoom.is_some(),
+                        sync: false,
+                    }
                 })
                 .collect(),
         })

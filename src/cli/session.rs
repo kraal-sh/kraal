@@ -36,13 +36,22 @@ pub(super) fn forget(s: &Session) -> Result<()> {
         Err(e) => return Err(e.into()),
     };
     let scrollback = crate::persist::forget_scrollback(session)?;
+    let buffers_path = paths::buffers_path(session);
+    let buffers = match std::fs::remove_file(&buffers_path) {
+        Ok(()) => true,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+        Err(e) => return Err(e.into()),
+    };
     if state {
         println!("forgot {}", p.display());
     }
     if scrollback {
         println!("forgot {}", paths::scrollback_dir(session).display());
     }
-    if !state && !scrollback {
+    if buffers {
+        println!("forgot {}", buffers_path.display());
+    }
+    if !state && !scrollback && !buffers {
         println!("nothing saved for {session}");
     }
     Ok(())

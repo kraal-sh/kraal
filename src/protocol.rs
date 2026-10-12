@@ -337,6 +337,32 @@ pub enum Request {
         workspace: Option<String>,
         name: Option<String>,
     },
+    /// The paste buffers, newest first.
+    BufferList,
+    /// A buffer's text: by number (0 is the newest numbered buffer) or name; the newest without.
+    BufferShow {
+        buffer: Option<String>,
+    },
+    /// Keep `text` in the buffer `name`, or in a new numbered buffer without one.
+    BufferSet {
+        name: Option<String>,
+        text: String,
+    },
+    /// Paste a buffer (the newest without one) into a pane as a terminal pastes: bracketed when
+    /// the program asked for it. A production pane is refused unless `production` says the
+    /// caller knows.
+    BufferPaste {
+        buffer: Option<String>,
+        pane: String,
+        #[serde(default)]
+        production: bool,
+    },
+    /// Delete a buffer (the newest without one), or all of them.
+    BufferDelete {
+        buffer: Option<String>,
+        #[serde(default)]
+        all: bool,
+    },
     /// Read the configuration file again; answered with its warnings, one per line.
     ReloadConfig,
     /// Save the session and stop. With `restart`, attached clients wait for the next server
@@ -367,6 +393,22 @@ pub enum Response {
     },
     Path(PathBuf),
     Tunnels(Vec<crate::server::net::TunnelInfo>),
+    Buffers(Vec<BufferInfo>),
+}
+
+/// A paste buffer, as `kraal buffer list` shows it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BufferInfo {
+    /// What `kraal buffer` commands take: the number of a numbered buffer (0 is the newest), or
+    /// the name of a named one.
+    pub buffer: String,
+    pub named: bool,
+    pub bytes: usize,
+    pub lines: usize,
+    /// When it was copied or set, in seconds since the epoch.
+    pub at: i64,
+    /// Its text on one line, cut short, control characters made visible.
+    pub preview: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

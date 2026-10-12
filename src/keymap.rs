@@ -66,6 +66,7 @@ pub enum Action {
     ScrollMode,
     Search,
     CopyLastOutput,
+    Buffers,
     Hints,
     ToggleSidebar,
     Messages,
@@ -133,6 +134,7 @@ const ACTIONS: &[(Action, &str, &str)] = &[
     (ScrollMode, "scroll_mode", "Copy mode: scroll and select"),
     (Search, "search", "Search the output"),
     (CopyLastOutput, "copy_last_output", "Copy the last command's output"),
+    (Buffers, "buffers", "Paste buffers: what was copied, to paste again"),
     (Hints, "hints", "Open a link or path (hints on screen)"),
     (ToggleSidebar, "toggle_sidebar", "Sidebar"),
     (Messages, "messages", "Message log"),
@@ -286,6 +288,8 @@ pub const KRAAL: Preset = Preset {
         ("broadcast_selected", &["{broadcast} s"]),
         ("broadcast_off", &["{broadcast} o"]),
         ("copy_last_output", &["{view} c"]),
+        // tmux's key for its list of buffers, too.
+        ("buffers", &["{view} p", "="]),
     ],
     direct: &[
         ("focus_or_tab_left", &["alt+left"]),
@@ -370,6 +374,7 @@ pub const CLASSIC: Preset = Preset {
         ("help", &["?"]),
         ("send_prefix", &["{prefix}"]),
         ("copy_last_output", &["Y"]),
+        ("buffers", &["="]),
     ],
     direct: &[
         ("focus_or_tab_left", &["alt+h", "alt+left"]),
@@ -1036,6 +1041,9 @@ mod tests {
         assert_eq!(km.lookup(&[key('g')]), run(Search));
         assert_eq!(km.lookup(&[key('/')]), run(Search));
         assert_eq!(km.lookup(&[key('?')]), run(Help));
+        assert_eq!(km.lookup(&[key('V'), key('p')]), run(Buffers));
+        assert_eq!(km.lookup(&[key('=')]), run(Buffers));
+        assert!(km.menu(&[key('V')]).iter().any(|e| e.label == "Paste buffers"));
         let right = Key { code: KeyCode::Right, mods: Mods::NONE, raw: Vec::new() };
         assert_eq!(km.lookup(&[key('P'), right]), run(SplitRight));
         assert_eq!(km.lookup(&[key('q')]), Lookup::Nothing);

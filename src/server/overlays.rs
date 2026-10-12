@@ -477,6 +477,7 @@ pub(super) fn draw_picker(p: &Picker, full: Rect, buf: &mut Buffer) -> Option<Cu
             K::Workspace => "Type a name to create a workspace.".into(),
             K::Runbook => "No runbooks yet: `kraal runbook new <name>` creates one.".into(),
             K::Tool => "No tools: add some under [tools] in config.toml.".into(),
+            K::Buffers => "Nothing copied yet: what you copy (copy mode, a mouse selection) shows here.".into(),
             _ => "Nothing here yet.".into(),
         };
         buf.set_stringn(list.x + 2, list.y, msg, list.width.saturating_sub(2) as usize, dim());

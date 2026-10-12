@@ -154,6 +154,8 @@ pub struct Preview {
     graphics: Option<Arc<crate::graphics::Shared>>,
     /// The image as terminals that show images get it.
     picture: Option<TerminalImage>,
+    /// The text was given, not read from a file (see [`Preview::of_text`]).
+    in_memory: bool,
 }
 
 /// An image preview as terminals that show images get it, under kraal's id for it.
@@ -228,7 +230,35 @@ impl Preview {
             scaled: None,
             graphics: None,
             picture: None,
+            in_memory: false,
         }
+    }
+
+    /// A preview of `text` (a paste buffer), titled `title`: there is no file to read or watch,
+    /// and `r` changes nothing.
+    pub fn of_text(title: &str, text: &str) -> Preview {
+        let watch = Arc::new(Watch::default());
+        watch.stop.store(true, Ordering::Relaxed);
+        Preview {
+            path: PathBuf::from(title),
+            kind: PreviewKind::Text,
+            content: Content::Text(TextData::new(text, None)),
+            stamp: None,
+            pending: false,
+            watch,
+            scroll: 0,
+            view: None,
+            layout: None,
+            scaled: None,
+            graphics: None,
+            picture: None,
+            in_memory: true,
+        }
+    }
+
+    /// Shows text kraal holds rather than a file.
+    pub fn in_memory(&self) -> bool {
+        self.in_memory
     }
 
     /// Show images as images (on terminals that can) rather than half blocks.
@@ -261,7 +291,7 @@ impl Preview {
     /// Asks for the file to be read again (by the server, off its thread), keeping the scroll
     /// position (clamped at next render).
     pub fn reload(&mut self) {
-        self.pending = true;
+        self.pending = !self.in_memory;
     }
 
     /// Show a file read by [`Loaded::read`] (on another thread: reading and decoding can be slow).

@@ -498,6 +498,12 @@ pub fn scrollback_dir(session: &str) -> PathBuf {
     state_dir().join("scrollback").join(session)
 }
 
+/// Where the paste buffers of `session` are kept across restarts, when they are (`[buffers]
+/// persist`).
+pub fn buffers_path(session: &str) -> PathBuf {
+    state_dir().join("buffers").join(format!("{session}.json"))
+}
+
 pub fn log_path(session: &str) -> PathBuf {
     state_dir().join(format!("server-{session}.log"))
 }

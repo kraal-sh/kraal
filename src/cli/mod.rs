@@ -2,6 +2,7 @@
 
 mod agents;
 mod args;
+mod buffers;
 mod panes;
 mod remote;
 mod restart;
@@ -119,6 +120,7 @@ fn run(cli: Cli) -> Result<()> {
         Some(Cmd::Close { pane }) => done(s.request(Request::ClosePane { pane: pane_ref(&s, pane)? })),
         Some(Cmd::Rename { pane, name }) => done(s.request(Request::RenamePane { pane: pane_ref(&s, pane)?, name })),
         Some(Cmd::Notify { title, body }) => done(s.request(Request::Notify { title, body: body.unwrap_or_default() })),
+        Some(Cmd::Buffer { action }) => buffers::run(&s, action),
         Some(Cmd::Events { types, list, since, boot }) => panes::events(&s, types, list, since, boot),
         Some(Cmd::Runbook { action }) => runbooks::run(action, &s.socket(), s.own_pane()),
         Some(Cmd::Cp { paths, dry_run, move_, no_replace, allow, expect }) => {

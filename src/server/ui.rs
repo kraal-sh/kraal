@@ -217,6 +217,8 @@ pub enum PickerKind {
     RunbookSteps,
     /// What to do with an edited file whose server's version changed meanwhile.
     EditConflict,
+    /// The paste buffers.
+    Buffers,
 }
 
 #[derive(Clone)]
@@ -274,6 +276,8 @@ pub enum PickAction {
         edit: u32,
         answer: super::edits::Answer,
     },
+    /// A paste buffer, by its id.
+    Buffer(u64),
     /// Point a file manager panel at `~` (local) or `server:~`.
     FilesSet {
         pane: PaneId,
@@ -365,6 +369,12 @@ impl Picker {
             PickerKind::Commands => &[("enter", "Run")],
             PickerKind::Pane => &[("enter", "Go to pane")],
             PickerKind::Tool => &[("enter", "Start tool")],
+            PickerKind::Buffers => &[
+                ("enter", "Paste into the pane"),
+                ("ctrl+y", "Copy to the clipboard again"),
+                ("ctrl+o", "Show in a preview pane"),
+                ("ctrl+x", "Delete"),
+            ],
             _ => &[("enter", "Choose")],
         }
     }

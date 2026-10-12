@@ -72,7 +72,7 @@ pub enum Cmd {
         #[arg(short, long)]
         yes: bool,
     },
-    /// Forget a session's saved layout and scrollback.
+    /// Forget a session's saved layout and scrollback (and its paste buffers, when they are kept).
     Forget,
     /// List workspaces: open ones and definitions on disk.
     #[command(alias = "ws")]
@@ -156,6 +156,13 @@ pub enum Cmd {
     },
     /// Show a desktop notification through the attached terminal.
     Notify { title: String, body: Option<String> },
+    /// Paste buffers: what kraal copied (copy mode, mouse selections, hints, the last command's
+    /// output), newest first, and text kept by name. Numbered buffers (0 is the newest) rotate;
+    /// named ones stay until deleted.
+    Buffer {
+        #[command(subcommand)]
+        action: BufferCmd,
+    },
     /// Runbooks: procedures with a plan, run on servers (TOML), and documents run step by step
     /// (Markdown). Yours are in ~/.config/kraal/runbooks, a repository's in .kraal/runbooks.
     Runbook {
@@ -348,6 +355,40 @@ pub enum Cmd {
     /// Run a session server in the foreground (normally started automatically).
     #[command(hide = true)]
     Server,
+}
+
+#[derive(Subcommand)]
+pub enum BufferCmd {
+    /// List the buffers, newest first: number or name, size, age, first line.
+    List {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Print a buffer's text: by number or name, the newest by default.
+    Show { buffer: Option<String> },
+    /// Keep text in a buffer: named (it stays until deleted), or numbered without a name. The
+    /// text comes from --from-file, else from the standard input.
+    Set {
+        name: Option<String>,
+        #[arg(short, long, value_name = "FILE")]
+        from_file: Option<PathBuf>,
+    },
+    /// Paste a buffer into a pane, as your terminal pastes: bracketed when the program asked for
+    /// it. By number or name, the newest by default.
+    Paste {
+        buffer: Option<String>,
+        #[arg(short, long)]
+        pane: Option<String>,
+        /// The pane is production and you mean to paste there.
+        #[arg(long)]
+        production: bool,
+    },
+    /// Delete a buffer (by number or name, the newest by default), or all of them.
+    Delete {
+        buffer: Option<String>,
+        #[arg(long, conflicts_with = "buffer")]
+        all: bool,
+    },
 }
 
 #[derive(Subcommand)]

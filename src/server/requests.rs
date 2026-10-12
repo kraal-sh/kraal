@@ -391,6 +391,16 @@ impl Server {
                 self.remove_tunnel(&key).map(|_| Response::Ok).map_err(|e| format!("{e:#}"))
             }
             Request::TunnelList => Ok(Response::Tunnels(self.tunnel_infos())),
+            Request::BufferList => Ok(Response::Buffers(self.buffer_infos())),
+            Request::BufferShow { buffer } => {
+                self.buffers.get(buffer.as_deref()).map(|b| Response::Text(b.text.clone()))
+            }
+            Request::BufferSet { name, text } => self.set_buffer(name.as_deref(), text),
+            Request::BufferPaste { buffer, pane, production } => self.resolve(&pane).and_then(|p| {
+                self.allow_input(p, production)?;
+                self.paste_buffer_to(p, buffer.as_deref())
+            }),
+            Request::BufferDelete { buffer, all } => self.delete_buffer(buffer.as_deref(), all),
             // Answered when the server stops, once its last state is written or has failed to
             // be: `kraal kill` then says whether the layout a restart brings back is saved.
             Request::ReloadConfig => self.reload_config().map(|warnings| Response::Text(warnings.join("\n"))),

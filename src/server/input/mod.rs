@@ -899,12 +899,32 @@ impl Server {
                 PromptAction::Upload { paths, raw: data, pane: p },
             ));
         }
+        self.paste(id, data)
+    }
+
+    /// Paste `data` as the terminal would: into the focused pane and those typing is broadcast
+    /// to, through the production guard.
+    fn paste(&mut self, id: ClientId, data: Vec<u8>) -> Mode {
         let Some(p) = self.client_focus(id) else { return Mode::Normal };
         let targets = self.input_targets(id, p);
         if self.hold_input(id, p, &targets, InputItem::Paste(data.clone())) {
             return Mode::Normal;
         }
         self.send_to_targets(p, &targets, vec![InputItem::Paste(data)])
+    }
+
+    /// Paste a buffer chosen in the list, as if the terminal pasted it.
+    fn paste_buffer(&mut self, id: ClientId, buffer: u64) -> Mode {
+        let Some(text) = self.picked_buffer(id, buffer) else { return Mode::Normal };
+        let takes = self
+            .client_focus(id)
+            .and_then(|p| self.panes.get(&p))
+            .is_some_and(|p| p.is_terminal() && p.exit_code.is_none());
+        if !takes {
+            self.toast(id, "this pane runs no program to paste into");
+            return Mode::Normal;
+        }
+        self.paste(id, text.into_bytes())
     }
 
     fn paste_into(&mut self, targets: &[PaneId], data: &[u8]) {
@@ -923,7 +943,14 @@ impl Server {
         }
     }
 
+    /// Copy `text` to the client's clipboard, and keep it as the newest paste buffer.
     pub(super) fn copy_to_client(&mut self, id: ClientId, text: &str) {
+        self.keep_copy(text);
+        self.send_clipboard(id, text);
+    }
+
+    /// Copy `text` to the client's clipboard (through its terminal) only.
+    pub(super) fn send_clipboard(&mut self, id: ClientId, text: &str) {
         if let Some(c) = self.clients.get(&id) {
             let _ = c.out.try_send(super::frame_bytes(&osc52(text)));
         }
