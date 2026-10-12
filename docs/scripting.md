@@ -113,8 +113,22 @@ that acts on the pane checks `$KRAAL_SERVER` first: it is empty for an agent of 
 ```
 
 `seq` grows with each event and `boot` changes when the server restarts. The server keeps the last
-1024 events: a script that was too slow (kraal drops it rather than slow down) or restarted can
-come back with `--since` its last `seq`; an `events.lost` line says when some are gone.
+1024 events: a script that restarted can come back with `--since` its last `seq`; an `events.lost`
+line says when some are gone.
+
+kraal never waits for a reader, and a reader may take the time it needs for each event. It is
+dropped when it falls too far behind: once 64 events wait for it in kraal, after those the system
+holds for it in its pipe and its connection (a few hundred on Linux, fewer on macOS). It still
+reads every event it was sent, then a last line, and `kraal events` fails (status 1) with the
+reason on its standard error:
+
+```
+{"v":1,"type":"events.dropped","boot":1760184000000,"since":1262,"reason":"too slow"}
+```
+
+`kraal events --since 1262 --boot 1760184000000` goes on from there, and misses nothing while the
+server still has the events. A stream that ends without that line, with status 0, ended with the
+session: kraal stopped or restarted, or its last pane closed.
 
 `[hooks]` runs a command when one happens, with the event in `$KRAAL_EVENT_JSON` and its fields as
 `$KRAAL_<FIELD>`; output goes to `~/.local/state/kraal/hooks.log`:

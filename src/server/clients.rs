@@ -2,8 +2,8 @@
 
 use std::io::Write;
 use std::os::unix::net::UnixStream;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::{SendTimeoutError, TrySendError};
@@ -274,34 +274,58 @@ pub fn frame_bytes(bytes: &[u8]) -> Vec<u8> {
 /// Where what goes to a client is sent. Written to its socket at once, from the server's
 /// thread, as far as the socket takes it without waiting and when nothing waits before it;
 /// the rest is queued, in order, for the client's writer thread.
-#[derive(Clone)]
 pub struct Outbox {
     queue: crossbeam_channel::Sender<Vec<u8>>,
     /// Messages queued and not written yet.
     queued: Arc<AtomicUsize>,
     socket: Arc<UnixStream>,
+    /// What the writer thread writes after everything queued, before it closes the connection
+    /// ([`Outbox::end_with`]).
+    last: Arc<OnceLock<Vec<u8>>>,
 }
+
+/// Messages an outbox queues for its writer thread: a client further behind takes no more.
+const QUEUE: usize = 64;
 
 impl Outbox {
     /// The outbox of a client connected on `stream`, and its writer thread.
     fn start(stream: UnixStream, id: ClientId) -> std::io::Result<Outbox> {
-        let (tx, rx) = crossbeam_channel::bounded::<Vec<u8>>(64);
+        let (tx, rx) = crossbeam_channel::bounded::<Vec<u8>>(QUEUE);
         // A client that stops reading is let go rather than holding its writer forever.
         let _ = stream.set_write_timeout(Some(Duration::from_secs(10)));
-        let out = Outbox { queue: tx, queued: Arc::new(AtomicUsize::new(0)), socket: Arc::new(stream) };
-        let (queued, socket) = (out.queued.clone(), out.socket.clone());
+        let out =
+            Outbox { queue: tx, queued: Arc::new(AtomicUsize::new(0)), socket: Arc::new(stream), last: Arc::default() };
+        let (queued, socket, last) = (out.queued.clone(), out.socket.clone(), out.last.clone());
         std::thread::Builder::new().name(format!("client-{id}-write")).spawn(move || {
             let mut w = &*socket;
-            for data in rx {
-                if w.write_all(&data).and_then(|_| w.flush()).is_err() {
-                    break;
+            let written = rx.iter().all(|data| {
+                let written = w.write_all(&data).and_then(|_| w.flush()).is_ok();
+                if written {
+                    // Once nothing is left, the server writes again itself.
+                    queued.fetch_sub(1, Ordering::AcqRel);
                 }
-                // Written: once nothing is left, the server writes again itself.
-                queued.fetch_sub(1, Ordering::AcqRel);
+                written
+            });
+            // The outbox is gone and what it queued is written: now what it left to say last.
+            if written && let Some(last) = last.get() {
+                let _ = w.write_all(last);
             }
             let _ = socket.shutdown(std::net::Shutdown::Both);
         })?;
         Ok(out)
+    }
+
+    /// Let the client take as long as it needs to read what waits for it: for a connection that
+    /// only listens (an event stream), which is closed for how far behind it is, never for how
+    /// long it takes. Cut after a while without reading, it could not be told why its stream ends.
+    pub fn wait_for_reader(&self) {
+        let _ = self.socket.set_write_timeout(None);
+    }
+
+    /// Close the connection once the client has read what is queued, then `last`: what a client
+    /// that takes no more (its queue is full) is told before it goes.
+    pub fn end_with(self, last: Vec<u8>) {
+        let _ = self.last.set(last);
     }
 
     pub fn try_send(&self, data: Vec<u8>) -> Result<(), TrySendError<Vec<u8>>> {
@@ -377,11 +401,11 @@ mod tests {
         }
     }
 
-    #[test]
-    fn what_a_client_does_not_read_yet_waits_for_it_in_order() {
+    /// A connection, the server's end first, with a small send buffer, as macOS gives a socket:
+    /// messages are cut often.
+    fn small_pair() -> (UnixStream, UnixStream) {
         use std::os::fd::AsRawFd;
-        let (server_end, mut client_end) = UnixStream::pair().unwrap();
-        // A small send buffer, as macOS gives a socket: messages are cut often.
+        let (server_end, client_end) = UnixStream::pair().unwrap();
         let size: libc::c_int = 8 * 1024;
         // SAFETY: sets an int option on a socket the test holds.
         let set = unsafe {
@@ -394,6 +418,12 @@ mod tests {
             )
         };
         assert_eq!(set, 0);
+        (server_end, client_end)
+    }
+
+    #[test]
+    fn what_a_client_does_not_read_yet_waits_for_it_in_order() {
+        let (server_end, mut client_end) = small_pair();
         let out = Outbox::start(server_end, 1).unwrap();
         // Small enough to go at once (through the writer thread where a send cannot be told not
         // to wait).
@@ -424,5 +454,44 @@ mod tests {
         let mut rest = Vec::new();
         client_end.read_to_end(&mut rest).unwrap();
         assert_eq!(rest, b"last", "and the connection closed after it");
+    }
+
+    #[test]
+    fn a_client_that_takes_no_more_reads_what_was_queued_then_the_last_words() {
+        let (server_end, mut client_end) = small_pair();
+        let out = Outbox::start(server_end, 1).unwrap();
+        // It reads nothing: its socket fills, then its queue, and it is sent no more.
+        let mut taken: Vec<Vec<u8>> = Vec::new();
+        loop {
+            let message = vec![b'a' + (taken.len() % 26) as u8; 1000 + taken.len()];
+            if out.try_send(message.clone()).is_err() {
+                break;
+            }
+            taken.push(message);
+            assert!(taken.len() < 10 * QUEUE, "never full");
+        }
+        assert!(taken.len() >= QUEUE, "{}", taken.len());
+        out.end_with(b"the end".to_vec());
+        let mut got = Vec::new();
+        client_end.read_to_end(&mut got).unwrap();
+        taken.push(b"the end".to_vec());
+        assert!(got == taken.concat(), "every message taken, in order, then the last words, then the end");
+    }
+
+    #[test]
+    fn a_reader_waited_for_takes_the_time_it_needs() {
+        let (server_end, mut client_end) = small_pair();
+        let out = Outbox::start(server_end, 1).unwrap();
+        // A client has ten seconds to take what is written to it: far less here, and this one
+        // takes longer.
+        out.socket.set_write_timeout(Some(Duration::from_millis(20))).unwrap();
+        out.wait_for_reader();
+        let message = vec![b'x'; 256 * 1024];
+        out.try_send(message.clone()).unwrap();
+        out.end_with(b"the end".to_vec());
+        std::thread::sleep(Duration::from_millis(200));
+        let mut got = Vec::new();
+        client_end.read_to_end(&mut got).unwrap();
+        assert!(got == [message, b"the end".to_vec()].concat(), "cut before it had read everything");
     }
 }
