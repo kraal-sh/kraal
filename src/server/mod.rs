@@ -947,13 +947,14 @@ impl Server {
                 if !self.take_output(p, &mut data, true) {
                     break;
                 }
-                if !self.parse_output(p, &data, rx) {
+                if !self.parse_output(p, &data, rx, false) {
                     break;
                 }
             }
         }
         // A frame due (an echo) goes before the others' turn, but not twice in a row: a pane
-        // printing in the focus, with frames always due, must not starve the others.
+        // printing in the focus, with frames always due, must not starve the others. Their turn
+        // is then a slice: the frame waits no longer than that.
         let now = Instant::now();
         let due = [self.next_render, self.image_wake].into_iter().flatten().any(|t| t <= now);
         let skip = due && !self.turn_skipped;
@@ -962,7 +963,7 @@ impl Server {
         while !std::mem::replace(&mut served, true) || more(self, budget) {
             let Some(id) = self.ready.pop_front() else { break };
             if self.take_output(id, &mut data, true) {
-                self.parse_output(id, &data, rx);
+                self.parse_output(id, &data, rx, due);
                 self.ready.push_back(id);
             } else if self.streaming(id) {
                 self.watched.push(id);
@@ -975,9 +976,9 @@ impl Server {
     }
 
     /// Parse output `data` of pane `id`, a slice at a time, until it is all parsed (true) or
-    /// something waits in `rx`: then the rest is parsed before any more of the pane's output,
-    /// and the pane stays in the queue for it.
-    fn parse_output(&mut self, id: PaneId, data: &[u8], rx: &Receiver<Event>) -> bool {
+    /// something waits in `rx` (after one slice with `one`): then the rest is parsed before any
+    /// more of the pane's output, and the pane stays in the queue for it.
+    fn parse_output(&mut self, id: PaneId, data: &[u8], rx: &Receiver<Event>, one: bool) -> bool {
         let typing = self.clients.values().any(|c| c.attached && c.last_input.elapsed() < TYPING);
         let slice = if typing { TYPING_SLICE } else { PARSE_SLICE };
         let mut at = 0;
@@ -985,7 +986,7 @@ impl Server {
             let end = (at + slice).min(data.len());
             self.pane_output(id, &data[at..end]);
             at = end;
-            if at < data.len() && !rx.is_empty() && self.panes.contains_key(&id) {
+            if at < data.len() && (one || !rx.is_empty()) && self.panes.contains_key(&id) {
                 self.unparsed.insert(id, data[at..].to_vec());
                 if self.ready_set.insert(id) {
                     self.ready.push_back(id);
