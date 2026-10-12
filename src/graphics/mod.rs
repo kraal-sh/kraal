@@ -8,6 +8,12 @@
 //! the images it needs (see `server::graphics`), and the cells render as the image there. A
 //! terminal that draws sixel instead gets each visible part of an image as a sixel image drawn
 //! over the cells (see [`paint`]); for the others, the cells render blank.
+//!
+//! What takes time (decoding what the program sent, encoding it as PNG, cutting a part of it) is
+//! done off the server's loop, a pane's pictures one at a time and in order (see [`Job`]): an
+//! image's cells are written as soon as its size is known, where the cursor is then, and render
+//! blank until its PNG is ready. The reply to a transmission comes then, and the program's other
+//! replies wait for it.
 
 mod diacritics;
 #[cfg(test)]
@@ -19,9 +25,9 @@ pub mod sixel;
 #[cfg(test)]
 mod tests;
 
-use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock, Weak};
 
 use alacritty_terminal::event::EventListener;
 use alacritty_terminal::grid::Dimensions;
@@ -65,6 +71,14 @@ const SWEEP_START: usize = 32;
 /// proportion to its pixels. Past it, the pane's images are refused (kitty) or dropped (sixel)
 /// until the next second; one image, however large, always fits in a second that spent nothing.
 const PIXELS_PER_SECOND: u64 = 100_000_000;
+/// Pictures this small (in bytes of data or of RGBA pixels) are prepared at once: a thread
+/// would cost about as much.
+const AT_ONCE: usize = 256 << 10;
+/// A PNG's first bytes: its signature, then its IHDR chunk, which gives its size.
+const PNG_SIGNATURE: [u8; 8] = [137, b'P', b'N', b'G', 13, 10, 26, 10];
+const PNG_HEAD: usize = 24;
+/// The base64 data read for the header of a compressed PNG: deflate's block headers come first.
+const PNG_HEAD_SEARCH: usize = 64 << 10;
 
 const LENIENT: base64::engine::GeneralPurpose = base64::engine::GeneralPurpose::new(
     &base64::alphabet::STANDARD,
@@ -157,24 +171,26 @@ impl Shared {
     }
 }
 
-/// An image as kraal keeps it: PNG, whatever the program sent.
+/// An image as kraal keeps it: PNG, whatever the program sent. Its size is known from the start,
+/// its PNG once prepared.
 pub struct Picture {
-    pub png: Vec<u8>,
     pub width: u32,
     pub height: u32,
+    png: OnceLock<Vec<u8>>,
     shared: Arc<Shared>,
 }
 
 impl Picture {
-    /// A PNG of `width × height` pixels, counted in the quota while it lives: the pane that keeps
-    /// it makes room for it (see [`PaneGraphics::make_room`]).
-    fn new(png: Vec<u8>, width: u32, height: u32, shared: &Arc<Shared>) -> Arc<Picture> {
-        shared.used.fetch_add(png.len() + PICTURE_COST, Ordering::Relaxed);
-        Arc::new(Picture { png, width, height, shared: shared.clone() })
+    /// A picture of `width × height` pixels to prepare, counted in the quota while it lives (its
+    /// PNG too, once it has it): the pane that keeps it makes room for it (see
+    /// [`PaneGraphics::make_room`]).
+    fn pending((width, height): (u32, u32), shared: &Arc<Shared>) -> Arc<Picture> {
+        shared.used.fetch_add(PICTURE_COST, Ordering::Relaxed);
+        Arc::new(Picture { width, height, png: OnceLock::new(), shared: shared.clone() })
     }
 
-    /// [`Picture::new`] for a picture that cannot make room for itself (a preview's: the panes'
-    /// images are not its to drop): only when it fits in what the quota has left.
+    /// A picture whose PNG is ready, for one that cannot make room for itself (a preview's: the
+    /// panes' images are not its to drop): only when it fits in what the quota has left.
     pub fn within_quota(png: Vec<u8>, width: u32, height: u32, shared: &Arc<Shared>) -> Option<Arc<Picture>> {
         let cost = png.len() + PICTURE_COST;
         let mut used = shared.used.load(Ordering::Relaxed);
@@ -185,22 +201,23 @@ impl Picture {
                 Err(now) => used = now,
             }
         }
-        Some(Arc::new(Picture { png, width, height, shared: shared.clone() }))
+        Some(Arc::new(Picture { width, height, png: OnceLock::from(png), shared: shared.clone() }))
     }
 
-    fn checked(png: Vec<u8>, width: u32, height: u32, shared: &Arc<Shared>) -> Result<Arc<Picture>, String> {
-        if png.len() > MAX_PNG {
-            return Err("EFBIG:image too large".into());
+    /// Its PNG, once prepared.
+    pub fn png(&self) -> Option<&[u8]> {
+        self.png.get().map(Vec::as_slice)
+    }
+
+    fn fill(&self, png: Vec<u8>) {
+        let bytes = png.len();
+        if self.png.set(png).is_ok() {
+            self.shared.used.fetch_add(bytes, Ordering::Relaxed);
         }
-        Ok(Picture::new(png, width, height, shared))
-    }
-
-    fn from_rgba(width: u32, height: u32, rgba: Vec<u8>, shared: &Arc<Shared>) -> Result<Arc<Picture>, String> {
-        Picture::checked(encode_png(width, height, &rgba)?, width, height, shared)
     }
 
     pub fn decode(&self) -> Result<image::DynamicImage, String> {
-        decode_png(&self.png)
+        decode_png(self.png().ok_or_else(|| "ENODATA:not prepared".to_string())?)
     }
 }
 
@@ -221,9 +238,46 @@ pub fn encode_png(width: u32, height: u32, rgba: &[u8]) -> Result<Vec<u8>, Strin
     Ok(png)
 }
 
+/// A PNG to keep: one too large to reach a client's terminal in one frame is refused.
+fn kept(png: Vec<u8>) -> Prepared {
+    if png.len() > MAX_PNG {
+        return Err("EFBIG:image too large".into());
+    }
+    Ok(png)
+}
+
 impl Drop for Picture {
     fn drop(&mut self) {
-        self.shared.used.fetch_sub(self.png.len() + PICTURE_COST, Ordering::Relaxed);
+        let png = self.png.get().map_or(0, Vec::len);
+        self.shared.used.fetch_sub(png + PICTURE_COST, Ordering::Relaxed);
+    }
+}
+
+/// What a program sent for a picture, held until the picture is prepared: it counts in the quota
+/// meanwhile.
+struct Held {
+    data: Vec<u8>,
+    shared: Arc<Shared>,
+}
+
+impl Held {
+    fn new(data: Vec<u8>, shared: &Arc<Shared>) -> Held {
+        shared.used.fetch_add(data.len(), Ordering::Relaxed);
+        Held { data, shared: shared.clone() }
+    }
+}
+
+impl std::ops::Deref for Held {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        &self.data
+    }
+}
+
+impl Drop for Held {
+    fn drop(&mut self) {
+        self.shared.used.fetch_sub(self.data.len(), Ordering::Relaxed);
     }
 }
 
@@ -278,13 +332,7 @@ impl Budget {
         }
     }
 
-    /// Whether nothing more may be decoded this second.
-    fn spent(&mut self) -> bool {
-        self.renew();
-        self.spent >= self.limit
-    }
-
-    /// Count `pixels` decoded; whether they fit, when asked before.
+    /// Count `pixels` to decode, when they fit in what is left of this second; whether they do.
     fn spend(&mut self, pixels: u64) -> bool {
         self.renew();
         if self.spent > 0 && self.spent.saturating_add(pixels) > self.limit {
@@ -302,6 +350,56 @@ struct Pending {
     command: Command,
     payload: Vec<u8>,
 }
+
+/// Makes a picture's PNG: what is slow (decoding what the program sent, encoding it as PNG,
+/// cropping) runs on a thread of its own.
+pub type Work = Box<dyn FnOnce() -> Prepared + Send>;
+/// A picture's PNG, or what went wrong (a kitty error: code, colon, message).
+pub type Prepared = Result<Vec<u8>, String>;
+
+/// A picture to prepare.
+struct Job {
+    picture: Weak<Picture>,
+    /// The program, when it is to hear how its transmission went.
+    asker: Option<Asker>,
+    work: Work,
+    /// How much work it is (see [`cost`]).
+    cost: usize,
+}
+
+impl Job {
+    /// Whether anything still waits for it: what shows or keeps the picture, or the program.
+    fn wanted(&self) -> bool {
+        self.asker.is_some() || self.picture.strong_count() > 0
+    }
+}
+
+/// A transmission's command, replied to under `id`.
+struct Asker {
+    command: Command,
+    id: u32,
+}
+
+impl Asker {
+    /// Whom to tell how a transmission went, unless the program is not to hear of it.
+    fn new(id: u32, command: Command) -> Option<Asker> {
+        command.answers(id).then_some(Asker { command, id })
+    }
+}
+
+/// What a program is told about an image command.
+#[derive(Debug, PartialEq)]
+pub enum Answer {
+    /// This, at once (or nothing).
+    Now(Option<Vec<u8>>),
+    /// A reply once its picture is prepared: the replies to what the program asks after wait
+    /// for it.
+    Later,
+}
+
+/// The reply a picture prepared off the server's loop owed the program: none when it asked not
+/// to hear of this outcome.
+pub struct Owed(pub Option<Vec<u8>>);
 
 /// A pane's images: what its program sent, and what is on show.
 pub struct PaneGraphics {
@@ -323,6 +421,10 @@ pub struct PaneGraphics {
     /// Images with cells in the part of the history kept outside the emulator.
     pub archived: HashSet<u32>,
     budget: Budget,
+    /// Pictures waiting to be prepared, and the one being prepared with whoever waits for it:
+    /// one at a time, in order, so that a part of a picture comes after the picture.
+    jobs: VecDeque<Job>,
+    preparing: Option<(Weak<Picture>, Option<Asker>)>,
 }
 
 impl Drop for PaneGraphics {
@@ -349,6 +451,8 @@ impl PaneGraphics {
             sweep_at: SWEEP_START,
             archived: HashSet::new(),
             budget: Budget::new(),
+            jobs: VecDeque::new(),
+            preparing: None,
         }
     }
 
@@ -365,21 +469,25 @@ impl PaneGraphics {
         self.scanner.split(bytes)
     }
 
-    /// Images on show, by kraal's id.
+    /// Images on show, by kraal's id: those whose picture is prepared.
     pub fn shown(&self) -> impl Iterator<Item = (u32, &Shown)> {
-        self.shown.iter().map(|(k, s)| (*k, s))
+        self.shown.iter().filter(|(_, s)| s.picture.png().is_some()).map(|(k, s)| (*k, s))
     }
 
-    /// Act on an image sequence; returns the reply for the program, if any.
-    pub fn handle<T: EventListener>(&mut self, piece: Piece<'_>, term: &mut Term<T>) -> Option<Vec<u8>> {
-        match piece {
-            Piece::Text(_) => None,
+    /// Act on an image sequence: what the program is told.
+    pub fn handle<T: EventListener>(&mut self, piece: Piece<'_>, term: &mut Term<T>) -> Answer {
+        let answer = match piece {
+            Piece::Text(_) => Answer::Now(None),
             Piece::Kitty(body) => self.kitty(&body, term),
-            Piece::Sixel { data, .. } => {
-                self.sixel(&data, term);
-                None
+            Piece::Sixel { data, size, .. } => {
+                self.sixel(data, size, term);
+                Answer::Now(None)
             }
-        }
+        };
+        // Pictures gone meanwhile (deleted, replaced, written over, beyond the quota) are not
+        // prepared.
+        self.jobs.retain(Job::wanted);
+        answer
     }
 
     fn tick(&mut self) -> u64 {
@@ -389,22 +497,22 @@ impl PaneGraphics {
 
     // ---- kitty graphics commands -----------------------------------------------------
 
-    fn kitty<T: EventListener>(&mut self, body: &[u8], term: &mut Term<T>) -> Option<Vec<u8>> {
+    fn kitty<T: EventListener>(&mut self, body: &[u8], term: &mut Term<T>) -> Answer {
         let mut cmd = match Command::parse(body) {
             Ok(c) => c,
-            Err(e) => return Command::default().reply(0, e),
+            Err(e) => return Answer::Now(Command::default().reply(0, e)),
         };
         // The chunks of a transmission carry only `m` (and `q`); a deletion ends it.
         if cmd.action != Some(b'd')
             && let Some(mut pending) = self.pending.take()
         {
             if pending.payload.len() + cmd.payload.len() > MAX_UPLOAD {
-                return pending.command.reply(pending.command.id, "EFBIG:image too large".into());
+                return Answer::Now(pending.command.reply(pending.command.id, "EFBIG:image too large".into()));
             }
             pending.payload.extend_from_slice(&cmd.payload);
             if cmd.more {
                 self.pending = Some(pending);
-                return None;
+                return Answer::Now(None);
             }
             let mut command = pending.command;
             command.payload = pending.payload;
@@ -413,34 +521,42 @@ impl PaneGraphics {
         match cmd.action.unwrap_or(b't') {
             b't' | b'T' | b'q' if cmd.more => {
                 self.pending = Some(Pending { payload: std::mem::take(&mut cmd.payload), command: cmd });
-                None
+                Answer::Now(None)
             }
             b't' | b'T' | b'q' => self.transmit(cmd, term),
-            b'p' => {
-                if !self.shared.available() {
-                    return None;
-                }
-                let id = match self.resolve_app(&cmd) {
-                    Ok(id) => id,
-                    Err(e) => return cmd.reply(cmd.id, e),
-                };
-                let Some(picture) = self.uploads.get_mut(&id).map(|u| {
-                    u.stamp = self.clock + 1;
-                    u.picture.clone()
-                }) else {
-                    return cmd.reply(id, "ENOENT:no such image".into());
-                };
-                self.tick();
-                match self.place(&cmd, id, picture, term) {
-                    Ok(()) => cmd.reply(id, "OK".into()),
-                    Err(e) => cmd.reply(id, e),
-                }
-            }
+            b'p' => Answer::Now(self.place_upload(&cmd, term)),
             b'd' => {
                 self.delete(&cmd, term);
-                None
+                Answer::Now(None)
             }
-            _ => cmd.reply(cmd.id, "EINVAL:animation is not supported".into()),
+            _ => Answer::Now(cmd.reply(cmd.id, "EINVAL:animation is not supported".into())),
+        }
+    }
+
+    /// Place an image the program sent before; the reply.
+    fn place_upload<T: EventListener>(&mut self, cmd: &Command, term: &mut Term<T>) -> Option<Vec<u8>> {
+        if !self.shared.available() {
+            return None;
+        }
+        let id = match self.resolve_app(cmd) {
+            Ok(id) => id,
+            Err(e) => return cmd.reply(cmd.id, e),
+        };
+        let Some(picture) = self.uploads.get_mut(&id).map(|u| {
+            u.stamp = self.clock + 1;
+            u.picture.clone()
+        }) else {
+            return cmd.reply(id, "ENOENT:no such image".into());
+        };
+        self.tick();
+        match self.place(cmd, id, picture, term) {
+            Ok(cut) => {
+                if let Some(cut) = cut {
+                    self.prepare(cut);
+                }
+                cmd.reply(id, "OK".into())
+            }
+            Err(e) => cmd.reply(id, e),
         }
     }
 
@@ -454,29 +570,58 @@ impl PaneGraphics {
         }
     }
 
-    fn transmit<T: EventListener>(&mut self, mut cmd: Command, term: &mut Term<T>) -> Option<Vec<u8>> {
+    fn transmit<T: EventListener>(&mut self, mut cmd: Command, term: &mut Term<T>) -> Answer {
         // Like a terminal without images: nothing kept, nothing answered.
         if !self.shared.available() {
-            return None;
+            return Answer::Now(None);
         }
         if cmd.id != 0 && cmd.number != 0 {
-            return cmd.reply(cmd.id, "EINVAL:both an id and a number".into());
+            return Answer::Now(cmd.reply(cmd.id, "EINVAL:both an id and a number".into()));
         }
-        let query = cmd.action == Some(b'q');
-        let picture = match self.load(&mut cmd) {
-            Ok(p) => p,
-            Err(e) => return cmd.reply(cmd.id, e),
+        let payload = std::mem::take(&mut cmd.payload);
+        let bytes = payload.len();
+        let (size, work) = match transmission(&cmd, payload, &self.shared) {
+            Ok(t) => t,
+            Err(e) => return Answer::Now(cmd.reply(cmd.id, e)),
         };
-        if query {
-            return cmd.reply(cmd.id, "OK".into());
+        if !self.budget.spend(u64::from(size.0) * u64::from(size.1)) {
+            return Answer::Now(cmd.reply(cmd.id, BUSY.into()));
         }
+        let cost = cost(bytes, size);
+        if cmd.action == Some(b'q') {
+            // Tried, never kept: a large one only as far as its size, rather than hold its data
+            // or take room from the images.
+            let tried = if cost <= AT_ONCE { work().map(drop) } else { Ok(()) };
+            return Answer::Now(cmd.outcome(cmd.id, tried));
+        }
+        let picture = Picture::pending(size, &self.shared);
         if let Err(e) = self.make_room() {
-            return cmd.reply(cmd.id, e);
+            return Answer::Now(cmd.reply(cmd.id, e));
         }
-        // An id or a number keeps the image for later placements; sending an id again
-        // replaces that image, and what showed it goes.
+        let id = self.keep(&cmd, &picture);
+        let placed = if cmd.action == Some(b'T') { self.place(&cmd, id, picture.clone(), term) } else { Ok(None) };
+        let load = Job { picture: Arc::downgrade(&picture), asker: None, work, cost };
+        match placed {
+            // The program hears why it could not be placed, and the picture is kept all the same.
+            Err(e) => {
+                self.prepare(load);
+                Answer::Now(cmd.reply(id, e))
+            }
+            Ok(cut) => {
+                let answer = self.prepare(Job { asker: Asker::new(id, cmd), ..load });
+                if let Some(cut) = cut {
+                    self.prepare(cut);
+                }
+                answer
+            }
+        }
+    }
+
+    /// Keep `picture` for later placements under the id or the number `cmd` gives: sending an
+    /// id again replaces that image, and what showed it goes. The id it is replied to under.
+    fn keep(&mut self, cmd: &Command, picture: &Arc<Picture>) -> u32 {
         let id = match (cmd.id, cmd.number) {
-            (0, 0) => 0,
+            (0, 0) => return 0,
             (0, n) => {
                 let id = self.shared.new_id();
                 self.numbers.insert(n, id);
@@ -488,79 +633,27 @@ impl PaneGraphics {
             }
         };
         let stamp = self.tick();
-        if id != 0 {
-            self.uploads.insert(id, Upload { picture: picture.clone(), stamp });
-        }
-        if cmd.action == Some(b'T')
-            && let Err(e) = self.place(&cmd, id, picture, term)
-        {
-            return cmd.reply(id, e);
-        }
-        cmd.reply(id, "OK".into())
-    }
-
-    /// The picture a transmission carries.
-    fn load(&mut self, cmd: &mut Command) -> Result<Arc<Picture>, String> {
-        if cmd.medium != b'd' {
-            // Files and shared memory would be this machine's, not the program's when it runs
-            // elsewhere (over ssh): programs fall back to sending the data.
-            return Err("EBADF:Failed to read image file".into());
-        }
-        let mut data = LENIENT.decode(&cmd.payload).map_err(|_| "EINVAL:bad base64 data".to_string())?;
-        cmd.payload = Vec::new();
-        if cmd.compressed {
-            let limit = (MAX_PIXELS * 4) as usize;
-            data = miniz_oxide::inflate::decompress_to_vec_zlib_with_limit(&data, limit)
-                .map_err(|_| "EINVAL:bad compressed data".to_string())?;
-        }
-        match cmd.format {
-            100 => {
-                if self.budget.spent() {
-                    return Err(BUSY.into());
-                }
-                let img = decode_png(&data)?;
-                self.budget.spend(u64::from(img.width()) * u64::from(img.height()));
-                Picture::checked(data, img.width(), img.height(), &self.shared)
-            }
-            24 | 32 => {
-                let (w, h) = (cmd.width, cmd.height);
-                if w == 0 || h == 0 || w > MAX_SIDE || h > MAX_SIDE || u64::from(w) * u64::from(h) > MAX_PIXELS {
-                    return Err("EINVAL:bad image size".into());
-                }
-                if !self.budget.spend(u64::from(w) * u64::from(h)) {
-                    return Err(BUSY.into());
-                }
-                let bpp = if cmd.format == 24 { 3 } else { 4 };
-                if data.len() != w as usize * h as usize * bpp {
-                    return Err("ENODATA:size does not match the data".into());
-                }
-                let rgba = if bpp == 4 {
-                    data
-                } else {
-                    data.as_chunks::<3>().0.iter().flat_map(|[r, g, b]| [*r, *g, *b, 255]).collect()
-                };
-                Picture::from_rgba(w, h, rgba, &self.shared)
-            }
-            _ => Err("EINVAL:unknown format".into()),
-        }
+        self.uploads.insert(id, Upload { picture: picture.clone(), stamp });
+        id
     }
 
     /// Show `picture` as `cmd` asks: a virtual placement for the program's own placeholders, or
-    /// placeholders written at the cursor.
+    /// placeholders written at the cursor. When it shows a part of the picture, the job that
+    /// cuts it, to prepare after the picture.
     fn place<T: EventListener>(
         &mut self,
         cmd: &Command,
         id: u32,
         picture: Arc<Picture>,
         term: &mut Term<T>,
-    ) -> Result<(), String> {
+    ) -> Result<Option<Job>, String> {
         if id == 0 && cmd.virtual_ {
             return Err("EINVAL:a placeholder needs an image id".into());
         }
         // A part of the image is a new picture: it counts in the quota like any.
-        let picture = crop(picture, cmd, &self.shared, &mut self.budget)?;
+        let (picture, cut) = crop(picture, cmd, &self.shared, &mut self.budget)?;
         self.make_room()?;
-        let (cols, rows) = cells_for(&picture, cmd.cols, cmd.rows, self.shared.cell());
+        let (cols, rows) = cells_for((picture.width, picture.height), cmd.cols, cmd.rows, self.shared.cell());
         let stamp = self.tick();
         if cmd.virtual_ {
             let kid = *self.virtual_ids.entry(id).or_insert_with(|| self.shared.new_id());
@@ -583,7 +676,7 @@ impl PaneGraphics {
             shown.stamp = stamp;
             self.limit_shown();
             self.shared.changed();
-            return Ok(());
+            return Ok(cut);
         }
         // A named placement placed again moves: the old one goes.
         if id != 0
@@ -613,7 +706,7 @@ impl PaneGraphics {
         }
         self.limit_shown();
         self.shared.changed();
-        Ok(())
+        Ok(cut)
     }
 
     fn delete<T: EventListener>(&mut self, cmd: &Command, term: &Term<T>) {
@@ -710,8 +803,9 @@ impl PaneGraphics {
         self.shared.changed();
     }
 
-    /// Keep the images of all panes within the quota, the new one counted: this pane's oldest
-    /// images go first. Another pane's images are not this pane's to drop.
+    /// Keep the images of all panes, with what was sent for those still to prepare, within the
+    /// quota, the new one counted: this pane's oldest images go first. Another pane's images are
+    /// not this pane's to drop.
     fn make_room(&mut self) -> Result<(), String> {
         while self.shared.used() > self.shared.quota {
             let oldest_upload = self.uploads.iter().min_by_key(|(_, u)| u.stamp).map(|(id, u)| (u.stamp, *id));
@@ -722,6 +816,8 @@ impl PaneGraphics {
                 (Some((_, id)), None) => self.remove_upload(id),
                 (None, None) => return Err("ENOSPC:image storage is full".into()),
             }
+            // What was sent for a picture that went, waiting for its preparation, goes too.
+            self.jobs.retain(Job::wanted);
         }
         Ok(())
     }
@@ -757,13 +853,16 @@ impl PaneGraphics {
 
     /// Images placed at the cursor whose cells are all gone (written over, or out of the
     /// history) are forgotten. kraal reads the grid through each time their number doubles, so
-    /// the cost stays in proportion to what was placed. The images of the screen that is not up
-    /// (main or alternate) are left alone, except that the alternate screen's go with it.
+    /// the cost stays in proportion to what was placed; on the alternate screen, which has no
+    /// history to read, also while pictures wait to be prepared: one written over is not. The
+    /// images of the screen that is not up (main or alternate) are left alone, except that the
+    /// alternate screen's go with it.
     fn sweep<T: EventListener>(&mut self, term: &Term<T>) {
-        if !self.sweep_due() {
+        let alt = term.mode().contains(TermMode::ALT_SCREEN);
+        let due = self.sweep_due() || (alt && !self.jobs.is_empty());
+        if !due {
             return;
         }
-        let alt = term.mode().contains(TermMode::ALT_SCREEN);
         let mut seen = placed_ids(term);
         if !alt {
             seen.extend(&self.archived);
@@ -782,18 +881,20 @@ impl PaneGraphics {
 
     // ---- sixel ---------------------------------------------------------------------------
 
-    fn sixel<T: EventListener>(&mut self, data: &[u8], term: &mut Term<T>) {
-        if !self.shared.available() || self.budget.spent() {
+    /// A sixel image of `size` (when it draws one): its cells now, at the cursor, its pixels once
+    /// they are painted.
+    fn sixel<T: EventListener>(&mut self, data: Vec<u8>, size: Option<(u32, u32)>, term: &mut Term<T>) {
+        let Some(size) = size.filter(|_| self.shared.available()) else { return };
+        if !self.budget.spend(u64::from(size.0) * u64::from(size.1)) {
             return;
         }
-        let Some(img) = sixel::decode(data) else { return };
-        self.budget.spend(u64::from(img.width) * u64::from(img.height));
-        let Ok(picture) = Picture::from_rgba(img.width, img.height, img.pixels, &self.shared) else { return };
+        let data = Held::new(data, &self.shared);
+        let picture = Picture::pending(size, &self.shared);
         if self.make_room().is_err() {
             return;
         }
         self.sweep(term);
-        let (cols, rows) = cells_for(&picture, 0, 0, self.shared.cell());
+        let (cols, rows) = cells_for(size, 0, 0, self.shared.cell());
         let kid = self.shared.new_id();
         let alt = term.mode().contains(TermMode::ALT_SCREEN);
         let drawn = write_cells(term, kid, cols, rows, After::NextLine);
@@ -801,7 +902,7 @@ impl PaneGraphics {
         self.shown.insert(
             kid,
             Shown {
-                picture,
+                picture: picture.clone(),
                 placements: vec![(0, drawn.0, drawn.1)],
                 generation: 0,
                 origin: 0,
@@ -811,17 +912,125 @@ impl PaneGraphics {
             },
         );
         self.limit_shown();
-        self.shared.changed();
+        let cost = cost(data.len(), size);
+        let wanted = Arc::downgrade(&picture);
+        let work = move || {
+            let rgba = sixel::paint(&data, size);
+            drop(data);
+            // Written over or scrolled away meanwhile, or its pane closed: no PNG for it.
+            if wanted.strong_count() == 0 {
+                return Err("ECANCELED:no longer shown".into());
+            }
+            kept(encode_png(size.0, size.1, &rgba)?)
+        };
+        self.prepare(Job { picture: Arc::downgrade(&picture), asker: None, work: Box::new(work), cost });
+    }
+
+    // ---- preparing pictures --------------------------------------------------------------
+
+    /// Prepare a picture, if anything still waits for it: at once when that is quick and none of
+    /// this pane's waits (they keep their order), else off the server's loop. What the program
+    /// is told now.
+    fn prepare(&mut self, job: Job) -> Answer {
+        if !job.wanted() {
+            return Answer::Now(None);
+        }
+        if job.cost > AT_ONCE || !self.jobs.is_empty() || self.preparing.is_some() {
+            let later = job.asker.is_some();
+            self.jobs.push_back(job);
+            return if later { Answer::Later } else { Answer::Now(None) };
+        }
+        Answer::Now(self.settle(job.picture, job.asker, (job.work)()))
+    }
+
+    /// The pane's program was started again: the old one is told nothing more.
+    pub fn restarted(&mut self) {
+        self.pending = None;
+        for job in &mut self.jobs {
+            job.asker = None;
+        }
+        if let Some((_, asker)) = &mut self.preparing {
+            *asker = None;
+        }
+        self.jobs.retain(Job::wanted);
+    }
+
+    /// Whether [`PaneGraphics::next_work`] has work to give.
+    pub fn has_work(&self) -> bool {
+        self.preparing.is_none() && !self.jobs.is_empty()
+    }
+
+    /// The work of the next picture to prepare off the server's loop, unless one is being
+    /// prepared: a pane's pictures are prepared one at a time, in order.
+    pub fn next_work(&mut self) -> Option<Work> {
+        if self.preparing.is_some() {
+            return None;
+        }
+        let job = std::iter::from_fn(|| self.jobs.pop_front()).find(Job::wanted)?;
+        self.preparing = Some((job.picture, job.asker));
+        Some(job.work)
+    }
+
+    /// The picture whose work [`PaneGraphics::next_work`] gave was prepared: what the program was
+    /// owed, when it was.
+    pub fn prepared(&mut self, prepared: Prepared) -> Option<Owed> {
+        let (picture, asker) = self.preparing.take()?;
+        let owed = asker.is_some();
+        let reply = self.settle(picture, asker, prepared);
+        // Making room for it may have taken pictures waiting to be prepared.
+        self.jobs.retain(Job::wanted);
+        owed.then_some(Owed(reply))
+    }
+
+    /// A picture was prepared, or could not be; the reply its transmission owes, if any.
+    fn settle(&mut self, picture: Weak<Picture>, asker: Option<Asker>, prepared: Prepared) -> Option<Vec<u8>> {
+        let outcome = match picture.upgrade() {
+            Some(picture) => self.finish(&picture, prepared),
+            // Gone meanwhile: only the program is to hear how it went.
+            None => prepared.map(drop),
+        };
+        let Asker { command, id } = asker?;
+        command.outcome(id, outcome)
+    }
+
+    /// A picture's preparation ended: with its PNG it shows, within the quota; else what showed
+    /// or kept it goes.
+    fn finish(&mut self, picture: &Arc<Picture>, prepared: Prepared) -> Result<(), String> {
+        let shown = prepared.and_then(|png| {
+            picture.fill(png);
+            self.make_room()
+        });
+        match shown {
+            Ok(()) => self.shared.changed(),
+            Err(_) => self.forget_picture(picture),
+        }
+        shown
+    }
+
+    /// What shows or keeps `picture` goes.
+    fn forget_picture(&mut self, picture: &Arc<Picture>) {
+        let shown: Vec<u32> =
+            self.shown.iter().filter(|(_, s)| Arc::ptr_eq(&s.picture, picture)).map(|(kid, _)| *kid).collect();
+        for kid in shown {
+            self.remove_shown(kid);
+        }
+        let kept: Vec<u32> =
+            self.uploads.iter().filter(|(_, u)| Arc::ptr_eq(&u.picture, picture)).map(|(id, _)| *id).collect();
+        for id in kept {
+            self.remove_upload(id);
+        }
     }
 
     // ---- showing the cells ---------------------------------------------------------------
 
-    /// Kraal's id for the image a placeholder cell names, when it is on show here.
+    /// Kraal's id for the image a placeholder cell names, when it is on show here (its picture
+    /// prepared).
     fn resolve(&self, id: u32) -> Option<u32> {
-        if let Some(kid) = self.virtual_ids.get(&id) {
-            return self.shown.contains_key(kid).then_some(*kid);
-        }
-        self.shown.get(&id).is_some_and(|s| s.direct).then_some(id)
+        let (kid, shown) = match self.virtual_ids.get(&id) {
+            Some(kid) => (*kid, self.shown.get(kid)?),
+            None => (id, self.shown.get(&id).filter(|s| s.direct)?),
+        };
+        shown.picture.png().is_some().then_some(kid)
     }
 
     /// Turn the placeholder cells of `area` (just rendered from this pane) into cells the
@@ -993,18 +1202,19 @@ impl Placeholder {
     }
 }
 
-/// The part of the picture a command asks for (`x`, `y`, `w`, `h` in pixels).
+/// The part of the picture a command asks for (`x`, `y`, `w`, `h` in pixels): the picture itself
+/// when that is all of it, else a new one, with the job that cuts it.
 fn crop(
     picture: Arc<Picture>,
     cmd: &Command,
     shared: &Arc<Shared>,
     budget: &mut Budget,
-) -> Result<Arc<Picture>, String> {
+) -> Result<(Arc<Picture>, Option<Job>), String> {
     let (x, y) = (cmd.x.min(picture.width), cmd.y.min(picture.height));
     let w = if cmd.w == 0 { picture.width - x } else { cmd.w.min(picture.width - x) };
     let h = if cmd.h == 0 { picture.height - y } else { cmd.h.min(picture.height - y) };
     if (x, y, w, h) == (0, 0, picture.width, picture.height) {
-        return Ok(picture);
+        return Ok((picture, None));
     }
     if w == 0 || h == 0 {
         return Err("EINVAL:empty source rectangle".into());
@@ -1013,15 +1223,26 @@ fn crop(
     if !budget.spend(u64::from(picture.width) * u64::from(picture.height)) {
         return Err(BUSY.into());
     }
-    let part = picture.decode()?.crop_imm(x, y, w, h).to_rgba8();
-    Picture::from_rgba(w, h, part.into_raw(), shared)
+    let part = Picture::pending((w, h), shared);
+    let cost = cost(0, (picture.width, picture.height));
+    let work = move || {
+        let cut = picture.decode()?.crop_imm(x, y, w, h).to_rgba8();
+        kept(encode_png(w, h, cut.as_raw())?)
+    };
+    let job = Job { picture: Arc::downgrade(&part), asker: None, work: Box::new(work), cost };
+    Ok((part, Some(job)))
 }
 
-/// The cells a picture spans: as asked, the other side keeping its proportions when only one
-/// is given, or its size in the outer terminal's cells.
-fn cells_for(picture: &Picture, cols: u32, rows: u32, cell: (u16, u16)) -> (u16, u16) {
+/// How much work preparing a picture of `width × height` pixels from `bytes` of data is, in bytes.
+fn cost(bytes: usize, (width, height): (u32, u32)) -> usize {
+    bytes.max(width as usize * height as usize * 4)
+}
+
+/// The cells a picture of `width × height` pixels spans: as asked, the other side keeping its
+/// proportions when only one is given, or its size in the outer terminal's cells.
+fn cells_for((width, height): (u32, u32), cols: u32, rows: u32, cell: (u16, u16)) -> (u16, u16) {
     let (cw, ch) = (f64::from(cell.0.max(1)), f64::from(cell.1.max(1)));
-    let (w, h) = (f64::from(picture.width.max(1)), f64::from(picture.height.max(1)));
+    let (w, h) = (f64::from(width.max(1)), f64::from(height.max(1)));
     let (c, r) = match (cols, rows) {
         (0, 0) => ((w / cw).ceil(), (h / ch).ceil()),
         (c, 0) => (f64::from(c), (f64::from(c) * cw * h / w / ch).ceil()),
@@ -1078,6 +1299,92 @@ fn write_cells<T: EventListener>(term: &mut Term<T>, kid: u32, cols: u16, rows: 
         }
     }
     (drawn as u16, rows as u16)
+}
+
+/// The picture a transmission carries: its size, read without decoding it (from the command, or
+/// from its PNG's header), and the work that makes its PNG.
+fn transmission(cmd: &Command, payload: Vec<u8>, shared: &Arc<Shared>) -> Result<((u32, u32), Work), String> {
+    if cmd.medium != b'd' {
+        // Files and shared memory would be this machine's, not the program's when it runs
+        // elsewhere (over ssh): programs fall back to sending the data.
+        return Err("EBADF:Failed to read image file".into());
+    }
+    let compressed = cmd.compressed;
+    match cmd.format {
+        100 => {
+            let size = png_size(&payload, compressed)?;
+            let payload = Held::new(payload, shared);
+            let work = move || {
+                let png = kept(decoded(&payload, compressed, MAX_PNG)?)?;
+                drop(payload);
+                decode_png(&png)?;
+                Ok(png)
+            };
+            Ok((size, Box::new(work)))
+        }
+        24 | 32 => {
+            let (w, h) = (cmd.width, cmd.height);
+            if !within_limits(w, h) {
+                return Err("EINVAL:bad image size".into());
+            }
+            let bpp = if cmd.format == 24 { 3 } else { 4 };
+            let bytes = w as usize * h as usize * bpp;
+            let payload = Held::new(payload, shared);
+            let work = move || {
+                let data = decoded(&payload, compressed, bytes)?;
+                drop(payload);
+                if data.len() != bytes {
+                    return Err("ENODATA:size does not match the data".into());
+                }
+                let rgba = if bpp == 4 {
+                    data
+                } else {
+                    data.as_chunks::<3>().0.iter().flat_map(|[r, g, b]| [*r, *g, *b, 255]).collect()
+                };
+                kept(encode_png(w, h, &rgba)?)
+            };
+            Ok(((w, h), Box::new(work)))
+        }
+        _ => Err("EINVAL:unknown format".into()),
+    }
+}
+
+/// The data of a transmission's base64 payload, inflated when it is compressed. Inflating stops
+/// a byte past `limit`: enough to tell that the data is longer.
+fn decoded(payload: &[u8], compressed: bool, limit: usize) -> Result<Vec<u8>, String> {
+    use miniz_oxide::inflate::{TINFLStatus, decompress_to_vec_zlib_with_limit};
+    let data = LENIENT.decode(payload).map_err(|_| "EINVAL:bad base64 data".to_string())?;
+    if !compressed {
+        return Ok(data);
+    }
+    match decompress_to_vec_zlib_with_limit(&data, limit.saturating_add(1)) {
+        Ok(data) => Ok(data),
+        Err(e) if e.status == TINFLStatus::HasMoreOutput => Ok(e.output),
+        Err(_) => Err("EINVAL:bad compressed data".into()),
+    }
+}
+
+/// The size a PNG's header gives, read from the start of a transmission's payload.
+fn png_size(payload: &[u8], compressed: bool) -> Result<(u32, u32), String> {
+    // Whole groups of four base64 characters decode on their own.
+    let start = if compressed { PNG_HEAD_SEARCH } else { PNG_HEAD.div_ceil(3) * 4 };
+    let head = decoded(&payload[..payload.len().min(start)], compressed, PNG_HEAD)?;
+    let Some(h) = head.first_chunk::<PNG_HEAD>().filter(|h| h[..8] == PNG_SIGNATURE && h[12..16] == *b"IHDR") else {
+        return Err("EBADPNG:not a PNG image".into());
+    };
+    let (width, height) =
+        (u32::from_be_bytes([h[16], h[17], h[18], h[19]]), u32::from_be_bytes([h[20], h[21], h[22], h[23]]));
+    if !within_limits(width, height) {
+        return Err("EBADPNG:bad image size".into());
+    }
+    Ok((width, height))
+}
+
+/// Whether kraal keeps a picture of `width × height` pixels.
+fn within_limits(width: u32, height: u32) -> bool {
+    (1..=MAX_SIDE).contains(&width)
+        && (1..=MAX_SIDE).contains(&height)
+        && u64::from(width) * u64::from(height) <= MAX_PIXELS
 }
 
 /// A kitty graphics command, parsed.
@@ -1153,11 +1460,22 @@ impl Command {
         Ok(cmd)
     }
 
+    /// Whether the program hears of some outcome about image `id` (an error, at least): it gave
+    /// an id or a number to reply to, and did not ask for quiet.
+    fn answers(&self, id: u32) -> bool {
+        self.quiet < 2 && (id != 0 || self.number != 0)
+    }
+
+    /// The reply about how the transmission of image `id` went.
+    fn outcome(&self, id: u32, outcome: Result<(), String>) -> Option<Vec<u8>> {
+        self.reply(id, outcome.err().unwrap_or_else(|| "OK".into()))
+    }
+
     /// The reply to send the program about image `id`, unless it asked for quiet or gave no
     /// id or number to reply to.
     fn reply(&self, id: u32, msg: String) -> Option<Vec<u8>> {
         let ok = msg == "OK";
-        if (ok && self.quiet >= 1) || (!ok && self.quiet >= 2) || (id == 0 && self.number == 0) {
+        if !self.answers(id) || (ok && self.quiet >= 1) {
             return None;
         }
         let mut keys = format!("i={id}");
@@ -1175,9 +1493,9 @@ impl Command {
 
 // ---- commands for the outer terminal ---------------------------------------------------
 
-/// Send image `kid` to the outer terminal (PNG, in chunks), without showing it.
-pub fn transmit(kid: u32, picture: &Picture, out: &mut Vec<u8>) {
-    let data = base64::engine::general_purpose::STANDARD.encode(&picture.png);
+/// Send image `kid` to the outer terminal (its PNG, in chunks), without showing it.
+pub fn transmit(kid: u32, png: &[u8], out: &mut Vec<u8>) {
+    let data = base64::engine::general_purpose::STANDARD.encode(png);
     let chunks: Vec<&[u8]> = data.as_bytes().chunks(4096).collect();
     for (i, chunk) in chunks.iter().enumerate() {
         let more = u8::from(i + 1 < chunks.len());
@@ -1208,7 +1526,7 @@ pub fn unplace(kid: u32, out: &mut Vec<u8>) {
 }
 
 /// An image the panes show, for a client's terminal: the generation of its placements, the
-/// picture, and the placements (placement id, columns, rows).
+/// picture (prepared), and the placements (placement id, columns, rows).
 pub type Live = (u64, Arc<Picture>, Vec<(u32, u16, u16)>);
 
 /// Bring a terminal that has the images of `sent` (with the generation of their placements) up
@@ -1233,11 +1551,12 @@ pub fn update_terminal(
             Some(had) if *had == generation => continue,
             Some(_) => unplace(kid, out),
             None => {
-                if !out.is_empty() && out.len() + picture.png.len() * 4 / 3 > budget {
+                let Some(png) = picture.png() else { continue };
+                if !out.is_empty() && out.len() + png.len() * 4 / 3 > budget {
                     more = true;
                     continue;
                 }
-                transmit(kid, &picture, out);
+                transmit(kid, png, out);
             }
         }
         for (placement, cols, rows) in placements {

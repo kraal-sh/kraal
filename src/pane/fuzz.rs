@@ -196,6 +196,12 @@ fn act(rng: &mut Rng, f: &mut Fixture, recent: &[u8]) {
             let graphics = &f.env.graphics;
             graphics.set_available(!graphics.available());
         }
+        26 => {
+            // The images waiting to be prepared, as the server's threads do.
+            while let Some(work) = p.take_image_work() {
+                p.image_prepared(work());
+            }
+        }
         _ => {
             // A frame: what a client is sent, drawn twice.
             draw_and_compare(p);

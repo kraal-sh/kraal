@@ -65,6 +65,10 @@ fn fuzz_graphics_commands() {
         let mut parser: Processor = Processor::new();
         let output = images(rng);
         fuzz::trace(|| format!("output {:?}", output.escape_ascii().to_string()));
+        let check = |reply: &[u8]| {
+            assert!(reply.starts_with(b"\x1b_G") && reply.ends_with(b"\x1b\\"));
+            assert!(!reply[3..reply.len() - 2].iter().any(|b| b.is_ascii_control()), "{reply:?}");
+        };
         for chunk in rng.chunks(&output) {
             for piece in g.split(chunk) {
                 let start = Instant::now();
@@ -72,14 +76,23 @@ fn fuzz_graphics_commands() {
                     Piece::Text(text) => parser.advance(&mut term, &text),
                     image => {
                         let what = format!("{image:?}").chars().take(200).collect::<String>();
-                        if let Some(reply) = g.handle(image, &mut term) {
-                            assert!(reply.starts_with(b"\x1b_G") && reply.ends_with(b"\x1b\\"));
-                            assert!(!reply[3..reply.len() - 2].iter().any(|b| b.is_ascii_control()), "{reply:?}");
+                        if let Answer::Now(Some(reply)) = g.handle(image, &mut term) {
+                            check(&reply);
                         }
                         let took = start.elapsed();
                         assert!(took < Duration::from_secs(10), "{what} took {took:?}");
                     }
                 }
+            }
+            // What waits is prepared now and then, as the server's threads do.
+            while rng.one_in(2)
+                && let Some(work) = g.next_work()
+            {
+                let start = Instant::now();
+                if let Some(Owed(Some(reply))) = g.prepared(work()) {
+                    check(&reply);
+                }
+                assert!(start.elapsed() < Duration::from_secs(10));
             }
             // This pane is the only one: it keeps within the quota.
             assert!(shared.used() <= quota, "{} bytes held, for a quota of {quota}", shared.used());
@@ -109,25 +122,21 @@ fn fuzz_graphics_sixel() {
             rng.mutate(&mut data, &[b"!", b"#", b"\"", b"-", b"$", b";", b"9999999999"]);
         }
         let begin = Instant::now();
-        if let Some(img) = sixel::decode(&data) {
-            assert!(img.width > 0 && img.height > 0 && img.width <= sixel::MAX_SIDE && img.height <= sixel::MAX_SIDE);
-            assert!(u64::from(img.width) * u64::from(img.height) <= sixel::MAX_PIXELS);
-            assert_eq!(img.pixels.len(), img.width as usize * img.height as usize * 4);
-            if img.pixels.len() <= 1 << 20 {
+        if let Some(((width, height), pixels)) = sixel::decode(&data) {
+            assert!(within_limits(width, height), "{width}x{height}");
+            assert_eq!(pixels.len(), width as usize * height as usize * 4);
+            if pixels.len() <= 1 << 20 {
                 // What a terminal that draws sixel gets back.
-                let rgba = image::RgbaImage::from_raw(img.width, img.height, img.pixels).unwrap();
-                let indexed = quantize::fit(&rgba, img.width.min(64), img.height.min(64));
+                let rgba = image::RgbaImage::from_raw(width, height, pixels).unwrap();
+                let indexed = quantize::fit(&rgba, width.min(64), height.min(64));
                 let mut out = Vec::new();
                 sixel::encode(&indexed, 0, 0, indexed.width, indexed.height, &mut out);
                 // The data, without the introducer and the terminator (the scanner takes them out).
                 let data = &out[out.iter().position(|b| *b == b'q').unwrap() + 1..out.len() - 2];
-                let again = sixel::decode(data);
-                if let Some(again) = again {
+                if let Some(((again_width, again_height), _)) = sixel::decode(data) {
                     assert!(
-                        again.width <= indexed.width && again.height <= indexed.height,
-                        "{}x{} from {}x{}: {:?}",
-                        again.width,
-                        again.height,
+                        again_width <= indexed.width && again_height <= indexed.height,
+                        "{again_width}x{again_height} from {}x{}: {:?}",
                         indexed.width,
                         indexed.height,
                         String::from_utf8_lossy(&out)

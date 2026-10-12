@@ -4241,6 +4241,33 @@ fn images_reach_a_terminal_that_draws_sixel() {
     client.wait_for_screen("\x1b[4X");
 }
 
+/// A large sixel image is painted off the server's loop: its cells are taken at once, where the
+/// program put it, the text after it goes below it, and the terminal gets it once painted.
+#[test]
+fn a_large_sixel_image_reaches_the_terminal_with_the_text_after_it_below() {
+    let env = Env::new("bigsixel");
+    env.workspace("w", "layout {\n    pane name=\"img\"\n}\n");
+    env.run(&["open", "w"]);
+    env.wait_for_text("img", "$");
+    // 400×240 pixels: 40 columns and 12 rows of 10×20 cells.
+    let image = env.root.join("big.six");
+    let mut sixel = b"\x1bPq\"1;1;400;240#1".to_vec();
+    for _ in 0..40 {
+        sixel.extend_from_slice(b"!400~-");
+    }
+    sixel.extend_from_slice(b"\x1b\\");
+    std::fs::write(&image, sixel).unwrap();
+    let mut client = RawClient::attach(&env, "w");
+    client.wait_for_screen("a=q");
+    client.send(b"\x1b_Gi=1263684657;OK\x1b\\\x1bP>|ghostty 1.1.3\x1b\\\x1b[6;20;10t");
+    std::thread::sleep(Duration::from_millis(300));
+    env.run(&["send", "-p", "img", &format!("printf '\\033[H\\033[2J'; cat {}; echo below\r", image.display())]);
+    let screen = env.wait_for_text("img", "below");
+    assert_eq!(screen.lines().position(|l| l.starts_with("below")), Some(12), "{screen}");
+    client.wait_for_screen("\x1b_Ga=t,f=100,i=");
+    client.wait_for_screen("\x1b_Ga=p,U=1,i=");
+}
+
 #[test]
 fn a_terminal_that_tells_its_cell_size_last_draws_sixel_too() {
     let env = Env::new("sixellate");

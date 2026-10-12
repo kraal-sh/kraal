@@ -1,24 +1,15 @@
-//! Sixel images (DEC's format, as img2sixel, chafa or matplotlib backends send them): decoded
-//! into RGBA pixels, and encoded for terminals that draw sixel but not kitty's placeholders.
+//! Sixel images (DEC's format, as img2sixel, chafa or matplotlib backends send them): measured
+//! as their data comes, so that their cells can be taken at once, then painted into RGBA pixels
+//! off the server's loop; and encoded for terminals that draw sixel but not kitty's placeholders.
 //! Pixels no sixel sets stay transparent, so the terminal's background shows.
 
 use std::io::Write;
 
 use super::quantize::{CLEAR, Indexed};
+use super::{MAX_SIDE, within_limits};
 
-/// Largest image decoded, per side and in pixels.
-pub const MAX_SIDE: u32 = 10_000;
-pub const MAX_PIXELS: u64 = 40_000_000;
 /// Colour registers a picture may define.
 const REGISTERS: usize = 1024;
-
-/// A decoded picture: `width * height` RGBA pixels.
-#[derive(Debug, PartialEq)]
-pub struct Rgba {
-    pub width: u32,
-    pub height: u32,
-    pub pixels: Vec<u8>,
-}
 
 /// The VT340's default palette, for pictures that use colours without defining them.
 const VT340: [[u8; 3]; 16] = [
@@ -40,77 +31,249 @@ const VT340: [[u8; 3]; 16] = [
     [204, 204, 204],
 ];
 
-/// Decode the data of a sixel DCS (what follows `q`). `None` when it draws nothing or is
-/// larger than the limits.
-pub fn decode(data: &[u8]) -> Option<Rgba> {
-    let mut palette = vec![[0u8, 0, 0]; REGISTERS];
-    palette[..16].copy_from_slice(&VT340);
-    let mut color = palette[0];
-    let mut canvas = Canvas::default();
-    let (mut x, mut band) = (0u32, 0u32);
-    let mut i = 0;
-    let number = |i: &mut usize| -> u32 {
-        let mut n: u32 = 0;
-        while *i < data.len() && data[*i].is_ascii_digit() {
-            n = n.saturating_mul(10).saturating_add(u32::from(data[*i] - b'0'));
-            *i += 1;
+/// The bytes that are sixels: each sets pixels of a column six high, as its bits (less `?`) say,
+/// from the top one.
+const SIXELS: std::ops::RangeInclusive<u8> = b'?'..=b'~';
+
+/// What sixel data does, in order.
+enum Op<'a> {
+    /// Announce the picture's size.
+    Raster { width: u32, height: u32 },
+    /// Draw with a colour register, after giving it a colour when `rgb` says one.
+    Colour { register: usize, rgb: Option<[u8; 3]> },
+    /// Set the columns of a band from column `x`, a sixel each.
+    Sixels { x: u32, band: u32, sixels: &'a [u8] },
+    /// Set `count` columns of a band from column `x` with one sixel.
+    Repeat { x: u32, band: u32, count: u32, sixel: u8 },
+}
+
+/// Reads the data of a sixel image (what follows `q`) a piece at a time: a piece may end in the
+/// middle of an introducer's parameters.
+#[derive(Default)]
+struct Reader {
+    /// The introducer (`"`, `#` or `!`) whose parameters are being read.
+    introducer: Option<u8>,
+    /// Its parameters so far: `"` and `#` take up to five, `!` one.
+    params: [u32; 5],
+    len: usize,
+    x: u32,
+    band: u32,
+}
+
+impl Reader {
+    fn read<'a>(&mut self, data: &'a [u8], each: &mut impl FnMut(Op<'a>)) {
+        let mut i = 0;
+        while i < data.len() {
+            if self.introducer.is_some() && self.param(data[i], each) {
+                i += 1;
+                continue;
+            }
+            let run = data[i..].iter().take_while(|b| SIXELS.contains(*b)).count();
+            if run > 0 {
+                each(Op::Sixels { x: self.x, band: self.band, sixels: &data[i..i + run] });
+                self.x = self.x.saturating_add(run as u32);
+                i += run;
+                continue;
+            }
+            match data[i] {
+                introducer @ (b'"' | b'#' | b'!') => {
+                    self.introducer = Some(introducer);
+                    self.params[0] = 0;
+                    self.len = 1;
+                }
+                b'$' => self.x = 0,
+                b'-' => {
+                    self.x = 0;
+                    self.band = self.band.saturating_add(1);
+                }
+                _ => {}
+            }
+            i += 1;
         }
-        n
-    };
-    // Up to five `;`-separated numbers after an introducer.
-    let numbers = |i: &mut usize| -> Vec<u32> {
-        let mut out = vec![number(i)];
-        while *i < data.len() && data[*i] == b';' && out.len() < 5 {
-            *i += 1;
-            out.push(number(i));
-        }
-        out
-    };
-    while i < data.len() {
-        let b = data[i];
-        i += 1;
+    }
+
+    /// A byte after an introducer: false when it ends the parameters, and is read as data.
+    fn param<'a>(&mut self, b: u8, each: &mut impl FnMut(Op<'a>)) -> bool {
         match b {
-            // Raster attributes: aspect ratio, then the size the picture announces.
-            b'"' => {
-                let n = numbers(&mut i);
-                if let (Some(&w), Some(&h)) = (n.get(2), n.get(3)) {
-                    canvas.reserve(w.min(MAX_SIDE), h.min(MAX_SIDE))?;
-                    canvas.announced = (w.min(MAX_SIDE), h.min(MAX_SIDE));
-                }
+            b'0'..=b'9' => {
+                let n = &mut self.params[self.len - 1];
+                *n = n.saturating_mul(10).saturating_add(u32::from(b - b'0'));
             }
-            b'#' => {
-                let n = numbers(&mut i);
-                let register = n[0] as usize % REGISTERS;
-                if n.len() >= 5 {
-                    palette[register] = match n[1] {
-                        1 => hls(n[2], n[3], n[4]),
-                        _ => [percent(n[2]), percent(n[3]), percent(n[4])],
-                    };
-                }
-                color = palette[register];
+            b';' if self.introducer != Some(b'!') && self.len < self.params.len() => {
+                self.params[self.len] = 0;
+                self.len += 1;
             }
-            b'!' => {
-                let count = number(&mut i);
-                if i < data.len() && (0x3f..=0x7e).contains(&data[i]) {
-                    let bits = data[i] - 0x3f;
-                    i += 1;
-                    canvas.paint(x, band, count.max(1), bits, color)?;
-                    x = x.saturating_add(count.max(1));
-                }
+            sixel if self.introducer == Some(b'!') && SIXELS.contains(&sixel) => {
+                self.introducer = None;
+                let count = self.params[0].max(1);
+                each(Op::Repeat { x: self.x, band: self.band, count, sixel });
+                self.x = self.x.saturating_add(count);
             }
-            b'$' => x = 0,
-            b'-' => {
-                x = 0;
-                band += 1;
+            _ => {
+                self.end_params(each);
+                return false;
             }
-            0x3f..=0x7e => {
-                canvas.paint(x, band, 1, b - 0x3f, color)?;
-                x += 1;
+        }
+        true
+    }
+
+    /// The parameters of the introducer being read are all there: a repeat count that no sixel
+    /// follows is dropped.
+    fn end_params<'a>(&mut self, each: &mut impl FnMut(Op<'a>)) {
+        match (self.introducer.take(), &self.params[..self.len]) {
+            (Some(b'"'), &[_, _, width, height, ..]) => each(Op::Raster { width, height }),
+            (Some(b'#'), &[register, ref rgb @ ..]) => {
+                let rgb = match *rgb {
+                    [1, h, l, s] => Some(hls(h, l, s)),
+                    [_, r, g, b] => Some([percent(r), percent(g), percent(b)]),
+                    _ => None,
+                };
+                each(Op::Colour { register: register as usize % REGISTERS, rgb });
             }
             _ => {}
         }
     }
-    canvas.finish()
+}
+
+/// The size of a sixel image, measured as its data comes in pieces.
+#[derive(Default)]
+pub struct Measure {
+    reader: Reader,
+    extent: Extent,
+}
+
+impl Measure {
+    pub fn read(&mut self, data: &[u8]) {
+        let extent = &mut self.extent;
+        self.reader.read(data, &mut |op| extent.take(op));
+    }
+
+    /// The picture's size in pixels, once all its data was read: `None` when it draws nothing
+    /// or is larger than the limits.
+    pub fn size(mut self) -> Option<(u32, u32)> {
+        // Data that ends with raster attributes still announces a size.
+        let extent = &mut self.extent;
+        self.reader.end_params(&mut |op| extent.take(op));
+        self.extent.size()
+    }
+}
+
+/// The size a picture announced, and how far its sixels reach.
+#[derive(Default)]
+struct Extent {
+    announced: (u32, u32),
+    width: u32,
+    height: u32,
+    /// A sixel sets pixels beyond the limits.
+    over: bool,
+}
+
+impl Extent {
+    fn take(&mut self, op: Op<'_>) {
+        match op {
+            Op::Raster { width, height } => self.announced = (width.min(MAX_SIDE), height.min(MAX_SIDE)),
+            Op::Colour { .. } => {}
+            Op::Sixels { x, band, sixels } => {
+                let set = sixels.iter().rposition(|s| *s != b'?').map(|last| {
+                    let bits = sixels[..=last].iter().fold(0, |bits, s| bits | (s - b'?'));
+                    (last as u64 + 1, bits)
+                });
+                self.reach(x, band, sixels.len() as u64, set);
+            }
+            Op::Repeat { x, band, count, sixel } => {
+                let set = (sixel != b'?').then_some((u64::from(count), sixel - b'?'));
+                self.reach(x, band, u64::from(count), set);
+            }
+        }
+    }
+
+    /// Sixels over `columns` columns of a band from `x`: blank ones widen the picture as far as
+    /// it may go; those that set pixels, over the first `set.0` columns, its bits `set.1` from
+    /// the top, must fit in it.
+    fn reach(&mut self, x: u32, band: u32, columns: u64, set: Option<(u64, u8)>) {
+        self.width = self.width.max((u64::from(x) + columns).min(u64::from(MAX_SIDE)) as u32);
+        let Some((columns, bits)) = set else { return };
+        let right = u64::from(x) + columns;
+        let bottom = u64::from(band) * 6 + u64::from(u8::BITS - bits.leading_zeros());
+        if right > u64::from(MAX_SIDE) || bottom > u64::from(MAX_SIDE) {
+            self.over = true;
+            return;
+        }
+        self.width = self.width.max(right as u32);
+        self.height = self.height.max(bottom as u32);
+    }
+
+    fn size(&self) -> Option<(u32, u32)> {
+        let (width, height) = (self.width.max(self.announced.0), self.height.max(self.announced.1));
+        (!self.over && within_limits(width, height)).then_some((width, height))
+    }
+}
+
+/// Paint the data of a sixel image into the `width × height` RGBA pixels [`Measure`] found.
+pub fn paint(data: &[u8], (width, height): (u32, u32)) -> Vec<u8> {
+    let mut canvas = Canvas::new(width as usize, height as usize);
+    Reader::default().read(data, &mut |op| canvas.draw(op));
+    canvas.pixels
+}
+
+/// The data of a sixel image measured, then painted: its size and its RGBA pixels.
+#[cfg(test)]
+pub fn decode(data: &[u8]) -> Option<((u32, u32), Vec<u8>)> {
+    let mut measure = Measure::default();
+    measure.read(data);
+    let size = measure.size()?;
+    Some((size, paint(data, size)))
+}
+
+/// RGBA pixels being painted, and the colours they are painted with.
+struct Canvas {
+    width: usize,
+    height: usize,
+    pixels: Vec<u8>,
+    palette: Vec<[u8; 3]>,
+    colour: [u8; 4],
+}
+
+impl Canvas {
+    fn new(width: usize, height: usize) -> Canvas {
+        let mut palette = vec![[0u8; 3]; REGISTERS];
+        palette[..16].copy_from_slice(&VT340);
+        let [r, g, b] = palette[0];
+        Canvas { width, height, pixels: vec![0; width * height * 4], palette, colour: [r, g, b, 255] }
+    }
+
+    fn draw(&mut self, op: Op<'_>) {
+        match op {
+            Op::Raster { .. } => {}
+            Op::Colour { register, rgb } => {
+                if let Some(rgb) = rgb {
+                    self.palette[register] = rgb;
+                }
+                let [r, g, b] = self.palette[register];
+                self.colour = [r, g, b, 255];
+            }
+            Op::Sixels { x, band, sixels } => {
+                for (x, sixel) in (x as usize..).zip(sixels) {
+                    self.set(x, band, 1, *sixel);
+                }
+            }
+            Op::Repeat { x, band, count, sixel } => self.set(x as usize, band, count as usize, sixel),
+        }
+    }
+
+    /// Set `count` columns of `band` from column `x` as `sixel` says.
+    fn set(&mut self, x: usize, band: u32, count: usize, sixel: u8) {
+        let right = x.saturating_add(count).min(self.width);
+        let x = x.min(right);
+        let bits = sixel - b'?';
+        let rows = (0..6).filter(|bit| bits & (1 << bit) != 0).map(|bit| band as usize * 6 + bit);
+        for y in rows.take_while(|y| *y < self.height) {
+            let row = y * self.width;
+            for pixel in self.pixels[(row + x) * 4..(row + right) * 4].as_chunks_mut::<4>().0 {
+                *pixel = self.colour;
+            }
+        }
+    }
 }
 
 /// `n` percent of 255.
@@ -137,87 +300,6 @@ fn hls(h: u32, l: u32, s: u32) -> [u8; 3] {
     let m = l - c / 2.0;
     let to = |v: f64| ((v + m) * 255.0).round().clamp(0.0, 255.0) as u8;
     [to(r), to(g), to(b)]
-}
-
-/// The pixels painted so far; grows as the picture goes right and down.
-#[derive(Default)]
-struct Canvas {
-    width: u32,
-    height: u32,
-    pixels: Vec<u8>,
-    /// The rightmost and lowest pixels painted, and the size the picture announced.
-    used_w: u32,
-    used_h: u32,
-    announced: (u32, u32),
-}
-
-impl Canvas {
-    /// Make room for `w × h` pixels; `None` past the limits.
-    fn reserve(&mut self, w: u32, h: u32) -> Option<()> {
-        if w <= self.width && h <= self.height {
-            return Some(());
-        }
-        let (nw, nh) = (w.max(self.width), h.max(self.height));
-        if nw > MAX_SIDE || nh > MAX_SIDE || u64::from(nw) * u64::from(nh) > MAX_PIXELS {
-            return None;
-        }
-        let mut pixels = vec![0u8; nw as usize * nh as usize * 4];
-        for row in 0..self.height as usize {
-            let from = row * self.width as usize * 4;
-            let to = row * nw as usize * 4;
-            pixels[to..to + self.width as usize * 4]
-                .copy_from_slice(&self.pixels[from..from + self.width as usize * 4]);
-        }
-        self.pixels = pixels;
-        self.width = nw;
-        self.height = nh;
-        Some(())
-    }
-
-    /// Paint the six pixels of `bits` in band `band`, `count` times from column `x`.
-    fn paint(&mut self, x: u32, band: u32, count: u32, bits: u8, color: [u8; 3]) -> Option<()> {
-        let top = band.checked_mul(6)?;
-        let right = x.checked_add(count)?;
-        if bits == 0 {
-            // Nothing painted, but the picture is that wide.
-            self.used_w = self.used_w.max(right.min(MAX_SIDE));
-            return Some(());
-        }
-        // Grow in steps, not one column at a time.
-        let grow = |have: u32, need: u32| {
-            if need > have { need.max(have.saturating_mul(2)).min(MAX_SIDE.max(need)) } else { have }
-        };
-        self.reserve(grow(self.width, right), grow(self.height, top + 6))?;
-        for bit in 0..6 {
-            if bits & (1 << bit) == 0 {
-                continue;
-            }
-            let y = top + bit;
-            let row = y as usize * self.width as usize * 4;
-            for px in x..right {
-                let at = row + px as usize * 4;
-                self.pixels[at..at + 4].copy_from_slice(&[color[0], color[1], color[2], 255]);
-            }
-            self.used_h = self.used_h.max(y + 1);
-        }
-        self.used_w = self.used_w.max(right);
-        Some(())
-    }
-
-    /// The painted part of the canvas, or the announced size if larger.
-    fn finish(self) -> Option<Rgba> {
-        let w = self.used_w.max(self.announced.0).min(self.width);
-        let h = self.used_h.max(self.announced.1).min(self.height);
-        if w == 0 || h == 0 {
-            return None;
-        }
-        let mut pixels = Vec::with_capacity(w as usize * h as usize * 4);
-        for row in 0..h as usize {
-            let from = row * self.width as usize * 4;
-            pixels.extend_from_slice(&self.pixels[from..from + w as usize * 4]);
-        }
-        Some(Rgba { width: w, height: h, pixels })
-    }
 }
 
 /// Encode the `width × height` pixels of `image` from `x, y` as a sixel image (DCS … ST), drawn

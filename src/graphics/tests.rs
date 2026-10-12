@@ -46,21 +46,57 @@ fn rgb_image(keys: &str, w: u32, h: u32) -> Vec<u8> {
     format!("\x1b_G{keys},f=24,s={w},v={h};{}\x1b\\", b64(&data)).into_bytes()
 }
 
-/// Feed `bytes` as a pane does: text to the emulator, images to `g`; the replies.
+/// Feed `bytes` as a pane does: text to the emulator, images to `g`; the replies given at once.
 fn feed(g: &mut PaneGraphics, t: &mut Term<VoidListener>, bytes: &[u8]) -> Vec<u8> {
     let mut parser: Processor = Processor::new();
     let mut replies = Vec::new();
     for piece in g.split(bytes) {
         match piece {
             Piece::Text(text) => parser.advance(t, &text),
-            image => replies.extend(g.handle(image, t).unwrap_or_default()),
+            image => {
+                if let Answer::Now(Some(reply)) = g.handle(image, t) {
+                    replies.extend(reply);
+                }
+            }
         }
     }
     replies
 }
 
+/// Hand `bytes`, images only, to `g`: what the program is told of each.
+fn answers(g: &mut PaneGraphics, t: &mut Term<VoidListener>, bytes: &[u8]) -> Vec<Answer> {
+    g.split(bytes).into_iter().map(|piece| g.handle(piece, t)).collect()
+}
+
+/// Prepare the pictures that wait, as the server does off its loop; the replies they owed.
+fn prepare_all(g: &mut PaneGraphics) -> Vec<u8> {
+    let mut replies = Vec::new();
+    while let Some(work) = g.next_work() {
+        if let Some(Owed(Some(reply))) = g.prepared(work()) {
+            replies.extend(reply);
+        }
+    }
+    replies
+}
+
+/// A picture prepared from `rgba`, counted in `shared`.
+fn ready_picture(width: u32, height: u32, rgba: &[u8], shared: &Arc<Shared>) -> Arc<Picture> {
+    let picture = Picture::pending((width, height), shared);
+    picture.fill(encode_png(width, height, rgba).unwrap());
+    picture
+}
+
 fn cell_at(t: &Term<VoidListener>, line: i32, col: usize) -> Option<Placeholder> {
     Placeholder::of_cell(&t.grid()[Line(line)][Column(col)])
+}
+
+/// The screen as a client sees it: the images as cells its terminal draws when it `show`s them.
+fn render(g: &PaneGraphics, t: &Term<VoidListener>, show: bool) -> Buffer {
+    let area = Rect::new(0, 0, t.columns() as u16, t.screen_lines() as u16);
+    let mut buf = Buffer::empty(area);
+    crate::pane::render_term(t, area, &mut buf, None);
+    g.show_cells(area, &mut buf, show);
+    buf
 }
 
 #[test]
@@ -86,7 +122,8 @@ fn image_sequences_are_taken_out_wherever_reads_cut_them() {
                 Piece::Text(b"a".to_vec().into()),
                 Piece::Kitty(b"f=100,a=T;QUJD".to_vec()),
                 Piece::Text(b"b".to_vec().into()),
-                Piece::Sixel { params: b"0;1".to_vec(), data: b"#0~~-".to_vec() },
+                // Measured as it came, whatever the cuts.
+                Piece::Sixel { params: b"0;1".to_vec(), data: b"#0~~-".to_vec(), size: Some((2, 6)) },
                 // A DCS that is not sixel, and the rest, go to the emulator as they came.
                 Piece::Text(b"c\x1b[1md\x1bPzz\x1b\\e".to_vec().into()),
             ],
@@ -223,13 +260,6 @@ fn deleted_images_render_blank_and_others_show() {
     feed(&mut g, &mut t, b"\r\n");
     feed(&mut g, &mut t, &rgb_image("a=T,i=2,c=2,r=1,q=2", 2, 2));
     assert_eq!(g.shown().count(), 2);
-    let render = |g: &PaneGraphics, t: &Term<VoidListener>, show: bool| {
-        let area = Rect::new(0, 0, 20, 6);
-        let mut buf = Buffer::empty(area);
-        crate::pane::render_term(t, area, &mut buf, None);
-        g.show_cells(area, &mut buf, show);
-        buf
-    };
     let buf = render(&g, &t, true);
     assert!(buf[(0, 0)].symbol().starts_with(PLACEHOLDER) && buf[(0, 1)].symbol().starts_with(PLACEHOLDER));
     assert!(matches!(buf[(0, 0)].fg, Color::Rgb(..)));
@@ -258,10 +288,7 @@ fn a_programs_own_placeholders_name_its_image_through_kraal() {
     assert!(t.grid()[Line(0)][Column(0)].c == ' ', "a virtual placement writes nothing");
     let text = format!("\x1b[38;5;42m{PLACEHOLDER}\u{0305}{PLACEHOLDER}{PLACEHOLDER}\x1b[39m");
     feed(&mut g, &mut t, text.as_bytes());
-    let area = Rect::new(0, 0, 20, 6);
-    let mut buf = Buffer::empty(area);
-    crate::pane::render_term(&t, area, &mut buf, None);
-    g.show_cells(area, &mut buf, true);
+    let buf = render(&g, &t, true);
     for col in 0..3u16 {
         let p = Placeholder::of_symbol(buf[(col, 0)].symbol(), buf[(col, 0)].fg).unwrap();
         assert_eq!((p.id, p.row, p.col), (kid, 0, col as usize), "column {col}");
@@ -269,9 +296,7 @@ fn a_programs_own_placeholders_name_its_image_through_kraal() {
     // An id nothing shows renders blank.
     let text = format!("\r\n\x1b[38;5;43m{PLACEHOLDER}\x1b[39m");
     feed(&mut g, &mut t, text.as_bytes());
-    let mut buf = Buffer::empty(area);
-    crate::pane::render_term(&t, area, &mut buf, None);
-    g.show_cells(area, &mut buf, true);
+    let buf = render(&g, &t, true);
     assert_eq!(buf[(0, 1)].symbol(), " ");
 }
 
@@ -290,7 +315,7 @@ fn the_oldest_images_go_when_the_quota_is_reached() {
     // What one picture counts: its PNG and the cost of keeping it.
     let one = {
         let probe = Arc::new(Shared::new(true, usize::MAX));
-        let _png = Picture::from_rgba(2, 2, [200, 10, 10, 255].repeat(4), &probe).unwrap();
+        let _picture = ready_picture(2, 2, &[200, 10, 10, 255].repeat(4), &probe);
         probe.used()
     };
     let s = Arc::new(Shared::new(true, one + one / 2));
@@ -308,14 +333,17 @@ fn the_oldest_images_go_when_the_quota_is_reached() {
 #[test]
 fn sixel_images_decode_and_take_cells() {
     // Two red columns six pixels high, then a band below in register 1's default blue.
-    let img = sixel::decode(b"\"1;1;2;12#0;2;100;0;0#0~~-#1!2~").unwrap();
-    assert_eq!((img.width, img.height), (2, 12));
-    assert_eq!(&img.pixels[..4], &[255, 0, 0, 255]);
-    assert_eq!(&img.pixels[6 * 2 * 4..6 * 2 * 4 + 4], &[51, 51, 204, 255]);
-    // Unpainted pixels are transparent.
-    let img = sixel::decode(b"#0;2;0;100;0@").unwrap();
-    assert_eq!((img.width, img.height), (1, 1));
-    assert_eq!(&img.pixels[..], &[0, 255, 0, 255]);
+    let (size, pixels) = sixel::decode(b"\"1;1;2;12#0;2;100;0;0#0~~-#1!2~").unwrap();
+    assert_eq!(size, (2, 12));
+    assert_eq!(&pixels[..4], &[255, 0, 0, 255]);
+    assert_eq!(&pixels[6 * 2 * 4..6 * 2 * 4 + 4], &[51, 51, 204, 255]);
+    let (size, pixels) = sixel::decode(b"#0;2;0;100;0@").unwrap();
+    assert_eq!(size, (1, 1));
+    assert_eq!(&pixels[..], &[0, 255, 0, 255]);
+    // Unpainted pixels are transparent; blank sixels and the size announced, even last, count.
+    let (size, pixels) = sixel::decode(b"@!3?-?\"1;1;2;9").unwrap();
+    assert_eq!(size, (4, 9));
+    assert!(pixels[4..].iter().all(|p| *p == 0));
     assert!(sixel::decode(b"!99999999~").is_none(), "too wide");
     assert!(sixel::decode(b"").is_none());
 
@@ -328,12 +356,119 @@ fn sixel_images_decode_and_take_cells() {
     assert_eq!(t.grid().cursor.point.line, Line(2));
 }
 
+/// A sixel image of `width × height` pixels in one colour, too large to paint at once.
+fn large_sixel(width: u32, height: u32) -> Vec<u8> {
+    let mut image = format!("\x1bPq\"1;1;{width};{height}#1").into_bytes();
+    for _ in 0..height.div_ceil(6) {
+        image.extend_from_slice(format!("!{width}~-").as_bytes());
+    }
+    image.extend_from_slice(b"\x1b\\");
+    image
+}
+
+#[test]
+fn a_large_sixel_takes_its_cells_at_once_and_shows_once_painted() {
+    let s = shared(true);
+    let mut g = PaneGraphics::new(s.clone());
+    let mut t = term(80, 40);
+    // 600×300 pixels: 60×15 cells of 10×20, painted off the server's loop. What follows it goes
+    // below it, where the cursor went.
+    let image = large_sixel(600, 300);
+    feed(&mut g, &mut t, &[&image[..], b"after"].concat());
+    let kid = cell_at(&t, 0, 0).unwrap().id;
+    assert_eq!(cell_at(&t, 14, 59).map(|p| (p.id, p.row, p.col)), Some((kid, 14, 59)));
+    assert_eq!(t.grid()[Line(15)][Column(0)].c, 'a');
+    // Meanwhile its cells render blank, and its data counts in the quota.
+    assert_eq!(g.shown().count(), 0);
+    assert_eq!(render(&g, &t, true)[(0, 0)].symbol(), " ");
+    let data = image.len() - b"\x1bPq".len() - b"\x1b\\".len();
+    assert_eq!(s.used(), data + PICTURE_COST);
+    assert!(prepare_all(&mut g).is_empty(), "sixel has no reply");
+    let (_, shown) = g.shown().next().unwrap();
+    assert_eq!(s.used(), shown.picture.png().unwrap().len() + PICTURE_COST);
+    assert!(render(&g, &t, true)[(0, 0)].symbol().starts_with(PLACEHOLDER));
+}
+
+#[test]
+fn a_large_kitty_image_is_placed_at_once_and_answered_once_prepared() {
+    let mut g = PaneGraphics::new(shared(true));
+    let mut t = term(80, 40);
+    assert_eq!(answers(&mut g, &mut t, &rgb_image("a=T,i=7,c=4,r=2", 300, 300)), [Answer::Later]);
+    assert_eq!(prepare_all(&mut g), b"\x1b_Gi=7;OK\x1b\\");
+    assert_eq!(g.shown().count(), 1);
+    // Data that does not make the image it says: the program hears why, and nothing keeps it.
+    let wrong = format!("\x1b_Ga=T,i=8,f=24,s=300,v=300;{}\x1b\\", b64(&[0; 30]));
+    assert_eq!(answers(&mut g, &mut t, wrong.as_bytes()), [Answer::Later]);
+    assert_eq!(prepare_all(&mut g), b"\x1b_Gi=8;ENODATA:size does not match the data\x1b\\");
+    assert_eq!(g.shown().count(), 1);
+    assert_eq!(feed(&mut g, &mut t, b"\x1b_Ga=p,i=8\x1b\\"), b"\x1b_Gi=8;ENOENT:no such image\x1b\\");
+    // Both took their cells at once, side by side.
+    let [first, second] = [cell_at(&t, 1, 3), cell_at(&t, 1, 4)].map(|p| p.map(|p| (p.row, p.col)));
+    assert_eq!((first, second), (Some((1, 3)), Some((0, 0))));
+}
+
+#[test]
+fn what_waits_to_be_prepared_counts_in_the_quota() {
+    // Room for one and a half transmissions of an image.
+    let image = |keys: &str| rgb_image(keys, 300, 300);
+    let s = Arc::new(Shared::new(true, image("q=2").len() * 3 / 2));
+    s.set_available(true);
+    let mut t = term(80, 40);
+    // The oldest image goes for a new one, with what was sent for it.
+    let mut g = PaneGraphics::new(s.clone());
+    feed(&mut g, &mut t, &image("a=T,i=1,q=2"));
+    feed(&mut g, &mut t, &image("a=T,i=2,q=2"));
+    assert_eq!(g.jobs.len(), 1);
+    drop(g);
+    // What was sent by a program waiting to hear how it went stays: no room for more.
+    let mut g = PaneGraphics::new(s.clone());
+    assert_eq!(answers(&mut g, &mut t, &image("a=t,i=1")), [Answer::Later]);
+    assert_eq!(feed(&mut g, &mut t, &image("a=t,i=2")), b"\x1b_Gi=2;ENOSPC:image storage is full\x1b\\");
+    assert_eq!(prepare_all(&mut g), b"\x1b_Gi=1;OK\x1b\\");
+    drop(g);
+    assert_eq!(s.used(), 0);
+}
+
+#[test]
+fn a_part_of_a_picture_being_prepared_is_cut_once_it_is() {
+    let mut g = PaneGraphics::new(shared(true));
+    let mut t = term(80, 40);
+    feed(&mut g, &mut t, &rgb_image("a=t,i=1,q=2", 300, 300));
+    assert_eq!(feed(&mut g, &mut t, b"\x1b_Ga=p,i=1,w=10,h=10\x1b\\"), b"\x1b_Gi=1;OK\x1b\\");
+    assert!(prepare_all(&mut g).is_empty());
+    let (_, shown) = g.shown().next().unwrap();
+    assert_eq!((shown.picture.width, shown.picture.height), (10, 10));
+    assert_eq!(shown.placements, vec![(0, 1, 1)]);
+}
+
+#[test]
+fn pictures_nothing_waits_for_are_not_prepared() {
+    let s = shared(true);
+    let mut g = PaneGraphics::new(s.clone());
+    let mut t = term(80, 40);
+    // Deleted before its turn: its data counts no more.
+    feed(&mut g, &mut t, &large_sixel(600, 300));
+    feed(&mut g, &mut t, b"\x1b_Ga=d\x1b\\");
+    assert!(g.next_work().is_none());
+    assert_eq!(s.used(), 0);
+    // A file manager's previews, one over the other on the alternate screen: only the last waits.
+    feed(&mut g, &mut t, b"\x1b[?1049h");
+    for _ in 0..3 {
+        feed(&mut g, &mut t, b"\x1b[2J\x1b[H");
+        feed(&mut g, &mut t, &large_sixel(600, 300));
+    }
+    assert_eq!(g.jobs.len(), 1);
+    // Its pane closed while it is painted: no PNG is made.
+    let work = g.next_work().unwrap();
+    drop(g);
+    assert!(work().is_err());
+    assert_eq!(s.used(), 0);
+}
+
 #[test]
 fn outer_terminal_commands_are_plain_and_chunked() {
-    let s = shared(true);
-    let picture = Picture::new(vec![7u8; 10_000], 1, 1, &s);
     let mut out = Vec::new();
-    transmit(KRAAL_ID | 5, &picture, &mut out);
+    transmit(KRAAL_ID | 5, &[7u8; 10_000], &mut out);
     let text = String::from_utf8(out).unwrap();
     assert!(text.starts_with(&format!("\x1b_Ga=t,f=100,i={},q=2,m=1;", KRAAL_ID | 5)));
     assert!(text.ends_with("\x1b\\"));
@@ -375,7 +510,7 @@ fn terminal_replies_reach_the_server_whole() {
 /// A quota that holds `n` pictures of `w × h` sent as RGB.
 fn quota_for(n: usize, w: u32, h: u32) -> Arc<Shared> {
     let probe = Arc::new(Shared::new(true, usize::MAX));
-    let _png = Picture::from_rgba(w, h, [200, 10, 10, 255].repeat((w * h) as usize), &probe).unwrap();
+    let _picture = ready_picture(w, h, &[200, 10, 10, 255].repeat((w * h) as usize), &probe);
     let s = Arc::new(Shared::new(true, probe.used() * n + probe.used() / 2));
     s.set_available(true);
     s.set_cell(10, 20);
@@ -685,13 +820,13 @@ fn sixel_output_decodes_to_the_pixels_it_was_given() {
         sixel::encode(&image, x, y, w, h, &mut out);
         let start = format!("\x1bP0;1;0q\"1;1;{w};{h}");
         assert!(out.starts_with(start.as_bytes()) && out.ends_with(b"\x1b\\"), "{:?}", String::from_utf8_lossy(&out));
-        let decoded = sixel::decode(&out[b"\x1bP0;1;0q".len()..out.len() - 2]).unwrap();
-        assert_eq!((decoded.width, decoded.height), (w, h));
+        let (size, decoded) = sixel::decode(&out[b"\x1bP0;1;0q".len()..out.len() - 2]).unwrap();
+        assert_eq!(size, (w, h));
         for py in 0..h {
             for px in 0..w {
                 let want = pixels[((y + py) * 5 + x + px) as usize];
                 let at = ((py * w + px) * 4) as usize;
-                let got = &decoded.pixels[at..at + 4];
+                let got = &decoded[at..at + 4];
                 if want == CLEAR {
                     assert_eq!(got[3], 0, "({px}, {py}) stays transparent");
                 } else {

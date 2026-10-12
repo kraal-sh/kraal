@@ -99,8 +99,11 @@ And everywhere:
 
 - Programs send the image data itself. Reading an image from a file or shared memory is refused
   (the program may run on another machine than kraal), and programs then send the data instead.
-- `[graphics] memory_mb` (256 by default) bounds the memory all panes keep for images; the oldest
-  go first. A preview whose image does not fit in what is left draws it with half blocks. The
+- Decoding an image is done off kraal's main thread, a pane's images one after the other: a
+  large one takes its place in the pane at once, what follows it goes on, and it shows when it is
+  decoded (a fraction of a second for the largest).
+- `[graphics] memory_mb` (256 by default) bounds the memory all panes keep for images, the data
+  of those still to decode included; the oldest go first. A preview whose image does not fit in what is left draws it with half blocks. The
   images ready to draw as sixel take at most a quarter of that again. `enabled = false` turns
   images off: their sequences then reach the emulator, which ignores them, and previews draw their
   image with half blocks.
