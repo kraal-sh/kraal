@@ -20,7 +20,8 @@ How kraal is organised, and how a workspace is declared once in a file and opene
 Sessions keep running when you close the terminal or lose the connection: `kraal` attaches
 again. After a restart of the server or a reboot, the processes are gone, but kraal rebuilds the
 layout, reconnects SSH shells and resumes agent conversations; other commands wait for Enter
-before they run again.
+before they run again. A workspace that cannot be brought back (its shell gone, say) stays saved
+as it was, and comes back at a later start.
 
 `kraal restart` (or `ctrl+b W r`) restarts a session's server on the kraal installed now, after an
 update for instance: the server saves the session and stops, and a new one starts and brings it

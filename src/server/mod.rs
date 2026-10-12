@@ -494,6 +494,8 @@ pub struct Server {
     persisted: Option<Vec<u8>>,
     /// What is saved of each pane's scrollback.
     pub scrollback: HashMap<PaneId, persist::SavedScrollback>,
+    /// The saved workspaces that could not be restored: saved again as they were.
+    pub unrestored: Vec<persist::WorkspaceSnap>,
     /// Starts the names of the scrollback files this server makes, so that none is a file an
     /// earlier server's state names.
     scrollback_tag: String,
@@ -757,6 +759,7 @@ pub fn run(session: &str) -> Result<()> {
         persisting,
         persisted: None,
         scrollback: HashMap::new(),
+        unrestored: Vec::new(),
         scrollback_tag: format!("{}-{}", crate::accounts::now(), std::process::id()),
         run_logs: {
             let warn = logs_tx;

@@ -1078,6 +1078,39 @@ fn forget_leaves_a_running_session_alone() {
     assert!(env.state_file().exists(), "the layout was deleted");
 }
 
+/// A workspace that cannot be restored (its shell is gone) stays saved as it was, scrollback
+/// included, while the server saves the others; it comes back once it can.
+#[test]
+fn a_workspace_that_cannot_be_restored_stays_saved() {
+    let env = Env::new("unrestored");
+    env.workspace("shells", "layout {\n    pane name=\"shell\"\n}\n");
+    env.workspace("jobs", "layout {\n    pane name=\"job\" command=\"sh\" { args \"-c\" \"exec sleep 4246\"; }\n}\n");
+    env.run(&["open", "shells"]);
+    env.run(&["open", "jobs"]);
+    env.run(&["send", "-p", "shell", "--enter", "echo kept-$((4*4))"]);
+    env.wait_for_text("shell", "kept-16");
+    env.run(&["kill"]);
+    let names = || -> Vec<String> {
+        let panes: serde_json::Value = serde_json::from_str(&env.run(&["panes", "--json"])).unwrap();
+        panes.as_array().unwrap().iter().map(|p| p["name"].as_str().unwrap_or_default().to_string()).collect()
+    };
+    // Without its shell, that workspace cannot come back; the other one does, and is saved.
+    let shell = env.root.join("sh");
+    let away = env.root.join("sh.away");
+    std::fs::rename(&shell, &away).unwrap();
+    env.run(&["open", "jobs"]);
+    assert_eq!(names(), ["job"]);
+    env.run(&["kill"]);
+    let state = std::fs::read_to_string(env.state_file()).unwrap();
+    assert!(state.contains("\"shells\""), "the workspace was dropped: {state}");
+    std::fs::rename(&away, &shell).unwrap();
+    env.run(&["open", "jobs"]);
+    let mut back = names();
+    back.sort();
+    assert_eq!(back, ["job", "shell"]);
+    env.wait_for_text("shell", "kept-16");
+}
+
 #[test]
 fn a_failed_start_leaves_no_empty_workspace() {
     let env = Env::new("emptyws");

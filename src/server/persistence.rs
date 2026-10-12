@@ -36,7 +36,7 @@ impl Server {
     pub(super) fn persist(&mut self) {
         self.persist_dirty = false;
         self.last_persist = Instant::now();
-        if self.workspaces.is_empty() {
+        if self.workspaces.is_empty() && self.unrestored.is_empty() {
             return;
         }
         // Turned off: nothing is saved, and what was goes once this state is written.

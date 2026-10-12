@@ -3,7 +3,8 @@
 //! Processes cannot survive a restart; panes come back as fresh shells in their last working
 //! directory. Interactive SSH panes reconnect and agents with a known session id are resumed
 //! (`claude --resume <id>`); other command panes wait for Enter rather than run again by
-//! themselves. Typing is never broadcast after a restart.
+//! themselves. Typing is never broadcast after a restart. A workspace that cannot be restored
+//! (its shell gone, say) stays saved as it was, to come back at a later start.
 //!
 //! What each pane showed is saved too, unless `save_scrollback` is off: a file per pane in the
 //! session's scrollback directory, named by the state and given back to the pane replacing it.
@@ -35,7 +36,7 @@ pub struct SessionSnapshot {
     pub tunnels: Vec<crate::server::net::TunnelSpec>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkspaceSnap {
     pub name: String,
     pub definition: Option<PathBuf>,
@@ -46,7 +47,7 @@ pub struct WorkspaceSnap {
     pub sync: crate::server::SyncScope,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TabSnap {
     pub name: String,
     pub root: Option<NodeSnap>,
@@ -60,7 +61,7 @@ pub struct TabSnap {
     pub preset: Option<Preset>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum NodeSnap {
     Pane(Box<PaneSnap>),
     /// A stack is a split of its panes marked `stacked`, with the index of the one open.
@@ -181,6 +182,7 @@ pub fn snapshot(server: &Server) -> SessionSnapshot {
                 })
                 .collect(),
         })
+        .chain(server.unrestored.iter().cloned())
         .collect();
     SessionSnapshot {
         version: VERSION,
@@ -362,27 +364,27 @@ pub fn apply(server: &mut Server, snap: SessionSnapshot) -> Result<()> {
     for ws in snap.workspaces {
         let panes_before: std::collections::HashSet<PaneId> = server.panes.keys().copied().collect();
         let workspaces_before: Vec<u32> = server.workspaces.iter().map(|w| w.id).collect();
-        let name = ws.name.clone();
-        if let Err(e) = apply_workspace(server, ws, snap.revision) {
+        if let Err(e) = apply_workspace(server, &ws, snap.revision) {
             server.rollback(&panes_before, &workspaces_before);
-            server.warnings.push(format!("could not restore workspace {name}: {e:#}"));
+            server.warnings.push(format!("could not restore workspace {}: {e:#}; it stays saved", ws.name));
+            server.unrestored.push(ws);
         }
     }
     server.relayout();
     Ok(())
 }
 
-fn apply_workspace(server: &mut Server, ws: WorkspaceSnap, revision: u32) -> Result<()> {
+fn apply_workspace(server: &mut Server, ws: &WorkspaceSnap, revision: u32) -> Result<()> {
     {
-        let id = server.new_workspace(ws.name, ws.definition);
+        let id = server.new_workspace(ws.name.clone(), ws.definition.clone());
         let wi = server.ws_index(id).unwrap();
-        server.workspaces[wi].cwd = ws.cwd;
-        for t in ws.tabs {
+        server.workspaces[wi].cwd = ws.cwd.clone();
+        for t in &ws.tabs {
             let tab_id = server.alloc_id();
             // Older versions saved a tab without a name as "tab N"; unnamed, it shows what its
             // pane runs.
             let old_default = revision == 0 && t.name.strip_prefix("tab ").is_some_and(|n| n.parse::<u32>().is_ok());
-            let mut tab = Tab::new(tab_id, if old_default { String::new() } else { t.name });
+            let mut tab = Tab::new(tab_id, if old_default { String::new() } else { t.name.clone() });
             tab.preset = t.preset;
             if let Some(root) = &t.root {
                 tab.root = Some(build(server, root)?);
