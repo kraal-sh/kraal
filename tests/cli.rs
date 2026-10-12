@@ -3713,6 +3713,32 @@ fn a_pane_printing_without_a_pause_does_not_starve_the_others() {
 }
 
 #[test]
+fn output_parsed_while_keys_come_is_whole_and_in_order() {
+    let env = Env::new("slices");
+    env.workspace("w", "layout {\n    pane name=\"main\" command=\"cat\"\n}\n");
+    env.run(&["open", "w"]);
+    // About 280 KB in lines narrower than the pane: chunks of it are parsed while keys come,
+    // each of which stops the parse for a moment.
+    let script = r#"sleep 0.5; awk 'BEGIN { for (i = 1; i <= 9000; i++) printf "%06d %023d\n", i, 0 }'; echo FLOOD-DONE; exec sleep 60"#;
+    env.run(&["run", "--name", "flood", "--", "sh", "-c", script]);
+    env.run(&["focus", "main"]);
+    let mut client = RawClient::attach(&env, "w");
+    let start = Instant::now();
+    while !env.run(&["read", "-p", "flood"]).contains("FLOOD-DONE") {
+        assert!(start.elapsed() < Duration::from_secs(10), "the output never ended");
+        for _ in 0..20 {
+            client.send(b"x");
+            std::thread::sleep(Duration::from_micros(500));
+        }
+    }
+    let text = env.run(&["read", "-p", "flood", "--lines", "9500"]);
+    let numbers: Vec<u32> = text.lines().filter_map(|l| l.split_whitespace().next()?.parse().ok()).collect();
+    assert!(numbers == (1..=9000).collect::<Vec<u32>>(), "{} lines, first gap after {:?}", numbers.len(), {
+        numbers.windows(2).find(|w| w[1] != w[0] + 1)
+    });
+}
+
+#[test]
 fn an_account_switch_never_resends_a_prompt_by_itself_and_one_that_fails_can_be_restarted() {
     let env = Env::new("switchacct");
     let bin = env.root.join("bin");

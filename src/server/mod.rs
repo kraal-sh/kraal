@@ -512,6 +512,9 @@ pub struct Server {
     ready_set: std::collections::HashSet<PaneId>,
     /// Room for the output being parsed, reused from one read to the next.
     output_buf: Vec<u8>,
+    /// Output taken from panes and not parsed yet: parsing stopped for something that came
+    /// (a key), and goes on before any more of their output (see `pump_output`).
+    unparsed: HashMap<PaneId, Vec<u8>>,
     /// Panes printing without a pause that had no output waiting: looked at again at
     /// `watch_at`, without their readers waking the server meanwhile.
     watched: Vec<PaneId>,
@@ -565,6 +568,9 @@ const BUSY_FRAME_GAP: Duration = Duration::from_millis(8);
 const BUSY_AFTER: u8 = 3;
 /// How long after a key the output of the pane it went to is drawn at once, as its echo.
 const ECHO_WAIT: Duration = Duration::from_millis(250);
+/// Output is parsed this much at a time, so that what comes meanwhile (a key, its echo) does not
+/// wait for all that a program printed to be parsed.
+const PARSE_SLICE: usize = 8 * 1024;
 
 /// Whether what was last done at `last` is due again at `now`, done `every` so often: a little
 /// early rather than a whole tick late.
@@ -717,6 +723,7 @@ pub fn run(session: &str) -> Result<()> {
         ready: Default::default(),
         ready_set: Default::default(),
         output_buf: Vec::new(),
+        unparsed: HashMap::new(),
         watched: Vec::new(),
         watch_at: None,
         exiting: Default::default(),
@@ -902,7 +909,8 @@ impl Server {
     /// turn, one chunk each. Stops early when a control event arrives or a frame is due, but the
     /// others always get a chunk: a pane printing without a pause keeps the queue busy, and must
     /// not starve the rest. A frame due once the focused panes are read (the echo of a key) goes
-    /// before the others' output, every other time at most.
+    /// before the others' output, every other time at most. A chunk is parsed a slice at a time:
+    /// one that comes while it is parsed (a key) waits for a slice, not for all of it.
     fn pump_output(&mut self, budget: Duration, rx: &Receiver<Event>) {
         let start = Instant::now();
         let focused: Vec<PaneId> =
@@ -918,10 +926,12 @@ impl Server {
         for p in focused {
             let mut first = true;
             while std::mem::take(&mut first) || more(self, budget / 2) {
-                if !self.take_output(p, &mut data) {
+                if !self.take_output(p, &mut data, true) {
                     break;
                 }
-                self.pane_output(p, &data);
+                if !self.parse_output(p, &data, rx) {
+                    break;
+                }
             }
         }
         // A frame due (an echo) goes before the others' turn, but not twice in a row: a pane
@@ -933,8 +943,8 @@ impl Server {
         let mut served = skip;
         while !std::mem::replace(&mut served, true) || more(self, budget) {
             let Some(id) = self.ready.pop_front() else { break };
-            if self.take_output(id, &mut data) {
-                self.pane_output(id, &data);
+            if self.take_output(id, &mut data, true) {
+                self.parse_output(id, &data, rx);
                 self.ready.push_back(id);
             } else if self.streaming(id) {
                 self.watched.push(id);
@@ -946,15 +956,42 @@ impl Server {
         self.output_buf = data;
     }
 
+    /// Parse output `data` of pane `id`, a slice at a time, until it is all parsed (true) or
+    /// something waits in `rx`: then the rest is parsed before any more of the pane's output,
+    /// and the pane stays in the queue for it.
+    fn parse_output(&mut self, id: PaneId, data: &[u8], rx: &Receiver<Event>) -> bool {
+        let mut at = 0;
+        while at < data.len() {
+            let end = (at + PARSE_SLICE).min(data.len());
+            self.pane_output(id, &data[at..end]);
+            at = end;
+            if at < data.len() && !rx.is_empty() && self.panes.contains_key(&id) {
+                self.unparsed.insert(id, data[at..].to_vec());
+                if self.ready_set.insert(id) {
+                    self.ready.push_back(id);
+                }
+                return false;
+            }
+        }
+        true
+    }
+
     /// Whether pane `id` printed just now: the server then comes back for its output on its own
     /// (every [`WATCH_STREAMS`]) instead of being woken for each read of it.
     fn streaming(&self, id: PaneId) -> bool {
         self.panes.get(&id).is_some_and(|p| p.last_output.elapsed() < STREAM_PAUSE)
     }
 
-    /// Take pane `id`'s waiting output into `data`; false when there was none.
-    fn take_output(&self, id: PaneId, data: &mut Vec<u8>) -> bool {
-        self.panes.get(&id).is_some_and(|p| p.take_output_into(data, self.streaming(id)))
+    /// Take pane `id`'s waiting output into `data`, what was left unparsed first; false when
+    /// there was none. With `watch`, a pane printing without a pause is looked at again on its
+    /// own (see `streaming`).
+    fn take_output(&mut self, id: PaneId, data: &mut Vec<u8>, watch: bool) -> bool {
+        if let Some(rest) = self.unparsed.remove(&id) {
+            *data = rest;
+            return true;
+        }
+        let comes_back = watch && self.streaming(id);
+        self.panes.get(&id).is_some_and(|p| p.take_output_into(data, comes_back))
     }
 
     fn next_deadline(&self) -> Instant {
@@ -1031,6 +1068,7 @@ impl Server {
         self.git_due(now);
         if now >= self.next_tick() {
             self.last_tick = now;
+            self.unparsed.retain(|id, _| self.panes.contains_key(id));
             self.tick(now);
             self.idle = self.quiet(now);
             self.scan_polled = self.scan_needed();
@@ -1396,13 +1434,14 @@ impl Server {
         let mut data = std::mem::take(&mut self.output_buf);
         for id in ids {
             let mut left: usize = 64 * 1024;
-            while left > 0 && self.panes.get(&id).is_some_and(|p| p.take_output_into(&mut data, false)) {
+            while left > 0 && self.take_output(id, &mut data, false) {
                 self.pane_output(id, &data);
                 left = left.saturating_sub(data.len());
             }
             let Some(&(pid, code, until)) = self.exiting.get(&id) else { continue };
             if self.panes.get(&id).is_none_or(|p| p.output_finished()) || Instant::now() >= until {
                 self.exiting.remove(&id);
+                self.unparsed.remove(&id);
                 self.pane_exited(id, pid, code);
             }
         }
