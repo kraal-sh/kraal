@@ -224,7 +224,7 @@ pub(super) fn agent(
 ) -> Result<()> {
     let inside = std::env::var_os("KRAAL_SOCKET").is_some();
     if inside && !here {
-        s.request(Request::OpenAgent {
+        let opened = s.request(Request::OpenAgent {
             agent,
             account,
             placement,
@@ -232,6 +232,7 @@ pub(super) fn agent(
             cwd: std::env::current_dir().ok(),
             args,
         })?;
+        super::print_opened(&opened);
         return Ok(());
     }
     // Here, in this pane: its workspace's account rules still apply.
@@ -306,7 +307,7 @@ pub(super) fn worktrees(s: &Session, action: WtCmd) -> Result<()> {
             prepared.run_here(&env)?;
             if let Some(agent) = agent {
                 if std::env::var_os("KRAAL_SOCKET").is_some() {
-                    s.request(Request::OpenAgent {
+                    let opened = s.request(Request::OpenAgent {
                         agent,
                         account: None,
                         placement: Placement::Tab,
@@ -314,6 +315,7 @@ pub(super) fn worktrees(s: &Session, action: WtCmd) -> Result<()> {
                         cwd: Some(w.path.clone()),
                         args: Vec::new(),
                     })?;
+                    super::print_opened(&opened);
                 } else {
                     std::env::set_current_dir(&w.path)?;
                     return exec_agent(&agent, None, None, &[], &env);

@@ -251,6 +251,14 @@ fn resolve_targets(known: &[servers::Known], targets: &[String]) -> Result<Vec<s
     Ok(out)
 }
 
+/// Print the id of the pane a command opened, alone on its line: what a script keeps to drive
+/// that pane (`kraal wait -p`, `kraal read -p`).
+fn print_opened(answer: &Response) {
+    if let Response::Pane(pane) = answer {
+        println!("{}", pane.id);
+    }
+}
+
 /// `kraal config keys`: every key, grouped as the help shows them, then the names that
 /// `[keys.leader]` and `[keys.direct]` take, with what each does and its keys now.
 fn print_keys(keymap: &crate::keymap::Keymap, markdown: bool) {

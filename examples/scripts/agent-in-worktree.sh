@@ -4,17 +4,14 @@
 # kraal makes the branch kraal/fix-login in <repository>.worktrees/fix-login, prepares it
 # and opens the agent there in a new tab: give it its task. The script waits until the
 # agent asks something or has finished, prints its screen and sends a notification.
-# Needs git, jq and the agent (claude by default, or codex).
+# Needs git and the agent (claude by default, or codex).
 set -eu
 
 name=${1:?usage: agent-in-worktree.sh NAME [AGENT]}
 agent=${2:-claude}
 
-kraal wt new "$name" --agent "$agent"
-
-# The agent's pane is the one whose directory is the new worktree.
-pane=$(kraal panes --json |
-    jq -r --arg dir ".worktrees/$name" 'first(.[] | select((.cwd // "") | endswith($dir)) | .id)')
+# What it prints goes to the terminal as it comes; its last line is the id of the agent's pane.
+pane=$(kraal wt new "$name" --agent "$agent" | tee /dev/tty | tail -n 1)
 
 state=$(kraal wait -p "$pane" --until blocked,done)
 kraal read -p "$pane" --lines 20

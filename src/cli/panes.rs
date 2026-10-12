@@ -124,9 +124,7 @@ pub(super) fn run(s: &Session, args: RunArgs) -> Result<()> {
         focus: !args.place.no_focus,
         close_on_exit: args.close_on_exit,
     })?;
-    if let Response::Pane(p) = r {
-        println!("{}", p.id);
-    }
+    super::print_opened(&r);
     Ok(())
 }
 
@@ -145,9 +143,7 @@ pub(super) fn preview(s: &Session, path: PathBuf, place: PlaceArgs) -> Result<()
         focus: !place.no_focus,
         close_on_exit: false,
     })?;
-    if let Response::Pane(p) = r {
-        println!("{}", p.id);
-    }
+    super::print_opened(&r);
     Ok(())
 }
 

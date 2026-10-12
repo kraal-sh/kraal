@@ -3728,6 +3728,11 @@ fn account_rules_see_a_worktree_anywhere_as_its_repository() {
         .unwrap();
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     let panes: serde_json::Value = serde_json::from_str(&env.run(&["panes", "--json"])).unwrap();
+    // It prints the id of the pane it opened, as `kraal run` does.
+    let opened = String::from_utf8(out.stdout).unwrap();
+    let pane = panes.as_array().unwrap().iter().find(|p| format!("{}\n", p["id"]) == opened);
+    let dir = pane.and_then(|p| p["cwd"].as_str()).map(|dir| Path::new(dir).canonicalize().unwrap());
+    assert_eq!(dir, Some(other.canonicalize().unwrap()), "{opened:?} among {panes}");
     let ids: Vec<String> = panes.as_array().unwrap().iter().map(|p| p["id"].to_string()).collect();
     let start = Instant::now();
     loop {
@@ -4137,8 +4142,12 @@ fn an_agent_worktree_is_prepared_in_its_pane_once_trusted() {
         .output()
         .unwrap();
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
-    assert!(String::from_utf8_lossy(&out.stdout).contains("changed"), "the setup ran there");
-    wait_for("claude", "agent in cli #1 port 3010");
+    let said = String::from_utf8(out.stdout).unwrap();
+    assert!(said.contains("changed"), "the setup ran there");
+    // Its last line is the id of the agent's pane.
+    let pane = said.lines().last().unwrap();
+    assert!(pane.parse::<u32>().is_ok(), "{said}");
+    wait_for(pane, "agent in cli #1 port 3010");
 }
 
 #[test]
