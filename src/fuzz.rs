@@ -6,6 +6,7 @@
 //! `KRAAL_FUZZ_CASES=<n>`. A failure names its seed: `KRAAL_FUZZ_SEED=<seed> KRAAL_FUZZ_CASES=1`
 //! runs that case again. A case running longer than `KRAAL_FUZZ_LIMIT` seconds (60) stops the
 //! process, naming its seed; so does one taking more than `KRAAL_FUZZ_RSS_MB` of memory (Linux).
+//! `KRAAL_FUZZ_KEEP_GOING` goes on after a failing case, `KRAAL_FUZZ_TRACE` says what each does.
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
@@ -214,6 +215,8 @@ struct Plan {
     seed: u64,
     limit: Duration,
     rss_mb: Option<u64>,
+    /// Go on after a failing case (`KRAAL_FUZZ_KEEP_GOING`): a long search finds more than one.
+    keep_going: bool,
 }
 
 fn env_number(name: &str) -> Option<u64> {
@@ -247,6 +250,7 @@ fn plan(name: &str, ci: u64) -> Plan {
         seed,
         limit: Duration::from_secs(env_number("KRAAL_FUZZ_LIMIT").unwrap_or(60)),
         rss_mb: env_number("KRAAL_FUZZ_RSS_MB"),
+        keep_going: std::env::var_os("KRAAL_FUZZ_KEEP_GOING").is_some(),
     }
 }
 
@@ -307,23 +311,28 @@ pub fn run(name: &str, ci: u64, case: impl Fn(&mut Rng)) {
         }
     });
     let mut ran = 0u64;
+    let mut failed = Vec::new();
     while ran < plan.cases && plan.until.is_none_or(|t| Instant::now() < t) {
         let seed = plan.seed.wrapping_add(ran);
         running.seed.store(seed, Ordering::Relaxed);
         running.since.store(running.start.elapsed().as_millis() as u64, Ordering::Relaxed);
         let result = catch_unwind(AssertUnwindSafe(|| case(&mut Rng::new(seed))));
         running.since.store(u64::MAX, Ordering::Relaxed);
-        if result.is_err() {
-            running.done.store(true, Ordering::Relaxed);
-            panic!("fuzz {name}: the case of seed {seed:#x} failed (KRAAL_FUZZ_SEED={seed:#x} KRAAL_FUZZ_CASES=1)");
-        }
         ran += 1;
+        if result.is_err() {
+            eprintln!("fuzz {name}: the case of seed {seed:#x} failed (KRAAL_FUZZ_SEED={seed:#x} KRAAL_FUZZ_CASES=1)");
+            failed.push(seed);
+            if !plan.keep_going {
+                break;
+            }
+        }
     }
     running.done.store(true, Ordering::Relaxed);
     let _ = watchdog.join();
     if plan.until.is_some() || plan.cases != ci {
-        eprintln!("fuzz {name}: {ran} cases from seed {:#x}", plan.seed);
+        eprintln!("fuzz {name}: {ran} cases from seed {:#x}, {} failed", plan.seed, failed.len());
     }
+    assert!(failed.is_empty(), "fuzz {name}: the cases of seeds {failed:#x?} failed");
 }
 
 /// Say what a case does, when `KRAAL_FUZZ_TRACE` is set: to read a failing case.
