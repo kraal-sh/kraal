@@ -5868,16 +5868,38 @@ fn a_restart_from_a_pane_says_what_stops_in_that_pane_too() {
         });
         text.lines().filter_map(|line| line.strip_prefix("  ")).map(String::from).collect()
     };
-    for typed in [restart.clone(), format!("sh '{}'", script.display()), format!("{restart} &")] {
+    // The pane's shell may have its own standard input elsewhere while the command runs: dash
+    // does that for a command given `< file`, and this line does it in any shell. The jobs are
+    // those of the shell's terminal all the same.
+    let elsewhere = |command: &str| format!("exec 3<&0 </dev/null; {command}; exec <&3 3<&-");
+    let typed = [
+        restart.clone(),
+        format!("sh '{}'", script.display()),
+        format!("{restart} &"),
+        elsewhere(&format!("'{}' restart >'{}' 2>&1", env!("CARGO_BIN_EXE_kraal"), said.display())),
+    ];
+    for typed in typed {
         let stops = stops(&typed);
         assert_eq!(stops.len(), 1, "{typed}: {stops:?}");
         assert!(stops[0].starts_with("sleep 4251 (in the background)  (pane "), "{typed}: {stops:?}");
     }
     // The same list as from outside the session.
-    let out = env.try_run(&["restart"]);
-    let said = String::from_utf8_lossy(&out.stdout);
-    assert!(said.contains("These programs stop:\n  sleep 4251 (in the background)  (pane "), "{said}");
-    assert_eq!(said.lines().filter(|line| line.starts_with("  ")).count(), 1, "{said}");
+    let outside = || {
+        let out = env.try_run(&["restart"]);
+        assert!(!out.status.success());
+        let said = String::from_utf8_lossy(&out.stdout).into_owned();
+        said.lines().filter_map(|line| line.strip_prefix("  ")).map(String::from).collect::<Vec<_>>()
+    };
+    let stops = outside();
+    assert_eq!(stops.len(), 1, "{stops:?}");
+    assert!(stops[0].starts_with("sleep 4251 (in the background)  (pane "), "{stops:?}");
+    // And from outside while that shell runs a program with its standard input elsewhere.
+    env.run(&["send", "-p", "shell", "--enter", &elsewhere("sleep 4253")]);
+    wait_until(Duration::from_secs(10), "the program never started", || running(b"sleep\x004253\x00"));
+    let stops = outside();
+    assert_eq!(stops.len(), 2, "{stops:?}");
+    assert!(stops[0].starts_with("sleep 4253  (pane "), "{stops:?}");
+    assert!(stops[1].starts_with("sleep 4251 (in the background)  (pane "), "{stops:?}");
     assert_eq!(env.server_pid(), Some(pid));
     assert!(running(b"sleep\x004251\x00"));
 }

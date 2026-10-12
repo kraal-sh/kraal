@@ -344,9 +344,25 @@ mod imp {
         rest.split_whitespace().nth(2)?.parse().ok()
     }
 
-    /// The terminal a pane's program runs on: its standard input.
+    /// The terminal a process runs on: its controlling terminal, when that is a pseudo-terminal
+    /// (a pane's is). Not what its standard input is: a shell has that elsewhere for a while
+    /// when it redirects itself (dash does, while a command given `< file` runs).
     pub fn terminal_of(pid: u32) -> Option<PathBuf> {
-        std::fs::read_link(format!("/proc/{pid}/fd/0")).ok().filter(|t| t.starts_with("/dev/"))
+        use std::os::unix::fs::MetadataExt;
+        // After the command name: state, parent, group, session, then the terminal's device (0
+        // without one) as the kernel packs it: the major number above the low byte of the minor,
+        // the rest of the minor above both.
+        let stat = std::fs::read(format!("/proc/{pid}/stat")).ok()?;
+        let end = stat.iter().rposition(|b| *b == b')')?;
+        let rest = String::from_utf8_lossy(&stat[end + 1..]).into_owned();
+        let device: u32 = rest.split_whitespace().nth(4)?.parse().ok()?;
+        let (major, minor) = ((device >> 8) & 0xfff, (device & 0xff) | ((device >> 12) & 0xfff00));
+        // A pseudo-terminal's name in /dev/pts is its minor number, under this major.
+        const PTS_MAJOR: u32 = 136;
+        let path = PathBuf::from(format!("/dev/pts/{minor}"));
+        let named =
+            major == PTS_MAJOR && std::fs::metadata(&path).is_ok_and(|m| m.rdev() == libc::makedev(major, minor));
+        named.then_some(path)
     }
 
     pub fn group_running(pgid: libc::pid_t) -> bool {
@@ -823,6 +839,47 @@ mod tests {
         assert!(!line.contains(&1), "{line:?}");
         child.kill().unwrap();
         child.wait().unwrap();
+    }
+
+    /// The jobs of a session are those of its terminal, whatever its leader reads: a shell has
+    /// its standard input elsewhere while it runs a command given `< file` (dash redirects
+    /// itself), as this one has for good.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_jobs_of_a_terminal_are_found_whatever_its_shell_reads() {
+        use portable_pty::{CommandBuilder, PtySize};
+        let dir = std::env::temp_dir().join(format!("kraal-tty-jobs-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let pidfile = dir.join("job");
+        let pair = portable_pty::native_pty_system()
+            .openpty(PtySize { rows: 5, cols: 20, pixel_width: 0, pixel_height: 0 })
+            .unwrap();
+        let mut cmd = CommandBuilder::new("sh");
+        // Job control: the background job gets a process group of its own.
+        cmd.args(["-c", &format!("set -m; sleep 4254 & echo $! > {}; exec </dev/null; wait", pidfile.display())]);
+        let mut shell = pair.slave.spawn_command(cmd).unwrap();
+        let leader = shell.process_id().unwrap();
+        let reads_elsewhere =
+            || std::fs::read_link(format!("/proc/{leader}/fd/0")).is_ok_and(|f| f == Path::new("/dev/null"));
+        let start = std::time::Instant::now();
+        while !(pidfile.exists() && reads_elsewhere()) {
+            assert!(start.elapsed() < std::time::Duration::from_secs(5), "the shell never got there");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let job: u32 = std::fs::read_to_string(&pidfile).unwrap().trim().parse().unwrap();
+        // The job may still be the shell's copy of itself for an instant.
+        while argv(job).is_none_or(|argv| argv != ["sleep", "4254"]) {
+            assert!(start.elapsed() < std::time::Duration::from_secs(5), "the job never started");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert_eq!(imp::terminal_of(leader), pair.master.tty_name());
+        assert_eq!(background_jobs(leader, &[]), [["sleep", "4254"]]);
+        assert!(background_jobs(leader, &[job]).is_empty(), "a job made of whoever asks is none");
+        // SAFETY: plain syscall on a process this test started.
+        unsafe { libc::kill(job as libc::pid_t, libc::SIGKILL) };
+        shell.kill().unwrap();
+        shell.wait().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
