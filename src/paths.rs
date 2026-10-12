@@ -417,25 +417,61 @@ fn try_lock(file: &std::fs::File) -> std::io::Result<bool> {
 /// `kraal forget` while it deletes what the session saved. A session so never has two servers,
 /// nor loses its files to `forget` while a server restores them, which a check that its socket
 /// answers cannot promise (a server not listening yet, a socket deleted).
+///
+/// The lock is a file in the runtime directory, which goes with its holder: every session name
+/// ever used would leave one otherwise. A process killed while it holds the session leaves its
+/// file, for the next holder of that session to take and remove.
 pub struct SessionLock {
     /// Locked while open.
-    _file: std::fs::File,
+    file: std::fs::File,
+    path: PathBuf,
 }
 
 impl SessionLock {
     /// Hold `session`, unless another process does (`None`).
     pub fn acquire(session: &str) -> std::io::Result<Option<SessionLock>> {
-        use std::os::unix::fs::OpenOptionsExt;
-        let path = private_runtime_dir()?.join(format!("{session}.lock"));
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(path)?;
-        Ok(try_lock(&file)?.then_some(SessionLock { _file: file }))
+        SessionLock::acquire_at(private_runtime_dir()?.join(format!("{session}.lock")))
     }
+
+    /// Hold the lock file `path`, made if needed, unless another process does (`None`).
+    fn acquire_at(path: PathBuf) -> std::io::Result<Option<SessionLock>> {
+        use std::os::unix::fs::OpenOptionsExt;
+        loop {
+            let file = std::fs::OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .write(true)
+                .mode(0o600)
+                .custom_flags(libc::O_NOFOLLOW)
+                .open(&path)?;
+            if !try_lock(&file)? {
+                return Ok(None);
+            }
+            if is_file_at(&file, &path) {
+                return Ok(Some(SessionLock { file, path }));
+            }
+            // Its last holder removed the file between the time it was opened here and the time
+            // it was locked: it locks nothing any more. The lock is the file there now, as it is
+            // for whoever comes next.
+        }
+    }
+}
+
+impl Drop for SessionLock {
+    fn drop(&mut self) {
+        // Removed while still held: nobody else holds it then, and who opened it before finds
+        // out once it has locked it (see `acquire_at`). A file someone else put there meanwhile
+        // (a cleaner of /tmp removed this one) is theirs.
+        if is_file_at(&self.file, &self.path) {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
+/// Whether the entry at `path` is `file` itself, not another file made there since it was opened.
+fn is_file_at(file: &std::fs::File, path: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    file.metadata().is_ok_and(|open| file_id(path) == Some((open.dev(), open.ino())))
 }
 
 /// The socket of `session`: where its server listens, or a new one will. A server an older kraal
@@ -961,6 +997,87 @@ mod tests {
             .collect();
         assert!(left.is_empty(), "no temporary file left behind");
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_session_lock_goes_with_its_holder_and_no_other_file_does() {
+        let dir = std::env::temp_dir().join(format!("kraal-lock-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("main.lock");
+        let held = SessionLock::acquire_at(path.clone()).unwrap().expect("nobody holds it");
+        // Whoever else asks is refused, and leaves the holder its file.
+        assert!(SessionLock::acquire_at(path.clone()).unwrap().is_none());
+        assert!(is_file_at(&held.file, &path));
+        drop(held);
+        assert!(!path.exists(), "the lock file was left");
+        // The file a killed holder left is taken, then goes too.
+        std::fs::write(&path, "").unwrap();
+        drop(SessionLock::acquire_at(path.clone()).unwrap().expect("nobody holds it"));
+        assert!(!path.exists(), "the file of a killed holder was left");
+        // A file put there while this one was held (this one removed by a cleaner of /tmp) is
+        // the lock of whoever made it.
+        let held = SessionLock::acquire_at(path.clone()).unwrap().unwrap();
+        std::fs::remove_file(&path).unwrap();
+        let other = SessionLock::acquire_at(path.clone()).unwrap().expect("the file there is free");
+        drop(held);
+        assert!(is_file_at(&other.file, &path), "the file of another holder was removed");
+        drop(other);
+        assert!(!path.exists());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Where [`a_contender_for_the_session_lock`] contends, when a test started it for that.
+    const CONTEND_IN: &str = "KRAAL_TEST_CONTEND_IN";
+
+    /// Taken and given back by many processes at once, over and over, a session is never held
+    /// by two, although its file goes with each holder, and nothing is left of it.
+    #[test]
+    fn a_session_lock_taken_by_many_processes_is_held_by_one_at_a_time() {
+        let dir = std::env::temp_dir().join(format!("kraal-lock-race-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // This test binary again, for the one test that contends.
+        let contenders: Vec<std::process::Child> = (0..8)
+            .map(|_| {
+                std::process::Command::new(std::env::current_exe().unwrap())
+                    .args(["--exact", "paths::tests::a_contender_for_the_session_lock", "--ignored", "--nocapture"])
+                    .env(CONTEND_IN, &dir)
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::piped())
+                    .spawn()
+                    .unwrap()
+            })
+            .collect();
+        // They start together, however long each took to get there.
+        std::fs::write(dir.join("go"), "").unwrap();
+        for contender in contenders {
+            let out = contender.wait_with_output().unwrap();
+            assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        }
+        assert!(!dir.join("main.lock").exists(), "a lock file was left");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// One of the processes of the test above: it takes the lock and gives it back many times,
+    /// and checks each time that it holds it alone.
+    #[test]
+    #[ignore = "started by a_session_lock_taken_by_many_processes_is_held_by_one_at_a_time"]
+    fn a_contender_for_the_session_lock() {
+        let Some(dir) = std::env::var_os(CONTEND_IN).map(PathBuf::from) else { return };
+        let (lock, alone) = (dir.join("main.lock"), dir.join("alone"));
+        let start = std::time::Instant::now();
+        while !dir.join("go").exists() {
+            assert!(start.elapsed() < std::time::Duration::from_secs(60), "never told to start");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        for _ in 0..5000 {
+            let Some(held) = SessionLock::acquire_at(lock.clone()).unwrap() else { continue };
+            // A file only one process can make: another holder would have made it.
+            let made = std::fs::OpenOptions::new().write(true).create_new(true).open(&alone);
+            assert!(made.is_ok(), "held by two at once");
+            std::thread::yield_now();
+            std::fs::remove_file(&alone).unwrap();
+            drop(held);
+        }
     }
 
     #[test]

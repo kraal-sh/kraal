@@ -1212,6 +1212,107 @@ fn forget_leaves_a_running_session_alone() {
     assert!(env.state_file().exists(), "the layout was deleted");
 }
 
+/// The lock files in a test's runtime directory.
+fn lock_files(env: &Env) -> Vec<String> {
+    let entries = std::fs::read_dir(env.root.join("run/kraal")).unwrap();
+    entries.map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).filter(|n| n.ends_with(".lock")).collect()
+}
+
+/// A session's lock file goes with the server, or the `kraal forget`, that held it: a session
+/// name that was used leaves nothing behind. The one a killed server left is the next one's.
+#[test]
+fn a_session_leaves_no_lock_file_behind() {
+    let env = Env::new("nolock");
+    env.workspace("w", "layout {\n    pane name=\"one\"\n}\n");
+    env.run(&["open", "w"]);
+    assert_eq!(lock_files(&env), ["nolock.lock"], "a running server holds its session");
+    env.run(&["kill"]);
+    assert_eq!(lock_files(&env), [""; 0], "left by a server that stopped");
+    env.run(&["forget"]);
+    assert_eq!(lock_files(&env), [""; 0], "left by kraal forget");
+    // A server killed outright cannot remove its file: the next server takes it, and removes it.
+    env.run(&["open", "w"]);
+    let pid = env.server_pid().expect("the server runs");
+    // SAFETY: plain syscall to the server this test started.
+    assert_eq!(unsafe { libc::kill(pid, libc::SIGKILL) }, 0);
+    // Gone once nothing listens: a process being killed still does for a moment.
+    let socket = env.root.join("run/kraal/nolock.sock");
+    wait_until(Duration::from_secs(10), "the killed server still listens", || {
+        std::os::unix::net::UnixStream::connect(&socket).is_err()
+    });
+    assert_eq!(lock_files(&env), ["nolock.lock"]);
+    env.run(&["open", "w"]);
+    env.run(&["kill"]);
+    assert_eq!(lock_files(&env), [""; 0], "left by the server after a killed one");
+}
+
+/// Servers started and stopped and the session forgotten, all at once and from many processes:
+/// the session is never held by two of them, every command works or is refused for what it says,
+/// and nothing is left of the lock once all is stopped.
+#[test]
+fn a_session_started_stopped_and_forgotten_at_once_is_held_by_one_at_a_time() {
+    use std::process::Stdio;
+    let env = Env::new("lockrace");
+    env.workspace("w", "layout {\n    pane name=\"one\"\n}\n");
+    let servers = std::sync::Mutex::new(Vec::new());
+    std::thread::scope(|scope| {
+        for worker in 0..8u64 {
+            let (env, servers) = (&env, &servers);
+            scope.spawn(move || {
+                // The same commands in the same order at each run, different for each worker.
+                let mut random = worker + 1;
+                for _ in 0..30 {
+                    random = random.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                    match (random >> 33) % 4 {
+                        0 | 1 => {
+                            let server = env.cmd(&["server"]).stdout(Stdio::null()).stderr(Stdio::piped()).spawn();
+                            servers.lock().unwrap().push(server.unwrap());
+                        }
+                        2 => {
+                            let out = env.try_run(&["kill"]);
+                            let said = String::from_utf8_lossy(&out.stderr);
+                            assert!(out.status.success() || said.contains("no kraal server"), "kill: {said}");
+                        }
+                        _ => {
+                            let out = env.try_run(&["forget"]);
+                            let said = String::from_utf8_lossy(&out.stderr);
+                            assert!(out.status.success() || said.contains("is running"), "forget: {said}");
+                        }
+                    }
+                }
+            });
+        }
+    });
+    // Each server ran until it was stopped, or was refused the session. One that had found
+    // another one listening, or its socket taken, would have held the session with that one.
+    let servers = servers.into_inner().unwrap();
+    assert!(servers.len() > 100, "{} servers started", servers.len());
+    let (mut ran, mut refused) = (0, 0);
+    for mut server in servers {
+        let start = Instant::now();
+        while server.try_wait().unwrap().is_none() {
+            let _ = env.try_run(&["kill"]);
+            assert!(start.elapsed() < Duration::from_secs(30), "a server would not stop");
+        }
+        let out = server.wait_with_output().unwrap();
+        let said = String::from_utf8_lossy(&out.stderr);
+        match out.status.success() {
+            true => ran += 1,
+            false => refused += 1,
+        }
+        assert_eq!(out.status.success(), said.is_empty(), "{said}");
+        assert!(said.is_empty() || said.contains("holds session \"lockrace\""), "{said}");
+    }
+    assert!(ran > 0 && refused > 0, "{ran} servers ran, {refused} were refused");
+    assert_eq!(lock_files(&env), [""; 0]);
+    // And the session is as any other.
+    env.run(&["open", "w"]);
+    assert!(env.run(&["panes"]).contains("one"));
+    env.run(&["kill"]);
+    env.run(&["forget"]);
+    assert_eq!(lock_files(&env), [""; 0]);
+}
+
 /// A workspace that cannot be restored (its shell is gone) stays saved as it was, scrollback
 /// included, while the server saves the others; it comes back once it can.
 #[test]
