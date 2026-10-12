@@ -578,7 +578,12 @@ pub fn run(session: &str) -> Result<()> {
     crate::pane::reserve_descriptors();
     let socket = paths::socket_path(session);
     paths::private_runtime_dir().context("checking the runtime directory")?;
+    // Held until this server is gone: the socket, and the session's files, are its alone.
+    let _held = paths::SessionLock::acquire(session)
+        .context("locking the session")?
+        .with_context(|| format!("another kraal holds session {session:?}: its server, or kraal forget"))?;
     if socket.exists() {
+        // A server an older kraal started holds no lock.
         if UnixStream::connect(&socket).is_ok() {
             anyhow::bail!("session {session:?} is already running");
         }

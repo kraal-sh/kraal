@@ -304,6 +304,30 @@ fn wait_gone(path: &Path) {
     }
 }
 
+/// Wait until `done`, failing the test with `what` after `limit`.
+fn wait_until(limit: Duration, what: &str, mut done: impl FnMut() -> bool) {
+    let start = Instant::now();
+    while !done() {
+        assert!(start.elapsed() < limit, "{what}");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// How `child` ended and what it printed, once it has: still running after `limit`, it is
+/// killed and the test fails.
+fn finish(mut child: std::process::Child, limit: Duration) -> Output {
+    let start = Instant::now();
+    while child.try_wait().unwrap().is_none() {
+        if start.elapsed() > limit {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("still running after {limit:?}");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    child.wait_with_output().unwrap()
+}
+
 #[test]
 fn run_send_read_and_close() {
     let env = Env::new("basic");
@@ -1013,6 +1037,45 @@ fn kill_says_when_the_layout_was_not_saved() {
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(!out.status.success() && err.contains("could not be saved"), "{err}");
     assert!(env.server_pid().is_none(), "the server stopped anyway");
+}
+
+/// A session has one server: another one started for it while it runs refuses to, even when
+/// the first one's socket is gone (a cleaner of /tmp may remove it), so that two servers never
+/// write the same session.
+#[test]
+fn a_session_never_has_two_servers() {
+    let env = Env::new("oneserver");
+    env.workspace("w", "layout {\n    pane name=\"one\"\n}\n");
+    env.run(&["open", "w"]);
+    let first = env.server_pid().expect("the server runs");
+    let socket = env.root.join("run/kraal/oneserver.sock");
+    let aside = env.root.join("run/kraal/aside.sock");
+    std::fs::rename(&socket, &aside).unwrap();
+    let second = env.cmd(&["server"]).stderr(std::process::Stdio::piped()).spawn().unwrap();
+    let out = finish(second, Duration::from_secs(10));
+    std::fs::rename(&aside, &socket).unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success() && err.contains("holds session \"oneserver\""), "{err}");
+    assert_eq!(env.server_pid(), Some(first));
+    env.run(&["panes"]);
+}
+
+/// `kraal forget` deletes nothing of a session whose server runs, even one whose socket is gone:
+/// a server holds its session, and `forget` must hold it too.
+#[test]
+fn forget_leaves_a_running_session_alone() {
+    let env = Env::new("forgetheld");
+    env.workspace("w", "layout {\n    pane name=\"one\"\n}\n");
+    env.run(&["open", "w"]);
+    wait_until(Duration::from_secs(10), "the layout was never saved", || env.state_file().exists());
+    let socket = env.root.join("run/kraal/forgetheld.sock");
+    let aside = env.root.join("run/kraal/aside.sock");
+    std::fs::rename(&socket, &aside).unwrap();
+    let out = env.try_run(&["forget"]);
+    std::fs::rename(&aside, &socket).unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success() && err.contains("is running"), "{err}");
+    assert!(env.state_file().exists(), "the layout was deleted");
 }
 
 #[test]

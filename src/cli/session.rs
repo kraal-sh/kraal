@@ -2,7 +2,7 @@
 
 use std::path::{Path, PathBuf};
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 
 use super::Session;
 use crate::protocol::{self, Request, Response};
@@ -26,7 +26,10 @@ pub(super) fn kill(s: &Session) -> Result<()> {
 /// `kraal forget`: delete what a stopped session saved.
 pub(super) fn forget(s: &Session) -> Result<()> {
     let session = &s.name;
-    if std::os::unix::net::UnixStream::connect(paths::socket_path(session)).is_ok() {
+    // Held while the files go, so that no server starts on them meanwhile. A server an older
+    // kraal started holds no lock, but listens.
+    let held = paths::SessionLock::acquire(session).context("locking the session")?;
+    if held.is_none() || std::os::unix::net::UnixStream::connect(paths::socket_path(session)).is_ok() {
         bail!("session {session} is running; `kraal kill` it first");
     }
     let p = paths::session_state_path(session);
