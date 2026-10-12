@@ -342,6 +342,14 @@ impl Reference {
         self.cut.drain(..self.cut.len() - cut);
         self.parser.advance(&mut self.term, &bytes[..alone]);
         self.parser.advance(&mut self.term, &bytes[alone..]);
+        // As kraal blanks the half of a wide character left at the cursor by a deletion: the
+        // emulator alone would read before the row for a cursor there at its first column.
+        let cursor = self.term.grid().cursor.point;
+        let cell = &mut self.term.grid_mut()[cursor];
+        if cell.flags.contains(alacritty_terminal::term::cell::Flags::WIDE_CHAR_SPACER) && cursor.column.0 == 0 {
+            cell.flags.remove(alacritty_terminal::term::cell::Flags::WIDE_CHAR_SPACER);
+            cell.c = ' ';
+        }
     }
 }
 /// Every row of the history and the screen, oldest first.
@@ -365,7 +373,20 @@ fn same_screen(t: &TermPane, r: &Reference, resized: bool, what: &str) {
     if t.parser.sync_timeout().sync_timeout().is_some() || r.parser.sync_timeout().sync_timeout().is_some() {
         return;
     }
-    let (ours, theirs) = (view(&t.term), view(&r.term));
+    let (mut ours, mut theirs) = (view(&t.term), view(&r.term));
+    // kraal blanks the second half of a wide character whose first half was deleted (`CSI P`):
+    // alacritty keeps it, half of nothing.
+    let area = theirs.area;
+    for y in area.top()..area.bottom() {
+        for x in area.left()..area.right() {
+            let orphan = theirs[(x, y)].symbol().is_empty()
+                && (x == area.left() || unicode_width::UnicodeWidthStr::width(theirs[(x - 1, y)].symbol()) < 2);
+            if orphan {
+                theirs[(x, y)].reset();
+                ours[(x, y)].reset();
+            }
+        }
+    }
     if resized {
         let text = |b: &Buffer| b.content.iter().map(|c| c.symbol().to_string()).collect::<Vec<_>>();
         assert_eq!(text(&ours), text(&theirs), "{what}:\n{ours:?}\n{theirs:?}");
@@ -390,7 +411,15 @@ fn passed_on(rng: &mut Rng, max: usize, ascii: bool) -> Vec<u8> {
             continue;
         }
         if ascii {
+            // And lines shorter than the thousand rows past which the archive keeps a line in
+            // pieces (no repeats of a character, `CSI b`).
+            if piece.starts_with(b"\x1b[") && piece.ends_with(b"b") {
+                continue;
+            }
             piece.retain(u8::is_ascii);
+            if rng.one_in(3) {
+                piece.extend_from_slice(b"\r\n");
+            }
         }
         out.extend(piece);
     }
@@ -499,9 +528,14 @@ fn fuzz_pane_shows_what_the_emulator_shows() {
                     let link = c.hyperlink().map(|h| h.uri().to_string());
                     (c.c, c.fg, c.bg, c.flags, c.zerowidth().map(<[char]>::to_vec), c.underline_color(), link)
                 };
+                use alacritty_terminal::term::cell::Flags;
+                let orphan = |c: alacritty_terminal::index::Column| {
+                    theirs[c].flags.contains(Flags::WIDE_CHAR_SPACER)
+                        && (c.0 == 0 || !theirs[c - 1].flags.contains(Flags::WIDE_CHAR))
+                };
                 let differs = (0..t.term.columns())
                     .map(alacritty_terminal::index::Column)
-                    .find(|c| cell(&ours[*c]) != cell(&theirs[*c]));
+                    .find(|c| !orphan(*c) && cell(&ours[*c]) != cell(&theirs[*c]));
                 if let Some(c) = differs {
                     panic!("row {l} at step {step}, column {}: {:?} {:?}", c.0, ours[c], theirs[c]);
                 }
