@@ -647,7 +647,7 @@ pub(super) fn keep_view_in_history<T: EventListener>(term: &mut Term<T>) {
 }
 
 /// The length of the UTF-8 character `lead` starts (1 for any other byte).
-fn utf8_len(lead: u8) -> usize {
+pub(super) fn utf8_len(lead: u8) -> usize {
     match lead {
         0xc2..=0xdf => 2,
         0xe0..=0xef => 3,
@@ -657,7 +657,7 @@ fn utf8_len(lead: u8) -> usize {
 }
 
 /// How many bytes at the end of `bytes` start a UTF-8 character without ending it.
-fn incomplete_char(bytes: &[u8]) -> usize {
+pub(super) fn incomplete_char(bytes: &[u8]) -> usize {
     let start = bytes.len().saturating_sub(3);
     match (start..bytes.len()).rev().find(|i| bytes[*i] & 0xc0 != 0x80) {
         Some(i) if matches!(std::str::from_utf8(&bytes[i..]), Err(e) if e.valid_up_to() == 0 && e.error_len().is_none()) => {

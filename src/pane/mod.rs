@@ -20,6 +20,8 @@ use crate::server::Event;
 mod archive;
 mod cache;
 mod commands;
+#[cfg(test)]
+mod fuzz;
 mod guard;
 mod history;
 mod osc;

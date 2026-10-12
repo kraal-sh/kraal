@@ -13,6 +13,8 @@ mod edit;
 mod exec;
 mod files;
 mod fleet;
+#[cfg(test)]
+mod fuzz;
 mod git;
 mod graphics;
 mod hints;
