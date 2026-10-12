@@ -189,18 +189,19 @@ impl Server {
         Mode::confirm(message, ConfirmAction::Restart)
     }
 
-    /// What a restart stops, a line per pane, in the order of the workspaces.
+    /// What a restart stops, a line per program, in the order of the workspaces.
     fn restart_stops(&self) -> Vec<String> {
         let ids: Vec<PaneId> = self.workspaces.iter().flat_map(|w| w.panes()).collect();
-        ids.into_iter()
-            .filter_map(|id| {
-                let pane = self.panes.get(&id)?;
-                let program = if pane.shell_waiting() { None } else { pane.foreground_argv() };
-                let info = self.pane_info(id);
-                let what = persist::stops_on_restart(&info, program.as_deref())?;
-                Some(persist::stopping_line(&info, &what))
-            })
-            .collect()
+        let mut lines = Vec::new();
+        for id in ids {
+            let Some(pane) = self.panes.get(&id) else { continue };
+            let program = if pane.shell_waiting() { None } else { pane.foreground_argv() };
+            let info = self.pane_info(id);
+            for what in persist::stops_on_restart(&info, program.as_deref(), &pane.background_jobs()) {
+                lines.push(persist::stopping_line(&info, &what));
+            }
+        }
+        lines
     }
 
     /// Restart the session: a helper started from the kraal installed now stops this server and

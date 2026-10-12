@@ -806,6 +806,12 @@ impl Pane {
         let t = self.term()?;
         t.master.process_group_leader().map(|p| p as u32)
     }
+
+    /// The command lines of the jobs in the background of the pane's terminal (see
+    /// [`crate::process::background_jobs`]).
+    pub fn background_jobs(&self) -> Vec<Vec<String>> {
+        self.pid().map(crate::process::background_jobs).unwrap_or_default()
+    }
 }
 
 /// Give the memory the allocator holds free back to the system, after panes freed much of it

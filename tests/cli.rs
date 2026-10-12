@@ -4713,6 +4713,36 @@ fn a_restart_from_the_last_pane_outlives_it() {
     assert!(env.run(&["panes"]).contains("only"));
 }
 
+/// A job left in the background of a shell stops with a restart (the terminal hangs up): it is
+/// said with what stops, and the restart needs a yes for it. What the shell runs off its
+/// terminal (a prompt's daemon) is not the user's job.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_restart_says_it_stops_the_jobs_in_the_background() {
+    let env = Env::new("bgjobs");
+    env.workspace("w", "layout {\n    pane name=\"shell\"\n}\n");
+    env.run(&["open", "w"]);
+    let pid = env.server_pid().expect("the server runs");
+    let jobs = "sleep 4247 & (exec sleep 4248 </dev/null >/dev/null 2>&1) &";
+    env.run(&["send", "-p", "shell", "--enter", jobs]);
+    let running = |argv: &[u8]| {
+        std::fs::read_dir("/proc")
+            .unwrap()
+            .flatten()
+            .any(|e| std::fs::read(e.path().join("cmdline")).is_ok_and(|c| c == argv))
+    };
+    wait_until(Duration::from_secs(10), "the jobs never started", || {
+        running(b"sleep\x004247\x00") && running(b"sleep\x004248\x00")
+    });
+    let out = env.try_run(&["restart"]);
+    let said = String::from_utf8_lossy(&out.stdout);
+    assert!(!out.status.success(), "{said}");
+    assert!(said.contains("These programs stop:\n  sleep 4247 (in the background)  (pane "), "{said}");
+    assert!(!said.contains("4248"), "{said}");
+    assert!(String::from_utf8_lossy(&out.stderr).contains("add --yes"));
+    assert_eq!(env.server_pid(), Some(pid));
+}
+
 /// Run `cmd` in a terminal (`script`, from util-linux), typing `input` into it; what the
 /// terminal showed.
 #[cfg(target_os = "linux")]

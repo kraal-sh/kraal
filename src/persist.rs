@@ -305,14 +305,26 @@ pub fn load(session: &str) -> Result<Option<SessionSnapshot>> {
     Ok(Some(snap))
 }
 
-/// What a restart stops in a pane, if anything, given what runs in it other than a shell at its
-/// prompt (`program`, its command line). A shell at its prompt comes back in its directory, an
-/// SSH shell reconnects and an agent resumes its conversation (a turn in progress stops); any
-/// other program stops, and a pane's own command waits for Enter after the restart.
-pub fn stops_on_restart(pane: &crate::protocol::PaneInfo, program: Option<&[String]>) -> Option<String> {
+/// What a restart stops in a pane, given what runs in it other than a shell at its prompt
+/// (`program`, its command line) and the jobs in the background of its terminal (`jobs`). A
+/// shell at its prompt comes back in its directory, an SSH shell reconnects and an agent resumes
+/// its conversation (a turn in progress stops); any other program stops, and a pane's own
+/// command waits for Enter after the restart. Every job in the background stops: the terminal
+/// hangs up.
+pub fn stops_on_restart(
+    pane: &crate::protocol::PaneInfo,
+    program: Option<&[String]>,
+    jobs: &[Vec<String>],
+) -> Vec<String> {
     if pane.kind != "terminal" || pane.suspended || pane.exit_code.is_some() {
-        return None;
+        return Vec::new();
     }
+    let background = jobs.iter().map(|job| format!("{} (in the background)", command_line(job)));
+    stops_in_foreground(pane, program).into_iter().chain(background).collect()
+}
+
+/// What a restart stops in the foreground of a running terminal pane (see [`stops_on_restart`]).
+fn stops_in_foreground(pane: &crate::protocol::PaneInfo, program: Option<&[String]>) -> Option<String> {
     if let Some(agent) = &pane.agent {
         return (pane.state == crate::agent::AgentState::Working)
             .then(|| format!("{agent}: the turn in progress (the conversation resumes)"));
@@ -323,8 +335,13 @@ pub fn stops_on_restart(pane: &crate::protocol::PaneInfo, program: Option<&[Stri
         return None;
     }
     let argv = program.filter(|p| !p.is_empty()).or((!pane.command.is_empty()).then_some(pane.command.as_slice()))?;
+    Some(command_line(argv))
+}
+
+/// `argv` as a shell reads it, cut at 60 characters.
+fn command_line(argv: &[String]) -> String {
     let line = crate::shell::join(argv);
-    Some(if line.chars().count() > 60 { format!("{}…", line.chars().take(59).collect::<String>()) } else { line })
+    if line.chars().count() > 60 { format!("{}…", line.chars().take(59).collect::<String>()) } else { line }
 }
 
 /// A line of the list of what a restart stops: the pane, then `what`.
@@ -535,30 +552,32 @@ mod tests {
             serde_json::from_value(info).unwrap()
         };
         let argv = |words: &[&str]| words.iter().map(|w| w.to_string()).collect::<Vec<_>>();
+        let stops = |pane: &crate::protocol::PaneInfo, program: Option<&[String]>| stops_on_restart(pane, program, &[]);
+        let none: Vec<String> = Vec::new();
         let shell = pane(serde_json::json!({}));
-        assert_eq!(stops_on_restart(&shell, None), None, "a shell at its prompt");
+        assert_eq!(stops(&shell, None), none, "a shell at its prompt");
         let sleep = argv(&["sleep", "1000"]);
-        assert_eq!(stops_on_restart(&shell, Some(&sleep)).as_deref(), Some("sleep 1000"));
+        assert_eq!(stops(&shell, Some(&sleep)), ["sleep 1000"]);
         assert_eq!(stopping_line(&shell, "sleep 1000"), "sleep 1000  (pane 3 \"build\" in w)");
         // A pane's own command stops (it waits for Enter after the restart), unless it is an
         // SSH shell, which reconnects; and nothing runs in a pane whose program ended.
         let command = pane(serde_json::json!({"command": ["make", "watch"]}));
-        assert_eq!(stops_on_restart(&command, None).as_deref(), Some("make watch"));
+        assert_eq!(stops(&command, None), ["make watch"]);
         let ssh = pane(serde_json::json!({"command": ["ssh", "web-1"]}));
-        assert_eq!(stops_on_restart(&ssh, Some(&argv(&["ssh", "web-1"]))), None);
+        assert_eq!(stops(&ssh, Some(&argv(&["ssh", "web-1"]))), none);
         let ssh_job = pane(serde_json::json!({"command": ["ssh", "web-1", "journalctl", "-f"]}));
-        assert!(stops_on_restart(&ssh_job, None).is_some());
+        assert_eq!(stops(&ssh_job, None).len(), 1);
         let ended = pane(serde_json::json!({"command": ["make"], "exit_code": 0}));
-        assert_eq!(stops_on_restart(&ended, None), None);
+        assert_eq!(stops(&ended, None), none);
         let waiting = pane(serde_json::json!({"command": ["make"], "suspended": true}));
-        assert_eq!(stops_on_restart(&waiting, None), None);
+        assert_eq!(stops(&waiting, None), none);
         let preview = pane(serde_json::json!({"kind": "preview:markdown"}));
-        assert_eq!(stops_on_restart(&preview, None), None);
+        assert_eq!(stops(&preview, None), none);
         // Agents resume; one in the middle of a turn loses that turn.
         let idle = pane(serde_json::json!({"agent": "claude", "state": "idle"}));
-        assert_eq!(stops_on_restart(&idle, Some(&argv(&["claude"]))), None);
+        assert_eq!(stops(&idle, Some(&argv(&["claude"]))), none);
         let working = pane(serde_json::json!({"agent": "claude", "state": "working"}));
-        assert!(stops_on_restart(&working, Some(&argv(&["claude"]))).is_some_and(|w| w.starts_with("claude: ")));
+        assert!(stops(&working, Some(&argv(&["claude"])))[0].starts_with("claude: "));
         let long = argv(&[
             "cargo",
             "build",
@@ -568,7 +587,16 @@ mod tests {
             "--target",
             "x86_64-unknown-linux-musl",
         ]);
-        assert!(stops_on_restart(&shell, Some(&long)).is_some_and(|w| w.chars().count() == 60 && w.ends_with('…')));
+        let cut = &stops(&shell, Some(&long))[0];
+        assert!(cut.chars().count() == 60 && cut.ends_with('…'), "{cut}");
+        // Jobs in the background stop beside whatever runs in the foreground, an idle agent
+        // or a shell at its prompt included; a pane whose program ended has none.
+        let jobs = [argv(&["sleep", "600"]), argv(&["tail", "-f", "log"])];
+        let both = ["sleep 600 (in the background)", "tail -f log (in the background)"];
+        assert_eq!(stops_on_restart(&shell, None, &jobs), both);
+        assert_eq!(stops_on_restart(&idle, Some(&argv(&["claude"])), &jobs), both);
+        assert_eq!(stops_on_restart(&shell, Some(&sleep), &jobs[1..]), ["sleep 1000", both[1]]);
+        assert_eq!(stops_on_restart(&ended, None, &jobs), none);
     }
 
     #[test]
