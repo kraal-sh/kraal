@@ -312,7 +312,7 @@ impl Server {
                     ConfirmAction::CloseWorkspace(ws),
                 );
             }
-            Action::Restart => return self.ask_restart(),
+            Action::Restart => return self.ask_restart(id),
             Action::EditServers => self.edit_servers(id),
             Action::SendPrefix => self.send_prefix(id, None),
         }

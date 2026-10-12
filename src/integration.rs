@@ -255,7 +255,7 @@ fn unknown(agent: &str) -> anyhow::Error {
 
 /// The command the agent's hooks run: a shell parses it, so the path is quoted whatever it holds.
 fn hook_command(agent: &str) -> Result<String> {
-    let exe = std::env::current_exe()?;
+    let exe = crate::client::installed_exe()?;
     Ok(format!("{} hook {agent}", crate::shell::quote(&exe.to_string_lossy())))
 }
 
@@ -297,7 +297,7 @@ pub fn install(agent: &str) -> Result<String> {
 
 /// What kraal writes in the file of its own it puts in an agent's directory.
 fn own_file(agent: &str) -> Result<String> {
-    let exe = std::env::current_exe()?.to_string_lossy().into_owned();
+    let exe = crate::client::installed_exe()?.to_string_lossy().into_owned();
     Ok(match agent {
         "copilot" => copilot_hooks(&exe),
         "pi" => pi_extension(&exe),
@@ -910,7 +910,7 @@ fn write_toml_hooks(
 
 fn install_codex(path: &Path) -> Result<String> {
     let text = read_text(path)?;
-    let exe = std::env::current_exe()?.to_string_lossy().into_owned();
+    let exe = crate::client::installed_exe()?.to_string_lossy().into_owned();
     let line = format!("notify = [{}, \"hook\", \"codex\"]", toml_string(&exe));
     // `notify` is a top-level key: it must come before the first [table].
     let mut lines: Vec<String> = text.lines().map(String::from).collect();

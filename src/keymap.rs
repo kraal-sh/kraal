@@ -117,7 +117,7 @@ const ACTIONS: &[(Action, &str, &str)] = &[
     (RenameWorkspace, "rename_workspace", "Rename workspace"),
     (CloseWorkspace, "close_workspace", "Close workspace"),
     (SaveWorkspace, "save_workspace", "Save workspace layout"),
-    (Restart, "restart", "Restart the session (on the kraal installed now; programs stop)"),
+    (Restart, "restart", "Restart the session (on the kraal installed now)"),
     (AgentPicker, "agent_picker", "Start an agent"),
     (NextAttention, "next_attention", "Next agent needing you"),
     (SwitchAccount, "switch_account", "Change the agent's account"),

@@ -399,7 +399,7 @@ impl Server {
             return;
         }
         let Some(ws) = self.clients.get(&client).map(|c| c.workspace) else { return };
-        let exe = std::env::current_exe().map(|p| p.display().to_string()).unwrap_or_else(|_| "kraal".into());
+        let exe = crate::client::kraal_program();
         let command = [exe.as_str(), "-s", &session, "attach", "--host", server, "--pane", &pane.to_string()]
             .map(String::from)
             .to_vec();

@@ -92,7 +92,7 @@ pub(super) fn install(server: &str) -> Result<()> {
         bail!("{} runs {remote}, this kraal is built for {local}; build kraal there (cargo install --path .)", s.name);
     }
     let script = install_script(&format!("kraal {}", env!("CARGO_PKG_VERSION")));
-    let exe = std::env::current_exe()?;
+    let exe = crate::client::installed_exe()?;
     let binary = std::fs::File::open(&exe).with_context(|| format!("reading {}", exe.display()))?;
     let mut c = std::process::Command::new("ssh");
     c.args(&ssh).arg(&dest).arg(format!("sh -c {}", crate::shell::quote(&script)));

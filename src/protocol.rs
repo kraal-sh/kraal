@@ -143,6 +143,11 @@ pub enum ServerMsg {
         /// again once the next server listens.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reattach: Option<String>,
+        /// With `reattach`: the server replaces itself in place (a live restart). The connection
+        /// ends with that in a moment, and the same server answers again; until then (or should
+        /// it not happen) the session goes on.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        live: bool,
     },
     /// The first answer to an attach: the server's kraal release. A server that does not send
     /// it is older than this message.
@@ -164,17 +169,12 @@ pub enum ServerMsg {
     Events {
         events: Vec<serde_json::Value>,
     },
-    /// The server is about to replace itself (a live restart): the connection will drop, and
-    /// the same session answers again on the same socket, showing `workspace`.
-    Restarting {
-        workspace: Option<String>,
-    },
 }
 
 impl ServerMsg {
     /// The end of an interactive session that does not come back by itself.
     pub fn exit(reason: impl Into<String>) -> ServerMsg {
-        ServerMsg::Exit { reason: reason.into(), reattach: None }
+        ServerMsg::Exit { reason: reason.into(), reattach: None, live: false }
     }
 }
 
@@ -347,10 +347,16 @@ pub enum Request {
         #[serde(default)]
         restart: bool,
     },
-    /// Replace the server with the kraal binary now installed, keeping every program in its
-    /// panes running (a live restart). Refused with the reason when something cannot be carried
-    /// over; once done, the connection simply closes.
-    Upgrade,
+    /// Replace the server with a kraal binary, keeping every program in its panes running (a
+    /// live restart): `binary`, else the one installed where the server was started from.
+    /// Refused with the reason when it cannot happen; once done, the connection simply closes.
+    /// With `check`, only say whether it can happen now.
+    Upgrade {
+        #[serde(default)]
+        check: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        binary: Option<PathBuf>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -458,11 +464,13 @@ mod tests {
         }
         let kill = serde_json::to_string(&Request::KillServer { restart: true }).unwrap();
         assert!(matches!(serde_json::from_str::<OldRequest>(&kill), Ok(OldRequest::KillServer)), "{kill}");
-        let exit =
-            serde_json::to_string(&ServerMsg::Exit { reason: "bye".into(), reattach: Some("w".into()) }).unwrap();
-        assert!(
-            matches!(serde_json::from_str::<OldServerMsg>(&exit), Ok(OldServerMsg::Exit { reason }) if reason == "bye")
-        );
+        for live in [false, true] {
+            let exit = ServerMsg::Exit { reason: "bye".into(), reattach: Some("w".into()), live };
+            let exit = serde_json::to_string(&exit).unwrap();
+            assert!(
+                matches!(serde_json::from_str::<OldServerMsg>(&exit), Ok(OldServerMsg::Exit { reason }) if reason == "bye")
+            );
+        }
         let attached = serde_json::to_string(&ServerMsg::Attached { version: "0.2.1".into() }).unwrap();
         assert_eq!(attached, r#"{"type":"attached","version":"0.2.1"}"#);
         assert!(serde_json::from_str::<OldServerMsg>(&attached).is_err(), "an older client skips it");
@@ -473,8 +481,11 @@ mod tests {
         ));
         assert!(matches!(
             serde_json::from_str::<ServerMsg>(r#"{"type":"exit","reason":"detached"}"#),
-            Ok(ServerMsg::Exit { reattach: None, .. })
+            Ok(ServerMsg::Exit { reattach: None, live: false, .. })
         ));
+        // A server from before live restarts says it does not know the request.
+        let upgrade = serde_json::to_value(Request::Upgrade { check: true, binary: None }).unwrap();
+        assert_eq!(upgrade, serde_json::json!({"cmd": "upgrade", "check": true}));
         let hello = r#"{"type":"attach","version":2,"cols":80,"rows":24,"workspace":null,"remote":false}"#;
         assert!(matches!(serde_json::from_str::<ClientMsg>(hello), Ok(ClientMsg::Attach { installed: None, .. })));
     }

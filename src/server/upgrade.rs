@@ -28,6 +28,7 @@ use serde::{Deserialize, Serialize};
 
 use super::events::{EventLog, SavedLog};
 use super::net::{LiveTunnel, TunnelState};
+use super::ui::{ConfirmAction, Mode};
 use super::{ClientId, Server};
 use crate::layout::PaneId;
 use crate::pane::{Drained, LivePane, Pane};
@@ -61,6 +62,8 @@ pub struct Handoff {
     pane_states: Vec<(PaneId, Option<String>, Option<String>)>,
     ports: Vec<(u16, PaneId)>,
     port_candidates: Vec<(u16, PaneId)>,
+    /// Connections accepted and not handled yet.
+    connections: Vec<RawFd>,
 }
 
 impl Handoff {
@@ -69,6 +72,7 @@ impl Handoff {
         let mut fds = vec![self.listener];
         fds.extend(self.panes.iter().map(|p| p.fd));
         fds.extend(self.tunnels.iter().filter_map(|t| t.stderr));
+        fds.extend(&self.connections);
         fds
     }
 
@@ -97,16 +101,18 @@ pub fn handoff_check(version: u32) -> Result<()> {
     Ok(())
 }
 
-/// The kraal binary installed where this server was started from. `kraal update` renames a new
-/// one over it, and Linux then names the running one `<path> (deleted)`.
-fn installed_binary() -> Result<PathBuf, String> {
-    let exe = std::env::current_exe().map_err(|e| format!("cannot tell where this kraal is: {e}"))?;
-    let bytes = exe.as_os_str().as_bytes();
-    let path = PathBuf::from(OsStr::from_bytes(bytes.strip_suffix(b" (deleted)").unwrap_or(bytes)));
-    if !path.is_file() {
-        return Err(format!("no kraal is installed at {} any more", path.display()));
+/// The kraal binary to restart on: `asked` (absolute), else the one installed where this server
+/// was started from (`kraal update` may have renamed a new one over the one running).
+fn binary_to_run(asked: Option<PathBuf>) -> Result<PathBuf, String> {
+    let exe = match asked {
+        Some(path) if path.is_absolute() => path,
+        Some(path) => return Err(format!("{} is not an absolute path", path.display())),
+        None => crate::client::installed_exe().map_err(|e| format!("{e:#}"))?,
+    };
+    if !exe.is_file() {
+        return Err(format!("no kraal at {}", exe.display()));
     }
-    Ok(path)
+    Ok(exe)
 }
 
 /// Whether `exe` runs here and takes over this hand-off's format.
@@ -118,11 +124,7 @@ fn check_binary(exe: &Path) -> Result<(), String> {
     if out.success() && out.stdout_text().trim() == check_answer(HANDOFF_VERSION) {
         return Ok(());
     }
-    Err(format!(
-        "{} cannot take over this server live (an older kraal, or not one); `kraal kill`, then `kraal` restarts it \
-         with the layout",
-        exe.display()
-    ))
+    Err(format!("the kraal installed cannot take over live ({}: an older kraal, or not one)", exe.display()))
 }
 
 fn handoff_path(session: &str) -> PathBuf {
@@ -149,11 +151,11 @@ fn exec(exe: &Path, session: &str, handoff: &Path) -> std::io::Error {
     let arg0 = std::env::args_os().next().unwrap_or_else(|| exe.as_os_str().to_owned());
     let args: [&OsStr; 6] = [
         &arg0,
+        OsStr::new("--handoff"),
+        handoff.as_os_str(),
         OsStr::new("server"),
         OsStr::new("--session"),
         OsStr::new(session),
-        OsStr::new("--handoff"),
-        handoff.as_os_str(),
     ];
     let c = |s: &OsStr| CString::new(s.as_bytes());
     let (Ok(program), Ok(argv)) = (c(exe.as_os_str()), args.iter().map(|a| c(a)).collect::<Result<Vec<_>, _>>()) else {
@@ -203,43 +205,104 @@ pub fn close_inherited() {
 
 type Reply = Option<Result<Response, String>>;
 
+/// Who asked for a live restart, and is told when it does not happen.
+#[derive(Clone, Copy)]
+pub(super) enum Asker {
+    /// `kraal restart`: a control request, answered then closed.
+    Request(ClientId),
+    /// The menu of an attached client.
+    Menu(ClientId),
+}
+
 impl Server {
-    /// `kraal restart --live`. Answered only when it does not happen, with why; otherwise the
-    /// connection closes with the exec.
-    pub(super) fn upgrade_request(&mut self, client: ClientId) -> Reply {
+    /// `kraal restart` asks for a live restart on `binary` (the server's own kraal by default),
+    /// or with `check` whether one can happen now. Answered when it does not happen, with why
+    /// (or, with `check`, when it can); otherwise the connection closes with the exec.
+    pub(super) fn upgrade_request(&mut self, client: ClientId, check: bool, binary: Option<PathBuf>) -> Reply {
         if self.upgrading {
             return Some(Err("a live restart is already under way".into()));
         }
         if let Some(why) = self.upgrade_refusal() {
             return Some(Err(why));
         }
-        let exe = match installed_binary() {
+        let exe = match binary_to_run(binary) {
             Ok(exe) => exe,
             Err(e) => return Some(Err(e)),
         };
+        if check {
+            let started = self.background(
+                move || check_binary(&exe),
+                move |server, result| {
+                    server.send_msg(client, &ServerMsg::Response { result: result.map(|()| Response::Ok) });
+                    server.clients.remove(&client);
+                },
+            );
+            return (!started).then(|| Err("cannot start trying the binary".into()));
+        }
+        self.start_upgrade(Asker::Request(client), exe);
+        None
+    }
+
+    /// The question before a restart from the menu: live when it can happen (nothing stops),
+    /// else what stops. Whether it can is known once the kraal installed now has been tried, off
+    /// the event loop: the question comes then.
+    pub(super) fn ask_restart(&mut self, client: ClientId) -> Mode {
+        if let Some(why) = self.upgrade_refusal() {
+            return self.cold_restart_question(&why);
+        }
+        let started = self.background(
+            || binary_to_run(None).and_then(|exe| check_binary(&exe)),
+            move |server, tried| {
+                let mode = match tried {
+                    Ok(()) => Mode::confirm(
+                        format!(
+                            "Restart session {} live on the kraal installed now? Every program in its panes keeps running.",
+                            server.session
+                        ),
+                        ConfirmAction::Restart { live: true },
+                    ),
+                    Err(why) => server.cold_restart_question(&why),
+                };
+                server.set_mode_if_idle(client, mode);
+            },
+        );
+        if !started {
+            return self.cold_restart_question("the kraal installed now could not be tried");
+        }
+        Mode::Normal
+    }
+
+    /// A live restart on the kraal installed now, asked from the menu (see `ask_restart`).
+    pub(super) fn upgrade_from_menu(&mut self, client: ClientId) {
+        if self.upgrading {
+            return self.toast(client, "a live restart is already under way");
+        }
+        match binary_to_run(None) {
+            Ok(exe) => self.start_upgrade(Asker::Menu(client), exe),
+            Err(why) => self.toast(client, format!("no live restart: {why}")),
+        }
+    }
+
+    /// Try `exe`, then hand over to it once nothing in the way is left (see `upgrade_now`).
+    fn start_upgrade(&mut self, asker: Asker, exe: PathBuf) {
         self.upgrading = true;
         let checked = exe.clone();
         let started = self.background(
             move || check_binary(&checked),
             move |server, result| match result {
-                Ok(()) => server.upgrade_when_idle(client, exe, Instant::now() + IDLE_WAIT),
-                Err(why) => server.upgrade_failed(client, why),
+                Ok(()) => server.upgrade_when_idle(asker, exe, Instant::now() + IDLE_WAIT),
+                Err(why) => server.upgrade_failed(asker, why),
             },
         );
         if !started {
-            self.upgrading = false;
-            return Some(Err("cannot start checking the new binary".into()));
+            self.upgrade_failed(asker, "cannot start trying the binary".into());
         }
-        None
     }
 
     /// What prevents a live restart, if anything: what cannot be carried over.
     fn upgrade_refusal(&self) -> Option<String> {
         if !cfg!(target_os = "linux") {
-            return Some(
-                "a live restart is only available on Linux for now: `kraal kill`, then `kraal` (the layout is kept)"
-                    .into(),
-            );
+            return Some("a live restart is only available on Linux for now".into());
         }
         if self.quitting || !self.kill_waiters.is_empty() {
             return Some("the server is stopping".into());
@@ -297,41 +360,88 @@ impl Server {
         None
     }
 
-    fn upgrade_when_idle(&mut self, client: ClientId, exe: PathBuf, deadline: Instant) {
-        // Whoever asked gave up (ctrl+c): nothing happens.
-        if !self.clients.contains_key(&client) {
+    fn upgrade_when_idle(&mut self, asker: Asker, exe: PathBuf, deadline: Instant) {
+        // The command that asked gave up (ctrl+c): nothing happens.
+        if let Asker::Request(client) = asker
+            && !self.clients.contains_key(&client)
+        {
             self.upgrading = false;
             return;
         }
         if let Some(why) = self.upgrade_refusal() {
-            return self.upgrade_failed(client, why);
+            return self.upgrade_failed(asker, why);
         }
         if let Some(why) = self.upgrade_busy() {
             if Instant::now() >= deadline {
-                return self.upgrade_failed(client, format!("{why}: try again in a moment"));
+                return self.upgrade_failed(asker, format!("{why}: try again in a moment"));
             }
             let started = self.background(
                 || std::thread::sleep(Duration::from_millis(50)),
-                move |server, ()| server.upgrade_when_idle(client, exe, deadline),
+                move |server, ()| server.upgrade_when_idle(asker, exe, deadline),
             );
             if !started {
-                self.upgrade_failed(client, why.to_string());
+                self.upgrade_failed(asker, why.to_string());
             }
             return;
         }
         let why = self.upgrade_now(&exe);
-        self.upgrade_failed(client, why);
+        self.upgrade_failed(asker, why);
     }
 
-    fn upgrade_failed(&mut self, client: ClientId, why: String) {
+    fn upgrade_failed(&mut self, asker: Asker, why: String) {
         self.upgrading = false;
-        self.send_msg(client, &ServerMsg::Response { result: Err(why) });
-        self.clients.remove(&client);
+        match asker {
+            Asker::Request(client) => {
+                self.send_msg(client, &ServerMsg::Response { result: Err(why) });
+                self.clients.remove(&client);
+            }
+            Asker::Menu(client) => self.toast(client, format!("no live restart: {why}")),
+        }
     }
 
     /// Hand everything over to `exe` and become it. Returns only when that did not happen, with
-    /// why; the server then goes on as before.
+    /// why; the server then goes on as before. From now on connections wait for the next server
+    /// (in the socket's backlog), and those accepted but not handled yet go to it too.
     fn upgrade_now(&mut self, exe: &Path) -> String {
+        let held = self.hold_connections();
+        let fds: Vec<RawFd> = held.0.iter().map(std::os::fd::AsRawFd::as_raw_fd).collect();
+        let why = self.hand_over(exe, fds);
+        self.release_connections(held);
+        why
+    }
+
+    /// Stop accepting connections, and take those waiting to be handled out of the events, with
+    /// the other events read meanwhile.
+    fn hold_connections(&mut self) -> (Vec<std::os::unix::net::UnixStream>, Vec<super::Event>) {
+        use std::sync::atomic::Ordering;
+        self.accepting.paused.store(true, Ordering::SeqCst);
+        let start = Instant::now();
+        while !self.accepting.parked.load(Ordering::SeqCst) && start.elapsed() < Duration::from_secs(1) {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let mut connections = Vec::new();
+        let mut events = Vec::new();
+        while let Ok(ev) = self.events_rx.try_recv() {
+            match ev {
+                super::Event::Connection(stream) => connections.push(stream),
+                other => events.push(other),
+            }
+        }
+        (connections, events)
+    }
+
+    /// The live restart did not happen: what was held is handled, and connections accepted again.
+    fn release_connections(&mut self, (connections, events): (Vec<std::os::unix::net::UnixStream>, Vec<super::Event>)) {
+        for ev in events {
+            self.handle(ev);
+        }
+        for stream in connections {
+            self.new_connection(stream);
+        }
+        self.accepting.paused.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn hand_over(&mut self, exe: &Path, connections: Vec<RawFd>) -> String {
         // What the PTYs hold stays there from now on, and what was read is drawn: nothing read
         // is lost in the exec.
         let ids: Vec<PaneId> = self.panes.keys().copied().collect();
@@ -365,7 +475,8 @@ impl Server {
         if self.run_logs.send(crate::runbooks::LogJob::Flush(done)).is_ok() {
             let _ = flushed.recv_timeout(Duration::from_secs(3));
         }
-        let handoff = self.handoff();
+        let mut handoff = self.handoff();
+        handoff.connections = connections;
         let fds = handoff.fds();
         let path = handoff_path(&self.session);
         let written = serde_json::to_vec(&handoff).map_err(std::io::Error::other).and_then(|data| {
@@ -457,6 +568,7 @@ impl Server {
             pane_states: self.pane_states.iter().map(|(id, (s, p))| (*id, s.clone(), p.clone())).collect(),
             ports: self.ports.iter().map(|(port, pane)| (*port, *pane)).collect(),
             port_candidates: self.port_candidates.iter().map(|(port, pane)| (*port, *pane)).collect(),
+            connections: Vec::new(),
         }
     }
 
@@ -466,8 +578,10 @@ impl Server {
         let ids: Vec<ClientId> = self.clients.values().filter(|c| c.attached).map(|c| c.id).collect();
         for id in ids {
             let ws = self.clients.get(&id).and_then(|c| self.ws_index(c.workspace));
-            let workspace = ws.map(|wi| self.workspaces[wi].name.clone());
-            self.send_msg(id, &ServerMsg::Restarting { workspace });
+            let workspace = ws.map(|wi| self.workspaces[wi].name.clone()).unwrap_or_default();
+            // A client from before live restarts leaves, and says how to come back.
+            let reason = "kraal restarted live: run kraal to attach again".to_string();
+            self.send_msg(id, &ServerMsg::Exit { reason, reattach: Some(workspace), live: true });
         }
         let start = Instant::now();
         while self.clients.values().any(|c| !c.out.is_empty()) && start.elapsed() < Duration::from_millis(500) {
@@ -547,6 +661,10 @@ impl Server {
                 },
             );
         }
+        for fd in h.connections {
+            // SAFETY: as above.
+            self.new_connection(unsafe { std::os::unix::net::UnixStream::from_raw_fd(fd) });
+        }
         let text = format!("restarted live from kraal {}: {kept} panes kept running", h.from);
         eprintln!("kraal: {text}");
         self.log_message(&text, false);
@@ -586,9 +704,11 @@ mod tests {
     fn the_new_binary_is_the_one_on_disk_and_says_what_it_reads() {
         assert_eq!(check_answer(HANDOFF_VERSION), format!("kraal hand-off {HANDOFF_VERSION}"));
         assert!(handoff_check(HANDOFF_VERSION + 1).is_err());
-        let exe = installed_binary().unwrap();
+        let exe = binary_to_run(None).unwrap();
         assert!(exe.is_file());
         assert!(!exe.to_string_lossy().ends_with(" (deleted)"));
+        assert!(binary_to_run(Some(PathBuf::from("kraal"))).is_err(), "a relative path");
+        assert!(binary_to_run(Some(std::env::temp_dir().join("kraal-nothing-here"))).is_err());
     }
 
     #[test]

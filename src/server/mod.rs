@@ -451,8 +451,19 @@ pub struct Server {
     pub broadcast_tip_shown: bool,
     /// The listening socket's descriptor, which a live restart hands over.
     listener_fd: std::os::fd::RawFd,
+    /// Whether connections are accepted (a live restart leaves them to the next server).
+    accepting: std::sync::Arc<AcceptGate>,
+    /// The events, as the event loop reads them: a live restart takes the connections waiting.
+    events_rx: Receiver<Event>,
     /// A live restart is being prepared.
     upgrading: bool,
+}
+
+/// Stops the thread that accepts connections for a while: `parked` once it has.
+#[derive(Default)]
+pub(super) struct AcceptGate {
+    paused: std::sync::atomic::AtomicBool,
+    parked: std::sync::atomic::AtomicBool,
 }
 
 /// Finishes a background job on the server thread with its result.
@@ -510,17 +521,30 @@ pub fn run(session: &str, handoff: Option<&std::path::Path>) -> Result<()> {
     let (tx, rx) = crossbeam_channel::bounded::<Event>(4096);
     let persist_tx = tx.clone();
     let logs_tx = tx.clone();
+    let accepting = std::sync::Arc::new(AcceptGate::default());
     {
-        let tx = tx.clone();
+        let (tx, gate) = (tx.clone(), accepting.clone());
         std::thread::Builder::new().name("accept".into()).spawn(move || {
-            for stream in listener.incoming() {
-                match stream {
-                    Ok(s) => {
-                        if tx.send(Event::Connection(s)).is_err() {
-                            break;
-                        }
-                    }
-                    Err(_) => continue,
+            loop {
+                if gate.paused.load(std::sync::atomic::Ordering::SeqCst) {
+                    gate.parked.store(true, std::sync::atomic::Ordering::SeqCst);
+                    std::thread::sleep(Duration::from_millis(10));
+                    continue;
+                }
+                gate.parked.store(false, std::sync::atomic::Ordering::SeqCst);
+                let mut pfd = libc::pollfd { fd: listener_fd, events: libc::POLLIN, revents: 0 };
+                // SAFETY: one valid pollfd; the listener lives as long as this thread.
+                if unsafe { libc::poll(&mut pfd, 1, 50) } <= 0 {
+                    continue;
+                }
+                // Paused meanwhile: the connection waits in the backlog.
+                if gate.paused.load(std::sync::atomic::Ordering::SeqCst) {
+                    continue;
+                }
+                if let Ok((s, _)) = listener.accept()
+                    && tx.send(Event::Connection(s)).is_err()
+                {
+                    break;
                 }
             }
         })?;
@@ -633,6 +657,8 @@ pub fn run(session: &str, handoff: Option<&std::path::Path>) -> Result<()> {
             })
         },
         listener_fd,
+        accepting,
+        events_rx: rx.clone(),
         upgrading: false,
     };
     server.scan_definitions();
@@ -1186,7 +1212,11 @@ impl Server {
                 self.workspaces.get(wi).map(|w| w.name.clone()).unwrap_or_default()
             });
             let msg = match reattach {
-                Some(_) => ServerMsg::Exit { reason: "kraal restarted: run kraal to attach again".into(), reattach },
+                Some(_) => ServerMsg::Exit {
+                    reason: "kraal restarted: run kraal to attach again".into(),
+                    reattach,
+                    live: false,
+                },
                 None => ServerMsg::exit("server exited"),
             };
             self.send_msg(id, &msg);

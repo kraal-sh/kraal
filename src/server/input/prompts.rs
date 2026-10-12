@@ -171,7 +171,7 @@ impl Server {
                     return Err((PromptAction::RunOn { targets }, "Type the command to run.".into()));
                 }
                 let Some(ws) = self.clients.get(&id).map(|c| c.workspace) else { return Ok(()) };
-                let exe = std::env::current_exe().map(|p| p.display().to_string()).unwrap_or_else(|_| "kraal".into());
+                let exe = crate::client::kraal_program();
                 let mut command = vec![exe, "exec".to_string()];
                 command.extend(targets.iter().cloned());
                 command.push("--".into());
@@ -324,7 +324,8 @@ impl Server {
                         }
                     }
                     ConfirmAction::CloseWorkspace(ws) => self.close_workspace(ws),
-                    ConfirmAction::Restart => self.restart(id),
+                    ConfirmAction::Restart { live: true } => self.upgrade_from_menu(id),
+                    ConfirmAction::Restart { live: false } => self.restart(id),
                     ConfirmAction::Job { label, args } => self.start_job(id, &label, args),
                     ConfirmAction::GitJob { label, script } => {
                         self.git_job(id, &label, script, crate::server::worktrees::JobEnd::CloseOnSuccess)

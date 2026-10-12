@@ -3494,9 +3494,10 @@ fn update_installs_a_checked_release_in_place() {
     assert_eq!(std::fs::metadata(&kraal).unwrap().modified().unwrap(), before, "left alone");
 }
 
-/// After an update, `kraal update` names the sessions still on an older kraal with what a
-/// restart stops in them, asks on a terminal (no by default when programs would stop), and has
-/// the new kraal restart them when told to.
+/// After an update, `kraal update` names the sessions still on an older kraal: one that can
+/// restart live, where nothing stops, or one that cannot, with what a restart stops in it. It
+/// asks on a terminal (no by default when programs would stop), and has the new kraal restart
+/// them when told to.
 #[test]
 fn update_offers_to_restart_the_sessions_left_on_an_older_kraal() {
     let env = Env::new("updrestart");
@@ -3524,6 +3525,9 @@ fn update_offers_to_restart_the_sessions_left_on_an_older_kraal() {
     };
     let version = env!("CARGO_PKG_VERSION");
     let pid = env.server_pid().expect("the server runs");
+    // While a `kraal wait` waits, the session cannot restart live (nor anywhere but on Linux).
+    let mut wait = env.cmd(&["wait", "-p", "job", "--until", "exit", "--timeout", "120"]).spawn().unwrap();
+    std::thread::sleep(Duration::from_millis(300));
 
     // Without a terminal to ask on, and without --restart: said, not done.
     install();
@@ -3531,6 +3535,7 @@ fn update_offers_to_restart_the_sessions_left_on_an_older_kraal() {
     let said = String::from_utf8_lossy(&out.stdout);
     assert!(out.status.success(), "{said}{}", String::from_utf8_lossy(&out.stderr));
     assert!(said.contains(&format!("Session updrestart still runs kraal {version}.")), "{said}");
+    assert!(said.contains("It cannot restart live: "), "{said}");
     assert!(said.contains("These programs stop:") && said.contains("\"job\" in w)"), "{said}");
     assert!(said.contains(&format!("Session updrestart keeps kraal {version} until: kraal -s updrestart restart")));
     assert_eq!(env.server_pid(), Some(pid));
@@ -3559,6 +3564,28 @@ fn update_offers_to_restart_the_sessions_left_on_an_older_kraal() {
     let new = env.server_pid().expect("a server runs again");
     assert_ne!(new, pid);
     env.wait_for_text_since_restore("job", "restored session");
+    let _ = wait.wait();
+
+    // Live: nothing stops, and nothing is asked about stopping.
+    #[cfg(target_os = "linux")]
+    {
+        env.run(&["run", "--name", "sleeper", "--", "sleep", "4246"]);
+        install();
+        let out = update(&["--restart"]).output().unwrap();
+        let said = String::from_utf8_lossy(&out.stdout);
+        assert!(out.status.success(), "{said}{}", String::from_utf8_lossy(&out.stderr));
+        assert!(
+            said.contains("Session updrestart still runs kraal") && said.contains("it restarts live: nothing stops")
+        );
+        assert!(!said.contains("These programs stop:"), "{said}");
+        assert!(said.contains("restarted session updrestart live"), "{said}");
+        assert_eq!(env.server_pid(), Some(new), "the same server");
+        let running = std::fs::read_dir("/proc")
+            .unwrap()
+            .flatten()
+            .any(|e| std::fs::read(e.path().join("cmdline")).is_ok_and(|c| c == b"sleep\x004246\x00"));
+        assert!(running, "what ran in the pane still runs");
+    }
 }
 
 /// The server says what it runs to a client that attaches, and says once, to a client that
@@ -3586,8 +3613,9 @@ fn a_client_with_a_newer_kraal_installed_is_told_the_session_runs_an_older_one()
     assert!(keys.lines().any(|l| l.trim_start().starts_with("restart ") && l.ends_with("ctrl+b W r")), "{keys}");
 }
 
-/// The restart in the menu says what stops and asks first; then the session comes back, and
-/// attached clients are told to come back to the workspace they showed.
+/// The restart in the menu asks first: live when it can be, where nothing stops, else saying
+/// what stops. Then the session comes back, and attached clients are told to come back to the
+/// workspace they showed.
 #[test]
 fn the_menu_restarts_the_session_after_asking() {
     let env = Env::new("menurestart");
@@ -3598,10 +3626,32 @@ fn the_menu_restarts_the_session_after_asking() {
     env.run(&["open", "w"]);
     env.wait_for_text("job", "started");
     let pid = env.server_pid().expect("the server runs");
+    // Live: nothing stops, and the session is the same process after.
+    #[cfg(target_os = "linux")]
+    {
+        let mut client = RawClient::attach(&env, "w");
+        client.wait_for_message("\"attached\"");
+        client.send(b"\x02Wr");
+        client.wait_for_screen("Restart session menurestart live on the kraal installed now?");
+        client.send(b"n");
+        std::thread::sleep(Duration::from_millis(500));
+        client.screen.lock().unwrap().clear();
+        client.send(b"\x02Wr");
+        client.wait_for_screen("Restart session menurestart live");
+        client.send(b"y");
+        client.wait_for_message(r#""live":true"#);
+        let screen = env.wait_for_text("job", "started");
+        assert!(!screen.contains("restored"), "{screen}");
+        assert_eq!(env.server_pid(), Some(pid), "the same server");
+    }
+    // While a `kraal wait` waits, a restart cannot be live: what stops is said.
+    let mut wait = env.cmd(&["wait", "-p", "job", "--until", "exit", "--timeout", "60"]).spawn().unwrap();
+    std::thread::sleep(Duration::from_millis(300));
     let mut client = RawClient::attach(&env, "w");
     client.wait_for_message("\"attached\"");
     client.send(b"\x02Wr");
     client.wait_for_screen("Restart session menurestart on the kraal installed now?");
+    client.wait_for_screen("No live restart now (one stops nothing): `kraal wait`");
     client.wait_for_screen("These programs stop:");
     client.wait_for_screen("\"job\" in w)");
     client.send(b"n");
@@ -3618,11 +3668,14 @@ fn the_menu_restarts_the_session_after_asking() {
         std::thread::sleep(Duration::from_millis(50));
     }
     env.wait_for_text_since_restore("job", "restored session");
+    let _ = wait.wait();
 }
 
-/// `kraal restart` says what would stop before asking; a client attached in a terminal waits for
-/// the next server and comes back to its workspace; an idle shell comes back; and a restart run
-/// from a pane of the session itself outlives that pane.
+/// `kraal restart` restarts live when it can: nothing stops or is listed, and a client attached
+/// in a terminal stays. Otherwise (`--cold`, or when a live restart cannot happen) it says what
+/// would stop before asking; a client waits for the next server and comes back to its workspace;
+/// an idle shell comes back; and a restart run from a pane of the session itself outlives that
+/// pane.
 #[cfg(target_os = "linux")]
 #[test]
 fn restart_keeps_the_session_and_brings_its_clients_back() {
@@ -3662,8 +3715,26 @@ fn restart_keeps_the_session_and_brings_its_clients_back() {
     attached();
     let pid = env.server_pid().expect("the server runs");
 
-    // Without a terminal to ask on: what stops is said, and nothing happens.
-    let out = env.try_run(&["restart"]);
+    // Live: on a terminal, asked (Enter is yes); nothing would stop, so nothing is listed.
+    let screen = in_terminal(env.cmd(&["restart"]), b"n\n");
+    assert!(screen.contains("it restarts live on kraal") && screen.contains("Restart session restart? [Y/n]"));
+    assert!(!screen.contains("These programs stop:") && screen.contains("cancelled"), "{screen}");
+    assert_eq!(env.server_pid(), Some(pid));
+    // Without a terminal: nothing to ask about.
+    let out = env.run(&["restart"]);
+    assert!(out.contains("restarted session restart live: kraal"), "{out}");
+    assert_eq!(env.server_pid(), Some(pid));
+    assert!(sleeping(), "the busy pane's program runs on");
+    assert!(client.try_wait().unwrap().is_none(), "the client left");
+    attached();
+    // From a pane of the session, the restart is done there.
+    let line = format!("'{}' restart --yes", env!("CARGO_BIN_EXE_kraal"));
+    env.run(&["send", "-p", "idle", "--enter", &line]);
+    env.wait_for_text("idle", "restarted session restart live");
+    assert_eq!(env.server_pid(), Some(pid));
+
+    // Not live: without a terminal to ask on, what stops is said, and nothing happens.
+    let out = env.try_run(&["restart", "--cold"]);
     let said = String::from_utf8_lossy(&out.stdout);
     assert!(!out.status.success(), "{said}");
     let listed = said.split_once("These programs stop:\n").map(|(_, rest)| rest).unwrap_or_default();
@@ -3672,18 +3743,32 @@ fn restart_keeps_the_session_and_brings_its_clients_back() {
     assert!(String::from_utf8_lossy(&out.stderr).contains("add --yes"));
     assert_eq!(env.server_pid(), Some(pid));
     // On a terminal: the list, then the question, whose Enter is no.
-    let screen = in_terminal(env.cmd(&["restart"]), b"\n");
+    let screen = in_terminal(env.cmd(&["restart", "--cold"]), b"\n");
     let (listed, asked) = (screen.find("sleep 4245"), screen.find("Restart session restart? [y/N]"));
     assert!(listed.is_some() && asked.is_some() && listed < asked, "{screen}");
     assert!(screen.contains("cancelled"), "{screen}");
     assert_eq!(env.server_pid(), Some(pid));
 
+    // While a `kraal wait` waits, a restart cannot be live: --live fails, and otherwise it is
+    // not live.
+    let mut wait = env.cmd(&["wait", "-p", "busy", "--until", "exit", "--timeout", "60"]).spawn().unwrap();
+    std::thread::sleep(Duration::from_millis(300));
+    let out = env.try_run(&["restart", "--live", "--yes"]);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success() && err.contains("cannot restart live: `kraal wait`"), "{err}");
+    assert_eq!(env.server_pid(), Some(pid));
     let out = env.run(&["restart", "--yes"]);
-    assert!(out.contains("restarted session restart"), "{out}");
+    assert!(out.contains("cannot restart live: `kraal wait`") && out.contains("These programs stop:"), "{out}");
+    assert!(out.contains("restarted session restart: kraal"), "{out}");
+    let _ = wait.wait();
     let second = env.server_pid().expect("a server runs again");
     assert_ne!(second, pid);
     // The idle shell is back, with what it showed, and takes commands.
-    env.wait_for_text("idle", "before-restart");
+    let start = Instant::now();
+    while !env.try_run(&["read", "-p", "idle", "--lines", "200"]).stdout.windows(14).any(|w| w == b"before-restart") {
+        assert!(start.elapsed() < Duration::from_secs(10), "the idle pane did not come back");
+        std::thread::sleep(Duration::from_millis(50));
+    }
     env.run(&["send", "-p", "idle", "--enter", "echo after-restart"]);
     env.wait_for_text_since_restore("idle", "after-restart");
     // The client did not leave: it attached to the next server.
@@ -3691,7 +3776,7 @@ fn restart_keeps_the_session_and_brings_its_clients_back() {
     attached();
 
     // From a pane of the session: the restart closes that pane, and happens all the same.
-    let line = format!("'{}' restart --yes", env!("CARGO_BIN_EXE_kraal"));
+    let line = format!("'{}' restart --yes --cold", env!("CARGO_BIN_EXE_kraal"));
     env.run(&["send", "-p", "idle", "--enter", &line]);
     let start = Instant::now();
     while env.server_pid().is_none_or(|p| p == second) {
@@ -4268,13 +4353,28 @@ fn a_refused_live_restart_leaves_the_server_as_it_was() {
     let _ = wait.kill();
     let _ = wait.wait();
 
-    // The binary installed now is not a kraal that can take over.
+    // The kraal installed where the server runs from cannot take over: the menu, which restarts
+    // on that one (`kraal restart` restarts on its own), offers a restart that is not live.
     write_script(&env.root.join("not-kraal"), "#!/bin/sh\nexit 0\n");
     install(&env.root.join("not-kraal"));
-    refused("cannot take over");
+    client.screen.lock().unwrap().clear();
+    client.send(b"\x02Wr");
+    client.wait_for_screen("No live restart now (one stops nothing): the kraal installed cannot take over");
+    client.send(b"n");
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(parent_of(pid), Some(server));
+    still_counting(&env, "counter");
 
-    // Once all that is over, from the kraal renamed over the one the server runs.
+    // Once all that is over, from the kraal renamed over the one the server runs (Linux names
+    // that one `<path> (deleted)`), from the menu, then from the command line.
     install(Path::new(env!("CARGO_BIN_EXE_kraal")));
+    client.screen.lock().unwrap().clear();
+    client.send(b"\x02Wr");
+    client.wait_for_screen("Restart session refused live on the kraal installed now?");
+    client.send(b"y");
+    client.wait_for_message(r#""live":true"#);
+    still_counting(&env, "counter");
+    assert_eq!(parent_of(pid), Some(server));
     let out = env.run(&["restart", "--live"]);
     assert!(out.contains("restarted session refused live"), "{out}");
     assert_eq!(parent_of(pid), Some(server));

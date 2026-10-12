@@ -22,7 +22,7 @@ pub fn main() {
     let cli = Cli::parse();
     // Plain CLI commands should die quietly when piped into `head`; the server and the attached
     // client handle broken sockets themselves.
-    if !matches!(cli.command, None | Some(Cmd::Attach { .. }) | Some(Cmd::Server { handoff_check: None, .. })) {
+    if !matches!(cli.command, None | Some(Cmd::Attach { .. }) | Some(Cmd::Server { handoff_check: None })) {
         // SAFETY: setting a signal disposition before any thread starts.
         unsafe {
             libc::signal(libc::SIGPIPE, libc::SIG_DFL);
@@ -95,12 +95,18 @@ fn run(cli: Cli) -> Result<()> {
             update::update(check, to, force, restart)
         }
         Some(Cmd::Proxy) => client::proxy(&s.name),
-        Some(Cmd::Server { handoff_check: Some(version), .. }) => server::handoff_check(version),
-        Some(Cmd::Server { handoff, .. }) => server::run(&s.name, handoff.as_deref()),
+        Some(Cmd::Server { handoff_check: Some(version) }) => server::handoff_check(version),
+        Some(Cmd::Server { handoff_check: None }) => server::run(&s.name, cli.handoff.as_deref()),
         Some(Cmd::Ls) => session::list_sessions(),
         Some(Cmd::Kill) => session::kill(&s),
-        Some(Cmd::Restart { live: true, .. }) => session::restart_live(&s),
-        Some(Cmd::Restart { yes, .. }) => restart::restart(&s, yes),
+        Some(Cmd::Restart { yes, live, cold }) => {
+            let how = match (live, cold) {
+                (true, _) => restart::How::Live,
+                (_, true) => restart::How::Cold,
+                _ => restart::How::Either,
+            };
+            restart::restart(&s, yes, how)
+        }
         Some(Cmd::Forget) => session::forget(&s),
         Some(Cmd::Workspaces { json }) => session::workspaces(&s, json),
         Some(Cmd::Open { name }) => session::open(&s, name),

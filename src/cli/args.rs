@@ -22,6 +22,10 @@ pub struct Cli {
     pub command: Option<Cmd>,
     /// Workspace to open when attaching.
     pub workspace: Option<String>,
+    /// With `server`: take over from the server it replaces (a live restart), as this file
+    /// says. Before the command, so that the server's command line still ends with its session.
+    #[arg(long, hide = true, value_name = "FILE")]
+    pub handoff: Option<PathBuf>,
 }
 
 #[derive(Subcommand)]
@@ -65,15 +69,19 @@ pub enum Cmd {
     Ls,
     /// Stop a session's server; its layout is saved for next time.
     Kill,
-    /// Restart a session's server on the kraal installed now: the layout, scrollback, SSH shells
-    /// and agents come back, other programs stop (they are listed first, and asked about).
+    /// Restart a session's server on the kraal installed now: live when it can (every program in
+    /// its panes keeps running), else the layout, scrollback, SSH shells and agents come back and
+    /// other programs stop (they are listed first, and asked about).
     Restart {
         /// Do not ask, even when programs would stop.
         #[arg(short, long)]
         yes: bool,
-        /// Only a live restart: every program in its panes keeps running.
-        #[arg(long)]
+        /// Only a live restart: fail rather than stop programs.
+        #[arg(long, conflicts_with = "cold")]
         live: bool,
+        /// Not a live restart: the server stops, and the next one brings the session back.
+        #[arg(long)]
+        cold: bool,
     },
     /// Forget a session's saved layout and scrollback.
     Forget,
@@ -351,9 +359,6 @@ pub enum Cmd {
     /// Run a session server in the foreground (normally started automatically).
     #[command(hide = true)]
     Server {
-        /// Take over from the server this one replaces (a live restart), as this file says.
-        #[arg(long, value_name = "FILE")]
-        handoff: Option<PathBuf>,
         /// Say whether this kraal can take over a server writing this hand-off format.
         #[arg(long, value_name = "VERSION")]
         handoff_check: Option<u32>,

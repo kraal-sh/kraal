@@ -1,26 +1,65 @@
-//! `kraal restart`: a session's server stops and the next one starts from the kraal installed
-//! now, bringing back what a restart keeps (see `persist`). `kraal update` offers it for the
-//! sessions an update leaves on an older kraal.
+//! `kraal restart`: a session's server moves to the kraal installed now. Live when it can (see
+//! `server::upgrade`): nothing stops. Otherwise the server stops and the next one starts from the
+//! kraal installed now, bringing back what a restart keeps (see `persist`). `kraal update` offers
+//! it for the sessions an update leaves on an older kraal.
 
 use std::collections::HashMap;
 use std::io::{BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 
 use super::Session;
 use crate::protocol::{self, Request, Response};
 use crate::{client, paths, persist, process};
 
-/// `kraal restart`: say what stops, ask, then restart. Inside one of the session's panes, which
-/// the restart closes, a helper of its own does it.
-pub(super) fn restart(s: &Session, yes: bool) -> Result<()> {
+/// Which restart `kraal restart` does.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum How {
+    /// Live when it can, else not.
+    Either,
+    /// Live, or none.
+    Live,
+    /// The server stops and the next one brings the session back.
+    Cold,
+}
+
+/// `kraal restart`: live when it can, asked first (nothing stops); else say what stops, ask,
+/// then restart. Inside one of the session's panes, which a restart that is not live closes, a
+/// helper of its own does that one.
+pub(super) fn restart(s: &Session, yes: bool, how: How) -> Result<()> {
     let session = &s.name;
     let socket = paths::socket_path(session);
     if std::os::unix::net::UnixStream::connect(&socket).is_err() {
         bail!("session {session} is not running");
     }
     let running = Running::at(session.clone(), socket.clone());
+    if how != How::Cold {
+        match running.live(None) {
+            Ok(()) => {
+                println!(
+                    "Session {session} runs {}; it restarts live on kraal {}: every program in its panes keeps running.",
+                    running.runs(),
+                    protocol::KRAAL_VERSION
+                );
+                if !yes && ask(&format!("Restart session {session}?"), true)? == Some(false) {
+                    bail!("cancelled");
+                }
+                match running.restart_live() {
+                    Ok(now) => {
+                        println!("restarted session {session} live: {} → kraal {now}", running.runs());
+                        return Ok(());
+                    }
+                    Err(Live::Refused(why)) if how == How::Either => println!("It did not restart live: {why}."),
+                    Err(Live::Refused(why)) => bail!("session {session} was not restarted: {why}"),
+                    Err(Live::Failed(e)) => return Err(e),
+                }
+            }
+            Err(why) if how == How::Live => bail!("session {session} cannot restart live: {why}"),
+            Err(why) => println!("Session {session} cannot restart live: {why}."),
+        }
+    }
     let stops = running.stops();
     println!(
         "Session {session} runs {}; it restarts on kraal {}, with its layout, scrollback, SSH shells and agents.",
@@ -63,11 +102,23 @@ pub(super) fn after_update(exe: &Path, installed: &str, choice: Option<bool>) ->
         return Ok(());
     }
     let mut anything_stops = false;
+    let mut live = Vec::new();
     for r in &older {
-        let stops = r.stops();
-        println!("Session {} still runs {}.", r.name, r.runs());
-        print_stops(&stops);
-        anything_stops |= !stops.is_empty();
+        // The server tries the kraal just installed.
+        match r.live(Some(exe)) {
+            Ok(()) => {
+                println!("Session {} still runs {}; it restarts live: nothing stops.", r.name, r.runs());
+                live.push(true);
+            }
+            Err(why) => {
+                let stops = r.stops();
+                println!("Session {} still runs {}.", r.name, r.runs());
+                println!("It cannot restart live: {why}.");
+                print_stops(&stops);
+                anything_stops |= !stops.is_empty();
+                live.push(false);
+            }
+        }
     }
     let them = if older.len() == 1 { "it" } else { "them" };
     let go = match choice {
@@ -80,15 +131,20 @@ pub(super) fn after_update(exe: &Path, installed: &str, choice: Option<bool>) ->
         }
         return Ok(());
     }
-    // The session this runs in goes last: its restart ends this command's pane.
+    // The session this runs in goes last: a restart that is not live ends this command's pane.
     let here = std::env::var("KRAAL_SESSION").ok();
-    let (last, first): (Vec<Running>, Vec<Running>) =
-        older.into_iter().partition(|r| here.as_deref() == Some(r.name.as_str()));
+    let (last, first): (Vec<_>, Vec<_>) =
+        older.into_iter().zip(live).partition(|(r, _)| here.as_deref() == Some(r.name.as_str()));
     let mut failed = 0;
-    for r in first.into_iter().chain(last) {
-        // The new kraal restarts it: this one may not know how the new one does.
+    for (r, live) in first.into_iter().chain(last) {
+        // The new kraal restarts it: this one may not know how the new one does. Said live, it
+        // is live or not at all.
+        let mut args = vec!["-s", &r.name, "restart", "--yes"];
+        if live {
+            args.push("--live");
+        }
         let status = std::process::Command::new(exe)
-            .args(["-s", &r.name, "restart", "--yes"])
+            .args(args)
             .status()
             .with_context(|| format!("starting {}", exe.display()))?;
         if !status.success() {
@@ -113,6 +169,45 @@ impl Running {
     fn at(name: String, socket: PathBuf) -> Running {
         let server = client::ping(&socket).ok();
         Running { name, socket, server }
+    }
+
+    /// Whether it can restart live now, on `binary` (else on this kraal's); why not otherwise.
+    fn live(&self, binary: Option<&Path>) -> Result<(), String> {
+        if self.server.is_none() {
+            return Err("its server does not answer".into());
+        }
+        let binary = match binary {
+            Some(b) => b.to_path_buf(),
+            None => client::installed_exe().map_err(|e| format!("{e:#}"))?,
+        };
+        client::upgrade(&self.socket, true, Some(binary))
+    }
+
+    /// Restart it live on this kraal: the release it runs then.
+    fn restart_live(&self) -> Result<String, Live> {
+        let exe = client::installed_exe().map_err(Live::Failed)?;
+        client::upgrade(&self.socket, false, Some(exe)).map_err(Live::Refused)?;
+        // It answers again once the new kraal has taken everything over, as the same process.
+        let before = self.server.as_ref().map(|(pid, _)| *pid);
+        let start = Instant::now();
+        loop {
+            if let Ok((pid, version)) = client::ping(&self.socket) {
+                if Some(pid) != before {
+                    return Err(Live::Failed(anyhow!(
+                        "session {} restarted, but not live: its programs stopped",
+                        self.name
+                    )));
+                }
+                return Ok(version);
+            }
+            if start.elapsed() > Duration::from_secs(30) {
+                return Err(Live::Failed(anyhow!(
+                    "session {} did not answer again; `kraal` starts it with its layout",
+                    self.name
+                )));
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
     }
 
     fn runs(&self) -> String {
@@ -168,6 +263,14 @@ fn pane_programs(server: u32, socket: &Path) -> HashMap<u32, Vec<String>> {
         }
     }
     out
+}
+
+/// Why a live restart did not happen.
+enum Live {
+    /// The server said no: it went on as before.
+    Refused(String),
+    /// Something went wrong past that point.
+    Failed(anyhow::Error),
 }
 
 fn print_stops(stops: &[String]) {

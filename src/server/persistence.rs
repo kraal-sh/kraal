@@ -123,10 +123,11 @@ impl Server {
         persist::apply(self, snap)
     }
 
-    /// The question before a restart, with what it stops.
-    pub(super) fn ask_restart(&self) -> Mode {
+    /// The question before a restart that is not live (`why_not_live`), with what it stops.
+    pub(super) fn cold_restart_question(&self, why_not_live: &str) -> Mode {
         let mut message = format!(
-            "Restart session {} on the kraal installed now? The layout, the scrollback, SSH shells and agents come back.",
+            "Restart session {} on the kraal installed now? The layout, the scrollback, SSH shells and agents come back.\n\
+             No live restart now (one stops nothing): {why_not_live}.",
             self.session
         );
         let stops = self.restart_stops();
@@ -137,7 +138,7 @@ impl Server {
                 message.push_str(&line);
             }
         }
-        Mode::confirm(message, ConfirmAction::Restart)
+        Mode::confirm(message, ConfirmAction::Restart { live: false })
     }
 
     /// What a restart stops, a line per pane, in the order of the workspaces.

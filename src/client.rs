@@ -19,7 +19,7 @@ pub fn ensure_server(session: &str) -> Result<PathBuf> {
     if UnixStream::connect(&socket).is_ok() {
         return Ok(socket);
     }
-    let exe = std::env::current_exe().context("locating the kraal binary")?;
+    let exe = installed_exe()?;
     let log = paths::log_path(session);
     // The state directory holds what the server logs and saves: only ours.
     if let Some(dir) = log.parent() {
@@ -85,8 +85,7 @@ fn exchange(stream: &mut UnixStream, req: Request) -> Result<Response> {
                     ServerMsg::Open { .. }
                     | ServerMsg::Event { .. }
                     | ServerMsg::Events { .. }
-                    | ServerMsg::Attached { .. }
-                    | ServerMsg::Restarting { .. } => continue,
+                    | ServerMsg::Attached { .. } => continue,
                 }
             }
             Some(_) => continue,
@@ -94,15 +93,17 @@ fn exchange(stream: &mut UnixStream, req: Request) -> Result<Response> {
     }
 }
 
-/// Ask the server behind `socket` to restart live (`kraal restart --live`): `Ok` once the
-/// connection closes, as the server replaces itself; why, when it refused.
-pub fn upgrade(socket: &Path) -> Result<()> {
-    let mut stream = UnixStream::connect(socket)
-        .with_context(|| format!("no kraal server at {} (is it running?)", socket.display()))?;
-    let request = ClientMsg::Request { version: protocol::PROTOCOL_VERSION, request: Request::Upgrade };
-    protocol::write_json(&mut stream, &request)?;
+/// Ask the server behind `socket` to restart live on `binary` (see [`Request::Upgrade`]), or
+/// with `check` whether it can now. `Ok` once it said yes, or once the connection closed as the
+/// server replaced itself; why not otherwise.
+pub fn upgrade(socket: &Path, check: bool, binary: Option<PathBuf>) -> Result<(), String> {
+    let mut stream = UnixStream::connect(socket).map_err(|e| format!("its server does not answer ({e})"))?;
+    let request =
+        ClientMsg::Request { version: protocol::PROTOCOL_VERSION, request: Request::Upgrade { check, binary } };
+    protocol::write_json(&mut stream, &request).map_err(|e| format!("its server does not answer ({e})"))?;
     loop {
         let payload = match protocol::read_frame(&mut stream) {
+            Ok(None) | Err(_) if check => return Err("its server closed the connection".into()),
             Ok(None) | Err(_) => return Ok(()),
             Ok(Some((protocol::JSON, payload))) => payload,
             Ok(Some(_)) => continue,
@@ -110,10 +111,11 @@ pub fn upgrade(socket: &Path) -> Result<()> {
         match serde_json::from_slice::<ServerMsg>(&payload) {
             // A server from before live restarts does not know the request.
             Ok(ServerMsg::Response { result: Err(e) }) if e.starts_with("bad message") => {
-                bail!("the running server cannot restart live: `kraal kill`, then `kraal` (the layout is kept)")
+                return Err("its server is a kraal from before live restarts".into());
             }
-            Ok(ServerMsg::Response { result: Err(e) }) => bail!(e),
+            Ok(ServerMsg::Response { result: Err(e) }) => return Err(e),
             Ok(ServerMsg::Response { result: Ok(_) }) => return Ok(()),
+            Ok(ServerMsg::Exit { reason, .. }) => return Err(reason),
             _ => continue,
         }
     }
@@ -170,9 +172,16 @@ pub fn installed_exe() -> Result<PathBuf> {
     }
 }
 
-/// Run `kraal -s <session> restart --yes` from `exe` on its own, out of any terminal, pane and
-/// session: it outlives the pane or the server that starts it. What it says goes to the
-/// session's log.
+/// The kraal a job runs (a transfer, a command on servers, an attachment): the one installed
+/// now, which an update may have put in place of the file this process started from; else the
+/// `kraal` on PATH.
+pub fn kraal_program() -> String {
+    installed_exe().map(|p| p.display().to_string()).unwrap_or_else(|_| "kraal".into())
+}
+
+/// Run `kraal -s <session> restart --yes --cold` from `exe` on its own, out of any terminal, pane
+/// and session: it outlives the pane or the server that starts it (a live restart needs none of
+/// that). What it says goes to the session's log.
 pub fn restart_detached(exe: &Path, session: &str) -> Result<()> {
     let log = paths::log_path(session);
     if let Some(dir) = log.parent() {
@@ -180,7 +189,7 @@ pub fn restart_detached(exe: &Path, session: &str) -> Result<()> {
     }
     let out = crate::runbooks::open_private_append(&log)?;
     let mut cmd = std::process::Command::new(exe);
-    cmd.args(["-s", session, "restart", "--yes"])
+    cmd.args(["-s", session, "restart", "--yes", "--cold"])
         .stdin(std::process::Stdio::null())
         .stdout(out.try_clone()?)
         .stderr(out)
@@ -677,11 +686,11 @@ pub fn attach(mut target: Target, mut workspace: Option<String>, mouse: bool, at
 
     let mut greeted = Some(first);
     let mut delay = Duration::from_secs(1);
-    // What the server said it runs, and the server that said it is restarting.
+    // What the server said it runs, the server that said it is restarting, and when it said it
+    // replaces itself in place (a live restart: the connection goes on until it happens).
     let mut server_version = None;
     let mut restarting = None;
-    // The server said it restarts live: when, and the workspace to come back to.
-    let mut live_restart: Option<(Instant, Option<String>)> = None;
+    let mut live_restart: Option<Instant> = None;
     let reason = 'session: loop {
         let session = match greeted.take() {
             Some(s) => Ok(s),
@@ -722,8 +731,12 @@ pub fn attach(mut target: Target, mut workspace: Option<String>, mouse: bool, at
                             }
                         }
                         Ok(Some((_, payload))) => match serde_json::from_slice::<ServerMsg>(&payload) {
-                            Ok(ServerMsg::Exit { reason, reattach: None }) => break 'session reason,
+                            Ok(ServerMsg::Exit { reason, reattach: None, .. }) => break 'session reason,
                             // The next server shows the same workspace.
+                            Ok(ServerMsg::Exit { reattach: Some(ws), live: true, .. }) => {
+                                workspace = Some(ws).filter(|w| !w.is_empty());
+                                live_restart = Some(Instant::now());
+                            }
                             Ok(ServerMsg::Exit { reattach: Some(ws), .. }) => {
                                 workspace = Some(ws).filter(|w| !w.is_empty());
                                 restarting = Some(c.server);
@@ -733,7 +746,6 @@ pub fn attach(mut target: Target, mut workspace: Option<String>, mouse: bool, at
                             Ok(ServerMsg::Open { url }) => {
                                 let _ = crate::pane::open_url(&url);
                             }
-                            Ok(ServerMsg::Restarting { workspace }) => live_restart = Some((Instant::now(), workspace)),
                             _ => {}
                         },
                         Ok(None) => break c.why_lost("the connection closed"),
@@ -745,22 +757,13 @@ pub fn attach(mut target: Target, mut workspace: Option<String>, mouse: bool, at
             }
             Err(lost) => lost,
         };
-        if let (Some(old), Target::Local { session }) = (restarting.take(), &target) {
+        // After a live restart, the same server answers again: no other process to wait for.
+        let live = live_restart.take().is_some_and(|at| at.elapsed() < Duration::from_secs(30));
+        if let (Some(old), Target::Local { session }) = (restarting.take().or(live.then_some(None)), &target) {
             set_modes(false, mouse);
             match wait_restarted(session, old, &quit) {
                 Ok(()) => continue 'session,
                 Err(why) => break 'session why,
-            }
-        }
-        // A server that said it restarts live answers again on its socket: back to the
-        // workspace shown.
-        if let Some((_, shown)) = live_restart.take().filter(|(at, _)| at.elapsed() < Duration::from_secs(30)) {
-            workspace = shown.or(workspace);
-            if let Target::Local { session } = &target {
-                match wait_restarted(session, None, &quit) {
-                    Ok(()) => continue 'session,
-                    Err(why) => break 'session why,
-                }
             }
         }
         let Target::Remote { label, .. } = &target else {

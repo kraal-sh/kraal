@@ -23,7 +23,7 @@ pub fn update(check: bool, to: Option<String>, force: bool, restart: Option<bool
         }
         return Ok(());
     }
-    let exe = std::env::current_exe().context("cannot tell where this kraal is")?;
+    let exe = crate::client::installed_exe().context("cannot tell where this kraal is")?;
     if let Some(manager) = package_manager(&exe) {
         bail!("this kraal was installed by {manager}: update it there");
     }

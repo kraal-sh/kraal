@@ -365,7 +365,7 @@ impl Server {
     /// Run `kraal <args>` in a floating pane that closes itself a few seconds after success.
     pub(super) fn start_job(&mut self, client: ClientId, label: &str, args: Vec<String>) {
         let Some(ws) = self.clients.get(&client).map(|c| c.workspace) else { return };
-        let exe = std::env::current_exe().map(|p| p.display().to_string()).unwrap_or_else(|_| "kraal".into());
+        let exe = crate::client::kraal_program();
         let mut command = vec![exe];
         command.extend(args);
         let spec = PaneSpec { command, close_on_success: true, ..Default::default() };

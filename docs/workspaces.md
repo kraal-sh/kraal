@@ -23,11 +23,13 @@ layout, reconnects SSH shells and resumes agent conversations; other commands wa
 before they run again.
 
 `kraal restart` (or `ctrl+b W r`) restarts a session's server on the kraal installed now, after an
-update for instance: the server saves the session and stops, and a new one starts and brings it
-back as above. First it lists the panes whose programs would stop (a shell at its prompt runs
-nothing; an agent in the middle of a turn loses that turn) and asks; `--yes` does not ask.
-Attached terminals wait for the new server and come back to the workspace they showed. Run from a
-pane of the session, the restart goes on once that pane has closed.
+update for instance. It restarts [live](#live-restart) when it can, and nothing stops; it asks
+first, and `--yes` does not ask. Otherwise, or with `--cold`, the server saves the session and
+stops, and a new one starts and brings it back as above: first it says why it is not live, lists
+the panes whose programs would stop (a shell at its prompt runs nothing; an agent in the middle of
+a turn loses that turn) and asks. `--live` fails rather than stop programs. Attached terminals wait
+for the new server and come back to the workspace they showed. Run from a pane of the session, a
+restart that is not live goes on once that pane has closed.
 
 Each pane also shows again what it showed, scrollback and colours included, down to a dim
 `kraal: restored from <time>` line; what runs in it now writes below that line. Copy mode and
@@ -42,21 +44,23 @@ and it can hold secrets (a token printed by a command, a password echoed by mist
 
 ### Live restart
 
-`kraal restart --live` moves a running server to the kraal binary installed now (after
-`kraal update`) and stops nothing: the server replaces itself in place, the new kraal takes over
-the panes' terminals, and every program in them keeps running, with the same pid (a build, a
-`tail -f`, an editor, an agent in the middle of a turn). Each pane shows what it showed, colours,
+A live restart moves a running server to another kraal binary (the one `kraal restart` runs; from
+the menu, the one installed where the server was started from) and stops nothing: the server
+replaces itself in place, the new kraal takes over the panes' terminals, and every program in them
+keeps running, with the same pid (a build, a `tail -f`, an editor, an agent in the middle of a
+turn). Each pane shows what it showed, colours,
 cursor and modes included; a full-screen program is made to draw itself again. Pane ids, tunnels
-and their ssh stay. Attached clients come back by themselves to the workspace they showed (a
-client of an older kraal exits instead: `kraal` attaches again); `kraal events` ends, and started
-again with `--since`, it gets what it missed, as the numbering goes on.
+and their ssh stay. Commands run meanwhile wait for the new kraal. Attached clients come back by
+themselves to the workspace they showed (a client of an older kraal exits instead: `kraal`
+attaches again); `kraal events` ends, and started again with `--since`, it gets what it missed,
+as the numbering goes on.
 
-The new binary is tried first: one that cannot take over is refused, and so is a live restart
-while something cannot be carried over (a runbook run, a transfer, a file open in the local
-editor, an agent switching accounts, a `kraal wait`): the reason is given, and the server goes on
-as before. A hook or background work still running is waited for a few seconds. What the server
-hands over goes through a file readable by you alone in `~/.local/state/kraal/`, deleted as soon
-as it is read. Linux only for now; elsewhere, `kraal kill`, then `kraal`.
+The new binary is tried first: there is no live restart on one that cannot take over (an older
+kraal), nor while something cannot be carried over (a runbook run, a transfer, a file open in the
+local editor, an agent switching accounts, a `kraal wait`), and the reason is given. A hook or
+background work still running is waited for a few seconds. Should the exec itself fail, the server
+goes on as before. What the server hands over goes through a file readable by you alone in
+`~/.local/state/kraal/`, deleted as soon as it is read. Linux only for now.
 
 ## Workspace files
 
