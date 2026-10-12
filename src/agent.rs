@@ -12,8 +12,6 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum AgentState {
-    #[default]
-    Unknown,
     /// Waiting for a prompt, and the user has already seen the last result.
     Idle,
     Working,
@@ -21,6 +19,10 @@ pub enum AgentState {
     Blocked,
     /// Finished a turn the user has not looked at yet.
     Done,
+    /// Also a state this kraal does not know (a newer kraal's).
+    #[default]
+    #[serde(other)]
+    Unknown,
 }
 
 impl AgentState {

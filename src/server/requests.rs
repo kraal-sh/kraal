@@ -44,8 +44,10 @@ impl Server {
             Request::Ping => Ok(Response::Pong {
                 pid: std::process::id(),
                 session: self.session.clone(),
-                version: env!("CARGO_PKG_VERSION").into(),
+                version: protocol::KRAAL_VERSION.into(),
+                features: Some(protocol::feature_names()),
             }),
+            Request::Unknown(request) => Err(protocol::unsupported(&request)),
             Request::ListPanes => {
                 let mut v: Vec<PaneId> = Vec::new();
                 for ws in &self.workspaces {

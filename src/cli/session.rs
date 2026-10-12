@@ -123,10 +123,10 @@ pub(super) fn list_sessions() -> Result<()> {
     let mut names = std::collections::BTreeMap::<String, String>::new();
     for (name, socket) in live_sockets() {
         let state = match client::ping(&socket) {
-            Ok((_, version)) if protocol::newer(protocol::KRAAL_VERSION, &version) => {
+            Ok(client::ServerInfo { version, .. }) if protocol::newer(protocol::KRAAL_VERSION, &version) => {
                 format!("running  {version} ({} is installed: kraal -s {name} restart)", protocol::KRAAL_VERSION)
             }
-            Ok((_, version)) => format!("running  {version}"),
+            Ok(client::ServerInfo { version, .. }) => format!("running  {version}"),
             Err(_) => "running".into(),
         };
         names.insert(name, state);
