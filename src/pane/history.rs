@@ -8,6 +8,7 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
 use alacritty_terminal::grid::Row;
+use alacritty_terminal::index::Column;
 use alacritty_terminal::term::cell::{Cell, Flags, Hyperlink};
 use alacritty_terminal::vte::ansi::{Color, NamedColor, Rgb};
 use unicode_width::UnicodeWidthChar;
@@ -84,9 +85,11 @@ const NONE: u8 = 0xff;
 pub(super) struct History {
     blocks: VecDeque<Block>,
     lines: usize,
-    /// Rows the lines take at `width` columns.
-    rows: usize,
+    /// The pane's width, and the rows the lines take at `counted` columns: counted again when
+    /// needed after the width changed, not at each resize.
     width: usize,
+    rows: usize,
+    counted: usize,
     /// The images whose cells are here, with the number of lines holding them.
     images: HashMap<u32, usize>,
     // Reused while encoding.
@@ -128,17 +131,18 @@ impl History {
     }
 
     /// Rows the lines take at the pane's width.
-    #[cfg(test)]
-    pub(super) fn rows(&self) -> usize {
+    pub(super) fn rows(&mut self) -> usize {
+        if self.counted != self.width {
+            let width = self.width;
+            self.rows = self.oldest_first().map(|l| l.rows_at(width)).sum();
+            self.counted = width;
+        }
         self.rows
     }
 
     /// The pane is `width` columns wide now.
     pub(super) fn set_width(&mut self, width: usize) {
-        if width != self.width {
-            self.width = width;
-            self.rows = self.oldest_first().map(|l| l.rows_at(width)).sum();
-        }
+        self.width = width;
     }
 
     /// Memory held, in bytes.
@@ -151,6 +155,7 @@ impl History {
         self.blocks.clear();
         self.lines = 0;
         self.rows = 0;
+        self.counted = self.width;
         self.images.clear();
     }
 
@@ -160,11 +165,16 @@ impl History {
     }
 
     /// Add the newest line: the emulator's `rows`, each but the last wrapped onto the next. With
-    /// `wraps`, the last one is too: the line goes on in the next one added.
-    pub(super) fn push(&mut self, rows: &[&[Cell]], wraps: bool) {
+    /// `wraps`, the last one is too: the line goes on in the next one added. The cells of the last
+    /// row from `extent` on are all alike (it may be its length).
+    pub(super) fn push(&mut self, rows: &[&[Cell]], wraps: bool, extent: usize) {
         let Some(last) = rows.last() else { return };
-        self.set_width(last.len());
-        let (end, fill) = if wraps { (last.len(), None) } else { trim(last) };
+        self.width = last.len();
+        let (mut end, fill) = if wraps { (last.len(), None) } else { trim(last, extent) };
+        if end == 0 && rows.len() > 1 {
+            // A row the line wrapped onto, blank since: a cell of it keeps it a row of the line.
+            end = 1;
+        }
         let mut flags = 0;
         let (glyphs, runs) = match self.encode(rows, end, false) {
             Some(counts) => counts,
@@ -213,8 +223,19 @@ impl History {
         if let Some(bg) = fill {
             put_color(out, bg);
         }
+        if self.lines == 0 {
+            (self.rows, self.counted) = (0, self.width);
+        }
+        #[cfg(test)]
+        {
+            // Laid out again at the same width, the line takes the rows it took.
+            let block = self.blocks.back().expect("just added");
+            assert_eq!(block.line(block.starts.len() - 1).rows_at(self.width), rows.len());
+        }
         self.lines += 1;
-        self.rows += rows.len();
+        if self.counted == self.width {
+            self.rows += rows.len();
+        }
     }
 
     /// Write the text, the widths when `explicit`, and the runs of a line into the scratch
@@ -225,47 +246,53 @@ impl History {
         self.widths.clear();
         self.runs.clear();
         let mut glyphs = 0usize;
-        let mut run: Option<(&Cell, usize)> = None;
         let mut runs = Runs::default();
+        // The run being counted: its first cell, and its length.
+        let mut first: Option<&Cell> = None;
+        let mut n = 0;
         for (i, row) in rows.iter().enumerate() {
             let end = if i + 1 == rows.len() { last_end } else { row.len() };
-            for cell in &row[..end] {
-                if cell.flags.intersects(SPACERS) {
-                    continue;
-                }
+            let cells = &row[..end];
+            self.text.reserve(cells.len());
+            for (col, cell) in cells.iter().enumerate() {
                 let c = cell.c;
-                if cell.extra.is_none() && (' '..'\x7f').contains(&c) && !cell.flags.contains(Flags::WIDE_CHAR) {
+                if cell.extra.is_none() && !cell.flags.intersects(LAYOUT) && (' '..'\x7f').contains(&c) {
                     self.text.push(c as u8);
                     if explicit {
                         self.widths.push(0);
                     }
                 } else {
+                    if cell.flags.intersects(SPACERS | Flags::WIDE_CHAR) && !explicit && !laid_out(rows, i, col) {
+                        return None;
+                    }
+                    if cell.flags.intersects(SPACERS) && !explicit {
+                        continue;
+                    }
                     push_char(&mut self.text, c);
                     let zerowidth = cell.zerowidth().unwrap_or_default();
                     for z in zerowidth {
                         push_char(&mut self.text, *z);
                     }
-                    let wide = cell.flags.contains(Flags::WIDE_CHAR);
                     if explicit {
-                        put_varint(&mut self.widths, zerowidth.len() << 1 | usize::from(wide));
-                    } else if !follows_rules(c, wide, zerowidth) {
+                        put_varint(&mut self.widths, zerowidth.len() << 3 | usize::from(layout_bits(cell.flags)));
+                    } else if !follows_rules(c, cell.flags.contains(Flags::WIDE_CHAR), zerowidth) {
                         return None;
                     }
                 }
                 glyphs += 1;
-                match &mut run {
-                    Some((first, n)) if same_look(first, cell) => *n += 1,
+                match first {
+                    Some(f) if same_look(f, cell) => n += 1,
                     _ => {
-                        if let Some((first, n)) = run.take() {
-                            runs.add(n, Look::of(first), &mut self.runs);
+                        if let Some(f) = first {
+                            runs.add(n, f, &mut self.runs);
                         }
-                        run = Some((cell, 1));
+                        (first, n) = (Some(cell), 1);
                     }
                 }
             }
         }
-        if let Some((first, n)) = run {
-            runs.add(n, Look::of(first), &mut self.runs);
+        if let Some(f) = first {
+            runs.add(n, f, &mut self.runs);
         }
         if runs.count == 1 && !runs.styled {
             self.runs.clear();
@@ -274,9 +301,14 @@ impl History {
         Some((glyphs, runs.count))
     }
 
-    /// Drop the oldest lines while they take more than `rows` rows.
-    pub(super) fn trim(&mut self, rows: usize) {
-        while self.rows > rows && !self.is_empty() {
+    /// Drop the oldest lines while they take more than `rows` rows. Until they are counted at the
+    /// pane's width, only while there are more lines than that (each takes a row at least); `exact`
+    /// counts them.
+    pub(super) fn trim(&mut self, rows: usize, exact: bool) {
+        if exact {
+            self.rows();
+        }
+        while (if self.counted == self.width { self.rows } else { self.lines }) > rows && !self.is_empty() {
             self.drop_oldest();
         }
     }
@@ -284,7 +316,7 @@ impl History {
     fn drop_oldest(&mut self) {
         let Some(block) = self.blocks.front_mut() else { return };
         let line = block.line(block.first);
-        let rows = line.rows_at(self.width);
+        let rows = if self.counted == self.width { line.rows_at(self.width) } else { 0 };
         if line.flags & IMAGE != 0 {
             forget_images(&mut self.images, &line);
         }
@@ -297,6 +329,7 @@ impl History {
     }
 
     /// The newest line.
+    #[cfg(test)]
     pub(super) fn newest(&self) -> Option<Line<'_>> {
         let block = self.blocks.back()?;
         (block.len() > 0).then(|| block.line(block.starts.len() - 1))
@@ -306,7 +339,7 @@ impl History {
         let Some(block) = self.blocks.back_mut() else { return };
         let Some(start) = block.starts.pop() else { return };
         let line = Line::parse(&block.data[start as usize..]);
-        let rows = line.rows_at(self.width);
+        let rows = if self.counted == self.width { line.rows_at(self.width) } else { 0 };
         if line.flags & IMAGE != 0 {
             forget_images(&mut self.images, &line);
         }
@@ -355,6 +388,39 @@ fn has_placeholder(text: &[u8]) -> bool {
     text.iter().enumerate().any(|(i, b)| *b == needle[0] && text[i..].starts_with(needle))
 }
 
+/// Whether the cells of a wide character are where the emulator puts them, for cell `col` of
+/// `rows[i]`: the character, then a spacer; or a spacer in the last column of a row the character
+/// did not fit on, which goes on with it on the next row.
+fn laid_out(rows: &[&[Cell]], i: usize, col: usize) -> bool {
+    let row = rows[i];
+    let flags = row[col].flags;
+    if flags.contains(Flags::WIDE_CHAR) {
+        !flags.intersects(SPACERS) && row.get(col + 1).is_some_and(|c| c.flags.contains(Flags::WIDE_CHAR_SPACER))
+    } else if flags.contains(Flags::WIDE_CHAR_SPACER) {
+        !flags.contains(Flags::LEADING_WIDE_CHAR_SPACER) && col > 0 && row[col - 1].flags.contains(Flags::WIDE_CHAR)
+    } else {
+        col + 1 == row.len()
+            && flags.contains(Flags::WRAPLINE)
+            && rows.get(i + 1).is_some_and(|next| next[0].flags.contains(Flags::WIDE_CHAR))
+    }
+}
+
+/// The flags that place a cell of a wide character, as kept for a line whose cells are kept as
+/// they are.
+fn layout_bits(flags: Flags) -> u8 {
+    u8::from(flags.contains(Flags::WIDE_CHAR))
+        | u8::from(flags.contains(Flags::WIDE_CHAR_SPACER)) << 1
+        | u8::from(flags.contains(Flags::LEADING_WIDE_CHAR_SPACER)) << 2
+}
+
+fn layout_flags(bits: usize) -> Flags {
+    let mut flags = Flags::empty();
+    flags.set(Flags::WIDE_CHAR, bits & 1 != 0);
+    flags.set(Flags::WIDE_CHAR_SPACER, bits & 2 != 0);
+    flags.set(Flags::LEADING_WIDE_CHAR_SPACER, bits & 4 != 0);
+    flags
+}
+
 /// Whether a cell holds what the emulator makes of its text: a character of one or two columns,
 /// as its width says, followed by characters of none.
 fn follows_rules(c: char, wide: bool, zerowidth: &[char]) -> bool {
@@ -363,15 +429,16 @@ fn follows_rules(c: char, wide: bool, zerowidth: &[char]) -> bool {
 }
 
 /// Where the last row of a line ends: past its last cell unlike the blank cells that fill its
-/// end, and their background when it is not the default.
-fn trim(row: &[Cell]) -> (usize, Option<Color>) {
+/// end, and their background when it is not the default. Its cells from `extent` on are all
+/// alike: only those before are read.
+fn trim(row: &[Cell], extent: usize) -> (usize, Option<Color>) {
     let Some(last) = row.last() else { return (0, None) };
     let default_fg = Color::Named(NamedColor::Foreground);
     if last.c != ' ' || !last.flags.is_empty() || last.extra.is_some() || last.fg != default_fg {
         return (row.len(), None);
     }
     let bg = last.bg;
-    let end = row
+    let end = row[..extent.min(row.len())]
         .iter()
         .rposition(|c| c.c != ' ' || c.bg != bg || c.fg != default_fg || !c.flags.is_empty() || c.extra.is_some())
         .map_or(0, |i| i + 1);
@@ -379,10 +446,11 @@ fn trim(row: &[Cell]) -> (usize, Option<Color>) {
 }
 
 /// Whether two cells look the same, characters aside.
+#[inline]
 fn same_look(a: &Cell, b: &Cell) -> bool {
-    a.fg == b.fg
+    (a.flags.bits() ^ b.flags.bits()) & !LAYOUT.bits() == 0
+        && a.fg == b.fg
         && a.bg == b.bg
-        && a.flags.difference(LAYOUT) == b.flags.difference(LAYOUT)
         && match (&a.extra, &b.extra) {
             (None, None) => true,
             (Some(x), Some(y)) if Arc::ptr_eq(x, y) => true,
@@ -440,8 +508,14 @@ struct Runs {
 }
 
 impl Runs {
-    fn add(&mut self, n: usize, look: Look, out: &mut Vec<u8>) {
+    /// Write a run of `n` characters that look like `cell`.
+    fn add(&mut self, n: usize, cell: &Cell, out: &mut Vec<u8>) {
         put_varint(out, n);
+        let look = if cell.extra.is_none() {
+            Look { fg: cell.fg, bg: cell.bg, flags: cell.flags.difference(LAYOUT), underline: None, link: None }
+        } else {
+            Look::of(cell)
+        };
         let prev = &self.last;
         let mut mask = 0;
         if look.fg != prev.fg {
@@ -486,7 +560,8 @@ impl Runs {
                 None => put_varint(out, 0),
             }
         }
-        self.styled |= look != Look::default();
+        // The first run changes nothing from the defaults when its characters look plain.
+        self.styled |= mask != 0;
         self.count += 1;
         self.last = look;
     }
@@ -495,7 +570,8 @@ impl Runs {
 /// One line, as kept.
 pub(super) struct Line<'a> {
     flags: u8,
-    text: &'a str,
+    /// UTF-8, read as such only when its characters are needed.
+    bytes: &'a [u8],
     widths: &'a [u8],
     runs: &'a [u8],
     fill: Option<Color>,
@@ -506,8 +582,7 @@ impl<'a> Line<'a> {
         let mut r = Reader { bytes, at: 0 };
         let len = r.varint();
         let flags = r.byte();
-        // Written from a str, kept as written.
-        let text = std::str::from_utf8(r.take(len)).unwrap_or_default();
+        let text = r.take(len);
         let mut section = |flag: u8| {
             if flags & flag == 0 {
                 return &[][..];
@@ -518,22 +593,22 @@ impl<'a> Line<'a> {
         let widths = section(WIDTHS);
         let runs = section(RUNS);
         let fill = (flags & FILL != 0).then(|| r.color());
-        Line { flags, text, widths, runs, fill }
+        Line { flags, bytes: text, widths, runs, fill }
     }
 
     /// The text: each character followed by those drawn over it.
-    #[cfg(test)]
     pub(super) fn text(&self) -> &'a str {
-        self.text
+        // Written from a str, kept as written.
+        std::str::from_utf8(self.bytes).unwrap_or_default()
     }
 
     /// The text a search reads: the characters without those drawn over them, as the emulator's
     /// search reads its cells.
     pub(super) fn searched(&self) -> Cow<'a, str> {
         if self.flags & ASCII != 0 {
-            Cow::Borrowed(self.text)
+            Cow::Borrowed(self.text())
         } else {
-            Cow::Owned(self.glyphs().map(|g| g.base).collect())
+            Cow::Owned(self.glyphs().filter(|g| !g.flags.intersects(SPACERS)).map(|g| g.base).collect())
         }
     }
 
@@ -554,7 +629,7 @@ impl<'a> Line<'a> {
         let mut widths = Reader { bytes: self.widths, at: 0 };
         // The number of characters first.
         widths.varint();
-        Glyphs { text: self.text, at: 0, widths: (self.flags & WIDTHS != 0).then_some(widths) }
+        Glyphs { text: self.text(), at: 0, widths: (self.flags & WIDTHS != 0).then_some(widths) }
     }
 
     /// Lay the line out at `width` columns: `place` gets each character with the column it
@@ -575,7 +650,7 @@ impl<'a> Line<'a> {
     /// Rows it takes at `width` columns.
     pub(super) fn rows_at(&self, width: usize) -> usize {
         if self.flags & ASCII != 0 {
-            return self.text.len().div_ceil(width.max(1)).max(1);
+            return self.bytes.len().div_ceil(width.max(1)).max(1);
         }
         let mut rows = 1;
         self.layout(width, |g| rows += usize::from(g.is_none()));
@@ -584,6 +659,15 @@ impl<'a> Line<'a> {
 
     /// Add the rows of the grid this line makes at `width` columns to `out`; returns how many.
     pub(super) fn decode(&self, width: usize, out: &mut Vec<Row<Cell>>) -> usize {
+        let start = out.len();
+        out.extend((0..self.rows_at(width)).map(|_| Row::new(width.max(1))));
+        self.decode_into(width, &mut out[start..], true)
+    }
+
+    /// Write the rows of the grid this line makes at `width` columns into `rows`, as many as it
+    /// makes ([`Line::rows_at`]); returns how many. With `blank`, they hold default cells already
+    /// and only the others are written.
+    pub(super) fn decode_into(&self, width: usize, rows: &mut [Row<Cell>], blank: bool) -> usize {
         let width = width.max(1);
         let mut looks = Reader { bytes: self.runs, at: 0 };
         let runs = looks.varint();
@@ -596,8 +680,7 @@ impl<'a> Line<'a> {
             template = look.cell();
             run = 1;
         }
-        let start = out.len();
-        let mut row: Vec<Cell> = Vec::with_capacity(width);
+        let (mut r, mut col) = (0, 0);
         for g in self.glyphs() {
             while left == 0 {
                 if run < runs {
@@ -612,37 +695,42 @@ impl<'a> Line<'a> {
             }
             left -= 1;
             let w = if g.wide && width >= 2 { 2 } else { 1 };
-            if row.len() + w > width {
-                if row.len() < width {
+            if col + w > width {
+                let Some(row) = rows.get_mut(r) else { return r };
+                if col < width {
                     let mut spacer = template.clone();
                     spacer.flags.insert(Flags::LEADING_WIDE_CHAR_SPACER);
-                    row.push(spacer);
+                    row[Column(col)] = spacer;
                 }
-                row[width - 1].flags.insert(Flags::WRAPLINE);
-                out.push(Row::from_vec(std::mem::replace(&mut row, Vec::with_capacity(width)), width));
+                row[Column(width - 1)].flags.insert(Flags::WRAPLINE);
+                (r, col) = (r + 1, 0);
             }
+            let Some(row) = rows.get_mut(r) else { return r };
             let mut cell = template.clone();
             cell.c = g.base;
+            cell.flags.insert(g.flags);
             for z in g.zerowidth.chars() {
                 cell.push_zerowidth(z);
             }
             if w == 2 {
                 cell.flags.insert(Flags::WIDE_CHAR);
-                row.push(cell);
                 let mut spacer = template.clone();
                 spacer.flags.insert(Flags::WIDE_CHAR_SPACER);
-                row.push(spacer);
-            } else {
-                row.push(cell);
+                row[Column(col + 1)] = spacer;
             }
+            row[Column(col)] = cell;
+            col += w;
         }
-        let fill = self.fill.map_or_else(Cell::default, Cell::from);
-        row.resize(width, fill);
+        let Some(row) = rows.get_mut(r) else { return r };
+        if let Some(bg) = self.fill {
+            row[Column(col)..].fill(Cell::from(bg));
+        } else if !blank {
+            row[Column(col)..].fill(Cell::default());
+        }
         if self.flags & WRAPS != 0 {
-            row[width - 1].flags.insert(Flags::WRAPLINE);
+            row[Column(width - 1)].flags.insert(Flags::WRAPLINE);
         }
-        out.push(Row::from_vec(row, width));
-        out.len() - start
+        r + 1
     }
 
     /// Add the text of each row this line makes at `width` columns to `out`, as the text of a
@@ -650,6 +738,7 @@ impl<'a> Line<'a> {
     pub(super) fn row_texts(&self, width: usize, out: &mut Vec<String>) {
         let mut text = String::new();
         self.layout(width, |g| match g {
+            Some((g, _)) if g.flags.contains(Flags::WIDE_CHAR_SPACER) => {}
             Some((g, _)) if g.base == crate::graphics::PLACEHOLDER => text.push(' '),
             Some((g, _)) => {
                 text.push(g.base);
@@ -664,11 +753,13 @@ impl<'a> Line<'a> {
     }
 }
 
-/// A character and those drawn over it.
+/// A character and those drawn over it: two columns when `wide`, else one, with `flags` when
+/// the cells of its line are kept as they are.
 struct Glyph<'a> {
     base: char,
     zerowidth: &'a str,
     wide: bool,
+    flags: Flags,
 }
 
 struct Glyphs<'a> {
@@ -685,12 +776,13 @@ impl<'a> Iterator for Glyphs<'a> {
         let rest = &self.text[self.at..];
         let base = rest.chars().next()?;
         let mut end = base.len_utf8();
-        let wide;
+        let mut wide = false;
+        let mut flags = Flags::empty();
         match &mut self.widths {
             Some(w) => {
                 let n = w.varint();
-                wide = n & 1 == 1;
-                for c in rest[end..].chars().take(n >> 1) {
+                flags = layout_flags(n & 7);
+                for c in rest[end..].chars().take(n >> 3) {
                     end += c.len_utf8();
                 }
             }
@@ -709,7 +801,7 @@ impl<'a> Iterator for Glyphs<'a> {
         }
         let zerowidth = &rest[base.len_utf8()..end];
         self.at += end;
-        Some(Glyph { base, zerowidth, wide })
+        Some(Glyph { base, zerowidth, wide, flags })
     }
 }
 
@@ -808,7 +900,12 @@ fn varint_into(buf: &mut [u8; 10], mut v: usize) -> usize {
 
 fn put_color(out: &mut Vec<u8>, c: Color) {
     match c {
-        Color::Named(n) => out.push(NAMED.iter().position(|m| *m == n).unwrap_or(16) as u8),
+        // The sixteen colours, then the others from Foreground (256) on, as in `NAMED`.
+        Color::Named(n) => out.push(match n as usize {
+            i @ 0..16 => i as u8,
+            i @ 256..269 => (i - 240) as u8,
+            _ => 16,
+        }),
         Color::Indexed(i) => out.extend_from_slice(&[INDEXED, i]),
         Color::Spec(Rgb { r, g, b }) => out.extend_from_slice(&[SPEC, r, g, b]),
     }
@@ -821,7 +918,7 @@ fn push_char(out: &mut Vec<u8>, c: char) {
 #[cfg(test)]
 mod tests {
     use alacritty_terminal::grid::Dimensions;
-    use alacritty_terminal::index::{Column, Line as GridLine};
+    use alacritty_terminal::index::Line as GridLine;
     use alacritty_terminal::term::{Config as TermConfig, Term};
     use alacritty_terminal::vte::ansi::Processor;
 
@@ -857,7 +954,7 @@ mod tests {
         let mut h = History::default();
         for rows in logical(t) {
             let rows: Vec<&[Cell]> = rows.iter().map(|r| &r[..]).collect();
-            h.push(&rows, false);
+            h.push(&rows, false, usize::MAX);
         }
         h
     }
@@ -912,7 +1009,7 @@ mod tests {
     fn a_line_is_kept_in_a_few_bytes() {
         let t = term(200, 3, 0, b"\x1b[32mINFO\x1b[0m request served in 12 ms");
         let mut h = History::default();
-        h.push(&[&t.grid()[GridLine(0)][..]], false);
+        h.push(&[&t.grid()[GridLine(0)][..]], false, usize::MAX);
         let line = h.newest().unwrap();
         assert_eq!(line.text(), "INFO request served in 12 ms");
         // Header, text and two runs, against 200 cells of 24 bytes.
@@ -926,17 +1023,52 @@ mod tests {
         let t = term(10, 1, 0, b"x");
         let row = &t.grid()[GridLine(0)][..];
         for _ in 0..20_000 {
-            h.push(&[row], false);
+            h.push(&[row], false, usize::MAX);
         }
         assert_eq!((h.len(), h.rows()), (20_000, 20_000));
         assert!(h.blocks.len() > 1);
-        h.trim(1000);
+        h.trim(1000, true);
         assert_eq!((h.len(), h.rows()), (1000, 1000));
         for _ in 0..1000 {
             assert_eq!(h.newest().unwrap().text(), "x");
             h.drop_newest();
         }
         assert!(h.is_empty() && h.blocks.is_empty());
+    }
+
+    /// What adding a line costs: `cargo test --release -- --ignored --nocapture push_cost`.
+    #[test]
+    #[ignore]
+    fn push_cost() {
+        // As the compare harness writes its coloured file: a colour every word.
+        let mut colourful = String::new();
+        for i in 0..50u32 {
+            colourful.push_str(&match i % 5 {
+                0 => format!("\x1b[38;5;{}m", i * 5),
+                1 => format!("\x1b[38;2;{};{};{}m", i, i * 2, i * 3),
+                2 => format!("\x1b[1;3{}m", i % 8),
+                3 => "\x1b[0m".to_string(),
+                _ => format!("\x1b[48;5;{}m", 232 + i % 24),
+            });
+            colourful.push_str(["error ", "Compiling ", "fn ", "αβγ ", "Ok(()) "][i as usize % 5]);
+        }
+        let lines: [&[u8]; 3] =
+            [b"1234567", b"\x1b[2m00:00:01.037\x1b[0m \x1b[32mINFO\x1b[0m  p00 req=000001 ok", colourful.as_bytes()];
+        for bytes in lines {
+            let t = term(169, 4, 0, bytes);
+            let wrapped = t.grid()[GridLine(0)][alacritty_terminal::index::Column(168)].flags.contains(Flags::WRAPLINE);
+            let rows: Vec<&[Cell]> = (0..if wrapped { 3 } else { 1 }).map(|l| &t.grid()[GridLine(l)][..]).collect();
+            let extent = rows.last().unwrap().iter().rposition(|c| c.c != ' ').map_or(0, |i| i + 2);
+            let mut h = History::default();
+            let start = std::time::Instant::now();
+            for _ in 0..200_000 {
+                h.push(&rows, false, extent);
+                if h.len() > 10_000 {
+                    h.trim(5_000, false);
+                }
+            }
+            eprintln!("{} rows: {:?} per line", rows.len(), start.elapsed() / 200_000);
+        }
     }
 
     #[test]
@@ -958,7 +1090,7 @@ mod tests {
         let mut row = vec![Cell { c: 'a', ..Cell::default() }, odd, spacer, Cell { c: 'b', ..Cell::default() }];
         row.resize(6, Cell::default());
         let mut h = History::default();
-        h.push(&[&row], false);
+        h.push(&[&row], false, usize::MAX);
         let mut back = Vec::new();
         h.newest().unwrap().decode(6, &mut back);
         assert_eq!(back[0][..], row[..]);

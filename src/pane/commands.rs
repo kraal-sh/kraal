@@ -164,6 +164,7 @@ impl TermPane {
                     if let Some(reply) = t.graphics.handle(image, &mut t.term) {
                         t.write(reply);
                     }
+                    t.archive.forget_extents(t.term.screen_lines(), t.term.grid().history_size());
                 }),
             }
         }

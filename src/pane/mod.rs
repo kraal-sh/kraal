@@ -489,6 +489,15 @@ impl Pane {
         signals
     }
 
+    /// The pane printed nothing for a while: what a flood of output left in the emulator's
+    /// history goes to the compact archive. Whether memory was freed.
+    pub fn rest(&mut self) -> bool {
+        match &mut self.content {
+            Content::Term(t) => t.rest(),
+            _ => false,
+        }
+    }
+
     /// Tell the program the pane's size in pixels again: the outer terminal's cells changed.
     pub fn refresh_pixel_size(&mut self) {
         if let Content::Term(t) = &mut self.content {
@@ -732,6 +741,17 @@ impl Pane {
     pub fn foreground_pid(&self) -> Option<u32> {
         let t = self.term()?;
         t.master.process_group_leader().map(|p| p as u32)
+    }
+}
+
+/// Give the memory the allocator holds free back to the system, after panes freed much of it
+/// (see [`Pane::rest`]): it keeps what was freed otherwise, in pieces of rows too small for it to
+/// give back on its own.
+pub fn release_memory() {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    // SAFETY: malloc_trim only returns free memory of the allocator to the system.
+    unsafe {
+        libc::malloc_trim(0);
     }
 }
 
