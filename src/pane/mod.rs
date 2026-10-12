@@ -1305,6 +1305,18 @@ mod tests {
         assert_eq!((point.line.0, point.column.0), (2, 9));
     }
 
+    /// A wide character at the start of a line, its first half deleted (`CSI P`): what is left
+    /// of it is no half of a character any more, and the cursor on it draws.
+    #[test]
+    fn half_a_wide_character_deleted_leaves_a_blank() {
+        let mut pane = fed_pane(10, 3, 100);
+        pane.feed("日本\r\x1b[P".as_bytes());
+        let mut buf = Buffer::empty(Rect::new(0, 0, 10, 3));
+        pane.render(Rect::new(0, 0, 10, 3), &mut buf, &mut crate::ansi::Links::new());
+        assert!(pane.cursor(Rect::new(0, 0, 10, 3)).is_some());
+        assert_eq!(pane.text(None).lines().next(), Some(" 本"));
+    }
+
     #[test]
     fn shells_are_told_from_other_programs() {
         for shell in ["zsh", "-zsh", "/bin/bash", "/usr/bin/fish", "sh"] {

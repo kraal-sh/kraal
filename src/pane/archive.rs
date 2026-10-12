@@ -1107,6 +1107,19 @@ impl<T: EventListener> Handler for Feed<'_, T> {
         self.term.set_private_mode(mode);
     }
 
+    fn delete_chars(&mut self, count: usize) {
+        self.term.delete_chars(count);
+        // The second half of a wide character whose first half went is half of nothing: a blank.
+        // alacritty 0.26 keeps it, and reads the cell before it for a cursor on it, before the
+        // row's start at its first column.
+        let cursor = self.term.grid().cursor.point;
+        let cell = &mut self.term.grid_mut()[cursor];
+        if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
+            cell.flags.remove(Flags::WIDE_CHAR_SPACER);
+            cell.c = ' ';
+        }
+    }
+
     #[inline]
     fn input(&mut self, c: char) {
         // A character pushes a row only when it wraps: after the last column was written, or a
@@ -1132,7 +1145,6 @@ impl<T: EventListener> Handler for Feed<'_, T> {
         set_scrolling_region(top: usize, bottom: Option<usize>);
         scroll_down(rows: usize);
         insert_blank_lines(rows: usize);
-        delete_chars(count: usize);
         reverse_index();
         unset_private_mode(mode: PrivateMode);
         decaln();
