@@ -4,6 +4,12 @@ use std::io::Write;
 use std::path::Path;
 use std::process::{Command, Stdio};
 
+/// How long a test waits for what programs it started are to do before it fails. Far longer
+/// than it takes: on a machine busy with other work (a CI runner, other tests beside), starting
+/// a program or ending one takes seconds, and a wait that ends when its condition holds costs
+/// nothing when it does.
+pub const PATIENCE: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// Write an executable script at `path`. A child process writes it: a file this process held
 /// open for writing could be inherited by a program another test starts at that moment, and
 /// running the script would then fail with "text file busy".

@@ -533,7 +533,7 @@ mod tests {
         let mut child = own_group(&mut sh(&script)).stdin(Stdio::null()).spawn().unwrap();
         let start = Instant::now();
         while std::fs::read_to_string(&pidfile).map_or(true, |s| s.trim().is_empty())
-            && start.elapsed() < Duration::from_secs(5)
+            && start.elapsed() < crate::testing::PATIENCE
         {
             std::thread::sleep(Duration::from_millis(10));
         }
@@ -541,7 +541,7 @@ mod tests {
         assert!(crate::process::running(escaped), "the escaped sleep runs");
         kill_tree(&mut child);
         let start = Instant::now();
-        while crate::process::running(escaped) && start.elapsed() < Duration::from_secs(5) {
+        while crate::process::running(escaped) && start.elapsed() < crate::testing::PATIENCE {
             std::thread::sleep(Duration::from_millis(10));
         }
         assert!(!crate::process::running(escaped), "what left the session went too");
@@ -565,7 +565,7 @@ mod tests {
         child.wait().unwrap();
         let start = Instant::now();
         while std::fs::read_to_string(&pidfile).map_or(true, |s| s.trim().is_empty())
-            && start.elapsed() < Duration::from_secs(5)
+            && start.elapsed() < crate::testing::PATIENCE
         {
             std::thread::sleep(Duration::from_millis(10));
         }
@@ -576,7 +576,7 @@ mod tests {
         assert!(crate::process::running(daemon), "out of reach of the tree");
         kill_tagged(&tag);
         let start = Instant::now();
-        while crate::process::running(daemon) && start.elapsed() < Duration::from_secs(5) {
+        while crate::process::running(daemon) && start.elapsed() < crate::testing::PATIENCE {
             std::thread::sleep(Duration::from_millis(10));
         }
         assert!(!crate::process::running(daemon), "found by its tag");
@@ -595,7 +595,7 @@ mod tests {
         assert!(group_alive(&child), "the background sleep is still in the group");
         kill_group(&mut child);
         let start = Instant::now();
-        while group_alive(&child) && start.elapsed() < Duration::from_secs(5) {
+        while group_alive(&child) && start.elapsed() < crate::testing::PATIENCE {
             std::thread::sleep(Duration::from_millis(10));
         }
         assert!(!group_alive(&child));
@@ -610,14 +610,14 @@ mod tests {
         let keep = lines.clone();
         read_lines_until(child.stdout.take().unwrap(), stop.clone(), move |l| keep.lock().unwrap().push(l.into()));
         let start = Instant::now();
-        while lines.lock().unwrap().len() < 2 && start.elapsed() < Duration::from_secs(5) {
+        while lines.lock().unwrap().len() < 2 && start.elapsed() < crate::testing::PATIENCE {
             std::thread::sleep(Duration::from_millis(10));
         }
         assert_eq!(*lines.lock().unwrap(), vec!["first".to_string(), "debug1: second".into()]);
         stop.store(true, Ordering::SeqCst);
         // The reader (holding the other end of `lines`) ends while `sleep` still runs.
         let start = Instant::now();
-        while Arc::strong_count(&lines) > 1 && start.elapsed() < Duration::from_secs(5) {
+        while Arc::strong_count(&lines) > 1 && start.elapsed() < crate::testing::PATIENCE {
             std::thread::sleep(Duration::from_millis(10));
         }
         assert_eq!(Arc::strong_count(&lines), 1);
@@ -630,7 +630,7 @@ mod tests {
     fn an_ended_child_keeps_its_pid_until_reaped() {
         let mut child = own_group(&mut sh("exit 3")).stdin(Stdio::null()).spawn().unwrap();
         let start = Instant::now();
-        while !has_exited(&child) && start.elapsed() < Duration::from_secs(5) {
+        while !has_exited(&child) && start.elapsed() < crate::testing::PATIENCE {
             std::thread::sleep(Duration::from_millis(10));
         }
         assert!(has_exited(&child));
@@ -650,7 +650,7 @@ mod tests {
         let last = last_line(child.stderr.take().unwrap());
         child.wait().unwrap();
         let start = Instant::now();
-        while last.lock().unwrap().as_str() != "last words" && start.elapsed() < Duration::from_secs(5) {
+        while last.lock().unwrap().as_str() != "last words" && start.elapsed() < crate::testing::PATIENCE {
             std::thread::sleep(Duration::from_millis(10));
         }
         assert_eq!(last.lock().unwrap().as_str(), "last words");
@@ -658,7 +658,7 @@ mod tests {
 
     #[test]
     fn captures_and_reports() {
-        let out = run(&mut sh("echo out; echo err >&2; exit 3"), Duration::from_secs(5), 1024).unwrap();
+        let out = run(&mut sh("echo out; echo err >&2; exit 3"), crate::testing::PATIENCE, 1024).unwrap();
         assert_eq!((out.code, out.stdout_text().as_str(), out.stderr_text().as_str()), (Some(3), "out\n", "err\n"));
         assert!(!out.success() && !out.timed_out && !out.truncated);
     }
@@ -667,7 +667,7 @@ mod tests {
     fn big_output_neither_blocks_nor_grows() {
         // 1 MiB through a pipe whose buffer is 64 KiB: the child must not block on us.
         let start = Instant::now();
-        let out = run(&mut sh("head -c 1048576 /dev/zero"), Duration::from_secs(5), 1000).unwrap();
+        let out = run(&mut sh("head -c 1048576 /dev/zero"), crate::testing::PATIENCE, 1000).unwrap();
         assert!(out.success(), "{out:?}");
         assert_eq!(out.stdout.len(), 1000);
         assert!(out.truncated);
@@ -676,12 +676,14 @@ mod tests {
 
     #[test]
     fn a_descendant_holding_the_pipe_does_not_hold_us() {
-        // `sleep` keeps stdout open after `sh` exits, in its own session (out of our group).
+        // `sleep` keeps stdout open after `sh` exits, in its own session (out of our group), for
+        // 30 s: held by it, this would take that long, where a loaded machine takes a few
+        // seconds to start `sh`.
         let start = Instant::now();
-        let out = run(&mut sh("echo early; setsid sleep 5 & exit 0"), Duration::from_secs(5), 1024).unwrap();
+        let out = run(&mut sh("echo early; setsid sleep 30 & exit 0"), Duration::from_secs(30), 1024).unwrap();
         assert_eq!(out.stdout_text(), "early\n");
         assert!(out.success());
-        assert!(start.elapsed() < Duration::from_secs(2), "{:?}", start.elapsed());
+        assert!(start.elapsed() < Duration::from_secs(15), "{:?}", start.elapsed());
     }
 
     #[test]
@@ -694,10 +696,11 @@ mod tests {
     #[test]
     fn timeout_kills_the_whole_group() {
         let start = Instant::now();
-        // The background sleep keeps stdout open: killing only `sh` would leave us waiting.
+        // The background sleep keeps stdout open: killing only `sh` would leave us waiting for
+        // its 30 s, where a loaded machine takes a few seconds to start and stop them.
         let out = run(&mut sh("sleep 30 & sleep 30"), Duration::from_millis(200), 1024).unwrap();
         assert!(out.timed_out && out.code.is_none());
-        assert!(start.elapsed() < Duration::from_secs(2), "{:?}", start.elapsed());
+        assert!(start.elapsed() < Duration::from_secs(15), "{:?}", start.elapsed());
     }
 
     /// A process that runs as another user (as a program run through sudo does) is not gone
