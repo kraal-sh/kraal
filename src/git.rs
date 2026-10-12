@@ -239,7 +239,7 @@ pub fn main_checkout(cwd: &Path) -> Option<PathBuf> {
 /// main checkout, so rules written for a repository also apply to its worktrees. `cwd` itself
 /// when git could not tell in time (it is asked again next time).
 pub fn project_path(cwd: &Path) -> PathBuf {
-    if let Some(hit) = PROJECT_PATHS.lock().ok().and_then(|c| c.as_ref().and_then(|m| m.get(cwd).cloned())) {
+    if let Some(hit) = known_project_path(cwd) {
         return hit;
     }
     let Some(found) = find_project_path(cwd) else { return cwd.to_path_buf() };
@@ -250,15 +250,44 @@ pub fn project_path(cwd: &Path) -> PathBuf {
 }
 
 /// Answers of [`project_path`], remembered (worktrees do not move).
-static PROJECT_PATHS: std::sync::Mutex<Option<std::collections::HashMap<PathBuf, PathBuf>>> =
-    std::sync::Mutex::new(None);
+static PROJECT_PATHS: std::sync::Mutex<Option<ProjectPaths>> = std::sync::Mutex::new(None);
+
+/// The answers of [`project_path`] kept: the latest ones, for the directories of the panes of a
+/// server that runs for weeks, not every directory a shell ever went to. One forgotten is asked
+/// again (the git thread asks about the directories of panes as they come up).
+const PROJECT_PATHS_KEPT: usize = 1024;
+
+#[derive(Default)]
+struct ProjectPaths {
+    map: std::collections::HashMap<PathBuf, PathBuf>,
+    /// The directories in `map`, oldest first.
+    order: std::collections::VecDeque<PathBuf>,
+}
+
+impl ProjectPaths {
+    fn get(&self, cwd: &Path) -> Option<PathBuf> {
+        self.map.get(cwd).cloned()
+    }
+
+    fn insert(&mut self, cwd: PathBuf, found: PathBuf) {
+        if self.map.insert(cwd.clone(), found).is_some() {
+            return;
+        }
+        self.order.push_back(cwd);
+        while self.order.len() > PROJECT_PATHS_KEPT {
+            if let Some(oldest) = self.order.pop_front() {
+                self.map.remove(&oldest);
+            }
+        }
+    }
+}
 
 /// [`project_path`] without running git, for the server's event loop: what git said before
 /// (the git thread asks about the directories of panes). `None` when git was not asked yet, or
 /// could not tell: a worktree may live anywhere, whatever its directory's name says, so ask
 /// [`project_path`] off the loop first.
 pub fn known_project_path(cwd: &Path) -> Option<PathBuf> {
-    PROJECT_PATHS.lock().ok().and_then(|c| c.as_ref().and_then(|m| m.get(cwd).cloned()))
+    PROJECT_PATHS.lock().ok().and_then(|c| c.as_ref().and_then(|m| m.get(cwd)))
 }
 
 /// Where `cwd` is in its main checkout: `cwd` itself outside a repository or in the main
@@ -868,6 +897,23 @@ mod tests {
         let d = parse_status("# branch.oid 3f58e39c80027dcb\n# branch.head (detached)\n").unwrap();
         assert_eq!((d.branch.as_str(), d.dirty), ("3f58e39", false));
         assert!(parse_status("").is_none());
+    }
+
+    #[test]
+    fn only_the_latest_project_paths_are_remembered() {
+        let mut paths = ProjectPaths::default();
+        let dir = |i: usize| PathBuf::from(format!("/x/{i}"));
+        // A shell that went through many directories over the weeks.
+        for i in 0..PROJECT_PATHS_KEPT + 10 {
+            paths.insert(dir(i), dir(i));
+        }
+        assert_eq!((paths.map.len(), paths.order.len()), (PROJECT_PATHS_KEPT, PROJECT_PATHS_KEPT));
+        assert_eq!(paths.get(&dir(9)), None, "the oldest went");
+        assert_eq!(paths.get(&dir(10)), Some(dir(10)));
+        assert_eq!(paths.get(&dir(PROJECT_PATHS_KEPT + 9)), Some(dir(PROJECT_PATHS_KEPT + 9)));
+        // Told again, a directory is counted once.
+        paths.insert(dir(10), dir(10));
+        assert_eq!((paths.map.len(), paths.order.len()), (PROJECT_PATHS_KEPT, PROJECT_PATHS_KEPT));
     }
 
     #[test]
