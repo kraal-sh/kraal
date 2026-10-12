@@ -174,7 +174,7 @@ pub enum Cmd {
         #[command(subcommand)]
         action: RunbookCmd,
     },
-    /// Print what happens in the session as JSON lines: `kraal events agent.* pane.failed`.
+    /// Print what happens in the session as JSON lines: `kraal events 'agent.*' pane.failed`.
     Events {
         /// Event types to follow (`pane.exited`, or a prefix like `agent.*`); all by default.
         types: Vec<String>,
@@ -255,8 +255,8 @@ pub enum Cmd {
         #[command(subcommand)]
         action: Option<ServersCmd>,
     },
-    /// Connect to a server by name: plain ssh here, or a new pane with --right/--down/--tab/
-    /// --floating, or every server of a group in a grid with --group.
+    /// Connect to a server by name: plain ssh here, or a new pane with
+    /// --right/--down/--tab/--floating, or every server of a group in a grid with --group.
     Ssh {
         target: String,
         /// Open the whole group TARGET in a grid.
@@ -279,8 +279,8 @@ pub enum Cmd {
         #[command(subcommand)]
         action: Option<AccountsCmd>,
     },
-    /// Start an agent on the right account: in a new pane inside kraal (with --right/--down/--tab/
-    /// --floating, or by default), else right here.
+    /// Start an agent on the right account: in a new pane inside kraal (with
+    /// --right/--down/--tab/--floating, or by default), else right here.
     Agent {
         /// claude or codex.
         agent: String,

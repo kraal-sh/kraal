@@ -209,12 +209,12 @@ read_only = true
 [hints]
 # ctrl+b o labels what can be acted on in the focused pane: links, paths (with :line),
 # commits, addresses, IPs and known servers, Kubernetes pods, UUIDs. Type a label to copy it;
-# type it with Shift to act where the pane is: open a link (a port on the pane's server gets a
+# press Tab first to act where the pane is: open a link (a port on the pane's server gets a
 # tunnel), edit a file at its line, `git show` a commit (or follow a container's logs), ssh to a
 # server, follow a pod's logs, type a UUID.
 # Letters labels are made of, easiest first.
 alphabet = "asdfqwerzxcvjklmiuopghtybn"
-# Patterns of your own; Shift+label runs `tool` with the match in $KRAAL_SELECTION:
+# Patterns of your own; Tab then the label runs `tool` with the match in $KRAAL_SELECTION:
 #   [hints.patterns.ticket]
 #   pattern = 'OPS-\d+'
 #   tool = "jira"
@@ -223,10 +223,10 @@ alphabet = "asdfqwerzxcvjklmiuopghtybn"
 # Run a shell command when something happens. Keys are event types (`kraal events --list`), or a
 # prefix with ".*" ("agent.*"). The command gets $KRAAL_EVENT, $KRAAL_EVENT_JSON and the event's
 # fields as $KRAAL_<FIELD> ($KRAAL_PANE, $KRAAL_NAME, $KRAAL_SERVER, $KRAAL_CODE…), and can call
-# kraal (`kraal read $KRAAL_PANE`). Its output goes to ~/.local/state/kraal/hooks.log.
+# kraal (`kraal read -p $KRAAL_PANE`). Its output goes to ~/.local/state/kraal/hooks.log.
 #   "agent.blocked" = 'notify-send "$KRAAL_AGENT needs you" "$KRAAL_NAME"'
 #   "pane.failed" = 'curl -s -d "$KRAAL_NAME failed ($KRAAL_CODE)" ntfy.sh/my-topic'
-#   "ssh.connected" = 'logger -t kraal "ssh $KRAAL_HOST production=$KRAAL_PRODUCTION"'
+#   "ssh.started" = 'logger -t kraal "ssh $KRAAL_HOST production=$KRAAL_PRODUCTION"'
 
 [keys]
 # "kraal": after the prefix, a theme's letter runs its main action and the same letter in
@@ -444,6 +444,16 @@ mod tests {
         // Paste buffers stay in memory unless asked.
         assert!(!cfg.buffers.persist);
         assert_eq!((cfg.buffers.limit, cfg.buffers.max_bytes()), (50, 32 << 20));
+    }
+
+    /// The hooks the default configuration shows, commented out, run once their `#` is gone.
+    #[test]
+    fn the_hooks_shown_as_examples_name_events() {
+        let examples: Vec<&str> = DEFAULT_CONFIG.lines().filter_map(|line| line.strip_prefix("#   ")).collect();
+        let hooks: String =
+            examples.iter().filter(|line| line.starts_with('"')).map(|line| format!("{line}\n")).collect();
+        let (hooks, warnings) = crate::server::events::read_hooks(&hooks.parse().unwrap());
+        assert!(!hooks.is_empty() && warnings.is_empty(), "{warnings:?}");
     }
 
     #[test]
