@@ -159,8 +159,7 @@ pub struct MdSession {
 pub(super) const PLAN_LIFETIME: Duration = Duration::from_secs(600);
 
 pub(super) fn first_line(code: &str) -> String {
-    let first: String = code.lines().next().unwrap_or("").trim().chars().take(80).collect();
-    if code.trim().lines().count() > 1 { format!("{first} …") } else { first }
+    crate::text::first_line(code, 80)
 }
 
 /// Output lines of a `choices_command`, run where local steps would run.

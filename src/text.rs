@@ -82,6 +82,12 @@ pub fn truncate_start(text: &str, width: usize) -> String {
     kept.into_iter().rev().collect()
 }
 
+/// The first line of `text`, cut to `width` columns, then ` …` when more lines follow.
+pub fn first_line(text: &str, width: usize) -> String {
+    let first = truncate(text.lines().next().unwrap_or("").trim(), width);
+    if text.trim().lines().count() > 1 { format!("{first} …") } else { first }
+}
+
 /// Right-aligns `text` in `width` columns.
 pub fn pad_start(text: &str, width: usize) -> String {
     let text = truncate(text, width);
@@ -183,5 +189,14 @@ mod tests {
         let wall = 1_709_168_399;
         let offset = local_tm(wall).map_or(0, |tm| tm.tm_gmtoff);
         assert_eq!(local_minutes(wall - offset), "2024-02-29 00:59");
+    }
+
+    #[test]
+    fn a_first_line_is_cut_to_columns() {
+        assert_eq!(first_line("  make  ", 80), "make");
+        assert_eq!(first_line("make\nmake install\n", 80), "make …");
+        let wide = "漢字".repeat(10);
+        assert_eq!(first_line(&wide, 7), "漢字漢…");
+        assert_eq!(first_line(&format!("{wide}\nmore"), 7), "漢字漢… …");
     }
 }

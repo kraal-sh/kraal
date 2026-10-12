@@ -371,11 +371,9 @@ pub fn script(steps: &[String], stop_on_failure: bool) -> String {
     let steps: Vec<&String> = steps.iter().filter(|s| !s.trim().is_empty()).collect();
     let n = steps.len();
     let header = |i: usize, step: &str| {
-        let first: String = step.lines().next().unwrap_or("").trim().chars().take(100).collect();
-        let more = if step.trim().lines().count() > 1 { " …" } else { "" };
         format!(
             "__kraal_step={i}\nprintf '\\n\\033[1;36m▶ %s/%s\\033[0m %s\\n' {i} {n} {}\n",
-            shell::quote(&format!("{first}{more}"))
+            shell::quote(&crate::text::first_line(step, 100))
         )
     };
     const FAILED: &str = "printf '\\n\\033[1;31m✗ step %s failed (exit %s)\\033[0m\\n'";

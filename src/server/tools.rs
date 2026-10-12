@@ -38,11 +38,7 @@ impl Server {
         // Tools that can run first.
         items.sort_by_key(|i| i.dim);
         let prod = ctx.production.as_ref().map(|why| format!("PRODUCTION ({why}) · ")).unwrap_or_default();
-        let mut place = ctx.place();
-        if place.chars().count() > 40 {
-            let tail: String = place.chars().rev().take(39).collect::<Vec<_>>().into_iter().rev().collect();
-            place = format!("…{tail}");
-        }
+        let place = crate::text::truncate_start(&ctx.place(), 40);
         Picker::new(PickerKind::Tool, &format!("Tools · {prod}{place}"), items)
     }
 
