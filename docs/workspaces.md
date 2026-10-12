@@ -90,7 +90,16 @@ layout {
 }
 ```
 
-`ctrl+b W s` or `kraal save <name>` writes the layout back as a file (`<name>.kdl` in the
-definitions directory; the file it replaces is kept as `.kdl.bak`), stacks included. An agent
-started on an account is saved as `agent="claude:pro"` with its arguments, and a command that has
-not run yet keeps `start_suspended=true`.
+`ctrl+b W s` or `kraal save` writes the layout back to the workspace's file, stacks included. A
+workspace that has none yet gets one in the definitions directory: `<its name>.kdl`, or the name
+given (`kraal save <name>`). For a workspace that has one, another name writes a copy there. The
+file it replaces is kept as `.kdl.bak`. An agent started on an account is saved as
+`agent="claude:pro"` with its arguments, and a command that has not run yet keeps
+`start_suspended=true`.
+
+An open workspace stays linked to its file, across restarts too: the sidebar and
+`kraal workspaces` list it once, and `kraal open` with the name of its file switches to it.
+Renaming the workspace (`ctrl+b W e`) renames its file: `perso.kdl` becomes `infra - perso.kdl`
+beside it. The new name must then be a file name (no `/`, not starting with `.`), and a file
+already there is never replaced: the rename is refused and nothing changes. A file renamed on disk
+while its workspace is open stays linked; one deleted is written again by the next save.

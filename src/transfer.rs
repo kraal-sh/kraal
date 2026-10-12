@@ -1114,7 +1114,7 @@ fn install_here(i: &Install) -> Result<()> {
     };
     let mut waiting = false;
     for (from, to) in items {
-        match rename_no_replace(&from, &to) {
+        match crate::paths::rename_no_replace(&from, &to) {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => waiting = true,
             Err(e) => {
@@ -1624,7 +1624,7 @@ pub fn rename_local(sources: &[Endpoint], dest: &Endpoint, opts: &Options) -> Re
             left.push(s.clone());
             continue;
         }
-        let renamed = if replace { std::fs::rename(p, &target) } else { rename_no_replace(p, &target) };
+        let renamed = if replace { std::fs::rename(p, &target) } else { crate::paths::rename_no_replace(p, &target) };
         match renamed {
             Ok(()) => eprintln!("moved {} → {}", p.display(), target.display()),
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
@@ -1638,38 +1638,6 @@ pub fn rename_local(sources: &[Endpoint], dest: &Endpoint, opts: &Options) -> Re
         }
     }
     Ok(left)
-}
-
-/// rename(2) that fails with `AlreadyExists` instead of replacing `to`.
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-fn rename_no_replace(from: &Path, to: &Path) -> std::io::Result<()> {
-    use std::ffi::CString;
-    use std::os::unix::ffi::OsStrExt;
-    let from = CString::new(from.as_os_str().as_bytes())?;
-    let to = CString::new(to.as_os_str().as_bytes())?;
-    // The system call itself: musl has no renameat2 wrapper.
-    // SAFETY: two NUL-terminated paths that live through the call.
-    #[cfg(target_os = "linux")]
-    let rc = unsafe {
-        libc::syscall(
-            libc::SYS_renameat2,
-            libc::AT_FDCWD,
-            from.as_ptr(),
-            libc::AT_FDCWD,
-            to.as_ptr(),
-            libc::RENAME_NOREPLACE,
-        )
-    };
-    // SAFETY: as above.
-    #[cfg(target_os = "macos")]
-    let rc = unsafe { libc::renamex_np(from.as_ptr(), to.as_ptr(), libc::RENAME_EXCL) };
-    if rc == 0 { Ok(()) } else { Err(std::io::Error::last_os_error()) }
-}
-
-/// Without a rename that refuses to replace, the copy does the move.
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn rename_no_replace(_from: &Path, _to: &Path) -> std::io::Result<()> {
-    Err(std::io::Error::from_raw_os_error(libc::ENOSYS))
 }
 
 /// After a move by rsync, which deletes the files it copied: remove the source directories left

@@ -313,7 +313,7 @@ impl Server {
                 return Mode::Prompt(Prompt::new("Preview file (path)", "", PromptAction::OpenPreview));
             }
             Action::SaveWorkspace => {
-                let name = crate::workspace::file_name_from(&self.workspaces[wi].name);
+                let name = self.definition_file_name(wi);
                 return Mode::Prompt(Prompt::new("Save workspace layout as", &name, PromptAction::SaveWorkspace(ws)));
             }
             Action::Upload | Action::Download => {

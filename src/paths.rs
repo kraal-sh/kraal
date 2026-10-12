@@ -297,6 +297,38 @@ pub fn write_atomic(path: &Path, data: &[u8]) -> std::io::Result<()> {
     write_with_mode(&target, data, mode)
 }
 
+/// The device and inode of the entry at `path` (a link's own, not its target's), which a rename
+/// keeps.
+pub fn file_id(path: &Path) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::symlink_metadata(path).ok().map(|m| (m.dev(), m.ino()))
+}
+
+/// rename(2) that fails with `AlreadyExists` instead of replacing `to`.
+pub fn rename_no_replace(from: &Path, to: &Path) -> std::io::Result<()> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    let from = CString::new(from.as_os_str().as_bytes())?;
+    let to = CString::new(to.as_os_str().as_bytes())?;
+    // The system call itself: musl has no renameat2 wrapper.
+    // SAFETY: two NUL-terminated paths that live through the call.
+    #[cfg(target_os = "linux")]
+    let rc = unsafe {
+        libc::syscall(
+            libc::SYS_renameat2,
+            libc::AT_FDCWD,
+            from.as_ptr(),
+            libc::AT_FDCWD,
+            to.as_ptr(),
+            libc::RENAME_NOREPLACE,
+        )
+    };
+    // SAFETY: as above.
+    #[cfg(target_os = "macos")]
+    let rc = unsafe { libc::renamex_np(from.as_ptr(), to.as_ptr(), libc::RENAME_EXCL) };
+    if rc == 0 { Ok(()) } else { Err(std::io::Error::last_os_error()) }
+}
+
 /// Open `path` for appending, creating it private (0600): a log can hold secrets (a command, what
 /// it printed). A link in its place is refused, and a file an older kraal made readable by
 /// others is made private.

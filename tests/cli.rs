@@ -879,6 +879,152 @@ fn save_writes_a_definition_that_reopens() {
     assert!(!env.root.join("config/kraal/escape.kdl").exists());
 }
 
+/// `kraal workspaces --json`, a line each: name, file, and whether it is open.
+fn listed_workspaces(env: &Env) -> Vec<String> {
+    let list: serde_json::Value = serde_json::from_str(&env.run(&["workspaces", "--json"])).unwrap();
+    let line = |w: &serde_json::Value| {
+        let file = w["definition"].as_str().and_then(|p| Path::new(p).file_name()).unwrap_or_default();
+        let open = if w["open"] == true { " (open)" } else { "" };
+        format!("{}: {}{open}", w["name"].as_str().unwrap(), file.to_string_lossy())
+    };
+    list.as_array().unwrap().iter().map(line).collect()
+}
+
+/// The names in `dir`, sorted.
+fn names_in(dir: &Path) -> Vec<String> {
+    let mut names: Vec<String> =
+        std::fs::read_dir(dir).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+    names.sort();
+    names
+}
+
+/// The rows naming the definitions the sidebar lists as not running, once the screen settles.
+fn not_running(client: &RawClient) -> Vec<String> {
+    client.settle();
+    client.rows().windows(2).filter(|w| w[1].contains("not running")).map(|w| w[0].clone()).collect()
+}
+
+/// The case reported: a workspace opened from `perso.kdl` and renamed with a prefix in the menu
+/// takes its file along, and is listed once, in the sidebar and by `kraal workspaces`, after a
+/// restart too. Saving its layout writes that file.
+#[test]
+fn a_renamed_workspace_takes_its_file_along() {
+    let env = Env::new("wsrename");
+    let dir = env.root.join("config/kraal/workspaces");
+    env.workspace("perso", "layout {\n    pane name=\"shell\"\n}\n");
+    env.workspace("work", "layout {\n    pane name=\"other\"\n}\n");
+    env.run(&["open", "perso"]);
+    let mut client = RawClient::attach(&env, "perso");
+    client.wait_for_message("\"attached\"");
+    client.wait_for_row("not running");
+    client.send(b"\x02We");
+    client.wait_for_row("Rename workspace");
+    // Home, then the prefix.
+    client.send(b"\x1b[Hinfra - \r");
+    client.wait_for_row("renamed perso.kdl to infra - perso.kdl");
+    assert_eq!(names_in(&dir), ["infra - perso.kdl", "work.kdl"]);
+    let shown = not_running(&client);
+    assert!(shown.len() == 1 && shown[0].contains("work"), "{shown:?}");
+    assert_eq!(listed_workspaces(&env), ["infra - perso: infra - perso.kdl (open)", "work: work.kdl"]);
+    let text = env.run(&["workspaces"]);
+    assert!(!text.lines().any(|l| l.starts_with("perso ")), "{text}");
+    // Saved from the menu under the name it proposes: to its file.
+    client.send(b"\x02Ws");
+    client.wait_for_row("Save workspace layout as");
+    client.send(b"\r");
+    client.wait_for_row("saved ");
+    assert_eq!(names_in(&dir), ["infra - perso.kdl", "infra - perso.kdl.bak", "work.kdl"]);
+    // Restored after a restart, still linked to its file.
+    env.run(&["kill"]);
+    env.run(&["open", "infra - perso"]);
+    assert_eq!(listed_workspaces(&env), ["infra - perso: infra - perso.kdl (open)", "work: work.kdl"]);
+    assert_eq!(env.run(&["panes"]).lines().count(), 1);
+}
+
+/// A rename never replaces a file: a name whose file exists, or that cannot name a file, is
+/// refused with why, and nothing changes. A workspace without a file takes any name.
+#[test]
+fn a_workspace_rename_never_replaces_a_file() {
+    let env = Env::new("wsrenameexists");
+    let dir = env.root.join("config/kraal/workspaces");
+    env.workspace("a", "layout {\n    pane name=\"one\"\n}\n");
+    env.workspace("b", "layout {\n    pane name=\"two\"\n}\n");
+    env.run(&["open", "a"]);
+    let mut client = RawClient::attach(&env, "a");
+    client.wait_for_message("\"attached\"");
+    client.send(b"\x02We");
+    client.wait_for_row("Rename workspace");
+    client.send(b"\x7fb\r");
+    client.wait_for_row("b.kdl exists: nothing was renamed.");
+    client.send(b"\x7fx/y\r");
+    client.wait_for_row("a workspace file name is one plain name");
+    client.send(b"\x1b");
+    client.wait_for_rows("the prompt closed", |rows| !rows.iter().any(|r| r.contains("Rename workspace")));
+    assert_eq!(names_in(&dir), ["a.kdl", "b.kdl"]);
+    assert_eq!(std::fs::read_to_string(dir.join("b.kdl")).unwrap(), "layout {\n    pane name=\"two\"\n}\n");
+    client.send(b"\x02Wn");
+    client.wait_for_row("New workspace");
+    client.send(b"scratch\r");
+    client.send(b"\x02We");
+    client.wait_for_row("Rename workspace");
+    client.send(b"/x\r");
+    wait_until(Duration::from_secs(10), "never renamed", || {
+        listed_workspaces(&env) == ["a: a.kdl (open)", "scratch/x:  (open)", "b: b.kdl"]
+    });
+    assert_eq!(names_in(&dir), ["a.kdl", "b.kdl"]);
+}
+
+/// A session where a workspace was renamed without its file, by an older kraal, keeps it linked
+/// to that file: listed once, opened by the file's name, saved to it. Renamed again in the menu,
+/// the file follows.
+#[test]
+fn a_workspace_renamed_without_its_file_is_still_that_files() {
+    let env = Env::new("wslegacy");
+    let dir = env.root.join("config/kraal/workspaces");
+    env.workspace("perso", "layout {\n    pane name=\"shell\"\n}\n");
+    env.workspace("work", "layout {\n    pane name=\"other\"\n}\n");
+    env.run(&["open", "perso"]);
+    env.run(&["kill"]);
+    let state = std::fs::read_to_string(env.state_file()).unwrap();
+    assert_eq!(state.matches("\"name\": \"perso\"").count(), 1, "{state}");
+    std::fs::write(env.state_file(), state.replace("\"name\": \"perso\"", "\"name\": \"infra - perso\"")).unwrap();
+    // The old name switches to it rather than starting it again.
+    env.run(&["open", "perso"]);
+    assert_eq!(listed_workspaces(&env), ["infra - perso: perso.kdl (open)", "work: work.kdl"]);
+    assert_eq!(env.run(&["panes"]).lines().count(), 1);
+    let mut client = RawClient::attach(&env, "perso");
+    client.wait_for_message("\"attached\"");
+    let shown = not_running(&client);
+    assert!(shown.len() == 1 && shown[0].contains("work"), "{shown:?}");
+    let saved = env.run(&["save", "--workspace", "infra - perso"]);
+    assert!(saved.trim_end().ends_with("/perso.kdl"), "{saved}");
+    assert_eq!(names_in(&dir), ["perso.kdl", "perso.kdl.bak", "work.kdl"]);
+    client.send(b"\x02We");
+    client.wait_for_row("Rename workspace");
+    client.send(b"\r");
+    client.wait_for_row("renamed perso.kdl to infra - perso.kdl");
+    assert_eq!(names_in(&dir), ["infra - perso.kdl", "perso.kdl.bak", "work.kdl"]);
+}
+
+/// A definition renamed on disk while its workspace is open stays linked to it, and its new name
+/// switches to the workspace. Deleted, it is written again by the next save.
+#[test]
+fn a_definition_renamed_on_disk_stays_linked() {
+    let env = Env::new("wsmoved");
+    let dir = env.root.join("config/kraal/workspaces");
+    env.workspace("perso", "layout {\n    pane name=\"shell\"\n}\n");
+    env.run(&["open", "perso"]);
+    std::fs::rename(dir.join("perso.kdl"), dir.join("moved.kdl")).unwrap();
+    wait_until(Duration::from_secs(10), "the renamed file is never found", || {
+        listed_workspaces(&env) == ["perso: moved.kdl (open)"]
+    });
+    env.run(&["open", "moved"]);
+    assert_eq!(env.run(&["panes"]).lines().count(), 1);
+    std::fs::remove_file(dir.join("moved.kdl")).unwrap();
+    env.run(&["save", "--workspace", "perso"]);
+    assert_eq!(names_in(&dir), ["moved.kdl"]);
+}
+
 /// Panes stacked from the keys share one place and keep one size; the one the focus reaches
 /// opens (a key, a click on its row); a pane comes out again; one key goes through the layouts;
 /// stacks and the layout chosen survive a restart, and a saved workspace keeps its stacks.

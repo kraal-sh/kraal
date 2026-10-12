@@ -1,6 +1,7 @@
 //! Workspace definitions (`.kdl` files): finding, opening and saving them.
 
-use std::path::PathBuf;
+use std::io::ErrorKind;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use anyhow::{Context, Result};
@@ -20,14 +21,37 @@ impl Server {
         dirs.push(paths::config_dir());
         dirs.push(paths::state_dir().join("usage"));
         self.dirwatch.watch_config(&dirs);
-        let defs: Vec<WorkspaceDef> = self.definitions().into_iter().filter_map(|(_, d)| d.ok()).collect();
-        let names: Vec<String> = defs.iter().map(|d| d.name.clone()).collect();
-        if names != self.def_names {
-            self.def_names = names;
+        let listed = self.definitions();
+        self.follow_definitions(&listed);
+        let files: Vec<(PathBuf, String)> =
+            listed.iter().filter_map(|(p, d)| Some((p.clone(), d.as_ref().ok()?.name.clone()))).collect();
+        if files != self.def_files {
+            self.def_files = files;
             self.mark_dirty();
         }
+        let defs: Vec<WorkspaceDef> = listed.into_iter().filter_map(|(_, d)| d.ok()).collect();
         self.refresh_known(&defs);
         self.reload_accounts();
+    }
+
+    /// Keep each open workspace linked to its definition file: a file renamed on disk is found
+    /// again by its inode. A file that is gone keeps its path, where saving the layout writes it
+    /// again (an editor may be replacing it), but not its inode, which a new file may take.
+    fn follow_definitions(&mut self, listed: &[(PathBuf, Result<WorkspaceDef>)]) {
+        for wi in 0..self.workspaces.len() {
+            let ws = &mut self.workspaces[wi];
+            let Some(path) = &ws.definition else { continue };
+            if let Some(seen) = paths::file_id(path) {
+                ws.definition_inode = Some(seen);
+                continue;
+            }
+            let Some(was) = ws.definition_inode.take() else { continue };
+            let moved = listed.iter().map(|(p, _)| p).find(|p| paths::file_id(p) == Some(was));
+            if let Some(path) = moved.filter(|p| self.definition_workspace(p).is_none()) {
+                self.workspaces[wi].set_definition(Some(path));
+                self.mark_persist();
+            }
+        }
     }
 
     pub fn definitions(&self) -> Vec<(PathBuf, Result<WorkspaceDef>)> {
@@ -38,23 +62,89 @@ impl Server {
         out
     }
 
-    pub(super) fn find_definition(&self, name: &str) -> Option<(PathBuf, WorkspaceDef)> {
-        self.definitions().into_iter().find_map(|(p, d)| match d {
-            Ok(d) if d.name == name => Some((p, d)),
-            _ => None,
-        })
+    fn find_definition(&self, name: &str) -> Option<PathBuf> {
+        self.definitions().into_iter().find_map(|(p, d)| (d.ok()?.name == name).then_some(p))
     }
 
-    /// Open a workspace by name: switch to it if it is running, else start it from its definition.
+    /// The open workspace linked to the definition file at `path` (as [`Server::definitions`]
+    /// lists it).
+    pub(super) fn definition_workspace(&self, path: &Path) -> Option<u32> {
+        self.workspaces.iter().find(|w| w.definition.as_deref() == Some(path)).map(|w| w.id)
+    }
+
+    /// Open a workspace by name: switch to the open workspace of that name, or to the one its
+    /// definition is open in, else start that definition.
     pub fn open_workspace(&mut self, name: &str) -> Result<u32> {
         if let Some(ws) = self.workspaces.iter().find(|w| w.name == name) {
             return Ok(ws.id);
         }
-        let (path, def) = self.find_definition(name).with_context(|| {
+        let path = self.find_definition(name).with_context(|| {
             let dirs: Vec<String> = self.config.workspace_dirs().iter().map(|d| paths::shorten_home(d)).collect();
             format!("no workspace named {name:?} in {}", dirs.join(", "))
         })?;
-        self.start_definition(&def, Some(path))
+        self.open_definition(&path)
+    }
+
+    /// Switch to the workspace the definition at `path` is open in, else start it.
+    pub(super) fn open_definition(&mut self, path: &Path) -> Result<u32> {
+        if let Some(ws) = self.definition_workspace(path) {
+            return Ok(ws);
+        }
+        let def = workspace::load_file(path)?;
+        self.start_definition(&def, Some(path.to_path_buf()))
+    }
+
+    /// Give the definition file of workspace `wi` its new name: `perso.kdl` becomes
+    /// `<name>.kdl` beside it, in one step that never replaces a file already there. A workspace
+    /// whose file is gone keeps none. Returns the file renamed, if one was.
+    pub(super) fn rename_definition(&mut self, wi: usize, name: &str) -> Result<Option<PathBuf>> {
+        let Some(from) = self.workspaces[wi].definition.clone() else { return Ok(None) };
+        let to = from.with_file_name(format!("{name}.kdl"));
+        if to == from {
+            return Ok(None);
+        }
+        anyhow::ensure!(workspace::valid_file_name(name), "{}: nothing was renamed.", workspace::FILE_NAME_RULE);
+        let renamed = match paths::rename_no_replace(&from, &to) {
+            // A file system that ignores case finds the file itself under a name that differs
+            // only in case.
+            Err(e)
+                if e.kind() == ErrorKind::AlreadyExists
+                    && paths::file_id(&from).is_some_and(|i| paths::file_id(&to) == Some(i)) =>
+            {
+                std::fs::rename(&from, &to)
+            }
+            other => other,
+        };
+        match renamed {
+            Ok(()) => {
+                if let Some(dir) = to.parent() {
+                    paths::sync_dir(dir);
+                }
+                self.workspaces[wi].set_definition(Some(&to));
+                // Listed again at once: until the next scan, the sidebar would show the old name
+                // as a definition not running.
+                self.scan_definitions();
+                Ok(Some(from))
+            }
+            Err(e) if e.kind() == ErrorKind::NotFound => {
+                self.workspaces[wi].set_definition(None);
+                Ok(None)
+            }
+            Err(e) if e.kind() == ErrorKind::AlreadyExists => {
+                anyhow::bail!("{} exists: nothing was renamed.", file_name(&to))
+            }
+            Err(e) => anyhow::bail!("renaming {}: {e}", paths::shorten_home(&from)),
+        }
+    }
+
+    /// The name workspace `wi` is saved under when none is given: its definition file's, else
+    /// one made from its own name.
+    pub(super) fn definition_file_name(&self, wi: usize) -> String {
+        let ws = &self.workspaces[wi];
+        match ws.definition.as_deref().and_then(Path::file_stem) {
+            Some(stem) => stem.to_string_lossy().into_owned(),
+            None => workspace::file_name_from(&ws.name),
+        }
     }
 
     /// Spawn every pane of a definition into a new workspace.
@@ -441,6 +531,11 @@ impl Server {
     pub fn definition_dir(&self) -> PathBuf {
         self.config.workspace_dirs().into_iter().next().unwrap_or_else(paths::workspaces_dir)
     }
+}
+
+/// The name of the file at `path`, to show.
+pub(super) fn file_name(path: &Path) -> String {
+    path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()
 }
 
 /// The waiting pane of an agent whose account is not chosen yet: it says why, and keeps what to
