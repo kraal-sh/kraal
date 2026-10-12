@@ -284,15 +284,23 @@ pub(super) fn parse_shell_record(record: &[u8], now: i64) -> Option<Entry> {
 pub(super) fn ls_time(month: &str, day: &str, time: &str, now: i64) -> Option<i64> {
     const MONTHS: [&str; 12] = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
     let month = u32::try_from(MONTHS.iter().position(|m| *m == month)? + 1).ok()?;
-    let day: u32 = day.parse().ok()?;
+    // What `ls` prints, nothing that would take the arithmetic past its range.
+    let day: u32 = day.parse().ok().filter(|d| (1..=31).contains(d))?;
     if let Some((hour, minute)) = time.split_once(':') {
-        let clock = hour.parse::<i64>().ok()? * 3600 + minute.parse::<i64>().ok()? * 60;
+        let hour = hour.parse::<i64>().ok().filter(|h| (0..24).contains(h))?;
+        let minute = minute.parse::<i64>().ok().filter(|m| (0..60).contains(m))?;
+        let clock = hour * 3600 + minute * 60;
         let (year, _, _) = civil_from_days(now.div_euclid(86_400));
         let this_year = days_from_civil(year, month, day) * 86_400 + clock;
         // Recent dates show no year: a date in the future belongs to last year.
-        Some(if this_year > now + 86_400 { days_from_civil(year - 1, month, day) * 86_400 + clock } else { this_year })
+        Some(if this_year > now.saturating_add(86_400) {
+            days_from_civil(year - 1, month, day) * 86_400 + clock
+        } else {
+            this_year
+        })
     } else {
-        Some(days_from_civil(time.parse().ok()?, month, day) * 86_400)
+        let year = time.parse::<i64>().ok().filter(|y| (0..=1_000_000).contains(y))?;
+        Some(days_from_civil(year, month, day) * 86_400)
     }
 }
 

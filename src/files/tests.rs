@@ -334,6 +334,20 @@ fn shell_fallback_lists_exact_names() {
     assert_eq!((exact.size, exact.mtime), (4, 1791748955));
 }
 
+/// A date no `ls` prints (a server sends anything) is no date: nothing overflows reading it.
+#[test]
+fn a_date_out_of_range_is_no_date() {
+    let now = days_from_civil(2026, 10, 10) * 86_400;
+    for record in [
+        &b"ff\t1\tJan 5 99999999999999999:00\tx"[..],
+        b"ff\t1\tJan 5 12:99999999999999999\tx",
+        b"ff\t1\tJan 5 9223372036854775807\tx",
+        b"ff\t1\tJan 99999999999 12:00\tx",
+    ] {
+        assert_eq!(parse_shell_record(record, now).unwrap().mtime, 0, "{}", String::from_utf8_lossy(record));
+    }
+}
+
 #[test]
 fn formats_times_and_sizes() {
     // Dates show in local time.
