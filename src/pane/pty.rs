@@ -681,8 +681,7 @@ fn start_io(id: PaneId, master: &(dyn MasterPty + Send), tx: &Sender<Event>) -> 
         // it also looks for panes with output now and then.
         read_output(reader, &out, &stopped, || ready_tx.try_send(Event::PaneReady(id)).is_ok());
     })?;
-    let (input, writer_stop) =
-        start_writer(id, writer, master.tty_name(), polled).inspect_err(|_| stop.stop())?;
+    let (input, writer_stop) = start_writer(id, writer, master.tty_name(), polled).inspect_err(|_| stop.stop())?;
     let input_pending = writer_stop.pending.clone();
     Ok(Io { input, input_pending, direct, output, eof: eof_rx, stop, writer_stop })
 }
@@ -703,7 +702,8 @@ fn start_writer(
         let _gone = gone_tx;
         for data in in_rx {
             // What waits once the pane went is no one's.
-            if stopped.load(Ordering::Acquire) || write_waiting(&mut writer, polled.as_ref(), &stopped, &data).is_err() {
+            if stopped.load(Ordering::Acquire) || write_waiting(&mut writer, polled.as_ref(), &stopped, &data).is_err()
+            {
                 break;
             }
             // Written: once nothing is left, the server writes again itself.
