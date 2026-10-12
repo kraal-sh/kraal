@@ -778,8 +778,12 @@ impl Server {
         let focused: Vec<PaneId> =
             self.clients.values().filter(|c| c.attached).filter_map(|c| self.client_focus(c.id)).collect();
         let mut data = std::mem::take(&mut self.output_buf);
+        // A frame is due at `next_render`, or when an image that stopped moving may be drawn.
         let more = |s: &Server, budget: Duration| {
-            start.elapsed() < budget && rx.is_empty() && s.next_render.is_none_or(|t| t > Instant::now())
+            let now = Instant::now();
+            start.elapsed() < budget
+                && rx.is_empty()
+                && [s.next_render, s.image_wake].into_iter().flatten().all(|t| t > now)
         };
         for p in focused {
             while more(self, budget / 2) {
