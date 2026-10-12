@@ -310,9 +310,21 @@ impl Pane {
             round || found.as_ref().is_none_or(|m| if older { *m.start() > origin } else { *m.end() < origin });
         if wrapped && let Some(lines) = archived_match(&t.archive.lines, &state.archived, older) {
             t.reveal_lines(lines);
+            // The line that matched is the first the emulator holds now: it alone is searched.
             let term = &mut t.term;
-            let from = if older { origin } else { Point::new(term.topmost_line(), Column(0)) };
-            found = term.search_next(&mut state.regex, from, dir, side, None).or(found);
+            let (top, last) = (term.topmost_line(), Column(term.columns() - 1));
+            let mut end = top;
+            while end < term.bottommost_line() && term.grid()[end][last].flags.contains(Flags::WRAPLINE) {
+                end += 1;
+            }
+            let rows = Some((end.0 - top.0) as usize);
+            let at = if older {
+                term.search_next(&mut state.regex, Point::new(end, last), dir, side, rows)
+            } else {
+                term.search_next(&mut state.regex, Point::new(top, Column(0)), dir, side, rows)
+            };
+            let from = if older { origin } else { Point::new(top, Column(0)) };
+            found = at.or_else(|| term.search_next(&mut state.regex, from, dir, side, None)).or(found);
         }
         let term = &mut t.term;
         let Some(m) = found else {
