@@ -532,7 +532,7 @@ impl Server {
             return;
         }
         let tx = self.tx.clone();
-        let _ = std::thread::Builder::new().name("codex-usage".into()).spawn(move || {
+        let polling = std::thread::Builder::new().name("codex-usage".into()).spawn(move || {
             for a in list {
                 let home = crate::paths::expand_tilde(&a.home);
                 if !home.is_dir() {
@@ -556,6 +556,9 @@ impl Server {
             }
             let _ = tx.send(super::Event::Wake);
         });
+        if let Err(e) = polling {
+            self.warnings.push(format!("cannot ask Codex for its limits: {e}"));
+        }
     }
 }
 

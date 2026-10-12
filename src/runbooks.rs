@@ -654,9 +654,9 @@ pub enum LogJob {
 
 /// The thread that writes run logs and the ledger, in order, off the server's event loop;
 /// failures are passed to `warn`.
-pub fn spawn_log_writer(warn: impl Fn(String) + Send + 'static) -> crossbeam_channel::Sender<LogJob> {
+pub fn spawn_log_writer(warn: impl Fn(String) + Send + 'static) -> std::io::Result<crossbeam_channel::Sender<LogJob>> {
     let (tx, rx) = crossbeam_channel::unbounded::<LogJob>();
-    let _ = std::thread::Builder::new().name("run-logs".into()).spawn(move || {
+    std::thread::Builder::new().name("run-logs".into()).spawn(move || {
         for job in rx {
             let failed = match job {
                 LogJob::Append(log, text) => {
@@ -687,8 +687,8 @@ pub fn spawn_log_writer(warn: impl Fn(String) + Send + 'static) -> crossbeam_cha
                 warn(format!("run log {}: {e}", paths::shorten_home(&path)));
             }
         }
-    });
-    tx
+    })?;
+    Ok(tx)
 }
 
 /// A run in progress, as the ledger keeps it on disk: after a crash or a kill, the next start

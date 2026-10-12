@@ -63,7 +63,7 @@ impl Server {
         );
         let tx = self.tx.clone();
         let done = Box::new(move |r: Result<(), String>| {
-            let _ = tx.send(crate::server::Event::Job(job, Box::new(r)));
+            let _ = tx.send(crate::server::Event::Job(job, Ok(Box::new(r))));
         });
         if self.run_logs.send(runbooks::LogJob::LedgerSync(self.session.clone(), ledger, done)).is_err() {
             self.jobs.remove(&job);

@@ -136,11 +136,14 @@ impl Server {
     pub(super) fn restore(&mut self) {
         // What a kraal killed while it wrote left: the temporary files of its writes, off the
         // event loop.
-        let _ = std::thread::Builder::new().name("temps".into()).spawn(|| {
+        let removing = std::thread::Builder::new().name("temps".into()).spawn(|| {
             for dir in paths::written_dirs() {
                 let _ = paths::remove_files_in(&dir, paths::abandoned_temp);
             }
         });
+        if let Err(e) = removing {
+            self.warnings.push(format!("cannot remove the temporary files a killed kraal left: {e}"));
+        }
         let interrupted = crate::runbooks::recover_interrupted(&self.session);
         if !interrupted.is_empty() {
             self.warnings.push(format!(
@@ -280,9 +283,12 @@ impl Persisting {
 
 /// The only writer of session state, so writes land in order: a late save never overwrites the
 /// final one, nor brings back a session whose state was deleted.
-pub(super) fn spawn_persister(events: Sender<Event>, shared: Arc<Mutex<Persisting>>) -> Sender<Persist> {
+pub(super) fn spawn_persister(
+    events: Sender<Event>,
+    shared: Arc<Mutex<Persisting>>,
+) -> std::io::Result<Sender<Persist>> {
     let (tx, rx) = crossbeam_channel::unbounded::<Persist>();
-    let _ = std::thread::Builder::new().name("persist".into()).spawn(move || {
+    std::thread::Builder::new().name("persist".into()).spawn(move || {
         let mut last: Result<(), String> = Ok(());
         // Scrollback files whose last write failed, and why.
         let mut failing: HashMap<String, String> = HashMap::new();
@@ -366,8 +372,8 @@ pub(super) fn spawn_persister(events: Sender<Event>, shared: Arc<Mutex<Persistin
                 }
             }
         }
-    });
-    tx
+    })?;
+    Ok(tx)
 }
 
 /// What the writer says when asked whether everything is written: whether the state, each

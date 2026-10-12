@@ -31,9 +31,10 @@ impl Server {
         let Ok(read_half) = stream.try_clone() else { return };
         // One that connects without saying anything is let go.
         let _ = read_half.set_read_timeout(Some(Duration::from_secs(10)));
-        let out = Outbox::start(stream, id);
+        // Without a thread to read or write it, the connection is closed (dropped).
+        let Ok(out) = Outbox::start(stream, id) else { return };
         let tx = self.tx.clone();
-        let _ = std::thread::Builder::new().name(format!("client-{id}-read")).spawn(move || {
+        let reading = std::thread::Builder::new().name(format!("client-{id}-read")).spawn(move || {
             let mut r = std::io::BufReader::with_capacity(64 * 1024, read_half);
             let mut first = true;
             while let Ok(Some((kind, payload))) = protocol::read_frame(&mut r) {
@@ -46,6 +47,9 @@ impl Server {
             }
             let _ = tx.send(Event::ClientGone(id));
         });
+        if reading.is_err() {
+            return;
+        }
         let ws = self.workspaces.first().map(|w| w.id).unwrap_or(0);
         self.clients.insert(
             id,
@@ -274,13 +278,13 @@ pub struct Outbox {
 
 impl Outbox {
     /// The outbox of a client connected on `stream`, and its writer thread.
-    fn start(stream: UnixStream, id: ClientId) -> Outbox {
+    fn start(stream: UnixStream, id: ClientId) -> std::io::Result<Outbox> {
         let (tx, rx) = crossbeam_channel::bounded::<Vec<u8>>(64);
         // A client that stops reading is let go rather than holding its writer forever.
         let _ = stream.set_write_timeout(Some(Duration::from_secs(10)));
         let out = Outbox { queue: tx, queued: Arc::new(AtomicUsize::new(0)), socket: Arc::new(stream) };
         let (queued, socket) = (out.queued.clone(), out.socket.clone());
-        let _ = std::thread::Builder::new().name(format!("client-{id}-write")).spawn(move || {
+        std::thread::Builder::new().name(format!("client-{id}-write")).spawn(move || {
             let mut w = &*socket;
             for data in rx {
                 if w.write_all(&data).and_then(|_| w.flush()).is_err() {
@@ -290,8 +294,8 @@ impl Outbox {
                 queued.fetch_sub(1, Ordering::AcqRel);
             }
             let _ = socket.shutdown(std::net::Shutdown::Both);
-        });
-        out
+        })?;
+        Ok(out)
     }
 
     pub fn try_send(&self, data: Vec<u8>) -> Result<(), TrySendError<Vec<u8>>> {
@@ -384,7 +388,7 @@ mod tests {
             )
         };
         assert_eq!(set, 0);
-        let out = Outbox::start(server_end, 1);
+        let out = Outbox::start(server_end, 1).unwrap();
         // Small enough to go at once (through the writer thread where a send cannot be told not
         // to wait).
         out.try_send(b"first".to_vec()).unwrap();
