@@ -522,6 +522,8 @@ pub struct Server {
     held_input: Vec<input::Held>,
     /// Panes told they have the focus (mode 1004).
     focus_reported: std::collections::HashSet<PaneId>,
+    /// The other panes' turn at output was skipped for a frame due (see `pump_output`).
+    turn_skipped: bool,
     /// Whether the sidebar had something to show at the last tick.
     sidebar_was_useful: bool,
     /// Whether a client was told how to stop the broadcast its key started.
@@ -714,6 +716,7 @@ pub fn run(session: &str) -> Result<()> {
         focus_reported: Default::default(),
         held_input: Vec::new(),
         sidebar_was_useful: false,
+        turn_skipped: false,
         broadcast_tip_shown: false,
         buffers,
         buffers_dirty: false,
@@ -760,6 +763,8 @@ pub fn run(session: &str) -> Result<()> {
     server.scan_definitions();
     server.load_buffers();
     server.restore();
+    // The sidebar shows what it has from the start: the first tick has no change to draw.
+    server.sidebar_was_useful = server.sidebar_useful();
     let result = server.event_loop(&rx);
     server.shutdown();
     let _ = std::fs::remove_file(&socket);
@@ -889,7 +894,7 @@ impl Server {
     /// turn, one chunk each. Stops early when a control event arrives or a frame is due, but the
     /// others always get a chunk: a pane printing without a pause keeps the queue busy, and must
     /// not starve the rest. A frame due once the focused panes are read (the echo of a key) goes
-    /// before the others' output.
+    /// before the others' output, every other time at most.
     fn pump_output(&mut self, budget: Duration, rx: &Receiver<Event>) {
         let start = Instant::now();
         let focused: Vec<PaneId> =
@@ -911,8 +916,13 @@ impl Server {
                 self.pane_output(p, &data);
             }
         }
+        // A frame due (an echo) goes before the others' turn, but not twice in a row: a pane
+        // printing in the focus, with frames always due, must not starve the others.
         let now = Instant::now();
-        let mut served = [self.next_render, self.image_wake].into_iter().flatten().any(|t| t <= now);
+        let due = [self.next_render, self.image_wake].into_iter().flatten().any(|t| t <= now);
+        let skip = due && !self.turn_skipped;
+        self.turn_skipped = skip;
+        let mut served = skip;
         while !std::mem::replace(&mut served, true) || more(self, budget) {
             let Some(id) = self.ready.pop_front() else { break };
             if self.take_output(id, &mut data) {
@@ -1175,7 +1185,9 @@ impl Server {
         let useful = self.sidebar_useful();
         if useful != self.sidebar_was_useful {
             self.sidebar_was_useful = useful;
-            for c in self.clients.values_mut() {
+            // A client that chose to show it or not keeps what it has on screen.
+            let follows = self.config.sidebar.visible;
+            for c in self.clients.values_mut().filter(|c| follows && c.sidebar.is_none()) {
                 c.encoder.invalidate();
             }
             self.relayout();

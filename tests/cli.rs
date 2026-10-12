@@ -3376,9 +3376,17 @@ fn frames_drawn_over_the_last_one_end_as_a_whole_frame() {
     client.settle();
     let before = client.settle();
     client.send(b"x");
-    client.wait_for_screen("x");
-    let typed = client.settle() - before;
-    assert!(typed < 100, "a frame for one character sent {typed} bytes");
+    // The frame with the echo is that character and the cursor, whatever else is drawn then.
+    let start = Instant::now();
+    let echo = loop {
+        let after = String::from_utf8_lossy(&client.screen.lock().unwrap()[before..]).into_owned();
+        if let Some(frame) = after.split_inclusive("\x1b[?2026l").find(|f| f.contains('x')) {
+            break frame.to_string();
+        }
+        assert!(start.elapsed() < Duration::from_secs(10), "the echo never came: {after:?}");
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert!(echo.len() < 100, "a frame for one character sent {} bytes: {echo:?}", echo.len());
     for b in b"yz 123" {
         client.send(&[*b]);
     }
