@@ -728,18 +728,14 @@ impl Server {
                 Duration::ZERO
             };
             match rx.recv_timeout(timeout) {
-                Ok(ev) => {
-                    self.handle(ev);
-                    self.follow_focus();
-                }
+                Ok(ev) => self.handle_and_follow(ev),
                 Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
                 Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
             }
             // Keystrokes, clients and control requests come first. Panes are told of focus changes
             // after each (a pane focused and left within one batch is told both).
             while let Ok(ev) = rx.try_recv() {
-                self.handle(ev);
-                self.follow_focus();
+                self.handle_and_follow(ev);
             }
             // …then a slice of program output, interrupted as soon as something else arrives.
             self.pump_output(Duration::from_millis(6), rx);
@@ -1001,6 +997,16 @@ impl Server {
         }
         if self.last_def_scan.elapsed() > Duration::from_secs(5) {
             self.scan_definitions();
+        }
+    }
+
+    /// Handle `ev`, then tell the panes whose focus it changed. A pane's wake-up changes nothing
+    /// yet: its output is read, and the focus followed, later in the loop.
+    fn handle_and_follow(&mut self, ev: Event) {
+        let wake_up = matches!(ev, Event::PaneReady(_));
+        self.handle(ev);
+        if !wake_up {
+            self.follow_focus();
         }
     }
 
