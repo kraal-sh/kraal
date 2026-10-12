@@ -5,6 +5,7 @@
 use std::collections::HashMap;
 use std::io::{BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 
@@ -127,7 +128,8 @@ impl Running {
     fn stops(&self) -> Vec<String> {
         let unknown = || vec!["whatever runs in its panes (its server does not say)".to_string()];
         let Some((pid, _)) = &self.server else { return unknown() };
-        let Ok(Response::Panes(panes)) = client::request(&self.socket, Request::ListPanes) else { return unknown() };
+        let listed = client::request_within(&self.socket, Request::ListPanes, LIST_PANES_TIMEOUT);
+        let Ok(Response::Panes(panes)) = listed else { return unknown() };
         let own = own_pane(&self.name);
         let programs = pane_programs(*pid, &self.socket);
         panes
@@ -140,6 +142,9 @@ impl Running {
             .collect()
     }
 }
+
+/// How long the server of a session to restart has to list its panes.
+const LIST_PANES_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// What runs in each pane of the server `server` (listening on `socket`), by pane id, when it is
 /// not a shell waiting at its prompt: the program in the foreground of the pane's terminal, or

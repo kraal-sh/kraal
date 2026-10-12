@@ -154,6 +154,28 @@ fn refusal(socket: &Path, needs: Option<protocol::Feature>, name: &str, said: St
     }
 }
 
+/// One request to a server that may not answer, given up on after `limit`; a refusal is said
+/// as the server said it.
+pub fn request_within(socket: &Path, req: Request, limit: Duration) -> Result<Response> {
+    let deadline = Instant::now() + limit;
+    let mut stream = UnixStream::connect(socket)?;
+    exchange_until(&mut stream, &ClientMsg::request(req), deadline)?.map_err(anyhow::Error::msg)
+}
+
+/// [`exchange`], given up on at `deadline`: the server sends one answer.
+fn exchange_until(stream: &mut UnixStream, msg: &ClientMsg, deadline: Instant) -> Result<Result<Response, String>> {
+    // A socket refuses a zero timeout.
+    let left = deadline.saturating_duration_since(Instant::now()).max(Duration::from_millis(1));
+    stream.set_read_timeout(Some(left))?;
+    stream.set_write_timeout(Some(left))?;
+    exchange(stream, msg).map_err(|e| {
+        let timed_out = e
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|e| matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut));
+        if timed_out { anyhow::anyhow!("the server did not answer in time") } else { e }
+    })
+}
+
 /// Send `msg` and wait for the server's answer, which is `Err` when it refused.
 fn exchange(stream: &mut UnixStream, msg: &ClientMsg) -> Result<Result<Response, String>> {
     protocol::write_json(stream, msg)?;
@@ -208,16 +230,17 @@ pub enum Saved {
     Unknown,
 }
 
-/// Stop the server behind `socket` and wait until it has exited. A server from another kraal
-/// version refuses every request, so when asking fails it gets SIGTERM, which every version
-/// handles the same way: save the layout, then exit.
+/// Stop the server behind `socket` and wait until it has exited ([`STOP_TIMEOUT`] at most). A
+/// server from another kraal version refuses every request, so when asking fails it gets
+/// SIGTERM, which every version handles the same way: save the layout, then exit.
 pub fn kill_server(socket: &Path) -> Result<Saved> {
     stop_server(socket, false)
 }
 
 /// Restart the session's server on this kraal: the server saves the session and stops, telling
 /// its attached clients to wait for the next one, which starts from this binary and restores
-/// the session. Whether the layout was saved, as for `kraal kill`.
+/// the session. Whether the layout was saved, as for `kraal kill`; a server of this protocol
+/// that cannot save it first refuses, and keeps running.
 pub fn restart_server(session: &str) -> Result<Saved> {
     let saved = stop_server(&paths::socket_path(session), true)?;
     ensure_server(session)?;
@@ -226,10 +249,7 @@ pub fn restart_server(session: &str) -> Result<Saved> {
 
 /// What the server behind `socket` is, given up on quickly when it does not answer.
 pub fn ping(socket: &Path) -> Result<ServerInfo> {
-    let mut stream = UnixStream::connect(socket)?;
-    stream.set_read_timeout(Some(Duration::from_secs(2)))?;
-    stream.set_write_timeout(Some(Duration::from_secs(2)))?;
-    match exchange(&mut stream, &ClientMsg::request(Request::Ping))?.map_err(anyhow::Error::msg)? {
+    match request_within(socket, Request::Ping, Duration::from_secs(2))? {
         Response::Pong { pid, session, version, features } => Ok(ServerInfo { pid, session, version, features }),
         _ => bail!("unexpected answer from the server"),
     }
@@ -280,7 +300,16 @@ pub fn restart_detached(exe: &Path, session: &str) -> Result<()> {
     Ok(())
 }
 
+/// How long stopping a server may take, from asking it to its exit: a restart waits up to 10 s
+/// for the session to be saved, then the server as long for its state, and as long again for
+/// its runs' logs, to reach the disk.
+const STOP_TIMEOUT: Duration = Duration::from_secs(30);
+
 fn stop_server(socket: &Path, restart: bool) -> Result<Saved> {
+    let deadline = Instant::now() + STOP_TIMEOUT;
+    // A server that answers speaks this protocol: its refusal to restart stands (it could not
+    // save the session first). One of another protocol refuses every request.
+    let refusal_stands = restart && ping(socket).is_ok();
     let mut stream = UnixStream::connect(socket)
         .with_context(|| format!("no kraal server at {} (is it running?)", socket.display()))?;
     let (pid, uid) = process::socket_peer(&stream).context("finding the server process")?;
@@ -288,10 +317,13 @@ fn stop_server(socket: &Path, restart: bool) -> Result<Saved> {
     if uid != unsafe { libc::getuid() } {
         bail!("{} belongs to another user", socket.display());
     }
-    let saved = match exchange(&mut stream, &ClientMsg::request(Request::KillServer { restart })) {
-        Ok(Ok(Response::Text(why))) => Saved::No(why),
-        Ok(Ok(_)) => Saved::Yes,
-        Ok(Err(_)) | Err(_) => {
+    let ask = ClientMsg::request(Request::KillServer { restart });
+    let answer = exchange_until(&mut stream, &ask, deadline).and_then(|a| a.map_err(anyhow::Error::msg));
+    let saved = match answer {
+        Ok(Response::Text(why)) => Saved::No(why),
+        Ok(_) => Saved::Yes,
+        Err(e) if refusal_stands => return Err(e),
+        Err(_) => {
             // SAFETY: plain signal to the process listening on our own private socket.
             if unsafe { libc::kill(pid, libc::SIGTERM) } != 0 {
                 let err = std::io::Error::last_os_error();
@@ -303,11 +335,9 @@ fn stop_server(socket: &Path, restart: bool) -> Result<Saved> {
         }
     };
     drop(stream);
-    // The server waits up to 10 s for its layout to reach the disk.
-    let start = Instant::now();
     while process::running(pid) {
-        if start.elapsed() > Duration::from_secs(15) {
-            bail!("the server (pid {pid}) is still running after 15 s");
+        if Instant::now() > deadline {
+            bail!("the server (pid {pid}) is still running after {} s", STOP_TIMEOUT.as_secs());
         }
         std::thread::sleep(Duration::from_millis(50));
     }

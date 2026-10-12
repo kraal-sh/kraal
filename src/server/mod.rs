@@ -1548,18 +1548,7 @@ impl Server {
 
     fn shutdown(&mut self) {
         self.end_edits();
-        // The last state goes through the writer, after anything it still has to write (the
-        // panes' scrollback first), and the server waits for it.
-        self.save_scrollback(true);
-        self.persist();
-        self.save_buffers(true);
-        let (done, written) = crossbeam_channel::bounded(1);
-        let saved = match self.persister.send(persistence::Persist::Stop(done)) {
-            Ok(()) => written
-                .recv_timeout(Duration::from_secs(10))
-                .unwrap_or_else(|_| Err("the layout could not be saved: its writer did not finish in time".into())),
-            Err(_) => Err("the layout could not be saved: its writer is gone".into()),
-        };
+        let saved = self.save_now();
         if let Err(e) = &saved {
             eprintln!("kraal: {e}");
         }

@@ -328,6 +328,24 @@ fn finish(mut child: std::process::Child, limit: Duration) -> Output {
     child.wait_with_output().unwrap()
 }
 
+/// A process this test stopped (SIGSTOP), continued when the test ends, however it ends.
+struct Stopped(libc::pid_t);
+
+impl Stopped {
+    fn stop(pid: libc::pid_t) -> Stopped {
+        // SAFETY: plain syscall to a process this test started.
+        assert_eq!(unsafe { libc::kill(pid, libc::SIGSTOP) }, 0);
+        Stopped(pid)
+    }
+}
+
+impl Drop for Stopped {
+    fn drop(&mut self) {
+        // SAFETY: plain syscall to a process this test started.
+        unsafe { libc::kill(self.0, libc::SIGCONT) };
+    }
+}
+
 #[test]
 fn run_send_read_and_close() {
     let env = Env::new("basic");
@@ -1109,6 +1127,54 @@ fn a_workspace_that_cannot_be_restored_stays_saved() {
     back.sort();
     assert_eq!(back, ["job", "shell"]);
     env.wait_for_text("shell", "kept-16");
+}
+
+/// A restart stops the session's programs only once the layout it brings back is saved: when it
+/// cannot be, the session keeps running as it is, and the restart says why.
+#[test]
+fn a_restart_that_cannot_save_the_session_leaves_it_running() {
+    use std::os::unix::fs::PermissionsExt;
+    let env = Env::new("unsavedrestart");
+    env.workspace("w", "layout {\n    pane name=\"one\"\n}\n");
+    env.run(&["open", "w"]);
+    wait_until(Duration::from_secs(10), "the layout was never saved", || env.state_file().exists());
+    let pid = env.server_pid().expect("the server runs");
+    let sessions = env.root.join("state/kraal/sessions");
+    std::fs::set_permissions(&sessions, std::fs::Permissions::from_mode(0o500)).unwrap();
+    // A pane opened since the last save: the layout on disk is not the session's any more.
+    env.run(&["run", "--name", "two", "--target", "one", "--", "sh"]);
+    let out = env.try_run(&["restart", "--yes"]);
+    std::fs::set_permissions(&sessions, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success() && err.contains("not restarting: the layout could not be saved"), "{err}");
+    assert_eq!(env.server_pid(), Some(pid), "the session stopped");
+    // Once it can be saved, the restart brings back the pane opened since.
+    let said = env.run(&["restart", "--yes"]);
+    assert!(said.contains("restarted session unsavedrestart"), "{said}");
+    assert_ne!(env.server_pid(), Some(pid));
+    assert!(env.run(&["panes"]).contains("two"));
+}
+
+/// `kraal kill` and `kraal restart` give up on a server that does not answer (stopped, here) in
+/// a bounded time, instead of waiting for it for good.
+#[test]
+fn stopping_a_server_that_does_not_answer_gives_up_in_time() {
+    let env = Env::new("frozen");
+    env.workspace("w", "layout {\n    pane name=\"one\"\n}\n");
+    env.run(&["open", "w"]);
+    let stopped = Stopped::stop(env.server_pid().expect("the server runs"));
+    let quiet = |args: &[&str]| {
+        let mut c = env.cmd(args);
+        c.stdout(std::process::Stdio::null()).stderr(std::process::Stdio::piped());
+        c.spawn().unwrap()
+    };
+    let (kill, restart) = (quiet(&["kill"]), quiet(&["restart", "--yes"]));
+    let outs = [finish(kill, Duration::from_secs(60)), finish(restart, Duration::from_secs(60))];
+    drop(stopped);
+    for out in outs {
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(!out.status.success() && err.contains("is still running after"), "{err}");
+    }
 }
 
 #[test]
