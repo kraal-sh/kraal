@@ -74,7 +74,15 @@ impl Env {
     fn wait_for(&self, pane: &str, text: &str, part: impl Fn(&str) -> &str) -> String {
         let start = Instant::now();
         loop {
-            let screen = self.run(&["read", "-p", pane]);
+            let out = self.try_run(&["read", "-p", pane]);
+            let screen = if out.status.success() {
+                String::from_utf8(out.stdout).unwrap()
+            } else {
+                // A pane that a command has just asked for may not exist yet.
+                let err = String::from_utf8_lossy(&out.stderr);
+                assert!(err.contains("no pane named"), "kraal read -p {pane:?} failed: {err}");
+                String::new()
+            };
             let seen = part(&screen);
             // A narrow pane wraps long lines: the text may run over two rows.
             if seen.contains(text) || seen.lines().collect::<String>().contains(text) {
