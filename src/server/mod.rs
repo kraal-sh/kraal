@@ -401,6 +401,9 @@ pub struct Server {
     streak: u8,
     /// Panes just typed into, until when their output is drawn at once (it is the echo).
     echo: HashMap<PaneId, Instant>,
+    /// When what was last marked to draw has been quiet long enough to be drawn without waiting
+    /// for the frame gap (see [`Server::schedule_render`]).
+    settle: Option<Instant>,
     quitting: bool,
     /// `kraal kill` requests, answered once the last state is written (or not).
     kill_waiters: Vec<ClientId>,
@@ -680,6 +683,7 @@ pub fn run(session: &str) -> Result<()> {
         last_frame: Instant::now(),
         streak: 0,
         echo: HashMap::new(),
+        settle: None,
         quitting: false,
         kill_waiters: Vec::new(),
         restarting: false,
@@ -866,6 +870,13 @@ impl Server {
                 self.image_wake = None;
                 self.next_render = Some(Instant::now());
             }
+            // What changed last has been quiet for a while: its frame waits no longer.
+            if let Some(at) = self.settle.filter(|t| *t <= Instant::now()) {
+                self.settle = None;
+                if let Some(r) = self.next_render {
+                    self.next_render = Some(r.min((self.last_frame + FRAME_GAP).max(at)));
+                }
+            }
             if self.next_render.is_some_and(|t| t <= Instant::now()) {
                 self.render_clients();
             }
@@ -932,6 +943,9 @@ impl Server {
         let mut d = self.next_tick();
         for r in [self.next_render, self.image_wake].into_iter().flatten() {
             d = d.min(r);
+        }
+        if let Some(s) = self.settle.filter(|_| self.next_render.is_some()) {
+            d = d.min(s);
         }
         if let Some(g) = self.dirwatch.next() {
             d = d.min(g);
@@ -1437,12 +1451,14 @@ impl Server {
     }
 
     /// Draw what changed: at once after a quiet spell, else when the last frame is
-    /// [`FRAME_GAP`] old, or [`BUSY_FRAME_GAP`] while output keeps coming.
+    /// [`FRAME_GAP`] old, or [`BUSY_FRAME_GAP`] while output keeps coming, but no later than
+    /// [`STREAM_PAUSE`] after it stops (see `settle`).
     fn schedule_render(&mut self) {
+        let now = Instant::now();
+        self.settle = Some(now + STREAM_PAUSE);
         if self.next_render.is_some() {
             return;
         }
-        let now = Instant::now();
         self.streak = if now < self.last_frame + FRAME_GAP { self.streak.saturating_add(1) } else { 0 };
         let gap = if self.streak >= BUSY_AFTER { BUSY_FRAME_GAP } else { FRAME_GAP };
         self.next_render = Some((self.last_frame + gap).max(now));
