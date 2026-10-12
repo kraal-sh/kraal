@@ -317,10 +317,9 @@ pub fn reap_later(mut child: Child) {
 pub fn wait_gone(pids: &[u32], timeout: Duration) -> bool {
     let start = Instant::now();
     loop {
-        // SAFETY: signal 0 only checks that the process, or a process of the group, exists.
         let alive = pids
             .iter()
-            .any(|p| unsafe { libc::kill(*p as libc::pid_t, 0) == 0 || libc::kill(-(*p as libc::pid_t), 0) == 0 });
+            .any(|&p| crate::process::exists(p as libc::pid_t) || crate::process::exists(-(p as libc::pid_t)));
         if !alive {
             return true;
         }
@@ -699,5 +698,22 @@ mod tests {
         let out = run(&mut sh("sleep 30 & sleep 30"), Duration::from_millis(200), 1024).unwrap();
         assert!(out.timed_out && out.code.is_none());
         assert!(start.elapsed() < Duration::from_secs(2), "{:?}", start.elapsed());
+    }
+
+    /// A process that runs as another user (as a program run through sudo does) is not gone
+    /// because it may not be signalled. Nothing to check as root, or where no such process shows.
+    #[test]
+    fn another_users_process_is_not_gone() {
+        // SAFETY: getuid cannot fail.
+        let me = unsafe { libc::getuid() };
+        let ps = Command::new("ps").args(["-A", "-o", "pid=", "-o", "uid="]).output().unwrap();
+        // The lowest pid: a process of the system's own, there for good.
+        let theirs = String::from_utf8_lossy(&ps.stdout).lines().find_map(|line| {
+            let mut fields = line.split_whitespace().map(str::parse::<u32>);
+            let (Some(Ok(pid)), Some(Ok(uid))) = (fields.next(), fields.next()) else { return None };
+            (pid > 1 && uid != me).then_some(pid)
+        });
+        let Some(pid) = theirs.filter(|_| me != 0) else { return };
+        assert!(!wait_gone(&[pid], Duration::from_millis(50)), "process {pid} still runs");
     }
 }
