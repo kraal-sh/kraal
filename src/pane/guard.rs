@@ -4,10 +4,10 @@
 //! keyboard modes (`CSI > flags u`): it removes from the title stack, panicking when that one is
 //! empty, which would take the whole server down. The guard runs the emulator's own parser
 //! (the same vte version, fed the same bytes) one step ahead of it, so it reads every sequence
-//! exactly as the emulator will, controls and odd bytes included. It follows the depth of the
-//! two stacks (the primary and the alternate screen each have one) as the emulator changes them,
-//! and turns the final byte of a push past a limit no real program reaches into CAN, which makes
-//! the emulator abandon that sequence.
+//! exactly as the emulator will, controls and odd bytes included. It follows the two stacks (the
+//! primary and the alternate screen each have one) as the emulator changes them, which a live
+//! restart hands over, and turns the final byte of a push past a limit no real program reaches
+//! into CAN, which makes the emulator abandon that sequence.
 //!
 //! It also follows the scroll region's top margin on the primary screen, for the command marks:
 //! a region that starts below the first line scrolls without filling the history.
@@ -15,7 +15,7 @@
 use alacritty_terminal::vte::{Params, Parser, Perform};
 
 /// Pushes beyond this depth are dropped (well below the emulator's 4096).
-const MAX_DEPTH: u32 = 1024;
+const MAX_DEPTH: usize = 1024;
 /// Cancel: ends the sequence being read without acting on it, in any state.
 const CAN: u8 = 0x18;
 
@@ -23,8 +23,8 @@ const CAN: u8 = 0x18;
 pub(super) struct KeyboardStackGuard {
     parser: Parser,
     seen: Seen,
-    /// Depth of the primary and alternate screens' stacks.
-    depth: [u32; 2],
+    /// The primary and alternate screens' stacks, as the emulator has them.
+    stacks: [Vec<u8>; 2],
     alt: bool,
     /// The scroll region starts below the first line.
     margin: bool,
@@ -38,7 +38,8 @@ struct Seen(Vec<Change>);
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum Change {
-    Push,
+    /// The kitty keyboard flags pushed.
+    Push(u8),
     Pop(u32),
     /// The alternate screen (1049) set or reset.
     AltScreen(bool),
@@ -56,7 +57,8 @@ impl Perform for Seen {
         }
         let first = || params.iter().next().map(|p| p[0]).filter(|p| *p != 0);
         match (action, intermediates) {
-            ('u', [b'>']) => self.0.push(Change::Push),
+            // As the emulator reads them: the flags it knows of the low byte.
+            ('u', [b'>']) => self.0.push(Change::Push(first().unwrap_or(0) as u8 & 0x1f)),
             ('u', [b'<']) => self.0.push(Change::Pop(u32::from(first().unwrap_or(1)))),
             ('h' | 'l', [b'?']) => {
                 for _ in params.iter().filter(|p| p[0] == 1049) {
@@ -119,14 +121,15 @@ impl KeyboardStackGuard {
         let mut refused = false;
         for change in std::mem::take(&mut self.seen.0) {
             let screen = usize::from(self.alt);
+            let stack = &mut self.stacks[screen];
             match change {
-                Change::Push if self.depth[screen] >= MAX_DEPTH => refused = true,
-                Change::Push => self.depth[screen] += 1,
-                Change::Pop(n) => self.depth[screen] = self.depth[screen].saturating_sub(n),
+                Change::Push(_) if stack.len() >= MAX_DEPTH => refused = true,
+                Change::Push(flags) => stack.push(flags),
+                Change::Pop(n) => stack.truncate(stack.len().saturating_sub(n as usize)),
                 // The emulator swaps the stacks only when the screen really changes.
                 Change::AltScreen(on) => self.alt = on,
                 Change::Reset => {
-                    self.depth = [0, 0];
+                    self.stacks = Default::default();
                     self.alt = false;
                     self.margin = false;
                 }
@@ -153,6 +156,11 @@ impl KeyboardStackGuard {
     pub(super) fn screen_resized(&mut self) {
         self.margin = false;
     }
+
+    /// The keyboard flags pushed on the primary and the alternate screen, oldest first.
+    pub(super) fn keyboard_stacks(&self) -> &[Vec<u8>; 2] {
+        &self.stacks
+    }
 }
 
 #[cfg(test)]
@@ -165,9 +173,9 @@ mod tests {
     #[test]
     fn pushes_past_the_limit_are_cancelled_and_the_rest_passes() {
         let mut g = KeyboardStackGuard::default();
-        let push = b"\x1b[>1u".repeat(MAX_DEPTH as usize + 5);
+        let push = b"\x1b[>1u".repeat(MAX_DEPTH + 5);
         let out = g.filter(&push);
-        assert_eq!(out.windows(5).filter(|w| *w == b"\x1b[>1u").count(), MAX_DEPTH as usize);
+        assert_eq!(out.windows(5).filter(|w| *w == b"\x1b[>1u").count(), MAX_DEPTH);
         assert_eq!(out.len(), push.len(), "nothing is removed, the last byte of a push changes");
         // Popping makes room again; other sequences and text are untouched, even when cut.
         let mut out = g.filter(b"\x1b[<2u\x1b[>1u\x1b[>1u\x1b[>1");
@@ -206,7 +214,7 @@ mod tests {
             for chunk in push.repeat(4100).chunks(7) {
                 parser.advance(&mut term, &g.filter(chunk));
             }
-            assert_eq!(g.depth[0], MAX_DEPTH, "{push:?}");
+            assert_eq!(g.stacks[0].len(), MAX_DEPTH, "{push:?}");
         }
     }
 }

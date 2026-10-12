@@ -2,6 +2,7 @@
 
 use std::io::Write;
 use std::os::unix::net::UnixStream;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use super::{Client, ClientId, Event, Mode, Server};
@@ -11,6 +12,16 @@ use crate::pane::PaneSpec;
 use crate::protocol::{self, ClientMsg, ServerMsg};
 /// Clients connected at once (attached terminals, CLI commands, event streams).
 const MAX_CLIENTS: usize = 256;
+
+/// Connections whose writer still runs: each ends once its connection is let go and what was
+/// queued for it is written (or cannot be).
+static WRITERS: AtomicUsize = AtomicUsize::new(0);
+
+/// How many connections' writers still run (see [`WRITERS`]): one let go is not done until
+/// what it was sent is written.
+pub(super) fn writers() -> usize {
+    WRITERS.load(Ordering::SeqCst)
+}
 
 impl Server {
     pub(super) fn new_connection(&mut self, stream: UnixStream) {
@@ -30,14 +41,19 @@ impl Server {
         let _ = write_half.set_write_timeout(Some(Duration::from_secs(10)));
         // And one that connects without saying anything.
         let _ = read_half.set_read_timeout(Some(Duration::from_secs(10)));
-        let _ = std::thread::Builder::new().name(format!("client-{id}-write")).spawn(move || {
+        WRITERS.fetch_add(1, Ordering::SeqCst);
+        let started = std::thread::Builder::new().name(format!("client-{id}-write")).spawn(move || {
             for data in out_rx {
                 if write_half.write_all(&data).and_then(|_| write_half.flush()).is_err() {
                     break;
                 }
             }
             let _ = write_half.shutdown(std::net::Shutdown::Both);
+            WRITERS.fetch_sub(1, Ordering::SeqCst);
         });
+        if started.is_err() {
+            WRITERS.fetch_sub(1, Ordering::SeqCst);
+        }
         let tx = self.tx.clone();
         let _ = std::thread::Builder::new().name(format!("client-{id}-read")).spawn(move || {
             let mut r = std::io::BufReader::with_capacity(64 * 1024, read_half);
@@ -81,6 +97,7 @@ impl Server {
                 welcome: false,
                 remote: false,
                 follows_live: false,
+                held: None,
                 peer,
             },
         );
@@ -99,10 +116,10 @@ impl Server {
             }
         };
         match msg {
-            ClientMsg::Attach { version, cols, rows, workspace, remote, pane, installed, live } => {
+            ClientMsg::Attach { version, cols, rows, workspace, remote, pane, installed, follows_live } => {
                 if let Some(c) = self.clients.get_mut(&id) {
                     c.remote = remote;
-                    c.follows_live = live;
+                    c.follows_live = follows_live;
                 }
                 let (cols, rows) = clamp_size(cols, rows);
                 if version != protocol::PROTOCOL_VERSION {
@@ -133,6 +150,11 @@ impl Server {
                 self.relayout();
             }
             ClientMsg::Detach => self.detach(id, "detached"),
+            ClientMsg::Held { attempt } => {
+                if let Some(c) = self.clients.get_mut(&id) {
+                    c.held = Some(attempt);
+                }
+            }
             ClientMsg::Request { version, request } => {
                 let result = if version != protocol::PROTOCOL_VERSION {
                     Some(Err(version_mismatch(version)))

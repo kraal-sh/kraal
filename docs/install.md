@@ -27,8 +27,9 @@ there is one, `--to v0.2.0` picks one. A kraal installed by a package manager (H
 your distribution) is updated there instead.
 
 A session's server keeps the version it started with. After installing, `kraal update` lists the
-sessions still on an older kraal and offers to [restart](workspaces.md#persistence) them: live
-when they can, and nothing stops; otherwise it lists the programs a restart would stop in them.
+sessions still on an older kraal and offers to [restart](workspaces.md#persistence) them:
+[live](workspaces.md#live-restart) when they can, and nothing stops; otherwise it lists the
+programs a restart would stop in them.
 No by default when programs would stop, and without a terminal to ask on; `--restart` or
 `--no-restart` answer beforehand. Later, `kraal ls` shows the
 version each session runs, attaching to a session on an older kraal says so, and

@@ -304,6 +304,8 @@ pub struct Client {
     pub peer: Option<u32>,
     /// It follows a live restart, holding what is typed meanwhile (see `upgrade`).
     pub follows_live: bool,
+    /// It said it holds what is typed, and when it was asked (see `ClientMsg::Held`).
+    pub held: Option<u32>,
 }
 
 /// A line of the messages log.
@@ -459,6 +461,15 @@ pub struct Server {
     events_rx: Receiver<Event>,
     /// A live restart is being prepared.
     upgrading: bool,
+    /// How many times clients were asked to hold what is typed (see `ClientMsg::Held`).
+    hold_attempts: u32,
+    /// Panes the last live restart did not take over yet: their terminals stay open and their
+    /// programs run, and they are tried again.
+    unadopted: Vec<upgrade::LeftOver>,
+    /// When they were last tried.
+    unadopted_tried: Instant,
+    /// What the last live restart took over.
+    live_restart: Option<crate::protocol::LiveRestart>,
 }
 
 /// Stops the thread that accepts connections for a while: `parked` once it has.
@@ -480,13 +491,14 @@ const INPUT_FLUSH: Duration = Duration::from_millis(30);
 pub fn run(session: &str, handoff: Option<&std::path::Path>) -> Result<()> {
     let socket = paths::socket_path(session);
     paths::private_runtime_dir().context("checking the runtime directory")?;
+    let mut salvaged = Vec::new();
     let taken = handoff.and_then(|path| match upgrade::read_handoff(path, session) {
         Ok(h) => Some(h),
         Err(e) => {
-            // Its programs cannot be reached: they get a hangup, as when a server stops, and the
-            // saved layout comes back.
+            // The saved layout comes back, and the terminals kept open with it, their programs
+            // running on.
             eprintln!("kraal: cannot take over from the previous server: {e:#}");
-            upgrade::close_inherited();
+            salvaged = upgrade::salvage();
             None
         }
     });
@@ -662,11 +674,18 @@ pub fn run(session: &str, handoff: Option<&std::path::Path>) -> Result<()> {
         accepting,
         events_rx: rx.clone(),
         upgrading: false,
+        hold_attempts: 0,
+        unadopted: Vec::new(),
+        unadopted_tried: Instant::now(),
+        live_restart: None,
     };
     server.scan_definitions();
     match taken {
         Some(h) => server.take_over(h),
-        None => server.restore(),
+        None => {
+            server.restore();
+            server.take_salvaged(salvaged);
+        }
     }
     let result = server.event_loop(&rx);
     server.shutdown();
@@ -813,9 +832,9 @@ impl Server {
         d.max(Instant::now() + Duration::from_millis(1))
     }
 
-    fn timers(&mut self) {
+    /// Read escape sequences that never completed as what they are on their own.
+    fn flush_stale_input(&mut self) {
         let now = Instant::now();
-        // Escape sequences that never completed.
         let flush: Vec<ClientId> = self
             .clients
             .values()
@@ -825,6 +844,11 @@ impl Server {
         for id in flush {
             self.flush_client_input(id);
         }
+    }
+
+    fn timers(&mut self) {
+        let now = Instant::now();
+        self.flush_stale_input();
         let expired: Vec<ClientId> =
             self.clients.values().filter(|c| c.toast.as_ref().is_some_and(|(_, t)| *t <= now)).map(|c| c.id).collect();
         for id in expired {
@@ -999,6 +1023,9 @@ impl Server {
         }
         if self.last_def_scan.elapsed() > Duration::from_secs(5) {
             self.scan_definitions();
+        }
+        if !self.unadopted.is_empty() && self.unadopted_tried.elapsed() > Duration::from_secs(2) {
+            self.adopt_left_over();
         }
     }
 

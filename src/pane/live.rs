@@ -45,8 +45,40 @@ pub struct LivePane {
     pub screen: LiveScreen,
 }
 
+impl LivePane {
+    /// A terminal kept open over a live restart whose hand-off could not be read: all that is
+    /// known is its PTY (`fd`), its size and the program that leads its session (`pid`, 0 when
+    /// none is known).
+    #[cfg(target_os = "linux")]
+    pub fn salvaged(id: PaneId, fd: i32, pid: u32, pgid: i32, (cols, rows): (u16, u16)) -> LivePane {
+        LivePane {
+            id,
+            fd,
+            pid,
+            pgid,
+            spec: PaneSpec::default(),
+            cols,
+            rows,
+            exit_code: None,
+            suspended: false,
+            preparing: false,
+            title: String::new(),
+            bell: false,
+            reported_cwd: None,
+            reported_host: String::new(),
+            ssh: None,
+            seen: Default::default(),
+            reported: None,
+            reported_since_command: false,
+            restored: None,
+            agent: LiveAgent::default(),
+            screen: LiveScreen::default(),
+        }
+    }
+}
+
 /// What kraal knows of the agent in a pane.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Default, Serialize, Deserialize)]
 pub struct LiveAgent {
     pub kind: Option<String>,
     pub state: crate::agent::AgentState,
@@ -61,11 +93,12 @@ pub struct LiveAgent {
 
 /// What an emulator shows: the primary screen with its history, the alternate screen while a
 /// full-screen program uses it, and the modes.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Default, Serialize, Deserialize)]
 pub struct LiveScreen {
     pub primary: ScreenText,
-    /// The kitty keyboard flags of the primary screen.
-    pub primary_keyboard: u8,
+    /// The kitty keyboard flags pushed on the primary and the alternate screen, oldest first:
+    /// a program pops back to the flags it pushed before.
+    pub keyboard_stacks: [Vec<u8>; 2],
     pub alternate: Option<ScreenText>,
     pub modes: Modes,
     /// The cursor's shape (DECSCUSR), when the program changed it.
@@ -73,7 +106,7 @@ pub struct LiveScreen {
 }
 
 /// One screen's text and cursor.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Default, Serialize, Deserialize)]
 pub struct ScreenText {
     /// Its lines, history first, as `scrollback_ansi` writes them.
     pub text: String,
@@ -86,7 +119,8 @@ pub struct ScreenText {
 }
 
 /// The modes a program set that change what it is sent or how it shows. The kitty keyboard
-/// flags are those of the screen in use.
+/// flags are those in force on the screen in use (set without a push, they are not the last
+/// pushed).
 #[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Modes {
     pub app_cursor: bool,
@@ -220,37 +254,50 @@ impl TermPane {
     fn capture(&mut self) -> LiveScreen {
         let modes = Modes::of(*self.term.mode());
         let cursor_shape = cursor_param(self.term.cursor_style());
+        let keyboard_stacks = self.guard.keyboard_stacks().clone();
         if !self.term.mode().contains(TermMode::ALT_SCREEN) {
             let primary = ScreenText::of(&self.term);
-            return LiveScreen { primary, primary_keyboard: modes.keyboard, alternate: None, modes, cursor_shape };
+            return LiveScreen { primary, keyboard_stacks, alternate: None, modes, cursor_shape };
         }
         let alternate = ScreenText::of(&self.term);
         // The primary screen is out of reach behind the alternate one: switch to it, then back
-        // (which clears the alternate screen: it is drawn again).
+        // (which clears the alternate screen, and puts the flags of the top of its stack in
+        // force: it is drawn again, and the flags it had set again).
         self.term.swap_alt();
         let primary = ScreenText::of(&self.term);
-        let primary_keyboard = keyboard_flags(*self.term.mode());
         self.term.swap_alt();
         let rows = self.term.grid().screen_lines() as u16;
-        self.advance(&alternate.replay(rows));
+        let mut again = alternate.replay(rows);
+        again.extend(format!("\x1b[={};1u", modes.keyboard).as_bytes());
+        self.advance(&again);
         self.events.borrow_mut().clear();
-        LiveScreen { primary, primary_keyboard, alternate: Some(alternate), modes, cursor_shape }
+        LiveScreen { primary, keyboard_stacks, alternate: Some(alternate), modes, cursor_shape }
     }
 
     /// Show `screen` on this emulator, fresh and of the same size as the one it was taken from.
     fn show(&mut self, screen: &LiveScreen) {
         let rows = self.term.grid().screen_lines() as u16;
-        let mut out = screen.primary.replay(rows);
-        if screen.primary_keyboard != 0 {
-            out.extend(format!("\x1b[>{}u", screen.primary_keyboard).as_bytes());
+        let push = |out: &mut Vec<u8>, stack: &[u8]| {
+            for flags in stack {
+                out.extend(format!("\x1b[>{flags}u").as_bytes());
+            }
+        };
+        let [primary_stack, alternate_stack] = &screen.keyboard_stacks;
+        let mut out = Vec::new();
+        // The alternate screen keeps its stack while the primary one shows.
+        if screen.alternate.is_none() && !alternate_stack.is_empty() {
+            out.extend_from_slice(b"\x1b[?1049h");
+            push(&mut out, alternate_stack);
+            out.extend_from_slice(b"\x1b[?1049l");
         }
+        out.extend(screen.primary.replay(rows));
+        push(&mut out, primary_stack);
         if let Some(alt) = &screen.alternate {
             out.extend_from_slice(b"\x1b[?1049h");
             out.extend(alt.replay(rows));
-            if screen.modes.keyboard != 0 {
-                out.extend(format!("\x1b[>{}u", screen.modes.keyboard).as_bytes());
-            }
+            push(&mut out, alternate_stack);
         }
+        out.extend(format!("\x1b[={};1u", screen.modes.keyboard).as_bytes());
         out.extend(screen.modes.sequence().as_bytes());
         if let Some(shape) = screen.cursor_shape {
             out.extend(format!("\x1b[{shape} q").as_bytes());
@@ -303,52 +350,57 @@ impl Pane {
         })
     }
 
-    /// The pane `live` describes, on its PTY (`fd`, owned from now on) and program, showing what
-    /// it showed. `name` and the place in the layout come with the session's state.
+    /// The pane `live` describes, on its PTY (`fd`, owned from now on) and its program (unless
+    /// it is not this process's: `process`), showing what it showed. `name` and the place in
+    /// the layout come with the session's state.
     pub fn adopt(
-        live: LivePane,
+        live: &LivePane,
         fd: std::os::fd::OwnedFd,
+        process: bool,
         name: Option<String>,
         env: &PaneEnv,
         tx: &Sender<Event>,
     ) -> Result<Pane> {
         let (cols, rows) = (live.cols.max(2), live.rows.max(1));
         let watch = live.exit_code.is_none();
-        let mut term = TermPane::adopt(live.id, fd, live.pid, watch, (cols, rows), env, tx)?;
+        let pid = process.then_some(live.pid);
+        let mut term = TermPane::adopt(live.id, fd, pid, watch, (cols, rows), env, tx)?;
         term.show(&live.screen);
         let since = Instant::now().checked_sub(Duration::from_millis(live.agent.for_ms)).unwrap_or_else(Instant::now);
+        // A finished transfer's window closes by itself, as it was going to.
+        let closes = live.spec.close_on_success && live.exit_code == Some(Some(0));
         Ok(Pane {
             id: live.id,
             name,
-            title: live.title,
-            spec: live.spec,
+            title: live.title.clone(),
+            spec: live.spec.clone(),
             content: Content::Term(Box::new(term)),
             cols,
             rows,
             agent: AgentTracker {
-                kind: live.agent.kind,
+                kind: live.agent.kind.clone(),
                 state: live.agent.state,
                 since,
                 hooked: live.agent.hooked,
-                session_id: live.agent.session_id,
-                message: live.agent.message,
+                session_id: live.agent.session_id.clone(),
+                message: live.agent.message.clone(),
                 reporter: live.agent.reporter,
             },
             exit_code: live.exit_code,
             last_output: Instant::now(),
             bell: live.bell,
-            reported_cwd: live.reported_cwd,
-            reported_host: live.reported_host,
-            ssh: live.ssh,
-            seen: live.seen,
-            reported: live.reported,
+            reported_cwd: live.reported_cwd.clone(),
+            reported_host: live.reported_host.clone(),
+            ssh: live.ssh.clone(),
+            seen: live.seen.clone(),
+            reported: live.reported.clone(),
             reported_since_command: live.reported_since_command,
-            close_at: None,
+            close_at: closes.then(|| Instant::now() + Duration::from_secs(3)),
             restart_with: None,
             suspended: live.suspended,
             preparing: live.preparing,
             search: None,
-            restored: live.restored,
+            restored: live.restored.clone(),
         })
     }
 
@@ -402,6 +454,12 @@ impl Pane {
         let mut signals = Vec::new();
         self.drain_events(&mut signals);
         signals
+    }
+
+    /// Whether nothing uses the pane's terminal any more (see `TermPane::output_ended`); a
+    /// pane that is not a terminal has none.
+    pub fn terminal_ended(&self) -> bool {
+        self.term().is_none_or(|t| t.output_ended())
     }
 
     /// Bytes typed or pasted that the PTY has not taken yet.
@@ -566,6 +624,41 @@ mod tests {
         );
         before.kill();
         after.kill();
+    }
+
+    /// A program pops back to the keyboard flags it pushed before, on either screen, and keeps
+    /// the flags it set without pushing.
+    #[test]
+    fn keyboard_stacks_come_back_whole() {
+        let (tx, _rx) = crossbeam_channel::bounded(64);
+        let spec = PaneSpec { command: vec!["sleep".into(), "5".into()], ..Default::default() };
+        let flags = |p: &Pane| keyboard_flags(*p.term().unwrap().term.mode());
+        for (setup, alternate) in [
+            // A full-screen program over a prompt with its own flags.
+            (&b"\x1b[>8u\x1b[>1u\x1b[?1049h\x1b[>4u\x1b[>2u\x1b[=3;2u"[..], true),
+            // Back on the primary screen: the alternate one keeps its stack.
+            (b"\x1b[>8u\x1b[>1u\x1b[?1049h\x1b[>4u\x1b[>2u\x1b[?1049l\x1b[=5;1u", false),
+        ] {
+            let mut before = Pane::spawn(1, None, spec.clone(), 20, 5, &env(), &tx).unwrap();
+            before.feed(setup);
+            let modes = *before.term().unwrap().term.mode();
+            let Content::Term(t) = &mut before.content else { panic!() };
+            let saved = t.capture();
+            assert_eq!(*t.term.mode(), modes, "taking it leaves the pane as it was");
+            assert_eq!(saved.alternate.is_some(), alternate);
+            let saved: LiveScreen = serde_json::from_str(&serde_json::to_string(&saved).unwrap()).unwrap();
+            let mut after = Pane::spawn(2, None, spec.clone(), 20, 5, &env(), &tx).unwrap();
+            let Content::Term(fresh) = &mut after.content else { panic!() };
+            fresh.show(&saved);
+            assert_eq!(flags(&after), flags(&before), "{setup:?}");
+            for step in [&b"\x1b[<u"[..], b"\x1b[<u", b"\x1b[?1049h", b"\x1b[<u", b"\x1b[?1049l", b"\x1b[<u"] {
+                before.feed(step);
+                after.feed(step);
+                assert_eq!(flags(&after), flags(&before), "{setup:?} then {step:?}");
+            }
+            before.kill();
+            after.kill();
+        }
     }
 
     #[test]

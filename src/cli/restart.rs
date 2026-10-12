@@ -47,8 +47,15 @@ pub(super) fn restart(s: &Session, yes: bool, how: How) -> Result<()> {
                     bail!("cancelled");
                 }
                 match running.restart_live() {
-                    Ok(now) => {
+                    Ok((now, not_kept)) => {
                         println!("restarted session {session} live: {} → kraal {now}", running.runs());
+                        if !not_kept.is_empty() {
+                            // Their programs run on all the same: none was stopped.
+                            eprintln!("Not taken over as it was (its program runs on):");
+                            for line in &not_kept {
+                                eprintln!("  {line}");
+                            }
+                        }
                         return Ok(());
                     }
                     Err(Live::Refused(why)) if how == How::Either => println!("It did not restart live: {why}."),
@@ -184,24 +191,41 @@ impl Running {
         client::upgrade(&self.socket, true, Some(binary))
     }
 
-    /// Restart it live on this kraal: the release it runs then.
-    fn restart_live(&self) -> Result<String, Live> {
+    /// Restart it live on this kraal: the release it runs then, and what it could not take
+    /// over as it was.
+    fn restart_live(&self) -> Result<(String, Vec<String>), Live> {
         let exe = client::installed_exe().map_err(Live::Failed)?;
-        let before = client::identify(&self.socket).map_err(Live::Failed)?;
+        let identity = client::identify(&self.socket).map_err(Live::Failed)?;
         client::upgrade(&self.socket, false, Some(exe)).map_err(Live::Refused)?;
         // It answers again once the new kraal has taken everything over: the same process, and
-        // the same session (a server that could not take over starts afresh in that process).
+        // the same session (a server that could not take over starts afresh in that process),
+        // one live restart further, which says what it took over.
+        let before = identity.live.as_ref().map_or(0, |l| l.count);
         let start = Instant::now();
         loop {
-            if let Ok((pid, version, boot)) = client::identify(&self.socket) {
-                if pid != before.0 || boot != before.2 {
+            if let Ok(after) = client::identify(&self.socket) {
+                if after.pid != identity.pid || after.boot != identity.boot {
+                    // The same process that could not read what it took over keeps the
+                    // terminals it was handed.
+                    let kept = after.pid == identity.pid && after.live.is_some_and(|l| !l.not_kept.is_empty());
+                    let what = match kept {
+                        true => "the programs in its panes run on, in workspace recovered",
+                        false => "its programs stopped",
+                    };
                     return Err(Live::Failed(anyhow!(
-                        "session {} restarted, but not live: its programs stopped (see {})",
+                        "session {} restarted, but not live: {what} (see {})",
                         self.name,
                         paths::log_path(&self.name).display()
                     )));
                 }
-                return Ok(version);
+                let Some(live) = after.live.filter(|l| l.count == before + 1) else {
+                    return Err(Live::Failed(anyhow!(
+                        "session {} answers, but does not say it took over (see {})",
+                        self.name,
+                        paths::log_path(&self.name).display()
+                    )));
+                };
+                return Ok((after.version, live.not_kept));
             }
             if start.elapsed() > Duration::from_secs(30) {
                 return Err(Live::Failed(anyhow!(

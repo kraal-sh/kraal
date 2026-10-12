@@ -120,16 +120,22 @@ pub enum ClientMsg {
         /// (a local client is that binary): the server says when it is newer than its own.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         installed: Option<String>,
-        /// The client follows a live restart (see [`ServerMsg::Exit`]) and holds what is typed
-        /// when asked to (see [`ServerMsg::Hold`]); an older one is told to attach again.
+        /// The client follows a live restart (see [`ServerMsg::Exit`]), and holds what is typed
+        /// when asked to, saying when it does (see [`ServerMsg::Hold`]); an older one is told
+        /// to attach again.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-        live: bool,
+        follows_live: bool,
     },
     Resize {
         cols: u16,
         rows: u16,
     },
     Detach,
+    /// The answer to [`ServerMsg::Hold`] `attempt`: what was typed before is sent whole (no key
+    /// or paste cut in two), and what is typed from here on is held.
+    Held {
+        attempt: u32,
+    },
     /// One control request; the server answers with [`ServerMsg::Response`] and closes.
     Request {
         version: u32,
@@ -153,11 +159,16 @@ pub enum ServerMsg {
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         live: bool,
     },
-    /// Keep what is typed (`on`) rather than send it, until told otherwise or attached again:
-    /// the server is about to replace itself (a live restart), and would lose it. Only to a
-    /// client that said it follows live restarts.
+    /// Keep what is typed (`on`) rather than send it, from the next point between two keys,
+    /// and say so ([`ClientMsg::Held`]); until told otherwise or attached again. The server is
+    /// about to replace itself (a live restart), and would lose it. Only to a client that said
+    /// it follows live restarts.
     Hold {
         on: bool,
+        /// Which time it asks, said again in the answer: an answer that comes late to a
+        /// request given up on is not taken for the next one's.
+        #[serde(default)]
+        attempt: u32,
     },
     /// The first answer to an attach: the server's kraal release. A server that does not send
     /// it is older than this message.
@@ -369,6 +380,17 @@ pub enum Request {
     },
 }
 
+/// What a live restart took over (see [`Response::Pong`]).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LiveRestart {
+    /// Live restarts since the session's server started, this one included.
+    pub count: u32,
+    /// Panes whose programs run on, taken over.
+    pub kept: u32,
+    /// What it could not take over as it was, a line each.
+    pub not_kept: Vec<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "data", rename_all = "snake_case")]
 pub enum Response {
@@ -381,6 +403,9 @@ pub enum Response {
         /// a restart that is not live changes it.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         boot: Option<u64>,
+        /// What the last live restart took over, when there was one since then.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        live: Option<LiveRestart>,
     },
     Pane(Box<PaneInfo>),
     Panes(Vec<PaneInfo>),
@@ -503,9 +528,9 @@ mod tests {
         let hello = r#"{"type":"attach","version":2,"cols":80,"rows":24,"workspace":null,"remote":false}"#;
         assert!(matches!(
             serde_json::from_str::<ClientMsg>(hello),
-            Ok(ClientMsg::Attach { installed: None, live: false, .. })
+            Ok(ClientMsg::Attach { installed: None, follows_live: false, .. })
         ));
         let pong = r#"{"kind":"pong","data":{"pid":1,"session":"s","version":"0.2.0"}}"#;
-        assert!(matches!(serde_json::from_str::<Response>(pong), Ok(Response::Pong { boot: None, .. })));
+        assert!(matches!(serde_json::from_str::<Response>(pong), Ok(Response::Pong { boot: None, live: None, .. })));
     }
 }

@@ -190,6 +190,8 @@ pub struct TermPane {
     /// Bytes sent to the PTY not written yet: a program that stops reading its input cannot
     /// make kraal hold an unbounded amount of it.
     pub(super) input_pending: Arc<AtomicUsize>,
+    /// The PTY takes no input any more (writing it failed): what is sent goes nowhere.
+    input_closed: Arc<AtomicBool>,
     /// Input was dropped because of that, since the server last asked.
     pub input_dropped: bool,
     /// Output read from the PTY, waiting to be parsed. Small and bounded: a program printing
@@ -300,23 +302,31 @@ impl TermPane {
         Ok(pane)
     }
 
-    /// A pane on the PTY (`fd`) and the program (`pid`) a live restart took over: the kraal
-    /// this one replaced kept them open and running over its exec. `watch`: wait for the
-    /// program to end (it had not, as far as that kraal knew).
+    /// A pane on the PTY (`fd`) and the program (`pid`, when it is this process's to take) a
+    /// live restart took over: the kraal this one replaced kept them open and running over its
+    /// exec. `watch`: wait for the program to end (it had not, as far as that kraal knew). When
+    /// the pane cannot be made, the program is left as it was: nothing here reaps it.
     pub(super) fn adopt(
         id: PaneId,
         fd: std::os::fd::OwnedFd,
-        pid: u32,
+        pid: Option<u32>,
         watch: bool,
         size: (u16, u16),
         env: &PaneEnv,
         tx: &Sender<Event>,
     ) -> Result<TermPane> {
         start_reaper().context("starting the thread that reaps panes' programs")?;
-        let child: PaneChild = Box::new(AdoptedChild { pid });
-        let process = Arc::new(Process { pid: Some(pid), child: Mutex::new(Some(child)) });
-        crate::exec::reaping_starts(pid);
-        TermPane::assemble(id, Box::new(AdoptedPty { fd }), process, watch, size, env, tx)
+        let child = pid.map(|pid| Box::new(AdoptedChild { pid }) as PaneChild);
+        let process = Arc::new(Process { pid, child: Mutex::new(child) });
+        let held = process.clone();
+        let pane = TermPane::assemble(id, Box::new(AdoptedPty { fd }), process, watch && pid.is_some(), size, env, tx)
+            .inspect_err(|_| {
+                held.child.lock().unwrap_or_else(|e| e.into_inner()).take();
+            })?;
+        if let Some(pid) = pid {
+            crate::exec::reaping_starts(pid);
+        }
+        Ok(pane)
     }
 
     /// The threads that read and write the PTY, the one that waits for the program to end
@@ -360,6 +370,7 @@ impl TermPane {
             master,
             input: io.input,
             input_pending: io.input_pending,
+            input_closed: io.input_closed,
             input_dropped: false,
             output: io.output,
             pid: process.pid,
@@ -375,17 +386,28 @@ impl TermPane {
     }
 
     /// Stop reading the PTY: what was read is still to be taken, and then the output channel
-    /// says it ended (see `Pane::drain`). What the program writes next waits in the PTY.
+    /// says it ended (see `Pane::drain`). What the program writes next waits in the PTY, and
+    /// its end cannot be seen meanwhile: an exit waits for it as long as it takes.
     pub(super) fn stop_reading(&self) {
+        self.eof.pause(true);
         self.reader_stop.store(true, Ordering::Relaxed);
     }
 
     /// Read the PTY again after [`TermPane::stop_reading`].
     pub(super) fn resume_reading(&mut self, id: PaneId, tx: &Sender<Event>) -> Result<()> {
-        let (output, stop) = start_reader(id, &*self.master, tx, &self.eof)?;
+        let started = start_reader(id, &*self.master, tx, &self.eof);
+        self.eof.pause(false);
+        let (output, stop) = started?;
         self.output = output;
         self.reader_stop = stop;
         Ok(())
+    }
+
+    /// Whether the PTY's output ended: nothing has it open any more, to read or to write.
+    /// Until then a program may still use it, the pane's own one ended or not (one it left in
+    /// the background).
+    pub(super) fn output_ended(&self) -> bool {
+        self.eof.seen()
     }
 
     /// The PTY's descriptor, which a live restart keeps open for the next kraal.
@@ -393,8 +415,11 @@ impl TermPane {
         self.master.as_raw_fd()
     }
 
-    /// Bytes of input not written to the PTY yet.
+    /// Bytes of input not written to the PTY yet, and that it may still take.
     pub(super) fn input_pending(&self) -> usize {
+        if self.input_closed.load(Ordering::Relaxed) {
+            return 0;
+        }
         self.input_pending.load(Ordering::Relaxed)
     }
 
@@ -415,6 +440,9 @@ impl TermPane {
     }
 
     pub(super) fn write(&mut self, bytes: Vec<u8>) {
+        if self.input_closed.load(Ordering::Relaxed) {
+            return;
+        }
         if self.input_pending.load(Ordering::Relaxed) + bytes.len() > MAX_PENDING_INPUT {
             self.input_dropped = true;
             return;
@@ -484,6 +512,7 @@ fn findable(program: &OsStr, dir: &Path, path: Option<&OsStr>) -> bool {
 struct Io {
     input: Sender<Vec<u8>>,
     input_pending: Arc<AtomicUsize>,
+    input_closed: Arc<AtomicBool>,
     output: crossbeam_channel::Receiver<Vec<u8>>,
     /// Set when the reader has seen the end of the output.
     eof: Arc<Eof>,
@@ -496,10 +525,12 @@ fn start_io(id: PaneId, master: &(dyn MasterPty + Send), tx: &Sender<Event>) -> 
     let (out_rx, stop) = start_reader(id, master, tx, &eof)?;
     let (in_tx, in_rx) = crossbeam_channel::unbounded::<Vec<u8>>();
     let input_pending = Arc::new(AtomicUsize::new(0));
-    let pending = input_pending.clone();
+    let input_closed = Arc::new(AtomicBool::new(false));
+    let (pending, closed) = (input_pending.clone(), input_closed.clone());
     let started = std::thread::Builder::new().name(format!("pane-{id}-write")).spawn(move || {
         for data in in_rx {
             if writer.write_all(&data).and_then(|_| writer.flush()).is_err() {
+                closed.store(true, Ordering::Relaxed);
                 break;
             }
             pending.fetch_sub(data.len(), Ordering::Relaxed);
@@ -509,27 +540,62 @@ fn start_io(id: PaneId, master: &(dyn MasterPty + Send), tx: &Sender<Event>) -> 
         stop.store(true, Ordering::Relaxed);
         return Err(e.into());
     }
-    Ok(Io { input: in_tx, input_pending, output: out_rx, eof, stop })
+    Ok(Io { input: in_tx, input_pending, input_closed, output: out_rx, eof, stop })
 }
 
 /// Whether a PTY's output has ended, as its readers saw it: a reader stopped (and replaced, see
 /// [`TermPane::resume_reading`]) has not seen it.
 #[derive(Default)]
 pub(super) struct Eof {
-    seen: Mutex<bool>,
+    state: Mutex<EofState>,
     told: std::sync::Condvar,
 }
 
+#[derive(Default)]
+struct EofState {
+    seen: bool,
+    /// The PTY is not read for now: its end cannot be seen.
+    paused: bool,
+}
+
 impl Eof {
+    fn lock(&self) -> std::sync::MutexGuard<'_, EofState> {
+        self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     fn set(&self) {
-        *self.seen.lock().unwrap_or_else(|e| e.into_inner()) = true;
+        self.lock().seen = true;
         self.told.notify_all();
     }
 
-    /// Wait until the end was seen, at most `limit`.
+    fn pause(&self, paused: bool) {
+        self.lock().paused = paused;
+        self.told.notify_all();
+    }
+
+    fn seen(&self) -> bool {
+        self.lock().seen
+    }
+
+    /// Wait until the end was seen, at most `limit` of the time the PTY is read.
     fn wait(&self, limit: std::time::Duration) {
-        let seen = self.seen.lock().unwrap_or_else(|e| e.into_inner());
-        let _ = self.told.wait_timeout_while(seen, limit, |seen| !*seen);
+        let mut state = self.lock();
+        let mut left = limit;
+        while !state.seen {
+            if state.paused {
+                state = self.told.wait(state).unwrap_or_else(|e| e.into_inner());
+                continue;
+            }
+            if left.is_zero() {
+                return;
+            }
+            let start = std::time::Instant::now();
+            state = match self.told.wait_timeout(state, left) {
+                Ok((state, _)) => state,
+                Err(e) => e.into_inner().0,
+            };
+            left = left.saturating_sub(start.elapsed());
+        }
     }
 }
 
@@ -1036,7 +1102,7 @@ mod tests {
         let script = format!("while [ ! -e '{}' ]; do sleep 0.05; done; echo LAST", go.display());
         let spec = PaneSpec { command: vec!["sh".into(), "-c".into(), script], ..Default::default() };
         let mut pane = super::Pane::spawn(1, None, spec, 80, 24, &env, &tx).unwrap();
-        let ended = |pane: &super::Pane| *pane.term().unwrap().eof.seen.lock().unwrap();
+        let ended = |pane: &super::Pane| pane.term().unwrap().eof.seen();
         pane.stop_reading();
         let start = Instant::now();
         while !matches!(pane.drain(), crate::pane::Drained::Stopped) {
@@ -1057,6 +1123,53 @@ mod tests {
         }
         while let Some(data) = pane.take_output() {
             seen.extend_from_slice(&data);
+        }
+        assert!(String::from_utf8_lossy(&seen).contains("LAST"), "{:?}", String::from_utf8_lossy(&seen));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A program that writes its last output and ends while its PTY is not read (a live restart
+    /// being prepared, however long that takes) is told to have ended only once that output can
+    /// be read: the time the PTY is not read does not count.
+    #[test]
+    fn an_exit_waits_for_the_output_while_the_pty_is_not_read() {
+        let dir = std::env::temp_dir().join(format!("kraal-unread-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let go = dir.join("go");
+        let (tx, rx) = crossbeam_channel::bounded(1024);
+        let env = PaneEnv {
+            socket: "/nonexistent".into(),
+            session: "t".into(),
+            shell: "sh".into(),
+            scrollback: 100,
+            graphics: Default::default(),
+        };
+        let script = format!("while [ ! -e '{}' ]; do sleep 0.05; done; echo LAST", go.display());
+        let spec = PaneSpec { command: vec!["sh".into(), "-c".into(), script], ..Default::default() };
+        let mut pane = super::Pane::spawn(1, None, spec, 80, 24, &env, &tx).unwrap();
+        pane.stop_reading();
+        let start = Instant::now();
+        while !matches!(pane.drain(), crate::pane::Drained::Stopped) {
+            assert!(start.elapsed() < Duration::from_secs(5), "the reader did not stop");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        std::fs::write(&go, "").unwrap();
+        // Longer than an exit waits for its output while the PTY is read.
+        std::thread::sleep(Duration::from_secs(3));
+        assert!(!rx.try_iter().any(|e| matches!(e, Event::PaneExited(..))), "told while the PTY was not read");
+        pane.resume_reading(&tx).unwrap();
+        let mut seen = Vec::new();
+        let start = Instant::now();
+        loop {
+            assert!(start.elapsed() < Duration::from_secs(10), "the end was not told");
+            let exited = rx.try_iter().any(|e| matches!(e, Event::PaneExited(..)));
+            while let Some(data) = pane.take_output() {
+                seen.extend_from_slice(&data);
+            }
+            if exited {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
         }
         assert!(String::from_utf8_lossy(&seen).contains("LAST"), "{:?}", String::from_utf8_lossy(&seen));
         let _ = std::fs::remove_dir_all(&dir);

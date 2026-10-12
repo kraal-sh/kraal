@@ -95,6 +95,11 @@ impl InputParser {
         }
     }
 
+    /// Whether all it was fed was read whole: no sequence cut in two, no paste still coming.
+    pub fn idle(&self) -> bool {
+        self.buf.is_empty() && self.paste.is_none()
+    }
+
     /// Called after a short timeout when [`has_pending`](Self::has_pending): turn whatever is
     /// pending into events. `ESC` + one printable byte (e.g. `ESC [`) becomes Alt+that key, other
     /// partial sequences become [`InputEvent::Raw`]. Inside a bracketed paste, the content

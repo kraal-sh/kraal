@@ -308,25 +308,43 @@ pub fn apply(server: &mut Server, snap: SessionSnapshot) -> Result<()> {
             server.warnings.push(format!("tunnel {}: {e:#}", t.describe()));
         }
     }
-    apply_layout(server, snap.workspaces, snap.revision, &mut spawn);
+    apply_layout(server, snap.workspaces, snap.revision, false, &mut spawn);
     Ok(())
 }
 
-/// Make the workspaces of a state again, each pane with `make`.
-pub fn apply_layout(server: &mut Server, workspaces: Vec<WorkspaceSnap>, revision: u32, make: &mut MakePane) {
+/// Make the workspaces of a state again, each pane with `make`. After a restart that is not
+/// live, a workspace that cannot be made whole is not made at all. After a live one (`live`),
+/// every pane that can be made is, in its place, and the others are left out (`make` keeps
+/// their programs running): no pane already made is stopped for another one.
+pub fn apply_layout(
+    server: &mut Server,
+    workspaces: Vec<WorkspaceSnap>,
+    revision: u32,
+    live: bool,
+    make: &mut MakePane,
+) {
     for ws in workspaces {
         let panes_before: std::collections::HashSet<PaneId> = server.panes.keys().copied().collect();
         let workspaces_before: Vec<u32> = server.workspaces.iter().map(|w| w.id).collect();
         let name = ws.name.clone();
-        if let Err(e) = apply_workspace(server, ws, revision, make) {
+        let mut left_out = Vec::new();
+        if let Err(e) = apply_workspace(server, ws, revision, live, make, &mut left_out) {
             server.rollback(&panes_before, &workspaces_before);
             server.warnings.push(format!("could not restore workspace {name}: {e:#}"));
         }
+        server.warnings.extend(left_out);
     }
     server.relayout();
 }
 
-fn apply_workspace(server: &mut Server, ws: WorkspaceSnap, revision: u32, make: &mut MakePane) -> Result<()> {
+fn apply_workspace(
+    server: &mut Server,
+    ws: WorkspaceSnap,
+    revision: u32,
+    live: bool,
+    make: &mut MakePane,
+    left_out: &mut Vec<String>,
+) -> Result<()> {
     {
         let id = server.new_workspace(ws.name, ws.definition);
         let wi = server.ws_index(id).unwrap();
@@ -338,14 +356,22 @@ fn apply_workspace(server: &mut Server, ws: WorkspaceSnap, revision: u32, make: 
             let old_default = revision == 0 && t.name.strip_prefix("tab ").is_some_and(|n| n.parse::<u32>().is_ok());
             let mut tab = Tab::new(tab_id, if old_default { String::new() } else { t.name });
             if let Some(root) = &t.root {
-                tab.root = Some(build(server, root, make)?);
+                tab.root = build(server, root, live, make, left_out)?;
             }
             for (p, rect) in &t.floating {
-                // Transfer windows are not worth bringing back.
-                if p.spec.close_on_success {
+                // Transfer windows are not worth bringing back (a live restart keeps them as
+                // they are, until they close by themselves).
+                if p.spec.close_on_success && !live {
                     continue;
                 }
-                let pane = make(server, p)?;
+                let pane = match make(server, p) {
+                    Ok(pane) => pane,
+                    Err(e) if live => {
+                        left_out.push(format!("{e:#}"));
+                        continue;
+                    }
+                    Err(e) => return Err(e),
+                };
                 tab.floating.push(Floating { pane, rect: *rect });
             }
             let panes = tab.panes();
@@ -370,17 +396,37 @@ fn apply_workspace(server: &mut Server, ws: WorkspaceSnap, revision: u32, make: 
     Ok(())
 }
 
-fn build(server: &mut Server, n: &NodeSnap, make: &mut MakePane) -> Result<Node> {
+/// The layout `n` describes, each pane made with `make`. A pane that cannot be made fails the
+/// whole, or, `live`, is left out (why goes to `left_out`).
+fn build<S>(
+    server: &mut S,
+    n: &NodeSnap,
+    live: bool,
+    make: &mut dyn FnMut(&mut S, &PaneSnap) -> Result<PaneId>,
+    left_out: &mut Vec<String>,
+) -> Result<Option<Node>> {
     Ok(match n {
-        NodeSnap::Pane(p) => Node::Leaf(make(server, p)?),
+        NodeSnap::Pane(p) => match make(server, p) {
+            Ok(id) => Some(Node::Leaf(id)),
+            Err(e) if live => {
+                left_out.push(format!("{e:#}"));
+                None
+            }
+            Err(e) => return Err(e),
+        },
         NodeSnap::Split { axis, children } => {
             let mut out = Vec::new();
             for (c, w) in children {
-                out.push((build(server, c, make)?, *w));
+                if let Some(node) = build(server, c, live, make, left_out)? {
+                    out.push((node, *w));
+                }
+            }
+            if out.is_empty() {
+                return Ok(None);
             }
             let mut node = Node::Split { axis: *axis, children: out };
             node.normalize();
-            node
+            Some(node)
         }
     })
 }
@@ -463,6 +509,33 @@ fn restore_scrollback(server: &mut Server, id: PaneId, p: &PaneSnap) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// After a live restart, a pane that cannot be made is left out of the layout alone; after
+    /// a restart that is not live, it fails the whole.
+    #[test]
+    fn a_pane_that_cannot_be_made_live_is_left_out_alone() {
+        let pane = |name: &str| {
+            let snap = serde_json::json!({"name": name, "spec": {}, "agent": null, "agent_session": null});
+            NodeSnap::Pane(Box::new(serde_json::from_value(snap).unwrap()))
+        };
+        let inner = NodeSnap::Split { axis: Axis::Column, children: vec![(pane("bad"), 0.5), (pane("c"), 0.5)] };
+        let tree = NodeSnap::Split { axis: Axis::Row, children: vec![(pane("a"), 0.5), (inner, 0.5)] };
+        let mut make = |made: &mut Vec<String>, p: &PaneSnap| -> Result<PaneId> {
+            let name = p.name.clone().unwrap();
+            if name == "bad" {
+                anyhow::bail!("pane bad: no descriptor to spare");
+            }
+            made.push(name);
+            Ok(made.len() as PaneId)
+        };
+        let (mut made, mut left_out) = (Vec::new(), Vec::new());
+        let node = build(&mut made, &tree, true, &mut make, &mut left_out).unwrap().unwrap();
+        assert_eq!(made, ["a", "c"]);
+        assert_eq!(node.leaves(), [1, 2]);
+        assert_eq!(left_out, ["pane bad: no descriptor to spare"]);
+        let mut made = Vec::new();
+        assert!(build(&mut made, &tree, false, &mut make, &mut Vec::new()).is_err());
+    }
 
     #[test]
     fn a_restart_stops_programs_not_shells_ssh_shells_or_idle_agents() {

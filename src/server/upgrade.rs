@@ -2,24 +2,31 @@
 //! panes stops.
 //!
 //! `exec` keeps the process, so the panes' programs stay its children, and their PTYs stay open
-//! when their descriptors are not closed on exec. The binary is opened once, tried (it runs and
-//! reads this hand-off's format), and that very file is run, unless it changed meanwhile. Before
-//! the exec, the server stops taking connections (they wait for the next server) and answers
-//! the commands it has read; it waits for the commands its threads run, and holds off new ones;
-//! it stops reading the PTYs (what was read is drawn first), and goes on only when every
-//! program's output stands between two sequences and its input has been taken. It writes a
-//! private hand-off file: the session's state with each pane's id, and for each terminal pane
-//! its PTY's descriptor, its program, and what its emulator shows (text with its attributes,
-//! cursors, modes), read back first to be sure the next server reads it. The new server reads it
-//! (and deletes it), keeps listening on the same socket, rebuilds every pane on its PTY and
-//! program, and has full-screen programs draw themselves again. Attached clients hold what is
-//! typed meanwhile, and come back once it answers.
+//! when their descriptors are not closed on exec. The binary is copied once into a sealed
+//! memory file, tried (it runs and reads this very hand-off format), and that copy is run. Before
+//! the exec, the server stops taking connections (they wait for the next server), answers the
+//! commands it has read and waits until what they were sent is written; attached clients hold
+//! what is typed from a point between two keys and say so (an older client is told to attach
+//! again), and none may be in a paste or a kraal menu. It waits for the commands its threads
+//! run, and holds off new ones; it stops reading the PTYs (what was read is drawn first), and
+//! goes on only when the output of every terminal still in use stands between two sequences and
+//! its input has been taken. It writes a private hand-off file of its own: the session's state
+//! with each pane's id, and for each terminal pane its PTY's descriptor, its program, and what
+//! its emulator shows (text with its attributes, cursors, modes, keyboard stacks), read back
+//! first to be sure the next server reads it. The new server reads it (and deletes it), keeps
+//! listening on the same socket, rebuilds every pane on its PTY and program, and has full-screen
+//! programs draw themselves again; clients come back once it answers.
 //!
 //! What cannot be carried over is refused, with the reason: a runbook run, a transfer, a file
 //! open in the local editor, an account switch, a `kraal wait`; and what does not end within a
 //! few seconds (a hook, background work, a command being answered, input a program does not
-//! read, a sequence cut in two). The server then goes on as before. Tunnels keep their ssh;
-//! those that list remote sessions' agents are started again.
+//! read, a sequence cut in two, a paste still coming). The server then goes on as before.
+//! Tunnels keep their ssh; those that list remote sessions' agents are started again.
+//!
+//! After the exec, nothing is closed under a program: a pane that cannot be taken over is left
+//! out of the layout alone, its PTY kept open and its program running, and is taken over later
+//! into workspace "recovered"; a hand-off that cannot be read leaves every PTY it kept open to
+//! be taken over the same way. `kraal restart` says what was not taken over as it was.
 
 use std::collections::HashMap;
 use std::ffi::{CString, OsStr};
@@ -40,14 +47,16 @@ use super::ui::{ConfirmAction, Mode};
 use super::{ClientId, Event, Server};
 use crate::layout::PaneId;
 use crate::pane::{Drained, LivePane, Pane};
-use crate::persist::{self, PaneSnap, SavedScrollback, SessionSnapshot};
+use crate::persist::{self, SavedScrollback, SessionSnapshot};
 use crate::protocol::{Response, ServerMsg};
 
 /// The format of the hand-off file. A kraal takes over only from one whose format it reads.
-pub const HANDOFF_VERSION: u32 = 1;
+pub const HANDOFF_VERSION: u32 = 2;
 
 /// How long a live restart waits for what is in its way to end before it gives up.
 const IDLE_WAIT: Duration = Duration::from_secs(5);
+/// How long clients have to send what they are sending, and to say they hold what is typed.
+const CLIENTS_WAIT: Duration = Duration::from_secs(2);
 /// How long the hand-off may take to reach the disk.
 const WRITE_WAIT: Duration = Duration::from_secs(5);
 
@@ -60,8 +69,10 @@ pub struct Handoff {
     session: String,
     /// The listening socket, kept open: a client connecting meanwhile waits for the new server.
     listener: RawFd,
-    /// The binary run, kept open to be run: the new server closes it.
+    /// The binary run (a copy), kept open to be run: the new server closes it.
     binary: RawFd,
+    /// Where that kraal is installed, which the copy cannot tell.
+    installed: PathBuf,
     next_id: u32,
     layout_area: (u16, u16, u16, u16),
     sidebar_was_useful: bool,
@@ -79,6 +90,8 @@ pub struct Handoff {
     /// Children no pane has any more (a closed pane's program that ignored the hangup), still to
     /// be reaped when they end.
     reaping: Vec<u32>,
+    /// Live restarts since the session's server started, before this one.
+    live_restarts: u32,
 }
 
 impl Handoff {
@@ -140,52 +153,59 @@ fn binary_to_run(asked: Option<PathBuf>) -> Result<PathBuf, String> {
     Ok(exe)
 }
 
-/// What identifies a file's content: it is the same file, and was not written since (its
-/// change time is not compared: it changes too when the file loses its name to a newer one).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Stamp {
-    dev: u64,
-    ino: u64,
-    size: u64,
-    mtime: (i64, i64),
-}
-
-impl Stamp {
-    fn of(file: &std::fs::File) -> std::io::Result<Stamp> {
-        use std::os::unix::fs::MetadataExt;
-        let m = file.metadata()?;
-        Ok(Stamp { dev: m.dev(), ino: m.ino(), size: m.size(), mtime: (m.mtime(), m.mtime_nsec()) })
-    }
-}
-
-/// The kraal binary a live restart runs, opened once: the file tried is the file run, whatever
-/// its path names by then (an update renames another one over it).
+/// The kraal binary a live restart runs: a sealed copy, made once, of the file installed. The
+/// copy tried is the copy run, whatever is written to the file or renamed over it meanwhile.
 struct Binary {
+    /// Where it is installed: what the next server runs jobs from and restarts on.
     path: PathBuf,
+    /// The copy (on Linux; elsewhere, where there is no live restart, the file itself).
     file: std::fs::File,
-    /// What it was when opened: it must still be that when run.
-    stamp: Stamp,
 }
 
 impl Binary {
     fn open(asked: Option<PathBuf>) -> Result<Binary, String> {
         let path = binary_to_run(asked)?;
-        let file = std::fs::File::open(&path).map_err(|e| format!("cannot open {}: {e}", path.display()))?;
-        let stamp = Stamp::of(&file).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
-        Ok(Binary { path, file, stamp })
+        let file = snapshot(&path).map_err(|e| format!("cannot copy {}: {e}", path.display()))?;
+        Ok(Binary { path, file })
     }
 
     fn fd(&self) -> RawFd {
         self.file.as_raw_fd()
     }
-
-    /// Whether the file is still what was opened (not written to since).
-    fn unchanged(&self) -> bool {
-        Stamp::of(&self.file).is_ok_and(|s| s == self.stamp)
-    }
 }
 
-/// Whether `binary` runs here and takes over this hand-off's format: the very file opened, run
+/// A copy of the file at `path` that cannot change: in memory, sealed against writes.
+#[cfg(target_os = "linux")]
+fn snapshot(path: &Path) -> std::io::Result<std::fs::File> {
+    let name = c"kraal";
+    let flags = libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING;
+    // SAFETY: memfd_create takes a NUL-terminated name. A kernel that runs memfds only when
+    // asked takes MFD_EXEC; an older one does not know it.
+    let mut fd = unsafe { libc::memfd_create(name.as_ptr(), flags | libc::MFD_EXEC) };
+    if fd < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EINVAL) {
+        // SAFETY: as above.
+        fd = unsafe { libc::memfd_create(name.as_ptr(), flags) };
+    }
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: a fresh descriptor nothing else owns.
+    let mut copy = unsafe { std::fs::File::from_raw_fd(fd) };
+    std::io::copy(&mut std::fs::File::open(path)?, &mut copy)?;
+    let seals = libc::F_SEAL_SHRINK | libc::F_SEAL_GROW | libc::F_SEAL_WRITE | libc::F_SEAL_SEAL;
+    // SAFETY: fcntl on a descriptor we own.
+    if unsafe { libc::fcntl(fd, libc::F_ADD_SEALS, seals) } < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(copy)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn snapshot(path: &Path) -> std::io::Result<std::fs::File> {
+    std::fs::File::open(path)
+}
+
+/// Whether `binary` runs here and takes over this hand-off's format: the very copy that is run,
 /// through this process's descriptor of it.
 fn check_binary(binary: &Binary) -> Result<(), String> {
     use std::os::unix::process::CommandExt;
@@ -210,8 +230,27 @@ fn check_binary(binary: &Binary) -> Result<(), String> {
     Err(format!("the kraal installed cannot take over live ({}: an older kraal, or not one)", binary.path.display()))
 }
 
+/// A hand-off file of its own for each attempt: one given up on (its disk too slow) and written
+/// late never takes the place of the next one's.
 fn handoff_path(session: &str) -> PathBuf {
-    crate::paths::state_dir().join(format!("handoff-{session}-{}.json", std::process::id()))
+    static ATTEMPTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = ATTEMPTS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let pid = std::process::id();
+    crate::paths::state_dir().join(format!("handoff-{session}-{pid}-{}-{n}.json", crate::accounts::now()))
+}
+
+/// The largest hand-off the next server reads.
+const MAX_HANDOFF: usize = 1 << 30;
+
+/// The hand-off as it is written, once sure the next server reads it: it parses back, and is
+/// not larger than it reads (`limit`).
+fn encode_handoff(h: &Handoff, limit: usize) -> Result<Vec<u8>, String> {
+    let data = serde_json::to_vec(h).map_err(|e| format!("cannot write down the session: {e}"))?;
+    if data.len() > limit {
+        return Err(format!("the session is too large to hand over ({} MiB)", data.len() >> 20));
+    }
+    parse_handoff(&data).map_err(|e| format!("the session cannot be handed over: {e}"))?;
+    Ok(data)
 }
 
 /// Have descriptor `fd` stay open over exec (`inherited`), or be closed by it.
@@ -298,9 +337,13 @@ fn within<T: Send + 'static>(
 /// Read the hand-off at `path` (deleted at once: it holds what the panes showed) for
 /// `session`. The descriptors it names are not inherited by what this server starts.
 pub fn read_handoff(path: &Path, session: &str) -> Result<Handoff> {
-    let data = crate::paths::read_regular(path, 1 << 30);
+    let data = crate::paths::read_regular(path, MAX_HANDOFF as u64);
     let _ = std::fs::remove_file(path);
     let data = data.with_context(|| format!("reading {}", path.display()))?;
+    #[cfg(debug_assertions)]
+    if std::env::var_os("KRAAL_TEST_UNREADABLE_HANDOFF").is_some() {
+        bail!("a test says it cannot be read");
+    }
     let h = parse_handoff(&data).with_context(|| format!("parsing {}", path.display()))?;
     if h.version != HANDOFF_VERSION {
         bail!("hand-off format {} (this kraal reads {HANDOFF_VERSION})", h.version);
@@ -315,22 +358,67 @@ pub fn read_handoff(path: &Path, session: &str) -> Result<Handoff> {
     unsafe {
         libc::close(h.binary);
     }
+    crate::client::set_installed(h.installed.clone());
     Ok(h)
 }
 
-/// Close every descriptor but the standard ones: those of a hand-off that cannot be read (the
-/// PTYs, whose programs then get a hangup as with a server that stops, and the socket).
-pub fn close_inherited() {
+/// What can be taken of a hand-off that cannot be read: the terminals it kept open, each with
+/// the program leading its session, to take over as they are (see `Server::take_salvaged`).
+/// Every other descriptor it kept open is closed (clients connect again, the socket is made
+/// again), and the other children are reaped once they end.
+pub fn salvage() -> Vec<LivePane> {
     let dir = if cfg!(target_os = "linux") { "/proc/self/fd" } else { "/dev/fd" };
     let fds: Vec<RawFd> = std::fs::read_dir(dir)
         .map(|d| d.flatten().filter_map(|e| e.file_name().to_str()?.parse().ok()).filter(|fd| *fd > 2).collect())
         .unwrap_or_default();
+    let mut terminals = Vec::new();
     for fd in fds {
-        // SAFETY: nothing in this process uses these yet (the directory's own is closed already).
-        unsafe {
-            libc::close(fd);
+        match salvage_terminal(fd) {
+            Some(live) => terminals.push(live),
+            // SAFETY: nothing in this process uses these yet (the directory's own is closed
+            // already).
+            None => unsafe {
+                libc::close(fd);
+            },
         }
     }
+    let leaders: Vec<u32> = terminals.iter().map(|t| t.pid).collect();
+    for pid in crate::process::children(std::process::id()) {
+        if !leaders.contains(&pid) && crate::exec::is_child(pid) {
+            crate::exec::reap_pid_later(pid);
+        }
+    }
+    terminals
+}
+
+/// Descriptor `fd`, when it is the main side of a PTY, as a pane to take over (its id given
+/// later).
+#[cfg(not(target_os = "linux"))]
+fn salvage_terminal(_fd: RawFd) -> Option<LivePane> {
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn salvage_terminal(fd: RawFd) -> Option<LivePane> {
+    // SAFETY: plain syscall on a descriptor of this process.
+    if unsafe { libc::isatty(fd) } != 1 {
+        return None;
+    }
+    let target = std::fs::read_link(format!("/proc/self/fd/{fd}")).ok()?;
+    if !target.to_string_lossy().ends_with("ptmx") {
+        return None;
+    }
+    let mut session: libc::pid_t = 0;
+    // SAFETY: TIOCGSID writes the session of the terminal's other side; TIOCGWINSZ its size.
+    let leader = match unsafe { libc::ioctl(fd, libc::TIOCGSID as _, &mut session) } {
+        0 if session > 0 => session as u32,
+        _ => 0,
+    };
+    let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
+    let _ = unsafe { libc::ioctl(fd, libc::TIOCGWINSZ as _, &mut ws) };
+    // SAFETY: plain syscall.
+    let group = if leader > 0 { unsafe { libc::getpgid(leader as libc::pid_t) } } else { -1 };
+    Some(LivePane::salvaged(0, fd, leader, group, (ws.ws_col.max(2), ws.ws_row.max(1))))
 }
 
 type Reply = Option<Result<Response, String>>;
@@ -362,10 +450,9 @@ enum NotNow {
 }
 
 /// What is held while a live restart is prepared: connections not handled yet, which go to the
-/// next server, and events read meanwhile, handled should it not happen.
+/// next server.
 struct Held {
     connections: Vec<UnixStream>,
-    events: Vec<Event>,
 }
 
 impl Server {
@@ -493,12 +580,23 @@ impl Server {
         if let Some(w) = self.waits.first() {
             return Some(format!("`kraal wait` is waiting on {}: try again once it ends", self.pane_label(w.pane)));
         }
+        if let Some(left) = self.unadopted.first() {
+            return Some(format!(
+                "pane {} was not taken over yet after the last live restart (its program runs): {}",
+                left.live.id, left.why
+            ));
+        }
         None
     }
 
     /// What a live restart waits for, a few seconds at most: what usually ends by itself in a
-    /// moment.
+    /// moment. A pane's program first: what keeps it busy lasts, and is what the user can act on.
     fn upgrade_busy(&self) -> Option<String> {
+        self.pane_busy().or_else(|| self.server_busy())
+    }
+
+    /// What the server does that would be lost in the exec.
+    fn server_busy(&self) -> Option<String> {
         if self.hooks.running() > 0 {
             return Some("a hook is running".into());
         }
@@ -511,18 +609,18 @@ impl Server {
         if self.tunnels.iter().any(|t| t.state == TunnelState::Connecting) {
             return Some("a tunnel is connecting".into());
         }
-        self.pane_busy()
+        None
     }
 
     /// A pane a live restart cannot take as it is now: a program that has not taken its input,
-    /// or whose output stops in the middle of a sequence.
+    /// or whose output stops in the middle of a sequence. Every terminal counts until nothing
+    /// uses it: the pane's own program may have ended and left another one in the background.
     fn pane_busy(&self) -> Option<String> {
         let mut ids: Vec<&PaneId> = self.panes.keys().collect();
         ids.sort();
         for id in ids {
             let p = &self.panes[id];
-            // A program that ended reads nothing more, and writes nothing more.
-            if p.exit_code.is_some() {
+            if p.terminal_ended() {
                 continue;
             }
             if p.input_pending() > 0 {
@@ -572,6 +670,10 @@ impl Server {
                 self.send_msg(client, &ServerMsg::Response { result: Err(why) });
                 self.clients.remove(&client);
             }
+            // Told to come back already: it hears why once it has.
+            Asker::Menu(client) if !self.clients.contains_key(&client) => {
+                self.warnings.push(format!("no live restart: {why}"));
+            }
             Asker::Menu(client) => self.toast(client, format!("no live restart: {why}")),
         }
     }
@@ -588,15 +690,18 @@ impl Server {
             Ok(held) => held,
             Err(why) => return NotNow::Busy(why),
         };
-        let why = self.hand_over(exe, &held);
+        let why = self.hand_over(asker, exe, &held);
         drop(children);
         self.release(held);
         why
     }
 
-    /// Stop taking connections (they wait for the next server in the socket's backlog), have
-    /// attached clients hold what is typed, and answer the commands already read. Connections
-    /// accepted and not handled yet are kept for the next server.
+    /// Stop taking connections (they wait for the next server in the socket's backlog), and
+    /// take in what clients send until nothing more comes: commands are answered, and what they
+    /// were sent written; attached clients hold what is typed from a point between two keys,
+    /// and say so, every key they sent before handled (one from before live restarts is told to
+    /// attach again, and is waited for to go). Connections accepted and not handled yet are
+    /// kept for the next server.
     fn quiesce(&mut self, asker: Asker) -> Result<Held, String> {
         use std::sync::atomic::Ordering;
         self.accepting.paused.store(true, Ordering::SeqCst);
@@ -604,16 +709,27 @@ impl Server {
         while !self.accepting.parked.load(Ordering::SeqCst) && start.elapsed() < Duration::from_secs(1) {
             std::thread::sleep(Duration::from_millis(5));
         }
-        let holding: Vec<ClientId> =
-            self.clients.values().filter(|c| c.attached && c.follows_live).map(|c| c.id).collect();
-        for id in &holding {
-            self.send_msg(*id, &ServerMsg::Hold { on: true });
-        }
-        let mut held = Held { connections: Vec::new(), events: Vec::new() };
-        // A moment for what was typed before the clients heard to arrive.
-        let settle = Instant::now() + Duration::from_millis(50);
-        let deadline = Instant::now() + Duration::from_secs(1);
+        let mut held = Held { connections: Vec::new() };
+        let mut told = std::collections::HashSet::new();
+        self.hold_attempts += 1;
+        let attempt = self.hold_attempts;
+        let deadline = Instant::now() + CLIENTS_WAIT;
         loop {
+            // Clients that attach meanwhile are told too.
+            let attached: Vec<(ClientId, bool)> = self
+                .clients
+                .values()
+                .filter(|c| c.attached && !told.contains(&c.id))
+                .map(|c| (c.id, c.follows_live))
+                .collect();
+            for (id, follows) in attached {
+                told.insert(id);
+                let msg = match follows {
+                    true => ServerMsg::Hold { on: true, attempt },
+                    false => ServerMsg::exit("kraal restarts live: run kraal to attach again"),
+                };
+                self.send_msg(id, &msg);
+            }
             while let Ok(ev) = self.events_rx.try_recv() {
                 match ev {
                     Event::Connection(stream) => held.connections.push(stream),
@@ -623,60 +739,102 @@ impl Server {
                     }
                 }
             }
-            // A command whose request was not read yet, or is being answered.
-            let answering = self.clients.values().any(|c| !c.attached && Some(c.id) != asker.request());
-            if !answering && Instant::now() >= settle {
-                return Ok(held);
+            // As the event loop would: an escape alone for a moment is the Escape key.
+            self.flush_stale_input();
+            match self.clients_sending(asker, attempt) {
+                None => break,
+                Some(why) if Instant::now() >= deadline => {
+                    self.release(held);
+                    return Err(why);
+                }
+                Some(_) => std::thread::sleep(Duration::from_millis(5)),
             }
-            if Instant::now() >= deadline {
-                self.release(held);
-                return Err("a command is still being answered".into());
-            }
-            std::thread::sleep(Duration::from_millis(5));
         }
+        if let Some(why) = self.clients_busy() {
+            self.release(held);
+            return Err(why);
+        }
+        Ok(held)
     }
 
-    /// The live restart did not happen: what was held is handled, attached clients send what
-    /// they held, and connections are accepted again.
-    fn release(&mut self, held: Held) {
-        for ev in held.events {
-            self.handle(ev);
+    /// What clients may still send, or be sent, if anything: `attempt` is this request to hold
+    /// what is typed.
+    fn clients_sending(&self, asker: Asker, attempt: u32) -> Option<String> {
+        if self.clients.values().any(|c| !c.attached && Some(c.id) != asker.request()) {
+            return Some("a command is still being answered".into());
         }
+        if self.clients.values().any(|c| c.attached && !c.follows_live) {
+            return Some("a client from before live restarts has not gone yet".into());
+        }
+        if self.clients.values().any(|c| c.attached && c.held != Some(attempt)) {
+            return Some("a client has not stopped sending what is typed".into());
+        }
+        if super::clients::writers() > self.clients.len() + self.subscribers.len() + self.waits.len() {
+            return Some("an answer is still being sent".into());
+        }
+        None
+    }
+
+    /// What an attached client is in the middle of, that the next server would not know: a key
+    /// or a paste not whole yet, a menu or a prompt of kraal's (what it holds would go to the
+    /// pane instead).
+    fn clients_busy(&self) -> Option<String> {
+        for c in self.clients.values().filter(|c| c.attached) {
+            if !c.parser.idle() || c.paste.is_some() {
+                return Some("a paste is still coming".into());
+            }
+            if !matches!(c.mode, Mode::Normal) {
+                return Some("a client has a kraal menu or prompt open".into());
+            }
+        }
+        None
+    }
+
+    /// The live restart did not happen: attached clients send what they held, and connections
+    /// are accepted again.
+    fn release(&mut self, held: Held) {
         for stream in held.connections {
             self.new_connection(stream);
         }
         let holding: Vec<ClientId> =
             self.clients.values().filter(|c| c.attached && c.follows_live).map(|c| c.id).collect();
         for id in holding {
-            self.send_msg(id, &ServerMsg::Hold { on: false });
+            if let Some(c) = self.clients.get_mut(&id) {
+                c.held = None;
+                // The rest of a key cut in two comes once the client sends what it held.
+                if c.pending_since.is_some() {
+                    c.pending_since = Some(Instant::now());
+                }
+            }
+            self.send_msg(id, &ServerMsg::Hold { on: false, attempt: 0 });
         }
         self.accepting.paused.store(false, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Stop reading the PTYs and write the hand-off, then exec. Returns only when that did not
     /// happen (the PTYs are read again then).
-    fn hand_over(&mut self, exe: &Binary, held: &Held) -> NotNow {
+    fn hand_over(&mut self, asker: Asker, exe: &Binary, held: &Held) -> NotNow {
         // What the PTYs hold stays there from now on, and what was read is drawn: nothing read
         // is lost in the exec.
         let ids: Vec<PaneId> = self.panes.keys().copied().collect();
         for id in &ids {
             self.panes[id].stop_reading();
         }
-        let why = self.prepare_and_exec(exe, held, &ids);
+        let why = self.prepare_and_exec(asker, exe, held, &ids);
         self.resume_panes();
         why
     }
 
-    fn prepare_and_exec(&mut self, exe: &Binary, held: &Held, ids: &[PaneId]) -> NotNow {
+    fn prepare_and_exec(&mut self, asker: Asker, exe: &Binary, held: &Held, ids: &[PaneId]) -> NotNow {
         if let Err(why) = self.drain_panes(ids) {
             return NotNow::Busy(why);
         }
-        // Drawing it may have started something (a hook).
+        // What was typed meanwhile, or drawing it, may have started something (a hook, a job).
         if let Some(why) = self.upgrade_refusal() {
             return NotNow::Refused(why);
         }
-        if self.hooks.running() > 0 {
-            return NotNow::Busy("a hook started".into());
+        if let Some(why) = self.server_busy() {
+            return NotNow::Busy(why);
         }
         for id in ids {
             let signals = self.panes.get_mut(id).map(|p| p.end_sync()).unwrap_or_default();
@@ -686,7 +844,7 @@ impl Server {
         // them is waited for (they would be lost), and so is one in the middle of a sequence
         // (the next emulator could not read its end).
         let start = Instant::now();
-        while self.panes.values().any(|p| p.exit_code.is_none() && p.input_pending() > 0)
+        while self.panes.values().any(|p| !p.terminal_ended() && p.input_pending() > 0)
             && start.elapsed() < Duration::from_secs(1)
         {
             std::thread::sleep(Duration::from_millis(5));
@@ -708,13 +866,10 @@ impl Server {
         let path = handoff_path(&self.session);
         // Written off this thread, and read back as the next server reads it: should either
         // fail, or the disk not answer, nothing happens.
-        let data = match serde_json::to_vec(&handoff) {
+        let data = match encode_handoff(&handoff, MAX_HANDOFF) {
             Ok(data) => data,
-            Err(e) => return NotNow::Refused(format!("cannot write down the session: {e}")),
+            Err(why) => return NotNow::Refused(why),
         };
-        if let Err(e) = parse_handoff(&data) {
-            return NotNow::Refused(format!("the session cannot be handed over: {e}"));
-        }
         let (target, stale) = (path.clone(), path.clone());
         let written = within(
             WRITE_WAIT,
@@ -731,15 +886,14 @@ impl Server {
             Some(Err(e)) => return NotNow::Refused(format!("cannot write {}: {e}", path.display())),
             None => return NotNow::Refused(format!("{} does not answer", crate::paths::state_dir().display())),
         }
-        if !exe.unchanged() {
-            let _ = std::fs::remove_file(&path);
-            return NotNow::Refused(format!("{} changed while it was tried: try again", exe.path.display()));
-        }
         // The ssh that list remote sessions' agents would lose their pipes: the next server
         // starts them again.
         self.stop_remotes();
         self.remotes.clear();
-        self.tell_restarting();
+        if let Err(why) = self.let_clients_go(asker) {
+            let _ = std::fs::remove_file(&path);
+            return NotNow::Refused(why);
+        }
         let why = match fds.iter().try_for_each(|fd| set_inherited(*fd, true)) {
             Ok(()) => format!("could not run {}: {}", exe.path.display(), exec(exe, &self.session, &path)),
             Err(e) => format!("cannot keep the panes' terminals open: {e}"),
@@ -805,6 +959,7 @@ impl Server {
             session: self.session.clone(),
             listener: self.listener_fd,
             binary: exe.fd(),
+            installed: exe.path.clone(),
             next_id: self.next_id,
             layout_area: (a.x, a.y, a.width, a.height),
             sidebar_was_useful: self.sidebar_was_useful,
@@ -819,29 +974,35 @@ impl Server {
             connections: Vec::new(),
             // The panes' own go with them.
             reaping: crate::exec::reaping().into_iter().filter(|pid| !pane_pids.contains(pid)).collect(),
+            live_restarts: self.live_restart.as_ref().map_or(0, |l| l.count),
         }
     }
 
-    /// Tell the attached clients the server restarts: one that follows a live restart comes
-    /// back to the workspace it shows; an older one leaves, saying how to come back. What they
-    /// were sent is on its way before the exec drops them.
-    fn tell_restarting(&mut self) {
+    /// Tell the attached clients the server restarts live (each comes back to the workspace it
+    /// shows), let every connection go but the asker's, and wait until what each was sent is
+    /// written: the exec would cut it short. Event streams end there, as with any restart.
+    fn let_clients_go(&mut self, asker: Asker) -> Result<(), String> {
         let ids: Vec<ClientId> = self.clients.values().filter(|c| c.attached).map(|c| c.id).collect();
         for id in ids {
             let ws = self.clients.get(&id).and_then(|c| self.ws_index(c.workspace));
             let workspace = ws.map(|wi| self.workspaces[wi].name.clone()).unwrap_or_default();
             let reason = "kraal restarted live: run kraal to attach again".to_string();
-            let msg = match self.clients.get(&id).is_some_and(|c| c.follows_live) {
-                true => ServerMsg::Exit { reason, reattach: Some(workspace), live: true },
-                false => ServerMsg::exit(reason),
-            };
-            self.send_msg(id, &msg);
+            self.send_msg(id, &ServerMsg::Exit { reason, reattach: Some(workspace), live: true });
         }
+        let keep = asker.request();
+        let gone: Vec<ClientId> = self.clients.keys().copied().filter(|id| Some(*id) != keep).collect();
+        for id in gone {
+            self.drop_client(id);
+        }
+        self.subscribers.clear();
         let start = Instant::now();
-        while self.clients.values().any(|c| !c.out.is_empty()) && start.elapsed() < Duration::from_millis(500) {
+        while super::clients::writers() > self.clients.len() {
+            if start.elapsed() > CLIENTS_WAIT {
+                return Err("a client does not take what it is sent".into());
+            }
             std::thread::sleep(Duration::from_millis(5));
         }
-        std::thread::sleep(Duration::from_millis(20));
+        Ok(())
     }
 
     /// Take over from the server this one replaced: its panes on their PTYs and programs, its
@@ -866,36 +1027,65 @@ impl Server {
             self.adopt_tunnel(t, stderr);
         }
         let mut live: HashMap<PaneId, LivePane> = h.panes.into_iter().map(|p| (p.id, p)).collect();
-        let mut kept = 0;
+        let (mut kept, mut not_kept) = (0, Vec::new());
         // Nothing opens: the workspaces are the same ones, their events said already, and the
-        // hooks run for them already.
+        // hooks run for them already. A pane that cannot be taken over is left out of its
+        // place, and alone: its program runs on, on its terminal, kept open to try again.
         let hooks = std::mem::take(&mut self.hooks.list);
-        persist::apply_layout(self, h.state.workspaces, h.state.revision, &mut |server, p| {
-            match p.id.and_then(|id| live.remove(&id)) {
-                Some(lp) => {
-                    let adopted = server.adopt_pane(p, lp);
-                    kept += usize::from(adopted.as_ref().is_ok_and(|(_, ok)| *ok));
-                    adopted.map(|(id, _)| id)
+        persist::apply_layout(self, h.state.workspaces, h.state.revision, true, &mut |server, p| {
+            let Some(lp) = p.id.and_then(|id| live.remove(&id)) else {
+                return match p.id {
+                    // A preview or a file manager, opened again where it was.
+                    Some(id) if p.spec.preview.is_some() || p.spec.files.is_some() => {
+                        server.spawn_pane_as(id, p.name.clone(), p.spec.clone())
+                    }
+                    _ if p.spec.preview.is_some() || p.spec.files.is_some() => {
+                        server.spawn_pane(p.name.clone(), p.spec.clone())
+                    }
+                    _ => persist::spawn(server, p),
+                };
+            };
+            let id = lp.id;
+            let mut not_as_it_was = |server: &mut Server, line: String| {
+                server.warnings.push(line.clone());
+                not_kept.push(line);
+            };
+            match server.adopt_live(lp, p.name.clone(), p.scrollback.clone()) {
+                Ok(true) => {
+                    kept += 1;
+                    Ok(id)
                 }
-                // A preview or a file manager, opened again where it was.
-                None if p.spec.preview.is_some() || p.spec.files.is_some() => match p.id {
-                    Some(id) => server.spawn_pane_as(id, p.name.clone(), p.spec.clone()),
-                    None => server.spawn_pane(p.name.clone(), p.spec.clone()),
-                },
-                None => persist::spawn(server, p),
+                Ok(false) => {
+                    let line =
+                        format!("pane {id}: its terminal is kept, but its program is not this server's to wait for");
+                    not_as_it_was(server, line);
+                    Ok(id)
+                }
+                Err(NotAdopted::NoTerminal) => {
+                    not_as_it_was(server, format!("pane {id}: its terminal was gone; it starts again"));
+                    persist::spawn(server, p)
+                }
+                Err(NotAdopted::Later(left)) => {
+                    let why = format!("pane {id} could not be taken over yet ({}): its program runs on", left.why);
+                    server.unadopted.push(*left);
+                    Err(anyhow::anyhow!(why))
+                }
             }
         });
         self.hooks.list = hooks;
         self.events = EventLog::restore(h.events);
-        // What has no place any more (a finished transfer's window) goes: its PTY is closed,
-        // and its program reaped.
-        for (_, lp) in live {
-            // SAFETY: as above.
-            drop(unsafe { OwnedFd::from_raw_fd(lp.fd) });
-            if crate::exec::is_child(lp.pid) {
-                crate::exec::reap_pid_later(lp.pid);
-            }
+        // What has no place any more is never closed: its program may still use its terminal.
+        for (_, live) in live {
+            self.warnings
+                .push(format!("pane {} had no place in the layout: it shows in workspace {RECOVERED}", live.id));
+            let why = "it had no place in the layout".to_string();
+            self.unadopted.push(LeftOver { live, name: None, why });
         }
+        self.adopt_left_over();
+        not_kept.extend(self.unadopted.iter().map(|l| {
+            format!("pane {}: not taken over yet ({}); it shows in workspace recovered once it is", l.live.id, l.why)
+        }));
+        self.live_restart = Some(crate::protocol::LiveRestart { count: h.live_restarts + 1, kept, not_kept });
         self.relayout();
         // Full-screen programs draw themselves again: a size change, then back.
         let nudged: Vec<PaneId> =
@@ -921,35 +1111,140 @@ impl Server {
             // SAFETY: as above.
             self.new_connection(unsafe { UnixStream::from_raw_fd(fd) });
         }
-        let text = format!("restarted live from kraal {}: {kept} panes kept running", h.from);
+        let report = self.live_restart.as_ref().map_or(0, |l| l.not_kept.len());
+        let text =
+            format!("restarted live from kraal {}: {kept} panes kept running, {report} not as they were", h.from);
         eprintln!("kraal: {text}");
-        self.log_message(&text, false);
+        self.log_message(&text, report > 0);
     }
 
-    /// Pane `p` of the state on the PTY and program `live` describes; started again as after a
-    /// restart when they are not this process's to take (whether they were taken).
-    fn adopt_pane(&mut self, p: &PaneSnap, live: LivePane) -> Result<(PaneId, bool)> {
+    /// The pane `live` describes, made on its PTY and its program (whether the program was
+    /// taken too: one that is not this process's child, or no longer the one it was, is left
+    /// alone). One that cannot be made now comes back as it was, its PTY open and its program
+    /// untouched.
+    fn adopt_live(
+        &mut self,
+        live: LivePane,
+        name: Option<String>,
+        scrollback: Option<String>,
+    ) -> Result<bool, NotAdopted> {
         let id = live.id;
-        // SAFETY: the hand-off gives this process the descriptor, which nothing else owns.
-        let fd = unsafe { OwnedFd::from_raw_fd(live.fd) };
-        // SAFETY: plain syscalls on a descriptor and a pid the hand-off names.
-        let (tty, group) = unsafe { (libc::isatty(live.fd) == 1, libc::getpgid(live.pid as libc::pid_t)) };
-        if !tty || !crate::exec::is_child(live.pid) || (group >= 0 && group != live.pgid) {
-            drop(fd);
-            self.warnings.push(format!("pane {id} could not be taken over: it starts again"));
-            return persist::spawn(self, p).map(|id| (id, false));
+        // SAFETY: plain syscalls on a descriptor the hand-off names.
+        if unsafe { libc::isatty(live.fd) } != 1 {
+            // Whatever it is, it is no terminal: no program uses it as one.
+            if unsafe { libc::fcntl(live.fd, libc::F_GETFD) } >= 0 {
+                // SAFETY: the hand-off gives this process the descriptor, which nothing else owns.
+                drop(unsafe { OwnedFd::from_raw_fd(live.fd) });
+            }
+            return Err(NotAdopted::NoTerminal);
         }
-        let pending = live.suspended && live.spec.pending_agent.is_some();
-        let pane = Pane::adopt(live, fd, p.name.clone(), &self.env, &self.tx)?;
+        #[cfg(debug_assertions)]
+        if unadoptable(name.as_deref()) {
+            let why = "a test says it cannot be".into();
+            return Err(NotAdopted::Later(Box::new(LeftOver { live, name, why })));
+        }
+        // SAFETY: plain syscall on a pid the hand-off names.
+        let group = unsafe { libc::getpgid(live.pid as libc::pid_t) };
+        let ours = live.pid > 0 && crate::exec::is_child(live.pid) && (group < 0 || group == live.pgid);
+        // The hand-off's descriptor stays as it is until the pane is made: the pane gets a copy.
+        // SAFETY: fcntl on a descriptor the hand-off names; the copy is a fresh one.
+        let copy = unsafe { libc::fcntl(live.fd, libc::F_DUPFD_CLOEXEC, 0) };
+        if copy < 0 {
+            let why = format!("{}", std::io::Error::last_os_error());
+            return Err(NotAdopted::Later(Box::new(LeftOver { live, name, why })));
+        }
+        // SAFETY: a fresh descriptor nothing else owns.
+        let copy = unsafe { OwnedFd::from_raw_fd(copy) };
+        let pane = match Pane::adopt(&live, copy, ours, name.clone(), &self.env, &self.tx) {
+            Ok(pane) => pane,
+            Err(e) => return Err(NotAdopted::Later(Box::new(LeftOver { live, name, why: format!("{e:#}") }))),
+        };
+        // SAFETY: the hand-off gives this process the descriptor; the pane has its copy.
+        drop(unsafe { OwnedFd::from_raw_fd(live.fd) });
         self.panes.insert(id, pane);
-        if let Some(file) = &p.scrollback {
-            self.scrollback.insert(id, SavedScrollback { file: Some(file.clone()), taken: Instant::now() });
+        if let Some(file) = scrollback {
+            self.scrollback.insert(id, SavedScrollback { file: Some(file), taken: Instant::now() });
         }
-        if pending {
+        if live.suspended && live.spec.pending_agent.is_some() {
             self.resolve_pending_agent(id);
         }
-        Ok((id, true))
+        Ok(ours)
     }
+
+    /// Take over the terminals a hand-off that could not be read kept open (see `salvage`):
+    /// each shows in workspace "recovered", its program running on.
+    pub(super) fn take_salvaged(&mut self, salvaged: Vec<LivePane>) {
+        if salvaged.is_empty() {
+            return;
+        }
+        let mut not_kept = Vec::new();
+        for mut live in salvaged {
+            live.id = self.alloc_id();
+            not_kept.push(format!("pane {}: its terminal shows in workspace {RECOVERED}", live.id));
+            let why = "the hand-off could not be read".to_string();
+            self.unadopted.push(LeftOver { live, name: None, why });
+        }
+        self.adopt_left_over();
+        self.warnings.push(format!(
+            "the previous server's state could not be taken over: what ran in its panes runs on, in workspace {RECOVERED}"
+        ));
+        self.live_restart = Some(crate::protocol::LiveRestart { count: 1, kept: 0, not_kept });
+    }
+
+    /// Try again to take over the panes a live restart could not take yet: each one taken shows
+    /// in a tab of its own in workspace "recovered".
+    pub(super) fn adopt_left_over(&mut self) {
+        self.unadopted_tried = Instant::now();
+        for left in std::mem::take(&mut self.unadopted) {
+            let LeftOver { live, name, .. } = left;
+            let id = live.id;
+            match self.adopt_live(live, name, None) {
+                Ok(_) => {
+                    let ws = match self.workspaces.iter().find(|w| w.name == RECOVERED) {
+                        Some(w) => w.id,
+                        None => self.new_workspace(RECOVERED.into(), None),
+                    };
+                    let Some(wi) = self.ws_index(ws) else { continue };
+                    let mut tab = super::Tab::new(self.alloc_id(), String::new());
+                    tab.root = Some(crate::layout::Node::Leaf(id));
+                    tab.set_focus(id);
+                    self.workspaces[wi].tabs.push(tab);
+                    self.log_message(&format!("pane {id} was taken over: it shows in workspace {RECOVERED}"), false);
+                    self.relayout();
+                    self.mark_dirty();
+                }
+                Err(NotAdopted::NoTerminal) => {}
+                Err(NotAdopted::Later(left)) => self.unadopted.push(*left),
+            }
+        }
+    }
+}
+
+/// Where panes a live restart took over late show.
+const RECOVERED: &str = "recovered";
+
+/// A pane a live restart did not take over yet (see `Server::adopt_left_over`).
+pub(super) struct LeftOver {
+    live: LivePane,
+    name: Option<String>,
+    why: String,
+}
+
+/// Why a pane handed over is not taken over.
+enum NotAdopted {
+    /// It has no terminal: no program uses it, and it starts again as after a restart.
+    NoTerminal,
+    /// It cannot be now (no descriptor or thread to spare): it is tried again.
+    Later(Box<LeftOver>),
+}
+
+/// Debug builds: whether a test asks that pane `name` cannot be taken over for now (the file
+/// `KRAAL_TEST_UNADOPTABLE` names lists such panes, a name a line).
+#[cfg(debug_assertions)]
+fn unadoptable(name: Option<&str>) -> bool {
+    let Some(file) = std::env::var_os("KRAAL_TEST_UNADOPTABLE") else { return false };
+    let listed = std::fs::read_to_string(file).unwrap_or_default();
+    name.is_some_and(|name| listed.lines().any(|l| l == name))
 }
 
 #[cfg(test)]
@@ -968,26 +1263,35 @@ mod tests {
     }
 
     #[test]
-    fn the_binary_run_is_the_file_tried_unless_it_was_written_to() {
+    fn the_binary_run_is_the_copy_tried_whatever_happens_to_the_file() {
+        use std::io::{Read, Seek, Write};
         let dir = std::env::temp_dir().join(format!("kraal-binary-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("kraal");
         std::fs::write(&path, "one").unwrap();
-        let opened = Binary::open(Some(path.clone())).unwrap();
-        // Another file renamed over its path: what was opened is still what was tried.
-        std::fs::write(dir.join("other"), "two").unwrap();
+        let mut opened = Binary::open(Some(path.clone())).unwrap();
+        // Written to in place, then another file renamed over its path: the copy is still what
+        // was tried.
+        std::fs::OpenOptions::new().write(true).open(&path).unwrap().write_all(b"two").unwrap();
+        std::fs::write(dir.join("other"), "three").unwrap();
         std::fs::rename(dir.join("other"), &path).unwrap();
-        assert!(opened.unchanged());
-        // Written to in place: no longer.
-        let again = Binary::open(Some(path.clone())).unwrap();
-        std::thread::sleep(Duration::from_millis(20));
-        std::fs::OpenOptions::new().append(true).open(&path).unwrap();
-        std::fs::write(&path, "three").unwrap();
-        assert!(!again.unchanged());
+        let mut read = String::new();
+        opened.file.rewind().unwrap();
+        opened.file.read_to_string(&mut read).unwrap();
+        assert_eq!(read, "one");
+        assert_eq!(opened.path, path, "where it is installed is kept");
+        #[cfg(target_os = "linux")]
+        assert!(opened.file.write_all(b"x").is_err(), "the copy cannot change");
         // Not something that runs: the exec fails, and says why; this process goes on.
-        let err = exec(&again, "s", Path::new("/nonexistent/handoff.json"));
-        assert!(matches!(err.kind(), std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::Unsupported), "{err}");
+        let err = exec(&opened, "s", Path::new("/nonexistent/handoff.json"));
+        assert!(err.raw_os_error().is_some() || err.kind() == std::io::ErrorKind::Unsupported, "{err}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn hand_offs_are_files_of_their_own_read_only_whole_and_of_this_format() {
+        assert_ne!(handoff_path("s"), handoff_path("s"), "an attempt's file is its own");
+        assert!(handoff_check(1).is_err(), "the format before this one is not read");
     }
 
     #[test]
@@ -1029,6 +1333,7 @@ mod tests {
             session: "s".into(),
             listener: -1,
             binary: -1,
+            installed: PathBuf::from("/kraal"),
             next_id: 1,
             layout_area: (0, 0, 80, 24),
             sidebar_was_useful: false,
@@ -1042,10 +1347,14 @@ mod tests {
             port_candidates: Vec::new(),
             connections: Vec::new(),
             reaping: Vec::new(),
+            live_restarts: 0,
         };
         let data = serde_json::to_vec(&h).unwrap();
         assert!(serde_json::from_slice::<Handoff>(&data).is_err(), "too deep for the default reader");
         assert!(parse_handoff(&data).is_ok());
+        // Not written when larger than the next server reads.
+        assert!(encode_handoff(&h, data.len()).is_ok());
+        assert!(encode_handoff(&h, data.len() - 1).unwrap_err().contains("too large"));
     }
 
     #[test]

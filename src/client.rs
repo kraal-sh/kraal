@@ -150,23 +150,47 @@ pub fn restart_server(session: &str) -> Result<Saved> {
 /// The pid and kraal release of the server behind `socket`, given up on quickly when it does
 /// not answer.
 pub fn ping(socket: &Path) -> Result<(u32, String)> {
-    identify(socket).map(|(pid, version, _)| (pid, version))
+    identify(socket).map(|i| (i.pid, i.version))
 }
 
-/// [`ping`], with when the server started (see `Response::Pong`), when it says.
-pub fn identify(socket: &Path) -> Result<(u32, String, Option<u64>)> {
+/// What a server says it is (see `Response::Pong`).
+pub struct Identity {
+    pub pid: u32,
+    pub version: String,
+    /// When the session's server started, when it says.
+    pub boot: Option<u64>,
+    /// What its last live restart took over, when it says.
+    pub live: Option<protocol::LiveRestart>,
+}
+
+/// [`ping`], with what else the server says of itself.
+pub fn identify(socket: &Path) -> Result<Identity> {
     let mut stream = UnixStream::connect(socket)?;
     stream.set_read_timeout(Some(Duration::from_secs(2)))?;
     stream.set_write_timeout(Some(Duration::from_secs(2)))?;
     match exchange(&mut stream, Request::Ping)? {
-        Response::Pong { pid, version, boot, .. } => Ok((pid, version, boot)),
+        Response::Pong { pid, version, boot, live, .. } => Ok(Identity { pid, version, boot, live }),
         _ => bail!("unexpected answer from the server"),
     }
+}
+
+/// Where this kraal is installed, when it runs from elsewhere (a live restart runs a copy).
+static INSTALLED: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+/// Say where this kraal is installed (see [`installed_exe`]).
+pub fn set_installed(path: PathBuf) {
+    let _ = INSTALLED.set(path);
 }
 
 /// The kraal binary installed where this one was started from. Once an update has replaced the
 /// file, Linux names the running one `<path> (deleted)`: the file now at `<path>` is meant.
 pub fn installed_exe() -> Result<PathBuf> {
+    if let Some(path) = INSTALLED.get() {
+        if path.exists() {
+            return Ok(path.clone());
+        }
+        bail!("{} is not there any more", path.display());
+    }
     let exe = std::env::current_exe().context("locating the kraal binary")?;
     if exe.exists() {
         return Ok(exe);
@@ -363,8 +387,150 @@ fn is_ctrl_c(keys: &[u8]) -> bool {
 }
 const RESTORE: &str = "\x1b[?2026l\x1b[<u\x1b[?1006l\x1b[?1003l\x1b[?1002l\x1b[?1000l\x1b[?1004l\x1b[?2004l\x1b[0m\x1b[0 q\x1b[?25h\x1b[?1049l";
 
-/// What is held of what is typed during a live restart, at most.
+/// What is held of what is typed during a live restart, at most: past that, the keyboard is
+/// not read until it is sent (the terminal holds the rest).
 const MAX_HELD_KEYS: usize = 16 << 20;
+/// How long an escape alone waits for the rest of a sequence, as the server waits for it.
+const ESCAPE_ALONE: Duration = Duration::from_millis(50);
+
+/// What is typed while a live restart is prepared: kept from a point where the server has every
+/// key and paste whole, and sent once it says (to the same server, or the next one).
+#[derive(Default)]
+struct Holding {
+    /// The server asked: what is typed is kept from the next point between two keys.
+    asked: bool,
+    /// Which time it asked, said in the answer.
+    attempt: u32,
+    /// What is kept, since the server was told it is.
+    kept: Option<Vec<u8>>,
+    /// What was sent, read as the server reads it: whether it ends between two keys.
+    sent: crate::input::InputParser,
+    /// When keys last came.
+    last: Option<Instant>,
+}
+
+impl Holding {
+    /// `keys` were typed (none: nothing came for a moment). What goes to the server now, and
+    /// whether to tell it that what is typed is held from there on.
+    fn typed(&mut self, keys: &[u8], now: Instant) -> (Vec<u8>, bool) {
+        if let Some(kept) = &mut self.kept {
+            kept.extend_from_slice(keys);
+            return (Vec::new(), false);
+        }
+        if !keys.is_empty() {
+            self.last = Some(now);
+        }
+        if !self.asked {
+            let _ = self.sent.feed(keys);
+            return (keys.to_vec(), false);
+        }
+        let mut at = self.sent.idle().then_some(0);
+        if at.is_none() {
+            for (i, b) in keys.iter().enumerate() {
+                let _ = self.sent.feed(std::slice::from_ref(b));
+                if self.sent.idle() {
+                    at = Some(i + 1);
+                    break;
+                }
+            }
+        }
+        // An escape alone for a moment is the Escape key (a paste goes on until its end).
+        if at.is_none() && self.last.is_none_or(|t| now >= t + ESCAPE_ALONE) {
+            let _ = self.sent.flush();
+            at = self.sent.idle().then_some(keys.len());
+        }
+        let Some(at) = at else { return (keys.to_vec(), false) };
+        self.kept = Some(keys[at..].to_vec());
+        (keys[..at].to_vec(), true)
+    }
+
+    /// The server needs nothing held any more (it said so, or it is another one): what was kept,
+    /// to send.
+    fn release(&mut self) -> Vec<u8> {
+        self.asked = false;
+        let kept = self.kept.take().unwrap_or_default();
+        let _ = self.sent.feed(&kept);
+        kept
+    }
+
+    /// Room for `more` bytes: once full, nothing more is read until what is kept is sent.
+    fn has_room(&self, more: usize) -> bool {
+        self.kept.as_ref().is_none_or(|k| k.is_empty() || k.len() + more <= MAX_HELD_KEYS)
+    }
+}
+
+type Writer = Mutex<Option<Box<dyn Write + Send>>>;
+
+/// Send what was typed (`keys`, from the keyboard) to the server, or keep it (see [`Holding`]).
+/// While disconnected, ctrl+c gives up (`quit`).
+fn forward_keys(keys: &[u8], writer: &Writer, holding: &Mutex<Holding>, quit: &AtomicBool) {
+    loop {
+        let Ok(mut w) = writer.lock() else { return };
+        if w.is_none() && is_ctrl_c(keys) {
+            quit.store(true, Ordering::SeqCst);
+            return;
+        }
+        let Ok(mut h) = holding.lock() else { return };
+        if !h.has_room(keys.len()) {
+            drop(h);
+            drop(w);
+            std::thread::sleep(Duration::from_millis(20));
+            continue;
+        }
+        let (send, held) = h.typed(keys, Instant::now());
+        let attempt = h.attempt;
+        drop(h);
+        if let Some(w) = w.as_mut() {
+            if !send.is_empty() {
+                let _ = protocol::write_frame(w, protocol::BYTES, &send);
+            }
+            if held {
+                let _ = protocol::write_json(w, &ClientMsg::Held { attempt });
+            }
+        }
+        return;
+    }
+}
+
+/// The server asks to hold what is typed (`attempt`): from the next point between two keys,
+/// said once reached (now, or as keys come).
+fn hold_keys(writer: &Writer, holding: &Mutex<Holding>, attempt: u32) {
+    let Ok(mut w) = writer.lock() else { return };
+    let Ok(mut h) = holding.lock() else { return };
+    h.asked = true;
+    h.attempt = attempt;
+    // Held already: said again.
+    let (send, held) = match h.kept {
+        Some(_) => (Vec::new(), true),
+        None => h.typed(&[], Instant::now()),
+    };
+    drop(h);
+    if let Some(w) = w.as_mut() {
+        if !send.is_empty() {
+            let _ = protocol::write_frame(w, protocol::BYTES, &send);
+        }
+        if held {
+            let _ = protocol::write_json(w, &ClientMsg::Held { attempt });
+        }
+    }
+}
+
+/// Send what was held to the server (the same one, or the next: `fresh`, which has read
+/// nothing yet).
+fn release_keys(writer: &Writer, holding: &Mutex<Holding>, fresh: bool) {
+    let Ok(mut w) = writer.lock() else { return };
+    let Ok(mut h) = holding.lock() else { return };
+    if fresh {
+        h.sent = crate::input::InputParser::new();
+    }
+    let kept = h.release();
+    drop(h);
+    if let Some(w) = w.as_mut()
+        && !kept.is_empty()
+    {
+        let _ = protocol::write_frame(w, protocol::BYTES, &kept);
+    }
+}
 
 /// Set when the client is going: the output loop writes nothing more.
 static LEAVING: AtomicBool = AtomicBool::new(false);
@@ -528,7 +694,7 @@ fn greet(target: &Target, workspace: &Option<String>) -> Result<Greeted, String>
         },
         // A local client is the kraal installed on the server's machine; a remote one may not be.
         installed: matches!(target, Target::Local { .. }).then(|| protocol::KRAAL_VERSION.to_string()),
-        live: true,
+        follows_live: true,
     };
     if protocol::write_json(&mut conn.writer, &hello).is_err() {
         return Err(conn.why_lost("could not talk to the server"));
@@ -576,9 +742,9 @@ impl KeysPause {
     }
 }
 
-/// Read `fd` (the keyboard) into `forward` until it ends. Nothing is read while paused: the
-/// reader parks before it would read, and it reads only the bytes already waiting, so a read
-/// never blocks it past a pause.
+/// Read `fd` (the keyboard) into `forward` until it ends; `forward` gets nothing when nothing
+/// came for a moment. Nothing is read while paused: the reader parks before it would read, and
+/// it reads only the bytes already waiting, so a read never blocks it past a pause.
 fn read_keys(fd: std::os::unix::io::RawFd, pause: &KeysPause, mut forward: impl FnMut(&[u8])) {
     let mut buf = [0u8; 16 * 1024];
     loop {
@@ -594,6 +760,9 @@ fn read_keys(fd: std::os::unix::io::RawFd, pause: &KeysPause, mut forward: impl 
             return;
         }
         if ready <= 0 || pause.paused.load(Ordering::SeqCst) {
+            if ready == 0 && !pause.paused.load(Ordering::SeqCst) {
+                forward(&[]);
+            }
             continue;
         }
         let mut waiting: libc::c_int = 0;
@@ -675,46 +844,19 @@ pub fn attach(mut target: Target, mut workspace: Option<String>, mouse: bool, at
     set_modes(true, mouse);
 
     // The current connection's writer; None while reconnecting.
-    let writer: Arc<Mutex<Option<Box<dyn Write + Send>>>> = Arc::new(Mutex::new(None));
+    let writer: Arc<Writer> = Arc::new(Mutex::new(None));
     let quit = Arc::new(AtomicBool::new(false));
     let pause = Arc::new(KeysPause::default());
     // What is typed while the server replaces itself (a live restart), for the next one.
-    let held: Arc<Mutex<Option<Vec<u8>>>> = Arc::new(Mutex::new(None));
+    let holding: Arc<Mutex<Holding>> = Arc::default();
 
     // Keyboard → server. While disconnected, ctrl+c gives up.
     {
-        let (writer, quit, pause, held) = (writer.clone(), quit.clone(), pause.clone(), held.clone());
+        let (writer, quit, pause, holding) = (writer.clone(), quit.clone(), pause.clone(), holding.clone());
         std::thread::Builder::new().name("stdin".into()).spawn(move || {
-            read_keys(0, &pause, |keys| {
-                let Ok(mut w) = writer.lock() else { return };
-                if w.is_none() && is_ctrl_c(keys) {
-                    quit.store(true, Ordering::SeqCst);
-                    return;
-                }
-                if let Ok(mut h) = held.lock()
-                    && let Some(kept) = h.as_mut()
-                {
-                    if kept.len() + keys.len() <= MAX_HELD_KEYS {
-                        kept.extend_from_slice(keys);
-                    }
-                    return;
-                }
-                if let Some(w) = w.as_mut() {
-                    let _ = protocol::write_frame(w, protocol::BYTES, keys);
-                }
-            });
+            read_keys(0, &pause, |keys| forward_keys(keys, &writer, &holding, &quit));
         })?;
     }
-    // Send what was held to the server (the same one, or the next).
-    let release = |writer: &Mutex<Option<Box<dyn Write + Send>>>| {
-        let Ok(mut w) = writer.lock() else { return };
-        let Some(kept) = held.lock().ok().and_then(|mut h| h.take()) else { return };
-        if let Some(w) = w.as_mut()
-            && !kept.is_empty()
-        {
-            let _ = protocol::write_frame(w, protocol::BYTES, &kept);
-        }
-    };
     // Window size changes → server.
     {
         let writer = writer.clone();
@@ -764,7 +906,7 @@ pub fn attach(mut target: Target, mut workspace: Option<String>, mouse: bool, at
         let lost = match session {
             Ok(Greeted { conn: mut c, mut frames, first }) => {
                 *writer.lock().unwrap() = Some(std::mem::replace(&mut c.writer, Box::new(std::io::sink())));
-                release(&writer);
+                release_keys(&writer, &holding, true);
                 delay = Duration::from_secs(1);
                 let mut out = std::io::stdout().lock();
                 let mut next = Some(Ok(Some(first)));
@@ -791,12 +933,8 @@ pub fn attach(mut target: Target, mut workspace: Option<String>, mouse: bool, at
                                 break "the session restarts".to_string();
                             }
                             Ok(ServerMsg::Attached { version }) => server_version = Some(version),
-                            Ok(ServerMsg::Hold { on: true }) => {
-                                if let Ok(mut h) = held.lock() {
-                                    h.get_or_insert_with(Vec::new);
-                                }
-                            }
-                            Ok(ServerMsg::Hold { on: false }) => release(&writer),
+                            Ok(ServerMsg::Hold { on: true, attempt }) => hold_keys(&writer, &holding, attempt),
+                            Ok(ServerMsg::Hold { on: false, .. }) => release_keys(&writer, &holding, false),
                             Ok(ServerMsg::Open { url }) => {
                                 let _ = crate::pane::open_url(&url);
                             }
@@ -920,6 +1058,78 @@ mod tests {
         assert!(!is_ctrl_c(b"\x1b[99;7u"), "ctrl+alt+c is something else");
         // A Russian layout: the key at the place of `c` types `с`.
         assert!(is_ctrl_c(b"\x1b[1089::99;5u"));
+    }
+
+    #[test]
+    fn what_is_typed_is_held_from_a_point_between_two_keys() {
+        let t0 = Instant::now();
+        let later = |ms| t0 + Duration::from_millis(ms);
+        let mut h = Holding::default();
+        assert_eq!(h.typed(b"ab\x1b[", t0), (b"ab\x1b[".to_vec(), false));
+        // Asked in the middle of a key: its end goes, and what follows is held.
+        h.asked = true;
+        assert_eq!(h.typed(b"Axyz", t0), (b"A".to_vec(), true));
+        assert_eq!(h.typed(b"more", t0), (Vec::new(), false));
+        assert_eq!(h.release(), b"xyzmore");
+        assert_eq!(h.typed(b"q", t0), (b"q".to_vec(), false));
+        // Asked between two keys: held at once.
+        h.asked = true;
+        assert_eq!(h.typed(&[], t0), (Vec::new(), true));
+        assert_eq!(h.typed(b"k", t0), (Vec::new(), false));
+        assert_eq!(h.release(), b"k");
+        // A paste goes on until its end, however long it pauses.
+        assert_eq!(h.typed(b"\x1b[200~line\r", t0), (b"\x1b[200~line\r".to_vec(), false));
+        h.asked = true;
+        assert_eq!(h.typed(b"more\r", later(1000)), (b"more\r".to_vec(), false));
+        assert_eq!(h.typed(&[], later(2000)), (Vec::new(), false));
+        assert_eq!(h.typed(b"end\x1b[201~after", later(2000)), (b"end\x1b[201~".to_vec(), true));
+        assert_eq!(h.release(), b"after");
+        // An escape alone is the Escape key once nothing follows for a moment.
+        assert_eq!(h.typed(b"\x1b", t0), (b"\x1b".to_vec(), false));
+        h.asked = true;
+        assert_eq!(h.typed(&[], later(10)), (Vec::new(), false), "the rest of a sequence may come");
+        assert_eq!(h.typed(&[], later(60)), (Vec::new(), true));
+        assert!(h.release().is_empty());
+    }
+
+    /// Typed into a full hold, the keys wait (and the keyboard is not read meanwhile) until
+    /// what is held is sent: none is lost.
+    #[test]
+    fn keys_held_past_the_limit_wait_rather_than_go() {
+        #[derive(Clone, Default)]
+        struct Sent(Arc<Mutex<Vec<u8>>>);
+        impl Write for Sent {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(b);
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let sent = Sent::default();
+        let writer: Arc<Writer> = Arc::new(Mutex::new(Some(Box::new(sent.clone()))));
+        let holding: Arc<Mutex<Holding>> = Arc::default();
+        {
+            let mut h = holding.lock().unwrap();
+            h.asked = true;
+            h.kept = Some(vec![b'x'; MAX_HELD_KEYS - 1]);
+        }
+        let done = Arc::new(AtomicBool::new(false));
+        let typing = {
+            let (writer, holding, done) = (writer.clone(), holding.clone(), done.clone());
+            std::thread::spawn(move || {
+                forward_keys(b"yz", &writer, &holding, &AtomicBool::new(false));
+                done.store(true, Ordering::SeqCst);
+            })
+        };
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(!done.load(Ordering::SeqCst), "taken past the limit");
+        assert_eq!(holding.lock().unwrap().kept.as_ref().map(Vec::len), Some(MAX_HELD_KEYS - 1));
+        release_keys(&writer, &holding, false);
+        typing.join().unwrap();
+        let all = sent.0.lock().unwrap();
+        assert!(all.len() > MAX_HELD_KEYS && all.ends_with(b"yz"), "{}", all.len());
     }
 
     #[test]

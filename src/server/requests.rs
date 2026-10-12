@@ -46,6 +46,7 @@ impl Server {
                 session: self.session.clone(),
                 version: env!("CARGO_PKG_VERSION").into(),
                 boot: Some(self.events.boot()),
+                live: self.live_restart.clone(),
             }),
             Request::ListPanes => {
                 let mut v: Vec<PaneId> = Vec::new();

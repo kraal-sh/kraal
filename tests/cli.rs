@@ -189,11 +189,16 @@ impl Drop for Env {
 /// A client attached through the session's socket, as kraal's own client is: it sends what a
 /// terminal would, and keeps what the server draws.
 struct RawClient {
-    stream: std::os::unix::net::UnixStream,
+    stream: std::sync::Arc<std::sync::Mutex<std::os::unix::net::UnixStream>>,
     screen: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
     /// The messages the server sent, as JSON.
     messages: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
 }
+
+/// What a client that follows a live restart does when asked to hold what is typed: after a
+/// while (`.0`, a slow connection), it sends what was typed meanwhile (`.1`), then holds.
+#[cfg(target_os = "linux")]
+type Holds = (Duration, Vec<u8>);
 
 impl RawClient {
     fn attach(env: &Env, workspace: &str) -> RawClient {
@@ -203,17 +208,24 @@ impl RawClient {
     /// Attach, saying which kraal is installed (a local client says its own).
     fn attach_installed(env: &Env, workspace: &str, installed: Option<&str>) -> RawClient {
         let installed = installed.map(|v| format!(r#","installed":"{v}""#)).unwrap_or_default();
-        RawClient::attach_with(env, workspace, &installed)
+        RawClient::attach_with(env, workspace, &installed, None)
     }
 
     /// Attach as a client that follows a live restart, as kraal's own does.
     #[cfg(target_os = "linux")]
     fn attach_following(env: &Env, workspace: &str) -> RawClient {
-        RawClient::attach_with(env, workspace, r#","live":true"#)
+        RawClient::attach_following_with(env, workspace, (Duration::ZERO, Vec::new()))
     }
 
-    /// Attach, with `extra` fields in the hello.
-    fn attach_with(env: &Env, workspace: &str, extra: &str) -> RawClient {
+    /// The same, holding what is typed as `holds` says.
+    #[cfg(target_os = "linux")]
+    fn attach_following_with(env: &Env, workspace: &str, holds: Holds) -> RawClient {
+        RawClient::attach_with(env, workspace, r#","follows_live":true"#, Some(holds))
+    }
+
+    /// Attach, with `extra` fields in the hello. Told to go, it goes, as kraal's own client
+    /// does; one that follows a live restart (`holds`) holds what is typed when asked.
+    fn attach_with(env: &Env, workspace: &str, extra: &str, holds: Option<(Duration, Vec<u8>)>) -> RawClient {
         use std::io::Read;
         let socket = env.root.join("run/kraal").join(format!("{}.sock", env.session));
         let mut stream = std::os::unix::net::UnixStream::connect(socket).unwrap();
@@ -223,7 +235,9 @@ impl RawClient {
         raw_frame(&mut stream, 0, hello.as_bytes());
         let screen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let messages = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let (mut reader, kept, said) = (stream.try_clone().unwrap(), screen.clone(), messages.clone());
+        let mut reader = stream.try_clone().unwrap();
+        let stream = std::sync::Arc::new(std::sync::Mutex::new(stream));
+        let (kept, said, writer) = (screen.clone(), messages.clone(), stream.clone());
         std::thread::spawn(move || {
             let mut header = [0u8; 5];
             while reader.read_exact(&mut header).is_ok() {
@@ -231,9 +245,25 @@ impl RawClient {
                 if reader.read_exact(&mut payload).is_err() {
                     break;
                 }
-                match header[4] {
-                    1 => kept.lock().unwrap().extend_from_slice(&payload),
-                    _ => said.lock().unwrap().push(String::from_utf8_lossy(&payload).into_owned()),
+                if header[4] == 1 {
+                    kept.lock().unwrap().extend_from_slice(&payload);
+                    continue;
+                }
+                let msg = String::from_utf8_lossy(&payload).into_owned();
+                said.lock().unwrap().push(msg.clone());
+                if let Some((after, typed)) = holds.as_ref().filter(|_| msg.contains(r#""type":"hold","on":true"#)) {
+                    let hold: serde_json::Value = serde_json::from_str(&msg).unwrap();
+                    std::thread::sleep(*after);
+                    let mut w = writer.lock().unwrap();
+                    if !typed.is_empty() {
+                        raw_frame(&mut *w, 1, typed);
+                    }
+                    let held = format!(r#"{{"type":"held","attempt":{}}}"#, hold["attempt"]);
+                    raw_frame(&mut *w, 0, held.as_bytes());
+                }
+                if msg.contains(r#""type":"exit""#) && !msg.contains(r#""live":true"#) {
+                    let _ = writer.lock().unwrap().shutdown(std::net::Shutdown::Both);
+                    break;
                 }
             }
         });
@@ -255,7 +285,7 @@ impl RawClient {
 
     /// Bytes as the terminal sends them, one read each.
     fn send(&mut self, bytes: &[u8]) {
-        raw_frame(&mut self.stream, 1, bytes);
+        raw_frame(&mut *self.stream.lock().unwrap(), 1, bytes);
     }
 
     /// A bracketed paste, sent as a terminal does: in reads of 64 KiB.
@@ -4549,6 +4579,43 @@ fn a_live_restart_runs_the_binary_it_tried() {
     still_counting(&env, "counter");
 }
 
+/// The kraal installed after the server started (not running, so it can be written to) is
+/// overwritten in place while a live restart from the menu waits: what runs is the copy tried.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_live_restart_runs_the_copy_it_tried_when_the_file_is_overwritten() {
+    let env = Env::new("overwritten");
+    configure(&env, "\n[hooks]\nnotification = \"sleep 3\"\n");
+    let bin = env.root.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let kraal = bin.join("kraal");
+    let install = || {
+        let staged = bin.join(".kraal.new");
+        assert!(Command::new("cp").arg(env!("CARGO_BIN_EXE_kraal")).arg(&staged).status().unwrap().success());
+        std::fs::rename(&staged, &kraal).unwrap();
+    };
+    install();
+    env.workspace("w", "layout {\n    pane name=\"sh\"\n}\n");
+    let out = env.cmd_with(&kraal, &["open", "w"]).output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    env.run(&["run", "--name", "counter", "--", "sh", "-c", COUNTER]);
+    let pid = counter_pid(&env, "counter");
+    let server = parent_of(pid).expect("the server");
+    // A newer one is installed: the server's restart runs it.
+    install();
+    let mut client = RawClient::attach_following(&env, "w");
+    client.wait_for_message("\"attached\"");
+    client.send(b"\x02Wr");
+    client.wait_for_screen("Restart session overwritten live on the kraal installed now?");
+    env.run(&["notify", "a hook runs"]);
+    client.send(b"y");
+    std::thread::sleep(Duration::from_millis(800));
+    std::fs::write(&kraal, "#!/bin/sh\nexit 1\n").unwrap();
+    client.wait_for_message(r#""live":true"#);
+    still_counting(&env, "counter");
+    assert_eq!(parent_of(pid), Some(server));
+}
+
 /// Input a program has not read yet would be lost in the exec: the restart waits for it, then
 /// is refused, and the program keeps it.
 #[cfg(target_os = "linux")]
@@ -4570,6 +4637,231 @@ fn input_a_program_has_not_read_holds_a_live_restart_back() {
     assert!(!out.status.success() && err.contains("has input it has not read yet"), "{err}");
     assert_eq!(parent_of(pid), Some(server));
     still_counting(&env, "counter");
+}
+
+/// A pane whose program ended can have left another one on its terminal, in the background: its
+/// input and its output count as any other program's.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_program_left_on_an_ended_panes_terminal_counts() {
+    let env = Env::new("leftover");
+    env.workspace("w", "layout {\n    pane name=\"sh\"\n}\n");
+    env.run(&["open", "w"]);
+    env.run(&["run", "--name", "counter", "--", "sh", "-c", COUNTER]);
+    let pid = counter_pid(&env, "counter");
+    let server = parent_of(pid).expect("the server");
+    let (stop, go) = (env.root.join("stop"), env.root.join("go"));
+    // The pane's program ends once told, and once what it leaves ignores the hangup its end
+    // sends; what it left keeps the terminal.
+    let left = |name: &str, first: &str, before_end: &dyn Fn()| {
+        let ready = env.root.join(format!("ready-{name}"));
+        let script = format!(
+            "stty raw -echo; (trap '' HUP; {first}; touch '{}'; while [ ! -e '{}' ]; do sleep 0.2; done) & \
+             while [ ! -e '{}' ] || [ ! -e '{}' ]; do sleep 0.1; done; exit 0",
+            ready.display(),
+            stop.display(),
+            go.display(),
+            ready.display()
+        );
+        env.run(&["run", "--name", name, "--", "sh", "-c", &script]);
+        before_end();
+        std::fs::write(&go, "").unwrap();
+        let start = Instant::now();
+        while pane_json(&env, name)["exit_code"] != 0 {
+            assert!(start.elapsed() < Duration::from_secs(10), "{}", pane_json(&env, name));
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        std::fs::remove_file(&go).unwrap();
+    };
+    let refused = |why: &str| {
+        let out = env.try_run(&["restart", "--live"]);
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(!out.status.success() && err.contains(why), "{why}: {err}");
+        assert_eq!(parent_of(pid), Some(server));
+        still_counting(&env, "counter");
+    };
+    // One that reads nothing: what was typed before the pane's program ended waits for it.
+    let chunk = "x".repeat(60_000);
+    left("deaf", "true", &|| {
+        for _ in 0..4 {
+            env.run(&["send", "-p", "deaf", &chunk]);
+        }
+    });
+    refused("has input it has not read yet");
+    env.run(&["close", "deaf"]);
+    // One that wrote half a sequence.
+    left("half", "printf '\\033['", &|| {});
+    refused("in the middle of writing an escape sequence");
+    std::fs::write(&stop, "").unwrap();
+}
+
+/// A pane the next server cannot take over (here, a test says so, until told otherwise) keeps
+/// its program running on its open terminal, and the others are taken over all the same: the
+/// restart says which, and the pane shows once it is taken over.
+#[cfg(all(target_os = "linux", debug_assertions))]
+#[test]
+fn a_pane_not_taken_over_keeps_its_program_and_spares_the_others() {
+    let env = Env::new("partial");
+    let unadoptable = env.root.join("unadoptable");
+    std::fs::write(&unadoptable, "stuck\n").unwrap();
+    env.workspace("w", "layout {\n    pane name=\"sh\"\n}\n");
+    let out = env.cmd(&["open", "w"]).env("KRAAL_TEST_UNADOPTABLE", &unadoptable).output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let names = ["before", "stuck", "after"];
+    for name in names {
+        env.run(&["run", "--name", name, "--", "sh", "-c", COUNTER]);
+    }
+    let pids: Vec<i32> = names.iter().map(|n| counter_pid(&env, n)).collect();
+    let server = parent_of(pids[0]).expect("the server");
+    let out = env.try_run(&["restart", "--live"]);
+    let (said, err) = (String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    assert!(out.status.success() && said.contains("restarted session partial live"), "{said}{err}");
+    assert!(err.contains("not taken over yet (a test says it cannot be)"), "{err}");
+    for pid in &pids {
+        assert_eq!(parent_of(*pid), Some(server));
+    }
+    still_counting(&env, "before");
+    still_counting(&env, "after");
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(!zombie(pids[1]) && parent_of(pids[1]) == Some(server), "its program runs on");
+    // Not while it waits to be taken over.
+    let out = env.try_run(&["restart", "--live"]);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success() && err.contains("was not taken over yet"), "{err}");
+    std::fs::write(&unadoptable, "").unwrap();
+    let start = Instant::now();
+    while !env.run(&["panes", "--json"]).contains("recovered") {
+        assert!(start.elapsed() < Duration::from_secs(10), "{}", env.run(&["panes"]));
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert_eq!(pane_json(&env, "stuck")["workspace"], "recovered");
+    still_counting(&env, "stuck");
+    let out = env.run(&["restart", "--live"]);
+    assert!(out.contains("restarted session partial live"), "{out}");
+    still_counting(&env, "stuck");
+}
+
+/// A hand-off the next server cannot read (here, a test says so): the layout comes back as
+/// after a restart that is not live, and the programs run on all the same, on their terminals,
+/// in workspace recovered.
+#[cfg(all(target_os = "linux", debug_assertions))]
+#[test]
+fn programs_run_on_when_the_hand_off_cannot_be_read() {
+    let env = Env::new("unreadable");
+    env.workspace("w", "layout {\n    pane name=\"sh\"\n}\n");
+    let out = env.cmd(&["open", "w"]).env("KRAAL_TEST_UNREADABLE_HANDOFF", "1").output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    env.run(&["run", "--name", "counter", "--", "sh", "-c", COUNTER]);
+    let pid = counter_pid(&env, "counter");
+    let server = parent_of(pid).expect("the server");
+    let out = env.try_run(&["restart", "--live"]);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success() && err.contains("run on, in workspace recovered"), "{err}");
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(parent_of(pid) == Some(server) && !zombie(pid), "its program runs on");
+    let panes: serde_json::Value = serde_json::from_str(&env.run(&["panes", "--json"])).unwrap();
+    let recovered: Vec<String> = panes
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|p| p["workspace"] == "recovered")
+        .map(|p| p["id"].to_string())
+        .collect();
+    assert!(!recovered.is_empty(), "{panes}");
+    // The counter shows there again, counting on.
+    let start = Instant::now();
+    let counting = |id: &str| env.run(&["read", "-p", id]).contains("tick");
+    while !recovered.iter().any(|id| counting(id)) {
+        assert!(start.elapsed() < Duration::from_secs(10), "{panes}");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    // The layout came back too.
+    assert_eq!(pane_json(&env, "counter")["workspace"], "w");
+}
+
+/// What a client sent just before it holds what is typed (over a slow connection, it arrives a
+/// while after the server asked) reaches the pane: the server waits until the client says it
+/// holds what is typed.
+#[cfg(target_os = "linux")]
+#[test]
+fn keys_on_their_way_when_a_live_restart_starts_reach_the_pane() {
+    let env = Env::new("inflight");
+    env.workspace("w", "layout {\n    pane name=\"sh\"\n}\n");
+    env.run(&["open", "w"]);
+    let typed = b"echo LATE-$((6*7))\r".to_vec();
+    let client = RawClient::attach_following_with(&env, "w", (Duration::from_millis(500), typed));
+    client.wait_for_message("\"attached\"");
+    std::thread::sleep(Duration::from_millis(300));
+    let out = env.run(&["restart", "--live"]);
+    assert!(out.contains("restarted session inflight live"), "{out}");
+    client.wait_for_message(r#""reattach":"w","live":true"#);
+    env.wait_for_text("sh", "LATE-42");
+}
+
+/// A paste still coming, or a kraal menu open, when a live restart starts: the next server would
+/// get the rest of the paste as keys, or what is typed in the menu would go to the pane. The
+/// restart waits, then is refused; once they are over, it happens.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_paste_still_coming_or_a_menu_open_holds_a_live_restart_back() {
+    let env = Env::new("midpaste");
+    env.workspace("w", "layout {\n    pane name=\"sh\"\n}\n");
+    env.run(&["open", "w"]);
+    let mut client = RawClient::attach_following(&env, "w");
+    client.wait_for_message("\"attached\"");
+    let refused = |why: &str| {
+        let out = env.try_run(&["restart", "--live"]);
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(!out.status.success() && err.contains(why), "{why}: {err}");
+    };
+    client.send(b"\x1b[200~echo PASTED-");
+    std::thread::sleep(Duration::from_millis(300));
+    refused("a paste is still coming");
+    client.send(b"$((6*7))\x1b[201~\r");
+    env.wait_for_text("sh", "PASTED-42");
+    client.send(b"\x02");
+    std::thread::sleep(Duration::from_millis(300));
+    refused("a kraal menu or prompt open");
+    client.send(b"\x1b");
+    std::thread::sleep(Duration::from_millis(300));
+    let out = env.run(&["restart", "--live"]);
+    assert!(out.contains("restarted session midpaste live"), "{out}");
+}
+
+/// An answer still being written to a command that reads it slowly is written whole before the
+/// exec, which would cut it short.
+#[cfg(target_os = "linux")]
+#[test]
+fn an_answer_being_written_is_written_whole_before_a_live_restart() {
+    use std::io::Read;
+    let env = Env::new("slowreader");
+    env.workspace("w", "layout {\n    pane name=\"sh\"\n}\n");
+    env.run(&["open", "w"]);
+    let lines = "i=0; while [ $i -lt 4000 ]; do printf '%0200d\\n' $i; i=$((i+1)); done; exec sleep 600";
+    env.run(&["run", "--name", "big", "--", "sh", "-c", lines]);
+    env.wait_for_text("big", "3999");
+    let socket = env.root.join("run/kraal/slowreader.sock");
+    let mut stream = std::os::unix::net::UnixStream::connect(&socket).unwrap();
+    raw_frame(
+        &mut stream,
+        0,
+        br#"{"type":"request","version":2,"request":{"cmd":"read_pane","pane":"big","lines":10000}}"#,
+    );
+    // Answered, and too large for the socket: it is written as it is read.
+    std::thread::sleep(Duration::from_millis(500));
+    let restart = env.cmd(&["restart", "--live"]).stdout(std::process::Stdio::piped()).spawn().unwrap();
+    std::thread::sleep(Duration::from_millis(1000));
+    stream.set_read_timeout(Some(Duration::from_secs(15))).unwrap();
+    let mut header = [0u8; 5];
+    stream.read_exact(&mut header).expect("an answer");
+    let mut payload = vec![0u8; u32::from_le_bytes(header[..4].try_into().unwrap()) as usize];
+    assert!(payload.len() > 300 << 10, "{}", payload.len());
+    stream.read_exact(&mut payload).expect("the whole answer");
+    let answer: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+    assert!(answer.to_string().contains("3999"));
+    let out = restart.wait_with_output().unwrap();
+    let said = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success() && said.contains("restarted session slowreader live"), "{said}");
 }
 
 /// A command one of the server's threads runs (git, for the panes' branches) is waited for, and
@@ -4679,7 +4971,7 @@ fn clients_that_do_not_follow_a_live_restart_are_told_to_attach_again() {
     following.wait_for_message("\"attached\"");
     let out = env.run(&["restart", "--live"]);
     assert!(out.contains("restarted session olderclient live"), "{out}");
-    older.wait_for_message("kraal restarted live: run kraal to attach again");
+    older.wait_for_message("kraal restarts live: run kraal to attach again");
     assert!(!older.messages.lock().unwrap().iter().any(|m| m.contains("reattach")), "{:?}", older.messages);
     following.wait_for_message(r#""reattach":"w","live":true"#);
     following.wait_for_message(r#""type":"hold","on":true"#);
