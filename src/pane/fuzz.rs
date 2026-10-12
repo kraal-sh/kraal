@@ -357,9 +357,28 @@ fn view<T: alacritty_terminal::event::EventListener>(term: &Term<T>) -> Buffer {
     buf
 }
 
+/// The pane's screen is the emulator's, unless either holds a synchronized update back. Once
+/// resized, the text only: the archive colours the end of a line's new last row where the
+/// emulator rewraps the coloured cells.
+fn same_screen(t: &TermPane, r: &Reference, resized: bool, what: &str) {
+    if t.parser.sync_timeout().sync_timeout().is_some() || r.parser.sync_timeout().sync_timeout().is_some() {
+        return;
+    }
+    let (ours, theirs) = (view(&t.term), view(&r.term));
+    if resized {
+        let text = |b: &Buffer| b.content.iter().map(|c| c.symbol().to_string()).collect::<Vec<_>>();
+        assert_eq!(text(&ours), text(&theirs), "{what}:\n{ours:?}\n{theirs:?}");
+    } else {
+        assert_eq!(ours, theirs, "{what}");
+    }
+}
+
 /// Output kraal passes on to the emulator as it is: no images, no kraal sequences that make it
 /// answer, fewer keyboard modes than the guard lets through.
-fn passed_on(rng: &mut Rng, max: usize) -> Vec<u8> {
+/// `ascii`: no byte past ASCII (no wide or zero-width characters), for a pane that changes
+/// size: the archive lays out whole lines where the emulator rewraps its rows, and they cut a
+/// line around a wide character in different places.
+fn passed_on(rng: &mut Rng, max: usize, ascii: bool) -> Vec<u8> {
     let mut out = Vec::new();
     let n = rng.size(max);
     while out.len() < n {
@@ -368,6 +387,9 @@ fn passed_on(rng: &mut Rng, max: usize) -> Vec<u8> {
         let pushes = piece.windows(2).filter(|w| *w == b"[>").count();
         if pushes > 50 {
             continue;
+        }
+        if ascii {
+            piece.retain(u8::is_ascii);
         }
         out.extend(piece);
     }
@@ -383,8 +405,9 @@ fn fuzz_pane_shows_what_the_emulator_shows() {
         let mut f = fixture(cols, rows, scrollback, disabled);
         let mut r = Reference::new(cols, rows, scrollback);
         let mut resized = false;
+        let resizes = rng.one_in(3);
         for step in 0..rng.range(1, 30) {
-            if rng.one_in(6) {
+            if resizes && rng.one_in(4) {
                 // A larger screen (a pane zoomed, a window grown): what each holds is laid out
                 // at its width, the screen filled from the history. The history is the same
                 // while it is far from full: kraal keeps at least all but what the emulator may
@@ -425,17 +448,20 @@ fn fuzz_pane_shows_what_the_emulator_shows() {
                         t.term.grid().cursor.point
                     )
                 });
-                if t.parser.sync_timeout().sync_timeout().is_none() && r.parser.sync_timeout().sync_timeout().is_none()
-                {
-                    assert_eq!(view(&t.term), view(&r.term), "the screen at step {step}, resized");
-                }
+                same_screen(t, &r, true, &format!("the screen at step {step}, resized"));
             }
-            let output = passed_on(rng, 5000);
+            // The same reads for both: vte 0.15 reads a C1 control cut across two reads as a
+            // character (which a repeat, `CSI b`, repeats).
+            let output = passed_on(rng, 5000, resizes);
             for chunk in rng.chunks(&output) {
                 fuzz::trace(|| format!("feed {:?}", chunk.escape_ascii().to_string()));
                 f.pane.feed(chunk);
+                r.feed(chunk);
+                if std::env::var_os("KRAAL_FUZZ_EACH_READ").is_some() {
+                    // To find the read where they part, compared after each.
+                    same_screen(f.pane.term().unwrap(), &r, resized, &format!("after a read at step {step}"));
+                }
             }
-            r.feed(&output);
             if rng.one_in(3) {
                 f.pane.rest();
             }
@@ -461,7 +487,7 @@ fn fuzz_pane_shows_what_the_emulator_shows() {
             if t.parser.sync_timeout().sync_timeout().is_some() || r.parser.sync_timeout().sync_timeout().is_some() {
                 continue;
             }
-            assert_eq!(view(&t.term), view(&r.term), "the screen at step {step}");
+            same_screen(t, &r, resized, &format!("the screen at step {step}"));
             // Cell by cell, with what the screen does not show (where lines wrap), until a resize:
             // the emulator alone rewraps rows it rewrapped before, the archive whole lines.
             for l in 0..if resized { 0 } else { t.term.screen_lines() as i32 } {
