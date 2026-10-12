@@ -1,8 +1,8 @@
 # How this repository prepares the worktrees kraal makes for agents, with `kraal wt new` or
 # "in a new worktree" in the agent picker (`ctrl+b a`).
 # Commit it as .kraal/worktree.toml at the top of your repository. kraal reads it from the
-# commit a worktree starts from, shows its commands and asks before it runs them, and asks
-# again whenever the file changes. `kraal config check` in the repository validates it.
+# commit a worktree starts from, and acts on nothing of it before you approved that version:
+# `kraal wt setup` shows it, `kraal wt trust` approves it. `kraal config check` validates it.
 # Needs what the commands use, here npm.
 
 # Files that git does not track and a fresh worktree lacks, copied from the main checkout

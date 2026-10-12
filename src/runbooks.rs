@@ -15,7 +15,7 @@ use serde::Deserialize;
 
 use crate::paths;
 use crate::shell;
-use crate::worktree_setup::visible;
+use crate::worktree_setup::visible_lines;
 
 /// Where a runbook comes from: the user's own run as they are, a repository's only once the
 /// user approved its content ([`trusted`]).
@@ -62,15 +62,11 @@ impl Runbook {
 impl Source {
     /// Text of a runbook from there (its file, its name, a step) as the command line prints it:
     /// the user's own as it is, a repository's with what a terminal would act on or hide
-    /// written out ([`visible`]), so that what is read is what gets approved.
+    /// written out ([`visible_lines`]), so that what is read is what gets approved.
     pub fn shown(&self, text: &str) -> String {
         match self {
             Source::User => text.to_string(),
-            // A line that ends with CR LF is a line.
-            Source::Repo(_) => {
-                let lines = text.split('\n').map(|line| visible(line.strip_suffix('\r').unwrap_or(line)));
-                lines.collect::<Vec<_>>().join("\n")
-            }
+            Source::Repo(_) => visible_lines(text),
         }
     }
 }
@@ -510,12 +506,20 @@ fn file_in_repo<'a>(r: &'a Runbook, root: &Path) -> &'a Path {
     r.path.strip_prefix(root).unwrap_or(&r.path)
 }
 
-/// Why the runbook `name` of the repository `root` does not run, and how to approve it: said
-/// wherever nobody can be asked (`--yes`, no terminal, a plan run by another program).
+/// Why the runbook `name` of the repository `root` does not run, and how to approve it.
 pub fn not_approved(name: &str, root: &Path) -> String {
+    refusal(name, root, &format!("kraal runbook show {name}"), &format!("kraal runbook trust {name}"))
+}
+
+/// Why kraal does not act on `what`, a file of the repository `root` (a runbook by its name,
+/// the worktree setup), and how to approve it, with the command that shows it and the one that
+/// approves it: said wherever nobody can be asked (`--yes`, no terminal, a plan run by another
+/// program). `--yes` answers what a command asks about what it does; it approves nothing a
+/// repository brings.
+pub fn refusal(what: &str, root: &Path, show: &str, trust: &str) -> String {
     format!(
-        "{name} comes from the repository {} and this version of it is not approved: read it \
-         (`kraal runbook show {name}`), then approve it (`kraal runbook trust {name}`)",
+        "{what} comes from the repository {} and this version of it is not approved: read it (`{show}`), then \
+         approve it (`{trust}`)",
         paths::shorten_home(root)
     )
 }

@@ -4092,13 +4092,14 @@ fn worktrees_are_prepared_numbered_and_pruned_from_the_command_line() {
 
     // Not approved yet, and nobody to ask: nothing is made.
     let out = wt(&["new", "one"]);
-    assert!(!out.status.success() && text(&out).contains("--yes") && text(&out).contains("1. echo"), "{}", text(&out));
+    assert!(!out.status.success() && text(&out).contains("`kraal wt trust`"), "{}", text(&out));
     assert!(!dir.join("one").exists());
     // Left as git makes it.
     assert!(wt(&["new", "one", "--no-setup"]).status.success());
     assert!(!dir.join("one/.env").exists());
     // Approved: the files are copied, never through a link out of the repository, and the
     // commands run with the worktree's number and port.
+    assert!(wt(&["trust"]).status.success());
     let out = wt(&["new", "two", "--yes"]);
     assert!(out.status.success(), "{}", text(&out));
     assert_eq!(std::fs::read_to_string(dir.join("two/setup.log")).unwrap(), "two #2 on 3020\n");
@@ -4114,6 +4115,7 @@ fn worktrees_are_prepared_numbered_and_pruned_from_the_command_line() {
     git(&["commit", "-q", "-am", "fail"]);
     assert!(!wt(&["new", "four"]).status.success());
     assert!(!dir.join("four").exists());
+    assert!(wt(&["trust"]).status.success());
     let out = wt(&["new", "four", "--yes"]);
     assert!(!out.status.success() && text(&out).contains("the setup of four failed (exit 3)"), "{}", text(&out));
     assert!(dir.join("four").exists());
@@ -4147,6 +4149,186 @@ fn worktrees_are_prepared_numbered_and_pruned_from_the_command_line() {
     assert!(dir.join("two/feature.txt").exists() && dir.join("three/notes.txt").exists());
     let list = String::from_utf8(wt(&["list"]).stdout).unwrap();
     assert!(!list.contains("one") && list.contains("two") && list.contains("three"), "{list}");
+}
+
+/// A repository's `.kraal/worktree.toml` is a file someone else wrote: kraal copies nothing it
+/// names and runs none of its commands before this version of it is approved, and approving is
+/// an act of its own (`kraal wt trust`). `--yes` asks nothing and approves nothing, with or
+/// without an agent to start; `kraal wt setup` shows the file and does nothing else.
+#[test]
+fn a_worktree_setup_is_acted_on_only_once_approved() {
+    let env = Env::new("wttrust");
+    let repo = env.root.join("app");
+    let ran = env.root.join("ran");
+    let file = repo.join(".kraal/worktree.toml");
+    let setup = |word: &str| format!("copy = [\".env\"] # \u{200b}\nsetup = [\"echo {word} >> {}\"]\n", ran.display());
+    let first = setup("one");
+    let committed = [(".gitignore", ".env\nnotes\n"), (".kraal/worktree.toml", first.as_str())];
+    let git = git_repo(&repo, &committed);
+    std::fs::write(repo.join(".env"), "A=1\n").unwrap();
+    let wt_in = |repo: &Path, args: &[&str]| {
+        let mut c = env.cmd(&[&["wt"], args].concat());
+        let out = c.current_dir(repo).stdin(std::process::Stdio::null()).output().unwrap();
+        (
+            out.status.success(),
+            format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr)),
+        )
+    };
+    let wt = |args: &[&str]| wt_in(&repo, args);
+    let dir = env.root.join("app.worktrees");
+    let store = env.root.join("state/kraal/trusted-runbooks.json");
+    let read = |path: &Path| std::fs::read_to_string(path).unwrap_or_default();
+
+    // Shown as a new worktree would get it, with what a terminal would hide written out.
+    let (ok, shown) = wt(&["setup"]);
+    assert!(ok && shown.contains(".kraal/worktree.toml as of main\n"), "{shown}");
+    assert!(shown.contains("# \\u{200b}\n") && shown.contains("echo one >> "), "{shown}");
+    assert!(!store.exists() && !dir.exists() && !ran.exists());
+
+    // `--yes` asks nothing, and nobody answers without a terminal: neither approves.
+    let refused: [&[&str]; 3] = [&["new", "x", "--yes"], &["new", "x"], &["new", "x", "--agent", "claude", "--yes"]];
+    for args in refused {
+        let (ok, said) = wt(args);
+        assert!(!ok && said.contains("the worktree setup comes from the repository "), "{args:?}: {said}");
+        assert!(said.contains("is not approved: read it (`kraal wt setup`)"), "{args:?}: {said}");
+        assert!(said.contains("approve it (`kraal wt trust`)") && said.contains("--no-setup"), "{args:?}: {said}");
+        assert!(!store.exists() && !dir.exists() && !ran.exists(), "{args:?}");
+    }
+    // Without the setup, the worktree is made, and nothing of the file is acted on.
+    let (ok, said) = wt(&["new", "bare", "--no-setup", "--yes"]);
+    assert!(ok && dir.join("bare").exists() && !dir.join("bare/.env").exists() && !ran.exists(), "{said}");
+
+    // Approved as it is now: its files are copied and its commands run, without a question.
+    let (ok, said) = wt(&["trust"]);
+    assert!(ok && said.contains("is approved as it is now"), "{said}");
+    let (ok, said) = wt(&["new", "x", "--yes"]);
+    assert!(ok, "{said}");
+    assert_eq!((read(&ran).as_str(), read(&dir.join("x/.env")).as_str()), ("one\n", "A=1\n"));
+
+    // Changed since, be it only in what it copies: that version was never approved.
+    std::fs::write(&file, "copy = [\".env\", \"notes\"]\n").unwrap();
+    std::fs::write(repo.join("notes"), "private\n").unwrap();
+    git(&["commit", "-q", "-am", "copy more"]);
+    let (ok, said) = wt(&["new", "y", "--yes"]);
+    assert!(!ok && said.contains("`kraal wt trust`") && !dir.join("y").exists(), "{said}");
+    assert!(wt(&["trust"]).0);
+    let (ok, said) = wt(&["new", "y", "--yes"]);
+    assert!(ok && read(&dir.join("y/notes")) == "private\n", "{said}");
+
+    // The file of another branch is another version: shown and approved by that branch's name.
+    git(&["checkout", "-q", "-b", "other"]);
+    std::fs::write(&file, setup("two")).unwrap();
+    git(&["commit", "-q", "-am", "two"]);
+    git(&["checkout", "-q", "main"]);
+    let (ok, said) = wt(&["new", "z", "--base", "other", "--yes"]);
+    assert!(!ok && said.contains("(`kraal wt setup --base other`)"), "{said}");
+    assert!(said.contains("(`kraal wt trust --base other`)") && !dir.join("z").exists(), "{said}");
+    let (ok, shown) = wt(&["setup", "--base", "other"]);
+    assert!(ok && shown.contains("worktree.toml as of other\n") && shown.contains("echo two >> "), "{shown}");
+    assert!(wt(&["trust", "--base", "other"]).0);
+    let (ok, said) = wt(&["new", "z", "--base", "other", "--yes"]);
+    assert!(ok && read(&ran) == "one\ntwo\n", "{said}");
+
+    // A repository without the file has nothing to approve.
+    let plain = env.root.join("plain");
+    let _ = git_repo(&plain, &[("a.txt", "1\n")]);
+    let (ok, said) = wt_in(&plain, &["setup"]);
+    assert!(ok && said.starts_with("no ") && said.contains(".kraal/worktree.toml as of main"), "{said}");
+    let (ok, said) = wt_in(&plain, &["trust"]);
+    assert!(ok && said.contains("nothing to approve"), "{said}");
+    let (ok, said) = wt_in(&plain, &["new", "n", "--yes"]);
+    assert!(ok && env.root.join("plain.worktrees/n").exists(), "{said}");
+}
+
+/// In a terminal, `kraal wt new` shows the repository's setup, every command of it, and asks
+/// whether to trust it before anything is made; `--yes` there asks nothing and approves
+/// nothing.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_worktree_setup_is_approved_in_a_terminal_by_a_question_that_says_so() {
+    let env = Env::new("wtask");
+    let repo = env.root.join("app");
+    let ran = env.root.join("ran");
+    let setup = format!("setup = [\"echo ran >> {}\"]\n", ran.display());
+    let _ = git_repo(&repo, &[(".kraal/worktree.toml", &setup)]);
+    let dir = env.root.join("app.worktrees");
+    let store = env.root.join("state/kraal/trusted-runbooks.json");
+    let new = |args: &[&str], typed: &[u8]| {
+        let mut c = env.cmd(&[&["wt", "new"], args].concat());
+        c.current_dir(&repo);
+        in_terminal(c, typed)
+    };
+
+    let shown = new(&["x"], b"n\n");
+    assert!(
+        shown.contains("Trust the worktree setup of the repository ") && shown.contains("  1. echo ran >> "),
+        "{shown}"
+    );
+    assert!(shown.contains("Trust this version and prepare the worktree with it? [y/N]"), "{shown}");
+    assert!(shown.contains("cancelled; nothing was created"), "{shown}");
+    assert!(!dir.exists() && !ran.exists() && !store.exists());
+    let shown = new(&["x", "--yes"], b"y\n");
+    assert!(shown.contains("is not approved") && !shown.contains("[y/N]"), "{shown}");
+    assert!(!dir.exists() && !ran.exists() && !store.exists());
+    let shown = new(&["x"], b"y\n");
+    assert!(shown.contains("[y/N]") && dir.join("x").exists() && ran.exists() && store.exists(), "{shown}");
+    // Approved: the next one is made without a question.
+    let shown = new(&["y"], b"");
+    assert!(!shown.contains("Trust") && dir.join("y").exists(), "{shown}");
+}
+
+/// A worktree's setup runs once, when the worktree is made. A session restarted while it runs
+/// brings the agent's pane back and runs nothing of the repository's again.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_worktree_setup_is_not_run_again_after_a_restart() {
+    let env = Env::new("wtrestart");
+    let repo = env.root.join("app");
+    let ran = env.root.join("ran");
+    let setup = format!("setup = [\"echo started >> {}\", \"sleep 30\"]\n", ran.display());
+    let _ = git_repo(&repo, &[(".kraal/worktree.toml", &setup)]);
+    let bin = env.root.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    write_script(&bin.join("claude"), "#!/bin/sh\necho agent started\nexec sleep 100\n");
+    let home = env.root.join("alpha-home");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::write(
+        env.root.join("config/kraal/accounts.toml"),
+        format!(
+            "[[account]]\nname = \"alpha\"\nagent = \"claude\"\nhome = {:?}\n\n[[rule]]\nworkspace = \"w\"\naccounts = [\"alpha\"]\n",
+            home.display().to_string()
+        ),
+    )
+    .unwrap();
+    env.workspace("w", &format!("layout {{\n    pane name=\"shell\" cwd={:?}\n}}\n", repo.display().to_string()));
+    let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap_or_default());
+    let open = || {
+        let out = env.cmd(&["open", "w"]).env("PATH", &path).output().unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    };
+    open();
+    let mut client = RawClient::attach(&env, "w");
+    client.wait_for_screen("⎇ main");
+    client.send(b"\x02a");
+    client.wait_for_screen("in a new worktree");
+    client.send(b"claude in a new worktree");
+    std::thread::sleep(Duration::from_millis(200));
+    client.send(b"\r");
+    client.wait_for_screen("Name of the worktree");
+    client.send(b"feat\r");
+    client.wait_for_screen("Trust the worktree setup");
+    client.send(b"y");
+    let started = || std::fs::read_to_string(&ran).unwrap_or_default();
+    wait_until(Duration::from_secs(15), "the setup never started", || started() == "started\n");
+
+    // Stopped while the setup runs, and started again: the pane is back, the setup is not.
+    env.run(&["kill"]);
+    open();
+    wait_until(Duration::from_secs(10), "the agent's pane did not come back", || {
+        env.run(&["panes"]).contains("claude feat")
+    });
+    std::thread::sleep(Duration::from_millis(1500));
+    assert_eq!(started(), "started\n", "the setup ran again");
 }
 
 /// From the agent picker: the worktree is made once its repository's setup is approved, the
@@ -4263,16 +4445,27 @@ fn an_agent_worktree_is_prepared_in_its_pane_once_trusted() {
     let panes = env.run(&["panes"]);
     assert!(!panes.contains("claude feat") && !panes.contains("claude bad"), "{panes}");
 
-    // From the command line inside the session: prepared there, and the agent opened in the
+    // From the command line inside the session: the version declined above is refused there
+    // too, `--yes` or not; approved, the worktree is prepared there, and the agent opened in the
     // session gets the worktree's number (the first, free again).
     let socket = env.root.join("run/kraal/wtsetup.sock");
-    let out = env
-        .cmd(&["wt", "new", "cli", "--agent", "claude", "--yes"])
-        .env("PATH", &path)
-        .env("KRAAL_SOCKET", &socket)
-        .current_dir(&repo)
-        .output()
-        .unwrap();
+    let new_cli = || {
+        env.cmd(&["wt", "new", "cli", "--agent", "claude", "--yes"])
+            .env("PATH", &path)
+            .env("KRAAL_SOCKET", &socket)
+            .current_dir(&repo)
+            .output()
+            .unwrap()
+    };
+    let out = new_cli();
+    assert!(!out.status.success() && String::from_utf8_lossy(&out.stderr).contains("`kraal wt trust`"));
+    assert!(!dir.join("cli").exists());
+    let trust = || {
+        let out = env.cmd(&["wt", "trust"]).current_dir(&repo).output().unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    };
+    trust();
+    let out = new_cli();
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     let said = String::from_utf8(out.stdout).unwrap();
     assert!(said.contains("changed"), "the setup ran there");
@@ -4280,6 +4473,28 @@ fn an_agent_worktree_is_prepared_in_its_pane_once_trusted() {
     let pane = said.lines().last().unwrap();
     assert!(pane.parse::<u32>().is_ok(), "{said}");
     wait_for(pane, "agent in cli #1 port 3010");
+
+    // Files to copy alone are asked about as well: the repository names them.
+    std::fs::write(repo.join(".kraal/worktree.toml"), "copy = [\".env\"]\n").unwrap();
+    git(&["commit", "-q", "-am", "copy only"]);
+    new_worktree(&mut client, "copy");
+    client.wait_for_screen("it copies from the main checkout: .env");
+    client.send(b"n");
+    client.wait_for_row("the worktree copy was not created");
+    assert!(!dir.join("copy").exists());
+    // Approved from the command line: the picker asks nothing more, and the file is copied.
+    trust();
+    env.run(&["focus", "shell"]);
+    client.screen.lock().unwrap().clear();
+    client.send(b"\x02a");
+    client.wait_for_screen("in a new worktree");
+    client.send(b"claude in a new worktree");
+    std::thread::sleep(Duration::from_millis(200));
+    client.send(b"\r");
+    client.wait_for_screen("Name of the worktree");
+    client.send(b"copied\r");
+    wait_for("claude copied", "agent in copied #2 port 3020");
+    assert_eq!(std::fs::read_to_string(dir.join("copied/.env")).unwrap(), "A=1\n");
 }
 
 #[test]

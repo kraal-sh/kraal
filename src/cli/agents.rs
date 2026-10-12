@@ -282,21 +282,22 @@ pub(super) fn worktrees(s: &Session, action: WtCmd) -> Result<()> {
             let cfg = crate::config::Config::load()?;
             let user = worktree_setup::Setup::of_user(&cfg.worktrees);
             let plan = worktree_setup::Plan::new(&cwd, &name, base.as_deref(), user, !no_setup)?;
-            // The repository's commands run once this version of its file is approved.
+            // The repository's file is acted on once this version of it is approved: an act of
+            // its own, which `--yes` (ask nothing) is not. Where someone can answer, it is shown
+            // and the question asked; otherwise nothing is made, and the way to approve is said.
             if plan.needs_trust() {
+                anyhow::ensure!(
+                    !yes && std::io::stdin().is_terminal(),
+                    "{}; --no-setup makes the worktree without it",
+                    plan.from.not_approved(base.as_deref())
+                );
                 println!("{}", plan.trust_question());
-                if !yes {
-                    anyhow::ensure!(
-                        std::io::stdin().is_terminal(),
-                        "add --yes to trust it and run it, or --no-setup to make the worktree without it"
-                    );
-                    eprint!("Trust this version and run it? [y/N] ");
-                    std::io::stderr().flush()?;
-                    let mut line = String::new();
-                    std::io::stdin().lock().read_line(&mut line)?;
-                    if !matches!(line.trim(), "y" | "Y" | "yes") {
-                        bail!("cancelled; nothing was created");
-                    }
+                eprint!("Trust this version and prepare the worktree with it? [y/N] ");
+                std::io::stderr().flush()?;
+                let mut line = String::new();
+                std::io::stdin().lock().read_line(&mut line)?;
+                if !matches!(line.trim(), "y" | "Y" | "yes") {
+                    bail!("cancelled; nothing was created");
                 }
                 plan.trust()?;
             }
@@ -320,6 +321,27 @@ pub(super) fn worktrees(s: &Session, action: WtCmd) -> Result<()> {
                     std::env::set_current_dir(&w.path)?;
                     return exec_agent(&agent, None, None, &[], &env);
                 }
+            }
+            Ok(())
+        }
+        WtCmd::Setup { base } => {
+            let file = worktree_setup::RepoFile::read(&cwd, base.as_deref())?;
+            match file.shown() {
+                Some(text) => print!("{}\n\n{text}", file.place()),
+                None => println!("no {}: a new worktree is prepared as [worktrees] in your config says", file.place()),
+            }
+            Ok(())
+        }
+        WtCmd::Trust { base } => {
+            let file = worktree_setup::RepoFile::read(&cwd, base.as_deref())?;
+            if file.trust()? {
+                println!(
+                    "the worktree setup, from the repository {}, is approved as it is now: kraal asks again when it \
+                     changes",
+                    paths::shorten_home(&file.repo)
+                );
+            } else {
+                println!("no {}: nothing to approve", file.place());
             }
             Ok(())
         }

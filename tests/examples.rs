@@ -323,13 +323,15 @@ fn the_repository_example_prepares_a_worktree() {
     for command in strings("setup") {
         fake(&env, command.split(' ').next().unwrap(), "");
     }
-    // Nobody to ask: nothing is made until the file is approved.
-    let out = in_repo(&["wt", "new", "fix-login"]).output().unwrap();
-    let asked = String::from_utf8_lossy(&out.stdout);
-    assert!(!out.status.success() && strings("setup").iter().all(|command| asked.contains(command)), "{asked}");
+    // Nobody to ask: nothing is made until the file is approved, which `--yes` does not do.
+    let out = in_repo(&["wt", "new", "fix-login", "--yes"]).output().unwrap();
+    assert!(!out.status.success(), "{}", String::from_utf8_lossy(&out.stdout));
+    let shown = quiet(in_repo(&["wt", "setup"]));
+    assert!(strings("setup").iter().all(|command| shown.contains(command)), "{shown}");
     let worktree = env.root.join("shop.worktrees/fix-login");
     assert!(!worktree.exists() && called(&env).is_empty());
 
+    quiet(in_repo(&["wt", "trust"]));
     let out = in_repo(&["wt", "new", "fix-login", "--yes"]).output().unwrap();
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     for path in copied {
