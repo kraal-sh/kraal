@@ -468,20 +468,22 @@ impl Pane {
         }
     }
 
-    pub fn resize(&mut self, cols: u16, rows: u16) {
+    /// Give the pane `cols × rows`. Whether its terminal changed size: the program in it is told,
+    /// and may draw itself again.
+    pub fn resize(&mut self, cols: u16, rows: u16) -> bool {
         let cols = cols.max(2);
         let rows = rows.max(1);
         if (cols, rows) == (self.cols, self.rows) {
-            return;
+            return false;
         }
         self.cols = cols;
         self.rows = rows;
-        if let Content::Term(t) = &mut self.content {
-            let _ = t.master.resize(pty::pty_size(cols, rows, t.graphics.shared()));
-            t.before_resize(Size { cols, rows });
-            t.resize_marked(Size { cols, rows });
-            t.after_resize();
-        }
+        let Content::Term(t) = &mut self.content else { return false };
+        let _ = t.master.resize(pty::pty_size(cols, rows, t.graphics.shared()));
+        t.before_resize(Size { cols, rows });
+        t.resize_marked(Size { cols, rows });
+        t.after_resize();
+        true
     }
 
     /// Feed process output. Returns signals for the server.

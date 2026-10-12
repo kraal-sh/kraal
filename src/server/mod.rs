@@ -416,6 +416,9 @@ pub struct Server {
     streak: u8,
     /// Panes just typed into, until when their output is drawn at once (it is the echo).
     echo: HashMap<PaneId, Instant>,
+    /// Panes just resized, until when their output is drawn at once (it is their picture at the
+    /// new size, see [`Server::relayout`]).
+    redraws: HashMap<PaneId, Instant>,
     /// When what was last marked to draw has been quiet long enough to be drawn without waiting
     /// for the frame gap (see [`Server::schedule_render`]).
     settle: Option<Instant>,
@@ -597,6 +600,9 @@ const BUSY_FRAME_GAP: Duration = Duration::from_millis(8);
 const BUSY_AFTER: u8 = 3;
 /// How long after a key the output of the pane it went to is drawn at once, as its echo.
 const ECHO_WAIT: Duration = Duration::from_millis(250);
+/// How long after a pane is resized its output is drawn at once, as its picture at the new size:
+/// a shell answers within a millisecond, a program on a server after a round trip.
+const REDRAW_WAIT: Duration = Duration::from_millis(250);
 /// Output is parsed this much at a time, so that what comes meanwhile (a key, its echo) does not
 /// wait for all that a program printed to be parsed...
 const PARSE_SLICE: usize = 8 * 1024;
@@ -738,6 +744,7 @@ pub fn run(session: &str) -> Result<()> {
         last_frame: Instant::now(),
         streak: 0,
         echo: HashMap::new(),
+        redraws: HashMap::new(),
         settle: None,
         quitting: false,
         kill_waiters: Vec::new(),
@@ -950,12 +957,13 @@ impl Server {
     }
 
     /// Parse waiting pane output for up to `budget`: the panes clients are looking at first,
-    /// a chunk each whatever else waits, then more for at most half of it, then the others in
-    /// turn, one chunk each. Stops early when a control event arrives or a frame is due, but the
-    /// others always get a chunk: a pane printing without a pause keeps the queue busy, and must
-    /// not starve the rest. A frame due once the focused panes are read (the echo of a key) goes
-    /// before the others' output, every other time at most. A chunk is parsed a slice at a time:
-    /// one that comes while it is parsed (a key) waits for a slice, not for all of it.
+    /// a chunk each whatever else waits, then more for at most half of it, then a chunk of each
+    /// pane just resized (see [`Server::redrawn`]), then the others in turn, one chunk each.
+    /// Stops early when a control event arrives or a frame is due, but the others always get a
+    /// chunk: a pane printing without a pause keeps the queue busy, and must not starve the
+    /// rest. A frame due once the focused panes are read (the echo of a key) goes before the
+    /// others' output, every other time at most. A chunk is parsed a slice at a time: one that
+    /// comes while it is parsed (a key) waits for a slice, not for all of it.
     fn pump_output(&mut self, budget: Duration, rx: &Receiver<Event>) {
         let start = Instant::now();
         let focused: Vec<PaneId> =
@@ -979,6 +987,13 @@ impl Server {
                 }
             }
         }
+        // The frame due after a resize shows the panes as they drew themselves again, not as
+        // they were left: what they printed since is read before it.
+        for p in self.redrawn() {
+            if self.take_output(p, &mut data, true) {
+                self.parse_output(p, &data, rx, false);
+            }
+        }
         // A frame due (an echo) goes before the others' turn, but not twice in a row: a pane
         // printing in the focus, with frames always due, must not starve the others. Their turn
         // is then a slice: the frame waits no longer than that.
@@ -1000,6 +1015,17 @@ impl Server {
             }
         }
         self.output_buf = data;
+    }
+
+    /// The panes resized a moment ago (see `redraws`) that have output waiting, in the order it
+    /// came.
+    fn redrawn(&self) -> Vec<PaneId> {
+        if self.redraws.is_empty() {
+            return Vec::new();
+        }
+        let now = Instant::now();
+        let awaited = |p: &PaneId| self.redraws.get(p).is_some_and(|until| now <= *until);
+        self.ready.iter().copied().filter(awaited).collect()
     }
 
     /// Parse output `data` of pane `id`, a slice at a time, until it is all parsed (true) or
@@ -1284,6 +1310,7 @@ impl Server {
         self.check_run_timeouts();
         self.show_warnings();
         self.echo.retain(|_, until| *until > now);
+        self.redraws.retain(|_, until| *until > now);
         // Wake-ups can be dropped when the event queue is full; catch those panes here.
         let waiting: Vec<PaneId> = self.panes.values().filter(|p| p.has_output()).map(|p| p.id).collect();
         for id in waiting {
@@ -1479,6 +1506,13 @@ impl Server {
         self.mark_dirty_pane(id);
         if !self.echo.is_empty()
             && let Some(until) = self.echo.remove(&id)
+            && Instant::now() <= until
+        {
+            self.render_now();
+        }
+        // Once per resize: what the pane prints after that is paced like any output.
+        if !self.redraws.is_empty()
+            && let Some(until) = self.redraws.remove(&id)
             && Instant::now() <= until
         {
             self.render_now();

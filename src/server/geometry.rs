@@ -1,5 +1,7 @@
 //! Where things are: the main area, pane rectangles, and which workspace holds a pane.
 
+use std::time::Instant;
+
 use ratatui::layout::Rect;
 
 use super::{Client, ClientId, Server, Tab};
@@ -144,7 +146,17 @@ impl Server {
         (frame, self.inner(frame))
     }
 
-    /// Recompute the layout area from the primary client and resize every pane.
+    /// The panes attached clients have on screen.
+    fn panes_on_screen(&self) -> std::collections::HashSet<PaneId> {
+        let shown = self.clients.values().filter(|c| c.attached).filter_map(|c| self.ws_index(c.workspace));
+        shown.flat_map(|wi| self.tab_rects(self.workspaces[wi].tab(), self.layout_area)).map(|(p, ..)| p).collect()
+    }
+
+    /// Recompute the layout area from the primary client and resize every pane. A program told
+    /// of a new size draws itself again, and that picture is what the user waits for, not a
+    /// stream of output to pace: the next output of each pane on screen is drawn at once (see
+    /// `redraws`), unless the pane was printing already (it goes on at its pace) or has shown
+    /// nothing yet (it has nothing to draw again).
     pub fn relayout(&mut self) {
         if let Some(c) = self.primary.and_then(|p| self.clients.get(&p)) {
             self.layout_area = self.main_area(c);
@@ -180,9 +192,17 @@ impl Server {
                 }
             }
         }
+        let on_screen = self.panes_on_screen();
+        let until = Instant::now() + super::REDRAW_WAIT;
         for (id, r) in sizes {
-            if let Some(p) = self.panes.get_mut(&id) {
-                p.resize(r.width, r.height);
+            let printing = self.ready_set.contains(&id);
+            if let Some(p) = self.panes.get_mut(&id)
+                && p.resize(r.width, r.height)
+                && p.fed > 0
+                && !printing
+                && on_screen.contains(&id)
+            {
+                self.redraws.insert(id, until);
             }
         }
         for c in self.clients.values_mut() {
