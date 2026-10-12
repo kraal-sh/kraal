@@ -36,6 +36,9 @@ pub struct ScreenCache {
     moved: u64,
     cells: Vec<Cell>,
     versions: Vec<u64>,
+    /// For each row, the version it had before its last change, and the columns that change
+    /// touched (from, to): what a client sent that version needs to be sent of it.
+    changed: Vec<(u64, u16, u16)>,
     /// The links of each row: column and target.
     links: Vec<Vec<(u16, Arc<str>)>>,
     /// Rows with image placeholders: what they show depends on the images too.
@@ -80,6 +83,8 @@ impl ScreenCache {
             self.cells.resize(cols * rows, Cell::EMPTY);
             self.versions.clear();
             self.versions.resize(rows, 0);
+            self.changed.clear();
+            self.changed.resize(rows, (0, 0, 0));
             self.links.clear();
             self.links.resize_with(rows, Vec::new);
             self.images.clear();
@@ -89,6 +94,8 @@ impl ScreenCache {
             lines.clear();
             lines.extend(0..rows);
         }
+        // Damaged rows are drawn whole: the emulator's columns miss some changes (insert mode
+        // moves the rest of a row, a character over half of a wide one clears the other half).
         for y in lines {
             if y < rows {
                 self.draw_row(term, y, resized);
@@ -126,7 +133,12 @@ impl ScreenCache {
         }
         let cells = &mut self.cells[y * cols..(y + 1) * cols];
         if fresh || cells != self.row.as_slice() {
+            // The columns that changed, from the first to the last.
+            let differ = |x: &usize| cells[*x] != self.row[*x];
+            let from = if fresh { 0 } else { (0..cols).find(differ).unwrap_or(0) };
+            let to = if fresh { cols } else { (0..cols).rev().find(differ).map_or(cols, |x| x + 1) };
             cells.swap_with_slice(&mut self.row);
+            self.changed[y] = (if fresh { 0 } else { self.versions[y] }, from as u16, to as u16);
             self.versions[y] = new_version();
         }
         std::mem::swap(&mut self.links[y], &mut self.row_links);
@@ -142,14 +154,27 @@ impl ScreenCache {
         &self.versions
     }
 
+    /// The columns (from, to) of row `y` that differ from what it showed at version `was`,
+    /// when that was the version before its last change; None otherwise (all of it may).
+    pub fn changed_since(&self, y: usize, was: u64) -> Option<(u16, u16)> {
+        let (before, from, to) = *self.changed.get(y)?;
+        (before == was && before != 0).then_some((from, to))
+    }
+
     /// Whether what row `y` shows depends on images.
     pub fn has_images(&self, y: usize) -> bool {
         self.images.get(y).copied().unwrap_or(false)
     }
 
-    /// Copy the rows `rows` says to into `buf` at `area` (the size of the rows), and add every
-    /// row's links to `links`.
-    pub fn draw(&self, area: Rect, buf: &mut Buffer, rows: impl Fn(usize) -> bool, links: &mut crate::ansi::Links) {
+    /// Copy the columns of each row `rows` says to (from, to) into `buf` at `area` (the size of
+    /// the rows), and add every row's links to `links`.
+    pub fn draw(
+        &self,
+        area: Rect,
+        buf: &mut Buffer,
+        rows: impl Fn(usize) -> Option<(u16, u16)>,
+        links: &mut crate::ansi::Links,
+    ) {
         let (bx, by, bw) = (usize::from(buf.area.x), usize::from(buf.area.y), usize::from(buf.area.width));
         let (x, y) = (usize::from(area.x), usize::from(area.y));
         if area.width as usize != self.cols || area.height as usize != self.rows || buf.area.union(area) != buf.area {
@@ -157,10 +182,11 @@ impl ScreenCache {
         }
         let cols = self.cols;
         for r in 0..self.rows {
-            if rows(r) {
+            if let Some((from, to)) = rows(r) {
+                let (from, to) = (usize::from(from).min(cols), usize::from(to).min(cols));
                 let at = (y + r - by) * bw + (x - bx);
-                if let Some(dst) = buf.content.get_mut(at..at + cols) {
-                    dst.clone_from_slice(&self.cells[r * cols..(r + 1) * cols]);
+                if let Some(dst) = buf.content.get_mut(at + from..at + to) {
+                    dst.clone_from_slice(&self.cells[r * cols + from..r * cols + to]);
                 }
             }
             for (cx, uri) in &self.links[r] {
@@ -195,7 +221,7 @@ mod tests {
         let screen = Rect::new(0, 0, area.width + 2, area.height + 3);
         let (mut cached, mut full) = (Buffer::empty(screen), Buffer::empty(screen));
         let (mut cached_links, mut full_links) = (crate::ansi::Links::new(), crate::ansi::Links::new());
-        cache.draw(area, &mut cached, |_| true, &mut cached_links);
+        cache.draw(area, &mut cached, |_| Some((0, cache.cols as u16)), &mut cached_links);
         render_term(term, area, &mut full, Some(&mut full_links));
         ((cached, cached_links), (full, full_links))
     }
@@ -375,7 +401,18 @@ mod tests {
                 assert_eq!(cached_links, full_links, "case {case} step {step}");
                 for (r, (old, new)) in versions.iter().zip(cache.versions()).enumerate() {
                     let y = r as u16 + 2;
-                    assert_eq!(old == new, row(&was, y) == row(&cached, y), "case {case} step {step} row {r}");
+                    let (before, now) = (row(&was, y), row(&cached, y));
+                    assert_eq!(old == new, before == now, "case {case} step {step} row {r}");
+                    // Outside the columns said to have changed, the row is as it was.
+                    if old != new
+                        && let Some((from, to)) = cache.changed_since(r, *old)
+                    {
+                        let told = usize::from(from) + 1..usize::from(to) + 1;
+                        let outside = (0..now.len()).filter(|x| !told.contains(x));
+                        assert!(outside.clone().all(|x| before[x] == now[x]), "case {case} step {step} row {r}");
+                        assert!(told.clone().next().is_some_and(|x| before[x] != now[x]), "from the first change");
+                        assert!(told.last().is_some_and(|x| before[x] != now[x]), "to the last");
+                    }
                 }
                 was = cached;
                 versions = cache.versions().to_vec();

@@ -173,10 +173,13 @@ fn kept_rows(placed: &[Placed]) -> Vec<Kept> {
         .filter_map(|p| Some((p, p.rows.as_ref()?)))
         .flat_map(|(p, rows)| {
             let c = p.content;
-            rows.iter().enumerate().filter(|(_, k)| **k).map(move |(r, _)| Kept {
-                y: c.y + r as u16,
-                x0: c.x,
-                x1: c.right(),
+            rows.iter().enumerate().flat_map(move |(r, span)| {
+                let y = c.y + r as u16;
+                // A row is kept but for the columns drawn again.
+                let (from, to) = span.map_or((c.width, c.width), |(a, b)| (a.min(c.width), b.min(c.width)));
+                [Kept { y, x0: c.x, x1: c.x + from }, Kept { y, x0: c.x + to, x1: c.right() }]
+                    .into_iter()
+                    .filter(|k| k.x0 < k.x1)
             })
         })
         .collect();
@@ -252,8 +255,9 @@ struct Placed {
     floating: bool,
     /// Where its content goes.
     content: Rect,
-    /// Drawn from its screen rows: for each row, whether the frame already has it.
-    rows: Option<Vec<bool>>,
+    /// Drawn from its screen rows: for each row, the columns to draw again (from, to), none
+    /// when the frame already has it.
+    rows: Option<Vec<Option<(u16, u16)>>>,
     /// The versions of its rows, when nothing else is drawn over them.
     versions: Option<Vec<u64>>,
 }
@@ -383,8 +387,11 @@ impl Server {
                 for p in &placed {
                     match (&p.rows, p.versions.is_some()) {
                         (Some(rows), true) => {
-                            for (r, _) in rows.iter().enumerate().filter(|(_, k)| !**k) {
-                                changed.row(p.content.y + r as u16, p.content.x, p.content.right());
+                            for (r, span) in rows.iter().enumerate() {
+                                if let Some((from, to)) = span {
+                                    let x = p.content.x;
+                                    changed.row(p.content.y + r as u16, x + from, (x + to).min(p.content.right()));
+                                }
                             }
                         }
                         _ => changed.rect(p.inner),
@@ -1171,11 +1178,20 @@ impl Server {
                 && tiles.iter().all(|(q, t)| *q == p.pane || !t.intersects(content));
             let versions = rows.versions();
             let same = memo.and_then(|m| m.panes.iter().find(|(q, r, _)| *q == p.pane && *r == content));
+            let whole = Some((0, content.width));
             p.rows = Some(match same {
-                Some((_, _, old)) if alone => {
-                    versions.iter().enumerate().map(|(r, v)| old.get(r) == Some(v) && !rows.has_images(r)).collect()
-                }
-                _ => vec![false; versions.len()],
+                Some((_, _, old)) if alone => versions
+                    .iter()
+                    .enumerate()
+                    .map(|(r, v)| match old.get(r) {
+                        _ if rows.has_images(r) => whole,
+                        Some(was) if was == v => None,
+                        // The row changed in a few columns since the frame has it: those.
+                        Some(was) => rows.changed_since(r, *was).or(whole),
+                        None => whole,
+                    })
+                    .collect(),
+                _ => vec![whole; versions.len()],
             });
             p.versions = alone.then(|| versions.to_vec());
         }
@@ -1234,8 +1250,8 @@ impl Server {
             }
             let Some(pane) = self.panes.get_mut(&pid) else { continue };
             match (&p.rows, pane.screen_cache()) {
-                (Some(kept), Some(screen)) => {
-                    screen.draw(content, buf, |r| !kept[r], links);
+                (Some(spans), Some(screen)) => {
+                    screen.draw(content, buf, |r| spans.get(r).copied().flatten(), links);
                     // Only rows with image placeholders change with the images.
                     let rows: Vec<u16> = (0..content.height).filter(|r| screen.has_images(usize::from(*r))).collect();
                     for r in rows {
