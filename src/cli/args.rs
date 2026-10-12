@@ -1,4 +1,9 @@
 //! The command line: every command, its arguments and their help.
+#![allow(
+    rustdoc::broken_intra_doc_links,
+    rustdoc::invalid_html_tags,
+    reason = "the doc comments are clap's help text, printed as written: `[...]` is optional, `<...>` a value"
+)]
 
 use std::path::PathBuf;
 

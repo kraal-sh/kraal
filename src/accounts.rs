@@ -1008,7 +1008,8 @@ pub struct Usage {
     pub weekly: Option<Window>,
     /// Unix seconds when this was observed.
     pub observed_at: i64,
-    /// "statusline", "app-server", "rollout", "screen".
+    /// Where it was read: "statusline" (Claude Code's status line), "codex" (what Codex reports)
+    /// or "screen" (a limit message on the agent's screen).
     pub source: String,
 }
 
@@ -1136,8 +1137,8 @@ pub fn limit_from_screen(screen: &str) -> Option<(bool, f64)> {
     None
 }
 
-/// "16:40", "Mon 09:00" style reset time for display (local time via `date` is not needed:
-/// show the remaining time instead).
+/// How long until `resets_at`, for display: "resets in 1d2h", "resets in 3h05" or "resets in
+/// 12m"; empty when it is not known.
 pub fn describe_reset(resets_at: Option<i64>, now: i64) -> String {
     let Some(r) = resets_at else { return String::new() };
     let secs = (r - now).max(0);

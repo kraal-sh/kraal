@@ -132,8 +132,8 @@ const WATCH_EVERY: Duration = Duration::from_secs(1);
 /// A scrollable preview of one file or directory.
 ///
 /// Nothing here touches the file system on the server's thread: the server reads the file with
-/// [`Loaded::read`] on another thread when [`Preview::needs_load`] says so (after opening, after
-/// `r`, after a change), and a watcher thread keeps the file's date and size.
+/// [`Loaded::read`] on another thread when [`Preview::modified_since_load`] says so (after
+/// opening, after `r`, after a change), and a watcher thread keeps the file's date and size.
 pub struct Preview {
     path: PathBuf,
     kind: PreviewKind,
@@ -221,8 +221,8 @@ impl Watch {
 }
 
 impl Preview {
-    /// A preview of `path`, read later (see [`Preview::needs_load`]). Never fails: errors are
-    /// rendered instead.
+    /// A preview of `path`, read later (see [`Preview::modified_since_load`]). Never fails:
+    /// errors are rendered instead.
     pub fn open(path: &Path) -> Preview {
         Preview {
             path: path.to_path_buf(),

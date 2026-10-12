@@ -763,7 +763,6 @@ pub fn known(inv: &Inventory, defs: &[WorkspaceDef], ssh_hosts: &[String]) -> Ve
     out
 }
 
-/// Look a server up by name, then by `user@host[:port]`.
 /// ssh options (without the destination) to reach `s`: one shared connection per server when
 /// `share` (kraal's commands then reuse what is open), then the server's own options, its jump
 /// host resolved among `known`.
@@ -793,6 +792,8 @@ fn connection_key(s: &Server) -> String {
     format!("{:016x}", crate::text::fnv64(&text))
 }
 
+/// Look a server up by name, then by `user@host[:port]` (a port asked for is kept); an address
+/// kraal does not know becomes a server of its own. `None` when `spec` is neither.
 pub fn resolve(known: &[Known], spec: &str) -> Option<Server> {
     if let Some(k) = known.iter().find(|k| k.server.name == spec) {
         return Some(k.server.clone());
@@ -810,7 +811,8 @@ pub fn resolve(known: &[Known], spec: &str) -> Option<Server> {
     Some(Server { name: short_name(&probe.host), ..probe })
 }
 
-/// Whether `spec` names a server kraal knows (by name, ssh alias, or address).
+/// Whether kraal knows `s`: an entry has its address, or `s` is a bare host that names an entry
+/// (ssh config aliases included).
 pub fn is_known(known: &[Known], s: &Server) -> bool {
     known.iter().any(|k| k.server.same_target(s) || (s.user.is_none() && s.port.is_none() && k.server.name == s.host))
 }
