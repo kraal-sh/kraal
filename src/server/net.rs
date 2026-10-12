@@ -42,6 +42,8 @@ impl TunnelSpec {
 pub enum TunnelState {
     Up,
     Connecting,
+    /// Also a state this kraal does not know (from a newer server).
+    #[serde(other)]
     Down,
 }
 

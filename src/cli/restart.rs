@@ -42,7 +42,7 @@ pub(super) fn restart(s: &Session, yes: bool) -> Result<()> {
         return Ok(());
     }
     let saved = client::restart_server(session)?;
-    let now = client::ping(&socket).map(|(_, v)| v).unwrap_or_else(|_| protocol::KRAAL_VERSION.into());
+    let now = client::ping(&socket).map(|s| s.version).unwrap_or_else(|_| protocol::KRAAL_VERSION.into());
     match saved {
         client::Saved::No(why) => bail!("restarted session {session} on kraal {now}, but {why}"),
         _ => println!("restarted session {session}: {} → kraal {now}", running.runs()),
@@ -111,7 +111,7 @@ struct Running {
 
 impl Running {
     fn at(name: String, socket: PathBuf) -> Running {
-        let server = client::ping(&socket).ok();
+        let server = client::ping(&socket).ok().map(|s| (s.pid, s.version));
         Running { name, socket, server }
     }
 

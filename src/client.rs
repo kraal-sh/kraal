@@ -107,34 +107,95 @@ pub fn control_socket(session: Option<&str>) -> PathBuf {
     }
 }
 
-/// Send one request and wait for its answer.
+/// Send one request and wait for its answer. When the server runs a kraal that cannot do what
+/// is asked, the error says so, and how to update it.
 pub fn request(socket: &Path, req: Request) -> Result<Response> {
     if socket.starts_with(paths::runtime_dir()) {
         paths::private_runtime_dir().context("checking the runtime directory")?;
     }
-    let mut stream = UnixStream::connect(socket)
-        .with_context(|| format!("no kraal server at {} (is it running?)", socket.display()))?;
-    exchange(&mut stream, req)
+    let no_server = || format!("no kraal server at {} (is it running?)", socket.display());
+    let needs = req.needs();
+    // A server without this feature would not refuse the request: it would quietly do less.
+    if let Some(feature) = needs.filter(|f| f.check_first) {
+        let server = ping(socket).with_context(no_server)?;
+        if !server.has(feature) {
+            bail!(server.cannot(feature.does));
+        }
+    }
+    let mut stream = UnixStream::connect(socket).with_context(no_server)?;
+    let msg = ClientMsg::request(req);
+    match exchange(&mut stream, &msg)? {
+        Ok(answer) => Ok(answer),
+        Err(e) if protocol::refused_as_unknown(&e) => {
+            let name = match &msg {
+                ClientMsg::Request { request, .. } => request.name(),
+                _ => String::new(),
+            };
+            bail!(refusal(socket, needs, &name, e))
+        }
+        Err(e) => bail!(e),
+    }
 }
 
-fn exchange(stream: &mut UnixStream, req: Request) -> Result<Response> {
-    protocol::write_json(stream, &ClientMsg::Request { version: protocol::PROTOCOL_VERSION, request: req })?;
+/// What to say when the server behind `socket` could not read the request `name`: the
+/// server's own words, unless it is a kraal that lacks what the request needs.
+fn refusal(socket: &Path, needs: Option<protocol::Feature>, name: &str, said: String) -> String {
+    let Ok(server) = ping(socket) else { return said };
+    if needs.is_some_and(|f| server.has(f)) {
+        return said;
+    }
+    if protocol::newer(&server.version, protocol::KRAAL_VERSION) {
+        let (session, version) = (&server.session, &server.version);
+        return format!("{said} (session {session} runs kraal {version}, newer than this one: `kraal update`)");
+    }
+    match needs {
+        Some(feature) => server.cannot(feature.does),
+        None => server.cannot(&format!("answer `{name}`")),
+    }
+}
+
+/// Send `msg` and wait for the server's answer, which is `Err` when it refused.
+fn exchange(stream: &mut UnixStream, msg: &ClientMsg) -> Result<Result<Response, String>> {
+    protocol::write_json(stream, msg)?;
     loop {
         match protocol::read_frame(stream)? {
             None => bail!("the server closed the connection"),
-            Some((protocol::JSON, payload)) => {
-                let msg: ServerMsg = serde_json::from_slice(&payload)?;
-                match msg {
-                    ServerMsg::Response { result } => return result.map_err(|e| anyhow::anyhow!(e)),
-                    ServerMsg::Exit { reason, .. } => bail!("{reason}"),
-                    ServerMsg::Open { .. }
-                    | ServerMsg::Event { .. }
-                    | ServerMsg::Events { .. }
-                    | ServerMsg::Attached { .. } => continue,
-                }
-            }
+            Some((protocol::JSON, payload)) => match serde_json::from_slice(&payload)? {
+                ServerMsg::Response { result } => return Ok(result),
+                ServerMsg::Exit { reason, .. } => bail!("{reason}"),
+                ServerMsg::Open { .. }
+                | ServerMsg::Event { .. }
+                | ServerMsg::Events { .. }
+                | ServerMsg::Attached { .. }
+                | ServerMsg::Unknown(_) => continue,
+            },
             Some(_) => continue,
         }
+    }
+}
+
+/// What a server says it is, in answer to a ping.
+#[derive(Debug, Clone)]
+pub struct ServerInfo {
+    pub pid: u32,
+    pub session: String,
+    /// Its kraal release.
+    pub version: String,
+    /// Its [`protocol::Feature`]s; `None` from a server older than that list.
+    pub features: Option<Vec<String>>,
+}
+
+impl ServerInfo {
+    pub fn has(&self, feature: protocol::Feature) -> bool {
+        self.features.as_ref().is_some_and(|list| list.iter().any(|f| f == feature.name))
+    }
+
+    /// That this server's kraal cannot do `what`, and that a restart updates it.
+    pub fn cannot(&self, what: &str) -> String {
+        let (session, version) = (&self.session, &self.version);
+        format!(
+            "session {session} runs kraal {version}, which cannot {what}: `kraal -s {session} restart` updates it (its layout and scrollback are kept)"
+        )
     }
 }
 
@@ -163,14 +224,13 @@ pub fn restart_server(session: &str) -> Result<Saved> {
     Ok(saved)
 }
 
-/// The pid and kraal release of the server behind `socket`, given up on quickly when it does
-/// not answer.
-pub fn ping(socket: &Path) -> Result<(u32, String)> {
+/// What the server behind `socket` is, given up on quickly when it does not answer.
+pub fn ping(socket: &Path) -> Result<ServerInfo> {
     let mut stream = UnixStream::connect(socket)?;
     stream.set_read_timeout(Some(Duration::from_secs(2)))?;
     stream.set_write_timeout(Some(Duration::from_secs(2)))?;
-    match exchange(&mut stream, Request::Ping)? {
-        Response::Pong { pid, version, .. } => Ok((pid, version)),
+    match exchange(&mut stream, &ClientMsg::request(Request::Ping))?.map_err(anyhow::Error::msg)? {
+        Response::Pong { pid, session, version, features } => Ok(ServerInfo { pid, session, version, features }),
         _ => bail!("unexpected answer from the server"),
     }
 }
@@ -228,10 +288,10 @@ fn stop_server(socket: &Path, restart: bool) -> Result<Saved> {
     if uid != unsafe { libc::getuid() } {
         bail!("{} belongs to another user", socket.display());
     }
-    let saved = match exchange(&mut stream, Request::KillServer { restart }) {
-        Ok(Response::Text(why)) => Saved::No(why),
-        Ok(_) => Saved::Yes,
-        Err(_) => {
+    let saved = match exchange(&mut stream, &ClientMsg::request(Request::KillServer { restart })) {
+        Ok(Ok(Response::Text(why))) => Saved::No(why),
+        Ok(Ok(_)) => Saved::Yes,
+        Ok(Err(_)) | Err(_) => {
             // SAFETY: plain signal to the process listening on our own private socket.
             if unsafe { libc::kill(pid, libc::SIGTERM) } != 0 {
                 let err = std::io::Error::last_os_error();
@@ -267,7 +327,7 @@ pub fn subscribe(
     let mut stream = UnixStream::connect(socket)
         .with_context(|| format!("no kraal server at {} (is it running?)", socket.display()))?;
     let request = Request::Subscribe { events: filters, since: since.map(|s| s.0), boot: since.and_then(|s| s.1) };
-    protocol::write_json(&mut stream, &ClientMsg::Request { version: protocol::PROTOCOL_VERSION, request })?;
+    protocol::write_json(&mut stream, &ClientMsg::request(request))?;
     loop {
         let Some((kind, payload)) = protocol::read_frame(&mut stream)? else { return Ok(()) };
         if kind != protocol::JSON {
@@ -303,7 +363,7 @@ pub fn request_quick(socket: &Path, req: Request) -> Result<()> {
     let mut stream = UnixStream::connect(socket)?;
     stream.set_write_timeout(Some(Duration::from_millis(500)))?;
     stream.set_read_timeout(Some(Duration::from_millis(1000)))?;
-    protocol::write_json(&mut stream, &ClientMsg::Request { version: protocol::PROTOCOL_VERSION, request: req })?;
+    protocol::write_json(&mut stream, &ClientMsg::request(req))?;
     let _ = protocol::read_frame(&mut stream);
     Ok(())
 }
@@ -510,6 +570,7 @@ fn greet(target: &Target, workspace: &Option<String>) -> Result<Greeted, String>
         },
         // A local client is the kraal installed on the server's machine; a remote one may not be.
         installed: matches!(target, Target::Local { .. }).then(|| protocol::KRAAL_VERSION.to_string()),
+        features: protocol::client_features(),
     };
     if protocol::write_json(&mut conn.writer, &hello).is_err() {
         return Err(conn.why_lost("could not talk to the server"));
@@ -800,7 +861,7 @@ pub fn attach(mut target: Target, mut workspace: Option<String>, mouse: bool, at
                                 restarting = Some(c.server);
                                 break "the session restarts".to_string();
                             }
-                            Ok(ServerMsg::Attached { version }) => server_version = Some(version),
+                            Ok(ServerMsg::Attached { version, .. }) => server_version = Some(version),
                             Ok(ServerMsg::Open { url }) => {
                                 let _ = crate::pane::open_url(&url);
                             }
@@ -857,7 +918,7 @@ pub fn attach(mut target: Target, mut workspace: Option<String>, mouse: bool, at
         let socket = paths::socket_path(session);
         let running = server_version
             .filter(|_| UnixStream::connect(&socket).is_ok())
-            .or_else(|| ping(&socket).ok().map(|(_, v)| v));
+            .or_else(|| ping(&socket).ok().map(|s| s.version));
         if let Some(older) = running.filter(|v| protocol::newer(protocol::KRAAL_VERSION, v)) {
             eprintln!(
                 "kraal {} is installed; session {session} runs {older}: `kraal -s {session} restart` restarts it",
@@ -1025,6 +1086,56 @@ mod tests {
         drop(typing);
         reader.join().unwrap();
         drop(keyboard_end);
+    }
+
+    /// A server of a release before feature lists: what it lacks is said with the way out, and
+    /// what it would quietly do less of is not even sent.
+    #[test]
+    fn what_an_older_server_cannot_do_is_said_with_the_way_out() {
+        let dir = std::env::temp_dir().join(format!("kraal-older-server-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let socket = dir.join("old.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let asked = Arc::new(Mutex::new(Vec::<String>::new()));
+        {
+            let asked = asked.clone();
+            std::thread::spawn(move || {
+                for mut stream in listener.incoming().map_while(Result::ok) {
+                    let Ok(Some((_, payload))) = protocol::read_frame(&mut stream) else { continue };
+                    let msg: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+                    let cmd = msg["request"]["cmd"].as_str().unwrap_or_default().to_string();
+                    let answer = match cmd.as_str() {
+                        "ping" => {
+                            serde_json::json!({"Ok": {"kind": "pong", "data": {"pid": 1, "session": "old", "version": "0.1.9"}}})
+                        }
+                        "read_pane" => serde_json::json!({"Err": "no such pane: 9"}),
+                        _ => {
+                            serde_json::json!({"Err": format!("bad message: unknown variant `{cmd}`, expected `ping`")})
+                        }
+                    };
+                    asked.lock().unwrap().push(cmd);
+                    let _ =
+                        protocol::write_json(&mut stream, &serde_json::json!({"type": "response", "result": answer}));
+                }
+            });
+        }
+        let err = request(&socket, Request::BufferList).unwrap_err().to_string();
+        assert_eq!(
+            err,
+            "session old runs kraal 0.1.9, which cannot keep paste buffers: `kraal -s old restart` updates it (its layout and scrollback are kept)"
+        );
+        let edit =
+            |sudo| Request::EditRemote { target: "web:/a".into(), line: None, near: None, production: false, sudo };
+        let err = request(&socket, edit(true)).unwrap_err().to_string();
+        assert!(err.contains("runs kraal 0.1.9, which cannot edit a server's files as root"), "{err}");
+        assert!(!asked.lock().unwrap().iter().any(|c| c == "edit_remote"), "asked about before it is sent");
+        let err = request(&socket, edit(false)).unwrap_err().to_string();
+        assert!(err.contains("which cannot answer `edit_remote`"), "{err}");
+        // A refusal for another reason is said as the server said it.
+        let err = request(&socket, Request::ReadPane { pane: "9".into(), lines: None }).unwrap_err().to_string();
+        assert_eq!(err, "no such pane: 9");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

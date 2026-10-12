@@ -101,13 +101,13 @@ impl Server {
             }
         };
         match msg {
-            ClientMsg::Attach { version, cols, rows, workspace, remote, pane, installed } => {
+            ClientMsg::Attach { version, cols, rows, workspace, remote, pane, installed, .. } => {
                 if let Some(c) = self.clients.get_mut(&id) {
                     c.remote = remote;
                 }
                 let (cols, rows) = clamp_size(cols, rows);
                 if version != protocol::PROTOCOL_VERSION {
-                    self.send_msg(id, &ServerMsg::exit(version_mismatch(version)));
+                    self.send_msg(id, &ServerMsg::exit(self.version_mismatch(version)));
                     return;
                 }
                 self.attach(id, cols, rows, workspace);
@@ -134,9 +134,9 @@ impl Server {
                 self.relayout();
             }
             ClientMsg::Detach => self.detach(id, "detached"),
-            ClientMsg::Request { version, request } => {
+            ClientMsg::Request { version, request, .. } => {
                 let result = if version != protocol::PROTOCOL_VERSION {
-                    Some(Err(version_mismatch(version)))
+                    Some(Err(self.version_mismatch(version)))
                 } else {
                     self.request(id, request)
                 };
@@ -145,6 +145,27 @@ impl Server {
                     self.clients.remove(&id);
                 }
             }
+            // From a newer client: an attached one goes on without it, a connection that came
+            // to ask something is told so.
+            ClientMsg::Unknown(msg) => {
+                if !self.clients.get(&id).is_some_and(|c| c.attached) {
+                    self.send_msg(id, &ServerMsg::Response { result: Err(protocol::unsupported(&msg)) });
+                    self.clients.remove(&id);
+                }
+            }
+        }
+    }
+
+    /// What a client of another protocol generation is told. `kraal restart` and `kraal kill`
+    /// stop a server of any version.
+    fn version_mismatch(&self, version: u32) -> String {
+        let (session, release) = (&self.session, protocol::KRAAL_VERSION);
+        if version > protocol::PROTOCOL_VERSION {
+            format!(
+                "session {session} runs kraal {release}, too old for this kraal: `kraal -s {session} restart` restarts it on this one (its layout is kept)"
+            )
+        } else {
+            format!("session {session} runs kraal {release}, too new for this kraal: update this one (`kraal update`)")
         }
     }
 
@@ -167,7 +188,8 @@ impl Server {
         let ws = target.unwrap_or_else(|| self.workspaces[0].id);
         let welcome = !crate::paths::state_dir().join("welcomed").exists();
         // Before anything is drawn: what this server is.
-        self.send_msg(id, &ServerMsg::Attached { version: protocol::KRAAL_VERSION.into() });
+        let features = Some(protocol::feature_names());
+        self.send_msg(id, &ServerMsg::Attached { version: protocol::KRAAL_VERSION.into(), features });
         if let Some(c) = self.clients.get_mut(&id) {
             c.attached = true;
             c.cols = cols;
@@ -231,14 +253,6 @@ impl Server {
             let _ = c.out.send_timeout(buf, Duration::from_millis(200));
         }
     }
-}
-
-/// What a client from another kraal version is told. `kraal kill` stops any version's server.
-fn version_mismatch(version: u32) -> String {
-    format!(
-        "protocol mismatch: server v{}, client v{version}; run `kraal kill`, then `kraal` again (the layout is kept)",
-        protocol::PROTOCOL_VERSION
-    )
 }
 
 /// A client's terminal size, within what kraal draws (a bogus size must not allocate gigabytes).
