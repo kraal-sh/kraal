@@ -66,13 +66,11 @@ pub struct Tunnel {
 }
 
 impl Tunnel {
-    /// Stop its ssh and what that started, and the reader of its stderr; how ssh ended, if it
-    /// ran.
+    /// Stop its ssh with what that started, and the reader of its stderr, never waiting for
+    /// ssh; how it ended, if it had.
     fn stop(&mut self) -> Option<std::process::ExitStatus> {
         self.stop_reading.store(true, Ordering::SeqCst);
-        let mut c = self.child.take()?;
-        crate::exec::kill_group(&mut c);
-        c.try_wait().ok().flatten()
+        crate::exec::kill_group_nowait(self.child.take()?)
     }
 }
 
