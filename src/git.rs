@@ -75,10 +75,18 @@ impl Worktree {
     }
 }
 
+/// git in `dir`, never asking anything, nor taking a lock it can do without (one the user's own
+/// git would then wait for).
+fn git_cmd(dir: &Path) -> Command {
+    let mut cmd = Command::new("git");
+    cmd.arg("-C").arg(dir).env("GIT_OPTIONAL_LOCKS", "0").env("GIT_TERMINAL_PROMPT", "0");
+    cmd
+}
+
 /// Run git with a deadline; stdout on success.
 fn git(dir: &Path, args: &[&str], timeout: Duration) -> Result<String> {
-    let mut cmd = Command::new("git");
-    cmd.arg("-C").arg(dir).args(args).env("GIT_OPTIONAL_LOCKS", "0").env("GIT_TERMINAL_PROMPT", "0");
+    let mut cmd = git_cmd(dir);
+    cmd.args(args);
     let out = crate::exec::run(&mut cmd, timeout, 8 << 20).context("running git")?;
     if out.timed_out {
         bail!("git {} took too long", args.join(" "));
@@ -258,13 +266,8 @@ pub fn known_project_path(cwd: &Path) -> Option<PathBuf> {
 /// the repository's own files could not be read): such an answer is never remembered, and no
 /// account is picked on it.
 fn find_project_path(cwd: &Path) -> Option<PathBuf> {
-    let mut cmd = Command::new("git");
-    cmd.arg("-C")
-        .arg(cwd)
-        .args(["rev-parse", "--path-format=absolute", "--git-common-dir", "--show-toplevel"])
-        .env("GIT_OPTIONAL_LOCKS", "0")
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .env("LC_ALL", "C");
+    let mut cmd = git_cmd(cwd);
+    cmd.args(["rev-parse", "--path-format=absolute", "--git-common-dir", "--show-toplevel"]).env("LC_ALL", "C");
     let out = match crate::exec::run(&mut cmd, Duration::from_secs(5), 64 << 10) {
         Ok(out) => out,
         // No git here: the repository's own files tell.
@@ -626,7 +629,8 @@ pub fn worktree_state(w: &Worktree) -> Result<WorktreeState> {
         let mut args = vec!["rev-list", "--count"];
         args.extend(tips.iter().map(String::as_str));
         args.extend(["--not", base_oid.as_str()]);
-        git(&w.repo, &args, Duration::from_secs(10))?.trim().parse().unwrap_or(0)
+        let count = git(&w.repo, &args, Duration::from_secs(10))?;
+        count.trim().parse().with_context(|| format!("git rev-list --count said {:?}, not a count", count.trim()))?
     };
     // Commits its history lacks may still have all their changes in the base: a squash merge.
     let applied = unmerged > 0 && tips.iter().all(|t| changes_in(&w.repo, t, &base_oid));
@@ -797,8 +801,8 @@ fn delete_branch(w: &Worktree, tip: &str, base: Option<&(String, String)>) -> Re
 /// [`git`] with `input` as its standard input.
 fn git_with_input(dir: &Path, args: &[&str], input: &str, timeout: Duration) -> Result<String> {
     use std::io::Write;
-    let mut cmd = Command::new("git");
-    cmd.arg("-C").arg(dir).args(args).env("GIT_TERMINAL_PROMPT", "0");
+    let mut cmd = git_cmd(dir);
+    cmd.args(args);
     let (reader, mut writer) = std::io::pipe().context("making a pipe")?;
     // Small enough for the pipe: written before git starts.
     writer.write_all(input.as_bytes()).context("writing to git")?;

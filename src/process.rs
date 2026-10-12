@@ -137,11 +137,7 @@ pub fn boot_id() -> String {
 /// Whether something still runs in process group `pgid`. A member that ended but was not reaped
 /// yet does not count: a pane keeps its ended leader unreaped (see `pane::pty::Process`).
 pub fn group_running(pgid: libc::pid_t) -> bool {
-    // SAFETY: signal 0 only checks that the group has members, zombies included.
-    if pgid <= 1 || unsafe { libc::kill(-pgid, 0) } != 0 {
-        return false;
-    }
-    imp::group_running(pgid)
+    pgid > 1 && exists(-pgid) && imp::group_running(pgid)
 }
 
 /// The processes of session `sid` (a pane's program leads one, with everything started from
@@ -178,11 +174,11 @@ pub fn background_jobs(leader: u32) -> Vec<Vec<String>> {
     shown.into_values().filter_map(|pid| argv(pid as u32)).collect()
 }
 
-/// Whether a process with this id exists, zombies included.
-#[cfg_attr(target_os = "linux", expect(dead_code, reason = "macOS only: Linux reads /proc"))]
-fn exists(pid: libc::pid_t) -> bool {
-    // SAFETY: signal 0 only checks that the process exists and may be signalled.
-    unsafe { libc::kill(pid, 0) == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM) }
+/// Whether the process `pid` exists, or the group `-pgid` has members, zombies included. One of
+/// another user's (a program run through sudo) exists too: it only may not be signalled.
+pub fn exists(target: libc::pid_t) -> bool {
+    // SAFETY: signal 0 only checks that the process or group exists and may be signalled.
+    unsafe { libc::kill(target, 0) == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM) }
 }
 
 /// Split NUL-separated strings, skipping empty ones (Linux `/proc` files).

@@ -371,11 +371,9 @@ pub fn script(steps: &[String], stop_on_failure: bool) -> String {
     let steps: Vec<&String> = steps.iter().filter(|s| !s.trim().is_empty()).collect();
     let n = steps.len();
     let header = |i: usize, step: &str| {
-        let first: String = step.lines().next().unwrap_or("").trim().chars().take(100).collect();
-        let more = if step.trim().lines().count() > 1 { " …" } else { "" };
         format!(
             "__kraal_step={i}\nprintf '\\n\\033[1;36m▶ %s/%s\\033[0m %s\\n' {i} {n} {}\n",
-            shell::quote(&format!("{first}{more}"))
+            shell::quote(&crate::text::first_line(step, 100))
         )
     };
     const FAILED: &str = "printf '\\n\\033[1;31m✗ step %s failed (exit %s)\\033[0m\\n'";
@@ -498,14 +496,6 @@ pub fn create_log(name: &str, id: u32, header: &str) -> Result<PathBuf> {
     bail!("could not find a free name for the log of {name} in {}", dir.display())
 }
 
-/// Open `path` for appending, creating it private (0600) if needed.
-pub fn open_private_append(path: &Path) -> std::io::Result<std::fs::File> {
-    let mut opts = std::fs::OpenOptions::new();
-    opts.append(true).create(true);
-    std::os::unix::fs::OpenOptionsExt::mode(&mut opts, 0o600);
-    opts.open(path)
-}
-
 /// Most of one target's output a run log keeps.
 const MAX_OUTPUT: u64 = 16 << 20;
 /// A line longer than this is written in pieces.
@@ -542,7 +532,7 @@ pub struct OutputLog {
 
 impl OutputLog {
     pub fn create(path: PathBuf) -> std::io::Result<OutputLog> {
-        let file = open_private_append(&path)?;
+        let file = paths::open_private_append(&path)?;
         Ok(OutputLog { file, path, error: None, line: Vec::new(), cr: false, seq: Seq::Text, written: 0, cut: false })
     }
 
@@ -632,7 +622,7 @@ impl OutputLog {
 /// Append `header` to the run log, then a finished target's output, deleting its file.
 fn fold_output(log: &Path, header: &str, output: Option<&Path>) -> std::io::Result<()> {
     use std::io::Write;
-    let mut f = open_private_append(log)?;
+    let mut f = paths::open_private_append(log)?;
     f.write_all(header.as_bytes())?;
     if let Some(output) = output {
         let mut out = std::fs::File::open(output)?;
@@ -662,14 +652,14 @@ pub enum LogJob {
 
 /// The thread that writes run logs and the ledger, in order, off the server's event loop;
 /// failures are passed to `warn`.
-pub fn spawn_log_writer(warn: impl Fn(String) + Send + 'static) -> crossbeam_channel::Sender<LogJob> {
+pub fn spawn_log_writer(warn: impl Fn(String) + Send + 'static) -> std::io::Result<crossbeam_channel::Sender<LogJob>> {
     let (tx, rx) = crossbeam_channel::unbounded::<LogJob>();
-    let _ = std::thread::Builder::new().name("run-logs".into()).spawn(move || {
+    std::thread::Builder::new().name("run-logs".into()).spawn(move || {
         for job in rx {
             let failed = match job {
                 LogJob::Append(log, text) => {
                     use std::io::Write;
-                    let written = open_private_append(&log).and_then(|mut f| f.write_all(text.as_bytes()));
+                    let written = paths::open_private_append(&log).and_then(|mut f| f.write_all(text.as_bytes()));
                     written.err().map(|e| (log, e.to_string()))
                 }
                 LogJob::Fold { log, header, output } => fold_output(&log, &header, Some(&output))
@@ -695,8 +685,8 @@ pub fn spawn_log_writer(warn: impl Fn(String) + Send + 'static) -> crossbeam_cha
                 warn(format!("run log {}: {e}", paths::shorten_home(&path)));
             }
         }
-    });
-    tx
+    })?;
+    Ok(tx)
 }
 
 /// A run in progress, as the ledger keeps it on disk: after a crash or a kill, the next start

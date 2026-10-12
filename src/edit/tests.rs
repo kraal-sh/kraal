@@ -551,3 +551,21 @@ fn the_password_goes_from_its_pane_to_kraal() {
     assert_eq!(ask(b"pass word\n"), Some(b"pass word".to_vec()));
     assert_eq!(ask(b""), None, "the input ended: not given");
 }
+
+/// The editor is the user's: `$VISUAL`, else `$EDITOR`, else vi, each with its own options.
+#[test]
+fn the_editor_is_visual_then_editor_then_vi() {
+    let t = Here::new("editor");
+    crate::testing::write_script(&t.dir.join("bin/vi"), "#!/bin/sh\nprintf 'vi<%s>' \"$@\"\n");
+    let argv = editor_argv(Path::new("/a dir/f"), Some(12));
+    let path = format!("{}:/usr/bin:/bin", t.dir.join("bin").display());
+    let run = |visual: Option<&str>, editor: Option<&str>| {
+        let mut c = std::process::Command::new(&argv[0]);
+        c.args(&argv[1..]).env("PATH", &path).env_remove("VISUAL").env_remove("EDITOR");
+        c.envs(visual.map(|v| ("VISUAL", v))).envs(editor.map(|e| ("EDITOR", e)));
+        String::from_utf8(c.output().unwrap().stdout).unwrap()
+    };
+    assert_eq!(run(Some("printf V<%s>"), Some("printf E<%s>")), "V<+12>V</a dir/f>");
+    assert_eq!(run(Some(""), Some("printf E<%s>")), "E<+12>E</a dir/f>", "an empty VISUAL is none");
+    assert_eq!(run(None, None), "vi<+12>vi</a dir/f>");
+}

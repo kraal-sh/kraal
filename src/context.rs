@@ -366,7 +366,7 @@ pub fn short_context(ctx: &str) -> String {
     } else {
         ctx
     };
-    if short.chars().count() > 28 { format!("{}…", short.chars().take(27).collect::<String>()) } else { short.into() }
+    crate::text::truncate(short, 28)
 }
 
 /// A `KUBECONFIG` value with relative entries made absolute against `base` (the directory of
@@ -863,6 +863,8 @@ users:
         assert_eq!(c.label(true), "k8s:prod-eks/payments");
         assert_eq!(short_context("arn:aws:eks:eu-west-1:123456789012:cluster/prod-eks"), "prod-eks");
         assert_eq!(short_context("gke_acme-123_europe-west1_staging"), "staging");
+        let wide = short_context(&format!("arn:aws:eks:ap-east-1:123:cluster/{}", "集群".repeat(20)));
+        assert!(crate::text::columns(&wide) <= 28 && wide.ends_with('…'), "{wide}");
         assert!(parse_kubeconfig("current-context: \"\"\n").current.is_none());
         // What minikube writes: extensions with names of their own inside a context.
         let minikube = "contexts:\n- context:\n    cluster: minikube\n    extensions:\n    - extension:\n        provider: minikube.sigs.k8s.io\n      name: context_info\n    namespace: default\n    user: minikube\n  name: minikube\ncurrent-context: minikube\n";

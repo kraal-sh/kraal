@@ -5200,7 +5200,8 @@ fn a_server_file_is_edited_in_the_local_editor() {
         ),
     );
     let path = format!("{}:{}", sshd.bin.display(), std::env::var("PATH").unwrap_or_default());
-    let kraal = |args: &[&str]| env.cmd(args).env("PATH", &path).env("EDITOR", &editor).output().unwrap();
+    let kraal =
+        |args: &[&str]| env.cmd(args).env("PATH", &path).env("EDITOR", &editor).env_remove("VISUAL").output().unwrap();
     let wait_until = |what: &str, ok: &dyn Fn() -> bool| {
         let start = Instant::now();
         while !ok() {
@@ -5762,7 +5763,7 @@ impl EditBench {
 
     fn kraal(&self, args: &[&str]) -> Command {
         let mut c = self.env.cmd(args);
-        c.env("PATH", &self.path).env("EDITOR", &self.editor);
+        c.env("PATH", &self.path).env("EDITOR", &self.editor).env_remove("VISUAL");
         c
     }
 

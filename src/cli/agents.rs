@@ -137,12 +137,8 @@ pub(super) fn accounts(action: AccountsCmd) -> Result<()> {
             if !accounts::Accounts::path().exists() {
                 all.save()?;
             }
-            let editor = std::env::var("VISUAL").or_else(|_| std::env::var("EDITOR")).unwrap_or_else(|_| "vi".into());
-            let mut parts = editor.split_whitespace();
-            std::process::Command::new(parts.next().unwrap_or("vi"))
-                .args(parts)
-                .arg(accounts::Accounts::path())
-                .status()?;
+            let editor = crate::edit::editor_argv(&accounts::Accounts::path(), None);
+            std::process::Command::new(&editor[0]).args(&editor[1..]).status()?;
             accounts::Accounts::load().map(|_| ())
         }
     }

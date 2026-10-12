@@ -140,10 +140,8 @@ pub(super) fn run(action: RunbookCmd, socket: &std::path::Path, own_pane: Option
         }
         RunbookCmd::Edit { name } => {
             let r = find_runbook(&name)?;
-            let status = std::process::Command::new("sh")
-                .arg("-c")
-                .arg(format!("${{EDITOR:-vi}} {}", crate::shell::quote(&r.path.display().to_string())))
-                .status()?;
+            let editor = crate::edit::editor_argv(&r.path, None);
+            let status = std::process::Command::new(&editor[0]).args(&editor[1..]).status()?;
             anyhow::ensure!(status.success(), "the editor failed");
             Ok(())
         }

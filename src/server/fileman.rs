@@ -251,7 +251,7 @@ impl Server {
             }
             FilesAction::Edit(Location::Local(path)) => {
                 let Some(ws) = self.clients.get(&client).map(|c| c.workspace) else { return Mode::Normal };
-                let command = super::edits::editor_command(&path, None);
+                let command = crate::edit::editor_argv(&path, None);
                 let name = path.file_name().map(|n| n.to_string_lossy().into_owned());
                 let spec = PaneSpec { command, close_on_exit: true, keep_on_failure: true, ..Default::default() };
                 if let Err(e) = self.spawn_pane_in(ws, Some(pane), spec, Placement::Floating, name) {

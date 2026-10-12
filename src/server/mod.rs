@@ -82,8 +82,8 @@ pub enum Event {
     Warning(String),
     /// Publish an event once what it describes is on disk (a run's log).
     Emit(&'static str, serde_json::Value),
-    /// A job started with [`Server::background`] finished with this result.
-    Job(u32, Box<dyn std::any::Any + Send>),
+    /// A job started with [`Server::background`] finished with this result, or panicked.
+    Job(u32, std::thread::Result<Box<dyn std::any::Any + Send>>),
     /// The agents a server's session has now, from the connection with this id.
     RemoteAgents(u32, Vec<remote::RemoteAgent>),
     /// Watched directories changed (see [`crate::watch`]).
@@ -595,6 +595,12 @@ fn due(now: Instant, last: Instant, every: Duration) -> bool {
     now.saturating_duration_since(last) + Duration::from_millis(50) >= every
 }
 
+/// What a panic said, when it said it in text.
+fn panic_text(payload: &(dyn std::any::Any + Send)) -> &str {
+    let text = payload.downcast_ref::<&str>().copied();
+    text.or_else(|| payload.downcast_ref::<String>().map(String::as_str)).unwrap_or("it panicked")
+}
+
 /// Run a session server in the foreground until it is told to exit.
 pub fn run(session: &str) -> Result<()> {
     let ready = take_ready_pipe();
@@ -764,7 +770,7 @@ pub fn run(session: &str) -> Result<()> {
         ports: Default::default(),
         git: HashMap::new(),
         dirwatch: dirwatch::DirWatch::new(watcher),
-        git_requests: worktrees::spawn_git_worker(git_tx),
+        git_requests: worktrees::spawn_git_worker(git_tx)?,
         launches: crate::pane::launcher(),
         kube: HashMap::new(),
         kube_cache: Default::default(),
@@ -786,7 +792,7 @@ pub fn run(session: &str) -> Result<()> {
         edits: Vec::new(),
         preview_loads: Default::default(),
         pending_opens: Vec::new(),
-        persister: spawn_persister(persist_tx, persisting.clone()),
+        persister: spawn_persister(persist_tx, persisting.clone())?,
         persisting,
         persisted: None,
         scrollback: HashMap::new(),
@@ -796,7 +802,7 @@ pub fn run(session: &str) -> Result<()> {
             let warn = logs_tx;
             crate::runbooks::spawn_log_writer(move |w| {
                 let _ = warn.send(Event::Warning(w));
-            })
+            })?
         },
     };
     server.scan_definitions();
@@ -838,7 +844,7 @@ fn take_ready_pipe() -> Option<std::fs::File> {
 impl Server {
     /// Run `work` on a helper thread (slow git, commands), then `then` with its result on the
     /// server thread, so nothing slow ever blocks the event loop. `false` when no thread could
-    /// be started: `then` never runs.
+    /// be started: `then` never runs, nor does it when `work` panics (a warning says so).
     pub fn background<T: Send + 'static>(
         &mut self,
         work: impl FnOnce() -> T + Send + 'static,
@@ -855,7 +861,8 @@ impl Server {
         );
         let tx = self.tx.clone();
         let spawned = std::thread::Builder::new().name("job".into()).spawn(move || {
-            let _ = tx.send(Event::Job(id, Box::new(work())));
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(work));
+            let _ = tx.send(Event::Job(id, result.map(|value| Box::new(value) as Box<dyn std::any::Any + Send>)));
         });
         if let Err(e) = spawned {
             self.jobs.remove(&id);
@@ -1394,8 +1401,14 @@ impl Server {
             Event::Warning(w) => self.warnings.push(w),
             Event::Emit(ty, fields) => self.emit(ty, fields),
             Event::Job(id, result) => {
-                if let Some(done) = self.jobs.remove(&id) {
-                    done(self, result);
+                let done = self.jobs.remove(&id);
+                match result {
+                    Ok(value) => {
+                        if let Some(done) = done {
+                            done(self, value);
+                        }
+                    }
+                    Err(panic) => self.warnings.push(format!("a background job failed: {}", panic_text(&*panic))),
                 }
             }
             Event::RemoteAgents(conn, list) => self.remote_list(conn, list),

@@ -135,6 +135,39 @@ fn forward_spec(spec: &TunnelSpec) -> String {
     format!("127.0.0.1:{}:{host}:{}", spec.local, spec.remote_port)
 }
 
+/// ssh's arguments for the tunnel `spec` through `s`: never a question, a connection of its
+/// own, a server that does not answer given up after 15 s, and a dead link seen within a
+/// minute. `-v`: ssh then says when it listens on the local port, which is how the tunnel
+/// shows it is up.
+fn tunnel_args(s: &crate::servers::Server, known: &[crate::servers::Known], spec: &TunnelSpec) -> Vec<String> {
+    let mut args: Vec<String> = [
+        "-N",
+        "-v",
+        "-o",
+        "ExitOnForwardFailure=yes",
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "ConnectTimeout=15",
+        "-o",
+        "ServerAliveInterval=15",
+        "-o",
+        "ServerAliveCountMax=3",
+        "-o",
+        "ControlMaster=no",
+        "-o",
+        "ControlPath=none",
+    ]
+    .iter()
+    .map(|a| a.to_string())
+    .collect();
+    args.extend(crate::servers::ssh_args(s, known, false));
+    args.push("-L".into());
+    args.push(forward_spec(spec));
+    args.push(s.destination());
+    args
+}
+
 /// A port nobody listens on, preferring `wanted`, and none of `taken` (ports other tunnels have
 /// that may not listen yet: their ssh is still connecting).
 pub fn free_port(wanted: u16, taken: &[u16]) -> Option<u16> {
@@ -349,32 +382,7 @@ impl Server {
             t.error = Some(format!("unknown server {}", t.spec.server));
             return;
         };
-        let known = &self.known_servers;
-        // `-v`: ssh then says when it listens on the local port, which is how the tunnel shows
-        // it is up.
-        let mut args: Vec<String> = [
-            "-N",
-            "-v",
-            "-o",
-            "ExitOnForwardFailure=yes",
-            "-o",
-            "BatchMode=yes",
-            "-o",
-            "ServerAliveInterval=15",
-            "-o",
-            "ServerAliveCountMax=3",
-            "-o",
-            "ControlMaster=no",
-            "-o",
-            "ControlPath=none",
-        ]
-        .iter()
-        .map(|a| a.to_string())
-        .collect();
-        args.extend(crate::servers::ssh_args(&s, known, false));
-        args.push("-L".into());
-        args.push(forward_spec(&t.spec));
-        args.push(s.destination());
+        let args = tunnel_args(&s, &self.known_servers, &t.spec);
         // The port listening is how the tunnel shows it is up: it must not be another program's.
         if let Err(why) = port_free(t.spec.local) {
             t.state = TunnelState::Down;
@@ -661,6 +669,23 @@ mod tests {
         let busy = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let port = busy.local_addr().unwrap().port();
         assert!(port_free(port).unwrap_err().contains("another program"));
+    }
+
+    #[test]
+    fn a_tunnel_gives_up_on_a_server_that_does_not_answer() {
+        let s = crate::servers::Server { name: "db".into(), host: "db.lan".into(), ..Default::default() };
+        let t = TunnelSpec {
+            server: "db".into(),
+            via: None,
+            local: 15432,
+            remote_host: "localhost".into(),
+            remote_port: 5432,
+        };
+        let args = tunnel_args(&s, &[], &t);
+        let at = |a: &str| args.iter().position(|x| x == a);
+        assert!(at("ConnectTimeout=15").is_some_and(|i| args[i - 1] == "-o"), "{args:?}");
+        assert!(at("BatchMode=yes").is_some(), "{args:?}");
+        assert_eq!(args[args.len() - 3..], ["-L", "127.0.0.1:15432:localhost:5432", "db.lan"]);
     }
 
     #[test]

@@ -560,11 +560,20 @@ impl Loaded {
     pub fn read(path: &Path, images: bool) -> Loaded {
         // Stamp first, so a write racing with the read is seen as a change.
         let stamp = Stamp::of(path);
-        let (kind, mut content) = load(path);
-        if images && let Content::Image(image) = &mut content {
-            let (width, height) = image.pixels.dimensions();
-            image.png = crate::graphics::encode_png(width, height, image.pixels.as_raw()).ok();
-        }
+        // A decoder that panics on a malformed file gives an error to show: the preview is
+        // never left waiting for a read that ended.
+        let read = std::panic::catch_unwind(|| {
+            let (kind, mut content) = load(path);
+            if images && let Content::Image(image) = &mut content {
+                let (width, height) = image.pixels.dimensions();
+                image.png = crate::graphics::encode_png(width, height, image.pixels.as_raw()).ok();
+            }
+            (kind, content)
+        });
+        let (kind, content) = read.unwrap_or_else(|_| {
+            let kind = load::kind_from_extension(path).unwrap_or(PreviewKind::Text);
+            (kind, Content::Error(format!("cannot preview {}: reading it failed", path.display())))
+        });
         Loaded { stamp, kind, content }
     }
 }

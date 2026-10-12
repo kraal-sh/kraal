@@ -165,15 +165,16 @@ fn run(cmd: &mut Command, what: &str) -> Result<String> {
     Ok(out.stdout_text())
 }
 
-/// Copy `new` next to `exe`, then rename it over `exe`: a kraal running from the old file keeps
-/// it, and nothing is left half written.
+/// Copy `new` next to `exe`, synced to the disk, then rename it over `exe`: a kraal running from
+/// the old file keeps it, and nothing is left half written, even by a crash of the machine.
 fn replace(new: &Path, exe: &Path) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
     let dir = exe.parent().context("this kraal has no folder")?;
     let staged = dir.join(format!(".kraal.new.{}", std::process::id()));
     let copy = std::fs::copy(new, &staged)
         .and_then(|_| std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o755)))
-        .and_then(|_| std::fs::rename(&staged, exe));
+        .and_then(|()| std::fs::File::open(&staged)?.sync_all())
+        .and_then(|()| std::fs::rename(&staged, exe));
     if let Err(e) = copy {
         let _ = std::fs::remove_file(&staged);
         bail!("cannot replace {}: {e} (install.sh can put kraal in another folder)", exe.display());

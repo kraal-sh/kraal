@@ -410,13 +410,7 @@ fn write_with_backup(path: &Path, content: &str) -> Result<()> {
         let backup = path.with_file_name(format!("{name}.kraal-bak"));
         std::fs::copy(path, &backup).with_context(|| format!("backing up {}", path.display()))?;
     }
-    // A symlink (dotfiles kept in a repository) stays one: the file it points to changes.
-    let target = match std::fs::symlink_metadata(path) {
-        Ok(m) if m.file_type().is_symlink() => std::fs::canonicalize(path)
-            .with_context(|| format!("{} is a link to a file that is not there", path.display()))?,
-        _ => path.to_path_buf(),
-    };
-    crate::paths::write_atomic(&target, content.as_bytes()).with_context(|| format!("writing {}", target.display()))
+    crate::paths::write_atomic(path, content.as_bytes()).with_context(|| format!("writing {}", path.display()))
 }
 
 fn runs_ours(hook: &Value, agent: &str) -> bool {
@@ -1455,17 +1449,9 @@ pub fn statusline() {
     }
     match all.claude.statusline.as_deref().filter(|c| !c.trim().is_empty() && !is_our_statusline(c)) {
         Some(cmd) => {
-            let child = std::process::Command::new("sh")
-                .args(["-c", cmd])
-                .stdin(std::process::Stdio::piped())
-                .stdout(std::process::Stdio::inherit())
-                .stderr(std::process::Stdio::inherit())
-                .spawn();
-            if let Ok(mut child) = child {
-                if let Some(mut stdin) = child.stdin.take() {
-                    let _ = stdin.write_all(&input);
-                }
-                let _ = child.wait();
+            if let Ok(out) = run_statusline(cmd, input, STATUSLINE_TIMEOUT) {
+                let _ = std::io::stdout().write_all(&out.stdout);
+                let _ = std::io::stderr().write_all(&out.stderr);
             }
         }
         None => {
@@ -1478,6 +1464,21 @@ pub fn statusline() {
             }
         }
     }
+}
+
+/// How long the user's own status line may take: one stuck never holds `kraal statusline`.
+const STATUSLINE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// What the user's own status line command `cmd` printed, given `input` (what Claude Code
+/// sent), within `timeout`.
+fn run_statusline(cmd: &str, input: Vec<u8>, timeout: std::time::Duration) -> std::io::Result<crate::exec::Output> {
+    use std::io::Write;
+    let (reader, mut writer) = std::io::pipe()?;
+    // Fed from a thread: a command that does not read it all never blocks kraal.
+    std::thread::Builder::new().name("statusline".into()).spawn(move || writer.write_all(&input))?;
+    let mut sh = std::process::Command::new("sh");
+    sh.args(["-c", cmd]);
+    crate::exec::run_with_input(&mut sh, reader.into(), timeout, 64 << 10)
 }
 
 #[cfg(test)]
@@ -2351,5 +2352,18 @@ mod tests {
             .output()
             .unwrap();
         assert_eq!(String::from_utf8_lossy(&out.stdout), exe.to_string_lossy());
+    }
+
+    #[test]
+    fn the_users_status_line_never_holds_kraal() {
+        use std::time::{Duration, Instant};
+        let read = run_statusline("printf '[%s]' \"$(head -c 5)\"", b"opus 4".to_vec(), STATUSLINE_TIMEOUT).unwrap();
+        assert_eq!(read.stdout_text(), "[opus ]");
+        // One that reads nothing of a large input, then one that never ends.
+        let large = vec![b'x'; 1 << 20];
+        let start = Instant::now();
+        assert_eq!(run_statusline("echo line", large.clone(), STATUSLINE_TIMEOUT).unwrap().stdout_text(), "line\n");
+        let stuck = run_statusline("sleep 30", large, Duration::from_millis(200)).unwrap();
+        assert!(stuck.timed_out && start.elapsed() < Duration::from_secs(5), "{:?}", start.elapsed());
     }
 }

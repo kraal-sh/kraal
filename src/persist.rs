@@ -338,10 +338,9 @@ fn stops_in_foreground(pane: &crate::protocol::PaneInfo, program: Option<&[Strin
     Some(command_line(argv))
 }
 
-/// `argv` as a shell reads it, cut at 60 characters.
+/// `argv` as a shell reads it, cut to 60 columns.
 fn command_line(argv: &[String]) -> String {
-    let line = crate::shell::join(argv);
-    if line.chars().count() > 60 { format!("{}…", line.chars().take(59).collect::<String>()) } else { line }
+    crate::text::truncate(&crate::shell::join(argv), 60)
 }
 
 /// A line of the list of what a restart stops: the pane, then `what`.
@@ -589,6 +588,8 @@ mod tests {
         ]);
         let cut = &stops(&shell, Some(&long))[0];
         assert!(cut.chars().count() == 60 && cut.ends_with('…'), "{cut}");
+        let wide = &stops(&shell, Some(&argv(&["echo", &"漢字".repeat(40)])))[0];
+        assert!(crate::text::columns(wide) <= 60 && wide.ends_with('…'), "{wide}");
         // Jobs in the background stop beside whatever runs in the foreground, an idle agent
         // or a shell at its prompt included; a pane whose program ended has none.
         let jobs = [argv(&["sleep", "600"]), argv(&["tail", "-f", "log"])];

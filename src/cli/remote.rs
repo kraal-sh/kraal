@@ -231,11 +231,10 @@ pub(super) fn servers(action: ServersCmd) -> Result<()> {
             if !path.exists() {
                 servers::Inventory::empty().save()?;
             }
-            let editor = std::env::var("VISUAL").or_else(|_| std::env::var("EDITOR")).unwrap_or_else(|_| "vi".into());
-            let mut parts = editor.split_whitespace();
-            let status = std::process::Command::new(parts.next().unwrap_or("vi")).args(parts).arg(&path).status()?;
+            let editor = crate::edit::editor_argv(&path, None);
+            let status = std::process::Command::new(&editor[0]).args(&editor[1..]).status()?;
             if !status.success() {
-                bail!("{editor} exited with {status}");
+                bail!("the editor exited with {status}");
             }
             servers::Inventory::load().map(|inv| println!("{} servers", inv.servers.len()))
         }

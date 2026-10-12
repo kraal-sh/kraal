@@ -662,6 +662,15 @@ fn wipe(secret: &mut [u8]) {
     }
 }
 
+/// The user's editor on `path`, at `line`: `$VISUAL`, else `$EDITOR`, else vi, split into words
+/// by sh as a shell would (`code --wait`).
+pub fn editor_argv(path: &Path, line: Option<u32>) -> Vec<String> {
+    let mut argv = ["sh", "-c", "exec ${VISUAL:-${EDITOR:-vi}} \"$@\"", "kraal-edit"].map(String::from).to_vec();
+    argv.extend(line.map(|line| format!("+{line}")));
+    argv.push(path.display().to_string());
+    argv
+}
+
 /// Where a pane hands kraal the sudo password: a FIFO in the edit's private directory, so the
 /// password is never written to a disk.
 pub fn password_fifo(dir: &Path) -> std::io::Result<PathBuf> {

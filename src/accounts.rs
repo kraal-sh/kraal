@@ -581,7 +581,8 @@ pub fn prepare_home(a: &Account) -> Result<Vec<String>> {
         return Ok(notes);
     }
     std::fs::create_dir_all(&home).with_context(|| format!("creating {}", home.display()))?;
-    let _ = std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700));
+    std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700))
+        .with_context(|| format!("making {} private", home.display()))?;
     for entry in kind.shared {
         let src = default.join(entry);
         let dst = home.join(entry);
@@ -1112,13 +1113,12 @@ fn agent_command(a: &Account, args: &[&str]) -> Result<Launch> {
 
 /// A random UUID v4 (for `--session-id`).
 pub fn new_uuid() -> String {
+    use std::io::Read;
     let mut b = [0u8; 16];
-    if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
-        use std::io::Read;
-        let _ = f.read_exact(&mut b);
-    } else {
+    let random = std::fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut b));
+    if random.is_err() {
         let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos();
-        b.copy_from_slice(&t.to_le_bytes());
+        b = t.to_le_bytes();
     }
     b[6] = (b[6] & 0x0f) | 0x40;
     b[8] = (b[8] & 0x3f) | 0x80;

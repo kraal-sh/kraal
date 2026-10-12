@@ -25,7 +25,7 @@ pub fn ensure_server(session: &str) -> Result<PathBuf> {
     if let Some(dir) = log.parent() {
         paths::ensure_private_dir(dir)?;
     }
-    let out = crate::runbooks::open_private_append(&log)?;
+    let out = paths::open_private_append(&log)?;
     // The server writes a byte to this pipe once it listens, instead of being asked again and
     // again whether it does.
     let (ready, ready_end) = std::io::pipe().context("creating a pipe")?;
@@ -277,7 +277,7 @@ pub fn restart_detached(exe: &Path, session: &str) -> Result<std::process::Child
     if let Some(dir) = log.parent() {
         paths::ensure_private_dir(dir)?;
     }
-    let out = crate::runbooks::open_private_append(&log)?;
+    let out = paths::open_private_append(&log)?;
     let mut cmd = std::process::Command::new(exe);
     cmd.args(["-s", session, "restart", "--yes"])
         .stdin(std::process::Stdio::null())
@@ -565,7 +565,7 @@ fn connect(target: &Target) -> Result<Conn> {
 fn status_line(msg: &str) {
     let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
     // Leave the last column empty: writing there would scroll the screen.
-    let text: String = msg.chars().take((cols as usize).saturating_sub(2)).collect();
+    let text = crate::text::truncate(msg, usize::from(cols).saturating_sub(2));
     let mut out = std::io::stdout();
     let _ = write!(out, "\x1b7\x1b[?7l\x1b[{rows};1H\x1b[0m\x1b[41;97m {text}\x1b[K\x1b[0m\x1b[?7h\x1b8");
     let _ = out.flush();
