@@ -25,7 +25,7 @@ pub fn update(check: bool, to: Option<String>, force: bool, restart: Option<bool
     }
     let exe = std::env::current_exe().context("cannot tell where this kraal is")?;
     if let Some(manager) = package_manager(&exe) {
-        bail!("this kraal was installed by {manager}: update it there");
+        bail!("this kraal was installed by {manager}");
     }
     let Some(asset) = asset_name(std::env::consts::OS, std::env::consts::ARCH) else {
         bail!("no release is built for this machine: update with cargo install kraal");
@@ -110,12 +110,18 @@ fn version_of(tag: &str) -> &str {
 /// The package manager that owns `exe`, if any: it would put its own copy back.
 fn package_manager(exe: &Path) -> Option<&'static str> {
     let path = exe.to_string_lossy();
+    let cargo_bin = std::env::var_os("CARGO_HOME")
+        .map(PathBuf::from)
+        .or_else(|| dirs::home_dir().map(|h| h.join(".cargo")))
+        .map(|c| c.join("bin"));
     if path.contains("/Cellar/") || path.contains("/homebrew/") {
-        Some("Homebrew")
+        Some("Homebrew: update it there")
     } else if path.starts_with("/nix/store/") {
-        Some("Nix")
+        Some("Nix: update it there")
     } else if path.starts_with("/usr/bin/") {
-        Some("your system's package manager")
+        Some("your system's package manager: update it there")
+    } else if cargo_bin.is_some_and(|bin| exe.parent() == Some(bin.as_path())) {
+        Some("Cargo: update it with cargo install kraal")
     } else {
         None
     }
@@ -194,7 +200,15 @@ mod tests {
         assert_eq!(version_of("v0.2.0"), "0.2.0");
         assert!(release_url(Some("v0.2.0")).ends_with("/releases/download/v0.2.0"));
         assert!(release_url(None).ends_with("/releases/latest/download"));
-        assert_eq!(package_manager(Path::new("/opt/homebrew/Cellar/kraal/0.1.0/bin/kraal")), Some("Homebrew"));
+        assert_eq!(
+            package_manager(Path::new("/opt/homebrew/Cellar/kraal/0.1.0/bin/kraal")),
+            Some("Homebrew: update it there")
+        );
+        let home = dirs::home_dir().unwrap();
+        if std::env::var_os("CARGO_HOME").is_none() {
+            let cargo = home.join(".cargo/bin/kraal");
+            assert_eq!(package_manager(&cargo), Some("Cargo: update it with cargo install kraal"));
+        }
         assert_eq!(package_manager(Path::new("/home/me/.local/bin/kraal")), None);
     }
 }

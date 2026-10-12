@@ -23,8 +23,8 @@ installing anything, into `~/.local/bin`. Settings:
 ## Updates
 
 `kraal update` replaces kraal with the latest release the same way: `--check` only says whether
-there is one, `--to v0.2.0` picks one. A kraal installed by a package manager (Homebrew, Nix,
-your distribution) is updated there instead.
+there is one, `--to v0.2.0` picks one. A kraal installed by Cargo or a package manager (Homebrew,
+Nix, your distribution) is updated there instead.
 
 A session's server keeps the version it started with. After installing, `kraal update` lists the
 sessions still on an older kraal, with the programs a restart would stop in them, and offers to
@@ -39,6 +39,9 @@ version each session runs, attaching to a session on an older kraal says so, and
 cargo install kraal                                  # the latest release, from crates.io
 cargo install --git https://github.com/kraal-sh/kraal  # the main branch
 ```
+
+`cargo install kraal` again updates it to the latest release; `kraal update` leaves a kraal that
+Cargo installed to Cargo.
 
 ## By hand
 
