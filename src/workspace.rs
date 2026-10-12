@@ -255,12 +255,13 @@ pub fn file_name_from(name: &str) -> String {
     if valid_file_name(&file) { file } else { format!("workspace{digest}") }
 }
 
-/// Load every `*.kdl` in `dir`, sorted by name. Unparseable files are returned as
-/// `Err` entries with the path.
+/// Load every `*.kdl` in `dir`, sorted by name, each listed under its [`definition_path`].
+/// Unparseable files are returned as `Err` entries with the path.
 ///
 /// A missing directory yields an empty list; any other error reading it yields a
 /// single `Err` entry for `dir` itself.
 pub fn load_dir(dir: &Path) -> Vec<(PathBuf, Result<WorkspaceDef>)> {
+    let dir = &fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
     let entries = match fs::read_dir(dir) {
         Ok(entries) => entries,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Vec::new(),
@@ -283,7 +284,18 @@ pub fn load_dir(dir: &Path) -> Vec<(PathBuf, Result<WorkspaceDef>)> {
         .collect()
 }
 
-fn load_file(path: &Path) -> Result<WorkspaceDef> {
+/// The path a definition file is known by: its directory resolved (links, `..`), so that a
+/// workspace opened through another spelling of that directory is still linked to its file. The
+/// file itself is not resolved: a definition that is a link is renamed as a link.
+pub fn definition_path(path: &Path) -> PathBuf {
+    match (path.parent().and_then(|dir| fs::canonicalize(dir).ok()), path.file_name()) {
+        (Some(dir), Some(name)) => dir.join(name),
+        _ => path.to_path_buf(),
+    }
+}
+
+/// The definition in the file at `path`, named after the file.
+pub fn load_file(path: &Path) -> Result<WorkspaceDef> {
     let src = fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
     let name = path.file_stem().map(|stem| stem.to_string_lossy().into_owned()).unwrap_or_default();
     parse_workspace(&name, &src).with_context(|| format!("parsing {}", path.display()))
@@ -1790,6 +1802,31 @@ layout {
 
         fs::remove_dir_all(&dir).unwrap();
         assert!(load_dir(&dir).is_empty());
+    }
+
+    /// Through a linked directory or another spelling of it, a definition has the path
+    /// `load_dir` lists; a definition that is a link keeps its own.
+    #[test]
+    fn a_definition_has_one_path_however_its_directory_is_reached() {
+        let root = env::temp_dir().join(format!("kraal-ws-paths-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let (real, linked) = (root.join("dotfiles/workspaces"), root.join("config"));
+        fs::create_dir_all(&real).unwrap();
+        std::os::unix::fs::symlink(&real, &linked).unwrap();
+        fs::write(real.join("perso.kdl"), "layout {\n    pane\n}\n").unwrap();
+        std::os::unix::fs::symlink(real.join("perso.kdl"), real.join("alias.kdl")).unwrap();
+
+        let listed: Vec<PathBuf> = load_dir(&linked).into_iter().map(|(path, _)| path).collect();
+        let real = fs::canonicalize(&real).unwrap();
+        assert_eq!(listed, [real.join("alias.kdl"), real.join("perso.kdl")]);
+        for spelling in [linked.join("perso.kdl"), root.join("dotfiles/../config/./perso.kdl"), real.join("perso.kdl")]
+        {
+            assert_eq!(definition_path(&spelling), real.join("perso.kdl"), "{}", spelling.display());
+        }
+        assert_eq!(definition_path(&linked.join("alias.kdl")), real.join("alias.kdl"));
+        // A file in a directory that is gone keeps the path it was given.
+        assert_eq!(definition_path(&root.join("gone/x.kdl")), root.join("gone/x.kdl"));
+        fs::remove_dir_all(&root).unwrap();
     }
 
     /// Parses the real layouts in `~/.config/zellij/layouts` (run with `--ignored`).

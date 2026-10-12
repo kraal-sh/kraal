@@ -223,7 +223,8 @@ pub enum PickerKind {
 #[derive(Clone)]
 pub enum PickAction {
     SwitchWorkspace(u32),
-    OpenDefinition(String),
+    /// A definition not running, by its file.
+    OpenDefinition(std::path::PathBuf),
     NewWorkspace,
     /// A server name or `user@host[:port]`.
     Ssh(String),

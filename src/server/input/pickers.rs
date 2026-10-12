@@ -9,6 +9,7 @@ use crate::keymap::{Action, Command};
 use crate::pane::PaneSpec;
 use crate::paths;
 use crate::protocol::Placement;
+use crate::server::definitions::file_name;
 use crate::server::ui::{ConfirmAction, Mode, PickAction, PickItem, Picker, PickerKind, Prompt, PromptAction};
 use crate::server::{ClientId, Server};
 
@@ -255,7 +256,7 @@ impl Server {
         match item.action {
             PickAction::Command(command) => return self.command(id, command),
             PickAction::SwitchWorkspace(ws) => self.show_workspace(id, ws),
-            PickAction::OpenDefinition(name) => match self.open_workspace(&name) {
+            PickAction::OpenDefinition(path) => match self.open_definition(&path) {
                 Ok(ws) => self.show_workspace(id, ws),
                 Err(e) => self.toast(id, format!("{e:#}")),
             },
@@ -364,18 +365,14 @@ impl Server {
         for (path, def) in self.definitions() {
             match def {
                 Ok(def) => {
-                    if self.workspaces.iter().any(|w| w.name == def.name) {
+                    if self.definition_workspace(&path).is_some() {
                         continue;
                     }
                     let n = def.panes().len();
                     items.push(PickItem {
-                        label: def.name.clone(),
-                        detail: format!(
-                            "not running · {n} pane{} · {}",
-                            plural(n),
-                            path.file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_default()
-                        ),
-                        action: PickAction::OpenDefinition(def.name),
+                        label: def.name,
+                        detail: format!("not running · {n} pane{} · {}", plural(n), file_name(&path)),
+                        action: PickAction::OpenDefinition(path),
                         state: None,
                         dim: true,
                     });

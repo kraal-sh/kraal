@@ -35,7 +35,7 @@ mod worktrees;
 
 use std::collections::HashMap;
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -258,7 +258,11 @@ pub struct Workspace {
     pub name: String,
     pub tabs: Vec<Tab>,
     pub active: usize,
+    /// The definition file it is linked to (see [`Workspace::set_definition`]): the one it was
+    /// started from, or first saved to.
     pub definition: Option<PathBuf>,
+    /// The device and inode of that file when last seen: what finds it again once renamed.
+    pub definition_inode: Option<(u64, u64)>,
     pub cwd: Option<PathBuf>,
     pub sync: SyncScope,
     /// Panes marked for typing in sync.
@@ -270,6 +274,13 @@ pub struct Workspace {
 }
 
 impl Workspace {
+    /// Link it to the definition file at `path`, or to none. The path is spelled as
+    /// [`crate::workspace::load_dir`] lists definitions, so that they compare equal.
+    pub fn set_definition(&mut self, path: Option<&Path>) {
+        self.definition = path.map(crate::workspace::definition_path);
+        self.definition_inode = path.and_then(crate::paths::file_id);
+    }
+
     /// Panes that receive what is typed in `focused`, besides itself.
     pub fn sync_targets(&self, focused: PaneId) -> Vec<PaneId> {
         let mut out = match self.sync {
@@ -424,8 +435,9 @@ pub struct Server {
     pub accounts_error: Option<String>,
     /// What kraal told the clients, for the messages log.
     pub messages: std::collections::VecDeque<Message>,
-    /// Names of the workspace definitions on disk, refreshed periodically.
-    pub def_names: Vec<String>,
+    /// Path and name of the workspace definitions on disk that could be read, refreshed
+    /// periodically.
+    pub def_files: Vec<(PathBuf, String)>,
     last_def_scan: Instant,
     /// Servers from the inventory, workspaces and ~/.ssh/config.
     pub known_servers: Vec<crate::servers::Known>,
@@ -738,7 +750,7 @@ pub fn run(session: &str) -> Result<()> {
         warnings,
         accounts_error: None,
         messages: Default::default(),
-        def_names: Vec::new(),
+        def_files: Vec::new(),
         last_def_scan: Instant::now(),
         known_servers: Vec::new(),
         discovered: Default::default(),

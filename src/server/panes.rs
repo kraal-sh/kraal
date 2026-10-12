@@ -19,17 +19,20 @@ impl Server {
             name = format!("{base}-{n}");
             n += 1;
         }
-        self.workspaces.push(Workspace {
+        let mut ws = Workspace {
             id,
             name,
             tabs: Vec::new(),
             active: 0,
-            definition,
+            definition: None,
+            definition_inode: None,
             cwd: None,
             sync: SyncScope::Off,
             marked: Default::default(),
             sync_approved: Default::default(),
-        });
+        };
+        ws.set_definition(definition.as_deref());
+        self.workspaces.push(ws);
         self.persist_dirty = true;
         let name = self.workspaces.last().map(|w| w.name.clone()).unwrap_or_default();
         self.emit("workspace.opened", serde_json::json!({ "workspace": name }));

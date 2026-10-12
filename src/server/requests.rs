@@ -232,7 +232,7 @@ impl Server {
                 match wi.filter(|i| *i < self.workspaces.len()) {
                     None => Err("no such workspace".into()),
                     Some(wi) => {
-                        let name = name.unwrap_or_else(|| crate::workspace::file_name_from(&self.workspaces[wi].name));
+                        let name = name.unwrap_or_else(|| self.definition_file_name(wi));
                         self.save_definition(wi, &name).map(Response::Path).map_err(|e| format!("{e:#}"))
                     }
                 }
@@ -534,7 +534,7 @@ impl Server {
         }
         for (path, def) in self.definitions() {
             let Ok(def) = def else { continue };
-            if self.workspaces.iter().any(|w| w.name == def.name) {
+            if self.definition_workspace(&path).is_some() {
                 continue;
             }
             out.push(WorkspaceInfo {

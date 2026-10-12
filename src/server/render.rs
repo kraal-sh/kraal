@@ -2,6 +2,7 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::rc::Rc;
 
 use ratatui::buffer::Buffer;
@@ -50,7 +51,8 @@ enum SideRow {
 #[derive(Debug, Clone, PartialEq)]
 pub enum SideItem {
     Workspace(u32),
-    Definition(String),
+    /// A definition not running, by its file.
+    Definition(PathBuf),
     Pane(PaneId),
     /// A tunnel, by local port.
     Tunnel(u16),
@@ -1015,12 +1017,12 @@ impl Server {
             );
             agents.extend(states.into_iter().map(|(p, s)| (p, s, ws)));
         }
-        for n in self.def_names.iter().filter(|n| !self.workspaces.iter().any(|w| &w.name == *n)) {
+        for (path, n) in self.def_files.iter().filter(|(p, _)| self.definition_workspace(p).is_none()) {
             let name = faint(n.clone(), t.dim);
             let detail = faint("not running".into(), t.dim);
             entry(
                 &mut rows,
-                SideItem::Definition(n.clone()),
+                SideItem::Definition(path.clone()),
                 dot(t.icon(AgentState::Idle), t.dim),
                 name,
                 detail,

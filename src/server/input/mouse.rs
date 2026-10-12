@@ -63,7 +63,7 @@ impl Server {
                     Some(SideItem::Workspace(ws)) => self.show_workspace(id, ws),
                     Some(SideItem::Pane(p)) => self.reveal(id, p),
                     Some(SideItem::Remote { server, pane }) => self.go_to_remote(id, &server, pane),
-                    Some(SideItem::Definition(name)) => match self.open_workspace(&name) {
+                    Some(SideItem::Definition(path)) => match self.open_definition(&path) {
                         Ok(ws) => self.show_workspace(id, ws),
                         Err(e) => self.toast(id, format!("{e:#}")),
                     },

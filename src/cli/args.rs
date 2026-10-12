@@ -189,7 +189,7 @@ pub enum Cmd {
         #[arg(long, requires = "since")]
         boot: Option<u64>,
     },
-    /// Save a workspace's current layout as a definition file.
+    /// Save a workspace's current layout to its definition file, or as `<name>.kdl`.
     Save {
         name: Option<String>,
         #[arg(short, long)]

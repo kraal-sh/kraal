@@ -53,7 +53,7 @@ impl Server {
 
     pub(super) fn sidebar_useful(&self) -> bool {
         self.workspaces.len() > 1
-            || !self.def_names.is_empty()
+            || !self.def_files.is_empty()
             || !self.tunnels.is_empty()
             || !self.ports.is_empty()
             || self.panes.values().any(|p| p.agent.kind.is_some())

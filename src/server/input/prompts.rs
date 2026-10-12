@@ -1,10 +1,14 @@
 //! Questions: text prompts and confirmations, and what their answers do.
 
+use std::ffi::OsStr;
+use std::path::PathBuf;
+
 use anyhow::Context;
 
 use crate::input::{InputEvent, KeyCode, MouseButton, MouseKind, encode_paste};
 use crate::pane::PaneSpec;
 use crate::protocol::Placement;
+use crate::server::definitions::file_name;
 use crate::server::ui::{ConfirmAction, Mode, Prompt, PromptAction, Question};
 use crate::server::{ClientId, Server};
 use crate::{paths, workspace};
@@ -80,9 +84,13 @@ impl Server {
                 if self.workspaces.iter().any(|w| w.name == value && w.id != ws) {
                     return Err((p.action, format!("A workspace named \"{value}\" is already open.")));
                 }
-                if let Some(wi) = self.ws_index(ws) {
-                    self.workspaces[wi].name = value;
+                let Some(wi) = self.ws_index(ws) else { return Ok(()) };
+                match self.rename_definition(wi, &value) {
+                    Ok(Some(old)) => self.toast(id, format!("renamed {} to {value}.kdl", file_name(&old))),
+                    Ok(None) => {}
+                    Err(e) => return Err((p.action, format!("{e:#}"))),
                 }
+                self.workspaces[wi].name = value;
             }
             PromptAction::NewWorkspace => {
                 if value.is_empty() {
@@ -209,23 +217,33 @@ impl Server {
         Ok(())
     }
 
-    /// Save workspace `wi` as definition `name` in the definitions directory, keeping the file it
-    /// replaces as `.kdl.bak`. The name must be a plain file name: a CLI or protocol request
-    /// must not write anywhere else.
-    pub(in crate::server) fn save_definition(&mut self, wi: usize, name: &str) -> anyhow::Result<std::path::PathBuf> {
+    /// Save workspace `wi` as definition `name`, keeping the file it replaces as `.kdl.bak`: in
+    /// its own definition file when `name` is that file's, else in the definitions directory. The
+    /// name must be a plain file name: a CLI or protocol request must not write anywhere else.
+    pub(in crate::server) fn save_definition(&mut self, wi: usize, name: &str) -> anyhow::Result<PathBuf> {
         anyhow::ensure!(workspace::valid_file_name(name), "{}, not {name:?}", workspace::FILE_NAME_RULE);
         let def = self.snapshot_definition(wi, name);
-        let dir = self.definition_dir();
-        std::fs::create_dir_all(&dir)?;
-        let path = dir.join(format!("{name}.kdl"));
+        let ws = &self.workspaces[wi];
+        let own = ws.definition.clone().filter(|own| own.file_stem() == Some(OsStr::new(name)));
+        // Under another name, a workspace that has a file of its own saves a copy.
+        let link = own.is_some() || ws.definition.is_none();
+        let path = match own {
+            Some(own) => own,
+            None => {
+                let dir = self.definition_dir();
+                std::fs::create_dir_all(&dir)?;
+                dir.join(format!("{name}.kdl"))
+            }
+        };
         if path.exists() {
             let backup = path.with_extension("kdl.bak");
             std::fs::copy(&path, &backup)
                 .with_context(|| format!("keeping a copy as {}: nothing was saved", backup.display()))?;
         }
         crate::paths::write_atomic(&path, workspace::to_kdl(&def).as_bytes())?;
-        let ws = &mut self.workspaces[wi];
-        ws.definition = Some(path.clone());
+        if link {
+            self.workspaces[wi].set_definition(Some(&path));
+        }
         Ok(path)
     }
 
