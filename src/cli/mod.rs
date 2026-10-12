@@ -119,7 +119,10 @@ fn run(cli: Cli) -> Result<()> {
         Some(Cmd::Read { pane, lines }) => panes::read(&s, pane, lines),
         Some(Cmd::Wait { pane, until, timeout }) => panes::wait(&s, pane, until, timeout),
         Some(Cmd::Focus { pane }) => done(s.request(Request::FocusPane { pane })),
-        Some(Cmd::Close { pane }) => done(s.request(Request::ClosePane { pane: pane_ref(&s, pane)? })),
+        Some(Cmd::Close { pane }) => {
+            let pane = pane_or_own(&s, pane, "name it after `kraal close`")?;
+            done(s.request(Request::ClosePane { pane }))
+        }
         Some(Cmd::Rename { pane, name }) => done(s.request(Request::RenamePane { pane: pane_ref(&s, pane)?, name })),
         Some(Cmd::Notify { title, body }) => done(s.request(Request::Notify { title, body: body.unwrap_or_default() })),
         Some(Cmd::Buffer { action }) => buffers::run(&s, action),
@@ -186,9 +189,15 @@ fn session_name(cli: &Option<String>) -> Result<String> {
     Ok(s)
 }
 
-/// The pane a command acts on: explicit, else the pane the command runs in (in its session).
+/// The pane a command acts on: the one it was given, else the pane it runs in (in its session).
+/// Without either, the message says `how` that command is given a pane.
+fn pane_or_own(s: &Session, p: Option<String>, how: &str) -> Result<String> {
+    p.or_else(|| s.own_pane()).with_context(|| format!("which pane? {how} (an id or a name; see `kraal panes`)"))
+}
+
+/// [`pane_or_own`] for the commands that take their pane with `--pane`.
 fn pane_ref(s: &Session, p: Option<String>) -> Result<String> {
-    p.or_else(|| s.own_pane()).context("which pane? pass --pane (an id or a name; see `kraal panes`)")
+    pane_or_own(s, p, "pass --pane")
 }
 
 /// Where `--right`, `--down`, `--floating` or `--tab` put a new pane, if one was given.

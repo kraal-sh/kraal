@@ -1283,6 +1283,29 @@ fn unknown_panes_and_workspaces_are_errors() {
     assert!(String::from_utf8_lossy(&out.stderr).contains("no workspace named"));
 }
 
+/// Outside a pane, a command that acts on a pane and is given none says how it takes one: the
+/// option for those that take an option, the argument for the one that takes an argument.
+#[test]
+fn a_command_given_no_pane_says_how_it_takes_one() {
+    let env = Env::new("whichpane");
+    let said = |args: &[&str]| {
+        let out = env.try_run(args);
+        assert!(!out.status.success(), "{args:?}");
+        String::from_utf8_lossy(&out.stderr).into_owned()
+    };
+    let with_option: [&[&str]; 6] =
+        [&["send", "hi"], &["keys", "enter"], &["read"], &["wait"], &["rename", "x"], &["buffer", "paste"]];
+    for args in with_option {
+        assert!(said(args).contains("which pane? pass --pane"), "{args:?}: {}", said(args));
+        // What the message names is taken: the command gets as far as looking for the session.
+        let named = said(&[args, &["--pane", "1"][..]].concat());
+        assert!(named.contains("no kraal server"), "{args:?}: {named}");
+    }
+    let close = said(&["close"]);
+    assert!(close.contains("which pane? name it after `kraal close`") && !close.contains("--pane"), "{close}");
+    assert!(said(&["close", "1"]).contains("no kraal server"));
+}
+
 #[test]
 fn server_inventory_and_copy_plans() {
     let env = Env::new("servers");
