@@ -21,24 +21,24 @@ pub struct AgentKind {
     /// The program that runs it.
     pub command: &'static str,
     /// Environment variable selecting the config home.
-    pub home_env: &'static str,
+    home_env: &'static str,
     /// The home the agent uses when that variable is unset: the account the user had before
     /// kraal, which needs no variable.
-    pub default_home: &'static str,
+    default_home: &'static str,
     /// Arguments of the agent's own login command.
     pub login: &'static [&'static str],
     /// Arguments of its command that says whether an account is logged in (exit status).
     pub login_status: &'static [&'static str],
     /// Arguments that resume a conversation; `{session}` is replaced by its id.
-    pub resume: &'static [&'static str],
+    resume: &'static [&'static str],
     /// Flag that sets the id of a new conversation, so kraal knows it without reading files.
     pub session_flag: Option<&'static str>,
     /// Entries of the default home shared with every other account (symlinked).
     pub shared: &'static [&'static str],
     /// Entries copied once into a new account home.
-    pub copied: &'static [&'static str],
+    copied: &'static [&'static str],
     /// Variables that would override the account's login; cleared in the pane.
-    pub clear_env: &'static [&'static str],
+    clear_env: &'static [&'static str],
 }
 
 /// The agents whose accounts kraal manages; other agents run with their own single home.
@@ -139,19 +139,19 @@ pub struct Account {
 
 /// Which accounts to use, in order, for a workspace or a directory.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Rule {
+struct Rule {
     /// The rule applies in this workspace only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub workspace: Option<String>,
+    workspace: Option<String>,
     /// The rule applies to agents started in this directory or below it (`~` allowed); a
     /// worktree counts as its repository.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub path: Option<String>,
+    path: Option<String>,
     /// The rule applies to this agent only; `None`: to every agent ([`Accounts::rule_accounts`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub agent: Option<String>,
+    agent: Option<String>,
     /// Account names to try, in order. Empty: no account may be used where the rule applies.
-    pub accounts: Vec<String>,
+    accounts: Vec<String>,
 }
 
 /// `[claude]` of accounts.toml.
@@ -184,9 +184,9 @@ pub struct Accounts {
     pub limits: Limits,
     pub claude: ClaudeOptions,
     /// The accounts as listed; [`Accounts::for_agent`] adds the implicit default ones.
-    pub accounts: Vec<Account>,
+    accounts: Vec<Account>,
     /// In order: the first rule that matches decides.
-    pub rules: Vec<Rule>,
+    rules: Vec<Rule>,
     path: PathBuf,
 }
 
@@ -353,14 +353,14 @@ impl Accounts {
     }
 
     /// Accounts to try, in order, for an agent started in `workspace` and `cwd`.
-    pub fn candidates(&self, agent: &str, workspace: Option<&str>, cwd: Option<&Path>) -> Vec<Account> {
+    fn candidates(&self, agent: &str, workspace: Option<&str>, cwd: Option<&Path>) -> Vec<Account> {
         self.rule_accounts(agent, workspace, cwd).unwrap_or_else(|| self.for_agent(agent))
     }
 
     /// The accounts of the first rule matching this context, if any. A rule for every agent
     /// concerns an agent when it names one of its accounts, or names no account of any agent
     /// any more: then nothing is allowed here (rather than any account at all).
-    pub fn rule_accounts(&self, agent: &str, workspace: Option<&str>, cwd: Option<&Path>) -> Option<Vec<Account>> {
+    fn rule_accounts(&self, agent: &str, workspace: Option<&str>, cwd: Option<&Path>) -> Option<Vec<Account>> {
         let all = self.for_agent(agent);
         let everyone = self.all();
         for rule in &self.rules {
@@ -1096,7 +1096,7 @@ impl Usage {
 
 /// Where an account's latest usage is saved: the status line command Claude runs and the server
 /// write it, the server and `kraal accounts` read it, and it outlives a restart.
-pub fn usage_path(agent: &str, name: &str) -> PathBuf {
+fn usage_path(agent: &str, name: &str) -> PathBuf {
     paths::state_dir().join("usage").join(format!("{agent}-{name}.json"))
 }
 
@@ -1109,7 +1109,7 @@ pub fn save_usage(agent: &str, name: &str, u: &Usage) -> Result<()> {
     Ok(())
 }
 
-pub fn load_usage(agent: &str, name: &str) -> Option<Usage> {
+fn load_usage(agent: &str, name: &str) -> Option<Usage> {
     serde_json::from_slice(&std::fs::read(usage_path(agent, name)).ok()?).ok()
 }
 

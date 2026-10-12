@@ -62,7 +62,7 @@ impl Location {
     }
 
     /// The parent directory, or `None` at the root (and at an unresolved `~`).
-    pub fn parent(&self) -> Option<Location> {
+    fn parent(&self) -> Option<Location> {
         match self {
             Location::Local(path) => {
                 path.parent().filter(|p| !p.as_os_str().is_empty()).map(|p| Location::Local(p.to_path_buf()))
@@ -152,17 +152,17 @@ fn parent_remote(path: &str) -> Option<String> {
 
 /// One directory entry.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Entry {
-    pub name: String,
+struct Entry {
+    name: String,
     /// A directory, or a symbolic link to one.
-    pub is_dir: bool,
-    pub is_link: bool,
-    pub size: u64,
+    is_dir: bool,
+    is_link: bool,
+    size: u64,
     /// unix seconds
-    pub mtime: i64,
+    mtime: i64,
     /// `name` is the entry's real name. A name that is not UTF-8 is shown approximately, and
     /// nothing is done to such an entry: an approximate name could designate another file.
-    pub exact: bool,
+    exact: bool,
 }
 
 /// Keys the pane understands (the server maps its own key type to these).

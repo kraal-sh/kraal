@@ -224,9 +224,9 @@ type Table = &'static [(&'static str, &'static [&'static str])];
 type MenuDef = (&'static str, &'static str, &'static str, Action);
 
 /// A set of default bindings.
-pub struct Preset {
+struct Preset {
     /// What `keys.preset` names it by.
-    pub name: &'static str,
+    name: &'static str,
     /// Sequences after the leader (keys separated by spaces), in menu order. `{id}` stands for
     /// the key of menu `id`, `{prefix}` for the prefix key.
     leader: Table,
@@ -239,7 +239,7 @@ pub struct Preset {
     tool_menu: &'static str,
 }
 
-pub const KRAAL: Preset = Preset {
+const KRAAL: Preset = Preset {
     name: "kraal",
     leader: &[
         // The main action of each theme; its uppercase letter opens the theme's menu.
@@ -341,7 +341,7 @@ pub const KRAAL: Preset = Preset {
 };
 
 /// tmux's keys, as kraal had them first.
-pub const CLASSIC: Preset = Preset {
+const CLASSIC: Preset = Preset {
     name: "classic",
     leader: &[
         ("split_right", &["%", "|"]),
@@ -425,7 +425,7 @@ pub const CLASSIC: Preset = Preset {
     tool_menu: "",
 };
 
-pub const PRESETS: [&Preset; 2] = [&KRAAL, &CLASSIC];
+const PRESETS: [&Preset; 2] = [&KRAAL, &CLASSIC];
 
 /// `[keys]` of the configuration.
 #[derive(Debug, Clone, Deserialize)]
@@ -442,7 +442,7 @@ pub struct KeysConfig {
     /// keys): a configuration written then keeps its bindings. No release documented it; it can
     /// go in any release.
     #[serde(default)]
-    pub prefixed: BTreeMap<String, Vec<String>>,
+    prefixed: BTreeMap<String, Vec<String>>,
     /// Per action, replacing the preset's: single keys that need no leader.
     #[serde(default)]
     pub direct: BTreeMap<String, Vec<String>>,
@@ -585,11 +585,11 @@ fn bindings(
 }
 
 /// A section of the reference: its title, and rows of keys with what they do.
-pub type Section = (String, Vec<(String, String)>);
+type Section = (String, Vec<(String, String)>);
 
 /// Keys and what they do in lists, text fields, questions and modes: fixed, the same in every
 /// preset.
-pub const MODE_KEYS: &[(&str, &[(&str, &str)])] = &[
+const MODE_KEYS: &[(&str, &[(&str, &str)])] = &[
     (
         "In lists",
         &[
@@ -883,7 +883,7 @@ impl Keymap {
     }
 
     /// Whether `action` is the main action of one of the menus.
-    pub fn is_main(&self, action: Action) -> bool {
+    fn is_main(&self, action: Action) -> bool {
         self.menus.iter().any(|m| m.main == action && !m.keys.is_empty())
     }
 

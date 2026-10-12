@@ -626,7 +626,7 @@ pub fn edit_line(text: &mut String, cursor: &mut usize, k: &crate::input::Key) -
 }
 
 /// The longest a one-line field gets: a path, a command, a name.
-pub const MAX_FIELD: usize = 4096;
+const MAX_FIELD: usize = 4096;
 
 /// Insert pasted text (its first line) at the cursor; refused whole when it does not fit.
 pub fn paste_line(text: &mut String, cursor: &mut usize, pasted: &str) -> Result<(), String> {
@@ -667,7 +667,7 @@ pub enum Drag {
 }
 
 /// Subsequence fuzzy match. `None` if `query` does not match; higher is better.
-pub fn fuzzy_score(query: &str, text: &str) -> Option<i32> {
+fn fuzzy_score(query: &str, text: &str) -> Option<i32> {
     let q: Vec<char> = query.to_lowercase().chars().filter(|c| !c.is_whitespace()).collect();
     if q.is_empty() {
         return Some(0);

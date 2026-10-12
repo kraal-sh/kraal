@@ -586,13 +586,13 @@ pub struct PlaceArgs {
     #[arg(short, long)]
     pub target: Option<String>,
     #[arg(long, conflicts_with_all = ["down", "floating", "tab"])]
-    pub right: bool,
+    right: bool,
     #[arg(long, conflicts_with_all = ["floating", "tab"])]
-    pub down: bool,
+    down: bool,
     #[arg(long, conflicts_with = "tab")]
     pub floating: bool,
     #[arg(long)]
-    pub tab: bool,
+    tab: bool,
     /// Keep the focus where it is.
     #[arg(long)]
     pub no_focus: bool,

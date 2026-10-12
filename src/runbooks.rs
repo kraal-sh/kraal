@@ -154,7 +154,7 @@ fn valid_var(name: &str) -> bool {
         && !name.starts_with("KRAAL_")
 }
 
-pub fn parse_steps(text: &str) -> Result<Steps> {
+fn parse_steps(text: &str) -> Result<Steps> {
     let s: Steps = toml::from_str(text)?;
     if s.steps.iter().all(|st| st.trim().is_empty()) {
         bail!("no steps");
@@ -184,7 +184,7 @@ impl Steps {
 }
 
 /// `90`, `30s`, `10m`, `2h`.
-pub fn parse_duration(s: &str) -> Option<std::time::Duration> {
+fn parse_duration(s: &str) -> Option<std::time::Duration> {
     let s = s.trim();
     let (num, unit) = match s.find(|c: char| !c.is_ascii_digit()) {
         Some(i) => (&s[..i], &s[i..]),
@@ -206,7 +206,7 @@ pub fn shown_value(p: Option<&Param>, value: &str) -> String {
 }
 
 /// The title (first heading) and the shell blocks of a Markdown runbook.
-pub fn parse_markdown(text: &str) -> (String, Vec<Block>) {
+fn parse_markdown(text: &str) -> (String, Vec<Block>) {
     use pulldown_cmark::{CodeBlockKind, Event, HeadingLevel, Parser, Tag, TagEnd};
     let mut title = String::new();
     let mut heading = String::new();
@@ -468,7 +468,7 @@ pub fn local_time(t: SystemTime) -> String {
 }
 
 /// Where run logs go, with the ledger of the runs in progress.
-pub fn runs_dir() -> PathBuf {
+fn runs_dir() -> PathBuf {
     paths::state_dir().join("runs")
 }
 
@@ -630,7 +630,7 @@ impl OutputLog {
 }
 
 /// Append `header` to the run log, then a finished target's output, deleting its file.
-pub fn fold_output(log: &Path, header: &str, output: Option<&Path>) -> std::io::Result<()> {
+fn fold_output(log: &Path, header: &str, output: Option<&Path>) -> std::io::Result<()> {
     use std::io::Write;
     let mut f = open_private_append(log)?;
     f.write_all(header.as_bytes())?;
@@ -726,7 +726,7 @@ fn ledger_path(session: &str) -> PathBuf {
 }
 
 /// Save the runs `session` has in progress; with none, the ledger goes.
-pub fn save_ledger(session: &str, runs: &[LedgerRun]) -> Result<()> {
+fn save_ledger(session: &str, runs: &[LedgerRun]) -> Result<()> {
     let path = ledger_path(session);
     if runs.is_empty() {
         return match std::fs::remove_file(&path) {

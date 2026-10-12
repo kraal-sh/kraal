@@ -14,11 +14,11 @@ use crate::{paths, shell};
 
 /// Where a repository says how to prepare its worktrees. It is read from the commit a new
 /// worktree starts from: what that worktree checks out.
-pub const FILE: &str = ".kraal/worktree.toml";
+const FILE: &str = ".kraal/worktree.toml";
 const FILE_MAX: usize = 64 << 10;
 
 /// The variables of a worktree's panes.
-pub const VARS: [&str; 4] = ["KRAAL_WORKTREE", "KRAAL_WORKTREE_INDEX", "KRAAL_PORT_OFFSET", "PORT"];
+const VARS: [&str; 4] = ["KRAAL_WORKTREE", "KRAAL_WORKTREE_INDEX", "KRAAL_PORT_OFFSET", "PORT"];
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -69,10 +69,10 @@ fn check_pattern(p: &str) -> Result<()> {
 pub struct Plan {
     pub name: String,
     /// The main checkout.
-    pub repo: PathBuf,
+    repo: PathBuf,
     pub base: String,
     /// The repository's file as of `base`, and what it says.
-    pub repo_file: Option<(String, Setup)>,
+    repo_file: Option<(String, Setup)>,
     /// The user's own (trusted).
     pub user: Setup,
 }
@@ -190,7 +190,7 @@ pub fn visible(s: &str) -> String {
 #[derive(Debug)]
 pub struct Prepared {
     pub worktree: Worktree,
-    pub copied: Copied,
+    copied: Copied,
     pub steps: Vec<String>,
 }
 
@@ -236,14 +236,14 @@ impl Prepared {
 
 /// What copying did.
 #[derive(Debug, Default, PartialEq, Eq)]
-pub struct Copied {
-    pub copied: Vec<String>,
+struct Copied {
+    copied: Vec<String>,
     /// Paths left out, and why.
-    pub skipped: Vec<(String, String)>,
+    skipped: Vec<(String, String)>,
 }
 
 impl Copied {
-    pub fn lines(&self) -> Vec<String> {
+    fn lines(&self) -> Vec<String> {
         let mut lines = Vec::new();
         if !self.copied.is_empty() {
             lines.push(format!("copied from the main checkout: {}", self.copied.join(", ")));
@@ -258,7 +258,7 @@ impl Copied {
 /// is copied must be in the repository once its links are resolved, and nothing is written
 /// through a link of the worktree (the repository may commit one where a copy goes). Links
 /// inside a copied directory are left out.
-pub fn copy_files(from: &Path, to: &Path, patterns: &[String]) -> Copied {
+fn copy_files(from: &Path, to: &Path, patterns: &[String]) -> Copied {
     let mut out = Copied::default();
     let (root, dest) = match (from.canonicalize(), to.canonicalize()) {
         (Ok(r), Ok(d)) => (r, d),

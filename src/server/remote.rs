@@ -44,7 +44,7 @@ pub struct RemoteAgent {
     pub agent: String,
     pub state: AgentState,
     /// The pane is the one its workspace shows there.
-    pub focused: bool,
+    focused: bool,
     /// Since when it is in this state, as seen here.
     pub since: Instant,
 }
@@ -79,14 +79,14 @@ struct Listed {
 
 /// Text from a server, safe to draw: control characters made visible, formatting ones (bidi
 /// overrides, zero-width characters) dropped, cut to `max` columns.
-pub fn clean(text: &str, max: usize) -> String {
+fn clean(text: &str, max: usize) -> String {
     let invisible = |c: &char| matches!(c, '\u{200b}'..='\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2060}'..='\u{206f}' | '\u{feff}');
     let text: String = text.chars().filter(|c| !invisible(c)).take(max * 4).map(crate::text::visible_char).collect();
     crate::text::truncate(text.trim(), max)
 }
 
 /// One line of `kraal agents --follow`: its agents, cleaned, at most [`MAX_AGENTS`].
-pub fn parse_list(line: &str, now: Instant) -> Option<Vec<RemoteAgent>> {
+fn parse_list(line: &str, now: Instant) -> Option<Vec<RemoteAgent>> {
     let listed: Vec<Listed> = serde_json::from_str(line).ok()?;
     let agents = listed
         .into_iter()
@@ -205,7 +205,7 @@ impl Watch {
 /// answer one), a connection of its own (one shared with panes could hide that the link is
 /// dead), a server that does not answer given up after 15 s, and a dead link seen within a
 /// minute.
-pub fn watch_args(s: &servers::Server, known: &[servers::Known], session: &str) -> Vec<String> {
+fn watch_args(s: &servers::Server, known: &[servers::Known], session: &str) -> Vec<String> {
     let mut args: Vec<String> = [
         "-T",
         "-o",
