@@ -649,12 +649,23 @@ impl TermPane {
         self.archive.rested = false;
         let mut feed = Feed { term: &mut self.term, archive: &mut self.archive, seen: &mut self.commands.history_seen };
         self.parser.advance(&mut feed, bytes);
+        self.view_moved();
     }
 
     /// Give the emulator the output a synchronized update holds.
     pub(super) fn stop_sync(&mut self) {
         let mut feed = Feed { term: &mut self.term, archive: &mut self.archive, seen: &mut self.commands.history_seen };
         self.parser.stop_sync(&mut feed);
+        self.view_moved();
+    }
+
+    /// Rows move on the grid: while the view shows history, what it shows may change without
+    /// the emulator's damage saying so, and the screen is looked at whole again (see
+    /// `ScreenCache::refresh`). At the bottom, the screen's rows stay where they are.
+    fn view_moved(&mut self) {
+        if self.term.grid().display_offset() > 0 {
+            self.moved = self.moved.wrapping_add(1);
+        }
     }
 
     /// The rows of the emulator's history that are its own: those below the lens.
@@ -665,6 +676,7 @@ impl TermPane {
     /// Make the emulator's history hold at least `rows` rows, bringing rows back from the archive
     /// (a page at least). Whether any came back.
     pub(super) fn reveal(&mut self, rows: usize) -> bool {
+        self.view_moved();
         let history = self.term.grid().history_size();
         if rows <= history {
             return false;
@@ -681,6 +693,7 @@ impl TermPane {
 
     /// The same, the rows brought back the emulator's own (where the marks are found).
     pub(super) fn bring_back_rows(&mut self, rows: usize) {
+        self.view_moved();
         self.fill_lens();
         let history = self.term.grid().history_size();
         if rows > history {
@@ -692,6 +705,7 @@ impl TermPane {
     /// Make room for `rows` rows below `line` before going down: with a lens, the lines between
     /// it and the emulator's own come as they are reached.
     pub(super) fn reveal_below(&mut self, line: Line, rows: usize) {
+        self.view_moved();
         self.archive.lens_down(&mut self.term, line.0, rows);
     }
 
@@ -710,6 +724,7 @@ impl TermPane {
     /// The view went up: the lines laid out far below it go (not while a search may have
     /// matched there).
     pub(super) fn went_up(&mut self, searching: bool) {
+        self.view_moved();
         if !searching {
             self.archive.lens_trim_below(&mut self.term);
         }
@@ -717,12 +732,14 @@ impl TermPane {
 
     /// Show the top of the history: its oldest line at the grid's top.
     pub(super) fn reveal_top(&mut self) {
+        self.view_moved();
         self.archive.open_lens(&mut self.term, None);
     }
 
     /// Lay out all the lines between the lens and the emulator's own rows: the history is whole
     /// on the grid again, where it was.
     pub(super) fn fill_lens(&mut self) {
+        self.view_moved();
         if self.archive.lens.is_some() {
             self.archive.lens_down(&mut self.term, i32::MIN, usize::MAX);
             self.archive.own_lens(&mut self.term, &mut self.commands.history_seen);
@@ -739,6 +756,7 @@ impl TermPane {
     /// Take the lens out; returns the line it showed at the view's top, to show again (see
     /// [`TermPane::show_line`]).
     pub(super) fn drop_lens(&mut self) -> Option<u64> {
+        self.view_moved();
         let lens = self.archive.lens.as_ref()?;
         let grid = self.term.grid();
         let mut above = grid.history_size().saturating_sub(grid.display_offset());
@@ -756,6 +774,7 @@ impl TermPane {
 
     /// Show the archived line numbered `at` at the view's top, the copy-mode cursor on it.
     pub(super) fn show_line(&mut self, at: u64) {
+        self.view_moved();
         if self.archive.open_lens(&mut self.term, Some(at)) {
             // The copy-mode cursor comes along into the view.
             self.term.scroll_display(Scroll::Top);
@@ -764,6 +783,7 @@ impl TermPane {
 
     /// Bring back the newest `lines` archived lines above the grid.
     pub(super) fn reveal_lines(&mut self, lines: usize) {
+        self.view_moved();
         let width = self.term.columns();
         let rows: usize = {
             let store = self.archive.lines();
@@ -792,6 +812,7 @@ impl TermPane {
     /// Move what nothing uses any more to the archive: rows brought back, once the view left
     /// them, and the lens.
     pub(super) fn settle(&mut self) {
+        self.view_moved();
         if self.archive.lens.is_some() {
             let grid = self.term.grid();
             if grid.display_offset() > self.own_history() {
@@ -832,6 +853,7 @@ impl TermPane {
         self.calm();
         if !self.archive.rested && !self.term.mode().contains(TermMode::ALT_SCREEN) {
             self.archive.rested = true;
+            self.view_moved();
             self.archive.compact(&mut self.term, &mut self.commands.history_seen, 0);
             self.term.grid_mut().truncate();
             self.archive.spare = Vec::new();
@@ -846,6 +868,7 @@ impl TermPane {
     /// The screen changed size: rows it gains come from the history, brought back first. A lens
     /// goes, to show the same line again after.
     pub(super) fn before_resize(&mut self, rows: usize) {
+        self.view_moved();
         self.archive.reopen = self.drop_lens();
         let (screen, history) = (self.term.screen_lines(), self.term.grid().history_size());
         if rows > screen + history {
@@ -859,6 +882,7 @@ impl TermPane {
     /// counted then, and the oldest that no longer fit go (as the emulator's own do when it
     /// rewraps them).
     pub(super) fn after_resize(&mut self) {
+        self.view_moved();
         self.archive.fit(self.term.screen_lines());
         self.archive.lines().set_width(self.term.columns());
         self.archive.spare.clear();

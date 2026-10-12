@@ -31,8 +31,9 @@ pub struct ScreenCache {
     /// drawn again.
     offset: usize,
     selection: Option<SelectionRange>,
-    /// The count of the grid's changes the rows were drawn after.
+    /// The count of the grid's changes the rows were drawn after, and of the archive's moves.
     changes: Option<u64>,
+    moved: u64,
     cells: Vec<Cell>,
     versions: Vec<u64>,
     /// The links of each row: column and target.
@@ -47,17 +48,19 @@ pub struct ScreenCache {
 impl ScreenCache {
     /// Bring the rows up to date with `term`: those its damage covers, or all of them when the
     /// view moved, the selection changed or the size did. `changes` counts the changes made to
-    /// the grid: nothing is looked at while it, the view and the selection stay the same.
-    pub fn refresh<T: EventListener>(&mut self, term: &mut Term<T>, changes: u64) {
+    /// the grid: nothing is looked at while it, the view and the selection stay the same. `moved`
+    /// counts the moves of rows the emulator's damage does not tell: every row is looked at again.
+    pub fn refresh<T: EventListener>(&mut self, term: &mut Term<T>, (changes, moved): (u64, u64)) {
         let (cols, rows) = (term.columns(), term.screen_lines());
         let offset = term.grid().display_offset();
         let selection = term.selection.as_ref().and_then(|s| s.to_range(term));
         let resized = (cols, rows) != (self.cols, self.rows) || self.cells.len() != cols * rows;
-        let mut all = resized || offset != self.offset || selection != self.selection;
+        let mut all = resized || offset != self.offset || selection != self.selection || moved != self.moved;
         if !all && self.changes == Some(changes) {
             return;
         }
         self.changes = Some(changes);
+        self.moved = moved;
         let mut lines = Vec::new();
         match term.damage() {
             TermDamage::Full => all = true,
@@ -207,17 +210,17 @@ mod tests {
         let mut parser: Processor = Processor::new();
         parser.advance(&mut t, b"hello\r\nworld");
         let mut cache = ScreenCache::default();
-        cache.refresh(&mut t, 1);
+        cache.refresh(&mut t, (1, 0));
         let before = cache.versions().to_vec();
         assert!(before.iter().all(|v| *v > 0));
         parser.advance(&mut t, b"!");
-        cache.refresh(&mut t, 2);
+        cache.refresh(&mut t, (2, 0));
         let after = cache.versions().to_vec();
         assert_eq!((after[0], after[2], after[3]), (before[0], before[2], before[3]));
         assert_ne!(after[1], before[1]);
         // The cursor moving changes no cell.
         parser.advance(&mut t, b"\x1b[1;1H\x1b[3;5H");
-        cache.refresh(&mut t, 3);
+        cache.refresh(&mut t, (3, 0));
         assert_eq!(cache.versions(), after.as_slice());
         let (cached, full) = both(&cache, &t);
         assert_eq!(cached, full);
@@ -228,15 +231,22 @@ mod tests {
         let mut t = term(6, 2, 0);
         let mut parser: Processor = Processor::new();
         let mut cache = ScreenCache::default();
-        cache.refresh(&mut t, 1);
+        cache.refresh(&mut t, (1, 0));
         let before = cache.versions().to_vec();
         // Changed behind the count's back: not seen.
         parser.advance(&mut t, b"abc");
-        cache.refresh(&mut t, 1);
+        cache.refresh(&mut t, (1, 0));
         assert_eq!(cache.versions(), before.as_slice());
         // Counted: seen.
-        cache.refresh(&mut t, 2);
+        cache.refresh(&mut t, (2, 0));
         assert_ne!(cache.versions()[0], before[0]);
+        let (cached, full) = both(&cache, &t);
+        assert_eq!(cached, full);
+        // Rows moved without damage (the archive's): every row is looked at.
+        t.grid_mut()[Line(1)][Column(0)].c = 'z';
+        cache.refresh(&mut t, (2, 0));
+        assert_ne!(both(&cache, &t).0, both(&cache, &t).1);
+        cache.refresh(&mut t, (2, 1));
         let (cached, full) = both(&cache, &t);
         assert_eq!(cached, full);
     }
@@ -244,9 +254,9 @@ mod tests {
     #[test]
     fn a_new_screen_never_reuses_versions() {
         let mut a = ScreenCache::default();
-        a.refresh(&mut term(5, 2, 0), 0);
+        a.refresh(&mut term(5, 2, 0), (0, 0));
         let mut b = ScreenCache::default();
-        b.refresh(&mut term(5, 2, 0), 0);
+        b.refresh(&mut term(5, 2, 0), (0, 0));
         assert!(a.versions().iter().all(|v| !b.versions().contains(v)));
     }
 
@@ -256,7 +266,7 @@ mod tests {
         let mut parser: Processor = Processor::new();
         parser.advance(&mut t, "ab\r\n\u{10EEEE}".as_bytes());
         let mut cache = ScreenCache::default();
-        cache.refresh(&mut t, 1);
+        cache.refresh(&mut t, (1, 0));
         assert_eq!((cache.has_images(0), cache.has_images(1), cache.has_images(2)), (false, true, false));
     }
 
@@ -336,7 +346,7 @@ mod tests {
             let mut parser: Processor = Processor::new();
             let mut cache = ScreenCache::default();
             let mut changes = 0;
-            cache.refresh(&mut t, changes);
+            cache.refresh(&mut t, (changes, 0));
             let ((mut was, _), _) = both(&cache, &t);
             let mut versions = cache.versions().to_vec();
             for step in 0..300 {
@@ -363,7 +373,7 @@ mod tests {
                 if t.grid().display_offset() > t.grid().history_size() {
                     t.scroll_display(Scroll::Bottom);
                 }
-                cache.refresh(&mut t, changes);
+                cache.refresh(&mut t, (changes, 0));
                 let ((cached, cached_links), (full, full_links)) = both(&cache, &t);
                 assert_eq!(cached, full, "case {case} step {step}");
                 assert_eq!(cached_links, full_links, "case {case} step {step}");

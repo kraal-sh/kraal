@@ -3441,6 +3441,60 @@ fn frames_drawn_over_the_last_one_end_as_a_whole_frame() {
     same(&client, "pane closed");
 }
 
+/// The rows a pane shows far back come from its compact history: a client drawn incrementally
+/// while the view goes there and back shows what a client attaching then is shown whole.
+#[test]
+fn rows_brought_back_from_the_history_are_drawn() {
+    let env = Env::new("farback");
+    std::fs::create_dir_all(env.root.join("state/kraal")).unwrap();
+    std::fs::write(env.root.join("state/kraal/welcomed"), "").unwrap();
+    env.workspace("w", "layout {\n    pane name=\"log\"\n}\n");
+    env.run(&["open", "w"]);
+    env.wait_for_text("log", "$");
+    env.run(&["send", "-p", "log", "seq 1 4000; echo ENDS\r"]);
+    let mut client = RawClient::attach(&env, "w");
+    client.wait_for_screen("ENDS");
+    // The pane's rows, below the top bar (it shows the client's mode), compared.
+    let same = |client: &RawClient, step: &str| {
+        client.settle();
+        let fresh = RawClient::attach(&env, "w");
+        fresh.settle();
+        client.settle();
+        let (a, b) = (client.screen.lock().unwrap().clone(), fresh.screen.lock().unwrap().clone());
+        let (a, b) = (terminal_after(&a, 120, 40), terminal_after(&b, 120, 40));
+        for (y, (a, b)) in a.iter().zip(&b).enumerate().take(40).skip(1) {
+            assert_eq!(a, b, "{step}: row {y} differs");
+        }
+        drop(fresh);
+        client.settle();
+    };
+    same(&client, "at the bottom");
+    // Many screens back with the wheel, beyond what the emulator keeps.
+    for _ in 0..80 {
+        client.send(b"\x1b[<64;60;20M");
+    }
+    same(&client, "far back");
+    // A search goes further back still, then down again.
+    client.send(b"\x02/");
+    client.settle();
+    client.send(b"1234");
+    client.send(b"\r");
+    same(&client, "search far back");
+    // The view is there, far beyond the rows the emulator keeps.
+    let rows = terminal_after(&client.screen.lock().unwrap(), 120, 40);
+    let text = |row: &String| -> String {
+        row.split(" | ").map(|c| c.split(' ').next().unwrap_or("").trim_matches('"').to_string()).collect()
+    };
+    assert!(rows.iter().any(|r| text(r).contains("│1234│")), "{:?}", rows.iter().map(text).collect::<Vec<_>>());
+    for _ in 0..30 {
+        client.send(b"\x1b[<65;60;20M");
+    }
+    same(&client, "down again");
+    client.send(b"\x1b");
+    std::thread::sleep(Duration::from_millis(100));
+    same(&client, "back at the bottom");
+}
+
 #[test]
 fn a_pane_printing_without_a_pause_does_not_starve_the_others() {
     let env = Env::new("starve");

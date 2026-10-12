@@ -232,6 +232,9 @@ pub struct TermPane {
     /// Counts the changes made to the emulator's grid (see `TermPane::marked`): the screen
     /// needs no look while it stays the same.
     pub(super) changes: u64,
+    /// Counts the times the archive moved rows on the grid, which the emulator's damage does
+    /// not tell (see `archive.rs`): the screen is looked at whole again.
+    pub(super) moved: u64,
     /// The process's directory as last read for a frame.
     pub(super) cwd_seen: RefCell<Option<super::CwdSeen>>,
 }
@@ -335,6 +338,7 @@ impl TermPane {
             graphics: crate::graphics::PaneGraphics::new(env.graphics.clone()),
             screen: Default::default(),
             changes: 0,
+            moved: 0,
             cwd_seen: Default::default(),
         };
         if let Some(text) = &spec.startup_input {

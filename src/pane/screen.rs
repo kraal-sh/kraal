@@ -415,7 +415,7 @@ impl Pane {
     /// other panes, and when `width × height` is not the whole screen.
     pub fn refresh_screen(&mut self, width: u16, height: u16) -> Option<&super::ScreenCache> {
         let t = self.term_mut()?;
-        t.screen.refresh(&mut t.term, t.changes);
+        t.screen.refresh(&mut t.term, (t.changes, t.moved));
         (t.screen.size() == (width, height)).then_some(&t.screen)
     }
 
