@@ -132,7 +132,7 @@ pub(super) fn decode_image(path: &Path) -> anyhow::Result<ImageData> {
     } else {
         decoded
     };
-    Ok(ImageData { pixels: decoded.into_rgba8(), width, height, format })
+    Ok(ImageData { pixels: decoded.into_rgba8(), width, height, format, png: None })
 }
 
 pub(super) fn read_directory(path: &Path) -> anyhow::Result<Vec<DirEntry>> {

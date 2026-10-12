@@ -69,15 +69,38 @@ Programs that draw images in the terminal work in panes, locally or over SSH: th
 protocol (kitty's `icat`, Yazi, timg, chafa…) and sixel (img2sixel, gnuplot, matplotlib
 backends…). kraal keeps each image and draws it in the pane like text: it scrolls with the
 output, is cut by the pane's frame, hides under a floating pane, and shows on every attached
-terminal that can draw it.
+terminal that can draw it. An image preview (`kraal preview photo.jpg`, `pane preview=`) is
+shown the same way.
 
-- Your terminal must draw kitty graphics over Unicode placeholders: Ghostty and kitty do. kraal
-  asks each terminal when it attaches; on one that cannot (WezTerm and Konsole draw images, but
-  not this way), the image's cells stay blank, and programs in panes are told no images can be
-  shown, as a terminal without them would.
+kraal asks each terminal what it draws when it attaches, and sends each the images in the best
+way it has:
+
+| Your terminal | Images |
+| --- | --- |
+| Ghostty, kitty | kitty graphics over Unicode placeholders: the terminal moves and cuts them itself |
+| One whose device attributes report sixel: foot, WezTerm, Konsole, iTerm2, mlterm, Windows Terminal 1.22 or later, xterm started with `-ti vt340` | sixel, drawn by kraal over the image's cells |
+| Others, such as Alacritty or Terminal.app | none: the image's cells stay blank, and programs in panes are told no images can be shown, as a terminal without them would; previews draw their image with half blocks |
+
+With sixel:
+
+- kraal draws the part of each image the screen shows, with up to 255 colours, when it appears,
+  changes or is uncovered; nothing is sent while it stays as it is. A part that goes is erased.
+- An image that moves (output scrolling under it, a pane scrolled back) is erased at once, and
+  drawn again where it is once it has stayed put for a tenth of a second.
+- The terminal must tell its cell size when asked (`CSI 16 t`). After the window is resized,
+  images come back once it has told it again.
+- The window's last row shows no image (a sixel image there scrolls some terminals), and the
+  bottom of each part stops at a whole band of six pixel rows, up to five rows short.
+- Drawing a large image again costs the server a few milliseconds (12 to 17 for one filling a
+  2000×1200 pixel window) and sends 1 to 2 MB. Scaling an image and choosing its colours is done
+  once per size, off kraal's main thread.
+
+And everywhere:
+
 - Programs send the image data itself. Reading an image from a file or shared memory is refused
   (the program may run on another machine than kraal), and programs then send the data instead.
 - `[graphics] memory_mb` (256 by default) bounds the memory all panes keep for images; the oldest
-  go first. `enabled = false` turns images off: their sequences then reach the emulator, which
-  ignores them.
+  go first. The images ready to draw as sixel take at most a quarter of that again. `enabled =
+  false` turns images off: their sequences then reach the emulator, which ignores them, and
+  previews draw their image with half blocks.
 - Not supported: animations, images under the text (negative z-index), offsets within a cell.

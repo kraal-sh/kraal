@@ -3215,6 +3215,101 @@ fn images_reach_a_terminal_that_shows_them() {
     assert!(!seen.contains("\x1b_Ga=t") && !seen.contains('\u{10EEEE}'), "no image for a terminal that cannot show it");
 }
 
+#[test]
+fn images_reach_a_terminal_that_draws_sixel() {
+    let env = Env::new("sixel");
+    env.workspace("w", "layout {\n    pane name=\"img\"\n}\n");
+    env.run(&["open", "w"]);
+    env.wait_for_text("img", "$");
+    let script = env.root.join("img.sh");
+    write_script(
+        &script,
+        "#!/bin/sh\nprintf '\\033_Ga=T,f=24,s=2,v=2,c=4,r=2,q=2;AAAAAAAAAAAAAAAA\\033\\\\'\necho shown\n",
+    );
+    let mut client = RawClient::attach(&env, "w");
+    // It answers as foot does: no kitty graphics, sixel among its device attributes.
+    client.wait_for_screen("\x1b[c");
+    client.send(b"\x1bP>|foot(1.21.0)\x1b\\\x1b[6;20;10t\x1b[?62;4;22c");
+    std::thread::sleep(Duration::from_millis(300));
+    env.run(&["send", "-p", "img", &format!("{}\r", script.display())]);
+    env.wait_for_text("img", "shown");
+    // 4×2 cells of 10×20 pixels, as many rows of them as whole sixel bands hold.
+    client.wait_for_screen("\x1bP0;1;0q\"1;1;40;36#0;2;0;0;0#0");
+    let seen = |c: &RawClient| String::from_utf8_lossy(&c.screen.lock().unwrap()).into_owned();
+    assert!(!seen(&client).contains('\u{10EEEE}') && !seen(&client).contains("\x1b_Ga=t"), "no placeholders");
+    // Text changing next to it does not draw it again.
+    let drawn = seen(&client).matches("\x1bP0;1;0q").count();
+    env.run(&["send", "-p", "img", "echo dk$((1+1))\r"]);
+    env.wait_for_text("img", "dk2");
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(seen(&client).matches("\x1bP0;1;0q").count(), drawn);
+    // The font changed with the window: the image waits for the new cell size, then takes it.
+    let asked = seen(&client).matches("\x1b[16t").count();
+    raw_frame(&mut client.stream, 0, br#"{"type":"resize","cols":120,"rows":40}"#);
+    let start = Instant::now();
+    while seen(&client).matches("\x1b[16t").count() == asked {
+        assert!(start.elapsed() < Duration::from_secs(10), "the cell size is asked again");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    client.send(b"\x1b[6;18;9t");
+    client.wait_for_screen("\x1bP0;1;0q\"1;1;36;36");
+    // The screen cleared: the image's cells are erased.
+    assert!(!seen(&client).contains("\x1b[4X"));
+    env.run(&["send", "-p", "img", "printf '\\033[H\\033[2J'\r"]);
+    client.wait_for_screen("\x1b[4X");
+}
+
+#[test]
+fn an_image_scrolling_with_the_output_is_not_sent_at_each_step() {
+    let env = Env::new("sixelscroll");
+    env.workspace("w", "layout {\n    pane name=\"img\"\n}\n");
+    env.run(&["open", "w"]);
+    env.wait_for_text("img", "$");
+    let script = env.root.join("img.sh");
+    // The pane is full first: each line after the image scrolls it up a row, 30 times.
+    write_script(
+        &script,
+        "#!/bin/sh\nseq 60\nprintf '\\033_Ga=T,f=24,s=2,v=2,c=4,r=2,q=2;AAAAAAAAAAAAAAAA\\033\\\\'\necho\n\
+         i=0\nwhile [ $i -lt 30 ]; do echo line $i; sleep 0.02; i=$((i+1)); done\necho stopped\n",
+    );
+    let mut client = RawClient::attach(&env, "w");
+    client.wait_for_screen("\x1b[c");
+    client.send(b"\x1bP>|foot(1.21.0)\x1b\\\x1b[6;20;10t\x1b[?62;4;22c");
+    std::thread::sleep(Duration::from_millis(300));
+    env.run(&["send", "-p", "img", &format!("{}\r", script.display())]);
+    env.wait_for_text("img", "stopped");
+    std::thread::sleep(Duration::from_millis(500));
+    let seen = String::from_utf8_lossy(&client.screen.lock().unwrap()).into_owned();
+    let drawn = seen.matches("\x1bP0;1;0q").count();
+    assert!((1..=6).contains(&drawn), "{drawn} sixel images for 30 steps");
+    // It shows where it stopped: drawn after it was last erased.
+    assert!(seen.rfind("\x1bP0;1;0q") > seen.rfind("\x1b[4X"), "not drawn where it stopped");
+}
+
+#[test]
+fn a_preview_shows_its_image_as_each_terminal_can() {
+    let env = Env::new("pimg");
+    let png = env.root.join("dot.png");
+    image::RgbaImage::from_pixel(2, 2, image::Rgba([200, 10, 10, 255])).save(&png).unwrap();
+    env.workspace("w", &format!("layout {{\n    pane name=\"pic\" preview=\"{}\"\n}}\n", png.display()));
+    env.run(&["open", "w"]);
+    let mut ghostty = RawClient::attach(&env, "w");
+    let mut foot = RawClient::attach(&env, "w");
+    let plain = RawClient::attach(&env, "w");
+    ghostty.wait_for_screen("\x1b[c");
+    ghostty.send(b"\x1b_Gi=1263684657;OK\x1b\\\x1bP>|ghostty 1.1.3\x1b\\\x1b[6;20;10t\x1b[?62;22c");
+    foot.wait_for_screen("\x1b[c");
+    foot.send(b"\x1bP>|foot(1.21.0)\x1b\\\x1b[6;20;10t\x1b[?62;4;22c");
+    ghostty.wait_for_screen("\x1b_Ga=t,f=100,i=");
+    ghostty.wait_for_screen("\x1b_Ga=p,U=1,i=");
+    ghostty.wait_for_screen("\u{10EEEE}");
+    foot.wait_for_screen("\x1bP0;1;0q\"1;1;");
+    // A terminal that shows no images gets half blocks.
+    plain.wait_for_screen("▀");
+    let seen = String::from_utf8_lossy(&plain.screen.lock().unwrap()).into_owned();
+    assert!(!seen.contains("\x1b_Ga=t") && !seen.contains("\x1bP0;1;0q") && !seen.contains('\u{10EEEE}'));
+}
+
 /// Drive the agent of pane `pane` in `env`'s session through Claude's hooks.
 fn claude_hook(env: &Env, pane: &str, payload: &str) {
     use std::io::Write;

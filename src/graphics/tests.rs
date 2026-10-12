@@ -477,3 +477,226 @@ fn a_removed_placement_goes_from_the_terminal_and_a_closed_pane_counts_as_a_chan
     assert_ne!(s.version(), before);
     assert_eq!(s.used(), 0);
 }
+
+// ---- terminals that draw sixel ---------------------------------------------------------------
+
+#[test]
+fn device_attributes_tell_the_terminals_that_draw_sixel() {
+    assert!(probe().ends_with("\x1b[c"), "asked last: every terminal answers it");
+    // foot, WezTerm, Windows Terminal, xterm as a VT340.
+    for da in [
+        "\x1b[?62;4;22;28c",
+        "\x1b[?65;4;6;18;22c",
+        "\x1b[?61;4;6;7;14;21;22;23;24;28;32;42c",
+        "\x1b[?63;1;2;3;4;6;9;15;16;22;29c",
+    ] {
+        assert_eq!(sixel_answer(da), Some(true), "{da:?}");
+    }
+    // kitty, Ghostty, xterm as it starts.
+    for da in ["\x1b[?62;c", "\x1b[?62;22c", "\x1b[?64;1;2;6;9;15;16;17;18;21;22;28c"] {
+        assert_eq!(sixel_answer(da), Some(false), "{da:?}");
+    }
+    // Other replies: the keyboard flags, the secondary attributes, a cursor report.
+    for other in ["\x1b[?4u", "\x1b[>1;10;0c", "\x1b[?12;4R", "\x1b[?62;x;4c"] {
+        assert_eq!(sixel_answer(other), None, "{other:?}");
+    }
+    let mut p = crate::input::InputParser::new();
+    let mut events = p.feed(b"\x1b[6;20;10t\x1b[?62;4;22c");
+    events.extend(p.flush());
+    let raw: Vec<Vec<u8>> = events
+        .into_iter()
+        .filter_map(|e| match e {
+            crate::input::InputEvent::Raw(r) => Some(r),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(raw, vec![b"\x1b[6;20;10t".to_vec(), b"\x1b[?62;4;22c".to_vec()]);
+}
+
+/// Image `kid`'s cells as `show_cells` leaves them, from the image's `col` and `row` at `area`.
+fn image_cells(buf: &mut Buffer, area: Rect, kid: u32, col: u16, row: u16) {
+    write_placeholders(buf, area, (area.x - col, area.y - row), kid, col + area.width, row + area.height);
+}
+
+fn part(kid: u32, area: Rect, col: u16, row: u16) -> paint::Part {
+    paint::Part { kid, placement: 0, area, col, row }
+}
+
+fn by_place(mut parts: Vec<paint::Part>) -> Vec<paint::Part> {
+    parts.sort_by_key(|p| (p.area.y, p.area.x));
+    parts
+}
+
+#[test]
+fn the_visible_parts_of_images_are_found_and_their_cells_blanked() {
+    let (a, b) = (KRAAL_ID | 1, KRAAL_ID | 2);
+    let mut buf = Buffer::empty(Rect::new(0, 0, 20, 10));
+    // Image a scrolled up by one row: its rows 1 to 4 show from row 1 of the screen.
+    image_cells(&mut buf, Rect::new(2, 1, 6, 4), a, 0, 1);
+    // A floating pane over three columns of its two middle rows.
+    buf.set_string(5, 2, "+--", ratatui::style::Style::default());
+    buf.set_string(5, 3, "|ab", ratatui::style::Style::default());
+    // Image b on the last two rows, from its third column.
+    image_cells(&mut buf, Rect::new(10, 8, 3, 2), b, 2, 0);
+    let parts = paint::take_parts(&mut buf, Rect::new(0, 0, 20, 9));
+    assert_eq!(
+        by_place(parts),
+        vec![
+            part(a, Rect::new(2, 1, 6, 1), 0, 1),
+            part(a, Rect::new(2, 2, 3, 2), 0, 2),
+            part(a, Rect::new(2, 4, 6, 1), 0, 4),
+            part(b, Rect::new(10, 8, 3, 1), 2, 0),
+        ],
+        "the last row is left out"
+    );
+    // Every image cell is blank now, those left out too; the rest is as it was.
+    for y in 0..10 {
+        for x in 0..20 {
+            assert!(!buf[(x, y)].symbol().starts_with(PLACEHOLDER), "({x}, {y})");
+        }
+    }
+    assert_eq!(buf[(10, 9)].symbol(), " ");
+    assert_eq!(buf[(6, 3)].symbol(), "a");
+}
+
+#[test]
+fn parts_are_drawn_when_they_change_and_erased_when_they_go() {
+    let drawn = |area: Rect, row: u16| paint::Drawn {
+        part: part(KRAAL_ID | 1, area, 0, row),
+        picture: 1,
+        cells: (6, 5),
+        cell: (10, 20),
+    };
+    let mut painted = paint::Painted::default();
+    let whole = drawn(Rect::new(2, 1, 6, 4), 0);
+    assert!(painted.stale(std::slice::from_ref(&whole)).is_empty());
+    assert_eq!(painted.update(vec![whole.clone()], |_| false), vec![whole.clone()], "new: drawn");
+    // Nothing changed: nothing to do.
+    assert!(painted.stale(std::slice::from_ref(&whole)).is_empty());
+    assert!(painted.update(vec![whole.clone()], |_| false).is_empty());
+    // Text written over its cells (a toast that came and went) takes it off: drawn again.
+    assert_eq!(painted.update(vec![whole.clone()], |r| r.y == 1), vec![whole.clone()]);
+    assert!(painted.update(vec![whole.clone()], |r| r.y == 0).is_empty());
+    // Scrolled up by a row: where it was is erased, and it is drawn where it is.
+    let up = drawn(Rect::new(2, 0, 6, 4), 1);
+    assert_eq!(painted.stale(std::slice::from_ref(&up)), vec![whole.part.area]);
+    assert_eq!(painted.update(vec![up.clone()], |_| false), vec![up.clone()]);
+    // Partly covered by a floating pane: the parts left are drawn, the whole erased.
+    let (top, left) = (drawn(Rect::new(2, 0, 6, 1), 1), drawn(Rect::new(2, 1, 3, 3), 2));
+    let covered = vec![top.clone(), left.clone()];
+    assert_eq!(painted.stale(&covered), vec![up.part.area]);
+    assert_eq!(painted.update(covered.clone(), |_| false), covered);
+    // Uncovered: whole again.
+    assert_eq!(painted.stale(std::slice::from_ref(&up)), vec![top.part.area, left.part.area]);
+    assert_eq!(painted.update(vec![up.clone()], |_| false), vec![up.clone()]);
+    // Another picture, or cells of another size: drawn again in the same place.
+    let other = paint::Drawn { picture: 2, ..up.clone() };
+    assert_eq!(painted.stale(std::slice::from_ref(&other)), vec![up.part.area]);
+    assert_eq!(painted.update(vec![other.clone()], |_| false), vec![other.clone()]);
+    let bigger = paint::Drawn { cell: (9, 18), ..other.clone() };
+    assert_eq!(painted.update(vec![bigger.clone()], |_| false), vec![bigger.clone()]);
+    // A cleared terminal shows nothing: everything is drawn.
+    painted.clear();
+    assert!(painted.stale(&[]).is_empty());
+    assert_eq!(painted.update(vec![bigger.clone()], |_| false), vec![bigger]);
+    // The pixels of a part stop at the last whole band of six.
+    assert_eq!(paint::pixels(&part(1, Rect::new(4, 2, 3, 2), 1, 2), (10, 20)), (10, 40, 30, 36));
+    assert_eq!(paint::pixels(&part(1, Rect::new(4, 2, 3, 2), 1, 2), (9, 18)), (9, 36, 27, 36));
+    assert_eq!(paint::pixels(&part(1, Rect::new(4, 2, 1, 1), 0, 0), (2, 5)), (0, 0, 2, 5));
+    let mut out = Vec::new();
+    paint::erase(Rect::new(4, 2, 3, 2), &mut out);
+    assert_eq!(out, b"\x1b[3;5H\x1b[3X\x1b[4;5H\x1b[3X");
+}
+
+#[test]
+fn an_image_that_moves_is_drawn_once_it_stays_put() {
+    use std::time::{Duration, Instant};
+    let still = Duration::from_millis(100);
+    let ms = Duration::from_millis;
+    let at =
+        |area: Rect, row: u16| paint::Drawn { part: part(7, area, 0, row), picture: 1, cells: (4, 4), cell: (10, 20) };
+    let mut motion = paint::Motion::default();
+    let t0 = Instant::now();
+    // Seen for the first time, or in the same place: drawn at once.
+    assert!(motion.track(&[at(Rect::new(2, 10, 4, 4), 0)], t0, still).is_empty());
+    assert!(motion.track(&[at(Rect::new(2, 10, 4, 4), 0)], t0 + ms(10), still).is_empty());
+    // Output scrolls it up a row at a time: it waits until it has stayed put long enough.
+    let t1 = t0 + ms(20);
+    assert_eq!(motion.track(&[at(Rect::new(2, 9, 4, 4), 0)], t1, still), HashMap::from([(7, t1 + still)]));
+    let t2 = t0 + ms(40);
+    assert_eq!(motion.track(&[at(Rect::new(2, 8, 4, 4), 0)], t2, still), HashMap::from([(7, t2 + still)]));
+    assert_eq!(motion.track(&[at(Rect::new(2, 8, 4, 4), 0)], t2 + ms(50), still), HashMap::from([(7, t2 + still)]));
+    assert!(motion.track(&[at(Rect::new(2, 8, 4, 4), 0)], t2 + still, still).is_empty(), "drawn where it stopped");
+    // Covered in part, or cut by the pane's top edge: it has not moved.
+    let t3 = t2 + ms(200);
+    assert!(motion.track(&[at(Rect::new(2, 9, 4, 3), 1)], t3, still).is_empty());
+    assert!(motion.track(&[at(Rect::new(2, 8, 4, 1), 0), at(Rect::new(2, 10, 4, 2), 2)], t3, still).is_empty());
+    // Gone, then back elsewhere: drawn at once.
+    assert!(motion.track(&[], t3 + ms(10), still).is_empty());
+    assert!(motion.track(&[at(Rect::new(2, 3, 4, 4), 0)], t3 + ms(20), still).is_empty());
+}
+
+#[test]
+fn sixel_output_decodes_to_the_pixels_it_was_given() {
+    use quantize::{CLEAR, Indexed};
+    let palette = vec![[255, 0, 0], [0, 0, 255], [10, 200, 30]];
+    let pixels: Vec<u8> = (0..5 * 8).map(|i| [0, 1, 2, CLEAR, 1][(i * 7 % 11) % 5]).collect();
+    let image = Indexed { width: 5, height: 8, palette: palette.clone(), pixels: pixels.clone() };
+    let check = |x: u32, y: u32, w: u32, h: u32| {
+        let mut out = Vec::new();
+        sixel::encode(&image, x, y, w, h, &mut out);
+        let start = format!("\x1bP0;1;0q\"1;1;{w};{h}");
+        assert!(out.starts_with(start.as_bytes()) && out.ends_with(b"\x1b\\"), "{:?}", String::from_utf8_lossy(&out));
+        let decoded = sixel::decode(&out[b"\x1bP0;1;0q".len()..out.len() - 2]).unwrap();
+        assert_eq!((decoded.width, decoded.height), (w, h));
+        for py in 0..h {
+            for px in 0..w {
+                let want = pixels[((y + py) * 5 + x + px) as usize];
+                let at = ((py * w + px) * 4) as usize;
+                let got = &decoded.pixels[at..at + 4];
+                if want == CLEAR {
+                    assert_eq!(got[3], 0, "({px}, {py}) stays transparent");
+                } else {
+                    let c = palette[usize::from(want)];
+                    assert!((0..3).all(|i| got[i].abs_diff(c[i]) <= 3) && got[3] == 255, "({px}, {py}): {got:?}");
+                }
+            }
+        }
+    };
+    check(0, 0, 5, 8);
+    check(1, 2, 3, 5);
+    // Long runs are repeated, not written out; a part outside the image is nothing.
+    let flat = Indexed { width: 40, height: 6, palette: vec![[0, 0, 0]], pixels: vec![0; 240] };
+    let mut out = Vec::new();
+    sixel::encode(&flat, 0, 0, 40, 6, &mut out);
+    assert_eq!(out, b"\x1bP0;1;0q\"1;1;40;6#0;2;0;0;0#0!40~\x1b\\");
+    let mut out = Vec::new();
+    sixel::encode(&flat, 40, 0, 10, 6, &mut out);
+    assert!(out.is_empty());
+}
+
+#[test]
+fn pictures_are_fitted_to_their_cells_and_reduced_to_a_palette() {
+    use quantize::{CLEAR, fit, quantize};
+    // A few colours: the picture's own, transparent pixels apart.
+    let (palette, indices) = quantize(&[255, 0, 0, 255, 0, 0, 255, 255, 255, 0, 0, 255, 9, 9, 9, 0]);
+    assert_eq!(palette, vec![[255, 0, 0], [0, 0, 255]]);
+    assert_eq!(indices, vec![0, 1, 0, CLEAR]);
+    // Thousands: a palette learnt from them, close to each.
+    let rgba: Vec<u8> = (0..64 * 64u32).flat_map(|i| [(i % 64 * 4) as u8, (i / 64 * 4) as u8, 128, 255]).collect();
+    let (palette, indices) = quantize(&rgba);
+    assert!(palette.len() <= 255);
+    let error: u32 = rgba
+        .chunks_exact(4)
+        .zip(&indices)
+        .map(|(p, i)| (0..3).map(|c| u32::from(p[c].abs_diff(palette[usize::from(*i)][c]))).sum::<u32>())
+        .sum();
+    assert!(error / (64 * 64 * 3) <= 6, "mean error {}", error / (64 * 64 * 3));
+    // Twice as wide as tall in a square box: scaled to its width, centred, the rest clear.
+    let image = image::RgbaImage::from_pixel(2, 1, image::Rgba([0, 255, 0, 255]));
+    let fitted = fit(&image, 10, 10);
+    assert_eq!((fitted.width, fitted.height, fitted.palette.clone()), (10, 10, vec![[0, 255, 0]]));
+    let rows: Vec<bool> = fitted.pixels.chunks(10).map(|r| r.iter().all(|p| *p == 0)).collect();
+    assert_eq!(rows, [false, false, true, true, true, true, true, false, false, false]);
+    assert!(fitted.pixels[..20].iter().chain(&fitted.pixels[70..]).all(|p| *p == CLEAR));
+}

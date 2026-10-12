@@ -215,7 +215,11 @@ impl Pane {
         let cols = cols.max(2);
         let rows = rows.max(1);
         let content = if let Some(path) = &spec.preview {
-            Content::Preview(Box::new(Preview::open(path)))
+            let mut preview = Preview::open(path);
+            if env.graphics.enabled() {
+                preview.set_graphics(env.graphics.clone());
+            }
+            Content::Preview(Box::new(preview))
         } else {
             Content::Term(Box::new(TermPane::spawn(id, &spec, cols, rows, env, tx)?))
         };
@@ -417,10 +421,28 @@ impl Pane {
     }
 
     /// Make the image placeholders `area` shows from this pane displayable, or blank when the
-    /// client cannot show images.
-    pub fn show_images(&self, area: Rect, buf: &mut Buffer, can_show: bool) {
-        if let Content::Term(t) = &self.content {
-            t.graphics.show_cells(area, buf, can_show);
+    /// client cannot show images. A preview's image becomes placeholders when it can.
+    pub fn show_images(&mut self, area: Rect, buf: &mut Buffer, can_show: bool) {
+        let size = (self.cols, self.rows);
+        match &mut self.content {
+            Content::Term(t) => t.graphics.show_cells(area, buf, can_show),
+            Content::Preview(p) if can_show => {
+                p.show_image(area, size, buf);
+            }
+            _ => {}
+        }
+    }
+
+    /// The images this pane shows, by kraal's id.
+    pub fn images(&self) -> Vec<(u32, crate::graphics::Live)> {
+        match &self.content {
+            Content::Term(t) => t
+                .graphics
+                .shown()
+                .map(|(kid, s)| (kid, (s.generation, s.picture.clone(), s.placements.clone())))
+                .collect(),
+            Content::Preview(p) => p.image().into_iter().collect(),
+            Content::Files(_) => Vec::new(),
         }
     }
 

@@ -305,6 +305,54 @@ fn image_transparency_and_odd_heights() {
 }
 
 #[test]
+fn image_is_shown_as_an_image_where_the_terminal_can() {
+    use crate::graphics::placeholder;
+    let dir = TempDir::new("picture");
+    let path = png(&dir, "tiny.png", 2, &[RED, GREEN, BLUE, WHITE]);
+    let area = Rect::new(0, 0, 10, 4);
+    // Images turned off: half blocks only.
+    let mut plain = Preview::loaded(&path);
+    assert!(!plain.show_image(area, (10, 4), &mut Buffer::empty(area)));
+    let shared = std::sync::Arc::new(crate::graphics::Shared::new(true, 64 << 20));
+    shared.set_cell(10, 20);
+    let mut preview = Preview::open(&path);
+    preview.set_graphics(shared.clone());
+    preview.apply(super::Loaded::read(&path, true));
+    assert!(preview.image().is_none(), "sent once shown");
+    assert!(shared.used() > 0, "it counts in the images' memory");
+    // 10×4 cells of 10×20 pixels: the square image fits in 80×80 pixels, 8 columns by 4 rows,
+    // centred.
+    let (mut buf, _) = render(&mut preview, 10, 4);
+    let before = shared.version();
+    assert!(preview.show_image(area, (10, 4), &mut buf));
+    assert_ne!(shared.version(), before);
+    let (kid, (generation, picture, placements)) = preview.image().unwrap();
+    assert_eq!((picture.width, picture.height, placements), (2, 2, vec![(0, 8, 4)]));
+    drop(picture);
+    assert_eq!(buf[(1, 0)].symbol(), placeholder(kid, 0, 0));
+    assert_eq!(buf[(8, 3)].symbol(), placeholder(kid, 3, 7));
+    assert_eq!(buf[(1, 0)].fg, Color::Rgb((kid >> 16) as u8, (kid >> 8) as u8, kid as u8));
+    assert_eq!((buf[(0, 0)].symbol(), buf[(9, 3)].symbol()), (" ", " "), "no half blocks left");
+    // A smaller client shows the top left of the same placement: nothing changes.
+    let small = Rect::new(0, 0, 5, 2);
+    let mut cut = Buffer::empty(small);
+    let before = shared.version();
+    preview.show_image(small, (10, 4), &mut cut);
+    assert_eq!(cut[(4, 1)].symbol(), placeholder(kid, 1, 3));
+    assert_eq!((preview.image().unwrap().1.0, shared.version()), (generation, before));
+    // A pane of another size is another placement.
+    let half = Rect::new(0, 0, 10, 2);
+    preview.show_image(half, (10, 2), &mut Buffer::empty(half));
+    let (_, (later, _, placements)) = preview.image().unwrap();
+    assert_eq!((later, placements), (generation + 1, vec![(0, 4, 2)]));
+    // Closed: its memory is freed, and the terminals forget it.
+    let before = shared.version();
+    drop(preview);
+    assert_ne!(shared.version(), before);
+    assert_eq!(shared.used(), 0);
+}
+
+#[test]
 fn image_sniffed_without_extension_and_decode_errors() {
     let dir = TempDir::new("sniff");
     let real = png(&dir, "real.png", 1, &[RED]);
@@ -519,7 +567,7 @@ fn read_when_changed(preview: &mut Preview) {
         assert!(started.elapsed() < std::time::Duration::from_secs(5), "the change was not seen");
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
-    preview.apply(super::Loaded::read(preview.path()));
+    preview.apply(super::Loaded::read(preview.path(), false));
 }
 
 #[test]
@@ -530,7 +578,7 @@ fn reload_follows_file_changes() {
     let mut preview = Preview::open(&path);
     assert!(preview.modified_since_load());
     assert_eq!(preview.visible_text(), "loading…");
-    preview.apply(super::Loaded::read(&path));
+    preview.apply(super::Loaded::read(&path, false));
     assert!(!preview.modified_since_load());
     fs::write(&path, "second version\n").unwrap();
     read_when_changed(&mut preview);

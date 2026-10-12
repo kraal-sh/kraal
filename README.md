@@ -141,8 +141,10 @@ agents are too.
 kraal is young. Linux is used every day; macOS passes the whole test suite on every release but
 nobody uses it daily yet; Windows is not supported. Known gaps:
 
-- Images in panes need a terminal that draws kitty graphics with Unicode placeholders (Ghostty,
-  kitty).
+- Images in panes and previews need a terminal that draws kitty graphics with Unicode
+  placeholders (Ghostty, kitty) or sixel (foot, WezTerm, Konsole, Windows Terminal…); elsewhere
+  their cells stay blank, and previews use half blocks. Over sixel, an image that output scrolls
+  shows again once it stays put, and never on the window's last row.
 - Agent states come from hooks for Claude Code and eight other agents, and for what Gemini CLI's,
   Codex's, Cursor's and Augment's hooks tell; otherwise they are read from the screen and can lag.
 

@@ -82,10 +82,12 @@ on_done = true
 long_command = 30
 
 [graphics]
-# Images programs draw in panes (kitty graphics protocol, sixel), shown when your terminal draws
-# kitty graphics over Unicode placeholders (Ghostty, kitty); blank elsewhere.
+# Images programs draw in panes (kitty graphics protocol, sixel) and image previews, shown when
+# your terminal draws kitty graphics over Unicode placeholders (Ghostty, kitty) or sixel (foot,
+# WezTerm, Konsole…); blank elsewhere, and previews use half blocks.
 enabled = true
-# Memory kept for the images of all panes, in MB; the oldest go first.
+# Memory kept for the images of all panes, in MB; the oldest go first. Images ready to draw as
+# sixel take at most a quarter of it again.
 memory_mb = 256
 
 [contexts]

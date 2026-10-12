@@ -1,9 +1,10 @@
 //! Rich file previews rendered into a ratatui [`Buffer`].
 //!
 //! A [`Preview`] shows a file or directory instead of a shell: rendered
-//! Markdown, an image drawn with Unicode half blocks, plain text with line
-//! numbers, a directory listing, or a short note for binary files. Errors are
-//! rendered inside the area rather than returned, so a preview never fails.
+//! Markdown, an image (drawn by the terminal when it shows images, with Unicode
+//! half blocks otherwise), plain text with line numbers, a directory listing,
+//! or a short note for binary files. Errors are rendered inside the area rather
+//! than returned, so a preview never fails.
 
 mod half_blocks;
 mod load;
@@ -115,7 +116,7 @@ const BULLETS: [&str; 4] = ["•", "◦", "▪", "▫"];
 pub enum PreviewKind {
     /// Rendered Markdown (`.md`, `.markdown`).
     Markdown,
-    /// A raster image drawn with half blocks.
+    /// A raster image: drawn by the terminal where it shows images, with half blocks elsewhere.
     Image,
     /// UTF-8 text with a line-number gutter.
     Text,
@@ -149,6 +150,19 @@ pub struct Preview {
     layout: Option<(u16, Vec<Line<'static>>)>,
     /// Image scaled for one area size.
     scaled: Option<((u16, u16), RgbaImage)>,
+    /// What the panes' images share: set when the terminals may be sent the image itself.
+    graphics: Option<Arc<crate::graphics::Shared>>,
+    /// The image as terminals that show images get it.
+    picture: Option<TerminalImage>,
+}
+
+/// An image preview as terminals that show images get it, under kraal's id for it.
+struct TerminalImage {
+    kid: u32,
+    picture: Arc<crate::graphics::Picture>,
+    /// The cells it takes, once shown, and how many times that changed.
+    cells: Option<(u16, u16)>,
+    generation: u64,
 }
 
 impl fmt::Debug for Preview {
@@ -165,6 +179,7 @@ impl fmt::Debug for Preview {
 impl Drop for Preview {
     fn drop(&mut self) {
         self.watch.stop.store(true, Ordering::Relaxed);
+        self.drop_picture();
     }
 }
 
@@ -211,14 +226,21 @@ impl Preview {
             view: None,
             layout: None,
             scaled: None,
+            graphics: None,
+            picture: None,
         }
+    }
+
+    /// Show images as images (on terminals that can) rather than half blocks.
+    pub fn set_graphics(&mut self, graphics: Arc<crate::graphics::Shared>) {
+        self.graphics = Some(graphics);
     }
 
     /// A preview read now, on this thread.
     #[cfg(test)]
     pub fn loaded(path: &Path) -> Preview {
         let mut preview = Preview::open(path);
-        preview.apply(Loaded::read(path));
+        preview.apply(Loaded::read(path, false));
         preview
     }
 
@@ -252,6 +274,56 @@ impl Preview {
         self.pending = false;
         self.layout = None;
         self.scaled = None;
+        self.drop_picture();
+        if let (Some(shared), Content::Image(image)) = (&self.graphics, &mut self.content)
+            && let Some(png) = image.png.take()
+        {
+            let (width, height) = image.pixels.dimensions();
+            self.picture = Some(TerminalImage {
+                kid: shared.new_id(),
+                picture: crate::graphics::Picture::new(png, width, height, shared),
+                cells: None,
+                generation: 0,
+            });
+        }
+    }
+
+    /// The image goes; terminals that were sent it forget it.
+    fn drop_picture(&mut self) {
+        if self.picture.take().is_some_and(|p| p.cells.is_some())
+            && let Some(shared) = &self.graphics
+        {
+            shared.changed();
+        }
+    }
+
+    /// Draw the image in `area` as the placeholder cells of a terminal that shows images,
+    /// centred in the pane's `size`; false when there is no such image.
+    pub fn show_image(&mut self, area: Rect, size: (u16, u16), buf: &mut Buffer) -> bool {
+        let (Some(shared), Some(picture)) = (&self.graphics, &mut self.picture) else { return false };
+        if !matches!(self.content, Content::Image(_)) {
+            return false;
+        }
+        let cells = fit_cells((picture.picture.width, picture.picture.height), size, shared.cell());
+        if picture.cells != Some(cells) {
+            picture.cells = Some(cells);
+            picture.generation += 1;
+            shared.changed();
+        }
+        for p in area.intersection(buf.area).positions() {
+            buf[p].reset();
+        }
+        let at = (area.x + (size.0.saturating_sub(cells.0)) / 2, area.y + (size.1.saturating_sub(cells.1)) / 2);
+        crate::graphics::write_placeholders(buf, area, at, picture.kid, cells.0, cells.1);
+        true
+    }
+
+    /// The image shown as an image, by kraal's id: the generation of its placement, the
+    /// picture and the placement.
+    pub fn image(&self) -> Option<(u32, crate::graphics::Live)> {
+        let p = self.picture.as_ref()?;
+        let (cols, rows) = p.cells?;
+        Some((p.kid, (p.generation, p.picture.clone(), vec![(0, cols, rows)])))
     }
 
     pub fn path(&self) -> &Path {
@@ -452,12 +524,28 @@ pub struct Loaded {
 }
 
 impl Loaded {
-    pub fn read(path: &Path) -> Loaded {
+    /// With `images`, an image is also kept as PNG, for the terminals that show images.
+    pub fn read(path: &Path, images: bool) -> Loaded {
         // Stamp first, so a write racing with the read is seen as a change.
         let stamp = Stamp::of(path);
-        let (kind, content) = load(path);
+        let (kind, mut content) = load(path);
+        if images && let Content::Image(image) = &mut content {
+            let (width, height) = image.pixels.dimensions();
+            image.png = crate::graphics::encode_png(width, height, image.pixels.as_raw()).ok();
+        }
         Loaded { stamp, kind, content }
     }
+}
+
+/// The cells an image of `width × height` pixels takes in a pane of `size` cells of `cell`
+/// pixels: as many as fit, its proportions kept.
+fn fit_cells((width, height): (u32, u32), size: (u16, u16), cell: (u16, u16)) -> (u16, u16) {
+    let (cw, ch) = (f64::from(cell.0.max(1)), f64::from(cell.1.max(1)));
+    let (w, h) = (f64::from(width.max(1)), f64::from(height.max(1)));
+    let scale = (f64::from(size.0) * cw / w).min(f64::from(size.1) * ch / h);
+    let most = crate::graphics::DIACRITICS.len() as f64;
+    let fit = |v: f64, max: u16| (v - 1e-6).ceil().clamp(1.0, f64::from(max.max(1)).min(most)) as u16;
+    (fit(w * scale / cw, size.0), fit(h * scale / ch, size.1))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -490,6 +578,8 @@ struct ImageData {
     width: u32,
     height: u32,
     format: Option<ImageFormat>,
+    /// The pixels as PNG, when terminals may be sent the image.
+    png: Option<Vec<u8>>,
 }
 
 impl ImageData {
