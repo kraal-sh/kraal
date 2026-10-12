@@ -126,7 +126,7 @@ impl Encoder {
     /// the same synchronized update. The cells of `kept` are taken to be unchanged since the
     /// previous frame (where they can be skipped without changing what the diff finds around
     /// them).
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments, reason = "the parts of a frame, which the renderer builds separately")]
     pub fn encode_with_images(
         &mut self,
         next: &Buffer,
@@ -327,7 +327,7 @@ impl Widths {
 }
 
 /// Whether ratatui's diff passes over a cell without looking at it.
-#[allow(deprecated)]
+#[expect(deprecated, reason = "ratatui's diff still honours `Cell::skip`, so this must read it too")]
 fn skipped(cell: &Cell) -> bool {
     matches!(cell.diff_option, CellDiffOption::Skip) || (cell.skip && matches!(cell.diff_option, CellDiffOption::None))
 }

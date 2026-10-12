@@ -162,7 +162,7 @@ impl Server {
     }
 
     /// [`Server::launch_agent`], giving the agent `args` too.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments, reason = "the arguments of `launch_agent`, and the agent's own")]
     pub fn launch_agent_with(
         &mut self,
         ws: u32,

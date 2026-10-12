@@ -176,21 +176,21 @@ pub fn background_jobs(leader: u32) -> Vec<Vec<String>> {
 }
 
 /// Whether a process with this id exists, zombies included.
-#[cfg_attr(target_os = "linux", allow(dead_code))]
+#[cfg_attr(target_os = "linux", expect(dead_code, reason = "macOS only: Linux reads /proc"))]
 fn exists(pid: libc::pid_t) -> bool {
     // SAFETY: signal 0 only checks that the process exists and may be signalled.
     unsafe { libc::kill(pid, 0) == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM) }
 }
 
 /// Split NUL-separated strings, skipping empty ones (Linux `/proc` files).
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[cfg_attr(all(not(target_os = "linux"), not(test)), expect(dead_code, reason = "Linux only, tested everywhere"))]
 fn nul_strings(raw: &[u8]) -> Vec<String> {
     raw.split(|b| *b == 0).filter(|s| !s.is_empty()).map(|s| String::from_utf8_lossy(s).into_owned()).collect()
 }
 
 /// Parse a `KERN_PROCARGS2` buffer (macOS): argc, the executable path, padding, argv, then
 /// the environment.
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+#[cfg_attr(all(not(target_os = "macos"), not(test)), expect(dead_code, reason = "macOS only, tested everywhere"))]
 fn parse_procargs2(buf: &[u8]) -> Option<(Vec<String>, Vec<String>)> {
     let argc = i32::from_ne_bytes(buf.get(..4)?.try_into().ok()?) as usize;
     let rest = &buf[4..];
@@ -205,7 +205,7 @@ fn parse_procargs2(buf: &[u8]) -> Option<(Vec<String>, Vec<String>)> {
 }
 
 /// Ports in `lsof -Fn` output (macOS).
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+#[cfg_attr(all(not(target_os = "macos"), not(test)), expect(dead_code, reason = "macOS only, tested everywhere"))]
 fn parse_lsof(text: &str) -> HashSet<u16> {
     text.lines()
         .filter_map(|l| l.strip_prefix('n'))
