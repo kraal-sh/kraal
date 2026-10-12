@@ -22,6 +22,10 @@ kraal notify "deploy" "finished"
 
 Panes are referred to by id, by name, or as `workspace:name`.
 
+Scripts keep working when kraal is updated while a session runs: commands work with a session
+that another kraal version started, and what the session's kraal cannot do yet fails with the
+reason and `kraal restart`, never half done ([Compatibility](compatibility.md)).
+
 `kraal agents` also lists the agents of the kraal sessions on your servers that kraal watches (see
 [Agents on your servers](servers.md#agents-on-your-servers)), after this session's own, as
 `gpu › api` in the workspace column. In `--json`, such an agent has `"kind": "remote"`, `server`
