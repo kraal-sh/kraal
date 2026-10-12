@@ -30,8 +30,8 @@ use alacritty_terminal::term::cell::{Cell, Flags};
 use alacritty_terminal::term::{Term, TermMode};
 use alacritty_terminal::vte::ansi::{
     Attr, CharsetIndex, ClearMode, Color, CursorShape, CursorStyle, Handler, Hyperlink, KeyboardModes,
-    KeyboardModesApplyBehavior, LineClearMode, Mode, ModifyOtherKeys, NamedColor, PrivateMode, Rgb, ScpCharPath,
-    ScpUpdateMode, StandardCharset, TabulationClearMode, cursor_icon::CursorIcon,
+    KeyboardModesApplyBehavior, LineClearMode, Mode, ModifyOtherKeys, NamedColor, NamedPrivateMode, PrivateMode, Rgb,
+    ScpCharPath, ScpUpdateMode, StandardCharset, TabulationClearMode, cursor_icon::CursorIcon,
 };
 
 use super::history;
@@ -986,6 +986,14 @@ impl<T: EventListener> Handler for Feed<'_, T> {
         self.term.clear_screen(mode);
     }
 
+    fn set_private_mode(&mut self, mode: PrivateMode) {
+        if mode == PrivateMode::Named(NamedPrivateMode::SwapScreenAndSetRestoreCursor) {
+            // The lens is on the history of the screen going away.
+            self.archive.drop_lens(self.term);
+        }
+        self.term.set_private_mode(mode);
+    }
+
     fn reset_state(&mut self) {
         self.archive.lines().clear();
         self.archive.lens = None;
@@ -1020,7 +1028,6 @@ impl<T: EventListener> Handler for Feed<'_, T> {
         insert_blank_lines(rows: usize);
         delete_chars(count: usize);
         reverse_index();
-        set_private_mode(mode: PrivateMode);
         unset_private_mode(mode: PrivateMode);
         decaln();
         set_title(title: Option<String>);
@@ -1246,6 +1253,24 @@ mod tests {
         assert!(b.pane.refresh_screen(COLS, ROWS).is_some());
         let grid = b.term().term.grid();
         assert!(grid.display_offset() <= grid.history_size(), "{} > {}", grid.display_offset(), grid.history_size());
+    }
+
+    #[test]
+    fn a_full_screen_program_shown_while_the_view_is_far_back_leaves_the_history_as_it_was() {
+        let mut b = Both::new();
+        b.feed(sample(4000).as_bytes());
+        let kept = b.history();
+        let before = b.pane.text(Some(kept + ROWS as usize));
+        b.pane.scroll(1500);
+        assert!(b.term().archive.lens.is_some());
+        b.feed(b"\x1b[?1049h\x1b[Hfull screen");
+        // Its screen alone: the history is the other screen's.
+        assert_eq!(b.pane.text(Some(50)), "full screen\n");
+        b.resize(COLS + 3, ROWS + 2);
+        b.resize(COLS, ROWS);
+        b.feed(b"\x1b[?1049l");
+        assert_eq!(b.history(), kept);
+        assert_eq!(b.pane.text(Some(kept + ROWS as usize)), before);
     }
 
     #[test]
