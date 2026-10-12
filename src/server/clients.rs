@@ -318,15 +318,13 @@ impl Outbox {
     /// Write `data` to the socket as far as it takes it now, unless something waits for the
     /// writer thread: what is left to queue. A message cut there goes on through the queue,
     /// which is empty then and has room for it.
+    #[cfg(target_os = "linux")]
     fn write_now(&self, data: Vec<u8>) -> Option<Vec<u8>> {
         use std::os::fd::AsRawFd;
         if self.len() > 0 {
             return Some(data);
         }
-        #[cfg(target_os = "linux")]
         let flags = libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL;
-        #[cfg(not(target_os = "linux"))]
-        let flags = libc::MSG_DONTWAIT;
         let mut done = 0;
         while done < data.len() {
             let rest = &data[done..];
@@ -344,6 +342,14 @@ impl Outbox {
             _ => Some(data[done..].to_vec()),
         }
     }
+
+    /// Everything goes through the writer thread: macOS does not let a send be told not to wait
+    /// (`MSG_DONTWAIT` waits all the same, up to the socket's timeout), and the socket itself
+    /// must wait for that thread and the reader.
+    #[cfg(not(target_os = "linux"))]
+    fn write_now(&self, data: Vec<u8>) -> Option<Vec<u8>> {
+        Some(data)
+    }
 }
 
 #[cfg(test)]
@@ -352,16 +358,42 @@ mod tests {
 
     use super::*;
 
+    /// Wait until `out` has nothing queued.
+    fn drained(out: &Outbox) {
+        let start = Instant::now();
+        while out.len() > 0 {
+            assert!(start.elapsed() < Duration::from_secs(5));
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
     #[test]
     fn what_a_client_does_not_read_yet_waits_for_it_in_order() {
+        use std::os::fd::AsRawFd;
         let (server_end, mut client_end) = UnixStream::pair().unwrap();
+        // A small send buffer, as macOS gives a socket: messages are cut often.
+        let size: libc::c_int = 8 * 1024;
+        // SAFETY: sets an int option on a socket the test holds.
+        let set = unsafe {
+            libc::setsockopt(
+                server_end.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_SNDBUF,
+                (&size as *const libc::c_int).cast(),
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            )
+        };
+        assert_eq!(set, 0);
         let out = Outbox::start(server_end, 1);
-        // Small enough to go at once.
+        // Small enough to go at once (through the writer thread where a send cannot be told not
+        // to wait).
         out.try_send(b"first".to_vec()).unwrap();
+        #[cfg(target_os = "linux")]
         assert_eq!(out.len(), 0);
         let mut first = [0u8; 5];
         client_end.read_exact(&mut first).unwrap();
         assert_eq!(&first, b"first");
+        drained(&out);
         // Far more than the socket holds: cut where it is full, the rest queued, nothing waits.
         let messages: Vec<Vec<u8>> = (0..40u8).map(|i| vec![b'a' + i % 26; 64 * 1024 + usize::from(i)]).collect();
         let start = Instant::now();
@@ -374,12 +406,9 @@ mod tests {
         let mut got = vec![0u8; want.len()];
         client_end.read_exact(&mut got).unwrap();
         assert!(got == want, "every byte, in order");
-        let start = Instant::now();
-        while out.len() > 0 {
-            assert!(start.elapsed() < Duration::from_secs(5));
-            std::thread::sleep(Duration::from_millis(5));
-        }
+        drained(&out);
         out.try_send(b"last".to_vec()).unwrap();
+        #[cfg(target_os = "linux")]
         assert_eq!(out.len(), 0, "written at once again");
         drop(out);
         let mut rest = Vec::new();
