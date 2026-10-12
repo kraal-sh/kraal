@@ -13,12 +13,6 @@ use crate::text::unix_seconds;
 pub(super) const SSH_TIMEOUT: Duration = Duration::from_secs(15);
 /// Options inserted before the destination of every listing ssh.
 const SSH_OPTIONS: [&str; 5] = ["-o", "BatchMode=yes", "-o", "ConnectTimeout=8", "-T"];
-/// Program used for remote listings. Tests use a name that cannot exist, so
-/// that nothing ever connects anywhere unless a test installs a fake.
-#[cfg(not(test))]
-const SSH_PROGRAM: &str = "ssh";
-#[cfg(test)]
-const SSH_PROGRAM: &str = "kraal-test-no-ssh";
 /// Precedes the remote listing, so that noise printed by login scripts is skipped.
 pub(super) const MARKER: &[u8] = b"KRAAL:LIST\0";
 /// The most a remote listing may print (a huge directory is cut there).
@@ -36,7 +30,7 @@ pub(super) struct Ssh {
 
 impl Default for Ssh {
     fn default() -> Self {
-        Ssh { program: SSH_PROGRAM.to_owned(), timeout: SSH_TIMEOUT }
+        Ssh { program: "ssh".to_owned(), timeout: SSH_TIMEOUT }
     }
 }
 

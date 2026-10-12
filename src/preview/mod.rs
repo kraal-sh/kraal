@@ -279,14 +279,6 @@ impl Preview {
         self.graphics = Some(graphics);
     }
 
-    /// A preview read now, on this thread.
-    #[cfg(test)]
-    pub fn loaded(path: &Path) -> Preview {
-        let mut preview = Preview::open(path);
-        preview.apply(Loaded::read(path, false));
-        preview
-    }
-
     /// The kind of content detected at the last load.
     pub fn kind(&self) -> PreviewKind {
         self.kind

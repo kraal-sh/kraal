@@ -8,9 +8,14 @@ use super::keyspec::*;
 use super::*;
 
 const NONE: Mods = Mods::NONE;
-const SHIFT: Mods = Mods::SHIFT;
+const SHIFT: Mods = Mods { shift: true, alt: false, ctrl: false };
 const ALT: Mods = Mods::ALT;
 const CTRL: Mods = Mods::CTRL;
+
+/// A synthesised key, without received bytes: [`encode_key`] encodes it from scratch.
+fn bare_key(code: KeyCode, mods: Mods) -> Key {
+    Key { code, mods, raw: Vec::new() }
+}
 
 /// Modifiers from letters: `s` shift, `a` alt, `c` ctrl.
 fn mods(s: &str) -> Mods {
@@ -729,8 +734,8 @@ fn encode_key_reencodes_extended_keys() {
     ] {
         assert_eq!(encode_key(&parse_key(seq), modes), expected, "{seq:?}");
     }
-    assert_eq!(encode_key(&Key::new(Up, NONE), app_cursor()), b"\x1bOA");
-    assert_eq!(encode_key(&Key::new(Char('c'), CTRL), modes), b"\x03");
+    assert_eq!(encode_key(&bare_key(Up, NONE), app_cursor()), b"\x1bOA");
+    assert_eq!(encode_key(&bare_key(Char('c'), CTRL), modes), b"\x03");
 }
 
 #[test]
@@ -1013,15 +1018,14 @@ fn shift_enter_reaches_kitty_panes_only() {
 
 #[test]
 fn kitty_encodings() {
-    let ctrl = Mods { ctrl: true, ..Default::default() };
-    let alt = Mods { alt: true, ..Default::default() };
-    assert_eq!(encode_kitty(KeyCode::Char('c'), ctrl, 1).unwrap(), b"\x1b[99;5u");
-    assert_eq!(encode_kitty(KeyCode::Char('H'), alt, 1).unwrap(), b"\x1b[104;4u");
-    assert_eq!(encode_kitty(KeyCode::Esc, Mods::default(), 1).unwrap(), b"\x1b[27u");
-    assert_eq!(encode_kitty(KeyCode::Char('a'), Mods::default(), 1), None, "plain text stays text");
-    assert_eq!(encode_kitty(KeyCode::Char('a'), Mods::default(), 8).unwrap(), b"\x1b[97u");
-    assert_eq!(encode_kitty(KeyCode::Enter, Mods::default(), 1), None);
-    assert_eq!(encode_kitty(KeyCode::Up, ctrl, 1), None, "arrows keep their CSI form");
+    let kitty = |flags| PaneInputModes { kitty_flags: flags, ..Default::default() };
+    assert_eq!(encode_key(&bare_key(Char('c'), CTRL), kitty(1)), b"\x1b[99;5u");
+    assert_eq!(encode_key(&bare_key(Char('H'), ALT), kitty(1)), b"\x1b[104;4u");
+    assert_eq!(encode_key(&bare_key(Esc, NONE), kitty(1)), b"\x1b[27u");
+    assert_eq!(encode_key(&bare_key(Char('a'), NONE), kitty(1)), b"a", "plain text stays text");
+    assert_eq!(encode_key(&bare_key(Char('a'), NONE), kitty(8)), b"\x1b[97u");
+    assert_eq!(encode_key(&bare_key(Enter, NONE), kitty(1)), b"\r");
+    assert_eq!(encode_key(&bare_key(Up, CTRL), kitty(1)), b"\x1b[1;5A", "arrows keep their CSI form");
     // Ctrl+C reaches a legacy pane as ETX even when received as CSI u.
     let mut p = InputParser::new();
     let ev = p.feed(b"\x1b[99;5u");
@@ -1191,7 +1195,7 @@ fn keyspec_matches() {
     let flushed = parser.flush();
     let [InputEvent::Key(key)] = flushed.as_slice() else { panic!("{flushed:?}") };
     assert!(KeySpec::parse("alt+[").unwrap().matches(key));
-    assert!(KeySpec::parse("q").unwrap().matches(&Key::new(Char('q'), NONE)));
+    assert!(KeySpec::parse("q").unwrap().matches(&bare_key(Char('q'), NONE)));
 }
 
 #[test]

@@ -35,9 +35,6 @@ pub struct Mods {
 impl Mods {
     /// No modifier.
     pub const NONE: Mods = Mods { shift: false, alt: false, ctrl: false };
-    /// Shift alone.
-    #[cfg(test)]
-    pub const SHIFT: Mods = Mods { shift: true, alt: false, ctrl: false };
     /// Alt alone.
     pub const ALT: Mods = Mods { shift: false, alt: true, ctrl: false };
     /// Ctrl alone.
@@ -97,12 +94,6 @@ pub struct Key {
 }
 
 impl Key {
-    /// A synthesised key with no received bytes; [`encode_key`] encodes it from scratch.
-    #[cfg(test)]
-    pub fn new(code: KeyCode, mods: Mods) -> Key {
-        Key { code, mods, raw: Vec::new() }
-    }
-
     /// Whether the terminal said where this key is (kitty keyboard protocol, alternate keys).
     pub fn has_place(&self) -> bool {
         decode::kitty_fields(&self.raw).is_some_and(|f| f.base != 0)

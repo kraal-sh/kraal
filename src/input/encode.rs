@@ -63,17 +63,10 @@ pub fn encode_key(key: &Key, modes: PaneInputModes) -> Vec<u8> {
     }
 }
 
-/// Kitty keyboard protocol encoding for a pane that enabled it, for the keys whose legacy
-/// encoding is ambiguous or lossy (Shift+Enter, Ctrl+Enter, Alt+letters, Esc…), and for every
-/// key with flag 8. `None` means the legacy encoding is also what the protocol sends (plain text,
-/// arrows, function keys).
-#[cfg(test)]
-pub fn encode_kitty(code: KeyCode, mods: Mods, flags: u8) -> Option<Vec<u8>> {
-    let (cp, m) = kitty_code(code, mods, flags)?;
-    Some(if m == 1 { format!("\x1b[{cp}u") } else { format!("\x1b[{cp};{m}u") }.into_bytes())
-}
-
-/// The key code and modifier field of [`encode_kitty`], when the key goes as a kitty sequence.
+/// The key code and modifier field of the kitty keyboard protocol sequence for a pane that
+/// enabled it: for the keys whose legacy encoding is ambiguous or lossy (Shift+Enter, Ctrl+Enter,
+/// Alt+letters, Esc…), and for every key with flag 8. `None` means the legacy encoding is also
+/// what the protocol sends (plain text, arrows, function keys).
 fn kitty_code(code: KeyCode, mods: Mods, flags: u8) -> Option<(u32, u32)> {
     use KeyCode::*;
     let all_keys = flags & 8 != 0;
@@ -100,10 +93,11 @@ fn kitty_code(code: KeyCode, mods: Mods, flags: u8) -> Option<(u32, u32)> {
     }
 }
 
-/// [`encode_kitty`] with what the pane's flags ask for beyond the key itself: its alternate keys
-/// (flag 4) and the text it types (flags 8 and 16). A key the terminal sent with the protocol
-/// goes on with the code and alternates the terminal gave; another one is described from what it
-/// is. The modifiers are Shift, Alt and Ctrl, without the lock keys, as for every program.
+/// The kitty sequence of `key` ([`kitty_code`]), with what the pane's flags ask for beyond the
+/// key itself: its alternate keys (flag 4) and the text it types (flags 8 and 16). A key the
+/// terminal sent with the protocol goes on with the code and alternates the terminal gave;
+/// another one is described from what it is. The modifiers are Shift, Alt and Ctrl, without the
+/// lock keys, as for every program.
 fn encode_kitty_key(key: &Key, flags: u8) -> Option<Vec<u8>> {
     let (cp, m) = kitty_code(key.code, key.mods, flags)?;
     let (cp, m, shifted, base, text) = match super::decode::kitty_fields(&key.raw) {
