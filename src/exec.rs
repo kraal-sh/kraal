@@ -36,58 +36,34 @@ impl Output {
 
 /// Put the command in its own process group, so killing it reaches its descendants.
 pub fn own_group(cmd: &mut Command) -> &mut Command {
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        cmd.process_group(0);
-    }
-    cmd
+    use std::os::unix::process::CommandExt;
+    cmd.process_group(0)
 }
 
 /// Whether anything still runs in the process group of a child started with [`own_group`]
 /// (the child itself, or what it left in the background).
 pub fn group_alive(child: &Child) -> bool {
-    #[cfg(unix)]
-    {
-        // SAFETY: signal 0 only checks that the group exists.
-        unsafe { libc::kill(-(child.id() as libc::pid_t), 0) == 0 }
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = child;
-        false
-    }
+    // SAFETY: signal 0 only checks that the group exists.
+    unsafe { libc::kill(-(child.id() as libc::pid_t), 0) == 0 }
 }
 
 /// Whether `child` has ended, without reaping it: until it is reaped, its pid (and the id of
 /// the group it leads) cannot go to another process, so [`kill_group`] still reaches only what
 /// it started.
 pub fn has_exited(child: &Child) -> bool {
-    #[cfg(unix)]
-    {
-        // SAFETY: waitid fills `info`, which we own; WNOWAIT leaves the child to be reaped later.
-        unsafe {
-            let mut info: libc::siginfo_t = std::mem::zeroed();
-            let flags = libc::WEXITED | libc::WNOHANG | libc::WNOWAIT;
-            libc::waitid(libc::P_PID, child.id() as libc::id_t, &mut info, flags) == 0 && info.si_pid() != 0
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = child;
-        false
+    // SAFETY: waitid fills `info`, which we own; WNOWAIT leaves the child to be reaped later.
+    unsafe {
+        let mut info: libc::siginfo_t = std::mem::zeroed();
+        let flags = libc::WEXITED | libc::WNOHANG | libc::WNOWAIT;
+        libc::waitid(libc::P_PID, child.id() as libc::id_t, &mut info, flags) == 0 && info.si_pid() != 0
     }
 }
 
 /// Kill a child started with [`own_group`] and everything it started, then reap it.
 pub fn kill_group(child: &mut Child) {
-    #[cfg(unix)]
-    {
-        let pid = child.id() as libc::pid_t;
-        // SAFETY: plain syscall on a process group we created.
-        unsafe {
-            libc::kill(-pid, libc::SIGKILL);
-        }
+    // SAFETY: plain syscall on a process group we created.
+    unsafe {
+        libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL);
     }
     let _ = child.kill();
     let _ = child.wait();
@@ -97,7 +73,6 @@ pub fn kill_group(child: &mut Child) {
 /// that does not answer) ends when the kernel lets it, and a thread of its own reaps it then.
 /// How it ended, if it had already.
 pub fn kill_group_nowait(mut child: Child) -> Option<std::process::ExitStatus> {
-    #[cfg(unix)]
     // SAFETY: plain syscall on a process group we created.
     unsafe {
         libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL);
@@ -117,7 +92,6 @@ pub fn kill_group_nowait(mut child: Child) -> Option<std::process::ExitStatus> {
 pub fn kill_tree(child: &mut Child) {
     // Listed while the child lives: once it is gone, its orphans are no longer its descendants.
     let tree = crate::process::descendants(child.id());
-    #[cfg(unix)]
     for pid in tree {
         // SAFETY: plain syscall on our own live descendants.
         unsafe {
@@ -203,7 +177,6 @@ pub const TAG: &str = "KRAAL_RUN_TAG";
 /// tag left behind, daemons that left its process tree included (unless they cleared their
 /// environment).
 pub fn kill_tagged(tag: &str) {
-    #[cfg(unix)]
     for pid in crate::process::tagged(TAG, tag) {
         // SAFETY: plain syscall on our own processes, started under this tag.
         unsafe {
@@ -343,7 +316,6 @@ pub fn reap_later(mut child: Child) {
 /// once nothing runs in it.
 pub fn wait_gone(pids: &[u32], timeout: Duration) -> bool {
     let start = Instant::now();
-    #[cfg(unix)]
     loop {
         // SAFETY: signal 0 only checks that the process, or a process of the group, exists.
         let alive = pids
@@ -356,11 +328,6 @@ pub fn wait_gone(pids: &[u32], timeout: Duration) -> bool {
             return false;
         }
         std::thread::sleep(Duration::from_millis(20));
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = (pids, start, timeout);
-        true
     }
 }
 
@@ -660,7 +627,6 @@ mod tests {
         let _ = child.wait();
     }
 
-    #[cfg(unix)]
     #[test]
     fn an_ended_child_keeps_its_pid_until_reaped() {
         let mut child = own_group(&mut sh("exit 3")).stdin(Stdio::null()).spawn().unwrap();

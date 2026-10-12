@@ -162,13 +162,7 @@ pub(super) fn read_directory(path: &Path) -> anyhow::Result<Vec<DirEntry>> {
     Ok(entries)
 }
 
-#[cfg(unix)]
 pub(super) fn is_executable(meta: &fs::Metadata) -> bool {
     use std::os::unix::fs::PermissionsExt;
     meta.is_file() && meta.permissions().mode() & 0o111 != 0
-}
-
-#[cfg(not(unix))]
-pub(super) fn is_executable(_meta: &fs::Metadata) -> bool {
-    false
 }

@@ -486,7 +486,6 @@ mod tests {
         assert!(toml::from_str::<ToolDef>("command = \"x\"\ntypo = 1").is_err());
     }
 
-    #[cfg(unix)]
     #[test]
     fn secrets_reach_the_command_but_no_argument_list() {
         let dir = std::env::temp_dir().join(format!("kraal-secrets-{}", std::process::id()));
