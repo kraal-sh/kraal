@@ -27,7 +27,8 @@ any keyboard layout.
 | run | `r` tools where the pane is | `R`: `r` tools, `b` runbooks, `g` git and worktrees |
 
 Inside every menu the same letters do the same things: `n` new, `x` close, `e` rename, arrows
-previous and next, and the theme's letter its main action again.
+previous and next, and the theme's letter (or Enter) its main action again. Backspace goes back
+to the menu before, Esc closes.
 
 | Other keys after `ctrl+b` | |
 |---|---|
@@ -35,7 +36,7 @@ previous and next, and the theme's letter its main action again.
 | `m` | mark this pane for broadcast |
 | `o` | open a link, a path, a commit on screen (hints) |
 | `g` (or `/`) | search the output |
-| `=` | paste buffers: what you copied, to paste again (tmux's key) |
+| `=` | paste buffers: what you copied, to paste again |
 | arrows · `1`…`9` | focus the pane on that side · go to a tab |
 | `space` | search every command by what it does (and see its keys) |
 | `h` (or `?`) | help: every key, from your configuration |
@@ -47,7 +48,9 @@ Without the prefix: `alt+arrows` move the focus (left/right at the edge go to th
 `alt+n` opens a new pane, `alt+a` jumps to the next agent that needs you.
 
 `[keys] preset = "classic"` switches to single-key commands (`%` `"` `c` `n` `p`
-`o` `s` `=`…), still with the menu; there `d` or `q` detaches and `Q` quits.
+`o` `s` `=`…), still with the menu; there `d` or `q` detaches and `Q` quits. The other pages give
+the keys of the default preset: with another preset or keys of your own, the menu, the help
+(`ctrl+b h` here) and `kraal config keys` show yours.
 
 ## The bottom bar
 
@@ -61,11 +64,14 @@ keys that do it in your keymap, and the menu key at the right end:
 | in a git repository | git and worktrees `ctrl+b R g`, tools `ctrl+b r`, new pane `alt+n`, split `ctrl+b P →`, start an agent `ctrl+b a` |
 | a shell | new pane, split, connect to a server `ctrl+b s`, start an agent |
 | a preview | its own keys: `↑↓` scroll, `r` reload, `q` close |
+| the file manager | new pane, split (its own keys are in its footer) |
 
-A click on an action runs it, and a click on the menu key opens the menu. When the terminal is
-narrow, actions give way from the right. `ctrl+b V k` hides the bar, or shows it again, for the
-session; `[bar] keys = "off"` in the configuration hides it for good. Without it, the panes take
-the row and the menu key goes to the top bar.
+An agent counts before its server, and a server before a repository. A click on an action runs
+it, and a click on the menu key opens the menu. When the terminal is narrow, actions give way
+from the right; in copy mode, a list or a question, the bar keeps only what the pane is.
+`ctrl+b V k` hides the bar, or shows it again, for the session; `[bar] keys = "off"` in the
+configuration hides it for good. Without it, the panes take the row and the menu key goes to the
+top bar.
 
 ## Stacks and layouts
 
@@ -81,24 +87,51 @@ splits the whole stack's place.
 `ctrl+b P l` arranges the tab's panes in the next layout, in their order and with the focus where
 it was: even columns, even rows, the first pane on the left and the others in a column on the
 right, the same with the others stacked, the first pane on top and the others in a row below, a
-grid. The tab keeps its layout as panes come and go, until you resize, split or stack by hand.
+grid. The first pane takes three fifths where it is the main one, the top bar names the layout
+(`Layout: even rows`), and a layout that would look like one before it is skipped (with three
+panes, the grid is the even columns). The tab keeps its layout as panes come and go, until you
+resize, split or stack by hand.
 
 In the classic preset: `E` the next layout, `M` then an arrow (or `hjkl`) to stack, `u` to
 unstack.
 
+## Copy mode, search and resizing
+
+`ctrl+b v` enters copy mode, where the keys move in the pane's text, its scrollback included:
+
+| Copy mode | |
+|---|---|
+| arrows, `h` `j` `k` `l` | move |
+| `w` · `b` · `e` | next word · previous word · end of word |
+| `0` · `$` (or `home` · `end`) | start · end of the line |
+| `g` · `G` | top · bottom |
+| `pageup` · `pagedown` | a page up · down (`ctrl+u` · `ctrl+d`: half a page) |
+| `v` · `V` · `ctrl+v` | select characters · lines · a block |
+| `y` (or Enter) | copy the selection and leave |
+| `/` · `n` · `N` | search · next match · previous match |
+| `p` · `P` | the prompt above · below, with a shell that marks its commands ([Shell commands](terminal.md#shell-commands)) |
+| `o` · `O` | select the output of the command at the cursor · the whole command |
+| `q` (or Esc) | leave |
+
+`ctrl+b g` searches the output: type the text, `↑↓` go to an older or newer match, Enter keeps
+the match and goes on in copy mode, Esc cancels. `ctrl+b P r` resizes: the arrows (or `hjkl`)
+move the focused pane's border, Enter or Esc ends it.
+
 ## Lists, fields and questions
 
 In lists, type to filter, `↑↓` move, Enter chooses, **Tab shows what else can be done** with the
-selected item (connect in a new tab, browse its files, run a command…), Esc closes. Text fields edit
-like a shell line (arrows, `home`/`end`, `alt+←→`, `ctrl+w`, `ctrl+u`, `ctrl+k`). Questions show
-two buttons, Cancel first: `y` answers yes, `n` or Esc no, Enter takes the selected button.
+selected item (connect in a new tab, browse its files, run a command…), each also on a key of its
+own that the list shows, Esc closes. Text fields edit like a shell line (arrows, `home`/`end`,
+`alt+←→`, `ctrl+w`, `ctrl+u`, `ctrl+k`). Questions show two buttons, Cancel first: `y` answers
+yes, `n` or Esc no, Enter takes the selected button (`←→` or Tab change it), and `↑↓` scroll a
+long question.
 `ctrl+b V j` lists the messages kraal showed, warnings included.
 
 ## Your own keys
 
 Every command and every menu can move, in `~/.config/kraal/config.toml`:
 
-```toml
+```toml config
 [keys]
 prefix = ["ctrl+b"]          # several are fine: ["ctrl+b", "ctrl+space"]
 
@@ -112,11 +145,11 @@ menu_servers = ["M"]         # a menu moves too: servers, broadcast, workspaces,
 new_pane = ["alt+n"]
 ```
 
-`kraal config keys` prints every key, menu and mode, with the names to use here (`--markdown`
-for a sheet to keep or print); `kraal config check` reports a key bound twice or a sequence that
-hides another; `kraal config reload` applies the file to the running session (keys, theme,
-sidebar, bottom bar, mouse, frames, tools, hints, hooks; new panes take a new shell or scrollback
-length).
+`kraal config keys` prints every key, menu and mode, with the names to use here
+(`kraal config keys --markdown` for a sheet to keep or print); `kraal config check` reports a key
+bound twice or a sequence that hides another; `kraal config reload` applies the file to the
+running session (keys, theme, sidebar, bottom bar, mouse, frames, tools, hints, hooks; new panes
+take a new shell or scrollback length).
 
 ## Mouse
 
@@ -124,17 +157,18 @@ The mouse works too: click to focus panes, tabs, workspaces and agents (a click 
 name opens the list, a click on a folded pane's row opens it), or to run an action of the bottom
 bar; drag borders to resize; drag floating panes by their title; wheel to scroll
 back; drag to select and copy (double click selects a word, triple click a line); Ctrl+click opens
-a link (OSC 8 links stay clickable, and plain URLs work too). Hold Shift to use your terminal's own
-selection.
+a link (OSC 8 links stay clickable, and plain URLs work too), or, on the top line of a pane's
+frame, marks the pane for broadcast. Hold Shift to use your terminal's own selection.
+`mouse = false` in the configuration leaves the mouse to your terminal.
 
 ## Paste buffers
 
-What you copy goes to your terminal's clipboard, and kraal keeps it too, as tmux does: a copy
-mode selection, a mouse selection, `ctrl+b V c` (the last command's output), a hint's text, and
-what programs copy. The newest copy is buffer 0, the one before it buffer 1, and so on; the same
-text copied twice in a row is kept once. At most 50 numbered buffers and 32 MB stay, the oldest
-going first; buffers set by name (`kraal buffer set notes`, see
-[Scripting](scripting.md#paste-buffers)) stay until deleted.
+What you copy goes to your terminal's clipboard, and kraal keeps it too: a copy mode selection, a
+mouse selection, `ctrl+b V c` (the last command's output), a hint's text, and what programs copy.
+The newest copy is buffer 0, the one before it buffer 1, and so on; the same text copied twice in
+a row is kept once. At most 50 numbered buffers and 32 MB stay, the oldest going first; buffers
+set by name (`kraal buffer set notes`, see [Scripting](scripting.md#paste-buffers)) stay until
+deleted.
 
 `ctrl+b V p` (or `ctrl+b =`) lists them, newest first, with their first line, size and age; type
 to filter. Enter pastes the selected one into the focused pane as your terminal would: bracketed

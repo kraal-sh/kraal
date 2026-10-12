@@ -427,6 +427,21 @@ mod tests {
         s.split_whitespace().map(String::from).collect()
     }
 
+    /// README.md names four agents and counts the others; docs/agents.md counts them all.
+    #[test]
+    fn the_pages_count_the_agents_recognised() {
+        let scripts = SCRIPT_ONLY.iter().map(|(.., name)| *name);
+        let subcommands = SUBCOMMANDS.iter().map(|(.., name)| *name);
+        let known = KNOWN_AGENTS.iter().map(|(_, name)| *name);
+        let agents = known.chain(scripts).chain(subcommands).collect::<std::collections::BTreeSet<_>>().len();
+        let page = |name: &str| std::fs::read_to_string(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(name));
+        assert!(page("README.md").unwrap().contains(&format!("and {} others", agents - 4)), "{agents} agents");
+        assert!(
+            page("docs/agents.md").unwrap().contains(&format!("recognises {agents} coding agents")),
+            "{agents} agents"
+        );
+    }
+
     #[test]
     fn detects_agents_through_interpreters() {
         assert_eq!(detect_agent(&argv("claude")), Some("claude"));

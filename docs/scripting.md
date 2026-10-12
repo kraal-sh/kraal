@@ -4,23 +4,40 @@ Scripts and agents drive kraal from inside its panes, and kraal tells them what 
 
 ## Driving kraal
 
-Every pane gets `KRAAL_SOCKET`, `KRAAL_SESSION` and `KRAAL_PANE`, so scripts and agents can drive
-kraal from inside: commands act on the session they run in (`kraal kill` too), and on their own pane
-when none is named, unless `-s` names another session:
+Every pane gets `KRAAL_SOCKET`, `KRAAL_SESSION` and `KRAAL_PANE` (and `KRAAL=1`), so scripts and
+agents can drive kraal from inside: commands act on the session they run in (`kraal kill` too),
+and on their own pane when none is named, unless `-s` names another session. From outside a pane
+they act on the session `main`, or the one `-s` or `$KRAAL_SESSION_NAME` names.
 
-```sh
-kraal run --right --name tests -- cargo test     # prints the new pane id
-kraal send -p tests --enter "cargo test"         # type into a pane
-kraal keys -p tests ctrl+c                       # press keys
-kraal read -p tests --lines 50                   # read the screen or scrollback
-kraal wait -p api --until blocked,done --timeout 600
-kraal agents --json                              # every agent and its state, servers' too
-kraal agents --follow                            # this session's, one JSON line again at each change
-kraal preview docs/design.md --floating
-kraal notify "deploy" "finished"
-```
+| Command | |
+|---|---|
+| `kraal run --right --name tests -- cargo test` | runs a command in a new pane and prints the pane's id |
+| `kraal send -p tests --enter "cargo test"` | types into a pane (`--enter` presses Enter after it) |
+| `kraal keys -p tests ctrl+c` | presses keys: `enter`, `up`, `ctrl+c`… |
+| `kraal read -p tests --lines 50` | prints a pane's screen, or with `--lines` its last lines, scrollback included |
+| `kraal wait -p api --until blocked,done --timeout 600` | waits for a pane, then prints its agent's state |
+| `kraal panes` | lists the panes: id, workspace, tab, name, directory or exit status (`--json` says everything) |
+| `kraal focus tests` | shows a pane in the attached terminal |
+| `kraal rename -p tests unit` | renames a pane |
+| `kraal close tests` | closes a pane |
+| `kraal agents --json` | every agent and its state, servers' too |
+| `kraal agents --follow` | this session's agents, as one JSON line, again at each change |
+| `kraal preview docs/design.md --floating` | shows a file or a directory in a new pane |
+| `kraal notify "deploy" "finished"` | a desktop notification through the attached terminal |
 
 Panes are referred to by id, by name, or as `workspace:name`.
+
+`kraal run` and `kraal preview` put the new pane where you say: `--right` or `--down` split a
+pane (the one `--target` names, else the one the command runs in, else the focused one),
+`--floating` floats it, `--tab` gives it a tab; without any of them, kraal splits the pane along
+its longer side. `--name` names the new pane and `--no-focus` leaves the focus where it is.
+`kraal run --cwd ~/src/api` starts the command in that directory, and `--close-on-exit` closes
+the pane when the command exits, where it would otherwise stay open with its exit status.
+
+For `kraal wait`, `--until` takes the states of an agent (`working`, `blocked`, `done`, `idle`),
+`exit` (the pane's program ended) and `quiet` (it printed nothing for two seconds); without it,
+the wait ends on `blocked`, `done`, `idle` or `exit`. It fails when `--timeout` (in seconds)
+passes first, or when the pane closes.
 
 Scripts keep working when kraal is updated while a session runs: commands work with a session
 that another kraal version started, and what the session's kraal cannot do yet fails with the
@@ -39,22 +56,21 @@ another kraal watching this session reads.
 What kraal copies is kept in paste buffers ([Keys](keys.md#paste-buffers)), and scripts and agents
 reach them too:
 
-```sh
-kraal buffer list                              # newest first: number or name, size, age, first line
-kraal buffer list --json
-kraal buffer show                              # the newest buffer's text, as it is
-kraal buffer show 2                            # the third newest numbered one (0 is the newest)
-git diff | kraal buffer set review             # a named buffer, from the standard input
-kraal buffer set notes --from-file notes.md    # or from a file
-kraal buffer set < out.txt                     # a numbered buffer, like a copy
-kraal buffer paste review -p api               # paste into a pane, as your terminal would
-kraal buffer delete review                     # one buffer (the newest without a name or number)
-kraal buffer delete --all
-```
+| Command | |
+|---|---|
+| `kraal buffer list` | newest first: number or name, size, age, first line (`kraal buffer list --json` for scripts) |
+| `kraal buffer show` | prints the newest buffer's text, as it is |
+| `kraal buffer show 2` | the third newest numbered one (0 is the newest) |
+| `kraal buffer set review` | keeps what it reads on its standard input (a pipe, a file) as the buffer `review` |
+| `kraal buffer set notes --from-file notes.md` | or the text of a file |
+| `kraal buffer set` | without a name: a numbered buffer, like a copy |
+| `kraal buffer paste review -p api` | pastes into a pane, as your terminal would |
+| `kraal buffer delete review` | deletes one buffer (the newest without a name or number) |
+| `kraal buffer delete --all` | deletes them all |
 
 Numbered buffers rotate: 0 is always the newest, and the oldest go past `[buffers] limit` or
-`max_mb`. Named buffers stay until deleted; a name is one word (letters, digits, `- _ . : @ +`),
-never a number. Setting a name again replaces that buffer. `kraal buffer paste` sends the text as a
+`max_mb`. Named buffers stay until deleted; a name is one word of at most 64 characters (letters,
+digits, `- _ . : @ +`), never a number. Setting a name again replaces that buffer. `kraal buffer paste` sends the text as a
 paste, bracketed when the program asked for it; like `kraal send`, it refuses a production pane
 unless given `--production` ([Production](production.md)). A paste goes whole or not at all: one
 larger than the program can be sent at once (16 MiB, less what it has not read yet) is refused.
@@ -64,11 +80,13 @@ Buffers hold text, in the server's memory only unless `[buffers] persist = true`
 
 ## Events
 
-```sh
-kraal events                       # everything, as JSON lines
-kraal events agent.* pane.failed   # some types (kraal events --list)
-kraal events --since 1200          # first what came after event 1200, if still kept
-```
+| Command | |
+|---|---|
+| `kraal events` | everything that happens, as JSON lines, until you stop it |
+| `kraal events 'agent.*' pane.failed` | some types only (quoted, or your shell reads the `*`) |
+| `kraal events --list` | the types |
+| `kraal events --since 1200` | first what came after event 1200, if still kept |
+| `kraal events --since 1200 --boot 1760184000000` | the same, with the `boot` read along with that `seq`: if the server restarted since, everything it kept comes |
 
 ```
 {"v":1,"seq":1201,"boot":1760184000000,"type":"agent.blocked","pane":12,"name":"api","workspace":"dev","agent":"claude",…}
@@ -99,13 +117,19 @@ come back with `--since` its last `seq`; an `events.lost` line says when some ar
 `[hooks]` runs a command when one happens, with the event in `$KRAAL_EVENT_JSON` and its fields as
 `$KRAAL_<FIELD>`; output goes to `~/.local/state/kraal/hooks.log`:
 
-```toml
+```toml config
 [hooks]
 "agent.blocked" = 'curl -s -d "$KRAAL_AGENT needs you in $KRAAL_NAME" ntfy.sh/my-topic'
 "pane.failed" = 'notify-send "$KRAAL_NAME failed ($KRAAL_CODE)"'
 "ssh.started" = 'logger -t kraal "ssh $KRAAL_HOST production=$KRAAL_PRODUCTION"'
 ```
 
+A key is an event type, or all those of a kind (`"agent.*"`); `kraal config check` names one that
+is no event. The command runs through `sh -c`. `$KRAAL_EVENT` is the type; a field that is true
+is `1`, and one that is false or empty is the empty string. A hook can call kraal: it runs with
+the session's `KRAAL_SOCKET`, so `kraal read -p "$KRAAL_PANE"` reads the pane the event is about.
+
 At most 20 hooks start per second and 32 run at once; a hook running for 10 minutes is stopped
-with everything it started; 64 KiB of each hook's output are kept. Hooks and scripts reading the
-stream run as you, like any script: kraal does not sandbox them.
+with everything it started; 64 KiB of each hook's output are kept, in a log only you can read,
+renamed `hooks.log.1` once past 1 MB. Hooks and scripts reading the stream run as you, like any
+script: kraal does not sandbox them.

@@ -10,12 +10,12 @@ on `web01`, `htop` shows web01's processes; from a local pane in a repository, `
 that repository. kraal ships lazygit, k9s, htop, logs (`journalctl -f`), docker and disk; tools that
 run here are hidden when their program is not installed. Add your own in the config:
 
-```toml
+```toml config
 [tools.pods]
 description = "pods of the pane's cluster and namespace"
 command = "kubectl get pods -o wide"
 on = "local"               # always here, with the pane's KUBECONFIG and AWS_PROFILE
-when = ["kubernetes"]      # only offered where a Kubernetes context is known
+when = ["kubernetes"]      # needs a Kubernetes context: dimmed, and refused, where none is known
 hold = true                # keep the output on screen
 key = "i"                  # ctrl+b R i starts it directly
 
@@ -24,12 +24,27 @@ command = 'git show "$KRAAL_SELECTION"'
 when = ["git", "selection"]
 ```
 
+| Field | |
+|---|---|
+| `command` | a shell command line, run by `sh -c` |
+| `description` | what the list says of the tool |
+| `on` | `"pane"` (the default): on the pane's server, or here in its directory; `"local"`: always here |
+| `open` | `"floating"` (the default), `"right"`, `"down"` or `"tab"` |
+| `hold` | `true` keeps the pane open when the command ends (one that fails always stays) |
+| `when` | what the pane must have: `"git"`, `"server"`, `"local"`, `"kubernetes"`, `"terraform"`, `"aws"`, `"selection"` |
+| `key` | a key that starts it: after `ctrl+b R`, or right after the prefix in the classic preset |
+| `read_only` | `true` for a tool that only looks: it starts on a [production](production.md) pane without asking |
+| `enabled` | `false` hides it |
+
+A tool kraal ships changes the same way, by the fields you name: `[tools.lazygit]` with `key =
+"i"`, or `[tools.k9s]` with `enabled = false`.
+
 A tool gets the pane's context in `$KRAAL_CWD`, `$KRAAL_SERVER`, `$KRAAL_HOST`, `$KRAAL_REPO`,
 `$KRAAL_BRANCH`, `$KRAAL_KUBE_CONTEXT`, `$KRAAL_KUBE_NAMESPACE`, `$KRAAL_TF_WORKSPACE`,
-`$KRAAL_AWS_PROFILE`, `$KRAAL_SELECTION` and `$KRAAL_PRODUCTION`. A tool started on a server runs
-in the pane's directory there when the remote shell reports it (OSC 7), and fails rather than run
-elsewhere if that directory is gone. A tool that fails stays open to
-show why. `kraal config default` documents every field.
+`$KRAAL_AWS_PROFILE`, `$KRAAL_SELECTION` and `$KRAAL_PRODUCTION` (`1` or empty). A tool started
+on a server runs in the pane's directory there when the remote shell reports it (OSC 7), and
+fails rather than run elsewhere if that directory is gone. A tool that fails stays open to
+show why.
 
 ## Contexts
 
@@ -41,7 +56,8 @@ of the last aws, terraform, cdk… run (`--profile`, else `AWS_PROFILE`; nothing
 profile). Local tools started from the pane use that same kubeconfig and profile. kraal reads
 kubeconfig files and the processes' command lines and environments; it never runs these programs
 itself. Commands are seen by looking a few times a second: one that ends in a split second can go
-unnoticed until the next.
+unnoticed until the next. `[contexts]` in the configuration turns each of the three off
+(`kubernetes`, `terraform`, `aws`): frames then leave it out, and so does the production guard.
 
 In an SSH pane, the shell on the server says what it works on at each prompt, once the shell
 integration is in its startup file there ([Over SSH](terminal.md#over-ssh)): the current context
@@ -60,24 +76,29 @@ there is ignored.
 ## Hints
 
 `ctrl+b o` puts a short label on everything kraal recognises in the focused pane: links, paths
-(`src/main.rs:42`), commits, `host:port` addresses, IPs and known servers, Kubernetes pods, UUIDs.
-The pane holds still meanwhile. Type a label to copy that text; press Tab first to act on it
-instead, where the pane is:
+(`src/main.rs:42`), commits, addresses (`localhost:5173`, `10.0.0.5:8080`), IPs and known servers,
+Kubernetes pods, UUIDs. The pane holds still meanwhile. Type a label to copy that text; press Tab
+first to act on it instead, where the pane is (Tab again goes back to copying, Esc cancels):
 
 | What | Tab, then the label |
 |---|---|
 | link | open it in your browser |
 | path | open it in `$VISUAL` or `$EDITOR`, at its line; in an SSH pane, the server's file in your local editor, each save sent back ([details](servers.md#editing-a-file-on-a-server)) |
 | commit (or container id) | `git show` in the pane's repository (or `docker logs -f`) |
-| `host:port` | open it; a port of the pane's server is reached through a new tunnel |
+| address | open it; `localhost:5173` in an SSH pane is a port of that server, reached through a tunnel |
 | IP, server | ssh to it |
 | pod | `kubectl logs -f` with the pane's context and namespace |
 | UUID | type it into the pane |
 
-Your own patterns run a tool with the match in `$KRAAL_SELECTION`:
+Your own patterns run a tool with the match in `$KRAAL_SELECTION` (without `tool`, the label only
+copies), and `[hints] alphabet` chooses the letters labels are made of:
 
-```toml
+```toml config
+[tools.ticket]
+command = 'xdg-open "https://tickets.example.com/$KRAAL_SELECTION"'
+on = "local"
+
 [hints.patterns.ticket]
 pattern = 'OPS-\d+'
-tool = "jira"               # a [tools.jira] that opens the ticket
+tool = "ticket"
 ```
