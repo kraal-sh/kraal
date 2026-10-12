@@ -1,5 +1,10 @@
-//! Decodes sixel images (DEC's format, as img2sixel, chafa or matplotlib backends send them)
-//! into RGBA pixels. Pixels no sixel sets stay transparent, so the terminal's background shows.
+//! Sixel images (DEC's format, as img2sixel, chafa or matplotlib backends send them): decoded
+//! into RGBA pixels, and encoded for terminals that draw sixel but not kitty's placeholders.
+//! Pixels no sixel sets stay transparent, so the terminal's background shows.
+
+use std::io::Write;
+
+use super::quantize::{CLEAR, Indexed};
 
 /// Largest image decoded, per side and in pixels.
 pub const MAX_SIDE: u32 = 10_000;
@@ -212,5 +217,99 @@ impl Canvas {
             pixels.extend_from_slice(&self.pixels[from..from + w as usize * 4]);
         }
         Some(Rgba { width: w, height: h, pixels })
+    }
+}
+
+/// Encode the `width × height` pixels of `image` from `x, y` as a sixel image (DCS … ST), drawn
+/// at the cursor. Unset ([`CLEAR`]) pixels stay transparent; colours are defined as the part
+/// uses them, in the image's palette numbering, so that every part of an image matches.
+pub fn encode(image: &Indexed, x: u32, y: u32, width: u32, height: u32, out: &mut Vec<u8>) {
+    let w = width.min(image.width.saturating_sub(x)) as usize;
+    let h = height.min(image.height.saturating_sub(y)) as usize;
+    if w == 0 || h == 0 {
+        return;
+    }
+    let stride = image.width as usize;
+    let row = |r: usize| {
+        let at = (y as usize + r) * stride + x as usize;
+        &image.pixels[at..at + w]
+    };
+    // P2 = 1: what no sixel sets keeps what is under it. Raster attributes: square pixels and
+    // the size, so that the terminal knows it before the data.
+    let _ = write!(out, "\x1bP0;1;0q\"1;1;{w};{h}");
+    let mut used = [false; 256];
+    for r in 0..h {
+        for &p in row(r) {
+            used[usize::from(p)] = true;
+        }
+    }
+    for (i, [r, g, b]) in image.palette.iter().enumerate().take(usize::from(CLEAR)) {
+        if used[i] {
+            let pct = |v: u8| (u32::from(v) * 100 + 127) / 255;
+            let _ = write!(out, "#{i};2;{};{};{}", pct(*r), pct(*g), pct(*b));
+        }
+    }
+    // For each colour of a band, its six-pixel columns and the span they cover.
+    let mut masks = vec![0u8; 256 * w];
+    let mut span = [(usize::MAX, 0usize); 256];
+    let mut present: Vec<u8> = Vec::with_capacity(256);
+    for band in 0..h.div_ceil(6) {
+        if band > 0 {
+            out.push(b'-');
+        }
+        present.clear();
+        for bit in 0..6 {
+            let r = band * 6 + bit;
+            if r >= h {
+                break;
+            }
+            for (px, &p) in row(r).iter().enumerate() {
+                if p == CLEAR {
+                    continue;
+                }
+                let c = usize::from(p);
+                if span[c].0 == usize::MAX {
+                    present.push(p);
+                    span[c] = (px, px);
+                } else {
+                    span[c].0 = span[c].0.min(px);
+                    span[c].1 = span[c].1.max(px);
+                }
+                masks[c * w + px] |= 1 << bit;
+            }
+        }
+        for (k, &p) in present.iter().enumerate() {
+            let c = usize::from(p);
+            if k > 0 {
+                out.push(b'$');
+            }
+            let _ = write!(out, "#{c}");
+            let (from, to) = span[c];
+            if from > 0 {
+                run(out, from, 0);
+            }
+            let bits = &mut masks[c * w + from..=c * w + to];
+            let mut i = 0;
+            while i < bits.len() {
+                let v = bits[i];
+                let n = bits[i..].iter().take_while(|b| **b == v).count();
+                run(out, n, v);
+                i += n;
+            }
+            bits.fill(0);
+            span[c] = (usize::MAX, 0);
+        }
+    }
+    out.extend_from_slice(b"\x1b\\");
+}
+
+/// `n` sixels of `bits`, repeated with `!` when that is shorter.
+fn run(out: &mut Vec<u8>, n: usize, bits: u8) {
+    let c = 0x3f + bits;
+    if n > 3 {
+        let _ = write!(out, "!{n}");
+        out.push(c);
+    } else {
+        out.extend(std::iter::repeat_n(c, n));
     }
 }

@@ -348,6 +348,8 @@ pub struct Server {
     pub outer_colors: Option<(String, String)>,
     /// What each client's terminal can show of the panes' images, and has been sent.
     images: HashMap<ClientId, graphics::ClientImages>,
+    /// Images ready to draw as sixel.
+    fitted: graphics::Fitted,
     /// Warnings not shown yet: they go to the clients and the messages log.
     pub warnings: Vec<String>,
     /// Why `accounts.toml` could not be read last time, so that it is said once, not every scan.
@@ -549,6 +551,7 @@ pub fn run(session: &str) -> Result<()> {
         restarting: false,
         outer_colors: None,
         images: HashMap::new(),
+        fitted: Default::default(),
         warnings,
         accounts_error: None,
         messages: Default::default(),
@@ -865,9 +868,10 @@ impl Server {
             self.refresh_tf_dirs();
         }
         // Changed previews are read again off the event loop (images take a while to decode).
+        let images = self.env.graphics.enabled();
         for (id, path) in reloads {
             let started = self.background(
-                move || crate::preview::Loaded::read(&path),
+                move || crate::preview::Loaded::read(&path, images),
                 move |server, loaded| {
                     server.preview_loads.remove(&id);
                     if let Some(crate::pane::Content::Preview(p)) = server.panes.get_mut(&id).map(|p| &mut p.content) {
@@ -1085,19 +1089,26 @@ impl Server {
         self.next_render = None;
         let ids: Vec<ClientId> = self.clients.values().filter(|c| c.attached && c.dirty).map(|c| c.id).collect();
         let mut again = false;
+        // The earliest a moving image may be drawn where it stopped.
+        let mut wake: Option<Instant> = None;
         for id in ids {
             // Slow client: keep it dirty and retry on the next frame.
             if self.clients[&id].out.len() >= 8 {
                 again = true;
                 continue;
             }
-            let (buf, cursor, links) = self.compose(id);
+            let (mut buf, cursor, links) = self.compose(id);
             // Images the client's terminal does not have yet go first.
             let (mut bytes, more) = self.graphics_updates(id);
+            // Or, for a terminal that draws sixel, the images' visible parts go over the cells.
+            let (erase, images, still) = self.paint_images(id, &mut buf);
             let Some(c) = self.clients.get_mut(&id) else { continue };
-            c.encoder.encode(&buf, cursor, &links, &mut bytes);
-            c.dirty = more;
+            c.encoder.encode_with_images(&buf, cursor, &links, &erase, &images, &mut bytes);
+            c.dirty = more || still.is_some();
             again |= more;
+            if let Some(at) = still {
+                wake = Some(wake.map_or(at, |w| w.min(at)));
+            }
             match c.out.try_send(frame_bytes(&bytes)) {
                 Ok(()) => {}
                 Err(TrySendError::Full(_)) => {
@@ -1113,6 +1124,9 @@ impl Server {
         }
         if again {
             self.next_render = Some(Instant::now() + FRAME);
+        }
+        if let Some(at) = wake {
+            self.next_render = Some(self.next_render.map_or(at, |r| r.min(at)));
         }
     }
 

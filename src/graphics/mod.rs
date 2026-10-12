@@ -5,10 +5,13 @@
 //! kitty's protocol defines them) into the pane's grid where the image goes: the colour of a
 //! cell names the image, combining characters its row and column. The cells scroll, clip and
 //! hide under other panes like any text. Each client whose terminal speaks the protocol gets
-//! the images it needs (see `server::graphics`), and the cells render as the image there; for
-//! the others, they render blank.
+//! the images it needs (see `server::graphics`), and the cells render as the image there. A
+//! terminal that draws sixel instead gets each visible part of an image as a sixel image drawn
+//! over the cells (see [`paint`]); for the others, the cells render blank.
 
 mod diacritics;
+pub mod paint;
+pub mod quantize;
 mod scan;
 pub mod sixel;
 #[cfg(test)]
@@ -130,11 +133,18 @@ impl Shared {
         self.used.load(Ordering::Relaxed)
     }
 
-    fn changed(&self) {
+    /// The most image data all panes may hold, in bytes.
+    pub fn quota(&self) -> usize {
+        self.quota
+    }
+
+    /// An image was shown or went: the clients' terminals are brought up to date.
+    pub fn changed(&self) {
         self.version.fetch_add(1, Ordering::Relaxed);
     }
 
-    fn new_id(&self) -> u32 {
+    /// A new id for an image kraal shows.
+    pub fn new_id(&self) -> u32 {
         let n = self.next_id.fetch_add(1, Ordering::Relaxed) & 0x00ff_ffff;
         KRAAL_ID | n.max(1)
     }
@@ -149,7 +159,8 @@ pub struct Picture {
 }
 
 impl Picture {
-    fn new(png: Vec<u8>, width: u32, height: u32, shared: &Arc<Shared>) -> Arc<Picture> {
+    /// A PNG of `width × height` pixels, counted in the quota while it lives.
+    pub fn new(png: Vec<u8>, width: u32, height: u32, shared: &Arc<Shared>) -> Arc<Picture> {
         shared.used.fetch_add(png.len() + PICTURE_COST, Ordering::Relaxed);
         Arc::new(Picture { png, width, height, shared: shared.clone() })
     }
@@ -162,26 +173,29 @@ impl Picture {
     }
 
     fn from_rgba(width: u32, height: u32, rgba: Vec<u8>, shared: &Arc<Shared>) -> Result<Arc<Picture>, String> {
-        use image::ImageEncoder;
-        if rgba.len() != width as usize * height as usize * 4 {
-            return Err("EINVAL:size does not match the data".into());
-        }
-        // Fast rather than small: the PNG only travels to the terminal next to it.
-        let mut png = Vec::new();
-        let encoder = image::codecs::png::PngEncoder::new_with_quality(
-            &mut png,
-            image::codecs::png::CompressionType::Fast,
-            image::codecs::png::FilterType::Adaptive,
-        );
-        encoder
-            .write_image(&rgba, width, height, image::ExtendedColorType::Rgba8)
-            .map_err(|e| format!("EINVAL:{e}"))?;
-        Picture::checked(png, width, height, shared)
+        Picture::checked(encode_png(width, height, &rgba)?, width, height, shared)
     }
 
-    fn decode(&self) -> Result<image::DynamicImage, String> {
+    pub fn decode(&self) -> Result<image::DynamicImage, String> {
         decode_png(&self.png)
     }
+}
+
+/// `width × height` RGBA pixels as PNG.
+pub fn encode_png(width: u32, height: u32, rgba: &[u8]) -> Result<Vec<u8>, String> {
+    use image::ImageEncoder;
+    if rgba.len() != width as usize * height as usize * 4 {
+        return Err("EINVAL:size does not match the data".into());
+    }
+    // Fast rather than small: the PNG only travels to the terminal next to it.
+    let mut png = Vec::new();
+    let encoder = image::codecs::png::PngEncoder::new_with_quality(
+        &mut png,
+        image::codecs::png::CompressionType::Fast,
+        image::codecs::png::FilterType::Adaptive,
+    );
+    encoder.write_image(rgba, width, height, image::ExtendedColorType::Rgba8).map_err(|e| format!("EINVAL:{e}"))?;
+    Ok(png)
 }
 
 impl Drop for Picture {
@@ -764,6 +778,24 @@ impl PaneGraphics {
     }
 }
 
+/// Write the placeholder cells of image `kid`, `cols × rows`, with their top left at `at`;
+/// only those inside `clip`.
+pub fn write_placeholders(buf: &mut Buffer, clip: Rect, at: (u16, u16), kid: u32, cols: u16, rows: u16) {
+    let clip = clip.intersection(buf.area);
+    for row in 0..rows {
+        for col in 0..cols {
+            let (x, y) = (at.0.saturating_add(col), at.1.saturating_add(row));
+            if !clip.contains((x, y).into()) {
+                continue;
+            }
+            let cell = &mut buf[(x, y)];
+            cell.reset();
+            cell.set_symbol(&placeholder(kid, usize::from(row), usize::from(col)));
+            cell.fg = Color::Rgb((kid >> 16) as u8, (kid >> 8) as u8, kid as u8);
+        }
+    }
+}
+
 /// The text of a placeholder cell for kraal's image `kid`: row, column and the id's high byte.
 pub fn placeholder(kid: u32, row: usize, col: usize) -> String {
     let mut s = String::with_capacity(16);
@@ -1120,12 +1152,21 @@ pub fn update_terminal(
 }
 
 /// The query that tells whether the outer terminal shows images (its answer carries
-/// [`PROBE_ID`]), the request for its name and version (XTVERSION) and for its cell size in
-/// pixels.
+/// [`PROBE_ID`]), the requests for its name and version (XTVERSION), for its cell size in
+/// pixels, and for its device attributes (sixel among them), which every terminal answers last.
 pub const PROBE_ID: u32 = 0x4b52_4c31;
 
 pub fn probe() -> String {
-    format!("\x1b_Gi={PROBE_ID},s=1,v=1,a=q,t=d,f=24;AAAA\x1b\\\x1b[>q\x1b[16t")
+    format!("\x1b_Gi={PROBE_ID},s=1,v=1,a=q,t=d,f=24;AAAA\x1b\\\x1b[>q\x1b[16t\x1b[c")
+}
+
+/// Whether a terminal's device attributes (`CSI ? … c`) say it draws sixel (attribute 4).
+pub fn sixel_answer(reply: &str) -> Option<bool> {
+    let body = reply.strip_prefix("\x1b[?")?.strip_suffix('c')?;
+    if !body.bytes().all(|b| b.is_ascii_digit() || b == b';') {
+        return None;
+    }
+    Some(body.split(';').any(|a| a == "4"))
 }
 
 /// The terminal's name in a reply to XTVERSION (`DCS > | name ST`).

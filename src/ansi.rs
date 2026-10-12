@@ -9,7 +9,11 @@ use std::io::Write;
 use std::sync::Arc;
 
 use ratatui::buffer::{Buffer, Cell};
+use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier};
+
+/// What a cell to draw again holds in the previous frame: no frame holds it.
+const STALE: &str = "\u{FFFF}";
 
 /// Cursor shape requested by the focused pane (DECSCUSR values).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -62,16 +66,61 @@ impl Encoder {
         self.last_cursor_style = None;
     }
 
+    /// Whether the next frame of `area` is drawn whole, on a cleared screen.
+    pub fn redraws_all(&self, area: Rect) -> bool {
+        self.prev.as_ref().is_none_or(|p| p.area != area)
+    }
+
+    /// Whether `next` writes to a cell of `area`.
+    pub fn rewrites(&self, next: &Buffer, area: Rect) -> bool {
+        let Some(prev) = self.prev.as_ref().filter(|p| p.area == next.area) else { return true };
+        area.intersection(next.area).positions().any(|p| prev[p] != next[p])
+    }
+
+    /// Draw the cells of `area` again with `next`, whatever they held, and on each row the
+    /// cell on their left when `next` has a wide character there (its second half is in `area`).
+    pub fn redraw(&mut self, area: Rect, next: &Buffer) {
+        let Some(prev) = self.prev.as_mut().filter(|p| p.area == next.area) else { return };
+        let area = area.intersection(prev.area);
+        for p in area.positions() {
+            prev[p].set_symbol(STALE);
+        }
+        if area.x > prev.area.x {
+            for y in area.top()..area.bottom() {
+                let lead = (area.x - 1, y);
+                if unicode_width::UnicodeWidthStr::width(next[lead].symbol()) > 1 {
+                    prev[lead].set_symbol(STALE);
+                }
+            }
+        }
+    }
+
     /// Append the bytes that turn the previous frame into `next` to `out`.
+    #[cfg(test)]
     pub fn encode(&mut self, next: &Buffer, cursor: Option<Cursor>, links: &Links, out: &mut Vec<u8>) {
+        self.encode_with_images(next, cursor, links, &[], &[], out);
+    }
+
+    /// [`Encoder::encode`], with images drawn at the cursor (sixel): `erase` goes before the
+    /// cells are drawn, `images` after them, all in the same synchronized update.
+    pub fn encode_with_images(
+        &mut self,
+        next: &Buffer,
+        cursor: Option<Cursor>,
+        links: &Links,
+        erase: &[u8],
+        images: &[u8],
+        out: &mut Vec<u8>,
+    ) {
         out.extend_from_slice(b"\x1b[?2026h\x1b[?25l");
-        let full = self.prev.as_ref().is_none_or(|p| p.area != next.area);
+        let full = self.redraws_all(next.area);
         let blank;
         let prev = if full {
             out.extend_from_slice(b"\x1b[0m\x1b[H\x1b[2J");
             blank = Buffer::empty(next.area);
             &blank
         } else {
+            out.extend_from_slice(erase);
             self.prev.as_ref().unwrap()
         };
 
@@ -131,6 +180,7 @@ impl Encoder {
             out.extend_from_slice(b"\x1b[0m");
         }
         self.prev_links = links.clone();
+        out.extend_from_slice(images);
 
         if let Some(c) = cursor {
             let style = (c.shape, c.blinking);
@@ -365,6 +415,39 @@ mod tests {
         let s = text(&out);
         assert!(s.contains("b.example\x1b\\\x1b[1;1H日"), "{s:?}");
         assert!(!s.contains("\x1b[1;2H"), "nothing is written over its second column: {s:?}");
+    }
+
+    #[test]
+    fn images_go_around_the_cells_and_erased_cells_are_drawn_again() {
+        let area = Rect::new(0, 0, 6, 2);
+        let mut buf = Buffer::empty(area);
+        buf.set_string(0, 0, "abc", Style::default());
+        let mut enc = Encoder::new();
+        assert!(enc.redraws_all(area));
+        let mut out = Vec::new();
+        enc.encode_with_images(&buf, None, &Links::new(), b"ERASE", b"IMAGE", &mut out);
+        let s = text(&out);
+        // The screen is cleared: nothing to erase. Images go over the cells.
+        assert!(!s.contains("ERASE") && s.find("abc") < s.find("IMAGE"), "{s:?}");
+        assert!(!enc.redraws_all(area) && enc.redraws_all(Rect::new(0, 0, 7, 2)));
+        assert!(!enc.rewrites(&buf, area));
+        // Cells to draw again (an image was erased there) are, whatever they hold.
+        enc.redraw(Rect::new(1, 0, 1, 2), &buf);
+        assert!(enc.rewrites(&buf, Rect::new(1, 1, 1, 1)) && !enc.rewrites(&buf, Rect::new(2, 0, 4, 2)));
+        let cursor = Cursor { x: 0, y: 1, shape: CursorShape::Block, blinking: false };
+        let mut out = Vec::new();
+        enc.encode_with_images(&buf, Some(cursor), &Links::new(), b"ERASE", b"IMAGE", &mut out);
+        let s = text(&out);
+        let at = |t: &str| s.find(t).unwrap_or_else(|| panic!("{t:?} in {s:?}"));
+        assert!(at("\x1b[?2026h") < at("ERASE") && at("ERASE") < at("\x1b[1;2Hb") && at("b") < at("IMAGE"), "{s:?}");
+        assert!(at("IMAGE") < at("\x1b[2;1H\x1b[?25h") && !s.contains('a') && !s.contains('c'), "{s:?}");
+        // A wide character whose second half is erased is drawn again whole.
+        buf.set_string(0, 1, "日", Style::default());
+        enc.encode(&buf, None, &Links::new(), &mut Vec::new());
+        enc.redraw(Rect::new(1, 1, 1, 1), &buf);
+        let mut out = Vec::new();
+        enc.encode(&buf, None, &Links::new(), &mut out);
+        assert!(text(&out).contains("\x1b[2;1H日"), "{:?}", text(&out));
     }
 
     #[test]
