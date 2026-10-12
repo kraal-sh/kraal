@@ -14,10 +14,7 @@ use crate::ansi::{Cursor, CursorShape};
 use crate::input::KeySpec;
 use crate::keymap::{Action, Command, MenuEntry};
 use crate::text::{columns, truncate, wrap};
-
-fn th() -> crate::theme::Theme {
-    crate::theme::current()
-}
+use crate::theme::current as th;
 
 fn key_style() -> Style {
     Style::default().fg(th().accent).add_modifier(Modifier::BOLD)

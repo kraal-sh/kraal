@@ -10,6 +10,7 @@ use crate::text::{
     columns as text_width, human_size, local_minutes, pad_start, sanitize, sanitize_lines, truncate, truncate_start,
     wrap,
 };
+use crate::theme::current as theme;
 
 /// Narrower areas show only the active panel.
 pub(super) const MIN_SPLIT_WIDTH: u16 = 24;
@@ -17,10 +18,6 @@ pub(super) const SIZE_WIDTH: usize = 7;
 pub(super) const DATE_WIDTH: usize = 16;
 /// Narrowest name column kept before the date, then the size, are dropped.
 pub(super) const MIN_NAME_WIDTH: usize = 8;
-
-fn theme() -> crate::theme::Theme {
-    crate::theme::current()
-}
 
 // The file manager's styles, from the interface theme.
 pub(super) fn dim() -> Style {
@@ -169,7 +166,7 @@ impl FilesPane {
         if let Some(y) = geo.header {
             let style = if active { header_active() } else { header_inactive() };
             buf.set_style(Rect::new(rect.x, y, rect.width, 1).intersection(rect), style);
-            let ascii = crate::theme::current().ascii;
+            let ascii = theme().ascii;
             let mark = match (active, ascii) {
                 (true, true) => "> ",
                 (true, false) => "▸ ",
@@ -262,7 +259,7 @@ impl FilesPane {
             }
         }
         // Selection and the cursor are marks of their own, not only colours.
-        let ascii = crate::theme::current().ascii;
+        let ascii = theme().ascii;
         if marked {
             put(buf, rect, rect.x, y, if ascii { "*" } else { "✓" }, 1, style);
         } else if cursor && active {

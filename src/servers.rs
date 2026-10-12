@@ -78,18 +78,13 @@ impl Server {
     }
 
     /// `user@host:port`: the port whenever one was given (22 too: without it, ~/.ssh/config
-    /// decides), an IPv6 address in brackets (`ops@[fe80::1]`), so it reads back the same.
+    /// decides), an IPv6 address in brackets (`ops@[fe80::1]`), so it reads back the same. It is
+    /// also what ssh's `-J` reads, which refuses an IPv6 address without brackets.
     pub fn address(&self) -> String {
         match self.port {
             Some(p) => format!("{}:{p}", self.bracketed_destination()),
             None => self.bracketed_destination(),
         }
-    }
-
-    /// `[user@]host[:port]` as ssh's `-J` reads it: the port whenever one was given, an IPv6
-    /// address always in brackets (ssh refuses `ops@fe80::1`).
-    pub fn jump_spec(&self) -> String {
-        self.address()
     }
 
     fn bracketed_destination(&self) -> String {
@@ -129,7 +124,7 @@ impl Server {
                 {
                     out.extend(["-o".to_string(), format!("ProxyCommand={}", js.proxy_command(jumps, depth + 1))]);
                 }
-                Some((js, v)) if js.jump_spec() != v => out.extend(["-J".to_string(), js.jump_spec()]),
+                Some((js, v)) if js.address() != v => out.extend(["-J".to_string(), js.address()]),
                 _ => out.extend(["-J".to_string(), raw.to_string()]),
             },
             // Turned off as given, in the order ssh needs: `ProxyJump=none` before a
@@ -1033,9 +1028,8 @@ mod tests {
         assert!(!s.ssh_options(&|_| Some(looping.clone())).is_empty());
         // IPv6 addresses take brackets where a port follows, and always for `-J`.
         let v6 = Server { host: "fe80::1".into(), user: Some("ops".into()), port: Some(2200), ..Default::default() };
-        assert_eq!(v6.jump_spec(), "ops@[fe80::1]:2200");
         assert_eq!(v6.address(), "ops@[fe80::1]:2200");
-        assert_eq!(Server { port: None, ..v6.clone() }.jump_spec(), "ops@[fe80::1]");
+        assert_eq!(Server { port: None, ..v6.clone() }.address(), "ops@[fe80::1]");
         // An IPv6 target behind a jump host with a key: `-W` takes it in brackets too.
         let v6_target = Server { host: "::1".into(), jump: Some("bastion".into()), ..Default::default() };
         assert!(v6_target.ssh_options(&chain)[1].contains("-W '[%h]:%p'"));
