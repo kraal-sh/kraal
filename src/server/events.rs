@@ -2,8 +2,8 @@
 //! `[hooks]` of the config.
 //!
 //! Every event carries `seq`, increasing within a server's life, and `boot`, which changes when
-//! the server restarts. The last events are kept, so a subscriber that was dropped (too slow)
-//! or reconnects can ask for what it missed with `since`.
+//! the server restarts (a live restart keeps both). The last events are kept, so a subscriber
+//! that was dropped (too slow) or reconnects can ask for what it missed with `since`.
 
 use std::collections::{HashMap, VecDeque};
 use std::io::Write;
@@ -88,7 +88,27 @@ impl Default for EventLog {
     }
 }
 
+/// An event log as a live restart hands it over: the numbering goes on.
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct SavedLog {
+    boot: u64,
+    seq: u64,
+    kept: Vec<Map<String, Value>>,
+}
+
 impl EventLog {
+    pub fn save(&self) -> SavedLog {
+        SavedLog { boot: self.boot, seq: self.seq, kept: self.kept.iter().cloned().collect() }
+    }
+
+    pub fn restore(saved: SavedLog) -> EventLog {
+        let mut kept: VecDeque<_> = saved.kept.into();
+        while kept.len() > KEPT {
+            kept.pop_front();
+        }
+        EventLog { boot: saved.boot, seq: saved.seq, kept }
+    }
+
     /// Number an event and keep it.
     fn record(&mut self, ty: &str, fields: Value) -> Map<String, Value> {
         self.seq += 1;
@@ -200,6 +220,11 @@ impl Hooks {
             h.log_output();
             false
         });
+    }
+
+    /// How many hooks are running.
+    pub fn running(&self) -> usize {
+        self.running.len()
     }
 
     /// kraal is stopping: so do the hooks.

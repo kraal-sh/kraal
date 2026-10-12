@@ -31,7 +31,7 @@ impl Server {
         let panes = &self.panes;
         self.scrollback.retain(|id, _| panes.contains_key(id));
         // Written by its own thread: the disk (fsync) never holds up the event loop.
-        let snap = persist::snapshot(self);
+        let snap = persist::snapshot(self, false);
         let _ = self.persister.send(Persist::Save(self.session.clone(), snap));
     }
 
@@ -80,6 +80,14 @@ impl Server {
 
     pub fn mark_persist(&mut self) {
         self.persist_dirty = true;
+    }
+
+    /// Wait, at most `limit`, until what the writer was given is on disk.
+    pub(super) fn sync_persister(&self, limit: Duration) {
+        let (done, written) = crossbeam_channel::bounded(1);
+        if self.persister.send(Persist::Sync(done)).is_ok() {
+            let _ = written.recv_timeout(limit);
+        }
     }
 
     /// Recreate the layout saved by a previous server, if any.
@@ -169,6 +177,8 @@ pub(super) enum Persist {
     },
     /// The session ended with its last pane: nothing is left to restore.
     Delete(String),
+    /// Say when everything asked before is written.
+    Sync(Sender<()>),
     /// Everything asked before is written: say whether the last save worked, and stop.
     Stop(Sender<Result<(), String>>),
 }
@@ -216,6 +226,9 @@ pub(super) fn spawn_persister(events: Sender<Event>) -> Sender<Persist> {
                         let _ = std::fs::remove_file(paths::session_state_path(session));
                         let _ = persist::forget_scrollback(session);
                         last = Ok(());
+                    }
+                    Persist::Sync(done) => {
+                        let _ = done.send(());
                     }
                     Persist::Stop(done) => {
                         let _ = done.send(last.clone());

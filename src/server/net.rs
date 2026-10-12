@@ -50,7 +50,9 @@ pub struct Tunnel {
     pub spec: TunnelSpec,
     pub state: TunnelState,
     pub error: Option<String>,
-    child: Option<Child>,
+    child: Option<Ssh>,
+    /// A copy of ssh's stderr, which a live restart hands over with ssh.
+    stderr: Option<std::os::fd::OwnedFd>,
     /// The last line ssh wrote on stderr (not its debug lines).
     said: Arc<Mutex<String>>,
     /// ssh said it listens on the local port and made the listener: the tunnel is up (a port
@@ -68,10 +70,59 @@ impl Tunnel {
     /// ran.
     fn stop(&mut self) -> Option<std::process::ExitStatus> {
         self.stop_reading.store(true, Ordering::SeqCst);
-        let mut c = self.child.take()?;
-        crate::exec::kill_group(&mut c);
-        c.try_wait().ok().flatten()
+        self.stderr = None;
+        self.child.take()?.kill_group()
     }
+}
+
+/// A tunnel's ssh, in a process group of its own: started here, or taken over by a live
+/// restart (still a child: exec keeps the pid).
+enum Ssh {
+    Started(Child),
+    Adopted(u32),
+}
+
+impl Ssh {
+    fn id(&self) -> u32 {
+        match self {
+            Ssh::Started(c) => c.id(),
+            Ssh::Adopted(pid) => *pid,
+        }
+    }
+
+    /// Whether it has ended, without reaping it.
+    fn has_exited(&self) -> bool {
+        match self {
+            Ssh::Started(c) => crate::exec::has_exited(c),
+            Ssh::Adopted(pid) => crate::exec::pid_exited(*pid),
+        }
+    }
+
+    /// Kill it and its group, then reap it: how it ended.
+    fn kill_group(self) -> Option<std::process::ExitStatus> {
+        match self {
+            Ssh::Started(mut c) => {
+                crate::exec::kill_group(&mut c);
+                c.try_wait().ok().flatten()
+            }
+            Ssh::Adopted(pid) => crate::exec::kill_group_of(pid),
+        }
+    }
+}
+
+/// A tunnel as a live restart hands it over.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct LiveTunnel {
+    pub id: u32,
+    pub spec: TunnelSpec,
+    pub state: TunnelState,
+    pub error: Option<String>,
+    /// Its ssh, and the descriptor of ssh's stderr kept open over the exec.
+    pub pid: Option<u32>,
+    pub stderr: Option<i32>,
+    pub failures: u32,
+    /// When it is tried again (from the hand-over), while it is down.
+    pub retry_in_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -126,6 +177,23 @@ impl Listener {
         }
         false
     }
+}
+
+/// Read what a tunnel's ssh says on stderr: when it listens (the tunnel is up), and its last
+/// words besides debug lines.
+fn read_ssh_stderr(t: &Tunnel, err: impl std::io::Read + std::os::fd::AsRawFd + Send + 'static) {
+    let (said, ready) = (t.said.clone(), t.ready.clone());
+    let mut listener = Listener::new(t.spec.local);
+    crate::exec::read_lines_until(err, t.stop_reading.clone(), move |line| {
+        if listener.read(line) {
+            ready.store(true, Ordering::SeqCst);
+        } else if !line.is_empty()
+            && !line.starts_with("debug")
+            && let Ok(mut s) = said.lock()
+        {
+            *s = line.chars().take(300).collect();
+        }
+    });
 }
 
 /// The `-L` forwarding of a tunnel: an IPv6 host in brackets.
@@ -237,6 +305,7 @@ impl Server {
             state: TunnelState::Connecting,
             error: None,
             child: None,
+            stderr: None,
             said: Default::default(),
             ready: Default::default(),
             stop_reading: Default::default(),
@@ -321,20 +390,10 @@ impl Server {
                 t.ready = Default::default();
                 t.stop_reading = Default::default();
                 if let Some(err) = c.stderr.take() {
-                    let (said, ready) = (t.said.clone(), t.ready.clone());
-                    let mut listener = Listener::new(t.spec.local);
-                    crate::exec::read_lines_until(err, t.stop_reading.clone(), move |line| {
-                        if listener.read(line) {
-                            ready.store(true, Ordering::SeqCst);
-                        } else if !line.is_empty()
-                            && !line.starts_with("debug")
-                            && let Ok(mut s) = said.lock()
-                        {
-                            *s = line.chars().take(300).collect();
-                        }
-                    });
+                    t.stderr = std::os::fd::AsFd::as_fd(&err).try_clone_to_owned().ok();
+                    read_ssh_stderr(t, err);
                 }
-                t.child = Some(c);
+                t.child = Some(Ssh::Started(c));
                 t.state = TunnelState::Connecting;
                 t.started = Instant::now();
             }
@@ -355,7 +414,7 @@ impl Server {
         let mut changed = false;
         let mut events = Vec::new();
         for t in &mut tunnels {
-            if t.child.as_ref().is_some_and(crate::exec::has_exited) {
+            if t.child.as_ref().is_some_and(Ssh::has_exited) {
                 // What ssh started (a ProxyCommand) goes too, before ssh is reaped: until then
                 // its group id cannot be another's.
                 let status = t.stop();
@@ -418,6 +477,59 @@ impl Server {
         for t in &mut self.tunnels {
             t.stop();
         }
+    }
+
+    /// The tunnels as a live restart hands them over: their ssh keeps running.
+    pub(super) fn live_tunnels(&self) -> Vec<LiveTunnel> {
+        let now = Instant::now();
+        self.tunnels
+            .iter()
+            .map(|t| LiveTunnel {
+                id: t.id,
+                spec: t.spec.clone(),
+                state: t.state,
+                error: t.error.clone(),
+                pid: t.child.as_ref().map(Ssh::id),
+                stderr: t.child.as_ref().and(t.stderr.as_ref()).map(std::os::fd::AsRawFd::as_raw_fd),
+                failures: t.failures,
+                retry_in_ms: t.retry_at.map(|r| r.saturating_duration_since(now).as_millis() as u64),
+            })
+            .collect()
+    }
+
+    /// Take over a tunnel a live restart handed over: its ssh (when `pid` is this process's
+    /// child) and the descriptor of its stderr. One whose ssh is not found is started again.
+    pub(super) fn adopt_tunnel(&mut self, live: LiveTunnel, stderr: Option<std::os::fd::OwnedFd>) {
+        let child = live.pid.filter(|pid| crate::exec::is_child(*pid)).map(Ssh::Adopted);
+        let mut t = Tunnel {
+            id: live.id,
+            spec: live.spec,
+            state: live.state,
+            error: live.error,
+            child: None,
+            stderr: None,
+            said: Default::default(),
+            ready: Arc::new(AtomicBool::new(live.state == TunnelState::Up)),
+            stop_reading: Default::default(),
+            started: Instant::now(),
+            retry_at: live.retry_in_ms.map(|ms| Instant::now() + Duration::from_millis(ms)),
+            failures: live.failures,
+        };
+        match child {
+            Some(ssh) => {
+                if let Some(fd) = stderr {
+                    t.stderr = fd.try_clone().ok();
+                    read_ssh_stderr(&t, std::fs::File::from(fd));
+                }
+                t.child = Some(ssh);
+            }
+            None if live.pid.is_some() => {
+                t.state = TunnelState::Down;
+                t.retry_at = Some(Instant::now());
+            }
+            None => {}
+        }
+        self.tunnels.push(t);
     }
 
     /// Remember ports a pane's output mentions (dev servers); kept while something listens.

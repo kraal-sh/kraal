@@ -259,7 +259,7 @@ impl Server {
         }
     }
 
-    fn log_message(&mut self, text: &str, warning: bool) {
+    pub(super) fn log_message(&mut self, text: &str, warning: bool) {
         if self.messages.len() >= super::MAX_MESSAGES {
             self.messages.pop_front();
         }

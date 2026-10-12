@@ -276,55 +276,108 @@ impl TermPane {
         let process = Arc::new(Process { pid, child: Mutex::new(Some(child)) });
         // A failure from here on must not leave the program running: it is killed, and reaped
         // when `process` goes (by the reaper, once the kill has taken effect).
-        let io = match start_io(id, &*pair.master, tx) {
-            Ok(io) => io,
-            Err(e) => {
-                process.signal_group(libc::SIGKILL);
-                return Err(e);
+        let held = process.clone();
+        let mut pane = TermPane::assemble(id, pair.master, process, true, (cols, rows), env, tx)
+            .inspect_err(|_| held.signal_group(libc::SIGKILL))?;
+        if let Some(text) = &spec.startup_input {
+            pane.write(text.clone().into_bytes());
+        }
+        Ok(pane)
+    }
+
+    /// A pane on the PTY (`fd`) and the program (`pid`) a live restart took over: the kraal
+    /// this one replaced kept them open and running over its exec. `watch`: wait for the
+    /// program to end (it had not, as far as that kraal knew).
+    pub(super) fn adopt(
+        id: PaneId,
+        fd: std::os::fd::OwnedFd,
+        pid: u32,
+        watch: bool,
+        size: (u16, u16),
+        env: &PaneEnv,
+        tx: &Sender<Event>,
+    ) -> Result<TermPane> {
+        start_reaper().context("starting the thread that reaps panes' programs")?;
+        let child: PaneChild = Box::new(AdoptedChild { pid });
+        let process = Arc::new(Process { pid: Some(pid), child: Mutex::new(Some(child)) });
+        TermPane::assemble(id, Box::new(AdoptedPty { fd }), process, watch, size, env, tx)
+    }
+
+    /// The threads that read and write the PTY, the one that waits for the program to end
+    /// (`watch`), and the emulator.
+    fn assemble(
+        id: PaneId,
+        master: Box<dyn MasterPty + Send>,
+        process: Arc<Process>,
+        watch: bool,
+        (cols, rows): (u16, u16),
+        env: &PaneEnv,
+        tx: &Sender<Event>,
+    ) -> Result<TermPane> {
+        let io = start_io(id, &*master, tx)?;
+        if watch {
+            let wait_tx = tx.clone();
+            let waited = process.clone();
+            let eof_rx = io.eof;
+            let started = std::thread::Builder::new().name(format!("pane-{id}-wait")).spawn(move || {
+                // Wait for the end without reaping: that is left to whoever drops the process last.
+                let code = wait_exited(waited.pid);
+                // Report the exit after the last output, so waits and logs see all of it. A program
+                // left in the background can keep the terminal open: then do not wait forever.
+                let _ = eof_rx.recv_timeout(std::time::Duration::from_secs(2));
+                let _ = wait_tx.send(Event::PaneExited(id, waited.pid, code));
+            });
+            if let Err(e) = started {
+                io.stop.store(true, Ordering::Relaxed);
+                return Err(e.into());
             }
-        };
-        let wait_tx = tx.clone();
-        let waited = process.clone();
-        let eof_rx = io.eof;
-        let started = std::thread::Builder::new().name(format!("pane-{id}-wait")).spawn(move || {
-            // Wait for the end without reaping: that is left to whoever drops the process last.
-            let code = wait_exited(waited.pid);
-            // Report the exit after the last output, so waits and logs see all of it. A program
-            // left in the background can keep the terminal open: then do not wait forever.
-            let _ = eof_rx.recv_timeout(std::time::Duration::from_secs(2));
-            let _ = wait_tx.send(Event::PaneExited(id, waited.pid, code));
-        });
-        if let Err(e) = started {
-            io.stop.store(true, Ordering::Relaxed);
-            process.signal_group(libc::SIGKILL);
-            return Err(e.into());
         }
 
         let events = Rc::new(RefCell::new(Vec::new()));
         // Programs may enable the kitty keyboard protocol (Claude Code does, for Shift+Enter).
         let config = TermConfig { scrolling_history: env.scrollback, kitty_keyboard: true, ..TermConfig::default() };
         let term = Term::new(config, &Size { cols, rows }, Listener(events.clone()));
-        let mut pane = TermPane {
+        Ok(TermPane {
             term,
             events,
             parser: Processor::new(),
-            master: pair.master,
+            master,
             input: io.input,
             input_pending: io.input_pending,
             input_dropped: false,
             output: io.output,
+            pid: process.pid,
             process,
             reader_stop: io.stop,
-            pid,
             osc: OscScanner::default(),
             guard: KeyboardStackGuard::default(),
             commands: Commands::new(env.scrollback),
             graphics: crate::graphics::PaneGraphics::new(env.graphics.clone()),
-        };
-        if let Some(text) = &spec.startup_input {
-            pane.write(text.clone().into_bytes());
-        }
-        Ok(pane)
+        })
+    }
+
+    /// Stop reading the PTY: what was read is still to be taken, and then the output channel
+    /// says it ended (see `Pane::drain`). What the program writes next waits in the PTY.
+    pub(super) fn stop_reading(&self) {
+        self.reader_stop.store(true, Ordering::Relaxed);
+    }
+
+    /// Read the PTY again after [`TermPane::stop_reading`].
+    pub(super) fn resume_reading(&mut self, id: PaneId, tx: &Sender<Event>) -> Result<()> {
+        let (output, stop, _eof) = start_reader(id, &*self.master, tx)?;
+        self.output = output;
+        self.reader_stop = stop;
+        Ok(())
+    }
+
+    /// The PTY's descriptor, which a live restart keeps open for the next kraal.
+    pub(super) fn master_fd(&self) -> Option<std::os::fd::RawFd> {
+        self.master.as_raw_fd()
+    }
+
+    /// Bytes of input not written to the PTY yet.
+    pub(super) fn input_pending(&self) -> usize {
+        self.input_pending.load(Ordering::Relaxed)
     }
 
     /// Hang up, as closing a terminal does: SIGHUP to the program, its foreground job, and the
@@ -420,8 +473,32 @@ struct Io {
 }
 
 fn start_io(id: PaneId, master: &(dyn MasterPty + Send), tx: &Sender<Event>) -> Result<Io> {
-    let reader = PtyReader::new(master)?;
     let mut writer = master.take_writer()?;
+    let (out_rx, stop, eof_rx) = start_reader(id, master, tx)?;
+    let (in_tx, in_rx) = crossbeam_channel::unbounded::<Vec<u8>>();
+    let input_pending = Arc::new(AtomicUsize::new(0));
+    let pending = input_pending.clone();
+    let started = std::thread::Builder::new().name(format!("pane-{id}-write")).spawn(move || {
+        for data in in_rx {
+            if writer.write_all(&data).and_then(|_| writer.flush()).is_err() {
+                break;
+            }
+            pending.fetch_sub(data.len(), Ordering::Relaxed);
+        }
+    });
+    if let Err(e) = started {
+        stop.store(true, Ordering::Relaxed);
+        return Err(e.into());
+    }
+    Ok(Io { input: in_tx, input_pending, output: out_rx, eof: eof_rx, stop })
+}
+
+/// The thread that reads a PTY's output: the channel it goes to, the flag that stops it, and
+/// a channel closed when it has seen the end.
+type Reading = (crossbeam_channel::Receiver<Vec<u8>>, Arc<AtomicBool>, crossbeam_channel::Receiver<()>);
+
+fn start_reader(id: PaneId, master: &(dyn MasterPty + Send), tx: &Sender<Event>) -> Result<Reading> {
+    let reader = PtyReader::new(master)?;
     let stop = Arc::new(AtomicBool::new(false));
     let ready_tx = tx.clone();
     let (out_tx, out_rx) = crossbeam_channel::bounded::<Vec<u8>>(4);
@@ -444,22 +521,138 @@ fn start_io(id: PaneId, master: &(dyn MasterPty + Send), tx: &Sender<Event>) -> 
             }
         }
     })?;
-    let (in_tx, in_rx) = crossbeam_channel::unbounded::<Vec<u8>>();
-    let input_pending = Arc::new(AtomicUsize::new(0));
-    let pending = input_pending.clone();
-    let started = std::thread::Builder::new().name(format!("pane-{id}-write")).spawn(move || {
-        for data in in_rx {
-            if writer.write_all(&data).and_then(|_| writer.flush()).is_err() {
-                break;
-            }
-            pending.fetch_sub(data.len(), Ordering::Relaxed);
+    Ok((out_rx, stop, eof_rx))
+}
+
+/// The PTY of a program taken over by a live restart: the descriptor the kraal before kept
+/// open over its exec.
+struct AdoptedPty {
+    fd: std::os::fd::OwnedFd,
+}
+
+impl AdoptedPty {
+    fn dup(&self) -> Result<std::fs::File> {
+        use std::os::fd::AsRawFd;
+        // SAFETY: dup of a descriptor we own; the copy is owned by the File.
+        let copy = unsafe { libc::fcntl(self.fd.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
+        if copy < 0 {
+            return Err(std::io::Error::last_os_error()).context("duplicating the pty");
         }
-    });
-    if let Err(e) = started {
-        stop.store(true, Ordering::Relaxed);
-        return Err(e.into());
+        // SAFETY: `copy` is a fresh descriptor nothing else owns.
+        Ok(unsafe { <std::fs::File as std::os::fd::FromRawFd>::from_raw_fd(copy) })
     }
-    Ok(Io { input: in_tx, input_pending, output: out_rx, eof: eof_rx, stop })
+}
+
+impl MasterPty for AdoptedPty {
+    fn resize(&self, size: PtySize) -> Result<()> {
+        use std::os::fd::AsRawFd;
+        let ws = libc::winsize {
+            ws_row: size.rows,
+            ws_col: size.cols,
+            ws_xpixel: size.pixel_width,
+            ws_ypixel: size.pixel_height,
+        };
+        // SAFETY: TIOCSWINSZ reads the winsize we pass.
+        if unsafe { libc::ioctl(self.fd.as_raw_fd(), libc::TIOCSWINSZ as _, &ws) } != 0 {
+            return Err(std::io::Error::last_os_error()).context("resizing the pty");
+        }
+        Ok(())
+    }
+
+    fn get_size(&self) -> Result<PtySize> {
+        use std::os::fd::AsRawFd;
+        // SAFETY: TIOCGWINSZ fills the zeroed winsize.
+        let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
+        if unsafe { libc::ioctl(self.fd.as_raw_fd(), libc::TIOCGWINSZ as _, &mut ws) } != 0 {
+            return Err(std::io::Error::last_os_error()).context("reading the pty's size");
+        }
+        Ok(PtySize { rows: ws.ws_row, cols: ws.ws_col, pixel_width: ws.ws_xpixel, pixel_height: ws.ws_ypixel })
+    }
+
+    fn try_clone_reader(&self) -> Result<Box<dyn Read + Send>> {
+        Ok(Box::new(self.dup()?))
+    }
+
+    fn take_writer(&self) -> Result<Box<dyn Write + Send>> {
+        Ok(Box::new(self.dup()?))
+    }
+
+    fn process_group_leader(&self) -> Option<libc::pid_t> {
+        use std::os::fd::AsRawFd;
+        // SAFETY: plain syscall on a descriptor we own.
+        match unsafe { libc::tcgetpgrp(self.fd.as_raw_fd()) } {
+            pid if pid > 0 => Some(pid),
+            _ => None,
+        }
+    }
+
+    fn as_raw_fd(&self) -> Option<std::os::fd::RawFd> {
+        use std::os::fd::AsRawFd;
+        Some(self.fd.as_raw_fd())
+    }
+
+    fn tty_name(&self) -> Option<PathBuf> {
+        None
+    }
+}
+
+/// A pane's program taken over by a live restart: still this process's child (exec keeps the
+/// pid), known by its pid alone.
+#[derive(Debug)]
+struct AdoptedChild {
+    pid: u32,
+}
+
+impl portable_pty::ChildKiller for AdoptedChild {
+    fn kill(&mut self) -> std::io::Result<()> {
+        // SAFETY: plain syscall; the pid is ours until this child is reaped.
+        if unsafe { libc::kill(self.pid as libc::pid_t, libc::SIGHUP) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    fn clone_killer(&self) -> Box<dyn portable_pty::ChildKiller + Send + Sync> {
+        Box::new(AdoptedChild { pid: self.pid })
+    }
+}
+
+impl Child for AdoptedChild {
+    fn try_wait(&mut self) -> std::io::Result<Option<portable_pty::ExitStatus>> {
+        reap(self.pid, libc::WNOHANG)
+    }
+
+    fn wait(&mut self) -> std::io::Result<portable_pty::ExitStatus> {
+        loop {
+            if let Some(status) = reap(self.pid, 0)? {
+                return Ok(status);
+            }
+        }
+    }
+
+    fn process_id(&self) -> Option<u32> {
+        Some(self.pid)
+    }
+}
+
+/// Reap child `pid` (`waitpid` with `flags`): its status once it has ended.
+fn reap(pid: u32, flags: libc::c_int) -> std::io::Result<Option<portable_pty::ExitStatus>> {
+    use std::os::unix::process::ExitStatusExt;
+    let mut status = 0;
+    loop {
+        // SAFETY: waitpid writes the status into `status`.
+        let r = unsafe { libc::waitpid(pid as libc::pid_t, &mut status, flags) };
+        match r {
+            0 => return Ok(None),
+            r if r > 0 => return Ok(Some(std::process::ExitStatus::from_raw(status).into())),
+            _ => {
+                let e = std::io::Error::last_os_error();
+                if e.kind() != std::io::ErrorKind::Interrupted {
+                    return Err(e);
+                }
+            }
+        }
+    }
 }
 
 /// Reads a PTY's output, giving up as soon as it is told to stop, even while the program is

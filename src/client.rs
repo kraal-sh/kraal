@@ -85,10 +85,36 @@ fn exchange(stream: &mut UnixStream, req: Request) -> Result<Response> {
                     ServerMsg::Open { .. }
                     | ServerMsg::Event { .. }
                     | ServerMsg::Events { .. }
-                    | ServerMsg::Attached { .. } => continue,
+                    | ServerMsg::Attached { .. }
+                    | ServerMsg::Restarting { .. } => continue,
                 }
             }
             Some(_) => continue,
+        }
+    }
+}
+
+/// Ask the server behind `socket` to restart live (`kraal restart --live`): `Ok` once the
+/// connection closes, as the server replaces itself; why, when it refused.
+pub fn upgrade(socket: &Path) -> Result<()> {
+    let mut stream = UnixStream::connect(socket)
+        .with_context(|| format!("no kraal server at {} (is it running?)", socket.display()))?;
+    let request = ClientMsg::Request { version: protocol::PROTOCOL_VERSION, request: Request::Upgrade };
+    protocol::write_json(&mut stream, &request)?;
+    loop {
+        let payload = match protocol::read_frame(&mut stream) {
+            Ok(None) | Err(_) => return Ok(()),
+            Ok(Some((protocol::JSON, payload))) => payload,
+            Ok(Some(_)) => continue,
+        };
+        match serde_json::from_slice::<ServerMsg>(&payload) {
+            // A server from before live restarts does not know the request.
+            Ok(ServerMsg::Response { result: Err(e) }) if e.starts_with("bad message") => {
+                bail!("the running server cannot restart live: `kraal kill`, then `kraal` (the layout is kept)")
+            }
+            Ok(ServerMsg::Response { result: Err(e) }) => bail!(e),
+            Ok(ServerMsg::Response { result: Ok(_) }) => return Ok(()),
+            _ => continue,
         }
     }
 }
@@ -654,6 +680,8 @@ pub fn attach(mut target: Target, mut workspace: Option<String>, mouse: bool, at
     // What the server said it runs, and the server that said it is restarting.
     let mut server_version = None;
     let mut restarting = None;
+    // The server said it restarts live: when, and the workspace to come back to.
+    let mut live_restart: Option<(Instant, Option<String>)> = None;
     let reason = 'session: loop {
         let session = match greeted.take() {
             Some(s) => Ok(s),
@@ -705,6 +733,7 @@ pub fn attach(mut target: Target, mut workspace: Option<String>, mouse: bool, at
                             Ok(ServerMsg::Open { url }) => {
                                 let _ = crate::pane::open_url(&url);
                             }
+                            Ok(ServerMsg::Restarting { workspace }) => live_restart = Some((Instant::now(), workspace)),
                             _ => {}
                         },
                         Ok(None) => break c.why_lost("the connection closed"),
@@ -721,6 +750,17 @@ pub fn attach(mut target: Target, mut workspace: Option<String>, mouse: bool, at
             match wait_restarted(session, old, &quit) {
                 Ok(()) => continue 'session,
                 Err(why) => break 'session why,
+            }
+        }
+        // A server that said it restarts live answers again on its socket: back to the
+        // workspace shown.
+        if let Some((_, shown)) = live_restart.take().filter(|(at, _)| at.elapsed() < Duration::from_secs(30)) {
+            workspace = shown.or(workspace);
+            if let Target::Local { session } = &target {
+                match wait_restarted(session, None, &quit) {
+                    Ok(()) => continue 'session,
+                    Err(why) => break 'session why,
+                }
             }
         }
         let Target::Remote { label, .. } = &target else {

@@ -293,7 +293,7 @@ fn flag(argv: &[String], names: &[&str]) -> Option<String> {
 }
 
 /// What the last tools run in a pane worked on.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct Seen {
     /// Absolute `KUBECONFIG` of the last Kubernetes tool ("" for the default file), and the
     /// context and namespace it chose by flags.
@@ -306,7 +306,7 @@ pub struct Seen {
 }
 
 /// Where a Terraform run's workspace came from, which decides how long it holds.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum TfSeen {
     /// `TF_WORKSPACE` in its environment: the shell's, wherever it goes next.
     Env(String),
@@ -316,7 +316,7 @@ pub enum TfSeen {
 }
 
 /// What a Kubernetes command line chose by itself, overriding the kubeconfig's choice.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct KubeFlags {
     pub context: Option<String>,
     pub namespace: Option<String>,
@@ -339,7 +339,7 @@ pub fn aws_profile_flag(argv: &[String]) -> Option<String> {
 
 // ---- Kubernetes --------------------------------------------------------------------------
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct KubeContext {
     pub context: String,
     pub namespace: Option<String>,
@@ -654,7 +654,7 @@ pub fn terraform_dir_workspace(dir: &Path, data_dir: Option<&str>) -> Option<Str
 pub const REPORTED_MAX: usize = 200;
 
 /// One context a shell reported.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Reported<T> {
     /// Nothing to report: no kubeconfig or no current context, not a Terraform directory, the
     /// default AWS profile.
@@ -678,7 +678,7 @@ impl<T> Reported<T> {
 /// What a shell on a server says it works on, at each prompt (`kraal integration show`): the
 /// contexts kraal reads itself for local panes. The text comes from the server: kraal only takes
 /// names made of a few safe characters, and never runs them.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct RemoteContexts {
     pub kube: Reported<KubeContext>,
     pub terraform: Reported<String>,

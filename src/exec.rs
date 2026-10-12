@@ -63,19 +63,68 @@ pub fn group_alive(child: &Child) -> bool {
 /// the group it leads) cannot go to another process, so [`kill_group`] still reaches only what
 /// it started.
 pub fn has_exited(child: &Child) -> bool {
+    pid_exited(child.id())
+}
+
+/// [`has_exited`] for a child known by its pid alone (one a live restart took over).
+pub fn pid_exited(pid: u32) -> bool {
     #[cfg(unix)]
     {
         // SAFETY: waitid fills `info`, which we own; WNOWAIT leaves the child to be reaped later.
         unsafe {
             let mut info: libc::siginfo_t = std::mem::zeroed();
             let flags = libc::WEXITED | libc::WNOHANG | libc::WNOWAIT;
-            libc::waitid(libc::P_PID, child.id() as libc::id_t, &mut info, flags) == 0 && info.si_pid() != 0
+            libc::waitid(libc::P_PID, pid as libc::id_t, &mut info, flags) == 0 && info.si_pid() != 0
         }
     }
     #[cfg(not(unix))]
     {
-        let _ = child;
+        let _ = pid;
         false
+    }
+}
+
+/// Whether `pid` is a child of this process (ended or not, not reaped yet).
+pub fn is_child(pid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        // SAFETY: waitid fills `info`, which we own; WNOWAIT leaves the child to be reaped later.
+        unsafe {
+            let mut info: libc::siginfo_t = std::mem::zeroed();
+            let flags = libc::WEXITED | libc::WNOHANG | libc::WNOWAIT;
+            libc::waitid(libc::P_PID, pid as libc::id_t, &mut info, flags) == 0
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        false
+    }
+}
+
+/// [`kill_group`] for a child known by its pid alone: how it ended.
+pub fn kill_group_of(pid: u32) -> Option<std::process::ExitStatus> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        let mut status = 0;
+        // SAFETY: plain syscalls on a child of ours and the group it leads; waitpid writes
+        // `status`.
+        unsafe {
+            libc::kill(-(pid as libc::pid_t), libc::SIGKILL);
+            libc::kill(pid as libc::pid_t, libc::SIGKILL);
+            while libc::waitpid(pid as libc::pid_t, &mut status, 0) < 0 {
+                if std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
+                    return None;
+                }
+            }
+        }
+        Some(std::process::ExitStatus::from_raw(status))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        None
     }
 }
 

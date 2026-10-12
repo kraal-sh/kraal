@@ -1,9 +1,9 @@
 //! Session state on disk, so a server restart (or a reboot) brings the layout back.
 //!
-//! Processes cannot survive a restart; panes come back as fresh shells in their last working
-//! directory. Interactive SSH panes reconnect and agents with a known session id are resumed
-//! (`claude --resume <id>`); other command panes wait for Enter rather than run again by
-//! themselves. Typing is never broadcast after a restart.
+//! Processes cannot survive a restart (a live restart, see `server::upgrade`, keeps them); panes
+//! come back as fresh shells in their last working directory. Interactive SSH panes reconnect
+//! and agents with a known session id are resumed (`claude --resume <id>`); other command panes
+//! wait for Enter rather than run again by themselves. Typing is never broadcast after a restart.
 //!
 //! What each pane showed is saved too, unless `save_scrollback` is off: a file per pane in the
 //! session's scrollback directory, named by the state and given back to the pane replacing it.
@@ -76,6 +76,9 @@ pub struct PaneSnap {
     /// The file in the session's scrollback directory holding what the pane showed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scrollback: Option<String>,
+    /// The pane's id, in the state a live restart hands over (its programs know it).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<PaneId>,
 }
 
 /// What is saved of a pane's scrollback.
@@ -87,7 +90,8 @@ pub struct SavedScrollback {
     pub taken: Instant,
 }
 
-pub fn snapshot(server: &Server) -> SessionSnapshot {
+/// The session's state; with `live`, each pane names its id (see [`PaneSnap::id`]).
+pub fn snapshot(server: &Server, live: bool) -> SessionSnapshot {
     let pane_snap = |id: PaneId| -> PaneSnap {
         let p = &server.panes[&id];
         let mut spec = p.spec.clone();
@@ -115,6 +119,7 @@ pub fn snapshot(server: &Server) -> SessionSnapshot {
             agent_session: p.agent.session_id.clone(),
             stopped: p.exit_code.is_some(),
             scrollback: server.scrollback.get(&id).and_then(|s| s.file.clone()),
+            id: live.then_some(id),
         }
     };
     fn node(n: &Node, f: &dyn Fn(PaneId) -> PaneSnap) -> NodeSnap {
@@ -281,6 +286,9 @@ pub fn resume_command(agent: &str, session: &str) -> Option<String> {
     }
 }
 
+/// The way a pane of the state is made again.
+pub type MakePane<'a> = dyn FnMut(&mut Server, &PaneSnap) -> Result<PaneId> + 'a;
+
 pub fn apply(server: &mut Server, snap: SessionSnapshot) -> Result<()> {
     for t in &snap.tunnels {
         let host = if t.remote_host.contains(':') { format!("[{}]", t.remote_host) } else { t.remote_host.clone() };
@@ -294,20 +302,25 @@ pub fn apply(server: &mut Server, snap: SessionSnapshot) -> Result<()> {
             server.warnings.push(format!("tunnel {}: {e:#}", t.describe()));
         }
     }
-    for ws in snap.workspaces {
+    apply_layout(server, snap.workspaces, snap.revision, &mut spawn);
+    Ok(())
+}
+
+/// Make the workspaces of a state again, each pane with `make`.
+pub fn apply_layout(server: &mut Server, workspaces: Vec<WorkspaceSnap>, revision: u32, make: &mut MakePane) {
+    for ws in workspaces {
         let panes_before: std::collections::HashSet<PaneId> = server.panes.keys().copied().collect();
         let workspaces_before: Vec<u32> = server.workspaces.iter().map(|w| w.id).collect();
         let name = ws.name.clone();
-        if let Err(e) = apply_workspace(server, ws, snap.revision) {
+        if let Err(e) = apply_workspace(server, ws, revision, make) {
             server.rollback(&panes_before, &workspaces_before);
             server.warnings.push(format!("could not restore workspace {name}: {e:#}"));
         }
     }
     server.relayout();
-    Ok(())
 }
 
-fn apply_workspace(server: &mut Server, ws: WorkspaceSnap, revision: u32) -> Result<()> {
+fn apply_workspace(server: &mut Server, ws: WorkspaceSnap, revision: u32, make: &mut MakePane) -> Result<()> {
     {
         let id = server.new_workspace(ws.name, ws.definition);
         let wi = server.ws_index(id).unwrap();
@@ -319,14 +332,14 @@ fn apply_workspace(server: &mut Server, ws: WorkspaceSnap, revision: u32) -> Res
             let old_default = revision == 0 && t.name.strip_prefix("tab ").is_some_and(|n| n.parse::<u32>().is_ok());
             let mut tab = Tab::new(tab_id, if old_default { String::new() } else { t.name });
             if let Some(root) = &t.root {
-                tab.root = Some(build(server, root)?);
+                tab.root = Some(build(server, root, make)?);
             }
             for (p, rect) in &t.floating {
                 // Transfer windows are not worth bringing back.
                 if p.spec.close_on_success {
                     continue;
                 }
-                let pane = spawn(server, p)?;
+                let pane = make(server, p)?;
                 tab.floating.push(Floating { pane, rect: *rect });
             }
             let panes = tab.panes();
@@ -351,13 +364,13 @@ fn apply_workspace(server: &mut Server, ws: WorkspaceSnap, revision: u32) -> Res
     Ok(())
 }
 
-fn build(server: &mut Server, n: &NodeSnap) -> Result<Node> {
+fn build(server: &mut Server, n: &NodeSnap, make: &mut MakePane) -> Result<Node> {
     Ok(match n {
-        NodeSnap::Pane(p) => Node::Leaf(spawn(server, p)?),
+        NodeSnap::Pane(p) => Node::Leaf(make(server, p)?),
         NodeSnap::Split { axis, children } => {
             let mut out = Vec::new();
             for (c, w) in children {
-                out.push((build(server, c)?, *w));
+                out.push((build(server, c, make)?, *w));
             }
             let mut node = Node::Split { axis: *axis, children: out };
             node.normalize();
@@ -366,7 +379,8 @@ fn build(server: &mut Server, n: &NodeSnap) -> Result<Node> {
     })
 }
 
-fn spawn(server: &mut Server, p: &PaneSnap) -> Result<PaneId> {
+/// A pane of the state, its command started again (or waiting for Enter).
+pub fn spawn(server: &mut Server, p: &PaneSnap) -> Result<PaneId> {
     // An agent that was still waiting for its account waits again, and is resolved again.
     if p.spec.pending_agent.is_some() {
         let id = server.spawn_pane_suspended(p.name.clone(), p.spec.clone(), "choosing the account")?;

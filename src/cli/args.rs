@@ -71,6 +71,9 @@ pub enum Cmd {
         /// Do not ask, even when programs would stop.
         #[arg(short, long)]
         yes: bool,
+        /// Only a live restart: every program in its panes keeps running.
+        #[arg(long)]
+        live: bool,
     },
     /// Forget a session's saved layout and scrollback.
     Forget,
@@ -347,7 +350,14 @@ pub enum Cmd {
     },
     /// Run a session server in the foreground (normally started automatically).
     #[command(hide = true)]
-    Server,
+    Server {
+        /// Take over from the server this one replaces (a live restart), as this file says.
+        #[arg(long, value_name = "FILE")]
+        handoff: Option<PathBuf>,
+        /// Say whether this kraal can take over a server writing this hand-off format.
+        #[arg(long, value_name = "VERSION")]
+        handoff_check: Option<u32>,
+    },
 }
 
 #[derive(Subcommand)]

@@ -115,6 +115,11 @@ fn marker_row<T>(term: &Term<T>, marker: &str) -> Option<i32> {
 /// lines separated by CR LF, each starting and ending with default attributes, at most
 /// `max_bytes` of the newest.
 fn encode<T>(term: &Term<T>, max_bytes: usize) -> Vec<u8> {
+    encode_rows(term, max_bytes).0
+}
+
+/// [`encode`], and the screen row of the last line it holds (below 0: a line of the history).
+pub(super) fn encode_rows<T>(term: &Term<T>, max_bytes: usize) -> (Vec<u8>, i32) {
     let grid = term.grid();
     let cols = grid.columns();
     let top = -(grid.history_size() as i32);
@@ -141,7 +146,14 @@ fn encode<T>(term: &Term<T>, max_bytes: usize) -> Vec<u8> {
         end = start - 1;
     }
     lines.reverse();
-    lines.join(&b"\r\n"[..])
+    (lines.join(&b"\r\n"[..]), bottom)
+}
+
+/// The attributes `cell` is drawn with, as one SGR sequence.
+pub(super) fn sgr_of(cell: &Cell) -> Vec<u8> {
+    let mut out = Vec::new();
+    Pen::of(cell).write(&mut out);
+    out
 }
 
 /// One line of text, over the rows it wraps on: all of each row but the last, which ends at its
@@ -319,7 +331,11 @@ pub(super) fn clean(saved: &[u8], lines: usize) -> Vec<u8> {
         return Vec::new();
     }
     // Each line starts with default attributes: the last ones read alone.
-    let from = saved.iter().enumerate().rev().filter(|(_, b)| **b == b'\n').nth(lines - 1).map_or(0, |(i, _)| i + 1);
+    let from = if lines == usize::MAX {
+        0
+    } else {
+        saved.iter().enumerate().rev().filter(|(_, b)| **b == b'\n').nth(lines - 1).map_or(0, |(i, _)| i + 1)
+    };
     let mut kept = Clean(Vec::with_capacity(saved.len() - from));
     Parser::new().advance(&mut kept, &saved[from..]);
     kept.0

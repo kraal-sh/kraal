@@ -23,6 +23,32 @@ pub(super) fn kill(s: &Session) -> Result<()> {
     Ok(())
 }
 
+/// `kraal restart --live`: the session's server replaces itself with the kraal installed now,
+/// and the programs in its panes keep running.
+pub(super) fn restart_live(s: &Session) -> Result<()> {
+    let socket = s.socket();
+    let Response::Pong { pid, version, .. } = s.request(Request::Ping)? else { bail!("unexpected answer") };
+    if let Err(why) = client::upgrade(&socket) {
+        bail!("session {} was not restarted: {why:#}", s.name);
+    }
+    // It answers again once the new kraal has taken everything over.
+    let start = std::time::Instant::now();
+    let (now, now_version) = loop {
+        if let Ok(Response::Pong { pid, version, .. }) = client::request(&socket, Request::Ping) {
+            break (pid, version);
+        }
+        if start.elapsed() > std::time::Duration::from_secs(30) {
+            bail!("session {} did not answer again; `kraal` starts it with its layout", s.name);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    };
+    if now != pid {
+        bail!("session {} restarted, but not live: its programs were stopped", s.name);
+    }
+    println!("restarted session {} live: kraal {version} → {now_version}", s.name);
+    Ok(())
+}
+
 /// `kraal forget`: delete what a stopped session saved.
 pub(super) fn forget(s: &Session) -> Result<()> {
     let session = &s.name;

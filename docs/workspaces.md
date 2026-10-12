@@ -40,6 +40,24 @@ and it can hold secrets (a token printed by a command, a password echoed by mist
 `save_scrollback = false` in the config stops saving it and deletes what was saved.
 `kraal forget` deletes the saved layout and scrollback of a stopped session.
 
+### Live restart
+
+`kraal restart --live` moves a running server to the kraal binary installed now (after
+`kraal update`) and stops nothing: the server replaces itself in place, the new kraal takes over
+the panes' terminals, and every program in them keeps running, with the same pid (a build, a
+`tail -f`, an editor, an agent in the middle of a turn). Each pane shows what it showed, colours,
+cursor and modes included; a full-screen program is made to draw itself again. Pane ids, tunnels
+and their ssh stay. Attached clients come back by themselves to the workspace they showed (a
+client of an older kraal exits instead: `kraal` attaches again); `kraal events` ends, and started
+again with `--since`, it gets what it missed, as the numbering goes on.
+
+The new binary is tried first: one that cannot take over is refused, and so is a live restart
+while something cannot be carried over (a runbook run, a transfer, a file open in the local
+editor, an agent switching accounts, a `kraal wait`): the reason is given, and the server goes on
+as before. A hook or background work still running is waited for a few seconds. What the server
+hands over goes through a file readable by you alone in `~/.local/state/kraal/`, deleted as soon
+as it is read. Linux only for now; elsewhere, `kraal kill`, then `kraal`.
+
 ## Workspace files
 
 Workspaces live in `~/.config/kraal/workspaces/*.kdl`, in KDL:

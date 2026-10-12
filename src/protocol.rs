@@ -164,6 +164,11 @@ pub enum ServerMsg {
     Events {
         events: Vec<serde_json::Value>,
     },
+    /// The server is about to replace itself (a live restart): the connection will drop, and
+    /// the same session answers again on the same socket, showing `workspace`.
+    Restarting {
+        workspace: Option<String>,
+    },
 }
 
 impl ServerMsg {
@@ -342,6 +347,10 @@ pub enum Request {
         #[serde(default)]
         restart: bool,
     },
+    /// Replace the server with the kraal binary now installed, keeping every program in its
+    /// panes running (a live restart). Refused with the reason when something cannot be carried
+    /// over; once done, the connection simply closes.
+    Upgrade,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

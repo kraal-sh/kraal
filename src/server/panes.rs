@@ -38,9 +38,14 @@ impl Server {
 
     /// Spawn a pane process with a provisional size; call [`Server::relayout`] afterwards.
     pub fn spawn_pane(&mut self, name: Option<String>, spec: PaneSpec) -> Result<PaneId> {
+        let id = self.alloc_id();
+        self.spawn_pane_as(id, name, spec)
+    }
+
+    /// [`Server::spawn_pane`] with the id `id` (one given before, which no pane has now).
+    pub(super) fn spawn_pane_as(&mut self, id: PaneId, name: Option<String>, spec: PaneSpec) -> Result<PaneId> {
         let mut spec = spec;
         self.add_worktree_env(&mut spec);
-        let id = self.alloc_id();
         let inner = self.inner(self.layout_area, false);
         if let Some([left, right]) = spec.files.clone() {
             let fm = self.file_manager(&left, &right);

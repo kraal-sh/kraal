@@ -30,7 +30,12 @@ impl Env {
     }
 
     fn cmd(&self, args: &[&str]) -> Command {
-        let mut c = self.isolated(Path::new(env!("CARGO_BIN_EXE_kraal")));
+        self.cmd_with(Path::new(env!("CARGO_BIN_EXE_kraal")), args)
+    }
+
+    /// [`Env::cmd`] run by another kraal binary (a server it starts runs that binary too).
+    fn cmd_with(&self, kraal: &Path, args: &[&str]) -> Command {
+        let mut c = self.isolated(kraal);
         c.args(["-s", &self.session]).args(args);
         c
     }
@@ -138,7 +143,14 @@ impl Env {
     /// typed into it.
     #[cfg(target_os = "linux")]
     fn client(&self) -> std::process::Child {
-        let attach = self.cmd(&["attach"]);
+        self.client_showing(&["attach"], Path::new("/dev/null"))
+    }
+
+    /// [`Env::client`] attached with `args`, everything it writes to its terminal kept in
+    /// `screen`.
+    #[cfg(target_os = "linux")]
+    fn client_showing(&self, args: &[&str], screen: &Path) -> std::process::Child {
+        let attach = self.cmd(args);
         let line = std::iter::once(attach.get_program())
             .chain(attach.get_args())
             .map(|a| format!("'{}'", a.to_string_lossy()))
@@ -146,7 +158,7 @@ impl Env {
             .join(" ");
         let mut c = Command::new("script");
         // The terminal `script` makes has no size until it is given one.
-        c.args(["-q", "-f", "-c", &format!("stty cols 100 rows 30; exec {line}"), "/dev/null"]);
+        c.args(["-q", "-f", "-c", &format!("stty cols 100 rows 30; exec {line}")]).arg(screen);
         for (k, v) in attach.get_envs() {
             match v {
                 Some(v) => c.env(k, v),
@@ -4052,4 +4064,300 @@ fn a_server_file_is_edited_in_the_local_editor() {
         assert!(err.contains(why), "{target}: {err}");
     }
     drop(sshd);
+}
+
+/// The parent of process `pid`.
+#[cfg(target_os = "linux")]
+fn parent_of(pid: i32) -> Option<i32> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    stat.rsplit_once(')')?.1.split_whitespace().nth(1)?.parse().ok()
+}
+
+/// A pane that prints its pid, then `tick N` ten times a second.
+#[cfg(target_os = "linux")]
+const COUNTER: &str = "echo pid $$; i=0; while :; do i=$((i+1)); echo tick $i; sleep 0.1; done";
+
+/// The pid a [`COUNTER`] pane printed.
+#[cfg(target_os = "linux")]
+fn counter_pid(env: &Env, pane: &str) -> i32 {
+    let screen = env.wait_for_text(pane, "tick 2");
+    screen.lines().find_map(|l| l.trim().strip_prefix("pid ")?.parse().ok()).expect("its pid")
+}
+
+/// Wait until a [`COUNTER`] pane has counted 3 more.
+#[cfg(target_os = "linux")]
+fn still_counting(env: &Env, pane: &str) {
+    let last = |s: &str| s.lines().filter_map(|l| l.trim().strip_prefix("tick ")?.parse::<u64>().ok()).max();
+    let now = last(&env.run(&["read", "-p", pane])).unwrap_or(0);
+    env.wait_for_text(pane, &format!("tick {}", now + 3));
+}
+
+/// Hand-off files left in the state directory.
+#[cfg(target_os = "linux")]
+fn handoff_files(env: &Env) -> Vec<PathBuf> {
+    let entries = std::fs::read_dir(env.root.join("state/kraal")).into_iter().flatten().flatten();
+    entries
+        .map(|e| e.path())
+        .filter(|p| p.file_name().is_some_and(|n| n.to_string_lossy().starts_with("handoff-")))
+        .collect()
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn a_live_restart_keeps_programs_running_and_clients_attached() {
+    let env = Env::new("live");
+    std::fs::create_dir_all(env.root.join("state/kraal")).unwrap();
+    std::fs::write(env.root.join("state/kraal/welcomed"), "").unwrap();
+    // A hook says when a workspace opens.
+    let opened = env.root.join("opened");
+    let cfg = env.root.join("config/kraal/config.toml");
+    let mut text = std::fs::read_to_string(&cfg).unwrap();
+    text.push_str(&format!("\n[hooks]\n\"workspace.opened\" = \"echo $KRAAL_WORKSPACE >> '{}'\"\n", opened.display()));
+    std::fs::write(&cfg, text).unwrap();
+    env.workspace("w", "layout {\n    pane name=\"sh\"\n}\n");
+    env.run(&["open", "w"]);
+    let start = Instant::now();
+    while std::fs::read_to_string(&opened).unwrap_or_default() != "w\n" {
+        assert!(start.elapsed() < Duration::from_secs(10), "the hook did not run");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let shown = env.root.join("client-screen");
+    let mut client = env.client_showing(&["attach", "w"], &shown);
+    // A full-screen program that draws itself again when its terminal changes size, and leaves
+    // the alternate screen once told.
+    let full = env.root.join("full");
+    let leave = env.root.join("leave");
+    write_script(
+        &full,
+        &format!(
+            "#!/bin/sh\nn=0\ndraw() {{ n=$((n+1)); printf '\\033[H\\033[2Jfull screen, drawn %s times\\r\\n' $n; }}\n\
+             echo before full screen\nprintf '\\033[?1049h'\ndraw\ntrap draw WINCH\n\
+             while [ ! -e '{}' ]; do sleep 0.1; done\nprintf '\\033[?1049l'\necho back\nexec sleep 600\n",
+            leave.display()
+        ),
+    );
+    env.run(&["run", "--name", "counter", "--", "sh", "-c", COUNTER]);
+    env.run(&["run", "--name", "full", "--", &full.display().to_string()]);
+    env.run(&["run", "--name", "done", "--", "sh", "-c", "echo finished"]);
+    let pid = counter_pid(&env, "counter");
+    let server = parent_of(pid).expect("the server");
+    // A narrow pane wraps the line.
+    let drawn = || {
+        let screen = env.run(&["read", "-p", "full"]);
+        let joined: String = screen.lines().collect();
+        let n = joined.split_once("drawn ").and_then(|(_, rest)| rest.split_once(" times")?.0.parse().ok());
+        (n.unwrap_or(0u32), screen)
+    };
+    env.wait_for_text("full", "full screen, drawn");
+    let start = Instant::now();
+    while pane_json(&env, "done")["exit_code"] != 0 {
+        assert!(start.elapsed() < Duration::from_secs(10), "{}", pane_json(&env, "done"));
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    std::thread::sleep(Duration::from_millis(300));
+    let (times, _) = drawn();
+
+    let out = env.run(&["restart", "--live"]);
+    assert!(out.contains("restarted session live live"), "{out}");
+    // The same server process, and the same program in the pane, counting on.
+    assert_eq!(parent_of(pid), Some(server));
+    still_counting(&env, "counter");
+    // The full-screen program shows, and is made to draw itself again.
+    let start = Instant::now();
+    while drawn().0 <= times {
+        assert!(start.elapsed() < Duration::from_secs(10), "not drawn again: {}", drawn().1);
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(!drawn().1.contains("before full screen"), "{}", drawn().1);
+    // What it covers comes back when it leaves the alternate screen.
+    std::fs::write(&leave, "").unwrap();
+    env.wait_for_text("full", "back");
+    let all: String = env.run(&["read", "-p", "full", "--lines", "100"]).lines().collect();
+    assert!(all.contains("before full screenback"), "{all}");
+    // A finished command still shows how it ended.
+    assert_eq!(pane_json(&env, "done")["exit_code"], 0);
+    // The client came back by itself: what a pane prints now reaches its terminal.
+    env.run(&["send", "-p", "sh", "--enter", "echo AFTER-$((40+2))"]);
+    let start = Instant::now();
+    while !String::from_utf8_lossy(&std::fs::read(&shown).unwrap_or_default()).contains("AFTER-42") {
+        assert!(start.elapsed() < Duration::from_secs(10), "the client did not come back");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(client.try_wait().unwrap().is_none(), "the client is attached");
+    assert!(handoff_files(&env).is_empty(), "{:?}", handoff_files(&env));
+    // Nothing opened again.
+    assert_eq!(std::fs::read_to_string(&opened).unwrap(), "w\n");
+    let _ = client.kill();
+    let _ = client.wait();
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn a_refused_live_restart_leaves_the_server_as_it_was() {
+    let env = Env::new("refused");
+    let bin = env.root.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    // The server runs a copy of kraal, replaced below as `kraal update` does it.
+    let kraal = bin.join("kraal");
+    let install = |from: &Path| {
+        let staged = bin.join(".kraal.new");
+        assert!(Command::new("cp").arg(from).arg(&staged).status().unwrap().success());
+        std::fs::rename(&staged, &kraal).unwrap();
+    };
+    install(Path::new(env!("CARGO_BIN_EXE_kraal")));
+    // The file manager's copies run rsync: this one copies nothing, and ends when told.
+    let stop = env.root.join("stop");
+    write_script(
+        &bin.join("rsync"),
+        &format!(
+            "#!/bin/sh\n[ \"$1\" = --version ] && {{ echo 'rsync  version 3.2.7  protocol version 31'; exit 0; }}\n\
+             while [ ! -e '{}' ]; do sleep 0.1; done\n",
+            stop.display()
+        ),
+    );
+    let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap_or_default());
+    env.workspace("w", "layout {\n    pane name=\"sh\"\n}\n");
+    let out = env.cmd_with(&kraal, &["open", "w"]).env("PATH", &path).output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    env.run(&["run", "--name", "counter", "--", "sh", "-c", COUNTER]);
+    let pid = counter_pid(&env, "counter");
+    let server = parent_of(pid).expect("the server");
+    let refused = |why: &str| {
+        let out = env.try_run(&["restart", "--live"]);
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(!out.status.success() && err.contains(why), "{why}: {err}");
+        // The same server, the same program counting on, nothing left behind.
+        assert_eq!(parent_of(pid), Some(server));
+        still_counting(&env, "counter");
+        assert!(handoff_files(&env).is_empty(), "{:?}", handoff_files(&env));
+    };
+
+    // A transfer runs.
+    let (from, to) = (env.root.join("from"), env.root.join("to"));
+    std::fs::create_dir_all(&from).unwrap();
+    std::fs::create_dir_all(&to).unwrap();
+    std::fs::write(from.join("payload.txt"), "data").unwrap();
+    env.run(&["files", &from.display().to_string(), &to.display().to_string()]);
+    let mut client = RawClient::attach(&env, "w");
+    client.wait_for_screen("payload.txt");
+    for key in [&b"\x1b[B"[..], b"c"] {
+        client.send(key);
+        std::thread::sleep(Duration::from_millis(150));
+    }
+    let copy = || {
+        let panes: serde_json::Value = serde_json::from_str(&env.run(&["panes", "--json"])).unwrap();
+        panes.as_array().unwrap().iter().find(|p| p["name"].as_str().is_some_and(|n| n.contains("copy"))).cloned()
+    };
+    let start = Instant::now();
+    while copy().is_none() {
+        assert!(start.elapsed() < Duration::from_secs(10), "the copy did not start");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    refused("still running");
+    std::fs::write(&stop, "").unwrap();
+    let start = Instant::now();
+    while copy().is_some_and(|c| c["exit_code"].is_null()) {
+        assert!(start.elapsed() < Duration::from_secs(10), "the copy did not end");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    // A `kraal wait` waits.
+    let mut wait = env.cmd(&["wait", "-p", "sh", "--until", "exit", "--timeout", "60"]).spawn().unwrap();
+    std::thread::sleep(Duration::from_millis(300));
+    refused("kraal wait");
+    let _ = wait.kill();
+    let _ = wait.wait();
+
+    // The binary installed now is not a kraal that can take over.
+    write_script(&env.root.join("not-kraal"), "#!/bin/sh\nexit 0\n");
+    install(&env.root.join("not-kraal"));
+    refused("cannot take over");
+
+    // Once all that is over, from the kraal renamed over the one the server runs.
+    install(Path::new(env!("CARGO_BIN_EXE_kraal")));
+    let out = env.run(&["restart", "--live"]);
+    assert!(out.contains("restarted session refused live"), "{out}");
+    assert_eq!(parent_of(pid), Some(server));
+    still_counting(&env, "counter");
+    assert!(handoff_files(&env).is_empty(), "{:?}", handoff_files(&env));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn tunnels_and_waiting_commands_are_carried_over_a_live_restart() {
+    let env = Env::new("livetunnel");
+    // A fake ssh that says it listens (as `ssh -v` does), then stays; its pids go in a file.
+    let bin = env.root.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let pids = env.root.join("ssh-pids");
+    write_script(
+        &bin.join("ssh"),
+        &format!(
+            "#!/bin/sh\nprev=; for a; do [ \"$prev\" = -L ] && fwd=$a; prev=$a; done\n\
+             port=$(echo \"$fwd\" | cut -d: -f2)\necho $$ >> {}\n\
+             echo \"debug1: Local forwarding listening on 127.0.0.1 port $port.\" >&2\n\
+             echo \"debug1: channel 0: new port-listener [port listener] (inactive timeout: 0)\" >&2\n\
+             exec sleep 600\n",
+            pids.display()
+        ),
+    );
+    let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap_or_default());
+    let run = |args: &[&str]| {
+        let out = env.cmd(args).env("PATH", &path).output().unwrap();
+        assert!(out.status.success(), "kraal {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+    let port = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap().local_addr().unwrap().port();
+    let tunnel_up =
+        || run(&["tunnel", "list"]).lines().any(|l| l.starts_with("up") && l.ends_with(&format!("localhost:{port}")));
+    let wait_up = || {
+        let start = Instant::now();
+        while !tunnel_up() {
+            assert!(start.elapsed() < Duration::from_secs(10), "{}", run(&["tunnel", "list"]));
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    };
+    let ssh_pids = || -> Vec<i32> {
+        std::fs::read_to_string(&pids).unwrap_or_default().lines().filter_map(|l| l.trim().parse().ok()).collect()
+    };
+    env.workspace(
+        "w",
+        "layout {\n    pane split_direction=\"vertical\" {\n        pane name=\"main\"\n        \
+         pane name=\"deploy\" command=\"sh\" { args \"-c\" \"echo DEPLOYED; exec sleep 1000\"; }\n    }\n}\n",
+    );
+    run(&["open", "w"]);
+    env.wait_for_text("deploy", "DEPLOYED");
+    run(&["tunnel", "add", "ok@a.lan", "5432", "--local", &port.to_string()]);
+    wait_up();
+    // After a restart, the command waits for Enter.
+    run(&["kill"]);
+    run(&["open", "w"]);
+    wait_up();
+    env.wait_for_text_since_restore("deploy", "restored session");
+    let ssh = *ssh_pids().last().unwrap();
+
+    let out = run(&["restart", "--live"]);
+    assert!(out.contains("restarted"), "{out}");
+    // The tunnel keeps its ssh: up, and no other one started.
+    assert!(tunnel_up(), "{}", run(&["tunnel", "list"]));
+    std::thread::sleep(Duration::from_millis(1500));
+    assert!(tunnel_up(), "{}", run(&["tunnel", "list"]));
+    assert_eq!(*ssh_pids().last().unwrap(), ssh);
+    // SAFETY: signal 0 only checks that the process exists.
+    let alive = |pid: i32| unsafe { libc::kill(pid, 0) } == 0;
+    assert!(alive(ssh));
+    // The command still waits for Enter, and Enter runs it.
+    assert_eq!(pane_json(&env, "deploy")["suspended"], true);
+    let mut client = RawClient::attach(&env, "w");
+    run(&["focus", "deploy"]);
+    std::thread::sleep(Duration::from_millis(300));
+    client.send(b"\r");
+    env.wait_for_text_since_restore("deploy", "DEPLOYED");
+    // Closing the tunnel stops the ssh it kept.
+    run(&["tunnel", "rm", &port.to_string()]);
+    let start = Instant::now();
+    while alive(ssh) {
+        assert!(start.elapsed() < Duration::from_secs(5), "the tunnel's ssh still runs");
+        std::thread::sleep(Duration::from_millis(20));
+    }
 }

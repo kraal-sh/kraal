@@ -19,12 +19,14 @@ use crate::server::Event;
 
 mod commands;
 mod guard;
+mod live;
 mod osc;
 mod pty;
 mod screen;
 mod scrollback;
 
 pub use commands::{Finished, short_duration};
+pub use live::{Drained, LivePane};
 use osc::sanitize_title;
 use osc::{Osc, OscScanner};
 pub use osc::{osc_notify, osc52};

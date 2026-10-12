@@ -28,6 +28,7 @@ pub mod runbooks;
 mod ssh;
 mod tools;
 mod ui;
+mod upgrade;
 mod worktrees;
 
 use std::collections::HashMap;
@@ -55,6 +56,7 @@ pub use clients::frame_bytes;
 use persistence::spawn_persister;
 pub use ssh::ssh_config_hosts;
 pub use ui::Mode;
+pub use upgrade::handoff_check;
 
 pub type ClientId = u32;
 
@@ -447,6 +449,10 @@ pub struct Server {
     sidebar_was_useful: bool,
     /// Whether a client was told how to stop the broadcast its key started.
     pub broadcast_tip_shown: bool,
+    /// The listening socket's descriptor, which a live restart hands over.
+    listener_fd: std::os::fd::RawFd,
+    /// A live restart is being prepared.
+    upgrading: bool,
 }
 
 /// Finishes a background job on the server thread with its result.
@@ -456,17 +462,34 @@ const TICK: Duration = Duration::from_millis(400);
 const FRAME: Duration = Duration::from_millis(16);
 const INPUT_FLUSH: Duration = Duration::from_millis(30);
 
-/// Run a session server in the foreground until it is told to exit.
-pub fn run(session: &str) -> Result<()> {
+/// Run a session server in the foreground until it is told to exit. With `handoff`, it takes
+/// over from the server it replaces (a live restart, see `upgrade`).
+pub fn run(session: &str, handoff: Option<&std::path::Path>) -> Result<()> {
     let socket = paths::socket_path(session);
     paths::private_runtime_dir().context("checking the runtime directory")?;
-    if socket.exists() {
-        if UnixStream::connect(&socket).is_ok() {
-            anyhow::bail!("session {session:?} is already running");
+    let taken = handoff.and_then(|path| match upgrade::read_handoff(path, session) {
+        Ok(h) => Some(h),
+        Err(e) => {
+            // Its programs cannot be reached: they get a hangup, as when a server stops, and the
+            // saved layout comes back.
+            eprintln!("kraal: cannot take over from the previous server: {e:#}");
+            upgrade::close_inherited();
+            None
         }
-        let _ = std::fs::remove_file(&socket);
-    }
-    let listener = UnixListener::bind(&socket).with_context(|| format!("binding {}", socket.display()))?;
+    });
+    let listener = match taken.as_ref().and_then(|h| h.listener()) {
+        Some(l) => l,
+        None => {
+            if socket.exists() {
+                if UnixStream::connect(&socket).is_ok() {
+                    anyhow::bail!("session {session:?} is already running");
+                }
+                let _ = std::fs::remove_file(&socket);
+            }
+            UnixListener::bind(&socket).with_context(|| format!("binding {}", socket.display()))?
+        }
+    };
+    let listener_fd = std::os::fd::AsRawFd::as_raw_fd(&listener);
 
     let (config, mut warnings) = match Config::load() {
         Ok(c) => (c, Vec::new()),
@@ -609,9 +632,14 @@ pub fn run(session: &str) -> Result<()> {
                 let _ = warn.send(Event::Warning(w));
             })
         },
+        listener_fd,
+        upgrading: false,
     };
     server.scan_definitions();
-    server.restore();
+    match taken {
+        Some(h) => server.take_over(h),
+        None => server.restore(),
+    }
     let result = server.event_loop(&rx);
     server.shutdown();
     let _ = std::fs::remove_file(&socket);

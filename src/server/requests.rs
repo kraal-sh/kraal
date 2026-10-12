@@ -392,6 +392,7 @@ impl Server {
                 self.kill_waiters.push(client);
                 return None;
             }
+            Request::Upgrade => return self.upgrade_request(client),
         })
     }
 
