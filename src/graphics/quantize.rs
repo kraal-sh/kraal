@@ -70,12 +70,12 @@ pub fn quantize(rgba: &[u8]) -> (Vec<[u8; 3]>, Vec<u8>) {
     if let Some(found) = exact(rgba) {
         return found;
     }
-    let all_opaque = rgba.chunks_exact(4).all(opaque);
+    let all_opaque = rgba.as_chunks::<4>().0.iter().all(|p| opaque(p));
     let sample: Vec<u8>;
     let learn = if all_opaque {
         rgba
     } else {
-        sample = rgba.chunks_exact(4).filter(|p| opaque(p)).flat_map(|p| [p[0], p[1], p[2], 255]).collect();
+        sample = rgba.as_chunks::<4>().0.iter().filter(|p| opaque(*p)).flat_map(|p| [p[0], p[1], p[2], 255]).collect();
         &sample
     };
     // NeuQuant learns from one pixel in `samplefac`: some fifty thousand at most, for speed.
@@ -85,7 +85,9 @@ pub fn quantize(rgba: &[u8]) -> (Vec<[u8; 3]>, Vec<u8>) {
     // Colours looked up once, by their six high bits per channel: far finer than the palette.
     let mut table = vec![CLEAR; 1 << 18];
     let indices = rgba
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .map(|p| {
             if !opaque(p) {
                 return CLEAR;
@@ -107,7 +109,7 @@ fn exact(rgba: &[u8]) -> Option<(Vec<[u8; 3]>, Vec<u8>)> {
     let mut seen: HashMap<[u8; 3], u8> = HashMap::new();
     let mut last: Option<([u8; 3], u8)> = None;
     let mut indices = Vec::with_capacity(rgba.len() / 4);
-    for p in rgba.chunks_exact(4) {
+    for p in rgba.as_chunks::<4>().0 {
         if !opaque(p) {
             indices.push(CLEAR);
             continue;

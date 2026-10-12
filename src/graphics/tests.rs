@@ -687,7 +687,9 @@ fn pictures_are_fitted_to_their_cells_and_reduced_to_a_palette() {
     let (palette, indices) = quantize(&rgba);
     assert!(palette.len() <= 255);
     let error: u32 = rgba
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .zip(&indices)
         .map(|(p, i)| (0..3).map(|c| u32::from(p[c].abs_diff(palette[usize::from(*i)][c]))).sum::<u32>())
         .sum();
