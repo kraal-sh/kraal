@@ -1860,6 +1860,25 @@ fn config_check(env: &Env, dir: &Path) -> (bool, String) {
     (out.status.success(), String::from_utf8(out.stderr).unwrap())
 }
 
+/// A workspace named like a command of kraal: its name alone runs the command, so the check
+/// names the file and the way to open it; `kraal open` takes it like any other.
+#[test]
+fn the_check_names_a_workspace_that_a_command_hides() {
+    let env = Env::new("wsname");
+    for name in ["files", "shop"] {
+        env.workspace(name, "layout {\n    pane name=\"main\"\n}\n");
+    }
+    let (ok, said) = config_check(&env, &env.root);
+    assert!(ok, "{said}");
+    let advice =
+        "workspaces/files.kdl: `kraal files` is a command of kraal: open this workspace with `kraal attach files`";
+    assert!(said.lines().count() == 1 && said.trim_end().ends_with(advice), "{said}");
+    env.run(&["open", "files"]);
+    let workspaces: serde_json::Value = serde_json::from_str(&env.run(&["workspaces", "--json"])).unwrap();
+    let open = |name: &str| workspaces.as_array().unwrap().iter().any(|w| w["name"] == name && w["open"] == true);
+    assert!(open("files") && !open("shop"), "{workspaces}");
+}
+
 /// What `kraal config default` prints is a file its own check has nothing to say about, in
 /// either preset.
 #[test]

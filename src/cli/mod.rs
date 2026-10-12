@@ -342,11 +342,19 @@ fn config_cmd(action: &str, markdown: bool) -> Result<()> {
             }
             // Warnings are advice; a file kraal cannot read at all is an error.
             let mut errors = 0;
+            let commands = <Cli as clap::CommandFactory>::command();
             for (path, def) in cfg.workspace_dirs().iter().flat_map(|d| workspace::load_dir(d)) {
                 match def {
                     Ok(d) => {
                         for w in d.warnings {
                             eprintln!("{}: {w}", path.display());
+                        }
+                        // `kraal <name>` opens a workspace, unless the name is a command.
+                        if commands.find_subcommand(&d.name).is_some() {
+                            let (path, name) = (path.display(), &d.name);
+                            eprintln!(
+                                "{path}: `kraal {name}` is a command of kraal: open this workspace with `kraal attach {name}`"
+                            );
                         }
                     }
                     Err(e) => {

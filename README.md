@@ -110,7 +110,7 @@ layout {
         pane split_direction="vertical" {
             pane command="ssh" { args "deploy@web-prod-1"; }
             pane split_direction="horizontal" {
-                pane agent="claude"              // a shell that starts claude
+                pane agent="claude"              // Claude Code, on the account the rules pick
                 pane preview="CHANGELOG.md"      // a live Markdown preview
             }
         }

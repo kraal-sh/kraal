@@ -20,6 +20,7 @@ How kraal is organised, and how a workspace is declared once in a file and opene
 |---|---|
 | `kraal` | attaches to the session, starting it if needed |
 | `kraal shop` (or `kraal attach shop`) | the same, on the workspace `shop`, opened from its file if it is not open |
+| `kraal attach files` | a workspace named like a command of kraal: `kraal files` is the command, and `kraal config check` names such a file |
 | `kraal ls` | lists the sessions: running, with the kraal each one runs, or saved |
 | `kraal kill` | stops the session's server and its programs; the layout is saved |
 | `kraal restart` | restarts the server on the kraal installed now (see below) |
@@ -88,7 +89,7 @@ layout {
     }
     tab name="work" {
         pane split_direction="vertical" {
-            pane agent="claude" size="60%"          // a shell that starts `claude`
+            pane agent="claude" size="60%"          // Claude Code, on the account the rules pick
             pane preview="README.md"                // a live Markdown preview
         }
     }
@@ -106,12 +107,18 @@ layout {
 | `size="60%"` or `size=40` on a pane | its share of the split it is in, in percent or in cells |
 | `command="ssh"` with `{ args "-p" "2222" "host"; }` | the program the pane runs instead of a shell, and its arguments |
 | `start_suspended=true` · `close_on_exit=true` | the command waits for Enter before it runs · the pane closes when it exits |
-| `agent="claude"` (or `"claude:pro"`), with `args` if needed | a shell that starts that agent, on the account the rules pick (or the one named) |
+| `agent="claude"` (or `"claude:pro"`), with `args` if needed | that agent as the pane's program, on the account the rules pick (or the one named) |
 | `preview="README.md"` | a preview of that file instead of a terminal |
 | `stacked=true` on a pane with panes in it | they are a stack (below) |
 | `floating_panes { pane … }` in a tab | panes floating over the others |
 
 What kraal does not know in a file is left out, and `kraal config check` says which line.
+
+An agent pane is a command pane: kraal runs `claude` or `codex` itself, with the account's
+environment and no shell under it. When the agent exits, the pane stays with its exit code:
+Enter starts the agent again, resuming its conversation, `x` closes the pane, and
+`close_on_exit=true` closes it by itself. The name of another agent, which kraal keeps no accounts
+for, is typed into a shell: that shell is what is left when the agent exits.
 
 `stacked=true` makes a pane's children a stack: they share its place, one open and
 the others folded to the top line of their frame ([Stacks and layouts](keys.md#stacks-and-layouts)).
@@ -135,7 +142,7 @@ From the command line:
 | Command | |
 |---|---|
 | `kraal workspaces` | the open workspaces with their tabs, panes and agents, and the files not open (`--json` for scripts) |
-| `kraal open shop` | starts the workspace `shop` from its file, or switches to it, without attaching |
+| `kraal open shop` | starts the workspace `shop` from its file, or switches to it, without attaching (any name: `kraal open files` too) |
 | `kraal save` | writes the layout of a workspace to its file: in a pane, that pane's workspace; outside one, the workspace on screen |
 | `kraal save --workspace shop` | the same for the workspace you name |
 | `kraal save shop-2` | writes it under that name |
