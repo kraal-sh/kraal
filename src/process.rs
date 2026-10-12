@@ -7,7 +7,7 @@ use std::os::unix::io::AsRawFd;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 
-/// Command line of a process.
+/// The command line of a process; `None` when it cannot be read, or is empty (a kernel thread).
 pub fn argv(pid: u32) -> Option<Vec<String>> {
     let (argv, _) = imp::args_and_env(pid)?;
     (!argv.is_empty()).then_some(argv)
@@ -24,7 +24,8 @@ pub fn environ(pid: u32, names: &[&str]) -> HashMap<String, String> {
         .collect()
 }
 
-/// Current directory of a process.
+/// The working directory of a process; `None` when the system does not show it (a process of
+/// another user, or one that is gone).
 pub fn cwd(pid: u32) -> Option<PathBuf> {
     imp::cwd(pid)
 }
@@ -39,8 +40,8 @@ pub fn socket_peer(stream: &UnixStream) -> std::io::Result<(libc::pid_t, libc::u
     imp::socket_peer(stream.as_raw_fd())
 }
 
-/// Whether a process with this id still runs. A process that exited but was not reaped yet
-/// counts as gone where the system tells (Linux).
+/// Whether a process with this id still runs. One that exited but was not reaped yet counts as
+/// gone.
 pub fn running(pid: libc::pid_t) -> bool {
     imp::running(pid)
 }
@@ -88,7 +89,7 @@ pub fn descendants(pid: u32) -> Vec<u32> {
     found
 }
 
-/// The parent of a process.
+/// The parent of a process; `None` once it is gone.
 pub fn ppid(pid: u32) -> Option<u32> {
     imp::ppid(pid)
 }
@@ -126,7 +127,9 @@ pub fn machine_id() -> Option<String> {
     imp::machine_id()
 }
 
-/// This boot of the machine where start times count from it (Linux); empty elsewhere.
+/// The id of the machine's current boot on Linux, where [`start_time`] counts from the boot: a
+/// start time saved with it names a process only while the id is the same. Empty on macOS, whose
+/// start times do not depend on the boot.
 pub fn boot_id() -> String {
     imp::boot_id()
 }
@@ -228,7 +231,8 @@ mod imp {
         std::fs::read_link(format!("/proc/{pid}/cwd")).ok()
     }
 
-    /// The files a process holds open (those it may read: ours).
+    /// The files a process holds open. Only our own processes' descriptors can be read, and only
+    /// those matter here.
     pub fn open_files(pid: u32) -> Vec<PathBuf> {
         let Ok(fds) = std::fs::read_dir(format!("/proc/{pid}/fd")) else { return Vec::new() };
         fds.flatten().filter_map(|fd| std::fs::read_link(fd.path()).ok()).filter(|p| p.is_absolute()).collect()
@@ -281,6 +285,7 @@ mod imp {
     }
 
     pub fn socket_peer(fd: std::os::unix::io::RawFd) -> std::io::Result<(libc::pid_t, libc::uid_t)> {
+        // SAFETY: plain C data (integers, arrays): all zero bytes are a valid value.
         let mut cred: libc::ucred = unsafe { std::mem::zeroed() };
         let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
         // SAFETY: SO_PEERCRED writes at most `len` bytes into `cred`.
@@ -404,7 +409,7 @@ mod imp {
         if need <= 0 {
             return Vec::new();
         }
-        // Room for a few more opened meanwhile.
+        // Room for the descriptors opened between the two calls.
         let mut fds: Vec<libc::proc_fdinfo> =
             (0..need as usize / entry + 16).map(|_| libc::proc_fdinfo { proc_fd: 0, proc_fdtype: 0 }).collect();
         let size = (fds.len() * entry) as libc::c_int;
@@ -415,6 +420,7 @@ mod imp {
         fds.iter()
             .filter(|f| f.proc_fdtype == libc::PROX_FDTYPE_VNODE as u32)
             .filter_map(|f| {
+                // SAFETY: plain C data (integers, arrays): all zero bytes are a valid value.
                 let mut info: VnodeFdInfoWithPath = unsafe { std::mem::zeroed() };
                 let size = std::mem::size_of::<VnodeFdInfoWithPath>() as libc::c_int;
                 // SAFETY: proc_pidfdinfo writes at most `size` bytes into `info`.
@@ -459,6 +465,7 @@ mod imp {
     }
 
     pub fn cwd(pid: u32) -> Option<PathBuf> {
+        // SAFETY: plain C data (integers, arrays): all zero bytes are a valid value.
         let mut info: libc::proc_vnodepathinfo = unsafe { std::mem::zeroed() };
         let size = std::mem::size_of::<libc::proc_vnodepathinfo>() as libc::c_int;
         // SAFETY: proc_pidinfo writes at most `size` bytes into `info`.
@@ -509,9 +516,10 @@ mod imp {
 
     /// The kernel's short description of a process (state, group, session), when it gives one.
     fn short_info(pid: libc::pid_t) -> Option<libc::proc_bsdshortinfo> {
-        // SAFETY: an all-zero proc_bsdshortinfo is valid; proc_pidinfo writes at most `size` bytes.
+        // SAFETY: plain C data (integers, arrays): all zero bytes are a valid value.
         let mut info: libc::proc_bsdshortinfo = unsafe { std::mem::zeroed() };
         let size = std::mem::size_of::<libc::proc_bsdshortinfo>() as libc::c_int;
+        // SAFETY: proc_pidinfo writes at most `size` bytes into `info`.
         let n = unsafe {
             libc::proc_pidinfo(
                 pid,
@@ -551,6 +559,7 @@ mod imp {
             return true;
         }
         pids.into_iter().filter(|p| *p > 0).any(|pid| {
+            // SAFETY: plain C data (integers, arrays): all zero bytes are a valid value.
             let mut info: libc::proc_bsdshortinfo = unsafe { std::mem::zeroed() };
             let size = std::mem::size_of::<libc::proc_bsdshortinfo>() as libc::c_int;
             // SAFETY: proc_pidinfo writes at most `size` bytes into `info`.
@@ -569,6 +578,7 @@ mod imp {
 
     /// The kernel's description of a process, when it gives one.
     fn bsd_info(pid: u32) -> Option<libc::proc_bsdinfo> {
+        // SAFETY: plain C data (integers, arrays): all zero bytes are a valid value.
         let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
         let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
         // SAFETY: proc_pidinfo writes at most `size` bytes into `info`.
@@ -636,6 +646,7 @@ mod imp {
     }
 
     pub fn ppid(pid: u32) -> Option<u32> {
+        // SAFETY: plain C data (integers, arrays): all zero bytes are a valid value.
         let mut info: libc::proc_bsdshortinfo = unsafe { std::mem::zeroed() };
         let size = std::mem::size_of::<libc::proc_bsdshortinfo>() as libc::c_int;
         // SAFETY: proc_pidinfo writes at most `size` bytes into `info`.
@@ -731,6 +742,7 @@ mod tests {
         let (a, b) = UnixStream::pair().unwrap();
         let (pid, uid) = socket_peer(&a).unwrap();
         assert_eq!(pid as u32, std::process::id());
+        // SAFETY: getuid cannot fail.
         assert_eq!(uid, unsafe { libc::getuid() });
         drop(b);
         assert!(running(pid));

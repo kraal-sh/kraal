@@ -16,10 +16,14 @@ use crate::paths;
 /// How kraal runs one kind of agent.
 #[derive(Debug, Clone, Copy)]
 pub struct AgentKind {
+    /// The agent's name in accounts.toml, in account keys ([`key`]) and on the command line.
     pub name: &'static str,
+    /// The program that runs it.
     pub command: &'static str,
     /// Environment variable selecting the config home.
     pub home_env: &'static str,
+    /// The home the agent uses when that variable is unset: the account the user had before
+    /// kraal, which needs no variable.
     pub default_home: &'static str,
     /// Arguments of the agent's own login command.
     pub login: &'static [&'static str],
@@ -37,6 +41,7 @@ pub struct AgentKind {
     pub clear_env: &'static [&'static str],
 }
 
+/// The agents whose accounts kraal manages; other agents run with their own single home.
 pub const AGENTS: &[AgentKind] = &[
     AgentKind {
         name: "claude",
@@ -81,6 +86,7 @@ pub fn agent_kind(name: &str) -> Option<&'static AgentKind> {
     AGENTS.iter().find(|a| a.name == name)
 }
 
+/// What kraal does when an account reaches its usage threshold (`[limits] mode`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Mode {
@@ -93,11 +99,13 @@ pub enum Mode {
     Auto,
 }
 
+/// `[limits]` of accounts.toml.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Limits {
     /// Usage (percent of the 5-hour or weekly window) at which an account counts as full.
     #[serde(default = "default_threshold")]
     pub threshold: u8,
+    /// What happens when an account reaches the threshold.
     #[serde(default)]
     pub mode: Mode,
 }
@@ -112,14 +120,19 @@ impl Default for Limits {
     }
 }
 
+/// An `[[account]]` of accounts.toml: one subscription of one agent.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Account {
+    /// Unique among the agent's accounts. `default` names the agent's default home only.
     pub name: String,
+    /// The [`AgentKind`] it is for, by name.
     pub agent: String,
     /// Config home; the agent's default home means "the account you already have".
     pub home: String,
+    /// This account's own threshold, instead of `[limits]`'s.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub threshold: Option<u8>,
+    /// The user's own text, which kraal keeps when it rewrites the file.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
 }
@@ -127,15 +140,21 @@ pub struct Account {
 /// Which accounts to use, in order, for a workspace or a directory.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Rule {
+    /// The rule applies in this workspace only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace: Option<String>,
+    /// The rule applies to agents started in this directory or below it (`~` allowed); a
+    /// worktree counts as its repository.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
+    /// The rule applies to this agent only; `None`: to every agent ([`Accounts::rule_accounts`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent: Option<String>,
+    /// Account names to try, in order. Empty: no account may be used where the rule applies.
     pub accounts: Vec<String>,
 }
 
+/// `[claude]` of accounts.toml.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ClaudeOptions {
     /// The user's own status line command, run after kraal's (kraal records usage first).
@@ -159,11 +178,14 @@ const HEADER: &str = "# kraal agent accounts. One [[account]] per subscription: 
 # and its config home. [[rule]] picks accounts by workspace or directory, in order; [limits] sets\n\
 # the usage threshold (percent) and what happens when an account reaches it: notify, ask or auto.\n\n";
 
+/// accounts.toml as loaded, saved back to the file it came from.
 #[derive(Debug, Clone)]
 pub struct Accounts {
     pub limits: Limits,
     pub claude: ClaudeOptions,
+    /// The accounts as listed; [`Accounts::for_agent`] adds the implicit default ones.
     pub accounts: Vec<Account>,
+    /// In order: the first rule that matches decides.
     pub rules: Vec<Rule>,
     path: PathBuf,
 }
@@ -245,8 +267,8 @@ impl Accounts {
         let mut out: Vec<Account> = self.accounts.iter().filter(|a| a.agent == agent).cloned().collect();
         if let Some(kind) = agent_kind(agent) {
             let default = paths::expand_tilde(kind.default_home);
-            // A listed account named "default" (from before the name was reserved) is not
-            // hidden behind the implicit one.
+            // A listed account named "default" is not hidden behind the implicit one: kraal
+            // reserves the name since 0.1.0, and an accounts.toml from before may still have one.
             if !out.iter().any(|a| paths::expand_tilde(&a.home) == default || a.name == "default") {
                 out.insert(
                     0,
@@ -307,9 +329,10 @@ impl Accounts {
     pub fn remove(&mut self, agent: &str, name: &str) -> bool {
         let before = self.accounts.len();
         self.accounts.retain(|a| !(a.agent == agent && a.name == name));
-        // A rule for every agent keeps the name while another agent has an account so named;
-        // where it then names none of this agent's accounts, a rule of this agent's own, with no
-        // account, keeps it from using any account there.
+        // A rule for every agent keeps the name while another agent still has an account so
+        // named. When it then names none of this agent's accounts, a rule for this agent alone,
+        // naming no account, goes before it: otherwise this agent would fall back to any of its
+        // accounts where the rule used to restrict it.
         let shared = self.all().iter().any(|a| a.name == name);
         let mine: Vec<String> = self.for_agent(agent).into_iter().map(|a| a.name).collect();
         let mut refusals = Vec::new();
@@ -423,11 +446,16 @@ fn valid_name(name: &str) -> bool {
     !name.is_empty() && name.chars().all(|c| c.is_alphanumeric() || matches!(c, '-' | '_' | '.'))
 }
 
-/// Short label, e.g. `claude·pro`.
+/// How an account is shown, e.g. `claude·pro`.
 pub fn label(a: &Account) -> String {
     format!("{}·{}", a.agent, a.name)
 }
 
+/// An account's identity outside accounts.toml: `agent:name`. It is saved with each pane an
+/// account runs in (`PaneSpec.account`, restored after a restart), given to its agent as
+/// `KRAAL_ACCOUNT`, reported in agent events, and keys the [`UsageMap`]. Readers split it at the
+/// first `:`, which neither an agent's name nor an account's ([`valid_name`]) holds: the format
+/// must not change.
 pub fn key(agent: &str, name: &str) -> String {
     format!("{agent}:{name}")
 }
@@ -487,8 +515,11 @@ pub fn prepare_home(a: &Account) -> Result<Vec<String>> {
 /// A command line for a pane, with its environment.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct Launch {
+    /// The program, then its arguments.
     pub argv: Vec<String>,
+    /// Variables set for it, over what it inherits.
     pub env: Vec<(String, String)>,
+    /// Variables removed from what it inherits, so that the account's own login applies.
     pub env_remove: Vec<String>,
 }
 
@@ -530,8 +561,10 @@ pub fn launch_args(kind: &AgentKind, argv: &[String]) -> Vec<String> {
     rest.get(skip..).unwrap_or_default().to_vec()
 }
 
-/// Options of the agents that take a value, or several (until the next option): to tell their
-/// values from a prompt given on the command line. From the agents' own `--help`.
+// The agents' options, from their own `--help`, by what follows them: a word after an option is
+// its value or the prompt given on the command line, which `resumable_args` tells apart.
+
+/// Claude's options that take one value.
 const CLAUDE_VALUE: &[&str] = &[
     "--model",
     "--fallback-model",
@@ -562,7 +595,7 @@ const CLAUDE_VALUE: &[&str] = &[
     "-n",
     "--name",
 ];
-/// Options of the agents that take no value: a word after one of them is a prompt.
+/// Claude's options that take no value: a word after one of them is a prompt.
 const CLAUDE_FLAGS: &[&str] = &[
     "--verbose",
     "--dangerously-skip-permissions",
@@ -592,6 +625,7 @@ const CLAUDE_FLAGS: &[&str] = &[
     "--no-session-persistence",
     "--disable-slash-commands",
 ];
+/// Codex's options that take no value.
 const CODEX_FLAGS: &[&str] = &[
     "--oss",
     "--search",
@@ -606,6 +640,7 @@ const CODEX_FLAGS: &[&str] = &[
     "--no-alt-screen",
     "--no-daemon",
 ];
+/// Claude's options that take every word up to the next option.
 const CLAUDE_VALUES: &[&str] = &[
     "--add-dir",
     "--mcp-config",
@@ -617,6 +652,7 @@ const CLAUDE_VALUES: &[&str] = &[
     "--file",
     "--tools",
 ];
+/// Codex's options that take one value.
 const CODEX_VALUE: &[&str] = &[
     "-m",
     "--model",
@@ -637,9 +673,11 @@ const CODEX_VALUE: &[&str] = &[
     "--remote",
     "--remote-auth-token-env",
 ];
+/// Codex's options that take every word up to the next option.
 const CODEX_VALUES: &[&str] = &["-i", "--image"];
-/// Options that make a run of its own, not a conversation (`claude -p`).
+/// Claude's options that make a run of its own, not a conversation (`claude -p`).
 const CLAUDE_ONE_SHOT: &[&str] = &["-p", "--print", "-h", "--help", "-v", "--version"];
+/// Codex's options that make a run of its own, not a conversation.
 const CODEX_ONE_SHOT: &[&str] = &["-h", "--help", "-V", "--version"];
 /// Claude subcommands: runs of their own, not a conversation.
 const CLAUDE_COMMANDS: &[&str] = &[
@@ -995,16 +1033,22 @@ pub fn new_uuid() -> String {
 
 // ---- usage -----------------------------------------------------------------------------------
 
+/// One of an account's usage windows: five hours, or a week.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Window {
+    /// How much of the window is used, in percent.
     pub used_percent: f64,
-    /// Unix seconds.
+    /// When the window starts again from zero, in Unix seconds; `None` when the source does not
+    /// say.
     pub resets_at: Option<i64>,
 }
 
+/// The latest usage seen for an account, saved under the state directory ([`usage_path`]).
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct Usage {
+    /// The five-hour window, when a source reported it.
     pub five_hour: Option<Window>,
+    /// The weekly window, when a source reported it.
     pub weekly: Option<Window>,
     /// Unix seconds when this was observed.
     pub observed_at: i64,
@@ -1050,6 +1094,8 @@ impl Usage {
     }
 }
 
+/// Where an account's latest usage is saved: the status line command Claude runs and the server
+/// write it, the server and `kraal accounts` read it, and it outlives a restart.
 pub fn usage_path(agent: &str, name: &str) -> PathBuf {
     paths::state_dir().join("usage").join(format!("{agent}-{name}.json"))
 }

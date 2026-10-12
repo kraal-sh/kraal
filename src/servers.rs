@@ -12,12 +12,20 @@ use serde::{Deserialize, Serialize};
 use crate::paths;
 use crate::workspace::WorkspaceDef;
 
+/// A server of the inventory: a `[[server]]` of servers.toml, which users edit and kraal rewrites,
+/// so its field names and values are a file format. A field left out leaves the choice to ssh and
+/// ~/.ssh/config; `jump`, `proxy` and `agents` also take the value `none`, which turns off what
+/// ~/.ssh/config or kraal would add there. kraal also makes one on the fly for an address it does
+/// not know (`kraal ssh user@host`).
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct Server {
+    /// What commands, the picker and jump hosts name it by: unique in the inventory.
     pub name: String,
+    /// The host name or address, an IPv6 address without brackets.
     pub host: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user: Option<String>,
+    /// Kept as given, even 22: only a server without a port takes the one ~/.ssh/config sets.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub port: Option<u16>,
     /// ProxyJump: a server name from the inventory, or `user@host[:port]`, or a list of them
@@ -40,12 +48,14 @@ pub struct Server {
     /// turns off a ProxyCommand or jump host ~/.ssh/config would add.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub proxy: Option<String>,
+    /// The groups commands can name it by (`kraal exec @prod`, `kraal ssh prod --group`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub groups: Vec<String>,
     /// Stage of the machine ("prod", "staging", "dev"). Decides whether kraal treats it as
     /// production; without it, the name, host and groups do.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub env: Option<String>,
+    /// The user's own text (`kraal servers add --note`), kept in the file; kraal does not read it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
     /// The kraal session on this server whose agents the sidebar lists (`kraal attach --host`
@@ -57,11 +67,15 @@ pub struct Server {
 /// Where a known server comes from.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Source {
+    /// servers.toml.
     Inventory,
+    /// An `ssh` pane of this workspace definition.
     Workspace(String),
+    /// A `Host` alias of ~/.ssh/config.
     SshConfig,
 }
 
+/// A server kraal knows of, from any [`Source`].
 #[derive(Debug, Clone, PartialEq)]
 pub struct Known {
     pub server: Server,
@@ -552,7 +566,9 @@ const HEADER: &str = "# kraal servers. Each [[server]] needs a name and a host; 
 # identity, groups, env (\"prod\", \"staging\"…), note and agents (the kraal session there whose\n\
 # agents the sidebar lists) are optional. kraal adds servers here when you ssh somewhere new.\n\n";
 
+/// servers.toml as loaded, saved back to the file it came from.
 pub struct Inventory {
+    /// In the file's order, each name once.
     pub servers: Vec<Server>,
     path: PathBuf,
 }
@@ -603,6 +619,7 @@ impl Inventory {
         Self::update_at(&Self::path(), f)
     }
 
+    /// [`Inventory::update`] on the inventory file at `path`.
     pub fn update_at<T>(path: &Path, f: impl FnOnce(&mut Inventory) -> Result<T>) -> Result<T> {
         paths::locked(path, || {
             let mut inv = Self::load_from(path)?;
@@ -1192,7 +1209,7 @@ mod tests {
         assert_ne!(connection_key(&a), connection_key(&behind));
         let proxied = Server { proxy: Some("nc %h %p".into()), ..a.clone() };
         assert_ne!(connection_key(&a), connection_key(&proxied));
-        // Two keys whose 32-bit digests were equal.
+        // Two keys a 32-bit digest, as kraal once used, could not tell apart.
         let k1 = Server { identity: Some("/keys/key79120".into()), ..a.clone() };
         let k2 = Server { identity: Some("/keys/key151242".into()), ..a.clone() };
         assert_ne!(connection_key(&k1), connection_key(&k2));

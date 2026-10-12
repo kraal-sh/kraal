@@ -4,7 +4,8 @@ use std::path::{Path, PathBuf};
 
 /// Longest Unix socket path both Linux (108 bytes) and macOS (104) accept, its final NUL aside.
 const SOCKET_PATH_MAX: usize = 103;
-/// Longest session name.
+/// Longest session name kraal accepts. Never lowered: a session named when it was allowed must
+/// stay reachable by its name.
 pub const SESSION_NAME_MAX: usize = 64;
 /// Longest socket file name before `.sock`: a longer session name gets a shortened one.
 const SOCKET_STEM_MAX: usize = 32;
@@ -15,6 +16,7 @@ const RUNTIME_BASE_MAX: usize = SOCKET_PATH_MAX - "/kraal/".len() - SOCKET_STEM_
 /// `$TMPDIR` when that is short and safe, else in /tmp (macOS's `$TMPDIR` is long). Other users
 /// can write there, so [`private_runtime_dir`] checks it.
 fn fallback_runtime_base() -> PathBuf {
+    // SAFETY: getuid cannot fail.
     let name = format!("kraal-{}", unsafe { libc::getuid() });
     let tmp = checked_base(&std::env::temp_dir(), RUNTIME_BASE_MAX - 1 - name.len());
     // /tmp itself (a link owned by root on macOS); the directory in it is checked as created.
@@ -96,6 +98,7 @@ pub fn ensure_private_dir(dir: &std::path::Path) -> std::io::Result<()> {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
     std::fs::create_dir_all(dir)?;
     let meta = std::fs::symlink_metadata(dir)?;
+    // SAFETY: getuid cannot fail.
     let uid = unsafe { libc::getuid() };
     if !meta.is_dir() || meta.uid() != uid {
         return Err(std::io::Error::new(
@@ -109,8 +112,9 @@ pub fn ensure_private_dir(dir: &std::path::Path) -> std::io::Result<()> {
     Ok(())
 }
 
-/// The runtime directory, checked (and its fallback parent in /tmp, which other users can write:
-/// one of them could otherwise swap the directory under it).
+/// The runtime directory, made private ([`ensure_private_dir`]). Under the fallback base
+/// (`kraal-<uid>` in a temporary directory every user can write to), that base is checked first:
+/// another user who made it could otherwise swap the directory under it.
 pub fn private_runtime_dir() -> std::io::Result<PathBuf> {
     let dir = runtime_dir();
     if dir.parent() == Some(fallback_runtime_base().as_path()) {
@@ -218,7 +222,8 @@ pub fn sync_dir(dir: &Path) {
 
 /// Remove the regular files of ours in `dir` whose names `remove` picks, through the directory
 /// as opened: a link in its place (to a directory elsewhere) is refused, and so is a directory
-/// that is not ours, and a link or directory in it is left alone. How many files are left.
+/// that is not ours, and a link or directory in it is left alone. Returns how many entries it
+/// left.
 pub fn remove_files_in(dir: &Path, remove: impl Fn(&str) -> bool) -> std::io::Result<usize> {
     use std::ffi::CStr;
     use std::os::fd::AsRawFd;
@@ -424,20 +429,22 @@ fn checked_socket(socket: &Path) -> Option<PathBuf> {
     (safe_chain(&dir) && ours_and_private(&socket)).then_some(socket)
 }
 
-/// Longest socket path Linux accepts (108 bytes with the final NUL): what kraal used before it
-/// kept to macOS's limit.
+/// Longest socket path Linux accepts (108 bytes with the final NUL): the limit the builds before
+/// 0.1.0 kept to, before kraal kept to macOS's.
 const LINUX_SOCKET_PATH_MAX: usize = 107;
 
-/// Where kraal put its sockets before 2026-10-11: `$XDG_RUNTIME_DIR` when it was at most 60
-/// bytes, else `$TMPDIR/kraal-<uid>`, without the checks made since, and each session under its
-/// own name. `None` when that is where they go now (an older socket may still be there under a
-/// name kraal now shortens: [`socket_path`] looks for it).
+/// Where the builds before 0.1.0 (up to 2026-10-11) put their sockets: `$XDG_RUNTIME_DIR` when it
+/// was at most 60 bytes, else `$TMPDIR/kraal-<uid>`, without the checks made since, and each
+/// session under its own name. `None` when that is where they go now; a socket there may still
+/// have a name kraal now shortens, which [`socket_path`] looks for. No release used this place:
+/// it serves sessions started by those builds only, and can go in any release.
 pub fn legacy_runtime_dir() -> Option<PathBuf> {
     let old = legacy_runtime_dir_in(std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from), std::env::temp_dir());
     (old != runtime_dir()).then_some(old)
 }
 
 fn legacy_runtime_dir_in(xdg: Option<PathBuf>, tmp: PathBuf) -> PathBuf {
+    // SAFETY: getuid cannot fail.
     let fallback = tmp.join(format!("kraal-{}", unsafe { libc::getuid() }));
     let base = xdg.filter(|p| p.is_dir() && p.as_os_str().len() <= 60).unwrap_or(fallback);
     base.join("kraal")
@@ -447,6 +454,7 @@ fn legacy_runtime_dir_in(xdg: Option<PathBuf>, tmp: PathBuf) -> PathBuf {
 /// be another user's, standing in for a session.
 fn ours_and_private(socket: &Path) -> bool {
     use std::os::unix::fs::{FileTypeExt, MetadataExt};
+    // SAFETY: getuid cannot fail.
     let uid = unsafe { libc::getuid() };
     let dir_ok = socket
         .parent()
@@ -495,6 +503,7 @@ pub fn ssh_control_dir() -> Option<PathBuf> {
         return private_runtime_dir().ok();
     }
     // Directly in /tmp, whose sticky bit keeps others from moving it once it is ours.
+    // SAFETY: getuid cannot fail.
     let short = PathBuf::from(format!("/tmp/kraal-{}", unsafe { libc::getuid() }));
     ensure_private_dir(&short).ok()?;
     Some(short)
@@ -520,6 +529,7 @@ pub fn data_home() -> PathBuf {
     xdg_dir("XDG_DATA_HOME", ".local/share")
 }
 
+/// The saved state of `session` (layout, panes, what each runs), which a restart restores.
 pub fn session_state_path(session: &str) -> PathBuf {
     state_dir().join("sessions").join(format!("{session}.json"))
 }
@@ -535,6 +545,8 @@ pub fn buffers_path(session: &str) -> PathBuf {
     state_dir().join("buffers").join(format!("{session}.json"))
 }
 
+/// The log of `session`'s server, which runs detached from any terminal: its standard output and
+/// error, and those of a restart run on its own ([`crate::client::restart_detached`]).
 pub fn log_path(session: &str) -> PathBuf {
     state_dir().join(format!("server-{session}.log"))
 }
@@ -552,7 +564,7 @@ pub fn workspaces_dir() -> PathBuf {
     config_dir().join("workspaces")
 }
 
-/// Expand a leading `~` to the home directory.
+/// Expand a leading `~` or `~/` to the home directory. `~user` is left as it is.
 pub fn expand_tilde(path: &str) -> PathBuf {
     if path == "~" {
         return dirs::home_dir().unwrap_or_else(|| PathBuf::from(path));
@@ -750,6 +762,7 @@ mod tests {
             check(Some(xdg60.clone()), &root, &xdg60);
         }
         // No runtime directory, or one too long: $TMPDIR/kraal-<uid>.
+        // SAFETY: getuid cannot fail.
         let fallback = root.join(format!("kraal-{}", unsafe { libc::getuid() }));
         check(None, &root, &fallback);
         let long = root.join("long").join("l".repeat(70));
