@@ -1,6 +1,7 @@
 //! What kraal draws over the panes: the leader menu, pickers, prompts, confirmations, help and
 //! messages. They share one look: a framed box with a short title, one column of padding, and a
-//! footer of keys (the key in the accent colour, what it does dimmed).
+//! footer of keys (the key in the accent colour, what it does dimmed). Each goes in the screen it
+//! is given: the client's, less the bottom bar's row ([`super::Server::screen_above_bar`]).
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Position, Rect};
@@ -24,11 +25,11 @@ fn dim() -> Style {
     Style::default().fg(th().dim)
 }
 
-/// A box centred in `full`.
-pub(super) fn centered(full: Rect, w: u16, h: u16) -> Rect {
-    let w = w.min(full.width);
-    let h = h.min(full.height);
-    Rect::new(full.x + (full.width - w) / 2, full.y + (full.height - h) / 2, w, h)
+/// A box centred in `screen`.
+pub(super) fn centered(screen: Rect, w: u16, h: u16) -> Rect {
+    let w = w.min(screen.width);
+    let h = h.min(screen.height);
+    Rect::new(screen.x + (screen.width - w) / 2, screen.y + (screen.height - h) / 2, w, h)
 }
 
 /// Clear `area` and frame it with `title`; returns the inside.
@@ -263,12 +264,13 @@ fn by_section(items: &[MenuItem], max_lines: usize) -> Option<Vec<Vec<usize>>> {
     (cols.len() > 1 && cols.iter().all(|c| c.len() <= max_lines)).then_some(cols)
 }
 
-pub(super) fn menu_layout(items: &[MenuItem], full: Rect) -> MenuLayout {
+pub(super) fn menu_layout(items: &[MenuItem], screen: Rect) -> MenuLayout {
     let mut layout = MenuLayout { area: Rect::default(), cells: Vec::new() };
-    // One column between the box and the right edge, down to the bottom; the top bar stays free.
-    let max_w = full.width.saturating_sub(2) as usize;
-    let max_lines = (full.height as usize).saturating_sub(6).max(1);
-    if items.is_empty() || max_w < 12 || full.height < 6 {
+    // One column between the box and the right edge, down to the bottom of the screen (above the
+    // bottom bar); the top bar stays free.
+    let max_w = screen.width.saturating_sub(2) as usize;
+    let max_lines = (screen.height as usize).saturating_sub(6).max(1);
+    if items.is_empty() || max_w < 12 || screen.height < 6 {
         return layout;
     }
     // Frame and padding: two columns on each side.
@@ -300,8 +302,8 @@ pub(super) fn menu_layout(items: &[MenuItem], full: Rect) -> MenuLayout {
     let lines = cols.iter().map(Vec::len).max().unwrap_or(1);
     let widths = column_widths(items, &cols, cap);
     let w = total(&cols, cap).min(max_w) as u16;
-    let h = (lines as u16 + 4).min(full.height - 1);
-    layout.area = Rect::new(full.x + full.width - w - 1, full.y + full.height - h, w, h);
+    let h = (lines as u16 + 4).min(screen.height - 1);
+    layout.area = Rect::new(screen.x + screen.width - w - 1, screen.y + screen.height - h, w, h);
     let right = layout.area.right() - 2;
     let mut x = layout.area.x + 2;
     for (c, (key_w, width)) in widths.iter().enumerate() {
@@ -388,10 +390,10 @@ impl PickerLayout {
 
 /// A picker's geometry. Its height follows the number of items, not the matches, so it does not
 /// jump while filtering.
-pub(super) fn picker_layout(p: &Picker, full: Rect) -> PickerLayout {
-    let w = full.width.saturating_sub(4).min(92);
-    let rows = (p.items.len().max(p.action_keys().len()) as u16).clamp(1, full.height.saturating_sub(9).max(1));
-    let area = centered(full, w, rows + 5);
+pub(super) fn picker_layout(p: &Picker, screen: Rect) -> PickerLayout {
+    let w = screen.width.saturating_sub(4).min(92);
+    let rows = (p.items.len().max(p.action_keys().len()) as u16).clamp(1, screen.height.saturating_sub(9).max(1));
+    let area = centered(screen, w, rows + 5);
     let inner = Rect::new(area.x + 1, area.y + 1, area.width.saturating_sub(2), area.height.saturating_sub(2));
     let list = Rect::new(inner.x, inner.y + 2, inner.width, inner.height.saturating_sub(3));
     let shown = list.height.max(1) as usize;
@@ -399,9 +401,9 @@ pub(super) fn picker_layout(p: &Picker, full: Rect) -> PickerLayout {
     PickerLayout { area, list, start }
 }
 
-pub(super) fn draw_picker(p: &Picker, full: Rect, buf: &mut Buffer) -> Option<Cursor> {
+pub(super) fn draw_picker(p: &Picker, screen: Rect, buf: &mut Buffer) -> Option<Cursor> {
     let t = th();
-    let layout = picker_layout(p, full);
+    let layout = picker_layout(p, screen);
     let inner = frame(layout.area, &p.title, t.accent, buf);
     if inner.height < 3 || inner.width < 6 {
         return None;
@@ -518,10 +520,10 @@ fn fill(buf: &mut Buffer, area: Rect, style: Style) {
 
 // ---- prompts --------------------------------------------------------------------------------
 
-pub(super) fn draw_prompt(p: &Prompt, full: Rect, buf: &mut Buffer) -> Option<Cursor> {
-    let w = full.width.saturating_sub(4).min(76);
+pub(super) fn draw_prompt(p: &Prompt, screen: Rect, buf: &mut Buffer) -> Option<Cursor> {
+    let w = screen.width.saturating_sub(4).min(76);
     let h = if p.error.is_some() { 5 } else { 4 };
-    let area = centered(full, w, h);
+    let area = centered(screen, w, h);
     let inner = frame(area, &p.title, th().accent, buf);
     if inner.height < 2 || inner.width < 4 {
         return None;
@@ -572,9 +574,9 @@ pub(super) struct ConfirmLayout {
     pub(super) ok: Option<Rect>,
 }
 
-pub(super) fn confirm_layout(q: &Question, full: Rect) -> ConfirmLayout {
+pub(super) fn confirm_layout(q: &Question, screen: Rect) -> ConfirmLayout {
     let verb = q.action.verb();
-    let max_w = full.width.saturating_sub(2).max(1) as usize;
+    let max_w = screen.width.saturating_sub(2).max(1) as usize;
     let buttons_w = columns(&verb) + 15;
     let widest = q.message.lines().map(columns).max().unwrap_or(0).max(buttons_w);
     let w = (widest + 4).clamp(30.min(max_w), max_w.min(84)) as u16;
@@ -585,9 +587,9 @@ pub(super) fn confirm_layout(q: &Question, full: Rect) -> ConfirmLayout {
             lines.push((part, i == 0));
         }
     }
-    let max_h = full.height.saturating_sub(2).max(3) as usize;
+    let max_h = screen.height.saturating_sub(2).max(3) as usize;
     let h = (lines.len() + 5).min(max_h) as u16;
-    let area = centered(full, w, h);
+    let area = centered(screen, w, h);
     let inner = Rect::new(area.x + 1, area.y + 1, area.width.saturating_sub(2), area.height.saturating_sub(2));
     let mut body = inner.height.saturating_sub(3);
     // A message longer than the box gives up a row to say so, and scrolls.
@@ -605,9 +607,9 @@ pub(super) fn confirm_layout(q: &Question, full: Rect) -> ConfirmLayout {
 
 /// A question with its two buttons. The message wraps; when it is longer than the box, it
 /// scrolls (the buttons stay in view).
-pub(super) fn draw_confirm(q: &Question, full: Rect, buf: &mut Buffer) {
+pub(super) fn draw_confirm(q: &Question, screen: Rect, buf: &mut Buffer) {
     let danger = q.action.danger(&q.message);
-    let layout = confirm_layout(q, full);
+    let layout = confirm_layout(q, screen);
     let color = if danger { th().production } else { th().accent };
     let inner = frame(layout.area, if danger { "Careful" } else { "Confirm" }, color, buf);
     if inner.height == 0 || inner.width < 2 {
@@ -664,16 +666,16 @@ pub(super) fn draw_viewer(
     lines: &[Line<'static>],
     scroll: u16,
     keys: &[(&str, &str)],
-    full: Rect,
+    screen: Rect,
     buf: &mut Buffer,
 ) {
-    let area = viewer_area(lines.len(), full);
+    let area = viewer_area(lines.len(), screen);
     let inner = frame(area, title, th().accent, buf);
     if inner.height < 2 {
         return;
     }
     let body = inner.height - 1;
-    let max_scroll = viewer_max_scroll(lines.len(), full);
+    let max_scroll = viewer_max_scroll(lines.len(), screen);
     let scroll = scroll.min(max_scroll) as usize;
     for (i, line) in lines.iter().skip(scroll).take(body as usize).enumerate() {
         buf.set_line(inner.x + 1, inner.y + i as u16, line, inner.width.saturating_sub(2));
@@ -683,16 +685,16 @@ pub(super) fn draw_viewer(
     buf.set_line(inner.x + 1, inner.y + inner.height - 1, &line, inner.width.saturating_sub(2));
 }
 
-fn viewer_area(lines: usize, full: Rect) -> Rect {
-    let w = full.width.saturating_sub(4).min(84);
-    let h = full.height.saturating_sub(2).min(lines.min(u16::MAX as usize - 3) as u16 + 3);
-    centered(full, w, h)
+fn viewer_area(lines: usize, screen: Rect) -> Rect {
+    let w = screen.width.saturating_sub(4).min(84);
+    let h = screen.height.saturating_sub(2).min(lines.min(u16::MAX as usize - 3) as u16 + 3);
+    centered(screen, w, h)
 }
 
-/// How far a viewer of `lines` can scroll in `full`: the last line at the bottom.
-pub(super) fn viewer_max_scroll(lines: usize, full: Rect) -> u16 {
+/// How far a viewer of `lines` can scroll in `screen`: the last line at the bottom.
+pub(super) fn viewer_max_scroll(lines: usize, screen: Rect) -> u16 {
     // Frame, then the body, then the line of keys.
-    let body = viewer_area(lines, full).height.saturating_sub(3);
+    let body = viewer_area(lines, screen).height.saturating_sub(3);
     (lines.min(u16::MAX as usize) as u16).saturating_sub(body)
 }
 
@@ -719,8 +721,9 @@ mod tests {
     use super::super::ui::ConfirmAction;
     use super::*;
 
-    #[test]
-    fn overlays_fit_any_terminal() {
+    /// Every kind of overlay, drawn in `screen` of `buf`: questions, a picker, a prompt, the menu
+    /// and a viewer.
+    fn draw_every_overlay(screen: Rect, buf: &mut Buffer) {
         let message = "Remove the worktree /a/very/long/path/that/does/not/fit and its branch kraal/x?\n\
                        It has 3 uncommitted changes: they will be lost.\nCloses 2 panes: a, b";
         let picker = Picker::new(
@@ -741,18 +744,37 @@ mod tests {
         let (km, _) = crate::keymap::Keymap::build(&crate::config::Config::default().keys);
         let menu = menu_items(&km.menu(&[]));
         let lines: Vec<Line<'static>> = (0..50).map(|i| entry("ctrl+b p r", &format!("line {i}"), 12)).collect();
-        for (w, h) in [(1, 1), (5, 3), (12, 4), (20, 5), (33, 6), (40, 10), (80, 24), (200, 60)] {
-            let area = Rect::new(0, 0, w, h);
-            let mut buf = Buffer::empty(area);
-            for (action, yes) in [(ConfirmAction::ClosePane(1), true), (ConfirmAction::TrustRunbook, false)] {
-                let q = Question { message: message.repeat(5), action, yes, scroll: 99 };
-                draw_confirm(&q, area, &mut buf);
+        for (action, yes) in [(ConfirmAction::ClosePane(1), true), (ConfirmAction::TrustRunbook, false)] {
+            let q = Question { message: message.repeat(5), action, yes, scroll: 99 };
+            draw_confirm(&q, screen, buf);
+        }
+        draw_picker(&picker, screen, buf);
+        draw_prompt(&prompt, screen, buf);
+        let layout = menu_layout(&menu, screen);
+        draw_menu(&menu, &layout, ("ctrl+b", &[]), false, Some("q does nothing here"), buf);
+        draw_viewer("Help", &lines, 99, &[("esc", "close")], screen, buf);
+    }
+
+    const SIZES: [(u16, u16); 8] = [(1, 1), (5, 3), (12, 4), (20, 5), (33, 6), (40, 10), (80, 24), (200, 60)];
+
+    #[test]
+    fn overlays_fit_any_terminal() {
+        for (w, h) in SIZES {
+            let screen = Rect::new(0, 0, w, h);
+            draw_every_overlay(screen, &mut Buffer::empty(screen));
+        }
+    }
+
+    #[test]
+    fn overlays_leave_the_bottom_bar_alone() {
+        // The bar's row, right under the screen overlays get.
+        for (w, h) in SIZES {
+            let mut buf = Buffer::empty(Rect::new(0, 0, w, h + 1));
+            for x in 0..w {
+                buf[(x, h)].set_symbol("=");
             }
-            draw_picker(&picker, area, &mut buf);
-            draw_prompt(&prompt, area, &mut buf);
-            let layout = menu_layout(&menu, area);
-            draw_menu(&menu, &layout, ("ctrl+b", &[]), false, Some("q does nothing here"), &mut buf);
-            draw_viewer("Help", &lines, 99, &[("esc", "close")], area, &mut buf);
+            draw_every_overlay(Rect::new(0, 0, w, h), &mut buf);
+            assert!((0..w).all(|x| buf[(x, h)].symbol() == "="), "{w}×{h}");
         }
     }
 

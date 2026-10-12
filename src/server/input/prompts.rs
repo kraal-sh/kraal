@@ -224,8 +224,7 @@ impl Server {
     }
 
     pub(super) fn on_confirm(&mut self, id: ClientId, mut q: Question, ev: InputEvent) -> Mode {
-        let (cols, rows) = self.clients.get(&id).map(|c| (c.cols, c.rows)).unwrap_or((80, 24));
-        let layout = crate::server::overlays::confirm_layout(&q, ratatui::layout::Rect::new(0, 0, cols, rows));
+        let layout = crate::server::overlays::confirm_layout(&q, self.client_screen(id));
         let yes = match ev {
             InputEvent::Key(k) => {
                 let plain = !k.mods.ctrl && !k.mods.alt;

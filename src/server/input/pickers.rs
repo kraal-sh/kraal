@@ -19,8 +19,7 @@ impl Server {
             let keys = p.action_keys();
             // A click on an action does it; anywhere else closes the list.
             if let InputEvent::Mouse(MouseEvent { kind: MouseKind::Press(MouseButton::Left), col, row, .. }) = ev {
-                let (cols, rows) = self.clients.get(&id).map(|c| (c.cols, c.rows)).unwrap_or((80, 24));
-                let layout = crate::server::overlays::picker_layout(&p, ratatui::layout::Rect::new(0, 0, cols, rows));
+                let layout = crate::server::overlays::picker_layout(&p, self.client_screen(id));
                 // The actions are drawn from the top of the list area, scrolled to the selected one.
                 let first = at.saturating_sub((layout.list.height as usize).saturating_sub(1));
                 let i = layout.row_at(col, row).map(|i| i - layout.start + first);
@@ -222,8 +221,7 @@ impl Server {
             InputEvent::Mouse(MouseEvent { kind: MouseKind::ScrollDown, .. }) => p.move_by(1),
             InputEvent::Mouse(MouseEvent { kind: MouseKind::Press(MouseButton::Left), col, row, .. }) => {
                 // A click on a row selects it; a second click on it chooses it.
-                let (cols, rows) = self.clients.get(&id).map(|c| (c.cols, c.rows)).unwrap_or((80, 24));
-                let layout = crate::server::overlays::picker_layout(&p, ratatui::layout::Rect::new(0, 0, cols, rows));
+                let layout = crate::server::overlays::picker_layout(&p, self.client_screen(id));
                 if let Some(i) = layout.row_at(col, row) {
                     if i == p.selected {
                         let Some(item) = p.current().cloned() else { return Mode::Picker(p) };

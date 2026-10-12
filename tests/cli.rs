@@ -3801,6 +3801,39 @@ fn the_bottom_bar_shows_the_focused_panes_actions() {
     client.wait_for_row("web-prod-1 ▸ ctrl+b f its files");
 }
 
+/// The menu, pickers and viewers go above the bottom bar, the menu right on it; without the bar
+/// they go down to the last row.
+#[test]
+fn overlays_stay_above_the_bottom_bar() {
+    let env = Env::new("overbar");
+    std::fs::create_dir_all(env.root.join("state/kraal")).unwrap();
+    std::fs::write(env.root.join("state/kraal/welcomed"), "").unwrap();
+    env.workspace("w", "layout {\n    pane name=\"main\"\n}\n");
+    env.run(&["open", "w"]);
+    let mut client = RawClient::attach(&env, "w");
+    let bar = client.wait_for_row("alt+n new pane")[39].clone();
+    let framed = |row: &str| row.contains(['│', '╭', '╮', '╰', '╯', '─']);
+    for (keys, title) in [(&b"\x02"[..], "Connect to a server"), (b"\x02 ", "Commands"), (b"\x02Vj", "Messages")] {
+        client.send(keys);
+        let rows = client.wait_for_row(title);
+        assert!(!framed(&rows[39]), "{title} over the bar:\n{}", rows.join("\n"));
+        client.send(b"\x1b");
+        client.wait_for_rows("the bar back", |rows| rows[39] == bar);
+    }
+    // The menu sits right on the bar, which keeps its keys while the menu is open.
+    client.send(b"\x02");
+    let rows = client.wait_for_row("Connect to a server");
+    assert!(rows[38].trim_end().ends_with('╯') && rows[39] == bar, "{}", rows.join("\n"));
+    client.send(b"\x1b");
+
+    // Without the bar, down to the last row.
+    client.send(b"\x02Vk");
+    client.wait_for_rows("the menu key on top", |rows| rows[0].contains("ctrl+b menu"));
+    client.send(b"\x02");
+    let rows = client.wait_for_row("Connect to a server");
+    assert!(rows[39].trim_end().ends_with('╯'), "{}", rows.join("\n"));
+}
+
 #[test]
 fn a_pane_printing_without_a_pause_does_not_starve_the_others() {
     let env = Env::new("starve");
