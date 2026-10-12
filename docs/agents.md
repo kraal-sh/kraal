@@ -83,15 +83,17 @@ The agent picker (`ctrl+b a`) offers to start an agent **in a new worktree**: kr
 agent there in its own tab. Several agents can work on the same repository without stepping on each
 other. `ctrl+b R g` in that tab reviews the changes (your pager, delta included), commits them, opens
 a pull request (`gh`), merges into the base branch or removes the worktree. Removing says first
-what would be lost (uncommitted changes, commits the base does not have) and which panes it
-closes. Account rules written for the repository also apply in its worktrees.
+what would be lost (uncommitted changes, commits the base does not have, ignored files of its
+own) and which panes it closes. Account rules written for the repository also apply in its
+worktrees.
 
 ```sh
 kraal wt new fix-login --agent claude   # the same from the command line
 kraal wt list                      # with each worktree's number
-kraal wt rm fix-login              # refuses if it would lose changes or unmerged commits
+kraal wt rm fix-login              # refuses if it would lose changes, unmerged commits or ignored files
 kraal wt rm fix-login --force      # removes anyway
 kraal wt prune                     # removes those merged into their base and clean (--dry-run)
+kraal wt prune --discard-ignored   # also those whose only leftovers are ignored files
 ```
 
 **Preparation.** A new worktree has no `.env` and no `node_modules`. A repository says how to
@@ -108,22 +110,41 @@ copied through a link out of the repository, nor written through one. `setup` ru
 worktree, in the agent's pane, before the agent starts; the first command that fails stops the
 setup, and the agent then waits for Enter. These commands come from the repository: like its
 runbooks, they run only once you have approved that version of the file (kraal shows them and
-asks again when the file changes). `kraal wt new` asks in the terminal; `--yes` approves,
-`--no-setup` skips the preparation. Your own `copy` and `setup`, for every repository, go in
-`[worktrees]` in the config; they run without asking, after the repository's.
+asks again when the file changes), with control and invisible characters written out (`\u{1b}`,
+`\r`), so what you approve is what runs. `kraal wt new` asks in the terminal; `--yes` approves,
+`--no-setup` skips the preparation (the file is not even read). Your own `copy` and `setup`, for
+every repository, go in `[worktrees]` in the config; they run without asking, after the
+repository's.
 
-**Ports.** Each worktree has a number in its repository (1, 2…, reused once its worktree is
-gone). Panes opened in it get `$KRAAL_WORKTREE` (its name), `$KRAAL_WORKTREE_INDEX` and
-`$KRAAL_PORT_OFFSET` (the number times `port_step`, 10 by default), and `$PORT` when `[worktrees]`
-sets `port_base`, so the same dev server can run in several worktrees at once:
+**Ports.** Each worktree has a number in its repository (1, 2…), kept with the worktree whatever
+it checks out (another branch, a detached HEAD) and reused once the worktree is gone. Panes opened
+in it get `$KRAAL_WORKTREE` (its name), `$KRAAL_WORKTREE_INDEX` and `$KRAAL_PORT_OFFSET` (the
+number times `port_step`, 10 by default), and `$PORT` when `[worktrees]` sets `port_base`, even
+when opened with `kraal run --cwd` in a worktree the session has not seen yet, so the same dev
+server can run in several worktrees at once:
 `npm run dev -- --port $((5173 + KRAAL_PORT_OFFSET))`. The sidebar's PORTS section names the
 worktree a port is served from.
 
 **Cleanup.** `ctrl+b R g` › Remove merged worktrees, from any checkout of the repository, removes
-in one go the worktrees that would lose nothing (no changes, every commit in their base), after
-saying which panes it closes and why the others stay. `kraal wt prune` does the same, keeping the
-worktrees panes of the session work in. Neither ever forces a removal: a branch squashed into its
-base on the server still has commits its base does not have, and stays.
+in one go the worktrees whose work is all in their base, after saying which panes it closes and
+why the others stay. `kraal wt prune` does the same, keeping the worktrees panes of the session
+work in. A worktree is merged when all of these hold:
+
+- it has no uncommitted change and no untracked file;
+- each commit of its branch (and of a detached HEAD in it) is in the history of its base, or, for
+  a branch merged by squash, rebased or cherry-picked, merging the branch into its base would
+  change nothing: every change the branch brings is in the base, the same. A change the base made
+  differently since, or undid, means the branch is not merged, and stays. Update the base first
+  (`git pull` on it) for a pull request merged on the server to count. This takes git 2.38 or
+  later; with an older git, only commits in the base's history count;
+- it has no ignored file (`.gitignore`) of its own: build output, a local database, a `.env` you
+  changed. One the main checkout has, the same, at the same place (a file `copy` put there) is
+  no loss. Remove merged worktrees lists such files and deletes them once you agree; `kraal wt
+  prune` keeps such a worktree unless given `--discard-ignored`.
+
+The branch is then deleted only at the commit that was checked, and only while its base is
+where it was: a commit made meanwhile (in another terminal) keeps the branch. Neither ever forces
+a removal.
 
 ## Accounts
 

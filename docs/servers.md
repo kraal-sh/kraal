@@ -78,6 +78,7 @@ Drop a file from your file manager on an SSH pane and kraal offers to upload it 
 ```sh
 kraal edit db:/etc/app.conf            # in your $EDITOR, in a floating pane
 kraal edit db:app/.env --line 12       # a path relative to the home directory there
+kraal edit db:/etc/nginx/nginx.conf --sudo   # as root, through sudo there
 ```
 
 `e` on a server's file in the file manager does the same, and so does Tab then the label of a
@@ -89,11 +90,22 @@ says so in a message. The editor must stay in the foreground until you are done 
 Nothing is written blindly: kraal keeps a hash of what it read, made on the server, and checks it
 before each save. If the file changed there meanwhile, it asks: keep your version as a local file
 (in `download_dir`; your next saves go there), keep the server's version (the editor's copy
-becomes it), or replace it with yours. A save writes a new file next to the old one, with its
-mode (and owner when you may give it), then renames it over it. kraal edits regular files of up
-to 16 MiB that you may write, following symbolic links to them, without sudo. On a production
-server it asks first, and `kraal edit` refuses unless given `--production`. If kraal stops while
-you edit, what was not saved is kept in `download_dir`.
+becomes it, unless you save again before it arrives: then it asks again), or replace it with
+yours. A save writes a new file next to the old one, with its mode (and owner when you may give
+it), then renames it over it. Once the new version is there, the check and the rename happen
+under a lock next to the file (`.kraal-edit-lock-…`, gone right after), so two kraal editors of
+the same file never overwrite each other unseen: the later one is asked. kraal edits regular
+files of up to 16 MiB, following symbolic links to them. On a production server it asks first,
+and `kraal edit` refuses unless given `--production`. If kraal stops while you edit, what was not
+saved is kept in `download_dir`.
+
+**As root.** A file you may not write (or read) is refused, unless you ask for sudo: `kraal edit
+--sudo`, or yes to the question `e` in the file manager and a hint ask then. One connection runs
+sudo for the whole edit: a small pane asks for your password, and kraal passes it on to sudo
+without keeping it (it is never written to a disk, and is wiped once given); no password is asked
+where sudo needs none. Each save then goes through the same checks, lock and rename as root,
+which keeps the file's mode and owner. sudo must accept a password on its input (`-S`): one that
+asks for more than a password (a one-time code), or that requires a terminal, is not supported.
 
 ## Fleet tools
 

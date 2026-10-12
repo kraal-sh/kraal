@@ -1,16 +1,22 @@
 //! Editing a file of a server in the local editor: a private copy, the editor in a floating
 //! pane, each save sent back to the server, and a question when the server's file changed
-//! meanwhile (see `crate::edit` for what runs there).
+//! meanwhile (see `crate::edit` for what runs there). Reading and writing files, here and on the
+//! server, happens in background jobs: a slow disk or server never stops the event loop.
 
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use super::contexts::Production;
 use super::ui::{ConfirmAction, Mode, PickAction, PickItem, Picker, PickerKind};
 use super::{ClientId, Server};
-use crate::edit::{self, RemoteFile, Saved, Stamp};
+use crate::edit::{self, Channel, RemoteFile, Saved, Stamp};
 use crate::layout::PaneId;
 use crate::pane::PaneSpec;
 use crate::protocol::{Placement, Response, ServerMsg};
+
+/// How long the pane asking for a sudo password waits for it.
+const PASSWORD_WAIT: Duration = Duration::from_secs(300);
 
 /// A file to edit, and where its editor opens.
 #[derive(Clone, Debug)]
@@ -26,6 +32,8 @@ pub struct EditTarget {
     pub ws: Option<u32>,
     /// The pane the editor opens over.
     pub near: Option<PaneId>,
+    /// As root, through sudo on the server.
+    pub sudo: bool,
 }
 
 /// What to do when the server's file changed since it was read.
@@ -50,13 +58,15 @@ pub(super) struct Edit {
     /// a local file: what that file holds.
     remote: Vec<u8>,
     identity: String,
-    /// The editor's copy, alone in its private directory.
+    /// The private directory kraal made for this edit: the only one removed when it ends.
+    dir: PathBuf,
+    /// The editor's copy, in that directory.
     local: PathBuf,
     pane: PaneId,
     seen: Option<Stamp>,
     /// The copy changed at the last look: it is read once it holds still.
     settling: bool,
-    /// An ssh command for this file runs.
+    /// A job for this file runs (reading the copy, ssh): nothing else starts meanwhile.
     busy: bool,
     /// The server's version changed since it was read (what identifies it now): nothing is sent
     /// until the user says what to do.
@@ -67,16 +77,34 @@ pub(super) struct Edit {
     kept: Option<PathBuf>,
     /// The editor ended.
     closed: bool,
+    /// How the server's file is read and written.
+    channel: Channel,
 }
 
 impl Edit {
     fn name(&self) -> String {
         printable(&self.file.name)
     }
+}
 
-    fn dir(&self) -> &Path {
-        self.local.parent().unwrap_or(Path::new("/"))
-    }
+/// A file read, and its private copy made: what the editor opens on.
+struct Ready {
+    channel: Channel,
+    opened: edit::Opened,
+    dir: PathBuf,
+    local: PathBuf,
+}
+
+/// What a look at the editor's copy did.
+enum Checked {
+    Unreadable(std::io::Error),
+    /// Nothing new in it.
+    Same,
+    /// Its content went to the kept local file.
+    Kept(Vec<u8>),
+    KeepFailed(std::io::Error),
+    /// Its content went to the server.
+    Sent(Vec<u8>, anyhow::Result<Saved>),
 }
 
 /// `$EDITOR` (vi without one) on `path`, at `line`: what an editor's pane runs.
@@ -94,6 +122,24 @@ fn printable(s: &str) -> String {
     s.chars().map(|c| if c.is_control() { '?' } else { c }).collect()
 }
 
+/// Where the private directories of edits go.
+fn edit_base() -> std::io::Result<PathBuf> {
+    Ok(crate::paths::private_runtime_dir()?.join("edit"))
+}
+
+/// The file read through `channel`, and its private copy.
+fn read_into_copy(channel: Channel, path: &str, dir: Option<PathBuf>) -> anyhow::Result<Ready> {
+    let opened = channel.open(path)?;
+    let (dir, local) = match dir {
+        Some(dir) => {
+            let local = edit::copy_into(&dir, &opened.file.name, &opened.content)?;
+            (dir, local)
+        }
+        None => edit::local_copy(&edit_base()?, &opened.file.name, &opened.content)?,
+    };
+    Ok(Ready { channel, opened, dir, local })
+}
+
 impl Server {
     /// Edit `target` for `client`, asking first when it is production.
     pub(super) fn edit_request(
@@ -104,9 +150,10 @@ impl Server {
     ) -> Mode {
         if let Some(why) = production {
             let message = format!(
-                "Edit {} on {}? It is production ({why}).\nEach save in the editor goes to the server.",
+                "Edit {} on {}{}? It is production ({why}).\nEach save in the editor goes to the server.",
                 printable(&target.path),
-                target.server
+                target.server,
+                if target.sudo { " as root" } else { "" }
             );
             return Mode::confirm(message, ConfirmAction::Edit(Box::new(target)));
         }
@@ -128,44 +175,168 @@ impl Server {
     /// Read the file off the event loop, then open the editor on a private copy of it. `reply`
     /// is a control request (`kraal edit`) waiting to know how that went.
     pub(super) fn start_edit(&mut self, client: Option<ClientId>, target: EditTarget, reply: Option<ClientId>) {
-        let (ssh, path) = (target.ssh.clone(), target.path.clone());
-        let shown = format!("{}:{}", target.server, printable(&target.path));
+        if target.sudo {
+            return self.start_sudo_edit(client, target, reply);
+        }
+        let (channel, path) = (Channel::Ssh(target.ssh.clone()), target.path.clone());
         let started = self.background(
-            move || edit::open(&ssh, &path),
-            move |server, opened| {
-                let result = opened
-                    .and_then(|o| server.open_editor(client, target, o))
-                    .map_err(|e| format!("cannot edit {shown}: {e:#}"));
-                match reply {
-                    Some(r) => {
-                        let result = result.map(|p| Response::Pane(Box::new(server.pane_info(p))));
-                        server.send_msg(r, &ServerMsg::Response { result });
-                        server.clients.remove(&r);
-                    }
-                    None => {
-                        if let Err(e) = result {
-                            server.toast(client.unwrap_or(0), e);
-                        }
-                    }
-                }
-            },
+            move || read_into_copy(channel, &path, None),
+            move |server, ready| server.edit_ready(client, target, reply, ready),
         );
-        if !started && let Some(r) = reply {
-            self.send_msg(r, &ServerMsg::Response { result: Err("cannot start reading the file".into()) });
-            self.clients.remove(&r);
+        if !started {
+            self.edit_failed(client, reply, "cannot start reading the file".into());
         }
     }
 
-    /// The editor on a private copy of `opened`, in a floating pane.
-    fn open_editor(
+    /// Through sudo: one connection runs it for the whole edit. When it needs a password, a
+    /// pane asks for it, and the file is read once sudo has it.
+    fn start_sudo_edit(&mut self, client: Option<ClientId>, target: EditTarget, reply: Option<ClientId>) {
+        enum Started {
+            Ready(Ready),
+            Password(edit::Session, PathBuf, PathBuf),
+        }
+        let (ssh, path) = (target.ssh.clone(), target.path.clone());
+        let started = self.background(
+            move || -> anyhow::Result<Started> {
+                let session = edit::Session::start(&ssh, &path)?;
+                if session.needs_password {
+                    let dir = edit::private_dir(&edit_base()?)?;
+                    match edit::password_fifo(&dir) {
+                        Ok(fifo) => Ok(Started::Password(session, dir, fifo)),
+                        Err(e) => {
+                            let _ = std::fs::remove_dir_all(&dir);
+                            Err(e.into())
+                        }
+                    }
+                } else {
+                    let path = session.path.clone();
+                    read_into_copy(Channel::Sudo(Arc::new(Mutex::new(session))), &path, None).map(Started::Ready)
+                }
+            },
+            move |server, started| match started {
+                Ok(Started::Ready(ready)) => server.edit_ready(client, target, reply, Ok(ready)),
+                Ok(Started::Password(session, dir, fifo)) => {
+                    server.ask_sudo_password(client, target, reply, session, dir, fifo)
+                }
+                Err(e) => server.edit_ready(client, target, reply, Err(e)),
+            },
+        );
+        if !started {
+            self.edit_failed(client, reply, "cannot start sudo".into());
+        }
+    }
+
+    /// A pane asks for the sudo password; sudo gets it as soon as it is typed, then the file is
+    /// read as root.
+    fn ask_sudo_password(
         &mut self,
         client: Option<ClientId>,
         target: EditTarget,
-        opened: edit::Opened,
-    ) -> anyhow::Result<PaneId> {
-        let base = crate::paths::private_runtime_dir()?.join("edit");
-        let local = edit::local_copy(&base, &opened.file.name, &opened.content)?;
-        let dir = local.parent().map(Path::to_path_buf).unwrap_or_default();
+        reply: Option<ClientId>,
+        session: edit::Session,
+        dir: PathBuf,
+        fifo: PathBuf,
+    ) {
+        let prompt =
+            format!("[sudo] password on {} (kraal edits {} as root): ", target.server, printable(&target.path));
+        let spec = PaneSpec {
+            command: edit::password_command(&fifo, &prompt),
+            cwd: Some(dir.clone()),
+            close_on_exit: true,
+            ..Default::default()
+        };
+        let ws = self.edit_workspace(client, &target);
+        let label = Some(format!("sudo · {}", target.server));
+        if let Err(e) = self.spawn_pane_in(ws, target.near, spec, Placement::Floating, label) {
+            self.drop_empty_workspaces();
+            self.background(move || drop((session, std::fs::remove_dir_all(&dir))), |_, ()| {});
+            return self.edit_failed(client, reply, format!("cannot edit {}: {e:#}", target.server));
+        }
+        let started = self.background(
+            move || -> anyhow::Result<Ready> {
+                let mut session = session;
+                let result = (|| {
+                    let password = edit::read_password(&fifo, PASSWORD_WAIT);
+                    // Gone before the copy is made: the file may have its name.
+                    let _ = std::fs::remove_file(&fifo);
+                    let Some(mut password) = password? else {
+                        anyhow::bail!("no password was given");
+                    };
+                    session.authenticate(&mut password)?;
+                    let path = session.path.clone();
+                    read_into_copy(Channel::Sudo(Arc::new(Mutex::new(session))), &path, Some(dir.clone()))
+                })();
+                if result.is_err() {
+                    let _ = std::fs::remove_dir_all(&dir);
+                }
+                result
+            },
+            move |server, ready| server.edit_ready(client, target, reply, ready),
+        );
+        if !started {
+            self.edit_failed(client, reply, "cannot wait for the password".into());
+        }
+    }
+
+    /// The file is read (or could not be): its editor opens, or the user is told why not. A file
+    /// the user may not write, asked for from the file manager or a hint, is offered as root.
+    fn edit_ready(
+        &mut self,
+        client: Option<ClientId>,
+        target: EditTarget,
+        reply: Option<ClientId>,
+        ready: anyhow::Result<Ready>,
+    ) {
+        let shown = format!("{}:{}", target.server, printable(&target.path));
+        let not_permitted = ready.as_ref().err().and_then(|e| e.downcast_ref::<edit::NotPermitted>());
+        if let (Some(why), None, false, Some(c)) = (not_permitted, reply, target.sudo, client) {
+            let message = format!(
+                "{shown}: {why}.\nEdit it as root, through sudo on {}? A pane asks for your password; kraal does not keep it.",
+                target.server
+            );
+            let target = EditTarget { sudo: true, ..target };
+            self.set_mode_if_idle(c, Mode::confirm(message, ConfirmAction::Edit(Box::new(target))));
+            return;
+        }
+        let result =
+            ready.and_then(|r| self.open_editor(client, target, r)).map_err(|e| format!("cannot edit {shown}: {e:#}"));
+        match (result, reply) {
+            (Ok(p), Some(r)) => {
+                let result = Ok(Response::Pane(Box::new(self.pane_info(p))));
+                self.send_msg(r, &ServerMsg::Response { result });
+                self.clients.remove(&r);
+            }
+            (Ok(_), None) => {}
+            (Err(e), _) => self.edit_failed(client, reply, e),
+        }
+    }
+
+    /// Say why an edit did not start: to the waiting control request, else to the client.
+    fn edit_failed(&mut self, client: Option<ClientId>, reply: Option<ClientId>, why: String) {
+        match reply {
+            Some(r) => {
+                self.send_msg(r, &ServerMsg::Response { result: Err(why) });
+                self.clients.remove(&r);
+            }
+            None => self.toast(client.unwrap_or(0), why),
+        }
+    }
+
+    /// The workspace an edit's panes open in: the target's, else the client's, else the first.
+    fn edit_workspace(&mut self, client: Option<ClientId>, target: &EditTarget) -> u32 {
+        // The workspace may have closed while the file was read.
+        let open = |ws: &u32| self.ws_index(*ws).is_some();
+        target
+            .ws
+            .filter(open)
+            .or_else(|| client.and_then(|c| self.clients.get(&c)).map(|c| c.workspace).filter(open))
+            .or_else(|| self.workspaces.first().map(|w| w.id))
+            .unwrap_or_else(|| self.new_workspace("main".into(), None))
+    }
+
+    /// The editor on the private copy of the file, in a floating pane.
+    fn open_editor(&mut self, client: Option<ClientId>, target: EditTarget, ready: Ready) -> anyhow::Result<PaneId> {
+        let Ready { channel, opened, dir, local } = ready;
         let command = editor_command(&local, target.line);
         // It ends with the editor, and does not come back after a restart (nor do transfer
         // windows): its copy is gone by then.
@@ -177,20 +348,13 @@ impl Server {
             close_on_success: true,
             ..Default::default()
         };
-        // The workspace may have closed while the file was read.
-        let open = |ws: &u32| self.ws_index(*ws).is_some();
-        let ws = target
-            .ws
-            .filter(open)
-            .or_else(|| client.and_then(|c| self.clients.get(&c)).map(|c| c.workspace).filter(open))
-            .or_else(|| self.workspaces.first().map(|w| w.id))
-            .unwrap_or_else(|| self.new_workspace("main".into(), None));
+        let ws = self.edit_workspace(client, &target);
         let label = format!("{} · {}", printable(&opened.file.name), target.server);
         let pane = match self.spawn_pane_in(ws, target.near, spec, Placement::Floating, Some(label)) {
             Ok(p) => p,
             Err(e) => {
                 self.drop_empty_workspaces();
-                let _ = std::fs::remove_dir_all(&dir);
+                self.background(move || drop((channel, std::fs::remove_dir_all(&dir))), |_, ()| {});
                 return Err(e);
             }
         };
@@ -203,6 +367,7 @@ impl Server {
             remote: opened.content,
             identity: opened.identity,
             seen: edit::stamp(&local),
+            dir,
             local,
             pane,
             settling: false,
@@ -211,6 +376,7 @@ impl Server {
             asked: false,
             kept: None,
             closed: false,
+            channel,
         });
         Ok(pane)
     }
@@ -272,68 +438,72 @@ impl Server {
             return;
         }
         e.settling = false;
-        let content = match crate::paths::read_regular(&e.local, edit::MAX_SIZE) {
-            Ok(c) => c,
-            Err(err) => {
-                let (name, closed, gone) = (e.name(), e.closed, err.kind() == std::io::ErrorKind::NotFound);
-                let dir = e.dir().to_path_buf();
+        e.busy = true;
+        let (local, kept, remote) = (e.local.clone(), e.kept.clone(), e.remote.clone());
+        let (channel, file, expected) = (e.channel.clone(), e.file.clone(), e.identity.clone());
+        let started = self.background(
+            move || {
+                let content = match crate::paths::read_regular(&local, edit::MAX_SIZE) {
+                    Ok(c) => c,
+                    Err(err) => return Checked::Unreadable(err),
+                };
+                if content == remote {
+                    return Checked::Same;
+                }
+                match kept {
+                    Some(path) => match crate::paths::write_private(&path, &content) {
+                        Ok(()) => Checked::Kept(content),
+                        Err(err) => Checked::KeepFailed(err),
+                    },
+                    None => {
+                        let result = channel.save(&file, &expected, &content);
+                        Checked::Sent(content, result)
+                    }
+                }
+            },
+            move |server, checked| server.edit_checked(id, checked),
+        );
+        if !started && let Some(i) = self.edit_index(id) {
+            self.edits[i].busy = false;
+        }
+    }
+
+    fn edit_checked(&mut self, id: u32, checked: Checked) {
+        let Some(i) = self.edit_index(id) else { return };
+        let e = &mut self.edits[i];
+        e.busy = false;
+        let (name, closed, dir) = (e.name(), e.closed, e.dir.clone());
+        match checked {
+            Checked::Unreadable(err) => {
+                let gone = err.kind() == std::io::ErrorKind::NotFound;
                 if closed && gone {
                     self.edit_toast(id, format!("{name}: the editor's copy is gone, nothing more was saved"));
                     self.finish_edit(id);
                 } else if closed {
                     self.edit_toast(id, format!("{name} was not saved: {err}; your copy stays in {}", dir.display()));
-                    self.edits.retain(|e| e.id != id);
+                    self.forget_edit(id);
                 } else if !gone {
                     self.edit_toast(id, format!("{name} was not saved: {err}"));
                 }
-                return;
             }
-        };
-        if let Some(kept) = e.kept.clone() {
-            if content != e.remote {
-                let name = e.name();
-                match crate::paths::write_private(&kept, &content) {
-                    Ok(()) => {
-                        e.remote = content;
-                        let shown = crate::paths::shorten_home(&kept);
-                        self.edit_toast(id, format!("{name} saved in {shown}"));
-                    }
-                    Err(err) => {
-                        let dir = e.dir().to_path_buf();
-                        self.edit_toast(id, format!("{name}: {err}; your copy stays in {}", dir.display()));
-                        self.edits.retain(|e| e.id != id);
-                        return;
-                    }
+            Checked::Same => {
+                if closed {
+                    self.finish_edit(id);
                 }
             }
-            if self.edits.get(i).is_some_and(|e| e.closed) {
-                self.finish_edit(id);
+            Checked::Kept(content) => {
+                e.remote = content;
+                let shown = e.kept.as_deref().map(crate::paths::shorten_home).unwrap_or_default();
+                self.edit_toast(id, format!("{name} saved in {shown}"));
+                if closed {
+                    self.finish_edit(id);
+                }
             }
-            return;
-        }
-        if content != e.remote {
-            let expected = e.identity.clone();
-            self.send_edit(id, content, expected);
-        } else if e.closed {
-            self.finish_edit(id);
-        }
-    }
-
-    /// Send `content` to the server, in place of what `expected` identifies.
-    fn send_edit(&mut self, id: u32, content: Vec<u8>, expected: String) {
-        let Some(i) = self.edit_index(id) else { return };
-        let e = &mut self.edits[i];
-        e.busy = true;
-        let (ssh, file) = (e.target.ssh.clone(), e.file.clone());
-        let started = self.background(
-            move || {
-                let result = edit::save(&ssh, &file, &expected, &content);
-                (content, result)
-            },
-            move |server, (content, result)| server.edit_sent(id, content, result),
-        );
-        if !started && let Some(i) = self.edit_index(id) {
-            self.edits[i].busy = false;
+            Checked::KeepFailed(err) => {
+                self.edit_toast(id, format!("{name}: {err}; your copy stays in {}", dir.display()));
+                self.forget_edit(id);
+            }
+            Checked::Sent(content, result) => self.edit_sent(id, content, result),
         }
     }
 
@@ -346,6 +516,7 @@ impl Server {
             Ok(Saved::Written(identity)) => {
                 e.identity = identity;
                 e.remote = content;
+                e.conflict = None;
                 self.edit_toast(id, format!("{name} saved to {server}"));
                 self.refresh_file_managers();
             }
@@ -434,81 +605,116 @@ impl Server {
         let e = &mut self.edits[i];
         e.client = Some(client);
         let Some(now) = e.conflict.clone() else { return };
+        if e.busy {
+            return;
+        }
         let (name, server) = (e.name(), e.target.server.clone());
-        match answer {
-            Answer::Overwrite => match crate::paths::read_regular(&e.local, edit::MAX_SIZE) {
-                Ok(content) => {
-                    e.conflict = None;
-                    self.send_edit(id, content, now);
-                }
-                Err(err) => self.toast(client, format!("{name} was not saved: {err}")),
-            },
+        let (local, channel, file) = (e.local.clone(), e.channel.clone(), e.file.clone());
+        let started = match answer {
+            Answer::Overwrite => {
+                e.busy = true;
+                self.background(
+                    move || match crate::paths::read_regular(&local, edit::MAX_SIZE) {
+                        Ok(content) => {
+                            let result = channel.save(&file, &now, &content);
+                            Checked::Sent(content, result)
+                        }
+                        Err(err) => Checked::Unreadable(err),
+                    },
+                    move |server, checked| match checked {
+                        Checked::Unreadable(err) => {
+                            if let Some(i) = server.edit_index(id) {
+                                server.edits[i].busy = false;
+                            }
+                            server.toast(client, format!("{name} was not saved: {err}"));
+                        }
+                        checked => server.edit_checked(id, checked),
+                    },
+                )
+            }
             Answer::KeepServer if e.closed => {
                 self.toast(client, format!("{name}: the version of {server} stays"));
                 self.finish_edit(id);
+                return;
             }
             Answer::KeepServer => {
                 e.conflict = None;
                 e.busy = true;
-                let (ssh, path) = (e.target.ssh.clone(), e.file.path());
-                let started = self.background(
-                    move || edit::open(&ssh, &path),
-                    move |server, opened| server.edit_reloaded(id, now, opened),
-                );
-                if !started && let Some(i) = self.edit_index(id) {
-                    self.edits[i].busy = false;
-                }
+                // The copy as it is now: a save made after this answer is never overwritten.
+                let answered = edit::stamp(&local);
+                let path = file.path();
+                self.background(
+                    move || {
+                        let opened = channel.open(&path)?;
+                        let replaced = edit::replace_copy(&local, answered, &opened.content)?;
+                        Ok((opened, replaced))
+                    },
+                    move |server, reloaded| server.edit_reloaded(id, now, reloaded),
+                )
             }
             Answer::KeepLocal => {
-                let kept = crate::paths::read_regular(&e.local, edit::MAX_SIZE).and_then(|content| {
-                    edit::keep(&self.download_dir(), &self.edits[i].file.name, &content).map(|p| (p, content))
-                });
-                match kept {
-                    Ok((path, content)) => {
-                        let e = &mut self.edits[i];
-                        e.conflict = None;
-                        e.kept = Some(path.clone());
-                        e.remote = content;
-                        let shown = crate::paths::shorten_home(&path);
-                        let next = if e.closed { "" } else { "; your next saves go there" };
-                        self.toast(client, format!("{name} kept in {shown}, {server} keeps its own{next}"));
-                        if self.edits[i].closed {
-                            self.finish_edit(id);
-                        }
-                    }
-                    Err(err) => self.toast(client, format!("{name} could not be kept: {err}")),
-                }
+                e.busy = true;
+                let downloads = self.download_dir();
+                self.background(
+                    move || {
+                        let content = crate::paths::read_regular(&local, edit::MAX_SIZE)?;
+                        edit::keep(&downloads, &file.name, &content).map(|p| (p, content))
+                    },
+                    move |server, kept| server.edit_kept(client, id, kept),
+                )
             }
+        };
+        if !started && let Some(i) = self.edit_index(id) {
+            self.edits[i].busy = false;
         }
     }
 
-    /// The server's version, read again for the editor's copy after the user chose to keep it.
-    fn edit_reloaded(&mut self, id: u32, conflict: String, opened: anyhow::Result<edit::Opened>) {
+    /// The answer "keep your version as a local file" was carried out, or could not be.
+    fn edit_kept(&mut self, client: ClientId, id: u32, kept: std::io::Result<(PathBuf, Vec<u8>)>) {
         let Some(i) = self.edit_index(id) else { return };
         let e = &mut self.edits[i];
         e.busy = false;
         let (name, server) = (e.name(), e.target.server.clone());
-        match opened {
-            Ok(_) if e.closed => {
+        match kept {
+            Ok((path, content)) => {
+                e.conflict = None;
+                e.kept = Some(path.clone());
+                e.remote = content;
+                let shown = crate::paths::shorten_home(&path);
+                let next = if e.closed { "" } else { "; your next saves go there" };
+                self.toast(client, format!("{name} kept in {shown}, {server} keeps its own{next}"));
+                if self.edits[i].closed {
+                    self.finish_edit(id);
+                }
+            }
+            Err(err) => self.toast(client, format!("{name} could not be kept: {err}")),
+        }
+    }
+
+    /// The server's version, read again for the editor's copy after the user chose to keep it:
+    /// the copy became it, unless it was saved again meanwhile (`None`), which asks again.
+    fn edit_reloaded(&mut self, id: u32, conflict: String, reloaded: anyhow::Result<(edit::Opened, Option<Stamp>)>) {
+        let Some(i) = self.edit_index(id) else { return };
+        let running = self.panes.get(&self.edits[i].pane).is_some_and(|p| p.exit_code.is_none());
+        let e = &mut self.edits[i];
+        e.busy = false;
+        let (name, server) = (e.name(), e.target.server.clone());
+        match reloaded {
+            Ok((_, Some(_))) if !running => {
                 self.edit_toast(id, format!("{name}: the version of {server} stays"));
                 self.finish_edit(id);
             }
-            Ok(o) => match std::fs::write(&e.local, &o.content) {
-                Ok(()) => {
-                    e.seen = edit::stamp(&e.local);
-                    e.settling = false;
-                    (e.file, e.remote, e.identity) = (o.file, o.content, o.identity);
-                    self.edit_toast(
-                        id,
-                        format!("{name}: the editor's copy is the version of {server} now (reload it)"),
-                    );
-                }
-                Err(err) => {
-                    e.conflict = Some(conflict);
-                    e.asked = true;
-                    self.edit_toast(id, format!("{name}: {err}"));
-                }
-            },
+            Ok((o, Some(stamp))) => {
+                e.seen = Some(stamp);
+                e.settling = false;
+                (e.file, e.remote, e.identity) = (o.file, o.content, o.identity);
+                self.edit_toast(id, format!("{name}: the editor's copy is the version of {server} now (reload it)"));
+            }
+            Ok((o, None)) => {
+                e.conflict = Some(o.identity);
+                e.asked = false;
+                self.edit_toast(id, format!("{name}: you saved again meanwhile, nothing was replaced"));
+            }
             Err(err) => {
                 // Asked again at the next save, or when the editor ends.
                 e.conflict = Some(conflict);
@@ -521,28 +727,56 @@ impl Server {
     /// End edit `id`, keeping the editor's version as a local file first.
     fn keep_edit_locally(&mut self, id: u32, why: &str) {
         let Some(i) = self.edit_index(id) else { return };
-        let (name, server) = (self.edits[i].name(), self.edits[i].target.server.clone());
-        let kept = crate::paths::read_regular(&self.edits[i].local, edit::MAX_SIZE)
-            .and_then(|content| edit::keep(&self.download_dir(), &self.edits[i].file.name, &content));
-        match kept {
-            Ok(path) => {
-                let shown = crate::paths::shorten_home(&path);
-                self.edit_toast(id, format!("{name}: {why}; your version is in {shown}, {server} keeps its own"));
-                self.finish_edit(id);
-            }
-            Err(err) => {
-                let dir = self.edits[i].dir().display().to_string();
-                self.edit_toast(id, format!("{name}: {why}, and {err}: your copy stays in {dir}"));
-                self.edits.retain(|e| e.id != id);
-            }
+        let e = &mut self.edits[i];
+        if e.busy {
+            return;
+        }
+        e.busy = true;
+        let (local, name) = (e.local.clone(), e.file.name.clone());
+        let downloads = self.download_dir();
+        let why = why.to_string();
+        let started = self.background(
+            move || {
+                let content = crate::paths::read_regular(&local, edit::MAX_SIZE)?;
+                edit::keep(&downloads, &name, &content)
+            },
+            move |server, kept| {
+                let Some(i) = server.edit_index(id) else { return };
+                let e = &server.edits[i];
+                let (name, target, dir) = (e.name(), e.target.server.clone(), e.dir.display().to_string());
+                match kept {
+                    Ok(path) => {
+                        let shown = crate::paths::shorten_home(&path);
+                        server.edit_toast(
+                            id,
+                            format!("{name}: {why}; your version is in {shown}, {target} keeps its own"),
+                        );
+                        server.finish_edit(id);
+                    }
+                    Err(err) => {
+                        server.edit_toast(id, format!("{name}: {why}, and {err}: your copy stays in {dir}"));
+                        server.forget_edit(id);
+                    }
+                }
+            },
+        );
+        if !started && let Some(i) = self.edit_index(id) {
+            self.edits[i].busy = false;
         }
     }
 
-    /// Forget edit `id` and remove its private copy.
+    /// Forget edit `id`, leaving its private copy where it is.
+    fn forget_edit(&mut self, id: u32) {
+        let Some(i) = self.edit_index(id) else { return };
+        let e = self.edits.remove(i);
+        self.background(move || drop(e.channel), |_, ()| {});
+    }
+
+    /// Forget edit `id` and remove its private directory (and only it).
     fn finish_edit(&mut self, id: u32) {
         let Some(i) = self.edit_index(id) else { return };
         let e = self.edits.remove(i);
-        let _ = std::fs::remove_dir_all(e.dir());
+        self.background(move || drop((e.channel, std::fs::remove_dir_all(&e.dir))), |_, ()| {});
     }
 
     /// The server stops: what was not sent is kept as local files (there is no time to send it),
@@ -567,9 +801,9 @@ impl Server {
                             path.display()
                         );
                     }
-                    let _ = std::fs::remove_dir_all(e.dir());
+                    let _ = std::fs::remove_dir_all(&e.dir);
                 }
-                Err(err) => eprintln!("kraal: {} was not saved: {err}; it stays in {}", e.name(), e.dir().display()),
+                Err(err) => eprintln!("kraal: {} was not saved: {err}; it stays in {}", e.name(), e.dir.display()),
             }
         }
     }

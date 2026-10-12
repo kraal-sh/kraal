@@ -187,6 +187,7 @@ impl Server {
             line,
             ws: self.clients.get(&id).map(|c| c.workspace),
             near: Some(pane),
+            sudo: false,
         };
         let production = self.pane_production(pane);
         self.edit_request(id, target, production)

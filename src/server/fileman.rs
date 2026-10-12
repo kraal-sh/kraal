@@ -237,7 +237,7 @@ impl Server {
                             };
                             // A POSIX script, whatever the login shell there (fish, csh…).
                             let script = format!("{cd} && exec \"${{SHELL:-sh}}\" -l");
-                            command.push(format!("sh -c {}", crate::shell::quote_always(&script)));
+                            command.push(crate::shell::sh_c(&script));
                             let spec = PaneSpec { command, server: Some(s.name.clone()), ..Default::default() };
                             self.spawn_pane_in(ws, None, spec, Placement::Tab, Some(s.name.clone()))
                         }
@@ -273,6 +273,7 @@ impl Server {
                     line: None,
                     ws: Some(ws),
                     near: Some(pane),
+                    sudo: false,
                 };
                 self.edit_request(client, target, production)
             }

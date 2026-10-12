@@ -22,6 +22,10 @@ pub struct GitInfo {
     pub behind: u32,
     /// The number of the kraal worktree this is (see [`Worktree::index`]); 0 elsewhere.
     pub worktree_index: u32,
+    /// The main checkout of the repository (`root` itself unless this is a linked worktree).
+    pub main: PathBuf,
+    /// On a kraal worktree's branch: the base it was made from, when recorded.
+    pub base: String,
 }
 
 impl GitInfo {
@@ -88,14 +92,35 @@ pub fn status(cwd: &Path) -> Option<GitInfo> {
         Ok(out) => (out, true),
         Err(_) => (git(cwd, &[&base[..], &["-uno"]].concat(), Duration::from_secs(2)).ok()?, false),
     };
-    let root = git(cwd, &["rev-parse", "--show-toplevel"], Duration::from_secs(1)).ok()?;
+    let dirs = git(cwd, &["rev-parse", "--show-toplevel", "--absolute-git-dir"], Duration::from_secs(1)).ok()?;
+    let mut lines = dirs.lines().map(PathBuf::from);
+    let (root, git_dir) = (lines.next()?, lines.next()?);
+    // A linked worktree's own git directory names the one the repository's worktrees share.
+    let common = match std::fs::read_to_string(git_dir.join("commondir")) {
+        Ok(c) => git_dir.join(c.trim()).canonicalize().unwrap_or_else(|_| git_dir.clone()),
+        Err(_) => git_dir.clone(),
+    };
     let mut info = parse_status(&out)?;
-    info.root = PathBuf::from(root.trim());
     info.untracked |= !listed;
-    if info.branch.starts_with("kraal/") {
-        info.worktree_index = worktree_index(cwd, &info.branch).unwrap_or(0);
+    info.main = main_of(&root, &common);
+    // Recorded with the worktree, whatever its branch is now (by older kraals, with its branch).
+    let kraal_branch = info.branch.starts_with("kraal/").then_some(info.branch.as_str());
+    let linked = (git_dir != common).then_some(git_dir.as_path());
+    info.worktree_index = worktree_index_of(&info.main, linked, kraal_branch);
+    if let Some(branch) = kraal_branch {
+        info.base = worktree_base(&info.main, branch).unwrap_or_default();
     }
+    info.root = root;
     Some(info)
+}
+
+/// The main checkout of the repository whose working tree is `top`, and whose git directory
+/// shared by its worktrees is `common` (`<repo>/.git` for normal repositories).
+fn main_of(top: &Path, common: &Path) -> PathBuf {
+    match common.file_name() {
+        Some(n) if n == ".git" => common.parent().map(Path::to_path_buf).unwrap_or_else(|| top.to_path_buf()),
+        _ => top.to_path_buf(),
+    }
 }
 
 /// Parse `git status --porcelain=v2 --branch` output.
@@ -125,7 +150,17 @@ pub fn parse_status(text: &str) -> Option<GitInfo> {
         }
     }
     let branch = branch.or(oid)?;
-    Some(GitInfo { root: PathBuf::new(), branch, dirty, untracked, ahead, behind, worktree_index: 0 })
+    Some(GitInfo {
+        root: PathBuf::new(),
+        branch,
+        dirty,
+        untracked,
+        ahead,
+        behind,
+        worktree_index: 0,
+        main: PathBuf::new(),
+        base: String::new(),
+    })
 }
 
 /// Top of the repository containing `cwd`. For a linked worktree, the main checkout.
@@ -193,12 +228,7 @@ fn find_project_path(cwd: &Path) -> Option<PathBuf> {
         return project_path_from_files(cwd).ok();
     };
     let (common, top) = (PathBuf::from(common), PathBuf::from(top));
-    // `<repo>/.git` for normal repositories and their linked worktrees.
-    let main = match common.file_name() {
-        Some(n) if n == ".git" => common.parent().map(Path::to_path_buf).unwrap_or_else(|| top.clone()),
-        _ => top.clone(),
-    };
-    Some(project_path_in(cwd, &top, &main))
+    Some(project_path_in(cwd, &top, &main_of(&top, &common)))
 }
 
 /// `cwd`, in worktree `top`, as the same place in main checkout `main`.
@@ -301,23 +331,73 @@ pub fn add_worktree(cwd: &Path, name: &str, base: Option<&str>) -> Result<Worktr
     }
     let path_s = path.display().to_string();
     git(&repo, &["worktree", "add", "-b", &branch, &path_s, &base], Duration::from_secs(60))?;
-    let index = record_worktree(&repo, &branch, &base)?;
+    let index = record_worktree(&repo, &path, &branch, &base)?;
     Ok(Worktree { repo, path, branch, base, index })
 }
 
-/// Remember with the branch of a new worktree its base (for reviews and merges in later
-/// sessions) and its number: the smallest no other kraal worktree of `repo` has. Both go with
-/// the branch. Worktrees made at the same time by other kraal processes wait for each other here.
-fn record_worktree(repo: &Path, branch: &str, base: &str) -> Result<u32> {
+/// What a kraal worktree's number is recorded in: a file of git's own directory for that
+/// worktree, which goes when the worktree is removed (or pruned), whatever its branch.
+const INDEX_FILE: &str = "kraal-index";
+
+/// Remember with the branch of a new worktree at `path` its base (for reviews and merges in
+/// later sessions), and with the worktree its number: the smallest no other registered worktree
+/// of `repo` holds, whatever it has checked out since (another branch, a detached HEAD).
+/// Worktrees made at the same time by other kraal processes wait for each other here.
+fn record_worktree(repo: &Path, path: &Path, branch: &str, base: &str) -> Result<u32> {
     let common = git(repo, &["rev-parse", "--path-format=absolute", "--git-common-dir"], Duration::from_secs(2))?;
-    let lock = PathBuf::from(common.trim()).join("kraal-worktrees");
-    crate::paths::locked(&lock, || {
+    let common = PathBuf::from(common.trim());
+    let own = git(path, &["rev-parse", "--absolute-git-dir"], Duration::from_secs(2))?;
+    let own = PathBuf::from(own.trim());
+    crate::paths::locked(&common.join("kraal-worktrees"), || {
         set_config(repo, &format!("branch.{branch}.kraalbase"), base)?;
-        let used: std::collections::HashSet<u32> = list_worktrees(repo)?.iter().map(|w| w.index).collect();
+        let used = used_indices(repo, &common)?;
         let index = (1..).find(|n| !used.contains(n)).unwrap_or(1);
+        std::fs::write(own.join(INDEX_FILE), format!("{index}\n")).context("recording the worktree's number")?;
+        // Where older kraals look for it.
         set_config(repo, &format!("branch.{branch}.kraalindex"), &index.to_string())?;
         Ok(index)
     })?
+}
+
+/// The numbers the registered worktrees of `repo` hold: those recorded with them, and for
+/// worktrees made by an older kraal, those recorded with their branch.
+fn used_indices(repo: &Path, common: &Path) -> Result<std::collections::HashSet<u32>> {
+    let mut used = std::collections::HashSet::new();
+    let admin = admin_dirs(common);
+    for dir in admin.values() {
+        if let Some(n) = read_index(dir) {
+            used.insert(n);
+        }
+    }
+    for w in list_worktrees(repo)? {
+        used.insert(w.index);
+    }
+    Ok(used)
+}
+
+/// Git's own directory for each registered linked worktree of a repository (`common`), by the
+/// worktree's path.
+fn admin_dirs(common: &Path) -> std::collections::HashMap<PathBuf, PathBuf> {
+    let mut found = std::collections::HashMap::new();
+    let Ok(entries) = std::fs::read_dir(common.join("worktrees")) else { return found };
+    for e in entries.flatten() {
+        let Ok(gitdir) = std::fs::read_to_string(e.path().join("gitdir")) else { continue };
+        // `<worktree>/.git`
+        if let Some(path) = Path::new(gitdir.trim()).parent() {
+            found.insert(path.to_path_buf(), e.path());
+        }
+    }
+    found
+}
+
+fn read_index(admin: &Path) -> Option<u32> {
+    std::fs::read_to_string(admin.join(INDEX_FILE)).ok()?.trim().parse().ok().filter(|n| *n > 0)
+}
+
+/// The number of a kraal worktree: recorded in its own git directory `admin` (a linked
+/// worktree), else, for one made by an older kraal, with its `branch`. 0 when it has none.
+fn worktree_index_of(repo: &Path, admin: Option<&Path>, branch: Option<&str>) -> u32 {
+    admin.and_then(read_index).or_else(|| branch.and_then(|b| worktree_index(repo, b))).unwrap_or(0)
 }
 
 /// Set `key` in the configuration of `repo`. A git writing it at the same moment (another
@@ -367,33 +447,75 @@ pub fn worktree_base(repo: &Path, branch: &str) -> Option<String> {
     (!base.is_empty()).then_some(base)
 }
 
-/// What removing a worktree would lose.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+/// What removing a worktree would lose, and what a removal checks has not moved.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct WorktreeState {
     /// Uncommitted changes, untracked files included.
     pub changes: usize,
-    /// Commits its base does not have: on its branch, and on a detached HEAD in it.
+    /// Commits the history of its base does not have: on its branch, and on a detached HEAD in
+    /// it.
     pub unmerged: usize,
-    /// Which work that is: the commits at stake, what is staged, and the content of each
-    /// changed file. A new edit to an already changed file, a change staged, or a rewritten
-    /// commit changes it even when the counts stay the same.
+    /// Those commits change nothing their base does not have already: the branch was merged by
+    /// squash (or rebased, or cherry-picked) into it.
+    pub applied: bool,
+    /// Ignored files and directories (`.gitignore`) that the main checkout does not have, the
+    /// same, at the same place: build output, a local database, a changed `.env`. Removing the
+    /// worktree deletes them.
+    pub ignored: Vec<String>,
+    /// Which work that is: the commits at stake, what is staged, the content of each changed
+    /// file, the ignored files. A new edit to an already changed file, a change staged, or a
+    /// rewritten commit changes it even when the counts stay the same.
     pub identity: u64,
+    /// The commit its branch was at: a removal deletes the branch only there.
+    pub tip: Option<String>,
+    /// Its base, as a ref name and the commit it was at (none for a base given as a commit).
+    pub base: Option<(String, String)>,
 }
 
 impl WorktreeState {
+    /// Removing it loses no change and no commit (ignored files aside).
     pub fn is_clean(&self) -> bool {
-        self.changes == 0 && self.unmerged == 0
+        self.changes == 0 && (self.unmerged == 0 || self.applied)
+    }
+
+    /// Removing it loses nothing at all.
+    pub fn loses_nothing(&self) -> bool {
+        self.is_clean() && self.ignored.is_empty()
+    }
+
+    /// The same work as `other` (whatever its base did meanwhile).
+    pub fn same_work(&self, other: &WorktreeState) -> bool {
+        (self.changes, self.unmerged, self.applied, &self.ignored, self.identity)
+            == (other.changes, other.unmerged, other.applied, &other.ignored, other.identity)
     }
 
     /// `3 uncommitted changes and 2 unmerged commits`.
     pub fn describe(&self) -> String {
         let n = |count: usize, what: &str| format!("{count} {what}{}", if count == 1 { "" } else { "s" });
-        match (self.changes, self.unmerged) {
-            (0, 0) => "nothing to lose".into(),
-            (c, 0) => n(c, "uncommitted change"),
-            (0, u) => n(u, "unmerged commit"),
-            (c, u) => format!("{} and {}", n(c, "uncommitted change"), n(u, "unmerged commit")),
+        let mut parts = Vec::new();
+        if self.changes > 0 {
+            parts.push(n(self.changes, "uncommitted change"));
         }
+        if self.unmerged > 0 && !self.applied {
+            parts.push(n(self.unmerged, "unmerged commit"));
+        }
+        if !self.ignored.is_empty() {
+            parts.push(format!("ignored files not in the main checkout ({})", self.ignored_names()));
+        }
+        match parts.split_last() {
+            None => "nothing to lose".into(),
+            Some((last, [])) => last.clone(),
+            Some((last, rest)) => format!("{} and {last}", rest.join(", ")),
+        }
+    }
+
+    /// The first of its ignored files, and how many others.
+    pub fn ignored_names(&self) -> String {
+        let mut names: Vec<String> = self.ignored.iter().take(3).cloned().collect();
+        if self.ignored.len() > 3 {
+            names.push(format!("{} more", self.ignored.len() - 3));
+        }
+        names.join(", ")
     }
 }
 
@@ -416,6 +538,7 @@ pub fn worktree_state(w: &Worktree) -> Result<WorktreeState> {
     // What is staged, by blob id (a change staged over an unchanged file shows nowhere else).
     git(&w.path, &["diff", "--cached", "--raw", "-z", "--no-abbrev", "--no-renames"], Duration::from_secs(10))?
         .hash(&mut identity);
+    let ignored = ignored_files(w, &mut identity)?;
     let base = if w.base.is_empty() {
         worktree_base(&w.repo, &w.branch)
             .or_else(|| git(&w.repo, &["rev-parse", "--abbrev-ref", "HEAD"], Duration::from_secs(2)).ok())
@@ -424,12 +547,22 @@ pub fn worktree_state(w: &Worktree) -> Result<WorktreeState> {
     } else {
         w.base.clone()
     };
+    // The base as it is now: what the commits are compared with.
+    let base_oid =
+        git(&w.repo, &["rev-parse", "--verify", "-q", &format!("{base}^{{commit}}")], Duration::from_secs(5))
+            .with_context(|| format!("its base {base} is not there"))?
+            .trim()
+            .to_string();
+    let base_ref = git(&w.repo, &["rev-parse", "--symbolic-full-name", &base], Duration::from_secs(5))
+        .ok()
+        .map(|r| r.trim().to_string())
+        .filter(|r| r.starts_with("refs/"));
     // Commits only a detached HEAD holds are lost with the worktree too.
-    let mut tips = Vec::new();
     let branch_ref = format!("refs/heads/{}", w.branch);
-    if let Ok(tip) = git(&w.repo, &["rev-parse", "--verify", "-q", &branch_ref], Duration::from_secs(5)) {
-        tips.push(tip.trim().to_string());
-    }
+    let tip = git(&w.repo, &["rev-parse", "--verify", "-q", &branch_ref], Duration::from_secs(5))
+        .ok()
+        .map(|t| t.trim().to_string());
+    let mut tips: Vec<String> = tip.iter().cloned().collect();
     if git(&w.path, &["symbolic-ref", "-q", "HEAD"], Duration::from_secs(5)).is_err() {
         tips.push(git(&w.path, &["rev-parse", "HEAD"], Duration::from_secs(5))?.trim().to_string());
     }
@@ -439,10 +572,88 @@ pub fn worktree_state(w: &Worktree) -> Result<WorktreeState> {
     } else {
         let mut args = vec!["rev-list", "--count"];
         args.extend(tips.iter().map(String::as_str));
-        args.extend(["--not", base.as_str()]);
+        args.extend(["--not", base_oid.as_str()]);
         git(&w.repo, &args, Duration::from_secs(10))?.trim().parse().unwrap_or(0)
     };
-    Ok(WorktreeState { changes, unmerged, identity: identity.finish() })
+    // Commits its history lacks may still have all their changes in the base: a squash merge.
+    let applied = unmerged > 0 && tips.iter().all(|t| changes_in(&w.repo, t, &base_oid));
+    Ok(WorktreeState {
+        changes,
+        unmerged,
+        applied,
+        ignored,
+        identity: identity.finish(),
+        tip,
+        base: base_ref.map(|r| (r, base_oid)),
+    })
+}
+
+/// Whether every change commit `tip` brings is in commit `base` already, though its history may
+/// not be there (a squash merge, a rebase, a cherry-pick): merging it into `base` would change
+/// nothing. A change the base made again differently, or undid since, is not in it.
+fn changes_in(repo: &Path, tip: &str, base: &str) -> bool {
+    if git(repo, &["merge-base", "--is-ancestor", tip, base], Duration::from_secs(10)).is_ok() {
+        return true;
+    }
+    // A conflict ends this with an error: not in it.
+    let Ok(merged) = git(repo, &["merge-tree", "--write-tree", "--no-messages", base, tip], Duration::from_secs(30))
+    else {
+        return false;
+    };
+    let Ok(tree) = git(repo, &["rev-parse", "--verify", "-q", &format!("{base}^{{tree}}")], Duration::from_secs(5))
+    else {
+        return false;
+    };
+    merged.lines().next().is_some_and(|m| !m.trim().is_empty() && m.trim() == tree.trim())
+}
+
+/// The ignored files and directories of worktree `w` that its main checkout does not have, the
+/// same, at the same place (a file copied there when the worktree was made is no loss). A
+/// directory counts whole, its content unread.
+fn ignored_files(w: &Worktree, identity: &mut impl std::hash::Hasher) -> Result<Vec<String>> {
+    use std::hash::Hash;
+    let args = ["ls-files", "-z", "--others", "--ignored", "--exclude-standard", "--directory"];
+    let out = git(&w.path, &args, Duration::from_secs(10))?;
+    let mut found = Vec::new();
+    for entry in out.split('\0').filter(|e| !e.is_empty()) {
+        let at = w.path.join(entry);
+        if !entry.ends_with('/') && same_file(&at, &w.repo.join(entry)) {
+            continue;
+        }
+        entry.hash(identity);
+        if let Ok(m) = at.symlink_metadata() {
+            (m.len(), m.modified().ok()).hash(identity);
+        }
+        found.push(entry.to_string());
+    }
+    Ok(found)
+}
+
+/// Whether `a` and `b` are regular files with the same content (up to 64 MiB), or links to the
+/// same place.
+fn same_file(a: &Path, b: &Path) -> bool {
+    use std::io::Read;
+    let (Ok(ma), Ok(mb)) = (a.symlink_metadata(), b.symlink_metadata()) else { return false };
+    if ma.file_type().is_symlink() || mb.file_type().is_symlink() {
+        return ma.file_type().is_symlink()
+            && mb.file_type().is_symlink()
+            && std::fs::read_link(a).ok() == std::fs::read_link(b).ok();
+    }
+    if !ma.is_file() || !mb.is_file() || ma.len() != mb.len() || ma.len() > 64 << 20 {
+        return false;
+    }
+    let (Ok(mut fa), Ok(mut fb)) = (std::fs::File::open(a), std::fs::File::open(b)) else { return false };
+    let (mut ba, mut bb) = (vec![0u8; 64 << 10], vec![0u8; 64 << 10]);
+    loop {
+        let n = match fa.read(&mut ba) {
+            Ok(0) => return fb.read(&mut bb).is_ok_and(|m| m == 0),
+            Ok(n) => n,
+            Err(_) => return false,
+        };
+        if fb.read_exact(&mut bb[..n]).is_err() || ba[..n] != bb[..n] {
+            return false;
+        }
+    }
 }
 
 /// Feed what `path` holds into `h`: a file's bytes, a link's target, or that it is missing.
@@ -466,24 +677,87 @@ fn hash_content(path: &Path, h: &mut impl std::hash::Hasher) {
     }
 }
 
-/// Remove a worktree and its branch. Without `force`, refuse when that would lose uncommitted
-/// changes or commits its base does not have.
-pub fn remove_worktree(w: &Worktree, force: bool) -> Result<()> {
-    if !force {
-        let state = worktree_state(w)?;
-        if !state.is_clean() {
-            bail!("{} has {}; remove it with force to discard them", w.name(), state.describe());
-        }
+/// What a removal may discard.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Discard {
+    /// Nothing: a worktree with anything to lose stays.
+    Nothing,
+    /// Its ignored files (build output, local databases), but no change and no commit.
+    Ignored,
+    /// Everything (forced).
+    Everything,
+}
+
+/// Remove a worktree and its branch, unless that would lose more than `discard` allows.
+pub fn remove_worktree(w: &Worktree, discard: Discard) -> Result<()> {
+    if discard == Discard::Everything {
+        let state = worktree_state(w).ok();
+        let path = w.path.display().to_string();
+        git(&w.repo, &["worktree", "remove", "--force", &path], Duration::from_secs(30))?;
+        return match state.as_ref().and_then(|s| s.tip.as_deref()) {
+            Some(tip) => delete_branch(w, tip, None),
+            None => git(&w.repo, &["branch", "-D", &w.branch], Duration::from_secs(10)).map(|_| ()),
+        };
     }
+    let state = worktree_state(w)?;
+    if !state.is_clean() {
+        bail!("{} has {}; remove it with force to discard them", w.name(), state.describe());
+    }
+    if discard == Discard::Nothing && !state.ignored.is_empty() {
+        bail!("{} has {}: removing it deletes them", w.name(), state.describe());
+    }
+    remove_checked(w, &state)
+}
+
+/// Remove worktree `w` as `state` found it (its losses, if any, accepted): its directory, then
+/// its branch, only at the commit that was checked and, when the removal rests on its work being
+/// in its base, only while the base is still where it was. Git's own check of the directory
+/// (no change, nothing untracked) applies unless changes were accepted.
+pub fn remove_checked(w: &Worktree, state: &WorktreeState) -> Result<()> {
     let path = w.path.display().to_string();
     let mut args = vec!["worktree", "remove", path.as_str()];
-    if force {
+    if state.changes > 0 {
         args.push("--force");
     }
     git(&w.repo, &args, Duration::from_secs(30))?;
-    // Merged (checked above) or explicitly forced: -D, since git's own check compares with HEAD.
-    git(&w.repo, &["branch", "-D", &w.branch], Duration::from_secs(10))?;
+    match &state.tip {
+        Some(tip) => delete_branch(w, tip, state.base.as_ref().filter(|_| state.is_clean())),
+        None => Ok(()),
+    }
+}
+
+/// Delete the branch of `w` if it is still at `tip`, and its `base` still at its commit: one
+/// transaction, so that a commit made meanwhile is never deleted.
+fn delete_branch(w: &Worktree, tip: &str, base: Option<&(String, String)>) -> Result<()> {
+    let mut input = String::new();
+    if let Some((name, oid)) = base {
+        input.push_str(&format!("verify {name} {oid}\n"));
+    }
+    input.push_str(&format!("delete refs/heads/{} {tip}\n", w.branch));
+    git_with_input(&w.repo, &["update-ref", "--stdin"], &input, Duration::from_secs(10))
+        .with_context(|| format!("the branch {} was kept: it, or its base, moved since it was checked", w.branch))?;
+    // What deleting a branch with git also removes: its settings (kraal's base and number).
+    let _ = git(&w.repo, &["config", "--remove-section", &format!("branch.{}", w.branch)], Duration::from_secs(5));
     Ok(())
+}
+
+/// [`git`] with `input` as its standard input.
+fn git_with_input(dir: &Path, args: &[&str], input: &str, timeout: Duration) -> Result<String> {
+    use std::io::Write;
+    let mut cmd = Command::new("git");
+    cmd.arg("-C").arg(dir).args(args).env("GIT_TERMINAL_PROMPT", "0");
+    let (reader, mut writer) = std::io::pipe().context("making a pipe")?;
+    // Small enough for the pipe: written before git starts.
+    writer.write_all(input.as_bytes()).context("writing to git")?;
+    drop(writer);
+    let out = crate::exec::run_with_input(&mut cmd, reader.into(), timeout, 1 << 20).context("running git")?;
+    if out.timed_out {
+        bail!("git {} took too long", args.join(" "));
+    }
+    if !out.success() {
+        bail!("git {}: {}", args.join(" "), out.stderr_text().trim());
+    }
+    Ok(out.stdout_text())
 }
 
 /// The kraal worktrees of the repository containing `cwd`, each with what removing it would
@@ -503,6 +777,8 @@ pub fn worktree_states(cwd: &Path) -> Result<Vec<(Worktree, Result<WorktreeState
 /// The kraal worktrees of the repository containing `cwd`.
 pub fn list_worktrees(cwd: &Path) -> Result<Vec<Worktree>> {
     let repo = main_checkout(cwd).context("not inside a git repository")?;
+    let common = git(&repo, &["rev-parse", "--path-format=absolute", "--git-common-dir"], Duration::from_secs(2))?;
+    let admin = admin_dirs(Path::new(common.trim()));
     let out = git(&repo, &["worktree", "list", "--porcelain"], Duration::from_secs(5))?;
     let mut list = Vec::new();
     let mut path: Option<PathBuf> = None;
@@ -514,7 +790,7 @@ pub fn list_worktrees(cwd: &Path) -> Result<Vec<Worktree>> {
             && let Some(p) = path.take()
         {
             let base = worktree_base(&repo, b).unwrap_or_default();
-            let index = worktree_index(&repo, b).unwrap_or(0);
+            let index = worktree_index_of(&repo, admin.get(&p).map(PathBuf::as_path), Some(b));
             list.push(Worktree { repo: repo.clone(), path: p, branch: b.to_string(), base, index });
         }
     }
@@ -628,7 +904,7 @@ mod tests {
         let listed = list_worktrees(&repo).unwrap();
         assert!(listed.iter().all(|w| made.contains(w)), "{listed:?}");
         // A number is free again once its worktree is gone.
-        remove_worktree(&a, false).unwrap();
+        remove_worktree(&a, Discard::Nothing).unwrap();
         assert_eq!(add_worktree(&repo, "d", None).unwrap().index, a.index);
         // b has a commit main does not have, c a change: neither is merged and clean.
         std::fs::write(b.path.join("b.txt"), "b").unwrap();
@@ -709,7 +985,7 @@ mod tests {
         // Made from inside a worktree, a new one starts from that worktree's branch.
         let f = add_worktree(&w.path, "followup", None).unwrap();
         assert_eq!(f.base, "kraal/fix-login");
-        remove_worktree(&f, true).unwrap();
+        remove_worktree(&f, Discard::Everything).unwrap();
         let in_tree = |args: &[&str]| {
             let ok = Command::new("git")
                 .arg("-C")
@@ -764,12 +1040,169 @@ mod tests {
         assert_eq!(counts(&w), (0, 2), "the branch's commit and the detached one");
         in_tree(&["checkout", "-q", "kraal/fix-login"]);
         in_tree(&["stash", "pop", "-q"]);
-        let refused = remove_worktree(&w, false).unwrap_err().to_string();
+        let refused = remove_worktree(&w, Discard::Nothing).unwrap_err().to_string();
         assert!(refused.contains("1 uncommitted change and 1 unmerged commit"), "{refused}");
         assert!(w.path.exists(), "nothing removed without force");
-        remove_worktree(&w, true).unwrap();
+        remove_worktree(&w, Discard::Everything).unwrap();
         assert!(!w.path.exists());
         assert!(list_worktrees(&repo).unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A repository with one commit in a new directory, for a test; `None` without git.
+    fn test_repo(name: &str) -> Option<(PathBuf, PathBuf)> {
+        Command::new("git").arg("--version").output().ok()?;
+        let dir = std::env::temp_dir().join(format!("kraal-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("app")).unwrap();
+        let dir = dir.canonicalize().unwrap();
+        let repo = dir.join("app");
+        std::fs::write(repo.join(".gitignore"), ".env\n*.db\nnode_modules/\n").unwrap();
+        std::fs::write(repo.join("a.txt"), "1\n2\n3\n").unwrap();
+        run_git(&repo, &["init", "-q", "-b", "main"]);
+        run_git(&repo, &["add", "."]);
+        run_git(&repo, &["commit", "-q", "-m", "one"]);
+        Some((dir, repo))
+    }
+
+    fn run_git(dir: &Path, args: &[&str]) -> String {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(["-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false"])
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    }
+
+    fn commit_file(dir: &Path, file: &str, text: &str) {
+        std::fs::write(dir.join(file), text).unwrap();
+        run_git(dir, &["add", file]);
+        run_git(dir, &["commit", "-q", "-m", file]);
+    }
+
+    /// A worktree keeps its number while it exists, whatever it has checked out: one made after
+    /// it never gets the same.
+    #[test]
+    fn a_number_stays_with_its_worktree_whatever_it_checks_out() {
+        let Some((dir, repo)) = test_repo("gitkeep") else { return };
+        let a = add_worktree(&repo, "a", None).unwrap();
+        assert_eq!(a.index, 1);
+        run_git(&a.path, &["checkout", "-q", "--detach"]);
+        assert_eq!(status(&a.path).unwrap().worktree_index, 1, "detached, it is still number 1");
+        let b = add_worktree(&repo, "b", None).unwrap();
+        assert_eq!(b.index, 2, "1 is still taken");
+        // Back on its branch, or on another one: the same number, and no one else's.
+        run_git(&a.path, &["checkout", "-q", "kraal/a"]);
+        assert_eq!(status(&a.path).unwrap().worktree_index, 1);
+        run_git(&a.path, &["checkout", "-q", "-b", "other"]);
+        assert_eq!(status(&a.path).unwrap().worktree_index, 1);
+        assert_eq!(add_worktree(&repo, "c", None).unwrap().index, 3);
+        // Free again once the worktree is gone.
+        run_git(&repo, &["worktree", "remove", a.path.to_str().unwrap()]);
+        assert_eq!(add_worktree(&repo, "d", None).unwrap().index, 1);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Ignored files are work too: an ignored `.env` changed in the worktree, or a local
+    /// database, keep it, unless their loss is accepted. One the main checkout has, the same, is
+    /// no loss.
+    #[test]
+    fn ignored_files_of_its_own_keep_a_worktree() {
+        let Some((dir, repo)) = test_repo("gitignored") else { return };
+        std::fs::write(repo.join(".env"), "A=1\n").unwrap();
+        let w = add_worktree(&repo, "fix", None).unwrap();
+        std::fs::write(w.path.join(".env"), "A=1\n").unwrap();
+        let state = worktree_state(&w).unwrap();
+        assert!(state.loses_nothing(), "a copy of the main checkout's .env is no loss: {state:?}");
+        std::fs::write(w.path.join(".env"), "A=2\n").unwrap();
+        std::fs::write(w.path.join("dev.db"), "rows").unwrap();
+        std::fs::create_dir_all(w.path.join("node_modules/x")).unwrap();
+        std::fs::write(w.path.join("node_modules/x/index.js"), "x").unwrap();
+        let state = worktree_state(&w).unwrap();
+        assert!(state.is_clean() && !state.loses_nothing(), "{state:?}");
+        assert_eq!(state.ignored, vec![".env", "dev.db", "node_modules/"]);
+        assert!(state.describe().contains("ignored files not in the main checkout (.env, dev.db, node_modules/)"));
+        let refused = remove_worktree(&w, Discard::Nothing).unwrap_err().to_string();
+        assert!(refused.contains("ignored files"), "{refused}");
+        assert_eq!(std::fs::read_to_string(w.path.join(".env")).unwrap(), "A=2\n", "nothing removed");
+        // A change to an ignored file changes what was confirmed.
+        std::fs::write(w.path.join("dev.db"), "more rows").unwrap();
+        assert!(!worktree_state(&w).unwrap().same_work(&state));
+        remove_worktree(&w, Discard::Ignored).unwrap();
+        assert!(!w.path.exists());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The branch goes only at the commit that was checked: a commit made after the check (in
+    /// another terminal) keeps it.
+    #[test]
+    fn a_commit_made_after_the_check_keeps_its_branch() {
+        let Some((dir, repo)) = test_repo("gitrace") else { return };
+        let w = add_worktree(&repo, "fix", None).unwrap();
+        let checked = worktree_state(&w).unwrap();
+        assert!(checked.loses_nothing());
+        commit_file(&w.path, "late.txt", "late\n");
+        let err = remove_checked(&w, &checked).unwrap_err().to_string();
+        assert!(err.contains("was kept"), "{err}");
+        let tip = run_git(&repo, &["rev-parse", "kraal/fix"]);
+        assert!(run_git(&repo, &["log", "--format=%s", tip.trim()]).contains("late.txt"), "the new commit is there");
+        // Its base moved back since the check: the branch is not deleted on an old answer.
+        let w2 = add_worktree(&repo, "two", None).unwrap();
+        commit_file(&w2.path, "b.txt", "b\n");
+        run_git(&repo, &["merge", "-q", "--ff-only", "kraal/two"]);
+        let checked = worktree_state(&w2).unwrap();
+        assert!(checked.loses_nothing(), "{checked:?}");
+        run_git(&repo, &["reset", "-q", "--hard", "HEAD~1"]);
+        assert!(remove_checked(&w2, &checked).is_err());
+        assert!(!run_git(&repo, &["branch", "--list", "kraal/two"]).is_empty(), "its commit is not lost");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A branch merged by squash (or rebased) into its base has commits the base's history does
+    /// not have, but its changes are all there: it is merged. One with a change the base does not
+    /// have (part of it picked, or undone since) is not.
+    #[test]
+    fn a_branch_squashed_into_its_base_is_merged() {
+        let Some((dir, repo)) = test_repo("gitsquash") else { return };
+        let w = add_worktree(&repo, "sq", None).unwrap();
+        commit_file(&w.path, "a.txt", "1\n2 changed\n3\n");
+        commit_file(&w.path, "new.txt", "new\n");
+        assert!(!worktree_state(&w).unwrap().is_clean());
+        run_git(&repo, &["merge", "-q", "--squash", "kraal/sq"]);
+        run_git(&repo, &["commit", "-q", "-m", "sq (#1)"]);
+        // The base goes on meanwhile.
+        commit_file(&repo, "later.txt", "later\n");
+        let state = worktree_state(&w).unwrap();
+        assert_eq!(state.unmerged, 2);
+        assert!(state.applied && state.is_clean() && state.loses_nothing(), "{state:?}");
+        assert_eq!(state.describe(), "nothing to lose");
+
+        // Only part of it in the base: not merged.
+        let p = add_worktree(&repo, "part", None).unwrap();
+        commit_file(&p.path, "p1.txt", "1\n");
+        commit_file(&p.path, "p2.txt", "2\n");
+        let first = run_git(&p.path, &["rev-parse", "HEAD~1"]);
+        run_git(&repo, &["cherry-pick", first.trim()]);
+        let state = worktree_state(&p).unwrap();
+        assert!(!state.applied && !state.is_clean(), "{state:?}");
+        assert!(remove_worktree(&p, Discard::Nothing).is_err());
+        // Squashed, then undone in the base: its work is no longer there.
+        let u = add_worktree(&repo, "undone", None).unwrap();
+        commit_file(&u.path, "u.txt", "u\n");
+        run_git(&repo, &["merge", "-q", "--squash", "kraal/undone"]);
+        run_git(&repo, &["commit", "-q", "-m", "undone (#2)"]);
+        run_git(&repo, &["revert", "--no-edit", "HEAD"]);
+        assert!(!worktree_state(&u).unwrap().is_clean());
+
+        remove_worktree(&w, Discard::Nothing).unwrap();
+        assert!(!w.path.exists());
+        assert!(run_git(&repo, &["branch", "--list", "kraal/sq"]).is_empty(), "its branch is gone");
+        let settings =
+            Command::new("git").arg("-C").arg(&repo).args(["config", "--get-regexp", "^branch\\.kraal/sq\\."]).output();
+        assert!(settings.unwrap().stdout.is_empty(), "and its settings");
         let _ = std::fs::remove_dir_all(dir);
     }
 }

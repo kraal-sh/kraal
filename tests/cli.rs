@@ -4047,8 +4047,9 @@ fn install_script_installs_a_checked_release() {
     assert!(!dir.join("kraal").exists(), "nothing installed");
 }
 
-/// A throwaway sshd on 127.0.0.1:2305 with its own host and user keys, and an `ssh` that uses
-/// only them (never ~/.ssh): a server reached for real. `None` where no sshd can run here.
+/// A throwaway sshd on 127.0.0.1 (port 2305 unless said otherwise) with its own host and user
+/// keys, and an `ssh` that uses only them (never ~/.ssh): a server reached for real. `None` where
+/// no sshd can run here.
 #[cfg(target_os = "linux")]
 struct Sshd {
     child: std::process::Child,
@@ -4061,6 +4062,10 @@ struct Sshd {
 #[cfg(target_os = "linux")]
 impl Sshd {
     fn start(dir: &Path) -> Option<Sshd> {
+        Sshd::start_on(dir, 2305)
+    }
+
+    fn start_on(dir: &Path, port: u16) -> Option<Sshd> {
         use std::os::fd::AsRawFd;
         let sshd = ["/usr/sbin/sshd", "/usr/bin/sshd"].into_iter().map(PathBuf::from).find(|p| p.exists())?;
         let ssh =
@@ -4070,7 +4075,7 @@ impl Sshd {
             .create(true)
             .truncate(false)
             .write(true)
-            .open("/tmp/kraal-test-sshd-2305.lock")
+            .open(format!("/tmp/kraal-test-sshd-{port}.lock"))
             .unwrap();
         // SAFETY: flock on a descriptor we own; released when it is closed.
         unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) };
@@ -4087,7 +4092,7 @@ impl Sshd {
         std::fs::write(
             dir.join("sshd_config"),
             format!(
-                "Port 2305\nListenAddress 127.0.0.1\nHostKey {d}/host_key\nPidFile {d}/sshd.pid\n\
+                "Port {port}\nListenAddress 127.0.0.1\nHostKey {d}/host_key\nPidFile {d}/sshd.pid\n\
                  AuthorizedKeysFile {d}/authorized_keys\nStrictModes no\nUsePAM no\nPasswordAuthentication no\n\
                  KbdInteractiveAuthentication no\nPubkeyAuthentication yes\nAllowUsers {}\n",
                 user.trim()
@@ -4095,7 +4100,7 @@ impl Sshd {
         )
         .unwrap();
         let host_key = std::fs::read_to_string(dir.join("host_key.pub")).unwrap();
-        std::fs::write(dir.join("known_hosts"), format!("[127.0.0.1]:2305 {host_key}")).unwrap();
+        std::fs::write(dir.join("known_hosts"), format!("[127.0.0.1]:{port} {host_key}")).unwrap();
         std::fs::write(
             dir.join("ssh_config"),
             format!(
@@ -4572,4 +4577,339 @@ fn the_paste_buffers_list_deletes_and_stays_open() {
     }
     assert_eq!(env.run(&["buffer", "show"]), "second-text");
     client.send(b"\x1b");
+}
+
+/// A session, a real sshd (on its own port) as the server `box`, and a local editor told what
+/// to do, for the tests of editing a server's file. The commands kraal runs there find a `sudo`
+/// that takes the password `pass word` (and runs them as this user), and wait 2 seconds once
+/// the file `slow` exists.
+#[cfg(target_os = "linux")]
+struct EditBench {
+    env: Env,
+    _sshd: Sshd,
+    path: String,
+    editor: PathBuf,
+    srv: PathBuf,
+}
+
+#[cfg(target_os = "linux")]
+impl EditBench {
+    fn new(name: &str, port: u16) -> Option<EditBench> {
+        let env = Env::new(name);
+        let sshd = Sshd::start_on(&env.root.join("sshd"), port)?;
+        let user = String::from_utf8(Command::new("id").arg("-un").output().unwrap().stdout).unwrap();
+        std::fs::write(
+            env.root.join("config/kraal/servers.toml"),
+            format!("[[server]]\nname = \"box\"\nhost = \"127.0.0.1\"\nport = {port}\nuser = \"{}\"\n", user.trim()),
+        )
+        .unwrap();
+        let cfg = env.root.join("config/kraal/config.toml");
+        let mut text = std::fs::read_to_string(&cfg).unwrap();
+        let downloads = env.root.join("downloads");
+        text.push_str(&format!("\n[servers]\nmultiplex = false\ndownload_dir = \"{}\"\n", downloads.display()));
+        std::fs::write(&cfg, text).unwrap();
+        let root = env.root.display().to_string();
+        let fake = env.root.join("server-bin");
+        std::fs::create_dir_all(&fake).unwrap();
+        write_script(
+            &fake.join("sudo"),
+            "#!/bin/sh\nn=\nwhile [ $# -gt 0 ]; do case $1 in -n) n=1 ;; -p) shift ;; --) shift; break ;; -*) ;; *) break ;; esac; shift; done\n\
+             if [ -n \"$n\" ]; then echo 'sudo: a password is required' >&2; exit 1; fi\n\
+             IFS= read -r pw\nif [ \"$pw\" != 'pass word' ]; then echo 'Sorry, try again.' >&2; exit 1; fi\nexec \"$@\"\n",
+        );
+        // In front of the test's ssh: what runs there finds that sudo first.
+        let bin = env.root.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        write_script(
+            &bin.join("ssh"),
+            &format!(
+                "#!/bin/sh\nif [ -e '{root}/slow' ]; then rm -f '{root}/slow'; sleep 2; fi\nn=$#; i=0\nfor a; do\n  i=$((i + 1))\n  \
+                 if [ \"$i\" -eq \"$n\" ]; then set -- \"$@\" \"env PATH={}:/usr/local/bin:/usr/bin:/bin $a\"; else set -- \"$@\" \"$a\"; fi\n\
+                 done\nshift \"$n\"\nexec '{}/ssh' \"$@\"\n",
+                fake.display(),
+                sshd.bin.display()
+            ),
+        );
+        let editor = env.root.join("editor");
+        write_script(
+            &editor,
+            &format!(
+                "#!/bin/sh\nfor f; do :; done\nprintf '%s' \"$f\" > '{root}/editing.tmp' && mv '{root}/editing.tmp' '{root}/editing'\n\
+                 n=0\nwhile :; do\n  if [ -e '{root}/step'$n ]; then . '{root}/step'$n; n=$((n + 1)); fi\n  \
+                 if [ -e '{root}/quit' ]; then rm -f '{root}/quit' '{root}/editing' '{root}/step'*; exit 0; fi\n  sleep 0.05\ndone\n"
+            ),
+        );
+        let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap_or_default());
+        let srv = env.root.join("srv");
+        std::fs::create_dir_all(&srv).unwrap();
+        env.workspace("w", "layout {\n    pane name=\"sh\"\n}\n");
+        let bench = EditBench { env, _sshd: sshd, path, editor, srv };
+        let out = bench.kraal(&["open", "w"]).output().unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        Some(bench)
+    }
+
+    fn kraal(&self, args: &[&str]) -> Command {
+        let mut c = self.env.cmd(args);
+        c.env("PATH", &self.path).env("EDITOR", &self.editor);
+        c
+    }
+
+    fn wait_until(&self, what: &str, ok: &dyn Fn() -> bool) {
+        let start = Instant::now();
+        while !ok() {
+            assert!(start.elapsed() < Duration::from_secs(15), "timed out waiting: {what}");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    /// The editor's copy, once the editor runs.
+    fn editing(&self) -> PathBuf {
+        let editing = self.env.root.join("editing");
+        self.wait_until("the editor starts", &|| editing.exists());
+        PathBuf::from(read(&editing))
+    }
+
+    /// Have the editor run `script` (`$f` is the file) as its step `n`.
+    fn step(&self, n: u32, script: &str) {
+        let tmp = self.env.root.join("step.tmp");
+        std::fs::write(&tmp, script).unwrap();
+        std::fs::rename(&tmp, self.env.root.join(format!("step{n}"))).unwrap();
+    }
+
+    /// End the editor: its private copy goes.
+    fn quit(&self, local: &Path) {
+        std::fs::write(self.env.root.join("quit"), "").unwrap();
+        let dir = local.parent().unwrap().to_path_buf();
+        self.wait_until("the private copy is removed", &|| !dir.exists());
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn read(p: &Path) -> String {
+    std::fs::read_to_string(p).unwrap_or_default()
+}
+
+/// `kraal edit --sudo`: a pane asks for the password, sudo gets it, and each save is written as
+/// root, through the same checks; a wrong password opens nothing, and a file one may not write
+/// is refused with the way to edit it.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_server_file_is_edited_as_root_through_sudo() {
+    use std::os::unix::fs::PermissionsExt;
+    let Some(b) = EditBench::new("rsudo", 2311) else {
+        eprintln!("skipped: no sshd can run here");
+        return;
+    };
+    let mut client = RawClient::attach(&b.env, "w");
+    std::thread::sleep(Duration::from_millis(500));
+    // Named like the FIFO the password goes through, in the same private directory.
+    let file = b.srv.join("sudo");
+    std::fs::write(&file, "v1\n").unwrap();
+    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o640)).unwrap();
+    let target = format!("box:{}", file.display());
+    let piped = std::process::Stdio::piped;
+    // Its pane says so (once it is there).
+    let asked = || {
+        let out = b.env.try_run(&["read", "-p", "sudo · box"]);
+        out.status.success() && String::from_utf8_lossy(&out.stdout).contains("password on box")
+    };
+    let cli = b.kraal(&["edit", "--sudo", &target]).stdout(piped()).stderr(piped()).spawn().unwrap();
+    b.wait_until("the password is asked in its pane", &asked);
+    assert!(!b.env.root.join("editing").exists(), "nothing opens before the password");
+    client.send(b"pass word\r");
+    let local = b.editing();
+    let out = cli.wait_with_output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(read(&local), "v1\n");
+    b.step(0, "printf 'v2\\n' > \"$f\"");
+    b.wait_until("the save reaches the server", &|| read(&file) == "v2\n");
+    assert_eq!(std::fs::metadata(&file).unwrap().permissions().mode() & 0o7777, 0o640, "the mode is kept");
+    b.step(1, "printf 'v3\\n' > \"$f\"");
+    b.wait_until("the next save, through the same sudo", &|| read(&file) == "v3\n");
+    b.quit(&local);
+    let names: Vec<String> =
+        std::fs::read_dir(&b.srv).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+    assert_eq!(names, vec!["sudo".to_string()], "no temporary file or lock is left");
+
+    // A wrong password: refused, nothing opens.
+    let cli = b.kraal(&["edit", "--sudo", &target]).stdout(piped()).stderr(piped()).spawn().unwrap();
+    b.wait_until("the password is asked in its pane", &asked);
+    client.send(b"wrong\r");
+    let out = cli.wait_with_output().unwrap();
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("sudo refused"), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(!b.env.root.join("editing").exists());
+
+    // Without --sudo, a file one may not write is refused, saying how to edit it.
+    let ro = b.srv.join("ro.conf");
+    std::fs::write(&ro, "x\n").unwrap();
+    std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o444)).unwrap();
+    let out = b.kraal(&["edit", &format!("box:{}", ro.display())]).output().unwrap();
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("kraal edit --sudo"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// "Keep the version of the server" while the editor saves again before that version arrived:
+/// the new save is not overwritten, and the question comes back.
+#[cfg(target_os = "linux")]
+#[test]
+fn keeping_the_servers_version_never_drops_a_later_save() {
+    let Some(b) = EditBench::new("rkeep", 2311) else {
+        eprintln!("skipped: no sshd can run here");
+        return;
+    };
+    let mut client = RawClient::attach(&b.env, "w");
+    std::thread::sleep(Duration::from_millis(500));
+    let file = b.srv.join("theirs.txt");
+    std::fs::write(&file, "v1\n").unwrap();
+    let out = b.kraal(&["edit", &format!("box:{}", file.display())]).output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let local = b.editing();
+    std::fs::write(&file, "theirs\n").unwrap();
+    client.screen.lock().unwrap().clear();
+    b.step(0, "printf 'mine\\n' > \"$f\"");
+    client.wait_for_screen("Keep the version of box");
+    // Reading the server's version takes a while; the user saves again meanwhile.
+    std::fs::write(b.env.root.join("slow"), "").unwrap();
+    client.send(b"\x1b[B");
+    std::thread::sleep(Duration::from_millis(100));
+    client.screen.lock().unwrap().clear();
+    client.send(b"\r");
+    b.step(1, "printf 'mine2\\n' > \"$f\"");
+    b.wait_until("the second save", &|| read(&local) == "mine2\n");
+    // Once the server's version arrived: asked again, the later save still there.
+    client.wait_for_screen("Keep your version as a local file");
+    assert_eq!(read(&local), "mine2\n", "the later save is still there");
+    client.send(b"\r");
+    let kept = b.env.root.join("downloads/theirs.txt");
+    b.wait_until("the later save is kept", &|| read(&kept) == "mine2\n");
+    assert_eq!(read(&file), "theirs\n");
+    b.quit(&local);
+}
+
+/// Opening the worktree actions of a shell that went into a worktree never waits for git on the
+/// server's loop: what git said about the pane's directory is enough.
+#[cfg(target_os = "linux")]
+#[test]
+fn worktree_actions_never_wait_for_git() {
+    let env = Env::new("wtslow");
+    let repo = env.root.join("app");
+    let _git = git_repo(&repo, &[("a.txt", "1\n")]);
+    let out = env.cmd(&["wt", "new", "x", "--no-setup"]).current_dir(&repo).output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let wt = env.root.join("app.worktrees/x");
+    // A git slow to tell a worktree's base, once `slow` exists.
+    let real = Command::new("sh").arg("-c").arg("command -v git").output().unwrap();
+    let real = String::from_utf8(real.stdout).unwrap();
+    let bin = env.root.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let slow = env.root.join("slow");
+    write_script(
+        &bin.join("git"),
+        &format!(
+            "#!/bin/sh\ncase \"$*\" in *kraalbase*) if [ -e '{}' ]; then sleep 5; fi ;; esac\nexec '{}' \"$@\"\n",
+            slow.display(),
+            real.trim()
+        ),
+    );
+    env.workspace("w", &format!("layout {{\n    pane name=\"sh\" cwd={:?}\n}}\n", wt.display().to_string()));
+    let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap_or_default());
+    let out = env.cmd(&["open", "w"]).env("PATH", &path).output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let mut client = RawClient::attach(&env, "w");
+    client.wait_for_screen("kraal/x");
+    std::fs::write(&slow, "").unwrap();
+    client.send(b"\x02Rg");
+    std::thread::sleep(Duration::from_millis(150));
+    let start = Instant::now();
+    env.run(&["panes"]);
+    let waited = start.elapsed();
+    std::fs::remove_file(&slow).unwrap();
+    assert!(waited < Duration::from_millis(1000), "the server waited {waited:?} for git");
+    client.wait_for_screen("Worktree x");
+}
+
+/// A pane opened from the command line in a worktree the session has not seen yet gets its
+/// variables (number, port offset, port).
+#[test]
+fn a_pane_opened_in_an_unseen_worktree_gets_its_variables() {
+    let env = Env::new("wtvars");
+    let repo = env.root.join("app");
+    let _git = git_repo(&repo, &[("a.txt", "1\n")]);
+    let config = env.root.join("config/kraal/config.toml");
+    let mut text = std::fs::read_to_string(&config).unwrap();
+    text.push_str("\n[worktrees]\nport_base = 3000\n");
+    std::fs::write(&config, text).unwrap();
+    let out = env.cmd(&["wt", "new", "x", "--no-setup"]).current_dir(&repo).output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let wt = env.root.join("app.worktrees/x");
+    env.workspace("w", "layout {\n    pane name=\"sh\"\n}\n");
+    env.run(&["open", "w"]);
+    let probe = "echo \"idx=$KRAAL_WORKTREE_INDEX offset=$KRAAL_PORT_OFFSET port=$PORT\"; exec sleep 60";
+    env.run(&["run", "--name", "probe", "--cwd", &wt.display().to_string(), "--", "sh", "-c", probe]);
+    env.wait_for_text("probe", "idx=1 offset=10 port=3010");
+}
+
+/// `kraal wt prune` removes a branch merged by squash (its commits are not in the base's
+/// history, their changes are), keeps one whose ignored files are its own unless told to discard
+/// them, and `--no-setup` makes a worktree even when the repository's setup file is broken.
+#[test]
+fn merged_worktrees_are_pruned_however_they_were_merged() {
+    let env = Env::new("wtsquash");
+    let repo = env.root.join("app");
+    let git = git_repo(&repo, &[(".gitignore", "*.db\n"), ("a.txt", "1\n")]);
+    let wt = |args: &[&str]| env.cmd(&[&["wt"], args].concat()).current_dir(&repo).output().unwrap();
+    let text =
+        |out: &Output| format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    let dir = env.root.join("app.worktrees");
+    for name in ["sq", "data"] {
+        assert!(wt(&["new", name, "--no-setup"]).status.success());
+    }
+    let in_sq = |args: &[&str]| {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(dir.join("sq"))
+            .args(["-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false"])
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    };
+    std::fs::write(dir.join("sq/a.txt"), "2\n").unwrap();
+    in_sq(&["commit", "-q", "-am", "two"]);
+    std::fs::write(dir.join("sq/b.txt"), "b\n").unwrap();
+    in_sq(&["add", "b.txt"]);
+    in_sq(&["commit", "-q", "-m", "b"]);
+    git(&["merge", "-q", "--squash", "kraal/sq"]);
+    git(&["commit", "-q", "-m", "sq (#1)"]);
+    std::fs::write(dir.join("data/dev.db"), "rows").unwrap();
+    // A broken setup file: the worktree is still made without it.
+    std::fs::create_dir_all(repo.join(".kraal")).unwrap();
+    std::fs::write(repo.join(".kraal/worktree.toml"), "setup = 1\n").unwrap();
+    git(&["add", ".kraal"]);
+    git(&["commit", "-q", "-m", "broken"]);
+    let out = wt(&["new", "broken"]);
+    assert!(!out.status.success() && text(&out).contains(".kraal/worktree.toml"), "{}", text(&out));
+    let out = wt(&["new", "broken", "--no-setup"]);
+    assert!(out.status.success(), "{}", text(&out));
+
+    let out = wt(&["prune", "--dry-run"]);
+    let said = text(&out);
+    assert!(said.contains("kraal/sq (its changes are in its base)"), "{said}");
+    assert!(said.contains("kept data: it has ignored files not in the main checkout (dev.db)"), "{said}");
+    assert!(said.contains("--discard-ignored"), "{said}");
+    let out = wt(&["prune"]);
+    assert!(out.status.success(), "{}", text(&out));
+    assert!(!dir.join("sq").exists() && !dir.join("broken").exists());
+    assert_eq!(std::fs::read_to_string(dir.join("data/dev.db")).unwrap(), "rows", "its own files are kept");
+    let out = wt(&["rm", "data"]);
+    assert!(!out.status.success() && text(&out).contains("--discard-ignored"), "{}", text(&out));
+    let out = wt(&["prune", "--discard-ignored"]);
+    assert!(out.status.success(), "{}", text(&out));
+    assert!(!dir.join("data").exists());
 }

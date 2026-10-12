@@ -411,9 +411,9 @@ pub(super) fn files(s: &Session, left: Option<String>, right: Option<String>) ->
 
 /// `kraal edit`: a server's file in the local editor, in a floating pane of the session (next
 /// to this pane inside kraal); kraal sends each save back.
-pub(super) fn edit(s: &Session, target: String, line: Option<u32>, production: bool) -> Result<()> {
+pub(super) fn edit(s: &Session, target: String, line: Option<u32>, production: bool, sudo: bool) -> Result<()> {
     s.ensure_server()?;
-    s.request(Request::EditRemote { target, line, near: s.own_pane(), production })?;
+    s.request(Request::EditRemote { target, line, near: s.own_pane(), production, sudo })?;
     Ok(())
 }
 

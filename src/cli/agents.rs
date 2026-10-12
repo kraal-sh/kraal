@@ -285,10 +285,7 @@ pub(super) fn worktrees(s: &Session, action: WtCmd) -> Result<()> {
             use std::io::{BufRead, IsTerminal, Write};
             let cfg = crate::config::Config::load()?;
             let user = worktree_setup::Setup::of_user(&cfg.worktrees);
-            let mut plan = worktree_setup::Plan::new(&cwd, &name, base.as_deref(), user)?;
-            if no_setup {
-                plan = plan.without_setup();
-            }
+            let plan = worktree_setup::Plan::new(&cwd, &name, base.as_deref(), user, !no_setup)?;
             // The repository's commands run once this version of its file is approved.
             if plan.needs_trust() {
                 println!("{}", plan.trust_question());
@@ -337,12 +334,13 @@ pub(super) fn worktrees(s: &Session, action: WtCmd) -> Result<()> {
             }
             Ok(())
         }
-        WtCmd::Prune { dry_run } => {
+        WtCmd::Prune { dry_run, discard_ignored } => {
             // Panes of the running session that work in a worktree keep it: close them first.
             let panes = match s.request(Request::ListPanes) {
                 Ok(Response::Panes(panes)) => panes,
                 _ => Vec::new(),
             };
+            let discard = if discard_ignored { git::Discard::Ignored } else { git::Discard::Nothing };
             let mut failed = 0;
             for (w, state) in git::worktree_states(&cwd)? {
                 let inside: Vec<String> = panes
@@ -350,19 +348,27 @@ pub(super) fn worktrees(s: &Session, action: WtCmd) -> Result<()> {
                     .filter(|p| p.cwd.as_ref().is_some_and(|c| c.starts_with(&w.path)))
                     .map(|p| p.name.clone().unwrap_or_else(|| p.id.to_string()))
                     .collect();
-                let kept = match state {
-                    Err(e) => Some(e),
+                let kept = match &state {
+                    Err(e) => Some(e.clone()),
                     Ok(s) if !s.is_clean() => Some(format!("it has {}", s.describe())),
+                    Ok(s) if !s.ignored.is_empty() && !discard_ignored => Some(format!(
+                        "it has ignored files not in the main checkout ({}); --discard-ignored removes them too",
+                        s.ignored_names()
+                    )),
                     Ok(_) if !inside.is_empty() => Some(format!("panes work in it ({})", inside.join(", "))),
                     Ok(_) => None,
+                };
+                let how = match &state {
+                    Ok(s) if s.unmerged > 0 => " (its changes are in its base)",
+                    _ => "",
                 };
                 if let Some(why) = kept {
                     println!("kept {}: {why}", w.name());
                 } else if dry_run {
-                    println!("would remove {} and {}", w.path.display(), w.branch);
+                    println!("would remove {} and {}{how}", w.path.display(), w.branch);
                 } else {
                     // Checked again as it is removed: nothing with changes or unmerged commits goes.
-                    match git::remove_worktree(&w, false) {
+                    match git::remove_worktree(&w, discard) {
                         Ok(()) => println!("removed {} and {}", w.path.display(), w.branch),
                         Err(e) => {
                             eprintln!("kept {}: {e:#}", w.name());
@@ -378,7 +384,7 @@ pub(super) fn worktrees(s: &Session, action: WtCmd) -> Result<()> {
             );
             Ok(())
         }
-        WtCmd::Rm { name, force } => {
+        WtCmd::Rm { name, force, discard_ignored } => {
             let w = git::list_worktrees(&cwd)?
                 .into_iter()
                 .find(|w| w.name() == name)
@@ -401,7 +407,17 @@ pub(super) fn worktrees(s: &Session, action: WtCmd) -> Result<()> {
                 }
                 std::thread::sleep(std::time::Duration::from_millis(500));
             }
-            git::remove_worktree(&w, force)?;
+            let discard = match (force, discard_ignored) {
+                (true, _) => git::Discard::Everything,
+                (false, true) => git::Discard::Ignored,
+                (false, false) => git::Discard::Nothing,
+            };
+            git::remove_worktree(&w, discard).map_err(|e| match git::worktree_state(&w) {
+                Ok(state) if state.is_clean() && !state.ignored.is_empty() => {
+                    anyhow::anyhow!("{e:#}; --discard-ignored removes it with them")
+                }
+                _ => e,
+            })?;
             println!("removed {} and {}", w.path.display(), w.branch);
             Ok(())
         }
