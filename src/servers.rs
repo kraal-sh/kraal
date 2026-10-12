@@ -655,6 +655,12 @@ impl Inventory {
         self.servers.iter().find(|x| x.same_address(s))
     }
 
+    /// The entry saved for the address of `s`, as written: the one [`Inventory::add`] keeps
+    /// rather than add `s`.
+    pub fn saved_mut(&mut self, s: &Server) -> Option<&mut Server> {
+        self.servers.iter_mut().find(|x| x.same_address(s))
+    }
+
     /// Add a server, choosing a free name if needed. Returns the stored entry's name.
     pub fn add(&mut self, server: Server) -> Result<String> {
         if let Some(existing) = self.find_target(&server).filter(|_| !server.host.is_empty()) {

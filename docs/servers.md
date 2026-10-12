@@ -40,8 +40,10 @@ it in the group `discovered`, unless `[servers] auto_add = false`.
 | `kraal ssh db` | plain ssh, resolved from the inventory; inside kraal, `--right`, `--down`, `--floating` or `--tab` open it in a new pane instead |
 | `kraal ssh prod --group` | every server of "prod" in a grid of panes, in a workspace of that name |
 
-`kraal servers add` leaves an address that is already saved as it is, but for `--agents`: change
-its other fields with `kraal servers edit`.
+`kraal servers add` leaves an address that is already saved as it is, and says so. `--agents` is
+the one field it sets there; given another option that would change the entry, it fails, names
+the option and changes nothing: change those fields with `kraal servers edit`. The same host
+with another user or port is another address, and gets an entry of its own.
 
 `ctrl+b s` opens the same list: Enter connects (or opens a whole group); Tab shows the other
 actions, each also on its own key: connect in a new tab (`ctrl+t`), browse its files (`ctrl+f`),

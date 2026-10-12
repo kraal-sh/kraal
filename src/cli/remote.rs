@@ -137,6 +137,23 @@ fn install_script(expected: &str) -> String {
     )
 }
 
+/// The options of `kraal servers add` (in `given`) that would change the entry `saved` for that
+/// address: adding it again does not set them.
+fn options_not_saved(given: &servers::Server, saved: &servers::Server) -> Vec<&'static str> {
+    let differs = |given: &Option<String>, saved: &Option<String>| given.is_some() && given != saved;
+    [
+        ("--name", !given.name.is_empty() && given.name != saved.name),
+        ("--group", given.groups.iter().any(|g| !saved.groups.contains(g))),
+        ("--jump", differs(&given.jump, &saved.jump)),
+        ("--identity", differs(&given.identity, &saved.identity)),
+        ("--env", differs(&given.env, &saved.env)),
+        ("--note", differs(&given.note, &saved.note)),
+    ]
+    .into_iter()
+    .filter_map(|(option, dropped)| dropped.then_some(option))
+    .collect()
+}
+
 pub(super) fn servers(action: ServersCmd) -> Result<()> {
     let cfg = config::Config::load()?;
     match action {
@@ -188,19 +205,38 @@ pub(super) fn servers(action: ServersCmd) -> Result<()> {
                 groups: group,
                 env,
                 note,
-                agents: agents.clone(),
+                agents,
             };
-            let name = servers::Inventory::update(|inv| {
-                let name = inv.add(s)?;
-                // A server saved already gets the session asked for too.
-                if let Some(a) = agents
-                    && let Some(entry) = inv.servers.iter_mut().find(|x| x.name == name)
-                {
-                    entry.agents = Some(a);
+            let file = paths::shorten_home(&servers::Inventory::path());
+            let done = servers::Inventory::update(|inv| {
+                let Some(saved) = inv.saved_mut(&s) else {
+                    return Ok(format!("saved {} in {file}", inv.add(s)?));
+                };
+                // An address already saved keeps its entry: nothing is said saved that was not.
+                let dropped = options_not_saved(&s, saved);
+                if !dropped.is_empty() {
+                    bail!(
+                        "{} is already saved as {}, and adding it again leaves its entry as it is: {} would not \
+                         be set. Change it with `kraal servers edit`",
+                        s.address(),
+                        saved.name,
+                        dropped.join(", ")
+                    );
                 }
-                Ok(name)
+                // But for the session whose agents are listed.
+                Ok(match s.agents.filter(|a| saved.agents.as_ref() != Some(a)) {
+                    Some(session) => {
+                        let done = format!(
+                            "{} is already saved in {file}: it now lists the agents of the session {session} there",
+                            saved.name
+                        );
+                        saved.agents = Some(session);
+                        done
+                    }
+                    None => format!("{} is already saved in {file}", saved.name),
+                })
             })?;
-            println!("saved {name} in {}", paths::shorten_home(&servers::Inventory::path()));
+            println!("{done}");
             Ok(())
         }
         ServersCmd::Rm { name } => {

@@ -1340,6 +1340,55 @@ fn a_command_given_no_pane_says_how_it_takes_one() {
     assert!(said(&["close", "1"]).contains("no kraal server"));
 }
 
+/// `kraal servers add` for an address already saved leaves its entry as it is, and says what it
+/// did: it never says "saved" for options it dropped. `--agents` is the one thing it sets there.
+#[test]
+fn adding_a_saved_server_again_never_claims_a_save() {
+    let env = Env::new("readd");
+    let file = env.root.join("config/kraal/servers.toml");
+    let add = |args: &[&str]| env.try_run(&[&["servers", "add", "admin@db.lan"], args].concat());
+    let said =
+        |out: &Output| format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    let saved = || std::fs::read_to_string(&file).unwrap();
+
+    let out = add(&["--name", "db", "--group", "data"]);
+    assert!(out.status.success() && said(&out).starts_with("saved db in "), "{}", said(&out));
+    let first = saved();
+    // An option that would change the entry is refused, by its name, and nothing is written.
+    let options: [&[&str]; 7] = [
+        &["--env", "prod"],
+        &["--group", "web"],
+        &["--jump", "bastion"],
+        &["--identity", "~/.ssh/db"],
+        &["--note", "primary"],
+        &["--name", "other"],
+        &["--env", "prod", "--agents", "main"],
+    ];
+    for option in options {
+        let out = add(option);
+        let said = said(&out);
+        assert!(!out.status.success(), "{option:?}: {said}");
+        assert!(said.contains("admin@db.lan is already saved as db") && said.contains(option[0]), "{option:?}: {said}");
+        assert!(said.contains("`kraal servers edit`") && !said.contains("saved db in"), "{option:?}: {said}");
+        assert_eq!(saved(), first, "{option:?}");
+    }
+    // What the entry already has changes nothing, and is not refused.
+    for same in [&[][..], &["--name", "db", "--group", "data"]] {
+        let out = add(same);
+        assert!(out.status.success() && said(&out).starts_with("db is already saved in "), "{}", said(&out));
+        assert_eq!(saved(), first);
+    }
+    // The session whose agents are listed is set on a saved server too, and said.
+    let out = add(&["--agents", "main"]);
+    assert!(out.status.success(), "{}", said(&out));
+    assert!(said(&out).starts_with("db is already saved in ") && said(&out).contains("session main"), "{}", said(&out));
+    assert_eq!(saved(), format!("{first}agents = \"main\"\n"));
+    // With another port it is another address: a new entry, with what it was given.
+    let out = env.try_run(&["servers", "add", "admin@db.lan:2222", "--env", "prod"]);
+    assert!(out.status.success() && said(&out).starts_with("saved db-admin in "), "{}", said(&out));
+    assert_eq!(saved().matches("env = \"prod\"").count(), 1);
+}
+
 #[test]
 fn server_inventory_and_copy_plans() {
     let env = Env::new("servers");
