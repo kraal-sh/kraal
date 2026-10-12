@@ -55,11 +55,14 @@ waiting for you.
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/kraal-sh/kraal/main/install.sh | sh
+# or, with Rust 1.88 or later:
+cargo install kraal
 ```
 
-or `cargo install kraal` · [prebuilt archives](https://github.com/kraal-sh/kraal/releases) for
-Linux and macOS, x86_64 and arm64. The script checks the archive's checksum and installs into
-`~/.local/bin`; `kraal update` does the same later. [More ways](docs/install.md)
+The script takes the [prebuilt archive](https://github.com/kraal-sh/kraal/releases) for your
+machine (Linux and macOS, x86_64 and arm64), checks its checksum and installs into
+`~/.local/bin`. To update later, `kraal update` for the script's install, `cargo install kraal`
+again for Cargo's. [More ways](docs/install.md)
 
 ## Quick start
 
