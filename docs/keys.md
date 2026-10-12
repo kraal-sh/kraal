@@ -22,7 +22,7 @@ any keyboard layout.
 | agents | `a` start one on an account | `A`: `a` start, `g` go to the agent needing you, `c` change account |
 | tabs | `t` new tab | `T`: `t` new, `←`/`→` previous/next, `e` rename, `x` close |
 | panes | `p` find a pane | `P`: `p` find, `n` new, `→`/`↓` split, `e` rename, `r` resize with the arrows, `f` floating, `x` close |
-| view | `v` copy mode: scroll and select | `V`: `v` copy mode, `g` search the output, `o` links and paths, `c` copy the last command's output, `f` floating panes, `l` sidebar, `j` message log |
+| view | `v` copy mode: scroll and select | `V`: `v` copy mode, `g` search the output, `o` links and paths, `c` copy the last command's output, `p` paste buffers, `f` floating panes, `l` sidebar, `j` message log |
 | files | `f` file manager | `F`: `f` file manager, `p` preview a file, `u`/`d` upload/download |
 | run | `r` tools where the pane is | `R`: `r` tools, `b` runbooks, `g` git and worktrees |
 
@@ -35,6 +35,7 @@ previous and next, and the theme's letter its main action again.
 | `m` | mark this pane for broadcast |
 | `o` | open a link, a path, a commit on screen (hints) |
 | `g` (or `/`) | search the output |
+| `=` | paste buffers: what you copied, to paste again (tmux's key) |
 | arrows · `1`…`9` | focus the pane on that side · go to a tab |
 | `space` | search every command by what it does (and see its keys) |
 | `h` (or `?`) | help: every key, from your configuration |
@@ -45,7 +46,7 @@ Without the prefix: `alt+arrows` move the focus (left/right at the edge go to th
 `alt+n` opens a new pane, `alt+a` jumps to the next agent that needs you.
 
 `[keys] preset = "classic"` switches to single-key commands (`%` `"` `c` `n` `p`
-`o` `s`…), still with the menu.
+`o` `s` `=`…), still with the menu.
 
 ## Lists, fields and questions
 
@@ -85,6 +86,32 @@ name opens the list); drag borders to resize; drag floating panes by their title
 back; drag to select and copy (double click selects a word, triple click a line); Ctrl+click opens
 a link (OSC 8 links stay clickable, and plain URLs work too). Hold Shift to use your terminal's own
 selection.
+
+## Paste buffers
+
+What you copy goes to your terminal's clipboard, and kraal keeps it too, as tmux does: a copy
+mode selection, a mouse selection, `ctrl+b V c` (the last command's output), a hint's text, and
+what programs copy. The newest copy is buffer 0, the one before it buffer 1, and so on; the same
+text copied twice in a row is kept once. At most 50 numbered buffers and 32 MB stay, the oldest
+going first; buffers set by name (`kraal buffer set notes`, see
+[Scripting](scripting.md#paste-buffers)) stay until deleted.
+
+`ctrl+b V p` (or `ctrl+b =`) lists them, newest first, with their first line, size and age; type
+to filter. Enter pastes the selected one into the focused pane as your terminal would: bracketed
+when the program asked for it, to the panes typing is broadcast to, and asked about first when
+several lines would run at once in production ([Production](production.md)). Tab shows what else
+can be done, each also on its own key:
+
+| Key | |
+|---|---|
+| `enter` | paste into the pane |
+| `ctrl+y` | copy to the clipboard again |
+| `ctrl+o` | show in a preview pane (a window, never saved with the session) |
+| `ctrl+x` | delete |
+
+Buffers live in the server's memory: they go when it stops, and nothing of them is written to
+disk, since they can hold secrets. `[buffers]` in the configuration changes the limits, or keeps
+them across restarts in a file only you can read ([Configuration](configuration.md)).
 
 ## Keyboards and terminals
 

@@ -156,6 +156,29 @@ impl Server {
                     self.edit_servers(id);
                     return Mode::Normal;
                 }
+                (KeyCode::Char('y'), true) if p.kind == PickerKind::Buffers => {
+                    if let Some(PickAction::Buffer(b)) = p.current().map(|i| i.action.clone()) {
+                        if let Some(text) = self.picked_buffer(id, b) {
+                            self.send_clipboard(id, &text);
+                        }
+                        return Mode::Normal;
+                    }
+                }
+                (KeyCode::Char('o'), true) if p.kind == PickerKind::Buffers => {
+                    if let Some(PickAction::Buffer(b)) = p.current().map(|i| i.action.clone()) {
+                        self.show_buffer(id, b);
+                        return Mode::Normal;
+                    }
+                }
+                (KeyCode::Char('x'), true) if p.kind == PickerKind::Buffers => {
+                    if let Some(PickAction::Buffer(b)) = p.current().map(|i| i.action.clone()) {
+                        self.delete_picked_buffer(id, b);
+                        // The list as it is now, at the same place.
+                        let mut next = self.buffer_picker();
+                        next.selected = p.selected.min(next.filtered.len().saturating_sub(1));
+                        return Mode::Picker(next);
+                    }
+                }
                 (KeyCode::Char('x'), true) if p.kind == PickerKind::Ssh => {
                     if let Some(PickAction::Ssh(name)) = p.current().map(|i| i.action.clone()) {
                         match self.forget_server(&name) {
@@ -241,6 +264,7 @@ impl Server {
                 Err(e) => self.toast(id, format!("{e:#}")),
             },
             PickAction::FocusPane(pane) => self.reveal(id, pane),
+            PickAction::Buffer(b) => return self.paste_buffer(id, b),
             PickAction::RemoteAgent { server, pane } => self.go_to_remote(id, &server, pane),
             PickAction::FilesSet { pane, side, target } => self.files_set(pane, side, &target),
             PickAction::EditAnswer { edit, answer } => self.answer_edit(id, edit, answer),

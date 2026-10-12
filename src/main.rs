@@ -3,6 +3,7 @@
 mod accounts;
 mod agent;
 mod ansi;
+mod buffers;
 mod cli;
 mod client;
 mod codex_usage;

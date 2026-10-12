@@ -30,6 +30,33 @@ session, not a pane here: `kraal -s main read -p 3` runs on the server, `kraal a
 --pane 3` shows it here. `kraal agents --follow` lists this session's own agents only: it is what
 another kraal watching this session reads.
 
+## Paste buffers
+
+What kraal copies is kept in paste buffers ([Keys](keys.md#paste-buffers)), and scripts and agents
+reach them too:
+
+```sh
+kraal buffer list                              # newest first: number or name, size, age, first line
+kraal buffer list --json
+kraal buffer show                              # the newest buffer's text, as it is
+kraal buffer show 2                            # the third newest numbered one (0 is the newest)
+git diff | kraal buffer set review             # a named buffer, from the standard input
+kraal buffer set notes --from-file notes.md    # or from a file
+kraal buffer set < out.txt                     # a numbered buffer, like a copy
+kraal buffer paste review -p api               # paste into a pane, as your terminal would
+kraal buffer delete review                     # one buffer (the newest without a name or number)
+kraal buffer delete --all
+```
+
+Numbered buffers rotate: 0 is always the newest, and the oldest go past `[buffers] limit` or
+`max_mb`. Named buffers stay until deleted; a name is one word (letters, digits, `- _ . : @ +`),
+never a number. Setting a name again replaces that buffer. `kraal buffer paste` sends the text as a
+paste, bracketed when the program asked for it; like `kraal send`, it refuses a production pane
+unless given `--production` ([Production](production.md)).
+
+Buffers hold text, in the server's memory only unless `[buffers] persist = true`
+([Configuration](configuration.md)).
+
 ## Events
 
 ```sh

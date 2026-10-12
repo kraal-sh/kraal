@@ -5,6 +5,7 @@
 
 mod agents;
 mod attention;
+mod buffers;
 mod clients;
 mod commands;
 mod contexts;
@@ -455,6 +456,10 @@ pub struct Server {
     sidebar_was_useful: bool,
     /// Whether a client was told how to stop the broadcast its key started.
     pub broadcast_tip_shown: bool,
+    /// What was copied, to paste again, and named text (`kraal buffer`).
+    pub buffers: crate::buffers::Buffers,
+    /// The buffers changed since they were last written (when they are kept across restarts).
+    buffers_dirty: bool,
 }
 
 /// Finishes a background job on the server thread with its result.
@@ -536,6 +541,7 @@ pub fn run(session: &str) -> Result<()> {
             config.graphics.memory_mb.saturating_mul(1 << 20),
         )),
     };
+    let buffers = crate::buffers::Buffers::new(config.buffers.limit, config.buffers.max_bytes());
     let mut server = Server {
         session: session.to_string(),
         config,
@@ -582,6 +588,8 @@ pub fn run(session: &str) -> Result<()> {
         held_input: Vec::new(),
         sidebar_was_useful: false,
         broadcast_tip_shown: false,
+        buffers,
+        buffers_dirty: false,
         tunnels: Vec::new(),
         remotes: Vec::new(),
         port_candidates: HashMap::new(),
@@ -622,6 +630,7 @@ pub fn run(session: &str) -> Result<()> {
         },
     };
     server.scan_definitions();
+    server.load_buffers();
     server.restore();
     let result = server.event_loop(&rx);
     server.shutdown();
@@ -894,6 +903,7 @@ impl Server {
             }
         }
         self.forget_ended_ssh(ssh_ended);
+        self.save_buffers();
         self.tick_edits();
         self.forget_ended_reports();
         self.diff_pane_states();
@@ -1041,6 +1051,7 @@ impl Server {
                     self.notify(&title, &body, Some(id));
                 }
                 PaneSignal::Clipboard(text) => {
+                    self.keep_copy(&text);
                     // What a pane copies goes to one clipboard: that of the client looking at its
                     // workspace that was used last (another machine attached elsewhere keeps its own).
                     let bytes = crate::pane::osc52(&text);
@@ -1152,6 +1163,7 @@ impl Server {
         // panes' scrollback first), and the server waits for it.
         self.save_scrollback(true);
         self.persist();
+        self.save_buffers();
         let (done, written) = crossbeam_channel::bounded(1);
         let saved = match self.persister.send(persistence::Persist::Stop(done)) {
             Ok(()) => written

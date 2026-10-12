@@ -198,6 +198,8 @@ pub(super) enum Persist {
         session: String,
         file: String,
     },
+    /// The paste buffers, into their private file; `None` deletes it.
+    Buffers(std::path::PathBuf, Option<Vec<u8>>),
     /// The session ended with its last pane: nothing is left to restore.
     Delete(String),
     /// Everything asked before is written: say whether the last save of the state and of each
@@ -280,6 +282,12 @@ pub(super) fn spawn_persister(events: Sender<Event>, shared: Arc<Mutex<Persistin
                                     s.failed.push(file.clone());
                                 }
                             }
+                        }
+                    }
+                    Persist::Buffers(..) if queue[i + 1..].iter().any(|j| matches!(j, Persist::Buffers(..))) => {}
+                    Persist::Buffers(path, data) => {
+                        if let Err(e) = super::buffers::write_file(path, data.as_deref()) {
+                            let _ = events.send(Event::Warning(format!("keeping the paste buffers: {e}")));
                         }
                     }
                     Persist::Delete(session) => {

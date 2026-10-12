@@ -41,7 +41,8 @@ This text is written to disk, readable by you alone, in `~/.local/state/kraal/sc
 and it can hold secrets (a token printed by a command, a password echoed by mistake):
 `save_scrollback = false` in the config stops saving it and deletes what was saved (kraal deletes
 only the files it wrote there, and nothing through a link put in place of that directory).
-`kraal forget` deletes the saved layout and scrollback of a stopped session.
+`kraal forget` deletes the saved layout and scrollback of a stopped session. Paste buffers are
+not saved unless `[buffers] persist = true` ([Configuration](configuration.md)).
 
 ## Workspace files
 

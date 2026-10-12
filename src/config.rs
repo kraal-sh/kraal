@@ -111,6 +111,20 @@ confirm_sync = true
 # Ask before pasting several lines into a production pane that would run them at once.
 confirm_paste = true
 
+[buffers]
+# Paste buffers: what kraal copies (copy mode, mouse selections, hints, the last command's
+# output, what programs copy) is also kept here, newest first. ctrl+b V p (or ctrl+b =) lists
+# them to paste one again; `kraal buffer` lists, sets and pastes them from scripts. Numbered
+# buffers rotate: at most this many are kept (0 keeps none).
+limit = 50
+# What all buffers hold together, in MB: past it, the oldest numbered ones go. Named buffers
+# (`kraal buffer set NAME`) stay until deleted.
+max_mb = 32
+# Buffers live in memory only and go when the server stops: they can hold secrets (a password,
+# a token). true keeps them across restarts in ~/.local/state/kraal/buffers, in a file only you
+# can read (0600); false keeps nothing on disk and deletes that file.
+persist = false
+
 [worktrees]
 # Worktrees kraal makes for agents (<repo>.worktrees/<name>). A repository can ship its own
 # preparation in .kraal/worktree.toml (same keys, run once you approve that version); these
@@ -213,7 +227,8 @@ alphabet = "asdfqwerzxcvjklmiuopghtybn"
 # workspace (W), a start an agent (A), t new tab (T), p find a pane (P), v copy mode (V view),
 # f file manager (F), r tools here (R run). Inside every menu: n new, x close, e rename, arrows
 # previous and next. Other keys: n new pane, x close, z zoom, m mark for broadcast, o open a
-# link or path, g search the output, arrows focus, 1-9 tabs, space search commands, h help.
+# link or path, g search the output, = paste buffers, arrows focus, 1-9 tabs, space search
+# commands, h help.
 # "classic": tmux's single keys after the prefix (% " x z c n p o s…).
 preset = "kraal"
 # The prefix (leader) key(s). Pressing one twice sends it to the program.
@@ -249,6 +264,7 @@ pub struct Config {
     pub graphics: GraphicsConfig,
     pub contexts: ContextsConfig,
     pub production: ProductionConfig,
+    pub buffers: BuffersConfig,
     pub worktrees: WorktreesConfig,
     pub hints: crate::hints::HintsConfig,
     #[serde(default)]
@@ -276,6 +292,22 @@ pub struct ProductionConfig {
     pub words: Vec<String>,
     pub confirm_sync: bool,
     pub confirm_paste: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct BuffersConfig {
+    /// Numbered buffers kept at most.
+    pub limit: usize,
+    /// MB all buffers hold together at most.
+    pub max_mb: usize,
+    /// Keep them across restarts, in a private file.
+    pub persist: bool,
+}
+
+impl BuffersConfig {
+    pub fn max_bytes(&self) -> usize {
+        self.max_mb.saturating_mul(1 << 20)
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -386,6 +418,9 @@ mod tests {
         assert!(cfg.save_scrollback);
         assert_eq!(cfg.keys.preset, "kraal");
         assert!(cfg.keys.leader.is_empty() && cfg.keys.direct.is_empty(), "the preset has the bindings");
+        // Paste buffers stay in memory unless asked.
+        assert!(!cfg.buffers.persist);
+        assert_eq!((cfg.buffers.limit, cfg.buffers.max_bytes()), (50, 32 << 20));
     }
 
     #[test]

@@ -101,6 +101,23 @@ pub struct PaneSpec {
     /// Environment holding secrets: given to the process only, never saved with the session.
     #[serde(skip)]
     pub secret_env: SecretEnv,
+    /// Text to show as a preview instead of a file's (a paste buffer): in memory only, never
+    /// saved with the session.
+    #[serde(skip)]
+    pub text: Option<ShownText>,
+}
+
+/// Text a preview pane shows, under a title. Debug output says how long it is, not what it says.
+#[derive(Clone)]
+pub struct ShownText {
+    pub title: String,
+    pub text: String,
+}
+
+impl std::fmt::Debug for ShownText {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "ShownText({:?}, {} bytes)", self.title, self.text.len())
+    }
 }
 
 /// An agent of a workspace definition, before its account is chosen.
@@ -231,7 +248,10 @@ impl Pane {
     ) -> Result<Pane> {
         let cols = cols.max(2);
         let rows = rows.max(1);
-        let content = if let Some(path) = &spec.preview {
+        let mut spec = spec;
+        let content = if let Some(shown) = spec.text.take() {
+            Content::Preview(Box::new(Preview::of_text(&shown.title, &shown.text)))
+        } else if let Some(path) = &spec.preview {
             let mut preview = Preview::open(path);
             if env.graphics.enabled() {
                 preview.set_graphics(env.graphics.clone());
@@ -341,6 +361,11 @@ impl Pane {
 
     pub fn is_preview(&self) -> bool {
         matches!(self.content, Content::Preview(_))
+    }
+
+    /// A preview of text kraal holds rather than of a file: nothing of it is saved.
+    pub fn shows_text(&self) -> bool {
+        matches!(&self.content, Content::Preview(p) if p.in_memory())
     }
 
     /// The preview this pane shows of `path`, if it is one.

@@ -4323,3 +4323,239 @@ fn a_server_file_is_edited_in_the_local_editor() {
     }
     drop(sshd);
 }
+
+/// `kraal buffer set` with `text` on its standard input.
+fn set_buffer(env: &Env, args: &[&str], text: &str) -> Output {
+    use std::io::Write;
+    let mut child = env
+        .cmd(&[&["buffer", "set"], args].concat())
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(text.as_bytes()).unwrap();
+    child.wait_with_output().unwrap()
+}
+
+fn buffer_list(env: &Env) -> Vec<serde_json::Value> {
+    let list: serde_json::Value = serde_json::from_str(&env.run(&["buffer", "list", "--json"])).unwrap();
+    list.as_array().unwrap().clone()
+}
+
+#[test]
+fn paste_buffers_from_the_command_line() {
+    let env = Env::new("buffers");
+    env.workspace("w", "layout {\n    pane name=\"main\"\n}\n");
+    let keys = env.run(&["config", "keys"]);
+    assert!(keys.contains("ctrl+b V p, ctrl+b =") && keys.contains("Paste buffers"), "{keys}");
+    env.run(&["open", "w"]);
+    let out = env.try_run(&["buffer", "show"]);
+    assert!(!out.status.success() && String::from_utf8_lossy(&out.stderr).contains("no paste buffers"));
+    // Text from the standard input, and from a file under a name.
+    assert!(set_buffer(&env, &[], "echo first\n").status.success());
+    let file = env.root.join("notes.txt");
+    std::fs::write(&file, "line one\nline two\n").unwrap();
+    env.run(&["buffer", "set", "notes", "--from-file", &file.display().to_string()]);
+    // What a program copies (OSC 52) is kept too, as the newest.
+    let copy = "printf '\\033]52;c;%s\\007' \"$(printf copied-by-a-program | base64)\"; exec sleep 60";
+    env.run(&["run", "--name", "copier", "--", "sh", "-c", copy]);
+    let start = Instant::now();
+    while buffer_list(&env).len() < 3 {
+        assert!(start.elapsed() < Duration::from_secs(10), "the program's copy was not kept");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let list = buffer_list(&env);
+    let keys: Vec<&str> = list.iter().map(|b| b["buffer"].as_str().unwrap()).collect();
+    assert_eq!(keys, ["0", "notes", "1"], "newest first; numbers count the numbered buffers");
+    let notes = (list[1]["named"].as_bool(), list[1]["lines"].as_u64(), list[1]["bytes"].as_u64());
+    assert_eq!(notes, (Some(true), Some(2), Some(18)));
+    assert_eq!(env.run(&["buffer", "show"]), "copied-by-a-program");
+    assert_eq!(env.run(&["buffer", "show", "notes"]), "line one\nline two\n");
+    assert_eq!(env.run(&["buffer", "show", "1"]), "echo first\n");
+    let shown = env.run(&["buffer", "list"]);
+    assert!(shown.contains("notes") && shown.contains("line one | line two"), "{shown}");
+    // The same text again is not kept twice, and a number is not a name.
+    assert!(set_buffer(&env, &[], "copied-by-a-program").status.success());
+    assert_eq!(buffer_list(&env).len(), 3);
+    let out = set_buffer(&env, &["7"], "x");
+    assert!(!out.status.success() && String::from_utf8_lossy(&out.stderr).contains("is a number"));
+    assert!(!env.try_run(&["buffer", "show", "5"]).status.success());
+
+    // A program that asked for bracketed paste gets the markers around it; one that did not
+    // gets its line ends as Enter.
+    assert!(set_buffer(&env, &["word"], "pasted-word").status.success());
+    let show = |mode: &str| format!("stty raw -echo; printf '{mode}READY'; exec cat -v");
+    env.run(&["run", "--name", "bracketed", "--", "sh", "-c", &show("\\033[?2004h")]);
+    env.run(&["run", "--name", "plain", "--", "sh", "-c", &show("")]);
+    env.wait_for_text("bracketed", "READY");
+    env.wait_for_text("plain", "READY");
+    env.run(&["buffer", "paste", "word", "-p", "bracketed"]);
+    env.wait_for_text("bracketed", "^[[200~pasted-word^[[201~");
+    env.run(&["buffer", "paste", "1", "-p", "plain"]);
+    let screen = env.wait_for_text("plain", "echo first^M");
+    assert!(!screen.contains("200~"), "{screen}");
+
+    env.run(&["buffer", "delete", "notes"]);
+    assert!(!buffer_list(&env).iter().any(|b| b["buffer"] == "notes"));
+    env.run(&["buffer", "delete", "--all"]);
+    assert!(buffer_list(&env).is_empty());
+}
+
+#[test]
+fn paste_buffers_stay_in_memory_unless_kept_on_purpose() {
+    let env = Env::new("bufkeep");
+    env.workspace("w", "layout {\n    pane name=\"main\"\n}\n");
+    env.run(&["open", "w"]);
+    let file = env.root.join("state/kraal/buffers").join(format!("{}.json", env.session));
+    assert!(set_buffer(&env, &["secret"], "hunter2").status.success());
+    env.run(&["kill"]);
+    assert!(!file.exists(), "written to disk unasked");
+    env.run(&["open", "w"]);
+    assert!(buffer_list(&env).is_empty(), "came back after a restart");
+
+    // Kept on purpose: in a file only its owner reads, and back after a restart.
+    let path = env.root.join("config/kraal/config.toml");
+    let base = std::fs::read_to_string(&path).unwrap();
+    std::fs::write(&path, format!("{base}[buffers]\npersist = true\n")).unwrap();
+    env.run(&["config", "reload"]);
+    assert!(set_buffer(&env, &["secret"], "hunter2").status.success());
+    let start = Instant::now();
+    while !file.exists() {
+        assert!(start.elapsed() < Duration::from_secs(5), "never written");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    use std::os::unix::fs::PermissionsExt;
+    assert_eq!(std::fs::metadata(&file).unwrap().permissions().mode() & 0o777, 0o600);
+    env.run(&["kill"]);
+    env.run(&["open", "w"]);
+    assert_eq!(env.run(&["buffer", "show", "secret"]), "hunter2");
+    // Turned off again: the file goes.
+    std::fs::write(&path, &base).unwrap();
+    env.run(&["config", "reload"]);
+    wait_gone(&file);
+    assert!(!file.exists());
+    assert_eq!(env.run(&["buffer", "show", "secret"]), "hunter2", "still there until the server stops");
+}
+
+#[test]
+fn paste_buffers_reach_production_only_on_purpose() {
+    let env = Env::new("bufprod");
+    let tf = env.root.join("infra");
+    std::fs::create_dir_all(tf.join(".terraform")).unwrap();
+    std::fs::write(tf.join(".terraform/environment"), "prod\n").unwrap();
+    env.workspace("w", "layout {\n    pane name=\"main\"\n}\n");
+    env.run(&["open", "w"]);
+    let script = "stty raw -echo; printf READY; exec cat -v";
+    env.run(&["run", "--cwd", &tf.display().to_string(), "--name", "ops", "--", "sh", "-c", script]);
+    wait_production(&env, "ops");
+    env.wait_for_text("ops", "READY");
+    assert!(set_buffer(&env, &[], "rm -rf /tmp/x\nreboot\n").status.success());
+    // From the command line: refused unless said.
+    let out = env.try_run(&["buffer", "paste", "-p", "ops"]);
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("is production") && err.contains("--production"), "{err}");
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(!env.run(&["read", "-p", "ops"]).contains("reboot"));
+    // From the list: the question a paste of several lines into production gets.
+    env.run(&["focus", "ops"]);
+    let mut client = RawClient::attach(&env, "w");
+    client.send(b"\x02=");
+    client.wait_for_screen("Paste buffers");
+    client.send(b"\r");
+    client.wait_for_screen("Paste 2 lines into production");
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(!env.run(&["read", "-p", "ops"]).contains("reboot"), "pasted before the answer");
+    client.send(b"y");
+    env.wait_for_text("ops", "rm -rf /tmp/x^Mreboot^M");
+    // On purpose from the command line.
+    assert!(set_buffer(&env, &[], "said-so").status.success());
+    env.run(&["buffer", "paste", "-p", "ops", "--production"]);
+    env.wait_for_text("ops", "said-so");
+}
+
+#[test]
+fn the_paste_buffers_list_pastes_shows_and_deletes() {
+    let env = Env::new("bufpick");
+    env.workspace("w", "layout {\n    pane name=\"main\"\n}\n");
+    env.run(&["open", "w"]);
+    env.run(&["run", "--name", "src", "--", "sh", "-c", "echo COPY-ME-LINE; exec sleep 60"]);
+    env.wait_for_text("src", "COPY-ME-LINE");
+    env.run(&["run", "--name", "sink", "--", "sh", "-c", "stty raw -echo; printf READY; exec cat -v"]);
+    env.wait_for_text("sink", "READY");
+    env.run(&["focus", "src"]);
+    let mut client = RawClient::attach(&env, "w");
+    client.wait_for_screen("COPY-ME-LINE");
+    // Copy mode: up to the line, select it, copy. It goes to the terminal and to the buffers.
+    for key in [&b"\x02v"[..], b"k", b"V", b"y"] {
+        client.send(key);
+        std::thread::sleep(Duration::from_millis(150));
+    }
+    client.wait_for_screen("\x1b]52;c;");
+    assert!(env.run(&["buffer", "show"]).contains("COPY-ME-LINE"));
+    assert!(set_buffer(&env, &[], "older-text").status.success());
+    assert!(set_buffer(&env, &[], "newest-text").status.success());
+
+    // Enter pastes the newest into the focused pane; typing filters.
+    env.run(&["focus", "sink"]);
+    client.send(b"\x02=");
+    client.wait_for_screen("Paste buffers");
+    client.send(b"\r");
+    env.wait_for_text("sink", "READYnewest-text");
+    client.send(b"\x02V");
+    std::thread::sleep(Duration::from_millis(150));
+    client.send(b"p");
+    client.wait_for_screen("older-text");
+    client.send(b"older");
+    std::thread::sleep(Duration::from_millis(150));
+    client.send(b"\r");
+    env.wait_for_text("sink", "newest-textolder-text");
+
+    // Tab lists what else can be done; ctrl+o shows the buffer in a window.
+    client.send(b"\x02=");
+    std::thread::sleep(Duration::from_millis(150));
+    client.send(b"\t");
+    client.wait_for_screen("Show in a preview pane");
+    client.send(b"\x1b");
+    std::thread::sleep(Duration::from_millis(150));
+    client.send(b"\x0f");
+    env.wait_for_text("buffer 0", "newest-text");
+    let panes: serde_json::Value = serde_json::from_str(&env.run(&["panes", "--json"])).unwrap();
+    let shown = panes.as_array().unwrap().iter().find(|p| p["name"] == "buffer 0").cloned().unwrap();
+    assert_eq!((shown["kind"].as_str(), shown["floating"].as_bool()), (Some("preview:text"), Some(true)));
+    // Nothing of it is saved with the session.
+    env.run(&["kill"]);
+    let state = std::fs::read_to_string(env.state_file()).unwrap();
+    assert!(state.contains("\"sink\"") && !state.contains("buffer 0") && !state.contains("newest-text"), "{state}");
+}
+
+#[test]
+fn the_paste_buffers_list_deletes_and_stays_open() {
+    let env = Env::new("bufdel");
+    env.workspace("w", "layout {\n    pane name=\"main\"\n}\n");
+    env.run(&["open", "w"]);
+    for text in ["first-text", "second-text", "third-text"] {
+        assert!(set_buffer(&env, &[], text).status.success());
+    }
+    let mut client = RawClient::attach(&env, "w");
+    client.send(b"\x02=");
+    client.wait_for_screen("Paste buffers");
+    // ctrl+x deletes the selected buffer (the newest), and the list stays to go on.
+    client.send(b"\x18");
+    let start = Instant::now();
+    while buffer_list(&env).len() != 2 {
+        assert!(start.elapsed() < Duration::from_secs(5), "not deleted");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    client.send(b"\x1b[B");
+    std::thread::sleep(Duration::from_millis(150));
+    client.send(b"\x18");
+    let start = Instant::now();
+    while buffer_list(&env).len() != 1 {
+        assert!(start.elapsed() < Duration::from_secs(5), "the list did not stay");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(env.run(&["buffer", "show"]), "second-text");
+    client.send(b"\x1b");
+}

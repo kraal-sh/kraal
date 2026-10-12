@@ -263,6 +263,7 @@ impl Server {
                 }
             }
             Action::CopyLastOutput => self.copy_last_output(id, focus),
+            Action::Buffers => return Mode::Picker(self.buffer_picker()),
             Action::OpenPreview => {
                 return Mode::Prompt(Prompt::new("Preview file (path)", "", PromptAction::OpenPreview));
             }

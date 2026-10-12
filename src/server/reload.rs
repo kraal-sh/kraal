@@ -6,7 +6,8 @@ use crate::keymap::Keymap;
 
 impl Server {
     /// Read the configuration again and apply it: keys, theme, sidebar, mouse, pane frames,
-    /// notifications, tools, hints, hooks, production words, contexts and saving scrollback. Panes
+    /// notifications, tools, hints, hooks, production words, contexts, saving scrollback and the
+    /// paste buffers' limits and file. Panes
     /// already open keep their shell and scrollback length; new panes take the new ones. When the
     /// file cannot be read, nothing changes. Returns the warnings.
     pub(super) fn reload_config(&mut self) -> Result<Vec<String>, String> {
@@ -36,7 +37,9 @@ impl Server {
                 let _ = c.out.try_send(frame_bytes(modes.as_bytes()));
             }
         }
+        let persisted = self.config.buffers.persist;
         self.config = config;
+        self.reconfigure_buffers(persisted);
         // Workspace folders, the sidebar's width and pane frames may have changed.
         self.scan_definitions();
         self.relayout();
