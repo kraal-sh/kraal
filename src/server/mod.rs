@@ -475,6 +475,12 @@ pub struct Server {
     /// Panes with output waiting, in round-robin order.
     ready: std::collections::VecDeque<PaneId>,
     ready_set: std::collections::HashSet<PaneId>,
+    /// Room for the output being parsed, reused from one read to the next.
+    output_buf: Vec<u8>,
+    /// Panes printing without a pause that had no output waiting: looked at again at
+    /// `watch_at`, without their readers waking the server meanwhile.
+    watched: Vec<PaneId>,
+    watch_at: Option<Instant>,
     /// Panes whose process exited, with its pid and code: their last output is read first, for
     /// a bounded time (something left in the background may keep writing).
     exiting: HashMap<PaneId, (Option<u32>, Option<i32>, Instant)>,
@@ -499,6 +505,10 @@ type JobDone = Box<dyn FnOnce(&mut Server, Box<dyn std::any::Any + Send>)>;
 const TICK: Duration = Duration::from_millis(400);
 const FRAME: Duration = Duration::from_millis(16);
 const INPUT_FLUSH: Duration = Duration::from_millis(30);
+/// A pane whose last output is younger than this is printing without a pause...
+const STREAM_PAUSE: Duration = Duration::from_millis(2);
+/// ...and its output is looked for this often (frames are drawn no sooner).
+const WATCH_STREAMS: Duration = Duration::from_millis(1);
 
 /// Run a session server in the foreground until it is told to exit.
 pub fn run(session: &str) -> Result<()> {
@@ -615,6 +625,9 @@ pub fn run(session: &str) -> Result<()> {
         limit_events: Default::default(),
         ready: Default::default(),
         ready_set: Default::default(),
+        output_buf: Vec::new(),
+        watched: Vec::new(),
+        watch_at: None,
         exiting: Default::default(),
         focus_reported: Default::default(),
         held_input: Vec::new(),
@@ -764,25 +777,40 @@ impl Server {
         let start = Instant::now();
         let focused: Vec<PaneId> =
             self.clients.values().filter(|c| c.attached).filter_map(|c| self.client_focus(c.id)).collect();
+        let mut data = std::mem::take(&mut self.output_buf);
         for p in focused {
             while start.elapsed() < budget / 2 && rx.is_empty() {
-                let Some(data) = self.panes.get(&p).and_then(|pn| pn.take_output()) else { break };
+                if !self.take_output(p, &mut data) {
+                    break;
+                }
                 self.pane_output(p, &data);
             }
         }
         let mut served = false;
         while !std::mem::replace(&mut served, true) || (start.elapsed() < budget && rx.is_empty()) {
             let Some(id) = self.ready.pop_front() else { break };
-            match self.panes.get(&id).and_then(|pn| pn.take_output()) {
-                Some(data) => {
-                    self.pane_output(id, &data);
-                    self.ready.push_back(id);
-                }
-                None => {
-                    self.ready_set.remove(&id);
-                }
+            if self.take_output(id, &mut data) {
+                self.pane_output(id, &data);
+                self.ready.push_back(id);
+            } else if self.streaming(id) {
+                self.watched.push(id);
+                self.watch_at.get_or_insert(Instant::now() + WATCH_STREAMS);
+            } else {
+                self.ready_set.remove(&id);
             }
         }
+        self.output_buf = data;
+    }
+
+    /// Whether pane `id` printed just now: the server then comes back for its output on its own
+    /// (every [`WATCH_STREAMS`]) instead of being woken for each read of it.
+    fn streaming(&self, id: PaneId) -> bool {
+        self.panes.get(&id).is_some_and(|p| p.last_output.elapsed() < STREAM_PAUSE)
+    }
+
+    /// Take pane `id`'s waiting output into `data`; false when there was none.
+    fn take_output(&self, id: PaneId, data: &mut Vec<u8>) -> bool {
+        self.panes.get(&id).is_some_and(|p| p.take_output_into(data, self.streaming(id)))
     }
 
     fn next_deadline(&self) -> Instant {
@@ -806,11 +834,18 @@ impl Server {
         for (_, _, until) in self.exiting.values() {
             d = d.min(*until);
         }
+        if let Some(w) = self.watch_at {
+            d = d.min(w);
+        }
         d.max(Instant::now() + Duration::from_millis(1))
     }
 
     fn timers(&mut self) {
         let now = Instant::now();
+        if self.watch_at.is_some_and(|t| t <= now) {
+            self.watch_at = None;
+            self.ready.extend(self.watched.drain(..));
+        }
         // Escape sequences that never completed.
         let flush: Vec<ClientId> = self
             .clients
@@ -1066,15 +1101,18 @@ impl Server {
     /// left is read each time, never the endless output of a program left in the background.
     fn finish_exits(&mut self) {
         let ids: Vec<PaneId> = self.exiting.keys().copied().collect();
+        let mut data = std::mem::take(&mut self.output_buf);
         for id in ids {
-            let mut left = 16;
+            let mut left: usize = 64 * 1024;
             let drained = loop {
                 if left == 0 {
                     break false;
                 }
-                let Some(data) = self.panes.get(&id).and_then(|p| p.take_output()) else { break true };
+                if !self.panes.get(&id).is_some_and(|p| p.take_output_into(&mut data, false)) {
+                    break true;
+                }
                 self.pane_output(id, &data);
-                left -= 1;
+                left = left.saturating_sub(data.len());
             };
             let Some(&(pid, code, until)) = self.exiting.get(&id) else { continue };
             if drained || Instant::now() >= until || !self.panes.contains_key(&id) {
@@ -1082,6 +1120,7 @@ impl Server {
                 self.pane_exited(id, pid, code);
             }
         }
+        self.output_buf = data;
     }
 
     /// Act on what feeding output to pane `id` asked for.
