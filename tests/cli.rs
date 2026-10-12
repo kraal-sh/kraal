@@ -3299,24 +3299,38 @@ fn an_image_scrolling_with_the_output_is_not_sent_at_each_step() {
     env.run(&["open", "w"]);
     env.wait_for_text("img", "$");
     let script = env.root.join("img.sh");
-    // The pane is full first: each line after the image scrolls it up a row, 30 times.
+    // The pane is full first: each line after the image scrolls it up a row, 31 times, a few
+    // milliseconds apart. The last word ends no line: the prompt follows it on the same row, and
+    // nothing moves after.
     write_script(
         &script,
         "#!/bin/sh\nseq 60\nprintf '\\033_Ga=T,f=24,s=2,v=2,c=4,r=2,q=2;AAAAAAAAAAAAAAAA\\033\\\\'\necho\n\
-         i=0\nwhile [ $i -lt 30 ]; do echo line $i; sleep 0.02; i=$((i+1)); done\necho stopped\n",
+         i=0\nwhile [ $i -lt 30 ]; do echo line $i; sleep 0.005; i=$((i+1)); done\nprintf stopped\n",
     );
     let mut client = RawClient::attach(&env, "w");
     client.wait_for_screen("\x1b[c");
     client.send(b"\x1bP>|foot(1.21.0)\x1b\\\x1b[6;20;10t\x1b[?62;4;22c");
     std::thread::sleep(Duration::from_millis(300));
     env.run(&["send", "-p", "img", &format!("{}\r", script.display())]);
-    env.wait_for_text("img", "stopped");
-    std::thread::sleep(Duration::from_millis(500));
-    let seen = String::from_utf8_lossy(&client.screen.lock().unwrap()).into_owned();
+    // The frame that shows the last word has the image where it stopped: what erased it
+    // before is in it or earlier. It is drawn there once it has stayed put, however long the
+    // machine takes.
+    client.wait_for_screen("stopped");
+    let start = Instant::now();
+    let seen = loop {
+        let seen = String::from_utf8_lossy(&client.screen.lock().unwrap()).into_owned();
+        let last = seen.rfind("\x1bP0;1;0q");
+        if last.is_some() && last > seen.rfind("\x1b[4X") {
+            break seen;
+        }
+        let drawn = seen.matches("\x1bP0;1;0q").count();
+        assert!(start.elapsed() < Duration::from_secs(10), "not drawn where it stopped ({drawn} sixel images)");
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    // Drawn again at each step, it would be some thirty times. A slow machine may pause long
+    // enough between steps for the image to be drawn where it waits, now and then.
     let drawn = seen.matches("\x1bP0;1;0q").count();
-    assert!((1..=6).contains(&drawn), "{drawn} sixel images for 30 steps");
-    // It shows where it stopped: drawn after it was last erased.
-    assert!(seen.rfind("\x1bP0;1;0q") > seen.rfind("\x1b[4X"), "not drawn where it stopped");
+    assert!(drawn <= 10, "{drawn} sixel images for 31 steps");
 }
 
 #[test]
