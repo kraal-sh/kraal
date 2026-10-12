@@ -5013,6 +5013,31 @@ fn paste_buffers_that_could_not_be_kept_are_written_later() {
 }
 
 #[test]
+fn copies_of_the_paste_buffers_a_killed_server_was_writing_go() {
+    let env = Env::new("buftemp");
+    env.workspace("w", "layout {\n    pane name=\"main\"\n}\n");
+    // What a server killed while it wrote left: temporary copies, named after its pid.
+    let mut gone = Command::new("true").spawn().unwrap();
+    let dead = gone.id();
+    gone.wait().unwrap();
+    let (buffers, sessions) = (env.root.join("state/kraal/buffers"), env.root.join("state/kraal/sessions"));
+    let temp = |dir: &Path, session: &str| dir.join(format!(".{session}.json.{dead}.0.tmp"));
+    for dir in [&buffers, &sessions] {
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(temp(dir, "buftemp"), "hunter2").unwrap();
+    }
+    std::fs::write(temp(&buffers, "other"), "another session's").unwrap();
+    // `kraal forget` deletes them with the rest of the session, and nothing of another.
+    env.run(&["forget"]);
+    assert!(!temp(&buffers, "buftemp").exists() && !temp(&sessions, "buftemp").exists());
+    assert!(temp(&buffers, "other").exists());
+    // A server that starts deletes all of them, buffers kept or not.
+    env.run(&["open", "w"]);
+    wait_gone(&temp(&buffers, "other"));
+    assert!(!temp(&buffers, "other").exists());
+}
+
+#[test]
 fn a_paste_buffer_goes_whole_or_not_at_all() {
     let env = Env::new("bufbig");
     env.workspace("w", "layout {\n    pane name=\"main\"\n}\n");

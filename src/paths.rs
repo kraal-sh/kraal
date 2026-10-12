@@ -135,25 +135,50 @@ pub fn private_runtime_dir() -> std::io::Result<PathBuf> {
 /// whose process no longer runs: `.<file>.<pid>.<n>.tmp` ([`temp_beside`]), left by a kraal that
 /// was killed while it wrote. A file a running process is writing never counts.
 pub fn abandoned_temp(name: &str) -> bool {
-    let Some(inner) = name.strip_prefix('.').and_then(|n| n.strip_suffix(".tmp")) else { return false };
+    abandoned_temp_of(name).is_some()
+}
+
+/// The file whose write left `name` behind, when it is an [`abandoned_temp`].
+fn abandoned_temp_of(name: &str) -> Option<&str> {
+    let inner = name.strip_prefix('.')?.strip_suffix(".tmp")?;
     let mut parts = inner.rsplitn(3, '.');
-    let (Some(n), Some(pid), Some(file)) = (parts.next(), parts.next(), parts.next()) else { return false };
+    let (n, pid, file) = (parts.next()?, parts.next()?, parts.next()?);
     let number = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
     if file.is_empty() || !number(n) || !number(pid) {
-        return false;
+        return None;
     }
-    let Ok(pid) = pid.parse::<libc::pid_t>() else { return false };
+    let pid = pid.parse::<libc::pid_t>().ok()?;
     // SAFETY: signal 0 only checks that the process exists; another user's says EPERM.
-    pid > 0
+    let gone = pid > 0
         && pid as u32 != std::process::id()
         && unsafe { libc::kill(pid, 0) } != 0
-        && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+        && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH);
+    gone.then_some(file)
+}
+
+/// Remove the temporary files that writes of `path` abandoned (see [`abandoned_temp`]): they
+/// may hold what `path` held.
+pub fn remove_abandoned_temps(path: &Path) -> std::io::Result<()> {
+    let (Some(dir), Some(file)) = (path.parent(), path.file_name()) else { return Ok(()) };
+    let file = file.to_string_lossy();
+    match remove_files_in(dir, |name| abandoned_temp_of(name) == Some(&*file)) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        removed => removed.map(drop),
+    }
 }
 
 /// The directories of kraal's own that its atomic writes go to.
 pub fn written_dirs() -> Vec<PathBuf> {
     let state = state_dir();
-    vec![state.join("sessions"), state.join("runs"), state.join("usage"), state, workspaces_dir(), config_dir()]
+    vec![
+        state.join("sessions"),
+        state.join("buffers"),
+        state.join("runs"),
+        state.join("usage"),
+        state,
+        workspaces_dir(),
+        config_dir(),
+    ]
 }
 
 /// A temporary path next to `path` that no other writer uses at the same time, in this process
@@ -907,6 +932,34 @@ mod tests {
         for name in kept.iter().chain([&link]) {
             assert!(std::fs::symlink_metadata(dir.join(name)).is_ok(), "{name}");
         }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn the_abandoned_copies_of_one_file_are_removed_and_no_others() {
+        let dir = std::env::temp_dir().join(format!("kraal-abandoned-of-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut gone = std::process::Command::new("true").spawn().unwrap();
+        let dead = gone.id();
+        gone.wait().unwrap();
+        let me = std::process::id();
+        let mine = format!(".main.json.{dead}.0.tmp");
+        let others = [
+            format!(".main.json.json.{dead}.0.tmp"),
+            format!(".other.json.{dead}.1.tmp"),
+            format!(".main.json.{me}.2.tmp"),
+        ];
+        for name in others.iter().chain([&mine]) {
+            std::fs::write(dir.join(name), "x").unwrap();
+        }
+        remove_abandoned_temps(&dir.join("main.json")).unwrap();
+        assert!(!dir.join(&mine).exists());
+        for name in &others {
+            assert!(dir.join(name).exists(), "{name}");
+        }
+        // Nothing to remove where nothing was written.
+        remove_abandoned_temps(&dir.join("never/main.json")).unwrap();
         let _ = std::fs::remove_dir_all(dir);
     }
 }

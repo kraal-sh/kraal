@@ -1,6 +1,6 @@
 //! Sessions and workspaces: attach, list, open, save, stop.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Result, bail};
 
@@ -30,18 +30,10 @@ pub(super) fn forget(s: &Session) -> Result<()> {
         bail!("session {session} is running; `kraal kill` it first");
     }
     let p = paths::session_state_path(session);
-    let state = match std::fs::remove_file(&p) {
-        Ok(()) => true,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
-        Err(e) => return Err(e.into()),
-    };
+    let state = remove_saved(&p)?;
     let scrollback = crate::persist::forget_scrollback(session)?;
     let buffers_path = paths::buffers_path(session);
-    let buffers = match std::fs::remove_file(&buffers_path) {
-        Ok(()) => true,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
-        Err(e) => return Err(e.into()),
-    };
+    let buffers = remove_saved(&buffers_path)?;
     if state {
         println!("forgot {}", p.display());
     }
@@ -55,6 +47,16 @@ pub(super) fn forget(s: &Session) -> Result<()> {
         println!("nothing saved for {session}");
     }
     Ok(())
+}
+
+/// Delete `path`, and the copies of it that writes killed midway left: whether it was there.
+fn remove_saved(path: &Path) -> std::io::Result<bool> {
+    paths::remove_abandoned_temps(path)?;
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e),
+    }
 }
 
 /// `kraal workspaces`: the open ones with their agents, or the definitions when no server runs.
