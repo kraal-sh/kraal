@@ -3782,6 +3782,27 @@ fn images_reach_a_terminal_that_draws_sixel() {
 }
 
 #[test]
+fn a_terminal_that_tells_its_cell_size_last_draws_sixel_too() {
+    let env = Env::new("sixellate");
+    env.workspace("w", "layout {\n    pane name=\"img\"\n}\n");
+    env.run(&["open", "w"]);
+    env.wait_for_text("img", "$");
+    let script = env.root.join("img.sh");
+    write_script(
+        &script,
+        "#!/bin/sh\nprintf '\\033_Ga=T,f=24,s=2,v=2,c=4,r=2,q=2;AAAAAAAAAAAAAAAA\\033\\\\'\necho shown\n",
+    );
+    let mut client = RawClient::attach(&env, "w");
+    client.wait_for_screen("\x1b[c");
+    // Its device attributes before its cell size, though asked after it.
+    client.send(b"\x1bP>|foot(1.21.0)\x1b\\\x1b[?62;4;22c\x1b[6;20;10t");
+    std::thread::sleep(Duration::from_millis(300));
+    env.run(&["send", "-p", "img", &format!("{}\r", script.display())]);
+    env.wait_for_text("img", "shown");
+    client.wait_for_screen("\x1bP0;1;0q");
+}
+
+#[test]
 fn an_image_scrolling_with_the_output_is_not_sent_at_each_step() {
     let env = Env::new("sixelscroll");
     env.workspace("w", "layout {\n    pane name=\"img\"\n}\n");
