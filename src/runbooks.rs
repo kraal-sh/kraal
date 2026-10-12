@@ -15,6 +15,7 @@ use serde::Deserialize;
 
 use crate::paths;
 use crate::shell;
+use crate::worktree_setup::visible;
 
 /// Where a runbook comes from: the user's own run as they are, a repository's only once the
 /// user approved its content ([`trusted`]).
@@ -52,6 +53,22 @@ impl Runbook {
             Body::Steps(s) => s.description.clone(),
             Body::Markdown { title, blocks } => {
                 format!("{title} · {} step{}", blocks.len(), if blocks.len() == 1 { "" } else { "s" })
+            }
+        }
+    }
+}
+
+impl Source {
+    /// Text of a runbook from there (its file, its name, a step) as the command line prints it:
+    /// the user's own as it is, a repository's with what a terminal would act on or hide
+    /// written out ([`visible`]), so that what is read is what gets approved.
+    pub fn shown(&self, text: &str) -> String {
+        match self {
+            Source::User => text.to_string(),
+            // A line that ends with CR LF is a line.
+            Source::Repo(_) => {
+                let lines = text.split('\n').map(|line| visible(line.strip_suffix('\r').unwrap_or(line)));
+                lines.collect::<Vec<_>>().join("\n")
             }
         }
     }
@@ -332,7 +349,8 @@ pub fn all(repo: Option<&Path>) -> (Vec<Runbook>, Vec<String>) {
     }
     if let Some(root) = repo {
         let repo_name = root.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-        for r in load_dir(&repo_dir(root), &Source::Repo(root.to_path_buf())) {
+        let source = Source::Repo(root.to_path_buf());
+        for r in load_dir(&repo_dir(root), &source) {
             match r {
                 Ok(mut r) => {
                     if out.iter().any(|o: &Runbook| o.name == r.name) {
@@ -340,7 +358,8 @@ pub fn all(repo: Option<&Path>) -> (Vec<Runbook>, Vec<String>) {
                     }
                     out.push(r);
                 }
-                Err(e) => errors.push(format!("{e:#}")),
+                // The error quotes the file.
+                Err(e) => errors.push(source.shown(&format!("{e:#}"))),
             }
         }
     }
@@ -436,6 +455,16 @@ pub fn trusted(r: &Runbook) -> bool {
 
 pub fn trust(r: &Runbook) -> Result<()> {
     trust_content(&r.path, &r.content)
+}
+
+/// Why the runbook `name` of the repository `root` does not run, and how to approve it: said
+/// wherever nobody can be asked (`--yes`, no terminal, a plan run by another program).
+pub fn not_approved(name: &str, root: &Path) -> String {
+    format!(
+        "{name} comes from the repository {} and this version of it is not approved: read it \
+         (`kraal runbook show {name}`), then approve it (`kraal runbook trust {name}`)",
+        paths::shorten_home(root)
+    )
 }
 
 /// Whether this exact content of the repository file `path` (a runbook, a worktree setup) was
@@ -948,5 +977,15 @@ mod tests {
         assert_eq!(r.name, "deploy");
         assert!(matches!(r.source, Source::Repo(_)));
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_repository_runbook_is_shown_with_nothing_hidden() {
+        // An escape sequence that erases the line, a carriage return that writes over it, and
+        // text a terminal would show in another order.
+        let content = "# Notes\r\n```sh\nrm -rf ~ \x1b[2K\rls\n\u{202e}dne\n```\n";
+        assert_eq!(Source::User.shown(content), content, "the user's own file is shown as it is");
+        let shown = Source::Repo(PathBuf::from("/repo")).shown(content);
+        assert_eq!(shown, "# Notes\n```sh\nrm -rf ~ \\u{1b}[2K\\rls\n\\u{202e}dne\n```\n");
     }
 }

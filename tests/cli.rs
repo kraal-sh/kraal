@@ -2035,6 +2035,253 @@ fn keys_typed_while_runbooks_load_stay_in_the_list() {
     let _ = client.wait();
 }
 
+/// The session's answer to `request`, sent through its socket as written: what a kraal of
+/// another release, or any other program, can send.
+fn raw_request(env: &Env, request: serde_json::Value) -> serde_json::Value {
+    use std::io::Read;
+    let socket = env.root.join("run/kraal").join(format!("{}.sock", env.session));
+    let mut stream = std::os::unix::net::UnixStream::connect(socket).unwrap();
+    stream.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    let message = serde_json::json!({ "type": "request", "version": 2, "request": request }).to_string();
+    raw_frame(&mut stream, 0, message.as_bytes());
+    let mut header = [0u8; 5];
+    stream.read_exact(&mut header).unwrap();
+    let mut payload = vec![0u8; u32::from_le_bytes(header[..4].try_into().unwrap()) as usize];
+    stream.read_exact(&mut payload).unwrap();
+    serde_json::from_slice::<serde_json::Value>(&payload).unwrap()["result"].take()
+}
+
+/// A repository's runbook is a file someone else wrote: nothing of it runs before this version
+/// of it is approved, and approving is an act of its own. Listing it, showing it, planning it
+/// and `--yes` (which answers the plan) approve nothing; `kraal runbook trust` does, for the
+/// file as it is.
+#[test]
+fn a_repository_runbook_runs_only_once_approved() {
+    let env = Env::new("rbtrust");
+    let repo = env.root.join("app");
+    let (ran, listed) = (env.root.join("ran"), env.root.join("listed"));
+    let file = repo.join(".kraal/runbooks/deploy.toml");
+    let version = |word: &str| {
+        format!(
+            "description = \"deploy\"\nsteps = [\"echo {word} > {}\"]\n[[param]]\nname = \"V\"\ndefault = \"1\"\nchoices_command = \"touch {}\"\n",
+            ran.display(),
+            listed.display()
+        )
+    };
+    let _ = git_repo(&repo, &[(".kraal/runbooks/deploy.toml", &version("one"))]);
+    env.workspace("w", "layout {\n    pane name=\"main\"\n}\n");
+    env.run(&["open", "w"]);
+    let kraal = |args: &[&str]| {
+        let mut c = env.cmd(&[&["runbook"], args].concat());
+        c.current_dir(&repo).stdin(std::process::Stdio::null()).output().unwrap()
+    };
+    let text =
+        |out: &Output| format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    let store = env.root.join("state/kraal/trusted-runbooks.json");
+    // What a program other than this kraal's command line can do: ask for a plan, then run it.
+    let plan = || {
+        let request =
+            serde_json::json!({ "cmd": "runbook_plan", "path": file, "target": null, "params": [], "pane": null });
+        let plan = raw_request(&env, request);
+        plan["Ok"]["data"]["token"].as_str().unwrap_or_else(|| panic!("no plan: {plan}")).to_string()
+    };
+    let run_plan = |token: &str| raw_request(&env, serde_json::json!({ "cmd": "runbook_run", "token": token }));
+    let refused = |answer: &serde_json::Value| answer["Err"].as_str().is_some_and(|e| e.contains("is not approved"));
+
+    // Reading it runs nothing and approves nothing.
+    for args in [&["list"][..], &["list", "--json"], &["show", "deploy"], &["run", "deploy", "--dry-run"]] {
+        let out = kraal(args);
+        assert!(out.status.success() && text(&out).contains("deploy"), "{args:?}: {}", text(&out));
+        assert!(!ran.exists() && !listed.exists() && !store.exists(), "{args:?}");
+    }
+    // `--yes` answers the plan, and without a terminal nobody answers: neither approves.
+    for args in [&["run", "deploy", "--yes", "--wait"][..], &["run", "deploy"]] {
+        let out = kraal(args);
+        let said = text(&out);
+        assert!(!out.status.success(), "{args:?}: {said}");
+        assert!(said.contains("is not approved") && said.contains("`kraal runbook trust deploy`"), "{args:?}: {said}");
+        assert!(!ran.exists() && !listed.exists() && !store.exists(), "{args:?}");
+    }
+    let answer = run_plan(&plan());
+    assert!(refused(&answer), "{answer}");
+    assert!(!ran.exists() && !store.exists());
+
+    // Approved as it is now: it runs without a question, and so does a plan made before.
+    let before = plan();
+    let out = kraal(&["trust", "deploy"]);
+    assert!(out.status.success() && text(&out).contains("is approved as it is now"), "{}", text(&out));
+    let out = kraal(&["run", "deploy", "--yes", "--wait"]);
+    assert!(out.status.success(), "{}", text(&out));
+    assert_eq!(std::fs::read_to_string(&ran).unwrap(), "one\n");
+    assert!(!listed.exists(), "the command line asks for no choice");
+    std::fs::remove_file(&ran).unwrap();
+    let answer = run_plan(&before);
+    assert!(answer["Ok"].is_object(), "{answer}");
+    wait_until(Duration::from_secs(10), "the plan made before the approval never ran", || {
+        std::fs::read_to_string(&ran).is_ok_and(|t| t == "one\n")
+    });
+
+    // Changed since: that version was never approved.
+    std::fs::write(&file, version("two")).unwrap();
+    let out = kraal(&["run", "deploy", "--yes", "--wait"]);
+    assert!(!out.status.success() && text(&out).contains("`kraal runbook trust deploy`"), "{}", text(&out));
+    let answer = run_plan(&plan());
+    assert!(refused(&answer), "{answer}");
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(std::fs::read_to_string(&ran).unwrap(), "one\n");
+    let out = kraal(&["trust", "deploy"]);
+    assert!(out.status.success(), "{}", text(&out));
+    let out = kraal(&["run", "deploy", "--yes", "--wait"]);
+    assert!(out.status.success(), "{}", text(&out));
+    assert_eq!(std::fs::read_to_string(&ran).unwrap(), "two\n");
+
+    // What these commands print of a repository's files, a terminal acts on none of it: an
+    // escape sequence in a description, in a step, or in a file that cannot be read.
+    let odd = "description = \"clear \\u001b[2J\"\nsteps = [\"echo \\u001b[2K\"]\n";
+    std::fs::write(repo.join(".kraal/runbooks/odd.toml"), odd).unwrap();
+    std::fs::write(repo.join(".kraal/runbooks/bad.toml"), "steps = \x1b[2J\n").unwrap();
+    let said = text(&kraal(&["list"]));
+    assert!(said.contains("clear \\u{1b}[2J") && said.contains("steps = \\u{1b}[2J"), "{said:?}");
+    assert!(!said.contains('\x1b'), "{said:?}");
+    let said = text(&kraal(&["run", "odd", "--dry-run"]));
+    assert!(said.contains("1. echo \\u{1b}[2K") && !said.contains('\x1b'), "{said:?}");
+    assert!(!text(&kraal(&["show", "odd"])).contains('\x1b'));
+
+    // The user's own runbooks need no approval.
+    std::fs::create_dir_all(env.root.join("config/kraal/runbooks")).unwrap();
+    std::fs::write(env.root.join("config/kraal/runbooks/mine.toml"), "steps = [\"true\"]\n").unwrap();
+    let out = kraal(&["trust", "mine"]);
+    assert!(out.status.success() && text(&out).contains("needs no approval"), "{}", text(&out));
+    let out = kraal(&["run", "mine", "--yes", "--wait"]);
+    assert!(out.status.success(), "{}", text(&out));
+}
+
+/// In a terminal, `kraal runbook run` asks before a repository runbook nobody approved: the
+/// question shows the file, with what a terminal would hide written out, names the approval,
+/// and comes before the plan's.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_repository_runbook_is_approved_by_a_question_of_its_own() {
+    let env = Env::new("rbask");
+    let repo = env.root.join("app");
+    let ran = env.root.join("ran");
+    // A zero-width space, which a terminal shows nothing of.
+    let runbook = format!("steps = [\"echo ran > {} #\u{200b}\"]\n", ran.display());
+    let _ = git_repo(&repo, &[(".kraal/runbooks/deploy.toml", &runbook)]);
+    env.workspace("w", "layout {\n    pane name=\"main\"\n}\n");
+    env.run(&["open", "w"]);
+    let store = env.root.join("state/kraal/trusted-runbooks.json");
+    let run = |input: &[u8]| {
+        let mut c = env.cmd(&["runbook", "run", "deploy", "--wait"]);
+        c.current_dir(&repo);
+        in_terminal(c, input)
+    };
+
+    let shown = run(b"n\n");
+    assert!(shown.contains("Trust this version?") && shown.contains("#\\u{200b}"), "{shown}");
+    assert!(!shown.contains("Run it?"), "{shown}");
+    assert!(!ran.exists() && !store.exists());
+    // Approved, then its plan declined: nothing runs, and it stays approved.
+    let shown = run(b"y\nn\n");
+    assert!(shown.contains("Trust this version?") && shown.contains("Run it?"), "{shown}");
+    assert!(!ran.exists() && store.exists());
+    let shown = run(b"y\n");
+    assert!(!shown.contains("Trust this version?") && shown.contains("finished: 1 ok"), "{shown}");
+    assert!(ran.exists());
+}
+
+/// From the list of runbooks, a repository runbook asks to be trusted before anything of it
+/// runs, its `choices_command` included; a no leaves it as it was, and a change asks again. A
+/// Markdown one asks before its first block is typed.
+#[test]
+fn the_runbook_list_asks_before_a_repository_runbook_does_anything() {
+    let env = Env::new("rbpick");
+    let repo = env.root.join("app");
+    let (ran, listed) = (env.root.join("ran"), env.root.join("listed"));
+    let file = repo.join(".kraal/runbooks/deploy.toml");
+    let version = |word: &str| {
+        format!(
+            "steps = [\"echo {word} $V > {}\"]\n[[param]]\nname = \"V\"\nchoices_command = \"touch {}; echo first\"\n",
+            ran.display(),
+            listed.display()
+        )
+    };
+    let _ = git_repo(
+        &repo,
+        &[
+            (".kraal/runbooks/deploy.toml", &version("one")),
+            (".kraal/runbooks/notes.md", "# Notes\n\n```sh\necho from-\"notes\"\n```\n"),
+        ],
+    );
+    env.workspace("w", &format!("layout {{\n    pane name=\"shell\" cwd={:?}\n}}\n", repo.display().to_string()));
+    env.run(&["open", "w"]);
+    let store = env.root.join("state/kraal/trusted-runbooks.json");
+    let mut client = RawClient::attach(&env, "w");
+    // The list has the repository's runbooks once git has seen it.
+    client.wait_for_screen("⎇ main");
+    let pick = |client: &mut RawClient, name: &str| {
+        env.run(&["focus", "shell"]);
+        client.send(b"\x02Rb");
+        client.wait_for_row("Runbooks");
+        client.send(name.as_bytes());
+        client.wait_for_row("repository app");
+        client.send(b"\r");
+    };
+    let gone = |client: &RawClient, text: &str| {
+        client.wait_for_rows(&format!("without {text:?}"), |rows| !rows.iter().any(|r| r.contains(text)));
+    };
+
+    pick(&mut client, "deploy");
+    client.wait_for_row("Trust the runbook deploy");
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(!listed.exists() && !ran.exists() && !store.exists(), "something ran before the answer");
+    client.send(b"n");
+    gone(&client, "Trust the runbook deploy");
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(!listed.exists() && !ran.exists() && !store.exists(), "a no approved or ran something");
+
+    // Approved: its choices are listed, then its plan is shown.
+    pick(&mut client, "deploy");
+    client.wait_for_row("Trust the runbook deploy");
+    client.send(b"y");
+    gone(&client, "Trust the runbook deploy");
+    client.wait_for_row("first");
+    assert!(listed.exists() && !ran.exists());
+    client.send(b"\r");
+    client.wait_for_row("Run deploy on this machine?");
+    client.send(b"y");
+    wait_until(Duration::from_secs(10), "the approved runbook never ran", || {
+        std::fs::read_to_string(&ran).is_ok_and(|t| t == "one first\n")
+    });
+
+    // Changed since: asked again, before its choices are listed.
+    std::fs::remove_file(&listed).unwrap();
+    std::fs::write(&file, version("two")).unwrap();
+    pick(&mut client, "deploy");
+    client.wait_for_row("Trust the runbook deploy");
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(!listed.exists());
+    client.send(b"n");
+    gone(&client, "Trust the runbook deploy");
+
+    // A document: its first block waits for the answer; approved from the command line, the
+    // block is typed without a question.
+    pick(&mut client, "notes");
+    client.wait_for_row("1. Notes");
+    client.send(b"\r");
+    client.wait_for_row("From the repository");
+    client.send(b"n");
+    gone(&client, "From the repository");
+    assert!(!env.run(&["read", "-p", "shell"]).contains("from-notes"));
+    let out = env.cmd(&["runbook", "trust", "notes"]).current_dir(&repo).output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    env.run(&["focus", "shell"]);
+    client.send(b"\x02Rb");
+    client.wait_for_row("1. Notes");
+    client.send(b"\r");
+    env.wait_for_text("shell", "from-notes");
+}
+
 /// A timed-out target is stopped to its last process, by its process group: a command started
 /// again in its pane meanwhile is not touched, and closing its pane does not let what it left
 /// behind escape.
@@ -5317,6 +5564,9 @@ fn in_terminal(cmd: Command, input: &[u8]) -> String {
         .join(" ");
     let mut c = Command::new("script");
     c.args(["-q", "-f", "-c", &line, "/dev/null"]);
+    if let Some(dir) = cmd.get_current_dir() {
+        c.current_dir(dir);
+    }
     for (k, v) in cmd.get_envs() {
         match v {
             Some(v) => c.env(k, v),

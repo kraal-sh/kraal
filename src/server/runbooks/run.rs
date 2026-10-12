@@ -21,9 +21,6 @@ impl Server {
     /// plan said. `asker` hears how it went; an `Err` here means nothing was started.
     pub(in crate::server) fn launch_runbook(&mut self, d: Draft, asker: Asker) -> Result<()> {
         self.check_launch(&d)?;
-        if matches!(d.runbook.source, Source::Repo(_)) && !runbooks::trusted(&d.runbook) {
-            runbooks::trust(&d.runbook)?;
-        }
         let specs = self.launch_specs(&d)?;
         let labels: Vec<String> = specs.iter().map(|(l, _)| l.clone()).collect();
         let rolling = if d.steps.rolling == 0 { specs.len() } else { d.steps.rolling.min(specs.len()) };
@@ -86,8 +83,10 @@ impl Server {
         if d.targets.as_ref().is_none_or(|t| t.is_empty()) {
             bail!("nowhere to run {}", d.runbook.name);
         }
-        if !d.trusted {
-            bail!("{} from a repository has not been approved", d.runbook.name);
+        if let Source::Repo(root) = &d.runbook.source
+            && !d.trusted
+        {
+            bail!(runbooks::not_approved(&d.runbook.name, root));
         }
         // The plan said where it runs: a pane that moved (another server, directory, production
         // status) since is not what was approved.

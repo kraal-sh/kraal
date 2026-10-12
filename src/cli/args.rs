@@ -512,7 +512,11 @@ pub enum RunbookCmd {
     },
     /// Show a runbook: its file and what it would run.
     Show { name: String },
-    /// Run a step runbook in kraal: shows the plan, asks, then runs it.
+    /// Approve a repository's runbook as it is now, so that it can run: read it first (`kraal
+    /// runbook show`). When it changes, it needs your approval again.
+    Trust { name: String },
+    /// Run a step runbook in kraal: shows the plan, asks, then runs it. A repository's runbook
+    /// that is new or changed is shown first, for you to approve.
     Run {
         name: String,
         /// Where to run it: a server, user@host or @group.
@@ -521,7 +525,8 @@ pub enum RunbookCmd {
         /// A parameter, NAME=value (repeat for several).
         #[arg(short, long = "param")]
         params: Vec<String>,
-        /// Run without asking.
+        /// Run without asking about the plan. It approves nothing: a repository's runbook that
+        /// is new or changed is refused (`kraal runbook trust`).
         #[arg(short, long)]
         yes: bool,
         /// Show the plan only.
