@@ -594,6 +594,15 @@ fn first_in_use<T>(term: &Term<T>) -> i32 {
     line - grid.screen_lines() as i32
 }
 
+/// A region below the top line that scrolls takes a view scrolled back further up, as if its
+/// rows went into the history (alacritty's grid), though none did: the view goes no higher than
+/// the top of the history, where rows can be read.
+pub(super) fn keep_view_in_history<T: EventListener>(term: &mut Term<T>) {
+    if term.grid().display_offset() > term.grid().history_size() {
+        term.scroll_display(Scroll::Top);
+    }
+}
+
 /// Rows went from the top of the grid: the copy-mode cursor stays on it, and a selection that
 /// was on them goes.
 fn keep_on_grid<T>(term: &mut Term<T>) {
@@ -649,13 +658,20 @@ impl TermPane {
         self.archive.rested = false;
         let mut feed = Feed { term: &mut self.term, archive: &mut self.archive, seen: &mut self.commands.history_seen };
         self.parser.advance(&mut feed, bytes);
-        self.view_moved();
+        self.parsed();
     }
 
     /// Give the emulator the output a synchronized update holds.
     pub(super) fn stop_sync(&mut self) {
         let mut feed = Feed { term: &mut self.term, archive: &mut self.archive, seen: &mut self.commands.history_seen };
         self.parser.stop_sync(&mut feed);
+        self.parsed();
+    }
+
+    /// Output was parsed: the view is brought back within the history, and rows that moved
+    /// under it are told.
+    fn parsed(&mut self) {
+        keep_view_in_history(&mut self.term);
         self.view_moved();
     }
 
@@ -1218,6 +1234,18 @@ mod tests {
         let t = b.term();
         let bytes = t.archive.lines().bytes();
         assert!(bytes < t.archive.lines().len() * 60, "{bytes} bytes for {} lines", t.archive.lines().len());
+    }
+
+    #[test]
+    fn a_region_scrolling_under_a_view_scrolled_back_keeps_it_within_the_history() {
+        let mut b = Both::new();
+        b.feed(sample(100).as_bytes());
+        b.pane.scroll(1);
+        // The region below the top line scrolls: no row goes into the history.
+        b.feed(format!("\x1b[2;{ROWS}r\x1b[{ROWS};1H{}", "\n".repeat(100)).as_bytes());
+        assert!(b.pane.refresh_screen(COLS, ROWS).is_some());
+        let grid = b.term().term.grid();
+        assert!(grid.display_offset() <= grid.history_size(), "{} > {}", grid.display_offset(), grid.history_size());
     }
 
     #[test]
