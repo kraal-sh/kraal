@@ -83,7 +83,7 @@ and every menu can move to the keys you want.
 
 ## Workspaces as files
 
-Declare a workspace once and open it in one command (`kraal shop`): tabs, splits, servers,
+Declare a workspace once and open it in one command (`kraal shop`): tabs, splits, stacks, servers,
 commands, agents and live previews, in a KDL file.
 
 ```kdl

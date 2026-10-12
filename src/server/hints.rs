@@ -95,9 +95,9 @@ impl Server {
     /// What a client sees of a pane right now, at its place on screen.
     fn pane_snapshot(&mut self, client: ClientId, pane: PaneId) -> Option<Box<ratatui::buffer::Buffer>> {
         let wi = self.clients.get(&client).and_then(|c| self.ws_index(c.workspace))?;
-        let (_, outer, floating) =
+        let (_, frame, _) =
             self.tab_rects(self.workspaces[wi].tab(), self.layout_area).into_iter().find(|(p, _, _)| *p == pane)?;
-        let inner = self.inner(outer, floating);
+        let inner = self.inner(frame);
         let mut buf = ratatui::buffer::Buffer::empty(inner);
         let mut links = crate::ansi::Links::new();
         self.panes.get_mut(&pane)?.render(inner, &mut buf, &mut links);

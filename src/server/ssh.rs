@@ -7,7 +7,7 @@ use anyhow::{Context, Result};
 
 use super::ui::{PickAction, PickItem, Picker, PickerKind};
 use super::{Server, Tab};
-use crate::layout::{Axis, Node, PaneId};
+use crate::layout::{PaneId, grid};
 use crate::pane::PaneSpec;
 use crate::paths;
 use crate::protocol::Placement;
@@ -286,29 +286,6 @@ fn group_workspace_name(group: &str, remote: &[String]) -> String {
     if remote.is_empty() { group.to_string() } else { format!("{group}: {}", remote.join(" ")) }
 }
 
-/// Tile panes in a grid: rows of up to `cols` panes, columns wider than tall like terminal cells.
-pub fn grid(ids: &[PaneId]) -> Node {
-    let n = ids.len();
-    if n == 1 {
-        return Node::Leaf(ids[0]);
-    }
-    let cols = ((n as f64 * 1.5).sqrt().ceil() as usize).clamp(1, n);
-    let rows: Vec<Node> = ids
-        .chunks(cols)
-        .map(|row| {
-            if row.len() == 1 {
-                Node::Leaf(row[0])
-            } else {
-                Node::Split { axis: Axis::Row, children: row.iter().map(|id| (Node::Leaf(*id), 1.0)).collect() }
-            }
-        })
-        .collect();
-    if rows.len() == 1 {
-        return rows.into_iter().next().unwrap();
-    }
-    Node::Split { axis: Axis::Column, children: rows.into_iter().map(|r| (r, 1.0)).collect() }
-}
-
 /// Hosts from `~/.ssh/config` (no wildcards).
 pub fn ssh_config_hosts() -> Vec<String> {
     let Some(home) = dirs::home_dir() else { return Vec::new() };
@@ -359,19 +336,5 @@ mod tests {
         assert_eq!(march, "prod: journalctl -fu nginx --since=2020-03-01");
         assert_ne!(march, name("journalctl -fu nginx --since=2020-04-01"));
         assert_eq!(group_workspace_name("prod", &[]), "prod");
-    }
-
-    #[test]
-    fn grids() {
-        assert_eq!(grid(&[1]), Node::Leaf(1));
-        let g = grid(&[1, 2, 3, 4]);
-        let Node::Split { axis: Axis::Column, children } = &g else { panic!("{g:?}") };
-        assert_eq!(children.len(), 2);
-        let g = grid(&(1..=9).collect::<Vec<_>>());
-        assert_eq!(g.leaves(), (1..=9).collect::<Vec<_>>());
-        let Node::Split { children, .. } = &g else { panic!() };
-        assert_eq!(children.len(), 3);
-        let g = grid(&[1, 2]);
-        assert!(matches!(g, Node::Split { axis: Axis::Row, .. }));
     }
 }

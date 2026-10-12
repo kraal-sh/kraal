@@ -829,6 +829,105 @@ fn save_writes_a_definition_that_reopens() {
     assert!(!env.root.join("config/kraal/escape.kdl").exists());
 }
 
+/// Panes stacked from the keys share one place and keep one size; the one the focus reaches
+/// opens (a key, a click on its row); a pane comes out again; one key goes through the layouts;
+/// stacks and the layout chosen survive a restart, and a saved workspace keeps its stacks.
+#[test]
+fn stacks_and_layouts_from_the_keys() {
+    let env = Env::new("stacks");
+    let config = env.root.join("config/kraal/config.toml");
+    let text = std::fs::read_to_string(&config).unwrap();
+    std::fs::write(&config, format!("{text}[sidebar]\nvisible = false\n")).unwrap();
+    env.workspace(
+        "w",
+        "layout {\n    pane split_direction=\"vertical\" {\n        pane name=\"alpha\"\n        pane name=\"bravo\"\n        pane name=\"charlie\"\n    }\n}\n",
+    );
+    env.run(&["open", "w"]);
+    let panes = || -> Vec<serde_json::Value> {
+        let v: serde_json::Value = serde_json::from_str(&env.run(&["panes", "--json"])).unwrap();
+        v.as_array().unwrap().iter().filter(|p| p["workspace"] == "w").cloned().collect()
+    };
+    let size = |name: &str| -> (u64, u64) {
+        let p = panes().into_iter().find(|p| p["name"] == name).unwrap();
+        (p["cols"].as_u64().unwrap(), p["rows"].as_u64().unwrap())
+    };
+    let focused = || -> String {
+        let p = panes().into_iter().find(|p| p["focused"] == true);
+        p.and_then(|p| p["name"].as_str().map(String::from)).unwrap_or_default()
+    };
+    let until = |what: &str, done: &dyn Fn() -> bool| {
+        let start = Instant::now();
+        while !done() {
+            assert!(start.elapsed() < Duration::from_secs(10), "{what}: {}", env.run(&["panes", "--json"]));
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    };
+    let mut client = RawClient::attach(&env, "w");
+    client.wait_for_message("\"attached\"");
+    // 120×40: the panes take rows 1 to 39, a third of the width each.
+    until("three columns", &|| size("alpha") == (37, 37));
+    env.run(&["focus", "bravo"]);
+
+    // Bravo goes right, onto charlie: bravo open in two thirds of the width, charlie folded to
+    // the row under it, of the same size.
+    client.send(b"\x02Ps\x1b[C");
+    until("stacked", &|| size("bravo") == (78, 36) && size("charlie") == (78, 36));
+    assert_eq!(focused(), "bravo");
+    // Down goes to the next pane of the stack, which opens.
+    client.send(b"\x1b[1;3B");
+    until("charlie focused", &|| focused() == "charlie");
+    // Bravo is folded to the top row of the stack now: a click on it opens it.
+    client.send(b"\x1b[<0;61;2M\x1b[<0;61;2m");
+    until("bravo clicked", &|| focused() == "bravo");
+    assert_eq!(size("charlie"), (78, 36), "opening a pane resizes nothing");
+    // Out of the stack again: above charlie, each half of the height.
+    client.send(b"\x02Pu");
+    until("unstacked", &|| size("bravo") == (78, 17) && size("charlie") == (78, 17));
+    assert_eq!(focused(), "bravo");
+
+    // The layouts, in turn: even columns, even rows, the main pane left, the others stacked.
+    client.send(b"\x02Pl");
+    until("columns", &|| size("alpha") == (37, 37) && size("charlie") == (38, 37));
+    client.send(b"\x02Pl");
+    until("rows", &|| size("alpha").0 == 118 && size("charlie").0 == 118);
+    client.send(b"\x02Pl");
+    until("main left", &|| size("alpha") == (69, 37) && size("bravo").0 == 46);
+    client.send(b"\x02Pl");
+    until("main left, stacked", &|| size("bravo") == (46, 36) && size("charlie") == (46, 36));
+    assert_eq!(focused(), "bravo");
+
+    // A restart brings the stack and the layout back.
+    drop(client);
+    env.run(&["kill"]);
+    let state = std::fs::read_to_string(env.state_file()).unwrap();
+    assert!(state.contains("\"stacked\": true") && state.contains("\"preset\": \"main-left-stacked\""), "{state}");
+    env.run(&["open", "w"]);
+    until("restored", &|| panes().len() == 3);
+    until("stacked again", &|| size("bravo") == (46, 36) && size("charlie") == (46, 36) && size("alpha") == (69, 37));
+    // The layout is still the tab's: a pane that comes joins the stack.
+    env.run(&["run", "-t", "alpha", "--name", "delta", "--", "sh"]);
+    until("delta stacked", &|| panes().len() == 4 && size("delta") == (46, 35) && size("bravo") == (46, 35));
+
+    // Saved, the stack is `stacked=true`, with the pane open `expanded=true`, and opens as one.
+    env.run(&["save", "copy", "--workspace", "w"]);
+    let saved = std::fs::read_to_string(env.root.join("config/kraal/workspaces/copy.kdl")).unwrap();
+    assert!(saved.contains("pane stacked=true") && saved.contains("expanded=true"), "{saved}");
+    env.run(&["open", "copy"]);
+    let copies = || -> Vec<(u64, u64)> {
+        let v: serde_json::Value = serde_json::from_str(&env.run(&["panes", "--json"])).unwrap();
+        let mut sizes: Vec<(u64, u64)> = v
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|p| p["workspace"] == "copy")
+            .map(|p| (p["cols"].as_u64().unwrap(), p["rows"].as_u64().unwrap()))
+            .collect();
+        sizes.sort();
+        sizes
+    };
+    until("the copy opens stacked", &|| copies() == [(46, 35), (46, 35), (46, 35), (69, 37)]);
+}
+
 #[test]
 fn commands_run_in_a_pane_stay_in_its_session() {
     let a = Env::new("sessa");

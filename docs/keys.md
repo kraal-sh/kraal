@@ -21,7 +21,7 @@ any keyboard layout.
 | workspaces | `w` choose one | `W`: `w` choose, `n` new, `←`/`→` previous/next, `e` rename, `s` save the layout, `r` restart the session (on the kraal installed now), `x` close |
 | agents | `a` start one on an account | `A`: `a` start, `g` go to the agent needing you, `c` change account |
 | tabs | `t` new tab | `T`: `t` new, `←`/`→` previous/next, `e` rename, `x` close |
-| panes | `p` find a pane | `P`: `p` find, `n` new, `→`/`↓` split, `e` rename, `r` resize with the arrows, `f` floating, `x` close |
+| panes | `p` find a pane | `P`: `p` find, `n` new, `→`/`↓` split, `e` rename, `r` resize with the arrows, `f` floating, `l` next layout, `s` then an arrow stack with the pane on that side, `u` unstack, `x` close |
 | view | `v` copy mode: scroll and select | `V`: `v` copy mode, `g` search the output, `o` links and paths, `c` copy the last command's output, `p` paste buffers, `f` floating panes, `l` sidebar, `j` message log |
 | files | `f` file manager | `F`: `f` file manager, `p` preview a file, `u`/`d` upload/download |
 | run | `r` tools where the pane is | `R`: `r` tools, `b` runbooks, `g` git and worktrees |
@@ -47,6 +47,25 @@ Without the prefix: `alt+arrows` move the focus (left/right at the edge go to th
 
 `[keys] preset = "classic"` switches to single-key commands (`%` `"` `c` `n` `p`
 `o` `s` `=`…), still with the menu.
+
+## Stacks and layouts
+
+Several panes can share one place as a **stack**: one is open, the others are folded to the top
+line of their frame, one row each (name, branch, agent state, PROD badge, as on any frame), those
+before it above and those after it below. `ctrl+b P s` then an arrow stacks the focused pane with
+the pane on that side; `ctrl+b P u` takes it out again. A folded pane opens when it gets the focus,
+whatever brings it there: `alt+↑`/`alt+↓` (they go through the stack first), a click on its row,
+the pane finder, `alt+a`. Opening one resizes nothing: every pane of a stack has the size of the
+open one. A stack resizes as one tile; `n` from a stacked pane adds a pane to its stack, a split
+splits the whole stack's place.
+
+`ctrl+b P l` arranges the tab's panes in the next layout, in their order and with the focus where
+it was: even columns, even rows, the first pane on the left and the others in a column on the
+right, the same with the others stacked, the first pane on top and the others in a row below, a
+grid. The tab keeps its layout as panes come and go, until you resize, split or stack by hand.
+
+In the classic preset: `E` the next layout, `M` then an arrow (or `hjkl`) to stack, `u` to
+unstack.
 
 ## Lists, fields and questions
 
@@ -82,7 +101,7 @@ sidebar, mouse, frames, tools, hints, hooks; new panes take a new shell or scrol
 ## Mouse
 
 The mouse works too: click to focus panes, tabs, workspaces and agents (a click on the workspace
-name opens the list); drag borders to resize; drag floating panes by their title; wheel to scroll
+name opens the list, a click on a folded pane's row opens it); drag borders to resize; drag floating panes by their title; wheel to scroll
 back; drag to select and copy (double click selects a word, triple click a line); Ctrl+click opens
 a link (OSC 8 links stay clickable, and plain URLs work too). Hold Shift to use your terminal's own
 selection.

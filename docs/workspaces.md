@@ -9,7 +9,7 @@ How kraal is organised, and how a workspace is declared once in a file and opene
 - A session holds **workspaces** (listed in the sidebar, which shows up once there is more than
   the one workspace to see: other workspaces, agents, ports, tunnels), each with **tabs** (named
   after their focused pane until you rename them), each with **panes**:
-  tiled, or floating on top.
+  tiled (some may share a place as a stack, one open at a time), or floating on top.
 - A pane is a terminal (a shell, or a command such as `ssh host`), or a **preview** of a file:
   rendered Markdown, an image, text, or a directory listing. Previews reload when the file changes.
 - A **command pane** stays open when its program exits, showing the exit code: press Enter to run
@@ -66,9 +66,28 @@ layout {
 }
 ```
 
-`split_direction="vertical"` places children side by side, `"horizontal"` stacks them. Sizes are
-percentages or cells. Besides a command, a pane can say `agent="<name>"` to start an agent in a
-shell, or `preview="<path>"` to show a file. `ctrl+b W s` or `kraal save <name>` writes the layout
-back as a file (`<name>.kdl` in the definitions directory; the file it replaces is kept as
-`.kdl.bak`). An agent started on an account is saved as `agent="claude:pro"` with its arguments,
-and a command that has not run yet keeps `start_suspended=true`.
+`split_direction="vertical"` places children side by side, `"horizontal"` one above the other.
+Sizes are percentages or cells. Besides a command, a pane can say `agent="<name>"` to start an
+agent in a shell, or `preview="<path>"` to show a file.
+
+`stacked=true` makes a pane's children a stack, as in Zellij: they share its place, one open and
+the others folded to the top line of their frame ([Stacks and layouts](keys.md#stacks-and-layouts)).
+The focused child is the one open, else the one marked `expanded=true`, else the first:
+
+```kdl
+layout {
+    pane split_direction="vertical" {
+        pane agent="claude" size="60%"
+        pane stacked=true {
+            pane name="tests" command="cargo" expanded=true { args "watch" "-x" "test"; }
+            pane name="logs" command="tail" { args "-f" "app.log"; }
+            pane name="shell"
+        }
+    }
+}
+```
+
+`ctrl+b W s` or `kraal save <name>` writes the layout back as a file (`<name>.kdl` in the
+definitions directory; the file it replaces is kept as `.kdl.bak`), stacks included. An agent
+started on an account is saved as `agent="claude:pro"` with its arguments, and a command that has
+not run yet keeps `start_suspended=true`.

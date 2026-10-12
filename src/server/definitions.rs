@@ -142,6 +142,20 @@ impl Server {
                 }
                 Node::Leaf(id)
             }
+            LayoutNode::Stack { panes, expanded } => {
+                let mut ids = Vec::new();
+                for def in panes {
+                    let id = self.spawn_from_def(def, cwd)?;
+                    if def.focus {
+                        *focus = Some(id);
+                    }
+                    ids.push(id);
+                }
+                let open = ids.get(*expanded).or(ids.first()).copied().context("an empty stack")?;
+                let mut n = Node::Stack { panes: ids, open };
+                n.normalize();
+                n
+            }
             LayoutNode::Split { axis, children } => {
                 let len = match axis {
                     Axis::Row => area.width,
@@ -370,6 +384,10 @@ impl Server {
         fn conv(n: &Node, focus: Option<PaneId>, to_def: &dyn Fn(PaneId, bool) -> workspace::PaneDef) -> LayoutNode {
             match n {
                 Node::Leaf(id) => LayoutNode::Pane(to_def(*id, focus == Some(*id))),
+                Node::Stack { panes, open } => LayoutNode::Stack {
+                    panes: panes.iter().map(|id| to_def(*id, focus == Some(*id))).collect(),
+                    expanded: panes.iter().position(|id| id == open).unwrap_or(0),
+                },
                 Node::Split { axis, children } => {
                     let sum: f32 = children.iter().map(|(_, w)| *w).sum::<f32>().max(f32::EPSILON);
                     LayoutNode::Split {
