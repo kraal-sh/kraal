@@ -170,8 +170,14 @@ impl Picture {
     /// images are not its to drop): only when it fits in what the quota has left.
     pub fn within_quota(png: Vec<u8>, width: u32, height: u32, shared: &Arc<Shared>) -> Option<Arc<Picture>> {
         let cost = png.len() + PICTURE_COST;
-        let fits = |used: usize| used.checked_add(cost).filter(|total| *total <= shared.quota);
-        shared.used.fetch_update(Ordering::Relaxed, Ordering::Relaxed, fits).ok()?;
+        let mut used = shared.used.load(Ordering::Relaxed);
+        loop {
+            let total = used.checked_add(cost).filter(|total| *total <= shared.quota)?;
+            match shared.used.compare_exchange_weak(used, total, Ordering::Relaxed, Ordering::Relaxed) {
+                Ok(_) => break,
+                Err(now) => used = now,
+            }
+        }
         Some(Arc::new(Picture { png, width, height, shared: shared.clone() }))
     }
 
