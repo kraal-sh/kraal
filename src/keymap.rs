@@ -50,6 +50,7 @@ pub enum Action {
     RenameWorkspace,
     CloseWorkspace,
     SaveWorkspace,
+    Restart,
     AgentPicker,
     NextAttention,
     SwitchAccount,
@@ -116,6 +117,7 @@ const ACTIONS: &[(Action, &str, &str)] = &[
     (RenameWorkspace, "rename_workspace", "Rename workspace"),
     (CloseWorkspace, "close_workspace", "Close workspace"),
     (SaveWorkspace, "save_workspace", "Save workspace layout"),
+    (Restart, "restart", "Restart the session (on the kraal installed now; programs stop)"),
     (AgentPicker, "agent_picker", "Start an agent"),
     (NextAttention, "next_attention", "Next agent needing you"),
     (SwitchAccount, "switch_account", "Change the agent's account"),
@@ -268,6 +270,7 @@ pub const KRAAL: Preset = Preset {
         ("rename_workspace", &["{workspaces} e"]),
         ("save_workspace", &["{workspaces} s"]),
         ("close_workspace", &["{workspaces} x"]),
+        ("restart", &["{workspaces} r"]),
         ("next_attention", &["{agents} g"]),
         ("switch_account", &["{agents} c"]),
         ("upload", &["{servers} u", "{files} u"]),
@@ -1063,6 +1066,9 @@ mod tests {
         assert_eq!(km.hint(SshPicker).as_deref(), Some("ctrl+b s"));
         assert_eq!(km.hint(NewPane).as_deref(), Some("alt+n"));
         assert_eq!(km.menu_hint("broadcast").as_deref(), Some("ctrl+b B"));
+        // A restart is about the whole session: in the Workspaces menu, under its first letter.
+        assert_eq!(km.hint(Restart).as_deref(), Some("ctrl+b W r"));
+        assert!(km.menu(&[key('W')]).iter().any(|e| e.label == "Restart the session"));
         // The reference covers the menus and the modes.
         let reference = km.reference(false);
         assert!(reference.iter().any(|(t, _)| t == "Servers (ctrl+b S)"), "{reference:?}");

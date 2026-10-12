@@ -238,6 +238,36 @@ pub fn load(session: &str) -> Result<Option<SessionSnapshot>> {
     Ok(Some(snap))
 }
 
+/// What a restart stops in a pane, if anything, given what runs in it other than a shell at its
+/// prompt (`program`, its command line). A shell at its prompt comes back in its directory, an
+/// SSH shell reconnects and an agent resumes its conversation (a turn in progress stops); any
+/// other program stops, and a pane's own command waits for Enter after the restart.
+pub fn stops_on_restart(pane: &crate::protocol::PaneInfo, program: Option<&[String]>) -> Option<String> {
+    if pane.kind != "terminal" || pane.suspended || pane.exit_code.is_some() {
+        return None;
+    }
+    if let Some(agent) = &pane.agent {
+        return (pane.state == crate::agent::AgentState::Working)
+            .then(|| format!("{agent}: the turn in progress (the conversation resumes)"));
+    }
+    let ssh_shell = pane.command.first().is_some_and(|c| c.rsplit('/').next() == Some("ssh"))
+        && !crate::servers::ssh_runs_command(&pane.command[1..]);
+    if ssh_shell {
+        return None;
+    }
+    let argv = program.filter(|p| !p.is_empty()).or((!pane.command.is_empty()).then_some(pane.command.as_slice()))?;
+    let line = crate::shell::join(argv);
+    Some(if line.chars().count() > 60 { format!("{}…", line.chars().take(59).collect::<String>()) } else { line })
+}
+
+/// A line of the list of what a restart stops: the pane, then `what`.
+pub fn stopping_line(pane: &crate::protocol::PaneInfo, what: &str) -> String {
+    match &pane.name {
+        Some(name) => format!("{what}  (pane {} \"{name}\" in {})", pane.id, pane.workspace),
+        None => format!("{what}  (pane {} in {})", pane.id, pane.workspace),
+    }
+}
+
 /// Shell input that resumes an agent conversation.
 pub fn resume_command(agent: &str, session: &str) -> Option<String> {
     let safe = session.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
@@ -413,6 +443,54 @@ fn restore_scrollback(server: &mut Server, id: PaneId, p: &PaneSnap) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_restart_stops_programs_not_shells_ssh_shells_or_idle_agents() {
+        let pane = |fields: serde_json::Value| -> crate::protocol::PaneInfo {
+            let mut info = serde_json::json!({"id": 3, "name": "build", "title": "sh", "workspace": "w", "tab": "t",
+                "kind": "terminal", "command": [], "cwd": null, "agent": null, "state": "unknown",
+                "exit_code": null, "focused": false, "floating": false, "cols": 80, "rows": 24});
+            for (k, v) in fields.as_object().unwrap() {
+                info[k] = v.clone();
+            }
+            serde_json::from_value(info).unwrap()
+        };
+        let argv = |words: &[&str]| words.iter().map(|w| w.to_string()).collect::<Vec<_>>();
+        let shell = pane(serde_json::json!({}));
+        assert_eq!(stops_on_restart(&shell, None), None, "a shell at its prompt");
+        let sleep = argv(&["sleep", "1000"]);
+        assert_eq!(stops_on_restart(&shell, Some(&sleep)).as_deref(), Some("sleep 1000"));
+        assert_eq!(stopping_line(&shell, "sleep 1000"), "sleep 1000  (pane 3 \"build\" in w)");
+        // A pane's own command stops (it waits for Enter after the restart), unless it is an
+        // SSH shell, which reconnects; and nothing runs in a pane whose program ended.
+        let command = pane(serde_json::json!({"command": ["make", "watch"]}));
+        assert_eq!(stops_on_restart(&command, None).as_deref(), Some("make watch"));
+        let ssh = pane(serde_json::json!({"command": ["ssh", "web-1"]}));
+        assert_eq!(stops_on_restart(&ssh, Some(&argv(&["ssh", "web-1"]))), None);
+        let ssh_job = pane(serde_json::json!({"command": ["ssh", "web-1", "journalctl", "-f"]}));
+        assert!(stops_on_restart(&ssh_job, None).is_some());
+        let ended = pane(serde_json::json!({"command": ["make"], "exit_code": 0}));
+        assert_eq!(stops_on_restart(&ended, None), None);
+        let waiting = pane(serde_json::json!({"command": ["make"], "suspended": true}));
+        assert_eq!(stops_on_restart(&waiting, None), None);
+        let preview = pane(serde_json::json!({"kind": "preview:markdown"}));
+        assert_eq!(stops_on_restart(&preview, None), None);
+        // Agents resume; one in the middle of a turn loses that turn.
+        let idle = pane(serde_json::json!({"agent": "claude", "state": "idle"}));
+        assert_eq!(stops_on_restart(&idle, Some(&argv(&["claude"]))), None);
+        let working = pane(serde_json::json!({"agent": "claude", "state": "working"}));
+        assert!(stops_on_restart(&working, Some(&argv(&["claude"]))).is_some_and(|w| w.starts_with("claude: ")));
+        let long = argv(&[
+            "cargo",
+            "build",
+            "--release",
+            "--workspace",
+            "--all-features",
+            "--target",
+            "x86_64-unknown-linux-musl",
+        ]);
+        assert!(stops_on_restart(&shell, Some(&long)).is_some_and(|w| w.chars().count() == 60 && w.ends_with('…')));
+    }
 
     #[test]
     fn resume_commands_are_safe() {

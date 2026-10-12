@@ -99,6 +99,17 @@ pub fn still_running(pid: u32, started: u64) -> bool {
     libc::pid_t::try_from(pid).is_ok_and(running) && start_time(pid) == Some(started)
 }
 
+/// The processes `pid` started that still run as its children.
+pub fn children(pid: u32) -> Vec<u32> {
+    imp::pids().into_iter().filter(|p| imp::ppid(*p) == Some(pid)).collect()
+}
+
+/// The process group in the foreground of the terminal `pid` runs in (the one a shell gives
+/// the keyboard to while it runs a command), if it has a terminal.
+pub fn foreground_group(pid: u32) -> Option<u32> {
+    imp::foreground_group(pid).filter(|g| *g > 0)
+}
+
 /// Every process running on this machine that the system shows us.
 pub fn pids() -> Vec<u32> {
     imp::pids()
@@ -233,6 +244,15 @@ mod imp {
         let end = stat.iter().rposition(|b| *b == b')')?;
         let rest = String::from_utf8_lossy(&stat[end + 1..]).into_owned();
         rest.split_whitespace().nth(1)?.parse().ok()
+    }
+
+    pub fn foreground_group(pid: u32) -> Option<u32> {
+        // After the command name: state, parent, group, session, terminal, its foreground group
+        // (-1 without a terminal).
+        let stat = std::fs::read(format!("/proc/{pid}/stat")).ok()?;
+        let end = stat.iter().rposition(|b| *b == b')')?;
+        let rest = String::from_utf8_lossy(&stat[end + 1..]).into_owned();
+        rest.split_whitespace().nth(5)?.parse::<i64>().ok().and_then(|g| u32::try_from(g).ok())
     }
 
     pub fn socket_peer(fd: std::os::unix::io::RawFd) -> std::io::Result<(libc::pid_t, libc::uid_t)> {
@@ -521,6 +541,22 @@ mod imp {
         (n == size).then(|| info.pbi_start_tvsec * 1_000_000 + info.pbi_start_tvusec)
     }
 
+    pub fn foreground_group(pid: u32) -> Option<u32> {
+        let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+        let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+        // SAFETY: proc_pidinfo writes at most `size` bytes into `info`.
+        let n = unsafe {
+            libc::proc_pidinfo(
+                pid as libc::c_int,
+                libc::PROC_PIDTBSDINFO,
+                0,
+                (&mut info as *mut libc::proc_bsdinfo).cast::<libc::c_void>(),
+                size,
+            )
+        };
+        (n == size).then_some(info.e_tpgid)
+    }
+
     pub fn machine_id() -> Option<String> {
         let mut id = [0u8; 16];
         let wait = libc::timespec { tv_sec: 0, tv_nsec: 0 };
@@ -631,6 +667,10 @@ mod imp {
     }
 
     pub fn ppid(_pid: u32) -> Option<u32> {
+        None
+    }
+
+    pub fn foreground_group(_pid: u32) -> Option<u32> {
         None
     }
 

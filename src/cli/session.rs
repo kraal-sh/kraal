@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use anyhow::{Result, bail};
 
 use super::Session;
-use crate::protocol::{Request, Response};
+use crate::protocol::{self, Request, Response};
 use crate::{client, config, paths, workspace};
 
 pub(super) fn attach(session: &str, workspace: Option<String>) -> Result<()> {
@@ -85,8 +85,9 @@ pub(super) fn save(s: &Session, name: Option<String>, workspace: Option<String>)
     Ok(())
 }
 
-pub(super) fn list_sessions() -> Result<()> {
-    let mut names = std::collections::BTreeMap::<String, &str>::new();
+/// The sessions whose server listens, with its socket.
+pub(super) fn live_sockets() -> Vec<(String, PathBuf)> {
+    let mut out = Vec::new();
     // Sessions an older kraal started may still listen where it put them.
     let dirs = std::iter::once(paths::runtime_dir()).chain(paths::legacy_runtime_dir());
     for rd in dirs.filter_map(|d| std::fs::read_dir(d).ok()) {
@@ -94,15 +95,28 @@ pub(super) fn list_sessions() -> Result<()> {
             let p = e.path();
             if p.extension().is_some_and(|x| x == "sock")
                 && let Some(stem) = p.file_stem()
+                && std::os::unix::net::UnixStream::connect(&p).is_ok()
             {
-                let alive = std::os::unix::net::UnixStream::connect(&p).is_ok();
                 // A long session name has a shortened socket name: the saved session says which.
                 let stem = stem.to_string_lossy();
-                if alive {
-                    names.insert(paths::session_of_socket(&stem).unwrap_or_else(|| stem.into_owned()), "running");
-                }
+                out.push((paths::session_of_socket(&stem).unwrap_or_else(|| stem.into_owned()), p.clone()));
             }
         }
+    }
+    out
+}
+
+pub(super) fn list_sessions() -> Result<()> {
+    let mut names = std::collections::BTreeMap::<String, String>::new();
+    for (name, socket) in live_sockets() {
+        let state = match client::ping(&socket) {
+            Ok((_, version)) if protocol::newer(protocol::KRAAL_VERSION, &version) => {
+                format!("running  {version} ({} is installed: kraal -s {name} restart)", protocol::KRAAL_VERSION)
+            }
+            Ok((_, version)) => format!("running  {version}"),
+            Err(_) => "running".into(),
+        };
+        names.insert(name, state);
     }
     if let Ok(rd) = std::fs::read_dir(paths::state_dir().join("sessions")) {
         for e in rd.flatten() {
@@ -110,7 +124,7 @@ pub(super) fn list_sessions() -> Result<()> {
             if p.extension().is_some_and(|x| x == "json")
                 && let Some(stem) = p.file_stem()
             {
-                names.entry(stem.to_string_lossy().into()).or_insert("saved");
+                names.entry(stem.to_string_lossy().into()).or_insert_with(|| "saved".into());
             }
         }
     }

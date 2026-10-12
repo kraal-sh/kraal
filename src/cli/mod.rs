@@ -4,6 +4,7 @@ mod agents;
 mod args;
 mod panes;
 mod remote;
+mod restart;
 mod runbooks;
 mod session;
 mod update;
@@ -89,11 +90,15 @@ fn run(cli: Cli) -> Result<()> {
         Some(Cmd::Attach { workspace, host: None, .. }) => session::attach(&s.name, workspace),
         Some(Cmd::Attach { workspace, host: Some(host), pane }) => remote::attach(&s.name, &host, workspace, pane),
         Some(Cmd::RemoteInstall { server }) => remote::install(&server),
-        Some(Cmd::Update { check, to, force }) => update::update(check, to, force),
+        Some(Cmd::Update { check, to, force, restart, no_restart }) => {
+            let restart = (restart || no_restart).then_some(restart);
+            update::update(check, to, force, restart)
+        }
         Some(Cmd::Proxy) => client::proxy(&s.name),
         Some(Cmd::Server) => server::run(&s.name),
         Some(Cmd::Ls) => session::list_sessions(),
         Some(Cmd::Kill) => session::kill(&s),
+        Some(Cmd::Restart { yes }) => restart::restart(&s, yes),
         Some(Cmd::Forget) => session::forget(&s),
         Some(Cmd::Workspaces { json }) => session::workspaces(&s, json),
         Some(Cmd::Open { name }) => session::open(&s, name),

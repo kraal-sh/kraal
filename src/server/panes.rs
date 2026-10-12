@@ -304,7 +304,7 @@ impl Server {
         if self.workspaces.is_empty() {
             let ids: Vec<ClientId> = self.clients.keys().copied().collect();
             for c in ids {
-                self.send_msg(c, &ServerMsg::Exit { reason: "all panes closed".into() });
+                self.send_msg(c, &ServerMsg::exit("all panes closed"));
             }
             let _ = self.persister.send(super::persistence::Persist::Delete(self.session.clone()));
             self.persist_dirty = false;

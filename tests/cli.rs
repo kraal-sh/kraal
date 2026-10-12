@@ -30,8 +30,14 @@ impl Env {
     }
 
     fn cmd(&self, args: &[&str]) -> Command {
-        let mut c = Command::new(env!("CARGO_BIN_EXE_kraal"));
+        let mut c = self.isolated(Path::new(env!("CARGO_BIN_EXE_kraal")));
         c.args(["-s", &self.session]).args(args);
+        c
+    }
+
+    /// `program` in this test's directories, out of any kraal session.
+    fn isolated(&self, program: &Path) -> Command {
+        let mut c = Command::new(program);
         c.env("XDG_RUNTIME_DIR", self.root.join("run"))
             .env("XDG_STATE_HOME", self.root.join("state"))
             .env("XDG_CONFIG_HOME", self.root.join("config"))
@@ -173,18 +179,28 @@ impl Drop for Env {
 struct RawClient {
     stream: std::os::unix::net::UnixStream,
     screen: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+    /// The messages the server sent, as JSON.
+    messages: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
 }
 
 impl RawClient {
     fn attach(env: &Env, workspace: &str) -> RawClient {
+        RawClient::attach_installed(env, workspace, None)
+    }
+
+    /// Attach, saying which kraal is installed (a local client says its own).
+    fn attach_installed(env: &Env, workspace: &str, installed: Option<&str>) -> RawClient {
         use std::io::Read;
         let socket = env.root.join("run/kraal").join(format!("{}.sock", env.session));
         let mut stream = std::os::unix::net::UnixStream::connect(socket).unwrap();
-        let hello =
-            format!(r#"{{"type":"attach","version":2,"cols":120,"rows":40,"workspace":"{workspace}","remote":false}}"#);
+        let installed = installed.map(|v| format!(r#","installed":"{v}""#)).unwrap_or_default();
+        let hello = format!(
+            r#"{{"type":"attach","version":2,"cols":120,"rows":40,"workspace":"{workspace}","remote":false{installed}}}"#
+        );
         raw_frame(&mut stream, 0, hello.as_bytes());
         let screen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let (mut reader, kept) = (stream.try_clone().unwrap(), screen.clone());
+        let messages = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (mut reader, kept, said) = (stream.try_clone().unwrap(), screen.clone(), messages.clone());
         std::thread::spawn(move || {
             let mut header = [0u8; 5];
             while reader.read_exact(&mut header).is_ok() {
@@ -192,12 +208,26 @@ impl RawClient {
                 if reader.read_exact(&mut payload).is_err() {
                     break;
                 }
-                if header[4] == 1 {
-                    kept.lock().unwrap().extend_from_slice(&payload);
+                match header[4] {
+                    1 => kept.lock().unwrap().extend_from_slice(&payload),
+                    _ => said.lock().unwrap().push(String::from_utf8_lossy(&payload).into_owned()),
                 }
             }
         });
-        RawClient { stream, screen }
+        RawClient { stream, screen, messages }
+    }
+
+    /// Wait until the server has sent a message containing `text`.
+    fn wait_for_message(&self, text: &str) {
+        let start = Instant::now();
+        while !self.messages.lock().unwrap().iter().any(|m| m.contains(text)) {
+            assert!(
+                start.elapsed() < Duration::from_secs(15),
+                "{text:?} never sent: {:?}",
+                self.messages.lock().unwrap()
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
     }
 
     /// Bytes as the terminal sends them, one read each.
@@ -3369,6 +3399,12 @@ fn agents_of_a_remote_session_are_listed_and_reached() {
 /// A release as GitHub serves it, made from this build: `kraal-<target>.tar.gz` and its
 /// checksum, in `dir`.
 fn fake_release(dir: &Path) -> String {
+    fake_release_of(dir, None)
+}
+
+/// A release, made from this build; with `version`, its kraal says it is that version and is
+/// this build otherwise.
+fn fake_release_of(dir: &Path, version: Option<&str>) -> String {
     let os = match std::env::consts::OS {
         "macos" => "apple-darwin",
         _ => "unknown-linux-musl",
@@ -3376,7 +3412,18 @@ fn fake_release(dir: &Path) -> String {
     let target = format!("{}-{os}", std::env::consts::ARCH);
     let inner = dir.join(format!("kraal-{target}"));
     std::fs::create_dir_all(&inner).unwrap();
-    std::fs::copy(env!("CARGO_BIN_EXE_kraal"), inner.join("kraal")).unwrap();
+    match version {
+        Some(v) => write_script(
+            &inner.join("kraal"),
+            &format!(
+                "#!/bin/sh\n[ \"$1\" = --version ] && {{ echo 'kraal {v}'; exit 0; }}\nexec '{}' \"$@\"\n",
+                env!("CARGO_BIN_EXE_kraal")
+            ),
+        ),
+        None => {
+            std::fs::copy(env!("CARGO_BIN_EXE_kraal"), inner.join("kraal")).unwrap();
+        }
+    }
     let asset = format!("kraal-{target}.tar.gz");
     let tar = Command::new("tar")
         .arg("-czf")
@@ -3412,7 +3459,7 @@ fn update_installs_a_checked_release_in_place() {
     std::fs::copy(env!("CARGO_BIN_EXE_kraal"), &kraal).unwrap();
     let url = format!("file://{}", release.display());
     let update =
-        |args: &[&str]| Command::new(&kraal).arg("update").args(args).env("KRAAL_DOWNLOAD_URL", &url).output().unwrap();
+        |args: &[&str]| env.isolated(&kraal).arg("update").args(args).env("KRAAL_DOWNLOAD_URL", &url).output().unwrap();
 
     let same = update(&[]);
     assert!(same.status.success(), "{}", String::from_utf8_lossy(&same.stderr));
@@ -3433,6 +3480,258 @@ fn update_installs_a_checked_release_in_place() {
     assert!(!wrong.status.success());
     assert!(String::from_utf8_lossy(&wrong.stderr).contains("does not match its checksum"));
     assert_eq!(std::fs::metadata(&kraal).unwrap().modified().unwrap(), before, "left alone");
+}
+
+/// After an update, `kraal update` names the sessions still on an older kraal with what a
+/// restart stops in them, asks on a terminal (no by default when programs would stop), and has
+/// the new kraal restart them when told to.
+#[test]
+fn update_offers_to_restart_the_sessions_left_on_an_older_kraal() {
+    let env = Env::new("updrestart");
+    env.workspace(
+        "w",
+        "layout {\n    pane name=\"job\" command=\"sh\" { args \"-c\" \"echo started; exec sleep 4243\"; }\n}\n",
+    );
+    env.run(&["open", "w"]);
+    env.wait_for_text("job", "started");
+    let release = env.root.join("release");
+    fake_release_of(&release, Some("9.9.9"));
+    let bin = env.root.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let kraal = bin.join("kraal");
+    // Each update replaces this copy with the release's kraal: put this build back first.
+    let install = || {
+        let _ = std::fs::remove_file(&kraal);
+        std::fs::copy(env!("CARGO_BIN_EXE_kraal"), &kraal).unwrap();
+    };
+    let url = format!("file://{}", release.display());
+    let update = |args: &[&str]| {
+        let mut c = env.isolated(&kraal);
+        c.arg("update").args(args).env("KRAAL_DOWNLOAD_URL", &url);
+        c
+    };
+    let version = env!("CARGO_PKG_VERSION");
+    let pid = env.server_pid().expect("the server runs");
+
+    // Without a terminal to ask on, and without --restart: said, not done.
+    install();
+    let out = update(&[]).output().unwrap();
+    let said = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{said}{}", String::from_utf8_lossy(&out.stderr));
+    assert!(said.contains(&format!("Session updrestart still runs kraal {version}.")), "{said}");
+    assert!(said.contains("These programs stop:") && said.contains("\"job\" in w)"), "{said}");
+    assert!(said.contains(&format!("Session updrestart keeps kraal {version} until: kraal -s updrestart restart")));
+    assert_eq!(env.server_pid(), Some(pid));
+
+    // On a terminal: asked, and Enter says no, since a program would stop.
+    #[cfg(target_os = "linux")]
+    {
+        install();
+        let screen = in_terminal(update(&[]), b"\n");
+        assert!(screen.contains("Restart it on kraal 9.9.9 now? [y/N]"), "{screen}");
+        assert!(screen.contains("keeps kraal"), "{screen}");
+        assert_eq!(env.server_pid(), Some(pid));
+        // --no-restart answers beforehand.
+        install();
+        let screen = in_terminal(update(&["--no-restart"]), b"");
+        assert!(screen.contains("keeps kraal") && !screen.contains("[y/N]"), "{screen}");
+        assert_eq!(env.server_pid(), Some(pid));
+    }
+
+    // --restart: the kraal just installed restarts it.
+    install();
+    let out = update(&["--restart"]).output().unwrap();
+    let said = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{said}{}", String::from_utf8_lossy(&out.stderr));
+    assert!(said.contains("restarted session updrestart"), "{said}");
+    let new = env.server_pid().expect("a server runs again");
+    assert_ne!(new, pid);
+    env.wait_for_text_since_restore("job", "restored session");
+}
+
+/// The server says what it runs to a client that attaches, and says once, to a client that
+/// has a newer kraal installed, that a restart brings it. `kraal ls` shows each session's.
+#[test]
+fn a_client_with_a_newer_kraal_installed_is_told_the_session_runs_an_older_one() {
+    let env = Env::new("notice");
+    env.workspace("w", "layout {\n    pane name=\"shell\"\n}\n");
+    env.run(&["open", "w"]);
+    let version = env!("CARGO_PKG_VERSION");
+    let newer = RawClient::attach_installed(&env, "w", Some("99.0.0"));
+    newer.wait_for_message(&format!(r#"{{"type":"attached","version":"{version}"}}"#));
+    newer.wait_for_screen(&format!("kraal 99.0.0 installed; this session runs {version}: ctrl+b W r restarts it"));
+    let same = RawClient::attach_installed(&env, "w", Some(version));
+    same.wait_for_message("\"attached\"");
+    let older = RawClient::attach_installed(&env, "w", Some("0.0.1"));
+    older.wait_for_message("\"attached\"");
+    std::thread::sleep(Duration::from_millis(500));
+    for client in [&same, &older] {
+        assert!(!String::from_utf8_lossy(&client.screen.lock().unwrap()).contains(" installed; "));
+    }
+    let ls = env.run(&["ls"]);
+    assert!(ls.lines().any(|l| l.starts_with("notice ") && l.ends_with(&format!("running  {version}"))), "{ls}");
+    let keys = env.run(&["config", "keys"]);
+    assert!(keys.lines().any(|l| l.trim_start().starts_with("restart ") && l.ends_with("ctrl+b W r")), "{keys}");
+}
+
+/// The restart in the menu says what stops and asks first; then the session comes back, and
+/// attached clients are told to come back to the workspace they showed.
+#[test]
+fn the_menu_restarts_the_session_after_asking() {
+    let env = Env::new("menurestart");
+    env.workspace(
+        "w",
+        "layout {\n    pane name=\"job\" command=\"sh\" { args \"-c\" \"echo started; exec sleep 4244\"; }\n}\n",
+    );
+    env.run(&["open", "w"]);
+    env.wait_for_text("job", "started");
+    let pid = env.server_pid().expect("the server runs");
+    let mut client = RawClient::attach(&env, "w");
+    client.wait_for_message("\"attached\"");
+    client.send(b"\x02Wr");
+    client.wait_for_screen("Restart session menurestart on the kraal installed now?");
+    client.wait_for_screen("These programs stop:");
+    client.wait_for_screen("\"job\" in w)");
+    client.send(b"n");
+    std::thread::sleep(Duration::from_millis(500));
+    assert_eq!(env.server_pid(), Some(pid), "no is no");
+    client.screen.lock().unwrap().clear();
+    client.send(b"\x02Wr");
+    client.wait_for_screen("Restart session menurestart");
+    client.send(b"y");
+    client.wait_for_message(r#""reattach":"w""#);
+    let start = Instant::now();
+    while env.server_pid().is_none_or(|p| p == pid) {
+        assert!(start.elapsed() < Duration::from_secs(20), "the session did not come back");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    env.wait_for_text_since_restore("job", "restored session");
+}
+
+/// `kraal restart` says what would stop before asking; a client attached in a terminal waits for
+/// the next server and comes back to its workspace; an idle shell comes back; and a restart run
+/// from a pane of the session itself outlives that pane.
+#[cfg(target_os = "linux")]
+#[test]
+fn restart_keeps_the_session_and_brings_its_clients_back() {
+    let env = Env::new("restart");
+    env.workspace(
+        "w",
+        "layout {\n    pane split_direction=\"vertical\" {\n        pane name=\"idle\"\n        pane name=\"busy\"\n    }\n}\n",
+    );
+    env.run(&["open", "w"]);
+    env.run(&["send", "-p", "idle", "--enter", "echo before-restart"]);
+    env.wait_for_text("idle", "before-restart");
+    env.run(&["send", "-p", "busy", "--enter", "sleep 4245"]);
+    let sleeping = || {
+        std::fs::read_dir("/proc")
+            .unwrap()
+            .flatten()
+            .any(|e| std::fs::read(e.path().join("cmdline")).is_ok_and(|c| c == b"sleep\x004245\x00"))
+    };
+    let start = Instant::now();
+    while !sleeping() {
+        assert!(start.elapsed() < Duration::from_secs(10), "sleep never started");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    // A client in a 30-row terminal: once it is attached, the panes are shorter than that.
+    let mut client = env.client();
+    let attached = || {
+        let start = Instant::now();
+        loop {
+            let panes: serde_json::Value = serde_json::from_str(&env.run(&["panes", "--json"])).unwrap();
+            if panes.as_array().unwrap().iter().all(|p| p["rows"].as_u64().unwrap() < 30) {
+                return;
+            }
+            assert!(start.elapsed() < Duration::from_secs(20), "no client attached: {panes}");
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    };
+    attached();
+    let pid = env.server_pid().expect("the server runs");
+
+    // Without a terminal to ask on: what stops is said, and nothing happens.
+    let out = env.try_run(&["restart"]);
+    let said = String::from_utf8_lossy(&out.stdout);
+    assert!(!out.status.success(), "{said}");
+    let listed = said.split_once("These programs stop:\n").map(|(_, rest)| rest).unwrap_or_default();
+    assert!(listed.starts_with("  sleep 4245  (pane ") && listed.contains(" \"busy\" in w)"), "{said}");
+    assert!(!said.contains("idle"), "a shell at its prompt runs nothing: {said}");
+    assert!(String::from_utf8_lossy(&out.stderr).contains("add --yes"));
+    assert_eq!(env.server_pid(), Some(pid));
+    // On a terminal: the list, then the question, whose Enter is no.
+    let screen = in_terminal(env.cmd(&["restart"]), b"\n");
+    let (listed, asked) = (screen.find("sleep 4245"), screen.find("Restart session restart? [y/N]"));
+    assert!(listed.is_some() && asked.is_some() && listed < asked, "{screen}");
+    assert!(screen.contains("cancelled"), "{screen}");
+    assert_eq!(env.server_pid(), Some(pid));
+
+    let out = env.run(&["restart", "--yes"]);
+    assert!(out.contains("restarted session restart"), "{out}");
+    let second = env.server_pid().expect("a server runs again");
+    assert_ne!(second, pid);
+    // The idle shell is back, with what it showed, and takes commands.
+    env.wait_for_text("idle", "before-restart");
+    env.run(&["send", "-p", "idle", "--enter", "echo after-restart"]);
+    env.wait_for_text_since_restore("idle", "after-restart");
+    // The client did not leave: it attached to the next server.
+    assert!(client.try_wait().unwrap().is_none(), "the client left");
+    attached();
+
+    // From a pane of the session: the restart closes that pane, and happens all the same.
+    let line = format!("'{}' restart --yes", env!("CARGO_BIN_EXE_kraal"));
+    env.run(&["send", "-p", "idle", "--enter", &line]);
+    let start = Instant::now();
+    while env.server_pid().is_none_or(|p| p == second) {
+        assert!(start.elapsed() < Duration::from_secs(20), "the session did not restart");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let start = Instant::now();
+    while !env.try_run(&["read", "-p", "idle", "--lines", "200"]).stdout.windows(13).any(|w| w == b"after-restart") {
+        assert!(start.elapsed() < Duration::from_secs(10), "the idle pane did not come back");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(client.try_wait().unwrap().is_none(), "the client left");
+    attached();
+    let _ = client.kill();
+    let _ = client.wait();
+}
+
+/// Run `cmd` in a terminal (`script`, from util-linux), typing `input` into it; what the
+/// terminal showed.
+#[cfg(target_os = "linux")]
+fn in_terminal(cmd: Command, input: &[u8]) -> String {
+    use std::io::{Read, Write};
+    let line = std::iter::once(cmd.get_program())
+        .chain(cmd.get_args())
+        .map(|a| format!("'{}'", a.to_string_lossy()))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let mut c = Command::new("script");
+    c.args(["-q", "-f", "-c", &line, "/dev/null"]);
+    for (k, v) in cmd.get_envs() {
+        match v {
+            Some(v) => c.env(k, v),
+            None => c.env_remove(k),
+        };
+    }
+    c.stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::null());
+    let mut child = c.spawn().expect("script (util-linux)");
+    let mut stdin = child.stdin.take().unwrap();
+    stdin.write_all(input).unwrap();
+    let mut out = child.stdout.take().unwrap();
+    let reader = std::thread::spawn(move || {
+        let mut shown = Vec::new();
+        let _ = out.read_to_end(&mut shown);
+        shown
+    });
+    let start = Instant::now();
+    while child.try_wait().unwrap().is_none() {
+        assert!(start.elapsed() < Duration::from_secs(30), "{line} is still running");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    drop(stdin);
+    String::from_utf8_lossy(&reader.join().unwrap()).into_owned()
 }
 
 /// install.sh installs a release that matches its checksum, and nothing when it does not.

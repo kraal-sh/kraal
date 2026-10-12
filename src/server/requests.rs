@@ -386,8 +386,9 @@ impl Server {
             // Answered when the server stops, once its last state is written or has failed to
             // be: `kraal kill` then says whether the layout a restart brings back is saved.
             Request::ReloadConfig => self.reload_config().map(|warnings| Response::Text(warnings.join("\n"))),
-            Request::KillServer => {
+            Request::KillServer { restart } => {
                 self.quitting = true;
+                self.restarting |= restart;
                 self.kill_waiters.push(client);
                 return None;
             }

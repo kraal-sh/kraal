@@ -239,6 +239,26 @@ impl Server {
         self.schedule_render();
     }
 
+    /// Tell a client that attaches with a newer kraal installed than this server's that a
+    /// restart brings it: once, after the message the client is being shown, if any.
+    pub(super) fn version_notice(&mut self, client: ClientId, installed: &str) {
+        let plain = installed.len() <= 40 && installed.chars().all(|c| c.is_ascii_alphanumeric() || ".-+".contains(c));
+        if !plain || !crate::protocol::newer(installed, crate::protocol::KRAAL_VERSION) {
+            return;
+        }
+        let how = self.keymap.hint(crate::keymap::Action::Restart).unwrap_or_else(|| "kraal restart".into());
+        let text = format!(
+            "kraal {installed} installed; this session runs {}: {how} restarts it",
+            crate::protocol::KRAAL_VERSION
+        );
+        let Some(c) = self.clients.get_mut(&client) else { return };
+        if c.toast.is_some() {
+            c.notice = Some(text);
+        } else {
+            self.toast(client, text);
+        }
+    }
+
     fn log_message(&mut self, text: &str, warning: bool) {
         if self.messages.len() >= super::MAX_MESSAGES {
             self.messages.pop_front();

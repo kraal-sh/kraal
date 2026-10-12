@@ -51,6 +51,12 @@ pub enum Cmd {
         /// Install even when it is the version already here.
         #[arg(long)]
         force: bool,
+        /// Restart the sessions running an older kraal without asking.
+        #[arg(long, conflicts_with = "no_restart")]
+        restart: bool,
+        /// Leave the sessions running an older kraal as they are, without asking.
+        #[arg(long)]
+        no_restart: bool,
     },
     /// Relay a client to the local session (what `attach --host` runs on the server).
     #[command(hide = true)]
@@ -59,6 +65,13 @@ pub enum Cmd {
     Ls,
     /// Stop a session's server; its layout is saved for next time.
     Kill,
+    /// Restart a session's server on the kraal installed now: the layout, scrollback, SSH shells
+    /// and agents come back, other programs stop (they are listed first, and asked about).
+    Restart {
+        /// Do not ask, even when programs would stop.
+        #[arg(short, long)]
+        yes: bool,
+    },
     /// Forget a session's saved layout and scrollback.
     Forget,
     /// List workspaces: open ones and definitions on disk.
