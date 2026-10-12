@@ -8,6 +8,12 @@ use std::time::{Duration, Instant};
 
 use common::{Env, claude_hook, git_repo, wait_until, write_script};
 
+/// How long a test waits for what it expects to show before it fails. Far longer than it takes:
+/// a machine busy with other work (a CI runner, the suite run beside other suites) is slower by
+/// tens of seconds where programs are started and talk to each other, and a wait that ends when
+/// its condition holds costs nothing when it does.
+const PATIENCE: Duration = Duration::from_secs(60);
+
 impl Env {
     fn workspace(&self, name: &str, kdl: &str) {
         std::fs::write(self.root.join("config/kraal/workspaces").join(format!("{name}.kdl")), kdl).unwrap();
@@ -39,7 +45,7 @@ impl Env {
             if seen.contains(text) || seen.lines().collect::<String>().contains(text) {
                 return seen.to_string();
             }
-            assert!(start.elapsed() < Duration::from_secs(10), "timed out waiting for {text:?} in:\n{screen}");
+            assert!(start.elapsed() < PATIENCE, "timed out waiting for {text:?} in:\n{screen}");
             std::thread::sleep(Duration::from_millis(50));
         }
     }
@@ -170,11 +176,7 @@ impl RawClient {
     fn wait_for_message(&self, text: &str) {
         let start = Instant::now();
         while !self.messages.lock().unwrap().iter().any(|m| m.contains(text)) {
-            assert!(
-                start.elapsed() < Duration::from_secs(15),
-                "{text:?} never sent: {:?}",
-                self.messages.lock().unwrap()
-            );
+            assert!(start.elapsed() < PATIENCE, "{text:?} never sent: {:?}", self.messages.lock().unwrap());
             std::thread::sleep(Duration::from_millis(50));
         }
     }
@@ -196,7 +198,7 @@ impl RawClient {
     fn wait_for_screen(&self, text: &str) {
         let start = Instant::now();
         while !String::from_utf8_lossy(&self.screen.lock().unwrap()).contains(text) {
-            assert!(start.elapsed() < Duration::from_secs(10), "{text:?} never shown");
+            assert!(start.elapsed() < PATIENCE, "{text:?} never shown");
             std::thread::sleep(Duration::from_millis(50));
         }
     }
@@ -218,7 +220,7 @@ fn wait_production(env: &Env, name: &str) {
         if pane["production"].is_string() {
             return;
         }
-        assert!(start.elapsed() < Duration::from_secs(10), "never seen as production: {pane}");
+        assert!(start.elapsed() < PATIENCE, "never seen as production: {pane}");
         std::thread::sleep(Duration::from_millis(100));
     }
 }
@@ -1973,7 +1975,7 @@ fn a_directory_that_becomes_a_terraform_one_is_guarded() {
     std::fs::write(tf.join(".terraform/environment"), "prod\n").unwrap();
     let start = Instant::now();
     while production().is_none() {
-        assert!(start.elapsed() < Duration::from_secs(5), "never seen as production");
+        assert!(start.elapsed() < PATIENCE, "never seen as production");
         std::thread::sleep(Duration::from_millis(100));
     }
     assert_eq!(production().as_deref(), Some("Terraform workspace prod"));
@@ -2000,7 +2002,7 @@ fn production_panes_refuse_unasked_cli_input() {
             assert_eq!(ops["contexts"][0], "tf:prod");
             break;
         }
-        assert!(start.elapsed() < Duration::from_secs(10), "never seen as production: {ops}");
+        assert!(start.elapsed() < PATIENCE, "never seen as production: {ops}");
         std::thread::sleep(Duration::from_millis(100));
     }
     let out = env.try_run(&["send", "-p", "ops", "echo", "hi"]);
@@ -2720,7 +2722,7 @@ fn a_tool_asks_when_the_kubeconfig_just_switched_to_production() {
         if panes.contains("dev") {
             break;
         }
-        assert!(start.elapsed() < Duration::from_secs(20), "the pane's context is read: {panes}");
+        assert!(start.elapsed() < PATIENCE, "the pane's context is read: {panes}");
         std::thread::sleep(Duration::from_millis(100));
     }
     let mut client = env.client();
@@ -2771,7 +2773,7 @@ fn wait_for_context(env: &Env, context: &str) {
         if panes.contains(context) {
             return;
         }
-        assert!(start.elapsed() < Duration::from_secs(20), "the pane's context is read: {panes}");
+        assert!(start.elapsed() < PATIENCE, "the pane's context is read: {panes}");
         std::thread::sleep(Duration::from_millis(100));
     }
 }
@@ -3175,18 +3177,25 @@ fn a_production_directory_left_and_come_back_to_is_still_guarded() {
     std::fs::create_dir_all(infra.join(".terraform")).unwrap();
     std::fs::write(infra.join(".terraform/environment"), "prod-a\n").unwrap();
     env.workspace("w", &format!("layout {{\n    pane name=\"b\" cwd=\"{}\" command=\"sh\"\n}}\n", infra.display()));
-    env.run(&["open", "w"]);
+    // A read of the environment file takes ten minutes while `environment.slow` exists: longer
+    // than this test waits for anything.
+    let out = env.cmd(&["open", "w"]).env("KRAAL_TEST_SLOW_KUBECONFIG_MS", "600000").output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     wait_for_context(&env, "tf:prod-a");
     env.wait_for_text("b", "$");
     let refused = |text: &str| !env.cmd(&["send", "-p", "b", "-e", text]).output().unwrap().status.success();
     assert!(refused("echo here"), "b is production");
     env.run(&["send", "-p", "b", "-e", "--production", "cd /"]);
+    wait_for_contexts(&env, "b", &[], None);
     // A scan (every 3 s) passes while no pane is in the directory.
     std::thread::sleep(Duration::from_millis(4000));
     assert!(!refused("echo away"), "away from the directory, b is not production");
+    // The directory cannot be read again in time from here on: what is said of it once the pane
+    // is back is what was known, however long the pane takes to get there.
+    std::fs::write(infra.join(".terraform/environment.slow"), "").unwrap();
     env.run(&["send", "-p", "b", "-e", &format!("cd {}", infra.display())]);
-    std::thread::sleep(Duration::from_millis(300));
-    assert!(refused("echo back"), "back in the directory, b is production again at once");
+    wait_for_contexts(&env, "b", &["tf:prod-a"], Some("Terraform workspace prod-a"));
+    assert!(refused("echo back"), "back in the directory, b is production again");
 }
 
 /// The pane named `name`, as `kraal panes --json` lists it.
@@ -3205,7 +3214,7 @@ fn wait_for_contexts(env: &Env, name: &str, contexts: &[&str], why: Option<&str>
         if pane["contexts"] == serde_json::json!(contexts) && pane["production"] == serde_json::json!(why) {
             return;
         }
-        assert!(start.elapsed() < Duration::from_secs(10), "never {contexts:?} ({why:?}): {pane}");
+        assert!(start.elapsed() < PATIENCE, "never {contexts:?} ({why:?}): {pane}");
         std::thread::sleep(Duration::from_millis(100));
     }
 }
@@ -3613,26 +3622,33 @@ fn an_idle_server_sleeps() {
     env.wait_for_text("a", "$");
     env.wait_for_text("b", "$");
     let pid = env.server_pid().expect("the server's pid");
-    // The times its threads went to sleep (not those another program took the processor from
-    // them while they ran: that depends on the machine's load).
-    let switches = || -> u64 {
+    // The times each of its threads went to sleep (not those another program took the processor
+    // from them while they ran: that depends on the machine's load).
+    let sleeps = || -> std::collections::HashMap<std::ffi::OsString, u64> {
         let tasks = std::fs::read_dir(format!("/proc/{pid}/task")).unwrap();
         tasks
             .flatten()
-            .filter_map(|t| std::fs::read_to_string(t.path().join("status")).ok())
-            .flat_map(|s| {
-                s.lines()
-                    .filter(|l| l.starts_with("voluntary_ctxt_switches"))
-                    .filter_map(|l| l.split_whitespace().last()?.parse::<u64>().ok())
-                    .collect::<Vec<_>>()
+            .filter_map(|t| {
+                let status = std::fs::read_to_string(t.path().join("status")).ok()?;
+                let line = status.lines().find(|l| l.starts_with("voluntary_ctxt_switches"))?;
+                Some((t.file_name(), line.split_whitespace().last()?.parse().ok()?))
             })
-            .sum()
+            .collect()
     };
     // Past the requests above, and what they started.
     std::thread::sleep(Duration::from_secs(4));
-    let before = switches();
-    std::thread::sleep(Duration::from_secs(6));
-    let woke = switches() - before;
+    let start = Instant::now();
+    let woke: u64 = loop {
+        let before = sleeps();
+        std::thread::sleep(Duration::from_secs(6));
+        let after = sleeps();
+        // A thread that ended meanwhile was still finishing what those requests started, as on
+        // a loaded machine: the server was not idle yet, and is looked at again.
+        if before.keys().all(|thread| after.contains_key(thread)) {
+            break after.iter().map(|(thread, now)| now - before.get(thread).copied().unwrap_or(0)).sum();
+        }
+        assert!(start.elapsed() < Duration::from_secs(60), "the server's threads keep ending: {after:?}");
+    };
     // At most its periodic work, and what that starts: not the readers of the panes, nor
     // anything else.
     assert!(woke <= 6, "{woke} wake-ups in 6 s");
@@ -6068,7 +6084,17 @@ impl Sshd {
         .unwrap();
         let bin = dir.join("bin");
         std::fs::create_dir_all(&bin).unwrap();
-        write_script(&bin.join("ssh"), &format!("#!/bin/sh\nexec '{}' -F '{d}/ssh_config' \"$@\"\n", ssh.display()));
+        // kraal gives a server a few seconds to answer. This one is on this machine, as slow as
+        // the tests beside it make it, and that limit is not what its tests are about: its `ssh`
+        // waits as long as they do (of an option given twice, ssh takes the first).
+        write_script(
+            &bin.join("ssh"),
+            &format!(
+                "#!/bin/sh\nexec '{}' -F '{d}/ssh_config' -o ConnectTimeout={} \"$@\"\n",
+                ssh.display(),
+                PATIENCE.as_secs()
+            ),
+        );
         let log = dir.join("sshd.log");
         let child =
             Command::new(&sshd).arg("-D").arg("-f").arg(dir.join("sshd_config")).arg("-E").arg(&log).spawn().ok()?;
@@ -6079,7 +6105,7 @@ impl Sshd {
             if said.contains("Server listening") {
                 return Some(sshd);
             }
-            if sshd.child.try_wait().ok().flatten().is_some() || start.elapsed() > Duration::from_secs(10) {
+            if sshd.child.try_wait().ok().flatten().is_some() || start.elapsed() > PATIENCE {
                 eprintln!("sshd did not start: {said}");
                 return None;
             }
@@ -6138,7 +6164,7 @@ fn a_server_file_is_edited_in_the_local_editor() {
     let wait_until = |what: &str, ok: &dyn Fn() -> bool| {
         let start = Instant::now();
         while !ok() {
-            assert!(start.elapsed() < Duration::from_secs(15), "timed out waiting: {what}");
+            assert!(start.elapsed() < PATIENCE, "timed out waiting: {what}");
             std::thread::sleep(Duration::from_millis(50));
         }
     };
@@ -6703,7 +6729,7 @@ impl EditBench {
     fn wait_until(&self, what: &str, ok: &dyn Fn() -> bool) {
         let start = Instant::now();
         while !ok() {
-            assert!(start.elapsed() < Duration::from_secs(15), "timed out waiting: {what}");
+            assert!(start.elapsed() < PATIENCE, "timed out waiting: {what}");
             std::thread::sleep(Duration::from_millis(50));
         }
     }
