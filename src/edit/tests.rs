@@ -15,13 +15,34 @@ impl Here {
         let dir = std::env::temp_dir().join(format!("kraal-edit-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("home")).unwrap();
+        std::fs::create_dir_all(dir.join("bin")).unwrap();
         let ssh = dir.join("fake-ssh");
         let home = crate::shell::quote(&dir.join("home").display().to_string());
+        let bin = crate::shell::quote(&dir.join("bin").display().to_string());
         crate::testing::write_script(
             &ssh,
-            &format!("#!/bin/sh\nfor a; do last=$a; done\ncd {home} && HOME={home} exec sh -c \"$last\"\n"),
+            &format!(
+                "#!/bin/sh\nfor a; do last=$a; done\ncd {home} && HOME={home} PATH={bin}:$PATH exec sh -c \"$last\"\n"
+            ),
         );
         Here { dir, ssh: ssh.display().to_string() }
+    }
+
+    /// The same, with a `sudo` there that takes the password `pass word` on its input (or none
+    /// once `~/.nopasswd` exists) and runs the command as this user.
+    fn with_sudo(name: &str) -> Here {
+        let t = Here::new(name);
+        crate::testing::write_script(
+            &t.dir.join("bin/sudo"),
+            "#!/bin/sh\nn=\nwhile [ $# -gt 0 ]; do case $1 in -n) n=1 ;; -p) shift ;; --) shift; break ;; -*) ;; *) break ;; esac; shift; done\n\
+             if [ -n \"$n\" ]; then [ -e \"$HOME/.nopasswd\" ] || { echo 'sudo: a password is required' >&2; exit 1; }; exec \"$@\"; fi\n\
+             IFS= read -r pw\nif [ \"$pw\" != 'pass word' ]; then echo 'Sorry, try again.' >&2; exit 1; fi\nexec \"$@\"\n",
+        );
+        t
+    }
+
+    fn session(&self, path: &str) -> Result<Session> {
+        Session::start_with(&self.ssh, &["server".to_string()], path)
     }
 
     fn home(&self) -> PathBuf {
@@ -246,13 +267,16 @@ fn what_one_may_not_write_is_refused_before_editing() {
     let home = t.home();
     std::fs::write(home.join("ro"), "x").unwrap();
     std::fs::set_permissions(home.join("ro"), std::fs::Permissions::from_mode(0o444)).unwrap();
-    let err = format!("{:#}", t.open("~/ro").unwrap_err());
-    assert!(err.contains("may not write") && err.contains("sudo"), "{err}");
+    let refused = t.open("~/ro").unwrap_err();
+    let err = format!("{refused:#}");
+    assert!(err.contains("may not write") && err.contains("kraal edit --sudo"), "{err}");
+    assert!(refused.downcast_ref::<NotPermitted>().is_some(), "as root it could be edited");
     std::fs::create_dir_all(home.join("locked")).unwrap();
     std::fs::write(home.join("locked/f"), "x").unwrap();
     std::fs::set_permissions(home.join("locked"), std::fs::Permissions::from_mode(0o555)).unwrap();
-    let err = format!("{:#}", t.open("~/locked/f").unwrap_err());
-    assert!(err.contains("its directory"), "{err}");
+    let refused = t.open("~/locked/f").unwrap_err();
+    assert!(format!("{refused:#}").contains("its directory"), "{refused:#}");
+    assert!(refused.downcast_ref::<NotPermitted>().is_some());
     std::fs::write(home.join("secret"), "x").unwrap();
     std::fs::set_permissions(home.join("secret"), std::fs::Permissions::from_mode(0o200)).unwrap();
     assert!(format!("{:#}", t.open("~/secret").unwrap_err()).contains("may not read"));
@@ -282,13 +306,14 @@ fn answers_are_found_after_login_noise() {
 fn local_copies_are_private_and_kept_copies_never_replace() {
     let t = Here::new("local");
     let base = t.dir.join("edit");
-    let file = local_copy(&base, "app.conf", b"secret").unwrap();
+    let (dir, file) = local_copy(&base, "app.conf", b"secret").unwrap();
+    assert_eq!(file.parent(), Some(dir.as_path()));
     assert_eq!(std::fs::read(&file).unwrap(), b"secret");
     assert_eq!(std::fs::metadata(&file).unwrap().permissions().mode() & 0o777, 0o600);
-    let dir = file.parent().unwrap();
+    let dir = dir.as_path();
     assert_eq!(std::fs::metadata(dir).unwrap().permissions().mode() & 0o777, 0o700);
     assert_eq!(std::fs::metadata(&base).unwrap().permissions().mode() & 0o777, 0o700);
-    assert_ne!(local_copy(&base, "app.conf", b"other").unwrap().parent(), Some(dir));
+    assert_ne!(local_copy(&base, "app.conf", b"other").unwrap().0, dir);
 
     let downloads = t.dir.join("downloads");
     let first = keep(&downloads, "app.conf", b"one").unwrap();
@@ -323,4 +348,206 @@ fn a_save_is_seen_however_the_editor_writes() {
     std::fs::rename(t.dir.join("g"), &file).unwrap();
     assert_ne!(stamp(&file).unwrap(), second);
     assert_eq!(stamp(&t.dir.join("gone")), None);
+}
+
+/// A server answering with a path for a name (or `..`) cannot make kraal write, or later remove,
+/// anything outside the edit's private directory.
+#[test]
+fn a_name_from_the_server_never_leaves_the_private_directory() {
+    let answer = |dir: &str, name: &str| {
+        let mut out = format!("KRAAL:EDIT\0{dir}\0{name}\0abc\x002\0").into_bytes();
+        out.extend_from_slice(b"hi\0abc\0");
+        parse_opened(&out)
+    };
+    assert_eq!(answer("/etc", "hosts").unwrap().file.name, "hosts");
+    for (dir, name) in [
+        ("/etc", "/home/alice/Documents/new.txt"),
+        ("/etc", "../x"),
+        ("/etc", ".."),
+        ("/etc", "."),
+        ("/etc", "a/b"),
+        ("etc", "hosts"),
+        ("", "x"),
+    ] {
+        assert!(answer(dir, name).is_err(), "{dir:?} {name:?}");
+    }
+    // Nor do the local copies take such a name.
+    let t = Here::new("names-local");
+    let base = t.dir.join("edit");
+    let outside = t.dir.join("outside.txt");
+    for name in [outside.display().to_string(), "../outside.txt".into(), "..".into(), "".into()] {
+        assert!(local_copy(&base, &name, b"x").is_err(), "{name:?}");
+        assert!(keep(&t.dir.join("downloads"), &name, b"x").is_err(), "{name:?}");
+    }
+    assert!(!outside.exists());
+}
+
+/// Two saves of the same version (two kraal editors, or one upload still on its way when
+/// another lands): the second one finds the file changed and writes nothing.
+#[test]
+fn two_saves_of_the_same_version_never_both_win() {
+    let t = Here::new("race");
+    let file = t.home().join("shared.txt");
+    std::fs::write(&file, "v1\n").unwrap();
+    let opened = t.open("~/shared.txt").unwrap();
+    // A slow upload: it has started, and passed its first check.
+    let mut slow = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(save_script(&opened.file, &opened.identity, 6))
+        .current_dir(t.home())
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut input = slow.stdin.take().unwrap();
+    input.write_all(b"sl").unwrap();
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(matches!(t.save(&opened, &opened.identity, b"fast\n").unwrap(), Saved::Written(_)));
+    input.write_all(b"ow\n\n").unwrap();
+    drop(input);
+    let out = slow.wait_with_output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(matches!(parse_saved(&out.stdout).unwrap(), Saved::Changed(_)), "the slow save overwrote the other one");
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "fast\n");
+    assert!(Here::leftovers(&t.home()).is_empty());
+}
+
+/// A save waits while another kraal holds the file's lock, then goes on.
+#[test]
+fn a_save_waits_for_the_lock_of_another() {
+    let t = Here::new("lock");
+    let file = t.home().join("f.txt");
+    std::fs::write(&file, "v1\n").unwrap();
+    let opened = t.open("~/f.txt").unwrap();
+    let sum = std::process::Command::new("sh").arg("-c").arg("printf %s f.txt | cksum").output().unwrap();
+    let sum = String::from_utf8(sum.stdout).unwrap();
+    let lock = t.home().join(format!(".kraal-edit-lock-{}", sum.split_whitespace().next().unwrap()));
+    std::fs::create_dir(&lock).unwrap();
+    let held = lock.clone();
+    let release = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(600));
+        std::fs::remove_dir(&held).unwrap();
+    });
+    let start = std::time::Instant::now();
+    assert!(matches!(t.save(&opened, &opened.identity, b"v2\n").unwrap(), Saved::Written(_)));
+    assert!(start.elapsed() >= Duration::from_millis(500), "it did not wait");
+    release.join().unwrap();
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "v2\n");
+    assert!(Here::leftovers(&t.home()).is_empty());
+}
+
+/// The server's version is written over the editor's copy only while the copy is as it was when
+/// the user chose it: a save made since is left alone.
+#[test]
+fn the_servers_version_never_replaces_a_copy_saved_meanwhile() {
+    let t = Here::new("replace");
+    let (dir, local) = local_copy(&t.dir.join("edit"), "f.txt", b"mine\n").unwrap();
+    let seen = stamp(&local);
+    let now = replace_copy(&local, seen, b"theirs\n").unwrap();
+    assert!(now.is_some());
+    assert_eq!(std::fs::read_to_string(&local).unwrap(), "theirs\n");
+    std::thread::sleep(Duration::from_millis(20));
+    std::fs::write(&local, "mine again\n").unwrap();
+    assert_eq!(replace_copy(&local, now, b"theirs 2\n").unwrap(), None);
+    assert_eq!(std::fs::read_to_string(&local).unwrap(), "mine again\n");
+    let names: Vec<_> = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name()).collect();
+    assert_eq!(names, vec!["f.txt"]);
+    // Whatever the file's name.
+    let (_, local) = local_copy(&t.dir.join("edit"), ".kraal-new", b"mine\n").unwrap();
+    assert!(replace_copy(&local, stamp(&local), b"theirs\n").unwrap().is_some());
+    assert_eq!(std::fs::read_to_string(&local).unwrap(), "theirs\n");
+}
+
+/// Through sudo: the password is handed over once, wiped, and every read and save of the edit
+/// then goes through the same root session, with the same checks and lock.
+#[test]
+fn as_root_through_sudo_the_password_is_given_once() {
+    let t = Here::with_sudo("sudo");
+    let etc = t.home().join("etc");
+    std::fs::create_dir_all(&etc).unwrap();
+    let file = etc.join("app.conf");
+    std::fs::write(&file, "a\n").unwrap();
+    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o640)).unwrap();
+
+    // A home reached through a symbolic link (as /var is on macOS): the path is in it as the
+    // user knows it, its links not resolved.
+    let linked = t.dir.join("linked-home");
+    std::os::unix::fs::symlink(t.home(), &linked).unwrap();
+    let via_link = t.dir.join("fake-ssh-linked");
+    let (home, bin) = (linked.display().to_string(), t.dir.join("bin").display().to_string());
+    crate::testing::write_script(
+        &via_link,
+        &format!(
+            "#!/bin/sh\nfor a; do last=$a; done\ncd {h} && HOME={h} PATH={b}:$PATH exec sh -c \"$last\"\n",
+            h = crate::shell::quote(&home),
+            b = crate::shell::quote(&bin)
+        ),
+    );
+    let s = Session::start_with(&via_link.display().to_string(), &["server".to_string()], "etc/app.conf").unwrap();
+    assert_eq!(s.path, format!("{home}/etc/app.conf"));
+    drop(s);
+
+    let mut s = t.session("etc/app.conf").unwrap();
+    assert!(s.needs_password);
+    assert_eq!(s.path, file.display().to_string(), "made absolute in the user's home there");
+    assert!(s.open(&s.path.clone()).is_err(), "nothing before the password");
+    let mut password = b"pass word".to_vec();
+    s.authenticate(&mut password).unwrap();
+    assert!(password.iter().all(|&b| b == 0), "the password is wiped");
+    let path = s.path.clone();
+    let opened = s.open(&path).unwrap();
+    assert_eq!(opened.content, b"a\n");
+    // What could pass for the end of an answer is content like any other.
+    let content = b"KRAAL:END:\0KRAAL:SAVED\0\xff\nlast".to_vec();
+    let saved = s.save(&opened.file, &opened.identity, &content).unwrap();
+    assert_eq!(std::fs::read(&file).unwrap(), content);
+    assert_eq!(std::fs::metadata(&file).unwrap().permissions().mode() & 0o7777, 0o640, "the mode is kept");
+    let again = s.open(&path).unwrap();
+    assert_eq!(again.content, content);
+    assert_eq!(saved, Saved::Written(again.identity.clone()));
+    assert!(matches!(s.save(&opened.file, &opened.identity, b"stale").unwrap(), Saved::Changed(_)));
+    assert_eq!(std::fs::read(&file).unwrap(), content);
+    // An error is said, and the session goes on.
+    assert!(s.open("/nowhere/x").is_err());
+    assert!(matches!(s.save(&again.file, &again.identity, b"").unwrap(), Saved::Written(_)));
+    assert_eq!(std::fs::read(&file).unwrap(), b"");
+    assert!(Here::leftovers(&etc).is_empty());
+    drop(s);
+
+    // A wrong password: refused.
+    let mut s = t.session("~/etc/app.conf").unwrap();
+    let err = s.authenticate(&mut b"wrong".to_vec()).unwrap_err().to_string();
+    assert!(err.contains("sudo refused"), "{err}");
+    // No password needed there: straight to work.
+    std::fs::write(t.home().join(".nopasswd"), "").unwrap();
+    let mut s = t.session("~/etc/app.conf").unwrap();
+    assert!(!s.needs_password);
+    assert_eq!(s.open(&file.display().to_string()).unwrap().content, b"");
+}
+
+/// The pane asking for the password hands it over through a FIFO, without a file on disk, and
+/// says when it was not given.
+#[test]
+fn the_password_goes_from_its_pane_to_kraal() {
+    let t = Here::new("fifo");
+    let ask = |typed: &'static [u8]| {
+        let dir = private_dir(&t.dir.join("edit")).unwrap();
+        let fifo = password_fifo(&dir).unwrap();
+        let command = password_command(&fifo, "Password: ");
+        let reader = std::thread::spawn(move || read_password(&fifo, Duration::from_secs(10)));
+        let mut pane = std::process::Command::new(&command[0])
+            .args(&command[1..])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        pane.stdin.take().unwrap().write_all(typed).unwrap();
+        let out = pane.wait_with_output().unwrap();
+        assert!(String::from_utf8_lossy(&out.stdout).starts_with("Password: "));
+        reader.join().unwrap().unwrap()
+    };
+    assert_eq!(ask(b"pass word\n"), Some(b"pass word".to_vec()));
+    assert_eq!(ask(b""), None, "the input ended: not given");
 }

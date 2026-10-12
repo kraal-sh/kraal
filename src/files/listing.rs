@@ -144,7 +144,7 @@ pub(super) fn ssh_command_args(remote: &Remote) -> Option<Vec<String>> {
 /// The command ssh runs: a POSIX script, wrapped in `sh -c` so that it works
 /// whatever the login shell (fish, csh, …).
 pub(super) fn remote_command(path: &str) -> String {
-    format!("sh -c {}", crate::shell::quote_always(&remote_script(path)))
+    crate::shell::sh_c(&remote_script(path))
 }
 
 /// Prints `MARKER`, the resolved directory, then the entries. With GNU find: `F`, then

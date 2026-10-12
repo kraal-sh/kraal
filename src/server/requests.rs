@@ -65,61 +65,33 @@ impl Server {
             Request::OpenWorkspace { name } => {
                 self.open_workspace(&name).map(|_| Response::Ok).map_err(|e| format!("{e:#}"))
             }
-            Request::NewPane { target, command, cwd, name, placement, preview, focus, close_on_exit } => {
-                let target = match target.as_deref().map(|t| self.resolve(t)).transpose() {
-                    Ok(t) => t,
-                    Err(e) => return Some(Err(e)),
+            req @ Request::NewPane { .. } => {
+                // A kraal worktree git has not been asked about yet gives its number to the
+                // pane's variables: git is asked first, off the loop, and the pane opens once it
+                // has answered.
+                let unknown = match &req {
+                    Request::NewPane { cwd: Some(dir), .. } if self.worktree_unknown(dir) => Some(dir.clone()),
+                    _ => None,
                 };
-                let ws = match target.and_then(|t| self.workspace_of(t)) {
-                    Some((wi, _)) => self.workspaces[wi].id,
-                    None => match self
-                        .primary
-                        .and_then(|p| self.clients.get(&p))
-                        .map(|c| c.workspace)
-                        .or_else(|| self.workspaces.first().map(|w| w.id))
-                    {
-                        Some(ws) => ws,
-                        None => self.new_workspace("main".into(), None),
-                    },
-                };
-                let previous = match target.and_then(|t| self.workspace_of(t)) {
-                    Some((wi, ti)) => self.workspaces[wi].tabs[ti].focus,
-                    None => self
-                        .ws_index(ws)
-                        .and_then(|wi| self.workspaces[wi].tabs.get(self.workspaces[wi].active))
-                        .and_then(|t| t.focus),
-                };
-                // What is on screen, to put back when the new pane must not take the focus.
-                let shown = self.ws_index(ws).map(|wi| {
-                    let w = &self.workspaces[wi];
-                    (w.active, w.tabs.get(w.active).map(|t| t.show_floating))
-                });
-                let spec = PaneSpec { command, cwd, preview, close_on_exit, ..Default::default() };
-                match self.spawn_pane_in(ws, target, spec, placement, name) {
-                    Ok(id) => {
-                        if !focus {
-                            if let Some(prev) = previous
-                                && let Some((wi, ti)) = self.workspace_of(prev)
-                            {
-                                self.workspaces[wi].tabs[ti].set_focus(prev);
-                            }
-                            if let (Some(wi), Some((active, show_floating))) = (self.ws_index(ws), shown)
-                                && active < self.workspaces[wi].tabs.len()
-                            {
-                                let w = &mut self.workspaces[wi];
-                                w.active = active;
-                                if let Some(show) = show_floating {
-                                    w.tabs[active].show_floating = show && !w.tabs[active].floating.is_empty();
-                                }
-                            }
-                            self.relayout();
-                        }
-                        self.mark_dirty();
-                        Ok(Response::Pane(Box::new(self.pane_info(id))))
-                    }
-                    Err(e) => Err(format!("{e:#}")),
+                if let Some(dir) = unknown {
+                    self.background(
+                        move || {
+                            let info = crate::git::status(&dir);
+                            (dir, info)
+                        },
+                        move |server, (dir, info)| {
+                            server.git_result(dir, info.map(Box::new));
+                            let result = server.new_pane(req);
+                            server.send_msg(client, &ServerMsg::Response { result });
+                            server.clients.remove(&client);
+                            server.drop_empty_workspaces();
+                        },
+                    );
+                    return None;
                 }
+                self.new_pane(req)
             }
+
             Request::ClosePane { pane } => self.resolve(&pane).map(|p| {
                 self.close_pane(p);
                 Response::Ok
@@ -342,7 +314,7 @@ impl Server {
                     .map(|p| Response::Pane(Box::new(self.pane_info(p))))
                     .map_err(|e| format!("{e:#}"))
             }
-            Request::EditRemote { target, line, near, production } => {
+            Request::EditRemote { target, line, near, production, sudo } => {
                 let near = match near.as_deref().map(|n| self.resolve(n)).transpose() {
                     Ok(n) => n,
                     Err(e) => return Some(Err(e)),
@@ -379,7 +351,7 @@ impl Server {
                 let viewer = viewer.or_else(|| self.clients.values().find(shows).map(|c| c.id)).or(self.primary);
                 let mut ssh = self.ssh_options(&server);
                 ssh.push(server.destination());
-                let target = super::edits::EditTarget { server: server.name.clone(), ssh, path, line, ws, near };
+                let target = super::edits::EditTarget { server: server.name.clone(), ssh, path, line, ws, near, sudo };
                 self.start_edit(viewer, target, Some(client));
                 return None;
             }
@@ -411,6 +383,63 @@ impl Server {
                 return None;
             }
         })
+    }
+
+    /// Open a pane as `kraal run` asks.
+    fn new_pane(&mut self, req: Request) -> Result<Response, String> {
+        let Request::NewPane { target, command, cwd, name, placement, preview, focus, close_on_exit } = req else {
+            return Err("not a new pane".into());
+        };
+        let target = target.as_deref().map(|t| self.resolve(t)).transpose()?;
+        let ws = match target.and_then(|t| self.workspace_of(t)) {
+            Some((wi, _)) => self.workspaces[wi].id,
+            None => match self
+                .primary
+                .and_then(|p| self.clients.get(&p))
+                .map(|c| c.workspace)
+                .or_else(|| self.workspaces.first().map(|w| w.id))
+            {
+                Some(ws) => ws,
+                None => self.new_workspace("main".into(), None),
+            },
+        };
+        let previous = match target.and_then(|t| self.workspace_of(t)) {
+            Some((wi, ti)) => self.workspaces[wi].tabs[ti].focus,
+            None => self
+                .ws_index(ws)
+                .and_then(|wi| self.workspaces[wi].tabs.get(self.workspaces[wi].active))
+                .and_then(|t| t.focus),
+        };
+        // What is on screen, to put back when the new pane must not take the focus.
+        let shown = self.ws_index(ws).map(|wi| {
+            let w = &self.workspaces[wi];
+            (w.active, w.tabs.get(w.active).map(|t| t.show_floating))
+        });
+        let spec = PaneSpec { command, cwd, preview, close_on_exit, ..Default::default() };
+        match self.spawn_pane_in(ws, target, spec, placement, name) {
+            Ok(id) => {
+                if !focus {
+                    if let Some(prev) = previous
+                        && let Some((wi, ti)) = self.workspace_of(prev)
+                    {
+                        self.workspaces[wi].tabs[ti].set_focus(prev);
+                    }
+                    if let (Some(wi), Some((active, show_floating))) = (self.ws_index(ws), shown)
+                        && active < self.workspaces[wi].tabs.len()
+                    {
+                        let w = &mut self.workspaces[wi];
+                        w.active = active;
+                        if let Some(show) = show_floating {
+                            w.tabs[active].show_floating = show && !w.tabs[active].floating.is_empty();
+                        }
+                    }
+                    self.relayout();
+                }
+                self.mark_dirty();
+                Ok(Response::Pane(Box::new(self.pane_info(id))))
+            }
+            Err(e) => Err(format!("{e:#}")),
+        }
     }
 
     /// Resolve a pane reference: an id, a pane name, or `workspace:name`.

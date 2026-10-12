@@ -128,7 +128,7 @@ fn run(cli: Cli) -> Result<()> {
         }
         Some(Cmd::Rm { paths, expect }) => remote::remove(&paths, &expect),
         Some(Cmd::Files { left, right }) => remote::files(&s, left, right),
-        Some(Cmd::Edit { target, line, production }) => remote::edit(&s, target, line, production),
+        Some(Cmd::Edit { target, line, production, sudo }) => remote::edit(&s, target, line, production, sudo),
         Some(Cmd::Servers { action }) => {
             remote::servers(action.unwrap_or(ServersCmd::List { json: false, group: None }))
         }

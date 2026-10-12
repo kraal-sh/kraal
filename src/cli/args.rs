@@ -240,6 +240,10 @@ pub enum Cmd {
         /// The server is production and you mean to edit there.
         #[arg(long)]
         production: bool,
+        /// Edit it as root, through sudo on the server: a pane asks for your password, which
+        /// kraal hands to sudo and does not keep.
+        #[arg(long)]
+        sudo: bool,
     },
     /// Your servers: list, add, remove, import from workspaces, edit (~/.config/kraal/servers.toml).
     Servers {
@@ -435,13 +439,22 @@ pub enum WtCmd {
         /// Even with uncommitted changes or an unmerged branch.
         #[arg(long)]
         force: bool,
+        /// Even with ignored files the main checkout does not have (build output, local
+        /// databases): they are deleted with it.
+        #[arg(long)]
+        discard_ignored: bool,
     },
-    /// Remove the worktrees merged into their base and clean (no changes, every commit in their
-    /// base), with their branches; says why the others stay.
+    /// Remove the worktrees merged into their base and clean (no changes, every commit or its
+    /// changes in their base, no ignored file of their own), with their branches; says why the
+    /// others stay.
     Prune {
         /// Only say what would be removed.
         #[arg(long)]
         dry_run: bool,
+        /// Also remove merged worktrees with ignored files the main checkout does not have
+        /// (build output, local databases): they are deleted with them.
+        #[arg(long)]
+        discard_ignored: bool,
     },
 }
 

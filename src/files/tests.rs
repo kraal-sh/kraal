@@ -238,7 +238,8 @@ fn ssh_options_precede_the_destination() {
     let expected = ["-p", "2222", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", "-T", "me@srv"];
     assert_eq!(&args[..expected.len()], expected);
     assert_eq!(args.len(), expected.len() + 1);
-    assert!(args[expected.len()].starts_with("sh -c 'cd -- '\\''/var/log'\\'' || exit 1;"), "{}", args[8]);
+    let script = crate::shell::unwrap_sh_c(&args[expected.len()]);
+    assert!(script.starts_with("cd -- '/var/log' || exit 1;"), "{script}");
     let empty = Remote { server: "x".to_owned(), ssh_args: Vec::new(), path: "/".to_owned() };
     assert_eq!(ssh_command_args(&empty), None);
 }

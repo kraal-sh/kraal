@@ -451,11 +451,7 @@ pub fn check(tools: &BTreeMap<String, ToolDef>) -> Vec<String> {
 mod tests {
     use super::*;
 
-    /// The script inside `sh -c '<script>'`.
-    fn unwrap_sh_c(line: &str) -> String {
-        let quoted = line.strip_prefix("sh -c '").and_then(|q| q.strip_suffix('\'')).expect("an sh -c line");
-        quoted.replace("'\\''", "'")
-    }
+    use crate::shell::unwrap_sh_c;
 
     fn tool(toml_text: &str) -> ToolDef {
         toml::from_str(toml_text).unwrap()

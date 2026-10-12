@@ -1980,13 +1980,13 @@ mod tests {
         let steps =
             plan(std::slice::from_ref(&src), &Endpoint::Local("/tmp".into()), &opts, &with_rsync(false)).unwrap();
         assert_eq!(steps[0].program, "ssh");
-        assert_eq!(steps[0].args.last().unwrap(), "sh -c 'tar cf - -C /etc ./hosts'");
+        assert_eq!(crate::shell::unwrap_sh_c(steps[0].args.last().unwrap()), "tar cf - -C /etc ./hosts");
         assert_eq!(steps[0].pipe_to.as_ref().unwrap().program, "sh");
         let dest = parse_endpoint("b:/srv/in", &k).unwrap();
         let steps = plan(std::slice::from_ref(&src), &dest, &opts, &with_rsync(true)).unwrap();
         // Two ssh piped together by kraal (no shell, so no `pipefail` portability issue).
         assert_eq!(steps[0].program, "ssh");
-        assert_eq!(steps[0].args.last().unwrap(), "sh -c 'tar cf - -C /etc ./hosts'");
+        assert_eq!(crate::shell::unwrap_sh_c(steps[0].args.last().unwrap()), "tar cf - -C /etc ./hosts");
         let right = steps[0].pipe_to.as_ref().unwrap();
         assert!(right.args.windows(2).any(|w| w == ["-p", "2222"]), "{:?}", right.args);
         // One file to a name that is not a directory there: it takes that name, as with rsync.
@@ -1994,11 +1994,17 @@ mod tests {
         // Relative sources are taken from home, each on its own (a relative -C would chain).
         let rel = [parse_endpoint("a:logs/x", &k).unwrap(), parse_endpoint("a:conf/y", &k).unwrap()];
         let steps = plan(&rel, &dest, &opts, &with_rsync(true)).unwrap();
-        assert_eq!(steps[0].args.last().unwrap(), "sh -c 'tar cf - -C \"$HOME\"/logs ./x -C \"$HOME\"/conf ./y'");
+        assert_eq!(
+            crate::shell::unwrap_sh_c(steps[0].args.last().unwrap()),
+            "tar cf - -C \"$HOME\"/logs ./x -C \"$HOME\"/conf ./y"
+        );
         let same = parse_endpoint("a:/tmp/", &k).unwrap();
         let steps = plan(&[src], &same, &opts, &with_rsync(true)).unwrap();
         assert_eq!(steps[0].program, "ssh");
-        assert_eq!(steps[0].args.last().unwrap(), "sh -c 'mkdir -p -- /tmp/ || exit 1; cp -RP -- /etc/hosts /tmp/'");
+        assert_eq!(
+            crate::shell::unwrap_sh_c(steps[0].args.last().unwrap()),
+            "mkdir -p -- /tmp/ || exit 1; cp -RP -- /etc/hosts /tmp/"
+        );
     }
 
     #[test]
@@ -3117,7 +3123,7 @@ mod tests {
             &with_rsync(true),
         )
         .unwrap();
-        assert_eq!(steps[0].args.last().unwrap(), "sh -c 'tar cf - -C / .'");
+        assert_eq!(crate::shell::unwrap_sh_c(steps[0].args.last().unwrap()), "tar cf - -C / .");
     }
 
     #[test]

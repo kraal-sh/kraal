@@ -91,18 +91,14 @@ impl Server {
         self.git.get(&p.current_cwd()?)?.as_ref()
     }
 
-    /// The worktree a pane works in: the one kraal created for it, or found from its directory.
+    /// The worktree a pane works in: the one kraal created for it, or found from its directory
+    /// (from what the git thread said about it: git never runs on the event loop).
     pub fn pane_worktree(&self, pane: PaneId) -> Option<Worktree> {
         let p = self.panes.get(&pane)?;
         if let Some(w) = &p.spec.worktree {
             return Some(w.clone());
         }
-        let info = self.pane_git(pane)?;
-        let name = info.branch.strip_prefix("kraal/")?;
-        let repo = git::main_checkout(&info.root)?;
-        let branch = format!("kraal/{name}");
-        let base = git::worktree_base(&repo, &branch).unwrap_or_default();
-        Some(Worktree { repo, path: info.root.clone(), branch, base, index: info.worktree_index })
+        worktree_of(self.pane_git(pane)?)
     }
 
     /// Give a pane opened in a worktree that worktree's variables (its name, number and port
@@ -120,21 +116,48 @@ impl Server {
         }
     }
 
-    /// The kraal worktree `cwd` is in, and its number, as known without asking git: from a pane
-    /// kraal started for one, or from what git said about a pane's directory.
+    /// The kraal worktree `cwd` is in, and its number, as known without asking git: what git
+    /// said about that very directory, else from a pane kraal started for one, or from what git
+    /// said about a pane's directory.
     fn worktree_at(&self, cwd: &Path) -> Option<(String, u32)> {
+        // Its branch's name, or with another checked out (a detached HEAD), its own.
+        let named = |g: &GitInfo| {
+            let name = match g.branch.strip_prefix("kraal/") {
+                Some(name) => name.to_string(),
+                None => g.root.file_name()?.to_string_lossy().into_owned(),
+            };
+            Some((name, g.worktree_index))
+        };
+        if let Some(Some(g)) = self.git.get(cwd)
+            && g.worktree_index > 0
+        {
+            return named(g);
+        }
         let started = self
             .panes
             .values()
             .filter_map(|p| p.spec.worktree.as_ref())
-            .find(|w| w.index > 0 && cwd.starts_with(&w.path))
+            .find(|w| w.index > 0 && self.dir_within(cwd, &w.path))
             .map(|w| (w.name(), w.index));
         started.or_else(|| {
-            self.git.values().flatten().filter(|g| g.worktree_index > 0 && cwd.starts_with(&g.root)).find_map(|g| {
-                let name = g.branch.strip_prefix("kraal/")?;
-                Some((name.to_string(), g.worktree_index))
-            })
+            self.git
+                .values()
+                .flatten()
+                .filter(|g| g.worktree_index > 0 && self.dir_within(cwd, &g.root))
+                .find_map(named)
         })
+    }
+
+    /// Whether `dir` is `root` or inside it, `root` as git gives paths (symbolic links resolved):
+    /// `dir` as it is, or as the git thread found it resolved. Nothing is asked of the disk here.
+    fn dir_within(&self, dir: &Path, root: &Path) -> bool {
+        dir.starts_with(root) || self.git.get(dir).and_then(Option::as_ref).is_some_and(|g| g.real.starts_with(root))
+    }
+
+    /// Whether the variables of a pane to open in `cwd` are still to be found: it may be in a
+    /// kraal worktree git has not been asked about yet. Then git is asked first, off the loop.
+    pub(super) fn worktree_unknown(&self, cwd: &Path) -> bool {
+        worktree_setup::in_worktrees_dir(cwd) && !self.git.contains_key(cwd) && self.worktree_at(cwd).is_none()
     }
 
     /// The worktree a pane works in, for the sidebar: cheap, from what it was started with.
@@ -152,7 +175,7 @@ impl Server {
             .values()
             .filter(|p| {
                 p.spec.worktree.as_ref().is_some_and(|pw| pw.path == w.path)
-                    || (p.ssh.is_none() && p.current_cwd().is_some_and(|c| c.starts_with(&w.path)))
+                    || (p.ssh.is_none() && p.current_cwd().is_some_and(|c| self.dir_within(&c, &w.path)))
             })
             .map(|p| p.id)
             .collect()
@@ -174,7 +197,7 @@ impl Server {
         let (agent, name) = (agent.to_string(), name.to_string());
         self.toast(client, format!("creating worktree {name}…"));
         self.background(
-            move || Plan::new(&cwd, &name, None, user),
+            move || Plan::new(&cwd, &name, None, user, true),
             move |server, plan| match plan {
                 Ok(plan) if plan.needs_trust() => {
                     let question = plan.trust_question();
@@ -260,7 +283,7 @@ impl Server {
         };
         let prune = item(
             "Remove merged worktrees",
-            "those with nothing to lose: no changes, every commit in their base".into(),
+            "those with nothing to lose: no changes, every commit (or its changes) in their base".into(),
             "prune",
         );
         let Some(w) = self.pane_worktree(pane) else {
@@ -366,8 +389,10 @@ impl Server {
         };
         let panes = self.panes_in(&w);
         let mut lines = vec![format!("Remove the worktree {} and its branch {}?", w.path.display(), w.branch)];
-        if !state.is_clean() {
+        if !state.loses_nothing() {
             lines.push(format!("It has {}: they will be lost.", state.describe()));
+        } else if state.unmerged > 0 {
+            lines.push("Its commits are not in the history of its base, but all their changes are.".into());
         }
         if !panes.is_empty() {
             let names: Vec<String> = panes.iter().map(|p| self.pane_label(*p)).collect();
@@ -383,8 +408,9 @@ impl Server {
         );
     }
 
-    /// Offer to remove the worktrees that would lose nothing (no changes, every commit in their
-    /// base), saying which panes that closes and why the others stay.
+    /// Offer to remove the worktrees that would lose no work (no changes, every commit or all
+    /// its changes in their base), saying which panes that closes, which ignored files go with
+    /// them, and why the others stay.
     fn ask_prune_worktrees(&mut self, client: ClientId, states: Vec<(Worktree, Result<WorktreeState, String>)>) {
         let (mut merged, mut kept) = (Vec::new(), Vec::new());
         for (w, state) in states {
@@ -400,12 +426,24 @@ impl Server {
             return;
         }
         let mut lines = vec![format!(
-            "Remove {} and {}? They have no changes, and their base has all their commits:",
+            "Remove {} and {}? They have no changes, and their base has all their commits, or all their changes:",
             plural(merged.len(), "merged worktree"),
             if merged.len() == 1 { "its branch" } else { "their branches" }
         )];
-        for (w, _) in &merged {
-            lines.push(format!("  {}  {}", w.name(), crate::paths::shorten_home(&w.path)));
+        for (w, s) in &merged {
+            let how = if s.unmerged > 0 { "  (its changes are in its base)" } else { "" };
+            lines.push(format!("  {}  {}{how}", w.name(), crate::paths::shorten_home(&w.path)));
+        }
+        let ignored: Vec<String> = merged
+            .iter()
+            .filter(|(_, s)| !s.ignored.is_empty())
+            .map(|(w, s)| format!("{} ({})", w.name(), s.ignored_names()))
+            .collect();
+        if !ignored.is_empty() {
+            lines.push(format!(
+                "Their ignored files that the main checkout does not have are deleted with them: {}",
+                ignored.join(", ")
+            ));
         }
         let mut panes: Vec<PaneId> = Vec::new();
         for p in merged.iter().flat_map(|(w, _)| self.panes_in(w)) {
@@ -531,7 +569,12 @@ fn remove_unchanged(list: Vec<(Worktree, WorktreeState)>, pids: &[u32]) -> (Vec<
             );
         }
         let now = git::worktree_state(w)?;
-        anyhow::ensure!(now == *state, "{} changed since you confirmed ({}); ask again", w.name(), now.describe());
+        anyhow::ensure!(
+            now.same_work(state),
+            "{} changed since you confirmed ({}); ask again",
+            w.name(),
+            now.describe()
+        );
         Ok(())
     };
     let mut errors = Vec::new();
@@ -549,13 +592,15 @@ fn remove_unchanged(list: Vec<(Worktree, WorktreeState)>, pids: &[u32]) -> (Vec<
     let mut removed = Vec::new();
     for (w, state) in ready {
         let result = (|| -> Result<()> {
+            let now = git::worktree_state(&w)?;
             anyhow::ensure!(
-                git::worktree_state(&w)? == state,
+                now.same_work(&state),
                 "{} is still changing (something outside its panes writes there); nothing was removed",
                 w.name()
             );
-            // Losing changes or commits was shown and accepted; nothing else is lost.
-            git::remove_worktree(&w, !state.is_clean())
+            // What would be lost was shown and accepted; nothing else is lost: the branch goes
+            // only at the commit checked now.
+            git::remove_checked(&w, &now)
         })();
         match result {
             Ok(()) => removed.push(w),
@@ -563,6 +608,20 @@ fn remove_unchanged(list: Vec<(Worktree, WorktreeState)>, pids: &[u32]) -> (Vec<
         }
     }
     (removed, errors)
+}
+
+/// The kraal worktree git described with `info`, if it is one.
+fn worktree_of(info: &GitInfo) -> Option<Worktree> {
+    if !info.branch.starts_with("kraal/") || info.main.as_os_str().is_empty() {
+        return None;
+    }
+    Some(Worktree {
+        repo: info.main.clone(),
+        path: info.root.clone(),
+        branch: info.branch.clone(),
+        base: info.base.clone(),
+        index: info.worktree_index,
+    })
 }
 
 /// `1 merged worktree`, `2 merged worktrees`.
