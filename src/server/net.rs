@@ -356,19 +356,19 @@ impl Server {
         Ok(info)
     }
 
-    /// Close the tunnel on local port `key` (`5432` or `:5432`), or with id `#7`.
+    /// Close the tunnel on local port `key` (`5432` or `:5432`): the port is what names a tunnel,
+    /// no two share one, and it stays the same across restarts.
     pub fn remove_tunnel(&mut self, key: &str) -> Result<()> {
-        let i = match key.strip_prefix('#') {
-            Some(id) => {
-                let id: u32 = id.parse().with_context(|| format!("not a tunnel id: {key}"))?;
-                self.tunnels.iter().position(|t| t.id == id)
-            }
-            None => {
-                let port: u16 = key.trim_start_matches(':').parse().with_context(|| format!("not a port: {key}"))?;
-                self.tunnels.iter().position(|t| t.spec.local == port)
-            }
-        }
-        .with_context(|| format!("no tunnel {key}"))?;
+        let port: u16 = key
+            .trim_start_matches(':')
+            .parse()
+            .ok()
+            .with_context(|| format!("not a local port: {key} (`kraal tunnel list` shows each tunnel's)"))?;
+        let i = self
+            .tunnels
+            .iter()
+            .position(|t| t.spec.local == port)
+            .with_context(|| format!("no tunnel on localhost:{port} (see `kraal tunnel list`)"))?;
         let mut t = self.tunnels.remove(i);
         t.stop();
         self.mark_persist();

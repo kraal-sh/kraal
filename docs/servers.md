@@ -137,8 +137,8 @@ asks for more than a password (a one-time code), or that requires a terminal, is
 | `kraal ssh @prod --group -- journalctl -fu nginx` | one pane per server running it, in a grid |
 | `kraal tunnel add db 5432` | `localhost:5432` goes to db's 5432, and stays open |
 | `kraal tunnel add bastion db.internal:5432 --local 15432` | a port of a machine that server reaches, on the local port you choose |
-| `kraal tunnel list` | the tunnels and their state |
-| `kraal tunnel rm 15432` | closes one, by its local port |
+| `kraal tunnel list` | the tunnels: their state, the server and its port, and the local port each one is on |
+| `kraal tunnel rm 15432` | closes one, by its local port: the list shows it, and no two tunnels share one |
 
 `kraal exec` never asks for a password (the servers must take your key), and fails when a server
 did. In the server picker (`ctrl+b s`), Tab then "Run a command on it" runs one on the selected

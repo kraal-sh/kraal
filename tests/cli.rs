@@ -3863,6 +3863,27 @@ fn tunnels_are_up_when_ssh_listens_and_survive_a_restart() {
         assert!(start.elapsed() < Duration::from_secs(5), "the closed tunnel's ssh still runs");
         std::thread::sleep(Duration::from_millis(20));
     }
+    // The local port is what names a tunnel, and the list shows it: of two tunnels to the same
+    // port of two servers, each is closed by its own. A tunnel has no other name.
+    let to_wanted = |list: &str| -> Vec<(String, u16)> {
+        let lines = list.lines().filter(|l| l.contains(&format!(":{wanted} → localhost:")));
+        lines
+            .map(|l| {
+                let (server, local) = l.split_once(" → localhost:").unwrap();
+                (server.split_whitespace().last().unwrap().to_string(), local.trim().parse().unwrap())
+            })
+            .collect()
+    };
+    let both = to_wanted(&run(&["tunnel", "list"]));
+    assert_eq!(both.len(), 2, "{both:?}");
+    let out = env.cmd(&["tunnel", "rm", "#1"]).env("PATH", &path).output().unwrap();
+    let said = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !out.status.success() && said.contains("not a local port: #1") && said.contains("kraal tunnel list"),
+        "{said}"
+    );
+    run(&["tunnel", "rm", &both[1].1.to_string()]);
+    assert_eq!(to_wanted(&run(&["tunnel", "list"])), [both[0].clone()]);
 
     // A tunnel through a connection kraal knows by no name comes back through that connection.
     run(&["kill"]);
