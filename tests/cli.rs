@@ -204,6 +204,14 @@ impl RawClient {
     }
 }
 
+impl Drop for RawClient {
+    fn drop(&mut self) {
+        // The thread that keeps what the server sends holds the connection too: closed for both,
+        // so that the server sees this client go when the test lets go of it.
+        let _ = self.stream.shutdown(std::net::Shutdown::Both);
+    }
+}
+
 fn raw_frame(w: &mut impl std::io::Write, kind: u8, payload: &[u8]) {
     let mut frame = (payload.len() as u32).to_le_bytes().to_vec();
     frame.push(kind);
@@ -6044,14 +6052,14 @@ fn install_script_installs_a_checked_release() {
     assert!(!dir.join("kraal").exists(), "nothing installed");
 }
 
-/// A throwaway sshd on 127.0.0.1 (port 2305 unless said otherwise) with its own host and user
-/// keys, and an `ssh` that uses only them (never ~/.ssh): a server reached for real. `None` where
-/// no sshd can run here.
+/// A throwaway sshd on 127.0.0.1 with its own host and user keys, and an `ssh` that uses only
+/// them (never ~/.ssh): a server reached for real. `None` where no sshd can run here.
 #[cfg(target_os = "linux")]
 struct Sshd {
     child: std::process::Child,
-    /// Holds the port for this test, against other test runs on this machine.
-    _lock: std::fs::File,
+    /// Where it listens: a port of its own, so that no test waits for the server of another
+    /// one, in this run of the tests or in another on this machine.
+    port: u16,
     /// Where that `ssh` is, to put first in PATH.
     bin: PathBuf,
 }
@@ -6059,23 +6067,10 @@ struct Sshd {
 #[cfg(target_os = "linux")]
 impl Sshd {
     fn start(dir: &Path) -> Option<Sshd> {
-        Sshd::start_on(dir, 2305)
-    }
-
-    fn start_on(dir: &Path, port: u16) -> Option<Sshd> {
-        use std::os::fd::AsRawFd;
         let sshd = ["/usr/sbin/sshd", "/usr/bin/sshd"].into_iter().map(PathBuf::from).find(|p| p.exists())?;
         let ssh =
             ["/usr/bin/ssh", "/bin/ssh", "/usr/local/bin/ssh"].into_iter().map(PathBuf::from).find(|p| p.exists())?;
         std::fs::create_dir_all(dir).unwrap();
-        let lock = std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .open(format!("/tmp/kraal-test-sshd-{port}.lock"))
-            .unwrap();
-        // SAFETY: flock on a descriptor we own; released when it is closed.
-        unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) };
         for key in ["host_key", "user_key"] {
             let made =
                 Command::new("ssh-keygen").args(["-q", "-t", "ed25519", "-N", "", "-f"]).arg(dir.join(key)).status();
@@ -6086,18 +6081,7 @@ impl Sshd {
         std::fs::copy(dir.join("user_key.pub"), dir.join("authorized_keys")).unwrap();
         let user = String::from_utf8(Command::new("id").arg("-un").output().unwrap().stdout).unwrap();
         let d = dir.display();
-        std::fs::write(
-            dir.join("sshd_config"),
-            format!(
-                "Port {port}\nListenAddress 127.0.0.1\nHostKey {d}/host_key\nPidFile {d}/sshd.pid\n\
-                 AuthorizedKeysFile {d}/authorized_keys\nStrictModes no\nUsePAM no\nPasswordAuthentication no\n\
-                 KbdInteractiveAuthentication no\nPubkeyAuthentication yes\nAllowUsers {}\n",
-                user.trim()
-            ),
-        )
-        .unwrap();
         let host_key = std::fs::read_to_string(dir.join("host_key.pub")).unwrap();
-        std::fs::write(dir.join("known_hosts"), format!("[127.0.0.1]:{port} {host_key}")).unwrap();
         std::fs::write(
             dir.join("ssh_config"),
             format!(
@@ -6121,20 +6105,42 @@ impl Sshd {
             ),
         );
         let log = dir.join("sshd.log");
-        let child =
-            Command::new(&sshd).arg("-D").arg("-f").arg(dir.join("sshd_config")).arg("-E").arg(&log).spawn().ok()?;
-        let mut sshd = Sshd { child, _lock: lock, bin };
-        let start = Instant::now();
         loop {
-            let said = std::fs::read_to_string(&log).unwrap_or_default();
-            if said.contains("Server listening") {
-                return Some(sshd);
+            // A port the system says is free. Another program may take it before sshd does:
+            // sshd says so, and another one is asked for.
+            let port = std::net::TcpListener::bind(("127.0.0.1", 0)).ok()?.local_addr().ok()?.port();
+            std::fs::write(
+                dir.join("sshd_config"),
+                format!(
+                    "Port {port}\nListenAddress 127.0.0.1\nHostKey {d}/host_key\nPidFile {d}/sshd.pid\n\
+                     AuthorizedKeysFile {d}/authorized_keys\nStrictModes no\nUsePAM no\nPasswordAuthentication no\n\
+                     KbdInteractiveAuthentication no\nPubkeyAuthentication yes\nAllowUsers {}\n",
+                    user.trim()
+                ),
+            )
+            .unwrap();
+            std::fs::write(dir.join("known_hosts"), format!("[127.0.0.1]:{port} {host_key}")).unwrap();
+            let _ = std::fs::remove_file(&log);
+            let config = dir.join("sshd_config");
+            let child = Command::new(&sshd).arg("-D").arg("-f").arg(config).arg("-E").arg(&log).spawn().ok()?;
+            let mut sshd = Sshd { child, port, bin: bin.clone() };
+            let start = Instant::now();
+            let said = || std::fs::read_to_string(&log).unwrap_or_default();
+            loop {
+                if said().contains("Server listening") {
+                    return Some(sshd);
+                }
+                // What it said last is read once it has ended.
+                let ended = sshd.child.try_wait().ok().flatten().is_some();
+                if ended && said().contains("Address already in use") {
+                    break;
+                }
+                if ended || start.elapsed() > PATIENCE {
+                    eprintln!("sshd did not start: {}", said());
+                    return None;
+                }
+                std::thread::sleep(Duration::from_millis(50));
             }
-            if sshd.child.try_wait().ok().flatten().is_some() || start.elapsed() > PATIENCE {
-                eprintln!("sshd did not start: {said}");
-                return None;
-            }
-            std::thread::sleep(Duration::from_millis(50));
         }
     }
 }
@@ -6142,9 +6148,12 @@ impl Sshd {
 #[cfg(target_os = "linux")]
 impl Drop for Sshd {
     fn drop(&mut self) {
-        // SAFETY: the pid of the child this test started, not reaped yet.
-        unsafe { libc::kill(self.child.id() as i32, libc::SIGTERM) };
-        let _ = self.child.wait();
+        // One that could not start has ended, and its pid may be another program's by now.
+        if let Ok(None) = self.child.try_wait() {
+            // SAFETY: the pid of the child this test started, not reaped yet.
+            unsafe { libc::kill(self.child.id() as i32, libc::SIGTERM) };
+            let _ = self.child.wait();
+        }
     }
 }
 
@@ -6162,7 +6171,11 @@ fn a_server_file_is_edited_in_the_local_editor() {
     };
     let user = String::from_utf8(Command::new("id").arg("-un").output().unwrap().stdout).unwrap();
     let entry = |name: &str| {
-        format!("[[server]]\nname = \"{name}\"\nhost = \"127.0.0.1\"\nport = 2305\nuser = \"{}\"\n", user.trim())
+        format!(
+            "[[server]]\nname = \"{name}\"\nhost = \"127.0.0.1\"\nport = {}\nuser = \"{}\"\n",
+            sshd.port,
+            user.trim()
+        )
     };
     std::fs::write(env.root.join("config/kraal/servers.toml"), format!("{}\n{}", entry("box"), entry("box-prod")))
         .unwrap();
@@ -6675,7 +6688,7 @@ fn the_paste_buffers_list_deletes_and_stays_open() {
     client.send(b"\x1b");
 }
 
-/// A session, a real sshd (on its own port) as the server `box`, and a local editor told what
+/// A session, a real sshd as the server `box`, and a local editor told what
 /// to do, for the tests of editing a server's file. The commands kraal runs there find a `sudo`
 /// that takes the password `pass word` (and runs them as this user), and wait 2 seconds once
 /// the file `slow` exists.
@@ -6690,13 +6703,17 @@ struct EditBench {
 
 #[cfg(target_os = "linux")]
 impl EditBench {
-    fn new(name: &str, port: u16) -> Option<EditBench> {
+    fn new(name: &str) -> Option<EditBench> {
         let env = Env::new(name);
-        let sshd = Sshd::start_on(&env.root.join("sshd"), port)?;
+        let sshd = Sshd::start(&env.root.join("sshd"))?;
         let user = String::from_utf8(Command::new("id").arg("-un").output().unwrap().stdout).unwrap();
         std::fs::write(
             env.root.join("config/kraal/servers.toml"),
-            format!("[[server]]\nname = \"box\"\nhost = \"127.0.0.1\"\nport = {port}\nuser = \"{}\"\n", user.trim()),
+            format!(
+                "[[server]]\nname = \"box\"\nhost = \"127.0.0.1\"\nport = {}\nuser = \"{}\"\n",
+                sshd.port,
+                user.trim()
+            ),
         )
         .unwrap();
         let cfg = env.root.join("config/kraal/config.toml");
@@ -6793,7 +6810,7 @@ fn read(p: &Path) -> String {
 #[test]
 fn a_server_file_is_edited_as_root_through_sudo() {
     use std::os::unix::fs::PermissionsExt;
-    let Some(b) = EditBench::new("rsudo", 2311) else {
+    let Some(b) = EditBench::new("rsudo") else {
         eprintln!("skipped: no sshd can run here");
         return;
     };
@@ -6855,7 +6872,7 @@ fn a_server_file_is_edited_as_root_through_sudo() {
 #[cfg(target_os = "linux")]
 #[test]
 fn keeping_the_servers_version_never_drops_a_later_save() {
-    let Some(b) = EditBench::new("rkeep", 2311) else {
+    let Some(b) = EditBench::new("rkeep") else {
         eprintln!("skipped: no sshd can run here");
         return;
     };
