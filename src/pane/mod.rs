@@ -1290,6 +1290,21 @@ mod tests {
         assert_eq!(pane.display_offset(), 0);
     }
 
+    /// `$` at the end of a wrapped line that a scroll moved down to the bottom row: the line ends
+    /// there, nothing below the screen.
+    #[test]
+    fn copy_mode_goes_to_the_end_of_a_line_wrapped_at_the_bottom() {
+        use alacritty_terminal::vi_mode::ViMotion;
+        let mut pane = fed_pane(10, 3, 100);
+        pane.feed(b"abcdefghijklmno\x1b[2T");
+        pane.copy_mode(true);
+        pane.vi_motion(ViMotion::Low);
+        pane.vi_motion(ViMotion::Last);
+        pane.vi_motion(ViMotion::Last);
+        let point = pane.term().unwrap().term.vi_mode_cursor.point;
+        assert_eq!((point.line.0, point.column.0), (2, 9));
+    }
+
     #[test]
     fn shells_are_told_from_other_programs() {
         for shell in ["zsh", "-zsh", "/bin/bash", "/usr/bin/fish", "sh"] {

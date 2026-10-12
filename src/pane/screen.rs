@@ -223,7 +223,7 @@ impl Pane {
             t.reveal_below(t.term.vi_mode_cursor.point.line, more);
             loop {
                 let (cursor, selection) = (t.term.vi_mode_cursor, t.term.selection.clone());
-                t.term.vi_motion(motion);
+                vi_move(&mut t.term, motion);
                 let line = t.term.vi_mode_cursor.point.line;
                 if t.beyond_lens(line) {
                     // Past the lines laid out far back: those after them come first.
@@ -237,7 +237,7 @@ impl Pane {
                     t.term.vi_mode_cursor = cursor;
                     t.term.selection = selection;
                     if !t.reveal(t.term.grid().history_size() + more) {
-                        t.term.vi_motion(motion);
+                        vi_move(&mut t.term, motion);
                         break;
                     }
                 } else {
@@ -496,6 +496,21 @@ impl Pane {
             return None;
         }
         Some(Cursor { x: area.x + x, y: area.y + y, shape, blinking: t.term.cursor_style().blinking })
+    }
+}
+
+/// Move the copy-mode cursor as the emulator does. A line that wraps onto the next ends at the
+/// bottom of the screen at the latest: alacritty 0.26 looks for the end of a wrapped line (`$`)
+/// below the grid when the bottom line says it wraps (a scroll moved it there).
+fn vi_move<T: alacritty_terminal::event::EventListener>(term: &mut Term<T>, motion: ViMotion) {
+    let (bottom, last) = (term.bottommost_line(), term.last_column());
+    let wraps = term.grid()[bottom][last].flags.contains(Flags::WRAPLINE);
+    if wraps {
+        term.grid_mut()[bottom][last].flags.remove(Flags::WRAPLINE);
+    }
+    term.vi_motion(motion);
+    if wraps {
+        term.grid_mut()[bottom][last].flags.insert(Flags::WRAPLINE);
     }
 }
 
