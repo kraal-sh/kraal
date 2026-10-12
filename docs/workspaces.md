@@ -53,7 +53,9 @@ default when nothing would stop; `kraal restart --yes` does not ask. Without a t
 (a script), it restarts when nothing would stop and fails otherwise. A session that cannot be
 saved (a full disk) is not restarted: it keeps running, and the restart says why. Attached
 terminals wait for the new server and come back to the workspace they showed. Run from a pane of
-the session, the command stays in that pane until the restart closes it.
+the session, the command lists the same programs as from anywhere else, the jobs in the
+background of that pane included (but not itself, nor a script that runs it), and it stays in
+that pane until the restart closes it.
 
 Each pane also shows again what it showed, scrollback and colours included, down to a dim
 `kraal: restored from <time>` line; what runs in it now writes below that line. Copy mode and

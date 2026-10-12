@@ -94,6 +94,18 @@ pub fn ppid(pid: u32) -> Option<u32> {
     imp::ppid(pid)
 }
 
+/// `pid` and the processes it descends from (the one that started it, the one that started
+/// that one, and so on), nearest first.
+pub fn lineage(pid: u32) -> Vec<u32> {
+    let mut line = vec![pid];
+    let mut next = ppid(pid);
+    while let Some(parent) = next.filter(|p| *p > 1 && !line.contains(p)) {
+        line.push(parent);
+        next = ppid(parent);
+    }
+    line
+}
+
 /// Whether the process that had this id and start time (see [`start_time`]) still runs: not
 /// another one that got its id since.
 pub fn still_running(pid: u32, started: u64) -> bool {
@@ -153,8 +165,9 @@ pub fn session_members(sid: libc::pid_t) -> Vec<libc::pid_t> {
 /// `&`): the process groups of the session, but the leader's own and the one in the terminal's
 /// foreground, with processes that have the terminal open; each by the command line of one of
 /// those, its leader when it is one. Hanging the session up stops them. What keeps off the
-/// terminal (a prompt's daemon, `nohup`) is no job of the user's.
-pub fn background_jobs(leader: u32) -> Vec<Vec<String>> {
+/// terminal (a prompt's daemon, `nohup`) is no job of the user's, nor are the processes `not`
+/// (whoever asks, when it runs there itself): a group of those alone is no job.
+pub fn background_jobs(leader: u32, not: &[u32]) -> Vec<Vec<String>> {
     let (Ok(sid), Some(terminal)) = (libc::pid_t::try_from(leader), imp::terminal_of(leader)) else {
         return Vec::new();
     };
@@ -163,7 +176,7 @@ pub fn background_jobs(leader: u32) -> Vec<Vec<String>> {
     let mut shown: std::collections::BTreeMap<libc::pid_t, libc::pid_t> = Default::default();
     for pid in session_members(sid) {
         let Some(group) = imp::group_of(pid).filter(|g| *g != sid && Some(*g) != foreground) else { continue };
-        if !imp::open_files(pid as u32).contains(&terminal) {
+        if not.contains(&(pid as u32)) || !imp::open_files(pid as u32).contains(&terminal) {
             continue;
         }
         let process = shown.entry(group).or_insert(pid);
@@ -798,6 +811,18 @@ mod tests {
             child.wait().unwrap();
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_lineage_goes_up_from_a_process_to_what_started_it() {
+        let me = std::process::id();
+        let mut child = std::process::Command::new("sleep").arg("5").spawn().unwrap();
+        let line = lineage(child.id());
+        assert_eq!(line[..2], [child.id(), me]);
+        assert_eq!(line[1..], lineage(me));
+        assert!(!line.contains(&1), "{line:?}");
+        child.kill().unwrap();
+        child.wait().unwrap();
     }
 
     #[test]

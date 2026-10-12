@@ -5638,6 +5638,53 @@ fn a_restart_from_the_last_pane_outlives_it() {
     assert!(env.run(&["panes"]).contains("only"));
 }
 
+/// `kraal restart` run in a pane of the session says what stops as it does from anywhere else:
+/// the jobs in the background of its own pane too. Only the command itself and what runs it (a
+/// script) are not programs that stop, in the foreground or in the background.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_restart_from_a_pane_says_what_stops_in_that_pane_too() {
+    let env = Env::new("ownjobs");
+    env.workspace("w", "layout {\n    pane name=\"shell\"\n}\n");
+    env.run(&["open", "w"]);
+    let pid = env.server_pid().expect("the server runs");
+    let running = |argv: &[u8]| {
+        std::fs::read_dir("/proc")
+            .unwrap()
+            .flatten()
+            .any(|e| std::fs::read(e.path().join("cmdline")).is_ok_and(|c| c == argv))
+    };
+    env.run(&["send", "-p", "shell", "--enter", "sleep 4251 &"]);
+    wait_until(Duration::from_secs(10), "the job never started", || running(b"sleep\x004251\x00"));
+    // Without a terminal to ask on, the command says what stops and goes no further.
+    let said = env.root.join("said");
+    let restart = format!("'{}' restart </dev/null >'{}' 2>&1", env!("CARGO_BIN_EXE_kraal"), said.display());
+    let script = env.root.join("restart.sh");
+    write_script(&script, &format!("#!/bin/sh\n{restart}\n"));
+    let stops = |typed: &str| -> Vec<String> {
+        let _ = std::fs::remove_file(&said);
+        env.run(&["send", "-p", "shell", "--enter", typed]);
+        let mut text = String::new();
+        wait_until(Duration::from_secs(10), "the restart did not stop at what it would stop", || {
+            text = std::fs::read_to_string(&said).unwrap_or_default();
+            text.contains("add --yes")
+        });
+        text.lines().filter_map(|line| line.strip_prefix("  ")).map(String::from).collect()
+    };
+    for typed in [restart.clone(), format!("sh '{}'", script.display()), format!("{restart} &")] {
+        let stops = stops(&typed);
+        assert_eq!(stops.len(), 1, "{typed}: {stops:?}");
+        assert!(stops[0].starts_with("sleep 4251 (in the background)  (pane "), "{typed}: {stops:?}");
+    }
+    // The same list as from outside the session.
+    let out = env.try_run(&["restart"]);
+    let said = String::from_utf8_lossy(&out.stdout);
+    assert!(said.contains("These programs stop:\n  sleep 4251 (in the background)  (pane "), "{said}");
+    assert_eq!(said.lines().filter(|line| line.starts_with("  ")).count(), 1, "{said}");
+    assert_eq!(env.server_pid(), Some(pid));
+    assert!(running(b"sleep\x004251\x00"));
+}
+
 /// A job left in the background of a shell stops with a restart (the terminal hangs up): it is
 /// said with what stops, and the restart needs a yes for it. What the shell runs off its
 /// terminal (a prompt's daemon) is not the user's job.

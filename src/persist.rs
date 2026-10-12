@@ -316,16 +316,31 @@ pub fn stops_with_server(
     program: Option<&[String]>,
     jobs: &[Vec<String>],
 ) -> Vec<String> {
-    if pane.kind != "terminal" || pane.suspended || pane.exit_code.is_some() {
-        return Vec::new();
-    }
-    let background = jobs.iter().map(|job| format!("{} (in the background)", command_line(job)));
-    stops_in_foreground(pane, program).into_iter().chain(background).collect()
+    stops_in_foreground(pane, program).into_iter().chain(jobs_stopping_with_server(pane, jobs)).collect()
 }
 
-/// What stopping the server stops in the foreground of a running terminal pane (see
+/// What stopping the server stops in the background of a pane's terminal (see
+/// [`stops_with_server`]). It is all that stops in the pane of a command that asks to stop the
+/// server: what is in the foreground there is that command.
+pub fn jobs_stopping_with_server(pane: &crate::protocol::PaneInfo, jobs: &[Vec<String>]) -> Vec<String> {
+    if !runs_in_terminal(pane) {
+        return Vec::new();
+    }
+    jobs.iter().map(|job| format!("{} (in the background)", command_line(job))).collect()
+}
+
+/// Whether a program runs in the pane's terminal: not a preview, a command waiting for Enter or
+/// one that ended.
+fn runs_in_terminal(pane: &crate::protocol::PaneInfo) -> bool {
+    pane.kind == "terminal" && !pane.suspended && pane.exit_code.is_none()
+}
+
+/// What stopping the server stops in the foreground of a pane's terminal (see
 /// [`stops_with_server`]).
 fn stops_in_foreground(pane: &crate::protocol::PaneInfo, program: Option<&[String]>) -> Option<String> {
+    if !runs_in_terminal(pane) {
+        return None;
+    }
     if let Some(agent) = &pane.agent {
         return (pane.state == crate::agent::AgentState::Working)
             .then(|| format!("{agent}: the turn in progress (the conversation resumes)"));
