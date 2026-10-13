@@ -80,6 +80,9 @@ cannot tell, and asks first. It knows a block was sent, not whether it succeeded
 Of a `console` block, only the lines after a `$` prompt are sent. Your existing procedure docs
 become runnable without being rewritten.
 
+Tab on a shell block offers to run or copy that step. The `‹ other runbooks` line only returns
+to the runbook list; its footer says so, and it offers no step actions.
+
 ## Repository runbooks
 
 A runbook from a repository is a file someone else may have written, and it runs commands on

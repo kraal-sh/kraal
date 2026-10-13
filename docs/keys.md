@@ -121,7 +121,9 @@ move the focused pane's border, Enter or Esc ends it.
 
 In lists, type to filter, `↑↓` move, Enter chooses, **Tab shows what else can be done** with the
 selected item (connect in a new tab, browse its files, run a command…), each also on a key of its
-own that the list shows, Esc closes. Text fields edit like a shell line (arrows, `home`/`end`,
+own that the list shows, Esc closes. The footer says what Enter does on the selected line;
+only actions that apply to that line are offered. When there are no other actions, Tab moves
+to the next line. Text fields edit like a shell line (arrows, `home`/`end`,
 `alt+←→`, `ctrl+w`, `ctrl+u`, `ctrl+k`). Questions show two buttons, Cancel first: `y` answers
 yes, `n` or Esc no, Enter takes the selected button (`←→` or Tab change it). A question longer
 than its box says how many lines are below and scrolls: `↑↓` (or `j` `k`) by a line, `pageup`

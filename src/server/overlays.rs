@@ -487,8 +487,11 @@ pub(super) fn draw_picker(p: &Picker, screen: Rect, buf: &mut Buffer) -> Option<
         buf.set_stringn(list.x + 2, list.y, msg, list.width.saturating_sub(2) as usize, dim());
     }
     let keys = p.action_keys();
-    let enter = lower_first(keys[0].1);
-    let mut footer: Vec<(&str, &str)> = vec![("⏎", &enter)];
+    let enter = keys.first().map(|(_, what)| lower_first(what));
+    let mut footer: Vec<(&str, &str)> = Vec::new();
+    if let Some(enter) = &enter {
+        footer.push(("⏎", enter));
+    }
     if keys.len() > 1 {
         footer.push(("tab", "more actions"));
     }
@@ -816,6 +819,48 @@ mod tests {
         (area.top()..area.bottom())
             .map(|y| (area.left()..area.right()).map(|x| buf[(x, y)].symbol()).collect::<String>() + "\n")
             .collect()
+    }
+
+    #[test]
+    fn picker_footers_describe_the_selected_line_at_both_sizes() {
+        use super::super::ui::{PickAction, PickItem, PickerKind};
+        for (w, h) in [(124, 36), (80, 24)] {
+            let area = Rect::new(0, 0, w, h);
+            let cases = [
+                (PickerKind::Agent, PickAction::AgentAdd { agent: "claude".into() }, "add account", false),
+                (
+                    PickerKind::Agent,
+                    PickAction::AgentSwitch { pane: 1, agent: "codex".into(), account: "work".into(), current: false },
+                    "switch account",
+                    false,
+                ),
+                (
+                    PickerKind::Agent,
+                    PickAction::AgentSwitch { pane: 1, agent: "codex".into(), account: "work".into(), current: true },
+                    "keep current account",
+                    false,
+                ),
+                (PickerKind::Ssh, PickAction::SshGroup("web".into()), "open group", true),
+                (PickerKind::Workspace, PickAction::OpenDefinition("w.kdl".into()), "open workspace", false),
+                (PickerKind::RunbookSteps, PickAction::RunbookList, "back to runbooks", false),
+            ];
+            for (kind, action, enter, more) in cases {
+                let p = Picker::new(kind, "List", vec![PickItem::new("item", "", action)]);
+                let mut buf = Buffer::empty(area);
+                draw_picker(&p, area, &mut buf);
+                let layout = picker_layout(&p, area);
+                let footer = screen(&buf, Rect::new(layout.area.x, layout.area.bottom() - 2, layout.area.width, 1));
+                assert!(footer.contains(enter), "{w}×{h}: {footer}");
+                assert_eq!(footer.contains("more actions"), more, "{footer}");
+                assert_eq!(layout.row_at(layout.list.x + 2, layout.list.y), Some(0));
+            }
+            let p = Picker::new(PickerKind::Agent, "Agents", vec![]);
+            let mut buf = Buffer::empty(area);
+            draw_picker(&p, area, &mut buf);
+            let text = screen(&buf, area);
+            assert!(text.contains("esc close"));
+            assert!(!text.contains("⏎") && !text.contains("more actions"), "{text}");
+        }
     }
 
     #[test]
