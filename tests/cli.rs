@@ -6293,6 +6293,15 @@ fn a_tab_attached_to_a_server_shows_each_agent_there_in_turn() {
     assert_eq!(panes.as_array().unwrap().len(), 2, "no other tab attached: {panes}");
 }
 
+/// Copy the program `from` to `to`. A child process copies it, as one writes a script
+/// ([`write_script`]): a program this process wrote cannot be run ("text file busy") while a
+/// child that another test started at that moment still holds its file, on its way to running
+/// what it was started for.
+fn copy_program(from: &str, to: &Path) {
+    let copied = Command::new("cp").arg(from).arg(to).status().unwrap();
+    assert!(copied.success(), "copying {from} to {}", to.display());
+}
+
 /// A release as GitHub serves it, made from this build: `kraal-<target>.tar.gz` and its
 /// checksum, in `dir`.
 fn fake_release(dir: &Path) -> String {
@@ -6317,9 +6326,7 @@ fn fake_release_of(dir: &Path, version: Option<&str>) -> String {
                 env!("CARGO_BIN_EXE_kraal")
             ),
         ),
-        None => {
-            std::fs::copy(env!("CARGO_BIN_EXE_kraal"), inner.join("kraal")).unwrap();
-        }
+        None => copy_program(env!("CARGO_BIN_EXE_kraal"), &inner.join("kraal")),
     }
     let asset = format!("kraal-{target}.tar.gz");
     let tar = Command::new("tar")
@@ -6353,7 +6360,7 @@ fn update_installs_a_checked_release_in_place() {
     let bin = env.root.join("bin");
     std::fs::create_dir_all(&bin).unwrap();
     let kraal = bin.join("kraal");
-    std::fs::copy(env!("CARGO_BIN_EXE_kraal"), &kraal).unwrap();
+    copy_program(env!("CARGO_BIN_EXE_kraal"), &kraal);
     let url = format!("file://{}", release.display());
     let update =
         |args: &[&str]| env.isolated(&kraal).arg("update").args(args).env("KRAAL_DOWNLOAD_URL", &url).output().unwrap();
@@ -6399,7 +6406,7 @@ fn update_offers_to_restart_the_sessions_left_on_an_older_kraal() {
     // Each update replaces this copy with the release's kraal: put this build back first.
     let install = || {
         let _ = std::fs::remove_file(&kraal);
-        std::fs::copy(env!("CARGO_BIN_EXE_kraal"), &kraal).unwrap();
+        copy_program(env!("CARGO_BIN_EXE_kraal"), &kraal);
     };
     let url = format!("file://{}", release.display());
     let update = |args: &[&str]| {
@@ -7503,8 +7510,12 @@ fn the_paste_buffers_list_pastes_shows_and_deletes() {
     std::thread::sleep(Duration::from_millis(150));
     client.send(b"\t");
     client.wait_for_screen("Show in a preview pane");
+    // Escape is the key once the server has waited for what may follow it: a key that reached
+    // it sooner, on a machine that took its time to read the Escape, would be Alt with that key.
     client.send(b"\x1b");
-    std::thread::sleep(Duration::from_millis(150));
+    client.wait_for_rows("back at the list", |rows| {
+        rows.iter().any(|r| r.contains("Paste buffers")) && !rows.iter().any(|r| r.contains("Show in a preview pane"))
+    });
     client.send(b"\x0f");
     env.wait_for_text("buffer 0", "newest-text");
     let panes: serde_json::Value = serde_json::from_str(&env.run(&["panes", "--json"])).unwrap();

@@ -314,10 +314,16 @@ mod imp {
     }
 
     pub fn running(pid: libc::pid_t) -> bool {
+        std::fs::read(format!("/proc/{pid}/stat")).is_ok_and(|stat| runs(&stat))
+    }
+
+    /// Whether `stat`, a process's line in `/proc`, is that of one that still runs: not one that
+    /// ended and waits to be reaped (Z), nor one being reaped (X), which is there for a moment
+    /// between the two.
+    pub fn runs(stat: &[u8]) -> bool {
         // The state follows the command name, which is in parentheses and may hold any byte.
-        let Ok(stat) = std::fs::read(format!("/proc/{pid}/stat")) else { return false };
         let Some(end) = stat.iter().rposition(|b| *b == b')') else { return false };
-        stat[end + 1..].iter().find(|b| !b.is_ascii_whitespace()) != Some(&b'Z')
+        !matches!(stat[end + 1..].iter().find(|b| !b.is_ascii_whitespace()), Some(b'Z' | b'X'))
     }
 
     pub fn session_members(sid: libc::pid_t) -> Vec<libc::pid_t> {
@@ -751,6 +757,19 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(100));
         }
         assert!(listening_ports().contains(&port));
+    }
+
+    /// A process that ended runs no more, whether it waits to be reaped or is being reaped: the
+    /// second is shown for a moment after the first, and is no process that came back.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_process_being_reaped_runs_no_more() {
+        assert!(imp::runs(b"4242 (sleep) S 1 4242 4242 0 -1 4194304"));
+        assert!(imp::runs(b"4242 (a) Z (b) R 1 4242 4242 0 -1 4194304"), "the state follows the whole name");
+        assert!(!imp::runs(b"4242 (sleep) Z 1 4242 4242 0 -1 4194304"));
+        assert!(!imp::runs(b"4242 (sleep) X 1 4242 4242 0 -1 4194304"));
+        assert!(!imp::runs(b"4242 (S) X 1 4242 4242 0 -1 4194304"));
+        assert!(!imp::runs(b""));
     }
 
     #[test]
