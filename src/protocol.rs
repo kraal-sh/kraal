@@ -64,8 +64,10 @@ pub const LIST_AGENTS: Feature =
 pub const BUFFERS: Feature = Feature { name: "buffers", does: "keep paste buffers", check_first: false };
 pub const EDIT_SUDO: Feature = Feature { name: "edit_sudo", does: "edit a server's files as root", check_first: true };
 
+pub const ACCOUNT_IDS: Feature =
+    Feature { name: "account_ids", does: "select an account by its identity", check_first: true };
 /// What this kraal's server lists.
-pub const FEATURES: [Feature; 3] = [LIST_AGENTS, BUFFERS, EDIT_SUDO];
+pub const FEATURES: [Feature; 4] = [LIST_AGENTS, BUFFERS, EDIT_SUDO, ACCOUNT_IDS];
 
 /// The names of this kraal's server features, as it lists them.
 pub fn feature_names() -> Vec<String> {
@@ -416,6 +418,8 @@ pub enum Request {
     OpenAgent {
         agent: String,
         account: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        account_id: Option<String>,
         placement: Placement,
         near: Option<String>,
         cwd: Option<PathBuf>,
@@ -504,6 +508,7 @@ impl Request {
     pub fn needs(&self) -> Option<Feature> {
         match self {
             Request::ListAgents => Some(LIST_AGENTS),
+            Request::OpenAgent { account_id: Some(_), .. } => Some(ACCOUNT_IDS),
             Request::BufferList
             | Request::BufferShow { .. }
             | Request::BufferSet { .. }
@@ -610,6 +615,10 @@ pub struct PaneInfo {
     pub command: Vec<String>,
     pub cwd: Option<PathBuf>,
     pub agent: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_id: Option<String>,
     pub state: AgentState,
     pub exit_code: Option<i32>,
     /// The command waits for Enter (restored session, start_suspended, or it could not start).
@@ -783,6 +792,23 @@ mod tests {
     }
 
     #[test]
+    fn account_identity_is_optional_and_requires_a_server_that_understands_it() {
+        let old = serde_json::json!({ "cmd": "open_agent", "agent": "claude", "account": "work",
+            "placement": "auto", "near": null, "cwd": null });
+        let request: Request = serde_json::from_value(old.clone()).unwrap();
+        assert!(matches!(request, Request::OpenAgent { account_id: None, .. }));
+        assert_eq!(request.needs(), None);
+        let mut new = old;
+        new["account_id"] = serde_json::json!("stable");
+        let request: Request = serde_json::from_value(new).unwrap();
+        assert_eq!(request.needs(), Some(ACCOUNT_IDS));
+        assert!(request.needs().unwrap().check_first, "an old server must not silently select by a reused label");
+        let wire = serde_json::to_value(request).unwrap();
+        assert_eq!(wire["account"], "work");
+        assert_eq!(wire["account_id"], "stable");
+    }
+
+    #[test]
     fn requests_say_what_an_older_server_lacks() {
         assert_eq!(Request::ListAgents.needs(), Some(LIST_AGENTS));
         assert_eq!(Request::BufferDelete { buffer: None, all: true }.needs(), Some(BUFFERS));
@@ -849,6 +875,7 @@ mod tests {
             Request::OpenAgent {
                 agent: s("claude"),
                 account: Some(s("a")),
+                account_id: None,
                 placement: Placement::Floating,
                 near: None,
                 cwd: Some(p("/")),
@@ -884,6 +911,8 @@ mod tests {
             ClientMsg::Detach,
         ]);
         let pane = PaneInfo {
+            account: None,
+            account_id: None,
             id: 1,
             name: Some(s("n")),
             title: s("t"),

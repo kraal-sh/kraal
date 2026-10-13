@@ -266,7 +266,14 @@ impl Server {
                     .map(|p| Response::Pane(Box::new(self.pane_info(p))))
                     .map_err(|e| format!("{e:#}"))
             }
-            Request::OpenAgent { agent, account, placement, near, cwd, args } => {
+            Request::OpenAgent { agent, account, account_id, placement, near, cwd, args } => {
+                let account = match account_id {
+                    Some(id) => match self.accounts.by_id(&id).filter(|a| a.agent == agent) {
+                        Some(a) => Some(format!("@{}", a.id)),
+                        None => return Some(Err("the account was removed; choose an account again".into())),
+                    },
+                    None => account,
+                };
                 let near = match near.as_deref().map(|n| self.resolve(n)).transpose() {
                     Ok(n) => n,
                     Err(e) => return Some(Err(e)),

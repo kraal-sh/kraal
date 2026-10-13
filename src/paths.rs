@@ -192,6 +192,7 @@ pub fn written_dirs() -> Vec<PathBuf> {
         state.join("buffers"),
         state.join("runs"),
         state.join("usage"),
+        state.join("usage/by-id"),
         state,
         workspaces_dir(),
         config_dir(),

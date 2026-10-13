@@ -42,6 +42,7 @@ impl Server {
     /// Spawn a pane process with a provisional size; call [`Server::relayout`] afterwards.
     pub fn spawn_pane(&mut self, name: Option<String>, spec: PaneSpec) -> Result<PaneId> {
         let mut spec = spec;
+        self.accounts.bind_pane(&mut spec);
         self.add_worktree_env(&mut spec);
         let id = self.alloc_id();
         let inner = self.inner(self.layout_area);
@@ -79,6 +80,7 @@ impl Server {
     /// A command pane that does not run its command yet: it shows `reason`, and Enter starts it.
     pub fn spawn_pane_suspended(&mut self, name: Option<String>, spec: PaneSpec, reason: &str) -> Result<PaneId> {
         let mut spec = spec;
+        self.accounts.bind_pane(&mut spec);
         self.add_worktree_env(&mut spec);
         let id = self.alloc_id();
         let inner = self.inner(self.layout_area);
@@ -175,6 +177,7 @@ impl Server {
     ) -> Result<PaneId> {
         let id = self.spawn_pane_in(ws, None, prelude, placement, name)?;
         let mut spec = spec;
+        self.accounts.bind_pane(&mut spec);
         self.add_worktree_env(&mut spec);
         if let Some(p) = self.panes.get_mut(&id) {
             // A prelude that could not start waits for Enter: Enter starts the command instead.
@@ -447,6 +450,8 @@ impl Server {
             None => (String::new(), String::new(), false, false),
         };
         protocol::PaneInfo {
+            account: p.spec.account.clone(),
+            account_id: p.spec.account_id.clone(),
             id,
             name: p.name.clone(),
             title: p.title.clone(),

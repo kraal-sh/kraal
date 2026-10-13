@@ -431,6 +431,79 @@ fn neither_release_starts_or_forgets_a_session_the_other_runs() {
     }
 }
 
+/// Both supported releases must keep their snapshots and name-based workspace rules when
+/// this kraal adds account identities to the shared file.
+#[test]
+#[ignore = "needs KRAAL_OLD, another release's kraal: tests/compat.sh runs it"]
+fn account_migration_preserves_running_release_snapshots_and_rules() {
+    let (old, this) = (Kraal::old(), Kraal::this());
+    let env = Env::new("compat-accounts");
+    let bin = env.root.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    write_script(&bin.join("claude"), "#!/bin/sh\necho \"account-ready:$CLAUDE_CONFIG_DIR\"\nexec sleep 1000\n");
+    let home = env.root.join("work-home");
+    std::fs::create_dir_all(&home).unwrap();
+    let file = env.root.join("config/kraal/accounts.toml");
+    std::fs::write(&file, format!(
+        "[[account]]\nname = 'work'\nagent = 'claude'\nhome = {:?}\n[[rule]]\nworkspace = 'w'\naccounts = ['work']\n", home.to_str().unwrap()
+    )).unwrap();
+    let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap_or_default());
+    let out = env.cmd(&old, &["open", "w"]).env("PATH", path).output().unwrap();
+    assert!(
+        out.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&out.stderr),
+        std::fs::read_to_string(env.root.join("state/kraal/server-compat-accounts.log")).unwrap_or_default()
+    );
+    let open_agent = || {
+        let answer = env.ask(serde_json::json!({ "cmd": "open_agent", "agent": "claude", "account": null,
+            "placement": "tab", "near": "first", "cwd": null }));
+        assert!(answer["result"]["Ok"].is_object(), "kraal {}: {answer}", old.version);
+    };
+    open_agent();
+    let saved = env.root.join("state/kraal/sessions/compat-accounts.json");
+    let start = Instant::now();
+    while !std::fs::read_to_string(&saved).is_ok_and(|s| s.contains("claude:work")) {
+        assert!(start.elapsed() < Duration::from_secs(60), "the old server never saved its agent");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    // Keep the old server listening but prevent its next write from hiding an erroneous
+    // migration of this snapshot. Always resume it before Env shuts it down.
+    struct Stopped(libc::pid_t);
+    impl Drop for Stopped {
+        fn drop(&mut self) {
+            // SAFETY: the server belongs to this test.
+            unsafe {
+                libc::kill(self.0, libc::SIGCONT);
+            }
+        }
+    }
+    let pid = env.server_pid() as libc::pid_t;
+    // SAFETY: the server belongs to this test.
+    assert_eq!(unsafe { libc::kill(pid, libc::SIGSTOP) }, 0);
+    let stopped = Stopped(pid);
+    let before = std::fs::read(&saved).unwrap();
+    env.run(&this, &["accounts", "limits", "--threshold", "75"]);
+    assert_eq!(
+        std::fs::read(&saved).unwrap(),
+        before,
+        "a running {} owns its snapshot, even without a session lock",
+        old.version
+    );
+    drop(stopped);
+    let accounts: toml::Value = toml::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    let id = accounts["account"][0]["id"].as_str().unwrap();
+    assert_eq!(accounts["rule"][0]["accounts"][0].as_str(), Some("work"));
+    assert_eq!(accounts["rule"][0]["account_ids"][0].as_str(), Some(format!("claude:@{id}").as_str()));
+    env.run(&old, &["config", "reload"]);
+    open_agent();
+    let agents: Vec<_> = env.panes(&old).into_iter().filter(|p| p["command"][0] == "claude").collect();
+    assert_eq!(agents.len(), 2, "both agents use the workspace rule before and after migration");
+    for pane in agents {
+        env.wait_for_text(&old, &pane["id"].to_string(), &format!("account-ready:{}", home.display()));
+    }
+}
+
 /// `kraal restart` brings a session of the other release to this kraal, with its panes and what
 /// they showed.
 #[test]

@@ -397,6 +397,8 @@ impl Server {
     /// its session there, and its pane's id there.
     pub(super) fn remote_agent_infos(&self) -> Vec<PaneInfo> {
         let info = |w: &Watch, a: &RemoteAgent| PaneInfo {
+            account: None,
+            account_id: None,
             id: a.pane,
             name: Some(a.name.clone()),
             title: String::new(),

@@ -55,6 +55,20 @@ Kraal 0.3.0 holds a session in its runtime directory only, and 0.2.0 not at all:
   server. A `forget` of 0.3.0 or older does not know that: run at that very moment, it still
   deletes what the session saved.
 
+## Account identities
+
+Accounts and saved sessions from 0.2.0 and 0.3.0 still load. Account names remain accepted by
+commands and older clients. New saved panes and protocol replies carry an optional account
+identity alongside the readable label. Selecting by identity requires the `account_ids` server
+feature, checked before sending, so an older server cannot silently select a reused name.
+
+The next change to `accounts.toml` adds missing identities and binds rules, with the original
+file kept in `accounts.toml.kraal-bak`. Comments, order and unknown keys stay. An unreadable file
+is never replaced. Rules keep readable names in `accounts` for older servers and authoritative
+references in `account_ids` for this version. A session still running an older binary continues
+its old name-based behavior until restarted on this version; it does not protect against name
+reuse. The backup can be restored to return to the original file.
+
 ## For contributors: how the protocol changes
 
 The client and the server exchange JSON messages (`src/protocol.rs`, whose comments hold the

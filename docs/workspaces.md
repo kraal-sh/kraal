@@ -168,6 +168,12 @@ Enter starts the agent again, resuming its conversation, `x` closes the pane, an
 `close_on_exit=true` closes it by itself. The name of another agent, which kraal keeps no accounts
 for, is typed into a shell: that shell is what is left when the agent exits.
 
+A saved agent account keeps an internal `account_id` beside its readable `agent="claude:name"`.
+Renaming the account keeps that binding; removing and recreating its name does not replace it.
+Old definitions using only `agent="claude:name"` still work and are bound before an account
+change. To choose a different account by editing the file, set `agent` and remove its old
+`account_id`. A bare `agent="claude"` continues to choose by the account rules each time.
+
 `stacked=true` makes a pane's children a stack: they share its place, one open and
 the others folded to the top line of their frame ([Stacks and layouts](keys.md#stacks-and-layouts)).
 The focused child is the one open, else the one marked `expanded=true`, else the first:

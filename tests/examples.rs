@@ -205,7 +205,16 @@ fn the_files_kraal_writes_to_keep_their_text() {
     assert_eq!(read(&config.join("servers.toml")), format!("{}{added}", read(&examples().join("servers.toml"))));
     assert!(kraal(&env, &["accounts", "limits", "--threshold", "70"]).output().unwrap().status.success());
     let example = read(&examples().join("accounts.toml"));
-    assert_eq!(read(&config.join("accounts.toml")), example.replace("threshold = 85", "threshold = 70"));
+    assert_eq!(
+        read(&config.join("accounts.toml")),
+        example
+            .replace("threshold = 85", "threshold = 70")
+            .replace(
+                "accounts = [\"work\", \"default\"]",
+                "accounts = [\"work\", \"default\"]\naccount_ids = [\n    \"work\",\n    \"claude:@default-claude\",\n    \"codex:@default-codex\",\n]"
+            )
+            .replace("accounts = [\"default\"]", "accounts = [\"default\"]\naccount_ids = [\"claude:@default-claude\"]")
+    );
     assert_ne!(example, example.replace("threshold = 85", "threshold = 70"));
 }
 

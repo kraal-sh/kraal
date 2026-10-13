@@ -115,14 +115,20 @@ impl Server {
                 }
                 (KeyCode::Char('x'), true) if p.kind == PickerKind::Agent => {
                     if let Some(PickAction::AgentLaunch { agent, account }) = p.current().map(|i| i.action.clone()) {
+                        let label = self.accounts.get(&agent, &account).as_ref().map(crate::accounts::label);
                         let result = crate::accounts::Accounts::update(|all| Ok(all.remove(&agent, &account)));
                         match result {
                             Ok(true) => {
                                 self.reload_accounts();
-                                self.toast(id, format!("forgot {agent}·{account} (its directory is kept)"));
+                                self.toast(
+                                    id,
+                                    format!("forgot {} (its directory is kept)", label.as_deref().unwrap_or("account")),
+                                );
                                 return Mode::Picker(self.agent_picker(id, None));
                             }
-                            Ok(false) => self.toast(id, "the default account cannot be forgotten"),
+                            Ok(false) => {
+                                self.toast(id, "the account is gone or is the default account; reopen the account list")
+                            }
                             Err(e) => self.toast(id, format!("{e:#}")),
                         }
                     }

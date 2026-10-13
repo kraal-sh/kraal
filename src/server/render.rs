@@ -1819,12 +1819,16 @@ mod tests {
         // The agents' own homes, none of them used yet, are nothing to list.
         assert!(account_lines(&accounts, &usage, 40, 1_000).is_empty());
         let window = Some(Window { used_percent: 42.0, resets_at: None });
-        usage.0.insert("claude:default".into(), Usage { five_hour: window, observed_at: 1_000, ..Default::default() });
-        usage.0.insert("codex:default".into(), Usage::default());
+        usage.0.insert(
+            accounts.get("claude", "default").unwrap().key(),
+            Usage { five_hour: window, observed_at: 1_000, ..Default::default() },
+        );
+        usage.0.insert(accounts.get("codex", "default").unwrap().key(), Usage::default());
         assert_eq!(account_lines(&accounts, &usage, 40, 1_000).len(), 2, "one used: both agents' are listed");
         let home = "/tmp/kraal-test-patron".to_string();
         accounts
             .add(Account {
+                id: crate::accounts::new_uuid(),
                 name: "patron.bzh".into(),
                 agent: "claude".into(),
                 home,
@@ -1851,6 +1855,7 @@ mod tests {
         let mut accounts = Accounts::empty();
         accounts
             .add(Account {
+                id: crate::accounts::new_uuid(),
                 name: "work".into(),
                 agent: "claude".into(),
                 home: "/tmp/kraal-required".into(),
@@ -1861,7 +1866,7 @@ mod tests {
             .unwrap();
         let mut usage = UsageMap::default();
         usage.0.insert(
-            "claude:work".into(),
+            accounts.get("claude", "work").unwrap().key(),
             Usage {
                 five_hour: Some(Window { used_percent: 42.0, resets_at: None }),
                 observed_at: 1_000,

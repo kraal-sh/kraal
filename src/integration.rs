@@ -1442,10 +1442,13 @@ pub fn statusline() {
     let home = std::env::var_os("CLAUDE_CONFIG_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|| crate::paths::expand_tilde("~/.claude"));
-    let account = all.by_home("claude", &home);
+    let account = match std::env::var("KRAAL_ACCOUNT_ID") {
+        Ok(id) => all.by_id(&id).filter(|a| a.agent == "claude"),
+        Err(_) => all.by_home("claude", &home),
+    };
     let usage = crate::accounts::usage_from_statusline(&v);
     if let (Some(a), Some(u)) = (&account, &usage) {
-        let _ = crate::accounts::save_usage(&a.agent, &a.name, u);
+        let _ = crate::accounts::save_usage(a, u);
     }
     match all.claude.statusline.as_deref().filter(|c| !c.trim().is_empty() && !is_our_statusline(c)) {
         Some(cmd) => {
