@@ -7834,6 +7834,67 @@ fn a_pane_opened_in_an_unseen_worktree_gets_its_variables() {
     env.wait_for_text("linked", "idx=2 offset=20 port=3020");
 }
 
+/// The worktrees of a repository are made and removed one at a time, whoever asks at the same
+/// moment (several `kraal wt` here, as a script, or the picker beside it, would): git does not
+/// keep two `git worktree add` apart, and one that reads the entry another is writing fails.
+/// Each worktree still gets a number of its own.
+#[test]
+fn the_worktrees_of_a_repository_are_changed_one_at_a_time() {
+    let env = Env::new("wtserial");
+    let repo = env.root.join("app");
+    let _git = git_repo(&repo, &[("a.txt", "1\n")]);
+    // A git that notes when two change the worktrees at the same moment, and takes long enough
+    // over it for the others to come meanwhile.
+    let real = Command::new("sh").arg("-c").arg("command -v git").output().unwrap();
+    let real = String::from_utf8(real.stdout).unwrap();
+    let bin = env.root.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let (busy, overlaps) = (env.root.join("busy"), env.root.join("overlaps"));
+    write_script(
+        &bin.join("git"),
+        &format!(
+            "#!/bin/sh\ncase \" $* \" in\n*' worktree add '*|*' worktree remove '*)\n  \
+             mkdir '{busy}' 2>/dev/null || echo \"$*\" >> '{overlaps}'\n  sleep 0.1\n  '{real}' \"$@\"\n  \
+             status=$?\n  rmdir '{busy}' 2>/dev/null\n  exit $status ;;\nesac\nexec '{real}' \"$@\"\n",
+            busy = busy.display(),
+            overlaps = overlaps.display(),
+            real = real.trim()
+        ),
+    );
+    let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap_or_default());
+    let names = ["a", "b", "c", "d", "e"];
+    let all_at_once = |verb: &str, flag: &str| {
+        std::thread::scope(|scope| {
+            let (env, path, repo) = (&env, &path, &repo);
+            let runs: Vec<_> = names
+                .iter()
+                .map(|name| {
+                    scope.spawn(move || {
+                        env.cmd(&["wt", verb, name, flag]).env("PATH", path).current_dir(repo).output().unwrap()
+                    })
+                })
+                .collect();
+            for run in runs {
+                let out = run.join().unwrap();
+                assert!(out.status.success(), "wt {verb}: {}", String::from_utf8_lossy(&out.stderr));
+            }
+        });
+        let overlaps = std::fs::read_to_string(&overlaps).unwrap_or_default();
+        assert_eq!(overlaps, "", "wt {verb}: two at the same moment");
+    };
+    all_at_once("new", "--no-setup");
+    let number = |name: &&str| {
+        let recorded = std::fs::read_to_string(repo.join(".git/worktrees").join(name).join("kraal-index")).unwrap();
+        recorded.trim().parse::<u32>().unwrap()
+    };
+    let mut numbers: Vec<u32> = names.iter().map(number).collect();
+    numbers.sort();
+    assert_eq!(numbers, [1, 2, 3, 4, 5]);
+    all_at_once("rm", "--force");
+    let left = std::fs::read_dir(repo.join(".git/worktrees")).map_or(0, |entries| entries.count());
+    assert_eq!(left, 0, "worktrees left");
+}
+
 /// `kraal wt prune` removes a branch merged by squash (its commits are not in the base's
 /// history, their changes are), keeps one whose ignored files are its own unless told to discard
 /// them, and `--no-setup` makes a worktree even when the repository's setup file is broken.

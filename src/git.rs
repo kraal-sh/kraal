@@ -415,9 +415,28 @@ pub fn add_worktree(cwd: &Path, name: &str, base: Option<&str>) -> Result<Worktr
         bail!("{} already exists", path.display());
     }
     let path_s = path.display().to_string();
-    git(&repo, &["worktree", "add", "-b", &branch, &path_s, &base], Duration::from_secs(60))?;
-    let index = record_worktree(&repo, &path, &branch, &base)?;
+    let index = changing_worktrees(&repo, |common| {
+        git(&repo, &["worktree", "add", "-b", &branch, &path_s, &base], Duration::from_secs(60))?;
+        record_worktree(&repo, common, &path, &branch, &base)
+    })?;
     Ok(Worktree { repo, path, branch, base, index })
+}
+
+/// How long a change to a repository's worktrees waits for another one to be done: as long as
+/// one may take.
+const WORKTREES_WAIT: Duration = Duration::from_secs(60);
+
+/// Run `change`, which adds or removes a worktree of `repo`, while no other kraal changes that
+/// repository's worktrees, in this process or in another (`kraal wt` beside a server, two
+/// servers). Git does not keep them apart itself: a `git worktree add` reads the entries of the
+/// other worktrees, fails on one that another is writing at that moment ("failed to read
+/// .git/worktrees/<name>/commondir"), and a worktree's number is the smallest that none of the
+/// others holds. `change` is given the repository's common git directory.
+fn changing_worktrees<T>(repo: &Path, change: impl FnOnce(&Path) -> Result<T>) -> Result<T> {
+    let common = git(repo, &["rev-parse", "--path-format=absolute", "--git-common-dir"], Duration::from_secs(2))?;
+    let common = PathBuf::from(common.trim());
+    crate::paths::locked_within(&common.join("kraal-worktrees"), WORKTREES_WAIT, || change(&common))
+        .with_context(|| format!("waiting to change the worktrees of {}", repo.display()))?
 }
 
 /// What a kraal worktree's number is recorded in: a file of git's own directory for that
@@ -426,22 +445,18 @@ const INDEX_FILE: &str = "kraal-index";
 
 /// Remember with the branch of a new worktree at `path` its base (for reviews and merges in
 /// later sessions), and with the worktree its number: the smallest no other registered worktree
-/// of `repo` holds, whatever it has checked out since (another branch, a detached HEAD).
-/// Worktrees made at the same time by other kraal processes wait for each other here.
-fn record_worktree(repo: &Path, path: &Path, branch: &str, base: &str) -> Result<u32> {
-    let common = git(repo, &["rev-parse", "--path-format=absolute", "--git-common-dir"], Duration::from_secs(2))?;
-    let common = PathBuf::from(common.trim());
+/// of `repo` holds, whatever it has checked out since (another branch, a detached HEAD). Whoever
+/// calls this is alone in changing the repository's worktrees ([`changing_worktrees`]).
+fn record_worktree(repo: &Path, common: &Path, path: &Path, branch: &str, base: &str) -> Result<u32> {
     let own = git(path, &["rev-parse", "--absolute-git-dir"], Duration::from_secs(2))?;
     let own = PathBuf::from(own.trim());
-    crate::paths::locked(&common.join("kraal-worktrees"), || {
-        set_config(repo, &format!("branch.{branch}.kraalbase"), base)?;
-        let used = used_indices(repo, &common)?;
-        let index = (1..).find(|n| !used.contains(n)).unwrap_or(1);
-        std::fs::write(own.join(INDEX_FILE), format!("{index}\n")).context("recording the worktree's number")?;
-        // Where older kraals look for it.
-        set_config(repo, &format!("branch.{branch}.kraalindex"), &index.to_string())?;
-        Ok(index)
-    })?
+    set_config(repo, &format!("branch.{branch}.kraalbase"), base)?;
+    let used = used_indices(repo, common)?;
+    let index = (1..).find(|n| !used.contains(n)).unwrap_or(1);
+    std::fs::write(own.join(INDEX_FILE), format!("{index}\n")).context("recording the worktree's number")?;
+    // Where older kraals look for it.
+    set_config(repo, &format!("branch.{branch}.kraalindex"), &index.to_string())?;
+    Ok(index)
 }
 
 /// The numbers the registered worktrees of `repo` hold: those recorded with them, and for
@@ -779,7 +794,9 @@ pub fn remove_worktree(w: &Worktree, discard: Discard) -> Result<()> {
     if discard == Discard::Everything {
         let state = worktree_state(w).ok();
         let path = w.path.display().to_string();
-        git(&w.repo, &["worktree", "remove", "--force", &path], Duration::from_secs(30))?;
+        changing_worktrees(&w.repo, |_| {
+            git(&w.repo, &["worktree", "remove", "--force", &path], Duration::from_secs(30))
+        })?;
         return match state.as_ref().and_then(|s| s.tip.as_deref()) {
             Some(tip) => delete_branch(w, tip, None),
             None => git(&w.repo, &["branch", "-D", &w.branch], Duration::from_secs(10)).map(|_| ()),
@@ -805,7 +822,7 @@ pub fn remove_checked(w: &Worktree, state: &WorktreeState) -> Result<()> {
     if state.changes > 0 {
         args.push("--force");
     }
-    git(&w.repo, &args, Duration::from_secs(30))?;
+    changing_worktrees(&w.repo, |_| git(&w.repo, &args, Duration::from_secs(30)))?;
     match &state.tip {
         Some(tip) => delete_branch(w, tip, state.base.as_ref().filter(|_| state.is_clean())),
         None => Ok(()),
@@ -1234,6 +1251,31 @@ mod tests {
         std::fs::write(dir.join(file), text).unwrap();
         run_git(dir, &["add", file]);
         run_git(dir, &["commit", "-q", "-m", file]);
+    }
+
+    /// Made at the same moment and removed at the same moment by several threads, as the
+    /// server's picker and its agents do, the worktrees of a repository do not fail on each
+    /// other in git, and each has a number of its own: round after round.
+    #[test]
+    fn worktrees_made_and_removed_at_once_each_have_their_number() {
+        let Some((dir, repo)) = test_repo("gitmany") else { return };
+        for round in 0..4 {
+            let names: Vec<String> = (0..5).map(|n| format!("r{round}-{n}")).collect();
+            let made: Vec<Worktree> = std::thread::scope(|s| {
+                let adds: Vec<_> = names.iter().map(|n| s.spawn(|| add_worktree(&repo, n, None).unwrap())).collect();
+                adds.into_iter().map(|add| add.join().unwrap()).collect()
+            });
+            let mut numbers: Vec<u32> = made.iter().map(|w| w.index).collect();
+            numbers.sort();
+            assert_eq!(numbers, [1, 2, 3, 4, 5], "round {round}");
+            std::thread::scope(|s| {
+                for w in &made {
+                    s.spawn(|| remove_worktree(w, Discard::Nothing).unwrap());
+                }
+            });
+            assert_eq!(list_worktrees(&repo).unwrap(), [], "round {round}");
+        }
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     /// A directory reached through a symbolic link is inside the worktree git names with its
