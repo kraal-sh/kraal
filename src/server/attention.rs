@@ -174,6 +174,7 @@ impl Server {
             let fields = serde_json::json!({
                 "agent": p.agent.kind,
                 "account": p.spec.account,
+                "account_id": p.spec.account_id,
                 "previous": before.label(),
                 "message": p.agent.message,
             });

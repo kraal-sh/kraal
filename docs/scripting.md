@@ -104,6 +104,10 @@ connected), `production.entered/left` (`entered` again when the reason changes),
 `runbook.started/finished`, `command.finished` (a command the shell marks ended: its `command`
 line, `exit` status and `seconds`; see [Shell commands](terminal.md#shell-commands)).
 
+Local agent events and pane JSON include an optional `account_id` alongside the readable
+`account` label. The identity stays the same across a rename and is kept after removal; a new
+account that reuses the name gets a different identity. Older sessions may omit this field.
+
 An agent of a server's session watched here changes state as a local one does: `agent.working`,
 `agent.blocked`, `agent.done` and `agent.idle` come for it too, with `server` and `session` (and
 `pane`, its id in that session; `previous` is null the first time it is seen). An `agent.*` hook

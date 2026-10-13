@@ -199,7 +199,7 @@ impl Server {
                 if let Err(e) = self.rename_account(&agent, &account, &value) {
                     return Err((PromptAction::RenameAccount { agent, account }, format!("{e:#}")));
                 }
-                self.toast(id, format!("renamed {agent}·{account} to {agent}·{value}"));
+                self.toast(id, format!("renamed account to {agent}·{value}"));
             }
             PromptAction::SaveWorkspace(ws) => {
                 if !workspace::valid_file_name(&value) {
@@ -235,12 +235,7 @@ impl Server {
                 dir.join(format!("{name}.kdl"))
             }
         };
-        if path.exists() {
-            let backup = path.with_extension("kdl.bak");
-            std::fs::copy(&path, &backup)
-                .with_context(|| format!("keeping a copy as {}: nothing was saved", backup.display()))?;
-        }
-        crate::paths::write_atomic(&path, workspace::to_kdl(&def).as_bytes())?;
+        workspace::save_file(&path, &def)?;
         if link {
             self.workspaces[wi].set_definition(Some(&path));
         }
@@ -375,7 +370,7 @@ impl Server {
                     ConfirmAction::RetryAccountSwitch { pane, account } => {
                         let result = self
                             .accounts
-                            .get(&account.agent, &account.name)
+                            .by_id(&account.id)
                             .filter(|a| a.same_home(&account))
                             .context("the target account changed; choose an account again")
                             .and_then(|a| self.switch_account(pane, &a, Some(id), false));
@@ -386,7 +381,7 @@ impl Server {
                     ConfirmAction::SignInAccount(account) => {
                         let result = self
                             .accounts
-                            .get(&account.agent, &account.name)
+                            .by_id(&account.id)
                             .filter(|a| a.same_home(&account))
                             .context("the target account changed; choose an account again")
                             .and_then(|a| self.open_login(id, &a));

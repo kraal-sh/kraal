@@ -47,6 +47,35 @@ pub struct WorkspaceSnap {
     pub sync: crate::server::SyncScope,
 }
 
+impl WorkspaceSnap {
+    /// Bind every saved pane, including a workspace whose programs cannot be restored yet.
+    pub fn bind_accounts(&mut self, accounts: &crate::accounts::Accounts) -> bool {
+        fn pane(p: &mut PaneSnap, accounts: &crate::accounts::Accounts) -> bool {
+            let before = (p.spec.account.clone(), p.spec.account_id.clone(), p.spec.env.clone());
+            accounts.bind_pane(&mut p.spec);
+            before != (p.spec.account.clone(), p.spec.account_id.clone(), p.spec.env.clone())
+        }
+        fn node(n: &mut NodeSnap, accounts: &crate::accounts::Accounts) -> bool {
+            match n {
+                NodeSnap::Pane(p) => pane(p, accounts),
+                NodeSnap::Split { children, .. } => {
+                    children.iter_mut().fold(false, |changed, (n, _)| node(n, accounts) || changed)
+                }
+            }
+        }
+        let mut changed = false;
+        for tab in &mut self.tabs {
+            if let Some(root) = &mut tab.root {
+                changed |= node(root, accounts);
+            }
+            for (p, _) in &mut tab.floating {
+                changed |= pane(p, accounts);
+            }
+        }
+        changed
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TabSnap {
     pub name: String,
@@ -104,6 +133,7 @@ pub fn snapshot(server: &Server) -> SessionSnapshot {
     let pane_snap = |id: PaneId| -> PaneSnap {
         let p = &server.panes[&id];
         let mut spec = p.spec.clone();
+        server.accounts.bind_pane(&mut spec);
         spec.startup_input = None;
         if let crate::pane::Content::Files(f) = &p.content {
             use crate::files::Side;
@@ -203,6 +233,80 @@ pub fn save(session: &str, snap: &SessionSnapshot) -> Result<()> {
     paths::write_private(&path, &serde_json::to_vec_pretty(snap)?)?;
     paths::sync_dir(dir);
     Ok(())
+}
+
+/// Closed sessions still carry old names until their next restore. Bind them while the
+/// accounts file still tells what those names meant; a running server binds its own panes.
+pub fn bind_accounts(accounts: &crate::accounts::Accounts) -> Result<()> {
+    let dir = paths::state_dir().join("sessions");
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e).context("reading saved sessions to migrate accounts"),
+    };
+    for entry in entries {
+        let path = entry?.path();
+        if path.extension().is_none_or(|e| e != "json") {
+            continue;
+        }
+        let Some(session) = path.file_stem().and_then(|s| s.to_str()).filter(|s| paths::valid_session_name(s)) else {
+            continue;
+        };
+        let Some(_lock) = paths::SessionLock::acquire(session)? else { continue };
+        // 0.2.0 does not hold a session lock. Its listening socket still owns this snapshot.
+        if !paths::nobody_listens(&paths::socket_path(session)) {
+            continue;
+        }
+        let source = std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
+        let Some(updated) = bind_saved_accounts(&source, accounts)? else { continue };
+        paths::write_private(&path, &updated).with_context(|| format!("migrating accounts in {}", path.display()))?;
+    }
+    Ok(())
+}
+
+fn bind_saved_accounts(source: &[u8], accounts: &crate::accounts::Accounts) -> Result<Option<Vec<u8>>> {
+    // An unreadable session is left for the restore path, which already explains how to recover it.
+    let Ok(snapshot) = serde_json::from_slice::<SessionSnapshot>(source) else { return Ok(None) };
+    if snapshot.version != VERSION {
+        return Ok(None);
+    }
+    let mut value: serde_json::Value = serde_json::from_slice(source)?;
+    fn pane(value: &mut serde_json::Value, accounts: &crate::accounts::Accounts) -> bool {
+        let Some(spec) = value.get_mut("spec") else { return false };
+        let Ok(mut pane) = serde_json::from_value::<PaneSpec>(spec.clone()) else { return false };
+        if pane.account.is_none() || pane.account_id.is_some() {
+            return false;
+        }
+        accounts.bind_pane(&mut pane);
+        spec["account_id"] = serde_json::json!(pane.account_id);
+        spec["account"] = serde_json::json!(pane.account);
+        spec["env"] = serde_json::json!(pane.env);
+        true
+    }
+    fn node(value: &mut serde_json::Value, accounts: &crate::accounts::Accounts) -> bool {
+        if let Some(p) = value.get_mut("Pane") {
+            return pane(p, accounts);
+        }
+        let mut changed = false;
+        if let Some(children) =
+            value.get_mut("Split").and_then(|s| s.get_mut("children")).and_then(serde_json::Value::as_array_mut)
+        {
+            for child in children {
+                changed |= node(&mut child[0], accounts);
+            }
+        }
+        changed
+    }
+    let mut changed = false;
+    for workspace in value["workspaces"].as_array_mut().into_iter().flatten() {
+        for tab in workspace["tabs"].as_array_mut().into_iter().flatten() {
+            changed |= node(&mut tab["root"], accounts);
+            for floating in tab["floating"].as_array_mut().into_iter().flatten() {
+                changed |= pane(&mut floating[0], accounts);
+            }
+        }
+    }
+    if changed { Ok(Some(serde_json::to_vec_pretty(&value)?)) } else { Ok(None) }
 }
 
 /// Write a pane's scrollback, as [`crate::pane::Pane::scrollback_ansi`] gives it, in place once
@@ -395,7 +499,8 @@ pub fn apply(server: &mut Server, snap: SessionSnapshot) -> Result<()> {
             server.warnings.push(format!("tunnel {}: {e:#}", t.describe()));
         }
     }
-    for ws in snap.workspaces {
+    for mut ws in snap.workspaces {
+        ws.bind_accounts(&server.accounts);
         let panes_before: std::collections::HashSet<PaneId> = server.panes.keys().copied().collect();
         let workspaces_before: Vec<u32> = server.workspaces.iter().map(|w| w.id).collect();
         if let Err(e) = apply_workspace(server, &ws, snap.revision) {
@@ -556,6 +661,34 @@ fn restore_scrollback(server: &mut Server, id: PaneId, p: &PaneSnap) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn old_saved_accounts_gain_identity_without_losing_unknown_fields() {
+        let pane = serde_json::json!({
+            "name": "agent", "agent": "claude", "agent_session": null,
+            "future": "kept", "spec": { "account": "claude:default", "future": [1, 2] }
+        });
+        let source = serde_json::json!({ "version": 1, "future": { "spec": { "account": "claude:default" } }, "workspaces": [{
+            "name": "w", "definition": null, "cwd": null, "active": 0, "tabs": [{
+                "name": "t", "root": { "Pane": pane }, "floating": [], "focus": 0,
+                "show_floating": false, "zoomed": false, "sync": false
+            }]
+        }] });
+        let accounts = crate::accounts::Accounts::empty();
+        let bytes = bind_saved_accounts(&serde_json::to_vec(&source).unwrap(), &accounts).unwrap().unwrap();
+        let mut migrated: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let spec = &mut migrated["workspaces"][0]["tabs"][0]["root"]["Pane"]["spec"];
+        assert_eq!(spec["account_id"], "default-claude");
+        assert_eq!(spec["account"], "claude:default");
+        assert!(bind_saved_accounts(&bytes, &accounts).unwrap().is_none(), "an identity is never rebound");
+        spec.as_object_mut().unwrap().remove("account_id");
+        spec.as_object_mut().unwrap().remove("env");
+        assert_eq!(migrated, source, "unknown fields and all other state survive");
+        assert!(bind_saved_accounts(b"{broken", &accounts).unwrap().is_none());
+        let restored: SessionSnapshot = serde_json::from_slice(&bytes).unwrap();
+        let NodeSnap::Pane(pane) = restored.workspaces[0].tabs[0].root.as_ref().unwrap() else { panic!("pane") };
+        assert_eq!(pane.spec.account_id.as_deref(), Some("default-claude"));
+    }
 
     #[test]
     fn a_restart_stops_programs_not_shells_ssh_shells_or_idle_agents() {

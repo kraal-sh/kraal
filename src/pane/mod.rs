@@ -148,6 +148,8 @@ pub struct PaneSpec {
     pub env_remove: Vec<String>,
     /// `agent:account` the pane's agent runs on, when kraal launched it.
     pub account: Option<String>,
+    /// Identity of that account; the label stays readable after removal.
+    pub account_id: Option<String>,
     /// Conversation id the agent was started with, for resuming it.
     pub session: Option<String>,
     /// The git worktree kraal created for this pane's agent.

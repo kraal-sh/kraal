@@ -1022,8 +1022,8 @@ fn save_in_a_pane_saves_the_workspace_of_that_pane() {
     let saved = |name: &str| std::fs::read_to_string(dir.join(name)).unwrap_or_default();
 
     assert!(in_pane(&["save"]).trim().ends_with("/v.kdl"));
-    // Saving over a definition keeps the one before beside it.
-    assert_eq!(names_in(&dir), ["v.kdl", "v.kdl.bak", "w.kdl"]);
+    // Saving keeps the previous definition and a persistent lock shared with account migration.
+    assert_eq!(names_in(&dir), [".v.kdl.lock", "v.kdl", "v.kdl.bak", "w.kdl"]);
     assert!(in_pane(&["save", "copy"]).trim().ends_with("/copy.kdl"));
     assert!(saved("copy.kdl").contains("name=\"second\"") && !saved("copy.kdl").contains("first"));
     assert!(in_pane(&["save", "named", "--workspace", "w"]).trim().ends_with("/named.kdl"));
@@ -1086,7 +1086,7 @@ fn a_renamed_workspace_takes_its_file_along() {
     client.wait_for_row("Save workspace layout as");
     client.send(b"\r");
     client.wait_for_row("saved ");
-    assert_eq!(names_in(&dir), ["infra - perso.kdl", "infra - perso.kdl.bak", "work.kdl"]);
+    assert_eq!(names_in(&dir), [".infra - perso.kdl.lock", "infra - perso.kdl", "infra - perso.kdl.bak", "work.kdl"]);
     // Restored after a restart, still linked to its file.
     env.run(&["kill"]);
     env.run(&["open", "infra - perso"]);
@@ -1151,12 +1151,12 @@ fn a_workspace_renamed_without_its_file_is_still_that_files() {
     assert!(shown.len() == 1 && shown[0].contains("work"), "{shown:?}");
     let saved = env.run(&["save", "--workspace", "infra - perso"]);
     assert!(saved.trim_end().ends_with("/perso.kdl"), "{saved}");
-    assert_eq!(names_in(&dir), ["perso.kdl", "perso.kdl.bak", "work.kdl"]);
+    assert_eq!(names_in(&dir), [".perso.kdl.lock", "perso.kdl", "perso.kdl.bak", "work.kdl"]);
     client.send(b"\x02We");
     client.wait_for_row("Rename workspace");
     client.send(b"\r");
     client.wait_for_row("renamed perso.kdl to infra - perso.kdl");
-    assert_eq!(names_in(&dir), ["infra - perso.kdl", "perso.kdl.bak", "work.kdl"]);
+    assert_eq!(names_in(&dir), [".perso.kdl.lock", "infra - perso.kdl", "perso.kdl.bak", "work.kdl"]);
 }
 
 /// A definition renamed on disk while its workspace is open stays linked to it, and its new name
@@ -1175,7 +1175,7 @@ fn a_definition_renamed_on_disk_stays_linked() {
     assert_eq!(env.run(&["panes"]).lines().count(), 1);
     std::fs::remove_file(dir.join("moved.kdl")).unwrap();
     env.run(&["save", "--workspace", "perso"]);
-    assert_eq!(names_in(&dir), ["moved.kdl"]);
+    assert_eq!(names_in(&dir), [".moved.kdl.lock", "moved.kdl"]);
 }
 
 /// Panes stacked from the keys share one place and keep one size; the one the focus reaches
@@ -2152,13 +2152,39 @@ fn a_session_started_stopped_and_forgotten_at_once_is_held_by_one_at_a_time() {
 #[test]
 fn a_workspace_that_cannot_be_restored_stays_saved() {
     let env = Env::new("unrestored");
-    env.workspace("shells", "layout {\n    pane name=\"shell\"\n}\n");
+    let bin = env.root.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    write_script(&bin.join("claude"), "#!/bin/sh\necho original-agent\nexec sleep 1000\n");
+    let home = env.root.join("work-home");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::write(
+        env.root.join("config/kraal/accounts.toml"),
+        format!("[[account]]\nname = 'work'\nagent = 'claude'\nhome = {:?}\n", home.to_str().unwrap()),
+    )
+    .unwrap();
+    env.workspace("shells", "layout {\n    pane name=\"shell\"\n    pane name=\"agent\" agent=\"claude:work\"\n}\n");
     env.workspace("jobs", "layout {\n    pane name=\"job\" command=\"sh\" { args \"-c\" \"exec sleep 4246\"; }\n}\n");
-    env.run(&["open", "shells"]);
+    let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap_or_default());
+    let opened = env.cmd(&["open", "shells"]).env("PATH", &path).output().unwrap();
+    assert!(opened.status.success(), "{}", String::from_utf8_lossy(&opened.stderr));
+    env.wait_for_text("agent", "original-agent");
+    let panes: serde_json::Value = serde_json::from_str(&env.run(&["panes", "--json"])).unwrap();
+    let original_id = panes.as_array().unwrap().iter().find(|p| p["name"] == "agent").unwrap()["account_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
     env.run(&["open", "jobs"]);
     env.run(&["send", "-p", "shell", "--enter", "echo kept-$((4*4))"]);
     env.wait_for_text("shell", "kept-16");
     env.run(&["kill"]);
+    // A released server saved only the name and launch home. The failing shell precedes
+    // the agent, so binding only panes that successfully spawn would miss it.
+    let mut state: serde_json::Value = serde_json::from_slice(&std::fs::read(env.state_file()).unwrap()).unwrap();
+    let spec = &mut state["workspaces"][0]["tabs"][0]["root"]["Split"]["children"][1][0]["Pane"]["spec"];
+    assert_eq!(spec["account_id"], original_id);
+    spec.as_object_mut().unwrap().remove("account_id");
+    spec["env"].as_array_mut().unwrap().retain(|pair| pair[0] != "KRAAL_ACCOUNT_ID");
+    std::fs::write(env.state_file(), serde_json::to_vec(&state).unwrap()).unwrap();
     let names = || -> Vec<String> {
         let panes: serde_json::Value = serde_json::from_str(&env.run(&["panes", "--json"])).unwrap();
         panes.as_array().unwrap().iter().map(|p| p["name"].as_str().unwrap_or_default().to_string()).collect()
@@ -2169,14 +2195,28 @@ fn a_workspace_that_cannot_be_restored_stays_saved() {
     std::fs::rename(&shell, &away).unwrap();
     env.run(&["open", "jobs"]);
     assert_eq!(names(), ["job"]);
+    env.run(&["accounts", "rename", "claude:work", "renamed"]);
+    env.run(&["config", "reload"]);
+    env.run(&["accounts", "rm", "claude:renamed"]);
+    env.run(&["accounts", "add", "claude", "renamed", "--home", home.to_str().unwrap(), "--no-login"]);
+    env.run(&["config", "reload"]);
     env.run(&["kill"]);
     let state = std::fs::read_to_string(env.state_file()).unwrap();
     assert!(state.contains("\"shells\""), "the workspace was dropped: {state}");
+    let saved: serde_json::Value = serde_json::from_str(&state).unwrap();
+    let workspace = saved["workspaces"].as_array().unwrap().iter().find(|ws| ws["name"] == "shells").unwrap();
+    let spec = &workspace["tabs"][0]["root"]["Split"]["children"][1][0]["Pane"]["spec"];
+    assert_eq!(spec["account_id"], original_id);
+    assert_eq!(spec["account"], "claude:renamed");
     std::fs::rename(&away, &shell).unwrap();
     env.run(&["open", "jobs"]);
     let mut back = names();
     back.sort();
-    assert_eq!(back, ["job", "shell"]);
+    assert_eq!(back, ["agent", "job", "shell"]);
+    let panes: serde_json::Value = serde_json::from_str(&env.run(&["panes", "--json"])).unwrap();
+    let agent = panes.as_array().unwrap().iter().find(|p| p["name"] == "agent").unwrap();
+    assert_eq!(agent["account_id"], original_id, "the replacement cannot capture the restored pane");
+    assert_eq!(agent["account"], "claude:renamed");
     env.wait_for_text("shell", "kept-16");
 }
 
@@ -2503,17 +2543,27 @@ fn commands_that_write_the_inventories_keep_what_the_user_wrote() {
                    # Work first.\n[[rule]]\nworkspace = \"work\"\naccounts = [\"work\", \"default\"]\n";
     std::fs::write(&accounts, by_hand).unwrap();
     run(&["accounts", "limits", "--threshold", "80"]);
-    let limited = by_hand.replace("threshold = 85", "threshold = 80");
+    // Older servers keep the readable names; resolved identities go in their own field.
+    let limited = format!(
+        "{}account_ids = [\n    \"work\",\n    \"claude:@default-claude\",\n    \"codex:@default-codex\",\n]\n",
+        by_hand.replace("threshold = 85", "threshold = 80")
+    );
     assert_eq!(read(&accounts), limited);
     let home = env.root.join("codex-work").display().to_string();
     run(&["accounts", "add", "codex", "work", "--home", &home, "--no-login"]);
-    let account = format!("\n[[account]]\nname = \"work\"\nagent = \"codex\"\nhome = \"{home}\"\n");
+    let parsed: toml::Value = toml::from_str(&read(&accounts)).unwrap();
+    let id = parsed["account"][0]["id"].as_str().unwrap();
+    let account = format!("\n[[account]]\nid = {id:?}\nname = \"work\"\nagent = \"codex\"\nhome = \"{home}\"\n");
+    // The previously unresolved name binds when its account is added, and stays bound.
+    let limited = limited.replace("    \"work\",", &format!("    \"codex:@{id}\","));
     assert_eq!(read(&accounts), format!("{limited}{account}"));
     run(&["accounts", "rename", "codex:work", "job"]);
-    let renamed = format!("{limited}{account}").replace("[\"work\", \"default\"]", "[\"job\", \"default\"]");
-    assert_eq!(read(&accounts), renamed.replace("name = \"work\"", "name = \"job\""));
+    let renamed = format!("{limited}{account}")
+        .replace("name = \"work\"", "name = \"job\"")
+        .replace("accounts = [\"work\",", "accounts = [\"job\",");
+    assert_eq!(read(&accounts), renamed);
     run(&["accounts", "rm", "codex:job"]);
-    assert_eq!(read(&accounts), limited.replace("[\"work\", \"default\"]", "[\"default\"]"));
+    assert_eq!(read(&accounts), limited.replace("accounts = [\"work\",", &format!("accounts = [\"codex:@{id}\",")));
 }
 
 #[test]
@@ -6977,7 +7027,7 @@ while IFS= read -r line; do printf 'reply:%s\n' "$line"; done
         std::fs::create_dir_all(home.join("projects/work")).unwrap();
         std::fs::write(home.join("status"), "0").unwrap();
         config.push_str(&format!(
-            "[[account]]\nagent = {agent:?}\nname = {name:?}\nhome = {:?}\n",
+            "[[account]]\nid = \"test-{agent}-{name}\"\nagent = {agent:?}\nname = {name:?}\nhome = {:?}\n",
             home.to_str().unwrap()
         ));
     }
@@ -7168,11 +7218,16 @@ fn codex_discloses_the_new_conversation_and_stop_confirmation_selects_cancel() {
 }
 
 fn write_account_usage(env: &Env, name: &str, percent: u8) {
-    let dir = env.root.join("state/kraal/usage");
+    let dir = env.root.join("state/kraal/usage/by-id");
     std::fs::create_dir_all(&dir).unwrap();
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+    let file: toml::Value =
+        toml::from_str(&std::fs::read_to_string(env.root.join("config/kraal/accounts.toml")).unwrap()).unwrap();
+    let id = file["account"].as_array().unwrap().iter().find(|a| a["name"].as_str() == Some(name)).unwrap()["id"]
+        .as_str()
+        .unwrap();
     std::fs::write(
-        dir.join(format!("claude-{name}.json")),
+        dir.join(format!("claude-{id}.json")),
         serde_json::json!({
             "five_hour": { "used_percent": percent, "resets_at": now + 3600 },
             "weekly": null, "observed_at": now, "source": "statusline"
@@ -7520,6 +7575,31 @@ fn command_line_login_verifies_and_reports_the_same_statuses() {
     }
 }
 
+/// Shell definitions need no account bindings, so account changes do not need write access
+/// to their directory (nor leave lock files beside them).
+#[test]
+fn account_updates_allow_read_only_shell_definitions() {
+    use std::os::unix::fs::PermissionsExt;
+    let env = Env::new("readonly-layouts");
+    env.workspace("shells", "layout { pane name=\"shell\" }\n");
+    let dir = env.root.join("config/kraal/workspaces");
+    let file = dir.join("shells.kdl");
+    let original = std::fs::read(&file).unwrap();
+    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o400)).unwrap();
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+    let added = env.try_run(&["accounts", "add", "codex", "work", "--no-login"]);
+    let limits = env.try_run(&["accounts", "limits", "--threshold", "75"]);
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(added.status.success(), "{}", String::from_utf8_lossy(&added.stderr));
+    assert!(limits.status.success(), "{}", String::from_utf8_lossy(&limits.stderr));
+    assert_eq!(std::fs::read(&file).unwrap(), original);
+    assert_eq!(std::fs::read_dir(dir).unwrap().count(), 1, "no lock file was needed");
+    let accounts: toml::Value =
+        toml::from_str(&std::fs::read_to_string(env.root.join("config/kraal/accounts.toml")).unwrap()).unwrap();
+    assert_eq!(accounts["account"][0]["name"].as_str(), Some("work"));
+    assert_eq!(accounts["limits"]["threshold"].as_integer(), Some(75));
+}
+
 /// An account renamed from the agent picker, then from the command line: its rule and its usage
 /// follow, and the agent running on it goes on under the new name.
 #[test]
@@ -7593,8 +7673,15 @@ fn a_renamed_account_keeps_its_rules_its_usage_and_its_agents() {
     let named = |name: &str| std::fs::read_to_string(&file).unwrap().contains(&format!("name = \"{name}\""));
     wait_until(Duration::from_secs(10), "renamed from the picker", || named("gamma"));
     let text = std::fs::read_to_string(&file).unwrap();
-    assert!(text.contains("accounts = [\"gamma\"]") && !text.contains("alpha\""), "{text}");
-    assert!(usage.join("claude-gamma.json").exists() && !usage.join("claude-alpha.json").exists());
+    let parsed: toml::Value = toml::from_str(&text).unwrap();
+    let id = parsed["account"][0]["id"].as_str().unwrap();
+    assert!(
+        text.contains(&format!("account_ids = [\"claude:@{id}\"]"))
+            && text.contains("accounts = [\"gamma\"]")
+            && !text.contains("alpha\""),
+        "{text}"
+    );
+    assert!(usage.join("by-id").join(format!("claude-{id}.json")).exists());
     hook(r#"{"hook_event_name":"Stop","session_id":"s-1"}"#);
     assert_eq!(account_said("agent.done"), "claude:gamma");
 
@@ -7603,14 +7690,123 @@ fn a_renamed_account_keeps_its_rules_its_usage_and_its_agents() {
     client.wait_for_screen("zulu");
     hook(r#"{"hook_event_name":"UserPromptSubmit","session_id":"s-1"}"#);
     assert_eq!(account_said("agent.working"), "claude:zulu");
-    assert!(std::fs::read_to_string(&file).unwrap().contains("accounts = [\"zulu\"]"));
-    assert!(usage.join("claude-zulu.json").exists());
+    assert!(std::fs::read_to_string(&file).unwrap().contains(&format!("account_ids = [\"claude:@{id}\"]")));
+    assert!(usage.join("by-id").join(format!("claude-{id}.json")).exists());
     let out = env.try_run(&["accounts", "rename", "claude:default", "mine"]);
     assert!(String::from_utf8_lossy(&out.stderr).contains("cannot be renamed") && !out.status.success());
     let screen = env.run(&["read", "-p", &agent]);
     assert!(screen.contains(&format!("home={}", home.display())), "the agent went on: {screen}");
     let _ = events.kill();
     let _ = events.wait();
+}
+
+#[test]
+fn reused_account_names_leave_running_and_saved_references_on_the_original_account() {
+    let env = Env::new("account-identity");
+    let pane = account_switch_agent(&env, "claude", "notify");
+    let path = format!("{}:{}", env.root.join("bin").display(), std::env::var("PATH").unwrap_or_default());
+    let panes = || -> serde_json::Value { serde_json::from_str(&env.run(&["panes", "--json"])).unwrap() };
+    let old =
+        panes().as_array().unwrap().iter().find(|p| p["id"].as_u64() == pane.parse::<u64>().ok()).unwrap().clone();
+    let id = old["account_id"].as_str().unwrap();
+    env.workspace("closed", "// Kept closed.\nlayout { pane agent=\"claude:alpha\" }\n");
+    env.run(&["save", "saved", "--workspace", "w"]);
+    env.run(&["accounts", "rename", "claude:alpha", "work"]);
+    wait_until(PATIENCE, "pane follows its renamed label", || {
+        panes().as_array().unwrap().iter().any(|p| p["account"] == "claude:work" && p["account_id"] == id)
+    });
+    let definition = std::fs::read_to_string(env.root.join("config/kraal/workspaces/closed.kdl")).unwrap();
+    assert!(definition.contains("// Kept closed.") && definition.contains(&format!("account_id={id:?}")));
+    env.run(&["kill"]);
+
+    // A session of an older release carries the label and launch environment, but no identity.
+    let saved = env.root.join(format!("state/kraal/sessions/{}.json", env.session));
+    let mut state: serde_json::Value = serde_json::from_slice(&std::fs::read(&saved).unwrap()).unwrap();
+    fn old_specs(value: &mut serde_json::Value) {
+        match value {
+            serde_json::Value::Object(object) => {
+                if let Some(spec) = object.get_mut("spec").and_then(serde_json::Value::as_object_mut) {
+                    spec.remove("account_id");
+                    if let Some(env) = spec.get_mut("env").and_then(serde_json::Value::as_array_mut) {
+                        env.retain(|pair| pair[0] != "KRAAL_ACCOUNT_ID");
+                    }
+                }
+                object.values_mut().for_each(old_specs);
+            }
+            serde_json::Value::Array(values) => values.iter_mut().for_each(old_specs),
+            _ => {}
+        }
+    }
+    old_specs(&mut state);
+    std::fs::write(&saved, serde_json::to_vec(&state).unwrap()).unwrap();
+    env.run(&["accounts", "rm", "claude:work"]);
+    let migrated = std::fs::read_to_string(&saved).unwrap();
+    assert!(migrated.contains(id), "closed legacy sessions are bound before removal");
+    let replacement = env.root.join("replacement").display().to_string();
+    env.run(&["accounts", "add", "claude", "alpha", "--home", &replacement, "--no-login"]);
+    let out = env.cmd(&["open", "w"]).env("PATH", &path).output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(panes().as_array().unwrap().iter().any(|p| p["account"] == "claude:work" && p["account_id"] == id));
+    for name in ["closed", "saved"] {
+        let out = env.try_run(&["open", name]);
+        let error = String::from_utf8_lossy(&out.stderr);
+        assert!(!out.status.success() && error.contains("account was removed") && !error.contains(id), "{error}");
+    }
+    let refused = raw_request(
+        &env,
+        serde_json::json!({ "cmd": "open_agent", "agent": "claude",
+        "account": "alpha", "account_id": id, "placement": "tab", "near": null, "cwd": null }),
+    );
+    assert!(refused["Err"].as_str().unwrap().contains("account was removed"));
+    // A 0.2 or 0.3 client still selects the current account by name.
+    let opened = raw_request(
+        &env,
+        serde_json::json!({ "cmd": "open_agent", "agent": "claude",
+        "account": "alpha", "placement": "tab", "near": null, "cwd": null }),
+    );
+    assert!(opened.get("Ok").is_some(), "{opened}");
+    assert!(panes().as_array().unwrap().iter().any(|p| p["account"] == "claude:alpha" && p["account_id"] != id));
+    let selected = raw_request(
+        &env,
+        serde_json::json!({ "cmd": "open_agent", "agent": "claude",
+        "account": "alpha", "account_id": "test-claude-beta", "placement": "tab", "near": null, "cwd": null }),
+    );
+    assert!(selected.get("Ok").is_some(), "{selected}");
+    assert!(
+        panes()
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|p| p["account"] == "claude:beta" && p["account_id"] == "test-claude-beta")
+    );
+    let live = panes().as_array().unwrap().iter().find(|p| p["account"] == "claude:alpha").unwrap().clone();
+    let live_id = live["account_id"].as_str().unwrap();
+    env.run(&["accounts", "rm", "claude:alpha"]);
+    env.run(&["accounts", "add", "claude", "alpha", "--home", &replacement, "--no-login"]);
+    let file: toml::Value =
+        toml::from_str(&std::fs::read_to_string(env.root.join("config/kraal/accounts.toml")).unwrap()).unwrap();
+    let replacement_id =
+        file["account"].as_array().unwrap().iter().find(|a| a["name"].as_str() == Some("alpha")).unwrap()["id"]
+            .as_str()
+            .unwrap();
+    assert_ne!(live_id, replacement_id);
+    env.run(&["config", "reload"]);
+    assert!(panes().as_array().unwrap().iter().any(|p| p["id"] == live["id"] && p["account_id"] == live_id));
+    let mut hook = env
+        .cmd(&["statusline"])
+        .env("KRAAL_ACCOUNT_ID", live_id)
+        .env("CLAUDE_CONFIG_DIR", &replacement)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    use std::io::Write;
+    hook.stdin.take().unwrap().write_all(br#"{"rate_limits":{"five_hour":{"used_percentage":91}}}"#).unwrap();
+    assert!(hook.wait().unwrap().success());
+    assert!(
+        !env.root.join(format!("state/kraal/usage/by-id/claude-{replacement_id}.json")).exists(),
+        "a late statusline must not write usage to the replacement, even in the same home"
+    );
 }
 
 /// While the keys after the prefix are awaited, the client's terminal is asked for every key

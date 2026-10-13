@@ -20,6 +20,7 @@ impl Server {
         let mut dirs = self.config.workspace_dirs();
         dirs.push(paths::config_dir());
         dirs.push(paths::state_dir().join("usage"));
+        dirs.push(paths::state_dir().join("usage/by-id"));
         self.dirwatch.watch_config(&dirs);
         let listed = self.definitions();
         self.follow_definitions(&listed);
@@ -313,9 +314,10 @@ impl Server {
                         if account.is_none() && self.accounts.undecided(kind, spec.cwd.as_deref()) {
                             return self.spawn_pending_agent(def, kind, ws, spec);
                         }
-                        let a = match account {
-                            Some(name) => self.accounts.get(kind, name),
-                            None => self.accounts.choose(
+                        let a = match (def.account_id.as_deref(), account) {
+                            (Some(id), _) => self.accounts.by_id(id).filter(|a| a.agent == kind),
+                            (None, Some(name)) => self.accounts.get(kind, name),
+                            (None, None) => self.accounts.choose(
                                 kind,
                                 ws.as_deref(),
                                 spec.cwd.as_deref(),
@@ -326,8 +328,12 @@ impl Server {
                         // A misspelt account is an error, not a plain shell in its place.
                         let a = a.with_context(|| {
                             format!(
-                                "{kind} has no account named {:?} (`kraal accounts` lists them)",
-                                account.unwrap_or("")
+                                "{} (`kraal accounts` lists them)",
+                                if def.account_id.is_some() {
+                                    "the account was removed; choose an account again".into()
+                                } else {
+                                    crate::accounts::missing_account(kind, account.unwrap_or(""))
+                                }
                             )
                         })?;
                         let mut agent_spec = self.agent_spec(&a, spec.cwd.clone(), None, &def.args)?;
@@ -438,6 +444,7 @@ impl Server {
             let mut wait = p.suspended && !p.spec.command.is_empty();
             if let Some(pending) = &p.spec.pending_agent {
                 return workspace::PaneDef {
+                    account_id: None,
                     name: p.name.clone(),
                     command: None,
                     args: pending.args.clone(),
@@ -477,6 +484,7 @@ impl Server {
                 focus: focused,
                 kind,
                 agent,
+                account_id: p.spec.account_id.clone(),
                 start_suspended: wait,
                 close_on_exit: p.spec.close_on_exit,
             }

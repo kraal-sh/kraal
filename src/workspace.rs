@@ -83,6 +83,9 @@ pub struct PaneDef {
     pub kind: PaneKind,
     /// Coding agent hint (kraal extension `agent="..."`).
     pub agent: Option<String>,
+    /// Saved identity of an explicitly chosen account; `agent` keeps its readable label.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_id: Option<String>,
     /// Wait for a keypress before starting `command`.
     pub start_suspended: bool,
     /// Close the pane when `command` exits instead of holding it open.
@@ -299,6 +302,61 @@ pub fn load_file(path: &Path) -> Result<WorkspaceDef> {
     let src = fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
     let name = path.file_stem().map(|stem| stem.to_string_lossy().into_owned()).unwrap_or_default();
     parse_workspace(&name, &src).with_context(|| format!("parsing {}", path.display()))
+}
+
+/// Bind old labels before a rename or removal. Insert at source spans: serializing a v1
+/// document through the v2 parser can move comments and change how its booleans are read.
+pub fn bind_accounts(path: &Path, accounts: &crate::accounts::Accounts) -> Result<()> {
+    fn bindings(doc: &KdlDocument, accounts: &crate::accounts::Accounts) -> Vec<(usize, String)> {
+        let mut out = Vec::new();
+        for node in doc.nodes() {
+            if node.name().value() == "pane"
+                && node.get("account_id").is_none()
+                && let Some(entry) =
+                    node.entries().iter().rev().find(|e| e.name().is_some_and(|n| n.value() == "agent"))
+                && let Some((agent, name)) = entry.value().as_string().and_then(|s| s.split_once(':'))
+                && let Some(a) = accounts.get(agent, name)
+            {
+                out.push((entry.span().offset() + entry.span().len(), format!(" account_id={}", quote(&a.id))));
+            }
+            if let Some(children) = node.children() {
+                out.extend(bindings(children, accounts));
+            }
+        }
+        out
+    }
+    // Unrelated definitions may be read-only. Require a lock only when something needs binding,
+    // then read again under it: a save may have replaced the definition since this first look.
+    let source = fs::read_to_string(path)?;
+    if bindings(&parse_kdl(&source)?, accounts).is_empty() {
+        return Ok(());
+    }
+    crate::paths::locked(path, || {
+        let mut source = fs::read_to_string(path)?;
+        let mut insertions = bindings(&parse_kdl(&source)?, accounts);
+        if !insertions.is_empty() {
+            insertions.sort_by_key(|(offset, _)| *offset);
+            for (offset, text) in insertions.into_iter().rev() {
+                source.insert_str(offset, &text);
+            }
+            parse_kdl(&source).context("checking migrated workspace accounts")?;
+            crate::paths::write_atomic(path, source.as_bytes())?;
+        }
+        Ok(())
+    })?
+}
+
+/// Save a definition, keeping the previous contents beside it. Migration takes the same lock.
+pub fn save_file(path: &Path, def: &WorkspaceDef) -> Result<()> {
+    crate::paths::locked(path, || {
+        if path.exists() {
+            let backup = path.with_extension("kdl.bak");
+            fs::copy(path, &backup)
+                .with_context(|| format!("keeping a copy as {}: nothing was saved", backup.display()))?;
+        }
+        crate::paths::write_atomic(path, to_kdl(def).as_bytes())?;
+        Ok(())
+    })?
 }
 
 /// What to say when no workspace is named `name`: none is open under that name, and no file of
@@ -882,6 +940,7 @@ impl Parser<'_> {
                 }
                 Some("preview") => preview = self.path(entry),
                 Some("agent") => def.agent = self.string(entry),
+                Some("account_id") => def.account_id = self.string(entry),
                 Some("stacked") => stacked = self.flag(entry).unwrap_or(stacked),
                 // Read by the stack holding the pane.
                 Some("expanded") => {
@@ -1079,6 +1138,7 @@ impl Writer {
             push_str(&mut head, "preview", Some(&path_text(path, own_cwd)));
         }
         push_str(&mut head, "agent", pane.agent.as_deref());
+        push_str(&mut head, "account_id", pane.account_id.as_deref());
         if pane.args.is_empty() {
             self.line(depth, &head);
             return;
@@ -1268,6 +1328,147 @@ layout {{
 }}
 "#
         )
+    }
+
+    #[test]
+    fn account_bindings_keep_labels_comments_and_unknown_properties() {
+        let dir = std::env::temp_dir().join(format!("kraal-workspace-account-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("work.kdl");
+        let source = "// Mine.\nlayout {\n    pane agent=\"claude:default\" future=\"kept\" focus=true // account\n    pane agent=\"codex\"\n}\n";
+        std::fs::write(&file, source).unwrap();
+        let accounts = crate::accounts::Accounts::empty();
+        bind_accounts(&file, &accounts).unwrap();
+        let migrated = std::fs::read_to_string(&file).unwrap();
+        assert_eq!(migrated, source.replace(" future=", " account_id=\"default-claude\" future="));
+        let ws = load_file(&file).unwrap();
+        let panes = ws.panes();
+        assert_eq!(panes[0].agent.as_deref(), Some("claude:default"));
+        assert_eq!(panes[0].account_id.as_deref(), Some("default-claude"));
+        assert!(panes[1].account_id.is_none(), "an agent selected by rules stays dynamic");
+        assert!(panes[0].focus, "the v1 boolean stays a boolean");
+        let roundtrip = parse_workspace("work", &to_kdl(&ws)).unwrap();
+        assert_eq!(roundtrip.panes()[0].account_id, panes[0].account_id);
+        bind_accounts(&file, &accounts).unwrap();
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), migrated);
+        std::fs::write(&file, source.replace("focus=true", "focus=#true")).unwrap();
+        bind_accounts(&file, &accounts).unwrap();
+        assert!(load_file(&file).unwrap().panes()[0].focus, "v2 stays v2");
+        std::fs::write(&file, "layout {").unwrap();
+        assert!(bind_accounts(&file, &accounts).is_err());
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "layout {");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn account_bindings_use_the_last_agent_property() {
+        let dir = std::env::temp_dir().join(format!("kraal-workspace-duplicate-account-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("work.kdl");
+        let mut accounts = crate::accounts::Accounts::empty();
+        let default = accounts.get("claude", "default").unwrap();
+        for name in ["alpha", "beta"] {
+            accounts
+                .add(crate::accounts::Account {
+                    id: name.into(),
+                    name: name.into(),
+                    home: format!("/{name}"),
+                    ..default.clone()
+                })
+                .unwrap();
+        }
+        for (last, expected) in [("claude:beta", Some("beta")), ("codex", None)] {
+            let source = format!("layout {{ pane agent=\"claude:alpha\" agent={last:?} }}\n");
+            std::fs::write(&file, &source).unwrap();
+            assert_eq!(load_file(&file).unwrap().panes()[0].agent.as_deref(), Some(last));
+            bind_accounts(&file, &accounts).unwrap();
+            let def = load_file(&file).unwrap();
+            assert_eq!(def.panes()[0].agent.as_deref(), Some(last));
+            assert_eq!(def.panes()[0].account_id.as_deref(), expected);
+            if expected.is_none() {
+                assert_eq!(std::fs::read_to_string(&file).unwrap(), source);
+            }
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn read_only_definitions_without_legacy_bindings_need_no_lock() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("kraal-readonly-workspace-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("shells.kdl");
+        let source =
+            "layout {\n    pane command=\"sh\"\n    pane agent=\"claude:default\" account_id=\"default-claude\"\n}\n";
+        std::fs::write(&file, source).unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o400)).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let result = bind_accounts(&file, &crate::accounts::Accounts::empty());
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        result.unwrap();
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), source);
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1, "no lock file was needed");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn saves_and_account_migration_share_a_lock_and_reread() {
+        use crate::paths;
+        use std::sync::mpsc;
+        let dir = std::env::temp_dir().join(format!("kraal-workspace-save-migration-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("work.kdl");
+        let accounts = crate::accounts::Accounts::empty();
+        let old = "layout { pane agent=\"claude:default\" }\n";
+        std::fs::write(&file, old).unwrap();
+        bind_accounts(&file, &accounts).unwrap();
+        let migrated = std::fs::read_to_string(&file).unwrap();
+        std::fs::write(&file, old).unwrap();
+        let saved = parse_workspace("work", "layout { pane name=\"new layout\" agent=\"codex:default\" }\n").unwrap();
+        // Migration has read the old definition and holds its lock while a save arrives.
+        let writer = paths::locked(&file, || {
+            assert_eq!(std::fs::read_to_string(&file).unwrap(), old);
+            let (tx, rx) = mpsc::channel();
+            let (path, saved) = (file.clone(), saved.clone());
+            let writer = std::thread::spawn(move || {
+                // SAFETY: gettid has no preconditions.
+                tx.send(unsafe { libc::gettid() }).unwrap();
+                save_file(&path, &saved).unwrap();
+            });
+            crate::testing::wait_asleep(rx.recv().unwrap());
+            assert!(!writer.is_finished(), "the save must wait for migration's read/write operation");
+            assert!(!file.with_extension("kdl.bak").exists(), "the backup also needs the lock");
+            paths::write_atomic(&file, migrated.as_bytes()).unwrap();
+            writer
+        })
+        .unwrap();
+        writer.join().unwrap();
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), to_kdl(&saved));
+        assert_eq!(std::fs::read_to_string(file.with_extension("kdl.bak")).unwrap(), migrated);
+        // A migration saw an old label before waiting for a save's lock. It must bind the
+        // newly saved layout once that lock becomes available, keeping all its new panes.
+        std::fs::write(&file, old).unwrap();
+        let migration = paths::locked(&file, || {
+            let (tx, rx) = mpsc::channel();
+            let path = file.clone();
+            let migration = std::thread::spawn(move || {
+                // SAFETY: gettid has no preconditions.
+                tx.send(unsafe { libc::gettid() }).unwrap();
+                bind_accounts(&path, &accounts).unwrap();
+            });
+            crate::testing::wait_asleep(rx.recv().unwrap());
+            assert!(!migration.is_finished(), "migration must wait for the save");
+            paths::write_atomic(&file, to_kdl(&saved).as_bytes()).unwrap();
+            migration
+        })
+        .unwrap();
+        migration.join().unwrap();
+        let mut expected = saved;
+        let LayoutNode::Pane(pane) = &mut expected.tabs[0].root else { panic!("pane") };
+        pane.account_id = Some("default-codex".into());
+        assert_eq!(load_file(&file).unwrap(), expected);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     fn parse(src: &str) -> WorkspaceDef {

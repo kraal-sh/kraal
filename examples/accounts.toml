@@ -11,6 +11,9 @@ mode = "ask"                    # "notify" tells you, "ask" offers, "auto" check
 # Changes need known usage below the threshold and verified sign-in. Unknown usage is not zero.
 # A failed automatic change waits for a manual retry or a new crossing of the threshold.
 
+# Names can also be written as agent:name. On rewriting, kraal binds known accounts to internal
+# identities so a rename or reused name does not change what a rule allows. Keep generated references.
+
 # The first rule that matches decides. In the workspace "shop", every agent starts on its
 # work account, and on your own when it has none or that one is over the threshold.
 [[rule]]

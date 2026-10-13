@@ -49,6 +49,7 @@ pub(super) fn accounts(action: AccountsCmd) -> Result<()> {
         AccountsCmd::Add { agent, name, home, threshold, no_login } => {
             let home = home.unwrap_or_else(|| accounts::default_home_for(&agent, &name).display().to_string());
             let a = accounts::Account {
+                id: accounts::new_uuid(),
                 name,
                 agent,
                 home: accounts::absolute_home(&home)?,
@@ -56,9 +57,10 @@ pub(super) fn accounts(action: AccountsCmd) -> Result<()> {
                 note: None,
                 sign_in_required: !no_login,
             };
-            let notes = accounts::Accounts::update(|all| {
-                all.add(a.clone())?;
-                accounts::prepare_home(&a)
+            let (a, notes) = accounts::Accounts::update(|all| {
+                let a = all.add(a)?;
+                let notes = accounts::prepare_home(&a)?;
+                Ok((a, notes))
             })?;
             for note in notes {
                 println!("  {note}");
@@ -77,7 +79,7 @@ pub(super) fn accounts(action: AccountsCmd) -> Result<()> {
         AccountsCmd::Rm { account } => {
             let a = find_account(&all, &account)?;
             accounts::Accounts::update(|all| {
-                if !all.remove(&a.agent, &a.name) {
+                if !all.remove(&a.agent, &a.key()) {
                     bail!("{} is the agent's default account; it cannot be forgotten", accounts::label(&a));
                 }
                 Ok(())
@@ -87,7 +89,7 @@ pub(super) fn accounts(action: AccountsCmd) -> Result<()> {
         }
         AccountsCmd::Rename { account, name } => {
             let a = find_account(&all, &account)?;
-            accounts::rename(&a.agent, &a.name, &name)?;
+            accounts::rename(&a.agent, &a.key(), &name)?;
             println!("renamed {} to {}·{name}", accounts::label(&a), a.agent);
             Ok(())
         }
@@ -105,7 +107,7 @@ pub(super) fn accounts(action: AccountsCmd) -> Result<()> {
                             observed_at: l.observed_at,
                             source: "codex".into(),
                         };
-                        accounts::save_usage(&a.agent, &a.name, &u)?;
+                        accounts::save_usage(&a, &u)?;
                         println!("{:<18} {}", accounts::label(&a), server::usage_text(&u, accounts::now()));
                     }
                     Err(e) => println!("{:<18} {e:#}", accounts::label(&a)),
@@ -150,7 +152,7 @@ pub(super) fn accounts(action: AccountsCmd) -> Result<()> {
 /// `agent:name` or a bare account name (searched across agents).
 fn find_account(all: &accounts::Accounts, spec: &str) -> Result<accounts::Account> {
     if let Some((agent, name)) = spec.split_once(':').or_else(|| spec.split_once('·')) {
-        return all.get(agent, name).with_context(|| format!("{agent} has no account named {name:?}"));
+        return all.get(agent, name).with_context(|| accounts::missing_account(agent, name));
     }
     let matches: Vec<accounts::Account> = all.all().into_iter().filter(|a| a.name == spec).collect();
     match matches.len() {
@@ -213,6 +215,7 @@ pub(super) fn agent(
     let inside = std::env::var_os("KRAAL_SOCKET").is_some();
     if inside && !here {
         let opened = s.request(Request::OpenAgent {
+            account_id: None,
             agent,
             account,
             placement,
@@ -250,7 +253,7 @@ fn exec_agent(
     }
     let usage = accounts::UsageMap::load(&all.all());
     let a = match account {
-        Some(name) => all.get(agent, name).with_context(|| format!("{agent} has no account named {name:?}"))?,
+        Some(name) => all.get(agent, name).with_context(|| accounts::missing_account(agent, name))?,
         None => all
             .choose(agent, workspace, cwd.as_deref(), &usage, accounts::now())
             .context("no account allowed here: the matching rule in accounts.toml names none")?,
@@ -297,6 +300,7 @@ pub(super) fn worktrees(s: &Session, action: WtCmd) -> Result<()> {
             if let Some(agent) = agent {
                 if std::env::var_os("KRAAL_SOCKET").is_some() {
                     let opened = s.request(Request::OpenAgent {
+                        account_id: None,
                         agent,
                         account: None,
                         placement: Placement::Tab,

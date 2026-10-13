@@ -212,17 +212,20 @@ Your existing setup is the `default` account of each agent (`kraal accounts add`
 set to the agent's own directory gives it another name). New Claude accounts share
 `CLAUDE.md`, `settings.json`, skills, plugins, memory and conversations with it, so a conversation
 can continue on another account; Codex accounts share nothing, as Codex keeps databases in its home.
-An agent kraal starts on an account gets `$KRAAL_ACCOUNT` (`claude:pro`), and not the API keys of
+An agent kraal starts on an account gets `$KRAAL_ACCOUNT` (`claude:pro`) and an internal
+`$KRAAL_ACCOUNT_ID` that stays the same when renamed. It does not inherit the API keys of
 your environment (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`…), which would bill another account.
 
 The agent picker (`ctrl+b a`) lists every account, and offers to add one. The `+ add a claude
 account` and `+ add a codex account` lines use the normal active style; Enter asks for the new
 account's name. Tab on an account shows
 what can be done with it, each also on its own key: start it in a new tab (`ctrl+t`), log in again
-(`ctrl+l`), rename it (`ctrl+r`) or remove it (`ctrl+x`). Renaming changes the rules that name the
-account and keeps its usage; its directory stays where it is, and agents running on it go on,
-shown under the new name. A rule for every agent that also names another agent's account of the
-old or the new name stays theirs: the renamed account gets a rule of its own just before it.
+(`ctrl+l`), rename it (`ctrl+r`) or remove it (`ctrl+x`). The name is a label: renaming keeps the
+same account, rules and usage. Its directory stays where it is, and running agents go on under
+the new name. Removing an account keeps the label and launch environment of panes that use it.
+Adding another account with that name does not attach those panes, saved sessions, workspace
+bindings, rules or cached usage to the replacement. A workspace bound to a removed account
+asks you to choose an account again.
 `default`, the agent's own home, keeps its name. Once an account is listed or one was used, the
 sidebar lists every account at the bottom
 (`claude·pro 42%`): the higher of its 5-hour and weekly usage, in yellow from 70% and in red at
@@ -295,14 +298,21 @@ accounts = ["pro", "default"]   # in order of preference
 ```
 
 The file also holds the accounts themselves, one `[[account]]` each (`name`, `agent`, `home`,
-and a `threshold` of its own if it has one), which `kraal accounts add` writes. A login that has
+an internal `id`, and a `threshold` of its own if it has one), which `kraal accounts add` writes. A login that has
 not been verified also has `sign_in_required = true`; successful verification removes that flag.
 kraal edits what it changes there and leaves the rest as you wrote it, including comments, order
 and unknown keys. A new file includes an explanatory header and omits empty rules and an empty `[claude]`
 table. When kraal next rewrites an older file, it removes an empty top-level `rule = []` and an
 empty `[claude]` table, keeping their comments. A `[claude]` table with a saved `statusline`
 command or other settings stays, as do existing rules. A file that cannot be parsed is left
-untouched.
+untouched. Older files without identifiers work unchanged. On the next rewrite, kraal adds
+identifiers and binds existing rules to them, keeping a first backup as `accounts.toml.kraal-bak`.
+Before changing accounts, it also binds readable closed sessions and workspace definitions in
+the configured directories. Rules accept bare names and `agent:name`; kraal writes resolved
+references as `agent:@id`. Workspace files keep the readable `agent="claude:name"` and add
+`account_id` when bound or saved. These are generated details: keep them when editing a label;
+use names when writing a new rule or choosing a different account in a workspace, removing that
+pane's old `account_id`. No command or picker requires an identifier.
 [examples/accounts.toml](../examples/accounts.toml) has limits and two rules, by workspace and by
 directory.
 

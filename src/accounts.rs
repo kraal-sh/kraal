@@ -123,6 +123,9 @@ impl Default for Limits {
 /// An `[[account]]` of accounts.toml: one subscription of one agent.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Account {
+    /// Stable identity; absent in files written before account identities were introduced.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub id: String,
     /// Unique among the agent's accounts. `default` names the agent's default home only.
     pub name: String,
     /// The [`AgentKind`] it is for, by name.
@@ -141,6 +144,22 @@ pub struct Account {
 }
 
 impl Account {
+    pub fn key(&self) -> String {
+        key(&self.agent, &format!("@{}", self.id))
+    }
+
+    fn matches(&self, reference: &str) -> bool {
+        reference.strip_prefix('@').is_some_and(|id| id == self.id)
+            || reference == self.key()
+            || reference == key(&self.agent, &self.name)
+            || reference == self.name
+    }
+
+    /// Readers of an old file must agree before any of them rewrites it.
+    fn legacy_id(&self) -> String {
+        format!("legacy-{:016x}", crate::text::fnv64(&format!("{}\0{}\0{}", self.agent, self.name, self.home)))
+    }
+
     pub fn same_home(&self, other: &Account) -> bool {
         let home = |a: &Account| {
             let path = paths::expand_tilde(&a.home);
@@ -163,8 +182,11 @@ struct Rule {
     /// The rule applies to this agent only; `None`: to every agent ([`Accounts::rule_accounts`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     agent: Option<String>,
-    /// Account names to try, in order. Empty: no account may be used where the rule applies.
+    /// Readable names for older servers, in order. Empty forbids every account.
     accounts: Vec<String>,
+    /// Authoritative references once bound; older servers keep using `accounts`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    account_ids: Option<Vec<String>>,
 }
 
 /// `[claude]` of accounts.toml.
@@ -272,7 +294,7 @@ impl Accounts {
             }
             None => Default::default(),
         };
-        let accounts = Accounts {
+        let mut accounts = Accounts {
             limits: file.limits,
             claude: file.claude,
             accounts: file.accounts,
@@ -280,6 +302,24 @@ impl Accounts {
             path: path.to_path_buf(),
             source,
         };
+        let mut ids = std::collections::HashSet::new();
+        for a in &mut accounts.accounts {
+            if a.id.is_empty() {
+                a.id = a.legacy_id();
+            }
+            anyhow::ensure!(
+                valid_name(&a.id) && ids.insert(a.id.clone()),
+                "invalid or duplicate account identity in {}; the file is unchanged",
+                path.display()
+            );
+        }
+        let mut effective_ids = std::collections::HashSet::new();
+        anyhow::ensure!(
+            accounts.all().iter().all(|a| effective_ids.insert(a.id.clone())),
+            "duplicate account identity in {}; the file is unchanged",
+            path.display()
+        );
+        accounts.bind_rules();
         Ok((accounts, warnings))
     }
 
@@ -315,8 +355,17 @@ impl Accounts {
         if let Some(dir) = self.path.parent() {
             std::fs::create_dir_all(dir)?;
         }
-        paths::write_atomic(&self.path, self.text()?.as_bytes())
-            .with_context(|| format!("writing {}", self.path.display()))
+        let text = self.text()?;
+        if let Some(source) = &self.source {
+            let old: File = toml::from_str(source)?;
+            if old.accounts.iter().any(|a| a.id.is_empty()) || old.rules != self.rules {
+                let backup = self.path.with_extension("toml.kraal-bak");
+                if !backup.exists() {
+                    paths::write_atomic(&backup, source.as_bytes()).context("backing up accounts before migration")?;
+                }
+            }
+        }
+        paths::write_atomic(&self.path, text.as_bytes()).with_context(|| format!("writing {}", self.path.display()))
     }
 
     /// Load the accounts, change them with `f` and save them if they changed, with no other kraal
@@ -330,8 +379,29 @@ impl Accounts {
         paths::locked(path, || {
             let mut all = Self::load_from(path)?;
             let before = all.text()?;
+            let previous = all.clone();
             let out = f(&mut all)?;
+            all.bind_rules();
             if all.text()? != before {
+                if path == Self::path() {
+                    for a in previous.all() {
+                        migrate_usage(&usage_dir(), &a)?;
+                    }
+                    crate::persist::bind_accounts(&previous)
+                        .context("could not migrate saved account references; accounts.toml is unchanged; check the saved session and retry")?;
+                    for dir in crate::config::Config::load()?.workspace_dirs() {
+                        for (file, definition) in crate::workspace::load_dir(&dir) {
+                            if definition.is_ok() {
+                                crate::workspace::bind_accounts(&file, &previous).with_context(|| {
+                                    format!(
+                                        "could not migrate {}; accounts.toml is unchanged; check this file and retry",
+                                        file.display()
+                                    )
+                                })?;
+                            }
+                        }
+                    }
+                }
                 all.save()?;
             }
             Ok(out)
@@ -350,6 +420,7 @@ impl Accounts {
                 out.insert(
                     0,
                     Account {
+                        id: format!("default-{agent}"),
                         name: "default".into(),
                         agent: agent.into(),
                         home: kind.default_home.into(),
@@ -374,10 +445,49 @@ impl Accounts {
     }
 
     pub fn get(&self, agent: &str, name: &str) -> Option<Account> {
-        self.for_agent(agent).into_iter().find(|a| a.name == name)
+        self.for_agent(agent).into_iter().find(|a| a.matches(name))
+    }
+
+    pub fn by_id(&self, id: &str) -> Option<Account> {
+        self.all().into_iter().find(|a| a.id == id)
+    }
+
+    fn bind_rules(&mut self) {
+        let all = self.all();
+        for rule in &mut self.rules {
+            // A name kept while its account did not exist binds as soon as it can be resolved.
+            // References already bound keep their identity, even after that account is removed.
+            let ids: Vec<String> = rule
+                .account_ids
+                .as_ref()
+                .unwrap_or(&rule.accounts)
+                .iter()
+                .flat_map(|reference| {
+                    let found: Vec<String> = all
+                        .iter()
+                        .filter(|a| rule.agent.as_deref().is_none_or(|agent| a.agent == agent) && a.matches(reference))
+                        .map(Account::key)
+                        .collect();
+                    if found.is_empty() { vec![reference.clone()] } else { found }
+                })
+                .collect();
+            let mut names = Vec::new();
+            for reference in &ids {
+                let name =
+                    all.iter().find(|a| a.matches(reference)).map_or_else(|| reference.clone(), |a| a.name.clone());
+                if !names.contains(&name) {
+                    names.push(name);
+                }
+            }
+            rule.accounts = names;
+            rule.account_ids = Some(ids);
+        }
     }
 
     pub fn set_sign_in_required(&mut self, account: &Account, required: bool) {
+        if self.by_id(&account.id).is_none() {
+            return;
+        }
         let mut found = false;
         for a in &mut self.accounts {
             if a.same_home(account) {
@@ -401,69 +511,94 @@ impl Accounts {
         })
     }
 
-    /// The account an agent started by [`launch`] runs on, from what its pane keeps: the account
-    /// `key` names, else, when none has that name any more (it was renamed), the one in the home
-    /// `env` gave the agent.
-    pub fn launched_on(&self, key: &str, env: &[(String, String)]) -> Option<Account> {
-        let (agent, name) = key.split_once(':')?;
-        if let Some(a) = self.get(agent, name) {
-            return Some(a);
+    /// Stable references never fall back to a reused name or home. Old panes have their
+    /// launch environment to distinguish a renamed account from a replacement of its name.
+    pub fn launched_on(&self, reference: &str, env: &[(String, String)]) -> Option<Account> {
+        if let Some((_, id)) = env.iter().find(|(k, _)| k == "KRAAL_ACCOUNT_ID") {
+            return self.by_id(id);
+        }
+        let (agent, name) = reference.split_once(':')?;
+        if name.starts_with('@') {
+            return self.get(agent, name);
         }
         let kind = agent_kind(agent)?;
-        let home = match env.iter().find(|(k, _)| k == kind.home_env) {
-            Some((_, home)) => PathBuf::from(home),
-            None => paths::expand_tilde(kind.default_home),
+        let home = env
+            .iter()
+            .find(|(k, _)| k == kind.home_env)
+            .map(|(_, home)| PathBuf::from(home))
+            .unwrap_or_else(|| paths::expand_tilde(kind.default_home));
+        self.get(agent, name).filter(|a| paths::expand_tilde(&a.home) == home).or_else(|| self.by_home(agent, &home))
+    }
+
+    pub fn bind_pane(&self, spec: &mut crate::pane::PaneSpec) {
+        let Some(reference) = spec.account.as_deref() else { return };
+        let account = match spec.account_id.as_deref() {
+            Some(id) => self.by_id(id),
+            None => self.launched_on(reference, &spec.env),
         };
-        self.by_home(agent, &home)
+        if let Some(a) = account {
+            spec.account = Some(key(&a.agent, &a.name));
+            spec.account_id = Some(a.id.clone());
+            spec.env.retain(|(k, _)| k != "KRAAL_ACCOUNT_ID" && k != "KRAAL_ACCOUNT");
+            spec.env.push(("KRAAL_ACCOUNT_ID".into(), a.id));
+            spec.env.push(("KRAAL_ACCOUNT".into(), key(&a.agent, &a.name)));
+        } else if spec.account_id.is_none() {
+            // A dangling old reference must not become a new account on a later reload.
+            spec.account_id = Some(
+                spec.env
+                    .iter()
+                    .find(|(k, _)| k == "KRAAL_ACCOUNT_ID")
+                    .map(|(_, id)| id.clone())
+                    .unwrap_or_else(new_uuid),
+            );
+        }
     }
 
     pub fn threshold(&self, a: &Account) -> u8 {
         a.threshold.unwrap_or(self.limits.threshold)
     }
 
-    pub fn add(&mut self, mut account: Account) -> Result<()> {
+    pub fn add(&mut self, mut account: Account) -> Result<Account> {
         let kind = agent_kind(&account.agent)
             .with_context(|| format!("unknown agent {:?} (known: {})", account.agent, agent_names()))?;
         account.home = absolute_home(&account.home)?;
+        let adopted = self.for_agent(kind.name).into_iter().find(|a| {
+            a.name == "default"
+                && !self.accounts.iter().any(|listed| listed.id == a.id)
+                && paths::expand_tilde(&a.home) == paths::expand_tilde(&account.home)
+        });
+        if let Some(a) = &adopted {
+            account.id = a.id.clone();
+        } else if account.id.is_empty() {
+            account.id = new_uuid();
+        }
+        anyhow::ensure!(valid_name(&account.id), "invalid account identity");
+        anyhow::ensure!(
+            !self.all().iter().any(|a| a.id == account.id && adopted.as_ref().is_none_or(|old| old.id != a.id)),
+            "account identity already exists"
+        );
         check_name(kind, &account.name, &account.home)?;
         if self.for_agent(kind.name).iter().any(|a| a.name == account.name && a.name != "default") {
             bail!("{} already has an account named {:?}", kind.name, account.name);
         }
+        self.bind_rules();
         // Naming the default home adopts it instead of adding a second entry.
         self.accounts.retain(|a| !(a.agent == account.agent && a.name == account.name));
-        self.accounts.push(account);
-        Ok(())
+        self.accounts.push(account.clone());
+        Ok(account)
     }
 
     pub fn remove(&mut self, agent: &str, name: &str) -> bool {
+        self.bind_rules();
+        let Some(account) = self.get(agent, name) else { return false };
         let before = self.accounts.len();
-        self.accounts.retain(|a| !(a.agent == agent && a.name == name));
-        // A rule for every agent keeps the name while another agent still has an account so
-        // named. When it then names none of this agent's accounts, a rule for this agent alone,
-        // naming no account, goes before it: otherwise this agent would fall back to any of its
-        // accounts where the rule used to restrict it.
-        let shared = self.all().iter().any(|a| a.name == name);
-        let mine: Vec<String> = self.for_agent(agent).into_iter().map(|a| a.name).collect();
-        let mut refusals = Vec::new();
-        for (i, r) in self.rules.iter_mut().enumerate() {
-            if r.agent.as_deref() == Some(agent) || (r.agent.is_none() && !shared) {
-                r.accounts.retain(|n| n != name);
-            } else if r.agent.is_none()
-                && r.accounts.iter().any(|n| n == name)
-                && !r.accounts.iter().any(|n| mine.contains(n))
-            {
-                refusals.push((i, Rule { agent: Some(agent.to_string()), accounts: Vec::new(), ..r.clone() }));
-            }
-        }
-        for (i, rule) in refusals.into_iter().rev() {
-            self.rules.insert(i, rule);
-        }
+        self.accounts.retain(|a| a.id != account.id);
         before != self.accounts.len()
     }
 
     /// Account `name` of `agent`, when it can be renamed; an error says why not.
     pub fn renamable(&self, agent: &str, name: &str) -> Result<Account> {
-        let a = self.get(agent, name).with_context(|| format!("{agent} has no account named {name:?}"))?;
+        let a = self.get(agent, name).with_context(|| missing_account(agent, name))?;
         if !self.accounts.contains(&a) {
             bail!(
                 "{} is {agent}'s own home ({}): it is always called \"default\" and cannot be renamed",
@@ -474,7 +609,7 @@ impl Accounts {
         Ok(a)
     }
 
-    /// Rename account `old` of `agent` to `new`, in the rules too. Its home stays where it is.
+    /// Rename the label, binding any legacy rules first. Its home and identity stay.
     fn rename(&mut self, agent: &str, old: &str, new: &str) -> Result<()> {
         let account = self.renamable(agent, old)?;
         let kind = agent_kind(agent).with_context(|| format!("unknown agent {agent:?} (known: {})", agent_names()))?;
@@ -482,41 +617,11 @@ impl Accounts {
         if self.get(agent, new).is_some() {
             bail!("{agent} already has an account named {new:?}");
         }
-        for a in self.accounts.iter_mut().filter(|a| a.agent == agent && a.name == old) {
+        self.bind_rules();
+        for a in self.accounts.iter_mut().filter(|a| a.id == account.id) {
             a.name = new.to_string();
         }
-        self.rename_in_rules(agent, old, new);
         Ok(())
-    }
-
-    /// Rules that name account `old` of `agent` name `new` instead. A rule for every agent names
-    /// the other agents' accounts of the same names too: when one of them has an account named
-    /// `old` or `new`, that rule stays theirs (without `old` if none of them has it), and this
-    /// agent gets a rule of its own just before it.
-    fn rename_in_rules(&mut self, agent: &str, old: &str, new: &str) {
-        let others: Vec<String> = self.all().into_iter().filter(|a| a.agent != agent).map(|a| a.name).collect();
-        let theirs = |name: &str| others.iter().any(|n| n == name);
-        let split = theirs(old) || theirs(new);
-        let renamed = |names: &[String]| -> Vec<String> {
-            names.iter().map(|n| if n == old { new.to_string() } else { n.clone() }).collect()
-        };
-        let mut own = Vec::new();
-        for (i, r) in self.rules.iter_mut().enumerate() {
-            if !r.accounts.iter().any(|n| n == old) || r.agent.as_deref().is_some_and(|a| a != agent) {
-                continue;
-            }
-            if r.agent.is_some() || !split {
-                r.accounts = renamed(&r.accounts);
-                continue;
-            }
-            own.push((i, Rule { agent: Some(agent.to_string()), accounts: renamed(&r.accounts), ..r.clone() }));
-            if !theirs(old) {
-                r.accounts.retain(|n| n != old);
-            }
-        }
-        for (i, rule) in own.into_iter().rev() {
-            self.rules.insert(i, rule);
-        }
     }
 
     /// Accounts to try, in order, for an agent started in `workspace` and `cwd`.
@@ -546,10 +651,15 @@ impl Accounts {
                 continue;
             }
             if ws_ok && path_ok {
+                let references = rule.account_ids.as_ref().unwrap_or(&rule.accounts);
                 let picked: Vec<Account> =
-                    rule.accounts.iter().filter_map(|n| all.iter().find(|a| &a.name == n).cloned()).collect();
-                let dangling = !rule.accounts.iter().any(|n| everyone.iter().any(|a| &a.name == n));
-                if !picked.is_empty() || rule.agent.is_some() || dangling {
+                    references.iter().filter_map(|n| all.iter().find(|a| a.matches(n)).cloned()).collect();
+                let dangling = !references.iter().any(|n| everyone.iter().any(|a| a.matches(n)));
+                if !picked.is_empty()
+                    || rule.agent.is_some()
+                    || dangling
+                    || references.iter().any(|r| r.starts_with(&format!("{agent}:@")))
+                {
                     return Some(picked);
                 }
             }
@@ -609,6 +719,14 @@ impl Accounts {
     }
 }
 
+pub fn missing_account(agent: &str, reference: &str) -> String {
+    if reference.contains('@') {
+        "the account was removed; choose an account again".into()
+    } else {
+        format!("{agent} has no account named {reference:?}")
+    }
+}
+
 pub fn agent_names() -> String {
     AGENTS.iter().map(|a| a.name).collect::<Vec<_>>().join(", ")
 }
@@ -629,8 +747,8 @@ fn check_name(kind: &AgentKind, name: &str, home: &str) -> Result<()> {
     Ok(())
 }
 
-/// Rename account `old` of `agent` to `new` in accounts.toml, with the rules that name it and
-/// its usage. Its home stays where it is: agents running on it go on.
+/// Rename the account label, keeping its rules and usage on the same identity.
+/// Its home stays where it is: agents running on it go on.
 pub fn rename(agent: &str, old: &str, new: &str) -> Result<()> {
     rename_in(&Accounts::path(), &usage_dir(), agent, old, new)
 }
@@ -638,8 +756,9 @@ pub fn rename(agent: &str, old: &str, new: &str) -> Result<()> {
 /// [`rename`] in the accounts file `file`, with the usage saved in `usage`.
 fn rename_in(file: &Path, usage: &Path, agent: &str, old: &str, new: &str) -> Result<()> {
     Accounts::update_at(file, |all| {
+        let a = all.get(agent, old).with_context(|| missing_account(agent, old))?;
         all.rename(agent, old, new)?;
-        move_usage(usage, agent, old, new)
+        migrate_usage(usage, &a)
     })
 }
 
@@ -648,11 +767,7 @@ pub fn label(a: &Account) -> String {
     format!("{}·{}", a.agent, a.name)
 }
 
-/// An account's identity outside accounts.toml: `agent:name`. It is saved with each pane an
-/// account runs in (`PaneSpec.account`, restored after a restart), given to its agent as
-/// `KRAAL_ACCOUNT`, reported in agent events, and keys the [`UsageMap`]. Readers split it at the
-/// first `:`, which neither an agent's name nor an account's ([`valid_name`]) holds: the format
-/// must not change.
+/// The readable account label kept for older clients and saved sessions.
 pub fn key(agent: &str, name: &str) -> String {
     format!("{agent}:{name}")
 }
@@ -733,6 +848,7 @@ pub fn launch(a: &Account, args: &[String], resume: Option<&str>, new_session: O
         l.env_remove.push(kind.home_env.to_string());
     }
     l.env.push(("KRAAL_ACCOUNT".into(), key(&a.agent, &a.name)));
+    l.env.push(("KRAAL_ACCOUNT_ID".into(), a.id.clone()));
     l.env_remove.extend(kind.clear_env.iter().map(|s| s.to_string()));
     match (resume, new_session, kind.session_flag) {
         (Some(id), _, _) => l.argv.extend(kind.resume.iter().map(|s| s.replace("{session}", id))),
@@ -1327,27 +1443,29 @@ fn usage_file(agent: &str, name: &str) -> String {
 
 /// Where an account's latest usage is saved: the status line command Claude runs and the server
 /// write it, the server and `kraal accounts` read it, and it outlives a restart.
-fn usage_path(agent: &str, name: &str) -> PathBuf {
-    usage_dir().join(usage_file(agent, name))
+fn usage_path(agent: &str, id: &str) -> PathBuf {
+    usage_dir().join("by-id").join(usage_file(agent, id))
 }
 
-/// Give account `old`'s usage, in directory `dir`, to its new name `new`. With none seen yet,
-/// the new name has none either: never that of a removed account once so named.
-fn move_usage(dir: &Path, agent: &str, old: &str, new: &str) -> Result<()> {
-    let (from, to) = (dir.join(usage_file(agent, old)), dir.join(usage_file(agent, new)));
-    if from.exists() {
-        return std::fs::rename(&from, &to).with_context(|| format!("moving {} to {}", from.display(), to.display()));
-    }
-    match std::fs::remove_file(&to) {
-        Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
-            Err(e).with_context(|| format!("removing {}", to.display()))
+/// Copy legacy usage once; new accounts never inherit a previous occupant's cache.
+fn migrate_usage(dir: &Path, a: &Account) -> Result<()> {
+    let to = dir.join("by-id").join(usage_file(&a.agent, &a.id));
+    if (a.id == a.legacy_id() || a.id == format!("default-{}", a.agent) && a.name == "default") && !to.exists() {
+        let from = dir.join(usage_file(&a.agent, &a.name));
+        match std::fs::read(&from) {
+            Ok(bytes) => {
+                paths::ensure_private_dir(&dir.join("by-id"))?;
+                paths::write_private(&to, &bytes)?;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e).context("reading legacy account usage"),
         }
-        _ => Ok(()),
     }
+    Ok(())
 }
 
-pub fn save_usage(agent: &str, name: &str, u: &Usage) -> Result<()> {
-    let path = usage_path(agent, name);
+pub fn save_usage(a: &Account, u: &Usage) -> Result<()> {
+    let path = usage_path(&a.agent, &a.id);
     if let Some(d) = path.parent() {
         paths::ensure_private_dir(d)?;
     }
@@ -1359,7 +1477,7 @@ fn load_usage(agent: &str, name: &str) -> Option<Usage> {
     serde_json::from_slice(&std::fs::read(usage_path(agent, name)).ok()?).ok()
 }
 
-/// Latest usage per account, keyed by `agent:name`.
+/// Latest usage per account, keyed by stable identity.
 #[derive(Debug, Clone, Default)]
 pub struct UsageMap(pub HashMap<String, Usage>);
 
@@ -1368,13 +1486,16 @@ impl UsageMap {
         UsageMap(
             accounts
                 .iter()
-                .filter_map(|a| load_usage(&a.agent, &a.name).map(|u| (key(&a.agent, &a.name), u)))
+                .filter_map(|a| {
+                    let _ = migrate_usage(&usage_dir(), a);
+                    load_usage(&a.agent, &a.id).map(|u| (a.key(), u))
+                })
                 .collect(),
         )
     }
 
     pub fn get(&self, a: &Account) -> Option<&Usage> {
-        self.0.get(&key(&a.agent, &a.name))
+        self.0.get(&a.key())
     }
 
     pub fn peak(&self, a: &Account, now: i64) -> Option<f64> {
@@ -1600,6 +1721,7 @@ mod tests {
     fn conversations_are_found_by_their_transcript() {
         let home = std::env::temp_dir().join(format!("kraal-conv-{}", std::process::id()));
         let a = Account {
+            id: crate::accounts::new_uuid(),
             name: "t".into(),
             agent: "claude".into(),
             home: home.display().to_string(),
@@ -1645,14 +1767,17 @@ mod tests {
     }
 
     fn acct(agent: &str, name: &str, home: &str) -> Account {
-        Account {
+        let mut a = Account {
+            id: String::new(),
             name: name.into(),
             agent: agent.into(),
             home: home.into(),
             threshold: None,
             note: None,
             sign_in_required: false,
-        }
+        };
+        a.id = a.legacy_id();
+        a
     }
 
     #[test]
@@ -1661,7 +1786,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("accounts.toml");
         let a = acct("claude", "work", dir.to_str().unwrap());
-        let alias = Account { name: "alias".into(), ..a.clone() };
+        let alias = Account { id: new_uuid(), name: "alias".into(), ..a.clone() };
         let other = acct("codex", "work", dir.to_str().unwrap());
         let mut all = Accounts::load_from(&path).unwrap();
         all.add(a.clone()).unwrap();
@@ -1712,7 +1837,13 @@ mod tests {
     fn accounts() -> Accounts {
         let mut a = Accounts::empty();
         a.accounts = vec![acct("claude", "pro", "/tmp/kraal-test-claude-pro"), acct("claude", "perso", "~/.claude")];
-        a.rules = vec![Rule { workspace: Some("work".into()), path: None, agent: None, accounts: vec!["pro".into()] }];
+        a.rules = vec![Rule {
+            account_ids: None,
+            workspace: Some("work".into()),
+            path: None,
+            agent: None,
+            accounts: vec!["pro".into()],
+        }];
         a
     }
 
@@ -1749,7 +1880,7 @@ mod tests {
         assert_eq!(a.choose("claude", Some("work"), None, &usage, now).unwrap().name, "pro");
         assert_eq!(a.choose("claude", Some("other"), None, &usage, now).unwrap().name, "pro");
         usage.0.insert(
-            "claude:pro".into(),
+            a.get("claude", "pro").unwrap().key(),
             Usage { five_hour: Some(Window { used_percent: 95.0, resets_at: Some(now + 600) }), ..Default::default() },
         );
         // Over the threshold: the rule has no other account, so it takes the one that resets first.
@@ -1760,7 +1891,7 @@ mod tests {
         assert!(a.alternative(&pro, Some("work"), None, &usage, now).is_none());
         assert!(a.alternative(&pro, None, None, &usage, now).is_none(), "unknown usage is not zero");
         usage.0.insert(
-            "claude:perso".into(),
+            a.get("claude", "perso").unwrap().key(),
             Usage { five_hour: Some(Window { used_percent: 0.0, resets_at: Some(now + 600) }), ..Default::default() },
         );
         assert_eq!(a.alternative(&pro, None, None, &usage, now).unwrap().name, "perso");
@@ -1775,11 +1906,11 @@ mod tests {
         let perso = a.get("claude", "perso").unwrap();
         let mut usage = UsageMap::default();
         assert_eq!(usage.peak(&perso, 0), None);
-        usage.0.insert("claude:perso".into(), Usage::default());
+        usage.0.insert(perso.key(), Usage::default());
         assert_eq!(usage.peak(&perso, 0), None);
         assert!(a.alternative(&pro, None, None, &usage, 0).is_none());
         usage.0.insert(
-            "claude:perso".into(),
+            a.get("claude", "perso").unwrap().key(),
             Usage { five_hour: Some(Window { used_percent: 0.0, resets_at: Some(100) }), ..Default::default() },
         );
         assert_eq!(a.choose("claude", None, None, &usage, 0).unwrap().name, "perso", "known headroom before unknown");
@@ -1816,6 +1947,7 @@ mod tests {
         let feature = std::fs::canonicalize(&feature).unwrap();
         let mut a = accounts();
         a.rules = vec![Rule {
+            account_ids: None,
             workspace: None,
             path: Some(repo.display().to_string()),
             agent: None,
@@ -1915,23 +2047,13 @@ mod tests {
         let mut a = accounts();
         a.accounts.push(acct("codex", "pro", "/tmp/kraal-test-codex-pro"));
         a.rules.push(Rule {
+            account_ids: None,
             workspace: Some("ops".into()),
             path: None,
             agent: Some("codex".into()),
             accounts: vec!["pro".into()],
         });
         assert!(a.remove("claude", "pro"));
-        // Codex's rule and the shared one keep "pro": codex still has it.
-        let named: Vec<(Option<String>, Vec<String>)> =
-            a.rules.iter().map(|r| (r.agent.clone(), r.accounts.clone())).collect();
-        assert_eq!(
-            named,
-            vec![
-                (Some("claude".into()), vec![]),
-                (None, vec!["pro".into()]),
-                (Some("codex".into()), vec!["pro".into()])
-            ]
-        );
         let usage = UsageMap::default();
         assert_eq!(a.choose("codex", Some("work"), None, &usage, 0).unwrap().name, "pro");
         // Claude used pro in "work": now no account there rather than any.
@@ -1948,6 +2070,7 @@ mod tests {
         let (file, usage) = (dir.join("accounts.toml"), dir.join("usage"));
         std::fs::create_dir_all(&usage).unwrap();
         let rule = |workspace: &str, agent: Option<&str>, accounts: &[&str]| Rule {
+            account_ids: None,
             workspace: Some(workspace.into()),
             path: None,
             agent: agent.map(String::from),
@@ -1962,6 +2085,9 @@ mod tests {
             rule("ci", Some("codex"), &["pro"]),
             rule("home", None, &["perso"]),
         ];
+        a.bind_rules();
+        let mut rules = a.rules.clone();
+        let pro_id = a.get("claude", "pro").unwrap().id;
         a.save().unwrap();
         std::fs::write(usage.join("claude-pro.json"), "pro's").unwrap();
         // A removed account's usage, under the name perso takes.
@@ -1972,23 +2098,23 @@ mod tests {
         let a = Accounts::load_from(&file).unwrap();
         let names: Vec<String> = a.all().iter().map(label).collect();
         assert_eq!(names, ["claude·work", "claude·me", "codex·default", "codex·pro"]);
-        // Codex's pro keeps the rules naming it; claude's work gets its own before the shared one.
-        assert_eq!(
-            a.rules,
-            vec![
-                rule("work", Some("claude"), &["work"]),
-                rule("work", None, &["pro"]),
-                rule("ops", Some("claude"), &["work", "me"]),
-                rule("ci", Some("codex"), &["pro"]),
-                rule("home", None, &["me"]),
-            ]
-        );
+        for (rule, names) in rules.iter_mut().zip([vec!["work", "pro"], vec!["work", "me"], vec!["pro"], vec!["me"]]) {
+            rule.accounts = names.into_iter().map(String::from).collect();
+        }
+        assert_eq!(a.rules, rules);
         let none = UsageMap::default();
         assert_eq!(a.choose("claude", Some("work"), None, &none, 0).unwrap().name, "work");
         assert_eq!(a.choose("codex", Some("work"), None, &none, 0).unwrap().name, "pro");
-        assert_eq!(std::fs::read_to_string(usage.join("claude-work.json")).unwrap(), "pro's");
-        assert!(!usage.join("claude-pro.json").exists());
-        assert!(!usage.join("claude-me.json").exists(), "me has seen no usage yet");
+        assert_eq!(
+            std::fs::read_to_string(usage.join("by-id").join(format!("claude-{pro_id}.json"))).unwrap(),
+            "pro's"
+        );
+        assert!(usage.join("claude-pro.json").exists(), "legacy cache is kept for rollback");
+        assert_eq!(
+            std::fs::read_to_string(usage.join("claude-me.json")).unwrap(),
+            "stale",
+            "unrelated cache is untouched"
+        );
 
         let text = std::fs::read_to_string(&file).unwrap();
         let refused = |agent: &str, old: &str, new: &str, why: &str| {
@@ -2013,7 +2139,7 @@ mod tests {
         a.rename("claude", "perso", "me").unwrap();
         assert_eq!(a.launched_on("claude:pro", &pro).unwrap().name, "work");
         assert_eq!(a.launched_on("claude:perso", &perso).unwrap().name, "me", "in the default home");
-        assert_eq!(a.launched_on("claude:work", &[]).unwrap().name, "work", "its name first");
+        assert_eq!(a.launched_on("claude:work", &pro).unwrap().name, "work");
         assert!(a.launched_on("codex:gone", &[("CODEX_HOME".into(), "/tmp/kraal-test-nowhere".into())]).is_none());
     }
 
@@ -2021,6 +2147,7 @@ mod tests {
     fn path_rules() {
         let mut a = accounts();
         a.rules.push(Rule {
+            account_ids: None,
             workspace: None,
             path: Some("/srv/client".into()),
             agent: Some("claude".into()),
@@ -2080,6 +2207,213 @@ mod tests {
     }
 
     #[test]
+    fn legacy_accounts_migrate_on_rewrite_with_a_backup_and_stable_references() {
+        let dir = std::env::temp_dir().join(format!("kraal-account-identity-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("accounts.toml");
+        let source = "# Mine.\n[[account]]\nagent = 'claude'\nname = 'work' # label\nhome = '/work'\ncolor = 'blue'\n\n[[rule]]\nworkspace = 'w'\naccounts = [\n  'claude:work', # preferred\n]\n";
+        std::fs::write(&path, source).unwrap();
+        let before = Accounts::load_from(&path).unwrap();
+        let account = before.get("claude", "work").unwrap();
+        assert_eq!(Accounts::load_from(&path).unwrap().get("claude", "work").unwrap().id, account.id);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), source, "reading does not rewrite");
+        Accounts::update_at(&path, |_| Ok(())).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), source, "a no-op does not rewrite");
+        Accounts::update_at(&path, |all| all.rename("claude", "work", "job")).unwrap();
+        let migrated = std::fs::read_to_string(&path).unwrap();
+        let expected = source
+            .replace("name = 'work'", "name = \"job\"")
+            .replace("color = 'blue'\n", &format!("color = 'blue'\nid = {:?}\n", account.id))
+            .replace("'claude:work'", "\"job\"");
+        let expected = format!("{expected}account_ids = [{:?}]\n", account.key());
+        assert_eq!(migrated, expected);
+        assert_eq!(std::fs::read_to_string(path.with_extension("toml.kraal-bak")).unwrap(), source);
+        let after = Accounts::load_from(&path).unwrap();
+        assert_eq!(after.get("claude", "job").unwrap().id, account.id);
+        assert_eq!(after.get("claude", &format!("@{}", account.id)).unwrap().name, "job");
+        assert_eq!(after.get("claude", &account.key()).unwrap().name, "job");
+        assert_eq!(after.get("claude", "claude:job").unwrap().id, account.id);
+        assert_eq!(after.choose("claude", Some("w"), None, &UsageMap::default(), 0).unwrap().id, account.id);
+        Accounts::update_at(&path, |all| all.rename("claude", "job", "team")).unwrap();
+        assert_eq!(std::fs::read_to_string(path.with_extension("toml.kraal-bak")).unwrap(), source);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn reused_names_and_homes_do_not_capture_panes_rules_or_late_login_results() {
+        let mut all = accounts();
+        let old = all.get("claude", "pro").unwrap();
+        let mut pane = crate::pane::PaneSpec {
+            account: Some(key(&old.agent, &old.name)),
+            env: launch(&old, &[], None, None).unwrap().env,
+            ..Default::default()
+        };
+        // A saved pane from 0.2 or 0.3 has no identity, even in its environment.
+        pane.env.retain(|(k, _)| k != "KRAAL_ACCOUNT_ID");
+        all.bind_pane(&mut pane);
+        assert_eq!(pane.account_id.as_deref(), Some(old.id.as_str()));
+        all.rename("claude", "pro", "work").unwrap();
+        all.bind_pane(&mut pane);
+        assert_eq!(pane.account.as_deref(), Some("claude:work"));
+        let replacement = Account { id: new_uuid(), sign_in_required: true, ..old.clone() };
+        all.add(replacement.clone()).unwrap();
+        assert_eq!(all.launched_on("claude:pro", &pane.env).unwrap().id, old.id);
+        all.remove("claude", "work");
+        all.bind_pane(&mut pane);
+        assert_eq!(pane.account.as_deref(), Some("claude:work"), "the removed account remains readable");
+        assert_eq!(pane.account_id.as_deref(), Some(old.id.as_str()));
+        assert!(all.by_id(&old.id).is_none());
+        assert!(all.launched_on("claude:pro", &pane.env).is_none());
+        assert!(all.choose("claude", Some("work"), None, &UsageMap::default(), 0).is_none());
+        all.set_sign_in_required(&old, false);
+        assert!(all.get("claude", "pro").unwrap().sign_in_required, "a late login belongs to the removed identity");
+    }
+
+    #[test]
+    fn a_dangling_legacy_pane_never_binds_to_a_later_account() {
+        let mut all = Accounts::empty();
+        let mut spec = crate::pane::PaneSpec {
+            account: Some("claude:gone".into()),
+            env: vec![("CLAUDE_CONFIG_DIR".into(), "/gone".into())],
+            ..Default::default()
+        };
+        all.bind_pane(&mut spec);
+        let id = spec.account_id.clone();
+        all.add(acct("claude", "gone", "/gone")).unwrap();
+        all.bind_pane(&mut spec);
+        assert_eq!(spec.account_id, id);
+        assert!(all.by_id(id.as_deref().unwrap()).is_none());
+    }
+
+    #[test]
+    fn invalid_account_identities_leave_the_file_untouched() {
+        let dir = std::env::temp_dir().join(format!("kraal-account-bad-id-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("accounts.toml");
+        for source in [
+            "[[account]]\nid = '../bad'\nname = 'a'\nagent = 'claude'\nhome = '/a'\n".to_string(),
+            "[[account]]\nid = 'default-claude'\nname = 'a'\nagent = 'claude'\nhome = '/a'\n".to_string(),
+            ["a", "b"]
+                .map(|name| format!("[[account]]\nid = 'same'\nname = '{name}'\nagent = 'claude'\nhome = '/{name}'\n"))
+                .concat(),
+        ] {
+            std::fs::write(&path, &source).unwrap();
+            assert!(
+                Accounts::update_at(&path, |all| {
+                    all.limits.threshold = 80;
+                    Ok(())
+                })
+                .is_err()
+            );
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), source);
+            assert!(!path.with_extension("toml.kraal-bak").exists());
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn legacy_usage_moves_once_and_a_reused_label_gets_no_usage() {
+        let dir = std::env::temp_dir().join(format!("kraal-usage-identity-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let old = acct("claude", "work", "/work");
+        std::fs::write(dir.join("claude-work.json"), "old usage").unwrap();
+        migrate_usage(&dir, &old).unwrap();
+        let file = dir.join("by-id").join(usage_file("claude", &old.id));
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "old usage");
+        std::fs::write(&file, "new usage").unwrap();
+        migrate_usage(&dir, &old).unwrap();
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "new usage");
+        let replacement = Account { id: new_uuid(), ..old.clone() };
+        migrate_usage(&dir, &replacement).unwrap();
+        assert!(!dir.join("by-id").join(usage_file("claude", &replacement.id)).exists());
+        let renamed = Account { name: "another".into(), ..old };
+        std::fs::remove_file(&file).unwrap();
+        std::fs::write(dir.join("claude-another.json"), "someone else's usage").unwrap();
+        migrate_usage(&dir, &renamed).unwrap();
+        assert!(!file.exists());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn naming_the_default_home_keeps_its_identity_and_bindings() {
+        let dir = std::env::temp_dir().join(format!("kraal-adopt-default-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("accounts.toml");
+        std::fs::write(&file, "[[rule]]\nworkspace = 'w'\naccounts = ['default']\nagent = 'claude'\n").unwrap();
+        let mut all = Accounts::load_from(&file).unwrap();
+        let old = all.get("claude", "default").unwrap();
+        let mut pane = crate::pane::PaneSpec {
+            account: Some(key(&old.agent, &old.name)),
+            env: launch(&old, &[], None, None).unwrap().env,
+            ..Default::default()
+        };
+        all.bind_pane(&mut pane);
+        let definition = dir.join("w.kdl");
+        std::fs::write(&definition, "layout { pane agent=\"claude:default\" }\n").unwrap();
+        crate::workspace::bind_accounts(&definition, &all).unwrap();
+        std::fs::write(
+            dir.join("claude-default.json"),
+            serde_json::to_vec(&Usage {
+                five_hour: Some(Window { used_percent: 42.0, resets_at: Some(i64::MAX) }),
+                ..Default::default()
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        migrate_usage(&dir, &old).unwrap();
+        let adopted = all.add(Account { id: new_uuid(), name: "personal".into(), ..old.clone() }).unwrap();
+        assert_eq!(adopted.id, old.id, "callers get the adopted identity too");
+        assert_eq!(all.for_agent("claude"), std::slice::from_ref(&adopted));
+        all.bind_pane(&mut pane);
+        assert_eq!(pane.account.as_deref(), Some("claude:personal"));
+        assert_eq!(pane.account_id.as_deref(), Some(old.id.as_str()));
+        assert_eq!(all.launched_on("claude:default", &pane.env), Some(adopted.clone()));
+        let def = crate::workspace::load_file(&definition).unwrap();
+        assert_eq!(all.by_id(def.panes()[0].account_id.as_deref().unwrap()), Some(adopted.clone()));
+        let usage: Usage =
+            serde_json::from_slice(&std::fs::read(dir.join("by-id").join(usage_file("claude", &adopted.id))).unwrap())
+                .unwrap();
+        let usage = UsageMap(HashMap::from([(adopted.key(), usage)]));
+        assert_eq!(usage.peak(&adopted, 0), Some(42.0));
+        assert_eq!(all.choose("claude", Some("w"), None, &usage, 0), Some(adopted.clone()));
+        all.bind_rules();
+        all.save().unwrap();
+        assert_eq!(Accounts::load_from(&file).unwrap().get("claude", "personal"), Some(adopted));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn identity_usage_cannot_collide_with_legacy_account_names() {
+        let dir = std::env::temp_dir().join(format!("kraal-usage-collision-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let default = Accounts::empty().get("claude", "default").unwrap();
+        let work = acct("claude", "work", "/work");
+        for account in [default, work] {
+            let namesake = acct("claude", &account.id, "/other");
+            let legacy = dir.join(usage_file("claude", &account.name));
+            let collision = dir.join(usage_file("claude", &namesake.name));
+            std::fs::write(&legacy, "own usage").unwrap();
+            std::fs::write(&collision, "namesake usage").unwrap();
+            migrate_usage(&dir, &account).unwrap();
+            migrate_usage(&dir, &namesake).unwrap();
+            assert_eq!(
+                std::fs::read_to_string(dir.join("by-id").join(usage_file("claude", &account.id))).unwrap(),
+                "own usage"
+            );
+            assert_eq!(
+                std::fs::read_to_string(dir.join("by-id").join(usage_file("claude", &namesake.id))).unwrap(),
+                "namesake usage"
+            );
+            assert_eq!(
+                std::fs::read_to_string(collision).unwrap(),
+                "namesake usage",
+                "legacy servers still own their caches"
+            );
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn uuids_are_v4() {
         let u = new_uuid();
         assert_eq!(u.len(), 36);
@@ -2118,16 +2452,19 @@ agent = \"claude\"
 name = \"pro\"
 home = \"/tmp/kraal-test-claude-pro\"
 seat = 4              # read by a newer kraal
+id = \"legacy-67bae7cfc475c28e\"
 
 [[account]]
 name = \"pro\"
 agent = \"codex\"
 home = \"/tmp/kraal-test-codex-pro\"
+id = \"legacy-e51c15a4282e68d8\"
 
 # Work first, then mine.
 [[rule]]
 workspace = \"work\"
 accounts = [\"pro\", \"default\"]
+account_ids = [\"claude:@legacy-67bae7cfc475c28e\", \"codex:@legacy-e51c15a4282e68d8\", \"claude:@default-claude\", \"codex:@default-codex\"]
 until = 2027-01-01    # read by a newer kraal
 ";
 
@@ -2165,8 +2502,11 @@ until = 2027-01-01    # read by a newer kraal
         });
         assert_eq!(text, format!("{BY_HAND}\n[claude]\nstatusline = \"my-line\"\n"));
         // `kraal accounts add`: one more account, after the others.
-        let text = changed("add", |all| all.add(acct("claude", "perso", "/tmp/kraal-test-claude-perso")));
-        let added = "[[account]]\nname = \"perso\"\nagent = \"claude\"\nhome = \"/tmp/kraal-test-claude-perso\"\n";
+        let text = changed("add", |all| all.add(acct("claude", "perso", "/tmp/kraal-test-claude-perso")).map(|_| ()));
+        let added = format!(
+            "[[account]]\nid = {:?}\nname = \"perso\"\nagent = \"claude\"\nhome = \"/tmp/kraal-test-claude-perso\"\n",
+            acct("claude", "perso", "/tmp/kraal-test-claude-perso").id
+        );
         assert_eq!(text, BY_HAND.replace("\n# Work first", &format!("\n{added}\n# Work first")));
         // `kraal accounts rm`: the account goes with the comment about it, the header stays.
         let text = changed("rm", |all| {
@@ -2175,17 +2515,24 @@ until = 2027-01-01    # read by a newer kraal
         });
         assert_eq!(
             text,
-            BY_HAND.replace(&BY_HAND[BY_HAND.find("# Paid").unwrap()..BY_HAND.find("[[account]]\nname").unwrap()], "")
+            BY_HAND
+                .replace(&BY_HAND[BY_HAND.find("# Paid").unwrap()..BY_HAND.find("[[account]]\nname").unwrap()], "")
+                .replace(
+                    "accounts = [\"pro\", \"default\"]",
+                    "accounts = [\"claude:@legacy-67bae7cfc475c28e\",\"pro\", \"default\"]"
+                )
         );
-        // `kraal accounts rename`: the account keeps its place and what the other kraal reads;
-        // the rule Codex's account of that name still needs stays whole, after Claude's own.
+        // Renaming changes only the label; the rule keeps its identity.
         let text = changed("rename", |all| all.rename("claude", "pro", "work"));
-        let own =
-            "[[rule]]\nworkspace = \"work\"\nagent = \"claude\"\naccounts = [\n    \"work\",\n    \"default\",\n]\n";
-        let expected = BY_HAND
-            .replace("agent = \"claude\"\nname = \"pro\"", "agent = \"claude\"\nname = \"work\"")
-            .replace("\n# Work first", &format!("\n{own}\n# Work first"));
-        assert_eq!(text, expected);
+        assert_eq!(
+            text,
+            BY_HAND
+                .replace(
+                    "name = \"pro\"\nhome = \"/tmp/kraal-test-claude-pro\"",
+                    "name = \"work\"\nhome = \"/tmp/kraal-test-claude-pro\""
+                )
+                .replace("accounts = [\"pro\", \"default\"]", "accounts = [\"work\",\"pro\", \"default\"]")
+        );
     }
 
     #[test]
@@ -2229,7 +2576,9 @@ until = 2027-01-01    # read by a newer kraal
             });
             assert_eq!(text, old.replace("threshold = 85", "threshold = 70"));
         }
-        let old = BY_HAND.replace("accounts = [\"pro\", \"default\"]", "accounts = []");
+        let rule = BY_HAND.lines().find(|line| line.starts_with("accounts = ")).unwrap();
+        let ids = BY_HAND.lines().find(|line| line.starts_with("account_ids = ")).unwrap();
+        let old = BY_HAND.replace(rule, "accounts = []").replace(ids, "account_ids = []");
         assert_eq!(changed_text("rule-no-accounts", &old, |all| all.save()), old);
     }
 
@@ -2263,7 +2612,13 @@ until = 2027-01-01    # read by a newer kraal
         Accounts::update_at(&path, add).unwrap();
         let whole = "[limits]\nthreshold = 90\nmode = \"notify\"\n\n\
                      [[account]]\nname = \"work\"\nagent = \"codex\"\nhome = \"/tmp/kraal-test-codex-work\"\n";
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), format!("{HEADER}{whole}"));
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            format!("{HEADER}{whole}").replace(
+                "[[account]]\n",
+                &format!("[[account]]\nid = {:?}\n", acct("codex", "work", "/tmp/kraal-test-codex-work").id)
+            )
+        );
         // The file `kraal accounts edit` makes when there is none takes its first account
         // under its header.
         std::fs::remove_file(&path).unwrap();
@@ -2272,7 +2627,7 @@ until = 2027-01-01    # read by a newer kraal
         assert!(empty.starts_with(HEADER) && !empty.contains("rule = []") && !empty.contains("\n[claude]"), "{empty}");
         Accounts::update_at(&path, add).unwrap();
         let text = std::fs::read_to_string(&path).unwrap();
-        assert!(text.starts_with(HEADER) && text.contains("[[account]]\nname = \"work\"\n"), "{text}");
+        assert!(text.starts_with(HEADER) && text.contains("name = \"work\"\n"), "{text}");
         assert_eq!(Accounts::load_from(&path).unwrap().accounts, [acct("codex", "work", "/tmp/kraal-test-codex-work")]);
 
         for broken in [
@@ -2315,11 +2670,13 @@ until = 2027-01-01    # read by a newer kraal
         full.accounts =
             vec![Account { threshold: Some(70), note: Some("team plan".into()), ..acct("claude", "pro", "/tmp/x") }];
         full.rules = vec![Rule {
+            account_ids: None,
             workspace: Some("shop".into()),
             path: Some("~/src/shop".into()),
             agent: Some("claude".into()),
             accounts: vec!["pro".into()],
         }];
+        full.bind_rules();
         full.save().unwrap();
         let (again, warnings) = Accounts::read(&path).unwrap();
         assert_eq!(warnings, [] as [&str; 0]);

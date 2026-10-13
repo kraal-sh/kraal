@@ -74,6 +74,7 @@ impl Server {
     pub(super) fn reload_accounts(&mut self) {
         match Accounts::load() {
             Ok(a) => {
+                self.follow_renamed_accounts();
                 self.accounts = a;
                 self.accounts_error = None;
                 self.follow_renamed_accounts();
@@ -92,13 +93,12 @@ impl Server {
     fn follow_renamed_accounts(&mut self) {
         let mut renamed = false;
         for pane in self.panes.values_mut() {
-            let Some(key) = &pane.spec.account else { continue };
-            let Some(a) = self.accounts.launched_on(key, &pane.spec.env) else { continue };
-            let now = accounts::key(&a.agent, &a.name);
-            if &now != key {
-                pane.spec.account = Some(now);
-                renamed = true;
-            }
+            let before = (pane.spec.account.clone(), pane.spec.account_id.clone());
+            self.accounts.bind_pane(&mut pane.spec);
+            renamed |= before != (pane.spec.account.clone(), pane.spec.account_id.clone());
+        }
+        for ws in &mut self.unrestored {
+            renamed |= ws.bind_accounts(&self.accounts);
         }
         if renamed {
             self.mark_dirty();
@@ -120,9 +120,14 @@ impl Server {
 
     /// The account of an agent pane kraal launched.
     pub fn pane_account(&self, pane: PaneId) -> Option<Account> {
-        let key = self.panes.get(&pane)?.spec.account.clone()?;
-        let (agent, name) = key.split_once(':')?;
-        self.accounts.get(agent, name)
+        self.spec_account(&self.panes.get(&pane)?.spec)
+    }
+
+    fn spec_account(&self, spec: &PaneSpec) -> Option<Account> {
+        match spec.account_id.as_deref() {
+            Some(id) => self.accounts.by_id(id),
+            None => self.accounts.launched_on(spec.account.as_deref()?, &spec.env),
+        }
     }
 
     /// Spec of a pane running `agent` on account `a`, resuming `resume` if given.
@@ -146,6 +151,7 @@ impl Server {
             env_remove: l.env_remove,
             cwd,
             account: Some(accounts::key(&a.agent, &a.name)),
+            account_id: Some(a.id.clone()),
             session,
             ..Default::default()
         })
@@ -159,7 +165,10 @@ impl Server {
     /// restore): not for a one-shot run (`claude -p`), which stays as it was, nor when a prompt
     /// was left out or would be sent; those wait for Enter.
     pub fn resume_spec(&self, spec: &PaneSpec, session: Option<&str>) -> (PaneSpec, bool) {
-        let Some(a) = spec.account.as_deref().and_then(|k| self.accounts.launched_on(k, &spec.env)) else {
+        let mut bound = spec.clone();
+        self.accounts.bind_pane(&mut bound);
+        let spec = &bound;
+        let Some(a) = self.spec_account(spec) else {
             return (spec.clone(), false);
         };
         let Some(kind) = accounts::agent_kind(&a.agent) else {
@@ -246,9 +255,7 @@ impl Server {
         let ws_name = self.workspaces[wi].name.clone();
         let cwd = self.agent_cwd(ws, target, cwd);
         let a = match account {
-            Some(name) => {
-                self.accounts.get(agent, name).with_context(|| format!("{agent} has no account named {name:?}"))?
-            }
+            Some(name) => self.accounts.get(agent, name).with_context(|| accounts::missing_account(agent, name))?,
             None => {
                 // Never a pick among accounts a rule may forbid here: git says first which
                 // repository this directory belongs to (callers that can wait do so).
@@ -378,8 +385,11 @@ impl Server {
         };
         anyhow::ensure!(same_process, "the pane's process changed; choose an account again");
         let from = self.pane_account(pane).context("the pane's account was removed")?;
-        anyhow::ensure!(from.same_home(&switch.from), "the pane's account changed; choose an account again");
-        let to = self.accounts.get(&switch.to.agent, &switch.to.name).context("the target account was removed")?;
+        anyhow::ensure!(
+            from.id == switch.from.id && from.same_home(&switch.from),
+            "the pane's account changed; choose an account again"
+        );
+        let to = self.accounts.by_id(&switch.to.id).context("the target account was removed")?;
         anyhow::ensure!(to.same_home(&switch.to), "the target account changed; choose an account again");
         if switch.client.is_none() {
             anyhow::ensure!(self.restarts_by_itself(pane), "this command now needs confirmation before restarting");
@@ -609,8 +619,8 @@ impl Server {
             if let (true, Some((weekly, pct))) = (fresh, screen_limit) {
                 let mut u = self.usage.get(&a).cloned().unwrap_or_default();
                 u.observe_screen(weekly, pct, now);
-                let _ = accounts::save_usage(&a.agent, &a.name, &u);
-                self.usage.0.insert(accounts::key(&a.agent, &a.name), u);
+                let _ = accounts::save_usage(&a, &u);
+                self.usage.0.insert(a.key(), u);
             }
             if self.switches.contains_key(&id) {
                 continue;
@@ -648,6 +658,7 @@ impl Server {
                 let fields = serde_json::json!({
                     "agent": a.agent,
                     "account": a.name,
+                    "account_id": a.id,
                     "percent": peak.round(),
                     "threshold": threshold,
                     "alternative": alt.as_ref().map(crate::accounts::label),
@@ -719,7 +730,7 @@ impl Server {
                     Some(u) => usage_text(u, now),
                     None => "no usage seen yet".to_string(),
                 };
-                if preferred.as_ref().is_some_and(|p| p.name == a.name) {
+                if preferred.as_ref().is_some_and(|p| p.id == a.id) {
                     detail.push_str(" · picked here");
                 }
                 let is_current = current.as_ref().is_some_and(|c| c.same_home(&a));
@@ -737,13 +748,10 @@ impl Server {
                     };
                 }
                 let action = match switch_for {
-                    Some(pane) => PickAction::AgentSwitch {
-                        pane,
-                        agent: a.agent.clone(),
-                        account: a.name.clone(),
-                        current: is_current,
-                    },
-                    None => PickAction::AgentLaunch { agent: a.agent.clone(), account: a.name.clone() },
+                    Some(pane) => {
+                        PickAction::AgentSwitch { pane, agent: a.agent.clone(), account: a.key(), current: is_current }
+                    }
+                    None => PickAction::AgentLaunch { agent: a.agent.clone(), account: a.key() },
                 };
                 items.push(PickItem {
                     label: accounts::label(&a),
@@ -783,7 +791,7 @@ impl Server {
                 switch_effect(&checked.agent, status, carry)
             },
             move |server, effect| {
-                if !server.accounts.get(&to.agent, &to.name).is_some_and(|a| a.same_home(&to)) {
+                if !server.accounts.by_id(&to.id).is_some_and(|a| a.same_home(&to)) {
                     return;
                 }
                 if let Some(c) = server.clients.get_mut(&client)
@@ -791,7 +799,7 @@ impl Server {
                 {
                     for item in &mut picker.items {
                         if matches!(&item.action, PickAction::AgentSwitch { pane: p, agent, account, current: false }
-                            if *p == pane && agent == &to.agent && account == &to.name)
+                            if *p == pane && agent == &to.agent && account == &to.key())
                         {
                             item.detail = effect.into();
                         }
@@ -806,6 +814,7 @@ impl Server {
     pub(super) fn add_account(&mut self, client: ClientId, agent: &str, name: &str) -> Result<()> {
         let home = accounts::default_home_for(agent, name);
         let a = Account {
+            id: crate::accounts::new_uuid(),
             name: name.into(),
             agent: agent.into(),
             home: home.display().to_string(),
@@ -813,9 +822,10 @@ impl Server {
             note: None,
             sign_in_required: true,
         };
-        Accounts::update(|all| {
-            all.add(a.clone())?;
-            accounts::prepare_home(&a)
+        let a = Accounts::update(|all| {
+            let a = all.add(a)?;
+            accounts::prepare_home(&a)?;
+            Ok(a)
         })?;
         self.reload_accounts();
         self.open_login(client, &a)
@@ -963,7 +973,7 @@ impl Server {
                         observed_at: l.observed_at,
                         source: "codex".into(),
                     };
-                    let _ = accounts::save_usage(&a.agent, &a.name, &u);
+                    let _ = accounts::save_usage(&a, &u);
                 }
             }
             let _ = tx.wake();
@@ -1002,6 +1012,62 @@ pub fn usage_text(u: &accounts::Usage, now: i64) -> String {
 mod tests {
     use super::*;
 
+    #[test]
+    fn unrestored_accounts_follow_renames_but_never_replacements() {
+        let mut t = SwitchTest::new("unrestored");
+        let old = t.server.accounts.get("claude", "from").unwrap();
+        let pane = serde_json::json!({ "name": "agent", "agent": "claude", "agent_session": null,
+            "spec": { "account": "claude:from", "env": [["CLAUDE_CONFIG_DIR", old.home]] } });
+        let ws = serde_json::json!({ "name": "failed", "definition": null, "cwd": null, "active": 0,
+            "tabs": [{ "name": "", "root": { "Split": { "axis": "Row", "children": [[{ "Pane": pane }, 1.0]] } },
+                "floating": [[pane, { "x": 0.1, "y": 0.1, "w": 0.5, "h": 0.5 }]],
+                "focus": null, "show_floating": true, "zoomed": false, "sync": false }] });
+        let ws: crate::persist::WorkspaceSnap = serde_json::from_value(ws).unwrap();
+        t.server.env.shell = t.dir.join("missing-shell").display().to_string();
+        crate::persist::apply(
+            &mut t.server,
+            crate::persist::SessionSnapshot {
+                version: 1,
+                revision: 1,
+                workspaces: vec![ws.clone()],
+                tunnels: Vec::new(),
+            },
+        )
+        .unwrap();
+        assert_eq!(t.server.unrestored.len(), 1, "the missing shell prevents restoration");
+        assert_eq!(
+            t.server.unrestored[0].tabs[0].floating[0].0.spec.account_id.as_deref(),
+            Some(old.id.as_str()),
+            "even panes not reached by restore must already be bound"
+        );
+        // A legacy workspace retained before a reload is bound too.
+        t.server.unrestored.push(ws);
+        t.server.follow_renamed_accounts();
+        t.server.accounts.remove("claude", "from");
+        t.server.accounts.add(Account { name: "renamed".into(), ..old.clone() }).unwrap();
+        t.server.follow_renamed_accounts();
+        assert!(t.server.persist_dirty);
+        let check = |server: &Server| {
+            for ws in &server.unrestored {
+                let crate::persist::NodeSnap::Split { children, .. } = ws.tabs[0].root.as_ref().unwrap() else {
+                    panic!("split")
+                };
+                let crate::persist::NodeSnap::Pane(tiled) = &children[0].0 else { panic!("pane") };
+                for pane in [tiled.as_ref(), &ws.tabs[0].floating[0].0] {
+                    assert_eq!(pane.spec.account_id.as_deref(), Some(old.id.as_str()));
+                    assert_eq!(pane.spec.account.as_deref(), Some("claude:renamed"));
+                    assert!(pane.spec.env.contains(&("KRAAL_ACCOUNT_ID".into(), old.id.clone())));
+                }
+            }
+        };
+        check(&t.server);
+        t.server.accounts.remove("claude", "renamed");
+        t.server.accounts.add(Account { id: accounts::new_uuid(), name: "renamed".into(), ..old.clone() }).unwrap();
+        t.server.follow_renamed_accounts();
+        check(&t.server);
+        assert!(t.server.accounts.by_id(&old.id).is_none());
+    }
+
     struct SwitchTest {
         server: Server,
         dir: PathBuf,
@@ -1014,6 +1080,7 @@ mod tests {
             std::fs::create_dir_all(dir.join("to/projects/work")).unwrap();
             std::fs::write(dir.join("from/projects/work/session.jsonl"), "{\"message\":1}\n").unwrap();
             let account = |name: &str| Account {
+                id: accounts::new_uuid(),
                 agent: "claude".into(),
                 name: name.into(),
                 home: dir.join(name).display().to_string(),
@@ -1030,6 +1097,7 @@ mod tests {
             let spec = PaneSpec {
                 command: vec!["claude".into()],
                 account: Some("claude:from".into()),
+                account_id: Some(from.id.clone()),
                 session: Some("session".into()),
                 text: Some(crate::pane::ShownText { title: String::new(), text: "still running".into() }),
                 ..Default::default()
@@ -1155,14 +1223,18 @@ mod tests {
 
     #[test]
     fn queued_changes_recheck_the_current_conversation_and_account() {
-        for changed in ["transcript", "session", "target"] {
+        for changed in ["transcript", "session", "target", "replaced"] {
             let mut t = SwitchTest::new(&format!("changed-{changed}"));
             t.checked(Status::SignedIn);
             match changed {
                 "transcript" => std::fs::remove_file(t.dir.join("from/projects/work/session.jsonl")).unwrap(),
                 "session" => t.server.panes.get_mut(&1).unwrap().agent.session_id = Some("new-session".into()),
                 _ => {
+                    let old = t.server.accounts.get("claude", "to").unwrap();
                     t.server.accounts.remove("claude", "to");
+                    if changed == "replaced" {
+                        t.server.accounts.add(Account { id: accounts::new_uuid(), ..old }).unwrap();
+                    }
                 }
             }
             t.server.switches.get_mut(&1).unwrap().stage = SwitchStage::Checking;
@@ -1179,7 +1251,7 @@ mod tests {
             t.server.switches.get_mut(&1).unwrap().client = None;
             if reason != "unknown" {
                 t.server.usage.0.insert(
-                    "claude:to".into(),
+                    t.server.accounts.get("claude", "to").unwrap().key(),
                     accounts::Usage {
                         five_hour: Some(accounts::Window {
                             used_percent: if reason == "full" { 100.0 } else { 0.0 },
@@ -1265,8 +1337,8 @@ mod tests {
             five_hour: Some(accounts::Window { used_percent: percent, resets_at: Some(accounts::now() + 3600) }),
             ..Default::default()
         };
-        t.server.usage.0.insert("claude:from".into(), usage(95.0));
-        t.server.usage.0.insert("claude:to".into(), usage(0.0));
+        t.server.usage.0.insert(t.server.accounts.get("claude", "from").unwrap().key(), usage(95.0));
+        t.server.usage.0.insert(t.server.accounts.get("claude", "to").unwrap().key(), usage(0.0));
         t.server.limit_alerts.insert(1, LimitAlert::Attempted);
         t.checked(Status::NotSignedIn);
         t.server.panes.get_mut(&1).unwrap().agent.state = AgentState::Done;
@@ -1276,7 +1348,7 @@ mod tests {
         assert!(t.server.switches.is_empty());
         assert!(t.server.jobs.is_empty());
         assert_eq!(t.server.limit_alerts.get(&1), Some(&LimitAlert::Attempted));
-        t.server.usage.0.insert("claude:from".into(), usage(10.0));
+        t.server.usage.0.insert(t.server.accounts.get("claude", "from").unwrap().key(), usage(10.0));
         t.server.check_limits();
         assert!(!t.server.limit_alerts.contains_key(&1));
     }
