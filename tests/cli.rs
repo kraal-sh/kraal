@@ -1414,6 +1414,16 @@ fn environment(env: &Env, other: bool, args: &[&str]) -> Command {
     c
 }
 
+/// Stops the server that `env`'s session has in its other runtime directory when the test
+/// ends, however it ends: `Env` stops the one of its own.
+struct StopsOther<'a>(&'a Env);
+
+impl Drop for StopsOther<'_> {
+    fn drop(&mut self) {
+        let _ = environment(self.0, true, &["kill"]).output();
+    }
+}
+
 /// What `kraal args` prints in one of the two environments of `env`, which must succeed.
 fn in_environment(env: &Env, other: bool, args: &[&str]) -> String {
     let out = environment(env, other, args).output().unwrap();
@@ -1460,6 +1470,7 @@ fn hold(env: &Env, place: &str, said: &str) -> std::fs::File {
 fn a_session_running_under_another_runtime_directory_is_refused_and_said() {
     for first in [false, true] {
         let env = Env::new(if first { "onestate-b" } else { "onestate-a" });
+        let _other = StopsOther(&env);
         env.workspace("w", "layout {\n    pane name=\"one\"\n}\n");
         let (here, there) = (first, !first);
         let run = |other: bool| if other { "run2" } else { "run" };
@@ -1496,6 +1507,7 @@ fn a_session_running_under_another_runtime_directory_is_refused_and_said() {
 #[test]
 fn a_session_started_at_once_from_two_runtime_directories_has_one_server() {
     let env = Env::new("atonce");
+    let _other = StopsOther(&env);
     env.workspace("w", "layout {\n    pane name=\"one\"\n}\n");
     for round in 0..10 {
         let together = std::sync::Barrier::new(2);
@@ -1532,6 +1544,7 @@ fn a_session_started_at_once_from_two_runtime_directories_has_one_server() {
 #[test]
 fn a_killed_server_leaves_nothing_that_blocks_the_next_start() {
     let env = Env::new("killedheld");
+    let _other = StopsOther(&env);
     env.workspace("w", "layout {\n    pane name=\"one\"\n}\n");
     for next in [false, true] {
         in_environment(&env, false, &["open", "w"]);
