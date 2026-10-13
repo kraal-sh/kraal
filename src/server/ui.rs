@@ -47,6 +47,7 @@ pub struct Question {
     pub yes: bool,
     /// First row of the message shown, when it is too long for the box.
     pub scroll: usize,
+    pub workspace_back: Option<Box<PickerState>>,
 }
 
 /// Hints in progress.
@@ -87,7 +88,7 @@ impl Mode {
 
     /// A question, Cancel selected.
     pub fn confirm(message: impl Into<String>, action: ConfirmAction) -> Mode {
-        Mode::Confirm(Question { message: message.into(), action, yes: false, scroll: 0 })
+        Mode::Confirm(Question { message: message.into(), action, yes: false, scroll: 0, workspace_back: None })
     }
 }
 
@@ -108,6 +109,7 @@ pub enum ConfirmAction {
     },
     CloseWorkspace(u32),
     RetryCloseWorkspace(u32),
+    OpenWorkspace(PickAction),
     /// Restart the session on the kraal installed now.
     Restart,
     /// Stop the session, its layout saved.
@@ -177,7 +179,7 @@ impl ConfirmAction {
             ConfirmAction::ClosePane(_) => "Close pane".into(),
             ConfirmAction::CloseTab { .. } => "Close tab".into(),
             ConfirmAction::CloseWorkspace(_) => "Stop and close".into(),
-            ConfirmAction::RetryCloseWorkspace(_) => "Retry".into(),
+            ConfirmAction::RetryCloseWorkspace(_) | ConfirmAction::OpenWorkspace(_) => "Retry".into(),
             ConfirmAction::Restart => "Restart".into(),
             ConfirmAction::Quit => "Quit".into(),
             ConfirmAction::Job { label, .. } | ConfirmAction::GitJob { label, .. } => {
@@ -272,7 +274,7 @@ pub enum PickAction {
     RetryWorkspaceClose(u32),
     /// A definition not running, by its file.
     OpenDefinition(std::path::PathBuf),
-    NewWorkspace,
+    AddWorkspace,
     /// A server name or `user@host[:port]`.
     Ssh(String),
     SshGroup(String),
@@ -334,13 +336,22 @@ pub enum PickAction {
     None,
 }
 
+impl PickAction {
+    pub fn workspace(&self) -> Option<u32> {
+        match self {
+            Self::SwitchWorkspace(ws) | Self::ReopenWorkspace(ws) | Self::RetryWorkspaceClose(ws) => Some(*ws),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct PickItem {
     pub label: String,
     pub detail: String,
     pub action: PickAction,
     pub state: Option<AgentState>,
-    /// Shown dimmed (e.g. a workspace that is defined but not running).
+    /// Shown dimmed when an entry is secondary.
     pub dim: bool,
 }
 
@@ -386,6 +397,8 @@ pub struct PickerState {
     query: String,
     cursor: usize,
     selected: Option<String>,
+    workspace: Option<u32>,
+    definition: Option<std::path::PathBuf>,
     message: Option<String>,
     min_items: usize,
 }
@@ -398,8 +411,8 @@ impl Picker {
             query: String::new(),
             cursor: 0,
             min_items: items.len(),
-            two_line: kind == PickerKind::Accounts,
-            pinned: items.iter().position(|i| matches!(i.action, PickAction::AddAccount)),
+            two_line: matches!(kind, PickerKind::Accounts | PickerKind::Workspace),
+            pinned: items.iter().position(|i| matches!(i.action, PickAction::AddAccount | PickAction::AddWorkspace)),
             items,
             filtered: Vec::new(),
             selected: 0,
@@ -417,6 +430,11 @@ impl Picker {
             query: self.query.clone(),
             cursor: self.cursor,
             selected: self.current().map(|i| i.label.clone()),
+            workspace: self.current().and_then(|i| i.action.workspace()),
+            definition: self.current().and_then(|i| match &i.action {
+                PickAction::OpenDefinition(path) => Some(path.clone()),
+                _ => None,
+            }),
             message: self.message.clone(),
             min_items: self.min_items,
         }
@@ -428,7 +446,11 @@ impl Picker {
         self.query = state.query;
         self.cursor = state.cursor;
         self.refilter();
-        if let Some(label) = state.selected {
+        if let Some(ws) = state.workspace {
+            self.select(|i| i.action.workspace() == Some(ws));
+        } else if let Some(path) = state.definition {
+            self.select(|i| matches!(&i.action, PickAction::OpenDefinition(p) if p == &path));
+        } else if let Some(label) = state.selected {
             self.select(|i| i.label == label);
         }
     }
@@ -473,10 +495,10 @@ impl Picker {
             (_, A::UseExisting { .. }) => &[("enter", "Choose")],
             (_, A::AddAccount) => &[("enter", "Add account")],
             (K::Workspace, A::RetryWorkspaceClose(_)) => &[("enter", "Retry Close")],
-            (K::Workspace, A::ReopenWorkspace(_)) => &[("enter", "Open")],
-            (K::Workspace, A::SwitchWorkspace(_)) => &[("enter", "Open"), ("ctrl+x", "Close workspace")],
-            (_, A::OpenDefinition(_)) => &[("enter", "Open workspace")],
-            (_, A::NewWorkspace) => &[("enter", "Create workspace")],
+            (K::Workspace, A::ReopenWorkspace(_)) => &[("enter", "Open"), ("ctrl+r", "Rename")],
+            (K::Workspace, A::SwitchWorkspace(_)) => &[("enter", "Open"), ("ctrl+r", "Rename"), ("ctrl+x", "Close")],
+            (_, A::OpenDefinition(_)) => &[("enter", "Open")],
+            (_, A::AddWorkspace) => &[("enter", "Add")],
             (K::Runbook, A::Runbook(_)) => &[("enter", "Run"), ("ctrl+e", "Edit")],
             (K::RunbookSteps, A::RunBlock(_)) => &[("enter", "Run step"), ("ctrl+y", "Copy step")],
             (_, A::RunbookList) => &[("enter", "Back to runbooks")],
@@ -505,7 +527,7 @@ impl Picker {
             .items
             .iter()
             .enumerate()
-            .filter(|(i, it)| Some(*i) != self.pinned && !matches!(it.action, PickAction::NewWorkspace))
+            .filter(|(i, _)| Some(*i) != self.pinned)
             .filter_map(|(i, it)| {
                 // The label matters most; details only rescue items whose label does not match.
                 fuzzy_score(&self.query, &it.label)
@@ -517,14 +539,6 @@ impl Picker {
             scored.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
         }
         self.filtered = scored.into_iter().map(|(_, i)| i).collect();
-        if self.kind == PickerKind::Workspace
-            && !self.query.trim().is_empty()
-            && !self.items.iter().any(|it| it.label == self.query.trim())
-            && let Some(i) = self.items.iter().position(|it| matches!(it.action, PickAction::NewWorkspace))
-        {
-            self.items[i].label = format!("+ new workspace \"{}\"", self.query.trim());
-            self.filtered.push(i);
-        }
         if self.kind == PickerKind::Ssh && !self.query.trim().is_empty() && !self.query.contains(' ') {
             let host = self.query.trim().to_string();
             if !self.items.iter().any(|it| it.label == host) {
@@ -639,6 +653,7 @@ pub struct Prompt {
     pub scroll: usize,
     /// What is typed is not shown (a secret).
     pub masked: bool,
+    pub workspace_form: Option<super::workspace_ui::WorkspaceForm>,
 }
 
 impl Prompt {
@@ -647,6 +662,8 @@ impl Prompt {
             title: title.into(),
             value: value.into(),
             cursor: value.chars().count(),
+            workspace_form: matches!(action, PromptAction::NewWorkspace | PromptAction::RenameWorkspace(_))
+                .then(super::workspace_ui::WorkspaceForm::default),
             action,
             error: None,
             scroll: 0,
@@ -832,6 +849,28 @@ mod tests {
     use super::*;
 
     #[test]
+    fn workspace_selection_survives_renames_and_distinguishes_same_named_files() {
+        for actions in [
+            [PickAction::SwitchWorkspace(1), PickAction::ReopenWorkspace(2)],
+            [PickAction::OpenDefinition("one/same.kdl".into()), PickAction::OpenDefinition("two/same.kdl".into())],
+        ] {
+            let mut old = Picker::new(
+                PickerKind::Workspace,
+                "Workspaces",
+                actions.iter().cloned().map(|a| PickItem::new("same", "", a)).collect(),
+            );
+            old.selected = 1;
+            let mut refreshed = Picker::new(
+                PickerKind::Workspace,
+                "Workspaces",
+                vec![PickItem::new("renamed", "", actions[1].clone()), PickItem::new("same", "", actions[0].clone())],
+            );
+            refreshed.restore(old.state());
+            assert_eq!(refreshed.current().unwrap().label, "renamed");
+        }
+    }
+
+    #[test]
     fn list_refresh_and_result_keep_the_query_selection_and_room_for_removed_rows() {
         let item = |name: &str| PickItem::new(name, "", PickAction::None);
         let mut old = Picker::new(PickerKind::Accounts, "Accounts", vec![item("One"), item("Two"), item("Other")]);
@@ -915,7 +954,7 @@ mod tests {
     }
 
     #[test]
-    fn picker_offers_new_workspace() {
+    fn workspace_search_keeps_a_uniform_add_row() {
         let items = vec![
             PickItem {
                 label: "perso".into(),
@@ -925,20 +964,20 @@ mod tests {
                 dim: false,
             },
             PickItem {
-                label: String::new(),
+                label: "+ Add workspace".into(),
                 detail: String::new(),
-                action: PickAction::NewWorkspace,
+                action: PickAction::AddWorkspace,
                 state: None,
                 dim: false,
             },
         ];
         let mut p = Picker::new(PickerKind::Workspace, "ws", items);
-        assert_eq!(p.filtered.len(), 1);
+        assert_eq!(p.filtered.len(), 2);
         p.query = "blog".into();
         p.refilter();
         assert_eq!(p.filtered.len(), 1);
-        assert!(p.current().unwrap().label.contains("blog"));
-        assert_eq!(p.action_keys(), &[("enter", "Create workspace")]);
+        assert_eq!(p.current().unwrap().label, "+ Add workspace");
+        assert_eq!(p.action_keys(), &[("enter", "Add")]);
     }
 
     #[test]
@@ -990,9 +1029,9 @@ mod tests {
             (
                 PickerKind::Workspace,
                 PickAction::SwitchWorkspace(1),
-                &[("enter", "Open"), ("ctrl+x", "Close workspace")],
+                &[("enter", "Open"), ("ctrl+r", "Rename"), ("ctrl+x", "Close")],
             ),
-            (PickerKind::Workspace, PickAction::OpenDefinition("w.kdl".into()), &[("enter", "Open workspace")]),
+            (PickerKind::Workspace, PickAction::OpenDefinition("w.kdl".into()), &[("enter", "Open")]),
             (PickerKind::RunbookSteps, PickAction::RunBlock(0), &[("enter", "Run step"), ("ctrl+y", "Copy step")]),
             (PickerKind::RunbookSteps, PickAction::RunbookList, &[("enter", "Back to runbooks")]),
             (

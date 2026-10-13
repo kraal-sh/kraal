@@ -1247,19 +1247,23 @@ fn workspace_creation_failures_keep_input_and_retry_from_both_entries_at_both_si
             std::fs::rename(&shell, &held).unwrap();
             if picker {
                 client.send(b"\x02w");
-                client.wait_for_row("Workspaces · type a new name");
+                client.wait_for_row("Workspaces");
             } else {
                 client.send(b"\x02Wn");
-                client.wait_for_row("New workspace");
+                client.wait_for_row("Name    ");
             }
-            client.send(format!(" {name} ").as_bytes());
             if picker {
-                let rows = client.wait_for_row("⏎ create workspace");
-                assert!(!rows.iter().any(|r| r.contains("more actions")));
+                client.send(name.as_bytes());
+                let rows = client.wait_for_row("Enter Add");
+                assert!(!rows.iter().any(|r| r.contains("Tab Actions")));
+                client.send(b"\r");
+                client.wait_for_row("Name    ");
+                assert_eq!(listed_workspaces(&env), before);
             }
+            client.send(format!("\x01\x0b {name} ").as_bytes());
             client.send(b"\r");
-            let rows = client.wait_for_row("⏎ retry");
-            for text in [&name, "New workspace", "Couldn't start the shell.", "No workspace was added.", "esc cancel"] {
+            let rows = client.wait_for_row("Enter Retry");
+            for text in [&name, "Add workspace", "Couldn't start the shell.", "No workspace was added.", "Esc Cancel"] {
                 assert!(rows.iter().any(|r| r.contains(text)), "{size:?}: {}", rows.join("\n"));
             }
             assert_eq!(listed_workspaces(&env), before);
@@ -1267,22 +1271,81 @@ fn workspace_creation_failures_keep_input_and_retry_from_both_entries_at_both_si
             // Cursor movement keeps the error; an edit clears it and keeps the cursor's place.
             client.send(b"\x1b[D");
             client.settle();
-            assert!(client.rows().iter().any(|r| r.contains("⏎ retry")));
+            assert!(client.rows().iter().any(|r| r.contains("Enter Retry")));
             client.send(b"-fixed");
-            client.wait_for_row("⏎ create");
+            client.wait_for_row("Enter Add");
             let fixed = format!("{name}-fixed");
             client.send(b"\r");
-            client.wait_for_row("⏎ retry");
+            client.wait_for_row("Enter Retry");
             assert_eq!(listed_workspaces(&env), before);
             std::fs::rename(&held, &shell).unwrap();
             client.send(b"\r");
-            client
-                .wait_for_rows("the creation prompt closed", |rows| !rows.iter().any(|r| r.contains("New workspace")));
+            client.wait_for_rows("the creation prompt closed", |rows| !rows.iter().any(|r| r.contains("Name    ")));
             let workspaces = listed_workspaces(&env);
             assert_eq!(workspaces.len(), before.len() + 1);
             assert_eq!(workspaces.iter().filter(|w| *w == &format!("{fixed}:  (open)")).count(), 1);
             assert_eq!(env.run(&["panes"]).lines().count(), panes.lines().count() + 1);
         }
+    }
+}
+
+#[test]
+fn workspace_search_add_and_closed_rename_work_at_both_sizes() {
+    for size in [(80, 24), (124, 36)] {
+        let env = Env::new(&format!("ws-list-{}", size.0));
+        let folder = env.root.join("project");
+        std::fs::create_dir(&folder).unwrap();
+        let source = format!("layout {{ cwd {:?}; pane name=\"shell\"; }}\n", folder.display().to_string());
+        env.workspace("source", &source);
+        env.run(&["open", "source"]);
+        let path = env.root.join("config/kraal/workspaces/source.kdl");
+        let mut client = RawClient::attach_sized(&env, Some("source"), size);
+        client.wait_for_message("\"attached\"");
+        client.wait_for_row("$ ");
+        if size.0 == 80 {
+            click_account_text(&mut client, "source");
+        } else {
+            click_account_text(&mut client, "WORKSPACES");
+        }
+        client.wait_for_row("Search");
+        client.send(b"billing");
+        client.wait_for_row("No matching workspaces.");
+        assert_eq!(listed_workspaces(&env), ["source: source.kdl (open)"]);
+        click_account_text(&mut client, "+ Add workspace");
+        client.wait_for_row("Name    billing");
+        client.wait_for_row("Starts in");
+        assert_eq!(listed_workspaces(&env), ["source: source.kdl (open)"]);
+        client.send(b"\x1b");
+        client.wait_for_row("Search  billing");
+        client.send(b"\r");
+        client.wait_for_row("Name    billing");
+        click_account_text(&mut client, "[> Add]");
+        client.wait_for_row("Workspace added");
+        let panes: serde_json::Value = serde_json::from_str(&env.run(&["panes", "--json"])).unwrap();
+        let added = panes.as_array().unwrap().iter().find(|p| p["workspace"] == "billing").unwrap();
+        assert_eq!(Path::new(added["cwd"].as_str().unwrap()).canonicalize().unwrap(), folder.canonicalize().unwrap());
+        client.wait_for_row("$ ");
+        client.send(b"\x02Wx");
+        client.wait_for_row("Closed · 1 tab · 1 pane");
+        let before = env.run(&["panes", "--json"]);
+        let list: serde_json::Value = serde_json::from_str(&env.run(&["workspaces", "--json"])).unwrap();
+        let id = list.as_array().unwrap().iter().find(|w| w["name"] == "billing").unwrap()["id"].clone();
+        client.send(b"\t");
+        client.wait_for_row("Rename");
+        client.send(b"\x1b[B\r");
+        client.wait_for_row("Rename workspace");
+        client.send(b"\x01\x0bbilling/review\r");
+        client.wait_for_row("Workspace renamed");
+        assert_eq!(env.run(&["panes", "--json"]), before, "renaming a closed workspace starts no programs");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), source);
+        assert!(!path.with_extension("kdl.bak").exists());
+        env.run(&["kill"]);
+        env.run(&["open", "source"]);
+        let list: serde_json::Value = serde_json::from_str(&env.run(&["workspaces", "--json"])).unwrap();
+        let renamed = list.as_array().unwrap().iter().find(|w| w["name"] == "billing/review").unwrap();
+        assert_eq!(renamed["id"], id);
+        assert_eq!(renamed["open"], false);
+        assert_eq!(std::fs::read_to_string(path).unwrap(), source);
     }
 }
 
@@ -1380,8 +1443,8 @@ fn a_cli_save_persists_its_first_link_before_the_periodic_save() {
     let mut client = RawClient::attach(&env, "base");
     client.wait_for_message("\"attached\"");
     client.send(b"\x02Wn");
-    client.wait_for_row("New workspace");
-    client.send(b"scratch\r");
+    client.wait_for_row("Name    ");
+    client.send(b"\x01\x0bscratch\r");
     wait_until(PATIENCE, "scratch was not created", || listed_workspaces(&env).iter().any(|w| w == "scratch:  (open)"));
     env.run(&["save", "linked", "--workspace", "scratch"]);
     wait_until(Duration::from_secs(10), "the CLI link was not persisted promptly", || {
@@ -1491,17 +1554,16 @@ fn names_in(dir: &Path) -> Vec<String> {
     names
 }
 
-/// The rows naming the definitions the sidebar lists as not running, once the screen settles.
-fn not_running(client: &RawClient) -> Vec<String> {
+/// The rows naming the definitions the sidebar lists as Closed, once the screen settles.
+fn closed_sidebar_rows(client: &RawClient) -> Vec<String> {
     client.settle();
-    client.rows().windows(2).filter(|w| w[1].contains("not running")).map(|w| w[0].clone()).collect()
+    client.rows().windows(2).filter(|w| w[1].contains("Closed")).map(|w| w[0].clone()).collect()
 }
 
-/// The case reported: a workspace opened from `perso.kdl` and renamed with a prefix in the menu
-/// takes its file along, and is listed once, in the sidebar and by `kraal workspaces`, after a
-/// restart too. Saving its layout writes that file.
+/// Rename keeps the identity and source, including after restart. Only an explicit save
+/// writes the source file.
 #[test]
-fn a_renamed_workspace_takes_its_file_along() {
+fn a_renamed_workspace_keeps_its_file_unchanged() {
     let env = Env::new("wsrename");
     let dir = env.root.join("config/kraal/workspaces");
     env.workspace("perso", "layout {\n    pane name=\"shell\"\n}\n");
@@ -1513,17 +1575,17 @@ fn a_renamed_workspace_takes_its_file_along() {
     assert!(id.as_str().is_some());
     let mut client = RawClient::attach(&env, "perso");
     client.wait_for_message("\"attached\"");
-    client.wait_for_row("not running");
+    client.wait_for_row("Closed");
     client.send(b"\x02We");
     client.wait_for_row("Rename workspace");
     // Home, then the prefix.
     client.send(b"\x1b[Hinfra - \r");
-    client.wait_for_row("renamed perso.kdl to infra - perso.kdl");
+    client.wait_for_row("Workspace renamed");
     assert_eq!(identity(), id);
-    assert_eq!(names_in(&dir), ["infra - perso.kdl", "work.kdl"]);
-    let shown = not_running(&client);
+    assert_eq!(names_in(&dir), ["perso.kdl", "work.kdl"]);
+    let shown = closed_sidebar_rows(&client);
     assert!(shown.len() == 1 && shown[0].contains("work"), "{shown:?}");
-    assert_eq!(listed_workspaces(&env), ["infra - perso: infra - perso.kdl (open)", "work: work.kdl"]);
+    assert_eq!(listed_workspaces(&env), ["infra - perso: perso.kdl (open)", "work: work.kdl"]);
     let text = env.run(&["workspaces"]);
     assert!(!text.lines().any(|l| l.starts_with("perso ")), "{text}");
     // Saved from the menu under the name it proposes: to its file.
@@ -1531,51 +1593,39 @@ fn a_renamed_workspace_takes_its_file_along() {
     client.wait_for_row("Save workspace layout as");
     client.send(b"\r");
     client.wait_for_row("saved ");
-    assert_eq!(names_in(&dir), [".infra - perso.kdl.lock", "infra - perso.kdl", "infra - perso.kdl.bak", "work.kdl"]);
+    assert_eq!(names_in(&dir), [".perso.kdl.lock", "perso.kdl", "perso.kdl.bak", "work.kdl"]);
     // Restored after a restart, still linked to its file.
     env.run(&["kill"]);
     env.run(&["open", "infra - perso"]);
-    assert_eq!(listed_workspaces(&env), ["infra - perso: infra - perso.kdl (open)", "work: work.kdl"]);
+    assert_eq!(listed_workspaces(&env), ["infra - perso: perso.kdl (open)", "work: work.kdl"]);
     assert_eq!(env.run(&["panes"]).lines().count(), 1);
     assert_eq!(identity(), id);
 }
 
-/// A rename never replaces a file: a name whose file exists, or that cannot name a file, is
-/// refused with why, and nothing changes. A workspace without a file takes any name.
+/// Existing list names are refused, but workspace names have no file-name restrictions.
 #[test]
 fn a_workspace_rename_never_replaces_a_file() {
     let env = Env::new("wsrenameexists");
     let dir = env.root.join("config/kraal/workspaces");
-    env.workspace("a", "layout {\n    pane name=\"one\"\n}\n");
-    env.workspace("b", "layout {\n    pane name=\"two\"\n}\n");
+    env.workspace("a", "layout { pane name=\"one\"; }\n");
+    env.workspace("b", "layout { pane name=\"two\"; }\n");
     env.run(&["open", "a"]);
     let mut client = RawClient::attach(&env, "a");
     client.wait_for_message("\"attached\"");
     client.send(b"\x02We");
     client.wait_for_row("Rename workspace");
     client.send(b"\x7fb\r");
-    client.wait_for_row("b.kdl exists: nothing was renamed.");
+    client.wait_for_row("This name is already used.");
     client.send(b"\x7fx/y\r");
-    client.wait_for_row("a workspace file name is one plain name");
-    client.send(b"\x1b");
-    client.wait_for_rows("the prompt closed", |rows| !rows.iter().any(|r| r.contains("Rename workspace")));
+    client.wait_for_row("Workspace renamed");
+    assert_eq!(listed_workspaces(&env), ["x/y: a.kdl (open)", "b: b.kdl"]);
     assert_eq!(names_in(&dir), ["a.kdl", "b.kdl"]);
-    assert_eq!(std::fs::read_to_string(dir.join("b.kdl")).unwrap(), "layout {\n    pane name=\"two\"\n}\n");
-    client.send(b"\x02Wn");
-    client.wait_for_row("New workspace");
-    client.send(b"scratch\r");
-    client.send(b"\x02We");
-    client.wait_for_row("Rename workspace");
-    client.send(b"/x\r");
-    wait_until(Duration::from_secs(10), "never renamed", || {
-        listed_workspaces(&env) == ["a: a.kdl (open)", "scratch/x:  (open)", "b: b.kdl"]
-    });
-    assert_eq!(names_in(&dir), ["a.kdl", "b.kdl"]);
+    assert_eq!(std::fs::read_to_string(dir.join("a.kdl")).unwrap(), "layout { pane name=\"one\"; }\n");
+    assert_eq!(std::fs::read_to_string(dir.join("b.kdl")).unwrap(), "layout { pane name=\"two\"; }\n");
 }
 
 /// A session where a workspace was renamed without its file, by an older kraal, keeps it linked
-/// to that file: listed once, opened by the file's name, saved to it. Renamed again in the menu,
-/// the file follows.
+/// to that file: listed once, opened by the file's name, saved to it. Renaming again keeps it.
 #[test]
 fn a_workspace_renamed_without_its_file_is_still_that_files() {
     let env = Env::new("wslegacy");
@@ -1593,7 +1643,7 @@ fn a_workspace_renamed_without_its_file_is_still_that_files() {
     assert_eq!(env.run(&["panes"]).lines().count(), 1);
     let mut client = RawClient::attach(&env, "perso");
     client.wait_for_message("\"attached\"");
-    let shown = not_running(&client);
+    let shown = closed_sidebar_rows(&client);
     assert!(shown.len() == 1 && shown[0].contains("work"), "{shown:?}");
     let saved = env.run(&["save", "--workspace", "infra - perso"]);
     assert!(saved.trim_end().ends_with("/perso.kdl"), "{saved}");
@@ -1601,8 +1651,8 @@ fn a_workspace_renamed_without_its_file_is_still_that_files() {
     client.send(b"\x02We");
     client.wait_for_row("Rename workspace");
     client.send(b"\r");
-    client.wait_for_row("renamed perso.kdl to infra - perso.kdl");
-    assert_eq!(names_in(&dir), [".perso.kdl.lock", "infra - perso.kdl", "perso.kdl.bak", "work.kdl"]);
+    client.wait_for_row("Workspace renamed");
+    assert_eq!(names_in(&dir), [".perso.kdl.lock", "perso.kdl", "perso.kdl.bak", "work.kdl"]);
 }
 
 /// A definition renamed on disk while its workspace is open stays linked to it, and its new name
@@ -7448,14 +7498,13 @@ fn picker_actions_and_footers_follow_the_line_at_both_sizes() {
         client.close_overlay("⏎ add account");
 
         client.send(b"\x02wclosed");
-        let rows = client.wait_for_row("⏎ open workspace");
-        assert!(!rows.iter().any(|r| r.contains("more actions")));
+        let rows = client.wait_for_row("Enter Open");
+        assert!(!rows.iter().any(|r| r.contains("Tab Actions")));
         client.send(b"\t");
-        let rows = client.wait_for_row("⏎ open workspace");
-        assert!(!rows.iter().any(|r| r.contains("Close workspace")));
+        let rows = client.wait_for_row("Enter Add");
+        assert!(!rows.iter().any(|r| r.contains("Tab Actions")));
         client.send(b"\x1b");
-        client
-            .wait_for_rows("the workspace picker closed", |rows| !rows.iter().any(|r| r.contains("⏎ open workspace")));
+        client.wait_for_rows("the workspace picker closed", |rows| !rows.iter().any(|r| r.contains("Search  closed")));
 
         client.send(b"\x02s");
         client.wait_for_row("Connect to");
@@ -10081,9 +10130,9 @@ fn closing_a_workspace_lists_its_programs_and_background_jobs_from_both_entries(
             client.wait_for_message("\"attached\"");
             if picker {
                 client.send(b"\x02w");
-                client.wait_for_row("Workspaces · type a new name");
+                client.wait_for_row("Workspaces");
                 client.send(b"api");
-                client.wait_for_row("⏎ open · tab more actions · esc close");
+                client.wait_for_row("Enter Open · Tab Actions · Esc Close");
                 client.send(b"\x18");
             } else {
                 client.send(b"\x02Wx");
@@ -10140,9 +10189,9 @@ fn closing_a_workspace_without_a_file_keeps_it_and_the_last_session() {
     let mut client = RawClient::attach(&env, "w").traced();
     client.wait_for_message("\"attached\"");
     client.send(b"\x02Wn");
-    client.wait_for_row("New workspace");
-    client.send(b"scratch\r");
-    client.wait_for_rows("the workspace was created", |rows| !rows.iter().any(|r| r.contains("New workspace")));
+    client.wait_for_row("Name    ");
+    client.send(b"\x01\x0bscratch\r");
+    client.wait_for_rows("the workspace was created", |rows| !rows.iter().any(|r| r.contains("Name    ")));
     client.wait_for_row("$ ");
     for size in [(80, 24), (124, 36)] {
         client.resize(size);
@@ -10152,20 +10201,17 @@ fn closing_a_workspace_without_a_file_keeps_it_and_the_last_session() {
         assert_eq!(env.server_pid(), Some(pid));
         assert!(!client.messages.lock().unwrap().iter().any(|m| m.contains(r#""type":"exit""#)));
         client.send(b"\r");
-        client
-            .wait_for_rows("scratch reopened", |rows| !rows.iter().any(|r| r.contains("Workspaces · type a new name")));
+        client.wait_for_rows("scratch reopened", |rows| !rows.iter().any(|r| r.contains("Workspaces")));
         client.wait_for_row("$ ");
         assert!(listed_workspaces(&env).contains(&"scratch:  (open)".to_string()));
     }
     client.send(b"\x02Wx");
     client.wait_for_row("Closed · 1 tab · 1 pane");
     client.send(b"\x1b");
-    client.wait_for_rows("the workspace picker closed", |rows| {
-        !rows.iter().any(|r| r.contains("Workspaces · type a new name"))
-    });
+    client.wait_for_rows("the workspace picker closed", |rows| !rows.iter().any(|r| r.contains("Workspaces")));
     client.wait_for_row("$ ");
     client.send(b"\x02Wx");
-    client.wait_for_row("Workspaces · type a new name");
+    client.wait_for_row("Workspaces");
     wait_until(PATIENCE, "both workspaces did not close", || {
         let workspaces: serde_json::Value = serde_json::from_str(&env.run(&["workspaces", "--json"])).unwrap();
         workspaces.as_array().is_some_and(|ws| ws.len() == 2 && ws.iter().all(|w| w["open"] == false))
@@ -10473,6 +10519,11 @@ fn a_crash_during_close_finishes_stopping_without_reopening_the_workspace() {
     // SAFETY: only the isolated server this test started, after its close intent reached disk.
     assert_eq!(unsafe { libc::kill(pid, libc::SIGKILL) }, 0);
     wait_until(PATIENCE, "the crashed server still runs", || env.server_pid().is_none());
+    // Its process information can disappear before its listening socket closes.
+    let socket = env.root.join("run/kraal/closecrash.sock");
+    wait_until(PATIENCE, "the crashed server still listens", || {
+        std::os::unix::net::UnixStream::connect(&socket).is_err()
+    });
     env.run(&["open", "other"]);
     let list: serde_json::Value = serde_json::from_str(&env.run(&["workspaces", "--json"])).unwrap();
     let ws = list.as_array().unwrap().iter().find(|w| w["name"] == "w").unwrap();

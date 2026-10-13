@@ -2,7 +2,6 @@
 
 use std::collections::HashSet;
 use std::ffi::OsStr;
-use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -233,49 +232,6 @@ impl Server {
             );
         }
         self.write_definition(wi, name, &save)
-    }
-
-    /// Give the definition file of workspace `wi` its new name: `perso.kdl` becomes
-    /// `<name>.kdl` beside it, in one step that never replaces a file already there. A workspace
-    /// whose file is gone keeps none. Returns the file renamed, if one was.
-    pub(super) fn rename_definition(&mut self, wi: usize, name: &str) -> Result<Option<PathBuf>> {
-        let Some(from) = self.workspaces[wi].definition.clone() else { return Ok(None) };
-        let to = from.with_file_name(format!("{name}.kdl"));
-        if to == from {
-            return Ok(None);
-        }
-        anyhow::ensure!(workspace::valid_file_name(name), "{}: nothing was renamed.", workspace::FILE_NAME_RULE);
-        let renamed = match paths::rename_no_replace(&from, &to) {
-            // A file system that ignores case finds the file itself under a name that differs
-            // only in case.
-            Err(e)
-                if e.kind() == ErrorKind::AlreadyExists
-                    && paths::file_id(&from).is_some_and(|i| paths::file_id(&to) == Some(i)) =>
-            {
-                std::fs::rename(&from, &to)
-            }
-            other => other,
-        };
-        match renamed {
-            Ok(()) => {
-                if let Some(dir) = to.parent() {
-                    paths::sync_dir(dir);
-                }
-                self.workspaces[wi].set_definition(Some(&to));
-                // Listed again at once: until the next scan, the sidebar would show the old name
-                // as a definition not running.
-                self.scan_definitions();
-                Ok(Some(from))
-            }
-            Err(e) if e.kind() == ErrorKind::NotFound => {
-                self.workspaces[wi].set_definition(None);
-                Ok(None)
-            }
-            Err(e) if e.kind() == ErrorKind::AlreadyExists => {
-                anyhow::bail!("{} exists: nothing was renamed.", file_name(&to))
-            }
-            Err(e) => anyhow::bail!("renaming {}: {e}", paths::shorten_home(&from)),
-        }
     }
 
     /// The name workspace `wi` is saved under when none is given: its definition file's, else
@@ -683,11 +639,6 @@ impl Server {
     pub fn definition_dir(&self) -> PathBuf {
         self.config.workspace_dirs().into_iter().next().unwrap_or_else(paths::workspaces_dir)
     }
-}
-
-/// The name of the file at `path`, to show.
-pub(super) fn file_name(path: &Path) -> String {
-    path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()
 }
 
 /// The waiting pane of an agent whose account is not chosen yet: it says why, and keeps what to

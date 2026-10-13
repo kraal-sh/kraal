@@ -36,6 +36,7 @@ pub mod runbooks;
 mod ssh;
 mod tools;
 mod ui;
+mod workspace_ui;
 mod worktrees;
 
 use std::collections::HashMap;

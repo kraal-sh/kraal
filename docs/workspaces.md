@@ -4,14 +4,23 @@ How kraal is organised, and how a workspace is declared once in a file and opene
 
 ## Concepts
 
-The workspace picker (`ctrl+b w`) shows what Enter does for each selected line: open an existing
-workspace or create the name typed. Saved workspaces show **Open** or **Closed**, with their
-retained tab and pane counts. Tab offers to close an open workspace; a closed workspace or a
-workspace file that has not been opened offers Open.
+The **Workspaces** list (`ctrl+b w`) shows **Open** or **Closed**, retained tab and pane counts,
+and **Current** for the workspace on screen. Enter or one click opens the selected workspace.
+Search only filters the list. **+ Add workspace** stays visible even when nothing matches.
+Tab or a right click offers actions for that row: **Rename** for a saved workspace, and **Close**
+when it is open. A workspace file that has not been imported offers **Open**.
 
-Creating a workspace (`ctrl+b W n`, or a new name in the picker) keeps the name you typed if
-the shell cannot start. No workspace is added on that failure. The error stays in **New workspace**:
-fix the cause and press Enter to retry, edit the name, or press Esc to cancel.
+**+ Add workspace** and `ctrl+b W n` open the same **Add workspace** form. It proposes an unused
+name (or the search text) and shows the folder inherited from the current pane. Edit **Name**,
+then Enter or click **Add**. Tab moves between the field and buttons; Esc or **Cancel** returns
+to the list with its search and selection. A direct shortcut returns to the terminal.
+Names are checked against the whole session, including closed workspaces and workspace files.
+
+An immediate shell or save failure keeps the form and its input, with **Retry** and **Cancel**.
+No workspace is added on that failure. **Workspace added** appears only after its state is saved.
+Renaming also waits for the saved name: if saving fails, the old name stays and the form keeps
+the proposed name for retry. A rename from the list selects the renamed row; if its new name
+no longer matches the search, the search clears to show it.
 
 - A **session** is one background server. It owns the processes; clients attach and detach.
   `kraal` uses the session `main`; `kraal -s work` (or `KRAAL_SESSION_NAME=work` in the
@@ -25,7 +34,10 @@ fix the cause and press Enter to retry, edit the name, or press Esc to cancel.
   `ctrl+b V l` hides it, or shows it again, in the terminal you type it in until that terminal
   detaches; `[sidebar] visible = false` in the configuration hides it for good. A terminal less
   than three times as wide as the sidebar (84 columns with the default width) has none: the panes
-  keep that room, and the top bar names the workspace.
+  keep that room, and the top bar names the workspace. Click that name to open **Workspaces**.
+  With the sidebar visible, its **WORKSPACES** heading opens the same list, **+ Add workspace**
+  opens the form, and a row's actions button or a right click opens that workspace's actions.
+  All workspace operations remain available at 80x24 without the sidebar.
 - Several terminals can be attached at once. The panes have the size that fits the one used last
   (attached, resized or typed in), and each terminal shows them beside its own sidebar: a smaller
   one shows what fits.
@@ -283,10 +295,10 @@ file it replaces is kept as `.kdl.bak`. An agent started on an account is saved 
 
 An open workspace stays linked to its file, across restarts too: the sidebar and
 `kraal workspaces` list it once, and `kraal open` with the name of its file switches to it.
-Renaming the workspace (`ctrl+b W e`) renames its file: `perso.kdl` becomes `infra - perso.kdl`
-beside it. The new name must then be a file name (no `/`, not starting with `.`), and a file
-already there is never replaced: the rename is refused and nothing changes. A file renamed on disk
-while its workspace is open stays linked; one deleted is written again by the next save.
+Renaming the workspace (`ctrl+b W e`, or **Rename** in the list) changes only its saved name.
+It works while open or closed, without starting programs or renaming any file. Names may contain
+`/` or start with `.` even when there is a source file. A file renamed on disk while its workspace
+is open stays linked; one deleted can be written again by an explicit save.
 
 ### Saving without replacing someone else's layout
 

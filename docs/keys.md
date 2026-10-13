@@ -18,7 +18,7 @@ any keyboard layout.
 |---|---|---|
 | servers | `s` connect (or a group in a grid) | `S`: `s` connect, `u` upload, `d` download, `e` edit the list |
 | broadcast | `b` typing goes to the whole tab, `b` again stops | `B`: `b` this tab, `w` the whole workspace, `m` mark this pane, `s` the marked panes, `o` stop |
-| workspaces | `w` choose one | `W`: `w` choose, `n` new, `←`/`→` previous/next, `e` rename, `s` save the layout, `r` restart the session (on the kraal installed now), `q` quit, `x` close |
+| workspaces | `w` choose one | `W`: `w` choose, `n` add, `←`/`→` previous/next, `e` rename, `s` save the layout, `r` restart the session (on the kraal installed now), `q` quit, `x` close |
 | agents | `a` start one on an account | `A`: `a` start, `l` accounts, `n` add account, `g` go to the agent needing you, `c` change account |
 | tabs | `t` new tab | `T`: `t` new, `←`/`→` previous/next, `e` rename, `x` close |
 | panes | `p` find a pane | `P`: `p` find, `n` new, `→`/`↓` split, `e` rename, `r` resize with the arrows, `f` floating, `l` next layout, `s` then an arrow stack with the pane on that side, `u` unstack, `x` close |
@@ -141,10 +141,15 @@ selected item (connect in a new tab, browse its files, run a command…), each a
 own that the list shows, Esc closes. The footer says what Enter does on the selected line;
 only actions that apply to that line are offered. When there are no other actions, Tab moves
 to the next line. Text fields edit like a shell line (arrows, `home`/`end`,
-`alt+←→`, `ctrl+w`, `ctrl+u`, `ctrl+k`). In the New workspace and Save workspace prompts,
+`alt+←→`, `ctrl+w`, `ctrl+u`, `ctrl+k`). In Add workspace, Rename workspace and Save workspace,
 errors wrap below the input and stay visible when moving the cursor.
 Long errors scroll with `pageup`/`pagedown` or the mouse wheel;
 the input and the keys to retry or cancel stay visible. Editing the value clears the error.
+Workspace search never creates a workspace. **+ Add workspace** or `ctrl+b W n` opens the
+shared form; Enter or its **Add** button creates it. In Add workspace and Rename workspace,
+Tab moves between **Name**, the action button and **Cancel**. Esc returns to the list's search
+and selection. In Workspaces, Tab or a right click offers **Rename** for an open or closed saved
+workspace, and **Close** only while open.
 Questions show two buttons, Cancel first: `y` answers
 yes, `n` or Esc no, Enter takes the selected button (`←→` or Tab change it). A question longer
 than its box says how many lines are below and scrolls: `↑↓` (or `j` `k`) by a line, `pageup`

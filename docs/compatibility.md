@@ -40,6 +40,11 @@ behavior until restarted: a new client cannot add file protections or lifecycle 
 A restart from 0.2.0 ends attached terminals; attach again afterwards. Later clients wait for
 the replacement server.
 
+Workspace Add and Rename use the attached terminal's existing input protocol. No new request or
+saved-state field is needed. A workspace's name is independent of its source path; older versions
+already read these separately. Renaming on a current server leaves every KDL file unchanged.
+A session still running 0.2.0 or 0.3.0 retains that server's old rename behavior.
+
 ## For contributors: how the protocol changes
 
 The client and the server exchange JSON messages (`src/protocol.rs`, whose comments hold the

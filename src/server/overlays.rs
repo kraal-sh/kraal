@@ -385,14 +385,21 @@ pub(super) struct PickerLayout {
     /// Index (in the filtered list) of the first row shown.
     pub(super) start: usize,
     pub(super) row_height: u16,
+    pinned: Option<(Rect, usize)>,
 }
 
 impl PickerLayout {
     /// The item under a click, if any.
     pub(super) fn row_at(&self, col: u16, row: u16) -> Option<usize> {
+        if let Some((area, index)) = self.pinned
+            && area.contains(Position::new(col, row))
+        {
+            return Some(index);
+        }
         self.list
             .contains(Position::new(col, row))
             .then(|| self.start + ((row - self.list.y) / self.row_height) as usize)
+            .filter(|&index| self.pinned.is_none_or(|(_, pinned)| index != pinned))
     }
 }
 
@@ -401,15 +408,30 @@ impl PickerLayout {
 pub(super) fn picker_layout(p: &Picker, screen: Rect) -> PickerLayout {
     let w = screen.width.saturating_sub(4).min(92);
     let row_height = if p.two_line && p.actions.is_none() { 2 } else { 1 };
-    let rows = (p.items.len().max(p.min_items).max(p.action_keys().len()) as u16 * row_height)
+    let rows = (p
+        .items
+        .len()
+        .max(p.min_items)
+        .max(p.action_keys().len())
+        .max(if p.kind == super::ui::PickerKind::Workspace { 2 } else { 1 }) as u16
+        * row_height)
         .clamp(1, screen.height.saturating_sub(9).max(1));
     let rows = rows / row_height * row_height;
     let area = centered(screen, w, rows + 5);
     let inner = Rect::new(area.x + 1, area.y + 1, area.width.saturating_sub(2), area.height.saturating_sub(2));
-    let list = Rect::new(inner.x, inner.y + 2, inner.width, inner.height.saturating_sub(3));
+    let mut list = Rect::new(inner.x, inner.y + 2, inner.width, inner.height.saturating_sub(3));
+    let pinned = if p.kind == super::ui::PickerKind::Workspace && p.actions.is_none() {
+        p.pinned.and_then(|pinned| p.filtered.iter().position(|&i| i == pinned)).map(|index| {
+            list.height = list.height.saturating_sub(row_height);
+            (Rect::new(list.x, list.bottom(), list.width, row_height), index)
+        })
+    } else {
+        None
+    };
     let shown = (list.height / row_height).max(1) as usize;
-    let start = p.selected.saturating_sub(shown.saturating_sub(1));
-    PickerLayout { area, list, start, row_height }
+    let selected = if pinned.is_some_and(|(_, i)| i == p.selected) { p.selected.saturating_sub(1) } else { p.selected };
+    let start = selected.saturating_sub(shown.saturating_sub(1));
+    PickerLayout { area, list, start, row_height, pinned }
 }
 
 pub(super) fn draw_picker(p: &Picker, screen: Rect, buf: &mut Buffer) -> Option<Cursor> {
@@ -421,10 +443,14 @@ pub(super) fn draw_picker(p: &Picker, screen: Rect, buf: &mut Buffer) -> Option<
     }
     // The search line.
     let review = p.kind == super::ui::PickerKind::AccountReview;
+    let workspace = p.kind == super::ui::PickerKind::Workspace;
     let prompt = if review {
         Line::from("Which account is this?")
     } else {
-        Line::from(vec![Span::styled(t.prompt(), Style::default().fg(t.accent)), Span::raw(p.query.clone())])
+        Line::from(vec![
+            Span::styled(if workspace { "Search  " } else { t.prompt() }, Style::default().fg(t.accent)),
+            Span::raw(p.query.clone()),
+        ])
     };
     buf.set_line(inner.x + 1, inner.y, &prompt, inner.width.saturating_sub(2));
     for x in inner.x..inner.x + inner.width {
@@ -463,11 +489,19 @@ pub(super) fn draw_picker(p: &Picker, screen: Rect, buf: &mut Buffer) -> Option<
         buf.set_line(inner.x + 1, inner.y + inner.height - 1, &footer, inner.width.saturating_sub(2));
         return None;
     }
-    for (row, &idx) in p.filtered.iter().skip(layout.start).take((list.height / layout.row_height) as usize).enumerate()
-    {
+    let visible = p
+        .filtered
+        .iter()
+        .enumerate()
+        .skip(layout.start)
+        .take((list.height / layout.row_height) as usize)
+        .filter(|(i, _)| layout.pinned.is_none_or(|(_, pinned)| *i != pinned))
+        .enumerate()
+        .map(|(row, (i, &idx))| (i, idx, list.y + row as u16 * layout.row_height));
+    let pinned = layout.pinned.map(|(area, i)| (i, p.filtered[i], area.y));
+    for (i, idx, y) in visible.chain(pinned) {
         let item = &p.items[idx];
-        let selected = layout.start + row == p.selected;
-        let y = list.y + row as u16 * layout.row_height;
+        let selected = i == p.selected;
         let mut spans = vec![Span::raw(pointer(selected))];
         if let Some(s) = item.state {
             spans.push(Span::styled(format!("{} ", t.icon(s)), Style::default().fg(t.state_color(s))));
@@ -500,11 +534,19 @@ pub(super) fn draw_picker(p: &Picker, screen: Rect, buf: &mut Buffer) -> Option<
             buf.set_stringn(
                 list.x + 2,
                 y + 1,
-                &item.detail,
+                if matches!(item.action, super::ui::PickAction::OpenDefinition(_)) {
+                    crate::text::truncate_start(&item.detail, list.width.saturating_sub(2) as usize)
+                } else {
+                    item.detail.clone()
+                },
                 list.width.saturating_sub(2) as usize,
                 row_style(selected),
             );
         }
+    }
+    if workspace && p.filtered.iter().all(|&i| Some(i) == p.pinned) && list.height > 0 {
+        let message = if p.query.is_empty() { "No workspaces yet." } else { "No matching workspaces." };
+        buf.set_stringn(list.x + 2, list.y, message, list.width.saturating_sub(2) as usize, dim());
     }
     if p.filtered.is_empty() {
         use super::ui::PickerKind as K;
@@ -512,7 +554,7 @@ pub(super) fn draw_picker(p: &Picker, screen: Rect, buf: &mut Buffer) -> Option<
             _ if p.loading.is_some() => if th().ascii { "Loading..." } else { "Loading…" }.into(),
             _ if !p.query.is_empty() => format!("Nothing matches \"{}\".", p.query),
             K::Ssh => "No saved servers. Type user@host to connect (`kraal servers add` saves one).".into(),
-            K::Workspace => "Type a name to create a workspace.".into(),
+            K::Workspace => "No workspaces yet.".into(),
             K::Runbook => "No runbooks yet: `kraal runbook new <name>` creates one.".into(),
             K::Tool => "No tools: add some under [tools] in config.toml.".into(),
             K::Agent => "No accounts ready. Open Accounts from the Agents menu to sign in.".into(),
@@ -525,16 +567,17 @@ pub(super) fn draw_picker(p: &Picker, screen: Rect, buf: &mut Buffer) -> Option<
     let enter = match p.current().map(|i| &i.action) {
         Some(super::ui::PickAction::AgentLaunch { .. }) => Some("start".into()),
         Some(super::ui::PickAction::AccountDetails(_)) => Some("details".into()),
+        _ if workspace => keys.first().map(|(_, what)| what.to_string()),
         _ => keys.first().map(|(_, what)| lower_first(what)),
     };
     let mut footer: Vec<(&str, &str)> = Vec::new();
     if let Some(enter) = &enter {
-        footer.push(("⏎", enter));
+        footer.push((if workspace { "Enter" } else { "⏎" }, enter));
     }
     if keys.len() > 1 {
-        footer.push(("tab", "more actions"));
+        footer.push(if workspace { ("Tab", "Actions") } else { ("tab", "more actions") });
     }
-    footer.push(("esc", if review { "Back" } else { "close" }));
+    footer.push(if workspace { ("Esc", "Close") } else { ("esc", if review { "Back" } else { "close" }) });
     let count = if let Some(message) = &p.message {
         message.clone()
     } else if p.query.is_empty() {
@@ -548,7 +591,7 @@ pub(super) fn draw_picker(p: &Picker, screen: Rect, buf: &mut Buffer) -> Option<
         return None;
     }
     let before: String = p.query.chars().take(p.cursor).collect();
-    let x = inner.x + 1 + columns(t.prompt()) as u16 + before.width() as u16;
+    let x = inner.x + 1 + columns(if workspace { "Search  " } else { t.prompt() }) as u16 + before.width() as u16;
     (x < inner.x + inner.width).then_some(Cursor { x, y: inner.y, shape: CursorShape::Bar, blinking: true })
 }
 
@@ -591,6 +634,9 @@ pub(super) fn prompt_layout(p: &Prompt, screen: Rect) -> PromptLayout {
 }
 
 pub(super) fn draw_prompt(p: &Prompt, screen: Rect, buf: &mut Buffer) -> Option<Cursor> {
+    if p.workspace_form.is_some() {
+        return super::workspace_ui::draw_form(p, screen, buf);
+    }
     let layout = prompt_layout(p, screen);
     let inner = frame(layout.area, &p.title, th().accent, buf);
     if inner.height < 2 || inner.width < 4 {
@@ -849,14 +895,14 @@ mod tests {
                 .collect(),
         );
         let mut prompt =
-            Prompt::new("Rename tab", "a long name that goes on and on", super::super::ui::PromptAction::NewWorkspace);
+            Prompt::new("Rename tab", "a long name that goes on and on", super::super::ui::PromptAction::RenamePane(1));
         prompt.error = Some(message.repeat(5));
         prompt.scroll = 99;
         let (km, _) = crate::keymap::Keymap::build(&crate::config::Config::default().keys);
         let menu = menu_items(&km.menu(&[]), true);
         let lines: Vec<Line<'static>> = (0..50).map(|i| entry("ctrl+b p r", &format!("line {i}"), 12)).collect();
         for (action, yes) in [(ConfirmAction::ClosePane(1), true), (ConfirmAction::TrustRunbook, false)] {
-            let q = Question { message: message.repeat(5), action, yes, scroll: 99 };
+            let q = Question { message: message.repeat(5), action, yes, scroll: 99, workspace_back: None };
             draw_confirm(&q, screen, buf);
         }
         draw_picker(&picker, screen, buf);
@@ -903,7 +949,7 @@ mod tests {
         let error = format!("Couldn't write {path}.\nPermission denied. Fix the destination and retry.");
         for (w, h) in [(80, 24), (124, 36)] {
             let area = Rect::new(0, 0, w, h);
-            for action in [PromptAction::NewWorkspace, PromptAction::SaveWorkspace(1)] {
+            for action in [PromptAction::SaveWorkspace(1)] {
                 let mut p = Prompt::new("Workspace", " café 日 ", action);
                 p.cursor = 3;
                 let mut buf = Buffer::empty(area);
@@ -938,7 +984,8 @@ mod tests {
     fn a_prompt_diagnostic_taller_than_the_terminal_is_readable_in_pages() {
         for (w, h) in [(80, 24), (124, 36)] {
             let area = Rect::new(0, 0, w, h);
-            let mut p = Prompt::new("New workspace", "scratch", super::super::ui::PromptAction::NewWorkspace);
+            let mut p =
+                Prompt::new("Save workspace layout as", "scratch", super::super::ui::PromptAction::SaveWorkspace(1));
             p.error = Some((0..100).map(|i| format!("Diagnostic line {i}\n")).collect());
             let layout = prompt_layout(&p, area);
             assert!(layout.max_scroll > 0);
@@ -976,13 +1023,13 @@ mod tests {
                     false,
                 ),
                 (PickerKind::Ssh, PickAction::SshGroup("web".into()), "open group", true),
-                (PickerKind::Workspace, PickAction::SwitchWorkspace(1), "open", true),
-                (PickerKind::Workspace, PickAction::OpenDefinition("w.kdl".into()), "open workspace", false),
-                (PickerKind::Workspace, PickAction::NewWorkspace, "create workspace", false),
+                (PickerKind::Workspace, PickAction::SwitchWorkspace(1), "Open", true),
+                (PickerKind::Workspace, PickAction::OpenDefinition("w.kdl".into()), "Open", false),
+                (PickerKind::Workspace, PickAction::AddWorkspace, "Add", false),
                 (PickerKind::RunbookSteps, PickAction::RunbookList, "back to runbooks", false),
             ];
             for (kind, action, enter, more) in cases {
-                let create = matches!(action, PickAction::NewWorkspace);
+                let create = matches!(action, PickAction::AddWorkspace);
                 let mut p = Picker::new(kind, "List", vec![PickItem::new("item", "", action)]);
                 if create {
                     p.query = "new".into();
@@ -993,8 +1040,17 @@ mod tests {
                 let layout = picker_layout(&p, area);
                 let footer = screen(&buf, Rect::new(layout.area.x, layout.area.bottom() - 2, layout.area.width, 1));
                 assert!(footer.contains(enter), "{w}×{h}: {footer}");
-                assert_eq!(footer.contains("more actions"), more, "{footer}");
-                assert_eq!(layout.row_at(layout.list.x + 2, layout.list.y), Some(0));
+                assert_eq!(
+                    footer.contains(if kind == PickerKind::Workspace { "Tab Actions" } else { "more actions" }),
+                    more,
+                    "{footer}"
+                );
+                if let Some((add, index)) = layout.pinned {
+                    assert_eq!(layout.row_at(layout.list.x + 2, layout.list.y), None);
+                    assert_eq!(layout.row_at(add.x + 2, add.y), Some(index));
+                } else {
+                    assert_eq!(layout.row_at(layout.list.x + 2, layout.list.y), Some(0));
+                }
             }
             let p = Picker::new(PickerKind::Agent, "Agents", vec![]);
             let mut buf = Buffer::empty(area);
@@ -1010,8 +1066,47 @@ mod tests {
             draw_picker(&p, area, &mut buf);
             let layout = picker_layout(&p, area);
             let footer = screen(&buf, Rect::new(layout.area.x, layout.area.bottom() - 2, layout.area.width, 1));
-            assert!(footer.contains("esc close"));
+            assert!(footer.contains("Esc Close"));
             assert!(!footer.contains("⏎") && !footer.contains("more actions"), "{footer}");
+        }
+    }
+
+    #[test]
+    fn workspace_add_stays_visible_and_names_are_not_dimmed_while_scrolling_and_searching() {
+        use super::super::ui::{PickAction, PickItem, PickerKind};
+        for (w, h) in [(80, 24), (124, 36)] {
+            let area = Rect::new(0, 0, w, h);
+            let mut items: Vec<_> = (0..40)
+                .map(|i| {
+                    PickItem::new(format!("workspace-{i}"), "Closed · 1 tab · 2 panes", PickAction::ReopenWorkspace(i))
+                })
+                .collect();
+            items.push(PickItem::new("+ Add workspace", "", PickAction::AddWorkspace));
+            let mut p = Picker::new(PickerKind::Workspace, "Workspaces", items);
+            for selected in [0, 20, 39, 40] {
+                p.selected = selected;
+                let layout = picker_layout(&p, area);
+                let mut buf = Buffer::empty(area);
+                draw_picker(&p, area, &mut buf);
+                let shown = screen(&buf, area);
+                assert!(shown.contains("+ Add workspace"), "{shown}");
+                assert!(shown.contains(&p.current().unwrap().label), "{shown}");
+                let (add, index) = layout.pinned.unwrap();
+                assert_eq!(index, 40);
+                assert_eq!(layout.row_at(add.x + 2, add.y), Some(40));
+                assert_eq!(layout.row_at(add.x + 2, add.y + 1), Some(40));
+                assert!(buf[(layout.list.x + 2, layout.list.y)].modifier.contains(Modifier::BOLD));
+                assert_ne!(buf[(layout.list.x + 2, layout.list.y)].fg, th().dim);
+            }
+            p.query = "does-not-exist".into();
+            p.refilter();
+            let mut buf = Buffer::empty(area);
+            draw_picker(&p, area, &mut buf);
+            let shown = screen(&buf, area);
+            assert!(shown.contains("No matching workspaces."));
+            assert!(shown.contains("Enter Add"));
+            assert!(!shown.contains("Tab Actions"));
+            assert_eq!(p.current().unwrap().label, "+ Add workspace");
         }
     }
 
@@ -1114,7 +1209,8 @@ mod tests {
     fn every_line_of_a_long_question_can_be_read() {
         let message: String = (1..=30).map(|i| format!("line number {i}\n")).collect();
         let area = Rect::new(0, 0, 60, 12);
-        let mut q = Question { message, action: ConfirmAction::ClosePane(1), yes: false, scroll: 0 };
+        let mut q =
+            Question { message, action: ConfirmAction::ClosePane(1), yes: false, scroll: 0, workspace_back: None };
         let layout = confirm_layout(&q, area);
         assert!(layout.max_scroll > 0 && layout.more.is_some() && layout.cancel.is_some());
         q.scroll = layout.max_scroll;
@@ -1136,7 +1232,7 @@ mod tests {
             "x".repeat(60)
         );
         let area = Rect::new(0, 0, 50, 20);
-        let q = Question { message, action: ConfirmAction::TrustRunbook, yes: false, scroll: 0 };
+        let q = Question { message, action: ConfirmAction::TrustRunbook, yes: false, scroll: 0, workspace_back: None };
         let layout = confirm_layout(&q, area);
         let rows: Vec<(&str, bool)> = layout.lines.iter().map(|row| (row.text.as_str(), row.continued)).collect();
         let (cut, rest) = (format!("  2. echo {}", "x".repeat(34)), format!("  {}", "x".repeat(26)));
