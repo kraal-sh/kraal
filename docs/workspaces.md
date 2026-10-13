@@ -4,6 +4,10 @@ How kraal is organised, and how a workspace is declared once in a file and opene
 
 ## Concepts
 
+The workspace picker (`ctrl+b w`) shows what Enter does for each selected line: open an existing
+workspace or create the name typed. Tab offers to close a workspace only when it is running;
+a workspace file that is not running can only be opened.
+
 - A **session** is one background server. It owns the processes; clients attach and detach.
   `kraal` uses the session `main`; `kraal -s work` (or `KRAAL_SESSION_NAME=work` in the
   environment) another one, and inside a pane every command uses that pane's session.

@@ -6682,6 +6682,141 @@ fn output_parsed_while_keys_come_is_whole_and_in_order() {
 }
 
 #[test]
+fn picker_actions_and_footers_follow_the_line_at_both_sizes() {
+    use alacritty_terminal::index::{Column, Line};
+    use alacritty_terminal::term::cell::Flags;
+
+    let env = Env::new("pickerlines");
+    env.workspace("w", "layout {\n    pane name=\"shell\"\n}\n");
+    env.workspace("closed", "layout {\n    pane\n}\n");
+    std::fs::write(
+        env.root.join("config/kraal/servers.toml"),
+        "[[server]]\nname = \"web\"\nhost = \"web.example.com\"\ngroups = [\"fleet\"]\n",
+    )
+    .unwrap();
+    env.run(&["open", "w"]);
+    let click = |client: &mut RawClient, text: &str| {
+        let rows = client.wait_for_row(text);
+        let y = rows.iter().position(|r| r.contains(text)).unwrap();
+        let x = rows[y][..rows[y].find(text).unwrap()].chars().count();
+        client.send(format!("\x1b[<0;{};{}M\x1b[<0;{};{}m", x + 1, y + 1, x + 1, y + 1).as_bytes());
+    };
+    for size in [(124, 36), (80, 24)] {
+        let mut client = RawClient::attach_sized(&env, Some("w"), size);
+        for agent in ["claude", "codex"] {
+            client.send(b"\x02a");
+            let label = format!("+ add a {agent} account");
+            let rows = client.wait_for_row(&label);
+            let y = rows.iter().position(|r| r.contains(&label)).unwrap();
+            let x = rows[y][..rows[y].find(&label).unwrap()].chars().count();
+            let term = emulate(&client.screen.lock().unwrap(), size.0, size.1);
+            assert!(term.grid()[Line(y as i32)][Column(x)].flags.contains(Flags::BOLD), "{agent} at {size:?}");
+            click(&mut client, &label);
+            let rows = client.wait_for_row("⏎ add account");
+            assert!(!rows.iter().any(|r| r.contains("more actions")));
+            if agent == "claude" {
+                client.send(b"\r");
+            } else {
+                click(&mut client, &label);
+            }
+            client.wait_for_row(&format!("Name of the new {agent} account"));
+            client.send(b"\x1b");
+            client.wait_for_rows("the name prompt closed", |rows| !rows.iter().any(|r| r.contains("Name of the new")));
+        }
+
+        client.send(b"\x02wclosed");
+        let rows = client.wait_for_row("⏎ open workspace");
+        assert!(!rows.iter().any(|r| r.contains("more actions")));
+        client.send(b"\t");
+        let rows = client.wait_for_row("⏎ open workspace");
+        assert!(!rows.iter().any(|r| r.contains("Close workspace")));
+        client.send(b"\x1b");
+        client
+            .wait_for_rows("the workspace picker closed", |rows| !rows.iter().any(|r| r.contains("⏎ open workspace")));
+
+        client.send(b"\x02s");
+        client.wait_for_row("Connect to");
+        client.wait_for_row("⏎ open group");
+        client.send(b"\t");
+        let rows = client.wait_for_row("Run a command on it");
+        for absent in ["Connect in a new tab", "Browse its files", "Forward one", "Remove saved server"] {
+            assert!(!rows.iter().any(|r| r.contains(absent)), "{size:?}: {absent}");
+        }
+        click(&mut client, "Run a command on it");
+        client.wait_for_row("Run on @fleet");
+        client.send(b"\x1b");
+    }
+}
+
+#[test]
+fn choosing_the_current_account_keeps_running_and_exited_panes_as_they_are() {
+    let env = Env::new("sameacct");
+    let bin = env.root.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let mut accounts = String::new();
+    for agent in ["claude", "codex"] {
+        write_script(
+            &bin.join(agent),
+            "#!/bin/sh\n[ \"$1\" = app-server ] && exit 0\nprintf '%s\\n' \"$$\" >> \"$HOME/starts\"\necho READY\nwhile IFS= read -r line; do\n    [ \"$line\" = quit ] && exit 0\n    printf 'reply:%s\\n' \"$line\"\ndone\n",
+        );
+        let home = env.root.join(format!("{agent}-home"));
+        std::fs::create_dir_all(&home).unwrap();
+        accounts.push_str(&format!(
+            "[[account]]\nname = \"work\"\nagent = {agent:?}\nhome = {:?}\n",
+            home.display().to_string()
+        ));
+    }
+    std::fs::write(env.root.join("config/kraal/accounts.toml"), accounts).unwrap();
+    env.workspace("w", "layout {\n    pane name=\"shell\"\n}\n");
+    let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap_or_default());
+    let out = env.cmd(&["open", "w"]).env("PATH", &path).output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let socket = env.root.join("run/kraal/sameacct.sock");
+    for (agent, size) in [("claude", (124, 36)), ("codex", (80, 24))] {
+        let out = env
+            .cmd(&["agent", agent, "--account", "work", "--tab"])
+            .env("PATH", &path)
+            .env("KRAAL_SOCKET", &socket)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        let pane = String::from_utf8(out.stdout).unwrap().trim().to_string();
+        let pane_id: u32 = pane.parse().unwrap();
+        env.wait_for_text(&pane, "READY");
+        let starts = std::fs::read_to_string(env.root.join("home/starts")).unwrap();
+        let mut client = RawClient::attach_sized(&env, Some("w"), size);
+        for exited in [false, true] {
+            client.send(b"\x02Ac\x1b[B");
+            let rows = client.wait_for_row("⏎ keep current account");
+            assert!(rows.iter().any(|r| r.contains(&format!("{agent}·work")) && r.contains("current")));
+            assert!(!rows.iter().any(|r| r.contains("more actions")));
+            // Tab moves to the other account rather than opening launch or login actions.
+            client.send(b"\t");
+            let rows = client.wait_for_row("⏎ switch account");
+            assert!(!rows.iter().any(|r| r.contains("more actions")));
+            client.send(b"\x1b[A");
+            client.wait_for_row("⏎ keep current account");
+            client.send(b"\r");
+            client.wait_for_rows("the account picker closed", |rows| {
+                !rows.iter().any(|r| r.contains("⏎ keep current account"))
+            });
+            if !exited {
+                client.send(b"alive\r");
+                env.wait_for_text(&pane, "reply:alive");
+            }
+            let panes: serde_json::Value = serde_json::from_str(&env.run(&["panes", "--json"])).unwrap();
+            let info = panes.as_array().unwrap().iter().find(|p| p["id"] == pane_id).unwrap();
+            assert_eq!(!info["exit_code"].is_null(), exited);
+            assert_eq!(std::fs::read_to_string(env.root.join("home/starts")).unwrap(), starts, "{agent} restarted");
+            if !exited {
+                client.send(b"quit\r");
+                client.wait_for_row("exited (0)");
+            }
+        }
+    }
+}
+
+#[test]
 fn an_account_switch_never_resends_a_prompt_by_itself_and_one_that_fails_can_be_restarted() {
     let env = Env::new("switchacct");
     let bin = env.root.join("bin");

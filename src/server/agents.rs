@@ -244,6 +244,9 @@ impl Server {
         let p = self.panes.get(&pane).context("no such pane")?;
         let from = self.pane_account(pane).context("this pane was not started from the agent manager")?;
         anyhow::ensure!(from.agent == to.agent, "{} cannot continue on a {} account", from.agent, to.agent);
+        if from.name == to.name {
+            return Ok(());
+        }
         let kind = accounts::agent_kind(&to.agent).context("unknown agent")?;
         accounts::resumable_args(kind, &accounts::launch_args(kind, &p.spec.command))
             .context("a one-shot run (-p, exec) is not a conversation to continue")?;
@@ -457,12 +460,18 @@ impl Server {
                 if preferred.as_ref().is_some_and(|p| p.name == a.name) {
                     detail.push_str(" · picked here");
                 }
-                if current.as_ref().is_some_and(|c| c.name == a.name) {
-                    detail.push_str(" · current");
+                let is_current = current.as_ref().is_some_and(|c| c.name == a.name);
+                if is_current {
+                    detail = format!("current · {detail}");
                 }
                 let full = self.usage.peak(&a, now) >= self.accounts.threshold(&a) as f64;
                 let action = match switch_for {
-                    Some(pane) => PickAction::AgentSwitch { pane, agent: a.agent.clone(), account: a.name.clone() },
+                    Some(pane) => PickAction::AgentSwitch {
+                        pane,
+                        agent: a.agent.clone(),
+                        account: a.name.clone(),
+                        current: is_current,
+                    },
                     None => PickAction::AgentLaunch { agent: a.agent.clone(), account: a.name.clone() },
                 };
                 items.push(PickItem {
@@ -479,7 +488,7 @@ impl Server {
                     detail: "new subscription: a separate config dir and the agent's own login".into(),
                     action: PickAction::AgentAdd { agent: kind.name.to_string() },
                     state: None,
-                    dim: true,
+                    dim: false,
                 });
             }
         }

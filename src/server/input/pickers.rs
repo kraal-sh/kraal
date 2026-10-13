@@ -294,7 +294,7 @@ impl Server {
                     self.toast(id, format!("{e:#}"));
                 }
             }
-            PickAction::AgentSwitch { pane, agent, account } => {
+            PickAction::AgentSwitch { pane, agent, account, .. } => {
                 let result = self
                     .accounts
                     .get(&agent, &account)

@@ -249,6 +249,7 @@ pub enum PickAction {
         pane: PaneId,
         agent: String,
         account: String,
+        current: bool,
     },
     AgentAdd {
         agent: String,
@@ -351,10 +352,13 @@ impl Picker {
         p
     }
 
-    /// What can be done with the selected item: the key, and what it does. The first is Enter.
+    /// What can be done with the selected item: the key, and what it does. The first, if any, is Enter.
     pub fn action_keys(&self) -> &'static [(&'static str, &'static str)] {
-        match self.kind {
-            PickerKind::Ssh => &[
+        use PickAction as A;
+        use PickerKind as K;
+        let Some(item) = self.current() else { return &[] };
+        match (self.kind, &item.action) {
+            (K::Ssh, A::Ssh(_)) => &[
                 ("enter", "Connect"),
                 ("ctrl+t", "Connect in a new tab"),
                 ("ctrl+f", "Browse its files"),
@@ -363,25 +367,37 @@ impl Picker {
                 ("ctrl+e", "Edit saved servers"),
                 ("ctrl+x", "Remove saved server"),
             ],
-            PickerKind::Agent => &[
+            (K::Ssh, A::SshGroup(_)) => {
+                &[("enter", "Open group"), ("ctrl+r", "Run a command on it"), ("ctrl+e", "Edit saved servers")]
+            }
+            (K::Agent, A::AgentLaunch { .. }) => &[
                 ("enter", "Start"),
                 ("ctrl+t", "Start in a new tab"),
                 ("ctrl+l", "Log in to this account"),
                 ("ctrl+r", "Rename account"),
                 ("ctrl+x", "Remove account (its files are kept)"),
             ],
-            PickerKind::Workspace => &[("enter", "Open"), ("ctrl+x", "Close workspace")],
-            PickerKind::Runbook => &[("enter", "Run"), ("ctrl+e", "Edit")],
-            PickerKind::RunbookSteps => &[("enter", "Run step"), ("ctrl+y", "Copy step")],
-            PickerKind::Commands => &[("enter", "Run")],
-            PickerKind::Pane => &[("enter", "Go to pane")],
-            PickerKind::Tool => &[("enter", "Start tool")],
-            PickerKind::Buffers => &[
+            (_, A::AgentSwitch { current: true, .. }) => &[("enter", "Keep current account")],
+            (_, A::AgentSwitch { .. }) => &[("enter", "Switch account")],
+            (_, A::AgentAdd { .. }) => &[("enter", "Add account")],
+            (_, A::AgentWorktree { .. }) => &[("enter", "Name worktree")],
+            (K::Workspace, A::SwitchWorkspace(_)) => &[("enter", "Open"), ("ctrl+x", "Close workspace")],
+            (_, A::OpenDefinition(_)) => &[("enter", "Open workspace")],
+            (_, A::NewWorkspace) => &[("enter", "Create workspace")],
+            (K::Runbook, A::Runbook(_)) => &[("enter", "Run"), ("ctrl+e", "Edit")],
+            (K::RunbookSteps, A::RunBlock(_)) => &[("enter", "Run step"), ("ctrl+y", "Copy step")],
+            (_, A::RunbookList) => &[("enter", "Back to runbooks")],
+            (_, A::Command(_)) => &[("enter", "Run")],
+            (_, A::FocusPane(_) | A::RemoteAgent { .. }) => &[("enter", "Go to pane")],
+            (_, A::FilesSet { .. }) => &[("enter", "Open directory")],
+            (_, A::Tool { .. }) => &[("enter", "Start tool")],
+            (K::Buffers, A::Buffer(_)) => &[
                 ("enter", "Paste into the pane"),
                 ("ctrl+y", "Copy to the clipboard again"),
                 ("ctrl+o", "Show in a preview pane"),
                 ("ctrl+x", "Delete"),
             ],
+            (_, A::None) => &[],
             _ => &[("enter", "Choose")],
         }
     }
@@ -775,5 +791,92 @@ mod tests {
         p.refilter();
         assert_eq!(p.filtered.len(), 1);
         assert!(p.current().unwrap().label.contains("blog"));
+        assert_eq!(p.action_keys(), &[("enter", "Create workspace")]);
+    }
+
+    #[test]
+    fn picker_actions_follow_the_selected_line() {
+        let mut p = Picker::new(
+            PickerKind::Agent,
+            "Agents",
+            vec![
+                PickItem::new(
+                    "claude·work",
+                    "",
+                    PickAction::AgentLaunch { agent: "claude".into(), account: "work".into() },
+                ),
+                PickItem::new("+ add a claude account", "", PickAction::AgentAdd { agent: "claude".into() }),
+                PickItem::new("claude in a new worktree", "", PickAction::AgentWorktree { agent: "claude".into() }),
+            ],
+        );
+        assert_eq!(
+            p.action_keys().iter().map(|(key, _)| *key).collect::<Vec<_>>(),
+            ["enter", "ctrl+t", "ctrl+l", "ctrl+r", "ctrl+x"]
+        );
+        p.move_by(1);
+        assert_eq!(p.action_keys(), &[("enter", "Add account")]);
+        p.move_by(1);
+        assert_eq!(p.action_keys(), &[("enter", "Name worktree")]);
+        p.query = "claude·work".into();
+        p.refilter();
+        assert_eq!(p.action_keys().len(), 5);
+
+        for (current, what) in [(false, "Switch account"), (true, "Keep current account")] {
+            let p = Picker::new(
+                PickerKind::Agent,
+                "Change account",
+                vec![PickItem::new(
+                    "codex·work",
+                    "",
+                    PickAction::AgentSwitch { pane: 1, agent: "codex".into(), account: "work".into(), current },
+                )],
+            );
+            assert_eq!(p.action_keys(), &[("enter", what)]);
+        }
+    }
+
+    #[test]
+    fn picker_actions_require_the_line_their_handlers_use() {
+        let cases = [
+            (
+                PickerKind::Ssh,
+                PickAction::SshGroup("web".into()),
+                &[("enter", "Open group"), ("ctrl+r", "Run a command on it"), ("ctrl+e", "Edit saved servers")][..],
+            ),
+            (
+                PickerKind::Workspace,
+                PickAction::SwitchWorkspace(1),
+                &[("enter", "Open"), ("ctrl+x", "Close workspace")],
+            ),
+            (PickerKind::Workspace, PickAction::OpenDefinition("w.kdl".into()), &[("enter", "Open workspace")]),
+            (PickerKind::RunbookSteps, PickAction::RunBlock(0), &[("enter", "Run step"), ("ctrl+y", "Copy step")]),
+            (PickerKind::RunbookSteps, PickAction::RunbookList, &[("enter", "Back to runbooks")]),
+            (
+                PickerKind::Pane,
+                PickAction::FilesSet { pane: 1, side: crate::files::Side::Left, target: "~".into() },
+                &[("enter", "Open directory")],
+            ),
+            (PickerKind::Pane, PickAction::Worktree { pane: 1, op: "review".into() }, &[("enter", "Choose")]),
+            (PickerKind::Workspace, PickAction::None, &[]),
+        ];
+        for (kind, action, expected) in cases {
+            let p = Picker::new(kind, "List", vec![PickItem::new("item", "", action)]);
+            assert_eq!(p.action_keys(), expected);
+        }
+        let p = Picker::new(PickerKind::Ssh, "Servers", vec![PickItem::new("web", "", PickAction::Ssh("web".into()))]);
+        assert_eq!(
+            p.action_keys().iter().map(|(key, _)| *key).collect::<Vec<_>>(),
+            ["enter", "ctrl+t", "ctrl+f", "ctrl+r", "ctrl+o", "ctrl+e", "ctrl+x"]
+        );
+    }
+
+    #[test]
+    fn a_picker_without_a_selected_line_offers_no_actions() {
+        let mut p = Picker::new(PickerKind::Agent, "Agents", vec![]);
+        assert!(p.action_keys().is_empty());
+        p.items.push(PickItem::new("claude", "", PickAction::AgentAdd { agent: "claude".into() }));
+        p.query = "no match".into();
+        p.refilter();
+        assert!(p.action_keys().is_empty());
     }
 }

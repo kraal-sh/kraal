@@ -54,7 +54,8 @@ with another user or port is another address, and gets an entry of its own.
 `ctrl+b s` opens the same list: Enter connects (or opens a whole group); Tab shows the other
 actions, each also on its own key: connect in a new tab (`ctrl+t`), browse its files (`ctrl+f`),
 run a command on it (`ctrl+r`), forward one of its ports (`ctrl+o`), edit the list (`ctrl+e`),
-remove a saved server (`ctrl+x`).
+remove a saved server (`ctrl+x`). On a group, Tab offers only opening the group, running a
+command on it and editing the saved servers; the footer says that Enter opens the group.
 
 kraal's own connections to a server (a pane opened from the picker or `kraal ssh`, a transfer, a
 tool, the file manager) share one SSH connection, so the second one starts at once and asks for

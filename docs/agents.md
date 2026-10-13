@@ -215,7 +215,9 @@ can continue on another account; Codex accounts share nothing, as Codex keeps da
 An agent kraal starts on an account gets `$KRAAL_ACCOUNT` (`claude:pro`), and not the API keys of
 your environment (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`…), which would bill another account.
 
-The agent picker (`ctrl+b a`) lists every account, and offers to add one; Tab on an account shows
+The agent picker (`ctrl+b a`) lists every account, and offers to add one. The `+ add a claude
+account` and `+ add a codex account` lines use the normal active style; Enter asks for the new
+account's name. Tab on an account shows
 what can be done with it, each also on its own key: start it in a new tab (`ctrl+t`), log in again
 (`ctrl+l`), rename it (`ctrl+r`) or remove it (`ctrl+x`). Renaming changes the rules that name the
 account and keeps its usage; its directory stays where it is, and agents running on it go on,
@@ -225,7 +227,10 @@ old or the new name stays theirs: the renamed account gets a rule of its own jus
 sidebar lists every account at the bottom
 (`claude·pro 42%`): the higher of its 5-hour and weekly usage, in yellow from 70% and in red at
 its threshold, or `not used yet`. `ctrl+b A c` moves the focused pane's agent to another account
-of the same agent.
+of the same agent. In that picker, Enter switches to the selected account; launch, login,
+rename and remove actions are not offered. The pane's account is marked `current`: selecting
+it closes the picker and leaves the agent running as it is, without restarting it. An exited
+pane stays exited too.
 
 **Usage.** Claude Code passes the 5-hour and weekly usage to its status line;
 `kraal integration install claude` puts a small status line in front of yours that records it,
