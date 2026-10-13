@@ -393,9 +393,20 @@ pub fn kill_server(socket: &Path) -> Result<Saved> {
 /// the session. Whether the layout was saved, as for `kraal kill`; a server of this protocol
 /// that cannot save it first refuses, and keeps running.
 pub fn restart_server(session: &str) -> Result<Saved> {
+    // Until the next server has the session: `kraal forget` does nothing in between.
+    let _kept = keep_from_restart(session)?;
     let saved = stop_server(&paths::socket_path(session), true)?;
     ensure_server(session)?;
     Ok(saved)
+}
+
+/// Keep `session` from being restarted by another kraal, for a restart of one's own or for
+/// `kraal forget` ([`paths::Restarting`]).
+pub fn keep_from_restart(session: &str) -> Result<paths::Restarting> {
+    match paths::Restarting::keep(session).context("locking the session")? {
+        Some(kept) => Ok(kept),
+        None => bail!("another kraal is restarting session {session}: try again"),
+    }
 }
 
 /// What the server behind `socket` is, given up on quickly when it does not answer.

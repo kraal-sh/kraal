@@ -1720,6 +1720,55 @@ fn a_runtime_directory_kraal_cannot_use_is_said() {
     assert!(kraal(&["kill"]).status.success());
 }
 
+/// A session is not forgotten while it is restarted: in the moment between its server and the
+/// next, when nobody holds it, `kraal forget` is refused, and the session comes back with what
+/// it saved. One restart at a time.
+#[test]
+fn a_session_is_not_forgotten_while_it_restarts() {
+    use std::os::fd::AsRawFd;
+    let env = Env::new("restartgap");
+    env.workspace("w", "layout {\n    pane name=\"one\"\n}\n");
+    env.run(&["open", "w"]);
+    env.run(&["run", "--name", "kept", "--", "sh"]);
+    wait_until(PATIENCE, "the layout was never saved", || env.state_file().exists());
+    // As a restart keeps it: `forget` deletes nothing, another restart stops nothing.
+    let kept = std::fs::File::create(env.root.join("state/kraal/restartgap.restart")).unwrap();
+    // SAFETY: plain syscall on a file this test holds open.
+    assert_eq!(unsafe { libc::flock(kept.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) }, 0);
+    let pid = env.server_pid();
+    let restart = bounded(&env, false, &["restart", "--yes"]);
+    let said = String::from_utf8_lossy(&restart.stderr);
+    assert!(!restart.status.success() && said.contains("another kraal is restarting session restartgap"), "{said}");
+    assert_eq!(env.server_pid(), pid, "the session was stopped");
+    env.run(&["kill"]);
+    let forget = bounded(&env, false, &["forget"]);
+    let said = String::from_utf8_lossy(&forget.stderr);
+    assert!(!forget.status.success() && said.contains("another kraal is restarting session restartgap"), "{said}");
+    assert!(env.state_file().exists(), "forgotten all the same");
+    drop(kept);
+    env.run(&["open", "w"]);
+    // Restarted again and again while `forget` keeps coming: it comes back whole each time.
+    let done = std::sync::atomic::AtomicBool::new(false);
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            while !done.load(std::sync::atomic::Ordering::SeqCst) {
+                let forget = env.try_run(&["forget"]);
+                assert!(!forget.status.success(), "a running session was forgotten");
+            }
+        });
+        for round in 0..8 {
+            let restarted = bounded(&env, false, &["restart", "--yes"]);
+            let panes = String::from_utf8_lossy(&env.try_run(&["panes"]).stdout).into_owned();
+            let whole = restarted.status.success() && panes.contains("one") && panes.contains("kept");
+            // Whatever is found, `forget` stops coming before this test ends.
+            done.store(round == 7 || !whole, std::sync::atomic::Ordering::SeqCst);
+            assert!(whole, "round {round}: {}\n{panes}", String::from_utf8_lossy(&restarted.stderr));
+        }
+    });
+    assert!(lock_file(&env, "state").exists(), "its server holds it");
+    assert!(!env.root.join("state/kraal/restartgap.restart").exists(), "what kept it for its restart was left");
+}
+
 /// A start that finds the session held by a kraal that does not listen yet (the one that won
 /// when two starts came at the same moment, a kraal 0.3.0 that holds only its runtime
 /// directory's lock) waits for it, and has a server once that one listens or is gone: it never

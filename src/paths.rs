@@ -529,6 +529,36 @@ pub struct Holder {
     pub runtime: PathBuf,
 }
 
+/// A session kept while it is restarted, from before its server stops until the next one has
+/// it: nobody holds the session in between ([`SessionLock`] is its server's), and a
+/// `kraal forget` that came then would delete what the next server is about to restore.
+/// `forget` takes this too, for the moment it takes, and so does nothing during a restart.
+/// Kraal 0.3.0 and older do not take it.
+pub struct Restarting {
+    _lock: LockFile,
+}
+
+impl Restarting {
+    /// Keep `session` for a restart, or for the time `kraal forget` takes. Another `forget` has
+    /// it for a moment, and is waited for; `None` when a restart, which has it for as long as
+    /// it takes, still does after two seconds.
+    pub fn keep(session: &str) -> std::io::Result<Option<Restarting>> {
+        let state = state_dir();
+        ensure_private_dir(&state)?;
+        let path = state.join(format!("{session}.restart"));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            if let Some(lock) = LockFile::acquire(path.clone(), false, try_lock)? {
+                return Ok(Some(Restarting { _lock: lock }));
+            }
+            if std::time::Instant::now() >= deadline {
+                return Ok(None);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+}
+
 /// What the holder of `session` says of itself, if it says so in a file of ours. What a holder
 /// killed before said is there until the next one says its own.
 pub fn holder(session: &str) -> Option<Holder> {

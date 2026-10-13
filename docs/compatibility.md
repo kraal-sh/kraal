@@ -51,6 +51,9 @@ Kraal 0.3.0 holds a session in its runtime directory only, and 0.2.0 not at all:
 - **Another runtime directory.** Only two kraal that both hold the session where it is saved keep
   each other out. A 0.3.0 or 0.2.0 started with another `$XDG_RUNTIME_DIR` than the session's
   server starts a second server on its files, as it always did.
+- **A restart.** `kraal restart` keeps the session from `kraal forget` for the moment it has no
+  server. A `forget` of 0.3.0 or older does not know that: run at that very moment, it still
+  deletes what the session saved.
 
 ## For contributors: how the protocol changes
 
