@@ -199,7 +199,7 @@ kraal accounts add claude pro
 |---|---|
 | `kraal accounts add codex work` | the same for Codex, with `codex login` |
 | `kraal accounts add claude team --home ~/claude-team --no-login --threshold 80` | in a directory you choose (`~/.local/share/kraal/accounts/claude-team` otherwise), without logging in now, with a threshold of its own |
-| `kraal accounts` | every account: logged in or not, 5-hour and weekly usage (`kraal accounts list --json` for scripts) |
+| `kraal accounts` | every account: sign-in status, 5-hour and weekly usage (`kraal accounts list --json` for scripts) |
 | `kraal accounts login claude:pro` | logs an account in again |
 | `kraal accounts rename claude:pro work` | renames it: rules and usage follow, the directory stays |
 | `kraal accounts rm claude:work` | forgets it; its directory is kept |
@@ -232,6 +232,30 @@ rename and remove actions are not offered. The pane's account is marked `current
 it closes the picker and leaves the agent running as it is, without restarting it. An exited
 pane stays exited too.
 
+Sign-in from the picker opens a dedicated login pane. Opening the same account's login again
+in that session focuses the existing pane, including through another account name for the same
+directory. After the login exits successfully, kraal checks with `claude auth status` or
+`codex login status`, in that account's environment. A confirmed sign-in closes the pane and
+says that the account is signed in. A failed or cancelled sign-in stays open: Enter closes it,
+and `r` is the separate **Try again** action. While a check runs, Enter also closes the pane;
+its late result is ignored. `c`, **Check again**, retries an unsuccessful check without running
+the login again. A check waits at most ten seconds and discards the agent's output.
+
+A lock in the account directory also prevents another kraal session or `kraal accounts login`
+from starting the same login while it is running or being checked.
+
+The account entry is kept in `accounts.toml` if sign-in fails, is cancelled, or cannot be
+verified. Until verification succeeds it shows **sign-in required** in the picker and sidebar,
+even if it has usage from before. Login panes and their scrollback are never saved, including
+when saving a workspace layout. Their output, titles, terminal notifications and clipboard
+requests are not copied into kraal's messages, notifications or logs.
+
+`kraal accounts` uses the same check: **signed in**, **sign-in required**, **not installed**,
+or **could not check sign-in**. A timeout or unexpected failure is **could not check sign-in**,
+not a missing agent. JSON keeps `logged_in` (`true`, `false`, or `null`) and adds `status`:
+`signed_in`, `not_signed_in`, `not_installed`, or `could_not_check`.
+The command-line add and login commands also verify sign-in after the login succeeds.
+
 **Usage.** Claude Code passes the 5-hour and weekly usage to its status line;
 `kraal integration install claude` puts a small status line in front of yours that records it,
 then runs yours unchanged. Codex accounts are asked through Codex's own app-server every few
@@ -252,9 +276,10 @@ accounts = ["pro", "default"]   # in order of preference
 ```
 
 The file also holds the accounts themselves, one `[[account]]` each (`name`, `agent`, `home`,
-and a `threshold` of its own if it has one), which `kraal accounts add` writes. kraal edits what
-it changes there and leaves the rest as you wrote it, including comments, order and unknown
-keys. A new file includes an explanatory header and omits empty rules and an empty `[claude]`
+and a `threshold` of its own if it has one), which `kraal accounts add` writes. A login that has
+not been verified also has `sign_in_required = true`; successful verification removes that flag.
+kraal edits what it changes there and leaves the rest as you wrote it, including comments, order
+and unknown keys. A new file includes an explanatory header and omits empty rules and an empty `[claude]`
 table. When kraal next rewrites an older file, it removes an empty top-level `rule = []` and an
 empty `[claude]` table, keeping their comments. A `[claude]` table with a saved `statusline`
 command or other settings stays, as do existing rules. A file that cannot be parsed is left

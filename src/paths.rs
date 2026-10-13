@@ -427,7 +427,7 @@ pub fn locked_within<T>(path: &Path, limit: std::time::Duration, f: impl FnOnce(
 
 /// Lock `file` for this process alone, without waiting: false when another holds it. The lock
 /// goes when the file is closed, by this process or as it ends, however it ends.
-fn try_lock(file: &std::fs::File) -> std::io::Result<bool> {
+pub(crate) fn try_lock(file: &std::fs::File) -> std::io::Result<bool> {
     use std::os::fd::AsRawFd;
     loop {
         // SAFETY: flock on a descriptor we own.

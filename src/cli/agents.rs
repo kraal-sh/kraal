@@ -5,7 +5,7 @@ use anyhow::{Context, Result, bail};
 use super::Session;
 use super::args::{AccountsCmd, WtCmd};
 use crate::protocol::{PaneInfo, Placement, Request, Response};
-use crate::{accounts, codex_usage, git, integration, paths, server, worktree_setup};
+use crate::{account_status, accounts, codex_usage, git, integration, paths, server, worktree_setup};
 
 pub(super) fn accounts(action: AccountsCmd) -> Result<()> {
     let all = accounts::Accounts::load()?;
@@ -15,9 +15,9 @@ pub(super) fn accounts(action: AccountsCmd) -> Result<()> {
             let now = accounts::now();
             let usage = accounts::UsageMap::load(&list);
             // Ask every agent in parallel whether its account is logged in.
-            let status: Vec<Option<bool>> = std::thread::scope(|s| {
-                let handles: Vec<_> = list.iter().map(|a| s.spawn(move || logged_in(a))).collect();
-                handles.into_iter().map(|h| h.join().ok().flatten()).collect()
+            let status: Vec<account_status::Status> = std::thread::scope(|s| {
+                let handles: Vec<_> = list.iter().map(|a| s.spawn(move || account_status::check(a))).collect();
+                handles.into_iter().map(|h| h.join().unwrap_or(account_status::Status::CouldNotCheck)).collect()
             });
             if json {
                 let v: Vec<serde_json::Value> = list
@@ -25,7 +25,7 @@ pub(super) fn accounts(action: AccountsCmd) -> Result<()> {
                     .zip(&status)
                     .map(|(a, st)| {
                         serde_json::json!({
-                            "agent": a.agent, "name": a.name, "home": a.home, "logged_in": st,
+                            "agent": a.agent, "name": a.name, "home": a.home, "logged_in": st.logged_in(), "status": st,
                             "threshold": all.threshold(a), "usage": usage.get(a),
                         })
                     })
@@ -34,11 +34,7 @@ pub(super) fn accounts(action: AccountsCmd) -> Result<()> {
                 return Ok(());
             }
             for (a, st) in list.iter().zip(&status) {
-                let login = match st {
-                    Some(true) => "logged in",
-                    Some(false) => "not logged in",
-                    None => "agent not found",
-                };
+                let login = st.label();
                 let u = usage.get(a).map(|u| server::usage_text(u, now)).unwrap_or_else(|| "no usage seen yet".into());
                 println!(
                     "{:<18} {:<14} {:<34} {u}",
@@ -52,7 +48,14 @@ pub(super) fn accounts(action: AccountsCmd) -> Result<()> {
         }
         AccountsCmd::Add { agent, name, home, threshold, no_login } => {
             let home = home.unwrap_or_else(|| accounts::default_home_for(&agent, &name).display().to_string());
-            let a = accounts::Account { name, agent, home: accounts::absolute_home(&home)?, threshold, note: None };
+            let a = accounts::Account {
+                name,
+                agent,
+                home: accounts::absolute_home(&home)?,
+                threshold,
+                note: None,
+                sign_in_required: !no_login,
+            };
             let notes = accounts::Accounts::update(|all| {
                 all.add(a.clone())?;
                 accounts::prepare_home(&a)
@@ -159,10 +162,24 @@ fn find_account(all: &accounts::Accounts, spec: &str) -> Result<accounts::Accoun
 
 /// The agent's own login for account `a`, in this terminal; a failed login is an error.
 fn login(a: &accounts::Account) -> Result<()> {
+    let _lock = accounts::lock_login(a)?;
+    accounts::Accounts::update(|all| {
+        all.set_sign_in_required(a, true);
+        Ok(())
+    })?;
     let status = run_with(&accounts::login(a)?, false)?;
     if !status.success() {
         bail!("{}'s login did not succeed ({status})", accounts::label(a));
     }
+    let checked = account_status::check(a);
+    if checked != account_status::Status::SignedIn {
+        bail!("{}: {}", accounts::label(a), checked.label());
+    }
+    accounts::Accounts::update(|all| {
+        all.set_sign_in_required(a, false);
+        Ok(())
+    })?;
+    println!("{} is signed in", accounts::label(a));
     Ok(())
 }
 
@@ -182,35 +199,6 @@ fn run_with(l: &accounts::Launch, exec: bool) -> Result<std::process::ExitStatus
         return Err(err).with_context(|| format!("running {}", l.argv[0]));
     }
     cmd.status().with_context(|| format!("running {}", l.argv[0]))
-}
-
-/// Logged in? Asks the agent itself (`claude auth status`, `codex login status`).
-fn logged_in(a: &accounts::Account) -> Option<bool> {
-    let l = accounts::login_status(a).ok()?;
-    let mut cmd = std::process::Command::new(&l.argv[0]);
-    cmd.args(&l.argv[1..])
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
-    for k in &l.env_remove {
-        cmd.env_remove(k);
-    }
-    for (k, v) in &l.env {
-        cmd.env(k, v);
-    }
-    let mut child = cmd.spawn().ok()?;
-    let start = std::time::Instant::now();
-    loop {
-        if let Ok(Some(status)) = child.try_wait() {
-            return Some(status.success());
-        }
-        if start.elapsed() > std::time::Duration::from_secs(10) {
-            let _ = child.kill();
-            let _ = child.wait();
-            return None;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(30));
-    }
 }
 
 /// `kraal agent`: a new agent pane in the session, or the agent here.

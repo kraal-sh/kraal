@@ -1330,7 +1330,17 @@ impl Server {
                     pane.show_images(content, buf, images);
                 }
             }
-            if let Some(code) = pane.exit_code {
+            if let Some(login) = &pane.spec.login
+                && pane.exit_code.is_some()
+            {
+                let style = Style::default().fg(Color::Black).bg(Color::Yellow);
+                for (row, message) in [login.state.message(), login.state.actions()].into_iter().enumerate() {
+                    let y = inner.y + inner.height.saturating_sub(2) + row as u16;
+                    if y < inner.bottom() {
+                        buf.set_stringn(inner.x, y, format!(" {message} "), inner.width as usize, style);
+                    }
+                }
+            } else if let Some(code) = pane.exit_code {
                 let msg = match code {
                     _ if pane.suspended => " not started · enter run · x close ".to_string(),
                     Some(c) => format!(" exited ({c}) · enter restart · x close "),
@@ -1724,8 +1734,16 @@ fn account_lines(
     accounts
         .all()
         .into_iter()
-        .map(|a| {
+        .flat_map(|a| {
             let name = Span::styled(format!("   {} ", crate::accounts::label(&a)), Style::default().fg(Color::Gray));
+            if a.sign_in_required {
+                let status = Span::styled("sign-in required", Style::default().fg(t.blocked));
+                return if name.content.width() + status.content.width() <= width {
+                    vec![Line::from(vec![name, status])]
+                } else {
+                    vec![Line::from(name), Line::from(vec![Span::raw("   "), status])]
+                };
+            }
             let used = match usage.get(&a) {
                 Some(u) => {
                     let peak = u.peak(now);
@@ -1743,7 +1761,7 @@ fn account_lines(
                     dim_span(if name.content.width() + unused.len() <= width { unused } else { "-" })
                 }
             };
-            Line::from(vec![name, used])
+            vec![Line::from(vec![name, used])]
         })
         .collect()
 }
@@ -1806,7 +1824,14 @@ mod tests {
         assert_eq!(account_lines(&accounts, &usage, 40, 1_000).len(), 2, "one used: both agents' are listed");
         let home = "/tmp/kraal-test-patron".to_string();
         accounts
-            .add(Account { name: "patron.bzh".into(), agent: "claude".into(), home, threshold: None, note: None })
+            .add(Account {
+                name: "patron.bzh".into(),
+                agent: "claude".into(),
+                home,
+                threshold: None,
+                note: None,
+                sign_in_required: false,
+            })
             .unwrap();
         assert_eq!(account_lines(&accounts, &UsageMap::default(), 40, 1_000).len(), 3, "one listed: all are");
         let rows = |width| -> Vec<String> {
@@ -1818,5 +1843,37 @@ mod tests {
             rows(40),
             ["   claude·default 42%", "   claude·patron.bzh not used yet", "   codex·default not used yet"]
         );
+    }
+
+    #[test]
+    fn sign_in_required_stays_visible_in_a_narrow_sidebar_even_with_old_usage() {
+        use crate::accounts::{Account, Accounts, Usage, UsageMap, Window};
+        let mut accounts = Accounts::empty();
+        accounts
+            .add(Account {
+                name: "work".into(),
+                agent: "claude".into(),
+                home: "/tmp/kraal-required".into(),
+                note: None,
+                threshold: None,
+                sign_in_required: true,
+            })
+            .unwrap();
+        let mut usage = UsageMap::default();
+        usage.0.insert(
+            "claude:work".into(),
+            Usage {
+                five_hour: Some(Window { used_percent: 42.0, resets_at: None }),
+                observed_at: 1_000,
+                ..Default::default()
+            },
+        );
+        for width in [26, 40] {
+            let lines = account_lines(&accounts, &usage, width, 1_000);
+            let text = lines.iter().map(|line| line.to_string()).collect::<Vec<_>>().join("\n");
+            assert!(text.contains("sign-in required"), "{text}");
+            assert!(!text.contains("42%"), "{text}");
+            assert!(lines.iter().all(|line| line.width() <= width), "{text}");
+        }
     }
 }

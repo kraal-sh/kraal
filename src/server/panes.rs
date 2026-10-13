@@ -59,6 +59,11 @@ impl Server {
             // still gets its pane, so the layout stays whole and Enter can retry once the
             // problem is fixed.
             Err(e) if !spec.command.is_empty() || spec.startup_input.is_some() => {
+                if let Some(login) = &mut spec.login {
+                    login.state = super::agents::login_start_failed(&spec.command);
+                    login.lock = None;
+                    return self.spawn_pane_suspended(name, spec, "sign-in could not start");
+                }
                 let reason = format!("{e:#}");
                 let reason = reason.lines().next().unwrap_or("cannot start").to_string();
                 return self.spawn_pane_suspended(name, spec, &format!("cannot start: {reason}"));
@@ -125,6 +130,13 @@ impl Server {
     pub(super) fn pane_failed(&mut self, id: PaneId, process: &ProcessHold, why: &str) {
         let Some(pane) = self.panes.get_mut(&id) else { return };
         if !pane.process_hold().is_some_and(|p| p.is(process)) {
+            return;
+        }
+        if let Some(login) = &mut pane.spec.login {
+            login.state = super::agents::login_start_failed(&pane.spec.command);
+            login.lock = None;
+            pane.exit_code = Some(None);
+            self.mark_dirty();
             return;
         }
         let reason = format!("cannot start: {}", why.lines().next().unwrap_or("cannot start"));
@@ -263,6 +275,10 @@ impl Server {
         let Some(pane) = self.panes.get_mut(&id) else { return };
         if pid.is_some() && pane.pid() != pid {
             return; // an earlier process of a respawned pane
+        }
+        if pane.spec.login.is_some() {
+            self.login_exited(id, code);
+            return;
         }
         if self.switches.contains_key(&id) {
             // Ended first: if the switch cannot go on, Enter starts it again on its account.

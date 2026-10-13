@@ -6931,6 +6931,303 @@ fn an_account_switch_never_resends_a_prompt_by_itself_and_one_that_fails_can_be_
     std::fs::set_permissions(beta.join("projects"), std::fs::Permissions::from_mode(0o755)).unwrap();
 }
 
+/// Native login and status commands controlled by files in the isolated account home.
+fn login_agent(env: &Env, agent: &str) -> (PathBuf, String) {
+    let bin = env.root.join("bin");
+    let home = env.root.join("account");
+    std::fs::create_dir_all(&bin).unwrap();
+    std::fs::create_dir_all(&home).unwrap();
+    write_script(
+        &bin.join(agent),
+        r#"#!/bin/sh
+home="${CLAUDE_CONFIG_DIR:-${CODEX_HOME:-}}"
+case "$*" in
+    'auth status'|'login status')
+        test -d "$home" || exit 1
+        code=$(cat "$home/status" 2>/dev/null) || code=1
+        echo check >> "$home/checks"
+        while test -f "$home/hold-check"; do sleep 0.05; done
+        echo checked >> "$home/checks"
+        printf 'PRIVATE-LOGIN-OUTPUT\n' >&2
+        exit "$code"
+        ;;
+    'auth login'|'login')
+        echo login >> "$home/logins"
+        printf 'PRIVATE-LOGIN-OUTPUT\n\033]0;PRIVATE-LOGIN-OUTPUT\007\033]777;notify;PRIVATE-LOGIN-OUTPUT;secret\007'
+        while test ! -f "$home/finish-login"; do sleep 0.05; done
+        exit "$(cat "$home/finish-login")"
+        ;;
+    *) exit 1 ;;
+esac
+"#,
+    );
+    std::fs::write(
+        env.root.join("config/kraal/accounts.toml"),
+        format!("[[account]]\nname = \"work\"\nagent = {agent:?}\nhome = {:?}\n", home.to_str().unwrap()),
+    )
+    .unwrap();
+    let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap_or_default());
+    env.workspace("w", "layout { pane name=\"shell\" }\n");
+    let out = env.cmd(&["open", "w"]).env("PATH", &path).output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    (home, path)
+}
+
+fn open_account_login(client: &mut RawClient) {
+    client.send(b"\x02a");
+    client.wait_for_row("Start an agent");
+    client.send(b"work");
+    client.wait_for_row("work");
+    client.send(b"\x0c");
+    client.wait_for_row("login ");
+}
+
+fn login_panes(env: &Env) -> Vec<serde_json::Value> {
+    let panes: Vec<serde_json::Value> = serde_json::from_str(&env.run(&["panes", "--json"])).unwrap();
+    panes.into_iter().filter(|p| p["name"].as_str().is_some_and(|s| s.starts_with("login "))).collect()
+}
+
+#[test]
+fn login_panes_verify_success_once_and_never_save_the_terminal() {
+    for agent in ["claude", "codex"] {
+        let env = Env::new(&format!("login-{agent}"));
+        let (home, path) = login_agent(&env, agent);
+        let mut client = RawClient::attach_sized(&env, Some("w"), (124, 36));
+        open_account_login(&mut client);
+        client.wait_for_row("PRIVATE-LOGIN-OUTPUT");
+        let first = login_panes(&env);
+        assert_eq!(first.len(), 1);
+        let mut second = RawClient::attach_sized(&env, Some("w"), (80, 24));
+        open_account_login(&mut second);
+        assert_eq!(login_panes(&env)[0]["id"], first[0]["id"], "another client must reuse the login");
+        assert_eq!(std::fs::read_to_string(home.join("logins")).unwrap(), "login\n");
+        env.run(&["save", "saved", "--workspace", "w"]);
+        let layout = std::fs::read_to_string(env.root.join("config/kraal/workspaces/saved.kdl")).unwrap();
+        // The shell's cwd contains "login" too: check the pane name and command instead.
+        assert!(!layout.contains("name=\"login "), "{layout}");
+        assert!(!layout.contains("command="), "{layout}");
+        assert!(!layout.contains("PRIVATE-LOGIN-OUTPUT"), "{layout}");
+        std::fs::write(home.join("hold-check"), "").unwrap();
+        std::fs::write(home.join("status"), "0").unwrap();
+        std::fs::write(home.join("finish-login"), "0").unwrap();
+        second.wait_for_row("checking sign-in");
+        assert_eq!(login_panes(&env).len(), 1, "exit zero alone must not close the pane");
+        let duplicate = env.cmd(&["accounts", "login", &format!("{agent}:work")]).env("PATH", &path).output().unwrap();
+        assert!(!duplicate.status.success());
+        assert!(String::from_utf8_lossy(&duplicate.stderr).contains("sign-in already running"));
+        assert_eq!(std::fs::read_to_string(home.join("logins")).unwrap(), "login\n");
+        std::fs::remove_file(home.join("hold-check")).unwrap();
+        second.wait_for_row(&format!("{agent}·work is signed in"));
+        common::wait_until(PATIENCE, "verified login closes", || login_panes(&env).is_empty());
+        second.send(b"\r");
+        assert_eq!(std::fs::read_to_string(home.join("logins")).unwrap(), "login\n");
+        assert!(
+            !std::fs::read_to_string(env.root.join("config/kraal/accounts.toml")).unwrap().contains("sign_in_required")
+        );
+
+        // A live login must also be excluded when the server saves on exit.
+        std::fs::remove_file(home.join("finish-login")).unwrap();
+        open_account_login(&mut second);
+        second.wait_for_row("PRIVATE-LOGIN-OUTPUT");
+        second.send(b"\x02Vf\x02Vj");
+        let messages = second.wait_for_row("Messages").join("\n");
+        assert!(!messages.contains("PRIVATE-LOGIN-OUTPUT"), "{messages}");
+        env.run(&["kill"]);
+        fn private_files(dir: &Path) {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    private_files(&path);
+                } else {
+                    let text = String::from_utf8_lossy(&std::fs::read(&path).unwrap()).into_owned();
+                    assert!(!text.contains("PRIVATE-LOGIN-OUTPUT"), "{}: {text}", path.display());
+                    if path.extension().is_some_and(|e| e == "json") {
+                        assert!(!text.contains("login "), "{}: {text}", path.display());
+                    }
+                }
+            }
+        }
+        private_files(&env.root.join("state"));
+    }
+}
+
+#[test]
+fn failed_and_cancelled_logins_close_on_enter_and_retry_only_when_asked() {
+    let env = Env::new("login-failed");
+    let (home, path) = login_agent(&env, "claude");
+    let mut client = RawClient::attach_sized(&env, Some("w"), (80, 24));
+    std::fs::write(home.join("finish-login"), "1").unwrap();
+    open_account_login(&mut client);
+    client.wait_for_row("sign-in failed");
+    client.wait_for_row("enter close · r try again");
+    assert!(!home.join("checks").exists(), "failure does not run a status check");
+    client.send(b"\r");
+    common::wait_until(PATIENCE, "Enter closes failed login", || login_panes(&env).is_empty());
+    assert_eq!(std::fs::read_to_string(home.join("logins")).unwrap(), "login\n");
+    let out = env.cmd(&["accounts"]).env("PATH", &path).output().unwrap();
+    assert!(out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .any(|l| l.contains("claude·work") && l.contains("sign-in required"))
+    );
+    client.resize((124, 36));
+    client.wait_for_row("sign-in required");
+    client.send(b"\x02a");
+    client.wait_for_rows("required in the account picker", |rows| {
+        rows.iter().any(|r| r.contains("claude·work") && r.contains("sign-in required"))
+    });
+    client.send(b"\x1b");
+
+    std::fs::remove_file(home.join("finish-login")).unwrap();
+    open_account_login(&mut client);
+    client.wait_for_row("PRIVATE-LOGIN-OUTPUT");
+    client.send(b"\x03");
+    client.wait_for_row("sign-in cancelled");
+    common::wait_until(PATIENCE, "cancelled program exits", || !login_panes(&env)[0]["exit_code"].is_null());
+    client.send(b"r");
+    common::wait_until(PATIENCE, "explicit retry starts once", || {
+        std::fs::read_to_string(home.join("logins")).unwrap().lines().count() == 3
+    });
+    std::fs::write(home.join("finish-login"), "130").unwrap();
+    client.wait_for_row("sign-in cancelled");
+    client.send(b"\r");
+    common::wait_until(PATIENCE, "Enter closes cancelled login", || login_panes(&env).is_empty());
+    assert!(
+        std::fs::read_to_string(env.root.join("config/kraal/accounts.toml"))
+            .unwrap()
+            .contains("sign_in_required = true")
+    );
+}
+
+#[test]
+fn an_unverified_login_can_check_again_without_another_login() {
+    let env = Env::new("login-check");
+    let (home, _) = login_agent(&env, "codex");
+    let mut client = RawClient::attach_sized(&env, Some("w"), (80, 24));
+    std::fs::write(home.join("finish-login"), "0").unwrap();
+    std::fs::write(home.join("status"), "1").unwrap();
+    open_account_login(&mut client);
+    client.wait_for_row("sign-in required");
+    client.wait_for_row("c check again");
+    std::fs::write(home.join("status"), "2").unwrap();
+    client.send(b"c");
+    client.wait_for_row("could not check sign-in");
+    std::fs::write(home.join("status"), "0").unwrap();
+    client.send(b"c");
+    client.wait_for_row("codex·work is signed in");
+    assert_eq!(std::fs::read_to_string(home.join("logins")).unwrap(), "login\n");
+    common::wait_until(PATIENCE, "verified retry closes", || login_panes(&env).is_empty());
+}
+
+#[test]
+fn a_verified_login_that_cannot_save_can_finish_without_logging_in_again() {
+    let env = Env::new("login-save");
+    let (home, _) = login_agent(&env, "claude");
+    let mut client = RawClient::attach(&env, "w");
+    std::fs::write(home.join("finish-login"), "0").unwrap();
+    std::fs::write(home.join("status"), "0").unwrap();
+    std::fs::write(home.join("hold-check"), "").unwrap();
+    open_account_login(&mut client);
+    client.wait_for_row("checking sign-in");
+    let file = env.root.join("config/kraal/accounts.toml");
+    let backup = file.with_extension("kept");
+    std::fs::rename(&file, &backup).unwrap();
+    std::fs::create_dir(&file).unwrap();
+    std::fs::remove_file(home.join("hold-check")).unwrap();
+    client.wait_for_row("signed in, could not save account");
+    assert_eq!(login_panes(&env).len(), 1);
+    assert!(std::fs::read_to_string(&backup).unwrap().contains("sign_in_required = true"));
+    std::fs::remove_dir(&file).unwrap();
+    std::fs::rename(&backup, &file).unwrap();
+    client.send(b"c");
+    client.wait_for_row("claude·work is signed in");
+    assert_eq!(std::fs::read_to_string(home.join("logins")).unwrap(), "login\n");
+    assert!(!std::fs::read_to_string(file).unwrap().contains("sign_in_required"));
+}
+
+#[test]
+fn closing_a_check_ignores_its_late_success() {
+    let env = Env::new("login-late");
+    let (home, _) = login_agent(&env, "claude");
+    let mut client = RawClient::attach(&env, "w");
+    std::fs::write(home.join("finish-login"), "0").unwrap();
+    std::fs::write(home.join("status"), "0").unwrap();
+    std::fs::write(home.join("hold-check"), "").unwrap();
+    open_account_login(&mut client);
+    client.wait_for_row("checking sign-in");
+    common::wait_until(PATIENCE, "check is running", || home.join("checks").exists());
+    client.send(b"\r");
+    common::wait_until(PATIENCE, "checking pane closes", || login_panes(&env).is_empty());
+    std::fs::write(home.join("status"), "2").unwrap();
+    open_account_login(&mut client);
+    client.wait_for_row("checking sign-in");
+    std::fs::remove_file(home.join("hold-check")).unwrap();
+    client.wait_for_row("could not check sign-in");
+    assert_eq!(login_panes(&env).len(), 1);
+    assert!(
+        std::fs::read_to_string(env.root.join("config/kraal/accounts.toml"))
+            .unwrap()
+            .contains("sign_in_required = true")
+    );
+    assert!(!client.rows().iter().any(|r| r.contains("is signed in")));
+}
+
+#[test]
+fn a_new_account_with_no_agent_keeps_a_sign_in_required_entry() {
+    let env = Env::new("login-missing");
+    env.workspace("w", "layout { pane name=\"shell\" }\n");
+    env.run(&["open", "w"]);
+    let mut client = RawClient::attach(&env, "w");
+    client.send(b"\x02a");
+    client.wait_for_row("Start an agent");
+    client.send(b"+ add a claude");
+    client.send(b"\r");
+    client.wait_for_row("Name of the new claude account");
+    client.send(b"unfinished\r");
+    client.wait_for_row("not installed");
+    client.wait_for_row("enter close");
+    let file = env.root.join("config/kraal/accounts.toml");
+    let accounts = std::fs::read_to_string(file).unwrap();
+    assert!(accounts.contains("name = \"unfinished\"") && accounts.contains("sign_in_required = true"), "{accounts}");
+    client.send(b"r");
+    client.wait_for_row("not installed");
+    client.send(b"\r");
+    common::wait_until(PATIENCE, "missing login closes", || login_panes(&env).is_empty());
+    client.wait_for_row("sign-in required");
+    let list: serde_json::Value = serde_json::from_str(&env.run(&["accounts", "list", "--json"])).unwrap();
+    let account = list.as_array().unwrap().iter().find(|a| a["name"] == "unfinished").unwrap();
+    assert_eq!(account["status"], "not_installed");
+    assert_eq!(account["logged_in"], serde_json::Value::Null);
+}
+
+#[test]
+fn command_line_login_verifies_and_reports_the_same_statuses() {
+    let env = Env::new("login-cli");
+    let (home, path) = login_agent(&env, "claude");
+    std::fs::write(home.join("finish-login"), "0").unwrap();
+    let file = env.root.join("config/kraal/accounts.toml");
+    for (code, status, label, logged_in) in [
+        ("1", "not_signed_in", "sign-in required", serde_json::json!(false)),
+        ("2", "could_not_check", "could not check sign-in", serde_json::Value::Null),
+        ("0", "signed_in", "is signed in", serde_json::json!(true)),
+    ] {
+        std::fs::write(home.join("status"), code).unwrap();
+        let out = env.cmd(&["accounts", "login", "claude:work"]).env("PATH", &path).output().unwrap();
+        assert_eq!(out.status.success(), code == "0");
+        let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+        assert!(text.contains(label), "{text}");
+        assert_eq!(std::fs::read_to_string(&file).unwrap().contains("sign_in_required = true"), code != "0");
+        let out = env.cmd(&["accounts", "list", "--json"]).env("PATH", &path).output().unwrap();
+        assert!(out.status.success());
+        assert!(!String::from_utf8_lossy(&out.stderr).contains("PRIVATE-LOGIN-OUTPUT"));
+        let list: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        let account = list.as_array().unwrap().iter().find(|a| a["name"] == "work").unwrap();
+        assert_eq!(account["status"], status);
+        assert_eq!(account["logged_in"], logged_in);
+    }
+}
+
 /// An account renamed from the agent picker, then from the command line: its rule and its usage
 /// follow, and the agent running on it goes on under the new name.
 #[test]

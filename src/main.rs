@@ -1,5 +1,6 @@
 //! kraal: a terminal workspace manager for SSH fleets and coding agents.
 
+mod account_status;
 mod accounts;
 mod agent;
 mod ansi;
