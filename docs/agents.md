@@ -86,7 +86,7 @@ it as shown. The same goes for Enter on an ended agent and for an account switch
 Panes in a git repository show their branch in their frame (`⎇ main*? ↑2`: `*` changes, `?`
 untracked files, commits ahead).
 
-The agent picker (`ctrl+b a`) offers to start an agent **in a new worktree**: kraal creates a branch
+In the agent picker (`ctrl+b a`), select an account and press Tab, then **Start in worktree**: kraal creates a branch
 `kraal/<name>` and a directory next to the repository (`<repo>.worktrees/<name>`), and starts the
 agent there in its own tab. Several agents can work on the same repository without stepping on each
 other. `ctrl+b R g` in that tab reviews the changes (your pager, delta included), commits them, opens
@@ -216,7 +216,7 @@ agent or an unsigned home adds no account. **Could not verify** offers **Check a
 starting a login; on the command line, run `kraal accounts list` again.
 
 If named accounts already exist, the existing sign-in appears as **Existing Claude account ·
-Review** (or Codex). Open it in `ctrl+b a`, click Review in the sidebar, or use
+Review** (or Codex). Open it in Accounts (`ctrl+b A l`), click Review in the sidebar, or use
 `kraal accounts review claude`. **Which account is this?** lists your named accounts and
 **A different account**. Choose one, then confirm **Use account**. Cancel is selected first.
 Running agents keep their process and home. New launches use the selected named account's
@@ -238,19 +238,38 @@ An agent kraal starts on an account gets `$KRAAL_ACCOUNT` (`claude:pro`) and an 
 `$KRAAL_ACCOUNT_ID` that stays the same when renamed. It does not inherit the API keys of
 your environment (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`…), which would bill another account.
 
-The agent picker (`ctrl+b a`) lists every account, and offers to add one. The `+ add a claude
-account` and `+ add a codex account` lines use the normal active style; Enter asks for the new
-account's name. Tab on an account shows
-what can be done with it, each also on its own key: start it in a new tab (`ctrl+t`), log in again
-(`ctrl+l`), rename it (`ctrl+r`) or remove it (`ctrl+x`). The name is a label: renaming keeps the
-same account, rules and usage. Its directory stays where it is, and running agents go on under
-the new name. Removing an account keeps the label and launch environment of panes that use it.
-Adding another account with that name does not attach those panes, saved sessions, workspace
-bindings, rules or cached usage to the replacement. A workspace bound to a removed account
-asks you to choose an account again.
-The sidebar lists confirmed accounts at the bottom
-(`claude·pro 42%`): the higher of its 5-hour and weekly usage, in yellow from 70% and in red at
-its threshold, or `not used yet`. `ctrl+b A c` moves the focused pane's agent to another account
+Open **Accounts** from the Agents menu (`ctrl+b A l`), or click the sidebar's **ACCOUNTS**
+heading. Each account has two lines: `Claude · work` and `57% used · 2 panes`. Unknown usage
+says **Usage unavailable**, a login still to verify says **Sign-in required**, and expired
+observations say **Last checked ...**. Enter or one click opens details with the usage windows,
+when they were checked and their resets. The sidebar uses the same wording; clicking either
+line opens those details. Tab opens **Rename**, **Sign in**, and **Remove** (`ctrl+r`, `ctrl+l`,
+`ctrl+x`). Remove asks first, with Cancel selected, and explains that conversations and the
+agent's own sign-in are kept.
+
+**+ Add account** opens one form, also reached directly with `ctrl+b A n`. It stays visible when
+filtering the list. **Agent** starts with the focused pane's agent, otherwise the last choice;
+Left/Right changes it. **Name** starts with an available name. Tab moves between fields and
+buttons. If an existing sign-in is still unadopted, **Use existing account** is offered first,
+with **Sign in to another account** below it. A missing agent says **Not installed** and explains
+how to retry. An error keeps both fields; long errors wrap and scroll with PageUp/PageDown or
+the wheel. Enter or one click on a button submits it. Successful addition returns to Accounts,
+selects the new account and says **Account added**. These screens also work at 80x24 without
+the sidebar.
+
+The launch picker (`ctrl+b a`) lists installed agents' accounts that do not require sign-in.
+Enter or one click starts the selected account. Tab offers **Start in new tab** (`ctrl+t`),
+**Start in worktree** (`ctrl+w`) when the focused pane is in a local repository, and **Account
+details** (`ctrl+d`). Worktree launches keep the selected account. Account management is in
+Accounts.
+
+The name is a label: renaming keeps the same account, rules and usage. Its directory stays where
+it is, and running agents go on under the new name. Removing an account keeps the label and
+launch environment of panes that use it. Adding another account with that name does not attach
+those panes, saved sessions, workspace bindings, rules or cached usage to the replacement.
+A workspace bound to a removed account asks you to choose an account again.
+
+`ctrl+b A c` moves the focused pane's agent to another account
 of the same agent. In that picker, Enter switches to the selected account; launch, login,
 rename and remove actions are not offered. The pane's account is marked `current`: selecting
 it closes the picker and leaves the agent running as it is, without restarting it. An exited
@@ -275,11 +294,11 @@ agent running. This also applies before Claude has written its first transcript:
 a turn before changing accounts. Codex changes start a **New conversation**, stated in both the
 picker and the confirmation; the original history stays in the original account's directory.
 
-Sign-in from the picker opens a dedicated login pane. Opening the same account's login again
+Sign-in from Accounts opens a dedicated login pane. Opening the same account's login again
 in that session focuses the existing pane, including through another account name for the same
 directory. After the login exits successfully, kraal checks with `claude auth status` or
 `codex login status`, in that account's environment. A confirmed sign-in closes the pane and
-says that the account is signed in. A failed or cancelled sign-in stays open: Enter closes it,
+says that the account is signed in. When adding, it returns to the new row in Accounts. A failed or cancelled sign-in stays open: Enter closes it,
 and `r` is the separate **Try again** action. While a check runs, Enter also closes the pane;
 its late result is ignored. `c`, **Check again**, retries an unsuccessful check without running
 the login again. A check waits at most ten seconds and discards the agent's output.
@@ -288,7 +307,7 @@ A lock in the account directory also prevents another kraal session or `kraal ac
 from starting the same login while it is running or being checked.
 
 The account entry is kept in `accounts.toml` if sign-in fails, is cancelled, or cannot be
-verified. Until verification succeeds it shows **sign-in required** in the picker and sidebar,
+verified. Until verification succeeds it shows **Sign-in required** in Accounts and the sidebar,
 even if it has usage from before. Login panes and their scrollback are never saved, including
 when saving a workspace layout. Their output, titles, terminal notifications and clipboard
 requests are not copied into kraal's messages, notifications or logs.

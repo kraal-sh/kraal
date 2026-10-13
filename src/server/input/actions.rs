@@ -203,6 +203,14 @@ impl Server {
             Action::WorkspacePicker => return Mode::Picker(self.workspace_picker(ws)),
             Action::SshPicker => return Mode::Picker(self.ssh_picker()),
             Action::PanePicker => return Mode::Picker(self.pane_picker()),
+            Action::Accounts => {
+                self.refresh_existing_accounts();
+                return Mode::Picker(self.accounts_picker(None));
+            }
+            Action::AddAccount => {
+                self.refresh_existing_accounts();
+                return Mode::AccountForm(self.account_form(id));
+            }
             Action::AgentPicker => {
                 self.refresh_existing_accounts();
                 return Mode::Picker(self.agent_picker(id, None));

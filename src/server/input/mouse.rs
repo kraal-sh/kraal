@@ -59,6 +59,9 @@ impl Server {
         if m.col < sw {
             if press_left {
                 match self.sidebar_hit(id, m.row) {
+                    Some(SideItem::Accounts) => return Some(self.action(id, Action::Accounts)),
+                    Some(SideItem::Account(account)) => return Some(self.account_details(&account)),
+                    Some(SideItem::AddAccount) => return Some(self.action(id, Action::AddAccount)),
                     Some(SideItem::Workspace(ws)) => self.show_workspace(id, ws),
                     Some(SideItem::ReviewAccount(account)) => {
                         if let Some(existing) = self.accounts.by_id(&account).filter(|a| a.review) {
@@ -442,4 +445,40 @@ impl Server {
 
 fn contains(r: ratatui::layout::Rect, x: u16, y: u16) -> bool {
     x >= r.x && x < r.x + r.width && y >= r.y && y < r.y + r.height
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::account_status::Status;
+    use crate::server::agents::ExistingCheck;
+    use crate::server::ui::PickerKind;
+
+    #[test]
+    fn sidebar_account_entry_points_retry_cached_unsigned_homes() {
+        for add in [false, true] {
+            let (tx, _rx) = crate::server::queue::channel(16);
+            let mut server = crate::server::tests::server(tx);
+            let (client, _peer) = crate::server::tests::client(&mut server);
+            server.existing_checks.insert("claude".into(), ExistingCheck::Checked(Status::NotSignedIn));
+            server.existing_checks.insert("codex".into(), ExistingCheck::Checking);
+            let row = (0..36)
+                .find(|&row| {
+                    matches!(
+                        (add, server.sidebar_hit(client, row)),
+                        (false, Some(SideItem::Accounts)) | (true, Some(SideItem::AddAccount))
+                    )
+                })
+                .unwrap();
+            let click = MouseEvent { kind: MouseKind::Press(MouseButton::Left), col: 2, row, mods: Default::default() };
+            let mode = server.on_mouse(client, click, false).unwrap();
+            if add {
+                assert!(matches!(mode, Mode::AccountForm(_)));
+            } else {
+                assert!(matches!(mode, Mode::Picker(p) if p.kind == PickerKind::Accounts));
+            }
+            assert!(matches!(server.existing_checks["claude"], ExistingCheck::Checking));
+            assert_eq!(server.jobs.len(), 1, "retry the cached result without duplicating the check in progress");
+        }
+    }
 }

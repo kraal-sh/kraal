@@ -22,6 +22,8 @@ pub enum Mode {
     },
     Picker(Picker),
     Prompt(Prompt),
+    AccountForm(super::account_ui::AccountForm),
+    AccountDetails(super::account_ui::AccountDetails),
     Help {
         scroll: u16,
     },
@@ -69,7 +71,8 @@ impl Mode {
             Mode::Scroll => "COPY",
             Mode::Search { .. } => "SEARCH",
             Mode::Picker(_) => "CHOOSE",
-            Mode::Prompt(_) => "INPUT",
+            Mode::Prompt(_) | Mode::AccountForm(_) => "INPUT",
+            Mode::AccountDetails(_) => "ACCOUNT",
             Mode::Help { .. } => "HELP",
             Mode::Messages { .. } => "MESSAGES",
             Mode::Confirm(_) => "CONFIRM",
@@ -89,6 +92,7 @@ impl Mode {
 }
 
 pub enum ConfirmAction {
+    RemoveAccount(crate::accounts::Account),
     UseExisting {
         existing: Box<crate::accounts::Account>,
         target: Option<crate::accounts::Account>,
@@ -162,6 +166,7 @@ impl ConfirmAction {
     pub fn verb(&self) -> String {
         match self {
             ConfirmAction::UseExisting { .. } => "Use account".into(),
+            ConfirmAction::RemoveAccount(_) => "Remove".into(),
             ConfirmAction::ClosePane(_) => "Close pane".into(),
             ConfirmAction::CloseTab { .. } => "Close tab".into(),
             ConfirmAction::CloseWorkspace(_) => "Close workspace".into(),
@@ -226,6 +231,7 @@ pub enum PickerKind {
     Pane,
     Agent,
     AccountReview,
+    Accounts,
     Tool,
     Runbook,
     RunbookTarget,
@@ -239,6 +245,8 @@ pub enum PickerKind {
 
 #[derive(Clone)]
 pub enum PickAction {
+    AccountDetails(String),
+    AddAccount,
     ReviewAccount(crate::accounts::Account),
     CheckExisting {
         agent: String,
@@ -273,12 +281,6 @@ pub enum PickAction {
         agent: String,
         account: String,
         current: bool,
-    },
-    AgentAdd {
-        agent: String,
-    },
-    AgentWorktree {
-        agent: String,
     },
     Worktree {
         pane: PaneId,
@@ -356,6 +358,8 @@ pub struct Picker {
     /// What the picker waits for (a list read off the event loop), by request: keys typed
     /// meanwhile stay here instead of reaching a pane.
     pub loading: Option<u32>,
+    pub worktree: bool,
+    pub message: Option<String>,
 }
 
 impl Picker {
@@ -370,12 +374,14 @@ impl Picker {
             selected: 0,
             actions: None,
             loading: None,
+            worktree: false,
+            message: None,
         };
         p.refilter();
         p
     }
 
-    /// What can be done with the selected item: the key, and what it does. The first, if any, is Enter.
+    /// Actions offered by Tab, with the keys that run them.
     pub fn action_keys(&self) -> &'static [(&'static str, &'static str)] {
         use PickAction as A;
         use PickerKind as K;
@@ -393,21 +399,18 @@ impl Picker {
             (K::Ssh, A::SshGroup(_)) => {
                 &[("enter", "Open group"), ("ctrl+r", "Run a command on it"), ("ctrl+e", "Edit saved servers")]
             }
-            (K::Agent, A::AgentLaunch { .. }) => &[
-                ("enter", "Start"),
-                ("ctrl+t", "Start in a new tab"),
-                ("ctrl+l", "Log in to this account"),
-                ("ctrl+r", "Rename account"),
-                ("ctrl+x", "Remove account (its files are kept)"),
-            ],
+            (K::Agent, A::AgentLaunch { .. }) if self.worktree => {
+                &[("ctrl+t", "Start in new tab"), ("ctrl+w", "Start in worktree"), ("ctrl+d", "Account details")]
+            }
+            (K::Agent, A::AgentLaunch { .. }) => &[("ctrl+t", "Start in new tab"), ("ctrl+d", "Account details")],
+            (_, A::AccountDetails(_)) => &[("ctrl+r", "Rename"), ("ctrl+l", "Sign in"), ("ctrl+x", "Remove")],
             (_, A::CancelSwitch { .. }) => &[("enter", "Cancel account change")],
             (_, A::AgentSwitch { current: true, .. }) => &[("enter", "Keep current account")],
             (_, A::AgentSwitch { .. }) => &[("enter", "Switch account")],
             (_, A::ReviewAccount(_)) => &[("enter", "Review")],
             (_, A::CheckExisting { .. }) => &[("enter", "Check again")],
             (_, A::UseExisting { .. }) => &[("enter", "Choose")],
-            (_, A::AgentAdd { .. }) => &[("enter", "Add account")],
-            (_, A::AgentWorktree { .. }) => &[("enter", "Name worktree")],
+            (_, A::AddAccount) => &[("enter", "Add account")],
             (K::Workspace, A::SwitchWorkspace(_)) => &[("enter", "Open"), ("ctrl+x", "Close workspace")],
             (_, A::OpenDefinition(_)) => &[("enter", "Open workspace")],
             (_, A::NewWorkspace) => &[("enter", "Create workspace")],
@@ -434,7 +437,7 @@ impl Picker {
             .items
             .iter()
             .enumerate()
-            .filter(|(_, it)| !matches!(it.action, PickAction::NewWorkspace))
+            .filter(|(_, it)| !matches!(it.action, PickAction::NewWorkspace | PickAction::AddAccount))
             .filter_map(|(i, it)| {
                 // The label matters most; details only rescue items whose label does not match.
                 fuzzy_score(&self.query, &it.label)
@@ -467,6 +470,9 @@ impl Picker {
                 });
                 self.filtered.push(self.items.len() - 1);
             }
+        }
+        if let Some(i) = self.items.iter().position(|it| matches!(it.action, PickAction::AddAccount)) {
+            self.filtered.push(i);
         }
         self.selected = self.selected.min(self.filtered.len().saturating_sub(1));
     }
@@ -507,10 +513,6 @@ pub enum PromptAction {
     },
     /// The value is `server:path` to download into the download directory.
     Download,
-    /// The value is the new account's name.
-    AddAccount {
-        agent: String,
-    },
     /// The value is the account's new name.
     RenameAccount {
         agent: String,
@@ -519,6 +521,7 @@ pub enum PromptAction {
     /// The value is the worktree's name.
     NewWorktree {
         agent: String,
+        account: String,
     },
     /// The value is a commit message for the pane's worktree.
     Commit {
@@ -549,7 +552,6 @@ impl PromptAction {
             PromptAction::SaveWorkspace(_) => "save",
             PromptAction::Upload { .. } | PromptAction::UploadPick { .. } => "upload",
             PromptAction::Download => "download",
-            PromptAction::AddAccount { .. } => "add",
             PromptAction::Commit { .. } => "commit",
             PromptAction::RunOn { .. } => "run",
             PromptAction::Tunnel { .. } => "forward",
@@ -826,27 +828,24 @@ mod tests {
         let mut p = Picker::new(
             PickerKind::Agent,
             "Agents",
-            vec![
-                PickItem::new(
-                    "claude·work",
-                    "",
-                    PickAction::AgentLaunch { agent: "claude".into(), account: "work".into() },
-                ),
-                PickItem::new("+ add a claude account", "", PickAction::AgentAdd { agent: "claude".into() }),
-                PickItem::new("claude in a new worktree", "", PickAction::AgentWorktree { agent: "claude".into() }),
-            ],
+            vec![PickItem::new(
+                "Claude · work",
+                "",
+                PickAction::AgentLaunch { agent: "claude".into(), account: "work".into() },
+            )],
         );
+        assert_eq!(p.action_keys(), &[("ctrl+t", "Start in new tab"), ("ctrl+d", "Account details")]);
+        p.worktree = true;
         assert_eq!(
-            p.action_keys().iter().map(|(key, _)| *key).collect::<Vec<_>>(),
-            ["enter", "ctrl+t", "ctrl+l", "ctrl+r", "ctrl+x"]
+            p.action_keys(),
+            &[("ctrl+t", "Start in new tab"), ("ctrl+w", "Start in worktree"), ("ctrl+d", "Account details")]
         );
-        p.move_by(1);
-        assert_eq!(p.action_keys(), &[("enter", "Add account")]);
-        p.move_by(1);
-        assert_eq!(p.action_keys(), &[("enter", "Name worktree")]);
-        p.query = "claude·work".into();
-        p.refilter();
-        assert_eq!(p.action_keys().len(), 5);
+        let p = Picker::new(
+            PickerKind::Accounts,
+            "Accounts",
+            vec![PickItem::new("Claude · work", "", PickAction::AccountDetails("id".into()))],
+        );
+        assert_eq!(p.action_keys(), &[("ctrl+r", "Rename"), ("ctrl+l", "Sign in"), ("ctrl+x", "Remove")]);
 
         for (current, what) in [(false, "Switch account"), (true, "Keep current account")] {
             let p = Picker::new(
@@ -901,7 +900,11 @@ mod tests {
     fn a_picker_without_a_selected_line_offers_no_actions() {
         let mut p = Picker::new(PickerKind::Agent, "Agents", vec![]);
         assert!(p.action_keys().is_empty());
-        p.items.push(PickItem::new("claude", "", PickAction::AgentAdd { agent: "claude".into() }));
+        p.items.push(PickItem::new(
+            "claude",
+            "",
+            PickAction::AgentLaunch { agent: "claude".into(), account: "work".into() },
+        ));
         p.query = "no match".into();
         p.refilter();
         assert!(p.action_keys().is_empty());

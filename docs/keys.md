@@ -19,7 +19,7 @@ any keyboard layout.
 | servers | `s` connect (or a group in a grid) | `S`: `s` connect, `u` upload, `d` download, `e` edit the list |
 | broadcast | `b` typing goes to the whole tab, `b` again stops | `B`: `b` this tab, `w` the whole workspace, `m` mark this pane, `s` the marked panes, `o` stop |
 | workspaces | `w` choose one | `W`: `w` choose, `n` new, `←`/`→` previous/next, `e` rename, `s` save the layout, `r` restart the session (on the kraal installed now), `q` quit, `x` close |
-| agents | `a` start one on an account | `A`: `a` start, `g` go to the agent needing you, `c` change account |
+| agents | `a` start one on an account | `A`: `a` start, `l` accounts, `n` add account, `g` go to the agent needing you, `c` change account |
 | tabs | `t` new tab | `T`: `t` new, `←`/`→` previous/next, `e` rename, `x` close |
 | panes | `p` find a pane | `P`: `p` find, `n` new, `→`/`↓` split, `e` rename, `r` resize with the arrows, `f` floating, `l` next layout, `s` then an arrow stack with the pane on that side, `u` unstack, `x` close |
 | view | `v` copy mode: scroll and select | `V`: `v` copy mode, `g` search the output, `o` links and paths, `c` copy the last command's output, `p` paste buffers, `f` floating panes, `l` sidebar, `k` bottom bar, `j` message log |
@@ -123,7 +123,7 @@ A successful, verified sign-in closes the pane automatically.
 
 ## Lists, fields and questions
 
-In lists, type to filter, `↑↓` move, Enter chooses, **Tab shows what else can be done** with the
+In lists, type to filter, `↑↓` move, Enter or one click chooses, **Tab shows what else can be done** with the
 selected item (connect in a new tab, browse its files, run a command…), each also on a key of its
 own that the list shows, Esc closes. The footer says what Enter does on the selected line;
 only actions that apply to that line are offered. When there are no other actions, Tab moves
