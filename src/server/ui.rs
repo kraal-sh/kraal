@@ -576,6 +576,7 @@ pub struct Prompt {
     pub action: PromptAction,
     /// Why the value was not accepted; the prompt stays open to fix it.
     pub error: Option<String>,
+    pub scroll: usize,
     /// What is typed is not shown (a secret).
     pub masked: bool,
 }
@@ -588,6 +589,7 @@ impl Prompt {
             cursor: value.chars().count(),
             action,
             error: None,
+            scroll: 0,
             masked: false,
         }
     }

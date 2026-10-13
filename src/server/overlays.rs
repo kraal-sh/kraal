@@ -566,11 +566,27 @@ fn fill(buf: &mut Buffer, area: Rect, style: Style) {
 
 // ---- prompts --------------------------------------------------------------------------------
 
-pub(super) fn draw_prompt(p: &Prompt, screen: Rect, buf: &mut Buffer) -> Option<Cursor> {
+pub(super) struct PromptLayout {
+    area: Rect,
+    lines: Vec<String>,
+    pub(super) body: u16,
+    pub(super) max_scroll: usize,
+}
+
+pub(super) fn prompt_layout(p: &Prompt, screen: Rect) -> PromptLayout {
     let w = screen.width.saturating_sub(4).min(76);
-    let h = if p.error.is_some() { 5 } else { 4 };
+    // Diagnostics include paths: keep their spacing when a line needs more than one row.
+    let lines: Vec<_> =
+        p.error.as_deref().unwrap_or("").lines().flat_map(|l| fold(l, w.saturating_sub(4) as usize)).collect();
+    let h = (lines.len() + 4).min(screen.height.saturating_sub(2).max(4) as usize) as u16;
     let area = centered(screen, w, h);
-    let inner = frame(area, &p.title, th().accent, buf);
+    let body = area.height.saturating_sub(4);
+    PromptLayout { area, max_scroll: lines.len().saturating_sub(body as usize), lines, body }
+}
+
+pub(super) fn draw_prompt(p: &Prompt, screen: Rect, buf: &mut Buffer) -> Option<Cursor> {
+    let layout = prompt_layout(p, screen);
+    let inner = frame(layout.area, &p.title, th().accent, buf);
     if inner.height < 2 || inner.width < 4 {
         return None;
     }
@@ -591,10 +607,21 @@ pub(super) fn draw_prompt(p: &Prompt, screen: Rect, buf: &mut Buffer) -> Option<
     let shown: String = chars[start..].iter().collect();
     buf.set_stringn(inner.x + 1, inner.y, &shown, room, Style::default());
     let x = inner.x + 1 + before as u16;
-    if let Some(e) = &p.error {
-        buf.set_stringn(inner.x + 1, inner.y + 1, e, room, Style::default().fg(th().production));
+    let scroll = p.scroll.min(layout.max_scroll);
+    for (i, line) in layout.lines.iter().skip(scroll).take(layout.body as usize).enumerate() {
+        buf.set_stringn(inner.x + 1, inner.y + 1 + i as u16, line, room, Style::default().fg(th().production));
     }
-    let mut keys = vec![("⏎", p.action.verb()), ("esc", "cancel")];
+    let verb = if p.error.is_some()
+        && matches!(p.action, super::ui::PromptAction::NewWorkspace | super::ui::PromptAction::SaveWorkspace(_))
+    {
+        "retry"
+    } else {
+        p.action.verb()
+    };
+    let mut keys = vec![("⏎", verb), ("esc", "cancel")];
+    if layout.max_scroll > 0 {
+        keys.insert(1, ("pgup/pgdn", "scroll"));
+    }
     if matches!(p.action, super::ui::PromptAction::Upload { .. }) {
         keys.insert(1, ("ctrl+p", "paste the paths instead"));
     }
@@ -815,8 +842,10 @@ mod tests {
                 })
                 .collect(),
         );
-        let prompt =
+        let mut prompt =
             Prompt::new("Rename tab", "a long name that goes on and on", super::super::ui::PromptAction::NewWorkspace);
+        prompt.error = Some(message.repeat(5));
+        prompt.scroll = 99;
         let (km, _) = crate::keymap::Keymap::build(&crate::config::Config::default().keys);
         let menu = menu_items(&km.menu(&[]), true);
         let lines: Vec<Line<'static>> = (0..50).map(|i| entry("ctrl+b p r", &format!("line {i}"), 12)).collect();
@@ -862,6 +891,66 @@ mod tests {
     }
 
     #[test]
+    fn workspace_prompt_errors_wrap_and_keep_input_and_retry_visible_at_both_sizes() {
+        use super::super::ui::PromptAction;
+        let path = format!("/{}a  b.kdl", "long-日-folder/".repeat(18));
+        let error = format!("Couldn't write {path}.\nPermission denied. Fix the destination and retry.");
+        for (w, h) in [(80, 24), (124, 36)] {
+            let area = Rect::new(0, 0, w, h);
+            for action in [PromptAction::NewWorkspace, PromptAction::SaveWorkspace(1)] {
+                let mut p = Prompt::new("Workspace", " café 日 ", action);
+                p.cursor = 3;
+                let mut buf = Buffer::empty(area);
+                draw_prompt(&p, area, &mut buf);
+                assert!(screen(&buf, area).contains(p.action.verb()));
+                p.error = Some(error.clone());
+                let layout = prompt_layout(&p, area);
+                assert_eq!(layout.max_scroll, 0);
+                assert_eq!(layout.area.width, 76);
+                let cursor = draw_prompt(&p, area, &mut buf).unwrap();
+                assert_eq!(cursor.x, layout.area.x + 5);
+                assert_eq!(cursor.y, layout.area.y + 1);
+                let shown = screen(&buf, area);
+                assert!(shown.contains(" café 日 "), "{shown}");
+                assert!(shown.contains("Permission denied. Fix the destination and retry."), "{shown}");
+                assert!(shown.contains("⏎ retry") && shown.contains("esc cancel"), "{shown}");
+                assert!(!shown.contains("scroll"), "{shown}");
+                for (i, line) in layout.lines.iter().enumerate() {
+                    let mut x = layout.area.x + 2;
+                    let y = layout.area.y + 2 + i as u16;
+                    for c in line.chars() {
+                        assert_eq!(buf[(x, y)].symbol(), c.to_string(), "missing {line:?}: {shown}");
+                        x += unicode_width::UnicodeWidthChar::width(c).unwrap_or(0) as u16;
+                    }
+                }
+                assert_eq!(layout.lines.join(""), error.replace('\n', ""));
+            }
+        }
+    }
+
+    #[test]
+    fn a_prompt_diagnostic_taller_than_the_terminal_is_readable_in_pages() {
+        for (w, h) in [(80, 24), (124, 36)] {
+            let area = Rect::new(0, 0, w, h);
+            let mut p = Prompt::new("New workspace", "scratch", super::super::ui::PromptAction::NewWorkspace);
+            p.error = Some((0..100).map(|i| format!("Diagnostic line {i}\n")).collect());
+            let layout = prompt_layout(&p, area);
+            assert!(layout.max_scroll > 0);
+            for start in (0..layout.lines.len()).step_by(layout.body as usize) {
+                p.scroll = start;
+                let mut buf = Buffer::empty(area);
+                draw_prompt(&p, area, &mut buf);
+                let shown = screen(&buf, area);
+                assert!(shown.contains("scratch"), "{shown}");
+                assert!(shown.contains("⏎ retry · pgup/pgdn scroll · esc cancel"), "{shown}");
+                for line in layout.lines.iter().skip(start.min(layout.max_scroll)).take(layout.body as usize) {
+                    assert!(shown.contains(line), "missing {line:?}: {shown}");
+                }
+            }
+        }
+    }
+
+    #[test]
     fn picker_footers_describe_the_selected_line_at_both_sizes() {
         use super::super::ui::{PickAction, PickItem, PickerKind};
         for (w, h) in [(124, 36), (80, 24)] {
@@ -881,11 +970,18 @@ mod tests {
                     false,
                 ),
                 (PickerKind::Ssh, PickAction::SshGroup("web".into()), "open group", true),
+                (PickerKind::Workspace, PickAction::SwitchWorkspace(1), "open", true),
                 (PickerKind::Workspace, PickAction::OpenDefinition("w.kdl".into()), "open workspace", false),
+                (PickerKind::Workspace, PickAction::NewWorkspace, "create workspace", false),
                 (PickerKind::RunbookSteps, PickAction::RunbookList, "back to runbooks", false),
             ];
             for (kind, action, enter, more) in cases {
-                let p = Picker::new(kind, "List", vec![PickItem::new("item", "", action)]);
+                let create = matches!(action, PickAction::NewWorkspace);
+                let mut p = Picker::new(kind, "List", vec![PickItem::new("item", "", action)]);
+                if create {
+                    p.query = "new".into();
+                    p.refilter();
+                }
                 let mut buf = Buffer::empty(area);
                 draw_picker(&p, area, &mut buf);
                 let layout = picker_layout(&p, area);
@@ -900,6 +996,16 @@ mod tests {
             let text = screen(&buf, area);
             assert!(text.contains("esc close"));
             assert!(!text.contains("⏎") && !text.contains("more actions"), "{text}");
+            let p = Picker::new(
+                PickerKind::Workspace,
+                "Workspaces",
+                vec![PickItem::new("invalid", "error", PickAction::None)],
+            );
+            draw_picker(&p, area, &mut buf);
+            let layout = picker_layout(&p, area);
+            let footer = screen(&buf, Rect::new(layout.area.x, layout.area.bottom() - 2, layout.area.width, 1));
+            assert!(footer.contains("esc close"));
+            assert!(!footer.contains("⏎") && !footer.contains("more actions"), "{footer}");
         }
     }
 

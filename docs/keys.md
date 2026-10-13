@@ -132,7 +132,11 @@ selected item (connect in a new tab, browse its files, run a command…), each a
 own that the list shows, Esc closes. The footer says what Enter does on the selected line;
 only actions that apply to that line are offered. When there are no other actions, Tab moves
 to the next line. Text fields edit like a shell line (arrows, `home`/`end`,
-`alt+←→`, `ctrl+w`, `ctrl+u`, `ctrl+k`). Questions show two buttons, Cancel first: `y` answers
+`alt+←→`, `ctrl+w`, `ctrl+u`, `ctrl+k`). In the New workspace and Save workspace prompts,
+errors wrap below the input and stay visible when moving the cursor.
+Long errors scroll with `pageup`/`pagedown` or the mouse wheel;
+the input and the keys to retry or cancel stay visible. Editing the value clears the error.
+Questions show two buttons, Cancel first: `y` answers
 yes, `n` or Esc no, Enter takes the selected button (`←→` or Tab change it). A question longer
 than its box says how many lines are below and scrolls: `↑↓` (or `j` `k`) by a line, `pageup`
 `pagedown` (or `space`) by what the box shows, `home` (or `g`) back to the top. What a question

@@ -12,6 +12,8 @@ use crate::server::{ClientId, Server};
 
 impl Server {
     pub(super) fn on_prompt(&mut self, id: ClientId, mut p: Prompt, ev: InputEvent) -> Mode {
+        let layout = crate::server::overlays::prompt_layout(&p, self.client_screen(id));
+        p.scroll = p.scroll.min(layout.max_scroll);
         match ev {
             InputEvent::Key(k) => match k.code {
                 KeyCode::Esc => return self.cancel_account_prompt(&p),
@@ -26,42 +28,59 @@ impl Server {
                     }
                     return Mode::Normal;
                 }
-                KeyCode::Enter => {
-                    if matches!(p.action, PromptAction::RunbookValue) {
-                        return self.set_draft_value(id, p.value);
-                    }
-                    if matches!(p.action, PromptAction::SaveWorkspace(_)) {
-                        return self.save_workspace_prompt(id, p);
-                    }
-                    let title = p.title.clone();
-                    let (value, cursor, masked) = (p.value.clone(), p.cursor, p.masked);
-                    let renamed = match &p.action {
-                        PromptAction::RenameAccount { agent, account } => {
-                            self.accounts.get(agent, account).map(|a| a.id)
-                        }
-                        _ => None,
-                    };
-                    return match self.commit_prompt(id, p) {
-                        Ok(()) => renamed.map_or(Mode::Normal, |a| Mode::Picker(self.accounts_picker(Some(&a)))),
-                        // Not accepted: the prompt stays, with the reason under it.
-                        Err((action, why)) => {
-                            Mode::Prompt(Prompt { title, value, cursor, action, error: Some(why), masked })
-                        }
-                    };
+                KeyCode::Enter => return self.submit_prompt(id, p),
+                KeyCode::PageDown => {
+                    p.scroll = (p.scroll + usize::from(layout.body).max(1)).min(layout.max_scroll);
                 }
+                KeyCode::PageUp => p.scroll = p.scroll.saturating_sub(usize::from(layout.body).max(1)),
                 _ => {
-                    if crate::server::ui::edit_line(&mut p.value, &mut p.cursor, &k) {
+                    let before = p.value.clone();
+                    if crate::server::ui::edit_line(&mut p.value, &mut p.cursor, &k) && p.value != before {
                         p.error = None;
+                        p.scroll = 0;
                     }
                 }
             },
             InputEvent::Paste(data) => {
-                p.error =
+                let before = p.value.clone();
+                let error =
                     crate::server::ui::paste_line(&mut p.value, &mut p.cursor, &String::from_utf8_lossy(&data)).err();
+                if error.is_some() || p.value != before {
+                    p.error = error;
+                    p.scroll = 0;
+                }
             }
+            InputEvent::Mouse(m) => match m.kind {
+                MouseKind::ScrollDown => p.scroll = (p.scroll + 2).min(layout.max_scroll),
+                MouseKind::ScrollUp => p.scroll = p.scroll.saturating_sub(2),
+                _ => {}
+            },
             _ => {}
         }
         Mode::Prompt(p)
+    }
+
+    pub(super) fn submit_prompt(&mut self, id: ClientId, mut p: Prompt) -> Mode {
+        p.scroll = 0;
+        if matches!(p.action, PromptAction::RunbookValue) {
+            return self.set_draft_value(id, p.value);
+        }
+        if matches!(p.action, PromptAction::SaveWorkspace(_)) {
+            return self.save_workspace_prompt(id, p);
+        }
+        let title = p.title.clone();
+        let (value, cursor, masked) = (p.value.clone(), p.cursor, p.masked);
+        let renamed = match &p.action {
+            PromptAction::RenameAccount { agent, account } => self.accounts.get(agent, account).map(|a| a.id),
+            _ => None,
+        };
+        match self.commit_prompt(id, p) {
+            Ok(()) => renamed.map_or(Mode::Normal, |a| Mode::Picker(self.accounts_picker(Some(&a)))),
+            // Not accepted: the prompt stays, with the reason under it.
+            Err((action, why)) => {
+                Mode::Prompt(Prompt { title, value, cursor, action, error: Some(why), scroll: 0, masked })
+            }
+        }
     }
 
     fn cancel_account_prompt(&self, prompt: &Prompt) -> Mode {
@@ -77,7 +96,7 @@ impl Server {
     pub(super) fn commit_prompt(&mut self, id: ClientId, p: Prompt) -> Result<(), (PromptAction, String)> {
         let value = p.value.trim().to_string();
         match p.action {
-            // Answered in on_prompt, which goes on to the next question.
+            // Answered in submit_prompt, which goes on to the next question.
             PromptAction::RunbookValue => {}
             PromptAction::RenameTab { workspace, tab } => {
                 // An empty name gives the tab back its automatic one (its focused pane's).
@@ -119,7 +138,7 @@ impl Server {
                     Ok(_) => self.show_workspace(id, ws),
                     Err(e) => {
                         self.drop_empty_workspaces();
-                        self.toast(id, format!("{e:#}"));
+                        return Err((p.action, format!("Couldn't start the shell. No workspace was added.\n{e:#}")));
                     }
                 }
             }
@@ -211,7 +230,7 @@ impl Server {
                 }
                 self.toast(id, format!("renamed account to {agent}·{value}"));
             }
-            PromptAction::SaveWorkspace(_) => unreachable!("answered in on_prompt"),
+            PromptAction::SaveWorkspace(_) => unreachable!("answered in submit_prompt"),
         }
         self.mark_persist();
         self.mark_dirty();
@@ -344,6 +363,7 @@ impl Server {
                     }
                     Err(e) => {
                         prompt.error = Some(format!("{e:#}"));
+                        prompt.scroll = 0;
                         return Mode::Prompt(prompt);
                     }
                 }
@@ -457,6 +477,144 @@ mod tests {
 
     fn key(code: KeyCode) -> InputEvent {
         InputEvent::Key(Key { code, mods: Mods::NONE, raw: Vec::new() })
+    }
+
+    #[test]
+    fn a_failed_workspace_creation_keeps_the_name_and_cursor_for_retry_or_cancel() {
+        let (tx, _rx) = crate::server::queue::channel(32);
+        let mut server = crate::server::tests::server(tx);
+        let (client, _peer) = crate::server::tests::client(&mut server);
+        let current = server.clients[&client].workspace;
+        server.env.shell = "/nonexistent/kraal-shell".into();
+        let mut p = Prompt::new("New workspace", " café 日 ", PromptAction::NewWorkspace);
+        p.cursor = 3;
+        for _ in 0..2 {
+            let Mode::Prompt(next) = server.on_prompt(client, p, key(KeyCode::Enter)) else { panic!("keep input") };
+            assert_eq!((next.value.as_str(), next.cursor), (" café 日 ", 3));
+            assert!(matches!(next.action, PromptAction::NewWorkspace));
+            assert!(next.error.as_ref().unwrap().contains("Couldn't start the shell. No workspace was added."));
+            assert_eq!(server.workspaces.len(), 1);
+            assert_eq!(server.clients[&client].workspace, current);
+            assert!(server.panes.is_empty());
+            p = next;
+        }
+        assert!(matches!(server.on_prompt(client, p, key(KeyCode::Esc)), Mode::Normal));
+        assert_eq!(server.workspaces[0].id, current);
+    }
+
+    #[test]
+    fn workspace_name_validation_keeps_input_without_creating_a_workspace() {
+        let (tx, _rx) = crate::server::queue::channel(32);
+        let mut server = crate::server::tests::server(tx);
+        let (client, _peer) = crate::server::tests::client(&mut server);
+        for (value, error) in [("  ", "Type a name."), (" test ", "already open")] {
+            let p = Prompt::new("New workspace", value, PromptAction::NewWorkspace);
+            let Mode::Prompt(p) = server.on_prompt(client, p, key(KeyCode::Enter)) else { panic!("keep input") };
+            assert_eq!(p.value, value);
+            assert!(p.error.as_ref().unwrap().contains(error));
+            assert_eq!(server.workspaces.len(), 1);
+            assert!(server.panes.is_empty());
+        }
+    }
+
+    #[test]
+    fn workspace_prompt_errors_scroll_without_changing_input_and_stay_until_an_edit() {
+        let (tx, _rx) = crate::server::queue::channel(32);
+        let mut server = crate::server::tests::server(tx);
+        let (client, _peer) = crate::server::tests::client(&mut server);
+        for (cols, rows, action) in [
+            (80, 24, PromptAction::NewWorkspace),
+            (124, 36, PromptAction::NewWorkspace),
+            (80, 24, PromptAction::SaveWorkspace(1)),
+            (124, 36, PromptAction::SaveWorkspace(1)),
+        ] {
+            let c = server.clients.get_mut(&client).unwrap();
+            (c.cols, c.rows) = (cols, rows);
+            let mut p = Prompt::new("Workspace", " café 日 ", action);
+            let error = "Read this diagnostic.\n".repeat(100);
+            p.error = Some(error.clone());
+            let layout = crate::server::overlays::prompt_layout(&p, server.client_screen(client));
+            let page = usize::from(layout.body);
+            let wheel = |kind| InputEvent::Mouse(crate::input::MouseEvent { kind, col: 0, row: 0, mods: Mods::NONE });
+            for (event, scroll) in [
+                (key(KeyCode::PageDown), page),
+                (key(KeyCode::PageDown), page * 2),
+                (key(KeyCode::PageUp), page),
+                (wheel(MouseKind::ScrollDown), page + 2),
+                (wheel(MouseKind::ScrollUp), page),
+                (key(KeyCode::Left), page),
+                (InputEvent::Paste(Vec::new()), page),
+            ] {
+                let Mode::Prompt(next) = server.on_prompt(client, p, event) else { panic!("keep input") };
+                assert_eq!(next.scroll, scroll);
+                assert_eq!(next.value, " café 日 ");
+                assert_eq!(next.error.as_deref(), Some(error.as_str()));
+                p = next;
+            }
+            assert_eq!(p.cursor, 7);
+            p.scroll = usize::MAX;
+            let Mode::Prompt(next) = server.on_prompt(client, p, key(KeyCode::PageDown)) else { panic!() };
+            assert_eq!(next.scroll, layout.max_scroll);
+            p = next;
+            for _ in 0..100 {
+                let Mode::Prompt(next) = server.on_prompt(client, p, key(KeyCode::PageUp)) else { panic!() };
+                p = next;
+            }
+            assert_eq!(p.scroll, 0);
+            for event in [key(KeyCode::Char('x')), InputEvent::Paste(b"y".to_vec())] {
+                p.error = Some(error.clone());
+                p.scroll = page;
+                let Mode::Prompt(next) = server.on_prompt(client, p, event) else { panic!() };
+                assert!(next.error.is_none());
+                assert_eq!(next.scroll, 0);
+                p = next;
+            }
+            assert_eq!(p.value, " café 日xy ");
+        }
+    }
+
+    #[test]
+    fn workspace_write_failures_keep_the_prompt_and_retry_after_the_cause_is_fixed() {
+        let (tx, _rx) = crate::server::queue::channel(32);
+        let mut server = crate::server::tests::server(tx);
+        let dir = std::env::temp_dir().join(format!("kraal-save-write-prompt-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("work.kdl");
+        let lock = dir.join(".work.kdl.lock");
+        let ws = server.new_workspace("work".into(), Some(path.clone()));
+        for confirm in [false, true] {
+            std::fs::write(&path, "original contents").unwrap();
+            server.workspaces[0].definition_source = (!confirm).then(|| "original contents".into());
+            let mut p = Prompt::new("Save workspace layout as", " work ", PromptAction::SaveWorkspace(ws));
+            p.cursor = 2;
+            // Reading the destination succeeds, but opening its write lock fails.
+            std::fs::create_dir(&lock).unwrap();
+            let next = server.on_prompt(0, p, key(KeyCode::Enter));
+            let next = if confirm {
+                let Mode::Confirm(q) = next else { panic!("confirmation") };
+                server.on_confirm(0, q, key(KeyCode::Char('y')))
+            } else {
+                next
+            };
+            let Mode::Prompt(p) = next else { panic!("write failure keeps input") };
+            assert_eq!((p.value.as_str(), p.cursor), (" work ", 2));
+            assert!(p.error.is_some());
+            assert!(matches!(p.action, PromptAction::SaveWorkspace(id) if id == ws));
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), "original contents");
+            std::fs::remove_dir(&lock).unwrap();
+            let next = server.on_prompt(0, p, key(KeyCode::Enter));
+            let next = if confirm {
+                let Mode::Confirm(q) = next else { panic!("confirmation") };
+                server.on_confirm(0, q, key(KeyCode::Char('y')))
+            } else {
+                next
+            };
+            assert!(matches!(next, Mode::Normal));
+            assert_eq!(std::fs::read_to_string(path.with_extension("kdl.bak")).unwrap(), "original contents");
+            assert_eq!(server.workspaces[0].definition_source, Some(std::fs::read_to_string(&path).unwrap()));
+            std::fs::remove_file(&lock).unwrap();
+        }
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

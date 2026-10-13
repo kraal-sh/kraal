@@ -277,15 +277,9 @@ impl Server {
                 Err(e) => self.toast(id, format!("{e:#}")),
             },
             PickAction::NewWorkspace => {
-                let name = p.query.trim().to_string();
-                let ws = self.new_workspace(name, None);
-                match self.spawn_pane_in(ws, None, PaneSpec::default(), Placement::Tab, None) {
-                    Ok(_) => self.show_workspace(id, ws),
-                    Err(e) => {
-                        self.drop_empty_workspaces();
-                        self.toast(id, format!("{e:#}"));
-                    }
-                }
+                let mut prompt = Prompt::new("New workspace", &p.query, PromptAction::NewWorkspace);
+                prompt.cursor = p.cursor;
+                return self.submit_prompt(id, prompt);
             }
             PickAction::Ssh(spec) => self.connect(id, &spec, Placement::Auto),
             PickAction::SshGroup(group) => match self.open_group(&group, &[]) {
@@ -502,9 +496,69 @@ impl Server {
 }
 
 #[cfg(test)]
-mod account_tests {
+mod tests {
     use super::*;
     use crate::input::Mods;
+
+    #[test]
+    fn creation_from_the_picker_keeps_input_on_failure_and_rechecks_the_name() {
+        let (tx, _rx) = crate::server::queue::channel(32);
+        let mut server = crate::server::tests::server(tx);
+        let (client, _peer) = crate::server::tests::client(&mut server);
+        let current = server.clients[&client].workspace;
+        server.env.shell = "/nonexistent/kraal-shell".into();
+        for stale in [false, true] {
+            let mut p = server.workspace_picker(current);
+            p.query = " café 日 ".into();
+            p.cursor = 3;
+            p.refilter();
+            assert!(matches!(p.current().unwrap().action, PickAction::NewWorkspace));
+            if stale {
+                server.workspaces[0].name = "café 日".into();
+            }
+            let event = InputEvent::Key(Key { code: KeyCode::Enter, mods: Mods::NONE, raw: Vec::new() });
+            let Mode::Prompt(p) = server.on_picker(client, p, event) else { panic!("keep input") };
+            assert_eq!((p.value.as_str(), p.cursor), (" café 日 ", 3));
+            assert!(matches!(p.action, PromptAction::NewWorkspace));
+            let reason = if stale { "already open" } else { "No workspace was added." };
+            assert!(p.error.as_ref().unwrap().contains(reason));
+            assert_eq!(server.workspaces.len(), 1);
+            assert_eq!(server.clients[&client].workspace, current);
+        }
+    }
+
+    #[test]
+    fn workspace_tab_and_close_apply_only_to_an_open_workspace() {
+        let (tx, _rx) = crate::server::queue::channel(32);
+        let mut server = crate::server::tests::server(tx);
+        let key = |code, mods| InputEvent::Key(Key { code, mods, raw: Vec::new() });
+        for action in [
+            PickAction::SwitchWorkspace(1),
+            PickAction::OpenDefinition("closed.kdl".into()),
+            PickAction::NewWorkspace,
+            PickAction::None,
+        ] {
+            let open = matches!(action, PickAction::SwitchWorkspace(_));
+            let mut p = Picker::new(
+                PickerKind::Workspace,
+                "Workspaces",
+                vec![PickItem::new("", "", action), PickItem::new("scratch", "", PickAction::None)],
+            );
+            p.query = "new".into();
+            p.filtered = vec![0, 1];
+            let Mode::Picker(mut p) = server.on_picker(0, p, key(KeyCode::Tab, Mods::NONE)) else { panic!() };
+            assert_eq!(p.actions, open.then_some(0));
+            assert_eq!(p.selected, usize::from(!open));
+            p.actions = None;
+            p.selected = 0;
+            let next = server.on_picker(0, p, key(KeyCode::Char('x'), Mods::CTRL));
+            if open {
+                assert!(matches!(next, Mode::Confirm(q) if matches!(q.action, ConfirmAction::CloseWorkspace(1))));
+            } else {
+                assert!(matches!(next, Mode::Picker(p) if p.query == "new" && p.selected == 0));
+            }
+        }
+    }
 
     #[test]
     fn one_click_on_either_line_opens_an_unselected_account_and_blank_rows_do_nothing() {

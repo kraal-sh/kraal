@@ -1113,6 +1113,96 @@ fn save_writes_a_definition_that_reopens() {
 /// Saves never take another workspace's source. Other existing files need a confirmation
 /// which preserves the input on Cancel and expires when the file changes again.
 #[test]
+fn workspace_creation_failures_keep_input_and_retry_from_both_entries_at_both_sizes() {
+    let env = Env::new("wscreateerrors");
+    env.workspace("w", "layout {\n    pane name=\"shell\"\n}\n");
+    env.run(&["open", "w"]);
+    let shell = env.root.join("sh");
+    let held = env.root.join("sh-held");
+    for size in [(80, 24), (124, 36)] {
+        for picker in [false, true] {
+            let name = format!("scratch-{}-{picker}", size.0);
+            let before = listed_workspaces(&env);
+            let panes = env.run(&["panes"]);
+            let mut client = RawClient::attach_sized(&env, Some("w"), size);
+            client.wait_for_message("\"attached\"");
+            std::fs::rename(&shell, &held).unwrap();
+            if picker {
+                client.send(b"\x02w");
+                client.wait_for_row("Workspaces · type a new name");
+            } else {
+                client.send(b"\x02Wn");
+                client.wait_for_row("New workspace");
+            }
+            client.send(format!(" {name} ").as_bytes());
+            if picker {
+                let rows = client.wait_for_row("⏎ create workspace");
+                assert!(!rows.iter().any(|r| r.contains("more actions")));
+            }
+            client.send(b"\r");
+            let rows = client.wait_for_row("⏎ retry");
+            for text in [&name, "New workspace", "Couldn't start the shell.", "No workspace was added.", "esc cancel"] {
+                assert!(rows.iter().any(|r| r.contains(text)), "{size:?}: {}", rows.join("\n"));
+            }
+            assert_eq!(listed_workspaces(&env), before);
+            assert_eq!(env.run(&["panes"]), panes);
+            // Cursor movement keeps the error; an edit clears it and keeps the cursor's place.
+            client.send(b"\x1b[D");
+            client.settle();
+            assert!(client.rows().iter().any(|r| r.contains("⏎ retry")));
+            client.send(b"-fixed");
+            client.wait_for_row("⏎ create");
+            let fixed = format!("{name}-fixed");
+            client.send(b"\r");
+            client.wait_for_row("⏎ retry");
+            assert_eq!(listed_workspaces(&env), before);
+            std::fs::rename(&held, &shell).unwrap();
+            client.send(b"\r");
+            client
+                .wait_for_rows("the creation prompt closed", |rows| !rows.iter().any(|r| r.contains("New workspace")));
+            let workspaces = listed_workspaces(&env);
+            assert_eq!(workspaces.len(), before.len() + 1);
+            assert_eq!(workspaces.iter().filter(|w| *w == &format!("{fixed}:  (open)")).count(), 1);
+            assert_eq!(env.run(&["panes"]).lines().count(), panes.lines().count() + 1);
+        }
+    }
+}
+
+#[test]
+fn workspace_save_errors_keep_the_name_and_full_reason_at_both_sizes() {
+    let env = Env::new("wssaveerrors");
+    let dir = env.root.join("config/kraal/workspaces");
+    env.workspace("w", "layout {\n    pane name=\"shell\"\n}\n");
+    env.run(&["open", "w"]);
+    for size in [(80, 24), (124, 36)] {
+        let name = format!("copy-{}-a  b-{}", size.0, "long-name-".repeat(5));
+        let path = dir.join(format!("{name}.kdl"));
+        std::fs::create_dir(&path).unwrap();
+        let mut client = RawClient::attach_sized(&env, Some("w"), size);
+        client.wait_for_message("\"attached\"");
+        client.send(b"\x02Ws");
+        client.wait_for_row("Save workspace layout as");
+        client.send(format!("\x01\x0b {name} \r").as_bytes());
+        let rows = client.wait_for_row("⏎ retry");
+        // Inside the prompt, after the pane's border: remove only the prompt's one-column padding.
+        let message: String = rows
+            .iter()
+            .filter_map(|r| r.split('│').nth(2))
+            .filter_map(|r| r.strip_prefix(' ')?.strip_suffix(' '))
+            .collect();
+        assert!(message.contains(&format!("{} is not a regular file", path.display())), "{}", rows.join("\n"));
+        assert!(rows.iter().any(|r| r.contains(&name)), "{}", rows.join("\n"));
+        assert!(rows.iter().any(|r| r.contains("esc cancel")));
+        std::fs::remove_dir(&path).unwrap();
+        client.send(b"\r");
+        client.wait_for_row("saved ");
+        assert!(path.is_file());
+        assert!(!path.with_extension("kdl.bak").exists());
+        assert_eq!(env.run(&["panes"]).lines().count(), 1);
+    }
+}
+
+#[test]
 fn workspace_saves_check_ownership_and_confirm_the_exact_file() {
     let env = Env::new("wssavechecked");
     let dir = env.root.join("config/kraal/workspaces");

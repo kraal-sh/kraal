@@ -8,6 +8,10 @@ The workspace picker (`ctrl+b w`) shows what Enter does for each selected line: 
 workspace or create the name typed. Tab offers to close a workspace only when it is running;
 a workspace file that is not running can only be opened.
 
+Creating a workspace (`ctrl+b W n`, or a new name in the picker) keeps the name you typed if
+the shell cannot start. No workspace is added on that failure. The error stays in **New workspace**:
+fix the cause and press Enter to retry, edit the name, or press Esc to cancel.
+
 - A **session** is one background server. It owns the processes; clients attach and detach.
   `kraal` uses the session `main`; `kraal -s work` (or `KRAAL_SESSION_NAME=work` in the
   environment) another one, and inside a pane every command uses that pane's session.
@@ -228,6 +232,10 @@ you can choose a name for a copy. Confirming **Replace file** keeps the replaced
 `.kdl.bak` beside the resolved target, including when saving through a symlink. Even an invalid
 KDL file needs this explicit confirmation. If the file changes again while the question is open,
 replacement is refused: retry to review the new version. Errors keep the form and its input open.
+Enter retries with the same name; Esc cancels. Errors wrap below the input at both 80-column and
+wider terminal sizes. If a diagnostic is taller than the dialog, `pageup`/`pagedown` or the mouse
+wheel scrolls it while the input and footer stay visible. Moving the cursor keeps the error;
+editing the value clears it.
 
 `kraal save` refuses a replacement that needs confirmation. Use `kraal save <name>` with a new
 name for a copy, or **Save workspace layout** in kraal to confirm replacement. There is no
