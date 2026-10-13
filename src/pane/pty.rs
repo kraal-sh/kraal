@@ -620,6 +620,15 @@ impl Output {
 /// Read a PTY until its end or until told to stop, adding its output to `out`, and telling the
 /// server (`tell`) of output it does not know of yet, and of the end: it may wait for it to act
 /// on the program's exit.
+///
+/// Output is read as soon as the PTY has some, however much already waits for the server: a line
+/// or two at a time from a program that prints without a pause. Those wake-ups are most of what
+/// kraal spends on such a program, and they are not to be saved: a reader that lets output gather
+/// in the PTY (a pause between reads, or reading less far ahead of a server that is behind) wakes
+/// 2 to 15 times less often, and the program then pays more for each write than the reader saved.
+/// Measured on Linux 7.2 after 0.3.0: the program and the kernel's workers spend 30 to 90% more
+/// CPU per megabyte, one flooding pane prints 29% less, fifteen print 18 to 37% less, and sixteen
+/// panes printing at once take 28 to 66% longer.
 fn read_output(mut reader: PtyReader, out: &Output, stop: &AtomicBool, tell: impl Fn() -> bool) {
     let mut buf = vec![0u8; 64 * 1024];
     while let Some(n) = reader.read(&mut buf, stop) {
