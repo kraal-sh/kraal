@@ -17,8 +17,8 @@ production = "lightred"       # frames and badges of production panes
 frames = "thick"              # "rounded", "plain", "thick", "double" or "ascii"
 
 [sidebar]
-visible = true                # shown once it has something to show
-width = 32
+visible = true                # false hides it
+width = 32                    # in terminals at least three times as wide
 
 [bar]
 keys = "context"              # the last row: what the focused pane can do; "off": no such row

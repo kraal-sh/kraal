@@ -357,19 +357,18 @@ impl Server {
         // Pickers, dialogs and menus go over the panes.
         let covered = !matches!(c.mode, Mode::Normal | Mode::Resize | Mode::Scroll | Mode::Search { .. });
         let c = &self.clients[&id];
-        let sidebar = self.sidebar_shown(c);
         let rows = c.rows;
         let cols = c.cols;
         // The panes, the sidebar and what goes over them end above the bottom bar.
         let screen = self.screen_above_bar(cols, rows);
         let bottom_row = Rect::new(0, screen.bottom(), cols, self.bottom_rows());
-        let sw = if sidebar { self.sidebar_width(cols) } else { 0 };
+        let sw = self.sidebar_cols(c);
         let side = Rect::new(0, 0, sw, if sw > 0 { screen.height } else { 0 });
 
         // A client shorter than the one the layout is for sees no folded row below its screen.
         let folds: Vec<(PaneId, Rect)> = self
             .ws_index(c.workspace)
-            .map_or_else(Vec::new, |wi| self.stack_rows(self.workspaces[wi].tab(), self.layout_area))
+            .map_or_else(Vec::new, |wi| self.stack_rows(self.workspaces[wi].tab(), self.client_area(id)))
             .into_iter()
             .filter(|(_, row)| row.y < screen.bottom())
             .collect();
@@ -578,7 +577,7 @@ impl Server {
     pub(super) fn pane_inner_rect(&self, id: ClientId, pane: PaneId) -> Option<Rect> {
         let wi = self.ws_index(self.clients.get(&id)?.workspace)?;
         let (_, frame, _) =
-            self.tab_rects(self.workspaces[wi].tab(), self.layout_area).into_iter().find(|(p, _, _)| *p == pane)?;
+            self.tab_rects(self.workspaces[wi].tab(), self.client_area(id)).into_iter().find(|(p, _, _)| *p == pane)?;
         Some(self.inner(frame))
     }
 
@@ -588,7 +587,8 @@ impl Server {
         let c = &self.clients[&id];
         let Some(wi) = self.ws_index(c.workspace) else { return };
         let tab = self.workspaces[wi].tab();
-        let Some((_, frame, _)) = self.tab_rects(tab, self.layout_area).into_iter().find(|(p, _, _)| *p == pane) else {
+        let Some((_, frame, _)) = self.tab_rects(tab, self.client_area(id)).into_iter().find(|(p, _, _)| *p == pane)
+        else {
             return;
         };
         let (_, inner) = self.placed(frame, self.screen_above_bar(c.cols, c.rows));
@@ -634,7 +634,7 @@ impl Server {
         let Some(wi) = self.ws_index(c.workspace) else { return bar };
         let ws = &self.workspaces[wi];
         let cols = c.cols;
-        let sw = if self.sidebar_shown(c) { self.sidebar_width(cols) } else { 0 };
+        let sw = self.sidebar_cols(c);
         let mut x = if sw > 0 { sw + 1 } else { 0 };
         if sw == 0 {
             // A broadcast in progress always shows, if need be with a shorter workspace name.
@@ -904,7 +904,8 @@ impl Server {
         let Some(wi) = self.ws_index(c.workspace) else { return Vec::new() };
         let tab = self.workspaces[wi].tab();
         let Some(f) = tab.focus else { return Vec::new() };
-        let Some((_, frame, floating)) = self.tab_rects(tab, self.layout_area).into_iter().find(|(p, ..)| *p == f)
+        let Some((_, frame, floating)) =
+            self.tab_rects(tab, self.client_area(c.id)).into_iter().find(|(p, ..)| *p == f)
         else {
             return Vec::new();
         };
@@ -1199,7 +1200,7 @@ impl Server {
         mut memo: Option<&mut FrameMemo>,
     ) -> Vec<Placed> {
         let Some(wi) = self.clients.get(&id).and_then(|c| self.ws_index(c.workspace)) else { return Vec::new() };
-        let rects = self.tab_rects(self.workspaces[wi].tab(), self.layout_area);
+        let rects = self.tab_rects(self.workspaces[wi].tab(), self.client_area(id));
         let mut placed: Vec<Placed> = rects
             .into_iter()
             .map(|(pane, frame, floating)| {

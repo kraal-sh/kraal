@@ -19,8 +19,8 @@ impl Server {
             return None;
         }
         let c = self.clients.get(&id)?;
-        let (cols, rows, sidebar) = (c.cols, c.rows, self.sidebar_shown(c));
-        let area = self.layout_area;
+        let (rows, sw) = (c.rows, self.sidebar_cols(c));
+        let area = self.client_area(id);
 
         // A drag in progress owns the mouse until release.
         if let Some(drag) = self.clients.get_mut(&id).and_then(|c| c.drag.take()) {
@@ -40,7 +40,6 @@ impl Server {
             return None;
         }
 
-        let sw = if sidebar { self.sidebar_width(cols) } else { 0 };
         let press_left = matches!(m.kind, MouseKind::Press(MouseButton::Left));
         // The bottom bar runs the whole width, under the sidebar.
         if self.bottom_bar && m.row + 1 == rows {
@@ -144,7 +143,7 @@ impl Server {
                 if button == MouseButton::Left
                     && !m.mods.ctrl
                     && hit.is_none_or(|(_, _, floating)| !floating)
-                    && let Some(b) = self.border_at(wi, m.col, m.row)
+                    && let Some(b) = self.border_at(wi, area, m.col, m.row)
                     && (folded.is_none() || b.axis == crate::layout::Axis::Row)
                 {
                     let along = match b.axis {
@@ -309,7 +308,7 @@ impl Server {
 
     pub(super) fn continue_drag(&mut self, id: ClientId, drag: Drag, m: MouseEvent) -> Option<Drag> {
         let released = matches!(m.kind, MouseKind::Release(_));
-        let area = self.layout_area;
+        let area = self.client_area(id);
         let (_, wi) = self.current_ws(id)?;
         match drag {
             Drag::Border(b, grab) => {
@@ -417,15 +416,22 @@ impl Server {
         }
     }
 
-    /// A tiled border under the cursor (see [`crate::layout::Border::grabbed_at`]).
-    pub(super) fn border_at(&self, wi: usize, col: u16, row: u16) -> Option<crate::layout::Border> {
+    /// A tiled border under the cursor, the layout being in `area` (see
+    /// [`crate::layout::Border::grabbed_at`]).
+    pub(super) fn border_at(
+        &self,
+        wi: usize,
+        area: ratatui::layout::Rect,
+        col: u16,
+        row: u16,
+    ) -> Option<crate::layout::Border> {
         let tab = self.workspaces[wi].tab();
         if tab.zoom.is_some() {
             return None;
         }
         let root = tab.root.as_ref()?;
         let frames = self.config.pane_frames;
-        root.borders(self.layout_area).into_iter().find(|b| b.grabbed_at(col, row, frames))
+        root.borders(area).into_iter().find(|b| b.grabbed_at(col, row, frames))
     }
 }
 

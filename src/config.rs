@@ -66,7 +66,8 @@ preset = "default"
 # frames = "rounded"
 
 [sidebar]
-# Shown when it has something to show (other workspaces, agents, ports, tunnels); false hides it.
+# The workspaces, agents, tunnels, ports and accounts, at the left of every terminal at least
+# three times as wide as it. false hides it; ctrl+b V l shows or hides it in one terminal.
 visible = true
 width = 28
 
