@@ -104,11 +104,14 @@ pub enum ConfirmAction {
         label: String,
         args: Vec<String>,
     },
-    /// Continue an agent pane's conversation on another account.
-    SwitchAccount {
+    StopAndSwitch {
         pane: PaneId,
-        agent: String,
-        account: String,
+        token: u32,
+    },
+    SignInAccount(crate::accounts::Account),
+    RetryAccountSwitch {
+        pane: PaneId,
+        account: crate::accounts::Account,
     },
     /// Run a git shell script in a job pane.
     GitJob {
@@ -166,7 +169,9 @@ impl ConfirmAction {
                 }
                 l
             }
-            ConfirmAction::SwitchAccount { .. } => "Switch account".into(),
+            ConfirmAction::StopAndSwitch { .. } => "Stop and switch".into(),
+            ConfirmAction::SignInAccount(_) => "Sign in".into(),
+            ConfirmAction::RetryAccountSwitch { .. } => "Check again".into(),
             ConfirmAction::RemoveWorktrees(list) if list.len() == 1 => "Remove worktree".into(),
             ConfirmAction::RemoveWorktrees(_) => "Remove worktrees".into(),
             ConfirmAction::TrustWorktreeSetup(_) => "Trust this version".into(),
@@ -228,6 +233,10 @@ pub enum PickerKind {
 
 #[derive(Clone)]
 pub enum PickAction {
+    CancelSwitch {
+        pane: PaneId,
+        token: u32,
+    },
     SwitchWorkspace(u32),
     /// A definition not running, by its file.
     OpenDefinition(std::path::PathBuf),
@@ -377,6 +386,7 @@ impl Picker {
                 ("ctrl+r", "Rename account"),
                 ("ctrl+x", "Remove account (its files are kept)"),
             ],
+            (_, A::CancelSwitch { .. }) => &[("enter", "Cancel account change")],
             (_, A::AgentSwitch { current: true, .. }) => &[("enter", "Keep current account")],
             (_, A::AgentSwitch { .. }) => &[("enter", "Switch account")],
             (_, A::AgentAdd { .. }) => &[("enter", "Add account")],

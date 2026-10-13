@@ -1744,9 +1744,8 @@ fn account_lines(
                     vec![Line::from(name), Line::from(vec![Span::raw("   "), status])]
                 };
             }
-            let used = match usage.get(&a) {
-                Some(u) => {
-                    let peak = u.peak(now);
+            let used = match usage.peak(&a, now) {
+                Some(peak) => {
                     let color = if peak >= accounts.threshold(&a) as f64 {
                         t.blocked
                     } else if peak >= 70.0 {
@@ -1821,6 +1820,7 @@ mod tests {
         assert!(account_lines(&accounts, &usage, 40, 1_000).is_empty());
         let window = Some(Window { used_percent: 42.0, resets_at: None });
         usage.0.insert("claude:default".into(), Usage { five_hour: window, observed_at: 1_000, ..Default::default() });
+        usage.0.insert("codex:default".into(), Usage::default());
         assert_eq!(account_lines(&accounts, &usage, 40, 1_000).len(), 2, "one used: both agents' are listed");
         let home = "/tmp/kraal-test-patron".to_string();
         accounts

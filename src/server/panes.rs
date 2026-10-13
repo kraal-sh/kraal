@@ -280,7 +280,7 @@ impl Server {
             self.login_exited(id, code);
             return;
         }
-        if self.switches.contains_key(&id) {
+        if self.switches.get(&id).is_some_and(|s| s.stage == super::agents::SwitchStage::Stopping) {
             // Ended first: if the switch cannot go on, Enter starts it again on its account.
             if let Some(pane) = self.panes.get_mut(&id) {
                 pane.exit_code = Some(code);

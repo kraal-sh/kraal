@@ -230,7 +230,26 @@ its threshold, or `not used yet`. `ctrl+b A c` moves the focused pane's agent to
 of the same agent. In that picker, Enter switches to the selected account; launch, login,
 rename and remove actions are not offered. The pane's account is marked `current`: selecting
 it closes the picker and leaves the agent running as it is, without restarting it. An exited
-pane stays exited too.
+pane stays exited too. Another name for the same account directory also leaves it unchanged.
+
+Each destination says **Continue conversation**, **New conversation**, **Sign-in required**, or
+**Could not verify**. Sign-in checks run while the picker is open and again when you choose an
+account. An account that needs sign-in offers **Sign in**; the current agent keeps running.
+After signing in, choose the account again. If verification fails, the current pane is unchanged;
+**Check again** retries it. A failure shown while another dialog is open can be retried from
+**Change account**.
+
+With reliable hooks, a change requested during work says **Switch after this turn**. Open
+`ctrl+b A c` again and choose **Cancel account change** to cancel it. Without a reliable turn
+boundary, kraal asks **Stop and switch?**, with **Cancel** selected. Only one change can be
+pending per pane: every attached client sees it and can cancel it before the agent stops.
+Sign-in and the conversation are checked again after waiting, before stopping anything.
+
+A Claude conversation must have a readable transcript on the current account. If it is missing,
+empty, unreadable, or has diverged from the destination's copy, kraal refuses and says why, leaving the
+agent running. This also applies before Claude has written its first transcript: let it finish
+a turn before changing accounts. Codex changes start a **New conversation**, stated in both the
+picker and the confirmation; the original history stays in the original account's directory.
 
 Sign-in from the picker opens a dedicated login pane. Opening the same account's login again
 in that session focuses the existing pane, including through another account name for the same
@@ -287,8 +306,9 @@ untouched.
 [examples/accounts.toml](../examples/accounts.toml) has limits and two rules, by workspace and by
 directory.
 
-The first rule that matches decides. A new agent starts on the first account of that rule that is
-under its threshold (when all are over, the one whose usage resets first); when
+The first rule that matches decides. A new agent starts on the first account of that rule whose
+known usage is under its threshold. Otherwise it tries the first account with unknown usage,
+or, when all have known usage over the threshold, the one whose usage resets first. When
 the matching rule names no account that exists any more, no account is used there (rather than
 any). Without a matching rule, every account of the agent may be used, `default` first. The name
 `default` is the account in the agent's own home (`~/.claude`, `~/.codex`). When
@@ -300,6 +320,11 @@ otherwise kraal asks instead, since restarting an agent mid-turn would lose its 
 watched for the agents kraal started on an account (the picker, `kraal agent`, a workspace file),
 not for one you typed in a shell. A Claude conversation continues on the other account; a
 Codex one cannot (its history stays in its account's directory), so switching starts a new one.
+Threshold alternatives need known usage below their threshold; unknown usage is not zero.
+Accounts marked as needing sign-in are excluded. An automatic change also checks sign-in and
+the conversation before stopping anything, and needs confirmation for a new Codex conversation.
+A failed automatic attempt is not repeated on each check: choose an account manually to retry,
+or wait until usage falls below the threshold and reaches it again.
 Workspace files can say `agent="claude"` (rules apply) or `agent="claude:pro"`.
 
 `auto` is off by default. Providers set usage limits per subscription; check their terms (for

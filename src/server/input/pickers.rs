@@ -294,12 +294,13 @@ impl Server {
                     self.toast(id, format!("{e:#}"));
                 }
             }
+            PickAction::CancelSwitch { pane, token } => self.cancel_switch(pane, token),
             PickAction::AgentSwitch { pane, agent, account, .. } => {
                 let result = self
                     .accounts
                     .get(&agent, &account)
                     .context("no such account")
-                    .and_then(|a| self.switch_account(pane, &a));
+                    .and_then(|a| self.switch_account(pane, &a, Some(id), false));
                 if let Err(e) = result {
                     self.toast(id, format!("{e:#}"));
                 }
