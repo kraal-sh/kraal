@@ -1070,12 +1070,66 @@ fn layout_survives_a_server_restart() {
     assert!(panes.contains("tab 2"), "{panes}");
     env.run(&["kill"]);
     let state = std::fs::read_to_string(env.state_file()).unwrap();
-    assert!(state.contains("\"revision\": 1,"), "{state}");
-    std::fs::write(env.state_file(), state.replace("\"revision\": 1,", "")).unwrap();
+    assert!(state.contains("\"revision\": 2,"), "{state}");
+    std::fs::write(env.state_file(), state.replace("\"revision\": 2,", "")).unwrap();
     env.run(&["open", "fleet"]);
     env.wait_for_text("a", "node-a");
     let panes = env.run(&["panes"]);
     assert!(!panes.contains("tab 2") && panes.contains("renamed"), "{panes}");
+}
+
+#[test]
+fn legacy_workspace_state_migrates_before_opening_and_keeps_its_own_layout() {
+    let env = Env::new("wsidentity");
+    let source = "// Keep this source\nlayout { pane name=\"source-pane\"; }\n";
+    env.workspace("w", source);
+    env.run(&["open", "w"]);
+    env.run(&["rename", "-p", "source-pane", "personal-pane"]);
+    env.run(&["kill"]);
+    let path = env.state_file();
+    let mut old: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    old["revision"] = serde_json::json!(1);
+    old["workspaces"][0].as_object_mut().unwrap().remove("id");
+    let bytes = serde_json::to_vec_pretty(&old).unwrap();
+    std::fs::write(&path, &bytes).unwrap();
+    env.run(&["open", "w"]);
+    let list = || serde_json::from_str::<serde_json::Value>(&env.run(&["workspaces", "--json"])).unwrap();
+    let id = list()[0]["id"].as_str().unwrap().to_owned();
+    assert!(!id.is_empty());
+    assert!(env.run(&["panes"]).contains("personal-pane"), "the saved layout wins over the KDL");
+    let backups = || {
+        std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| p.file_name().unwrap().to_string_lossy().starts_with("wsidentity.json.before-workspace-ids-"))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(backups().len(), 1);
+    assert_eq!(std::fs::read(backups()[0].join("state.json")).unwrap(), bytes);
+    env.run(&["kill"]);
+    env.run(&["open", "w"]);
+    assert_eq!(list()[0]["id"], id);
+    assert_eq!(backups().len(), 1);
+    assert_eq!(std::fs::read_to_string(env.root.join("config/kraal/workspaces/w.kdl")).unwrap(), source);
+}
+
+#[test]
+fn a_failed_state_migration_never_starts_an_empty_session_or_replaces_the_source() {
+    let env = Env::new("wsbadstate");
+    env.workspace("w", "layout { pane; }\n");
+    std::fs::create_dir_all(env.state_file().parent().unwrap()).unwrap();
+    for bytes in ["{", r#"{"version":2,"workspaces":[]}"#, r#"{"version":1,"revision":3,"workspaces":[]}"#] {
+        std::fs::write(env.state_file(), bytes).unwrap();
+        let out = env.try_run(&["open", "w"]);
+        let said = String::from_utf8_lossy(&out.stderr);
+        assert!(!out.status.success() && said.contains("the saved session is unchanged"), "{said}");
+        assert_eq!(std::fs::read_to_string(env.state_file()).unwrap(), bytes);
+        assert!(env.server_pid().is_none());
+    }
+    // Repairing the original is sufficient; no hidden replacement needs to be removed first.
+    std::fs::write(env.state_file(), r#"{"version":1,"workspaces":[]}"#).unwrap();
+    env.run(&["open", "w"]);
+    assert!(env.server_pid().is_some());
 }
 
 #[test]
@@ -1389,6 +1443,10 @@ fn a_renamed_workspace_takes_its_file_along() {
     env.workspace("perso", "layout {\n    pane name=\"shell\"\n}\n");
     env.workspace("work", "layout {\n    pane name=\"other\"\n}\n");
     env.run(&["open", "perso"]);
+    let identity =
+        || serde_json::from_str::<serde_json::Value>(&env.run(&["workspaces", "--json"])).unwrap()[0]["id"].clone();
+    let id = identity();
+    assert!(id.as_str().is_some());
     let mut client = RawClient::attach(&env, "perso");
     client.wait_for_message("\"attached\"");
     client.wait_for_row("not running");
@@ -1397,6 +1455,7 @@ fn a_renamed_workspace_takes_its_file_along() {
     // Home, then the prefix.
     client.send(b"\x1b[Hinfra - \r");
     client.wait_for_row("renamed perso.kdl to infra - perso.kdl");
+    assert_eq!(identity(), id);
     assert_eq!(names_in(&dir), ["infra - perso.kdl", "work.kdl"]);
     let shown = not_running(&client);
     assert!(shown.len() == 1 && shown[0].contains("work"), "{shown:?}");
@@ -1414,6 +1473,7 @@ fn a_renamed_workspace_takes_its_file_along() {
     env.run(&["open", "infra - perso"]);
     assert_eq!(listed_workspaces(&env), ["infra - perso: infra - perso.kdl (open)", "work: work.kdl"]);
     assert_eq!(env.run(&["panes"]).lines().count(), 1);
+    assert_eq!(identity(), id);
 }
 
 /// A rename never replaces a file: a name whose file exists, or that cannot name a file, is

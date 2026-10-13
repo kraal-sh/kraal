@@ -22,13 +22,13 @@ use crate::paths;
 use crate::server::{FloatRect, Floating, Server, Tab};
 
 const VERSION: u32 = 1;
-const REVISION: u32 = 1;
+const REVISION: u32 = 2;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct SessionSnapshot {
     pub version: u32,
     /// Changes that older versions read without noticing: 1 = a tab without a name is saved
-    /// without one (before, as "tab N").
+    /// without one (before, as "tab N"); 2 = durable workspace identities.
     #[serde(default)]
     pub revision: u32,
     pub workspaces: Vec<WorkspaceSnap>,
@@ -38,6 +38,8 @@ pub struct SessionSnapshot {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkspaceSnap {
+    #[serde(default)]
+    pub id: String,
     pub name: String,
     pub definition: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -47,6 +49,8 @@ pub struct WorkspaceSnap {
     pub tabs: Vec<TabSnap>,
     #[serde(default)]
     pub sync: crate::server::SyncScope,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restore_error: Option<String>,
 }
 
 impl WorkspaceSnap {
@@ -183,6 +187,7 @@ pub fn snapshot(server: &Server) -> SessionSnapshot {
         .workspaces
         .iter()
         .map(|ws| WorkspaceSnap {
+            id: ws.stable_id.clone(),
             name: ws.name.clone(),
             definition: ws.definition.clone(),
             definition_source: ws.definition_source.clone(),
@@ -190,6 +195,7 @@ pub fn snapshot(server: &Server) -> SessionSnapshot {
             active: ws.active,
             // Typing is never broadcast after a restart: it starts again only when asked.
             sync: crate::server::SyncScope::Off,
+            restore_error: None,
             tabs: ws
                 .tabs
                 .iter()
@@ -270,7 +276,7 @@ pub fn bind_accounts(accounts: &crate::accounts::Accounts) -> Result<()> {
 fn bind_saved_accounts(source: &[u8], accounts: &crate::accounts::Accounts) -> Result<Option<Vec<u8>>> {
     // An unreadable session is left for the restore path, which already explains how to recover it.
     let Ok(snapshot) = serde_json::from_slice::<SessionSnapshot>(source) else { return Ok(None) };
-    if snapshot.version != VERSION {
+    if snapshot.version != VERSION || snapshot.revision > REVISION {
         return Ok(None);
     }
     let mut value: serde_json::Value = serde_json::from_slice(source)?;
@@ -402,16 +408,110 @@ fn scrollback_name(file: &str) -> bool {
 
 pub fn load(session: &str) -> Result<Option<SessionSnapshot>> {
     let path = paths::session_state_path(session);
-    let data = match std::fs::read(&path) {
+    load_from(&path, &paths::scrollback_dir(session)).with_context(|| {
+        format!(
+            "could not restore {}; the saved session is unchanged; fix the file or its permissions and retry",
+            path.display()
+        )
+    })
+}
+
+fn load_from(path: &Path, scrollback: &Path) -> Result<Option<SessionSnapshot>> {
+    let data = match paths::read_regular(path, u64::MAX) {
         Ok(d) => d,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound && std::fs::symlink_metadata(path).is_err() => {
+            return Ok(None);
+        }
         Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
     };
-    let snap: SessionSnapshot = serde_json::from_slice(&data).with_context(|| format!("parsing {}", path.display()))?;
-    if snap.version != VERSION {
-        anyhow::bail!("unsupported state version {}", snap.version);
+    let (snap, migrated) = migrate(&data).with_context(|| format!("parsing {}", path.display()))?;
+    if let Some(updated) = migrated {
+        let backup = backup_state(path, &data, &snap, scrollback)?;
+        anyhow::ensure!(paths::read_regular(path, u64::MAX)? == data, "state changed during migration; retry");
+        paths::write_private(path, &updated)
+            .with_context(|| format!("migrating {}; the original is also in {}", path.display(), backup.display()))?;
+        paths::sync_dir(path.parent().context("no directory for the state")?);
     }
     Ok(Some(snap))
+}
+
+fn migrate(data: &[u8]) -> Result<(SessionSnapshot, Option<Vec<u8>>)> {
+    // Read the original bytes first: Value would silently discard duplicate fields.
+    let old: SessionSnapshot = serde_json::from_slice(data)?;
+    anyhow::ensure!(old.version == VERSION, "unsupported state version {}; use a kraal that supports it", old.version);
+    anyhow::ensure!(old.revision <= REVISION, "unsupported state revision {}; use a newer kraal", old.revision);
+    let mut ids = HashSet::new();
+    for ws in &old.workspaces {
+        if ws.id.is_empty() && old.revision < REVISION {
+            continue;
+        }
+        anyhow::ensure!(
+            !ws.id.is_empty()
+                && ws.id.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
+                && ids.insert(ws.id.clone()),
+            "invalid or duplicate workspace identity"
+        );
+    }
+    let mut value: serde_json::Value = serde_json::from_slice(data)?;
+    let state = value.as_object_mut().context("saved session must be an object")?;
+    let workspaces = state
+        .get_mut("workspaces")
+        .and_then(serde_json::Value::as_array_mut)
+        .context("saved workspaces must be an array")?;
+    for (ws, saved) in workspaces.iter_mut().zip(&old.workspaces) {
+        let ws = ws.as_object_mut().context("saved workspace must be an object")?;
+        if saved.id.is_empty() {
+            let mut id = crate::accounts::new_uuid();
+            while !ids.insert(id.clone()) {
+                id = crate::accounts::new_uuid();
+            }
+            ws.insert("id".into(), serde_json::json!(id));
+        }
+        let tabs =
+            ws.get_mut("tabs").and_then(serde_json::Value::as_array_mut).context("saved tabs must be an array")?;
+        for tab in tabs {
+            let tab = tab.as_object_mut().context("saved tab must be an object")?;
+            if old.revision == 0 && tab.get("name").and_then(serde_json::Value::as_str).is_some_and(old_tab_name) {
+                tab.insert("name".into(), serde_json::json!(""));
+            }
+        }
+    }
+    if old.revision == REVISION {
+        return Ok((old, None));
+    }
+    state.insert("revision".into(), serde_json::json!(REVISION));
+    let snap = serde_json::from_value(value.clone())?;
+    Ok((snap, Some(serde_json::to_vec_pretty(&value)?)))
+}
+
+fn old_tab_name(name: &str) -> bool {
+    name.strip_prefix("tab ").is_some_and(|n| n.parse::<u32>().is_ok())
+}
+
+fn backup_state(path: &Path, data: &[u8], snap: &SessionSnapshot, scrollback: &Path) -> Result<PathBuf> {
+    use std::os::unix::fs::DirBuilderExt;
+    let backup = path.with_extension(format!("json.before-workspace-ids-{}", crate::accounts::new_uuid()));
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&backup)
+        .with_context(|| format!("creating migration backup {}", backup.display()))?;
+    paths::sync_dir(path.parent().context("no directory for the state")?);
+    // The live scrollback is overwritten and pruned later, so the rollback copy must own its bytes.
+    for file in scrollback_files(snap).into_iter().filter(|f| scrollback_name(f)) {
+        let bytes = match paths::read_regular(&scrollback.join(file), crate::pane::MAX_SAVED_BYTES as u64) {
+            Ok(bytes) => bytes,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(e).context("backing up saved scrollback before migration"),
+        };
+        let dir = backup.join("scrollback");
+        durable_dir(&dir)?;
+        paths::write_private(&dir.join(file), &bytes)?;
+        paths::sync_dir(&dir);
+    }
+    // Written last: a backup without state.json was interrupted and cannot be used for rollback.
+    paths::write_private(&backup.join("state.json"), data)?;
+    paths::sync_dir(&backup);
+    Ok(backup)
 }
 
 /// What stopping the server (to restart, or to quit) stops in a pane, given what runs in it other
@@ -503,12 +603,19 @@ pub fn apply(server: &mut Server, snap: SessionSnapshot) -> Result<()> {
         }
     }
     for mut ws in snap.workspaces {
+        if ws.id.is_empty() {
+            ws.id = crate::accounts::new_uuid();
+        }
         ws.bind_accounts(&server.accounts);
         let panes_before: std::collections::HashSet<PaneId> = server.panes.keys().copied().collect();
         let workspaces_before: Vec<u32> = server.workspaces.iter().map(|w| w.id).collect();
         if let Err(e) = apply_workspace(server, &ws, snap.revision) {
             server.rollback(&panes_before, &workspaces_before);
-            server.warnings.push(format!("could not restore workspace {}: {e:#}; it stays saved", ws.name));
+            ws.restore_error = Some(format!("{e:#}"));
+            server.warnings.push(format!(
+                "could not restore workspace {}: {e:#}; it stays saved; fix the cause and restart the session",
+                ws.name
+            ));
             server.unrestored.push(ws);
         }
     }
@@ -520,13 +627,15 @@ fn apply_workspace(server: &mut Server, ws: &WorkspaceSnap, revision: u32) -> Re
     {
         let id = server.new_workspace(ws.name.clone(), ws.definition.clone());
         let wi = server.ws_index(id).unwrap();
+        server.workspaces[wi].stable_id = ws.id.clone();
+        server.workspaces[wi].name = ws.name.clone();
         server.workspaces[wi].cwd = ws.cwd.clone();
         server.workspaces[wi].definition_source = ws.definition_source.clone();
         for t in &ws.tabs {
             let tab_id = server.alloc_id();
             // Older versions saved a tab without a name as "tab N"; unnamed, it shows what its
             // pane runs.
-            let old_default = revision == 0 && t.name.strip_prefix("tab ").is_some_and(|n| n.parse::<u32>().is_ok());
+            let old_default = revision == 0 && old_tab_name(&t.name);
             let mut tab = Tab::new(tab_id, if old_default { String::new() } else { t.name.clone() });
             tab.preset = t.preset;
             if let Some(root) = &t.root {
@@ -552,12 +661,9 @@ fn apply_workspace(server: &mut Server, ws: &WorkspaceSnap, revision: u32) -> Re
             }
             server.workspaces[wi].tabs.push(tab);
         }
-        if server.workspaces[wi].tabs.is_empty() {
-            server.workspaces.remove(wi);
-        } else {
-            let n = server.workspaces[wi].tabs.len();
-            server.workspaces[wi].active = ws.active.min(n - 1);
-        }
+        anyhow::ensure!(!server.workspaces[wi].tabs.is_empty(), "the saved workspace has no restorable panes");
+        let n = server.workspaces[wi].tabs.len();
+        server.workspaces[wi].active = ws.active.min(n - 1);
     }
     Ok(())
 }
@@ -666,6 +772,246 @@ fn restore_scrollback(server: &mut Server, id: PaneId, p: &PaneSnap) {
 mod tests {
     use super::*;
 
+    fn legacy_state() -> serde_json::Value {
+        serde_json::json!({
+            "version": 1, "revision": 1, "future": { "keep": true }, "workspaces": [{
+                "name": "same", "definition": "/missing/source.kdl", "definition_source": "// original\nlayout { pane; }",
+                "cwd": "/missing/project", "active": 0, "future": [1, 2],
+                "tabs": [{ "name": "tab 1", "root": { "Pane": {
+                    "name": "agent", "agent": "claude", "agent_session": "conversation",
+                    "spec": { "account": "claude:renamed", "account_id": "kept-account",
+                        "env": [["CLAUDE_CONFIG_DIR", "/original/home"]] }, "scrollback": "1-2-3.ans"
+                } }, "floating": [], "focus": 0, "show_floating": false, "zoomed": false, "sync": false }]
+            }]
+        })
+    }
+
+    fn directory(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("kraal-state-{name}-{}", crate::accounts::new_uuid()));
+        std::fs::create_dir(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn migration_only_adds_identities_and_keeps_order_sources_collisions_and_accounts() {
+        let mut source = legacy_state();
+        let mut other = source["workspaces"][0].clone();
+        other["definition"] = serde_json::json!("/another/source.kdl");
+        other["restore_error"] = serde_json::json!("missing shell");
+        source["workspaces"].as_array_mut().unwrap().push(other);
+        let (snap, updated) = migrate(&serde_json::to_vec(&source).unwrap()).unwrap();
+        assert_eq!(snap.workspaces.len(), 2);
+        assert_ne!(snap.workspaces[0].id, snap.workspaces[1].id);
+        assert!(!snap.workspaces[0].id.is_empty());
+        let updated = updated.unwrap();
+        let mut value: serde_json::Value = serde_json::from_slice(&updated).unwrap();
+        for ws in value["workspaces"].as_array_mut().unwrap() {
+            ws.as_object_mut().unwrap().remove("id");
+        }
+        value["revision"] = serde_json::json!(1);
+        assert_eq!(value, source, "all existing metadata, including unknown fields, survives conversion");
+        let (again, changed) = migrate(&updated).unwrap();
+        assert!(changed.is_none());
+        assert_eq!(again.workspaces[0].id, snap.workspaces[0].id);
+    }
+
+    #[test]
+    fn releases_020_and_030_can_read_the_complete_migrated_workspace_array() {
+        // These session and workspace fields are shared by both released readers. Neither
+        // release rejects an additive revision; changing version would reject the whole session.
+        #[derive(Serialize, Deserialize)]
+        struct ReleasedWorkspace {
+            name: String,
+            definition: Option<PathBuf>,
+            cwd: Option<PathBuf>,
+            active: usize,
+            tabs: Vec<TabSnap>,
+            #[serde(default)]
+            sync: crate::server::SyncScope,
+        }
+        #[derive(Serialize, Deserialize)]
+        struct ReleasedSession {
+            version: u32,
+            #[serde(default)]
+            revision: u32,
+            workspaces: Vec<ReleasedWorkspace>,
+            #[serde(default)]
+            tunnels: Vec<crate::server::net::TunnelSpec>,
+        }
+        let source = serde_json::to_vec(&legacy_state()).unwrap();
+        let original: ReleasedSession = serde_json::from_slice(&source).unwrap();
+        let (snap, _) = migrate(&source).unwrap();
+        let saved = serde_json::to_vec(&snap).unwrap();
+        let read: ReleasedSession = serde_json::from_slice(&saved).unwrap();
+        assert_eq!(read.version, 1);
+        assert_eq!(read.workspaces.len(), 1);
+        assert_eq!(serde_json::to_value(read.workspaces).unwrap(), serde_json::to_value(original.workspaces).unwrap());
+    }
+
+    #[test]
+    fn migration_preserves_the_meaning_of_legacy_tab_names() {
+        let mut source = legacy_state();
+        source.as_object_mut().unwrap().remove("revision");
+        let (snap, _) = migrate(&serde_json::to_vec(&source).unwrap()).unwrap();
+        assert_eq!(snap.workspaces[0].tabs[0].name, "");
+        source["revision"] = serde_json::json!(1);
+        let (snap, _) = migrate(&serde_json::to_vec(&source).unwrap()).unwrap();
+        assert_eq!(snap.workspaces[0].tabs[0].name, "tab 1");
+    }
+
+    #[test]
+    fn the_migration_backup_is_private_complete_and_never_replaced() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = directory("backup");
+        let path = dir.join("main.json");
+        let scrollback = dir.join("scrollback");
+        std::fs::create_dir(&scrollback).unwrap();
+        std::fs::write(scrollback.join("1-2-3.ans"), "original text").unwrap();
+        let source = serde_json::to_vec(&legacy_state()).unwrap();
+        std::fs::write(&path, &source).unwrap();
+        let loaded = load_from(&path, &scrollback).unwrap().unwrap();
+        let backups = || {
+            std::fs::read_dir(&dir)
+                .unwrap()
+                .map(|e| e.unwrap().path())
+                .filter(|p| p.file_name().unwrap().to_string_lossy().starts_with("main.json.before-workspace-ids-"))
+                .collect::<Vec<_>>()
+        };
+        let backup = backups().pop().unwrap();
+        assert_eq!(std::fs::metadata(&backup).unwrap().permissions().mode() & 0o777, 0o700);
+        assert_eq!(std::fs::metadata(backup.join("state.json")).unwrap().permissions().mode() & 0o777, 0o600);
+        assert_eq!(std::fs::read(backup.join("state.json")).unwrap(), source);
+        std::fs::write(scrollback.join("1-2-3.ans"), "later text").unwrap();
+        assert_eq!(std::fs::read_to_string(backup.join("scrollback/1-2-3.ans")).unwrap(), "original text");
+        assert_eq!(load_from(&path, &scrollback).unwrap().unwrap().workspaces[0].id, loaded.workspaces[0].id);
+        assert_eq!(backups().len(), 1, "reading migrated state does not migrate it again");
+        // An older writer can save this session again; that conversion keeps a separate original.
+        std::fs::write(&path, &source).unwrap();
+        load_from(&path, &scrollback).unwrap();
+        assert_eq!(backups().len(), 2);
+        assert_eq!(std::fs::read(backup.join("state.json")).unwrap(), source);
+        assert_eq!(std::fs::read_to_string(backup.join("scrollback/1-2-3.ans")).unwrap(), "original text");
+        // Rollback needs no converter, just these saved bytes and their scrollback directory.
+        std::fs::copy(backup.join("state.json"), &path).unwrap();
+        std::fs::copy(backup.join("scrollback/1-2-3.ans"), scrollback.join("1-2-3.ans")).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), source);
+        assert_eq!(std::fs::read_to_string(scrollback.join("1-2-3.ans")).unwrap(), "original text");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_failed_backup_leaves_the_state_unchanged_and_can_be_retried() {
+        let dir = directory("failed-backup");
+        let path = dir.join("main.json");
+        let scrollback = dir.join("scrollback");
+        std::fs::create_dir_all(scrollback.join("1-2-3.ans")).unwrap();
+        let source = serde_json::to_vec(&legacy_state()).unwrap();
+        std::fs::write(&path, &source).unwrap();
+        assert!(load_from(&path, &scrollback).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), source);
+        std::fs::remove_dir(scrollback.join("1-2-3.ans")).unwrap();
+        assert!(
+            load_from(&path, &scrollback).unwrap().is_some(),
+            "missing scrollback does not prevent restoring the layout"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn unreadable_future_and_invalid_states_are_never_replaced() {
+        let dir = directory("invalid");
+        let path = dir.join("main.json");
+        let scrollback = dir.join("scrollback");
+        let mut cases = vec![b"{".to_vec()];
+        for (field, value) in [("version", 2), ("revision", 3), ("revision", 2)] {
+            let mut source = legacy_state();
+            source[field] = serde_json::json!(value);
+            cases.push(serde_json::to_vec(&source).unwrap());
+        }
+        for id in ["bad/id", "duplicate"] {
+            let mut source = legacy_state();
+            source["workspaces"][0]["id"] = serde_json::json!(id);
+            let ws = source["workspaces"][0].clone();
+            source["workspaces"].as_array_mut().unwrap().push(ws);
+            cases.push(serde_json::to_vec(&source).unwrap());
+        }
+        for source in cases {
+            std::fs::write(&path, &source).unwrap();
+            assert!(load_from(&path, &scrollback).is_err());
+            assert_eq!(std::fs::read(&path).unwrap(), source);
+            assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+        }
+        std::fs::remove_file(&path).unwrap();
+        assert!(load_from(&path, &scrollback).unwrap().is_none());
+        std::os::unix::fs::symlink(dir.join("missing"), &path).unwrap();
+        assert!(load_from(&path, &scrollback).is_err());
+        assert!(std::fs::read_link(&path).is_ok());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    fn assert_state_refused(source: &[u8], reason: &str) {
+        let session = format!("invalid-state-{}", crate::accounts::new_uuid());
+        let path = paths::session_state_path(&session);
+        let dir = path.parent().unwrap();
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(&path, source).unwrap();
+        let error = format!("{:#}", load(&session).unwrap_err());
+        assert!(error.contains("the saved session is unchanged; fix the file or its permissions and retry"), "{error}");
+        assert!(error.contains(reason), "{error}");
+        assert_eq!(std::fs::read(&path).unwrap(), source);
+        assert_eq!(
+            std::fs::read_dir(dir)
+                .unwrap()
+                .filter(|entry| entry.as_ref().unwrap().file_name().to_string_lossy().starts_with(&session))
+                .count(),
+            1,
+            "refused state creates no migration backup"
+        );
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn duplicate_workspace_and_layout_fields_refuse_restore_without_changing_state() {
+        for revision in 0..=REVISION {
+            let mut source = legacy_state();
+            source["revision"] = serde_json::json!(revision);
+            source["workspaces"][0]["id"] = serde_json::json!("kept");
+            let ws = &source["workspaces"][0];
+            for (field, before, after) in [
+                ("workspaces", &source["workspaces"], "[]"),
+                ("tabs", &ws["tabs"], "[]"),
+                ("root", &ws["tabs"][0]["root"], "null"),
+            ] {
+                let original = format!("\"{field}\":{before}");
+                let duplicate = format!("{original},\"{field}\":{after}");
+                let bytes = serde_json::to_string(&source).unwrap().replacen(&original, &duplicate, 1);
+                assert_state_refused(bytes.as_bytes(), &format!("duplicate field `{field}`"));
+            }
+        }
+    }
+
+    #[test]
+    fn positional_struct_arrays_refuse_restore_without_changing_state() {
+        for revision in 0..=REVISION {
+            let mut source = legacy_state();
+            source["revision"] = serde_json::json!(revision);
+            source["workspaces"][0]["id"] = serde_json::json!("kept");
+            let mut workspace = source.clone();
+            workspace["workspaces"][0] = serde_json::json!(["kept", "same", null, null, null, 0, [], "off", null]);
+            let mut tab = source.clone();
+            tab["workspaces"][0]["tabs"][0] = serde_json::json!(["tab 1", null, [], null, false, false, false, null]);
+            for (value, reason) in [
+                (serde_json::json!([1, revision, [], []]), "session must be an object"),
+                (workspace, "workspace must be an object"),
+                (tab, "tab must be an object"),
+            ] {
+                let bytes = serde_json::to_vec(&value).unwrap();
+                assert!(serde_json::from_slice::<SessionSnapshot>(&bytes).is_ok(), "Serde accepts positional structs");
+                assert_state_refused(&bytes, reason);
+            }
+        }
+    }
+
     #[test]
     fn old_saved_accounts_gain_identity_without_losing_unknown_fields() {
         let pane = serde_json::json!({
@@ -689,6 +1035,9 @@ mod tests {
         spec.as_object_mut().unwrap().remove("env");
         assert_eq!(migrated, source, "unknown fields and all other state survive");
         assert!(bind_saved_accounts(b"{broken", &accounts).unwrap().is_none());
+        let mut future = source.clone();
+        future["revision"] = serde_json::json!(REVISION + 1);
+        assert!(bind_saved_accounts(&serde_json::to_vec(&future).unwrap(), &accounts).unwrap().is_none());
         let restored: SessionSnapshot = serde_json::from_slice(&bytes).unwrap();
         let NodeSnap::Pane(pane) = restored.workspaces[0].tabs[0].root.as_ref().unwrap() else { panic!("pane") };
         assert_eq!(pane.spec.account_id.as_deref(), Some("default-claude"));

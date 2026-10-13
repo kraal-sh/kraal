@@ -1807,7 +1807,7 @@ fn agent_command(a: &Account, args: &[&str]) -> Result<Launch> {
     Ok(l)
 }
 
-/// A random UUID v4 (for `--session-id`).
+/// A random UUID v4 for saved identities and agent sessions.
 pub fn new_uuid() -> String {
     use std::io::Read;
     let mut b = [0u8; 16];

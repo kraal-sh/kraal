@@ -21,6 +21,7 @@ impl Server {
         }
         let mut ws = Workspace {
             id,
+            stable_id: crate::accounts::new_uuid(),
             name,
             tabs: Vec::new(),
             active: 0,

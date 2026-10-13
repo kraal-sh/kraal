@@ -1,5 +1,7 @@
 //! Lists to choose from: the generic picker, and the workspace, command and pane lists.
 
+use std::collections::HashSet;
+
 use anyhow::Context;
 
 use super::plural;
@@ -400,16 +402,28 @@ impl Server {
                 dim: false,
             });
         }
-        for (path, def) in self.definitions() {
+        let definitions = self.definitions();
+        let mut names = HashSet::new();
+        let mut collisions = HashSet::new();
+        for (_, def) in &definitions {
+            if let Ok(def) = def
+                && !names.insert(&def.name)
+            {
+                collisions.insert(def.name.clone());
+            }
+        }
+        for (path, def) in definitions {
             match def {
                 Ok(def) => {
                     if !matches!(self.definition_workspace(&path), Ok(None)) {
                         continue;
                     }
                     let n = def.panes().len();
+                    let source =
+                        if collisions.contains(&def.name) { paths::shorten_home(&path) } else { file_name(&path) };
                     items.push(PickItem {
                         label: def.name,
-                        detail: format!("not running · {n} pane{} · {}", plural(n), file_name(&path)),
+                        detail: format!("not running · {n} pane{} · {source}", plural(n)),
                         action: PickAction::OpenDefinition(path),
                         state: None,
                         dim: true,
@@ -520,6 +534,54 @@ impl Server {
         if let Err(e) = self.spawn_pane_in(ws, None, spec, Placement::Floating, Some("servers.toml".into())) {
             self.toast(id, format!("{e:#}"));
         }
+    }
+}
+
+#[cfg(test)]
+mod workspace_tests {
+    use super::*;
+
+    #[test]
+    fn colliding_workspace_files_show_their_directories_before_either_is_opened() {
+        let (tx, _) = crate::server::queue::channel(16);
+        let mut server = crate::server::tests::server(tx);
+        // Exercise the clipping caused by macOS's long temporary paths on every platform.
+        let dir =
+            std::env::temp_dir().join(format!("kraal-picker-{}-{}", std::process::id(), "long-directory-".repeat(8)));
+        for (sub, command) in [("one", "true"), ("two", "false")] {
+            let path = dir.join(sub);
+            std::fs::create_dir_all(&path).unwrap();
+            std::fs::write(
+                path.join("same.kdl"),
+                format!("layout {{ pane command=\"{command}\" start_suspended=true; }}\n"),
+            )
+            .unwrap();
+            server.config.workspace_dirs.push(path.display().to_string());
+        }
+        std::fs::write(dir.join("one/only.kdl"), "layout { pane; }").unwrap();
+        assert!(
+            server.open_workspace("same").unwrap_err().to_string().contains("choose a file in the workspace picker")
+        );
+        let picker = server.workspace_picker(0);
+        let rows: Vec<_> = picker.items.iter().filter(|item| item.label == "same").collect();
+        assert_eq!(rows.len(), 2);
+        for (row, sub) in rows.iter().zip(["one", "two"]) {
+            let path = crate::workspace::definition_path(&dir.join(sub).join("same.kdl"));
+            assert_eq!(row.detail, format!("not running · 1 pane · {}", paths::shorten_home(&path)));
+            assert!(matches!(&row.action, PickAction::OpenDefinition(p) if p == &path));
+        }
+        let only = picker.items.iter().find(|item| item.label == "only").unwrap();
+        assert_eq!(only.detail, "not running · 1 pane · only.kdl");
+        for width in [80, 120] {
+            let screen = ratatui::layout::Rect::new(0, 0, width, 30);
+            let mut buffer = ratatui::buffer::Buffer::empty(screen);
+            crate::server::overlays::draw_picker(&picker, screen, &mut buffer);
+            let text: String = buffer.content.iter().map(|cell| cell.symbol()).collect();
+            assert!(text.contains("one/same.kdl") && text.contains("two/same.kdl"), "{text}");
+        }
+        assert!(server.workspaces.is_empty());
+        assert!(server.panes.is_empty());
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }
 

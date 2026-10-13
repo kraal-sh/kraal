@@ -648,6 +648,8 @@ pub struct PaneInfo {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkspaceInfo {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
     pub name: String,
     pub open: bool,
     pub definition: Option<PathBuf>,
@@ -661,6 +663,19 @@ pub struct WorkspaceInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn workspace_identity_is_optional_for_older_servers_and_clients() {
+        let old = serde_json::json!({ "name": "w", "open": true, "definition": null,
+            "tabs": 1, "panes": 2, "working": 0, "blocked": 0, "done": 0 });
+        let mut workspace: WorkspaceInfo = serde_json::from_value(old.clone()).unwrap();
+        assert_eq!(workspace.id, None);
+        assert_eq!(serde_json::to_value(&workspace).unwrap(), old);
+        workspace.id = Some("stable".into());
+        let mut new = serde_json::to_value(&workspace).unwrap();
+        assert_eq!(new.as_object_mut().unwrap().remove("id"), Some(serde_json::json!("stable")));
+        assert_eq!(new, old, "the fields an old client reads have not changed");
+    }
 
     #[test]
     fn releases_compare_as_semver() {
@@ -953,6 +968,7 @@ mod tests {
             Response::Pane(Box::new(pane.clone())),
             Response::Panes(vec![pane]),
             Response::Workspaces(vec![WorkspaceInfo {
+                id: Some(s("workspace-id")),
                 name: s("w"),
                 open: true,
                 definition: Some(p("/w.kdl")),

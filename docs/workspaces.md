@@ -122,6 +122,38 @@ only the files it wrote there, and nothing through a link put in place of that d
 `kraal forget` deletes the saved layout and scrollback of a stopped session. Paste buffers are
 not saved unless `[buffers] persist = true` ([Configuration](configuration.md)).
 
+### Workspace identities and migration
+
+An opened workspace has a saved identity independent of its name, position and source path.
+`kraal workspaces --json` includes it as `id` on open workspaces; file-only entries omit it.
+Restarting keeps that identity. The pane and tab numbers used within a running server remain
+local to that server.
+
+On the first start with an older saved session, kraal assigns missing workspace identities and
+writes snapshot revision 2 atomically, before restoring any programs. It keeps the saved layout,
+source paths, recorded source contents, account identities and initial order. It does not match
+sources by name or rewrite KDL files, their backups, or accounts. Existing name collisions stay;
+a command that cannot choose one workspace by name asks you to select and rename a workspace.
+
+Before conversion, kraal creates a private directory beside the session file:
+`~/.local/state/kraal/sessions/<session>.json.before-workspace-ids-<unique-id>/`.
+It contains the exact old `state.json` and copies of the available referenced files under
+`scrollback/`. A backup without `state.json` was interrupted and is incomplete. Completed
+backups are never overwritten, pruned with live scrollback, or removed by `kraal forget`.
+They can contain the same secrets as the saved session. Remove them manually when no longer
+needed.
+
+To roll back, stop the session first. Keep a copy of its current state if you want to return to
+it, copy the backup's `state.json` over `sessions/<session>.json`, and copy the backup's
+`scrollback/` files into `scrollback/<session>/` under the same kraal state directory. Then start
+the older kraal. The backup contains only what existed at migration time, not later changes.
+
+If reading, validating or backing up the state fails, kraal leaves the original in place and
+refuses to start the session. Fix the reported cause and retry. Unsupported versions or revisions
+require a kraal that supports them. A workspace whose panes cannot be restored keeps its identity,
+layout, source and failure reason in the saved session. Fix that cause and restart to retry;
+opening its source does not replace the saved workspace with a fresh copy.
+
 ## Workspace files
 
 Workspaces live in `~/.config/kraal/workspaces/*.kdl` (and in the directories `workspace_dirs`

@@ -68,6 +68,23 @@ save behavior and cannot provide these protections. File locks coordinate curren
 older servers and external editors do not take part. See [Workspace saves](workspaces.md#saving-without-replacing-someone-elses-layout)
 for concurrent editor writes and recovery.
 
+## Workspace identities
+
+Snapshot revision 2 adds workspace identities and optional restore errors within the existing
+version 1 `workspaces` array. Kraal 0.2.0 and 0.3.0 still read every workspace and its layout;
+they do not interpret this state as an empty session. They ignore the new metadata and lose it
+if they save the session again. On returning to this version, missing identities are assigned
+again, with a separate migration backup.
+
+Workspace list replies add an optional `id`. Old clients ignore it, and current clients accept
+replies without it from old servers. Workspace selection still uses names; no request silently
+asks an old server to select by an identity it cannot understand.
+
+The conversion keeps an exact copy of the original snapshot and its available scrollback before
+writing anything. See [Workspace identities and migration](workspaces.md#workspace-identities-and-migration)
+for rollback and failed-state recovery. Whole-session restore failures now stop startup and leave
+the original in place, rather than starting a new session that could overwrite it.
+
 ## Account identities
 
 Accounts and saved sessions from 0.2.0 and 0.3.0 still load. Account names remain accepted by
