@@ -156,7 +156,10 @@ than its box says how many lines are below and scrolls: `↑↓` (or `j` `k`) by
 `pagedown` (or `space`) by what the box shows, `home` (or `g`) back to the top. What a question
 quotes, like the commands a runbook would run, keeps its spacing; a line too long for the box
 goes on in the rows below it, each marked `↪` in the margin.
-`ctrl+b V j` lists the messages kraal showed, warnings included.
+`ctrl+b V j` opens **Messages**, including warnings received while another message was displayed.
+Background warnings leave an active message and its actions visible until it expires or another
+action replaces it. Those warnings stay in Messages; they are not shown later as a delayed error.
+When no message is active, warnings appear in the notice line too.
 
 ## Your own keys
 

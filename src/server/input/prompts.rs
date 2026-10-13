@@ -450,7 +450,7 @@ impl Server {
                         return self.ask_close_workspace(id, ws);
                     }
                     ConfirmAction::Restart => self.restart(id),
-                    ConfirmAction::Quit => self.quit(),
+                    ConfirmAction::Quit => self.quit(id),
                     ConfirmAction::Job { label, args } => self.start_job(id, &label, args),
                     ConfirmAction::GitJob { label, script } => {
                         self.git_job(id, &label, script, crate::server::worktrees::JobEnd::CloseOnSuccess)

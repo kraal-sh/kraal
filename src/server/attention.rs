@@ -318,7 +318,7 @@ impl Server {
         self.messages.push_back(super::Message { at: std::time::SystemTime::now(), text: text.to_string(), warning });
     }
 
-    /// Show the pending warnings to the attached clients (and log them).
+    /// Log pending warnings and show them to attached clients with no active message.
     pub(super) fn show_warnings(&mut self) {
         if self.warnings.is_empty() {
             return;
@@ -346,8 +346,15 @@ impl Server {
                 self.keymap.hint(crate::keymap::Action::Messages).unwrap_or_default()
             ),
         };
+        let now = Instant::now();
         for c in self.clients.values_mut().filter(|c| c.attached) {
-            c.toast = Some((text.clone(), Instant::now() + Duration::from_secs(10)));
+            // A queued warning may already be obsolete after the user's action. Keep its
+            // result visible, even before the first frame; the warning stays in Messages.
+            if c.toast.as_ref().is_some_and(|(_, until)| *until > now) {
+                continue;
+            }
+            c.toast = Some((text.clone(), now + Duration::from_secs(10)));
+            c.toast_action = None;
             c.dirty = Dirty::Yes;
         }
         self.schedule_render();
@@ -376,5 +383,110 @@ impl Server {
         }
         self.send_msg(client, &crate::protocol::ServerMsg::Open { url: url.to_string() });
         self.toast(client, format!("opening {url}"));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::server::{
+        queue,
+        tests::{client, server},
+    };
+
+    #[test]
+    fn a_pending_warning_cannot_hide_a_result_before_its_first_frame() {
+        for (cols, rows) in [(80, 24), (124, 36)] {
+            for warning_first in [false, true] {
+                let (tx, _rx) = queue::channel(16);
+                let mut server = server(tx);
+                let (id, _peer) = client(&mut server);
+                let c = server.clients.get_mut(&id).unwrap();
+                c.cols = cols;
+                c.rows = rows;
+                let warning = "reading accounts.toml: Is a directory";
+                let result = "claude·work is signed in";
+                server.warnings.push(warning.into());
+                if warning_first {
+                    server.show_warnings();
+                }
+                server.toast(id, result);
+                let until = server.clients[&id].toast.as_ref().unwrap().1;
+                // A watch can queue an error before the retry repairs the file. The tick
+                // can deliver it after the retry succeeds, before any frame shows success.
+                server.show_warnings();
+                let mut buffer = ratatui::buffer::Buffer::empty(server.client_screen(id));
+                server.compose(id, crate::accounts::now(), &mut buffer);
+                let text: String = buffer.content.iter().map(|c| c.symbol()).collect();
+                assert!(text.contains(result), "{cols}x{rows}: {text}");
+                assert_eq!(server.clients[&id].toast, Some((result.into(), until)));
+                assert!(server.messages.iter().any(|m| m.warning && m.text == warning));
+                assert!(server.messages.iter().any(|m| !m.warning && m.text == result));
+                assert!(server.warnings.is_empty());
+                assert!(server.clients[&id].notice.is_none(), "an obsolete warning must not be replayed later");
+            }
+        }
+    }
+
+    #[test]
+    fn warnings_keep_an_active_notification_and_its_action() {
+        for action in [ToastAction::UndoAccount, ToastAction::ChangeAccount] {
+            let (tx, _rx) = queue::channel(16);
+            let mut server = server(tx);
+            let (id, _peer) = client(&mut server);
+            server.config.notifications.mode = NotifyMode::Off;
+            server.notify_action("work", 42, action);
+            let before = server.clients[&id].toast.clone();
+            server.warnings.push("could not save paste buffers".into());
+            server.show_warnings();
+            assert_eq!(server.clients[&id].toast, before);
+            assert_eq!(server.clients[&id].toast_action, Some((42, action)));
+            assert_eq!(server.messages.back().unwrap().text, "could not save paste buffers");
+            assert!(server.messages.back().unwrap().warning);
+        }
+    }
+
+    #[test]
+    fn warnings_show_on_idle_clients_and_clear_expired_actions() {
+        let (tx, _rx) = queue::channel(16);
+        let mut server = server(tx);
+        let [(busy, _busy_peer), (idle, _idle_peer), (expired, _expired_peer), (detached, _detached_peer)] =
+            std::array::from_fn(|_| client(&mut server));
+        server.toast(busy, "Workspace renamed");
+        let c = server.clients.get_mut(&expired).unwrap();
+        c.toast = Some(("Using work · Undo".into(), Instant::now() - Duration::from_secs(1)));
+        c.toast_action = Some((42, ToastAction::UndoAccount));
+        server.clients.get_mut(&detached).unwrap().attached = false;
+        server.warnings.extend(["first warning".into(), "second warning".into()]);
+        server.show_warnings();
+        assert_eq!(server.clients[&busy].toast.as_ref().unwrap().0, "Workspace renamed");
+        for id in [idle, expired] {
+            let c = &server.clients[&id];
+            assert!(c.toast.as_ref().unwrap().0.starts_with("first warning (and 1 more:"));
+            assert!(c.toast_action.is_none(), "a warning must not retain an unrelated action");
+        }
+        assert!(server.clients[&detached].toast.is_none());
+        assert_eq!(server.messages.iter().filter(|m| m.warning).count(), 2);
+        server.show_warnings();
+        assert_eq!(server.messages.iter().filter(|m| m.warning).count(), 2);
+    }
+
+    #[test]
+    fn warnings_while_detached_are_bounded_and_logged_when_a_client_attaches() {
+        let (tx, _rx) = queue::channel(16);
+        let mut server = server(tx);
+        for n in 0..MAX_PENDING_WARNINGS + 10 {
+            server.warnings.extend([format!("warning {n}"), format!("warning {n}")]);
+        }
+        server.show_warnings();
+        assert_eq!(server.warnings.len(), MAX_PENDING_WARNINGS);
+        assert_eq!(server.warnings[0], "warning 10");
+        assert!(server.messages.is_empty());
+        let (id, _peer) = client(&mut server);
+        server.show_warnings();
+        assert!(server.clients[&id].toast.as_ref().unwrap().0.starts_with("warning 10 (and 49 more:"));
+        assert_eq!(server.messages.len(), MAX_PENDING_WARNINGS);
+        assert!(server.messages.iter().all(|m| m.warning));
+        assert!(server.warnings.is_empty());
     }
 }
