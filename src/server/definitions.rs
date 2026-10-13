@@ -1,5 +1,6 @@
 //! Workspace definitions (`.kdl` files): finding, opening and saving them.
 
+use std::collections::HashSet;
 use std::ffi::OsStr;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
@@ -69,11 +70,36 @@ impl Server {
         for dir in self.config.workspace_dirs() {
             out.extend(workspace::load_dir(&dir));
         }
+        let mut seen = HashSet::new();
+        out.retain(|(path, _)| seen.insert(path.clone()));
         out
     }
 
-    fn find_definition(&self, name: &str) -> Option<PathBuf> {
-        self.definitions().into_iter().find_map(|(p, d)| (d.ok()?.name == name).then_some(p))
+    fn find_definition(&self, name: &str) -> Result<Option<PathBuf>> {
+        let mut found = self.definitions().into_iter().filter_map(|(p, d)| (d.ok()?.name == name).then_some(p));
+        let path = found.next();
+        anyhow::ensure!(
+            found.next().is_none(),
+            "several workspace files are named {name:?}; choose a file in the workspace picker"
+        );
+        Ok(path)
+    }
+
+    pub(super) fn named_workspace(&self, name: &str) -> Result<Option<usize>> {
+        let mut found = self.workspaces.iter().enumerate().filter(|(_, w)| w.name == name);
+        let first = found.next().map(|(i, _)| i);
+        let failed: Vec<_> = self.unrestored.iter().filter(|w| w.name == name).collect();
+        anyhow::ensure!(
+            found.next().is_none() && usize::from(first.is_some()) + failed.len() <= 1,
+            "several saved workspaces are named {name:?}; select a workspace and rename it before retrying"
+        );
+        if let Some(ws) = failed.first() {
+            anyhow::bail!(
+                "workspace {name:?} could not be restored: {}; it stays saved; fix the cause and restart the session",
+                ws.restore_error.as_deref().unwrap_or("its panes could not be started")
+            );
+        }
+        Ok(first)
     }
 
     /// The open workspace linked to the definition file at `path` (as [`Server::definitions`]
@@ -100,10 +126,10 @@ impl Server {
     /// Open a workspace by name: switch to the open workspace of that name, or to the one its
     /// definition is open in, else start that definition.
     pub fn open_workspace(&mut self, name: &str) -> Result<u32> {
-        if let Some(ws) = self.workspaces.iter().find(|w| w.name == name) {
-            return Ok(ws.id);
+        if let Some(wi) = self.named_workspace(name)? {
+            return Ok(self.workspaces[wi].id);
         }
-        let path = self.find_definition(name).with_context(|| {
+        let path = self.find_definition(name)?.with_context(|| {
             let names_server = crate::servers::names_server(&self.known_servers, name);
             workspace::unknown(name, &self.config.workspace_dirs(), names_server)
         })?;
@@ -112,6 +138,15 @@ impl Server {
 
     /// Switch to the workspace the definition at `path` is open in, else start it.
     pub(super) fn open_definition(&mut self, path: &Path) -> Result<u32> {
+        if let Some(ws) =
+            self.unrestored.iter().find(|w| w.definition.as_deref().is_some_and(|p| paths::same_file(p, path)))
+        {
+            anyhow::bail!(
+                "workspace {:?} could not be restored: {}; it stays saved; fix the cause and restart the session",
+                ws.name,
+                ws.restore_error.as_deref().unwrap_or("its panes could not be started")
+            );
+        }
         if let Some(ws) = self.definition_workspace(path)? {
             return Ok(ws);
         }
@@ -688,6 +723,79 @@ mod tests {
         let wi = server.ws_index(id).unwrap();
         server.workspaces[wi].definition_source = Some(source.into());
         wi
+    }
+
+    #[test]
+    fn failed_workspaces_keep_their_source_without_opening_a_second_copy() {
+        let mut server = server();
+        let dir = directory("failed-source");
+        let path = dir.join("original.kdl");
+        linked(&mut server, &path, "// unchanged\nlayout { pane; }");
+        server.workspaces[0].name = "personal name".into();
+        server.unrestored = crate::persist::snapshot(&server).workspaces;
+        server.unrestored[0].restore_error = Some("shell missing".into());
+        server.workspaces.clear();
+        for error in [server.open_definition(&path).unwrap_err(), server.open_workspace("personal name").unwrap_err()] {
+            assert!(error.to_string().contains("shell missing"));
+            assert!(error.to_string().contains("fix the cause and restart"));
+        }
+        assert!(server.workspaces.is_empty());
+        assert_eq!(server.unrestored.len(), 1);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "// unchanged\nlayout { pane; }");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn ambiguous_workspace_names_never_pick_the_first_saved_layout_or_file() {
+        let mut server = server();
+        server.new_workspace("same".into(), None);
+        server.new_workspace("other".into(), None);
+        server.workspaces[1].name = "same".into();
+        for ws in &mut server.workspaces {
+            ws.tabs.push(crate::server::Tab::new(99, String::new()));
+        }
+        assert!(server.open_workspace("same").unwrap_err().to_string().contains("several saved workspaces"));
+        let result =
+            server.request(0, crate::protocol::Request::SaveWorkspace { workspace: Some("same".into()), name: None });
+        assert!(result.unwrap().unwrap_err().contains("several saved workspaces"));
+        server.unrestored = crate::persist::snapshot(&server).workspaces.into_iter().skip(1).collect();
+        server.workspaces.pop();
+        assert!(server.open_workspace("same").unwrap_err().to_string().contains("several saved workspaces"));
+        server.workspaces.clear();
+        server.unrestored.clear();
+        let dir = directory("ambiguous-sources");
+        for sub in ["one", "two"] {
+            let path = dir.join(sub);
+            std::fs::create_dir_all(&path).unwrap();
+            std::fs::write(path.join("same.kdl"), "layout { pane; }").unwrap();
+            server.config.workspace_dirs.push(path.display().to_string());
+        }
+        assert!(
+            server.open_workspace("same").unwrap_err().to_string().contains("choose a file in the workspace picker")
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn directory_aliases_list_and_open_one_definition_by_name() {
+        let mut server = server();
+        let dir = directory("directory-aliases");
+        let real = dir.join("real");
+        let alias = dir.join("alias");
+        std::fs::create_dir(&real).unwrap();
+        std::os::unix::fs::symlink(&real, &alias).unwrap();
+        let path = real.join("directory-alias.kdl");
+        let source = "layout { pane command=\"true\" start_suspended=true; }\n";
+        std::fs::write(&path, source).unwrap();
+        server.config.workspace_dirs = vec![real.display().to_string(), alias.display().to_string()];
+        assert_eq!(server.definitions().iter().filter(|(p, _)| p == &path).count(), 1);
+        let id = server.open_workspace("directory-alias").unwrap();
+        assert_eq!(server.open_workspace("directory-alias").unwrap(), id);
+        assert_eq!(server.workspaces.len(), 1);
+        assert_eq!(server.workspaces[0].definition.as_ref(), Some(&path));
+        assert_eq!(server.workspaces[0].panes().len(), 1);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), source);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

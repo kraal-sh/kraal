@@ -233,7 +233,10 @@ impl Server {
             }
             Request::SaveWorkspace { workspace, name } => {
                 let wi = match workspace {
-                    Some(w) => self.workspaces.iter().position(|x| x.name == w),
+                    Some(w) => match self.named_workspace(&w) {
+                        Ok(wi) => wi,
+                        Err(e) => return Some(Err(format!("{e:#}"))),
+                    },
                     None => self
                         .primary
                         .and_then(|p| self.clients.get(&p))
@@ -540,6 +543,7 @@ impl Server {
             let count =
                 |s: AgentState| panes.iter().filter(|p| self.panes.get(p).is_some_and(|x| x.agent.state == s)).count();
             out.push(WorkspaceInfo {
+                id: Some(ws.stable_id.clone()),
                 name: ws.name.clone(),
                 open: true,
                 definition: ws.definition.clone(),
@@ -556,6 +560,7 @@ impl Server {
                 continue;
             }
             out.push(WorkspaceInfo {
+                id: None,
                 name: def.name.clone(),
                 open: false,
                 definition: Some(path),

@@ -483,6 +483,12 @@ pub(super) fn draw_picker(p: &Picker, screen: Rect, buf: &mut Buffer) -> Option<
                 let keys = truncate(&item.detail, room);
                 spans.push(Span::raw(" ".repeat(room.saturating_sub(columns(&keys)) + 1)));
                 spans.push(Span::styled(keys, key_style()));
+            } else if matches!(item.action, super::ui::PickAction::OpenDefinition(_)) {
+                // Keep the end of the path visible: it distinguishes same-named workspace files.
+                let used: usize = spans.iter().map(|s| columns(&s.content)).sum();
+                let room = (list.width as usize).saturating_sub(used + 2);
+                let detail = crate::text::truncate_start(&item.detail, room);
+                spans.push(Span::styled(format!("  {detail}"), dim()));
             } else {
                 spans.push(Span::styled(format!("  {}", item.detail), dim()));
             }

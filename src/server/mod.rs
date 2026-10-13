@@ -263,6 +263,8 @@ pub enum SyncScope {
 
 pub struct Workspace {
     pub id: u32,
+    /// Saved identity; the numeric id only addresses this server's objects.
+    pub stable_id: String,
     pub name: String,
     pub tabs: Vec<Tab>,
     pub active: usize,
@@ -457,7 +459,7 @@ pub struct Server {
     /// When an image that stopped moving may be drawn as sixel where it stopped. Kept apart from
     /// `next_render`, which it would hold back: other changes are drawn meanwhile.
     image_wake: Option<Instant>,
-    /// When the last frames were drawn.
+    /// When drawing the last frame finished: composing it is not a quiet spell in the output.
     last_frame: Instant,
     /// Frames in a row that output was already waiting for (see [`Server::schedule_render`]).
     streak: u8,
@@ -698,7 +700,7 @@ pub const HELD_STATUS: i32 = 75;
 
 /// Run a session server in the foreground until it is told to exit.
 pub fn run(session: &str) -> Result<()> {
-    let ready = take_ready_pipe();
+    let mut ready = take_ready_pipe();
     // Kept from `kraal forget` until this server has the session, when a restart started it.
     let restarting = paths::Restarting::inherited(session);
     // What this process inherited stays out of the panes' programs.
@@ -722,13 +724,6 @@ pub fn run(session: &str) -> Result<()> {
         return Err(Held(format!("session {session:?} is already running")).into());
     };
     let own_socket = paths::file_id(&socket);
-    // Connections wait in the listener's queue from now on: the client that started this server
-    // may connect.
-    if let Some(mut ready) = ready {
-        use std::io::Write;
-        let _ = ready.write_all(b"1");
-    }
-
     let (config, mut warnings) =
         Config::load_with_warnings().unwrap_or_else(|e| (Config::default(), vec![format!("config: {e:#}")]));
     // In the log too: the list is shown to who attaches, and none may.
@@ -917,9 +912,17 @@ pub fn run(session: &str) -> Result<()> {
     };
     server.scan_definitions();
     server.load_buffers();
-    server.restore();
-    let result = server.event_loop(&rx);
-    server.shutdown();
+    let result = server.restore().and_then(|()| {
+        // On failure, keep the pipe open until cleanup removes the socket: the caller looks
+        // for a listening server once the pipe closes, and this one cannot serve it.
+        if let Some(mut ready) = ready.take() {
+            use std::io::Write;
+            let _ = ready.write_all(b"1");
+        }
+        let result = server.event_loop(&rx);
+        server.shutdown();
+        result
+    });
     // Its own socket, as far as a look before the removal tells: not the one of a kraal 0.2.0
     // (it takes no lock) that listens there since a cleaner of /tmp removed this one. No other
     // file has this one's number while this server listens: it holds the file until it is gone.
@@ -1842,7 +1845,6 @@ impl Server {
                 again = true;
                 continue;
             }
-            self.last_frame = Instant::now();
             // The frame is composed over the last one: from what one pane printed alone when
             // nothing else can have changed, from everything otherwise.
             let Some(c) = self.clients.get_mut(&id) else { continue };
@@ -1895,6 +1897,7 @@ impl Server {
                 }
                 Err(TrySendError::Disconnected(_)) => {}
             }
+            self.last_frame = Instant::now();
         }
         if again {
             self.next_render = Some(Instant::now() + FRAME);

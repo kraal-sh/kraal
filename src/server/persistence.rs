@@ -133,7 +133,7 @@ impl Server {
     }
 
     /// Recreate the layout saved by a previous server, if any.
-    pub(super) fn restore(&mut self) {
+    pub(super) fn restore(&mut self) -> Result<()> {
         // What a kraal killed while it wrote left: the temporary files of its writes, off the
         // event loop.
         let removing = crate::threads::named("temps").spawn(|| {
@@ -151,18 +151,10 @@ impl Server {
                 interrupted.join(", ")
             ));
         }
-        let snap = match persist::load(&self.session) {
-            Ok(Some(s)) => s,
-            Ok(None) => return,
-            Err(e) => {
-                let kept = keep_aside(&paths::session_state_path(&self.session));
-                self.warnings.push(format!("could not restore the previous session ({e:#}); {kept}"));
-                return;
-            }
-        };
-        if let Err(e) = self.apply_snapshot(snap) {
-            self.warnings.push(format!("restore: {e:#}"));
+        if let Some(snap) = persist::load(&self.session)? {
+            self.apply_snapshot(snap)?;
         }
+        Ok(())
     }
 
     pub(super) fn apply_snapshot(&mut self, snap: SessionSnapshot) -> Result<()> {
@@ -414,19 +406,73 @@ fn flush_answer(
     }
 }
 
-/// Move the state at `path`, which could not be restored, aside rather than overwrite it with
-/// this new session; what became of it, to tell the user.
-fn keep_aside(path: &std::path::Path) -> String {
-    let aside = path.with_extension(format!("json.unreadable-{}", crate::accounts::now()));
-    match std::fs::rename(path, &aside) {
-        Ok(()) => format!("kept it as {}", paths::shorten_home(&aside)),
-        Err(e) => format!("it could not be kept aside ({e}): saving this session replaces it"),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn workspace_identity_survives_renaming_reordering_and_restoring() {
+        use crate::layout::Node;
+        use crate::pane::PaneSpec;
+        use crate::server::Tab;
+        let (tx, _rx) = crate::server::event_channel(4096);
+        let mut server = super::super::tests::server(tx.clone());
+        for name in ["one", "two"] {
+            server.new_workspace(name.into(), Some(format!("/missing/{name}.kdl").into()));
+            let pane = server
+                .spawn_pane(
+                    None,
+                    PaneSpec { files: Some(["/missing".into(), "/missing".into()]), ..Default::default() },
+                )
+                .unwrap();
+            let mut tab = Tab::new(server.alloc_id(), name.into());
+            tab.root = Some(Node::Leaf(pane));
+            server.workspaces.last_mut().unwrap().tabs.push(tab);
+        }
+        let ids: Vec<_> = server.workspaces.iter().map(|w| w.stable_id.clone()).collect();
+        assert_ne!(ids[0], ids[1]);
+        server.workspaces[0].name = "renamed".into();
+        server.workspaces[1].name = "renamed".into();
+        server.workspaces[0].set_definition(Some(std::path::Path::new("/elsewhere/source.kdl")));
+        server.workspaces.reverse();
+        let mut saved = persist::snapshot(&server);
+        saved.workspaces[0].restore_error = Some("previous failure".into());
+        let mut restored = super::super::tests::server(tx);
+        // Runtime ids change across restores and must not become the saved identity.
+        restored.alloc_id();
+        persist::apply(&mut restored, saved).unwrap();
+        assert!(restored.unrestored.is_empty());
+        let saved = persist::snapshot(&restored);
+        assert!(saved.workspaces[0].restore_error.is_none());
+        assert_eq!(saved.workspaces.iter().map(|w| &w.id).collect::<Vec<_>>(), [&ids[1], &ids[0]]);
+        assert_eq!(saved.workspaces[0].name, "renamed", "saved name collisions are kept");
+        assert_eq!(saved.workspaces[1].name, "renamed");
+        assert_eq!(saved.workspaces[1].definition.as_deref(), Some(std::path::Path::new("/elsewhere/source.kdl")));
+        assert_eq!(saved.workspaces[1].tabs[0].name, "one");
+    }
+
+    #[test]
+    fn a_failed_workspace_keeps_its_identity_source_layout_and_reason_until_restored() {
+        let (tx, _rx) = crate::server::event_channel(4096);
+        let mut server = super::super::tests::server(tx.clone());
+        let value = serde_json::json!({ "version": 1, "revision": 2, "workspaces": [{
+            "id": "stable", "name": "kept", "definition": "/missing/source.kdl",
+            "definition_source": "// source kept verbatim", "cwd": null, "active": 0, "tabs": []
+        }] });
+        persist::apply(&mut server, serde_json::from_value(value).unwrap()).unwrap();
+        assert!(server.workspaces.is_empty());
+        let saved = persist::snapshot(&server);
+        let failed = &saved.workspaces[0];
+        assert_eq!(failed.id, "stable");
+        assert_eq!(failed.definition_source.as_deref(), Some("// source kept verbatim"));
+        assert_eq!(failed.restore_error.as_deref(), Some("the saved workspace has no restorable panes"));
+        assert!(server.open_workspace("kept").unwrap_err().to_string().contains("fix the cause and restart"));
+        let reason = failed.restore_error.clone();
+        let mut restored = super::super::tests::server(tx);
+        persist::apply(&mut restored, saved).unwrap();
+        assert_eq!(restored.unrestored[0].id, "stable");
+        assert_eq!(restored.unrestored[0].restore_error, reason);
+    }
 
     /// The writer keeps what holds the session for as long as it can be asked to write, and
     /// lets go of it as it ends: never while a write of its own may still land.
@@ -452,21 +498,6 @@ mod tests {
             assert!(start.elapsed() < crate::testing::PATIENCE, "kept after its last write");
             std::thread::sleep(Duration::from_millis(5));
         }
-    }
-
-    #[test]
-    fn an_unreadable_state_is_kept_aside_or_said_not_to_be() {
-        let dir = std::env::temp_dir().join(format!("kraal-unreadable-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let state = dir.join("main.json");
-        std::fs::write(&state, "{").unwrap();
-        let kept = keep_aside(&state);
-        assert!(kept.starts_with("kept it as ") && !state.exists(), "{kept}");
-        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
-        let lost = keep_aside(&state);
-        assert!(lost.starts_with("it could not be kept aside"), "{lost}");
-        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
