@@ -85,7 +85,10 @@ not saved unless `[buffers] persist = true` ([Configuration](configuration.md)).
 ## Workspace files
 
 Workspaces live in `~/.config/kraal/workspaces/*.kdl` (and in the directories `workspace_dirs`
-names in the configuration), in KDL:
+names in the configuration), in KDL. Two to copy and change:
+[first.kdl](../examples/workspaces/first.kdl) (tabs, a split, a live preview, a command pane) and
+[two-agents.kdl](../examples/workspaces/two-agents.kdl) (two agents, a stack of helper panes).
+One with servers and an agent:
 
 ```kdl
 layout {

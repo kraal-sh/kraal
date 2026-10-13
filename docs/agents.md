@@ -147,6 +147,11 @@ names the commands above. `--no-setup` makes the worktree without any preparatio
 not even read). Your own `copy` and `setup`, for every repository, go in `[worktrees]` in the
 config; they need no approval, and run after the repository's.
 
+To copy: a repository's [worktree.toml](../examples/repository/.kraal/worktree.toml), your own
+[`[worktrees]`](../examples/config/worktrees.toml), and
+[agent-in-worktree.sh](../examples/scripts/agent-in-worktree.sh), which starts an agent in a new
+worktree and tells you when it needs you.
+
 **Ports.** Each worktree has a number in its repository (1, 2…), kept with the worktree whatever
 it checks out (another branch, a detached HEAD) and reused once the worktree is gone. Panes opened
 in it get `$KRAAL_WORKTREE` (its name), `$KRAAL_WORKTREE_INDEX` and `$KRAAL_PORT_OFFSET` (the
@@ -243,6 +248,8 @@ accounts = ["pro", "default"]   # in order of preference
 The file also holds the accounts themselves, one `[[account]]` each (`name`, `agent`, `home`,
 and a `threshold` of its own if it has one), which `kraal accounts add` writes. kraal edits what
 it changes there and leaves the rest as you wrote it, comments included.
+[examples/accounts.toml](../examples/accounts.toml) has limits and two rules, by workspace and by
+directory.
 
 The first rule that matches decides. A new agent starts on the first account of that rule that is
 under its threshold (when all are over, the one whose usage resets first); when

@@ -70,6 +70,7 @@ toggle_floating = ["alt+f"]
 ```
 
 Every name these two tables take is in `kraal config keys` ([Keys](keys.md#your-own-keys)).
+A whole example, on the classic preset: [keys-classic.toml](../examples/config/keys-classic.toml).
 
 ## Themes
 
@@ -82,6 +83,8 @@ sync = "magenta"         # panes typing is broadcast to
 production = "red"
 frames = "rounded"       # or "plain", "thick", "double", "ascii"
 ```
+
+A look to copy, with the sidebar and the bottom bar: [theme.toml](../examples/config/theme.toml).
 
 ## Servers, production and contexts
 

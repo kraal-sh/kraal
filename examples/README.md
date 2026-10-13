@@ -20,7 +20,7 @@ at its tag. The [documentation](../docs/README.md) explains what they use.
 | [accounts.toml](accounts.toml) | Usage limits and two rules, by workspace and by directory | nothing | `kraal accounts` |
 | [runbooks/reload-nginx.toml](runbooks/reload-nginx.toml) | Steps on a group of servers, one at a time, with a parameter, stopping at the first failure | servers where you may sudo | `kraal runbook run reload-nginx --on @web --dry-run` |
 | [runbooks/restart-api.md](runbooks/restart-api.md) | A Markdown procedure whose shell blocks run one by one | a server with systemd | `ctrl+b R b` |
-| [repository/.kraal/worktree.toml](repository/.kraal/worktree.toml) | What a repository copies and runs in its worktrees, once you approved it | npm | `kraal wt new fix-login` |
+| [repository/.kraal/worktree.toml](repository/.kraal/worktree.toml) | What a repository copies and runs in its worktrees, once you approved it | npm | `kraal wt setup` |
 | [repository/.kraal/runbooks/deploy.toml](repository/.kraal/runbooks/deploy.toml) | A runbook shared with the code: tags to choose from, a secret parameter | tags, a deploy script | `kraal runbook run deploy --dry-run` |
 | [scripts/notify-blocked.sh](scripts/notify-blocked.sh) | A script on `kraal events` that goes on where it stopped | jq, curl | `NTFY_TOPIC=my-topic scripts/notify-blocked.sh` |
 | [scripts/agent-in-worktree.sh](scripts/agent-in-worktree.sh) | An agent in a worktree of its own, and a notification when it needs you | git, claude | `scripts/agent-in-worktree.sh fix-login` |

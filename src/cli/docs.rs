@@ -33,7 +33,7 @@ struct Page {
     tables: Vec<Vec<Vec<Vec<String>>>>,
     /// What a link can point at in it: its headings, as GitHub names them.
     anchors: BTreeSet<String>,
-    /// Its links: where each is written, and where it leads.
+    /// Its links and its images: where each is written, and where it leads.
     links: Vec<(String, String)>,
 }
 
@@ -104,11 +104,15 @@ fn page(root: &Path, path: &Path) -> Page {
             Event::End(TagEnd::TableCell) => in_cell = false,
             Event::Start(Tag::Heading { .. }) => heading = Some(String::new()),
             Event::End(TagEnd::Heading(_)) => page.anchors.extend(heading.take().map(|title| anchor(&title))),
-            Event::Start(Tag::Link { dest_url, .. }) => page.links.push((at(range.start), dest_url.to_string())),
+            Event::Start(Tag::Link { dest_url, .. } | Tag::Image { dest_url, .. }) => {
+                page.links.push((at(range.start), dest_url.to_string()));
+            }
             // The README's header is HTML.
             Event::Html(html) | Event::InlineHtml(html) => {
-                let links = html.split("href=\"").skip(1).filter_map(|rest| rest.split('"').next());
-                page.links.extend(links.map(|link| (at(range.start), link.to_string())));
+                for attribute in ["href=\"", "src=\""] {
+                    let links = html.split(attribute).skip(1).filter_map(|rest| rest.split('"').next());
+                    page.links.extend(links.map(|link| (at(range.start), link.to_string())));
+                }
             }
             _ => {}
         }
@@ -587,8 +591,11 @@ fn plain(path: &Path) -> String {
     parts.join("/")
 }
 
+/// A link leads to a page, and to a heading it has, or to another file of the repository (an
+/// example, an image, the licence), which is there.
 #[test]
-fn the_links_between_pages_lead_somewhere() {
+fn the_links_lead_somewhere() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let pages = pages();
     let mut broken = Vec::new();
     for page in &pages {
@@ -599,17 +606,16 @@ fn the_links_between_pages_lead_somewhere() {
                 "" => page.name.clone(),
                 file => plain(&Path::new(&page.name).with_file_name(file)),
             };
-            // Other files (the licence, images) are not pages.
-            if !name.ends_with(".md") {
-                continue;
-            }
-            let target = pages.iter().find(|page| page.name == name);
-            if !target.is_some_and(|page| heading.is_none_or(|h| page.anchors.contains(h))) {
+            let there = match pages.iter().find(|page| page.name == name) {
+                Some(page) => heading.is_none_or(|h| page.anchors.contains(h)),
+                None => !name.ends_with(".md") && root.join(&name).exists(),
+            };
+            if !there {
                 broken.push(format!("{at}: {link}"));
             }
         }
     }
-    assert!(broken.is_empty(), "links to a page or a heading that is not there:\n{}", broken.join("\n"));
+    assert!(broken.is_empty(), "links to a page, a heading or a file that is not there:\n{}", broken.join("\n"));
 }
 
 /// The oldest release kraal works with is written twice: tests/compat.sh tests it, and
