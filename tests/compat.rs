@@ -504,10 +504,11 @@ fn account_migration_preserves_running_release_snapshots_and_rules() {
     }
 }
 
-/// Adoption keeps the name older servers use, even once they reload the shared accounts file.
+/// Released readers load the compact file using the current name; only current readers
+/// understand the former names stored in reference fields.
 #[test]
 #[ignore = "needs KRAAL_OLD, another release's kraal: tests/compat.sh runs it"]
-fn adopting_a_standard_sign_in_keeps_default_usable_on_a_running_release() {
+fn adopting_a_standard_sign_in_keeps_accounts_readable_by_a_running_release() {
     let (old, this) = (Kraal::old(), Kraal::this());
     let env = Env::new("compat-adopt");
     let bin = env.root.join("bin");
@@ -531,26 +532,32 @@ exec sleep 1000
         std::fs::read_to_string(env.root.join("state/kraal/server-compat-adopt.log")).unwrap_or_default()
     );
     let pid = env.server_pid();
-    let open_agent = || {
+    let open_agent = |binary: &Kraal, account: &str| {
         let out = env
-            .cmd(&this, &["agent", "claude", "--account", "default", "--tab"])
+            .cmd(binary, &["agent", "claude", "--account", account, "--tab"])
             .env("KRAAL_SOCKET", env.socket())
             .env("KRAAL_PANE", "first")
             .output()
             .unwrap();
         assert!(out.status.success(), "kraal {}: {}", old.version, String::from_utf8_lossy(&out.stderr));
     };
-    open_agent();
+    open_agent(&this, "default");
     let out = env.cmd(&this, &["accounts", "list", "--json"]).env("PATH", &path).output().unwrap();
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     let list: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(list.as_array().unwrap().len(), 1);
     assert_eq!(list[0]["name"], "Personal");
+    let file: toml::Value =
+        toml::from_str(&std::fs::read_to_string(env.root.join("config/kraal/accounts.toml")).unwrap()).unwrap();
+    assert_eq!(file["account"].as_array().unwrap().len(), 1);
+    assert_eq!(file["account"][0]["name"].as_str(), Some("Personal"));
+    assert_eq!(file["account"][0]["references"][0]["name"].as_str(), Some("default"));
     env.run(&old, &["config", "reload"]);
-    open_agent();
+    open_agent(&this, "Personal");
+    open_agent(&old, "Personal");
     assert_eq!(env.server_pid(), pid, "adoption leaves the release server running");
     let agents: Vec<_> = env.panes(&old).into_iter().filter(|p| p["command"][0] == "claude").collect();
-    assert_eq!(agents.len(), 2);
+    assert_eq!(agents.len(), 3);
     for pane in agents {
         env.wait_for_text(&old, &pane["id"].to_string(), &format!("account-ready:{}", home.display()));
     }

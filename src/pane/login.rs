@@ -145,6 +145,7 @@ mod tests {
                 review: false,
                 public_identity: None,
                 linked_to: None,
+                references: Vec::new(),
             },
             state: LoginState::Running,
             lock: None,

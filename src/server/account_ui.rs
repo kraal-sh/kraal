@@ -15,16 +15,29 @@ use crate::layout::PaneId;
 use crate::text::wrap;
 
 #[derive(Clone)]
+pub enum AccountChoice {
+    New,
+    Existing,
+}
+
+#[derive(Clone)]
 pub struct AccountForm {
     pub agent: usize,
     pub name: String,
     pub cursor: usize,
     pub field: usize,
     pub existing: Option<Account>,
+    pub choice: Option<AccountChoice>,
     pub installed: bool,
     pub error: Option<String>,
     pub scroll: usize,
     pub checking: Option<u32>,
+}
+
+impl AccountForm {
+    fn choosing(&self) -> bool {
+        self.existing.is_some() && self.choice.is_none()
+    }
 }
 
 pub struct AccountDetails {
@@ -83,6 +96,25 @@ pub(super) fn usage_summary(a: &Account, usage: Option<&Usage>, now: i64) -> Str
     }
 }
 
+pub(super) fn sidebar_summary(summary: &str, width: usize) -> String {
+    if crate::text::columns(summary) <= width {
+        return summary.into();
+    }
+    let short = summary
+        .replace("Usage unavailable", "No usage")
+        .replace("Last checked", "Checked")
+        .replace("Sign-in required", "Sign in")
+        .replace("Could not save · Check again", "Retry save")
+        .replace("Could not verify · Check again", "Retry check")
+        .replace("Checking sign-in", "Checking")
+        .replace("% used", "%");
+    if crate::text::columns(&short) <= width {
+        return short;
+    }
+    let status = short.split(" · ").next().unwrap_or_default();
+    if crate::text::columns(status) <= width { status.into() } else { String::new() }
+}
+
 impl Server {
     pub(super) fn account_summary(&self, a: &Account) -> String {
         self.account_summary_at(a, accounts::now())
@@ -94,7 +126,7 @@ impl Server {
             summary
         } else {
             let count = self.panes.keys().filter(|&&p| self.pane_account(p).is_some_and(|b| b.id == a.id)).count();
-            format!("{summary} · {count} pane{}", if count == 1 { "" } else { "s" })
+            if count == 0 { summary } else { format!("{summary} · {count} pane{}", if count == 1 { "" } else { "s" }) }
         }
     }
 
@@ -198,20 +230,23 @@ impl Server {
             cursor: 0,
             field: 1,
             existing: None,
+            choice: None,
             installed: false,
             error: None,
             scroll: 0,
             checking: None,
         };
         self.fill_account_form(&mut form);
-        form.name = self.accounts.proposed_name(accounts::AGENTS[agent].name, None);
-        form.cursor = form.name.chars().count();
         form
     }
 
     pub(super) fn fill_account_form(&self, form: &mut AccountForm) {
+        let choosing = form.choosing();
         let kind = accounts::AGENTS[form.agent];
         form.installed = crate::transfer::have_program(kind.command);
+        if matches!(form.choice, Some(AccountChoice::Existing)) {
+            return;
+        }
         form.existing = self.accounts.reviews().into_iter().chain(self.accounts.unlisted()).find(|a| {
             a.agent == kind.name
                 && (a.review
@@ -223,6 +258,23 @@ impl Server {
                         )
                     ))
         });
+        if form.choosing() && !choosing {
+            form.field = 2;
+        } else if !form.choosing() && choosing {
+            form.field = 1;
+        }
+    }
+
+    pub(super) fn name_existing_form(&self, client: ClientId, existing: Account) -> AccountForm {
+        let mut form = self.account_form(client);
+        form.agent = accounts::AGENTS.iter().position(|k| k.name == existing.agent).unwrap_or(0);
+        form.installed = crate::transfer::have_program(accounts::AGENTS[form.agent].command);
+        form.name = self.accounts.proposed_name(&existing.agent, existing.public_identity.as_deref());
+        form.cursor = form.name.chars().count();
+        form.existing = Some(existing);
+        form.choice = Some(AccountChoice::Existing);
+        form.field = 1;
+        form
     }
 
     fn account_added(&mut self, client: ClientId, account: &Account) {
@@ -251,14 +303,7 @@ impl Server {
                 {
                     return;
                 }
-                let result = (|| -> Result<Account> {
-                    anyhow::ensure!(
-                        status.status == Status::SignedIn,
-                        "{}. Sign in to another account, or try Use existing account again.",
-                        status.status.label()
-                    );
-                    Accounts::update(|all| name_existing_account(all, &existing, status.identity.as_deref(), &name))
-                })();
+                let result = Accounts::update(|all| name_existing_account(all, &existing, &status, &name));
                 server.reload_accounts();
                 match result {
                     Ok(a) => server.account_added(client, &a),
@@ -304,16 +349,24 @@ impl Server {
                     submit = !cancel;
                 }
                 KeyCode::Tab | KeyCode::BackTab => {
-                    let fields: &[usize] = if form.existing.is_some() { &[0, 1, 2, 3, 4] } else { &[0, 1, 2, 4] };
+                    let fields: &[usize] = if form.choosing() { &[0, 2, 3, 4] } else { &[0, 1, 2, 4] };
                     let at = fields.iter().position(|f| *f == form.field).unwrap_or(0);
                     let next = if k.code == KeyCode::BackTab { at + fields.len() - 1 } else { at + 1 };
                     form.field = fields[next % fields.len()];
                 }
                 KeyCode::Left | KeyCode::Right | KeyCode::Up | KeyCode::Down if form.field == 0 => {
                     form.agent = (form.agent + 1) % accounts::AGENTS.len();
+                    form.choice = None;
                     self.fill_account_form(&mut form);
                     form.error = None;
                     form.scroll = 0;
+                }
+                KeyCode::Left | KeyCode::Up | KeyCode::Right | KeyCode::Down if form.field >= 2 => {
+                    let fields: &[usize] = if form.choosing() { &[2, 3, 4] } else { &[2, 4] };
+                    let at = fields.iter().position(|f| *f == form.field).unwrap_or(0);
+                    let next =
+                        if matches!(k.code, KeyCode::Left | KeyCode::Up) { at + fields.len() - 1 } else { at + 1 };
+                    form.field = fields[next % fields.len()];
                 }
                 KeyCode::PageDown => form.scroll = (form.scroll + layout.body.height as usize).min(layout.max_scroll),
                 KeyCode::PageUp => form.scroll = form.scroll.saturating_sub(layout.body.height as usize),
@@ -332,8 +385,9 @@ impl Server {
                     if layout.agent.contains(at) {
                         form.field = 0;
                         form.agent = (form.agent + 1) % accounts::AGENTS.len();
+                        form.choice = None;
                         self.fill_account_form(&mut form);
-                    } else if layout.name.contains(at) {
+                    } else if !form.choosing() && layout.name.contains(at) {
                         form.field = 1;
                     } else if layout.primary.contains(at) {
                         form.field = 2;
@@ -358,11 +412,27 @@ impl Server {
             return Mode::Picker(self.accounts_picker(None));
         }
         if submit {
+            if form.choosing() {
+                if form.field == 3 {
+                    form.choice = Some(AccountChoice::New);
+                    form.field = 1;
+                    form.error = None;
+                    return Mode::AccountForm(form);
+                }
+                let existing = form.existing.as_ref().unwrap();
+                if existing.review {
+                    return Mode::Picker(self.review_account_picker(existing));
+                }
+                return Mode::AccountForm(self.name_existing_form(client, existing.clone()));
+            }
             form.installed = crate::transfer::have_program(accounts::AGENTS[form.agent].command);
             form.scroll = 0;
             if !form.installed {
                 form.error = Some(install_message(form.agent));
-            } else if form.existing.is_some() && form.field != 3 {
+            } else if form.name.trim().is_empty() {
+                form.error = Some("Enter a name for this account.".into());
+                form.field = 1;
+            } else if matches!(form.choice, Some(AccountChoice::Existing)) {
                 return self.use_existing_form(client, form);
             } else {
                 match self.add_account(client, accounts::AGENTS[form.agent].name, form.name.trim()) {
@@ -465,21 +535,27 @@ impl Server {
 fn name_existing_account(
     all: &mut Accounts,
     existing: &Account,
-    identity: Option<&str>,
+    checked: &account_status::Checked,
     name: &str,
 ) -> Result<Account> {
+    anyhow::ensure!(
+        checked.status == Status::SignedIn || existing.review && checked.status == Status::NotSignedIn,
+        "{}. Try Use existing account again.",
+        checked.status.label()
+    );
     let pending = if existing.review { all.reviews() } else { all.unlisted() };
     anyhow::ensure!(pending.contains(existing), "The existing account changed. Open Add account again.");
     let a = if existing.review {
         all.review(existing, None)?
     } else {
-        all.adopt_checked(existing, identity)?;
+        all.adopt_checked(existing, checked.identity.as_deref())?;
         let a = all.by_id(&existing.id).context("The existing account changed. Try again.")?;
         if a.review { all.review(&a, None)? } else { a }
     };
     if a.name != name {
         all.rename(&a.agent, &a.key(), name)?;
     }
+    all.set_sign_in_required(&a, checked.status == Status::NotSignedIn);
     all.by_id(&a.id).context("The account changed. Try again.")
 }
 
@@ -514,13 +590,19 @@ fn form_layout(form: &AccountForm, screen: Rect) -> FormLayout {
         form.error.clone().unwrap_or_else(|| if form.installed { String::new() } else { install_message(form.agent) })
     };
     let lines: Vec<_> = message.lines().flat_map(|l| wrap(l, width.saturating_sub(4).max(1) as usize)).collect();
-    let height = (lines.len() as u16 + 9).min(screen.height.saturating_sub(2)).max(9);
+    let base = if form.choosing() { 8 } else { 7 };
+    let height = (lines.len() as u16 + base).min(screen.height.saturating_sub(2)).max(base);
     let area = overlays::centered(screen, width, height);
     let row = |y| Rect::new(area.x + 2, area.y + y, area.width.saturating_sub(4), 1);
-    let body = Rect { height: area.height.saturating_sub(9), ..row(4) };
-    let primary = row(area.height.saturating_sub(4));
-    let alternate = form.existing.is_some().then(|| row(area.height.saturating_sub(3)));
-    let cancel = Rect { x: area.x + area.width.saturating_sub(10), width: 8, ..primary };
+    let body = Rect { height: area.height.saturating_sub(base), ..row(3) };
+    let primary = row(area.height.saturating_sub(if form.choosing() { 5 } else { 3 }));
+    let primary_width = if form.choosing() || matches!(form.choice, Some(AccountChoice::Existing)) { 24 } else { 11 };
+    let alternate = form.choosing().then(|| Rect { width: 30, ..row(area.height.saturating_sub(4)) });
+    let cancel = if form.choosing() {
+        Rect { width: 10, ..row(area.height.saturating_sub(3)) }
+    } else {
+        Rect { x: primary.x + primary_width + 2, width: 10, ..primary }
+    };
     FormLayout {
         area,
         agent: row(1),
@@ -528,7 +610,7 @@ fn form_layout(form: &AccountForm, screen: Rect) -> FormLayout {
         body,
         max_scroll: lines.len().saturating_sub(body.height as usize),
         lines,
-        primary: Rect { width: primary.width.saturating_sub(12), ..primary },
+        primary: Rect { width: primary_width, ..primary },
         alternate,
         cancel,
         footer: row(area.height.saturating_sub(2)),
@@ -537,7 +619,7 @@ fn form_layout(form: &AccountForm, screen: Rect) -> FormLayout {
 
 pub(super) fn draw_form(form: &AccountForm, screen: Rect, buf: &mut Buffer) -> Option<Cursor> {
     let l = form_layout(form, screen);
-    if l.area.width < 20 || l.area.height < 9 {
+    if l.area.width < 20 || l.area.height < 7 {
         return None;
     }
     let theme = crate::theme::current();
@@ -566,26 +648,48 @@ pub(super) fn draw_form(form: &AccountForm, screen: Rect, buf: &mut Buffer) -> O
         start -= 1;
     }
     let shown: String = chars[start..].iter().collect();
-    buf.set_stringn(l.name.x, l.name.y, format!("Name    {shown}"), l.name.width as usize, style(1));
+    if form.choosing() {
+        let message = format!("Existing {} sign-in needs review.", agent_name(accounts::AGENTS[form.agent].name));
+        buf.set_stringn(l.name.x, l.name.y, message, l.name.width as usize, Style::default());
+    } else {
+        buf.set_stringn(l.name.x, l.name.y, format!("Name    {shown}"), l.name.width as usize, style(1));
+        if form.name.is_empty() {
+            buf.set_stringn(l.name.x + 8, l.name.y, "e.g. Work or Personal", room, Style::default().fg(theme.dim));
+        }
+    }
     let scroll = form.scroll.min(l.max_scroll);
     for (i, line) in l.lines.iter().skip(scroll).take(l.body.height as usize).enumerate() {
         buf.set_stringn(l.body.x, l.body.y + i as u16, line, l.body.width as usize, Style::default().fg(theme.blocked));
     }
+    let primary = if form.choosing() || matches!(form.choice, Some(AccountChoice::Existing)) {
+        "Use existing account"
+    } else {
+        "Sign in"
+    };
+    let button = |buf: &mut Buffer, rect: Rect, label: &str, field| {
+        let selected = form.field == field || field == 2 && form.field < 2;
+        let marker = if selected { "> " } else { "  " };
+        buf.set_stringn(
+            rect.x,
+            rect.y,
+            format!("[{marker}{label}]"),
+            rect.width as usize,
+            overlays::button_style(selected, false),
+        );
+    };
+    button(buf, l.cancel, "Cancel", 4);
     if form.checking.is_some() {
-        buf.set_stringn(l.cancel.x, l.cancel.y, "Cancel", l.cancel.width as usize, style(4));
         buf.set_stringn(l.footer.x, l.footer.y, "Esc Cancel", l.footer.width as usize, Style::default().fg(theme.dim));
         return None;
     }
-    let primary = if form.existing.is_some() { "Use existing account" } else { "Sign in" };
-    for (rect, text, field) in [(l.primary, primary, 2), (l.cancel, "Cancel", 4)] {
-        buf.set_stringn(rect.x, rect.y, text, rect.width as usize, style(field));
-    }
+    button(buf, l.primary, primary, 2);
     if let Some(r) = l.alternate {
-        buf.set_stringn(r.x, r.y, "Sign in to another account", r.width as usize, style(3));
+        button(buf, r, "Sign in to another account", 3);
     }
     let verb = match form.field {
-        3 => "Sign in",
+        3 => "Choose",
         4 => "Cancel",
+        _ if form.choosing() => "Review",
         _ => primary,
     };
     let footer = if l.max_scroll > 0 {
@@ -594,7 +698,7 @@ pub(super) fn draw_form(form: &AccountForm, screen: Rect, buf: &mut Buffer) -> O
         format!("Enter {verb} · Tab Next field · Esc Cancel")
     };
     buf.set_stringn(l.footer.x, l.footer.y, footer, l.footer.width as usize, Style::default().fg(theme.dim));
-    (form.field == 1 && form.checking.is_none() && room > 0).then_some(Cursor {
+    (form.field == 1 && !form.choosing() && form.checking.is_none() && room > 0).then_some(Cursor {
         x: l.name.x + 8 + before as u16,
         y: l.name.y,
         shape: CursorShape::Bar,
@@ -645,6 +749,7 @@ mod tests {
             review: false,
             public_identity: None,
             linked_to: None,
+            references: Vec::new(),
         }
     }
 
@@ -761,7 +866,9 @@ mod tests {
             })
             .unwrap();
             let before = std::fs::read_to_string(&file).unwrap();
-            let result = Accounts::update_at(&file, |all| name_existing_account(all, &existing, None, "stale-name"));
+            let checked = account_status::Checked { status: Status::SignedIn, identity: None };
+            let result =
+                Accounts::update_at(&file, |all| name_existing_account(all, &existing, &checked, "stale-name"));
             assert!(result.unwrap_err().to_string().contains("existing account changed"));
             assert_eq!(std::fs::read_to_string(&file).unwrap(), before);
             assert_eq!(Accounts::load_from(&file).unwrap().by_id(&renamed).unwrap().name, "other-client");
@@ -780,18 +887,61 @@ mod tests {
                 existing = all.reviews().pop().unwrap();
             }
             let mut stale = existing.clone();
+            let checked = account_status::Checked { status: Status::SignedIn, identity: None };
             stale.id = accounts::new_uuid();
-            assert!(name_existing_account(&mut all, &stale, None, "wrong-id").is_err());
+            assert!(name_existing_account(&mut all, &stale, &checked, "wrong-id").is_err());
             stale = existing.clone();
             stale.home = "/nonexistent/replaced".into();
-            assert!(name_existing_account(&mut all, &stale, None, "wrong-home").is_err());
-            let named = name_existing_account(&mut all, &existing, None, "personal").unwrap();
+            assert!(name_existing_account(&mut all, &stale, &checked, "wrong-home").is_err());
+            let named = name_existing_account(&mut all, &existing, &checked, "personal").unwrap();
             assert_eq!(named.name, "personal");
             assert!(named.same_home(&existing));
             assert!(!named.review);
             assert!(!named.sign_in_required);
             assert_eq!(all.for_agent("claude").len(), if reviewed { 2 } else { 1 });
         }
+    }
+
+    #[test]
+    fn a_pending_review_can_be_named_after_sign_out_but_uncertain_checks_change_nothing() {
+        let dir = std::env::temp_dir().join(format!("kraal-signed-out-review-{}", accounts::new_uuid()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for review in [false, true] {
+            for status in [Status::SignedIn, Status::NotSignedIn, Status::NotInstalled, Status::CouldNotCheck] {
+                let file = dir.join(format!("{review}-{status:?}.toml"));
+                let existing = Accounts::update_at(&file, |all| {
+                    all.add(account())?;
+                    let existing = all.unlisted().into_iter().find(|a| a.agent == "claude").unwrap();
+                    if review {
+                        all.adopt_checked(&existing, None)?;
+                        Ok(all.reviews().pop().unwrap())
+                    } else {
+                        Ok(existing)
+                    }
+                })
+                .unwrap();
+                let before = std::fs::read_to_string(&file).unwrap();
+                let checked = account_status::Checked { status, identity: None };
+                let result =
+                    Accounts::update_at(&file, |all| name_existing_account(all, &existing, &checked, "personal"));
+                if status == Status::SignedIn || review && status == Status::NotSignedIn {
+                    let named = result.unwrap();
+                    assert_eq!(named.id, existing.id);
+                    assert_eq!(named.name, "personal");
+                    assert!(named.same_home(&existing));
+                    assert!(!named.review);
+                    assert_eq!(named.sign_in_required, status == Status::NotSignedIn);
+                    let saved = Accounts::load_from(&file).unwrap();
+                    assert_eq!(saved.by_id(&named.id).unwrap(), named);
+                    assert!(saved.reviews().is_empty());
+                    assert_eq!(saved.for_agent("claude").len(), 2);
+                } else {
+                    assert!(result.unwrap_err().to_string().contains(status.label()));
+                    assert_eq!(std::fs::read_to_string(&file).unwrap(), before);
+                }
+            }
+        }
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
@@ -813,12 +963,129 @@ mod tests {
     }
 
     #[test]
+    fn sidebar_summaries_fit_without_cutting_words_or_showing_zero_panes() {
+        for (summary, width, expected) in [
+            ("Usage unavailable", 25, "Usage unavailable"),
+            ("Usage unavailable · 1 pane", 25, "No usage · 1 pane"),
+            ("Usage unavailable · 2 panes", 18, "No usage · 2 panes"),
+            ("57% used · 123 panes", 18, "57% · 123 panes"),
+            ("Last checked 16m ago", 18, "Checked 16m ago"),
+            ("Sign-in required", 12, "Sign in"),
+            ("Could not verify · Check again", 18, "Retry check"),
+        ] {
+            assert_eq!(sidebar_summary(summary, width), expected);
+            assert!(crate::text::columns(expected) <= width);
+        }
+        let mut server = server();
+        let a = server.accounts.add(account()).unwrap();
+        assert_eq!(server.account_summary_at(&a, 1100), "Usage unavailable");
+        server.usage.0.insert(
+            a.key(),
+            Usage {
+                five_hour: Some(Window { used_percent: 57.0, resets_at: Some(2000) }),
+                observed_at: 1000,
+                ..Default::default()
+            },
+        );
+        assert_eq!(server.account_summary_at(&a, 1100), "57% used");
+    }
+
+    #[test]
+    fn pending_sign_in_requires_a_choice_before_a_name_and_enter_only_opens_review() {
+        let mut server = server();
+        server.accounts.add(account()).unwrap();
+        let existing = server.accounts.get("claude", "default").unwrap();
+        server.accounts.adopt_checked(&existing, Some("me@example.com")).unwrap();
+        let pending = server.accounts.reviews().pop().unwrap();
+        let before = server.accounts.all();
+        for screen in [Rect::new(0, 0, 80, 24), Rect::new(0, 0, 124, 36)] {
+            let mut form = server.account_form(0);
+            form.installed = true;
+            assert!(form.choosing());
+            assert_eq!(form.field, 2);
+            assert!(form.name.is_empty());
+            let mut buf = Buffer::empty(screen);
+            assert!(draw_form(&form, screen, &mut buf).is_none());
+            let text = buf.content.iter().map(|c| c.symbol()).collect::<String>();
+            assert!(text.contains("Existing Claude sign-in needs review."));
+            assert!(!text.contains("Name    "));
+            assert!(text.contains("[> Use existing account]"));
+            assert!(text.contains("[  Sign in to another account]"));
+            assert!(text.contains("[  Cancel]"));
+            let l = form_layout(&form, screen);
+            assert_eq!(l.primary.y, l.name.y + 1);
+            assert_eq!(l.alternate.unwrap().y, l.primary.y + 1);
+            assert_eq!(l.cancel.y, l.primary.y + 2);
+            let Mode::Picker(p) = server.on_account_form(0, form.clone(), key("enter")) else { panic!() };
+            assert!(p.kind == PickerKind::AccountReview);
+            let Mode::AccountForm(form) = server.on_account_form(0, form, key("right")) else { panic!() };
+            assert_eq!(form.field, 3);
+            let mut buf = Buffer::empty(screen);
+            draw_form(&form, screen, &mut buf);
+            assert!(
+                buf.content.iter().map(|c| c.symbol()).collect::<String>().contains("[> Sign in to another account]")
+            );
+            let Mode::AccountForm(form) = server.on_account_form(0, form, key("enter")) else { panic!() };
+            assert!(!form.choosing());
+            assert!(matches!(form.choice, Some(AccountChoice::New)));
+            assert_eq!(form.field, 1);
+            assert!(form.name.is_empty());
+            let mut buf = Buffer::empty(screen);
+            assert!(draw_form(&form, screen, &mut buf).is_some());
+            let text = buf.content.iter().map(|c| c.symbol()).collect::<String>();
+            assert!(text.contains("Name    e.g. Work or Personal"));
+            assert!(text.contains("[> Sign in]  [  Cancel]"));
+            let Mode::AccountForm(form) = server.on_account_form(0, form, key("enter")) else { panic!() };
+            assert!(form.error.is_some());
+        }
+        assert_eq!(server.accounts.all(), before);
+        assert_eq!(server.accounts.reviews(), std::slice::from_ref(&pending));
+        let form = server.name_existing_form(0, pending);
+        assert_eq!(form.name, "me@example.com");
+        assert!(matches!(form.choice, Some(AccountChoice::Existing)));
+    }
+
+    #[test]
+    fn one_click_selects_either_sign_in_path_and_background_refresh_keeps_the_choice() {
+        let mut server = server();
+        server.accounts.add(account()).unwrap();
+        let existing = server.accounts.get("claude", "default").unwrap();
+        server.accounts.adopt_checked(&existing, None).unwrap();
+        let form = server.account_form(0);
+        let l = form_layout(&form, server.client_screen(0));
+        let click = |r: Rect| {
+            InputEvent::Mouse(MouseEvent {
+                kind: MouseKind::Press(MouseButton::Left),
+                col: r.x,
+                row: r.y,
+                mods: Default::default(),
+            })
+        };
+        assert!(
+            matches!(server.on_account_form(0, form.clone(), click(l.primary)), Mode::Picker(p) if p.kind == PickerKind::AccountReview)
+        );
+        let Mode::AccountForm(mut form) = server.on_account_form(0, form, click(l.alternate.unwrap())) else {
+            panic!()
+        };
+        form.name = "Work".into();
+        server.fill_account_form(&mut form);
+        assert_eq!(form.name, "Work");
+        assert!(!form.choosing());
+        assert!(matches!(form.choice, Some(AccountChoice::New)));
+        let existing = server.accounts.reviews().pop().unwrap();
+        let mut form = server.name_existing_form(0, existing.clone());
+        server.accounts.review(&existing, None).unwrap();
+        server.fill_account_form(&mut form);
+        assert_eq!(form.existing, Some(existing), "a stale form keeps its snapshot for validation");
+    }
+
+    #[test]
     fn accounts_list_always_has_one_active_add_row_and_selects_by_identity() {
         let mut server = server();
         let a = server.accounts.add(account()).unwrap();
         let mut p = server.accounts_picker(Some(&a.id));
         assert_eq!(p.current().unwrap().label, "Claude · work");
-        assert_eq!(p.current().unwrap().detail, "Usage unavailable · 0 panes");
+        assert_eq!(p.current().unwrap().detail, "Usage unavailable");
         assert_eq!(p.items.len(), 2);
         p.query = "nothing matches".into();
         p.refilter();
@@ -843,7 +1110,7 @@ mod tests {
     fn add_form_defaults_and_missing_program_keep_values_without_creating_an_account() {
         let mut server = server();
         let form = server.account_form(0);
-        assert_eq!(form.name, "Personal");
+        assert!(form.name.is_empty());
         assert_eq!(form.agent, 0);
         let name = form.name.clone();
         let Mode::AccountForm(form) = server.on_account_form(0, form, key("enter")) else { panic!("form closed") };
@@ -909,7 +1176,7 @@ mod tests {
         let text = buf.content.iter().map(|c| c.symbol()).collect::<String>();
         assert!(text.find("Use existing account").unwrap() < text.find("Sign in to another account").unwrap());
         let Mode::AccountDetails(details) = server.account_details(&a.id) else { panic!() };
-        assert_eq!(details.text, "Usage unavailable · 0 panes");
+        assert_eq!(details.text, "Usage unavailable");
         assert!(matches!(server.on_account_details(0, details, key("tab")), Mode::Picker(p) if p.actions == Some(0)));
     }
     #[test]

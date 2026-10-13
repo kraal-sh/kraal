@@ -309,6 +309,9 @@ impl Server {
                 return Mode::Picker(self.accounts_picker(None));
             }
             PickAction::UseExisting { existing, target } => {
+                if target.is_none() {
+                    return Mode::AccountForm(self.name_existing_form(id, existing));
+                }
                 let name = target.as_ref().map_or(existing.name.as_str(), |a| &a.name);
                 return Mode::confirm(
                     format!("Use {name}?\nYour running agents will keep working.\nThis account will appear once."),
@@ -520,6 +523,7 @@ mod account_tests {
                 review: false,
                 public_identity: None,
                 linked_to: None,
+                references: Vec::new(),
             })
             .unwrap();
         for line in [0, 1] {
@@ -562,6 +566,7 @@ mod account_tests {
                 review: false,
                 public_identity: None,
                 linked_to: None,
+                references: Vec::new(),
             })
             .unwrap();
         let p = server.accounts_picker(Some(&a.id));

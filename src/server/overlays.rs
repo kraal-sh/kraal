@@ -671,6 +671,15 @@ pub(super) fn confirm_layout(q: &Question, screen: Rect) -> ConfirmLayout {
     ConfirmLayout { area, lines, body, max_scroll, more, cancel, ok }
 }
 
+pub(super) fn button_style(selected: bool, danger: bool) -> Style {
+    let color = if danger { th().production } else { th().accent };
+    if selected {
+        Style::default().fg(Color::Black).bg(color).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(th().text).add_modifier(Modifier::UNDERLINED)
+    }
+}
+
 /// A question with its two buttons. The message wraps; when it is longer than the box, it
 /// scrolls (the buttons stay in view). A quoted line longer than the box goes on in the rows
 /// below it, each marked in the margin, where no text of the message is ever drawn: a long line
@@ -704,15 +713,8 @@ pub(super) fn draw_confirm(q: &Question, screen: Rect, buf: &mut Buffer) {
         let more = if th().ascii { more.replace('↓', "v").replace('↑', "^") } else { more };
         buf.set_stringn(inner.x + 1, y, format!("{more:>width$}"), width, dim());
     }
-    let button = |label: &str, selected: bool, danger: bool| {
-        let c = if danger { th().production } else { th().accent };
-        let style = if selected {
-            Style::default().fg(Color::Black).bg(c).add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(th().text).add_modifier(Modifier::UNDERLINED)
-        };
-        Span::styled(format!(" {label} "), style)
-    };
+    let button =
+        |label: &str, selected: bool, danger: bool| Span::styled(format!(" {label} "), button_style(selected, danger));
     if let Some(cancel) = layout.cancel {
         let row = Line::from(vec![
             button("Cancel", !q.yes, false),

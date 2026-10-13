@@ -221,8 +221,8 @@ Review** (or Codex). Open it in Accounts (`ctrl+b A l`), click Review in the sid
 **A different account**. Choose one, then confirm **Use account**. Cancel is selected first.
 Running agents keep their process and home. New launches use the selected named account's
 home. The account appears once, and its latest usage observation is used without adding usage
-from two homes. No home or credential is deleted. Choosing **A different account** keeps the
-existing home as a separate named account. The answer is saved, so Review does not return.
+from two homes. No home or credential is deleted. Choosing **A different account** asks for its name and keeps the
+existing home as a separate named account. The command-line review keeps its proposed name. The answer is saved, so Review does not return.
 Two names for the same canonical home are joined automatically; an email alone never joins
 accounts.
 
@@ -242,16 +242,22 @@ Open **Accounts** from the Agents menu (`ctrl+b A l`), or click the sidebar's **
 heading. Each account has two lines: `Claude · work` and `57% used · 2 panes`. Unknown usage
 says **Usage unavailable**, a login still to verify says **Sign-in required**, and expired
 observations say **Last checked ...**. Enter or one click opens details with the usage windows,
-when they were checked and their resets. The sidebar uses the same wording; clicking either
-line opens those details. Tab opens **Rename**, **Sign in**, and **Remove** (`ctrl+r`, `ctrl+l`,
-`ctrl+x`). Remove asks first, with Cancel selected, and explains that conversations and the
+when they were checked and their resets. Zero panes are omitted. In a narrow sidebar, **No usage**
+and **Checked ...** keep the second line readable; clicking either line opens those details.
+Tab opens **Rename**, **Sign in**, and **Remove** (`ctrl+r`, `ctrl+l`, `ctrl+x`). Remove asks first, with Cancel selected, and explains that conversations and the
 agent's own sign-in are kept.
 
 **+ Add account** opens one form, also reached directly with `ctrl+b A n`. It stays visible when
 filtering the list. **Agent** starts with the focused pane's agent, otherwise the last choice;
-Left/Right changes it. **Name** starts with an available name. Tab moves between fields and
-buttons. If an existing sign-in is still unadopted, **Use existing account** is offered first,
-with **Sign in to another account** below it. A missing agent says **Not installed** and explains
+Left/Right changes it. When an existing sign-in needs review, a one-line explanation and the
+buttons **Use existing account**, **Sign in to another account**, and **Cancel** come before
+any name field. **Use existing account** opens Review; it does not adopt the sign-in. Choosing
+**Sign in to another account** opens the name field for a new sign-in. A name for an existing
+sign-in uses the public identity reported by the agent when available and not already taken.
+Otherwise **Name** is empty with the hint **e.g. Work or Personal**. Enter on an empty name asks
+for a name and changes nothing. No numbered Personal name is proposed by the form.
+Tab moves between fields and buttons; arrows choose a button. Buttons stay together, with a
+border and a `>` marker on the selected action. A missing agent says **Not installed** and explains
 how to retry. An error keeps both fields; long errors wrap and scroll with PageUp/PageDown or
 the wheel. Enter or one click on a button submits it. Successful addition returns to Accounts,
 selects the new account and says **Account added**. These screens also work at 80x24 without
@@ -340,9 +346,16 @@ accounts = ["pro", "Personal"]  # in order of preference
 The file also holds the accounts themselves, one `[[account]]` each (`name`, `agent`, `home`,
 an internal `id`, and a `threshold` of its own if it has one), which `kraal accounts add` writes. A login that has
 not been verified also has `sign_in_required = true`; successful verification removes that flag.
-Pending reviews have `review = true` and may keep a `public_identity` supplied by the agent. Old entries retained for compatibility use `linked_to` to
-refer to the chosen identity; they are not additional accounts. Keep these generated fields.
-An older kraal ignores them and can still display its old duplicate entries until restarted.
+Pending reviews have `review = true` and may keep a `public_identity` supplied by the agent.
+Former names, identities and homes are stored in `[[account.references]]` under their owner,
+including notes and unknown keys. Old files with separate `linked_to` account entries are
+compacted on their next rewrite, with the original kept in `accounts.toml.kraal-bak`. Once a
+review is resolved there is one `[[account]]` per account in the list. References whose account
+was removed have no owner; they are kept in `[[forgotten]]` to prevent rediscovery and identity
+reuse, not as account entries. Keep these generated fields. No home or credential is removed.
+Older kraal reads the ordinary `name`, `agent` and `home` fields and ignores these reference
+fields. It cannot resolve a former name from them and may rediscover a standard home joined to
+another home. See [Account compatibility](compatibility.md#account-identities).
 kraal edits what it changes there and leaves the rest as you wrote it, including comments, order
 and unknown keys. A new file includes an explanatory header and omits empty rules and an empty `[claude]`
 table. When kraal next rewrites an older file, it removes an empty top-level `rule = []` and an
