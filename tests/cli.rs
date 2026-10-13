@@ -1004,6 +1004,126 @@ fn save_writes_a_definition_that_reopens() {
     assert!(!env.root.join("config/kraal/escape.kdl").exists());
 }
 
+/// Saves never take another workspace's source. Other existing files need a confirmation
+/// which preserves the input on Cancel and expires when the file changes again.
+#[test]
+fn workspace_saves_check_ownership_and_confirm_the_exact_file() {
+    let env = Env::new("wssavechecked");
+    let dir = env.root.join("config/kraal/workspaces");
+    let old = "layout {\n    pane name=\"original\"\n}\n";
+    env.workspace("a", old);
+    env.workspace("b", old);
+    env.workspace("copy", old);
+    env.run(&["open", "a"]);
+    env.run(&["open", "b"]);
+    let refused = env.try_run(&["save", "b", "--workspace", "a"]);
+    assert!(!refused.status.success());
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("belongs to workspace"));
+    assert_eq!(std::fs::read_to_string(dir.join("b.kdl")).unwrap(), old);
+    let refused = env.try_run(&["save", "copy", "--workspace", "a"]);
+    assert!(!refused.status.success());
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("confirm replacement"));
+    assert!(!dir.join("copy.kdl.bak").exists());
+
+    let mut client = RawClient::attach(&env, "a");
+    client.wait_for_message("\"attached\"");
+    client.send(b"\x02Ws");
+    client.wait_for_row("Save workspace layout as");
+    client.send(b"\x01\x0bcopy\r");
+    client.wait_for_row("Replace file?");
+    client.send(b"\r");
+    client.wait_for_row("Save workspace layout as");
+    assert_eq!(std::fs::read_to_string(dir.join("copy.kdl")).unwrap(), old);
+    client.send(b"\r");
+    client.wait_for_row("Replace file?");
+    std::fs::write(dir.join("copy.kdl"), "edited after confirmation").unwrap();
+    client.send(b"y");
+    // The reason stays visible even when the full destination is wider than the prompt.
+    client.wait_for_row("changed while saving");
+    client.send(b"\r");
+    client.wait_for_row("Replace file?");
+    client.send(b"y");
+    client.wait_for_row("saved ");
+    assert_eq!(std::fs::read_to_string(dir.join("copy.kdl.bak")).unwrap(), "edited after confirmation");
+    assert_eq!(listed_workspaces(&env), ["a: a.kdl (open)", "b: b.kdl (open)", "copy: copy.kdl"]);
+    // Saving the linked source after a manual edit also asks, without restarting its panes.
+    std::fs::write(dir.join("a.kdl"), "invalid KDL from an editor").unwrap();
+    client.send(b"\x02Ws\r");
+    client.wait_for_row("File changed");
+    client.send(b"y");
+    client.wait_for_row("saved ");
+    wait_until(PATIENCE, "the confirmed source was not saved", || {
+        std::fs::read_to_string(dir.join("a.kdl.bak")).is_ok_and(|s| s == "invalid KDL from an editor")
+    });
+    assert_eq!(env.run(&["panes"]).lines().count(), 2);
+}
+
+#[test]
+fn a_cli_save_persists_its_first_link_before_the_periodic_save() {
+    let env = Env::new("wssavelink");
+    env.workspace("base", "layout { pane; }\n");
+    env.run(&["open", "base"]);
+    let mut client = RawClient::attach(&env, "base");
+    client.wait_for_message("\"attached\"");
+    client.send(b"\x02Wn");
+    client.wait_for_row("New workspace");
+    client.send(b"scratch\r");
+    wait_until(PATIENCE, "scratch was not created", || listed_workspaces(&env).iter().any(|w| w == "scratch:  (open)"));
+    env.run(&["save", "linked", "--workspace", "scratch"]);
+    wait_until(Duration::from_secs(10), "the CLI link was not persisted promptly", || {
+        let Ok(text) = std::fs::read_to_string(env.state_file()) else { return false };
+        let Ok(state) = serde_json::from_str::<serde_json::Value>(&text) else { return false };
+        state["workspaces"].as_array().is_some_and(|list| {
+            list.iter()
+                .any(|w| w["name"] == "scratch" && w["definition"].as_str().is_some_and(|p| p.ends_with("/linked.kdl")))
+        })
+    });
+    env.run(&["kill"]);
+    env.run(&["open", "linked"]);
+    assert_eq!(listed_workspaces(&env), ["base: base.kdl (open)", "scratch: linked.kdl (open)"]);
+}
+
+/// Independent sessions share files, not revisions. They cannot overwrite each other's saves,
+/// including when both try to create the same copy at once.
+#[test]
+fn two_sessions_cannot_silently_replace_each_others_layouts() {
+    let first = Env::new("wssavefirst");
+    let second = Env::new("wssavesecond");
+    let shared = first.root.join("config/kraal/workspaces");
+    let alias = second.root.join("config/kraal/workspaces");
+    std::fs::remove_dir(&alias).unwrap();
+    std::os::unix::fs::symlink(&shared, &alias).unwrap();
+    let old = "layout {\n    pane name=\"shared\"\n}\n";
+    first.workspace("work", old);
+    first.run(&["open", "work"]);
+    second.run(&["open", "work"]);
+    first.run(&["run", "--name", "first", "--", "sleep", "100"]);
+    second.run(&["run", "--name", "second", "--", "sleep", "100"]);
+    first.run(&["save", "--workspace", "work"]);
+    let winner = std::fs::read_to_string(shared.join("work.kdl")).unwrap();
+    let refused = second.try_run(&["save", "--workspace", "work"]);
+    assert!(!refused.status.success());
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("File changed"));
+    assert_eq!(std::fs::read_to_string(shared.join("work.kdl")).unwrap(), winner);
+    assert_eq!(std::fs::read_to_string(shared.join("work.kdl.bak")).unwrap(), old);
+    // Restarting cannot silently adopt the version written by the other session.
+    second.run(&["kill"]);
+    second.run(&["open", "work"]);
+    assert!(!second.try_run(&["save", "--workspace", "work"]).status.success());
+    let mut one = first.cmd(&["save", "copy", "--workspace", "work"]);
+    let mut two = second.cmd(&["save", "copy", "--workspace", "work"]);
+    one.stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped());
+    two.stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped());
+    let one = one.spawn().unwrap();
+    let two = two.spawn().unwrap();
+    let (one, two) = (one.wait_with_output().unwrap(), two.wait_with_output().unwrap());
+    assert_ne!(one.status.success(), two.status.success(), "{one:?} {two:?}");
+    let copy = std::fs::read_to_string(shared.join("copy.kdl")).unwrap();
+    let expected = if one.status.success() { "name=\"first\"" } else { "name=\"second\"" };
+    assert!(copy.contains(expected), "{copy}");
+    assert!(!shared.join("copy.kdl.bak").exists());
+}
+
 /// `kraal save` run in a pane saves that pane's workspace, as every command run in a pane acts
 /// where it runs: not the workspace a terminal shows, nor the first one. `--workspace` names
 /// another, and outside a pane the one on screen is saved.

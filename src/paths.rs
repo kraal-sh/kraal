@@ -322,6 +322,150 @@ pub fn write_atomic(path: &Path, data: &[u8]) -> std::io::Result<()> {
     write_with_mode(&target, data, mode)
 }
 
+/// The bytes and resolved destination a file operation was prepared against. A confirmation
+/// must not authorize a new file reached through a changed symlink or a replaced directory.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FileRevision {
+    pub target: PathBuf,
+    pub bytes: Option<Vec<u8>>,
+    inode: Option<(u64, u64)>,
+}
+
+impl FileRevision {
+    pub fn read(path: &Path) -> std::io::Result<Self> {
+        let target = match std::fs::canonicalize(path) {
+            Ok(target) => target,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // A dangling link is not an invitation to replace the link itself.
+                if std::fs::symlink_metadata(path).is_ok() {
+                    return Err(e);
+                }
+                let parent = path.parent().unwrap_or(Path::new("."));
+                let parent = std::fs::canonicalize(parent)?;
+                return Ok(Self {
+                    target: parent.join(path.file_name().unwrap_or_default()),
+                    bytes: None,
+                    inode: None,
+                });
+            }
+            Err(e) => return Err(e),
+        };
+        let inode = file_id(&target);
+        let bytes = read_regular(&target, u64::MAX)?;
+        if inode != file_id(&target) {
+            return Err(file_changed(path));
+        }
+        Ok(Self { target, bytes: Some(bytes), inode })
+    }
+}
+
+fn file_changed(path: &Path) -> std::io::Error {
+    std::io::Error::other(format!("File changed while saving; retry to review {}", path.display()))
+}
+
+/// Save only the revision that was read or confirmed. The lock serializes kraal writers,
+/// including sessions using symlinks to the same file. An editor need not take that lock, so
+/// the old entry is moved aside and checked before a no-replace publication. An editor that
+/// creates the destination meanwhile wins; writes through its old descriptor stay in the
+/// backup. There is briefly no file at the destination, also after a crash at that point.
+pub fn write_checked(path: &Path, data: &[u8], expected: &FileRevision) -> std::io::Result<()> {
+    locked(&expected.target, || {
+        if FileRevision::read(path)? != *expected {
+            return Err(file_changed(path));
+        }
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&expected.target).map(|m| m.permissions().mode() & 0o7777).unwrap_or(0o644);
+        let tmp = temp_beside(&expected.target);
+        let result = write_with_mode(&tmp, data, mode).and_then(|()| {
+            if expected.bytes.is_none() {
+                return rename_no_replace(&tmp, &expected.target);
+            }
+            // Unlike an abandoned .tmp, this file must survive cleanup after a crash.
+            let kept = temp_beside(&expected.target).with_extension("recover");
+            rename_no_replace(&expected.target, &kept)?;
+            sync_dir(expected.target.parent().unwrap());
+            replace_kept(path, &tmp, &kept, expected)
+        });
+        let _ = std::fs::remove_file(&tmp);
+        if result.is_ok() {
+            sync_dir(expected.target.parent().unwrap());
+        }
+        result
+    })?
+}
+
+fn replace_kept(path: &Path, tmp: &Path, kept: &Path, expected: &FileRevision) -> std::io::Result<()> {
+    let mut recovery = kept.to_path_buf();
+    let result = (|| {
+        if file_id(kept) != expected.inode || read_regular(kept, u64::MAX)? != *expected.bytes.as_ref().unwrap() {
+            return Err(file_changed(path));
+        }
+        // Resolve again while the destination is absent: a retargeted link or directory must
+        // not send the new layout elsewhere. A symlink to the held file is temporarily dangling.
+        if file_target(path)? != expected.target {
+            return Err(file_changed(path));
+        }
+        let backup = expected.target.with_extension("kdl.bak");
+        // Rename the entry, never copy through a symlink at the backup's name.
+        std::fs::rename(kept, &backup).map_err(|e| {
+            std::io::Error::new(
+                e.kind(),
+                format!("keeping a backup at {}: {e}; fix that destination and retry", backup.display()),
+            )
+        })?;
+        recovery = backup;
+        sync_dir(recovery.parent().unwrap());
+        rename_no_replace(tmp, &expected.target)
+    })();
+    if let Err(error) = result {
+        if rename_no_replace(&recovery, &expected.target).is_ok() {
+            sync_dir(expected.target.parent().unwrap());
+            return Err(error);
+        }
+        // Do not leave a failed save's recovery at .bak, which a later save would replace.
+        if recovery != kept && rename_no_replace(&recovery, kept).is_ok() {
+            recovery = kept.to_path_buf();
+        }
+        sync_dir(recovery.parent().unwrap());
+        return Err(std::io::Error::other(format!(
+            "{error}; the previous file is kept at {}; inspect that file before retrying",
+            recovery.display()
+        )));
+    }
+    Ok(())
+}
+
+// Unlike canonicalize, this also resolves a symlink to a temporarily absent destination.
+fn file_target(path: &Path) -> std::io::Result<PathBuf> {
+    let mut entry = path.to_path_buf();
+    for _ in 0..40 {
+        let parent = std::fs::canonicalize(entry.parent().unwrap_or(Path::new(".")))?;
+        entry = parent.join(entry.file_name().unwrap_or_default());
+        match std::fs::read_link(&entry) {
+            Ok(to) => entry = if to.is_absolute() { to } else { parent.join(to) },
+            Err(e) if matches!(e.kind(), std::io::ErrorKind::NotFound | std::io::ErrorKind::InvalidInput) => {
+                return Ok(entry);
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Err(std::io::Error::from_raw_os_error(libc::ELOOP))
+}
+
+/// Whether two definition paths reach the same file, including symlinks and hard links.
+pub fn same_file(a: &Path, b: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    if crate::workspace::definition_path(a) == crate::workspace::definition_path(b) {
+        return true;
+    }
+    if let (Ok(a), Ok(b)) = (std::fs::metadata(a), std::fs::metadata(b))
+        && (a.dev(), a.ino()) == (b.dev(), b.ino())
+    {
+        return true;
+    }
+    matches!((file_target(a), file_target(b)), (Ok(a), Ok(b)) if a == b)
+}
+
 /// The device and inode of the entry at `path` (a link's own, not its target's), which a rename
 /// keeps.
 pub fn file_id(path: &Path) -> Option<(u64, u64)> {
@@ -1927,6 +2071,159 @@ mod tests {
         assert!(open_private_append(&link).is_err());
         assert!(!elsewhere.exists(), "nothing is written where the link points");
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    fn checked_directory(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("kraal-checked-{name}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn concurrent_creates_and_replacements_have_one_winner() {
+        use std::sync::{Arc, Barrier};
+        for exists in [false, true] {
+            let dir = checked_directory(if exists { "replace" } else { "create" });
+            let path = dir.join("work.kdl");
+            if exists {
+                std::fs::write(&path, "old").unwrap();
+            }
+            let alias = dir.join("alias.kdl");
+            std::os::unix::fs::symlink("work.kdl", &alias).unwrap();
+            let expected = FileRevision::read(&path).unwrap();
+            let barrier = Arc::new(Barrier::new(2));
+            let writers: Vec<_> = [b"first".as_slice(), b"second".as_slice()]
+                .into_iter()
+                .enumerate()
+                .map(|(i, data)| {
+                    let path = if exists && i == 1 { alias.clone() } else { path.clone() };
+                    let (expected, barrier) = (expected.clone(), barrier.clone());
+                    std::thread::spawn(move || {
+                        barrier.wait();
+                        write_checked(&path, data, &expected)
+                    })
+                })
+                .collect();
+            let results: Vec<_> = writers.into_iter().map(|w| w.join().unwrap()).collect();
+            assert_eq!(results.iter().filter(|r| r.is_ok()).count(), 1, "{results:?}");
+            let content = std::fs::read_to_string(&path).unwrap();
+            assert!(content == "first" || content == "second");
+            if exists {
+                assert_eq!(std::fs::read_to_string(path.with_extension("kdl.bak")).unwrap(), "old");
+            } else {
+                assert!(!path.with_extension("kdl.bak").exists());
+            }
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn edits_with_the_same_size_and_timestamp_are_not_overwritten() {
+        let dir = checked_directory("same-time");
+        let path = dir.join("work.kdl");
+        std::fs::write(&path, "old").unwrap();
+        let expected = FileRevision::read(&path).unwrap();
+        let time = std::fs::metadata(&path).unwrap().modified().unwrap();
+        std::fs::write(&path, "new").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(time))
+            .unwrap();
+        assert!(write_checked(&path, b"ours", &expected).is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "new");
+        assert!(!path.with_extension("kdl.bak").exists());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn an_edit_between_comparison_and_moving_the_file_is_restored() {
+        let dir = checked_directory("displaced-edit");
+        let path = dir.join("work.kdl");
+        let (tmp, kept) = (dir.join("new"), dir.join("kept.recover"));
+        std::fs::write(&path, "old").unwrap();
+        let expected = FileRevision::read(&path).unwrap();
+        std::fs::write(&tmp, "ours").unwrap();
+        // The editor changed it after the initial comparison, before the entry was moved aside.
+        std::fs::write(&path, "edited").unwrap();
+        rename_no_replace(&path, &kept).unwrap();
+        assert!(replace_kept(&path, &tmp, &kept, &expected).is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "edited");
+        assert!(!kept.exists());
+        assert!(!path.with_extension("kdl.bak").exists());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn an_editor_that_creates_the_destination_wins_and_both_versions_survive() {
+        let dir = checked_directory("editor-wins");
+        let path = dir.join("work.kdl");
+        let (tmp, kept) = (dir.join("new"), dir.join("kept.recover"));
+        std::fs::write(&path, "old").unwrap();
+        let expected = FileRevision::read(&path).unwrap();
+        std::fs::write(&tmp, "ours").unwrap();
+        rename_no_replace(&path, &kept).unwrap();
+        std::fs::write(&path, "editor").unwrap();
+        let error = replace_kept(&path, &tmp, &kept, &expected).unwrap_err().to_string();
+        assert!(error.contains(&kept.display().to_string()), "{error}");
+        assert!(error.contains("inspect that file before retrying"), "{error}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "editor");
+        assert_eq!(std::fs::read_to_string(&kept).unwrap(), "old");
+        assert!(!abandoned_temp(kept.file_name().unwrap().to_str().unwrap()));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn backup_failures_restore_the_file_and_backup_links_are_not_followed() {
+        let dir = checked_directory("backup");
+        let path = dir.join("work.kdl");
+        let backup = path.with_extension("kdl.bak");
+        let precious = dir.join("precious");
+        std::fs::write(&path, "old").unwrap();
+        let expected = FileRevision::read(&path).unwrap();
+        std::fs::create_dir(&backup).unwrap();
+        assert!(write_checked(&path, b"ours", &expected).is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "old");
+        std::fs::remove_dir(&backup).unwrap();
+        std::fs::write(&precious, "kept").unwrap();
+        std::os::unix::fs::symlink(&precious, &backup).unwrap();
+        write_checked(&path, b"ours", &expected).unwrap();
+        assert_eq!(std::fs::read_to_string(&precious).unwrap(), "kept");
+        assert_eq!(std::fs::read_to_string(&backup).unwrap(), "old");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn checked_saves_preserve_symlinks_modes_and_writes_to_the_old_descriptor() {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+        let dir = checked_directory("links");
+        let path = dir.join("work.kdl");
+        let (alias, second) = (dir.join("alias.kdl"), dir.join("second.kdl"));
+        std::fs::write(&path, "old").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
+        std::os::unix::fs::symlink("work.kdl", &alias).unwrap();
+        std::os::unix::fs::symlink("alias.kdl", &second).unwrap();
+        let expected = FileRevision::read(&second).unwrap();
+        let mut editor = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+        write_checked(&second, b"ours", &expected).unwrap();
+        editor.write_all(b" edited").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "ours");
+        assert_eq!(std::fs::read_to_string(path.with_extension("kdl.bak")).unwrap(), "old edited");
+        assert!(std::fs::symlink_metadata(&second).unwrap().file_type().is_symlink());
+        assert!(std::fs::symlink_metadata(&alias).unwrap().file_type().is_symlink());
+        assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o640);
+        let expected = FileRevision::read(&alias).unwrap();
+        let other = dir.join("other.kdl");
+        std::fs::write(&other, "ours").unwrap();
+        std::fs::remove_file(&alias).unwrap();
+        std::os::unix::fs::symlink(&other, &alias).unwrap();
+        assert!(write_checked(&alias, b"wrong", &expected).is_err());
+        assert_eq!(std::fs::read_to_string(&other).unwrap(), "ours");
+        std::fs::remove_file(&other).unwrap();
+        assert!(FileRevision::read(&alias).is_err());
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

@@ -544,7 +544,7 @@ impl Server {
         }
         for (path, def) in self.definitions() {
             let Ok(def) = def else { continue };
-            if self.definition_workspace(&path).is_some() {
+            if !matches!(self.definition_workspace(&path), Ok(None)) {
                 continue;
             }
             out.push(WorkspaceInfo {

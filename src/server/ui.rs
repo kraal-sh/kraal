@@ -93,6 +93,10 @@ impl Mode {
 
 pub enum ConfirmAction {
     RemoveAccount(crate::accounts::Account),
+    ReplaceWorkspaceFile {
+        prompt: Prompt,
+        save: super::definitions::DefinitionSave,
+    },
     UseExisting {
         existing: Box<crate::accounts::Account>,
         target: Option<crate::accounts::Account>,
@@ -165,6 +169,7 @@ impl ConfirmAction {
     /// The confirming button: what will happen.
     pub fn verb(&self) -> String {
         match self {
+            ConfirmAction::ReplaceWorkspaceFile { .. } => "Replace file".into(),
             ConfirmAction::UseExisting { .. } => "Use account".into(),
             ConfirmAction::RemoveAccount(_) => "Remove".into(),
             ConfirmAction::ClosePane(_) => "Close pane".into(),

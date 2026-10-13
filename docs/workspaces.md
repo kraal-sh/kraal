@@ -214,3 +214,37 @@ Renaming the workspace (`ctrl+b W e`) renames its file: `perso.kdl` becomes `inf
 beside it. The new name must then be a file name (no `/`, not starting with `.`), and a file
 already there is never replaced: the rename is refused and nothing changes. A file renamed on disk
 while its workspace is open stays linked; one deleted is written again by the next save.
+
+### Saving without replacing someone else's layout
+
+A destination linked to another workspace in this session is refused, including another path
+or symlink to the same file. Choose another name. Workspaces whose panes could not be restored
+also keep their file association.
+
+Saving an unchanged linked file needs no extra step. Any other existing destination asks
+**Replace file?**, with **Cancel** selected. A linked file edited outside kraal, including by
+another session, asks **File changed** instead. Cancel returns to the name you entered, where
+you can choose a name for a copy. Confirming **Replace file** keeps the replaced file as
+`.kdl.bak` beside the resolved target, including when saving through a symlink. Even an invalid
+KDL file needs this explicit confirmation. If the file changes again while the question is open,
+replacement is refused: retry to review the new version. Errors keep the form and its input open.
+
+`kraal save` refuses a replacement that needs confirmation. Use `kraal save <name>` with a new
+name for a copy, or **Save workspace layout** in kraal to confirm replacement. There is no
+permanent overwrite permission. The CLI's first file association is queued for session
+persistence as soon as the save succeeds.
+
+The comparison uses the loaded or last saved contents, not just a timestamp, and survives a
+session restart. A session saved by an older version has no recorded contents, so its first
+replacement needs confirmation. Directory scans and renames do not accept external edits on
+your behalf. A missing source can still be recreated; a dangling symlink is refused.
+
+Saves from current kraal sessions use the same lock for a destination, including symlink
+aliases. A replacement first moves the existing file aside, checks those exact contents, and
+publishes the complete new file only if the destination is still absent. An editor that creates
+the destination meanwhile wins. The destination is briefly absent during replacement. Writes
+through an editor's already open descriptor remain in the backup. On failure, kraal restores
+the old file if the destination is free; otherwise it keeps both versions and reports the
+recovery file to inspect before retrying. After a crash during replacement, the old file is in
+`.kdl.bak` or a sibling named `.<file>.<pid>.<number>.recover`; move it back if the destination is
+missing. Recovery files are never removed by temporary-file cleanup.

@@ -55,6 +55,19 @@ Kraal 0.3.0 holds a session in its runtime directory only, and 0.2.0 not at all:
   server. A `forget` of 0.3.0 or older does not know that: run at that very moment, it still
   deletes what the session saved.
 
+## Workspace file replacements
+
+The session format and workspace KDL remain readable by 0.2.0 and 0.3.0. A new optional
+`definition_source` field records the contents last loaded or saved; older versions ignore it
+and still read all the workspaces. Old snapshots without this field still restore their layout
+and links, but require confirmation before replacing an existing source.
+
+The save request has not changed. Older clients of a current server receive the same collision
+and external-edit refusals as current clients. A server running 0.2.0 or 0.3.0 still uses its old
+save behavior and cannot provide these protections. File locks coordinate current writers;
+older servers and external editors do not take part. See [Workspace saves](workspaces.md#saving-without-replacing-someone-elses-layout)
+for concurrent editor writes and recovery.
+
 ## Account identities
 
 Accounts and saved sessions from 0.2.0 and 0.3.0 still load. Account names remain accepted by
