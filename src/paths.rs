@@ -711,24 +711,41 @@ pub fn listen_alone(socket: &Path) -> std::io::Result<Option<std::os::unix::net:
             Err(e) if e.kind() == ErrorKind::AddrInUse => {}
             Err(e) => return Err(e),
         }
-        let there = file_id(socket);
-        match connect_now(socket) {
-            Err(e) if e.kind() == ErrorKind::ConnectionRefused => remove_stale(socket, there)?,
+        // A second name for what is there, for as long as it is looked at: a file is told
+        // from another by its number, and one made once this one is gone may be given the
+        // same (ext4 gives a new file the number just freed). While this one has a name, no
+        // other file has its number. Where no second name can be made, the number alone is
+        // what there is.
+        let seen = socket.with_extension(format!("seen.{}", std::process::id()));
+        let _ = std::fs::remove_file(&seen);
+        let named = match std::fs::hard_link(socket, &seen) {
+            Ok(()) => true,
             // Gone since: the place is free.
-            Err(e) if e.kind() == ErrorKind::NotFound => {}
-            // It answers, or will once it takes connections again.
-            _ => return Ok(None),
+            Err(e) if e.kind() == ErrorKind::NotFound => continue,
+            Err(_) => false,
+        };
+        let there = if named { &seen } else { socket };
+        // One that answers, or will once it takes connections again, is left alone.
+        let refuses = nobody_listens(there);
+        let removed = if refuses { remove_stale(socket, file_id(there)) } else { Ok(()) };
+        if named {
+            let _ = std::fs::remove_file(&seen);
+        }
+        removed?;
+        if !refuses {
+            return Ok(None);
         }
     }
     Err(std::io::Error::new(ErrorKind::AddrInUse, "something keeps taking that place"))
 }
 
-/// Remove the socket at `socket` that refused a connection: the file `stale`, which was there
-/// before it did. It is moved aside and looked at before it is deleted: when another file took
-/// the place between the refusal and the move (a kraal 0.2.0, which holds no lock, started
-/// then), that one is put back instead. This narrows what a check followed by a removal leaves
-/// open, and does not close it: yet another server may take the place while the file is aside,
-/// and the file then stays aside.
+/// Remove the socket at `socket` that refused a connection: the file `stale`, which whoever
+/// calls this keeps under another name meanwhile, so that no other file has its number. What is
+/// at `socket` is moved aside and looked at before it is deleted: when another file took the
+/// place between the refusal and the move (a kraal 0.2.0, which holds no lock, started then),
+/// that one is put back instead. This narrows what a check followed by a removal leaves open,
+/// and does not close it: yet another server may take the place while the file is aside, and
+/// the file then stays aside.
 fn remove_stale(socket: &Path, stale: Option<(u64, u64)>) -> std::io::Result<()> {
     let aside = socket.with_extension(format!("stale.{}", std::process::id()));
     match std::fs::rename(socket, &aside) {
@@ -1358,11 +1375,12 @@ mod tests {
         // One that stays (the runtime directory's, which kraal 0.3.0 takes without looking at it
         // again) is the same file for every holder.
         let held = LockFile::acquire(path.clone(), true, try_lock).unwrap().unwrap();
-        let file = file_id(&path);
+        // Open here while it is looked for: a file made once it is gone could have its number.
+        let file = std::fs::File::open(&path).unwrap();
         drop(held);
-        assert!(file.is_some() && file_id(&path) == file, "the lock file went with its holder");
+        assert!(is_file_at(&file, &path), "the lock file went with its holder");
         drop(once_free(|| LockFile::acquire(path.clone(), true, try_lock)));
-        assert_eq!(file_id(&path), file);
+        assert!(is_file_at(&file, &path));
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -1438,10 +1456,11 @@ mod tests {
         assert!(hold(&there).unwrap().is_none());
         assert_eq!(holder_at(&lock(&state)), Some(holder(&here)), "the one refused wrote nothing");
         assert!(!lock(&there).exists(), "the one refused left a lock");
-        let runtime_lock = file_id(&lock(&here));
+        // Open here while it is looked for: a file made once it is gone could have its number.
+        let runtime_lock = std::fs::File::open(lock(&here)).unwrap();
         drop(held);
         assert!(!lock(&state).exists(), "the state directory's lock file was left");
-        assert!(runtime_lock.is_some() && file_id(&lock(&here)) == runtime_lock, "the runtime directory's went");
+        assert!(is_file_at(&runtime_lock, &lock(&here)), "the runtime directory's went");
         // What a holder killed before said is replaced by the next one's.
         std::fs::write(lock(&state), "{\"pid\":1,\"host\":\"gone\",\"runtime\":\"/elsewhere\"}\nmore\n").unwrap();
         let held = once_free(|| hold(&there));
@@ -1454,7 +1473,7 @@ mod tests {
         assert!(hold(&here).unwrap().is_none());
         assert!(!lock(&state).exists(), "the one refused kept the state directory's lock");
         drop(old);
-        assert_eq!(file_id(&lock(&here)), runtime_lock);
+        assert!(is_file_at(&runtime_lock, &lock(&here)));
         drop(once_free(|| hold(&here)));
         std::fs::remove_dir_all(&dir).unwrap();
     }
@@ -1508,9 +1527,9 @@ mod tests {
             // A kraal 0.3.0, which knows the runtime directory's lock alone, is kept out too.
             assert!(LockFile::acquire(runtime.join("main.lock"), true, try_lock).unwrap().is_none());
             assert_eq!(holder_at(&both.join("main.lock")).map(|said| said.pid), Some(4242));
-            let file = file_id(&both.join("main.lock"));
+            let file = std::fs::File::open(both.join("main.lock")).unwrap();
             drop(held);
-            assert!(file.is_some() && file_id(&both.join("main.lock")) == file, "the lock file went with its holder");
+            assert!(is_file_at(&file, &both.join("main.lock")), "the lock file went with its holder");
             drop(once_free(hold));
         }
         std::fs::remove_dir_all(&dir).unwrap();
@@ -1541,8 +1560,8 @@ mod tests {
 
     /// A server listens where none does: a socket that refuses is removed for it, one a server
     /// listens at is left to that server. A socket that took the place of the one that refused
-    /// is put back when the removal finds it; what a server binding at that very moment does to
-    /// this is not shown here.
+    /// is put back when the removal finds it, whatever number its file was given; what a server
+    /// binding at that very moment does to this is not shown here.
     #[test]
     fn a_socket_is_removed_only_when_nobody_listens_at_it() {
         use std::io::ErrorKind;
@@ -1559,16 +1578,24 @@ mod tests {
         drop(first);
         until_nobody_listens(&socket);
         assert_eq!(connect_now(&socket).unwrap_err().kind(), ErrorKind::ConnectionRefused);
-        let stale = file_id(&socket);
+        // Kept under another name from here on, as `listen_alone` keeps what it looks at: the
+        // socket made in its place cannot be given its number, as it would be on a file system
+        // that gives a new file the number just freed.
+        let seen = dir.join("main.seen");
+        std::fs::hard_link(&socket, &seen).unwrap();
+        let stale = file_id(&seen);
         let second = listen_alone(&socket).unwrap().expect("nobody listened there");
-        assert!(file_id(&socket) != stale && connect_now(&socket).is_ok());
-        // A server that took the place after a connection was refused (kraal 0.2.0 takes no
-        // lock) keeps it when the removal comes after: what is removed is the file that refused.
+        assert!(connect_now(&socket).is_ok(), "the server after it does not listen");
+        // That server took the place after the connection was refused, as a kraal 0.2.0 may
+        // (it takes no lock): the removal, which comes after, finds another file than the one
+        // that refused, and puts it back.
         remove_stale(&socket, stale).unwrap();
         assert!(connect_now(&socket).is_ok(), "the socket of a server was removed");
+        std::fs::remove_file(&seen).unwrap();
         let left: Vec<_> = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name()).collect();
         assert_eq!(left, ["main.sock"]);
         drop(second);
+        until_nobody_listens(&socket);
         remove_stale(&socket, file_id(&socket)).unwrap();
         assert!(!socket.exists() && std::fs::read_dir(&dir).unwrap().next().is_none());
         std::fs::remove_dir_all(&dir).unwrap();

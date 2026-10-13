@@ -855,7 +855,8 @@ pub fn run(session: &str) -> Result<()> {
     let result = server.event_loop(&rx);
     server.shutdown();
     // Its own socket, as far as a look before the removal tells: not the one of a kraal 0.2.0
-    // (it takes no lock) that listens there since a cleaner of /tmp removed this one.
+    // (it takes no lock) that listens there since a cleaner of /tmp removed this one. No other
+    // file has this one's number while this server listens: it holds the file until it is gone.
     if own_socket.is_some() && paths::file_id(&socket) == own_socket {
         let _ = std::fs::remove_file(&socket);
     }

@@ -1765,7 +1765,8 @@ fn a_session_leaves_no_lock_file_where_it_saves() {
     env.workspace("w", "layout {\n    pane name=\"one\"\n}\n");
     env.run(&["open", "w"]);
     assert!(lock_file(&env, "state").exists() && lock_file(&env, "run").exists(), "a server holds its session");
-    let runtime_lock = std::fs::metadata(lock_file(&env, "run")).map(|m| std::os::unix::fs::MetadataExt::ino(&m)).ok();
+    // Open here until the end: a file made once it is gone could have its number.
+    let runtime_lock = std::fs::File::open(lock_file(&env, "run")).unwrap();
     env.run(&["kill"]);
     assert!(!lock_file(&env, "state").exists(), "left by a server that stopped");
     env.run(&["forget"]);
@@ -1784,8 +1785,9 @@ fn a_session_leaves_no_lock_file_where_it_saves() {
     env.run(&["open", "w"]);
     env.run(&["kill"]);
     assert!(!lock_file(&env, "state").exists(), "left by the server after a killed one");
-    let still = std::fs::metadata(lock_file(&env, "run")).map(|m| std::os::unix::fs::MetadataExt::ino(&m)).ok();
-    assert!(runtime_lock.is_some() && still == runtime_lock, "the runtime directory's lock file was replaced");
+    let number = |file: std::fs::Metadata| std::os::unix::fs::MetadataExt::ino(&file);
+    let (then, now) = (runtime_lock.metadata().unwrap(), std::fs::metadata(lock_file(&env, "run")).unwrap());
+    assert_eq!(number(now), number(then), "the runtime directory's lock file was replaced");
 }
 
 /// Servers started and stopped and the session forgotten, all at once and from many processes:

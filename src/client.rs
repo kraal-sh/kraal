@@ -109,8 +109,10 @@ fn is_here(holder: &paths::Holder, here: &Path) -> bool {
 /// macOS).
 fn same_directory(a: &Path, b: &Path) -> bool {
     use std::os::unix::fs::MetadataExt;
-    let id = |dir: &Path| std::fs::metadata(dir).ok().map(|m| (m.dev(), m.ino()));
-    a == b || (id(a).is_some() && id(a) == id(b))
+    // Both held open while they are compared: a directory made once another is gone may be
+    // given its number.
+    let open = |dir: &Path| std::fs::File::open(dir).and_then(|dir| Ok((dir.metadata()?, dir))).ok();
+    a == b || matches!((open(a), open(b)), (Some((a, _)), Some((b, _))) if (a.dev(), a.ino()) == (b.dev(), b.ino()))
 }
 
 /// What the holder of a session is to a kraal whose runtime directory is `here`, and how to
