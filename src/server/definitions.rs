@@ -70,7 +70,7 @@ impl Server {
             out.extend(workspace::load_dir(&dir));
         }
         let mut seen = HashSet::new();
-        out.retain(|(path, _)| seen.insert(path.clone()));
+        out.retain(|(path, _)| !self.source_removed(path) && seen.insert(path.clone()));
         out
     }
 
@@ -157,6 +157,8 @@ impl Server {
         let id = self.start_definition(&def, Some(path.to_path_buf()))?;
         let wi = self.ws_index(id).unwrap();
         self.workspaces[wi].definition_source = Some(source);
+        self.removed_sources.retain(|p| !paths::same_file(p, path));
+        self.mark_persist();
         Ok(id)
     }
 
@@ -263,6 +265,12 @@ impl Server {
     pub(super) fn start_definition_inner(&mut self, def: &WorkspaceDef, path: Option<PathBuf>) -> Result<u32> {
         let ws = self.new_workspace(def.name.clone(), path);
         let wi = self.ws_index(ws).unwrap();
+        self.populate_definition(wi, def)?;
+        self.relayout();
+        Ok(ws)
+    }
+
+    pub(super) fn populate_definition(&mut self, wi: usize, def: &WorkspaceDef) -> Result<()> {
         self.workspaces[wi].cwd = def.cwd.clone();
         let mut focus_tab = 0;
         for (ti, tdef) in def.tabs.iter().enumerate() {
@@ -292,12 +300,10 @@ impl Server {
             ws.tabs.push(tab);
         }
         if self.workspaces[wi].tabs.is_empty() {
-            self.workspaces.remove(wi);
             anyhow::bail!("workspace {:?} has no panes", def.name);
         }
         self.workspaces[wi].active = focus_tab;
-        self.relayout();
-        Ok(ws)
+        Ok(())
     }
 
     /// Undo a half-built workspace: kill the panes it spawned and drop workspaces it created, so

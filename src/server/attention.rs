@@ -17,17 +17,18 @@ pub enum Attention {
     Remote { server: String, pane: u32 },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ToastAction {
     ChangeAccount,
     UndoAccount,
+    RestoreWorkspace(String),
 }
 
 impl ToastAction {
-    pub(super) fn label(self) -> &'static str {
+    pub(super) fn label(&self) -> &'static str {
         match self {
             Self::ChangeAccount => "Change account",
-            Self::UndoAccount => "Undo",
+            Self::UndoAccount | Self::RestoreWorkspace(_) => "Undo",
         }
     }
 }
@@ -257,12 +258,15 @@ impl Server {
         self.notify(&format!("{message} · {label}"), "", Some(pane));
         for c in self.clients.values_mut().filter(|c| c.attached) {
             c.toast = Some((format!("{message} · {label}"), Instant::now() + Duration::from_secs(6)));
-            c.toast_action = Some((pane, action));
+            c.toast_action = Some((pane, action.clone()));
         }
         self.mark_dirty();
     }
 
     pub(super) fn toast_action(&mut self, client: ClientId, pane: PaneId, action: ToastAction) -> super::ui::Mode {
+        if let ToastAction::RestoreWorkspace(identity) = &action {
+            return self.restore_workspace_mode(client, identity, None);
+        }
         if !self.panes.contains_key(&pane) {
             return super::ui::Mode::Normal;
         }
@@ -274,6 +278,7 @@ impl Server {
                 }
                 super::ui::Mode::Normal
             }
+            ToastAction::RestoreWorkspace(_) => unreachable!("answered above"),
         }
     }
 
@@ -435,7 +440,7 @@ mod tests {
             let mut server = server(tx);
             let (id, _peer) = client(&mut server);
             server.config.notifications.mode = NotifyMode::Off;
-            server.notify_action("work", 42, action);
+            server.notify_action("work", 42, action.clone());
             let before = server.clients[&id].toast.clone();
             server.warnings.push("could not save paste buffers".into());
             server.show_warnings();

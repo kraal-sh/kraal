@@ -45,6 +45,13 @@ saved-state field is needed. A workspace's name is independent of its source pat
 already read these separately. Renaming on a current server leaves every KDL file unchanged.
 A session still running 0.2.0 or 0.3.0 retains that server's old rename behavior.
 
+Delete, Undo and Deleted workspaces also use the existing attached-terminal input protocol.
+Their retained layouts, deletion intents and source exclusions stay in `sessions-v2` with the
+session's private state. Missing deletion fields in an earlier snapshot mean no deletions.
+The 0.2.0 and 0.3.0 session paths remain untouched, so those releases cannot read a session
+containing only deleted workspaces as an empty session or overwrite its recovery records.
+An older running server continues its existing workspace behavior until restarted.
+
 ## For contributors: how the protocol changes
 
 The client and the server exchange JSON messages (`src/protocol.rs`, whose comments hold the

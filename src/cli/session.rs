@@ -215,7 +215,8 @@ pub(super) fn list_sessions() -> Result<()> {
 
 fn list_definitions(session: &str, json: bool) -> Result<()> {
     let cfg = config::Config::load()?;
-    let saved = crate::persist::inspect(session)?.map(|s| s.workspaces).unwrap_or_default();
+    let (saved, removed) =
+        crate::persist::inspect(session)?.map(|s| (s.workspaces, s.removed_sources)).unwrap_or_default();
     let mut list: Vec<_> = saved
         .iter()
         .map(|w| {
@@ -235,7 +236,9 @@ fn list_definitions(session: &str, json: bool) -> Result<()> {
         .collect();
     let defs: Vec<_> = cfg.workspace_dirs().iter().flat_map(|d| workspace::load_dir(d)).collect();
     for (path, def) in defs {
-        if saved.iter().any(|w| w.definition.as_deref().is_some_and(|p| paths::same_file(p, &path))) {
+        if removed.iter().any(|p| paths::same_file(p, &path))
+            || saved.iter().any(|w| w.definition.as_deref().is_some_and(|p| paths::same_file(p, &path)))
+        {
             continue;
         }
         match def {

@@ -24,34 +24,59 @@ impl Server {
     }
 
     pub(super) fn action(&mut self, id: ClientId, action: Action) -> Mode {
-        if action == Action::NewWorkspace {
-            return Mode::Prompt(self.add_workspace_form(id, None));
+        match action {
+            Action::NewWorkspace => return Mode::Prompt(self.add_workspace_form(id, None)),
+            Action::WorkspacePicker => {
+                return Mode::Picker(self.workspace_picker(self.clients.get(&id).map_or(0, |c| c.workspace)));
+            }
+            Action::PanePicker => return Mode::Picker(self.pane_picker()),
+            Action::Accounts => {
+                self.refresh_existing_accounts();
+                return Mode::Picker(self.accounts_picker(None));
+            }
+            Action::AddAccount => {
+                self.refresh_existing_accounts();
+                return Mode::AccountForm(self.account_form(id));
+            }
+            Action::NextAttention => {
+                let queue = self.attention_queue();
+                let next = queue.iter().find(|a| !self.attention_shown(id, a)).or(queue.first()).cloned();
+                match next {
+                    Some(a) => self.go_to(id, a),
+                    None => self.toast(id, "no agent needs you"),
+                }
+            }
+            Action::ToggleSidebar => {
+                let shown = self.clients.get(&id).is_some_and(|c| self.sidebar_shown(c));
+                if let Some(c) = self.clients.get_mut(&id) {
+                    c.sidebar = Some(!shown);
+                    c.encoder.invalidate();
+                }
+                self.relayout();
+            }
+            Action::ToggleBottomBar => {
+                self.bottom_bar = !self.bottom_bar;
+                self.relayout();
+            }
+            Action::Buffers => return Mode::Picker(self.buffer_picker()),
+            Action::Detach => self.detach(id, "detached"),
+            Action::Help => return Mode::Help { scroll: 0 },
+            Action::Messages => return Mode::Messages { scroll: 0 },
+            Action::CommandPalette => return Mode::Picker(self.command_picker()),
+            Action::Restart => return self.ask_restart(),
+            Action::Quit => return self.ask_quit(),
+            _ => return self.workspace_action(id, action),
         }
-        if action == Action::WorkspacePicker {
-            return Mode::Picker(self.workspace_picker(self.clients.get(&id).map_or(0, |c| c.workspace)));
-        }
+        self.mark_persist();
+        self.mark_dirty();
+        Mode::Normal
+    }
+
+    fn workspace_action(&mut self, id: ClientId, action: Action) -> Mode {
         let Some((ws, wi)) = self.current_ws(id) else { return Mode::Normal };
         if self.workspaces[wi].kept.is_some()
             && !self.workspaces[wi].closed()
-            && !matches!(
-                action,
-                Action::WorkspacePicker
-                    | Action::NewWorkspace
-                    | Action::NextWorkspace
-                    | Action::PrevWorkspace
-                    | Action::CloseWorkspace
-                    | Action::Restart
-                    | Action::Quit
-                    | Action::Detach
-                    | Action::ToggleSidebar
-                    | Action::ToggleBottomBar
-                    | Action::Messages
-                    | Action::Help
-                    | Action::CommandPalette
-                    | Action::Accounts
-                    | Action::AddAccount
-                    | Action::NextAttention
-            )
+            && !matches!(action, Action::NextWorkspace | Action::PrevWorkspace | Action::CloseWorkspace)
         {
             return Mode::confirm(
                 "The workspace has not finished closing. Retry Close to continue.",
@@ -235,15 +260,6 @@ impl Server {
                 }
             }
             Action::SshPicker => return Mode::Picker(self.ssh_picker()),
-            Action::PanePicker => return Mode::Picker(self.pane_picker()),
-            Action::Accounts => {
-                self.refresh_existing_accounts();
-                return Mode::Picker(self.accounts_picker(None));
-            }
-            Action::AddAccount => {
-                self.refresh_existing_accounts();
-                return Mode::AccountForm(self.account_form(id));
-            }
             Action::AgentPicker => {
                 self.refresh_existing_accounts();
                 return Mode::Picker(self.agent_picker(id, None));
@@ -265,26 +281,6 @@ impl Server {
                 if let Some(pane) = focus {
                     return self.change_account_mode(id, pane);
                 }
-            }
-            Action::NextAttention => {
-                let queue = self.attention_queue();
-                let next = queue.iter().find(|a| !self.attention_shown(id, a)).or(queue.first()).cloned();
-                match next {
-                    Some(a) => self.go_to(id, a),
-                    None => self.toast(id, "no agent needs you"),
-                }
-            }
-            Action::ToggleSidebar => {
-                let shown = self.clients.get(&id).is_some_and(|c| self.sidebar_shown(c));
-                if let Some(c) = self.clients.get_mut(&id) {
-                    c.sidebar = Some(!shown);
-                    c.encoder.invalidate();
-                }
-                self.relayout();
-            }
-            Action::ToggleBottomBar => {
-                self.bottom_bar = !self.bottom_bar;
-                self.relayout();
             }
             Action::SelectForBroadcast => {
                 if let Some(p) = focus {
@@ -350,7 +346,6 @@ impl Server {
                 }
             }
             Action::CopyLastOutput => self.copy_last_output(id, focus),
-            Action::Buffers => return Mode::Picker(self.buffer_picker()),
             Action::OpenPreview => {
                 return Mode::Prompt(Prompt::new("Preview file (path)", "", PromptAction::OpenPreview));
             }
@@ -380,10 +375,6 @@ impl Server {
                     PromptAction::Download,
                 ));
             }
-            Action::Detach => self.detach(id, "detached"),
-            Action::Help => return Mode::Help { scroll: 0 },
-            Action::Messages => return Mode::Messages { scroll: 0 },
-            Action::CommandPalette => return Mode::Picker(self.command_picker()),
             Action::ResizeMode => {
                 let tiled =
                     self.workspaces[wi].tab().and_then(|t| t.root.as_ref()).is_some_and(|r| r.places().len() > 1);
@@ -393,10 +384,22 @@ impl Server {
                 }
                 return Mode::Resize;
             }
-            Action::NewWorkspace | Action::WorkspacePicker => unreachable!("handled before selecting a workspace"),
+            Action::NewWorkspace
+            | Action::WorkspacePicker
+            | Action::PanePicker
+            | Action::Accounts
+            | Action::AddAccount
+            | Action::NextAttention
+            | Action::ToggleSidebar
+            | Action::ToggleBottomBar
+            | Action::Buffers
+            | Action::Detach
+            | Action::Help
+            | Action::Messages
+            | Action::CommandPalette
+            | Action::Restart
+            | Action::Quit => unreachable!("handled before selecting a workspace"),
             Action::CloseWorkspace => return self.ask_close_workspace(id, ws),
-            Action::Restart => return self.ask_restart(),
-            Action::Quit => return self.ask_quit(),
             Action::EditServers => self.edit_servers(id),
             Action::SendPrefix => self.send_prefix(id, None),
         }

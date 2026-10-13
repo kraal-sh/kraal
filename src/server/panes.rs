@@ -117,6 +117,7 @@ impl Server {
             tabs: Vec::new(),
             kept: None,
             close_error: None,
+            delete_pending: false,
             active: 0,
             definition: None,
             definition_inode: None,
@@ -608,6 +609,9 @@ impl Server {
 
     fn finish_workspace_close(&mut self, ws: u32) {
         let Some(wi) = self.ws_index(ws) else { return };
+        if self.workspaces[wi].delete_pending {
+            return;
+        }
         self.workspaces[wi].close_error = None;
         self.emit("workspace.closed", serde_json::json!({ "workspace": self.workspaces[wi].name }));
         let fallback = self.workspaces.iter().find(|w| !w.closed() && w.id != ws).map(|w| w.id);
@@ -627,6 +631,7 @@ impl Server {
 
     pub(super) fn reopen_workspace(&mut self, ws: u32) -> Result<()> {
         let wi = self.ws_index(ws).context("no such workspace")?;
+        anyhow::ensure!(!self.workspaces[wi].delete_pending, "Deletion is not finished. Retry Delete in Workspaces.");
         let Some(saved) = self.workspaces[wi].kept.clone() else { return Ok(()) };
         if saved.closed && self.workspaces[wi].close_error.is_some() {
             self.keep_and_close_workspace(ws).map_err(anyhow::Error::msg)?;
@@ -635,7 +640,19 @@ impl Server {
         let before = self.panes.keys().copied().collect();
         let workspaces = self.workspaces.iter().map(|w| w.id).collect::<Vec<_>>();
         let result = self.with_batch(|server| {
-            let result = crate::persist::restore_workspace_tabs(server, wi, &saved);
+            let result = if saved.unopened {
+                server.starting_workspace = Some(saved.name.clone());
+                let result = saved
+                    .definition_source
+                    .as_deref()
+                    .context("the saved source is missing")
+                    .and_then(|s| crate::workspace::parse_workspace(&saved.name, s))
+                    .and_then(|d| server.populate_definition(wi, &d));
+                server.starting_workspace = None;
+                result
+            } else {
+                crate::persist::restore_workspace_tabs(server, wi, &saved)
+            };
             if result.is_err() {
                 server.rollback(&before, &workspaces);
                 server.workspaces[wi].tabs.clear();

@@ -443,7 +443,7 @@ pub(super) fn draw_picker(p: &Picker, screen: Rect, buf: &mut Buffer) -> Option<
     }
     // The search line.
     let review = p.kind == super::ui::PickerKind::AccountReview;
-    let workspace = p.kind == super::ui::PickerKind::Workspace;
+    let workspace = matches!(p.kind, super::ui::PickerKind::Workspace | super::ui::PickerKind::DeletedWorkspaces);
     let prompt = if review {
         Line::from("Which account is this?")
     } else {
@@ -555,6 +555,7 @@ pub(super) fn draw_picker(p: &Picker, screen: Rect, buf: &mut Buffer) -> Option<
             _ if !p.query.is_empty() => format!("Nothing matches \"{}\".", p.query),
             K::Ssh => "No saved servers. Type user@host to connect (`kraal servers add` saves one).".into(),
             K::Workspace => "No workspaces yet.".into(),
+            K::DeletedWorkspaces => "No deleted workspaces.".into(),
             K::Runbook => "No runbooks yet: `kraal runbook new <name>` creates one.".into(),
             K::Tool => "No tools: add some under [tools] in config.toml.".into(),
             K::Agent => "No accounts ready. Open Accounts from the Agents menu to sign in.".into(),
@@ -577,7 +578,14 @@ pub(super) fn draw_picker(p: &Picker, screen: Rect, buf: &mut Buffer) -> Option<
     if keys.len() > 1 {
         footer.push(if workspace { ("Tab", "Actions") } else { ("tab", "more actions") });
     }
-    footer.push(if workspace { ("Esc", "Close") } else { ("esc", if review { "Back" } else { "close" }) });
+    if p.undo.is_some() {
+        footer.push(("Ctrl+Z", "Undo"));
+    }
+    footer.push(if workspace {
+        ("Esc", if p.kind == super::ui::PickerKind::DeletedWorkspaces { "Back" } else { "Close" })
+    } else {
+        ("esc", if review { "Back" } else { "close" })
+    });
     let count = if let Some(message) = &p.message {
         message.clone()
     } else if p.query.is_empty() {
@@ -1087,7 +1095,7 @@ mod tests {
                 ),
                 (PickerKind::Ssh, PickAction::SshGroup("web".into()), "open group", true),
                 (PickerKind::Workspace, PickAction::SwitchWorkspace(1), "Open", true),
-                (PickerKind::Workspace, PickAction::OpenDefinition("w.kdl".into()), "Open", false),
+                (PickerKind::Workspace, PickAction::OpenDefinition("w.kdl".into()), "Open", true),
                 (PickerKind::Workspace, PickAction::AddWorkspace, "Add", false),
                 (PickerKind::RunbookSteps, PickAction::RunbookList, "back to runbooks", false),
             ];

@@ -830,7 +830,23 @@ impl Server {
     /// session unless it is the default one. When room runs out, the right side gives way first.
     pub fn top_bar(&self, c: &Client) -> TopBar {
         let mut bar = TopBar::default();
-        let Some(wi) = self.ws_index(c.workspace) else { return bar };
+        let Some(wi) = self.ws_index(c.workspace) else {
+            let sidebar = self.sidebar_cols(c);
+            let used = if sidebar == 0 {
+                let label = " Workspaces ";
+                bar.items.push((
+                    0,
+                    label.len() as u16,
+                    BarItem::Workspace,
+                    vec![Span::styled(label, Style::default().fg(th().accent).add_modifier(Modifier::BOLD))],
+                ));
+                label.len() as u16
+            } else {
+                sidebar + 1
+            };
+            bar.right = self.bar_right(c, c.cols.saturating_sub(used + 1));
+            return bar;
+        };
         let ws = &self.workspaces[wi];
         let cols = c.cols;
         let sw = self.sidebar_cols(c);
@@ -1024,7 +1040,7 @@ impl Server {
         let mut notice = Vec::new();
         if let Some((msg, _)) = &c.toast {
             let style = Style::default().fg(t.blocked);
-            if let Some((_, action)) = c.toast_action {
+            if let Some((_, action)) = &c.toast_action {
                 let label = action.label();
                 let prefix = msg.strip_suffix(&format!(" · {label}")).unwrap_or(msg);
                 let available = room.saturating_sub(1);
@@ -1163,8 +1179,10 @@ impl Server {
     pub fn tab_bar_hit(&self, id: ClientId, col: u16) -> Option<BarItem> {
         let c = self.clients.get(&id)?;
         let bar = self.top_bar(c);
-        if let Some((pane, action)) =
-            c.toast_action.filter(|_| c.toast.as_ref().is_some_and(|(_, until)| *until > std::time::Instant::now()))
+        if let Some((pane, action)) = c
+            .toast_action
+            .as_ref()
+            .filter(|_| c.toast.as_ref().is_some_and(|(_, until)| *until > std::time::Instant::now()))
         {
             let mut x = c.cols.saturating_sub(spans_width(&bar.right) + 1);
             for span in &bar.right {
@@ -1173,7 +1191,7 @@ impl Server {
                     && span.style.add_modifier.contains(Modifier::UNDERLINED)
                     && (x..x + width).contains(&col)
                 {
-                    return Some(BarItem::Toast(pane, action));
+                    return Some(BarItem::Toast(*pane, action.clone()));
                 }
                 x += width;
             }
@@ -1246,7 +1264,11 @@ impl Server {
             );
             agents.extend(states.into_iter().map(|(p, s)| (p, s, ws)));
         }
-        for (path, n) in self.def_files.iter().filter(|(p, _)| matches!(self.definition_workspace(p), Ok(None))) {
+        for (path, n) in self
+            .def_files
+            .iter()
+            .filter(|(p, _)| !self.source_removed(p) && matches!(self.definition_workspace(p), Ok(None)))
+        {
             let name = strong(n.clone());
             let detail = faint("Closed".into(), t.dim);
             entry(
@@ -2118,6 +2140,28 @@ mod tests {
     }
 
     #[test]
+    fn removed_sources_are_hidden_even_before_the_cached_sidebar_is_rescanned() {
+        let (tx, _rx) = super::super::queue::channel(32);
+        let mut server = super::super::tests::server(tx);
+        let (client, _peer) = super::super::tests::client(&mut server);
+        let path = PathBuf::from("/missing/deleted-source.kdl");
+        server.def_files.push((path.clone(), "deleted-source".into()));
+        assert!(
+            server
+                .sidebar_rows(&server.clients[&client], 36, 0)
+                .iter()
+                .any(|r| matches!(r, SideRow::Entry { item: Some(SideItem::Definition(_)), .. }))
+        );
+        server.removed_sources.push(path);
+        assert!(
+            !server
+                .sidebar_rows(&server.clients[&client], 36, 0)
+                .iter()
+                .any(|r| matches!(r, SideRow::Entry { item: Some(SideItem::Definition(_)), .. }))
+        );
+    }
+
+    #[test]
     fn the_cells_kept_are_all_but_those_changed() {
         let mut changed = Changed::new(Rect::new(0, 0, 10, 4));
         changed.row(0, 2, 4);
@@ -2259,12 +2303,17 @@ mod tests {
         let (id, _peer) = super::super::tests::client(&mut server);
         for cols in [80, 124] {
             server.clients.get_mut(&id).unwrap().cols = cols;
-            for action in [ToastAction::UndoAccount, ToastAction::ChangeAccount] {
-                server.notify_action(&"A long account name ".repeat(8), 7, action);
+            for action in [
+                ToastAction::UndoAccount,
+                ToastAction::ChangeAccount,
+                ToastAction::RestoreWorkspace("saved-workspace".into()),
+            ] {
+                server.notify_action(&"A long account name ".repeat(8), 7, action.clone());
                 let bar = server.top_bar(&server.clients[&id]);
                 assert!(bar.right.iter().any(|s| s.content == action.label()));
-                let hits: Vec<_> =
-                    (0..cols).filter(|&x| server.tab_bar_hit(id, x) == Some(BarItem::Toast(7, action))).collect();
+                let hits: Vec<_> = (0..cols)
+                    .filter(|&x| server.tab_bar_hit(id, x) == Some(BarItem::Toast(7, action.clone())))
+                    .collect();
                 assert_eq!(hits.len(), action.label().len());
                 let at = hits[0];
                 server.clients.get_mut(&id).unwrap().toast.as_mut().unwrap().1 =

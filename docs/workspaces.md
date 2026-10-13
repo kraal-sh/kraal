@@ -9,7 +9,8 @@ and **Current** for the workspace on screen. Enter or one click opens the select
 Search only filters the list. **+ Add workspace** stays visible even when nothing matches.
 The bottom-right count includes only workspaces, showing matches over the total while searching.
 Tab or a right click offers actions for that row: **Rename** for a saved workspace, and **Close**
-when it is open. A workspace file that has not been imported offers **Open**.
+when it is open. **Delete** is available for saved workspaces and workspace files that have
+not been imported. An unimported file also offers **Open**.
 
 **+ Add workspace** and `ctrl+b W n` open the same **Add workspace** form. It proposes an unused
 name (or the search text) and shows the folder inherited from the current pane. Edit **Name**,
@@ -139,6 +140,37 @@ The session and attached terminals stay open, and an empty workspace stays
 empty after a restart. Closing the last open workspace shows Workspaces. Use Quit (`ctrl+b q`)
 or `kraal kill` to stop the session explicitly. A command pane that shows its exit code remains
 in the layout until it is closed.
+
+### Deleting and restoring a workspace
+
+In **Workspaces** (`ctrl+b w`), select a workspace, press Tab and choose **Delete**.
+The same action is available from a sidebar row's actions. There is no direct Delete shortcut.
+**Cancel** is selected first. For a running workspace, one **Stop and delete** confirmation
+lists its programs and background jobs and explains that their unsaved work cannot be restored.
+Project files, Git branches and external KDL files are kept.
+
+After the deletion is saved, the workspace leaves the main list. Click **Undo** in the toast,
+or press **Ctrl+Z** while the deletion result is in Workspaces. Later, including after a restart,
+open **Deleted workspaces** from Workspaces and press Enter or click a row to **Restore** it.
+Deleted workspaces have no automatic expiry. Restore keeps the identity, layout, source contents
+and available scrollback, and puts the workspace back at its previous position where possible.
+It is **Closed**: restoring starts no programs. Enter on the restored row opens it explicitly.
+If its name has been reused, **Restore workspace** proposes a free name such as `api-restored`;
+the newer workspace and the deleted contents are both kept.
+
+Deleting a workspace that came from a scanned KDL file also excludes that source from this
+session's scans and from `kraal workspaces`, including while the server is stopped. Other sessions
+keep their own lists. Deleting a file that has not been opened retains its contents without
+starting its programs. Restore uses that retained copy even if the file has since changed or
+disappeared; it does not write the external file.
+
+Delete saves the layout, scrollback and intent before stopping programs, using the same process
+identity checks as Close. A failed preparation stops nothing and offers **Retry**. If cancellation
+of a timed-out write cannot be confirmed, the dialog says so and asks to fix the save error and
+retry. A failure after stopping keeps the prepared layout and offers **Retry Delete** in Workspaces.
+After a crash, the next server finishes the recorded deletion without relaunching those programs.
+A failed Restore keeps the deleted copy and the entered name for retry. Deleting the last workspace
+leaves Workspaces open; attaching after restart does not create a replacement workspace.
 
 ### Restarting a session
 

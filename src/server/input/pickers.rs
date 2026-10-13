@@ -16,6 +16,14 @@ use crate::server::{ClientId, Server};
 
 impl Server {
     pub(super) fn on_picker(&mut self, id: ClientId, mut p: Picker, ev: InputEvent) -> Mode {
+        if let InputEvent::Mouse(MouseEvent { kind: MouseKind::Press(MouseButton::Left), col, row: 0, .. }) = &ev
+            && let Some(super::super::render::BarItem::Toast(
+                _,
+                super::super::attention::ToastAction::RestoreWorkspace(identity),
+            )) = self.tab_bar_hit(id, *col)
+        {
+            return self.restore_workspace_mode(id, &identity, Some(&p));
+        }
         // The list of what can be done with the selected item (Tab).
         if let Some(at) = p.actions {
             let keys = p.action_keys();
@@ -27,6 +35,9 @@ impl Server {
                 let i = layout.row_at(col, row).map(|i| i - layout.start + first);
                 p.actions = None;
                 if let Some(i) = i.filter(|i| *i < keys.len()) {
+                    if keys[i].0.is_empty() {
+                        return self.delete_picker_workspace(id, p);
+                    }
                     let spec = crate::input::KeySpec::parse(keys[i].0).expect("picker action keys are valid");
                     let key = Key { code: spec.code, mods: spec.mods, raw: Vec::new() };
                     return self.on_picker(id, p, InputEvent::Key(key));
@@ -39,6 +50,9 @@ impl Server {
                     KeyCode::Down => p.actions = Some((at + 1) % keys.len()),
                     KeyCode::Enter => {
                         p.actions = None;
+                        if keys[at].0.is_empty() {
+                            return self.delete_picker_workspace(id, p);
+                        }
                         // The action is its key, pressed in the list.
                         let spec = crate::input::KeySpec::parse(keys[at].0).expect("picker action keys are valid");
                         let key = Key { code: spec.code, mods: spec.mods, raw: Vec::new() };
@@ -54,6 +68,12 @@ impl Server {
                 (KeyCode::Esc, _) | (KeyCode::Char('c'), true) | (KeyCode::Char('g'), true) => {
                     return if p.kind == PickerKind::AccountReview {
                         Mode::Picker(self.accounts_picker(None))
+                    } else if p.kind == PickerKind::DeletedWorkspaces {
+                        let mut back = self.workspace_picker(self.clients.get(&id).map_or(0, |c| c.workspace));
+                        if let Some(state) = p.back.take() {
+                            back.restore(*state);
+                        }
+                        Mode::Picker(back)
                     } else {
                         Mode::Normal
                     };
@@ -61,6 +81,9 @@ impl Server {
                 (KeyCode::Enter, _) => {
                     let Some(item) = p.current().cloned() else { return Mode::Picker(p) };
                     return self.pick(id, &p, item);
+                }
+                (KeyCode::Char('z'), true) if p.undo.is_some() => {
+                    return self.restore_workspace_mode(id, p.undo.as_deref().unwrap(), Some(&p));
                 }
                 (KeyCode::Tab, _) if p.action_keys().len() > 1 && p.current().is_some() => p.actions = Some(0),
                 (KeyCode::Tab, _) => p.move_by(1),
@@ -312,6 +335,18 @@ impl Server {
                 let mode = self.ask_close_workspace(id, ws);
                 return self.return_to_workspaces(id, mode, p.state());
             }
+            PickAction::RetryWorkspaceDelete(ws) => {
+                let mode = self.ask_delete_workspace(super::super::workspace_lifecycle::DeleteTarget::Workspace(ws));
+                return self.return_to_workspaces(id, mode, p.state());
+            }
+            PickAction::DeletedWorkspaces => {
+                let mut deleted = self.deleted_workspace_picker();
+                deleted.back = Some(Box::new(p.state()));
+                return Mode::Picker(deleted);
+            }
+            PickAction::RestoreWorkspace(identity) => {
+                return self.restore_workspace_mode(id, &identity, Some(p));
+            }
             PickAction::OpenDefinition(path) => match self.open_definition(&path) {
                 Ok(ws) => self.show_workspace(id, ws),
                 Err(e) => {
@@ -405,12 +440,21 @@ impl Server {
             .iter()
             .filter_map(|(&id, c)| {
                 let Mode::Picker(p) = &c.mode else { return None };
-                (p.kind == PickerKind::Workspace).then(|| (id, c.workspace, p.state()))
+                matches!(p.kind, PickerKind::Workspace | PickerKind::DeletedWorkspaces)
+                    .then(|| (id, c.workspace, p.state()))
             })
             .collect();
         for (id, ws, state) in clients {
-            let mut picker = self.workspace_picker(ws);
+            let mut picker = if state.kind == PickerKind::DeletedWorkspaces {
+                self.deleted_workspace_picker()
+            } else {
+                self.workspace_picker(ws)
+            };
             picker.restore(state);
+            if picker.undo.as_ref().is_some_and(|id| !self.deleted_workspaces.iter().any(|d| &d.workspace.id == id)) {
+                picker.undo = None;
+                picker.message = None;
+            }
             self.clients.get_mut(&id).unwrap().mode = Mode::Picker(picker);
         }
     }
@@ -448,7 +492,9 @@ impl Server {
             items.push(PickItem {
                 label: ws.name.clone(),
                 detail,
-                action: if ws.close_error.is_some() {
+                action: if ws.delete_pending {
+                    PickAction::RetryWorkspaceDelete(ws.id)
+                } else if ws.close_error.is_some() {
                     PickAction::RetryWorkspaceClose(ws.id)
                 } else if ws.closed() {
                     PickAction::ReopenWorkspace(ws.id)
@@ -503,6 +549,13 @@ impl Server {
                 }),
             }
         }
+        if !self.deleted_workspaces.is_empty() {
+            items.push(PickItem::new(
+                format!("Deleted workspaces ({})", self.deleted_workspaces.len()),
+                "",
+                PickAction::DeletedWorkspaces,
+            ));
+        }
         items.push(PickItem {
             label: "+ Add workspace".into(),
             detail: String::new(),
@@ -520,6 +573,17 @@ impl Server {
         let mut picker = Picker::new(PickerKind::Workspace, "Workspaces", items);
         picker.selected = selected;
         picker
+    }
+
+    fn delete_picker_workspace(&self, id: ClientId, p: Picker) -> Mode {
+        use super::super::workspace_lifecycle::DeleteTarget;
+        let target = match p.current().map(|i| &i.action) {
+            Some(PickAction::SwitchWorkspace(ws) | PickAction::ReopenWorkspace(ws)) => DeleteTarget::Workspace(*ws),
+            Some(PickAction::OpenDefinition(path)) => DeleteTarget::Source(path.clone()),
+            _ => return Mode::Picker(p),
+        };
+        let mode = self.ask_delete_workspace(target);
+        self.return_to_workspaces(id, mode, p.state())
     }
 
     /// Every command, to find by what it does and run; each shows its keys.
@@ -975,7 +1039,7 @@ mod tests {
         ] {
             let open = matches!(action, PickAction::SwitchWorkspace(_));
             let stale = matches!(action, PickAction::SwitchWorkspace(u32::MAX));
-            let actions = open || matches!(action, PickAction::ReopenWorkspace(_));
+            let actions = open || matches!(action, PickAction::ReopenWorkspace(_) | PickAction::OpenDefinition(_));
             let mut p = Picker::new(
                 PickerKind::Workspace,
                 "Workspaces",
@@ -1075,5 +1139,204 @@ mod tests {
             matches!(server.on_confirm(0, q, InputEvent::Key(key)), Mode::Picker(p) if p.kind == PickerKind::Accounts)
         );
         assert_eq!(server.accounts.all().len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod deletion_tests {
+    use super::*;
+    use crate::input::KeySpec;
+    use crate::server::persistence::tests::writer;
+    use crate::server::workspace_lifecycle::DeleteTarget;
+    use ratatui::buffer::Buffer;
+
+    fn key(spec: &str) -> InputEvent {
+        let spec = KeySpec::parse(spec).unwrap();
+        InputEvent::Key(Key { code: spec.code, mods: spec.mods, raw: Vec::new() })
+    }
+
+    #[test]
+    fn global_actions_work_after_last_workspace_deletion_and_reattachment() {
+        for reattach in [false, true] {
+            let (tx, _rx) = crate::server::queue::channel(4096);
+            let mut server = crate::server::tests::server(tx);
+            let (mut client, _peer) = crate::server::tests::client(&mut server);
+            let ws = server.clients[&client].workspace;
+            writer(&mut server, vec![]);
+            server.keep_and_delete_workspace(ws).unwrap();
+            let _reattached_peer = if reattach {
+                server.detach(client, "detached");
+                let (stream, peer) = std::os::unix::net::UnixStream::pair().unwrap();
+                client = server.next_id;
+                server.new_connection(stream);
+                server.attach(client, 80, 24, None);
+                Some(peer)
+            } else {
+                None
+            };
+            assert!(server.workspaces.is_empty());
+            assert!(matches!(server.clients[&client].mode, Mode::Picker(_)));
+            server.client_input(client, b"\x1b");
+            server.flush_client_input(client);
+            assert!(matches!(server.clients[&client].mode, Mode::Normal));
+            server.client_input(client, b"\x02?");
+            assert!(matches!(server.clients[&client].mode, Mode::Help { .. }));
+            server.client_input(client, b"\x1b");
+            server.flush_client_input(client);
+            server.client_input(client, b"\x02q");
+            assert!(
+                matches!(&server.clients[&client].mode, Mode::Confirm(q) if matches!(q.action, ConfirmAction::Quit))
+            );
+            server.client_input(client, b"\x1b");
+            server.flush_client_input(client);
+            server.client_input(client, b"\x02Wr");
+            assert!(
+                matches!(&server.clients[&client].mode, Mode::Confirm(q) if matches!(q.action, ConfirmAction::Restart))
+            );
+            server.client_input(client, b"\x1b");
+            server.flush_client_input(client);
+            assert!(matches!(server.action(client, Action::Messages), Mode::Messages { .. }));
+            assert!(matches!(server.action(client, Action::CommandPalette), Mode::Picker(_)));
+            assert!(matches!(server.action(client, Action::Accounts), Mode::Picker(_)));
+            assert!(matches!(server.action(client, Action::AddAccount), Mode::AccountForm(_)));
+            assert!(matches!(server.action(client, Action::NewWorkspace), Mode::Prompt(_)));
+            assert!(matches!(server.action(client, Action::WorkspacePicker), Mode::Picker(_)));
+            let before = server.bottom_bar;
+            server.action(client, Action::ToggleBottomBar);
+            assert_eq!(server.bottom_bar, !before);
+            let before = server.sidebar_shown(&server.clients[&client]);
+            server.action(client, Action::ToggleSidebar);
+            assert_eq!(server.sidebar_shown(&server.clients[&client]), !before);
+            server.client_input(client, b"\x02d");
+            assert!(!server.clients.contains_key(&client));
+            assert!(server.workspaces.is_empty());
+            assert!(!server.quitting);
+        }
+    }
+
+    #[test]
+    fn delete_rechecks_programs_and_a_scanned_row_that_was_opened_by_another_client() {
+        let (tx, _rx) = crate::server::queue::channel(4096);
+        let mut server = crate::server::tests::server(tx);
+        let (client, _peer) = crate::server::tests::client(&mut server);
+        let ws = server.clients[&client].workspace;
+        let Mode::Confirm(question) = server.ask_delete_workspace(DeleteTarget::Workspace(ws)) else { panic!() };
+        assert_eq!(question.action.verb(), "Delete");
+        let _batch = crate::pane::batch();
+        server
+            .spawn_pane_in(
+                ws,
+                None,
+                PaneSpec { command: vec!["sleep".into(), "60".into()], ..Default::default() },
+                Placement::Tab,
+                Some("new program".into()),
+            )
+            .unwrap();
+        let Mode::Confirm(updated) = server.on_confirm(client, question, key("y")) else { panic!() };
+        assert!(!updated.yes);
+        assert_eq!(updated.action.verb(), "Stop and delete");
+        assert!(updated.message.contains("sleep 60"));
+        assert_eq!(server.panes.len(), 1);
+        assert!(server.deleted_workspaces.is_empty());
+        let path = std::env::temp_dir().join(format!("kraal-delete-question-{}.kdl", crate::accounts::new_uuid()));
+        std::fs::write(&path, "layout { pane; }\n").unwrap();
+        let Mode::Confirm(question) = server.ask_delete_workspace(DeleteTarget::Source(path.clone())) else { panic!() };
+        server.open_definition(&path).unwrap();
+        let Mode::Confirm(retry) = server.on_confirm(client, question, key("y")) else { panic!() };
+        assert!(retry.message.contains("opened meanwhile"));
+        assert_eq!(server.panes.len(), 2);
+        assert!(server.deleted_workspaces.is_empty());
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn delete_confirmation_cancel_undo_and_deleted_list_work_with_keys_and_mouse_at_both_sizes() {
+        for size in [(80, 24), (124, 36)] {
+            let (tx, _rx) = crate::server::queue::channel(4096);
+            let mut server = crate::server::tests::server(tx);
+            let (client, _peer) = crate::server::tests::client(&mut server);
+            let c = server.clients.get_mut(&client).unwrap();
+            (c.cols, c.rows) = size;
+            let ws = c.workspace;
+            writer(&mut server, vec![]);
+            let mut p = server.workspace_picker(ws);
+            p.query = "test".into();
+            p.cursor = 2;
+            p.refilter();
+            let Mode::Picker(mut p) = server.on_picker(client, p, key("tab")) else { panic!() };
+            p.actions = Some(p.action_keys().len() - 1);
+            let event = if size.0 == 80 {
+                key("enter")
+            } else {
+                let layout = crate::server::overlays::picker_layout(&p, server.client_screen(client));
+                InputEvent::Mouse(MouseEvent {
+                    kind: MouseKind::Press(MouseButton::Left),
+                    col: layout.list.x + 2,
+                    row: layout.list.y + p.actions.unwrap() as u16,
+                    mods: Default::default(),
+                })
+            };
+            let Mode::Confirm(q) = server.on_picker(client, p, event) else { panic!() };
+            assert!(!q.yes);
+            assert_eq!(q.action.verb(), "Delete");
+            assert!(q.message.contains("Deleted workspaces"));
+            assert!(q.message.contains("Project files will be kept."));
+            let mut buf = Buffer::empty(server.client_screen(client));
+            crate::server::overlays::draw_confirm(&q, buf.area, &mut buf);
+            let shown: String = buf.content.iter().map(|c| c.symbol()).collect();
+            for text in ["Delete test?", "Cancel", "Delete"] {
+                assert!(shown.contains(text), "{shown}");
+            }
+            let Mode::Picker(p) = server.on_confirm(client, q, key("enter")) else { panic!() };
+            assert_eq!((p.query.as_str(), p.cursor), ("test", 2));
+            assert_eq!(server.workspaces.len(), 1);
+            let Mode::Confirm(q) = server.ask_delete_workspace(DeleteTarget::Workspace(ws)) else { panic!() };
+            let Mode::Picker(p) = server.on_confirm(client, q, key("y")) else { panic!() };
+            assert!(server.workspaces.is_empty());
+            assert!(!server.quitting);
+            assert!(p.undo.is_some());
+            let mut buf = Buffer::empty(server.client_screen(client));
+            crate::server::overlays::draw_picker(&p, buf.area, &mut buf);
+            let shown: String = buf.content.iter().map(|c| c.symbol()).collect();
+            assert!(shown.contains("Ctrl+Z Undo"), "{shown}");
+            assert!(shown.contains("Deleted workspaces (1)"), "{shown}");
+            let identity = p.undo.clone().unwrap();
+            let Mode::Picker(restored) = server.on_picker(client, p, key("ctrl+z")) else { panic!() };
+            let ws = restored.current().unwrap().action.workspace().unwrap();
+            assert!(server.workspaces[0].closed());
+            assert!(server.panes.is_empty());
+            assert_eq!(server.workspaces[0].stable_id, identity);
+            let Mode::Picker(_) = server.delete_workspace(client, DeleteTarget::Workspace(ws)) else { panic!() };
+            let col = (0..size.0)
+                .find(|&col| {
+                    matches!(server.tab_bar_hit(client, col), Some(crate::server::render::BarItem::Toast(_, _)))
+                })
+                .unwrap();
+            let p = server.workspace_picker(0);
+            let click = InputEvent::Mouse(MouseEvent {
+                kind: MouseKind::Press(MouseButton::Left),
+                col,
+                row: 0,
+                mods: Default::default(),
+            });
+            let Mode::Picker(restored) = server.on_picker(client, p, click) else { panic!() };
+            let ws = restored.current().unwrap().action.workspace().unwrap();
+            assert!(server.workspaces[0].closed());
+            server.keep_and_delete_workspace(ws).unwrap();
+            let mut list = server.workspace_picker(0);
+            list.select(|i| matches!(i.action, PickAction::DeletedWorkspaces));
+            let Mode::Picker(deleted) = server.on_picker(client, list, key("enter")) else { panic!() };
+            assert!(deleted.kind == PickerKind::DeletedWorkspaces);
+            let layout = crate::server::overlays::picker_layout(&deleted, server.client_screen(client));
+            let click = InputEvent::Mouse(MouseEvent {
+                kind: MouseKind::Press(MouseButton::Left),
+                col: layout.list.x + 2,
+                row: layout.list.y + 1,
+                mods: Default::default(),
+            });
+            let Mode::Picker(restored) = server.on_picker(client, deleted, click) else { panic!() };
+            assert!(restored.message.as_ref().unwrap().contains("Workspace restored"));
+            assert!(server.workspaces[0].closed());
+        }
     }
 }

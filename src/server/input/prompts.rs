@@ -123,7 +123,9 @@ impl Server {
                     pn.name = (!value.is_empty()).then_some(value);
                 }
             }
-            PromptAction::RenameWorkspace(_) | PromptAction::NewWorkspace => unreachable!("answered in submit_prompt"),
+            PromptAction::RenameWorkspace(_) | PromptAction::NewWorkspace | PromptAction::RestoreWorkspace(_) => {
+                unreachable!("answered in submit_prompt")
+            }
             PromptAction::OpenPreview => {
                 if value.is_empty() {
                     return Err((p.action, "Type the path of a file or directory.".into()));
@@ -450,6 +452,21 @@ impl Server {
                     }
                     ConfirmAction::RetryCloseWorkspace(ws) => {
                         return self.ask_close_workspace(id, ws);
+                    }
+                    ConfirmAction::DeleteWorkspace { target, .. } => {
+                        let current = self.ask_delete_workspace(target.clone());
+                        if matches!(&current, Mode::Confirm(next) if matches!(next.action, ConfirmAction::DeleteWorkspace { .. }) && next.message == q.message)
+                        {
+                            return self.delete_workspace(id, target);
+                        }
+                        return current;
+                    }
+                    ConfirmAction::RetryDeleteWorkspace(target) => {
+                        if matches!(&target, super::super::workspace_lifecycle::DeleteTarget::Workspace(ws) if self.ws_index(*ws).is_some_and(|wi| self.workspaces[wi].delete_pending))
+                        {
+                            return self.delete_workspace(id, target);
+                        }
+                        return self.ask_delete_workspace(target);
                     }
                     ConfirmAction::Restart => self.restart(id),
                     ConfirmAction::Quit => self.quit(id),
