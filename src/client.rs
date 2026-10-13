@@ -396,9 +396,12 @@ pub fn request_quick(socket: &Path, req: Request) -> Result<()> {
     Ok(())
 }
 
-struct TerminalGuard;
-
-const SETUP_NO_MOUSE: &str = "\x1b[?1049h\x1b[?25l";
+/// The alternate screen, with the cursor hidden.
+const SCREEN_ON: &str = "\x1b[?1049h\x1b[?25l";
+/// Back to the screen the client found, then the attributes and the cursor as it found them.
+const SCREEN_OFF: &str = "\x1b[?1049l\x1b[0m\x1b[0 q\x1b[?25h";
+/// The end of a synchronized update, should a frame have left one open.
+const SYNC_OFF: &str = "\x1b[?2026l";
 // `CSI > 5 u` asks the terminal for unambiguous keys (kitty keyboard protocol), so Shift+Enter,
 // Ctrl+Enter or Esc arrive distinct, and for their alternates, so a key with Ctrl or Alt also
 // says where it is on the keyboard; typed text still comes as text. Terminals without the
@@ -409,17 +412,132 @@ const KEYS_OFF: &str = "\x1b[<u\x1b[?1004l\x1b[?2004l";
 pub(crate) const MOUSE_ON: &str = "\x1b[?1000h\x1b[?1002h\x1b[?1006h";
 pub(crate) const MOUSE_OFF: &str = "\x1b[?1006l\x1b[?1003l\x1b[?1002l\x1b[?1000l";
 
-/// Turn the terminal's input modes on (kitty keys, bracketed paste, focus reports, the mouse
-/// when asked) while a server answers, and off while kraal waits for one.
-fn set_modes(on: bool, mouse: bool) {
-    let mut out = std::io::stdout();
-    let _ = out.write_all(if on { KEYS_ON } else { KEYS_OFF }.as_bytes());
-    // Off whatever the setting was when attaching: the server turns the mouse on or off when its
-    // configuration is read again.
-    if mouse || !on {
-        let _ = out.write_all(if on { MOUSE_ON } else { MOUSE_OFF }.as_bytes());
+/// A terminal as the client drives it.
+trait Tty {
+    /// Raw mode, or line mode back.
+    fn set_raw(&mut self, on: bool) -> std::io::Result<()>;
+    /// All of `bytes`, now.
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<()>;
+}
+
+/// The terminal kraal was started in.
+struct OwnTty;
+
+impl Tty for OwnTty {
+    fn set_raw(&mut self, on: bool) -> std::io::Result<()> {
+        if on { crossterm::terminal::enable_raw_mode() } else { crossterm::terminal::disable_raw_mode() }
     }
-    let _ = out.flush();
+
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+        let mut out = std::io::stdout().lock();
+        out.write_all(bytes)?;
+        out.flush()
+    }
+}
+
+/// What the client has changed on its terminal. Whoever leaves first (the end of `attach`, a
+/// signal, a panic) undoes exactly that, once and in order; nothing more is set up or written
+/// after. Held while anything is written (see [`terminal`]): a frame goes out whole, and none
+/// follows the bytes that give the terminal back.
+struct Terminal<T: Tty> {
+    tty: T,
+    /// Raw mode (off while ssh has the terminal).
+    raw: bool,
+    /// The alternate screen, with the cursor hidden.
+    screen: bool,
+    /// The client's entry on the terminal's keyboard stack, bracketed paste and focus reports.
+    keys: bool,
+    /// The terminal was given back.
+    left: bool,
+}
+
+impl<T: Tty> Terminal<T> {
+    const fn new(tty: T) -> Terminal<T> {
+        Terminal { tty, raw: false, screen: false, keys: false, left: false }
+    }
+
+    /// Raw mode on, or off for ssh to ask what it has to in the terminal.
+    fn set_raw(&mut self, on: bool) -> std::io::Result<()> {
+        if self.left || self.raw == on {
+            return Ok(());
+        }
+        self.tty.set_raw(on)?;
+        self.raw = on;
+        Ok(())
+    }
+
+    /// Write `bytes` (a frame, a status line), unless the terminal was given back: whether they
+    /// were written.
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<bool> {
+        if self.left {
+            return Ok(false);
+        }
+        self.tty.write(bytes)?;
+        Ok(true)
+    }
+
+    /// Take the screen.
+    fn enter(&mut self) -> std::io::Result<()> {
+        self.screen |= self.write(SCREEN_ON.as_bytes())?;
+        Ok(())
+    }
+
+    /// Turn the terminal's input modes on (kitty keys, bracketed paste, focus reports, the mouse
+    /// when asked) while a server answers, and off while kraal waits for one. Asked again for
+    /// what they are already, they are left alone: the terminal's keyboard stack is popped as
+    /// often as it was pushed, and no server has touched the mouse in between.
+    fn set_modes(&mut self, on: bool, mouse: bool) {
+        if self.keys == on {
+            return;
+        }
+        let mut bytes = if on { KEYS_ON } else { KEYS_OFF }.as_bytes().to_vec();
+        // Off whatever the setting was when attaching: the server turns the mouse on or off when
+        // its configuration is read again.
+        if mouse || !on {
+            bytes.extend_from_slice(if on { MOUSE_ON } else { MOUSE_OFF }.as_bytes());
+        }
+        if self.write(&bytes).unwrap_or(false) {
+            self.keys = on;
+        }
+    }
+
+    /// Give the terminal back as the client found it: line mode first (that cannot wait for the
+    /// terminal to read), then the keyboard, the mouse, the screen and the cursor.
+    fn leave(&mut self) {
+        if std::mem::replace(&mut self.left, true) {
+            return;
+        }
+        if std::mem::take(&mut self.raw) {
+            let _ = self.tty.set_raw(false);
+        }
+        if !std::mem::take(&mut self.screen) {
+            return;
+        }
+        let mut bytes = SYNC_OFF.as_bytes().to_vec();
+        if std::mem::take(&mut self.keys) {
+            bytes.extend_from_slice(KEYS_OFF.as_bytes());
+        }
+        // The server may have turned the mouse on since: off, whatever the client set.
+        bytes.extend_from_slice(MOUSE_OFF.as_bytes());
+        bytes.extend_from_slice(SCREEN_OFF.as_bytes());
+        let _ = self.tty.write(&bytes);
+    }
+}
+
+static TERMINAL: Mutex<Terminal<OwnTty>> = Mutex::new(Terminal::new(OwnTty));
+
+/// The client's terminal, held for the time of one change or one write.
+fn terminal() -> std::sync::MutexGuard<'static, Terminal<OwnTty>> {
+    TERMINAL.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Gives the terminal back when `attach` ends, however it ends.
+struct TerminalGuard;
+
+impl Drop for TerminalGuard {
+    fn drop(&mut self) {
+        terminal().leave();
+    }
 }
 
 /// Whether `keys` hold ctrl+c, as a terminal sends it with or without the kitty protocol, and on
@@ -434,35 +552,9 @@ fn is_ctrl_c(keys: &[u8]) -> bool {
             if k.mods.ctrl && !k.mods.alt && (k.code == c || k.by_place().is_some_and(|p| p.code == c)))
     })
 }
-const RESTORE: &str = "\x1b[?2026l\x1b[<u\x1b[?1006l\x1b[?1003l\x1b[?1002l\x1b[?1000l\x1b[?1004l\x1b[?2004l\x1b[0m\x1b[0 q\x1b[?25h\x1b[?1049l";
 
-/// Set when the client is going: the output loop writes nothing more.
-static LEAVING: AtomicBool = AtomicBool::new(false);
 /// The ssh process of a remote attachment, to stop with the client.
 static SSH_PID: AtomicU32 = AtomicU32::new(0);
-
-/// Give the terminal back as it was: line mode first (that cannot block), then the reset
-/// sequences, written to the descriptor directly (on a signal, the output loop may hold the
-/// stdout lock).
-fn restore_terminal() {
-    let _ = crossterm::terminal::disable_raw_mode();
-    let mut out: &[u8] = RESTORE.as_bytes();
-    while !out.is_empty() {
-        // SAFETY: writing a valid buffer to stdout's descriptor.
-        let n = unsafe { libc::write(1, out.as_ptr().cast(), out.len()) };
-        if n <= 0 {
-            break;
-        }
-        out = &out[n as usize..];
-    }
-}
-
-impl Drop for TerminalGuard {
-    fn drop(&mut self) {
-        let _ = std::io::stdout().flush();
-        restore_terminal();
-    }
-}
 
 /// Where to attach: this machine's server, or a server running on another machine over SSH.
 #[derive(Debug, Clone)]
@@ -566,9 +658,8 @@ fn status_line(msg: &str) {
     let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
     // Leave the last column empty: writing there would scroll the screen.
     let text = crate::text::truncate(msg, usize::from(cols).saturating_sub(2));
-    let mut out = std::io::stdout();
-    let _ = write!(out, "\x1b7\x1b[?7l\x1b[{rows};1H\x1b[0m\x1b[41;97m {text}\x1b[K\x1b[0m\x1b[?7h\x1b8");
-    let _ = out.flush();
+    let line = format!("\x1b7\x1b[?7l\x1b[{rows};1H\x1b[0m\x1b[41;97m {text}\x1b[K\x1b[0m\x1b[?7h\x1b8");
+    let _ = terminal().write(line.as_bytes());
 }
 
 /// A connection the server answered.
@@ -767,29 +858,22 @@ pub fn attach(mut target: Target, mut workspace: Option<String>, mouse: bool, at
         let mut signals = signal_hook::iterator::Signals::new([SIGTERM, SIGHUP, SIGINT, SIGQUIT])?;
         crate::threads::named("signals").spawn(move || {
             if let Some(sig) = signals.forever().next() {
-                LEAVING.store(true, Ordering::SeqCst);
                 let pid = SSH_PID.load(Ordering::SeqCst);
                 if pid != 0 {
                     // SAFETY: signalling the ssh child this client started.
                     unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
                 }
-                // CAN ends an escape sequence the output loop may have left half written.
-                // SAFETY: one byte to stdout's descriptor.
-                unsafe { libc::write(1, b"\x18".as_ptr().cast(), 1) };
-                restore_terminal();
+                // After the frame being written, if one is: none is cut short.
+                terminal().leave();
                 std::process::exit(128 + sig);
             }
         })?;
     }
 
-    crossterm::terminal::enable_raw_mode().context("switching the terminal to raw mode")?;
+    terminal().set_raw(true).context("switching the terminal to raw mode")?;
     let guard = TerminalGuard;
-    {
-        let mut out = std::io::stdout();
-        out.write_all(SETUP_NO_MOUSE.as_bytes())?;
-        out.flush()?;
-    }
-    set_modes(true, mouse);
+    terminal().enter()?;
+    terminal().set_modes(true, mouse);
 
     // The current connection's writer; None while reconnecting.
     let writer: Arc<Mutex<Option<Box<dyn Write + Send>>>> = Arc::new(Mutex::new(None));
@@ -852,11 +936,11 @@ pub fn attach(mut target: Target, mut workspace: Option<String>, mouse: bool, at
                 // reads nothing, and ctrl+c (a signal again) ends it. The keyboard modes are off
                 // already (see below).
                 if pause.pause() {
-                    let _ = crossterm::terminal::disable_raw_mode();
+                    let _ = terminal().set_raw(false);
                     let greeted = greet(&target, &workspace);
-                    let _ = crossterm::terminal::enable_raw_mode();
+                    let _ = terminal().set_raw(true);
                     if greeted.is_ok() {
-                        set_modes(true, mouse);
+                        terminal().set_modes(true, mouse);
                     }
                     pause.resume();
                     greeted
@@ -870,10 +954,9 @@ pub fn attach(mut target: Target, mut workspace: Option<String>, mouse: bool, at
         let lost = match session {
             Ok(Greeted { conn: mut c, mut frames, first }) => {
                 let mut to_server = std::mem::replace(&mut c.writer, Box::new(std::io::sink()));
-                let mut out = std::io::stdout().lock();
                 if let Some(said) = &nested {
                     let _ = protocol::write_frame(&mut to_server, protocol::BYTES, b"\x1b]7701;report\x07");
-                    let _ = out.write_all(said.as_bytes()).and_then(|_| out.flush());
+                    let _ = terminal().write(said.as_bytes());
                 }
                 *writer.lock().unwrap() = Some(to_server);
                 delay = Duration::from_secs(1);
@@ -881,11 +964,11 @@ pub fn attach(mut target: Target, mut workspace: Option<String>, mouse: bool, at
                 let lost = loop {
                     match next.take().unwrap_or_else(|| protocol::read_frame(&mut frames)) {
                         Ok(Some((protocol::BYTES, bytes))) => {
-                            if LEAVING.load(Ordering::SeqCst) {
-                                break 'session "leaving".to_string();
-                            }
-                            if out.write_all(&bytes).and_then(|_| out.flush()).is_err() {
-                                break 'session "output closed".to_string();
+                            let written = terminal().write(&bytes);
+                            match written {
+                                Ok(true) => {}
+                                Ok(false) => leaving(),
+                                Err(_) => break 'session "output closed".to_string(),
                             }
                         }
                         Ok(Some((_, payload))) => match serde_json::from_slice::<ServerMsg>(&payload) {
@@ -908,14 +991,14 @@ pub fn attach(mut target: Target, mut workspace: Option<String>, mouse: bool, at
                 };
                 *writer.lock().unwrap() = None;
                 if nested.is_some() {
-                    let _ = out.write_all(NOT_ATTACHED).and_then(|_| out.flush());
+                    let _ = terminal().write(NOT_ATTACHED);
                 }
                 lost
             }
             Err(lost) => lost,
         };
         if let (Some(old), Target::Local { session }) = (restarting.take(), &target) {
-            set_modes(false, mouse);
+            terminal().set_modes(false, mouse);
             match wait_restarted(session, old, &quit) {
                 Ok(()) => continue 'session,
                 Err(why) => break 'session why,
@@ -926,7 +1009,7 @@ pub fn attach(mut target: Target, mut workspace: Option<String>, mouse: bool, at
         };
         // Until a server answers again, keys are plain (ctrl+c is ^C, and a signal while ssh
         // has the terminal), and neither the mouse nor focus changes type into a password.
-        set_modes(false, mouse);
+        terminal().set_modes(false, mouse);
         // Remote: wait and try again, until it works or the user gives up.
         let until = Instant::now() + delay;
         while Instant::now() < until {
@@ -943,11 +1026,10 @@ pub fn attach(mut target: Target, mut workspace: Option<String>, mouse: bool, at
         delay = (delay * 2).min(Duration::from_secs(15));
     };
     if nested.is_some() {
-        let mut out = std::io::stdout();
-        let _ = out.write_all(NOT_ATTACHED).and_then(|_| out.flush());
+        let _ = terminal().write(NOT_ATTACHED);
     }
     drop(guard);
-    eprintln!("[kraal: {reason}]");
+    say(&format!("[kraal: {reason}]"));
     if let Target::Local { session } = &target {
         // A session left running on an older kraal is said once more, here.
         let socket = paths::socket_path(session);
@@ -955,13 +1037,27 @@ pub fn attach(mut target: Target, mut workspace: Option<String>, mouse: bool, at
             .filter(|_| UnixStream::connect(&socket).is_ok())
             .or_else(|| ping(&socket).ok().map(|s| s.version));
         if let Some(older) = running.filter(|v| protocol::newer(protocol::KRAAL_VERSION, v)) {
-            eprintln!(
+            say(&format!(
                 "kraal {} is installed; session {session} runs {older}: `kraal -s {session} restart` restarts it",
                 protocol::KRAAL_VERSION
-            );
+            ));
         }
     }
     Ok(())
+}
+
+/// Say `line` in the terminal the client gave back, in one write: a signal that ends the client
+/// meanwhile leaves the line whole or unwritten, never cut.
+fn say(line: &str) {
+    let _ = std::io::stderr().write_all(format!("{line}\n").as_bytes());
+}
+
+/// A signal gave the terminal back while a frame was on its way: its thread ends the process,
+/// with the signal's status, and nothing is left to do here.
+fn leaving() -> ! {
+    loop {
+        std::thread::park();
+    }
 }
 
 /// Wait until the server that is restarting (`old`) has gone and the next one listens, saying
@@ -1019,6 +1115,110 @@ pub fn proxy(session: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A terminal that keeps what is done to it, in order: `raw`, `line`, or the bytes written.
+    #[derive(Default)]
+    struct Recorded(Vec<String>);
+
+    impl Tty for Recorded {
+        fn set_raw(&mut self, on: bool) -> std::io::Result<()> {
+            self.0.push(if on { "raw" } else { "line" }.to_string());
+            Ok(())
+        }
+
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+            self.0.push(String::from_utf8(bytes.to_vec()).unwrap());
+            Ok(())
+        }
+    }
+
+    impl Terminal<Recorded> {
+        /// A terminal taken as `attach` takes it.
+        fn taken() -> Terminal<Recorded> {
+            let mut t = Terminal::new(Recorded::default());
+            t.set_raw(true).unwrap();
+            t.enter().unwrap();
+            t.set_modes(true, true);
+            t
+        }
+
+        /// How many times `sequence` was written.
+        fn wrote(&self, sequence: &str) -> usize {
+            self.tty.0.iter().map(|step| step.matches(sequence).count()).sum()
+        }
+    }
+
+    #[test]
+    fn the_terminal_is_given_back_once_and_in_order() {
+        let mut t = Terminal::taken();
+        assert_eq!(t.tty.0, ["raw", SCREEN_ON, &format!("{KEYS_ON}{MOUSE_ON}")]);
+        assert!(t.write(b"frame").unwrap());
+        t.tty.0.clear();
+        t.leave();
+        // Line mode first, then the keyboard, the mouse, the screen and the cursor.
+        let bytes = "\x1b[?2026l\x1b[<u\x1b[?1004l\x1b[?2004l\x1b[?1006l\x1b[?1003l\x1b[?1002l\x1b[?1000l\x1b[?1049l\x1b[0m\x1b[0 q\x1b[?25h";
+        assert_eq!(t.tty.0, ["line", bytes]);
+        // Whoever comes second (a signal during a normal exit) finds it done, and nothing more
+        // is written or set up.
+        t.leave();
+        assert!(!t.write(b"a late frame").unwrap());
+        t.set_modes(true, true);
+        t.set_modes(false, true);
+        t.set_raw(true).unwrap();
+        t.enter().unwrap();
+        assert_eq!(t.tty.0, ["line", bytes]);
+    }
+
+    #[test]
+    fn the_keyboard_stack_is_popped_as_often_as_it_was_pushed() {
+        // A restart wait that is given up: the modes went off for the wait.
+        let mut t = Terminal::taken();
+        t.set_modes(false, true);
+        t.leave();
+        assert_eq!((t.wrote("\x1b[>5u"), t.wrote("\x1b[<u"), t.wrote("\x1b[?1049l")), (1, 1, 1));
+        // Every failed reconnection to a server turns them off again.
+        let mut t = Terminal::taken();
+        for _ in 0..3 {
+            t.set_modes(false, true);
+        }
+        t.leave();
+        assert_eq!((t.wrote("\x1b[>5u"), t.wrote("\x1b[<u")), (1, 1));
+        // A session that came back, then a normal exit.
+        let mut t = Terminal::taken();
+        t.set_modes(false, true);
+        t.set_modes(true, true);
+        t.set_modes(true, true);
+        t.leave();
+        assert_eq!((t.wrote("\x1b[>5u"), t.wrote("\x1b[<u"), t.wrote("\x1b[?1049l")), (2, 2, 1));
+        // Without the mouse asked for, it is still turned off on the way out: the server may
+        // have turned it on.
+        let mut t = Terminal::new(Recorded::default());
+        t.enter().unwrap();
+        t.set_modes(true, false);
+        assert_eq!(t.wrote(MOUSE_ON), 0);
+        t.leave();
+        assert_eq!(t.wrote(MOUSE_OFF), 1);
+    }
+
+    #[test]
+    fn a_terminal_left_while_ssh_has_it_stays_in_line_mode() {
+        let mut t = Terminal::taken();
+        t.set_modes(false, true);
+        t.set_raw(false).unwrap();
+        t.tty.0.clear();
+        // A signal while ssh asks for a password: line mode is on already, and stays.
+        t.leave();
+        assert_eq!(t.tty.0.len(), 1, "{:?}", t.tty.0);
+        assert_eq!(t.wrote("\x1b[<u"), 0);
+        t.set_raw(true).unwrap();
+        assert_eq!(t.tty.0.len(), 1, "raw mode never comes back: {:?}", t.tty.0);
+        // Left before anything was taken: nothing to give back, and nothing is taken after.
+        let mut t = Terminal::new(Recorded::default());
+        t.leave();
+        t.set_raw(true).unwrap();
+        t.enter().unwrap();
+        assert!(t.tty.0.is_empty(), "{:?}", t.tty.0);
+    }
 
     #[test]
     fn ctrl_c_is_seen_with_or_without_the_kitty_protocol() {
