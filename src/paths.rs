@@ -1020,8 +1020,8 @@ mod tests {
         assert!(listen_alone(&reachable(current.clone(), vec![legacy.clone()])).unwrap().is_none());
         assert!(!current.exists());
         // Gone, its socket refuses: the usual place again.
-        drop(server);
-        assert!(nobody_listens(&legacy));
+        drop((server, _waiting));
+        until_nobody_listens(&legacy);
         assert_eq!(reachable(current.clone(), vec![legacy]), current);
         std::fs::remove_dir_all(&root).unwrap();
     }
@@ -1307,6 +1307,30 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// What `take` gives once nobody holds what it locks. A lock file that stays is, for a
+    /// moment after its holder let go, still locked by a program another test is starting: that
+    /// one has this process's files until it runs.
+    fn once_free<T>(take: impl Fn() -> std::io::Result<Option<T>>) -> T {
+        let start = std::time::Instant::now();
+        loop {
+            if let Some(held) = take().unwrap() {
+                return held;
+            }
+            assert!(start.elapsed() < crate::testing::PATIENCE, "never let go");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+
+    /// Wait until nobody listens at `socket` any more: a listener this test closed is, for the
+    /// same moment, still open in a program another test is starting.
+    fn until_nobody_listens(socket: &Path) {
+        let start = std::time::Instant::now();
+        while !nobody_listens(socket) {
+            assert!(start.elapsed() < crate::testing::PATIENCE, "still listened at");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+
     #[test]
     fn a_session_lock_goes_with_its_holder_and_no_other_file_does() {
         let dir = std::env::temp_dir().join(format!("kraal-lock-{}", std::process::id()));
@@ -1337,7 +1361,7 @@ mod tests {
         let file = file_id(&path);
         drop(held);
         assert!(file.is_some() && file_id(&path) == file, "the lock file went with its holder");
-        drop(LockFile::acquire(path.clone(), true, try_lock).unwrap().expect("nobody holds it"));
+        drop(once_free(|| LockFile::acquire(path.clone(), true, try_lock)));
         assert_eq!(file_id(&path), file);
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -1420,18 +1444,18 @@ mod tests {
         assert!(runtime_lock.is_some() && file_id(&lock(&here)) == runtime_lock, "the runtime directory's went");
         // What a holder killed before said is replaced by the next one's.
         std::fs::write(lock(&state), "{\"pid\":1,\"host\":\"gone\",\"runtime\":\"/elsewhere\"}\nmore\n").unwrap();
-        let held = hold(&there).unwrap().unwrap();
+        let held = once_free(|| hold(&there));
         assert_eq!(std::fs::read_to_string(lock(&state)).unwrap().lines().count(), 1);
         assert_eq!(holder_at(&lock(&state)), Some(holder(&there)));
         drop(held);
         // A kraal 0.3.0 holds the runtime directory's lock alone: the session is its own there,
         // and the same file is the lock once it is gone.
-        let old = LockFile::acquire(lock(&here), true, try_lock).unwrap().unwrap();
+        let old = once_free(|| LockFile::acquire(lock(&here), true, try_lock));
         assert!(hold(&here).unwrap().is_none());
         assert!(!lock(&state).exists(), "the one refused kept the state directory's lock");
         drop(old);
         assert_eq!(file_id(&lock(&here)), runtime_lock);
-        drop(hold(&here).unwrap().expect("nobody has it"));
+        drop(once_free(|| hold(&here)));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -1479,7 +1503,7 @@ mod tests {
         let holder = Holder { pid: 4242, host: "box".into(), runtime: both.clone() };
         for runtime in [&both, &alias] {
             let hold = || SessionLock::acquire_at(both.join("main.lock"), runtime.join("main.lock"), &holder, try_lock);
-            let held = hold().unwrap().expect("held against itself");
+            let held = once_free(hold);
             assert!(hold().unwrap().is_none(), "held twice");
             // A kraal 0.3.0, which knows the runtime directory's lock alone, is kept out too.
             assert!(LockFile::acquire(runtime.join("main.lock"), true, try_lock).unwrap().is_none());
@@ -1487,7 +1511,7 @@ mod tests {
             let file = file_id(&both.join("main.lock"));
             drop(held);
             assert!(file.is_some() && file_id(&both.join("main.lock")) == file, "the lock file went with its holder");
-            drop(hold().unwrap().expect("nobody has it"));
+            drop(once_free(hold));
         }
         std::fs::remove_dir_all(&dir).unwrap();
     }
@@ -1533,6 +1557,7 @@ mod tests {
         assert!(connect_now(&socket).is_ok(), "its socket was touched");
         // Its server gone, the socket stays, and refuses.
         drop(first);
+        until_nobody_listens(&socket);
         assert_eq!(connect_now(&socket).unwrap_err().kind(), ErrorKind::ConnectionRefused);
         let stale = file_id(&socket);
         let second = listen_alone(&socket).unwrap().expect("nobody listened there");

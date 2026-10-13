@@ -1401,17 +1401,6 @@ fn lock_file(env: &Env, place: &str) -> PathBuf {
     env.root.join(place).join(format!("kraal/{}.lock", env.session))
 }
 
-/// The places ([`lock_file`]) where a process holds `env`'s session.
-fn held(env: &Env) -> Vec<&'static str> {
-    use std::os::fd::AsRawFd;
-    let is_held = |place: &&str| {
-        let Ok(lock) = std::fs::File::open(lock_file(env, place)) else { return false };
-        // SAFETY: plain syscall on a file this test holds open; what it locks goes as it closes.
-        unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) != 0 }
-    };
-    ["state", "run", "run2"].into_iter().filter(is_held).collect()
-}
-
 /// How long a start that finds its session held looks for that one's server before it gives up:
 /// the time a start may take, and not much more.
 fn gave_up_in_time(took: Duration) -> bool {
@@ -1472,8 +1461,12 @@ fn hold(env: &Env, place: &str, said: &str) -> std::fs::File {
     std::fs::DirBuilder::new().recursive(true).mode(0o700).create(&dir).unwrap();
     let path = dir.join(format!("{}.lock", env.session));
     let mut lock = std::fs::OpenOptions::new().write(true).create(true).truncate(true).open(path).unwrap();
+    // Once nobody has it: a lock this test let go a moment ago is still that of a program
+    // another test is starting, which has this process's files until it runs.
     // SAFETY: plain syscall on a file this test holds open.
-    assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) }, 0, "the session is held");
+    wait_until(PATIENCE, "the session is held", || unsafe {
+        libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) == 0
+    });
     lock.write_all(said.as_bytes()).unwrap();
     lock
 }
@@ -1511,12 +1504,13 @@ fn a_session_running_under_another_runtime_directory_is_refused_and_said() {
         assert_eq!((sockets(&env), env.state_file().exists()), (vec![run(here)], true));
         assert!(in_environment(&env, here, &["panes"]).contains("one"));
         assert!(in_environment(&env, here, &["kill"]).contains("stopped session"));
-        assert_eq!((sockets(&env), held(&env)), (Vec::new(), Vec::new()));
+        assert_eq!((sockets(&env), lock_file(&env, "state").exists()), (Vec::new(), false));
         in_environment(&env, there, &["open", "w"]);
         assert!(in_environment(&env, there, &["panes"]).contains("one"));
         in_environment(&env, there, &["kill"]);
         in_environment(&env, here, &["forget"]);
-        assert_eq!((sockets(&env), held(&env), env.state_file().exists()), (Vec::new(), Vec::new(), false));
+        let left = (sockets(&env), lock_file(&env, "state").exists(), env.state_file().exists());
+        assert_eq!(left, (Vec::new(), false, false));
     }
 }
 
@@ -1553,7 +1547,7 @@ fn a_session_started_at_once_from_two_runtime_directories_has_one_server() {
         assert!(!loser.status.success() && told, "round {round}: {said}");
         assert!(in_environment(&env, winner, &["panes"]).contains("one"), "round {round}");
         in_environment(&env, winner, &["kill"]);
-        assert_eq!(held(&env), [""; 0], "round {round}");
+        assert!(!lock_file(&env, "state").exists(), "round {round}");
         in_environment(&env, !winner, &["forget"]);
     }
 }
@@ -1580,7 +1574,7 @@ fn a_killed_server_leaves_nothing_that_blocks_the_next_start() {
         assert!(started.status.success(), "{}", String::from_utf8_lossy(&started.stderr));
         assert!(in_environment(&env, next, &["panes"]).contains("one"));
         in_environment(&env, next, &["kill"]);
-        assert_eq!((held(&env), lock_file(&env, "state").exists()), (Vec::new(), false));
+        assert!(!lock_file(&env, "state").exists(), "the lock file a killed server left");
     }
 }
 
@@ -1761,22 +1755,21 @@ fn a_session_started_many_times_at_once_starts_once_and_for_all() {
     }
 }
 
-/// A session is held by its server, and by nobody once that server is gone. The lock file where
-/// it saves goes with its holder, a server or `kraal forget`: a session name that was used
-/// leaves nothing there, and the file a killed server left is the next one's to remove. The
-/// one of the runtime directory stays, for kraal 0.3.0: it takes that file without looking at
-/// it again, and would hold one that is gone.
+/// The lock file where a session saves goes with its holder, a server or `kraal forget`: a
+/// session name that was used leaves nothing there, and the file a killed server left is the
+/// next one's to remove. The one of the runtime directory stays, for kraal 0.3.0: it takes that
+/// file without looking at it again, and would hold one that is gone.
 #[test]
 fn a_session_leaves_no_lock_file_where_it_saves() {
     let env = Env::new("nolock");
     env.workspace("w", "layout {\n    pane name=\"one\"\n}\n");
     env.run(&["open", "w"]);
-    assert_eq!(held(&env), ["state", "run"], "a running server holds its session");
+    assert!(lock_file(&env, "state").exists() && lock_file(&env, "run").exists(), "a server holds its session");
     let runtime_lock = std::fs::metadata(lock_file(&env, "run")).map(|m| std::os::unix::fs::MetadataExt::ino(&m)).ok();
     env.run(&["kill"]);
-    assert_eq!((held(&env), lock_file(&env, "state").exists()), (Vec::new(), false), "after a server that stopped");
+    assert!(!lock_file(&env, "state").exists(), "left by a server that stopped");
     env.run(&["forget"]);
-    assert_eq!((held(&env), lock_file(&env, "state").exists()), (Vec::new(), false), "after kraal forget");
+    assert!(!lock_file(&env, "state").exists(), "left by kraal forget");
     // A server killed outright cannot remove its file: the next server takes it, and removes it.
     env.run(&["open", "w"]);
     let pid = env.server_pid().expect("the server runs");
@@ -1790,7 +1783,7 @@ fn a_session_leaves_no_lock_file_where_it_saves() {
     assert!(lock_file(&env, "state").exists());
     env.run(&["open", "w"]);
     env.run(&["kill"]);
-    assert_eq!((held(&env), lock_file(&env, "state").exists()), (Vec::new(), false), "after a killed server's next");
+    assert!(!lock_file(&env, "state").exists(), "left by the server after a killed one");
     let still = std::fs::metadata(lock_file(&env, "run")).map(|m| std::os::unix::fs::MetadataExt::ino(&m)).ok();
     assert!(runtime_lock.is_some() && still == runtime_lock, "the runtime directory's lock file was replaced");
 }
@@ -1853,13 +1846,13 @@ fn a_session_started_stopped_and_forgotten_at_once_is_held_by_one_at_a_time() {
         assert!(said.is_empty() || said.contains("holds session \"lockrace\""), "{said}");
     }
     assert!(ran > 0 && refused > 0, "{ran} servers ran, {refused} were refused");
-    assert_eq!(held(&env), [""; 0]);
+    assert!(!lock_file(&env, "state").exists());
     // And the session is as any other.
     env.run(&["open", "w"]);
     assert!(env.run(&["panes"]).contains("one"));
     env.run(&["kill"]);
     env.run(&["forget"]);
-    assert_eq!(held(&env), [""; 0]);
+    assert!(!lock_file(&env, "state").exists());
 }
 
 /// A workspace that cannot be restored (its shell is gone) stays saved as it was, scrollback
