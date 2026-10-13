@@ -534,9 +534,19 @@ pub struct Holder {
 /// `kraal forget` that came then would delete what the next server is about to restore.
 /// `forget` takes this too, for the moment it takes, and so does nothing during a restart.
 /// Kraal 0.3.0 and older do not take it.
+///
+/// The server a restart starts inherits it ([`Restarting::inherited`]): the lock is that of the
+/// open file, which the two processes then share, so the session stays kept until that server
+/// has it, even when the kraal that restarts is killed or gives up waiting before. The file
+/// goes with whoever knows the session is held again: that server, or the kraal that restarts
+/// once a server listens.
 pub struct Restarting {
-    _lock: LockFile,
+    lock: LockFile,
 }
+
+/// The environment variable that gives a server the descriptor of what keeps its session while
+/// it is restarted ([`Restarting::inherited`]).
+pub const RESTART_FD_VAR: &str = "KRAAL_RESTART_FD";
 
 impl Restarting {
     /// Keep `session` for a restart, or for the time `kraal forget` takes. Another `forget` has
@@ -549,13 +559,57 @@ impl Restarting {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
         loop {
             if let Some(lock) = LockFile::acquire(path.clone(), false, try_lock)? {
-                return Ok(Some(Restarting { _lock: lock }));
+                return Ok(Some(Restarting { lock }));
             }
             if std::time::Instant::now() >= deadline {
                 return Ok(None);
             }
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
+    }
+
+    /// The descriptor a server started for the restart is to inherit.
+    pub fn descriptor(&self) -> std::os::fd::RawFd {
+        std::os::fd::AsRawFd::as_raw_fd(&self.lock.file)
+    }
+
+    /// Let go of it without removing its file: a server started for the restart may still be
+    /// on its way with it, and whoever made a file in its place would get past that server.
+    pub fn leave_to_the_server(mut self) {
+        self.lock.stays = true;
+    }
+
+    /// What the kraal that restarts `session` gave this process, a server it started: the
+    /// descriptor [`RESTART_FD_VAR`] names, when it is the file that keeps the session. Taken
+    /// out of the environment, and closed in what this server starts.
+    pub fn inherited(session: &str) -> Option<Restarting> {
+        use std::os::fd::FromRawFd;
+        use std::os::unix::fs::MetadataExt;
+        let value = std::env::var_os(RESTART_FD_VAR)?;
+        // SAFETY: the server has not started any thread yet.
+        unsafe { std::env::remove_var(RESTART_FD_VAR) };
+        let fd: libc::c_int = value.to_str()?.parse().ok().filter(|fd| *fd > 2)?;
+        // SAFETY: fstat and fcntl only look at the descriptor, and fail on one that is not
+        // open. A regular file among those this process was started with is no other part's:
+        // it is owned here from now on.
+        let file = unsafe {
+            let mut st: libc::stat = std::mem::zeroed();
+            if libc::fstat(fd, &mut st) != 0 || st.st_mode & libc::S_IFMT != libc::S_IFREG {
+                return None;
+            }
+            libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
+            std::fs::File::from_raw_fd(fd)
+        };
+        let path = state_dir().join(format!("{session}.restart"));
+        // SAFETY: getuid cannot fail.
+        let ours = file.metadata().is_ok_and(|meta| meta.uid() == unsafe { libc::getuid() });
+        // Until this server has the session, the file stays whatever becomes of this server.
+        (ours && is_file_at(&file, &path)).then_some(Restarting { lock: LockFile { file, path, stays: true } })
+    }
+
+    /// The session is held again: what kept it for its restart goes, file and all.
+    pub fn end(mut self) {
+        self.lock.stays = false;
     }
 }
 

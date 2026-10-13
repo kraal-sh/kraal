@@ -29,6 +29,12 @@ const WORD_LIMIT: Duration = Duration::from_secs(2);
 /// answers here, is not started: its files would be written twice. The error says who has it,
 /// where its holder says so.
 pub fn ensure_server(session: &str) -> Result<PathBuf> {
+    start(session, None)
+}
+
+/// [`ensure_server`]. For a restart, each server started inherits `kept`, the descriptor of
+/// what keeps the session from `kraal forget` until one of them has it.
+fn start(session: &str, kept: Option<std::os::fd::RawFd>) -> Result<PathBuf> {
     paths::private_runtime_dir().context("checking the runtime directory")?;
     let socket = paths::socket_path(session);
     let listens = || paths::connect_now(&socket).is_ok();
@@ -46,7 +52,7 @@ pub fn ensure_server(session: &str) -> Result<PathBuf> {
     let mut held = false;
     loop {
         let logged = std::fs::metadata(&log).map_or(0, |m| m.len());
-        let (mut child, ready) = start_server(session, &log)?;
+        let (mut child, ready) = start_server(session, &log, kept)?;
         let heard_by = deadline.max(Instant::now() + WORD_LIMIT);
         if wait_ready(&ready, heard_by.saturating_duration_since(Instant::now())) {
             return Ok(socket);
@@ -171,8 +177,12 @@ fn last_logged(log: &Path, from: u64) -> Option<String> {
 }
 
 /// Start a server for `session` in the background, its output in `log`: the process, and the
-/// pipe it says on that it listens.
-fn start_server(session: &str, log: &Path) -> Result<(std::process::Child, std::io::PipeReader)> {
+/// pipe it says on that it listens. It inherits `kept`, when a restart starts it.
+fn start_server(
+    session: &str,
+    log: &Path,
+    kept: Option<std::os::fd::RawFd>,
+) -> Result<(std::process::Child, std::io::PipeReader)> {
     let exe = std::env::current_exe().context("locating the kraal binary")?;
     // The state directory holds what the server logs and saves: only ours.
     if let Some(dir) = log.parent() {
@@ -190,18 +200,25 @@ fn start_server(session: &str, log: &Path) -> Result<(std::process::Child, std::
         .stdout(out.try_clone()?)
         .stderr(out)
         .current_dir(dirs::home_dir().unwrap_or_else(|| "/".into()));
+    if let Some(kept) = kept {
+        cmd.env(paths::RESTART_FD_VAR, kept.to_string());
+    }
     // What this kraal was started with is not the server's to keep: a pipe that whoever started
     // it reads to its end (a script, a build tool, a test) would not end before the session
-    // does. Every descriptor open now, but the standard ones and the pipe the server is given,
-    // is closed in the server-to-be before it runs. The one the listing was made through is
-    // closed already, and left out: another could have its number by then.
+    // does. Every descriptor open now, but the standard ones, the pipe the server is given and
+    // what keeps the session while it is restarted, is closed in the server-to-be before it
+    // runs. The one the listing was made through is closed already, and left out: another
+    // could have its number by then.
     let left_out: Vec<libc::c_int> = crate::pane::open_descriptors()
         .into_iter()
         // SAFETY: fcntl only looks at the descriptor, and fails on one that is not open.
-        .filter(|fd| *fd > 2 && *fd != ready_fd && unsafe { libc::fcntl(*fd, libc::F_GETFD) } != -1)
+        .filter(|fd| {
+            *fd > 2 && *fd != ready_fd && Some(*fd) != kept && unsafe { libc::fcntl(*fd, libc::F_GETFD) } != -1
+        })
         .collect();
-    // Detach from the terminal so closing it does not take the server down, and keep the end
-    // of the pipe the server writes to open across exec (in the child only).
+    // Detach from the terminal so closing it does not take the server down, and keep what the
+    // server is given open across exec (in the child only): the end of the pipe it writes to,
+    // and what keeps the session while it is restarted.
     unsafe {
         use std::os::unix::process::CommandExt;
         cmd.pre_exec(move || {
@@ -209,8 +226,10 @@ fn start_server(session: &str, log: &Path) -> Result<(std::process::Child, std::
             for fd in &left_out {
                 libc::close(*fd);
             }
-            if libc::fcntl(ready_fd, libc::F_SETFD, 0) != 0 {
-                return Err(std::io::Error::last_os_error());
+            for fd in [Some(ready_fd), kept].into_iter().flatten() {
+                if libc::fcntl(fd, libc::F_SETFD, 0) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
             }
             Ok(())
         });
@@ -394,10 +413,16 @@ pub fn kill_server(socket: &Path) -> Result<Saved> {
 /// that cannot save it first refuses, and keeps running.
 pub fn restart_server(session: &str) -> Result<Saved> {
     // Until the next server has the session: `kraal forget` does nothing in between.
-    let _kept = keep_from_restart(session)?;
+    let kept = keep_from_restart(session)?;
     let saved = stop_server(&paths::socket_path(session), true)?;
-    ensure_server(session)?;
-    Ok(saved)
+    match start(session, Some(kept.descriptor())) {
+        // A server listens: it has the session.
+        Ok(_) => Ok(saved),
+        Err(e) => {
+            kept.leave_to_the_server();
+            Err(e)
+        }
+    }
 }
 
 /// Keep `session` from being restarted by another kraal, for a restart of one's own or for

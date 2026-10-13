@@ -1748,25 +1748,100 @@ fn a_session_is_not_forgotten_while_it_restarts() {
     drop(kept);
     env.run(&["open", "w"]);
     // Restarted again and again while `forget` keeps coming: it comes back whole each time.
+    /// Says so when it goes, however this test ends: `forget` then stops coming.
+    struct Done<'a>(&'a std::sync::atomic::AtomicBool);
+    impl Drop for Done<'_> {
+        fn drop(&mut self) {
+            self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
     let done = std::sync::atomic::AtomicBool::new(false);
     std::thread::scope(|scope| {
         scope.spawn(|| {
             while !done.load(std::sync::atomic::Ordering::SeqCst) {
-                let forget = env.try_run(&["forget"]);
+                let forget = bounded(&env, false, &["forget"]);
                 assert!(!forget.status.success(), "a running session was forgotten");
             }
         });
+        let _done = Done(&done);
         for round in 0..8 {
             let restarted = bounded(&env, false, &["restart", "--yes"]);
-            let panes = String::from_utf8_lossy(&env.try_run(&["panes"]).stdout).into_owned();
+            let panes = String::from_utf8_lossy(&bounded(&env, false, &["panes"]).stdout).into_owned();
             let whole = restarted.status.success() && panes.contains("one") && panes.contains("kept");
-            // Whatever is found, `forget` stops coming before this test ends.
-            done.store(round == 7 || !whole, std::sync::atomic::Ordering::SeqCst);
             assert!(whole, "round {round}: {}\n{panes}", String::from_utf8_lossy(&restarted.stderr));
         }
     });
     assert!(lock_file(&env, "state").exists(), "its server holds it");
     assert!(!env.root.join("state/kraal/restartgap.restart").exists(), "what kept it for its restart was left");
+}
+
+/// A restart keeps the session from `kraal forget` until the server it started has it, whatever
+/// becomes of the kraal that restarts: killed, or done waiting, while that server is still on
+/// its way. That server alone has what kept it: once it has the session, nothing else does.
+#[test]
+fn a_restart_keeps_the_session_until_its_server_has_it() {
+    use std::process::Stdio;
+    let env = Env::new("restartkept");
+    env.workspace("w", "layout {\n    pane name=\"one\"\n}\n");
+    env.run(&["open", "w"]);
+    env.run(&["run", "--name", "kept", "--", "sh"]);
+    wait_until(PATIENCE, "the layout was never saved", || env.state_file().exists());
+    // While this file is there, a server started for the session waits before it takes it.
+    let hold = env.root.join("hold");
+    /// Lets that server go and stops it when the test ends, however it ends: one still held
+    /// back would start once the test's directory, and this file with it, is gone.
+    struct LetGo<'a>(&'a Env, PathBuf);
+    impl Drop for LetGo<'_> {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.1);
+            let start = Instant::now();
+            while self.0.server_pid().is_some() && start.elapsed() < Duration::from_secs(10) {
+                let _ = self.0.try_run(&["kill"]);
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
+    }
+    let _let_go = LetGo(&env, hold.clone());
+    let reservation = env.root.join("state/kraal/restartkept.restart");
+    for killed in [true, false] {
+        std::fs::write(&hold, "").unwrap();
+        let old = env.server_pid().expect("the server runs");
+        let mut restart = env
+            .cmd(&["restart", "--yes"])
+            .env("KRAAL_TEST_HOLD_SERVER", &hold)
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        // SAFETY: signal 0 only asks whether the server this test started is still there.
+        wait_until(PATIENCE, "the next server was never started", || unsafe {
+            libc::kill(old, 0) != 0 && env.server_pid().is_some()
+        });
+        if killed {
+            restart.kill().unwrap();
+            restart.wait().unwrap();
+        } else {
+            let out = finish(restart, PATIENCE);
+            let said = String::from_utf8_lossy(&out.stderr);
+            assert!(!out.status.success() && said.contains("did not start in time"), "{said}");
+        }
+        // The server on its way has no session yet, and still keeps it.
+        let forget = bounded(&env, false, &["forget"]);
+        let said = String::from_utf8_lossy(&forget.stderr);
+        assert!(!forget.status.success() && said.contains("another kraal is restarting session"), "{killed}: {said}");
+        assert!(env.state_file().exists() && reservation.exists(), "killed: {killed}");
+        // Let go, it takes the session and restores it.
+        std::fs::remove_file(&hold).unwrap();
+        wait_until(PATIENCE, "the session never came back", || {
+            String::from_utf8_lossy(&bounded(&env, false, &["panes"]).stdout).contains("kept")
+        });
+        assert!(!reservation.exists(), "what kept it for its restart was left");
+        // What kept it is nobody's any more, a pane's least of all: `forget` gets as far as the
+        // session, which its server has.
+        let forget = bounded(&env, false, &["forget"]);
+        let said = String::from_utf8_lossy(&forget.stderr);
+        assert!(!forget.status.success() && said.contains("is running"), "killed: {killed}: {said}");
+    }
 }
 
 /// A start that finds the session held by a kraal that does not listen yet (the one that won
