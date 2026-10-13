@@ -6545,7 +6545,8 @@ impl RawClient {
             });
             let left_to_read = below(&screen);
             let top = screen.iter().position(|r| r.contains(" Confirm ") || r.contains(" Careful ")).unwrap();
-            let buttons = screen.iter().position(|r| r.contains(" Cancel ")).unwrap();
+            // The message may itself say "Cancel and save...": the button row comes last.
+            let buttons = screen.iter().rposition(|r| r.contains(" Cancel ")).unwrap();
             // The Cancel button is two columns inside the box, after the margin.
             let left = screen[buttons].split("Cancel").next().unwrap().chars().count() - 3;
             let border = screen[buttons].chars().nth(left).unwrap();
@@ -9974,6 +9975,121 @@ fn a_signal_that_meets_a_normal_exit_gives_the_terminal_back_once() {
     }
 }
 
+#[test]
+fn closing_a_workspace_lists_its_programs_and_background_jobs_from_both_entries() {
+    let env = Env::new("wsclosejobs");
+    env.workspace("api", "layout {\n    pane name=\"shell\"\n}\n");
+    env.workspace("other", "layout {\n    pane name=\"unrelated\" command=\"sleep\" { args \"4259\"; }\n}\n");
+    env.run(&["open", "api"]);
+    env.run(&["open", "other"]);
+    let job_pid = env.root.join("job.pid");
+    env.run(&["send", "-p", "shell", "--enter", &format!("sleep 4257 & echo $! > '{}'", job_pid.display())]);
+    wait_until(Duration::from_secs(10), "the background job never started", || {
+        let pid = std::fs::read_to_string(&job_pid).unwrap_or_default();
+        !pid.trim().is_empty()
+            && Command::new("ps")
+                .args(["-p", pid.trim(), "-o", "comm="])
+                .output()
+                .is_ok_and(|out| out.status.success() && String::from_utf8_lossy(&out.stdout).trim().ends_with("sleep"))
+    });
+    env.run(&["run", "--name", "foreground", "--target", "shell", "--", "sh", "-c", "echo ready; exec sleep 4258"]);
+    env.wait_for_text("foreground", "ready");
+    let before = env.run(&["panes"]);
+    for size in [(80, 24), (124, 36)] {
+        for picker in [false, true] {
+            let mut client = RawClient::attach_sized(&env, Some(if picker { "other" } else { "api" }), size).traced();
+            client.wait_for_message("\"attached\"");
+            if picker {
+                client.send(b"\x02w");
+                client.wait_for_row("Workspaces · type a new name");
+                client.send(b"api");
+                client.wait_for_row("⏎ open · tab more actions · esc close");
+                client.send(b"\x18");
+            } else {
+                client.send(b"\x02Wx");
+            }
+            client.wait_for_row("Close workspace \"api\"");
+            let question = client.read_question(b"\x1b[6~").join("\n");
+            for text in [
+                "The current layout will be removed from the session.",
+                "The workspace file is kept unchanged:",
+                "Reopening uses that file's layout.",
+                "Cancel and save the layout first to keep it.",
+                "sleep 4257 (in the background)",
+                "sleep 4258",
+                "Unsaved work in these programs may be lost.",
+            ] {
+                assert!(question.contains(text), "{size:?}, picker={picker}: {question}");
+            }
+            assert!(!question.contains("4259"), "{question}");
+            assert!(!question.contains("The session will stop."), "{question}");
+            client.wait_for_row("Stop and close");
+            client.send(b"\r");
+            client
+                .wait_for_rows("Cancel closed the question", |rows| !rows.iter().any(|r| r.contains("Stop and close")));
+            assert_eq!(env.run(&["panes"]), before);
+        }
+    }
+    let mut client = RawClient::attach(&env, "api").traced();
+    let other_client = RawClient::attach(&env, "api");
+    other_client.wait_for_message("\"attached\"");
+    client.wait_for_message("\"attached\"");
+    client.send(b"\x02Wx");
+    client.wait_for_row("Stop and close");
+    client.send(b"y");
+    client.wait_for_rows("the workspace closed", |rows| !rows.iter().any(|r| r.contains("Stop and close")));
+    other_client.wait_for_row("unrelated");
+    let panes = env.run(&["panes"]);
+    assert!(!panes.contains("shell") && !panes.contains("foreground") && panes.contains("unrelated"), "{panes}");
+    assert!(listed_workspaces(&env).contains(&"api: api.kdl".to_string()));
+    assert_eq!(
+        std::fs::read_to_string(env.root.join("config/kraal/workspaces/api.kdl")).unwrap(),
+        "layout {\n    pane name=\"shell\"\n}\n"
+    );
+    env.run(&["open", "api"]);
+    let panes = env.run(&["panes"]);
+    assert!(panes.contains("shell") && !panes.contains("foreground"), "{panes}");
+}
+
+#[test]
+fn closing_a_workspace_without_a_file_warns_even_at_the_prompt_and_stops_the_last_session() {
+    let env = Env::new("wscloselast");
+    env.workspace("w", "layout {\n    pane name=\"shell\"\n}\n");
+    env.run(&["open", "w"]);
+    let mut client = RawClient::attach(&env, "w").traced();
+    client.wait_for_message("\"attached\"");
+    client.send(b"\x02Wn");
+    client.wait_for_row("New workspace");
+    client.send(b"scratch\r");
+    client.wait_for_rows("the workspace was created", |rows| !rows.iter().any(|r| r.contains("New workspace")));
+    client.wait_for_row("$ ");
+    for size in [(80, 24), (124, 36)] {
+        client.resize(size);
+        client.send(b"\x02Wx");
+        client.wait_for_row("Close workspace \"scratch\"");
+        let question = client.read_question(b"\x1b[6~").join(" ");
+        assert!(question.contains("This workspace has no linked file. It will disappear from the list."), "{question}");
+        assert!(question.contains("Cancel and save the layout first to keep it."), "{question}");
+        assert!(!question.contains("These programs stop:"), "{question}");
+        client.send(b"\r");
+        client.wait_for_rows("Cancel kept scratch open", |rows| !rows.iter().any(|r| r.contains("Stop and close")));
+        assert!(listed_workspaces(&env).contains(&"scratch:  (open)".to_string()));
+    }
+    client.send(b"\x02Wx");
+    client.wait_for_row("Stop and close");
+    client.send(b"y");
+    client.wait_for_rows("scratch closed", |rows| !rows.iter().any(|r| r.contains("Stop and close")));
+    assert!(!listed_workspaces(&env).iter().any(|w| w.starts_with("scratch:")));
+    client.send(b"\x02Wx");
+    client.wait_for_row("Close workspace \"w\"");
+    let question = client.read_question(b"\x1b[6~").join("\n");
+    assert!(question.contains("This is the last workspace. The session will stop."), "{question}");
+    client.send(b"\t\r");
+    client.wait_for_message("the last pane closed, so kraal stopped");
+    wait_until(Duration::from_secs(10), "the session did not stop", || env.server_pid().is_none());
+    assert!(!env.state_file().exists());
+}
+
 /// `ctrl+b q` asks first, Cancel selected, saying what stops (a short question when nothing
 /// would); a yes saves the layout and stops the session, every attached client is told how it
 /// comes back, and the next start brings the layout back.
@@ -11475,6 +11591,10 @@ while IFS= read -r line; do printf 'reply:%s\n' "$line"; done
         env.wait_for_text("agent", "READY account=codex:work");
         let mut client = RawClient::attach_sized(&env, Some("w"), size).traced();
         if size.0 == 124 {
+            // Discovery removes the unsigned standard accounts and moves the heading.
+            client.wait_for_rows("startup account discovery completed", |rows| {
+                rows.iter().any(|r| r.contains("ACCOUNTS")) && !rows.iter().any(|r| r.contains("Existing "))
+            });
             click_account_text(&mut client, "ACCOUNTS");
             client.wait_for_row("⏎ details");
             client.send(b"\x1b");

@@ -486,6 +486,56 @@ mod tests {
     }
 
     #[test]
+    fn close_keeps_cancel_first_and_readable_while_the_program_list_scrolls() {
+        use crate::pane::PaneSpec;
+        use crate::protocol::Placement;
+        use crate::server::overlays::{confirm_layout, draw_confirm};
+        use ratatui::buffer::Buffer;
+
+        let (tx, _rx) = crate::server::queue::channel(32);
+        let mut server = crate::server::tests::server(tx);
+        let (client, _peer) = crate::server::tests::client(&mut server);
+        let ws = server.clients[&client].workspace;
+        let _batch = crate::pane::batch();
+        for i in 0..30 {
+            let placement = if i == 0 { Placement::Auto } else { Placement::Tab };
+            server.spawn_pane_in(ws, None, PaneSpec::default(), placement, None).unwrap();
+        }
+        for (cols, rows) in [(80, 24), (124, 36)] {
+            let c = server.clients.get_mut(&client).unwrap();
+            c.cols = cols;
+            c.rows = rows;
+            for cancel in [KeyCode::Enter, KeyCode::Esc, KeyCode::Char('n')] {
+                let Mode::Confirm(q) = server.ask_close_workspace(ws) else { panic!("confirmation") };
+                let layout = confirm_layout(&q, server.client_screen(client));
+                assert!(layout.max_scroll > 0);
+                let cancel_button = layout.cancel.unwrap();
+                let close_button = layout.ok.unwrap();
+                assert!(cancel_button.x < close_button.x);
+                let mut buf = Buffer::empty(server.client_screen(client));
+                draw_confirm(&q, server.client_screen(client), &mut buf);
+                assert_ne!(buf[(cancel_button.x, cancel_button.y)].bg, buf[(close_button.x, close_button.y)].bg);
+                assert!(!q.yes);
+                assert_eq!(q.action.verb(), "Stop and close");
+                let Mode::Confirm(q) = server.on_confirm(client, q, key(KeyCode::PageDown)) else { panic!("scroll") };
+                assert!(q.scroll > 0);
+                assert!(!q.yes);
+                assert!(matches!(server.on_confirm(client, q, key(cancel)), Mode::Normal));
+                assert_eq!(server.panes.len(), 30);
+                assert_eq!(server.workspaces.len(), 1);
+                assert!(!server.quitting);
+            }
+        }
+        let Mode::Confirm(q) = server.ask_close_workspace(ws) else { panic!("confirmation") };
+        let Mode::Confirm(q) = server.on_confirm(client, q, key(KeyCode::Tab)) else { panic!("choose") };
+        assert!(q.yes);
+        assert!(matches!(server.on_confirm(client, q, key(KeyCode::Enter)), Mode::Normal));
+        assert!(server.panes.is_empty());
+        assert!(server.workspaces.is_empty());
+        assert!(server.quitting);
+    }
+
+    #[test]
     fn a_failed_workspace_creation_keeps_the_name_and_cursor_for_retry_or_cancel() {
         let (tx, _rx) = crate::server::queue::channel(32);
         let mut server = crate::server::tests::server(tx);

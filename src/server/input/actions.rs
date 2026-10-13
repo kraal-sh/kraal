@@ -360,13 +360,7 @@ impl Server {
                 return Mode::Resize;
             }
             Action::NewWorkspace => return Mode::Prompt(Prompt::new("New workspace", "", PromptAction::NewWorkspace)),
-            Action::CloseWorkspace => {
-                let name = self.workspaces[wi].name.clone();
-                return Mode::confirm(
-                    format!("Close workspace \"{name}\" and all its panes?"),
-                    ConfirmAction::CloseWorkspace(ws),
-                );
-            }
+            Action::CloseWorkspace => return self.ask_close_workspace(ws),
             Action::Restart => return self.ask_restart(),
             Action::Quit => return self.ask_quit(),
             Action::EditServers => self.edit_servers(id),

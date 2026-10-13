@@ -528,6 +528,34 @@ pub fn stops_with_server(
     stops_in_foreground(pane, program).into_iter().chain(jobs_stopping_with_server(pane, jobs)).collect()
 }
 
+pub fn stops_with_workspace(
+    pane: &crate::protocol::PaneInfo,
+    program: Option<&[String]>,
+    jobs: &[Vec<String>],
+    shell_waiting: bool,
+) -> Vec<String> {
+    // Closing removes the panes: unlike a restart, it cannot promise to resume an agent or SSH shell.
+    let foreground = if !runs_in_terminal(pane) {
+        None
+    } else if let Some(agent) = &pane.agent {
+        Some(format!("{agent}: {}", pane.state.label()))
+    } else if shell_waiting
+        && program.is_some_and(|p| {
+            let Some((shell, args)) = p.split_first() else { return false };
+            // A shell can lead the foreground group while running a script. Only known
+            // interactive/login invocations count as a prompt; keep other arguments visible.
+            crate::pane::is_shell(shell)
+                && args.iter().all(|a| matches!(a.as_str(), "-i" | "-l" | "-il" | "-li" | "--interactive" | "--login"))
+        })
+    {
+        None
+    } else {
+        let argv = program.filter(|p| !p.is_empty()).or((!pane.command.is_empty()).then_some(pane.command.as_slice()));
+        Some(argv.map(command_line).unwrap_or_else(|| "Unknown program (activity could not be checked)".into()))
+    };
+    foreground.into_iter().chain(jobs_stopping_with_server(pane, jobs)).collect()
+}
+
 /// What stopping the server stops in the background of a pane's terminal (see
 /// [`stops_with_server`]). It is all that stops in the pane of a command that asks to stop the
 /// server: what is in the foreground there is that command.
@@ -1043,17 +1071,19 @@ mod tests {
         assert_eq!(pane.spec.account_id.as_deref(), Some("default-claude"));
     }
 
-    #[test]
-    fn a_restart_stops_programs_not_shells_ssh_shells_or_idle_agents() {
-        let pane = |fields: serde_json::Value| -> crate::protocol::PaneInfo {
-            let mut info = serde_json::json!({"id": 3, "name": "build", "title": "sh", "workspace": "w", "tab": "t",
+    fn stopping_pane(fields: serde_json::Value) -> crate::protocol::PaneInfo {
+        let mut info = serde_json::json!({"id": 3, "name": "build", "title": "sh", "workspace": "w", "tab": "t",
                 "kind": "terminal", "command": [], "cwd": null, "agent": null, "state": "unknown",
                 "exit_code": null, "focused": false, "floating": false, "cols": 80, "rows": 24});
-            for (k, v) in fields.as_object().unwrap() {
-                info[k] = v.clone();
-            }
-            serde_json::from_value(info).unwrap()
-        };
+        for (k, v) in fields.as_object().unwrap() {
+            info[k] = v.clone();
+        }
+        serde_json::from_value(info).unwrap()
+    }
+
+    #[test]
+    fn a_restart_stops_programs_not_shells_ssh_shells_or_idle_agents() {
+        let pane = stopping_pane;
         let argv = |words: &[&str]| words.iter().map(|w| w.to_string()).collect::<Vec<_>>();
         let stops =
             |pane: &crate::protocol::PaneInfo, program: Option<&[String]>| stops_with_server(pane, program, &[]);
@@ -1103,6 +1133,61 @@ mod tests {
         assert_eq!(stops_with_server(&idle, Some(&argv(&["claude"])), &jobs), both);
         assert_eq!(stops_with_server(&shell, Some(&sleep), &jobs[1..]), ["sleep 1000", both[1]]);
         assert_eq!(stops_with_server(&ended, None, &jobs), none);
+    }
+
+    #[test]
+    fn closing_a_workspace_lists_agents_ssh_jobs_and_unknown_activity_without_promising_a_resume() {
+        let argv = |words: &[&str]| words.iter().map(|w| w.to_string()).collect::<Vec<_>>();
+        let shell = stopping_pane(serde_json::json!({}));
+        let sh = argv(&["/bin/sh"]);
+        let sleep = argv(&["sleep", "600"]);
+        let jobs = [argv(&["tail", "-f", "log"])];
+        assert!(stops_with_workspace(&shell, Some(&sh), &[], true).is_empty());
+        assert_eq!(stops_with_workspace(&shell, Some(&sh), &jobs, true), ["tail -f log (in the background)"]);
+        assert_eq!(
+            stops_with_workspace(&shell, Some(&sleep), &jobs, false),
+            ["sleep 600", "tail -f log (in the background)"]
+        );
+        assert_eq!(stops_with_workspace(&shell, Some(&sh), &[], false), ["/bin/sh"]);
+        for command in [
+            argv(&["sh", "-c", "sleep 600; echo done"]),
+            argv(&["sh", "-ic", "sleep 600; echo done"]),
+            argv(&["sh", "script.sh"]),
+            argv(&["sh", "-i", "script.sh"]),
+        ] {
+            assert_eq!(stops_with_workspace(&shell, Some(&command), &[], true), [command_line(&command)]);
+        }
+        for command in [argv(&["-bash"]), argv(&["sh", "-i"]), argv(&["zsh", "-il"])] {
+            assert!(stops_with_workspace(&shell, Some(&command), &[], true).is_empty());
+        }
+        for waiting in [false, true] {
+            for program in [None, Some([].as_slice())] {
+                assert_eq!(
+                    stops_with_workspace(&shell, program, &[], waiting),
+                    ["Unknown program (activity could not be checked)"]
+                );
+            }
+        }
+        for state in ["working", "idle", "unknown", "blocked", "done"] {
+            let agent = stopping_pane(serde_json::json!({"agent": "claude", "state": state}));
+            assert_eq!(
+                stops_with_workspace(&agent, None, &jobs, true),
+                [format!("claude: {state}"), "tail -f log (in the background)".into()]
+            );
+        }
+        for command in [argv(&["ssh", "web-1"]), argv(&["make", "watch"])] {
+            let pane = stopping_pane(serde_json::json!({"command": command}));
+            assert_eq!(stops_with_workspace(&pane, None, &[], true), [command_line(&command)]);
+            assert_eq!(stops_with_workspace(&pane, Some(&command), &[], false), [command_line(&command)]);
+        }
+        for fields in [
+            serde_json::json!({"exit_code": 0}),
+            serde_json::json!({"suspended": true}),
+            serde_json::json!({"kind": "preview:markdown"}),
+            serde_json::json!({"kind": "files"}),
+        ] {
+            assert!(stops_with_workspace(&stopping_pane(fields), Some(&sleep), &jobs, false).is_empty());
+        }
     }
 
     #[test]

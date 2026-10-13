@@ -175,7 +175,7 @@ impl ConfirmAction {
             ConfirmAction::RemoveAccount(_) => "Remove".into(),
             ConfirmAction::ClosePane(_) => "Close pane".into(),
             ConfirmAction::CloseTab { .. } => "Close tab".into(),
-            ConfirmAction::CloseWorkspace(_) => "Close workspace".into(),
+            ConfirmAction::CloseWorkspace(_) => "Stop and close".into(),
             ConfirmAction::Restart => "Restart".into(),
             ConfirmAction::Quit => "Quit".into(),
             ConfirmAction::Job { label, .. } | ConfirmAction::GitJob { label, .. } => {
