@@ -125,6 +125,10 @@ impl Env {
     }
 
     fn state_file(&self) -> PathBuf {
+        self.root.join("state/kraal/sessions-v2").join(format!("{}.json", self.session))
+    }
+
+    fn legacy_state_file(&self) -> PathBuf {
         self.root.join("state/kraal/sessions").join(format!("{}.json", self.session))
     }
 
@@ -1070,8 +1074,11 @@ fn layout_survives_a_server_restart() {
     assert!(panes.contains("tab 2"), "{panes}");
     env.run(&["kill"]);
     let state = std::fs::read_to_string(env.state_file()).unwrap();
-    assert!(state.contains("\"revision\": 2,"), "{state}");
-    std::fs::write(env.state_file(), state.replace("\"revision\": 2,", "")).unwrap();
+    let mut old: serde_json::Value = serde_json::from_str(&state).unwrap();
+    old["version"] = serde_json::json!(1);
+    std::fs::create_dir_all(env.legacy_state_file().parent().unwrap()).unwrap();
+    std::fs::write(env.legacy_state_file(), serde_json::to_vec(&old).unwrap()).unwrap();
+    std::fs::remove_file(env.state_file()).unwrap();
     env.run(&["open", "fleet"]);
     env.wait_for_text("a", "node-a");
     let panes = env.run(&["panes"]);
@@ -1088,10 +1095,16 @@ fn legacy_workspace_state_migrates_before_opening_and_keeps_its_own_layout() {
     env.run(&["kill"]);
     let path = env.state_file();
     let mut old: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    old["version"] = serde_json::json!(1);
     old["revision"] = serde_json::json!(1);
     old["workspaces"][0].as_object_mut().unwrap().remove("id");
     let bytes = serde_json::to_vec_pretty(&old).unwrap();
+    let path = env.legacy_state_file();
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
     std::fs::write(&path, &bytes).unwrap();
+    std::fs::remove_file(env.state_file()).unwrap();
+    let stopped = env.run(&["ls"]);
+    assert_eq!(stopped.lines().filter(|line| line.starts_with(&env.session)).count(), 1, "{stopped}");
     env.run(&["open", "w"]);
     let list = || serde_json::from_str::<serde_json::Value>(&env.run(&["workspaces", "--json"])).unwrap();
     let id = list()[0]["id"].as_str().unwrap().to_owned();
@@ -1101,7 +1114,7 @@ fn legacy_workspace_state_migrates_before_opening_and_keeps_its_own_layout() {
         std::fs::read_dir(path.parent().unwrap())
             .unwrap()
             .map(|e| e.unwrap().path())
-            .filter(|p| p.file_name().unwrap().to_string_lossy().starts_with("wsidentity.json.before-workspace-ids-"))
+            .filter(|p| p.file_name().unwrap().to_string_lossy().starts_with("wsidentity.json.before-0.4-"))
             .collect::<Vec<_>>()
     };
     assert_eq!(backups().len(), 1);
@@ -1111,25 +1124,76 @@ fn legacy_workspace_state_migrates_before_opening_and_keeps_its_own_layout() {
     assert_eq!(list()[0]["id"], id);
     assert_eq!(backups().len(), 1);
     assert_eq!(std::fs::read_to_string(env.root.join("config/kraal/workspaces/w.kdl")).unwrap(), source);
+    assert_eq!(std::fs::read(&path).unwrap(), bytes);
+    env.run(&["kill"]);
+    let stopped = env.run(&["ls"]);
+    assert_eq!(stopped.lines().filter(|line| line.starts_with(&env.session)).count(), 1, "{stopped}");
+    env.run(&["forget"]);
+    assert!(!path.exists() && !env.state_file().exists());
+    assert_eq!(std::fs::read(backups()[0].join("state.json")).unwrap(), bytes);
+    assert!(!env.run(&["ls"]).contains(&env.session));
 }
 
 #[test]
 fn a_failed_state_migration_never_starts_an_empty_session_or_replaces_the_source() {
     let env = Env::new("wsbadstate");
     env.workspace("w", "layout { pane; }\n");
-    std::fs::create_dir_all(env.state_file().parent().unwrap()).unwrap();
+    std::fs::create_dir_all(env.legacy_state_file().parent().unwrap()).unwrap();
     for bytes in ["{", r#"{"version":2,"workspaces":[]}"#, r#"{"version":1,"revision":3,"workspaces":[]}"#] {
-        std::fs::write(env.state_file(), bytes).unwrap();
+        std::fs::write(env.legacy_state_file(), bytes).unwrap();
         let out = env.try_run(&["open", "w"]);
         let said = String::from_utf8_lossy(&out.stderr);
         assert!(!out.status.success() && said.contains("the saved session is unchanged"), "{said}");
-        assert_eq!(std::fs::read_to_string(env.state_file()).unwrap(), bytes);
+        assert_eq!(std::fs::read_to_string(env.legacy_state_file()).unwrap(), bytes);
         assert!(env.server_pid().is_none());
     }
     // Repairing the original is sufficient; no hidden replacement needs to be removed first.
-    std::fs::write(env.state_file(), r#"{"version":1,"workspaces":[]}"#).unwrap();
+    std::fs::write(env.legacy_state_file(), r#"{"version":1,"workspaces":[]}"#).unwrap();
     env.run(&["open", "w"]);
     assert!(env.server_pid().is_some());
+}
+
+#[test]
+fn account_migration_refuses_unreadable_sessions_before_changing_the_account_file() {
+    use std::os::unix::fs::PermissionsExt;
+    let env = Env::new("unreadable-account-state");
+    let accounts = env.root.join("config/kraal/accounts.toml");
+    let source = "[[account]]\nname = 'work'\nagent = 'claude'\nhome = '/work'\n";
+    std::fs::write(&accounts, source).unwrap();
+    for path in [env.state_file(), env.legacy_state_file()] {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, r#"{"version":1,"workspaces":[]}"#).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let out = env.try_run(&["accounts", "rename", "claude:work", "renamed"]);
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let error = String::from_utf8_lossy(&out.stderr);
+        assert!(!out.status.success() && error.contains("accounts.toml is unchanged"), "{error}");
+        assert_eq!(std::fs::read_to_string(&accounts).unwrap(), source);
+        assert!(!accounts.with_extension("toml.kraal-bak").exists());
+        std::fs::remove_file(path).unwrap();
+    }
+}
+
+#[test]
+fn newer_state_is_refused_without_falling_back_or_overwriting_either_format() {
+    let env = Env::new("future-state");
+    env.workspace("w", "layout { pane; }\n");
+    let current = env.state_file();
+    let legacy = env.legacy_state_file();
+    let future = br#"{"version":3,"future_layout":[]}"#;
+    let original = br#"{"version":1,"workspaces":[]}"#;
+    for (path, bytes) in [(&current, future.as_slice()), (&legacy, original.as_slice())] {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, bytes).unwrap();
+    }
+    for args in [&["workspaces", "--json"][..], &["open", "w"]] {
+        let out = env.try_run(args);
+        let error = String::from_utf8_lossy(&out.stderr);
+        assert!(!out.status.success() && error.contains("use a newer kraal"), "{error}");
+        assert_eq!(std::fs::read(&current).unwrap(), future);
+        assert_eq!(std::fs::read(&legacy).unwrap(), original);
+        assert!(env.server_pid().is_none());
+    }
 }
 
 #[test]
@@ -1760,7 +1824,7 @@ fn kill_says_when_the_layout_was_not_saved() {
     let env = Env::new("unsaved");
     env.workspace("w", "layout {\n    pane name=\"one\"\n}\n");
     env.run(&["open", "w"]);
-    let sessions = env.root.join("state/kraal/sessions");
+    let sessions = env.root.join("state/kraal/sessions-v2");
     std::fs::create_dir_all(&sessions).unwrap();
     std::fs::set_permissions(&sessions, std::fs::Permissions::from_mode(0o500)).unwrap();
     let out = env.try_run(&["kill"]);
@@ -2612,7 +2676,7 @@ fn a_restart_that_cannot_save_the_session_leaves_it_running() {
     env.run(&["open", "w"]);
     wait_until(Duration::from_secs(10), "the layout was never saved", || env.state_file().exists());
     let pid = env.server_pid().expect("the server runs");
-    let sessions = env.root.join("state/kraal/sessions");
+    let sessions = env.root.join("state/kraal/sessions-v2");
     std::fs::set_permissions(&sessions, std::fs::Permissions::from_mode(0o500)).unwrap();
     // A pane opened since the last save: the layout on disk is not the session's any more.
     env.run(&["run", "--name", "two", "--target", "one", "--", "sh"]);
@@ -3080,7 +3144,7 @@ fn scrollback_survives_a_server_restart() {
     env.wait_for_text("shell", "red-42 日本");
     env.run(&["kill"]);
     // Saved with its colours, for the user's eyes only.
-    let dir = env.root.join("state/kraal/scrollback/scrollback");
+    let dir = env.root.join("state/kraal/scrollback-v2/scrollback");
     let files: Vec<PathBuf> = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().path()).collect();
     assert_eq!(files.len(), 1, "{files:?}");
     let saved = std::fs::read_to_string(&files[0]).unwrap();
@@ -3132,7 +3196,7 @@ fn scrollback_that_could_not_be_written_is_saved_later() {
     let env = Env::new("scrollfail");
     env.workspace("w", "layout {\n    pane name=\"shell\"\n}\n");
     // A file where the session's scrollback directory goes: nothing can be written there.
-    let dir = env.root.join("state/kraal/scrollback/scrollfail");
+    let dir = env.root.join("state/kraal/scrollback-v2/scrollfail");
     std::fs::create_dir_all(dir.parent().unwrap()).unwrap();
     std::fs::write(&dir, "in the way").unwrap();
     env.run(&["open", "w"]);
@@ -3166,7 +3230,7 @@ fn scrollback_survives_a_crash() {
     env.run(&["send", "-p", "shell", "--enter", "echo before-$((3*3))"]);
     env.wait_for_text("shell", "before-9");
     // Written while the pane prints, then named by the state.
-    let dir = env.root.join("state/kraal/scrollback/crash");
+    let dir = env.root.join("state/kraal/scrollback-v2/crash");
     let saved = || {
         let files = std::fs::read_dir(&dir).into_iter().flatten().flatten();
         files.filter(|e| std::fs::read_to_string(e.path()).unwrap_or_default().contains("before-9")).count() == 1
@@ -9001,7 +9065,7 @@ fn reused_account_names_leave_running_and_saved_references_on_the_original_accou
     env.run(&["kill"]);
 
     // A session of an older release carries the label and launch environment, but no identity.
-    let saved = env.root.join(format!("state/kraal/sessions/{}.json", env.session));
+    let saved = env.root.join(format!("state/kraal/sessions-v2/{}.json", env.session));
     let mut state: serde_json::Value = serde_json::from_slice(&std::fs::read(&saved).unwrap()).unwrap();
     fn old_specs(value: &mut serde_json::Value) {
         match value {
@@ -9019,8 +9083,15 @@ fn reused_account_names_leave_running_and_saved_references_on_the_original_accou
         }
     }
     old_specs(&mut state);
-    std::fs::write(&saved, serde_json::to_vec(&state).unwrap()).unwrap();
+    state["version"] = serde_json::json!(1);
+    state["revision"] = serde_json::json!(1);
+    let legacy = env.legacy_state_file();
+    let source = serde_json::to_vec(&state).unwrap();
+    std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+    std::fs::write(&legacy, &source).unwrap();
+    std::fs::remove_file(&saved).unwrap();
     env.run(&["accounts", "rm", "claude:work"]);
+    assert_eq!(std::fs::read(&legacy).unwrap(), source);
     let migrated = std::fs::read_to_string(&saved).unwrap();
     assert!(migrated.contains(id), "closed legacy sessions are bound before removal");
     let replacement = env.root.join("replacement").display().to_string();
@@ -10159,7 +10230,7 @@ fn a_quit_that_cannot_save_the_session_leaves_it_running() {
     env.run(&["open", "w"]);
     wait_until(Duration::from_secs(10), "the layout was never saved", || env.state_file().exists());
     let pid = env.server_pid().expect("the server runs");
-    let sessions = env.root.join("state/kraal/sessions");
+    let sessions = env.root.join("state/kraal/sessions-v2");
     std::fs::set_permissions(&sessions, std::fs::Permissions::from_mode(0o500)).unwrap();
     // A pane opened since the last save: the layout on disk is not the session's any more.
     env.run(&["run", "--name", "two", "--target", "one", "--", "sh"]);
@@ -10254,7 +10325,7 @@ fn close_preparation_failure_keeps_the_programs_and_offers_retry() {
     env.run(&["send", "-p", "only", "--enter", "echo waiting"]);
     env.wait_for_text("only", "waiting");
     wait_until(PATIENCE, "no saved state", || env.state_file().exists());
-    let sessions = env.root.join("state/kraal/sessions");
+    let sessions = env.root.join("state/kraal/sessions-v2");
     std::fs::set_permissions(&sessions, std::fs::Permissions::from_mode(0o500)).unwrap();
     let mut client = RawClient::attach(&env, "w");
     client.wait_for_message("\"attached\"");
@@ -11192,7 +11263,7 @@ fn copies_of_the_paste_buffers_a_killed_server_was_writing_go() {
     let mut gone = Command::new("true").spawn().unwrap();
     let dead = gone.id();
     gone.wait().unwrap();
-    let (buffers, sessions) = (env.root.join("state/kraal/buffers"), env.root.join("state/kraal/sessions"));
+    let (buffers, sessions) = (env.root.join("state/kraal/buffers"), env.root.join("state/kraal/sessions-v2"));
     let temp = |dir: &Path, session: &str| dir.join(format!(".{session}.json.{dead}.0.tmp"));
     for dir in [&buffers, &sessions] {
         std::fs::create_dir_all(dir).unwrap();

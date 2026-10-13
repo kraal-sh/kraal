@@ -618,15 +618,17 @@ fn the_links_lead_somewhere() {
     assert!(broken.is_empty(), "links to a page, a heading or a file that is not there:\n{}", broken.join("\n"));
 }
 
-/// The oldest release kraal works with is written twice: tests/compat.sh tests it, and
-/// docs/compatibility.md promises it.
+/// The released migration sources and protocol peers are fixed, even after a newer release.
 #[test]
-fn the_oldest_release_promised_is_the_one_tested() {
+fn the_releases_promised_are_the_ones_tested() {
     let read = |name: &str| std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join(name)).unwrap();
     let script = read("tests/compat.sh");
-    let oldest = script.lines().find_map(|line| line.strip_prefix("OLDEST=v")).expect("OLDEST in tests/compat.sh");
-    let promised = format!("from **{oldest}** on");
-    assert!(read("docs/compatibility.md").contains(&promised), "docs/compatibility.md does not say {promised:?}");
+    let releases = script.lines().find_map(|line| line.strip_prefix("RELEASES=")).unwrap().trim_matches('"');
+    assert_eq!(releases, "v0.2.0 v0.3.0");
+    let docs = read("docs/compatibility.md");
+    for release in releases.split_whitespace() {
+        assert!(docs.contains(&format!("**{}**", release.trim_start_matches('v'))));
+    }
 }
 
 // ---- events ------------------------------------------------------------------------------

@@ -8,7 +8,7 @@
 //! # Compatibility
 //!
 //! A kraal works with sessions started by another release, older or newer, from the oldest
-//! supported release on (0.2.0, `OLDEST` in tests/compat.sh, which tests it): an update never
+//! supported release on (0.2.0, `RELEASES` in tests/compat.sh, which tests it): an update never
 //! forces a restart (docs/compatibility.md). The protocol changes only in these ways:
 //!
 //! - A new field is optional: it has `#[serde(default)]`, so that a message from a peer that
@@ -66,8 +66,10 @@ pub const EDIT_SUDO: Feature = Feature { name: "edit_sudo", does: "edit a server
 
 pub const ACCOUNT_IDS: Feature =
     Feature { name: "account_ids", does: "select an account by its identity", check_first: true };
+pub const STATE_V2: Feature =
+    Feature { name: "state_v2", does: "save sessions in the version 2 format", check_first: false };
 /// What this kraal's server lists.
-pub const FEATURES: [Feature; 4] = [LIST_AGENTS, BUFFERS, EDIT_SUDO, ACCOUNT_IDS];
+pub const FEATURES: [Feature; 5] = [LIST_AGENTS, BUFFERS, EDIT_SUDO, ACCOUNT_IDS, STATE_V2];
 
 /// The names of this kraal's server features, as it lists them.
 pub fn feature_names() -> Vec<String> {

@@ -502,24 +502,25 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn closed_and_empty_workspaces_stay_in_the_array_read_by_released_versions() {
+    fn closed_and_empty_workspaces_have_no_compatibility_shell() {
         let (tx, _rx) = crate::server::event_channel(4096);
         let mut server = crate::server::tests::server(tx.clone());
         server.new_workspace("empty".into(), None);
-        let mut snap = persist::snapshot(&server);
-        snap.workspaces[0].closed = true;
-        let mut value = serde_json::to_value(snap).unwrap();
-        // Both released readers ignore additive metadata and restore the ordinary tabs.
-        let ws = value["workspaces"][0].as_object_mut().unwrap();
-        for field in ["id", "closed", "empty", "close_pending"] {
-            ws.remove(field);
+        for closed in [false, true] {
+            let mut snap = persist::snapshot(&server);
+            snap.workspaces[0].closed = closed;
+            let value = serde_json::to_value(&snap).unwrap();
+            assert_eq!(value["version"], 2);
+            assert!(value.get("revision").is_none());
+            assert_eq!(value["workspaces"][0]["tabs"], serde_json::json!([]));
+            let mut restored = crate::server::tests::server(tx.clone());
+            persist::apply(&mut restored, snap).unwrap();
+            assert_eq!(restored.workspaces.len(), 1);
+            assert_eq!(restored.workspaces[0].name, "empty");
+            assert_eq!(restored.workspaces[0].closed(), closed);
+            assert!(restored.panes.is_empty());
+            assert!(restored.unrestored.is_empty());
         }
-        let mut older = crate::server::tests::server(tx);
-        persist::apply(&mut older, serde_json::from_value(value).unwrap()).unwrap();
-        assert_eq!(older.workspaces.len(), 1);
-        assert_eq!(older.workspaces[0].name, "empty");
-        assert_eq!(older.workspaces[0].panes().len(), 1);
-        assert!(older.unrestored.is_empty());
     }
 
     #[test]
@@ -612,7 +613,7 @@ pub(super) mod tests {
         let saved = persist::snapshot(&server);
         assert!(saved.workspaces[0].empty);
         assert_eq!(saved.workspaces[0].counts(), (0, 0));
-        assert_eq!(saved.workspaces[0].tabs.len(), 1, "older readers get a shell fallback");
+        assert!(saved.workspaces[0].tabs.is_empty(), "empty workspaces have no fallback panes");
         let mut restored = super::super::tests::server(tx);
         restored.apply_snapshot(saved).unwrap();
         assert!(restored.unrestored.is_empty());
@@ -798,7 +799,7 @@ pub(super) mod tests {
     fn a_failed_workspace_keeps_its_identity_source_layout_and_reason_until_restored() {
         let (tx, _rx) = crate::server::event_channel(4096);
         let mut server = super::super::tests::server(tx.clone());
-        let value = serde_json::json!({ "version": 1, "revision": 2, "workspaces": [{
+        let value = serde_json::json!({ "version": 2, "workspaces": [{
             "id": "stable", "name": "kept", "definition": "/missing/source.kdl",
             "definition_source": "// source kept verbatim", "cwd": null, "active": 0, "tabs": []
         }] });

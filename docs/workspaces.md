@@ -144,7 +144,7 @@ could not be.
 Account login panes are excluded: neither the pane nor its scrollback is saved or restored.
 Their account entries stay, marked **sign-in required** until sign-in is verified.
 
-This text is written to disk, readable by you alone, in `~/.local/state/kraal/scrollback/<session>/`,
+This text is written to disk, readable by you alone, in `~/.local/state/kraal/scrollback-v2/<session>/`,
 and it can hold secrets (a token printed by a command, a password echoed by mistake):
 `save_scrollback = false` in the config stops saving it and deletes what was saved (kraal deletes
 only the files it wrote there, and nothing through a link put in place of that directory).
@@ -158,24 +158,32 @@ A saved workspace has an identity independent of its name, position and source p
 Restarting keeps that identity. The pane and tab numbers used within a running server remain
 local to that server.
 
-On the first start with an older saved session, kraal assigns missing workspace identities and
-writes snapshot revision 2 atomically, before restoring any programs. It keeps the saved layout,
+On the first start with a session saved by 0.2.0 or 0.3.0, kraal 0.4 assigns missing workspace
+identities and writes format 2 atomically to `sessions-v2/<session>.json`, before restoring any
+programs. Its scrollback goes in `scrollback-v2/<session>/`. It keeps the saved layout,
 source paths, recorded source contents, account identities and initial order. It does not match
 sources by name or rewrite KDL files, their backups, or accounts. Existing name collisions stay;
 a command that cannot choose one workspace by name asks you to select and rename a workspace.
 
 Before conversion, kraal creates a private directory beside the session file:
-`~/.local/state/kraal/sessions/<session>.json.before-workspace-ids-<unique-id>/`.
+`~/.local/state/kraal/sessions/<session>.json.before-0.4-<unique-id>/`.
 It contains the exact old `state.json` and copies of the available referenced files under
 `scrollback/`. A backup without `state.json` was interrupted and is incomplete. Completed
 backups are never overwritten, pruned with live scrollback, or removed by `kraal forget`.
 They can contain the same secrets as the saved session. Remove them manually when no longer
 needed.
 
-To roll back, stop the session first. Keep a copy of its current state if you want to return to
-it, copy the backup's `state.json` over `sessions/<session>.json`, and copy the backup's
-`scrollback/` files into `scrollback/<session>/` under the same kraal state directory. Then start
-the older kraal. The backup contains only what existed at migration time, not later changes.
+To go back to 0.2.0 or 0.3.0, stop the session and start the older kraal. The original
+`sessions/<session>.json` and `scrollback/<session>/` are left in place at upgrade. The older
+binary finds that session, or no saved session if there was none before. It never reads or
+changes `sessions-v2/` or `scrollback-v2/`. Returning to 0.4 uses those newer files, ignoring
+changes made by the older kraal. The retained copy contains only what existed at migration time.
+If the old files have since changed, the backup's `state.json` and `scrollback/` can restore them
+while the session is stopped.
+
+`kraal forget` in 0.4 removes both the current and legacy session files and scrollback, so the
+legacy session does not return on the next start. Migration backups stay. From 0.5.0, an
+unconverted state older than 0.4 is left untouched and refused: run kraal 0.4 once first.
 
 If reading, validating or backing up the state fails, kraal leaves the original in place and
 refuses to start the session. Fix the reported cause and retry. Unsupported versions or revisions

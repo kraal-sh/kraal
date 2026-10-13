@@ -188,7 +188,7 @@ pub fn remove_abandoned_temps(path: &Path) -> std::io::Result<()> {
 pub fn written_dirs() -> Vec<PathBuf> {
     let state = state_dir();
     vec![
-        state.join("sessions"),
+        state.join("sessions-v2"),
         state.join("buffers"),
         state.join("runs"),
         state.join("usage"),
@@ -1145,10 +1145,9 @@ pub fn session_of_socket(stem: &str) -> Option<String> {
         return Some(stem.to_string());
     }
     let dir = runtime_dir();
-    let saved = std::fs::read_dir(state_dir().join("sessions")).ok()?;
-    saved
-        .flatten()
-        .filter_map(|e| Some(e.path().file_stem()?.to_string_lossy().into_owned()))
+    saved_sessions()
+        .ok()?
+        .into_iter()
         .find(|name| socket_path_in(&dir, name).file_stem().is_some_and(|s| s.to_string_lossy() == stem))
 }
 
@@ -1194,12 +1193,41 @@ pub fn data_home() -> PathBuf {
 
 /// The saved state of `session` (layout, panes, what each runs), which a restart restores.
 pub fn session_state_path(session: &str) -> PathBuf {
+    state_dir().join("sessions-v2").join(format!("{session}.json"))
+}
+
+// Keep recognizing old files after their migration is removed, so startup can refuse them.
+pub fn legacy_session_state_path(session: &str) -> PathBuf {
     state_dir().join("sessions").join(format!("{session}.json"))
+}
+
+pub fn saved_sessions() -> std::io::Result<std::collections::BTreeSet<String>> {
+    saved_sessions_in(&state_dir())
+}
+
+fn saved_sessions_in(state: &Path) -> std::io::Result<std::collections::BTreeSet<String>> {
+    let mut names = std::collections::BTreeSet::new();
+    for dir in ["sessions-v2", "sessions"] {
+        let entries = match std::fs::read_dir(state.join(dir)) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(e),
+        };
+        for entry in entries {
+            let path = entry?.path();
+            if path.extension().is_some_and(|e| e == "json")
+                && let Some(name) = path.file_stem().and_then(|s| s.to_str()).filter(|s| valid_session_name(s))
+            {
+                names.insert(name.to_string());
+            }
+        }
+    }
+    Ok(names)
 }
 
 /// Where the panes' saved scrollback of `session` goes, one file per pane.
 pub fn scrollback_dir(session: &str) -> PathBuf {
-    state_dir().join("scrollback").join(session)
+    state_dir().join("scrollback-v2").join(session)
 }
 
 /// Where the paste buffers of `session` are kept across restarts, when they are (`[buffers]
@@ -1296,6 +1324,40 @@ pub fn valid_session_name(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_session_directory_that_cannot_be_read_is_not_treated_as_empty() {
+        let root = std::env::temp_dir().join(format!("kraal-saved-dirs-{}", crate::accounts::new_uuid()));
+        std::fs::create_dir(&root).unwrap();
+        assert!(saved_sessions_in(&root).unwrap().is_empty());
+        for dir in ["sessions", "sessions-v2"] {
+            let path = root.join(dir);
+            std::fs::write(&path, "in the way").unwrap();
+            assert!(saved_sessions_in(&root).is_err());
+            std::fs::remove_file(path).unwrap();
+        }
+        std::fs::remove_dir(root).unwrap();
+    }
+
+    #[test]
+    fn saved_sessions_find_both_formats_once_and_resolve_shortened_sockets() {
+        let id = crate::accounts::new_uuid();
+        let session = format!("{}{id}", "s".repeat(SESSION_NAME_MAX - id.len()));
+        let current = session_state_path(&session);
+        let legacy = legacy_session_state_path(&session);
+        for path in [&current, &legacy] {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, "{}").unwrap();
+            assert!(saved_sessions().unwrap().contains(&session));
+            let socket = socket_path_in(&runtime_dir(), &session);
+            assert_eq!(session_of_socket(socket.file_stem().unwrap().to_str().unwrap()), Some(session.clone()));
+        }
+        assert_eq!(saved_sessions().unwrap().iter().filter(|name| *name == &session).count(), 1);
+        assert_ne!(current, legacy);
+        assert_ne!(scrollback_dir(&session), state_dir().join("scrollback").join(&session));
+        std::fs::remove_file(current).unwrap();
+        std::fs::remove_file(legacy).unwrap();
+    }
 
     #[test]
     fn every_valid_session_has_a_socket_path_that_fits() {

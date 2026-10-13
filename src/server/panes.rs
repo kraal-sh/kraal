@@ -633,7 +633,7 @@ impl Server {
         let before = self.panes.keys().copied().collect();
         let workspaces = self.workspaces.iter().map(|w| w.id).collect::<Vec<_>>();
         let result = self.with_batch(|server| {
-            let result = crate::persist::restore_workspace_tabs(server, wi, &saved, 2);
+            let result = crate::persist::restore_workspace_tabs(server, wi, &saved);
             if result.is_err() {
                 server.rollback(&before, &workspaces);
                 server.workspaces[wi].tabs.clear();

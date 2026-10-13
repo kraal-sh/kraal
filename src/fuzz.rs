@@ -862,7 +862,7 @@ mod files {
         run("files_session", 100, |rng| {
             let snap = damaged(
                 rng,
-                r#"{"version":1,"revision":1,"workspaces":[{"name":"w","definition":null,"cwd":"/tmp","active":3,"tabs":[{"name":"t","root":{"Split":{"axis":"Row","children":[[{"Pane":{"name":null,"spec":{"command":["ssh","h"]},"agent":"claude","agent_session":"a b","scrollback":"1-2-3.ans"}},1.0],[{"Pane":{"name":"x","spec":{},"agent":null,"agent_session":null,"scrollback":"../x"}},-2.0]],"stacked":true,"open":7}},"floating":[],"focus":9,"show_floating":true,"zoomed":true,"sync":false}]}]}"#,
+                r#"{"version":2,"workspaces":[{"id":"w","name":"w","definition":null,"cwd":"/tmp","active":3,"tabs":[{"name":"t","root":{"Split":{"axis":"Row","children":[[{"Pane":{"name":null,"spec":{"command":["ssh","h"]},"agent":"claude","agent_session":"a b","scrollback":"1-2-3.ans"}},1.0],[{"Pane":{"name":"x","spec":{},"agent":null,"agent_session":null,"scrollback":"../x"}},-2.0]],"stacked":true,"open":7}},"floating":[],"focus":9,"show_floating":true,"zoomed":true,"sync":false}]}]}"#,
             );
             if let Ok(snap) = serde_json::from_str::<crate::persist::SessionSnapshot>(&snap) {
                 let _ = crate::persist::scrollback_files(&snap);
