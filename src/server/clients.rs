@@ -168,6 +168,18 @@ impl Server {
     }
 
     pub(super) fn attach(&mut self, id: ClientId, cols: u16, rows: u16, workspace: Option<String>) {
+        if let Some(c) = self.clients.get_mut(&id) {
+            c.cols = cols;
+            c.rows = rows;
+        }
+        // While no client is attached, the layout is for a terminal nobody has. The workspace
+        // this client opens is laid out for its own at once, each pane's emulator made for the
+        // place it keeps, and not for that layout first and for this client's after.
+        if self.primary.is_none()
+            && let Some(c) = self.clients.get(&id)
+        {
+            self.layout_area = self.main_area(c);
+        }
         let mut target = None;
         if let Some(name) = workspace {
             match self.open_workspace(&name) {
@@ -196,8 +208,6 @@ impl Server {
         self.send_msg(id, &ServerMsg::Attached { version: protocol::KRAAL_VERSION.into(), features });
         if let Some(c) = self.clients.get_mut(&id) {
             c.attached = true;
-            c.cols = cols;
-            c.rows = rows;
             c.workspace = ws;
             c.dirty = true;
             c.welcome = welcome;

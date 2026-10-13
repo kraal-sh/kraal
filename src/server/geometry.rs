@@ -15,7 +15,7 @@ pub(super) struct Tiling {
 impl Server {
     /// Main pane area of client `c`: below the top bar, above the bottom bar, one column of space
     /// right of the sidebar.
-    fn main_area(&self, c: &Client) -> Rect {
+    pub(super) fn main_area(&self, c: &Client) -> Rect {
         let top = 1;
         let height = c.rows.saturating_sub(top + self.bottom_rows()).max(1);
         let left = self.panes_left(c);
