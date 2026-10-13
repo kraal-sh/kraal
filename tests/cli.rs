@@ -511,6 +511,38 @@ fn command_panes_stay_after_exit_and_wait_reports_it() {
 }
 
 #[test]
+fn a_silent_panes_final_burst_is_drawn_and_its_empty_end_is_seen() {
+    let env = Env::new("finalburst");
+    env.workspace("w", "layout { pane name=\"main\"; }\n");
+    env.run(&["open", "w"]);
+    let mut client = RawClient::attach(&env, "w");
+    env.run(&["run", "--name", "burst", "--", "sh", "-c", "stty -echo; printf 'FINAL-BURST\\n'; read line"]);
+    client.wait_for_row("FINAL-BURST");
+    client.send(b"\r");
+    env.run(&["wait", "-p", "burst", "--until", "exit", "--timeout", "10"]);
+    let text = env.run(&["read", "-p", "burst"]);
+    assert_eq!(text.matches("FINAL-BURST").count(), 1, "{text}");
+}
+
+#[test]
+fn a_wait_for_exit_includes_every_line_of_the_final_output_once() {
+    let env = Env::new("finaloutput");
+    env.workspace("w", "layout { pane name=\"main\"; }\n");
+    env.run(&["open", "w"]);
+    let script =
+        r#"awk 'BEGIN { for (i = 1; i <= 9000; i++) printf "%06d %023d\n", i, 0 }'; printf 'LAST-LINE\n'; exit 7"#;
+    env.run(&["run", "--name", "burst", "--", "sh", "-c", script]);
+    env.run(&["wait", "-p", "burst", "--until", "exit", "--timeout", "15"]);
+    let text = env.run(&["read", "-p", "burst", "--lines", "9500"]);
+    let numbers: Vec<u32> = text.lines().filter_map(|l| l.split_whitespace().next()?.parse().ok()).collect();
+    assert_eq!(numbers, (1..=9000).collect::<Vec<_>>());
+    assert_eq!(text.matches("LAST-LINE").count(), 1);
+    let panes: serde_json::Value = serde_json::from_str(&env.run(&["panes", "--json"])).unwrap();
+    let burst = panes.as_array().unwrap().iter().find(|p| p["name"] == "burst").unwrap();
+    assert_eq!(burst["exit_code"], 7);
+}
+
+#[test]
 fn hooks_drive_agent_state() {
     let env = Env::new("hooks");
     env.workspace("w", "layout {\n    pane name=\"agent\"\n}\n");
@@ -2539,6 +2571,16 @@ fn a_program_that_cannot_run_after_all_waits_for_enter() {
     }
     env.run(&["send", "-p", "ok", "-e", "echo still-here"]);
     env.wait_for_text("ok", "still-here");
+    write_script(&broken, "#!/bin/sh\nprintf 'repaired-start\\n'\nexec sleep 1000\n");
+    env.run(&["wait", "-p", "bad", "--until", "exit", "--timeout", "10"]);
+    env.run(&["focus", "bad"]);
+    let mut client = RawClient::attach(&env, "w");
+    client.wait_for_row("cannot start");
+    client.send(b"\r");
+    env.wait_for_text("bad", "repaired-start");
+    let panes: serde_json::Value = serde_json::from_str(&env.run(&["panes", "--json"])).unwrap();
+    let bad = panes.as_array().unwrap().iter().find(|p| p["name"] == "bad").unwrap();
+    assert_eq!(bad["suspended"], false);
 }
 
 #[test]

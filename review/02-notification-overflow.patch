@@ -1,0 +1,1268 @@
+diff --git a/src/pane/archive.rs b/src/pane/archive.rs
+--- a/src/pane/archive.rs
++++ b/src/pane/archive.rs
+@@ -1271,7 +1271,7 @@
+ 
+         /// A pane `rows` high that keeps `scrollback` rows of history.
+         fn sized(scrollback: usize, rows: u16) -> Both {
+-            let (tx, _rx) = crossbeam_channel::bounded(64);
++            let (tx, _rx) = crate::server::event_channel(64);
+             let env = PaneEnv {
+                 socket: "/nonexistent".into(),
+                 session: "t".into(),
+diff --git a/src/pane/commands.rs b/src/pane/commands.rs
+--- a/src/pane/commands.rs
++++ b/src/pane/commands.rs
+@@ -599,8 +599,8 @@
+     use super::*;
+ 
+     /// A pane whose program prints nothing: the tests feed it output themselves.
+-    fn pane(rows: u16, scrollback: usize) -> (Pane, crossbeam_channel::Receiver<crate::server::Event>) {
+-        let (tx, rx) = crossbeam_channel::bounded(64);
++    fn pane(rows: u16, scrollback: usize) -> (Pane, crate::server::EventReceiver) {
++        let (tx, rx) = crate::server::event_channel(64);
+         let env = PaneEnv {
+             socket: "/nonexistent".into(),
+             session: "t".into(),
+diff --git a/src/pane/fuzz.rs b/src/pane/fuzz.rs
+--- a/src/pane/fuzz.rs
++++ b/src/pane/fuzz.rs
+@@ -20,13 +20,13 @@
+ struct Fixture {
+     pane: Pane,
+     env: PaneEnv,
+-    tx: crossbeam_channel::Sender<Event>,
+-    _rx: crossbeam_channel::Receiver<Event>,
++    tx: crate::server::EventSender,
++    _rx: crate::server::EventReceiver,
+ }
+ 
+ /// A pane whose program is never started: what it is fed is all it prints.
+ fn fixture(cols: u16, rows: u16, scrollback: usize, graphics: Arc<crate::graphics::Shared>) -> Fixture {
+-    let (tx, rx) = crossbeam_channel::unbounded();
++    let (tx, rx) = crate::server::event_channel(4096);
+     let env = PaneEnv { socket: "/nonexistent".into(), session: "t".into(), shell: "sh".into(), scrollback, graphics };
+     let spec = PaneSpec { command: vec!["true".into()], ..Default::default() };
+     let batch = super::spawn::batch();
+diff --git a/src/pane/mod.rs b/src/pane/mod.rs
+--- a/src/pane/mod.rs
++++ b/src/pane/mod.rs
+@@ -7,7 +7,6 @@
+ use alacritty_terminal::grid::Scroll;
+ use alacritty_terminal::term::TermMode;
+ use anyhow::Result;
+-use crossbeam_channel::Sender;
+ use ratatui::buffer::Buffer;
+ use ratatui::layout::Rect;
+ 
+@@ -15,7 +14,7 @@
+ use crate::input::PaneInputModes;
+ use crate::layout::PaneId;
+ use crate::preview::Preview;
+-use crate::server::Event;
++use crate::server::EventSender;
+ 
+ mod archive;
+ mod cache;
+@@ -307,7 +306,7 @@
+         cols: u16,
+         rows: u16,
+         env: &PaneEnv,
+-        tx: &Sender<Event>,
++        tx: &EventSender,
+     ) -> Result<Pane> {
+         let cols = cols.max(2);
+         let rows = rows.max(1);
+@@ -321,7 +320,7 @@
+             }
+             let tx = tx.clone();
+             preview.on_change(move || {
+-                let _ = tx.try_send(Event::Wake);
++                let _ = tx.wake();
+             });
+             Content::Preview(Box::new(preview))
+         } else {
+@@ -394,7 +393,7 @@
+     }
+ 
+     /// Restart the command of an exited pane, keeping its scrollback.
+-    pub fn respawn(&mut self, env: &PaneEnv, tx: &Sender<Event>) -> Result<()> {
++    pub fn respawn(&mut self, env: &PaneEnv, tx: &EventSender) -> Result<()> {
+         let Content::Term(old) = &mut self.content else { return Ok(()) };
+         let mut fresh = TermPane::spawn(self.id, &self.spec, self.cols, self.rows, env, tx)?;
+         // Keep history: move the old emulator over and reset its modes.
+@@ -1007,7 +1006,7 @@
+ 
+     #[test]
+     fn replies_held_in_a_synchronized_update_go_out_when_it_times_out() {
+-        let (tx, _rx) = crossbeam_channel::bounded(64);
++        let (tx, _rx) = crate::server::event_channel(64);
+         let env = PaneEnv {
+             socket: "/nonexistent".into(),
+             session: "t".into(),
+@@ -1043,7 +1042,7 @@
+ 
+     #[test]
+     fn what_a_program_prints_first_is_its_first_picture_up_to_a_screenful() {
+-        let (tx, _rx) = crossbeam_channel::bounded(64);
++        let (tx, _rx) = crate::server::event_channel(64);
+         let env = PaneEnv {
+             socket: "/nonexistent".into(),
+             session: "t".into(),
+@@ -1076,7 +1075,7 @@
+     /// kraal's answer comes first, as the shell reads up to the attributes.
+     #[test]
+     fn kraal_answers_the_question_whether_it_is_kraal_before_the_attributes() {
+-        let (tx, _rx) = crossbeam_channel::bounded(64);
++        let (tx, _rx) = crate::server::event_channel(64);
+         let env = PaneEnv {
+             socket: "/nonexistent".into(),
+             session: "t".into(),
+@@ -1114,7 +1113,7 @@
+     #[test]
+     fn replies_wait_for_that_of_an_image_being_prepared() {
+         use base64::Engine;
+-        let (tx, _rx) = crossbeam_channel::bounded(64);
++        let (tx, _rx) = crate::server::event_channel(64);
+         let graphics = std::sync::Arc::new(crate::graphics::Shared::new(true, 64 << 20));
+         graphics.set_available(true);
+         let env = PaneEnv {
+@@ -1164,7 +1163,7 @@
+         let reported = crate::context::RemoteContexts::parse("k8s=prod;ns=web;aws=ops");
+         assert_eq!(found, vec![Osc::Query, Osc::Contexts(reported.clone())], "an answer is not a question");
+ 
+-        let (tx, _rx) = crossbeam_channel::bounded(64);
++        let (tx, _rx) = crate::server::event_channel(64);
+         let env = PaneEnv {
+             socket: "/nonexistent".into(),
+             session: "t".into(),
+@@ -1194,7 +1193,7 @@
+     /// gone as when they come in several reads.
+     #[test]
+     fn a_prompt_without_a_report_ends_one_read_in_the_same_output() {
+-        let (tx, _rx) = crossbeam_channel::bounded(64);
++        let (tx, _rx) = crate::server::event_channel(64);
+         let env = PaneEnv {
+             socket: "/nonexistent".into(),
+             session: "t".into(),
+@@ -1218,7 +1217,7 @@
+ 
+     #[test]
+     fn a_command_never_runs_in_another_directory_than_its_own() {
+-        let (tx, _rx) = crossbeam_channel::bounded(64);
++        let (tx, _rx) = crate::server::event_channel(64);
+         let env = PaneEnv {
+             socket: "/nonexistent".into(),
+             session: "t".into(),
+@@ -1239,7 +1238,7 @@
+ 
+     /// A pane whose program never starts: what the test feeds it is all it prints.
+     pub(super) fn fed_pane(cols: u16, rows: u16, scrollback: usize) -> Pane {
+-        let (tx, _rx) = crossbeam_channel::unbounded();
++        let (tx, _rx) = crate::server::event_channel(4096);
+         let env = PaneEnv {
+             socket: "/nonexistent".into(),
+             session: "t".into(),
+diff --git a/src/pane/pty.rs b/src/pane/pty.rs
+--- a/src/pane/pty.rs
++++ b/src/pane/pty.rs
+@@ -25,7 +25,7 @@
+ use super::guard::KeyboardStackGuard;
+ use super::*;
+ use crate::layout::PaneId;
+-use crate::server::Event;
++use crate::server::{Event, EventSender};
+ 
+ #[derive(Clone, Default)]
+ pub struct Listener(pub(super) Rc<RefCell<Vec<TermEvent>>>);
+@@ -279,7 +279,7 @@
+         cols: u16,
+         rows: u16,
+         env: &PaneEnv,
+-        tx: &Sender<Event>,
++        tx: &EventSender,
+     ) -> Result<TermPane> {
+         // A command, or input typed into the shell, meant for a directory never runs in another
+         // one: a cleanup started in the wrong place deletes the wrong files. A plain shell starts
+@@ -665,7 +665,7 @@
+ /// What the waiter thread of a pane is given once its program started.
+ struct Waiter {
+     id: PaneId,
+-    tx: Sender<Event>,
++    tx: EventSender,
+     /// Closed when the reader has seen the end of the output.
+     eof: crossbeam_channel::Receiver<()>,
+     /// The program, as errors name it.
+@@ -759,7 +759,7 @@
+ /// Start the reader and the writer threads of a PTY. On Linux the PTY is made not to wait
+ /// (`O_NONBLOCK`): a key is then written from the server's thread without handing it to the
+ /// writer, which only writes what the PTY had no room for, and the reader waits in `poll`.
+-fn start_io(id: PaneId, master: &(dyn MasterPty + Send), tx: &Sender<Event>) -> Result<Io> {
++fn start_io(id: PaneId, master: &(dyn MasterPty + Send), tx: &EventSender) -> Result<Io> {
+     let stop = ReaderStop::new(master.tty_name());
+     #[cfg(target_os = "linux")]
+     let direct = master.as_raw_fd().is_some_and(set_nonblocking);
+@@ -775,9 +775,7 @@
+     let stopped = stop.flag.clone();
+     crate::threads::named(format!("pane-{id}-read")).spawn(move || {
+         let _eof = eof_tx;
+-        // The server takes all that waits when told. Telling may fail when its queue is full:
+-        // it also looks for panes with output now and then.
+-        read_output(reader, &out, &stopped, || ready_tx.try_send(Event::PaneReady(id)).is_ok());
++        read_output(reader, &out, &stopped, || ready_tx.pane_ready(id));
+     })?;
+     let (input, writer_stop) = start_writer(id, writer, master.tty_name(), polled).inspect_err(|_| stop.stop())?;
+     let input_pending = writer_stop.pending.clone();
+@@ -1047,10 +1045,96 @@
+ }
+ 
+ #[cfg(test)]
++impl TermPane {
++    pub(crate) fn publish_output(&self, id: PaneId, data: Option<&[u8]>, tx: &EventSender) {
++        let tell = match data {
++            Some(bytes) => self.output.add(bytes, &AtomicBool::new(false)).unwrap(),
++            None => self.output.end(),
++        };
++        if tell {
++            assert!(tx.pane_ready(id));
++        }
++    }
++}
++
++#[cfg(test)]
+ mod tests {
+     use std::time::{Duration, Instant};
+ 
+     use super::*;
++
++    #[test]
++    fn the_reader_publishes_its_final_burst_and_empty_eof_through_overflow() {
++        for data in [b"last-burst".as_slice(), b"".as_slice()] {
++            let (read, mut write) = std::io::pipe().unwrap();
++            let read = std::fs::File::from(std::os::fd::OwnedFd::from(read));
++            let (tx, rx) = crate::server::event_channel(1);
++            tx.wake();
++            let out = Arc::new(Output::default());
++            let output = out.clone();
++            let sender = tx.clone();
++            let (said, heard) = crossbeam_channel::unbounded();
++            let worker = std::thread::spawn(move || {
++                read_output(PtyReader { file: read, woken: true }, &output, &AtomicBool::new(false), || {
++                    let published = sender.pane_ready(1);
++                    said.send(()).unwrap();
++                    published
++                });
++            });
++            let mut write = if data.is_empty() {
++                drop(write);
++                None
++            } else {
++                write.write_all(data).unwrap();
++                Some(write)
++            };
++            heard.recv_timeout(Duration::from_secs(5)).unwrap();
++            assert!(out.lock().told, "overflow is a completed notification");
++            assert!(matches!(rx.try_recv(), Ok(Event::Wake)));
++            assert!(rx.reconcile(false).panes);
++            let mut bytes = Vec::new();
++            assert_eq!(out.take(&mut bytes, false), !data.is_empty());
++            assert_eq!(bytes, data);
++            assert!(!out.take(&mut bytes, false));
++            if data.is_empty() {
++                assert!(out.finished());
++            }
++            // Only after the final-burst assertion may this silent pipe end.
++            drop(write.take());
++            worker.join().unwrap();
++            assert!(out.finished());
++        }
++    }
++
++    #[test]
++    fn overflow_releases_a_reader_waiting_for_output_space() {
++        let (tx, rx) = crate::server::event_channel(1);
++        tx.wake();
++        let out = Arc::new(Output::default());
++        assert_eq!(out.add(&vec![b'x'; MAX_WAITING], &AtomicBool::new(false)), Some(true));
++        assert!(tx.pane_ready(1));
++        let (entered, adding) = crossbeam_channel::bounded(0);
++        let o = out.clone();
++        let worker = std::thread::spawn(move || {
++            entered.send(()).unwrap();
++            assert!(o.add(b"last", &AtomicBool::new(false)).is_some());
++            if o.end() {
++                assert!(tx.pane_ready(1));
++            }
++        });
++        adding.recv().unwrap();
++        // No tick or other producer: taking the overflow token must make room.
++        assert!(matches!(rx.try_recv(), Ok(Event::Wake)));
++        assert!(rx.reconcile(false).panes);
++        let mut bytes = Vec::new();
++        assert!(out.take(&mut bytes, false));
++        assert_eq!(bytes, vec![b'x'; MAX_WAITING]);
++        worker.join().unwrap();
++        assert!(out.take(&mut bytes, false));
++        assert_eq!(bytes, b"last");
++        assert!(out.finished());
++        assert!(!out.take(&mut bytes, false));
++    }
+ 
+     #[test]
+     fn a_reader_stops_while_the_program_is_silent() {
+@@ -1161,7 +1245,7 @@
+     #[test]
+     #[cfg(target_os = "linux")]
+     fn the_output_of_a_program_that_ended_is_all_taken_before_it_is_finished() {
+-        let (tx, rx) = crossbeam_channel::unbounded();
++        let (tx, rx) = crate::server::event_channel(4096);
+         let env = PaneEnv {
+             socket: "/nonexistent".into(),
+             session: "t".into(),
+@@ -1202,7 +1286,7 @@
+     #[cfg(target_os = "linux")]
+     fn a_pane_that_goes_lets_go_of_a_pty_whose_program_reads_no_input() {
+         use std::os::unix::fs::OpenOptionsExt;
+-        let (tx, _rx) = crossbeam_channel::unbounded();
++        let (tx, _rx) = crate::server::event_channel(4096);
+         let env = PaneEnv {
+             socket: "/nonexistent".into(),
+             session: "t".into(),
+@@ -1472,7 +1556,7 @@
+         let _ = std::fs::remove_dir_all(&dir);
+         std::fs::create_dir_all(&dir).unwrap();
+         let got = dir.join("got");
+-        let (tx, _rx) = crossbeam_channel::unbounded();
++        let (tx, _rx) = crate::server::event_channel(4096);
+         let env = PaneEnv {
+             socket: "/nonexistent".into(),
+             session: "t".into(),
+@@ -1525,7 +1609,7 @@
+         let _ = std::fs::remove_dir_all(&dir);
+         std::fs::create_dir_all(&dir).unwrap();
+         crate::testing::write_script(&dir.join("broken"), "#!/no/such/interpreter\n");
+-        let (tx, rx) = crossbeam_channel::unbounded();
++        let (tx, rx) = crate::server::event_channel(4096);
+         let env = PaneEnv {
+             socket: "/nonexistent".into(),
+             session: "t".into(),
+diff --git a/src/pane/scrollback.rs b/src/pane/scrollback.rs
+--- a/src/pane/scrollback.rs
++++ b/src/pane/scrollback.rs
+@@ -659,7 +659,7 @@
+ 
+     #[test]
+     fn a_restored_pane_tells_its_old_text_from_the_new() {
+-        let (tx, _rx) = crossbeam_channel::bounded(64);
++        let (tx, _rx) = crate::server::event_channel(64);
+         let env = PaneEnv {
+             socket: "/nonexistent".into(),
+             session: "t".into(),
+@@ -702,7 +702,7 @@
+ 
+     #[test]
+     fn restored_text_is_searched_and_copied_and_new_commands_are_marked() {
+-        let (tx, _rx) = crossbeam_channel::bounded(64);
++        let (tx, _rx) = crate::server::event_channel(64);
+         let env = PaneEnv {
+             socket: "/nonexistent".into(),
+             session: "t".into(),
+@@ -731,7 +731,7 @@
+ 
+     #[test]
+     fn nothing_is_saved_from_the_alternate_screen() {
+-        let (tx, _rx) = crossbeam_channel::bounded(64);
++        let (tx, _rx) = crate::server::event_channel(64);
+         let env = PaneEnv {
+             socket: "/nonexistent".into(),
+             session: "t".into(),
+@@ -752,7 +752,7 @@
+ 
+     #[test]
+     fn a_link_left_open_in_a_saved_file_ends_before_the_new_output() {
+-        let (tx, _rx) = crossbeam_channel::bounded(64);
++        let (tx, _rx) = crate::server::event_channel(64);
+         let env = PaneEnv {
+             socket: "/nonexistent".into(),
+             session: "t".into(),
+diff --git a/src/preview/tests.rs b/src/preview/tests.rs
+--- a/src/preview/tests.rs
++++ b/src/preview/tests.rs
+@@ -685,3 +685,29 @@
+     assert_eq!(Preview::open(Path::new("/srv/notes.md")).title(), "notes.md");
+     assert_eq!(Preview::open(Path::new("/")).title(), "/");
+ }
++
++#[test]
++fn a_preview_callback_returns_with_both_notification_queues_full() {
++    let preview = Preview::of_text("test", "unchanged");
++    let (tx, rx) = crate::server::event_channel(1);
++    assert!(tx.wake());
++    assert!(tx.wake());
++    let sender = tx.clone();
++    preview.on_change(move || {
++        let _ = sender.wake();
++    });
++    let call = || {
++        let watch = preview.watch.clone();
++        std::thread::spawn(move || {
++            let callback = watch.changed.lock().unwrap();
++            callback.as_ref().unwrap()();
++        })
++        .join()
++        .unwrap();
++    };
++    call();
++    assert!(rx.reconcile(false).wake);
++    // The callback also returns during teardown, still holding its callback mutex.
++    drop(rx);
++    call();
++}
+diff --git a/src/server/agents.rs b/src/server/agents.rs
+--- a/src/server/agents.rs
++++ b/src/server/agents.rs
+@@ -554,7 +554,7 @@
+                     let _ = accounts::save_usage(&a.agent, &a.name, &u);
+                 }
+             }
+-            let _ = tx.send(super::Event::Wake);
++            let _ = tx.wake();
+         });
+         if let Err(e) = polling {
+             self.warnings.push(format!("cannot ask Codex for its limits: {e}"));
+diff --git a/src/server/fileman.rs b/src/server/fileman.rs
+--- a/src/server/fileman.rs
++++ b/src/server/fileman.rs
+@@ -7,7 +7,7 @@
+ 
+ use super::edits::EditTarget;
+ use super::ui::{ConfirmAction, Mode, PickAction, PickItem, Picker, PickerKind};
+-use super::{ClientId, Event, FloatRect, Server};
++use super::{ClientId, FloatRect, Server};
+ use crate::files::{FileKey, FilesAction, FilesPane, Location, Remote, Side};
+ use crate::input::{Key, KeyCode};
+ use crate::layout::PaneId;
+@@ -34,7 +34,7 @@
+         // Called from the listing's own thread: waiting for room in the queue costs nothing there,
+         // while a wake-up dropped would leave the panel loading for good.
+         let wake: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+-            let _ = tx.send(Event::Wake);
++            let _ = tx.wake();
+         });
+         FilesPane::new(self.files_location(left), self.files_location(right), wake)
+     }
+diff --git a/src/server/mod.rs b/src/server/mod.rs
+--- a/src/server/mod.rs
++++ b/src/server/mod.rs
+@@ -23,6 +23,9 @@
+ mod overlays;
+ mod panes;
+ mod persistence;
++#[cfg(test)]
++mod publication_tests;
++mod queue;
+ mod reload;
+ pub mod remote;
+ mod render;
+@@ -40,7 +43,7 @@
+ use std::time::{Duration, Instant};
+ 
+ use anyhow::{Context, Result};
+-use crossbeam_channel::{Receiver, Sender, TrySendError};
++use crossbeam_channel::{Sender, TrySendError};
+ use ratatui::layout::Rect;
+ 
+ use crate::agent::detect_agent;
+@@ -57,6 +60,10 @@
+ pub use agents::usage_text;
+ pub use clients::frame_bytes;
+ use persistence::spawn_persister;
++use queue::Wait;
++#[cfg(test)]
++pub(crate) use queue::channel as event_channel;
++pub use queue::{EventReceiver, EventSender};
+ pub use ssh::ssh_config_hosts;
+ pub use ui::Mode;
+ 
+@@ -381,7 +388,7 @@
+     pub config: Config,
+     pub keymap: Keymap,
+     pub env: PaneEnv,
+-    pub tx: Sender<Event>,
++    pub tx: EventSender,
+     pub panes: HashMap<PaneId, Pane>,
+     pub workspaces: Vec<Workspace>,
+     pub clients: HashMap<ClientId, Client>,
+@@ -687,7 +694,7 @@
+     warnings.extend(tw);
+     let bottom_bar = config.bar.keys != crate::config::BarKeys::Off;
+ 
+-    let (tx, rx) = crossbeam_channel::bounded::<Event>(4096);
++    let (tx, rx) = queue::channel(4096);
+     let persist_tx = tx.clone();
+     let persisting = Arc::new(Mutex::new(persistence::Persisting::default()));
+     let logs_tx = tx.clone();
+@@ -947,22 +954,16 @@
+         id
+     }
+ 
+-    fn event_loop(&mut self, rx: &Receiver<Event>) -> Result<()> {
++    fn event_loop(&mut self, rx: &EventReceiver) -> Result<()> {
++        rx.assert_sender(&self.tx);
+         loop {
+             let timeout = if self.ready.is_empty() {
+                 self.next_deadline().saturating_duration_since(Instant::now())
+             } else {
+                 Duration::ZERO
+             };
+-            match rx.recv_timeout(timeout) {
+-                Ok(ev) => self.handle_and_follow(ev),
+-                Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
+-                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+-            }
+-            // Keystrokes, clients and control requests come first. Panes are told of focus changes
+-            // after each (a pane focused and left within one batch is told both).
+-            while let Ok(ev) = rx.try_recv() {
+-                self.handle_and_follow(ev);
++            if !self.event_phase(rx, rx.wait(timeout)) {
++                break;
+             }
+             // …then a slice of program output, interrupted as soon as something else arrives.
+             self.pump_output(Duration::from_millis(6), rx);
+@@ -988,6 +989,38 @@
+             }
+         }
+         Ok(())
++    }
++
++    fn event_phase(&mut self, rx: &EventReceiver, first: Wait) -> bool {
++        let selected = matches!(first, Wait::Overflow);
++        match first {
++            Wait::Event(ev) => self.handle_and_follow(ev),
++            Wait::Disconnected => return false,
++            Wait::Overflow | Wait::Timeout => {}
++        }
++        // Keep ordinary events in order, including the one selection took. A selected token
++        // remains an obligation until these handlers finish.
++        while let Ok(ev) = rx.try_recv() {
++            self.handle_and_follow(ev);
++        }
++        let notifications = rx.reconcile(selected);
++        if notifications.panes {
++            self.wake();
++            self.reconcile_panes();
++            self.finish_exits();
++        }
++        if notifications.wake {
++            self.handle_and_follow(Event::Wake);
++        }
++        true
++    }
++
++    fn reconcile_panes(&mut self) {
++        for pane in self.panes.values() {
++            if pane.has_output() && self.ready_set.insert(pane.id) {
++                self.ready.push_back(pane.id);
++            }
++        }
+     }
+ 
+     /// Parse waiting pane output for up to `budget`: the panes clients are looking at first,
+@@ -998,7 +1031,7 @@
+     /// rest. A frame due once the focused panes are read (the echo of a key) goes before the
+     /// others' output, every other time at most. A chunk is parsed a slice at a time: one that
+     /// comes while it is parsed (a key) waits for a slice, not for all of it.
+-    fn pump_output(&mut self, budget: Duration, rx: &Receiver<Event>) {
++    fn pump_output(&mut self, budget: Duration, rx: &EventReceiver) {
+         let start = Instant::now();
+         let focused: Vec<PaneId> =
+             self.clients.values().filter(|c| c.attached).filter_map(|c| self.client_focus(c.id)).collect();
+@@ -1065,7 +1098,7 @@
+     /// Parse output `data` of pane `id`, a slice at a time, until it is all parsed (true) or
+     /// something waits in `rx` (after one slice with `one`): then the rest is parsed before any
+     /// more of the pane's output, and the pane stays in the queue for it.
+-    fn parse_output(&mut self, id: PaneId, data: &[u8], rx: &Receiver<Event>, one: bool) -> bool {
++    fn parse_output(&mut self, id: PaneId, data: &[u8], rx: &EventReceiver, one: bool) -> bool {
+         let typing = self.clients.values().any(|c| c.attached && c.last_input.elapsed() < TYPING);
+         let slice = if typing { TYPING_SLICE } else { PARSE_SLICE };
+         let mut at = 0;
+@@ -1345,13 +1378,7 @@
+         self.show_warnings();
+         self.echo.retain(|_, until| *until > now);
+         self.redraws.retain(|_, until| *until > now);
+-        // Wake-ups can be dropped when the event queue is full; catch those panes here.
+-        let waiting: Vec<PaneId> = self.panes.values().filter(|p| p.has_output()).map(|p| p.id).collect();
+-        for id in waiting {
+-            if self.ready_set.insert(id) {
+-                self.ready.push_back(id);
+-            }
+-        }
++        self.reconcile_panes();
+         // Leave copy mode in panes no client is browsing any more (focus moved, client gone).
+         let browsing: Vec<PaneId> = self
+             .clients
+@@ -1794,7 +1821,7 @@
+     use super::*;
+     use crate::layout::Preset;
+ 
+-    pub(super) fn server(tx: Sender<Event>) -> Server {
++    pub(super) fn server(tx: EventSender) -> Server {
+         let config = Config::default();
+         let keymap = Keymap::build(&config.keys).0;
+         let hint_patterns = crate::hints::Custom::build(&config.hints, &config.tools).0;
+diff --git a/src/server/panes.rs b/src/server/panes.rs
+--- a/src/server/panes.rs
++++ b/src/server/panes.rs
+@@ -505,10 +505,15 @@
+     #[test]
+     fn synchronous_launch_failure_does_not_wait_for_its_full_queue() {
+         for capacity in [1, 4096] {
+-            let (tx, rx) = crossbeam_channel::bounded(capacity);
+-            for i in 0..capacity {
+-                assert!(tx.send(Event::Warning(i.to_string())).is_ok());
+-            }
++            let (tx, rx) = super::super::queue::channel(capacity);
++            let producer = tx.clone();
++            std::thread::spawn(move || {
++                for i in 0..capacity {
++                    assert!(producer.send(Event::Warning(i.to_string())).is_ok());
++                }
++            })
++            .join()
++            .unwrap();
+             let mut server = super::super::tests::server(tx);
+             let spec = broken();
+             let file = spec.command[0].clone();
+@@ -539,7 +544,7 @@
+ 
+     #[test]
+     fn synchronous_launch_failure_survives_receiver_shutdown() {
+-        let (tx, rx) = crossbeam_channel::bounded(1);
++        let (tx, rx) = super::super::queue::channel(1);
+         drop(rx);
+         let mut server = super::super::tests::server(tx);
+         let spec = broken();
+@@ -553,7 +558,7 @@
+ 
+     #[test]
+     fn a_returned_failure_owns_the_failed_process_and_cannot_suspend_its_replacement() {
+-        let (tx, _rx) = crossbeam_channel::bounded(1);
++        let (tx, _rx) = super::super::queue::channel(1);
+         let mut server = super::super::tests::server(tx);
+         let batch = crate::pane::batch();
+         let spec = broken();
+diff --git a/src/server/persistence.rs b/src/server/persistence.rs
+--- a/src/server/persistence.rs
++++ b/src/server/persistence.rs
+@@ -8,7 +8,7 @@
+ use crossbeam_channel::Sender;
+ 
+ use super::ui::{ConfirmAction, Mode};
+-use super::{ClientId, Event, Server};
++use super::{ClientId, Event, EventSender, Server};
+ use crate::layout::PaneId;
+ use crate::paths;
+ use crate::persist::{self, SavedScrollback, SessionSnapshot};
+@@ -302,7 +302,7 @@
+ /// session for this server, until it has written its last: a server that stops without waiting
+ /// for a write that is stuck does not let go of the session while that write may still land.
+ pub(super) fn spawn_persister(
+-    events: Sender<Event>,
++    events: EventSender,
+     shared: Arc<Mutex<Persisting>>,
+     held: impl Send + 'static,
+ ) -> std::io::Result<Sender<Persist>> {
+@@ -440,7 +440,7 @@
+             }
+         }
+         let let_go = Arc::new(AtomicBool::new(false));
+-        let (events, _events) = crossbeam_channel::unbounded();
++        let (events, _events) = crate::server::event_channel(4096);
+         let writer = spawn_persister(events, Arc::default(), Held(let_go.clone())).unwrap();
+         let (done, written) = crossbeam_channel::bounded(1);
+         writer.send(Persist::Flush(done)).unwrap();
+diff --git a/src/server/worktrees.rs b/src/server/worktrees.rs
+--- a/src/server/worktrees.rs
++++ b/src/server/worktrees.rs
+@@ -10,7 +10,7 @@
+ 
+ use super::dirwatch::SOON_EVERY;
+ use super::ui::{ConfirmAction, Mode, PickAction, PickItem, Picker, PickerKind};
+-use super::{ClientId, Event, Server};
++use super::{ClientId, Event, EventSender, Server};
+ use crate::git::{self, GitInfo, Worktree, WorktreeState};
+ use crate::layout::PaneId;
+ use crate::pane::PaneSpec;
+@@ -35,7 +35,7 @@
+ }
+ 
+ /// Start the thread that runs `git status` for directories the server asks about.
+-pub fn spawn_git_worker(tx: Sender<Event>) -> std::io::Result<Sender<PathBuf>> {
++pub fn spawn_git_worker(tx: EventSender) -> std::io::Result<Sender<PathBuf>> {
+     let (req_tx, req_rx) = crossbeam_channel::unbounded::<PathBuf>();
+     crate::threads::named("git").spawn(move || {
+         for dir in req_rx {
+diff --git a/tests/cli.rs b/tests/cli.rs
+--- a/tests/cli.rs
++++ b/tests/cli.rs
+@@ -508,6 +508,38 @@
+     let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+     assert_eq!(v[0]["exit_code"], 7, "{json}");
+     assert!(env.run(&["read", "-p", "job"]).contains("working"));
++}
++
++#[test]
++fn a_silent_panes_final_burst_is_drawn_and_its_empty_end_is_seen() {
++    let env = Env::new("finalburst");
++    env.workspace("w", "layout { pane name=\"main\"; }\n");
++    env.run(&["open", "w"]);
++    let mut client = RawClient::attach(&env, "w");
++    env.run(&["run", "--name", "burst", "--", "sh", "-c", "stty -echo; printf 'FINAL-BURST\\n'; read line"]);
++    client.wait_for_row("FINAL-BURST");
++    client.send(b"\r");
++    env.run(&["wait", "-p", "burst", "--until", "exit", "--timeout", "10"]);
++    let text = env.run(&["read", "-p", "burst"]);
++    assert_eq!(text.matches("FINAL-BURST").count(), 1, "{text}");
++}
++
++#[test]
++fn a_wait_for_exit_includes_every_line_of_the_final_output_once() {
++    let env = Env::new("finaloutput");
++    env.workspace("w", "layout { pane name=\"main\"; }\n");
++    env.run(&["open", "w"]);
++    let script =
++        r#"awk 'BEGIN { for (i = 1; i <= 9000; i++) printf "%06d %023d\n", i, 0 }'; printf 'LAST-LINE\n'; exit 7"#;
++    env.run(&["run", "--name", "burst", "--", "sh", "-c", script]);
++    env.run(&["wait", "-p", "burst", "--until", "exit", "--timeout", "15"]);
++    let text = env.run(&["read", "-p", "burst", "--lines", "9500"]);
++    let numbers: Vec<u32> = text.lines().filter_map(|l| l.split_whitespace().next()?.parse().ok()).collect();
++    assert_eq!(numbers, (1..=9000).collect::<Vec<_>>());
++    assert_eq!(text.matches("LAST-LINE").count(), 1);
++    let panes: serde_json::Value = serde_json::from_str(&env.run(&["panes", "--json"])).unwrap();
++    let burst = panes.as_array().unwrap().iter().find(|p| p["name"] == "burst").unwrap();
++    assert_eq!(burst["exit_code"], 7);
+ }
+ 
+ #[test]
+diff --git a/src/server/queue.rs b/src/server/queue.rs
+new file mode 100644
+--- /dev/null
++++ b/src/server/queue.rs
+@@ -0,0 +1,358 @@
++//! The server's event queue and the notifications whose state survives a full queue.
++
++use std::marker::PhantomData;
++use std::rc::Rc;
++use std::sync::Arc;
++use std::sync::atomic::{AtomicU8, Ordering};
++use std::thread::{self, ThreadId};
++use std::time::Duration;
++
++use crossbeam_channel::{Receiver, Sender, TryRecvError, TrySendError};
++
++use super::Event;
++use crate::layout::PaneId;
++
++const PANES: u8 = 1;
++const WAKE: u8 = 2;
++
++struct Domain {
++    owner: ThreadId,
++    dirty: AtomicU8,
++}
++
++#[derive(Clone)]
++pub struct EventSender {
++    events: Sender<Event>,
++    token: Sender<()>,
++    domain: Arc<Domain>,
++}
++
++pub struct EventReceiver {
++    events: Receiver<Event>,
++    token: Receiver<()>,
++    domain: Arc<Domain>,
++    // A receiver stays on the thread recorded at construction, even when moved into a server.
++    _owner: PhantomData<Rc<()>>,
++}
++
++pub enum SendError {
++    OwnThread(Event),
++    Disconnected(Event),
++}
++
++impl std::fmt::Debug for SendError {
++    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        let (kind, event) = match self {
++            Self::OwnThread(event) => ("OwnThread", event),
++            Self::Disconnected(event) => ("Disconnected", event),
++        };
++        f.debug_tuple(kind).field(&std::mem::discriminant(event)).finish()
++    }
++}
++
++pub enum Wait {
++    Event(Event),
++    Overflow,
++    Timeout,
++    Disconnected,
++}
++
++#[derive(Default)]
++pub struct Notifications {
++    pub panes: bool,
++    pub wake: bool,
++}
++
++/// Bind a queue to this thread before any restore or handler can start producers.
++pub fn channel(capacity: usize) -> (EventSender, EventReceiver) {
++    let (events, rx) = crossbeam_channel::bounded(capacity);
++    let (token, tokens) = crossbeam_channel::bounded(1);
++    let domain = Arc::new(Domain { owner: thread::current().id(), dirty: AtomicU8::new(0) });
++    (
++        EventSender { events, token, domain: domain.clone() },
++        EventReceiver { events: rx, token: tokens, domain, _owner: PhantomData },
++    )
++}
++
++impl EventSender {
++    pub fn send(&self, event: Event) -> Result<(), SendError> {
++        if thread::current().id() == self.domain.owner {
++            return Err(SendError::OwnThread(event));
++        }
++        self.events.send(event).map_err(|e| SendError::Disconnected(e.0))
++    }
++
++    pub fn pane_ready(&self, id: PaneId) -> bool {
++        self.notify(Event::PaneReady(id), PANES)
++    }
++
++    pub fn wake(&self) -> bool {
++        self.notify(Event::Wake, WAKE)
++    }
++
++    fn notify(&self, event: Event, bit: u8) -> bool {
++        match self.events.try_send(event) {
++            Ok(()) => true,
++            Err(TrySendError::Disconnected(_)) => false,
++            Err(TrySendError::Full(_)) => {
++                self.mark(bit);
++                // Even an already-set bit needs a token: the loop may have taken the old
++                // token and exchanged the bits while this publisher was paused.
++                self.signal()
++            }
++        }
++    }
++
++    fn mark(&self, bit: u8) {
++        self.domain.dirty.fetch_or(bit, Ordering::SeqCst);
++    }
++
++    fn signal(&self) -> bool {
++        !matches!(self.token.try_send(()), Err(TrySendError::Disconnected(())))
++    }
++}
++
++impl EventReceiver {
++    pub fn assert_sender(&self, sender: &EventSender) {
++        assert!(Arc::ptr_eq(&self.domain, &sender.domain), "server event queue mismatch");
++    }
++
++    pub fn wait(&self, timeout: Duration) -> Wait {
++        crossbeam_channel::select! {
++            recv(self.events) -> event => match event {
++                Ok(event) => Wait::Event(event),
++                Err(_) => Wait::Disconnected,
++            },
++            recv(self.token) -> token => match token {
++                Ok(()) => Wait::Overflow,
++                // Only the ordinary channel decides shutdown.
++                Err(_) => match self.events.recv_timeout(timeout) {
++                    Ok(event) => Wait::Event(event),
++                    Err(crossbeam_channel::RecvTimeoutError::Timeout) => Wait::Timeout,
++                    Err(crossbeam_channel::RecvTimeoutError::Disconnected) => Wait::Disconnected,
++                },
++            },
++            default(timeout) => Wait::Timeout,
++        }
++    }
++
++    pub fn try_recv(&self) -> Result<Event, TryRecvError> {
++        self.events.try_recv()
++    }
++
++    pub fn is_empty(&self) -> bool {
++        self.events.is_empty()
++    }
++
++    pub fn reconcile(&self, selected: bool) -> Notifications {
++        if !selected && self.token.try_recv().is_err() {
++            return Notifications::default();
++        }
++        // Consume the token first; publication after this exchange leaves a later token.
++        self.take_dirty()
++    }
++
++    fn take_dirty(&self) -> Notifications {
++        let bits = self.domain.dirty.swap(0, Ordering::SeqCst);
++        Notifications { panes: bits & PANES != 0, wake: bits & WAKE != 0 }
++    }
++
++    #[cfg(test)]
++    pub fn recv_timeout(&self, timeout: Duration) -> Result<Event, crossbeam_channel::RecvTimeoutError> {
++        self.events.recv_timeout(timeout)
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    fn bits(n: Notifications) -> u8 {
++        (u8::from(n.panes) * PANES) | (u8::from(n.wake) * WAKE)
++    }
++
++    #[test]
++    fn successful_notifications_use_only_the_ordinary_queue() {
++        let (tx, rx) = channel(2);
++        assert!(tx.pane_ready(7));
++        assert!(tx.wake());
++        assert!(matches!(rx.wait(Duration::ZERO), Wait::Event(Event::PaneReady(7))));
++        assert!(matches!(rx.wait(Duration::ZERO), Wait::Event(Event::Wake)));
++        assert_eq!(bits(rx.reconcile(false)), 0);
++        assert!(matches!(rx.wait(Duration::ZERO), Wait::Timeout));
++    }
++
++    #[test]
++    fn both_notification_kinds_coalesce_but_payloads_do_not() {
++        let (tx, rx) = channel(1);
++        tx.wake();
++        for _ in 0..20 {
++            assert!(tx.pane_ready(9));
++            assert!(tx.wake());
++        }
++        assert_eq!(rx.token.len(), 1);
++        assert!(matches!(rx.try_recv(), Ok(Event::Wake)));
++        assert!(matches!(rx.wait(Duration::ZERO), Wait::Overflow));
++        assert_eq!(bits(rx.reconcile(true)), PANES | WAKE);
++        assert!(matches!(rx.wait(Duration::ZERO), Wait::Timeout));
++        let worker = std::thread::spawn(move || {
++            for i in 0..20 {
++                tx.send(Event::ClientFrame(8, 0, vec![i])).unwrap();
++            }
++        });
++        for i in 0..20 {
++            assert!(
++                matches!(rx.wait(Duration::from_secs(2)), Wait::Event(Event::ClientFrame(8, 0, data)) if data == [i])
++            );
++        }
++        worker.join().unwrap();
++        assert_eq!(bits(rx.reconcile(false)), 0);
++    }
++
++    #[test]
++    fn own_thread_errors_return_the_event_even_with_room_or_after_shutdown() {
++        for full in [false, true] {
++            let (tx, rx) = channel(1);
++            if full {
++                tx.wake();
++            }
++            let event = Event::ClientFrame(3, 5, b"owned".to_vec());
++            assert!(
++                matches!(tx.send(event), Err(SendError::OwnThread(Event::ClientFrame(3, 5, data))) if data == b"owned")
++            );
++            drop(rx);
++            assert!(!tx.pane_ready(3));
++            assert!(!tx.wake());
++            assert!(matches!(tx.send(Event::Shutdown), Err(SendError::OwnThread(Event::Shutdown))));
++            std::thread::spawn(move || {
++                assert!(matches!(tx.send(Event::Warning("kept".into())), Err(SendError::Disconnected(Event::Warning(w))) if w == "kept"));
++            }).join().unwrap();
++        }
++    }
++
++    #[test]
++    fn dropping_a_receiver_releases_a_blocked_worker_with_its_payload() {
++        let (tx, rx) = channel(1);
++        tx.wake();
++        tx.pane_ready(1);
++        let worker = std::thread::spawn(move || {
++            assert!(
++                matches!(tx.send(Event::ClientFrame(1, 0, vec![1, 2, 3])), Err(SendError::Disconnected(Event::ClientFrame(1, 0, data))) if data == [1, 2, 3])
++            );
++            assert!(!tx.wake());
++        });
++        drop(rx);
++        worker.join().unwrap();
++    }
++
++    #[test]
++    fn bindings_are_distinct_even_when_recreated_on_the_same_thread() {
++        let (old, rx) = channel(1);
++        rx.assert_sender(&old.clone());
++        old.wake();
++        old.pane_ready(1);
++        drop(rx);
++        let (tx, rx) = channel(1);
++        rx.assert_sender(&tx);
++        assert!(!old.wake());
++        assert!(matches!(rx.wait(Duration::ZERO), Wait::Timeout));
++        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| rx.assert_sender(&old))).is_err());
++    }
++
++    #[test]
++    fn all_dirty_and_token_interleavings_remain_reachable() {
++        fn schedules(prefix: &mut Vec<usize>, next: &mut [usize; 3], visit: &mut impl FnMut(&[usize])) {
++            if prefix.len() == 6 {
++                visit(prefix);
++                return;
++            }
++            for actor in 0..3 {
++                if next[actor] < 2 {
++                    next[actor] += 1;
++                    prefix.push(actor);
++                    schedules(prefix, next, visit);
++                    prefix.pop();
++                    next[actor] -= 1;
++                }
++            }
++        }
++        let mut count = 0;
++        for (token, initial) in [(false, 0), (true, 0), (true, PANES), (true, WAKE), (true, PANES | WAKE)] {
++            for second in [PANES, WAKE] {
++                schedules(&mut Vec::new(), &mut [0; 3], &mut |order| {
++                    let (tx, rx) = channel(1);
++                    tx.mark(initial);
++                    if token {
++                        assert!(tx.signal());
++                    }
++                    let mut next = [0; 3];
++                    let mut selected = false;
++                    let mut seen = 0;
++                    for &actor in order {
++                        match (actor, next[actor]) {
++                            (0, 0) => tx.mark(PANES),
++                            (1, 0) => tx.mark(second),
++                            (0 | 1, 1) => assert!(tx.signal()),
++                            (2, 0) => selected = rx.token.try_recv().is_ok(),
++                            (2, 1) if selected => seen |= bits(rx.take_dirty()),
++                            (2, 1) => {}
++                            _ => unreachable!(),
++                        }
++                        next[actor] += 1;
++                    }
++                    // All publishers are now silent. Only the real selector may rescue work.
++                    while let Wait::Overflow = rx.wait(Duration::ZERO) {
++                        seen |= bits(rx.reconcile(true));
++                    }
++                    assert_eq!(seen, initial | PANES | second, "initial={initial}, order={order:?}");
++                    assert_eq!(rx.domain.dirty.load(Ordering::SeqCst), 0);
++                    count += 1;
++                });
++            }
++        }
++        assert_eq!(count, 900);
++    }
++
++    #[test]
++    fn a_producer_paused_after_the_dirty_store_still_sends_a_token() {
++        let (tx, rx) = channel(1);
++        tx.mark(PANES);
++        tx.signal();
++        let (marked, resume) = crossbeam_channel::bounded(0);
++        let (go, continued) = crossbeam_channel::bounded(0);
++        let producer = tx.clone();
++        let worker = std::thread::spawn(move || {
++            producer.mark(PANES);
++            marked.send(()).unwrap();
++            continued.recv().unwrap();
++            assert!(producer.signal());
++        });
++        resume.recv().unwrap();
++        assert!(matches!(rx.wait(Duration::ZERO), Wait::Overflow));
++        assert_eq!(bits(rx.reconcile(true)), PANES);
++        go.send(()).unwrap();
++        worker.join().unwrap();
++        assert!(matches!(rx.wait(Duration::ZERO), Wait::Overflow));
++        assert_eq!(bits(rx.reconcile(true)), 0, "a stale token is harmless");
++    }
++
++    #[test]
++    #[cfg(target_os = "linux")]
++    fn an_idle_selector_stays_asleep_until_publication() {
++        let (bound, binding) = crossbeam_channel::bounded(1);
++        let worker = std::thread::spawn(move || {
++            let (tx, rx) = channel(1);
++            // SAFETY: gettid has no preconditions.
++            bound.send((tx, unsafe { libc::gettid() })).unwrap();
++            assert!(matches!(rx.wait(Duration::from_secs(30)), Wait::Event(Event::Wake)));
++        });
++        let (tx, tid) = binding.recv().unwrap();
++        crate::testing::wait_asleep(tid);
++        let switches = crate::testing::thread_switches(tid);
++        let before = switches();
++        std::thread::sleep(Duration::from_millis(700));
++        assert_eq!(switches(), before, "no new polling interval");
++        tx.wake();
++        worker.join().unwrap();
++    }
++}
+diff --git a/src/server/publication_tests.rs b/src/server/publication_tests.rs
+new file mode 100644
+--- /dev/null
++++ b/src/server/publication_tests.rs
+@@ -0,0 +1,154 @@
++use super::*;
++use crate::pane::PaneSpec;
++
++fn pane(server: &mut Server) -> PaneId {
++    let batch = crate::pane::batch();
++    let spec = PaneSpec { command: vec!["true".into()], ..Default::default() };
++    let id = server.spawn_pane(None, spec).unwrap();
++    drop(batch);
++    id
++}
++
++fn publish(server: &Server, id: PaneId, data: Option<&[u8]>) {
++    server.panes[&id].term().unwrap().publish_output(id, data, &server.tx);
++}
++
++fn turn(server: &mut Server, rx: &EventReceiver) {
++    assert!(server.event_phase(rx, rx.wait(Duration::ZERO)));
++    server.next_render = None;
++    server.pump_output(Duration::from_millis(20), rx);
++}
++
++#[test]
++fn rejected_final_output_is_parsed_once_without_a_tick_or_later_producer() {
++    let (tx, rx) = queue::channel(1);
++    let mut server = tests::server(tx);
++    let id = pane(&mut server);
++    server.tx.wake();
++    publish(&server, id, Some(b"final-burst\r\n"));
++    let last_tick = server.last_tick;
++    turn(&mut server, &rx);
++    assert_eq!(server.panes[&id].live_text().matches("final-burst").count(), 1);
++    turn(&mut server, &rx);
++    assert_eq!(server.panes[&id].live_text().matches("final-burst").count(), 1);
++    assert_eq!(server.last_tick, last_tick);
++    assert!(matches!(rx.wait(Duration::ZERO), Wait::Timeout));
++}
++
++#[test]
++fn rejected_eof_finishes_an_exit_without_bytes_or_a_timer() {
++    let (tx, rx) = queue::channel(1);
++    let mut server = tests::server(tx);
++    let id = pane(&mut server);
++    server.handle_and_follow(Event::PaneExited(id, None, Some(7)));
++    assert!(server.exiting.contains_key(&id));
++    server.tx.wake();
++    publish(&server, id, None);
++    let last_tick = server.last_tick;
++    turn(&mut server, &rx);
++    assert!(server.exiting.is_empty());
++    assert_eq!(server.panes[&id].exit_code, Some(Some(7)));
++    assert_eq!(server.last_tick, last_tick);
++}
++
++#[test]
++fn overflow_and_ordinary_readiness_do_not_duplicate_unparsed_or_watched_output() {
++    let (tx, rx) = queue::channel(1);
++    let mut server = tests::server(tx);
++    server.env.scrollback = 1000;
++    let id = pane(&mut server);
++    server.panes.get_mut(&id).unwrap().resize(80, 20);
++    server.tx.wake();
++    let data: String = (1..=400).map(|i| format!("{i:04} abcdefghijklmnopqrstuv\r\n")).collect();
++    publish(&server, id, Some(data.as_bytes()));
++    assert!(server.event_phase(&rx, rx.wait(Duration::ZERO)));
++    let mut read = Vec::new();
++    assert!(server.take_output(id, &mut read, false));
++    assert!(!server.parse_output(id, &read, &rx, true));
++    assert!(server.unparsed.contains_key(&id));
++    server.handle_and_follow(Event::PaneReady(id));
++    server.reconcile_panes();
++    assert_eq!(server.ready.iter().filter(|p| **p == id).count(), 1);
++    turn(&mut server, &rx);
++    assert!(!server.unparsed.contains_key(&id));
++    let text = server.panes[&id].text(Some(1000));
++    let numbers: Vec<u32> = text.lines().filter_map(|l| l.split_whitespace().next()?.parse().ok()).collect();
++    assert_eq!(numbers, (1..=400).collect::<Vec<_>>());
++    // A watched pane already belongs to ready_set; overflow does not add a second entry.
++    server.ready.clear();
++    server.watched = vec![id];
++    publish(&server, id, Some(b"unique-tail"));
++    server.tx.wake();
++    server.tx.pane_ready(id);
++    assert!(server.event_phase(&rx, rx.wait(Duration::ZERO)));
++    assert!(server.ready.is_empty());
++    assert_eq!(server.watched, [id]);
++    server.ready.extend(server.watched.drain(..));
++    turn(&mut server, &rx);
++    assert_eq!(server.panes[&id].live_text().matches("unique-tail").count(), 1);
++}
++
++#[test]
++fn reconciliation_uses_current_panes_after_removal_or_restart() {
++    let (tx, rx) = queue::channel(1);
++    let mut server = tests::server(tx);
++    let removed = pane(&mut server);
++    let restarted = pane(&mut server);
++    server.tx.wake();
++    publish(&server, removed, Some(b"removed"));
++    publish(&server, restarted, Some(b"old-process"));
++    server.panes.remove(&removed);
++    let batch = crate::pane::batch();
++    server.panes.get_mut(&restarted).unwrap().respawn(&server.env, &server.tx).unwrap();
++    drop(batch);
++    publish(&server, restarted, Some(b"new-process"));
++    turn(&mut server, &rx);
++    assert!(!server.ready_set.contains(&removed));
++    let screen = server.panes[&restarted].live_text();
++    assert!(!screen.contains("old-process"));
++    assert_eq!(screen.matches("new-process").count(), 1);
++}
++
++#[test]
++fn a_selected_token_is_kept_across_handlers_and_selected_events_keep_fifo() {
++    let (tx, rx) = queue::channel(1);
++    let mut server = tests::server(tx);
++    let id = pane(&mut server);
++    server.tx.wake();
++    publish(&server, id, Some(b"after-handlers"));
++    assert!(matches!(rx.try_recv(), Ok(Event::Wake)));
++    let first = rx.wait(Duration::ZERO);
++    assert!(matches!(first, Wait::Overflow));
++    let worker = server.tx.clone();
++    std::thread::spawn(move || worker.send(Event::Warning("first".into())).unwrap()).join().unwrap();
++    let event = rx.wait(Duration::ZERO);
++    let worker = server.tx.clone();
++    std::thread::spawn(move || worker.send(Event::Warning("second".into())).unwrap()).join().unwrap();
++    assert!(server.event_phase(&rx, event));
++    assert_eq!(server.warnings, ["first", "second"]);
++    assert!(server.ready.is_empty(), "the consumed token is still the caller's obligation");
++    assert!(server.event_phase(&rx, first));
++    server.pump_output(Duration::from_millis(20), &rx);
++    assert!(server.panes[&id].live_text().contains("after-handlers"));
++}
++
++#[test]
++fn a_rejected_preview_wake_runs_the_existing_reload_handler() {
++    let (tx, rx) = queue::channel(1);
++    let mut server = tests::server(tx);
++    let path = std::env::temp_dir().join(format!("kraal-overflow-preview-{}", std::process::id()));
++    std::fs::write(&path, "preview-last-change").unwrap();
++    let spec = PaneSpec { preview: Some(path.clone()), ..Default::default() };
++    let id = server.spawn_pane(None, spec).unwrap();
++    server.tx.pane_ready(999);
++    assert!(server.tx.wake());
++    assert!(server.event_phase(&rx, rx.wait(Duration::ZERO)));
++    assert!(server.preview_loads.contains(&id), "Wake started the reload without a tick");
++    // Only the requested load remains; it returns through the ordinary payload queue.
++    let first = rx.wait(Duration::from_secs(5));
++    assert!(matches!(first, Wait::Event(Event::Job(..))));
++    assert!(server.event_phase(&rx, first));
++    assert!(server.panes[&id].live_text().contains("preview-last-change"));
++    server.panes.remove(&id);
++    std::fs::remove_file(path).unwrap();
++}

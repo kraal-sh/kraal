@@ -7,7 +7,7 @@ use anyhow::Result;
 
 use super::edits::EditTarget;
 use super::ui::{ConfirmAction, Mode, PickAction, PickItem, Picker, PickerKind};
-use super::{ClientId, Event, FloatRect, Server};
+use super::{ClientId, FloatRect, Server};
 use crate::files::{FileKey, FilesAction, FilesPane, Location, Remote, Side};
 use crate::input::{Key, KeyCode};
 use crate::layout::PaneId;
@@ -34,7 +34,7 @@ impl Server {
         // Called from the listing's own thread: waiting for room in the queue costs nothing there,
         // while a wake-up dropped would leave the panel loading for good.
         let wake: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
-            let _ = tx.send(Event::Wake);
+            let _ = tx.wake();
         });
         FilesPane::new(self.files_location(left), self.files_location(right), wake)
     }

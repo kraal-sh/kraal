@@ -685,3 +685,29 @@ fn titles_come_from_the_path_alone() {
     assert_eq!(Preview::open(Path::new("/srv/notes.md")).title(), "notes.md");
     assert_eq!(Preview::open(Path::new("/")).title(), "/");
 }
+
+#[test]
+fn a_preview_callback_returns_with_both_notification_queues_full() {
+    let preview = Preview::of_text("test", "unchanged");
+    let (tx, rx) = crate::server::event_channel(1);
+    assert!(tx.wake());
+    assert!(tx.wake());
+    let sender = tx.clone();
+    preview.on_change(move || {
+        let _ = sender.wake();
+    });
+    let call = || {
+        let watch = preview.watch.clone();
+        std::thread::spawn(move || {
+            let callback = watch.changed.lock().unwrap();
+            callback.as_ref().unwrap()();
+        })
+        .join()
+        .unwrap();
+    };
+    call();
+    assert!(rx.reconcile(false).wake);
+    // The callback also returns during teardown, still holding its callback mutex.
+    drop(rx);
+    call();
+}

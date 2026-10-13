@@ -1271,7 +1271,7 @@ mod tests {
 
         /// A pane `rows` high that keeps `scrollback` rows of history.
         fn sized(scrollback: usize, rows: u16) -> Both {
-            let (tx, _rx) = crossbeam_channel::bounded(64);
+            let (tx, _rx) = crate::server::event_channel(64);
             let env = PaneEnv {
                 socket: "/nonexistent".into(),
                 session: "t".into(),

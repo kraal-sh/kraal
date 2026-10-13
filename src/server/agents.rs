@@ -554,7 +554,7 @@ impl Server {
                     let _ = accounts::save_usage(&a.agent, &a.name, &u);
                 }
             }
-            let _ = tx.send(super::Event::Wake);
+            let _ = tx.wake();
         });
         if let Err(e) = polling {
             self.warnings.push(format!("cannot ask Codex for its limits: {e}"));
