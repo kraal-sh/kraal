@@ -571,8 +571,7 @@ impl KubeCache {
         let number = self.number();
         let (cache, value) = (self.clone(), kubeconfig.to_string());
         let (tx, rx) = std::sync::mpsc::channel();
-        std::thread::Builder::new()
-            .name("kubeconfig".into())
+        crate::threads::named("kubeconfig")
             .spawn(move || {
                 let _ = tx.send(cache.merged(&value));
             })

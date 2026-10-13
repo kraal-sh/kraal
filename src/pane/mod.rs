@@ -1202,6 +1202,35 @@ mod tests {
             .unwrap()
     }
 
+    /// A pane given its place before its program starts, as a layout does: its emulator is the
+    /// one a pane made at that size has, whatever size it was made with.
+    #[test]
+    fn a_pane_placed_before_its_program_starts_is_as_one_made_at_that_size() {
+        let text = b"one two three four\r\n\tfive\x1b[5;1Hlast";
+        for (cols, rows) in [(12, 3), (40, 10), (90, 30)] {
+            let (mut placed, mut made) = (fed_pane(40, 10, 100), fed_pane(cols, rows, 100));
+            placed.resize(cols, rows);
+            assert!(placed.term().unwrap().term.grid() == made.term().unwrap().term.grid(), "{cols}x{rows}");
+            placed.feed(text);
+            made.feed(text);
+            assert!(placed.term().unwrap().term.grid() == made.term().unwrap().term.grid(), "{cols}x{rows}");
+            assert_eq!(placed.text(Some(100)), made.text(Some(100)), "{cols}x{rows}");
+        }
+    }
+
+    /// What is written on a pane before its program starts (the text it showed before a
+    /// restart) stays when the pane is given its place.
+    #[test]
+    fn a_pane_placed_before_its_program_starts_keeps_what_is_written_on_it() {
+        use alacritty_terminal::grid::Dimensions;
+        let mut pane = fed_pane(40, 10, 100);
+        pane.feed(b"from before\r\n");
+        pane.resize(12, 3);
+        assert_eq!(pane.text(None).lines().next(), Some("from before"));
+        let term = &pane.term().unwrap().term;
+        assert_eq!((term.columns(), term.screen_lines()), (12, 3));
+    }
+
     #[test]
     fn copy_mode_goes_to_the_middle_of_a_one_row_pane() {
         let mut pane = fed_pane(10, 1, 100);

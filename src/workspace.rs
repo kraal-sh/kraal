@@ -1975,12 +1975,11 @@ layout {
     }
 
     /// A file nesting blocks thousands deep is refused, not read until the stack overflows (on a
-    /// thread of the default size, as tests and kraal's threads have), braces in its strings and
-    /// comments whatever they say.
+    /// thread kraal names, whose stack is the smallest it reads a file on), braces in its strings
+    /// and comments whatever they say.
     #[test]
     fn deeply_nested_blocks_are_refused() {
-        std::thread::Builder::new()
-            .stack_size(2 << 20)
+        crate::threads::named("nested")
             .spawn(|| {
                 // A brace closed in a string or a comment closes nothing.
                 for open in

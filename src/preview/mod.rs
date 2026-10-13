@@ -200,7 +200,7 @@ impl Watch {
     fn start(path: PathBuf) -> Arc<Watch> {
         let watch = Arc::new(Watch::default());
         let w = Arc::clone(&watch);
-        let spawned = std::thread::Builder::new().name("kraal-preview".into()).spawn(move || {
+        let spawned = crate::threads::named("kraal-preview").spawn(move || {
             while !w.stop.load(Ordering::Relaxed) {
                 let stamp = Stamp::of(&path);
                 let before = w.seen.lock().unwrap_or_else(PoisonError::into_inner).replace(stamp);

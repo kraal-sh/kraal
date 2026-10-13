@@ -156,7 +156,7 @@ mod imp {
             let fd = unsafe { OwnedFd::from_raw_fd(raw) };
             let queue = fd.try_clone()?;
             let (stop, stop_end) = std::io::pipe()?;
-            std::thread::Builder::new().name("watch".into()).spawn(move || {
+            crate::threads::named("watch").spawn(move || {
                 let mut buf = vec![0u8; 64 << 10];
                 while super::wait(queue.as_raw_fd(), stop.as_raw_fd()) {
                     let mut out = Vec::new();
@@ -273,7 +273,7 @@ mod imp {
             // The other end closed (the watcher dropped), the pipe reads as ended: the thread stops.
             register(&queue, stop.as_raw_fd(), libc::EVFILT_READ, 0, super::ANY)?;
             let thread_queue = queue.clone();
-            std::thread::Builder::new().name("watch".into()).spawn(move || {
+            crate::threads::named("watch").spawn(move || {
                 let _stop = stop;
                 // SAFETY: kevent is plain data; zeroed is a valid value.
                 let mut events: [libc::kevent; 32] = unsafe { std::mem::zeroed() };

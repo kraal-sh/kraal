@@ -308,6 +308,9 @@ impl TermPane {
     /// keep their distance to the cursor when only the height changed; a new width rewraps the
     /// lines, and they lose their places.
     pub(super) fn resize_marked(&mut self, size: super::pty::Size) {
+        if self.renew(size) {
+            return;
+        }
         let before = self.term.grid().cursor.point.line.0;
         let width = self.term.columns();
         let alt = self.alt_screen();

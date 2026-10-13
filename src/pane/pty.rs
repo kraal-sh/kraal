@@ -177,7 +177,7 @@ fn start_reaper() -> Result<()> {
         return Ok(());
     }
     let (tx, rx) = crossbeam_channel::unbounded::<PaneChild>();
-    std::thread::Builder::new().name("pane-reaper".into()).spawn(move || {
+    crate::threads::named("pane-reaper").spawn(move || {
         let mut waiting: Vec<PaneChild> = Vec::new();
         loop {
             let next = if waiting.is_empty() {
@@ -247,6 +247,15 @@ pub struct TermPane {
     pub(super) moved: u64,
     /// The process's directory as last read for a frame.
     pub(super) cwd_seen: RefCell<Option<super::CwdSeen>>,
+    /// The lines of history the emulator keeps.
+    scrollback: usize,
+}
+
+/// The emulator of a pane of `size` that keeps `scrollback` lines of history.
+fn emulator(scrollback: usize, size: Size, events: &Rc<RefCell<Vec<TermEvent>>>) -> Term<Listener> {
+    // Programs may enable the kitty keyboard protocol (Claude Code does, for Shift+Enter).
+    let config = TermConfig { scrolling_history: scrollback, kitty_keyboard: true, ..TermConfig::default() };
+    Term::new(config, &size, Listener(events.clone()))
 }
 
 /// A PTY of `cols × rows`, with its size in pixels from the outer terminal's cells: programs
@@ -326,11 +335,8 @@ impl TermPane {
         let io = start_io(id, &*pair.master, tx)?;
 
         let events = Rc::new(RefCell::new(Vec::new()));
-        // Programs may enable the kitty keyboard protocol (Claude Code does, for Shift+Enter).
-        let config = TermConfig { scrolling_history: env.scrollback, kitty_keyboard: true, ..TermConfig::default() };
-        let term = Term::new(config, &Size { cols, rows }, Listener(events.clone()));
         let mut pane = TermPane {
-            term,
+            term: emulator(env.scrollback, Size { cols, rows }, &events),
             archive: Archive::new(env.scrollback, usize::from(rows)),
             events,
             parser: Processor::new(),
@@ -355,6 +361,7 @@ impl TermPane {
             changes: 0,
             moved: 0,
             cwd_seen: Default::default(),
+            scrollback: env.scrollback,
         };
         if let Some(text) = &spec.startup_input {
             pane.write(text.clone().into_bytes());
@@ -365,6 +372,18 @@ impl TermPane {
             watch(&pane.process, waiting, launch.run())?;
         }
         Ok(pane)
+    }
+
+    /// Make the emulator anew, at `size`, when the pane's program has not started and nothing
+    /// is written on it: whether it was. That is a pane taking its place in a layout. Resized,
+    /// an emulator keeps the cells it had: those of the provisional size the pane was made with
+    /// (`Server::spawn_pane`), often several times what its place shows, for as long as it lives.
+    pub(super) fn renew(&mut self, size: Size) -> bool {
+        let unwritten = self.pending.is_some() && self.changes == 0;
+        if unwritten {
+            self.term = emulator(self.scrollback, size, &self.events);
+        }
+        unwritten
     }
 
     /// The process id of the pane's program, once it started.
@@ -659,7 +678,7 @@ fn watch(process: &Arc<Process>, waiting: Waiter, started: Result<PaneChild>) ->
     let Waiter { id, tx, eof, what } = waiting;
     process.started(started.with_context(|| format!("starting {what:?}"))?);
     let waited = process.clone();
-    let started = std::thread::Builder::new().name(format!("pane-{id}-wait")).spawn(move || {
+    let started = crate::threads::named(format!("pane-{id}-wait")).spawn(move || {
         // Wait for the end without reaping: that is left to whoever drops the process last.
         let code = wait_exited(waited.pid());
         // Report the exit after the last output, so waits and logs see all of it. A program
@@ -706,7 +725,7 @@ impl Pending {
 /// be started) is for the sender to start.
 pub fn launcher() -> Sender<Pending> {
     let (tx, rx) = crossbeam_channel::unbounded::<Pending>();
-    let _ = std::thread::Builder::new().name("pane-launch".into()).spawn(move || {
+    let _ = crate::threads::named("pane-launch").spawn(move || {
         for pending in rx {
             pending.start();
         }
@@ -744,7 +763,7 @@ fn start_io(id: PaneId, master: &(dyn MasterPty + Send), tx: &Sender<Event>) -> 
     let out = output.clone();
     let (eof_tx, eof_rx) = crossbeam_channel::bounded::<()>(0);
     let stopped = stop.flag.clone();
-    std::thread::Builder::new().name(format!("pane-{id}-read")).spawn(move || {
+    crate::threads::named(format!("pane-{id}-read")).spawn(move || {
         let _eof = eof_tx;
         // The server takes all that waits when told. Telling may fail when its queue is full:
         // it also looks for panes with output now and then.
@@ -767,7 +786,7 @@ fn start_writer(
     let (gone_tx, gone) = crossbeam_channel::bounded::<()>(0);
     let stop = WriterStop { flag: Arc::default(), pending: Arc::default(), tty, gone };
     let (stopped, pending) = (stop.flag.clone(), stop.pending.clone());
-    std::thread::Builder::new().name(format!("pane-{id}-write")).spawn(move || {
+    crate::threads::named(format!("pane-{id}-write")).spawn(move || {
         let _gone = gone_tx;
         for data in in_rx {
             // What waits once the pane went is no one's.
@@ -808,7 +827,7 @@ impl WriterStop {
         }
         let Some(tty) = self.tty.clone() else { return };
         let gone = self.gone.clone();
-        let _ = std::thread::Builder::new().name("pane-input-drop".into()).spawn(move || drop_input(&tty, &gone));
+        let _ = crate::threads::named("pane-input-drop").spawn(move || drop_input(&tty, &gone));
     }
 }
 
