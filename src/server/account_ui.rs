@@ -2,14 +2,14 @@
 
 use anyhow::{Context, Result};
 use ratatui::buffer::Buffer;
-use ratatui::layout::{Position, Rect};
-use ratatui::style::{Modifier, Style};
+use ratatui::layout::Rect;
+use ratatui::style::Style;
 
 use super::ui::{Mode, PickAction, PickItem, Picker, PickerKind};
-use super::{ClientId, Server, overlays};
+use super::{ClientId, Server, forms, overlays};
 use crate::account_status::{self, Status};
 use crate::accounts::{self, Account, Accounts, Usage};
-use crate::ansi::{Cursor, CursorShape};
+use crate::ansi::Cursor;
 use crate::input::{InputEvent, KeyCode, MouseButton, MouseKind};
 use crate::layout::PaneId;
 use crate::text::wrap;
@@ -37,6 +37,15 @@ pub struct AccountForm {
 impl AccountForm {
     fn choosing(&self) -> bool {
         self.existing.is_some() && self.choice.is_none()
+    }
+
+    fn state(&mut self) -> forms::FormState<'_> {
+        forms::FormState {
+            field: &mut self.field,
+            scroll: &mut self.scroll,
+            error: &mut self.error,
+            pending: &mut self.checking,
+        }
     }
 }
 
@@ -164,8 +173,7 @@ impl Server {
         items.push(PickItem::new("+ Add account", "", PickAction::AddAccount));
         let mut p = Picker::new(PickerKind::Accounts, "Accounts", items);
         if let Some(id) = selected {
-            p.selected =
-                p.items.iter().position(|i| matches!(&i.action, PickAction::AccountDetails(a) if a == id)).unwrap_or(0);
+            p.select(|i| matches!(&i.action, PickAction::AccountDetails(a) if a == id));
         }
         p
     }
@@ -278,10 +286,9 @@ impl Server {
     }
 
     fn account_added(&mut self, client: ClientId, account: &Account) {
-        let mut picker = self.accounts_picker(Some(&account.id));
-        picker.message = Some("Account added".into());
+        let result = self.accounts_picker(Some(&account.id)).result("Account added");
         if let Some(c) = self.clients.get_mut(&client) {
-            c.mode = Mode::Picker(picker);
+            c.mode = result;
         }
         self.mark_dirty();
     }
@@ -291,7 +298,9 @@ impl Server {
         let checked = existing.clone();
         let name = form.name.trim().to_string();
         let token = self.alloc_id();
-        form.checking = Some(token);
+        if !form.state().begin(token) {
+            return Mode::AccountForm(form);
+        }
         let saved_form = form.clone();
         if !self.background(
             move || account_status::inspect(&checked),
@@ -305,113 +314,63 @@ impl Server {
                 }
                 let result = Accounts::update(|all| name_existing_account(all, &existing, &status, &name));
                 server.reload_accounts();
+                let mut form = saved_form;
+                form.state().complete(token, result.as_ref().err().map(|e| format!("{e:#}")));
                 match result {
                     Ok(a) => server.account_added(client, &a),
-                    Err(e) => {
-                        let mut form = saved_form;
-                        form.checking = None;
-                        form.error = Some(format!("{e:#}"));
+                    Err(_) => {
                         server.clients.get_mut(&client).unwrap().mode = Mode::AccountForm(form);
                         server.mark_dirty();
                     }
                 }
             },
         ) {
-            form.checking = None;
-            form.error = Some("Could not start the sign-in check. Try again.".into());
+            form.state().complete(token, Some("Could not start the sign-in check. Try again.".into()));
         }
         Mode::AccountForm(form)
     }
 
     pub(super) fn on_account_form(&mut self, client: ClientId, mut form: AccountForm, event: InputEvent) -> Mode {
         let layout = form_layout(&form, self.client_screen(client));
-        if form.checking.is_some() {
-            let cancel = match &event {
-                InputEvent::Key(k) => {
-                    k.code == KeyCode::Esc || (k.mods.ctrl && matches!(k.code, KeyCode::Char('c' | 'g')))
-                }
-                InputEvent::Mouse(m) => {
-                    matches!(m.kind, MouseKind::Press(MouseButton::Left))
-                        && layout.cancel.contains(Position::new(m.col, m.row))
-                }
-                _ => false,
-            };
-            return if cancel { Mode::Picker(self.accounts_picker(None)) } else { Mode::AccountForm(form) };
+        let buttons = form_buttons(&form);
+        let mut fields = vec![forms::Field { id: 0, area: layout.agent, value: forms::FieldValue::Choice }];
+        if !form.choosing() {
+            fields.push(forms::Field {
+                id: 1,
+                area: layout.name,
+                value: forms::FieldValue::Text { value: &mut form.name, cursor: &mut form.cursor },
+            });
         }
-        let mut submit = false;
-        let mut cancel = false;
-        match event {
-            InputEvent::Key(k) => match k.code {
-                KeyCode::Esc => cancel = true,
-                KeyCode::Char('c' | 'g') if k.mods.ctrl => cancel = true,
-                KeyCode::Enter => {
-                    cancel = form.field == 4;
-                    submit = !cancel;
-                }
-                KeyCode::Tab | KeyCode::BackTab => {
-                    let fields: &[usize] = if form.choosing() { &[0, 2, 3, 4] } else { &[0, 1, 2, 4] };
-                    let at = fields.iter().position(|f| *f == form.field).unwrap_or(0);
-                    let next = if k.code == KeyCode::BackTab { at + fields.len() - 1 } else { at + 1 };
-                    form.field = fields[next % fields.len()];
-                }
-                KeyCode::Left | KeyCode::Right | KeyCode::Up | KeyCode::Down if form.field == 0 => {
-                    form.agent = (form.agent + 1) % accounts::AGENTS.len();
-                    form.choice = None;
-                    self.fill_account_form(&mut form);
-                    form.error = None;
-                    form.scroll = 0;
-                }
-                KeyCode::Left | KeyCode::Up | KeyCode::Right | KeyCode::Down if form.field >= 2 => {
-                    let fields: &[usize] = if form.choosing() { &[2, 3, 4] } else { &[2, 4] };
-                    let at = fields.iter().position(|f| *f == form.field).unwrap_or(0);
-                    let next =
-                        if matches!(k.code, KeyCode::Left | KeyCode::Up) { at + fields.len() - 1 } else { at + 1 };
-                    form.field = fields[next % fields.len()];
-                }
-                KeyCode::PageDown => form.scroll = (form.scroll + layout.body.height as usize).min(layout.max_scroll),
-                KeyCode::PageUp => form.scroll = form.scroll.saturating_sub(layout.body.height as usize),
-                _ if form.field == 1 && super::ui::edit_line(&mut form.name, &mut form.cursor, &k) => {
-                    form.error = None;
-                }
-                _ => {}
-            },
-            InputEvent::Paste(data) if form.field == 1 => {
-                form.error =
-                    super::ui::paste_line(&mut form.name, &mut form.cursor, &String::from_utf8_lossy(&data)).err();
+        let outcome = forms::FormState {
+            field: &mut form.field,
+            scroll: &mut form.scroll,
+            error: &mut form.error,
+            pending: &mut form.checking,
+        }
+        .handle(event, &mut fields, &buttons, &layout);
+        if form.checking.is_some() {
+            return if matches!(outcome, forms::FormEvent::Cancel) {
+                Mode::Picker(self.accounts_picker(None))
+            } else {
+                Mode::AccountForm(form)
+            };
+        }
+        if let forms::FormEvent::Choice { field: 0, keyboard } = outcome {
+            form.agent = (form.agent + 1) % accounts::AGENTS.len();
+            form.choice = None;
+            self.fill_account_form(&mut form);
+            if keyboard {
+                form.error = None;
+                form.scroll = 0;
             }
-            InputEvent::Mouse(m) => match m.kind {
-                MouseKind::Press(MouseButton::Left) => {
-                    let at = Position::new(m.col, m.row);
-                    if layout.agent.contains(at) {
-                        form.field = 0;
-                        form.agent = (form.agent + 1) % accounts::AGENTS.len();
-                        form.choice = None;
-                        self.fill_account_form(&mut form);
-                    } else if !form.choosing() && layout.name.contains(at) {
-                        form.field = 1;
-                    } else if layout.primary.contains(at) {
-                        form.field = 2;
-                        submit = true;
-                    } else if layout.alternate.is_some_and(|r| r.contains(at)) {
-                        form.field = 3;
-                        submit = true;
-                    } else if layout.cancel.contains(at) {
-                        cancel = true;
-                    }
-                }
-                MouseKind::ScrollDown => form.scroll = (form.scroll + 2).min(layout.max_scroll),
-                MouseKind::ScrollUp => form.scroll = form.scroll.saturating_sub(2),
-                _ => {}
-            },
-            _ => {}
         }
         if let Some(c) = self.clients.get_mut(&client) {
             c.last_account_agent = Some(accounts::AGENTS[form.agent].name.into());
         }
-        if cancel {
+        if matches!(outcome, forms::FormEvent::Cancel) {
             return Mode::Picker(self.accounts_picker(None));
         }
-        if submit {
+        if matches!(outcome, forms::FormEvent::Submit) {
             if form.choosing() {
                 if form.field == 3 {
                     form.choice = Some(AccountChoice::New);
@@ -569,52 +528,43 @@ fn install_message(agent: usize) -> String {
     )
 }
 
-pub(super) struct FormLayout {
-    area: Rect,
+struct FormLayout {
     agent: Rect,
     name: Rect,
-    body: Rect,
-    lines: Vec<String>,
-    max_scroll: usize,
-    primary: Rect,
-    alternate: Option<Rect>,
-    cancel: Rect,
-    footer: Rect,
+    form: forms::FormLayout,
+}
+
+impl std::ops::Deref for FormLayout {
+    type Target = forms::FormLayout;
+
+    fn deref(&self) -> &Self::Target {
+        &self.form
+    }
+}
+
+fn form_buttons(form: &AccountForm) -> forms::Buttons<'static> {
+    forms::Buttons {
+        primary: forms::Button {
+            field: 2,
+            label: if form.choosing() || matches!(form.choice, Some(AccountChoice::Existing)) {
+                "Use existing account"
+            } else {
+                "Sign in"
+            },
+        },
+        alternate: form.choosing().then_some(forms::Button { field: 3, label: "Sign in to another account" }),
+        cancel: forms::Button { field: 4, label: "Cancel" },
+    }
 }
 
 fn form_layout(form: &AccountForm, screen: Rect) -> FormLayout {
-    let width = screen.width.saturating_sub(4).clamp(4, 76);
     let message = if form.checking.is_some() {
         "Checking sign-in...".into()
     } else {
         form.error.clone().unwrap_or_else(|| if form.installed { String::new() } else { install_message(form.agent) })
     };
-    let lines: Vec<_> = message.lines().flat_map(|l| wrap(l, width.saturating_sub(4).max(1) as usize)).collect();
-    let base = if form.choosing() { 8 } else { 7 };
-    let height = (lines.len() as u16 + base).min(screen.height.saturating_sub(2)).max(base);
-    let area = overlays::centered(screen, width, height);
-    let row = |y| Rect::new(area.x + 2, area.y + y, area.width.saturating_sub(4), 1);
-    let body = Rect { height: area.height.saturating_sub(base), ..row(3) };
-    let primary = row(area.height.saturating_sub(if form.choosing() { 5 } else { 3 }));
-    let primary_width = if form.choosing() || matches!(form.choice, Some(AccountChoice::Existing)) { 24 } else { 11 };
-    let alternate = form.choosing().then(|| Rect { width: 30, ..row(area.height.saturating_sub(4)) });
-    let cancel = if form.choosing() {
-        Rect { width: 10, ..row(area.height.saturating_sub(3)) }
-    } else {
-        Rect { x: primary.x + primary_width + 2, width: 10, ..primary }
-    };
-    FormLayout {
-        area,
-        agent: row(1),
-        name: row(2),
-        body,
-        max_scroll: lines.len().saturating_sub(body.height as usize),
-        lines,
-        primary: Rect { width: primary_width, ..primary },
-        alternate,
-        cancel,
-        footer: row(area.height.saturating_sub(2)),
-    }
+    let layout = forms::FormLayout::new(screen, 2, &message, &form_buttons(form));
+    FormLayout { agent: layout.fields[0], name: layout.fields[1], form: layout }
 }
 
 pub(super) fn draw_form(form: &AccountForm, screen: Rect, buf: &mut Buffer) -> Option<Cursor> {
@@ -624,86 +574,36 @@ pub(super) fn draw_form(form: &AccountForm, screen: Rect, buf: &mut Buffer) -> O
     }
     let theme = crate::theme::current();
     overlays::frame(l.area, "Add account", theme.accent, buf);
-    let style = |field| {
-        if form.field == field {
-            Style::default().bg(theme.selection).add_modifier(Modifier::BOLD)
-        } else {
-            Style::default()
-        }
-    };
     let mut agent = format!("Agent   {}  (Left/Right)", agent_name(accounts::AGENTS[form.agent].name));
     if !form.installed {
         agent.push_str(" · Not installed");
     }
-    buf.set_stringn(l.agent.x, l.agent.y, agent, l.agent.width as usize, style(0));
-    let room = l.name.width.saturating_sub(8) as usize;
-    let chars: Vec<_> = form.name.chars().collect();
-    let (mut start, mut before) = (form.cursor.min(chars.len()), 0);
-    while start > 0 {
-        let width = unicode_width::UnicodeWidthChar::width(chars[start - 1]).unwrap_or(0);
-        if before + width >= room {
-            break;
-        }
-        before += width;
-        start -= 1;
-    }
-    let shown: String = chars[start..].iter().collect();
-    if form.choosing() {
+    buf.set_stringn(l.agent.x, l.agent.y, agent, l.agent.width as usize, forms::field_style(form.field == 0));
+    let cursor = if form.choosing() {
         let message = format!("Existing {} sign-in needs review.", agent_name(accounts::AGENTS[form.agent].name));
         buf.set_stringn(l.name.x, l.name.y, message, l.name.width as usize, Style::default());
+        None
     } else {
-        buf.set_stringn(l.name.x, l.name.y, format!("Name    {shown}"), l.name.width as usize, style(1));
-        if form.name.is_empty() {
-            buf.set_stringn(l.name.x + 8, l.name.y, "e.g. Work or Personal", room, Style::default().fg(theme.dim));
-        }
-    }
-    let scroll = form.scroll.min(l.max_scroll);
-    for (i, line) in l.lines.iter().skip(scroll).take(l.body.height as usize).enumerate() {
-        buf.set_stringn(l.body.x, l.body.y + i as u16, line, l.body.width as usize, Style::default().fg(theme.blocked));
-    }
-    let primary = if form.choosing() || matches!(form.choice, Some(AccountChoice::Existing)) {
-        "Use existing account"
-    } else {
-        "Sign in"
+        forms::draw_text_field(
+            l.name,
+            "Name    ",
+            &form.name,
+            form.cursor,
+            "e.g. Work or Personal",
+            form.field == 1,
+            buf,
+        )
     };
-    let button = |buf: &mut Buffer, rect: Rect, label: &str, field| {
-        let selected = form.field == field || field == 2 && form.field < 2;
-        let marker = if selected { "> " } else { "  " };
-        buf.set_stringn(
-            rect.x,
-            rect.y,
-            format!("[{marker}{label}]"),
-            rect.width as usize,
-            overlays::button_style(selected, false),
-        );
-    };
-    button(buf, l.cancel, "Cancel", 4);
-    if form.checking.is_some() {
-        buf.set_stringn(l.footer.x, l.footer.y, "Esc Cancel", l.footer.width as usize, Style::default().fg(theme.dim));
-        return None;
-    }
-    button(buf, l.primary, primary, 2);
-    if let Some(r) = l.alternate {
-        button(buf, r, "Sign in to another account", 3);
-    }
+    forms::draw_message(&l, form.scroll, buf);
+    let buttons = form_buttons(form);
     let verb = match form.field {
         3 => "Choose",
         4 => "Cancel",
         _ if form.choosing() => "Review",
-        _ => primary,
+        _ => buttons.primary.label,
     };
-    let footer = if l.max_scroll > 0 {
-        format!("Enter {verb} · Tab Next · PgUp/PgDn Scroll · Esc Cancel")
-    } else {
-        format!("Enter {verb} · Tab Next field · Esc Cancel")
-    };
-    buf.set_stringn(l.footer.x, l.footer.y, footer, l.footer.width as usize, Style::default().fg(theme.dim));
-    (form.field == 1 && !form.choosing() && form.checking.is_none() && room > 0).then_some(Cursor {
-        x: l.name.x + 8 + before as u16,
-        y: l.name.y,
-        shape: CursorShape::Bar,
-        blinking: true,
-    })
+    forms::draw_buttons(&l, &buttons, form.field, form.checking, verb, buf);
+    if form.checking.is_some() { None } else { cursor }
 }
 
 fn details_area(screen: Rect) -> Rect {

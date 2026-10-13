@@ -300,31 +300,16 @@ impl Server {
                     && ((p.kind == PickerKind::Agent && p.title == "Start an agent") || p.kind == PickerKind::Accounts)
                     && p.actions.is_none()
                 {
-                    Some((
-                        id,
-                        p.kind,
-                        p.query.clone(),
-                        p.cursor,
-                        p.current().map(|i| i.label.clone()),
-                        p.message.clone(),
-                        p.min_items,
-                    ))
+                    Some((id, p.kind, p.state()))
                 } else {
                     None
                 }
             })
             .collect();
-        for (id, kind, query, cursor, selected, message, min_items) in clients {
+        for (id, kind, state) in clients {
             let mut p =
                 if kind == PickerKind::Accounts { self.accounts_picker(None) } else { self.agent_picker(id, None) };
-            p.min_items = p.min_items.max(min_items);
-            p.message = message;
-            p.query = query;
-            p.cursor = cursor;
-            p.refilter();
-            if let Some(label) = selected {
-                p.selected = p.filtered.iter().position(|&i| p.items[i].label == label).unwrap_or(0);
-            }
+            p.restore(state);
             self.clients.get_mut(&id).unwrap().mode = Mode::Picker(p);
         }
     }
