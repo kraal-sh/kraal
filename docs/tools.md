@@ -37,7 +37,8 @@ when = ["git", "selection"]
 | `enabled` | `false` hides it |
 
 A tool kraal ships changes the same way, by the fields you name: `[tools.lazygit]` with `key =
-"i"`, or `[tools.k9s]` with `enabled = false`.
+"i"`, or `[tools.k9s]` with `enabled = false`. A file to copy, with two tools and a
+[hint](#hints) that runs one: [tools.toml](../examples/config/tools.toml).
 
 A tool gets the pane's context in `$KRAAL_CWD`, `$KRAAL_SERVER`, `$KRAAL_HOST`, `$KRAAL_REPO`,
 `$KRAAL_BRANCH`, `$KRAAL_KUBE_CONTEXT`, `$KRAAL_KUBE_NAMESPACE`, `$KRAAL_TF_WORKSPACE`,

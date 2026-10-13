@@ -2,7 +2,10 @@
 
 A runbook is a procedure kept as a file: yours in `~/.config/kraal/runbooks/`, a repository's in
 its `.kraal/runbooks/` (shared with the code). `ctrl+b R b` lists both; `kraal runbook new <name>`
-starts one from a template.
+starts one from a template. Three to copy:
+[reload-nginx.toml](../examples/runbooks/reload-nginx.toml) (steps on a group of servers),
+[restart-api.md](../examples/runbooks/restart-api.md) (a Markdown procedure) and a repository's
+[deploy.toml](../examples/repository/.kraal/runbooks/deploy.toml) (tags to choose from, a secret).
 
 ## Steps (TOML)
 

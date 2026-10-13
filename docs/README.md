@@ -18,3 +18,5 @@ New here? Start with the [README](../README.md): install, quick start and a tour
 | [Compatibility](compatibility.md) | sessions started by another kraal version, what an older one cannot do, the cross-version test |
 
 `kraal config default` prints every setting with its default, and `kraal config keys` every key.
+The [examples](../examples/README.md) are files to copy: workspaces, configurations, an
+inventory, account rules, runbooks and scripts, each one tested with the program.

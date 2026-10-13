@@ -132,7 +132,8 @@ goes on in the rows below it, each marked `↪` in the margin.
 
 ## Your own keys
 
-Every command and every menu can move, in `~/.config/kraal/config.toml`:
+Every command and every menu can move, in `~/.config/kraal/config.toml`
+([an example](../examples/config/keys-classic.toml), on the classic preset):
 
 ```toml config
 [keys]

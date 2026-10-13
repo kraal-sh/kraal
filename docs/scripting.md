@@ -130,6 +130,8 @@ reason on its standard error:
 `kraal events --since 1262 --boot 1760184000000` goes on from there, and misses nothing while the
 server still has the events. A stream that ends without that line, with status 0, ended with the
 session: kraal stopped or restarted, or its last pane closed.
+[notify-blocked.sh](../examples/scripts/notify-blocked.sh) is a script on this stream that goes on
+where it stopped.
 
 `[hooks]` runs a command when one happens, with the event in `$KRAAL_EVENT_JSON` and its fields as
 `$KRAAL_<FIELD>`; output goes to `~/.local/state/kraal/hooks.log`:
@@ -145,6 +147,7 @@ A key is an event type, or all those of a kind (`"agent.*"`); `kraal config chec
 is no event. The command runs through `sh -c`. `$KRAAL_EVENT` is the type; a field that is true
 is `1`, and one that is false or empty is the empty string. A hook can call kraal: it runs with
 the session's `KRAAL_SOCKET`, so `kraal read -p "$KRAAL_PANE"` reads the pane the event is about.
+[hooks.toml](../examples/config/hooks.toml) is this table as a file to copy.
 
 At most 20 hooks start per second and 32 run at once; a hook running for 10 minutes is stopped
 with everything it started; 64 KiB of each hook's output are kept, in a log only you can read,

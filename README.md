@@ -118,7 +118,8 @@ layout {
 }
 ```
 
-[Sessions and workspaces](docs/workspaces.md)
+[Sessions and workspaces](docs/workspaces.md) · [this file](examples/workspaces/release.kdl),
+among the [examples](examples/README.md) to copy
 
 ## Made to be scripted
 
@@ -148,6 +149,9 @@ connection to production. [Scripting, events and hooks](docs/scripting.md)
 [Scripting, events and hooks](docs/scripting.md) ·
 [Configuration](docs/configuration.md) ·
 [Compatibility](docs/compatibility.md)
+
+[Examples](examples/README.md): workspaces, configurations, an inventory, account rules, runbooks
+and scripts to copy, each one tested with the program.
 
 ## The name
 

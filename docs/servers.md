@@ -4,7 +4,9 @@ Every machine you SSH to, at hand: an inventory, file transfers in every directi
 
 ## The inventory
 
-kraal keeps an inventory in `~/.config/kraal/servers.toml`:
+kraal keeps an inventory in `~/.config/kraal/servers.toml`
+([one to start from](../examples/servers.toml), and [a workspace](../examples/workspaces/fleet.kdl)
+on its servers):
 
 ```toml servers
 [[server]]
@@ -171,6 +173,8 @@ the network drops, and its programs keep running on the server meanwhile:
 `kraal open` is a workspace of this machine's session. When no workspace has that name and it
 reads as a server (`user@host`, or the name of a server kraal knows), kraal attaches nowhere and
 says what to type: for `kraal attach fpa@anvil`, `kraal attach --host fpa@anvil`.
+[attach-remote.sh](../examples/scripts/attach-remote.sh) is the whole way there as a script:
+it installs kraal on the server when it has none, then attaches.
 
 Attach from a terminal of your own: inside a kraal pane, `kraal attach` refuses to nest (the
 sidebar's agents and `alt+a` open such a tab for you, see below). Ctrl+click on a link in a

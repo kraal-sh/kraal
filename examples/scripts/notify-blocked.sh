@@ -20,8 +20,9 @@ if [ -r "$cursor" ]; then
 fi
 mkdir -p "$state"
 
-# An events.lost line (some events are gone) has no seq: it is left out. A notification
-# that cannot be sent ends the script before the cursor moves: the next run sends it again.
+# A line that is no event has no seq, and is left out: events.lost (some events are gone),
+# events.dropped (this reader was too slow: the stream ends there). A notification that
+# cannot be sent ends the script before the cursor moves: the next run sends it again.
 kraal -s "$session" events "$@" |
     jq --unbuffered -r 'select(.seq) | "\(.seq) \(.boot) \(.type) \(.agent) \(.name) in \(.workspace)"' |
     while read -r seq boot type agent where; do
