@@ -8,7 +8,7 @@ use anyhow::Result;
 use crossbeam_channel::Sender;
 
 use super::ui::{ConfirmAction, Mode};
-use super::{ClientId, Event, Server};
+use super::{ClientId, Event, EventSender, Server};
 use crate::layout::PaneId;
 use crate::paths;
 use crate::persist::{self, SavedScrollback, SessionSnapshot};
@@ -302,7 +302,7 @@ impl Persisting {
 /// session for this server, until it has written its last: a server that stops without waiting
 /// for a write that is stuck does not let go of the session while that write may still land.
 pub(super) fn spawn_persister(
-    events: Sender<Event>,
+    events: EventSender,
     shared: Arc<Mutex<Persisting>>,
     held: impl Send + 'static,
 ) -> std::io::Result<Sender<Persist>> {
@@ -440,7 +440,7 @@ mod tests {
             }
         }
         let let_go = Arc::new(AtomicBool::new(false));
-        let (events, _events) = crossbeam_channel::unbounded();
+        let (events, _events) = crate::server::event_channel(4096);
         let writer = spawn_persister(events, Arc::default(), Held(let_go.clone())).unwrap();
         let (done, written) = crossbeam_channel::bounded(1);
         writer.send(Persist::Flush(done)).unwrap();

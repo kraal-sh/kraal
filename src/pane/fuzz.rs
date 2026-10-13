@@ -20,13 +20,13 @@ use crate::fuzz::{self, Rng};
 struct Fixture {
     pane: Pane,
     env: PaneEnv,
-    tx: crossbeam_channel::Sender<Event>,
-    _rx: crossbeam_channel::Receiver<Event>,
+    tx: crate::server::EventSender,
+    _rx: crate::server::EventReceiver,
 }
 
 /// A pane whose program is never started: what it is fed is all it prints.
 fn fixture(cols: u16, rows: u16, scrollback: usize, graphics: Arc<crate::graphics::Shared>) -> Fixture {
-    let (tx, rx) = crossbeam_channel::unbounded();
+    let (tx, rx) = crate::server::event_channel(4096);
     let env = PaneEnv { socket: "/nonexistent".into(), session: "t".into(), shell: "sh".into(), scrollback, graphics };
     let spec = PaneSpec { command: vec!["true".into()], ..Default::default() };
     let batch = super::spawn::batch();

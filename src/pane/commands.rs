@@ -599,8 +599,8 @@ mod tests {
     use super::*;
 
     /// A pane whose program prints nothing: the tests feed it output themselves.
-    fn pane(rows: u16, scrollback: usize) -> (Pane, crossbeam_channel::Receiver<crate::server::Event>) {
-        let (tx, rx) = crossbeam_channel::bounded(64);
+    fn pane(rows: u16, scrollback: usize) -> (Pane, crate::server::EventReceiver) {
+        let (tx, rx) = crate::server::event_channel(64);
         let env = PaneEnv {
             socket: "/nonexistent".into(),
             session: "t".into(),

@@ -109,8 +109,12 @@ impl Server {
         for id in ids {
             let Some(pending) = self.panes.get_mut(&id).and_then(Pane::take_pending) else { continue };
             // Without the launcher thread, here.
-            if let Err(e) = self.launches.send(pending) {
-                e.into_inner().start();
+            if let Err(e) = self.launches.send(pending)
+                && let crate::pane::Started::Failed(id, process, why) = e.into_inner().start()
+            {
+                // Before queued events, but focus and empty-workspace cleanup still belong
+                // to the enclosing handler's boundary.
+                self.pane_failed(id, &process, &why);
             }
         }
     }
@@ -482,5 +486,102 @@ fn placeholder(spec: &PaneSpec, reason: &str) -> PaneSpec {
         ],
         cwd: spec.cwd.clone().filter(|c| c.is_dir()),
         ..Default::default()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::server::Event;
+
+    fn broken() -> PaneSpec {
+        let dir = std::env::temp_dir().join(format!("kraal-fallback-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join(format!("{:?}", std::thread::current().id()));
+        crate::testing::write_script(&file, "#!/no/such/interpreter\n");
+        PaneSpec { command: vec![file.to_string_lossy().into_owned()], ..Default::default() }
+    }
+
+    #[test]
+    fn synchronous_launch_failure_does_not_wait_for_its_full_queue() {
+        for capacity in [1, 4096] {
+            let (tx, rx) = super::super::queue::channel(capacity);
+            let producer = tx.clone();
+            std::thread::spawn(move || {
+                for i in 0..capacity {
+                    assert!(producer.send(Event::Warning(i.to_string())).is_ok());
+                }
+            })
+            .join()
+            .unwrap();
+            let mut server = super::super::tests::server(tx);
+            let spec = broken();
+            let file = spec.command[0].clone();
+            server.jobs.insert(
+                99,
+                Box::new(move |server, _| {
+                    server.new_workspace("empty".into(), None);
+                    server.focus_reported.insert(999);
+                    server.with_batch(|server| {
+                        let ws = server.new_workspace("kept".into(), None);
+                        server.spawn_pane_in(ws, None, spec, protocol::Placement::Tab, None).unwrap();
+                    });
+                    assert!(server.panes.values().all(|p| p.suspended));
+                    assert!(server.workspaces.iter().any(|w| w.name == "empty"));
+                    assert!(server.focus_reported.contains(&999));
+                    assert!(server.warnings.is_empty(), "queued work has not run");
+                }),
+            );
+            server.handle_and_follow(Event::Job(99, Ok(Box::new(()))));
+            assert_eq!(server.workspaces.len(), 1, "cleanup at the handler boundary");
+            assert!(server.focus_reported.is_empty(), "focus at the handler boundary");
+            for i in 0..capacity {
+                assert!(matches!(rx.try_recv(), Ok(Event::Warning(w)) if w == i.to_string()));
+            }
+            std::fs::remove_file(file).unwrap();
+        }
+    }
+
+    #[test]
+    fn synchronous_launch_failure_survives_receiver_shutdown() {
+        let (tx, rx) = super::super::queue::channel(1);
+        drop(rx);
+        let mut server = super::super::tests::server(tx);
+        let spec = broken();
+        let file = spec.command[0].clone();
+        server.with_batch(|server| {
+            server.spawn_pane(None, spec).unwrap();
+        });
+        assert!(server.panes.values().all(|p| p.suspended));
+        std::fs::remove_file(file).unwrap();
+    }
+
+    #[test]
+    fn a_returned_failure_owns_the_failed_process_and_cannot_suspend_its_replacement() {
+        let (tx, _rx) = super::super::queue::channel(1);
+        let mut server = super::super::tests::server(tx);
+        let batch = crate::pane::batch();
+        let spec = broken();
+        let file = spec.command[0].clone();
+        let id = server.spawn_pane(None, spec).unwrap();
+        let hold = server.panes[&id].process_hold().unwrap();
+        let pending = server.panes.get_mut(&id).unwrap().take_pending().unwrap();
+        let crate::pane::Started::Failed(failed_id, process, why) = pending.start() else { panic!("failure") };
+        assert_eq!(failed_id, id);
+        assert!(process.is(&hold));
+        assert!(why.contains("No such file or directory"), "{why}");
+        let pane = server.panes.get_mut(&id).unwrap();
+        pane.spec.command = vec!["true".into()];
+        pane.respawn(&server.env, &server.tx).unwrap();
+        assert!(!pane.process_hold().unwrap().is(&process));
+        server.pane_failed(id, &process, &why);
+        assert!(!server.panes[&id].suspended);
+        let pending = server.panes.get_mut(&id).unwrap().take_pending().unwrap();
+        server.panes.remove(&id);
+        assert!(matches!(pending.start(), crate::pane::Started::Cancelled));
+        server.pane_failed(id, &process, &why);
+        assert!(server.panes.is_empty());
+        drop(batch);
+        std::fs::remove_file(file).unwrap();
     }
 }

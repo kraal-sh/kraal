@@ -25,7 +25,7 @@ use super::commands::Commands;
 use super::guard::KeyboardStackGuard;
 use super::*;
 use crate::layout::PaneId;
-use crate::server::Event;
+use crate::server::{Event, EventSender};
 
 #[derive(Clone, Default)]
 pub struct Listener(pub(super) Rc<RefCell<Vec<TermEvent>>>);
@@ -279,7 +279,7 @@ impl TermPane {
         cols: u16,
         rows: u16,
         env: &PaneEnv,
-        tx: &Sender<Event>,
+        tx: &EventSender,
     ) -> Result<TermPane> {
         // A command, or input typed into the shell, meant for a directory never runs in another
         // one: a cleanup started in the wrong place deletes the wrong files. A plain shell starts
@@ -665,7 +665,7 @@ fn read_output(mut reader: PtyReader, out: &Output, stop: &AtomicBool, tell: imp
 /// What the waiter thread of a pane is given once its program started.
 struct Waiter {
     id: PaneId,
-    tx: Sender<Event>,
+    tx: EventSender,
     /// Closed when the reader has seen the end of the output.
     eof: crossbeam_channel::Receiver<()>,
     /// The program, as errors name it.
@@ -703,18 +703,25 @@ pub struct Pending {
     pane: std::sync::Weak<()>,
 }
 
+#[must_use]
+pub enum Started {
+    Cancelled,
+    Running,
+    Failed(PaneId, ProcessHold, String),
+}
+
 impl Pending {
-    /// Start the program, unless its pane is gone, and watch it end. One that cannot start is
-    /// said to the server ([`Event::PaneFailed`]): its pane then waits for Enter, as one whose
-    /// program could not start when it was made does.
-    pub fn start(self) {
+    /// Start the program, unless its pane is gone, and watch it end. Return a failure to the
+    /// caller: this may be the server itself, which cannot wait for room in its own queue.
+    pub fn start(self) -> Started {
         let Pending { launch, process, waiting, pane } = self;
         if pane.strong_count() == 0 {
-            return;
+            return Started::Cancelled;
         }
-        let (id, tx) = (waiting.id, waiting.tx.clone());
-        if let Err(e) = watch(&process, waiting, launch.run()) {
-            let _ = tx.send(Event::PaneFailed(id, ProcessHold(process), format!("{e:#}")));
+        let id = waiting.id;
+        match watch(&process, waiting, launch.run()) {
+            Ok(()) => Started::Running,
+            Err(e) => Started::Failed(id, ProcessHold(process), format!("{e:#}")),
         }
     }
 }
@@ -727,7 +734,10 @@ pub fn launcher() -> Sender<Pending> {
     let (tx, rx) = crossbeam_channel::unbounded::<Pending>();
     let _ = crate::threads::named("pane-launch").spawn(move || {
         for pending in rx {
-            pending.start();
+            let tx = pending.waiting.tx.clone();
+            if let Started::Failed(id, process, why) = pending.start() {
+                let _ = tx.send(Event::PaneFailed(id, process, why));
+            }
         }
     });
     tx
@@ -749,7 +759,7 @@ struct Io {
 /// Start the reader and the writer threads of a PTY. On Linux the PTY is made not to wait
 /// (`O_NONBLOCK`): a key is then written from the server's thread without handing it to the
 /// writer, which only writes what the PTY had no room for, and the reader waits in `poll`.
-fn start_io(id: PaneId, master: &(dyn MasterPty + Send), tx: &Sender<Event>) -> Result<Io> {
+fn start_io(id: PaneId, master: &(dyn MasterPty + Send), tx: &EventSender) -> Result<Io> {
     let stop = ReaderStop::new(master.tty_name());
     #[cfg(target_os = "linux")]
     let direct = master.as_raw_fd().is_some_and(set_nonblocking);
@@ -765,9 +775,7 @@ fn start_io(id: PaneId, master: &(dyn MasterPty + Send), tx: &Sender<Event>) -> 
     let stopped = stop.flag.clone();
     crate::threads::named(format!("pane-{id}-read")).spawn(move || {
         let _eof = eof_tx;
-        // The server takes all that waits when told. Telling may fail when its queue is full:
-        // it also looks for panes with output now and then.
-        read_output(reader, &out, &stopped, || ready_tx.try_send(Event::PaneReady(id)).is_ok());
+        read_output(reader, &out, &stopped, || ready_tx.pane_ready(id));
     })?;
     let (input, writer_stop) = start_writer(id, writer, master.tty_name(), polled).inspect_err(|_| stop.stop())?;
     let input_pending = writer_stop.pending.clone();
@@ -1037,10 +1045,96 @@ fn exit_code(info: &libc::siginfo_t) -> Option<i32> {
 }
 
 #[cfg(test)]
+impl TermPane {
+    pub(crate) fn publish_output(&self, id: PaneId, data: Option<&[u8]>, tx: &EventSender) {
+        let tell = match data {
+            Some(bytes) => self.output.add(bytes, &AtomicBool::new(false)).unwrap(),
+            None => self.output.end(),
+        };
+        if tell {
+            assert!(tx.pane_ready(id));
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use std::time::{Duration, Instant};
 
     use super::*;
+
+    #[test]
+    fn the_reader_publishes_its_final_burst_and_empty_eof_through_overflow() {
+        for data in [b"last-burst".as_slice(), b"".as_slice()] {
+            let (read, mut write) = std::io::pipe().unwrap();
+            let read = std::fs::File::from(std::os::fd::OwnedFd::from(read));
+            let (tx, rx) = crate::server::event_channel(1);
+            tx.wake();
+            let out = Arc::new(Output::default());
+            let output = out.clone();
+            let sender = tx.clone();
+            let (said, heard) = crossbeam_channel::unbounded();
+            let worker = std::thread::spawn(move || {
+                read_output(PtyReader { file: read, woken: true }, &output, &AtomicBool::new(false), || {
+                    let published = sender.pane_ready(1);
+                    said.send(()).unwrap();
+                    published
+                });
+            });
+            let mut write = if data.is_empty() {
+                drop(write);
+                None
+            } else {
+                write.write_all(data).unwrap();
+                Some(write)
+            };
+            heard.recv_timeout(Duration::from_secs(5)).unwrap();
+            assert!(out.lock().told, "overflow is a completed notification");
+            assert!(matches!(rx.try_recv(), Ok(Event::Wake)));
+            assert!(rx.reconcile(false).panes);
+            let mut bytes = Vec::new();
+            assert_eq!(out.take(&mut bytes, false), !data.is_empty());
+            assert_eq!(bytes, data);
+            assert!(!out.take(&mut bytes, false));
+            if data.is_empty() {
+                assert!(out.finished());
+            }
+            // Only after the final-burst assertion may this silent pipe end.
+            drop(write.take());
+            worker.join().unwrap();
+            assert!(out.finished());
+        }
+    }
+
+    #[test]
+    fn overflow_releases_a_reader_waiting_for_output_space() {
+        let (tx, rx) = crate::server::event_channel(1);
+        tx.wake();
+        let out = Arc::new(Output::default());
+        assert_eq!(out.add(&vec![b'x'; MAX_WAITING], &AtomicBool::new(false)), Some(true));
+        assert!(tx.pane_ready(1));
+        let (entered, adding) = crossbeam_channel::bounded(0);
+        let o = out.clone();
+        let worker = std::thread::spawn(move || {
+            entered.send(()).unwrap();
+            assert!(o.add(b"last", &AtomicBool::new(false)).is_some());
+            if o.end() {
+                assert!(tx.pane_ready(1));
+            }
+        });
+        adding.recv().unwrap();
+        // No tick or other producer: taking the overflow token must make room.
+        assert!(matches!(rx.try_recv(), Ok(Event::Wake)));
+        assert!(rx.reconcile(false).panes);
+        let mut bytes = Vec::new();
+        assert!(out.take(&mut bytes, false));
+        assert_eq!(bytes, vec![b'x'; MAX_WAITING]);
+        worker.join().unwrap();
+        assert!(out.take(&mut bytes, false));
+        assert_eq!(bytes, b"last");
+        assert!(out.finished());
+        assert!(!out.take(&mut bytes, false));
+    }
 
     #[test]
     fn a_reader_stops_while_the_program_is_silent() {
@@ -1151,7 +1245,7 @@ mod tests {
     #[test]
     #[cfg(target_os = "linux")]
     fn the_output_of_a_program_that_ended_is_all_taken_before_it_is_finished() {
-        let (tx, rx) = crossbeam_channel::unbounded();
+        let (tx, rx) = crate::server::event_channel(4096);
         let env = PaneEnv {
             socket: "/nonexistent".into(),
             session: "t".into(),
@@ -1192,7 +1286,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     fn a_pane_that_goes_lets_go_of_a_pty_whose_program_reads_no_input() {
         use std::os::unix::fs::OpenOptionsExt;
-        let (tx, _rx) = crossbeam_channel::unbounded();
+        let (tx, _rx) = crate::server::event_channel(4096);
         let env = PaneEnv {
             socket: "/nonexistent".into(),
             session: "t".into(),
@@ -1462,7 +1556,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let got = dir.join("got");
-        let (tx, _rx) = crossbeam_channel::unbounded();
+        let (tx, _rx) = crate::server::event_channel(4096);
         let env = PaneEnv {
             socket: "/nonexistent".into(),
             session: "t".into(),
@@ -1515,7 +1609,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         crate::testing::write_script(&dir.join("broken"), "#!/no/such/interpreter\n");
-        let (tx, rx) = crossbeam_channel::unbounded();
+        let (tx, rx) = crate::server::event_channel(4096);
         let env = PaneEnv {
             socket: "/nonexistent".into(),
             session: "t".into(),
@@ -1539,9 +1633,11 @@ mod tests {
         drop(gone);
         // On another thread, as the launcher starts them.
         std::thread::spawn(move || {
-            g.start();
-            k.start();
-            f.start();
+            assert!(matches!(g.start(), Started::Cancelled));
+            assert!(matches!(k.start(), Started::Running));
+            let tx = f.waiting.tx.clone();
+            let Started::Failed(id, process, why) = f.start() else { panic!("the start failed") };
+            assert!(tx.send(Event::PaneFailed(id, process, why)).is_ok());
         })
         .join()
         .unwrap();

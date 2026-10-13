@@ -7,7 +7,6 @@ use alacritty_terminal::event::{Event as TermEvent, EventListener, WindowSize};
 use alacritty_terminal::grid::Scroll;
 use alacritty_terminal::term::TermMode;
 use anyhow::Result;
-use crossbeam_channel::Sender;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 
@@ -15,7 +14,7 @@ use crate::agent::AgentTracker;
 use crate::input::PaneInputModes;
 use crate::layout::PaneId;
 use crate::preview::Preview;
-use crate::server::Event;
+use crate::server::EventSender;
 
 mod archive;
 mod cache;
@@ -39,7 +38,7 @@ use osc::sanitize_title;
 use osc::{Osc, OscScanner};
 pub use osc::{osc_notify, osc52};
 use pty::Size;
-pub use pty::{Pending, ProcessHold, TermPane, launcher};
+pub use pty::{Pending, ProcessHold, Started, TermPane, launcher};
 #[cfg(test)]
 pub use screen::render_term;
 pub use screen::set_outer_colors;
@@ -307,7 +306,7 @@ impl Pane {
         cols: u16,
         rows: u16,
         env: &PaneEnv,
-        tx: &Sender<Event>,
+        tx: &EventSender,
     ) -> Result<Pane> {
         let cols = cols.max(2);
         let rows = rows.max(1);
@@ -321,7 +320,7 @@ impl Pane {
             }
             let tx = tx.clone();
             preview.on_change(move || {
-                let _ = tx.try_send(Event::Wake);
+                let _ = tx.wake();
             });
             Content::Preview(Box::new(preview))
         } else {
@@ -394,7 +393,7 @@ impl Pane {
     }
 
     /// Restart the command of an exited pane, keeping its scrollback.
-    pub fn respawn(&mut self, env: &PaneEnv, tx: &Sender<Event>) -> Result<()> {
+    pub fn respawn(&mut self, env: &PaneEnv, tx: &EventSender) -> Result<()> {
         let Content::Term(old) = &mut self.content else { return Ok(()) };
         let mut fresh = TermPane::spawn(self.id, &self.spec, self.cols, self.rows, env, tx)?;
         // Keep history: move the old emulator over and reset its modes.
@@ -1007,7 +1006,7 @@ mod tests {
 
     #[test]
     fn replies_held_in_a_synchronized_update_go_out_when_it_times_out() {
-        let (tx, _rx) = crossbeam_channel::bounded(64);
+        let (tx, _rx) = crate::server::event_channel(64);
         let env = PaneEnv {
             socket: "/nonexistent".into(),
             session: "t".into(),
@@ -1043,7 +1042,7 @@ mod tests {
 
     #[test]
     fn what_a_program_prints_first_is_its_first_picture_up_to_a_screenful() {
-        let (tx, _rx) = crossbeam_channel::bounded(64);
+        let (tx, _rx) = crate::server::event_channel(64);
         let env = PaneEnv {
             socket: "/nonexistent".into(),
             session: "t".into(),
@@ -1076,7 +1075,7 @@ mod tests {
     /// kraal's answer comes first, as the shell reads up to the attributes.
     #[test]
     fn kraal_answers_the_question_whether_it_is_kraal_before_the_attributes() {
-        let (tx, _rx) = crossbeam_channel::bounded(64);
+        let (tx, _rx) = crate::server::event_channel(64);
         let env = PaneEnv {
             socket: "/nonexistent".into(),
             session: "t".into(),
@@ -1114,7 +1113,7 @@ mod tests {
     #[test]
     fn replies_wait_for_that_of_an_image_being_prepared() {
         use base64::Engine;
-        let (tx, _rx) = crossbeam_channel::bounded(64);
+        let (tx, _rx) = crate::server::event_channel(64);
         let graphics = std::sync::Arc::new(crate::graphics::Shared::new(true, 64 << 20));
         graphics.set_available(true);
         let env = PaneEnv {
@@ -1164,7 +1163,7 @@ mod tests {
         let reported = crate::context::RemoteContexts::parse("k8s=prod;ns=web;aws=ops");
         assert_eq!(found, vec![Osc::Query, Osc::Contexts(reported.clone())], "an answer is not a question");
 
-        let (tx, _rx) = crossbeam_channel::bounded(64);
+        let (tx, _rx) = crate::server::event_channel(64);
         let env = PaneEnv {
             socket: "/nonexistent".into(),
             session: "t".into(),
@@ -1194,7 +1193,7 @@ mod tests {
     /// gone as when they come in several reads.
     #[test]
     fn a_prompt_without_a_report_ends_one_read_in_the_same_output() {
-        let (tx, _rx) = crossbeam_channel::bounded(64);
+        let (tx, _rx) = crate::server::event_channel(64);
         let env = PaneEnv {
             socket: "/nonexistent".into(),
             session: "t".into(),
@@ -1218,7 +1217,7 @@ mod tests {
 
     #[test]
     fn a_command_never_runs_in_another_directory_than_its_own() {
-        let (tx, _rx) = crossbeam_channel::bounded(64);
+        let (tx, _rx) = crate::server::event_channel(64);
         let env = PaneEnv {
             socket: "/nonexistent".into(),
             session: "t".into(),
@@ -1239,7 +1238,7 @@ mod tests {
 
     /// A pane whose program never starts: what the test feeds it is all it prints.
     pub(super) fn fed_pane(cols: u16, rows: u16, scrollback: usize) -> Pane {
-        let (tx, _rx) = crossbeam_channel::unbounded();
+        let (tx, _rx) = crate::server::event_channel(4096);
         let env = PaneEnv {
             socket: "/nonexistent".into(),
             session: "t".into(),

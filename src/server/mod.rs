@@ -23,6 +23,9 @@ pub mod net;
 mod overlays;
 mod panes;
 mod persistence;
+#[cfg(test)]
+mod publication_tests;
+mod queue;
 mod reload;
 pub mod remote;
 mod render;
@@ -40,7 +43,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use crossbeam_channel::{Receiver, Sender, TrySendError};
+use crossbeam_channel::{Sender, TrySendError};
 use ratatui::layout::Rect;
 
 use crate::agent::detect_agent;
@@ -57,6 +60,10 @@ use crate::protocol::ServerMsg;
 pub use agents::usage_text;
 pub use clients::frame_bytes;
 use persistence::spawn_persister;
+use queue::Wait;
+#[cfg(test)]
+pub(crate) use queue::channel as event_channel;
+pub use queue::{EventReceiver, EventSender};
 pub use ssh::ssh_config_hosts;
 pub use ui::Mode;
 
@@ -381,7 +388,7 @@ pub struct Server {
     pub config: Config,
     pub keymap: Keymap,
     pub env: PaneEnv,
-    pub tx: Sender<Event>,
+    pub tx: EventSender,
     pub panes: HashMap<PaneId, Pane>,
     pub workspaces: Vec<Workspace>,
     pub clients: HashMap<ClientId, Client>,
@@ -694,7 +701,7 @@ pub fn run(session: &str) -> Result<()> {
     warnings.extend(tw);
     let bottom_bar = config.bar.keys != crate::config::BarKeys::Off;
 
-    let (tx, rx) = crossbeam_channel::bounded::<Event>(4096);
+    let (tx, rx) = queue::channel(4096);
     let persist_tx = tx.clone();
     let persisting = Arc::new(Mutex::new(persistence::Persisting::default()));
     let logs_tx = tx.clone();
@@ -965,22 +972,16 @@ impl Server {
         id
     }
 
-    fn event_loop(&mut self, rx: &Receiver<Event>) -> Result<()> {
+    fn event_loop(&mut self, rx: &EventReceiver) -> Result<()> {
+        rx.assert_sender(&self.tx);
         loop {
             let timeout = if self.ready.is_empty() {
                 self.next_deadline().saturating_duration_since(Instant::now())
             } else {
                 Duration::ZERO
             };
-            match rx.recv_timeout(timeout) {
-                Ok(ev) => self.handle_and_follow(ev),
-                Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
-                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
-            }
-            // Keystrokes, clients and control requests come first. Panes are told of focus changes
-            // after each (a pane focused and left within one batch is told both).
-            while let Ok(ev) = rx.try_recv() {
-                self.handle_and_follow(ev);
+            if !self.event_phase(rx, rx.wait(timeout)) {
+                break;
             }
             // …then a slice of program output, interrupted as soon as something else arrives.
             self.pump_output(Duration::from_millis(6), rx);
@@ -1008,6 +1009,38 @@ impl Server {
         Ok(())
     }
 
+    fn event_phase(&mut self, rx: &EventReceiver, first: Wait) -> bool {
+        let selected = matches!(first, Wait::Overflow);
+        match first {
+            Wait::Event(ev) => self.handle_and_follow(ev),
+            Wait::Disconnected => return false,
+            Wait::Overflow | Wait::Timeout => {}
+        }
+        // Keep ordinary events in order, including the one selection took. A selected token
+        // remains an obligation until these handlers finish.
+        while let Ok(ev) = rx.try_recv() {
+            self.handle_and_follow(ev);
+        }
+        let notifications = rx.reconcile(selected);
+        if notifications.panes {
+            self.wake();
+            self.reconcile_panes();
+            self.finish_exits();
+        }
+        if notifications.wake {
+            self.handle_and_follow(Event::Wake);
+        }
+        true
+    }
+
+    fn reconcile_panes(&mut self) {
+        for pane in self.panes.values() {
+            if pane.has_output() && self.ready_set.insert(pane.id) {
+                self.ready.push_back(pane.id);
+            }
+        }
+    }
+
     /// Parse waiting pane output for up to `budget`: the panes clients are looking at first,
     /// a chunk each whatever else waits, then more for at most half of it, then a chunk of each
     /// pane just resized (see [`Server::redrawn`]), then the others in turn, one chunk each.
@@ -1016,7 +1049,7 @@ impl Server {
     /// rest. A frame due once the focused panes are read (the echo of a key) goes before the
     /// others' output, every other time at most. A chunk is parsed a slice at a time: one that
     /// comes while it is parsed (a key) waits for a slice, not for all of it.
-    fn pump_output(&mut self, budget: Duration, rx: &Receiver<Event>) {
+    fn pump_output(&mut self, budget: Duration, rx: &EventReceiver) {
         let start = Instant::now();
         let focused: Vec<PaneId> =
             self.clients.values().filter(|c| c.attached).filter_map(|c| self.client_focus(c.id)).collect();
@@ -1083,7 +1116,7 @@ impl Server {
     /// Parse output `data` of pane `id`, a slice at a time, until it is all parsed (true) or
     /// something waits in `rx` (after one slice with `one`): then the rest is parsed before any
     /// more of the pane's output, and the pane stays in the queue for it.
-    fn parse_output(&mut self, id: PaneId, data: &[u8], rx: &Receiver<Event>, one: bool) -> bool {
+    fn parse_output(&mut self, id: PaneId, data: &[u8], rx: &EventReceiver, one: bool) -> bool {
         let typing = self.clients.values().any(|c| c.attached && c.last_input.elapsed() < TYPING);
         let slice = if typing { TYPING_SLICE } else { PARSE_SLICE };
         let mut at = 0;
@@ -1363,13 +1396,7 @@ impl Server {
         self.show_warnings();
         self.echo.retain(|_, until| *until > now);
         self.redraws.retain(|_, until| *until > now);
-        // Wake-ups can be dropped when the event queue is full; catch those panes here.
-        let waiting: Vec<PaneId> = self.panes.values().filter(|p| p.has_output()).map(|p| p.id).collect();
-        for id in waiting {
-            if self.ready_set.insert(id) {
-                self.ready.push_back(id);
-            }
-        }
+        self.reconcile_panes();
         // Leave copy mode in panes no client is browsing any more (focus moved, client gone).
         let browsing: Vec<PaneId> = self
             .clients
@@ -1812,6 +1839,126 @@ mod tests {
     use super::*;
     use crate::layout::Preset;
 
+    pub(super) fn server(tx: EventSender) -> Server {
+        let config = Config::default();
+        let keymap = Keymap::build(&config.keys).0;
+        let hint_patterns = crate::hints::Custom::build(&config.hints, &config.tools).0;
+        let bottom_bar = false;
+        let env = PaneEnv {
+            socket: "/nonexistent".into(),
+            session: "publication-test".into(),
+            shell: "sh".into(),
+            scrollback: 100,
+            graphics: Default::default(),
+        };
+        let buffers = crate::buffers::Buffers::new(config.buffers.limit, config.buffers.max_bytes());
+        Server {
+            session: "publication-test".into(),
+            config,
+            keymap,
+            env,
+            tx,
+            panes: HashMap::new(),
+            workspaces: Vec::new(),
+            clients: HashMap::new(),
+            next_id: 1,
+            primary: None,
+            // A 120×40 terminal's, until a client attaches.
+            layout_area: Rect::new(0, 1, 120, 39 - u16::from(bottom_bar)),
+            waits: Vec::new(),
+            persist_dirty: false,
+            last_persist: Instant::now(),
+            last_tick: Instant::now(),
+            idle: false,
+            scan_polled: true,
+            kube_polled: false,
+            last_contact: Instant::now(),
+            last_scan: Instant::now() - SCAN_EVERY,
+            next_render: None,
+            image_wake: None,
+            last_frame: Instant::now(),
+            streak: 0,
+            echo: HashMap::new(),
+            redraws: HashMap::new(),
+            settle: None,
+            quitting: false,
+            kill_waiters: Vec::new(),
+            restarting: false,
+            outer_colors: None,
+            images: HashMap::new(),
+            fitted: Default::default(),
+            preparing: 0,
+            warnings: Vec::new(),
+            accounts_error: None,
+            messages: Default::default(),
+            def_files: Vec::new(),
+            last_def_scan: Instant::now(),
+            known_servers: Vec::new(),
+            discovered: Default::default(),
+            accounts: crate::accounts::Accounts::empty(),
+            starting_workspace: None,
+            usage: Default::default(),
+            last_codex_poll: Instant::now() - Duration::from_secs(3600),
+            limit_alerts: HashMap::new(),
+            screen_limits: HashMap::new(),
+            switches: HashMap::new(),
+            limit_events: Default::default(),
+            ready: Default::default(),
+            ready_set: Default::default(),
+            output_buf: Vec::new(),
+            unparsed: HashMap::new(),
+            watched: Vec::new(),
+            watch_at: None,
+            exiting: Default::default(),
+            focus_reported: Default::default(),
+            held_input: Vec::new(),
+            bottom_bar,
+            turn_skipped: false,
+            typed_quietly: false,
+            chrome_gen: 0,
+            facts: Default::default(),
+            tilings: Default::default(),
+            broadcast_tip_shown: false,
+            buffers,
+            buffers_dirty: false,
+            panes_closed: false,
+            tunnels: Vec::new(),
+            remotes: Vec::new(),
+            port_candidates: HashMap::new(),
+            ports: Default::default(),
+            git: HashMap::new(),
+            dirwatch: dirwatch::DirWatch::new(None),
+            git_requests: crossbeam_channel::unbounded().0,
+            launches: crossbeam_channel::unbounded().0,
+            kube: HashMap::new(),
+            kube_cache: Default::default(),
+            tf_dirs: Default::default(),
+            hint_patterns,
+            subscribers: Vec::new(),
+            events: Default::default(),
+            announced: Default::default(),
+            hooks: events::Hooks::new(Vec::new()),
+            pane_states: Default::default(),
+            drafts: HashMap::new(),
+            plans: HashMap::new(),
+            runs: Vec::new(),
+            launching: Vec::new(),
+            stray_groups: Vec::new(),
+            run_output: HashMap::new(),
+            md_sessions: HashMap::new(),
+            jobs: HashMap::new(),
+            edits: Vec::new(),
+            preview_loads: Default::default(),
+            pending_opens: Vec::new(),
+            persister: crossbeam_channel::unbounded().0,
+            persisting: Default::default(),
+            persisted: None,
+            scrollback: HashMap::new(),
+            unrestored: Vec::new(),
+            scrollback_tag: format!("{}-{}", crate::accounts::now(), std::process::id()),
+            run_logs: crossbeam_channel::unbounded().0,
+        }
+    }
     #[test]
     fn a_folded_pane_opens_when_it_gets_the_focus() {
         let mut tab = Tab::new(1, String::new());

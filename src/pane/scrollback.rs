@@ -659,7 +659,7 @@ mod tests {
 
     #[test]
     fn a_restored_pane_tells_its_old_text_from_the_new() {
-        let (tx, _rx) = crossbeam_channel::bounded(64);
+        let (tx, _rx) = crate::server::event_channel(64);
         let env = PaneEnv {
             socket: "/nonexistent".into(),
             session: "t".into(),
@@ -702,7 +702,7 @@ mod tests {
 
     #[test]
     fn restored_text_is_searched_and_copied_and_new_commands_are_marked() {
-        let (tx, _rx) = crossbeam_channel::bounded(64);
+        let (tx, _rx) = crate::server::event_channel(64);
         let env = PaneEnv {
             socket: "/nonexistent".into(),
             session: "t".into(),
@@ -731,7 +731,7 @@ mod tests {
 
     #[test]
     fn nothing_is_saved_from_the_alternate_screen() {
-        let (tx, _rx) = crossbeam_channel::bounded(64);
+        let (tx, _rx) = crate::server::event_channel(64);
         let env = PaneEnv {
             socket: "/nonexistent".into(),
             session: "t".into(),
@@ -752,7 +752,7 @@ mod tests {
 
     #[test]
     fn a_link_left_open_in_a_saved_file_ends_before_the_new_output() {
-        let (tx, _rx) = crossbeam_channel::bounded(64);
+        let (tx, _rx) = crate::server::event_channel(64);
         let env = PaneEnv {
             socket: "/nonexistent".into(),
             session: "t".into(),

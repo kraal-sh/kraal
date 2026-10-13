@@ -10,7 +10,7 @@ use crossbeam_channel::Sender;
 
 use super::dirwatch::SOON_EVERY;
 use super::ui::{ConfirmAction, Mode, PickAction, PickItem, Picker, PickerKind};
-use super::{ClientId, Event, Server};
+use super::{ClientId, Event, EventSender, Server};
 use crate::git::{self, GitInfo, Worktree, WorktreeState};
 use crate::layout::PaneId;
 use crate::pane::PaneSpec;
@@ -35,7 +35,7 @@ pub enum JobEnd {
 }
 
 /// Start the thread that runs `git status` for directories the server asks about.
-pub fn spawn_git_worker(tx: Sender<Event>) -> std::io::Result<Sender<PathBuf>> {
+pub fn spawn_git_worker(tx: EventSender) -> std::io::Result<Sender<PathBuf>> {
     let (req_tx, req_rx) = crossbeam_channel::unbounded::<PathBuf>();
     crate::threads::named("git").spawn(move || {
         for dir in req_rx {
