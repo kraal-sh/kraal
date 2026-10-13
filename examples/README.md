@@ -23,7 +23,7 @@ at its tag. The [documentation](../docs/README.md) explains what they use.
 | [repository/.kraal/worktree.toml](repository/.kraal/worktree.toml) | What a repository copies and runs in its worktrees, once you approved it | npm | `kraal wt new fix-login` |
 | [repository/.kraal/runbooks/deploy.toml](repository/.kraal/runbooks/deploy.toml) | A runbook shared with the code: tags to choose from, a secret parameter | tags, a deploy script | `kraal runbook run deploy --dry-run` |
 | [scripts/notify-blocked.sh](scripts/notify-blocked.sh) | A script on `kraal events` that goes on where it stopped | jq, curl | `NTFY_TOPIC=my-topic scripts/notify-blocked.sh` |
-| [scripts/agent-in-worktree.sh](scripts/agent-in-worktree.sh) | An agent in a worktree of its own, and a notification when it needs you | git, jq, claude | `scripts/agent-in-worktree.sh fix-login` |
+| [scripts/agent-in-worktree.sh](scripts/agent-in-worktree.sh) | An agent in a worktree of its own, and a notification when it needs you | git, claude | `scripts/agent-in-worktree.sh fix-login` |
 | [scripts/attach-remote.sh](scripts/attach-remote.sh) | The kraal session of another machine, from this one: `kraal attach --host workstation` (without `--host`, the name is a workspace on this machine) | ssh access to that machine | `scripts/attach-remote.sh workstation` |
 
 The files of `config/` are each a whole `config.toml`: copy one, or add its tables to yours.

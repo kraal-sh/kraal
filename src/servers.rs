@@ -755,19 +755,16 @@ pub fn from_workspaces(defs: &[WorkspaceDef]) -> Vec<Known> {
 /// Every server kraal knows: the inventory first, then workspaces, then `~/.ssh/config`
 /// aliases. Duplicates (the same connection, written the same way) keep the first entry; a
 /// workspace pane that connects otherwise (another user, port, key or jump host) keeps its own
-/// entry, so its name opens what it opens. Names stay unique.
+/// entry, so its name opens what it opens. Names stay unique. The inventory's entry stands as
+/// its file gives it: a workspace whose pane connects as it does adds no group to it, so the
+/// group named after a workspace holds the servers the inventory does not have.
 pub fn known(inv: &Inventory, defs: &[WorkspaceDef], ssh_hosts: &[String]) -> Vec<Known> {
     let mut out: Vec<Known> =
         inv.servers.iter().map(|s| Known { server: s.clone(), source: Source::Inventory }).collect();
     for k in from_workspaces(defs) {
-        if let Some(existing) =
-            out.iter_mut().find(|e| e.server.same_address(&k.server) && e.server.same_connection(&k.server))
-        {
-            for g in &k.server.groups {
-                if existing.source != Source::Inventory && !existing.server.groups.contains(g) {
-                    existing.server.groups.push(g.clone());
-                }
-            }
+        // Two panes that connect the same way are one entry already ([`from_workspaces`]): what
+        // is found here is the inventory's.
+        if out.iter().any(|e| e.server.same_address(&k.server) && e.server.same_connection(&k.server)) {
             continue;
         }
         let mut k = k;
@@ -992,6 +989,9 @@ mod tests {
         assert_eq!(names, vec!["proxy", "db", "bastion"]);
         assert_eq!(k[1].server.port, Some(2222));
         assert_eq!(k[1].server.groups, vec!["fleet".to_string()]);
+        // The inventory's entry stands for the pane that connects as it does, with the groups
+        // its file gives: the workspace's is not one of them.
+        assert_eq!((&k[0].source, k[0].server.groups.len()), (&Source::Inventory, 0));
         assert_eq!(resolve(&k, "db").unwrap().host, "db.lan");
         assert_eq!(resolve(&k, "deploy@edge-proxy.lan").unwrap().name, "proxy");
         assert_eq!(resolve(&k, "me@new.example.org").unwrap().name, "new");

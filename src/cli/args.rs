@@ -281,7 +281,7 @@ pub enum Cmd {
         action: Option<AccountsCmd>,
     },
     /// Start an agent on the right account: in a new pane inside kraal (with
-    /// --right/--down/--tab/--floating, or by default), else right here.
+    /// --right/--down/--tab/--floating, or by default), whose id is printed, else right here.
     Agent {
         /// claude or codex.
         agent: String,
@@ -421,7 +421,7 @@ pub enum TunnelCmd {
 pub enum WtCmd {
     /// Create a worktree from the current repository and prepare it (.kraal/worktree.toml and
     /// [worktrees] in the config: files copied, setup commands); with --agent, start that agent
-    /// in it (in a new tab inside kraal).
+    /// in it (in a new tab inside kraal, whose pane's id is printed last).
     New {
         name: String,
         #[arg(long)]
@@ -522,7 +522,7 @@ pub enum RunbookCmd {
         /// Where to run it: a server, user@host or @group.
         #[arg(long)]
         on: Option<String>,
-        /// A parameter, NAME=value (repeat for several).
+        /// A parameter, NAME=value (repeat for several): one of its choices when it has some.
         #[arg(short, long = "param")]
         params: Vec<String>,
         /// Run without asking about the plan. It approves nothing: a repository's runbook that

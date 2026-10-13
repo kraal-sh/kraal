@@ -178,6 +178,24 @@ fn the_check_has_nothing_to_say_of_any_example() {
     }
 }
 
+/// `kraal config keys` with the keys example in place: an action it gives other keys is listed
+/// where the preset lists that action, with each of its keys, as text and as Markdown.
+#[test]
+fn the_keys_of_the_example_are_listed_in_place() {
+    let env = Env::new("exkeys");
+    std::fs::copy(examples().join("config/keys-classic.toml"), env.root.join("config/kraal/config.toml")).unwrap();
+    let first = ["|", "\\", "-", "_", "x", "z", "space"];
+    let text = quiet(kraal(&env, &["config", "keys"]));
+    let rows = text.lines().skip_while(|line| *line != "After ctrl+a").skip(1);
+    let keys: Vec<&str> = rows.map_while(|row| row.trim().strip_prefix("ctrl+a ")?.split(' ').next()).collect();
+    assert_eq!(keys[..first.len()], first, "{text}");
+    let sheet = quiet(kraal(&env, &["config", "keys", "--markdown"]));
+    let rows =
+        sheet.lines().skip_while(|line| *line != "## After ctrl+a").filter_map(|row| row.strip_prefix("| `ctrl+a "));
+    let keys: Vec<&str> = rows.filter_map(|row| row.split("` |").next()).collect();
+    assert_eq!(keys[..first.len()], ["\\|", "\\", "-", "_", "x", "z", "space"], "{sheet}");
+}
+
 /// Every workspace opens with the tabs and panes it declares, its programs started.
 #[test]
 fn every_workspace_opens_as_it_is_written() {
@@ -223,6 +241,13 @@ fn every_workspace_opens_as_it_is_written() {
     let fleet = panes("fleet");
     assert_eq!(fleet[0]["server"], "web-staging-1");
     assert!(fleet[0]["production"].is_null() && fleet[1]["production"].is_null(), "{fleet:?}");
+    // Their group is the one their entries give: the workspace adds none to the inventory's.
+    let group = |name: &str| -> Vec<String> {
+        let members = json(&quiet(kraal(&env, &["servers", "list", "--group", name, "--json"])));
+        members.iter().map(|server| server["name"].as_str().unwrap().to_string()).collect()
+    };
+    assert_eq!(group("web"), ["web-staging-1", "web-staging-2", "web-prod-1"]);
+    assert!(group("fleet").is_empty());
 }
 
 /// Every runbook is listed as what it is, and every steps runbook shows its plan: on a group

@@ -60,7 +60,12 @@ printed, so do not echo them.
 | `kraal runbook edit reload-nginx` | opens it in `$VISUAL` or `$EDITOR` |
 
 A parameter without a default that `-p` does not give is asked in the terminal; without a
-terminal, the run fails and names it.
+terminal, the run fails and names it. A value is one the question in kraal would offer: when the
+parameter has `choices`, or a `choices_command` that lists some, any other value is refused with
+the list in place of the plan, `--dry-run` included. When that command fails or lists nothing,
+any value goes, and the plan says that it was not checked. The command of a repository's runbook
+you have not approved does not run: its plan (`--dry-run`) says that the value is taken as given,
+and the value is held to the list once the runbook is approved.
 
 ## Documents (Markdown)
 
@@ -88,8 +93,8 @@ act of its own:
   hide or act on, like `\u{1b}`).
 
 `--yes` answers the plan and approves nothing: with it, or without a terminal, a runbook that is
-new or changed is refused, and the message names the command that approves it. Listing a runbook,
-showing it and `--dry-run` only read its file.
+new or changed is refused, and the message names the command that approves it. Listing a runbook
+and showing it only read its file, and so does `--dry-run` of one that is not approved.
 
 An approval is of that file in that repository, where the repository really is: reaching the
 checkout through a link changes nothing, and a link that comes to lead to another checkout takes

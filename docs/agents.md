@@ -97,7 +97,7 @@ worktrees.
 
 | Command | |
 |---|---|
-| `kraal wt new fix-login --agent claude` | the same from the command line (without `--agent`, the worktree alone) |
+| `kraal wt new fix-login --agent claude` | the same from the command line (without `--agent`, the worktree alone); its last line is the id of the agent's pane |
 | `kraal wt new fix-login --base main` | from that branch instead of the one checked out |
 | `kraal wt list` | this repository's worktrees, with each one's number |
 | `kraal wt rm fix-login` | removes one with its branch; refuses if it would lose changes, unmerged commits or ignored files, or while panes work in it |
@@ -184,7 +184,7 @@ kraal accounts add claude pro
 | `kraal accounts rename claude:pro work` | renames it: rules and usage follow, the directory stays |
 | `kraal accounts rm claude:work` | forgets it; its directory is kept |
 | `kraal accounts limits --threshold 85 --mode ask` | sets the threshold and what happens there (below) |
-| `kraal agent claude` | starts Claude Code on the account the rules pick, in a new pane (in this terminal outside kraal) |
+| `kraal agent claude` | starts Claude Code on the account the rules pick, in a new pane whose id it prints (in this terminal outside kraal) |
 | `kraal agent codex --account work --right` | on that account, in a split on the right (`--down`, `--floating` and `--tab` place it too; `--here` runs it in this terminal even inside kraal) |
 | `kraal agent claude -- --model opus` | what follows `--` goes to the agent |
 

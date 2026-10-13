@@ -157,6 +157,17 @@ impl Param {
     pub fn prompt(&self) -> String {
         self.prompt.clone().unwrap_or_else(|| self.name.clone())
     }
+
+    /// Refuse a value the question about this parameter does not offer. With `choices` (the
+    /// file's, or what its command listed) the question is a list, which takes one of them and
+    /// nothing else; without any, it takes whatever is typed.
+    pub fn accept(&self, value: &str, choices: &[String]) -> Result<()> {
+        if choices.is_empty() || choices.iter().any(|choice| choice == value) {
+            return Ok(());
+        }
+        let (name, value) = (&self.name, shown_value(Some(self), value));
+        bail!("{name}={value} is not one of its choices: {}", choices.join(", "))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -961,6 +972,23 @@ mod tests {
         assert_eq!(parse_duration("0s"), None);
         let vars = vec![("KRAAL_BRANCH".to_string(), "main".to_string()), ("KRAAL_B".to_string(), "x".to_string())];
         assert_eq!(expand_vars("v-$KRAAL_BRANCH-${KRAAL_B}", &vars), "v-main-x");
+    }
+
+    #[test]
+    fn a_parameter_takes_one_of_its_choices() {
+        let params = "[[param]]\nname = \"SITE\"\n[[param]]\nname = \"TOKEN\"\nsecret = true\n";
+        let steps = parse_steps(&format!("steps = [\"a\"]\n{params}")).unwrap();
+        let (site, token) = (&steps.params[0], &steps.params[1]);
+        let choices = ["shop".to_string(), "blog".to_string()];
+        assert!(site.accept("blog", &choices).is_ok());
+        let refused = site.accept("Blog", &choices).unwrap_err().to_string();
+        assert_eq!(refused, "SITE=Blog is not one of its choices: shop, blog");
+        assert!(site.accept("", &choices).is_err());
+        // Without choices, the question is a field: anything goes, nothing included.
+        assert!(site.accept("anything", &[]).is_ok() && site.accept("", &[]).is_ok());
+        // A secret is not repeated, refused or not.
+        let refused = token.accept("hunter2", &choices).unwrap_err().to_string();
+        assert_eq!(refused, "TOKEN=•••• is not one of its choices: shop, blog");
     }
 
     #[test]

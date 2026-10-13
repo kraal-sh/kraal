@@ -2,8 +2,8 @@
 // Copy it to ~/.config/kraal/workspaces/fleet.kdl, then open it with `kraal fleet`.
 // `ctrl+b b` types in every pane of the tab at once; the production pane has a red frame,
 // and kraal asks before broadcast keys or a paste of several lines reach it.
-// Needs servers you can ssh to: put yours in place of the example.com hosts. With
-// examples/servers.toml in place, each pane takes the name, groups and env of its entry.
+// Needs servers you can ssh to, in place of the example.com hosts. With examples/servers.toml
+// in place, each pane takes its entry's name, env and groups: the three are `@web`, not `@fleet`.
 layout {
     tab name="web" {
         pane split_direction="vertical" {

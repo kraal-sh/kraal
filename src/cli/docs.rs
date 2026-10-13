@@ -10,7 +10,7 @@ use clap::error::ErrorKind;
 use clap::{CommandFactory, Parser as _};
 use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
 
-use super::args::Cli;
+use super::args::{Cli, Cmd};
 use crate::config::{Config, DEFAULT_CONFIG};
 use crate::input::{Key, KeyCode, KeySpec};
 use crate::keymap::{Command, Keymap, Lookup};
@@ -303,6 +303,19 @@ fn other_quotes() -> Vec<Quote> {
         }
     }
     quotes
+}
+
+/// What docs/workspaces.md says of a workspace named like a command: its name alone is the
+/// command, and `attach` and `open` take it as a workspace, as any other name alone is one.
+#[test]
+fn a_workspace_named_like_a_command_takes_attach_or_open() {
+    let parsed = |line: &str| Cli::try_parse_from(line.split(' ')).unwrap_or_else(|e| panic!("{line}: {e}"));
+    assert!(matches!(parsed("kraal files").command, Some(Cmd::Files { .. })));
+    let attach = parsed("kraal attach files").command;
+    assert!(matches!(attach, Some(Cmd::Attach { workspace: Some(name), host: None, .. }) if name == "files"));
+    assert!(matches!(parsed("kraal open files").command, Some(Cmd::Open { name }) if name == "files"));
+    let alone = parsed("kraal shop");
+    assert!(alone.command.is_none() && alone.workspace.as_deref() == Some("shop"));
 }
 
 #[test]

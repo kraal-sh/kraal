@@ -146,10 +146,11 @@ new_pane = ["alt+n"]
 ```
 
 `kraal config keys` prints every key, menu and mode, with the names to use here
-(`kraal config keys --markdown` for a sheet to keep or print); `kraal config check` reports a key
-bound twice or a sequence that hides another; `kraal config reload` applies the file to the
-running session (keys, theme, sidebar, bottom bar, mouse, frames, tools, hints, hooks; new panes
-take a new shell or scrollback length).
+(`kraal config keys --markdown` for a sheet to keep or print): each key of a command has its line,
+and a command you gave other keys stays where it was among the others, as in the menu and the
+help. `kraal config check` reports a key bound twice or a sequence that hides another;
+`kraal config reload` applies the file to the running session (keys, theme, sidebar, bottom bar,
+mouse, frames, tools, hints, hooks; new panes take a new shell or scrollback length).
 
 ## Mouse
 

@@ -13,7 +13,7 @@ use std::collections::BTreeMap;
 
 use serde::Deserialize;
 
-use crate::input::{Key, KeyCode, KeySpec};
+use crate::input::{Key, KeyCode, KeySpec, Mods};
 
 /// A command kraal has, whatever reaches it: keys, the menu, the command search. [`ACTIONS`]
 /// gives each its name in the configuration and its description.
@@ -593,6 +593,12 @@ fn bindings(
     out
 }
 
+/// Where a preset's `table` lists `action`: its row, and past the last one for an action the
+/// preset gives no key.
+fn place(table: Table, action: Action) -> usize {
+    table.iter().position(|(name, _)| Action::parse(name) == Some(action)).unwrap_or(table.len())
+}
+
 /// A section of the reference: its title, and rows of keys with what they do.
 type Section = (String, Vec<(String, String)>);
 
@@ -737,6 +743,10 @@ impl Keymap {
                 kept.push((k, a));
             }
         }
+        // The keys the user gave an action are listed where the preset lists that action (the
+        // menu, the help, `kraal config keys`). Only the listing: a key two actions ask for
+        // went to the preset's, as before.
+        kept.sort_by_key(|(_, a)| place(preset.direct, *a));
         let leader = bindings(preset.leader, &user, "keys.leader", (&menus, &prefix), &mut warnings);
         let tool_menu = match preset.tool_menu {
             "" => vec![Vec::new()],
@@ -752,6 +762,10 @@ impl Keymap {
         for (keys, a) in leader {
             km.add(keys, Command::Action(a), &mut warnings);
         }
+        km.leader.sort_by_key(|(_, command)| match command {
+            Command::Action(a) => place(preset.leader, *a),
+            Command::Tool(_) => preset.leader.len(),
+        });
         (km, warnings)
     }
 
@@ -911,14 +925,32 @@ impl Keymap {
         Some(format!("{} {key}", self.prefix_label()))
     }
 
+    /// Whether each of `actions` has one key right after the prefix, the one given with it:
+    /// keys the reference can write as a range.
+    fn bound_as(&self, actions: &[(Action, KeyCode)]) -> bool {
+        actions.iter().all(|(action, code)| {
+            let command = Command::Action(*action);
+            let mut keys = self.leader.iter().filter(|(keys, c)| keys.len() == 1 && *c == command);
+            let its_key = keys.next().is_some_and(|(keys, _)| keys[0] == KeySpec::new(*code, Mods::NONE));
+            its_key && keys.next().is_none()
+        })
+    }
+
     /// The whole reference, for the help screen and `kraal config keys`: sections of (keys,
     /// what they do). The keys after the prefix come first, then each menu, the keys without the
-    /// prefix, and the fixed keys of lists, fields, questions and modes.
-    pub fn reference(&self, ascii: bool) -> Vec<Section> {
+    /// prefix, and the fixed keys of lists, fields, questions and modes. In a section, the help
+    /// shows a command once, with its first key; with `every`, each key bound has its row.
+    pub fn reference(&self, ascii: bool, every: bool) -> Vec<Section> {
         let p = self.prefix_label();
         let seq = |keys: &[KeySpec]| self.after_prefix(keys, |k| pretty(k, ascii));
         let root = format!("After {p}");
-        // Each section, with the commands it lists (a command shows once per section).
+        // The arrows and the digits are written as a range: among every key, only where they
+        // are bound as that range and nothing else.
+        let sides = [FocusLeft, FocusDown, FocusUp, FocusRight].into_iter();
+        let sides: Vec<_> = sides.zip([KeyCode::Left, KeyCode::Down, KeyCode::Up, KeyCode::Right]).collect();
+        let tabs: Vec<_> = (1..=9).map(|n| (Tab(n), KeyCode::Char(char::from(b'0' + n)))).collect();
+        let (arrows, digits) = (!every || self.bound_as(&sides), !every || self.bound_as(&tabs));
+        // Each section, with the commands it lists.
         let mut sections: Vec<(Section, Vec<Command>)> = vec![((root.clone(), Vec::new()), Vec::new())];
         for (keys, cmd) in &self.leader {
             let title = match keys.len() {
@@ -929,20 +961,20 @@ impl Keymap {
                 },
             };
             let row = match cmd {
-                Command::Action(Tab(n)) if *n > 1 && keys.len() == 1 => None,
-                Command::Action(FocusDown | FocusRight | FocusUp) if keys.len() == 1 => None,
-                Command::Action(FocusLeft) if keys.len() == 1 => Some((
-                    format!("{p} {}", if ascii { "arrows" } else { "←↓↑→" }),
-                    "Focus the pane on that side".to_string(),
-                )),
-                Command::Action(Tab(_)) if keys.len() == 1 => Some((format!("{p} 1…9"), "Go to tab 1-9".to_string())),
+                Command::Action(Tab(n)) if digits && keys.len() == 1 => {
+                    (*n == 1).then(|| (format!("{p} 1…9"), "Go to tab 1-9".to_string()))
+                }
+                Command::Action(side @ (FocusLeft | FocusDown | FocusUp | FocusRight)) if arrows && keys.len() == 1 => {
+                    let keys = format!("{p} {}", if ascii { "arrows" } else { "←↓↑→" });
+                    (*side == FocusLeft).then(|| (keys, "Focus the pane on that side".to_string()))
+                }
                 Command::Action(a) => Some((seq(keys), a.describe())),
                 Command::Tool(t) => Some((seq(keys), format!("Tool: {t}"))),
             };
             let Some(row) = row else { continue };
             match sections.iter_mut().find(|((t, _), _)| *t == title) {
                 Some(((_, rows), seen)) => {
-                    if !seen.contains(cmd) {
+                    if every || !seen.contains(cmd) {
                         seen.push(cmd.clone());
                         rows.push(row);
                     }
@@ -1062,7 +1094,6 @@ fn digit_row(key: &Key) -> Option<Key> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::input::Mods;
 
     fn cfg(user: &str) -> crate::config::Config {
         crate::config::Config::from_user_toml(user).unwrap()
@@ -1155,7 +1186,7 @@ mod tests {
         assert_eq!(km.hint(Restart).as_deref(), Some("ctrl+b W r"));
         assert!(km.menu(&[key('W')]).iter().any(|e| e.label == "Restart the session"));
         // The reference covers the menus and the modes.
-        let reference = km.reference(false);
+        let reference = km.reference(false, false);
         assert!(reference.iter().any(|(t, _)| t == "Servers (ctrl+b S)"), "{reference:?}");
         assert!(reference.iter().any(|(t, _)| t == "Copy mode"));
     }
@@ -1217,6 +1248,79 @@ mod tests {
         assert_eq!(km.lookup(&[key('y')]), Lookup::Run(Command::Action(BroadcastToggle)));
         let (_, warnings) = Keymap::build(&cfg("[keys]\npreset = \"emacs\"\n").keys);
         assert_eq!(warnings.len(), 1);
+    }
+
+    #[test]
+    fn the_keys_given_to_an_action_are_listed_where_the_preset_lists_it() {
+        // The order of a preset is the order of the listings: no action has two places in it.
+        for preset in PRESETS {
+            for table in [preset.leader, preset.direct] {
+                for (row, (name, _)) in table.iter().enumerate() {
+                    assert_eq!(place(table, Action::parse(name).unwrap()), row, "{}: {name}", preset.name);
+                }
+            }
+        }
+        // Keys moved, added and taken away, and two actions the preset gives no key.
+        let user = "[keys]\npreset = \"classic\"\n\
+                    [keys.leader]\nsplit_down = [\"-\", \"_\"]\ntoggle_zoom = [\"z\", \"space\"]\nfiles = [\"e\"]\n\
+                    open_preview = []\nhints = [\"f\"]\nmessages = [\"i\"]\n\
+                    [keys.direct]\nfocus_up = [\"alt+up\", \"alt+p\"]\nnext_tab = [\"alt+.\"]\n";
+        let (km, warnings) = Keymap::build(&cfg(user).keys);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        // The keys of the first section, without the prefix.
+        let after_prefix = |km: &Keymap, every: bool| -> Vec<String> {
+            let (title, rows) = km.reference(true, every).remove(0);
+            assert_eq!(title, "After ctrl+b");
+            rows.into_iter().map(|(keys, _)| keys.strip_prefix("ctrl+b ").unwrap().to_string()).collect()
+        };
+        let every = after_prefix(&km, true);
+        assert_eq!(every[..10], ["%", "|", "-", "_", "x", "z", "space", "t", "F", "e"], "{every:?}");
+        let place_of = |key: &str| every.iter().position(|k| k == key).unwrap_or_else(|| panic!("{key}: {every:?}"));
+        assert_eq!(place_of("f"), place_of("T") + 1, "hints, after the tools: {every:?}");
+        assert_eq!(every.last().map(String::as_str), Some("i"), "what the preset does not bind comes last");
+        // The help shows an action once, there too.
+        let help = after_prefix(&km, false);
+        assert_eq!(help[..8], ["%", "-", "x", "z", "t", "F", "e", "arrows"], "{help:?}");
+        // The menu, which has a line per action, lists them in that order as well.
+        let menu: Vec<String> = km.menu(&[]).into_iter().map(|e| e.key.to_string()).collect();
+        assert_eq!(menu[..7], ["%", "-", "x", "z", "t", "F", "e"], "{menu:?}");
+        let direct: Vec<String> = km.direct.iter().map(|(k, _)| k.to_string()).collect();
+        assert_eq!(direct[..8], ["alt+h", "alt+left", "alt+l", "alt+right", "alt+up", "alt+p", "alt+j", "alt+down"]);
+        assert_eq!(direct.last().map(String::as_str), Some("alt+."));
+
+        // A key two actions ask for still goes to the preset's, wherever the other is listed.
+        let (km, warnings) =
+            Keymap::build(&cfg("[keys]\npreset = \"classic\"\n[keys.leader]\nsplit_right = [\"x\"]\n").keys);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert_eq!(km.lookup(&[key('x')]), Lookup::Run(Command::Action(ClosePane)));
+    }
+
+    #[test]
+    fn every_key_is_listed_and_a_range_only_where_it_is_one() {
+        let rows = |km: &Keymap, every: bool| -> Vec<(String, String)> {
+            km.reference(true, every).into_iter().flat_map(|(_, rows)| rows).collect()
+        };
+        let has = |rows: &[(String, String)], keys: &str, what: &str| rows.iter().any(|(k, w)| k == keys && w == what);
+        // The default keys: the arrows and the digits are ranges, and a second key has its row.
+        let (km, _) = Keymap::build(&cfg("").keys);
+        let (help, every) = (rows(&km, false), rows(&km, true));
+        for listing in [&help, &every] {
+            assert!(has(listing, "ctrl+b arrows", "Focus the pane on that side"), "{listing:?}");
+            assert!(has(listing, "ctrl+b 1…9", "Go to tab 1-9"), "{listing:?}");
+            assert!(has(listing, "ctrl+b g", "Search the output"), "{listing:?}");
+        }
+        assert!(has(&every, "ctrl+b /", "Search the output") && !has(&help, "ctrl+b /", "Search the output"));
+        assert!(has(&every, "ctrl+b T enter", "New tab") && !has(&help, "ctrl+b T enter", "New tab"));
+        // Other keys for a side or a tab: each has its row among every key.
+        let (km, _) = Keymap::build(&cfg("[keys.leader]\nfocus_left = [\"left\", \"H\"]\ntab_3 = [\"#\"]\n").keys);
+        let every = rows(&km, true);
+        for (keys, what) in [("left", "Focus left"), ("H", "Focus left"), ("down", "Focus down")] {
+            assert!(has(&every, &format!("ctrl+b {keys}"), what), "{keys}: {every:?}");
+        }
+        for (keys, what) in [("1", "Go to tab 1"), ("#", "Go to tab 3"), ("9", "Go to tab 9")] {
+            assert!(has(&every, &format!("ctrl+b {keys}"), what), "{keys}: {every:?}");
+        }
+        assert!(!every.iter().any(|(k, _)| k == "ctrl+b arrows" || k == "ctrl+b 1…9"), "{every:?}");
     }
 
     #[test]
@@ -1303,7 +1407,7 @@ mod tests {
         let sides: Vec<String> = km.menu(&[key('P'), key('s')]).into_iter().map(|e| e.label).collect();
         assert_eq!(sides, ["The pane on the left", "The pane below", "The pane above", "The pane on the right"]);
         assert_eq!(km.hint(StackUp).as_deref(), Some("ctrl+b P s up"));
-        let reference = km.reference(false);
+        let reference = km.reference(false, false);
         let (_, rows) = reference.iter().find(|(t, _)| t == "Panes (ctrl+b P)").unwrap();
         assert!(rows.iter().any(|(k, w)| k == "ctrl+b P s ←" && w == "Stack with the pane on the left"), "{rows:?}");
         assert!(rows.iter().any(|(k, w)| k == "ctrl+b P l" && w.starts_with("Next layout")), "{rows:?}");

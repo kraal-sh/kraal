@@ -12,6 +12,7 @@ they act on the session `main`, or the one `-s` or `$KRAAL_SESSION_NAME` names.
 | Command | |
 |---|---|
 | `kraal run --right --name tests -- cargo test` | runs a command in a new pane and prints the pane's id |
+| `kraal agent claude --tab` | starts an agent in a new pane and prints the pane's id ([Accounts](agents.md#accounts)) |
 | `kraal send -p tests --enter "cargo test"` | types into a pane (`--enter` presses Enter after it) |
 | `kraal keys -p tests ctrl+c` | presses keys: `enter`, `up`, `ctrl+c`… |
 | `kraal read -p tests --lines 50` | prints a pane's screen, or with `--lines` its last lines, scrollback included |

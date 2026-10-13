@@ -251,8 +251,16 @@ fn resolve_targets(known: &[servers::Known], targets: &[String]) -> Result<Vec<s
     Ok(out)
 }
 
-/// `kraal config keys`: every key, grouped as the help shows them, then the names that
-/// `[keys.leader]` and `[keys.direct]` take, with what each does and its keys now.
+/// Print the id of the pane a command opened, alone on its line: what a script keeps to drive
+/// that pane (`kraal wait -p`, `kraal read -p`).
+fn print_opened(answer: &Response) {
+    if let Response::Pane(pane) = answer {
+        println!("{}", pane.id);
+    }
+}
+
+/// `kraal config keys`: every key, grouped and ordered as the help shows them, then the names
+/// that `[keys.leader]` and `[keys.direct]` take, with what each does and its keys now.
 fn print_keys(keymap: &crate::keymap::Keymap, markdown: bool) {
     use crate::keymap::{Action, Command};
     let cell = |s: &str| s.replace('|', "\\|");
@@ -272,7 +280,7 @@ fn print_keys(keymap: &crate::keymap::Keymap, markdown: bool) {
     let title = format!("kraal keys: preset {}, prefix {}", keymap.preset, keymap.prefix_label());
     if markdown {
         println!("# {title}\n");
-        for (section, rows) in keymap.reference(false) {
+        for (section, rows) in keymap.reference(false, true) {
             println!("## {section}\n\n| Keys | What it does |\n|---|---|");
             for (k, what) in rows {
                 println!("| `{}` | {} |", cell(&k), cell(&what));
@@ -286,7 +294,7 @@ fn print_keys(keymap: &crate::keymap::Keymap, markdown: bool) {
         return;
     }
     println!("{title}\n");
-    for (section, rows) in keymap.reference(false) {
+    for (section, rows) in keymap.reference(false, true) {
         println!("{section}");
         let w = rows.iter().map(|(k, _)| crate::text::columns(k)).max().unwrap_or(0).min(28);
         for (k, what) in rows {
@@ -334,11 +342,19 @@ fn config_cmd(action: &str, markdown: bool) -> Result<()> {
             }
             // Warnings are advice; a file kraal cannot read at all is an error.
             let mut errors = 0;
+            let commands = <Cli as clap::CommandFactory>::command();
             for (path, def) in cfg.workspace_dirs().iter().flat_map(|d| workspace::load_dir(d)) {
                 match def {
                     Ok(d) => {
                         for w in d.warnings {
                             eprintln!("{}: {w}", path.display());
+                        }
+                        // `kraal <name>` opens a workspace, unless the name is a command.
+                        if commands.find_subcommand(&d.name).is_some() {
+                            let (path, name) = (path.display(), &d.name);
+                            eprintln!(
+                                "{path}: `kraal {name}` is a command of kraal: open this workspace with `kraal attach {name}`"
+                            );
                         }
                     }
                     Err(e) => {
