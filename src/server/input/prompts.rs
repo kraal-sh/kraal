@@ -258,13 +258,26 @@ impl Server {
                         q.yes = !q.yes;
                         return Mode::Confirm(q);
                     }
-                    // A long question scrolls.
-                    KeyCode::Up | KeyCode::PageUp => {
-                        q.scroll = q.scroll.saturating_sub(if k.code == KeyCode::Up { 1 } else { 10 });
+                    // A long question scrolls, with the keys that scroll the help: by a row, or by
+                    // as many as the box shows, so that paging through it skips none.
+                    KeyCode::Up | KeyCode::Char('k') if plain => {
+                        q.scroll = q.scroll.saturating_sub(1);
                         return Mode::Confirm(q);
                     }
-                    KeyCode::Down | KeyCode::PageDown => {
-                        q.scroll = (q.scroll + if k.code == KeyCode::Down { 1 } else { 10 }).min(layout.max_scroll);
+                    KeyCode::Down | KeyCode::Char('j') if plain => {
+                        q.scroll = (q.scroll + 1).min(layout.max_scroll);
+                        return Mode::Confirm(q);
+                    }
+                    KeyCode::PageUp if plain => {
+                        q.scroll = q.scroll.saturating_sub(layout.page());
+                        return Mode::Confirm(q);
+                    }
+                    KeyCode::PageDown | KeyCode::Char(' ') if plain => {
+                        q.scroll = (q.scroll + layout.page()).min(layout.max_scroll);
+                        return Mode::Confirm(q);
+                    }
+                    KeyCode::Home | KeyCode::Char('g') if plain => {
+                        q.scroll = 0;
                         return Mode::Confirm(q);
                     }
                     KeyCode::Enter if plain => q.yes,

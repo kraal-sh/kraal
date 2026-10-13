@@ -123,8 +123,11 @@ In lists, type to filter, `↑↓` move, Enter chooses, **Tab shows what else ca
 selected item (connect in a new tab, browse its files, run a command…), each also on a key of its
 own that the list shows, Esc closes. Text fields edit like a shell line (arrows, `home`/`end`,
 `alt+←→`, `ctrl+w`, `ctrl+u`, `ctrl+k`). Questions show two buttons, Cancel first: `y` answers
-yes, `n` or Esc no, Enter takes the selected button (`←→` or Tab change it), and `↑↓` scroll a
-long question.
+yes, `n` or Esc no, Enter takes the selected button (`←→` or Tab change it). A question longer
+than its box says how many lines are below and scrolls: `↑↓` (or `j` `k`) by a line, `pageup`
+`pagedown` (or `space`) by what the box shows, `home` (or `g`) back to the top. What a question
+quotes, like the commands a runbook would run, keeps its spacing; a line too long for the box
+goes on in the rows below it, each marked `↪` in the margin.
 `ctrl+b V j` lists the messages kraal showed, warnings included.
 
 ## Your own keys

@@ -125,6 +125,36 @@ pub fn wrap(text: &str, width: usize) -> Vec<String> {
     lines
 }
 
+/// Entry `number` of a list of commands shown to be approved: every line of `code` as it is
+/// written, the first after the number and the others under it.
+pub fn numbered(number: usize, code: &str) -> Vec<String> {
+    let label = format!("  {number}. ");
+    let under = " ".repeat(label.len());
+    code.lines().enumerate().map(|(i, line)| format!("{}{line}", if i == 0 { &label } else { &under })).collect()
+}
+
+/// Cuts `line` into rows of `width` columns as it is written: unlike [`wrap`], every space is
+/// kept and a row ends where the room does. The rows after the first start under the line's
+/// indentation (at most half the width), so that they read as the rest of it.
+pub fn fold(line: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    let indent = line.chars().take_while(|c| *c == ' ').count().min(width / 2);
+    let mut rows = vec![String::new()];
+    let (mut used, mut start) = (0, 0);
+    for c in line.chars() {
+        let w = c.width().unwrap_or(0);
+        if used + w > width && used > start {
+            rows.push(" ".repeat(indent));
+            (used, start) = (indent, indent);
+        }
+        if let Some(row) = rows.last_mut() {
+            row.push(c);
+        }
+        used += w;
+    }
+    rows
+}
+
 /// 64-bit FNV-1a of `text`: stable across runs and versions (unlike std's hasher), to tell
 /// names apart in file names. Not a defence against someone crafting collisions.
 pub fn fnv64(text: &str) -> u64 {
@@ -198,5 +228,22 @@ mod tests {
         let wide = "漢字".repeat(10);
         assert_eq!(first_line(&wide, 7), "漢字漢…");
         assert_eq!(first_line(&format!("{wide}\nmore"), 7), "漢字漢… …");
+    }
+
+    #[test]
+    fn a_numbered_command_keeps_its_lines_under_its_number() {
+        assert_eq!(numbered(3, "make"), ["  3. make"]);
+        assert_eq!(numbered(10, "if x; then\n  y\n\nfi"), ["  10. if x; then", "        y", "      ", "      fi"]);
+    }
+
+    #[test]
+    fn a_folded_line_keeps_every_character_and_its_indentation() {
+        assert_eq!(fold("  if  x;  then", 20), ["  if  x;  then"]);
+        assert_eq!(fold("    echo one  two", 10), ["    echo o", "    ne  tw", "    o"]);
+        assert_eq!(fold("  ", 10), ["  "], "a blank line of code is a row");
+        // Wide characters are not split, and a deep indentation leaves room for the text.
+        assert_eq!(fold(" 漢字漢字", 5), [" 漢字", " 漢字"]);
+        assert_eq!(fold("      ab", 4), ["    ", "    ", "  ab"]);
+        assert_eq!(fold("abc", 0), ["a", "b", "c"]);
     }
 }

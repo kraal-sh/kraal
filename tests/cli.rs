@@ -3008,6 +3008,114 @@ fn the_runbook_list_asks_before_a_repository_runbook_does_anything() {
     env.wait_for_text("shell", "from-notes");
 }
 
+/// A step as a question quotes it to be approved: under its number, each line as it is written.
+fn numbered(number: usize, step: &str) -> Vec<String> {
+    let label = format!("  {number}. ");
+    let under = " ".repeat(label.len());
+    step.lines().enumerate().map(|(i, line)| format!("{}{line}", if i == 0 { &label } else { &under })).collect()
+}
+
+/// Lines as [`RawClient::read_question`] gives them: a terminal's row does not tell the spaces
+/// that end a line from the room after it.
+fn without_trailing_spaces(lines: Vec<String>) -> Vec<String> {
+    lines.iter().map(|line| line.trim_end().to_string()).collect()
+}
+
+/// The question that asks to trust a repository's runbook shows all that a yes lets run,
+/// whatever its length and the terminal's size: every line of every step with its spacing, a
+/// long line whole, what a terminal would hide written out, the shell, and the commands that
+/// list choices. Reading it runs and approves nothing, and Enter cancels. A document's shows the
+/// step in full, then its other steps.
+#[test]
+fn all_that_a_repository_runbook_runs_can_be_read_before_it_is_trusted() {
+    let env = Env::new("rbread");
+    let repo = env.root.join("app");
+    let (ran, listed) = (env.root.join("ran"), env.root.join("listed"));
+    let steps: Vec<String> = (1..=40)
+        .map(|i| match i {
+            7 => "echo safe \u{1b}[2K\u{200b}".to_string(),
+            40 => format!("echo {} > {}", "0123456789".repeat(20), ran.display()),
+            _ => format!("if test -n \"$V\"; then\n    echo  step {i}\n\nfi"),
+        })
+        .collect();
+    let choices = format!("touch {}\n  echo first", listed.display());
+    let quoted: Vec<String> = steps.iter().map(|step| serde_json::json!(step).to_string()).collect();
+    let deploy = format!(
+        "shell = \"bash\"\nsteps = [{}]\n[[param]]\nname = \"V\"\nchoices_command = {}\n",
+        quoted.join(", "),
+        serde_json::json!(choices)
+    );
+    let build = "for f in a b; do\n    echo  from-\"notes\" \"$f\"\n\ndone\n".to_string() + &"echo more\n".repeat(8);
+    let notes = format!(
+        "# Notes\n\n## Build\n\n```sh\n{build}```\n\n## Deploy\n\n```sh\necho one\n  echo two\n```\n\n\
+         ## Check\n\n```console\n$ echo three\nthree\n```\n"
+    );
+    let _ = git_repo(&repo, &[(".kraal/runbooks/deploy.toml", &deploy), (".kraal/runbooks/notes.md", &notes)]);
+    env.workspace("w", &format!("layout {{\n    pane name=\"shell\" cwd={:?}\n}}\n", repo.display().to_string()));
+    env.run(&["open", "w"]);
+    let store = env.root.join("state/kraal/trusted-runbooks.json");
+    let pick = |client: &mut RawClient, name: &str| {
+        env.run(&["focus", "shell"]);
+        client.send(b"\x02Rb");
+        client.wait_for_row("Runbooks");
+        client.send(name.as_bytes());
+        client.wait_for_row("repository app");
+        client.send(b"\r");
+    };
+    let gone = |client: &RawClient, text: &str| {
+        client.wait_for_rows(&format!("without {text:?}"), |rows| !rows.iter().any(|r| r.contains(text)));
+    };
+    // A step as the question quotes it: under its number, each line where it is in the file.
+    let mut expected: Vec<String> = Vec::new();
+    for (i, step) in steps.iter().enumerate() {
+        expected.extend(numbered(i + 1, &step.replace('\u{1b}', "\\u{1b}").replace('\u{200b}', "\\u{200b}")));
+    }
+    expected.push("To list the choices of V, it runs:".to_string());
+    expected.extend(choices.lines().map(|line| format!("     {line}")));
+    let expected = without_trailing_spaces(expected);
+    // The sidebar is there from 84 columns on; a page key moves by the rows the box has.
+    for (size, key) in [((124, 36), &b"\x1b[6~"[..]), ((80, 24), b" "), ((60, 12), b"\x1b[6~")] {
+        let mut client = RawClient::attach_sized(&env, Some("w"), size);
+        if size.0 == 124 {
+            // The list has the repository's runbooks once git has seen it.
+            client.wait_for_screen("⎇ main");
+        }
+        pick(&mut client, "deploy");
+        client.wait_for_row("Trust the runbook deploy");
+        let lines = client.read_question(key);
+        let first = lines.iter().position(|line| line.starts_with("  1. ")).unwrap();
+        assert_eq!(lines[first..], expected[..], "at {size:?}");
+        let said = lines[..first].join(" ");
+        assert!(said.contains("It runs these steps with bash:"), "at {size:?}: {said}");
+        assert!(!listed.exists() && !ran.exists() && !store.exists(), "reading it ran or approved something");
+        // Cancel is the button selected.
+        client.send(b"\r");
+        gone(&client, "Trust the runbook deploy");
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(!listed.exists() && !store.exists(), "Enter approved it");
+    }
+
+    // A document: the step that would be typed, whole, then the others a yes approves with it.
+    let mut client = RawClient::attach_sized(&env, Some("w"), (80, 24));
+    pick(&mut client, "notes");
+    client.wait_for_row("1. Build");
+    client.send(b"\r");
+    client.wait_for_row("Run step 1 in");
+    let lines = client.read_question(b"j");
+    let mut expected: Vec<String> = build.lines().map(|line| format!("  {line}")).collect();
+    expected.push("Its other steps:".to_string());
+    expected.extend(numbered(2, "echo one\n  echo two"));
+    expected.extend(numbered(3, "echo three"));
+    let first = lines.iter().position(|line| line.starts_with("  for f in")).unwrap();
+    assert_eq!(lines[first..], without_trailing_spaces(expected)[..]);
+    let said = lines[..first].join(" ");
+    assert!(said.contains("A yes approves it as it is now, with all its steps."), "{said}");
+    client.send(b"\r");
+    gone(&client, "Run step 1 in");
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(!env.run(&["read", "-p", "shell"]).contains("from-notes") && !store.exists());
+}
+
 /// A timed-out target is stopped to its last process, by its process group: a command started
 /// again in its pane meanwhile is not touched, and closing its pane does not let what it left
 /// behind escape.
@@ -4594,6 +4702,66 @@ fn an_agent_worktree_is_prepared_in_its_pane_once_trusted() {
     assert_eq!(std::fs::read_to_string(dir.join("copied/.env")).unwrap(), "A=1\n");
 }
 
+/// The question that asks to trust a repository's worktree setup shows all of it, however long:
+/// what it copies, and every line of each command with its spacing. Reading it makes nothing,
+/// and Enter cancels.
+#[cfg(target_os = "linux")]
+#[test]
+fn all_of_a_worktree_setup_can_be_read_before_it_is_trusted() {
+    let env = Env::new("wtread");
+    let repo = env.root.join("app");
+    let commands: Vec<String> =
+        (1..=12).map(|i| format!("if test -d src; then\n    echo  prepare {i}\n\nfi")).collect();
+    let quoted: Vec<String> = commands.iter().map(|command| serde_json::json!(command).to_string()).collect();
+    let setup = format!("copy = [\".env\", \"config/*.local\"]\nsetup = [{}]\n", quoted.join(", "));
+    let _ = git_repo(&repo, &[(".kraal/worktree.toml", &setup)]);
+    let bin = env.root.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    write_script(&bin.join("claude"), "#!/bin/sh\nexec sleep 100\n");
+    let home = env.root.join("alpha-home");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::write(
+        env.root.join("config/kraal/accounts.toml"),
+        format!(
+            "[[account]]\nname = \"alpha\"\nagent = \"claude\"\nhome = {:?}\n\n[[rule]]\nworkspace = \"w\"\naccounts = [\"alpha\"]\n",
+            home.display().to_string()
+        ),
+    )
+    .unwrap();
+    env.workspace("w", &format!("layout {{\n    pane name=\"shell\" cwd={:?}\n}}\n", repo.display().to_string()));
+    let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap_or_default());
+    let out = env.cmd(&["open", "w"]).env("PATH", &path).output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let commands = commands.iter().enumerate().flat_map(|(i, command)| numbered(i + 1, command));
+    let expected = without_trailing_spaces(commands.collect());
+
+    for (size, key) in [((124, 36), &b"\x1b[6~"[..]), ((80, 24), b"\x1b[B")] {
+        let mut client = RawClient::attach_sized(&env, Some("w"), size);
+        if size.0 == 124 {
+            // The agent picker offers worktrees once git has seen the repository.
+            client.wait_for_screen("⎇ main");
+        }
+        env.run(&["focus", "shell"]);
+        client.send(b"\x02a");
+        client.wait_for_screen("in a new worktree");
+        client.send(b"claude in a new worktree");
+        std::thread::sleep(Duration::from_millis(200));
+        client.send(b"\r");
+        client.wait_for_screen("Name of the worktree");
+        client.send(b"feat\r");
+        client.wait_for_row("Trust the worktree setup");
+        let lines = client.read_question(key);
+        let runs = lines.iter().position(|line| line == "it runs there:").unwrap();
+        assert_eq!(lines[runs - 1], "it copies from the main checkout: .env, config/*.local", "at {size:?}");
+        assert_eq!(lines[runs + 1..], expected[..], "at {size:?}");
+        // Cancel is the button selected.
+        client.send(b"\r");
+        client.wait_for_row("the worktree feat was not created");
+        assert!(!env.root.join("app.worktrees").exists(), "reading the question made something");
+        assert!(!env.root.join("state/kraal/trusted-runbooks.json").exists(), "Enter approved it");
+    }
+}
+
 #[test]
 fn closing_or_adding_tabs_keeps_the_one_shown() {
     let env = Env::new("tabs");
@@ -5076,6 +5244,58 @@ impl RawClient {
             assert!(start.elapsed() < Duration::from_secs(10), "never {what}:\n{}", rows.join("\n"));
             std::thread::sleep(Duration::from_millis(50));
         }
+    }
+
+    /// The message of the question its terminal shows, read as someone would: from the top to
+    /// the end, pressing `key` while the box says there is more below. Each line is as written,
+    /// a line the box cut over several rows (marked in its margin) put back together.
+    fn read_question(&mut self, key: &[u8]) -> Vec<String> {
+        // The rows still below, when the message is longer than the box.
+        let below = |rows: &[String]| {
+            let said = rows.iter().find(|r| r.contains("more line") || r.contains("↑ top"))?;
+            let count = said.split("↓ ").nth(1).and_then(|rest| rest.split(' ').next());
+            Some(count.map_or(0, |n| n.parse::<usize>().unwrap()))
+        };
+        let mut rows: Vec<(bool, Vec<char>)> = Vec::new();
+        let mut before = None;
+        let mut first = None;
+        loop {
+            // The footer is drawn last: the box above it is whole.
+            let screen = self.wait_for_rows("the question, further down", |rows| {
+                rows.iter().any(|r| r.contains("y yes")) && Some(below(rows)) != before
+            });
+            let left_to_read = below(&screen);
+            let top = screen.iter().position(|r| r.contains(" Confirm ") || r.contains(" Careful ")).unwrap();
+            let buttons = screen.iter().position(|r| r.contains(" Cancel ")).unwrap();
+            // The Cancel button is two columns inside the box, after the margin.
+            let left = screen[buttons].split("Cancel").next().unwrap().chars().count() - 3;
+            let border = screen[buttons].chars().nth(left).unwrap();
+            let right = left + 1 + screen[buttons].chars().skip(left + 1).position(|c| c == border).unwrap();
+            // Above the buttons: an empty row and, when there is more to read, the row saying so.
+            let body = &screen[top + 1..buttons - 1 - usize::from(left_to_read.is_some())];
+            let at = *first.get_or_insert(left_to_read.unwrap_or(0)) - left_to_read.unwrap_or(0);
+            rows.truncate(at);
+            for row in body {
+                let cells: Vec<char> = row.chars().collect();
+                rows.push((cells[left + 1] == '↪', cells[left + 2..right - 1].to_vec()));
+            }
+            if left_to_read.unwrap_or(0) == 0 {
+                break;
+            }
+            before = Some(left_to_read);
+            self.send(key);
+        }
+        let mut lines: Vec<Vec<char>> = Vec::new();
+        for (continued, text) in rows {
+            match lines.last_mut().filter(|_| continued) {
+                Some(line) => {
+                    let indent = line.iter().take_while(|c| **c == ' ').count().min(text.len() / 2);
+                    line.extend(&text[indent..]);
+                }
+                None => lines.push(text),
+            }
+        }
+        lines.iter().map(|line| line.iter().collect::<String>().trim_end().to_string()).collect()
     }
 
     /// Wait until nothing more is drawn for a while; how much was drawn.
@@ -6657,7 +6877,8 @@ fn the_menu_quits_after_asking_and_keeps_the_layout() {
     client.send(b"\x02q");
     client.wait_for_row("Quit kraal? These programs stop:");
     let rows = client.wait_for_row("The layout is saved for next time.");
-    let listed = rows.iter().any(|r| r.contains("sleep 4249 (pane ") && r.contains("\"job\" in w)"));
+    // The line as `kraal restart` prints it, spacing included.
+    let listed = rows.iter().any(|r| r.contains("  sleep 4249  (pane ") && r.contains("\"job\" in w)"));
     assert!(listed, "{}", rows.join("\n"));
     client.send(b"y");
     let said = "stopped; kraal -s menuquit starts it again with its layout";

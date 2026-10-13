@@ -20,6 +20,7 @@ use crate::paths;
 use crate::protocol::Placement;
 use crate::runbooks::{self, Block, Body, On, Param, Runbook, Source, Steps};
 use crate::servers;
+use crate::text::numbered;
 
 /// Where one copy of a runbook runs.
 #[expect(
@@ -74,6 +75,32 @@ impl Draft {
     fn listed(&self) -> Vec<(Param, String, String)> {
         let params = self.steps.params.iter().zip(&self.values).filter(|(p, _)| p.choices.is_empty());
         params.filter_map(|(p, (_, value))| Some((p.clone(), p.choices_command.clone()?, value.clone()))).collect()
+    }
+
+    /// The question asked before anything of a repository's runbook runs. It quotes all that a
+    /// yes lets run, in full and as the command line would print it ([`Source::shown`]): every
+    /// line of every step, the shell they run in, and the commands that list choices.
+    fn trust_question(&self) -> String {
+        let shown = |text: &str| self.runbook.source.shown(text);
+        let root = match &self.runbook.source {
+            Source::Repo(root) => shown(&paths::shorten_home(root)),
+            Source::User => String::new(),
+        };
+        let mut lines = vec![
+            format!("Trust the runbook {} from the repository {root}?", shown(&self.runbook.name)),
+            format!("It is new, or changed since you approved it. It runs these steps with {}:", self.steps.shell),
+        ];
+        let steps = self.steps.steps.iter().filter(|step| !step.trim().is_empty());
+        for (i, step) in steps.enumerate() {
+            lines.extend(numbered(i + 1, &shown(step.trim_end())));
+        }
+        for p in &self.steps.params {
+            if let Some(command) = &p.choices_command {
+                lines.push(format!("To list the choices of {}, it runs:", p.name));
+                lines.extend(shown(command.trim_end()).lines().map(|line| format!("     {line}")));
+            }
+        }
+        lines.join("\n")
     }
 
     /// `NAME=value` lines, secrets masked.
@@ -160,6 +187,13 @@ pub struct MdSession {
     approved: Option<crate::server::contexts::Production>,
     /// The user agreed to type steps into a pane on a server.
     remote_ok: bool,
+}
+
+impl MdSession {
+    /// Whether its runbook is a repository's that is not approved as it is now.
+    fn unapproved(&self) -> bool {
+        !runbooks::trusted(&self.runbook)
+    }
 }
 
 /// How long a reviewed plan can be run.

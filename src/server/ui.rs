@@ -36,12 +36,15 @@ pub enum Mode {
 
 /// A question with two buttons.
 pub struct Question {
+    /// The question on its first line, then what there is to know before answering. A line
+    /// that starts with a space quotes what the question is about (a command, a list entry):
+    /// the box shows it with its spacing, all of it.
     pub message: String,
     pub action: ConfirmAction,
     /// The confirming button is selected (Enter confirms); Cancel is, at first.
     pub yes: bool,
-    /// First line of the message shown, when it is too long for the box.
-    pub scroll: u16,
+    /// First row of the message shown, when it is too long for the box.
+    pub scroll: usize,
 }
 
 /// Hints in progress.
