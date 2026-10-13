@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use super::contexts::Production;
 use super::ui::{ConfirmAction, Mode, PickAction, PickItem, Picker, PickerKind};
-use super::{ClientId, Server};
+use super::{ClientId, Dirty, Server};
 use crate::edit::{self, Channel, RemoteFile, Saved, Stamp};
 use crate::layout::PaneId;
 use crate::pane::PaneSpec;
@@ -546,7 +546,7 @@ impl Server {
         self.edits[i].asked = true;
         if let Some(c) = self.clients.get_mut(&client) {
             c.mode = Mode::Picker(picker);
-            c.dirty = true;
+            c.dirty = Dirty::Yes;
         }
         self.mark_dirty_client(client);
         true

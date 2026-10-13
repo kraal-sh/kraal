@@ -127,6 +127,17 @@ impl Env {
     fn state_file(&self) -> PathBuf {
         self.root.join("state/kraal/sessions").join(format!("{}.json", self.session))
     }
+
+    /// Start the session by opening workspace `name`, with a server that notes how it composes
+    /// each frame (this build does, where `KRAAL_TEST_FRAMES` says): what reads the notes so far,
+    /// a frame each, `<client> output` for one made from what one pane printed alone and
+    /// `<client> whole` for any other.
+    fn open_noting_frames(&self, name: &str) -> impl Fn() -> Vec<String> {
+        let notes = self.root.join("frames");
+        let out = self.cmd(&["open", name]).env("KRAAL_TEST_FRAMES", &notes).output().unwrap();
+        assert!(out.status.success(), "kraal open {name}: {}", String::from_utf8_lossy(&out.stderr));
+        move || std::fs::read_to_string(&notes).unwrap_or_default().lines().map(String::from).collect()
+    }
 }
 
 /// A client attached through the session's socket, as kraal's own client is: it sends what a
@@ -5205,11 +5216,17 @@ fn git_in_frames_follows_changes_made_elsewhere() {
     assert!(start.elapsed() < Duration::from_secs(2), "a commit showed after {:?}", start.elapsed());
 }
 
-/// An idle server sleeps: no thread of it wakes up again and again while nothing happens.
+/// An idle server sleeps: no thread of it wakes up again and again while nothing happens, not
+/// even to wait for the reset of a usage window.
 #[cfg(target_os = "linux")]
 #[test]
 fn an_idle_server_sleeps() {
     let env = Env::new("sleeps");
+    std::fs::write(
+        env.root.join("config/kraal/accounts.toml"),
+        "[[account]]\nid = 'work'\nname = 'work'\nagent = 'claude'\nhome = '~/work'\n",
+    )
+    .unwrap();
     // In a directory where nothing happens (the home directory may be busy: its changes are
     // looked at).
     let quiet = env.root.join("quiet");
@@ -5221,10 +5238,23 @@ fn an_idle_server_sleeps() {
             quiet.display().to_string()
         ),
     );
+    // An account's usage window that resets in an hour: the server wakes for it then, once.
+    let usage = env.root.join("state/kraal/usage/by-id");
+    std::fs::create_dir_all(&usage).unwrap();
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+    let seen = serde_json::json!({
+        "five_hour": { "used_percent": 60, "resets_at": now + 3600 },
+        "observed_at": now,
+        "source": "statusline",
+    });
+    std::fs::write(usage.join("claude-work.json"), seen.to_string()).unwrap();
     env.run(&["open", "w"]);
     let client = RawClient::attach(&env, "w");
     env.wait_for_text("a", "$");
     env.wait_for_text("b", "$");
+    client.wait_for_rows("the account's usage", |rows| {
+        rows.windows(2).any(|r| r[0].contains("Claude · work") && r[1].contains("60% used · 0 panes"))
+    });
     let pid = env.server_pid().expect("the server's pid");
     // The times each of its threads went to sleep (not those another program took the processor
     // from them while they ran: that depends on the machine's load).
@@ -6169,10 +6199,10 @@ fn text_after(bytes: &[u8], cols: usize, rows: usize) -> Vec<String> {
 }
 
 /// What a terminal of `cols × rows` shows after `bytes`: each row's cells (text, colours,
-/// attributes, link) and the cursor.
+/// attributes, link), the cursor (its place, its shape, whether it blinks) and the modes the
+/// terminal is in (the cursor shown, what it reports of the mouse and of the keys...).
 fn terminal_after(bytes: &[u8], cols: usize, rows: usize) -> Vec<String> {
     use alacritty_terminal::index::{Column, Line};
-    use alacritty_terminal::term::TermMode;
     let term = emulate(bytes, cols, rows);
     let grid = term.grid();
     let mut out: Vec<String> = (0..rows)
@@ -6191,12 +6221,8 @@ fn terminal_after(bytes: &[u8], cols: usize, rows: usize) -> Vec<String> {
         })
         .collect();
     let cursor = grid.cursor.point;
-    out.push(format!(
-        "cursor {} {} shown {}",
-        cursor.line.0,
-        cursor.column.0,
-        term.mode().contains(TermMode::SHOW_CURSOR)
-    ));
+    out.push(format!("cursor {} {} {:?}", cursor.line.0, cursor.column.0, term.cursor_style()));
+    out.push(format!("modes {:?}", term.mode()));
     out
 }
 
@@ -6318,23 +6344,30 @@ fn frames_drawn_over_the_last_one_end_as_a_whole_frame() {
     let env = Env::new("incremental");
     std::fs::create_dir_all(env.root.join("state/kraal")).unwrap();
     std::fs::write(env.root.join("state/kraal/welcomed"), "").unwrap();
-    env.workspace("w", "layout {\n    pane name=\"main\"\n}\n");
-    env.workspace("w2", "layout {\n    pane name=\"other\"\n}\n");
-    env.workspace("w3", "layout {\n    pane name=\"third\"\n}\n");
-    env.run(&["open", "w"]);
+    // In a directory that is no repository: what git says of one comes when git has answered,
+    // which would change the frames by itself between two looks at them.
+    let here = env.root.display().to_string();
+    for (workspace, pane) in [("w", "main"), ("w2", "other"), ("w3", "third")] {
+        env.workspace(workspace, &format!("layout {{\n    cwd {here:?}\n    pane name={pane:?}\n}}\n"));
+    }
+    let run = |name: &str, place: &str, script: &str| {
+        env.run(&["run", "--name", name, place, "--cwd", &here, "--", "sh", "-c", script]);
+    };
+    let frames = env.open_noting_frames("w");
     let colors = "printf '\\033[1;31mred \\033[42;4mgreen\\033[0m \\346\\227\\245\\346\\234\\254 \
                   \\033]8;;https://example.org\\033\\\\link\\033]8;;\\033\\\\ e\\314\\201 done\\n'; exec cat";
-    env.run(&["run", "--name", "colors", "--right", "--", "sh", "-c", colors]);
-    env.run(&["run", "--name", "lines", "--down", "--", "sh", "-c", "seq 1 200; exec cat"]);
+    run("colors", "--right", colors);
+    run("lines", "--down", "seq 1 200; exec cat");
     let mut client = RawClient::attach(&env, "w");
     client.wait_for_screen("done");
     let same = |client: &RawClient, step: &str| {
         client.settle();
+        // What it shows before another client attaches: that draws every client again, whole.
+        let shown = client.screen.lock().unwrap().clone();
         let fresh = RawClient::attach(&env, "w");
         fresh.settle();
-        client.settle();
-        let (a, b) = (client.screen.lock().unwrap().clone(), fresh.screen.lock().unwrap().clone());
-        let (a, b) = (terminal_after(&a, 120, 40), terminal_after(&b, 120, 40));
+        let whole = fresh.screen.lock().unwrap().clone();
+        let (a, b) = (terminal_after(&shown, 120, 40), terminal_after(&whole, 120, 40));
         for (y, (a, b)) in a.iter().zip(&b).enumerate() {
             assert_eq!(a, b, "{step}: row {y} differs");
         }
@@ -6358,37 +6391,58 @@ fn frames_drawn_over_the_last_one_end_as_a_whole_frame() {
         std::thread::sleep(Duration::from_millis(20));
     };
     assert!(echo.len() < 100, "a frame for one character sent {} bytes: {echo:?}", echo.len());
-    for b in b"yz 123" {
+    // Keys typed one after the other are echoed in frames made from what the pane printed alone
+    // (but the first after the server's periodic work, made whole).
+    let drawn = frames().len();
+    let from_output = || frames()[drawn..].iter().filter(|f| f.ends_with("output")).count();
+    let start = Instant::now();
+    for b in b"yz 123".iter().cycle() {
+        if from_output() >= 3 {
+            break;
+        }
+        assert!(start.elapsed() < PATIENCE, "{:?}", &frames()[drawn..]);
         client.send(&[*b]);
+        std::thread::sleep(Duration::from_millis(30));
     }
     same(&client, "typing");
+    // Typing while another pane prints: frames made from what one pane printed, from what both
+    // did, and one after the other.
+    for i in 0..8 {
+        client.send(b"k");
+        env.run(&["send", "-p", "lines", &format!("between {i}\r")]);
+    }
+    client.send(b"last");
+    same(&client, "typing while another pane prints");
+    // What a pane prints changes what its frame says of it (a command that failed), with
+    // nothing else happening: the keys only went to its shell.
+    env.run(&["focus", "main"]);
+    client.settle();
+    client.send(b"printf '\\033]133;A\\007$ \\033]133;B\\007x\\n\\033]133;C\\007\\033]133;D;7\\007'\r");
+    client.wait_for_row("\u{2717} 7");
+    same(&client, "a command failed");
+    env.run(&["focus", "colors"]);
     // Output scrolling one pane.
     env.run(&["send", "-p", "lines", "more\r"]);
     same(&client, "scrolling");
     // Image placeholders without an image draw as blanks.
-    env.run(&[
-        "run",
-        "--name",
-        "img",
-        "--right",
-        "--",
-        "sh",
-        "-c",
-        "printf 'img:\\364\\216\\273\\256 end\\n'; exec cat",
-    ]);
+    run("img", "--right", "printf 'img:\\364\\216\\273\\256 end\\n'; exec cat");
     same(&client, "placeholders");
     // A floating pane over the others, then gone.
-    env.run(&["run", "--name", "float", "--floating", "--", "sh", "-c", "echo FLOAT; exec cat"]);
+    run("float", "--floating", "echo FLOAT; exec cat");
     client.wait_for_screen("FLOAT");
     same(&client, "floating");
     env.run(&["close", "float"]);
     same(&client, "floating closed");
     // Another tab, and back.
-    env.run(&["run", "--name", "tab2", "--tab", "--", "sh", "-c", "echo TAB2; exec cat"]);
+    run("tab2", "--tab", "echo TAB2; exec cat");
     client.wait_for_screen("TAB2");
     same(&client, "new tab");
     env.run(&["focus", "colors"]);
     same(&client, "tab back");
+    // A pane that is not on the screen prints, then one that is.
+    env.run(&["send", "-p", "tab2", "unseen\r"]);
+    client.send(b"seen");
+    same(&client, "a pane of another tab printed");
     // Colors stacked with the pane below it: lines folded to a row, renamed there, then open.
     client.send(b"\x02Ps\x1b[B");
     same(&client, "stacked");
@@ -6406,9 +6460,72 @@ fn frames_drawn_over_the_last_one_end_as_a_whole_frame() {
     same(&client, "sidebar");
     env.run(&["open", "w3"]);
     same(&client, "sidebar changed");
+    // A pane of another workspace prints, then one of this one: the sidebar shows both.
+    env.run(&["send", "-p", "other", "elsewhere\r"]);
+    client.send(b"here");
+    same(&client, "a pane of another workspace printed");
     // A pane closed: the others take its place.
     env.run(&["close", "img"]);
     same(&client, "pane closed");
+}
+
+/// What a pane types by itself before the thing a test looks at: a character at a time, each in
+/// a frame of its own, most of them made from what the pane printed alone.
+const PRINTS_A_LITTLE: &str = "i=0; while [ $i -lt 20 ]; do printf t; sleep 0.02; i=$((i+1)); done";
+
+/// The notes of the frames of a test with one client (see [`Env::open_noting_frames`]), once
+/// the pane that printed a little did the thing looked at and nothing more: some were made from
+/// what it printed alone, and the last one, which drew that thing, whole.
+fn drawn_whole_after_output(frames: &[String]) {
+    assert!(frames.iter().any(|f| f.ends_with("output")), "{frames:?}");
+    assert!(frames.last().is_some_and(|f| f.ends_with("whole")), "{frames:?}");
+}
+
+/// A bell in a tab that is not shown marks that tab in the top bar. Nothing a frame keeps of the
+/// pane says so (its name, what it works on): only that something other than output happened,
+/// which is what makes the frame whole.
+#[test]
+fn a_bell_in_another_tab_is_drawn_by_a_whole_frame() {
+    let env = Env::new("bell");
+    // No welcome note: the top bar has room for both tabs.
+    std::fs::create_dir_all(env.root.join("state/kraal")).unwrap();
+    std::fs::write(env.root.join("state/kraal/welcomed"), "").unwrap();
+    let tabs = "tab name=\"one\" focus=true {\n        pane name=\"front\"\n    }\n    \
+                tab name=\"two\" {\n        pane name=\"back\"\n    }";
+    env.workspace("w", &format!("layout {{\n    {tabs}\n}}\n"));
+    let frames = env.open_noting_frames("w");
+    let client = RawClient::attach(&env, "w");
+    client.wait_for_row(" 2 two ");
+    // Then nothing comes after the bell: its shell is busy.
+    env.run(&["send", "-p", "back", "--enter", &format!("{PRINTS_A_LITTLE}; printf '\\a'; sleep 600")]);
+    client.wait_for_row("two  !");
+    client.settle();
+    drawn_whole_after_output(&frames());
+}
+
+/// A command that starts takes the failure of the one before off the pane's frame. Nothing is
+/// signalled then, as when a command ends: only what the frame keeps of the pane says it
+/// changed, which is what makes the frame whole. (Without a sidebar: with one, the frame is
+/// whole already for what the sidebar may say of the pane.)
+#[test]
+fn a_command_that_starts_is_drawn_by_a_whole_frame() {
+    let env = Env::new("starts");
+    let config = env.root.join("config/kraal/config.toml");
+    let text = std::fs::read_to_string(&config).unwrap();
+    std::fs::write(&config, format!("{text}[sidebar]\nvisible = false\n")).unwrap();
+    env.workspace("w", "layout {\n    pane name=\"shell\"\n}\n");
+    let frames = env.open_noting_frames("w");
+    let client = RawClient::attach(&env, "w");
+    // What a shell that marks its commands prints around them: one that failed, then one that
+    // starts and runs on.
+    let failed = "printf '\\033]133;A\\007$ \\033]133;B\\007x\\n\\033]133;C\\007\\033]133;D;7\\007'";
+    let starts = "printf '\\033]133;A\\007$ \\033]133;B\\007y\\n\\033]133;C\\007'";
+    env.run(&["send", "-p", "shell", "--enter", failed]);
+    client.wait_for_row("\u{2717} 7");
+    env.run(&["send", "-p", "shell", "--enter", &format!("{PRINTS_A_LITTLE}; {starts}; sleep 600")]);
+    client.wait_for_rows("the failure off the frame", |rows| !rows.iter().any(|r| r.contains("\u{2717} 7")));
+    client.settle();
+    drawn_whole_after_output(&frames());
 }
 
 /// The columns a pane's frame starts and ends at on the row under the top bar, where the sidebar
@@ -6565,6 +6682,82 @@ fn each_terminal_draws_the_panes_beside_its_own_sidebar() {
     // Once wide enough, it has the sidebar too.
     narrow.resize((120, 40));
     assert_eq!(side(&shows(&narrow, (29, 119), "the sidebar once there is room")), sidebar);
+}
+
+/// An account's usage window resets with the clock, whatever else happens: the sidebar shows the
+/// account without it from then on, while a pane prints (frames made from what that pane printed
+/// alone, each checked against a whole one in this build) as on a screen where nothing moves.
+#[test]
+fn the_sidebar_follows_a_usage_window_that_resets() {
+    let env = Env::new("resets");
+    std::fs::write(
+        env.root.join("config/kraal/accounts.toml"),
+        "[[account]]\nid = 'work'\nname = 'work'\nagent = 'claude'\nhome = '~/work'\n",
+    )
+    .unwrap();
+    let usage = env.root.join("state/kraal/usage/by-id");
+    std::fs::create_dir_all(&usage).unwrap();
+    env.workspace("w", "layout {\n    pane name=\"shell\"\n}\n");
+    env.run(&["open", "w"]);
+    let mut client = RawClient::attach(&env, "w");
+    client.wait_for_row("ACCOUNTS");
+    client.wait_for_row("Claude · work");
+    let now = || std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+    // The named account's usage: its five-hour window, the fuller, and its weekly one.
+    let seen = |five_hour: u64, weekly: u64| {
+        let said = serde_json::json!({
+            "five_hour": { "used_percent": 93, "resets_at": five_hour },
+            "weekly": { "used_percent": 41, "resets_at": weekly },
+            "observed_at": now(),
+            "source": "statusline",
+        });
+        std::fs::write(usage.join("new"), said.to_string()).unwrap();
+        std::fs::rename(usage.join("new"), usage.join("claude-work.json")).unwrap();
+    };
+    let shows = |rows: &[String], detail: &str| {
+        rows.windows(2).any(|r| r[0].contains("Claude · work") && r[1].contains(detail))
+    };
+    // Keys typed one after the other, each echoed in a frame of its own, until the sidebar says
+    // `figure` of the account.
+    let typing_until = |client: &mut RawClient, figure: &str| {
+        let row = format!("{figure} used · 0 panes");
+        let start = Instant::now();
+        while !shows(&client.rows(), &row) {
+            assert!(start.elapsed() < Duration::from_secs(15), "never {row}:\n{}", client.rows().join("\n"));
+            client.send(b"x");
+            std::thread::sleep(Duration::from_millis(15));
+        }
+    };
+    // Resets as far away as a file can say are none to wait for: the usage shows all the same.
+    seen(i64::MAX as u64, i64::MAX as u64);
+    typing_until(&mut client, "93%");
+    // The five-hour window resets while keys are echoed, the weekly one once nothing happens.
+    seen(now() + 2, now() + 5);
+    typing_until(&mut client, "41%");
+    client.wait_for_rows("both usage windows expired", |rows| shows(rows, "Last checked just now"));
+}
+
+/// The sidebar names panes of every workspace: what a pane prints that changes its name (a
+/// title) shows at once for a client that looks at another workspace, where nothing happens.
+#[test]
+fn the_sidebar_follows_what_a_pane_of_another_workspace_prints() {
+    let env = Env::new("elsewhere");
+    env.workspace("here", "layout {\n    pane name=\"quiet\"\n}\n");
+    env.workspace("there", "layout {\n    pane\n}\n");
+    env.run(&["open", "there"]);
+    let client = RawClient::attach(&env, "here");
+    let panes: serde_json::Value = serde_json::from_str(&env.run(&["panes", "--json"])).unwrap();
+    let unnamed = panes.as_array().unwrap().iter().find(|p| p["workspace"] == "there").unwrap()["id"].to_string();
+    // A port the pane serves, as far as kraal can tell: the sidebar lists it with the pane's name.
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    env.run(&["send", "-p", &unnamed, "--enter", &format!("echo http://localhost:{port}/")]);
+    client.wait_for_row(&format!(":{port}"));
+    // The title comes when the request that typed its command is long over, and all is quiet.
+    env.run(&["send", "-p", &unnamed, "--enter", "sleep 1; printf '\\033]2;renamed\\007'"]);
+    client.settle();
+    assert!(!client.rows().iter().any(|r| r.contains("renamed")), "{}", client.rows().join("\n"));
+    client.wait_for_row("   renamed");
 }
 
 /// The rows a pane shows far back come from its compact history: a client drawn incrementally
@@ -6781,7 +6974,10 @@ fn panes_resized_show_what_their_programs_draw_again() {
     fresh.settle();
     client.settle();
     let (a, b) = (client.screen.lock().unwrap()[drawn..].to_vec(), fresh.screen.lock().unwrap().clone());
-    for (y, (a, b)) in terminal_after(&a, 120, 40).iter().zip(&terminal_after(&b, 120, 40)).enumerate() {
+    // The cells and the cursor: the modes were set when the client attached, before the frames
+    // read here.
+    let shown = |bytes: &[u8]| terminal_after(bytes, 120, 40)[..41].to_vec();
+    for (y, (a, b)) in shown(&a).iter().zip(&shown(&b)).enumerate() {
         assert_eq!(a, b, "row {y} differs");
     }
 }

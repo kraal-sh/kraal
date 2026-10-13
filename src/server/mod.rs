@@ -324,6 +324,35 @@ impl Workspace {
     }
 }
 
+/// What a client's next frame is due for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Dirty {
+    /// Nothing: no frame is due.
+    No,
+    /// What panes printed since its last frame, and nothing else that marks a client.
+    Output,
+    /// Anything.
+    Yes,
+}
+
+/// The panes that printed since a client's last frame, in whatever workspace.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::server) enum Printed {
+    None,
+    One(PaneId),
+    Several,
+}
+
+impl Printed {
+    fn add(&mut self, pane: PaneId) {
+        *self = match *self {
+            Printed::None => Printed::One(pane),
+            Printed::One(p) if p == pane => Printed::One(p),
+            Printed::One(_) | Printed::Several => Printed::Several,
+        };
+    }
+}
+
 pub struct Client {
     pub id: ClientId,
     pub out: clients::Outbox,
@@ -344,7 +373,8 @@ pub struct Client {
     /// Whether it has the sidebar, once it showed or hid it itself: `[sidebar] visible` says
     /// until then.
     pub sidebar: Option<bool>,
-    pub dirty: bool,
+    pub dirty: Dirty,
+    pub(in crate::server) printed: Printed,
     pub last_input: Instant,
     pub terminal_focused: bool,
     pub drag: Option<ui::Drag>,
@@ -470,6 +500,9 @@ pub struct Server {
     /// Name of the workspace whose definition is being started (for account rules).
     starting_workspace: Option<String>,
     pub usage: crate::accounts::UsageMap,
+    /// The reset of a usage window that comes next (Unix seconds), and when to wake for it (see
+    /// [`Server::await_usage_reset`]).
+    usage_reset: Option<(i64, Instant)>,
     last_codex_poll: Instant,
     limit_alerts: HashMap<PaneId, agents::LimitAlert>,
     /// The limit message each agent pane shows, as already counted: a message staying on
@@ -574,6 +607,9 @@ pub struct Server {
     chrome_gen: u64,
     /// What the chrome shows of each pane, while it holds (see `Server::pane_facts`).
     facts: render::FactsCache,
+    /// The panes that printed since the last frames: what the chrome shows of them is looked at
+    /// before the next ones (see `Server::show_what_output_changed`).
+    printed: Vec<PaneId>,
     /// The last layouts worked out, most recent last (see `Server::tiled_rects`).
     tilings: std::cell::RefCell<Vec<geometry::Tiling>>,
     /// Whether the bottom bar shows: as `[bar] keys` says, until toggled for the session.
@@ -809,6 +845,7 @@ pub fn run(session: &str) -> Result<()> {
         existing_checks: HashMap::new(),
         starting_workspace: None,
         usage: Default::default(),
+        usage_reset: None,
         last_codex_poll: Instant::now() - Duration::from_secs(3600),
         limit_alerts: HashMap::new(),
         screen_limits: HashMap::new(),
@@ -828,6 +865,7 @@ pub fn run(session: &str) -> Result<()> {
         typed_quietly: false,
         chrome_gen: 0,
         facts: Default::default(),
+        printed: Vec::new(),
         tilings: Default::default(),
         broadcast_tip_shown: false,
         buffers,
@@ -907,6 +945,18 @@ fn held_back_for_tests() {
     }
 }
 
+/// Tests (debug builds only) read how each frame was composed from the file `KRAAL_TEST_FRAMES`
+/// names, a line a frame: the client, then `output` for a frame made from what one pane printed
+/// alone (see `Server::compose_output`), `whole` for any other.
+#[cfg(debug_assertions)]
+fn note_frame(client: ClientId, from_output: bool) {
+    use std::io::Write;
+    let Some(path) = std::env::var_os("KRAAL_TEST_FRAMES") else { return };
+    if let Ok(mut log) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+        let _ = writeln!(log, "{client} {}", if from_output { "output" } else { "whole" });
+    }
+}
+
 /// The pipe the client that started this server waits on (see `client::ensure_server`), taken
 /// out of the environment so that nothing this server starts sees it. Only the write end of a
 /// pipe is taken: a stale or odd value names nothing to write to.
@@ -973,7 +1023,7 @@ impl Server {
             return;
         }
         c.mode = mode;
-        c.dirty = true;
+        c.dirty = Dirty::Yes;
         self.mark_dirty_client(client);
     }
 
@@ -1194,6 +1244,9 @@ impl Server {
         if let Some(w) = self.watch_at {
             d = d.min(w);
         }
+        if let Some((_, wake)) = self.usage_reset {
+            d = d.min(wake);
+        }
         d.max(Instant::now() + Duration::from_millis(1))
     }
 
@@ -1202,6 +1255,9 @@ impl Server {
         if self.watch_at.is_some_and(|t| t <= now) {
             self.watch_at = None;
             self.ready.extend(self.watched.drain(..));
+        }
+        if self.usage_reset.is_some_and(|(_, wake)| wake <= now) {
+            self.await_usage_reset();
         }
         // Escape sequences that never completed.
         let flush: Vec<ClientId> = self
@@ -1675,7 +1731,7 @@ impl Server {
 
     pub fn mark_dirty(&mut self) {
         for c in self.clients.values_mut() {
-            c.dirty = true;
+            c.dirty = Dirty::Yes;
         }
         self.chrome_changed();
         self.schedule_render();
@@ -1683,7 +1739,7 @@ impl Server {
 
     pub fn mark_dirty_client(&mut self, id: ClientId) {
         if let Some(c) = self.clients.get_mut(&id) {
-            c.dirty = true;
+            c.dirty = Dirty::Yes;
         }
         self.chrome_changed();
         self.schedule_render();
@@ -1694,14 +1750,42 @@ impl Server {
         self.chrome_gen = self.chrome_gen.wrapping_add(1);
     }
 
+    /// What `pane` shows changed with what it printed: a frame is due for the clients of its
+    /// workspace, and every client's next frame knows which pane printed (the sidebar shows the
+    /// panes of every workspace).
     fn mark_dirty_pane(&mut self, pane: PaneId) {
         let ws = self.workspace_of(pane).map(|(w, _)| self.workspaces[w].id);
         for c in self.clients.values_mut() {
-            if Some(c.workspace) == ws {
-                c.dirty = true;
+            c.printed.add(pane);
+            if Some(c.workspace) == ws && c.dirty == Dirty::No {
+                c.dirty = Dirty::Output;
             }
         }
+        if !self.printed.contains(&pane) {
+            self.printed.push(pane);
+        }
         self.schedule_render();
+    }
+
+    /// What the panes that printed since the last frames show around their rows may have changed
+    /// with it (a title, a directory, a command that failed). The clients of their workspace are
+    /// due a frame already; the sidebar lists panes of every workspace, so a client that has one
+    /// is due a whole frame too, wherever it looks.
+    fn show_what_output_changed(&mut self) {
+        let mut changed = false;
+        for pane in std::mem::take(&mut self.printed) {
+            changed |= self.facts_changed(pane);
+        }
+        if !changed {
+            return;
+        }
+        let with_sidebar = |c: &&Client| self.sidebar_cols(c) > 0;
+        let ids: Vec<ClientId> = self.clients.values().filter(with_sidebar).map(|c| c.id).collect();
+        for id in ids {
+            if let Some(c) = self.clients.get_mut(&id) {
+                c.dirty = Dirty::Yes;
+            }
+        }
     }
 
     /// Draw what changed: at once after a quiet spell, else when the last frame is
@@ -1726,7 +1810,11 @@ impl Server {
     fn render_clients(&mut self) {
         self.next_render = None;
         let _frame = crate::pane::Frame::start();
-        let ids: Vec<ClientId> = self.clients.values().filter(|c| c.attached && c.dirty).map(|c| c.id).collect();
+        // One moment for all that these frames show of the accounts' usage, however composed.
+        let now = crate::accounts::now();
+        self.show_what_output_changed();
+        let due = |c: &&Client| c.attached && c.dirty != Dirty::No;
+        let ids: Vec<ClientId> = self.clients.values().filter(due).map(|c| c.id).collect();
         let mut again = false;
         // The earliest a moving image may be drawn where it stopped.
         let mut wake: Option<Instant> = None;
@@ -1737,9 +1825,26 @@ impl Server {
                 continue;
             }
             self.last_frame = Instant::now();
-            // The frame is composed over the last one.
-            let mut buf = self.clients.get_mut(&id).map(|c| std::mem::take(&mut c.frame)).unwrap_or_default();
-            let (cursor, links, kept) = self.compose(id, &mut buf);
+            // The frame is composed over the last one: from what one pane printed alone when
+            // nothing else can have changed, from everything otherwise.
+            let Some(c) = self.clients.get_mut(&id) else { continue };
+            let mut buf = std::mem::take(&mut c.frame);
+            let printed = match (c.dirty, std::mem::replace(&mut c.printed, Printed::None)) {
+                (Dirty::Output, Printed::One(pane)) => Some(pane),
+                _ => None,
+            };
+            let composed = printed.and_then(|pane| self.compose_output(id, pane, now, &mut buf));
+            #[cfg(debug_assertions)]
+            {
+                if let Some(frame) = &composed {
+                    self.assert_whole(id, now, &buf, frame);
+                }
+                note_frame(id, composed.is_some());
+            }
+            let (cursor, links, kept) = match composed {
+                Some(frame) => frame,
+                None => self.compose(id, now, &mut buf),
+            };
             // Images the client's terminal does not have yet go first.
             let (mut bytes, more) = self.graphics_updates(id);
             // Or, for a terminal that draws sixel, the images' visible parts go over the cells.
@@ -1754,7 +1859,7 @@ impl Server {
             }
             c.encoder.encode_with_images(&buf, &kept, cursor, &links, &erase, &images, &mut bytes);
             c.frame = buf;
-            c.dirty = more || still.is_some();
+            c.dirty = if more || still.is_some() { Dirty::Yes } else { Dirty::No };
             again |= more;
             if let Some(at) = still {
                 wake = Some(wake.map_or(at, |w| w.min(at)));
@@ -1764,7 +1869,7 @@ impl Server {
                 Ok(()) => {}
                 Err(TrySendError::Full(_)) => {
                     c.encoder.invalidate();
-                    c.dirty = true;
+                    c.dirty = Dirty::Yes;
                     again = true;
                     if let Some(ci) = self.images.get_mut(&id) {
                         ci.forget();
@@ -1926,6 +2031,7 @@ mod tests {
             existing_checks: HashMap::new(),
             starting_workspace: None,
             usage: Default::default(),
+            usage_reset: None,
             last_codex_poll: Instant::now() - Duration::from_secs(3600),
             limit_alerts: HashMap::new(),
             screen_limits: HashMap::new(),
@@ -1945,6 +2051,7 @@ mod tests {
             typed_quietly: false,
             chrome_gen: 0,
             facts: Default::default(),
+            printed: Vec::new(),
             tilings: Default::default(),
             broadcast_tip_shown: false,
             buffers,
@@ -2010,6 +2117,45 @@ mod tests {
         tab.set_focus(1);
         assert!(tab.remove(1));
         assert_eq!((tab.focus, open(&tab)), (Some(4), Some(4)));
+    }
+
+    #[test]
+    fn a_frame_knows_whether_one_pane_alone_printed() {
+        let mut printed = Printed::None;
+        printed.add(4);
+        printed.add(4);
+        assert_eq!(printed, Printed::One(4));
+        printed.add(5);
+        assert_eq!(printed, Printed::Several);
+        // The first one printing again changes nothing: another did meanwhile.
+        printed.add(4);
+        assert_eq!(printed, Printed::Several);
+    }
+
+    #[test]
+    fn every_printed_pane_refreshes_its_facts() {
+        let (tx, _rx) = queue::channel(16);
+        let mut server = server(tx);
+        let _batch = crate::pane::batch();
+        let panes: Vec<_> = (0..2)
+            .map(|_| {
+                let spec = crate::pane::PaneSpec { command: vec!["true".into()], ..Default::default() };
+                let id = server.spawn_pane(None, spec).unwrap();
+                assert!(server.facts_changed(id));
+                id
+            })
+            .collect();
+        for &id in &panes {
+            server.pane_output(id, format!("\x1b]2;pane-{id}\x07").as_bytes());
+            assert_eq!(server.panes[&id].display_name(), format!("pane-{id}"));
+        }
+        let _frame = crate::pane::Frame::start();
+        server.show_what_output_changed();
+        assert!(server.printed.is_empty());
+        // A change in the first pane must not stop the next pane's facts from being refreshed.
+        for id in panes {
+            assert!(!server.facts_changed(id), "pane {id}'s facts were not refreshed");
+        }
     }
 
     #[test]

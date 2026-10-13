@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use crossbeam_channel::{SendTimeoutError, TrySendError};
 
-use super::{Client, ClientId, Event, Mode, Server};
+use super::{Client, ClientId, Dirty, Event, Mode, Printed, Server};
 use crate::ansi::Encoder;
 use crate::input::InputParser;
 use crate::pane::PaneSpec;
@@ -69,7 +69,8 @@ impl Server {
                 frame: Default::default(),
                 memo: Default::default(),
                 sidebar: None,
-                dirty: false,
+                dirty: Dirty::No,
+                printed: Printed::None,
                 last_input: Instant::now(),
                 terminal_focused: true,
                 pointer_motion: false,
@@ -211,7 +212,7 @@ impl Server {
         if let Some(c) = self.clients.get_mut(&id) {
             c.attached = true;
             c.workspace = ws;
-            c.dirty = true;
+            c.dirty = Dirty::Yes;
             c.welcome = welcome;
             // Ask the outer terminal for its colours so panes querying them get real values.
             let _ = c.out.try_send(frame_bytes(b"\x1b]10;?\x07\x1b]11;?\x07"));
