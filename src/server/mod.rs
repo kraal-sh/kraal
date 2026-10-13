@@ -457,6 +457,7 @@ pub struct Server {
     /// ssh destinations already looked at for auto-adding.
     discovered: std::collections::HashSet<String>,
     pub accounts: crate::accounts::Accounts,
+    existing_checks: HashMap<String, agents::ExistingCheck>,
     /// Name of the workspace whose definition is being started (for account rules).
     starting_workspace: Option<String>,
     pub usage: crate::accounts::UsageMap,
@@ -796,6 +797,7 @@ pub fn run(session: &str) -> Result<()> {
         known_servers: Vec::new(),
         discovered: Default::default(),
         accounts: crate::accounts::Accounts::empty(),
+        existing_checks: HashMap::new(),
         starting_workspace: None,
         usage: Default::default(),
         last_codex_poll: Instant::now() - Duration::from_secs(3600),
@@ -1897,6 +1899,7 @@ mod tests {
             known_servers: Vec::new(),
             discovered: Default::default(),
             accounts: crate::accounts::Accounts::empty(),
+            existing_checks: HashMap::new(),
             starting_workspace: None,
             usage: Default::default(),
             last_codex_poll: Instant::now() - Duration::from_secs(3600),

@@ -69,6 +69,14 @@ references in `account_ids` for this version. A session still running an older b
 its old name-based behavior until restarted on this version; it does not protect against name
 reuse. The backup can be restored to return to the original file.
 
+Verified standard sign-ins become ordinary named accounts. Old `default` references still resolve,
+including after a review links that home to a named account. Names for the same canonical home
+resolve to one identity. Hidden account entries retain links from old identities and homes; panes
+keep their launch home when resumed. Usage uses the newest observation across those entries,
+never a sum. No credentials or homes are removed. Older kraal versions ignore these links and
+can still show duplicate entries. A forgotten standard home stays recorded as a hidden reference
+so discovery does not add it again.
+
 ## For contributors: how the protocol changes
 
 The client and the server exchange JSON messages (`src/protocol.rs`, whose comments hold the

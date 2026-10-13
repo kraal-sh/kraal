@@ -184,8 +184,8 @@ a removal.
 
 ## Accounts
 
-Each account is a separate config directory for an agent (`CLAUDE_CONFIG_DIR` for Claude Code,
-`CODEX_HOME` for Codex), logged in with the agent's own login. kraal never reads or stores
+Each account has a name and a sign-in home for an agent (`CLAUDE_CONFIG_DIR` for Claude Code,
+`CODEX_HOME` for Codex). kraal never reads or stores
 credentials; it chooses which directory a pane starts with and reads the usage the agents report.
 
 Accounts are for Claude Code and Codex. A second Claude subscription, named `pro`, in a new
@@ -200,6 +200,7 @@ kraal accounts add claude pro
 | `kraal accounts add codex work` | the same for Codex, with `codex login` |
 | `kraal accounts add claude team --home ~/claude-team --no-login --threshold 80` | in a directory you choose (`~/.local/share/kraal/accounts/claude-team` otherwise), without logging in now, with a threshold of its own |
 | `kraal accounts` | every account: sign-in status, 5-hour and weekly usage (`kraal accounts list --json` for scripts) |
+| `kraal accounts review claude` | identifies an existing sign-in marked Review, without another login |
 | `kraal accounts login claude:pro` | logs an account in again |
 | `kraal accounts rename claude:pro work` | renames it: rules and usage follow, the directory stays |
 | `kraal accounts rm claude:work` | forgets it; its directory is kept |
@@ -208,8 +209,29 @@ kraal accounts add claude pro
 | `kraal agent codex --account work --right` | on that account, in a split on the right (`--down`, `--floating` and `--tab` place it too; `--here` runs it in this terminal even inside kraal) |
 | `kraal agent claude -- --model opus` | what follows `--` goes to the agent |
 
-Your existing setup is the `default` account of each agent (`kraal accounts add` with `--home`
-set to the agent's own directory gives it another name). New Claude accounts share
+When the agent verifies its existing sign-in in `~/.claude` or `~/.codex`, kraal adopts it as
+**Personal**, or uses a public identity returned by the agent, such as Claude's email. You can
+rename it like any other account. No login is started and no credentials are copied. An absent
+agent or an unsigned home adds no account. **Could not verify** offers **Check again**, without
+starting a login; on the command line, run `kraal accounts list` again.
+
+If named accounts already exist, the existing sign-in appears as **Existing Claude account ·
+Review** (or Codex). Open it in `ctrl+b a`, click Review in the sidebar, or use
+`kraal accounts review claude`. **Which account is this?** lists your named accounts and
+**A different account**. Choose one, then confirm **Use account**. Cancel is selected first.
+Running agents keep their process and home. New launches use the selected named account's
+home. The account appears once, and its latest usage observation is used without adding usage
+from two homes. No home or credential is deleted. Choosing **A different account** keeps the
+existing home as a separate named account. The answer is saved, so Review does not return.
+Two names for the same canonical home are joined automatically; an email alone never joins
+accounts.
+
+`kraal accounts add` also adopts an unlisted verified sign-in when there are no named accounts.
+An explicit `--home` with a verified sign-in is adopted without login, even without `--no-login`.
+Adding another name for a listed home resolves to that same account. Use Rename to change its
+visible name. Old `default` references in commands, rules and saved sessions continue to resolve.
+
+New Claude accounts share
 `CLAUDE.md`, `settings.json`, skills, plugins, memory and conversations with it, so a conversation
 can continue on another account; Codex accounts share nothing, as Codex keeps databases in its home.
 An agent kraal starts on an account gets `$KRAAL_ACCOUNT` (`claude:pro`) and an internal
@@ -226,8 +248,7 @@ the new name. Removing an account keeps the label and launch environment of pane
 Adding another account with that name does not attach those panes, saved sessions, workspace
 bindings, rules or cached usage to the replacement. A workspace bound to a removed account
 asks you to choose an account again.
-`default`, the agent's own home, keeps its name. Once an account is listed or one was used, the
-sidebar lists every account at the bottom
+The sidebar lists confirmed accounts at the bottom
 (`claude·pro 42%`): the higher of its 5-hour and weekly usage, in yellow from 70% and in red at
 its threshold, or `not used yet`. `ctrl+b A c` moves the focused pane's agent to another account
 of the same agent. In that picker, Enter switches to the selected account; launch, login,
@@ -294,12 +315,15 @@ mode = "ask"          # notify | ask | auto
 [[rule]]
 workspace = "pro"     # or: path = "~/Dev/client"
 agent = "claude"
-accounts = ["pro", "default"]   # in order of preference
+accounts = ["pro", "Personal"]  # in order of preference
 ```
 
 The file also holds the accounts themselves, one `[[account]]` each (`name`, `agent`, `home`,
 an internal `id`, and a `threshold` of its own if it has one), which `kraal accounts add` writes. A login that has
 not been verified also has `sign_in_required = true`; successful verification removes that flag.
+Pending reviews have `review = true` and may keep a `public_identity` supplied by the agent. Old entries retained for compatibility use `linked_to` to
+refer to the chosen identity; they are not additional accounts. Keep these generated fields.
+An older kraal ignores them and can still display its old duplicate entries until restarted.
 kraal edits what it changes there and leaves the rest as you wrote it, including comments, order
 and unknown keys. A new file includes an explanatory header and omits empty rules and an empty `[claude]`
 table. When kraal next rewrites an older file, it removes an empty top-level `rule = []` and an
@@ -320,8 +344,7 @@ The first rule that matches decides. A new agent starts on the first account of 
 known usage is under its threshold. Otherwise it tries the first account with unknown usage,
 or, when all have known usage over the threshold, the one whose usage resets first. When
 the matching rule names no account that exists any more, no account is used there (rather than
-any). Without a matching rule, every account of the agent may be used, `default` first. The name
-`default` is the account in the agent's own home (`~/.claude`, `~/.codex`). When
+any). Without a matching rule, every confirmed account of the agent may be used, in list order. When
 the account of a running agent reaches its threshold, kraal notifies you (`notify`), offers to
 continue the conversation on another account once the agent finished its turn (`ask`), or does it
 by itself at the end of the turn (`auto`). `auto` only switches when the agent's own hooks said

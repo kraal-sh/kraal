@@ -31,6 +31,13 @@ pub(super) enum SwitchStage {
     Stopping,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum ExistingCheck {
+    Checking,
+    Checked(Status),
+    SaveFailed,
+}
+
 pub(super) struct AccountSwitch {
     token: u32,
     from: Account,
@@ -77,6 +84,7 @@ impl Server {
                 self.follow_renamed_accounts();
                 self.accounts = a;
                 self.accounts_error = None;
+                self.check_existing_accounts();
                 self.follow_renamed_accounts();
             }
             Err(e) => {
@@ -87,6 +95,128 @@ impl Server {
                 }
             }
         }
+    }
+
+    fn check_existing_accounts(&mut self) {
+        for a in self.accounts.unlisted() {
+            if self.existing_checks.contains_key(&a.agent) {
+                continue;
+            }
+            self.existing_checks.insert(a.agent.clone(), ExistingCheck::Checking);
+            let checked = a.clone();
+            let agent = a.agent.clone();
+            let started = self.background(
+                move || {
+                    let result = account_status::inspect(&checked);
+                    let saved = if result.status == Status::SignedIn {
+                        Accounts::update(|all| all.adopt_checked(&checked, result.identity.as_deref()))
+                    } else {
+                        Ok(())
+                    };
+                    (result.status, saved)
+                },
+                move |server, (status, saved)| {
+                    server.existing_checks.insert(a.agent.clone(), ExistingCheck::Checked(status));
+                    match saved {
+                        Ok(()) => {
+                            server.reload_accounts();
+                            server.reload_usage();
+                        }
+                        Err(e) => {
+                            server.existing_checks.insert(a.agent, ExistingCheck::SaveFailed);
+                            server
+                                .warnings
+                                .push(format!("Could not adopt the existing account: {e:#}. Open Check again."));
+                        }
+                    }
+                    server.refresh_agent_pickers();
+                    server.mark_dirty();
+                },
+            );
+            if !started {
+                self.existing_checks.insert(agent, ExistingCheck::Checked(Status::CouldNotCheck));
+            }
+        }
+    }
+
+    fn refresh_agent_pickers(&mut self) {
+        let clients: Vec<_> = self
+            .clients
+            .iter()
+            .filter_map(|(&id, c)| {
+                if let Mode::Picker(p) = &c.mode
+                    && p.kind == PickerKind::Agent
+                    && p.title == "Start an agent"
+                {
+                    Some((id, p.query.clone(), p.cursor, p.current().map(|i| i.label.clone())))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        for (id, query, cursor, selected) in clients {
+            let mut p = self.agent_picker(id, None);
+            p.query = query;
+            p.cursor = cursor;
+            p.refilter();
+            if let Some(label) = selected {
+                p.selected = p.filtered.iter().position(|&i| p.items[i].label == label).unwrap_or(0);
+            }
+            self.clients.get_mut(&id).unwrap().mode = Mode::Picker(p);
+        }
+    }
+
+    pub(super) fn refresh_existing_accounts(&mut self) {
+        self.existing_checks.retain(|_, status| {
+            matches!(
+                status,
+                ExistingCheck::Checking | ExistingCheck::Checked(Status::CouldNotCheck) | ExistingCheck::SaveFailed
+            )
+        });
+        self.check_existing_accounts();
+    }
+
+    pub(super) fn retry_existing_account(&mut self, agent: &str) {
+        if self.existing_checks.get(agent).is_some_and(|state| *state != ExistingCheck::Checking) {
+            self.existing_checks.remove(agent);
+            self.check_existing_accounts();
+        }
+    }
+
+    pub(super) fn review_account_picker(&self, existing: &Account) -> Picker {
+        let mut items: Vec<_> = self
+            .accounts
+            .for_agent(&existing.agent)
+            .into_iter()
+            .map(|a| {
+                PickItem::new(
+                    a.name.clone(),
+                    "",
+                    PickAction::UseExisting { existing: existing.clone(), target: Some(a) },
+                )
+            })
+            .collect();
+        items.push(PickItem::new(
+            "A different account",
+            "",
+            PickAction::UseExisting { existing: existing.clone(), target: None },
+        ));
+        Picker::new(PickerKind::AccountReview, &accounts::existing_label(&existing.agent), items)
+    }
+
+    pub(super) fn confirm_existing_account(
+        &mut self,
+        client: ClientId,
+        existing: &Account,
+        target: Option<&Account>,
+    ) -> Result<()> {
+        Accounts::update(|all| all.review(existing, target))?;
+        self.reload_accounts();
+        self.reload_usage();
+        self.refresh_agent_pickers();
+        self.mark_dirty();
+        self.toast(client, "Account updated");
+        Ok(())
     }
 
     /// Panes started on an account renamed since go on under its new name.
@@ -115,7 +245,7 @@ impl Server {
     }
 
     pub(super) fn reload_usage(&mut self) {
-        self.usage = UsageMap::load(&self.accounts.all());
+        self.usage = UsageMap::load(&self.accounts);
     }
 
     /// The account of an agent pane kraal launched.
@@ -125,7 +255,7 @@ impl Server {
 
     fn spec_account(&self, spec: &PaneSpec) -> Option<Account> {
         match spec.account_id.as_deref() {
-            Some(id) => self.accounts.by_id(id),
+            Some(id) => self.accounts.by_id(id).map(|a| self.accounts.at_launch_home(a, &spec.env)),
             None => self.accounts.launched_on(spec.account.as_deref()?, &spec.env),
         }
     }
@@ -296,7 +426,7 @@ impl Server {
         let p = self.panes.get(&pane).context("no such pane")?;
         let from = self.pane_account(pane).context("this pane was not started from the agent manager")?;
         anyhow::ensure!(from.agent == to.agent, "{} cannot continue on a {} account", from.agent, to.agent);
-        if from.same_home(to) {
+        if from.id == to.id || from.same_home(to) {
             return Ok(());
         }
         anyhow::ensure!(!self.switches.contains_key(&pane), "an account change is already pending for this pane");
@@ -733,7 +863,7 @@ impl Server {
                 if preferred.as_ref().is_some_and(|p| p.id == a.id) {
                     detail.push_str(" · picked here");
                 }
-                let is_current = current.as_ref().is_some_and(|c| c.same_home(&a));
+                let is_current = current.as_ref().is_some_and(|c| c.id == a.id || c.same_home(&a));
                 if is_current {
                     detail = format!("current · {detail}");
                 }
@@ -762,6 +892,32 @@ impl Server {
                 });
             }
             if switch_for.is_none() {
+                for a in self.accounts.reviews().into_iter().filter(|a| a.agent == kind.name) {
+                    items.push(PickItem::new(
+                        accounts::existing_label(kind.name),
+                        "Review",
+                        PickAction::ReviewAccount(a),
+                    ));
+                }
+                if self.accounts.unlisted().iter().any(|a| a.agent == kind.name) {
+                    let detail = match self.existing_checks.get(kind.name) {
+                        Some(ExistingCheck::Checked(Status::CouldNotCheck)) => Some("Could not verify · Check again"),
+                        Some(ExistingCheck::SaveFailed) => Some("Could not save · Check again"),
+                        Some(ExistingCheck::Checking) => Some("Checking sign-in"),
+                        _ => None,
+                    };
+                    if let Some(detail) = detail {
+                        items.push(PickItem::new(
+                            accounts::existing_label(kind.name),
+                            detail,
+                            if self.existing_checks.get(kind.name) == Some(&ExistingCheck::Checking) {
+                                PickAction::None
+                            } else {
+                                PickAction::CheckExisting { agent: kind.name.into() }
+                            },
+                        ));
+                    }
+                }
                 items.push(PickItem {
                     label: format!("+ add a {} account", kind.name),
                     detail: "new subscription: a separate config dir and the agent's own login".into(),
@@ -821,6 +977,9 @@ impl Server {
             threshold: None,
             note: None,
             sign_in_required: true,
+            review: false,
+            public_identity: None,
+            linked_to: None,
         };
         let a = Accounts::update(|all| {
             let a = all.add(a)?;
@@ -1013,6 +1172,75 @@ mod tests {
     use super::*;
 
     #[test]
+    fn review_questions_and_confirmations_fit_both_terminal_sizes() {
+        use ratatui::{buffer::Buffer, layout::Rect};
+        let mut t = SwitchTest::new("review-ui");
+        t.server.accounts.rename("claude", "from", "patron.bzh").unwrap();
+        t.server.accounts.rename("claude", "to", "gmail").unwrap();
+        let original = t.server.accounts.get("claude", "default").unwrap();
+        t.server.accounts.adopt_checked(&original, None).unwrap();
+        let existing = t.server.accounts.reviews().pop().unwrap();
+        for (cols, rows) in [(124, 36), (80, 24)] {
+            let screen = Rect::new(0, 0, cols, rows);
+            let picker = t.server.review_account_picker(&existing);
+            assert_eq!(picker.action_keys(), &[("enter", "Choose")]);
+            let mut buf = Buffer::empty(screen);
+            super::super::overlays::draw_picker(&picker, screen, &mut buf);
+            let text: String = buf.content.iter().map(|c| c.symbol()).collect();
+            for label in [
+                "Existing Claude account",
+                "Which account is this?",
+                "patron.bzh",
+                "gmail",
+                "A different account",
+                "Back",
+            ] {
+                assert!(text.contains(label), "{cols}x{rows}: {label}");
+            }
+            let mode = t.server.pick(99, &picker, picker.items[0].clone());
+            let Mode::Confirm(question) = mode else { panic!("choosing only opens confirmation") };
+            assert!(!question.yes);
+            assert_eq!(question.action.verb(), "Use account");
+            super::super::overlays::draw_confirm(&question, screen, &mut buf);
+            let text: String = buf.content.iter().map(|c| c.symbol()).collect();
+            for label in [
+                "Use patron.bzh?",
+                "Your running agents will keep working.",
+                "This account will appear once.",
+                "Cancel",
+                "Use account",
+            ] {
+                assert!(text.contains(label), "{cols}x{rows}: {label}");
+            }
+            assert_eq!(t.server.accounts.reviews().len(), 1, "choosing does not commit the review");
+        }
+    }
+
+    #[test]
+    fn a_linked_live_pane_keeps_its_home_and_selecting_its_identity_does_not_switch() {
+        let mut t = SwitchTest::new("review-pane");
+        t.server.switches.clear();
+        let old = t.server.accounts.get("claude", "default").unwrap();
+        t.server.accounts.adopt_checked(&old, None).unwrap();
+        let pending = t.server.accounts.reviews().pop().unwrap();
+        let target = t.server.accounts.get("claude", "to").unwrap();
+        let spec = &mut t.server.panes.get_mut(&1).unwrap().spec;
+        spec.account = Some("claude:default".into());
+        spec.account_id = Some(old.id.clone());
+        spec.env = accounts::launch(&old, &[], None, None).unwrap().env;
+        let command = spec.command.clone();
+        t.server.accounts.review(&pending, Some(&target)).unwrap();
+        t.server.follow_renamed_accounts();
+        assert_eq!(t.server.pane_account(1).unwrap().home, old.home);
+        assert_eq!(t.server.pane_account(1).unwrap().id, target.id);
+        assert_eq!(t.server.panes[&1].spec.command, command);
+        assert!(t.server.panes[&1].exit_code.is_none());
+        t.server.switch_account(1, &target, None, false).unwrap();
+        assert!(t.server.switches.is_empty());
+        assert_eq!(t.server.panes[&1].agent.state, AgentState::Working);
+    }
+
+    #[test]
     fn unrestored_accounts_follow_renames_but_never_replacements() {
         let mut t = SwitchTest::new("unrestored");
         let old = t.server.accounts.get("claude", "from").unwrap();
@@ -1087,6 +1315,9 @@ mod tests {
                 threshold: None,
                 note: None,
                 sign_in_required: false,
+                review: false,
+                public_identity: None,
+                linked_to: None,
             };
             let (from, to) = (account("from"), account("to"));
             let (tx, _rx) = super::super::queue::channel(16);

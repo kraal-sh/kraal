@@ -89,6 +89,10 @@ impl Mode {
 }
 
 pub enum ConfirmAction {
+    UseExisting {
+        existing: Box<crate::accounts::Account>,
+        target: Option<crate::accounts::Account>,
+    },
     ClosePane(PaneId),
     CloseTab {
         workspace: u32,
@@ -157,6 +161,7 @@ impl ConfirmAction {
     /// The confirming button: what will happen.
     pub fn verb(&self) -> String {
         match self {
+            ConfirmAction::UseExisting { .. } => "Use account".into(),
             ConfirmAction::ClosePane(_) => "Close pane".into(),
             ConfirmAction::CloseTab { .. } => "Close tab".into(),
             ConfirmAction::CloseWorkspace(_) => "Close workspace".into(),
@@ -220,6 +225,7 @@ pub enum PickerKind {
     Ssh,
     Pane,
     Agent,
+    AccountReview,
     Tool,
     Runbook,
     RunbookTarget,
@@ -233,6 +239,14 @@ pub enum PickerKind {
 
 #[derive(Clone)]
 pub enum PickAction {
+    ReviewAccount(crate::accounts::Account),
+    CheckExisting {
+        agent: String,
+    },
+    UseExisting {
+        existing: crate::accounts::Account,
+        target: Option<crate::accounts::Account>,
+    },
     CancelSwitch {
         pane: PaneId,
         token: u32,
@@ -389,6 +403,9 @@ impl Picker {
             (_, A::CancelSwitch { .. }) => &[("enter", "Cancel account change")],
             (_, A::AgentSwitch { current: true, .. }) => &[("enter", "Keep current account")],
             (_, A::AgentSwitch { .. }) => &[("enter", "Switch account")],
+            (_, A::ReviewAccount(_)) => &[("enter", "Review")],
+            (_, A::CheckExisting { .. }) => &[("enter", "Check again")],
+            (_, A::UseExisting { .. }) => &[("enter", "Choose")],
             (_, A::AgentAdd { .. }) => &[("enter", "Add account")],
             (_, A::AgentWorktree { .. }) => &[("enter", "Name worktree")],
             (K::Workspace, A::SwitchWorkspace(_)) => &[("enter", "Open"), ("ctrl+x", "Close workspace")],

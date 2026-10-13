@@ -203,7 +203,10 @@ impl Server {
             Action::WorkspacePicker => return Mode::Picker(self.workspace_picker(ws)),
             Action::SshPicker => return Mode::Picker(self.ssh_picker()),
             Action::PanePicker => return Mode::Picker(self.pane_picker()),
-            Action::AgentPicker => return Mode::Picker(self.agent_picker(id, None)),
+            Action::AgentPicker => {
+                self.refresh_existing_accounts();
+                return Mode::Picker(self.agent_picker(id, None));
+            }
             Action::GitActions => match focus.and_then(|f| self.worktree_picker(f)) {
                 Some(p) => return Mode::Picker(p),
                 None => {

@@ -523,12 +523,12 @@ pub enum AccountsCmd {
         #[arg(long)]
         json: bool,
     },
-    /// Add a subscription: `kraal accounts add claude pro`, then log in with the agent's own login.
+    /// Add an account, adopting an existing verified sign-in when it is not listed yet.
     Add {
         agent: String,
         name: String,
-        /// Config home (default: ~/.local/share/kraal/accounts/<agent>-<name>; the agent's default
-        /// home adopts the account you already have).
+        /// Config home (otherwise an unlisted verified sign-in, or a new home under
+        /// ~/.local/share/kraal/accounts/<agent>-<name>).
         #[arg(long)]
         home: Option<String>,
         #[arg(long)]
@@ -536,6 +536,8 @@ pub enum AccountsCmd {
         #[arg(long)]
         no_login: bool,
     },
+    /// Identify an existing sign-in shown as Review, without signing in again.
+    Review { agent: String },
     /// Log an account in again (runs the agent's own login).
     Login { account: String },
     /// Forget an account (its directory is kept).
