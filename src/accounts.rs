@@ -126,7 +126,7 @@ pub struct Account {
     /// Stable identity; absent in files written before account identities were introduced.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub id: String,
-    /// Unique among the agent's accounts. `default` names the agent's default home only.
+    /// Unique among the agent's accounts.
     pub name: String,
     /// The [`AgentKind`] it is for, by name.
     pub agent: String,
@@ -141,6 +141,14 @@ pub struct Account {
     /// A login was started but has not yet been verified by the agent.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub sign_in_required: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub review: bool,
+    /// A name collision may add a suffix to the label; the identity shown in Review must stay exact.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub public_identity: Option<String>,
+    /// Old references and homes stay resolvable after accounts are joined or forgotten.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub linked_to: Option<String>,
 }
 
 impl Account {
@@ -254,7 +262,7 @@ const HEADER: &str = "# kraal agent accounts. One [[account]] per subscription: 
 pub struct Accounts {
     pub limits: Limits,
     pub claude: ClaudeOptions,
-    /// The accounts as listed; [`Accounts::for_agent`] adds the implicit default ones.
+    /// Includes the hidden references retained for older panes and clients.
     accounts: Vec<Account>,
     /// In order: the first rule that matches decides.
     rules: Vec<Rule>,
@@ -308,17 +316,18 @@ impl Accounts {
                 a.id = a.legacy_id();
             }
             anyhow::ensure!(
-                valid_name(&a.id) && ids.insert(a.id.clone()),
+                valid_name(&a.id) && a.linked_to.as_deref().is_none_or(valid_name) && ids.insert(a.id.clone()),
                 "invalid or duplicate account identity in {}; the file is unchanged",
                 path.display()
             );
         }
         let mut effective_ids = std::collections::HashSet::new();
         anyhow::ensure!(
-            accounts.all().iter().all(|a| effective_ids.insert(a.id.clone())),
+            accounts.known().iter().all(|a| effective_ids.insert(a.id.clone())),
             "duplicate account identity in {}; the file is unchanged",
             path.display()
         );
+        accounts.join_same_homes()?;
         accounts.bind_rules();
         Ok((accounts, warnings))
     }
@@ -358,7 +367,7 @@ impl Accounts {
         let text = self.text()?;
         if let Some(source) = &self.source {
             let old: File = toml::from_str(source)?;
-            if old.accounts.iter().any(|a| a.id.is_empty()) || old.rules != self.rules {
+            if old.accounts != self.accounts || old.rules != self.rules {
                 let backup = self.path.with_extension("toml.kraal-bak");
                 if !backup.exists() {
                     paths::write_atomic(&backup, source.as_bytes()).context("backing up accounts before migration")?;
@@ -379,12 +388,17 @@ impl Accounts {
         paths::locked(path, || {
             let mut all = Self::load_from(path)?;
             let before = all.text()?;
+            let joined = all
+                .source
+                .as_ref()
+                .and_then(|s| toml::from_str::<File>(s).ok())
+                .is_some_and(|old| old.accounts.iter().zip(&all.accounts).any(|(a, b)| a.linked_to != b.linked_to));
             let previous = all.clone();
             let out = f(&mut all)?;
             all.bind_rules();
-            if all.text()? != before {
+            if joined || all.text()? != before {
                 if path == Self::path() {
-                    for a in previous.all() {
+                    for a in previous.known() {
                         migrate_usage(&usage_dir(), &a)?;
                     }
                     crate::persist::bind_accounts(&previous)
@@ -408,52 +422,217 @@ impl Accounts {
         })?
     }
 
-    /// Accounts of an agent, with an implicit "default" account for the agent's default home
-    /// when no listed account uses it.
+    /// Confirmed accounts, with one entry per home or reviewed identity.
     pub fn for_agent(&self, agent: &str) -> Vec<Account> {
-        let mut out: Vec<Account> = self.accounts.iter().filter(|a| a.agent == agent).cloned().collect();
-        if let Some(kind) = agent_kind(agent) {
-            let default = paths::expand_tilde(kind.default_home);
-            // A listed account named "default" is not hidden behind the implicit one: kraal
-            // reserves the name since 0.1.0, and an accounts.toml from before may still have one.
-            if !out.iter().any(|a| paths::expand_tilde(&a.home) == default || a.name == "default") {
-                out.insert(
-                    0,
-                    Account {
-                        id: format!("default-{agent}"),
-                        name: "default".into(),
-                        agent: agent.into(),
-                        home: kind.default_home.into(),
-                        threshold: None,
-                        note: None,
-                        sign_in_required: false,
-                    },
-                );
+        let mut out: Vec<Account> = Vec::new();
+        for a in self
+            .accounts
+            .iter()
+            .filter(|a| a.agent == agent && a.linked_to.is_none() && !a.review && a.name != "default")
+        {
+            if !out.iter().any(|other| other.same_home(a)) {
+                out.push(a.clone());
             }
         }
         out
     }
 
-    /// Whether no account is listed: there are only the agents' own homes, each as `default`.
-    pub fn none_listed(&self) -> bool {
-        self.accounts.is_empty()
-    }
-
-    /// Every account of every known agent.
     pub fn all(&self) -> Vec<Account> {
         AGENTS.iter().flat_map(|k| self.for_agent(k.name)).collect()
     }
 
+    pub fn reviews(&self) -> Vec<Account> {
+        self.accounts.iter().filter(|a| a.review && a.linked_to.is_none()).cloned().collect()
+    }
+
+    fn standard(agent: &str) -> Option<Account> {
+        let kind = agent_kind(agent)?;
+        Some(Account {
+            id: format!("default-{agent}"),
+            name: "default".into(),
+            agent: agent.into(),
+            home: kind.default_home.into(),
+            threshold: None,
+            note: None,
+            sign_in_required: false,
+            review: false,
+            public_identity: None,
+            linked_to: None,
+        })
+    }
+
+    /// Unlisted homes are checked off the event loop, never inferred from credential files.
+    pub fn unlisted(&self) -> Vec<Account> {
+        AGENTS
+            .iter()
+            .filter_map(|kind| {
+                let standard = Self::standard(kind.name)?;
+                let found = self
+                    .accounts
+                    .iter()
+                    .find(|a| a.same_home(&standard) || a.agent == kind.name && a.name == "default");
+                match found {
+                    Some(a) if a.name == "default" && a.linked_to.is_none() && !a.review => Some(a.clone()),
+                    None => Some(standard),
+                    _ => None,
+                }
+            })
+            .collect()
+    }
+
+    fn known(&self) -> Vec<Account> {
+        let mut all = self.accounts.clone();
+        for kind in AGENTS {
+            let standard = Self::standard(kind.name).unwrap();
+            if !all.iter().any(|a| a.agent == kind.name && (a.same_home(&standard) || a.name == "default")) {
+                all.push(standard);
+            }
+        }
+        all
+    }
+
+    fn resolve(&self, account: &Account) -> Option<Account> {
+        let mut a = account;
+        for _ in 0..=self.accounts.len() {
+            match &a.linked_to {
+                Some(id) => a = self.accounts.iter().find(|other| &other.id == id && other.agent == a.agent)?,
+                None => {
+                    return Some(a.clone());
+                }
+            }
+        }
+        None
+    }
+
     pub fn get(&self, agent: &str, name: &str) -> Option<Account> {
-        self.for_agent(agent).into_iter().find(|a| a.matches(name))
+        let all = self.known();
+        if let Some(a) = all.iter().find(|a| a.agent == agent && a.linked_to.is_none() && a.matches(name)) {
+            return self.resolve(a);
+        }
+        if let Some(a) = all.iter().find(|a| a.agent == agent && a.matches(name)) {
+            return self.resolve(a);
+        }
+        if name == format!("@default-{agent}") || name == format!("{agent}:@default-{agent}") {
+            return self.by_id(&format!("default-{agent}"));
+        }
+        if name == "default" || name == key(agent, "default") {
+            let standard = Self::standard(agent)?;
+            return all.iter().filter(|a| a.same_home(&standard)).find_map(|a| self.resolve(a));
+        }
+        None
     }
 
     pub fn by_id(&self, id: &str) -> Option<Account> {
-        self.all().into_iter().find(|a| a.id == id)
+        if let Some(a) = self.known().iter().find(|a| a.id == id) {
+            return self.resolve(a);
+        }
+        let agent = id.strip_prefix("default-")?;
+        let standard = Self::standard(agent)?;
+        self.accounts
+            .iter()
+            .find(|a| a.same_home(&standard) || a.agent == agent && a.name == "default")
+            .and_then(|a| self.resolve(a))
+    }
+
+    fn join_same_homes(&mut self) -> Result<()> {
+        for i in 0..self.accounts.len() {
+            let a = &self.accounts[i];
+            if a.linked_to.is_some() {
+                continue;
+            }
+            let target = self
+                .accounts
+                .iter()
+                .enumerate()
+                .find(|(j, b)| {
+                    *j != i
+                        && b.linked_to.is_none()
+                        && a.same_home(b)
+                        && (*j < i || a.name == "default" && b.name != "default")
+                })
+                .map(|(_, b)| b.id.clone());
+            self.accounts[i].linked_to = target;
+        }
+        for a in &self.accounts {
+            let mut seen = std::collections::HashSet::new();
+            let mut next = Some(a);
+            while let Some(a) = next {
+                anyhow::ensure!(seen.insert(&a.id), "account links form a cycle; the file is unchanged");
+                next = a.linked_to.as_ref().and_then(|id| self.accounts.iter().find(|b| &b.id == id));
+                anyhow::ensure!(
+                    next.is_none_or(|b| b.agent == a.agent),
+                    "account links must use the same agent; the file is unchanged"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    pub fn proposed_name(&self, agent: &str, identity: Option<&str>) -> String {
+        let base = identity.filter(|name| valid_account_name(name) && *name != "default").unwrap_or("Personal");
+        let mut name = base.to_string();
+        let mut suffix = 2;
+        while self.accounts.iter().any(|a| a.agent == agent && a.name == name) {
+            name = format!("{base}{suffix}");
+            suffix += 1;
+        }
+        name
+    }
+
+    pub fn adopt_checked(&mut self, checked: &Account, identity: Option<&str>) -> Result<()> {
+        let Some(mut a) = self.unlisted().into_iter().find(|a| a.id == checked.id && a.same_home(checked)) else {
+            return Ok(());
+        };
+        let old_default = (!Self::standard(&a.agent).is_some_and(|standard| a.same_home(&standard))).then(|| a.clone());
+        if old_default.is_some() {
+            a.id = new_uuid();
+        }
+        a.name = self.proposed_name(&a.agent, identity);
+        a.sign_in_required = false;
+        a.review = !self.for_agent(&a.agent).is_empty();
+        a.public_identity = identity.filter(|name| a.review && valid_account_name(name)).map(String::from);
+        if let Some(old_default) = old_default {
+            let old = self.accounts.iter_mut().find(|old| old.id == old_default.id).unwrap();
+            old.linked_to = Some(a.id.clone());
+        } else {
+            // Older servers resolve only names and suppress their implicit default once
+            // this home is listed. Keep that name, hidden through linking in this version.
+            self.accounts.push(Account { id: new_uuid(), linked_to: Some(a.id.clone()), ..checked.clone() });
+        }
+        if let Some(old) = self.accounts.iter_mut().find(|old| old.id == a.id) {
+            *old = a;
+        } else {
+            self.accounts.push(a);
+        }
+        Ok(())
+    }
+
+    pub fn review(&mut self, existing: &Account, target: Option<&Account>) -> Result<Account> {
+        let a = self
+            .accounts
+            .iter()
+            .find(|a| a.id == existing.id && a.review && a.linked_to.is_none() && a.same_home(existing))
+            .context("this review changed; open Review again")?
+            .clone();
+        let target = match target {
+            Some(target) => self
+                .for_agent(&a.agent)
+                .into_iter()
+                .find(|b| b.id == target.id && b.same_home(target))
+                .context("the chosen account changed; open Review again")?,
+            None => Account { review: false, public_identity: None, ..a.clone() },
+        };
+        self.bind_rules();
+        let old = self.accounts.iter_mut().find(|b| b.id == a.id).unwrap();
+        old.review = false;
+        old.public_identity = None;
+        old.linked_to = (a.id != target.id).then(|| target.id.clone());
+        Ok(target)
     }
 
     fn bind_rules(&mut self) {
-        let all = self.all();
+        let all: Vec<Account> = self.known().iter().filter_map(|a| self.resolve(a)).collect();
+        let lookup = self.clone();
         for rule in &mut self.rules {
             // A name kept while its account did not exist binds as soon as it can be resolved.
             // References already bound keep their identity, even after that account is removed.
@@ -465,7 +644,10 @@ impl Accounts {
                 .flat_map(|reference| {
                     let found: Vec<String> = all
                         .iter()
-                        .filter(|a| rule.agent.as_deref().is_none_or(|agent| a.agent == agent) && a.matches(reference))
+                        .filter(|a| {
+                            rule.agent.as_deref().is_none_or(|agent| a.agent == agent)
+                                && lookup.get(&a.agent, reference).is_some_and(|b| b.id == a.id)
+                        })
                         .map(Account::key)
                         .collect();
                     if found.is_empty() { vec![reference.clone()] } else { found }
@@ -480,6 +662,8 @@ impl Accounts {
                 }
             }
             rule.accounts = names;
+            let mut unique = std::collections::HashSet::new();
+            let ids = ids.into_iter().filter(|id| unique.insert(id.clone())).collect();
             rule.account_ids = Some(ids);
         }
     }
@@ -490,7 +674,7 @@ impl Accounts {
         }
         let mut found = false;
         for a in &mut self.accounts {
-            if a.same_home(account) {
+            if a.id == account.id || a.same_home(account) && a.linked_to.is_none() {
                 a.sign_in_required = required;
                 found = true;
             }
@@ -504,22 +688,31 @@ impl Accounts {
 
     /// The account whose home is `home` (used to tell which account a status line belongs to).
     pub fn by_home(&self, agent: &str, home: &Path) -> Option<Account> {
-        let home = std::fs::canonicalize(home).unwrap_or_else(|_| home.to_path_buf());
-        self.for_agent(agent).into_iter().find(|a| {
-            let h = paths::expand_tilde(&a.home);
-            std::fs::canonicalize(&h).unwrap_or(h) == home
-        })
+        let probe = Account { home: home.display().to_string(), ..Self::standard(agent)? };
+        self.known().iter().filter(|a| a.same_home(&probe)).find_map(|a| self.resolve(a))
+    }
+
+    /// Resuming a pane must use the home it launched in, even after its identity was linked.
+    pub fn at_launch_home(&self, mut a: Account, env: &[(String, String)]) -> Account {
+        if let Some(kind) = agent_kind(&a.agent) {
+            let home =
+                env.iter().find(|(k, _)| k == kind.home_env).map(|(_, v)| v.as_str()).unwrap_or(kind.default_home);
+            if self.by_home(&a.agent, &paths::expand_tilde(home)).is_some_and(|b| a.id == b.id) {
+                a.home = home.into();
+            }
+        }
+        a
     }
 
     /// Stable references never fall back to a reused name or home. Old panes have their
     /// launch environment to distinguish a renamed account from a replacement of its name.
     pub fn launched_on(&self, reference: &str, env: &[(String, String)]) -> Option<Account> {
         if let Some((_, id)) = env.iter().find(|(k, _)| k == "KRAAL_ACCOUNT_ID") {
-            return self.by_id(id);
+            return self.by_id(id).map(|a| self.at_launch_home(a, env));
         }
         let (agent, name) = reference.split_once(':')?;
         if name.starts_with('@') {
-            return self.get(agent, name);
+            return self.get(agent, name).map(|a| self.at_launch_home(a, env));
         }
         let kind = agent_kind(agent)?;
         let home = env
@@ -527,7 +720,10 @@ impl Accounts {
             .find(|(k, _)| k == kind.home_env)
             .map(|(_, home)| PathBuf::from(home))
             .unwrap_or_else(|| paths::expand_tilde(kind.default_home));
-        self.get(agent, name).filter(|a| paths::expand_tilde(&a.home) == home).or_else(|| self.by_home(agent, &home))
+        self.get(agent, name)
+            .filter(|a| paths::expand_tilde(&a.home) == home)
+            .or_else(|| self.by_home(agent, &home))
+            .map(|a| self.at_launch_home(a, env))
     }
 
     pub fn bind_pane(&self, spec: &mut crate::pane::PaneSpec) {
@@ -562,28 +758,52 @@ impl Accounts {
         let kind = agent_kind(&account.agent)
             .with_context(|| format!("unknown agent {:?} (known: {})", account.agent, agent_names()))?;
         account.home = absolute_home(&account.home)?;
-        let adopted = self.for_agent(kind.name).into_iter().find(|a| {
-            a.name == "default"
-                && !self.accounts.iter().any(|listed| listed.id == a.id)
-                && paths::expand_tilde(&a.home) == paths::expand_tilde(&account.home)
-        });
-        if let Some(a) = &adopted {
-            account.id = a.id.clone();
-        } else if account.id.is_empty() {
+        if account.id.is_empty() {
             account.id = new_uuid();
         }
         anyhow::ensure!(valid_name(&account.id), "invalid account identity");
-        anyhow::ensure!(
-            !self.all().iter().any(|a| a.id == account.id && adopted.as_ref().is_none_or(|old| old.id != a.id)),
-            "account identity already exists"
-        );
-        check_name(kind, &account.name, &account.home)?;
-        if self.for_agent(kind.name).iter().any(|a| a.name == account.name && a.name != "default") {
+        anyhow::ensure!(!self.accounts.iter().any(|a| a.id == account.id), "account identity already exists");
+        check_name(kind, &account.name)?;
+        if self.accounts.iter().any(|a| a.agent == kind.name && a.name == account.name && a.linked_to.is_none()) {
             bail!("{} already has an account named {:?}", kind.name, account.name);
         }
         self.bind_rules();
-        // Naming the default home adopts it instead of adding a second entry.
-        self.accounts.retain(|a| !(a.agent == account.agent && a.name == account.name));
+        if let Some(existing) = self.accounts.iter().filter(|a| a.same_home(&account)).find_map(|a| self.resolve(a)) {
+            anyhow::ensure!(
+                !existing.review,
+                "review the existing account with `kraal accounts review {}`",
+                account.agent
+            );
+            if existing.name == "default" {
+                account.id = existing.id;
+                let old = self.accounts.iter_mut().find(|a| a.id == account.id).unwrap();
+                old.name = account.name.clone();
+                old.sign_in_required = account.sign_in_required;
+                if account.threshold.is_some() {
+                    old.threshold = account.threshold;
+                }
+                let adopted = old.clone();
+                self.accounts.push(Account { id: new_uuid(), linked_to: Some(adopted.id.clone()), ..existing });
+                return Ok(adopted);
+            }
+            account.linked_to = Some(existing.id.clone());
+            if let Some(threshold) = account.threshold {
+                self.accounts.iter_mut().find(|a| a.id == existing.id).unwrap().threshold = Some(threshold);
+            }
+            self.accounts.push(account);
+            return Ok(self.by_id(&existing.id).unwrap());
+        }
+        if Self::standard(kind.name).is_some_and(|a| a.same_home(&account))
+            && !self.accounts.iter().any(|a| a.id == format!("default-{}", kind.name) || a.same_home(&account))
+        {
+            account.id = format!("default-{}", kind.name);
+            self.accounts.push(Account {
+                id: new_uuid(),
+                name: "default".into(),
+                linked_to: Some(account.id.clone()),
+                ..account.clone()
+            });
+        }
         self.accounts.push(account.clone());
         Ok(account)
     }
@@ -592,28 +812,31 @@ impl Accounts {
         self.bind_rules();
         let Some(account) = self.get(agent, name) else { return false };
         let before = self.accounts.len();
+        if Self::standard(agent).is_some_and(|standard| standard.same_home(&account)) {
+            let forgotten = new_uuid();
+            if let Some(a) = self.accounts.iter_mut().find(|a| a.id == account.id) {
+                a.linked_to = Some(forgotten);
+                return true;
+            }
+        }
         self.accounts.retain(|a| a.id != account.id);
         before != self.accounts.len()
     }
 
-    /// Account `name` of `agent`, when it can be renamed; an error says why not.
     pub fn renamable(&self, agent: &str, name: &str) -> Result<Account> {
         let a = self.get(agent, name).with_context(|| missing_account(agent, name))?;
-        if !self.accounts.contains(&a) {
-            bail!(
-                "{} is {agent}'s own home ({}): it is always called \"default\" and cannot be renamed",
-                label(&a),
-                a.home
-            );
-        }
+        anyhow::ensure!(
+            self.accounts.iter().any(|listed| listed.id == a.id && !listed.review && listed.name != "default"),
+            "check the existing sign-in with `kraal accounts list` first"
+        );
         Ok(a)
     }
 
     /// Rename the label, binding any legacy rules first. Its home and identity stay.
-    fn rename(&mut self, agent: &str, old: &str, new: &str) -> Result<()> {
+    pub fn rename(&mut self, agent: &str, old: &str, new: &str) -> Result<()> {
         let account = self.renamable(agent, old)?;
         let kind = agent_kind(agent).with_context(|| format!("unknown agent {agent:?} (known: {})", agent_names()))?;
-        check_name(kind, new, &account.home)?;
+        check_name(kind, new)?;
         if self.get(agent, new).is_some() {
             bail!("{agent} already has an account named {new:?}");
         }
@@ -626,15 +849,16 @@ impl Accounts {
 
     /// Accounts to try, in order, for an agent started in `workspace` and `cwd`.
     fn candidates(&self, agent: &str, workspace: Option<&str>, cwd: Option<&Path>) -> Vec<Account> {
-        self.rule_accounts(agent, workspace, cwd).unwrap_or_else(|| self.for_agent(agent))
+        self.rule_accounts(agent, workspace, cwd).unwrap_or_else(|| {
+            let listed = self.for_agent(agent);
+            if listed.is_empty() { self.get(agent, "default").into_iter().collect() } else { listed }
+        })
     }
 
     /// The accounts of the first rule matching this context, if any. A rule for every agent
     /// concerns an agent when it names one of its accounts, or names no account of any agent
     /// any more: then nothing is allowed here (rather than any account at all).
     fn rule_accounts(&self, agent: &str, workspace: Option<&str>, cwd: Option<&Path>) -> Option<Vec<Account>> {
-        let all = self.for_agent(agent);
-        let everyone = self.all();
         for rule in &self.rules {
             if rule.agent.as_deref().is_some_and(|a| a != agent) {
                 continue;
@@ -652,9 +876,8 @@ impl Accounts {
             }
             if ws_ok && path_ok {
                 let references = rule.account_ids.as_ref().unwrap_or(&rule.accounts);
-                let picked: Vec<Account> =
-                    references.iter().filter_map(|n| all.iter().find(|a| a.matches(n)).cloned()).collect();
-                let dangling = !references.iter().any(|n| everyone.iter().any(|a| a.matches(n)));
+                let picked: Vec<Account> = references.iter().filter_map(|n| self.get(agent, n)).collect();
+                let dangling = !references.iter().any(|n| AGENTS.iter().any(|kind| self.get(kind.name, n).is_some()));
                 if !picked.is_empty()
                     || rule.agent.is_some()
                     || dangling
@@ -712,15 +935,17 @@ impl Accounts {
         now: i64,
     ) -> Option<Account> {
         self.candidates(&current.agent, workspace, cwd).into_iter().find(|a| {
-            !a.same_home(current)
+            a.id != current.id
+                && !a.same_home(current)
                 && !a.sign_in_required
+                && !a.review
                 && usage.peak(a, now).is_some_and(|p| p < self.threshold(a) as f64)
         })
     }
 }
 
 pub fn missing_account(agent: &str, reference: &str) -> String {
-    if reference.contains('@') {
+    if reference.starts_with('@') || reference.contains(":@") {
         "the account was removed; choose an account again".into()
     } else {
         format!("{agent} has no account named {reference:?}")
@@ -735,14 +960,19 @@ fn valid_name(name: &str) -> bool {
     !name.is_empty() && name.chars().all(|c| c.is_alphanumeric() || matches!(c, '-' | '_' | '.'))
 }
 
-/// Refuse `name` for an account of `kind` in `home`: one kraal cannot use, or `default` for
-/// another home than the agent's own.
-fn check_name(kind: &AgentKind, name: &str, home: &str) -> Result<()> {
-    if !valid_name(name) {
-        bail!("invalid account name {name:?} (letters, digits, - _ . only)");
+fn valid_account_name(name: &str) -> bool {
+    !name.is_empty()
+        && !name.starts_with('@')
+        && name.chars().all(|c| c.is_alphanumeric() || matches!(c, '-' | '_' | '.' | '@' | '+'))
+}
+
+/// Keep `default` available for references written by older clients.
+fn check_name(kind: &AgentKind, name: &str) -> Result<()> {
+    if !valid_account_name(name) {
+        bail!("invalid account name {name:?} (letters, digits, - _ . @ + only)");
     }
-    if name == "default" && paths::expand_tilde(home) != paths::expand_tilde(kind.default_home) {
-        bail!("\"default\" is the account in {}; give this one another name", kind.default_home);
+    if name == "default" {
+        bail!("\"default\" is the account in {}; choose an ordinary name", kind.default_home);
     }
     Ok(())
 }
@@ -762,9 +992,18 @@ fn rename_in(file: &Path, usage: &Path, agent: &str, old: &str, new: &str) -> Re
     })
 }
 
+pub fn existing_label(agent: &str) -> String {
+    let name = match agent {
+        "claude" => "Claude",
+        "codex" => "Codex",
+        _ => agent,
+    };
+    format!("Existing {name} account")
+}
+
 /// How an account is shown, e.g. `claude·pro`.
 pub fn label(a: &Account) -> String {
-    format!("{}·{}", a.agent, a.name)
+    format!("{}·{}", a.agent, if a.review || a.name == "default" { "Existing account" } else { &a.name })
 }
 
 /// The readable account label kept for older clients and saved sessions.
@@ -1447,11 +1686,23 @@ fn usage_path(agent: &str, id: &str) -> PathBuf {
     usage_dir().join("by-id").join(usage_file(agent, id))
 }
 
+fn legacy_usage_name(a: &Account) -> Option<&str> {
+    if a.id == format!("default-{}", a.agent) {
+        Some("default")
+    } else if a.id == a.legacy_id() {
+        Some(&a.name)
+    } else {
+        None
+    }
+}
+
 /// Copy legacy usage once; new accounts never inherit a previous occupant's cache.
 fn migrate_usage(dir: &Path, a: &Account) -> Result<()> {
     let to = dir.join("by-id").join(usage_file(&a.agent, &a.id));
-    if (a.id == a.legacy_id() || a.id == format!("default-{}", a.agent) && a.name == "default") && !to.exists() {
-        let from = dir.join(usage_file(&a.agent, &a.name));
+    if let Some(name) = legacy_usage_name(a)
+        && !to.exists()
+    {
+        let from = dir.join(usage_file(&a.agent, name));
         match std::fs::read(&from) {
             Ok(bytes) => {
                 paths::ensure_private_dir(&dir.join("by-id"))?;
@@ -1473,8 +1724,8 @@ pub fn save_usage(a: &Account, u: &Usage) -> Result<()> {
     Ok(())
 }
 
-fn load_usage(agent: &str, name: &str) -> Option<Usage> {
-    serde_json::from_slice(&std::fs::read(usage_path(agent, name)).ok()?).ok()
+fn load_usage(dir: &Path, agent: &str, id: &str) -> Option<Usage> {
+    serde_json::from_slice(&std::fs::read(dir.join("by-id").join(usage_file(agent, id))).ok()?).ok()
 }
 
 /// Latest usage per account, keyed by stable identity.
@@ -1482,16 +1733,33 @@ fn load_usage(agent: &str, name: &str) -> Option<Usage> {
 pub struct UsageMap(pub HashMap<String, Usage>);
 
 impl UsageMap {
-    pub fn load(accounts: &[Account]) -> UsageMap {
-        UsageMap(
-            accounts
-                .iter()
-                .filter_map(|a| {
-                    let _ = migrate_usage(&usage_dir(), a);
-                    load_usage(&a.agent, &a.id).map(|u| (a.key(), u))
-                })
-                .collect(),
-        )
+    pub fn load(accounts: &Accounts) -> UsageMap {
+        Self::load_from(accounts, &usage_dir())
+    }
+
+    fn load_from(accounts: &Accounts, dir: &Path) -> UsageMap {
+        let mut usage = UsageMap::default();
+        for a in accounts.known() {
+            let Some(target) = accounts.by_id(&a.id) else { continue };
+            let _ = migrate_usage(dir, &a);
+            if let Some(u) = load_usage(dir, &a.agent, &a.id) {
+                usage.observe(&target, u);
+            }
+            if let Some(name) = legacy_usage_name(&a)
+                && let Ok(bytes) = std::fs::read(dir.join(usage_file(&a.agent, name)))
+                && let Ok(u) = serde_json::from_slice(&bytes)
+            {
+                usage.observe(&target, u);
+            }
+        }
+        usage
+    }
+
+    fn observe(&mut self, account: &Account, usage: Usage) {
+        let key = account.key();
+        if self.0.get(&key).is_none_or(|old| usage.observed_at > old.observed_at) {
+            self.0.insert(key, usage);
+        }
     }
 
     pub fn get(&self, a: &Account) -> Option<&Usage> {
@@ -1568,6 +1836,297 @@ pub fn describe_reset(resets_at: Option<i64>, now: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn verified_existing_sign_ins_are_ordinary_renameable_accounts() {
+        for kind in AGENTS {
+            let mut all = Accounts::empty();
+            let original = all.get(kind.name, "default").unwrap();
+            assert!(all.all().is_empty());
+            all.adopt_checked(&original, None).unwrap();
+            assert_eq!(all.for_agent(kind.name).len(), 1);
+            let adopted = all.get(kind.name, "Personal").unwrap();
+            assert_eq!(adopted.id, original.id);
+            assert_eq!(adopted.home, original.home);
+            assert!(!adopted.sign_in_required);
+            let legacy = all.accounts.iter().find(|a| a.agent == kind.name && a.name == "default").unwrap();
+            assert_eq!(legacy.home, original.home);
+            assert_eq!(legacy.linked_to.as_deref(), Some(adopted.id.as_str()));
+            assert_ne!(legacy.id, adopted.id);
+            all.rename(kind.name, "default", "Mine").unwrap();
+            assert_eq!(all.get(kind.name, "default").unwrap().name, "Mine");
+            assert_eq!(all.by_id(&original.id).unwrap().name, "Mine");
+            assert!(all.unlisted().iter().all(|a| a.agent != kind.name));
+            assert!(all.remove(kind.name, "Mine"));
+            assert!(all.for_agent(kind.name).is_empty());
+            assert!(all.by_id(&original.id).is_none());
+            assert!(all.unlisted().iter().all(|a| a.agent != kind.name), "forgetting is permanent");
+        }
+    }
+
+    #[test]
+    fn public_identity_proposes_a_name_but_does_not_prove_two_sign_ins_are_the_same() {
+        let mut all = Accounts::empty();
+        let existing = all.get("claude", "default").unwrap();
+        let email = "me+personal@example.com";
+        all.adopt_checked(&existing, Some(email)).unwrap();
+        assert_eq!(all.get("claude", "default").unwrap().name, email);
+        all.rename("claude", email, "Personal").unwrap();
+        assert_eq!(all.proposed_name("claude", None), "Personal2");
+        assert_eq!(all.proposed_name("codex", Some("bad\nname@example.com")), "Personal");
+        let mut other = Accounts::empty();
+        other.add(acct("claude", email, "/a-different-home")).unwrap();
+        other.adopt_checked(&existing, Some(email)).unwrap();
+        assert_eq!(other.all().len(), 1);
+        assert_eq!(other.reviews().len(), 1, "matching email alone still needs review");
+        let pending = other.reviews().pop().unwrap();
+        assert_eq!(pending.public_identity.as_deref(), Some(email));
+        other.review(&pending, None).unwrap();
+        assert_eq!(other.all().len(), 2);
+        assert_eq!(other.get("claude", "default").unwrap().name, "me+personal@example.com2");
+        assert!(other.reviews().is_empty());
+    }
+
+    #[test]
+    fn a_rule_for_a_pending_or_legacy_claude_account_leaves_codex_unrestricted() {
+        let mut all = Accounts::empty();
+        let codex = all.add(acct("codex", "work", "/codex-work")).unwrap();
+        all.add(acct("claude", "work", "/claude-work")).unwrap();
+        let existing = all.get("claude", "default").unwrap();
+        all.rules.push(Rule {
+            workspace: Some("w".into()),
+            path: None,
+            agent: None,
+            accounts: vec!["claude:default".into()],
+            account_ids: None,
+        });
+        let chosen = |all: &Accounts| all.choose("codex", Some("w"), None, &UsageMap::default(), 0);
+        assert_eq!(chosen(&all), Some(codex.clone()), "the implicit legacy account resolves");
+        all.adopt_checked(&existing, None).unwrap();
+        assert_eq!(all.reviews().len(), 1);
+        assert_eq!(chosen(&all), Some(codex.clone()), "a pending review still resolves by name");
+        all.bind_rules();
+        assert_eq!(chosen(&all), Some(codex.clone()), "a pending review still resolves by identity");
+        all.remove("claude", "default");
+        assert_eq!(chosen(&all), None, "a truly dangling rule still forbids every account");
+    }
+
+    #[test]
+    fn review_links_old_references_without_moving_a_running_or_saved_panes_home() {
+        let mut all = Accounts::empty();
+        let original = all.get("claude", "default").unwrap();
+        let mut spec = crate::pane::PaneSpec {
+            command: vec!["claude".into(), "--resume".into(), "conversation".into()],
+            account: Some("claude:default".into()),
+            session: Some("conversation".into()),
+            ..Default::default()
+        };
+        all.add(acct("claude", "patron.bzh", "/patron")).unwrap();
+        all.add(acct("claude", "gmail", "/gmail")).unwrap();
+        all.rules.push(Rule {
+            workspace: Some("old".into()),
+            path: None,
+            agent: Some("claude".into()),
+            accounts: vec!["default".into()],
+            account_ids: None,
+        });
+        all.adopt_checked(&original, None).unwrap();
+        let pending = all.reviews().pop().unwrap();
+        let target = all.get("claude", "patron.bzh").unwrap();
+        assert_eq!(label(&all.get("claude", "default").unwrap()), "claude·Existing account");
+        assert_eq!(all.all().len(), 2);
+        all.bind_pane(&mut spec);
+        let command = spec.command.clone();
+        let home_env = spec.env.clone();
+        all.review(&pending, Some(&target)).unwrap();
+        all.bind_pane(&mut spec);
+        assert_eq!(spec.command, command);
+        assert_eq!(spec.session.as_deref(), Some("conversation"));
+        assert_eq!(spec.account_id.as_deref(), Some(target.id.as_str()));
+        assert_eq!(spec.account.as_deref(), Some("claude:patron.bzh"));
+        assert_eq!(all.launched_on("claude:default", &home_env).unwrap().home, "~/.claude");
+        assert_eq!(all.at_launch_home(target.clone(), &spec.env).home, "~/.claude");
+        assert_eq!(all.by_home("claude", &paths::expand_tilde("~/.claude")).unwrap().id, target.id);
+        assert_eq!(all.by_id(&original.id).unwrap().id, target.id);
+        assert_eq!(all.get("claude", "claude:default").unwrap().id, target.id);
+        assert_eq!(all.get("claude", "default").unwrap().home, target.home, "new launches use the chosen home");
+        assert_eq!(all.choose("claude", Some("old"), None, &UsageMap::default(), 0).unwrap().id, target.id);
+        assert!(all.reviews().is_empty());
+        assert_eq!(all.all().len(), 2);
+        assert!(all.review(&pending, Some(&target)).is_err(), "a second confirmation is stale");
+    }
+
+    #[test]
+    fn a_virtual_default_identity_never_moves_to_a_replacement_home() {
+        let mut all = Accounts::empty();
+        let old = acct("claude", "Personal", "~/.claude");
+        all.accounts.push(old.clone());
+        assert_eq!(all.by_id("default-claude").unwrap().id, old.id);
+        assert!(all.remove("claude", "Personal"));
+        let replacement = all.add(Account { id: new_uuid(), ..old.clone() }).unwrap();
+        assert_ne!(replacement.id, "default-claude");
+        assert!(all.by_id("default-claude").is_none());
+        assert!(all.get("claude", "@default-claude").is_none());
+        assert!(all.by_id(&old.id).is_none());
+        assert_eq!(all.get("claude", "default").unwrap().id, replacement.id, "names may select the replacement");
+    }
+
+    #[test]
+    fn stale_review_choices_leave_the_pending_account_intact() {
+        let mut all = Accounts::empty();
+        let target = all.add(acct("claude", "work", "/work")).unwrap();
+        let original = all.get("claude", "default").unwrap();
+        all.adopt_checked(&original, None).unwrap();
+        let pending = all.reviews().pop().unwrap();
+        all.remove("claude", "work");
+        all.add(Account { id: new_uuid(), ..target.clone() }).unwrap();
+        let before = all.text().unwrap();
+        assert!(all.review(&pending, Some(&target)).is_err());
+        assert_eq!(all.text().unwrap(), before);
+        let mut moved = target;
+        moved.home = "/moved".into();
+        assert!(all.review(&pending, Some(&moved)).is_err());
+        assert_eq!(all.text().unwrap(), before);
+    }
+
+    #[test]
+    fn persisted_review_preserves_the_original_file_and_is_not_offered_again() {
+        let dir = std::env::temp_dir().join(format!("kraal-review-file-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("accounts.toml");
+        let source = "# My accounts.\n[[account]]\nagent = 'claude'\nname = 'default'\nhome = '~/.claude'\nnote = 'keep me'\nfuture = 7\n\n[[account]]\nagent = 'claude'\nname = 'patron.bzh'\nhome = '/patron'\n";
+        std::fs::write(&path, source).unwrap();
+        let existing =
+            Accounts::load_from(&path).unwrap().unlisted().into_iter().find(|a| a.agent == "claude").unwrap();
+        Accounts::update_at(&path, |all| all.adopt_checked(&existing, None)).unwrap();
+        let all = Accounts::load_from(&path).unwrap();
+        let pending = all.reviews().pop().unwrap();
+        let chosen = all.get("claude", "patron.bzh").unwrap();
+        Accounts::update_at(&path, |all| all.review(&pending, Some(&chosen))).unwrap();
+        let all = Accounts::load_from(&path).unwrap();
+        assert!(all.reviews().is_empty());
+        assert_eq!(all.get("claude", "default").unwrap().id, chosen.id);
+        assert_eq!(all.by_id(&existing.id).unwrap().id, chosen.id);
+        assert!(all.unlisted().iter().all(|a| a.agent != "claude"));
+        assert_eq!(all.all().len(), 1);
+        let saved = std::fs::read_to_string(&path).unwrap();
+        assert!(saved.contains("# My accounts.") && saved.contains("note = 'keep me'") && saved.contains("future = 7"));
+        assert_eq!(std::fs::read_to_string(path.with_extension("toml.kraal-bak")).unwrap(), source);
+        Accounts::update_at(&path, |all| all.adopt_checked(&existing, None)).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), saved, "late discovery cannot undo a review");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn invalid_links_and_failed_review_writes_leave_the_file_unchanged() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("kraal-review-failure-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("accounts.toml");
+        for (target, agent) in [("a", "claude"), ("b", "codex"), ("../bad", "claude")] {
+            let source = format!(
+                "[[account]]\nid = 'a'\nname = 'one'\nagent = 'claude'\nhome = '/one'\nlinked_to = '{target}'\n[[account]]\nid = 'b'\nname = 'two'\nagent = '{agent}'\nhome = '/two'\n"
+            );
+            std::fs::write(&path, &source).unwrap();
+            assert!(Accounts::update_at(&path, |_| Ok(())).is_err());
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), source);
+        }
+        let mut all = Accounts::empty();
+        all.path = path.clone();
+        all.add(acct("claude", "work", "/work")).unwrap();
+        let existing = all.get("claude", "default").unwrap();
+        all.adopt_checked(&existing, None).unwrap();
+        all.save().unwrap();
+        let pending = all.reviews().pop().unwrap();
+        let before = std::fs::read_to_string(&path).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let result = Accounts::update_at(&path, |all| all.review(&pending, None));
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        if result.is_err() {
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+            assert_eq!(Accounts::load_from(&path).unwrap().reviews().len(), 1);
+            Accounts::update_at(&path, |all| all.review(&pending, None)).unwrap();
+        }
+        assert!(Accounts::load_from(&path).unwrap().reviews().is_empty());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn same_canonical_home_is_one_account_and_keeps_legacy_names_ids_and_notes() {
+        let dir = std::env::temp_dir().join(format!("kraal-same-home-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("home")).unwrap();
+        let alias = dir.join("alias");
+        std::os::unix::fs::symlink(dir.join("home"), &alias).unwrap();
+        let path = dir.join("accounts.toml");
+        let source = format!(
+            "# Mine.\n[[account]]\nname = 'work'\nagent = 'claude'\nhome = {:?}\n\n# Keep this note.\n[[account]]\nname = 'other'\nagent = 'claude'\nhome = {:?}\nnote = 'old label'\nfuture = 7\n",
+            dir.join("home").display().to_string(),
+            alias.display().to_string()
+        );
+        std::fs::write(&path, &source).unwrap();
+        let all = Accounts::load_from(&path).unwrap();
+        let first = all.get("claude", "work").unwrap();
+        assert_eq!(all.all().len(), 1);
+        assert_eq!(all.get("claude", "other").unwrap().id, first.id);
+        let old_alias = all.accounts.iter().find(|a| a.name == "other").unwrap().id.clone();
+        assert_eq!(all.by_id(&old_alias).unwrap().id, first.id);
+        Accounts::update_at(&path, |_| Ok(())).unwrap();
+        let saved = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            saved.contains("# Keep this note.") && saved.contains("future = 7") && saved.contains("note = 'old label'")
+        );
+        assert!(saved.contains("linked_to ="));
+        assert_eq!(std::fs::read_to_string(path.with_extension("toml.kraal-bak")).unwrap(), source);
+        let mut all = Accounts::load_from(&path).unwrap();
+        let added = all.add(acct("claude", "third", alias.to_str().unwrap())).unwrap();
+        assert_eq!(added.id, first.id);
+        assert_eq!(all.all().len(), 1);
+        assert_eq!(all.get("claude", "third").unwrap().id, first.id);
+        all.add(acct("codex", "work", alias.to_str().unwrap())).unwrap();
+        assert_eq!(all.all().len(), 2, "different agents remain separate");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn linked_usage_uses_the_latest_observation_and_never_adds_two_homes() {
+        let dir = std::env::temp_dir().join(format!("kraal-linked-usage-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("by-id")).unwrap();
+        let mut all = Accounts::empty();
+        let target = all.add(acct("claude", "patron.bzh", "/patron")).unwrap();
+        let original = all.get("claude", "default").unwrap();
+        all.adopt_checked(&original, None).unwrap();
+        let pending = all.reviews().pop().unwrap();
+        all.review(&pending, Some(&target)).unwrap();
+        let observation = |percent, at| Usage {
+            observed_at: at,
+            five_hour: Some(Window { used_percent: percent, resets_at: None }),
+            ..Default::default()
+        };
+        for (account, usage) in [(&original, observation(57.0, 200)), (&target, observation(40.0, 100))] {
+            std::fs::write(
+                dir.join("by-id").join(usage_file(&account.agent, &account.id)),
+                serde_json::to_vec(&usage).unwrap(),
+            )
+            .unwrap();
+        }
+        let usage = UsageMap::load_from(&all, &dir);
+        assert_eq!(usage.0.len(), 1);
+        assert_eq!(usage.peak(&target, 200), Some(57.0));
+        std::fs::write(
+            dir.join("by-id").join(usage_file(&target.agent, &target.id)),
+            serde_json::to_vec(&observation(20.0, 300)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(UsageMap::load_from(&all, &dir).peak(&target, 300), Some(20.0));
+        assert!(dir.join("by-id").join(usage_file(&original.agent, &original.id)).exists());
+        std::fs::write(dir.join("claude-default.json"), serde_json::to_vec(&observation(60.0, 400)).unwrap()).unwrap();
+        assert_eq!(
+            UsageMap::load_from(&all, &dir).peak(&target, 400),
+            Some(60.0),
+            "a hook from an older kraal still reports usage"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn agents_started_directly_resume_with_their_arguments() {
@@ -1728,6 +2287,9 @@ mod tests {
             threshold: None,
             note: None,
             sign_in_required: false,
+            review: false,
+            public_identity: None,
+            linked_to: None,
         };
         assert_eq!(conversation_exists(&a, "abc").unwrap(), Some(false));
         std::fs::create_dir_all(home.join("projects/-home-me")).unwrap();
@@ -1775,6 +2337,9 @@ mod tests {
             threshold: None,
             note: None,
             sign_in_required: false,
+            review: false,
+            public_identity: None,
+            linked_to: None,
         };
         a.id = a.legacy_id();
         a
@@ -1848,11 +2413,11 @@ mod tests {
     }
 
     #[test]
-    fn implicit_default_account() {
+    fn legacy_default_is_resolvable_but_never_listed() {
         let a = Accounts::empty();
         let codex = a.for_agent("codex");
-        assert_eq!(codex.len(), 1);
-        assert_eq!(codex[0].name, "default");
+        assert!(codex.is_empty());
+        assert_eq!(a.get("codex", "default").unwrap().home, "~/.codex");
         // When an account uses the default home, no implicit one is added.
         let a = accounts();
         let names: Vec<String> = a.for_agent("claude").into_iter().map(|x| x.name).collect();
@@ -2097,7 +2662,7 @@ mod tests {
         rename_in(&file, &usage, "claude", "perso", "me").unwrap();
         let a = Accounts::load_from(&file).unwrap();
         let names: Vec<String> = a.all().iter().map(label).collect();
-        assert_eq!(names, ["claude·work", "claude·me", "codex·default", "codex·pro"]);
+        assert_eq!(names, ["claude·work", "claude·me", "codex·pro"]);
         for (rule, names) in rules.iter_mut().zip([vec!["work", "pro"], vec!["work", "me"], vec!["pro"], vec!["me"]]) {
             rule.accounts = names.into_iter().map(String::from).collect();
         }
@@ -2125,7 +2690,7 @@ mod tests {
         refused("claude", "work", "me", "already has an account named");
         refused("claude", "work", "my work", "invalid account name");
         refused("claude", "work", "default", "is the account in ~/.claude");
-        refused("codex", "default", "mine", "cannot be renamed");
+        refused("codex", "default", "mine", "check the existing sign-in");
         refused("claude", "gone", "here", "no account named");
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -2255,7 +2820,8 @@ mod tests {
         all.rename("claude", "pro", "work").unwrap();
         all.bind_pane(&mut pane);
         assert_eq!(pane.account.as_deref(), Some("claude:work"));
-        let replacement = Account { id: new_uuid(), sign_in_required: true, ..old.clone() };
+        let replacement =
+            Account { id: new_uuid(), home: "/replacement".into(), sign_in_required: true, ..old.clone() };
         all.add(replacement.clone()).unwrap();
         assert_eq!(all.launched_on("claude:pro", &pane.env).unwrap().id, old.id);
         all.remove("claude", "work");
@@ -2364,6 +2930,9 @@ mod tests {
         let adopted = all.add(Account { id: new_uuid(), name: "personal".into(), ..old.clone() }).unwrap();
         assert_eq!(adopted.id, old.id, "callers get the adopted identity too");
         assert_eq!(all.for_agent("claude"), std::slice::from_ref(&adopted));
+        let legacy = all.accounts.iter().find(|a| a.name == "default").unwrap();
+        assert_eq!(legacy.linked_to.as_deref(), Some(adopted.id.as_str()));
+        assert!(legacy.same_home(&adopted));
         all.bind_pane(&mut pane);
         assert_eq!(pane.account.as_deref(), Some("claude:personal"));
         assert_eq!(pane.account_id.as_deref(), Some(old.id.as_str()));

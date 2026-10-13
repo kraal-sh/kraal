@@ -50,7 +50,13 @@ impl Server {
         }
         match ev {
             InputEvent::Key(k) => match (k.code, k.mods.ctrl) {
-                (KeyCode::Esc, _) | (KeyCode::Char('c'), true) | (KeyCode::Char('g'), true) => return Mode::Normal,
+                (KeyCode::Esc, _) | (KeyCode::Char('c'), true) | (KeyCode::Char('g'), true) => {
+                    return if p.kind == PickerKind::AccountReview {
+                        Mode::Picker(self.agent_picker(id, None))
+                    } else {
+                        Mode::Normal
+                    };
+                }
                 (KeyCode::Enter, _) => {
                     let Some(item) = p.current().cloned() else { return Mode::Picker(p) };
                     return self.pick(id, &p, item);
@@ -126,9 +132,7 @@ impl Server {
                                 );
                                 return Mode::Picker(self.agent_picker(id, None));
                             }
-                            Ok(false) => {
-                                self.toast(id, "the account is gone or is the default account; reopen the account list")
-                            }
+                            Ok(false) => self.toast(id, "the account is gone; reopen the account list"),
                             Err(e) => self.toast(id, format!("{e:#}")),
                         }
                     }
@@ -223,7 +227,7 @@ impl Server {
                     }
                 }
                 // A question that may come while the user types elsewhere: typing does not answer it.
-                _ if p.kind == PickerKind::EditConflict => {}
+                _ if matches!(p.kind, PickerKind::EditConflict | PickerKind::AccountReview) => {}
                 _ => {
                     let before = p.query.clone();
                     if crate::server::ui::edit_line(&mut p.query, &mut p.cursor, &k) && p.query != before {
@@ -232,7 +236,7 @@ impl Server {
                     }
                 }
             },
-            InputEvent::Paste(_) if p.kind == PickerKind::EditConflict => {}
+            InputEvent::Paste(_) if matches!(p.kind, PickerKind::EditConflict | PickerKind::AccountReview) => {}
             InputEvent::Paste(data) => {
                 // A search field: what does not fit is simply not pasted.
                 let _ = crate::server::ui::paste_line(&mut p.query, &mut p.cursor, &String::from_utf8_lossy(&data));
@@ -258,7 +262,7 @@ impl Server {
         Mode::Picker(p)
     }
 
-    pub(super) fn pick(&mut self, id: ClientId, p: &Picker, item: PickItem) -> Mode {
+    pub(in crate::server) fn pick(&mut self, id: ClientId, p: &Picker, item: PickItem) -> Mode {
         match item.action {
             PickAction::Command(command) => return self.command(id, command),
             PickAction::SwitchWorkspace(ws) => self.show_workspace(id, ws),
@@ -293,6 +297,18 @@ impl Server {
             PickAction::RunBlock(i) => return self.run_block(id, i),
             PickAction::RunbookList => return self.runbook_list(id),
             PickAction::Tool { pane, name } => return self.tool_request(id, pane, &name, None),
+            PickAction::ReviewAccount(existing) => return Mode::Picker(self.review_account_picker(&existing)),
+            PickAction::CheckExisting { agent } => {
+                self.retry_existing_account(&agent);
+                return Mode::Picker(self.agent_picker(id, None));
+            }
+            PickAction::UseExisting { existing, target } => {
+                let name = target.as_ref().map_or(existing.name.as_str(), |a| &a.name);
+                return Mode::confirm(
+                    format!("Use {name}?\nYour running agents will keep working.\nThis account will appear once."),
+                    ConfirmAction::UseExisting { existing: Box::new(existing), target },
+                );
+            }
             PickAction::AgentLaunch { agent, account } => {
                 let ws = self.clients.get(&id).map(|c| c.workspace).unwrap_or(0);
                 let focus = self.client_focus(id);

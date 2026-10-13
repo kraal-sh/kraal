@@ -309,6 +309,17 @@ impl Server {
         }
         let action = q.action;
         match action {
+            ConfirmAction::UseExisting { existing, target } => {
+                if yes {
+                    if let Err(e) = self.confirm_existing_account(id, &existing, target.as_ref()) {
+                        self.toast(id, format!("{e:#}"));
+                        self.reload_accounts();
+                        return Mode::Picker(self.agent_picker(id, None));
+                    }
+                    return Mode::Picker(self.agent_picker(id, None));
+                }
+                return Mode::Picker(self.review_account_picker(&existing));
+            }
             ConfirmAction::StopAndSwitch { pane, token } => {
                 self.confirm_switch(pane, token, id, yes);
                 return Mode::Normal;
@@ -339,7 +350,8 @@ impl Server {
         match yes {
             true => {
                 match action {
-                    ConfirmAction::StopAndSwitch { .. }
+                    ConfirmAction::UseExisting { .. }
+                    | ConfirmAction::StopAndSwitch { .. }
                     | ConfirmAction::Production { .. }
                     | ConfirmAction::RunRunbook
                     | ConfirmAction::RunBlock { .. }

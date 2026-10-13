@@ -1,9 +1,9 @@
-# Which account an agent starts on, by workspace and by directory, and what happens when an
-# account is nearly used up.
-# Add these tables to ~/.config/kraal/accounts.toml with `kraal accounts edit`: that file also
-# holds your [[account]] entries, which `kraal accounts add claude work` writes. `kraal accounts`
-# then lists every account with its usage.
-# Needs no account but "default", the one each agent already has: a rule skips the others.
+# Which account an agent starts on, by workspace or directory, and what happens at its limit.
+# Add these tables to ~/.config/kraal/accounts.toml with `kraal accounts edit`.
+# That file also holds [[account]] entries, written by `kraal accounts add claude work`.
+# Needs the names in `kraal accounts`: a verified existing sign-in is named Personal unless
+# the agent supplies a public identity. Rename it or adjust these rules to its actual name.
+# A rule skips accounts that are not listed.
 
 [limits]
 threshold = 85                  # percent of the 5-hour or weekly window: the account is full
@@ -18,10 +18,10 @@ mode = "ask"                    # "notify" tells you, "ask" offers, "auto" check
 # work account, and on your own when it has none or that one is over the threshold.
 [[rule]]
 workspace = "shop"
-accounts = ["work", "default"]
+accounts = ["work", "Personal"]
 
 # In this directory and below it (its worktrees count), Claude only uses your own account.
 [[rule]]
 path = "~/src/personal"
 agent = "claude"
-accounts = ["default"]
+accounts = ["Personal"]

@@ -210,10 +210,10 @@ fn the_files_kraal_writes_to_keep_their_text() {
         example
             .replace("threshold = 85", "threshold = 70")
             .replace(
-                "accounts = [\"work\", \"default\"]",
-                "accounts = [\"work\", \"default\"]\naccount_ids = [\n    \"work\",\n    \"claude:@default-claude\",\n    \"codex:@default-codex\",\n]"
+                "accounts = [\"work\", \"Personal\"]",
+                "accounts = [\"work\", \"Personal\"]\naccount_ids = [\n    \"work\",\n    \"Personal\",\n]"
             )
-            .replace("accounts = [\"default\"]", "accounts = [\"default\"]\naccount_ids = [\"claude:@default-claude\"]")
+            .replace("accounts = [\"Personal\"]", "accounts = [\"Personal\"]\naccount_ids = [\"Personal\"]")
     );
     assert_ne!(example, example.replace("threshold = 85", "threshold = 70"));
 }
@@ -222,11 +222,15 @@ fn the_files_kraal_writes_to_keep_their_text() {
 #[test]
 fn every_workspace_opens_as_it_is_written() {
     let env = installed("exopen");
-    for program in ["ssh", "claude", "make"] {
+    for program in ["ssh", "make"] {
         fake(&env, program, "exec sleep 600");
     }
+    fake(&env, "claude", "[ \"$*\" = 'auth status' ] && exit 0\nexec sleep 600");
     // Codex is also asked for its usage, which this one does not tell.
-    fake(&env, "codex", "[ \"$1\" = app-server ] && exit 1\nexec sleep 600");
+    fake(&env, "codex", "[ \"$*\" = 'login status' ] && exit 0\n[ \"$1\" = app-server ] && exit 1\nexec sleep 600");
+    let accounts = json(&quiet(kraal(&env, &["accounts", "list", "--json"])));
+    assert_eq!(accounts.len(), 2);
+    assert!(accounts.iter().all(|a| a["name"] == "Personal" && a["status"] == "signed_in"));
     for checkout in ["home/src/shop", "home/src/shop-docs"] {
         std::fs::create_dir_all(env.root.join(checkout)).unwrap();
     }

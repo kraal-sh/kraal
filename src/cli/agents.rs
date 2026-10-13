@@ -8,19 +8,29 @@ use crate::protocol::{PaneInfo, Placement, Request, Response};
 use crate::{account_status, accounts, codex_usage, git, integration, paths, server, worktree_setup};
 
 pub(super) fn accounts(action: AccountsCmd) -> Result<()> {
-    let all = accounts::Accounts::load()?;
+    let mut all = accounts::Accounts::load()?;
+    let discover = matches!(&action, AccountsCmd::List { .. } | AccountsCmd::Review { .. } | AccountsCmd::Refresh)
+        || matches!(&action, AccountsCmd::Rename { account, .. }
+            if find_account(&all, account).is_ok_and(|a| a.name == "default"));
+    let discovered = if discover {
+        let discovered = account_status::discover(&all)?;
+        all = accounts::Accounts::load()?;
+        discovered
+    } else {
+        Vec::new()
+    };
     match action {
         AccountsCmd::List { json } => {
             let list = all.all();
             let now = accounts::now();
-            let usage = accounts::UsageMap::load(&list);
+            let usage = accounts::UsageMap::load(&all);
             // Ask every agent in parallel whether its account is logged in.
             let status: Vec<account_status::Status> = std::thread::scope(|s| {
                 let handles: Vec<_> = list.iter().map(|a| s.spawn(move || account_status::check(a))).collect();
                 handles.into_iter().map(|h| h.join().unwrap_or(account_status::Status::CouldNotCheck)).collect()
             });
             if json {
-                let v: Vec<serde_json::Value> = list
+                let mut v: Vec<serde_json::Value> = list
                     .iter()
                     .zip(&status)
                     .map(|(a, st)| {
@@ -30,6 +40,16 @@ pub(super) fn accounts(action: AccountsCmd) -> Result<()> {
                         })
                     })
                     .collect();
+                for a in all.reviews() {
+                    v.push(serde_json::json!({ "agent": a.agent, "name": accounts::existing_label(&a.agent),
+                        "home": a.home, "logged_in": true, "status": "review_required", "usage": null }));
+                }
+                for (a, status) in &discovered {
+                    if *status == account_status::Status::CouldNotCheck {
+                        v.push(serde_json::json!({ "agent": a.agent, "name": accounts::existing_label(&a.agent),
+                            "home": a.home, "logged_in": null, "status": status, "usage": null }));
+                    }
+                }
                 println!("{}", serde_json::to_string_pretty(&v)?);
                 return Ok(());
             }
@@ -43,11 +63,38 @@ pub(super) fn accounts(action: AccountsCmd) -> Result<()> {
                     paths::shorten_home(&paths::expand_tilde(&a.home))
                 );
             }
+            for a in all.reviews() {
+                println!("{} · Review: `kraal accounts review {}`", accounts::existing_label(&a.agent), a.agent);
+            }
+            for (a, status) in &discovered {
+                if *status == account_status::Status::CouldNotCheck {
+                    println!(
+                        "{} · Could not verify. Run `kraal accounts list` to check again.",
+                        accounts::existing_label(&a.agent)
+                    );
+                }
+            }
             println!("threshold {}% · when reached: {:?}", all.limits.threshold, all.limits.mode);
             Ok(())
         }
         AccountsCmd::Add { agent, name, home, threshold, no_login } => {
-            let home = home.unwrap_or_else(|| accounts::default_home_for(&agent, &name).display().to_string());
+            let existing = if home.is_none() && all.for_agent(&agent).is_empty() {
+                match all.unlisted().into_iter().find(|a| a.agent == agent) {
+                    Some(a) => match account_status::check(&a) {
+                        account_status::Status::SignedIn => Some(a),
+                        account_status::Status::CouldNotCheck => {
+                            bail!("could not verify the existing sign-in; run `kraal accounts list` to check again")
+                        }
+                        _ => None,
+                    },
+                    None => None,
+                }
+            } else {
+                None
+            };
+            let home = home
+                .or_else(|| existing.as_ref().map(|a| a.home.clone()))
+                .unwrap_or_else(|| accounts::default_home_for(&agent, &name).display().to_string());
             let a = accounts::Account {
                 id: accounts::new_uuid(),
                 name,
@@ -56,22 +103,64 @@ pub(super) fn accounts(action: AccountsCmd) -> Result<()> {
                 threshold,
                 note: None,
                 sign_in_required: !no_login,
+                review: false,
+                public_identity: None,
+                linked_to: None,
             };
+            // Adding a home already linked by Review uses its chosen account and home.
+            let effective = all.clone().add(a.clone())?;
+            let checked = if existing.as_ref().is_some_and(|a| a.id == effective.id && a.same_home(&effective)) {
+                account_status::Status::SignedIn
+            } else if paths::expand_tilde(&effective.home).is_dir()
+                || all.by_home(&effective.agent, &paths::expand_tilde(&effective.home)).is_some()
+            {
+                account_status::check(&effective)
+            } else {
+                account_status::Status::NotSignedIn
+            };
+            anyhow::ensure!(
+                no_login || checked != account_status::Status::CouldNotCheck,
+                "could not verify this home's sign-in; run the add command again to check it"
+            );
+            let verified = checked == account_status::Status::SignedIn;
+            let requested_name = a.name.clone();
             let (a, notes) = accounts::Accounts::update(|all| {
-                let a = all.add(a)?;
-                let notes = accounts::prepare_home(&a)?;
+                let mut a = a;
+                if let Some(existing) = &existing {
+                    anyhow::ensure!(
+                        all.for_agent(&a.agent).is_empty()
+                            && all
+                                .unlisted()
+                                .iter()
+                                .any(|current| current.id == existing.id && current.same_home(existing)),
+                        "the account list changed; run `kraal accounts list` before adding an account"
+                    );
+                }
+                a.sign_in_required = !no_login && !verified;
+                let mut a = all.add(a)?;
+                anyhow::ensure!(
+                    a.id == effective.id && a.same_home(&effective),
+                    "the account changed while checking sign-in; run the add command again"
+                );
+                if verified {
+                    all.set_sign_in_required(&a, false);
+                    a.sign_in_required = false;
+                }
+                let notes = if verified { Vec::new() } else { accounts::prepare_home(&a)? };
                 Ok((a, notes))
             })?;
             for note in notes {
                 println!("  {note}");
             }
-            println!("added {} ({})", accounts::label(&a), paths::shorten_home(&paths::expand_tilde(&a.home)));
-            if no_login {
+            let action = if a.name == requested_name { "added" } else { "using existing account" };
+            println!("{action} {} ({})", accounts::label(&a), paths::shorten_home(&paths::expand_tilde(&a.home)));
+            if no_login || verified {
                 return Ok(());
             }
             println!("logging in with {}'s own login…", a.agent);
             login(&a)
         }
+        AccountsCmd::Review { agent } => review_account(&all, &agent),
         AccountsCmd::Login { account } => {
             let a = find_account(&all, &account)?;
             login(&a)
@@ -80,7 +169,7 @@ pub(super) fn accounts(action: AccountsCmd) -> Result<()> {
             let a = find_account(&all, &account)?;
             accounts::Accounts::update(|all| {
                 if !all.remove(&a.agent, &a.key()) {
-                    bail!("{} is the agent's default account; it cannot be forgotten", accounts::label(&a));
+                    bail!("no saved account to forget; run `kraal accounts list` first");
                 }
                 Ok(())
             })?;
@@ -149,12 +238,55 @@ pub(super) fn accounts(action: AccountsCmd) -> Result<()> {
     }
 }
 
+fn review_account(all: &accounts::Accounts, agent: &str) -> Result<()> {
+    use std::io::{BufRead, IsTerminal, Write};
+    let existing = all.reviews().into_iter().find(|a| a.agent == agent).context("no existing account needs review")?;
+    anyhow::ensure!(
+        std::io::stdin().is_terminal(),
+        "run `kraal accounts review {agent}` in a terminal to choose an account"
+    );
+    let choices = all.for_agent(agent);
+    println!("{}\nWhich account is this?", accounts::existing_label(agent));
+    if let Some(identity) = &existing.public_identity {
+        println!("{identity}");
+    }
+    for (i, a) in choices.iter().enumerate() {
+        println!("{}. {}", i + 1, a.name);
+    }
+    println!("{}. A different account", choices.len() + 1);
+    eprint!("Choose a number (Enter cancels): ");
+    std::io::stderr().flush()?;
+    let mut line = String::new();
+    std::io::stdin().lock().read_line(&mut line)?;
+    if line.trim().is_empty() {
+        return Ok(());
+    }
+    let n = line
+        .trim()
+        .parse::<usize>()
+        .ok()
+        .filter(|n| *n > 0 && *n <= choices.len() + 1)
+        .context("no account chosen; run the review again and choose a listed number")?;
+    let target = choices.get(n - 1);
+    let name = target.map_or(existing.name.as_str(), |a| &a.name);
+    println!("Use {name}?\nYour running agents will keep working.\nThis account will appear once.");
+    eprint!("Use account? [y/N] ");
+    std::io::stderr().flush()?;
+    line.clear();
+    std::io::stdin().lock().read_line(&mut line)?;
+    if matches!(line.trim(), "y" | "Y" | "yes") {
+        accounts::Accounts::update(|all| all.review(&existing, target))?;
+        println!("Account updated");
+    }
+    Ok(())
+}
+
 /// `agent:name` or a bare account name (searched across agents).
 fn find_account(all: &accounts::Accounts, spec: &str) -> Result<accounts::Account> {
     if let Some((agent, name)) = spec.split_once(':').or_else(|| spec.split_once('·')) {
         return all.get(agent, name).with_context(|| accounts::missing_account(agent, name));
     }
-    let matches: Vec<accounts::Account> = all.all().into_iter().filter(|a| a.name == spec).collect();
+    let matches: Vec<accounts::Account> = accounts::AGENTS.iter().filter_map(|kind| all.get(kind.name, spec)).collect();
     match matches.len() {
         1 => Ok(matches.into_iter().next().unwrap()),
         0 => bail!("no account named {spec:?} (see `kraal accounts`)"),
@@ -251,7 +383,7 @@ fn exec_agent(
     if account.is_none() && all.undecided(agent, cwd.as_deref()) {
         bail!("git did not say in time which repository this directory belongs to; try again");
     }
-    let usage = accounts::UsageMap::load(&all.all());
+    let usage = accounts::UsageMap::load(&all);
     let a = match account {
         Some(name) => all.get(agent, name).with_context(|| accounts::missing_account(agent, name))?,
         None => all

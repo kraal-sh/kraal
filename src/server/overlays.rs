@@ -414,10 +414,21 @@ pub(super) fn draw_picker(p: &Picker, screen: Rect, buf: &mut Buffer) -> Option<
         return None;
     }
     // The search line.
-    let prompt = Line::from(vec![Span::styled(t.prompt(), Style::default().fg(t.accent)), Span::raw(p.query.clone())]);
+    let review = p.kind == super::ui::PickerKind::AccountReview;
+    let prompt = if review {
+        Line::from("Which account is this?")
+    } else {
+        Line::from(vec![Span::styled(t.prompt(), Style::default().fg(t.accent)), Span::raw(p.query.clone())])
+    };
     buf.set_line(inner.x + 1, inner.y, &prompt, inner.width.saturating_sub(2));
     for x in inner.x..inner.x + inner.width {
         buf[(x, inner.y + 1)].set_symbol(t.hline()).set_fg(t.dim);
+    }
+    if review
+        && let Some(super::ui::PickAction::UseExisting { existing, .. }) = p.items.first().map(|i| &i.action)
+        && let Some(identity) = &existing.public_identity
+    {
+        buf.set_stringn(inner.x + 1, inner.y + 1, identity, inner.width.saturating_sub(2) as usize, dim());
     }
     let list = layout.list;
     let row_style =
@@ -495,7 +506,7 @@ pub(super) fn draw_picker(p: &Picker, screen: Rect, buf: &mut Buffer) -> Option<
     if keys.len() > 1 {
         footer.push(("tab", "more actions"));
     }
-    footer.push(("esc", "close"));
+    footer.push(("esc", if review { "Back" } else { "close" }));
     let count = if p.query.is_empty() {
         format!("{}", p.filtered.len())
     } else {
@@ -503,6 +514,9 @@ pub(super) fn draw_picker(p: &Picker, screen: Rect, buf: &mut Buffer) -> Option<
     };
     let line = key_line(&footer, &count, inner.width.saturating_sub(2));
     buf.set_line(inner.x + 1, inner.y + inner.height - 1, &line, inner.width.saturating_sub(2));
+    if review {
+        return None;
+    }
     let before: String = p.query.chars().take(p.cursor).collect();
     let x = inner.x + 1 + columns(t.prompt()) as u16 + before.width() as u16;
     (x < inner.x + inner.width).then_some(Cursor { x, y: inner.y, shape: CursorShape::Bar, blinking: true })

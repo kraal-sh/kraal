@@ -833,6 +833,11 @@ fn codex_usage_leaves_nothing_behind() {
     let env = Env::new("usage");
     let home = env.root.join("home");
     std::fs::create_dir_all(home.join(".codex")).unwrap();
+    std::fs::write(
+        env.root.join("config/kraal/accounts.toml"),
+        "[[account]]\nname = \"work\"\nagent = \"codex\"\nhome = \"~/.codex\"\n",
+    )
+    .unwrap();
     let bin = env.root.join("bin");
     std::fs::create_dir_all(&bin).unwrap();
     let pidfile = env.root.join("helper.pid");
@@ -856,6 +861,7 @@ sleep 600
     let mut c = env.cmd(&["accounts", "refresh"]);
     c.env("PATH", path).stdin(std::process::Stdio::null()).stderr(std::process::Stdio::null());
     let out = c.output().unwrap();
+    assert!(out.status.success());
     let text = String::from_utf8_lossy(&out.stdout);
     assert!(text.contains("42%"), "{text}");
     let pid = std::fs::read_to_string(&pidfile).unwrap().trim().to_string();
@@ -6827,12 +6833,14 @@ fn choosing_the_current_account_keeps_running_and_exited_panes_as_they_are() {
             &bin.join(agent),
             "#!/bin/sh\n[ \"$1\" = app-server ] && exit 0\n[ \"$2\" = status ] && exit 0\nprintf '%s\\n' \"$$\" >> \"$HOME/starts\"\necho READY\nwhile IFS= read -r line; do\n    [ \"$line\" = quit ] && exit 0\n    printf 'reply:%s\\n' \"$line\"\ndone\n",
         );
-        let home = env.root.join(format!("{agent}-home"));
-        std::fs::create_dir_all(&home).unwrap();
-        accounts.push_str(&format!(
-            "[[account]]\nname = \"work\"\nagent = {agent:?}\nhome = {:?}\n",
-            home.display().to_string()
-        ));
+        for name in ["other", "work"] {
+            let home = env.root.join(format!("{agent}-{name}-home"));
+            std::fs::create_dir_all(&home).unwrap();
+            accounts.push_str(&format!(
+                "[[account]]\nname = {name:?}\nagent = {agent:?}\nhome = {:?}\n",
+                home.display().to_string()
+            ));
+        }
     }
     std::fs::write(env.root.join("config/kraal/accounts.toml"), accounts).unwrap();
     env.workspace("w", "layout {\n    pane name=\"shell\"\n}\n");
@@ -7520,6 +7528,394 @@ fn closing_a_check_ignores_its_late_success() {
     assert!(!client.rows().iter().any(|r| r.contains("is signed in")));
 }
 
+fn existing_sign_in_agent(env: &Env, agent: &str) -> String {
+    let bin = env.root.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    write_script(
+        &bin.join(agent),
+        r#"#!/bin/sh
+case "$0" in
+    *claude) home="${CLAUDE_CONFIG_DIR:-$HOME/.claude}" ;;
+    *codex) home="${CODEX_HOME:-$HOME/.codex}" ;;
+esac
+case "$*" in
+    'auth status'|'login status')
+        echo "$home" >> "$HOME/status-checks"
+        test -f "$home/status" || exit 1
+        test ! -f "$home/public-status" || cat "$home/public-status"
+        exit "$(cat "$home/status")"
+        ;;
+    'auth login'|'login') echo unexpected >> "$HOME/logins"; exit 2 ;;
+    app-server*) exit 1 ;;
+esac
+echo "$$" >> "$home/starts"
+if [ "$1" = --session-id ]; then
+    mkdir -p "$home/projects/work"
+    printf '{"message":1}\n' > "$home/projects/work/$2.jsonl"
+fi
+echo "READY home=$home"
+while IFS= read -r line; do printf 'reply:%s\n' "$line"; done
+"#,
+    );
+    format!("{}:{}", bin.display(), std::env::var("PATH").unwrap_or_default())
+}
+
+#[test]
+fn existing_sign_ins_are_verified_adopted_and_renamed_without_login_or_credential_copy() {
+    for agent in ["claude", "codex"] {
+        let env = Env::new(&format!("adopt-{agent}"));
+        let path = existing_sign_in_agent(&env, agent);
+        let home = env.root.join(format!("home/.{agent}"));
+        let run = |args: &[&str]| {
+            let out = env.cmd(args).env("PATH", &path).output().unwrap();
+            assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+            String::from_utf8(out.stdout).unwrap()
+        };
+        let list = || serde_json::from_str::<serde_json::Value>(&run(&["accounts", "list", "--json"])).unwrap();
+        assert_eq!(list(), serde_json::json!([]), "unsigned and absent agents add no accounts");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(home.join("credential"), "PRIVATE-CREDENTIAL").unwrap();
+        for (status, count) in [("1", 0), ("2", 1), ("0", 1)] {
+            std::fs::write(home.join("status"), status).unwrap();
+            if agent == "claude" {
+                std::fs::write(home.join("public-status"), r#"{"loggedIn":true,"email":"me@example.com"}"#).unwrap();
+            }
+            let listed = list();
+            assert_eq!(listed.as_array().unwrap().len(), count);
+            if status == "2" {
+                assert_eq!(listed[0]["status"], "could_not_check");
+                assert!(!env.root.join("config/kraal/accounts.toml").exists());
+                assert!(run(&["accounts", "list"]).contains("check again"));
+            }
+            if status == "0" {
+                assert_eq!(listed[0]["name"], if agent == "claude" { "me@example.com" } else { "Personal" });
+                assert_eq!(listed[0]["status"], "signed_in");
+            }
+        }
+        run(&["accounts", "rename", &format!("{agent}:default"), "Mine"]);
+        assert_eq!(list()[0]["name"], "Mine");
+        assert_eq!(list().as_array().unwrap().len(), 1);
+        assert!(!env.root.join("home/logins").exists());
+        assert!(!env.root.join("home/.local/share/kraal/accounts").exists());
+        assert_eq!(std::fs::read_to_string(home.join("credential")).unwrap(), "PRIVATE-CREDENTIAL");
+        run(&["accounts", "rm", &format!("{agent}:Mine")]);
+        assert_eq!(list(), serde_json::json!([]), "forgotten standard homes are not rediscovered");
+        assert!(home.join("credential").exists());
+    }
+}
+
+#[test]
+fn accounts_add_adopts_a_verified_home_and_aliases_do_not_add_an_account() {
+    for explicit in [false, true] {
+        let env = Env::new(if explicit { "adopt-home" } else { "adopt-add" });
+        let path = existing_sign_in_agent(&env, "claude");
+        let home = env.root.join("home/.claude");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(home.join("status"), "0").unwrap();
+        std::fs::write(home.join("credential"), "kept").unwrap();
+        let mut args = vec!["accounts", "add", "claude", "Mine"];
+        if explicit {
+            args.extend(["--home", home.to_str().unwrap()]);
+        }
+        let out = env.cmd(&args).env("PATH", &path).output().unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        assert!(!String::from_utf8_lossy(&out.stdout).contains("logging in"));
+        let alias = env.root.join("alias");
+        std::os::unix::fs::symlink(&home, &alias).unwrap();
+        let out = env
+            .cmd(&["accounts", "add", "claude", "Another", "--home", alias.to_str().unwrap()])
+            .env("PATH", &path)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        let out = env.cmd(&["accounts", "list", "--json"]).env("PATH", &path).output().unwrap();
+        let list: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(list.as_array().unwrap().len(), 1);
+        assert_eq!(list[0]["name"], "Mine");
+        assert!(!env.root.join("home/logins").exists());
+        assert_eq!(std::fs::read_to_string(home.join("credential")).unwrap(), "kept");
+        let out = env.cmd(&["accounts", "rename", "Another", "Personal"]).env("PATH", &path).output().unwrap();
+        assert!(out.status.success(), "the old alias is still usable");
+    }
+}
+
+#[test]
+fn accounts_add_checks_the_home_chosen_by_review() {
+    for signed_in in [false, true] {
+        let env = Env::new(&format!("add-reviewed-{signed_in}"));
+        let path = existing_sign_in_agent(&env, "claude");
+        let standard = env.root.join("home/.claude");
+        let work = env.root.join("work");
+        for home in [&standard, &work] {
+            std::fs::create_dir_all(home).unwrap();
+        }
+        std::fs::write(standard.join("status"), if signed_in { "1" } else { "0" }).unwrap();
+        std::fs::write(work.join("status"), if signed_in { "0" } else { "1" }).unwrap();
+        let file = env.root.join("config/kraal/accounts.toml");
+        std::fs::write(&file, format!(
+            "[[account]]\nid = 'default-claude'\nagent = 'claude'\nname = 'Personal'\nhome = '~/.claude'\nlinked_to = 'work-id'\n\n[[account]]\nid = 'work-id'\nagent = 'claude'\nname = 'work'\nhome = {:?}\nsign_in_required = true\n",
+            work.to_str().unwrap()
+        )).unwrap();
+        let out = env
+            .cmd(&["accounts", "add", "claude", "Another", "--home", "~/.claude"])
+            .env("PATH", &path)
+            .output()
+            .unwrap();
+        assert_eq!(out.status.success(), signed_in, "{}", String::from_utf8_lossy(&out.stderr));
+        assert_eq!(env.root.join("home/logins").exists(), !signed_in, "only a signed-out target needs login");
+        assert_eq!(
+            std::fs::read_to_string(env.root.join("home/status-checks")).unwrap().trim(),
+            work.to_str().unwrap()
+        );
+        let saved: toml::Value = toml::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+        let work = saved["account"].as_array().unwrap().iter().find(|a| a["id"].as_str() == Some("work-id")).unwrap();
+        assert_eq!(work.get("sign_in_required").and_then(toml::Value::as_bool).unwrap_or(false), !signed_in);
+    }
+}
+
+#[test]
+fn accounts_add_revalidates_the_checked_identity_and_home_before_saving() {
+    for change in ["identity", "home"] {
+        let env = Env::new(&format!("add-checked-{change}"));
+        let path = existing_sign_in_agent(&env, "claude");
+        let file = env.root.join("config/kraal/accounts.toml");
+        let source = "[[account]]\nid = 'default-claude'\nagent = 'claude'\nname = 'Personal'\nhome = '~/.claude'\nlinked_to = 'work-id'\n\n[[account]]\nid = 'work-id'\nagent = 'claude'\nname = 'work'\nhome = '~/work'\nsign_in_required = true\n";
+        std::fs::write(&file, source).unwrap();
+        let changed = if change == "identity" {
+            source.replace("work-id", "replacement-id")
+        } else {
+            source.replace("~/work", "~/moved")
+        };
+        std::fs::write(env.root.join("home/replacement"), &changed).unwrap();
+        write_script(
+            &env.root.join("bin/claude"),
+            r#"#!/bin/sh
+[ "$1 $2" = 'auth status' ] || exit 2
+cat "$HOME/replacement" > "$XDG_CONFIG_HOME/kraal/accounts.toml"
+exit 0
+"#,
+        );
+        let out = env
+            .cmd(&["accounts", "add", "claude", "Another", "--home", "~/.claude"])
+            .env("PATH", &path)
+            .output()
+            .unwrap();
+        assert!(!out.status.success());
+        assert!(String::from_utf8_lossy(&out.stderr).contains("account changed while checking"));
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), changed, "the stale check saves nothing");
+    }
+}
+
+#[test]
+fn accounts_refresh_discovers_the_standard_codex_sign_in_and_fetches_usage() {
+    let env = Env::new("refresh-existing-codex");
+    let path = existing_sign_in_agent(&env, "codex");
+    let home = env.root.join("home/.codex");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::write(home.join("status"), "0").unwrap();
+    write_script(
+        &env.root.join("bin/codex"),
+        r#"#!/bin/sh
+home="${CODEX_HOME:-$HOME/.codex}"
+case "$*" in
+    'login status') exit "$(cat "$home/status")" ;;
+    'app-server --listen stdio://') ;;
+    *) exit 2 ;;
+esac
+echo "$home" > "$HOME/usage-home"
+IFS= read -r line
+printf '%s\n' '{"id":1,"result":{}}'
+IFS= read -r line
+IFS= read -r line
+[ "$line" = '{"id":2,"method":"account/rateLimits/read","params":null}' ] || exit 3
+printf '%s\n' '{"id":2,"result":{"rateLimits":{"primary":{"usedPercent":42,"windowDurationMins":300}}}}'
+"#,
+    );
+    assert!(!env.root.join("config/kraal/accounts.toml").exists());
+    let out = env.cmd(&["accounts", "refresh"]).env("PATH", &path).output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(String::from_utf8_lossy(&out.stdout).contains("42%"));
+    assert_eq!(std::fs::read_to_string(env.root.join("home/usage-home")).unwrap().trim(), home.to_str().unwrap());
+    let out = env.cmd(&["accounts", "list", "--json"]).env("PATH", &path).output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let list: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(list.as_array().unwrap().len(), 1);
+    assert_eq!(list[0]["name"], "Personal");
+    assert_eq!(list[0]["usage"]["five_hour"]["used_percent"], 42.0);
+}
+
+#[test]
+fn an_uncertain_existing_sign_in_never_starts_login_or_creates_an_account() {
+    let env = Env::new("adopt-uncertain");
+    let path = existing_sign_in_agent(&env, "claude");
+    let home = env.root.join("home/.claude");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::write(home.join("status"), "2").unwrap();
+    for explicit in [false, true] {
+        let mut args = vec!["accounts", "add", "claude", "Mine"];
+        if explicit {
+            args.extend(["--home", home.to_str().unwrap()]);
+        }
+        let out = env.cmd(&args).env("PATH", &path).output().unwrap();
+        assert!(!out.status.success());
+        assert!(String::from_utf8_lossy(&out.stderr).contains("could not verify"));
+        assert!(!env.root.join("config/kraal/accounts.toml").exists());
+        assert!(!env.root.join("home/logins").exists());
+    }
+    std::fs::write(home.join("status"), "0").unwrap();
+    let out = env.cmd(&["accounts", "add", "claude", "Mine"]).env("PATH", &path).output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(!env.root.join("home/logins").exists());
+}
+
+#[test]
+fn command_line_review_can_keep_a_different_account_without_login() {
+    let env = Env::new("review-cli");
+    let path = existing_sign_in_agent(&env, "claude");
+    let home = env.root.join("home/.claude");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::write(home.join("status"), "0").unwrap();
+    let file = env.root.join("config/kraal/accounts.toml");
+    std::fs::write(
+        &file,
+        format!(
+            "[[account]]\nagent = 'claude'\nname = 'work'\nhome = {:?}\n",
+            env.root.join("work").display().to_string()
+        ),
+    )
+    .unwrap();
+    let out = env.cmd(&["accounts", "list"]).env("PATH", &path).output().unwrap();
+    assert!(out.status.success());
+    assert!(String::from_utf8_lossy(&out.stdout).contains("Existing Claude account · Review"));
+    let before = std::fs::read_to_string(&file).unwrap();
+    let out = env.cmd(&["accounts", "review", "claude"]).env("PATH", &path).output().unwrap();
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("in a terminal"));
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), before);
+    env.workspace("w", "layout { pane name=\"shell\" }\n");
+    let out = env.cmd(&["open", "w"]).env("PATH", &path).output().unwrap();
+    assert!(out.status.success());
+    let pane = env.run(&["run", "--tab", "--", env!("CARGO_BIN_EXE_kraal"), "accounts", "review", "claude"]);
+    let pane = pane.trim();
+    env.wait_for_text(pane, "Which account is this?");
+    env.wait_for_text(pane, "2. A different account");
+    env.run(&["send", "-p", pane, "2\r"]);
+    env.wait_for_text(pane, "Use Personal?");
+    env.run(&["send", "-p", pane, "y\r"]);
+    env.wait_for_text(pane, "Account updated");
+    let out = env.cmd(&["accounts", "list", "--json"]).env("PATH", &path).output().unwrap();
+    let list: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(list.as_array().unwrap().len(), 2);
+    assert!(list.as_array().unwrap().iter().any(|a| a["name"] == "Personal" && a["status"] == "signed_in"));
+    assert!(!std::fs::read_to_string(&file).unwrap().contains("review = true"));
+    assert!(!env.root.join("home/logins").exists());
+}
+
+#[test]
+fn reviewing_the_existing_account_keeps_live_agents_and_reports_usage_once() {
+    for size in [(124, 36), (80, 24)] {
+        let env = Env::new(&format!("account-review-{}", size.0));
+        let path = existing_sign_in_agent(&env, "claude");
+        let standard = env.root.join("home/.claude");
+        let mut config = String::from("# My subscriptions.\n");
+        for name in ["patron.bzh", "gmail"] {
+            let home = env.root.join(name);
+            std::fs::create_dir_all(&home).unwrap();
+            std::fs::write(home.join("status"), "0").unwrap();
+            std::fs::write(home.join("credential"), name).unwrap();
+            config.push_str(&format!(
+                "[[account]]\nagent = 'claude'\nname = '{name}'\nhome = {:?}\n",
+                home.to_str().unwrap()
+            ));
+        }
+        config.push_str("[[rule]]\nworkspace = 'legacy'\nagent = 'claude'\naccounts = ['default']\n");
+        let file = env.root.join("config/kraal/accounts.toml");
+        std::fs::write(&file, &config).unwrap();
+        std::fs::create_dir_all(&standard).unwrap();
+        std::fs::write(standard.join("status"), "0").unwrap();
+        std::fs::write(standard.join("credential"), "standard").unwrap();
+        let usage = env.root.join("state/kraal/usage");
+        std::fs::create_dir_all(&usage).unwrap();
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        for (name, percent, at) in [("default", 57, now), ("patron.bzh", 40, now - 1)] {
+            std::fs::write(
+                usage.join(format!("claude-{name}.json")),
+                serde_json::json!({
+                    "five_hour": { "used_percent": percent, "resets_at": now + 3600 },
+                    "weekly": null, "observed_at": at, "source": "statusline"
+                })
+                .to_string(),
+            )
+            .unwrap();
+        }
+        env.workspace("w", "layout { pane name=\"agent\" agent=\"claude:default\" }\n");
+        let out = env.cmd(&["open", "w"]).env("PATH", &path).output().unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        let panes: serde_json::Value = serde_json::from_str(&env.run(&["panes", "--json"])).unwrap();
+        let pane = panes.as_array().unwrap().iter().find(|p| p["name"] == "agent").unwrap()["id"].to_string();
+        env.wait_for_text(&pane, "READY");
+        let mut client = RawClient::attach_sized(&env, Some("w"), size);
+        if size.0 == 124 {
+            let rows = client.wait_for_row("Existing Claude account");
+            let row = rows.iter().position(|r| r.contains("Existing Claude account")).unwrap() + 1;
+            client.send(format!("\x1b[<0;10;{row}M\x1b[<0;10;{row}m").as_bytes());
+        } else {
+            client.send(b"\x02a");
+            client.wait_for_rows("verified existing sign-in offers Review", |rows| {
+                rows.iter().any(|r| r.contains("Existing Claude account") && r.contains("Review"))
+            });
+            assert!(!client.rows().iter().any(|r| r.contains("claude·default") || r.contains("codex·default")));
+            client.send(b"Existing Claude");
+            client.send(b"\r");
+        }
+        client.wait_for_row("Which account is this?");
+        client.wait_for_row("A different account");
+        // Adoption already links the legacy default; cancelling the review must leave the file unchanged.
+        let before_review = std::fs::read_to_string(&file).unwrap();
+        client.send(b"\r");
+        client.wait_for_row("Use patron.bzh?");
+        client.wait_for_row("Your running agents will keep working.");
+        client.send(b"\r");
+        client.wait_for_row("Which account is this?");
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), before_review, "Enter cancels first");
+        client.send(b"\r");
+        client.wait_for_row("Use patron.bzh?");
+        client.send(b"y");
+        client.wait_for_row("Account updated");
+        client.send(b"\x1b");
+        env.run(&["send", "-p", &pane, "still-here\r"]);
+        env.wait_for_text(&pane, "reply:still-here");
+        assert_eq!(std::fs::read_to_string(standard.join("starts")).unwrap().lines().count(), 1);
+        assert!(!env.root.join("patron.bzh/starts").exists());
+        let out = env.cmd(&["accounts", "list", "--json"]).env("PATH", &path).output().unwrap();
+        let list: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(list.as_array().unwrap().len(), 2);
+        let patron = list.as_array().unwrap().iter().find(|a| a["name"] == "patron.bzh").unwrap();
+        assert_eq!(patron["usage"]["five_hour"]["used_percent"], 57.0);
+        assert!(list.as_array().unwrap().iter().all(|a| a["status"] != "review_required"));
+        assert_eq!(std::fs::read_to_string(file.with_extension("toml.kraal-bak")).unwrap(), config);
+        for (home, credential) in
+            [(&standard, "standard"), (&env.root.join("patron.bzh"), "patron.bzh"), (&env.root.join("gmail"), "gmail")]
+        {
+            assert_eq!(std::fs::read_to_string(home.join("credential")).unwrap(), credential);
+        }
+        assert!(!env.root.join("home/logins").exists());
+        let socket = env.root.join(format!("run/kraal/{}.sock", env.session));
+        let out = env
+            .cmd(&["agent", "claude", "--account", "default", "--tab"])
+            .env("PATH", &path)
+            .env("KRAAL_SOCKET", socket)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        let new_pane = String::from_utf8(out.stdout).unwrap().trim().to_string();
+        env.wait_for_text(&new_pane, &format!("home={}", env.root.join("patron.bzh").display()));
+        client.send(b"\x02a");
+        client.wait_for_row("Start an agent");
+        assert!(!client.rows().iter().any(|r| r.contains("Existing Claude account")));
+    }
+}
+
 #[test]
 fn a_new_account_with_no_agent_keeps_a_sign_in_required_entry() {
     let env = Env::new("login-missing");
@@ -7693,7 +8089,7 @@ fn a_renamed_account_keeps_its_rules_its_usage_and_its_agents() {
     assert!(std::fs::read_to_string(&file).unwrap().contains(&format!("account_ids = [\"claude:@{id}\"]")));
     assert!(usage.join("by-id").join(format!("claude-{id}.json")).exists());
     let out = env.try_run(&["accounts", "rename", "claude:default", "mine"]);
-    assert!(String::from_utf8_lossy(&out.stderr).contains("cannot be renamed") && !out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("check the existing sign-in") && !out.status.success());
     let screen = env.run(&["read", "-p", &agent]);
     assert!(screen.contains(&format!("home={}", home.display())), "the agent went on: {screen}");
     let _ = events.kill();

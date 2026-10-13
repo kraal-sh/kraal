@@ -504,6 +504,58 @@ fn account_migration_preserves_running_release_snapshots_and_rules() {
     }
 }
 
+/// Adoption keeps the name older servers use, even once they reload the shared accounts file.
+#[test]
+#[ignore = "needs KRAAL_OLD, another release's kraal: tests/compat.sh runs it"]
+fn adopting_a_standard_sign_in_keeps_default_usable_on_a_running_release() {
+    let (old, this) = (Kraal::old(), Kraal::this());
+    let env = Env::new("compat-adopt");
+    let bin = env.root.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    write_script(
+        &bin.join("claude"),
+        r#"#!/bin/sh
+[ "$1 $2" = 'auth status' ] && exit 0
+echo "account-ready:${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
+exec sleep 1000
+"#,
+    );
+    let home = env.root.join("home/.claude");
+    std::fs::create_dir_all(&home).unwrap();
+    let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap_or_default());
+    let out = env.cmd(&old, &["open", "w"]).env("PATH", &path).output().unwrap();
+    assert!(
+        out.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&out.stderr),
+        std::fs::read_to_string(env.root.join("state/kraal/server-compat-adopt.log")).unwrap_or_default()
+    );
+    let pid = env.server_pid();
+    let open_agent = || {
+        let out = env
+            .cmd(&this, &["agent", "claude", "--account", "default", "--tab"])
+            .env("KRAAL_SOCKET", env.socket())
+            .env("KRAAL_PANE", "first")
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "kraal {}: {}", old.version, String::from_utf8_lossy(&out.stderr));
+    };
+    open_agent();
+    let out = env.cmd(&this, &["accounts", "list", "--json"]).env("PATH", &path).output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let list: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(list.as_array().unwrap().len(), 1);
+    assert_eq!(list[0]["name"], "Personal");
+    env.run(&old, &["config", "reload"]);
+    open_agent();
+    assert_eq!(env.server_pid(), pid, "adoption leaves the release server running");
+    let agents: Vec<_> = env.panes(&old).into_iter().filter(|p| p["command"][0] == "claude").collect();
+    assert_eq!(agents.len(), 2);
+    for pane in agents {
+        env.wait_for_text(&old, &pane["id"].to_string(), &format!("account-ready:{}", home.display()));
+    }
+}
+
 /// `kraal restart` brings a session of the other release to this kraal, with its panes and what
 /// they showed.
 #[test]

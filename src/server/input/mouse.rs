@@ -60,6 +60,11 @@ impl Server {
             if press_left {
                 match self.sidebar_hit(id, m.row) {
                     Some(SideItem::Workspace(ws)) => self.show_workspace(id, ws),
+                    Some(SideItem::ReviewAccount(account)) => {
+                        if let Some(existing) = self.accounts.by_id(&account).filter(|a| a.review) {
+                            return Some(Mode::Picker(self.review_account_picker(&existing)));
+                        }
+                    }
                     Some(SideItem::Pane(p)) => self.reveal(id, p),
                     Some(SideItem::Remote { server, pane }) => self.go_to_remote(id, &server, pane),
                     Some(SideItem::Definition(path)) => match self.open_definition(&path) {

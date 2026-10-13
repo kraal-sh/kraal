@@ -51,6 +51,7 @@ enum SideRow {
 #[derive(Debug, Clone, PartialEq)]
 pub enum SideItem {
     Workspace(u32),
+    ReviewAccount(String),
     /// A definition not running, by its file.
     Definition(PathBuf),
     Pane(PaneId),
@@ -1041,7 +1042,9 @@ impl Server {
             for (p, s, ws) in agents {
                 let pane = &self.panes[&p];
                 let kind = match &pane.spec.account {
-                    Some(a) => a.replace(':', "·"),
+                    Some(a) => {
+                        self.pane_account(p).as_ref().map(crate::accounts::label).unwrap_or_else(|| a.replace(':', "·"))
+                    }
                     None => pane.agent.kind.clone().unwrap_or_default(),
                 };
                 let mut detail = format!("{}{sep}{kind}", s.label());
@@ -1122,7 +1125,17 @@ impl Server {
         if !accounts.is_empty() && rows.len() <= top {
             rows.resize_with(top, || SideRow::Blank);
             rows.push(SideRow::Section("ACCOUNTS"));
-            rows.extend(accounts.into_iter().map(|line| SideRow::Entry { item: None, line, selected: false }));
+            let reviews = self.accounts.reviews();
+            let items = std::iter::repeat_n(None, accounts.len().saturating_sub(reviews.len() * 2)).chain(
+                reviews
+                    .into_iter()
+                    .flat_map(|a| [Some(SideItem::ReviewAccount(a.id.clone())), Some(SideItem::ReviewAccount(a.id))]),
+            );
+            rows.extend(accounts.into_iter().zip(items).map(|(line, item)| SideRow::Entry {
+                item,
+                line,
+                selected: false,
+            }));
         }
         rows
     }
@@ -1380,7 +1393,7 @@ impl Server {
         }
         if let Some(kind) = &pane.agent.kind {
             let state = pane.agent.state;
-            let kind = pane.spec.account.as_ref().map(|a| a.replace(':', "·")).unwrap_or_else(|| kind.clone());
+            let kind = self.pane_account(pid).as_ref().map(crate::accounts::label).unwrap_or_else(|| kind.clone());
             let sep = if th().ascii { "-" } else { "·" };
             out.push(Span::styled(
                 format!(" {} {} {sep} {kind} ", th().icon(state), state.label()),
@@ -1727,9 +1740,6 @@ fn account_lines(
     width: usize,
     now: i64,
 ) -> Vec<Line<'static>> {
-    if accounts.none_listed() && usage.0.is_empty() {
-        return Vec::new();
-    }
     let t = th();
     accounts
         .all()
@@ -1762,6 +1772,9 @@ fn account_lines(
             };
             vec![Line::from(vec![name, used])]
         })
+        .chain(accounts.reviews().iter().flat_map(|a| {
+            vec![Line::from(format!("   {}", crate::accounts::existing_label(&a.agent))), Line::from("   Review")]
+        }))
         .collect()
 }
 
@@ -1824,7 +1837,7 @@ mod tests {
             Usage { five_hour: window, observed_at: 1_000, ..Default::default() },
         );
         usage.0.insert(accounts.get("codex", "default").unwrap().key(), Usage::default());
-        assert_eq!(account_lines(&accounts, &usage, 40, 1_000).len(), 2, "one used: both agents' are listed");
+        assert!(account_lines(&accounts, &usage, 40, 1_000).is_empty(), "usage alone never verifies sign-in");
         let home = "/tmp/kraal-test-patron".to_string();
         accounts
             .add(Account {
@@ -1835,18 +1848,20 @@ mod tests {
                 threshold: None,
                 note: None,
                 sign_in_required: false,
+                review: false,
+                public_identity: None,
+                linked_to: None,
             })
             .unwrap();
-        assert_eq!(account_lines(&accounts, &UsageMap::default(), 40, 1_000).len(), 3, "one listed: all are");
+        assert_eq!(account_lines(&accounts, &UsageMap::default(), 40, 1_000).len(), 1);
+        let existing = accounts.unlisted().into_iter().find(|a| a.agent == "claude").unwrap();
+        accounts.adopt_checked(&existing, None).unwrap();
         let rows = |width| -> Vec<String> {
             let lines = account_lines(&accounts, &usage, width, 1_000);
             lines.iter().map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect()).collect()
         };
-        assert_eq!(rows(26), ["   claude·default 42%", "   claude·patron.bzh -", "   codex·default -"]);
-        assert_eq!(
-            rows(40),
-            ["   claude·default 42%", "   claude·patron.bzh not used yet", "   codex·default not used yet"]
-        );
+        assert_eq!(rows(26), ["   claude·patron.bzh -", "   Existing Claude account", "   Review"]);
+        assert_eq!(rows(40), ["   claude·patron.bzh not used yet", "   Existing Claude account", "   Review"]);
     }
 
     #[test]
@@ -1862,6 +1877,9 @@ mod tests {
                 note: None,
                 threshold: None,
                 sign_in_required: true,
+                review: false,
+                public_identity: None,
+                linked_to: None,
             })
             .unwrap();
         let mut usage = UsageMap::default();
