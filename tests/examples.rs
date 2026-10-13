@@ -196,6 +196,21 @@ fn the_keys_of_the_example_are_listed_in_place() {
     assert_eq!(keys[..first.len()], ["\\|", "\\", "-", "_", "x", "z", "space"], "{sheet}");
 }
 
+/// What kraal writes to the example inventory and accounts, it edits in: the rest is the
+/// example as it is, its comments included.
+#[test]
+fn the_files_kraal_writes_to_keep_their_text() {
+    let env = installed("exkeep");
+    let config = env.root.join("config/kraal");
+    assert!(kraal(&env, &["servers", "add", "ops@backup.example.com"]).output().unwrap().status.success());
+    let added = "\n[[server]]\nname = \"backup\"\nhost = \"backup.example.com\"\nuser = \"ops\"\n";
+    assert_eq!(read(&config.join("servers.toml")), format!("{}{added}", read(&examples().join("servers.toml"))));
+    assert!(kraal(&env, &["accounts", "limits", "--threshold", "70"]).output().unwrap().status.success());
+    let example = read(&examples().join("accounts.toml"));
+    assert_eq!(read(&config.join("accounts.toml")), example.replace("threshold = 85", "threshold = 70"));
+    assert_ne!(example, example.replace("threshold = 85", "threshold = 70"));
+}
+
 /// Every workspace opens with the tabs and panes it declares, its programs started.
 #[test]
 fn every_workspace_opens_as_it_is_written() {

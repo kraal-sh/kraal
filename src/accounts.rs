@@ -188,6 +188,8 @@ pub struct Accounts {
     /// In order: the first rule that matches decides.
     rules: Vec<Rule>,
     path: PathBuf,
+    /// The file as it was read, which a save edits; `None` when there was none.
+    source: Option<String>,
 }
 
 impl Accounts {
@@ -210,12 +212,16 @@ impl Accounts {
     }
 
     fn read(path: &Path) -> Result<(Accounts, Vec<String>)> {
-        let (file, warnings) = match std::fs::read_to_string(path) {
-            Ok(text) => {
-                crate::unknown_keys::from_toml::<File>(&text).with_context(|| format!("parsing {}", path.display()))?
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Default::default(),
+        let source = match std::fs::read_to_string(path) {
+            Ok(text) => Some(text),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
             Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+        };
+        let (file, warnings) = match &source {
+            Some(text) => {
+                crate::unknown_keys::from_toml::<File>(text).with_context(|| format!("parsing {}", path.display()))?
+            }
+            None => Default::default(),
         };
         let accounts = Accounts {
             limits: file.limits,
@@ -223,6 +229,7 @@ impl Accounts {
             accounts: file.accounts,
             rules: file.rules,
             path: path.to_path_buf(),
+            source,
         };
         Ok((accounts, warnings))
     }
@@ -234,9 +241,12 @@ impl Accounts {
             accounts: Vec::new(),
             rules: Vec::new(),
             path: Self::path(),
+            source: None,
         }
     }
 
+    /// What a save writes: the file as it was read with what changed since edited in, so that
+    /// the user's comments and the keys another kraal reads stay; a new file whole.
     fn text(&self) -> Result<String> {
         let file = File {
             limits: self.limits.clone(),
@@ -244,7 +254,12 @@ impl Accounts {
             accounts: self.accounts.clone(),
             rules: self.rules.clone(),
         };
-        Ok(format!("{HEADER}{}", toml::to_string_pretty(&file)?))
+        match &self.source {
+            Some(text) => {
+                crate::rewrite::rewrite(text, &file).with_context(|| format!("editing {}", self.path.display()))
+            }
+            None => Ok(format!("{HEADER}{}", toml::to_string_pretty(&file)?)),
+        }
     }
 
     pub fn save(&self) -> Result<()> {
@@ -1886,6 +1901,113 @@ mod tests {
         let b = Accounts::load_from(&path).unwrap();
         assert_eq!(b.limits.mode, Mode::Ask);
         assert_eq!(b.accounts.len(), 1);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A user's own file: a header, comments, an order that is not kraal's, and keys only another
+    /// kraal reads.
+    const BY_HAND: &str = "\
+# The accounts of the team laptop.
+
+[limits]
+mode = \"ask\"          # never move by itself
+threshold = 85
+
+# Paid by work.
+[[account]]
+agent = \"claude\"
+name = \"pro\"
+home = \"/tmp/kraal-test-claude-pro\"
+seat = 4              # read by a newer kraal
+
+[[account]]
+name = \"pro\"
+agent = \"codex\"
+home = \"/tmp/kraal-test-codex-pro\"
+
+# Work first, then mine.
+[[rule]]
+workspace = \"work\"
+accounts = [\"pro\", \"default\"]
+until = 2027-01-01    # read by a newer kraal
+";
+
+    /// What a file that held `BY_HAND` holds once `change` was made to the accounts.
+    fn changed(name: &str, change: impl FnOnce(&mut Accounts) -> Result<()>) -> String {
+        let dir = std::env::temp_dir().join(format!("kraal-accounts-{name}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("accounts.toml");
+        std::fs::write(&path, BY_HAND).unwrap();
+        Accounts::update_at(&path, change).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_dir_all(dir);
+        text
+    }
+
+    #[test]
+    fn a_change_leaves_the_rest_of_the_file_as_the_user_wrote_it() {
+        assert_eq!(changed("same", |_| Ok(())), BY_HAND);
+        // `kraal accounts limits`: the value changes where it is.
+        let text = changed("limits", |all| {
+            all.limits.threshold = 70;
+            all.limits.mode = Mode::Auto;
+            Ok(())
+        });
+        let expected = BY_HAND.replace("mode = \"ask\"", "mode = \"auto\"").replace("threshold = 85", "threshold = 70");
+        assert_eq!(text, expected);
+        // Installing the hooks: a table the file did not have comes last.
+        let text = changed("statusline", |all| {
+            all.claude.statusline = Some("my-line".into());
+            Ok(())
+        });
+        assert_eq!(text, format!("{BY_HAND}\n[claude]\nstatusline = \"my-line\"\n"));
+        // `kraal accounts add`: one more account, after the others.
+        let text = changed("add", |all| all.add(acct("claude", "perso", "/tmp/kraal-test-claude-perso")));
+        let added = "[[account]]\nname = \"perso\"\nagent = \"claude\"\nhome = \"/tmp/kraal-test-claude-perso\"\n";
+        assert_eq!(text, BY_HAND.replace("\n# Work first", &format!("\n{added}\n# Work first")));
+        // `kraal accounts rm`: the account goes with the comment about it, the header stays.
+        let text = changed("rm", |all| {
+            all.remove("claude", "pro");
+            Ok(())
+        });
+        assert_eq!(
+            text,
+            BY_HAND.replace(&BY_HAND[BY_HAND.find("# Paid").unwrap()..BY_HAND.find("[[account]]\nname").unwrap()], "")
+        );
+        // `kraal accounts rename`: the account keeps its place and what the other kraal reads;
+        // the rule Codex's account of that name still needs stays whole, after Claude's own.
+        let text = changed("rename", |all| all.rename("claude", "pro", "work"));
+        let own =
+            "[[rule]]\nworkspace = \"work\"\nagent = \"claude\"\naccounts = [\n    \"work\",\n    \"default\",\n]\n";
+        let expected = BY_HAND
+            .replace("agent = \"claude\"\nname = \"pro\"", "agent = \"claude\"\nname = \"work\"")
+            .replace("\n# Work first", &format!("\n{own}\n# Work first"));
+        assert_eq!(text, expected);
+    }
+
+    #[test]
+    fn a_new_file_is_written_whole_and_one_that_cannot_be_read_is_left_alone() {
+        let dir = std::env::temp_dir().join(format!("kraal-accounts-new-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("accounts.toml");
+        let add = |all: &mut Accounts| all.add(acct("codex", "work", "/tmp/kraal-test-codex-work"));
+        Accounts::update_at(&path, add).unwrap();
+        let whole = "rule = []\n\n[limits]\nthreshold = 90\nmode = \"notify\"\n\n[claude]\n\n\
+                     [[account]]\nname = \"work\"\nagent = \"codex\"\nhome = \"/tmp/kraal-test-codex-work\"\n";
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), format!("{HEADER}{whole}"));
+        // The file `kraal accounts edit` makes when there is none takes its first account
+        // under its header.
+        std::fs::remove_file(&path).unwrap();
+        Accounts::load_from(&path).unwrap().save().unwrap();
+        Accounts::update_at(&path, add).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.starts_with(HEADER) && text.contains("[[account]]\nname = \"work\"\n"), "{text}");
+        assert_eq!(Accounts::load_from(&path).unwrap().accounts, [acct("codex", "work", "/tmp/kraal-test-codex-work")]);
+
+        let broken = "# mine\n[[account]\nname = \"work\"\n";
+        std::fs::write(&path, broken).unwrap();
+        assert!(Accounts::update_at(&path, add).is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), broken);
         let _ = std::fs::remove_dir_all(dir);
     }
 

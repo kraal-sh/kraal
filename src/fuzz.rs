@@ -765,6 +765,44 @@ mod files {
         });
     }
 
+    /// Whatever a file looks like, a change kraal writes into it is read back as kraal meant
+    /// it.
+    #[test]
+    fn fuzz_files_rewritten() {
+        use crate::servers::{Inventory, Server};
+        run("files_rewritten", 100, |rng| {
+            let text = damaged(
+                rng,
+                "# Ours.\n\n[[server]]\nname = \"web-1\" # the first\nhost = \"192.0.2.1\"\nuser = \"deploy\"\ncolor = \"red\"\ngroups = [\"web\", \"prod\"]\n\n# The way in.\n[[server]]\nhost = \"b.example.net\"\nname = \"bastion\"\nmore_identities = [\n    \"~/.ssh/id\", # mine\n]\n",
+            );
+            let path = temp_file(&text, "toml");
+            if Inventory::load_from(&path).is_ok() {
+                let change = rng.below(4);
+                let wanted = Inventory::update_at(&path, |inv| {
+                    match change {
+                        0 => drop(inv.add(Server { host: "new.example.net".into(), ..Default::default() })?),
+                        1 => drop(inv.servers.pop()),
+                        2 => inv.servers.reverse(),
+                        _ => {
+                            if let Some(first) = inv.servers.first_mut() {
+                                first.agents = Some("main".into());
+                                first.groups.retain(|group| group != "web");
+                            }
+                        }
+                    }
+                    Ok(inv.servers.clone())
+                });
+                let written = std::fs::read_to_string(&path).unwrap();
+                let wanted = wanted.unwrap_or_else(|e| panic!("{e:#}: {text:?}"));
+                let read = Inventory::load_from(&path).map(|inv| inv.servers);
+                assert_eq!(read.ok(), Some(wanted), "{text:?} became {written:?}");
+            }
+            let _ = std::fs::remove_file(&path);
+            let lock = format!(".{}.lock", path.file_name().unwrap().to_string_lossy());
+            let _ = std::fs::remove_file(path.with_file_name(lock));
+        });
+    }
+
     #[test]
     fn fuzz_files_accounts() {
         run("files_accounts", 100, |rng| {

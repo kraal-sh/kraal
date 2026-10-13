@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use crate::paths;
 use crate::workspace::WorkspaceDef;
 
-/// A server of the inventory: a `[[server]]` of servers.toml, which users edit and kraal rewrites,
+/// A server of the inventory: a `[[server]]` of servers.toml, which users and kraal both edit,
 /// so its field names and values are a file format. A field left out leaves the choice to ssh and
 /// ~/.ssh/config; `jump`, `proxy` and `agents` also take the value `none`, which turns off what
 /// ~/.ssh/config or kraal would add there. kraal also makes one on the fly for an address it does
@@ -571,6 +571,8 @@ pub struct Inventory {
     /// In the file's order, each name once.
     pub servers: Vec<Server>,
     path: PathBuf,
+    /// The file as it was read, which a save edits; `None` when there was none.
+    source: Option<String>,
 }
 
 impl Inventory {
@@ -579,7 +581,7 @@ impl Inventory {
     }
 
     pub fn empty() -> Inventory {
-        Inventory { servers: Vec::new(), path: Self::path() }
+        Inventory { servers: Vec::new(), path: Self::path(), source: None }
     }
 
     pub fn load() -> Result<Inventory> {
@@ -597,12 +599,16 @@ impl Inventory {
     }
 
     fn read(path: &Path) -> Result<(Inventory, Vec<String>)> {
-        let (file, warnings) = match std::fs::read_to_string(path) {
-            Ok(text) => {
-                crate::unknown_keys::from_toml::<File>(&text).with_context(|| format!("parsing {}", path.display()))?
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Default::default(),
+        let source = match std::fs::read_to_string(path) {
+            Ok(text) => Some(text),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
             Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+        };
+        let (file, warnings) = match &source {
+            Some(text) => {
+                crate::unknown_keys::from_toml::<File>(text).with_context(|| format!("parsing {}", path.display()))?
+            }
+            None => Default::default(),
         };
         let servers = file.servers;
         // A name picks one server: two servers with one name would make it pick either.
@@ -611,11 +617,19 @@ impl Inventory {
                 bail!("{}: two servers are named {:?}; rename one", path.display(), s.name);
             }
         }
-        Ok((Inventory { servers, path: path.to_path_buf() }, warnings))
+        Ok((Inventory { servers, path: path.to_path_buf(), source }, warnings))
     }
 
+    /// What a save writes: the file as it was read with what changed since edited in, so that
+    /// the user's comments and the keys another kraal reads stay; a new file whole.
     fn text(&self) -> Result<String> {
-        Ok(format!("{HEADER}{}", toml::to_string_pretty(&File { servers: self.servers.clone() })?))
+        let file = File { servers: self.servers.clone() };
+        match &self.source {
+            Some(text) => {
+                crate::rewrite::rewrite(text, &file).with_context(|| format!("editing {}", self.path.display()))
+            }
+            None => Ok(format!("{HEADER}{}", toml::to_string_pretty(&file)?)),
+        }
     }
 
     pub fn save(&self) -> Result<()> {
@@ -976,7 +990,7 @@ mod tests {
 }"#,
         )
         .unwrap();
-        let mut inv = Inventory { servers: Vec::new(), path: PathBuf::from("/nonexistent") };
+        let mut inv = Inventory { servers: Vec::new(), path: PathBuf::from("/nonexistent"), source: None };
         inv.add(Server {
             name: "proxy".into(),
             host: "edge-proxy.lan".into(),
@@ -1260,7 +1274,7 @@ mod tests {
             "layout {\n    pane name=\"db\" command=\"ssh\" { args \"deploy@db.other\"; }\n}\n",
         )
         .unwrap();
-        let mut inv = Inventory { servers: Vec::new(), path: PathBuf::from("/nonexistent") };
+        let mut inv = Inventory { servers: Vec::new(), path: PathBuf::from("/nonexistent"), source: None };
         for (name, host) in [("db", "db.lan"), ("db-fleet", "db-fleet.lan")] {
             inv.servers.push(Server { name: name.into(), host: host.into(), ..Default::default() });
         }
@@ -1269,7 +1283,7 @@ mod tests {
         assert_eq!(names, vec!["db", "db-fleet", "db-fleet-2"]);
         assert_eq!(resolve(&k, "db-fleet-2").unwrap().host, "db.other");
         // `box:22` is not `box`, whose port ~/.ssh/config may set: two entries.
-        let mut inv = Inventory { servers: Vec::new(), path: PathBuf::from("/nonexistent") };
+        let mut inv = Inventory { servers: Vec::new(), path: PathBuf::from("/nonexistent"), source: None };
         assert_eq!(inv.add(parse_ssh_args(&argv("box")).unwrap()).unwrap(), "box");
         assert_eq!(inv.add(parse_ssh_args(&argv("-p 22 box")).unwrap()).unwrap(), "box-2");
         assert_eq!(inv.get("box-2").unwrap().port, Some(22));
@@ -1279,7 +1293,7 @@ mod tests {
             "layout {\n    pane name=\"web\" command=\"ssh\" { args \"deploy@web.lan\"; }\n}\n",
         )
         .unwrap();
-        let mut inv = Inventory { servers: Vec::new(), path: PathBuf::from("/nonexistent") };
+        let mut inv = Inventory { servers: Vec::new(), path: PathBuf::from("/nonexistent"), source: None };
         inv.servers.push(Server { name: "web".into(), host: "web.lan".into(), ..Default::default() });
         let k = known(&inv, &[def], &[]);
         let r = resolve(&k, "web-ops").unwrap();
@@ -1369,6 +1383,102 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// A user's own file: a header, comments in and around the entries, an order of keys that
+    /// is not kraal's, and a key only another kraal reads.
+    const BY_HAND: &str = "\
+# Our servers. Ask ops before you add one.
+
+[[server]]
+host = \"bastion.example.com\"   # the only way in
+name = \"bastion\"
+user = \"ops\"
+
+# Behind the bastion.
+[[server]]
+name = \"web\"
+host = \"web.example.com\"
+jump = \"bastion\"
+tags = [\"blue\"]                 # read by a newer kraal
+groups = [\"web\"]
+";
+
+    /// What a file that held `BY_HAND` holds once `change` was made to the inventory.
+    fn changed(name: &str, change: impl FnOnce(&mut Inventory) -> Result<()>) -> String {
+        let dir = std::env::temp_dir().join(format!("kraal-servers-{name}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("servers.toml");
+        std::fs::write(&path, BY_HAND).unwrap();
+        Inventory::update_at(&path, change).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_dir_all(dir);
+        text
+    }
+
+    #[test]
+    fn a_change_leaves_the_rest_of_the_file_as_the_user_wrote_it() {
+        let web = Server {
+            name: "web".into(),
+            host: "web.example.com".into(),
+            jump: Some("bastion".into()),
+            ..Default::default()
+        };
+        // A server it has already: nothing is written.
+        assert_eq!(changed("same", |inv| inv.add(web.clone()).map(drop)), BY_HAND);
+        // `kraal attach --host web`: the entry gets `agents`, after its other keys.
+        let text = changed("agents", |inv| inv.watch_agents(&web, "main", true).map(drop));
+        assert_eq!(text, format!("{BY_HAND}agents = \"main\"\n"));
+        // A server kraal saw, `kraal servers add`, `kraal servers import`: one more entry, last.
+        let db = Server {
+            host: "db.example.com".into(),
+            user: Some("admin".into()),
+            groups: vec!["discovered".into()],
+            ..Default::default()
+        };
+        let text = changed("add", |inv| inv.add(db).map(drop));
+        let added =
+            "[[server]]\nname = \"db\"\nhost = \"db.example.com\"\nuser = \"admin\"\ngroups = [\"discovered\"]\n";
+        assert_eq!(text, format!("{BY_HAND}\n{added}"));
+        // `kraal servers rm`: the entry goes with the comment about it; the file's header stays.
+        let text = changed("rm", |inv| {
+            inv.remove("bastion");
+            Ok(())
+        });
+        let rest = &BY_HAND[BY_HAND.find("# Behind").unwrap()..];
+        assert_eq!(text, format!("# Our servers. Ask ops before you add one.\n\n{rest}"));
+        let text = changed("rm-last", |inv| {
+            inv.remove("web");
+            Ok(())
+        });
+        assert_eq!(text, BY_HAND[..BY_HAND.find("\n# Behind").unwrap()]);
+        // What the other kraal's key says is still there for it.
+        let text =
+            changed("kept", |inv| inv.add(Server { host: "x.example.com".into(), ..Default::default() }).map(drop));
+        let kept: toml::Table = text.parse().unwrap();
+        assert_eq!(kept["server"][1]["tags"][0].as_str(), Some("blue"));
+    }
+
+    #[test]
+    fn a_new_file_is_written_whole_and_one_that_cannot_be_read_is_left_alone() {
+        let dir = std::env::temp_dir().join(format!("kraal-servers-new-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("servers.toml");
+        let db = Server { host: "db.example.com".into(), port: Some(2222), ..Default::default() };
+        Inventory::update_at(&path, |inv| inv.add(db.clone()).map(drop)).unwrap();
+        let entry = "[[server]]\nname = \"db\"\nhost = \"db.example.com\"\nport = 2222\n";
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), format!("{HEADER}{entry}"));
+        // The file `kraal servers edit` makes when there is none takes its first entry under
+        // its header, as a new file does.
+        Inventory { servers: Vec::new(), path: path.clone(), source: None }.save().unwrap();
+        Inventory::update_at(&path, |inv| inv.add(db.clone()).map(drop)).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), format!("{HEADER}{entry}"));
+
+        let broken = "# mine\n[[server]\nname = \"db\"\n";
+        std::fs::write(&path, broken).unwrap();
+        assert!(Inventory::update_at(&path, |inv| inv.add(db.clone()).map(drop)).is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), broken);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     #[test]
     fn keys_the_inventory_does_not_read_are_warnings() {
         let dir = std::env::temp_dir().join(format!("kraal-servers-unknown-{}", std::process::id()));
@@ -1401,7 +1511,7 @@ mod tests {
             note: Some("front".into()),
             agents: Some("main".into()),
         };
-        Inventory { servers: vec![full.clone()], path: path.clone() }.save().unwrap();
+        Inventory { servers: vec![full.clone()], path: path.clone(), source: None }.save().unwrap();
         let (inv, warnings) = Inventory::read(&path).unwrap();
         assert_eq!((inv.servers, warnings), (vec![full], Vec::new()));
         let _ = std::fs::remove_dir_all(dir);
