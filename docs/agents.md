@@ -252,6 +252,8 @@ when they were checked and their resets. Zero panes are omitted. In a narrow sid
 and **Checked ...** keep the second line readable; clicking either line opens those details.
 Tab opens **Rename**, **Sign in**, and **Remove** (`ctrl+r`, `ctrl+l`, `ctrl+x`). Remove asks first, with Cancel selected, and explains that conversations and the
 agent's own sign-in are kept.
+Enter or Esc in details returns to the list with that account selected. Background account
+checks keep the list's search and selected row while updating its entries.
 
 **+ Add account** opens one form, also reached directly with `ctrl+b A n`. It stays visible when
 filtering the list. **Agent** starts with the focused pane's agent, otherwise the last choice;
@@ -268,6 +270,9 @@ how to retry. An error keeps both fields; long errors wrap and scroll with PageU
 the wheel. Enter or one click on a button submits it. Successful addition returns to Accounts,
 selects the new account and says **Account added**. These screens also work at 80x24 without
 the sidebar.
+Esc or **Cancel** in the form returns to Accounts. While **Checking sign-in...** is shown,
+the form accepts cancellation but no second submission. A cancelled check cannot later replace
+the screen you are using with its result.
 
 The launch picker (`ctrl+b a`) lists installed agents' accounts that do not require sign-in.
 Enter or one click starts the selected account. Tab offers **Start in new tab** (`ctrl+t`),

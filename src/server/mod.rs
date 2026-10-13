@@ -16,6 +16,7 @@ mod dirwatch;
 mod edits;
 pub mod events;
 mod fileman;
+mod forms;
 mod geometry;
 mod graphics;
 mod hints;

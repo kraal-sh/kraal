@@ -363,6 +363,9 @@ pub struct Picker {
     pub items: Vec<PickItem>,
     /// Keep room for rows removed by a background refresh, so the list does not move under a click.
     pub min_items: usize,
+    pub two_line: bool,
+    /// An add row stays last even when the query matches no entries.
+    pub pinned: Option<usize>,
     /// Indices into `items` matching the query, best first.
     pub filtered: Vec<usize>,
     pub selected: usize,
@@ -375,6 +378,14 @@ pub struct Picker {
     pub message: Option<String>,
 }
 
+pub struct PickerState {
+    query: String,
+    cursor: usize,
+    selected: Option<String>,
+    message: Option<String>,
+    min_items: usize,
+}
+
 impl Picker {
     pub fn new(kind: PickerKind, title: &str, items: Vec<PickItem>) -> Picker {
         let mut p = Picker {
@@ -383,6 +394,8 @@ impl Picker {
             query: String::new(),
             cursor: 0,
             min_items: items.len(),
+            two_line: kind == PickerKind::Accounts,
+            pinned: items.iter().position(|i| matches!(i.action, PickAction::AddAccount)),
             items,
             filtered: Vec::new(),
             selected: 0,
@@ -393,6 +406,36 @@ impl Picker {
         };
         p.refilter();
         p
+    }
+
+    pub fn state(&self) -> PickerState {
+        PickerState {
+            query: self.query.clone(),
+            cursor: self.cursor,
+            selected: self.current().map(|i| i.label.clone()),
+            message: self.message.clone(),
+            min_items: self.min_items,
+        }
+    }
+
+    pub fn restore(&mut self, state: PickerState) {
+        self.min_items = self.min_items.max(state.min_items);
+        self.message = state.message;
+        self.query = state.query;
+        self.cursor = state.cursor;
+        self.refilter();
+        if let Some(label) = state.selected {
+            self.select(|i| i.label == label);
+        }
+    }
+
+    pub fn select(&mut self, matches: impl Fn(&PickItem) -> bool) {
+        self.selected = self.filtered.iter().position(|&i| matches(&self.items[i])).unwrap_or(0);
+    }
+
+    pub fn result(mut self, message: impl Into<String>) -> Mode {
+        self.message = Some(message.into());
+        Mode::Picker(self)
     }
 
     /// Actions offered by Tab, with the keys that run them.
@@ -456,7 +499,7 @@ impl Picker {
             .items
             .iter()
             .enumerate()
-            .filter(|(_, it)| !matches!(it.action, PickAction::NewWorkspace | PickAction::AddAccount))
+            .filter(|(i, it)| Some(*i) != self.pinned && !matches!(it.action, PickAction::NewWorkspace))
             .filter_map(|(i, it)| {
                 // The label matters most; details only rescue items whose label does not match.
                 fuzzy_score(&self.query, &it.label)
@@ -490,7 +533,7 @@ impl Picker {
                 self.filtered.push(self.items.len() - 1);
             }
         }
-        if let Some(i) = self.items.iter().position(|it| matches!(it.action, PickAction::AddAccount)) {
+        if let Some(i) = self.pinned.filter(|&i| i < self.items.len()) {
             self.filtered.push(i);
         }
         self.selected = self.selected.min(self.filtered.len().saturating_sub(1));
@@ -781,6 +824,54 @@ fn fuzzy_score(query: &str, text: &str) -> Option<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn list_refresh_and_result_keep_the_query_selection_and_room_for_removed_rows() {
+        let item = |name: &str| PickItem::new(name, "", PickAction::None);
+        let mut old = Picker::new(PickerKind::Accounts, "Accounts", vec![item("One"), item("Two"), item("Other")]);
+        old.query = "o".into();
+        old.cursor = 1;
+        old.refilter();
+        old.select(|i| i.label == "Two");
+        old.message = Some("Account added".into());
+        let mut refreshed = Picker::new(PickerKind::Accounts, "Accounts", vec![item("Two"), item("One")]);
+        refreshed.restore(old.state());
+        assert_eq!(refreshed.query, "o");
+        assert_eq!(refreshed.cursor, 1);
+        assert_eq!(refreshed.current().unwrap().label, "Two");
+        assert_eq!(refreshed.min_items, 3);
+        assert_eq!(refreshed.message.as_deref(), Some("Account added"));
+        let mut missing = Picker::new(PickerKind::Accounts, "Accounts", vec![item("One")]);
+        missing.restore(refreshed.state());
+        assert_eq!(missing.current().unwrap().label, "One");
+        let Mode::Picker(result) = refreshed.result("Done") else { panic!() };
+        assert_eq!(result.query, "o");
+        assert_eq!(result.current().unwrap().label, "Two");
+        assert_eq!(result.message.as_deref(), Some("Done"));
+    }
+
+    #[test]
+    fn a_pinned_list_row_and_two_line_geometry_do_not_depend_on_the_account_kind() {
+        let mut p = Picker::new(
+            PickerKind::Tool,
+            "List",
+            vec![PickItem::new("One", "Details", PickAction::None), PickItem::new("Add", "", PickAction::None)],
+        );
+        p.pinned = Some(1);
+        p.two_line = true;
+        p.query = "no matches".into();
+        p.refilter();
+        assert_eq!(p.filtered, [1]);
+        assert_eq!(p.current().unwrap().label, "Add");
+        p.query.clear();
+        p.refilter();
+        assert_eq!(p.filtered, [0, 1]);
+        let layout = super::super::overlays::picker_layout(&p, ratatui::layout::Rect::new(0, 0, 80, 24));
+        assert_eq!(layout.row_height, 2);
+        assert_eq!(layout.row_at(layout.list.x, layout.list.y), Some(0));
+        assert_eq!(layout.row_at(layout.list.x, layout.list.y + 1), Some(0));
+        assert_eq!(layout.row_at(layout.list.x, layout.list.y + 2), Some(1));
+    }
 
     #[test]
     fn fuzzy_prefers_word_starts_and_runs() {
