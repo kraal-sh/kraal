@@ -120,7 +120,9 @@ for tag in $tags; do
         bin="$dir/$tag/kraal"
         [ -x "$bin" ] || download "$tag"
     fi
-    "$bin" --version >/dev/null || fail "$bin does not run here"
-    say "this kraal with $("$bin" --version)"
+    # In an empty environment: only the tests, which have directories of their own, run a
+    # release where it could read something. Here it would be the developer's.
+    version=$(env -i "$bin" --version) || fail "$bin does not run here"
+    say "this kraal with $version"
     KRAAL_OLD="$bin" cargo test --locked --test compat -- --ignored "$@"
 done

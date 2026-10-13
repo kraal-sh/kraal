@@ -3,6 +3,10 @@
 //! binary: `tests/compat.sh` fetches the releases kraal keeps working with and runs these with
 //! each of them.
 
+/// Where the tests run, as the other end-to-end tests do.
+#[path = "common/isolation.rs"]
+mod isolation;
+
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
@@ -39,10 +43,11 @@ struct Env {
 
 impl Env {
     fn new(name: &str) -> Env {
+        isolation::check();
         // Under /tmp: macOS's temporary directory is too long for the sockets kraal makes there.
         let root = PathBuf::from("/tmp").join(format!("kraal-compat-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
-        for d in ["run", "state", "config/kraal/workspaces"] {
+        for d in ["home", "run", "state", "config/kraal/workspaces"] {
             std::fs::create_dir_all(root.join(d)).unwrap();
         }
         let sh = root.join("sh");
@@ -58,13 +63,10 @@ impl Env {
 
     fn cmd(&self, kraal: &Kraal, args: &[&str]) -> Command {
         let mut c = Command::new(&kraal.bin);
-        c.env("XDG_RUNTIME_DIR", self.root.join("run"))
+        c.env("HOME", self.root.join("home"))
+            .env("XDG_RUNTIME_DIR", self.root.join("run"))
             .env("XDG_STATE_HOME", self.root.join("state"))
             .env("XDG_CONFIG_HOME", self.root.join("config"))
-            .env_remove("KRAAL_PANE")
-            .env_remove("KRAAL_SOCKET")
-            .env_remove("KRAAL_SESSION")
-            .env_remove("KRAAL_SESSION_NAME")
             .args(["-s", &self.session])
             .args(args);
         c

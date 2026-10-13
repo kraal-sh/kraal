@@ -74,14 +74,12 @@ fn called(env: &Env) -> String {
     std::fs::read_to_string(env.root.join("called")).unwrap_or_default()
 }
 
-/// `program` in the test's directories, with the fakes first in its `PATH` and a home of the
-/// test's own: an example never reaches the real ssh, agents or home.
+/// `program` in the test's directories, with the fakes first in its `PATH`: an example never
+/// reaches the real ssh.
 fn isolated(env: &Env, program: &Path) -> Command {
-    let home = env.root.join("home");
-    std::fs::create_dir_all(&home).unwrap();
     let mut c = env.isolated(program);
     let path = format!("{}:{}", env.root.join("bin").display(), std::env::var("PATH").unwrap_or_default());
-    c.env("PATH", path).env("HOME", home).current_dir(&env.root);
+    c.env("PATH", path).current_dir(&env.root);
     c
 }
 

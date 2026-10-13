@@ -684,7 +684,7 @@ sleep 600
     );
     let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap_or_default());
     let mut c = env.cmd(&["accounts", "refresh"]);
-    c.env("HOME", &home).env("PATH", path).stdin(std::process::Stdio::null()).stderr(std::process::Stdio::null());
+    c.env("PATH", path).stdin(std::process::Stdio::null()).stderr(std::process::Stdio::null());
     let out = c.output().unwrap();
     let text = String::from_utf8_lossy(&out.stdout);
     assert!(text.contains("42%"), "{text}");
@@ -1119,22 +1119,46 @@ fn a_stack_opens_on_its_expanded_pane_without_a_focus_given() {
     assert_eq!(focused, ["b"]);
 }
 
+/// A kraal the tests run stops rather than use what is the developer's, however a test let it
+/// through: as the home, as a directory of kraal's or of an agent, or in `PATH`.
+#[test]
+fn a_kraal_run_by_a_test_stays_out_of_what_is_the_developers() {
+    let env = Env::new("keepout");
+    let theirs = env.root.join("theirs");
+    std::fs::create_dir_all(theirs.join("run")).unwrap();
+    let kraal = || {
+        let mut c = env.cmd(&["ls"]);
+        c.env(common::isolation::KEEP_OUT, &theirs);
+        c
+    };
+    let path = format!("{}:{}", theirs.join("bin").display(), std::env::var("PATH").unwrap());
+    for (name, value) in [
+        ("HOME", theirs.clone().into_os_string()),
+        ("XDG_CONFIG_HOME", theirs.join(".config").into()),
+        ("XDG_STATE_HOME", theirs.join(".local/state").into()),
+        ("XDG_DATA_HOME", theirs.join(".local/share").into()),
+        ("XDG_RUNTIME_DIR", theirs.join("run").into()),
+        ("CLAUDE_CONFIG_DIR", theirs.join(".claude-work").into()),
+        ("CODEX_HOME", theirs.join(".codex").into()),
+        ("PATH", path.into()),
+    ] {
+        let out = kraal().env(name, &value).output().unwrap();
+        let said = String::from_utf8_lossy(&out.stderr);
+        assert!(!out.status.success(), "{name} let through");
+        let named = said.starts_with("kraal: run by a test, ") && said.contains(&*theirs.to_string_lossy());
+        assert!(named, "{name}: {said}");
+    }
+    let out = kraal().output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(!theirs.join("run/kraal").exists(), "nothing was made there");
+}
+
 #[test]
 fn commands_run_in_a_pane_stay_in_its_session() {
     let a = Env::new("sessa");
     a.workspace("w", "layout {\n    pane name=\"one\"\n}\n");
     a.run(&["open", "w"]);
-    let base = || {
-        let mut c = Command::new(env!("CARGO_BIN_EXE_kraal"));
-        c.env("XDG_RUNTIME_DIR", a.root.join("run"))
-            .env("XDG_STATE_HOME", a.root.join("state"))
-            .env("XDG_CONFIG_HOME", a.root.join("config"))
-            .env_remove("KRAAL_PANE")
-            .env_remove("KRAAL_SOCKET")
-            .env_remove("KRAAL_SESSION")
-            .env_remove("KRAAL_SESSION_NAME");
-        c
-    };
+    let base = || a.isolated(Path::new(env!("CARGO_BIN_EXE_kraal")));
     // A second session in the same directories, whose pane has the same id.
     let b = |args: &[&str]| base().args(["-s", "sessb"]).args(args).output().unwrap();
     assert!(b(&["open", "w"]).status.success());
@@ -1640,7 +1664,7 @@ fn commands_that_write_the_inventories_keep_what_the_user_wrote() {
     let env = Env::new("keepfile");
     let config = env.root.join("config/kraal");
     let run = |args: &[&str]| {
-        let out = env.cmd(args).env("HOME", env.root.join("home")).output().unwrap();
+        let out = env.cmd(args).output().unwrap();
         assert!(out.status.success(), "kraal {args:?}: {}", String::from_utf8_lossy(&out.stderr));
     };
     let read = |file: &Path| std::fs::read_to_string(file).unwrap();
@@ -6885,7 +6909,8 @@ fn install_script_installs_a_checked_release() {
 }
 
 /// A throwaway sshd on 127.0.0.1 with its own host and user keys, and an `ssh` that uses only
-/// them (never ~/.ssh): a server reached for real. `None` where no sshd can run here.
+/// them (never ~/.ssh): a server reached for real, where the user who logs in has a home of the
+/// test's own. `None` where no sshd can run here.
 #[cfg(target_os = "linux")]
 struct Sshd {
     child: std::process::Child,
@@ -6902,7 +6927,7 @@ impl Sshd {
         let sshd = ["/usr/sbin/sshd", "/usr/bin/sshd"].into_iter().map(PathBuf::from).find(|p| p.exists())?;
         let ssh =
             ["/usr/bin/ssh", "/bin/ssh", "/usr/local/bin/ssh"].into_iter().map(PathBuf::from).find(|p| p.exists())?;
-        std::fs::create_dir_all(dir).unwrap();
+        std::fs::create_dir_all(dir.join("home")).unwrap();
         for key in ["host_key", "user_key"] {
             let made =
                 Command::new("ssh-keygen").args(["-q", "-t", "ed25519", "-N", "", "-f"]).arg(dir.join(key)).status();
@@ -6946,7 +6971,8 @@ impl Sshd {
                 format!(
                     "Port {port}\nListenAddress 127.0.0.1\nHostKey {d}/host_key\nPidFile {d}/sshd.pid\n\
                      AuthorizedKeysFile {d}/authorized_keys\nStrictModes no\nUsePAM no\nPasswordAuthentication no\n\
-                     KbdInteractiveAuthentication no\nPubkeyAuthentication yes\nAllowUsers {}\n",
+                     KbdInteractiveAuthentication no\nPubkeyAuthentication yes\nAllowUsers {}\n\
+                     SetEnv HOME={d}/home\nPermitUserRC no\n",
                     user.trim()
                 ),
             )
