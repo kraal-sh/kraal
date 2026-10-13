@@ -5837,6 +5837,28 @@ fn a_pane_printing_without_a_pause_does_not_starve_the_others() {
     env.wait_for_text("other", "OTHER-SPOKE");
 }
 
+/// What a program prints first is drawn at once, up to a screenful: one that prints a little at
+/// a time without a pause, from its start, is then drawn at its pace like any other, not once
+/// for each piece of what it prints.
+#[test]
+fn a_program_printing_without_a_pause_from_its_start_draws_no_storm_of_frames() {
+    let env = Env::new("firstflood");
+    env.workspace("w", "layout {\n    pane name=\"main\"\n}\n");
+    env.run(&["open", "w"]);
+    let client = RawClient::attach(&env, "w");
+    client.wait_for_row("$");
+    let frames = || String::from_utf8_lossy(&client.screen.lock().unwrap()).matches("\x1b[?2026l").count();
+    let (before, start) = (frames(), Instant::now());
+    // A line at a time, each written by itself, thousands of them a second.
+    let ticks = "BEGIN { while (1) { print \"tick\"; fflush(); for (i = 0; i < 2000; i++) {} } }";
+    env.run(&["run", "--name", "ticks", "--right", "--", "awk", ticks]);
+    std::thread::sleep(Duration::from_secs(1));
+    let per_second = (frames() - before) as f64 / start.elapsed().as_secs_f64();
+    // A frame for each of its first rows, then one every 8 ms or so.
+    assert!(per_second < 400.0, "{per_second:.0} frames a second");
+    client.wait_for_row("tick");
+}
+
 #[test]
 fn output_parsed_while_keys_come_is_whole_and_in_order() {
     let env = Env::new("slices");

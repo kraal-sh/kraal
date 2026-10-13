@@ -215,6 +215,15 @@ impl Server {
         self.workspaces.iter().position(|w| w.id == id)
     }
 
+    /// Whether an attached client has pane `id` on screen: in the tab its workspace shows, and
+    /// neither folded in a stack nor hidden by a zoomed pane.
+    pub(super) fn on_screen(&self, id: PaneId) -> bool {
+        let Some((wi, _)) = self.workspace_of(id) else { return false };
+        let ws = &self.workspaces[wi];
+        self.clients.values().any(|c| c.attached && c.workspace == ws.id)
+            && self.tab_rects(ws.tab(), self.layout_area).iter().any(|(pane, ..)| *pane == id)
+    }
+
     /// (workspace index, tab index) holding a pane.
     pub fn workspace_of(&self, pane: PaneId) -> Option<(usize, usize)> {
         for (wi, ws) in self.workspaces.iter().enumerate() {

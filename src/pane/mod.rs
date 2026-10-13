@@ -232,6 +232,8 @@ pub struct Pane {
     /// Set when the process exited; the pane stays open for command panes.
     pub exit_code: Option<Option<i32>>,
     pub last_output: Instant,
+    /// How much of a screen its program has filled since it started (see [`Pane::prints`]).
+    filled: usize,
     /// Counts the output parsed.
     pub fed: u64,
     /// Counts the OSC sequences kraal reads in the output (directories, command marks, contexts
@@ -336,6 +338,7 @@ impl Pane {
             agent: AgentTracker::default(),
             exit_code: None,
             last_output: Instant::now(),
+            filled: 0,
             fed: 0,
             oscs: 0,
             bell: false,
@@ -369,6 +372,7 @@ impl Pane {
             agent: AgentTracker::default(),
             exit_code: None,
             last_output: Instant::now(),
+            filled: 0,
             fed: 0,
             oscs: 0,
             bell: false,
@@ -405,6 +409,7 @@ impl Pane {
         fresh.marked(|t| t.parse(&reset));
         **old = fresh;
         // A new process: nothing of the old one's lifecycle carries over, but its conversation.
+        self.filled = 0;
         self.reported = None;
         self.reported_since_command = false;
         self.exit_code = None;
@@ -484,6 +489,18 @@ impl Pane {
         t.resize_marked(Size { cols, rows });
         t.after_resize();
         true
+    }
+
+    /// The pane's program printed `bytes` more, in one piece: whether they belong to its first
+    /// picture, the screenful it starts with (a prompt, what a command says first). Whoever
+    /// opens a layout waits for that picture; what the program prints beyond it is a stream
+    /// like any other. A piece counts for a row at least: a program that prints a little at a
+    /// time has filled the screen after as many pieces as it has rows.
+    pub fn prints(&mut self, bytes: usize) -> bool {
+        let (cols, rows) = (usize::from(self.cols), usize::from(self.rows));
+        let first = self.filled < cols * rows;
+        self.filled = self.filled.saturating_add(bytes.max(cols));
+        first
     }
 
     /// Feed process output. Returns signals for the server.
@@ -1022,6 +1039,37 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
         assert!(seen.contains("got\x1b[1;1R"), "the reply never reached the program: {seen:?}");
+    }
+
+    #[test]
+    fn what_a_program_prints_first_is_its_first_picture_up_to_a_screenful() {
+        let (tx, _rx) = crossbeam_channel::bounded(64);
+        let env = PaneEnv {
+            socket: "/nonexistent".into(),
+            session: "t".into(),
+            shell: "sh".into(),
+            scrollback: 100,
+            graphics: Default::default(),
+        };
+        let spec = PaneSpec { command: vec!["sleep".into(), "30".into()], ..Default::default() };
+        // Ten columns, four rows.
+        let mut pane = Pane::spawn(1, None, spec, 10, 4, &env, &tx).unwrap();
+        // A line, a prompt after it, and the piece that fills the screen, with all that comes
+        // with it: then the program is one that keeps printing.
+        assert!(pane.prints(9));
+        assert!(pane.prints(12));
+        assert!(pane.prints(500));
+        assert!(!pane.prints(1));
+        assert!(!pane.prints(usize::MAX));
+        // A program started again in the pane has a first picture of its own. One that prints a
+        // little at a time has filled the screen after a piece for each row.
+        pane.kill();
+        pane.respawn(&env, &tx).unwrap();
+        for _ in 0..4 {
+            assert!(pane.prints(1));
+        }
+        assert!(!pane.prints(1));
+        pane.kill();
     }
 
     /// A shell over SSH asks whether its terminal is kraal, then for the terminal's attributes:
