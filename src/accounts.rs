@@ -313,6 +313,11 @@ impl Accounts {
         out
     }
 
+    /// Whether no account is listed: there are only the agents' own homes, each as `default`.
+    pub fn none_listed(&self) -> bool {
+        self.accounts.is_empty()
+    }
+
     /// Every account of every known agent.
     pub fn all(&self) -> Vec<Account> {
         AGENTS.iter().flat_map(|k| self.for_agent(k.name)).collect()

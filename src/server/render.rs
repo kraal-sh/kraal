@@ -1114,12 +1114,12 @@ impl Server {
             }
         }
 
-        // Every account of the agents, one row each, at the bottom.
+        // Every account of the agents, one row each, at the bottom, once there is one to list.
         let inside = usize::from(self.sidebar_width(c.cols).saturating_sub(2));
         let accounts = account_lines(&self.accounts, &self.usage, inside, crate::accounts::now());
         // They end on the last row before the bottom border, and give way when there is no room.
         let top = (height as usize).saturating_sub(2).saturating_sub(accounts.len());
-        if rows.len() <= top {
+        if !accounts.is_empty() && rows.len() <= top {
             rows.resize_with(top, || SideRow::Blank);
             rows.push(SideRow::Section("ACCOUNTS"));
             rows.extend(accounts.into_iter().map(|line| SideRow::Entry { item: None, line, selected: false }));
@@ -1709,13 +1709,17 @@ fn fit_spans(spans: Vec<Span<'static>>, max: u16) -> Vec<Span<'static>> {
 }
 
 /// The sidebar's rows of the agents' accounts, `width` columns wide: each one's usage, or that
-/// none was seen yet.
+/// none was seen yet. None while no account is listed and none was used: the agents' own homes
+/// alone are nothing to list.
 fn account_lines(
     accounts: &crate::accounts::Accounts,
     usage: &crate::accounts::UsageMap,
     width: usize,
     now: i64,
 ) -> Vec<Line<'static>> {
+    if accounts.none_listed() && usage.0.is_empty() {
+        return Vec::new();
+    }
     let t = th();
     accounts
         .all()
@@ -1794,13 +1798,17 @@ mod tests {
     fn every_account_is_listed_used_or_not() {
         use crate::accounts::{Account, Accounts, Usage, UsageMap, Window};
         let mut accounts = Accounts::empty();
+        let mut usage = UsageMap::default();
+        // The agents' own homes, none of them used yet, are nothing to list.
+        assert!(account_lines(&accounts, &usage, 40, 1_000).is_empty());
+        let window = Some(Window { used_percent: 42.0, resets_at: None });
+        usage.0.insert("claude:default".into(), Usage { five_hour: window, observed_at: 1_000, ..Default::default() });
+        assert_eq!(account_lines(&accounts, &usage, 40, 1_000).len(), 2, "one used: both agents' are listed");
         let home = "/tmp/kraal-test-patron".to_string();
         accounts
             .add(Account { name: "patron.bzh".into(), agent: "claude".into(), home, threshold: None, note: None })
             .unwrap();
-        let mut usage = UsageMap::default();
-        let window = Some(Window { used_percent: 42.0, resets_at: None });
-        usage.0.insert("claude:default".into(), Usage { five_hour: window, observed_at: 1_000, ..Default::default() });
+        assert_eq!(account_lines(&accounts, &UsageMap::default(), 40, 1_000).len(), 3, "one listed: all are");
         let rows = |width| -> Vec<String> {
             let lines = account_lines(&accounts, &usage, width, 1_000);
             lines.iter().map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect()).collect()
