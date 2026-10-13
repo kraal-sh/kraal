@@ -5488,6 +5488,123 @@ fn overlays_stay_above_the_bottom_bar() {
     assert!(rows[39].trim_end().ends_with('╯'), "{}", rows.join("\n"));
 }
 
+/// The script of a pane that says its size each time its terminal is resized, as a program that
+/// draws itself again does.
+fn says_its_size(name: &str) -> String {
+    format!("trap 'echo {name} is $(stty size)' WINCH; echo {name} ready; while :; do sleep 1 & wait $!; done")
+}
+
+/// What the program of the pane `name` says once told of the size the pane has now.
+fn says(env: &Env, name: &str) -> String {
+    let panes: serde_json::Value = serde_json::from_str(&env.run(&["panes", "--json"])).unwrap();
+    let pane = panes.as_array().unwrap().iter().find(|p| p["name"] == name).cloned().unwrap();
+    format!("{name} is {} {}", pane["rows"], pane["cols"])
+}
+
+/// Tell the server the client's terminal is now `cols × rows`; how much it had drawn until then.
+fn resize(client: &mut RawClient, cols: usize, rows: usize) -> usize {
+    let drawn = client.screen.lock().unwrap().len();
+    raw_frame(&mut client.stream, 0, format!(r#"{{"type":"resize","cols":{cols},"rows":{rows}}}"#).as_bytes());
+    drawn
+}
+
+/// The frames a client was sent.
+fn frames(client: &RawClient) -> usize {
+    String::from_utf8_lossy(&client.screen.lock().unwrap()).matches("\x1b[?2026l").count()
+}
+
+/// What its program draws when a pane is resized is the picture the user waits for: every pane
+/// shows it, at the size it was given last, however fast the resizes came, and the client ends
+/// with what a client attaching then is shown whole.
+#[test]
+fn panes_resized_show_what_their_programs_draw_again() {
+    let env = Env::new("redraws");
+    std::fs::create_dir_all(env.root.join("state/kraal")).unwrap();
+    std::fs::write(env.root.join("state/kraal/welcomed"), "").unwrap();
+    let names = ["one", "two", "three", "four"];
+    let pane = |name: &str| format!("pane name={name:?} command=\"sh\" {{ args \"-c\" {:?}; }}", says_its_size(name));
+    let column = |a: &str, b: &str| format!("pane split_direction=\"horizontal\" {{\n{}\n{}\n}}", pane(a), pane(b));
+    env.workspace(
+        "w",
+        &format!(
+            "layout {{\npane split_direction=\"vertical\" {{\n{}\n{}\n}}\n}}\n",
+            column("one", "two"),
+            column("three", "four")
+        ),
+    );
+    env.run(&["open", "w"]);
+    let mut client = RawClient::attach(&env, "w");
+    for name in names {
+        client.wait_for_row(&format!("{name} ready"));
+    }
+    client.settle();
+    // One resize, then many faster than the programs answer, then back: each ends at a size no
+    // pane had before.
+    let bursts: [&[(usize, usize)]; 3] = [
+        &[(100, 30)],
+        &[(90, 28), (140, 44), (96, 32), (132, 42), (88, 26), (150, 46), (104, 34), (126, 38)],
+        &[(120, 40)],
+    ];
+    let mut drawn = 0;
+    for sizes in bursts {
+        for (cols, rows) in sizes {
+            drawn = resize(&mut client, *cols, *rows);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let (cols, rows) = sizes[sizes.len() - 1];
+        for name in names {
+            wait_until(Duration::from_secs(10), &format!("the size of {name} never shown"), || {
+                // The first frame after a resize draws the whole screen: what came since the
+                // last one is what a terminal of that size shows.
+                let shown = text_after(&client.screen.lock().unwrap()[drawn..], cols, rows);
+                let said = says(&env, name);
+                shown.iter().any(|row| row.contains(&said))
+            });
+        }
+        client.settle();
+    }
+    let fresh = RawClient::attach(&env, "w");
+    fresh.settle();
+    client.settle();
+    let (a, b) = (client.screen.lock().unwrap()[drawn..].to_vec(), fresh.screen.lock().unwrap().clone());
+    for (y, (a, b)) in terminal_after(&a, 120, 40).iter().zip(&terminal_after(&b, 120, 40)).enumerate() {
+        assert_eq!(a, b, "row {y} differs");
+    }
+}
+
+/// A pane printing without a pause is drawn at its own pace whatever is resized meanwhile: a
+/// resize adds its frame and those of the panes that draw themselves again, not a frame for
+/// each piece of what the other one prints.
+#[test]
+fn resizes_while_a_pane_floods_do_not_draw_a_storm_of_frames() {
+    let env = Env::new("resizeflood");
+    env.workspace("w", "layout {\n    pane name=\"main\"\n}\n");
+    env.run(&["open", "w"]);
+    env.run(&["run", "--name", "quiet", "--right", "--", "sh", "-c", &says_its_size("quiet")]);
+    env.run(&["run", "--name", "flood", "--down", "--", "yes"]);
+    env.run(&["focus", "main"]);
+    let mut client = RawClient::attach(&env, "w");
+    client.wait_for_row("quiet ready");
+    std::thread::sleep(Duration::from_millis(300));
+    let (before, start) = (frames(&client), Instant::now());
+    for i in 0..20 {
+        let (cols, rows) = if i % 2 == 0 { (100, 30) } else { (120, 40) };
+        resize(&mut client, cols, rows);
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let per_second = (frames(&client) - before) as f64 / start.elapsed().as_secs_f64();
+    // The flood is drawn every 8 ms or so, and each resize adds a few frames: far from the
+    // thousands a frame for each read of the flood would make.
+    assert!(per_second < 400.0, "{per_second:.0} frames a second");
+    // The quiet pane's picture still comes through, at a size it did not have yet.
+    let drawn = resize(&mut client, 110, 36);
+    wait_until(Duration::from_secs(10), "the size of the quiet pane never shown", || {
+        let shown = text_after(&client.screen.lock().unwrap()[drawn..], 110, 36);
+        let said = says(&env, "quiet");
+        shown.iter().any(|row| row.contains(&said))
+    });
+}
+
 #[test]
 fn a_pane_printing_without_a_pause_does_not_starve_the_others() {
     let env = Env::new("starve");
