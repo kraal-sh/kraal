@@ -50,6 +50,17 @@ impl Setup {
     fn commands(&self) -> impl Iterator<Item = &String> {
         self.setup.iter().filter(|c| !c.trim().is_empty())
     }
+
+    /// Whether it asks for nothing: no file to copy, no command to run.
+    fn is_empty(&self) -> bool {
+        self.copy.is_empty() && self.commands().next().is_none()
+    }
+
+    /// What a repository's file says. The error for one that cannot be read quotes it: with
+    /// what a terminal would act on written out, as for all that kraal shows of the file.
+    fn parse_repo(text: &str) -> Result<Setup> {
+        Setup::parse(text).map_err(|e| anyhow::anyhow!(visible_lines(&format!("{e:#}"))))
+    }
 }
 
 /// What `kraal config check` says of the repository's file as the checkout at `root` has it: an
@@ -57,9 +68,104 @@ impl Setup {
 pub fn check_repo_file(root: &Path) -> Result<()> {
     let path = root.join(FILE);
     match paths::read_regular_text(&path, FILE_MAX as u64) {
-        Ok(text) => Setup::parse(&text).map(drop).with_context(|| format!("in {}", path.display())),
+        Ok(text) => Setup::parse_repo(&text).map(drop).with_context(|| format!("in {}", path.display())),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(e).with_context(|| format!("reading {}", path.display())),
+    }
+}
+
+/// A repository's own setup file as of the commit a new worktree starts from (what that
+/// worktree checks out): what kraal shows, what the user approves, and what a worktree is
+/// then prepared from. It comes with the repository, so kraal acts on none of it (neither its
+/// commands nor the files it names to copy) before this version of it is approved, which is an
+/// act of its own, like a repository runbook's ([`crate::runbooks::trust_content`]).
+#[derive(Debug, Clone)]
+pub struct RepoFile {
+    /// The main checkout.
+    pub repo: PathBuf,
+    pub base: String,
+    /// The file's text and what it says; `None` when that commit has no such file.
+    file: Option<(String, Setup)>,
+}
+
+impl RepoFile {
+    /// The file of the repository containing `cwd`, as of `base` (by default the current
+    /// branch).
+    pub fn read(cwd: &Path, base: Option<&str>) -> Result<RepoFile> {
+        let (repo, base) = git::start_point(cwd, base)?;
+        RepoFile::at(repo, base)
+    }
+
+    /// The file of the repository whose main checkout is `repo`, as of `base`.
+    fn at(repo: PathBuf, base: String) -> Result<RepoFile> {
+        let file = match git::file_at(&repo, &base, FILE, FILE_MAX)? {
+            Some(text) => {
+                let setup = Setup::parse_repo(&text).with_context(|| format!("in {FILE} of {base}"))?;
+                Some((text, setup))
+            }
+            None => None,
+        };
+        Ok(RepoFile { repo, base, file })
+    }
+
+    fn setup(&self) -> Option<&Setup> {
+        self.file.as_ref().map(|(_, setup)| setup)
+    }
+
+    /// Whether kraal may act on it: it asks for nothing, or the user approved this version.
+    pub fn approved(&self) -> bool {
+        let Some((text, setup)) = &self.file else { return true };
+        setup.is_empty() || crate::runbooks::trusted_content(&self.repo, Path::new(FILE), text)
+    }
+
+    /// Approve this version of it. `false` when the repository has no such file.
+    pub fn trust(&self) -> Result<bool> {
+        let Some((text, _)) = &self.file else { return Ok(false) };
+        crate::runbooks::trust_content(&self.repo, Path::new(FILE), text)?;
+        Ok(true)
+    }
+
+    /// Where it is, as said to the user: `~/src/app/.kraal/worktree.toml as of main`.
+    pub fn place(&self) -> String {
+        format!("{} as of {}", paths::shorten_home(&self.repo.join(FILE)), visible(&self.base))
+    }
+
+    /// Its text as a terminal shows it to be read ([`visible_lines`]), if it is there.
+    pub fn shown(&self) -> Option<String> {
+        self.file.as_ref().map(|(text, _)| visible_lines(text))
+    }
+
+    /// Why kraal does not act on it, and how to approve it: said where nobody can be asked
+    /// (`--yes`, no terminal). `base` is the branch given to the command refused, which the
+    /// commands named must be given too.
+    pub fn not_approved(&self, base: Option<&str>) -> String {
+        let base = base.map(|b| format!(" --base {}", shell::quote(b))).unwrap_or_default();
+        let (show, trust) = (format!("kraal wt setup{base}"), format!("kraal wt trust{base}"));
+        crate::runbooks::refusal("the worktree setup", &self.repo, &show, &trust)
+    }
+
+    /// The question asked before kraal acts on it: every command, in full, and what it copies,
+    /// with what a terminal would act on rather than show written out (see [`visible`]).
+    pub fn trust_question(&self, worktree: &str) -> String {
+        let mut lines = vec![
+            format!("Trust the worktree setup of the repository {}?", visible(&paths::shorten_home(&self.repo))),
+            format!("Its {FILE} is new, or changed since you approved it. For the new worktree {worktree}:"),
+        ];
+        let Some(setup) = self.setup() else { return lines.join("\n") };
+        if !setup.copy.is_empty() {
+            let copy: Vec<String> = setup.copy.iter().map(|p| visible(p)).collect();
+            lines.push(format!("it copies from the main checkout: {}", copy.join(", ")));
+        }
+        if setup.commands().next().is_some() {
+            lines.push("it runs there:".into());
+        }
+        for (i, command) in setup.commands().enumerate() {
+            for (j, line) in command.trim_end_matches('\n').split('\n').enumerate() {
+                let line = visible(line);
+                lines.push(if j == 0 { format!("  {}. {line}", i + 1) } else { format!("     {line}") });
+            }
+        }
+        lines.join("\n")
     }
 }
 
@@ -75,15 +181,13 @@ fn check_pattern(p: &str) -> Result<()> {
 }
 
 /// How a new worktree is made and prepared, decided before anything is created: the
-/// repository's commands are approved first.
+/// repository's file is approved first.
 #[derive(Debug, Clone)]
 pub struct Plan {
     pub name: String,
-    /// The main checkout.
-    repo: PathBuf,
-    pub base: String,
-    /// The repository's file as of `base`, and what it says.
-    repo_file: Option<(String, Setup)>,
+    /// The repository, the commit the worktree starts from, and the repository's file as of
+    /// that commit (not read for a worktree left as git makes it).
+    pub from: RepoFile,
     /// The user's own (trusted).
     pub user: Setup,
 }
@@ -101,40 +205,32 @@ impl Plan {
         let path = git::worktrees_dir(&repo).join(name);
         ensure!(!path.exists(), "{} already exists", path.display());
         if !prepare {
-            return Ok(Plan { name: name.to_string(), repo, base, repo_file: None, user: Setup::default() });
+            let from = RepoFile { repo, base, file: None };
+            return Ok(Plan { name: name.to_string(), from, user: Setup::default() });
         }
-        let repo_file = match git::file_at(&repo, &base, FILE, FILE_MAX)? {
-            Some(text) => {
-                let setup = Setup::parse(&text).with_context(|| format!("in {FILE} of {base}"))?;
-                Some((text, setup))
-            }
-            None => None,
-        };
-        Ok(Plan { name: name.to_string(), repo, base, repo_file, user })
+        Ok(Plan { name: name.to_string(), from: RepoFile::at(repo, base)?, user })
     }
 
-    fn repo_setup(&self) -> Option<&Setup> {
-        self.repo_file.as_ref().map(|(_, s)| s)
-    }
-
-    /// The repository's commands run only once the user approved this version of its file: the
-    /// file of the main checkout, wherever that really is.
+    /// Whether the repository's file is still to be approved: kraal copies nothing it names and
+    /// runs none of its commands before.
     pub fn needs_trust(&self) -> bool {
-        let Some((text, setup)) = &self.repo_file else { return false };
-        setup.commands().next().is_some() && !crate::runbooks::trusted_content(&self.repo, Path::new(FILE), text)
+        !self.from.approved()
     }
 
+    /// Approve this version of the repository's file.
     pub fn trust(&self) -> Result<()> {
-        match &self.repo_file {
-            Some((text, _)) => crate::runbooks::trust_content(&self.repo, Path::new(FILE), text),
-            None => Ok(()),
-        }
+        self.from.trust().map(drop)
+    }
+
+    /// The question asked before the repository's file is acted on ([`RepoFile::trust_question`]).
+    pub fn trust_question(&self) -> String {
+        self.from.trust_question(&self.name)
     }
 
     /// What is copied: the user's patterns, then the repository's.
     pub fn copy(&self) -> Vec<String> {
         let mut out: Vec<String> = Vec::new();
-        for p in self.user.copy.iter().chain(self.repo_setup().map(|s| &s.copy).into_iter().flatten()) {
+        for p in self.user.copy.iter().chain(self.from.setup().map(|s| &s.copy).into_iter().flatten()) {
             if !out.contains(p) {
                 out.push(p.clone());
             }
@@ -144,37 +240,13 @@ impl Plan {
 
     /// What runs: the repository's commands, then the user's.
     pub fn steps(&self) -> Vec<String> {
-        self.repo_setup().into_iter().flat_map(Setup::commands).chain(self.user.commands()).cloned().collect()
-    }
-
-    /// The question asked before the repository's commands run: all of them, in full, with
-    /// what a terminal would act on rather than show written out (see [`visible`]).
-    pub fn trust_question(&self) -> String {
-        let mut lines = vec![
-            format!("Trust the worktree setup of the repository {}?", visible(&paths::shorten_home(&self.repo))),
-            format!(
-                "Its {FILE} is new, or changed since you last approved it. In the new worktree {}, it runs:",
-                self.name
-            ),
-        ];
-        let Some(setup) = self.repo_setup() else { return lines.join("\n") };
-        for (i, command) in setup.commands().enumerate() {
-            for (j, line) in command.trim_end_matches('\n').split('\n').enumerate() {
-                let line = visible(line);
-                lines.push(if j == 0 { format!("  {}. {line}", i + 1) } else { format!("     {line}") });
-            }
-        }
-        if !setup.copy.is_empty() {
-            let copy: Vec<String> = setup.copy.iter().map(|p| visible(p)).collect();
-            lines.push(format!("and copies from the main checkout: {}", copy.join(", ")));
-        }
-        lines.join("\n")
+        self.from.setup().into_iter().flat_map(Setup::commands).chain(self.user.commands()).cloned().collect()
     }
 
     /// Create the worktree and copy the files into it; the commands are left to run there.
     pub fn create(&self) -> Result<Prepared> {
-        let worktree = git::add_worktree(&self.repo, &self.name, Some(&self.base))?;
-        let copied = copy_files(&self.repo, &worktree.path, &self.copy());
+        let worktree = git::add_worktree(&self.from.repo, &self.name, Some(&self.from.base))?;
+        let copied = copy_files(&self.from.repo, &worktree.path, &self.copy());
         Ok(Prepared { worktree, copied, steps: self.steps() })
     }
 }
@@ -191,6 +263,13 @@ pub fn visible(s: &str) -> String {
             || matches!(c, '\u{e0000}'..='\u{e007f}')
     };
     s.chars().map(|c| if hidden(c) { c.escape_default().to_string() } else { c.to_string() }).collect()
+}
+
+/// [`visible`] for text of several lines (a file, an error that quotes one): the lines stay
+/// lines, a CR LF ends one like an LF.
+pub fn visible_lines(text: &str) -> String {
+    let lines = text.split('\n').map(|line| visible(line.strip_suffix('\r').unwrap_or(line)));
+    lines.collect::<Vec<_>>().join("\n")
 }
 
 /// A worktree just created, its files copied, its commands still to run.
@@ -250,12 +329,15 @@ struct Copied {
 }
 
 impl Copied {
+    /// What to say of it. The names are the repository's files, which no approval showed (a
+    /// pattern stands for them): they are written with nothing for a terminal to act on.
     fn lines(&self) -> Vec<String> {
         let mut lines = Vec::new();
         if !self.copied.is_empty() {
-            lines.push(format!("copied from the main checkout: {}", self.copied.join(", ")));
+            let names: Vec<String> = self.copied.iter().map(|name| visible(name)).collect();
+            lines.push(format!("copied from the main checkout: {}", names.join(", ")));
         }
-        lines.extend(self.skipped.iter().map(|(p, why)| format!("not copied: {p} ({why})")));
+        lines.extend(self.skipped.iter().map(|(p, why)| format!("not copied: {} ({})", visible(p), visible(why))));
         lines
     }
 }
@@ -601,7 +683,7 @@ mod tests {
         std::fs::write(repo.join(".env"), "A=1\n").unwrap();
         let user = Setup { copy: vec![".env".into(), "local.txt".into()], setup: vec!["echo mine".into()] };
         let plan = Plan::new(&repo, "feature", None, user, true).unwrap();
-        assert_eq!(plan.base, "main");
+        assert_eq!(plan.from.base, "main");
         assert_eq!(plan.steps(), vec!["echo one", "echo mine"], "the repository's first, then yours");
         assert_eq!(plan.copy(), vec![".env", "local.txt"]);
         assert!(plan.trust_question().contains("  1. echo one"), "{}", plan.trust_question());
@@ -655,7 +737,7 @@ mod tests {
         let broken_user = Setup { copy: vec!["../outside".into()], setup: Vec::new() };
         assert!(Plan::new(&repo, "x", None, Setup::default(), true).is_err());
         let plan = Plan::new(&repo, "x", None, broken_user, false).unwrap();
-        assert!(plan.repo_file.is_none() && plan.copy().is_empty() && plan.steps().is_empty());
+        assert!(plan.from.file.is_none() && plan.copy().is_empty() && plan.steps().is_empty());
         assert!(!plan.needs_trust());
         let prepared = plan.create().unwrap();
         assert!(prepared.worktree.path.join(".kraal/worktree.toml").exists());
@@ -671,20 +753,54 @@ mod tests {
                     copy = [\".env\\u0007\"]\n";
         let setup = Setup::parse(text).unwrap();
         assert!(setup.setup[0].contains('\u{1b}'), "the command itself is untouched");
-        let plan = Plan {
-            name: "x".into(),
+        let file = |text: &str| RepoFile {
             repo: PathBuf::from("/src/app"),
             base: "main".into(),
-            repo_file: Some((text.into(), setup)),
-            user: Setup::default(),
+            file: Some((text.into(), Setup::parse(text).unwrap())),
         };
-        let shown = plan.trust_question();
+        let shown = file(text).trust_question("x");
         assert!(!shown.chars().any(|c| c.is_control() && c != '\n'), "{shown:?}");
         assert!(!shown.contains(['\u{202e}', '\u{202c}']), "{shown:?}");
         assert!(shown.contains("  1. touch /tmp/unapproved # \\u{1b}[2K\\r  1. echo safe"), "{shown}");
         assert!(shown.contains("  2. echo \\u{202e}evil\\u{202c} ok"), "{shown}");
-        assert!(shown.contains(".env\\u{7}"), "{shown}");
+        assert!(shown.contains("it copies from the main checkout: .env\\u{7}"), "{shown}");
         assert_eq!(visible("plain é 漢字 $(x) \\n"), "plain é 漢字 $(x) \\n");
+        // The file as `kraal wt setup` prints it, and an error that quotes it: no more there.
+        let raw = "copy = [\".env\"] # \u{200b}\u{202e}\r\nsetup = []\n";
+        assert_eq!(file(raw).shown().unwrap(), "copy = [\".env\"] # \\u{200b}\\u{202e}\nsetup = []\n");
+        let error = format!("{:#}", Setup::parse_repo("setup = \u{1b}[2J\n").unwrap_err());
+        assert!(error.contains("\\u{1b}[2J") && !error.contains('\u{1b}'), "{error:?}");
+    }
+
+    /// The repository's file is acted on once approved, whatever it asks for: files to copy
+    /// need the approval as commands do. One that asks for nothing needs none.
+    #[test]
+    fn what_a_repository_asks_for_needs_approval_be_it_only_a_copy() {
+        let file = |text: &str| RepoFile {
+            repo: PathBuf::from("/nowhere/kraal-test-repository"),
+            base: "main".into(),
+            file: Some((text.into(), Setup::parse(text).unwrap())),
+        };
+        let asks_nothing = |text: &str| Setup::parse(text).unwrap().is_empty();
+        assert!(!asks_nothing("setup = [\"npm ci\"]\n") && !asks_nothing("copy = [\".env\"]\n"));
+        // Nothing asked for, or no file: approved without a look at what was recorded.
+        assert!(asks_nothing("") && file("").approved() && file("setup = [\" \"]\ncopy = []\n").approved());
+        let none = RepoFile { repo: PathBuf::from("/nowhere/kraal-test-repository"), base: "main".into(), file: None };
+        assert!(none.approved() && none.shown().is_none());
+        // What is asked says each part there is, and only those.
+        let copy_only = file("copy = [\".env\", \"config/*.key\"]\n").trust_question("fix");
+        assert!(copy_only.contains("it copies from the main checkout: .env, config/*.key"), "{copy_only}");
+        assert!(!copy_only.contains("it runs"), "{copy_only}");
+        let both = file("copy = [\".env\"]\nsetup = [\"npm ci\"]\n").trust_question("fix");
+        assert!(both.contains("it copies from the main checkout: .env\nit runs there:\n  1. npm ci"), "{both}");
+        // Where nobody can be asked: the commands that show it and approve it, for that branch.
+        let said = file("copy = [\".env\"]\n").not_approved(Some("release 1"));
+        assert!(said.starts_with("the worktree setup comes from the repository /nowhere/kraal-test-repository"));
+        assert!(
+            said.contains("`kraal wt setup --base 'release 1'`")
+                && said.contains("`kraal wt trust --base 'release 1'`")
+        );
+        assert!(file("copy = [\".env\"]\n").not_approved(None).contains("(`kraal wt trust`)"));
     }
 
     /// A pattern matches in time proportional to its length times the name's, however many

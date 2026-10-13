@@ -421,7 +421,9 @@ pub enum TunnelCmd {
 pub enum WtCmd {
     /// Create a worktree from the current repository and prepare it (.kraal/worktree.toml and
     /// [worktrees] in the config: files copied, setup commands); with --agent, start that agent
-    /// in it (in a new tab inside kraal, whose pane's id is printed last).
+    /// in it (in a new tab inside kraal, whose pane's id is printed last). The repository's
+    /// .kraal/worktree.toml is acted on once you have approved that version of it: it is shown
+    /// first, for you to approve.
     New {
         name: String,
         #[arg(long)]
@@ -429,12 +431,28 @@ pub enum WtCmd {
         /// Branch to start from (default: the current one).
         #[arg(long)]
         base: Option<String>,
-        /// Trust the repository's setup commands without asking, when they are new or changed.
+        /// Ask nothing. It approves nothing: a setup of the repository that is new or changed is
+        /// refused (`kraal wt trust`).
         #[arg(long)]
         yes: bool,
         /// Copy nothing and run no setup command.
         #[arg(long)]
         no_setup: bool,
+    },
+    /// Show the repository's worktree setup (.kraal/worktree.toml, as a new worktree would get
+    /// it): what it copies and what it runs.
+    Setup {
+        /// The branch a worktree would start from (default: the current one).
+        #[arg(long)]
+        base: Option<String>,
+    },
+    /// Approve the repository's worktree setup as it is now, so that a new worktree can be
+    /// prepared from it: read it first (`kraal wt setup`). When it changes, it needs your
+    /// approval again.
+    Trust {
+        /// The branch a worktree would start from (default: the current one).
+        #[arg(long)]
+        base: Option<String>,
     },
     /// List this repository's kraal worktrees, with their number.
     List,

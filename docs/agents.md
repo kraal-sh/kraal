@@ -99,6 +99,8 @@ worktrees.
 |---|---|
 | `kraal wt new fix-login --agent claude` | the same from the command line (without `--agent`, the worktree alone); its last line is the id of the agent's pane |
 | `kraal wt new fix-login --base main` | from that branch instead of the one checked out |
+| `kraal wt setup` | shows the repository's `.kraal/worktree.toml` as a new worktree would get it (`--base main`: as that branch has it) |
+| `kraal wt trust` | approves that file as it is now, for new worktrees to be prepared from it (see Preparation below) |
 | `kraal wt list` | this repository's worktrees, with each one's number |
 | `kraal wt rm fix-login` | removes one with its branch; refuses if it would lose changes, unmerged commits or ignored files, or while panes work in it |
 | `kraal wt rm fix-login --discard-ignored` | removes it with ignored files of its own |
@@ -124,13 +126,25 @@ copied through a link out of the repository, nor written through one. `setup` ru
 worktree, in the agent's pane, before the agent starts; the first command that fails stops the
 setup, and the agent then waits for Enter. With `kraal wt new`, the setup runs in the terminal
 you typed it in: a command that fails there fails `kraal wt new`, the worktree stays, and the
-agent is not started. These commands come from the repository: like its
-runbooks, they run only once you have approved that version of the file (kraal shows them and
-asks again when the file changes), with control and invisible characters written out (`\u{1b}`,
-`\r`), so what you approve is what runs. `kraal wt new` asks in the terminal; `--yes` approves,
-`--no-setup` skips the preparation (the file is not even read). Your own `copy` and `setup`, for
-every repository, go in `[worktrees]` in the config; they run without asking, after the
-repository's.
+agent is not started.
+
+This file comes with the repository, and someone else may have written it. Like a repository's
+[runbooks](runbooks.md#repository-runbooks), kraal acts on it only once you have approved that
+version of it: it copies none of the files it names and runs none of its commands before, and it
+needs your approval again when the file changes. Approving is an act of its own:
+
+- The agent picker shows what the file copies and every command it runs, and asks whether to
+  trust it, before the worktree is made.
+- In a terminal, `kraal wt new fix-login` shows the same and asks, before anything is made.
+- `kraal wt trust` approves the file as it is now, without a question: for scripts, and once you
+  have read it (`kraal wt setup`).
+
+Whatever kraal shows of the file has its control and invisible characters written out (`\u{1b}`,
+`\r`), so what you approve is what runs. `--yes` asks nothing and approves nothing: with it, or
+without a terminal, a file that is new or changed is refused, nothing is made, and the message
+names the commands above. `--no-setup` makes the worktree without any preparation (the file is
+not even read). Your own `copy` and `setup`, for every repository, go in `[worktrees]` in the
+config; they need no approval, and run after the repository's.
 
 **Ports.** Each worktree has a number in its repository (1, 2…), kept with the worktree whatever
 it checks out (another branch, a detached HEAD) and reused once the worktree is gone. Panes opened
