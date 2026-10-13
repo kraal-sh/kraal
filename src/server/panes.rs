@@ -135,6 +135,13 @@ impl Server {
         if !pane.process_hold().is_some_and(|p| p.is(process)) {
             return;
         }
+        if self.switches.get(&id).is_some_and(|s| {
+            matches!(s.stage, super::agents::SwitchStage::Starting | super::agents::SwitchStage::Restoring)
+        }) {
+            pane.exit_code = Some(None);
+            self.switch_start_failed(id, why);
+            return;
+        }
         if let Some(login) = &mut pane.spec.login {
             login.state = super::agents::login_start_failed(&pane.spec.command);
             login.lock = None;
@@ -284,8 +291,24 @@ impl Server {
             self.login_exited(id, code);
             return;
         }
+        if !pane.suspended
+            && self.switches.get(&id).is_some_and(|s| {
+                matches!(
+                    s.stage,
+                    super::agents::SwitchStage::Starting
+                        | super::agents::SwitchStage::Restoring
+                        | super::agents::SwitchStage::Recovering
+                        | super::agents::SwitchStage::RecoveryStopping
+                )
+            })
+        {
+            pane.exit_code = Some(code);
+            self.switch_start_failed(id, &format!("the agent exited before starting ({code:?})"));
+            self.mark_dirty();
+            return;
+        }
         if self.switches.get(&id).is_some_and(|s| s.stage == super::agents::SwitchStage::Stopping) {
-            // Ended first: if the switch cannot go on, Enter starts it again on its account.
+            // The last source output is read before its replacement starts.
             if let Some(pane) = self.panes.get_mut(&id) {
                 pane.exit_code = Some(code);
                 let session = pane.agent.session_id.take();

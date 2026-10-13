@@ -152,6 +152,9 @@ pub struct PaneSpec {
     pub account_id: Option<String>,
     /// Conversation id the agent was started with, for resuming it.
     pub session: Option<String>,
+    /// The previous account and conversation, without an older Undo chain.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub account_undo: Option<Box<PaneSpec>>,
     /// The git worktree kraal created for this pane's agent.
     pub worktree: Option<crate::git::Worktree>,
     /// An agent waiting for its account (the rules depend on what git says about its
@@ -507,6 +510,11 @@ impl Pane {
         let first = self.filled < cols * rows;
         self.filled = self.filled.saturating_add(bytes.max(cols));
         first
+    }
+
+    /// Whether the current process has produced output since its last start.
+    pub fn has_printed(&self) -> bool {
+        self.filled != 0
     }
 
     /// Feed process output. Returns signals for the server.
@@ -1075,9 +1083,11 @@ mod tests {
         let spec = PaneSpec { command: vec!["sleep".into(), "30".into()], ..Default::default() };
         // Ten columns, four rows.
         let mut pane = Pane::spawn(1, None, spec, 10, 4, &env, &tx).unwrap();
+        assert!(!pane.has_printed());
         // A line, a prompt after it, and the piece that fills the screen, with all that comes
         // with it: then the program is one that keeps printing.
         assert!(pane.prints(9));
+        assert!(pane.has_printed());
         assert!(pane.prints(12));
         assert!(pane.prints(500));
         assert!(!pane.prints(1));
@@ -1086,6 +1096,7 @@ mod tests {
         // little at a time has filled the screen after a piece for each row.
         pane.kill();
         pane.respawn(&env, &tx).unwrap();
+        assert!(!pane.has_printed(), "old output does not confirm a new process started");
         for _ in 0..4 {
             assert!(pane.prints(1));
         }

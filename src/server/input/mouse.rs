@@ -100,6 +100,7 @@ impl Server {
                         }
                     }
                     Some(BarItem::NewTab) => return Some(self.action(id, Action::NewTab)),
+                    Some(BarItem::Toast(pane, action)) => return Some(self.toast_action(id, pane, action)),
                     Some(BarItem::Workspace) => {
                         let ws = self.clients[&id].workspace;
                         return Some(Mode::Picker(self.workspace_picker(ws)));
@@ -146,6 +147,15 @@ impl Server {
                 }
             }
             MouseKind::Press(button) => {
+                if button == MouseButton::Left
+                    && !m.mods.ctrl
+                    && !scroll_mode
+                    && let Some((pane, tile, floating)) = hit
+                    && m.row == tile.y
+                    && self.frame_account_hit(pane, tile, floating, self.workspaces[wi].marked.contains(&pane), m.col)
+                {
+                    return Some(self.change_account_mode(id, pane));
+                }
                 // Borders of tiled panes; ctrl+click on a frame's top marks the pane instead. A
                 // folded pane's row is that pane's, but for its ends, on the borders beside it.
                 if button == MouseButton::Left

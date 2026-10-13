@@ -19,8 +19,7 @@ use crate::pane::Content;
 pub(super) enum Context {
     /// Connected to a server.
     Server { name: String, production: bool },
-    /// A coding agent: its pane's name, its state, whether kraal started it on an account (which
-    /// can then be switched), whether it works in a worktree.
+    /// A coding agent: its pane's name, its state, whether it supports accounts, whether it works in a worktree.
     Agent { name: String, state: AgentState, account: bool, worktree: bool },
     /// A shell, or another program, in a git repository.
     Repository,
@@ -199,7 +198,7 @@ impl Server {
             return Context::Agent {
                 name: pane.display_name(),
                 state: pane.agent.state,
-                account: self.pane_account(id).is_some(),
+                account: pane.agent.kind.as_deref().is_some_and(|k| crate::accounts::agent_kind(k).is_some()),
                 worktree: self.pane_worktree(id).is_some(),
             };
         }

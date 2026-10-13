@@ -102,6 +102,11 @@ names. Rules saved by this version keep current readable names for older readers
 workspace formats are unchanged; older readers still load their panes. These limits of older
 account lookup do not justify extra `[[account]]` rows in the shared file.
 
+A saved pane may also carry an optional `account_undo` with the previous launch and conversation.
+Older saved panes still load without it. Older kraal versions ignore that return action and
+continue to read the pane's ordinary account and session fields. Account switching uses the
+existing attached-terminal input protocol, so older clients can use the same interface.
+
 ## For contributors: how the protocol changes
 
 The client and the server exchange JSON messages (`src/protocol.rs`, whose comments hold the

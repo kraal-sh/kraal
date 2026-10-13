@@ -228,14 +228,11 @@ impl Server {
             Action::ToolPicker => return Mode::Picker(self.tool_picker(focus)),
             Action::Hints => return self.start_hints(id),
             Action::Runbooks => return self.runbooks_action(id),
-            Action::SwitchAccount => match focus.filter(|f| self.pane_account(*f).is_some()) {
-                Some(f) if self.switches.contains_key(&f) => return self.pending_switch_mode(f),
-                Some(f) => return Mode::Picker(self.agent_picker(id, Some(f))),
-                None => {
-                    let how = self.keymap.hint(Action::AgentPicker).unwrap_or_default();
-                    self.toast(id, format!("This agent was not started from kraal's agents ({how})."))
+            Action::SwitchAccount => {
+                if let Some(pane) = focus {
+                    return self.change_account_mode(id, pane);
                 }
-            },
+            }
             Action::NextAttention => {
                 let queue = self.attention_queue();
                 let next = queue.iter().find(|a| !self.attention_shown(id, a)).or(queue.first()).cloned();

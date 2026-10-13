@@ -256,6 +256,8 @@ pub struct AgentTracker {
     /// Hooks have reported for the current agent run; heuristics are then ignored.
     pub hooked: bool,
     pub session_id: Option<String>,
+    /// Foreground process whose descendant reported this conversation.
+    pub session_process: Option<(u32, u64)>,
     pub message: Option<String>,
     /// The process that ran the agent's last hook (its id and start time): the agent itself when
     /// it runs its hooks directly, as OpenCode's and Kilo's plugins do.
@@ -270,6 +272,7 @@ impl Default for AgentTracker {
             since: Instant::now(),
             hooked: false,
             session_id: None,
+            session_process: None,
             message: None,
             reporter: None,
         }

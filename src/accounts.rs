@@ -38,7 +38,7 @@ pub struct AgentKind {
     /// Entries copied once into a new account home.
     copied: &'static [&'static str],
     /// Variables that would override the account's login; cleared in the pane.
-    clear_env: &'static [&'static str],
+    pub clear_env: &'static [&'static str],
 }
 
 /// The agents whose accounts kraal manages; other agents run with their own single home.
@@ -838,6 +838,30 @@ impl Accounts {
         self.known().iter().filter(|a| a.same_home(&probe)).find_map(|a| self.resolve(a))
     }
 
+    /// Associate a live process only when its home selects one account and no credential overrides it.
+    pub fn process_account(&self, kind: &AgentKind, env: &HashMap<String, String>) -> Option<Account> {
+        if kind.clear_env.iter().any(|k| env.get(*k).is_some_and(|v| !v.is_empty())) {
+            return None;
+        }
+        let home = match env.get(kind.home_env) {
+            Some(home) if !home.is_empty() => PathBuf::from(home),
+            _ => PathBuf::from(env.get("HOME")?).join(kind.default_home.strip_prefix("~/")?),
+        };
+        if !home.is_absolute() {
+            return None;
+        }
+        let canonical = home.canonicalize().ok()?;
+        let mut matches = self.all().into_iter().filter(|a| {
+            a.agent == kind.name && paths::expand_tilde(&a.home).canonicalize().ok().as_ref() == Some(&canonical)
+        });
+        let mut account = matches.next()?;
+        if matches.any(|a| a.id != account.id) {
+            return None;
+        }
+        account.home = home.to_str()?.into();
+        Some(account)
+    }
+
     /// Resuming a pane must use the home it launched in, even after its identity was linked.
     pub fn at_launch_home(&self, mut a: Account, env: &[(String, String)]) -> Account {
         if let Some(kind) = agent_kind(&a.agent) {
@@ -1585,6 +1609,50 @@ pub fn conversation_exists(a: &Account, session: &str) -> Result<Option<bool>> {
         return Ok(None);
     }
     Ok(Some(transcript(a, session)?.is_some()))
+}
+
+/// Verify the saved conversation before promising a return to it.
+pub fn check_resume(a: &Account, session: &str) -> Result<()> {
+    anyhow::ensure!(
+        !session.is_empty() && session.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'),
+        "could not verify the conversation id"
+    );
+    if a.agent == "claude" {
+        return check_carry(a, a, session);
+    }
+    fn find(dir: &Path, session: &str, depth: usize) -> Result<bool> {
+        use std::io::{BufRead, Read};
+        let entries = match std::fs::read_dir(dir) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(e) => return Err(e.into()),
+        };
+        for entry in entries {
+            let entry = entry?;
+            let kind = entry.file_type()?;
+            if kind.is_dir() && depth < 3 && find(&entry.path(), session, depth + 1)? {
+                return Ok(true);
+            }
+            if kind.is_file() && entry.file_name().to_str().is_some_and(|n| n.ends_with(&format!("-{session}.jsonl"))) {
+                let file = std::fs::File::open(entry.path())?;
+                let mut first = String::new();
+                std::io::BufReader::new(file.take(64 * 1024)).read_line(&mut first)?;
+                if let Ok(meta) = serde_json::from_str::<serde_json::Value>(&first)
+                    && meta["type"] == "session_meta"
+                    && meta["payload"]["id"] == session
+                {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
+    }
+    anyhow::ensure!(
+        a.agent == "codex" && find(&paths::expand_tilde(&a.home).join("sessions"), session, 0)?,
+        "could not find the saved conversation on {}",
+        label(a)
+    );
+    Ok(())
 }
 
 /// Where conversation `session`'s transcript is in account `a`'s home, if anywhere. An error
@@ -2727,7 +2795,17 @@ mod tests {
         drop(held);
         assert!(lock_login(&alias).is_err(), "a closed pane's waiter still holds the login");
         drop(waiter);
-        drop(lock_login(&alias).unwrap());
+        // Another test's fork can hold this descriptor until exec closes it (as with the
+        // session locks). Releasing our last hold must still make the lock available.
+        let start = std::time::Instant::now();
+        loop {
+            if let Ok(lock) = lock_login(&alias) {
+                drop(lock);
+                break;
+            }
+            assert!(start.elapsed() < crate::testing::PATIENCE, "the sign-in lock was never released");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -3690,5 +3768,52 @@ until = 2027-01-01    # read by a newer kraal
                 + *rng.pick(&["You've used 85% of your weekly limit", "used 1e309% of your session limit", "used -5%"]);
             let _ = limit_from_screen(&screen);
         });
+    }
+    #[test]
+    fn a_process_account_uses_its_own_home_and_refuses_credential_overrides() {
+        let dir = std::env::temp_dir().join(format!("kraal-process-account-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join(".claude")).unwrap();
+        let mut all = Accounts::empty();
+        let mut a = Accounts::standard("claude").unwrap();
+        a.name = "personal".into();
+        a.id = new_uuid();
+        a.home = dir.join(".claude").display().to_string();
+        all.add(a.clone()).unwrap();
+        let kind = agent_kind("claude").unwrap();
+        let mut env = HashMap::from([("HOME".into(), dir.display().to_string())]);
+        assert_eq!(all.process_account(kind, &env).unwrap().id, a.id);
+        env.insert("HOME".into(), "/unrelated-home".into());
+        assert!(all.process_account(kind, &env).is_none());
+        env.insert("CLAUDE_CONFIG_DIR".into(), a.home.clone());
+        assert_eq!(all.process_account(kind, &env).unwrap().id, a.id);
+        for key in kind.clear_env {
+            env.insert((*key).into(), "override".into());
+            assert!(all.process_account(kind, &env).is_none(), "{key}");
+            env.remove(*key);
+        }
+        env.insert("CLAUDE_CONFIG_DIR".into(), "relative".into());
+        assert!(all.process_account(kind, &env).is_none());
+        assert!(all.process_account(kind, &HashMap::new()).is_none());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn codex_resume_requires_readable_matching_session_metadata() {
+        let dir = std::env::temp_dir().join(format!("kraal-codex-resume-{}", std::process::id()));
+        let mut a = Accounts::standard("codex").unwrap();
+        a.home = dir.display().to_string();
+        let folder = dir.join("sessions/2026/10/13");
+        std::fs::create_dir_all(&folder).unwrap();
+        let file = folder.join("rollout-today-original.jsonl");
+        assert!(check_resume(&a, "original").is_err());
+        for text in ["", "not json", r#"{"type":"session_meta","payload":{"id":"different"}}"#] {
+            std::fs::write(&file, text).unwrap();
+            assert!(check_resume(&a, "original").is_err());
+        }
+        std::fs::write(&file, "{\"type\":\"session_meta\",\"payload\":{\"id\":\"original\"}}\n").unwrap();
+        check_resume(&a, "original").unwrap();
+        assert!(check_resume(&a, "../original").is_err());
+        assert!(check_resume(&a, "").is_err());
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

@@ -440,13 +440,19 @@ impl Server {
                         self.git_job(id, &label, script, crate::server::worktrees::JobEnd::CloseOnSuccess)
                     }
                     ConfirmAction::RemoveWorktrees(list) => self.remove_worktrees(id, list),
-                    ConfirmAction::RetryAccountSwitch { pane, account } => {
+                    ConfirmAction::RetryAccountSwitch { pane, account, undo } => {
                         let result = self
                             .accounts
                             .by_id(&account.id)
                             .filter(|a| a.same_home(&account))
                             .context("the target account changed; choose an account again")
-                            .and_then(|a| self.switch_account(pane, &a, Some(id), false));
+                            .and_then(|a| {
+                                if undo {
+                                    self.undo_account_change(pane, id)
+                                } else {
+                                    self.switch_account(pane, &a, Some(id), false)
+                                }
+                            });
                         if let Err(e) = result {
                             self.toast(id, format!("{e:#}"));
                         }

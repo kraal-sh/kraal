@@ -80,6 +80,7 @@ impl Server {
                 paste: None,
                 drag: None,
                 toast: None,
+                toast_action: None,
                 notice: None,
                 last_click: None,
                 welcome: false,
