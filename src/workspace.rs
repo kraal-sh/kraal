@@ -331,8 +331,9 @@ pub fn bind_accounts(path: &Path, accounts: &crate::accounts::Accounts) -> Resul
     if bindings(&parse_kdl(&source)?, accounts).is_empty() {
         return Ok(());
     }
-    crate::paths::locked(path, || {
-        let mut source = fs::read_to_string(path)?;
+    let target = fs::canonicalize(path)?;
+    crate::paths::locked(&target, || {
+        let mut source = fs::read_to_string(&target)?;
         let mut insertions = bindings(&parse_kdl(&source)?, accounts);
         if !insertions.is_empty() {
             insertions.sort_by_key(|(offset, _)| *offset);
@@ -340,23 +341,18 @@ pub fn bind_accounts(path: &Path, accounts: &crate::accounts::Accounts) -> Resul
                 source.insert_str(offset, &text);
             }
             parse_kdl(&source).context("checking migrated workspace accounts")?;
-            crate::paths::write_atomic(path, source.as_bytes())?;
+            crate::paths::write_atomic(&target, source.as_bytes())?;
         }
         Ok(())
     })?
 }
 
-/// Save a definition, keeping the previous contents beside it. Migration takes the same lock.
-pub fn save_file(path: &Path, def: &WorkspaceDef) -> Result<()> {
-    crate::paths::locked(path, || {
-        if path.exists() {
-            let backup = path.with_extension("kdl.bak");
-            fs::copy(path, &backup)
-                .with_context(|| format!("keeping a copy as {}: nothing was saved", backup.display()))?;
-        }
-        crate::paths::write_atomic(path, to_kdl(def).as_bytes())?;
-        Ok(())
-    })?
+/// Save the revision that was loaded or confirmed, keeping the replaced file beside it.
+pub fn save_file(path: &Path, def: &WorkspaceDef, expected: &crate::paths::FileRevision) -> Result<String> {
+    let source = to_kdl(def);
+    crate::paths::write_checked(path, source.as_bytes(), expected)
+        .with_context(|| format!("saving {}", path.display()))?;
+    Ok(source)
 }
 
 /// What to say when no workspace is named `name`: none is open under that name, and no file of
@@ -1419,6 +1415,8 @@ layout {{
         let dir = std::env::temp_dir().join(format!("kraal-workspace-save-migration-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let file = dir.join("work.kdl");
+        let alias = dir.join("alias.kdl");
+        std::os::unix::fs::symlink(&file, &alias).unwrap();
         let accounts = crate::accounts::Accounts::empty();
         let old = "layout { pane agent=\"claude:default\" }\n";
         std::fs::write(&file, old).unwrap();
@@ -1430,11 +1428,13 @@ layout {{
         let writer = paths::locked(&file, || {
             assert_eq!(std::fs::read_to_string(&file).unwrap(), old);
             let (tx, rx) = mpsc::channel();
-            let (path, saved) = (file.clone(), saved.clone());
+            let (path, saved) = (alias.clone(), saved.clone());
+            let expected = paths::FileRevision::read(&file).unwrap();
             let writer = std::thread::spawn(move || {
                 // SAFETY: gettid has no preconditions.
                 tx.send(unsafe { libc::gettid() }).unwrap();
-                save_file(&path, &saved).unwrap();
+                let error = save_file(&path, &saved, &expected).unwrap_err();
+                assert!(format!("{error:#}").contains("changed while saving"), "{error:#}");
             });
             crate::testing::wait_asleep(rx.recv().unwrap());
             assert!(!writer.is_finished(), "the save must wait for migration's read/write operation");
@@ -1444,14 +1444,14 @@ layout {{
         })
         .unwrap();
         writer.join().unwrap();
-        assert_eq!(std::fs::read_to_string(&file).unwrap(), to_kdl(&saved));
-        assert_eq!(std::fs::read_to_string(file.with_extension("kdl.bak")).unwrap(), migrated);
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), migrated);
+        assert!(!file.with_extension("kdl.bak").exists());
         // A migration saw an old label before waiting for a save's lock. It must bind the
         // newly saved layout once that lock becomes available, keeping all its new panes.
         std::fs::write(&file, old).unwrap();
         let migration = paths::locked(&file, || {
             let (tx, rx) = mpsc::channel();
-            let path = file.clone();
+            let path = alias.clone();
             let migration = std::thread::spawn(move || {
                 // SAFETY: gettid has no preconditions.
                 tx.send(unsafe { libc::gettid() }).unwrap();
@@ -1468,6 +1468,7 @@ layout {{
         let LayoutNode::Pane(pane) = &mut expected.tabs[0].root else { panic!("pane") };
         pane.account_id = Some("default-codex".into());
         assert_eq!(load_file(&file).unwrap(), expected);
+        assert!(std::fs::symlink_metadata(&alias).unwrap().file_type().is_symlink());
         std::fs::remove_dir_all(dir).unwrap();
     }
 

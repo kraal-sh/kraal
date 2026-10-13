@@ -1031,7 +1031,7 @@ impl Server {
             );
             agents.extend(states.into_iter().map(|(p, s)| (p, s, ws)));
         }
-        for (path, n) in self.def_files.iter().filter(|(p, _)| self.definition_workspace(p).is_none()) {
+        for (path, n) in self.def_files.iter().filter(|(p, _)| matches!(self.definition_workspace(p), Ok(None))) {
             let name = faint(n.clone(), t.dim);
             let detail = faint("not running".into(), t.dim);
             entry(

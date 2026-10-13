@@ -52,6 +52,10 @@ Without the prefix: `alt+arrows` move the focus (left/right at the edge go to th
 the keys of the default preset: with another preset or keys of your own, the menu, the help
 (`ctrl+b h` here) and `kraal config keys` show yours.
 
+Saving a workspace layout (`ctrl+b W s`) asks before replacing another existing file or a source
+changed outside kraal. **Cancel** is selected and returns to the entered name. A destination
+linked to another workspace is refused. See [Saving without replacing someone else's layout](workspaces.md#saving-without-replacing-someone-elses-layout).
+
 ## The bottom bar
 
 The last row shows what can be done in the focused pane, the most useful first, each with the

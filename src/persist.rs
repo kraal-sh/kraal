@@ -40,6 +40,8 @@ pub struct SessionSnapshot {
 pub struct WorkspaceSnap {
     pub name: String,
     pub definition: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub definition_source: Option<String>,
     pub cwd: Option<PathBuf>,
     pub active: usize,
     pub tabs: Vec<TabSnap>,
@@ -183,6 +185,7 @@ pub fn snapshot(server: &Server) -> SessionSnapshot {
         .map(|ws| WorkspaceSnap {
             name: ws.name.clone(),
             definition: ws.definition.clone(),
+            definition_source: ws.definition_source.clone(),
             cwd: ws.cwd.clone(),
             active: ws.active,
             // Typing is never broadcast after a restart: it starts again only when asked.
@@ -518,6 +521,7 @@ fn apply_workspace(server: &mut Server, ws: &WorkspaceSnap, revision: u32) -> Re
         let id = server.new_workspace(ws.name.clone(), ws.definition.clone());
         let wi = server.ws_index(id).unwrap();
         server.workspaces[wi].cwd = ws.cwd.clone();
+        server.workspaces[wi].definition_source = ws.definition_source.clone();
         for t in &ws.tabs {
             let tab_id = server.alloc_id();
             // Older versions saved a tab without a name as "tab N"; unnamed, it shows what its

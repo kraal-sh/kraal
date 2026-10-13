@@ -382,7 +382,7 @@ impl Server {
         for (path, def) in self.definitions() {
             match def {
                 Ok(def) => {
-                    if self.definition_workspace(&path).is_some() {
+                    if !matches!(self.definition_workspace(&path), Ok(None)) {
                         continue;
                     }
                     let n = def.panes().len();

@@ -271,6 +271,8 @@ pub struct Workspace {
     pub definition: Option<PathBuf>,
     /// The device and inode of that file when last seen: what finds it again once renamed.
     pub definition_inode: Option<(u64, u64)>,
+    /// The exact KDL loaded or last saved, independent of later directory scans.
+    pub definition_source: Option<String>,
     pub cwd: Option<PathBuf>,
     pub sync: SyncScope,
     /// Panes marked for typing in sync.
@@ -287,6 +289,9 @@ impl Workspace {
     pub fn set_definition(&mut self, path: Option<&Path>) {
         self.definition = path.map(crate::workspace::definition_path);
         self.definition_inode = path.and_then(crate::paths::file_id);
+        if path.is_none() {
+            self.definition_source = None;
+        }
     }
 
     /// Panes that receive what is typed in `focused`, besides itself.

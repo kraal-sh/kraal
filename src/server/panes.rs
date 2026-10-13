@@ -26,6 +26,7 @@ impl Server {
             active: 0,
             definition: None,
             definition_inode: None,
+            definition_source: None,
             cwd: None,
             sync: SyncScope::Off,
             marked: Default::default(),
