@@ -23,6 +23,9 @@ pub(super) fn restart(s: &Session, yes: bool) -> Result<()> {
         bail!("session {session} is not running");
     }
     let running = Running::at(session.clone(), socket.clone());
+    if let Some(server) = &running.server {
+        server.check_restart()?;
+    }
     let stops = running.stops();
     println!(
         "Session {session} runs {}; it restarts on kraal {}, with its layout, scrollback, SSH shells and agents.",
@@ -65,7 +68,7 @@ pub(super) fn after_update(exe: &Path, installed: &str, choice: Option<bool>) ->
     let older: Vec<Running> = super::session::live_sockets()
         .into_iter()
         .map(|(name, socket)| Running::at(name, socket))
-        .filter(|r| r.server.as_ref().is_none_or(|(_, v)| protocol::newer(installed, v)))
+        .filter(|r| r.server.as_ref().is_none_or(|s| protocol::newer(installed, &s.version)))
         .collect();
     if older.is_empty() {
         return Ok(());
@@ -114,18 +117,18 @@ struct Running {
     name: String,
     socket: PathBuf,
     /// Its pid and kraal release; `None` when it does not answer (another protocol).
-    server: Option<(u32, String)>,
+    server: Option<client::ServerInfo>,
 }
 
 impl Running {
     fn at(name: String, socket: PathBuf) -> Running {
-        let server = client::ping(&socket).ok().map(|s| (s.pid, s.version));
+        let server = client::ping(&socket).ok();
         Running { name, socket, server }
     }
 
     fn runs(&self) -> String {
         match &self.server {
-            Some((_, version)) => format!("kraal {version}"),
+            Some(server) => format!("kraal {}", server.version),
             None => "a kraal this one cannot talk to".into(),
         }
     }
@@ -135,10 +138,10 @@ impl Running {
     /// stops there.
     fn stops(&self) -> Vec<String> {
         let unknown = || vec!["whatever runs in its panes (its server does not say)".to_string()];
-        let Some((pid, _)) = &self.server else { return unknown() };
+        let Some(server) = &self.server else { return unknown() };
         let listed = client::request_within(&self.socket, Request::ListPanes, LIST_PANES_TIMEOUT);
         let Ok(Response::Panes(panes)) = listed else { return unknown() };
-        let running = in_panes(*pid, &self.socket);
+        let running = in_panes(server.pid, &self.socket);
         let mut lines = Vec::new();
         for p in &panes {
             let here = running.get(&p.id);

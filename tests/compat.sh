@@ -1,9 +1,9 @@
 #!/bin/sh
 # The cross-version test (tests/compat.rs): this kraal with sessions that other releases started,
-# and their commands with a session this kraal started. It runs against the oldest release kraal
-# keeps working with and the latest release, or against the releases given:
+# and their commands with a session this kraal started. It also checks one-way migration and
+# downgrade isolation against 0.2.0 and 0.3.0, or against the releases given:
 #
-#   tests/compat.sh                    # the oldest supported release and the latest one
+#   tests/compat.sh                    # 0.2.0 and 0.3.0
 #   tests/compat.sh v0.2.0             # one release
 #   tests/compat.sh --build v0.2.0     # built from its tag instead of downloaded
 #   tests/compat.sh --list             # which releases it would test
@@ -14,8 +14,8 @@
 # to the test binary (`tests/compat.sh -- --nocapture`).
 set -eu
 
-# The oldest release this kraal works with, both ways (docs/compatibility.md).
-OLDEST=v0.2.0
+# Released clients, servers and migration sources (docs/compatibility.md).
+RELEASES="v0.2.0 v0.3.0"
 
 repo=kraal-sh/kraal
 root=$(cd "$(dirname "$0")/.." && pwd)
@@ -40,18 +40,12 @@ while [ $# -gt 0 ]; do
             exit 0
             ;;
         v*) tags="$tags $1" ;;
-        *) fail "unknown argument $1 (a release tag such as $OLDEST, --build, --list, or -- and test arguments)" ;;
+        *) fail "unknown argument $1 (a release tag such as v0.2.0, --build, --list, or -- and test arguments)" ;;
     esac
     shift
 done
 
-if [ -z "$tags" ]; then
-    # Where GitHub's latest release redirects: the newest one published, assets and all.
-    latest=$(curl -fsSLI -o /dev/null -w '%{url_effective}' "https://github.com/$repo/releases/latest" | sed -n 's|.*/tag/||p')
-    [ -n "$latest" ] || fail "could not find the latest release of $repo"
-    tags=$OLDEST
-    [ "$latest" = "$OLDEST" ] || tags="$tags $latest"
-fi
+[ -n "$tags" ] || tags=$RELEASES
 if [ "$list" = 1 ]; then
     # Tags given as arguments each came after a space.
     echo "${tags# }"

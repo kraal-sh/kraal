@@ -30,7 +30,8 @@ fn unknown_without_a_session(session: &str, name: &str, cfg: &config::Config) ->
     // first: no socket is looked for in it here.
     paths::private_runtime_dir().ok()?;
     let session_there = std::os::unix::net::UnixStream::connect(paths::socket_path(session)).is_ok()
-        || paths::session_state_path(session).exists();
+        || paths::session_state_path(session).exists()
+        || paths::legacy_session_state_path(session).exists();
     let dirs = cfg.workspace_dirs();
     let defined =
         || dirs.iter().flat_map(|dir| workspace::load_dir(dir)).any(|(_, def)| def.is_ok_and(|def| def.name == name));
@@ -68,20 +69,30 @@ pub(super) fn forget(s: &Session) -> Result<()> {
         bail!("session {session} is running; `kraal kill` it first");
     }
     let p = paths::session_state_path(session);
+    let legacy_path = paths::legacy_session_state_path(session);
+    let legacy = remove_saved(&legacy_path)?;
     let state = remove_saved(&p)?;
+    let legacy_scrollback_path = paths::state_dir().join("scrollback").join(session);
+    let legacy_scrollback = match std::fs::remove_dir_all(&legacy_scrollback_path) {
+        Ok(()) => true,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+        Err(e) => return Err(e.into()),
+    };
     let scrollback = crate::persist::forget_scrollback(session)?;
     let buffers_path = paths::buffers_path(session);
     let buffers = remove_saved(&buffers_path)?;
-    if state {
-        println!("forgot {}", p.display());
+    for (removed, path) in [
+        (legacy, legacy_path),
+        (state, p),
+        (legacy_scrollback, legacy_scrollback_path),
+        (scrollback, paths::scrollback_dir(session)),
+        (buffers, buffers_path),
+    ] {
+        if removed {
+            println!("forgot {}", path.display());
+        }
     }
-    if scrollback {
-        println!("forgot {}", paths::scrollback_dir(session).display());
-    }
-    if buffers {
-        println!("forgot {}", buffers_path.display());
-    }
-    if !state && !scrollback && !buffers {
+    if !state && !legacy && !scrollback && !legacy_scrollback && !buffers {
         println!("nothing saved for {session}");
     }
     Ok(())
@@ -190,15 +201,8 @@ pub(super) fn list_sessions() -> Result<()> {
         };
         names.insert(name, state);
     }
-    if let Ok(rd) = std::fs::read_dir(paths::state_dir().join("sessions")) {
-        for e in rd.flatten() {
-            let p = e.path();
-            if p.extension().is_some_and(|x| x == "json")
-                && let Some(stem) = p.file_stem()
-            {
-                names.entry(stem.to_string_lossy().into()).or_insert_with(|| "saved".into());
-            }
-        }
+    for name in paths::saved_sessions().context("reading saved sessions")? {
+        names.entry(name).or_insert_with(|| "saved".into());
     }
     if names.is_empty() {
         println!("no sessions");

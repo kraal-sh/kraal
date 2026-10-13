@@ -22,7 +22,7 @@ scrollback = 10000
 
 # Save what each pane shows, its scrollback included, so that it shows again after the server
 # restarts (with a dim line marking where the new output starts). It is written to disk, in
-# ~/.local/state/kraal/scrollback, and can hold secrets: false saves nothing and deletes what was
+# ~/.local/state/kraal/scrollback-v2, and can hold secrets: false saves nothing and deletes what was
 # saved.
 save_scrollback = true
 
@@ -457,6 +457,15 @@ mod tests {
         // Paste buffers stay in memory unless asked.
         assert!(!cfg.buffers.persist);
         assert_eq!((cfg.buffers.limit, cfg.buffers.max_bytes()), (50, 32 << 20));
+    }
+
+    #[test]
+    fn scrollback_guidance_names_the_saved_output_directory() {
+        let dir = paths::scrollback_dir("main");
+        let name = dir.parent().unwrap().file_name().unwrap().to_str().unwrap();
+        let path = format!("~/.local/state/kraal/{name}");
+        assert!(DEFAULT_CONFIG.contains(&format!("{path},")));
+        assert!(include_str!("../docs/configuration.md").contains(&format!("`{path}`")));
     }
 
     #[test]

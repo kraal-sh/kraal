@@ -382,6 +382,22 @@ impl ServerInfo {
         self.features.as_ref().is_some_and(|list| list.iter().any(|f| f == feature.name))
     }
 
+    /// A downgraded server saves separately: restarting it cannot replace existing newer state.
+    pub fn check_restart(&self) -> Result<()> {
+        let (session, version) = (&self.session, &self.version);
+        let saved = paths::session_state_path(session);
+        if !self.has(protocol::STATE_V2) && saved.try_exists()? {
+            bail!(
+                "not restarting session {session}: newer saved state already exists in {}; \
+                 restarting kraal {version} would restore that state instead of this running session's layout and scrollback. \
+                 Keep any changes you need before stopping it with `kraal -s {session} kill`; \
+                 starting it on this kraal then restores the newer saved state",
+                saved.display()
+            );
+        }
+        Ok(())
+    }
+
     /// That this server's kraal cannot do `what`, and that a restart updates it.
     pub fn cannot(&self, what: &str) -> String {
         let (session, version) = (&self.session, &self.version);
@@ -414,6 +430,9 @@ pub fn kill_server(socket: &Path) -> Result<Saved> {
 pub fn restart_server(session: &str) -> Result<Saved> {
     // Until the next server has the session: `kraal forget` does nothing in between.
     let kept = keep_from_restart(session)?;
+    if let Ok(server) = ping(&paths::socket_path(session)) {
+        server.check_restart()?;
+    }
     let saved = stop_server(&paths::socket_path(session), true)?;
     match start(session, Some(kept.descriptor())) {
         // A server listens: it has the session.
@@ -1516,6 +1535,30 @@ mod tests {
         drop(typing);
         reader.join().unwrap();
         drop(keyboard_end);
+    }
+
+    #[test]
+    fn a_legacy_server_cannot_restart_over_newer_saved_state() {
+        let mut server = ServerInfo {
+            pid: 1,
+            session: format!("restart-state-{}", crate::accounts::new_uuid()),
+            version: protocol::KRAAL_VERSION.into(),
+            features: None,
+        };
+        assert!(server.check_restart().is_ok(), "the first upgrade can migrate the server's state");
+        let saved = paths::session_state_path(&server.session);
+        paths::ensure_private_dir(saved.parent().unwrap()).unwrap();
+        paths::write_private(&saved, b"newer state").unwrap();
+        for features in [None, Some(vec![protocol::BUFFERS.name.into()])] {
+            server.features = features;
+            let err = server.check_restart().unwrap_err().to_string();
+            assert!(err.contains("newer saved state") && err.contains(&*saved.to_string_lossy()), "{err}");
+            assert!(err.contains("instead of this running session's layout and scrollback"), "{err}");
+        }
+        server.features = Some(protocol::feature_names());
+        assert!(server.check_restart().is_ok(), "a server using this format can restart on its own state");
+        assert_eq!(std::fs::read(&saved).unwrap(), b"newer state");
+        std::fs::remove_file(saved).unwrap();
     }
 
     /// A server of a release before feature lists: what it lacks is said with the way out, and

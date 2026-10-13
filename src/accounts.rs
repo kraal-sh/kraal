@@ -13,6 +13,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::paths;
 
+mod migration;
+use migration::{legacy_usage_name, migrate_usage};
+
 /// How kraal runs one kind of agent.
 #[derive(Debug, Clone, Copy)]
 pub struct AgentKind {
@@ -166,11 +169,6 @@ impl Account {
             || reference == self.name
     }
 
-    /// Readers of an old file must agree before any of them rewrites it.
-    fn legacy_id(&self) -> String {
-        format!("legacy-{:016x}", crate::text::fnv64(&format!("{}\0{}\0{}", self.agent, self.name, self.home)))
-    }
-
     pub fn same_home(&self, other: &Account) -> bool {
         let home = |a: &Account| {
             let path = paths::expand_tilde(&a.home);
@@ -229,12 +227,10 @@ struct File {
 }
 
 impl File {
-    fn expanded_accounts(self) -> Vec<Account> {
+    fn expanded_accounts(mut self) -> Vec<Account> {
+        migration::identify(&mut self);
         let mut accounts = Vec::new();
         for mut account in self.accounts {
-            if account.id.is_empty() {
-                account.id = account.legacy_id();
-            }
             let references = std::mem::take(&mut account.references);
             let id = account.id.clone();
             accounts.push(account);
@@ -266,8 +262,9 @@ fn expanded_document(source: &str) -> Result<String> {
     let mut accounts = ArrayOfTables::new();
     doc.remove("account");
     for mut table in stored {
-        let account: Account = toml::from_str(&table.to_string())?;
-        let id = if account.id.is_empty() { account.legacy_id() } else { account.id };
+        let mut account: Account = toml::from_str(&table.to_string())?;
+        migration::identify_account(&mut account);
+        let id = account.id;
         let references = table.remove("references");
         accounts.push(table);
         if let Some(item) = references {
@@ -297,36 +294,6 @@ fn clear_positions(table: &mut toml_edit::Table) {
         }
     }
     Unplaced.visit_table_mut(table);
-}
-
-/// Remove the empty sections older kraal versions wrote, using their source spans so that
-/// comments and everything outside those sections keep their exact spelling and position.
-fn without_empty_sections(mut text: String) -> Result<String> {
-    let doc = toml_edit::Document::parse(text.as_str())?;
-    let mut remove = Vec::new();
-    if let Some(array) = doc.get("rule").and_then(toml_edit::Item::as_array).filter(|array| array.is_empty())
-        && let (Some(key), Some(value)) = (doc.key("rule").and_then(toml_edit::Key::span), array.span())
-    {
-        remove.push(key.start..value.start + 1);
-        remove.push(value.end - 1..value.end);
-    }
-    if let Some(table) = doc.get("claude").and_then(toml_edit::Item::as_table).filter(|table| table.is_empty())
-        && let Some(span) = table.span()
-    {
-        remove.push(span);
-    }
-    remove.sort_by_key(|span| span.start);
-    for span in remove.into_iter().rev() {
-        let start = text[..span.start].rfind('\n').map_or(0, |i| i + 1);
-        let end = text[span.end..].find('\n').map_or(text.len(), |i| span.end + i + 1);
-        // Drop a line only when removing its syntax leaves no comment on it.
-        if text[start..span.start].trim().is_empty() && text[span.end..end].trim().is_empty() {
-            text.replace_range(start..end, "");
-        } else {
-            text.replace_range(span, "");
-        }
-    }
-    Ok(text)
 }
 
 const HEADER: &str = "# kraal agent accounts. One [[account]] per subscription: a name, the agent (claude, codex)\n\
@@ -388,9 +355,7 @@ impl Accounts {
         };
         let mut ids = std::collections::HashSet::new();
         for a in &mut accounts.accounts {
-            if a.id.is_empty() {
-                a.id = a.legacy_id();
-            }
+            anyhow::ensure!(!a.id.is_empty(), "accounts predate kraal 0.4; run kraal 0.4 once first");
             anyhow::ensure!(
                 valid_name(&a.id) && a.linked_to.as_deref().is_none_or(valid_name) && ids.insert(a.id.clone()),
                 "invalid or duplicate account identity in {}; the file is unchanged",
@@ -435,7 +400,7 @@ impl Accounts {
         };
         let text = self
             .compact_document(&text)
-            .and_then(without_empty_sections)
+            .and_then(migration::without_empty_sections)
             .with_context(|| format!("editing {}", self.path.display()))?;
         // Compaction changes ordering and flattens links, but must preserve what kraal reads.
         let mut read: File = toml::from_str(&text).context("reading the compacted accounts")?;
@@ -503,15 +468,7 @@ impl Accounts {
             std::fs::create_dir_all(dir)?;
         }
         let text = self.text()?;
-        if let Some(source) = &self.source {
-            let old: File = toml::from_str(source)?;
-            if old.rules != self.rules || old.expanded_accounts() != self.accounts || source != &text {
-                let backup = self.path.with_extension("toml.kraal-bak");
-                if !backup.exists() {
-                    paths::write_atomic(&backup, source.as_bytes()).context("backing up accounts before migration")?;
-                }
-            }
-        }
+        migration::backup(self, &text)?;
         paths::write_atomic(&self.path, text.as_bytes()).with_context(|| format!("writing {}", self.path.display()))
     }
 
@@ -1911,35 +1868,6 @@ fn usage_path(agent: &str, id: &str) -> PathBuf {
     usage_dir().join("by-id").join(usage_file(agent, id))
 }
 
-fn legacy_usage_name(a: &Account) -> Option<&str> {
-    if a.id == format!("default-{}", a.agent) {
-        Some("default")
-    } else if a.id == a.legacy_id() {
-        Some(&a.name)
-    } else {
-        None
-    }
-}
-
-/// Copy legacy usage once; new accounts never inherit a previous occupant's cache.
-fn migrate_usage(dir: &Path, a: &Account) -> Result<()> {
-    let to = dir.join("by-id").join(usage_file(&a.agent, &a.id));
-    if let Some(name) = legacy_usage_name(a)
-        && !to.exists()
-    {
-        let from = dir.join(usage_file(&a.agent, name));
-        match std::fs::read(&from) {
-            Ok(bytes) => {
-                paths::ensure_private_dir(&dir.join("by-id"))?;
-                paths::write_private(&to, &bytes)?;
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(e).context("reading legacy account usage"),
-        }
-    }
-    Ok(())
-}
-
 pub fn save_usage(a: &Account, u: &Usage) -> Result<()> {
     let path = usage_path(&a.agent, &a.id);
     if let Some(d) = path.parent() {
@@ -2727,7 +2655,7 @@ mod tests {
         assert_eq!(launch_args(codex, &argv("codex -m o3")), argv("-m o3"));
     }
 
-    fn acct(agent: &str, name: &str, home: &str) -> Account {
+    pub(super) fn acct(agent: &str, name: &str, home: &str) -> Account {
         let mut a = Account {
             id: String::new(),
             name: name.into(),
@@ -2741,7 +2669,7 @@ mod tests {
             linked_to: None,
             references: Vec::new(),
         };
-        a.id = a.legacy_id();
+        a.id = format!("legacy-{:016x}", crate::text::fnv64(&format!("{agent}\0{name}\0{home}")));
         a
     }
 
@@ -3215,39 +3143,6 @@ mod tests {
     }
 
     #[test]
-    fn legacy_accounts_migrate_on_rewrite_with_a_backup_and_stable_references() {
-        let dir = std::env::temp_dir().join(format!("kraal-account-identity-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("accounts.toml");
-        let source = "# Mine.\n[[account]]\nagent = 'claude'\nname = 'work' # label\nhome = '/work'\ncolor = 'blue'\n\n[[rule]]\nworkspace = 'w'\naccounts = [\n  'claude:work', # preferred\n]\n";
-        std::fs::write(&path, source).unwrap();
-        let before = Accounts::load_from(&path).unwrap();
-        let account = before.get("claude", "work").unwrap();
-        assert_eq!(Accounts::load_from(&path).unwrap().get("claude", "work").unwrap().id, account.id);
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), source, "reading does not rewrite");
-        Accounts::update_at(&path, |_| Ok(())).unwrap();
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), source, "a no-op does not rewrite");
-        Accounts::update_at(&path, |all| all.rename("claude", "work", "job")).unwrap();
-        let migrated = std::fs::read_to_string(&path).unwrap();
-        let expected = source
-            .replace("name = 'work'", "name = \"job\"")
-            .replace("color = 'blue'\n", &format!("color = 'blue'\nid = {:?}\n", account.id))
-            .replace("'claude:work'", "\"job\"");
-        let expected = format!("{expected}account_ids = [{:?}]\n", account.key());
-        assert_eq!(migrated, expected);
-        assert_eq!(std::fs::read_to_string(path.with_extension("toml.kraal-bak")).unwrap(), source);
-        let after = Accounts::load_from(&path).unwrap();
-        assert_eq!(after.get("claude", "job").unwrap().id, account.id);
-        assert_eq!(after.get("claude", &format!("@{}", account.id)).unwrap().name, "job");
-        assert_eq!(after.get("claude", &account.key()).unwrap().name, "job");
-        assert_eq!(after.get("claude", "claude:job").unwrap().id, account.id);
-        assert_eq!(after.choose("claude", Some("w"), None, &UsageMap::default(), 0).unwrap().id, account.id);
-        Accounts::update_at(&path, |all| all.rename("claude", "job", "team")).unwrap();
-        assert_eq!(std::fs::read_to_string(path.with_extension("toml.kraal-bak")).unwrap(), source);
-        std::fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[test]
     fn reused_names_and_homes_do_not_capture_panes_rules_or_late_login_results() {
         let mut all = accounts();
         let old = all.get("claude", "pro").unwrap();
@@ -3321,29 +3216,6 @@ mod tests {
     }
 
     #[test]
-    fn legacy_usage_moves_once_and_a_reused_label_gets_no_usage() {
-        let dir = std::env::temp_dir().join(format!("kraal-usage-identity-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let old = acct("claude", "work", "/work");
-        std::fs::write(dir.join("claude-work.json"), "old usage").unwrap();
-        migrate_usage(&dir, &old).unwrap();
-        let file = dir.join("by-id").join(usage_file("claude", &old.id));
-        assert_eq!(std::fs::read_to_string(&file).unwrap(), "old usage");
-        std::fs::write(&file, "new usage").unwrap();
-        migrate_usage(&dir, &old).unwrap();
-        assert_eq!(std::fs::read_to_string(&file).unwrap(), "new usage");
-        let replacement = Account { id: new_uuid(), ..old.clone() };
-        migrate_usage(&dir, &replacement).unwrap();
-        assert!(!dir.join("by-id").join(usage_file("claude", &replacement.id)).exists());
-        let renamed = Account { name: "another".into(), ..old };
-        std::fs::remove_file(&file).unwrap();
-        std::fs::write(dir.join("claude-another.json"), "someone else's usage").unwrap();
-        migrate_usage(&dir, &renamed).unwrap();
-        assert!(!file.exists());
-        std::fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[test]
     fn naming_the_default_home_keeps_its_identity_and_bindings() {
         let dir = std::env::temp_dir().join(format!("kraal-adopt-default-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -3391,37 +3263,6 @@ mod tests {
         all.bind_rules();
         all.save().unwrap();
         assert_eq!(Accounts::load_from(&file).unwrap().get("claude", "personal"), Some(adopted));
-        std::fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[test]
-    fn identity_usage_cannot_collide_with_legacy_account_names() {
-        let dir = std::env::temp_dir().join(format!("kraal-usage-collision-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let default = Accounts::empty().get("claude", "default").unwrap();
-        let work = acct("claude", "work", "/work");
-        for account in [default, work] {
-            let namesake = acct("claude", &account.id, "/other");
-            let legacy = dir.join(usage_file("claude", &account.name));
-            let collision = dir.join(usage_file("claude", &namesake.name));
-            std::fs::write(&legacy, "own usage").unwrap();
-            std::fs::write(&collision, "namesake usage").unwrap();
-            migrate_usage(&dir, &account).unwrap();
-            migrate_usage(&dir, &namesake).unwrap();
-            assert_eq!(
-                std::fs::read_to_string(dir.join("by-id").join(usage_file("claude", &account.id))).unwrap(),
-                "own usage"
-            );
-            assert_eq!(
-                std::fs::read_to_string(dir.join("by-id").join(usage_file("claude", &namesake.id))).unwrap(),
-                "namesake usage"
-            );
-            assert_eq!(
-                std::fs::read_to_string(collision).unwrap(),
-                "namesake usage",
-                "legacy servers still own their caches"
-            );
-        }
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -3485,7 +3326,7 @@ until = 2027-01-01    # read by a newer kraal
         changed_text(name, BY_HAND, change)
     }
 
-    fn changed_text(name: &str, text: &str, change: impl FnOnce(&mut Accounts) -> Result<()>) -> String {
+    pub(super) fn changed_text(name: &str, text: &str, change: impl FnOnce(&mut Accounts) -> Result<()>) -> String {
         let dir = std::env::temp_dir().join(format!("kraal-accounts-{name}-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("accounts.toml");
@@ -3545,25 +3386,6 @@ until = 2027-01-01    # read by a newer kraal
                 )
                 .replace("accounts = [\"pro\", \"default\"]", "accounts = [\"work\",\"pro\", \"default\"]")
         );
-    }
-
-    #[test]
-    fn empty_sections_go_when_the_file_is_rewritten_and_their_comments_stay() {
-        let old = "# My accounts.\nrule = []\n\n[claude]\n\n[limits]\nthreshold = 85 # mine\n";
-        let text = changed_text("empty", old, |all| {
-            all.limits.threshold = 70;
-            Ok(())
-        });
-        assert_eq!(text, old.replace("rule = []\n", "").replace("[claude]\n", "").replace("85", "70"));
-        assert_eq!(changed_text("empty-again", &text, |all| all.save()), text);
-
-        let old = "# My accounts.\n'rule' = [ # contexts\n    # No rules yet.\n] # later\ncolor = 'blue'\n\n\
-                   [ 'claude' ] # my status line\n# Kept for later.\n\n[limits]\nthreshold = 85 # mine\n";
-        let text = changed_text("empty-comments", old, |all| all.save());
-        assert_eq!(text, old.replace("'rule' = [", "").replace("] # later", " # later").replace("[ 'claude' ]", ""));
-        let windows = old.replace('\n', "\r\n");
-        assert_eq!(changed_text("empty-crlf", &windows, |all| all.save()), text.replace('\n', "\r\n"));
-        assert_eq!(without_empty_sections("rule = []\n[claude]".into()).unwrap(), "");
     }
 
     #[test]

@@ -400,7 +400,8 @@ fn neither_release_starts_or_forgets_a_session_the_other_runs() {
         let env = Env::new(name);
         env.run(runs, &["open", "w"]);
         let pid = env.server_pid();
-        let saved = env.root.join("state/kraal/sessions").join(format!("{name}.json"));
+        let dir = if runs.bin == this.bin { "sessions-v2" } else { "sessions" };
+        let saved = env.root.join("state/kraal").join(dir).join(format!("{name}.json"));
         let start = Instant::now();
         while !saved.exists() {
             assert!(start.elapsed() < Duration::from_secs(60), "the layout was never saved");
@@ -444,11 +445,15 @@ fn account_migration_preserves_running_release_snapshots_and_rules() {
     let home = env.root.join("work-home");
     std::fs::create_dir_all(&home).unwrap();
     let file = env.root.join("config/kraal/accounts.toml");
-    std::fs::write(&file, format!(
-        "[[account]]\nname = 'work'\nagent = 'claude'\nhome = {:?}\n[[rule]]\nworkspace = 'w'\naccounts = ['work']\n", home.to_str().unwrap()
-    )).unwrap();
+    let source = format!(
+        "# Kept from the old release.\n[[account]]\nname = 'work'\nagent = 'claude'\nhome = {:?}\n[[rule]]\nworkspace = 'w'\naccounts = ['work']\n",
+        home.to_str().unwrap()
+    );
+    std::fs::write(&file, &source).unwrap();
+    env.run(&old, &["accounts", "limits", "--threshold", "85"]);
+    let source = std::fs::read_to_string(&file).unwrap();
     let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap_or_default());
-    let out = env.cmd(&old, &["open", "w"]).env("PATH", path).output().unwrap();
+    let out = env.cmd(&old, &["open", "w"]).env("PATH", &path).output().unwrap();
     assert!(
         out.status.success(),
         "{}\n{}",
@@ -495,69 +500,15 @@ fn account_migration_preserves_running_release_snapshots_and_rules() {
     let id = accounts["account"][0]["id"].as_str().unwrap();
     assert_eq!(accounts["rule"][0]["accounts"][0].as_str(), Some("work"));
     assert_eq!(accounts["rule"][0]["account_ids"][0].as_str(), Some(format!("claude:@{id}").as_str()));
-    env.run(&old, &["config", "reload"]);
+    assert_eq!(std::fs::read_to_string(file.with_extension("toml.kraal-bak")).unwrap(), source);
+    // The replacement server needs the same mock agent on PATH as the old one.
+    let out = env.cmd(&this, &["restart", "--yes"]).env("PATH", &path).output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     open_agent();
+    env.run(&this, &["accounts", "limits", "--threshold", "70"]);
+    assert_eq!(std::fs::read_to_string(file.with_extension("toml.kraal-bak")).unwrap(), source);
     let agents: Vec<_> = env.panes(&old).into_iter().filter(|p| p["command"][0] == "claude").collect();
     assert_eq!(agents.len(), 2, "both agents use the workspace rule before and after migration");
-    for pane in agents {
-        env.wait_for_text(&old, &pane["id"].to_string(), &format!("account-ready:{}", home.display()));
-    }
-}
-
-/// Released readers load the compact file using the current name; only current readers
-/// understand the former names stored in reference fields.
-#[test]
-#[ignore = "needs KRAAL_OLD, another release's kraal: tests/compat.sh runs it"]
-fn adopting_a_standard_sign_in_keeps_accounts_readable_by_a_running_release() {
-    let (old, this) = (Kraal::old(), Kraal::this());
-    let env = Env::new("compat-adopt");
-    let bin = env.root.join("bin");
-    std::fs::create_dir_all(&bin).unwrap();
-    write_script(
-        &bin.join("claude"),
-        r#"#!/bin/sh
-[ "$1 $2" = 'auth status' ] && exit 0
-echo "account-ready:${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
-exec sleep 1000
-"#,
-    );
-    let home = env.root.join("home/.claude");
-    std::fs::create_dir_all(&home).unwrap();
-    let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap_or_default());
-    let out = env.cmd(&old, &["open", "w"]).env("PATH", &path).output().unwrap();
-    assert!(
-        out.status.success(),
-        "{}\n{}",
-        String::from_utf8_lossy(&out.stderr),
-        std::fs::read_to_string(env.root.join("state/kraal/server-compat-adopt.log")).unwrap_or_default()
-    );
-    let pid = env.server_pid();
-    let open_agent = |binary: &Kraal, account: &str| {
-        let out = env
-            .cmd(binary, &["agent", "claude", "--account", account, "--tab"])
-            .env("KRAAL_SOCKET", env.socket())
-            .env("KRAAL_PANE", "first")
-            .output()
-            .unwrap();
-        assert!(out.status.success(), "kraal {}: {}", old.version, String::from_utf8_lossy(&out.stderr));
-    };
-    open_agent(&this, "default");
-    let out = env.cmd(&this, &["accounts", "list", "--json"]).env("PATH", &path).output().unwrap();
-    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
-    let list: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
-    assert_eq!(list.as_array().unwrap().len(), 1);
-    assert_eq!(list[0]["name"], "Personal");
-    let file: toml::Value =
-        toml::from_str(&std::fs::read_to_string(env.root.join("config/kraal/accounts.toml")).unwrap()).unwrap();
-    assert_eq!(file["account"].as_array().unwrap().len(), 1);
-    assert_eq!(file["account"][0]["name"].as_str(), Some("Personal"));
-    assert_eq!(file["account"][0]["references"][0]["name"].as_str(), Some("default"));
-    env.run(&old, &["config", "reload"]);
-    open_agent(&this, "Personal");
-    open_agent(&old, "Personal");
-    assert_eq!(env.server_pid(), pid, "adoption leaves the release server running");
-    let agents: Vec<_> = env.panes(&old).into_iter().filter(|p| p["command"][0] == "claude").collect();
-    assert_eq!(agents.len(), 3);
     for pane in agents {
         env.wait_for_text(&old, &pane["id"].to_string(), &format!("account-ready:{}", home.display()));
     }
@@ -583,8 +534,130 @@ fn a_session_of_another_release_restarts_on_this_kraal() {
     env.wait_for_text(&this, "first", "before-42");
     env.run(&this, &["send", "-p", "first", "--enter", "echo", "after-$((40+2))"]);
     env.wait_for_text(&this, "first", "after-42");
+    // This server writes the newer state itself, so later restarts keep using it.
+    env.run(&this, &["restart", "--yes"]);
+    env.wait_for_text(&this, "first", "after-42");
     let ls = env.run(&this, &["ls"]);
     assert!(ls.contains(&format!("running  {}", this.version)), "{ls}");
+}
+
+fn saved_scrollback(env: &Env) -> std::collections::BTreeMap<PathBuf, Vec<u8>> {
+    let dir = env.root.join("state/kraal/scrollback-v2").join(&env.session);
+    std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .map(|entry| {
+            let path = entry.unwrap().path();
+            let bytes = std::fs::read(&path).unwrap();
+            (path, bytes)
+        })
+        .collect()
+}
+
+#[test]
+#[ignore = "needs KRAAL_OLD, another release's kraal: tests/compat.sh runs it"]
+fn a_downgrade_restores_the_upgrade_copy_and_cannot_overwrite_new_state() {
+    let (old, this) = (Kraal::old(), Kraal::this());
+    let env = Env::new("compat-downgrade");
+    let config = env.root.join("config/kraal/config.toml");
+    let definition = env.root.join("config/kraal/workspaces/w.kdl");
+    let original_files = [std::fs::read(&config).unwrap(), std::fs::read(&definition).unwrap()];
+    env.run(&old, &["open", "w"]);
+    env.run(&old, &["rename", "-p", "first", "at-upgrade"]);
+    env.run(&old, &["send", "-p", "at-upgrade", "--enter", "echo", "upgrade-$((40+2))"]);
+    env.wait_for_text(&old, "at-upgrade", "upgrade-42");
+    env.run(&old, &["kill"]);
+    let legacy = env.root.join("state/kraal/sessions").join(format!("{}.json", env.session));
+    let original = std::fs::read(&legacy).unwrap();
+    env.run(&this, &["open", "w"]);
+    env.wait_for_text(&this, "at-upgrade", "upgrade-42");
+    env.run(&this, &["rename", "-p", "at-upgrade", "after-upgrade"]);
+    env.run(&this, &["send", "-p", "after-upgrade", "--enter", "echo", "new-$((40+2))"]);
+    env.wait_for_text(&this, "after-upgrade", "new-42");
+    env.run(&this, &["kill"]);
+    let current = env.root.join("state/kraal/sessions-v2").join(format!("{}.json", env.session));
+    let saved = std::fs::read(&current).unwrap();
+    let state: serde_json::Value = serde_json::from_slice(&saved).unwrap();
+    assert_eq!(state["version"], 2);
+    assert!(state.get("revision").is_none());
+    let scrollback = saved_scrollback(&env);
+    assert!(!scrollback.is_empty());
+    assert_eq!(std::fs::read(&legacy).unwrap(), original);
+    let backups: Vec<_> = std::fs::read_dir(legacy.parent().unwrap())
+        .unwrap()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.file_name().unwrap().to_string_lossy().starts_with(&format!("{}.json.before-0.4-", env.session)))
+        .collect();
+    assert_eq!(backups.len(), 1);
+    assert_eq!(std::fs::read(backups[0].join("state.json")).unwrap(), original);
+
+    env.run(&old, &["open", "w"]);
+    let panes = env.panes(&old);
+    assert_eq!(panes.len(), 1);
+    assert_eq!(panes[0]["name"], "at-upgrade");
+    env.wait_for_text(&old, "at-upgrade", "upgrade-42");
+    env.run(&old, &["rename", "-p", "at-upgrade", "old-writer"]);
+    env.run(&old, &["send", "-p", "old-writer", "--enter", "echo", "downgraded-$((40+2))"]);
+    env.wait_for_text(&old, "old-writer", "downgraded-42");
+    let pid = env.server_pid();
+    // A restart must explain the separate saved states before stopping the downgraded server.
+    for args in [&["restart"][..], &["restart", "--yes"][..]] {
+        let out = env.try_run(&this, args);
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(!out.status.success(), "restart discarded the downgraded session: {err}");
+        assert!(err.contains(&format!("not restarting session {}", env.session)), "{err}");
+        assert!(err.contains("newer saved state") && err.contains(&*current.to_string_lossy()), "{err}");
+        assert!(err.contains("instead of this running session's layout and scrollback"), "{err}");
+        assert!(err.contains(&format!("kraal -s {} kill", env.session)), "{err}");
+        assert!(!String::from_utf8_lossy(&out.stdout).contains("with its layout, scrollback"));
+        assert_eq!(env.server_pid(), pid, "the downgraded server was stopped");
+        assert_eq!(env.panes(&old)[0]["name"], "old-writer");
+        env.wait_for_text(&old, "old-writer", "downgraded-42");
+        assert_eq!(std::fs::read(&current).unwrap(), saved);
+        assert_eq!(saved_scrollback(&env), scrollback);
+    }
+    env.run(&old, &["kill"]);
+    assert_eq!(std::fs::read(&current).unwrap(), saved);
+    assert_eq!(saved_scrollback(&env), scrollback);
+    env.run(&old, &["forget"]);
+    assert_eq!(std::fs::read(&current).unwrap(), saved);
+    assert_eq!(saved_scrollback(&env), scrollback);
+    assert_eq!(std::fs::read(backups[0].join("state.json")).unwrap(), original);
+
+    env.run(&this, &["open", "w"]);
+    env.wait_for_text(&this, "after-upgrade", "new-42");
+    let workspaces: serde_json::Value = serde_json::from_str(&env.run(&this, &["workspaces", "--json"])).unwrap();
+    assert_eq!(workspaces[0]["id"], state["workspaces"][0]["id"]);
+    assert_eq!([std::fs::read(config).unwrap(), std::fs::read(definition).unwrap()], original_files);
+}
+
+#[test]
+#[ignore = "needs KRAAL_OLD, another release's kraal: tests/compat.sh runs it"]
+fn a_new_empty_session_is_invisible_to_an_older_release() {
+    let (old, this) = (Kraal::old(), Kraal::this());
+    let env = Env::new("compat-new-state");
+    env.run(&this, &["open", "w"]);
+    env.run(&this, &["close", "first"]);
+    env.run(&this, &["kill"]);
+    let current = env.root.join("state/kraal/sessions-v2").join(format!("{}.json", env.session));
+    let saved = std::fs::read(&current).unwrap();
+    let state: serde_json::Value = serde_json::from_slice(&saved).unwrap();
+    assert_eq!(state["workspaces"][0]["empty"], true);
+    assert_eq!(state["workspaces"][0]["tabs"], serde_json::json!([]));
+    let listed = env.run(&old, &["ls"]);
+    assert!(!listed.contains(&env.session), "{listed}");
+    env.run(&old, &["forget"]);
+    assert_eq!(std::fs::read(&current).unwrap(), saved);
+    env.run(&old, &["open", "w"]);
+    assert_eq!(env.panes(&old)[0]["name"], "first", "the old release opens its KDL");
+    env.run(&old, &["kill"]);
+    env.run(&old, &["forget"]);
+    assert_eq!(std::fs::read(&current).unwrap(), saved);
+    env.run(&this, &["open", "w"]);
+    assert!(env.panes(&this).is_empty());
+    let workspaces: serde_json::Value = serde_json::from_str(&env.run(&this, &["workspaces", "--json"])).unwrap();
+    assert_eq!(workspaces[0]["id"], state["workspaces"][0]["id"]);
 }
 
 /// A reader of the events too slow for the session is dropped by either release. A session of
