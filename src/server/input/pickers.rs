@@ -69,6 +69,17 @@ impl Server {
                 (KeyCode::Down, _) | (KeyCode::Char('n'), true) | (KeyCode::Char('j'), true) => p.move_by(1),
                 (KeyCode::PageUp, _) => p.move_by(-10),
                 (KeyCode::PageDown, _) => p.move_by(10),
+                (KeyCode::Char(key @ ('a' | 'u')), true) if p.kind == PickerKind::Pane => {
+                    if let Some(PickAction::FocusPane { pane, .. }) = p.current().map(|i| &i.action) {
+                        if key == 'a' {
+                            return self.change_account_mode(id, *pane);
+                        }
+                        if let Err(e) = self.undo_account_change(*pane, id) {
+                            self.toast(id, format!("{e:#}"));
+                        }
+                        return Mode::Normal;
+                    }
+                }
                 (KeyCode::Char('t'), true) if p.kind == PickerKind::Ssh => {
                     if let Some(PickAction::Ssh(spec)) = p.current().map(|i| i.action.clone()) {
                         self.connect(id, &spec, Placement::Tab);
@@ -292,7 +303,7 @@ impl Server {
                 Ok(ws) => self.show_workspace(id, ws),
                 Err(e) => self.toast(id, format!("{e:#}")),
             },
-            PickAction::FocusPane(pane) => self.reveal(id, pane),
+            PickAction::FocusPane { pane, .. } => self.reveal(id, pane),
             PickAction::Buffer(b) => return self.paste_buffer(id, b),
             PickAction::RemoteAgent { server, pane } => self.go_to_remote(id, &server, pane),
             PickAction::FilesSet { pane, side, target } => self.files_set(pane, side, &target),
@@ -325,6 +336,18 @@ impl Server {
                     self.toast(id, format!("{e:#}"));
                 }
             }
+            PickAction::OpenAnotherAccount(pane) => {
+                let agent = self.panes.get(&pane).and_then(|p| p.agent.kind.clone());
+                let mut picker = self.agent_picker(id, None);
+                picker.title = "Open with another account".into();
+                if let Some(agent) = agent {
+                    picker
+                        .items
+                        .retain(|i| matches!(&i.action, PickAction::AgentLaunch { agent: a, .. } if *a == agent));
+                    picker.refilter();
+                }
+                return Mode::Picker(picker);
+            }
             PickAction::CancelSwitch { pane, token } => self.cancel_switch(pane, token),
             PickAction::AgentSwitch { pane, agent, account, .. } => {
                 let result = self
@@ -334,6 +357,7 @@ impl Server {
                     .and_then(|a| self.switch_account(pane, &a, Some(id), false));
                 if let Err(e) = result {
                     self.toast(id, format!("{e:#}"));
+                    return self.change_account_mode(id, pane);
                 }
             }
             PickAction::Worktree { pane, op } => return self.worktree_op(id, pane, &op),
@@ -451,7 +475,11 @@ impl Server {
                     items.push(PickItem {
                         label: format!("{} › {} › {}", ws.name, self.tab_label(tab), pane.display_name()),
                         detail,
-                        action: PickAction::FocusPane(p),
+                        action: PickAction::FocusPane {
+                            pane: p,
+                            agent: pane.agent.kind.is_some(),
+                            undo: pane.spec.account_undo.is_some(),
+                        },
                         state: pane.agent.kind.as_ref().map(|_| pane.agent.state),
                         dim: false,
                     });

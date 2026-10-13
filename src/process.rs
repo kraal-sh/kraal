@@ -15,13 +15,26 @@ pub fn argv(pid: u32) -> Option<Vec<String>> {
 
 /// Some variables of a process's environment, as it was started.
 pub fn environ(pid: u32, names: &[&str]) -> HashMap<String, String> {
-    let Some((_, env)) = imp::args_and_env(pid) else { return HashMap::new() };
-    env.into_iter()
+    command_env(pid, names).map(|(_, env)| env).unwrap_or_default()
+}
+
+/// Read the command and selected environment together; unreadable is not an empty environment.
+pub fn command_env(pid: u32, names: &[&str]) -> Option<(Vec<String>, HashMap<String, String>)> {
+    #[cfg(target_os = "linux")]
+    let (argv, env) = (
+        nul_strings(&std::fs::read(format!("/proc/{pid}/cmdline")).ok()?),
+        nul_strings(&std::fs::read(format!("/proc/{pid}/environ")).ok()?),
+    );
+    #[cfg(not(target_os = "linux"))]
+    let (argv, env) = imp::args_and_env(pid)?;
+    let env = env
+        .into_iter()
         .filter_map(|e| {
             let (k, v) = e.split_once('=')?;
             names.contains(&k).then(|| (k.to_string(), v.to_string()))
         })
-        .collect()
+        .collect();
+    Some((argv, env))
 }
 
 /// The working directory of a process; `None` when the system does not show it (a process of
@@ -159,6 +172,14 @@ pub fn session_members(sid: libc::pid_t) -> Vec<libc::pid_t> {
         return Vec::new();
     }
     imp::session_members(sid)
+}
+
+/// Whether stopping this terminal would affect only its shell and the foreground agent's children.
+pub fn sole_foreground_job(leader: u32, foreground: u32) -> bool {
+    let members = session_members(leader as libc::pid_t);
+    members.contains(&(leader as libc::pid_t))
+        && members.contains(&(foreground as libc::pid_t))
+        && members.into_iter().all(|pid| pid as u32 == leader || lineage(pid as u32).contains(&foreground))
 }
 
 /// The jobs left in the background of the terminal of the session `leader` leads (a shell's
@@ -927,5 +948,12 @@ mod tests {
         assert_eq!(env, vec!["HOME=/Users/me", "TERM=xterm"]);
         let ports = parse_lsof("p123\nf5\nn*:5173\nn127.0.0.1:8000\nn[::1]:9000\n");
         assert_eq!(ports, [5173, 8000, 9000].into_iter().collect());
+    }
+    #[test]
+    fn command_environment_distinguishes_an_unreadable_process() {
+        let (command, env) = command_env(std::process::id(), &["PATH"]).unwrap();
+        assert_eq!(Some(command), argv(std::process::id()));
+        assert!(env.keys().all(|k| k == "PATH"));
+        assert!(command_env(u32::MAX, &["HOME"]).is_none());
     }
 }

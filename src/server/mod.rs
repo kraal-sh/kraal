@@ -379,6 +379,7 @@ pub struct Client {
     pub terminal_focused: bool,
     pub drag: Option<ui::Drag>,
     pub toast: Option<(String, Instant)>,
+    pub toast_action: Option<(PaneId, attention::ToastAction)>,
     /// A message to show once the one shown now goes.
     pub notice: Option<String>,
     /// Click bookkeeping for double/triple click selection.
@@ -510,6 +511,7 @@ pub struct Server {
     screen_limits: HashMap<PaneId, (bool, f64)>,
     /// Account changes shared by every client attached to this session.
     switches: HashMap<PaneId, agents::AccountSwitch>,
+    observed_agents: HashMap<PaneId, agents::ObservedAgent>,
     /// Panes whose account is over its threshold, already reported as an event.
     limit_events: std::collections::HashSet<PaneId>,
     /// Branch and changes per directory (None: not a repository).
@@ -850,6 +852,7 @@ pub fn run(session: &str) -> Result<()> {
         limit_alerts: HashMap::new(),
         screen_limits: HashMap::new(),
         switches: HashMap::new(),
+        observed_agents: HashMap::new(),
         limit_events: Default::default(),
         ready: Default::default(),
         ready_set: Default::default(),
@@ -1020,6 +1023,7 @@ impl Server {
         if !matches!(c.mode, Mode::Normal | Mode::Leader { .. }) {
             c.toast =
                 Some(("finish what you are doing, then ask again".into(), Instant::now() + Duration::from_secs(3)));
+            c.toast_action = None;
             return;
         }
         c.mode = mode;
@@ -1274,6 +1278,7 @@ impl Server {
         for id in expired {
             let notice = self.clients.get_mut(&id).and_then(|c| {
                 c.toast = None;
+                c.toast_action = None;
                 c.notice.take()
             });
             if let Some(text) = notice {
@@ -1360,6 +1365,16 @@ impl Server {
             || !self.held_input.is_empty()
             || !self.waits.is_empty()
             || !self.exiting.is_empty()
+            || self.switches.values().any(|s| {
+                matches!(
+                    s.stage,
+                    agents::SwitchStage::Stopping
+                        | agents::SwitchStage::Starting
+                        | agents::SwitchStage::Restoring
+                        | agents::SwitchStage::Recovering
+                        | agents::SwitchStage::RecoveryStopping
+                )
+            })
             || self.hooks.busy()
             || self.panes.values().any(|p| {
                 p.close_at.is_some()
@@ -1456,6 +1471,9 @@ impl Server {
         self.forget_ended_ssh(ssh_ended);
         self.save_buffers(false);
         self.tick_edits();
+        if scan {
+            self.refresh_observed_accounts();
+        }
         self.check_switches();
         self.forget_ended_reports();
         self.diff_pane_states();
@@ -2036,6 +2054,7 @@ mod tests {
             limit_alerts: HashMap::new(),
             screen_limits: HashMap::new(),
             switches: HashMap::new(),
+            observed_agents: HashMap::new(),
             limit_events: Default::default(),
             ready: Default::default(),
             ready_set: Default::default(),

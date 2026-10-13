@@ -7318,7 +7318,7 @@ fn choosing_the_current_account_keeps_running_and_exited_panes_as_they_are() {
 }
 
 #[test]
-fn an_account_switch_never_resends_a_prompt_by_itself_and_one_that_fails_can_be_restarted() {
+fn an_account_switch_never_resends_a_prompt_by_itself_and_a_failed_transfer_resumes_the_source() {
     let env = Env::new("switchacct");
     let bin = env.root.join("bin");
     std::fs::create_dir_all(&bin).unwrap();
@@ -7332,7 +7332,7 @@ if [ "$1" = --session-id ]; then
     mkdir -p "$CLAUDE_CONFIG_DIR/projects/-work"
     printf '{}\n' > "$CLAUDE_CONFIG_DIR/projects/-work/$2.jsonl"
 fi
-exec sleep 100
+while IFS= read -r line; do :; done
 "#,
     );
     let (alpha, beta) = (env.root.join("alpha-home"), env.root.join("beta-home"));
@@ -7390,8 +7390,7 @@ exec sleep 100
     let screen = env.run(&["read", "-p", &odd]).replace('\n', "");
     assert!(screen.contains("--brand-new-flag Deploy now"), "everything after the unknown option stays: {screen}");
 
-    // 2. A switch whose conversation cannot follow (beta cannot write it) leaves the pane ended
-    // on its account, and Enter starts it again there, resuming its conversation.
+    // 2. If copying fails after stopping, the source resumes without another keystroke.
     let plain = agent(&["--verbose"]);
     env.wait_for_text(&plain, &on_alpha);
     let command: Vec<String> =
@@ -7410,16 +7409,13 @@ exec sleep 100
     client.send(b"\r");
     client.wait_for_row("Stop and switch?");
     client.send(b"y");
-    wait_until(Duration::from_secs(10), "the failed switch leaves the agent ended", || {
-        !info(&plain)["exit_code"].is_null()
-    });
-    assert_eq!(info(&plain)["suspended"], false);
-    client.send(b"\r");
     // Lines may wrap in the pane: compare without line ends.
     let resumed = format!("{on_alpha} args=--resume {session} --verbose");
     wait_until(Duration::from_secs(10), "it resumes on alpha", || {
         env.run(&["read", "-p", &plain]).replace('\n', "").contains(&resumed)
     });
+    assert_eq!(info(&plain)["suspended"], false);
+    assert!(info(&plain)["exit_code"].is_null());
     assert!(!env.run(&["read", "-p", &plain]).replace('\n', "").contains(&on_beta));
     std::fs::set_permissions(beta.join("projects/-work"), std::fs::Permissions::from_mode(0o755)).unwrap();
 }
@@ -7443,12 +7439,25 @@ case "$*" in
     app-server*) exit 0 ;;
 esac
 echo "$$" >> "$home/starts"
+while test -f "$home/hold-start"; do sleep 0.05; done
+test -f "$home/fail-start" && exit 23
 if [ "$1" = --session-id ]; then
     mkdir -p "$home/projects/work"
     printf '{"message":1}\n' > "$home/projects/work/$2.jsonl"
 fi
+if [ -n "$CODEX_HOME" ]; then
+    session="conversation-$(basename "$home")"
+    [ "$1" = resume ] && session="$2"
+    mkdir -p "$home/sessions/2026/10/13"
+    printf '{"type":"session_meta","payload":{"id":"%s"}}\n' "$session" > "$home/sessions/2026/10/13/rollout-today-$session.jsonl"
+fi
 echo "READY home=$home args=$*"
-while IFS= read -r line; do printf 'reply:%s\n' "$line"; done
+while IFS= read -r line; do
+    if [ -n "$CODEX_HOME" ]; then
+        "$KRAAL_TEST_BIN" hook codex "{\"type\":\"agent-turn-complete\",\"thread-id\":\"$session\"}"
+    fi
+    printf 'reply:%s\n' "$line"
+done
 "#,
     );
     let mut config = format!("[limits]\nmode = {mode:?}\nthreshold = 90\n");
@@ -7464,7 +7473,8 @@ while IFS= read -r line; do printf 'reply:%s\n' "$line"; done
     std::fs::write(env.root.join("config/kraal/accounts.toml"), config).unwrap();
     env.workspace("w", "layout { pane name=\"shell\" }\n");
     let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap_or_default());
-    let out = env.cmd(&["open", "w"]).env("PATH", &path).output().unwrap();
+    let binary = env.cmd(&[]).get_program().to_os_string();
+    let out = env.cmd(&["open", "w"]).env("PATH", &path).env("KRAAL_TEST_BIN", binary).output().unwrap();
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     let socket = env.root.join(format!("run/kraal/{}.sock", env.session));
     let out = env
@@ -7476,6 +7486,10 @@ while IFS= read -r line; do printf 'reply:%s\n' "$line"; done
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     let pane = String::from_utf8(out.stdout).unwrap().trim().to_string();
     env.wait_for_text(&pane, "READY");
+    if agent == "codex" {
+        env.run(&["send", "-p", &pane, "first turn\r"]);
+        env.wait_for_text(&pane, "reply:first turn");
+    }
     pane
 }
 
@@ -7651,6 +7665,210 @@ fn codex_discloses_the_new_conversation_and_stop_confirmation_selects_cancel() {
     wait_until(PATIENCE, "Codex starts on beta", || env.root.join("beta/starts").exists());
     env.wait_for_text(&pane, &format!("home={} args=", env.root.join("beta").display()));
     assert_eq!(std::fs::read_to_string(env.root.join("beta/starts")).unwrap().lines().count(), 1);
+}
+
+#[test]
+fn frame_and_bottom_bar_open_the_same_change_and_claude_undo_continues_the_latest_history() {
+    for size in [(80, 24), (124, 36)] {
+        let env = Env::new(&format!("switch-undo-{}", size.0));
+        let pane = account_switch_agent(&env, "claude", "notify");
+        let mut client = RawClient::attach_sized(&env, Some("w"), size);
+        click_account_text(&mut client, "switch account");
+        client.wait_for_row("Change account");
+        client.send(b"\x1b");
+        // Two panes make the frame visible even with the compact single-pane setting.
+        // Stack them so the account details fit at both terminal widths.
+        env.run(&["run", "--down", "-n", "beside", "--", "sh"]);
+        env.run(&["focus", &pane]);
+        claude_hook(&env, &pane, r#"{"hook_event_name":"Stop"}"#);
+        let rows = client.wait_for_rows("the account in the frame", |rows| {
+            rows.iter().any(|r| r.contains("claude·alpha") && r.contains('─'))
+        });
+        let y = rows.iter().position(|r| r.contains("claude·alpha") && r.contains('─')).unwrap();
+        let x = rows[y][..rows[y].find("claude·alpha").unwrap()].chars().count();
+        client.send(format!("\x1b[<0;{};{}M\x1b[<0;{};{}m", x + 1, y + 1, x + 1, y + 1).as_bytes());
+        client.wait_for_row("Change account");
+        client.send(b"beta");
+        client.wait_for_row("Continue conversation");
+        client.send(b"\r");
+        client.wait_for_row("Using beta · Undo");
+        let transcript =
+            std::fs::read_dir(env.root.join("beta/projects/work")).unwrap().next().unwrap().unwrap().path();
+        use std::io::Write;
+        std::fs::OpenOptions::new().append(true).open(&transcript).unwrap().write_all(b"{\"message\":2}\n").unwrap();
+        claude_hook(&env, &pane, r#"{"hook_event_name":"Stop"}"#);
+        click_account_text(&mut client, "Undo");
+        client.wait_for_row("Account change undone");
+        let original = env.root.join("alpha/projects/work").join(transcript.file_name().unwrap());
+        assert_eq!(std::fs::read(original).unwrap(), std::fs::read(transcript).unwrap());
+        let starts = std::fs::read_to_string(env.root.join("alpha/starts")).unwrap();
+        assert_eq!(starts.lines().count(), 2);
+        assert_eq!(std::fs::read_to_string(env.root.join("beta/starts")).unwrap().lines().count(), 1);
+    }
+}
+
+#[test]
+fn codex_undo_from_pane_actions_reopens_the_original_and_keeps_the_new_conversation() {
+    let env = Env::new("codex-undo");
+    let pane = account_switch_agent(&env, "codex", "notify");
+    let mut client = RawClient::attach(&env, "w");
+    choose_switch_target(&mut client, "New conversation");
+    client.wait_for_row("Stop and switch?");
+    client.send(b"y");
+    client.wait_for_row("Using beta · Undo");
+    let newer = env.root.join("beta/sessions/2026/10/13/rollout-today-conversation-beta.jsonl");
+    let newer_contents = std::fs::read(&newer).unwrap();
+    // The action remains after its notification is dismissed.
+    client.send(b"\x02p");
+    client.send(b"codex\t");
+    client.wait_for_row("Undo account change");
+    client.send(b"\x1b[B\x1b[B\r");
+    client.wait_for_row("Stop and switch?");
+    client.wait_for_row("Continue conversation");
+    client.send(b"y");
+    env.wait_for_text(&pane, "args=resume conversation-alpha");
+    client.wait_for_row("Account change undone");
+    assert_eq!(std::fs::read(newer).unwrap(), newer_contents);
+    assert_eq!(std::fs::read_to_string(env.root.join("beta/starts")).unwrap().lines().count(), 1);
+    for name in ["alpha", "beta"] {
+        assert!(env.root.join(format!("{name}/sessions/2026/10/13/rollout-today-conversation-{name}.jsonl")).is_file());
+    }
+}
+
+#[test]
+fn a_replacement_that_exits_before_starting_resumes_the_source_once() {
+    for recovery_fails in [false, true] {
+        let env = Env::new(if recovery_fails { "switch-double-failure" } else { "switch-recovery" });
+        let pane = account_switch_agent(&env, "claude", "notify");
+        let mut client = RawClient::attach(&env, "w");
+        std::fs::write(env.root.join("beta/fail-start"), "").unwrap();
+        if recovery_fails {
+            std::fs::write(env.root.join("alpha/fail-start"), "").unwrap();
+        }
+        claude_hook(&env, &pane, r#"{"hook_event_name":"Stop"}"#);
+        choose_switch_target(&mut client, "Continue conversation");
+        if recovery_fails {
+            client.wait_for_row("Couldn't resume.");
+        } else {
+            client.wait_for_row("Resumed on alpha.");
+            env.run(&["send", "-p", &pane, "still-here\r"]);
+            env.wait_for_text(&pane, "reply:still-here");
+        }
+        assert_eq!(std::fs::read_to_string(env.root.join("alpha/starts")).unwrap().lines().count(), 2);
+        assert_eq!(std::fs::read_to_string(env.root.join("beta/starts")).unwrap().lines().count(), 1);
+        let panes: serde_json::Value = serde_json::from_str(&env.run(&["panes", "--json"])).unwrap();
+        let info = panes.as_array().unwrap().iter().find(|p| p["id"].as_u64() == pane.parse::<u64>().ok()).unwrap();
+        assert_eq!(info["account"], "claude:alpha");
+        assert_eq!(!info["exit_code"].is_null(), recovery_fails);
+    }
+}
+
+#[test]
+fn a_notify_threshold_opens_change_for_the_pane_that_reached_it() {
+    let env = Env::new("switch-notify-action");
+    let pane = account_switch_agent(&env, "claude", "notify");
+    let mut client = RawClient::attach_sized(&env, Some("w"), (80, 24));
+    env.run(&["run", "-n", "beside", "--", "sh"]);
+    write_account_usage(&env, "alpha", 95);
+    client.wait_for_row("alpha is at 95% used · Change account");
+    click_account_text(&mut client, "Change account");
+    client.wait_for_row("Change account");
+    client.wait_for_row("current · Continue conversation");
+    client.send(b"\x1b");
+    account_still_runs(&env, &pane, "only-notified");
+}
+
+#[test]
+fn a_shell_agent_can_switch_only_with_an_exact_account_and_saved_conversation() {
+    for agent in ["claude", "codex"] {
+        let env = Env::new(&format!("manual-switch-{agent}"));
+        account_switch_agent(&env, agent, "notify");
+        let mut client = RawClient::attach(&env, "w");
+        env.run(&["focus", "shell"]);
+        let variable = if agent == "claude" { "CLAUDE_CONFIG_DIR" } else { "CODEX_HOME" };
+        let args = if agent == "claude" { "--session-id manual-session" } else { "" };
+        let command = format!(
+            "{variable}='{}' '{}' {args}\r",
+            env.root.join("alpha").display(),
+            env.root.join(format!("bin/{agent}")).display()
+        );
+        env.run(&["send", "-p", "shell", &command]);
+        env.wait_for_text("shell", "READY");
+        if agent == "codex" {
+            // The fake reports its conversation id through the hook after its first turn.
+            env.run(&["send", "-p", "shell", "first turn\r"]);
+            env.wait_for_text("shell", "reply:first turn");
+        }
+        client.wait_for_row("switch account");
+        choose_switch_target(&mut client, if agent == "claude" { "Continue conversation" } else { "New conversation" });
+        client.wait_for_row("Stop and switch?");
+        client.send(b"y");
+        client.wait_for_row("Using beta · Undo");
+        env.run(&["send", "-p", "shell", "new-account\r"]);
+        env.wait_for_text("shell", "reply:new-account");
+        assert_eq!(
+            std::fs::read_to_string(env.root.join("alpha/starts")).unwrap().lines().count(),
+            2,
+            "the original managed agent also keeps running"
+        );
+        assert_eq!(std::fs::read_to_string(env.root.join("beta/starts")).unwrap().lines().count(), 1);
+    }
+}
+
+#[test]
+fn an_ambiguous_shell_agent_offers_another_pane_without_stopping_it() {
+    for reason in ["missing-session", "credential", "wrapper", "background-job"] {
+        let env = Env::new(&format!("manual-refused-{reason}"));
+        account_switch_agent(&env, "claude", "notify");
+        let mut client = RawClient::attach(&env, "w");
+        env.run(&["focus", "shell"]);
+        let program = env.root.join("bin/claude");
+        let args = if reason == "missing-session" { "" } else { "--session-id manual-session" };
+        let extra = if reason == "credential" { "ANTHROPIC_API_KEY=override " } else { "" };
+        if reason == "background-job" {
+            env.run(&["send", "-p", "shell", "sleep 60 &\r"]);
+        }
+        let command = if reason == "wrapper" {
+            format!(
+                "CLAUDE_CONFIG_DIR='{}' sh -c '\"{}\" {args} </dev/tty & wait'\r",
+                env.root.join("alpha").display(),
+                program.display()
+            )
+        } else {
+            format!("{extra}CLAUDE_CONFIG_DIR='{}' '{}' {args}\r", env.root.join("alpha").display(), program.display())
+        };
+        env.run(&["send", "-p", "shell", &command]);
+        env.wait_for_text("shell", "READY");
+        client.send(b"\x02Ac");
+        client.wait_for_row("Can't switch this process.");
+        client.wait_for_row("Open with another account");
+        assert_eq!(std::fs::read_to_string(env.root.join("alpha/starts")).unwrap().lines().count(), 2);
+        assert!(!env.root.join("beta/starts").exists());
+        client.send(b"\r");
+        client.wait_for_row("Open with another account");
+        client.send(b"beta\r");
+        env.wait_for_text("shell", "READY");
+        wait_until(PATIENCE, "another pane starts on beta", || env.root.join("beta/starts").exists());
+        let panes: serde_json::Value = serde_json::from_str(&env.run(&["panes", "--json"])).unwrap();
+        let original = panes.as_array().unwrap().iter().find(|p| p["name"] == "shell").unwrap();
+        assert!(original["exit_code"].is_null());
+        assert!(original["account"].is_null());
+    }
+}
+
+#[test]
+fn switching_waits_for_the_replacement_to_produce_output_before_offering_undo() {
+    let env = Env::new("switch-start-signal");
+    let pane = account_switch_agent(&env, "claude", "notify");
+    let mut client = RawClient::attach(&env, "w");
+    std::fs::write(env.root.join("beta/hold-start"), "").unwrap();
+    claude_hook(&env, &pane, r#"{"hook_event_name":"Stop"}"#);
+    choose_switch_target(&mut client, "Continue conversation");
+    wait_until(PATIENCE, "the replacement was spawned", || env.root.join("beta/starts").exists());
+    std::thread::sleep(Duration::from_secs(2));
+    assert!(!client.rows().iter().any(|r| r.contains("Using beta") || r.contains("Switched")));
+    std::fs::remove_file(env.root.join("beta/hold-start")).unwrap();
+    client.wait_for_row("Using beta · Undo");
 }
 
 fn write_account_usage(env: &Env, name: &str, percent: u8) {
@@ -8349,6 +8567,7 @@ fn reviewing_the_existing_account_keeps_live_agents_and_reports_usage_once() {
         let mut client = RawClient::attach_sized(&env, Some("w"), size).traced();
         if size.0 == 124 {
             client.wait_for_row("Codex · Personal");
+            // The name is also shown while checking sign-in; only Review opens the review picker.
             let rows = wait_for_account_review(&client, "Claude");
             let row = rows.iter().position(|r| r.contains("Existing Claude account")).unwrap() + 1;
             client.send(format!("\x1b[<0;10;{row}M\x1b[<0;10;{row}m").as_bytes());

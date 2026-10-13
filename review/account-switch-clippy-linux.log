@@ -1,0 +1,3 @@
+    Blocking waiting for file lock on build directory
+    Checking kraal v0.3.0 (/home/fpa/.cache/kraal-queue/wt-accounts-switch-undo)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 9.15s

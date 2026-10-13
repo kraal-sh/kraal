@@ -17,6 +17,21 @@ pub enum Attention {
     Remote { server: String, pane: u32 },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToastAction {
+    ChangeAccount,
+    UndoAccount,
+}
+
+impl ToastAction {
+    pub(super) fn label(self) -> &'static str {
+        match self {
+            Self::ChangeAccount => "Change account",
+            Self::UndoAccount => "Undo",
+        }
+    }
+}
+
 impl Server {
     /// Focused pane of the tab a client is looking at.
     pub fn client_focus(&self, id: ClientId) -> Option<PaneId> {
@@ -231,9 +246,35 @@ impl Server {
         }
         for c in self.clients.values_mut().filter(|c| c.attached) {
             c.toast = Some((format!("{title}: {body}"), Instant::now() + Duration::from_secs(4)));
+            c.toast_action = None;
             c.dirty = Dirty::Yes;
         }
         self.schedule_render();
+    }
+
+    pub(super) fn notify_action(&mut self, message: &str, pane: PaneId, action: ToastAction) {
+        let label = action.label();
+        self.notify(&format!("{message} · {label}"), "", Some(pane));
+        for c in self.clients.values_mut().filter(|c| c.attached) {
+            c.toast = Some((format!("{message} · {label}"), Instant::now() + Duration::from_secs(6)));
+            c.toast_action = Some((pane, action));
+        }
+        self.mark_dirty();
+    }
+
+    pub(super) fn toast_action(&mut self, client: ClientId, pane: PaneId, action: ToastAction) -> super::ui::Mode {
+        if !self.panes.contains_key(&pane) {
+            return super::ui::Mode::Normal;
+        }
+        match action {
+            ToastAction::ChangeAccount => self.change_account_mode(client, pane),
+            ToastAction::UndoAccount => {
+                if let Err(e) = self.undo_account_change(pane, client) {
+                    self.toast(client, format!("{e:#}"));
+                }
+                super::ui::Mode::Normal
+            }
+        }
     }
 
     /// Tell a client something, briefly; the messages log keeps it.
@@ -244,6 +285,7 @@ impl Server {
             // Long messages stay longer.
             let secs = (3 + msg.chars().count() as u64 / 25).min(10);
             c.toast = Some((msg, Instant::now() + Duration::from_secs(secs)));
+            c.toast_action = None;
             c.dirty = Dirty::Yes;
         }
         self.schedule_render();

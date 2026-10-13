@@ -281,8 +281,9 @@ launch environment of panes that use it. Adding another account with that name d
 those panes, saved sessions, workspace bindings, rules or cached usage to the replacement.
 A workspace bound to a removed account asks you to choose an account again.
 
-`ctrl+b A c` moves the focused pane's agent to another account
-of the same agent. In that picker, Enter switches to the selected account; launch, login,
+Click the account name in a pane's frame, the bottom bar's **switch account**, or press
+`ctrl+b A c` to open **Change account** for that pane. It lists accounts of the same agent.
+In that picker, Enter switches to the selected account; launch, login,
 rename and remove actions are not offered. The pane's account is marked `current`: selecting
 it closes the picker and leaves the agent running as it is, without restarting it. An exited
 pane stays exited too. Another name for the same account directory also leaves it unchanged.
@@ -305,6 +306,29 @@ empty, unreadable, or has diverged from the destination's copy, kraal refuses an
 agent running. This also applies before Claude has written its first transcript: let it finish
 a turn before changing accounts. Codex changes start a **New conversation**, stated in both the
 picker and the confirmation; the original history stays in the original account's directory.
+Kraal needs its conversation id and saved history before stopping Codex. If the id is not yet
+known, finish a turn with kraal's integration enabled, then try again.
+
+After the replacement starts, **Using <name> · Undo** offers a clickable return. The previous
+account is also kept in the pane's actions: open **Find a pane** (`ctrl+b p`), select the pane,
+press Tab and choose **Undo account change**. This remains available after the message expires
+and after restoring a saved session. Claude returns with the latest conversation, subject to
+the same transcript, sign-in and interruption checks. Codex reopens the original conversation
+in its account and keeps the newer conversation's files in the other account. Undo does not
+revert changes the agent made to your working files. A successful Undo clears that return action;
+a later account change replaces it with the most recent source.
+
+A failure after stopping triggers one attempt to resume the previous account. Kraal confirms
+success only after observing the replacement agent running, and says **Resumed on <name>** if
+recovery succeeds. If recovery also fails, the pane keeps the previous command and Enter retries
+it. The message only says the conversation is saved when its history can be verified.
+
+Claude and Codex started by hand in a shell can also change accounts when kraal can identify
+the foreground process, account home, saved conversation and exact resume arguments. A session
+selector or a hook from that process supplies the conversation id. An opaque wrapper, credential
+override, unknown conversation or ambiguous command instead shows **Can't switch this process.**
+and offers **Open with another account**. That opens another pane and leaves the original running.
+Shells with other jobs are not stopped for an account change.
 
 Sign-in from Accounts opens a dedicated login pane. Opening the same account's login again
 in that session focuses the existing pane, including through another account name for the same
@@ -383,13 +407,14 @@ known usage is under its threshold. Otherwise it tries the first account with un
 or, when all have known usage over the threshold, the one whose usage resets first. When
 the matching rule names no account that exists any more, no account is used there (rather than
 any). Without a matching rule, every confirmed account of the agent may be used, in list order. When
-the account of a running agent reaches its threshold, kraal notifies you (`notify`), offers to
-continue the conversation on another account once the agent finished its turn (`ask`), or does it
-by itself at the end of the turn (`auto`). `auto` only switches when the agent's own hooks said
+the account of a running agent reaches its threshold, kraal notifies you (`notify`) with
+**<name> is at NN% used · Change account**. Click **Change account** in kraal's notification to
+open that pane's account picker, even when another pane has focus. In `ask` mode it offers to
+continue the conversation on another account once the agent finished its turn. In `auto` mode
+it does so by itself at the end of the turn. `auto` only switches when the agent's own hooks said
 its turn ended, which Claude Code's do (`kraal integration install claude`) and Codex's cannot;
 otherwise kraal asks instead, since restarting an agent mid-turn would lose its work. Limits are
-watched for the agents kraal started on an account (the picker, `kraal agent`, a workspace file),
-not for one you typed in a shell. A Claude conversation continues on the other account; a
+watched for agents kraal started on an account and for shell launches it can associate safely. A Claude conversation continues on the other account; a
 Codex one cannot (its history stays in its account's directory), so switching starts a new one.
 Threshold alternatives need known usage below their threshold; unknown usage is not zero.
 Accounts marked as needing sign-in are excluded. An automatic change also checks sign-in and

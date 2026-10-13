@@ -187,6 +187,13 @@ impl Server {
                     .and_then(|c| c.peer)
                     .and_then(crate::process::ppid)
                     .and_then(|pid| Some((pid, crate::process::start_time(pid)?)));
+                let session_process = self.panes[&p].foreground_pid().and_then(|fg| {
+                    let (reporter, _) = reporter?;
+                    crate::process::lineage(reporter)
+                        .contains(&fg)
+                        .then(|| Some((fg, crate::process::start_time(fg)?)))
+                        .flatten()
+                });
                 let before = self.panes[&p].agent.state;
                 let pn = self.panes.get_mut(&p).unwrap();
                 let a = &mut pn.agent;
@@ -204,6 +211,7 @@ impl Server {
                     a.reporter = reporter;
                     if let Some(id) = session_id {
                         a.session_id = Some(id);
+                        a.session_process = session_process;
                     }
                     // An agent waiting for a prompt says nothing of whether its last result
                     // was seen: a finished turn stays to be looked at.

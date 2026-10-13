@@ -29,6 +29,10 @@ pub(super) enum SwitchStage {
     Waiting,
     Confirm,
     Stopping,
+    Starting,
+    Restoring,
+    Recovering,
+    RecoveryStopping,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -46,7 +50,131 @@ pub(super) struct AccountSwitch {
     process: Option<crate::pane::ProcessHold>,
     client: Option<ClientId>,
     ask: bool,
+    original: PaneSpec,
+    undo: bool,
+    observed: Option<ObservedAgent>,
+    started: Option<Instant>,
+    stopping: Option<SwitchStop>,
     pub stage: SwitchStage,
+}
+
+/// Keep the terminal's session and the agent's children identifiable after its shell exits.
+struct SwitchStop {
+    process: crate::pane::ProcessHold,
+    members: Vec<(u32, u64)>,
+    since: Instant,
+}
+
+impl SwitchStop {
+    fn new(pane: &crate::pane::Pane) -> Option<Self> {
+        let mut stop = Self { process: pane.process_hold()?, members: Vec::new(), since: Instant::now() };
+        stop.refresh();
+        Some(stop)
+    }
+
+    fn refresh(&mut self) {
+        self.members.retain(|&(pid, started)| crate::process::still_running(pid, started));
+        let mut pids = self.process.session_members();
+        pids.extend(self.members.iter().map(|&(pid, _)| pid));
+        // Remember children before signalling their parents, including ones in another session.
+        let roots = pids.clone();
+        for pid in roots {
+            pids.extend(crate::process::descendants(pid));
+        }
+        pids.sort_unstable();
+        pids.dedup();
+        for pid in pids {
+            if !self.members.iter().any(|&(seen, _)| seen == pid)
+                && let Some(started) = crate::process::start_time(pid)
+            {
+                self.members.push((pid, started));
+            }
+        }
+    }
+
+    fn signal(&self, signal: i32) {
+        self.process.signal(signal);
+        for &(pid, started) in &self.members {
+            if crate::process::still_running(pid, started) {
+                // SAFETY: this member of our stopped job still has the identity we retained.
+                unsafe { libc::kill(pid as libc::pid_t, signal) };
+            }
+        }
+    }
+
+    fn finished(&mut self) -> bool {
+        self.refresh();
+        if self.members.iter().all(|&(pid, started)| !crate::process::still_running(pid, started)) {
+            return true;
+        }
+        let elapsed = self.since.elapsed();
+        if elapsed >= Duration::from_secs(2) {
+            self.signal(libc::SIGKILL);
+        } else if elapsed >= Duration::from_secs(1) {
+            self.signal(libc::SIGTERM);
+        }
+        false
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub(super) struct ObservedAgent {
+    pid: u32,
+    started: u64,
+    command: Vec<String>,
+    account: Account,
+    session: String,
+    cwd: PathBuf,
+    path: String,
+}
+
+/// Only a direct executable or a runtime's script has arguments we can safely reuse.
+fn observed_command(argv: &[String], agent: &str) -> Option<Vec<String>> {
+    fn base(s: &str) -> &str {
+        s.rsplit('/').next().unwrap_or(s)
+    }
+    let first = argv.first()?;
+    let command = if base(first) == agent {
+        argv
+    } else if matches!(base(first), "node" | "bun" | "python" | "python3" | "sh" | "bash" | "zsh" | "dash")
+        && argv.get(1).is_some_and(|s| base(s) == agent)
+    {
+        &argv[1..]
+    } else {
+        return None;
+    };
+    let kind = accounts::agent_kind(agent)?;
+    if command.get(1).is_some_and(|s| matches!(s.as_str(), "--resume" | "--session-id" | "resume"))
+        && command.get(2).is_none_or(|s| {
+            s.is_empty() || s.starts_with('-') || !s.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+        })
+    {
+        return None;
+    }
+    let args = accounts::launch_args(kind, command);
+    if args.iter().any(|s| {
+        [
+            "-c",
+            "--config",
+            "--profile",
+            "--settings",
+            "--setting-sources",
+            "--resume",
+            "--session-id",
+            "--continue",
+            "--fork-session",
+            "--oss",
+            "--local-provider",
+            "-r",
+            "-p",
+        ]
+        .iter()
+        .any(|flag| s == flag || s.starts_with(&format!("{flag}=")))
+    }) {
+        return None;
+    }
+    let (_, exact) = accounts::resumable_args(kind, &accounts::launch_args(kind, command))?;
+    exact.then(|| command.to_vec())
 }
 
 fn switch_timing(hooked: bool, state: AgentState, exited: bool) -> SwitchStage {
@@ -66,6 +194,18 @@ fn switch_effect(agent: &str, status: Status, carry: bool) -> &'static str {
         Status::SignedIn if carry => "Continue conversation",
         _ => "Could not verify",
     }
+}
+
+fn cannot_switch_mode(pane: PaneId) -> Mode {
+    Mode::Picker(Picker::new(
+        PickerKind::Agent,
+        "Can't switch this process.",
+        vec![PickItem::new(
+            "Open with another account",
+            "The current pane keeps running",
+            PickAction::OpenAnotherAccount(pane),
+        )],
+    ))
 }
 
 /// Whether a conversation can move between accounts of this agent (they share its storage).
@@ -288,9 +428,106 @@ impl Server {
         self.usage_reset = self.usage.next_end(now).and_then(|at| Some((at, wake(at)?)));
     }
 
-    /// The account of an agent pane kraal launched.
+    /// The account of a managed pane, or of an unambiguously identified foreground agent.
     pub fn pane_account(&self, pane: PaneId) -> Option<Account> {
-        self.spec_account(&self.panes.get(&pane)?.spec)
+        let spec = &self.panes.get(&pane)?.spec;
+        if spec.account.is_some() || spec.account_id.is_some() {
+            self.spec_account(spec)
+        } else {
+            self.observed_agents.get(&pane).map(|a| a.account.clone())
+        }
+    }
+
+    fn observed_agent(&self, pane: PaneId) -> Option<ObservedAgent> {
+        let p = self.panes.get(&pane)?;
+        if p.exit_code.is_some() || p.ssh.is_some() || p.spec.login.is_some() {
+            return None;
+        }
+        let kind = accounts::agent_kind(p.agent.kind.as_deref()?)?;
+        let pid = p.foreground_pid()?;
+        let started = crate::process::start_time(pid)?;
+        let mut names = vec!["HOME", "PATH", kind.home_env];
+        names.extend(kind.clear_env);
+        let (argv, env) = crate::process::command_env(pid, &names)?;
+        let mut command = observed_command(&argv, kind.name)?;
+        // A shell's other jobs and opaque wrappers must not be stopped with its foreground job.
+        if !crate::process::sole_foreground_job(p.pid()?, pid)
+            || !p.spec.command.is_empty() && observed_command(&p.spec.command, kind.name).is_none()
+            || pid != p.pid()? && crate::process::ppid(pid) != p.pid()
+        {
+            return None;
+        }
+        let account = self.accounts.process_account(kind, &env)?;
+        let session = p
+            .agent
+            .session_process
+            .filter(|process| *process == (pid, started))
+            .and(p.agent.session_id.clone())
+            .or_else(|| {
+                let selector = if kind.name == "claude" { &["--resume", "--session-id"][..] } else { &["resume"][..] };
+                selector.contains(&command.get(1)?.as_str()).then(|| command.get(2).cloned()).flatten()
+            })?;
+        let cwd = crate::process::cwd(pid)?;
+        let program = std::path::Path::new(&command[0]);
+        let executable = |path: &std::path::Path| {
+            use std::os::unix::fs::PermissionsExt;
+            path.metadata().is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+        };
+        let program = if program.components().count() > 1 {
+            cwd.join(program)
+        } else {
+            std::env::split_paths(env.get("PATH")?).map(|dir| cwd.join(dir).join(program)).find(|p| executable(p))?
+        };
+        if !executable(&program) {
+            return None;
+        }
+        command[0] = program.to_str()?.into();
+        if !crate::process::still_running(pid, started) {
+            return None;
+        }
+        Some(ObservedAgent { pid, started, command, account, session, cwd, path: env.get("PATH")?.clone() })
+    }
+
+    pub(super) fn refresh_observed_accounts(&mut self) {
+        let observed = self
+            .panes
+            .keys()
+            .filter(|id| {
+                let spec = &self.panes[id].spec;
+                spec.account.is_none() && spec.account_id.is_none()
+            })
+            .filter_map(|&id| self.observed_agent(id).map(|a| (id, a)))
+            .collect();
+        if self.observed_agents != observed {
+            self.observed_agents = observed;
+            self.mark_dirty();
+        }
+    }
+
+    pub(super) fn change_account_mode(&mut self, client: ClientId, pane: PaneId) -> Mode {
+        if self.switches.contains_key(&pane) {
+            return self.pending_switch_mode(pane);
+        }
+        let managed = self.panes.get(&pane).is_some_and(|p| p.spec.account.is_some() || p.spec.account_id.is_some());
+        if !managed {
+            self.observed_agents.remove(&pane);
+            if let Some(a) =
+                self.observed_agent(pane).filter(|a| accounts::check_resume(&a.account, &a.session).is_ok())
+            {
+                self.observed_agents.insert(pane, a);
+            }
+        }
+        if self.pane_account(pane).is_some() {
+            return Mode::Picker(self.agent_picker(client, Some(pane)));
+        }
+        cannot_switch_mode(pane)
+    }
+
+    pub(super) fn undo_account_change(&mut self, pane: PaneId, client: ClientId) -> Result<()> {
+        let saved =
+            self.panes.get(&pane).and_then(|p| p.spec.account_undo.as_deref()).context("no account change to undo")?;
+        let to = self.spec_account(saved).context("the previous account was removed; open Change account")?;
+        self.begin_switch(pane, &to, Some(client), false, true)
     }
 
     fn spec_account(&self, spec: &PaneSpec) -> Option<Account> {
@@ -357,8 +594,16 @@ impl Server {
         let Some(session) = session.or(reserved) else { return (spec.clone(), exact) };
         match self.agent_spec(&a, spec.cwd.clone(), Some(session), &args) {
             Ok(fresh) => {
-                let mut fresh =
-                    PaneSpec { worktree: spec.worktree.clone(), close_on_exit: spec.close_on_exit, ..fresh };
+                let mut fresh = PaneSpec {
+                    worktree: spec.worktree.clone(),
+                    close_on_exit: spec.close_on_exit,
+                    account_undo: spec.account_undo.clone(),
+                    ..fresh
+                };
+                if let Some(program) = spec.command.first().filter(|p| std::path::Path::new(p).is_absolute()) {
+                    fresh.command[0] = program.clone();
+                }
+                fresh.env.extend(spec.env.iter().filter(|(k, _)| k == "PATH").cloned());
                 crate::worktree_setup::carry_env(&spec.env, &mut fresh.env);
                 (fresh, exact)
             }
@@ -463,15 +708,49 @@ impl Server {
         client: Option<ClientId>,
         ask: bool,
     ) -> Result<()> {
+        self.begin_switch(pane, to, client, ask, false)
+    }
+
+    fn begin_switch(
+        &mut self,
+        pane: PaneId,
+        to: &Account,
+        client: Option<ClientId>,
+        ask: bool,
+        undo: bool,
+    ) -> Result<()> {
         let p = self.panes.get(&pane).context("no such pane")?;
-        let from = self.pane_account(pane).context("this pane was not started from the agent manager")?;
+        let observed = if p.spec.account.is_none() && p.spec.account_id.is_none() {
+            Some(self.observed_agent(pane).context("Can't switch this process. Open with another account.")?)
+        } else {
+            None
+        };
+        let from = observed
+            .as_ref()
+            .map(|a| a.account.clone())
+            .or_else(|| self.pane_account(pane))
+            .context("Can't switch this process. Open with another account.")?;
         anyhow::ensure!(from.agent == to.agent, "{} cannot continue on a {} account", from.agent, to.agent);
         if from.id == to.id || from.same_home(to) {
             return Ok(());
         }
         anyhow::ensure!(!self.switches.contains_key(&pane), "an account change is already pending for this pane");
         let kind = accounts::agent_kind(&to.agent).context("unknown agent")?;
-        accounts::resumable_args(kind, &accounts::launch_args(kind, &p.spec.command))
+        let mut original = match &observed {
+            Some(a) => PaneSpec {
+                command: a.command.clone(),
+                cwd: Some(a.cwd.clone()),
+                session: Some(a.session.clone()),
+                account: Some(accounts::key(&from.agent, &from.name)),
+                account_id: Some(from.id.clone()),
+                env: vec![(kind.home_env.into(), from.home.clone()), ("PATH".into(), a.path.clone())],
+                ..Default::default()
+            },
+            None => p.spec.clone(),
+        };
+        original.account = Some(accounts::key(&from.agent, &from.name));
+        original.account_id = Some(from.id.clone());
+        accounts::resumable_args(kind, &accounts::launch_args(kind, &original.command))
             .context("a one-shot run (-p, exec) is not a conversation to continue")?;
         let process = p.process_hold();
         let token = self.alloc_id();
@@ -485,6 +764,11 @@ impl Server {
                 process,
                 client,
                 ask,
+                original,
+                observed,
+                undo,
+                started: None,
+                stopping: None,
                 stage: SwitchStage::Checking,
             },
         );
@@ -531,14 +815,20 @@ impl Server {
     fn switch_failed(&mut self, pane: PaneId, reason: &str, sign_in: bool) {
         let Some(switch) = self.switches.remove(&pane) else { return };
         self.refresh_switch_views(pane);
+        let unsupported =
+            switch.observed.as_ref().is_some_and(|before| self.observed_agent(pane).as_ref() != Some(before));
         let client = switch.client.or(self.primary);
         if let Some(c) = client.and_then(|id| self.clients.get_mut(&id)).filter(|c| matches!(c.mode, Mode::Normal)) {
             let action = if sign_in {
                 ConfirmAction::SignInAccount(switch.to)
             } else {
-                ConfirmAction::RetryAccountSwitch { pane, account: switch.to }
+                ConfirmAction::RetryAccountSwitch { pane, account: switch.to, undo: switch.undo }
             };
-            c.mode = Mode::confirm(format!("Could not change account\n{reason}"), action);
+            c.mode = if unsupported {
+                cannot_switch_mode(pane)
+            } else {
+                Mode::confirm(format!("Could not change account\n{reason}"), action)
+            };
             self.mark_dirty();
         } else {
             self.notify("Could not change account", &format!("{reason} Open Change account to try again."), Some(pane));
@@ -554,7 +844,18 @@ impl Server {
             _ => false,
         };
         anyhow::ensure!(same_process, "the pane's process changed; choose an account again");
-        let from = self.pane_account(pane).context("the pane's account was removed")?;
+        if let Some(observed) = &switch.observed {
+            anyhow::ensure!(
+                self.observed_agent(pane).as_ref() == Some(observed),
+                "Can't switch this process. Open with another account."
+            );
+        }
+        let from = switch
+            .observed
+            .as_ref()
+            .map(|a| a.account.clone())
+            .or_else(|| self.pane_account(pane))
+            .context("the pane's account was removed")?;
         anyhow::ensure!(
             from.id == switch.from.id && from.same_home(&switch.from),
             "the pane's account changed; choose an account again"
@@ -569,12 +870,33 @@ impl Server {
                 "the target account no longer has verified usage below its threshold"
             );
         }
-        let session = p.agent.session_id.clone().or_else(|| p.spec.session.clone());
+        let session = if switch.observed.is_some() {
+            switch.original.session.clone()
+        } else {
+            p.agent.session_id.clone().or_else(|| switch.original.session.clone())
+        };
         if conversations_move(&from.agent) {
             let id = session.as_deref().context("could not verify the Claude conversation id")?;
             accounts::check_carry(&from, &to, id)?;
+        } else {
+            // A fresh Codex launch has no hook id until its first completed turn. Undo can
+            // already return to the saved conversation; any new transcript stays in this home.
+            if let Some(id) = session.as_deref() {
+                accounts::check_resume(&from, id)?;
+            } else {
+                anyhow::ensure!(switch.undo, "conversation id is unavailable; finish a turn and try again");
+            }
+            if switch.undo {
+                let saved = switch.original.account_undo.as_deref().context("no account change to undo")?;
+                accounts::check_resume(
+                    &to,
+                    saved.session.as_deref().context("the original conversation id is unavailable")?,
+                )?;
+            }
         }
-        let timing = switch_timing(p.agent.hooked, p.agent.state, p.exit_code.is_some());
+        let hooked = p.agent.hooked
+            && switch.observed.as_ref().is_none_or(|a| p.agent.session_process == Some((a.pid, a.started)));
+        let timing = switch_timing(hooked, p.agent.state, p.exit_code.is_some());
         let stage = if approved {
             SwitchStage::Stopping
         } else if switch.ask || !conversations_move(&to.agent) && timing == SwitchStage::Stopping {
@@ -585,6 +907,10 @@ impl Server {
         let exited = p.exit_code.is_some();
         let client = switch.client;
         let switch = self.switches.get_mut(&pane).unwrap();
+        switch.original.session = session.clone();
+        if switch.observed.is_none() {
+            switch.original.cwd = p.current_cwd().or_else(|| switch.original.cwd.clone());
+        }
         switch.session = session;
         switch.stage = stage;
         match stage {
@@ -608,9 +934,19 @@ impl Server {
                     self.notify("Account change needs confirmation", "Open Change account to try again", Some(pane));
                 }
             }
-            SwitchStage::Stopping if exited => self.finish_switch(pane),
-            SwitchStage::Stopping => self.panes.get_mut(&pane).unwrap().kill(),
-            SwitchStage::Checking => unreachable!(),
+            SwitchStage::Stopping => {
+                self.stop_switch(pane, SwitchStage::Stopping);
+                if exited {
+                    self.finish_switch(pane);
+                }
+            }
+            SwitchStage::Checking
+            | SwitchStage::Starting
+            | SwitchStage::Restoring
+            | SwitchStage::Recovering
+            | SwitchStage::RecoveryStopping => {
+                unreachable!()
+            }
         }
         self.refresh_switch_views(pane);
         self.mark_dirty();
@@ -641,12 +977,22 @@ impl Server {
 
     pub(super) fn pending_switch_mode(&self, pane: PaneId) -> Mode {
         let Some(switch) = self.switches.get(&pane) else { return Mode::Normal };
-        if switch.stage == SwitchStage::Stopping {
+        if matches!(
+            switch.stage,
+            SwitchStage::Stopping
+                | SwitchStage::Starting
+                | SwitchStage::Restoring
+                | SwitchStage::Recovering
+                | SwitchStage::RecoveryStopping
+        ) {
             return Mode::Normal;
         }
         if switch.stage == SwitchStage::Confirm {
-            let effect =
-                if conversations_move(&switch.to.agent) { "Continue conversation" } else { "New conversation" };
+            let effect = if conversations_move(&switch.to.agent) || switch.undo {
+                "Continue conversation"
+            } else {
+                "New conversation"
+            };
             let reason = if switch.ask {
                 format!("{} reached its usage threshold.\n", accounts::label(&switch.from))
             } else {
@@ -664,7 +1010,12 @@ impl Server {
         let detail = match switch.stage {
             SwitchStage::Waiting => "Switch after this turn",
             SwitchStage::Checking => "Checking sign-in",
-            SwitchStage::Stopping | SwitchStage::Confirm => unreachable!(),
+            SwitchStage::Stopping
+            | SwitchStage::Confirm
+            | SwitchStage::Starting
+            | SwitchStage::Restoring
+            | SwitchStage::Recovering
+            | SwitchStage::RecoveryStopping => unreachable!(),
         };
         Mode::Picker(Picker::new(
             PickerKind::Agent,
@@ -680,7 +1031,9 @@ impl Server {
     }
 
     pub(super) fn cancel_switch(&mut self, pane: PaneId, token: u32) {
-        if self.switches.get(&pane).is_some_and(|s| s.token == token && s.stage != SwitchStage::Stopping) {
+        if self.switches.get(&pane).is_some_and(|s| {
+            s.token == token && matches!(s.stage, SwitchStage::Checking | SwitchStage::Waiting | SwitchStage::Confirm)
+        }) {
             self.switches.remove(&pane);
             self.refresh_switch_views(pane);
             self.mark_dirty();
@@ -714,50 +1067,221 @@ impl Server {
         for pane in ready {
             self.check_switch(pane, false);
         }
+        let stopping: Vec<_> = self
+            .switches
+            .iter()
+            .filter_map(|(&id, s)| {
+                matches!(s.stage, SwitchStage::Stopping | SwitchStage::Recovering | SwitchStage::RecoveryStopping)
+                    .then_some((id, s.stage))
+            })
+            .collect();
+        for (id, stage) in stopping {
+            if stage == SwitchStage::Stopping {
+                self.finish_switch(id);
+            } else {
+                self.switch_start_failed(id, "the agent did not start");
+            }
+        }
+        let starting: Vec<_> = self
+            .switches
+            .iter()
+            .filter_map(|(&id, s)| matches!(s.stage, SwitchStage::Starting | SwitchStage::Restoring).then_some(id))
+            .collect();
+        for id in starting {
+            let Some(p) = self.panes.get(&id).filter(|p| !p.suspended) else { continue };
+            let s = self.switches.get_mut(&id).unwrap();
+            let elapsed = s.started.get_or_insert_with(Instant::now).elapsed();
+            let expected = if s.stage == SwitchStage::Restoring { &s.from.agent } else { &s.to.agent };
+            let running = p.pid().is_some_and(|pid| crate::process::running(pid as libc::pid_t));
+            if running
+                && p.has_printed()
+                && p.agent.kind.as_ref() == Some(expected)
+                && elapsed >= Duration::from_secs(1)
+            {
+                self.switch_started(id);
+            } else if elapsed >= Duration::from_secs(10) {
+                if running {
+                    // Wait for the last output and exit before another process takes this pane.
+                    let stage = if s.stage == SwitchStage::Restoring {
+                        SwitchStage::RecoveryStopping
+                    } else {
+                        SwitchStage::Recovering
+                    };
+                    self.stop_switch(id, stage);
+                } else {
+                    self.switch_start_failed(id, "the agent did not start");
+                }
+            }
+        }
     }
 
-    /// The agent of a pane switching accounts has stopped (its pane shows it ended): carry its
-    /// conversation over and start it again on the new account. When the conversation cannot
-    /// follow, or the new agent cannot start, the pane stays as it is: Enter starts it again on
-    /// its account, rather than start a new conversation. When its command must be shown first
-    /// (a word kraal could not tell from a prompt), it waits for Enter on the new account.
+    fn stop_switch(&mut self, pane: PaneId, stage: SwitchStage) {
+        let switch = self.switches.get_mut(&pane).unwrap();
+        switch.stage = stage;
+        let p = &self.panes[&pane];
+        switch.stopping = SwitchStop::new(p);
+        if let Some(stop) = &switch.stopping {
+            stop.signal(libc::SIGHUP);
+        }
+    }
+
+    fn switch_stopped(&mut self, pane: PaneId) -> bool {
+        let Some(stop) = self.switches.get_mut(&pane).and_then(|s| s.stopping.as_mut()) else { return true };
+        stop.finished() && self.panes.get(&pane).is_none_or(|p| p.exit_code.is_some())
+    }
+
+    /// Keep the source until the replacement reports a usable start, including an early exit.
     pub(super) fn finish_switch(&mut self, pane: PaneId) {
-        if !self.switches.get(&pane).is_some_and(|s| s.stage == SwitchStage::Stopping) {
+        if !self.switch_stopped(pane) {
             return;
         }
-        let Some(AccountSwitch { from, to, session, .. }) = self.switches.remove(&pane) else { return };
-        self.refresh_switch_views(pane);
-        if !self.panes.contains_key(&pane) {
-            return;
-        }
+        let Some(switch) = self.switches.get(&pane).filter(|s| s.stage == SwitchStage::Stopping) else { return };
+        let (from, to, session, original, undo) =
+            (switch.from.clone(), switch.to.clone(), switch.session.clone(), switch.original.clone(), switch.undo);
         let result = (|| -> Result<()> {
-            let p = self.panes.get(&pane).context("no such pane")?;
+            anyhow::ensure!(
+                self.accounts.by_id(&to.id).is_some_and(|a| a.same_home(&to)),
+                "the target account changed while the agent was stopping"
+            );
             let kind = accounts::agent_kind(&to.agent).context("unknown agent")?;
-            let resume = match &session {
-                Some(id) => accounts::carry_conversation(&from, &to, id)
-                    .with_context(|| format!("the conversation could not follow to {}", accounts::label(&to)))?
-                    .then(|| id.clone()),
-                None => None,
+            let resume = if undo && to.agent == "codex" {
+                original.account_undo.as_ref().and_then(|s| s.session.clone())
+            } else {
+                match &session {
+                    Some(id) => accounts::carry_conversation(&from, &to, id)?.then(|| id.clone()),
+                    None => None,
+                }
             };
-            let cwd = p.current_cwd().or_else(|| p.spec.cwd.clone());
-            let worktree = p.spec.worktree.clone();
-            // The options carry over; a prompt given on the command line is not sent again.
-            let (args, exact) = accounts::resumable_args(kind, &accounts::launch_args(kind, &p.spec.command))
-                .context("a one-shot run (-p, exec) is not a conversation to continue")?;
-            let mut spec = PaneSpec { worktree, ..self.agent_spec(&to, cwd, resume.as_deref(), &args)? };
-            crate::worktree_setup::carry_env(&p.spec.env, &mut spec.env);
-            if !exact {
-                return self.suspend_pane(pane, spec, AMBIGUOUS);
+            let source = if undo && to.agent == "codex" {
+                original.account_undo.as_deref().context("no account change to undo")?
+            } else {
+                &original
+            };
+            let (args, exact) = accounts::resumable_args(kind, &accounts::launch_args(kind, &source.command))
+                .context("a one-shot run is not a conversation to continue")?;
+            let mut spec = PaneSpec {
+                worktree: original.worktree.clone(),
+                close_on_exit: original.close_on_exit,
+                ..self.agent_spec(&to, source.cwd.clone(), resume.as_deref(), &args)?
+            };
+            if let Some(program) = source.command.first().filter(|p| std::path::Path::new(p).is_absolute()) {
+                spec.command[0] = program.clone();
             }
-            let pn = self.panes.get_mut(&pane).context("no such pane")?;
-            let old = std::mem::replace(&mut pn.spec, spec);
-            pn.respawn(&self.env, &self.tx).inspect_err(|_| pn.spec = old)
+            spec.env.extend(source.env.iter().filter(|(k, _)| k == "PATH").cloned());
+            crate::worktree_setup::carry_env(&original.env, &mut spec.env);
+            self.switches.get_mut(&pane).unwrap().stage = SwitchStage::Starting;
+            if !undo {
+                let mut previous = original.clone();
+                previous.account_undo = None;
+                spec.account_undo = Some(Box::new(previous));
+            }
+            if !exact {
+                self.suspend_pane(pane, spec, AMBIGUOUS)?;
+                let p = self.panes.get_mut(&pane).unwrap();
+                p.agent.session_id = p.spec.session.clone();
+                return Ok(());
+            }
+            self.start_switch_spec(pane, spec)
         })();
         if let Err(e) = result {
-            self.warnings.push(format!("{e:#}; the pane stays on {} (Enter starts it again)", accounts::label(&from)));
+            self.switch_start_failed(pane, &format!("{e:#}"));
+        }
+        self.refresh_switch_views(pane);
+        self.mark_persist();
+        self.relayout();
+    }
+
+    fn start_switch_spec(&mut self, pane: PaneId, spec: PaneSpec) -> Result<()> {
+        let p = self.panes.get_mut(&pane).context("the pane was closed")?;
+        p.spec = spec;
+        p.respawn(&self.env, &self.tx)?;
+        // A new Codex conversation must not inherit the source conversation's hook identity.
+        p.agent.session_id = p.spec.session.clone();
+        let switch = self.switches.get_mut(&pane).unwrap();
+        switch.started = Some(Instant::now());
+        switch.stopping = None;
+        Ok(())
+    }
+
+    pub(super) fn switch_start_failed(&mut self, pane: PaneId, reason: &str) {
+        if let Some(switch) = self.switches.get(&pane)
+            && switch.stopping.is_none()
+        {
+            let stage = if matches!(switch.stage, SwitchStage::Restoring | SwitchStage::RecoveryStopping) {
+                SwitchStage::RecoveryStopping
+            } else {
+                SwitchStage::Recovering
+            };
+            self.stop_switch(pane, stage);
+        }
+        if !self.switch_stopped(pane) {
+            return;
+        }
+        let Some(switch) = self.switches.get_mut(&pane) else { return };
+        if matches!(switch.stage, SwitchStage::Restoring | SwitchStage::RecoveryStopping) {
+            self.switch_recovery_failed(pane, reason);
+            return;
+        }
+        switch.stage = SwitchStage::Restoring;
+        let original = switch.original.clone();
+        let (spec, exact) = self.resume_spec(&original, original.session.as_deref());
+        if !exact {
+            self.switch_recovery_failed(pane, "the previous command needs review before it can run again");
+            return;
+        }
+        if let Err(e) = self.start_switch_spec(pane, spec) {
+            self.switch_recovery_failed(pane, &format!("{e:#}"));
         }
         self.mark_persist();
         self.relayout();
+    }
+
+    fn switch_recovery_failed(&mut self, pane: PaneId, reason: &str) {
+        let Some(switch) = self.switches.remove(&pane) else { return };
+        let saved = switch.original.session.as_deref().is_some_and(|s| accounts::check_resume(&switch.from, s).is_ok());
+        let message = if saved {
+            "Couldn't resume. Your conversation is saved. Enter retries on the previous account."
+        } else {
+            "Couldn't resume. The previous command and pane output are available. Enter retries."
+        };
+        let (spec, _) = self.resume_spec(&switch.original, switch.original.session.as_deref());
+        if let Some(p) = self.panes.get_mut(&pane) {
+            p.spec = spec;
+            p.agent = crate::agent::AgentTracker { session_id: p.spec.session.clone(), ..Default::default() };
+            p.exit_code = Some(None);
+        }
+        self.notify("Could not change account", &format!("{message} {reason}"), Some(pane));
+        self.refresh_switch_views(pane);
+        self.mark_persist();
+    }
+
+    fn switch_started(&mut self, pane: PaneId) {
+        let Some(switch) = self.switches.remove(&pane) else { return };
+        if switch.stage == SwitchStage::Restoring {
+            self.notify(
+                "Could not change account",
+                &format!("Resumed on {}. Open Change account to try again.", switch.from.name),
+                Some(pane),
+            );
+        } else {
+            self.limit_alerts.remove(&pane);
+            self.limit_events.remove(&pane);
+            self.screen_limits.remove(&pane);
+            let mut original = switch.original;
+            original.account_undo = None;
+            if let Some(p) = self.panes.get_mut(&pane) {
+                p.spec.account_undo = (!switch.undo).then(|| Box::new(original));
+            }
+            let message = format!("Using {}", switch.to.name);
+            if switch.undo {
+                self.notify(&message, "Account change undone", Some(pane));
+            } else {
+                self.notify_action(&message, pane, super::attention::ToastAction::UndoAccount);
+            }
+        }
+        self.refresh_switch_views(pane);
+        self.mark_persist();
+        self.mark_dirty();
     }
 
     /// Thresholds: alert, offer or switch when an agent's account is nearly used up.
@@ -861,14 +1385,11 @@ impl Server {
                 // In ask and auto modes, wait for the end of the turn rather than interrupting.
                 (LimitMode::Ask | LimitMode::Auto, Some(_)) => {}
                 _ if already.is_none() => {
-                    // The key from the keymap in use (`ctrl+b A c` by default).
-                    let key = self.keymap.hint(crate::keymap::Action::SwitchAccount);
-                    let hint = match (&alt, key) {
-                        (Some(alt), Some(key)) => format!("{key} to continue on {}", accounts::label(alt)),
-                        (Some(alt), None) => format!("{} is free to continue on", accounts::label(alt)),
-                        (None, _) => "no other account under its threshold".to_string(),
-                    };
-                    self.notify(&what, &hint, Some(id));
+                    self.notify_action(
+                        &format!("{} is at {peak:.0}% used", a.name),
+                        id,
+                        super::attention::ToastAction::ChangeAccount,
+                    );
                     self.limit_alerts.insert(id, LimitAlert::Notified);
                 }
                 _ => {}
@@ -921,6 +1442,9 @@ impl Server {
         }
         let title = if switch_for.is_some() { "Change account" } else { "Start an agent" };
         let mut picker = Picker::new(PickerKind::Agent, title, items);
+        if current.as_ref().is_some_and(|a| a.agent == "codex") {
+            picker.message = Some("Undo returns to this conversation.".into());
+        }
         picker.worktree = self.client_focus(client).and_then(|p| self.pane_git(p)).is_some()
             && self.client_focus(client).and_then(|p| self.panes.get(&p)).is_some_and(|p| p.ssh.is_none());
         picker
@@ -928,7 +1452,9 @@ impl Server {
 
     fn check_switch_row(&mut self, client: ClientId, pane: PaneId, to: &Account) {
         let Some(from) = self.pane_account(pane) else { return };
-        let session = self.panes.get(&pane).and_then(|p| p.agent.session_id.clone().or_else(|| p.spec.session.clone()));
+        let session = self.observed_agent(pane).map(|a| a.session).or_else(|| {
+            self.panes.get(&pane).and_then(|p| p.agent.session_id.clone().or_else(|| p.spec.session.clone()))
+        });
         let to = to.clone();
         let checked = to.clone();
         self.background(
@@ -1437,6 +1963,7 @@ mod tests {
     struct SwitchTest {
         server: Server,
         dir: PathBuf,
+        rx: super::super::queue::EventReceiver,
     }
 
     impl SwitchTest {
@@ -1445,6 +1972,7 @@ mod tests {
             std::fs::create_dir_all(dir.join("from/projects/work")).unwrap();
             std::fs::create_dir_all(dir.join("to/projects/work")).unwrap();
             std::fs::write(dir.join("from/projects/work/session.jsonl"), "{\"message\":1}\n").unwrap();
+            let dir = dir.canonicalize().unwrap();
             let account = |name: &str| Account {
                 id: accounts::new_uuid(),
                 agent: "claude".into(),
@@ -1459,7 +1987,7 @@ mod tests {
                 references: Vec::new(),
             };
             let (from, to) = (account("from"), account("to"));
-            let (tx, _rx) = super::super::queue::channel(16);
+            let (tx, rx) = super::super::queue::channel(64);
             let mut server = super::super::tests::server(tx);
             server.config.notifications.mode = crate::config::NotifyMode::Off;
             server.accounts.add(from.clone()).unwrap();
@@ -1487,10 +2015,42 @@ mod tests {
                     process: None,
                     client: Some(99),
                     ask: false,
+                    original: server.panes[&1].spec.clone(),
+                    undo: false,
+                    observed: None,
+                    started: None,
+                    stopping: None,
                     stage: SwitchStage::Checking,
                 },
             );
-            Self { server, dir }
+            Self { server, dir, rx }
+        }
+
+        fn pump(&mut self) {
+            while let Ok(event) = self.rx.try_recv() {
+                self.server.handle(event);
+            }
+            while let Some(data) = self.server.panes.get(&1).and_then(|p| p.take_output()) {
+                self.server.pane_output(1, &data);
+            }
+            self.server.finish_exits();
+        }
+
+        fn until(&mut self, what: &str, check: impl Fn(&Self) -> bool) {
+            let start = Instant::now();
+            loop {
+                self.pump();
+                if check(self) {
+                    return;
+                }
+                assert!(start.elapsed() < crate::testing::PATIENCE, "{what}");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+
+        fn spawn(&mut self, spec: PaneSpec) {
+            let pane = crate::pane::Pane::spawn(1, None, spec, 80, 24, &self.server.env, &self.server.tx).unwrap();
+            self.server.panes.insert(1, pane);
         }
 
         fn checked(&mut self, status: Status) {
@@ -1507,6 +2067,16 @@ mod tests {
 
     impl Drop for SwitchTest {
         fn drop(&mut self) {
+            for switch in self.server.switches.values() {
+                if let Some(stop) = &switch.stopping {
+                    stop.signal(libc::SIGKILL);
+                }
+            }
+            for pane in self.server.panes.values() {
+                if let Some(stop) = SwitchStop::new(pane) {
+                    stop.signal(libc::SIGKILL);
+                }
+            }
             std::fs::remove_dir_all(&self.dir).unwrap();
         }
     }
@@ -1721,5 +2291,540 @@ mod tests {
         t.server.usage.0.insert(t.server.accounts.get("claude", "from").unwrap().key(), usage(10.0));
         t.server.check_limits();
         assert!(!t.server.limit_alerts.contains_key(&1));
+    }
+    #[test]
+    fn observed_commands_require_exact_interactive_arguments() {
+        let words = |s: &str| s.split_whitespace().map(str::to_string).collect::<Vec<_>>();
+        for command in [
+            "claude --model opus",
+            "/usr/bin/node /opt/claude --resume session --model opus",
+            "sh /bin/codex resume original -m model",
+        ] {
+            let kind = if command.contains("codex") { "codex" } else { "claude" };
+            assert!(observed_command(&words(command), kind).is_some(), "{command}");
+        }
+        for command in [
+            "sh -c claude",
+            "wrapper claude",
+            "node --eval claude",
+            "claude --new-flag value",
+            "claude -p prompt",
+            "claude --settings other",
+            "claude --resume session --settings other",
+            "claude --continue",
+            "claude --fork-session",
+        ] {
+            assert!(observed_command(&words(command), "claude").is_none(), "{command}");
+        }
+        for command in ["codex exec prompt", "codex -c auth=other", "codex --profile other", "codex resume --last"] {
+            assert!(observed_command(&words(command), "codex").is_none(), "{command}");
+        }
+    }
+
+    #[test]
+    fn undo_is_saved_only_with_a_started_change_and_survives_resuming_the_pane() {
+        let mut t = SwitchTest::new("undo-saved");
+        t.server.limit_alerts.insert(1, LimitAlert::Notified);
+        t.server.switches.get_mut(&1).unwrap().stage = SwitchStage::Stopping;
+        t.server.switches.get_mut(&1).unwrap().session = Some("session".into());
+        t.server.finish_switch(1);
+        assert_eq!(t.server.switches[&1].stage, SwitchStage::Starting);
+        assert!(t.server.messages.is_empty(), "preparing a command is not success");
+        t.server.switch_started(1);
+        assert!(t.server.switches.is_empty());
+        assert!(!t.server.limit_alerts.contains_key(&1), "the new account has its own threshold crossing");
+        let spec = &t.server.panes[&1].spec;
+        let saved = spec.account_undo.as_ref().unwrap();
+        assert_eq!(saved.session.as_deref(), Some("session"));
+        assert_eq!(saved.account.as_deref(), Some("claude:from"));
+        assert!(saved.account_undo.is_none());
+        let json = serde_json::to_string(spec).unwrap();
+        let restored: PaneSpec = serde_json::from_str(&json).unwrap();
+        let (resumed, _) = t.server.resume_spec(&restored, Some("session"));
+        assert_eq!(resumed.account_undo.unwrap().account_id, saved.account_id);
+        assert!(
+            serde_json::from_str::<PaneSpec>(r#"{"command":["claude"],"account":"claude:from"}"#)
+                .unwrap()
+                .account_undo
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn claude_undo_carries_the_latest_transcript_and_refuses_divergence() {
+        for diverged in [false, true] {
+            let mut t = SwitchTest::new(if diverged { "undo-diverged" } else { "undo-latest" });
+            t.server.switches.get_mut(&1).unwrap().stage = SwitchStage::Stopping;
+            t.server.switches.get_mut(&1).unwrap().session = Some("session".into());
+            t.server.finish_switch(1);
+            t.server.switch_started(1);
+            let original = t.server.panes[&1].spec.clone();
+            let from = t.server.accounts.get("claude", "to").unwrap();
+            let to = t.server.accounts.get("claude", "from").unwrap();
+            std::fs::write(t.dir.join("to/projects/work/session.jsonl"), "{\"message\":1}\n{\"message\":2}\n").unwrap();
+            if diverged {
+                std::fs::write(t.dir.join("from/projects/work/session.jsonl"), "different\n").unwrap();
+            }
+            t.server.switches.insert(
+                1,
+                AccountSwitch {
+                    token: 3,
+                    from,
+                    to,
+                    original,
+                    session: None,
+                    process: None,
+                    client: Some(99),
+                    ask: false,
+                    undo: true,
+                    observed: None,
+                    started: None,
+                    stopping: None,
+                    stage: SwitchStage::Checking,
+                },
+            );
+            let result = t.server.prepare_switch(1, true);
+            if diverged {
+                assert!(result.is_err());
+                assert_eq!(t.server.panes[&1].spec.account.as_deref(), Some("claude:to"));
+            } else {
+                result.unwrap();
+                t.server.finish_switch(1);
+                t.server.switch_started(1);
+                assert_eq!(t.server.panes[&1].spec.account.as_deref(), Some("claude:from"));
+                assert!(t.server.panes[&1].spec.account_undo.is_none());
+                assert_eq!(
+                    std::fs::read(t.dir.join("from/projects/work/session.jsonl")).unwrap(),
+                    std::fs::read(t.dir.join("to/projects/work/session.jsonl")).unwrap()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn failed_start_restores_the_source_and_a_failed_recovery_keeps_one_retry() {
+        let mut t = SwitchTest::new("restore-source");
+        t.server.switches.get_mut(&1).unwrap().stage = SwitchStage::Starting;
+        let target = t.server.switches[&1].to.clone();
+        t.server.panes.get_mut(&1).unwrap().spec = t.server.agent_spec(&target, None, Some("session"), &[]).unwrap();
+        t.server.switch_start_failed(1, "target exited");
+        assert_eq!(t.server.switches[&1].stage, SwitchStage::Restoring);
+        assert_eq!(t.server.panes[&1].spec.account.as_deref(), Some("claude:from"));
+        assert!(t.server.panes[&1].spec.command.windows(2).any(|w| w == ["--resume", "session"]));
+        assert!(t.server.panes[&1].spec.account_undo.is_none());
+        t.server.switch_start_failed(1, "source exited too");
+        assert!(t.server.switches.is_empty());
+        assert!(t.server.panes[&1].exit_code.is_some());
+        assert_eq!(t.server.panes[&1].spec.account.as_deref(), Some("claude:from"));
+        t.server.check_switches();
+        assert!(t.server.switches.is_empty(), "no retry loop");
+    }
+
+    #[test]
+    fn an_unassociated_process_offers_a_new_pane_without_changing_the_old_one() {
+        let mut t = SwitchTest::new("opaque");
+        t.server.switches.clear();
+        t.server.panes.get_mut(&1).unwrap().spec.account = None;
+        t.server.panes.get_mut(&1).unwrap().spec.account_id = None;
+        let Mode::Picker(p) = t.server.change_account_mode(99, 1) else { panic!("a way out") };
+        assert_eq!(p.title, "Can't switch this process.");
+        assert!(matches!(p.items[0].action, PickAction::OpenAnotherAccount(1)));
+        assert_eq!(p.items[0].label, "Open with another account");
+        assert_eq!(t.server.panes[&1].agent.state, AgentState::Working);
+        assert!(t.server.switches.is_empty());
+    }
+
+    #[test]
+    fn notify_threshold_has_a_change_action_without_stopping_or_requiring_an_alternative() {
+        let mut t = SwitchTest::new("notify-action");
+        t.server.switches.clear();
+        let (client, _peer) = super::super::tests::client(&mut t.server);
+        let a = t.server.accounts.get("claude", "from").unwrap();
+        t.server.usage.0.insert(
+            a.key(),
+            accounts::Usage {
+                five_hour: Some(accounts::Window { used_percent: 94.6, resets_at: Some(accounts::now() + 3600) }),
+                ..Default::default()
+            },
+        );
+        t.server.check_limits();
+        let c = &t.server.clients[&client];
+        assert_eq!(c.toast.as_ref().unwrap().0, "from is at 95% used · Change account");
+        assert_eq!(c.toast_action, Some((1, super::super::attention::ToastAction::ChangeAccount)));
+        t.unchanged();
+        assert!(t.server.switches.is_empty());
+        t.server.toast(client, "Dismissed");
+        t.server.check_limits();
+        assert_eq!(t.server.clients[&client].toast.as_ref().unwrap().0, "Dismissed", "one notification per crossing");
+    }
+    #[test]
+    fn codex_undo_resumes_the_original_id_and_keeps_both_histories() {
+        for completed in [true, false] {
+            let mut t = SwitchTest::new(if completed { "codex-return" } else { "codex-unused-return" });
+            let s = t.server.switches.get_mut(&1).unwrap();
+            s.from.agent = "codex".into();
+            s.to.agent = "codex".into();
+            let (from, to) = (s.from.clone(), s.to.clone());
+            t.server.accounts = Accounts::empty();
+            t.server.accounts.add(from.clone()).unwrap();
+            t.server.accounts.add(to.clone()).unwrap();
+            for (home, session) in [("from", "original"), ("to", "new")] {
+                let dir = t.dir.join(home).join("sessions/2026/10/13");
+                std::fs::create_dir_all(&dir).unwrap();
+                std::fs::write(
+                    dir.join(format!("rollout-today-{session}.jsonl")),
+                    format!("{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"{session}\"}}}}\n"),
+                )
+                .unwrap();
+            }
+            let spec = t.server.agent_spec(&from, None, Some("original"), &[]).unwrap();
+            t.server.panes.get_mut(&1).unwrap().spec = spec.clone();
+            let s = t.server.switches.get_mut(&1).unwrap();
+            s.original = spec;
+            s.session = Some("original".into());
+            s.stage = SwitchStage::Stopping;
+            t.server.finish_switch(1);
+            assert_eq!(t.server.panes[&1].agent.session_id, None, "new Codex never inherits the original id");
+            t.server.switch_started(1);
+            if completed {
+                t.server.panes.get_mut(&1).unwrap().agent.session_id = Some("new".into());
+            }
+            let original = t.server.panes[&1].spec.clone();
+            t.server.switches.insert(
+                1,
+                AccountSwitch {
+                    token: 3,
+                    from: to.clone(),
+                    to: from.clone(),
+                    original,
+                    session: None,
+                    process: None,
+                    client: Some(99),
+                    ask: false,
+                    undo: true,
+                    observed: None,
+                    started: None,
+                    stopping: None,
+                    stage: SwitchStage::Checking,
+                },
+            );
+            t.server.prepare_switch(1, true).unwrap();
+            t.server.finish_switch(1);
+            assert!(t.server.panes[&1].spec.command.windows(2).any(|w| w == ["resume", "original"]));
+            t.server.switch_started(1);
+            accounts::check_resume(&from, "original").unwrap();
+            accounts::check_resume(&to, "new").unwrap();
+            assert!(t.server.panes[&1].spec.account_undo.is_none());
+        }
+    }
+
+    #[test]
+    fn a_failed_undo_sign_in_keeps_the_return_action_and_running_account() {
+        let mut t = SwitchTest::new("undo-sign-in");
+        t.server.switches.get_mut(&1).unwrap().undo = true;
+        t.server.panes.get_mut(&1).unwrap().spec.account_undo = Some(Box::new(PaneSpec {
+            account: Some("claude:to".into()),
+            session: Some("original".into()),
+            ..Default::default()
+        }));
+        t.checked(Status::NotSignedIn);
+        t.unchanged();
+        assert!(t.server.panes[&1].spec.account_undo.is_some());
+        assert!(t.server.switches.is_empty());
+    }
+
+    #[test]
+    fn a_live_detected_process_is_rechecked_before_any_stop() {
+        let mut t = SwitchTest::new("observed-process");
+        let program = t.dir.join("claude");
+        crate::testing::write_script(&program, "#!/bin/sh\nwhile IFS= read -r line; do :; done\n");
+        let from = t.server.switches[&1].from.clone();
+        let spec = PaneSpec {
+            command: vec![program.display().to_string(), "--session-id".into(), "session".into()],
+            env: vec![("CLAUDE_CONFIG_DIR".into(), from.home.clone())],
+            cwd: Some(t.dir.clone()),
+            ..Default::default()
+        };
+        let mut pane = crate::pane::Pane::spawn(1, None, spec, 80, 24, &t.server.env, &t.server.tx).unwrap();
+        pane.agent.kind = Some("claude".into());
+        t.server.panes.insert(1, pane);
+        let started = Instant::now();
+        let observed = loop {
+            if let Some(a) = t.server.observed_agent(1) {
+                break a;
+            }
+            assert!(started.elapsed() < crate::testing::PATIENCE);
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        assert_eq!(observed.account.id, from.id);
+        assert_eq!(observed.session, "session");
+        let hold = t.server.panes[&1].process_hold();
+        let s = t.server.switches.get_mut(&1).unwrap();
+        s.process = hold;
+        s.observed = Some(ObservedAgent { started: observed.started.wrapping_add(1), ..observed });
+        let result = t.server.prepare_switch(1, true);
+        assert!(result.unwrap_err().to_string().contains("Can't switch this process."));
+        let pid = t.server.panes[&1].pid().unwrap();
+        assert!(crate::process::running(pid as libc::pid_t));
+        t.server.panes.get_mut(&1).unwrap().kill();
+    }
+
+    #[test]
+    fn a_shell_switch_waits_for_the_agent_and_its_children_and_keeps_the_agents_directory() {
+        let mut t = SwitchTest::new("shell-survivor");
+        let program = t.dir.join("claude");
+        crate::testing::write_script(
+            &program,
+            r#"#!/bin/sh
+test "$*" = 'auth status' && exit 0
+root="$(dirname "$CLAUDE_CONFIG_DIR")"
+if test "$CLAUDE_CONFIG_DIR" = "$root/from"; then
+    trap '' HUP TERM
+    sh -c 'trap "" HUP TERM
+        echo $$ > "$1/child"
+        while test ! -f "$1/release-child"; do sleep 0.02; done
+        printf "{\"message\":2}\n" >> "$2"' sh "$root" "$CLAUDE_CONFIG_DIR/projects/work/session.jsonl" &
+    echo $$ > "$root/agent"
+    while test ! -f "$root/release-agent"; do sleep 0.02; done
+    exit 0
+fi
+pwd > "$root/replacement-cwd"
+echo READY
+while IFS= read -r line; do :; done
+"#,
+        );
+        let project = t.dir.join("project-B");
+        std::fs::create_dir(&project).unwrap();
+        let (from, to) = (t.server.switches[&1].from.clone(), t.server.switches[&1].to.clone());
+        t.server.switches.clear();
+        t.server.env.shell = "bash".into();
+        t.spawn(PaneSpec {
+            cwd: Some(t.dir.clone()),
+            env: vec![
+                ("CLAUDE_CONFIG_DIR".into(), from.home.clone()),
+                ("PROJECT_B".into(), project.display().to_string()),
+                ("FAKE_AGENT".into(), program.display().to_string()),
+            ],
+            ..Default::default()
+        });
+        let pane = t.server.panes.get_mut(&1).unwrap();
+        pane.agent.kind = Some("claude".into());
+        pane.write_input(b"(cd \"$PROJECT_B\"; exec \"$FAKE_AGENT\" --resume session)\n".to_vec());
+        t.until("the shell's foreground agent is observed", |t| {
+            t.dir.join("child").exists() && t.server.observed_agent(1).is_some()
+        });
+        let observed = t.server.observed_agent(1).unwrap();
+        assert_eq!(observed.cwd, project);
+        assert_eq!(t.server.panes[&1].current_cwd(), Some(t.dir.clone()));
+        t.server.begin_switch(1, &to, Some(99), false, false).unwrap();
+        let token = t.server.switches[&1].token;
+        t.server.switch_checked(1, token, Status::SignedIn, false);
+        assert_eq!(t.server.switches[&1].stage, SwitchStage::Confirm);
+        assert_eq!(t.server.switches[&1].original.cwd, Some(project.clone()));
+        t.server.prepare_switch(1, true).unwrap();
+        // Keep the survivors alive past the shell's output-drain deadline.
+        t.server.switches.get_mut(&1).unwrap().stopping.as_mut().unwrap().since =
+            Instant::now() + crate::testing::PATIENCE;
+        t.until("the shell exits while its agent survives", |t| t.server.panes[&1].exit_code.is_some());
+        assert!(crate::process::still_running(observed.pid, observed.started));
+        let child: u32 = std::fs::read_to_string(t.dir.join("child")).unwrap().trim().parse().unwrap();
+        let child_started = crate::process::start_time(child).unwrap();
+        let copied = t.dir.join("to/projects/work/session.jsonl");
+        t.server.check_switches();
+        assert_eq!(t.server.switches[&1].stage, SwitchStage::Stopping);
+        assert!(!copied.exists(), "no transfer while the foreground agent runs");
+        assert!(!t.dir.join("replacement-cwd").exists());
+
+        std::fs::write(t.dir.join("release-agent"), "").unwrap();
+        t.until("the foreground agent exits", |_| !crate::process::still_running(observed.pid, observed.started));
+        t.server.check_switches();
+        assert!(crate::process::still_running(child, child_started));
+        assert_eq!(t.server.switches[&1].stage, SwitchStage::Stopping);
+        assert!(!copied.exists(), "the agent's orphaned child can still write the transcript");
+        assert!(!t.dir.join("replacement-cwd").exists());
+
+        std::fs::write(t.dir.join("release-child"), "").unwrap();
+        t.until("the child finishes writing", |_| !crate::process::still_running(child, child_started));
+        t.server.check_switches();
+        t.until("the replacement runs", |t| t.dir.join("replacement-cwd").exists());
+        assert_eq!(std::fs::read_to_string(copied).unwrap(), "{\"message\":1}\n{\"message\":2}\n");
+        assert_eq!(t.server.panes[&1].spec.cwd, Some(project.clone()));
+        assert_eq!(std::fs::read_to_string(t.dir.join("replacement-cwd")).unwrap().trim(), project.to_str().unwrap());
+        // Recovery uses the same verified directory, even though the original pane was a shell.
+        std::fs::remove_file(t.dir.join("release-agent")).unwrap();
+        std::fs::remove_file(t.dir.join("release-child")).unwrap();
+        t.server.panes.get_mut(&1).unwrap().kill();
+        t.until("the source is restored", |t| t.server.switches[&1].stage == SwitchStage::Restoring);
+        assert_eq!(t.server.panes[&1].spec.cwd, Some(project.clone()));
+        let pid = t.server.panes[&1].pid().unwrap();
+        t.until("recovery runs in the agent's directory", |_| crate::process::cwd(pid) == Some(project.clone()));
+    }
+
+    #[test]
+    fn silent_replacement_and_recovery_that_ignore_hangup_are_stopped() {
+        let mut t = SwitchTest::new("silent-hangup");
+        let program = t.dir.join("claude");
+        crate::testing::write_script(
+            &program,
+            "#!/bin/sh\ntrap '' HUP TERM\necho $$ > \"$CLAUDE_CONFIG_DIR/started\"\nwhile :; do sleep 1; done\n",
+        );
+        let original = PaneSpec {
+            command: vec![program.display().to_string(), "--resume".into(), "session".into()],
+            env: vec![("CLAUDE_CONFIG_DIR".into(), t.server.switches[&1].from.home.clone())],
+            text: None,
+            ..t.server.panes[&1].spec.clone()
+        };
+        t.spawn(original.clone());
+        t.until("the source starts", |t| t.dir.join("from/started").exists());
+        t.server.panes[&1].process_hold().unwrap().signal(libc::SIGKILL);
+        t.until("the source stops", |t| t.server.panes[&1].exit_code.is_some());
+        std::fs::remove_file(t.dir.join("from/started")).unwrap();
+        t.server.switches.get_mut(&1).unwrap().original = original;
+        t.server.switches.get_mut(&1).unwrap().stage = SwitchStage::Stopping;
+        t.server.switches.get_mut(&1).unwrap().session = Some("session".into());
+        t.server.finish_switch(1);
+
+        for (home, starting, stopping) in [
+            ("to", SwitchStage::Starting, SwitchStage::Recovering),
+            ("from", SwitchStage::Restoring, SwitchStage::RecoveryStopping),
+        ] {
+            t.until("the silent agent starts", |t| t.dir.join(home).join("started").exists());
+            assert_eq!(t.server.switches[&1].stage, starting);
+            let pid = t.server.panes[&1].pid().unwrap();
+            let started = crate::process::start_time(pid).unwrap();
+            assert!(!t.server.panes[&1].has_printed());
+            t.server.switches.get_mut(&1).unwrap().started = Some(Instant::now() - Duration::from_secs(11));
+            t.server.check_switches();
+            assert_eq!(t.server.switches[&1].stage, stopping);
+            assert!(crate::process::still_running(pid, started), "the agent ignores hangup");
+            t.server.switches.get_mut(&1).unwrap().stopping.as_mut().unwrap().since =
+                Instant::now() - Duration::from_secs(3);
+            t.server.check_switches();
+            t.until("the watchdog kills the unresponsive agent", |_| !crate::process::still_running(pid, started));
+            t.until("the stopped launch releases its reservation", |t| {
+                t.server.switches.get(&1).is_none_or(|s| s.stage != stopping)
+            });
+        }
+        assert!(t.server.switches.is_empty());
+        assert!(t.server.panes[&1].exit_code.is_some());
+        assert_eq!(t.server.panes[&1].spec.account.as_deref(), Some("claude:from"));
+        t.server.check_switches();
+        assert!(t.server.switches.is_empty(), "a failed recovery does not retry forever");
+    }
+
+    #[test]
+    fn a_deferred_switch_launch_failure_recovers_without_an_exit_event() {
+        let mut t = SwitchTest::new("deferred-switch-failure");
+        let program = t.dir.join("claude");
+        crate::testing::write_script(&program, "#!/bin/sh\necho READY\nread -r line\n");
+        let mut original = t.server.panes[&1].spec.clone();
+        original.command[0] = program.display().to_string();
+        original.text = None;
+        t.server.switches.get_mut(&1).unwrap().original = original;
+        t.server.switches.get_mut(&1).unwrap().stage = SwitchStage::Starting;
+        let missing_interpreter = t.dir.join("broken-claude");
+        crate::testing::write_script(&missing_interpreter, "#!/nonexistent-interpreter\n");
+        let batch = crate::pane::batch();
+        t.spawn(PaneSpec { command: vec![missing_interpreter.display().to_string()], ..Default::default() });
+        drop(batch);
+        let pending = t.server.panes.get_mut(&1).unwrap().take_pending().unwrap();
+        let crate::pane::Started::Failed(id, process, why) = pending.start() else { panic!("cannot start") };
+        t.server.pane_failed(id, &process, &why);
+        assert_eq!(t.server.switches[&1].stage, SwitchStage::Restoring);
+        assert_eq!(t.server.panes[&1].spec.account.as_deref(), Some("claude:from"));
+        t.until("the source starts without waiting for a nonexistent process to exit", |t| {
+            t.server.panes[&1].has_printed()
+        });
+    }
+
+    #[test]
+    fn enter_after_a_synchronous_recovery_failure_resumes_the_source_conversation() {
+        for undo in [false, true] {
+            let mut t = SwitchTest::new(if undo { "undo-recovery-id" } else { "switch-recovery-id" });
+            let switch = t.server.switches.get_mut(&1).unwrap();
+            switch.from.agent = "codex".into();
+            switch.to.agent = "codex".into();
+            switch.undo = undo;
+            let (from, to) = (switch.from.clone(), switch.to.clone());
+            t.server.accounts = Accounts::empty();
+            for (a, session) in [(&from, "source"), (&to, "destination")] {
+                t.server.accounts.add(a.clone()).unwrap();
+                let dir = PathBuf::from(&a.home).join("sessions/2026/10/13");
+                std::fs::create_dir_all(&dir).unwrap();
+                std::fs::write(
+                    dir.join(format!("rollout-today-{session}.jsonl")),
+                    format!("{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"{session}\"}}}}\n"),
+                )
+                .unwrap();
+            }
+            let program = t.dir.join("codex");
+            let script = "#!/bin/sh\necho \"$*\" > \"$CODEX_HOME/args\"\necho READY\nread -r line\nexit 23\n";
+            crate::testing::write_script(&program, script);
+            let mut original = t.server.agent_spec(&from, Some(t.dir.clone()), Some("source"), &[]).unwrap();
+            original.command[0] = program.display().to_string();
+            let mut destination = t.server.agent_spec(&to, Some(t.dir.clone()), Some("destination"), &[]).unwrap();
+            destination.command[0] = program.display().to_string();
+            t.spawn(PaneSpec { command: vec!["sh".into(), "-c".into(), "exit".into()], ..Default::default() });
+            t.until("the initial process ends", |t| t.server.panes[&1].exit_code.is_some());
+            let switch = t.server.switches.get_mut(&1).unwrap();
+            switch.original = original;
+            switch.stage = SwitchStage::Starting;
+            t.server.start_switch_spec(1, destination).unwrap();
+            assert_eq!(t.server.panes[&1].agent.session_id.as_deref(), Some("destination"));
+            t.until("the destination runs", |t| t.dir.join("to/args").exists());
+            std::fs::remove_file(&program).unwrap();
+            t.server.panes.get_mut(&1).unwrap().write_input(b"exit\n".to_vec());
+            t.until("recovery fails synchronously", |t| t.server.switches.is_empty());
+            let pane = &t.server.panes[&1];
+            assert!(pane.exit_code.is_some());
+            assert_eq!(pane.spec.session.as_deref(), Some("source"));
+            assert_eq!(pane.agent.session_id.as_deref(), Some("source"));
+            assert_eq!(pane.agent.session_process, None);
+            let (retry, exact) = t.server.restart_spec(1).unwrap();
+            assert!(exact);
+            assert!(retry.command.windows(2).any(|args| args == ["resume", "source"]));
+
+            crate::testing::write_script(&program, script);
+            let (client, _peer) = super::super::tests::client(&mut t.server);
+            let tab = &mut t.server.workspaces.last_mut().unwrap().tabs[0];
+            tab.root = Some(crate::layout::Node::Leaf(1));
+            tab.set_focus(1);
+            t.server.client_input(client, b"\r");
+            t.until("Enter resumes the source", |t| t.dir.join("from/args").exists());
+            assert_eq!(std::fs::read_to_string(t.dir.join("from/args")).unwrap().trim(), "resume source");
+            assert_eq!(t.server.panes[&1].spec.account_id, Some(from.id));
+        }
+    }
+    #[test]
+    fn removing_the_destination_after_the_stop_resumes_the_source() {
+        let mut t = SwitchTest::new("removed-after-stop");
+        t.server.switches.get_mut(&1).unwrap().stage = SwitchStage::Stopping;
+        t.server.accounts.remove("claude", "to");
+        t.server.finish_switch(1);
+        assert_eq!(t.server.switches[&1].stage, SwitchStage::Restoring);
+        assert_eq!(t.server.panes[&1].spec.account.as_deref(), Some("claude:from"));
+        assert!(t.server.panes[&1].spec.account_undo.is_none());
+    }
+    #[test]
+    fn a_process_that_changes_during_verification_offers_another_pane() {
+        let mut t = SwitchTest::new("process-changed-during-check");
+        let (client, _peer) = super::super::tests::client(&mut t.server);
+        let s = t.server.switches.get_mut(&1).unwrap();
+        s.client = Some(client);
+        s.observed = Some(ObservedAgent {
+            pid: u32::MAX,
+            started: 0,
+            command: vec!["claude".into()],
+            account: s.from.clone(),
+            session: "session".into(),
+            cwd: t.dir.clone(),
+            path: String::new(),
+        });
+        t.checked(Status::SignedIn);
+        let Mode::Picker(p) = &t.server.clients[&client].mode else { panic!("a safe next step") };
+        assert_eq!(p.title, "Can't switch this process.");
+        assert!(matches!(p.items[0].action, PickAction::OpenAnotherAccount(1)));
+        assert!(t.server.switches.is_empty());
+        t.unchanged();
     }
 }

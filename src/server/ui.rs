@@ -124,6 +124,7 @@ pub enum ConfirmAction {
     RetryAccountSwitch {
         pane: PaneId,
         account: crate::accounts::Account,
+        undo: bool,
     },
     /// Run a git shell script in a job pane.
     GitJob {
@@ -271,7 +272,12 @@ pub enum PickAction {
     /// A server name or `user@host[:port]`.
     Ssh(String),
     SshGroup(String),
-    FocusPane(PaneId),
+    FocusPane {
+        pane: PaneId,
+        agent: bool,
+        undo: bool,
+    },
+    OpenAnotherAccount(PaneId),
     /// An agent of a server's kraal session: the server, and its pane's id there.
     RemoteAgent {
         server: String,
@@ -426,7 +432,12 @@ impl Picker {
             (K::RunbookSteps, A::RunBlock(_)) => &[("enter", "Run step"), ("ctrl+y", "Copy step")],
             (_, A::RunbookList) => &[("enter", "Back to runbooks")],
             (_, A::Command(_)) => &[("enter", "Run")],
-            (_, A::FocusPane(_) | A::RemoteAgent { .. }) => &[("enter", "Go to pane")],
+            (_, A::FocusPane { undo: true, .. }) => {
+                &[("enter", "Go to pane"), ("ctrl+a", "Change account"), ("ctrl+u", "Undo account change")]
+            }
+            (_, A::FocusPane { agent: true, .. }) => &[("enter", "Go to pane"), ("ctrl+a", "Change account")],
+            (_, A::FocusPane { .. } | A::RemoteAgent { .. }) => &[("enter", "Go to pane")],
+            (_, A::OpenAnotherAccount(_)) => &[("enter", "Open with another account")],
             (_, A::FilesSet { .. }) => &[("enter", "Open directory")],
             (_, A::Tool { .. }) => &[("enter", "Start tool")],
             (K::Buffers, A::Buffer(_)) => &[

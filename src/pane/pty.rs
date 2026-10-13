@@ -148,6 +148,14 @@ impl ProcessHold {
         self.0.pid().is_some_and(|pid| crate::process::group_running(pid as libc::pid_t))
     }
 
+    /// The running members of the session whose leader this hold keeps unreaped.
+    pub fn session_members(&self) -> Vec<u32> {
+        self.0
+            .pid()
+            .map(|pid| crate::process::session_members(pid as libc::pid_t).into_iter().map(|p| p as u32).collect())
+            .unwrap_or_default()
+    }
+
     /// Send `signal` to the process and its group.
     pub fn signal(&self, signal: i32) {
         self.0.signal_group(signal);

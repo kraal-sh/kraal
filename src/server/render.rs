@@ -31,6 +31,7 @@ pub enum BarItem {
     Workspace,
     Tab(usize),
     NewTab,
+    Toast(PaneId, super::attention::ToastAction),
     /// A label a click does nothing on.
     Text,
 }
@@ -994,7 +995,19 @@ impl Server {
         let waiting = self.attention_queue().len();
         let mut notice = Vec::new();
         if let Some((msg, _)) = &c.toast {
-            notice.push(Span::styled(msg.clone(), Style::default().fg(t.blocked)));
+            let style = Style::default().fg(t.blocked);
+            if let Some((_, action)) = c.toast_action {
+                let label = action.label();
+                let prefix = msg.strip_suffix(&format!(" · {label}")).unwrap_or(msg);
+                let available = room.saturating_sub(1);
+                if available >= label.width() as u16 + 4 {
+                    let prefix = crate::text::truncate(prefix, usize::from(available) - label.width() - 3);
+                    notice.push(Span::styled(format!("{prefix} · "), style));
+                    notice.push(Span::styled(label, style.add_modifier(Modifier::UNDERLINED)));
+                }
+            } else {
+                notice.push(Span::styled(msg.clone(), style));
+            }
         } else if normal && c.welcome && waiting == 0 {
             // Until the menu is opened once.
             notice.push(Span::styled("Welcome to kraal", Style::default().fg(t.accent).add_modifier(Modifier::BOLD)));
@@ -1121,7 +1134,23 @@ impl Server {
 
     pub fn tab_bar_hit(&self, id: ClientId, col: u16) -> Option<BarItem> {
         let c = self.clients.get(&id)?;
-        self.top_bar(c).items.into_iter().find(|(x, w, ..)| col >= *x && col < x + w).map(|(_, _, item, _)| item)
+        let bar = self.top_bar(c);
+        if let Some((pane, action)) =
+            c.toast_action.filter(|_| c.toast.as_ref().is_some_and(|(_, until)| *until > std::time::Instant::now()))
+        {
+            let mut x = c.cols.saturating_sub(spans_width(&bar.right) + 1);
+            for span in &bar.right {
+                let width = span.width() as u16;
+                if span.content == action.label()
+                    && span.style.add_modifier.contains(Modifier::UNDERLINED)
+                    && (x..x + width).contains(&col)
+                {
+                    return Some(BarItem::Toast(pane, action));
+                }
+                x += width;
+            }
+        }
+        bar.items.into_iter().find(|(x, w, ..)| col >= *x && col < x + w).map(|(_, _, item, _)| item)
     }
 
     fn draw_top_bar(bar: &TopBar, cols: u16, buf: &mut Buffer) {
@@ -1545,12 +1574,19 @@ impl Server {
         }
         if let Some(kind) = &pane.agent.kind {
             let state = pane.agent.state;
-            let kind = self.pane_account(pid).as_ref().map(crate::accounts::label).unwrap_or_else(|| kind.clone());
+            let account = self.pane_account(pid);
+            let kind = account.as_ref().map(crate::accounts::label).unwrap_or_else(|| kind.clone());
             let sep = if th().ascii { "-" } else { "·" };
             out.push(Span::styled(
-                format!(" {} {} {sep} {kind} ", th().icon(state), state.label()),
+                format!(" {} {} {sep} ", th().icon(state), state.label()),
                 Style::default().fg(th().state_color(state)),
             ));
+            let style = Style::default().fg(th().state_color(state));
+            out.push(Span::styled(
+                kind,
+                if account.is_some() { style.add_modifier(Modifier::UNDERLINED) } else { style },
+            ));
+            out.push(Span::raw(" "));
         }
         // The last command the shell marked failed: its status, and how long it ran if that
         // was long enough to matter.
@@ -1699,6 +1735,26 @@ impl Server {
             title.insert(0, Span::styled(" ◆", Style::default().fg(th().sync).add_modifier(Modifier::BOLD)));
         }
         Some(FrameLook { tile, color, title, details: facts.details.clone() })
+    }
+
+    pub(super) fn frame_account_hit(&self, pane: PaneId, tile: Rect, floating: bool, marked: bool, col: u16) -> bool {
+        if self.inner(tile) == tile {
+            return false;
+        }
+        let Some(look) = self.frame_look(pane, tile, false, false, floating, marked) else { return false };
+        let width = spans_width(&look.details);
+        if u32::from(spans_width(&look.title)) + u32::from(width) + 4 > u32::from(tile.width) {
+            return false;
+        }
+        let mut x = tile.right() - 2 - width;
+        for span in look.details {
+            let width = span.width() as u16;
+            if span.style.add_modifier.contains(Modifier::UNDERLINED) && (x..x + width).contains(&col) {
+                return true;
+            }
+            x += width;
+        }
+        false
     }
 
     fn draw_frame(look: &FrameLook, buf: &mut Buffer) {
@@ -2021,5 +2077,71 @@ mod tests {
         assert_eq!(server.account_summaries_until(1_300), Some(1_360));
         assert_eq!(rows(1_359), rows(1_300));
         assert_ne!(rows(1_360), rows(1_300));
+    }
+
+    #[test]
+    fn account_frame_hit_uses_the_drawn_cells_and_drops_hidden_details() {
+        let (tx, _rx) = super::super::queue::channel(16);
+        let mut server = super::super::tests::server(tx);
+        let mut account = server.accounts.get("claude", "default").unwrap();
+        account.name = "équipe".into();
+        server.accounts.add(account.clone()).unwrap();
+        let spec = crate::pane::PaneSpec {
+            account: Some("claude:équipe".into()),
+            account_id: Some(account.id),
+            text: Some(crate::pane::ShownText { title: String::new(), text: String::new() }),
+            ..Default::default()
+        };
+        let mut pane =
+            crate::pane::Pane::spawn(1, Some("review".into()), spec, 80, 24, &server.env, &server.tx).unwrap();
+        pane.agent.kind = Some("claude".into());
+        server.panes.insert(1, pane);
+        for width in [80, 124] {
+            for floating in [false, true] {
+                let tile = Rect::new(3, 2, width, 10);
+                let look = server.frame_look(1, tile, false, false, floating, true).unwrap();
+                let mut buf = Buffer::empty(Rect::new(0, 0, 130, 36));
+                Server::draw_frame(&look, &mut buf);
+                let row: String = (tile.x..tile.right()).map(|x| buf[(x, tile.y)].symbol()).collect();
+                let at = row[..row.find("claude·équipe").unwrap()].width() as u16 + tile.x;
+                for col in tile.x..tile.right() {
+                    assert_eq!(
+                        server.frame_account_hit(1, tile, floating, true, col),
+                        (at..at + "claude·équipe".width() as u16).contains(&col),
+                        "{width}, {col}"
+                    );
+                }
+            }
+        }
+        let narrow = Rect::new(0, 0, 16, 10);
+        assert!((0..16).all(|x| !server.frame_account_hit(1, narrow, false, false, x)));
+        server.config.pane_frames = false;
+        assert!((0..80).all(|x| !server.frame_account_hit(1, Rect::new(0, 0, 80, 24), false, false, x)));
+    }
+
+    #[test]
+    fn notification_actions_stay_visible_when_truncated_and_expire_with_the_message() {
+        use super::super::attention::ToastAction;
+        let (tx, _rx) = super::super::queue::channel(16);
+        let mut server = super::super::tests::server(tx);
+        server.config.notifications.mode = crate::config::NotifyMode::Off;
+        let (id, _peer) = super::super::tests::client(&mut server);
+        for cols in [80, 124] {
+            server.clients.get_mut(&id).unwrap().cols = cols;
+            for action in [ToastAction::UndoAccount, ToastAction::ChangeAccount] {
+                server.notify_action(&"A long account name ".repeat(8), 7, action);
+                let bar = server.top_bar(&server.clients[&id]);
+                assert!(bar.right.iter().any(|s| s.content == action.label()));
+                let hits: Vec<_> =
+                    (0..cols).filter(|&x| server.tab_bar_hit(id, x) == Some(BarItem::Toast(7, action))).collect();
+                assert_eq!(hits.len(), action.label().len());
+                let at = hits[0];
+                server.clients.get_mut(&id).unwrap().toast.as_mut().unwrap().1 =
+                    std::time::Instant::now() - std::time::Duration::from_secs(1);
+                assert_ne!(server.tab_bar_hit(id, at), Some(BarItem::Toast(7, action)));
+                server.toast(id, "Another message");
+                assert!(server.clients[&id].toast_action.is_none());
+            }
+        }
     }
 }

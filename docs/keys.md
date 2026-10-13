@@ -64,7 +64,7 @@ keys that do it in your keymap, and the menu key at the right end:
 | Focused pane | |
 |---|---|
 | on a server (its name in red in production) | its files `ctrl+b f`, the tools there `ctrl+b r`, download `ctrl+b S d`, upload `ctrl+b S u` |
-| an agent (its name and state) | switch its account `ctrl+b A c` (one kraal started), review its worktree `ctrl+b R g` (when it works in one), the next agent needing you `alt+a`, a new agent `ctrl+b a` |
+| an agent (its name and state) | switch its account `ctrl+b A c` (Claude or Codex, including identifiable shell launches), review its worktree `ctrl+b R g` (when it works in one), the next agent needing you `alt+a`, a new agent `ctrl+b a` |
 | in a git repository | git and worktrees `ctrl+b R g`, tools `ctrl+b r`, new pane `alt+n`, split `ctrl+b P →`, start an agent `ctrl+b a` |
 | a shell | new pane, split, connect to a server `ctrl+b s`, start an agent |
 | a preview | its own keys: `↑↓` scroll, `r` reload, `q` close |
@@ -216,3 +216,7 @@ the prefix, without Shift. On a non-Latin layout, a key stands for the letter at
 US keyboard, so Ctrl+B is still the prefix on a Russian layout. A key the keymap binds by its
 character keeps that meaning. Terminals without the protocol send characters only, and shortcuts
 read them as such. Key release events are not passed on yet.
+
+The account name in a pane's frame opens **Change account** too. After a change, click **Undo**
+in its message, or open **Find a pane** (`ctrl+b p`), select the pane and press Tab for
+**Undo account change**. The action remains after the message disappears.
