@@ -11,7 +11,6 @@ use crate::keymap::{Action, Command};
 use crate::pane::PaneSpec;
 use crate::paths;
 use crate::protocol::Placement;
-use crate::server::definitions::file_name;
 use crate::server::ui::{ConfirmAction, Mode, PickAction, PickItem, Picker, PickerKind, Prompt, PromptAction};
 use crate::server::{ClientId, Server};
 
@@ -236,9 +235,17 @@ impl Server {
                         }
                     }
                 }
+                (KeyCode::Char('r'), true) if p.kind == PickerKind::Workspace => {
+                    if let Some(PickAction::SwitchWorkspace(ws) | PickAction::ReopenWorkspace(ws)) =
+                        p.current().map(|i| &i.action)
+                    {
+                        return self.rename_workspace_form(*ws, Some(&p));
+                    }
+                }
                 (KeyCode::Char('x'), true) if p.kind == PickerKind::Workspace => {
                     if let Some(PickAction::SwitchWorkspace(ws)) = p.current().map(|i| i.action.clone()) {
-                        return self.ask_close_workspace(id, ws);
+                        let mode = self.ask_close_workspace(id, ws);
+                        return self.return_to_workspaces(id, mode, p.state());
                     }
                 }
                 // A question that may come while the user types elsewhere: typing does not answer it.
@@ -259,6 +266,15 @@ impl Server {
             }
             InputEvent::Mouse(MouseEvent { kind: MouseKind::ScrollUp, .. }) => p.move_by(-1),
             InputEvent::Mouse(MouseEvent { kind: MouseKind::ScrollDown, .. }) => p.move_by(1),
+            InputEvent::Mouse(MouseEvent { kind: MouseKind::Press(MouseButton::Right), col, row, .. })
+                if p.kind == PickerKind::Workspace =>
+            {
+                let layout = crate::server::overlays::picker_layout(&p, self.client_screen(id));
+                if let Some(i) = layout.row_at(col, row).filter(|&i| i < p.filtered.len()) {
+                    p.selected = i;
+                    p.actions = (p.action_keys().len() > 1).then_some(0);
+                }
+            }
             InputEvent::Mouse(MouseEvent { kind: MouseKind::Press(MouseButton::Left), col, row, .. }) => {
                 // Rows and their actions use the same activation as Enter.
                 let layout = crate::server::overlays::picker_layout(&p, self.client_screen(id));
@@ -280,16 +296,34 @@ impl Server {
     pub(in crate::server) fn pick(&mut self, id: ClientId, p: &Picker, item: PickItem) -> Mode {
         match item.action {
             PickAction::Command(command) => return self.command(id, command),
-            PickAction::SwitchWorkspace(ws) | PickAction::ReopenWorkspace(ws) => self.show_workspace(id, ws),
-            PickAction::RetryWorkspaceClose(ws) => return self.ask_close_workspace(id, ws),
+            PickAction::SwitchWorkspace(ws) | PickAction::ReopenWorkspace(ws) => {
+                if let Err(e) = self.reopen_workspace(ws) {
+                    let mode = Mode::confirm(
+                        format!(
+                            "Couldn't open the workspace.\n{e:#}\nThe saved workspace is kept. Fix the cause and retry."
+                        ),
+                        ConfirmAction::OpenWorkspace(PickAction::ReopenWorkspace(ws)),
+                    );
+                    return self.return_to_workspaces(id, mode, p.state());
+                }
+                self.show_workspace(id, ws);
+            }
+            PickAction::RetryWorkspaceClose(ws) => {
+                let mode = self.ask_close_workspace(id, ws);
+                return self.return_to_workspaces(id, mode, p.state());
+            }
             PickAction::OpenDefinition(path) => match self.open_definition(&path) {
                 Ok(ws) => self.show_workspace(id, ws),
-                Err(e) => self.toast(id, format!("{e:#}")),
+                Err(e) => {
+                    let mode = Mode::confirm(
+                        format!("Couldn't open the file.\n{e:#}\nThe file is unchanged. Fix the cause and retry."),
+                        ConfirmAction::OpenWorkspace(PickAction::OpenDefinition(path)),
+                    );
+                    return self.return_to_workspaces(id, mode, p.state());
+                }
             },
-            PickAction::NewWorkspace => {
-                let mut prompt = Prompt::new("New workspace", &p.query, PromptAction::NewWorkspace);
-                prompt.cursor = p.cursor;
-                return self.submit_prompt(id, prompt);
+            PickAction::AddWorkspace => {
+                return Mode::Prompt(self.add_workspace_form(id, Some(p)));
             }
             PickAction::Ssh(spec) => self.connect(id, &spec, Placement::Auto),
             PickAction::SshGroup(group) => match self.open_group(&group, &[]) {
@@ -356,7 +390,11 @@ impl Server {
             PickAction::Worktree { pane, op } => return self.worktree_op(id, pane, &op),
             PickAction::AddAccount => return Mode::AccountForm(self.account_form(id)),
             PickAction::AccountDetails(account) => return self.account_details(&account),
-            PickAction::None => return Mode::Picker(Picker::new(p.kind, &p.title, p.items.clone())),
+            PickAction::None => {
+                let mut next = Picker::new(p.kind, &p.title, p.items.clone());
+                next.restore(p.state());
+                return Mode::Picker(next);
+            }
         }
         Mode::Normal
     }
@@ -367,14 +405,12 @@ impl Server {
             .iter()
             .filter_map(|(&id, c)| {
                 let Mode::Picker(p) = &c.mode else { return None };
-                (p.kind == PickerKind::Workspace).then(|| (id, c.workspace, p.query.clone(), p.selected))
+                (p.kind == PickerKind::Workspace).then(|| (id, c.workspace, p.state()))
             })
             .collect();
-        for (id, ws, query, selected) in clients {
+        for (id, ws, state) in clients {
             let mut picker = self.workspace_picker(ws);
-            picker.query = query;
-            picker.selected = selected;
-            picker.refilter();
+            picker.restore(state);
             self.clients.get_mut(&id).unwrap().mode = Mode::Picker(picker);
         }
     }
@@ -398,7 +434,7 @@ impl Server {
                 detail.push_str(&format!(" · ▲{blocked} ●{working} ✓{done}"));
             }
             if ws.id == current {
-                detail.push_str(" · current");
+                detail.push_str(" · Current");
             }
             let state = if blocked > 0 {
                 Some(AgentState::Blocked)
@@ -440,14 +476,22 @@ impl Server {
                         continue;
                     }
                     let n = def.panes().len();
-                    let source =
-                        if collisions.contains(&def.name) { paths::shorten_home(&path) } else { file_name(&path) };
+                    let source = if collisions.contains(&def.name) {
+                        format!(" · {}", paths::shorten_home(&path))
+                    } else {
+                        String::new()
+                    };
                     items.push(PickItem {
                         label: def.name,
-                        detail: format!("not running · {n} pane{} · {source}", plural(n)),
+                        detail: format!(
+                            "Closed · {} tab{} · {n} pane{}{source}",
+                            def.tabs.len(),
+                            plural(def.tabs.len()),
+                            plural(n)
+                        ),
                         action: PickAction::OpenDefinition(path),
                         state: None,
-                        dim: true,
+                        dim: false,
                     });
                 }
                 Err(e) => items.push(PickItem {
@@ -455,14 +499,14 @@ impl Server {
                     detail: format!("error: {e:#}"),
                     action: PickAction::None,
                     state: None,
-                    dim: true,
+                    dim: false,
                 }),
             }
         }
         items.push(PickItem {
-            label: String::new(),
+            label: "+ Add workspace".into(),
             detail: String::new(),
-            action: PickAction::NewWorkspace,
+            action: PickAction::AddWorkspace,
             state: None,
             dim: false,
         });
@@ -473,7 +517,7 @@ impl Server {
             PickAction::SwitchWorkspace(id) | PickAction::ReopenWorkspace(id) | PickAction::RetryWorkspaceClose(id) if id == current)
             })
             .unwrap_or(0);
-        let mut picker = Picker::new(PickerKind::Workspace, "Workspaces · type a new name to create one", items);
+        let mut picker = Picker::new(PickerKind::Workspace, "Workspaces", items);
         picker.selected = selected;
         picker
     }
@@ -597,11 +641,11 @@ mod workspace_tests {
         assert_eq!(rows.len(), 2);
         for (row, sub) in rows.iter().zip(["one", "two"]) {
             let path = crate::workspace::definition_path(&dir.join(sub).join("same.kdl"));
-            assert_eq!(row.detail, format!("not running · 1 pane · {}", paths::shorten_home(&path)));
+            assert_eq!(row.detail, format!("Closed · 1 tab · 1 pane · {}", paths::shorten_home(&path)));
             assert!(matches!(&row.action, PickAction::OpenDefinition(p) if p == &path));
         }
         let only = picker.items.iter().find(|item| item.label == "only").unwrap();
-        assert_eq!(only.detail, "not running · 1 pane · only.kdl");
+        assert_eq!(only.detail, "Closed · 1 tab · 1 pane");
         for width in [80, 120] {
             let screen = ratatui::layout::Rect::new(0, 0, width, 30);
             let mut buffer = ratatui::buffer::Buffer::empty(screen);
@@ -621,6 +665,211 @@ mod tests {
     use crate::input::Mods;
 
     #[test]
+    fn closed_rows_open_once_and_their_actions_rename_without_switching() {
+        let (tx, _rx) = crate::server::queue::channel(32);
+        let mut server = crate::server::tests::server(tx);
+        let (client, _peer) = crate::server::tests::client(&mut server);
+        let current = server.clients[&client].workspace;
+        let ws = server.new_workspace("closed".into(), None);
+        let mut saved = crate::persist::snapshot(&server).workspaces.remove(1);
+        saved.closed = true;
+        for line in [0, 1] {
+            server.workspaces[1].kept = Some(saved.clone());
+            let p = server.workspace_picker(current);
+            let layout = crate::server::overlays::picker_layout(&p, server.client_screen(client));
+            let click = |button| {
+                InputEvent::Mouse(MouseEvent {
+                    kind: MouseKind::Press(button),
+                    col: layout.list.x + 2,
+                    row: layout.list.y + 2 + line,
+                    mods: Mods::NONE,
+                })
+            };
+            assert!(matches!(server.on_picker(client, p, click(MouseButton::Left)), Mode::Normal));
+            assert_eq!(server.clients[&client].workspace, ws);
+            assert!(!server.workspaces[1].closed());
+            assert!(server.panes.is_empty());
+            server.workspaces[1].kept = Some(saved.clone());
+            server.clients.get_mut(&client).unwrap().workspace = current;
+            let p = server.workspace_picker(current);
+            let Mode::Picker(p) = server.on_picker(client, p, click(MouseButton::Right)) else { panic!() };
+            assert_eq!(p.actions, Some(0));
+            let key = |code| InputEvent::Key(Key { code, mods: Mods::NONE, raw: Vec::new() });
+            let Mode::Picker(p) = server.on_picker(client, p, key(KeyCode::Down)) else { panic!() };
+            let Mode::Prompt(p) = server.on_picker(client, p, key(KeyCode::Enter)) else { panic!() };
+            assert!(matches!(p.action, PromptAction::RenameWorkspace(id) if id == ws));
+            assert_eq!(server.clients[&client].workspace, current);
+            assert!(server.workspaces[1].closed());
+        }
+    }
+
+    #[test]
+    fn failed_open_keeps_a_readable_retry_and_cancel_returns_to_the_search() {
+        let (tx, _rx) = crate::server::queue::channel(32);
+        let mut server = crate::server::tests::server(tx);
+        let (client, _peer) = crate::server::tests::client(&mut server);
+        let current = server.clients[&client].workspace;
+        let path = std::env::temp_dir().join(format!("kraal-w6-open-{}.kdl", std::process::id()));
+        let item = PickItem::new("file", "Closed", PickAction::OpenDefinition(path.clone()));
+        let mut p = Picker::new(PickerKind::Workspace, "Workspaces", vec![item.clone()]);
+        p.query = "file".into();
+        p.cursor = 2;
+        p.refilter();
+        std::fs::write(&path, "invalid {").unwrap();
+        for retry in [false, true] {
+            let Mode::Confirm(q) = server.pick(client, &p, item.clone()) else { panic!() };
+            assert!(q.message.contains("Fix the cause and retry."));
+            assert!(!q.yes);
+            if retry {
+                std::fs::write(&path, "layout { pane; }").unwrap();
+            }
+            let _batch = crate::pane::batch();
+            let event = InputEvent::Key(Key {
+                code: if retry { KeyCode::Char('y') } else { KeyCode::Esc },
+                mods: Mods::NONE,
+                raw: Vec::new(),
+            });
+            let mode = server.on_confirm(client, q, event);
+            if retry {
+                assert!(matches!(mode, Mode::Normal));
+                assert_ne!(server.clients[&client].workspace, current);
+                assert_eq!(server.workspaces.len(), 2);
+            } else {
+                let Mode::Picker(p) = mode else { panic!() };
+                assert_eq!((p.query.as_str(), p.cursor), ("file", 2));
+                assert_eq!(server.clients[&client].workspace, current);
+                assert_eq!(server.workspaces.len(), 1);
+            }
+        }
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn closing_from_a_filtered_list_keeps_its_query_cursor_and_workspace_selection() {
+        let (tx, _rx) = crate::server::queue::channel(32);
+        let mut server = crate::server::tests::server(tx);
+        let (client, _peer) = crate::server::tests::client(&mut server);
+        let ws = server.clients[&client].workspace;
+        crate::server::persistence::tests::writer(&mut server, vec![Ok(())]);
+        let mut p = server.workspace_picker(ws);
+        p.query = "test".into();
+        p.cursor = 2;
+        p.refilter();
+        let event = InputEvent::Key(Key { code: KeyCode::Char('x'), mods: Mods::CTRL, raw: Vec::new() });
+        let Mode::Picker(p) = server.on_picker(client, p, event) else { panic!() };
+        assert_eq!((p.query.as_str(), p.cursor), ("test", 2));
+        assert!(matches!(p.current().unwrap().action, PickAction::ReopenWorkspace(id) if id == ws));
+        assert!(server.workspaces[0].closed());
+    }
+
+    #[test]
+    fn closing_from_a_status_filter_clears_it_and_enter_reopens_the_same_workspace() {
+        let (tx, _rx) = crate::server::queue::channel(32);
+        let mut server = crate::server::tests::server(tx);
+        let (client, _peer) = crate::server::tests::client(&mut server);
+        let ws = server.clients[&client].workspace;
+        server
+            .spawn_pane_in(
+                ws,
+                None,
+                PaneSpec { files: Some(["/missing".into(), "/missing".into()]), ..Default::default() },
+                Placement::Auto,
+                None,
+            )
+            .unwrap();
+        let identity = server.workspaces[0].stable_id.clone();
+        crate::server::persistence::tests::writer(&mut server, vec![Ok(()), Ok(())]);
+        let mut p = server.workspace_picker(ws);
+        p.query = "Open 1".into();
+        p.cursor = p.query.len();
+        p.refilter();
+        assert_eq!(p.current().unwrap().action.workspace(), Some(ws));
+        let key = |code, mods| InputEvent::Key(Key { code, mods, raw: Vec::new() });
+        let Mode::Picker(p) = server.on_picker(client, p, key(KeyCode::Char('x'), Mods::CTRL)) else { panic!() };
+        assert_eq!((p.query.as_str(), p.cursor), ("", 0));
+        assert!(matches!(p.current().unwrap().action, PickAction::ReopenWorkspace(id) if id == ws));
+        assert!(server.workspaces[0].closed());
+        assert!(server.panes.is_empty());
+        assert!(matches!(server.on_picker(client, p, key(KeyCode::Enter, Mods::NONE)), Mode::Normal));
+        assert_eq!(server.clients[&client].workspace, ws);
+        assert_eq!(server.workspaces.len(), 1);
+        assert_eq!(server.workspaces[0].stable_id, identity);
+        assert!(!server.workspaces[0].closed());
+        assert_eq!(server.workspaces[0].panes().len(), 1);
+    }
+
+    #[test]
+    fn blank_and_informational_workspace_rows_do_not_activate_add() {
+        for size in [(80, 24), (124, 36)] {
+            let (tx, _rx) = crate::server::queue::channel(32);
+            let mut server = crate::server::tests::server(tx);
+            let (client, _peer) = crate::server::tests::client(&mut server);
+            let ws = server.clients[&client].workspace;
+            let c = server.clients.get_mut(&client).unwrap();
+            (c.cols, c.rows) = size;
+            for query in ["", "no match"] {
+                let mut p = server.workspace_picker(ws);
+                p.query = query.into();
+                p.refilter();
+                // Keep space for a filtered-out row, as when the list was refreshed.
+                if query.is_empty() {
+                    p.min_items = 3;
+                }
+                let selected = p.current().unwrap().label.clone();
+                let layout = crate::server::overlays::picker_layout(&p, server.client_screen(client));
+                let first = layout.list.y + if query.is_empty() { layout.row_height } else { 0 };
+                let mut buf = ratatui::buffer::Buffer::empty(server.client_screen(client));
+                crate::server::overlays::draw_picker(&p, buf.area, &mut buf);
+                let shown: String = buf.content.iter().map(|c| c.symbol()).collect();
+                if !query.is_empty() {
+                    assert!(shown.contains("No matching workspaces."));
+                }
+                for row in first..layout.list.bottom() {
+                    for button in [MouseButton::Left, MouseButton::Right] {
+                        let event = InputEvent::Mouse(MouseEvent {
+                            kind: MouseKind::Press(button),
+                            col: layout.list.x + 2,
+                            row,
+                            mods: Mods::NONE,
+                        });
+                        let Mode::Picker(next) = server.on_picker(client, p, event) else { panic!("no action") };
+                        p = next;
+                        assert_eq!(p.current().unwrap().label, selected);
+                        assert_eq!(p.query, query);
+                        assert!(p.actions.is_none());
+                        assert_eq!(server.workspaces.len(), 1);
+                    }
+                }
+                let event = InputEvent::Mouse(MouseEvent {
+                    kind: MouseKind::Press(MouseButton::Left),
+                    col: layout.list.x + 2,
+                    row: layout.list.bottom(),
+                    mods: Mods::NONE,
+                });
+                let Mode::Prompt(p) = server.on_picker(client, p, event) else { panic!("Add opens its form") };
+                assert!(matches!(p.action, PromptAction::NewWorkspace));
+            }
+        }
+    }
+
+    #[test]
+    fn workspace_picker_and_add_actions_work_without_a_current_workspace() {
+        let (tx, _rx) = crate::server::queue::channel(32);
+        let mut server = crate::server::tests::server(tx);
+        let (client, _peer) = crate::server::tests::client(&mut server);
+        for empty in [false, true] {
+            if empty {
+                server.workspaces.clear();
+            }
+            let Mode::Picker(p) = server.action(client, Action::WorkspacePicker) else { panic!() };
+            assert!(p.kind == PickerKind::Workspace);
+            assert!(p.items.iter().any(|i| matches!(i.action, PickAction::AddWorkspace)));
+            let Mode::Prompt(p) = server.action(client, Action::NewWorkspace) else { panic!() };
+            assert!(matches!(p.action, PromptAction::NewWorkspace));
+        }
+    }
+
+    #[test]
     fn creation_from_the_picker_keeps_input_on_failure_and_rechecks_the_name() {
         let (tx, _rx) = crate::server::queue::channel(32);
         let mut server = crate::server::tests::server(tx);
@@ -632,15 +881,19 @@ mod tests {
             p.query = " café 日 ".into();
             p.cursor = 3;
             p.refilter();
-            assert!(matches!(p.current().unwrap().action, PickAction::NewWorkspace));
+            assert!(matches!(p.current().unwrap().action, PickAction::AddWorkspace));
             if stale {
                 server.workspaces[0].name = "café 日".into();
             }
             let event = InputEvent::Key(Key { code: KeyCode::Enter, mods: Mods::NONE, raw: Vec::new() });
             let Mode::Prompt(p) = server.on_picker(client, p, event) else { panic!("keep input") };
-            assert_eq!((p.value.as_str(), p.cursor), (" café 日 ", 3));
+            assert_eq!(p.value, "café 日");
             assert!(matches!(p.action, PromptAction::NewWorkspace));
-            let reason = if stale { "already exists" } else { "No workspace was added." };
+            assert!(p.error.is_none());
+            assert_eq!(server.workspaces.len(), 1, "Add opens the form without creating");
+            let event = InputEvent::Key(Key { code: KeyCode::Enter, mods: Mods::NONE, raw: Vec::new() });
+            let Mode::Prompt(p) = server.on_prompt(client, p, event) else { panic!("keep input") };
+            let reason = if stale { "already used" } else { "No workspace was added." };
             assert!(p.error.as_ref().unwrap().contains(reason));
             assert_eq!(server.workspaces.len(), 1);
             assert_eq!(server.clients[&client].workspace, current);
@@ -697,7 +950,7 @@ mod tests {
     }
 
     #[test]
-    fn workspace_tab_and_close_apply_only_to_an_open_workspace() {
+    fn workspace_actions_offer_rename_on_closed_rows_and_close_only_on_open_rows() {
         let (tx, _rx) = crate::server::queue::channel(32);
         let mut server = crate::server::tests::server(tx);
         assert_eq!(server.new_workspace("open".into(), None), 1);
@@ -717,11 +970,12 @@ mod tests {
             PickAction::SwitchWorkspace(u32::MAX),
             PickAction::ReopenWorkspace(1),
             PickAction::OpenDefinition("closed.kdl".into()),
-            PickAction::NewWorkspace,
+            PickAction::AddWorkspace,
             PickAction::None,
         ] {
             let open = matches!(action, PickAction::SwitchWorkspace(_));
             let stale = matches!(action, PickAction::SwitchWorkspace(u32::MAX));
+            let actions = open || matches!(action, PickAction::ReopenWorkspace(_));
             let mut p = Picker::new(
                 PickerKind::Workspace,
                 "Workspaces",
@@ -730,13 +984,13 @@ mod tests {
             p.query = "new".into();
             p.filtered = vec![0, 1];
             let Mode::Picker(mut p) = server.on_picker(0, p, key(KeyCode::Tab, Mods::NONE)) else { panic!() };
-            assert_eq!(p.actions, open.then_some(0));
-            assert_eq!(p.selected, usize::from(!open));
+            assert_eq!(p.actions, actions.then_some(0));
+            assert_eq!(p.selected, usize::from(!actions));
             p.actions = None;
             p.selected = 0;
             let next = server.on_picker(0, p, key(KeyCode::Char('x'), Mods::CTRL));
             if stale {
-                assert!(matches!(next, Mode::Normal), "a stale workspace cannot be closed");
+                assert!(matches!(next, Mode::Picker(_)), "a stale workspace returns to the list");
             } else if open {
                 assert!(matches!(next, Mode::Confirm(q) if matches!(q.action, ConfirmAction::CloseWorkspace(1))));
             } else {

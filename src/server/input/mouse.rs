@@ -57,16 +57,29 @@ impl Server {
         }
         // The sidebar runs from the top, beside the top bar.
         if m.col < sw {
+            if (matches!(m.kind, MouseKind::Press(MouseButton::Right)) || press_left && m.col >= sw.saturating_sub(4))
+                && let Some(SideItem::Workspace(ws)) = self.sidebar_hit(id, m.row)
+                && (matches!(m.kind, MouseKind::Press(MouseButton::Right))
+                    || self.sidebar_hit(id, m.row.saturating_sub(1)) != Some(SideItem::Workspace(ws)))
+            {
+                let current = self.clients[&id].workspace;
+                let mut picker = self.workspace_picker(current);
+                picker.select(|i| i.action.workspace() == Some(ws));
+                picker.actions = (picker.action_keys().len() > 1).then_some(0);
+                return Some(Mode::Picker(picker));
+            }
             if press_left {
                 match self.sidebar_hit(id, m.row) {
+                    Some(SideItem::Workspaces) => return Some(self.action(id, Action::WorkspacePicker)),
+                    Some(SideItem::AddWorkspace) => return Some(self.action(id, Action::NewWorkspace)),
                     Some(SideItem::Accounts) => return Some(self.action(id, Action::Accounts)),
                     Some(SideItem::Account(account)) => return Some(self.account_details(&account)),
                     Some(SideItem::AddAccount) => return Some(self.action(id, Action::AddAccount)),
                     Some(SideItem::Workspace(ws)) => {
-                        if self.ws_index(ws).is_some_and(|wi| self.workspaces[wi].close_error.is_some()) {
-                            return Some(self.ask_close_workspace(id, ws));
-                        }
-                        self.show_workspace(id, ws);
+                        let mut picker = self.workspace_picker(self.clients[&id].workspace);
+                        picker.select(|i| i.action.workspace() == Some(ws));
+                        let item = picker.current()?.clone();
+                        return Some(self.pick(id, &picker, item));
                     }
                     Some(SideItem::ReviewAccount(account)) => {
                         if let Some(existing) = self.accounts.by_id(&account).filter(|a| a.review) {
@@ -75,10 +88,18 @@ impl Server {
                     }
                     Some(SideItem::Pane(p)) => self.reveal(id, p),
                     Some(SideItem::Remote { server, pane }) => self.go_to_remote(id, &server, pane),
-                    Some(SideItem::Definition(path)) => match self.open_definition(&path) {
-                        Ok(ws) => self.show_workspace(id, ws),
-                        Err(e) => self.toast(id, format!("{e:#}")),
-                    },
+                    Some(SideItem::Definition(path)) => {
+                        let mut picker = self.workspace_picker(self.clients[&id].workspace);
+                        picker.select(
+                            |i| matches!(&i.action, crate::server::ui::PickAction::OpenDefinition(p) if p == &path),
+                        );
+                        let item = crate::server::ui::PickItem::new(
+                            "",
+                            "",
+                            crate::server::ui::PickAction::OpenDefinition(path),
+                        );
+                        return Some(self.pick(id, &picker, item));
+                    }
                     // A dev server or a tunnel: open it in the browser with ctrl, else copy its address.
                     Some(SideItem::Port(port)) | Some(SideItem::Tunnel(port)) => {
                         let addr = format!("localhost:{port}");
@@ -479,6 +500,82 @@ mod tests {
     use crate::account_status::Status;
     use crate::server::agents::ExistingCheck;
     use crate::server::ui::PickerKind;
+
+    #[test]
+    fn a_stale_sidebar_file_click_keeps_its_target_and_offers_retry() {
+        let (tx, _rx) = crate::server::queue::channel(32);
+        let mut server = crate::server::tests::server(tx);
+        let (client, _peer) = crate::server::tests::client(&mut server);
+        let current = server.clients[&client].workspace;
+        let path = std::path::PathBuf::from("/nonexistent/kraal-w6-file.kdl");
+        server.def_files.push((path.clone(), "missing".into()));
+        let row = (0..36).find(|&r| server.sidebar_hit(client, r) == Some(SideItem::Definition(path.clone()))).unwrap();
+        let click = MouseEvent { kind: MouseKind::Press(MouseButton::Left), col: 3, row, mods: Default::default() };
+        let Mode::Confirm(q) = server.on_mouse(client, click, false).unwrap() else { panic!() };
+        assert!(
+            matches!(q.action, crate::server::ui::ConfirmAction::OpenWorkspace(crate::server::ui::PickAction::OpenDefinition(p)) if p == path)
+        );
+        assert_eq!(server.clients[&client].workspace, current);
+        assert_eq!(server.workspaces.len(), 1);
+    }
+
+    #[test]
+    fn workspace_entries_and_actions_work_with_and_without_the_sidebar() {
+        for (cols, rows) in [(80, 24), (124, 36)] {
+            let (tx, _rx) = crate::server::queue::channel(32);
+            let mut server = crate::server::tests::server(tx);
+            let (client, _peer) = crate::server::tests::client(&mut server);
+            let c = server.clients.get_mut(&client).unwrap();
+            (c.cols, c.rows) = (cols, rows);
+            let current = server.clients[&client].workspace;
+            let other = server.new_workspace("other".into(), None);
+            let click =
+                |button, col, row| MouseEvent { kind: MouseKind::Press(button), col, row, mods: Default::default() };
+            let sidebar = server.sidebar_cols(&server.clients[&client]);
+            assert_eq!(sidebar == 0, cols == 80);
+            let col = if sidebar > 0 {
+                2
+            } else {
+                (0..cols).find(|&col| matches!(server.tab_bar_hit(client, col), Some(BarItem::Workspace))).unwrap()
+            };
+            let Mode::Picker(p) = server.on_mouse(client, click(MouseButton::Left, col, 0), false).unwrap() else {
+                panic!()
+            };
+            assert!(p.kind == PickerKind::Workspace);
+            for line in [0, 1] {
+                let p = server.workspace_picker(current);
+                let layout = crate::server::overlays::picker_layout(&p, server.client_screen(client));
+                let event = crate::input::InputEvent::Mouse(click(
+                    MouseButton::Left,
+                    layout.list.x + 2,
+                    layout.list.y + 2 + line,
+                ));
+                assert!(matches!(server.on_picker(client, p, event), Mode::Normal));
+                assert_eq!(server.clients[&client].workspace, other, "one click on an unselected row");
+                server.clients.get_mut(&client).unwrap().workspace = current;
+            }
+            if sidebar > 0 {
+                let row =
+                    (0..rows).find(|&r| server.sidebar_hit(client, r) == Some(SideItem::Workspace(other))).unwrap();
+                for (button, col) in [(MouseButton::Right, 3), (MouseButton::Left, sidebar - 3)] {
+                    let Mode::Picker(p) = server.on_mouse(client, click(button, col, row), false).unwrap() else {
+                        panic!()
+                    };
+                    assert!(p.actions.is_some());
+                    assert_eq!(p.current().unwrap().action.workspace(), Some(other));
+                    assert_eq!(server.clients[&client].workspace, current);
+                }
+                for i in 0..50 {
+                    server.new_workspace(format!("extra-{i}"), None);
+                }
+                let row = (0..rows).find(|&r| server.sidebar_hit(client, r) == Some(SideItem::AddWorkspace)).unwrap();
+                let Mode::Prompt(p) = server.on_mouse(client, click(MouseButton::Left, 3, row), false).unwrap() else {
+                    panic!()
+                };
+                assert_eq!(p.title, "Add workspace");
+            }
+        }
+    }
 
     #[test]
     fn sidebar_account_entry_points_retry_cached_unsigned_homes() {

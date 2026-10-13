@@ -36,7 +36,9 @@ impl Server {
     pub(super) fn persist(&mut self) {
         self.persist_dirty = false;
         self.last_persist = Instant::now();
-        if self.workspaces.is_empty() && self.unrestored.is_empty() {
+        // Nothing to save before a session exists. Once one was queued, an empty state may
+        // need to replace it, including a rollback of the first workspace's creation.
+        if self.workspaces.is_empty() && self.unrestored.is_empty() && self.persisted.is_none() {
             return;
         }
         // Turned off: nothing is saved, and what was goes once this state is written.

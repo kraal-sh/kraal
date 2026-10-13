@@ -24,6 +24,12 @@ impl Server {
     }
 
     pub(super) fn action(&mut self, id: ClientId, action: Action) -> Mode {
+        if action == Action::NewWorkspace {
+            return Mode::Prompt(self.add_workspace_form(id, None));
+        }
+        if action == Action::WorkspacePicker {
+            return Mode::Picker(self.workspace_picker(self.clients.get(&id).map_or(0, |c| c.workspace)));
+        }
         let Some((ws, wi)) = self.current_ws(id) else { return Mode::Normal };
         if self.workspaces[wi].kept.is_some()
             && !self.workspaces[wi].closed()
@@ -218,8 +224,7 @@ impl Server {
                 }
             }
             Action::RenameWorkspace => {
-                let name = self.workspaces[wi].name.clone();
-                return Mode::Prompt(Prompt::new("Rename workspace", &name, PromptAction::RenameWorkspace(ws)));
+                return self.rename_workspace_form(ws, None);
             }
             Action::NextWorkspace | Action::PrevWorkspace => {
                 let open: Vec<_> = self.workspaces.iter().filter(|w| !w.closed()).map(|w| w.id).collect();
@@ -229,7 +234,6 @@ impl Server {
                     self.show_workspace(id, next);
                 }
             }
-            Action::WorkspacePicker => return Mode::Picker(self.workspace_picker(ws)),
             Action::SshPicker => return Mode::Picker(self.ssh_picker()),
             Action::PanePicker => return Mode::Picker(self.pane_picker()),
             Action::Accounts => {
@@ -389,7 +393,7 @@ impl Server {
                 }
                 return Mode::Resize;
             }
-            Action::NewWorkspace => return Mode::Prompt(Prompt::new("New workspace", "", PromptAction::NewWorkspace)),
+            Action::NewWorkspace | Action::WorkspacePicker => unreachable!("handled before selecting a workspace"),
             Action::CloseWorkspace => return self.ask_close_workspace(id, ws),
             Action::Restart => return self.ask_restart(),
             Action::Quit => return self.ask_quit(),
@@ -416,7 +420,7 @@ impl Server {
         }
     }
 
-    pub(super) fn show_workspace(&mut self, id: ClientId, ws: u32) {
+    pub(in crate::server) fn show_workspace(&mut self, id: ClientId, ws: u32) {
         if let Err(e) = self.reopen_workspace(ws) {
             self.toast(id, format!("{e:#}"));
             return;
@@ -428,7 +432,7 @@ impl Server {
         self.mark_dirty();
     }
 
-    pub(super) fn current_ws(&self, id: ClientId) -> Option<(u32, usize)> {
+    pub(in crate::server) fn current_ws(&self, id: ClientId) -> Option<(u32, usize)> {
         let c = self.clients.get(&id)?;
         Some((c.workspace, self.ws_index(c.workspace)?))
     }

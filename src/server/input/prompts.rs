@@ -6,12 +6,14 @@ use crate::input::{InputEvent, KeyCode, MouseButton, MouseKind, encode_paste};
 use crate::pane::PaneSpec;
 use crate::paths;
 use crate::protocol::Placement;
-use crate::server::definitions::file_name;
 use crate::server::ui::{ConfirmAction, Mode, Prompt, PromptAction, Question};
 use crate::server::{ClientId, Server};
 
 impl Server {
     pub(super) fn on_prompt(&mut self, id: ClientId, mut p: Prompt, ev: InputEvent) -> Mode {
+        if p.workspace_form.is_some() {
+            return self.on_workspace_form(id, p, ev);
+        }
         let layout = crate::server::overlays::prompt_layout(&p, self.client_screen(id));
         p.scroll = p.scroll.min(layout.max_scroll);
         match ev {
@@ -62,6 +64,9 @@ impl Server {
 
     pub(super) fn submit_prompt(&mut self, id: ClientId, mut p: Prompt) -> Mode {
         p.scroll = 0;
+        if p.workspace_form.is_some() {
+            return self.submit_workspace_form(id, p);
+        }
         if matches!(p.action, PromptAction::RunbookValue) {
             return self.set_draft_value(id, p.value);
         }
@@ -77,9 +82,16 @@ impl Server {
         match self.commit_prompt(id, p) {
             Ok(()) => renamed.map_or(Mode::Normal, |a| Mode::Picker(self.accounts_picker(Some(&a)))),
             // Not accepted: the prompt stays, with the reason under it.
-            Err((action, why)) => {
-                Mode::Prompt(Prompt { title, value, cursor, action, error: Some(why), scroll: 0, masked })
-            }
+            Err((action, why)) => Mode::Prompt(Prompt {
+                title,
+                value,
+                cursor,
+                action,
+                error: Some(why),
+                scroll: 0,
+                masked,
+                workspace_form: None,
+            }),
         }
     }
 
@@ -111,37 +123,7 @@ impl Server {
                     pn.name = (!value.is_empty()).then_some(value);
                 }
             }
-            PromptAction::RenameWorkspace(ws) => {
-                if value.is_empty() {
-                    return Err((p.action, "Type a name.".into()));
-                }
-                if self.workspaces.iter().any(|w| w.name == value && w.id != ws) {
-                    return Err((p.action, format!("A workspace named \"{value}\" already exists.")));
-                }
-                let Some(wi) = self.ws_index(ws) else { return Ok(()) };
-                match self.rename_definition(wi, &value) {
-                    Ok(Some(old)) => self.toast(id, format!("renamed {} to {value}.kdl", file_name(&old))),
-                    Ok(None) => {}
-                    Err(e) => return Err((p.action, format!("{e:#}"))),
-                }
-                self.workspaces[wi].name = value;
-            }
-            PromptAction::NewWorkspace => {
-                if value.is_empty() {
-                    return Err((p.action, "Type a name.".into()));
-                }
-                if self.workspaces.iter().any(|w| w.name == value) {
-                    return Err((p.action, format!("A workspace named \"{value}\" already exists.")));
-                }
-                let ws = self.new_workspace(value, None);
-                match self.spawn_pane_in(ws, None, PaneSpec::default(), Placement::Tab, None) {
-                    Ok(_) => self.show_workspace(id, ws),
-                    Err(e) => {
-                        self.workspaces.retain(|w| w.id != ws);
-                        return Err((p.action, format!("Couldn't start the shell. No workspace was added.\n{e:#}")));
-                    }
-                }
-            }
+            PromptAction::RenameWorkspace(_) | PromptAction::NewWorkspace => unreachable!("answered in submit_prompt"),
             PromptAction::OpenPreview => {
                 if value.is_empty() {
                     return Err((p.action, "Type the path of a file or directory.".into()));
@@ -269,6 +251,18 @@ impl Server {
     }
 
     pub(super) fn on_confirm(&mut self, id: ClientId, mut q: Question, ev: InputEvent) -> Mode {
+        if matches!(q.action, ConfirmAction::OpenWorkspace(_)) {
+            return self.on_confirm_inner(id, q, ev);
+        }
+        let back = q.workspace_back.take().map(|s| *s);
+        let mode = self.on_confirm_inner(id, q, ev);
+        match back {
+            Some(state) => self.return_to_workspaces(id, mode, state),
+            None => mode,
+        }
+    }
+
+    fn on_confirm_inner(&mut self, id: ClientId, mut q: Question, ev: InputEvent) -> Mode {
         let layout = crate::server::overlays::confirm_layout(&q, self.client_screen(id));
         let yes = match ev {
             InputEvent::Key(k) => {
@@ -335,6 +329,17 @@ impl Server {
         }
         let action = q.action;
         match action {
+            ConfirmAction::OpenWorkspace(action) => {
+                let mut p = self.workspace_picker(self.clients[&id].workspace);
+                if let Some(state) = q.workspace_back {
+                    p.restore(*state);
+                }
+                return if yes {
+                    self.pick(id, &p, crate::server::ui::PickItem::new("", "", action))
+                } else {
+                    Mode::Picker(p)
+                };
+            }
             ConfirmAction::RemoveAccount(a) => {
                 if yes {
                     match crate::accounts::Accounts::update(|all| Ok(all.remove(&a.agent, &a.key()))) {
@@ -411,6 +416,7 @@ impl Server {
                 match action {
                     ConfirmAction::RemoveAccount(_)
                     | ConfirmAction::ReplaceWorkspaceFile { .. }
+                    | ConfirmAction::OpenWorkspace(_)
                     | ConfirmAction::UseExisting { .. }
                     | ConfirmAction::StopAndSwitch { .. }
                     | ConfirmAction::Production { .. }
@@ -625,7 +631,12 @@ mod tests {
             assert!(matches!(question.action, ConfirmAction::CloseWorkspace(w) if w == ws));
             assert!(!question.yes);
             assert!(server.panes[&pane].process_hold().unwrap().group_running());
-            assert!(matches!(server.on_confirm(client, question, key(KeyCode::Enter)), Mode::Normal));
+            let cancelled = server.on_confirm(client, question, key(KeyCode::Enter));
+            assert!(if matches!(entry, 1 | 2) {
+                matches!(cancelled, Mode::Picker(_))
+            } else {
+                matches!(cancelled, Mode::Normal)
+            });
             assert!(server.panes[&pane].process_hold().unwrap().group_running());
             server.close_pane(pane);
         }
@@ -659,7 +670,7 @@ mod tests {
         let (tx, _rx) = crate::server::queue::channel(32);
         let mut server = crate::server::tests::server(tx);
         let (client, _peer) = crate::server::tests::client(&mut server);
-        for (value, error) in [("  ", "Type a name."), (" test ", "already exists")] {
+        for (value, error) in [("  ", "Type a name."), (" test ", "already used")] {
             let p = Prompt::new("New workspace", value, PromptAction::NewWorkspace);
             let Mode::Prompt(p) = server.on_prompt(client, p, key(KeyCode::Enter)) else { panic!("keep input") };
             assert_eq!(p.value, value);
@@ -674,12 +685,9 @@ mod tests {
         let (tx, _rx) = crate::server::queue::channel(32);
         let mut server = crate::server::tests::server(tx);
         let (client, _peer) = crate::server::tests::client(&mut server);
-        for (cols, rows, action) in [
-            (80, 24, PromptAction::NewWorkspace),
-            (124, 36, PromptAction::NewWorkspace),
-            (80, 24, PromptAction::SaveWorkspace(1)),
-            (124, 36, PromptAction::SaveWorkspace(1)),
-        ] {
+        for (cols, rows, action) in
+            [(80, 24, PromptAction::SaveWorkspace(1)), (124, 36, PromptAction::SaveWorkspace(1))]
+        {
             let c = server.clients.get_mut(&client).unwrap();
             (c.cols, c.rows) = (cols, rows);
             let mut p = Prompt::new("Workspace", " café 日 ", action);

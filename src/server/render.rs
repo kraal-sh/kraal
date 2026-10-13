@@ -52,6 +52,8 @@ enum SideRow {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum SideItem {
+    Workspaces,
+    AddWorkspace,
     Workspace(u32),
     ReviewAccount(String),
     Accounts,
@@ -1220,7 +1222,7 @@ impl Server {
             AgentState::Unknown => 0,
         };
 
-        // Workspaces: open ones with their most urgent agent, then those defined but not running.
+        // Saved workspaces keep their place when opened or closed.
         let mut agents = Vec::new();
         for ws in &self.workspaces {
             let panes = ws.panes();
@@ -1247,8 +1249,8 @@ impl Server {
             agents.extend(states.into_iter().map(|(p, s)| (p, s, ws)));
         }
         for (path, n) in self.def_files.iter().filter(|(p, _)| matches!(self.definition_workspace(p), Ok(None))) {
-            let name = faint(n.clone(), t.dim);
-            let detail = faint("not running".into(), t.dim);
+            let name = strong(n.clone());
+            let detail = faint("Closed".into(), t.dim);
             entry(
                 &mut rows,
                 SideItem::Definition(path.clone()),
@@ -1258,6 +1260,15 @@ impl Server {
                 false,
             );
         }
+
+        // Reserve the add row even when the workspace list fills the sidebar.
+        let visible = height.saturating_sub(3) as usize / 2;
+        rows.truncate(1 + visible * 2);
+        rows.push(SideRow::Entry {
+            item: Some(SideItem::AddWorkspace),
+            line: Line::from(strong(" + Add workspace".into())),
+            selected: false,
+        });
 
         // Agents, with their state and what runs them; the workspace when it is not this one.
         // Then those of the servers watched, after their server's name.
@@ -1368,6 +1379,7 @@ impl Server {
         match self.sidebar_rows(c, height, crate::accounts::now()).into_iter().nth(row as usize)? {
             SideRow::Entry { item, .. } => item,
             SideRow::Section("ACCOUNTS") => Some(SideItem::Accounts),
+            SideRow::Section("WORKSPACES") => Some(SideItem::Workspaces),
             _ => None,
         }
     }
@@ -1405,13 +1417,23 @@ impl Server {
                     ]);
                     buf.set_line(area.x + 1, y, &title, width);
                 }
-                SideRow::Entry { line: text, selected, .. } => {
+                SideRow::Entry { item, line: text, selected } => {
                     if *selected {
                         for x in area.x + 1..area.right() - 1 {
                             buf[(x, y)].set_bg(th().selection);
                         }
                     }
-                    buf.set_line(area.x + 1, y, text, width);
+                    let actions = matches!(item, Some(SideItem::Workspace(_)))
+                        && text.spans.first().is_some_and(|s| s.content != "   ");
+                    buf.set_line(area.x + 1, y, text, width.saturating_sub(if actions { 3 } else { 0 }));
+                    if actions {
+                        buf.set_string(
+                            area.right() - 4,
+                            y,
+                            if th().ascii { "..." } else { " ⋮ " },
+                            Style::default().fg(th().accent),
+                        );
+                    }
                 }
                 SideRow::Blank => {}
             }
