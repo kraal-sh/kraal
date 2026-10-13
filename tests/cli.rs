@@ -240,6 +240,139 @@ fn raw_frame(w: &mut impl std::io::Write, kind: u8, payload: &[u8]) {
     w.write_all(&frame).unwrap();
 }
 
+/// A client attached in a terminal the test holds (a pty): what the client writes to it is kept
+/// byte for byte, and the terminal's line mode can be looked at.
+#[cfg(target_os = "linux")]
+struct TerminalClient {
+    master: Box<dyn portable_pty::MasterPty + Send>,
+    keys: Box<dyn std::io::Write + Send>,
+    child: Box<dyn portable_pty::Child + Send + Sync>,
+    written: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+    reader: std::thread::JoinHandle<()>,
+}
+
+#[cfg(target_os = "linux")]
+impl TerminalClient {
+    /// Attach to `env`'s session, and wait until it is drawn.
+    fn attach(env: &Env) -> TerminalClient {
+        let size = portable_pty::PtySize { rows: 30, cols: 100, pixel_width: 0, pixel_height: 0 };
+        let pair = portable_pty::native_pty_system().openpty(size).unwrap();
+        let attach = env.cmd(&["attach"]);
+        let mut cmd = portable_pty::CommandBuilder::new(attach.get_program());
+        cmd.args(attach.get_args());
+        for (k, v) in attach.get_envs() {
+            match v {
+                Some(v) => cmd.env(k, v),
+                None => cmd.env_remove(k),
+            }
+        }
+        let child = pair.slave.spawn_command(cmd).unwrap();
+        drop(pair.slave);
+        let written = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (mut from_client, kept) = (pair.master.try_clone_reader().unwrap(), written.clone());
+        // Until the client has gone: the terminal then has no other end.
+        let reader = std::thread::spawn(move || {
+            use std::io::Read;
+            let mut buf = [0u8; 64 * 1024];
+            while let Ok(n @ 1..) = from_client.read(&mut buf) {
+                kept.lock().unwrap().extend_from_slice(&buf[..n]);
+            }
+        });
+        let client =
+            TerminalClient { keys: pair.master.take_writer().unwrap(), master: pair.master, child, written, reader };
+        client.wait_for_frames(1);
+        client
+    }
+
+    /// Wait until the client has written `frames` frames to its terminal (each ends a
+    /// synchronized update).
+    fn wait_for_frames(&self, frames: usize) {
+        let start = Instant::now();
+        loop {
+            let written = self.written.lock().unwrap().clone();
+            if written.windows(8).filter(|w| *w == b"\x1b[?2026l").count() >= frames {
+                return;
+            }
+            let shown = String::from_utf8_lossy(&written).replace('\x1b', "^[");
+            assert!(start.elapsed() < Duration::from_secs(10), "{frames} frame(s) never written: {shown}");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// Wait until the client has written `text` to its terminal.
+    fn wait_for(&self, text: &str) {
+        let start = Instant::now();
+        loop {
+            let written = String::from_utf8_lossy(&self.written.lock().unwrap()).into_owned();
+            if written.contains(text) {
+                return;
+            }
+            assert!(start.elapsed() < Duration::from_secs(10), "{text:?} never written: {written:?}");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn type_keys(&mut self, keys: &[u8]) {
+        self.keys.write_all(keys).unwrap();
+        self.keys.flush().unwrap();
+    }
+
+    fn signal(&self, signal: libc::c_int) {
+        // SAFETY: plain syscall to the client this test started (ended already, it is still ours
+        // to wait for).
+        unsafe { libc::kill(self.child.process_id().unwrap() as libc::pid_t, signal) };
+    }
+
+    /// Whether the terminal is in line mode, as a shell has it.
+    fn line_mode(&self) -> bool {
+        // SAFETY: tcgetattr fills the zeroed struct, for a descriptor the test holds.
+        let mode = unsafe {
+            let mut mode: libc::termios = std::mem::zeroed();
+            assert_eq!(libc::tcgetattr(self.master.as_raw_fd().unwrap(), &mut mode), 0);
+            mode
+        };
+        mode.c_lflag & (libc::ICANON | libc::ECHO) == libc::ICANON | libc::ECHO
+    }
+
+    /// Wait for the client to end, and check that it gave its terminal back, `what` saying how
+    /// it left: its exit status, and what it said once the terminal was the shell's again.
+    ///
+    /// Given back means: line mode; the keyboard stack popped as often as the client pushed it;
+    /// the alternate screen left once; in order (the keyboard, the mouse, the screen, the
+    /// cursor); and nothing but plain text after that.
+    fn left(mut self, what: &str) -> (u32, String) {
+        let start = Instant::now();
+        let status = loop {
+            if let Some(status) = self.child.try_wait().unwrap() {
+                break status;
+            }
+            assert!(start.elapsed() < Duration::from_secs(15), "{what}: the client is still there");
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        assert!(self.line_mode(), "{what}: the terminal is not in line mode");
+        // The terminal has no other end once the client has gone: all it wrote is read. Only
+        // then may the test's own end go, which says so in the terminal (a new line it echoes).
+        while !self.reader.is_finished() {
+            assert!(start.elapsed() < Duration::from_secs(15), "{what}: the terminal is still held");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let written = self.written.lock().unwrap().clone();
+        let shown = String::from_utf8_lossy(&written).replace('\x1b', "^[");
+        let count = |sequence: &str| written.windows(sequence.len()).filter(|w| *w == sequence.as_bytes()).count();
+        let last = |sequence: &str| {
+            let at = written.windows(sequence.len()).rposition(|w| w == sequence.as_bytes());
+            at.unwrap_or_else(|| panic!("{what}: {sequence:?} never written: {shown}"))
+        };
+        let (pushed, popped, screens) = (count("\x1b[>5u"), count("\x1b[<u"), count("\x1b[?1049l"));
+        assert_eq!((popped, screens), (pushed, 1), "{what}: pushed {pushed}, popped {popped}: {shown}");
+        let order = [last("\x1b[<u"), last("\x1b[?1000l"), last("\x1b[?1049l"), last("\x1b[?25h")];
+        assert!(order.is_sorted(), "{what}: given back out of order {order:?}: {shown}");
+        let said = String::from_utf8_lossy(&written[order[3] + "\x1b[?25h".len()..]).into_owned();
+        assert!(!said.contains('\x1b'), "{what}: written after the terminal was given back: {shown}");
+        (status.exit_code(), said)
+    }
+}
+
 /// Wait until the pane named `name` is seen as production.
 fn wait_production(env: &Env, name: &str) {
     let start = Instant::now();
@@ -6869,6 +7002,104 @@ fn the_menu_restarts_the_session_after_asking() {
         std::thread::sleep(Duration::from_millis(50));
     }
     env.wait_for_text_since_restore("job", "restored session");
+}
+
+/// However a client leaves, it gives its terminal back once, and in order: detach, a signal
+/// (also while frames are on their way), the server dying, quit.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_client_gives_its_terminal_back_once_however_it_leaves() {
+    let env = Env::new("giveback");
+    env.workspace("w", "layout {\n    pane name=\"shell\"\n}\n");
+    env.run(&["open", "w"]);
+    let mut client = TerminalClient::attach(&env);
+    assert!(!client.line_mode(), "raw mode while attached");
+    client.type_keys(b"\x02d");
+    assert_eq!(client.left("detach"), (0, "[kraal: detached]\r\n".to_string()));
+
+    for (signal, name) in [(libc::SIGTERM, "SIGTERM"), (libc::SIGHUP, "SIGHUP"), (libc::SIGINT, "SIGINT")] {
+        let client = TerminalClient::attach(&env);
+        client.signal(signal);
+        assert_eq!(client.left(name), (128 + signal as u32, String::new()));
+    }
+
+    // A frame on its way when the signal comes is written whole, and none follows.
+    env.run(&["send", "-p", "shell", "--enter", "seq 1 100000000"]);
+    let client = TerminalClient::attach(&env);
+    client.wait_for_frames(20);
+    client.signal(libc::SIGTERM);
+    assert_eq!(client.left("SIGTERM while a pane prints"), (128 + libc::SIGTERM as u32, String::new()));
+    env.run(&["keys", "-p", "shell", "ctrl+c"]);
+
+    let client = TerminalClient::attach(&env);
+    let server = env.server_pid().expect("the server runs");
+    // SAFETY: plain syscall to the server this test started.
+    unsafe { libc::kill(server, libc::SIGKILL) };
+    let (status, said) = client.left("the server dies");
+    assert!(status == 0 && said.starts_with("[kraal: the server went away"), "{status} {said:?}");
+    wait_gone(&PathBuf::from(format!("/proc/{server}")));
+
+    env.run(&["open", "w"]);
+    let mut client = TerminalClient::attach(&env);
+    client.type_keys(b"\x02q");
+    client.wait_for("Quit kraal?");
+    client.type_keys(b"y");
+    let (status, said) = client.left("quit");
+    assert!(status == 0 && said.starts_with("[kraal: stopped; kraal -s giveback starts it again"), "{status} {said:?}");
+}
+
+/// The server stops for a restart and none comes back: the client turned its input modes off
+/// for the wait, and giving the wait up (ctrl+c, or a signal) does not turn them off again.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_restart_wait_given_up_gives_the_terminal_back_once() {
+    for by_signal in [false, true] {
+        let env = Env::new(if by_signal { "waitsignal" } else { "waitkey" });
+        env.workspace("w", "layout {\n    pane name=\"shell\"\n}\n");
+        env.run(&["open", "w"]);
+        let mut client = TerminalClient::attach(&env);
+        let socket = env.root.join("run/kraal").join(format!("{}.sock", env.session));
+        let mut asking = std::os::unix::net::UnixStream::connect(socket).unwrap();
+        raw_frame(&mut asking, 0, br#"{"type":"request","version":2,"request":{"cmd":"kill_server","restart":true}}"#);
+        client.wait_for("kraal: the session restarts");
+        if by_signal {
+            client.signal(libc::SIGINT);
+            assert_eq!(client.left("SIGINT during the wait"), (128 + libc::SIGINT as u32, String::new()));
+        } else {
+            client.type_keys(b"\x03");
+            let said = "[kraal: gave up waiting for the session to restart]\r\n";
+            assert_eq!(client.left("ctrl+c during the wait"), (0, said.to_string()));
+        }
+    }
+}
+
+/// A signal that comes while the client is leaving anyway finds the terminal given back, or
+/// gives it back itself: never both.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_signal_that_meets_a_normal_exit_gives_the_terminal_back_once() {
+    let env = Env::new("exitsignal");
+    env.workspace("w", "layout {\n    pane name=\"shell\"\n}\n");
+    env.run(&["open", "w"]);
+    // The client leaves some 0.2 ms after the keys: the signal is sent all around that.
+    for delay in (0..500).step_by(20).map(Duration::from_micros) {
+        let mut client = TerminalClient::attach(&env);
+        client.type_keys(b"\x02d");
+        let typed = Instant::now();
+        while typed.elapsed() < delay {
+            std::hint::spin_loop();
+        }
+        client.signal(libc::SIGTERM);
+        let (status, said) = client.left(&format!("SIGTERM {delay:?} after a detach"));
+        // Keys the signal overtook are still in the terminal, which shows them as a shell's
+        // would; a goodbye is whole, or unsaid.
+        let said_by_signal = ["", "^Bd", "[kraal: detached]\r\n"];
+        let as_expected = match status {
+            0 => said == "[kraal: detached]\r\n",
+            status => status == 128 + libc::SIGTERM as u32 && said_by_signal.contains(&said.as_str()),
+        };
+        assert!(as_expected, "{delay:?}: {status} {said:?}");
+    }
 }
 
 /// `ctrl+b q` asks first, Cancel selected, saying what stops (a short question when nothing
