@@ -727,10 +727,22 @@ mod tests {
         let argv = argv(me).expect("own command line");
         assert!(!argv.is_empty());
         assert_eq!(cwd(me).unwrap(), std::env::current_dir().unwrap().canonicalize().unwrap());
-        // The environment as the process started (other tests change PATH while running).
-        if let Ok(home) = std::env::var("HOME") {
-            assert_eq!(environ(me, &["HOME"]).get("HOME"), Some(&home));
-        }
+        // The environment a program started with (the tests have changed their own since). The
+        // system shows it once the program is loaded, a moment after it is started.
+        let mut child =
+            std::process::Command::new("sleep").arg("60").env("KRAAL_SEEN", "at the start").spawn().unwrap();
+        let start = std::time::Instant::now();
+        let seen = loop {
+            let seen = environ(child.id(), &["KRAAL_SEEN", "KRAAL_NOT_THERE"]);
+            if !seen.is_empty() || start.elapsed() > crate::testing::PATIENCE {
+                break seen;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert_eq!(seen.get("KRAAL_SEEN").map(String::as_str), Some("at the start"));
+        assert_eq!(seen.len(), 1);
         let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let port = listener.local_addr().unwrap().port();
         // macOS answers from a cache that `lsof` fills in the background.

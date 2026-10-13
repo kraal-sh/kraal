@@ -677,6 +677,38 @@ pub fn shorten_home(path: &Path) -> String {
     path.display().to_string()
 }
 
+/// What this kraal would use of the developer's while a test runs it, if anything. Debug builds
+/// only: the tests run kraal in directories of their own and name in `KRAAL_TEST_KEEP_OUT`, as
+/// `PATH` names its directories, the developer's home and where their sessions are. A test that
+/// lets one through (as a home, a directory of kraal's, an agent's home, a directory of `PATH`)
+/// fails on this, where it would have read their accounts, run their agents or reached their
+/// session.
+#[cfg(debug_assertions)]
+pub fn of_the_developer() -> Option<String> {
+    let keep_out = std::env::var_os("KRAAL_TEST_KEEP_OUT")?;
+    let followed = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    let own = [
+        ("HOME", dirs::home_dir()),
+        ("the configuration directory", Some(config_dir())),
+        ("the state directory", Some(state_dir())),
+        ("the data directory", Some(data_home())),
+        ("the runtime directory", Some(runtime_dir())),
+    ];
+    let agents = crate::accounts::AGENTS.iter().map(|a| (a.home_env, std::env::var_os(a.home_env).map(PathBuf::from)));
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let used: Vec<(&str, PathBuf)> = own
+        .into_iter()
+        .chain(agents)
+        .filter_map(|(what, dir)| Some((what, dir?)))
+        .chain(std::env::split_paths(&path).map(|dir| ("PATH", dir)))
+        .collect();
+    std::env::split_paths(&keep_out).find_map(|theirs| {
+        let inside = |dir: &Path| dir.starts_with(&theirs) || followed(dir).starts_with(followed(&theirs));
+        let (what, dir) = used.iter().find(|(_, dir)| inside(dir))?;
+        Some(format!("{what} ({}) is the developer's: the tests stay out of {}", dir.display(), theirs.display()))
+    })
+}
+
 /// Session names end up in file names; keep them tame and reasonably short.
 pub fn valid_session_name(name: &str) -> bool {
     !name.is_empty()

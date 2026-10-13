@@ -22,6 +22,11 @@ use crate::protocol::{Placement, Request, Response};
 use crate::{client, config, hints, integration, paths, server, servers, theme, tools, workspace};
 
 pub fn main() {
+    #[cfg(debug_assertions)]
+    if let Some(theirs) = paths::of_the_developer() {
+        eprintln!("kraal: run by a test, {theirs}");
+        std::process::exit(1);
+    }
     let cli = Cli::parse();
     // Plain CLI commands should die quietly when piped into `head`; the server and the attached
     // client handle broken sockets themselves.

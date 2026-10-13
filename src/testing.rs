@@ -1,5 +1,9 @@
 //! Helpers shared by unit tests.
 
+/// Where the tests run: the end-to-end tests have the same.
+#[path = "../tests/common/isolation.rs"]
+pub mod isolation;
+
 use std::io::Write;
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -64,4 +68,43 @@ pub fn waited_for_a_processor(tid: libc::pid_t) -> std::time::Duration {
     let counted = std::fs::read_to_string(format!("/proc/self/task/{tid}/schedstat")).unwrap_or_default();
     let waited = counted.split_whitespace().nth(1).and_then(|ns| ns.parse().ok());
     std::time::Duration::from_nanos(waited.unwrap_or(0))
+}
+
+mod tests {
+    use super::{isolation, write_script};
+
+    /// The unit tests run where nothing is the developer's, and kraal finds its directories
+    /// there.
+    #[test]
+    fn the_tests_are_out_of_what_is_the_developers() {
+        isolation::check();
+        assert_eq!(crate::paths::of_the_developer(), None);
+        assert!(std::env::var_os(isolation::KEEP_OUT).is_some(), "a kraal the tests start is told nothing");
+    }
+
+    /// The tests' `PATH` has no directory of the developer's home, even reached by a link, and
+    /// none of their own programs: what else a directory with one holds is still found.
+    #[test]
+    fn the_tests_path_has_nothing_of_the_developers() {
+        let root = std::env::temp_dir().join(format!("kraal-tests-path-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let (home, system, plain) = (root.join("home"), root.join("system"), root.join("plain"));
+        for dir in [&home.join("bin"), &system, &plain] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        for program in [home.join("bin/claude"), system.join("codex"), system.join("git"), plain.join("sh")] {
+            write_script(&program, "#!/bin/sh\n");
+        }
+        std::os::unix::fs::symlink(home.join("bin"), root.join("link")).unwrap();
+        let theirs =
+            [home.join("bin"), system.clone(), "relative".into(), root.join("link"), plain.clone(), system.clone()];
+        let links = root.join("links");
+        let path = isolation::path(&std::env::join_paths(theirs).unwrap(), Some(&home), &links);
+        let dirs: Vec<_> = std::env::split_paths(&path).collect();
+        assert_eq!(dirs, [links.join("0"), plain]);
+        assert_eq!(std::fs::read_link(links.join("0/git")).unwrap(), system.join("git"));
+        let linked: Vec<_> = std::fs::read_dir(links.join("0")).unwrap().map(|e| e.unwrap().file_name()).collect();
+        assert_eq!(linked, ["git"]);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
 }

@@ -1,5 +1,7 @@
 //! What the end-to-end tests share: a kraal session in directories of its own, and helpers.
 
+pub mod isolation;
+
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::time::{Duration, Instant};
@@ -12,11 +14,12 @@ pub struct Env {
 
 impl Env {
     pub fn new(name: &str) -> Env {
+        isolation::check();
         // Under /tmp: macOS's temporary directory is too long for the sockets kraal makes there,
         // and kraal would fall back to a directory every test shares.
         let root = PathBuf::from("/tmp").join(format!("kraal-e2e-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
-        for d in ["run", "state", "config/kraal/workspaces"] {
+        for d in ["home", "run", "state", "config/kraal/workspaces"] {
             std::fs::create_dir_all(root.join(d)).unwrap();
         }
         // A quiet, predictable shell.
@@ -36,16 +39,14 @@ impl Env {
         c
     }
 
-    /// `program` in this test's directories, out of any kraal session.
+    /// `program` in this test's directories: a home and a session of its own, where the other
+    /// tests have theirs ([`isolation`] keeps them all out of the developer's).
     pub fn isolated(&self, program: &Path) -> Command {
         let mut c = Command::new(program);
-        c.env("XDG_RUNTIME_DIR", self.root.join("run"))
+        c.env("HOME", self.root.join("home"))
+            .env("XDG_RUNTIME_DIR", self.root.join("run"))
             .env("XDG_STATE_HOME", self.root.join("state"))
-            .env("XDG_CONFIG_HOME", self.root.join("config"))
-            .env_remove("KRAAL_PANE")
-            .env_remove("KRAAL_SOCKET")
-            .env_remove("KRAAL_SESSION")
-            .env_remove("KRAAL_SESSION_NAME");
+            .env("XDG_CONFIG_HOME", self.root.join("config"));
         c
     }
 

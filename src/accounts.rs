@@ -21,7 +21,7 @@ pub struct AgentKind {
     /// The program that runs it.
     pub command: &'static str,
     /// Environment variable selecting the config home.
-    home_env: &'static str,
+    pub home_env: &'static str,
     /// The home the agent uses when that variable is unset: the account the user had before
     /// kraal, which needs no variable.
     default_home: &'static str,
