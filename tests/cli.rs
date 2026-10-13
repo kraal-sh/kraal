@@ -1362,6 +1362,7 @@ fn kill_says_when_the_layout_was_not_saved() {
 #[test]
 fn a_session_never_has_two_servers() {
     let env = Env::new("oneserver");
+    let _evidence = Evidence(&env);
     env.workspace("w", "layout {\n    pane name=\"one\"\n}\n");
     env.run(&["open", "w"]);
     let first = env.server_pid().expect("the server runs");
@@ -1382,6 +1383,7 @@ fn a_session_never_has_two_servers() {
 #[test]
 fn forget_leaves_a_running_session_alone() {
     let env = Env::new("forgetheld");
+    let _evidence = Evidence(&env);
     env.workspace("w", "layout {\n    pane name=\"one\"\n}\n");
     env.run(&["open", "w"]);
     wait_until(Duration::from_secs(10), "the layout was never saved", || env.state_file().exists());
@@ -1478,6 +1480,18 @@ fn within(env: &Env, command: &mut Command, what: &str) -> Output {
     Output { status, stdout, stderr }
 }
 
+/// Says what is known of `env`'s session ([`evidence`]) when the test that has it fails,
+/// whatever fails in it: an assertion, a command that did not end, a thread of its own.
+struct Evidence<'a>(&'a Env);
+
+impl Drop for Evidence<'_> {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            eprintln!("{}", evidence(self.0));
+        }
+    }
+}
+
 /// What is known of `env`'s session when a command did not do what a test expects: what its
 /// servers logged, and what is where it saves and in its two runtime directories (sockets, their
 /// second names, lock files).
@@ -1536,6 +1550,7 @@ fn a_session_running_under_another_runtime_directory_is_refused_and_said() {
     for first in [false, true] {
         let env = Env::new(if first { "onestate-b" } else { "onestate-a" });
         let _other = StopsOther(&env);
+        let _evidence = Evidence(&env);
         env.workspace("w", "layout {\n    pane name=\"one\"\n}\n");
         let (here, there) = (first, !first);
         let run = |other: bool| if other { "run2" } else { "run" };
@@ -1576,6 +1591,7 @@ fn a_session_running_under_another_runtime_directory_is_refused_and_said() {
 fn a_session_started_at_once_from_two_runtime_directories_has_one_server() {
     let env = Env::new("atonce");
     let _other = StopsOther(&env);
+    let _evidence = Evidence(&env);
     env.workspace("w", "layout {\n    pane name=\"one\"\n}\n");
     for round in 0..3 {
         let together = std::sync::Barrier::new(2);
@@ -1613,6 +1629,7 @@ fn a_session_started_at_once_from_two_runtime_directories_has_one_server() {
 fn a_killed_server_leaves_nothing_that_blocks_the_next_start() {
     let env = Env::new("killedheld");
     let _other = StopsOther(&env);
+    let _evidence = Evidence(&env);
     env.workspace("w", "layout {\n    pane name=\"one\"\n}\n");
     for next in [false, true] {
         in_environment(&env, false, &["open", "w"]);
@@ -1639,6 +1656,7 @@ fn a_killed_server_leaves_nothing_that_blocks_the_next_start() {
 #[test]
 fn a_state_directory_that_cannot_hold_a_session_starts_none_and_forgets_none() {
     let env = Env::new("nostate");
+    let _evidence = Evidence(&env);
     env.workspace("w", "layout {\n    pane name=\"one\"\n}\n");
     env.run(&["open", "w"]);
     wait_until(PATIENCE, "the layout was never saved", || env.state_file().exists());
@@ -1665,6 +1683,7 @@ fn a_state_directory_that_cannot_hold_a_session_starts_none_and_forgets_none() {
 #[test]
 fn a_runtime_directory_kraal_cannot_use_is_said() {
     let env = Env::new("xdgno");
+    let _evidence = Evidence(&env);
     env.workspace("w", "layout {\n    pane name=\"one\"\n}\n");
     std::fs::create_dir_all(env.root.join("state/kraal")).unwrap();
     std::fs::write(env.root.join("state/kraal/welcomed"), "").unwrap();
@@ -1712,6 +1731,7 @@ fn a_runtime_directory_kraal_cannot_use_is_said() {
 #[test]
 fn a_start_waits_for_the_kraal_that_has_the_session() {
     let env = Env::new("heldstart");
+    let _evidence = Evidence(&env);
     env.workspace("w", "layout {\n    pane name=\"one\"\n}\n");
     let elsewhere = "{\"pid\":4242,\"host\":\"another-machine.invalid\",\"runtime\":\"/run/user/1/kraal\"}\n";
     let held_for = Duration::from_secs(1);
@@ -1761,6 +1781,7 @@ fn a_start_waits_for_the_kraal_that_has_the_session() {
 #[test]
 fn a_state_and_a_runtime_directory_that_are_one_hold_a_session() {
     let env = Env::new("onedir");
+    let _evidence = Evidence(&env);
     env.workspace("w", "layout {\n    pane name=\"one\"\n}\n");
     let (both, alias) = (env.root.join("both"), env.root.join("alias"));
     std::fs::create_dir_all(&both).unwrap();
@@ -1793,6 +1814,7 @@ fn a_state_and_a_runtime_directory_that_are_one_hold_a_session() {
 #[test]
 fn a_session_started_many_times_at_once_starts_once_and_for_all() {
     let env = Env::new("startrace");
+    let _evidence = Evidence(&env);
     env.workspace("w", "layout {\n    pane name=\"one\"\n}\n");
     for round in 0..10 {
         let together = std::sync::Barrier::new(8);
@@ -1833,6 +1855,7 @@ fn a_server_keeps_nothing_its_starter_was_given() {
     use std::os::fd::AsRawFd;
     use std::os::unix::process::CommandExt;
     let env = Env::new("nofds");
+    let _evidence = Evidence(&env);
     env.workspace("w", "layout {\n    pane name=\"one\"\n}\n");
     let (mut read, given) = std::io::pipe().unwrap();
     let fd = given.as_raw_fd();
@@ -1865,6 +1888,7 @@ fn a_server_keeps_nothing_its_starter_was_given() {
 #[test]
 fn a_session_leaves_no_lock_file_where_it_saves() {
     let env = Env::new("nolock");
+    let _evidence = Evidence(&env);
     env.workspace("w", "layout {\n    pane name=\"one\"\n}\n");
     env.run(&["open", "w"]);
     assert!(lock_file(&env, "state").exists() && lock_file(&env, "run").exists(), "a server holds its session");
@@ -1900,6 +1924,7 @@ fn a_session_leaves_no_lock_file_where_it_saves() {
 fn a_session_started_stopped_and_forgotten_at_once_is_held_by_one_at_a_time() {
     use std::process::Stdio;
     let env = Env::new("lockrace");
+    let _evidence = Evidence(&env);
     env.workspace("w", "layout {\n    pane name=\"one\"\n}\n");
     // Each server with the file it says in: no pipe, which a server started at the same moment
     // would keep open for as long as it runs.

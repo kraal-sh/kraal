@@ -15,12 +15,19 @@ use crate::{paths, process};
 /// How long a session may take to have a server that listens, from the moment one is asked for.
 const START_LIMIT: Duration = Duration::from_secs(5);
 
+/// How long a server just started is given to say that it listens, or to end because another
+/// kraal has the session, when less than that is left of [`START_LIMIT`]: starting a kraal takes
+/// a moment, a long one on a busy machine, and one started just before the limit would
+/// otherwise be given up on before it could tell why there is no server.
+const WORD_LIMIT: Duration = Duration::from_secs(2);
+
 /// Make sure a server runs for `session`, starting one in the background if needed: where it
 /// listens. When another kraal has the session (a server started at the same moment, which
 /// listens in a moment; one that is going; `kraal forget`), its socket is waited for here, and a
-/// server asked for again once nobody has the session, [`START_LIMIT`] at most in all. A session
-/// still held then, with no server that answers here, is not started: its files would be
-/// written twice. The error says who has it, where its holder says so.
+/// server asked for again once nobody has the session, for [`START_LIMIT`] in all (the last
+/// server started is heard out: [`WORD_LIMIT`]). A session still held then, with no server that
+/// answers here, is not started: its files would be written twice. The error says who has it,
+/// where its holder says so.
 pub fn ensure_server(session: &str) -> Result<PathBuf> {
     paths::private_runtime_dir().context("checking the runtime directory")?;
     let socket = paths::socket_path(session);
@@ -35,28 +42,37 @@ pub fn ensure_server(session: &str) -> Result<PathBuf> {
     let log = paths::log_path(session);
     let deadline = Instant::now() + START_LIMIT;
     let mut pause = Duration::from_millis(20);
+    // Whether a server started here ended because another kraal has the session.
+    let mut held = false;
     loop {
         let logged = std::fs::metadata(&log).map_or(0, |m| m.len());
         let (mut child, ready) = start_server(session, &log)?;
-        if wait_ready(&ready, deadline.saturating_duration_since(Instant::now())) {
+        let heard_by = deadline.max(Instant::now() + WORD_LIMIT);
+        if wait_ready(&ready, heard_by.saturating_duration_since(Instant::now())) {
             return Ok(socket);
         }
         // It closed the pipe without a word: it failed, or another kraal has the session.
         let status = loop {
             if let Ok(Some(status)) = child.try_wait() {
-                break status;
+                break Some(status);
             }
             if listens() {
                 return Ok(socket);
             }
-            if Instant::now() >= deadline {
-                bail!("the server did not start in time; see {}", log.display());
+            if Instant::now() >= heard_by {
+                break None;
             }
             std::thread::sleep(Duration::from_millis(20));
         };
-        if status.code() != Some(crate::server::HELD_STATUS) {
-            let why = last_logged(&log, logged).map(|line| format!(": {line}")).unwrap_or_default();
-            bail!("the server exited ({status}){why}; see {}", log.display());
+        match status {
+            Some(status) if status.code() == Some(crate::server::HELD_STATUS) => held = true,
+            Some(status) => {
+                let why = last_logged(&log, logged).map(|line| format!(": {line}")).unwrap_or_default();
+                bail!("the server exited ({status}){why}; see {}", log.display());
+            }
+            // This one has not said, and those before it found the session held.
+            None if held => bail!(held_without_a_server(session, &socket, &log)),
+            None => bail!("the server did not start in time; see {}", log.display()),
         }
         // Its server is looked for until the next try, each a little later than the last: many
         // kraal started at once must not keep the one that has the session from listening.
