@@ -8428,7 +8428,9 @@ fn a_verified_login_that_cannot_save_can_finish_without_logging_in_again() {
     std::fs::rename(&backup, &file).unwrap();
     client.send(b"c");
     client.wait_for_row("claude·work is signed in");
+    assert!(login_panes(&env).is_empty(), "a saved login must be closed");
     assert_eq!(std::fs::read_to_string(home.join("logins")).unwrap(), "login\n");
+    assert_eq!(std::fs::read_to_string(home.join("checks")).unwrap(), "check\nchecked\ncheck\nchecked\n");
     assert!(!std::fs::read_to_string(file).unwrap().contains("sign_in_required"));
 }
 
@@ -10286,6 +10288,9 @@ fn a_quit_that_cannot_save_the_session_leaves_it_running() {
     client.wait_for_row("Quit kraal?");
     client.send(b"y");
     client.wait_for_rows("the question gone", |rows| !rows.iter().any(|r| r.contains("Quit kraal?")));
+    client.wait_for_rows("the Quit failure on the notice line", |rows| {
+        rows[0].contains("not quitting: the layout could not be saved")
+    });
     client.send(b"\x02Vj");
     client.wait_for_row("not quitting: the layout could not be saved");
     std::fs::set_permissions(&sessions, std::fs::Permissions::from_mode(0o700)).unwrap();

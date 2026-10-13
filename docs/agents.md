@@ -344,6 +344,11 @@ and `r` is the separate **Try again** action. While a check runs, Enter also clo
 its late result is ignored. `c`, **Check again**, retries an unsuccessful check without running
 the login again. A check waits at most ten seconds and discards the agent's output.
 
+If sign-in is verified but the account cannot be saved, the pane stays open with
+**signed in, could not save account**. Fix the file error, then press `c` to check and save
+again without another login. Background warnings cannot replace the sign-in confirmation
+while it is displayed; their details remain in **Messages** (`ctrl+b V j`).
+
 A lock in the account directory also prevents another kraal session or `kraal accounts login`
 from starting the same login while it is running or being checked.
 

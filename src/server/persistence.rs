@@ -253,13 +253,12 @@ impl Server {
     }
 
     /// Quit: the server stops once the session is saved, as for `kraal kill`, and its clients
-    /// end. A session that cannot be saved keeps running and says why, first among the warnings:
-    /// those of the failed save, which come after, say the same, and must not hide the answer to
-    /// the key just pressed.
-    pub(super) fn quit(&mut self) {
+    /// end. A session that cannot be saved keeps running and tells the client why, replacing
+    /// its previous message. The failed save's warnings must not hide the answer to Quit.
+    pub(super) fn quit(&mut self, client: ClientId) {
         match self.save_now() {
             Ok(()) => self.quitting = true,
-            Err(e) => self.warnings.insert(0, format!("not quitting: {e}")),
+            Err(e) => self.toast(client, format!("not quitting: {e}")),
         }
     }
 
@@ -501,6 +500,44 @@ pub(super) mod tests {
         }
         server.workspaces[0].definition_source = Some("// original source".into());
         ws
+    }
+
+    #[test]
+    fn a_failed_quit_replaces_an_active_copy_toast_on_the_notice_line() {
+        for (cols, rows) in [(80, 24), (124, 36)] {
+            let (tx, _rx) = crate::server::queue::channel(16);
+            let mut server = crate::server::tests::server(tx);
+            let (client, _peer) = crate::server::tests::client(&mut server);
+            let c = server.clients.get_mut(&client).unwrap();
+            c.cols = cols;
+            c.rows = rows;
+            let error = "the layout could not be saved: Disk full";
+            let saved = writer(&mut server, vec![Err(error.into()), Ok(())]);
+            server.copy_to_client(client, "text");
+            server.client_input(client, b"\x02q");
+            assert!(matches!(server.clients[&client].mode, Mode::Confirm(_)));
+            let (text, until) = server.clients[&client].toast.as_ref().unwrap();
+            assert_eq!(text, "copied 4 characters");
+            assert!(*until > Instant::now());
+            server.client_input(client, b"y");
+            assert!(!server.quitting);
+            assert!(matches!(server.clients[&client].mode, Mode::Normal));
+            // The writer's warning may arrive after the answer to Quit.
+            server.warnings.push(error.into());
+            server.show_warnings();
+            let mut buffer = ratatui::buffer::Buffer::empty(server.client_screen(client));
+            server.compose(client, crate::accounts::now(), &mut buffer);
+            let notice: String = (0..cols).map(|x| buffer[(x, 0)].symbol()).collect();
+            assert!(notice.contains("not quitting: the layout could not be saved"), "{cols}x{rows}: {notice}");
+            let result = format!("not quitting: {error}");
+            assert_eq!(server.clients[&client].toast.as_ref().unwrap().0, result);
+            assert!(server.messages.iter().any(|m| m.text == result));
+            assert!(server.messages.iter().any(|m| m.warning && m.text == error));
+            assert_eq!(saved.lock().unwrap().len(), 1);
+            server.client_input(client, b"\x02qy");
+            assert!(server.quitting, "Quit can be retried once saving works");
+            assert_eq!(saved.lock().unwrap().len(), 2);
+        }
     }
 
     #[test]
