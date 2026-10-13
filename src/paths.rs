@@ -648,7 +648,11 @@ fn reachable(current: PathBuf, older: Vec<PathBuf>) -> PathBuf {
 
 /// Whether nobody listens at `socket`: nothing is there, or what is there refuses a connection.
 /// A server that takes none for now is somebody: no other is started beside it, and what its
-/// session saved is not forgotten.
+/// session saved is not forgotten. Linux tells such a server from a socket left behind; macOS
+/// refuses for both. So a refusal alone removes nothing and forgets nothing: whoever acts on it
+/// holds the session first ([`SessionLock`]), which a server of kraal 0.3.0 or later that is
+/// only busy still has. What is left is a busy server of kraal 0.2.0 on macOS, which holds
+/// nothing.
 pub fn nobody_listens(socket: &Path) -> bool {
     use std::io::ErrorKind;
     connect_now(socket).is_err_and(|e| matches!(e.kind(), ErrorKind::NotFound | ErrorKind::ConnectionRefused))

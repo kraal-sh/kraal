@@ -51,7 +51,7 @@ impl Env {
     }
 
     pub fn run(&self, args: &[&str]) -> String {
-        let out = self.cmd(args).output().unwrap();
+        let out = self.try_run(args);
         assert!(out.status.success(), "kraal {args:?} failed: {}", String::from_utf8_lossy(&out.stderr));
         String::from_utf8(out.stdout).unwrap()
     }
@@ -63,7 +63,10 @@ impl Env {
 
 impl Drop for Env {
     fn drop(&mut self) {
-        let _ = self.try_run(&["kill"]);
+        // Nothing of what it says is read: a pipe would be read to an end that comes only once
+        // every process that has it is gone.
+        let quiet = std::process::Stdio::null;
+        let _ = self.cmd(&["kill"]).stdout(quiet()).stderr(quiet()).status();
         let _ = std::fs::remove_dir_all(&self.root);
     }
 }

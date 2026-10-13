@@ -1425,23 +1425,78 @@ struct StopsOther<'a>(&'a Env);
 
 impl Drop for StopsOther<'_> {
     fn drop(&mut self) {
-        let _ = environment(self.0, true, &["kill"]).output();
+        use std::process::Stdio;
+        let _ = environment(self.0, true, &["kill"]).stdout(Stdio::null()).stderr(Stdio::null()).status();
     }
 }
 
-/// What `kraal args` prints in one of the two environments of `env`, which must succeed.
+/// What `kraal args` prints in one of the two environments of `env`, which must succeed, and
+/// within the time any command may take ([`bounded`]).
 fn in_environment(env: &Env, other: bool, args: &[&str]) -> String {
-    let out = environment(env, other, args).output().unwrap();
-    assert!(out.status.success(), "kraal {args:?} (other: {other}): {}", String::from_utf8_lossy(&out.stderr));
-    String::from_utf8(out.stdout).unwrap()
+    let out = bounded(env, other, args);
+    let (said, err) = (String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    let failed = format!("kraal {args:?} (other: {other}): {}\n{said}{err}", out.status);
+    assert!(out.status.success(), "{failed}\n{}", evidence(env));
+    said.into_owned()
 }
 
 /// What `kraal args` did in one of the two environments of `env`, within the time any command
-/// may take: one that hangs fails the test.
+/// may take: one that does not end is stopped, and fails the test with what is known of the
+/// session ([`evidence`]). What it says goes to files, not to pipes: a pipe is read to its end,
+/// which comes once every process that has it is gone, and on macOS a program another thread
+/// starts at that moment is given it.
 fn bounded(env: &Env, other: bool, args: &[&str]) -> Output {
-    use std::process::Stdio;
-    let child = environment(env, other, args).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
-    finish(child, PATIENCE)
+    let mut command = environment(env, other, args);
+    within(env, &mut command, &format!("kraal {args:?}"))
+}
+
+/// What `command`, a program of `env`'s test, did within the time any command may take, as
+/// [`bounded`] has it.
+fn within(env: &Env, command: &mut Command, what: &str) -> Output {
+    static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let said = env.root.join(format!("said-{}", NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)));
+    let file = |end: &str| std::fs::File::create(said.with_extension(end)).unwrap();
+    let mut child = command.stdout(file("out")).stderr(file("err")).spawn().unwrap();
+    let start = Instant::now();
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break Some(status);
+        }
+        if start.elapsed() > PATIENCE {
+            let _ = child.kill();
+            let _ = child.wait();
+            break None;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    let read = |end: &str| std::fs::read(said.with_extension(end)).unwrap_or_default();
+    let (stdout, stderr) = (read("out"), read("err"));
+    let Some(status) = status else {
+        let (out, err) = (String::from_utf8_lossy(&stdout), String::from_utf8_lossy(&stderr));
+        panic!("{what} still ran after {PATIENCE:?}. It said:\n{out}{err}\n{}", evidence(env));
+    };
+    Output { status, stdout, stderr }
+}
+
+/// What is known of `env`'s session when a command did not do what a test expects: what its
+/// servers logged, and what is where it saves and in its two runtime directories (sockets, their
+/// second names, lock files).
+fn evidence(env: &Env) -> String {
+    let mut all = String::new();
+    for dir in ["state/kraal", "run/kraal", "run2/kraal"] {
+        let mut names: Vec<String> = std::fs::read_dir(env.root.join(dir))
+            .into_iter()
+            .flatten()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        all.push_str(&format!("--- {dir}: {names:?}\n"));
+        for log in names.iter().filter(|name| name.starts_with("server-") && name.ends_with(".log")) {
+            let logged = std::fs::read_to_string(env.root.join(dir).join(log)).unwrap_or_default();
+            all.push_str(&format!("--- {log}:\n{logged}\n"));
+        }
+    }
+    all
 }
 
 /// Where the session of `env` has a socket, of its two runtime directories.
@@ -1741,7 +1796,7 @@ fn a_session_started_many_times_at_once_starts_once_and_for_all() {
     env.workspace("w", "layout {\n    pane name=\"one\"\n}\n");
     for round in 0..10 {
         let together = std::sync::Barrier::new(8);
-        std::thread::scope(|scope| {
+        let starts: Vec<Output> = std::thread::scope(|scope| {
             let starts: Vec<_> = (0..8)
                 .map(|_| {
                     scope.spawn(|| {
@@ -1750,17 +1805,57 @@ fn a_session_started_many_times_at_once_starts_once_and_for_all() {
                     })
                 })
                 .collect();
-            for start in starts {
-                let out = start.join().unwrap();
-                assert!(out.status.success(), "round {round}: {}", String::from_utf8_lossy(&out.stderr));
-            }
+            starts.into_iter().map(|start| start.join().unwrap()).collect()
         });
-        assert!(env.run(&["panes"]).contains("one"), "round {round}");
+        let all: Vec<String> = starts
+            .iter()
+            .map(|out| format!("{}: {}", out.status, String::from_utf8_lossy(&out.stderr).trim()))
+            .collect();
+        assert!(starts.iter().all(|out| out.status.success()), "round {round}: {all:#?}\n{}", evidence(&env));
+        assert!(in_environment(&env, false, &["panes"]).contains("one"), "round {round}\n{}", evidence(&env));
         // One server: stopped, none is left.
-        env.run(&["kill"]);
-        wait_until(PATIENCE, "a second server was running", || env.server_pid().is_none());
-        env.run(&["forget"]);
+        in_environment(&env, false, &["kill"]);
+        let start = Instant::now();
+        while env.server_pid().is_some() {
+            assert!(start.elapsed() < PATIENCE, "round {round}: a second server was running\n{}", evidence(&env));
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        in_environment(&env, false, &["forget"]);
     }
+}
+
+/// A server keeps open nothing of what the kraal that started it was started with. A pipe that
+/// kraal was given (by a script that reads what its commands say, a build tool, a test) ends
+/// for whoever reads it when that kraal is gone, not when the session is.
+#[test]
+fn a_server_keeps_nothing_its_starter_was_given() {
+    use std::io::Read;
+    use std::os::fd::AsRawFd;
+    use std::os::unix::process::CommandExt;
+    let env = Env::new("nofds");
+    env.workspace("w", "layout {\n    pane name=\"one\"\n}\n");
+    let (mut read, given) = std::io::pipe().unwrap();
+    let fd = given.as_raw_fd();
+    let mut open = env.cmd(&["open", "w"]);
+    // SAFETY: fcntl alone, which may run between fork and exec. The kraal started has the
+    // writing end of the pipe as a descriptor nobody marked to be closed.
+    unsafe {
+        open.pre_exec(move || match libc::fcntl(fd, libc::F_SETFD, 0) {
+            0 => Ok(()),
+            _ => Err(std::io::Error::last_os_error()),
+        })
+    };
+    let out = within(&env, &mut open, "kraal open w");
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    drop(given);
+    assert!(env.server_pid().is_some(), "no server runs");
+    let (ended, end) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut rest = Vec::new();
+        let _ = ended.send(read.read_to_end(&mut rest));
+    });
+    let ended = end.recv_timeout(Duration::from_secs(10));
+    assert!(ended.is_ok(), "the server holds a pipe of whoever started the kraal that started it");
 }
 
 /// The lock file where a session saves goes with its holder, a server or `kraal forget`: a
@@ -1806,6 +1901,8 @@ fn a_session_started_stopped_and_forgotten_at_once_is_held_by_one_at_a_time() {
     use std::process::Stdio;
     let env = Env::new("lockrace");
     env.workspace("w", "layout {\n    pane name=\"one\"\n}\n");
+    // Each server with the file it says in: no pipe, which a server started at the same moment
+    // would keep open for as long as it runs.
     let servers = std::sync::Mutex::new(Vec::new());
     std::thread::scope(|scope| {
         for worker in 0..8u64 {
@@ -1813,20 +1910,22 @@ fn a_session_started_stopped_and_forgotten_at_once_is_held_by_one_at_a_time() {
             scope.spawn(move || {
                 // The same commands in the same order at each run, different for each worker.
                 let mut random = worker + 1;
-                for _ in 0..30 {
+                for n in 0..30 {
                     random = random.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
                     match (random >> 33) % 4 {
                         0 | 1 => {
-                            let server = env.cmd(&["server"]).stdout(Stdio::null()).stderr(Stdio::piped()).spawn();
-                            servers.lock().unwrap().push(server.unwrap());
+                            let said = env.root.join(format!("server-{worker}-{n}.err"));
+                            let err = std::fs::File::create(&said).unwrap();
+                            let server = env.cmd(&["server"]).stdout(Stdio::null()).stderr(err).spawn();
+                            servers.lock().unwrap().push((server.unwrap(), said));
                         }
                         2 => {
-                            let out = env.try_run(&["kill"]);
+                            let out = bounded(env, false, &["kill"]);
                             let said = String::from_utf8_lossy(&out.stderr);
                             assert!(out.status.success() || said.contains("no kraal server"), "kill: {said}");
                         }
                         _ => {
-                            let out = env.try_run(&["forget"]);
+                            let out = bounded(env, false, &["forget"]);
                             let said = String::from_utf8_lossy(&out.stderr);
                             assert!(out.status.success() || said.contains("is running"), "forget: {said}");
                         }
@@ -1840,19 +1939,21 @@ fn a_session_started_stopped_and_forgotten_at_once_is_held_by_one_at_a_time() {
     let servers = servers.into_inner().unwrap();
     assert!(servers.len() > 100, "{} servers started", servers.len());
     let (mut ran, mut refused) = (0, 0);
-    for mut server in servers {
+    for (mut server, said) in servers {
         let start = Instant::now();
-        while server.try_wait().unwrap().is_none() {
-            let _ = env.try_run(&["kill"]);
-            assert!(start.elapsed() < Duration::from_secs(30), "a server would not stop");
-        }
-        let out = server.wait_with_output().unwrap();
-        let said = String::from_utf8_lossy(&out.stderr);
-        match out.status.success() {
+        let status = loop {
+            if let Some(status) = server.try_wait().unwrap() {
+                break status;
+            }
+            let _ = bounded(&env, false, &["kill"]);
+            assert!(start.elapsed() < Duration::from_secs(30), "a server would not stop\n{}", evidence(&env));
+        };
+        let said = std::fs::read_to_string(said).unwrap();
+        match status.success() {
             true => ran += 1,
             false => refused += 1,
         }
-        assert_eq!(out.status.success(), said.is_empty(), "{said}");
+        assert_eq!(status.success(), said.is_empty(), "{said}");
         assert!(said.is_empty() || said.contains("holds session \"lockrace\""), "{said}");
     }
     assert!(ran > 0 && refused > 0, "{ran} servers ran, {refused} were refused");

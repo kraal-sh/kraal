@@ -174,12 +174,25 @@ fn start_server(session: &str, log: &Path) -> Result<(std::process::Child, std::
         .stdout(out.try_clone()?)
         .stderr(out)
         .current_dir(dirs::home_dir().unwrap_or_else(|| "/".into()));
+    // What this kraal was started with is not the server's to keep: a pipe that whoever started
+    // it reads to its end (a script, a build tool, a test) would not end before the session
+    // does. Every descriptor open now, but the standard ones and the pipe the server is given,
+    // is closed in the server-to-be before it runs. The one the listing was made through is
+    // closed already, and left out: another could have its number by then.
+    let left_out: Vec<libc::c_int> = crate::pane::open_descriptors()
+        .into_iter()
+        // SAFETY: fcntl only looks at the descriptor, and fails on one that is not open.
+        .filter(|fd| *fd > 2 && *fd != ready_fd && unsafe { libc::fcntl(*fd, libc::F_GETFD) } != -1)
+        .collect();
     // Detach from the terminal so closing it does not take the server down, and keep the end
     // of the pipe the server writes to open across exec (in the child only).
     unsafe {
         use std::os::unix::process::CommandExt;
         cmd.pre_exec(move || {
             libc::setsid();
+            for fd in &left_out {
+                libc::close(*fd);
+            }
             if libc::fcntl(ready_fd, libc::F_SETFD, 0) != 0 {
                 return Err(std::io::Error::last_os_error());
             }
