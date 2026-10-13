@@ -162,16 +162,52 @@ pub struct ClaudeOptions {
     pub statusline: Option<String>,
 }
 
+impl ClaudeOptions {
+    fn is_empty(&self) -> bool {
+        self.statusline.is_none()
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct File {
     #[serde(default)]
     limits: Limits,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "ClaudeOptions::is_empty")]
     claude: ClaudeOptions,
     #[serde(default, rename = "account")]
     accounts: Vec<Account>,
-    #[serde(default, rename = "rule")]
+    #[serde(default, rename = "rule", skip_serializing_if = "Vec::is_empty")]
     rules: Vec<Rule>,
+}
+
+/// Remove the empty sections older kraal versions wrote, using their source spans so that
+/// comments and everything outside those sections keep their exact spelling and position.
+fn without_empty_sections(mut text: String) -> Result<String> {
+    let doc = toml_edit::Document::parse(text.as_str())?;
+    let mut remove = Vec::new();
+    if let Some(array) = doc.get("rule").and_then(toml_edit::Item::as_array).filter(|array| array.is_empty())
+        && let (Some(key), Some(value)) = (doc.key("rule").and_then(toml_edit::Key::span), array.span())
+    {
+        remove.push(key.start..value.start + 1);
+        remove.push(value.end - 1..value.end);
+    }
+    if let Some(table) = doc.get("claude").and_then(toml_edit::Item::as_table).filter(|table| table.is_empty())
+        && let Some(span) = table.span()
+    {
+        remove.push(span);
+    }
+    remove.sort_by_key(|span| span.start);
+    for span in remove.into_iter().rev() {
+        let start = text[..span.start].rfind('\n').map_or(0, |i| i + 1);
+        let end = text[span.end..].find('\n').map_or(text.len(), |i| span.end + i + 1);
+        // Drop a line only when removing its syntax leaves no comment on it.
+        if text[start..span.start].trim().is_empty() && text[span.end..end].trim().is_empty() {
+            text.replace_range(start..end, "");
+        } else {
+            text.replace_range(span, "");
+        }
+    }
+    Ok(text)
 }
 
 const HEADER: &str = "# kraal agent accounts. One [[account]] per subscription: a name, the agent (claude, codex)\n\
@@ -255,9 +291,9 @@ impl Accounts {
             rules: self.rules.clone(),
         };
         match &self.source {
-            Some(text) => {
-                crate::rewrite::rewrite(text, &file).with_context(|| format!("editing {}", self.path.display()))
-            }
+            Some(text) => crate::rewrite::rewrite(text, &file)
+                .and_then(without_empty_sections)
+                .with_context(|| format!("editing {}", self.path.display())),
             None => Ok(format!("{HEADER}{}", toml::to_string_pretty(&file)?)),
         }
     }
@@ -1939,10 +1975,14 @@ until = 2027-01-01    # read by a newer kraal
 
     /// What a file that held `BY_HAND` holds once `change` was made to the accounts.
     fn changed(name: &str, change: impl FnOnce(&mut Accounts) -> Result<()>) -> String {
+        changed_text(name, BY_HAND, change)
+    }
+
+    fn changed_text(name: &str, text: &str, change: impl FnOnce(&mut Accounts) -> Result<()>) -> String {
         let dir = std::env::temp_dir().join(format!("kraal-accounts-{name}-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("accounts.toml");
-        std::fs::write(&path, BY_HAND).unwrap();
+        std::fs::write(&path, text).unwrap();
         Accounts::update_at(&path, change).unwrap();
         let text = std::fs::read_to_string(&path).unwrap();
         let _ = std::fs::remove_dir_all(dir);
@@ -1991,28 +2031,100 @@ until = 2027-01-01    # read by a newer kraal
     }
 
     #[test]
+    fn empty_sections_go_when_the_file_is_rewritten_and_their_comments_stay() {
+        let old = "# My accounts.\nrule = []\n\n[claude]\n\n[limits]\nthreshold = 85 # mine\n";
+        let text = changed_text("empty", old, |all| {
+            all.limits.threshold = 70;
+            Ok(())
+        });
+        assert_eq!(text, old.replace("rule = []\n", "").replace("[claude]\n", "").replace("85", "70"));
+        assert_eq!(changed_text("empty-again", &text, |all| all.save()), text);
+
+        let old = "# My accounts.\n'rule' = [ # contexts\n    # No rules yet.\n] # later\ncolor = 'blue'\n\n\
+                   [ 'claude' ] # my status line\n# Kept for later.\n\n[limits]\nthreshold = 85 # mine\n";
+        let text = changed_text("empty-comments", old, |all| all.save());
+        assert_eq!(text, old.replace("'rule' = [", "").replace("] # later", " # later").replace("[ 'claude' ]", ""));
+        let windows = old.replace('\n', "\r\n");
+        assert_eq!(changed_text("empty-crlf", &windows, |all| all.save()), text.replace('\n', "\r\n"));
+        assert_eq!(without_empty_sections("rule = []\n[claude]".into()).unwrap(), "");
+    }
+
+    #[test]
+    fn claude_settings_and_existing_rules_keep_their_spelling_and_order() {
+        for (i, claude) in [
+            "[claude]\nstatusline = 'my-line' # run mine too\n",
+            "[claude]\nstatusline = '' # still a command value\n",
+            "[claude]\nfuture = 'kept'\n",
+            "[claude]\n[claude.future]\ncolor = 'blue'\n",
+            "claude = { future = 'kept' }\n",
+            "claude = {}\n",
+            "[claude]\nrule = [] # a key this kraal does not read\n",
+            "[claude]\nstatusline = '''\nrule = []\n[claude]\n'''\n",
+        ]
+        .iter()
+        .enumerate()
+        {
+            let old = format!("{claude}{BY_HAND}");
+            let text = changed_text(&format!("claude-{i}"), &old, |all| {
+                all.limits.threshold = 70;
+                Ok(())
+            });
+            assert_eq!(text, old.replace("threshold = 85", "threshold = 70"));
+        }
+        let old = BY_HAND.replace("accounts = [\"pro\", \"default\"]", "accounts = []");
+        assert_eq!(changed_text("rule-no-accounts", &old, |all| all.save()), old);
+    }
+
+    #[test]
+    fn setting_and_clearing_a_statusline_keeps_unknown_claude_settings() {
+        for (i, settings) in ["", "future = 'kept'\n"].iter().enumerate() {
+            let old = format!("# My status line.\n[claude] # integration\n{settings}\n{BY_HAND}");
+            let text = changed_text(&format!("set-statusline-{i}"), &old, |all| {
+                all.claude.statusline = Some("my-line".into());
+                Ok(())
+            });
+            let expected = old.replace(
+                &format!("{settings}\n{BY_HAND}"),
+                &format!("{settings}statusline = \"my-line\"\n\n{BY_HAND}"),
+            );
+            assert_eq!(text, expected);
+            let text = changed_text(&format!("clear-statusline-{i}"), &text, |all| {
+                all.claude.statusline = None;
+                Ok(())
+            });
+            assert_eq!(text, if settings.is_empty() { old.replace("[claude]", "") } else { old });
+        }
+    }
+
+    #[test]
     fn a_new_file_is_written_whole_and_one_that_cannot_be_read_is_left_alone() {
         let dir = std::env::temp_dir().join(format!("kraal-accounts-new-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("accounts.toml");
         let add = |all: &mut Accounts| all.add(acct("codex", "work", "/tmp/kraal-test-codex-work"));
         Accounts::update_at(&path, add).unwrap();
-        let whole = "rule = []\n\n[limits]\nthreshold = 90\nmode = \"notify\"\n\n[claude]\n\n\
+        let whole = "[limits]\nthreshold = 90\nmode = \"notify\"\n\n\
                      [[account]]\nname = \"work\"\nagent = \"codex\"\nhome = \"/tmp/kraal-test-codex-work\"\n";
         assert_eq!(std::fs::read_to_string(&path).unwrap(), format!("{HEADER}{whole}"));
         // The file `kraal accounts edit` makes when there is none takes its first account
         // under its header.
         std::fs::remove_file(&path).unwrap();
         Accounts::load_from(&path).unwrap().save().unwrap();
+        let empty = std::fs::read_to_string(&path).unwrap();
+        assert!(empty.starts_with(HEADER) && !empty.contains("rule = []") && !empty.contains("\n[claude]"), "{empty}");
         Accounts::update_at(&path, add).unwrap();
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(text.starts_with(HEADER) && text.contains("[[account]]\nname = \"work\"\n"), "{text}");
         assert_eq!(Accounts::load_from(&path).unwrap().accounts, [acct("codex", "work", "/tmp/kraal-test-codex-work")]);
 
-        let broken = "# mine\n[[account]\nname = \"work\"\n";
-        std::fs::write(&path, broken).unwrap();
-        assert!(Accounts::update_at(&path, add).is_err());
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), broken);
+        for broken in [
+            "# mine\nrule = []\n[claude]\n[[account]\nname = \"work\"\n",
+            "# mine\nrule = []\n[claude]\nstatusline = 42\n",
+        ] {
+            std::fs::write(&path, broken).unwrap();
+            assert!(Accounts::update_at(&path, add).is_err());
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), broken);
+        }
         let _ = std::fs::remove_dir_all(dir);
     }
 

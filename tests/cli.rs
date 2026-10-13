@@ -2481,6 +2481,24 @@ fn commands_that_write_the_inventories_keep_what_the_user_wrote() {
     assert_eq!(read(&servers), "# mine\n[[server]\n");
 
     let accounts = config.join("accounts.toml");
+    run(&["accounts", "limits", "--threshold", "80"]);
+    let fresh = read(&accounts);
+    assert!(fresh.starts_with("# kraal agent accounts."), "{fresh}");
+    assert!(!fresh.contains("rule = []") && !fresh.contains("[claude]"), "{fresh}");
+
+    let legacy = "# The team's accounts.\nrule = [] # no rules yet\n\n\
+                  [claude] # reserved\n\n[limits]\nthreshold = 85\nfuture = 'kept'\n";
+    std::fs::write(&accounts, legacy).unwrap();
+    run(&["accounts", "limits", "--threshold", "80"]);
+    assert_eq!(
+        read(&accounts),
+        legacy.replace("rule = []", "").replace("[claude]", "").replace("threshold = 85", "threshold = 80")
+    );
+    let broken = "# mine\nrule = []\n[claude]\n[[account]\n";
+    std::fs::write(&accounts, broken).unwrap();
+    assert!(!env.try_run(&["accounts", "limits", "--threshold", "80"]).status.success());
+    assert_eq!(read(&accounts), broken);
+
     let by_hand = "# The team's accounts.\n\n[limits]\nmode = \"ask\"  # never by itself\nthreshold = 85\nwarn_at = 70\n\n\
                    # Work first.\n[[rule]]\nworkspace = \"work\"\naccounts = [\"work\", \"default\"]\n";
     std::fs::write(&accounts, by_hand).unwrap();

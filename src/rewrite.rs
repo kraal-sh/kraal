@@ -71,7 +71,10 @@ fn edit_table(doc: &mut dyn TableLike, before: &toml::Table, after: &toml::Table
             continue;
         }
         let edited = match (doc.get_mut(key), old, new, fresh) {
-            (Some(item), Some(toml::Value::Table(old)), toml::Value::Table(new), Item::Table(fresh)) => {
+            (Some(item), old, toml::Value::Table(new), Item::Table(fresh)) => {
+                // A table omitted by serialization can still hold keys this kraal does not read.
+                let empty = toml::Table::new();
+                let old = old.and_then(toml::Value::as_table).unwrap_or(&empty);
                 item.as_table_like_mut().map(|table| edit_table(table, old, new, fresh, left)).is_some()
             }
             (Some(item), Some(toml::Value::Array(old)), toml::Value::Array(new), fresh) => {
@@ -84,7 +87,17 @@ fn edit_table(doc: &mut dyn TableLike, before: &toml::Table, after: &toml::Table
         }
     }
     for key in before.keys().filter(|key| !after.contains_key(*key)) {
-        doc.remove(key);
+        let edited = match (doc.get_mut(key), before.get(key)) {
+            (Some(item), Some(toml::Value::Table(old))) => item
+                .as_table_like_mut()
+                .map(|table| edit_table(table, old, &toml::Table::new(), &Table::new(), left))
+                .is_some(),
+            (Some(item), Some(toml::Value::Array(old))) => edit_entries(item, old, &[], &Item::None, left),
+            _ => false,
+        };
+        if !edited {
+            doc.remove(key);
+        }
     }
 }
 
@@ -314,7 +327,7 @@ mod tests {
         limits: Limits,
         #[serde(default, rename = "server")]
         servers: Vec<Server>,
-        #[serde(default, rename = "rule")]
+        #[serde(default, rename = "rule", skip_serializing_if = "Vec::is_empty")]
         rules: Vec<Rule>,
     }
 
@@ -430,7 +443,7 @@ groups = [
         let out = rewritten(INVENTORY, |file| file.limits.threshold = 80);
         assert_eq!(out, INVENTORY.replace("\n# Kept for later:", "\n[limits]\nthreshold = 80\n\n# Kept for later:"));
         let out = rewritten("# Nothing yet.\n", |file| file.servers.push(server("web")));
-        let whole = "rule = []\n\n[limits]\nthreshold = 90\n\n[[server]]\nname = \"web\"\nhost = \"web.example.com\"\n";
+        let whole = "[limits]\nthreshold = 90\n\n[[server]]\nname = \"web\"\nhost = \"web.example.com\"\n";
         assert_eq!(out, format!("# Nothing yet.\n\n{whole}"));
         // A list kraal wrote empty takes entries as tables.
         let out =
@@ -485,6 +498,12 @@ accounts = [\"default\"]
             .replace("name = \"bastion\"", "name = \"db\"")
             .replace("host = \"bastion.example.com\"", "host = \"db.example.com\"");
         assert_eq!(out, expected);
+    }
+
+    #[test]
+    fn an_omitted_empty_list_keeps_the_comments_for_the_file() {
+        let rules = "# My rules.\n\n# For work.\n[[rule]]\nworkspace = 'work'\naccounts = ['pro']\n\n# End.\n";
+        assert_eq!(rewritten(rules, |file| file.rules.clear()), "# My rules.\n\n# End.\n");
     }
 
     #[test]

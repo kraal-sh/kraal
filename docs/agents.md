@@ -253,7 +253,12 @@ accounts = ["pro", "default"]   # in order of preference
 
 The file also holds the accounts themselves, one `[[account]]` each (`name`, `agent`, `home`,
 and a `threshold` of its own if it has one), which `kraal accounts add` writes. kraal edits what
-it changes there and leaves the rest as you wrote it, comments included.
+it changes there and leaves the rest as you wrote it, including comments, order and unknown
+keys. A new file includes an explanatory header and omits empty rules and an empty `[claude]`
+table. When kraal next rewrites an older file, it removes an empty top-level `rule = []` and an
+empty `[claude]` table, keeping their comments. A `[claude]` table with a saved `statusline`
+command or other settings stays, as do existing rules. A file that cannot be parsed is left
+untouched.
 [examples/accounts.toml](../examples/accounts.toml) has limits and two rules, by workspace and by
 directory.
 
