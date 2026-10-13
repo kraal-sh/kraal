@@ -12,11 +12,11 @@ How kraal is organised, and how a workspace is declared once in a file and opene
   tiled (some may share a place as a stack, one open at a time), or floating on top.
 - The **sidebar**, at the left from the first screen on, lists the workspaces (the open ones,
   then the workspace files that are not open) and, when there are some, the agents, the tunnels
-  and the ports, with the agents' accounts at the bottom. `ctrl+b V l` hides it, or shows it
-  again, in the terminal you type it in until that terminal detaches; `[sidebar] visible = false`
-  in the configuration hides it for good. A terminal less than three times as wide as the sidebar
-  (84 columns with the default width) has none: the panes keep that room, and the top bar names
-  the workspace.
+  and the ports, with the agents' accounts at the bottom once one is listed or used.
+  `ctrl+b V l` hides it, or shows it again, in the terminal you type it in until that terminal
+  detaches; `[sidebar] visible = false` in the configuration hides it for good. A terminal less
+  than three times as wide as the sidebar (84 columns with the default width) has none: the panes
+  keep that room, and the top bar names the workspace.
 - Several terminals can be attached at once. The panes have the size that fits the one used last
   (attached, resized or typed in), and each terminal shows them beside its own sidebar: a smaller
   one shows what fits.

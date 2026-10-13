@@ -5659,12 +5659,9 @@ fn each_terminal_draws_the_panes_beside_its_own_sidebar() {
     let env = Env::new("beside");
     env.workspace("w", "layout {\n    pane name=\"shell\"\n}\n");
     env.run(&["open", "w"]);
-    // The columns of the sidebar and the space after it, down to the accounts (whose usage may
-    // come while the test runs).
-    let side = |rows: &[String]| -> Vec<String> {
-        let side = rows.iter().map(|r| r.chars().take(29).collect::<String>());
-        side.take_while(|r| !r.contains("ACCOUNTS")).collect()
-    };
+    // The columns of the sidebar and the space after it, above the place of the accounts (which
+    // come with their usage, and that may be seen while the test runs).
+    let side = |rows: &[String]| -> Vec<String> { rows[..32].iter().map(|r| r.chars().take(29).collect()).collect() };
     let shows = |client: &RawClient, columns: (usize, usize), when: &str| {
         let columns = (Some(columns.0), Some(columns.1));
         let rows = client.wait_for_rows(when, |rows| frame_columns(rows) == columns);

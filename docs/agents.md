@@ -221,7 +221,8 @@ what can be done with it, each also on its own key: start it in a new tab (`ctrl
 account and keeps its usage; its directory stays where it is, and agents running on it go on,
 shown under the new name. A rule for every agent that also names another agent's account of the
 old or the new name stays theirs: the renamed account gets a rule of its own just before it.
-`default`, the agent's own home, keeps its name. The sidebar lists every account at the bottom
+`default`, the agent's own home, keeps its name. Once an account is listed or one was used, the
+sidebar lists every account at the bottom
 (`claude·pro 42%`): the higher of its 5-hour and weekly usage, in yellow from 70% and in red at
 its threshold, or `not used yet`. `ctrl+b A c` moves the focused pane's agent to another account
 of the same agent.
