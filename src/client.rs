@@ -12,20 +12,173 @@ use anyhow::{Context, Result, bail};
 use crate::protocol::{self, ClientMsg, Request, Response, ServerMsg};
 use crate::{paths, process};
 
-/// Make sure a server runs for `session`, starting one in the background if needed.
+/// How long a session may take to have a server that listens, from the moment one is asked for.
+const START_LIMIT: Duration = Duration::from_secs(5);
+
+/// How long a server just started is given to say that it listens, or to end because another
+/// kraal has the session, when less than that is left of [`START_LIMIT`]: starting a kraal takes
+/// a moment, a long one on a busy machine, and one started just before the limit would
+/// otherwise be given up on before it could tell why there is no server.
+const WORD_LIMIT: Duration = Duration::from_secs(2);
+
+/// Make sure a server runs for `session`, starting one in the background if needed: where it
+/// listens. When another kraal has the session (a server started at the same moment, which
+/// listens in a moment; one that is going; `kraal forget`), its socket is waited for here, and a
+/// server asked for again once nobody has the session, for [`START_LIMIT`] in all (the last
+/// server started is heard out: [`WORD_LIMIT`]). A session still held then, with no server that
+/// answers here, is not started: its files would be written twice. The error says who has it,
+/// where its holder says so.
 pub fn ensure_server(session: &str) -> Result<PathBuf> {
     paths::private_runtime_dir().context("checking the runtime directory")?;
     let socket = paths::socket_path(session);
-    if UnixStream::connect(&socket).is_ok() {
+    let listens = || paths::connect_now(&socket).is_ok();
+    if listens() {
         return Ok(socket);
     }
-    let exe = std::env::current_exe().context("locating the kraal binary")?;
+    // Said to who starts the server: its own list is shown to who attaches, and none may.
+    if let Some(refused) = paths::runtime_dir_refused() {
+        eprintln!("kraal: warning: {refused}");
+    }
     let log = paths::log_path(session);
+    let deadline = Instant::now() + START_LIMIT;
+    let mut pause = Duration::from_millis(20);
+    // Whether a server started here ended because another kraal has the session.
+    let mut held = false;
+    loop {
+        let logged = std::fs::metadata(&log).map_or(0, |m| m.len());
+        let (mut child, ready) = start_server(session, &log)?;
+        let heard_by = deadline.max(Instant::now() + WORD_LIMIT);
+        if wait_ready(&ready, heard_by.saturating_duration_since(Instant::now())) {
+            return Ok(socket);
+        }
+        // It closed the pipe without a word: it failed, or another kraal has the session.
+        let status = loop {
+            if let Ok(Some(status)) = child.try_wait() {
+                break Some(status);
+            }
+            if listens() {
+                return Ok(socket);
+            }
+            if Instant::now() >= heard_by {
+                break None;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        match status {
+            Some(status) if status.code() == Some(crate::server::HELD_STATUS) => held = true,
+            Some(status) => {
+                let why = last_logged(&log, logged).map(|line| format!(": {line}")).unwrap_or_default();
+                bail!("the server exited ({status}){why}; see {}", log.display());
+            }
+            // This one has not said, and those before it found the session held.
+            None if held => bail!(held_without_a_server(session, &socket, &log)),
+            None => bail!("the server did not start in time; see {}", log.display()),
+        }
+        // Its server is looked for until the next try, each a little later than the last: many
+        // kraal started at once must not keep the one that has the session from listening.
+        let next = (Instant::now() + pause).min(deadline);
+        while Instant::now() < next {
+            if listens() {
+                return Ok(socket);
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        if Instant::now() >= deadline {
+            bail!(held_without_a_server(session, &socket, &log));
+        }
+        pause = (pause * 2).min(Duration::from_millis(320));
+    }
+}
+
+/// Who has `session`, where its holder says so: what it said of itself is shown, quoted, and
+/// nothing else is done with it.
+pub fn who_holds(session: &str) -> Option<String> {
+    paths::holder(session).map(|holder| said_of(&holder, &paths::runtime_dir()))
+}
+
+/// What to say of `session` once another kraal has had it for as long as a start may take
+/// without a server of it answering here. What its holder says of itself explains that, and
+/// decided nothing: the start was tried again until now whatever it said, since what is read
+/// there may be what a holder killed before left.
+fn held_without_a_server(session: &str, socket: &Path, log: &Path) -> String {
+    if !paths::nobody_listens(socket) {
+        return format!("the server of session {session} takes no connection for now ({})", socket.display());
+    }
+    let here = paths::runtime_dir();
+    match paths::holder(session) {
+        Some(holder) if !is_here(&holder, &here) => {
+            format!("session {session} is not started here: {}", said_of(&holder, &here))
+        }
+        holder => {
+            let who = holder.map_or_else(|| "by another kraal".into(), |holder| said_of(&holder, &here));
+            format!("session {session} is held ({who}) and no server of it listens: try again (see {})", log.display())
+        }
+    }
+}
+
+/// Whether `holder` keeps its socket in `here`, this kraal's runtime directory on this machine.
+fn is_here(holder: &paths::Holder, here: &Path) -> bool {
+    same_directory(&holder.runtime, here) && holder.host == crate::context::hostname().unwrap_or_default()
+}
+
+/// Whether two paths are one directory, however each is spelt (`/tmp` is `/private/tmp` on
+/// macOS).
+fn same_directory(a: &Path, b: &Path) -> bool {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    if a == b {
+        return true;
+    }
+    // Opened as directories, and without waiting: one of the two is what a holder wrote, which
+    // may name anything (a FIFO would never open). Both stay open while they are compared: a
+    // directory made once another is gone may be given its number.
+    let open = |dir: &Path| {
+        let flags = libc::O_DIRECTORY | libc::O_NONBLOCK;
+        std::fs::OpenOptions::new().read(true).custom_flags(flags).open(dir).ok()
+    };
+    let (Some(a), Some(b)) = (open(a), open(b)) else { return false };
+    matches!((a.metadata(), b.metadata()), (Ok(a), Ok(b)) if (a.dev(), a.ino()) == (b.dev(), b.ino()))
+}
+
+/// What the holder of a session is to a kraal whose runtime directory is `here`, and how to
+/// reach it.
+fn said_of(holder: &paths::Holder, here: &Path) -> String {
+    let paths::Holder { pid, host, runtime } = holder;
+    if *host != crate::context::hostname().unwrap_or_default() {
+        return format!(
+            "it runs on {host:?} (kraal {pid}), which saves in the same directory: use it there, or give this \
+             one another name (kraal -s NAME)"
+        );
+    }
+    if same_directory(runtime, here) {
+        return format!("kraal {pid} has it");
+    }
+    let base = runtime.parent().unwrap_or(runtime);
+    format!(
+        "kraal {pid} runs it with its socket in {runtime:?}, not in {here:?} where this kraal looks: reach it \
+         with XDG_RUNTIME_DIR={base:?}"
+    )
+}
+
+/// The last line a server wrote in `log` after its first `from` bytes: why it did not start.
+fn last_logged(log: &Path, from: u64) -> Option<String> {
+    use std::io::{Seek, SeekFrom};
+    let mut file = std::fs::File::open(log).ok()?;
+    file.seek(SeekFrom::Start(from)).ok()?;
+    let mut said = String::new();
+    file.take(64 << 10).read_to_string(&mut said).ok()?;
+    let line = said.lines().rev().find(|line| !line.trim().is_empty())?;
+    Some(line.trim().trim_start_matches("kraal: ").to_string())
+}
+
+/// Start a server for `session` in the background, its output in `log`: the process, and the
+/// pipe it says on that it listens.
+fn start_server(session: &str, log: &Path) -> Result<(std::process::Child, std::io::PipeReader)> {
+    let exe = std::env::current_exe().context("locating the kraal binary")?;
     // The state directory holds what the server logs and saves: only ours.
     if let Some(dir) = log.parent() {
         paths::ensure_private_dir(dir)?;
     }
-    let out = paths::open_private_append(&log)?;
+    let out = paths::open_private_append(log)?;
     // The server writes a byte to this pipe once it listens, instead of being asked again and
     // again whether it does.
     let (ready, ready_end) = std::io::pipe().context("creating a pipe")?;
@@ -37,35 +190,33 @@ pub fn ensure_server(session: &str) -> Result<PathBuf> {
         .stdout(out.try_clone()?)
         .stderr(out)
         .current_dir(dirs::home_dir().unwrap_or_else(|| "/".into()));
+    // What this kraal was started with is not the server's to keep: a pipe that whoever started
+    // it reads to its end (a script, a build tool, a test) would not end before the session
+    // does. Every descriptor open now, but the standard ones and the pipe the server is given,
+    // is closed in the server-to-be before it runs. The one the listing was made through is
+    // closed already, and left out: another could have its number by then.
+    let left_out: Vec<libc::c_int> = crate::pane::open_descriptors()
+        .into_iter()
+        // SAFETY: fcntl only looks at the descriptor, and fails on one that is not open.
+        .filter(|fd| *fd > 2 && *fd != ready_fd && unsafe { libc::fcntl(*fd, libc::F_GETFD) } != -1)
+        .collect();
     // Detach from the terminal so closing it does not take the server down, and keep the end
     // of the pipe the server writes to open across exec (in the child only).
     unsafe {
         use std::os::unix::process::CommandExt;
         cmd.pre_exec(move || {
             libc::setsid();
+            for fd in &left_out {
+                libc::close(*fd);
+            }
             if libc::fcntl(ready_fd, libc::F_SETFD, 0) != 0 {
                 return Err(std::io::Error::last_os_error());
             }
             Ok(())
         });
     }
-    let mut child = cmd.spawn().context("starting the kraal server")?;
-    drop(ready_end);
-    let start = Instant::now();
-    if wait_ready(&ready, Duration::from_secs(5)) {
-        return Ok(socket);
-    }
-    // It closed the pipe without a word: it failed, or another server took the session first.
-    while start.elapsed() < Duration::from_secs(5) {
-        if UnixStream::connect(&socket).is_ok() {
-            return Ok(socket);
-        }
-        if let Ok(Some(status)) = child.try_wait() {
-            bail!("the server exited ({status}); see {}", log.display());
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    }
-    bail!("the server did not start in time; see {}", log.display())
+    let child = cmd.spawn().context("starting the kraal server")?;
+    Ok((child, ready))
 }
 
 /// The environment variable that gives a new server the descriptor of the pipe it says on that

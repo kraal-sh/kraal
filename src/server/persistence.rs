@@ -298,13 +298,17 @@ impl Persisting {
 }
 
 /// The only writer of session state, so writes land in order: a late save never overwrites the
-/// final one, nor brings back a session whose state was deleted.
+/// final one, nor brings back a session whose state was deleted. It keeps `held`, what holds the
+/// session for this server, until it has written its last: a server that stops without waiting
+/// for a write that is stuck does not let go of the session while that write may still land.
 pub(super) fn spawn_persister(
     events: Sender<Event>,
     shared: Arc<Mutex<Persisting>>,
+    held: impl Send + 'static,
 ) -> std::io::Result<Sender<Persist>> {
     let (tx, rx) = crossbeam_channel::unbounded::<Persist>();
     crate::threads::named("persist").spawn(move || {
+        let _held = held;
         let mut last: Result<(), String> = Ok(());
         // Scrollback files whose last write failed, and why.
         let mut failing: HashMap<String, String> = HashMap::new();
@@ -423,6 +427,32 @@ fn keep_aside(path: &std::path::Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The writer keeps what holds the session for as long as it can be asked to write, and
+    /// lets go of it as it ends: never while a write of its own may still land.
+    #[test]
+    fn the_writer_keeps_the_session_until_it_ends() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        struct Held(Arc<AtomicBool>);
+        impl Drop for Held {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        let let_go = Arc::new(AtomicBool::new(false));
+        let (events, _events) = crossbeam_channel::unbounded();
+        let writer = spawn_persister(events, Arc::default(), Held(let_go.clone())).unwrap();
+        let (done, written) = crossbeam_channel::bounded(1);
+        writer.send(Persist::Flush(done)).unwrap();
+        assert_eq!(written.recv_timeout(crate::testing::PATIENCE).unwrap(), Ok(()));
+        assert!(!let_go.load(Ordering::SeqCst), "let go while it could still be asked to write");
+        drop(writer);
+        let start = Instant::now();
+        while !let_go.load(Ordering::SeqCst) {
+            assert!(start.elapsed() < crate::testing::PATIENCE, "kept after its last write");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
 
     #[test]
     fn an_unreadable_state_is_kept_aside_or_said_not_to_be() {

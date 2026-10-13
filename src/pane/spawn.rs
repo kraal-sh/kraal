@@ -494,8 +494,9 @@ pub fn close_inherited() {
     }
 }
 
-/// The descriptors this process has open (none when they cannot be listed).
-fn open_descriptors() -> Vec<libc::c_int> {
+/// The descriptors this process has open (none when they cannot be listed), the one they are
+/// listed through among them, which is closed again as this returns.
+pub fn open_descriptors() -> Vec<libc::c_int> {
     #[cfg(target_os = "linux")]
     let dir = "/proc/self/fd";
     #[cfg(not(target_os = "linux"))]

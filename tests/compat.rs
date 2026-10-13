@@ -389,6 +389,48 @@ fn another_release_drives_a_session_of_this_kraal() {
     assert!(std::os::unix::net::UnixStream::connect(env.socket()).is_err(), "still listening");
 }
 
+/// A session one release runs, and listens for, is neither started again nor forgotten by the
+/// other in the runtime directory they share, whichever of the two runs it: one command after
+/// the other here, not what two of them do at the same instant.
+#[test]
+#[ignore = "needs KRAAL_OLD, another release's kraal: tests/compat.sh runs it"]
+fn neither_release_starts_or_forgets_a_session_the_other_runs() {
+    let (old, this) = (Kraal::old(), Kraal::this());
+    for (name, runs, other) in [("compat-held-a", &old, &this), ("compat-held-b", &this, &old)] {
+        let env = Env::new(name);
+        env.run(runs, &["open", "w"]);
+        let pid = env.server_pid();
+        let saved = env.root.join("state/kraal/sessions").join(format!("{name}.json"));
+        let start = Instant::now();
+        while !saved.exists() {
+            assert!(start.elapsed() < Duration::from_secs(60), "the layout was never saved");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        // Each ends by itself, refused: a second server that started would run until it is
+        // killed here, and so would a `forget` that waited.
+        let refused = |args: &[&str]| {
+            let mut command = env.cmd(other, args).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
+            let start = Instant::now();
+            loop {
+                if let Some(status) = command.try_wait().unwrap() {
+                    break !status.success();
+                }
+                if start.elapsed() > Duration::from_secs(60) {
+                    let _ = command.kill();
+                    let _ = command.wait();
+                    break false;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        };
+        let (theirs, ours) = (&other.version, &runs.version);
+        assert!(refused(&["server", "--session", name]), "kraal {theirs} started a second server beside {ours}");
+        assert!(refused(&["forget"]) && saved.exists(), "kraal {theirs} forgot a session kraal {ours} runs");
+        assert_eq!(env.server_pid(), pid, "the session's server");
+        env.run(runs, &["kill"]);
+    }
+}
+
 /// `kraal restart` brings a session of the other release to this kraal, with its panes and what
 /// they showed.
 #[test]

@@ -54,10 +54,14 @@ pub(super) fn kill(s: &Session) -> Result<()> {
 /// `kraal forget`: delete what a stopped session saved.
 pub(super) fn forget(s: &Session) -> Result<()> {
     let session = &s.name;
-    // Held while the files go, so that no server starts on them meanwhile. A server an older
-    // kraal started holds no lock, but listens.
-    let held = paths::SessionLock::acquire(session).context("locking the session")?;
-    if held.is_none() || std::os::unix::net::UnixStream::connect(paths::socket_path(session)).is_ok() {
+    // Held while the files go, so that no server starts on them meanwhile.
+    let Some(_held) = paths::SessionLock::acquire(session).context("locking the session")? else {
+        let who = client::who_holds(session).map(|who| format!(" ({who})")).unwrap_or_default();
+        bail!("session {session} is running{who}; `kraal kill` it first");
+    };
+    // A server kraal 0.2.0 started holds no lock, but listens: one that takes no connection for
+    // now counts as much as one that answers.
+    if !paths::nobody_listens(&paths::socket_path(session)) {
         bail!("session {session} is running; `kraal kill` it first");
     }
     let p = paths::session_state_path(session);

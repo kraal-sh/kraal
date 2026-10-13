@@ -157,8 +157,13 @@ impl RawClient {
     }
 
     fn attach_as(env: &Env, workspace: Option<&str>, size: (usize, usize), installed: Option<&str>) -> RawClient {
-        use std::io::Read;
         let socket = env.root.join("run/kraal").join(format!("{}.sock", env.session));
+        RawClient::attach_at(&socket, workspace, size, installed)
+    }
+
+    /// Attach to the server that listens at `socket`.
+    fn attach_at(socket: &Path, workspace: Option<&str>, size: (usize, usize), installed: Option<&str>) -> RawClient {
+        use std::io::Read;
         let mut stream = std::os::unix::net::UnixStream::connect(socket).unwrap();
         let installed = installed.map(|v| format!(r#","installed":"{v}""#)).unwrap_or_default();
         let (cols, rows) = size;
@@ -1357,6 +1362,7 @@ fn kill_says_when_the_layout_was_not_saved() {
 #[test]
 fn a_session_never_has_two_servers() {
     let env = Env::new("oneserver");
+    let _evidence = Evidence(&env);
     env.workspace("w", "layout {\n    pane name=\"one\"\n}\n");
     env.run(&["open", "w"]);
     let first = env.server_pid().expect("the server runs");
@@ -1377,6 +1383,7 @@ fn a_session_never_has_two_servers() {
 #[test]
 fn forget_leaves_a_running_session_alone() {
     let env = Env::new("forgetheld");
+    let _evidence = Evidence(&env);
     env.workspace("w", "layout {\n    pane name=\"one\"\n}\n");
     env.run(&["open", "w"]);
     wait_until(Duration::from_secs(10), "the layout was never saved", || env.state_file().exists());
@@ -1390,24 +1397,507 @@ fn forget_leaves_a_running_session_alone() {
     assert!(env.state_file().exists(), "the layout was deleted");
 }
 
-/// The lock files in a test's runtime directory.
-fn lock_files(env: &Env) -> Vec<String> {
-    let entries = std::fs::read_dir(env.root.join("run/kraal")).unwrap();
-    entries.map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).filter(|n| n.ends_with(".lock")).collect()
+/// The lock file of `env`'s session in one of its places: where the session saves (`state`), or
+/// one of its two runtime directories (`run`, and `run2` of [`environment`]).
+fn lock_file(env: &Env, place: &str) -> PathBuf {
+    env.root.join(place).join(format!("kraal/{}.lock", env.session))
 }
 
-/// A session's lock file goes with the server, or the `kraal forget`, that held it: a session
-/// name that was used leaves nothing behind. The one a killed server left is the next one's.
+/// How long a start that finds its session held looks for that one's server before it gives up:
+/// the time a start may take, and not much more.
+fn gave_up_in_time(took: Duration) -> bool {
+    took >= Duration::from_secs(5) && took < Duration::from_secs(20)
+}
+
+/// The same user, state and configuration as `env`, with another runtime directory when
+/// `other`: a cron job without `$XDG_RUNTIME_DIR`, say, beside a desktop terminal that has it.
+fn environment(env: &Env, other: bool, args: &[&str]) -> Command {
+    let mut c = env.cmd(args);
+    if other {
+        let run = env.root.join("run2");
+        std::fs::create_dir_all(&run).unwrap();
+        c.env("XDG_RUNTIME_DIR", run);
+    }
+    c
+}
+
+/// Stops the server that `env`'s session has in its other runtime directory when the test
+/// ends, however it ends: `Env` stops the one of its own.
+struct StopsOther<'a>(&'a Env);
+
+impl Drop for StopsOther<'_> {
+    fn drop(&mut self) {
+        use std::process::Stdio;
+        let _ = environment(self.0, true, &["kill"]).stdout(Stdio::null()).stderr(Stdio::null()).status();
+    }
+}
+
+/// What `kraal args` prints in one of the two environments of `env`, which must succeed, and
+/// within the time any command may take ([`bounded`]).
+fn in_environment(env: &Env, other: bool, args: &[&str]) -> String {
+    let out = bounded(env, other, args);
+    let (said, err) = (String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    let failed = format!("kraal {args:?} (other: {other}): {}\n{said}{err}", out.status);
+    assert!(out.status.success(), "{failed}\n{}", evidence(env));
+    said.into_owned()
+}
+
+/// What `kraal args` did in one of the two environments of `env`, within the time any command
+/// may take: one that does not end is stopped, and fails the test with what is known of the
+/// session ([`evidence`]). What it says goes to files, not to pipes: a pipe is read to its end,
+/// which comes once every process that has it is gone, and on macOS a program another thread
+/// starts at that moment is given it.
+fn bounded(env: &Env, other: bool, args: &[&str]) -> Output {
+    let mut command = environment(env, other, args);
+    within(env, &mut command, &format!("kraal {args:?}"))
+}
+
+/// What `command`, a program of `env`'s test, did within the time any command may take, as
+/// [`bounded`] has it.
+fn within(env: &Env, command: &mut Command, what: &str) -> Output {
+    static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let said = env.root.join(format!("said-{}", NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)));
+    let file = |end: &str| std::fs::File::create(said.with_extension(end)).unwrap();
+    let mut child = command.stdout(file("out")).stderr(file("err")).spawn().unwrap();
+    let start = Instant::now();
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break Some(status);
+        }
+        if start.elapsed() > PATIENCE {
+            let _ = child.kill();
+            let _ = child.wait();
+            break None;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    let read = |end: &str| std::fs::read(said.with_extension(end)).unwrap_or_default();
+    let (stdout, stderr) = (read("out"), read("err"));
+    let Some(status) = status else {
+        let (out, err) = (String::from_utf8_lossy(&stdout), String::from_utf8_lossy(&stderr));
+        panic!("{what} still ran after {PATIENCE:?}. It said:\n{out}{err}\n{}", evidence(env));
+    };
+    Output { status, stdout, stderr }
+}
+
+/// Says what is known of `env`'s session ([`evidence`]) when the test that has it fails,
+/// whatever fails in it: an assertion, a command that did not end, a thread of its own.
+struct Evidence<'a>(&'a Env);
+
+impl Drop for Evidence<'_> {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            eprintln!("{}", evidence(self.0));
+        }
+    }
+}
+
+/// What is known of `env`'s session when a command did not do what a test expects: what its
+/// servers logged, and what is where it saves and in its two runtime directories (sockets, their
+/// second names, lock files).
+fn evidence(env: &Env) -> String {
+    let mut all = String::new();
+    for dir in ["state/kraal", "run/kraal", "run2/kraal"] {
+        let mut names: Vec<String> = std::fs::read_dir(env.root.join(dir))
+            .into_iter()
+            .flatten()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        all.push_str(&format!("--- {dir}: {names:?}\n"));
+        for log in names.iter().filter(|name| name.starts_with("server-") && name.ends_with(".log")) {
+            let logged = std::fs::read_to_string(env.root.join(dir).join(log)).unwrap_or_default();
+            all.push_str(&format!("--- {log}:\n{logged}\n"));
+        }
+    }
+    all
+}
+
+/// Where the session of `env` has a socket, of its two runtime directories.
+fn sockets(env: &Env) -> Vec<&'static str> {
+    let socket = format!("kraal/{}.sock", env.session);
+    ["run", "run2"].into_iter().filter(|run| env.root.join(run).join(&socket).exists()).collect()
+}
+
+/// Hold a lock of `env`'s session, as another kraal would: the one where the session saves
+/// (`state`) or the one of its runtime directory (`run`), with what that kraal says of itself
+/// there. Held until what is returned is dropped.
+fn hold(env: &Env, place: &str, said: &str) -> std::fs::File {
+    use std::io::Write;
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::DirBuilderExt;
+    let dir = env.root.join(place).join("kraal");
+    std::fs::DirBuilder::new().recursive(true).mode(0o700).create(&dir).unwrap();
+    let path = dir.join(format!("{}.lock", env.session));
+    let mut lock = std::fs::OpenOptions::new().write(true).create(true).truncate(true).open(path).unwrap();
+    // Once nobody has it: a lock this test let go a moment ago is still that of a program
+    // another test is starting, which has this process's files until it runs.
+    // SAFETY: plain syscall on a file this test holds open.
+    wait_until(PATIENCE, "the session is held", || unsafe {
+        libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) == 0
+    });
+    lock.write_all(said.as_bytes()).unwrap();
+    lock
+}
+
+/// A session has one server for what it saves, whichever runtime directory a kraal of the user
+/// resolves: started from one environment, it is not started, served or forgotten from the
+/// other; in both orders. A start from the other looks for a server of its own for the time a
+/// start may take, then says where the session runs and how to reach it. Stopped where it runs,
+/// the session starts from the other.
 #[test]
-fn a_session_leaves_no_lock_file_behind() {
-    let env = Env::new("nolock");
+fn a_session_running_under_another_runtime_directory_is_refused_and_said() {
+    for first in [false, true] {
+        let env = Env::new(if first { "onestate-b" } else { "onestate-a" });
+        let _other = StopsOther(&env);
+        let _evidence = Evidence(&env);
+        env.workspace("w", "layout {\n    pane name=\"one\"\n}\n");
+        let (here, there) = (first, !first);
+        let run = |other: bool| if other { "run2" } else { "run" };
+        in_environment(&env, here, &["open", "w"]);
+        wait_until(PATIENCE, "the layout was never saved", || env.state_file().exists());
+        let where_it_is = format!("{}/kraal\", not in", run(here));
+        let reach_it = format!("{}/kraal\" where this kraal looks: reach it with XDG_RUNTIME_DIR=", run(there));
+        let start = Instant::now();
+        let refused = bounded(&env, there, &["open", "w"]);
+        let said = String::from_utf8_lossy(&refused.stderr);
+        assert!(gave_up_in_time(start.elapsed()), "refused after {:?}", start.elapsed());
+        assert!(!refused.status.success() && said.contains("session onestate-"), "{said}");
+        assert!(said.contains("is not started here: kraal ") && said.contains(&where_it_is), "{said}");
+        assert!(said.contains(&reach_it), "{said}");
+        let forget = bounded(&env, there, &["forget"]);
+        let said = String::from_utf8_lossy(&forget.stderr);
+        assert!(!forget.status.success() && said.contains("is running (kraal ") && said.contains(&reach_it), "{said}");
+        let second = bounded(&env, there, &["server"]);
+        assert_eq!(second.status.code(), Some(75), "{}", String::from_utf8_lossy(&second.stderr));
+        // Nothing of it was touched: it answers where it runs, with what it saved.
+        assert_eq!((sockets(&env), env.state_file().exists()), (vec![run(here)], true));
+        assert!(in_environment(&env, here, &["panes"]).contains("one"));
+        assert!(in_environment(&env, here, &["kill"]).contains("stopped session"));
+        assert_eq!((sockets(&env), lock_file(&env, "state").exists()), (Vec::new(), false));
+        in_environment(&env, there, &["open", "w"]);
+        assert!(in_environment(&env, there, &["panes"]).contains("one"));
+        in_environment(&env, there, &["kill"]);
+        in_environment(&env, here, &["forget"]);
+        let left = (sockets(&env), lock_file(&env, "state").exists(), env.state_file().exists());
+        assert_eq!(left, (Vec::new(), false, false));
+    }
+}
+
+/// Started at the same instant from two environments with different runtime directories, a
+/// session ends with one socket, and one of the two starts is refused: a few rounds of what the
+/// lock decides, which the unit tests of the lock show step by step.
+#[test]
+fn a_session_started_at_once_from_two_runtime_directories_has_one_server() {
+    let env = Env::new("atonce");
+    let _other = StopsOther(&env);
+    let _evidence = Evidence(&env);
+    env.workspace("w", "layout {\n    pane name=\"one\"\n}\n");
+    for round in 0..3 {
+        let together = std::sync::Barrier::new(2);
+        let started: Vec<Output> = std::thread::scope(|scope| {
+            let starts: Vec<_> = [false, true]
+                .into_iter()
+                .map(|other| {
+                    let (env, together) = (&env, &together);
+                    scope.spawn(move || {
+                        together.wait();
+                        bounded(env, other, &["open", "w"])
+                    })
+                })
+                .collect();
+            starts.into_iter().map(|start| start.join().unwrap()).collect()
+        });
+        let at = sockets(&env);
+        assert_eq!(at.len(), 1, "round {round}: {at:?}");
+        let winner = at[0] == "run2";
+        assert!(started[usize::from(winner)].status.success(), "round {round}");
+        let loser = &started[usize::from(!winner)];
+        let said = String::from_utf8_lossy(&loser.stderr);
+        let told = said.contains("is not started here") || said.contains("no server of it listens");
+        assert!(!loser.status.success() && told, "round {round}: {said}");
+        assert!(in_environment(&env, winner, &["panes"]).contains("one"), "round {round}");
+        in_environment(&env, winner, &["kill"]);
+        assert!(!lock_file(&env, "state").exists(), "round {round}");
+        in_environment(&env, !winner, &["forget"]);
+    }
+}
+
+/// A server killed outright leaves its lock files, what it said of itself and its socket:
+/// nothing of that keeps the session from starting again, from either environment.
+#[test]
+fn a_killed_server_leaves_nothing_that_blocks_the_next_start() {
+    let env = Env::new("killedheld");
+    let _other = StopsOther(&env);
+    let _evidence = Evidence(&env);
+    env.workspace("w", "layout {\n    pane name=\"one\"\n}\n");
+    for next in [false, true] {
+        in_environment(&env, false, &["open", "w"]);
+        let pid = env.server_pid().expect("the server runs");
+        let socket = env.root.join("run/kraal/killedheld.sock");
+        // SAFETY: plain syscall to the server this test started.
+        assert_eq!(unsafe { libc::kill(pid, libc::SIGKILL) }, 0);
+        // Gone once nothing listens: a process being killed still does for a moment.
+        wait_until(PATIENCE, "the killed server still listens", || {
+            std::os::unix::net::UnixStream::connect(&socket).is_err()
+        });
+        assert!(lock_file(&env, "state").exists() && socket.exists(), "what a killed server leaves");
+        let started = bounded(&env, next, &["open", "w"]);
+        assert!(started.status.success(), "{}", String::from_utf8_lossy(&started.stderr));
+        assert!(in_environment(&env, next, &["panes"]).contains("one"));
+        in_environment(&env, next, &["kill"]);
+        assert!(!lock_file(&env, "state").exists(), "the lock file a killed server left");
+    }
+}
+
+/// Where the state directory cannot hold a session, none is started there and none forgotten:
+/// the reason is said, with what to do, and what the session saved stays. Here the lock file
+/// cannot be made; a file system that locks no file is what the unit tests put in its place.
+#[test]
+fn a_state_directory_that_cannot_hold_a_session_starts_none_and_forgets_none() {
+    let env = Env::new("nostate");
+    let _evidence = Evidence(&env);
     env.workspace("w", "layout {\n    pane name=\"one\"\n}\n");
     env.run(&["open", "w"]);
-    assert_eq!(lock_files(&env), ["nolock.lock"], "a running server holds its session");
+    wait_until(PATIENCE, "the layout was never saved", || env.state_file().exists());
     env.run(&["kill"]);
-    assert_eq!(lock_files(&env), [""; 0], "left by a server that stopped");
+    // No lock can be had there: a directory is where its file goes.
+    let lock = env.root.join("state/kraal/nostate.lock");
+    std::fs::create_dir(&lock).unwrap();
+    for command in [&["open", "w"][..], &["forget"]] {
+        let out = bounded(&env, false, command);
+        let said = String::from_utf8_lossy(&out.stderr);
+        assert!(!out.status.success() && said.contains("no session can be held in"), "{command:?}: {said}");
+        assert!(said.contains("XDG_STATE_HOME"), "{command:?}: {said}");
+    }
+    assert_eq!((env.server_pid(), sockets(&env)), (None, Vec::new()));
+    assert!(env.state_file().exists(), "what it saved was deleted");
+    std::fs::remove_dir(&lock).unwrap();
+    env.run(&["open", "w"]);
+    assert!(env.run(&["panes"]).contains("one"));
+}
+
+/// `$XDG_RUNTIME_DIR` set to a directory kraal cannot keep its sockets in is said with the
+/// reason: by `kraal config check`, to who starts a server so, in that server's log, and to who
+/// attaches to it. Not set, the sockets go where they go without a word.
+#[test]
+fn a_runtime_directory_kraal_cannot_use_is_said() {
+    let env = Env::new("xdgno");
+    let _evidence = Evidence(&env);
+    env.workspace("w", "layout {\n    pane name=\"one\"\n}\n");
+    std::fs::create_dir_all(env.root.join("state/kraal")).unwrap();
+    std::fs::write(env.root.join("state/kraal/welcomed"), "").unwrap();
+    // Too long for a socket path. The sockets then go under the temporary directory: this
+    // test's own.
+    let (long, tmp) = (env.root.join("x".repeat(60)), env.root.join("t"));
+    for dir in [&long, &tmp] {
+        std::fs::create_dir_all(dir).unwrap();
+    }
+    let tmp = tmp.canonicalize().unwrap();
+    // SAFETY: getuid cannot fail.
+    let sockets = tmp.join(format!("kraal-{}/kraal", unsafe { libc::getuid() }));
+    let warning = format!(
+        "XDG_RUNTIME_DIR ({}) is not used: it is {} bytes long, and a socket path leaves it 59. Sockets are in {}",
+        long.display(),
+        long.as_os_str().len(),
+        sockets.display()
+    );
+    let kraal = |args: &[&str]| env.cmd(args).env("XDG_RUNTIME_DIR", &long).env("TMPDIR", &tmp).output().unwrap();
+    let checked = kraal(&["config", "check"]);
+    assert_eq!(String::from_utf8_lossy(&checked.stderr), format!("warning: {warning}\n"));
+    let unset = env.cmd(&["config", "check"]).env_remove("XDG_RUNTIME_DIR").env("TMPDIR", &tmp).output().unwrap();
+    assert_eq!(String::from_utf8_lossy(&unset.stderr), "");
+    let opened = kraal(&["open", "w"]);
+    assert!(opened.status.success(), "{}", String::from_utf8_lossy(&opened.stderr));
+    assert_eq!(String::from_utf8_lossy(&opened.stderr), format!("kraal: warning: {warning}\n"));
+    let log = std::fs::read_to_string(env.root.join("state/kraal/server-xdgno.log")).unwrap();
+    assert!(log.contains(&format!("kraal: warning: {warning}\n")), "{log}");
+    // Said once, by who started the server.
+    assert_eq!(String::from_utf8_lossy(&kraal(&["panes"]).stderr), "");
+    let client = RawClient::attach_at(&sockets.join("xdgno.sock"), Some("w"), (120, 40), None);
+    client.wait_for_screen("XDG_RUNTIME_DIR (");
+    drop(client);
+    assert!(kraal(&["kill"]).status.success());
+}
+
+/// A start that finds the session held by a kraal that does not listen yet (the one that won
+/// when two starts came at the same moment, a kraal 0.3.0 that holds only its runtime
+/// directory's lock) waits for it, and has a server once that one listens or is gone: it never
+/// says that its own server exited. What is written of the holder decides nothing of that: a
+/// kraal that has just taken the session and not yet said so, under what one killed in another
+/// runtime directory left written, is waited for like any other. While the session stays held
+/// and nothing listens, the start gives up after the time a start may take, and what is written
+/// then tells why.
+#[test]
+fn a_start_waits_for_the_kraal_that_has_the_session() {
+    let env = Env::new("heldstart");
+    let _evidence = Evidence(&env);
+    env.workspace("w", "layout {\n    pane name=\"one\"\n}\n");
+    let elsewhere = "{\"pid\":4242,\"host\":\"another-machine.invalid\",\"runtime\":\"/run/user/1/kraal\"}\n";
+    let held_for = Duration::from_secs(1);
+    for (place, said) in [("run", ""), ("state", ""), ("state", elsewhere)] {
+        let lock = hold(&env, place, said);
+        let start = Instant::now();
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                std::thread::sleep(held_for);
+                drop(lock);
+            });
+            let out = bounded(&env, false, &["open", "w"]);
+            assert!(out.status.success(), "{place} {said:?}: {}", String::from_utf8_lossy(&out.stderr));
+        });
+        assert!(start.elapsed() >= held_for, "{place}: started while the session was held");
+        assert!(env.run(&["panes"]).contains("one"));
+        env.run(&["kill"]);
+    }
+    // Held for good, with no server: said, once a start has had its time.
+    let by_another = "session heldstart is held (by another kraal) and no server of it listens";
+    let on_another = "session heldstart is not started here: it runs on \"another-machine.invalid\" (kraal 4242)";
+    // What is written may name anything where the holder's sockets are: a FIFO, which would
+    // never open, keeps nobody waiting.
+    let fifo = env.root.join("fifo");
+    let name = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+    // SAFETY: a path that ends in a zero byte.
+    assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+    let at_a_fifo =
+        format!("{{\"pid\":4242,\"host\":\"another-machine.invalid\",\"runtime\":{:?}}}\n", fifo.display().to_string());
+    for (said, told) in [("", by_another), (elsewhere, on_another), (at_a_fifo.as_str(), on_another)] {
+        let lock = hold(&env, "state", said);
+        let start = Instant::now();
+        let out = bounded(&env, false, &["open", "w"]);
+        let answer = String::from_utf8_lossy(&out.stderr);
+        assert!(!out.status.success() && answer.contains(told) && !answer.contains("exited"), "{answer}");
+        assert!(gave_up_in_time(start.elapsed()), "gave up after {:?}", start.elapsed());
+        assert_eq!((env.server_pid(), sockets(&env)), (None, Vec::new()));
+        drop(lock);
+    }
+    env.run(&["open", "w"]);
+    assert!(env.run(&["panes"]).contains("one"));
+}
+
+/// A state directory and a runtime directory that are one directory, as given or through a
+/// link, hold a session as two do: it starts at once, is not forgotten while it runs, and is
+/// forgotten once stopped.
+#[test]
+fn a_state_and_a_runtime_directory_that_are_one_hold_a_session() {
+    let env = Env::new("onedir");
+    let _evidence = Evidence(&env);
+    env.workspace("w", "layout {\n    pane name=\"one\"\n}\n");
+    let (both, alias) = (env.root.join("both"), env.root.join("alias"));
+    std::fs::create_dir_all(&both).unwrap();
+    std::os::unix::fs::symlink(&both, &alias).unwrap();
+    for runtime in [&both, &alias] {
+        let kraal = |args: &[&str]| {
+            use std::process::Stdio;
+            let mut c = env.cmd(args);
+            c.env("XDG_STATE_HOME", &both)
+                .env("XDG_RUNTIME_DIR", runtime)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            finish(c.spawn().unwrap(), PATIENCE)
+        };
+        let start = Instant::now();
+        let opened = kraal(&["open", "w"]);
+        assert!(opened.status.success(), "{}", String::from_utf8_lossy(&opened.stderr));
+        assert!(start.elapsed() < Duration::from_secs(5), "started after {:?}", start.elapsed());
+        assert!(String::from_utf8_lossy(&kraal(&["panes"]).stdout).contains("one"));
+        let forget = kraal(&["forget"]);
+        assert!(String::from_utf8_lossy(&forget.stderr).contains("is running"), "{forget:?}");
+        assert!(kraal(&["kill"]).status.success());
+        let forget = kraal(&["forget"]);
+        assert!(forget.status.success(), "{}", String::from_utf8_lossy(&forget.stderr));
+    }
+}
+
+/// Started many times at the same moment, a session has one server, and every start ends with
+/// it: none fails because another one's server was first.
+#[test]
+fn a_session_started_many_times_at_once_starts_once_and_for_all() {
+    let env = Env::new("startrace");
+    let _evidence = Evidence(&env);
+    env.workspace("w", "layout {\n    pane name=\"one\"\n}\n");
+    for round in 0..10 {
+        let together = std::sync::Barrier::new(8);
+        let starts: Vec<Output> = std::thread::scope(|scope| {
+            let starts: Vec<_> = (0..8)
+                .map(|_| {
+                    scope.spawn(|| {
+                        together.wait();
+                        bounded(&env, false, &["open", "w"])
+                    })
+                })
+                .collect();
+            starts.into_iter().map(|start| start.join().unwrap()).collect()
+        });
+        let all: Vec<String> = starts
+            .iter()
+            .map(|out| format!("{}: {}", out.status, String::from_utf8_lossy(&out.stderr).trim()))
+            .collect();
+        assert!(starts.iter().all(|out| out.status.success()), "round {round}: {all:#?}\n{}", evidence(&env));
+        assert!(in_environment(&env, false, &["panes"]).contains("one"), "round {round}\n{}", evidence(&env));
+        // One server: stopped, none is left.
+        in_environment(&env, false, &["kill"]);
+        let start = Instant::now();
+        while env.server_pid().is_some() {
+            assert!(start.elapsed() < PATIENCE, "round {round}: a second server was running\n{}", evidence(&env));
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        in_environment(&env, false, &["forget"]);
+    }
+}
+
+/// A server keeps open nothing of what the kraal that started it was started with. A pipe that
+/// kraal was given (by a script that reads what its commands say, a build tool, a test) ends
+/// for whoever reads it when that kraal is gone, not when the session is.
+#[test]
+fn a_server_keeps_nothing_its_starter_was_given() {
+    use std::io::Read;
+    use std::os::fd::AsRawFd;
+    use std::os::unix::process::CommandExt;
+    let env = Env::new("nofds");
+    let _evidence = Evidence(&env);
+    env.workspace("w", "layout {\n    pane name=\"one\"\n}\n");
+    let (mut read, given) = std::io::pipe().unwrap();
+    let fd = given.as_raw_fd();
+    let mut open = env.cmd(&["open", "w"]);
+    // SAFETY: fcntl alone, which may run between fork and exec. The kraal started has the
+    // writing end of the pipe as a descriptor nobody marked to be closed.
+    unsafe {
+        open.pre_exec(move || match libc::fcntl(fd, libc::F_SETFD, 0) {
+            0 => Ok(()),
+            _ => Err(std::io::Error::last_os_error()),
+        })
+    };
+    let out = within(&env, &mut open, "kraal open w");
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    drop(given);
+    assert!(env.server_pid().is_some(), "no server runs");
+    let (ended, end) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut rest = Vec::new();
+        let _ = ended.send(read.read_to_end(&mut rest));
+    });
+    let ended = end.recv_timeout(Duration::from_secs(10));
+    assert!(ended.is_ok(), "the server holds a pipe of whoever started the kraal that started it");
+}
+
+/// The lock file where a session saves goes with its holder, a server or `kraal forget`: a
+/// session name that was used leaves nothing there, and the file a killed server left is the
+/// next one's to remove. The one of the runtime directory stays, for kraal 0.3.0: it takes that
+/// file without looking at it again, and would hold one that is gone.
+#[test]
+fn a_session_leaves_no_lock_file_where_it_saves() {
+    let env = Env::new("nolock");
+    let _evidence = Evidence(&env);
+    env.workspace("w", "layout {\n    pane name=\"one\"\n}\n");
+    env.run(&["open", "w"]);
+    assert!(lock_file(&env, "state").exists() && lock_file(&env, "run").exists(), "a server holds its session");
+    // Open here until the end: a file made once it is gone could have its number.
+    let runtime_lock = std::fs::File::open(lock_file(&env, "run")).unwrap();
+    env.run(&["kill"]);
+    assert!(!lock_file(&env, "state").exists(), "left by a server that stopped");
     env.run(&["forget"]);
-    assert_eq!(lock_files(&env), [""; 0], "left by kraal forget");
+    assert!(!lock_file(&env, "state").exists(), "left by kraal forget");
     // A server killed outright cannot remove its file: the next server takes it, and removes it.
     env.run(&["open", "w"]);
     let pid = env.server_pid().expect("the server runs");
@@ -1418,10 +1908,13 @@ fn a_session_leaves_no_lock_file_behind() {
     wait_until(Duration::from_secs(10), "the killed server still listens", || {
         std::os::unix::net::UnixStream::connect(&socket).is_err()
     });
-    assert_eq!(lock_files(&env), ["nolock.lock"]);
+    assert!(lock_file(&env, "state").exists());
     env.run(&["open", "w"]);
     env.run(&["kill"]);
-    assert_eq!(lock_files(&env), [""; 0], "left by the server after a killed one");
+    assert!(!lock_file(&env, "state").exists(), "left by the server after a killed one");
+    let number = |file: std::fs::Metadata| std::os::unix::fs::MetadataExt::ino(&file);
+    let (then, now) = (runtime_lock.metadata().unwrap(), std::fs::metadata(lock_file(&env, "run")).unwrap());
+    assert_eq!(number(now), number(then), "the runtime directory's lock file was replaced");
 }
 
 /// Servers started and stopped and the session forgotten, all at once and from many processes:
@@ -1431,7 +1924,10 @@ fn a_session_leaves_no_lock_file_behind() {
 fn a_session_started_stopped_and_forgotten_at_once_is_held_by_one_at_a_time() {
     use std::process::Stdio;
     let env = Env::new("lockrace");
+    let _evidence = Evidence(&env);
     env.workspace("w", "layout {\n    pane name=\"one\"\n}\n");
+    // Each server with the file it says in: no pipe, which a server started at the same moment
+    // would keep open for as long as it runs.
     let servers = std::sync::Mutex::new(Vec::new());
     std::thread::scope(|scope| {
         for worker in 0..8u64 {
@@ -1439,20 +1935,22 @@ fn a_session_started_stopped_and_forgotten_at_once_is_held_by_one_at_a_time() {
             scope.spawn(move || {
                 // The same commands in the same order at each run, different for each worker.
                 let mut random = worker + 1;
-                for _ in 0..30 {
+                for n in 0..30 {
                     random = random.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
                     match (random >> 33) % 4 {
                         0 | 1 => {
-                            let server = env.cmd(&["server"]).stdout(Stdio::null()).stderr(Stdio::piped()).spawn();
-                            servers.lock().unwrap().push(server.unwrap());
+                            let said = env.root.join(format!("server-{worker}-{n}.err"));
+                            let err = std::fs::File::create(&said).unwrap();
+                            let server = env.cmd(&["server"]).stdout(Stdio::null()).stderr(err).spawn();
+                            servers.lock().unwrap().push((server.unwrap(), said));
                         }
                         2 => {
-                            let out = env.try_run(&["kill"]);
+                            let out = bounded(env, false, &["kill"]);
                             let said = String::from_utf8_lossy(&out.stderr);
                             assert!(out.status.success() || said.contains("no kraal server"), "kill: {said}");
                         }
                         _ => {
-                            let out = env.try_run(&["forget"]);
+                            let out = bounded(env, false, &["forget"]);
                             let said = String::from_utf8_lossy(&out.stderr);
                             assert!(out.status.success() || said.contains("is running"), "forget: {said}");
                         }
@@ -1466,29 +1964,31 @@ fn a_session_started_stopped_and_forgotten_at_once_is_held_by_one_at_a_time() {
     let servers = servers.into_inner().unwrap();
     assert!(servers.len() > 100, "{} servers started", servers.len());
     let (mut ran, mut refused) = (0, 0);
-    for mut server in servers {
+    for (mut server, said) in servers {
         let start = Instant::now();
-        while server.try_wait().unwrap().is_none() {
-            let _ = env.try_run(&["kill"]);
-            assert!(start.elapsed() < Duration::from_secs(30), "a server would not stop");
-        }
-        let out = server.wait_with_output().unwrap();
-        let said = String::from_utf8_lossy(&out.stderr);
-        match out.status.success() {
+        let status = loop {
+            if let Some(status) = server.try_wait().unwrap() {
+                break status;
+            }
+            let _ = bounded(&env, false, &["kill"]);
+            assert!(start.elapsed() < Duration::from_secs(30), "a server would not stop\n{}", evidence(&env));
+        };
+        let said = std::fs::read_to_string(said).unwrap();
+        match status.success() {
             true => ran += 1,
             false => refused += 1,
         }
-        assert_eq!(out.status.success(), said.is_empty(), "{said}");
+        assert_eq!(status.success(), said.is_empty(), "{said}");
         assert!(said.is_empty() || said.contains("holds session \"lockrace\""), "{said}");
     }
     assert!(ran > 0 && refused > 0, "{ran} servers ran, {refused} were refused");
-    assert_eq!(lock_files(&env), [""; 0]);
+    assert!(!lock_file(&env, "state").exists());
     // And the session is as any other.
     env.run(&["open", "w"]);
     assert!(env.run(&["panes"]).contains("one"));
     env.run(&["kill"]);
     env.run(&["forget"]);
-    assert_eq!(lock_files(&env), [""; 0]);
+    assert!(!lock_file(&env, "state").exists());
 }
 
 /// A workspace that cannot be restored (its shell is gone) stays saved as it was, scrollback

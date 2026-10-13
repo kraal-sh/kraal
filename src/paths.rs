@@ -91,6 +91,30 @@ fn runtime_dir_in(xdg: Option<PathBuf>) -> PathBuf {
     base.join("kraal")
 }
 
+/// Why the sockets are not in `$XDG_RUNTIME_DIR` although it is set, and where they are: said
+/// when a server is started (to who starts it, and in its log) and by `kraal config check`,
+/// since whoever set it expects them there. `None` when it is used, or not set: the sockets
+/// then go where they go without a word.
+pub fn runtime_dir_refused() -> Option<String> {
+    let xdg = std::env::var_os("XDG_RUNTIME_DIR").filter(|dir| !dir.is_empty()).map(PathBuf::from)?;
+    let why = base_refused(&xdg, RUNTIME_BASE_MAX)?;
+    Some(format!("XDG_RUNTIME_DIR ({}) is not used: {why}. Sockets are in {}", xdg.display(), runtime_dir().display()))
+}
+
+/// Why [`checked_base`] does not take `dir`, if it does not.
+fn base_refused(dir: &Path, max_len: usize) -> Option<String> {
+    if checked_base(dir, max_len).is_some() {
+        return None;
+    }
+    Some(if !dir.is_dir() {
+        "it is not a directory".into()
+    } else if short_spelling(dir, max_len).is_none() {
+        format!("it is {} bytes long, and a socket path leaves it {max_len}", dir.as_os_str().len())
+    } else {
+        "another user could replace it, or what is in it".into()
+    })
+}
+
 /// Create `dir` (and missing parents) and make sure it is a real directory owned by us and
 /// private (0700). Refuses symlinks and directories owned by someone else: a socket in such a
 /// place could be read or replaced by another user.
@@ -419,56 +443,168 @@ fn try_lock(file: &std::fs::File) -> std::io::Result<bool> {
     }
 }
 
-/// A session held by one process: its server, from before it listens until it is gone, or
-/// `kraal forget` while it deletes what the session saved. A session so never has two servers,
-/// nor loses its files to `forget` while a server restores them, which a check that its socket
-/// answers cannot promise (a server not listening yet, a socket deleted).
+/// A session held by one process: its server, from before it reads what the session saved until
+/// nothing of it can write there any more, or `kraal forget` while it deletes that. Among the
+/// kraal that take it, a session so never has two servers, nor loses its files to `forget` while
+/// a server restores them, which a check that its socket answers cannot promise (a server not
+/// listening yet, a socket deleted, a server whose socket is in another runtime directory).
 ///
-/// The lock is a file in the runtime directory, which goes with its holder: every session name
-/// ever used would leave one otherwise. A process killed while it holds the session leaves its
-/// file, for the next holder of that session to take and remove.
+/// It is held where the session saves, in the state directory: two kraal of one user that do not
+/// resolve the same runtime directory (a desktop terminal with `$XDG_RUNTIME_DIR`, a cron job
+/// without it) write the same files, and so do the machines that share a home directory. The
+/// one that comes second is refused, and told who has the session ([`Holder`]). The lock of the
+/// runtime directory is held as well: the only one kraal 0.3.0 takes, which so keeps out and is
+/// kept out in that directory, and nowhere else. Kraal 0.2.0 takes none ([`listen_alone`]).
+///
+/// The state directory's lock file goes with its holder (every session name ever used would
+/// leave one otherwise): only a kraal that looks at the file again once it has locked it takes
+/// it. The runtime directory's stays: kraal 0.3.0 does not look again, and would hold a file
+/// that is gone beside the holder of the one made since. That directory goes with the login.
 pub struct SessionLock {
+    _state: LockFile,
+    /// `None` when it is the state directory's file: both directories are one.
+    _runtime: Option<LockFile>,
+}
+
+/// How a file is locked for this process alone: [`try_lock`], or what a test has in its place.
+type Locker = fn(&std::fs::File) -> std::io::Result<bool>;
+
+impl SessionLock {
+    /// Hold `session`, unless another process does (`None`). An error when the state directory
+    /// cannot hold it (its file system locks no file): a session is then neither started nor
+    /// forgotten, where a second server or a `forget` could not be kept away from its files.
+    pub fn acquire(session: &str) -> std::io::Result<Option<SessionLock>> {
+        let runtime = private_runtime_dir()?;
+        // What a session saves, and who holds it, is only ours to read.
+        let state = state_dir();
+        ensure_private_dir(&state)?;
+        let holder = Holder {
+            pid: std::process::id(),
+            host: crate::context::hostname().unwrap_or_default(),
+            runtime: runtime.clone(),
+        };
+        let lock = format!("{session}.lock");
+        SessionLock::acquire_at(state.join(&lock), runtime.join(&lock), &holder, try_lock)
+    }
+
+    fn acquire_at(
+        state: PathBuf,
+        runtime: PathBuf,
+        holder: &Holder,
+        lock: Locker,
+    ) -> std::io::Result<Option<SessionLock>> {
+        let dir = state.parent().unwrap_or(&state).display().to_string();
+        let unheld = |e: std::io::Error| {
+            let why = format!(
+                "no session can be held in {dir} ({e}): kraal starts no server and forgets nothing where it \
+                 cannot keep another kraal out. Keep its state on a file system that locks files (XDG_STATE_HOME)"
+            );
+            std::io::Error::new(e.kind(), why)
+        };
+        let Some(mut state) = LockFile::acquire(state, false, lock).map_err(unheld)? else { return Ok(None) };
+        // One file for both where the state and the runtime directory are one, however each is
+        // spelt: locked once (a second lock on it would wait for the first), and left in place
+        // as the runtime directory's is.
+        let runtime = if is_file_at(&state.file, &runtime) {
+            state.stays = true;
+            None
+        } else {
+            let Some(runtime) = LockFile::acquire(runtime, true, lock)? else { return Ok(None) };
+            Some(runtime)
+        };
+        // What it says is for a user to read: the session is held whether or not it is written.
+        let _ = state.say(holder);
+        Ok(Some(SessionLock { _state: state, _runtime: runtime }))
+    }
+}
+
+/// What the holder of a session says of itself in the state directory: for the kraal it keeps
+/// out to tell its user, who alone acts on it. Nothing there is connected to or signalled.
+#[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct Holder {
+    pub pid: u32,
+    /// The machine it runs on: one that shares the state directory may be another.
+    pub host: String,
+    /// Where its sockets are.
+    pub runtime: PathBuf,
+}
+
+/// What the holder of `session` says of itself, if it says so in a file of ours. What a holder
+/// killed before said is there until the next one says its own.
+pub fn holder(session: &str) -> Option<Holder> {
+    holder_at(&state_dir().join(format!("{session}.lock")))
+}
+
+fn holder_at(lock: &Path) -> Option<Holder> {
+    use std::io::Read;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    // Not waited for: what is not a file there (a FIFO) would never open.
+    let flags = libc::O_NOFOLLOW | libc::O_NONBLOCK;
+    let file = std::fs::OpenOptions::new().read(true).custom_flags(flags).open(lock).ok()?;
+    let meta = file.metadata().ok()?;
+    // SAFETY: getuid cannot fail.
+    if !meta.is_file() || meta.uid() != unsafe { libc::getuid() } {
+        return None;
+    }
+    let mut said = String::new();
+    file.take(4096).read_to_string(&mut said).ok()?;
+    serde_json::from_str(said.lines().next()?).ok()
+}
+
+/// A lock file held by one process.
+struct LockFile {
     /// Locked while open.
     file: std::fs::File,
     path: PathBuf,
+    /// Whether the file is left in place when its holder goes.
+    stays: bool,
 }
 
-impl SessionLock {
-    /// Hold `session`, unless another process does (`None`).
-    pub fn acquire(session: &str) -> std::io::Result<Option<SessionLock>> {
-        SessionLock::acquire_at(private_runtime_dir()?.join(format!("{session}.lock")))
-    }
-
+impl LockFile {
     /// Hold the lock file `path`, made if needed, unless another process does (`None`).
-    fn acquire_at(path: PathBuf) -> std::io::Result<Option<SessionLock>> {
-        use std::os::unix::fs::OpenOptionsExt;
+    fn acquire(path: PathBuf, stays: bool, lock: Locker) -> std::io::Result<Option<LockFile>> {
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
         loop {
             let file = std::fs::OpenOptions::new()
                 .create(true)
                 .truncate(false)
                 .write(true)
                 .mode(0o600)
-                .custom_flags(libc::O_NOFOLLOW)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
                 .open(&path)?;
-            if !try_lock(&file)? {
+            let meta = file.metadata()?;
+            // SAFETY: getuid cannot fail.
+            if !meta.is_file() || meta.uid() != unsafe { libc::getuid() } {
+                return Err(std::io::Error::other(format!("{} is not a file of ours", path.display())));
+            }
+            if !lock(&file)? {
                 return Ok(None);
             }
             if is_file_at(&file, &path) {
-                return Ok(Some(SessionLock { file, path }));
+                return Ok(Some(LockFile { file, path, stays }));
             }
-            // Its last holder removed the file between the time it was opened here and the time
-            // it was locked: it locks nothing any more. The lock is the file there now, as it is
-            // for whoever comes next.
+            // The file was removed between the time it was opened here and the time it was
+            // locked (by its last holder, or by a cleaner of /tmp): it locks nothing any more.
+            // The lock is the file there now, as it is for whoever comes next.
         }
+    }
+
+    /// Write in the file who holds it, in place of what its last holder said.
+    fn say(&self, holder: &Holder) -> std::io::Result<()> {
+        use std::os::unix::fs::FileExt;
+        let mut line = serde_json::to_vec(holder).map_err(std::io::Error::other)?;
+        line.push(b'\n');
+        self.file.set_len(0)?;
+        self.file.write_all_at(&line, 0)
     }
 }
 
-impl Drop for SessionLock {
+impl Drop for LockFile {
     fn drop(&mut self) {
         // Removed while still held: nobody else holds it then, and who opened it before finds
-        // out once it has locked it (see `acquire_at`). A file someone else put there meanwhile
+        // out once it has locked it (see `acquire`). A file someone else put there meanwhile
         // (a cleaner of /tmp removed this one) is theirs.
-        if is_file_at(&self.file, &self.path) {
+        if !self.stays && is_file_at(&self.file, &self.path) {
             let _ = std::fs::remove_file(&self.path);
         }
     }
@@ -506,8 +642,213 @@ fn reachable(current: PathBuf, older: Vec<PathBuf>) -> PathBuf {
         .iter()
         .filter(|old| **old != current)
         .filter_map(|old| checked_socket(old))
-        .find(|old| std::os::unix::net::UnixStream::connect(old).is_ok())
+        .find(|old| !nobody_listens(old))
         .unwrap_or(current)
+}
+
+/// Whether nobody listens at `socket`: nothing is there, or what is there refuses a connection.
+/// A server that takes none for now is somebody: no other is started beside it, and what its
+/// session saved is not forgotten. Linux tells such a server from a socket left behind; macOS
+/// refuses for both. So a refusal alone removes nothing and forgets nothing: whoever acts on it
+/// holds the session first ([`SessionLock`]), which a server of kraal 0.3.0 or later that is
+/// only busy still has. What is left is a busy server of kraal 0.2.0 on macOS, which holds
+/// nothing.
+pub fn nobody_listens(socket: &Path) -> bool {
+    use std::io::ErrorKind;
+    connect_now(socket).is_err_and(|e| matches!(e.kind(), ErrorKind::NotFound | ErrorKind::ConnectionRefused))
+}
+
+/// What the system's socket address has for a path, the zero byte that ends it included: 108
+/// bytes on Linux, 104 on macOS.
+const SUN_PATH: usize = std::mem::size_of::<libc::sockaddr_un>() - std::mem::offset_of!(libc::sockaddr_un, sun_path);
+
+/// Connect to `socket` without waiting. A server that takes no connection now (it is stopped, or
+/// far behind: its queue is full) is `WouldBlock` on Linux, where a plain connect would wait for
+/// it without end. macOS refuses such a connection as it does one to a socket nobody listens
+/// at: the two cannot be told apart there.
+pub fn connect_now(socket: &Path) -> std::io::Result<std::os::unix::net::UnixStream> {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::os::unix::ffi::OsStrExt;
+    let name = socket.as_os_str().as_bytes();
+    // SAFETY: plain C data: all zero bytes are a valid value.
+    let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    if name.len() >= SUN_PATH || name.contains(&0) {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "not a socket path"));
+    }
+    addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
+    for (to, from) in addr.sun_path.iter_mut().zip(name) {
+        *to = *from as libc::c_char;
+    }
+    // SAFETY: plain syscall.
+    let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: a descriptor just made, owned by nothing else.
+    let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+    // SAFETY: flags of a descriptor we own.
+    unsafe {
+        libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC);
+        libc::fcntl(fd.as_raw_fd(), libc::F_SETFL, libc::O_NONBLOCK);
+    }
+    let len = std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t;
+    // SAFETY: `addr` is a whole sockaddr_un, with a path that ends in a zero byte.
+    while unsafe { libc::connect(fd.as_raw_fd(), (&raw const addr).cast(), len) } != 0 {
+        let e = std::io::Error::last_os_error();
+        if e.kind() != std::io::ErrorKind::Interrupted {
+            return Err(e);
+        }
+    }
+    let stream = std::os::unix::net::UnixStream::from(fd);
+    stream.set_nonblocking(false)?;
+    Ok(stream)
+}
+
+/// Listen at `socket`, where no server does: `None` when one listens there, or takes no
+/// connection for now. A socket that refuses is removed first ([`remove_stale`]). Whoever calls
+/// this holds the session, so no kraal that takes its lock listens there. What else may is a
+/// server of kraal 0.2.0, which takes none: nothing here keeps such a one out for certain. One
+/// that has bound its socket and does not listen yet refuses like a socket left behind, and so
+/// does, on macOS, one whose queue is full.
+pub fn listen_alone(socket: &Path) -> std::io::Result<Option<std::os::unix::net::UnixListener>> {
+    listen_alone_with(socket, |file, name| std::fs::hard_link(file, name), &mut |_| ())
+}
+
+/// [`listen_alone`], with what gives a file a second name (`link`), and `meanwhile`, run with
+/// that name between the moment a socket refused and its removal: where the tests put a file
+/// system that gives none, and a server that takes the place at that moment.
+fn listen_alone_with(
+    socket: &Path,
+    link: fn(&Path, &Path) -> std::io::Result<()>,
+    meanwhile: &mut dyn FnMut(Option<&Path>),
+) -> std::io::Result<Option<std::os::unix::net::UnixListener>> {
+    use std::io::ErrorKind;
+    let alias = alias_of(socket);
+    remove_abandoned_aliases(socket);
+    // A lockless server that takes the place again and again is not raced with for ever.
+    for _ in 0..5 {
+        match std::os::unix::net::UnixListener::bind(socket) {
+            Ok(listener) => return Ok(Some(listener)),
+            Err(e) if e.kind() == ErrorKind::AddrInUse => {}
+            Err(e) => return Err(e),
+        }
+        // The file there, before anything is asked of it: what refuses below is this one.
+        let there = file_id(socket);
+        // A second name for it, for as long as it is looked at: a file is told from another
+        // by its number, and one made once this one is gone may be given the same (ext4 gives
+        // a new file the number just freed). While this one has a name, no other has its number.
+        let named = match &alias {
+            Some(alias) => match link(socket, alias) {
+                Ok(()) => true,
+                // Gone since: the place is free.
+                Err(e) if e.kind() == ErrorKind::NotFound => continue,
+                Err(e) if e.kind() == ErrorKind::AlreadyExists => {
+                    let why = format!("{} is in the way of looking at {}", alias.display(), socket.display());
+                    return Err(std::io::Error::new(ErrorKind::AlreadyExists, why));
+                }
+                // No second name can be made here. The file is then told by the number it had
+                // before it refused: sound unless a server that takes no lock replaces it in
+                // that moment and is given its number. Refusing to remove it instead would
+                // keep every session whose server was killed from starting again there.
+                Err(_) => false,
+            },
+            None => false,
+        };
+        let (asked, seen) = match &alias {
+            Some(alias) if named => (alias.as_path(), file_id(alias)),
+            _ => (socket, there),
+        };
+        let refused = match connect_now(asked) {
+            Err(e) if e.kind() == ErrorKind::ConnectionRefused => Ok(true),
+            // Gone since: the place is free, and there is nothing to remove.
+            Err(e) if e.kind() == ErrorKind::NotFound => {
+                meanwhile(None);
+                continue;
+            }
+            // The second name is made here to be a socket path: that it is none is a mistake
+            // of this code, not a server that takes no connection.
+            Err(e) if named && e.kind() == ErrorKind::InvalidInput => Err(e),
+            // It answers, or will once it takes connections again.
+            _ => Ok(false),
+        };
+        let removed = refused.and_then(|refused| {
+            if refused {
+                meanwhile(named.then_some(asked));
+                remove_stale(socket, seen)?;
+            }
+            Ok(refused)
+        });
+        if named {
+            let _ = std::fs::remove_file(asked);
+        }
+        if !removed? {
+            return Ok(None);
+        }
+    }
+    Err(std::io::Error::new(ErrorKind::AddrInUse, "something keeps taking that place"))
+}
+
+/// What ends a socket's own name, and what stands there in the second name [`listen_alone`]
+/// gives it: `~`, which no session name and no file of kraal's has, before four characters.
+const SOCKET_SUFFIX: &str = ".sock";
+const ALIAS_MARK: char = '~';
+
+/// The second name [`listen_alone`] gives the file at `socket` while it looks at it: next to
+/// it, of this process alone, and exactly as long as the socket's own, so that it is a socket
+/// path wherever that one is. `None` for a path that is not named as kraal names its sockets,
+/// or that no socket address holds.
+fn alias_of(socket: &Path) -> Option<PathBuf> {
+    const DIGITS: &[u8; 62] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+    let stem = socket.file_name()?.to_str()?.strip_suffix(SOCKET_SUFFIX)?;
+    // Four digits hold every process id (4194304 at most on Linux, 99999 on macOS).
+    let mut id = std::process::id() as usize;
+    let mut digits = [0u8; SOCKET_SUFFIX.len() - 1];
+    for digit in digits.iter_mut().rev() {
+        *digit = DIGITS[id % DIGITS.len()];
+        id /= DIGITS.len();
+    }
+    let alias = socket.with_file_name(format!("{stem}{ALIAS_MARK}{}", String::from_utf8_lossy(&digits)));
+    (alias.as_os_str().len() < SUN_PATH).then_some(alias)
+}
+
+/// Remove the second names of `socket` that a kraal killed while it looked at it left behind.
+/// Whoever calls this holds the session, so none is in use. Each is unlinked as the entry it
+/// is, never followed; what cannot be unlinked so (a directory put there) stays.
+fn remove_abandoned_aliases(socket: &Path) {
+    let (Some(dir), Some(name)) = (socket.parent(), socket.file_name().and_then(|name| name.to_str())) else { return };
+    let Some(stem) = name.strip_suffix(SOCKET_SUFFIX) else { return };
+    for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+        let name = entry.file_name();
+        let alias = name.to_str().and_then(|name| name.strip_prefix(stem)?.strip_prefix(ALIAS_MARK));
+        if alias.is_some_and(|id| id.len() == SOCKET_SUFFIX.len() - 1 && id.chars().all(|c| c.is_ascii_alphanumeric()))
+        {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
+/// Remove the socket at `socket` that refused a connection: the file `stale`, which whoever
+/// calls this keeps under another name meanwhile, so that no other file has its number. What is
+/// at `socket` is moved aside and looked at before it is deleted: when another file took the
+/// place between the refusal and the move (a kraal 0.2.0, which holds no lock, started then),
+/// that one is put back instead. This narrows what a check followed by a removal leaves open,
+/// and does not close it: yet another server may take the place while the file is aside, and
+/// the file then stays aside.
+fn remove_stale(socket: &Path, stale: Option<(u64, u64)>) -> std::io::Result<()> {
+    let aside = socket.with_extension(format!("stale.{}", std::process::id()));
+    match std::fs::rename(socket, &aside) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        moved => moved?,
+    }
+    if stale.is_some() && file_id(&aside) == stale {
+        return std::fs::remove_file(&aside);
+    }
+    // Back under its name, unless a third server has taken it: the file then stays aside,
+    // since nothing says that nobody listens at it.
+    match rename_no_replace(&aside, socket) {
+        Err(e) if e.kind() != std::io::ErrorKind::AlreadyExists => Err(e),
+        _ => Ok(()),
+    }
 }
 
 /// `socket` spelt as it was checked: links resolved, or as given when that alone fits a socket
@@ -754,6 +1095,40 @@ mod tests {
         let _ = std::fs::remove_dir(long_dir);
         let _ = std::fs::remove_dir(base);
         assert!(fallback_runtime_base().as_os_str().len() <= RUNTIME_BASE_MAX);
+    }
+
+    /// The server of an older kraal that takes no connection for now is found as one that
+    /// answers is: no other is started beside it at the usual place, and its session is not
+    /// forgotten. Linux tells such a server from a socket nobody listens at.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_server_of_an_older_kraal_that_takes_no_connection_is_still_found() {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join(format!("kraal-legacy-full-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let (now, old) = (root.join("now"), root.join("old"));
+        for d in [&now, &old] {
+            std::fs::create_dir_all(d).unwrap();
+            std::fs::set_permissions(d, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let root = root.canonicalize().unwrap();
+        let (current, legacy) = (root.join("now/work.sock"), root.join("old/work.sock"));
+        let server = std::os::unix::net::UnixListener::bind(&legacy).unwrap();
+        // SAFETY: plain syscall on a socket this test holds: its queue takes one connection.
+        assert_eq!(unsafe { libc::listen(server.as_raw_fd(), 0) }, 0);
+        let _waiting = connect_now(&legacy).unwrap();
+        assert_eq!(connect_now(&legacy).unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
+        assert!(!nobody_listens(&legacy));
+        assert_eq!(reachable(current.clone(), vec![legacy.clone()]), legacy);
+        // So a server that would start for the session finds that one, and starts none.
+        assert!(listen_alone(&reachable(current.clone(), vec![legacy.clone()])).unwrap().is_none());
+        assert!(!current.exists());
+        // Gone, its socket refuses: the usual place again.
+        drop((server, _waiting));
+        until_nobody_listens(&legacy);
+        assert_eq!(reachable(current.clone(), vec![legacy]), current);
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]
@@ -1037,30 +1412,63 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// What `take` gives once nobody holds what it locks. A lock file that stays is, for a
+    /// moment after its holder let go, still locked by a program another test is starting: that
+    /// one has this process's files until it runs.
+    fn once_free<T>(take: impl Fn() -> std::io::Result<Option<T>>) -> T {
+        let start = std::time::Instant::now();
+        loop {
+            if let Some(held) = take().unwrap() {
+                return held;
+            }
+            assert!(start.elapsed() < crate::testing::PATIENCE, "never let go");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+
+    /// Wait until nobody listens at `socket` any more: a listener this test closed is, for the
+    /// same moment, still open in a program another test is starting.
+    fn until_nobody_listens(socket: &Path) {
+        let start = std::time::Instant::now();
+        while !nobody_listens(socket) {
+            assert!(start.elapsed() < crate::testing::PATIENCE, "still listened at");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+
     #[test]
     fn a_session_lock_goes_with_its_holder_and_no_other_file_does() {
         let dir = std::env::temp_dir().join(format!("kraal-lock-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("main.lock");
-        let held = SessionLock::acquire_at(path.clone()).unwrap().expect("nobody holds it");
+        let held = LockFile::acquire(path.clone(), false, try_lock).unwrap().expect("nobody holds it");
         // Whoever else asks is refused, and leaves the holder its file.
-        assert!(SessionLock::acquire_at(path.clone()).unwrap().is_none());
+        assert!(LockFile::acquire(path.clone(), false, try_lock).unwrap().is_none());
         assert!(is_file_at(&held.file, &path));
         drop(held);
         assert!(!path.exists(), "the lock file was left");
         // The file a killed holder left is taken, then goes too.
         std::fs::write(&path, "").unwrap();
-        drop(SessionLock::acquire_at(path.clone()).unwrap().expect("nobody holds it"));
+        drop(LockFile::acquire(path.clone(), false, try_lock).unwrap().expect("nobody holds it"));
         assert!(!path.exists(), "the file of a killed holder was left");
         // A file put there while this one was held (this one removed by a cleaner of /tmp) is
         // the lock of whoever made it.
-        let held = SessionLock::acquire_at(path.clone()).unwrap().unwrap();
+        let held = LockFile::acquire(path.clone(), false, try_lock).unwrap().unwrap();
         std::fs::remove_file(&path).unwrap();
-        let other = SessionLock::acquire_at(path.clone()).unwrap().expect("the file there is free");
+        let other = LockFile::acquire(path.clone(), false, try_lock).unwrap().expect("the file there is free");
         drop(held);
         assert!(is_file_at(&other.file, &path), "the file of another holder was removed");
         drop(other);
         assert!(!path.exists());
+        // One that stays (the runtime directory's, which kraal 0.3.0 takes without looking at it
+        // again) is the same file for every holder.
+        let held = LockFile::acquire(path.clone(), true, try_lock).unwrap().unwrap();
+        // Open here while it is looked for: a file made once it is gone could have its number.
+        let file = std::fs::File::open(&path).unwrap();
+        drop(held);
+        assert!(is_file_at(&file, &path), "the lock file went with its holder");
+        drop(once_free(|| LockFile::acquire(path.clone(), true, try_lock)));
+        assert!(is_file_at(&file, &path));
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -1108,7 +1516,7 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
         for _ in 0..5000 {
-            let Some(held) = SessionLock::acquire_at(lock.clone()).unwrap() else { continue };
+            let Some(held) = LockFile::acquire(lock.clone(), false, try_lock).unwrap() else { continue };
             // A file only one process can make: another holder would have made it.
             let made = std::fs::OpenOptions::new().write(true).create_new(true).open(&alone);
             assert!(made.is_ok(), "held by two at once");
@@ -1116,6 +1524,303 @@ mod tests {
             std::fs::remove_file(&alone).unwrap();
             drop(held);
         }
+    }
+
+    /// A session is held in the state directory: a kraal with another runtime directory does
+    /// not hold it too, and reads who does. The state directory's lock file goes with its
+    /// holder; the runtime directory's stays, for kraal 0.3.0.
+    #[test]
+    fn a_session_is_held_in_the_state_directory_whatever_the_runtime_one() {
+        let dir = std::env::temp_dir().join(format!("kraal-held-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (state, here, there) = (dir.join("state"), dir.join("here"), dir.join("there"));
+        for d in [&state, &here, &there] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        let lock = |d: &Path| d.join("main.lock");
+        let holder = |runtime: &Path| Holder { pid: 4242, host: "box".into(), runtime: runtime.to_path_buf() };
+        let hold = |runtime: &Path| SessionLock::acquire_at(lock(&state), lock(runtime), &holder(runtime), try_lock);
+        let held = hold(&here).unwrap().expect("nobody has it");
+        assert!(hold(&there).unwrap().is_none());
+        assert_eq!(holder_at(&lock(&state)), Some(holder(&here)), "the one refused wrote nothing");
+        assert!(!lock(&there).exists(), "the one refused left a lock");
+        // Open here while it is looked for: a file made once it is gone could have its number.
+        let runtime_lock = std::fs::File::open(lock(&here)).unwrap();
+        drop(held);
+        assert!(!lock(&state).exists(), "the state directory's lock file was left");
+        assert!(is_file_at(&runtime_lock, &lock(&here)), "the runtime directory's went");
+        // What a holder killed before said is replaced by the next one's.
+        std::fs::write(lock(&state), "{\"pid\":1,\"host\":\"gone\",\"runtime\":\"/elsewhere\"}\nmore\n").unwrap();
+        let held = once_free(|| hold(&there));
+        assert_eq!(std::fs::read_to_string(lock(&state)).unwrap().lines().count(), 1);
+        assert_eq!(holder_at(&lock(&state)), Some(holder(&there)));
+        drop(held);
+        // A kraal 0.3.0 holds the runtime directory's lock alone: the session is its own there,
+        // and the same file is the lock once it is gone.
+        let old = once_free(|| LockFile::acquire(lock(&here), true, try_lock));
+        assert!(hold(&here).unwrap().is_none());
+        assert!(!lock(&state).exists(), "the one refused kept the state directory's lock");
+        drop(old);
+        assert!(is_file_at(&runtime_lock, &lock(&here)));
+        drop(once_free(|| hold(&here)));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Where no lock can be had in the state directory (its file system locks no file, or the
+    /// lock file cannot be made), the session is not held at all: an error says what to do, and
+    /// the runtime directory's lock is not taken in its place.
+    #[test]
+    fn a_session_is_not_held_where_the_state_directory_cannot_lock() {
+        let dir = std::env::temp_dir().join(format!("kraal-unheld-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (state, runtime) = (dir.join("state"), dir.join("runtime"));
+        for d in [&state, &runtime] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        let (state, runtime) = (state.join("main.lock"), runtime.join("main.lock"));
+        let holder = Holder { pid: 4242, host: "box".into(), runtime: dir.join("runtime") };
+        // As a file system that locks no file answers.
+        fn no_locks(_: &std::fs::File) -> std::io::Result<bool> {
+            Err(std::io::Error::from_raw_os_error(libc::ENOLCK))
+        }
+        let unheld = SessionLock::acquire_at(state.clone(), runtime.clone(), &holder, no_locks).err().expect("held");
+        let said = unheld.to_string();
+        assert!(said.contains("no session can be held in") && said.contains("XDG_STATE_HOME"), "{said}");
+        assert_eq!(unheld.raw_os_error(), None, "{said}");
+        assert!(said.contains(&std::io::Error::from_raw_os_error(libc::ENOLCK).to_string()), "{said}");
+        assert!(!runtime.exists(), "the runtime directory's lock was taken");
+        // A lock file that cannot be made is said the same way.
+        std::fs::remove_file(&state).unwrap();
+        std::fs::create_dir(&state).unwrap();
+        let unheld = SessionLock::acquire_at(state, runtime.clone(), &holder, try_lock).err().expect("held");
+        assert!(unheld.to_string().contains("no session can be held in"), "{unheld}");
+        assert!(!runtime.exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A state directory and a runtime directory that are one, as given or through a link, have
+    /// one lock file for both: it is locked once, and stays as the runtime directory's does.
+    #[test]
+    fn a_state_and_a_runtime_directory_that_are_one_hold_a_session_once() {
+        let dir = std::env::temp_dir().join(format!("kraal-onedir-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (both, alias) = (dir.join("both"), dir.join("alias"));
+        std::fs::create_dir_all(&both).unwrap();
+        std::os::unix::fs::symlink(&both, &alias).unwrap();
+        let holder = Holder { pid: 4242, host: "box".into(), runtime: both.clone() };
+        for runtime in [&both, &alias] {
+            let hold = || SessionLock::acquire_at(both.join("main.lock"), runtime.join("main.lock"), &holder, try_lock);
+            let held = once_free(hold);
+            assert!(hold().unwrap().is_none(), "held twice");
+            // A kraal 0.3.0, which knows the runtime directory's lock alone, is kept out too.
+            assert!(LockFile::acquire(runtime.join("main.lock"), true, try_lock).unwrap().is_none());
+            assert_eq!(holder_at(&both.join("main.lock")).map(|said| said.pid), Some(4242));
+            let file = std::fs::File::open(both.join("main.lock")).unwrap();
+            drop(held);
+            assert!(is_file_at(&file, &both.join("main.lock")), "the lock file went with its holder");
+            drop(once_free(hold));
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// What says who holds a session is read only from a file of ours, and never waited for.
+    #[test]
+    fn who_holds_a_session_is_read_from_a_file_only() {
+        let dir = std::env::temp_dir().join(format!("kraal-holder-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (fifo, link, odd) = (dir.join("fifo.lock"), dir.join("link.lock"), dir.join("odd.lock"));
+        let name = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: a path that ends in a zero byte.
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        assert_eq!(holder_at(&fifo), None);
+        std::fs::write(&odd, "not what a kraal says\n").unwrap();
+        assert_eq!(holder_at(&odd), None);
+        std::fs::write(dir.join("said"), "{\"pid\":7,\"host\":\"box\",\"runtime\":\"/run\"}\n").unwrap();
+        std::os::unix::fs::symlink(dir.join("said"), &link).unwrap();
+        assert_eq!(holder_at(&link), None, "read through a link");
+        assert!(holder_at(&dir.join("said")).is_some());
+        assert_eq!(holder_at(&dir.join("none.lock")), None);
+        // Nor is a lock taken on what is not a file.
+        assert!(LockFile::acquire(fifo, false, try_lock).is_err());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// What gives a file a second name, as [`listen_alone`] has it.
+    fn link(file: &Path, name: &Path) -> std::io::Result<()> {
+        std::fs::hard_link(file, name)
+    }
+
+    /// As a file system that gives no second name answers.
+    fn no_link(_: &Path, _: &Path) -> std::io::Result<()> {
+        Err(std::io::Error::from_raw_os_error(libc::EPERM))
+    }
+
+    /// A directory of a test's own, with a socket path in it and a socket nobody listens at
+    /// there.
+    fn left_behind(name: &str) -> (PathBuf, PathBuf) {
+        let dir = std::env::temp_dir().join(format!("kraal-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let socket = dir.join("main.sock");
+        drop(std::os::unix::net::UnixListener::bind(&socket).unwrap());
+        until_nobody_listens(&socket);
+        (dir, socket)
+    }
+
+    /// The names in `dir`, in order.
+    fn names(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> =
+            std::fs::read_dir(dir).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+        names.sort();
+        names
+    }
+
+    /// A server listens where none does: a socket that refuses is removed for it, one a server
+    /// listens at is left to that server, and nothing else is left in the directory.
+    #[test]
+    fn a_socket_is_removed_only_when_nobody_listens_at_it() {
+        use std::io::ErrorKind;
+        let (dir, socket) = left_behind("alone");
+        std::fs::remove_file(&socket).unwrap();
+        assert_eq!(connect_now(&socket).unwrap_err().kind(), ErrorKind::NotFound);
+        let first = listen_alone(&socket).unwrap().expect("nothing was there");
+        assert!(connect_now(&socket).is_ok());
+        // Nothing refused: nothing is removed, with or without a second name to tell it by.
+        for link in [link, no_link] {
+            let beside =
+                listen_alone_with(&socket, link, &mut |_| panic!("a socket that answers was taken for one left"));
+            assert!(beside.unwrap().is_none(), "a server listens there");
+            assert!(connect_now(&socket).is_ok(), "its socket was touched");
+        }
+        // Its server gone, the socket stays, and refuses: the next server takes its place.
+        drop(first);
+        until_nobody_listens(&socket);
+        assert_eq!(connect_now(&socket).unwrap_err().kind(), ErrorKind::ConnectionRefused);
+        let second = listen_alone(&socket).unwrap().expect("nobody listened there");
+        assert!(connect_now(&socket).is_ok(), "the server after it does not listen");
+        assert_eq!(names(&dir), ["main.sock"]);
+        drop(second);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// While it looks at a socket that refuses, `listen_alone` keeps it under a second name of
+    /// its own making, as long as the socket's own: a server that takes the place at that
+    /// moment (kraal 0.2.0 takes no lock) is another file whatever number it is given, and
+    /// keeps its socket. The second name is gone afterwards.
+    #[test]
+    fn a_server_that_takes_the_place_of_a_socket_being_removed_keeps_it() {
+        let (dir, socket) = left_behind("replaced");
+        let mut taken = None;
+        let beside = listen_alone_with(&socket, link, &mut |seen| {
+            if taken.is_none() {
+                let seen = seen.expect("the socket has no second name while it is looked at");
+                assert!(file_id(seen).is_some() && file_id(seen) == file_id(&socket), "the name of another file");
+                assert_eq!(seen.as_os_str().len(), socket.as_os_str().len());
+                std::fs::remove_file(&socket).unwrap();
+                taken = Some(std::os::unix::net::UnixListener::bind(&socket).unwrap());
+            }
+        });
+        assert!(beside.unwrap().is_none(), "started beside the server that took the place");
+        assert!(taken.is_some() && connect_now(&socket).is_ok(), "the socket of that server was removed");
+        assert_eq!(names(&dir), ["main.sock"]);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Where no second name can be made, a socket left behind is still removed, told by the
+    /// number it had before it refused: a server that takes its place after the refusal is
+    /// another file, and keeps its socket.
+    #[test]
+    fn a_socket_is_told_by_what_it_was_before_it_refused_where_it_gets_no_second_name() {
+        let (dir, socket) = left_behind("nolink");
+        let listening = listen_alone_with(&socket, no_link, &mut |seen| assert_eq!(seen, None));
+        drop(listening.unwrap().expect("nobody listened there"));
+        until_nobody_listens(&socket);
+        // The file that refuses keeps a name here, so that the server which takes its place is
+        // not given its number: what is shown is which file was looked at, and when.
+        let kept = dir.join("kept");
+        std::fs::hard_link(&socket, &kept).unwrap();
+        let mut taken = None;
+        let beside = listen_alone_with(&socket, no_link, &mut |_| {
+            if taken.is_none() {
+                std::fs::remove_file(&socket).unwrap();
+                taken = Some(std::os::unix::net::UnixListener::bind(&socket).unwrap());
+            }
+        });
+        assert!(beside.unwrap().is_none(), "started beside the server that took the place");
+        assert!(taken.is_some() && connect_now(&socket).is_ok(), "the socket of that server was removed");
+        assert_eq!(names(&dir), ["kept", "main.sock"]);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The second name fits wherever the socket's does: at the longest path a socket can have,
+    /// a socket left behind is removed as anywhere else.
+    #[test]
+    fn a_socket_at_the_longest_path_is_removed_when_nobody_listens_at_it() {
+        let root = std::env::temp_dir().join(format!("kraal-longest-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let name = "/main.sock";
+        let dir = root.join("d".repeat(SUN_PATH - 1 - name.len() - root.as_os_str().len() - 1));
+        std::fs::create_dir_all(&dir).unwrap();
+        let socket = dir.join("main.sock");
+        assert_eq!(socket.as_os_str().len(), SUN_PATH - 1);
+        assert_eq!(alias_of(&socket).unwrap().as_os_str().len(), SUN_PATH - 1);
+        drop(std::os::unix::net::UnixListener::bind(&socket).unwrap());
+        until_nobody_listens(&socket);
+        let listening = listen_alone(&socket).unwrap().expect("nobody listened there");
+        assert!(connect_now(&socket).is_ok());
+        assert_eq!(names(&dir), ["main.sock"]);
+        drop(listening);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// The second names a kraal killed while it looked at a socket left behind are removed by
+    /// the next one that looks at it: as the entries they are, a link not followed, and no
+    /// other session's. A directory where this process's own name goes is said, and the socket
+    /// then stays as it is.
+    #[test]
+    fn second_names_left_behind_are_removed_and_one_in_the_way_is_said() {
+        let (dir, socket) = left_behind("aliases");
+        let precious = dir.join("precious");
+        std::fs::write(&precious, "kept").unwrap();
+        std::fs::write(dir.join("main~0000"), "").unwrap();
+        std::os::unix::fs::symlink(&precious, dir.join("main~zzzz")).unwrap();
+        for other in ["other~0000", "main~00", "main.lock", "main~00000"] {
+            std::fs::write(dir.join(other), "").unwrap();
+        }
+        drop(listen_alone(&socket).unwrap().expect("nobody listened there"));
+        assert_eq!(names(&dir), ["main.lock", "main.sock", "main~00", "main~00000", "other~0000", "precious"]);
+        assert_eq!(std::fs::read_to_string(&precious).unwrap(), "kept");
+        until_nobody_listens(&socket);
+        let own = alias_of(&socket).unwrap();
+        std::fs::create_dir(&own).unwrap();
+        let said = listen_alone(&socket).unwrap_err();
+        assert_eq!(said.kind(), std::io::ErrorKind::AlreadyExists);
+        assert!(said.to_string().contains(&own.display().to_string()), "{said}");
+        assert!(nobody_listens(&socket) && socket.exists(), "the socket was removed all the same");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A server that takes no connection for now is not waited for: on Linux the system says so
+    /// at once, where a plain connect would wait until it does.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_server_that_takes_no_connection_is_not_waited_for() {
+        use std::os::fd::AsRawFd;
+        let dir = std::env::temp_dir().join(format!("kraal-full-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let socket = dir.join("main.sock");
+        let server = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        // SAFETY: plain syscall on a socket this test holds: its queue takes one connection.
+        assert_eq!(unsafe { libc::listen(server.as_raw_fd(), 0) }, 0);
+        let _waiting = connect_now(&socket).unwrap();
+        let start = std::time::Instant::now();
+        assert_eq!(connect_now(&socket).unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
+        assert!(start.elapsed() < std::time::Duration::from_secs(5));
+        // It is there all the same: nobody takes its place.
+        assert!(listen_alone(&socket).unwrap().is_none());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
