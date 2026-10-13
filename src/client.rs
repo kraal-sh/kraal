@@ -108,11 +108,19 @@ fn is_here(holder: &paths::Holder, here: &Path) -> bool {
 /// Whether two paths are one directory, however each is spelt (`/tmp` is `/private/tmp` on
 /// macOS).
 fn same_directory(a: &Path, b: &Path) -> bool {
-    use std::os::unix::fs::MetadataExt;
-    // Both held open while they are compared: a directory made once another is gone may be
-    // given its number.
-    let open = |dir: &Path| std::fs::File::open(dir).and_then(|dir| Ok((dir.metadata()?, dir))).ok();
-    a == b || matches!((open(a), open(b)), (Some((a, _)), Some((b, _))) if (a.dev(), a.ino()) == (b.dev(), b.ino()))
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    if a == b {
+        return true;
+    }
+    // Opened as directories, and without waiting: one of the two is what a holder wrote, which
+    // may name anything (a FIFO would never open). Both stay open while they are compared: a
+    // directory made once another is gone may be given its number.
+    let open = |dir: &Path| {
+        let flags = libc::O_DIRECTORY | libc::O_NONBLOCK;
+        std::fs::OpenOptions::new().read(true).custom_flags(flags).open(dir).ok()
+    };
+    let (Some(a), Some(b)) = (open(a), open(b)) else { return false };
+    matches!((a.metadata(), b.metadata()), (Ok(a), Ok(b)) if (a.dev(), a.ino()) == (b.dev(), b.ino()))
 }
 
 /// What the holder of a session is to a kraal whose runtime directory is `here`, and how to

@@ -1678,7 +1678,15 @@ fn a_start_waits_for_the_kraal_that_has_the_session() {
     // Held for good, with no server: said, once a start has had its time.
     let by_another = "session heldstart is held (by another kraal) and no server of it listens";
     let on_another = "session heldstart is not started here: it runs on \"another-machine.invalid\" (kraal 4242)";
-    for (said, told) in [("", by_another), (elsewhere, on_another)] {
+    // What is written may name anything where the holder's sockets are: a FIFO, which would
+    // never open, keeps nobody waiting.
+    let fifo = env.root.join("fifo");
+    let name = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+    // SAFETY: a path that ends in a zero byte.
+    assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+    let at_a_fifo =
+        format!("{{\"pid\":4242,\"host\":\"another-machine.invalid\",\"runtime\":{:?}}}\n", fifo.display().to_string());
+    for (said, told) in [("", by_another), (elsewhere, on_another), (at_a_fifo.as_str(), on_another)] {
         let lock = hold(&env, "state", said);
         let start = Instant::now();
         let out = bounded(&env, false, &["open", "w"]);

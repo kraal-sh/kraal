@@ -654,6 +654,10 @@ pub fn nobody_listens(socket: &Path) -> bool {
     connect_now(socket).is_err_and(|e| matches!(e.kind(), ErrorKind::NotFound | ErrorKind::ConnectionRefused))
 }
 
+/// What the system's socket address has for a path, the zero byte that ends it included: 108
+/// bytes on Linux, 104 on macOS.
+const SUN_PATH: usize = std::mem::size_of::<libc::sockaddr_un>() - std::mem::offset_of!(libc::sockaddr_un, sun_path);
+
 /// Connect to `socket` without waiting. A server that takes no connection now (it is stopped, or
 /// far behind: its queue is full) is `WouldBlock` on Linux, where a plain connect would wait for
 /// it without end. macOS refuses such a connection as it does one to a socket nobody listens
@@ -664,7 +668,7 @@ pub fn connect_now(socket: &Path) -> std::io::Result<std::os::unix::net::UnixStr
     let name = socket.as_os_str().as_bytes();
     // SAFETY: plain C data: all zero bytes are a valid value.
     let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
-    if name.len() >= addr.sun_path.len() || name.contains(&0) {
+    if name.len() >= SUN_PATH || name.contains(&0) {
         return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "not a socket path"));
     }
     addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
@@ -703,7 +707,20 @@ pub fn connect_now(socket: &Path) -> std::io::Result<std::os::unix::net::UnixStr
 /// that has bound its socket and does not listen yet refuses like a socket left behind, and so
 /// does, on macOS, one whose queue is full.
 pub fn listen_alone(socket: &Path) -> std::io::Result<Option<std::os::unix::net::UnixListener>> {
+    listen_alone_with(socket, |file, name| std::fs::hard_link(file, name), &mut |_| ())
+}
+
+/// [`listen_alone`], with what gives a file a second name (`link`), and `meanwhile`, run with
+/// that name between the moment a socket refused and its removal: where the tests put a file
+/// system that gives none, and a server that takes the place at that moment.
+fn listen_alone_with(
+    socket: &Path,
+    link: fn(&Path, &Path) -> std::io::Result<()>,
+    meanwhile: &mut dyn FnMut(Option<&Path>),
+) -> std::io::Result<Option<std::os::unix::net::UnixListener>> {
     use std::io::ErrorKind;
+    let alias = alias_of(socket);
+    remove_abandoned_aliases(socket);
     // A lockless server that takes the place again and again is not raced with for ever.
     for _ in 0..5 {
         match std::os::unix::net::UnixListener::bind(socket) {
@@ -711,32 +728,99 @@ pub fn listen_alone(socket: &Path) -> std::io::Result<Option<std::os::unix::net:
             Err(e) if e.kind() == ErrorKind::AddrInUse => {}
             Err(e) => return Err(e),
         }
-        // A second name for what is there, for as long as it is looked at: a file is told
-        // from another by its number, and one made once this one is gone may be given the
-        // same (ext4 gives a new file the number just freed). While this one has a name, no
-        // other file has its number. Where no second name can be made, the number alone is
-        // what there is.
-        let seen = socket.with_extension(format!("seen.{}", std::process::id()));
-        let _ = std::fs::remove_file(&seen);
-        let named = match std::fs::hard_link(socket, &seen) {
-            Ok(()) => true,
-            // Gone since: the place is free.
-            Err(e) if e.kind() == ErrorKind::NotFound => continue,
-            Err(_) => false,
+        // The file there, before anything is asked of it: what refuses below is this one.
+        let there = file_id(socket);
+        // A second name for it, for as long as it is looked at: a file is told from another
+        // by its number, and one made once this one is gone may be given the same (ext4 gives
+        // a new file the number just freed). While this one has a name, no other has its number.
+        let named = match &alias {
+            Some(alias) => match link(socket, alias) {
+                Ok(()) => true,
+                // Gone since: the place is free.
+                Err(e) if e.kind() == ErrorKind::NotFound => continue,
+                Err(e) if e.kind() == ErrorKind::AlreadyExists => {
+                    let why = format!("{} is in the way of looking at {}", alias.display(), socket.display());
+                    return Err(std::io::Error::new(ErrorKind::AlreadyExists, why));
+                }
+                // No second name can be made here. The file is then told by the number it had
+                // before it refused: sound unless a server that takes no lock replaces it in
+                // that moment and is given its number. Refusing to remove it instead would
+                // keep every session whose server was killed from starting again there.
+                Err(_) => false,
+            },
+            None => false,
         };
-        let there = if named { &seen } else { socket };
-        // One that answers, or will once it takes connections again, is left alone.
-        let refuses = nobody_listens(there);
-        let removed = if refuses { remove_stale(socket, file_id(there)) } else { Ok(()) };
+        let (asked, seen) = match &alias {
+            Some(alias) if named => (alias.as_path(), file_id(alias)),
+            _ => (socket, there),
+        };
+        let refused = match connect_now(asked) {
+            Err(e) if e.kind() == ErrorKind::ConnectionRefused => Ok(true),
+            // Gone since: the place is free, and there is nothing to remove.
+            Err(e) if e.kind() == ErrorKind::NotFound => {
+                meanwhile(None);
+                continue;
+            }
+            // The second name is made here to be a socket path: that it is none is a mistake
+            // of this code, not a server that takes no connection.
+            Err(e) if named && e.kind() == ErrorKind::InvalidInput => Err(e),
+            // It answers, or will once it takes connections again.
+            _ => Ok(false),
+        };
+        let removed = refused.and_then(|refused| {
+            if refused {
+                meanwhile(named.then_some(asked));
+                remove_stale(socket, seen)?;
+            }
+            Ok(refused)
+        });
         if named {
-            let _ = std::fs::remove_file(&seen);
+            let _ = std::fs::remove_file(asked);
         }
-        removed?;
-        if !refuses {
+        if !removed? {
             return Ok(None);
         }
     }
     Err(std::io::Error::new(ErrorKind::AddrInUse, "something keeps taking that place"))
+}
+
+/// What ends a socket's own name, and what stands there in the second name [`listen_alone`]
+/// gives it: `~`, which no session name and no file of kraal's has, before four characters.
+const SOCKET_SUFFIX: &str = ".sock";
+const ALIAS_MARK: char = '~';
+
+/// The second name [`listen_alone`] gives the file at `socket` while it looks at it: next to
+/// it, of this process alone, and exactly as long as the socket's own, so that it is a socket
+/// path wherever that one is. `None` for a path that is not named as kraal names its sockets,
+/// or that no socket address holds.
+fn alias_of(socket: &Path) -> Option<PathBuf> {
+    const DIGITS: &[u8; 62] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+    let stem = socket.file_name()?.to_str()?.strip_suffix(SOCKET_SUFFIX)?;
+    // Four digits hold every process id (4194304 at most on Linux, 99999 on macOS).
+    let mut id = std::process::id() as usize;
+    let mut digits = [0u8; SOCKET_SUFFIX.len() - 1];
+    for digit in digits.iter_mut().rev() {
+        *digit = DIGITS[id % DIGITS.len()];
+        id /= DIGITS.len();
+    }
+    let alias = socket.with_file_name(format!("{stem}{ALIAS_MARK}{}", String::from_utf8_lossy(&digits)));
+    (alias.as_os_str().len() < SUN_PATH).then_some(alias)
+}
+
+/// Remove the second names of `socket` that a kraal killed while it looked at it left behind.
+/// Whoever calls this holds the session, so none is in use. Each is unlinked as the entry it
+/// is, never followed; what cannot be unlinked so (a directory put there) stays.
+fn remove_abandoned_aliases(socket: &Path) {
+    let (Some(dir), Some(name)) = (socket.parent(), socket.file_name().and_then(|name| name.to_str())) else { return };
+    let Some(stem) = name.strip_suffix(SOCKET_SUFFIX) else { return };
+    for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+        let name = entry.file_name();
+        let alias = name.to_str().and_then(|name| name.strip_prefix(stem)?.strip_prefix(ALIAS_MARK));
+        if alias.is_some_and(|id| id.len() == SOCKET_SUFFIX.len() - 1 && id.chars().all(|c| c.is_ascii_alphanumeric()))
+        {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
 }
 
 /// Remove the socket at `socket` that refused a connection: the file `stale`, which whoever
@@ -1558,46 +1642,158 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
-    /// A server listens where none does: a socket that refuses is removed for it, one a server
-    /// listens at is left to that server. A socket that took the place of the one that refused
-    /// is put back when the removal finds it, whatever number its file was given; what a server
-    /// binding at that very moment does to this is not shown here.
-    #[test]
-    fn a_socket_is_removed_only_when_nobody_listens_at_it() {
-        use std::io::ErrorKind;
-        let dir = std::env::temp_dir().join(format!("kraal-alone-{}", std::process::id()));
+    /// What gives a file a second name, as [`listen_alone`] has it.
+    fn link(file: &Path, name: &Path) -> std::io::Result<()> {
+        std::fs::hard_link(file, name)
+    }
+
+    /// As a file system that gives no second name answers.
+    fn no_link(_: &Path, _: &Path) -> std::io::Result<()> {
+        Err(std::io::Error::from_raw_os_error(libc::EPERM))
+    }
+
+    /// A directory of a test's own, with a socket path in it and a socket nobody listens at
+    /// there.
+    fn left_behind(name: &str) -> (PathBuf, PathBuf) {
+        let dir = std::env::temp_dir().join(format!("kraal-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let socket = dir.join("main.sock");
+        drop(std::os::unix::net::UnixListener::bind(&socket).unwrap());
+        until_nobody_listens(&socket);
+        (dir, socket)
+    }
+
+    /// The names in `dir`, in order.
+    fn names(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> =
+            std::fs::read_dir(dir).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+        names.sort();
+        names
+    }
+
+    /// A server listens where none does: a socket that refuses is removed for it, one a server
+    /// listens at is left to that server, and nothing else is left in the directory.
+    #[test]
+    fn a_socket_is_removed_only_when_nobody_listens_at_it() {
+        use std::io::ErrorKind;
+        let (dir, socket) = left_behind("alone");
+        std::fs::remove_file(&socket).unwrap();
         assert_eq!(connect_now(&socket).unwrap_err().kind(), ErrorKind::NotFound);
         let first = listen_alone(&socket).unwrap().expect("nothing was there");
         assert!(connect_now(&socket).is_ok());
-        assert!(listen_alone(&socket).unwrap().is_none(), "a server listens there");
-        assert!(connect_now(&socket).is_ok(), "its socket was touched");
-        // Its server gone, the socket stays, and refuses.
+        // Nothing refused: nothing is removed, with or without a second name to tell it by.
+        for link in [link, no_link] {
+            let beside =
+                listen_alone_with(&socket, link, &mut |_| panic!("a socket that answers was taken for one left"));
+            assert!(beside.unwrap().is_none(), "a server listens there");
+            assert!(connect_now(&socket).is_ok(), "its socket was touched");
+        }
+        // Its server gone, the socket stays, and refuses: the next server takes its place.
         drop(first);
         until_nobody_listens(&socket);
         assert_eq!(connect_now(&socket).unwrap_err().kind(), ErrorKind::ConnectionRefused);
-        // Kept under another name from here on, as `listen_alone` keeps what it looks at: the
-        // socket made in its place cannot be given its number, as it would be on a file system
-        // that gives a new file the number just freed.
-        let seen = dir.join("main.seen");
-        std::fs::hard_link(&socket, &seen).unwrap();
-        let stale = file_id(&seen);
         let second = listen_alone(&socket).unwrap().expect("nobody listened there");
         assert!(connect_now(&socket).is_ok(), "the server after it does not listen");
-        // That server took the place after the connection was refused, as a kraal 0.2.0 may
-        // (it takes no lock): the removal, which comes after, finds another file than the one
-        // that refused, and puts it back.
-        remove_stale(&socket, stale).unwrap();
-        assert!(connect_now(&socket).is_ok(), "the socket of a server was removed");
-        std::fs::remove_file(&seen).unwrap();
-        let left: Vec<_> = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name()).collect();
-        assert_eq!(left, ["main.sock"]);
+        assert_eq!(names(&dir), ["main.sock"]);
         drop(second);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// While it looks at a socket that refuses, `listen_alone` keeps it under a second name of
+    /// its own making, as long as the socket's own: a server that takes the place at that
+    /// moment (kraal 0.2.0 takes no lock) is another file whatever number it is given, and
+    /// keeps its socket. The second name is gone afterwards.
+    #[test]
+    fn a_server_that_takes_the_place_of_a_socket_being_removed_keeps_it() {
+        let (dir, socket) = left_behind("replaced");
+        let mut taken = None;
+        let beside = listen_alone_with(&socket, link, &mut |seen| {
+            if taken.is_none() {
+                let seen = seen.expect("the socket has no second name while it is looked at");
+                assert!(file_id(seen).is_some() && file_id(seen) == file_id(&socket), "the name of another file");
+                assert_eq!(seen.as_os_str().len(), socket.as_os_str().len());
+                std::fs::remove_file(&socket).unwrap();
+                taken = Some(std::os::unix::net::UnixListener::bind(&socket).unwrap());
+            }
+        });
+        assert!(beside.unwrap().is_none(), "started beside the server that took the place");
+        assert!(taken.is_some() && connect_now(&socket).is_ok(), "the socket of that server was removed");
+        assert_eq!(names(&dir), ["main.sock"]);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Where no second name can be made, a socket left behind is still removed, told by the
+    /// number it had before it refused: a server that takes its place after the refusal is
+    /// another file, and keeps its socket.
+    #[test]
+    fn a_socket_is_told_by_what_it_was_before_it_refused_where_it_gets_no_second_name() {
+        let (dir, socket) = left_behind("nolink");
+        let listening = listen_alone_with(&socket, no_link, &mut |seen| assert_eq!(seen, None));
+        drop(listening.unwrap().expect("nobody listened there"));
         until_nobody_listens(&socket);
-        remove_stale(&socket, file_id(&socket)).unwrap();
-        assert!(!socket.exists() && std::fs::read_dir(&dir).unwrap().next().is_none());
+        // The file that refuses keeps a name here, so that the server which takes its place is
+        // not given its number: what is shown is which file was looked at, and when.
+        let kept = dir.join("kept");
+        std::fs::hard_link(&socket, &kept).unwrap();
+        let mut taken = None;
+        let beside = listen_alone_with(&socket, no_link, &mut |_| {
+            if taken.is_none() {
+                std::fs::remove_file(&socket).unwrap();
+                taken = Some(std::os::unix::net::UnixListener::bind(&socket).unwrap());
+            }
+        });
+        assert!(beside.unwrap().is_none(), "started beside the server that took the place");
+        assert!(taken.is_some() && connect_now(&socket).is_ok(), "the socket of that server was removed");
+        assert_eq!(names(&dir), ["kept", "main.sock"]);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The second name fits wherever the socket's does: at the longest path a socket can have,
+    /// a socket left behind is removed as anywhere else.
+    #[test]
+    fn a_socket_at_the_longest_path_is_removed_when_nobody_listens_at_it() {
+        let root = std::env::temp_dir().join(format!("kraal-longest-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let name = "/main.sock";
+        let dir = root.join("d".repeat(SUN_PATH - 1 - name.len() - root.as_os_str().len() - 1));
+        std::fs::create_dir_all(&dir).unwrap();
+        let socket = dir.join("main.sock");
+        assert_eq!(socket.as_os_str().len(), SUN_PATH - 1);
+        assert_eq!(alias_of(&socket).unwrap().as_os_str().len(), SUN_PATH - 1);
+        drop(std::os::unix::net::UnixListener::bind(&socket).unwrap());
+        until_nobody_listens(&socket);
+        let listening = listen_alone(&socket).unwrap().expect("nobody listened there");
+        assert!(connect_now(&socket).is_ok());
+        assert_eq!(names(&dir), ["main.sock"]);
+        drop(listening);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// The second names a kraal killed while it looked at a socket left behind are removed by
+    /// the next one that looks at it: as the entries they are, a link not followed, and no
+    /// other session's. A directory where this process's own name goes is said, and the socket
+    /// then stays as it is.
+    #[test]
+    fn second_names_left_behind_are_removed_and_one_in_the_way_is_said() {
+        let (dir, socket) = left_behind("aliases");
+        let precious = dir.join("precious");
+        std::fs::write(&precious, "kept").unwrap();
+        std::fs::write(dir.join("main~0000"), "").unwrap();
+        std::os::unix::fs::symlink(&precious, dir.join("main~zzzz")).unwrap();
+        for other in ["other~0000", "main~00", "main.lock", "main~00000"] {
+            std::fs::write(dir.join(other), "").unwrap();
+        }
+        drop(listen_alone(&socket).unwrap().expect("nobody listened there"));
+        assert_eq!(names(&dir), ["main.lock", "main.sock", "main~00", "main~00000", "other~0000", "precious"]);
+        assert_eq!(std::fs::read_to_string(&precious).unwrap(), "kept");
+        until_nobody_listens(&socket);
+        let own = alias_of(&socket).unwrap();
+        std::fs::create_dir(&own).unwrap();
+        let said = listen_alone(&socket).unwrap_err();
+        assert_eq!(said.kind(), std::io::ErrorKind::AlreadyExists);
+        assert!(said.to_string().contains(&own.display().to_string()), "{said}");
+        assert!(nobody_listens(&socket) && socket.exists(), "the socket was removed all the same");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
