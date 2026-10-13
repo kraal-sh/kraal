@@ -25,3 +25,7 @@ accounts = ["work", "Personal"]
 path = "~/src/personal"
 agent = "claude"
 accounts = ["Personal"]
+
+# kraal keeps one [[account]] per account after review. Former names, identities and homes
+# are fields under [[account.references]], not extra accounts. Keep these generated fields.
+# References with no remaining account are kept under [[forgotten]] to prevent rediscovery.

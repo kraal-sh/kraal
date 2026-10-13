@@ -84,11 +84,23 @@ reuse. The backup can be restored to return to the original file.
 
 Verified standard sign-ins become ordinary named accounts. Old `default` references still resolve,
 including after a review links that home to a named account. Names for the same canonical home
-resolve to one identity. Hidden account entries retain links from old identities and homes; panes
-keep their launch home when resumed. Usage uses the newest observation across those entries,
-never a sum. No credentials or homes are removed. Older kraal versions ignore these links and
-can still show duplicate entries. A forgotten standard home stays recorded as a hidden reference
-so discovery does not add it again.
+resolve to one identity. The file keeps one
+`[[account]]` per account after review. Its `[[account.references]]` fields retain old names,
+identities and homes; panes keep their launch home when resumed. Usage uses the newest
+observation across those references, never a sum. The next rewrite migrates old `linked_to`
+entries into these fields, keeping their comments, notes and unknown keys. No credentials or
+homes are removed. A forgotten reference has no owning account, so it is stored separately in
+`[[forgotten]]` to prevent rediscovery and reuse of its identity.
+
+Kraal 0.2.0 and 0.3.0 still read every ordinary account's `name`, `agent`, `home` and threshold.
+They do not understand the reference fields: a field cannot teach an already released binary
+to resolve a former name. On an older server, use the current account name. If the standard home
+was joined to a different home, an older kraal can still show its implicit `default`; if the
+standard home itself was named, it suppresses that implicit account and the former `default`
+name is unavailable there. Old clients talking to a current server can still use these former
+names. Rules saved by this version keep current readable names for older readers. Session and
+workspace formats are unchanged; older readers still load their panes. These limits of older
+account lookup do not justify extra `[[account]]` rows in the shared file.
 
 ## For contributors: how the protocol changes
 

@@ -106,6 +106,7 @@ pub(super) fn accounts(action: AccountsCmd) -> Result<()> {
                 review: false,
                 public_identity: None,
                 linked_to: None,
+                references: Vec::new(),
             };
             // Adding a home already linked by Review uses its chosen account and home.
             let effective = all.clone().add(a.clone())?;

@@ -5253,7 +5253,9 @@ fn an_idle_server_sleeps() {
     env.wait_for_text("a", "$");
     env.wait_for_text("b", "$");
     client.wait_for_rows("the account's usage", |rows| {
-        rows.windows(2).any(|r| r[0].contains("Claude · work") && r[1].contains("60% used · 0 panes"))
+        rows.windows(2).any(|r| {
+            r[0].contains("Claude · work") && r[1].split('│').nth(1).is_some_and(|detail| detail.trim() == "60% used")
+        })
     });
     let pid = env.server_pid().expect("the server's pid");
     // The times each of its threads went to sleep (not those another program took the processor
@@ -6715,12 +6717,13 @@ fn the_sidebar_follows_a_usage_window_that_resets() {
         std::fs::rename(usage.join("new"), usage.join("claude-work.json")).unwrap();
     };
     let shows = |rows: &[String], detail: &str| {
-        rows.windows(2).any(|r| r[0].contains("Claude · work") && r[1].contains(detail))
+        rows.windows(2)
+            .any(|r| r[0].contains("Claude · work") && r[1].split('│').nth(1).is_some_and(|text| text.trim() == detail))
     };
     // Keys typed one after the other, each echoed in a frame of its own, until the sidebar says
     // `figure` of the account.
     let typing_until = |client: &mut RawClient, figure: &str| {
-        let row = format!("{figure} used · 0 panes");
+        let row = format!("{figure} used");
         let start = Instant::now();
         while !shows(&client.rows(), &row) {
             assert!(start.elapsed() < Duration::from_secs(15), "never {row}:\n{}", client.rows().join("\n"));
@@ -7106,7 +7109,7 @@ fn picker_actions_and_footers_follow_the_line_at_both_sizes() {
         let term = emulate(&client.screen.lock().unwrap(), size.0, size.1);
         assert!(term.grid()[Line(y as i32)][Column(x)].flags.contains(Flags::BOLD), "at {size:?}");
         click(&mut client, label);
-        client.wait_for_row("Name    Personal");
+        client.wait_for_row("Name    e.g. Work or Personal");
         client.wait_for_row("Agent   Claude");
         client.close_overlay("Agent   Claude");
         client.wait_for_row("+ Add account");
@@ -8131,6 +8134,10 @@ fn reviewing_the_existing_account_keeps_live_agents_and_reports_usage_once() {
     for size in [(124, 36), (80, 24)] {
         let env = Env::new(&format!("account-review-{}", size.0));
         let path = existing_sign_in_agent(&env, "claude");
+        existing_sign_in_agent(&env, "codex");
+        let codex = env.root.join("home/.codex");
+        std::fs::create_dir_all(&codex).unwrap();
+        std::fs::write(codex.join("status"), "0").unwrap();
         let standard = env.root.join("home/.claude");
         let mut config = String::from("# My subscriptions.\n");
         for name in ["patron.bzh", "gmail"] {
@@ -8171,11 +8178,13 @@ fn reviewing_the_existing_account_keeps_live_agents_and_reports_usage_once() {
         env.wait_for_text(&pane, "READY");
         let mut client = RawClient::attach_sized(&env, Some("w"), size);
         if size.0 == 124 {
+            client.wait_for_row("Codex · Personal");
             let rows = client.wait_for_row("Existing Claude account");
             let row = rows.iter().position(|r| r.contains("Existing Claude account")).unwrap() + 1;
             client.send(format!("\x1b[<0;10;{row}M\x1b[<0;10;{row}m").as_bytes());
         } else {
             client.send(b"\x02Al");
+            client.wait_for_row("Codex · Personal");
             client.wait_for_row("Existing Claude account");
             client.wait_for_row("Review");
             assert!(!client.rows().iter().any(|r| r.contains("claude·default") || r.contains("codex·default")));
@@ -8203,7 +8212,11 @@ fn reviewing_the_existing_account_keeps_live_agents_and_reports_usage_once() {
         assert!(!env.root.join("patron.bzh/starts").exists());
         let out = env.cmd(&["accounts", "list", "--json"]).env("PATH", &path).output().unwrap();
         let list: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
-        assert_eq!(list.as_array().unwrap().len(), 2);
+        assert_eq!(list.as_array().unwrap().len(), 3);
+        let saved = std::fs::read_to_string(&file).unwrap();
+        let saved: toml::Value = toml::from_str(&saved).unwrap();
+        assert_eq!(saved["account"].as_array().unwrap().len(), 3);
+        assert!(saved["account"].as_array().unwrap().iter().all(|a| a.get("linked_to").is_none()));
         let patron = list.as_array().unwrap().iter().find(|a| a["name"] == "patron.bzh").unwrap();
         assert_eq!(patron["usage"]["five_hour"]["used_percent"], 57.0);
         assert!(list.as_array().unwrap().iter().all(|a| a["status"] != "review_required"));
@@ -10920,7 +10933,7 @@ while IFS= read -r line; do printf 'reply:%s\n' "$line"; done
             client.wait_for_row("⏎ details");
             client.send(b"\x1b");
             client.wait_for_rows("Accounts closed", |rows| !rows.iter().any(|r| r.contains("⏎ details")));
-            click_account_text(&mut client, "Usage unavailable · 1 pane");
+            click_account_text(&mut client, "No usage · 1 pane");
             client.wait_for_row("Enter Back · Tab Actions");
             client.send(b"\r\x1b");
             client.wait_for_rows("Details closed", |rows| {
@@ -10931,7 +10944,7 @@ while IFS= read -r line; do printf 'reply:%s\n' "$line"; done
         }
         client.send(b"\x02An");
         client.wait_for_row("Agent   Codex");
-        client.wait_for_row("Name    Personal");
+        client.wait_for_row("Name    e.g. Work or Personal");
         client.send(b"\x15work\r");
         client.wait_for_row("already has an account named");
         client.wait_for_row("Name    work");
@@ -10944,7 +10957,8 @@ while IFS= read -r line; do printf 'reply:%s\n' "$line"; done
         client.wait_for_row("Codex · second");
         client.send(b"\r");
         client.wait_for_row("Enter Back · Tab Actions");
-        client.wait_for_row("Usage unavailable · 0 panes");
+        let rows = client.wait_for_row("Usage unavailable");
+        assert!(!rows.iter().any(|r| r.contains("0 panes")));
         client.close_overlay("Enter Back · Tab Actions");
         let added: toml::Value = toml::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
         let second =
@@ -11024,11 +11038,24 @@ fn the_add_form_names_an_existing_sign_in_without_running_login() {
     client.wait_for_row("Existing Claude account");
     client.wait_for_row("Review");
     click_account_text(&mut client, "+ Add account");
-    let rows = client.wait_for_row("Use existing account");
-    assert!(
-        rows.iter().position(|r| r.contains("Use existing account")).unwrap()
-            < rows.iter().position(|r| r.contains("Sign in to another account")).unwrap()
-    );
+    let rows = client.wait_for_row("[> Use existing account]");
+    assert!(rows.iter().any(|r| r.contains("Existing Claude sign-in needs review.")));
+    assert!(!rows.iter().any(|r| r.contains("Name    ")));
+    let pending_file = std::fs::read_to_string(&file).unwrap();
+    click_account_text(&mut client, "Sign in to another account");
+    client.wait_for_row("Name    e.g. Work or Personal");
+    client.send(b"\r\r");
+    client.wait_for_row("Enter a name for this account.");
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), pending_file);
+    assert!(!env.root.join("home/logins").exists());
+    click_account_text(&mut client, "Cancel");
+    client.wait_for_row("+ Add account");
+    click_account_text(&mut client, "+ Add account");
+    client.wait_for_row("[> Use existing account]");
+    client.send(b"\r");
+    client.wait_for_row("Which account is this?");
+    click_account_text(&mut client, "A different account");
+    client.wait_for_row("Name    e.g. Work or Personal");
     let before = std::fs::read_to_string(&file).unwrap();
     let checks = || std::fs::read_to_string(env.root.join("home/status-checks")).unwrap_or_default().lines().count();
     let finished = || std::fs::read_to_string(standard.join("check-finished")).unwrap_or_default().lines().count();
@@ -11044,7 +11071,11 @@ fn the_add_form_names_an_existing_sign_in_without_running_login() {
     assert_eq!(checks(), before_checks + 1, "Enter while checking did not start another check");
     assert_eq!(std::fs::read_to_string(&file).unwrap(), before);
     click_account_text(&mut client, "+ Add account");
-    client.wait_for_row("Use existing account");
+    client.wait_for_row("[> Use existing account]");
+    click_account_text(&mut client, "Use existing account");
+    client.wait_for_row("Which account is this?");
+    click_account_text(&mut client, "A different account");
+    client.wait_for_row("Name    e.g. Work or Personal");
     client.send(b"\x15personal\r");
     client.wait_for_row("Account added");
     client.wait_for_row("Claude · personal");
@@ -11053,6 +11084,54 @@ fn the_add_form_names_an_existing_sign_in_without_running_login() {
     let a = accounts["account"].as_array().unwrap().iter().find(|a| a["name"].as_str() == Some("personal")).unwrap();
     assert_eq!(a["home"].as_str().unwrap(), "~/.claude");
     assert!(a.get("review").is_none());
+}
+
+#[test]
+fn a_different_account_review_after_sign_out_exposes_sign_in() {
+    let env = Env::new("account-review-signed-out");
+    let path = existing_sign_in_agent(&env, "claude");
+    let standard = env.root.join("home/.claude");
+    std::fs::create_dir_all(&standard).unwrap();
+    std::fs::write(standard.join("status"), "0").unwrap();
+    let file = env.root.join("config/kraal/accounts.toml");
+    std::fs::write(
+        &file,
+        format!("[[account]]\nagent='claude'\nname='work'\nhome={:?}\n", env.root.join("work").to_str().unwrap()),
+    )
+    .unwrap();
+    env.workspace("w", "layout { pane name=\"shell\" }\n");
+    let out = env.cmd(&["open", "w"]).env("PATH", &path).output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let mut client = RawClient::attach_sized(&env, Some("w"), (80, 24));
+    client.send(b"\x02Al");
+    client.wait_for_row("Existing Claude account");
+    client.wait_for_row("Review");
+    assert!(std::fs::read_to_string(&file).unwrap().contains("review = true"));
+    // Discovery succeeded, but the agent signs out before the user resolves its review.
+    std::fs::write(standard.join("status"), "1").unwrap();
+    click_account_text(&mut client, "Existing Claude account");
+    client.wait_for_row("Which account is this?");
+    click_account_text(&mut client, "A different account");
+    client.wait_for_row("Name    e.g. Work or Personal");
+    client.send(b"personal\r");
+    client.wait_for_row("Account added");
+    client.wait_for_row("Claude · personal");
+    client.wait_for_row("Sign-in required");
+    assert!(!env.root.join("home/logins").exists());
+    let accounts: toml::Value = toml::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    let accounts = accounts["account"].as_array().unwrap();
+    assert_eq!(accounts.len(), 2);
+    let a = accounts.iter().find(|a| a["name"].as_str() == Some("personal")).unwrap();
+    assert_eq!(a["home"].as_str().unwrap(), "~/.claude");
+    assert_eq!(a["sign_in_required"].as_bool(), Some(true));
+    assert!(a.get("review").is_none());
+    client.send(b"\r");
+    client.wait_for_row("Enter Back · Tab Actions");
+    client.send(b"\t");
+    client.wait_for_row("Sign in");
+    click_account_text(&mut client, "Sign in");
+    common::wait_until(PATIENCE, "the account's Sign in action starts login", || env.root.join("home/logins").exists());
+    assert_eq!(std::fs::read_to_string(env.root.join("home/logins")).unwrap(), "unexpected\n");
 }
 
 #[test]

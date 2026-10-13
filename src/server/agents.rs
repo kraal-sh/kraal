@@ -977,6 +977,7 @@ impl Server {
             review: false,
             public_identity: None,
             linked_to: None,
+            references: Vec::new(),
         };
         let a = Accounts::update(|all| {
             let a = all.add(a)?;
@@ -1316,6 +1317,7 @@ mod tests {
                 review: false,
                 public_identity: None,
                 linked_to: None,
+                references: Vec::new(),
             };
             let (from, to) = (account("from"), account("to"));
             let (tx, _rx) = super::super::queue::channel(16);

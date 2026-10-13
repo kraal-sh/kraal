@@ -149,6 +149,9 @@ pub struct Account {
     /// Old references and homes stay resolvable after accounts are joined or forgotten.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub linked_to: Option<String>,
+    /// Stored under their owner so older readers see only real accounts.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub references: Vec<Account>,
 }
 
 impl Account {
@@ -219,8 +222,81 @@ struct File {
     claude: ClaudeOptions,
     #[serde(default, rename = "account")]
     accounts: Vec<Account>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    forgotten: Vec<Account>,
     #[serde(default, rename = "rule", skip_serializing_if = "Vec::is_empty")]
     rules: Vec<Rule>,
+}
+
+impl File {
+    fn expanded_accounts(self) -> Vec<Account> {
+        let mut accounts = Vec::new();
+        for mut account in self.accounts {
+            if account.id.is_empty() {
+                account.id = account.legacy_id();
+            }
+            let references = std::mem::take(&mut account.references);
+            let id = account.id.clone();
+            accounts.push(account);
+            for mut reference in references {
+                reference.linked_to = Some(id.clone());
+                accounts.push(reference);
+            }
+        }
+        accounts.extend(self.forgotten);
+        accounts
+    }
+}
+
+// Move whole tables so comments and keys unknown to this kraal follow their reference.
+fn expanded_document(source: &str) -> Result<String> {
+    use toml_edit::{ArrayOfTables, Item};
+    let tables = |item: Item| -> Result<ArrayOfTables> {
+        if item.as_array().is_some_and(|array| array.is_empty()) {
+            Ok(ArrayOfTables::new())
+        } else {
+            item.into_array_of_tables().map_err(|_| anyhow::anyhow!("invalid account reference tables"))
+        }
+    };
+    let mut doc: toml_edit::DocumentMut = source.parse()?;
+    let stored = doc.get("account").cloned().map(tables).transpose()?.unwrap_or_default();
+    if doc.get("forgotten").is_none() && stored.iter().all(|t| !t.contains_key("references")) {
+        return Ok(source.to_string());
+    }
+    let mut accounts = ArrayOfTables::new();
+    doc.remove("account");
+    for mut table in stored {
+        let account: Account = toml::from_str(&table.to_string())?;
+        let id = if account.id.is_empty() { account.legacy_id() } else { account.id };
+        let references = table.remove("references");
+        accounts.push(table);
+        if let Some(item) = references {
+            for mut reference in tables(item)? {
+                reference.insert("linked_to", toml_edit::value(&id));
+                accounts.push(reference);
+            }
+        }
+    }
+    if let Some(item) = doc.remove("forgotten") {
+        accounts.extend(tables(item)?);
+    }
+    if !accounts.is_empty() {
+        doc.insert("account", Item::ArrayOfTables(accounts));
+    }
+    Ok(doc.to_string())
+}
+
+// A moved table and all its children follow their new parent, keeping their comments.
+fn clear_positions(table: &mut toml_edit::Table) {
+    use toml_edit::visit_mut::{self, VisitMut};
+    struct Unplaced;
+    impl VisitMut for Unplaced {
+        fn visit_table_mut(&mut self, table: &mut toml_edit::Table) {
+            table.set_position(None);
+            visit_mut::visit_table_mut(self, table);
+        }
+    }
+    Unplaced.visit_table_mut(table);
 }
 
 /// Remove the empty sections older kraal versions wrote, using their source spans so that
@@ -303,10 +379,10 @@ impl Accounts {
             None => Default::default(),
         };
         let mut accounts = Accounts {
-            limits: file.limits,
-            claude: file.claude,
-            accounts: file.accounts,
-            rules: file.rules,
+            limits: file.limits.clone(),
+            claude: file.claude.clone(),
+            rules: file.rules.clone(),
+            accounts: file.expanded_accounts(),
             path: path.to_path_buf(),
             source,
         };
@@ -346,18 +422,80 @@ impl Accounts {
     /// What a save writes: the file as it was read with what changed since edited in, so that
     /// the user's comments and the keys another kraal reads stay; a new file whole.
     fn text(&self) -> Result<String> {
-        let file = File {
+        let mut file = File {
             limits: self.limits.clone(),
             claude: self.claude.clone(),
             accounts: self.accounts.clone(),
+            forgotten: Vec::new(),
             rules: self.rules.clone(),
         };
-        match &self.source {
-            Some(text) => crate::rewrite::rewrite(text, &file)
-                .and_then(without_empty_sections)
-                .with_context(|| format!("editing {}", self.path.display())),
-            None => Ok(format!("{HEADER}{}", toml::to_string_pretty(&file)?)),
+        let text = match &self.source {
+            Some(text) => crate::rewrite::rewrite(&expanded_document(text)?, &file)?,
+            None => format!("{HEADER}{}", toml::to_string_pretty(&file)?),
+        };
+        let text = self
+            .compact_document(&text)
+            .and_then(without_empty_sections)
+            .with_context(|| format!("editing {}", self.path.display()))?;
+        // Compaction changes ordering and flattens links, but must preserve what kraal reads.
+        let mut read: File = toml::from_str(&text).context("reading the compacted accounts")?;
+        read.accounts = read.clone().expanded_accounts();
+        read.forgotten.clear();
+        for a in &mut file.accounts {
+            if a.linked_to.is_some()
+                && let Some(target) = self.resolve(a)
+            {
+                a.linked_to = Some(target.id);
+            }
         }
+        file.accounts.sort_by(|a, b| a.id.cmp(&b.id));
+        read.accounts.sort_by(|a, b| a.id.cmp(&b.id));
+        anyhow::ensure!(
+            toml::Table::try_from(&read)? == toml::Table::try_from(&file)?,
+            "kraal cannot compact this accounts file as it is laid out"
+        );
+        Ok(text)
+    }
+
+    fn compact_document(&self, text: &str) -> Result<String> {
+        if self.accounts.iter().all(|a| a.linked_to.is_none()) {
+            return Ok(text.to_string());
+        }
+        use toml_edit::{ArrayOfTables, Item};
+        let mut doc: toml_edit::DocumentMut = text.parse()?;
+        let Some(item) = doc.remove("account") else { return Ok(doc.to_string()) };
+        let tables = item.into_array_of_tables().map_err(|_| anyhow::anyhow!("invalid account tables"))?;
+        let mut kept = ArrayOfTables::new();
+        let mut references: HashMap<String, ArrayOfTables> = HashMap::new();
+        let mut forgotten = ArrayOfTables::new();
+        for mut table in tables {
+            let id = table.get("id").and_then(Item::as_str).context("account identity missing")?;
+            let a = self.accounts.iter().find(|a| a.id == id).context("account identity changed")?;
+            if a.linked_to.is_none() {
+                kept.push(table);
+            } else {
+                clear_positions(&mut table);
+                if let Some(target) = self.resolve(a) {
+                    table.remove("linked_to");
+                    references.entry(target.id).or_default().push(table);
+                } else {
+                    forgotten.push(table);
+                }
+            }
+        }
+        for table in kept.iter_mut() {
+            let id = table.get("id").and_then(Item::as_str).unwrap();
+            if let Some(references) = references.remove(id) {
+                table.insert("references", Item::ArrayOfTables(references));
+            }
+        }
+        if !kept.is_empty() {
+            doc.insert("account", Item::ArrayOfTables(kept));
+        }
+        if !forgotten.is_empty() {
+            doc.insert("forgotten", Item::ArrayOfTables(forgotten));
+        }
+        Ok(doc.to_string())
     }
 
     pub fn save(&self) -> Result<()> {
@@ -367,7 +505,7 @@ impl Accounts {
         let text = self.text()?;
         if let Some(source) = &self.source {
             let old: File = toml::from_str(source)?;
-            if old.accounts != self.accounts || old.rules != self.rules {
+            if old.rules != self.rules || old.expanded_accounts() != self.accounts || source != &text {
                 let backup = self.path.with_extension("toml.kraal-bak");
                 if !backup.exists() {
                     paths::write_atomic(&backup, source.as_bytes()).context("backing up accounts before migration")?;
@@ -388,11 +526,10 @@ impl Accounts {
         paths::locked(path, || {
             let mut all = Self::load_from(path)?;
             let before = all.text()?;
-            let joined = all
-                .source
-                .as_ref()
-                .and_then(|s| toml::from_str::<File>(s).ok())
-                .is_some_and(|old| old.accounts.iter().zip(&all.accounts).any(|(a, b)| a.linked_to != b.linked_to));
+            let joined = all.source.as_ref().and_then(|s| toml::from_str::<File>(s).ok()).is_some_and(|old| {
+                old.accounts.iter().any(|a| a.linked_to.is_some())
+                    || old.expanded_accounts().iter().zip(&all.accounts).any(|(a, b)| a.linked_to != b.linked_to)
+            });
             let previous = all.clone();
             let out = f(&mut all)?;
             all.bind_rules();
@@ -458,6 +595,7 @@ impl Accounts {
             review: false,
             public_identity: None,
             linked_to: None,
+            references: Vec::new(),
         })
     }
 
@@ -569,6 +707,15 @@ impl Accounts {
     }
 
     pub fn proposed_name(&self, agent: &str, identity: Option<&str>) -> String {
+        identity
+            .filter(|name| {
+                valid_account_name(name) && *name != "default" && self.get(agent, name).is_none_or(|a| a.review)
+            })
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    fn adopted_name(&self, agent: &str, identity: Option<&str>) -> String {
         let base = identity.filter(|name| valid_account_name(name) && *name != "default").unwrap_or("Personal");
         let mut name = base.to_string();
         let mut suffix = 2;
@@ -587,7 +734,7 @@ impl Accounts {
         if old_default.is_some() {
             a.id = new_uuid();
         }
-        a.name = self.proposed_name(&a.agent, identity);
+        a.name = self.adopted_name(&a.agent, identity);
         a.sign_in_required = false;
         a.review = !self.for_agent(&a.agent).is_empty();
         a.public_identity = identity.filter(|name| a.review && valid_account_name(name)).map(String::from);
@@ -595,8 +742,7 @@ impl Accounts {
             let old = self.accounts.iter_mut().find(|old| old.id == old_default.id).unwrap();
             old.linked_to = Some(a.id.clone());
         } else {
-            // Older servers resolve only names and suppress their implicit default once
-            // this home is listed. Keep that name, hidden through linking in this version.
+            // Keep the old name and its usage reference when the visible label changes.
             self.accounts.push(Account { id: new_uuid(), linked_to: Some(a.id.clone()), ..checked.clone() });
         }
         if let Some(old) = self.accounts.iter_mut().find(|old| old.id == a.id) {
@@ -1855,6 +2001,170 @@ mod tests {
     use super::*;
 
     #[test]
+    fn linked_files_rewrite_to_one_entry_per_account_with_all_references_and_legacy_fields() {
+        let dir = std::env::temp_dir().join(format!("kraal-compact-{}", new_uuid()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("accounts.toml");
+        let source = "# My accounts.\n\
+[[account]]\nid = 'work'\nname = 'patron.bzh'\nagent = 'claude'\nhome = '/patron'\n\
+[[account]]\nid = 'gmail'\nname = 'gmail'\nagent = 'claude'\nhome = '/gmail'\n\
+# Keep the old home.\n\
+[[account]]\nid = 'old-claude'\nname = 'default'\nagent = 'claude'\nhome = '~/.claude'\nlinked_to = 'default-claude'\nnote = 'mine'\nfuture = 7\n\
+[[account]]\nid = 'default-claude'\nname = 'Personal'\nagent = 'claude'\nhome = '~/.claude'\nlinked_to = 'work'\n\
+[[account]]\nid = 'old-codex'\nname = 'default'\nagent = 'codex'\nhome = '~/.codex'\nlinked_to = 'default-codex'\n\
+[[account]]\nid = 'default-codex'\nname = 'Personal'\nagent = 'codex'\nhome = '~/.codex'\n\
+[[rule]]\nworkspace = 'w'\nagent = 'claude'\naccounts = ['default']\n";
+        std::fs::write(&path, source).unwrap();
+        Accounts::update_at(&path, |_| Ok(())).unwrap();
+        let saved = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(saved.matches("[[account]]").count(), 3, "{saved}");
+        assert!(!saved.contains("linked_to"), "{saved}");
+        for kept in ["# My accounts.", "# Keep the old home.", "note = 'mine'", "future = 7"] {
+            assert!(saved.contains(kept), "{saved}");
+        }
+        let all = Accounts::load_from(&path).unwrap();
+        assert_eq!(all.all().len(), 3);
+        for id in ["old-claude", "default-claude", "work"] {
+            assert_eq!(all.by_id(id).unwrap().name, "patron.bzh", "{saved}");
+        }
+        assert_eq!(all.get("claude", "default").unwrap().id, "work");
+        assert_eq!(all.get("claude", "Personal").unwrap().id, "work");
+        assert_eq!(all.by_home("claude", &paths::expand_tilde("~/.claude")).unwrap().id, "work");
+        assert_eq!(all.by_id("old-codex").unwrap().name, "Personal");
+        assert_eq!(all.choose("claude", Some("w"), None, &UsageMap::default(), 0).unwrap().id, "work");
+        let env = vec![("CLAUDE_CONFIG_DIR".into(), paths::expand_tilde("~/.claude").display().to_string())];
+        let launched = all.launched_on("claude:default", &env).unwrap();
+        assert_eq!(launched.id, "work");
+        assert!(launched.same_home(&Accounts::standard("claude").unwrap()));
+
+        #[derive(Deserialize)]
+        struct LegacyAccount {
+            name: String,
+            agent: String,
+            home: String,
+            threshold: Option<u8>,
+        }
+        #[derive(Deserialize)]
+        struct LegacyFile {
+            account: Vec<LegacyAccount>,
+        }
+        let old: LegacyFile = toml::from_str(&saved).unwrap();
+        assert_eq!(old.account.len(), 3);
+        for (a, b) in old.account.iter().zip(all.all()) {
+            assert_eq!((&a.name, &a.agent, &a.home, a.threshold), (&b.name, &b.agent, &b.home, b.threshold));
+        }
+        assert_eq!(std::fs::read_to_string(path.with_extension("toml.kraal-bak")).unwrap(), source);
+        Accounts::update_at(&path, |all| all.save()).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), saved, "rewriting is idempotent");
+        Accounts::update_at(&path, |all| {
+            all.limits.threshold = 75;
+            Ok(())
+        })
+        .unwrap();
+        let changed = std::fs::read_to_string(&path).unwrap();
+        assert!(changed.contains("# Keep the old home.") && changed.contains("future = 7"));
+        assert_eq!(changed.matches("[[account]]").count(), 3);
+        Accounts::update_at(&path, |all| {
+            assert!(all.remove("claude", "patron.bzh"));
+            Ok(())
+        })
+        .unwrap();
+        let all = Accounts::load_from(&path).unwrap();
+        assert!(all.by_id("default-claude").is_none());
+        assert!(all.unlisted().iter().all(|a| a.agent != "claude"));
+        assert_eq!(all.all().len(), 2);
+        assert_eq!(std::fs::read_to_string(&path).unwrap().matches("[[account]]").count(), 2);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn compaction_keeps_nested_unknown_fields_with_their_reference() {
+        let dir = std::env::temp_dir().join(format!("kraal-compact-nested-{}", new_uuid()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("accounts.toml");
+        let source = "[[account]]\nid = 'work'\nname = 'work'\nagent = 'claude'\nhome = '/work'\n\
+[[account]]\nid = 'personal'\nname = 'personal'\nagent = 'claude'\nhome = '/personal'\n\
+# Keep this reference.\n\
+[[account]]\nid = 'old'\nname = 'old'\nagent = 'claude'\nhome = '/old'\nlinked_to = 'work'\n\
+[account.future] # Keep this table.\nvalue = 7 # Keep this value.\n\
+[account.future.nested]\nlabel = 'nested'\n\
+[[account.future.entries]] # Keep this entry.\nname = 'first'\n\
+[account.future.entries.options]\nenabled = true\n\
+[[account.future.entries]]\nname = 'second'\n";
+        std::fs::write(&path, source).unwrap();
+        let original: toml::Value = toml::from_str(source).unwrap();
+        let future = &original["account"][2]["future"];
+        for forgotten in [false, true] {
+            Accounts::update_at(&path, |all| {
+                if forgotten {
+                    assert!(all.remove("claude", "work"));
+                }
+                Ok(())
+            })
+            .unwrap();
+            let saved = std::fs::read_to_string(&path).unwrap();
+            let doc: toml::Value = toml::from_str(&saved).unwrap();
+            let references = if forgotten {
+                doc["forgotten"].as_array().unwrap()
+            } else {
+                doc["account"][0]["references"].as_array().unwrap()
+            };
+            let old = references.iter().find(|a| a["id"].as_str() == Some("old")).unwrap();
+            assert_eq!(&old["future"], future, "{saved}");
+            let personal =
+                doc["account"].as_array().unwrap().iter().find(|a| a["id"].as_str() == Some("personal")).unwrap();
+            assert!(personal.get("references").is_none(), "{saved}");
+            for comment in ["# Keep this reference.", "# Keep this table.", "# Keep this value.", "# Keep this entry."]
+            {
+                assert!(saved.contains(comment), "{saved}");
+            }
+            let all = Accounts::load_from(&path).unwrap();
+            assert_eq!(all.all().len(), if forgotten { 1 } else { 2 });
+            assert_eq!(all.by_id("old").map(|a| a.id), (!forgotten).then(|| "work".to_string()));
+            Accounts::update_at(&path, |_| Ok(())).unwrap();
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), saved, "rewriting is idempotent");
+            Accounts::update_at(&path, |all| {
+                all.limits.threshold = 75;
+                Ok(())
+            })
+            .unwrap();
+            assert_eq!(Accounts::load_from(&path).unwrap().limits.threshold, 75);
+        }
+        assert_eq!(std::fs::read_to_string(path.with_extension("toml.kraal-bak")).unwrap(), source);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn inline_references_and_empty_lists_survive_rewriting() {
+        let dir = std::env::temp_dir().join(format!("kraal-inline-references-{}", new_uuid()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("accounts.toml");
+        for source in [
+            "account = [{id = 'work', name = 'work', agent = 'claude', home = '/work', references = [{id = 'old', name = 'old', agent = 'claude', home = '/old', future = 7}]}]\n",
+            "account = []\nforgotten = []\n",
+            "[[account]]\nid = 'work'\nname = 'work'\nagent = 'claude'\nhome = '/work'\nreferences = []\n",
+        ] {
+            std::fs::write(&path, source).unwrap();
+            Accounts::update_at(&path, |all| {
+                all.limits.threshold = 75;
+                Ok(())
+            })
+            .unwrap();
+            let saved = std::fs::read_to_string(&path).unwrap();
+            let all = Accounts::load_from(&path).unwrap();
+            assert_eq!(all.limits.threshold, 75);
+            if source.contains("future") {
+                assert!(saved.contains("future = 7"), "{saved}");
+                assert_eq!(all.get("claude", "old").unwrap().id, "work");
+                assert_eq!(all.all().len(), 1);
+            }
+            Accounts::update_at(&path, |all| all.save()).unwrap();
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), saved);
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn verified_existing_sign_ins_are_ordinary_renameable_accounts() {
         for kind in AGENTS {
             let mut all = Accounts::empty();
@@ -1862,6 +2172,8 @@ mod tests {
             assert!(all.all().is_empty());
             all.adopt_checked(&original, None).unwrap();
             assert_eq!(all.for_agent(kind.name).len(), 1);
+            let saved: toml::Value = toml::from_str(&all.text().unwrap()).unwrap();
+            assert_eq!(saved["account"].as_array().unwrap().len(), 1);
             let adopted = all.get(kind.name, "Personal").unwrap();
             assert_eq!(adopted.id, original.id);
             assert_eq!(adopted.home, original.home);
@@ -1889,8 +2201,8 @@ mod tests {
         all.adopt_checked(&existing, Some(email)).unwrap();
         assert_eq!(all.get("claude", "default").unwrap().name, email);
         all.rename("claude", email, "Personal").unwrap();
-        assert_eq!(all.proposed_name("claude", None), "Personal2");
-        assert_eq!(all.proposed_name("codex", Some("bad\nname@example.com")), "Personal");
+        assert_eq!(all.proposed_name("claude", None), "");
+        assert_eq!(all.proposed_name("codex", Some("bad\nname@example.com")), "");
         let mut other = Accounts::empty();
         other.add(acct("claude", email, "/a-different-home")).unwrap();
         other.adopt_checked(&existing, Some(email)).unwrap();
@@ -2092,7 +2404,8 @@ mod tests {
         assert!(
             saved.contains("# Keep this note.") && saved.contains("future = 7") && saved.contains("note = 'old label'")
         );
-        assert!(saved.contains("linked_to ="));
+        assert!(saved.contains("[[account.references]]"));
+        assert_eq!(saved.matches("[[account]]").count(), 1);
         assert_eq!(std::fs::read_to_string(path.with_extension("toml.kraal-bak")).unwrap(), source);
         let mut all = Accounts::load_from(&path).unwrap();
         let added = all.add(acct("claude", "third", alias.to_str().unwrap())).unwrap();
@@ -2307,6 +2620,7 @@ mod tests {
             review: false,
             public_identity: None,
             linked_to: None,
+            references: Vec::new(),
         };
         assert_eq!(conversation_exists(&a, "abc").unwrap(), Some(false));
         std::fs::create_dir_all(home.join("projects/-home-me")).unwrap();
@@ -2357,6 +2671,7 @@ mod tests {
             review: false,
             public_identity: None,
             linked_to: None,
+            references: Vec::new(),
         };
         a.id = a.legacy_id();
         a

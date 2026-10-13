@@ -1288,7 +1288,12 @@ impl Server {
         }
 
         let room = (height as usize).saturating_sub(rows.len() + 1);
-        let accounts = account_rows(self.accounts_picker_at(None, now).items, room);
+        let mut items = self.accounts_picker_at(None, now).items;
+        for item in &mut items {
+            item.detail =
+                super::account_ui::sidebar_summary(&item.detail, self.sidebar_cols(c).saturating_sub(3) as usize);
+        }
+        let accounts = account_rows(items, room);
         if !accounts.is_empty() {
             let top = (height as usize).saturating_sub(accounts.len() + 1);
             rows.resize_with(top, || SideRow::Blank);
@@ -1987,6 +1992,7 @@ mod tests {
                 review: false,
                 public_identity: None,
                 linked_to: None,
+                references: Vec::new(),
             })
             .unwrap();
         let five_hour = Some(Window { used_percent: 93.0, resets_at: Some(1_100) });
@@ -2002,11 +2008,9 @@ mod tests {
                 .collect()
         };
         let shown = |now| rows(now)[1].to_string();
-        for (from, until, figure) in [
-            (1_000, Some(1_100), "93% used · 0 panes"),
-            (1_100, Some(1_300), "41% used · 0 panes"),
-            (1_300, None, "Last checked 5m ago"),
-        ] {
+        for (from, until, figure) in
+            [(1_000, Some(1_100), "93% used"), (1_100, Some(1_300), "41% used"), (1_300, None, "Last checked 5m ago")]
+        {
             assert_eq!((shown(from), server.usage.next_end(from)), (figure.to_string(), until));
             if let Some(until) = until {
                 assert_eq!(rows(until - 1), rows(from));
