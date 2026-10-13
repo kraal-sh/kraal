@@ -671,7 +671,7 @@ mod tests {
         let (client, _peer) = super::super::tests::client(&mut server);
         let a = server.accounts.add(account()).unwrap();
         let login = server.alloc_id();
-        server.workspaces[0].tab_mut().focus = Some(login);
+        server.workspaces[0].tab_mut().unwrap().focus = Some(login);
         server.clients.get_mut(&client).unwrap().adding_account = Some(login);
         server.clients.get_mut(&client).unwrap().mode =
             Mode::Prompt(Prompt::new("Rename workspace", "", PromptAction::RenameWorkspace(server.workspaces[0].id)));
@@ -691,12 +691,12 @@ mod tests {
 
         server.clients.get_mut(&client).unwrap().mode = Mode::Normal;
         server.clients.get_mut(&client).unwrap().adding_account = Some(login);
-        server.workspaces[0].tab_mut().focus = Some(login + 1);
+        server.workspaces[0].tab_mut().unwrap().focus = Some(login + 1);
         server.added_login_finished(login, &a);
         assert!(matches!(server.clients[&client].mode, Mode::Normal));
         assert_eq!(server.clients[&client].adding_account, None);
 
-        server.workspaces[0].tab_mut().focus = Some(login);
+        server.workspaces[0].tab_mut().unwrap().focus = Some(login);
         server.clients.get_mut(&client).unwrap().adding_account = Some(login);
         server.added_login_finished(login + 1, &a);
         assert!(matches!(server.clients[&client].mode, Mode::Normal));
@@ -725,7 +725,7 @@ mod tests {
             };
             let login = server.spawn_pane(None, spec).unwrap();
             drop(batch);
-            server.workspaces[0].tab_mut().focus = Some(login);
+            server.workspaces[0].tab_mut().unwrap().focus = Some(login);
             server.clients.get_mut(&client).unwrap().adding_account = Some(login);
             if cancel {
                 server.client_input(client, b"\x03");

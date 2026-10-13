@@ -533,8 +533,9 @@ impl Server {
     /// their processes to end, check nothing changed since the question (else ask again),
     /// remove.
     pub(super) fn remove_worktrees(&mut self, client: ClientId, list: Vec<(Worktree, WorktreeState)>) {
-        let Some((first, _)) = list.first() else { return };
-        let repo = first.repo.clone();
+        if list.is_empty() {
+            return;
+        }
         let mut in_tree: Vec<PaneId> = Vec::new();
         for p in list.iter().flat_map(|(w, _)| self.panes_in(w)) {
             if !in_tree.contains(&p) {
@@ -542,19 +543,6 @@ impl Server {
             }
         }
         let pids: Vec<u32> = in_tree.iter().filter_map(|p| self.panes.get(p)?.pid()).collect();
-        // Closing the last panes would end the session before the removal ran: a shell in the
-        // repository takes their place.
-        if !in_tree.is_empty()
-            && self.panes.keys().all(|p| in_tree.contains(p))
-            && let Some((wi, _)) = self.workspace_of(in_tree[0])
-        {
-            let ws = self.workspaces[wi].id;
-            let spec = PaneSpec { cwd: Some(repo), ..Default::default() };
-            if let Err(e) = self.spawn_pane_in(ws, None, spec, Placement::Tab, None) {
-                self.toast(client, format!("{e:#}: nothing was removed"));
-                return;
-            }
-        }
         for p in in_tree {
             self.close_pane(p);
         }

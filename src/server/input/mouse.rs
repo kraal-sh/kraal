@@ -62,7 +62,12 @@ impl Server {
                     Some(SideItem::Accounts) => return Some(self.action(id, Action::Accounts)),
                     Some(SideItem::Account(account)) => return Some(self.account_details(&account)),
                     Some(SideItem::AddAccount) => return Some(self.action(id, Action::AddAccount)),
-                    Some(SideItem::Workspace(ws)) => self.show_workspace(id, ws),
+                    Some(SideItem::Workspace(ws)) => {
+                        if self.ws_index(ws).is_some_and(|wi| self.workspaces[wi].close_error.is_some()) {
+                            return Some(self.ask_close_workspace(id, ws));
+                        }
+                        self.show_workspace(id, ws);
+                    }
                     Some(SideItem::ReviewAccount(account)) => {
                         if let Some(existing) = self.accounts.by_id(&account).filter(|a| a.review) {
                             return Some(Mode::Picker(self.review_account_picker(&existing)));
@@ -111,13 +116,24 @@ impl Server {
             }
             return None;
         }
-        let (_, wi) = self.current_ws(id)?;
-        let rects = self.tab_rects(self.workspaces[wi].tab(), area);
+        if press_left && self.empty_workspace_button(id).is_some_and(|(r, _)| contains(r, m.col, m.row)) {
+            return Some(self.empty_workspace_enter(id));
+        }
+        let (ws, wi) = self.current_ws(id)?;
+        if self.workspaces[wi].kept.is_some() && !self.workspaces[wi].closed() {
+            return Some(Mode::confirm(
+                "The workspace has not finished closing. Retry Close to continue.",
+                crate::server::ui::ConfirmAction::RetryCloseWorkspace(ws),
+            ));
+        }
+        let rects = self.tab_rects(self.workspaces[wi].tab()?, area);
         let hit = rects.iter().rev().find(|(_, r, _)| contains(*r, m.col, m.row)).copied();
         // The row of a pane folded in a stack, unless a floating pane covers it.
         let folded = match hit {
             Some((.., true)) => None,
-            _ => self.stack_rows(self.workspaces[wi].tab(), area).into_iter().find(|(_, r)| contains(*r, m.col, m.row)),
+            _ => {
+                self.stack_rows(self.workspaces[wi].tab()?, area).into_iter().find(|(_, r)| contains(*r, m.col, m.row))
+            }
         };
 
         match m.kind {
@@ -179,7 +195,7 @@ impl Server {
                         self.toggle_mark(id, p);
                     } else {
                         // It opens, and the pane open in its stack folds.
-                        self.workspaces[wi].tab_mut().set_focus(p);
+                        self.workspaces[wi].tab_mut()?.set_focus(p);
                         self.mark_seen_focused(id);
                         self.mark_dirty();
                     }
@@ -192,7 +208,7 @@ impl Server {
                     return None;
                 }
                 {
-                    let tab = self.workspaces[wi].tab_mut();
+                    let tab = self.workspaces[wi].tab_mut()?;
                     if tab.focus != Some(p) {
                         tab.set_focus(p);
                         self.mark_seen_focused(id);
@@ -334,7 +350,7 @@ impl Server {
                     crate::layout::Axis::Row => m.col,
                     crate::layout::Axis::Column => m.row,
                 };
-                let Some(root) = &mut self.workspaces[wi].tab_mut().root else { return None };
+                let Some(root) = &mut self.workspaces[wi].tab_mut()?.root else { return None };
                 // The border keeps its distance to the pointer: a click alone moves nothing, even
                 // next to a pane narrower than a drag would leave it.
                 let target = pos.saturating_add(grab);
@@ -342,7 +358,7 @@ impl Server {
                 // Borders move as we drag: refresh the one we hold.
                 let fresh = root.borders(area).into_iter().find(|nb| nb.path == b.path && nb.index == b.index);
                 if moved {
-                    self.workspaces[wi].tab_mut().preset = None;
+                    self.workspaces[wi].tab_mut()?.preset = None;
                     self.relayout();
                 }
                 if released {
@@ -355,7 +371,7 @@ impl Server {
                 // A click that does not move selects nothing: it only focuses the pane, and the
                 // clipboard keeps what it had.
                 let moved = moved || (m.col, m.row) != from;
-                let rects = self.tab_rects(self.workspaces[wi].tab(), area);
+                let rects = self.tab_rects(self.workspaces[wi].tab()?, area);
                 let r = rects.iter().find(|(p, ..)| *p == pane).map(|(_, r, _)| self.inner(*r))?;
                 let pn = self.panes.get_mut(&pane)?;
                 if moved {
@@ -385,7 +401,7 @@ impl Server {
                 Some(Drag::Select { pane, from, moved })
             }
             Drag::MoveFloat { pane, grab_x, grab_y } => {
-                let tab = self.workspaces[wi].tab_mut();
+                let tab = self.workspaces[wi].tab_mut()?;
                 if let Some(f) = tab.floating.iter_mut().find(|f| f.pane == pane) {
                     let r = f.rect.to_rect(area);
                     let x = m.col.saturating_sub(grab_x).clamp(area.x, area.x + area.width - r.width);
@@ -402,7 +418,7 @@ impl Server {
                 }
             }
             Drag::ResizeFloat { pane } => {
-                let tab = self.workspaces[wi].tab_mut();
+                let tab = self.workspaces[wi].tab_mut()?;
                 if let Some(f) = tab.floating.iter_mut().find(|f| f.pane == pane) {
                     let r = f.rect.to_rect(area);
                     // At least 10×5, unless the area is smaller than that from here.
@@ -421,7 +437,7 @@ impl Server {
                 }
             }
             Drag::Forward { pane, button } => {
-                let rects = self.tab_rects(self.workspaces[wi].tab(), area);
+                let rects = self.tab_rects(self.workspaces[wi].tab()?, area);
                 let r = rects.iter().find(|(p, ..)| *p == pane).map(|(_, r, _)| self.inner(*r))?;
                 let pn = self.panes.get_mut(&pane)?;
                 let col = m.col.saturating_sub(r.x).min(r.width.saturating_sub(1));
@@ -443,7 +459,7 @@ impl Server {
         col: u16,
         row: u16,
     ) -> Option<crate::layout::Border> {
-        let tab = self.workspaces[wi].tab();
+        let tab = self.workspaces[wi].tab()?;
         if tab.zoom.is_some() {
             return None;
         }

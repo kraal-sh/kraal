@@ -5,11 +5,102 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 
-use super::{FloatRect, Floating, Server, SyncScope, Tab, Workspace};
+use super::ui::{ConfirmAction, Mode};
+use super::{ClientId, FloatRect, Floating, Server, SyncScope, Tab, Workspace};
 use crate::layout::{Axis, Node, PaneId};
 use crate::pane::{Pane, PaneSpec, ProcessHold};
 use crate::protocol;
+/// Keep the terminal's session and the agent's children identifiable after its shell exits.
+pub(super) struct ProgramStop {
+    process: Option<crate::pane::ProcessHold>,
+    members: Vec<(u32, u64)>,
+    sessions: Vec<crate::process::SessionOwner>,
+    pub(super) since: Instant,
+}
+
+impl ProgramStop {
+    fn recover(intent: &crate::persist::CloseIntent) -> Self {
+        let mut stop = Self {
+            process: None,
+            members: intent.local_members(),
+            sessions: intent.local_sessions(),
+            since: Instant::now(),
+        };
+        stop.refresh();
+        stop
+    }
+
+    pub(super) fn new(pane: &crate::pane::Pane) -> Option<Self> {
+        let process = pane.process_hold()?;
+        let sessions = process.session_owner().into_iter().collect();
+        let mut stop = Self { process: Some(process), members: Vec::new(), sessions, since: Instant::now() };
+        stop.refresh();
+        Some(stop)
+    }
+
+    fn refresh(&mut self) {
+        self.members.retain(|&(pid, started)| crate::process::still_running(pid, started));
+        let mut pids = self.process.as_ref().map(|p| p.session_members()).unwrap_or_default();
+        if self.process.is_none() {
+            pids.extend(self.sessions.iter().flat_map(|s| s.members()));
+        }
+        pids.extend(self.members.iter().map(|&(pid, _)| pid));
+        // Remember children before signalling their parents, including ones in another session.
+        let roots = pids.clone();
+        for pid in roots {
+            pids.extend(crate::process::descendants(pid));
+        }
+        pids.sort_unstable();
+        pids.dedup();
+        for pid in pids {
+            if !self.members.iter().any(|&(seen, _)| seen == pid)
+                && let Some(started) = crate::process::start_time(pid)
+            {
+                self.members.push((pid, started));
+            }
+        }
+    }
+
+    pub(super) fn signal(&self, signal: i32) {
+        if let Some(process) = &self.process {
+            process.signal(signal);
+        }
+        for &(pid, started) in &self.members {
+            if crate::process::still_running(pid, started) {
+                // SAFETY: this member of our stopped job still has the identity we retained.
+                unsafe { libc::kill(pid as libc::pid_t, signal) };
+            }
+        }
+    }
+
+    pub(super) fn finished(&mut self) -> bool {
+        self.refresh();
+        if !self.process.as_ref().is_some_and(|p| p.group_running())
+            && self.members.iter().all(|&(pid, started)| !crate::process::still_running(pid, started))
+        {
+            return true;
+        }
+        let elapsed = self.since.elapsed();
+        if elapsed >= Duration::from_secs(2) {
+            self.signal(libc::SIGKILL);
+        } else if elapsed >= Duration::from_secs(1) {
+            self.signal(libc::SIGTERM);
+        }
+        false
+    }
+}
+
 impl Server {
+    /// An open destination for new panes: the preferred workspace, the primary client's, or
+    /// the first open one. A prepared close owns its layout until it has finished.
+    pub(super) fn available_workspace(&self, preferred: Option<u32>) -> Option<u32> {
+        preferred
+            .into_iter()
+            .chain(self.primary.and_then(|p| self.clients.get(&p)).map(|c| c.workspace))
+            .chain(self.workspaces.iter().map(|w| w.id))
+            .find(|ws| self.ws_index(*ws).is_some_and(|wi| self.workspaces[wi].kept.is_none()))
+    }
+
     pub fn new_workspace(&mut self, name: String, definition: Option<PathBuf>) -> u32 {
         let id = self.alloc_id();
         let mut name = name;
@@ -24,6 +115,8 @@ impl Server {
             stable_id: crate::accounts::new_uuid(),
             name,
             tabs: Vec::new(),
+            kept: None,
+            close_error: None,
             active: 0,
             definition: None,
             definition_inode: None,
@@ -121,8 +214,7 @@ impl Server {
             if let Err(e) = self.launches.send(pending)
                 && let crate::pane::Started::Failed(id, process, why) = e.into_inner().start()
             {
-                // Before queued events, but focus and empty-workspace cleanup still belong
-                // to the enclosing handler's boundary.
+                // Before queued events, but focus still belongs to the enclosing handler's boundary.
                 self.pane_failed(id, &process, &why);
             }
         }
@@ -207,6 +299,7 @@ impl Server {
     ) -> Result<PaneId> {
         use crate::protocol::Placement;
         let wi = self.ws_index(ws).context("no such workspace")?;
+        anyhow::ensure!(self.workspaces[wi].kept.is_none(), "Open the workspace before adding a pane.");
         let mut spec = spec;
         if spec.cwd.is_none() {
             let from =
@@ -233,7 +326,7 @@ impl Server {
                 ws.active = ti;
                 &mut ws.tabs[ti]
             }
-            None => ws.tab_mut(),
+            None => ws.tab_mut().expect("a tab was just created"),
         };
         let target = target.filter(|t| tab.contains(*t)).or(tab.focus);
         if placement == Placement::Floating {
@@ -381,7 +474,7 @@ impl Server {
         }
     }
 
-    /// Close a pane and clean up empty tabs and workspaces.
+    /// Close a pane and remove its empty tab, keeping the workspace.
     pub fn close_pane(&mut self, id: PaneId) {
         self.abandon_added_login(id);
         if !self.panes.contains_key(&id) {
@@ -407,54 +500,155 @@ impl Server {
                     ws.active = ws.active.saturating_sub(1);
                 }
             }
-            if ws.tabs.is_empty() {
-                self.remove_workspace(wi);
-            }
         }
         self.persist_dirty = true;
         self.emit("pane.closed", serde_json::Value::Object(fields));
         self.runbook_pane_closed(id);
-        // The session ends with its last pane; the server tells its clients as it stops.
-        if self.workspaces.is_empty() {
-            // Nothing is left to restore, unless workspaces this server could not restore are.
-            if self.unrestored.is_empty() {
-                let _ = self.persister.send(super::persistence::Persist::Delete(self.session.clone()));
-                self.persisted = None;
-                self.persist_dirty = false;
-            }
-            self.quitting = true;
-            return;
-        }
         self.check_waits();
         self.relayout();
     }
 
-    /// Remove workspace `wi`, moving the clients that showed it to a neighbour.
-    fn remove_workspace(&mut self, wi: usize) {
-        let removed = self.workspaces.remove(wi);
-        self.emit("workspace.closed", serde_json::json!({ "workspace": removed.name }));
-        let fallback = self.workspaces.get(wi.saturating_sub(1)).or(self.workspaces.first()).map(|w| w.id);
-        for c in self.clients.values_mut() {
-            if c.workspace == removed.id {
-                c.workspace = fallback.unwrap_or(0);
+    pub(super) fn close_workspace(&mut self, client: ClientId, ws: u32) -> Mode {
+        match self.keep_and_close_workspace(ws) {
+            Ok(()) => {
+                self.toast(client, "Workspace closed. Enter opens it again.");
+                Mode::Picker(self.workspace_picker(ws))
+            }
+            Err(message) => {
+                if let Some(wi) = self.ws_index(ws) {
+                    self.workspaces[wi].close_error = Some(message.clone());
+                }
+                self.refresh_workspace_pickers();
+                self.mark_dirty();
+                Mode::confirm(message, ConfirmAction::RetryCloseWorkspace(ws))
             }
         }
-        self.persist_dirty = true;
     }
 
-    /// Remove the workspaces left without tabs because what was to fill them could not start:
-    /// a workspace always has a tab to show.
-    pub fn drop_empty_workspaces(&mut self) {
-        while let Some(wi) = self.workspaces.iter().position(|w| w.tabs.is_empty()) {
-            self.remove_workspace(wi);
+    pub(super) fn keep_and_close_workspace(&mut self, ws: u32) -> Result<(), String> {
+        let wi = self.ws_index(ws).ok_or("This workspace is no longer available.")?;
+        if self.workspaces[wi].closed() {
+            self.save_now().map_err(|e| format!("Programs stopped. Couldn't save the final state.\n{e}"))?;
+            self.finish_workspace_close(ws);
+            return Ok(());
         }
+        let panes = self.workspaces[wi].panes();
+        if panes
+            .iter()
+            .filter_map(|p| self.panes.get(p))
+            .any(|p| p.is_terminal() && p.pid().is_none() && p.exit_code.is_none())
+        {
+            return Err("A program is still starting. Nothing was stopped. Retry Close once it starts.".into());
+        }
+        let mut stops: Vec<_> = panes.iter().filter_map(|p| self.panes.get(p).and_then(ProgramStop::new)).collect();
+        if let Some(intent) = self.workspaces[wi].kept.as_ref().and_then(|s| s.close_pending.as_ref()) {
+            stops.push(ProgramStop::recover(intent));
+        }
+        let retry = self.workspaces[wi].kept.is_some();
+        if !retry {
+            self.save_scrollback(true);
+            let mut saved = crate::persist::snapshot(self).workspaces.remove(wi);
+            saved.close_pending = Some(crate::persist::CloseIntent::new(
+                stops.iter().flat_map(|s| s.members.iter().copied()).collect(),
+                stops.iter().flat_map(|s| s.sessions.iter().cloned()).collect(),
+            ));
+            self.workspaces[wi].kept = Some(saved);
+        }
+        if let Err(e) = self.save_now() {
+            if !retry {
+                self.workspaces[wi].kept = None;
+                // A timed-out writer may still publish the intent. Queue its cancellation after it.
+                self.persist();
+            }
+            return Err(format!(
+                "Couldn't save the workspace.\n{}\n{e}",
+                if retry { "The workspace is still open. Retry to finish closing." } else { "Nothing was stopped." }
+            ));
+        }
+        for &id in &panes {
+            self.switches.remove(&id);
+            if let Some(pane) = self.panes.get_mut(&id) {
+                pane.restart_with = None;
+                pane.preparing = false;
+                pane.kill();
+            }
+        }
+        for stop in &mut stops {
+            stop.since = Instant::now();
+            stop.signal(libc::SIGHUP);
+        }
+        let start = Instant::now();
+        loop {
+            let remaining = stops.iter_mut().filter_map(|s| (!s.finished()).then_some(())).count();
+            if remaining == 0 {
+                break;
+            }
+            if start.elapsed() >= Duration::from_secs(3) {
+                return Err("Couldn't stop all programs.\nThe workspace is still open. Retry to finish closing.".into());
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        for pane in panes {
+            self.close_pane(pane);
+        }
+        let saved = self.workspaces[wi].kept.as_mut().expect("closing keeps its layout");
+        saved.closed = true;
+        saved.close_pending = None;
+        self.workspaces[wi].tabs.clear();
+        self.workspaces[wi].active = 0;
+        self.workspaces[wi].sync = SyncScope::Off;
+        self.workspaces[wi].marked.clear();
+        self.workspaces[wi].sync_approved.clear();
+        self.save_now().map_err(|e| format!("Programs stopped. Couldn't save the final state.\n{e}"))?;
+        self.finish_workspace_close(ws);
+        Ok(())
     }
 
-    pub fn close_workspace(&mut self, ws: u32) {
+    fn finish_workspace_close(&mut self, ws: u32) {
         let Some(wi) = self.ws_index(ws) else { return };
-        for id in self.workspaces[wi].panes() {
-            self.close_pane(id);
+        self.workspaces[wi].close_error = None;
+        self.emit("workspace.closed", serde_json::json!({ "workspace": self.workspaces[wi].name }));
+        let fallback = self.workspaces.iter().find(|w| !w.closed() && w.id != ws).map(|w| w.id);
+        let clients: Vec<_> = self.clients.values().filter(|c| c.workspace == ws).map(|c| c.id).collect();
+        for id in clients {
+            let mode = fallback.is_none().then(|| Mode::Picker(self.workspace_picker(ws)));
+            if let Some(c) = self.clients.get_mut(&id) {
+                c.workspace = fallback.unwrap_or(ws);
+                if let Some(mode) = mode {
+                    c.mode = mode;
+                }
+            }
         }
+        self.refresh_workspace_pickers();
+        self.mark_dirty();
+    }
+
+    pub(super) fn reopen_workspace(&mut self, ws: u32) -> Result<()> {
+        let wi = self.ws_index(ws).context("no such workspace")?;
+        let Some(saved) = self.workspaces[wi].kept.clone() else { return Ok(()) };
+        if saved.closed && self.workspaces[wi].close_error.is_some() {
+            self.keep_and_close_workspace(ws).map_err(anyhow::Error::msg)?;
+        }
+        anyhow::ensure!(saved.closed, "The workspace has not finished closing. Retry Close first.");
+        let before = self.panes.keys().copied().collect();
+        let workspaces = self.workspaces.iter().map(|w| w.id).collect::<Vec<_>>();
+        let result = self.with_batch(|server| {
+            let result = crate::persist::restore_workspace_tabs(server, wi, &saved, 2);
+            if result.is_err() {
+                server.rollback(&before, &workspaces);
+                server.workspaces[wi].tabs.clear();
+            }
+            result
+        });
+        if let Err(e) = result {
+            return Err(e).context("Couldn't open the workspace. Its layout is kept. Fix the cause and retry Open");
+        }
+        self.workspaces[wi].kept = None;
+        self.workspaces[wi].close_error = None;
+        self.refresh_workspace_pickers();
+        self.mark_persist();
+        self.relayout();
+        Ok(())
     }
 
     pub fn pane_label(&self, pane: PaneId) -> String {
@@ -541,6 +735,80 @@ mod tests {
     use super::*;
     use crate::server::Event;
 
+    #[test]
+    fn close_recovery_stops_children_forked_after_preparation_and_their_parent_exits() {
+        let dir = std::env::temp_dir().join(format!("kraal-close-survivor-{}", crate::accounts::new_uuid()));
+        std::fs::create_dir(&dir).unwrap();
+        let child_file = dir.join("child");
+        let ready = dir.join("ready");
+        let script = dir.join("survivor");
+        crate::testing::write_script(
+            &script,
+            &format!("#!/bin/sh\ntrap '' HUP TERM\necho $$ > {}\nexec sleep 60\n", child_file.display()),
+        );
+        let (tx, _rx) = crate::server::event_channel(4096);
+        let mut server = super::super::tests::server(tx);
+        let ws = server.new_workspace("closing".into(), None);
+        let command = format!(
+            "trap 'trap \"\" HUP TERM; sh {} </dev/null >/dev/null 2>&1 & exit 0' HUP; echo ready > {}; while :; do sleep 0.01; done",
+            script.display(),
+            ready.display()
+        );
+        let pane = server
+            .spawn_pane_in(
+                ws,
+                None,
+                PaneSpec { command: vec!["sh".into(), "-c".into(), command], ..Default::default() },
+                protocol::Placement::Tab,
+                None,
+            )
+            .unwrap();
+        let wait = |done: &dyn Fn() -> bool| {
+            let start = Instant::now();
+            while !done() {
+                assert!(start.elapsed() < crate::testing::PATIENCE, "the process did not reach the expected state");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        };
+        wait(&|| ready.exists());
+        let parent = server.panes[&pane].pid().unwrap();
+        let stop = ProgramStop::new(&server.panes[&pane]).unwrap();
+        let mut other = stop.sessions[0].clone();
+        other.started = other.started.wrapping_add(1);
+        assert!(other.members().is_empty(), "a reused leader's pid is not our session");
+        let intent = crate::persist::CloseIntent::new(stop.members.clone(), stop.sessions.clone());
+        let prepared = serde_json::to_vec(&intent).unwrap();
+        assert!(!child_file.exists(), "the survivor is not in the preparation's process inventory");
+        stop.signal(libc::SIGHUP);
+        let read_child = || std::fs::read_to_string(&child_file).ok().and_then(|s| s.trim().parse::<u32>().ok());
+        wait(&|| read_child().is_some() && !crate::process::running(parent as libc::pid_t));
+        let child = read_child().unwrap();
+        let started = crate::process::start_time(child).unwrap();
+        server.close_pane(pane);
+        drop(stop);
+        wait(&|| crate::process::start_time(parent).is_none());
+        assert!(crate::process::still_running(child, started), "the new child survived its parent and SIGHUP");
+        other.started = intent.local_sessions()[0].started;
+        other.token.push_str("different");
+        assert!(other.members().is_empty(), "an orphaned session needs its ownership token");
+        let restored = serde_json::from_slice(&prepared).unwrap();
+        let mut recovered = ProgramStop::recover(&restored);
+        let found = recovered.members.contains(&(child, started));
+        if !found {
+            // SAFETY: clean up only this test's survivor when discovery regresses.
+            unsafe { libc::kill(child as libc::pid_t, libc::SIGKILL) };
+        }
+        assert!(found, "recovery must find the new child through its retained session ownership");
+        recovered.since = Instant::now() - Duration::from_secs(3);
+        let start = Instant::now();
+        while !recovered.finished() {
+            assert!(start.elapsed() < crate::testing::PATIENCE);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!crate::process::still_running(child, started), "Closed requires actual survivor termination");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     fn broken() -> PaneSpec {
         let dir = std::env::temp_dir().join(format!("kraal-fallback-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -580,7 +848,7 @@ mod tests {
                 }),
             );
             server.handle_and_follow(Event::Job(99, Ok(Box::new(()))));
-            assert_eq!(server.workspaces.len(), 1, "cleanup at the handler boundary");
+            assert_eq!(server.workspaces.len(), 2, "empty workspaces are kept");
             assert!(server.focus_reported.is_empty(), "focus at the handler boundary");
             for i in 0..capacity {
                 assert!(matches!(rx.try_recv(), Ok(Event::Warning(w)) if w == i.to_string()));

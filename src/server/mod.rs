@@ -268,6 +268,9 @@ pub struct Workspace {
     pub stable_id: String,
     pub name: String,
     pub tabs: Vec<Tab>,
+    /// The layout retained while closing or closed, independent of the remaining processes.
+    pub kept: Option<persist::WorkspaceSnap>,
+    pub close_error: Option<String>,
     pub active: usize,
     /// The definition file it is linked to (see [`Workspace::set_definition`]): the one it was
     /// started from, or first saved to.
@@ -301,7 +304,7 @@ impl Workspace {
     pub fn sync_targets(&self, focused: PaneId) -> Vec<PaneId> {
         let mut out = match self.sync {
             SyncScope::Off => Vec::new(),
-            SyncScope::Tab => self.tab().root.as_ref().map(|r| r.leaves()).unwrap_or_default(),
+            SyncScope::Tab => self.tab().and_then(|t| t.root.as_ref()).map(|r| r.leaves()).unwrap_or_default(),
             SyncScope::Workspace => {
                 self.tabs.iter().flat_map(|t| t.root.as_ref().map(|r| r.leaves()).unwrap_or_default()).collect()
             }
@@ -313,13 +316,33 @@ impl Workspace {
         out
     }
 
-    pub fn tab(&self) -> &Tab {
-        &self.tabs[self.active.min(self.tabs.len() - 1)]
+    pub fn tab(&self) -> Option<&Tab> {
+        self.tabs.get(self.active.min(self.tabs.len().saturating_sub(1)))
     }
 
-    pub fn tab_mut(&mut self) -> &mut Tab {
-        let i = self.active.min(self.tabs.len() - 1);
-        &mut self.tabs[i]
+    pub fn tab_mut(&mut self) -> Option<&mut Tab> {
+        let active = self.active.min(self.tabs.len().saturating_sub(1));
+        self.tabs.get_mut(active)
+    }
+
+    pub fn closed(&self) -> bool {
+        self.kept.as_ref().is_some_and(|s| s.closed)
+    }
+
+    pub fn status(&self) -> &'static str {
+        if self.close_error.is_some() {
+            if self.closed() { "Programs stopped · Save failed" } else { "Open · Close failed" }
+        } else if self.closed() {
+            "Closed"
+        } else if self.kept.is_some() {
+            "Closing"
+        } else {
+            "Open"
+        }
+    }
+
+    pub fn counts(&self) -> (usize, usize) {
+        self.kept.as_ref().map_or_else(|| (self.tabs.len(), self.panes().len()), |s| s.counts())
     }
 
     pub fn panes(&self) -> Vec<PaneId> {
@@ -1627,9 +1650,6 @@ impl Server {
             }
             Event::Shutdown => self.quitting = true,
         }
-        // Whatever was to fill a new workspace and could not start leaves no empty workspace
-        // behind (one is never shown without a tab).
-        self.drop_empty_workspaces();
     }
 
     /// A client said something. After a quiet spell, the tick runs first: what it is about to
@@ -1959,9 +1979,6 @@ impl Server {
     /// What the clients are told when the server stops for good, `saved` saying whether the
     /// session was: why, and how it comes back.
     fn stop_message(&self, saved: &Result<(), String>) -> String {
-        if self.workspaces.is_empty() {
-            return "the last pane closed, so kraal stopped".into();
-        }
         let start = match self.session.as_str() {
             "main" => "kraal".to_string(),
             session => format!("kraal -s {session}"),

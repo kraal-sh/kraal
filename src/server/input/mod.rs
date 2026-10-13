@@ -442,7 +442,21 @@ impl Server {
     // ---- panes ----------------------------------------------------------------------------
 
     fn key_to_pane(&mut self, id: ClientId, k: &Key) -> Mode {
-        let Some(p) = self.client_focus(id) else { return Mode::Normal };
+        if let Some((ws, wi)) = self.current_ws(id)
+            && self.workspaces[wi].kept.is_some()
+            && !self.workspaces[wi].closed()
+        {
+            return Mode::confirm(
+                "The workspace has not finished closing. Retry Close to continue.",
+                super::ui::ConfirmAction::RetryCloseWorkspace(ws),
+            );
+        }
+        let Some(p) = self.client_focus(id) else {
+            if k.code == KeyCode::Enter && !k.mods.ctrl && !k.mods.alt {
+                return self.empty_workspace_enter(id);
+            }
+            return Mode::Normal;
+        };
         let Some(pane) = self.panes.get_mut(&p) else { return Mode::Normal };
         if matches!(pane.content, crate::pane::Content::Files(_)) {
             return self.files_key(id, p, k);

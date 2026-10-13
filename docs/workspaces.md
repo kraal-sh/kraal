@@ -5,8 +5,9 @@ How kraal is organised, and how a workspace is declared once in a file and opene
 ## Concepts
 
 The workspace picker (`ctrl+b w`) shows what Enter does for each selected line: open an existing
-workspace or create the name typed. Tab offers to close a workspace only when it is running;
-a workspace file that is not running can only be opened.
+workspace or create the name typed. Saved workspaces show **Open** or **Closed**, with their
+retained tab and pane counts. Tab offers to close an open workspace; a closed workspace or a
+workspace file that has not been opened offers Open.
 
 Creating a workspace (`ctrl+b W n`, or a new name in the picker) keeps the name you typed if
 the shell cannot start. No workspace is added on that failure. The error stays in **New workspace**:
@@ -18,8 +19,8 @@ fix the cause and press Enter to retry, edit the name, or press Esc to cancel.
 - A session holds **workspaces**, each with **tabs** (named after their focused pane until you
   rename them), each with **panes**:
   tiled (some may share a place as a stack, one open at a time), or floating on top.
-- The **sidebar**, at the left from the first screen on, lists the workspaces (the open ones,
-  then the workspace files that are not open) and, when there are some, the agents, the tunnels
+- The **sidebar**, at the left from the first screen on, lists the saved workspaces, open and
+  closed, then the workspace files that have not been opened and, when there are some, the agents, the tunnels
   and the ports, with the agents' accounts at the bottom once one is listed or used.
   `ctrl+b V l` hides it, or shows it again, in the terminal you type it in until that terminal
   detaches; `[sidebar] visible = false` in the configuration hides it for good. A terminal less
@@ -38,7 +39,7 @@ fix the cause and press Enter to retry, edit the name, or press Esc to cancel.
 | Command | |
 |---|---|
 | `kraal` | attaches to the session, starting it if needed |
-| `kraal shop` (or `kraal attach shop`) | the same, on the workspace `shop`, opened from its file if it is not open |
+| `kraal shop` (or `kraal attach shop`) | the same, on the workspace `shop`, reopened from its saved layout, or imported from its file the first time |
 | `kraal attach files` | a workspace named like a command of kraal: `kraal files` is the command, and `kraal config check` names such a file |
 | `kraal ls` | lists the sessions: running, with the kraal each one runs, or saved |
 | `kraal kill` | stops the session's server and its programs; the layout is saved |
@@ -88,26 +89,35 @@ stopped: it keeps running, and the quit says why (`kraal kill` stops it all the 
 
 ### Closing a workspace
 
-`ctrl+b W x`, or `ctrl+x` on an open workspace in the workspace picker, asks before closing
-all its panes. The question lists that workspace's running programs, including jobs in the
-background, agents and SSH connections. Activity kraal cannot identify is shown as unknown.
-Unsaved work in these programs may be lost. **Cancel** is selected first; Enter cancels,
-and **Stop and close** confirms. Other workspaces keep running. Other clients showing the
-closed workspace move to a neighbouring workspace.
+Closing a workspace (`ctrl+b W x`, or `ctrl+x` on an open workspace in the picker) keeps its current layout
+and stops its programs. The row stays **Closed**, including when it was the last open workspace.
+Enter in the picker, clicking its sidebar row, or `kraal open <name>` reopens that saved layout.
+Tabs, splits, floating panes, pane directories, commands, agent conversations and saved scrollback
+are kept. Reopening follows the same rules as a session restart: shells start, SSH shells reconnect,
+agent conversations resume, and other commands wait for Enter. The imported KDL file is not
+rewritten or reread by Close or Open; editing, removing or breaking that file does not replace
+the saved layout. To export a closed workspace with `kraal save`, open it first.
 
-Close currently removes the live layout from the session. A linked workspace file stays
-unchanged: reopening uses that file's layout, without changes made since it was saved.
-A workspace without a linked file disappears from the list. The question explains this;
-cancel and [save the layout](#workspace-files) first to keep it. Even a workspace
-with only shells at their prompts asks before removing its layout.
+Close lists the running programs, background jobs, agents and SSH connections before stopping them.
+**Cancel** is selected first; Enter cancels, and **Stop and close** confirms. Unsaved work in these
+programs may be lost. Other workspaces keep running, and clients showing the closed workspace move
+to another open workspace, or to Workspaces if none remain. Shells waiting at their prompt need no
+extra confirmation; unknown activity still asks. If another client changes
+the programs while the question is open, the updated inventory needs confirmation. Before signalling any
+program, kraal writes the layout, scrollback and close intent durably. If that preparation fails,
+the dialog says **Nothing was stopped** and offers **Retry**. If programs cannot all be stopped,
+the workspace stays open and Retry continues the close. If saving the final state fails after
+stopping, the dialog says **Programs stopped. Couldn't save the final state.** The prepared
+layout remains recoverable; Retry saves the final state. After a crash during Close, the next
+server finishes the recorded close without reopening those programs. Recovery checks the machine,
+boot and process start times before signalling surviving programs.
 
-Closing the last workspace also stops the session, as the question says.
-
-When the last pane of the last workspace ends (`exit` in the last shell), the session ends with
-it: nothing runs any more, so nothing is asked, the attached terminals end with
-`[kraal: the last pane closed, so kraal stopped]`, nothing stays saved, and the next `kraal`
-starts a new session. A command pane that stays open to show how its program ended has not ended:
-the session goes on until that pane is closed.
+Closing an individual pane or tab removes it from the layout. When the last pane ends, including
+`exit` in the last shell, the workspace stays empty and saved. **+ Add pane** adds a shell with
+Enter or a click. The session and attached terminals stay open, and an empty workspace stays
+empty after a restart. Closing the last open workspace shows Workspaces. Use Quit (`ctrl+b q`)
+or `kraal kill` to stop the session explicitly. A command pane that shows its exit code remains
+in the layout until it is closed.
 
 ### Restarting a session
 
@@ -143,8 +153,8 @@ not saved unless `[buffers] persist = true` ([Configuration](configuration.md)).
 
 ### Workspace identities and migration
 
-An opened workspace has a saved identity independent of its name, position and source path.
-`kraal workspaces --json` includes it as `id` on open workspaces; file-only entries omit it.
+A saved workspace has an identity independent of its name, position and source path.
+`kraal workspaces --json` includes it as `id` on open and closed workspaces; file-only entries omit it.
 Restarting keeps that identity. The pane and tab numbers used within a running server remain
 local to that server.
 
@@ -250,8 +260,8 @@ From the command line:
 
 | Command | |
 |---|---|
-| `kraal workspaces` | the open workspaces with their tabs, panes and agents, and the files not open (`--json` for scripts) |
-| `kraal open shop` | starts the workspace `shop` from its file, or switches to it, without attaching (any name: `kraal open files` too) |
+| `kraal workspaces` | its open and closed workspaces with retained tab and pane counts, plus files not imported (`--json` for scripts); saved workspaces remain listed when the server is stopped |
+| `kraal open shop` | reopens the saved workspace `shop`, switches to it if open, or imports its file the first time, without attaching (any name: `kraal open files` too) |
 | `kraal save` | writes the layout of a workspace to its file: in a pane, that pane's workspace; outside one, the workspace on screen |
 | `kraal save --workspace shop` | the same for the workspace you name |
 | `kraal save shop-2` | writes it under that name |

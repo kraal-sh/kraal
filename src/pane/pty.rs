@@ -62,6 +62,7 @@ pub(super) const MAX_PENDING_INPUT: usize = 16 << 20;
 /// signal sent to them cannot reach another program.
 #[derive(Default)]
 pub(super) struct Process {
+    token: String,
     /// Set once it started (a pane set up in a batch starts its program a moment later).
     pid: std::sync::OnceLock<u32>,
     child: Mutex<Option<PaneChild>>,
@@ -154,6 +155,15 @@ impl ProcessHold {
             .pid()
             .map(|pid| crate::process::session_members(pid as libc::pid_t).into_iter().map(|p| p as u32).collect())
             .unwrap_or_default()
+    }
+
+    pub fn session_owner(&self) -> Option<crate::process::SessionOwner> {
+        let leader = self.0.pid()?;
+        Some(crate::process::SessionOwner {
+            leader,
+            started: crate::process::start_time(leader)?,
+            token: self.0.token.clone(),
+        })
     }
 
     /// Send `signal` to the process and its group.
@@ -335,6 +345,8 @@ impl TermPane {
         for (k, v) in spec.env.iter().chain(&spec.secret_env.0) {
             cmd.env(k, v);
         }
+        let token = crate::accounts::new_uuid();
+        cmd.env("KRAAL_PROCESS", &token);
         // Ready to start: a program that cannot be found fails here. It starts below, or after
         // the other panes of its batch are set up (see `super::spawn::batch`).
         let what = spec.command.first().unwrap_or(&env.shell).clone();
@@ -356,7 +368,7 @@ impl TermPane {
             input_dropped: false,
             owed: VecDeque::new(),
             output: io.output,
-            process: Arc::new(Process::default()),
+            process: Arc::new(Process { token, pid: Default::default(), child: Default::default() }),
             reader_stop: io.stop,
             writer_stop: io.writer_stop,
             pending: Some((

@@ -7,6 +7,26 @@ use std::os::unix::io::AsRawFd;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 
+/// Ownership of a terminal session across a server crash. The token is inherited by new
+/// children, so a surviving member can identify the session after its leader has been reaped.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct SessionOwner {
+    pub leader: u32,
+    pub started: u64,
+    pub token: String,
+}
+
+impl SessionOwner {
+    pub fn members(&self) -> Vec<u32> {
+        let members: Vec<_> = session_members(self.leader as libc::pid_t).into_iter().map(|p| p as u32).collect();
+        let owned = match start_time(self.leader) {
+            Some(started) => started == self.started,
+            None => members.iter().any(|p| environ(*p, &["KRAAL_PROCESS"]).get("KRAAL_PROCESS") == Some(&self.token)),
+        };
+        if owned { members } else { Vec::new() }
+    }
+}
+
 /// The command line of a process; `None` when it cannot be read, or is empty (a kernel thread).
 pub fn argv(pid: u32) -> Option<Vec<String>> {
     let (argv, _) = imp::args_and_env(pid)?;

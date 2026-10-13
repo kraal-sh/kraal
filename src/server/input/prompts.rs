@@ -116,7 +116,7 @@ impl Server {
                     return Err((p.action, "Type a name.".into()));
                 }
                 if self.workspaces.iter().any(|w| w.name == value && w.id != ws) {
-                    return Err((p.action, format!("A workspace named \"{value}\" is already open.")));
+                    return Err((p.action, format!("A workspace named \"{value}\" already exists.")));
                 }
                 let Some(wi) = self.ws_index(ws) else { return Ok(()) };
                 match self.rename_definition(wi, &value) {
@@ -131,13 +131,13 @@ impl Server {
                     return Err((p.action, "Type a name.".into()));
                 }
                 if self.workspaces.iter().any(|w| w.name == value) {
-                    return Err((p.action, format!("A workspace named \"{value}\" is already open.")));
+                    return Err((p.action, format!("A workspace named \"{value}\" already exists.")));
                 }
                 let ws = self.new_workspace(value, None);
                 match self.spawn_pane_in(ws, None, PaneSpec::default(), Placement::Tab, None) {
                     Ok(_) => self.show_workspace(id, ws),
                     Err(e) => {
-                        self.drop_empty_workspaces();
+                        self.workspaces.retain(|w| w.id != ws);
                         return Err((p.action, format!("Couldn't start the shell. No workspace was added.\n{e:#}")));
                     }
                 }
@@ -432,7 +432,17 @@ impl Server {
                             }
                         }
                     }
-                    ConfirmAction::CloseWorkspace(ws) => self.close_workspace(ws),
+                    ConfirmAction::CloseWorkspace(ws) => {
+                        let current = self.ask_close_workspace(id, ws);
+                        if matches!(&current, Mode::Confirm(next) if matches!(next.action, ConfirmAction::CloseWorkspace(_)) && next.message == q.message)
+                        {
+                            return self.close_workspace(id, ws);
+                        }
+                        return current;
+                    }
+                    ConfirmAction::RetryCloseWorkspace(ws) => {
+                        return self.ask_close_workspace(id, ws);
+                    }
                     ConfirmAction::Restart => self.restart(id),
                     ConfirmAction::Quit => self.quit(),
                     ConfirmAction::Job { label, args } => self.start_job(id, &label, args),
@@ -496,17 +506,18 @@ mod tests {
         let mut server = crate::server::tests::server(tx);
         let (client, _peer) = crate::server::tests::client(&mut server);
         let ws = server.clients[&client].workspace;
-        let _batch = crate::pane::batch();
+        crate::server::persistence::tests::writer(&mut server, vec![Ok(()), Ok(())]);
         for i in 0..30 {
             let placement = if i == 0 { Placement::Auto } else { Placement::Tab };
-            server.spawn_pane_in(ws, None, PaneSpec::default(), placement, None).unwrap();
+            let spec = PaneSpec { command: vec!["sleep".into(), "60".into()], ..Default::default() };
+            server.spawn_pane_in(ws, None, spec, placement, None).unwrap();
         }
         for (cols, rows) in [(80, 24), (124, 36)] {
             let c = server.clients.get_mut(&client).unwrap();
             c.cols = cols;
             c.rows = rows;
             for cancel in [KeyCode::Enter, KeyCode::Esc, KeyCode::Char('n')] {
-                let Mode::Confirm(q) = server.ask_close_workspace(ws) else { panic!("confirmation") };
+                let Mode::Confirm(q) = server.ask_close_workspace(client, ws) else { panic!("confirmation") };
                 let layout = confirm_layout(&q, server.client_screen(client));
                 assert!(layout.max_scroll > 0);
                 let cancel_button = layout.cancel.unwrap();
@@ -526,13 +537,98 @@ mod tests {
                 assert!(!server.quitting);
             }
         }
-        let Mode::Confirm(q) = server.ask_close_workspace(ws) else { panic!("confirmation") };
+        let Mode::Confirm(q) = server.ask_close_workspace(client, ws) else { panic!("confirmation") };
         let Mode::Confirm(q) = server.on_confirm(client, q, key(KeyCode::Tab)) else { panic!("choose") };
         assert!(q.yes);
-        assert!(matches!(server.on_confirm(client, q, key(KeyCode::Enter)), Mode::Normal));
+        assert!(matches!(server.on_confirm(client, q, key(KeyCode::Enter)), Mode::Picker(_)));
         assert!(server.panes.is_empty());
-        assert!(server.workspaces.is_empty());
-        assert!(server.quitting);
+        assert_eq!(server.workspaces.len(), 1);
+        assert!(server.workspaces[0].closed());
+        assert_eq!(server.workspaces[0].counts(), (30, 30));
+        assert!(!server.quitting);
+    }
+
+    #[test]
+    fn close_asks_again_when_another_client_changes_the_programs() {
+        let (tx, _rx) = crate::server::queue::channel(32);
+        let mut server = crate::server::tests::server(tx);
+        let ws = server.new_workspace("work".into(), None);
+        let spec = crate::pane::PaneSpec { command: vec!["sleep".into(), "60".into()], ..Default::default() };
+        let first = server
+            .spawn_pane_in(ws, None, spec.clone(), crate::protocol::Placement::Tab, Some("first".into()))
+            .unwrap();
+        let Mode::Confirm(question) = server.ask_close_workspace(0, ws) else { panic!("confirm the program") };
+        let second =
+            server.spawn_pane_in(ws, None, spec, crate::protocol::Placement::Tab, Some("second".into())).unwrap();
+        let Mode::Confirm(updated) = server.on_confirm(0, question, key(KeyCode::Char('y'))) else {
+            panic!("confirm the new inventory")
+        };
+        assert!(updated.message.contains("first") && updated.message.contains("second"));
+        assert!(!updated.yes);
+        assert!(matches!(updated.action, ConfirmAction::CloseWorkspace(id) if id == ws));
+        assert!(server.workspaces[0].kept.is_none());
+        for pane in [first, second] {
+            assert!(server.panes[&pane].process_hold().unwrap().group_running());
+        }
+        assert!(matches!(server.on_confirm(0, updated, key(KeyCode::Enter)), Mode::Normal));
+        for pane in [first, second] {
+            server.close_pane(pane);
+        }
+    }
+
+    #[test]
+    fn retrying_an_unprepared_close_confirms_new_programs_from_every_entry() {
+        use crate::input::{MouseButton, MouseEvent, MouseKind};
+        use crate::server::render::SideItem;
+        use crate::server::ui::{PickAction, PickItem};
+
+        for entry in 0..4 {
+            let (tx, _rx) = crate::server::queue::channel(64);
+            let mut server = crate::server::tests::server(tx);
+            let (client, _peer) = crate::server::tests::client(&mut server);
+            let ws = server.clients[&client].workspace;
+            crate::server::persistence::tests::writer(&mut server, vec![Err("disk full".into())]);
+            let Mode::Confirm(retry) = server.ask_close_workspace(client, ws) else { panic!("retry") };
+            assert!(matches!(retry.action, ConfirmAction::RetryCloseWorkspace(_)));
+            assert!(server.workspaces[0].kept.is_none());
+            let pane = server
+                .spawn_pane_in(
+                    ws,
+                    None,
+                    crate::pane::PaneSpec { command: vec!["sleep".into(), "60".into()], ..Default::default() },
+                    crate::protocol::Placement::Tab,
+                    Some("new editor".into()),
+                )
+                .unwrap();
+            let next = match entry {
+                0 => server.on_confirm(client, retry, key(KeyCode::Char('y'))),
+                1 => {
+                    let picker = server.workspace_picker(ws);
+                    server.pick(client, &picker, PickItem::new("Retry", "", PickAction::RetryWorkspaceClose(ws)))
+                }
+                2 => {
+                    let row = (0..36)
+                        .find(|&r| matches!(server.sidebar_hit(client, r), Some(SideItem::Workspace(w)) if w == ws))
+                        .unwrap();
+                    server
+                        .on_mouse(
+                            client,
+                            MouseEvent { kind: MouseKind::Press(MouseButton::Left), col: 2, row, mods: Mods::NONE },
+                            false,
+                        )
+                        .unwrap()
+                }
+                _ => server.empty_workspace_enter(client),
+            };
+            let Mode::Confirm(question) = next else { panic!("confirm the new program") };
+            assert!(question.message.contains("new editor"));
+            assert!(matches!(question.action, ConfirmAction::CloseWorkspace(w) if w == ws));
+            assert!(!question.yes);
+            assert!(server.panes[&pane].process_hold().unwrap().group_running());
+            assert!(matches!(server.on_confirm(client, question, key(KeyCode::Enter)), Mode::Normal));
+            assert!(server.panes[&pane].process_hold().unwrap().group_running());
+            server.close_pane(pane);
+        }
     }
 
     #[test]
@@ -563,7 +659,7 @@ mod tests {
         let (tx, _rx) = crate::server::queue::channel(32);
         let mut server = crate::server::tests::server(tx);
         let (client, _peer) = crate::server::tests::client(&mut server);
-        for (value, error) in [("  ", "Type a name."), (" test ", "already open")] {
+        for (value, error) in [("  ", "Type a name."), (" test ", "already exists")] {
             let p = Prompt::new("New workspace", value, PromptAction::NewWorkspace);
             let Mode::Prompt(p) = server.on_prompt(client, p, key(KeyCode::Enter)) else { panic!("keep input") };
             assert_eq!(p.value, value);

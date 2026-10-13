@@ -45,7 +45,7 @@ impl Server {
         self.reload_accounts();
     }
 
-    /// Keep each open workspace linked to its definition file: a file renamed on disk is found
+    /// Keep each saved workspace linked to its definition file: a file renamed on disk is found
     /// again by its inode. A file that is gone keeps its path, where saving the layout writes it
     /// again (an editor may be replacing it), but not its inode, which a new file may take.
     fn follow_definitions(&mut self, listed: &[(PathBuf, Result<WorkspaceDef>)]) {
@@ -102,7 +102,7 @@ impl Server {
         Ok(first)
     }
 
-    /// The open workspace linked to the definition file at `path` (as [`Server::definitions`]
+    /// The saved workspace linked to the definition file at `path` (as [`Server::definitions`]
     /// lists it). An exact association wins over aliases; several alias owners need a name.
     pub(super) fn definition_workspace(&self, path: &Path) -> Result<Option<u32>> {
         let normalized = workspace::definition_path(path);
@@ -114,7 +114,7 @@ impl Server {
         let Some(ws) = aliases.next() else { return Ok(None) };
         if let Some(other) = aliases.next() {
             anyhow::bail!(
-                "{} belongs to several open workspaces, including {:?} and {:?}; open a workspace by its name",
+                "{} belongs to several saved workspaces, including {:?} and {:?}; open a workspace by its name",
                 path.display(),
                 ws.name,
                 other.name
@@ -123,11 +123,12 @@ impl Server {
         Ok(Some(ws.id))
     }
 
-    /// Open a workspace by name: switch to the open workspace of that name, or to the one its
-    /// definition is open in, else start that definition.
+    /// Reopen a saved workspace by name or its source, else import the definition.
     pub fn open_workspace(&mut self, name: &str) -> Result<u32> {
         if let Some(wi) = self.named_workspace(name)? {
-            return Ok(self.workspaces[wi].id);
+            let id = self.workspaces[wi].id;
+            self.reopen_workspace(id)?;
+            return Ok(id);
         }
         let path = self.find_definition(name)?.with_context(|| {
             let names_server = crate::servers::names_server(&self.known_servers, name);
@@ -136,7 +137,7 @@ impl Server {
         self.open_definition(&path)
     }
 
-    /// Switch to the workspace the definition at `path` is open in, else start it.
+    /// Reopen the workspace imported from `path`, else import it.
     pub(super) fn open_definition(&mut self, path: &Path) -> Result<u32> {
         if let Some(ws) =
             self.unrestored.iter().find(|w| w.definition.as_deref().is_some_and(|p| paths::same_file(p, path)))
@@ -148,6 +149,7 @@ impl Server {
             );
         }
         if let Some(ws) = self.definition_workspace(path)? {
+            self.reopen_workspace(ws)?;
             return Ok(ws);
         }
         let source = paths::read_regular_text(path, u64::MAX)?;
@@ -162,6 +164,7 @@ impl Server {
     pub(super) fn prepare_definition_save(&self, wi: usize, name: &str) -> Result<DefinitionSave> {
         anyhow::ensure!(workspace::valid_file_name(name), "{}, not {name:?}", workspace::FILE_NAME_RULE);
         let ws = &self.workspaces[wi];
+        anyhow::ensure!(ws.kept.is_none(), "Open the workspace before exporting its layout.");
         let own = ws.definition.as_ref().filter(|p| p.file_stem() == Some(OsStr::new(name)));
         let path = own.cloned().unwrap_or_else(|| self.definition_dir().join(format!("{name}.kdl")));
         self.check_definition_owner(wi, &path)?;
@@ -342,7 +345,7 @@ impl Server {
     }
 
     /// Undo a half-built workspace: kill the panes it spawned and drop workspaces it created, so
-    /// no workspace is ever left without tabs.
+    /// existing empty and closed workspaces stay intact.
     pub(crate) fn rollback(&mut self, panes_before: &std::collections::HashSet<PaneId>, workspaces_before: &[u32]) {
         let new: Vec<PaneId> = self.panes.keys().copied().filter(|p| !panes_before.contains(p)).collect();
         for id in new {
@@ -361,7 +364,6 @@ impl Server {
             }
             ws.tabs.retain(|t| !t.panes().is_empty());
         }
-        self.workspaces.retain(|w| !w.tabs.is_empty());
         self.relayout();
     }
 
@@ -902,7 +904,7 @@ mod tests {
         assert_eq!(restored.open_definition(&directory_alias.join("b.kdl")).unwrap(), beta);
         let error = restored.open_workspace("c").unwrap_err().to_string();
         assert!(
-            error.contains("several open workspaces") && error.contains("alpha") && error.contains("beta"),
+            error.contains("several saved workspaces") && error.contains("alpha") && error.contains("beta"),
             "{error}"
         );
         assert!(error.contains("open a workspace by its name"), "{error}");

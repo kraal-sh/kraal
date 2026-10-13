@@ -238,7 +238,7 @@ impl Server {
                 }
                 (KeyCode::Char('x'), true) if p.kind == PickerKind::Workspace => {
                     if let Some(PickAction::SwitchWorkspace(ws)) = p.current().map(|i| i.action.clone()) {
-                        return self.ask_close_workspace(ws);
+                        return self.ask_close_workspace(id, ws);
                     }
                 }
                 // A question that may come while the user types elsewhere: typing does not answer it.
@@ -280,7 +280,8 @@ impl Server {
     pub(in crate::server) fn pick(&mut self, id: ClientId, p: &Picker, item: PickItem) -> Mode {
         match item.action {
             PickAction::Command(command) => return self.command(id, command),
-            PickAction::SwitchWorkspace(ws) => self.show_workspace(id, ws),
+            PickAction::SwitchWorkspace(ws) | PickAction::ReopenWorkspace(ws) => self.show_workspace(id, ws),
+            PickAction::RetryWorkspaceClose(ws) => return self.ask_close_workspace(id, ws),
             PickAction::OpenDefinition(path) => match self.open_definition(&path) {
                 Ok(ws) => self.show_workspace(id, ws),
                 Err(e) => self.toast(id, format!("{e:#}")),
@@ -360,7 +361,25 @@ impl Server {
         Mode::Normal
     }
 
-    pub(super) fn workspace_picker(&self, current: u32) -> Picker {
+    pub(in crate::server) fn refresh_workspace_pickers(&mut self) {
+        let clients: Vec<_> = self
+            .clients
+            .iter()
+            .filter_map(|(&id, c)| {
+                let Mode::Picker(p) = &c.mode else { return None };
+                (p.kind == PickerKind::Workspace).then(|| (id, c.workspace, p.query.clone(), p.selected))
+            })
+            .collect();
+        for (id, ws, query, selected) in clients {
+            let mut picker = self.workspace_picker(ws);
+            picker.query = query;
+            picker.selected = selected;
+            picker.refilter();
+            self.clients.get_mut(&id).unwrap().mode = Mode::Picker(picker);
+        }
+    }
+
+    pub(in crate::server) fn workspace_picker(&self, current: u32) -> Picker {
         let mut items = Vec::new();
         for ws in &self.workspaces {
             let panes = ws.panes();
@@ -373,8 +392,8 @@ impl Server {
                     _ => {}
                 }
             }
-            let mut detail =
-                format!("{} tab{} · {} pane{}", ws.tabs.len(), plural(ws.tabs.len()), panes.len(), plural(panes.len()));
+            let (tabs, count) = ws.counts();
+            let mut detail = format!("{} · {tabs} tab{} · {count} pane{}", ws.status(), plural(tabs), plural(count));
             if blocked + working + done > 0 {
                 detail.push_str(&format!(" · ▲{blocked} ●{working} ✓{done}"));
             }
@@ -393,7 +412,13 @@ impl Server {
             items.push(PickItem {
                 label: ws.name.clone(),
                 detail,
-                action: PickAction::SwitchWorkspace(ws.id),
+                action: if ws.close_error.is_some() {
+                    PickAction::RetryWorkspaceClose(ws.id)
+                } else if ws.closed() {
+                    PickAction::ReopenWorkspace(ws.id)
+                } else {
+                    PickAction::SwitchWorkspace(ws.id)
+                },
                 state,
                 dim: false,
             });
@@ -441,7 +466,16 @@ impl Server {
             state: None,
             dim: false,
         });
-        Picker::new(PickerKind::Workspace, "Workspaces · type a new name to create one", items)
+        let selected = items
+            .iter()
+            .position(|item| {
+                matches!(item.action,
+            PickAction::SwitchWorkspace(id) | PickAction::ReopenWorkspace(id) | PickAction::RetryWorkspaceClose(id) if id == current)
+            })
+            .unwrap_or(0);
+        let mut picker = Picker::new(PickerKind::Workspace, "Workspaces · type a new name to create one", items);
+        picker.selected = selected;
+        picker
     }
 
     /// Every command, to find by what it does and run; each shows its keys.
@@ -606,7 +640,7 @@ mod tests {
             let Mode::Prompt(p) = server.on_picker(client, p, event) else { panic!("keep input") };
             assert_eq!((p.value.as_str(), p.cursor), (" café 日 ", 3));
             assert!(matches!(p.action, PromptAction::NewWorkspace));
-            let reason = if stale { "already open" } else { "No workspace was added." };
+            let reason = if stale { "already exists" } else { "No workspace was added." };
             assert!(p.error.as_ref().unwrap().contains(reason));
             assert_eq!(server.workspaces.len(), 1);
             assert_eq!(server.clients[&client].workspace, current);
@@ -667,14 +701,27 @@ mod tests {
         let (tx, _rx) = crate::server::queue::channel(32);
         let mut server = crate::server::tests::server(tx);
         assert_eq!(server.new_workspace("open".into(), None), 1);
+        let _batch = crate::pane::batch();
+        server
+            .spawn_pane_in(
+                1,
+                None,
+                crate::pane::PaneSpec { command: vec!["sleep".into(), "60".into()], ..Default::default() },
+                crate::protocol::Placement::Tab,
+                None,
+            )
+            .unwrap();
         let key = |code, mods| InputEvent::Key(Key { code, mods, raw: Vec::new() });
         for action in [
             PickAction::SwitchWorkspace(1),
+            PickAction::SwitchWorkspace(u32::MAX),
+            PickAction::ReopenWorkspace(1),
             PickAction::OpenDefinition("closed.kdl".into()),
             PickAction::NewWorkspace,
             PickAction::None,
         ] {
             let open = matches!(action, PickAction::SwitchWorkspace(_));
+            let stale = matches!(action, PickAction::SwitchWorkspace(u32::MAX));
             let mut p = Picker::new(
                 PickerKind::Workspace,
                 "Workspaces",
@@ -688,7 +735,9 @@ mod tests {
             p.actions = None;
             p.selected = 0;
             let next = server.on_picker(0, p, key(KeyCode::Char('x'), Mods::CTRL));
-            if open {
+            if stale {
+                assert!(matches!(next, Mode::Normal), "a stale workspace cannot be closed");
+            } else if open {
                 assert!(matches!(next, Mode::Confirm(q) if matches!(q.action, ConfirmAction::CloseWorkspace(1))));
             } else {
                 assert!(matches!(next, Mode::Picker(p) if p.query == "new" && p.selected == 0));

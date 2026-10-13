@@ -238,7 +238,6 @@ impl Server {
         let ws = self.edit_workspace(client, &target);
         let label = Some(format!("sudo · {}", target.server));
         if let Err(e) = self.spawn_pane_in(ws, target.near, spec, Placement::Floating, label) {
-            self.drop_empty_workspaces();
             self.background(move || drop((session, std::fs::remove_dir_all(&dir))), |_, ()| {});
             return self.edit_failed(client, reply, format!("cannot edit {}: {e:#}", target.server));
         }
@@ -315,13 +314,8 @@ impl Server {
     /// The workspace an edit's panes open in: the target's, else the client's, else the first.
     fn edit_workspace(&mut self, client: Option<ClientId>, target: &EditTarget) -> u32 {
         // The workspace may have closed while the file was read.
-        let open = |ws: &u32| self.ws_index(*ws).is_some();
-        target
-            .ws
-            .filter(open)
-            .or_else(|| client.and_then(|c| self.clients.get(&c)).map(|c| c.workspace).filter(open))
-            .or_else(|| self.workspaces.first().map(|w| w.id))
-            .unwrap_or_else(|| self.new_workspace("main".into(), None))
+        let preferred = target.ws.or_else(|| client.and_then(|c| self.clients.get(&c)).map(|c| c.workspace));
+        self.available_workspace(preferred).unwrap_or_else(|| self.new_workspace("main".into(), None))
     }
 
     /// The editor on the private copy of the file, in a floating pane.
@@ -343,7 +337,6 @@ impl Server {
         let pane = match self.spawn_pane_in(ws, target.near, spec, Placement::Floating, Some(label)) {
             Ok(p) => p,
             Err(e) => {
-                self.drop_empty_workspaces();
                 self.background(move || drop((channel, std::fs::remove_dir_all(&dir))), |_, ()| {});
                 return Err(e);
             }

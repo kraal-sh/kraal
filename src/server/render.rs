@@ -432,7 +432,8 @@ impl Server {
         // A client shorter than the one the layout is for sees no folded row below its screen.
         let folds: Vec<(PaneId, Rect)> = self
             .ws_index(c.workspace)
-            .map_or_else(Vec::new, |wi| self.stack_rows(self.workspaces[wi].tab(), self.client_area(id)))
+            .and_then(|wi| self.workspaces[wi].tab())
+            .map_or_else(Vec::new, |tab| self.stack_rows(tab, self.client_area(id)))
             .into_iter()
             .filter(|(_, row)| row.y < screen.bottom())
             .collect();
@@ -536,6 +537,29 @@ impl Server {
         }
         if bottom_changed {
             chrome.bottom.draw(bottom_row.y, buf);
+        }
+        if let Some((button, label)) = self.empty_workspace_button(id) {
+            let wi = self.ws_index(self.clients[&id].workspace).unwrap();
+            let message = if self.workspaces[wi].kept.is_some() { self.workspaces[wi].status() } else { "No panes." };
+            if button.y >= self.main_area(&self.clients[&id]).y + 2 {
+                buf.set_stringn(
+                    button.x,
+                    button.y - 2,
+                    message,
+                    usize::from(button.width),
+                    Style::default().fg(th().dim),
+                );
+            }
+            buf.set_stringn(button.x, button.y, label, usize::from(button.width), Style::default().fg(th().accent));
+            if button.y + 2 < screen.bottom() {
+                buf.set_stringn(
+                    button.x,
+                    button.y + 2,
+                    "Enter to continue",
+                    usize::from(button.width),
+                    Style::default().fg(th().dim),
+                );
+            }
         }
         let mut links = crate::ansi::Links::new();
         let mut cursor = self.draw_panes(
@@ -698,7 +722,7 @@ impl Server {
         if self.pane_facts(printed)?.0 != facts {
             return None;
         }
-        let focus = self.ws_index(c.workspace).and_then(|wi| self.workspaces[wi].tab().focus);
+        let focus = self.ws_index(c.workspace).and_then(|wi| self.workspaces[wi].tab().and_then(|t| t.focus));
         let mut links = c.encoder.links().clone();
         let mut changed = Changed::new(full);
         // A pane that is not on the screen (another tab, folded in a stack) changes nothing there.
@@ -747,8 +771,10 @@ impl Server {
     /// Where a pane's content is drawn for a client.
     pub(super) fn pane_inner_rect(&self, id: ClientId, pane: PaneId) -> Option<Rect> {
         let wi = self.ws_index(self.clients.get(&id)?.workspace)?;
-        let (_, frame, _) =
-            self.tab_rects(self.workspaces[wi].tab(), self.client_area(id)).into_iter().find(|(p, _, _)| *p == pane)?;
+        let (_, frame, _) = self
+            .tab_rects(self.workspaces[wi].tab()?, self.client_area(id))
+            .into_iter()
+            .find(|(p, _, _)| *p == pane)?;
         Some(self.inner(frame))
     }
 
@@ -757,7 +783,7 @@ impl Server {
     fn draw_hints(&self, id: ClientId, pane: PaneId, hints: &[crate::hints::Hint], typed: &str, buf: &mut Buffer) {
         let c = &self.clients[&id];
         let Some(wi) = self.ws_index(c.workspace) else { return };
-        let tab = self.workspaces[wi].tab();
+        let Some(tab) = self.workspaces[wi].tab() else { return };
         let Some((_, frame, _)) = self.tab_rects(tab, self.client_area(id)).into_iter().find(|(p, _, _)| *p == pane)
         else {
             return;
@@ -809,7 +835,7 @@ impl Server {
         let mut x = if sw > 0 { sw + 1 } else { 0 };
         if sw == 0 {
             // A broadcast in progress always shows, if need be with a shorter workspace name.
-            let broadcasting = ws.sync != super::SyncScope::Off && ws.tab().focus.is_some();
+            let broadcasting = ws.sync != super::SyncScope::Off && ws.tab().and_then(|t| t.focus).is_some();
             let name_room = if broadcasting { (cols as usize / 4).clamp(1, 20) } else { 20 };
             let name = format!(" {} ", crate::text::truncate(&ws.name, name_room));
             let w = name.width() as u16;
@@ -902,7 +928,7 @@ impl Server {
         if ws.sync == super::SyncScope::Off {
             return None;
         }
-        let targets = ws.sync_targets(ws.tab().focus?);
+        let targets = ws.sync_targets(ws.tab()?.focus?);
         let n = targets.len();
         let prod = targets.iter().filter(|p| self.pane_facts(**p).is_some_and(|(_, f)| f.production.is_some())).count();
         let prod_text = if prod > 0 { format!(", {prod} PROD") } else { String::new() };
@@ -1085,7 +1111,7 @@ impl Server {
     /// What the focused pane works on, when it has no frame to show it (pane frames off).
     fn focused_details(&self, c: &Client) -> Vec<Span<'static>> {
         let Some(wi) = self.ws_index(c.workspace) else { return Vec::new() };
-        let tab = self.workspaces[wi].tab();
+        let Some(tab) = self.workspaces[wi].tab() else { return Vec::new() };
         let Some(f) = tab.focus else { return Vec::new() };
         let Some((_, frame, floating)) =
             self.tab_rects(tab, self.client_area(c.id)).into_iter().find(|(p, ..)| *p == f)
@@ -1208,7 +1234,8 @@ impl Server {
                 Some(s) => (t.icon(s), t.state_color(s)),
                 None => (t.icon(AgentState::Working), t.dim),
             };
-            let detail = format!("{}{sep}{}", plural(ws.tabs.len(), "tab"), plural(panes.len(), "pane"));
+            let (tabs, panes) = ws.counts();
+            let detail = format!("{}{sep}{}{sep}{}", ws.status(), plural(tabs, "tab"), plural(panes, "pane"));
             entry(
                 &mut rows,
                 SideItem::Workspace(ws.id),
@@ -1391,6 +1418,24 @@ impl Server {
         }
     }
 
+    pub(super) fn empty_workspace_button(&self, id: ClientId) -> Option<(Rect, &'static str)> {
+        let c = self.clients.get(&id)?;
+        let ws = &self.workspaces[self.ws_index(c.workspace)?];
+        if !ws.tabs.is_empty() {
+            return None;
+        }
+        let area = self.main_area(c);
+        let width = area.width.min(40);
+        let label = if ws.close_error.is_some() {
+            "Retry Close"
+        } else if ws.closed() {
+            "Open workspace"
+        } else {
+            "+ Add pane"
+        };
+        Some((Rect::new(area.x + (area.width - width) / 2, area.y + area.height / 2, width, 1), label))
+    }
+
     // ---- panes ------------------------------------------------------------------------
 
     /// The panes client `id` sees, in drawing order, and for those drawn from their screen rows,
@@ -1405,7 +1450,8 @@ impl Server {
         mut memo: Option<&mut FrameMemo>,
     ) -> Vec<Placed> {
         let Some(wi) = self.clients.get(&id).and_then(|c| self.ws_index(c.workspace)) else { return Vec::new() };
-        let rects = self.tab_rects(self.workspaces[wi].tab(), self.client_area(id));
+        let Some(tab) = self.workspaces[wi].tab() else { return Vec::new() };
+        let rects = self.tab_rects(tab, self.client_area(id));
         let mut placed: Vec<Placed> = rects
             .into_iter()
             .map(|(pane, frame, floating)| {
@@ -1472,7 +1518,7 @@ impl Server {
         let c = &self.clients[&id];
         let wi = self.ws_index(c.workspace)?;
         let images = self.can_show_images(id);
-        let tab = self.workspaces[wi].tab();
+        let tab = self.workspaces[wi].tab()?;
         let focus = tab.focus;
         let show_floating = tab.show_floating;
         let floating_focus = focus.is_some_and(|f| tab.is_floating(f));
@@ -1618,7 +1664,7 @@ impl Server {
             return (placed.iter().map(|_| None).collect(), folds.iter().map(|_| None).collect());
         };
         let ws = &self.workspaces[wi];
-        let tab = ws.tab();
+        let Some(tab) = ws.tab() else { return (Vec::new(), Vec::new()) };
         let focus = tab.focus;
         let synced: Vec<PaneId> = match (ws.sync, focus) {
             (super::SyncScope::Off, _) | (_, None) => Vec::new(),

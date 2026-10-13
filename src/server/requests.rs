@@ -18,11 +18,17 @@ impl Server {
     /// the directory a new pane or agent opens in. A subscription is answered by its stream of
     /// events.
     pub(super) fn request(&mut self, client: ClientId, req: Request) -> Reply {
-        let reply = self.answer(client, req);
-        // A request that created a workspace for a pane that then failed to start leaves it
-        // empty.
-        self.drop_empty_workspaces();
-        reply
+        self.with_workspace_cleanup(|server| server.answer(client, req).transpose()).transpose()
+    }
+
+    /// Failed requests discard only the empty workspaces they just created.
+    fn with_workspace_cleanup<T>(&mut self, f: impl FnOnce(&mut Self) -> Result<T, String>) -> Result<T, String> {
+        let before: Vec<_> = self.workspaces.iter().map(|w| w.id).collect();
+        let result = f(self);
+        if result.is_err() {
+            self.workspaces.retain(|w| before.contains(&w.id) || !w.tabs.is_empty() || w.kept.is_some());
+        }
+        result
     }
 
     fn answer(&mut self, client: ClientId, req: Request) -> Reply {
@@ -89,10 +95,9 @@ impl Server {
                         },
                         move |server, (dir, info)| {
                             server.git_result(dir, info.map(Box::new));
-                            let result = server.new_pane(req);
+                            let result = server.with_workspace_cleanup(|server| server.new_pane(req));
                             server.send_msg(client, &ServerMsg::Response { result });
                             server.clients.remove(&client);
-                            server.drop_empty_workspaces();
                         },
                     );
                     return None;
@@ -237,11 +242,7 @@ impl Server {
                         Ok(wi) => wi,
                         Err(e) => return Some(Err(format!("{e:#}"))),
                     },
-                    None => self
-                        .primary
-                        .and_then(|p| self.clients.get(&p))
-                        .and_then(|c| self.ws_index(c.workspace))
-                        .or(Some(0)),
+                    None => self.available_workspace(None).and_then(|ws| self.ws_index(ws)),
                 };
                 match wi.filter(|i| *i < self.workspaces.len()) {
                     None => Err("no such workspace".into()),
@@ -265,13 +266,7 @@ impl Server {
                 };
                 let ws = match near.and_then(|n| self.workspace_of(n)) {
                     Some((wi, _)) => self.workspaces[wi].id,
-                    None => match self.primary.and_then(|p| self.clients.get(&p)).map(|c| c.workspace) {
-                        Some(ws) => ws,
-                        None => match self.workspaces.first() {
-                            Some(w) => w.id,
-                            None => self.new_workspace("main".into(), None),
-                        },
-                    },
+                    None => self.available_workspace(None).unwrap_or_else(|| self.new_workspace("main".into(), None)),
                 };
                 self.open_ssh_running(ws, near, &server, placement, &command)
                     .map(|p| Response::Pane(Box::new(self.pane_info(p))))
@@ -311,10 +306,11 @@ impl Server {
                             if info.is_some() {
                                 server.git_result(dir, info.map(Box::new));
                             }
-                            let result = server.open_agent(near, &agent, account.as_deref(), placement, cwd, &args);
+                            let result = server.with_workspace_cleanup(|server| {
+                                server.open_agent(near, &agent, account.as_deref(), placement, cwd, &args)
+                            });
                             server.send_msg(client, &ServerMsg::Response { result });
                             server.clients.remove(&client);
-                            server.drop_empty_workspaces();
                         },
                     );
                     return None;
@@ -328,13 +324,7 @@ impl Server {
                 };
                 let ws = match near.and_then(|n| self.workspace_of(n)) {
                     Some((wi, _)) => self.workspaces[wi].id,
-                    None => match self.primary.and_then(|p| self.clients.get(&p)).map(|c| c.workspace) {
-                        Some(ws) => ws,
-                        None => match self.workspaces.first() {
-                            Some(w) => w.id,
-                            None => self.new_workspace("main".into(), None),
-                        },
-                    },
+                    None => self.available_workspace(None).unwrap_or_else(|| self.new_workspace("main".into(), None)),
                 };
                 self.open_files(ws, left, right)
                     .map(|p| Response::Pane(Box::new(self.pane_info(p))))
@@ -361,15 +351,10 @@ impl Server {
                         server.name
                     )));
                 }
-                // A workspace made now would be dropped as empty before the file is read: one is
-                // made, if needed, when the editor opens.
+                // Create a workspace, if needed, once the file is ready for its editor.
                 let ws = match near.and_then(|n| self.workspace_of(n)) {
                     Some((wi, _)) => Some(self.workspaces[wi].id),
-                    None => self
-                        .primary
-                        .and_then(|p| self.clients.get(&p))
-                        .map(|c| c.workspace)
-                        .or_else(|| self.workspaces.first().map(|w| w.id)),
+                    None => self.available_workspace(None),
                 };
                 // Told about saves and asked about changes: a client showing that workspace.
                 let shows = |c: &&super::Client| c.attached && Some(c.workspace) == ws;
@@ -425,12 +410,7 @@ impl Server {
         let target = target.as_deref().map(|t| self.resolve(t)).transpose()?;
         let ws = match target.and_then(|t| self.workspace_of(t)) {
             Some((wi, _)) => self.workspaces[wi].id,
-            None => match self
-                .primary
-                .and_then(|p| self.clients.get(&p))
-                .map(|c| c.workspace)
-                .or_else(|| self.workspaces.first().map(|w| w.id))
-            {
+            None => match self.available_workspace(None) {
                 Some(ws) => ws,
                 None => self.new_workspace("main".into(), None),
             },
@@ -474,14 +454,12 @@ impl Server {
         }
     }
 
-    /// Resolve a pane reference: an id, a pane name, or `workspace:name`.
     /// The workspace an agent opened from the CLI goes to: that of the pane it starts next to,
-    /// else the one the last active client shows, else the first.
+    /// else an open workspace, preferring the one the last active client shows.
     fn agent_workspace(&self, near: Option<PaneId>) -> Option<u32> {
         near.and_then(|n| self.workspace_of(n))
             .map(|(wi, _)| self.workspaces[wi].id)
-            .or_else(|| self.primary.and_then(|p| self.clients.get(&p)).map(|c| c.workspace))
-            .or_else(|| self.workspaces.first().map(|w| w.id))
+            .or_else(|| self.available_workspace(None))
     }
 
     fn open_agent(
@@ -504,6 +482,9 @@ impl Server {
 
     /// Input from the CLI reaches a production pane only when the caller says it means to.
     fn allow_input(&self, pane: PaneId, production: bool) -> Result<(), String> {
+        if self.workspace_of(pane).is_some_and(|(wi, _)| self.workspaces[wi].kept.is_some()) {
+            return Err("The workspace has not finished closing. Retry Close to continue.".into());
+        }
         match self.pane_production(pane) {
             Some(why) if !production => {
                 Err(format!("{} is production ({why}); add --production to send to it", self.pane_label(pane)))
@@ -545,10 +526,10 @@ impl Server {
             out.push(WorkspaceInfo {
                 id: Some(ws.stable_id.clone()),
                 name: ws.name.clone(),
-                open: true,
+                open: !ws.closed(),
                 definition: ws.definition.clone(),
-                tabs: ws.tabs.len(),
-                panes: panes.len(),
+                tabs: ws.counts().0,
+                panes: ws.counts().1,
                 working: count(AgentState::Working),
                 blocked: count(AgentState::Blocked),
                 done: count(AgentState::Done),
@@ -616,5 +597,68 @@ impl Server {
                 None => i += 1,
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn missing_account() -> Request {
+        Request::OpenAgent {
+            agent: "claude".into(),
+            account: Some("missing".into()),
+            account_id: None,
+            placement: protocol::Placement::Tab,
+            near: None,
+            cwd: None,
+            args: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn failed_requests_remove_only_the_empty_workspaces_they_created() {
+        let (tx, _rx) = crate::server::event_channel(4096);
+        let mut server = super::super::tests::server(tx);
+        assert!(server.request(0, missing_account()).unwrap().is_err());
+        assert!(server.workspaces.is_empty());
+        let existing = server.new_workspace("empty".into(), None);
+        assert!(server.request(0, missing_account()).unwrap().is_err());
+        assert_eq!(server.workspaces.len(), 1);
+        assert_eq!(server.workspaces[0].id, existing);
+        assert!(server.workspaces[0].tabs.is_empty());
+        assert!(server.workspaces[0].kept.is_none());
+        assert_eq!(crate::persist::snapshot(&server).workspaces.len(), 1);
+    }
+
+    #[test]
+    fn implicit_requests_use_an_open_workspace_without_an_attached_client() {
+        let (tx, _rx) = crate::server::event_channel(4096);
+        let mut server = super::super::tests::server(tx);
+        let closed = server.new_workspace("a".into(), None);
+        crate::server::persistence::tests::writer(&mut server, vec![]);
+        server.keep_and_close_workspace(closed).unwrap();
+        let open = server.new_workspace("b".into(), None);
+        assert!(server.primary.is_none());
+        assert_eq!(server.agent_workspace(None), Some(open));
+        let request = Request::NewPane {
+            target: None,
+            command: vec!["sleep".into(), "60".into()],
+            cwd: None,
+            name: Some("new".into()),
+            placement: protocol::Placement::Tab,
+            preview: None,
+            focus: false,
+            close_on_exit: false,
+        };
+        let Response::Pane(pane) = server.request(0, request).unwrap().unwrap() else { panic!("new pane") };
+        assert_eq!(pane.workspace, "b");
+        let request = Request::OpenFiles { left: "/missing".into(), right: "/missing".into(), near: None };
+        let Response::Pane(files) = server.request(0, request).unwrap().unwrap() else { panic!("files pane") };
+        assert_eq!(files.workspace, "b");
+        assert!(server.workspaces[0].closed());
+        assert!(server.workspaces[0].panes().is_empty());
+        server.close_pane(pane.id);
+        server.close_pane(files.id);
     }
 }
