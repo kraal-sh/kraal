@@ -644,6 +644,8 @@ pub const HELD_STATUS: i32 = 75;
 /// Run a session server in the foreground until it is told to exit.
 pub fn run(session: &str) -> Result<()> {
     let ready = take_ready_pipe();
+    // Kept from `kraal forget` until this server has the session, when a restart started it.
+    let restarting = paths::Restarting::inherited(session);
     // What this process inherited stays out of the panes' programs.
     crate::pane::close_inherited();
     crate::pane::reserve_descriptors();
@@ -651,10 +653,15 @@ pub fn run(session: &str) -> Result<()> {
     paths::private_runtime_dir().context("checking the runtime directory")?;
     // Held until this server is gone, and what writes for it with it ([`spawn_persister`]): the
     // socket, and the session's files, are its alone.
+    #[cfg(debug_assertions)]
+    held_back_for_tests();
     let Some(held) = paths::SessionLock::acquire(session).context("locking the session")? else {
         return Err(Held(format!("another kraal holds session {session:?}: its server, or kraal forget")).into());
     };
     let held = Arc::new(held);
+    if let Some(restarting) = restarting {
+        restarting.end();
+    }
     // A server kraal 0.2.0 started holds no lock.
     let Some(listener) = paths::listen_alone(&socket).with_context(|| format!("binding {}", socket.display()))? else {
         return Err(Held(format!("session {session:?} is already running")).into());
@@ -869,6 +876,17 @@ pub fn run(session: &str) -> Result<()> {
         std::thread::sleep(Duration::from_millis(5));
     }
     result
+}
+
+/// Tests (debug builds only) hold a server back before it takes its session, for as long as the
+/// file `KRAAL_TEST_HOLD_SERVER` names is there: the moment in which a restart has left the
+/// session to the server it started.
+#[cfg(debug_assertions)]
+fn held_back_for_tests() {
+    let Some(marker) = std::env::var_os("KRAAL_TEST_HOLD_SERVER").map(std::path::PathBuf::from) else { return };
+    while marker.exists() {
+        std::thread::sleep(Duration::from_millis(10));
+    }
 }
 
 /// The pipe the client that started this server waits on (see `client::ensure_server`), taken

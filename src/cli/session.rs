@@ -54,6 +54,9 @@ pub(super) fn kill(s: &Session) -> Result<()> {
 /// `kraal forget`: delete what a stopped session saved.
 pub(super) fn forget(s: &Session) -> Result<()> {
     let session = &s.name;
+    // Not while it is restarted: it has no server for a moment then, and the next one is about
+    // to restore what would be deleted here.
+    let _not_restarting = client::keep_from_restart(session)?;
     // Held while the files go, so that no server starts on them meanwhile.
     let Some(_held) = paths::SessionLock::acquire(session).context("locking the session")? else {
         let who = client::who_holds(session).map(|who| format!(" ({who})")).unwrap_or_default();
