@@ -4,7 +4,7 @@ use std::time::Instant;
 
 use ratatui::layout::Rect;
 
-use super::{Client, ClientId, Dirty, Server, Tab};
+use super::{Client, ClientId, Server, Tab};
 use crate::layout::{Node, PaneId};
 /// A layout worked out: the tiles of the tree `root` in `area`, with frames or not.
 pub(super) struct Tiling {
@@ -206,7 +206,7 @@ impl Server {
             }
         }
         for c in self.clients.values_mut() {
-            c.dirty = Dirty::Yes;
+            c.dirty = true;
         }
         self.schedule_render();
     }

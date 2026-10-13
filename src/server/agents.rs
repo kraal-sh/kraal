@@ -267,23 +267,6 @@ impl Server {
 
     pub(super) fn reload_usage(&mut self) {
         self.usage = UsageMap::load(&self.accounts);
-        self.await_usage_reset();
-    }
-
-    /// Wake when the usage window that resets next does: what the clients show of the accounts
-    /// changes then, with nothing else happening. Called when the usage changed and when that
-    /// moment comes; a reset awaited that has come makes every client's frame due, whichever
-    /// call sees it first (the clock may have been set, or the machine asleep meanwhile).
-    pub(super) fn await_usage_reset(&mut self) {
-        let now = accounts::now();
-        if self.usage_reset.is_some_and(|(at, _)| at <= now) {
-            self.mark_dirty();
-        }
-        // Whole seconds from a clock that counts them: the wake is not before the reset. A reset
-        // said to come later than the clock can tell (a usage file may say anything) is not
-        // waited for.
-        let wake = |at: i64| Instant::now().checked_add(Duration::from_secs(u64::try_from(at - now).unwrap_or(0)));
-        self.usage_reset = self.usage.next_end(now).and_then(|at| Some((at, wake(at)?)));
     }
 
     /// The account of an agent pane kraal launched.
@@ -789,7 +772,6 @@ impl Server {
                 u.observe_screen(weekly, pct, now);
                 let _ = accounts::save_usage(&a, &u);
                 self.usage.0.insert(a.key(), u);
-                self.await_usage_reset();
             }
             if self.switches.contains_key(&id) {
                 continue;

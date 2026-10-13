@@ -12,7 +12,7 @@ use std::time::Instant;
 
 use super::contexts::Production;
 use super::ui::{ConfirmAction, InputItem, Mode, PendingInput, Prompt, PromptAction};
-use super::{ClientId, Dirty, Server};
+use super::{ClientId, Server};
 use crate::input::{InputEvent, Key, KeyCode, MouseEvent, MouseKind, encode_key, encode_paste_after};
 use crate::keymap::{Action, Command, Lookup};
 use crate::layout::{Dir, PaneId};
@@ -190,9 +190,7 @@ impl Server {
         let shown = !(quiet && matches!(next, Mode::Normal));
         if let Some(c) = self.clients.get_mut(&id) {
             c.mode = next;
-            if shown {
-                c.dirty = Dirty::Yes;
-            }
+            c.dirty |= shown;
         }
         if shown {
             self.mark_dirty_client(id);
@@ -682,7 +680,7 @@ impl Server {
                 // A question about it: what came after waits for the answer.
                 if let Some(c) = self.clients.get_mut(&id) {
                     c.mode = next;
-                    c.dirty = Dirty::Yes;
+                    c.dirty = true;
                 }
                 self.mark_dirty_client(id);
                 return;

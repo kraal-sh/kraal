@@ -1639,24 +1639,13 @@ impl Usage {
         self.five_hour.iter().chain(self.weekly.iter())
     }
 
-    /// Each window with the time it counts until: its reset or, when it does not say when it
-    /// resets, the end of its period after it was seen.
-    fn ends(&self) -> impl Iterator<Item = (&Window, i64)> {
-        let end = |w: &Window, period: i64| w.resets_at.unwrap_or(self.observed_at.saturating_add(period));
-        let five = self.five_hour.iter().map(move |w| (w, end(w, 5 * 3600)));
-        let week = self.weekly.iter().map(move |w| (w, end(w, 7 * 24 * 3600)));
-        five.chain(week)
-    }
-
-    /// Highest usage among windows that have not reset yet.
+    /// Highest usage among windows that have not reset yet. A window that does not say when it
+    /// resets counts until the end of its period after it was seen.
     pub fn peak(&self, now: i64) -> f64 {
-        self.ends().filter(|(_, end)| *end > now).map(|(w, _)| w.used_percent).fold(0.0, f64::max)
-    }
-
-    /// When [`Usage::peak`] changes next with nothing new seen: the earliest reset of a window
-    /// that counts at `now`.
-    pub fn next_end(&self, now: i64) -> Option<i64> {
-        self.ends().map(|(_, end)| end).filter(|end| *end > now).min()
+        let live = |w: &Window, period: i64| w.resets_at.unwrap_or(self.observed_at.saturating_add(period)) > now;
+        let five = self.five_hour.iter().filter(|w| live(w, 5 * 3600));
+        let week = self.weekly.iter().filter(|w| live(w, 7 * 24 * 3600));
+        five.chain(week).map(|w| w.used_percent).fold(0.0, f64::max)
     }
 
     /// A limit message seen on the agent's screen, saying `pct` percent of a window (weekly or
@@ -1779,12 +1768,6 @@ impl UsageMap {
 
     pub fn peak(&self, a: &Account, now: i64) -> Option<f64> {
         self.get(a).filter(|u| u.windows().next().is_some()).map(|u| u.peak(now))
-    }
-
-    /// When the usage of an account changes next with nothing new seen: a window resets (see
-    /// [`Usage::next_end`]). What shows the accounts' usage at `now` holds until then.
-    pub fn next_end(&self, now: i64) -> Option<i64> {
-        self.0.values().filter_map(|u| u.next_end(now)).min()
     }
 }
 
@@ -2779,39 +2762,6 @@ mod tests {
         };
         assert_eq!(u.peak(1_000 + 3600), 100.0);
         assert_eq!(u.peak(1_000 + 5 * 3600 + 1), 0.0, "five hours later it has reset");
-    }
-
-    /// What is worked out of the usage at one moment holds until the reset said to come next,
-    /// and no longer: frames that keep it until then show what a frame made afresh would.
-    #[test]
-    fn usage_holds_until_the_next_reset() {
-        let week = 7 * 24 * 3600;
-        let claude = Usage {
-            five_hour: Some(Window { used_percent: 93.0, resets_at: Some(1_100) }),
-            // It does not say when it resets: a week after it was seen.
-            weekly: Some(Window { used_percent: 41.0, resets_at: None }),
-            observed_at: 1_000,
-            ..Default::default()
-        };
-        let codex = Usage {
-            five_hour: Some(Window { used_percent: 58.0, resets_at: Some(1_250) }),
-            observed_at: 1_000,
-            ..Default::default()
-        };
-        let all = UsageMap(HashMap::from([("claude:default".into(), claude.clone()), ("codex:default".into(), codex)]));
-        let peaks = |now| -> Vec<f64> { ["claude:default", "codex:default"].map(|k| all.0[k].peak(now)).to_vec() };
-        let resets = [1_100, 1_250, 1_000 + week];
-        let mut from = 1_000;
-        for reset in resets {
-            assert_eq!(all.next_end(from), Some(reset));
-            for now in [from, (from + reset) / 2, reset - 1] {
-                assert_eq!((peaks(now), all.next_end(now)), (peaks(from), Some(reset)), "at {now}");
-            }
-            assert_ne!(peaks(reset), peaks(reset - 1), "at {reset}");
-            from = reset;
-        }
-        assert_eq!((peaks(from), all.next_end(from)), (vec![0.0, 0.0], None));
-        assert_eq!((claude.peak(1_099), claude.peak(1_100), claude.next_end(1_100)), (93.0, 41.0, Some(1_000 + week)));
     }
 
     #[test]

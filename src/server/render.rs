@@ -4,7 +4,6 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::rc::Rc;
-use std::time::Instant;
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
@@ -110,16 +109,6 @@ impl FactsCache {
     pub(super) fn keep(&self, alive: impl Fn(PaneId) -> bool) {
         self.panes.borrow_mut().retain(|id, _| alive(*id));
     }
-
-    /// The panes whose facts were worked out for frame `frame`.
-    fn checked_for(&self, frame: u64) -> Vec<PaneId> {
-        self.panes.borrow().iter().filter(|(_, e)| e.checked == frame).map(|(id, _)| *id).collect()
-    }
-
-    /// The version of the facts last worked out for `pane`.
-    fn version(&self, pane: PaneId) -> Option<u64> {
-        self.panes.borrow().get(&pane).map(|e| e.version)
-    }
 }
 
 /// What a client's last frame was made of: the panes drawn from their screen rows with nothing
@@ -131,29 +120,7 @@ pub struct FrameMemo {
     chrome: Option<Chrome>,
     /// The look of each pane's frame, with what it was made from, in the order drawn.
     looks: Looks,
-    /// What the frame showed around its panes' rows, when the next one can be composed from what
-    /// one pane printed alone (see `Server::compose_output`).
-    rest: Option<Rest>,
 }
-
-/// What a frame showed besides the rows of its panes, each of them alone on its cells and drawn
-/// from its screen rows, without images, while keys go to programs. The next frame shows the same
-/// around the rows of a pane that printed, while what this holds does: the chrome's generation
-/// (everything but output), that pane's facts, the directories read for the panes, and the
-/// accounts' usage windows.
-struct Rest {
-    chrome: u64,
-    /// The facts of the panes of the client's workspace, by version, as its top bar has them.
-    facts: Vec<(PaneId, u64)>,
-    /// Until when no directory a frame read for a pane is read again unless the pane prints.
-    cwd_until: Option<Instant>,
-    /// When the usage its sidebar shows changes by itself (see [`Inputs`]).
-    usage_until: Option<i64>,
-}
-
-/// What a frame is made of for the encoder: the cursor, the links, and the cells the last frame
-/// already had.
-type Composed = (Option<Cursor>, crate::ansi::Links, Vec<Kept>);
 
 /// What a part of the chrome (a bar, the sidebar) is made from, besides the client: the chrome's
 /// generation, and the facts of the panes it shows, by version. The same make the same.
@@ -161,9 +128,6 @@ type Composed = (Option<Cursor>, crate::ansi::Links, Vec<Kept>);
 struct Inputs {
     chrome: u64,
     panes: Vec<(PaneId, u64)>,
-    /// When the accounts' rows change with nothing else happening: a window resets or a
-    /// last-checked age changes (Unix seconds). The sidebar alone shows usage: none for the bars.
-    usage_until: Option<i64>,
 }
 
 /// The looks of the frames of a frame's panes, with what each was made from.
@@ -255,21 +219,6 @@ fn kept_rows(placed: &[Placed]) -> Vec<Kept> {
     kept
 }
 
-/// For each of a pane's screen `rows`, `width` columns wide, the columns to draw again (from,
-/// to) over a frame that has them at the versions `old`: none for a row the frame has, all of
-/// them for a row with images or one it never had.
-fn rows_to_draw(rows: &crate::pane::ScreenCache, old: &[u64], width: u16) -> Vec<Option<(u16, u16)>> {
-    let whole = Some((0, width));
-    let row = |(r, v): (usize, &u64)| match old.get(r) {
-        _ if rows.has_images(r) => whole,
-        Some(was) if was == v => None,
-        // The row changed in a few columns since the frame has it: those.
-        Some(was) => rows.changed_since(r, *was).or(whole),
-        None => whole,
-    };
-    rows.versions().iter().enumerate().map(row).collect()
-}
-
 /// The cells of a screen to draw again, row by row.
 struct Changed {
     area: Rect,
@@ -346,13 +295,6 @@ struct Placed {
 }
 
 impl Server {
-    /// Whether what the chrome shows of pane `id` is no longer what was last worked out of it,
-    /// for the frame being drawn.
-    pub(super) fn facts_changed(&self, id: PaneId) -> bool {
-        let before = self.facts.version(id);
-        self.pane_facts(id).map(|(version, _)| version) != before
-    }
-
     /// What the chrome shows of pane `id`, with its version. Worked out again only when
     /// something it comes from may have changed (see `FactsFrom`), and while a context is read
     /// (one that does not answer soon becomes unknown).
@@ -400,11 +342,10 @@ impl Server {
         Some((version, facts))
     }
 
-    /// Compose what client `id` sees at `now` (Unix seconds: the accounts' usage windows count
-    /// or not by it) into `buf`, which holds its last frame: the rows of panes that did not
-    /// change since are left as they are (and returned, so that the encoder does not compare
-    /// them), everything else is drawn again.
-    pub fn compose(&mut self, id: ClientId, now: i64, buf: &mut Buffer) -> Composed {
+    /// Compose what client `id` sees into `buf`, which holds its last frame: the rows of panes
+    /// that did not change since are left as they are (and returned, so that the encoder does
+    /// not compare them), everything else is drawn again.
+    pub fn compose(&mut self, id: ClientId, buf: &mut Buffer) -> (Option<Cursor>, crate::ansi::Links, Vec<Kept>) {
         let Some(c) = self.clients.get_mut(&id) else { return (None, Default::default(), Vec::new()) };
         let full = Rect::new(0, 0, c.cols.max(1), c.rows.max(1));
         let mut memo = std::mem::take(&mut c.memo);
@@ -448,10 +389,10 @@ impl Server {
             Some(l) => (std::mem::take(&mut l.bar), true),
             None => (self.top_bar(c), false),
         };
-        let sidebar_from = if sw > 0 { self.sidebar_inputs(side.height, now) } else { Inputs::default() };
+        let sidebar_from = if sw > 0 { self.sidebar_inputs(side.height) } else { Inputs::default() };
         let (sidebar, sidebar_same) = match last.as_mut().filter(|l| sw > 0 && l.sidebar_from == sidebar_from) {
             Some(l) => (std::mem::take(&mut l.sidebar), true),
-            None if sw > 0 => (self.sidebar_rows(c, side.height, now), false),
+            None if sw > 0 => (self.sidebar_rows(c, side.height), false),
             None => (Vec::new(), false),
         };
         let bottom_from = if self.bottom_bar { self.bottom_inputs(c) } else { Inputs::default() };
@@ -545,25 +486,6 @@ impl Server {
             (&chrome.frames, &frames_changed),
             (&chrome.folds, &chrome.fold_looks, &folds_changed),
         );
-        // With every pane drawn from its rows alone, without images, and keys going to programs,
-        // the next frame is this one and what a pane printed (see `Server::compose_output`).
-        let rows_alone = |p: &Placed| {
-            let screen = self.panes.get(&p.pane).and_then(|pane| pane.screen_cache());
-            p.versions.is_some() && screen.is_some_and(|rows| !rows.any_images())
-        };
-        let plain = cached && matches!(self.clients[&id].mode, Mode::Normal) && placed.iter().all(rows_alone);
-        memo.rest = plain.then(|| {
-            // The directories this frame's facts come from: the next whole frame reads again
-            // those read too long ago.
-            let read = self.facts.checked_for(crate::pane::frame());
-            let held = read.iter().filter_map(|p| self.panes.get(p)?.cwd_held_until());
-            Rest {
-                chrome: self.chrome_gen,
-                facts: chrome.bar_from.panes.clone(),
-                cwd_until: held.min(),
-                usage_until: chrome.sidebar_from.usage_until,
-            }
-        });
         if !covered {
             memo.panes = placed.into_iter().filter_map(|p| Some((p.pane, p.content, p.versions?))).collect();
         } else {
@@ -661,86 +583,6 @@ impl Server {
             links.clear();
         }
         (cursor, links, kept)
-    }
-
-    /// Compose what client `id` sees at `now` into `buf`, its last frame, from what pane
-    /// `printed` alone printed since: its rows that changed, and the cursor. Only when the last
-    /// frame says the rest still shows the same (see [`Rest`]); None when the frame has to be
-    /// composed whole. Nothing is then worked out for the other panes, the bars or the sidebar:
-    /// the echo of a key costs the same whatever else is on the screen.
-    pub(super) fn compose_output(
-        &mut self,
-        id: ClientId,
-        printed: PaneId,
-        now: i64,
-        buf: &mut Buffer,
-    ) -> Option<Composed> {
-        let c = self.clients.get(&id)?;
-        let rest = c.memo.rest.as_ref()?;
-        let full = Rect::new(0, 0, c.cols.max(1), c.rows.max(1));
-        let holds = rest.chrome == self.chrome_gen
-            && matches!(c.mode, Mode::Normal)
-            && buf.area == full
-            && !c.encoder.redraws_all(full)
-            // A frame reads again the directories read too long ago, and the contexts being
-            // read: both are for a whole frame to do.
-            && rest.cwd_until.is_none_or(|until| Instant::now() < until)
-            && !self.contexts_reading()
-            // A usage window that reset or a last-checked age that changed alters the sidebar.
-            && rest.usage_until.is_none_or(|until| now < until);
-        if !holds {
-            return None;
-        }
-        // The pane's facts are worked out as for any frame (its directory is read again): with
-        // other facts, the chrome changes.
-        let facts = rest.facts.iter().find(|f| f.0 == printed)?.1;
-        if self.pane_facts(printed)?.0 != facts {
-            return None;
-        }
-        let focus = self.ws_index(c.workspace).and_then(|wi| self.workspaces[wi].tab().focus);
-        let mut links = c.encoder.links().clone();
-        let mut changed = Changed::new(full);
-        // A pane that is not on the screen (another tab, folded in a stack) changes nothing there.
-        if let Some(at) = c.memo.panes.iter().position(|p| p.0 == printed) {
-            let content = c.memo.panes[at].1;
-            let rows = self.panes.get_mut(&printed)?.refresh_screen(content.width, content.height)?;
-            let had = &mut self.clients.get_mut(&id)?.memo.panes[at].2;
-            if rows.any_images() || had.len() != rows.versions().len() {
-                return None;
-            }
-            let draw = rows_to_draw(rows, had, content.width);
-            had.copy_from_slice(rows.versions());
-            for (r, (from, to)) in draw.iter().enumerate().filter_map(|(r, columns)| Some((r, (*columns)?))) {
-                changed.row(content.y + r as u16, content.x + from, (content.x + to).min(content.right()));
-            }
-            links.retain(|(x, y), _| !content.contains((*x, *y).into()));
-            let kept = changed.kept();
-            clear_except(buf, &kept);
-            rows.draw(content, buf, |r| draw.get(r).copied().flatten(), &mut links);
-            return Some((self.shown_cursor(id, focus), links, kept));
-        }
-        Some((self.shown_cursor(id, focus), links, changed.kept()))
-    }
-
-    /// The cursor of pane `focus` where client `id`'s last frame has its rows, as a frame of
-    /// panes drawn from their rows alone shows it.
-    fn shown_cursor(&self, id: ClientId, focus: Option<PaneId>) -> Option<Cursor> {
-        let (pane, content, _) = self.clients.get(&id)?.memo.panes.iter().find(|p| Some(p.0) == focus)?;
-        self.panes.get(pane)?.cursor(*content)
-    }
-
-    /// A frame composed from what one pane printed is the frame composed whole, at the same
-    /// `now`: every such frame is checked in debug builds, those of the tests among them.
-    #[cfg(debug_assertions)]
-    pub(super) fn assert_whole(&mut self, id: ClientId, now: i64, buf: &Buffer, (cursor, links, _): &Composed) {
-        let memo = self.clients.get_mut(&id).map(|c| std::mem::take(&mut c.memo));
-        let mut whole = Buffer::empty(buf.area);
-        let (whole_cursor, whole_links, _) = self.compose(id, now, &mut whole);
-        if let (Some(c), Some(memo)) = (self.clients.get_mut(&id), memo) {
-            c.memo = memo;
-        }
-        let same = whole == *buf && whole_cursor == *cursor && whole_links == *links;
-        assert!(same, "client {id}: the frame composed from one pane's output is not the whole frame");
     }
 
     /// Where a pane's content is drawn for a client.
@@ -1138,9 +980,8 @@ impl Server {
 
     /// The sidebar's rows from the top of the screen, `height` rows in all. Each section opens on
     /// a line that carries its name, the first one on the top border; its entries take two rows,
-    /// a name after a state dot and a detail below. Accounts sit at the bottom when there is room,
-    /// with their usage at `now`.
-    fn sidebar_rows(&self, c: &Client, height: u16, now: i64) -> Vec<SideRow> {
+    /// a name after a state dot and a detail below. Accounts sit at the bottom when there is room.
+    fn sidebar_rows(&self, c: &Client, height: u16) -> Vec<SideRow> {
         let t = th();
         let mut rows = vec![SideRow::Section("WORKSPACES")];
         let entry = |rows: &mut Vec<SideRow>,
@@ -1288,7 +1129,7 @@ impl Server {
         }
 
         let room = (height as usize).saturating_sub(rows.len() + 1);
-        let accounts = account_rows(self.accounts_picker_at(None, now).items, room);
+        let accounts = account_rows(self.accounts_picker(None).items, room);
         if !accounts.is_empty() {
             let top = (height as usize).saturating_sub(accounts.len() + 1);
             rows.resize_with(top, || SideRow::Blank);
@@ -1304,7 +1145,7 @@ impl Server {
         if row.saturating_add(1) >= height {
             return None;
         }
-        match self.sidebar_rows(c, height, crate::accounts::now()).into_iter().nth(row as usize)? {
+        match self.sidebar_rows(c, height).into_iter().nth(row as usize)? {
             SideRow::Entry { item, .. } => item,
             SideRow::Section("ACCOUNTS") => Some(SideItem::Accounts),
             _ => None,
@@ -1405,11 +1246,22 @@ impl Server {
                 let i = if m.panes.get(i).is_some_and(at) { i } else { m.panes.iter().position(at)? };
                 Some(std::mem::take(&mut m.panes[i].2))
             });
+            let whole = Some((0, content.width));
             p.rows = Some(match &same {
                 // Nothing new: no row to draw (an empty list).
                 Some(old) if alone && old == versions && !rows.any_images() => Vec::new(),
-                Some(old) if alone => rows_to_draw(rows, old, content.width),
-                _ => vec![Some((0, content.width)); versions.len()],
+                Some(old) if alone => versions
+                    .iter()
+                    .enumerate()
+                    .map(|(r, v)| match old.get(r) {
+                        _ if rows.has_images(r) => whole,
+                        Some(was) if was == v => None,
+                        // The row changed in a few columns since the frame has it: those.
+                        Some(was) => rows.changed_since(r, *was).or(whole),
+                        None => whole,
+                    })
+                    .collect(),
+                _ => vec![whole; versions.len()],
             });
             p.versions = alone.then(|| match same.take() {
                 Some(mut old) if old.len() == versions.len() => {
@@ -1630,24 +1482,24 @@ impl Server {
         {
             panes.push((p.id, p.fed));
         }
-        Inputs { chrome: self.chrome_gen, panes, usage_until: None }
+        Inputs { chrome: self.chrome_gen, panes }
     }
 
     /// What client `c`'s bottom bar is made from: the chrome's generation and the facts of its
     /// focused pane. (A client of another width starts its frames afresh.)
     fn bottom_inputs(&self, c: &Client) -> Inputs {
         let focus = self.client_focus(c.id).and_then(|p| Some((p, self.pane_facts(p)?.0)));
-        Inputs { chrome: self.chrome_gen, panes: focus.into_iter().collect(), usage_until: None }
+        Inputs { chrome: self.chrome_gen, panes: focus.into_iter().collect() }
     }
 
-    /// What a sidebar `height` rows high is made from at `now`: the chrome's generation, the
-    /// facts of all panes, and the accounts' usage windows that count.
-    fn sidebar_inputs(&self, height: u16, now: i64) -> Inputs {
+    /// What a sidebar `height` rows high is made from: the chrome's generation and the facts of
+    /// all panes.
+    fn sidebar_inputs(&self, height: u16) -> Inputs {
         let mut panes: Vec<(PaneId, u64)> =
             self.panes.keys().filter_map(|p| Some((*p, self.pane_facts(*p)?.0))).collect();
         panes.sort_unstable();
         panes.push((0, u64::from(height)));
-        Inputs { chrome: self.chrome_gen, panes, usage_until: self.account_summaries_until(now) }
+        Inputs { chrome: self.chrome_gen, panes }
     }
 
     /// A pane's frame: its name on the top border, what it works on at the right of it. The
@@ -1965,57 +1817,5 @@ mod tests {
         assert_eq!(rows.len(), 2);
         assert!(matches!(rows[0], SideRow::Section("ACCOUNTS")));
         assert!(matches!(rows[1], SideRow::Entry { item: Some(SideItem::AddAccount), .. }));
-    }
-
-    /// The accounts' rows made at one moment are those of any moment before the reset the usage
-    /// says comes next (what a sidebar is kept until), and not those of that reset.
-    #[test]
-    fn the_accounts_rows_hold_until_a_usage_window_resets() {
-        use crate::accounts::{Account, Usage, Window};
-        let (tx, _) = super::super::queue::channel(16);
-        let mut server = super::super::tests::server(tx);
-        let account = server
-            .accounts
-            .add(Account {
-                id: crate::accounts::new_uuid(),
-                agent: "claude".into(),
-                name: "work".into(),
-                home: "/nonexistent/work".into(),
-                threshold: None,
-                note: None,
-                sign_in_required: false,
-                review: false,
-                public_identity: None,
-                linked_to: None,
-            })
-            .unwrap();
-        let five_hour = Some(Window { used_percent: 93.0, resets_at: Some(1_100) });
-        let weekly = Some(Window { used_percent: 41.0, resets_at: Some(1_300) });
-        server.usage.0.insert(account.key(), Usage { five_hour, weekly, observed_at: 1_000, ..Default::default() });
-        let rows = |now| -> Vec<Line<'static>> {
-            account_rows(server.accounts_picker_at(None, now).items, 20)
-                .into_iter()
-                .filter_map(|row| match row {
-                    SideRow::Entry { line, .. } => Some(line),
-                    _ => None,
-                })
-                .collect()
-        };
-        let shown = |now| rows(now)[1].to_string();
-        for (from, until, figure) in [
-            (1_000, Some(1_100), "93% used · 0 panes"),
-            (1_100, Some(1_300), "41% used · 0 panes"),
-            (1_300, None, "Last checked 5m ago"),
-        ] {
-            assert_eq!((shown(from), server.usage.next_end(from)), (figure.to_string(), until));
-            if let Some(until) = until {
-                assert_eq!(rows(until - 1), rows(from));
-                assert_ne!(rows(until), rows(from));
-            }
-        }
-        // After the windows expire, the age of the observation also bounds cached rows.
-        assert_eq!(server.account_summaries_until(1_300), Some(1_360));
-        assert_eq!(rows(1_359), rows(1_300));
-        assert_ne!(rows(1_360), rows(1_300));
     }
 }

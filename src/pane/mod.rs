@@ -863,15 +863,6 @@ impl Pane {
         t.cwd_seen.borrow().as_ref().map_or(0, |seen| seen.version)
     }
 
-    /// Until when frames take the pane's directory as last read for one, while the pane prints
-    /// nothing: none for a pane whose directory frames do not read, or never did.
-    pub fn cwd_held_until(&self) -> Option<Instant> {
-        if self.reported_cwd.is_some() && !self.reported_remotely() {
-            return None;
-        }
-        self.term()?.cwd_seen.borrow().as_ref().map(|seen| seen.at + CWD_SHOWN)
-    }
-
     /// Read the directory of process `pid` for the frame being drawn, unless what was read
     /// holds for it (see `current_cwd`).
     fn see_cwd(t: &TermPane, pid: u32) {
