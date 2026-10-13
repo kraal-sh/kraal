@@ -42,12 +42,15 @@ jobs:
             echo "tag $GITHUB_REF_NAME, but Cargo.toml says $version"
             exit 1
           fi
-      # Static Linux binaries, linked by zig for both architectures.
+      # Static Linux binaries, linked by zig for both architectures. zig and cargo-zigbuild are
+      # pinned: zig's libc is part of these binaries, and a new zig changes it without a word
+      # (0.16 replaced musl's allocator with its own, which cost every session of 0.3.0 some
+      # 10 MB). Another version goes in once a build made with it has been through the benchmark.
       - name: Build (Linux)
         if: runner.os == 'Linux'
         run: |
-          pip install ziglang
-          cargo install --locked cargo-zigbuild
+          pip install ziglang==0.17.0
+          cargo install --locked cargo-zigbuild@0.23.4
           cargo zigbuild --release --locked --target ${{ matrix.target }}
       - name: Build (macOS)
         if: runner.os == 'macOS'
