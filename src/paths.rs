@@ -374,13 +374,19 @@ pub fn read_regular_text(path: &Path, cap: u64) -> std::io::Result<String> {
 /// Run `f` holding an exclusive lock tied to `path` (a `.<name>.lock` file next to it), so that
 /// kraal processes updating the same file (load, change, save) never lose each other's changes.
 pub fn locked<T>(path: &Path, f: impl FnOnce() -> T) -> std::io::Result<T> {
+    // Another kraal holds it for a moment at most; never wait for good.
+    locked_within(path, std::time::Duration::from_secs(3), f)
+}
+
+/// [`locked`], waiting up to `limit` for whoever holds the lock: as long as what it does there
+/// may take. The lock keeps threads of one process apart as well as processes.
+pub fn locked_within<T>(path: &Path, limit: std::time::Duration, f: impl FnOnce() -> T) -> std::io::Result<T> {
     let dir = path.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(Path::new("."));
     std::fs::create_dir_all(dir)?;
     let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
     let lock =
         std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(dir.join(format!(".{name}.lock")))?;
-    // Another kraal holds it for a moment at most; never wait for good.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    let deadline = std::time::Instant::now() + limit;
     while !try_lock(&lock)? {
         if std::time::Instant::now() > deadline {
             return Err(std::io::Error::new(
