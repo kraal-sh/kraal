@@ -389,9 +389,9 @@ fn another_release_drives_a_session_of_this_kraal() {
     assert!(std::os::unix::net::UnixStream::connect(env.socket()).is_err(), "still listening");
 }
 
-/// A session one release runs is neither started again nor forgotten by the other, in the
-/// runtime directory they share: whichever of the two runs it, and whether or not that one
-/// takes a lock (kraal 0.2.0 takes none).
+/// A session one release runs, and listens for, is neither started again nor forgotten by the
+/// other in the runtime directory they share, whichever of the two runs it: one command after
+/// the other here, not what two of them do at the same instant.
 #[test]
 #[ignore = "needs KRAAL_OLD, another release's kraal: tests/compat.sh runs it"]
 fn neither_release_starts_or_forgets_a_session_the_other_runs() {
@@ -406,24 +406,26 @@ fn neither_release_starts_or_forgets_a_session_the_other_runs() {
             assert!(start.elapsed() < Duration::from_secs(60), "the layout was never saved");
             std::thread::sleep(Duration::from_millis(50));
         }
-        // A second server ends by itself: one that started would run until it is killed here.
-        let mut second =
-            env.cmd(other, &["server", "--session", name]).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
-        let start = Instant::now();
-        let refused = loop {
-            if let Some(status) = second.try_wait().unwrap() {
-                break !status.success();
+        // Each ends by itself, refused: a second server that started would run until it is
+        // killed here, and so would a `forget` that waited.
+        let refused = |args: &[&str]| {
+            let mut command = env.cmd(other, args).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
+            let start = Instant::now();
+            loop {
+                if let Some(status) = command.try_wait().unwrap() {
+                    break !status.success();
+                }
+                if start.elapsed() > Duration::from_secs(60) {
+                    let _ = command.kill();
+                    let _ = command.wait();
+                    break false;
+                }
+                std::thread::sleep(Duration::from_millis(20));
             }
-            if start.elapsed() > Duration::from_secs(60) {
-                let _ = second.kill();
-                let _ = second.wait();
-                break false;
-            }
-            std::thread::sleep(Duration::from_millis(20));
         };
-        assert!(refused, "kraal {} started a second server of a session of kraal {}", other.version, runs.version);
-        let forget = env.try_run(other, &["forget"]);
-        assert!(!forget.status.success() && saved.exists(), "kraal {} forgot a running session", other.version);
+        let (theirs, ours) = (&other.version, &runs.version);
+        assert!(refused(&["server", "--session", name]), "kraal {theirs} started a second server beside {ours}");
+        assert!(refused(&["forget"]) && saved.exists(), "kraal {theirs} forgot a session kraal {ours} runs");
         assert_eq!(env.server_pid(), pid, "the session's server");
         env.run(runs, &["kill"]);
     }

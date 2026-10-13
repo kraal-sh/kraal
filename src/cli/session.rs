@@ -61,8 +61,7 @@ pub(super) fn forget(s: &Session) -> Result<()> {
     };
     // A server kraal 0.2.0 started holds no lock, but listens: one that takes no connection for
     // now counts as much as one that answers.
-    let gone = [std::io::ErrorKind::NotFound, std::io::ErrorKind::ConnectionRefused];
-    if !paths::connect_now(&paths::socket_path(session)).is_err_and(|e| gone.contains(&e.kind())) {
+    if !paths::nobody_listens(&paths::socket_path(session)) {
         bail!("session {session} is running; `kraal kill` it first");
     }
     let p = paths::session_state_path(session);

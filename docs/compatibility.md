@@ -39,13 +39,18 @@ A few things do less instead of failing:
 One thing an older kraal does not take part in: kraal now holds a session where it saves it, so
 that a kraal which looks in another runtime directory does not start a second server on the same
 files ([One server for what a session saves](workspaces.md#one-server-for-what-a-session-saves)).
-Kraal 0.3.0 holds a session in its runtime directory only, and 0.2.0 not at all. In the runtime
-directory they share, every release still keeps the others out: none starts or forgets a session
-another one runs. Across two runtime directories, only two kraal that both hold the session
-where it is saved do: a 0.3.0 or 0.2.0 started with another `$XDG_RUNTIME_DIR` than the session's
-server starts a second server on its files, as it always did. And kraal 0.2.0, which takes no
-lock, can still become a second server of a session when it is started at the very instant
-another kraal starts the same one.
+Kraal 0.3.0 holds a session in its runtime directory only, and 0.2.0 not at all:
+
+- **0.3.0, same runtime directory.** Both take the lock of that directory: neither starts nor
+  forgets a session the other holds.
+- **0.2.0, same runtime directory.** It takes no lock, so only a socket that answers keeps a
+  second server or a `kraal forget` away, on both sides: a session whose server listens is not
+  started again nor forgotten. A 0.2.0 started at the very instant another kraal starts the same
+  session can still become a second server of it. And on macOS a server too busy to take a
+  connection (its queue is full) looks like one that is gone, where Linux tells the two apart.
+- **Another runtime directory.** Only two kraal that both hold the session where it is saved keep
+  each other out. A 0.3.0 or 0.2.0 started with another `$XDG_RUNTIME_DIR` than the session's
+  server starts a second server on its files, as it always did.
 
 ## For contributors: how the protocol changes
 

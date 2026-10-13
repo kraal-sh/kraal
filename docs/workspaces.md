@@ -41,8 +41,8 @@ A session's server holds the session where it saves it (`~/.local/state/kraal`),
 the runtime directory of the shell that started it (`$XDG_RUNTIME_DIR/kraal`, or
 `/tmp/kraal-<uid>/kraal` without one). A kraal that looks in another runtime directory (a cron job
 or a `sudo -u` shell without `$XDG_RUNTIME_DIR`, beside a desktop terminal that has it) does not
-find that server. It does not start a second one on the same files, nor forget them: it stops,
-and says where the session runs.
+find that server. It does not start a second one on the same files, nor forget them: after a
+few seconds spent looking for a server of its own, it stops and says where the session runs.
 
 ```
 $ kraal

@@ -16,11 +16,11 @@ use crate::{paths, process};
 const START_LIMIT: Duration = Duration::from_secs(5);
 
 /// Make sure a server runs for `session`, starting one in the background if needed: where it
-/// listens. When another kraal of this runtime directory has the session (a server started at
-/// the same moment, which listens in a moment; one that is going; `kraal forget`), its socket
-/// is waited for, and a server asked for again once nobody has the session, [`START_LIMIT`] at
-/// most in all. A session held by a kraal whose sockets are elsewhere is not started: this one
-/// could not keep that one's files from being written twice, and says who has it.
+/// listens. When another kraal has the session (a server started at the same moment, which
+/// listens in a moment; one that is going; `kraal forget`), its socket is waited for here, and a
+/// server asked for again once nobody has the session, [`START_LIMIT`] at most in all. A session
+/// still held then, with no server that answers here, is not started: its files would be
+/// written twice. The error says who has it, where its holder says so.
 pub fn ensure_server(session: &str) -> Result<PathBuf> {
     paths::private_runtime_dir().context("checking the runtime directory")?;
     let socket = paths::socket_path(session);
@@ -58,9 +58,6 @@ pub fn ensure_server(session: &str) -> Result<PathBuf> {
             let why = last_logged(&log, logged).map(|line| format!(": {line}")).unwrap_or_default();
             bail!("the server exited ({status}){why}; see {}", log.display());
         }
-        if let Some(elsewhere) = held_elsewhere(session) {
-            bail!(elsewhere);
-        }
         // Its server is looked for until the next try, each a little later than the last: many
         // kraal started at once must not keep the one that has the session from listening.
         let next = (Instant::now() + pause).min(deadline);
@@ -71,8 +68,7 @@ pub fn ensure_server(session: &str) -> Result<PathBuf> {
             std::thread::sleep(Duration::from_millis(20));
         }
         if Instant::now() >= deadline {
-            let who = who_holds(session).unwrap_or_else(|| "by another kraal".into());
-            bail!("session {session} is held ({who}) and no server of it listens: try again (see {})", log.display());
+            bail!(held_without_a_server(session, &socket, &log));
         }
         pause = (pause * 2).min(Duration::from_millis(320));
     }
@@ -84,20 +80,37 @@ pub fn who_holds(session: &str) -> Option<String> {
     paths::holder(session).map(|holder| said_of(&holder, &paths::runtime_dir()))
 }
 
-/// What to say when `session` is held by a kraal whose socket is not where this one looks:
-/// `None` when its holder is, or may be, one of this runtime directory, which is waited for.
-fn held_elsewhere(session: &str) -> Option<String> {
+/// What to say of `session` once another kraal has had it for as long as a start may take
+/// without a server of it answering here. What its holder says of itself explains that, and
+/// decided nothing: the start was tried again until now whatever it said, since what is read
+/// there may be what a holder killed before left.
+fn held_without_a_server(session: &str, socket: &Path, log: &Path) -> String {
+    if !paths::nobody_listens(socket) {
+        return format!("the server of session {session} takes no connection for now ({})", socket.display());
+    }
     let here = paths::runtime_dir();
-    let elsewhere = || paths::holder(session).filter(|holder| !is_here(holder, &here));
-    // Read twice: what a holder killed before said is there until the next one says its own.
-    elsewhere()?;
-    std::thread::sleep(Duration::from_millis(50));
-    Some(format!("session {session} is not started here: {}", said_of(&elsewhere()?, &here)))
+    match paths::holder(session) {
+        Some(holder) if !is_here(&holder, &here) => {
+            format!("session {session} is not started here: {}", said_of(&holder, &here))
+        }
+        holder => {
+            let who = holder.map_or_else(|| "by another kraal".into(), |holder| said_of(&holder, &here));
+            format!("session {session} is held ({who}) and no server of it listens: try again (see {})", log.display())
+        }
+    }
 }
 
 /// Whether `holder` keeps its socket in `here`, this kraal's runtime directory on this machine.
 fn is_here(holder: &paths::Holder, here: &Path) -> bool {
-    holder.runtime == here && holder.host == crate::context::hostname().unwrap_or_default()
+    same_directory(&holder.runtime, here) && holder.host == crate::context::hostname().unwrap_or_default()
+}
+
+/// Whether two paths are one directory, however each is spelt (`/tmp` is `/private/tmp` on
+/// macOS).
+fn same_directory(a: &Path, b: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let id = |dir: &Path| std::fs::metadata(dir).ok().map(|m| (m.dev(), m.ino()));
+    a == b || (id(a).is_some() && id(a) == id(b))
 }
 
 /// What the holder of a session is to a kraal whose runtime directory is `here`, and how to
@@ -110,7 +123,7 @@ fn said_of(holder: &paths::Holder, here: &Path) -> String {
              one another name (kraal -s NAME)"
         );
     }
-    if runtime == here {
+    if same_directory(runtime, here) {
         return format!("kraal {pid} has it");
     }
     let base = runtime.parent().unwrap_or(runtime);
