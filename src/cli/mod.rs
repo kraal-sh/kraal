@@ -41,7 +41,7 @@ pub fn main() {
     }
     if let Err(e) = run(cli) {
         eprintln!("kraal: {e:#}");
-        std::process::exit(1);
+        std::process::exit(if e.is::<server::Held>() { server::HELD_STATUS } else { 1 });
     }
 }
 
@@ -341,7 +341,8 @@ fn config_cmd(action: &str, markdown: bool) -> Result<()> {
         }
         _ => {
             let (cfg, unknown_keys) = config::Config::load_with_warnings()?;
-            for w in unknown_keys.into_iter().chain(config_warnings(&cfg)) {
+            let warnings = unknown_keys.into_iter().chain(config_warnings(&cfg));
+            for w in warnings.chain(paths::runtime_dir_refused()) {
                 eprintln!("warning: {w}");
             }
             // Warnings are advice; a file kraal cannot read at all is an error.

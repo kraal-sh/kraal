@@ -36,6 +36,17 @@ A few things do less instead of failing:
   nothing for ten seconds while events wait for it, without telling it: the stream ends as it
   does with the session ([Events](scripting.md#events)).
 
+One thing an older kraal does not take part in: kraal now holds a session where it saves it, so
+that a kraal which looks in another runtime directory does not start a second server on the same
+files ([One server for what a session saves](workspaces.md#one-server-for-what-a-session-saves)).
+Kraal 0.3.0 holds a session in its runtime directory only, and 0.2.0 not at all. In the runtime
+directory they share, every release still keeps the others out: none starts or forgets a session
+another one runs. Across two runtime directories, only two kraal that both hold the session
+where it is saved do: a 0.3.0 or 0.2.0 started with another `$XDG_RUNTIME_DIR` than the session's
+server starts a second server on its files, as it always did. And kraal 0.2.0, which takes no
+lock, can still become a second server of a session when it is started at the very instant
+another kraal starts the same one.
+
 ## For contributors: how the protocol changes
 
 The client and the server exchange JSON messages (`src/protocol.rs`, whose comments hold the

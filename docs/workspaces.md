@@ -35,6 +35,33 @@ How kraal is organised, and how a workspace is declared once in a file and opene
 | `kraal restart` | restarts the server on the kraal installed now (see below) |
 | `kraal forget` | deletes what a stopped session saved |
 
+### One server for what a session saves
+
+A session's server holds the session where it saves it (`~/.local/state/kraal`), and listens in
+the runtime directory of the shell that started it (`$XDG_RUNTIME_DIR/kraal`, or
+`/tmp/kraal-<uid>/kraal` without one). A kraal that looks in another runtime directory (a cron job
+or a `sudo -u` shell without `$XDG_RUNTIME_DIR`, beside a desktop terminal that has it) does not
+find that server. It does not start a second one on the same files, nor forget them: it stops,
+and says where the session runs.
+
+```
+$ kraal
+kraal: session main is not started here: kraal 4242 runs it with its socket in "/run/user/1000/kraal", not in "/tmp/kraal-1000/kraal" where this kraal looks: reach it with XDG_RUNTIME_DIR="/run/user/1000"
+```
+
+Set `XDG_RUNTIME_DIR` as it says to work with that session, or name another one (`kraal -s NAME`).
+When `$XDG_RUNTIME_DIR` is set and kraal cannot keep its sockets in it (the path is too long for
+one, or another user could replace it), kraal says so when it starts a server, in that server's
+log, and in `kraal config check`.
+
+The same holds between machines that share a home directory, as far as their file system locks a
+file for all of them: the second machine is told the session runs on the first. A network file
+system mounted with local locks only keeps each machine's kraal from its own, not from the
+others': name the session differently on each machine there (`kraal -s NAME`), or keep kraal's
+state on a local disk (`XDG_STATE_HOME`). Where the state directory cannot lock a file at all,
+kraal starts no session and forgets none, and says so: it would have no way to keep a second
+server from the same files.
+
 ## Persistence
 
 Sessions keep running when you close the terminal, lose the connection or detach (`ctrl+b d`):

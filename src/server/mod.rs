@@ -34,7 +34,7 @@ mod ui;
 mod worktrees;
 
 use std::collections::HashMap;
-use std::os::unix::net::{UnixListener, UnixStream};
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -624,6 +624,23 @@ fn panic_text(payload: &(dyn std::any::Any + Send)) -> &str {
     text.or_else(|| payload.downcast_ref::<String>().map(String::as_str)).unwrap_or("it panicked")
 }
 
+/// Why a server did not start: another kraal has its session. A server ends with
+/// [`HELD_STATUS`] then, and the kraal that started it waits for that one's socket, or says who
+/// has the session.
+#[derive(Debug)]
+pub struct Held(String);
+
+impl std::fmt::Display for Held {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for Held {}
+
+/// What `kraal server` exits with on [`Held`] (a temporary failure, as sysexits names 75).
+pub const HELD_STATUS: i32 = 75;
+
 /// Run a session server in the foreground until it is told to exit.
 pub fn run(session: &str) -> Result<()> {
     let ready = take_ready_pipe();
@@ -632,18 +649,17 @@ pub fn run(session: &str) -> Result<()> {
     crate::pane::reserve_descriptors();
     let socket = paths::socket_path(session);
     paths::private_runtime_dir().context("checking the runtime directory")?;
-    // Held until this server is gone: the socket, and the session's files, are its alone.
-    let _held = paths::SessionLock::acquire(session)
-        .context("locking the session")?
-        .with_context(|| format!("another kraal holds session {session:?}: its server, or kraal forget"))?;
-    if socket.exists() {
-        // A server an older kraal started holds no lock.
-        if UnixStream::connect(&socket).is_ok() {
-            anyhow::bail!("session {session:?} is already running");
-        }
-        let _ = std::fs::remove_file(&socket);
-    }
-    let listener = UnixListener::bind(&socket).with_context(|| format!("binding {}", socket.display()))?;
+    // Held until this server is gone, and what writes for it with it ([`spawn_persister`]): the
+    // socket, and the session's files, are its alone.
+    let Some(held) = paths::SessionLock::acquire(session).context("locking the session")? else {
+        return Err(Held(format!("another kraal holds session {session:?}: its server, or kraal forget")).into());
+    };
+    let held = Arc::new(held);
+    // A server kraal 0.2.0 started holds no lock.
+    let Some(listener) = paths::listen_alone(&socket).with_context(|| format!("binding {}", socket.display()))? else {
+        return Err(Held(format!("session {session:?} is already running")).into());
+    };
+    let own_socket = paths::file_id(&socket);
     // Connections wait in the listener's queue from now on: the client that started this server
     // may connect.
     if let Some(mut ready) = ready {
@@ -653,6 +669,11 @@ pub fn run(session: &str) -> Result<()> {
 
     let (config, mut warnings) =
         Config::load_with_warnings().unwrap_or_else(|e| (Config::default(), vec![format!("config: {e:#}")]));
+    // In the log too: the list is shown to who attaches, and none may.
+    if let Some(refused) = paths::runtime_dir_refused() {
+        eprintln!("kraal: warning: {refused}");
+        warnings.push(refused);
+    }
     let (mut keymap, kw) = Keymap::build(&config.keys);
     warnings.extend(kw);
     warnings.extend(keymap.bind_tools(&config.tools));
@@ -815,7 +836,7 @@ pub fn run(session: &str) -> Result<()> {
         edits: Vec::new(),
         preview_loads: Default::default(),
         pending_opens: Vec::new(),
-        persister: spawn_persister(persist_tx, persisting.clone())?,
+        persister: spawn_persister(persist_tx, persisting.clone(), held.clone())?,
         persisting,
         persisted: None,
         scrollback: HashMap::new(),
@@ -833,7 +854,19 @@ pub fn run(session: &str) -> Result<()> {
     server.restore();
     let result = server.event_loop(&rx);
     server.shutdown();
-    let _ = std::fs::remove_file(&socket);
+    // Its own socket, not one that has taken its place since: a cleaner of /tmp removed this
+    // one, and a kraal 0.2.0, which takes no lock, listens there now.
+    if own_socket.is_some() && paths::file_id(&socket) == own_socket {
+        let _ = std::fs::remove_file(&socket);
+    }
+    // Nothing asks the writer for more: it lets go of the session as it ends, and the session is
+    // let go here once it has. A writer stuck in a write keeps it until this process is gone,
+    // and that write with it.
+    drop(server);
+    let limit = Instant::now() + Duration::from_secs(2);
+    while Arc::strong_count(&held) > 1 && Instant::now() < limit {
+        std::thread::sleep(Duration::from_millis(5));
+    }
     result
 }
 
