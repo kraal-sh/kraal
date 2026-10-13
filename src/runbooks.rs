@@ -88,7 +88,9 @@ pub enum On {
     Server,
 }
 
-/// A TOML runbook, as its file says.
+/// A TOML runbook, as its file says. A key kraal does not know is refused, where the
+/// configuration only warns: a runbook says what runs and how, and running it without what a
+/// key asked for (`stop_on_failure`, `timeout` or `secret`, misspelt) is worse than not running it.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Steps {
@@ -947,6 +949,8 @@ mod tests {
         assert!(parse_steps("steps = [\"a\"]\n[[param]]\nname = \"bad name\"\n").is_err());
         assert!(parse_steps("steps = [\"a\"]\n[[param]]\nname = \"KRAAL_X\"\n").is_err());
         assert!(parse_steps("steps = [\"a\"]\ntypo = 1\n").is_err());
+        // Read past, this misspelt key would show a secret in the plan and the log.
+        assert!(parse_steps("steps = [\"a\"]\n[[param]]\nname = \"TOKEN\"\nsecrte = true\n").is_err());
         assert!(parse_steps("steps = [\"a\"]\nshell = \"bash;rm\"\n").is_err());
         assert!(parse_steps("steps = [\"a\"]\nshell = \"/usr/bin/bash\"\n").is_ok());
         assert!(parse_steps(TEMPLATE_TOML).is_ok());

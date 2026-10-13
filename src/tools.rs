@@ -16,8 +16,9 @@ use crate::protocol::Placement;
 use crate::servers::Server;
 use crate::shell;
 
+/// A tool of `[tools]`. A key this kraal does not know (another version's, in a configuration
+/// both read) is warned about like any other of the file, and the tool loads without it.
 #[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct ToolDef {
     /// A shell command line, run by `sh -c`.
     pub command: String,
@@ -483,7 +484,8 @@ mod tests {
         ctx.selection = Some("  ".into());
         assert!(sel.missing(&ctx).is_some());
         assert!(toml::from_str::<ToolDef>("command = \"x\"\nwhen = [\"nope\"]").is_err());
-        assert!(toml::from_str::<ToolDef>("command = \"x\"\ntypo = 1").is_err());
+        // A key of another kraal's: the tool loads, and the configuration warns of the key.
+        assert_eq!(tool("command = \"x\"\nconfirm = true").command, "x");
     }
 
     #[test]

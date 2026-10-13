@@ -19,9 +19,10 @@ session's next start. When the file cannot be read, nothing changes and the comm
 The check also reads your runbooks and, run in a repository, its `.kraal/worktree.toml` and its
 runbooks. A key kraal does not know in `config.toml`, `servers.toml` or `accounts.toml` (a typo,
 or a setting of another version of kraal) is a warning that names it, `bar.kyes: unknown key (did
-you mean keys?)`, and the rest of the file applies; a session says the same of `config.toml` when
-it starts or reloads it. A tool, a hint pattern, a runbook and `.kraal/worktree.toml` refuse a
-key they do not know.
+you mean keys?)`, and the rest of the file applies, a tool or a hint pattern that has such a key
+included; a session says the same of `config.toml` when it starts or reloads it. A runbook and
+`.kraal/worktree.toml` refuse a key they do not know: they say what runs, and running part of it
+would be worse than refusing it.
 
 ## Panes and the screen
 
