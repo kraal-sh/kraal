@@ -86,11 +86,30 @@ with every program in it, as `kraal kill` does, and each attached terminal ends 
 `[kraal: stopped; kraal starts it again with its layout]`. A session that cannot be saved is not
 stopped: it keeps running, and the quit says why (`kraal kill` stops it all the same).
 
+### Closing a workspace
+
+`ctrl+b W x`, or `ctrl+x` on an open workspace in the workspace picker, asks before closing
+all its panes. The question lists that workspace's running programs, including jobs in the
+background, agents and SSH connections. Activity kraal cannot identify is shown as unknown.
+Unsaved work in these programs may be lost. **Cancel** is selected first; Enter cancels,
+and **Stop and close** confirms. Other workspaces keep running. Other clients showing the
+closed workspace move to a neighbouring workspace.
+
+Close currently removes the live layout from the session. A linked workspace file stays
+unchanged: reopening uses that file's layout, without changes made since it was saved.
+A workspace without a linked file disappears from the list. The question explains this;
+cancel and [save the layout](#workspace-files) first to keep it. Even a workspace
+with only shells at their prompts asks before removing its layout.
+
+Closing the last workspace also stops the session, as the question says.
+
 When the last pane of the last workspace ends (`exit` in the last shell), the session ends with
 it: nothing runs any more, so nothing is asked, the attached terminals end with
 `[kraal: the last pane closed, so kraal stopped]`, nothing stays saved, and the next `kraal`
 starts a new session. A command pane that stays open to show how its program ended has not ended:
 the session goes on until that pane is closed.
+
+### Restarting a session
 
 `kraal restart` (or `ctrl+b W r`) restarts a session's server on the kraal installed now, after an
 update for instance: the server saves the session and stops, and a new one starts and brings it

@@ -176,10 +176,17 @@ pub fn session_members(sid: libc::pid_t) -> Vec<libc::pid_t> {
 
 /// Whether stopping this terminal would affect only its shell and the foreground agent's children.
 pub fn sole_foreground_job(leader: u32, foreground: u32) -> bool {
-    let members = session_members(leader as libc::pid_t);
+    sole_foreground_job_in(leader, foreground, session_members(leader as libc::pid_t))
+}
+
+fn sole_foreground_job_in(leader: u32, foreground: u32, members: Vec<libc::pid_t>) -> bool {
     members.contains(&(leader as libc::pid_t))
         && members.contains(&(foreground as libc::pid_t))
-        && members.into_iter().all(|pid| pid as u32 == leader || lineage(pid as u32).contains(&foreground))
+        && members.into_iter().all(|pid| {
+            // A short-lived child may be reaped between listing the session and reading its
+            // ancestry. Only a process that is still there can be an unrelated job we must keep.
+            pid as u32 == leader || lineage(pid as u32).contains(&foreground) || !exists(pid)
+        })
 }
 
 /// The jobs left in the background of the terminal of the session `leader` leads (a shell's
@@ -747,6 +754,28 @@ compile_error!("kraal builds for Linux and macOS only");
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_foreground_check_allows_a_member_that_disappeared_after_the_session_was_listed() {
+        use std::process::{Command, Stdio};
+
+        let waiting = || Command::new("sh").args(["-c", "read line"]).stdin(Stdio::piped()).spawn().unwrap();
+        let mut foreground = waiting();
+        let mut other = waiting();
+        let leader = std::process::id();
+        let members = vec![leader as libc::pid_t, foreground.id() as libc::pid_t, other.id() as libc::pid_t];
+        let only_foreground = sole_foreground_job_in(leader, foreground.id(), members[..2].to_vec());
+        let with_other_job = sole_foreground_job_in(leader, foreground.id(), members.clone());
+        // Keep the list, but let a process in it exit and be reaped before its ancestry is read.
+        drop(other.stdin.take());
+        other.wait().unwrap();
+        let after_exit = sole_foreground_job_in(leader, foreground.id(), members);
+        drop(foreground.stdin.take());
+        foreground.wait().unwrap();
+        assert!(only_foreground);
+        assert!(!with_other_job, "a live unrelated job must still prevent switching");
+        assert!(after_exit, "a process that no longer exists cannot be stopped by switching");
+    }
 
     #[test]
     fn this_process() {

@@ -238,11 +238,7 @@ impl Server {
                 }
                 (KeyCode::Char('x'), true) if p.kind == PickerKind::Workspace => {
                     if let Some(PickAction::SwitchWorkspace(ws)) = p.current().map(|i| i.action.clone()) {
-                        let name = self.ws_index(ws).map(|i| self.workspaces[i].name.clone()).unwrap_or_default();
-                        return Mode::confirm(
-                            format!("Close workspace \"{name}\" and all its panes?"),
-                            ConfirmAction::CloseWorkspace(ws),
-                        );
+                        return self.ask_close_workspace(ws);
                     }
                 }
                 // A question that may come while the user types elsewhere: typing does not answer it.
@@ -618,9 +614,59 @@ mod tests {
     }
 
     #[test]
+    fn both_close_entries_list_only_the_chosen_workspace_including_other_tabs_and_floats() {
+        use crate::input::{InputEvent, Key, KeyCode, Mods};
+        use crate::pane::PaneSpec;
+        use crate::protocol::Placement;
+        use crate::server::ui::{PickAction, PickItem, Picker, PickerKind};
+
+        let (tx, _rx) = crate::server::queue::channel(32);
+        let mut server = crate::server::tests::server(tx);
+        let (client, _peer) = crate::server::tests::client(&mut server);
+        let ws = server.clients[&client].workspace;
+        let other = server.new_workspace("other".into(), None);
+        let _batch = crate::pane::batch();
+        for (workspace, placement, name) in [
+            (ws, Placement::Auto, "first"),
+            (ws, Placement::Tab, "second"),
+            (ws, Placement::Floating, "floating"),
+            (other, Placement::Auto, "elsewhere"),
+        ] {
+            let id = server.spawn_pane_in(workspace, None, PaneSpec::default(), placement, Some(name.into())).unwrap();
+            server.panes.get_mut(&id).unwrap().spec.command = vec!["sleep".into(), name.into()];
+        }
+        let Mode::Confirm(direct) = server.action(client, crate::keymap::Action::CloseWorkspace) else {
+            panic!("confirmation")
+        };
+        // A picker can close a workspace other than the one the client shows.
+        server.clients.get_mut(&client).unwrap().workspace = other;
+        let picker = Picker::new(
+            PickerKind::Workspace,
+            "Workspaces",
+            vec![PickItem::new("test", "", PickAction::SwitchWorkspace(ws))],
+        );
+        let close = InputEvent::Key(Key { code: KeyCode::Char('x'), mods: Mods::CTRL, raw: Vec::new() });
+        let Mode::Confirm(picked) = server.on_picker(client, picker, close) else { panic!("confirmation") };
+        assert_eq!(direct.message, picked.message);
+        assert!(matches!(picked.action, ConfirmAction::CloseWorkspace(id) if id == ws));
+        assert!(!picked.yes);
+        for name in ["first", "second", "floating"] {
+            assert!(picked.message.contains(&format!("sleep {name}  (pane ")), "{}", picked.message);
+        }
+        assert!(!picked.message.contains("elsewhere"));
+        assert!(picked.message.contains("Unsaved work in these programs may be lost."));
+        for question in [server.ask_quit(), server.ask_restart()] {
+            let Mode::Confirm(q) = question else { panic!("confirmation") };
+            assert!(q.message.contains("sleep elsewhere  (pane "));
+            assert!(!q.message.contains("layout will be removed"));
+        }
+    }
+
+    #[test]
     fn workspace_tab_and_close_apply_only_to_an_open_workspace() {
         let (tx, _rx) = crate::server::queue::channel(32);
         let mut server = crate::server::tests::server(tx);
+        assert_eq!(server.new_workspace("open".into(), None), 1);
         let key = |code, mods| InputEvent::Key(Key { code, mods, raw: Vec::new() });
         for action in [
             PickAction::SwitchWorkspace(1),

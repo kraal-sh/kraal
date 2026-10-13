@@ -168,7 +168,7 @@ impl Server {
             "Restart session {} on the kraal installed now? The layout, the scrollback, SSH shells and agents come back.",
             self.session
         );
-        if let Some(stops) = self.stops() {
+        if let Some(stops) = self.stops(None) {
             message.push('\n');
             message.push_str(&stops);
         }
@@ -177,22 +177,64 @@ impl Server {
 
     /// The question before quitting, with what stops.
     pub(super) fn ask_quit(&self) -> Mode {
-        let message = match self.stops() {
+        let message = match self.stops(None) {
             Some(stops) => format!("Quit kraal? {stops}\nThe layout is saved for next time."),
             None => "Quit kraal? The layout is saved for next time.".into(),
         };
         Mode::confirm(message, ConfirmAction::Quit)
     }
 
-    /// What stopping the server (to restart, or to quit) stops, as a question says it: a line
-    /// per program, in the order of the workspaces. `None` when nothing does.
-    fn stops(&self) -> Option<String> {
+    pub(super) fn ask_close_workspace(&self, ws: u32) -> Mode {
+        let Some(wi) = self.ws_index(ws) else { return Mode::Normal };
+        let workspace = &self.workspaces[wi];
+        let mut message = format!(
+            "Close workspace \"{}\" and all its panes?\nThe current layout will be removed from the session.",
+            workspace.name
+        );
+        if let Some(path) = &workspace.definition {
+            let usable = paths::read_regular_text(path, u64::MAX)
+                .is_ok_and(|source| crate::workspace::parse_workspace(&workspace.name, &source).is_ok());
+            if usable {
+                message.push_str(&format!(
+                    "\nThe workspace file is kept unchanged:\n  {}\nReopening uses that file's layout.",
+                    paths::shorten_home(path)
+                ));
+            } else {
+                message.push_str(&format!(
+                    "\nThe linked workspace file is missing or unusable:\n  {}\nReopening requires saving the layout first.",
+                    paths::shorten_home(path)
+                ));
+            }
+        } else {
+            message.push_str("\nThis workspace has no linked file. It will disappear from the list.");
+        }
+        message.push_str("\nCancel and save the layout first to keep it.");
+        if self.workspaces.len() == 1 {
+            message.push_str("\nThis is the last workspace. The session will stop.");
+        }
+        if let Some(stops) = self.stops(Some(ws)) {
+            message.push('\n');
+            message.push_str(&stops);
+            message.push_str("\nUnsaved work in these programs may be lost.");
+        }
+        Mode::confirm(message, ConfirmAction::CloseWorkspace(ws))
+    }
+
+    /// What quitting or restarting the session, or closing just `workspace`, stops.
+    fn stops(&self, workspace: Option<u32>) -> Option<String> {
         let mut lines = Vec::new();
-        for id in self.workspaces.iter().flat_map(|w| w.panes()) {
+        for id in self.workspaces.iter().filter(|w| workspace.is_none_or(|id| w.id == id)).flat_map(|w| w.panes()) {
             let Some(pane) = self.panes.get(&id) else { continue };
-            let program = if pane.shell_waiting() { None } else { pane.foreground_argv() };
+            let waiting = pane.shell_waiting();
+            let program = if waiting && workspace.is_none() { None } else { pane.foreground_argv() };
             let info = self.pane_info(id);
-            for what in persist::stops_with_server(&info, program.as_deref(), &pane.background_jobs()) {
+            let jobs = pane.background_jobs();
+            let stops = if workspace.is_some() {
+                persist::stops_with_workspace(&info, program.as_deref(), &jobs, waiting)
+            } else {
+                persist::stops_with_server(&info, program.as_deref(), &jobs)
+            };
+            for what in stops {
                 lines.push(format!("\n  {}", persist::stopping_line(&info, &what)));
             }
         }
@@ -472,6 +514,99 @@ mod tests {
         persist::apply(&mut restored, saved).unwrap();
         assert_eq!(restored.unrestored[0].id, "stable");
         assert_eq!(restored.unrestored[0].restore_error, reason);
+    }
+
+    #[test]
+    fn closing_says_what_happens_to_the_layout_file_and_last_workspace() {
+        let dir = std::env::temp_dir().join(format!("kraal-close-layout-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("api.kdl");
+        std::fs::write(&path, "layout { pane; }\n").unwrap();
+        let (tx, _rx) = crate::server::queue::channel(32);
+        let mut server = crate::server::tests::server(tx);
+        let ws = server.new_workspace("api".into(), None);
+        for linked in [false, true] {
+            server.workspaces[0].definition = linked.then(|| path.clone());
+            let Mode::Confirm(q) = server.ask_close_workspace(ws) else { panic!("confirmation") };
+            assert!(!q.yes);
+            assert!(q.message.starts_with("Close workspace \"api\" and all its panes?"));
+            assert!(q.message.contains("The current layout will be removed from the session."));
+            assert!(q.message.contains("Cancel and save the layout first to keep it."));
+            assert!(q.message.contains("This is the last workspace. The session will stop."));
+            assert!(!q.message.contains("These programs stop:"));
+            if linked {
+                assert!(q.message.contains(&format!("The workspace file is kept unchanged:\n  {}", path.display())));
+                assert!(q.message.contains("Reopening uses that file's layout."));
+                assert!(!q.message.contains("disappear"));
+            } else {
+                assert!(q.message.contains("This workspace has no linked file. It will disappear from the list."));
+                assert!(!q.message.contains("Reopening"));
+            }
+        }
+        server.new_workspace("other".into(), None);
+        let Mode::Confirm(q) = server.ask_close_workspace(ws) else { panic!("confirmation") };
+        assert!(!q.message.contains("The session will stop."));
+        assert!(matches!(server.ask_close_workspace(u32::MAX), Mode::Normal));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn closing_warns_when_the_linked_definition_was_deleted_or_became_invalid() {
+        let dir = std::env::temp_dir().join(format!("kraal-close-missing-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir = dir.canonicalize().unwrap();
+        let path = dir.join("api.kdl");
+        for replacement in [None, Some("not a workspace")] {
+            std::fs::write(&path, "layout { pane command=\"true\" start_suspended=true; }\n").unwrap();
+            let (tx, _rx) = crate::server::queue::channel(32);
+            let mut server = crate::server::tests::server(tx);
+            let ws = server.open_definition(&path).unwrap();
+            if let Some(text) = replacement {
+                std::fs::write(&path, text).unwrap();
+            } else {
+                std::fs::remove_file(&path).unwrap();
+            }
+            server.scan_definitions();
+            assert_eq!(server.workspaces[0].definition.as_ref(), Some(&path));
+            let Mode::Confirm(q) = server.ask_close_workspace(ws) else { panic!("confirmation") };
+            assert!(!q.yes);
+            assert!(q.message.contains("The linked workspace file is missing or unusable:"), "{}", q.message);
+            assert!(q.message.contains(&path.display().to_string()), "{}", q.message);
+            assert!(q.message.contains("Reopening requires saving the layout first."), "{}", q.message);
+            assert!(q.message.contains("Cancel and save the layout first to keep it."));
+            assert!(!q.message.contains("Reopening uses that file's layout."));
+            assert_eq!(server.workspaces[0].panes().len(), 1);
+            assert_eq!(std::fs::read_to_string(&path).ok().as_deref(), replacement);
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn closing_lists_a_shell_script_leading_the_foreground_group() {
+        let (tx, _rx) = crate::server::queue::channel(32);
+        let mut server = crate::server::tests::server(tx);
+        let def = crate::workspace::parse_workspace(
+            "script",
+            "layout { pane command=\"sh\" { args \"-c\" \"sleep 600; echo done\"; }; }\n",
+        )
+        .unwrap();
+        let ws = server.start_definition_inner(&def, None).unwrap();
+        let pane = &server.panes[&server.workspaces[0].panes()[0]];
+        let pid = pane.pid().unwrap();
+        let start = Instant::now();
+        while !crate::process::children(pid)
+            .into_iter()
+            .any(|child| crate::process::argv(child).is_some_and(|a| a == ["sleep", "600"]))
+        {
+            assert!(start.elapsed() < crate::testing::PATIENCE, "the script never started");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(pane.foreground_pid(), Some(pid));
+        assert!(pane.shell_waiting());
+        assert!(pane.background_jobs().is_empty());
+        let Mode::Confirm(q) = server.ask_close_workspace(ws) else { panic!("confirmation") };
+        assert!(q.message.contains("These programs stop:\n  sh -c 'sleep 600; echo done'"), "{}", q.message);
+        assert!(q.message.contains("Unsaved work in these programs may be lost."), "{}", q.message);
     }
 
     /// The writer keeps what holds the session for as long as it can be asked to write, and

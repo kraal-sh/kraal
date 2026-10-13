@@ -56,6 +56,11 @@ Saving a workspace layout (`ctrl+b W s`) asks before replacing another existing 
 changed outside kraal. **Cancel** is selected and returns to the entered name. A destination
 linked to another workspace is refused. See [Saving without replacing someone else's layout](workspaces.md#saving-without-replacing-someone-elses-layout).
 
+Closing a workspace (`ctrl+b W x`, or `ctrl+x` in the workspace picker) lists its running
+programs and background jobs, and explains that its current layout will be removed.
+**Cancel** is selected first; **Stop and close** confirms. Cancel and save the layout first
+to keep it. See [Closing a workspace](workspaces.md#closing-a-workspace).
+
 ## The bottom bar
 
 The last row shows what can be done in the focused pane, the most useful first, each with the
