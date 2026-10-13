@@ -94,7 +94,7 @@ impl Server {
             .values()
             // A pane waiting for Enter shows what was restored in it, saved already. One whose
             // history is being stored is saved next time, rather than store it here.
-            .filter(|p| p.is_terminal() && !p.suspended && (all || p.history_stored()))
+            .filter(|p| p.spec.login.is_none() && p.is_terminal() && !p.suspended && (all || p.history_stored()))
             .filter_map(|p| {
                 let saved = self.scrollback.get(&p.id);
                 let taken = saved.map(|s| s.taken);

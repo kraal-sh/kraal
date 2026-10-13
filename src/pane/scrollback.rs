@@ -54,6 +54,9 @@ impl Pane {
     /// out past [`MAX_SAVED_BYTES`]. None while a full-screen program shows the alternate screen
     /// (the primary one is out of reach then), and for panes that are not terminals.
     pub fn scrollback_ansi(&self) -> Option<Vec<u8>> {
+        if self.spec.login.is_some() {
+            return None;
+        }
         let t = self.term()?;
         if t.term.mode().contains(TermMode::ALT_SCREEN) {
             return None;

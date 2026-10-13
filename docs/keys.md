@@ -117,6 +117,10 @@ unstack.
 the match and goes on in copy mode, Esc cancels. `ctrl+b P r` resizes: the arrows (or `hjkl`)
 move the focused pane's border, Enter or Esc ends it.
 
+An account login pane has its own ending: Enter closes it after failure or cancellation,
+`r` explicitly tries the login again, and `c` checks sign-in again after an unsuccessful check.
+A successful, verified sign-in closes the pane automatically.
+
 ## Lists, fields and questions
 
 In lists, type to filter, `↑↓` move, Enter chooses, **Tab shows what else can be done** with the

@@ -52,7 +52,8 @@ long_command = 30        # seconds a command runs before its end is announced; 0
 `save_scrollback` saves what each pane shows, its scrollback included, in
 `~/.local/state/kraal/scrollback`, so that panes show it again after a restart (see
 [Persistence](workspaces.md#persistence)). Scrollback can hold secrets: `false` saves none and
-deletes what was saved. `long_command` needs a shell that marks its commands
+deletes what was saved. Account login panes and their text are never saved, even when this
+setting is `true`. `long_command` needs a shell that marks its commands
 ([Shell commands](terminal.md#shell-commands)).
 
 ## Keys

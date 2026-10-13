@@ -1332,7 +1332,7 @@ impl Server {
             if let crate::pane::Content::Preview(_) = &pane.content {
                 continue;
             }
-            if pane.exit_code.is_some() {
+            if pane.exit_code.is_some() || pane.spec.login.is_some() {
                 continue;
             }
             if let crate::pane::Content::Term(t) = &mut pane.content

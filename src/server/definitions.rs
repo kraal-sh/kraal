@@ -521,7 +521,12 @@ impl Server {
                     focus: i == ws.active,
                     cwd: None,
                     root,
-                    floating: t.floating.iter().map(|f| to_def(f.pane, t.focus == Some(f.pane))).collect(),
+                    floating: t
+                        .floating
+                        .iter()
+                        .filter(|f| self.panes.get(&f.pane).is_none_or(|p| p.spec.login.is_none()))
+                        .map(|f| to_def(f.pane, t.focus == Some(f.pane)))
+                        .collect(),
                 }
             })
             .collect();

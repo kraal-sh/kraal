@@ -135,6 +135,19 @@ pub struct Account {
     /// The user's own text, which kraal keeps when it rewrites the file.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
+    /// A login was started but has not yet been verified by the agent.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub sign_in_required: bool,
+}
+
+impl Account {
+    pub fn same_home(&self, other: &Account) -> bool {
+        let home = |a: &Account| {
+            let path = paths::expand_tilde(&a.home);
+            std::fs::canonicalize(&path).unwrap_or(path)
+        };
+        self.agent == other.agent && home(self) == home(other)
+    }
 }
 
 /// Which accounts to use, in order, for a workspace or a directory.
@@ -342,6 +355,7 @@ impl Accounts {
                         home: kind.default_home.into(),
                         threshold: None,
                         note: None,
+                        sign_in_required: false,
                     },
                 );
             }
@@ -361,6 +375,21 @@ impl Accounts {
 
     pub fn get(&self, agent: &str, name: &str) -> Option<Account> {
         self.for_agent(agent).into_iter().find(|a| a.name == name)
+    }
+
+    pub fn set_sign_in_required(&mut self, account: &Account, required: bool) {
+        let mut found = false;
+        for a in &mut self.accounts {
+            if a.same_home(account) {
+                a.sign_in_required = required;
+                found = true;
+            }
+        }
+        if required && !found {
+            let mut account = account.clone();
+            account.sign_in_required = true;
+            self.accounts.push(account);
+        }
     }
 
     /// The account whose home is `home` (used to tell which account a status line belongs to).
@@ -1160,6 +1189,22 @@ pub fn carry_conversation(from: &Account, to: &Account, session: &str) -> Result
     Ok(true)
 }
 
+/// The lock lives in the home so aliases and other kraal sessions share it.
+pub fn lock_login(a: &Account) -> Result<std::sync::Arc<std::fs::File>> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let home = paths::expand_tilde(&a.home);
+    std::fs::create_dir_all(&home)?;
+    let lock = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(home.join(format!(".kraal-{}-login.lock", a.agent)))?;
+    anyhow::ensure!(paths::try_lock(&lock)?, "{}: sign-in already running", label(a));
+    Ok(std::sync::Arc::new(lock))
+}
+
 /// The agent's own login command for an account.
 pub fn login(a: &Account) -> Result<Launch> {
     let kind = agent_kind(&a.agent).context("unknown agent")?;
@@ -1547,6 +1592,7 @@ mod tests {
             home: home.display().to_string(),
             threshold: None,
             note: None,
+            sign_in_required: false,
         };
         assert_eq!(conversation_exists(&a, "abc").unwrap(), Some(false));
         std::fs::create_dir_all(home.join("projects/-home-me")).unwrap();
@@ -1586,7 +1632,68 @@ mod tests {
     }
 
     fn acct(agent: &str, name: &str, home: &str) -> Account {
-        Account { name: name.into(), agent: agent.into(), home: home.into(), threshold: None, note: None }
+        Account {
+            name: name.into(),
+            agent: agent.into(),
+            home: home.into(),
+            threshold: None,
+            note: None,
+            sign_in_required: false,
+        }
+    }
+
+    #[test]
+    fn unfinished_sign_in_survives_reload_and_verification_clears_only_its_home() {
+        let dir = std::env::temp_dir().join(format!("kraal-sign-in-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("accounts.toml");
+        let a = acct("claude", "work", dir.to_str().unwrap());
+        let alias = Account { name: "alias".into(), ..a.clone() };
+        let other = acct("codex", "work", dir.to_str().unwrap());
+        let mut all = Accounts::load_from(&path).unwrap();
+        all.add(a.clone()).unwrap();
+        all.add(alias).unwrap();
+        all.add(other).unwrap();
+        all.save().unwrap();
+        let original = std::fs::read_to_string(&path).unwrap();
+        assert!(!original.contains("sign_in_required"));
+        Accounts::update_at(&path, |all| {
+            all.set_sign_in_required(&a, true);
+            Ok(())
+        })
+        .unwrap();
+        let mut loaded = Accounts::load_from(&path).unwrap();
+        assert!(loaded.get("claude", "work").unwrap().sign_in_required);
+        assert!(loaded.get("claude", "alias").unwrap().sign_in_required);
+        assert!(!loaded.get("codex", "work").unwrap().sign_in_required);
+        loaded.set_sign_in_required(&a, false);
+        loaded.save().unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        loaded.remove("claude", "work");
+        loaded.remove("claude", "alias");
+        loaded.set_sign_in_required(&a, false);
+        assert!(loaded.get("claude", "work").is_none(), "a late check must not recreate a removed account");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn the_same_sign_in_is_recognized_through_a_directory_alias() {
+        let dir = std::env::temp_dir().join(format!("kraal-sign-in-alias-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("home")).unwrap();
+        std::os::unix::fs::symlink(dir.join("home"), dir.join("alias")).unwrap();
+        let a = acct("claude", "work", dir.join("home").to_str().unwrap());
+        let b = acct("claude", "renamed", dir.join("alias").to_str().unwrap());
+        assert!(a.same_home(&b));
+        assert!(!a.same_home(&Account { agent: "codex".into(), ..b }));
+        let alias = acct("claude", "alias", dir.join("alias").to_str().unwrap());
+        let held = lock_login(&a).unwrap();
+        assert!(lock_login(&alias).unwrap_err().to_string().contains("sign-in already running"));
+        let waiter = held.clone();
+        drop(held);
+        assert!(lock_login(&alias).is_err(), "a closed pane's waiter still holds the login");
+        drop(waiter);
+        drop(lock_login(&alias).unwrap());
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     fn accounts() -> Accounts {

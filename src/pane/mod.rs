@@ -23,6 +23,7 @@ mod commands;
 mod fuzz;
 mod guard;
 mod history;
+mod login;
 mod osc;
 mod pty;
 mod screen;
@@ -34,6 +35,7 @@ pub use spawn::{batch, batching, close_inherited, open_descriptors, reserve_desc
 
 pub use cache::ScreenCache;
 pub use commands::{Finished, short_duration};
+pub use login::{Login, LoginAction, LoginState};
 use osc::sanitize_title;
 use osc::{Osc, OscScanner};
 pub use osc::{osc_notify, osc52};
@@ -119,6 +121,9 @@ fn reset_sequence(cols: u16) -> Vec<u8> {
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 pub struct PaneSpec {
+    /// Login panes and their output are never restored.
+    #[serde(skip)]
+    pub login: Option<Login>,
     /// Empty = the user's shell.
     pub command: Vec<String>,
     pub cwd: Option<PathBuf>,
@@ -513,6 +518,9 @@ impl Pane {
         let mut start = 0;
         for (end, osc) in t.osc.scan(bytes) {
             self.oscs = self.oscs.wrapping_add(1);
+            if self.spec.login.is_some() && !matches!(osc, Osc::Query) {
+                continue;
+            }
             match osc {
                 Osc::Notify { title, body } => signals.push(PaneSignal::Notification { title, body }),
                 Osc::Cwd { host, path } => {
@@ -674,6 +682,9 @@ impl Pane {
         let Content::Term(t) = &mut self.content else { return };
         t.answer_queries();
         let events: Vec<TermEvent> = t.events.borrow_mut().drain(..).collect();
+        if self.spec.login.is_some() {
+            return;
+        }
         for ev in events {
             match ev {
                 TermEvent::Title(s) => {

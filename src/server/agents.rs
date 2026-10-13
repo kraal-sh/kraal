@@ -8,10 +8,11 @@ use anyhow::{Context, Result, bail};
 
 use super::ui::{ConfirmAction, Mode, PickAction, PickItem, Picker, PickerKind};
 use super::{ClientId, Server};
+use crate::account_status::{self, Status};
 use crate::accounts::{self, Account, Accounts, Mode as LimitMode, UsageMap};
 use crate::agent::AgentState;
 use crate::layout::PaneId;
-use crate::pane::PaneSpec;
+use crate::pane::{Login, LoginState, PaneSpec};
 use crate::protocol::Placement;
 
 /// What kraal last did about a pane being over its threshold, so it does not repeat itself.
@@ -454,6 +455,7 @@ impl Server {
             for a in self.accounts.for_agent(kind.name) {
                 let u = self.usage.get(&a);
                 let mut detail = match u {
+                    _ if a.sign_in_required => "sign-in required".to_string(),
                     Some(u) => usage_text(u, now),
                     None => "no usage seen yet".to_string(),
                 };
@@ -516,6 +518,7 @@ impl Server {
             home: home.display().to_string(),
             threshold: None,
             note: None,
+            sign_in_required: true,
         };
         Accounts::update(|all| {
             all.add(a.clone())?;
@@ -526,10 +529,117 @@ impl Server {
     }
 
     pub(super) fn open_login(&mut self, client: ClientId, a: &Account) -> Result<()> {
+        if let Some(id) =
+            self.panes.values().find_map(|p| p.spec.login.as_ref().filter(|l| l.account.same_home(a)).map(|_| p.id))
+        {
+            self.reveal(client, id);
+            return Ok(());
+        }
         let l = accounts::login(a)?;
         let ws = self.clients.get(&client).map(|c| c.workspace).context("no client")?;
-        let spec = PaneSpec { command: l.argv, env: l.env, env_remove: l.env_remove, ..Default::default() };
+        let lock = accounts::lock_login(a)?;
+        Accounts::update(|all| {
+            all.set_sign_in_required(a, true);
+            Ok(())
+        })?;
+        self.reload_accounts();
+        let spec = PaneSpec {
+            command: l.argv,
+            env: l.env,
+            env_remove: l.env_remove,
+            login: Some(Login { account: a.clone(), state: LoginState::Running, lock: Some(lock) }),
+            ..Default::default()
+        };
         self.spawn_pane_in(ws, None, spec, Placement::Floating, Some(format!("login {}", accounts::label(a))))?;
+        Ok(())
+    }
+
+    pub(super) fn login_exited(&mut self, id: PaneId, code: Option<i32>) {
+        let Some(pane) = self.panes.get_mut(&id) else { return };
+        let Some(login) = &mut pane.spec.login else { return };
+        pane.exit_code = Some(code);
+        let was_running = login.state == LoginState::Running;
+        login.state = login.state.exited(code);
+        if was_running && login.state == LoginState::Checking {
+            if self.check_login(id).is_err() {
+                self.login_checked(id, Status::CouldNotCheck);
+            }
+        } else if login.state != LoginState::Checking {
+            login.lock = None;
+        }
+        self.mark_dirty();
+    }
+
+    pub(super) fn check_login(&mut self, id: PaneId) -> Result<()> {
+        let Some(login) = self.panes.get_mut(&id).and_then(|p| p.spec.login.as_mut()) else { return Ok(()) };
+        if login.lock.is_none() {
+            login.lock = Some(accounts::lock_login(&login.account)?);
+        }
+        login.state = LoginState::Checking;
+        let account = login.account.clone();
+        if !self.background(
+            move || account_status::check(&account),
+            move |server, status| {
+                server.login_checked(id, status);
+            },
+        ) {
+            self.login_checked(id, Status::CouldNotCheck);
+        }
+        self.mark_dirty();
+        Ok(())
+    }
+
+    fn login_checked(&mut self, id: PaneId, status: Status) {
+        let Some(login) = self.panes.get_mut(&id).and_then(|p| p.spec.login.as_mut()) else { return };
+        // Closing or cancelling a check must not publish its late result.
+        if login.state != LoginState::Checking {
+            return;
+        }
+        login.state = LoginState::Checked(status);
+        if status == Status::SignedIn {
+            let account = login.account.clone();
+            if Accounts::update(|all| {
+                all.set_sign_in_required(&account, false);
+                Ok(())
+            })
+            .is_err()
+            {
+                login.state = LoginState::SaveFailed;
+                login.lock = None;
+            } else {
+                self.reload_accounts();
+                self.close_pane(id);
+                let message = format!("{} is signed in", accounts::label(&account));
+                for client in self.clients.keys().copied().collect::<Vec<_>>() {
+                    self.toast(client, &message);
+                }
+            }
+        } else {
+            login.lock = None;
+        }
+        self.mark_dirty();
+    }
+
+    pub(super) fn retry_login(&mut self, id: PaneId) -> Result<()> {
+        let Some(login) = self.panes.get(&id).and_then(|p| p.spec.login.as_ref()) else { return Ok(()) };
+        let account = login.account.clone();
+        let lock = accounts::lock_login(&account)?;
+        Accounts::update(|all| {
+            all.set_sign_in_required(&account, true);
+            Ok(())
+        })?;
+        self.reload_accounts();
+        let Some(pane) = self.panes.get_mut(&id) else { return Ok(()) };
+        let Some(login) = &mut pane.spec.login else { return Ok(()) };
+        login.lock = Some(lock);
+        login.state = LoginState::Running;
+        if pane.respawn(&self.env, &self.tx).is_err() {
+            let login = pane.spec.login.as_mut().unwrap();
+            login.state = login_start_failed(&pane.spec.command);
+            login.lock = None;
+        }
+        self.mark_dirty();
+        self.relayout();
         Ok(())
     }
 
@@ -568,6 +678,14 @@ impl Server {
         if let Err(e) = polling {
             self.warnings.push(format!("cannot ask Codex for its limits: {e}"));
         }
+    }
+}
+
+pub(super) fn login_start_failed(command: &[String]) -> LoginState {
+    if command.first().is_some_and(|c| crate::transfer::have_program(c)) {
+        LoginState::Failed
+    } else {
+        LoginState::Checked(Status::NotInstalled)
     }
 }
 

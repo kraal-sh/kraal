@@ -161,11 +161,13 @@ pub fn snapshot(server: &Server) -> SessionSnapshot {
                 .tabs
                 .iter()
                 .map(|t| {
-                    // A paste buffer shown in a window is not saved: it may hold a secret.
+                    // Login panes and shown paste buffers may hold secrets and must not return.
                     let floating: Vec<&crate::server::Floating> = t
                         .floating
                         .iter()
-                        .filter(|f| !server.panes.get(&f.pane).is_some_and(|p| p.shows_text()))
+                        .filter(|f| {
+                            !server.panes.get(&f.pane).is_some_and(|p| p.shows_text() || p.spec.login.is_some())
+                        })
                         .collect();
                     let mut kept = t.root.as_ref().map(|r| r.leaves()).unwrap_or_default();
                     kept.extend(floating.iter().map(|f| f.pane));

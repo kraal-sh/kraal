@@ -351,7 +351,16 @@ impl TermPane {
             process: Arc::new(Process::default()),
             reader_stop: io.stop,
             writer_stop: io.writer_stop,
-            pending: Some((launch, Waiter { id, tx: tx.clone(), eof: io.eof, what })),
+            pending: Some((
+                launch,
+                Waiter {
+                    id,
+                    tx: tx.clone(),
+                    eof: io.eof,
+                    what,
+                    login_lock: spec.login.as_ref().and_then(|l| l.lock.clone()),
+                },
+            )),
             here: Arc::new(()),
             osc: OscScanner::default(),
             guard: KeyboardStackGuard::default(),
@@ -670,12 +679,14 @@ struct Waiter {
     eof: crossbeam_channel::Receiver<()>,
     /// The program, as errors name it.
     what: String,
+    /// Closing the pane must not release its login until the program has actually ended.
+    login_lock: Option<Arc<std::fs::File>>,
 }
 
 /// The program `started` (or not) is `process`'s: watch it end. A failure leaves nothing
 /// running.
 fn watch(process: &Arc<Process>, waiting: Waiter, started: Result<PaneChild>) -> Result<()> {
-    let Waiter { id, tx, eof, what } = waiting;
+    let Waiter { id, tx, eof, what, login_lock } = waiting;
     process.started(started.with_context(|| format!("starting {what:?}"))?);
     let waited = process.clone();
     let started = crate::threads::named(format!("pane-{id}-wait")).spawn(move || {
@@ -684,6 +695,7 @@ fn watch(process: &Arc<Process>, waiting: Waiter, started: Result<PaneChild>) ->
         // Report the exit after the last output, so waits and logs see all of it. A program
         // left in the background can keep the terminal open: then do not wait forever.
         let _ = eof.recv_timeout(std::time::Duration::from_secs(2));
+        drop(login_lock);
         let _ = tx.send(Event::PaneExited(id, waited.pid(), code));
     });
     if let Err(e) = started {

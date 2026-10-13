@@ -28,6 +28,8 @@ a workspace file that is not running can only be opened.
   rendered Markdown, an image, text, or a directory listing. Previews reload when the file changes.
 - A **command pane** stays open when its program exits, showing the exit code: press Enter to run
   it again (handy when an SSH connection drops) or `x` to close it.
+- An account's **login pane** closes after successful sign-in is verified. After failure or
+  cancellation, Enter closes it; only the labelled `r` action tries the login again.
 
 | Command | |
 |---|---|
@@ -105,6 +107,9 @@ comes back with the text from before it started. kraal saves this text when the 
 every 10 seconds or so while a pane prints, so a crash loses little. A pane whose text could not be
 written (a full disk) is saved again later, printing or not, and `kraal kill` says when it still
 could not be.
+
+Account login panes are excluded: neither the pane nor its scrollback is saved or restored.
+Their account entries stay, marked **sign-in required** until sign-in is verified.
 
 This text is written to disk, readable by you alone, in `~/.local/state/kraal/scrollback/<session>/`,
 and it can hold secrets (a token printed by a command, a password echoed by mistake):

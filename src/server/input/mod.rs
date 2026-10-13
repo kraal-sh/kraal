@@ -444,6 +444,28 @@ impl Server {
             return self.files_key(id, p, k);
         }
         pane.clear_selection();
+        if let Some(login) = &mut pane.spec.login {
+            if pane.exit_code.is_some() {
+                match login.state.action(k) {
+                    Some(crate::pane::LoginAction::Close) => self.close_pane(p),
+                    Some(action @ (crate::pane::LoginAction::Retry | crate::pane::LoginAction::Check)) => {
+                        let result = if action == crate::pane::LoginAction::Retry {
+                            self.retry_login(p)
+                        } else {
+                            self.check_login(p)
+                        };
+                        if let Err(e) = result {
+                            self.toast(id, format!("{e:#}"));
+                        }
+                    }
+                    None => {}
+                }
+                return Mode::Normal;
+            }
+            if k.code == KeyCode::Char('c') && k.mods.ctrl {
+                login.state = crate::pane::LoginState::Cancelled;
+            }
+        }
         if pane.exit_code.is_some() {
             match (k.code, k.mods.ctrl) {
                 (KeyCode::Enter, _) | (KeyCode::Char('r'), false) if pane.spec.pending_agent.is_some() => {
