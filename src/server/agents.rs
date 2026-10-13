@@ -167,15 +167,17 @@ impl Server {
                         p.cursor,
                         p.current().map(|i| i.label.clone()),
                         p.message.clone(),
+                        p.min_items,
                     ))
                 } else {
                     None
                 }
             })
             .collect();
-        for (id, kind, query, cursor, selected, message) in clients {
+        for (id, kind, query, cursor, selected, message, min_items) in clients {
             let mut p =
                 if kind == PickerKind::Accounts { self.accounts_picker(None) } else { self.agent_picker(id, None) };
+            p.min_items = p.min_items.max(min_items);
             p.message = message;
             p.query = query;
             p.cursor = cursor;
@@ -1169,6 +1171,143 @@ pub fn usage_text(u: &accounts::Usage, now: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn finishing_discovery_keeps_the_clicked_account_in_place() {
+        for (cols, rows) in [(80, 24), (124, 36)] {
+            for finished in [&["claude"][..], &["codex"], &["claude", "codex"], &["codex", "claude"]] {
+                let (tx, _) = super::super::queue::channel(16);
+                let mut server = super::super::tests::server(tx);
+                let (client, _peer) = super::super::tests::client(&mut server);
+                let c = server.clients.get_mut(&client).unwrap();
+                c.cols = cols;
+                c.rows = rows;
+                let [_, second] = ["work", "second"].map(|name| {
+                    server
+                        .accounts
+                        .add(Account {
+                            id: accounts::new_uuid(),
+                            agent: "codex".into(),
+                            name: name.into(),
+                            home: format!("/nonexistent/{name}"),
+                            threshold: None,
+                            note: None,
+                            sign_in_required: false,
+                            review: false,
+                            public_identity: None,
+                            linked_to: None,
+                            references: Vec::new(),
+                        })
+                        .unwrap()
+                });
+                for agent in ["claude", "codex"] {
+                    server.existing_checks.insert(agent.into(), ExistingCheck::Checking);
+                }
+                let picker = server.accounts_picker(None);
+                let layout = super::super::overlays::picker_layout(&picker, server.client_screen(client));
+                let mut buffer = ratatui::buffer::Buffer::empty(server.client_screen(client));
+                super::super::overlays::draw_picker(&picker, buffer.area, &mut buffer);
+                let (col, row) = (layout.list.x + 2, layout.list.y + 2);
+                let label: String = (col..col + 14).map(|x| buffer[(x, row)].symbol()).collect();
+                assert_eq!(label, "Codex · second");
+                server.clients.get_mut(&client).unwrap().mode = Mode::Picker(picker);
+                // The user clicks the row they saw while the background checks finish.
+                for &agent in finished {
+                    server.existing_checks.insert(agent.into(), ExistingCheck::Checked(Status::NotSignedIn));
+                    server.refresh_agent_pickers();
+                }
+                server.client_input(client, format!("\x1b[<0;{};{}M", col + 1, row + 1).as_bytes());
+                let Mode::AccountDetails(details) = &server.clients[&client].mode else {
+                    panic!("the click did not open details");
+                };
+                assert_eq!(details.account, second.id, "{cols}x{rows}: the clicked row changed accounts");
+                server.client_input(client, b"\t\r");
+                let Mode::Prompt(prompt) = &server.clients[&client].mode else {
+                    panic!("Rename did not open");
+                };
+                assert_eq!(prompt.title, "Rename Codex · second");
+            }
+        }
+    }
+
+    #[test]
+    fn account_discovery_starts_each_check_once_and_handles_results_without_a_tick() {
+        use super::super::{Event, queue::Wait};
+
+        for reverse in [false, true] {
+            let (tx, rx) = super::super::queue::channel(16);
+            let mut server = super::super::tests::server(tx);
+            server.check_existing_accounts();
+            assert_eq!(server.jobs.len(), accounts::AGENTS.len());
+            assert!(server.existing_checks.values().all(|s| *s == ExistingCheck::Checking));
+            server.refresh_existing_accounts();
+            assert_eq!(server.jobs.len(), accounts::AGENTS.len(), "opening Accounts shares the pending checks");
+
+            // The isolated PATH has neither agent. Keep their completed jobs, not a status
+            // subprocess racing its watchdog, and deliver them in each order.
+            let mut results = Vec::new();
+            for _ in accounts::AGENTS {
+                let Wait::Event(Event::Job(id, result)) = rx.wait(crate::testing::PATIENCE) else {
+                    panic!("the check did not publish its result");
+                };
+                results.push((id, result));
+            }
+            results.sort_by_key(|(id, _)| *id);
+            if reverse {
+                results.reverse();
+            }
+            let (client, _peer) = super::super::tests::client(&mut server);
+            server.clients.get_mut(&client).unwrap().mode = Mode::Picker(server.accounts_picker(None));
+            let last_tick = server.last_tick;
+            for (i, (id, result)) in results.into_iter().enumerate() {
+                server.handle(Event::Job(id, result));
+                assert_eq!(server.jobs.len(), accounts::AGENTS.len() - i - 1);
+                assert_eq!(
+                    server
+                        .existing_checks
+                        .values()
+                        .filter(|s| **s == ExistingCheck::Checked(Status::NotInstalled))
+                        .count(),
+                    i + 1,
+                    "each result is published while the other is still pending"
+                );
+                let Mode::Picker(picker) = &server.clients[&client].mode else { panic!("Accounts stays open") };
+                for (agent, state) in &server.existing_checks {
+                    let item = picker.items.iter().find(|item| item.label == accounts::existing_label(agent));
+                    if *state == ExistingCheck::Checking {
+                        assert_eq!(item.unwrap().detail, "Checking sign-in");
+                    } else {
+                        assert!(item.is_none(), "a completed missing agent no longer shows as checking");
+                    }
+                }
+                if i == 0 {
+                    server.handle(Event::Warning("server-responsive".into()));
+                    assert_eq!(server.warnings, ["server-responsive"]);
+                }
+            }
+            assert!(server.jobs.is_empty());
+            assert!(server.existing_checks.values().all(|s| *s == ExistingCheck::Checked(Status::NotInstalled)));
+            assert_eq!(server.last_tick, last_tick);
+            assert!(server.panes.is_empty(), "discovery never starts a login");
+        }
+    }
+
+    #[test]
+    fn a_verified_account_opens_review_without_rechecking_or_waiting_for_another_agent() {
+        let mut t = SwitchTest::new("review-checked");
+        let original = t.server.accounts.get("claude", "default").unwrap();
+        t.server.accounts.adopt_checked(&original, None).unwrap();
+        t.server.existing_checks.insert("codex".into(), ExistingCheck::Checking);
+        for _ in 0..3 {
+            t.server.refresh_existing_accounts();
+            let picker = t.server.accounts_picker(None);
+            let item = picker.items.iter().find(|i| matches!(i.action, PickAction::ReviewAccount(_))).unwrap();
+            assert_eq!(item.detail, "Review");
+            let Mode::Picker(review) = t.server.pick(99, &picker, item.clone()) else { panic!("review") };
+            assert!(review.kind == PickerKind::AccountReview);
+            assert!(t.server.jobs.is_empty(), "a verified home needs no new status command to open Review");
+        }
+    }
 
     #[test]
     fn review_questions_and_confirmations_fit_both_terminal_sizes() {

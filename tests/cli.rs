@@ -149,9 +149,95 @@ struct RawClient {
     messages: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
     /// Its terminal's columns and rows.
     size: (usize, usize),
+    trace: Option<std::cell::RefCell<Vec<ClientStep>>>,
+}
+
+struct ClientStep {
+    at: Instant,
+    drawn: usize,
+    size: (usize, usize),
+    action: ClientAction,
+}
+
+enum ClientAction {
+    Input(Vec<u8>),
+    Observed(String),
 }
 
 impl RawClient {
+    /// Keep input and screen offsets cheaply; replay them only if the test fails.
+    fn traced(mut self) -> Self {
+        self.trace = Some(Default::default());
+        self.trace_step(ClientAction::Observed("attached".into()));
+        self
+    }
+
+    fn trace_step(&self, action: ClientAction) {
+        let drawn = self.screen.lock().unwrap().len();
+        self.trace_step_at(drawn, action);
+    }
+
+    fn trace_step_at(&self, drawn: usize, action: ClientAction) {
+        if let Some(trace) = &self.trace {
+            trace.borrow_mut().push(ClientStep { at: Instant::now(), drawn, size: self.size, action });
+        }
+    }
+
+    fn print_trace(&self) {
+        let Some(trace) = &self.trace else { return };
+        let trace = trace.borrow();
+        let bytes = self.screen.lock().unwrap().clone();
+        let show = |drawn, size: (usize, usize)| {
+            let rows = text_after(&bytes[..drawn], size.0, size.1);
+            for (y, row) in rows.iter().enumerate() {
+                eprintln!("{:2} {row}", y + 1);
+            }
+            rows
+        };
+        eprintln!("Client trace (mouse coordinates and screen rows are 1-based):");
+        for (i, step) in trace.iter().enumerate() {
+            eprintln!(
+                "Step {i}, +{:?}, {}x{}, {} bytes drawn",
+                step.at - trace[0].at,
+                step.size.0,
+                step.size.1,
+                step.drawn
+            );
+            match &step.action {
+                ClientAction::Observed(what) => {
+                    eprintln!("Observed: {what}");
+                    show(step.drawn, step.size);
+                }
+                ClientAction::Input(input) => {
+                    eprintln!("Before input: {}", input.escape_ascii());
+                    let rows = show(step.drawn, step.size);
+                    // SGR mouse reports, including both the press and release of a click.
+                    for report in input.split(|b| *b == 0x1b).filter_map(|s| s.strip_prefix(b"[<")) {
+                        if let Some(end) = report.iter().position(|b| *b == b'M' || *b == b'm') {
+                            let fields: Vec<usize> = String::from_utf8_lossy(&report[..end])
+                                .split(';')
+                                .filter_map(|s| s.parse().ok())
+                                .collect();
+                            if let [button, col, row] = fields.as_slice() {
+                                let text = row.checked_sub(1).and_then(|y| rows.get(y));
+                                eprintln!(
+                                    "Mouse {} button={button} column={col} row={row}, row text: {text:?}",
+                                    if report[end] == b'M' { "press" } else { "release" }
+                                );
+                            }
+                        }
+                    }
+                    // The next observation/input marks how far the test let this input run.
+                    let next = trace.get(i + 1);
+                    eprintln!("After input (at next step, or failure):");
+                    show(next.map_or(bytes.len(), |s| s.drawn), next.map_or(self.size, |s| s.size));
+                }
+            }
+        }
+        eprintln!("Screen at failure:");
+        show(bytes.len(), self.size);
+    }
+
     fn attach(env: &Env, workspace: &str) -> RawClient {
         RawClient::attach_installed(env, workspace, None)
     }
@@ -199,12 +285,13 @@ impl RawClient {
                 }
             }
         });
-        RawClient { stream, screen, messages, size }
+        RawClient { stream, screen, messages, size, trace: None }
     }
 
     /// Its terminal takes another size: the server draws the whole screen again.
     fn resize(&mut self, size: (usize, usize)) {
         self.size = size;
+        self.trace_step(ClientAction::Observed(format!("resize to {}x{}", size.0, size.1)));
         let (cols, rows) = size;
         raw_frame(&mut self.stream, 0, format!(r#"{{"type":"resize","cols":{cols},"rows":{rows}}}"#).as_bytes());
     }
@@ -216,10 +303,14 @@ impl RawClient {
             assert!(start.elapsed() < PATIENCE, "{text:?} never sent: {:?}", self.messages.lock().unwrap());
             std::thread::sleep(Duration::from_millis(50));
         }
+        self.trace_step(ClientAction::Observed(format!("message {text:?}")));
     }
 
     /// Bytes as the terminal sends them, one read each.
     fn send(&mut self, bytes: &[u8]) {
+        if self.trace.is_some() {
+            self.trace_step(ClientAction::Input(bytes.to_vec()));
+        }
         raw_frame(&mut self.stream, 1, bytes);
     }
 
@@ -238,6 +329,7 @@ impl RawClient {
             assert!(start.elapsed() < PATIENCE, "{text:?} never shown");
             std::thread::sleep(Duration::from_millis(50));
         }
+        self.trace_step(ClientAction::Observed(format!("screen contains {text:?}")));
     }
 }
 
@@ -246,6 +338,9 @@ impl Drop for RawClient {
         // The thread that keeps what the server sends holds the connection too: closed for both,
         // so that the server sees this client go when the test lets go of it.
         let _ = self.stream.shutdown(std::net::Shutdown::Both);
+        if std::thread::panicking() {
+            self.print_trace();
+        }
     }
 }
 
@@ -5036,7 +5131,10 @@ fn account_rules_see_a_worktree_anywhere_as_its_repository() {
     // A stand-in for claude that says which config home it was given.
     let bin = env.root.join("bin");
     std::fs::create_dir_all(&bin).unwrap();
-    write_script(&bin.join("claude"), "#!/bin/sh\necho \"home=${CLAUDE_CONFIG_DIR:-default}\"\nexec sleep 100\n");
+    write_script(
+        &bin.join("claude"),
+        "#!/bin/sh\n[ \"$2\" = status ] && exit 1\necho \"home=${CLAUDE_CONFIG_DIR:-default}\"\nexec sleep 100\n",
+    );
     let pro = env.root.join("pro-home");
     std::fs::create_dir_all(&pro).unwrap();
     let repo = std::fs::canonicalize(&repo).unwrap();
@@ -5111,7 +5209,10 @@ fn an_agent_waiting_for_its_account_waits_again_after_a_restart() {
     git(&["worktree", "add", "-q", "-b", "feature", feature.to_str().unwrap()]);
     let bin = env.root.join("bin");
     std::fs::create_dir_all(&bin).unwrap();
-    write_script(&bin.join("claude"), "#!/bin/sh\necho \"home=${CLAUDE_CONFIG_DIR:-default}\"\nexec sleep 100\n");
+    write_script(
+        &bin.join("claude"),
+        "#!/bin/sh\n[ \"$2\" = status ] && exit 1\necho \"home=${CLAUDE_CONFIG_DIR:-default}\"\nexec sleep 100\n",
+    );
     // A git that hangs on the question kraal asks while `slow` exists: the agent cannot get its
     // account before the session is stopped.
     let real_git =
@@ -6231,7 +6332,8 @@ fn terminal_after(bytes: &[u8], cols: usize, rows: usize) -> Vec<String> {
 impl RawClient {
     /// The text of each row its terminal shows.
     fn rows(&self) -> Vec<String> {
-        text_after(&self.screen.lock().unwrap(), self.size.0, self.size.1)
+        let bytes = self.screen.lock().unwrap().clone();
+        text_after(&bytes, self.size.0, self.size.1)
     }
 
     /// The text of each row its terminal showed after the first frame drawn for it.
@@ -6262,8 +6364,10 @@ impl RawClient {
     fn wait_for_rows(&self, what: &str, done: impl Fn(&[String]) -> bool) -> Vec<String> {
         let start = Instant::now();
         loop {
-            let rows = self.rows();
+            let bytes = self.screen.lock().unwrap().clone();
+            let rows = text_after(&bytes, self.size.0, self.size.1);
             if done(&rows) {
+                self.trace_step_at(bytes.len(), ClientAction::Observed(what.into()));
                 return rows;
             }
             assert!(start.elapsed() < Duration::from_secs(10), "never {what}:\n{}", rows.join("\n"));
@@ -6329,8 +6433,12 @@ impl RawClient {
         let start = Instant::now();
         loop {
             std::thread::sleep(Duration::from_millis(300));
-            let now = self.screen.lock().unwrap().len();
-            if now == seen {
+            let (now, framed) = {
+                let screen = self.screen.lock().unwrap();
+                (screen.len(), screen.windows(8).any(|w| w == b"\x1b[?2026l"))
+            };
+            // A new connection can be quiet before its first frame arrives.
+            if now == seen && framed {
                 return now;
             }
             seen = now;
@@ -7177,7 +7285,7 @@ fn choosing_the_current_account_keeps_running_and_exited_panes_as_they_are() {
         let pane_id: u32 = pane.parse().unwrap();
         env.wait_for_text(&pane, "READY");
         let starts = std::fs::read_to_string(env.root.join("home/starts")).unwrap();
-        let mut client = RawClient::attach_sized(&env, Some("w"), size);
+        let mut client = RawClient::attach_sized(&env, Some("w"), size).traced();
         for exited in [false, true] {
             client.send(b"\x02Ac\x1b[B");
             let rows = client.wait_for_row("⏎ keep current account");
@@ -7258,16 +7366,9 @@ exec sleep 100
         let id: u64 = id.parse().unwrap();
         panes.as_array().unwrap().iter().find(|p| p["id"] == id).unwrap().clone()
     };
-    let until = |what: &str, ok: &dyn Fn() -> bool| {
-        let start = Instant::now();
-        while !ok() {
-            assert!(start.elapsed() < Duration::from_secs(10), "never: {what}");
-            std::thread::sleep(Duration::from_millis(50));
-        }
-    };
     let on_alpha = format!("home={}", alpha.display());
     let on_beta = format!("home={}", beta.display());
-    let mut client = RawClient::attach(&env, "w");
+    let mut client = RawClient::attach(&env, "w").traced();
 
     // 1. An option kraal does not know, then a word: its value, or a prompt. Switching stops the
     // agent and prepares it on the other account, but shows the command: Enter runs it.
@@ -7275,13 +7376,13 @@ exec sleep 100
     env.wait_for_text(&odd, &on_alpha);
     env.run(&["focus", &odd]);
     client.send(b"\x02Ac");
-    client.wait_for_screen("beta");
+    client.wait_for_row("Change account");
     client.send(b"beta");
-    std::thread::sleep(Duration::from_millis(200));
+    client.wait_for_row("1/");
     client.send(b"\r");
     client.wait_for_row("Stop and switch?");
     client.send(b"y");
-    until("the switched agent waits", &|| info(&odd)["suspended"] == true);
+    wait_until(Duration::from_secs(10), "the switched agent waits", || info(&odd)["suspended"] == true);
     let screen = env.wait_for_text(&odd, "cannot tell");
     assert!(!screen.contains(&on_beta), "it ran by itself: {screen}");
     client.send(b"\r");
@@ -7303,18 +7404,22 @@ exec sleep 100
     std::fs::set_permissions(beta.join("projects/-work"), std::fs::Permissions::from_mode(0o555)).unwrap();
     env.run(&["focus", &plain]);
     client.send(b"\x02Ac");
-    client.wait_for_screen("beta");
+    client.wait_for_row("Change account");
     client.send(b"beta");
-    std::thread::sleep(Duration::from_millis(200));
+    client.wait_for_row("1/");
     client.send(b"\r");
     client.wait_for_row("Stop and switch?");
     client.send(b"y");
-    until("the failed switch leaves the agent ended", &|| !info(&plain)["exit_code"].is_null());
+    wait_until(Duration::from_secs(10), "the failed switch leaves the agent ended", || {
+        !info(&plain)["exit_code"].is_null()
+    });
     assert_eq!(info(&plain)["suspended"], false);
     client.send(b"\r");
     // Lines may wrap in the pane: compare without line ends.
     let resumed = format!("{on_alpha} args=--resume {session} --verbose");
-    until("it resumes on alpha", &|| env.run(&["read", "-p", &plain]).replace('\n', "").contains(&resumed));
+    wait_until(Duration::from_secs(10), "it resumes on alpha", || {
+        env.run(&["read", "-p", &plain]).replace('\n', "").contains(&resumed)
+    });
     assert!(!env.run(&["read", "-p", &plain]).replace('\n', "").contains(&on_beta));
     std::fs::set_permissions(beta.join("projects/-work"), std::fs::Permissions::from_mode(0o755)).unwrap();
 }
@@ -7379,7 +7484,7 @@ fn choose_switch_target(client: &mut RawClient, effect: &str) {
     client.wait_for_row("Change account");
     client.send(b"beta");
     client.wait_for_rows("the target account's effect", |rows| {
-        rows.iter().any(|r| r.contains("beta") && r.contains(effect))
+        rows.iter().any(|r| r.contains("beta") && r.contains(effect) && !r.contains("checking sign-in"))
     });
     client.send(b"\r");
 }
@@ -7396,7 +7501,7 @@ fn an_unsigned_target_offers_sign_in_without_stopping_the_agent() {
     let env = Env::new("switchlogin");
     let pane = account_switch_agent(&env, "claude", "notify");
     std::fs::write(env.root.join("beta/status"), "1").unwrap();
-    let mut client = RawClient::attach_sized(&env, Some("w"), (80, 24));
+    let mut client = RawClient::attach_sized(&env, Some("w"), (80, 24)).traced();
     choose_switch_target(&mut client, "Sign-in required");
     client.wait_for_row("The current agent keeps running");
     client.send(b"\r");
@@ -7439,7 +7544,7 @@ fn unverified_accounts_and_broken_transcripts_never_stop_the_current_agent() {
                 "each went on"
             }
         };
-        let mut client = RawClient::attach_sized(&env, Some("w"), (124, 36));
+        let mut client = RawClient::attach_sized(&env, Some("w"), (124, 36)).traced();
         choose_switch_target(&mut client, "Could not verify");
         client.wait_for_screen(expected);
         account_still_runs(&env, &pane, reason);
@@ -7460,15 +7565,21 @@ fn cancelling_a_check_from_another_client_ignores_its_late_success() {
     let pane = account_switch_agent(&env, "claude", "notify");
     let hold = env.root.join("beta/hold-check");
     std::fs::write(&hold, "").unwrap();
-    let mut first = RawClient::attach(&env, "w");
-    let mut second = RawClient::attach(&env, "w");
-    choose_switch_target(&mut first, "Could not verify");
+    let mut first = RawClient::attach(&env, "w").traced();
+    let mut second = RawClient::attach(&env, "w").traced();
+    first.send(b"\x02Ac");
+    first.wait_for_row("Change account");
+    first.send(b"beta");
+    first.wait_for_row("checking sign-in");
+    first.send(b"\r");
     wait_until(PATIENCE, "both the picker and change check sign-in", || {
         std::fs::read_to_string(env.root.join("beta/checks")).is_ok_and(|s| s.lines().count() == 2)
     });
     second.send(b"\x02Ac");
     second.wait_for_row("Checking sign-in");
     second.send(b"\r");
+    second
+        .wait_for_rows("the pending change is cancelled", |rows| !rows.iter().any(|r| r.contains("Checking sign-in")));
     std::fs::remove_file(hold).unwrap();
     wait_until(PATIENCE, "both checks returned", || {
         std::fs::read_to_string(env.root.join("beta/checked")).is_ok_and(|s| s.lines().count() == 2)
@@ -7485,8 +7596,8 @@ fn a_switch_waits_for_the_turn_is_cancelled_by_another_client_and_rechecks_sign_
     let env = Env::new("switchturn");
     let pane = account_switch_agent(&env, "claude", "notify");
     claude_hook(&env, &pane, r#"{"hook_event_name":"UserPromptSubmit"}"#);
-    let mut first = RawClient::attach_sized(&env, Some("w"), (124, 36));
-    let mut second = RawClient::attach_sized(&env, Some("w"), (80, 24));
+    let mut first = RawClient::attach_sized(&env, Some("w"), (124, 36)).traced();
+    let mut second = RawClient::attach_sized(&env, Some("w"), (80, 24)).traced();
     choose_switch_target(&mut first, "Continue conversation");
     first.wait_for_row("Switch after this turn");
     first.send(b"\x02Ac");
@@ -7528,7 +7639,7 @@ fn a_switch_waits_for_the_turn_is_cancelled_by_another_client_and_rechecks_sign_
 fn codex_discloses_the_new_conversation_and_stop_confirmation_selects_cancel() {
     let env = Env::new("switchcodex");
     let pane = account_switch_agent(&env, "codex", "notify");
-    let mut client = RawClient::attach_sized(&env, Some("w"), (80, 24));
+    let mut client = RawClient::attach_sized(&env, Some("w"), (80, 24)).traced();
     choose_switch_target(&mut client, "New conversation");
     client.wait_for_row("Stop and switch?");
     client.wait_for_row("New conversation");
@@ -7566,7 +7677,7 @@ fn write_account_usage(env: &Env, name: &str, percent: u8) {
 fn threshold_ask_checks_the_destination_then_needs_one_confirmation() {
     let env = Env::new("switchask");
     let pane = account_switch_agent(&env, "claude", "ask");
-    let mut client = RawClient::attach(&env, "w");
+    let mut client = RawClient::attach(&env, "w").traced();
     claude_hook(&env, &pane, r#"{"hook_event_name":"Stop"}"#);
     write_account_usage(&env, "beta", 0);
     write_account_usage(&env, "alpha", 95);
@@ -7584,6 +7695,7 @@ fn threshold_ask_checks_the_destination_then_needs_one_confirmation() {
 fn automatic_switches_need_known_usage_and_do_not_retry_a_failed_check_each_tick() {
     let env = Env::new("switchauto");
     let pane = account_switch_agent(&env, "claude", "auto");
+    let client = RawClient::attach(&env, "w").traced();
     claude_hook(&env, &pane, r#"{"hook_event_name":"Stop"}"#);
     let usage = |name, percent| write_account_usage(&env, name, percent);
     usage("alpha", 95);
@@ -7593,6 +7705,7 @@ fn automatic_switches_need_known_usage_and_do_not_retry_a_failed_check_each_tick
     std::fs::write(env.root.join("beta/status"), "1").unwrap();
     usage("beta", 0);
     wait_until(PATIENCE, "the automatic switch checks sign-in", || env.root.join("beta/checks").exists());
+    client.wait_for_row("The current agent keeps running");
     std::thread::sleep(Duration::from_secs(3));
     let checks = std::fs::read_to_string(env.root.join("beta/checks")).unwrap();
     assert_eq!(checks.lines().count(), 1);
@@ -7664,12 +7777,12 @@ fn login_panes_verify_success_once_and_never_save_the_terminal() {
     for agent in ["claude", "codex"] {
         let env = Env::new(&format!("login-{agent}"));
         let (home, path) = login_agent(&env, agent);
-        let mut client = RawClient::attach_sized(&env, Some("w"), (124, 36));
+        let mut client = RawClient::attach_sized(&env, Some("w"), (124, 36)).traced();
         open_account_login(&mut client);
         client.wait_for_row("PRIVATE-LOGIN-OUTPUT");
         let first = login_panes(&env);
         assert_eq!(first.len(), 1);
-        let mut second = RawClient::attach_sized(&env, Some("w"), (80, 24));
+        let mut second = RawClient::attach_sized(&env, Some("w"), (80, 24)).traced();
         open_account_login(&mut second);
         assert_eq!(login_panes(&env)[0]["id"], first[0]["id"], "another client must reuse the login");
         assert_eq!(std::fs::read_to_string(home.join("logins")).unwrap(), "login\n");
@@ -7727,7 +7840,7 @@ fn login_panes_verify_success_once_and_never_save_the_terminal() {
 fn failed_and_cancelled_logins_close_on_enter_and_retry_only_when_asked() {
     let env = Env::new("login-failed");
     let (home, path) = login_agent(&env, "claude");
-    let mut client = RawClient::attach_sized(&env, Some("w"), (80, 24));
+    let mut client = RawClient::attach_sized(&env, Some("w"), (80, 24)).traced();
     std::fs::write(home.join("finish-login"), "1").unwrap();
     open_account_login(&mut client);
     client.wait_for_row("sign-in failed");
@@ -7736,13 +7849,6 @@ fn failed_and_cancelled_logins_close_on_enter_and_retry_only_when_asked() {
     client.send(b"\r");
     common::wait_until(PATIENCE, "Enter closes failed login", || login_panes(&env).is_empty());
     assert_eq!(std::fs::read_to_string(home.join("logins")).unwrap(), "login\n");
-    let out = env.cmd(&["accounts"]).env("PATH", &path).output().unwrap();
-    assert!(out.status.success());
-    assert!(
-        String::from_utf8_lossy(&out.stdout)
-            .lines()
-            .any(|l| l.contains("claude·work") && l.contains("sign-in required"))
-    );
     client.resize((124, 36));
     client.wait_for_row("Sign-in required");
     client.send(b"\x02Al");
@@ -7758,16 +7864,35 @@ fn failed_and_cancelled_logins_close_on_enter_and_retry_only_when_asked() {
     common::wait_until(PATIENCE, "cancelled program exits", || !login_panes(&env)[0]["exit_code"].is_null());
     client.send(b"r");
     common::wait_until(PATIENCE, "explicit retry starts once", || {
+        let panes = login_panes(&env);
         std::fs::read_to_string(home.join("logins")).unwrap().lines().count() == 3
+            && panes.len() == 1
+            && panes[0]["exit_code"].is_null()
+    });
+    // Running logins show the native terminal, with no banner. Acknowledge the retry's
+    // redraw before finishing it, so the old cancelled banner cannot satisfy the next wait.
+    client.wait_for_rows("the retried login is running", |rows| {
+        rows.iter().any(|r| r.contains("PRIVATE-LOGIN-OUTPUT")) && !rows.iter().any(|r| r.contains("sign-in cancelled"))
     });
     std::fs::write(home.join("finish-login"), "130").unwrap();
     client.wait_for_row("sign-in cancelled");
     client.send(b"\r");
     common::wait_until(PATIENCE, "Enter closes cancelled login", || login_panes(&env).is_empty());
+    assert_eq!(std::fs::read_to_string(home.join("logins")).unwrap().lines().count(), 3);
+    assert!(!home.join("checks").exists(), "cancellation does not run a status check");
     assert!(
         std::fs::read_to_string(env.root.join("config/kraal/accounts.toml"))
             .unwrap()
             .contains("sign_in_required = true")
+    );
+    // Listing accounts explicitly checks sign-in: do it after checking that neither
+    // failure nor cancellation ran a status command.
+    let out = env.cmd(&["accounts"]).env("PATH", &path).output().unwrap();
+    assert!(out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .any(|l| l.contains("claude·work") && l.contains("sign-in required"))
     );
 }
 
@@ -7775,7 +7900,7 @@ fn failed_and_cancelled_logins_close_on_enter_and_retry_only_when_asked() {
 fn an_unverified_login_can_check_again_without_another_login() {
     let env = Env::new("login-check");
     let (home, _) = login_agent(&env, "codex");
-    let mut client = RawClient::attach_sized(&env, Some("w"), (80, 24));
+    let mut client = RawClient::attach_sized(&env, Some("w"), (80, 24)).traced();
     std::fs::write(home.join("finish-login"), "0").unwrap();
     std::fs::write(home.join("status"), "1").unwrap();
     open_account_login(&mut client);
@@ -7795,17 +7920,16 @@ fn an_unverified_login_can_check_again_without_another_login() {
 fn a_verified_login_that_cannot_save_can_finish_without_logging_in_again() {
     let env = Env::new("login-save");
     let (home, _) = login_agent(&env, "claude");
-    let mut client = RawClient::attach(&env, "w");
-    std::fs::write(home.join("finish-login"), "0").unwrap();
+    let mut client = RawClient::attach(&env, "w").traced();
     std::fs::write(home.join("status"), "0").unwrap();
-    std::fs::write(home.join("hold-check"), "").unwrap();
     open_account_login(&mut client);
-    client.wait_for_row("checking sign-in");
+    client.wait_for_row("PRIVATE-LOGIN-OUTPUT");
     let file = env.root.join("config/kraal/accounts.toml");
     let backup = file.with_extension("kept");
     std::fs::rename(&file, &backup).unwrap();
     std::fs::create_dir(&file).unwrap();
-    std::fs::remove_file(home.join("hold-check")).unwrap();
+    // Make saving fail before the login exits, without holding a check against its timeout.
+    std::fs::write(home.join("finish-login"), "0").unwrap();
     client.wait_for_row("signed in, could not save account");
     assert_eq!(login_panes(&env).len(), 1);
     assert!(std::fs::read_to_string(&backup).unwrap().contains("sign_in_required = true"));
@@ -7821,7 +7945,7 @@ fn a_verified_login_that_cannot_save_can_finish_without_logging_in_again() {
 fn closing_a_check_ignores_its_late_success() {
     let env = Env::new("login-late");
     let (home, _) = login_agent(&env, "claude");
-    let mut client = RawClient::attach(&env, "w");
+    let mut client = RawClient::attach(&env, "w").traced();
     std::fs::write(home.join("finish-login"), "0").unwrap();
     std::fs::write(home.join("status"), "0").unwrap();
     std::fs::write(home.join("hold-check"), "").unwrap();
@@ -7833,6 +7957,9 @@ fn closing_a_check_ignores_its_late_success() {
     std::fs::write(home.join("status"), "2").unwrap();
     open_account_login(&mut client);
     client.wait_for_row("checking sign-in");
+    common::wait_until(PATIENCE, "the replacement check read its status", || {
+        std::fs::read_to_string(home.join("checks")).is_ok_and(|s| s.lines().filter(|l| *l == "check").count() == 2)
+    });
     std::fs::remove_file(home.join("hold-check")).unwrap();
     client.wait_for_row("could not check sign-in");
     assert_eq!(login_panes(&env).len(), 1);
@@ -7876,6 +8003,49 @@ while IFS= read -r line; do printf 'reply:%s\n' "$line"; done
 "#,
     );
     format!("{}:{}", bin.display(), std::env::var("PATH").unwrap_or_default())
+}
+
+fn wait_for_account_review(client: &RawClient, agent: &str) -> Vec<String> {
+    let label = format!("Existing {agent} account");
+    client.wait_for_rows(&format!("{label} ready for Review"), |rows| {
+        rows.iter().enumerate().any(|(i, row)| {
+            row.contains(&label)
+                && (row.contains("Review") || rows.get(i + 1).is_some_and(|detail| detail.contains("Review")))
+        })
+    })
+}
+
+#[test]
+fn account_discovery_updates_each_agent_without_waiting_for_the_other() {
+    let env = Env::new("accounts-concurrent");
+    let path = existing_sign_in_agent(&env, "claude");
+    existing_sign_in_agent(&env, "codex");
+    for agent in ["claude", "codex"] {
+        let home = env.root.join(format!("home/.{agent}"));
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(home.join("status"), "0").unwrap();
+    }
+    // The server unit test controls completion order by holding job results. Holding a
+    // status subprocess here would race its watchdog while the client and shell start.
+    env.workspace("w", "layout { pane name=\"shell\" }\n");
+    let out = env.cmd(&["open", "w"]).env("PATH", path).output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let mut client = RawClient::attach_sized(&env, Some("w"), (80, 24)).traced();
+    client.send(b"\x02Al");
+    client.wait_for_row("Codex · Personal");
+    env.run(&["send", "-p", "shell", "printf 'server-%s\\n' responsive\r"]);
+    env.wait_for_text("shell", "server-responsive");
+    client.wait_for_row("Claude · Personal");
+    let checks = std::fs::read_to_string(env.root.join("home/status-checks")).unwrap();
+    assert_eq!(checks.lines().count(), 2);
+    for _ in 0..3 {
+        client.close_overlay("⏎ details");
+        client.send(b"\x02Al");
+        client.wait_for_row("Claude · Personal");
+        client.wait_for_row("Codex · Personal");
+    }
+    assert_eq!(std::fs::read_to_string(env.root.join("home/status-checks")).unwrap(), checks);
+    assert!(!env.root.join("home/logins").exists());
 }
 
 #[test]
@@ -8176,17 +8346,16 @@ fn reviewing_the_existing_account_keeps_live_agents_and_reports_usage_once() {
         let panes: serde_json::Value = serde_json::from_str(&env.run(&["panes", "--json"])).unwrap();
         let pane = panes.as_array().unwrap().iter().find(|p| p["name"] == "agent").unwrap()["id"].to_string();
         env.wait_for_text(&pane, "READY");
-        let mut client = RawClient::attach_sized(&env, Some("w"), size);
+        let mut client = RawClient::attach_sized(&env, Some("w"), size).traced();
         if size.0 == 124 {
             client.wait_for_row("Codex · Personal");
-            let rows = client.wait_for_row("Existing Claude account");
+            let rows = wait_for_account_review(&client, "Claude");
             let row = rows.iter().position(|r| r.contains("Existing Claude account")).unwrap() + 1;
             client.send(format!("\x1b[<0;10;{row}M\x1b[<0;10;{row}m").as_bytes());
         } else {
             client.send(b"\x02Al");
             client.wait_for_row("Codex · Personal");
-            client.wait_for_row("Existing Claude account");
-            client.wait_for_row("Review");
+            wait_for_account_review(&client, "Claude");
             assert!(!client.rows().iter().any(|r| r.contains("claude·default") || r.contains("codex·default")));
             client.send(b"Existing Claude");
             client.send(b"\r");
@@ -8248,7 +8417,7 @@ fn a_missing_agent_keeps_the_add_form_and_creates_nothing() {
     let env = Env::new("login-missing");
     env.workspace("w", "layout { pane name=\"shell\" }\n");
     env.run(&["open", "w"]);
-    let mut client = RawClient::attach_sized(&env, Some("w"), (80, 24));
+    let mut client = RawClient::attach_sized(&env, Some("w"), (80, 24)).traced();
     client.send(b"\x02An");
     client.wait_for_row("Not installed");
     client.send(b"\x15unfinished\r");
@@ -8332,7 +8501,10 @@ fn a_renamed_account_keeps_its_rules_its_usage_and_its_agents() {
     let env = Env::new("renameacct");
     let bin = env.root.join("bin");
     std::fs::create_dir_all(&bin).unwrap();
-    write_script(&bin.join("claude"), "#!/bin/sh\necho \"home=${CLAUDE_CONFIG_DIR:-default}\"\nexec sleep 100\n");
+    write_script(
+        &bin.join("claude"),
+        "#!/bin/sh\n[ \"$2\" = status ] && exit 1\necho \"home=${CLAUDE_CONFIG_DIR:-default}\"\nexec sleep 100\n",
+    );
     let home = env.root.join("alpha-home");
     std::fs::create_dir_all(&home).unwrap();
     let file = env.root.join("config/kraal/accounts.toml");
@@ -8383,17 +8555,22 @@ fn a_renamed_account_keeps_its_rules_its_usage_and_its_agents() {
     };
     hook(r#"{"hook_event_name":"UserPromptSubmit","session_id":"s-1"}"#);
     assert_eq!(account_said("agent.working"), "claude:alpha");
-    let mut client = RawClient::attach(&env, "w");
+    let mut client = RawClient::attach(&env, "w").traced();
 
     // Tab on the account in Accounts, then Rename and the new name.
     // The client is sent what changed since the frame before: a word is looked for only where
     // it is drawn over blank cells or other letters.
     client.send(b"\x02Al");
-    client.wait_for_screen("Accounts");
+    client.wait_for_row("Accounts");
     client.send(b"alpha");
-    std::thread::sleep(Duration::from_millis(200));
+    client.wait_for_rows("alpha selected beside Add account", |rows| {
+        rows.iter().any(|r| r.contains("❯ alpha"))
+            && rows.iter().any(|r| r.contains("▸ Claude · alpha"))
+            && rows.iter().any(|r| r.contains("+ Add account"))
+            && rows.iter().any(|r| r.contains("⏎ details") && r.contains("2/"))
+    });
     client.send(b"\t");
-    client.wait_for_screen("Rename");
+    client.wait_for_row("Rename");
     client.send(b"\r\x15gamma\r");
     let named = |name: &str| std::fs::read_to_string(&file).unwrap().contains(&format!("name = \"{name}\""));
     wait_until(Duration::from_secs(10), "renamed from the picker", || named("gamma"));
@@ -8412,7 +8589,7 @@ fn a_renamed_account_keeps_its_rules_its_usage_and_its_agents() {
 
     // From the command line: the session reads accounts.toml again when it changes.
     assert_eq!(env.run(&["accounts", "rename", "claude:gamma", "zulu"]).trim(), "renamed claude·gamma to claude·zulu");
-    client.wait_for_screen("zulu");
+    client.wait_for_row("zulu");
     hook(r#"{"hook_event_name":"UserPromptSubmit","session_id":"s-1"}"#);
     assert_eq!(account_said("agent.working"), "claude:zulu");
     assert!(std::fs::read_to_string(&file).unwrap().contains(&format!("account_ids = [\"claude:@{id}\"]")));
@@ -10927,7 +11104,7 @@ while IFS= read -r line; do printf 'reply:%s\n' "$line"; done
         let out = env.cmd(&["open", "w"]).env("PATH", &path).output().unwrap();
         assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
         env.wait_for_text("agent", "READY account=codex:work");
-        let mut client = RawClient::attach_sized(&env, Some("w"), size);
+        let mut client = RawClient::attach_sized(&env, Some("w"), size).traced();
         if size.0 == 124 {
             click_account_text(&mut client, "ACCOUNTS");
             client.wait_for_row("⏎ details");
@@ -11033,10 +11210,9 @@ fn the_add_form_names_an_existing_sign_in_without_running_login() {
     env.workspace("w", "layout { pane name=\"shell\" }\n");
     let out = env.cmd(&["open", "w"]).env("PATH", &path).output().unwrap();
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
-    let mut client = RawClient::attach_sized(&env, Some("w"), (80, 24));
+    let mut client = RawClient::attach_sized(&env, Some("w"), (80, 24)).traced();
     client.send(b"\x02Al");
-    client.wait_for_row("Existing Claude account");
-    client.wait_for_row("Review");
+    wait_for_account_review(&client, "Claude");
     click_account_text(&mut client, "+ Add account");
     let rows = client.wait_for_row("[> Use existing account]");
     assert!(rows.iter().any(|r| r.contains("Existing Claude sign-in needs review.")));
@@ -11151,7 +11327,7 @@ fn sidebar_accounts_discover_a_sign_in_completed_after_startup() {
         env.workspace("w", "layout { pane name=\"shell\" }\n");
         let out = env.cmd(&["open", "w"]).env("PATH", &path).output().unwrap();
         assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
-        let mut client = RawClient::attach_sized(&env, Some("w"), (124, 36));
+        let mut client = RawClient::attach_sized(&env, Some("w"), (124, 36)).traced();
         common::wait_until(PATIENCE, "startup checked the unsigned home", || standard.join("check-finished").exists());
         client.wait_for_rows("startup discovery completed", |rows| {
             rows.iter().any(|r| r.contains("ACCOUNTS")) && !rows.iter().any(|r| r.contains("Checking sign-in"))
@@ -11162,8 +11338,7 @@ fn sidebar_accounts_discover_a_sign_in_completed_after_startup() {
         std::fs::write(standard.join("status"), "0").unwrap();
         click_account_text(&mut client, entry);
         if entry == "ACCOUNTS" {
-            client.wait_for_row("Existing Claude account");
-            client.wait_for_row("Review");
+            wait_for_account_review(&client, "Claude");
             click_account_text(&mut client, "+ Add account");
         }
         client.wait_for_row("Use existing account");
