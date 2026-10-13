@@ -215,6 +215,12 @@ rename it like any other account. No login is started and no credentials are cop
 agent or an unsigned home adds no account. **Could not verify** offers **Check again**, without
 starting a login; on the command line, run `kraal accounts list` again.
 
+Accounts opens immediately. Discovery checks Claude and Codex independently in the background;
+each result appears as soon as it finishes. **Checking sign-in** is still pending: wait for
+**Review** before choosing which account it is. Opening a verified account or its Review does
+not run another status command. Reopening Accounts checks unsigned standard homes again, so
+a sign-in completed outside kraal can be found; an uncertain result waits for **Check again**.
+
 If named accounts already exist, the existing sign-in appears as **Existing Claude account ·
 Review** (or Codex). Open it in Accounts (`ctrl+b A l`), click Review in the sidebar, or use
 `kraal accounts review claude`. **Which account is this?** lists your named accounts and

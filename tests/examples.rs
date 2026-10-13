@@ -282,6 +282,14 @@ fn every_workspace_opens_as_it_is_written() {
 fn the_runbooks_are_listed_and_planned() {
     let env = installed("exrun");
     fake(&env, "ssh", "exit 255");
+    // The example subscribes to a workstation's agents in the background. Disable that
+    // subscription here, so any SSH call below really came from planning a runbook.
+    let file = env.root.join("config/kraal/servers.toml");
+    let mut inventory: toml::Table = read(&file).parse().unwrap();
+    for server in inventory["server"].as_array_mut().unwrap() {
+        server.as_table_mut().unwrap().remove("agents");
+    }
+    std::fs::write(&file, toml::to_string(&inventory).unwrap()).unwrap();
     open(&env, "first");
     let inventory: toml::Table = read(&examples().join("servers.toml")).parse().unwrap();
     let servers = inventory["server"].as_array().unwrap();

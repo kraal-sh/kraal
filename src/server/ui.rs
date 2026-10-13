@@ -355,6 +355,8 @@ pub struct Picker {
     /// Cursor in `query`, in characters.
     pub cursor: usize,
     pub items: Vec<PickItem>,
+    /// Keep room for rows removed by a background refresh, so the list does not move under a click.
+    pub min_items: usize,
     /// Indices into `items` matching the query, best first.
     pub filtered: Vec<usize>,
     pub selected: usize,
@@ -374,6 +376,7 @@ impl Picker {
             title: title.into(),
             query: String::new(),
             cursor: 0,
+            min_items: items.len(),
             items,
             filtered: Vec::new(),
             selected: 0,

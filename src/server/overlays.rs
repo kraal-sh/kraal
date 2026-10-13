@@ -401,8 +401,8 @@ impl PickerLayout {
 pub(super) fn picker_layout(p: &Picker, screen: Rect) -> PickerLayout {
     let w = screen.width.saturating_sub(4).min(92);
     let row_height = if p.kind == super::ui::PickerKind::Accounts && p.actions.is_none() { 2 } else { 1 };
-    let rows =
-        (p.items.len().max(p.action_keys().len()) as u16 * row_height).clamp(1, screen.height.saturating_sub(9).max(1));
+    let rows = (p.items.len().max(p.min_items).max(p.action_keys().len()) as u16 * row_height)
+        .clamp(1, screen.height.saturating_sub(9).max(1));
     let rows = rows / row_height * row_height;
     let area = centered(screen, w, rows + 5);
     let inner = Rect::new(area.x + 1, area.y + 1, area.width.saturating_sub(2), area.height.saturating_sub(2));
