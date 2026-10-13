@@ -97,25 +97,35 @@ fn remove_saved(path: &Path) -> std::io::Result<bool> {
     }
 }
 
-/// `kraal workspaces`: the open ones with their agents, or the definitions when no server runs.
+/// `kraal workspaces`: saved workspaces and file definitions, also when the server is stopped.
 pub(super) fn workspaces(s: &Session, json: bool) -> Result<()> {
     let r = match s.request(Request::ListWorkspaces) {
         Ok(r) => r,
-        Err(_) => return list_definitions(json),
+        Err(_) => return list_definitions(&s.name, json),
     };
     let Response::Workspaces(list) = r else { bail!("unexpected answer") };
+    print_workspaces(&list, json)
+}
+
+fn print_workspaces(list: &[protocol::WorkspaceInfo], json: bool) -> Result<()> {
     if json {
-        println!("{}", serde_json::to_string_pretty(&list)?);
+        println!("{}", serde_json::to_string_pretty(list)?);
         return Ok(());
     }
     for w in list {
-        let state = if w.open { "open" } else { "-" };
+        let state = if w.open {
+            "open"
+        } else if w.id.is_some() {
+            "closed"
+        } else {
+            "-"
+        };
         let agents = if w.blocked + w.done + w.working > 0 {
             format!("  ▲{} ✓{} ●{}", w.blocked, w.done, w.working)
         } else {
             String::new()
         };
-        println!("{:<20} {:<5} {:>3} tabs {:>4} panes{agents}", w.name, state, w.tabs, w.panes);
+        println!("{:<20} {:<6} {:>3} tabs {:>4} panes{agents}", w.name, state, w.tabs, w.panes);
     }
     Ok(())
 }
@@ -199,24 +209,51 @@ pub(super) fn list_sessions() -> Result<()> {
     Ok(())
 }
 
-fn list_definitions(json: bool) -> Result<()> {
+fn list_definitions(session: &str, json: bool) -> Result<()> {
     let cfg = config::Config::load()?;
+    let saved = crate::persist::inspect(session)?.map(|s| s.workspaces).unwrap_or_default();
+    let mut list: Vec<_> = saved
+        .iter()
+        .map(|w| {
+            let (tabs, panes) = w.counts();
+            protocol::WorkspaceInfo {
+                id: (!w.id.is_empty()).then(|| w.id.clone()),
+                name: w.name.clone(),
+                open: false,
+                definition: w.definition.clone(),
+                tabs,
+                panes,
+                working: 0,
+                blocked: 0,
+                done: 0,
+            }
+        })
+        .collect();
     let defs: Vec<_> = cfg.workspace_dirs().iter().flat_map(|d| workspace::load_dir(d)).collect();
-    if json {
-        let v: Vec<_> = defs
-            .iter()
-            .filter_map(|(p, d)| d.as_ref().ok().map(|d| serde_json::json!({"name": d.name, "open": false, "definition": p, "tabs": d.tabs.len(), "panes": d.panes().len()})))
-            .collect();
-        println!("{}", serde_json::to_string_pretty(&v)?);
-        return Ok(());
-    }
-    for (p, d) in defs {
-        match d {
-            Ok(d) => println!("{:<20} {:<5} {:>3} tabs {:>4} panes", d.name, "-", d.tabs.len(), d.panes().len()),
-            Err(e) => println!("{:<20} error: {e:#}", p.display()),
+    for (path, def) in defs {
+        if saved.iter().any(|w| w.definition.as_deref().is_some_and(|p| paths::same_file(p, &path))) {
+            continue;
+        }
+        match def {
+            Ok(def) => {
+                let panes = def.panes().len();
+                list.push(protocol::WorkspaceInfo {
+                    id: None,
+                    name: def.name,
+                    open: false,
+                    definition: Some(path),
+                    tabs: def.tabs.len(),
+                    panes,
+                    working: 0,
+                    blocked: 0,
+                    done: 0,
+                });
+            }
+            Err(e) if !json => println!("{:<20} error: {e:#}", path.display()),
+            Err(_) => {}
         }
     }
-    Ok(())
+    print_workspaces(&list, json)
 }
 
 pub(super) fn import_zellij(from: Option<PathBuf>, force: bool) -> Result<()> {

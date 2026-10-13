@@ -2666,8 +2666,13 @@ fn a_failed_start_leaves_no_empty_workspace() {
     assert!(!out.status.success());
     let list = env.run(&["workspaces", "--json"]);
     let v: serde_json::Value = serde_json::from_str(&list).unwrap();
-    assert!(v.as_array().unwrap().iter().all(|w| w["name"] != "main" || w["open"] == false), "{list}");
+    assert!(v.as_array().unwrap().iter().all(|w| w["name"] != "main"), "{list}");
     env.run(&["open", "w"]);
+    env.run(&["close", "one"]);
+    let before = env.run(&["workspaces", "--json"]);
+    let out = env.cmd(&["agent", "claude", "--account", "nope"]).env("KRAAL_SOCKET", &socket).output().unwrap();
+    assert!(!out.status.success());
+    assert_eq!(env.run(&["workspaces", "--json"]), before, "an existing empty workspace stays open");
     env.run(&["kill"]);
     let _ = server.wait();
 }
@@ -3492,7 +3497,7 @@ fn a_reader_too_slow_for_the_events_is_told_and_misses_nothing() {
 }
 
 /// What else ends a `kraal events` stream ends it as before, without a word and with success:
-/// the session stopped, or ended with its last pane. A terminal that detaches ends no stream.
+/// the session stopped. Detaching or closing its last pane ends no stream.
 #[test]
 fn the_event_stream_ends_quietly_with_the_session() {
     use std::process::Stdio;
@@ -3518,6 +3523,10 @@ fn the_event_stream_ends_quietly_with_the_session() {
             assert!(start.elapsed() < Duration::from_secs(10), "no event after a terminal detached");
         }
         env.run(end);
+        if end[0] == "close" {
+            assert!(reader.try_wait().unwrap().is_none(), "the empty session still owns the stream");
+            env.run(&["kill"]);
+        }
         let out = finish(reader, Duration::from_secs(10));
         let said = String::from_utf8_lossy(&out.stderr);
         assert!(out.status.success() && said.is_empty(), "after {end:?}: {:?} {said}", out.status);
@@ -4489,15 +4498,15 @@ fn a_timed_out_target_is_stopped_whatever_happens_to_kraal_meanwhile() {
         read_pid(&pidfile).expect("the pid of what the target left")
     };
 
-    // Its pane, the last one, closed during the grace period: kraal stops, and stops it first.
+    // Closing its last pane keeps the session while the timeout's grace period finishes.
     let env = Env::new("tolast");
     let left = start_run(&env, "last");
     env.run(&["close", "shell"]);
     let panes: serde_json::Value = serde_json::from_str(&env.run(&["panes", "--json"])).unwrap();
     let id = panes.as_array().unwrap()[0]["id"].to_string();
     let _ = env.try_run(&["close", &id]);
-    wait_until("kraal stops", 20, Box::new(|| env.server_pid().is_none()));
-    wait_until("what the target left is stopped", 5, Box::new(|| !alive(left)));
+    assert!(env.server_pid().is_some());
+    wait_until("what the target left is stopped", 20, Box::new(|| !alive(left)));
 
     // The server held up past the grace period: SIGKILL still goes before it gives up.
     let env = Env::new("toheld");
@@ -6831,7 +6840,7 @@ fn the_sidebar_is_there_from_the_first_screen() {
     // What has nothing to list has no section.
     client.settle();
     let rows = client.rows();
-    assert!(rows[2].starts_with("│   1 tab · 1 pane"), "{}", rows.join("\n"));
+    assert!(rows[2].starts_with("│   Open · 1 tab · 1 pane"), "{}", rows.join("\n"));
     let sections = rows.iter().filter(|r| r.starts_with("├─ ")).collect::<Vec<_>>();
     assert!(sections.iter().all(|s| s.starts_with("├─ ACCOUNTS")), "{sections:?}");
 
@@ -10011,10 +10020,10 @@ fn closing_a_workspace_lists_its_programs_and_background_jobs_from_both_entries(
             client.wait_for_row("Close workspace \"api\"");
             let question = client.read_question(b"\x1b[6~").join("\n");
             for text in [
-                "The current layout will be removed from the session.",
+                "The layout will be kept.",
                 "The workspace file is kept unchanged:",
-                "Reopening uses that file's layout.",
-                "Cancel and save the layout first to keep it.",
+                "Reopening uses the saved layout.",
+                "Close and Open do not reread that file.",
                 "sleep 4257 (in the background)",
                 "sleep 4258",
                 "Unsaved work in these programs may be lost.",
@@ -10048,14 +10057,15 @@ fn closing_a_workspace_lists_its_programs_and_background_jobs_from_both_entries(
     );
     env.run(&["open", "api"]);
     let panes = env.run(&["panes"]);
-    assert!(panes.contains("shell") && !panes.contains("foreground"), "{panes}");
+    assert!(panes.contains("shell") && panes.contains("foreground"), "{panes}");
 }
 
 #[test]
-fn closing_a_workspace_without_a_file_warns_even_at_the_prompt_and_stops_the_last_session() {
+fn closing_a_workspace_without_a_file_keeps_it_and_the_last_session() {
     let env = Env::new("wscloselast");
     env.workspace("w", "layout {\n    pane name=\"shell\"\n}\n");
     env.run(&["open", "w"]);
+    let pid = env.server_pid().unwrap();
     let mut client = RawClient::attach(&env, "w").traced();
     client.wait_for_message("\"attached\"");
     client.send(b"\x02Wn");
@@ -10066,28 +10076,36 @@ fn closing_a_workspace_without_a_file_warns_even_at_the_prompt_and_stops_the_las
     for size in [(80, 24), (124, 36)] {
         client.resize(size);
         client.send(b"\x02Wx");
-        client.wait_for_row("Close workspace \"scratch\"");
-        let question = client.read_question(b"\x1b[6~").join(" ");
-        assert!(question.contains("This workspace has no linked file. It will disappear from the list."), "{question}");
-        assert!(question.contains("Cancel and save the layout first to keep it."), "{question}");
-        assert!(!question.contains("These programs stop:"), "{question}");
+        client.wait_for_row("Closed · 1 tab · 1 pane");
+        assert!(listed_workspaces(&env).contains(&"scratch: ".to_string()));
+        assert_eq!(env.server_pid(), Some(pid));
+        assert!(!client.messages.lock().unwrap().iter().any(|m| m.contains(r#""type":"exit""#)));
         client.send(b"\r");
-        client.wait_for_rows("Cancel kept scratch open", |rows| !rows.iter().any(|r| r.contains("Stop and close")));
+        client
+            .wait_for_rows("scratch reopened", |rows| !rows.iter().any(|r| r.contains("Workspaces · type a new name")));
+        client.wait_for_row("$ ");
         assert!(listed_workspaces(&env).contains(&"scratch:  (open)".to_string()));
     }
     client.send(b"\x02Wx");
-    client.wait_for_row("Stop and close");
-    client.send(b"y");
-    client.wait_for_rows("scratch closed", |rows| !rows.iter().any(|r| r.contains("Stop and close")));
-    assert!(!listed_workspaces(&env).iter().any(|w| w.starts_with("scratch:")));
+    client.wait_for_row("Closed · 1 tab · 1 pane");
+    client.send(b"\x1b");
+    client.wait_for_rows("the workspace picker closed", |rows| {
+        !rows.iter().any(|r| r.contains("Workspaces · type a new name"))
+    });
+    client.wait_for_row("$ ");
     client.send(b"\x02Wx");
-    client.wait_for_row("Close workspace \"w\"");
-    let question = client.read_question(b"\x1b[6~").join("\n");
-    assert!(question.contains("This is the last workspace. The session will stop."), "{question}");
-    client.send(b"\t\r");
-    client.wait_for_message("the last pane closed, so kraal stopped");
-    wait_until(Duration::from_secs(10), "the session did not stop", || env.server_pid().is_none());
-    assert!(!env.state_file().exists());
+    client.wait_for_row("Workspaces · type a new name");
+    wait_until(PATIENCE, "both workspaces did not close", || {
+        let workspaces: serde_json::Value = serde_json::from_str(&env.run(&["workspaces", "--json"])).unwrap();
+        workspaces.as_array().is_some_and(|ws| ws.len() == 2 && ws.iter().all(|w| w["open"] == false))
+    });
+    assert_eq!(env.server_pid(), Some(pid));
+    assert!(env.state_file().exists());
+    assert!(!client.messages.lock().unwrap().iter().any(|m| m.contains(r#""type":"exit""#)));
+    env.run(&["kill"]);
+    env.run(&["open", "scratch"]);
+    assert!(listed_workspaces(&env).contains(&"scratch:  (open)".to_string()));
+    assert!(listed_workspaces(&env).contains(&"w: w.kdl".to_string()));
 }
 
 /// `ctrl+b q` asks first, Cancel selected, saying what stops (a short question when nothing
@@ -10158,27 +10176,243 @@ fn a_quit_that_cannot_save_the_session_leaves_it_running() {
     assert!(!client.messages.lock().unwrap().iter().any(|m| m.contains(r#""type":"exit""#)));
 }
 
-/// `exit` in the last shell of the last workspace ends the session, as in tmux and Zellij:
-/// without a question, every attached terminal leaves, and nothing is left to restore.
-#[cfg(target_os = "linux")]
+/// An empty workspace remains usable, saved and attached after its last shell exits.
 #[test]
-fn the_session_ends_with_its_last_pane() {
+fn the_last_pane_leaves_an_empty_saved_workspace() {
     let env = Env::new("lastexit");
     env.workspace("w", "layout {\n    pane name=\"only\"\n}\n");
     env.run(&["open", "w"]);
-    wait_until(Duration::from_secs(10), "the layout was never saved", || env.state_file().exists());
+    let pid = env.server_pid().unwrap();
     let client = RawClient::attach(&env, "w");
     client.wait_for_message("\"attached\"");
-    let mut terminal = env.client();
+    let before: serde_json::Value = serde_json::from_str(&env.run(&["workspaces", "--json"])).unwrap();
     env.run(&["send", "-p", "only", "--enter", "exit"]);
-    client.wait_for_message("the last pane closed, so kraal stopped");
-    wait_until(Duration::from_secs(10), "the attached terminal stayed", || terminal.try_wait().unwrap().is_some());
-    wait_until(Duration::from_secs(10), "the server still runs", || env.server_pid().is_none());
-    assert!(!env.state_file().exists(), "an ended session was kept");
+    client.wait_for_row("+ Add pane");
+    assert_eq!(env.server_pid(), Some(pid));
+    let after: serde_json::Value = serde_json::from_str(&env.run(&["workspaces", "--json"])).unwrap();
+    assert_eq!(after[0]["id"], before[0]["id"]);
+    assert_eq!(after[0]["tabs"], 0);
+    assert_eq!(after[0]["panes"], 0);
+    env.run(&["kill"]);
+    env.run(&["open", "w"]);
+    let restored: serde_json::Value = serde_json::from_str(&env.run(&["workspaces", "--json"])).unwrap();
+    assert_eq!(restored, after);
+    let mut client = RawClient::attach(&env, "w");
+    client.wait_for_row("+ Add pane");
+    client.send(b"\r");
+    wait_until(PATIENCE, "Enter did not add a pane", || {
+        let panes: serde_json::Value = serde_json::from_str(&env.run(&["panes", "--json"])).unwrap();
+        panes.as_array().is_some_and(|p| p.len() == 1)
+    });
+}
+
+/// Closing keeps the personal layout even when its imported source changes or disappears.
+#[test]
+fn close_and_reopen_keep_unsaved_tabs_panes_and_identity() {
+    let env = Env::new("closekept");
+    let source = "layout {\n    pane name=\"shell\"\n}\n";
+    env.workspace("w", source);
+    env.run(&["open", "w"]);
+    env.run(&["run", "--tab", "--name", "job", "--", "sh", "-c", "echo ready; exec sleep 4209"]);
+    env.wait_for_text("job", "ready");
+    let before: serde_json::Value = serde_json::from_str(&env.run(&["workspaces", "--json"])).unwrap();
+    let mut client = RawClient::attach(&env, "w");
+    let other = RawClient::attach(&env, "w");
+    client.wait_for_message("\"attached\"");
+    client.send(b"\x02Wx");
+    client.wait_for_row("The layout will be kept.");
+    client.send(b"y");
+    client.wait_for_row("Closed · 2 tabs · 2 panes");
+    other.wait_for_row("Closed · 2 tabs · 2 panes");
+    let closed: serde_json::Value = serde_json::from_str(&env.run(&["workspaces", "--json"])).unwrap();
+    assert_eq!(closed[0]["id"], before[0]["id"]);
+    assert_eq!(closed[0]["open"], false);
+    assert!(env.run(&["workspaces"]).contains("closed"));
+    assert_eq!(std::fs::read_to_string(env.root.join("config/kraal/workspaces/w.kdl")).unwrap(), source);
+    std::fs::remove_file(env.root.join("config/kraal/workspaces/w.kdl")).unwrap();
+    env.run(&["kill"]);
+    let saved = std::fs::read(env.state_file()).unwrap();
+    let stopped: serde_json::Value = serde_json::from_str(&env.run(&["workspaces", "--json"])).unwrap();
+    assert_eq!(stopped, closed);
+    assert_eq!(std::fs::read(env.state_file()).unwrap(), saved, "listing never rewrites saved state");
+    env.run(&["open", "w"]);
+    let reopened: serde_json::Value = serde_json::from_str(&env.run(&["workspaces", "--json"])).unwrap();
+    assert_eq!(reopened[0]["id"], before[0]["id"]);
+    assert_eq!(reopened[0]["tabs"], 2);
+    assert_eq!(reopened[0]["panes"], 2);
+    let panes: serde_json::Value = serde_json::from_str(&env.run(&["panes", "--json"])).unwrap();
+    assert!(panes.as_array().unwrap().iter().any(|p| p["name"] == "job" && p["suspended"] == true));
+    assert!(env.run(&["read", "-p", "job"]).contains("ready"));
+}
+
+#[test]
+fn close_preparation_failure_keeps_the_programs_and_offers_retry() {
+    use std::os::unix::fs::PermissionsExt;
+    let env = Env::new("closefull");
+    env.workspace("w", "layout { pane name=\"only\"; }\n");
+    env.run(&["open", "w"]);
+    env.run(&["send", "-p", "only", "--enter", "echo waiting"]);
+    env.wait_for_text("only", "waiting");
+    wait_until(PATIENCE, "no saved state", || env.state_file().exists());
+    let sessions = env.root.join("state/kraal/sessions");
+    std::fs::set_permissions(&sessions, std::fs::Permissions::from_mode(0o500)).unwrap();
+    let mut client = RawClient::attach(&env, "w");
+    client.wait_for_message("\"attached\"");
+    client.send(b"\x02Wx");
+    client.wait_for_row("Nothing was stopped.");
+    env.run(&["send", "-p", "only", "--enter", "echo still-running"]);
+    env.wait_for_text("only", "still-running");
+    std::fs::set_permissions(&sessions, std::fs::Permissions::from_mode(0o700)).unwrap();
+    client.send(b"y");
+    client.wait_for_row("Closed · 1 tab · 1 pane");
+}
+
+#[test]
+fn commands_outside_kraal_skip_a_closed_first_workspace() {
+    let env = Env::new("closedfirst");
+    let bin = env.root.join("bin");
+    let home = env.root.join("account");
+    std::fs::create_dir_all(&bin).unwrap();
+    std::fs::create_dir_all(&home).unwrap();
+    write_script(&bin.join("ssh"), "#!/bin/sh\necho connected\nexec sleep 60\n");
+    write_script(&bin.join("claude"), "#!/bin/sh\n[ \"$2\" = status ] && exit 0\necho agent-ready\nexec sleep 60\n");
+    std::fs::write(
+        env.root.join("config/kraal/accounts.toml"),
+        format!("[[account]]\nname = \"work\"\nagent = \"claude\"\nhome = {:?}\n", home.display().to_string()),
+    )
+    .unwrap();
+    let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap_or_default());
+    env.workspace("a", "layout { pane name=\"first\"; }\n");
+    env.workspace("b", "layout { pane name=\"second\"; }\n");
+    assert!(env.cmd(&["open", "a"]).env("PATH", &path).status().unwrap().success());
+    env.run(&["open", "b"]);
+    let mut client = RawClient::attach(&env, "a");
+    client.wait_for_row("$ ");
+    client.send(b"\x02Wx");
+    client.wait_for_row("Closed · 1 tab · 1 pane");
+    drop(client);
+    // No attached client, and the first retained workspace is Closed.
+    let restarted = env.cmd(&["restart", "--yes"]).env("PATH", &path).output().unwrap();
+    assert!(restarted.status.success(), "{}", String::from_utf8_lossy(&restarted.stderr));
+    let run = env.run(&["run", "--name", "new", "--", "sh"]);
+    // Address the server without a pane or attached terminal as the agent's destination.
+    let agent = env
+        .cmd(&["agent", "claude", "--account", "work", "--tab"])
+        .env("KRAAL_SOCKET", env.root.join("run/kraal/closedfirst.sock"))
+        .output()
+        .unwrap();
+    assert!(agent.status.success(), "{}", String::from_utf8_lossy(&agent.stderr));
+    let agent = String::from_utf8(agent.stdout).unwrap();
+    env.run(&["ssh", "example.invalid", "--tab"]);
+    env.run(&["files", env.root.to_str().unwrap()]);
+    env.wait_for_text(agent.trim(), "agent-ready");
+    let panes: Vec<serde_json::Value> = serde_json::from_str(&env.run(&["panes", "--json"])).unwrap();
+    let ssh = panes.iter().find(|p| p["command"][0] == "ssh").unwrap();
+    env.wait_for_text(&ssh["id"].to_string(), "connected");
+    assert_eq!(panes.len(), 5);
+    assert!(panes.iter().all(|p| p["workspace"] == "b"), "{panes:?}");
+    assert!(panes.iter().any(|p| p["id"].as_u64() == Some(run.trim().parse::<u64>().unwrap())));
+    let workspaces: Vec<serde_json::Value> = serde_json::from_str(&env.run(&["workspaces", "--json"])).unwrap();
+    assert_eq!(workspaces[0]["name"], "a");
+    assert_eq!(workspaces[0]["open"], false);
+}
+
+#[test]
+fn a_server_runbook_after_the_last_close_gets_an_open_saved_workspace() {
+    let env = Env::new("runafterclose");
+    let bin = env.root.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    write_script(&bin.join("ssh"), "#!/bin/sh\nfor a; do cmd=$a; done\nexec sh -c \"$cmd\"\n");
+    std::fs::write(env.root.join("config/kraal/servers.toml"), "[[server]]\nname = \"box\"\nhost = \"box.invalid\"\n")
+        .unwrap();
+    std::fs::create_dir_all(env.root.join("config/kraal/runbooks")).unwrap();
+    std::fs::write(env.root.join("config/kraal/runbooks/check.toml"), "on = \"server\"\nsteps = [\"echo checked\"]\n")
+        .unwrap();
+    env.workspace("w", "layout { pane name=\"original\"; }\n");
+    let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap_or_default());
+    assert!(env.cmd(&["open", "w"]).env("PATH", &path).status().unwrap().success());
+    let mut client = RawClient::attach(&env, "w");
+    client.wait_for_row("$ ");
+    client.send(b"\x02Wx");
+    client.wait_for_row("Closed · 1 tab · 1 pane");
+    let result = env.run(&["runbook", "run", "check", "--on", "box", "--yes", "--wait"]);
+    assert!(result.contains("finished: 1 ok, 0 failed, 0 skipped"), "{result}");
+    env.wait_for_text("box", "checked");
+    let workspaces: Vec<serde_json::Value> = serde_json::from_str(&env.run(&["workspaces", "--json"])).unwrap();
+    assert_eq!(workspaces.len(), 2);
+    assert_eq!(workspaces[0]["name"], "w");
+    assert_eq!(workspaces[0]["open"], false);
+    assert_eq!(workspaces[1]["open"], true);
+    assert_eq!(workspaces[1]["panes"], 1);
+    env.run(&["kill"]);
+    let saved: serde_json::Value = serde_json::from_slice(&std::fs::read(env.state_file()).unwrap()).unwrap();
+    assert_eq!(saved["workspaces"][1]["tabs"][0]["root"]["Pane"]["name"], "box");
+}
+
+#[test]
+fn the_ssh_group_command_reopens_its_closed_workspace() {
+    let env = Env::new("groupreopen");
+    let bin = env.root.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    write_script(&bin.join("ssh"), "#!/bin/sh\necho connected\nexec sleep 60\n");
+    std::fs::write(
+        env.root.join("config/kraal/servers.toml"),
+        "[[server]]\nname = \"box\"\nhost = \"box.invalid\"\ngroups = [\"prod\"]\n",
+    )
+    .unwrap();
+    let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap_or_default());
+    assert!(env.cmd(&["ssh", "prod", "--group"]).env("PATH", &path).status().unwrap().success());
+    env.wait_for_text("box", "connected");
+    let before: Vec<serde_json::Value> = serde_json::from_str(&env.run(&["workspaces", "--json"])).unwrap();
+    let name = before[0]["name"].as_str().unwrap();
+    let mut client = RawClient::attach(&env, name);
+    client.wait_for_message("\"attached\"");
+    client.send(b"\x02Wx");
+    client.wait_for_row("The layout will be kept.");
+    client.send(b"y");
+    client.wait_for_row("Closed · 1 tab · 1 pane");
+    env.run(&["ssh", "prod", "--group"]);
+    env.wait_for_text_since_restore("box", "connected");
+    let after: Vec<serde_json::Value> = serde_json::from_str(&env.run(&["workspaces", "--json"])).unwrap();
+    assert_eq!(after.len(), 1);
+    assert_eq!(after[0]["id"], before[0]["id"]);
+    assert_eq!(after[0]["open"], true);
+    assert_eq!(after[0]["panes"], 1);
+}
+
+#[test]
+fn a_crash_during_close_finishes_stopping_without_reopening_the_workspace() {
+    let env = Env::new("closecrash");
+    env.workspace("w", "layout { pane name=\"job\" command=\"sh\" { args \"-c\" \"trap '' HUP TERM; echo ready; while :; do sleep 1; done\"; }; }\n");
+    env.workspace("other", "layout { pane; }\n");
+    env.run(&["open", "w"]);
+    env.wait_for_text("job", "ready");
+    let mut client = RawClient::attach(&env, "w");
+    client.wait_for_message("\"attached\"");
+    client.send(b"\x02Wx");
+    client.wait_for_row("The layout will be kept.");
+    client.send(b"y");
+    wait_until(PATIENCE, "close was not prepared", || {
+        std::fs::read(env.state_file())
+            .ok()
+            .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+            .is_some_and(|s| s["workspaces"][0]["close_pending"].is_object())
+    });
+    let pid = env.server_pid().unwrap();
+    // SAFETY: only the isolated server this test started, after its close intent reached disk.
+    assert_eq!(unsafe { libc::kill(pid, libc::SIGKILL) }, 0);
+    wait_until(PATIENCE, "the crashed server still runs", || env.server_pid().is_none());
+    env.run(&["open", "other"]);
+    let list: serde_json::Value = serde_json::from_str(&env.run(&["workspaces", "--json"])).unwrap();
+    let ws = list.as_array().unwrap().iter().find(|w| w["name"] == "w").unwrap();
+    assert_eq!(ws["open"], false);
+    assert_eq!(ws["panes"], 1);
+    let panes: serde_json::Value = serde_json::from_str(&env.run(&["panes", "--json"])).unwrap();
+    assert!(panes.as_array().unwrap().iter().all(|p| p["workspace"] != "w"));
 }
 
 /// A command pane stays open when its program ends, to show how it ended: it has not ended, and
-/// the session goes on until it is closed.
+/// closing it leaves the workspace empty and the session running.
 #[test]
 fn a_command_pane_left_open_keeps_its_session() {
     let env = Env::new("keptopen");
@@ -10192,7 +10426,8 @@ fn a_command_pane_left_open_keeps_its_session() {
     assert_eq!(env.server_pid(), Some(pid), "the session ended");
     assert!(!client.messages.lock().unwrap().iter().any(|m| m.contains(r#""type":"exit""#)));
     env.run(&["close", "job"]);
-    client.wait_for_message("the last pane closed, so kraal stopped");
+    client.wait_for_row("+ Add pane");
+    assert_eq!(env.server_pid(), Some(pid));
 }
 
 /// `kraal restart` says what would stop before asking; a client attached in a terminal waits for

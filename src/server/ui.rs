@@ -107,6 +107,7 @@ pub enum ConfirmAction {
         tab: u32,
     },
     CloseWorkspace(u32),
+    RetryCloseWorkspace(u32),
     /// Restart the session on the kraal installed now.
     Restart,
     /// Stop the session, its layout saved.
@@ -176,6 +177,7 @@ impl ConfirmAction {
             ConfirmAction::ClosePane(_) => "Close pane".into(),
             ConfirmAction::CloseTab { .. } => "Close tab".into(),
             ConfirmAction::CloseWorkspace(_) => "Stop and close".into(),
+            ConfirmAction::RetryCloseWorkspace(_) => "Retry".into(),
             ConfirmAction::Restart => "Restart".into(),
             ConfirmAction::Quit => "Quit".into(),
             ConfirmAction::Job { label, .. } | ConfirmAction::GitJob { label, .. } => {
@@ -266,6 +268,8 @@ pub enum PickAction {
         token: u32,
     },
     SwitchWorkspace(u32),
+    ReopenWorkspace(u32),
+    RetryWorkspaceClose(u32),
     /// A definition not running, by its file.
     OpenDefinition(std::path::PathBuf),
     NewWorkspace,
@@ -468,6 +472,8 @@ impl Picker {
             (_, A::CheckExisting { .. }) => &[("enter", "Check again")],
             (_, A::UseExisting { .. }) => &[("enter", "Choose")],
             (_, A::AddAccount) => &[("enter", "Add account")],
+            (K::Workspace, A::RetryWorkspaceClose(_)) => &[("enter", "Retry Close")],
+            (K::Workspace, A::ReopenWorkspace(_)) => &[("enter", "Open")],
             (K::Workspace, A::SwitchWorkspace(_)) => &[("enter", "Open"), ("ctrl+x", "Close workspace")],
             (_, A::OpenDefinition(_)) => &[("enter", "Open workspace")],
             (_, A::NewWorkspace) => &[("enter", "Create workspace")],

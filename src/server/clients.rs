@@ -200,12 +200,13 @@ impl Server {
         if self.workspaces.is_empty() {
             let ws = self.new_workspace("main".into(), None);
             if let Err(e) = self.spawn_pane_in(ws, None, PaneSpec::default(), crate::protocol::Placement::Tab, None) {
-                self.drop_empty_workspaces();
                 self.send_msg(id, &ServerMsg::exit(format!("cannot start a shell: {e:#}")));
                 return;
             }
         }
-        let ws = target.unwrap_or_else(|| self.workspaces[0].id);
+        let ws =
+            target.unwrap_or_else(|| self.workspaces.iter().find(|w| !w.closed()).unwrap_or(&self.workspaces[0]).id);
+        let mode = self.workspaces.iter().all(|w| w.closed()).then(|| Mode::Picker(self.workspace_picker(ws)));
         let welcome = !crate::paths::state_dir().join("welcomed").exists();
         // Before anything is drawn: what this server is.
         let features = Some(protocol::feature_names());
@@ -213,6 +214,9 @@ impl Server {
         if let Some(c) = self.clients.get_mut(&id) {
             c.attached = true;
             c.workspace = ws;
+            if let Some(mode) = mode {
+                c.mode = mode;
+            }
             c.dirty = Dirty::Yes;
             c.welcome = welcome;
             // Ask the outer terminal for its colours so panes querying them get real values.

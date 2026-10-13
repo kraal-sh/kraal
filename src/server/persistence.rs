@@ -153,6 +153,20 @@ impl Server {
         }
         if let Some(snap) = persist::load(&self.session)? {
             self.apply_snapshot(snap)?;
+            let closing: Vec<_> = self
+                .workspaces
+                .iter()
+                .filter(|w| w.kept.as_ref().is_some_and(|s| s.close_pending.is_some()))
+                .map(|w| w.id)
+                .collect();
+            for ws in closing {
+                if let Err(e) = self.keep_and_close_workspace(ws) {
+                    if let Some(wi) = self.ws_index(ws) {
+                        self.workspaces[wi].close_error = Some(e.clone());
+                    }
+                    self.warnings.push(e);
+                }
+            }
         }
         Ok(())
     }
@@ -184,39 +198,34 @@ impl Server {
         Mode::confirm(message, ConfirmAction::Quit)
     }
 
-    pub(super) fn ask_close_workspace(&self, ws: u32) -> Mode {
+    pub(super) fn ask_close_workspace(&mut self, client: ClientId, ws: u32) -> Mode {
         let Some(wi) = self.ws_index(ws) else { return Mode::Normal };
+        if self.workspaces[wi].close_error.is_some() && self.workspaces[wi].kept.is_some() {
+            return self.close_workspace(client, ws);
+        }
+        if self.workspaces[wi].closed() {
+            return Mode::Picker(self.workspace_picker(ws));
+        }
+        let Some(stops) = self.stops(Some(ws)) else { return self.close_workspace(client, ws) };
         let workspace = &self.workspaces[wi];
         let mut message = format!(
-            "Close workspace \"{}\" and all its panes?\nThe current layout will be removed from the session.",
+            "Close workspace \"{}\" and all its panes?\nThe layout will be kept.\nReopening uses the saved layout.",
             workspace.name
         );
         if let Some(path) = &workspace.definition {
-            let usable = paths::read_regular_text(path, u64::MAX)
-                .is_ok_and(|source| crate::workspace::parse_workspace(&workspace.name, &source).is_ok());
-            if usable {
-                message.push_str(&format!(
-                    "\nThe workspace file is kept unchanged:\n  {}\nReopening uses that file's layout.",
-                    paths::shorten_home(path)
-                ));
-            } else {
-                message.push_str(&format!(
-                    "\nThe linked workspace file is missing or unusable:\n  {}\nReopening requires saving the layout first.",
-                    paths::shorten_home(path)
-                ));
-            }
+            message.push_str(&format!(
+                "\nThe workspace file is kept unchanged:\n  {}\nClose and Open do not reread that file.",
+                paths::shorten_home(path)
+            ));
         } else {
-            message.push_str("\nThis workspace has no linked file. It will disappear from the list.");
+            message.push_str("\nThis workspace has no linked file. It will stay in the list as Closed.");
         }
-        message.push_str("\nCancel and save the layout first to keep it.");
-        if self.workspaces.len() == 1 {
-            message.push_str("\nThis is the last workspace. The session will stop.");
+        if self.workspaces.iter().filter(|w| !w.closed()).count() == 1 {
+            message.push_str("\nThis is the last open workspace. The session will stay open.");
         }
-        if let Some(stops) = self.stops(Some(ws)) {
-            message.push('\n');
-            message.push_str(&stops);
-            message.push_str("\nUnsaved work in these programs may be lost.");
-        }
+        message.push('\n');
+        message.push_str(&stops);
+        message.push_str("\nUnsaved work in these programs may be lost.");
         Mode::confirm(message, ConfirmAction::CloseWorkspace(ws))
     }
 
@@ -277,8 +286,6 @@ pub(super) enum Persist {
     /// The paste buffers' file, as [`Persisting`] last has it, if an earlier job did not write
     /// it already.
     Buffers,
-    /// The session ended with its last pane: nothing is left to restore.
-    Delete(String),
     /// Everything asked before is written: say whether the last save of the state, of each
     /// pane's scrollback and of the paste buffers worked.
     Flush(Sender<Result<(), String>>),
@@ -332,7 +339,7 @@ impl Persisting {
 }
 
 /// The only writer of session state, so writes land in order: a late save never overwrites the
-/// final one, nor brings back a session whose state was deleted. It keeps `held`, what holds the
+/// final one. It keeps `held`, what holds the
 /// session for this server, until it has written its last: a server that stops without waiting
 /// for a write that is stuck does not let go of the session while that write may still land.
 pub(super) fn spawn_persister(
@@ -414,12 +421,6 @@ pub(super) fn spawn_persister(
                             }
                         }
                     }
-                    Persist::Delete(session) => {
-                        let _ = std::fs::remove_file(paths::session_state_path(session));
-                        let _ = persist::forget_scrollback(session);
-                        last = Ok(());
-                        failing.clear();
-                    }
                     Persist::Flush(done) => {
                         let _ = done.send(flush_answer(&last, &failing, buffers_failing.as_deref()));
                     }
@@ -449,8 +450,308 @@ fn flush_answer(
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
+
+    pub(in crate::server) fn writer(
+        server: &mut Server,
+        answers: Vec<Result<(), String>>,
+    ) -> Arc<Mutex<Vec<serde_json::Value>>> {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let saved = Arc::new(Mutex::new(Vec::new()));
+        let recorded = saved.clone();
+        let shared = server.persisting.clone();
+        server.persister = tx;
+        std::thread::spawn(move || {
+            let mut answers = answers.into_iter();
+            while let Ok(job) = rx.recv() {
+                match job {
+                    Persist::Save(_, snap) => {
+                        recorded.lock().unwrap().push(serde_json::to_value(snap).unwrap());
+                        shared.lock().unwrap().saves = 0;
+                    }
+                    Persist::Flush(done) => {
+                        let answer = answers.next().unwrap_or(Ok(()));
+                        shared.lock().unwrap().state_failed = answer.is_err();
+                        let _ = done.send(answer);
+                    }
+                    _ => {}
+                }
+            }
+        });
+        saved
+    }
+
+    fn workspace(server: &mut Server) -> u32 {
+        use crate::pane::PaneSpec;
+        use crate::protocol::Placement;
+        let ws = server.new_workspace("personal".into(), Some("/missing/source.kdl".into()));
+        for placement in [Placement::Tab, Placement::Right, Placement::Floating, Placement::Tab] {
+            server
+                .spawn_pane_in(
+                    ws,
+                    None,
+                    PaneSpec { files: Some(["/missing".into(), "/missing".into()]), ..Default::default() },
+                    placement,
+                    Some("kept".into()),
+                )
+                .unwrap();
+        }
+        server.workspaces[0].definition_source = Some("// original source".into());
+        ws
+    }
+
+    #[test]
+    fn closed_and_empty_workspaces_stay_in_the_array_read_by_released_versions() {
+        let (tx, _rx) = crate::server::event_channel(4096);
+        let mut server = crate::server::tests::server(tx.clone());
+        server.new_workspace("empty".into(), None);
+        let mut snap = persist::snapshot(&server);
+        snap.workspaces[0].closed = true;
+        let mut value = serde_json::to_value(snap).unwrap();
+        // Both released readers ignore additive metadata and restore the ordinary tabs.
+        let ws = value["workspaces"][0].as_object_mut().unwrap();
+        for field in ["id", "closed", "empty", "close_pending"] {
+            ws.remove(field);
+        }
+        let mut older = crate::server::tests::server(tx);
+        persist::apply(&mut older, serde_json::from_value(value).unwrap()).unwrap();
+        assert_eq!(older.workspaces.len(), 1);
+        assert_eq!(older.workspaces[0].name, "empty");
+        assert_eq!(older.workspaces[0].panes().len(), 1);
+        assert!(older.unrestored.is_empty());
+    }
+
+    #[test]
+    fn close_saves_intent_before_stopping_and_reopens_the_personal_layout() {
+        let (tx, _rx) = crate::server::event_channel(4096);
+        let mut server = super::super::tests::server(tx.clone());
+        let ws = workspace(&mut server);
+        let original = serde_json::to_value(persist::snapshot(&server)).unwrap();
+        let saved = writer(&mut server, vec![Ok(()), Ok(())]);
+        server.keep_and_close_workspace(ws).unwrap();
+        assert!(!server.quitting);
+        assert!(server.panes.is_empty());
+        assert!(server.workspaces[0].closed());
+        assert_eq!(server.workspaces[0].counts(), (2, 4));
+        let writes = saved.lock().unwrap();
+        assert_eq!(writes.len(), 2);
+        assert!(writes[0]["workspaces"][0]["close_pending"].is_object());
+        assert_ne!(writes[0]["workspaces"][0]["closed"], true);
+        assert_eq!(writes[1]["workspaces"][0]["closed"], true);
+        assert_eq!(writes[0]["workspaces"][0]["tabs"], original["workspaces"][0]["tabs"]);
+        drop(writes);
+        let mut restored = super::super::tests::server(tx);
+        restored.apply_snapshot(persist::snapshot(&server)).unwrap();
+        assert!(restored.panes.is_empty(), "closed workspaces start no programs");
+        assert!(restored.workspaces[0].closed());
+        restored.open_workspace("personal").unwrap();
+        assert_eq!(serde_json::to_value(persist::snapshot(&restored)).unwrap(), original);
+        assert_eq!(restored.workspaces.len(), 1, "the missing source is never imported again");
+    }
+
+    #[test]
+    fn a_failed_preparation_stops_nothing_and_a_retry_keeps_the_layout() {
+        let (tx, _rx) = crate::server::event_channel(4096);
+        let mut server = super::super::tests::server(tx);
+        let ws = workspace(&mut server);
+        let before = serde_json::to_value(persist::snapshot(&server)).unwrap();
+        writer(&mut server, vec![Err("Disk full".into()), Ok(()), Ok(())]);
+        let Mode::Confirm(question) = server.close_workspace(0, ws) else { panic!("retry") };
+        assert!(question.message.contains("Nothing was stopped."));
+        assert!(question.message.contains("Disk full"));
+        assert_eq!(question.action.verb(), "Retry");
+        assert!(!question.yes);
+        assert!(
+            matches!(server.workspace_picker(ws).current().unwrap().action, super::super::ui::PickAction::RetryWorkspaceClose(id) if id == ws)
+        );
+        assert_eq!(server.panes.len(), 4);
+        assert_eq!(serde_json::to_value(persist::snapshot(&server)).unwrap(), before);
+        assert!(matches!(server.close_workspace(0, ws), Mode::Picker(_)));
+        assert!(server.workspaces[0].closed());
+        assert!(server.workspaces[0].close_error.is_none());
+    }
+
+    #[test]
+    fn a_failed_final_save_keeps_the_prepared_layout_and_tells_the_truth() {
+        let (tx, _rx) = crate::server::event_channel(4096);
+        let mut server = super::super::tests::server(tx.clone());
+        let ws = workspace(&mut server);
+        let saved = writer(&mut server, vec![Ok(()), Err("Disk full".into()), Ok(())]);
+        let Mode::Confirm(question) = server.close_workspace(0, ws) else { panic!("retry") };
+        assert!(question.message.contains("Programs stopped. Couldn't save the final state."));
+        assert!(!question.message.contains("Nothing was stopped"));
+        assert!(server.panes.is_empty());
+        assert_eq!(server.workspaces[0].status(), "Programs stopped · Save failed");
+        let prepared = saved.lock().unwrap()[0].clone();
+        let mut recovered = super::super::tests::server(tx);
+        recovered.apply_snapshot(serde_json::from_value(prepared).unwrap()).unwrap();
+        assert!(recovered.panes.is_empty(), "an interrupted close never relaunches its programs");
+        let id = recovered.workspaces[0].id;
+        writer(&mut recovered, vec![Ok(()), Ok(())]);
+        recovered.keep_and_close_workspace(id).unwrap();
+        assert!(recovered.workspaces[0].closed());
+        assert_eq!(recovered.workspaces[0].counts(), (2, 4));
+        server.close_workspace(0, ws);
+        assert!(server.workspaces[0].close_error.is_none());
+        assert_eq!(server.workspaces[0].status(), "Closed");
+    }
+
+    #[test]
+    fn the_last_pane_keeps_an_empty_workspace_across_restore() {
+        let (tx, _rx) = crate::server::event_channel(4096);
+        let mut server = super::super::tests::server(tx.clone());
+        workspace(&mut server);
+        let id = server.workspaces[0].stable_id.clone();
+        for pane in server.workspaces[0].panes() {
+            server.close_pane(pane);
+        }
+        assert!(!server.quitting);
+        assert!(server.workspaces[0].tabs.is_empty());
+        assert!(server.workspaces[0].tab().is_none());
+        let saved = persist::snapshot(&server);
+        assert!(saved.workspaces[0].empty);
+        assert_eq!(saved.workspaces[0].counts(), (0, 0));
+        assert_eq!(saved.workspaces[0].tabs.len(), 1, "older readers get a shell fallback");
+        let mut restored = super::super::tests::server(tx);
+        restored.apply_snapshot(saved).unwrap();
+        assert!(restored.unrestored.is_empty());
+        assert_eq!(restored.workspaces[0].stable_id, id);
+        assert!(restored.workspaces[0].tabs.is_empty());
+        let ws = restored.workspaces[0].id;
+        writer(&mut restored, vec![]);
+        restored.keep_and_close_workspace(ws).unwrap();
+        restored.reopen_workspace(ws).unwrap();
+        assert!(restored.workspaces[0].tabs.is_empty());
+        assert!(restored.panes.is_empty());
+    }
+
+    #[test]
+    fn partial_close_snapshots_and_scrollback_survive_later_saves() {
+        let (tx, _rx) = crate::server::event_channel(4096);
+        let mut server = super::super::tests::server(tx);
+        let ws = workspace(&mut server);
+        let mut saved = persist::snapshot(&server).workspaces.remove(0);
+        saved.close_pending = Some(persist::CloseIntent::new(Vec::new(), Vec::new()));
+        let persist::NodeSnap::Pane(pane) = saved.tabs[1].root.as_mut().unwrap() else { panic!() };
+        pane.scrollback = Some("1-2-3.ans".into());
+        server.workspaces[0].kept = Some(saved.clone());
+        for pane in server.workspaces[0].panes() {
+            server.close_pane(pane);
+        }
+        let partial = persist::snapshot(&server);
+        assert_eq!(serde_json::to_value(&partial.workspaces[0]).unwrap(), serde_json::to_value(saved).unwrap());
+        assert!(persist::scrollback_files(&partial).contains("1-2-3.ans"));
+        assert!(server.reopen_workspace(ws).unwrap_err().to_string().contains("Retry Close"));
+        server.config.save_scrollback = false;
+        assert!(persist::scrollback_files(&persist::snapshot(&server)).is_empty());
+    }
+
+    #[test]
+    fn a_live_program_is_not_signalled_until_the_preparation_is_acknowledged() {
+        let (tx, _rx) = crate::server::event_channel(4096);
+        let mut server = super::super::tests::server(tx);
+        server.config.save_scrollback = false;
+        let ws = server.new_workspace("live".into(), None);
+        let pane = server
+            .spawn_pane_in(
+                ws,
+                None,
+                crate::pane::PaneSpec { command: vec!["sleep".into(), "60".into()], ..Default::default() },
+                crate::protocol::Placement::Tab,
+                None,
+            )
+            .unwrap();
+        let process = server.panes[&pane].process_hold().unwrap();
+        let observed = process.clone();
+        let (writer, jobs) = crossbeam_channel::unbounded();
+        server.persister = writer;
+        let written = std::thread::spawn(move || {
+            let mut saves = 0;
+            let mut prepared = false;
+            while let Ok(job) = jobs.recv() {
+                match job {
+                    Persist::Save(_, snap) => {
+                        saves += 1;
+                        if saves == 1 {
+                            let intent = snap.workspaces[0].close_pending.as_ref().unwrap();
+                            assert_eq!(intent.local_sessions()[0].leader, observed.session_owner().unwrap().leader);
+                            assert!(observed.group_running());
+                        }
+                    }
+                    Persist::Flush(done) => {
+                        if !prepared {
+                            assert!(observed.group_running(), "the writer has not acknowledged preparation yet");
+                            prepared = true;
+                        } else {
+                            assert!(!observed.group_running(), "Closed requires stopped programs");
+                            done.send(Ok(())).unwrap();
+                            return saves;
+                        }
+                        done.send(Ok(())).unwrap();
+                    }
+                    _ => {}
+                }
+            }
+            panic!("close did not finish")
+        });
+        server.keep_and_close_workspace(ws).unwrap();
+        assert_eq!(written.join().unwrap(), 2);
+        assert!(!process.group_running());
+        assert!(server.workspaces[0].closed());
+    }
+
+    #[test]
+    fn a_failed_reopen_keeps_the_layout_and_other_empty_workspaces() {
+        let (tx, _rx) = crate::server::event_channel(4096);
+        let mut server = super::super::tests::server(tx);
+        let ws = workspace(&mut server);
+        writer(&mut server, vec![]);
+        server.keep_and_close_workspace(ws).unwrap();
+        let kept = server.workspaces[0].kept.as_mut().unwrap();
+        let persist::NodeSnap::Pane(p) = kept.tabs[1].root.as_mut().unwrap() else { panic!() };
+        p.spec.files = None;
+        // An earlier SSH pane is ready to launch, before the later shell fails preparation.
+        let earlier = &mut kept.tabs[0].floating[0].0;
+        earlier.spec.files = None;
+        earlier.spec.command = vec!["ssh".into(), "example.invalid".into()];
+        earlier.stopped = false;
+        let original = serde_json::to_value(&server.workspaces[0].kept).unwrap();
+        server.new_workspace("empty neighbour".into(), None);
+        server.env.shell = "/no/such/shell".into();
+        let (launches, queued) = crossbeam_channel::unbounded();
+        server.launches = launches;
+        assert!(server.reopen_workspace(ws).unwrap_err().to_string().contains("Its layout is kept"));
+        assert!(queued.is_empty(), "failed construction must never queue the earlier program for launch");
+        assert!(server.panes.is_empty(), "partial construction is rolled back");
+        assert!(server.workspaces[0].closed());
+        assert_eq!(serde_json::to_value(&server.workspaces[0].kept).unwrap(), original);
+        assert_eq!(server.workspaces.len(), 2);
+        assert!(server.workspaces[1].tabs.is_empty());
+    }
+
+    #[test]
+    fn closing_the_last_workspace_keeps_all_clients_in_the_list() {
+        let (tx, _rx) = crate::server::event_channel(4096);
+        let mut server = super::super::tests::server(tx);
+        let (first, _peer) = super::super::tests::client(&mut server);
+        let ws = server.clients[&first].workspace;
+        server.workspaces[0].tabs.clear();
+        let (second, _other) = super::super::tests::client(&mut server);
+        server.workspaces.pop();
+        server.clients.get_mut(&second).unwrap().workspace = ws;
+        writer(&mut server, vec![]);
+        server.keep_and_close_workspace(ws).unwrap();
+        for id in [first, second] {
+            assert_eq!(server.clients[&id].workspace, ws);
+            assert!(matches!(server.clients[&id].mode, Mode::Picker(_)));
+        }
+        assert!(!server.quitting);
+        server.attach(first, 80, 24, None);
+        assert!(server.workspaces[0].closed(), "attaching without a name does not reopen it");
+        assert!(matches!(server.clients[&first].mode, Mode::Picker(_)));
+        assert_eq!(server.workspaces.len(), 1, "no replacement main workspace");
+    }
 
     #[test]
     fn workspace_identity_survives_renaming_reordering_and_restoring() {
@@ -525,39 +826,49 @@ mod tests {
         let (tx, _rx) = crate::server::queue::channel(32);
         let mut server = crate::server::tests::server(tx);
         let ws = server.new_workspace("api".into(), None);
+        server
+            .spawn_pane_in(
+                ws,
+                None,
+                crate::pane::PaneSpec { command: vec!["sleep".into(), "60".into()], ..Default::default() },
+                crate::protocol::Placement::Tab,
+                None,
+            )
+            .unwrap();
         for linked in [false, true] {
             server.workspaces[0].definition = linked.then(|| path.clone());
-            let Mode::Confirm(q) = server.ask_close_workspace(ws) else { panic!("confirmation") };
+            let Mode::Confirm(q) = server.ask_close_workspace(0, ws) else { panic!("confirmation") };
             assert!(!q.yes);
             assert!(q.message.starts_with("Close workspace \"api\" and all its panes?"));
-            assert!(q.message.contains("The current layout will be removed from the session."));
-            assert!(q.message.contains("Cancel and save the layout first to keep it."));
-            assert!(q.message.contains("This is the last workspace. The session will stop."));
-            assert!(!q.message.contains("These programs stop:"));
+            assert!(q.message.contains("The layout will be kept."));
+            assert!(q.message.contains("Reopening uses the saved layout."));
+            assert!(q.message.contains("This is the last open workspace. The session will stay open."));
+            assert!(q.message.contains("These programs stop:"));
             if linked {
                 assert!(q.message.contains(&format!("The workspace file is kept unchanged:\n  {}", path.display())));
-                assert!(q.message.contains("Reopening uses that file's layout."));
+                assert!(q.message.contains("Close and Open do not reread that file."));
                 assert!(!q.message.contains("disappear"));
             } else {
-                assert!(q.message.contains("This workspace has no linked file. It will disappear from the list."));
-                assert!(!q.message.contains("Reopening"));
+                assert!(q.message.contains("This workspace has no linked file. It will stay in the list as Closed."));
+                assert!(!q.message.contains("The workspace file is kept unchanged:"));
             }
         }
         server.new_workspace("other".into(), None);
-        let Mode::Confirm(q) = server.ask_close_workspace(ws) else { panic!("confirmation") };
-        assert!(!q.message.contains("The session will stop."));
-        assert!(matches!(server.ask_close_workspace(u32::MAX), Mode::Normal));
+        let Mode::Confirm(q) = server.ask_close_workspace(0, ws) else { panic!("confirmation") };
+        assert!(!q.message.contains("This is the last open workspace."));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "layout { pane; }\n");
+        assert!(matches!(server.ask_close_workspace(0, u32::MAX), Mode::Normal));
         std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
-    fn closing_warns_when_the_linked_definition_was_deleted_or_became_invalid() {
+    fn closing_keeps_the_layout_when_the_linked_definition_was_deleted_or_became_invalid() {
         let dir = std::env::temp_dir().join(format!("kraal-close-missing-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let dir = dir.canonicalize().unwrap();
         let path = dir.join("api.kdl");
         for replacement in [None, Some("not a workspace")] {
-            std::fs::write(&path, "layout { pane command=\"true\" start_suspended=true; }\n").unwrap();
+            std::fs::write(&path, "layout { pane command=\"sleep\" { args \"60\"; }; }\n").unwrap();
             let (tx, _rx) = crate::server::queue::channel(32);
             let mut server = crate::server::tests::server(tx);
             let ws = server.open_definition(&path).unwrap();
@@ -568,14 +879,24 @@ mod tests {
             }
             server.scan_definitions();
             assert_eq!(server.workspaces[0].definition.as_ref(), Some(&path));
-            let Mode::Confirm(q) = server.ask_close_workspace(ws) else { panic!("confirmation") };
+            let Mode::Confirm(q) = server.ask_close_workspace(0, ws) else { panic!("confirmation") };
             assert!(!q.yes);
-            assert!(q.message.contains("The linked workspace file is missing or unusable:"), "{}", q.message);
+            assert!(q.message.contains("The workspace file is kept unchanged:"), "{}", q.message);
             assert!(q.message.contains(&path.display().to_string()), "{}", q.message);
-            assert!(q.message.contains("Reopening requires saving the layout first."), "{}", q.message);
-            assert!(q.message.contains("Cancel and save the layout first to keep it."));
+            assert!(q.message.contains("Close and Open do not reread that file."), "{}", q.message);
+            assert!(q.message.contains("Reopening uses the saved layout."));
             assert!(!q.message.contains("Reopening uses that file's layout."));
             assert_eq!(server.workspaces[0].panes().len(), 1);
+            assert_eq!(std::fs::read_to_string(&path).ok().as_deref(), replacement);
+            let mut expected = serde_json::to_value(persist::snapshot(&server)).unwrap();
+            expected["workspaces"][0]["tabs"][0]["root"]["Pane"]["stopped"] = true.into();
+            writer(&mut server, vec![Ok(()), Ok(())]);
+            server.keep_and_close_workspace(ws).unwrap();
+            assert!(server.workspaces[0].closed());
+            assert!(server.panes.is_empty());
+            server.reopen_workspace(ws).unwrap();
+            let after = serde_json::to_value(persist::snapshot(&server)).unwrap();
+            assert_eq!(after["workspaces"][0]["tabs"], expected["workspaces"][0]["tabs"]);
             assert_eq!(std::fs::read_to_string(&path).ok().as_deref(), replacement);
         }
         std::fs::remove_dir_all(dir).unwrap();
@@ -604,7 +925,7 @@ mod tests {
         assert_eq!(pane.foreground_pid(), Some(pid));
         assert!(pane.shell_waiting());
         assert!(pane.background_jobs().is_empty());
-        let Mode::Confirm(q) = server.ask_close_workspace(ws) else { panic!("confirmation") };
+        let Mode::Confirm(q) = server.ask_close_workspace(0, ws) else { panic!("confirmation") };
         assert!(q.message.contains("These programs stop:\n  sh -c 'sleep 600; echo done'"), "{}", q.message);
         assert!(q.message.contains("Unsaved work in these programs may be lost."), "{}", q.message);
     }

@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 
+use super::panes::ProgramStop;
 use super::ui::{ConfirmAction, Mode, PickAction, PickItem, Picker, PickerKind};
 use super::{ClientId, Server};
 use crate::account_status::{self, Status};
@@ -54,67 +55,8 @@ pub(super) struct AccountSwitch {
     undo: bool,
     observed: Option<ObservedAgent>,
     started: Option<Instant>,
-    stopping: Option<SwitchStop>,
+    stopping: Option<ProgramStop>,
     pub stage: SwitchStage,
-}
-
-/// Keep the terminal's session and the agent's children identifiable after its shell exits.
-struct SwitchStop {
-    process: crate::pane::ProcessHold,
-    members: Vec<(u32, u64)>,
-    since: Instant,
-}
-
-impl SwitchStop {
-    fn new(pane: &crate::pane::Pane) -> Option<Self> {
-        let mut stop = Self { process: pane.process_hold()?, members: Vec::new(), since: Instant::now() };
-        stop.refresh();
-        Some(stop)
-    }
-
-    fn refresh(&mut self) {
-        self.members.retain(|&(pid, started)| crate::process::still_running(pid, started));
-        let mut pids = self.process.session_members();
-        pids.extend(self.members.iter().map(|&(pid, _)| pid));
-        // Remember children before signalling their parents, including ones in another session.
-        let roots = pids.clone();
-        for pid in roots {
-            pids.extend(crate::process::descendants(pid));
-        }
-        pids.sort_unstable();
-        pids.dedup();
-        for pid in pids {
-            if !self.members.iter().any(|&(seen, _)| seen == pid)
-                && let Some(started) = crate::process::start_time(pid)
-            {
-                self.members.push((pid, started));
-            }
-        }
-    }
-
-    fn signal(&self, signal: i32) {
-        self.process.signal(signal);
-        for &(pid, started) in &self.members {
-            if crate::process::still_running(pid, started) {
-                // SAFETY: this member of our stopped job still has the identity we retained.
-                unsafe { libc::kill(pid as libc::pid_t, signal) };
-            }
-        }
-    }
-
-    fn finished(&mut self) -> bool {
-        self.refresh();
-        if self.members.iter().all(|&(pid, started)| !crate::process::still_running(pid, started)) {
-            return true;
-        }
-        let elapsed = self.since.elapsed();
-        if elapsed >= Duration::from_secs(2) {
-            self.signal(libc::SIGKILL);
-        } else if elapsed >= Duration::from_secs(1) {
-            self.signal(libc::SIGTERM);
-        }
-        false
-    }
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -375,7 +317,7 @@ impl Server {
             self.accounts.bind_pane(&mut pane.spec);
             renamed |= before != (pane.spec.account.clone(), pane.spec.account_id.clone());
         }
-        for ws in &mut self.unrestored {
+        for ws in self.unrestored.iter_mut().chain(self.workspaces.iter_mut().filter_map(|w| w.kept.as_mut())) {
             renamed |= ws.bind_accounts(&self.accounts);
         }
         if renamed {
@@ -1104,7 +1046,7 @@ impl Server {
         let switch = self.switches.get_mut(&pane).unwrap();
         switch.stage = stage;
         let p = &self.panes[&pane];
-        switch.stopping = SwitchStop::new(p);
+        switch.stopping = ProgramStop::new(p);
         if let Some(stop) = &switch.stopping {
             stop.signal(libc::SIGHUP);
         }
@@ -2058,7 +2000,7 @@ mod tests {
                 }
             }
             for pane in self.server.panes.values() {
-                if let Some(stop) = SwitchStop::new(pane) {
+                if let Some(stop) = ProgramStop::new(pane) {
                     stop.signal(libc::SIGKILL);
                 }
             }

@@ -133,7 +133,8 @@ reason on its standard error:
 
 `kraal events --since 1262 --boot 1760184000000` goes on from there, and misses nothing while the
 server still has the events. A stream that ends without that line, with status 0, ended with the
-session: kraal stopped or restarted, or its last pane closed.
+session: kraal stopped or restarted. Closing its last pane or workspace keeps the session and
+its event streams running.
 [notify-blocked.sh](../examples/scripts/notify-blocked.sh) is a script on this stream that goes on
 where it stopped.
 

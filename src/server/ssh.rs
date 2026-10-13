@@ -117,8 +117,9 @@ impl Server {
     /// after the group (switching to it if it is already open).
     pub fn open_group(&mut self, group: &str, remote: &[String]) -> Result<u32> {
         let ws_name = group_workspace_name(group, remote);
-        if let Some(ws) = self.workspaces.iter().find(|w| w.name == ws_name) {
-            return Ok(ws.id);
+        if let Some(ws) = self.workspaces.iter().find(|w| w.name == ws_name).map(|w| w.id) {
+            self.reopen_workspace(ws)?;
+            return Ok(ws);
         }
         let members: Vec<servers::Server> = self
             .known_servers
@@ -328,6 +329,28 @@ fn read_ssh_config(path: &Path, out: &mut Vec<String>, depth: u8) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reopening_a_group_reports_restore_failure_and_keeps_its_identity() {
+        let (tx, _rx) = crate::server::event_channel(4096);
+        let mut server = crate::server::tests::server(tx);
+        let ws = server.new_workspace("prod".into(), None);
+        server.spawn_pane_in(ws, None, PaneSpec::default(), Placement::Tab, None).unwrap();
+        crate::server::persistence::tests::writer(&mut server, vec![]);
+        server.keep_and_close_workspace(ws).unwrap();
+        server.env.shell = "/missing/shell".into();
+        assert!(server.open_group("prod", &[]).unwrap_err().to_string().contains("Its layout is kept"));
+        assert!(server.workspaces[0].closed());
+        assert!(server.panes.is_empty());
+        server.env.shell = "sh".into();
+        assert_eq!(server.open_group("prod", &[]).unwrap(), ws);
+        assert_eq!(server.workspaces.len(), 1);
+        assert!(!server.workspaces[0].closed());
+        assert_eq!(server.workspaces[0].panes().len(), 1);
+        for pane in server.workspaces[0].panes() {
+            server.close_pane(pane);
+        }
+    }
 
     #[test]
     fn group_commands_get_a_workspace_each() {

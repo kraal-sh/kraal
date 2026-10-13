@@ -47,13 +47,82 @@ pub struct WorkspaceSnap {
     pub cwd: Option<PathBuf>,
     pub active: usize,
     pub tabs: Vec<TabSnap>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub closed: bool,
+    /// Older readers restore the compatible shell in `tabs`; this reader keeps no panes.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub empty: bool,
+    /// Process identities retained before signalling, so interrupted closes can finish safely.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub close_pending: Option<CloseIntent>,
     #[serde(default)]
     pub sync: crate::server::SyncScope,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub restore_error: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CloseIntent {
+    machine: Option<String>,
+    boot: String,
+    members: Vec<(u32, u64)>,
+    #[serde(default)]
+    sessions: Vec<crate::process::SessionOwner>,
+}
+
+impl CloseIntent {
+    pub fn new(members: Vec<(u32, u64)>, sessions: Vec<crate::process::SessionOwner>) -> Self {
+        Self { machine: crate::process::machine_id(), boot: crate::process::boot_id(), members, sessions }
+    }
+
+    pub fn local_members(&self) -> Vec<(u32, u64)> {
+        if self.is_local() { self.members.clone() } else { Vec::new() }
+    }
+
+    pub fn local_sessions(&self) -> Vec<crate::process::SessionOwner> {
+        if self.is_local() { self.sessions.clone() } else { Vec::new() }
+    }
+
+    fn is_local(&self) -> bool {
+        self.machine.is_some() && self.machine == crate::process::machine_id() && self.boot == crate::process::boot_id()
+    }
+}
+
 impl WorkspaceSnap {
+    fn clear_scrollback(&mut self) {
+        fn clear(node: &mut NodeSnap) {
+            match node {
+                NodeSnap::Pane(p) => p.scrollback = None,
+                NodeSnap::Split { children, .. } => {
+                    for (child, _) in children {
+                        clear(child);
+                    }
+                }
+            }
+        }
+        for tab in &mut self.tabs {
+            if let Some(root) = &mut tab.root {
+                clear(root);
+            }
+            for (pane, _) in &mut tab.floating {
+                pane.scrollback = None;
+            }
+        }
+    }
+
+    pub fn counts(&self) -> (usize, usize) {
+        fn panes(node: &NodeSnap) -> usize {
+            match node {
+                NodeSnap::Pane(_) => 1,
+                NodeSnap::Split { children, .. } => children.iter().map(|(n, _)| panes(n)).sum(),
+            }
+        }
+        if self.empty {
+            return (0, 0);
+        }
+        (self.tabs.len(), self.tabs.iter().map(|t| t.root.as_ref().map_or(0, panes) + t.floating.len()).sum())
+    }
+
     /// Bind every saved pane, including a workspace whose programs cannot be restored yet.
     pub fn bind_accounts(&mut self, accounts: &crate::accounts::Accounts) -> bool {
         fn pane(p: &mut PaneSnap, accounts: &crate::accounts::Accounts) -> bool {
@@ -162,7 +231,7 @@ pub fn snapshot(server: &Server) -> SessionSnapshot {
             spec,
             agent,
             agent_session: p.agent.session_id.clone(),
-            stopped: p.exit_code.is_some(),
+            stopped: p.exit_code.is_some() || p.suspended,
             scrollback: server.scrollback.get(&id).and_then(|s| s.file.clone()),
         }
     };
@@ -183,48 +252,92 @@ pub fn snapshot(server: &Server) -> SessionSnapshot {
             },
         }
     }
-    let workspaces = server
+    let mut workspaces: Vec<WorkspaceSnap> = server
         .workspaces
         .iter()
-        .map(|ws| WorkspaceSnap {
-            id: ws.stable_id.clone(),
-            name: ws.name.clone(),
-            definition: ws.definition.clone(),
-            definition_source: ws.definition_source.clone(),
-            cwd: ws.cwd.clone(),
-            active: ws.active,
-            // Typing is never broadcast after a restart: it starts again only when asked.
-            sync: crate::server::SyncScope::Off,
-            restore_error: None,
-            tabs: ws
-                .tabs
-                .iter()
-                .map(|t| {
-                    // Login panes and shown paste buffers may hold secrets and must not return.
-                    let floating: Vec<&crate::server::Floating> = t
-                        .floating
-                        .iter()
-                        .filter(|f| {
-                            !server.panes.get(&f.pane).is_some_and(|p| p.shows_text() || p.spec.login.is_some())
-                        })
-                        .collect();
-                    let mut kept = t.root.as_ref().map(|r| r.leaves()).unwrap_or_default();
-                    kept.extend(floating.iter().map(|f| f.pane));
-                    TabSnap {
-                        name: t.name.clone(),
-                        root: t.root.as_ref().map(|r| node(r, &pane_snap)),
-                        floating: floating.iter().map(|f| (pane_snap(f.pane), f.rect)).collect(),
-                        focus: t.focus.and_then(|f| kept.iter().position(|p| *p == f)),
-                        show_floating: t.show_floating && !floating.is_empty(),
-                        zoomed: t.zoom.is_some(),
-                        sync: false,
-                        preset: t.preset,
-                    }
-                })
-                .collect(),
+        .map(|ws| {
+            if let Some(kept) = &ws.kept {
+                let mut kept = kept.clone();
+                kept.bind_accounts(&server.accounts);
+                kept.name = ws.name.clone();
+                kept.definition = ws.definition.clone();
+                kept.definition_source = ws.definition_source.clone();
+                return kept;
+            }
+            let mut saved = WorkspaceSnap {
+                id: ws.stable_id.clone(),
+                name: ws.name.clone(),
+                definition: ws.definition.clone(),
+                definition_source: ws.definition_source.clone(),
+                cwd: ws.cwd.clone(),
+                active: ws.active,
+                // Typing is never broadcast after a restart: it starts again only when asked.
+                sync: crate::server::SyncScope::Off,
+                restore_error: None,
+                closed: false,
+                empty: false,
+                close_pending: None,
+                tabs: ws
+                    .tabs
+                    .iter()
+                    .map(|t| {
+                        // Login panes and shown paste buffers may hold secrets and must not return.
+                        let floating: Vec<&crate::server::Floating> = t
+                            .floating
+                            .iter()
+                            .filter(|f| {
+                                !server.panes.get(&f.pane).is_some_and(|p| p.shows_text() || p.spec.login.is_some())
+                            })
+                            .collect();
+                        let mut kept = t.root.as_ref().map(|r| r.leaves()).unwrap_or_default();
+                        kept.extend(floating.iter().map(|f| f.pane));
+                        TabSnap {
+                            name: t.name.clone(),
+                            root: t.root.as_ref().map(|r| node(r, &pane_snap)),
+                            floating: floating.iter().map(|f| (pane_snap(f.pane), f.rect)).collect(),
+                            focus: t.focus.and_then(|f| kept.iter().position(|p| *p == f)),
+                            show_floating: t.show_floating && !floating.is_empty(),
+                            zoomed: t.zoom.is_some(),
+                            sync: false,
+                            preset: t.preset,
+                        }
+                    })
+                    .collect(),
+            };
+            let has_panes = |t: &&TabSnap| t.root.is_some() || !t.floating.is_empty();
+            saved.active = saved.tabs.iter().take(ws.active).filter(has_panes).count();
+            saved.tabs.retain(|t| t.root.is_some() || !t.floating.is_empty());
+            saved.empty = saved.tabs.is_empty();
+            if saved.empty {
+                // 0.2.0 and 0.3.0 discard a workspace without panes. Keep a readable shell
+                // fallback in the ordinary array so downgrading never erases its record.
+                saved.tabs.push(TabSnap {
+                    name: String::new(),
+                    root: Some(NodeSnap::Pane(Box::new(PaneSnap {
+                        name: None,
+                        spec: PaneSpec { cwd: saved.cwd.clone(), ..Default::default() },
+                        agent: None,
+                        agent_session: None,
+                        stopped: true,
+                        scrollback: None,
+                    }))),
+                    floating: Vec::new(),
+                    focus: Some(0),
+                    show_floating: false,
+                    zoomed: false,
+                    sync: false,
+                    preset: None,
+                });
+            }
+            saved
         })
         .chain(server.unrestored.iter().cloned())
         .collect();
+    if !server.config.save_scrollback {
+        for ws in &mut workspaces {
+            ws.clear_scrollback();
+        }
+    }
     SessionSnapshot {
         version: VERSION,
         revision: REVISION,
@@ -240,7 +353,7 @@ pub fn save(session: &str, snap: &SessionSnapshot) -> Result<()> {
     let dir = path.parent().context("no directory for the state")?;
     durable_dir(dir)?;
     paths::write_private(&path, &serde_json::to_vec_pretty(snap)?)?;
-    paths::sync_dir(dir);
+    sync_directory(dir)?;
     Ok(())
 }
 
@@ -324,8 +437,12 @@ pub fn save_scrollback(session: &str, file: &str, text: &[u8]) -> Result<()> {
     let dir = paths::scrollback_dir(session);
     durable_dir(&dir)?;
     paths::write_private(&dir.join(file), text)?;
-    paths::sync_dir(&dir);
+    sync_directory(&dir)?;
     Ok(())
+}
+
+fn sync_directory(dir: &Path) -> Result<()> {
+    std::fs::File::open(dir).and_then(|f| f.sync_all()).with_context(|| format!("making {} durable", dir.display()))
 }
 
 /// [`paths::ensure_private_dir`], each directory it makes recorded in its parent for good.
@@ -334,7 +451,7 @@ fn durable_dir(dir: &Path) -> Result<()> {
     paths::ensure_private_dir(dir)?;
     for made in missing.iter().rev() {
         if let Some(parent) = made.parent() {
-            paths::sync_dir(parent);
+            sync_directory(parent)?;
         }
     }
     Ok(())
@@ -404,6 +521,21 @@ fn scrollback_name(file: &str) -> bool {
     !file.is_empty()
         && !file.starts_with('.')
         && file.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+}
+
+/// Inspect a stopped session without converting its state or creating migration backups.
+pub fn inspect(session: &str) -> Result<Option<SessionSnapshot>> {
+    let path = paths::session_state_path(session);
+    let data = match paths::read_regular(&path, u64::MAX) {
+        Ok(data) => data,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound && std::fs::symlink_metadata(&path).is_err() => {
+            return Ok(None);
+        }
+        Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+    };
+    // Use the same validation, but leave legacy identities unassigned until actual migration.
+    migrate(&data).with_context(|| format!("parsing {}", path.display()))?;
+    Ok(Some(serde_json::from_slice(&data)?))
 }
 
 pub fn load(session: &str) -> Result<Option<SessionSnapshot>> {
@@ -528,13 +660,13 @@ pub fn stops_with_server(
     stops_in_foreground(pane, program).into_iter().chain(jobs_stopping_with_server(pane, jobs)).collect()
 }
 
+/// Close keeps agents and SSH commands for later, but still stops their current programs.
 pub fn stops_with_workspace(
     pane: &crate::protocol::PaneInfo,
     program: Option<&[String]>,
     jobs: &[Vec<String>],
     shell_waiting: bool,
 ) -> Vec<String> {
-    // Closing removes the panes: unlike a restart, it cannot promise to resume an agent or SSH shell.
     let foreground = if !runs_in_terminal(pane) {
         None
     } else if let Some(agent) = &pane.agent {
@@ -652,47 +784,53 @@ pub fn apply(server: &mut Server, snap: SessionSnapshot) -> Result<()> {
 }
 
 fn apply_workspace(server: &mut Server, ws: &WorkspaceSnap, revision: u32) -> Result<()> {
-    {
-        let id = server.new_workspace(ws.name.clone(), ws.definition.clone());
-        let wi = server.ws_index(id).unwrap();
-        server.workspaces[wi].stable_id = ws.id.clone();
-        server.workspaces[wi].name = ws.name.clone();
-        server.workspaces[wi].cwd = ws.cwd.clone();
-        server.workspaces[wi].definition_source = ws.definition_source.clone();
-        for t in &ws.tabs {
-            let tab_id = server.alloc_id();
-            // Older versions saved a tab without a name as "tab N"; unnamed, it shows what its
-            // pane runs.
-            let old_default = revision == 0 && old_tab_name(&t.name);
-            let mut tab = Tab::new(tab_id, if old_default { String::new() } else { t.name.clone() });
-            tab.preset = t.preset;
-            if let Some(root) = &t.root {
-                tab.root = Some(build(server, root)?);
-            }
-            for (p, rect) in &t.floating {
-                // Transfer windows are not worth bringing back.
-                if p.spec.close_on_success {
-                    continue;
-                }
-                let pane = spawn(server, p)?;
-                tab.floating.push(Floating { pane, rect: *rect });
-            }
-            let panes = tab.panes();
-            if panes.is_empty() {
+    let id = server.new_workspace(ws.name.clone(), ws.definition.clone());
+    let wi = server.ws_index(id).unwrap();
+    server.workspaces[wi].stable_id = ws.id.clone();
+    server.workspaces[wi].name = ws.name.clone();
+    server.workspaces[wi].cwd = ws.cwd.clone();
+    server.workspaces[wi].definition_source = ws.definition_source.clone();
+    if ws.closed || ws.close_pending.is_some() {
+        server.workspaces[wi].kept = Some(ws.clone());
+    } else {
+        restore_workspace_tabs(server, wi, ws, revision)?;
+    }
+    Ok(())
+}
+
+pub(crate) fn restore_workspace_tabs(server: &mut Server, wi: usize, ws: &WorkspaceSnap, revision: u32) -> Result<()> {
+    if ws.empty {
+        return Ok(());
+    }
+    for t in &ws.tabs {
+        let tab_id = server.alloc_id();
+        let old_default = revision == 0 && old_tab_name(&t.name);
+        let mut tab = Tab::new(tab_id, if old_default { String::new() } else { t.name.clone() });
+        tab.preset = t.preset;
+        if let Some(root) = &t.root {
+            tab.root = Some(build(server, root)?);
+        }
+        for (p, rect) in &t.floating {
+            if p.spec.close_on_success {
                 continue;
             }
-            let focus = t.focus.and_then(|i| panes.get(i).copied()).unwrap_or(panes[0]);
-            tab.show_floating = t.show_floating && !tab.floating.is_empty();
-            tab.set_focus(focus);
-            if t.zoomed && !tab.is_floating(focus) {
-                tab.zoom = Some(focus);
-            }
-            server.workspaces[wi].tabs.push(tab);
+            let pane = spawn(server, p)?;
+            tab.floating.push(Floating { pane, rect: *rect });
         }
-        anyhow::ensure!(!server.workspaces[wi].tabs.is_empty(), "the saved workspace has no restorable panes");
-        let n = server.workspaces[wi].tabs.len();
-        server.workspaces[wi].active = ws.active.min(n - 1);
+        let panes = tab.panes();
+        if panes.is_empty() {
+            continue;
+        }
+        let focus = t.focus.and_then(|i| panes.get(i).copied()).unwrap_or(panes[0]);
+        tab.show_floating = t.show_floating && !tab.floating.is_empty();
+        tab.set_focus(focus);
+        if t.zoomed && !tab.is_floating(focus) {
+            tab.zoom = Some(focus);
+        }
+        server.workspaces[wi].tabs.push(tab);
     }
+    anyhow::ensure!(!server.workspaces[wi].tabs.is_empty(), "the saved workspace has no restorable panes");
+    server.workspaces[wi].active = ws.active.min(server.workspaces[wi].tabs.len() - 1);
     Ok(())
 }
 
@@ -818,6 +956,46 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("kraal-state-{name}-{}", crate::accounts::new_uuid()));
         std::fs::create_dir(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn inspecting_a_stopped_session_does_not_migrate_or_invent_identities() {
+        let session = format!("inspect-{}", crate::accounts::new_uuid());
+        let path = paths::session_state_path(&session);
+        let source = serde_json::to_vec(&legacy_state()).unwrap();
+        durable_dir(path.parent().unwrap()).unwrap();
+        paths::write_private(&path, &source).unwrap();
+        let snap = inspect(&session).unwrap().unwrap();
+        assert_eq!(snap.revision, 1);
+        assert!(snap.workspaces[0].id.is_empty());
+        assert_eq!(std::fs::read(&path).unwrap(), source);
+        assert!(
+            !std::fs::read_dir(path.parent().unwrap())
+                .unwrap()
+                .flatten()
+                .any(|e| e.file_name().to_string_lossy().starts_with(&format!("{session}.json.before-")))
+        );
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn close_recovery_never_signals_a_different_machine_boot_or_process() {
+        let pid = std::process::id();
+        let start = crate::process::start_time(pid).unwrap();
+        let owner = crate::process::SessionOwner { leader: pid, started: start, token: "test".into() };
+        let mut intent = CloseIntent::new(vec![(pid, start)], vec![owner]);
+        if intent.machine.is_some() {
+            assert_eq!(intent.local_members(), vec![(pid, start)]);
+            assert_eq!(intent.local_sessions().len(), 1);
+        }
+        intent.boot.push_str("different");
+        assert!(intent.local_members().is_empty());
+        assert!(intent.local_sessions().is_empty());
+        intent.boot = crate::process::boot_id();
+        intent.machine = Some("another machine".into());
+        assert!(intent.local_members().is_empty());
+        assert!(intent.local_sessions().is_empty());
+        assert!(!crate::process::still_running(pid, start.wrapping_add(1)));
     }
 
     #[test]
@@ -1025,7 +1203,8 @@ mod tests {
             source["revision"] = serde_json::json!(revision);
             source["workspaces"][0]["id"] = serde_json::json!("kept");
             let mut workspace = source.clone();
-            workspace["workspaces"][0] = serde_json::json!(["kept", "same", null, null, null, 0, [], "off", null]);
+            workspace["workspaces"][0] =
+                serde_json::json!(["kept", "same", null, null, null, 0, [], false, false, null, "off", null]);
             let mut tab = source.clone();
             tab["workspaces"][0]["tabs"][0] = serde_json::json!(["tab 1", null, [], null, false, false, false, null]);
             for (value, reason) in [
@@ -1133,6 +1312,15 @@ mod tests {
         assert_eq!(stops_with_server(&idle, Some(&argv(&["claude"])), &jobs), both);
         assert_eq!(stops_with_server(&shell, Some(&sleep), &jobs[1..]), ["sleep 1000", both[1]]);
         assert_eq!(stops_with_server(&ended, None, &jobs), none);
+        assert_eq!(stops_with_workspace(&shell, Some(&argv(&["sh"])), &[], true), none);
+        assert_eq!(stops_with_workspace(&shell, Some(&argv(&["sh"])), &jobs, true), both);
+        assert_eq!(stops_with_workspace(&shell, None, &[], false), ["Unknown program (activity could not be checked)"]);
+        assert_eq!(stops_with_workspace(&shell, Some(&sleep), &[], false), ["sleep 1000"]);
+        assert_eq!(stops_with_workspace(&idle, None, &[], false), ["claude: idle"]);
+        assert_eq!(stops_with_workspace(&ssh, Some(&argv(&["ssh", "web-1"])), &[], false), ["ssh web-1"]);
+        for pane in [&ended, &waiting, &preview] {
+            assert_eq!(stops_with_workspace(pane, None, &[], false), none);
+        }
     }
 
     #[test]

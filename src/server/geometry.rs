@@ -149,7 +149,11 @@ impl Server {
     /// The panes attached clients have on screen.
     fn panes_on_screen(&self) -> std::collections::HashSet<PaneId> {
         let shown = self.clients.values().filter(|c| c.attached).filter_map(|c| self.ws_index(c.workspace));
-        shown.flat_map(|wi| self.tab_rects(self.workspaces[wi].tab(), self.layout_area)).map(|(p, ..)| p).collect()
+        shown
+            .filter_map(|wi| self.workspaces[wi].tab())
+            .flat_map(|tab| self.tab_rects(tab, self.layout_area))
+            .map(|(p, ..)| p)
+            .collect()
     }
 
     /// Recompute the layout area from the primary client and resize every pane. A program told
@@ -221,7 +225,7 @@ impl Server {
         let Some((wi, _)) = self.workspace_of(id) else { return false };
         let ws = &self.workspaces[wi];
         self.clients.values().any(|c| c.attached && c.workspace == ws.id)
-            && self.tab_rects(ws.tab(), self.layout_area).iter().any(|(pane, ..)| *pane == id)
+            && ws.tab().is_some_and(|tab| self.tab_rects(tab, self.layout_area).iter().any(|(pane, ..)| *pane == id))
     }
 
     /// (workspace index, tab index) holding a pane.

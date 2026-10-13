@@ -85,6 +85,24 @@ writing anything. See [Workspace identities and migration](workspaces.md#workspa
 for rollback and failed-state recovery. Whole-session restore failures now stop startup and leave
 the original in place, rather than starting a new session that could overwrite it.
 
+## Closed and empty workspaces
+
+Saved sessions keep the version 1 `workspaces` array and revision 2. Optional `closed`, `empty`
+and `close_pending` fields describe the new lifecycle; older snapshots without them still load.
+Closed layouts stay in the ordinary array, including their scrollback references. An empty
+workspace carries a shell fallback in `tabs`, which current kraal ignores when `empty` is true.
+This prevents 0.2.0 and 0.3.0 from discarding its record as an unrestorable empty layout.
+
+An older server ignores these fields: it reopens closed workspaces, gives empty workspaces a
+shell, and cannot finish an interrupted Close. Saving from that older server loses the new
+lifecycle metadata. The session is never read as empty merely because all its workspaces were
+closed or empty. Use the current version to retain those states and complete crash recovery.
+
+Workspace list replies keep the existing `open` boolean and counts. Closed saved workspaces
+also have the optional stable `id`; file-only entries omit it. Old clients can reopen them by
+name with the existing open request, and attached clients use the server's Close and Retry UI.
+No new client capability is required.
+
 ## Account identities
 
 Accounts and saved sessions from 0.2.0 and 0.3.0 still load. Account names remain accepted by

@@ -7,7 +7,7 @@ use crate::layout::{Dir, Node, PaneId, Preset, neighbour};
 use crate::pane::PaneSpec;
 use crate::protocol::Placement;
 use crate::server::ui::{ConfirmAction, Mode, Prompt, PromptAction};
-use crate::server::{ClientId, Server, Tab};
+use crate::server::{ClientId, Server};
 
 impl Server {
     /// Give the focused pane a prefix key: `key` as pressed, or the first prefix.
@@ -25,7 +25,34 @@ impl Server {
 
     pub(super) fn action(&mut self, id: ClientId, action: Action) -> Mode {
         let Some((ws, wi)) = self.current_ws(id) else { return Mode::Normal };
-        let focus = self.workspaces[wi].tab().focus;
+        if self.workspaces[wi].kept.is_some()
+            && !self.workspaces[wi].closed()
+            && !matches!(
+                action,
+                Action::WorkspacePicker
+                    | Action::NewWorkspace
+                    | Action::NextWorkspace
+                    | Action::PrevWorkspace
+                    | Action::CloseWorkspace
+                    | Action::Restart
+                    | Action::Quit
+                    | Action::Detach
+                    | Action::ToggleSidebar
+                    | Action::ToggleBottomBar
+                    | Action::Messages
+                    | Action::Help
+                    | Action::CommandPalette
+                    | Action::Accounts
+                    | Action::AddAccount
+                    | Action::NextAttention
+            )
+        {
+            return Mode::confirm(
+                "The workspace has not finished closing. Retry Close to continue.",
+                ConfirmAction::RetryCloseWorkspace(ws),
+            );
+        }
+        let focus = self.workspaces[wi].tab().and_then(|t| t.focus);
         match action {
             Action::NewPane | Action::SplitRight | Action::SplitDown | Action::NewFloating | Action::NewTab => {
                 let placement = match action {
@@ -55,7 +82,7 @@ impl Server {
                 }
             }
             Action::ToggleZoom => {
-                let tab = self.workspaces[wi].tab_mut();
+                let Some(tab) = self.workspaces[wi].tab_mut() else { return Mode::Normal };
                 tab.zoom = match (tab.zoom, focus) {
                     (Some(_), _) => None,
                     (None, Some(f))
@@ -68,7 +95,7 @@ impl Server {
                 self.relayout();
             }
             Action::ToggleFloating => {
-                let tab = self.workspaces[wi].tab_mut();
+                let Some(tab) = self.workspaces[wi].tab_mut() else { return Mode::Normal };
                 if tab.floating.is_empty() {
                     if let Err(e) = self.spawn_pane_in(ws, focus, PaneSpec::default(), Placement::Floating, None) {
                         self.toast(id, format!("{e:#}"));
@@ -119,7 +146,7 @@ impl Server {
                 self.resize_focused(wi, dir);
             }
             Action::NextLayout => {
-                let tab = self.workspaces[wi].tab_mut();
+                let Some(tab) = self.workspaces[wi].tab_mut() else { return Mode::Normal };
                 match tab.root.as_ref().and_then(|root| Preset::next(tab.preset, root, tab.focus)) {
                     Some((preset, tree)) => {
                         tab.root = Some(tree);
@@ -143,7 +170,7 @@ impl Server {
                 }
             }
             Action::Unstack => {
-                let tab = self.workspaces[wi].tab_mut();
+                let Some(tab) = self.workspaces[wi].tab_mut() else { return Mode::Normal };
                 let unstacked = match (focus, &mut tab.root) {
                     (Some(f), Some(root)) => root.unstack(f).then_some(f),
                     _ => None,
@@ -168,7 +195,7 @@ impl Server {
                 self.mark_seen_focused(id);
             }
             Action::CloseTab => {
-                let tab = self.workspaces[wi].tab();
+                let Some(tab) = self.workspaces[wi].tab() else { return Mode::Normal };
                 let n = tab.panes().len();
                 let action = ConfirmAction::CloseTab { workspace: ws, tab: tab.id };
                 return Mode::confirm(
@@ -177,7 +204,7 @@ impl Server {
                 );
             }
             Action::RenameTab => {
-                let tab = self.workspaces[wi].tab();
+                let Some(tab) = self.workspaces[wi].tab() else { return Mode::Normal };
                 return Mode::Prompt(Prompt::new(
                     "Rename tab",
                     &tab.name,
@@ -195,10 +222,12 @@ impl Server {
                 return Mode::Prompt(Prompt::new("Rename workspace", &name, PromptAction::RenameWorkspace(ws)));
             }
             Action::NextWorkspace | Action::PrevWorkspace => {
-                let n = self.workspaces.len() as i32;
-                let delta = if action == Action::NextWorkspace { 1 } else { -1 };
-                let next = self.workspaces[(wi as i32 + delta).rem_euclid(n) as usize].id;
-                self.show_workspace(id, next);
+                let open: Vec<_> = self.workspaces.iter().filter(|w| !w.closed()).map(|w| w.id).collect();
+                if let Some(at) = open.iter().position(|id| *id == ws) {
+                    let delta = if action == Action::NextWorkspace { 1 } else { -1 };
+                    let next = open[(at as i32 + delta).rem_euclid(open.len() as i32) as usize];
+                    self.show_workspace(id, next);
+                }
             }
             Action::WorkspacePicker => return Mode::Picker(self.workspace_picker(ws)),
             Action::SshPicker => return Mode::Picker(self.ssh_picker()),
@@ -352,7 +381,8 @@ impl Server {
             Action::Messages => return Mode::Messages { scroll: 0 },
             Action::CommandPalette => return Mode::Picker(self.command_picker()),
             Action::ResizeMode => {
-                let tiled = self.workspaces[wi].tab().root.as_ref().is_some_and(|r| r.places().len() > 1);
+                let tiled =
+                    self.workspaces[wi].tab().and_then(|t| t.root.as_ref()).is_some_and(|r| r.places().len() > 1);
                 if !tiled {
                     self.toast(id, "One pane fills the tab: there is nothing to resize.");
                     return Mode::Normal;
@@ -360,7 +390,7 @@ impl Server {
                 return Mode::Resize;
             }
             Action::NewWorkspace => return Mode::Prompt(Prompt::new("New workspace", "", PromptAction::NewWorkspace)),
-            Action::CloseWorkspace => return self.ask_close_workspace(ws),
+            Action::CloseWorkspace => return self.ask_close_workspace(id, ws),
             Action::Restart => return self.ask_restart(),
             Action::Quit => return self.ask_quit(),
             Action::EditServers => self.edit_servers(id),
@@ -373,7 +403,24 @@ impl Server {
         Mode::Normal
     }
 
+    pub(super) fn empty_workspace_enter(&mut self, id: ClientId) -> Mode {
+        let Some((ws, wi)) = self.current_ws(id) else { return Mode::Normal };
+        if self.workspaces[wi].close_error.is_some() {
+            return self.ask_close_workspace(id, ws);
+        }
+        if self.workspaces[wi].closed() {
+            self.show_workspace(id, ws);
+            Mode::Normal
+        } else {
+            self.action(id, Action::NewPane)
+        }
+    }
+
     pub(super) fn show_workspace(&mut self, id: ClientId, ws: u32) {
+        if let Err(e) = self.reopen_workspace(ws) {
+            self.toast(id, format!("{e:#}"));
+            return;
+        }
         if let Some(c) = self.clients.get_mut(&id) {
             c.workspace = ws;
         }
@@ -397,7 +444,7 @@ impl Server {
 
     pub(super) fn move_focus(&mut self, wi: usize, dir: Dir) -> bool {
         let area = self.layout_area;
-        let tab: &mut Tab = self.workspaces[wi].tab_mut();
+        let Some(tab) = self.workspaces[wi].tab_mut() else { return false };
         let Some(f) = tab.focus else { return false };
         if tab.is_floating(f) && tab.show_floating {
             let ids: Vec<PaneId> = tab.floating.iter().map(|x| x.pane).collect();
@@ -441,7 +488,7 @@ impl Server {
     /// the focus.
     pub(super) fn stack_focused(&mut self, wi: usize, dir: Dir) -> Result<(), &'static str> {
         let area = self.layout_area;
-        let tab = self.workspaces[wi].tab_mut();
+        let tab = self.workspaces[wi].tab_mut().ok_or("No panes. Add a pane first.")?;
         let Some(f) = tab.focus.filter(|f| !tab.is_floating(*f)) else { return Err("Floating panes do not stack.") };
         let Some(root) = &mut tab.root else { return Err("Floating panes do not stack.") };
         let onto = neighbour(&root.layout(area), root.holder(f), dir, &tab.recent).ok_or("No pane on that side.")?;
@@ -457,7 +504,7 @@ impl Server {
 
     pub(super) fn resize_focused(&mut self, wi: usize, dir: Dir) {
         let area = self.layout_area;
-        let tab = self.workspaces[wi].tab_mut();
+        let Some(tab) = self.workspaces[wi].tab_mut() else { return };
         let Some(f) = tab.focus else { return };
         if let Some(fl) = tab.floating.iter_mut().find(|x| x.pane == f) {
             let (dw, dh) = match dir {
@@ -485,5 +532,68 @@ impl Server {
             }
         }
         self.relayout();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::input::{Mods, MouseButton, MouseEvent, MouseKind};
+
+    #[test]
+    fn empty_workspaces_fit_the_smallest_supported_terminal() {
+        let (tx, _rx) = crate::server::event_channel(4096);
+        let mut server = crate::server::tests::server(tx);
+        let (client, _peer) = crate::server::tests::client(&mut server);
+        server.workspaces[0].tabs.clear();
+        server.clients.get_mut(&client).unwrap().cols = 10;
+        server.clients.get_mut(&client).unwrap().rows = 3;
+        for bottom in [false, true] {
+            server.bottom_bar = bottom;
+            let mut buffer = ratatui::buffer::Buffer::empty(ratatui::layout::Rect::new(0, 0, 10, 3));
+            server.compose(client, 0, &mut buffer);
+            let text: String = buffer.content.iter().map(|c| c.symbol()).collect();
+            assert!(text.contains("+ Add pane"));
+        }
+    }
+
+    #[test]
+    fn empty_workspaces_render_and_add_a_pane_with_enter_or_a_click() {
+        for (cols, rows, mouse) in [(80, 24, false), (124, 36, true)] {
+            let (tx, _rx) = crate::server::event_channel(4096);
+            let mut server = crate::server::tests::server(tx);
+            let (client, _peer) = crate::server::tests::client(&mut server);
+            server.clients.get_mut(&client).unwrap().cols = cols;
+            server.clients.get_mut(&client).unwrap().rows = rows;
+            server.workspaces[0].tabs.clear();
+            let mut buffer = ratatui::buffer::Buffer::empty(ratatui::layout::Rect::new(0, 0, cols, rows));
+            server.compose(client, 0, &mut buffer);
+            let text: String = buffer.content.iter().map(|c| c.symbol()).collect();
+            assert!(text.contains("No panes."));
+            assert!(text.contains("+ Add pane"));
+            for action in [Action::CloseTab, Action::RenameTab, Action::NextLayout, Action::ToggleZoom, Action::Unstack]
+            {
+                server.action(client, action);
+                assert!(server.workspaces[0].tabs.is_empty());
+            }
+            if mouse {
+                let (button, _) = server.empty_workspace_button(client).unwrap();
+                server.on_mouse(
+                    client,
+                    MouseEvent {
+                        kind: MouseKind::Press(MouseButton::Left),
+                        col: button.x,
+                        row: button.y,
+                        mods: Mods::NONE,
+                    },
+                    false,
+                );
+            } else {
+                server.empty_workspace_enter(client);
+            }
+            assert_eq!(server.workspaces[0].tabs.len(), 1);
+            assert_eq!(server.panes.len(), 1);
+            assert!(!server.quitting);
+        }
     }
 }

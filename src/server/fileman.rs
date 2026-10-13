@@ -73,7 +73,7 @@ impl Server {
         let c = self.clients.get(&client)?;
         let wi = self.ws_index(c.workspace)?;
         let (_, frame, _) = self
-            .tab_rects(self.workspaces[wi].tab(), self.client_area(client))
+            .tab_rects(self.workspaces[wi].tab()?, self.client_area(client))
             .into_iter()
             .find(|(p, _, _)| *p == pane)?;
         let (_, inner) = self.placed(frame, self.screen_above_bar(c.cols, c.rows));

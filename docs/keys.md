@@ -26,6 +26,10 @@ any keyboard layout.
 | files | `f` file manager | `F`: `f` file manager, `p` preview a file, `u`/`d` upload/download |
 | run | `r` tools where the pane is | `R`: `r` tools, `b` runbooks, `g` git and worktrees |
 
+Closing a workspace keeps its layout and leaves it **Closed** in Workspaces. Enter opens it
+again. Closing its last pane leaves **+ Add pane**, available with Enter or a click. Neither
+closes the session; `ctrl+b q` quits it.
+
 Inside every menu the same letters do the same things: `n` new, `x` close, `e` rename, arrows
 previous and next, and the theme's letter (or Enter) its main action again. Backspace goes back
 to the menu before, Esc closes.

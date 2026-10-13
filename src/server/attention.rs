@@ -37,7 +37,7 @@ impl Server {
     pub fn client_focus(&self, id: ClientId) -> Option<PaneId> {
         let c = self.clients.get(&id)?;
         let wi = self.ws_index(c.workspace)?;
-        self.workspaces[wi].tab().focus
+        self.workspaces[wi].tab()?.focus
     }
 
     /// Make a pane visible and focused for a client.

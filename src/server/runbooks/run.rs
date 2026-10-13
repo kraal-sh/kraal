@@ -202,13 +202,18 @@ impl Server {
         let s = &d.steps;
         let name = d.runbook.name.clone();
         let labels: Vec<String> = specs.iter().map(|(l, _)| l.clone()).collect();
-        let ws = client
+        let preferred = client
             .and_then(|c| self.clients.get(&c))
             .map(|c| c.workspace)
             .or_else(|| d.pane.and_then(|p| self.workspace_of(p)).map(|(wi, _)| self.workspaces[wi].id))
-            .or_else(|| self.primary.and_then(|c| self.clients.get(&c)).map(|c| c.workspace))
-            .or_else(|| self.workspaces.first().map(|w| w.id))
-            .unwrap_or_else(|| self.new_workspace("main".into(), None));
+            .or_else(|| self.primary.and_then(|c| self.clients.get(&c)).map(|c| c.workspace));
+        if let Some(wi) = preferred.and_then(|ws| self.ws_index(ws)) {
+            anyhow::ensure!(
+                self.workspaces[wi].kept.is_none() || self.workspaces[wi].closed(),
+                "The workspace has not finished closing. Retry Close first."
+            );
+        }
+        let ws = self.available_workspace(preferred).unwrap_or_else(|| self.new_workspace("main".into(), None));
         let log = log.to_path_buf();
         let mut items: Vec<RunItem> = Vec::new();
         for (i, (label, spec)) in specs.into_iter().enumerate() {
@@ -736,6 +741,86 @@ impl Server {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn draft() -> Draft {
+        let content = "steps = ['true']".to_string();
+        let steps: runbooks::Steps = toml::from_str(&content).unwrap();
+        let book = runbooks::Runbook {
+            name: "check".into(),
+            path: "/missing/check.toml".into(),
+            source: Source::User,
+            content,
+            body: runbooks::Body::Steps(Box::new(steps.clone())),
+        };
+        Draft::new(book, steps, None, Some(vec![Target::Local]))
+    }
+
+    #[test]
+    fn runbooks_refuse_a_destination_still_closing() {
+        for entry in 0..3 {
+            let (tx, _rx) = crate::server::event_channel(4096);
+            let mut server = crate::server::tests::server(tx);
+            let (client, _peer) = crate::server::tests::client(&mut server);
+            let ws = server.clients[&client].workspace;
+            let pane = server
+                .spawn_pane_in(
+                    ws,
+                    None,
+                    PaneSpec { files: Some(["/missing".into(), "/missing".into()]), ..Default::default() },
+                    crate::protocol::Placement::Tab,
+                    None,
+                )
+                .unwrap();
+            let mut saved = crate::persist::snapshot(&server).workspaces.remove(0);
+            saved.close_pending = Some(crate::persist::CloseIntent::new(Vec::new(), Vec::new()));
+            server.workspaces[0].kept = Some(saved);
+            let mut d = draft();
+            if entry == 1 {
+                d.pane = Some(pane);
+            }
+            if entry == 2 {
+                server.primary = Some(client);
+            }
+            let result = server.start_run(
+                &d,
+                50,
+                Path::new("/missing/run.log"),
+                vec![("job".into(), PaneSpec::default())],
+                1,
+                (entry == 0).then_some(client),
+            );
+            assert!(result.unwrap_err().to_string().contains("Retry Close"));
+            assert_eq!(server.panes.len(), 1);
+            assert_eq!(server.workspaces.len(), 1);
+            assert!(server.runs.is_empty());
+        }
+    }
+
+    #[test]
+    fn a_runbook_after_the_last_close_is_in_the_saved_open_layout() {
+        let (tx, _rx) = crate::server::event_channel(4096);
+        let mut server = crate::server::tests::server(tx);
+        let ws = server.new_workspace("closed".into(), None);
+        crate::server::persistence::tests::writer(&mut server, vec![]);
+        server.keep_and_close_workspace(ws).unwrap();
+        let dir = std::env::temp_dir().join(format!("kraal-run-after-close-{}", crate::accounts::new_uuid()));
+        std::fs::create_dir(&dir).unwrap();
+        let spec = PaneSpec { command: vec!["sleep".into(), "60".into()], ..Default::default() };
+        server.start_run(&draft(), 50, &dir.join("run.log"), vec![("job".into(), spec)], 1, None).unwrap();
+        assert!(server.workspaces[0].closed());
+        assert_eq!(server.workspaces.len(), 2);
+        let pane = server.workspaces[1].panes()[0];
+        assert!(server.workspaces[1].kept.is_none());
+        assert!(server.panes[&pane].process_hold().unwrap().group_running());
+        let saved = crate::persist::snapshot(&server);
+        assert!(!saved.workspaces[1].closed);
+        let crate::persist::NodeSnap::Pane(job) = saved.workspaces[1].tabs[0].root.as_ref().unwrap() else {
+            panic!("saved runbook pane")
+        };
+        assert_eq!(job.name.as_deref(), Some("job"));
+        server.close_pane(pane);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn a_group_is_alive_while_anything_in_it_runs() {
