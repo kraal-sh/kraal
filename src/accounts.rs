@@ -571,8 +571,7 @@ impl Accounts {
         })
     }
 
-    /// The account to start with: the first candidate under its threshold, else the one that
-    /// frees up first.
+    /// Prefer measured headroom, then unknown usage, then the first reset among full accounts.
     pub fn choose(
         &self,
         agent: &str,
@@ -582,7 +581,10 @@ impl Accounts {
         now: i64,
     ) -> Option<Account> {
         let candidates = self.candidates(agent, workspace, cwd);
-        if let Some(a) = candidates.iter().find(|a| usage.peak(a, now) < self.threshold(a) as f64) {
+        if let Some(a) = candidates.iter().find(|a| usage.peak(a, now).is_some_and(|p| p < self.threshold(a) as f64)) {
+            return Some(a.clone());
+        }
+        if let Some(a) = candidates.iter().find(|a| usage.peak(a, now).is_none()) {
             return Some(a.clone());
         }
         candidates.into_iter().min_by_key(|a| usage.get(a).and_then(|u| u.next_reset(now)).unwrap_or(i64::MAX))
@@ -599,9 +601,11 @@ impl Accounts {
         usage: &UsageMap,
         now: i64,
     ) -> Option<Account> {
-        self.candidates(&current.agent, workspace, cwd)
-            .into_iter()
-            .find(|a| a.name != current.name && usage.peak(a, now) < self.threshold(a) as f64)
+        self.candidates(&current.agent, workspace, cwd).into_iter().find(|a| {
+            !a.same_home(current)
+                && !a.sign_in_required
+                && usage.peak(a, now).is_some_and(|p| p < self.threshold(a) as f64)
+        })
     }
 }
 
@@ -1128,7 +1132,7 @@ fn is_prefix(short: &Path, long: &Path) -> std::io::Result<bool> {
 /// What continuing conversation `session` on account `to` needs (Claude: accounts that keep
 /// their conversations apart each have a copy of the transcript, which only ever grows).
 enum Carry {
-    /// No transcript anywhere: nothing was said yet, there is nothing to continue.
+    /// This agent cannot move a conversation between accounts.
     Nothing,
     /// `to` sees the newest transcript already (the same file, or a copy holding all of it).
     There,
@@ -1137,18 +1141,27 @@ enum Carry {
 }
 
 fn carry_plan(from: &Account, to: &Account, session: &str) -> Result<Carry> {
-    if from.agent != "claude" || to.agent != "claude" || conversation_exists(to, session)?.is_none() {
+    if from.agent != "claude" || to.agent != "claude" {
         return Ok(Carry::Nothing);
     }
+    anyhow::ensure!(
+        !session.is_empty() && session.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'),
+        "could not verify the Claude conversation id"
+    );
     let (src, dst) = (transcript(from, session)?, transcript(to, session)?);
-    let Some(src) = src else {
-        return Ok(if dst.is_some() { Carry::There } else { Carry::Nothing });
+    let src = src.with_context(|| format!("the Claude transcript for {session} is missing on {}", label(from)))?;
+    // Even a shared file must be readable before stopping the process that owns it.
+    let readable = |path: &Path| -> Result<u64> {
+        let mut file = std::fs::File::open(path).with_context(|| format!("reading {}", path.display()))?;
+        std::io::copy(&mut file, &mut std::io::sink()).with_context(|| format!("reading {}", path.display()))
     };
+    anyhow::ensure!(readable(&src)? > 0, "the Claude transcript for {session} is empty on {}", label(from));
     let Some(dst) = dst else {
         let project = src.parent().and_then(|d| d.file_name()).context("an odd transcript path")?;
         let dst = paths::expand_tilde(&to.home).join("projects").join(project).join(src.file_name().unwrap());
         return Ok(Carry::Copy(src, dst));
     };
+    readable(&dst)?;
     let same = match (std::fs::canonicalize(&src), std::fs::canonicalize(&dst)) {
         (Ok(a), Ok(b)) => a == b,
         _ => false,
@@ -1364,8 +1377,8 @@ impl UsageMap {
         self.0.get(&key(&a.agent, &a.name))
     }
 
-    pub fn peak(&self, a: &Account, now: i64) -> f64 {
-        self.get(a).map(|u| u.peak(now)).unwrap_or(0.0)
+    pub fn peak(&self, a: &Account, now: i64) -> Option<f64> {
+        self.get(a).filter(|u| u.windows().next().is_some()).map(|u| u.peak(now))
     }
 }
 
@@ -1745,9 +1758,37 @@ mod tests {
         let pro = a.get("claude", "pro").unwrap();
         // The "work" rule only lists pro: no alternative there, but elsewhere perso is fine.
         assert!(a.alternative(&pro, Some("work"), None, &usage, now).is_none());
+        assert!(a.alternative(&pro, None, None, &usage, now).is_none(), "unknown usage is not zero");
+        usage.0.insert(
+            "claude:perso".into(),
+            Usage { five_hour: Some(Window { used_percent: 0.0, resets_at: Some(now + 600) }), ..Default::default() },
+        );
         assert_eq!(a.alternative(&pro, None, None, &usage, now).unwrap().name, "perso");
         // A window that already reset does not count.
-        assert_eq!(usage.peak(&pro, now + 601), 0.0);
+        assert_eq!(usage.peak(&pro, now + 601), Some(0.0));
+    }
+
+    #[test]
+    fn unknown_usage_and_sign_in_required_accounts_are_not_threshold_alternatives() {
+        let mut a = accounts();
+        let pro = a.get("claude", "pro").unwrap();
+        let perso = a.get("claude", "perso").unwrap();
+        let mut usage = UsageMap::default();
+        assert_eq!(usage.peak(&perso, 0), None);
+        usage.0.insert("claude:perso".into(), Usage::default());
+        assert_eq!(usage.peak(&perso, 0), None);
+        assert!(a.alternative(&pro, None, None, &usage, 0).is_none());
+        usage.0.insert(
+            "claude:perso".into(),
+            Usage { five_hour: Some(Window { used_percent: 0.0, resets_at: Some(100) }), ..Default::default() },
+        );
+        assert_eq!(a.choose("claude", None, None, &usage, 0).unwrap().name, "perso", "known headroom before unknown");
+        assert_eq!(a.alternative(&pro, None, None, &usage, 0).unwrap().name, "perso");
+        a.set_sign_in_required(&perso, true);
+        assert!(a.alternative(&pro, None, None, &usage, 0).is_none());
+        a.set_sign_in_required(&perso, false);
+        a.accounts.iter_mut().find(|a| a.name == "perso").unwrap().home = pro.home.clone();
+        assert!(a.alternative(&pro, None, None, &usage, 0).is_none(), "an alias is the same account");
     }
 
     #[test]
@@ -1805,7 +1846,7 @@ mod tests {
         assert!(carry_conversation(&a, &b, "abc-1").unwrap());
         assert_eq!(conversation_exists(&b, "abc-1").unwrap(), Some(true));
         assert!(carry_conversation(&a, &b, "abc-1").unwrap(), "again: already there");
-        assert!(!carry_conversation(&a, &b, "nope").unwrap(), "nothing to carry");
+        assert!(carry_conversation(&a, &b, "nope").is_err(), "a missing transcript is not a new conversation");
         let codex = acct("codex", "pro", to.to_str().unwrap());
         assert!(!carry_conversation(&codex, &codex, "abc-1").unwrap());
         // The conversation went on on pro; switching back to perso takes all of it, never the
@@ -1845,6 +1886,16 @@ mod tests {
         std::fs::rename(shared.join("projects-link"), shared.join("projects")).unwrap();
         assert!(carry_conversation(&a, &c, "abc-1").unwrap());
         assert!(check_carry(&c, &a, "abc-1").is_ok());
+        std::fs::set_permissions(&on_from, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::read(&on_from).is_err() {
+            assert!(check_carry(&a, &c, "abc-1").is_err(), "even a shared transcript must be readable");
+            std::fs::remove_file(&on_to).unwrap();
+            assert!(check_carry(&a, &b, "abc-1").is_err(), "a first copy must be readable before stopping");
+        }
+        std::fs::set_permissions(&on_from, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::fs::remove_file(&on_from).unwrap();
+        std::fs::write(&on_to, "old copy\n").unwrap();
+        assert!(check_carry(&a, &b, "abc-1").is_err(), "the destination alone cannot prove the source's history");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -314,6 +314,10 @@ impl Server {
         }
         let action = q.action;
         match action {
+            ConfirmAction::StopAndSwitch { pane, token } => {
+                self.confirm_switch(pane, token, id, yes);
+                return Mode::Normal;
+            }
             ConfirmAction::Production { workspace, approve, pending } => {
                 return self.answer_production(id, yes, workspace, approve, pending);
             }
@@ -340,7 +344,8 @@ impl Server {
         match yes {
             true => {
                 match action {
-                    ConfirmAction::Production { .. }
+                    ConfirmAction::StopAndSwitch { .. }
+                    | ConfirmAction::Production { .. }
                     | ConfirmAction::RunRunbook
                     | ConfirmAction::RunBlock { .. }
                     | ConfirmAction::TrustRunbook
@@ -367,12 +372,24 @@ impl Server {
                         self.git_job(id, &label, script, crate::server::worktrees::JobEnd::CloseOnSuccess)
                     }
                     ConfirmAction::RemoveWorktrees(list) => self.remove_worktrees(id, list),
-                    ConfirmAction::SwitchAccount { pane, agent, account } => {
+                    ConfirmAction::RetryAccountSwitch { pane, account } => {
                         let result = self
                             .accounts
-                            .get(&agent, &account)
-                            .context("no such account")
-                            .and_then(|a| self.switch_account(pane, &a));
+                            .get(&account.agent, &account.name)
+                            .filter(|a| a.same_home(&account))
+                            .context("the target account changed; choose an account again")
+                            .and_then(|a| self.switch_account(pane, &a, Some(id), false));
+                        if let Err(e) = result {
+                            self.toast(id, format!("{e:#}"));
+                        }
+                    }
+                    ConfirmAction::SignInAccount(account) => {
+                        let result = self
+                            .accounts
+                            .get(&account.agent, &account.name)
+                            .filter(|a| a.same_home(&account))
+                            .context("the target account changed; choose an account again")
+                            .and_then(|a| self.open_login(id, &a));
                         if let Err(e) = result {
                             self.toast(id, format!("{e:#}"));
                         }

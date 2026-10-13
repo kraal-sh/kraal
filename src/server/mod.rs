@@ -465,8 +465,8 @@ pub struct Server {
     /// The limit message each agent pane shows, as already counted: a message staying on
     /// screen is one observation, not a new one at every check.
     screen_limits: HashMap<PaneId, (bool, f64)>,
-    /// Agent panes switching accounts, until their agent stops: from, to, and the conversation.
-    switches: HashMap<PaneId, (crate::accounts::Account, crate::accounts::Account, Option<String>)>,
+    /// Account changes shared by every client attached to this session.
+    switches: HashMap<PaneId, agents::AccountSwitch>,
     /// Panes whose account is over its threshold, already reported as an event.
     limit_events: std::collections::HashSet<PaneId>,
     /// Branch and changes per directory (None: not a repository).
@@ -1389,6 +1389,7 @@ impl Server {
         self.forget_ended_ssh(ssh_ended);
         self.save_buffers(false);
         self.tick_edits();
+        self.check_switches();
         self.forget_ended_reports();
         self.diff_pane_states();
         self.hooks.reap();

@@ -6775,7 +6775,7 @@ fn choosing_the_current_account_keeps_running_and_exited_panes_as_they_are() {
     for agent in ["claude", "codex"] {
         write_script(
             &bin.join(agent),
-            "#!/bin/sh\n[ \"$1\" = app-server ] && exit 0\nprintf '%s\\n' \"$$\" >> \"$HOME/starts\"\necho READY\nwhile IFS= read -r line; do\n    [ \"$line\" = quit ] && exit 0\n    printf 'reply:%s\\n' \"$line\"\ndone\n",
+            "#!/bin/sh\n[ \"$1\" = app-server ] && exit 0\n[ \"$2\" = status ] && exit 0\nprintf '%s\\n' \"$$\" >> \"$HOME/starts\"\necho READY\nwhile IFS= read -r line; do\n    [ \"$line\" = quit ] && exit 0\n    printf 'reply:%s\\n' \"$line\"\ndone\n",
         );
         let home = env.root.join(format!("{agent}-home"));
         std::fs::create_dir_all(&home).unwrap();
@@ -6842,7 +6842,15 @@ fn an_account_switch_never_resends_a_prompt_by_itself_and_one_that_fails_can_be_
     // A stand-in for claude that says which config home and arguments it was given.
     write_script(
         &bin.join("claude"),
-        "#!/bin/sh\necho \"home=${CLAUDE_CONFIG_DIR:-default} args=$*\"\nexec sleep 100\n",
+        r#"#!/bin/sh
+[ "$2" = status ] && exit 0
+echo "home=${CLAUDE_CONFIG_DIR:-default} args=$*"
+if [ "$1" = --session-id ]; then
+    mkdir -p "$CLAUDE_CONFIG_DIR/projects/-work"
+    printf '{}\n' > "$CLAUDE_CONFIG_DIR/projects/-work/$2.jsonl"
+fi
+exec sleep 100
+"#,
     );
     let (alpha, beta) = (env.root.join("alpha-home"), env.root.join("beta-home"));
     std::fs::create_dir_all(&alpha).unwrap();
@@ -6896,6 +6904,8 @@ fn an_account_switch_never_resends_a_prompt_by_itself_and_one_that_fails_can_be_
     client.send(b"beta");
     std::thread::sleep(Duration::from_millis(200));
     client.send(b"\r");
+    client.wait_for_row("Stop and switch?");
+    client.send(b"y");
     until("the switched agent waits", &|| info(&odd)["suspended"] == true);
     let screen = env.wait_for_text(&odd, "cannot tell");
     assert!(!screen.contains(&on_beta), "it ran by itself: {screen}");
@@ -6914,13 +6924,16 @@ fn an_account_switch_never_resends_a_prompt_by_itself_and_one_that_fails_can_be_
     std::fs::create_dir_all(alpha.join("projects/-work")).unwrap();
     std::fs::write(alpha.join(format!("projects/-work/{session}.jsonl")), "{}\n").unwrap();
     use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(beta.join("projects"), std::fs::Permissions::from_mode(0o555)).unwrap();
+    // The first switch already created this project: it, not its parent, receives the copy.
+    std::fs::set_permissions(beta.join("projects/-work"), std::fs::Permissions::from_mode(0o555)).unwrap();
     env.run(&["focus", &plain]);
     client.send(b"\x02Ac");
     client.wait_for_screen("beta");
     client.send(b"beta");
     std::thread::sleep(Duration::from_millis(200));
     client.send(b"\r");
+    client.wait_for_row("Stop and switch?");
+    client.send(b"y");
     until("the failed switch leaves the agent ended", &|| !info(&plain)["exit_code"].is_null());
     assert_eq!(info(&plain)["suspended"], false);
     client.send(b"\r");
@@ -6928,7 +6941,286 @@ fn an_account_switch_never_resends_a_prompt_by_itself_and_one_that_fails_can_be_
     let resumed = format!("{on_alpha} args=--resume {session} --verbose");
     until("it resumes on alpha", &|| env.run(&["read", "-p", &plain]).replace('\n', "").contains(&resumed));
     assert!(!env.run(&["read", "-p", &plain]).replace('\n', "").contains(&on_beta));
-    std::fs::set_permissions(beta.join("projects"), std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::set_permissions(beta.join("projects/-work"), std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+fn account_switch_agent(env: &Env, agent: &str, mode: &str) -> String {
+    let bin = env.root.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    write_script(
+        &bin.join(agent),
+        r#"#!/bin/sh
+home="${CLAUDE_CONFIG_DIR:-${CODEX_HOME:-}}"
+case "$*" in
+    'auth status'|'login status')
+        test -d "$home" || exit 1
+        echo check >> "$home/checks"
+        while test -f "$home/hold-check"; do sleep 0.05; done
+        echo checked >> "$home/checked"
+        exit "$(cat "$home/status" 2>/dev/null || echo 1)"
+        ;;
+    'auth login'|'login') echo login >> "$home/logins"; echo SIGNING-IN; exit 1 ;;
+    app-server*) exit 0 ;;
+esac
+echo "$$" >> "$home/starts"
+if [ "$1" = --session-id ]; then
+    mkdir -p "$home/projects/work"
+    printf '{"message":1}\n' > "$home/projects/work/$2.jsonl"
+fi
+echo "READY home=$home args=$*"
+while IFS= read -r line; do printf 'reply:%s\n' "$line"; done
+"#,
+    );
+    let mut config = format!("[limits]\nmode = {mode:?}\nthreshold = 90\n");
+    for name in ["alpha", "beta"] {
+        let home = env.root.join(name);
+        std::fs::create_dir_all(home.join("projects/work")).unwrap();
+        std::fs::write(home.join("status"), "0").unwrap();
+        config.push_str(&format!(
+            "[[account]]\nagent = {agent:?}\nname = {name:?}\nhome = {:?}\n",
+            home.to_str().unwrap()
+        ));
+    }
+    std::fs::write(env.root.join("config/kraal/accounts.toml"), config).unwrap();
+    env.workspace("w", "layout { pane name=\"shell\" }\n");
+    let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap_or_default());
+    let out = env.cmd(&["open", "w"]).env("PATH", &path).output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let socket = env.root.join(format!("run/kraal/{}.sock", env.session));
+    let out = env
+        .cmd(&["agent", agent, "--account", "alpha", "--tab"])
+        .env("PATH", &path)
+        .env("KRAAL_SOCKET", socket)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let pane = String::from_utf8(out.stdout).unwrap().trim().to_string();
+    env.wait_for_text(&pane, "READY");
+    pane
+}
+
+fn choose_switch_target(client: &mut RawClient, effect: &str) {
+    client.send(b"\x02Ac");
+    client.wait_for_row("Change account");
+    client.send(b"beta");
+    client.wait_for_rows("the target account's effect", |rows| {
+        rows.iter().any(|r| r.contains("beta") && r.contains(effect))
+    });
+    client.send(b"\r");
+}
+
+fn account_still_runs(env: &Env, pane: &str, message: &str) {
+    env.run(&["send", "-p", pane, &format!("{message}\r")]);
+    env.wait_for_text(pane, &format!("reply:{message}"));
+    assert_eq!(std::fs::read_to_string(env.root.join("alpha/starts")).unwrap().lines().count(), 1);
+    assert!(!env.root.join("beta/starts").exists());
+}
+
+#[test]
+fn an_unsigned_target_offers_sign_in_without_stopping_the_agent() {
+    let env = Env::new("switchlogin");
+    let pane = account_switch_agent(&env, "claude", "notify");
+    std::fs::write(env.root.join("beta/status"), "1").unwrap();
+    let mut client = RawClient::attach_sized(&env, Some("w"), (80, 24));
+    choose_switch_target(&mut client, "Sign-in required");
+    client.wait_for_row("The current agent keeps running");
+    client.send(b"\r");
+    account_still_runs(&env, &pane, "cancel-sign-in");
+    assert!(!env.root.join("beta/logins").exists());
+    choose_switch_target(&mut client, "Sign-in required");
+    client.wait_for_row("The current agent keeps running");
+    client.send(b"y");
+    wait_until(PATIENCE, "sign-in was offered and started", || env.root.join("beta/logins").exists());
+    account_still_runs(&env, &pane, "during-sign-in");
+}
+
+#[test]
+fn unverified_accounts_and_broken_transcripts_never_stop_the_current_agent() {
+    use std::os::unix::fs::PermissionsExt;
+    for reason in ["status", "missing", "unreadable", "diverged"] {
+        let env = Env::new(&format!("switch-{reason}"));
+        let pane = account_switch_agent(&env, "claude", "notify");
+        let transcript =
+            std::fs::read_dir(env.root.join("alpha/projects/work")).unwrap().next().unwrap().unwrap().path();
+        let expected = match reason {
+            "status" => {
+                std::fs::write(env.root.join("beta/status"), "2").unwrap();
+                "could not check sign-in"
+            }
+            "missing" => {
+                std::fs::remove_file(&transcript).unwrap();
+                "is missing"
+            }
+            "unreadable" => {
+                std::fs::set_permissions(&transcript, std::fs::Permissions::from_mode(0o000)).unwrap();
+                if std::fs::read(&transcript).is_ok() {
+                    continue;
+                }
+                "reading"
+            }
+            _ => {
+                std::fs::write(env.root.join("beta/projects/work").join(transcript.file_name().unwrap()), "diverged\n")
+                    .unwrap();
+                "each went on"
+            }
+        };
+        let mut client = RawClient::attach_sized(&env, Some("w"), (124, 36));
+        choose_switch_target(&mut client, "Could not verify");
+        client.wait_for_screen(expected);
+        account_still_runs(&env, &pane, reason);
+        if reason == "status" {
+            client.wait_for_row("Check again");
+            std::fs::write(env.root.join("beta/status"), "0").unwrap();
+            client.send(b"y");
+            client.wait_for_row("Stop and switch?");
+            client.send(b"\r");
+            account_still_runs(&env, &pane, "after-check-again");
+        }
+    }
+}
+
+#[test]
+fn cancelling_a_check_from_another_client_ignores_its_late_success() {
+    let env = Env::new("switchcheckcancel");
+    let pane = account_switch_agent(&env, "claude", "notify");
+    let hold = env.root.join("beta/hold-check");
+    std::fs::write(&hold, "").unwrap();
+    let mut first = RawClient::attach(&env, "w");
+    let mut second = RawClient::attach(&env, "w");
+    choose_switch_target(&mut first, "Could not verify");
+    wait_until(PATIENCE, "both the picker and change check sign-in", || {
+        std::fs::read_to_string(env.root.join("beta/checks")).is_ok_and(|s| s.lines().count() == 2)
+    });
+    second.send(b"\x02Ac");
+    second.wait_for_row("Checking sign-in");
+    second.send(b"\r");
+    std::fs::remove_file(hold).unwrap();
+    wait_until(PATIENCE, "both checks returned", || {
+        std::fs::read_to_string(env.root.join("beta/checked")).is_ok_and(|s| s.lines().count() == 2)
+    });
+    account_still_runs(&env, &pane, "late-success");
+    first.send(b"\x02Ac");
+    first.wait_for_row("Change account");
+    first.send(b"beta");
+    first.wait_for_row("Continue conversation");
+}
+
+#[test]
+fn a_switch_waits_for_the_turn_is_cancelled_by_another_client_and_rechecks_sign_in() {
+    let env = Env::new("switchturn");
+    let pane = account_switch_agent(&env, "claude", "notify");
+    claude_hook(&env, &pane, r#"{"hook_event_name":"UserPromptSubmit"}"#);
+    let mut first = RawClient::attach_sized(&env, Some("w"), (124, 36));
+    let mut second = RawClient::attach_sized(&env, Some("w"), (80, 24));
+    choose_switch_target(&mut first, "Continue conversation");
+    first.wait_for_row("Switch after this turn");
+    first.send(b"\x02Ac");
+    first.wait_for_row("Cancel account change");
+    second.send(b"\x02Ac");
+    second.wait_for_row("Cancel account change");
+    second.send(b"\r");
+    first.wait_for_rows("cancellation reaches both clients", |rows| {
+        !rows.iter().any(|r| r.contains("Cancel account change"))
+    });
+    account_still_runs(&env, &pane, "after-cancel");
+
+    choose_switch_target(&mut first, "Continue conversation");
+    // The cancelled change's notification may still show: wait for this change's pending row.
+    first.send(b"\x02Ac");
+    first.wait_for_rows("the new account change waits for the turn", |rows| {
+        rows.iter().any(|r| r.contains("Cancel account change") && r.contains("Switch after this turn"))
+    });
+    std::fs::write(env.root.join("beta/status"), "1").unwrap();
+    claude_hook(&env, &pane, r#"{"hook_event_name":"Stop"}"#);
+    first.wait_for_row("The current agent keeps running");
+    first.send(b"\r");
+    account_still_runs(&env, &pane, "expired-while-waiting");
+
+    std::fs::write(env.root.join("beta/status"), "0").unwrap();
+    choose_switch_target(&mut first, "Continue conversation");
+    wait_until(PATIENCE, "the same conversation starts on beta", || env.root.join("beta/starts").exists());
+    let text = env.wait_for_text(&pane, "--resume").replace('\n', "");
+    assert!(text.contains(&format!("home={}", env.root.join("beta").display())));
+    assert_eq!(std::fs::read_to_string(env.root.join("beta/starts")).unwrap().lines().count(), 1);
+    let transcript = std::fs::read_dir(env.root.join("alpha/projects/work")).unwrap().next().unwrap().unwrap().path();
+    assert_eq!(
+        std::fs::read(&transcript).unwrap(),
+        std::fs::read(env.root.join("beta/projects/work").join(transcript.file_name().unwrap())).unwrap()
+    );
+}
+
+#[test]
+fn codex_discloses_the_new_conversation_and_stop_confirmation_selects_cancel() {
+    let env = Env::new("switchcodex");
+    let pane = account_switch_agent(&env, "codex", "notify");
+    let mut client = RawClient::attach_sized(&env, Some("w"), (80, 24));
+    choose_switch_target(&mut client, "New conversation");
+    client.wait_for_row("Stop and switch?");
+    client.wait_for_row("New conversation");
+    client.send(b"\r");
+    account_still_runs(&env, &pane, "cancel-stop");
+    choose_switch_target(&mut client, "New conversation");
+    client.wait_for_row("Stop and switch?");
+    client.send(b"y");
+    wait_until(PATIENCE, "Codex starts on beta", || env.root.join("beta/starts").exists());
+    env.wait_for_text(&pane, &format!("home={} args=", env.root.join("beta").display()));
+    assert_eq!(std::fs::read_to_string(env.root.join("beta/starts")).unwrap().lines().count(), 1);
+}
+
+fn write_account_usage(env: &Env, name: &str, percent: u8) {
+    let dir = env.root.join("state/kraal/usage");
+    std::fs::create_dir_all(&dir).unwrap();
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+    std::fs::write(
+        dir.join(format!("claude-{name}.json")),
+        serde_json::json!({
+            "five_hour": { "used_percent": percent, "resets_at": now + 3600 },
+            "weekly": null, "observed_at": now, "source": "statusline"
+        })
+        .to_string(),
+    )
+    .unwrap();
+}
+
+#[test]
+fn threshold_ask_checks_the_destination_then_needs_one_confirmation() {
+    let env = Env::new("switchask");
+    let pane = account_switch_agent(&env, "claude", "ask");
+    let mut client = RawClient::attach(&env, "w");
+    claude_hook(&env, &pane, r#"{"hook_event_name":"Stop"}"#);
+    write_account_usage(&env, "beta", 0);
+    write_account_usage(&env, "alpha", 95);
+    client.wait_for_row("reached its usage threshold");
+    client.wait_for_row("Stop and switch?");
+    assert!(env.root.join("beta/checked").exists());
+    assert!(!env.root.join("beta/starts").exists());
+    client.send(b"y");
+    wait_until(PATIENCE, "one confirmation starts the verified alternative", || env.root.join("beta/starts").exists());
+    env.wait_for_text(&pane, "--resume");
+    assert_eq!(std::fs::read_to_string(env.root.join("beta/starts")).unwrap().lines().count(), 1);
+}
+
+#[test]
+fn automatic_switches_need_known_usage_and_do_not_retry_a_failed_check_each_tick() {
+    let env = Env::new("switchauto");
+    let pane = account_switch_agent(&env, "claude", "auto");
+    claude_hook(&env, &pane, r#"{"hook_event_name":"Stop"}"#);
+    let usage = |name, percent| write_account_usage(&env, name, percent);
+    usage("alpha", 95);
+    std::thread::sleep(Duration::from_secs(3));
+    assert!(!env.root.join("beta/checks").exists(), "unknown usage is not free capacity");
+    account_still_runs(&env, &pane, "unknown-usage");
+    std::fs::write(env.root.join("beta/status"), "1").unwrap();
+    usage("beta", 0);
+    wait_until(PATIENCE, "the automatic switch checks sign-in", || env.root.join("beta/checks").exists());
+    std::thread::sleep(Duration::from_secs(3));
+    let checks = std::fs::read_to_string(env.root.join("beta/checks")).unwrap();
+    assert_eq!(checks.lines().count(), 1);
+    account_still_runs(&env, &pane, "failed-auto");
+    std::fs::write(env.root.join("beta/status"), "0").unwrap();
+    std::thread::sleep(Duration::from_secs(3));
+    assert_eq!(std::fs::read_to_string(env.root.join("beta/checks")).unwrap(), checks);
+    account_still_runs(&env, &pane, "no-retry");
 }
 
 /// Native login and status commands controlled by files in the isolated account home.
