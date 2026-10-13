@@ -14,7 +14,7 @@ use super::ui::{Picker, Prompt, Question};
 use crate::ansi::{Cursor, CursorShape};
 use crate::input::KeySpec;
 use crate::keymap::{Action, Command, MenuEntry};
-use crate::text::{columns, truncate, wrap};
+use crate::text::{columns, fold, truncate, wrap};
 use crate::theme::current as th;
 
 fn key_style() -> Style {
@@ -567,16 +567,32 @@ pub(super) fn draw_prompt(p: &Prompt, screen: Rect, buf: &mut Buffer) -> Option<
 /// Where a question's parts are; the same for drawing and for mouse clicks.
 pub(super) struct ConfirmLayout {
     pub(super) area: Rect,
-    /// The message wrapped to the box, each line with whether it is the question itself.
-    pub(super) lines: Vec<(String, bool)>,
+    /// The message, cut to the box.
+    pub(super) lines: Vec<ConfirmRow>,
     /// Rows for the message.
     pub(super) body: u16,
     /// How far the message scrolls (0: it fits); the row saying there is more.
-    pub(super) max_scroll: u16,
+    pub(super) max_scroll: usize,
     pub(super) more: Option<u16>,
     /// The buttons, when there is room to draw them.
     pub(super) cancel: Option<Rect>,
     pub(super) ok: Option<Rect>,
+}
+
+impl ConfirmLayout {
+    /// How far a page key scrolls: the rows of the message in view.
+    pub(super) fn page(&self) -> usize {
+        usize::from(self.body).max(1)
+    }
+}
+
+/// A row of a question's message.
+pub(super) struct ConfirmRow {
+    pub(super) text: String,
+    /// The question itself: the message's first line.
+    pub(super) question: bool,
+    /// The rest of a quoted line that the row above could not hold.
+    pub(super) continued: bool,
 }
 
 pub(super) fn confirm_layout(q: &Question, screen: Rect) -> ConfirmLayout {
@@ -588,8 +604,12 @@ pub(super) fn confirm_layout(q: &Question, screen: Rect) -> ConfirmLayout {
     let text_w = (w as usize).saturating_sub(4).max(1);
     let mut lines = Vec::new();
     for (i, l) in q.message.lines().enumerate() {
-        for part in wrap(l, text_w) {
-            lines.push((part, i == 0));
+        // What a question quotes (see [`Question::message`]) is cut as it is written; the rest
+        // is prose, wrapped between words.
+        let quoted = l.starts_with(' ');
+        let rows = if quoted { fold(l, text_w) } else { wrap(l, text_w) };
+        for (j, text) in rows.into_iter().enumerate() {
+            lines.push(ConfirmRow { text, question: i == 0, continued: quoted && j > 0 });
         }
     }
     let max_h = screen.height.saturating_sub(2).max(3) as usize;
@@ -602,7 +622,7 @@ pub(super) fn confirm_layout(q: &Question, screen: Rect) -> ConfirmLayout {
         body -= 1;
         inner.y + body
     });
-    let max_scroll = (lines.len() as u16).saturating_sub(body);
+    let max_scroll = lines.len().saturating_sub(body as usize);
     let y = inner.y + inner.height.saturating_sub(2);
     let buttons = inner.height >= 3 && inner.width >= columns(&verb) as u16 + 15;
     let cancel = buttons.then(|| Rect::new(inner.x + 1, y, 8, 1));
@@ -611,7 +631,9 @@ pub(super) fn confirm_layout(q: &Question, screen: Rect) -> ConfirmLayout {
 }
 
 /// A question with its two buttons. The message wraps; when it is longer than the box, it
-/// scrolls (the buttons stay in view).
+/// scrolls (the buttons stay in view). A quoted line longer than the box goes on in the rows
+/// below it, each marked in the margin, where no text of the message is ever drawn: a long line
+/// cannot be taken for several, nor several for one.
 pub(super) fn draw_confirm(q: &Question, screen: Rect, buf: &mut Buffer) {
     let danger = q.action.danger(&q.message);
     let layout = confirm_layout(q, screen);
@@ -622,11 +644,16 @@ pub(super) fn draw_confirm(q: &Question, screen: Rect, buf: &mut Buffer) {
     }
     let width = inner.width.saturating_sub(2) as usize;
     let body = layout.body as usize;
-    let max_scroll = layout.max_scroll as usize;
-    let scroll = (q.scroll as usize).min(max_scroll);
-    for (row, (line, first)) in layout.lines.iter().skip(scroll).take(body).enumerate() {
-        let style = if *first { Style::default().add_modifier(Modifier::BOLD) } else { Style::default().fg(th().text) };
-        buf.set_stringn(inner.x + 1, inner.y + row as u16, line, width, style);
+    let max_scroll = layout.max_scroll;
+    let scroll = q.scroll.min(max_scroll);
+    for (row, line) in layout.lines.iter().skip(scroll).take(body).enumerate() {
+        let y = inner.y + row as u16;
+        let style =
+            if line.question { Style::default().add_modifier(Modifier::BOLD) } else { Style::default().fg(th().text) };
+        buf.set_stringn(inner.x + 1, y, &line.text, width, style);
+        if line.continued {
+            buf.set_stringn(inner.x, y, if th().ascii { ">" } else { "↪" }, 1, dim());
+        }
     }
     if let Some(y) = layout.more {
         let more = match max_scroll - scroll {
@@ -730,7 +757,8 @@ mod tests {
     /// and a viewer.
     fn draw_every_overlay(screen: Rect, buf: &mut Buffer) {
         let message = "Remove the worktree /a/very/long/path/that/does/not/fit and its branch kraal/x?\n\
-                       It has 3 uncommitted changes: they will be lost.\nCloses 2 panes: a, b";
+                       It has 3 uncommitted changes: they will be lost.\nCloses 2 panes: a, b\n  \
+                       1. a quoted command, longer than most of these boxes are wide, is cut to their rows\n";
         let picker = Picker::new(
             super::super::ui::PickerKind::Ssh,
             "Connect to a server",
@@ -899,6 +927,40 @@ mod tests {
             .map(|y| (0..area.width).map(|x| buf[(x, y)].symbol().to_string()).collect::<String>() + "\n")
             .collect();
         assert!(screen.contains("line number 30") && screen.contains("↑ top"), "{screen}");
+    }
+
+    /// What a question quotes keeps its spacing, and a line of it longer than the box goes on
+    /// in rows marked as its continuation; the prose around it wraps between words.
+    #[test]
+    fn a_question_quotes_lines_as_they_are_written() {
+        let message = format!(
+            "Trust the runbook deploy?\none two three four five six seven eight nine ten eleven twelve\n  \
+             1. if true; then\n         echo  two   spaces\n     \n     fi\n  2. echo {}",
+            "x".repeat(60)
+        );
+        let area = Rect::new(0, 0, 50, 20);
+        let q = Question { message, action: ConfirmAction::TrustRunbook, yes: false, scroll: 0 };
+        let layout = confirm_layout(&q, area);
+        let rows: Vec<(&str, bool)> = layout.lines.iter().map(|row| (row.text.as_str(), row.continued)).collect();
+        let (cut, rest) = (format!("  2. echo {}", "x".repeat(34)), format!("  {}", "x".repeat(26)));
+        let expected = [
+            ("Trust the runbook deploy?", false),
+            ("one two three four five six seven eight nine", false),
+            ("ten eleven twelve", false),
+            ("  1. if true; then", false),
+            ("         echo  two   spaces", false),
+            ("     ", false),
+            ("     fi", false),
+            (cut.as_str(), false),
+            (rest.as_str(), true),
+        ];
+        assert_eq!(rows, expected);
+        // The mark is in the margin, which the message never reaches.
+        let mut buf = Buffer::empty(area);
+        draw_confirm(&q, area, &mut buf);
+        let margin = |row: u16| buf[(layout.area.x + 1, layout.area.y + 1 + row)].symbol().to_string();
+        assert_eq!((margin(7), margin(8)), (" ".to_string(), "↪".to_string()), "{}", screen(&buf, area));
+        assert!(screen(&buf, area).contains("         echo  two   spaces"));
     }
 
     #[test]

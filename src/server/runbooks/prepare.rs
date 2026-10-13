@@ -20,7 +20,7 @@ impl Server {
     pub(in crate::server) fn advance_draft(&mut self, client: ClientId) -> Mode {
         let Some(d) = self.drafts.get(&client) else { return Mode::Normal };
         if !d.trusted {
-            return Mode::confirm(self.trust_question(d), ConfirmAction::TrustRunbook);
+            return Mode::confirm(d.trust_question(), ConfirmAction::TrustRunbook);
         }
         if d.targets.is_none() {
             let targets = match d.steps.on {
@@ -70,29 +70,6 @@ impl Server {
             }
             _ => self.param_question(client),
         }
-    }
-
-    pub(super) fn trust_question(&self, d: &Draft) -> String {
-        let root = match &d.runbook.source {
-            Source::Repo(root) => paths::shorten_home(root),
-            Source::User => String::new(),
-        };
-        let mut lines = vec![
-            format!("Trust the runbook {} from the repository {root}?", d.runbook.name),
-            "It is new, or changed since you approved it. It runs:".into(),
-        ];
-        let steps: Vec<&String> = d.steps.steps.iter().filter(|s| !s.trim().is_empty()).collect();
-        for (i, st) in steps.iter().enumerate().take(8) {
-            lines.push(format!("  {}. {}", i + 1, first_line(st)));
-        }
-        if steps.len() > 8 {
-            let key = self.runbooks_key();
-            lines.push(format!("  … and {} more steps ({key}, ctrl+e shows the file)", steps.len() - 8));
-        }
-        for p in d.steps.params.iter().filter_map(|p| p.choices_command.as_ref()) {
-            lines.push(format!("  and lists choices with: {}", first_line(p)));
-        }
-        lines.join("\n")
     }
 
     pub(in crate::server) fn confirm_trust(&mut self, client: ClientId, yes: bool) -> Mode {

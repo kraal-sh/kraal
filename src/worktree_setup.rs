@@ -10,6 +10,7 @@ use serde::Deserialize;
 
 use crate::config::WorktreesConfig;
 use crate::git::{self, Worktree};
+use crate::text::numbered;
 use crate::{paths, shell};
 
 /// Where a repository says how to prepare its worktrees. It is read from the commit a new
@@ -160,10 +161,8 @@ impl RepoFile {
             lines.push("it runs there:".into());
         }
         for (i, command) in setup.commands().enumerate() {
-            for (j, line) in command.trim_end_matches('\n').split('\n').enumerate() {
-                let line = visible(line);
-                lines.push(if j == 0 { format!("  {}. {line}", i + 1) } else { format!("     {line}") });
-            }
+            let shown: Vec<String> = command.trim_end_matches('\n').split('\n').map(visible).collect();
+            lines.extend(numbered(i + 1, &shown.join("\n")));
         }
         lines.join("\n")
     }

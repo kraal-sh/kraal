@@ -133,8 +133,9 @@ This file comes with the repository, and someone else may have written it. Like 
 version of it: it copies none of the files it names and runs none of its commands before, and it
 needs your approval again when the file changes. Approving is an act of its own:
 
-- The agent picker shows what the file copies and every command it runs, and asks whether to
-  trust it, before the worktree is made.
+- The agent picker shows what the file copies and every line of every command it runs, and asks
+  whether to trust it, before the worktree is made. A long one
+  [scrolls](keys.md#lists-fields-and-questions), and Cancel is the button selected.
 - In a terminal, `kraal wt new fix-login` shows the same and asks, before anything is made.
 - `kraal wt trust` approves the file as it is now, without a question: for scripts, and once you
   have read it (`kraal wt setup`).

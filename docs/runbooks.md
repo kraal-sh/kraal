@@ -84,8 +84,12 @@ your machine and your servers. It runs nothing (not even a `choices_command`) be
 approved that version of it, and it needs your approval again when it changes. Approving is an
 act of its own:
 
-- In kraal, the list of runbooks asks whether to trust it, with what it runs, before anything
-  else; a Markdown one asks before its first block is sent.
+- In kraal, the list of runbooks asks whether to trust it before anything else. The question
+  shows all that a yes lets run: every line of every step, the shell they run in and the commands
+  that list choices, written out as `kraal runbook show` writes them. A long one
+  [scrolls](keys.md#lists-fields-and-questions), and Cancel is the button selected. A Markdown
+  one asks before its first block is sent, with that block in full, then the document's other
+  steps, which a yes approves with it.
 - In a terminal, `kraal runbook run deploy` shows the file and asks whether to trust this version,
   before the plan.
 - `kraal runbook trust deploy` approves the file as it is now, without a question: for scripts,

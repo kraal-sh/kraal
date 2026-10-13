@@ -13,6 +13,7 @@ use crate::protocol::Placement;
 use crate::runbooks::{self, Body, Runbook, Source};
 use crate::server::ui::{ConfirmAction, Mode, PickAction, PickItem, Picker, PickerKind};
 use crate::server::{ClientId, Server};
+use crate::text::numbered;
 
 impl Server {
     pub(super) fn open_markdown(&mut self, client: ClientId, r: Runbook) -> Mode {
@@ -87,9 +88,17 @@ impl Server {
             return self.send_block(client, index);
         }
         let Some(s) = self.md_sessions.get(&client) else { return Mode::Normal };
+        let shown = |code: &str| s.runbook.source.shown(code);
         let mut lines = vec![format!("Run step {} in {}?", index + 1, self.pane_label(s.target))];
         lines.extend(concerns);
-        lines.extend(s.blocks[index].code.lines().take(6).map(|l| format!("  {l}")));
+        lines.extend(shown(&s.blocks[index].code).lines().map(|line| format!("  {line}")));
+        // A yes approves the document, so every step it could then send is there to read.
+        if s.unapproved() && s.blocks.len() > 1 {
+            lines.push("Its other steps:".into());
+            for (i, block) in s.blocks.iter().enumerate().filter(|(i, _)| *i != index) {
+                lines.extend(numbered(i + 1, &shown(&block.code)));
+            }
+        }
         let production = self.pane_production(s.target);
         Mode::confirm(lines.join("\n"), ConfirmAction::RunBlock { index, production })
     }
@@ -189,10 +198,13 @@ impl Server {
         }
         let mut concerns = Vec::new();
         if let Source::Repo(root) = &s.runbook.source
-            && !runbooks::trusted(&s.runbook)
+            && s.unapproved()
         {
-            let root = paths::shorten_home(root);
-            concerns.push(format!("From the repository {root}: new, or changed since you approved it."));
+            let root = s.runbook.source.shown(&paths::shorten_home(root));
+            concerns.push(format!(
+                "From the repository {root}: new, or changed since you approved it. A yes approves it as it is \
+                 now, with all its steps."
+            ));
         }
         if let Some(why) = self.pane_production(target)
             && s.approved.as_ref() != Some(&why)
