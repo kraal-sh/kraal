@@ -358,6 +358,7 @@ impl Server {
 
     /// Close a pane and clean up empty tabs and workspaces.
     pub fn close_pane(&mut self, id: PaneId) {
+        self.abandon_added_login(id);
         if !self.panes.contains_key(&id) {
             return;
         }

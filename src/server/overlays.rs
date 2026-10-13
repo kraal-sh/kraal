@@ -33,7 +33,7 @@ pub(super) fn centered(screen: Rect, w: u16, h: u16) -> Rect {
 }
 
 /// Clear `area` and frame it with `title`; returns the inside.
-fn frame(area: Rect, title: &str, color: Color, buf: &mut Buffer) -> Rect {
+pub(super) fn frame(area: Rect, title: &str, color: Color, buf: &mut Buffer) -> Rect {
     Clear.render(area, buf);
     let title = truncate(title, area.width.saturating_sub(4) as usize);
     let block = Block::default()
@@ -384,12 +384,15 @@ pub(super) struct PickerLayout {
     pub(super) list: Rect,
     /// Index (in the filtered list) of the first row shown.
     pub(super) start: usize,
+    pub(super) row_height: u16,
 }
 
 impl PickerLayout {
     /// The item under a click, if any.
     pub(super) fn row_at(&self, col: u16, row: u16) -> Option<usize> {
-        self.list.contains(Position::new(col, row)).then(|| self.start + (row - self.list.y) as usize)
+        self.list
+            .contains(Position::new(col, row))
+            .then(|| self.start + ((row - self.list.y) / self.row_height) as usize)
     }
 }
 
@@ -397,13 +400,16 @@ impl PickerLayout {
 /// jump while filtering.
 pub(super) fn picker_layout(p: &Picker, screen: Rect) -> PickerLayout {
     let w = screen.width.saturating_sub(4).min(92);
-    let rows = (p.items.len().max(p.action_keys().len()) as u16).clamp(1, screen.height.saturating_sub(9).max(1));
+    let row_height = if p.kind == super::ui::PickerKind::Accounts && p.actions.is_none() { 2 } else { 1 };
+    let rows =
+        (p.items.len().max(p.action_keys().len()) as u16 * row_height).clamp(1, screen.height.saturating_sub(9).max(1));
+    let rows = rows / row_height * row_height;
     let area = centered(screen, w, rows + 5);
     let inner = Rect::new(area.x + 1, area.y + 1, area.width.saturating_sub(2), area.height.saturating_sub(2));
     let list = Rect::new(inner.x, inner.y + 2, inner.width, inner.height.saturating_sub(3));
-    let shown = list.height.max(1) as usize;
+    let shown = (list.height / row_height).max(1) as usize;
     let start = p.selected.saturating_sub(shown.saturating_sub(1));
-    PickerLayout { area, list, start }
+    PickerLayout { area, list, start, row_height }
 }
 
 pub(super) fn draw_picker(p: &Picker, screen: Rect, buf: &mut Buffer) -> Option<Cursor> {
@@ -457,10 +463,11 @@ pub(super) fn draw_picker(p: &Picker, screen: Rect, buf: &mut Buffer) -> Option<
         buf.set_line(inner.x + 1, inner.y + inner.height - 1, &footer, inner.width.saturating_sub(2));
         return None;
     }
-    for (row, &idx) in p.filtered.iter().skip(layout.start).take(list.height as usize).enumerate() {
+    for (row, &idx) in p.filtered.iter().skip(layout.start).take((list.height / layout.row_height) as usize).enumerate()
+    {
         let item = &p.items[idx];
         let selected = layout.start + row == p.selected;
-        let y = list.y + row as u16;
+        let y = list.y + row as u16 * layout.row_height;
         let mut spans = vec![Span::raw(pointer(selected))];
         if let Some(s) = item.state {
             spans.push(Span::styled(format!("{} ", t.icon(s)), Style::default().fg(t.state_color(s))));
@@ -468,7 +475,7 @@ pub(super) fn draw_picker(p: &Picker, screen: Rect, buf: &mut Buffer) -> Option<
         let label_style =
             if item.dim { Style::default().fg(t.dim) } else { Style::default().add_modifier(Modifier::BOLD) };
         spans.push(Span::styled(item.label.clone(), label_style));
-        if !item.detail.is_empty() {
+        if !item.detail.is_empty() && layout.row_height == 1 {
             if p.kind == super::ui::PickerKind::Commands {
                 // Keys against the right edge, in a column.
                 let used: usize = spans.iter().map(|s| columns(&s.content)).sum();
@@ -482,6 +489,16 @@ pub(super) fn draw_picker(p: &Picker, screen: Rect, buf: &mut Buffer) -> Option<
         }
         fill(buf, Rect::new(list.x, y, list.width, 1), row_style(selected));
         buf.set_line(list.x, y, &Line::from(spans).patch_style(row_style(selected)), list.width);
+        if layout.row_height == 2 {
+            fill(buf, Rect::new(list.x, y + 1, list.width, 1), row_style(selected));
+            buf.set_stringn(
+                list.x + 2,
+                y + 1,
+                &item.detail,
+                list.width.saturating_sub(2) as usize,
+                row_style(selected),
+            );
+        }
     }
     if p.filtered.is_empty() {
         use super::ui::PickerKind as K;
@@ -492,13 +509,18 @@ pub(super) fn draw_picker(p: &Picker, screen: Rect, buf: &mut Buffer) -> Option<
             K::Workspace => "Type a name to create a workspace.".into(),
             K::Runbook => "No runbooks yet: `kraal runbook new <name>` creates one.".into(),
             K::Tool => "No tools: add some under [tools] in config.toml.".into(),
+            K::Agent => "No accounts ready. Open Accounts from the Agents menu to sign in.".into(),
             K::Buffers => "Nothing copied yet: what you copy (copy mode, a mouse selection) shows here.".into(),
             _ => "Nothing here yet.".into(),
         };
         buf.set_stringn(list.x + 2, list.y, msg, list.width.saturating_sub(2) as usize, dim());
     }
     let keys = p.action_keys();
-    let enter = keys.first().map(|(_, what)| lower_first(what));
+    let enter = match p.current().map(|i| &i.action) {
+        Some(super::ui::PickAction::AgentLaunch { .. }) => Some("start".into()),
+        Some(super::ui::PickAction::AccountDetails(_)) => Some("details".into()),
+        _ => keys.first().map(|(_, what)| lower_first(what)),
+    };
     let mut footer: Vec<(&str, &str)> = Vec::new();
     if let Some(enter) = &enter {
         footer.push(("⏎", enter));
@@ -507,7 +529,9 @@ pub(super) fn draw_picker(p: &Picker, screen: Rect, buf: &mut Buffer) -> Option<
         footer.push(("tab", "more actions"));
     }
     footer.push(("esc", if review { "Back" } else { "close" }));
-    let count = if p.query.is_empty() {
+    let count = if let Some(message) = &p.message {
+        message.clone()
+    } else if p.query.is_empty() {
         format!("{}", p.filtered.len())
     } else {
         format!("{}/{}", p.filtered.len(), p.items.len())
@@ -841,7 +865,7 @@ mod tests {
         for (w, h) in [(124, 36), (80, 24)] {
             let area = Rect::new(0, 0, w, h);
             let cases = [
-                (PickerKind::Agent, PickAction::AgentAdd { agent: "claude".into() }, "add account", false),
+                (PickerKind::Accounts, PickAction::AddAccount, "add account", false),
                 (
                     PickerKind::Agent,
                     PickAction::AgentSwitch { pane: 1, agent: "codex".into(), account: "work".into(), current: false },

@@ -17,8 +17,8 @@ impl Server {
     pub(super) fn on_prompt(&mut self, id: ClientId, mut p: Prompt, ev: InputEvent) -> Mode {
         match ev {
             InputEvent::Key(k) => match k.code {
-                KeyCode::Esc => return Mode::Normal,
-                KeyCode::Char('c' | 'g') if k.mods.ctrl => return Mode::Normal,
+                KeyCode::Esc => return self.cancel_account_prompt(&p),
+                KeyCode::Char('c' | 'g') if k.mods.ctrl => return self.cancel_account_prompt(&p),
                 // Files dropped on an SSH pane: paste their paths instead of uploading them.
                 KeyCode::Char('p') if k.mods.ctrl && matches!(p.action, PromptAction::Upload { .. }) => {
                     if let PromptAction::Upload { raw, pane, .. } = p.action
@@ -35,8 +35,14 @@ impl Server {
                     }
                     let title = p.title.clone();
                     let (value, cursor, masked) = (p.value.clone(), p.cursor, p.masked);
+                    let renamed = match &p.action {
+                        PromptAction::RenameAccount { agent, account } => {
+                            self.accounts.get(agent, account).map(|a| a.id)
+                        }
+                        _ => None,
+                    };
                     return match self.commit_prompt(id, p) {
-                        Ok(()) => Mode::Normal,
+                        Ok(()) => renamed.map_or(Mode::Normal, |a| Mode::Picker(self.accounts_picker(Some(&a)))),
                         // Not accepted: the prompt stays, with the reason under it.
                         Err((action, why)) => {
                             Mode::Prompt(Prompt { title, value, cursor, action, error: Some(why), masked })
@@ -56,6 +62,15 @@ impl Server {
             _ => {}
         }
         Mode::Prompt(p)
+    }
+
+    fn cancel_account_prompt(&self, prompt: &Prompt) -> Mode {
+        if let PromptAction::RenameAccount { agent, account } = &prompt.action {
+            let a = self.accounts.get(agent, account);
+            Mode::Picker(self.accounts_picker(a.as_ref().map(|a| a.id.as_str())))
+        } else {
+            Mode::Normal
+        }
     }
 
     /// Act on a prompt's value; a value that cannot be used gives the action back with why.
@@ -164,9 +179,9 @@ impl Server {
                 }
                 self.start_job(id, "download", vec!["cp".into(), "--".into(), value, format!("{}/", dir.display())]);
             }
-            PromptAction::NewWorktree { agent } => {
-                if let Err(e) = self.agent_in_worktree(id, &agent, &value) {
-                    return Err((PromptAction::NewWorktree { agent }, format!("{e:#}")));
+            PromptAction::NewWorktree { agent, account } => {
+                if let Err(e) = self.agent_in_worktree(id, &agent, &account, &value) {
+                    return Err((PromptAction::NewWorktree { agent, account }, format!("{e:#}")));
                 }
             }
             PromptAction::Commit { pane } => self.commit_worktree(id, pane, &value),
@@ -188,11 +203,6 @@ impl Server {
                 let label = format!("» {} on {}", value.chars().take(30).collect::<String>(), targets.join(" "));
                 if let Err(e) = self.spawn_pane_in(ws, None, spec, Placement::Floating, Some(label)) {
                     self.toast(id, format!("{e:#}"));
-                }
-            }
-            PromptAction::AddAccount { agent } => {
-                if let Err(e) = self.add_account(id, &agent, &value) {
-                    return Err((PromptAction::AddAccount { agent }, format!("{e:#}")));
                 }
             }
             PromptAction::RenameAccount { agent, account } => {
@@ -309,14 +319,26 @@ impl Server {
         }
         let action = q.action;
         match action {
+            ConfirmAction::RemoveAccount(a) => {
+                if yes {
+                    match crate::accounts::Accounts::update(|all| Ok(all.remove(&a.agent, &a.key()))) {
+                        Ok(_) => {
+                            self.reload_accounts();
+                            self.toast(id, "Account removed");
+                        }
+                        Err(e) => self.toast(id, format!("{e:#}")),
+                    }
+                }
+                return Mode::Picker(self.accounts_picker(Some(&a.id)));
+            }
             ConfirmAction::UseExisting { existing, target } => {
                 if yes {
                     if let Err(e) = self.confirm_existing_account(id, &existing, target.as_ref()) {
                         self.toast(id, format!("{e:#}"));
                         self.reload_accounts();
-                        return Mode::Picker(self.agent_picker(id, None));
+                        return Mode::Picker(self.accounts_picker(None));
                     }
-                    return Mode::Picker(self.agent_picker(id, None));
+                    return Mode::Picker(self.accounts_picker(None));
                 }
                 return Mode::Picker(self.review_account_picker(&existing));
             }
@@ -350,7 +372,8 @@ impl Server {
         match yes {
             true => {
                 match action {
-                    ConfirmAction::UseExisting { .. }
+                    ConfirmAction::RemoveAccount(_)
+                    | ConfirmAction::UseExisting { .. }
                     | ConfirmAction::StopAndSwitch { .. }
                     | ConfirmAction::Production { .. }
                     | ConfirmAction::RunRunbook

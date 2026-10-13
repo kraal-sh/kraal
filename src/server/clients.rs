@@ -63,6 +63,8 @@ impl Server {
                 parser: InputParser::new(),
                 pending_since: None,
                 mode: Mode::Normal,
+                last_account_agent: None,
+                adding_account: None,
                 encoder: Encoder::new(),
                 frame: Default::default(),
                 memo: Default::default(),

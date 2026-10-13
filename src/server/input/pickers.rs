@@ -52,7 +52,7 @@ impl Server {
             InputEvent::Key(k) => match (k.code, k.mods.ctrl) {
                 (KeyCode::Esc, _) | (KeyCode::Char('c'), true) | (KeyCode::Char('g'), true) => {
                     return if p.kind == PickerKind::AccountReview {
-                        Mode::Picker(self.agent_picker(id, None))
+                        Mode::Picker(self.accounts_picker(None))
                     } else {
                         Mode::Normal
                     };
@@ -95,45 +95,51 @@ impl Server {
                         return Mode::Normal;
                     }
                 }
-                (KeyCode::Char('l'), true) if p.kind == PickerKind::Agent => {
-                    if let Some(PickAction::AgentLaunch { agent, account }) = p.current().map(|i| i.action.clone())
-                        && let Some(a) = self.accounts.get(&agent, &account)
+                (KeyCode::Char('d'), true) if p.kind == PickerKind::Agent => {
+                    if let Some(PickAction::AgentLaunch { agent, account }) = p.current().map(|i| &i.action)
+                        && let Some(a) = self.accounts.get(agent, account)
                     {
-                        if let Err(e) = self.open_login(id, &a) {
-                            self.toast(id, format!("{e:#}"));
-                        }
-                        return Mode::Normal;
+                        return self.account_details(&a.id);
                     }
                 }
-                (KeyCode::Char('r'), true) if p.kind == PickerKind::Agent => {
+                (KeyCode::Char('w'), true) if p.kind == PickerKind::Agent && p.worktree => {
                     if let Some(PickAction::AgentLaunch { agent, account }) = p.current().map(|i| i.action.clone()) {
-                        match self.accounts.renamable(&agent, &account) {
-                            Ok(a) => {
+                        return Mode::Prompt(Prompt::new(
+                            &format!("Name of the worktree for {agent} (branch kraal/<name>)"),
+                            "",
+                            PromptAction::NewWorktree { agent, account },
+                        ));
+                    }
+                }
+                (KeyCode::Char(key @ ('r' | 'l' | 'x')), true) if p.kind == PickerKind::Accounts => {
+                    if let Some(PickAction::AccountDetails(account)) = p.current().map(|i| &i.action)
+                        && let Some(a) = self.accounts.by_id(account)
+                    {
+                        match key {
+                            'r' => {
                                 return Mode::Prompt(Prompt::new(
-                                    &format!("New name for {}", crate::accounts::label(&a)),
+                                    &format!("Rename {}", super::super::account_ui::label(&a)),
                                     &a.name,
-                                    PromptAction::RenameAccount { agent, account },
+                                    PromptAction::RenameAccount { agent: a.agent.clone(), account: a.key() },
                                 ));
                             }
-                            Err(e) => self.toast(id, format!("{e:#}")),
-                        }
-                    }
-                }
-                (KeyCode::Char('x'), true) if p.kind == PickerKind::Agent => {
-                    if let Some(PickAction::AgentLaunch { agent, account }) = p.current().map(|i| i.action.clone()) {
-                        let label = self.accounts.get(&agent, &account).as_ref().map(crate::accounts::label);
-                        let result = crate::accounts::Accounts::update(|all| Ok(all.remove(&agent, &account)));
-                        match result {
-                            Ok(true) => {
-                                self.reload_accounts();
-                                self.toast(
-                                    id,
-                                    format!("forgot {} (its directory is kept)", label.as_deref().unwrap_or("account")),
-                                );
-                                return Mode::Picker(self.agent_picker(id, None));
+                            'l' => {
+                                if let Err(e) = self.open_login(id, &a) {
+                                    self.toast(id, format!("{e:#}"));
+                                } else {
+                                    return Mode::Normal;
+                                }
                             }
-                            Ok(false) => self.toast(id, "the account is gone; reopen the account list"),
-                            Err(e) => self.toast(id, format!("{e:#}")),
+                            'x' => {
+                                return Mode::confirm(
+                                    format!(
+                                        "Remove {}?\nConversations and the agent's own sign-in are kept.\nRunning panes keep their account. It will no longer be offered for new launches.",
+                                        super::super::account_ui::label(&a)
+                                    ),
+                                    ConfirmAction::RemoveAccount(a),
+                                );
+                            }
+                            _ => {}
                         }
                     }
                 }
@@ -245,14 +251,14 @@ impl Server {
             InputEvent::Mouse(MouseEvent { kind: MouseKind::ScrollUp, .. }) => p.move_by(-1),
             InputEvent::Mouse(MouseEvent { kind: MouseKind::ScrollDown, .. }) => p.move_by(1),
             InputEvent::Mouse(MouseEvent { kind: MouseKind::Press(MouseButton::Left), col, row, .. }) => {
-                // A click on a row selects it; a second click on it chooses it.
+                // Rows and their actions use the same activation as Enter.
                 let layout = crate::server::overlays::picker_layout(&p, self.client_screen(id));
                 if let Some(i) = layout.row_at(col, row) {
-                    if i == p.selected {
+                    if i < p.filtered.len() {
+                        p.selected = i;
                         let Some(item) = p.current().cloned() else { return Mode::Picker(p) };
                         return self.pick(id, &p, item);
                     }
-                    p.selected = i;
                 } else if !layout.area.contains(ratatui::layout::Position::new(col, row)) {
                     return Mode::Normal;
                 }
@@ -300,7 +306,7 @@ impl Server {
             PickAction::ReviewAccount(existing) => return Mode::Picker(self.review_account_picker(&existing)),
             PickAction::CheckExisting { agent } => {
                 self.retry_existing_account(&agent);
-                return Mode::Picker(self.agent_picker(id, None));
+                return Mode::Picker(self.accounts_picker(None));
             }
             PickAction::UseExisting { existing, target } => {
                 let name = target.as_ref().map_or(existing.name.as_str(), |a| &a.name);
@@ -327,21 +333,9 @@ impl Server {
                     self.toast(id, format!("{e:#}"));
                 }
             }
-            PickAction::AgentWorktree { agent } => {
-                return Mode::Prompt(Prompt::new(
-                    &format!("Name of the worktree for {agent} (branch kraal/<name>)"),
-                    "",
-                    PromptAction::NewWorktree { agent },
-                ));
-            }
             PickAction::Worktree { pane, op } => return self.worktree_op(id, pane, &op),
-            PickAction::AgentAdd { agent } => {
-                return Mode::Prompt(Prompt::new(
-                    &format!("Name of the new {agent} account (e.g. pro, perso2)"),
-                    "",
-                    PromptAction::AddAccount { agent },
-                ));
-            }
+            PickAction::AddAccount => return Mode::AccountForm(self.account_form(id)),
+            PickAction::AccountDetails(account) => return self.account_details(&account),
             PickAction::None => return Mode::Picker(Picker::new(p.kind, &p.title, p.items.clone())),
         }
         Mode::Normal
@@ -501,5 +495,85 @@ impl Server {
         if let Err(e) = self.spawn_pane_in(ws, None, spec, Placement::Floating, Some("servers.toml".into())) {
             self.toast(id, format!("{e:#}"));
         }
+    }
+}
+
+#[cfg(test)]
+mod account_tests {
+    use super::*;
+    use crate::input::Mods;
+
+    #[test]
+    fn one_click_on_either_line_opens_an_unselected_account_and_blank_rows_do_nothing() {
+        let (tx, _) = crate::server::queue::channel(16);
+        let mut server = crate::server::tests::server(tx);
+        let a = server
+            .accounts
+            .add(crate::accounts::Account {
+                id: crate::accounts::new_uuid(),
+                agent: "claude".into(),
+                name: "work".into(),
+                home: "/nonexistent/work".into(),
+                threshold: None,
+                note: None,
+                sign_in_required: false,
+                review: false,
+                public_identity: None,
+                linked_to: None,
+            })
+            .unwrap();
+        for line in [0, 1] {
+            let mut p = server.accounts_picker(None);
+            p.selected = 1;
+            let l = crate::server::overlays::picker_layout(&p, server.client_screen(0));
+            let event = InputEvent::Mouse(MouseEvent {
+                kind: MouseKind::Press(MouseButton::Left),
+                col: l.list.x + 2,
+                row: l.list.y + line,
+                mods: Mods::default(),
+            });
+            assert!(matches!(server.on_picker(0, p, event), Mode::AccountDetails(d) if d.account == a.id));
+        }
+        let p = Picker::new(PickerKind::Accounts, "Accounts", vec![]);
+        let l = crate::server::overlays::picker_layout(&p, server.client_screen(0));
+        let event = InputEvent::Mouse(MouseEvent {
+            kind: MouseKind::Press(MouseButton::Left),
+            col: l.list.x + 2,
+            row: l.list.y,
+            mods: Mods::default(),
+        });
+        assert!(matches!(server.on_picker(0, p, event), Mode::Picker(_)));
+    }
+
+    #[test]
+    fn remove_first_asks_and_enter_cancels_without_touching_accounts() {
+        let (tx, _) = crate::server::queue::channel(16);
+        let mut server = crate::server::tests::server(tx);
+        let a = server
+            .accounts
+            .add(crate::accounts::Account {
+                id: crate::accounts::new_uuid(),
+                agent: "claude".into(),
+                name: "work".into(),
+                home: "/nonexistent/work".into(),
+                threshold: None,
+                note: None,
+                sign_in_required: false,
+                review: false,
+                public_identity: None,
+                linked_to: None,
+            })
+            .unwrap();
+        let p = server.accounts_picker(Some(&a.id));
+        let key = Key { code: KeyCode::Char('x'), mods: Mods { ctrl: true, ..Default::default() }, raw: Vec::new() };
+        let Mode::Confirm(q) = server.on_picker(0, p, InputEvent::Key(key)) else { panic!() };
+        assert!(!q.yes);
+        assert!(q.message.contains("Conversations and the agent's own sign-in are kept."));
+        assert_eq!(q.action.verb(), "Remove");
+        let key = Key { code: KeyCode::Enter, mods: Mods::default(), raw: Vec::new() };
+        assert!(
+            matches!(server.on_confirm(0, q, InputEvent::Key(key)), Mode::Picker(p) if p.kind == PickerKind::Accounts)
+        );
+        assert_eq!(server.accounts.all().len(), 1);
     }
 }

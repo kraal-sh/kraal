@@ -22,6 +22,7 @@ use crate::worktree_setup::{self, Plan, Prepared};
 pub struct NewWorktree {
     ws: u32,
     agent: String,
+    account: String,
     plan: Plan,
 }
 
@@ -251,7 +252,7 @@ impl Server {
     /// Create a worktree from the focused pane's repository, prepare it as the repository and
     /// the config say, then start `agent` in it in a new tab. Git runs in the background (it
     /// can be slow); the repository's setup commands are approved first.
-    pub(super) fn agent_in_worktree(&mut self, client: ClientId, agent: &str, name: &str) -> Result<()> {
+    pub(super) fn agent_in_worktree(&mut self, client: ClientId, agent: &str, account: &str, name: &str) -> Result<()> {
         let ws = self.clients.get(&client).map(|c| c.workspace).context("no client")?;
         let cwd = self
             .client_focus(client)
@@ -261,17 +262,17 @@ impl Server {
             .context("no local directory to take the repository from")?;
         anyhow::ensure!(git::valid_worktree_name(name), "invalid worktree name {name:?} (letters, digits, - _ .)");
         let user = worktree_setup::Setup::of_user(&self.config.worktrees);
-        let (agent, name) = (agent.to_string(), name.to_string());
+        let (agent, account, name) = (agent.to_string(), account.to_string(), name.to_string());
         self.toast(client, format!("creating worktree {name}…"));
         self.background(
             move || Plan::new(&cwd, &name, None, user, true),
             move |server, plan| match plan {
                 Ok(plan) if plan.needs_trust() => {
                     let question = plan.trust_question();
-                    let new = Box::new(NewWorktree { ws, agent, plan });
+                    let new = Box::new(NewWorktree { ws, agent, account, plan });
                     server.set_mode_if_idle(client, Mode::confirm(question, ConfirmAction::TrustWorktreeSetup(new)));
                 }
-                Ok(plan) => server.create_worktree(client, NewWorktree { ws, agent, plan }),
+                Ok(plan) => server.create_worktree(client, NewWorktree { ws, agent, account, plan }),
                 Err(e) => server.toast(client, format!("{e:#}")),
             },
         );
@@ -292,11 +293,11 @@ impl Server {
     }
 
     fn create_worktree(&mut self, client: ClientId, new: NewWorktree) {
-        let NewWorktree { ws, agent, plan } = new;
+        let NewWorktree { ws, agent, account, plan } = new;
         self.background(
             move || plan.create(),
             move |server, created| {
-                let result = created.and_then(|p| server.start_agent_in(ws, &agent, p));
+                let result = created.and_then(|p| server.start_agent_in(ws, &agent, &account, p));
                 if let Err(e) = result {
                     server.toast(client, format!("{e:#}"));
                 }
@@ -306,16 +307,12 @@ impl Server {
 
     /// Start `agent` in its new worktree, in a tab named after it; the worktree's setup runs in
     /// its pane first.
-    fn start_agent_in(&mut self, ws: u32, agent: &str, prepared: Prepared) -> Result<()> {
-        let wi = self.ws_index(ws).context("the workspace was closed")?;
-        let ws_name = self.workspaces[wi].name.clone();
+    fn start_agent_in(&mut self, ws: u32, agent: &str, account: &str, prepared: Prepared) -> Result<()> {
+        self.ws_index(ws).context("the workspace was closed")?;
         let wt = prepared.worktree.clone();
         let name = wt.name();
-        // Account rules are written for the repository, not for its worktrees' directories.
-        let account = self
-            .accounts
-            .choose(agent, Some(&ws_name), Some(&wt.repo), &self.usage, crate::accounts::now())
-            .context("no account for this agent")?;
+        let account =
+            self.accounts.get(agent, account).context("The account was removed. Open Accounts to choose another.")?;
         let mut spec = self.agent_spec(&account, Some(wt.path.clone()), None, &[])?;
         spec.worktree = Some(wt.clone());
         let title = Some(format!("{agent} {name}"));
@@ -592,24 +589,6 @@ impl Server {
             self.toast(client, format!("{e:#}"));
         }
         // Branch states change after these: git is asked again when its pane's program ends.
-    }
-
-    /// Worktree items for the agent picker: start an agent on a new branch of this repository.
-    pub(super) fn worktree_items(&self, client: ClientId) -> Vec<PickItem> {
-        let in_repo = self.client_focus(client).and_then(|p| self.pane_git(p)).is_some();
-        if !in_repo {
-            return Vec::new();
-        }
-        crate::accounts::AGENTS
-            .iter()
-            .map(|k| PickItem {
-                label: format!("+ {} in a new worktree", k.name),
-                detail: "its own branch (kraal/<name>) and directory, next to this repository".into(),
-                action: PickAction::AgentWorktree { agent: k.name.to_string() },
-                state: None,
-                dim: true,
-            })
-            .collect()
     }
 }
 

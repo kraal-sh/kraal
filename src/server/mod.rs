@@ -3,6 +3,7 @@
 //! All state lives on one thread. PTY readers, process waiters and client sockets run on helper
 //! threads that only forward [`Event`]s through a channel, so the state needs no locking.
 
+mod account_ui;
 mod agents;
 mod attention;
 mod bottom_bar;
@@ -328,6 +329,9 @@ pub struct Client {
     pub parser: InputParser,
     pub pending_since: Option<Instant>,
     pub mode: Mode,
+    pub last_account_agent: Option<String>,
+    /// The login pane opened by this client's Add account form.
+    pub adding_account: Option<PaneId>,
     pub encoder: Encoder,
     /// The last frame composed for it, kept to compose the next one over it.
     pub(in crate::server) frame: ratatui::buffer::Buffer,
@@ -1841,6 +1845,21 @@ impl Server {
 mod tests {
     use super::*;
     use crate::layout::Preset;
+
+    pub(super) fn client(server: &mut Server) -> (ClientId, std::os::unix::net::UnixStream) {
+        let ws = server.new_workspace("test".into(), None);
+        let tab = server.alloc_id();
+        server.workspaces.last_mut().unwrap().tabs.push(Tab::new(tab, "test".into()));
+        let (stream, peer) = std::os::unix::net::UnixStream::pair().unwrap();
+        let id = server.next_id;
+        server.new_connection(stream);
+        let c = server.clients.get_mut(&id).unwrap();
+        c.attached = true;
+        c.workspace = ws;
+        c.cols = 124;
+        c.rows = 36;
+        (id, peer)
+    }
 
     pub(super) fn server(tx: EventSender) -> Server {
         let config = Config::default();

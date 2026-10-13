@@ -170,6 +170,8 @@ impl Server {
             Mode::Search { query, found } => self.on_search(id, query, found, ev),
             Mode::Picker(p) => self.on_picker(id, p, ev),
             Mode::Prompt(p) => self.on_prompt(id, p, ev),
+            Mode::AccountForm(form) => self.on_account_form(id, form, ev),
+            Mode::AccountDetails(details) => self.on_account_details(id, details, ev),
             Mode::Help { scroll } => {
                 let lines = self.help_lines().len();
                 self.on_help(id, scroll, lines, ev).unwrap_or(Mode::Help { scroll })
@@ -464,6 +466,11 @@ impl Server {
             }
             if k.code == KeyCode::Char('c') && k.mods.ctrl {
                 login.state = crate::pane::LoginState::Cancelled;
+                for c in self.clients.values_mut() {
+                    if c.adding_account == Some(p) {
+                        c.adding_account = None;
+                    }
+                }
             }
         }
         if pane.exit_code.is_some() {

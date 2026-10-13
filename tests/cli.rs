@@ -5373,8 +5373,8 @@ fn a_worktree_setup_is_not_run_again_after_a_restart() {
     std::fs::write(
         env.root.join("config/kraal/accounts.toml"),
         format!(
-            "[[account]]\nname = \"alpha\"\nagent = \"claude\"\nhome = {:?}\n\n[[rule]]\nworkspace = \"w\"\naccounts = [\"alpha\"]\n",
-            home.display().to_string()
+            "[[account]]\nname = \"alpha\"\nagent = \"claude\"\nhome = {:?}\n\n[[rule]]\nworkspace = \"w\"\naccounts = [\"beta\"]\n\n[[account]]\nname=\"beta\"\nagent=\"claude\"\nhome={:?}\n",
+            home.display().to_string(), env.root.join("beta-home").display().to_string()
         ),
     )
     .unwrap();
@@ -5388,16 +5388,18 @@ fn a_worktree_setup_is_not_run_again_after_a_restart() {
     let mut client = RawClient::attach(&env, "w");
     client.wait_for_screen("⎇ main");
     client.send(b"\x02a");
-    client.wait_for_screen("in a new worktree");
-    client.send(b"claude in a new worktree");
-    std::thread::sleep(Duration::from_millis(200));
-    client.send(b"\r");
+    client.wait_for_row("Claude · alpha");
+    client.send(b"\x17");
     client.wait_for_screen("Name of the worktree");
     client.send(b"feat\r");
     client.wait_for_screen("Trust the worktree setup");
     client.send(b"y");
     let started = || std::fs::read_to_string(&ran).unwrap_or_default();
     wait_until(Duration::from_secs(15), "the setup never started", || started() == "started\n");
+
+    let panes: serde_json::Value = serde_json::from_str(&env.run(&["panes", "--json"])).unwrap();
+    let agent = panes.as_array().unwrap().iter().find(|p| p["name"] == "claude feat").unwrap();
+    assert_eq!(agent["account"], "claude:alpha", "the selected account overrides the beta rule");
 
     // Stopped while the setup runs, and started again: the pane is back, the setup is not.
     env.run(&["kill"]);
@@ -5460,10 +5462,8 @@ fn an_agent_worktree_is_prepared_in_its_pane_once_trusted() {
         env.run(&["focus", "shell"]);
         client.screen.lock().unwrap().clear();
         client.send(b"\x02a");
-        client.wait_for_screen("in a new worktree");
-        client.send(b"claude in a new worktree");
-        std::thread::sleep(Duration::from_millis(200));
-        client.send(b"\r");
+        client.wait_for_row("Claude · alpha");
+        client.send(b"\x17");
         client.wait_for_screen("Name of the worktree");
         client.send(name.as_bytes());
         client.send(b"\r");
@@ -5565,10 +5565,8 @@ fn an_agent_worktree_is_prepared_in_its_pane_once_trusted() {
     env.run(&["focus", "shell"]);
     client.screen.lock().unwrap().clear();
     client.send(b"\x02a");
-    client.wait_for_screen("in a new worktree");
-    client.send(b"claude in a new worktree");
-    std::thread::sleep(Duration::from_millis(200));
-    client.send(b"\r");
+    client.wait_for_row("Claude · alpha");
+    client.send(b"\x17");
     client.wait_for_screen("Name of the worktree");
     client.send(b"copied\r");
     wait_for("claude copied", "agent in copied #2 port 3020");
@@ -5616,10 +5614,8 @@ fn all_of_a_worktree_setup_can_be_read_before_it_is_trusted() {
         }
         env.run(&["focus", "shell"]);
         client.send(b"\x02a");
-        client.wait_for_screen("in a new worktree");
-        client.send(b"claude in a new worktree");
-        std::thread::sleep(Duration::from_millis(200));
-        client.send(b"\r");
+        client.wait_for_row("Claude · alpha");
+        client.send(b"\x17");
         client.wait_for_screen("Name of the worktree");
         client.send(b"feat\r");
         client.wait_for_row("Trust the worktree setup");
@@ -6104,6 +6100,14 @@ impl RawClient {
     /// it, which a frame leaves out.
     fn wait_for_row(&self, text: &str) -> Vec<String> {
         self.wait_for_rows(text, |rows| rows.iter().any(|r| r.contains(text)))
+    }
+
+    /// Close the overlay identified by `text` before sending more keys: Escape followed by
+    /// another key before its timeout is Alt+that key, even in separate reads.
+    fn close_overlay(&mut self, text: &str) {
+        self.wait_for_row(text);
+        self.send(b"\x1b");
+        self.wait_for_rows(&format!("{text} closed"), |rows| !rows.iter().any(|r| r.contains(text)));
     }
 
     /// Wait until the rows its terminal shows are `what` says (`done`); the rows then.
@@ -6777,26 +6781,20 @@ fn picker_actions_and_footers_follow_the_line_at_both_sizes() {
     };
     for size in [(124, 36), (80, 24)] {
         let mut client = RawClient::attach_sized(&env, Some("w"), size);
-        for agent in ["claude", "codex"] {
-            client.send(b"\x02a");
-            let label = format!("+ add a {agent} account");
-            let rows = client.wait_for_row(&label);
-            let y = rows.iter().position(|r| r.contains(&label)).unwrap();
-            let x = rows[y][..rows[y].find(&label).unwrap()].chars().count();
-            let term = emulate(&client.screen.lock().unwrap(), size.0, size.1);
-            assert!(term.grid()[Line(y as i32)][Column(x)].flags.contains(Flags::BOLD), "{agent} at {size:?}");
-            click(&mut client, &label);
-            let rows = client.wait_for_row("⏎ add account");
-            assert!(!rows.iter().any(|r| r.contains("more actions")));
-            if agent == "claude" {
-                client.send(b"\r");
-            } else {
-                click(&mut client, &label);
-            }
-            client.wait_for_row(&format!("Name of the new {agent} account"));
-            client.send(b"\x1b");
-            client.wait_for_rows("the name prompt closed", |rows| !rows.iter().any(|r| r.contains("Name of the new")));
-        }
+        client.send(b"\x02Al");
+        client.wait_for_row("⏎ add account");
+        let label = "+ Add account";
+        let rows = client.wait_for_row(label);
+        let y = rows.iter().position(|r| r.contains(label)).unwrap();
+        let x = rows[y][..rows[y].find(label).unwrap()].chars().count();
+        let term = emulate(&client.screen.lock().unwrap(), size.0, size.1);
+        assert!(term.grid()[Line(y as i32)][Column(x)].flags.contains(Flags::BOLD), "at {size:?}");
+        click(&mut client, label);
+        client.wait_for_row("Name    Personal");
+        client.wait_for_row("Agent   Claude");
+        client.close_overlay("Agent   Claude");
+        client.wait_for_row("+ Add account");
+        client.close_overlay("⏎ add account");
 
         client.send(b"\x02wclosed");
         let rows = client.wait_for_row("⏎ open workspace");
@@ -7329,8 +7327,8 @@ esac
 }
 
 fn open_account_login(client: &mut RawClient) {
-    client.send(b"\x02a");
-    client.wait_for_row("Start an agent");
+    client.send(b"\x02Al");
+    client.wait_for_row("Accounts");
     client.send(b"work");
     client.wait_for_row("work");
     client.send(b"\x0c");
@@ -7427,12 +7425,11 @@ fn failed_and_cancelled_logins_close_on_enter_and_retry_only_when_asked() {
             .any(|l| l.contains("claude·work") && l.contains("sign-in required"))
     );
     client.resize((124, 36));
-    client.wait_for_row("sign-in required");
-    client.send(b"\x02a");
-    client.wait_for_rows("required in the account picker", |rows| {
-        rows.iter().any(|r| r.contains("claude·work") && r.contains("sign-in required"))
-    });
-    client.send(b"\x1b");
+    client.wait_for_row("Sign-in required");
+    client.send(b"\x02Al");
+    client.wait_for_row("Claude · work");
+    client.wait_for_row("Sign-in required");
+    client.close_overlay("⏎ details");
 
     std::fs::remove_file(home.join("finish-login")).unwrap();
     open_account_login(&mut client);
@@ -7542,6 +7539,8 @@ case "$*" in
     'auth status'|'login status')
         echo "$home" >> "$HOME/status-checks"
         test -f "$home/status" || exit 1
+        while test -f "$home/hold-check"; do sleep 0.05; done
+        echo checked >> "$home/check-finished"
         test ! -f "$home/public-status" || cat "$home/public-status"
         exit "$(cat "$home/status")"
         ;;
@@ -7860,10 +7859,9 @@ fn reviewing_the_existing_account_keeps_live_agents_and_reports_usage_once() {
             let row = rows.iter().position(|r| r.contains("Existing Claude account")).unwrap() + 1;
             client.send(format!("\x1b[<0;10;{row}M\x1b[<0;10;{row}m").as_bytes());
         } else {
-            client.send(b"\x02a");
-            client.wait_for_rows("verified existing sign-in offers Review", |rows| {
-                rows.iter().any(|r| r.contains("Existing Claude account") && r.contains("Review"))
-            });
+            client.send(b"\x02Al");
+            client.wait_for_row("Existing Claude account");
+            client.wait_for_row("Review");
             assert!(!client.rows().iter().any(|r| r.contains("claude·default") || r.contains("codex·default")));
             client.send(b"Existing Claude");
             client.send(b"\r");
@@ -7917,31 +7915,33 @@ fn reviewing_the_existing_account_keeps_live_agents_and_reports_usage_once() {
 }
 
 #[test]
-fn a_new_account_with_no_agent_keeps_a_sign_in_required_entry() {
+fn a_missing_agent_keeps_the_add_form_and_creates_nothing() {
     let env = Env::new("login-missing");
     env.workspace("w", "layout { pane name=\"shell\" }\n");
     env.run(&["open", "w"]);
-    let mut client = RawClient::attach(&env, "w");
-    client.send(b"\x02a");
-    client.wait_for_row("Start an agent");
-    client.send(b"+ add a claude");
-    client.send(b"\r");
-    client.wait_for_row("Name of the new claude account");
-    client.send(b"unfinished\r");
-    client.wait_for_row("not installed");
-    client.wait_for_row("enter close");
+    let mut client = RawClient::attach_sized(&env, Some("w"), (80, 24));
+    client.send(b"\x02An");
+    client.wait_for_row("Not installed");
+    client.send(b"\x15unfinished\r");
+    client.wait_for_row("Install Claude");
+    client.wait_for_row("Name    unfinished");
+    assert!(login_panes(&env).is_empty());
     let file = env.root.join("config/kraal/accounts.toml");
-    let accounts = std::fs::read_to_string(file).unwrap();
-    assert!(accounts.contains("name = \"unfinished\"") && accounts.contains("sign_in_required = true"), "{accounts}");
-    client.send(b"r");
-    client.wait_for_row("not installed");
-    client.send(b"\r");
-    common::wait_until(PATIENCE, "missing login closes", || login_panes(&env).is_empty());
-    client.wait_for_row("sign-in required");
-    let list: serde_json::Value = serde_json::from_str(&env.run(&["accounts", "list", "--json"])).unwrap();
-    let account = list.as_array().unwrap().iter().find(|a| a["name"] == "unfinished").unwrap();
-    assert_eq!(account["status"], "not_installed");
-    assert_eq!(account["logged_in"], serde_json::Value::Null);
+    assert!(!std::fs::read_to_string(file).unwrap_or_default().contains("unfinished"));
+    client.close_overlay("Name    unfinished");
+    client.wait_for_row("+ Add account");
+    client.close_overlay("⏎ add account");
+    client.send(b"\x02An\x1b[Z\x1b[C");
+    client.wait_for_row("Agent   Codex");
+    client.close_overlay("Agent   Codex");
+    client.close_overlay("⏎ add account");
+    client.send(b"\x02An");
+    client.wait_for_row("Agent   Codex");
+    client.close_overlay("Agent   Codex");
+    client.close_overlay("⏎ add account");
+    client.send(b"\x02a");
+    let rows = client.wait_for_row("No accounts ready.");
+    assert!(!rows.iter().any(|r| r.contains("Add account")));
 }
 
 #[test]
@@ -8056,16 +8056,16 @@ fn a_renamed_account_keeps_its_rules_its_usage_and_its_agents() {
     assert_eq!(account_said("agent.working"), "claude:alpha");
     let mut client = RawClient::attach(&env, "w");
 
-    // Tab on the account in the agent picker, then its fourth action, Rename, and the new name.
+    // Tab on the account in Accounts, then Rename and the new name.
     // The client is sent what changed since the frame before: a word is looked for only where
     // it is drawn over blank cells or other letters.
-    client.send(b"\x02a");
-    client.wait_for_screen("Start an agent");
+    client.send(b"\x02Al");
+    client.wait_for_screen("Accounts");
     client.send(b"alpha");
     std::thread::sleep(Duration::from_millis(200));
     client.send(b"\t");
     client.wait_for_screen("Rename");
-    client.send(b"\x1b[B\x1b[B\x1b[B\r\x15gamma\r");
+    client.send(b"\r\x15gamma\r");
     let named = |name: &str| std::fs::read_to_string(&file).unwrap().contains(&format!("name = \"{name}\""));
     wait_until(Duration::from_secs(10), "renamed from the picker", || named("gamma"));
     let text = std::fs::read_to_string(&file).unwrap();
@@ -10551,4 +10551,228 @@ fn merged_worktrees_are_pruned_however_they_were_merged() {
     let out = wt(&["prune", "--discard-ignored"]);
     assert!(out.status.success(), "{}", text(&out));
     assert!(!dir.join("data").exists());
+}
+
+fn click_account_text(client: &mut RawClient, text: &str) {
+    let rows = client.wait_for_row(text);
+    let (x, y) = rows
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| !r.contains("Enter ") && !r.contains('⏎'))
+        .filter_map(|(y, r)| r.rfind(text).map(|at| (r[..at].chars().count(), y)))
+        .max()
+        .unwrap();
+    client.send(format!("\x1b[<0;{};{}M\x1b[<0;{};{}m", x + 1, y + 1, x + 1, y + 1).as_bytes());
+}
+
+#[test]
+fn accounts_add_form_finishes_in_the_list_and_actions_keep_live_conversations() {
+    for size in [(80, 24), (124, 36)] {
+        let env = Env::new(&format!("accounts-form-{}", size.0));
+        let bin = env.root.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        for agent in ["claude", "codex"] {
+            write_script(
+                &bin.join(agent),
+                r#"#!/bin/sh
+home="${CLAUDE_CONFIG_DIR:-${CODEX_HOME:-}}"
+case "$*" in
+    'auth status'|'login status') test -f "$home/signed-in"; exit $? ;;
+    'auth login'|'login') echo login >> "$home/logins"; touch "$home/signed-in"; exit 0 ;;
+    app-server) exit 1 ;;
+esac
+echo "READY account=$KRAAL_ACCOUNT"
+while IFS= read -r line; do printf 'reply:%s\n' "$line"; done
+"#,
+            );
+        }
+        let home = env.root.join("work-home");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(home.join("signed-in"), "credential").unwrap();
+        std::fs::write(home.join("conversation"), "history").unwrap();
+        let file = env.root.join("config/kraal/accounts.toml");
+        std::fs::write(&file, format!("[[account]]\nname='work'\nagent='codex'\nhome={:?}\n", home.to_str().unwrap()))
+            .unwrap();
+        env.workspace("w", "layout { pane name=\"agent\" agent=\"codex:work\" }\n");
+        let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap_or_default());
+        let out = env.cmd(&["open", "w"]).env("PATH", &path).output().unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        env.wait_for_text("agent", "READY account=codex:work");
+        let mut client = RawClient::attach_sized(&env, Some("w"), size);
+        if size.0 == 124 {
+            click_account_text(&mut client, "ACCOUNTS");
+            client.wait_for_row("⏎ details");
+            client.send(b"\x1b");
+            client.wait_for_rows("Accounts closed", |rows| !rows.iter().any(|r| r.contains("⏎ details")));
+            click_account_text(&mut client, "Usage unavailable · 1 pane");
+            client.wait_for_row("Enter Back · Tab Actions");
+            client.send(b"\r\x1b");
+            client.wait_for_rows("Details closed", |rows| {
+                !rows.iter().any(|r| r.contains("Enter Back") || r.contains("⏎ details"))
+            });
+        } else {
+            assert!(!client.rows().iter().any(|r| r.contains("ACCOUNTS")));
+        }
+        client.send(b"\x02An");
+        client.wait_for_row("Agent   Codex");
+        client.wait_for_row("Name    Personal");
+        client.send(b"\x15work\r");
+        client.wait_for_row("already has an account named");
+        client.wait_for_row("Name    work");
+        client.wait_for_row("Agent   Codex");
+        assert!(!home.join("logins").exists());
+        client.send(b"\x15second");
+        client.wait_for_row("Name    second");
+        click_account_text(&mut client, "Sign in");
+        client.wait_for_row("Account added");
+        client.wait_for_row("Codex · second");
+        client.send(b"\r");
+        client.wait_for_row("Enter Back · Tab Actions");
+        client.wait_for_row("Usage unavailable · 0 panes");
+        client.close_overlay("Enter Back · Tab Actions");
+        let added: toml::Value = toml::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+        let second =
+            added["account"].as_array().unwrap().iter().find(|a| a["name"].as_str() == Some("second")).unwrap();
+        let second_home = PathBuf::from(second["home"].as_str().unwrap());
+        assert_eq!(std::fs::read_to_string(second_home.join("logins")).unwrap(), "login\n");
+        assert!(second.get("sign_in_required").is_none());
+        client.close_overlay("⏎ details");
+        client.send(b"\x02a");
+        client.wait_for_row("Start an agent");
+        client.send(b"\t");
+        let rows = client.wait_for_row("Start in new tab");
+        assert!(rows.iter().any(|r| r.contains("Account details")));
+        for absent in ["Rename", "Remove", "Start in worktree"] {
+            assert!(!rows.iter().any(|r| r.contains(absent)), "{rows:?}");
+        }
+        if size.0 == 80 {
+            assert!(!rows.iter().any(|r| r.contains("Add account")), "{rows:?}");
+        }
+        client.close_overlay("Start in new tab");
+        client.send(b"second");
+        client.wait_for_row("1/2");
+        click_account_text(&mut client, "Codex · second");
+        client.wait_for_row("READY account=codex:second");
+        let launched: serde_json::Value = serde_json::from_str(&env.run(&["panes", "--json"])).unwrap();
+        assert_eq!(launched.as_array().unwrap().iter().filter(|p| p["account"] == "codex:second").count(), 1);
+        client.send(b"\x02Al");
+        client.wait_for_row("⏎ details");
+        click_account_text(&mut client, "Codex · second");
+        client.wait_for_row("Enter Back · Tab Actions");
+        client.send(b"\t");
+        click_account_text(&mut client, "Rename");
+        client.wait_for_row("Rename Codex · second");
+        client.send(b"\x15renamed\r");
+        client.wait_for_row("Codex · renamed");
+        client.send(b"\r");
+        client.wait_for_row("Enter Back · Tab Actions");
+        client.send(b"\x1b");
+        client.wait_for_row("⏎ details");
+        click_account_text(&mut client, "Codex · work");
+        client.send(b"\t");
+        click_account_text(&mut client, "Remove");
+        client.wait_for_row("Conversations and the agent's own sign-in are kept.");
+        client.send(b"\r");
+        client.wait_for_row("⏎ details");
+        client.send(b"\x18");
+        client.wait_for_row("Conversations and the agent's own sign-in are kept.");
+        client.send(b"y");
+        client.wait_for_row("Account removed");
+        assert_eq!(std::fs::read_to_string(home.join("signed-in")).unwrap(), "credential");
+        assert_eq!(std::fs::read_to_string(home.join("conversation")).unwrap(), "history");
+        env.run(&["send", "-p", "agent", "still-here\r"]);
+        env.wait_for_text("agent", "reply:still-here");
+        let panes: serde_json::Value = serde_json::from_str(&env.run(&["panes", "--json"])).unwrap();
+        assert_eq!(panes.as_array().unwrap().iter().find(|p| p["name"] == "agent").unwrap()["account"], "codex:work");
+    }
+}
+
+#[test]
+fn the_add_form_names_an_existing_sign_in_without_running_login() {
+    let env = Env::new("account-form-existing");
+    let path = existing_sign_in_agent(&env, "claude");
+    let standard = env.root.join("home/.claude");
+    std::fs::create_dir_all(&standard).unwrap();
+    std::fs::write(standard.join("status"), "0").unwrap();
+    let file = env.root.join("config/kraal/accounts.toml");
+    std::fs::write(
+        &file,
+        format!("[[account]]\nagent='claude'\nname='work'\nhome={:?}\n", env.root.join("work").to_str().unwrap()),
+    )
+    .unwrap();
+    env.workspace("w", "layout { pane name=\"shell\" }\n");
+    let out = env.cmd(&["open", "w"]).env("PATH", &path).output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let mut client = RawClient::attach_sized(&env, Some("w"), (80, 24));
+    client.send(b"\x02Al");
+    client.wait_for_row("Existing Claude account");
+    client.wait_for_row("Review");
+    click_account_text(&mut client, "+ Add account");
+    let rows = client.wait_for_row("Use existing account");
+    assert!(
+        rows.iter().position(|r| r.contains("Use existing account")).unwrap()
+            < rows.iter().position(|r| r.contains("Sign in to another account")).unwrap()
+    );
+    let before = std::fs::read_to_string(&file).unwrap();
+    let checks = || std::fs::read_to_string(env.root.join("home/status-checks")).unwrap_or_default().lines().count();
+    let finished = || std::fs::read_to_string(standard.join("check-finished")).unwrap_or_default().lines().count();
+    let (before_checks, before_finished) = (checks(), finished());
+    std::fs::write(standard.join("hold-check"), "").unwrap();
+    client.send(b"\x15cancelled\r\r");
+    client.wait_for_row("Checking sign-in...");
+    common::wait_until(PATIENCE, "one check started", || checks() == before_checks + 1);
+    click_account_text(&mut client, "Cancel");
+    client.wait_for_row("+ Add account");
+    std::fs::remove_file(standard.join("hold-check")).unwrap();
+    common::wait_until(PATIENCE, "cancelled check finished", || finished() == before_finished + 1);
+    assert_eq!(checks(), before_checks + 1, "Enter while checking did not start another check");
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), before);
+    click_account_text(&mut client, "+ Add account");
+    client.wait_for_row("Use existing account");
+    client.send(b"\x15personal\r");
+    client.wait_for_row("Account added");
+    client.wait_for_row("Claude · personal");
+    assert!(!env.root.join("home/logins").exists());
+    let accounts: toml::Value = toml::from_str(&std::fs::read_to_string(file).unwrap()).unwrap();
+    let a = accounts["account"].as_array().unwrap().iter().find(|a| a["name"].as_str() == Some("personal")).unwrap();
+    assert_eq!(a["home"].as_str().unwrap(), "~/.claude");
+    assert!(a.get("review").is_none());
+}
+
+#[test]
+fn sidebar_accounts_discover_a_sign_in_completed_after_startup() {
+    for entry in ["ACCOUNTS", "+ Add account"] {
+        let env = Env::new(if entry == "ACCOUNTS" { "sidebar-accounts-discovery" } else { "sidebar-add-discovery" });
+        let path = existing_sign_in_agent(&env, "claude");
+        let standard = env.root.join("home/.claude");
+        std::fs::create_dir_all(&standard).unwrap();
+        std::fs::write(standard.join("status"), "1").unwrap();
+        let file = env.root.join("config/kraal/accounts.toml");
+        std::fs::write(
+            &file,
+            format!("[[account]]\nagent='claude'\nname='work'\nhome={:?}\n", env.root.join("work").to_str().unwrap()),
+        )
+        .unwrap();
+        env.workspace("w", "layout { pane name=\"shell\" }\n");
+        let out = env.cmd(&["open", "w"]).env("PATH", &path).output().unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        let mut client = RawClient::attach_sized(&env, Some("w"), (124, 36));
+        common::wait_until(PATIENCE, "startup checked the unsigned home", || standard.join("check-finished").exists());
+        client.wait_for_rows("startup discovery completed", |rows| {
+            rows.iter().any(|r| r.contains("ACCOUNTS")) && !rows.iter().any(|r| r.contains("Checking sign-in"))
+        });
+        assert!(!std::fs::read_to_string(&file).unwrap().contains("review = true"));
+
+        // The agent signs in outside kraal after the server cached its unsigned status.
+        std::fs::write(standard.join("status"), "0").unwrap();
+        click_account_text(&mut client, entry);
+        if entry == "ACCOUNTS" {
+            client.wait_for_row("Existing Claude account");
+            client.wait_for_row("Review");
+            click_account_text(&mut client, "+ Add account");
+        }
+        client.wait_for_row("Use existing account");
+        assert!(std::fs::read_to_string(&file).unwrap().contains("review = true"));
+        assert!(!env.root.join("home/logins").exists());
+    }
 }

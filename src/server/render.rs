@@ -52,6 +52,9 @@ enum SideRow {
 pub enum SideItem {
     Workspace(u32),
     ReviewAccount(String),
+    Accounts,
+    Account(String),
+    AddAccount,
     /// A definition not running, by its file.
     Definition(PathBuf),
     Pane(PaneId),
@@ -497,6 +500,11 @@ impl Server {
         let overlay_cursor = match &c.mode {
             Mode::Picker(p) => Some(overlays::draw_picker(p, screen, buf)),
             Mode::Prompt(p) => Some(overlays::draw_prompt(p, screen, buf)),
+            Mode::AccountForm(form) => Some(super::account_ui::draw_form(form, screen, buf)),
+            Mode::AccountDetails(details) => {
+                super::account_ui::draw_details(details, screen, buf);
+                None
+            }
             Mode::Help { scroll } => {
                 let keys = [("↑↓", "scroll"), ("esc", "close")];
                 overlays::draw_viewer("Help", &self.help_lines(), *scroll, &keys, screen, buf);
@@ -549,10 +557,13 @@ impl Server {
         };
         let c = &self.clients[&id];
         match &c.mode {
-            Mode::Picker(_) | Mode::Prompt(_) => cursor = overlay_cursor.flatten(),
-            Mode::Leader { .. } | Mode::Help { .. } | Mode::Messages { .. } | Mode::Confirm(_) | Mode::Hints(_) => {
-                cursor = None
-            }
+            Mode::Picker(_) | Mode::Prompt(_) | Mode::AccountForm(_) => cursor = overlay_cursor.flatten(),
+            Mode::Leader { .. }
+            | Mode::Help { .. }
+            | Mode::Messages { .. }
+            | Mode::Confirm(_)
+            | Mode::Hints(_)
+            | Mode::AccountDetails(_) => cursor = None,
             Mode::Search { .. } => {
                 // After the query, in the top bar.
                 cursor = self.top_bar(c).cursor.map(|x| Cursor {
@@ -1117,25 +1128,12 @@ impl Server {
             }
         }
 
-        // Every account of the agents, one row each, at the bottom, once there is one to list.
-        let inside = usize::from(self.sidebar_width(c.cols).saturating_sub(2));
-        let accounts = account_lines(&self.accounts, &self.usage, inside, crate::accounts::now());
-        // They end on the last row before the bottom border, and give way when there is no room.
-        let top = (height as usize).saturating_sub(2).saturating_sub(accounts.len());
-        if !accounts.is_empty() && rows.len() <= top {
+        let room = (height as usize).saturating_sub(rows.len() + 1);
+        let accounts = account_rows(self.accounts_picker(None).items, room);
+        if !accounts.is_empty() {
+            let top = (height as usize).saturating_sub(accounts.len() + 1);
             rows.resize_with(top, || SideRow::Blank);
-            rows.push(SideRow::Section("ACCOUNTS"));
-            let reviews = self.accounts.reviews();
-            let items = std::iter::repeat_n(None, accounts.len().saturating_sub(reviews.len() * 2)).chain(
-                reviews
-                    .into_iter()
-                    .flat_map(|a| [Some(SideItem::ReviewAccount(a.id.clone())), Some(SideItem::ReviewAccount(a.id))]),
-            );
-            rows.extend(accounts.into_iter().zip(items).map(|(line, item)| SideRow::Entry {
-                item,
-                line,
-                selected: false,
-            }));
+            rows.extend(accounts);
         }
         rows
     }
@@ -1149,6 +1147,7 @@ impl Server {
         }
         match self.sidebar_rows(c, height).into_iter().nth(row as usize)? {
             SideRow::Entry { item, .. } => item,
+            SideRow::Section("ACCOUNTS") => Some(SideItem::Accounts),
             _ => None,
         }
     }
@@ -1731,51 +1730,26 @@ fn fit_spans(spans: Vec<Span<'static>>, max: u16) -> Vec<Span<'static>> {
     out
 }
 
-/// The sidebar's rows of the agents' accounts, `width` columns wide: each one's usage, or that
-/// none was seen yet. None while no account is listed and none was used: the agents' own homes
-/// alone are nothing to list.
-fn account_lines(
-    accounts: &crate::accounts::Accounts,
-    usage: &crate::accounts::UsageMap,
-    width: usize,
-    now: i64,
-) -> Vec<Line<'static>> {
-    let t = th();
-    accounts
-        .all()
-        .into_iter()
-        .flat_map(|a| {
-            let name = Span::styled(format!("   {} ", crate::accounts::label(&a)), Style::default().fg(Color::Gray));
-            if a.sign_in_required {
-                let status = Span::styled("sign-in required", Style::default().fg(t.blocked));
-                return if name.content.width() + status.content.width() <= width {
-                    vec![Line::from(vec![name, status])]
-                } else {
-                    vec![Line::from(name), Line::from(vec![Span::raw("   "), status])]
-                };
-            }
-            let used = match usage.peak(&a, now) {
-                Some(peak) => {
-                    let color = if peak >= accounts.threshold(&a) as f64 {
-                        t.blocked
-                    } else if peak >= 70.0 {
-                        t.working
-                    } else {
-                        t.text
-                    };
-                    Span::styled(format!("{peak:.0}%"), Style::default().fg(color).add_modifier(Modifier::BOLD))
-                }
-                None => {
-                    let unused = "not used yet";
-                    dim_span(if name.content.width() + unused.len() <= width { unused } else { "-" })
-                }
-            };
-            vec![Line::from(vec![name, used])]
-        })
-        .chain(accounts.reviews().iter().flat_map(|a| {
-            vec![Line::from(format!("   {}", crate::accounts::existing_label(&a.agent))), Line::from("   Review")]
-        }))
-        .collect()
+fn account_rows(mut items: Vec<super::ui::PickItem>, room: usize) -> Vec<SideRow> {
+    if room < 2 {
+        return Vec::new();
+    }
+    let Some(add) = items.pop() else { return Vec::new() };
+    items.truncate((room - 2) / 2);
+    items.push(add);
+    let mut rows = vec![SideRow::Section("ACCOUNTS")];
+    for entry in items {
+        let item = match entry.action {
+            super::ui::PickAction::AccountDetails(id) => SideItem::Account(id),
+            super::ui::PickAction::ReviewAccount(a) => SideItem::ReviewAccount(a.id),
+            super::ui::PickAction::AddAccount => SideItem::AddAccount,
+            _ => SideItem::Accounts,
+        };
+        for text in [entry.label, entry.detail].into_iter().filter(|s| !s.is_empty()) {
+            rows.push(SideRow::Entry { item: Some(item.clone()), line: Line::from(text), selected: false });
+        }
+    }
+    rows
 }
 
 fn badge_span(text: &str, color: Color) -> Span<'static> {
@@ -1823,80 +1797,25 @@ mod tests {
         assert_eq!(spans_width(&cut), 12);
         assert_eq!(cut.iter().map(|s| s.content.as_ref()).collect::<String>(), "deploy fail…");
     }
-
     #[test]
-    fn every_account_is_listed_used_or_not() {
-        use crate::accounts::{Account, Accounts, Usage, UsageMap, Window};
-        let mut accounts = Accounts::empty();
-        let mut usage = UsageMap::default();
-        // The agents' own homes, none of them used yet, are nothing to list.
-        assert!(account_lines(&accounts, &usage, 40, 1_000).is_empty());
-        let window = Some(Window { used_percent: 42.0, resets_at: None });
-        usage.0.insert(
-            accounts.get("claude", "default").unwrap().key(),
-            Usage { five_hour: window, observed_at: 1_000, ..Default::default() },
-        );
-        usage.0.insert(accounts.get("codex", "default").unwrap().key(), Usage::default());
-        assert!(account_lines(&accounts, &usage, 40, 1_000).is_empty(), "usage alone never verifies sign-in");
-        let home = "/tmp/kraal-test-patron".to_string();
-        accounts
-            .add(Account {
-                id: crate::accounts::new_uuid(),
-                name: "patron.bzh".into(),
-                agent: "claude".into(),
-                home,
-                threshold: None,
-                note: None,
-                sign_in_required: false,
-                review: false,
-                public_identity: None,
-                linked_to: None,
-            })
-            .unwrap();
-        assert_eq!(account_lines(&accounts, &UsageMap::default(), 40, 1_000).len(), 1);
-        let existing = accounts.unlisted().into_iter().find(|a| a.agent == "claude").unwrap();
-        accounts.adopt_checked(&existing, None).unwrap();
-        let rows = |width| -> Vec<String> {
-            let lines = account_lines(&accounts, &usage, width, 1_000);
-            lines.iter().map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect()).collect()
-        };
-        assert_eq!(rows(26), ["   claude·patron.bzh -", "   Existing Claude account", "   Review"]);
-        assert_eq!(rows(40), ["   claude·patron.bzh not used yet", "   Existing Claude account", "   Review"]);
-    }
-
-    #[test]
-    fn sign_in_required_stays_visible_in_a_narrow_sidebar_even_with_old_usage() {
-        use crate::accounts::{Account, Accounts, Usage, UsageMap, Window};
-        let mut accounts = Accounts::empty();
-        accounts
-            .add(Account {
-                id: crate::accounts::new_uuid(),
-                name: "work".into(),
-                agent: "claude".into(),
-                home: "/tmp/kraal-required".into(),
-                note: None,
-                threshold: None,
-                sign_in_required: true,
-                review: false,
-                public_identity: None,
-                linked_to: None,
-            })
-            .unwrap();
-        let mut usage = UsageMap::default();
-        usage.0.insert(
-            accounts.get("claude", "work").unwrap().key(),
-            Usage {
-                five_hour: Some(Window { used_percent: 42.0, resets_at: None }),
-                observed_at: 1_000,
-                ..Default::default()
-            },
-        );
-        for width in [26, 40] {
-            let lines = account_lines(&accounts, &usage, width, 1_000);
-            let text = lines.iter().map(|line| line.to_string()).collect::<Vec<_>>().join("\n");
-            assert!(text.contains("sign-in required"), "{text}");
-            assert!(!text.contains("42%"), "{text}");
-            assert!(lines.iter().all(|line| line.width() <= width), "{text}");
+    fn sidebar_accounts_share_two_lines_and_keep_the_list_and_add_accessible() {
+        use super::super::ui::{PickAction, PickItem};
+        let items = vec![
+            PickItem::new("Claude · work", "57% used · 2 panes", PickAction::AccountDetails("work-id".into())),
+            PickItem::new("Codex · home", "Sign-in required", PickAction::AccountDetails("home-id".into())),
+            PickItem::new("+ Add account", "", PickAction::AddAccount),
+        ];
+        let rows = account_rows(items.clone(), 20);
+        assert!(matches!(rows[0], SideRow::Section("ACCOUNTS")));
+        for (i, text) in [(1, "Claude · work"), (2, "57% used · 2 panes")] {
+            let SideRow::Entry { item, line, .. } = &rows[i] else { panic!() };
+            assert_eq!(item, &Some(SideItem::Account("work-id".into())));
+            assert_eq!(line.to_string(), text);
         }
+        assert!(matches!(&rows[5], SideRow::Entry { item: Some(SideItem::AddAccount), .. }));
+        let rows = account_rows(items, 2);
+        assert_eq!(rows.len(), 2);
+        assert!(matches!(rows[0], SideRow::Section("ACCOUNTS")));
+        assert!(matches!(rows[1], SideRow::Entry { item: Some(SideItem::AddAccount), .. }));
     }
 }

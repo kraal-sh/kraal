@@ -140,22 +140,43 @@ impl Server {
     }
 
     fn refresh_agent_pickers(&mut self) {
+        let forms: Vec<_> = self
+            .clients
+            .iter()
+            .filter_map(|(&id, c)| match &c.mode {
+                Mode::AccountForm(form) if form.checking.is_none() => Some((id, form.clone())),
+                _ => None,
+            })
+            .collect();
+        for (id, mut form) in forms {
+            self.fill_account_form(&mut form);
+            self.clients.get_mut(&id).unwrap().mode = Mode::AccountForm(form);
+        }
         let clients: Vec<_> = self
             .clients
             .iter()
             .filter_map(|(&id, c)| {
                 if let Mode::Picker(p) = &c.mode
-                    && p.kind == PickerKind::Agent
-                    && p.title == "Start an agent"
+                    && ((p.kind == PickerKind::Agent && p.title == "Start an agent") || p.kind == PickerKind::Accounts)
+                    && p.actions.is_none()
                 {
-                    Some((id, p.query.clone(), p.cursor, p.current().map(|i| i.label.clone())))
+                    Some((
+                        id,
+                        p.kind,
+                        p.query.clone(),
+                        p.cursor,
+                        p.current().map(|i| i.label.clone()),
+                        p.message.clone(),
+                    ))
                 } else {
                     None
                 }
             })
             .collect();
-        for (id, query, cursor, selected) in clients {
-            let mut p = self.agent_picker(id, None);
+        for (id, kind, query, cursor, selected, message) in clients {
+            let mut p =
+                if kind == PickerKind::Accounts { self.accounts_picker(None) } else { self.agent_picker(id, None) };
+            p.message = message;
             p.query = query;
             p.cursor = cursor;
             p.refilter();
@@ -837,32 +858,18 @@ impl Server {
 
     pub(super) fn agent_picker(&mut self, client: ClientId, switch_for: Option<PaneId>) -> Picker {
         let now = accounts::now();
-        let ws_name = self
-            .clients
-            .get(&client)
-            .and_then(|c| self.ws_index(c.workspace))
-            .map(|wi| self.workspaces[wi].name.clone());
-        let cwd = self.client_focus(client).and_then(|p| self.panes.get(&p)).and_then(|p| p.current_cwd());
         let current = switch_for.and_then(|p| self.pane_account(p));
         let mut items = Vec::new();
         for kind in accounts::AGENTS {
             if current.as_ref().is_some_and(|c| c.agent != kind.name) {
                 continue;
             }
-            // Not marked before git has said which repository rules see here.
-            let preferred = (!self.accounts.undecided(kind.name, cwd.as_deref()))
-                .then(|| self.accounts.choose(kind.name, ws_name.as_deref(), cwd.as_deref(), &self.usage, now))
-                .flatten();
+            let installed = crate::transfer::have_program(kind.command);
             for a in self.accounts.for_agent(kind.name) {
-                let u = self.usage.get(&a);
-                let mut detail = match u {
-                    _ if a.sign_in_required => "sign-in required".to_string(),
-                    Some(u) => usage_text(u, now),
-                    None => "no usage seen yet".to_string(),
-                };
-                if preferred.as_ref().is_some_and(|p| p.id == a.id) {
-                    detail.push_str(" · picked here");
+                if switch_for.is_none() && (!installed || a.sign_in_required) {
+                    continue;
                 }
+                let mut detail = super::account_ui::usage_summary(&a, self.usage.get(&a), now);
                 let is_current = current.as_ref().is_some_and(|c| c.id == a.id || c.same_home(&a));
                 if is_current {
                     detail = format!("current · {detail}");
@@ -884,54 +891,19 @@ impl Server {
                     None => PickAction::AgentLaunch { agent: a.agent.clone(), account: a.key() },
                 };
                 items.push(PickItem {
-                    label: accounts::label(&a),
+                    label: if switch_for.is_some() { accounts::label(&a) } else { super::account_ui::label(&a) },
                     detail,
                     action,
                     state: full.then_some(AgentState::Blocked),
                     dim: false,
                 });
             }
-            if switch_for.is_none() {
-                for a in self.accounts.reviews().into_iter().filter(|a| a.agent == kind.name) {
-                    items.push(PickItem::new(
-                        accounts::existing_label(kind.name),
-                        "Review",
-                        PickAction::ReviewAccount(a),
-                    ));
-                }
-                if self.accounts.unlisted().iter().any(|a| a.agent == kind.name) {
-                    let detail = match self.existing_checks.get(kind.name) {
-                        Some(ExistingCheck::Checked(Status::CouldNotCheck)) => Some("Could not verify · Check again"),
-                        Some(ExistingCheck::SaveFailed) => Some("Could not save · Check again"),
-                        Some(ExistingCheck::Checking) => Some("Checking sign-in"),
-                        _ => None,
-                    };
-                    if let Some(detail) = detail {
-                        items.push(PickItem::new(
-                            accounts::existing_label(kind.name),
-                            detail,
-                            if self.existing_checks.get(kind.name) == Some(&ExistingCheck::Checking) {
-                                PickAction::None
-                            } else {
-                                PickAction::CheckExisting { agent: kind.name.into() }
-                            },
-                        ));
-                    }
-                }
-                items.push(PickItem {
-                    label: format!("+ add a {} account", kind.name),
-                    detail: "new subscription: a separate config dir and the agent's own login".into(),
-                    action: PickAction::AgentAdd { agent: kind.name.to_string() },
-                    state: None,
-                    dim: false,
-                });
-            }
-        }
-        if switch_for.is_none() {
-            items.extend(self.worktree_items(client));
         }
         let title = if switch_for.is_some() { "Change account" } else { "Start an agent" };
-        Picker::new(PickerKind::Agent, title, items)
+        let mut picker = Picker::new(PickerKind::Agent, title, items);
+        picker.worktree = self.client_focus(client).and_then(|p| self.pane_git(p)).is_some()
+            && self.client_focus(client).and_then(|p| self.panes.get(&p)).is_some_and(|p| p.ssh.is_none());
+        picker
     }
 
     fn check_switch_row(&mut self, client: ClientId, pane: PaneId, to: &Account) {
@@ -967,7 +939,14 @@ impl Server {
     }
 
     /// Create an account and open its login in a floating pane.
-    pub(super) fn add_account(&mut self, client: ClientId, agent: &str, name: &str) -> Result<()> {
+    pub(super) fn add_account(&mut self, client: ClientId, agent: &str, name: &str) -> Result<PaneId> {
+        let kind = accounts::agent_kind(agent).context("Unknown agent")?;
+        anyhow::ensure!(
+            crate::transfer::have_program(kind.command),
+            "{} is not installed. Install {}, then try again.",
+            super::account_ui::agent_name(agent),
+            kind.command
+        );
         let home = accounts::default_home_for(agent, name);
         let a = Account {
             id: crate::accounts::new_uuid(),
@@ -988,14 +967,15 @@ impl Server {
         })?;
         self.reload_accounts();
         self.open_login(client, &a)
+            .context("Account saved. Press Esc to return to Accounts, then choose Sign in to retry")
     }
 
-    pub(super) fn open_login(&mut self, client: ClientId, a: &Account) -> Result<()> {
+    pub(super) fn open_login(&mut self, client: ClientId, a: &Account) -> Result<PaneId> {
         if let Some(id) =
             self.panes.values().find_map(|p| p.spec.login.as_ref().filter(|l| l.account.same_home(a)).map(|_| p.id))
         {
             self.reveal(client, id);
-            return Ok(());
+            return Ok(id);
         }
         let l = accounts::login(a)?;
         let ws = self.clients.get(&client).map(|c| c.workspace).context("no client")?;
@@ -1012,8 +992,7 @@ impl Server {
             login: Some(Login { account: a.clone(), state: LoginState::Running, lock: Some(lock) }),
             ..Default::default()
         };
-        self.spawn_pane_in(ws, None, spec, Placement::Floating, Some(format!("login {}", accounts::label(a))))?;
-        Ok(())
+        self.spawn_pane_in(ws, None, spec, Placement::Floating, Some(format!("login {}", accounts::label(a))))
     }
 
     pub(super) fn login_exited(&mut self, id: PaneId, code: Option<i32>) {
@@ -1070,6 +1049,7 @@ impl Server {
                 login.lock = None;
             } else {
                 self.reload_accounts();
+                self.added_login_finished(id, &account);
                 self.close_pane(id);
                 let message = format!("{} is signed in", accounts::label(&account));
                 for client in self.clients.keys().copied().collect::<Vec<_>>() {
