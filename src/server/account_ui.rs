@@ -85,7 +85,11 @@ pub(super) fn usage_summary(a: &Account, usage: Option<&Usage>, now: i64) -> Str
 
 impl Server {
     pub(super) fn account_summary(&self, a: &Account) -> String {
-        let summary = usage_summary(a, self.usage.get(a), accounts::now());
+        self.account_summary_at(a, accounts::now())
+    }
+
+    fn account_summary_at(&self, a: &Account, now: i64) -> String {
+        let summary = usage_summary(a, self.usage.get(a), now);
         if summary == "Sign-in required" || summary.starts_with("Last checked") {
             summary
         } else {
@@ -95,11 +99,15 @@ impl Server {
     }
 
     pub(super) fn accounts_picker(&self, selected: Option<&str>) -> Picker {
+        self.accounts_picker_at(selected, accounts::now())
+    }
+
+    pub(super) fn accounts_picker_at(&self, selected: Option<&str>, now: i64) -> Picker {
         let mut items: Vec<_> = self
             .accounts
             .all()
             .iter()
-            .map(|a| PickItem::new(label(a), self.account_summary(a), PickAction::AccountDetails(a.id.clone())))
+            .map(|a| PickItem::new(label(a), self.account_summary_at(a, now), PickAction::AccountDetails(a.id.clone())))
             .collect();
         items.extend(
             self.accounts
@@ -128,6 +136,25 @@ impl Server {
                 p.items.iter().position(|i| matches!(&i.action, PickAction::AccountDetails(a) if a == id)).unwrap_or(0);
         }
         p
+    }
+
+    /// Account rows hold until a usage window resets or a "Last checked" age changes.
+    pub(super) fn account_summaries_until(&self, now: i64) -> Option<i64> {
+        let ages = self.usage.0.values().filter_map(|u| {
+            if u.observed_at <= 0 || u.next_end(now).is_some() || (u.five_hour.is_none() && u.weekly.is_none()) {
+                return None;
+            }
+            let seconds = now.saturating_sub(u.observed_at).max(0);
+            let step = if seconds < 3600 {
+                60
+            } else if seconds < 86400 {
+                3600
+            } else {
+                86400
+            };
+            now.checked_add(step - seconds % step)
+        });
+        self.usage.next_end(now).into_iter().chain(ages).min()
     }
 
     pub(super) fn account_details(&self, id: &str) -> Mode {

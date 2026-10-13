@@ -45,7 +45,7 @@ pub struct Kept {
     pub x1: u16,
 }
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct Encoder {
     /// What the terminal shows: the last frame encoded, with the cells to draw again whatever
     /// they hold marked [`STALE`].
@@ -91,6 +91,11 @@ impl Encoder {
         self.last_cursor_style = None;
     }
 
+    /// The links of the last frame encoded.
+    pub fn links(&self) -> &Links {
+        &self.prev_links
+    }
+
     /// Whether the next frame of `area` is drawn whole, on a cleared screen.
     pub fn redraws_all(&self, area: Rect) -> bool {
         self.prev.as_ref().is_none_or(|p| p.area != area)
@@ -125,9 +130,32 @@ impl Encoder {
     /// the cursor (sixel): `erase` goes before the cells are drawn, `images` after them, all in
     /// the same synchronized update. The cells of `kept` are taken to be unchanged since the
     /// previous frame (where they can be skipped without changing what the diff finds around
-    /// them).
+    /// them). Debug builds check it: every frame is also encoded with every cell compared, and
+    /// a cell said kept that changed would be missing from what is sent.
     #[expect(clippy::too_many_arguments, reason = "the parts of a frame, which the renderer builds separately")]
     pub fn encode_with_images(
+        &mut self,
+        next: &Buffer,
+        kept: &[Kept],
+        cursor: Option<Cursor>,
+        links: &Links,
+        erase: &[u8],
+        images: &[u8],
+        out: &mut Vec<u8>,
+    ) {
+        #[cfg(debug_assertions)]
+        let (compared, from) = {
+            let mut all = Vec::new();
+            self.clone().encode_frame(next, &[], cursor, links, erase, images, &mut all);
+            (all, out.len())
+        };
+        self.encode_frame(next, kept, cursor, links, erase, images, out);
+        #[cfg(debug_assertions)]
+        assert!(out[from..] == compared[..], "a frame left out cells that changed since the last one: {kept:?}");
+    }
+
+    #[expect(clippy::too_many_arguments, reason = "the parts of a frame, which the renderer builds separately")]
+    fn encode_frame(
         &mut self,
         next: &Buffer,
         kept: &[Kept],
@@ -814,6 +842,21 @@ mod tests {
             diff_ranges(Some(&prev.content), &next, &compared(&prev.content, &next, &kept), &mut skipping);
             assert_eq!(skipping, want, "case {case}: kept {kept:?}");
         }
+    }
+
+    /// A cell said kept that changed since the last frame would not be sent: debug builds, which
+    /// encode every frame both ways, stop on it.
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "left out cells that changed")]
+    fn a_kept_cell_that_changed_is_caught() {
+        let area = Rect::new(0, 0, 6, 1);
+        let mut buf = Buffer::empty(area);
+        buf.set_string(0, 0, "abcdef", Style::default());
+        let mut enc = Encoder::new();
+        encode(&mut enc, &buf, None, &Links::new(), &mut Vec::new());
+        buf[(2, 0)].set_char('X');
+        enc.encode_with_images(&buf, &[Kept { y: 0, x0: 0, x1: 6 }], None, &Links::new(), &[], &[], &mut Vec::new());
     }
 
     /// Kept runs that meet, row after row, are skipped as one: only the cell typed is compared.

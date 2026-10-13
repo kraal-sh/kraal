@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Result, bail};
 
 use super::ui::{Mode, PickAction, PickItem, Picker, PickerKind};
-use super::{ClientId, Server};
+use super::{ClientId, Dirty, Server};
 use crate::layout::PaneId;
 use crate::pane::PaneSpec;
 use crate::paths;
@@ -281,7 +281,7 @@ impl Server {
                 && let Some(c) = server.clients.get_mut(&client)
             {
                 c.mode = next;
-                c.dirty = true;
+                c.dirty = Dirty::Yes;
             }
             server.mark_dirty_client(client);
         });

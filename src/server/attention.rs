@@ -2,7 +2,7 @@
 
 use std::time::{Duration, Instant};
 
-use super::{ClientId, Server, frame_bytes};
+use super::{ClientId, Dirty, Server, frame_bytes};
 use crate::agent::AgentState;
 use crate::config::NotifyMode;
 use crate::layout::PaneId;
@@ -231,7 +231,7 @@ impl Server {
         }
         for c in self.clients.values_mut().filter(|c| c.attached) {
             c.toast = Some((format!("{title}: {body}"), Instant::now() + Duration::from_secs(4)));
-            c.dirty = true;
+            c.dirty = Dirty::Yes;
         }
         self.schedule_render();
     }
@@ -244,7 +244,7 @@ impl Server {
             // Long messages stay longer.
             let secs = (3 + msg.chars().count() as u64 / 25).min(10);
             c.toast = Some((msg, Instant::now() + Duration::from_secs(secs)));
-            c.dirty = true;
+            c.dirty = Dirty::Yes;
         }
         self.schedule_render();
     }
@@ -306,7 +306,7 @@ impl Server {
         };
         for c in self.clients.values_mut().filter(|c| c.attached) {
             c.toast = Some((text.clone(), Instant::now() + Duration::from_secs(10)));
-            c.dirty = true;
+            c.dirty = Dirty::Yes;
         }
         self.schedule_render();
     }
