@@ -559,7 +559,7 @@ mod tests {
                 p.error = Some("Port 5432 is in use.".into());
                 let mut buf = Buffer::empty(screen);
                 draw_form(&p, screen, &mut buf);
-                let text: String = buf.content.iter().map(|c| c.symbol()).collect();
+                let text: String = crate::testing::buffer_text(&buf);
                 for expected in ["Server    db", "Remote    localhost:5432", "Local     5432", "Use 10000"] {
                     assert!(text.contains(expected), "{text}");
                 }
@@ -584,7 +584,7 @@ mod tests {
                 }
                 let mut buf = Buffer::empty(screen);
                 draw_form(&p, screen, &mut buf);
-                let text: String = buf.content.iter().map(|c| c.symbol()).collect();
+                let text: String = crate::testing::buffer_text(&buf);
                 for expected in ["Final detail.", "PgUp/PgDn", "Cancel", "Local"] {
                     assert!(text.contains(expected), "{text}");
                 }
@@ -744,7 +744,7 @@ mod tests {
                 let Mode::TunnelDetails(details) = server.tunnel_details(42, Some(picker.state())) else { panic!() };
                 let mut buf = Buffer::empty(screen);
                 server.draw_tunnel_details(&details, screen, &mut buf);
-                let text: String = buf.content.iter().map(|c| c.symbol()).collect();
+                let text: String = crate::testing::buffer_text(&buf);
                 for expected in [label, "localhost:15432", "Enter Close", "Stop"] {
                     assert!(text.contains(expected), "{text}");
                 }
@@ -782,7 +782,7 @@ mod tests {
             assert_eq!(server.tunnels[0].id, 43);
             let mut buf = Buffer::empty(screen);
             server.draw_tunnel_details(&details, screen, &mut buf);
-            let text: String = buf.content.iter().map(|c| c.symbol()).collect();
+            let text: String = crate::testing::buffer_text(&buf);
             assert!(text.contains("Stopped") && !text.contains(" Stop "), "{text}");
             let Mode::TunnelDetails(details) = server.tunnel_details(43, None) else { panic!() };
             let (_, message, _, _) = server.tunnel_result(43);

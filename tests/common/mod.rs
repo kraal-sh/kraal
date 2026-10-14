@@ -1,6 +1,8 @@
 //! What the end-to-end tests share: a kraal session in directories of its own, and helpers.
 
 pub mod isolation;
+mod script;
+pub use script::write_script;
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -69,23 +71,6 @@ impl Drop for Env {
         let _ = self.cmd(&["kill"]).stdout(quiet()).stderr(quiet()).status();
         let _ = std::fs::remove_dir_all(&self.root);
     }
-}
-
-/// Write an executable script. A child process writes it: a file this process held open for
-/// writing could be inherited by a program another test starts at that moment, and running the
-/// script would then fail with "text file busy".
-pub fn write_script(path: &Path, body: &str) {
-    use std::io::Write;
-    let mut child = Command::new("sh")
-        .arg("-c")
-        .arg("cat > \"$1\" && chmod 755 \"$1\"")
-        .arg("sh")
-        .arg(path)
-        .stdin(std::process::Stdio::piped())
-        .spawn()
-        .unwrap();
-    child.stdin.take().unwrap().write_all(body.as_bytes()).unwrap();
-    assert!(child.wait().unwrap().success(), "writing {}", path.display());
 }
 
 /// Wait until `done`, failing the test with `what` after `limit`.

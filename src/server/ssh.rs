@@ -411,7 +411,7 @@ mod tests {
             let screen = server.client_screen(client);
             let mut buf = ratatui::buffer::Buffer::empty(screen);
             super::super::overlays::draw_confirm(q, screen, &mut buf);
-            let text = buf.content.iter().map(|c| c.symbol()).collect::<String>();
+            let text = crate::testing::buffer_text(&buf);
             assert!(text.contains("The server is saved."));
             assert!(text.contains("Close") && text.contains("Try again"));
             let retry = super::super::overlays::confirm_layout(q, screen).ok.unwrap();

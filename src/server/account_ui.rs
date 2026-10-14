@@ -1218,7 +1218,7 @@ mod tests {
             assert!(form.name.is_empty());
             let mut buf = Buffer::empty(screen);
             assert!(draw_form(&form, screen, &mut buf).is_none());
-            let text = buf.content.iter().map(|c| c.symbol()).collect::<String>();
+            let text = crate::testing::buffer_text(&buf);
             assert!(text.contains("Existing Claude sign-in needs review."));
             assert!(!text.contains("Name    "));
             assert!(text.contains(" Use existing account "));
@@ -1243,7 +1243,7 @@ mod tests {
             assert!(form.name.is_empty());
             let mut buf = Buffer::empty(screen);
             assert!(draw_form(&form, screen, &mut buf).is_some());
-            let text = buf.content.iter().map(|c| c.symbol()).collect::<String>();
+            let text = crate::testing::buffer_text(&buf);
             assert!(text.contains("Name    e.g. Work or Personal"));
             assert!(text.contains(" Sign in     Cancel "));
             assert_eq!(buf[form_layout(&form, screen).primary.as_position()].bg, crate::theme::current().accent);
@@ -1354,7 +1354,7 @@ mod tests {
                 let mut buf = Buffer::empty(screen);
                 draw_form(&form, screen, &mut buf);
                 assert_eq!(buf[l.body.as_position()].fg, crate::theme::current().blocked);
-                seen.push_str(&buf.content.iter().map(|c| c.symbol()).collect::<String>());
+                seen.push_str(&crate::testing::buffer_text(&buf));
             }
             for n in 0..50 {
                 assert!(seen.contains(&format!("error line {n}")), "line {n} missing");
@@ -1386,7 +1386,7 @@ mod tests {
         let screen = Rect::new(0, 0, 80, 24);
         let mut buf = Buffer::empty(screen);
         draw_form(&form, screen, &mut buf);
-        let text = buf.content.iter().map(|c| c.symbol()).collect::<String>();
+        let text = crate::testing::buffer_text(&buf);
         assert!(text.find("Use existing account").unwrap() < text.find("Sign in to another account").unwrap());
         let Mode::AccountDetails(details) = server.account_details(&a.id) else { panic!() };
         assert_eq!(details.text, "Usage unavailable");
@@ -1401,7 +1401,7 @@ mod tests {
         assert_eq!(form.checking, Some(42));
         let mut buf = Buffer::empty(Rect::new(0, 0, 80, 24));
         draw_form(&form, buf.area, &mut buf);
-        let text = buf.content.iter().map(|c| c.symbol()).collect::<String>();
+        let text = crate::testing::buffer_text(&buf);
         assert!(text.contains("Checking sign-in..."));
         assert!(!text.contains("Enter Sign in"));
         assert!(matches!(server.on_account_form(0, form, key("esc")), Mode::Picker(_)));

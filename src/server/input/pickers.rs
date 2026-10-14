@@ -848,7 +848,7 @@ mod workspace_tests {
             let screen = ratatui::layout::Rect::new(0, 0, width, 30);
             let mut buffer = ratatui::buffer::Buffer::empty(screen);
             crate::server::overlays::draw_picker(&picker, screen, &mut buffer);
-            let text: String = buffer.content.iter().map(|cell| cell.symbol()).collect();
+            let text: String = crate::testing::buffer_text(&buffer);
             assert!(text.contains("one/same.kdl") && text.contains("two/same.kdl"), "{text}");
         }
         assert!(server.workspaces.is_empty());
@@ -1064,7 +1064,7 @@ mod tests {
                 let first = layout.list.y + if query.is_empty() { layout.row_height } else { 0 };
                 let mut buf = ratatui::buffer::Buffer::empty(server.client_screen(client));
                 crate::server::overlays::draw_picker(&p, buf.area, &mut buf);
-                let shown: String = buf.content.iter().map(|c| c.symbol()).collect();
+                let shown: String = crate::testing::buffer_text(&buf);
                 if !query.is_empty() {
                     assert!(shown.contains("No matching workspaces."));
                 }
@@ -1471,7 +1471,7 @@ mod deletion_tests {
             assert!(q.message.contains("Project files will be kept."));
             let mut buf = Buffer::empty(server.client_screen(client));
             crate::server::overlays::draw_confirm(&q, buf.area, &mut buf);
-            let shown: String = buf.content.iter().map(|c| c.symbol()).collect();
+            let shown: String = crate::testing::buffer_text(&buf);
             for text in ["Delete test?", "Cancel", "Delete"] {
                 assert!(shown.contains(text), "{shown}");
             }
@@ -1485,7 +1485,7 @@ mod deletion_tests {
             assert!(p.undo.is_some());
             let mut buf = Buffer::empty(server.client_screen(client));
             crate::server::overlays::draw_picker(&p, buf.area, &mut buf);
-            let shown: String = buf.content.iter().map(|c| c.symbol()).collect();
+            let shown: String = crate::testing::buffer_text(&buf);
             assert!(shown.contains("Ctrl+Z Undo"), "{shown}");
             assert!(shown.contains("Deleted workspaces (1)"), "{shown}");
             let identity = p.undo.clone().unwrap();
@@ -1866,7 +1866,7 @@ mod workspace_action_tests {
             p.actions = Some(keys.iter().position(|(_, a)| *a == "Clear search to reorder").unwrap());
             let mut buf = Buffer::empty(server.client_screen(client));
             overlays::draw_picker(&p, buf.area, &mut buf);
-            let text: String = buf.content.iter().map(|c| c.symbol()).collect();
+            let text: String = crate::testing::buffer_text(&buf);
             assert!(text.contains("Clear search to reorder"));
             let Mode::Picker(p) = server.on_picker(client, p, key("enter")) else { panic!() };
             assert_eq!((p.query.as_str(), p.cursor), ("", 0));
@@ -1932,7 +1932,7 @@ mod workspace_action_tests {
             let Mode::Confirm(q) = choose(&mut server, client, p, "Move up", false) else { panic!() };
             let mut buf = Buffer::empty(server.client_screen(client));
             overlays::draw_confirm(&q, buf.area, &mut buf);
-            let text: String = buf.content.iter().map(|c| c.symbol()).collect();
+            let text: String = crate::testing::buffer_text(&buf);
             for message in ["Couldn't save the order.", "Previous order kept.", "disk full", "Retry", "Cancel"] {
                 assert!(text.contains(message), "{text}");
             }

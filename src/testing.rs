@@ -4,9 +4,15 @@
 #[path = "../tests/common/isolation.rs"]
 pub mod isolation;
 
-use std::io::Write;
-use std::path::Path;
-use std::process::{Command, Stdio};
+#[path = "../tests/common/script.rs"]
+mod script;
+pub use script::write_script;
+
+use std::path::PathBuf;
+use std::process::Command;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+use ratatui::buffer::Buffer;
 
 /// How long a test waits for what programs it started are to do before it fails. Far longer
 /// than it takes: on a machine busy with other work (a CI runner, other tests beside), starting
@@ -14,20 +20,44 @@ use std::process::{Command, Stdio};
 /// nothing when it does.
 pub const PATIENCE: std::time::Duration = std::time::Duration::from_secs(60);
 
-/// Write an executable script at `path`. A child process writes it: a file this process held
-/// open for writing could be inherited by a program another test starts at that moment, and
-/// running the script would then fail with "text file busy".
-pub fn write_script(path: &Path, body: &str) {
-    let mut child = Command::new("sh")
-        .arg("-c")
-        .arg("cat > \"$1\" && chmod 755 \"$1\"")
-        .arg("sh")
-        .arg(path)
-        .stdin(Stdio::piped())
-        .spawn()
-        .unwrap();
-    child.stdin.take().unwrap().write_all(body.as_bytes()).unwrap();
-    assert!(child.wait().unwrap().success(), "writing {}", path.display());
+pub struct TempDir(pub PathBuf);
+
+impl TempDir {
+    pub fn new(name: &str) -> Self {
+        static COUNTER: AtomicUsize = AtomicUsize::new(0);
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("kraal-test-{}-{name}-{id}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // File-manager tests compare these paths with paths resolved by the shell on macOS.
+        Self(dir.canonicalize().unwrap())
+    }
+
+    pub fn write(&self, name: &str, contents: impl AsRef<[u8]>) -> PathBuf {
+        let path = self.0.join(name);
+        std::fs::write(&path, contents).unwrap();
+        path
+    }
+
+    pub fn mkdir(&self, name: &str) -> PathBuf {
+        let path = self.0.join(name);
+        std::fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    pub fn text(&self) -> String {
+        self.0.to_str().unwrap().to_owned()
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+pub fn buffer_text(buf: &Buffer) -> String {
+    buf.content.iter().map(|cell| cell.symbol()).collect()
 }
 
 /// Whether this is the process where test `name` (its full path) runs alone, with a home of its
@@ -124,7 +154,72 @@ pub fn waited_for_a_processor(tid: libc::pid_t) -> std::time::Duration {
 }
 
 mod tests {
-    use super::{isolation, write_script};
+    use super::{TempDir, buffer_text, isolation, write_script};
+    use ratatui::buffer::Buffer;
+    use ratatui::layout::Rect;
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::PathBuf;
+    use std::process::Command;
+
+    #[test]
+    fn temporary_directories_are_distinct_and_removed_with_their_contents() {
+        let first = TempDir::new("same-name");
+        let second = TempDir::new("same-name");
+        assert_ne!(first.0, second.0);
+        assert_eq!(first.0, first.0.canonicalize().unwrap());
+        assert_eq!(first.text(), first.0.to_str().unwrap());
+        first.mkdir("nested/directory");
+        let file = first.write("nested/directory/data", [0, 255, b'\n']);
+        assert_eq!(std::fs::read(file).unwrap(), [0, 255, b'\n']);
+        let kept = second.write("kept", "still here");
+        let path = first.0.clone();
+        drop(first);
+        assert!(!path.exists());
+        assert_eq!(std::fs::read_to_string(kept).unwrap(), "still here");
+        let path = second.0.clone();
+        drop(second);
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn temporary_directory_is_removed_during_unwinding() {
+        let mut path = PathBuf::new();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let dir = TempDir::new("unwind");
+            path = dir.0.clone();
+            dir.write("file", "contents");
+            panic!("test failure");
+        }));
+        assert!(result.is_err());
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn scripts_preserve_contents_and_literal_paths_and_are_executable() {
+        let dir = TempDir::new("script");
+        let path = dir.0.join("script with 'quotes' $and ; spaces");
+        for (body, expected) in [
+            ("#!/bin/sh\nprintf '%s' 'hello 世界'\n", "hello 世界"),
+            ("#!/bin/sh\nprintf '%s' 'replacement'\n", "replacement"),
+        ] {
+            write_script(&path, body);
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), body);
+            assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o755);
+            let output = Command::new(&path).output().unwrap();
+            assert!(output.status.success());
+            assert_eq!(String::from_utf8(output.stdout).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn buffer_text_preserves_all_cell_symbols_and_spaces_without_row_separators() {
+        let mut buf = Buffer::empty(Rect::new(3, 5, 3, 2));
+        buf[(3, 5)].set_symbol("界");
+        buf[(5, 5)].set_symbol("e\u{301}");
+        buf[(4, 6)].set_symbol("z");
+        assert_eq!(buffer_text(&buf), "界 e\u{301} z ");
+        assert_eq!(buffer_text(&Buffer::empty(Rect::new(0, 0, 0, 0))), "");
+    }
 
     /// The unit tests run where nothing is the developer's, and kraal finds its directories
     /// there.

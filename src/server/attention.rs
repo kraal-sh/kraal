@@ -494,7 +494,7 @@ mod tests {
                 server.show_warnings();
                 let mut buffer = ratatui::buffer::Buffer::empty(server.client_screen(id));
                 server.compose(id, crate::accounts::now(), &mut buffer);
-                let text: String = buffer.content.iter().map(|c| c.symbol()).collect();
+                let text: String = crate::testing::buffer_text(&buffer);
                 assert!(text.contains(result), "{cols}x{rows}: {text}");
                 assert_eq!(server.clients[&id].toast, Some((result.into(), until, NoticeKind::Notice)));
                 assert!(server.messages.iter().any(|m| m.kind == NoticeKind::Warning && m.text == warning));

@@ -1,8 +1,8 @@
 //! Tests of previews: loading, layouts, Markdown and images.
 
+use crate::testing::TempDir;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
 
 use image::{Rgba, RgbaImage};
 use ratatui::buffer::Buffer;
@@ -20,32 +20,6 @@ fn loaded(path: &Path) -> Preview {
     let mut preview = Preview::open(path);
     preview.apply(super::Loaded::read(path, false));
     preview
-}
-
-/// A unique scratch directory removed on drop.
-struct TempDir(PathBuf);
-
-impl TempDir {
-    fn new(name: &str) -> Self {
-        static COUNTER: AtomicUsize = AtomicUsize::new(0);
-        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!("kraal-preview-{}-{name}-{id}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
-        TempDir(dir)
-    }
-
-    fn write(&self, name: &str, contents: impl AsRef<[u8]>) -> PathBuf {
-        let path = self.0.join(name);
-        fs::write(&path, contents).unwrap();
-        path
-    }
-}
-
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
-    }
 }
 
 /// Rows of `area` as text, skipping the cells hidden by wide characters.

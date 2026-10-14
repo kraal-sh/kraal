@@ -2147,32 +2147,24 @@ mod tests {
         );
     }
 
-    /// A directory under the temporary directory, removed at the end.
-    struct Tmp(PathBuf);
+    struct Tmp {
+        dir: crate::testing::TempDir,
+    }
 
     impl Tmp {
         fn new(name: &str) -> Tmp {
-            let dir = std::env::temp_dir().join(format!("kraal-transfer-{name}-{}", std::process::id()));
-            let _ = std::fs::remove_dir_all(&dir);
-            std::fs::create_dir_all(&dir).unwrap();
-            Tmp(dir)
+            Tmp { dir: crate::testing::TempDir::new(name) }
         }
 
         fn write(&self, rel: &str, text: &str) -> PathBuf {
-            let p = self.0.join(rel);
+            let p = self.dir.0.join(rel);
             std::fs::create_dir_all(p.parent().unwrap()).unwrap();
             std::fs::write(&p, text).unwrap();
             p
         }
 
         fn read(&self, rel: &str) -> String {
-            std::fs::read_to_string(self.0.join(rel)).unwrap_or_default()
-        }
-    }
-
-    impl Drop for Tmp {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
+            std::fs::read_to_string(self.dir.0.join(rel)).unwrap_or_default()
         }
     }
 
@@ -2185,10 +2177,11 @@ mod tests {
         let keep = |rsync| Options { rsync, replace: Some(vec!["a".into()]), ..Default::default() };
         let rsyncs = if rsync_capable() { vec![false, true] } else { vec![false] };
         for rsync in rsyncs {
-            let _ = std::fs::remove_dir_all(t.0.join("dst"));
+            let _ = std::fs::remove_dir_all(t.dir.0.join("dst"));
             t.write("dst/a", "the old a");
-            let sources = [Endpoint::Local(a.clone()), Endpoint::Local(b.clone()), Endpoint::Local(t.0.join("src/d"))];
-            let steps = plan(&sources, &Endpoint::Local(t.0.join("dst/")), &opts, &keep(rsync)).unwrap();
+            let sources =
+                [Endpoint::Local(a.clone()), Endpoint::Local(b.clone()), Endpoint::Local(t.dir.0.join("src/d"))];
+            let steps = plan(&sources, &Endpoint::Local(t.dir.0.join("dst/")), &opts, &keep(rsync)).unwrap();
             // The race itself: `b` and `d` appear in the destination after the copy started (here,
             // once the files are staged), just before they are put in place.
             let (install, before) = steps.split_last().unwrap();
@@ -2198,9 +2191,9 @@ mod tests {
             assert!(run(std::slice::from_ref(install)).is_err(), "rsync {rsync}: a taken name is an error");
             assert_eq!((t.read("dst/a").as_str(), t.read("dst/b").as_str()), ("new a", "theirs"), "rsync {rsync}");
             assert_eq!(t.read("dst/d/mine"), "theirs too");
-            assert!(!t.0.join("dst/d/inner").exists(), "a directory is not merged into one that appeared");
+            assert!(!t.dir.0.join("dst/d/inner").exists(), "a directory is not merged into one that appeared");
             // What was not put in place waits in the staging directory.
-            let stage = std::fs::read_dir(t.0.join("dst"))
+            let stage = std::fs::read_dir(t.dir.0.join("dst"))
                 .unwrap()
                 .map(|e| e.unwrap().path())
                 .find(|p| p.file_name().unwrap().to_string_lossy().starts_with(".kraal-stage-"))
@@ -2208,8 +2201,8 @@ mod tests {
             assert_eq!(std::fs::read_to_string(stage.join("payload/b")).unwrap(), "new b");
             assert!(stage.join("payload/d/inner").exists());
             // Without anything in the way, what waits is put in place and the staging goes.
-            std::fs::remove_file(t.0.join("dst/b")).unwrap();
-            std::fs::remove_dir_all(t.0.join("dst/d")).unwrap();
+            std::fs::remove_file(t.dir.0.join("dst/b")).unwrap();
+            std::fs::remove_dir_all(t.dir.0.join("dst/d")).unwrap();
             run(std::slice::from_ref(install)).unwrap();
             assert_eq!((t.read("dst/b").as_str(), t.read("dst/d/inner").as_str()), ("new b", "new d"));
             assert!(!stage.exists());
@@ -2241,8 +2234,8 @@ mod tests {
     fn putting_in_place_never_replaces() {
         use std::os::unix::fs::MetadataExt;
         let t = Tmp::new("put");
-        let stage = t.0.join("stage");
-        let dest = t.0.join("dest");
+        let stage = t.dir.0.join("stage");
+        let dest = t.dir.0.join("dest");
         std::fs::create_dir_all(&dest).unwrap();
         let put = |name: &str| {
             let word = |p: &Path| crate::shell::quote_always(&p.display().to_string());
@@ -2305,25 +2298,27 @@ mod tests {
         use std::os::unix::fs::MetadataExt;
         let t = Tmp::new("put-here");
         t.write("src/tree/a", "a");
-        std::fs::set_permissions(t.0.join("src/tree"), std::os::unix::fs::PermissionsExt::from_mode(0o750)).unwrap();
-        std::fs::create_dir_all(t.0.join("out")).unwrap();
+        std::fs::set_permissions(t.dir.0.join("src/tree"), std::os::unix::fs::PermissionsExt::from_mode(0o750))
+            .unwrap();
+        std::fs::create_dir_all(t.dir.0.join("out")).unwrap();
         let keep = Options { replace: Some(Vec::new()), ..Default::default() };
         let steps =
-            plan(&[Endpoint::Local(t.0.join("src/tree"))], &Endpoint::Local(t.0.join("out/")), &opts, &keep).unwrap();
+            plan(&[Endpoint::Local(t.dir.0.join("src/tree"))], &Endpoint::Local(t.dir.0.join("out/")), &opts, &keep)
+                .unwrap();
         let (install, before) = steps.split_last().unwrap();
         run(before).unwrap();
-        let [stage] = &stages(&t.0.join("out"))[..] else { panic!("one staging directory") };
+        let [stage] = &stages(&t.dir.0.join("out"))[..] else { panic!("one staging directory") };
         let staged = std::fs::metadata(stage.join("payload/tree")).unwrap();
         // An empty directory takes the name meanwhile: it is not replaced.
-        std::fs::create_dir(t.0.join("out/tree")).unwrap();
+        std::fs::create_dir(t.dir.0.join("out/tree")).unwrap();
         assert!(run(std::slice::from_ref(install)).is_err());
-        assert!(std::fs::read_dir(t.0.join("out/tree")).unwrap().next().is_none());
-        std::fs::remove_dir(t.0.join("out/tree")).unwrap();
+        assert!(std::fs::read_dir(t.dir.0.join("out/tree")).unwrap().next().is_none());
+        std::fs::remove_dir(t.dir.0.join("out/tree")).unwrap();
         run(std::slice::from_ref(install)).unwrap();
-        let placed = std::fs::metadata(t.0.join("out/tree")).unwrap();
+        let placed = std::fs::metadata(t.dir.0.join("out/tree")).unwrap();
         assert_eq!((placed.ino(), placed.mode() & 0o7777, placed.gid()), (staged.ino(), 0o750, staged.gid()));
         assert_eq!(t.read("out/tree/a"), "a");
-        assert!(stages(&t.0.join("out")).is_empty());
+        assert!(stages(&t.dir.0.join("out")).is_empty());
     }
 
     #[test]
@@ -2334,7 +2329,7 @@ mod tests {
         let unpack = |dest: &Path, single: Option<&str>, members: &[&str]| {
             let mut tar = std::process::Command::new("tar")
                 .args(["cf", "-", "-C"])
-                .arg(t.0.join("src"))
+                .arg(t.dir.0.join("src"))
                 .args(members)
                 .stdout(std::process::Stdio::piped())
                 .spawn()
@@ -2349,16 +2344,20 @@ mod tests {
             status.success()
         };
         // One file to a new name: renamed.
-        assert!(unpack(&t.0.join("out/renamed"), Some("f"), &["./f"]));
+        assert!(unpack(&t.dir.0.join("out/renamed"), Some("f"), &["./f"]));
         assert_eq!(t.read("out/renamed"), "file");
         // To an existing directory: inside it.
-        assert!(unpack(&t.0.join("out"), Some("f"), &["./f"]));
+        assert!(unpack(&t.dir.0.join("out"), Some("f"), &["./f"]));
         assert_eq!(t.read("out/f"), "file");
         // A directory to a new name: created, with the directory inside, as rsync does.
-        assert!(unpack(&t.0.join("tree"), Some("d"), &["./d"]));
+        assert!(unpack(&t.dir.0.join("tree"), Some("d"), &["./d"]));
         assert_eq!(t.read("tree/d/x"), "inner");
         assert!(
-            std::fs::read_dir(&t.0).unwrap().all(|e| !e.unwrap().file_name().to_string_lossy().starts_with(".kraal"))
+            std::fs::read_dir(&t.dir.0).unwrap().all(|e| !e
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".kraal"))
         );
     }
 
@@ -2366,52 +2365,52 @@ mod tests {
     fn local_moves_rename_and_never_lose_the_source() {
         let t = Tmp::new("move");
         let f = t.write("data/report", "only copy");
-        std::os::unix::fs::symlink(t.0.join("data"), t.0.join("alias")).unwrap();
+        std::os::unix::fs::symlink(t.dir.0.join("data"), t.dir.0.join("alias")).unwrap();
         let src = [Endpoint::Local(f.clone())];
         // The same directory, through a link: nothing to do, and nothing deleted.
-        assert!(check_move(&src, &Endpoint::Local(t.0.join("alias"))).is_err());
-        assert!(check_move(&src, &Endpoint::Local(t.0.join("data/"))).is_err());
-        let dir = t.0.join("data");
+        assert!(check_move(&src, &Endpoint::Local(t.dir.0.join("alias"))).is_err());
+        assert!(check_move(&src, &Endpoint::Local(t.dir.0.join("data/"))).is_err());
+        let dir = t.dir.0.join("data");
         assert!(check_move(&[Endpoint::Local(dir.clone())], &Endpoint::Local(dir.join("sub"))).is_err());
         // A rename where it can: atomic, and refused rather than replacing.
         t.write("taken/report", "theirs");
         let keep = Options { replace: Some(Vec::new()), moving: true, ..Default::default() };
-        assert!(rename_local(&src, &Endpoint::Local(t.0.join("taken")), &keep).is_err());
+        assert!(rename_local(&src, &Endpoint::Local(t.dir.0.join("taken")), &keep).is_err());
         assert_eq!((t.read("data/report").as_str(), t.read("taken/report").as_str()), ("only copy", "theirs"));
-        let left = rename_local(&src, &Endpoint::Local(t.0.join("dest/")), &keep).unwrap();
+        let left = rename_local(&src, &Endpoint::Local(t.dir.0.join("dest/")), &keep).unwrap();
         assert_eq!(left, src, "a destination to create is left to the copy");
-        std::fs::create_dir(t.0.join("dest")).unwrap();
-        assert!(rename_local(&src, &Endpoint::Local(t.0.join("dest")), &keep).unwrap().is_empty());
+        std::fs::create_dir(t.dir.0.join("dest")).unwrap();
+        assert!(rename_local(&src, &Endpoint::Local(t.dir.0.join("dest")), &keep).unwrap().is_empty());
         assert_eq!(t.read("dest/report"), "only copy");
         assert!(!f.exists());
         // Empty directories go after rsync deleted their files; one with a file left stays.
         t.write("tree/a/b/keep", "late");
-        std::fs::create_dir_all(t.0.join("tree/c/d")).unwrap();
-        let kept = prune_moved(&[Endpoint::Local(t.0.join("tree"))], &opts).unwrap();
-        assert_eq!(kept, [t.0.join("tree").display().to_string()]);
-        assert!(t.0.join("tree/a/b/keep").exists() && !t.0.join("tree/c").exists());
+        std::fs::create_dir_all(t.dir.0.join("tree/c/d")).unwrap();
+        let kept = prune_moved(&[Endpoint::Local(t.dir.0.join("tree"))], &opts).unwrap();
+        assert_eq!(kept, [t.dir.0.join("tree").display().to_string()]);
+        assert!(t.dir.0.join("tree/a/b/keep").exists() && !t.dir.0.join("tree/c").exists());
     }
 
     #[test]
     fn cleaning_up_a_move_never_reads_a_name_as_find_options() {
         let home = Tmp::new("prune-home");
         home.write("keep/precious", "data");
-        std::fs::create_dir_all(home.0.join("-delete/empty/deeper")).unwrap();
+        std::fs::create_dir_all(home.dir.0.join("-delete/empty/deeper")).unwrap();
         home.write("-delete/left", "late");
         let status = std::process::Command::new("sh")
             .args(["-c", &prune_script(&["-delete".to_string()])])
-            .env("HOME", &home.0)
-            .current_dir(&home.0)
+            .env("HOME", &home.dir.0)
+            .current_dir(&home.dir.0)
             .status()
             .unwrap();
         assert!(status.success());
         assert_eq!(home.read("keep/precious"), "data", "nothing outside the moved directory is touched");
-        assert!(!home.0.join("-delete/empty").exists() && home.0.join("-delete/left").exists());
+        assert!(!home.dir.0.join("-delete/empty").exists() && home.dir.0.join("-delete/left").exists());
     }
 
     /// A fake ssh that runs the command here: a server that is this machine.
     fn fake_ssh(t: &Tmp) -> String {
-        let path = t.0.join("fake-ssh");
+        let path = t.dir.0.join("fake-ssh");
         crate::testing::write_script(&path, "#!/bin/sh\nshift\nexec sh -c \"$*\"\n");
         path.display().to_string()
     }
@@ -2452,41 +2451,42 @@ mod tests {
         let t = Tmp::new("old-mv");
         t.write("in/tree/a", "a");
         t.write("in/note", "note");
-        std::fs::create_dir_all(t.0.join("out")).unwrap();
+        std::fs::create_dir_all(t.dir.0.join("out")).unwrap();
         // The server's `mv` is one from before coreutils 8.30.
         let real = std::process::Command::new("sh").args(["-c", "command -v mv"]).output().unwrap();
         let real = String::from_utf8_lossy(&real.stdout).trim().to_string();
-        std::fs::create_dir_all(t.0.join("bin")).unwrap();
+        std::fs::create_dir_all(t.dir.0.join("bin")).unwrap();
         crate::testing::write_script(
-            &t.0.join("bin/mv"),
+            &t.dir.0.join("bin/mv"),
             &format!(
                 "#!/bin/sh\nif [ \"$1\" = --version ]; then echo 'mv (GNU coreutils) 8.28'; exit 0; fi\nexec {} \"$@\"\n",
                 crate::shell::quote(&real)
             ),
         );
-        let old = format!("PATH={}:$PATH; export PATH; ", crate::shell::quote(&t.0.join("bin").display().to_string()));
+        let old =
+            format!("PATH={}:$PATH; export PATH; ", crate::shell::quote(&t.dir.0.join("bin").display().to_string()));
         let moving = Options { moving: true, replace: Some(Vec::new()), dest_dir: Some(true), ..Default::default() };
-        let dest = here_at(&t.0.join("out/"));
-        let tree = here_at(&t.0.join("in/tree"));
+        let dest = here_at(&t.dir.0.join("out/"));
+        let tree = here_at(&t.dir.0.join("in/tree"));
         let err = run_on_server_like(&t, &plan(std::slice::from_ref(&tree), &dest, &opts, &moving).unwrap(), &old);
         assert!(err.is_err(), "refused");
         assert_eq!(t.read("in/tree/a"), "a", "the directory is where it was");
-        assert!(stages(&t.0.join("out")).is_empty() && !t.0.join("out/tree").exists(), "nothing was staged");
+        assert!(stages(&t.dir.0.join("out")).is_empty() && !t.dir.0.join("out/tree").exists(), "nothing was staged");
         // A file needs no directory put in place: it goes as before.
-        let note = here_at(&t.0.join("in/note"));
+        let note = here_at(&t.dir.0.join("in/note"));
         run_on_server_like(&t, &plan(std::slice::from_ref(&note), &dest, &opts, &moving).unwrap(), &old).unwrap();
         assert_eq!(t.read("out/note"), "note");
-        assert!(!t.0.join("in/note").exists());
+        assert!(!t.dir.0.join("in/note").exists());
         // A local directory too is known to need it before anything is sent.
         let local = Options { replace: Some(Vec::new()), dest_dir: Some(true), ..Default::default() };
-        let up = Endpoint::Local(t.0.join("in/tree"));
+        let up = Endpoint::Local(t.dir.0.join("in/tree"));
         assert!(run_on_server_like(&t, &plan(std::slice::from_ref(&up), &dest, &opts, &local).unwrap(), &old).is_err());
-        assert!(stages(&t.0.join("out")).is_empty() && !t.0.join("out/tree").exists());
+        assert!(stages(&t.dir.0.join("out")).is_empty() && !t.dir.0.join("out/tree").exists());
         // With an mv that can, the directory moves, the same directory.
         if mv_keeps_here() {
             run_here(&t, &plan(std::slice::from_ref(&tree), &dest, &opts, &moving).unwrap()).unwrap();
             assert_eq!(t.read("out/tree/a"), "a");
-            assert!(!t.0.join("in/tree").exists());
+            assert!(!t.dir.0.join("in/tree").exists());
         }
     }
 
@@ -2526,9 +2526,9 @@ mod tests {
     fn staging_left_by_others_is_never_removed_unless_its_copy_is_over() {
         let t = Tmp::new("others");
         let src = Endpoint::Local(t.write("in/report", "the report"));
-        let out = t.0.join("out");
+        let out = t.dir.0.join("out");
         std::fs::create_dir_all(&out).unwrap();
-        let dest = Endpoint::Local(t.0.join("out/"));
+        let dest = Endpoint::Local(t.dir.0.join("out/"));
         let prefix = stage_prefix(std::slice::from_ref(&src), &dest);
         let hex = |c: char| std::iter::repeat_n(c, 32).collect::<String>();
         // An older kraal's staging, without a run of its own in its name: what it holds is the
@@ -2561,7 +2561,7 @@ mod tests {
         // A move refuses while staging it cannot tell is over is there, and touches none of it.
         let moving = Options { rsync: true, moving: true, replace: Some(Vec::new()), ..Default::default() };
         let back = Endpoint::Local(t.write("in/report", "the report"));
-        std::fs::remove_file(t.0.join("out/report")).unwrap();
+        std::fs::remove_file(t.dir.0.join("out/report")).unwrap();
         assert!(run(&plan(std::slice::from_ref(&back), &dest, &opts, &moving).unwrap()).is_err());
         assert_eq!(t.read("in/report"), "the report");
         for kept in [&legacy, &older, &running, &moved, &elsewhere] {
@@ -2576,9 +2576,9 @@ mod tests {
         let (machine, boot) = (words[0], words[1]);
         let t = Tmp::new("maybe-running");
         let src = Endpoint::Local(t.write("in/report", "the report"));
-        let out = t.0.join("out");
+        let out = t.dir.0.join("out");
         std::fs::create_dir_all(&out).unwrap();
-        let dest = Endpoint::Local(t.0.join("out/"));
+        let dest = Endpoint::Local(t.dir.0.join("out/"));
         let prefix = stage_prefix(std::slice::from_ref(&src), &dest);
         let hex = |c: char| std::iter::repeat_n(c, 32).collect::<String>();
         let keep = Options { replace: Some(Vec::new()), ..Default::default() };
@@ -2616,9 +2616,10 @@ mod tests {
         let t = Tmp::new("partial-name");
         t.write("in/project/.kraal-partial/photos", "mine");
         t.write("in/project/.kraal-partial-0123/notes", "mine too");
-        std::fs::create_dir_all(t.0.join("out")).unwrap();
+        std::fs::create_dir_all(t.dir.0.join("out")).unwrap();
         let replace = Options { rsync: true, ..Default::default() };
-        let steps = plan(&[Endpoint::Local(t.0.join("in/project"))], &here_at(&t.0.join("out/")), &opts, &replace);
+        let steps =
+            plan(&[Endpoint::Local(t.dir.0.join("in/project"))], &here_at(&t.dir.0.join("out/")), &opts, &replace);
         run_here(&t, &steps.unwrap()).unwrap();
         assert_eq!(t.read("out/project/.kraal-partial/photos"), "mine");
         assert_eq!(t.read("out/project/.kraal-partial-0123/notes"), "mine too");
@@ -2632,13 +2633,13 @@ mod tests {
         let t = Tmp::new("resume");
         let whole: String = (0..20000).map(|i| format!("line {i}\n")).collect();
         let src = Endpoint::Local(t.write("in/big", &whole));
-        std::fs::create_dir_all(t.0.join("out")).unwrap();
-        let dest = here_at(&t.0.join("out/"));
+        std::fs::create_dir_all(t.dir.0.join("out")).unwrap();
+        let dest = here_at(&t.dir.0.join("out/"));
         let replace = Options { rsync: true, ..Default::default() };
         // What an interrupted run left: the first part, in its partial directory.
         let interrupted = plan(std::slice::from_ref(&src), &dest, &opts, &replace).unwrap();
         let flag = interrupted[0].args.iter().find(|a| a.starts_with("--partial-dir=")).unwrap();
-        let partial = t.0.join("out").join(flag.trim_start_matches("--partial-dir="));
+        let partial = t.dir.0.join("out").join(flag.trim_start_matches("--partial-dir="));
         std::fs::create_dir_all(&partial).unwrap();
         std::fs::write(partial.join("big"), &whole[..whole.len() / 2]).unwrap();
         // Run again.
@@ -2664,7 +2665,7 @@ mod tests {
     fn a_second_run_of_a_copy_waits_for_the_first() {
         let t = Tmp::new("one-run");
         let src = Endpoint::Local(t.write("in/big", "data"));
-        let dest = here_at(&t.0.join("out/"));
+        let dest = here_at(&t.dir.0.join("out/"));
         let steps = plan(std::slice::from_ref(&src), &dest, &opts, &with_rsync(true)).unwrap();
         let partial = partial_of(&steps).clone();
         let first = PartialRun::start(&partial).unwrap();
@@ -2697,7 +2698,7 @@ mod tests {
     fn copies_leave_no_lock_behind() {
         let t = Tmp::new("locks");
         let partial = |key: u64, dir: &str| {
-            let dir = t.0.join(dir);
+            let dir = t.dir.0.join(dir);
             std::fs::create_dir_all(&dir).unwrap();
             Partial {
                 key,
@@ -2732,8 +2733,8 @@ mod tests {
             return;
         }
         let t = Tmp::new("leftovers");
-        std::fs::create_dir_all(t.0.join("out/sub")).unwrap();
-        let dest = here_at(&t.0.join("out/"));
+        std::fs::create_dir_all(t.dir.0.join("out/sub")).unwrap();
+        let dest = here_at(&t.dir.0.join("out/"));
         let replace = with_rsync(true);
         let fake = fake_ssh(&t);
         let interrupted = |name: &str| {
@@ -2745,7 +2746,7 @@ mod tests {
             // Started, killed: its note stays, and so do its partial files, here in a
             // subdirectory as rsync puts them for files there.
             leave_note(&partial);
-            let dir = t.0.join("out/sub").join(partial_name(partial.key));
+            let dir = t.dir.0.join("out/sub").join(partial_name(partial.key));
             std::fs::create_dir_all(&dir).unwrap();
             std::fs::write(dir.join(name), "half").unwrap();
             (src, partial, dir)
@@ -2777,8 +2778,8 @@ mod tests {
     #[test]
     fn what_an_interrupted_copy_left_is_removed_where_it_put_it() {
         let t = Tmp::new("own-places");
-        let place = format!("here {}", t.0.display());
-        let q = |p: &str| crate::shell::quote_always(&t.0.join(p).display().to_string());
+        let place = format!("here {}", t.dir.0.display());
+        let q = |p: &str| crate::shell::quote_always(&t.dir.0.join(p).display().to_string());
         let partial = |key: u64, tops: Vec<String>| Partial {
             key,
             place: place.clone(),
@@ -2788,26 +2789,26 @@ mod tests {
         };
         // Interrupted, into backup/current, a link to a directory outside backup: its partial
         // files are behind the link.
-        std::fs::create_dir_all(t.0.join("backup")).unwrap();
+        std::fs::create_dir_all(t.dir.0.join("backup")).unwrap();
         t.write(&format!("elsewhere/{}/half", partial_name(61)), "half");
-        std::os::unix::fs::symlink(t.0.join("elsewhere"), t.0.join("backup/current")).unwrap();
+        std::os::unix::fs::symlink(t.dir.0.join("elsewhere"), t.dir.0.join("backup/current")).unwrap();
         leave_note(&partial(61, vec![q("backup/current"), q("backup")]));
         // A copy into backup/ succeeds: it looks where the interrupted one went, through its own
         // connection.
         PartialRun::start(&partial(62, vec![q("backup")])).unwrap().finish();
-        assert!(!t.0.join("elsewhere").join(partial_name(61)).exists(), "removed behind the link");
+        assert!(!t.dir.0.join("elsewhere").join(partial_name(61)).exists(), "removed behind the link");
         assert!(!notes_dir().join(format!("{:016x}.note", 61)).exists(), "and its note goes");
         // A note that names only its place (older) is looked for where the finishing copy looks.
         t.write(&format!("backup/{}/half", partial_name(63)), "half");
         std::fs::write(notes_dir().join(format!("{:016x}.note", 63)), format!("{place}\n")).unwrap();
         PartialRun::start(&partial(64, vec![q("backup")])).unwrap().finish();
-        assert!(!t.0.join("backup").join(partial_name(63)).exists());
+        assert!(!t.dir.0.join("backup").join(partial_name(63)).exists());
     }
 
     #[test]
     fn a_copy_to_a_name_and_one_into_its_directory_know_each_other() {
         let t = Tmp::new("same-place");
-        std::fs::create_dir_all(t.0.join("out")).unwrap();
+        std::fs::create_dir_all(t.dir.0.join("out")).unwrap();
         let src = Endpoint::Local(t.write("in/report", "data"));
         let place = |dest: &Endpoint| {
             let steps = plan(std::slice::from_ref(&src), dest, &opts, &with_rsync(true)).unwrap();
@@ -2815,14 +2816,14 @@ mod tests {
         };
         // Copied as out/report, or into out/: both runs receive in out, and what one left the
         // other cleans up.
-        assert_eq!(place(&here_at(&t.0.join("out/report"))), place(&here_at(&t.0.join("out/"))));
+        assert_eq!(place(&here_at(&t.dir.0.join("out/report"))), place(&here_at(&t.dir.0.join("out/"))));
     }
 
     #[test]
     fn each_machine_and_user_keeps_its_own_partial_files() {
         let t = Tmp::new("clients");
         let src = Endpoint::Local(t.write("in/big", "data"));
-        let dest = here_at(&t.0.join("out/"));
+        let dest = here_at(&t.dir.0.join("out/"));
         let key = |client: &str| partial_key(client, std::slice::from_ref(&src), &dest);
         let ours = key("machine-a 1000");
         assert_eq!(ours, key("machine-a 1000"), "a retry here takes up what it left");
@@ -2839,14 +2840,14 @@ mod tests {
         for k in [ours, theirs] {
             t.write(&format!("out/{}/big", partial_name(k)), "half");
         }
-        let out = crate::shell::quote_always(&t.0.join("out").display().to_string());
+        let out = crate::shell::quote_always(&t.dir.0.join("out").display().to_string());
         run_with_input(
             &Step::new("sh", vec!["-c".into(), cleanup_script(std::slice::from_ref(&out))]),
             &partial_name(ours),
         )
         .unwrap();
-        assert!(!t.0.join("out").join(partial_name(ours)).exists());
-        assert!(t.0.join("out").join(partial_name(theirs)).exists());
+        assert!(!t.dir.0.join("out").join(partial_name(ours)).exists());
+        assert!(t.dir.0.join("out").join(partial_name(theirs)).exists());
     }
 
     #[test]
@@ -2854,26 +2855,28 @@ mod tests {
         let t = Tmp::new("linked-dest");
         let name = partial_name(42);
         t.write(&format!("real/sub/{name}/big"), "half");
-        std::os::unix::fs::symlink(t.0.join("real"), t.0.join("current")).unwrap();
+        std::os::unix::fs::symlink(t.dir.0.join("real"), t.dir.0.join("current")).unwrap();
         let cleanup = |top: &str| {
-            let top = crate::shell::quote_always(&t.0.join(top).display().to_string());
+            let top = crate::shell::quote_always(&t.dir.0.join(top).display().to_string());
             Step::new("sh", vec!["-c".into(), cleanup_script(&[top])])
         };
         run_with_input(&cleanup("current"), &name).unwrap();
-        assert!(!t.0.join("real/sub").join(&name).exists(), "found through the link, as the copy went");
+        assert!(!t.dir.0.join("real/sub").join(&name).exists(), "found through the link, as the copy went");
         // Named without `/`, a linked directory is where rsync put things, not its parent: both
         // are looked at.
         t.write(&format!("real/{name}/big"), "half");
-        let both: Vec<String> =
-            ["current", ""].iter().map(|p| crate::shell::quote_always(&t.0.join(p).display().to_string())).collect();
+        let both: Vec<String> = ["current", ""]
+            .iter()
+            .map(|p| crate::shell::quote_always(&t.dir.0.join(p).display().to_string()))
+            .collect();
         run_with_input(&Step::new("sh", vec!["-c".into(), cleanup_script(&both)]), &name).unwrap();
-        assert!(!t.0.join("real").join(&name).exists(), "found in the linked destination named without /");
+        assert!(!t.dir.0.join("real").join(&name).exists(), "found in the linked destination named without /");
         // Where nothing can be looked at, the cleanup fails and the notes stay for a later run.
-        std::os::unix::fs::symlink(t.0.join("gone"), t.0.join("dangling")).unwrap();
+        std::os::unix::fs::symlink(t.dir.0.join("gone"), t.dir.0.join("dangling")).unwrap();
         let partial = Partial {
             key: 43,
-            place: format!("here {}", t.0.display()),
-            tops: vec![crate::shell::quote_always(&t.0.join("dangling").display().to_string())],
+            place: format!("here {}", t.dir.0.display()),
+            tops: vec![crate::shell::quote_always(&t.dir.0.join("dangling").display().to_string())],
             runner: Step::new("sh", vec!["-c".into()]),
             remote: false,
         };
@@ -2888,8 +2891,8 @@ mod tests {
         t.write("in/note", "note");
         t.write("in/tree/a", "a");
         let other = Server { name: "other".into(), host: "other.lan".into(), ..Default::default() };
-        let from = |p: &str| Endpoint::Remote { server: other.clone(), path: t.0.join(p).display().to_string() };
-        let dest = here_at(&t.0.join("out/"));
+        let from = |p: &str| Endpoint::Remote { server: other.clone(), path: t.dir.0.join(p).display().to_string() };
+        let dest = here_at(&t.dir.0.join("out/"));
         // The other server, asked here.
         let ask = |_: &Server, script: &str| -> Result<String> {
             let out = std::process::Command::new("sh").args(["-c", script]).output()?;
@@ -2907,15 +2910,15 @@ mod tests {
     fn an_interrupted_move_is_never_written_over() {
         let t = Tmp::new("pending-move");
         t.write("in/report", "the original");
-        std::fs::create_dir_all(t.0.join("out")).unwrap();
+        std::fs::create_dir_all(t.dir.0.join("out")).unwrap();
         let keep = Options { moving: true, replace: Some(Vec::new()), dest_dir: Some(true), ..Default::default() };
-        let (src, dest) = (here_at(&t.0.join("in/report")), here_at(&t.0.join("out/")));
+        let (src, dest) = (here_at(&t.dir.0.join("in/report")), here_at(&t.dir.0.join("out/")));
         let steps = plan(std::slice::from_ref(&src), &dest, &opts, &keep).unwrap();
         // Interrupted once the source is staged, before it is put in place.
         let (_, before) = steps.split_last().unwrap();
         run_here(&t, before).unwrap();
-        assert!(!t.0.join("in/report").exists());
-        let found = stages(&t.0.join("out"));
+        assert!(!t.dir.0.join("in/report").exists());
+        let found = stages(&t.dir.0.join("out"));
         let [stage] = &found[..] else { panic!("one staging directory: {found:?}") };
         // The report comes back to where it was (its producer wrote it again); moving again must
         // not touch the staged one, the only copy of the original.
@@ -2924,7 +2927,7 @@ mod tests {
         assert!(run_here(&t, &again).is_err(), "the earlier move is named, nothing is done");
         assert_eq!(std::fs::read_to_string(stage.join("payload/report")).unwrap(), "the original");
         assert_eq!(t.read("in/report"), "a new one");
-        assert!(!t.0.join("out/report").exists());
+        assert!(!t.dir.0.join("out/report").exists());
         // An interrupted copy is another matter: its sources are still there, and once the copy
         // that made the staging no longer runs, it is started over.
         let copy = Options { replace: Some(Vec::new()), dest_dir: Some(true), ..Default::default() };
@@ -2932,30 +2935,30 @@ mod tests {
         let steps = plan(std::slice::from_ref(&src), &dest, &opts, &copy).unwrap();
         run_here(&t, &steps[..steps.len() - 1]).unwrap();
         let Some(dead) = gone_owner() else { return };
-        let [stage] = &stages(&t.0.join("out"))[..] else { panic!("one staging directory") };
+        let [stage] = &stages(&t.dir.0.join("out"))[..] else { panic!("one staging directory") };
         std::fs::write(stage.join("owner"), dead).unwrap();
         run_here(&t, &plan(std::slice::from_ref(&src), &dest, &opts, &copy).unwrap()).unwrap();
         assert_eq!(t.read("out/report"), "a new one");
-        assert!(stages(&t.0.join("out")).is_empty(), "the interrupted copy's staging is gone");
+        assert!(stages(&t.dir.0.join("out")).is_empty(), "the interrupted copy's staging is gone");
     }
 
     #[test]
     fn a_retried_copy_never_writes_through_what_an_earlier_one_staged() {
         let t = Tmp::new("stale-link");
         t.write("victim", "not to be touched");
-        std::fs::create_dir_all(t.0.join("in")).unwrap();
-        std::fs::create_dir_all(t.0.join("out")).unwrap();
-        std::os::unix::fs::symlink(t.0.join("victim"), t.0.join("in/item")).unwrap();
+        std::fs::create_dir_all(t.dir.0.join("in")).unwrap();
+        std::fs::create_dir_all(t.dir.0.join("out")).unwrap();
+        std::os::unix::fs::symlink(t.dir.0.join("victim"), t.dir.0.join("in/item")).unwrap();
         let keep = Options { replace: Some(Vec::new()), dest_dir: Some(true), ..Default::default() };
-        let (src, dest) = (here_at(&t.0.join("in/item")), here_at(&t.0.join("out")));
+        let (src, dest) = (here_at(&t.dir.0.join("in/item")), here_at(&t.dir.0.join("out")));
         let steps = plan(std::slice::from_ref(&src), &dest, &opts, &keep).unwrap();
         run_here(&t, &steps[..steps.len() - 1]).unwrap();
         // The source is now a file of its own; the copy is done again.
-        std::fs::remove_file(t.0.join("in/item")).unwrap();
+        std::fs::remove_file(t.dir.0.join("in/item")).unwrap();
         t.write("in/item", "the file asked for");
         run_here(&t, &plan(std::slice::from_ref(&src), &dest, &opts, &keep).unwrap()).unwrap();
         assert_eq!(t.read("victim"), "not to be touched");
-        assert!(std::fs::symlink_metadata(t.0.join("out/item")).unwrap().is_file());
+        assert!(std::fs::symlink_metadata(t.dir.0.join("out/item")).unwrap().is_file());
         assert_eq!(t.read("out/item"), "the file asked for");
     }
 
@@ -2964,26 +2967,26 @@ mod tests {
         let t = Tmp::new("names");
         let names = [".kraal-partial", ".as", "payload", "work", "kind", "ref", "format", "owner"];
         let sources: Vec<Endpoint> = names.iter().map(|n| here_at(&t.write(&format!("in/{n}"), n))).collect();
-        std::fs::create_dir_all(t.0.join("out")).unwrap();
+        std::fs::create_dir_all(t.dir.0.join("out")).unwrap();
         let keep = Options { replace: Some(Vec::new()), ..Default::default() };
-        run_here(&t, &plan(&sources, &here_at(&t.0.join("out/")), &opts, &keep).unwrap()).unwrap();
+        run_here(&t, &plan(&sources, &here_at(&t.dir.0.join("out/")), &opts, &keep).unwrap()).unwrap();
         for n in names {
             assert_eq!(t.read(&format!("out/{n}")), n);
         }
         // One source renamed to a name of kraal's own staging: it takes it.
-        let one = here_at(&t.0.join("in/.as"));
-        let to = here_at(&t.0.join("out/.as-renamed"));
+        let one = here_at(&t.dir.0.join("in/.as"));
+        let to = here_at(&t.dir.0.join("out/.as-renamed"));
         let keep_new = Options { dest_dir: Some(false), ..keep.clone() };
         run_here(&t, &plan(&[one], &to, &opts, &keep_new).unwrap()).unwrap();
         assert_eq!(t.read("out/.as-renamed"), ".as");
         // A move delivers them too.
         let moving = Options { moving: true, ..keep };
         let partial = here_at(&t.write("in2/.kraal-partial", "moved"));
-        std::fs::create_dir_all(t.0.join("out2")).unwrap();
-        run_here(&t, &plan(&[partial], &here_at(&t.0.join("out2/")), &opts, &moving).unwrap()).unwrap();
+        std::fs::create_dir_all(t.dir.0.join("out2")).unwrap();
+        run_here(&t, &plan(&[partial], &here_at(&t.dir.0.join("out2/")), &opts, &moving).unwrap()).unwrap();
         assert_eq!(t.read("out2/.kraal-partial"), "moved");
-        assert!(!t.0.join("in2/.kraal-partial").exists());
-        assert!(stages(&t.0.join("out")).is_empty() && stages(&t.0.join("out2")).is_empty());
+        assert!(!t.dir.0.join("in2/.kraal-partial").exists());
+        assert!(stages(&t.dir.0.join("out")).is_empty() && stages(&t.dir.0.join("out2")).is_empty());
     }
 
     #[test]
@@ -2995,9 +2998,9 @@ mod tests {
         let t = Tmp::new("retry-dir");
         t.write("in/tree/a", "a");
         t.write("in/tree/sub/b", "b");
-        std::fs::create_dir_all(t.0.join("out")).unwrap();
+        std::fs::create_dir_all(t.dir.0.join("out")).unwrap();
         let keep = Options { replace: Some(Vec::new()), dest_dir: Some(false), ..Default::default() };
-        let (src, dest) = (here_at(&t.0.join("in/tree")), here_at(&t.0.join("out/new")));
+        let (src, dest) = (here_at(&t.dir.0.join("in/tree")), here_at(&t.dir.0.join("out/new")));
         let steps = plan(std::slice::from_ref(&src), &dest, &opts, &keep).unwrap();
         let (install, before) = steps.split_last().unwrap();
         run_here(&t, before).unwrap();
@@ -3006,17 +3009,17 @@ mod tests {
         assert!(run_here(&t, std::slice::from_ref(install)).is_err());
         assert_eq!(t.read("out/new"), "theirs");
         // It goes; the copy is done again, and takes the name with what the source holds.
-        std::fs::remove_file(t.0.join("out/new")).unwrap();
+        std::fs::remove_file(t.dir.0.join("out/new")).unwrap();
         run_here(&t, &plan(std::slice::from_ref(&src), &dest, &opts, &keep).unwrap()).unwrap();
         assert_eq!((t.read("out/new/a").as_str(), t.read("out/new/sub/b").as_str()), ("a", "b"));
-        assert!(!t.0.join("out/new/tree").exists(), "not one level too deep");
+        assert!(!t.dir.0.join("out/new/tree").exists(), "not one level too deep");
     }
 
     #[test]
     fn a_destination_directory_holds_its_own_staging() {
         let t = Tmp::new("stage-where");
         let f = t.write("file", "x");
-        let home = t.0.join("home");
+        let home = t.dir.0.join("home");
         let alice = home.join("alice");
         std::fs::create_dir_all(&alice).unwrap();
         // What holds the destination cannot be written; the destination itself can.
@@ -3041,16 +3044,16 @@ mod tests {
         let t = Tmp::new("literal");
         t.write("src/backup[1]", "the one asked for");
         t.write("src/backup1", "a neighbour");
-        std::fs::create_dir_all(t.0.join("dst")).unwrap();
+        std::fs::create_dir_all(t.dir.0.join("dst")).unwrap();
         let here = Server { name: "here".into(), host: "localhost".into(), ..Default::default() };
-        let src = Endpoint::Remote { server: here, path: format!("{}/src/backup[1]", t.0.display()) };
+        let src = Endpoint::Remote { server: here, path: format!("{}/src/backup[1]", t.dir.0.display()) };
         let moving = Options { rsync: true, moving: true, ..Default::default() };
-        let mut steps = plan(&[src], &Endpoint::Local(t.0.join("dst/")), &opts, &moving).unwrap();
+        let mut steps = plan(&[src], &Endpoint::Local(t.dir.0.join("dst/")), &opts, &moving).unwrap();
         let e = steps[0].args.iter().position(|a| a == "-e").unwrap();
         steps[0].args[e + 1] = fake_ssh(&t);
         run(&steps).unwrap();
         assert_eq!(t.read("dst/backup[1]"), "the one asked for");
-        assert!(!t.0.join("dst/backup1").exists() && !t.0.join("src/backup[1]").exists());
+        assert!(!t.dir.0.join("dst/backup1").exists() && !t.dir.0.join("src/backup[1]").exists());
         assert_eq!(t.read("src/backup1"), "a neighbour", "a neighbouring name is neither copied nor deleted");
         assert_eq!(rsync_literal("plain\\name"), "plain\\name");
         assert_eq!(rsync_literal("a*[b]?"), "a\\*\\[b\\]\\?");
@@ -3095,28 +3098,28 @@ mod tests {
             let line = steps[0].args.last().unwrap().clone();
             std::process::Command::new("sh").args(["-c", &line]).status().unwrap().success()
         };
-        assert!(script(&t.0.join("a/f"), &t.0.join("b")));
+        assert!(script(&t.dir.0.join("a/f"), &t.dir.0.join("b")));
         assert_eq!(t.read("b/f"), "x");
         // Another file system: mv would copy, then delete the whole source; it is refused.
         let shm = Path::new("/dev/shm");
         let dev = |p: &Path| std::os::unix::fs::MetadataExt::dev(&std::fs::metadata(p).unwrap());
-        if shm.is_dir() && dev(shm) != dev(&t.0) {
+        if shm.is_dir() && dev(shm) != dev(&t.dir.0) {
             let other = shm.join(format!("kraal-samefs-{}", std::process::id()));
-            assert!(!script(&t.0.join("b/f"), &other));
+            assert!(!script(&t.dir.0.join("b/f"), &other));
             assert_eq!(t.read("b/f"), "x");
             // An existing directory named without a trailing slash receives the source too: its
             // own file system counts, not that of what holds it.
             std::fs::create_dir_all(&other).unwrap();
-            let src = Endpoint::Remote { server: here.clone(), path: t.0.join("b").display().to_string() };
+            let src = Endpoint::Remote { server: here.clone(), path: t.dir.0.join("b").display().to_string() };
             let dest = Endpoint::Remote { server: here.clone(), path: other.display().to_string() };
             let steps = plan(&[src], &dest, &opts, &moving).unwrap();
             let line = steps[0].args.last().unwrap().clone();
             assert!(!std::process::Command::new("sh").args(["-c", &line]).status().unwrap().success());
             assert_eq!(t.read("b/f"), "x");
             // The same through a link to it: where the link leads counts, not where it is.
-            std::os::unix::fs::symlink(&other, t.0.join("usb")).unwrap();
-            let src = Endpoint::Remote { server: here.clone(), path: t.0.join("b").display().to_string() };
-            let dest = Endpoint::Remote { server: here.clone(), path: t.0.join("usb").display().to_string() };
+            std::os::unix::fs::symlink(&other, t.dir.0.join("usb")).unwrap();
+            let src = Endpoint::Remote { server: here.clone(), path: t.dir.0.join("b").display().to_string() };
+            let dest = Endpoint::Remote { server: here.clone(), path: t.dir.0.join("usb").display().to_string() };
             let steps = plan(&[src], &dest, &opts, &moving).unwrap();
             let line = steps[0].args.last().unwrap().clone();
             assert!(!std::process::Command::new("sh").args(["-c", &line]).status().unwrap().success());
@@ -3130,7 +3133,7 @@ mod tests {
     fn a_server_that_is_this_machine_is_seen_before_a_move() {
         let t = Tmp::new("self");
         let f = t.write("data/report", "only copy");
-        let dir = t.0.join("data");
+        let dir = t.dir.0.join("data");
         let marks = Marks { next_to: ".kraal-move-test-by".into(), inside: ".kraal-move-test-in".into() };
         // This machine to "a server" that is this machine (the script runs here).
         let seen = |dest: &Path, into: bool| {
@@ -3145,7 +3148,7 @@ mod tests {
         assert!(seen(&dir, true).contains(&"next to".to_string()), "into the source's own directory");
         assert!(seen(&dir, false).contains(&"into".to_string()), "an existing directory receives the sources");
         assert!(seen(&dir.join("new/deeper"), true).contains(&"inside".to_string()), "inside a source");
-        assert_eq!(seen(&t.0.join("elsewhere"), true), ["into"], "a sibling is another place");
+        assert_eq!(seen(&t.dir.0.join("elsewhere"), true), ["into"], "a sibling is another place");
         drop(placed);
         assert!(
             std::fs::read_dir(&dir).unwrap().all(|e| !e.unwrap().file_name().to_string_lossy().starts_with(".kraal"))
@@ -3155,10 +3158,10 @@ mod tests {
         let ok = std::process::Command::new("sh").args(["-c", &place_script(&paths, &marks)]).status().unwrap();
         assert!(ok.success());
         assert_eq!(local_seen(&dir.join("sub"), true, &marks), (false, true));
-        assert_eq!(local_seen(&t.0, true, &marks), (true, false));
-        assert_eq!(local_seen(&t.0.join("other"), true, &marks), (false, false), "a sibling is another place");
+        assert_eq!(local_seen(&t.dir.0, true, &marks), (true, false));
+        assert_eq!(local_seen(&t.dir.0.join("other"), true, &marks), (false, false), "a sibling is another place");
         std::process::Command::new("sh").args(["-c", &unplace_script(&paths, &marks)]).status().unwrap();
-        assert!(!dir.join(&marks.inside).exists() && !t.0.join(&marks.next_to).exists());
+        assert!(!dir.join(&marks.inside).exists() && !t.dir.0.join(&marks.next_to).exists());
     }
 
     #[test]
@@ -3172,7 +3175,7 @@ mod tests {
             String::from_utf8_lossy(&out.stdout).lines().map(str::to_string).collect::<Vec<_>>()
         };
         // A directory whose name ends in a newline: `$(dirname …)` would cut it and look elsewhere.
-        let dir = t.0.join("data\n");
+        let dir = t.dir.0.join("data\n");
         let f = dir.join("report");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(&f, "only copy").unwrap();
@@ -3188,7 +3191,7 @@ mod tests {
         std::process::Command::new("sh").args(["-c", &unplace_script(&paths, &marks)]).status().unwrap();
         assert!(!dir.join(&marks.next_to).exists());
         // Moving what a directory holds needs that directory, not the one holding it.
-        let home = t.0.join("home");
+        let home = t.dir.0.join("home");
         let mine = home.join("alice");
         std::fs::create_dir_all(&mine).unwrap();
         std::fs::write(mine.join("notes"), "x").unwrap();
@@ -3232,11 +3235,11 @@ mod tests {
         let names =
             ["notes client.txt", "single'quote", "double\"quote", "back\\slash", "$literal", "brackets[1]", "café.png"];
         for name in names {
-            let path = t.0.join(name);
+            let path = t.dir.0.join(name);
             std::fs::write(&path, b"x").unwrap();
             assert_eq!(dropped_paths(&crate::shell::quote(path.to_str().unwrap())), Some(vec![path.clone()]));
         }
-        let path = t.0.join("notes client.txt");
+        let path = t.dir.0.join("notes client.txt");
         assert_eq!(dropped_paths(path.to_str().unwrap()), Some(vec![path.clone()]));
         let uri = format!("file://{}", path.display().to_string().replace(' ', "%20"));
         assert_eq!(dropped_paths(&uri), Some(vec![path.clone()]));
@@ -3253,16 +3256,16 @@ mod tests {
             format!("{uri}%00"),
             format!("{uri}?query"),
             format!("{uri}#fragment"),
-            format!("{}/$literal", t.0.display()),
-            format!("{}/brackets[1]", t.0.display()),
+            format!("{}/$literal", t.dir.0.display()),
+            format!("{}/brackets[1]", t.dir.0.display()),
             "/$(touch /tmp/no)".into(),
             "relative".into(),
             String::new(),
         ] {
             assert_eq!(dropped_paths(&text), None, "{text}");
         }
-        let a = t.0.join("a");
-        let b = t.0.join("b");
+        let a = t.dir.0.join("a");
+        let b = t.dir.0.join("b");
         std::fs::write(&a, b"a").unwrap();
         std::fs::write(&b, b"b").unwrap();
         let text = format!("{} {}", a.display(), b.display());
@@ -3272,11 +3275,11 @@ mod tests {
         assert_eq!(dropped_paths(&text), None);
         assert_eq!(dropped_paths(&format!("'{}' '{}'", a.display(), b.display())), Some(vec![a, b]));
         assert_eq!(dropped_paths(&format!("'{text}'")), Some(vec![raw]));
-        let c = t.0.join("c");
+        let c = t.dir.0.join("c");
         std::fs::write(&c, b"c").unwrap();
         assert_eq!(dropped_paths(&format!("{text} {}", c.display())), None);
         assert_eq!(dropped_paths(&format!("'{}' {text}", c.display())), None);
-        let backslash = t.0.join("back\\slash");
+        let backslash = t.dir.0.join("back\\slash");
         assert_eq!(dropped_paths(&format!("\"{}\"", backslash.display())), Some(vec![backslash]));
     }
 

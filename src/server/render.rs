@@ -2989,9 +2989,8 @@ mod tests {
 
         let (client, _peer) = super::super::tests::client(&mut server);
         let mut buf = Buffer::empty(Rect::new(0, 0, 124, 36));
-        let text = |buf: &Buffer| buf.content.iter().map(|cell| cell.symbol()).collect::<String>();
         server.compose(client, 1_300, &mut buf);
-        assert!(text(&buf).contains("Last checked 5m ago"));
+        assert!(crate::testing::buffer_text(&buf).contains("Last checked 5m ago"));
         server.next_render = None;
         server.clients.get_mut(&client).unwrap().dirty = super::super::Dirty::No;
 
@@ -3005,8 +3004,8 @@ mod tests {
         server.mark_dirty_client(client);
         assert!(server.next_render.is_some());
         server.compose(client, 1_360, &mut buf);
-        assert!(text(&buf).contains("Last checked 6m ago"));
-        assert!(!text(&buf).contains("Last checked 5m ago"));
+        assert!(crate::testing::buffer_text(&buf).contains("Last checked 6m ago"));
+        assert!(!crate::testing::buffer_text(&buf).contains("Last checked 5m ago"));
     }
 
     #[test]
