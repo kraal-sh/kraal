@@ -127,7 +127,7 @@ impl Server {
             return Mode::Normal;
         }
         if c.attachments.blocked.is_some() {
-            self.toast(id, "Press Ctrl+C to dismiss the attachment result before trying again.");
+            self.toast(id, "Close the attachment result before trying again.");
             return Mode::Normal;
         }
         if c.attachments.pending.is_some() {
@@ -157,7 +157,7 @@ impl Server {
             SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos(),
             self.alloc_id()
         );
-        let target = self.pane_label(pane);
+        let target = self.panes[&pane].display_name();
         self.clients.get_mut(&id).unwrap().attachments.pending = Some(Pending {
             token: token.clone(),
             from_paste: false,
@@ -183,11 +183,12 @@ impl Server {
         Mode::Normal
     }
 
-    fn request_attachment(&mut self, id: ClientId, token: String, text: Vec<u8>) {
+    fn request_attachment(&mut self, id: ClientId, token: String, text: Vec<u8>, image: bool) {
         if !attachments::token_valid(&token) || text.len() > 64 * 1024 {
             return;
         }
-        if !matches!(self.clients[&id].mode, Mode::Normal)
+        if !image
+            && !matches!(self.clients[&id].mode, Mode::Normal)
             && self.clients[&id].attachments.pending.is_none()
             && self.clients[&id].attachments.blocked.is_none()
         {
@@ -220,12 +221,11 @@ impl Server {
             return;
         }
         let pane = pane.unwrap();
-        let workspace = self.workspaces[self.ws_index(self.clients[&id].workspace).unwrap()].name.clone();
-        let target = format!("{workspace} / {}", self.pane_label(pane));
+        let target = self.panes[&pane].display_name();
         self.clients.get_mut(&id).unwrap().attachments.pending = Some(Pending {
             token: token.clone(),
-            from_paste: true,
-            image: false,
+            from_paste: !image,
+            image,
             pane,
             started: Instant::now(),
             batch: false,
@@ -279,7 +279,7 @@ impl Server {
             format!("Transfer interrupted: {error}. No paths or queued typing pasted.")
         } else {
             format!(
-                "Attachment stopped: {error}. No paths or queued typing pasted. Press Ctrl+C, then use {} to retry.",
+                "Attachment stopped: {error}. No paths or queued typing pasted. Close this result, then use {} to retry.",
                 if image { "Attach clipboard image" } else { "Attach files" }
             )
         };
@@ -291,13 +291,16 @@ impl Server {
         if !self.clients.get(&id).is_some_and(|c| c.attached && c.attachments.negotiated) {
             return;
         }
-        if matches!(msg, ClientMsg::AttachmentRequest { .. } | ClientMsg::AttachmentText { .. })
+        if matches!(msg, ClientMsg::AttachmentRequest { image: false, .. } | ClientMsg::AttachmentText { .. })
             && !self.clients[&id].attachments.recognition
         {
             return;
         }
-        if let ClientMsg::AttachmentRequest { token, text } = msg {
-            self.request_attachment(id, token, text);
+        if let ClientMsg::AttachmentRequest { token, text, image } = msg {
+            if image && !self.clients[&id].attachments.images {
+                return;
+            }
+            self.request_attachment(id, token, text, image);
             return;
         }
         let token = match &msg {
@@ -552,7 +555,9 @@ impl Server {
                 self.clients.get_mut(&id).unwrap().mode = mode;
                 self.record_attachment(id, &token, message);
                 self.send_msg(id, &ServerMsg::AttachmentResult { pasted: true, token, message: message.into() });
-                self.toast(id, message);
+                self.toast(id, if !same_focus && !pending.keys.is_empty() {
+                    "Attachment sent. Focus changed: queued typing discarded. Select the destination pane before typing."
+                } else if pending.image { "Image sent." } else { "Files sent." });
                 if same_focus {
                     self.client_input(id, &pending.keys);
                 }
@@ -707,10 +712,46 @@ mod tests {
     }
 
     #[test]
+    fn image_retry_reserves_its_kind_and_completes_locally() {
+        let (mut server, id, _peer, pane, rx) = setup("image-retry");
+        server.clients.get_mut(&id).unwrap().remote = false;
+        let request = || ClientMsg::AttachmentRequest { token: "ab".into(), text: Vec::new(), image: true };
+        server.attachment_message(id, request());
+        assert!(server.clients[&id].attachments.pending.is_none(), "images need their capability");
+        server.clients.get_mut(&id).unwrap().attachments.images = true;
+        server.offer_attachment(id, None, true);
+        let token = server.clients[&id].attachments.pending.as_ref().unwrap().token.clone();
+        server.expire_attachments(Instant::now() + attachments::TIMEOUT);
+        assert_eq!(server.clients[&id].attachments.blocked.as_ref(), Some(&token));
+        server.attachment_message(id, ClientMsg::AttachmentDismiss { token });
+        server.attachment_message(id, request());
+        let pending = server.clients[&id].attachments.pending.as_ref().unwrap();
+        assert!(pending.image);
+        assert_eq!(pending.pane, pane);
+        server.attachment_message(
+            id,
+            ClientMsg::AttachmentStart {
+                token: "ab".into(),
+                files: vec![FileSpec { name: "clipboard.png".into(), size: 3 }],
+            },
+        );
+        settle(&mut server, &rx);
+        assert!(server.clients[&id].attachments.pending.as_ref().unwrap().batch);
+        chunk(&mut server, id, "ab", &rx);
+        server.attachment_message(id, ClientMsg::AttachmentFinish { token: "ab".into() });
+        settle(&mut server, &rx);
+        assert!(server.clients[&id].attachments.pending.is_none());
+        assert!(server.clients[&id].attachments.blocked.is_none());
+        assert_eq!(server.clients[&id].toast.as_ref().unwrap().0, "Image sent.");
+        assert_eq!(std::fs::read(attachments::directory(&server.session).join("ab/0/clipboard.png")).unwrap(), b"abc");
+        attachments::remove(&server.session).unwrap();
+    }
+
+    #[test]
     fn pasted_path_reservation_needs_negotiation_and_text_keeps_the_original_target() {
         let (mut server, id, _peer, pane, _rx) = setup("pasted-text");
         let original = b"  '/laptop/notes client.txt'  \n";
-        let request = || ClientMsg::AttachmentRequest { token: "ab".into(), text: original.to_vec() };
+        let request = || ClientMsg::AttachmentRequest { token: "ab".into(), text: original.to_vec(), image: false };
         server.attachment_message(id, request());
         assert!(server.clients[&id].attachments.pending.is_none());
         server.clients.get_mut(&id).unwrap().attachments.recognition = true;
@@ -834,7 +875,10 @@ mod tests {
         server.clients.get_mut(&id).unwrap().attachments.recognition = true;
         server.clients.get_mut(&id).unwrap().mode =
             Mode::Prompt(super::super::ui::Prompt::new("Path", "", super::super::ui::PromptAction::OpenPreview));
-        server.attachment_message(id, ClientMsg::AttachmentRequest { token: "ab".into(), text: b"/laptop/a".to_vec() });
+        server.attachment_message(
+            id,
+            ClientMsg::AttachmentRequest { token: "ab".into(), text: b"/laptop/a".to_vec(), image: false },
+        );
         assert!(server.clients[&id].attachments.pending.is_none());
         assert!(matches!(&server.clients[&id].mode, Mode::Prompt(prompt) if prompt.value == "/laptop/a"));
     }
@@ -1019,6 +1063,9 @@ mod tests {
         settle(&mut server, &rx);
         assert!(attachments::result(&server.session, &token).unwrap().contains("reserved pane"));
         assert!(server.clients[&id].toast.as_ref().unwrap().0.contains("queued typing discarded"));
+        assert!(server.attachment_input(id, b"\x03"));
+        server.attachment_message(id, ClientMsg::AttachmentDismiss { token });
+        assert!(!server.attachment_input(id, b"\x03"));
         server.purge_attachments(id);
         settle(&mut server, &rx);
         assert!(!attachments::directory(&server.session).exists());

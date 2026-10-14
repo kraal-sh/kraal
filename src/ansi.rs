@@ -275,6 +275,23 @@ impl Encoder {
     }
 }
 
+/// Paint a client-owned box without clearing the screen or changing the pane's cursor.
+pub fn overlay(buf: &Buffer) -> Vec<u8> {
+    let mut out = b"\x1b[?2026h\x1b7\x1b[0m\x1b]8;;\x1b\\".to_vec();
+    let mut pen = Pen::RESET;
+    for y in buf.area.top()..buf.area.bottom() {
+        let _ = write!(out, "\x1b[{};{}H", y + 1, buf.area.x + 1);
+        let mut x = buf.area.x;
+        while x < buf.area.right() {
+            let cell = &buf[(x, y)];
+            write_style(&mut out, &mut pen, cell);
+            x += write_symbol(&mut out, cell).max(1);
+        }
+    }
+    out.extend_from_slice(b"\x1b[0m\x1b8\x1b[?2026l");
+    out
+}
+
 /// The ranges of cells (as indexes in the buffers' content) to compare: everything but the
 /// cells `kept`, in order. A run of kept cells is compared all the same when skipping it could
 /// change what the diff finds around it: when it starts within reach of a wide cell before it,

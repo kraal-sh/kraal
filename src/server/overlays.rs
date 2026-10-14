@@ -26,14 +26,14 @@ fn dim() -> Style {
 }
 
 /// A box centred in `screen`.
-pub(super) fn centered(screen: Rect, w: u16, h: u16) -> Rect {
+pub(crate) fn centered(screen: Rect, w: u16, h: u16) -> Rect {
     let w = w.min(screen.width);
     let h = h.min(screen.height);
     Rect::new(screen.x + (screen.width - w) / 2, screen.y + (screen.height - h) / 2, w, h)
 }
 
 /// Clear `area` and frame it with `title`; returns the inside.
-pub(super) fn frame(area: Rect, title: &str, color: Color, buf: &mut Buffer) -> Rect {
+pub(crate) fn frame(area: Rect, title: &str, color: Color, buf: &mut Buffer) -> Rect {
     Clear.render(area, buf);
     let title = truncate(title, area.width.saturating_sub(4) as usize);
     let block = Block::default()
@@ -60,7 +60,7 @@ pub(super) fn shown_key(k: &str) -> String {
         .replace('⌫', "bksp")
 }
 
-pub(super) fn key_line(keys: &[(&str, &str)], right: &str, width: u16) -> Line<'static> {
+pub(crate) fn key_line(keys: &[(&str, &str)], right: &str, width: u16) -> Line<'static> {
     let width = width as usize;
     let owned: Vec<(String, &str)> = keys.iter().map(|(k, w)| (shown_key(k), *w)).collect();
     let keys: Vec<(&str, &str)> = owned.iter().map(|(k, w)| (k.as_str(), *w)).collect();
@@ -763,7 +763,7 @@ pub(super) fn confirm_layout(q: &Question, screen: Rect) -> ConfirmLayout {
     ConfirmLayout { area, lines, body, max_scroll, more, cancel, ok }
 }
 
-pub(super) fn button_style(selected: bool, danger: bool) -> Style {
+pub(crate) fn button_style(selected: bool, danger: bool) -> Style {
     let color = if danger { th().production } else { th().accent };
     if selected {
         Style::default().fg(Color::Black).bg(color).add_modifier(Modifier::BOLD)
