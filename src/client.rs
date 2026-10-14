@@ -403,17 +403,30 @@ impl ServerInfo {
         self.features.as_ref().is_some_and(|list| list.iter().any(|f| f == feature.name))
     }
 
-    /// A downgraded server saves separately: restarting it cannot replace existing newer state.
+    /// A downgraded server saves separately: restarting it cannot replace newer state or undo Forget.
     pub fn check_restart(&self) -> Result<()> {
+        if self.has(protocol::STATE_V2) {
+            return Ok(());
+        }
         let (session, version) = (&self.session, &self.version);
         let saved = paths::session_state_path(session);
-        if !self.has(protocol::STATE_V2) && saved.try_exists()? {
+        if saved.try_exists()? {
             bail!(
                 "not restarting session {session}: newer saved state already exists in {}; \
                  restarting kraal {version} would restore that state instead of this running session's layout and scrollback. \
                  Keep any changes you need before stopping it with `kraal -s {session} kill`; \
                  starting it on this kraal then restores the newer saved state",
                 saved.display()
+            );
+        }
+        let marker = saved.with_extension("forgotten");
+        if marker.try_exists()? {
+            bail!(
+                "not restarting session {session}: its legacy state was forgotten, as recorded in {}; \
+                 restarting kraal {version} would start an empty session instead of this running session's layout and scrollback. \
+                 Keep any changes you need before stopping it with `kraal -s {session} kill`; \
+                 to import the legacy state, remove that marker after stopping it and before starting it on this kraal",
+                marker.display()
             );
         }
         Ok(())
@@ -1691,6 +1704,32 @@ mod tests {
         drop(typing);
         reader.join().unwrap();
         drop(keyboard_end);
+    }
+
+    #[test]
+    fn a_legacy_server_cannot_restart_after_forget() {
+        let mut server = ServerInfo {
+            pid: 1,
+            session: format!("restart-forgotten-{}", crate::accounts::new_uuid()),
+            version: protocol::KRAAL_VERSION.into(),
+            features: None,
+        };
+        let marker = paths::session_state_path(&server.session).with_extension("forgotten");
+        paths::ensure_private_dir(marker.parent().unwrap()).unwrap();
+        paths::write_private(&marker, b"").unwrap();
+        for features in [None, Some(vec![protocol::BUFFERS.name.into()])] {
+            server.features = features;
+            let err = server.check_restart().unwrap_err().to_string();
+            assert!(err.contains("was forgotten") && err.contains(&*marker.to_string_lossy()), "{err}");
+            assert!(err.contains("instead of this running session's layout and scrollback"), "{err}");
+            assert!(err.contains("remove") && err.contains("import the legacy state"), "{err}");
+        }
+        server.features = Some(protocol::feature_names());
+        assert!(server.check_restart().is_ok(), "this format can save and restart after Forget");
+        assert_eq!(std::fs::read(&marker).unwrap(), b"");
+        std::fs::remove_file(marker).unwrap();
+        server.features = None;
+        assert!(server.check_restart().is_ok(), "removing the marker allows migration again");
     }
 
     #[test]

@@ -26,10 +26,13 @@ fn convert_from(
         .context("no state directory")?
         .join("scrollback")
         .join(path.file_stem().unwrap());
-    let backup = backup_state(path, data, snap, &old_scrollback)?;
     for file in scrollback_files(snap).into_iter().filter(|f| scrollback_name(f)) {
-        let source = backup.join("scrollback").join(file);
-        let Some(bytes) = read_state(&source)? else { continue };
+        let source = old_scrollback.join(file);
+        let bytes = match paths::read_regular(&source, crate::pane::MAX_SAVED_BYTES as u64) {
+            Ok(bytes) => bytes,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(e).context("reading saved scrollback before migration"),
+        };
         durable_dir(scrollback)?;
         copy_scrollback(&source, &scrollback.join(file), &bytes)?;
     }
@@ -38,8 +41,9 @@ fn convert_from(
     }
     anyhow::ensure!(paths::read_regular(path, u64::MAX)? == data, "state changed during migration; retry");
     durable_dir(to.parent().context("no directory for the state")?)?;
-    paths::write_private(to, updated)
-        .with_context(|| format!("migrating {}; the original is also in {}", path.display(), backup.display()))?;
+    paths::write_private(to, updated).with_context(|| {
+        format!("migrating {}; the original is unchanged; fix the destination and retry", path.display())
+    })?;
     sync_directory(to.parent().unwrap())?;
     Ok(())
 }
@@ -90,32 +94,6 @@ fn copy_scrollback(from: &Path, to: &Path, bytes: &[u8]) -> Result<()> {
     file.set_modified(modified)?;
     file.sync_all()?;
     Ok(())
-}
-
-fn backup_state(path: &Path, data: &[u8], snap: &SessionSnapshot, scrollback: &Path) -> Result<PathBuf> {
-    use std::os::unix::fs::DirBuilderExt;
-    let backup = path.with_extension(format!("json.before-0.4-{}", crate::accounts::new_uuid()));
-    std::fs::DirBuilder::new()
-        .mode(0o700)
-        .create(&backup)
-        .with_context(|| format!("creating migration backup {}", backup.display()))?;
-    paths::sync_dir(path.parent().context("no directory for the state")?);
-    // The live scrollback is overwritten and pruned later, so the rollback copy must own its bytes.
-    for file in scrollback_files(snap).into_iter().filter(|f| scrollback_name(f)) {
-        let bytes = match paths::read_regular(&scrollback.join(file), crate::pane::MAX_SAVED_BYTES as u64) {
-            Ok(bytes) => bytes,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(e) => return Err(e).context("backing up saved scrollback before migration"),
-        };
-        let dir = backup.join("scrollback");
-        durable_dir(&dir)?;
-        copy_scrollback(&scrollback.join(file), &dir.join(file), &bytes)?;
-        paths::sync_dir(&dir);
-    }
-    // Written last: a backup without state.json was interrupted and cannot be used for rollback.
-    paths::write_private(&backup.join("state.json"), data)?;
-    paths::sync_dir(&backup);
-    Ok(backup)
 }
 
 /// Closed sessions still carry old names until their next restore. Bind them while the
@@ -289,15 +267,6 @@ mod tests {
         (path, source)
     }
 
-    fn backups(dir: &Path) -> Vec<PathBuf> {
-        std::fs::read_dir(dir.join("sessions"))
-            .unwrap()
-            .flatten()
-            .map(|e| e.path())
-            .filter(|p| p.file_name().unwrap().to_string_lossy().starts_with("main.json.before-0.4-"))
-            .collect()
-    }
-
     #[test]
     fn inspecting_a_stopped_session_does_not_migrate_or_invent_identities() {
         let session = format!("inspect-{}", crate::accounts::new_uuid());
@@ -310,12 +279,6 @@ mod tests {
         assert!(snap.workspaces[0].id.is_empty());
         assert_eq!(std::fs::read(&path).unwrap(), source);
         assert!(!paths::session_state_path(&session).exists());
-        assert!(
-            !std::fs::read_dir(path.parent().unwrap())
-                .unwrap()
-                .flatten()
-                .any(|e| e.file_name().to_string_lossy().starts_with(&format!("{session}.json.before-")))
-        );
         std::fs::remove_file(path).unwrap();
     }
 
@@ -399,7 +362,6 @@ mod tests {
             assert_eq!(updated, serde_json::to_vec_pretty(&expected).unwrap(), "only account bindings change");
             assert!(bind_saved_accounts(&updated, &accounts).unwrap().is_none(), "identities are never rebound");
             assert_eq!(std::fs::read(&path).unwrap(), original);
-            assert_eq!(std::fs::read(backups(&dir)[0].join("state.json")).unwrap(), original);
             std::fs::remove_dir_all(dir).unwrap();
         }
     }
@@ -439,7 +401,7 @@ mod tests {
                 assert_eq!(error.to_string(), "unsupported state revision 2; use a newer kraal");
                 assert_eq!(std::fs::read(&path).unwrap(), bytes);
                 assert_eq!(std::fs::read_to_string(&scrollback).unwrap(), "original text");
-                assert!(backups(&dir).is_empty());
+                assert_eq!(std::fs::read_dir(dir.join("sessions")).unwrap().count(), 1);
                 assert!(!dir.join("sessions-v2").exists());
                 assert!(!dir.join("scrollback-v2").exists());
             }
@@ -450,7 +412,7 @@ mod tests {
     #[test]
     fn migration_is_private_complete_once_and_independent_of_older_writers() {
         use std::os::unix::fs::PermissionsExt;
-        let dir = directory("backup");
+        let dir = directory("migration");
         let (path, source) = source_in(&dir);
         let scrollback = dir.join("scrollback/main");
         std::fs::create_dir_all(&scrollback).unwrap();
@@ -458,29 +420,155 @@ mod tests {
         let modified = std::time::UNIX_EPOCH + std::time::Duration::new(1_600_000_000, 123_456_789);
         std::fs::File::open(scrollback.join("1-2-3.ans")).unwrap().set_modified(modified).unwrap();
         let loaded = load_from(&dir).unwrap().unwrap();
-        let backup = backups(&dir).pop().unwrap();
-        for file in [
-            scrollback.join("1-2-3.ans"),
-            backup.join("scrollback/1-2-3.ans"),
-            dir.join("scrollback-v2/main/1-2-3.ans"),
-        ] {
+        for file in [scrollback.join("1-2-3.ans"), dir.join("scrollback-v2/main/1-2-3.ans")] {
             assert_eq!(std::fs::metadata(&file).unwrap().modified().unwrap(), modified, "{}", file.display());
         }
-        assert_eq!(std::fs::metadata(&backup).unwrap().permissions().mode() & 0o777, 0o700);
-        assert_eq!(std::fs::metadata(backup.join("state.json")).unwrap().permissions().mode() & 0o777, 0o600);
-        assert_eq!(std::fs::read(backup.join("state.json")).unwrap(), source);
         assert_eq!(std::fs::read(&path).unwrap(), source);
         assert_eq!(std::fs::read_to_string(scrollback.join("1-2-3.ans")).unwrap(), "original text");
         let current = dir.join("sessions-v2/main.json");
         assert_eq!(std::fs::metadata(&current).unwrap().permissions().mode() & 0o777, 0o600);
+        assert_eq!(std::fs::metadata(current.parent().unwrap()).unwrap().permissions().mode() & 0o777, 0o700);
+        let copied = dir.join("scrollback-v2/main/1-2-3.ans");
+        assert_eq!(std::fs::metadata(&copied).unwrap().permissions().mode() & 0o777, 0o600);
+        assert_eq!(std::fs::metadata(copied.parent().unwrap()).unwrap().permissions().mode() & 0o777, 0o700);
         let bytes = std::fs::read(&current).unwrap();
         std::fs::write(&path, b"old writer changed this").unwrap();
         std::fs::remove_dir_all(scrollback).unwrap();
         assert_eq!(load_from(&dir).unwrap().unwrap().workspaces[0].id, loaded.workspaces[0].id);
-        assert_eq!(backups(&dir).len(), 1);
+        assert_eq!(std::fs::read_dir(dir.join("sessions")).unwrap().count(), 1);
         assert_eq!(std::fs::read(&current).unwrap(), bytes);
         assert_eq!(std::fs::read_to_string(dir.join("scrollback-v2/main/1-2-3.ans")).unwrap(), "original text");
-        assert_eq!(std::fs::read_to_string(backup.join("scrollback/1-2-3.ans")).unwrap(), "original text");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn forgetting_current_or_unconverted_state_preserves_legacy_files_and_prevents_reimport() {
+        for converted in [false, true] {
+            let dir = directory("forget");
+            let (legacy, original) = source_in(&dir);
+            let scrollback = dir.join("scrollback/main/1-2-3.ans");
+            std::fs::create_dir_all(scrollback.parent().unwrap()).unwrap();
+            std::fs::write(&scrollback, b"original output\0\xff").unwrap();
+            let current = dir.join("sessions-v2/main.json");
+            if converted {
+                load_from(&dir).unwrap().unwrap();
+            }
+            assert!(forget_from(&current, &legacy).unwrap());
+            assert!(!current.exists());
+            assert!(current.with_extension("forgotten").is_file());
+            for convert in [false, true] {
+                assert!(read_from(&current, &legacy, &dir.join("scrollback-v2/main"), convert).unwrap().is_none());
+            }
+            assert!(!forget_from(&current, &legacy).unwrap());
+            assert_eq!(std::fs::read(&legacy).unwrap(), original);
+            assert_eq!(std::fs::read(&scrollback).unwrap(), b"original output\0\xff");
+            assert_eq!(std::fs::read_dir(dir.join("sessions")).unwrap().count(), 1);
+            // A later save takes precedence over the marker, including after another Forget.
+            let (_, updated) = migrate(&original).unwrap();
+            paths::write_private(&current, &updated).unwrap();
+            assert!(load_from(&dir).unwrap().is_some());
+            assert!(forget_from(&current, &legacy).unwrap());
+            assert!(load_from(&dir).unwrap().is_none());
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn forgetting_a_dangling_legacy_symlink_prevents_reimport_when_its_target_returns() {
+        let dir = directory("forget-dangling-link");
+        let (legacy, original) = source_in(&dir);
+        let target = dir.join("missing.json");
+        std::fs::remove_file(&legacy).unwrap();
+        std::os::unix::fs::symlink(&target, &legacy).unwrap();
+        let current = dir.join("sessions-v2/main.json");
+        assert!(load_from(&dir).is_err());
+        assert!(forget_from(&current, &legacy).unwrap());
+        assert!(current.with_extension("forgotten").is_file());
+        assert!(!target.exists());
+        for returned in [false, true] {
+            if returned {
+                std::fs::write(&target, &original).unwrap();
+            }
+            for convert in [false, true] {
+                assert!(read_from(&current, &legacy, &dir.join("scrollback-v2/main"), convert).unwrap().is_none());
+            }
+            assert_eq!(std::fs::read_link(&legacy).unwrap(), target);
+            assert!(!current.exists());
+            assert!(!dir.join("scrollback-v2").exists());
+            assert!(!forget_from(&current, &legacy).unwrap());
+        }
+        assert_eq!(std::fs::read(&target).unwrap(), original);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn forgetting_without_legacy_state_removes_current_state_without_a_marker() {
+        let dir = directory("forget-current");
+        let legacy = dir.join("sessions/main.json");
+        let current = dir.join("sessions-v2/main.json");
+        assert!(!forget_from(&current, &legacy).unwrap());
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
+        std::fs::create_dir(current.parent().unwrap()).unwrap();
+        let (_, updated) = migrate(&serde_json::to_vec(&legacy_state()).unwrap()).unwrap();
+        paths::write_private(&current, &updated).unwrap();
+        assert!(forget_from(&current, &legacy).unwrap());
+        assert!(!current.exists());
+        assert!(!current.with_extension("forgotten").exists());
+        assert!(!forget_from(&current, &legacy).unwrap());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_failed_forget_marker_keeps_current_and_legacy_state_for_retry() {
+        let dir = directory("forget-failure");
+        let (legacy, original) = source_in(&dir);
+        load_from(&dir).unwrap().unwrap();
+        let current = dir.join("sessions-v2/main.json");
+        let saved = std::fs::read(&current).unwrap();
+        let parent = current.parent().unwrap();
+        let aside = dir.join("current");
+        std::fs::rename(parent, &aside).unwrap();
+        std::fs::write(parent, "not a directory").unwrap();
+        assert!(forget_from(&current, &legacy).is_err());
+        assert_eq!(std::fs::read(&legacy).unwrap(), original);
+        assert_eq!(std::fs::read(aside.join("main.json")).unwrap(), saved);
+        std::fs::remove_file(parent).unwrap();
+        std::fs::rename(aside, parent).unwrap();
+        assert!(forget_from(&current, &legacy).unwrap());
+        assert!(load_from(&dir).unwrap().is_none());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn migration_needs_no_writable_legacy_directory_and_retries_a_failed_destination() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = directory("read-only-legacy");
+        let (legacy, original) = source_in(&dir);
+        let old_scrollback = dir.join("scrollback/main");
+        std::fs::create_dir_all(&old_scrollback).unwrap();
+        let output = old_scrollback.join("1-2-3.ans");
+        std::fs::write(&output, b"original output").unwrap();
+        for file in [&legacy, &output] {
+            std::fs::set_permissions(file, std::fs::Permissions::from_mode(0o400)).unwrap();
+        }
+        for dir in [legacy.parent().unwrap(), old_scrollback.as_path()] {
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+        }
+        let destination = dir.join("scrollback-v2/main/1-2-3.ans");
+        std::fs::create_dir_all(&destination).unwrap();
+        assert!(load_from(&dir).is_err());
+        assert!(!dir.join("sessions-v2/main.json").exists());
+        assert_eq!(std::fs::read(&legacy).unwrap(), original);
+        assert_eq!(std::fs::read(&output).unwrap(), b"original output");
+        std::fs::remove_dir(&destination).unwrap();
+        assert!(load_from(&dir).unwrap().is_some());
+        assert_eq!(std::fs::read(&destination).unwrap(), b"original output");
+        assert_eq!(std::fs::read(&legacy).unwrap(), original);
+        assert_eq!(std::fs::read(&output).unwrap(), b"original output");
+        assert_eq!(std::fs::read_dir(legacy.parent().unwrap()).unwrap().count(), 1);
+        for dir in [legacy.parent().unwrap(), old_scrollback.as_path()] {
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -495,14 +583,14 @@ mod tests {
             assert!(load_from(&dir).is_err());
             assert_eq!(std::fs::read_to_string(&current).unwrap(), bytes);
             assert_eq!(std::fs::read(&legacy).unwrap(), original);
-            assert_eq!(backups(&dir).len(), 1);
+            assert_eq!(std::fs::read_dir(dir.join("sessions")).unwrap().count(), 1);
         }
         std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
-    fn a_failed_backup_leaves_the_state_unchanged_and_can_be_retried() {
-        let dir = directory("failed-backup");
+    fn unreadable_scrollback_leaves_the_state_unchanged_and_can_be_retried() {
+        let dir = directory("unreadable-scrollback");
         let (path, source) = source_in(&dir);
         let scrollback = dir.join("scrollback/main/1-2-3.ans");
         std::fs::create_dir_all(&scrollback).unwrap();
@@ -535,7 +623,7 @@ mod tests {
             std::fs::write(&path, &source).unwrap();
             assert!(load_from(&dir).is_err());
             assert_eq!(std::fs::read(&path).unwrap(), source);
-            assert!(backups(&dir).is_empty());
+            assert_eq!(std::fs::read_dir(dir.join("sessions")).unwrap().count(), 1);
         }
         std::fs::remove_file(&path).unwrap();
         assert!(load_from(&dir).unwrap().is_none());

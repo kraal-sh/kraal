@@ -603,6 +603,41 @@ fn made_by_kraal(name: &str) -> bool {
     }
 }
 
+/// Forget current state without allowing the untouched legacy session to return.
+pub fn forget(session: &str) -> Result<bool> {
+    forget_from(&paths::session_state_path(session), &paths::legacy_session_state_path(session)).with_context(|| {
+        format!("could not finish forgetting session {session}; fix the state directory and retry `kraal -s {session} forget`")
+    })
+}
+
+fn forget_from(path: &Path, legacy: &Path) -> Result<bool> {
+    let marker = path.with_extension("forgotten");
+    let legacy_exists = match std::fs::symlink_metadata(legacy) {
+        Ok(_) => true,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+        Err(e) => return Err(e.into()),
+    };
+    let newly_forgotten = legacy_exists && !marker.try_exists()?;
+    if legacy_exists {
+        // Record this before removing current state, so an interrupted Forget cannot reimport it.
+        let dir = path.parent().context("no directory for the state")?;
+        durable_dir(dir)?;
+        if newly_forgotten {
+            paths::write_private(&marker, b"")?;
+        }
+        sync_directory(dir)?;
+    }
+    paths::remove_abandoned_temps(path)?;
+    match std::fs::remove_file(path) {
+        Ok(()) => {
+            sync_directory(path.parent().unwrap())?;
+            Ok(true)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(newly_forgotten),
+        Err(e) => Err(e.into()),
+    }
+}
+
 /// Delete all that is saved of the panes' scrollback of `session`. Whether there was any.
 pub fn forget_scrollback(session: &str) -> std::io::Result<bool> {
     match std::fs::remove_dir_all(paths::scrollback_dir(session)) {
@@ -619,7 +654,7 @@ fn scrollback_name(file: &str) -> bool {
         && file.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
 }
 
-/// Inspect a stopped session without converting its state or creating migration backups.
+/// Inspect a stopped session without converting its state.
 pub fn inspect(session: &str) -> Result<Option<SessionSnapshot>> {
     read_session(session, false)
 }
@@ -642,6 +677,9 @@ fn read_session(session: &str, convert: bool) -> Result<Option<SessionSnapshot>>
 fn read_from(path: &Path, legacy: &Path, scrollback: &Path, convert: bool) -> Result<Option<SessionSnapshot>> {
     if let Some(data) = read_state(path)? {
         return parse(&data).map(Some).with_context(|| format!("parsing {}", path.display()));
+    }
+    if path.with_extension("forgotten").try_exists()? {
+        return Ok(None);
     }
     let Some(data) = read_state(legacy)? else { return Ok(None) };
     let version = state_version(&data)?;
@@ -1207,7 +1245,7 @@ mod tests {
                 .filter(|entry| entry.as_ref().unwrap().file_name().to_string_lossy().starts_with(&session))
                 .count(),
             1,
-            "refused state creates no migration backup"
+            "refused state creates no other files"
         );
         std::fs::remove_file(path).unwrap();
     }

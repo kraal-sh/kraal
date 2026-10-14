@@ -1235,6 +1235,10 @@ fn saved_sessions_in(state: &Path) -> std::io::Result<std::collections::BTreeSet
             if path.extension().is_some_and(|e| e == "json")
                 && let Some(name) = path.file_stem().and_then(|s| s.to_str()).filter(|s| valid_session_name(s))
             {
+                let current = state.join("sessions-v2").join(format!("{name}.json"));
+                if dir == "sessions" && !current.try_exists()? && current.with_extension("forgotten").try_exists()? {
+                    continue;
+                }
                 names.insert(name.to_string());
             }
         }
@@ -1397,6 +1401,25 @@ mod tests {
         assert_ne!(scrollback_dir(&session), state_dir().join("scrollback").join(&session));
         std::fs::remove_file(current).unwrap();
         std::fs::remove_file(legacy).unwrap();
+    }
+
+    #[test]
+    fn forgotten_sessions_stay_unlisted_until_current_state_is_saved_again() {
+        let root = std::env::temp_dir().join(format!("kraal-forgotten-{}", crate::accounts::new_uuid()));
+        let current = root.join("sessions-v2/main.json");
+        let legacy = root.join("sessions/main.json");
+        for path in [&current, &legacy] {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, "{}").unwrap();
+        }
+        std::fs::write(current.with_extension("forgotten"), "").unwrap();
+        assert!(saved_sessions_in(&root).unwrap().contains("main"));
+        std::fs::remove_file(&current).unwrap();
+        assert!(saved_sessions_in(&root).unwrap().is_empty());
+        std::fs::write(&current, "{}").unwrap();
+        assert!(saved_sessions_in(&root).unwrap().contains("main"));
+        assert_eq!(std::fs::read_to_string(&legacy).unwrap(), "{}");
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

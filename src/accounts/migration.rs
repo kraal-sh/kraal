@@ -2,7 +2,7 @@
 //!
 //! In 0.5.0 remove this module and its hooks (legacy ID synthesis, empty TOML sections, backups,
 //! usage copying and fallback reads, and `before_account_change`), `persist::migration`
-//! (legacy session conversion, backups and saved reference rewriting), `workspace::migration`
+//! (legacy session conversion and saved reference rewriting), `workspace::migration`
 //! (external KDL binding), and their migration tests. Keep ordinary account resolution,
 //! retained references and homes, `WorkspaceSnap::bind_accounts`, and
 //! `workspace::bind_source_accounts`: current operations still use them.
