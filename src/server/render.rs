@@ -3061,6 +3061,8 @@ mod tests {
                 ToastAction::UndoAccount,
                 ToastAction::ChangeAccount,
                 ToastAction::RestoreWorkspace("saved-workspace".into()),
+                ToastAction::ReviewWorkspace(1),
+                ToastAction::UndoLayout(1),
             ] {
                 for kind in [NoticeKind::Notice, NoticeKind::Warning, NoticeKind::Error] {
                     server.notify_action(kind, &"A long account name ".repeat(8), 7, action.clone());
