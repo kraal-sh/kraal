@@ -172,6 +172,7 @@ impl Server {
             Mode::Prompt(p) => self.on_prompt(id, p, ev),
             Mode::AccountForm(form) => self.on_account_form(id, form, ev),
             Mode::PaneForm(form) => self.on_pane_form(id, *form, ev),
+            Mode::TunnelDetails(details) => self.on_tunnel_details(id, details, ev),
             Mode::AccountDetails(details) => self.on_account_details(id, details, ev),
             Mode::Help { scroll } => {
                 let lines = self.help_lines().len();

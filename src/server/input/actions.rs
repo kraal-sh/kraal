@@ -25,6 +25,7 @@ impl Server {
 
     pub(super) fn action(&mut self, id: ClientId, action: Action) -> Mode {
         match action {
+            Action::Tunnels => return Mode::Picker(self.tunnel_picker()),
             Action::AddServer => return Mode::Prompt(self.add_server_form(None, None)),
             Action::NewWorkspace => return Mode::Prompt(self.add_workspace_form(id, None)),
             Action::WorkspacePicker => {
@@ -390,7 +391,8 @@ impl Server {
                 }
                 return Mode::Resize;
             }
-            Action::AddServer
+            Action::Tunnels
+            | Action::AddServer
             | Action::NewWorkspace
             | Action::WorkspacePicker
             | Action::PanePicker

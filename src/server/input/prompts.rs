@@ -11,6 +11,9 @@ use crate::server::{ClientId, Server};
 
 impl Server {
     pub(super) fn on_prompt(&mut self, id: ClientId, mut p: Prompt, ev: InputEvent) -> Mode {
+        if p.tunnel_form.is_some() {
+            return self.on_tunnel_form(id, p, ev);
+        }
         if p.server_form.is_some() {
             return self.on_server_form(id, p, ev);
         }
@@ -67,6 +70,9 @@ impl Server {
 
     pub(super) fn submit_prompt(&mut self, id: ClientId, mut p: Prompt) -> Mode {
         p.scroll = 0;
+        if p.tunnel_form.is_some() {
+            return self.submit_tunnel_form(p);
+        }
         if p.server_form.is_some() {
             return self.submit_server_form(id, p);
         }
@@ -95,6 +101,7 @@ impl Server {
                 masked,
                 workspace_form: None,
                 server_form: None,
+                tunnel_form: None,
             }),
         }
     }
@@ -127,6 +134,7 @@ impl Server {
             }
             PromptAction::RenameWorkspace(_)
             | PromptAction::DuplicateWorkspace(_)
+            | PromptAction::AddTunnel
             | PromptAction::AddServer
             | PromptAction::NewWorkspace
             | PromptAction::RestoreWorkspace(_)
@@ -197,10 +205,6 @@ impl Server {
                 }
             }
             PromptAction::Commit { pane } => self.commit_worktree(id, pane, &value),
-            PromptAction::Tunnel { server } => match self.add_tunnel(&server, &value, None) {
-                Ok(t) => self.toast(id, format!("tunnel {}", t.spec.describe())),
-                Err(e) => return Err((PromptAction::Tunnel { server }, format!("{e:#}"))),
-            },
             PromptAction::RunOn { targets } => {
                 if value.is_empty() {
                     return Err((PromptAction::RunOn { targets }, "Type the command to run.".into()));

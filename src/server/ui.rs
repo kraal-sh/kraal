@@ -25,6 +25,7 @@ pub enum Mode {
     AccountForm(super::account_ui::AccountForm),
     PaneForm(Box<super::pane_ui::PaneForm>),
     AccountDetails(super::account_ui::AccountDetails),
+    TunnelDetails(super::tunnel_ui::TunnelDetails),
     Help {
         scroll: u16,
     },
@@ -76,6 +77,7 @@ impl Mode {
             Mode::Picker(_) => "CHOOSE",
             Mode::Prompt(_) | Mode::AccountForm(_) | Mode::PaneForm(_) => "INPUT",
             Mode::AccountDetails(_) => "ACCOUNT",
+            Mode::TunnelDetails(_) => "TUNNEL",
             Mode::Help { .. } => "HELP",
             Mode::Messages { .. } => "MESSAGES",
             Mode::Confirm(_) => "CONFIRM",
@@ -279,6 +281,7 @@ pub enum PickerKind {
     Workspace,
     DeletedWorkspaces,
     Ssh,
+    Tunnels,
     Pane,
     Agent,
     AccountReview,
@@ -321,6 +324,11 @@ pub enum PickAction {
     UnavailableDefinition(std::path::PathBuf),
     AddWorkspace,
     AddServer(Option<Box<crate::servers::Server>>),
+    AddTunnel,
+    Tunnel {
+        id: u32,
+        retry: bool,
+    },
     /// A server name or `user@host[:port]`.
     Ssh(String),
     SshGroup(String),
@@ -483,7 +491,13 @@ impl Picker {
             min_items: items.len(),
             two_line: matches!(kind, PickerKind::Accounts | PickerKind::Workspace | PickerKind::DeletedWorkspaces),
             pinned: items.iter().position(|i| {
-                matches!(i.action, PickAction::AddAccount | PickAction::AddWorkspace | PickAction::AddServer(None))
+                matches!(
+                    i.action,
+                    PickAction::AddAccount
+                        | PickAction::AddWorkspace
+                        | PickAction::AddServer(None)
+                        | PickAction::AddTunnel
+                )
             }),
             items,
             filtered: Vec::new(),
@@ -538,7 +552,13 @@ impl Picker {
             self.layout_undos = state.layout_undos;
             self.items = items;
             self.pinned = self.items.iter().position(|i| {
-                matches!(i.action, PickAction::AddAccount | PickAction::AddWorkspace | PickAction::AddServer(None))
+                matches!(
+                    i.action,
+                    PickAction::AddAccount
+                        | PickAction::AddWorkspace
+                        | PickAction::AddServer(None)
+                        | PickAction::AddTunnel
+                )
             });
             self.actions = Some(at);
         }
@@ -574,7 +594,7 @@ impl Picker {
                 ("ctrl+t", "Connect in a new tab"),
                 ("ctrl+f", "Browse its files"),
                 ("ctrl+r", "Run a command on it"),
-                ("ctrl+o", "Forward one of its ports"),
+                ("ctrl+o", "Add tunnel"),
                 ("ctrl+e", "Edit saved servers"),
                 ("ctrl+x", "Remove saved server"),
             ],
@@ -613,7 +633,9 @@ impl Picker {
             (_, A::OpenDefinition(_)) => &[("enter", "Open"), ("", "Delete")],
             (_, A::DeletedWorkspaces) => &[("enter", "View")],
             (_, A::RestoreWorkspace(_)) => &[("enter", "Restore")],
-            (_, A::AddWorkspace | A::AddServer(_)) => &[("enter", "Add")],
+            (_, A::Tunnel { retry: true, .. }) => &[("enter", "Details"), ("ctrl+r", "Retry now"), ("ctrl+x", "Stop")],
+            (_, A::Tunnel { .. }) => &[("enter", "Details"), ("ctrl+x", "Stop")],
+            (_, A::AddWorkspace | A::AddServer(_) | A::AddTunnel) => &[("enter", "Add")],
             (K::Runbook, A::Runbook(_)) => &[("enter", "Run"), ("ctrl+e", "Edit")],
             (K::RunbookSteps, A::RunBlock(_)) => &[("enter", "Run step"), ("ctrl+y", "Copy step")],
             (_, A::RunbookList) => &[("enter", "Back to runbooks")],
@@ -762,10 +784,7 @@ pub enum PromptAction {
     RunOn {
         targets: Vec<String>,
     },
-    /// The value is `[host:]port` to forward from this server.
-    Tunnel {
-        server: String,
-    },
+    AddTunnel,
     /// The value of the runbook parameter being asked.
     RunbookValue,
 }
@@ -783,13 +802,12 @@ impl PromptAction {
             PromptAction::DuplicateWorkspace(_) => "duplicate",
             PromptAction::OpenPreview => "open",
             PromptAction::ExportWorkspace(_) => "export",
-            PromptAction::ImportWorkspace | PromptAction::AddServer => "add",
+            PromptAction::ImportWorkspace | PromptAction::AddServer | PromptAction::AddTunnel => "add",
             PromptAction::ReviewWorkspace(_) => "review",
             PromptAction::Upload { .. } | PromptAction::UploadPick { .. } => "upload",
             PromptAction::Download => "download",
             PromptAction::Commit { .. } => "commit",
             PromptAction::RunOn { .. } => "run",
-            PromptAction::Tunnel { .. } => "forward",
             PromptAction::RunbookValue => "next",
         }
     }
@@ -806,6 +824,7 @@ pub struct Prompt {
     pub scroll: usize,
     /// What is typed is not shown (a secret).
     pub masked: bool,
+    pub tunnel_form: Option<Box<super::tunnel_ui::TunnelForm>>,
     pub server_form: Option<Box<super::server_ui::ServerForm>>,
     pub workspace_form: Option<Box<super::workspace_ui::WorkspaceForm>>,
 }
@@ -816,6 +835,8 @@ impl Prompt {
             title: title.into(),
             value: value.into(),
             cursor: value.chars().count(),
+            tunnel_form: matches!(action, PromptAction::AddTunnel)
+                .then(|| Box::new(super::tunnel_ui::TunnelForm::default())),
             server_form: matches!(action, PromptAction::AddServer)
                 .then(|| Box::new(super::server_ui::ServerForm::default())),
             workspace_form: matches!(

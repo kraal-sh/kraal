@@ -212,13 +212,14 @@ impl Server {
                         PromptAction::RunOn { targets: vec![target] },
                     ));
                 }
+                (KeyCode::Char('r' | 'x'), true) if p.kind == PickerKind::Tunnels => {
+                    if let Some(PickAction::Tunnel { id: tunnel, .. }) = p.current().map(|i| &i.action) {
+                        return self.tunnel_action(*tunnel, k.code == KeyCode::Char('r'), Some(p.state()));
+                    }
+                }
                 (KeyCode::Char('o'), true) if p.kind == PickerKind::Ssh => {
                     if let Some(PickAction::Ssh(name)) = p.current().map(|i| i.action.clone()) {
-                        return Mode::Prompt(Prompt::new(
-                            &format!("Forward from {name}: [host:]port (e.g. 5432, or db.internal:5432)"),
-                            "",
-                            PromptAction::Tunnel { server: name },
-                        ));
+                        return Mode::Prompt(self.add_tunnel_form(Some(&p), &name));
                     }
                 }
                 (KeyCode::Char('e'), true) if p.kind == PickerKind::Runbook => {
@@ -376,6 +377,8 @@ impl Server {
             PickAction::AddWorkspace => {
                 return Mode::Prompt(self.add_workspace_form(id, Some(p)));
             }
+            PickAction::AddTunnel => return Mode::Prompt(self.add_tunnel_form(Some(p), "")),
+            PickAction::Tunnel { id, .. } => return self.tunnel_details(id, Some(p.state())),
             PickAction::AddServer(server) => {
                 return Mode::Prompt(self.add_server_form(Some(p), server.as_deref()));
             }

@@ -100,15 +100,12 @@ impl Server {
                         );
                         return Some(self.pick(id, &picker, item));
                     }
-                    // A dev server or a tunnel: open it in the browser with ctrl, else copy its address.
-                    Some(SideItem::Port(port)) | Some(SideItem::Tunnel(port)) => {
-                        let addr = format!("localhost:{port}");
-                        if m.mods.ctrl || matches!(self.sidebar_hit(id, m.row), Some(SideItem::Port(_))) {
-                            self.open_for(id, &format!("http://{addr}"));
-                        } else {
-                            self.copy_to_client(id, &addr);
+                    Some(SideItem::Tunnel(port)) => {
+                        if let Some(tunnel) = self.tunnels.iter().find(|t| t.spec.local == port) {
+                            return Some(self.tunnel_details(tunnel.id, None));
                         }
                     }
+                    Some(SideItem::Port(port)) => self.open_for(id, &format!("http://localhost:{port}")),
                     None => {}
                 }
             }

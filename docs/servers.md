@@ -70,7 +70,7 @@ is already running lets that save finish and reports its result.
 
 On a server row, Enter connects (or opens a whole group); Tab shows the other
 actions, each also on its own key: connect in a new tab (`ctrl+t`), browse its files (`ctrl+f`),
-run a command on it (`ctrl+r`), forward one of its ports (`ctrl+o`), edit the list (`ctrl+e`),
+run a command on it (`ctrl+r`), add a tunnel (`ctrl+o`), edit the list (`ctrl+e`),
 remove a saved server (`ctrl+x`). On a group, Tab offers only opening the group, running a
 command on it and editing the saved servers; the footer says that Enter opens the group.
 On + Add server and discovery suggestions, Enter opens the form and no connection actions appear.
@@ -172,9 +172,26 @@ asks for more than a password (a one-time code), or that requires a terminal, is
 
 `kraal exec` never asks for a password (the servers must take your key), and fails when a server
 did. In the server picker (`ctrl+b s`), Tab then "Run a command on it" runs one on the selected
-server or group, and "Forward one of its ports" opens a tunnel. Tunnels come back after a restart
-and reconnect when the network drops; the sidebar lists them (click copies `localhost:PORT`,
-ctrl+click opens it in the browser).
+server or group. On a server row, **Add tunnel** (`ctrl+o`) opens the shared form with the
+server filled in. **Tunnels** (`ctrl+b S o`, also in the command palette) lists all tunnels
+and keeps **+ Add tunnel** available even while searching.
+
+The form shows **Server**, **Remote** (`[host:]port`) and **Local**. Local follows the remote
+port until you edit it. Enter or **Add** starts the connection on exactly the shown local port.
+If it is occupied, the form keeps your values and offers **Use PORT**. That button updates
+Local; **Add** then submits the chosen port. No port changes silently. Tab moves between
+fields and buttons; Esc or **Cancel** returns to the previous list with its selection intact.
+
+Adding selects the tunnel in **Tunnels**, showing **Connecting**, then **Ready** only once
+SSH confirms its local listener, or **Error** with the reason. Enter or a click opens details;
+Tab opens the row's actions. Details keep the error and show the time until the next automatic
+retry, with **Close** selected, **Retry now** and **Stop** reachable by keyboard or mouse.
+**Stop** is also available while connecting or ready. Close returns to the list and leaves
+the tunnel running. Stop removes it and cancels retries. Tunnels come back after a restart
+and reconnect when the network drops. The sidebar shows their state; clicking one opens details.
+
+The CLI keeps its existing behavior: without `--local`, `kraal tunnel add` chooses an available
+port and prints it. `kraal tunnel list` keeps the state names `connecting`, `up` and `down`.
 
 Ports that programs in your panes announce (`http://localhost:5173`) and listen on show up in the
 sidebar under PORTS; a click opens them.
