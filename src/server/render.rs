@@ -1499,7 +1499,23 @@ impl Server {
                     }
                     let actions = matches!(item, Some(SideItem::Workspace(_)))
                         && text.spans.first().is_some_and(|s| s.content != "   ");
-                    buf.set_line(area.x + 1, y, text, width.saturating_sub(if actions { 3 } else { 0 }));
+                    let mut text = text.clone();
+                    if matches!(item, Some(SideItem::Workspace(_)))
+                        && text.spans.first().is_some_and(|s| s.content == "   ")
+                        && let Some(detail) = text.spans.get_mut(1)
+                    {
+                        let sep = if th().ascii { " - " } else { " · " };
+                        let mut shown = String::new();
+                        for part in detail.content.split(sep) {
+                            let next = if shown.is_empty() { part.to_string() } else { format!("{shown}{sep}{part}") };
+                            if crate::text::columns(&next) > width.saturating_sub(3) as usize {
+                                break;
+                            }
+                            shown = next;
+                        }
+                        detail.content = shown.into();
+                    }
+                    buf.set_line(area.x + 1, y, &text, width.saturating_sub(if actions { 3 } else { 0 }));
                     if actions {
                         buf.set_string(
                             area.right() - 4,
@@ -2321,6 +2337,25 @@ mod tests {
             buf.content.chunks(124).map(|row| row.iter().take(28).map(|c| c.symbol()).collect()).collect();
         for expected in ["● main", "○ web", "○ first"] {
             assert!(rows.iter().any(|row| row.contains(expected)), "{rows:?}");
+        }
+    }
+
+    #[test]
+    fn sidebar_status_omits_whole_parts_that_do_not_fit() {
+        for (width, expected) in [(26, "Open · 11 tabs"), (32, "Open · 11 tabs · 45 panes"), (16, "Open")] {
+            let area = Rect::new(0, 0, width, 24);
+            let rows = vec![
+                SideRow::Section("WORKSPACES"),
+                SideRow::Entry {
+                    item: Some(SideItem::Workspace(1)),
+                    line: Line::from(vec![Span::raw("   "), Span::raw("Open · 11 tabs · 45 panes")]),
+                    selected: true,
+                },
+            ];
+            let mut buf = Buffer::empty(area);
+            Server::draw_sidebar(&rows, area, &mut buf);
+            let shown: String = (1..width - 1).map(|x| buf[(x, 1)].symbol()).collect();
+            assert_eq!(shown.trim(), expected);
         }
     }
 

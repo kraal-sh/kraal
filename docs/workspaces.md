@@ -13,9 +13,15 @@ when it is open. **Delete** is available for saved workspaces and workspace file
 not been imported. **Move up** and **Move down** change the order of saved workspaces and
 unimported files. An unimported file also offers **Open**.
 
+Workspace actions keep the same order for open and closed rows: Open, Rename, Duplicate,
+Move up/down, Export layout, source actions when available, then Close and Delete.
+Close appears only while open. Sidebar status omits trailing parts that do not fit, so
+**Open · 11 tabs** stays readable when the pane count would be cut off.
+
 **+ Add workspace** and `ctrl+b W n` open the same **Add workspace** form. It proposes an unused
 name (or the search text) and shows the folder inherited from the current pane. Edit **Name**,
-then Enter or click **Add**. Tab moves between the field and buttons; Esc or **Cancel** returns
+then Enter or click **Add**. **Add**, **From file...** and **Cancel** share one row when they fit.
+Tab moves between the field and buttons; Esc or **Cancel** returns
 to the list with its search and selection. A direct shortcut returns to the terminal.
 Names are checked against the whole session, including closed workspaces and workspace files.
 A taken or empty name keeps **Add** (or **Rename**) as the action: correct the name and submit
@@ -418,6 +424,9 @@ From the command line:
 
 ### Importing a layout
 
+Import and export output abbreviates paths under your home directory with `~`. Success
+messages quote workspace names, for example `Workspace "imported" added.`
+
 In **Add workspace**, choose **From file...**. Enter **File**, then Tab or **Preview** to see
 the tab and pane counts and any unsupported KDL warnings. **Name** starts with the file's name
 and remains editable. **Add** opens the workspace only after that preview. Parsing and previewing
@@ -452,7 +461,8 @@ to retry the import.
 `ctrl+b W s` shortcut opens the same form. **File** proposes an unused copy path. Change it to
 export elsewhere, including to the source file explicitly. Export preserves the workspace's
 name, identity and position; it does not add a second workspace to this session's list.
-**Layout exported** reports the full path written; **Done** returns to the previous screen. Errors keep the editable path with **Retry**.
+**Layout exported** reports the full path written. Its single **Close** button returns to the
+previous screen. Errors keep the editable path with **Retry**.
 
 The exported KDL describes tabs, splits, stacks, floating panes, folders and startup commands.
 It contains no conversations or running process state. Managed agents use portable references

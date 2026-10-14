@@ -629,8 +629,8 @@ impl Picker {
                 ("enter", "Open"),
                 ("ctrl+r", "Rename"),
                 ("", "Duplicate"),
-                ("ctrl+x", "Close"),
                 ("ctrl+s", "Export layout"),
+                ("ctrl+x", "Close"),
                 ("", "Delete"),
             ],
             (_, A::OpenDefinition(_)) => &[("enter", "Open"), ("", "Delete")],
@@ -665,13 +665,15 @@ impl Picker {
             && matches!(item.action, A::SwitchWorkspace(_) | A::ReopenWorkspace(_))
         {
             if self.source_workspaces.contains(&ws) {
-                keys.push(("", "Load from file"));
+                let insert = keys.iter().position(|(_, action)| matches!(*action, "Close" | "Delete")).unwrap();
+                keys.insert(insert, ("", "Load from file"));
                 if self.review_workspaces.contains(&ws) {
-                    keys.push(("", "Review"));
+                    keys.insert(insert + 1, ("", "Review"));
                 }
             }
             if self.layout_undos.contains(&ws) {
-                keys.push(("", "Undo load"));
+                let insert = keys.iter().position(|(_, action)| matches!(*action, "Close" | "Delete")).unwrap();
+                keys.insert(insert, ("", "Undo load"));
             }
         }
         if self.kind == K::Workspace
@@ -685,7 +687,7 @@ impl Picker {
                 .map(|(i, _)| i)
                 .collect();
             let at = rows.iter().position(|i| Some(i) == self.filtered.get(self.selected)).unwrap();
-            let insert = keys.iter().position(|(_, action)| matches!(*action, "Close" | "Delete")).unwrap();
+            let insert = keys.iter().position(|(_, action)| matches!(*action, "Export layout" | "Delete")).unwrap();
             let mut moves = Vec::new();
             if rows.len() > 1 && !self.query.is_empty() {
                 moves.push(("", "Clear search to reorder"));
@@ -1269,8 +1271,8 @@ mod tests {
                     ("enter", "Open"),
                     ("ctrl+r", "Rename"),
                     ("", "Duplicate"),
-                    ("ctrl+x", "Close"),
                     ("ctrl+s", "Export layout"),
+                    ("ctrl+x", "Close"),
                     ("", "Delete"),
                 ],
             ),

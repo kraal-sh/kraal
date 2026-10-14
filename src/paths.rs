@@ -1287,9 +1287,13 @@ pub fn expand_tilde(path: &str) -> PathBuf {
 
 /// Replace the home directory prefix with `~` for display.
 pub fn shorten_home(path: &Path) -> String {
-    if let Some(home) = dirs::home_dir()
-        && let Ok(rest) = path.strip_prefix(&home)
-    {
+    let Some(home) = dirs::home_dir() else { return path.display().to_string() };
+    shorten_home_in(path, &home)
+}
+
+fn shorten_home_in(path: &Path, home: &Path) -> String {
+    let resolved = std::fs::canonicalize(home).unwrap_or_else(|_| home.to_path_buf());
+    if let Ok(rest) = path.strip_prefix(home).or_else(|_| path.strip_prefix(&resolved)) {
         if rest.as_os_str().is_empty() {
             return "~".into();
         }
@@ -1341,6 +1345,25 @@ pub fn valid_session_name(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn home_paths_are_shortened_through_a_symlink() {
+        let root = std::env::temp_dir().join(format!("kraal-home-paths-{}", crate::accounts::new_uuid()));
+        let home = root.join("home");
+        let alias = root.join("alias");
+        std::fs::create_dir_all(&home).unwrap();
+        std::os::unix::fs::symlink(&home, &alias).unwrap();
+        let resolved = std::fs::canonicalize(&home).unwrap();
+        for path in [&alias, &resolved] {
+            assert_eq!(shorten_home_in(path, &alias), "~");
+            assert_eq!(shorten_home_in(&path.join("recipe.kdl"), &alias), "~/recipe.kdl");
+        }
+        let outside = root.join("home-other/recipe.kdl");
+        assert_eq!(shorten_home_in(&outside, &alias), outside.display().to_string());
+        let missing = root.join("missing");
+        assert_eq!(shorten_home_in(&missing.join("recipe.kdl"), &missing), "~/recipe.kdl");
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn a_session_directory_that_cannot_be_read_is_not_treated_as_empty() {

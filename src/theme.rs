@@ -219,10 +219,6 @@ impl Theme {
     pub fn pointer(&self) -> &'static str {
         if self.ascii { ">" } else { "▸" }
     }
-
-    pub fn prompt(&self) -> &'static str {
-        if self.ascii { "> " } else { "❯ " }
-    }
 }
 
 static CURRENT: RwLock<Theme> = RwLock::new(Theme::DEFAULT);

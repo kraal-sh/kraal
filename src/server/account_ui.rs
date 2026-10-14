@@ -1102,9 +1102,9 @@ mod tests {
             assert!(text.contains("[  Sign in to another account]"));
             assert!(text.contains("[  Cancel]"));
             let l = form_layout(&form, screen);
-            assert_eq!(l.primary.y, l.name.y + 1);
-            assert_eq!(l.alternate.unwrap().y, l.primary.y + 1);
-            assert_eq!(l.cancel.y, l.primary.y + 2);
+            assert_eq!(l.primary.y, l.name.y + 2);
+            assert_eq!(l.alternate.unwrap().y, l.primary.y);
+            assert_eq!(l.cancel.y, l.primary.y);
             let Mode::Picker(p) = server.on_account_form(0, form.clone(), key("enter")) else { panic!() };
             assert!(p.kind == PickerKind::AccountReview);
             let Mode::AccountForm(form) = server.on_account_form(0, form, key("right")) else { panic!() };

@@ -441,16 +441,16 @@ pub(super) fn draw_picker(p: &Picker, screen: Rect, buf: &mut Buffer) -> Option<
     if inner.height < 3 || inner.width < 6 {
         return None;
     }
-    // The search line.
+    // The search line, or an instruction for fixed choices.
     let review = p.kind == super::ui::PickerKind::AccountReview;
+    let conflict = p.kind == super::ui::PickerKind::EditConflict;
     let workspace = matches!(p.kind, super::ui::PickerKind::Workspace | super::ui::PickerKind::DeletedWorkspaces);
     let prompt = if review {
         Line::from("Which account is this?")
+    } else if conflict {
+        Line::from("Choose which version to keep.")
     } else {
-        Line::from(vec![
-            Span::styled(if workspace { "Search  " } else { t.prompt() }, Style::default().fg(t.accent)),
-            Span::raw(p.query.clone()),
-        ])
+        Line::from(vec![Span::styled("Search  ", Style::default().fg(t.accent)), Span::raw(p.query.clone())])
     };
     buf.set_line(inner.x + 1, inner.y, &prompt, inner.width.saturating_sub(2));
     for x in inner.x..inner.x + inner.width {
@@ -476,7 +476,10 @@ pub(super) fn draw_picker(p: &Picker, screen: Rect, buf: &mut Buffer) -> Option<
             let y = list.y + row as u16;
             let line = Line::from(vec![
                 Span::raw(pointer(selected)),
-                Span::styled(format!("{k:<key_w$}"), key_style()),
+                Span::styled(
+                    format!("{:<key_w$}", k.split('+').map(upper_first).collect::<Vec<_>>().join("+")),
+                    key_style(),
+                ),
                 Span::raw("  "),
                 Span::raw(what.to_string()),
             ])
@@ -485,7 +488,8 @@ pub(super) fn draw_picker(p: &Picker, screen: Rect, buf: &mut Buffer) -> Option<
             buf.set_line(list.x, y, &line, list.width);
         }
         let item = p.current().map(|i| i.label.as_str()).unwrap_or("");
-        let footer = key_line(&[("⏎", "do it"), ("esc", "back")], item, inner.width.saturating_sub(2));
+        let verb = keys.get(at).map_or("Choose", |(_, label)| *label);
+        let footer = key_line(&[("Enter", verb), ("Esc", "Back")], item, inner.width.saturating_sub(2));
         buf.set_line(inner.x + 1, inner.y + inner.height - 1, &footer, inner.width.saturating_sub(2));
         return None;
     }
@@ -567,26 +571,21 @@ pub(super) fn draw_picker(p: &Picker, screen: Rect, buf: &mut Buffer) -> Option<
     }
     let keys = p.action_keys();
     let enter = match p.current().map(|i| &i.action) {
-        Some(super::ui::PickAction::AgentLaunch { .. }) => Some("start".into()),
-        Some(super::ui::PickAction::AccountDetails(_)) => Some("details".into()),
-        _ if workspace => keys.first().map(|(_, what)| what.to_string()),
-        _ => keys.first().map(|(_, what)| lower_first(what)),
+        Some(super::ui::PickAction::AgentLaunch { .. }) => Some("Start".to_string()),
+        Some(super::ui::PickAction::AccountDetails(_)) => Some("Details".to_string()),
+        _ => keys.first().map(|(_, what)| what.to_string()),
     };
     let mut footer: Vec<(&str, &str)> = Vec::new();
     if let Some(enter) = &enter {
-        footer.push((if workspace { "Enter" } else { "⏎" }, enter));
+        footer.push(("Enter", enter));
     }
     if keys.len() > 1 {
-        footer.push(if workspace { ("Tab", "Actions") } else { ("tab", "more actions") });
+        footer.push(("Tab", "Actions"));
     }
     if p.undo.is_some() {
         footer.push(("Ctrl+Z", "Undo"));
     }
-    footer.push(if workspace {
-        ("Esc", if p.kind == super::ui::PickerKind::DeletedWorkspaces { "Back" } else { "Close" })
-    } else {
-        ("esc", if review { "Back" } else { "close" })
-    });
+    footer.push(("Esc", if review || p.kind == super::ui::PickerKind::DeletedWorkspaces { "Back" } else { "Close" }));
     let count = if let Some(message) = &p.message {
         message.clone()
     } else if p.query.is_empty() {
@@ -598,19 +597,19 @@ pub(super) fn draw_picker(p: &Picker, screen: Rect, buf: &mut Buffer) -> Option<
     };
     let line = key_line(&footer, &count, inner.width.saturating_sub(2));
     buf.set_line(inner.x + 1, inner.y + inner.height - 1, &line, inner.width.saturating_sub(2));
-    if review {
+    if review || conflict {
         return None;
     }
     let before: String = p.query.chars().take(p.cursor).collect();
-    let x = inner.x + 1 + columns(if workspace { "Search  " } else { t.prompt() }) as u16 + before.width() as u16;
+    let x = inner.x + 1 + columns("Search  ") as u16 + before.width() as u16;
     (x < inner.x + inner.width).then_some(Cursor { x, y: inner.y, shape: CursorShape::Bar, blinking: true })
 }
 
-/// "Connect" → "connect", for a footer.
-fn lower_first(s: &str) -> String {
+/// Capitalize a prompt action for its footer.
+fn upper_first(s: &str) -> String {
     let mut s = s.to_string();
     if let Some(first) = s.get_mut(..1) {
-        first.make_ascii_lowercase();
+        first.make_ascii_uppercase();
     }
     s
 }
@@ -687,12 +686,13 @@ pub(super) fn draw_prompt(p: &Prompt, screen: Rect, buf: &mut Buffer) -> Option<
     } else {
         p.action.verb()
     };
-    let mut keys = vec![("⏎", verb), ("esc", "cancel")];
+    let verb = upper_first(verb);
+    let mut keys = vec![("Enter", verb.as_str()), ("Esc", "Cancel")];
     if layout.max_scroll > 0 {
-        keys.insert(1, ("pgup/pgdn", "scroll"));
+        keys.insert(1, ("PgUp/PgDn", "Scroll"));
     }
     if matches!(p.action, super::ui::PromptAction::Upload { .. }) {
-        keys.insert(1, ("ctrl+p", "paste the paths instead"));
+        keys.insert(1, ("Ctrl+P", "Paste paths"));
     }
     let line = key_line(&keys, "", inner.width.saturating_sub(2));
     buf.set_line(inner.x + 1, inner.y + inner.height - 1, &line, inner.width.saturating_sub(2));
@@ -736,17 +736,24 @@ pub(super) fn confirm_layout(q: &Question, screen: Rect) -> ConfirmLayout {
     let verb = q.action.verb();
     let max_w = screen.width.saturating_sub(2).max(1) as usize;
     let buttons_w = columns(&verb) + 15;
-    let widest = q.message.lines().chain(q.title.as_deref()).map(columns).max().unwrap_or(0).max(buttons_w);
+    let footer_w = columns(&verb).max(columns(q.action.cancel_label()))
+        + columns("Enter  · Tab Choose · Esc ")
+        + columns(q.action.cancel_label());
+    let widest =
+        q.message.lines().chain(q.title.as_deref()).map(columns).max().unwrap_or(0).max(buttons_w).max(footer_w);
     let w = (widest + 4).clamp(30.min(max_w), max_w.min(84)) as u16;
     let text_w = (w as usize).saturating_sub(4).max(1);
     let mut lines = Vec::new();
-    if matches!(q.action, super::ui::ConfirmAction::CloseWorkspace { .. })
-        && let Some(title) = q.title.as_deref().filter(|t| columns(t) > text_w)
-    {
-        // A truncated workspace name must still be readable, including after a resize.
+    let title = q.title.as_deref().unwrap_or_else(|| q.message.lines().next().unwrap_or(""));
+    let long_title = columns(title) > text_w;
+    if q.title.is_some() && long_title {
+        // Keep a long question readable after the title is clipped, including after a resize.
         lines.extend(fold(title, text_w).into_iter().map(|text| ConfirmRow { text, question: true, continued: false }));
     }
     for (i, l) in q.message.lines().enumerate() {
+        if i == 0 && l == title && !long_title {
+            continue;
+        }
         // What a question quotes (see [`Question::message`]) is cut as it is written; the rest
         // is prose, wrapped between words.
         let quoted = l.starts_with(' ');
@@ -756,7 +763,7 @@ pub(super) fn confirm_layout(q: &Question, screen: Rect) -> ConfirmLayout {
         }
     }
     let max_h = screen.height.saturating_sub(2).max(3) as usize;
-    let h = (lines.len() + 5).min(max_h) as u16;
+    let h = (lines.len().max(1) + 5).min(max_h) as u16;
     let area = centered(screen, w, h);
     let inner = Rect::new(area.x + 1, area.y + 1, area.width.saturating_sub(2), area.height.saturating_sub(2));
     let mut body = inner.height.saturating_sub(3);
@@ -791,7 +798,7 @@ pub(super) fn draw_confirm(q: &Question, screen: Rect, buf: &mut Buffer) {
     let danger = q.action.danger(&q.message);
     let layout = confirm_layout(q, screen);
     let color = if danger { th().production } else { th().accent };
-    let title = q.title.as_deref().unwrap_or(if danger { "Careful" } else { "Confirm" });
+    let title = q.title.as_deref().unwrap_or_else(|| q.message.lines().next().unwrap_or(""));
     let inner = frame(layout.area, title, color, buf);
     if inner.height == 0 || inner.width < 2 {
         return;
@@ -828,11 +835,13 @@ pub(super) fn draw_confirm(q: &Question, screen: Rect, buf: &mut Buffer) {
         buf.set_line(inner.x + 1, cancel.y, &row, inner.width.saturating_sub(2));
     }
     // Leaving comes last, so it is the one footer key that never gives way.
-    let mut keys = vec![("⏎", "select"), ("←→", "choose")];
+    let verb = q.action.verb();
+    let selected = if q.yes { verb.as_str() } else { q.action.cancel_label() };
+    let mut keys = vec![("Enter", selected), ("Tab", "Choose")];
     if max_scroll > 0 {
-        keys.push(("↑↓", "read"));
+        keys.push(("PgUp/PgDn", "Scroll"));
     }
-    keys.extend([("y", "yes"), ("n", "no")]);
+    keys.push(("Esc", q.action.cancel_label()));
     let line = key_line(&keys, "", inner.width.saturating_sub(2));
     buf.set_line(inner.x + 1, inner.y + inner.height - 1, &line, inner.width.saturating_sub(2));
 }
@@ -979,7 +988,7 @@ mod tests {
                 p.cursor = 3;
                 let mut buf = Buffer::empty(area);
                 draw_prompt(&p, area, &mut buf);
-                assert!(screen(&buf, area).contains(p.action.verb()));
+                assert!(screen(&buf, area).contains(&upper_first(p.action.verb())));
                 p.error = Some(error.clone());
                 let layout = prompt_layout(&p, area);
                 assert_eq!(layout.max_scroll, 0);
@@ -990,7 +999,7 @@ mod tests {
                 let shown = screen(&buf, area);
                 assert!(shown.contains(" café 日 "), "{shown}");
                 assert!(shown.contains("Permission denied. Fix the destination and retry."), "{shown}");
-                assert!(shown.contains("⏎ open") && shown.contains("esc cancel"), "{shown}");
+                assert!(shown.contains("Enter Open") && shown.contains("Esc Cancel"), "{shown}");
                 assert!(!shown.contains("scroll"), "{shown}");
                 for (i, line) in layout.lines.iter().enumerate() {
                     let mut x = layout.area.x + 2;
@@ -1019,7 +1028,7 @@ mod tests {
                 draw_prompt(&p, area, &mut buf);
                 let shown = screen(&buf, area);
                 assert!(shown.contains("scratch"), "{shown}");
-                assert!(shown.contains("⏎ open · pgup/pgdn scroll · esc cancel"), "{shown}");
+                assert!(shown.contains("Enter Open · PgUp/PgDn Scroll · Esc Cancel"), "{shown}");
                 for line in layout.lines.iter().skip(start.min(layout.max_scroll)).take(layout.body as usize) {
                     assert!(shown.contains(line), "missing {line:?}: {shown}");
                 }
@@ -1082,29 +1091,173 @@ mod tests {
     }
 
     #[test]
+    fn edit_conflicts_show_an_instruction_without_an_input_cursor() {
+        use super::super::edits::Answer;
+        use super::super::ui::{PickAction, PickItem, PickerKind};
+        for (w, h) in [(80, 24), (124, 36)] {
+            let area = Rect::new(0, 0, w, h);
+            let items = [
+                ("Keep your version as a local file", Answer::KeepLocal),
+                ("Keep the version of box", Answer::KeepServer),
+                ("Replace it with your version", Answer::Overwrite),
+            ]
+            .into_iter()
+            .map(|(label, answer)| PickItem::new(label, "", PickAction::EditAnswer { edit: 1, answer }))
+            .collect();
+            let mut p = Picker::new(PickerKind::EditConflict, "File changed on box", items);
+            for selected in 0..p.items.len() {
+                p.selected = selected;
+                let mut buf = Buffer::empty(area);
+                assert!(draw_picker(&p, area, &mut buf).is_none());
+                let shown = screen(&buf, area);
+                assert!(shown.contains("Choose which version to keep."), "{shown}");
+                assert!(!shown.contains("Search"), "{shown}");
+                for item in &p.items {
+                    assert!(shown.contains(&item.label), "{shown}");
+                }
+                assert!(shown.contains("Enter Choose") && shown.contains("Esc Close"), "{shown}");
+            }
+        }
+    }
+
+    #[test]
+    fn shared_picker_search_and_actions_use_explicit_key_names() {
+        use super::super::ui::{PickAction, PickItem, PickerKind};
+        for (w, h) in [(80, 24), (124, 36)] {
+            let area = Rect::new(0, 0, w, h);
+            for (kind, action, verb) in [
+                (PickerKind::Accounts, PickAction::AddAccount, "Add account"),
+                (PickerKind::Accounts, PickAction::AccountDetails("work".into()), "Details"),
+                (
+                    PickerKind::Agent,
+                    PickAction::AgentLaunch { agent: "claude".into(), account: "work".into() },
+                    "Start",
+                ),
+                (PickerKind::Tunnels, PickAction::Tunnel { id: 1, retry: true }, "Details"),
+                (PickerKind::Ssh, PickAction::Ssh("web".into()), "Connect"),
+                (PickerKind::Workspace, PickAction::SwitchWorkspace(1), "Open"),
+                (PickerKind::Tunnels, PickAction::AddTunnel, "Add"),
+            ] {
+                let mut p = Picker::new(kind, "List", vec![PickItem::new("item", "", action)]);
+                p.query = "it".into();
+                p.cursor = 2;
+                p.refilter();
+                let mut buf = Buffer::empty(area);
+                let cursor = draw_picker(&p, area, &mut buf).unwrap();
+                let layout = picker_layout(&p, area);
+                let shown = screen(&buf, area);
+                assert!(shown.contains("Search  it"), "{shown}");
+                assert_eq!(cursor.x, layout.area.x + 2 + 8 + 2);
+                assert!(shown.contains(&format!("Enter {verb}")) && shown.contains("Esc Close"), "{shown}");
+                if p.action_keys().len() > 1 {
+                    assert!(shown.contains("Tab Actions"), "{shown}");
+                    p.actions = Some(1);
+                    buf = Buffer::empty(area);
+                    draw_picker(&p, area, &mut buf);
+                    let layout = picker_layout(&p, area);
+                    let footer = screen(&buf, Rect::new(layout.area.x, layout.area.bottom() - 2, layout.area.width, 1));
+                    assert!(footer.contains(&format!("Enter {}", p.action_keys()[1].1)), "{footer}");
+                    assert!(footer.contains("Esc Back"), "{footer}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn questions_use_the_question_as_title_and_name_the_selected_action() {
+        use super::super::ui::Mode;
+        for (w, h) in [(80, 24), (124, 36)] {
+            let area = Rect::new(0, 0, w, h);
+            for message in [
+                "Delete web?\nThe layout can be restored.",
+                "Close pane?",
+                "Trust this runbook?\nRead its commands first.",
+            ] {
+                let Mode::Confirm(mut q) = Mode::confirm(message, ConfirmAction::ClosePane(1)) else { panic!() };
+                for yes in [false, true] {
+                    q.yes = yes;
+                    let mut buf = Buffer::empty(area);
+                    draw_confirm(&q, area, &mut buf);
+                    let layout = confirm_layout(&q, area);
+                    assert!(layout.body > 0 && layout.cancel.is_some() && layout.ok.is_some());
+                    let title = screen(&buf, Rect::new(layout.area.x, layout.area.y, layout.area.width, 1));
+                    assert!(title.contains(message.lines().next().unwrap()), "{title}");
+                    let shown = screen(&buf, area);
+                    assert_eq!(shown.matches(message.lines().next().unwrap()).count(), 1, "{shown}");
+                    let verb = if yes { q.action.verb() } else { q.action.cancel_label().into() };
+                    assert!(shown.contains(&format!("Enter {verb} · Tab Choose · Esc Cancel")), "{shown}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn workspace_actions_keep_management_before_close_and_delete() {
+        use super::super::ui::{PickAction, PickItem, PickerKind};
+        for (w, h) in [(80, 24), (124, 36)] {
+            for open in [false, true] {
+                let action = if open { PickAction::SwitchWorkspace(1) } else { PickAction::ReopenWorkspace(1) };
+                let mut p = Picker::new(
+                    PickerKind::Workspace,
+                    "Workspaces",
+                    vec![PickItem::new("web", "", action), PickItem::new("docs", "", PickAction::ReopenWorkspace(2))],
+                );
+                p.source_workspaces.push(1);
+                p.review_workspaces.push(1);
+                p.layout_undos.push(1);
+                p.actions = Some(0);
+                let area = Rect::new(0, 0, w, h);
+                let mut buf = Buffer::empty(area);
+                draw_picker(&p, area, &mut buf);
+                let layout = picker_layout(&p, area);
+                let shown = screen(&buf, layout.list);
+                let mut expected = vec![
+                    "Open",
+                    "Rename",
+                    "Duplicate",
+                    "Move down",
+                    "Export layout",
+                    "Load from file",
+                    "Review",
+                    "Undo load",
+                ];
+                if open {
+                    expected.push("Close");
+                }
+                expected.push("Delete");
+                let positions: Vec<_> = expected
+                    .iter()
+                    .map(|label| shown.find(label).unwrap_or_else(|| panic!("{label}: {shown}")))
+                    .collect();
+                assert!(positions.windows(2).all(|p| p[0] < p[1]), "{shown}");
+            }
+        }
+    }
+
+    #[test]
     fn picker_footers_describe_the_selected_line_at_both_sizes() {
         use super::super::ui::{PickAction, PickItem, PickerKind};
         for (w, h) in [(124, 36), (80, 24)] {
             let area = Rect::new(0, 0, w, h);
             let cases = [
-                (PickerKind::Accounts, PickAction::AddAccount, "add account", false),
+                (PickerKind::Accounts, PickAction::AddAccount, "Add account", false),
                 (
                     PickerKind::Agent,
                     PickAction::AgentSwitch { pane: 1, agent: "codex".into(), account: "work".into(), current: false },
-                    "switch account",
+                    "Switch account",
                     false,
                 ),
                 (
                     PickerKind::Agent,
                     PickAction::AgentSwitch { pane: 1, agent: "codex".into(), account: "work".into(), current: true },
-                    "keep current account",
+                    "Keep current account",
                     false,
                 ),
-                (PickerKind::Ssh, PickAction::SshGroup("web".into()), "open group", true),
+                (PickerKind::Ssh, PickAction::SshGroup("web".into()), "Open group", true),
                 (PickerKind::Workspace, PickAction::SwitchWorkspace(1), "Open", true),
                 (PickerKind::Workspace, PickAction::OpenDefinition("w.kdl".into()), "Open", true),
                 (PickerKind::Workspace, PickAction::AddWorkspace, "Add", false),
-                (PickerKind::RunbookSteps, PickAction::RunbookList, "back to runbooks", false),
+                (PickerKind::RunbookSteps, PickAction::RunbookList, "Back to runbooks", false),
             ];
             for (kind, action, enter, more) in cases {
                 let create = matches!(action, PickAction::AddWorkspace);
@@ -1118,11 +1271,7 @@ mod tests {
                 let layout = picker_layout(&p, area);
                 let footer = screen(&buf, Rect::new(layout.area.x, layout.area.bottom() - 2, layout.area.width, 1));
                 assert!(footer.contains(enter), "{w}×{h}: {footer}");
-                assert_eq!(
-                    footer.contains(if kind == PickerKind::Workspace { "Tab Actions" } else { "more actions" }),
-                    more,
-                    "{footer}"
-                );
+                assert_eq!(footer.contains("Tab Actions"), more, "{footer}");
                 if let Some((add, index)) = layout.pinned {
                     assert_eq!(layout.row_at(layout.list.x + 2, layout.list.y), None);
                     assert_eq!(layout.row_at(add.x + 2, add.y), Some(index));
@@ -1134,7 +1283,7 @@ mod tests {
             let mut buf = Buffer::empty(area);
             draw_picker(&p, area, &mut buf);
             let text = screen(&buf, area);
-            assert!(text.contains("esc close"));
+            assert!(text.contains("Esc Close"));
             assert!(!text.contains("⏎") && !text.contains("more actions"), "{text}");
             let p = Picker::new(
                 PickerKind::Workspace,
@@ -1328,7 +1477,6 @@ mod tests {
         let rows: Vec<(&str, bool)> = layout.lines.iter().map(|row| (row.text.as_str(), row.continued)).collect();
         let (cut, rest) = (format!("  2. echo {}", "x".repeat(34)), format!("  {}", "x".repeat(26)));
         let expected = [
-            ("Trust the runbook deploy?", false),
             ("one two three four five six seven eight nine", false),
             ("ten eleven twelve", false),
             ("  1. if true; then", false),
@@ -1343,16 +1491,16 @@ mod tests {
         let mut buf = Buffer::empty(area);
         draw_confirm(&q, area, &mut buf);
         let margin = |row: u16| buf[(layout.area.x + 1, layout.area.y + 1 + row)].symbol().to_string();
-        assert_eq!((margin(7), margin(8)), (" ".to_string(), "↪".to_string()), "{}", screen(&buf, area));
+        assert_eq!((margin(6), margin(7)), (" ".to_string(), "↪".to_string()), "{}", screen(&buf, area));
         assert!(screen(&buf, area).contains("         echo  two   spaces"));
     }
 
     #[test]
     fn key_lines_drop_what_does_not_fit() {
         let text = |l: &Line| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>();
-        let keys = [("⏎", "connect"), ("tab", "more actions"), ("esc", "close")];
-        assert_eq!(text(&key_line(&keys, "", 80)), "⏎ connect · tab more actions · esc close");
-        assert_eq!(text(&key_line(&keys, "", 25)), "⏎ connect · esc close", "leaving stays possible");
+        let keys = [("Enter", "Connect"), ("Tab", "Actions"), ("Esc", "Close")];
+        assert_eq!(text(&key_line(&keys, "", 80)), "Enter Connect · Tab Actions · Esc Close");
+        assert_eq!(text(&key_line(&keys, "", 25)), "Enter Connect · Esc Close", "leaving stays possible");
         let with_count = text(&key_line(&keys, "3/40", 60));
         assert!(with_count.ends_with("3/40") && columns(&with_count) == 60, "{with_count:?}");
     }

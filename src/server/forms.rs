@@ -36,23 +36,34 @@ impl FormLayout {
         let width = screen.width.saturating_sub(4).clamp(4, 76);
         let lines: Vec<_> =
             message.lines().flat_map(|l| crate::text::wrap(l, width.saturating_sub(4).max(1) as usize)).collect();
-        let stacked = buttons.alternate.is_some();
-        let base = fields as u16 + if stacked { 6 } else { 5 };
+        // A result with only Close uses the same action for Enter and Esc.
+        let single = buttons.primary.field == buttons.cancel.field;
+        let button_width = |button: &Button<'_>| crate::text::columns(button.label) as u16 + 4;
+        let button_count = if single { 1 } else { 2 + u16::from(buttons.alternate.is_some()) };
+        let total_width = button_width(&buttons.primary)
+            + if single { 0 } else { button_width(&buttons.cancel) }
+            + buttons.alternate.as_ref().map_or(0, button_width)
+            + 2 * (button_count - 1);
+        let stacked = total_width > width.saturating_sub(4);
+        let base = fields as u16 + 5 + if stacked { button_count - 1 } else { 0 };
         let height = (lines.len() as u16 + base).min(screen.height.saturating_sub(2)).max(base);
         let area = overlays::centered(screen, width, height);
         let row = |y| Rect::new(area.x + 2, area.y + y, area.width.saturating_sub(4), 1);
         let body = Rect { height: area.height.saturating_sub(base), ..row(fields as u16 + 1) };
-        let button_width = |button: &Button<'_>| crate::text::columns(button.label) as u16 + 4;
         let primary = Rect {
             width: button_width(&buttons.primary),
-            ..row(area.height.saturating_sub(if stacked { 5 } else { 3 }))
+            ..row(area.height.saturating_sub(3 + if stacked { button_count - 1 } else { 0 }))
         };
-        let alternate =
-            buttons.alternate.as_ref().map(|b| Rect { width: button_width(b), ..row(area.height.saturating_sub(4)) });
-        let cancel = Rect {
-            width: button_width(&buttons.cancel),
-            ..if stacked { row(area.height.saturating_sub(3)) } else { Rect { x: primary.right() + 2, ..primary } }
+        let next = |previous: Rect, button: &Button<'_>| Rect {
+            width: button_width(button),
+            ..if stacked {
+                Rect { y: previous.y + 1, ..previous }
+            } else {
+                Rect { x: previous.right() + 2, ..previous }
+            }
         };
+        let alternate = buttons.alternate.as_ref().map(|b| next(primary, b));
+        let cancel = if single { primary } else { next(alternate.unwrap_or(primary), &buttons.cancel) };
         Self {
             area,
             fields: (1..=fields).map(|y| row(y as u16)).collect(),
@@ -134,7 +145,7 @@ impl FormState<'_> {
         }
         let button_ids: Vec<_> = std::iter::once(buttons.primary.field)
             .chain(buttons.alternate.as_ref().map(|b| b.field))
-            .chain(std::iter::once(buttons.cancel.field))
+            .chain((buttons.primary.field != buttons.cancel.field).then_some(buttons.cancel.field))
             .collect();
         let move_to = |selected: &mut usize, ids: &[usize], backwards: bool| {
             let at = ids.iter().position(|id| id == selected).unwrap_or(0);
@@ -286,12 +297,20 @@ pub(super) fn draw_buttons(
     let footer = if pending.is_some() {
         format!("Esc {cancel}")
     } else {
-        button(buf, layout.primary, &buttons.primary);
+        if buttons.primary.field != buttons.cancel.field {
+            button(buf, layout.primary, &buttons.primary);
+        }
         if let Some((area, alternate)) = layout.alternate.zip(buttons.alternate.as_ref()) {
             button(buf, area, alternate);
         }
         if layout.max_scroll > 0 {
-            format!("Enter {verb} · Tab Next · PgUp/PgDn Scroll · Esc {cancel}")
+            if buttons.primary.field == buttons.cancel.field {
+                format!("Enter {verb} · PgUp/PgDn Scroll · Esc {cancel}")
+            } else {
+                format!("Enter {verb} · Tab Next · PgUp/PgDn Scroll · Esc {cancel}")
+            }
+        } else if buttons.primary.field == buttons.cancel.field {
+            format!("Enter {verb} · Esc {cancel}")
         } else if layout.fields.is_empty() {
             format!("Enter {verb} · Tab Next · Esc {cancel}")
         } else {
