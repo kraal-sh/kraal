@@ -115,7 +115,7 @@ fn run(cli: Cli) -> Result<()> {
         Some(Cmd::Kill) => session::kill(&s),
         Some(Cmd::Restart { yes }) => restart::restart(&s, yes),
         Some(Cmd::Forget) => session::forget(&s),
-        Some(Cmd::Workspaces { json }) => session::workspaces(&s, json),
+        Some(Cmd::Workspaces { json, deleted, command }) => session::workspaces(&s, json, deleted, command),
         Some(Cmd::Open { name }) => session::open(&s, name),
         Some(Cmd::Import { file, name, yes }) => session::import(&s, file, name, yes),
         Some(Cmd::Export { file, workspace, replace }) => session::export(&s, file, workspace, replace),

@@ -138,6 +138,7 @@ pub enum ConfirmAction {
         workspace: crate::persist::WorkspaceKey,
         neighbor: crate::persist::WorkspaceKey,
         before: bool,
+        order: Option<Vec<crate::persist::WorkspaceKey>>,
     },
     OpenWorkspace(PickAction),
     /// Restart the session on the kraal installed now.
@@ -449,6 +450,7 @@ pub struct Picker {
     pub selected: usize,
     /// The list of actions on the selected item is open, at this one.
     pub actions: Option<usize>,
+    pub drag: Option<WorkspaceDrag>,
     /// What the picker waits for (a list read off the event loop), by request: keys typed
     /// meanwhile stay here instead of reaching a pane.
     pub loading: Option<u32>,
@@ -503,6 +505,7 @@ impl Picker {
             filtered: Vec::new(),
             selected: 0,
             actions: None,
+            drag: None,
             loading: None,
             worktree: false,
             message: None,
@@ -974,8 +977,23 @@ pub fn paste_line(text: &mut String, cursor: &mut usize, pasted: &str) -> Result
     Ok(())
 }
 
+pub struct WorkspaceDrag {
+    pub workspace: crate::persist::WorkspaceKey,
+    pub order: Vec<crate::persist::WorkspaceKey>,
+    pub from: (u16, u16),
+    /// The first visible picker row when the gesture began.
+    pub list_start: usize,
+    pub moved: bool,
+    pub target: Option<crate::persist::WorkspaceKey>,
+    pub hover: Option<usize>,
+}
+
 /// A mouse drag in progress.
 pub enum Drag {
+    Workspace {
+        drag: WorkspaceDrag,
+        picker: Box<Picker>,
+    },
     /// Moving a split: the border, and how far before it the pointer took hold of it.
     Border(Border, u16),
     /// Selecting text: `from` is where the button went down; `moved`, whether the selection

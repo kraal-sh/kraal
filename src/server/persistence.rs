@@ -28,7 +28,7 @@ pub struct CloseInventory {
     panes: Vec<ClosePane>,
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, serde::Serialize)]
 pub struct ClosePane {
     id: PaneId,
     leader: Option<CloseProcess>,
@@ -69,7 +69,7 @@ impl ClosePane {
     }
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, serde::Serialize)]
 struct CloseProcess {
     pid: u32,
     started: Option<u64>,

@@ -107,11 +107,19 @@ impl Server {
     }
 
     pub(super) fn keep_and_delete_workspace(&mut self, ws: u32) -> Result<String, String> {
+        self.keep_and_delete_workspace_checked(ws, |_| Ok(()))
+    }
+
+    pub(super) fn keep_and_delete_workspace_checked(
+        &mut self,
+        ws: u32,
+        check: impl FnOnce(&Self) -> Result<(), String>,
+    ) -> Result<String, String> {
         let wi = self.ws_index(ws).ok_or("This workspace is no longer available.")?;
         let retry = self.workspaces[wi].delete_pending;
         let was_kept = self.workspaces[wi].kept.clone();
         self.workspaces[wi].delete_pending = true;
-        if let Err(e) = self.keep_and_close_workspace(ws) {
+        if let Err(e) = self.keep_and_close_workspace_checked(ws, check) {
             // A failed preparation must cancel even a writer that finishes after its timeout.
             let prepared = self.workspaces[wi].kept.as_ref().is_some_and(|s| s.close_pending.is_some() || s.closed);
             if !retry && (!prepared || was_kept.as_ref().is_some_and(|s| s.closed)) {
@@ -177,7 +185,7 @@ impl Server {
         }
     }
 
-    fn delete_workspace_source(&mut self, path: &Path) -> Result<String, String> {
+    pub(super) fn delete_workspace_source(&mut self, path: &Path) -> Result<String, String> {
         if self.source_removed(path) {
             return Err("This source was already deleted. Open Deleted workspaces to restore it.".into());
         }
@@ -343,9 +351,7 @@ impl Server {
             .iter()
             .position(|d| d.workspace.id == identity)
             .ok_or("This workspace was already restored. Cancel to return to the list.")?;
-        if self.workspace_name_used(name, None) {
-            return Err("This name is already used. Choose another name.".into());
-        }
+        self.validate_workspace_name(name, None)?;
         let deleted = self.deleted_workspaces.remove(at);
         let mut saved = deleted.workspace.clone();
         // A replacement keeps its source. The restored copy keeps its contents and can

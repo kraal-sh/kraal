@@ -77,6 +77,12 @@ impl Server {
                 let local = v.into_iter().filter(|p| self.panes[p].agent.kind.is_some()).map(|p| self.pane_info(p));
                 Ok(Response::Panes(local.chain(self.remote_agent_infos()).collect()))
             }
+            req @ (Request::ListDeletedWorkspaces
+            | Request::CreateWorkspace { .. }
+            | Request::RenameWorkspace { .. }
+            | Request::CloseWorkspace { .. }
+            | Request::DeleteWorkspace { .. }
+            | Request::RestoreWorkspace { .. }) => self.workspace_request(req),
             Request::ListWorkspaces => Ok(Response::Workspaces(self.workspace_infos())),
             Request::OpenWorkspace { name } => {
                 self.open_workspace(&name).map(|_| Response::Ok).map_err(|e| format!("{e:#}"))

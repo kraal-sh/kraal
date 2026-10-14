@@ -830,7 +830,18 @@ impl Server {
         }
     }
 
-    fn rename_workspace(&mut self, ws: u32, name: &str) -> Result<(), String> {
+    pub(super) fn validate_workspace_name(&self, name: &str, except: Option<u32>) -> Result<(), String> {
+        if name.trim().is_empty() {
+            Err("Type a name.".into())
+        } else if self.workspace_name_used(name, except) {
+            Err("This name is already used. Choose another name.".into())
+        } else {
+            Ok(())
+        }
+    }
+
+    pub(super) fn rename_workspace(&mut self, ws: u32, name: &str) -> Result<(), String> {
+        self.validate_workspace_name(name, Some(ws))?;
         let wi =
             self.ws_index(ws).ok_or("This workspace is no longer available. Cancel and choose another workspace.")?;
         let old = std::mem::replace(&mut self.workspaces[wi].name, name.to_string());
@@ -848,7 +859,8 @@ impl Server {
         Ok(())
     }
 
-    fn add_workspace(&mut self, name: &str, cwd: Option<PathBuf>) -> Result<u32, String> {
+    pub(super) fn add_workspace(&mut self, name: &str, cwd: Option<PathBuf>) -> Result<u32, String> {
+        self.validate_workspace_name(name, None)?;
         if let Some(dir) = &cwd
             && !dir.is_dir()
         {

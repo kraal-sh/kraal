@@ -9,7 +9,7 @@ use crate::keymap::Action;
 use crate::layout::PaneId;
 use crate::server::bottom_bar::Click;
 use crate::server::render::{BarItem, SideItem};
-use crate::server::ui::{Drag, Mode};
+use crate::server::ui::{Drag, Mode, Picker, WorkspaceDrag};
 use crate::server::{ClientId, Server};
 
 impl Server {
@@ -24,6 +24,30 @@ impl Server {
 
         // A drag in progress owns the mouse until release.
         if let Some(drag) = self.clients.get_mut(&id).and_then(|c| c.drag.take()) {
+            if let Drag::Workspace { mut drag, picker } = drag {
+                let target = (m.col < sw).then(|| self.sidebar_workspace_key(id, m.row)).flatten();
+                drag.moved |= (m.col, m.row) != drag.from;
+                drag.target = target;
+                if matches!(m.kind, MouseKind::Release(MouseButton::Left)) {
+                    if !drag.moved {
+                        let mut item = picker.current()?.clone();
+                        if let crate::persist::WorkspaceKey::Source(path) = drag.workspace {
+                            item.action = crate::server::ui::PickAction::OpenDefinition(path);
+                        }
+                        return Some(self.pick(id, &picker, item));
+                    }
+                    let mode = self.drop_workspace(id, *picker, drag);
+                    return match mode {
+                        Mode::Picker(p) if p.message.is_none() => None,
+                        mode => Some(mode),
+                    };
+                }
+                if matches!(m.kind, MouseKind::Drag(MouseButton::Left)) {
+                    self.clients.get_mut(&id)?.drag = Some(Drag::Workspace { drag, picker });
+                    self.mark_dirty();
+                }
+                return None;
+            }
             // Copy mode came while a press was going to the program: the program gets the
             // release now, and copy mode the mouse from the next press on.
             // The release is that of the button the program saw pressed.
@@ -78,8 +102,9 @@ impl Server {
                     Some(SideItem::Workspace(ws)) => {
                         let mut picker = self.workspace_picker(self.clients[&id].workspace);
                         picker.select(|i| i.action.workspace() == Some(ws));
-                        let item = picker.current()?.clone();
-                        return Some(self.pick(id, &picker, item));
+                        let drag = self.start_workspace_drag(&picker, (m.col, m.row))?;
+                        self.clients.get_mut(&id)?.drag = Some(Drag::Workspace { drag, picker: Box::new(picker) });
+                        return None;
                     }
                     Some(SideItem::ReviewAccount(account)) => {
                         if let Some(existing) = self.accounts.by_id(&account).filter(|a| a.review) {
@@ -90,15 +115,18 @@ impl Server {
                     Some(SideItem::Remote { server, pane }) => self.go_to_remote(id, &server, pane),
                     Some(SideItem::Definition(path)) => {
                         let mut picker = self.workspace_picker(self.clients[&id].workspace);
-                        picker.select(
-                            |i| matches!(&i.action, crate::server::ui::PickAction::OpenDefinition(p) if p == &path),
-                        );
-                        let item = crate::server::ui::PickItem::new(
-                            "",
-                            "",
-                            crate::server::ui::PickAction::OpenDefinition(path),
-                        );
-                        return Some(self.pick(id, &picker, item));
+                        if !picker.items.iter().any(|i| i.action.definition() == Some(path.as_path())) {
+                            picker.items.push(crate::server::ui::PickItem::new(
+                                "",
+                                "",
+                                crate::server::ui::PickAction::OpenDefinition(path.clone()),
+                            ));
+                            picker.refilter();
+                        }
+                        picker.select(|i| i.action.definition() == Some(path.as_path()));
+                        let drag = self.start_workspace_drag(&picker, (m.col, m.row))?;
+                        self.clients.get_mut(&id)?.drag = Some(Drag::Workspace { drag, picker: Box::new(picker) });
+                        return None;
                     }
                     Some(SideItem::Tunnel(port)) => {
                         if let Some(tunnel) = self.tunnels.iter().find(|t| t.spec.local == port) {
@@ -358,11 +386,46 @@ impl Server {
         self.mark_dirty();
     }
 
+    pub(super) fn start_workspace_drag(&self, picker: &Picker, from: (u16, u16)) -> Option<WorkspaceDrag> {
+        Some(WorkspaceDrag {
+            workspace: self.workspace_key(&picker.current()?.action)?,
+            order: picker.items.iter().filter_map(|i| self.workspace_key(&i.action)).collect(),
+            from,
+            list_start: 0,
+            moved: false,
+            target: None,
+            hover: None,
+        })
+    }
+
+    fn sidebar_workspace_key(&self, id: ClientId, row: u16) -> Option<crate::persist::WorkspaceKey> {
+        use crate::server::ui::PickAction;
+        match self.sidebar_hit(id, row)? {
+            SideItem::Workspace(ws) => self.workspace_key(&PickAction::SwitchWorkspace(ws)),
+            SideItem::Definition(path) => self.workspace_key(&PickAction::OpenDefinition(path)),
+            _ => None,
+        }
+    }
+
+    pub(super) fn drop_workspace(&mut self, id: ClientId, mut picker: Picker, drag: WorkspaceDrag) -> Mode {
+        picker.select(|i| self.workspace_key(&i.action).as_ref() == Some(&drag.workspace));
+        picker.message = None;
+        if !picker.query.is_empty() {
+            return picker.result("Clear search to reorder");
+        }
+        let Some(target) = drag.target else { return Mode::Picker(picker) };
+        let before =
+            drag.order.iter().position(|k| *k == target) < drag.order.iter().position(|k| *k == drag.workspace);
+        let mode = self.reorder_workspace_checked(id, drag.workspace, target, before, Some(drag.order));
+        self.return_to_workspaces(id, mode, picker.state())
+    }
+
     pub(super) fn continue_drag(&mut self, id: ClientId, drag: Drag, m: MouseEvent) -> Option<Drag> {
         let released = matches!(m.kind, MouseKind::Release(_));
         let area = self.client_area(id);
         let (_, wi) = self.current_ws(id)?;
         match drag {
+            Drag::Workspace { .. } => None,
             Drag::Border(b, grab) => {
                 let pos = match b.axis {
                     crate::layout::Axis::Row => m.col,
@@ -508,7 +571,9 @@ mod tests {
         server.def_files.push((path.clone(), "missing".into()));
         let row = (0..36).find(|&r| server.sidebar_hit(client, r) == Some(SideItem::Definition(path.clone()))).unwrap();
         let click = MouseEvent { kind: MouseKind::Press(MouseButton::Left), col: 3, row, mods: Default::default() };
-        let Mode::Confirm(q) = server.on_mouse(client, click, false).unwrap() else { panic!() };
+        assert!(server.on_mouse(client, click, false).is_none());
+        let release = MouseEvent { kind: MouseKind::Release(MouseButton::Left), ..click };
+        let Mode::Confirm(q) = server.on_mouse(client, release, false).unwrap() else { panic!() };
         assert!(
             matches!(q.action, crate::server::ui::ConfirmAction::OpenWorkspace(crate::server::ui::PickAction::OpenDefinition(p)) if p == path)
         );
@@ -547,7 +612,11 @@ mod tests {
                     layout.list.x + 2,
                     layout.list.y + 2 + line,
                 ));
-                assert!(matches!(server.on_picker(client, p, event), Mode::Normal));
+                let crate::input::InputEvent::Mouse(press) = event else { panic!() };
+                let Mode::Picker(p) = server.on_picker(client, p, event) else { panic!() };
+                assert_eq!(server.clients[&client].workspace, current);
+                let release = MouseEvent { kind: MouseKind::Release(MouseButton::Left), ..press };
+                assert!(matches!(server.on_picker(client, p, crate::input::InputEvent::Mouse(release)), Mode::Normal));
                 assert_eq!(server.clients[&client].workspace, other, "one click on an unselected row");
                 server.clients.get_mut(&client).unwrap().workspace = current;
             }
@@ -600,5 +669,295 @@ mod tests {
             assert!(matches!(server.existing_checks["claude"], ExistingCheck::Checking));
             assert_eq!(server.jobs.len(), 1, "retry the cached result without duplicating the check in progress");
         }
+    }
+}
+
+#[cfg(test)]
+mod workspace_drag_tests {
+    use super::*;
+    use crate::input::{InputEvent, Key, KeyCode, Mods};
+    use crate::server::{persistence::tests::writer, queue, tests};
+
+    fn event(kind: MouseKind, col: u16, row: u16) -> MouseEvent {
+        MouseEvent { kind, col, row, mods: Mods::NONE }
+    }
+
+    fn names(server: &Server) -> Vec<String> {
+        server
+            .workspace_picker(0)
+            .items
+            .iter()
+            .filter(|i| server.workspace_key(&i.action).is_some())
+            .map(|i| i.label.clone())
+            .collect()
+    }
+
+    fn press(server: &mut Server, client: ClientId, from: usize) -> (Picker, u16, u16) {
+        let picker = server.workspace_picker(server.clients[&client].workspace);
+        let layout = crate::server::overlays::picker_layout(&picker, server.client_screen(client));
+        let (col, row) = (layout.list.x + 2, layout.list.y);
+        let Mode::Picker(picker) = server.on_picker(
+            client,
+            picker,
+            InputEvent::Mouse(event(MouseKind::Press(MouseButton::Left), col, row + from as u16 * 2)),
+        ) else {
+            panic!()
+        };
+        assert!(picker.drag.is_some());
+        (picker, col, row)
+    }
+
+    fn release(server: &mut Server, client: ClientId, picker: Picker, col: u16, row: u16) -> Mode {
+        let screen = server.client_screen(client);
+        let area = crate::server::overlays::picker_layout(&picker, screen).area;
+        let Mode::Picker(picker) =
+            server.on_picker(client, picker, InputEvent::Mouse(event(MouseKind::Drag(MouseButton::Left), col, row)))
+        else {
+            panic!()
+        };
+        assert_eq!(crate::server::overlays::picker_layout(&picker, screen).area, area);
+        if picker.query.is_empty() && picker.drag.as_ref().is_some_and(|d| d.hover.is_some()) {
+            let mut buffer = ratatui::buffer::Buffer::empty(screen);
+            crate::server::overlays::draw_picker(&picker, screen, &mut buffer);
+            assert_eq!(buffer[(col, row)].bg, crate::theme::current().selection);
+        }
+        server.on_picker(client, picker, InputEvent::Mouse(event(MouseKind::Release(MouseButton::Left), col, row)))
+    }
+
+    #[test]
+    fn list_drag_moves_across_rows_without_opening_or_changing_any_clients_workspace() {
+        for (cols, rows) in [(80, 24), (124, 36)] {
+            let (tx, _rx) = queue::channel(32);
+            let mut server = tests::server(tx);
+            let (client, _peer) = tests::client(&mut server);
+            let (other, _peer2) = tests::client(&mut server);
+            server.workspaces.pop();
+            let current = server.clients[&client].workspace;
+            let c = server.clients.get_mut(&client).unwrap();
+            (c.cols, c.rows) = (cols, rows);
+            let b = server.new_workspace("b".into(), None);
+            server.new_workspace("c".into(), None);
+            let d = server.new_workspace("d".into(), None);
+            let saved = writer(&mut server, vec![]);
+            server.keep_and_close_workspace(d).unwrap();
+            server.clients.get_mut(&other).unwrap().workspace = b;
+            let (picker, col, row) = press(&mut server, client, 3);
+            let Mode::Picker(picker) = release(&mut server, client, picker, col, row + 1) else { panic!() };
+            assert_eq!(names(&server), ["d", "test", "b", "c"]);
+            assert_eq!(picker.current().unwrap().action.workspace(), Some(d));
+            assert!(server.workspaces[0].closed());
+            assert_eq!(server.clients[&client].workspace, current);
+            assert_eq!(server.clients[&other].workspace, b);
+            assert!(server.panes.is_empty());
+            let snap = serde_json::from_value(saved.lock().unwrap().last().unwrap().clone()).unwrap();
+            let (tx, _rx3) = queue::channel(32);
+            let mut restored = tests::server(tx);
+            crate::persist::apply(&mut restored, snap).unwrap();
+            assert_eq!(names(&restored), names(&server));
+            let (picker, col, row) = press(&mut server, client, 0);
+            assert!(matches!(release(&mut server, client, picker, col, row + 6), Mode::Picker(_)));
+            assert_eq!(names(&server), ["test", "b", "c", "d"]);
+        }
+    }
+
+    #[test]
+    fn list_drag_from_an_unselected_scrolled_row_keeps_the_viewport_and_destination() {
+        let (tx, _rx) = queue::channel(32);
+        let mut server = tests::server(tx);
+        let (client, _peer) = tests::client(&mut server);
+        let current = server.clients[&client].workspace;
+        let c = server.clients.get_mut(&client).unwrap();
+        (c.cols, c.rows) = (80, 24);
+        for i in 2..=12 {
+            server.new_workspace(format!("workspace-{i}"), None);
+        }
+        let saved = writer(&mut server, vec![]);
+        let mut picker = server.workspace_picker(current);
+        picker.selected = 11;
+        let screen = server.client_screen(client);
+        let layout = crate::server::overlays::picker_layout(&picker, screen);
+        assert_eq!(layout.start, 6);
+        let (col, row) = (layout.list.x + 2, layout.list.y);
+        let Mode::Picker(picker) =
+            server.on_picker(client, picker, InputEvent::Mouse(event(MouseKind::Press(MouseButton::Left), col, row)))
+        else {
+            panic!()
+        };
+        assert_eq!(picker.current().unwrap().label, "workspace-7");
+        assert!(picker.drag.is_some());
+        assert_eq!(crate::server::overlays::picker_layout(&picker, screen).start, layout.start);
+        let Mode::Picker(picker) = server.on_picker(
+            client,
+            picker,
+            InputEvent::Mouse(event(MouseKind::Drag(MouseButton::Left), col, row + layout.row_height)),
+        ) else {
+            panic!()
+        };
+        assert_eq!(crate::server::overlays::picker_layout(&picker, screen).start, layout.start);
+        assert_eq!(picker.drag.as_ref().unwrap().hover, Some(7));
+        let mut buffer = ratatui::buffer::Buffer::empty(screen);
+        crate::server::overlays::draw_picker(&picker, screen, &mut buffer);
+        for (offset, name) in [(0, "workspace-7"), (layout.row_height, "workspace-8")] {
+            let text: String =
+                (layout.list.x..layout.list.right()).map(|x| buffer[(x, row + offset)].symbol()).collect();
+            assert!(text.contains(name), "{text}");
+        }
+        let Mode::Picker(picker) = release(&mut server, client, picker, col, row + layout.row_height) else { panic!() };
+        let mut expected = vec!["test".to_string()];
+        expected.extend((2..=12).map(|i| format!("workspace-{i}")));
+        expected.swap(6, 7);
+        assert_eq!(names(&server), expected);
+        assert_eq!(picker.current().unwrap().label, "workspace-7");
+        assert!(picker.drag.is_none());
+        assert_eq!(server.clients[&client].workspace, current);
+        assert!(server.panes.is_empty());
+        assert_eq!(saved.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn filtered_cancelled_and_stale_drags_never_reorder_or_open_rows() {
+        let (tx, _rx) = queue::channel(32);
+        let mut server = tests::server(tx);
+        let (client, _peer) = tests::client(&mut server);
+        let current = server.clients[&client].workspace;
+        server.new_workspace("test-b".into(), None);
+        let saved = writer(&mut server, vec![]);
+        let (mut picker, col, row) = press(&mut server, client, 0);
+        picker.query = "test".into();
+        picker.refilter();
+        let Mode::Picker(picker) = release(&mut server, client, picker, col, row + 2) else { panic!() };
+        assert_eq!(picker.message.as_deref(), Some("Clear search to reorder"));
+        assert_eq!(picker.current().unwrap().action.workspace(), Some(current));
+        assert_eq!(picker.query, "test");
+        let (picker, _, _) = press(&mut server, client, 0);
+        let Mode::Picker(picker) = release(&mut server, client, picker, 0, 0) else { panic!() };
+        assert!(picker.message.is_none());
+        assert_eq!(picker.current().unwrap().action.workspace(), Some(current));
+        let (picker, col, row) = press(&mut server, client, 0);
+        server.new_workspace("new".into(), None);
+        let Mode::Picker(picker) = release(&mut server, client, picker, col, row + 2) else { panic!() };
+        assert_eq!(picker.message.as_deref(), Some("Order changed. Drag the workspace again."));
+        assert_eq!(names(&server), ["test", "test-b", "new"]);
+        assert_eq!(server.clients[&client].workspace, current);
+        assert!(saved.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn keyboard_and_focus_changes_cancel_a_list_drag_and_clear_its_hint() {
+        let (tx, _rx) = queue::channel(32);
+        let mut server = tests::server(tx);
+        let (client, _peer) = tests::client(&mut server);
+        server.new_workspace("other".into(), None);
+        let saved = writer(&mut server, vec![]);
+        for code in [KeyCode::Esc, KeyCode::Char('x')] {
+            let (picker, col, row) = press(&mut server, client, 0);
+            let Mode::Picker(picker) = server.on_picker(
+                client,
+                picker,
+                InputEvent::Mouse(event(MouseKind::Drag(MouseButton::Left), col, row + 2)),
+            ) else {
+                panic!()
+            };
+            assert!(picker.message.is_some());
+            let Mode::Picker(picker) =
+                server.on_picker(client, picker, InputEvent::Key(Key { code, mods: Mods::NONE, raw: vec![] }))
+            else {
+                panic!()
+            };
+            assert!(picker.drag.is_none());
+            assert!(picker.message.is_none());
+        }
+        let (picker, _, _) = press(&mut server, client, 0);
+        server.clients.get_mut(&client).unwrap().mode = Mode::Picker(picker);
+        server.client_input(client, b"\x1b[O");
+        let Mode::Picker(picker) = &server.clients[&client].mode else { panic!() };
+        assert!(picker.drag.is_none());
+        assert_eq!(names(&server), ["test", "other"]);
+        assert!(saved.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn failed_drag_keeps_the_previous_order_and_retry_uses_the_same_destination() {
+        let (tx, _rx) = queue::channel(32);
+        let mut server = tests::server(tx);
+        let (client, _peer) = tests::client(&mut server);
+        server.new_workspace("b".into(), None);
+        server.new_workspace("c".into(), None);
+        let _saved = writer(&mut server, vec![Err("disk full".into()), Ok(()), Ok(())]);
+        let (picker, col, row) = press(&mut server, client, 0);
+        let Mode::Confirm(mut q) = release(&mut server, client, picker, col, row + 4) else { panic!() };
+        assert!(q.message.contains("Previous order kept"));
+        assert_eq!(names(&server), ["test", "b", "c"]);
+        q.yes = true;
+        assert!(matches!(
+            server.on_confirm(client, q, InputEvent::Key(Key { code: KeyCode::Enter, mods: Mods::NONE, raw: vec![] })),
+            Mode::Picker(_)
+        ));
+        assert_eq!(names(&server), ["b", "c", "test"]);
+    }
+
+    #[test]
+    fn file_drags_preserve_sources_and_deleted_workspace_slots() {
+        use crate::persist::WorkspaceKey;
+        use crate::server::ui::PickAction;
+        let (tx, _rx) = queue::channel(32);
+        let mut server = tests::server(tx);
+        let (client, _peer) = tests::client(&mut server);
+        let current = server.clients[&client].workspace;
+        let deleted = server.new_workspace("deleted".into(), None);
+        let b = server.new_workspace("b".into(), None);
+        let dir = std::env::temp_dir().join(format!("kraal-drag-file-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("recipe.kdl");
+        let source = "// Keep me.\nlayout { pane command=\"never-run\"; }\n";
+        std::fs::write(&path, source).unwrap();
+        server.config.workspace_dirs.push(dir.display().to_string());
+        let keys: Vec<_> = [current, deleted, b]
+            .into_iter()
+            .map(|ws| server.workspace_key(&PickAction::SwitchWorkspace(ws)).unwrap())
+            .chain([WorkspaceKey::Source(crate::workspace::definition_path(&path))])
+            .collect();
+        server.workspace_order = keys;
+        let _saved = writer(&mut server, vec![]);
+        let identity = server.keep_and_delete_workspace(deleted).unwrap();
+        let (picker, col, row) = press(&mut server, client, 2);
+        let Mode::Picker(picker) = release(&mut server, client, picker, col, row) else { panic!() };
+        assert_eq!(picker.current().unwrap().label, "recipe");
+        assert_eq!(names(&server), ["recipe", "test", "b"]);
+        server.restore_deleted_workspace(&identity, "deleted").unwrap();
+        assert_eq!(names(&server), ["recipe", "deleted", "test", "b"]);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), source);
+        assert!(!path.with_extension("kdl.bak").exists());
+        assert!(server.panes.is_empty());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn sidebar_drag_keeps_focus_and_escape_cancels_the_pending_click() {
+        let (tx, _rx) = queue::channel(32);
+        let mut server = tests::server(tx);
+        let (client, _peer) = tests::client(&mut server);
+        let current = server.clients[&client].workspace;
+        server.new_workspace("b".into(), None);
+        let c = server.new_workspace("c".into(), None);
+        let _saved = writer(&mut server, vec![]);
+        let row = |server: &Server, ws| {
+            (0..36).find(|&r| server.sidebar_hit(client, r) == Some(SideItem::Workspace(ws))).unwrap()
+        };
+        let from = row(&server, c);
+        let to = row(&server, current);
+        assert!(server.on_mouse(client, event(MouseKind::Press(MouseButton::Left), 3, from), false).is_none());
+        assert!(server.on_mouse(client, event(MouseKind::Drag(MouseButton::Left), 3, to), false).is_none());
+        assert!(server.on_mouse(client, event(MouseKind::Release(MouseButton::Left), 3, to), false).is_none());
+        assert_eq!(names(&server), ["c", "test", "b"]);
+        assert_eq!(server.clients[&client].workspace, current);
+        let from = row(&server, c);
+        server.on_mouse(client, event(MouseKind::Press(MouseButton::Left), 3, from), false);
+        server.client_input(client, b"\x1b");
+        server.flush_client_input(client);
+        assert!(server.clients[&client].drag.is_none());
+        server.on_mouse(client, event(MouseKind::Release(MouseButton::Left), 3, from), false);
+        assert_eq!(server.clients[&client].workspace, current);
+        assert!(server.panes.is_empty());
     }
 }

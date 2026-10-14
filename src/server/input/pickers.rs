@@ -16,6 +16,44 @@ use crate::server::{ClientId, Server};
 
 impl Server {
     pub(super) fn on_picker(&mut self, id: ClientId, mut p: Picker, ev: InputEvent) -> Mode {
+        if p.drag.is_some() && !matches!(ev, InputEvent::Mouse(_)) {
+            p.drag = None;
+            p.message = None;
+            if matches!(ev, InputEvent::Key(Key { code: KeyCode::Esc, .. })) {
+                return Mode::Picker(p);
+            }
+        }
+        if let InputEvent::Mouse(m) = &ev
+            && p.drag.is_some()
+        {
+            let layout = crate::server::overlays::picker_layout(&p, self.client_screen(id));
+            let mut drag = p.drag.take().unwrap();
+            drag.moved |= (m.col, m.row) != drag.from;
+            let at = layout.row_at(m.col, m.row).filter(|&i| i < p.filtered.len());
+            drag.target = at.and_then(|i| self.workspace_key(&p.items[p.filtered[i]].action));
+            drag.hover = at.filter(|_| drag.target.is_some());
+            if matches!(m.kind, MouseKind::Release(MouseButton::Left)) {
+                if drag.moved {
+                    return self.drop_workspace(id, p, drag);
+                }
+                if let Some(item) = p.current().cloned()
+                    && self.workspace_key(&item.action).as_ref() == Some(&drag.workspace)
+                {
+                    return self.pick(id, &p, item);
+                }
+                return p.result("Workspace unavailable. Select a workspace.");
+            } else if matches!(m.kind, MouseKind::Drag(MouseButton::Left)) {
+                if p.query.is_empty() {
+                    p.message = Some("Release to move here".into());
+                } else {
+                    p.message = Some("Clear search to reorder".into());
+                }
+                p.drag = Some(drag);
+            } else {
+                p.message = None;
+            }
+            return Mode::Picker(p);
+        }
         if let InputEvent::Mouse(MouseEvent { kind: MouseKind::Press(MouseButton::Left), col, row: 0, .. }) = &ev
             && let Some(super::super::render::BarItem::Toast(_, action)) = self.tab_bar_hit(id, *col)
         {
@@ -322,6 +360,13 @@ impl Server {
                     if i < p.filtered.len() {
                         p.selected = i;
                         let Some(item) = p.current().cloned() else { return Mode::Picker(p) };
+                        if p.kind == PickerKind::Workspace {
+                            p.drag = self.start_workspace_drag(&p, (col, row));
+                            if let Some(drag) = &mut p.drag {
+                                drag.list_start = layout.start;
+                                return Mode::Picker(p);
+                            }
+                        }
                         return self.pick(id, &p, item);
                     }
                 } else if !layout.area.contains(ratatui::layout::Position::new(col, row)) {
@@ -471,6 +516,9 @@ impl Server {
                 self.workspace_picker(ws)
             };
             picker.restore(state);
+            if let Mode::Picker(previous) = &mut self.clients.get_mut(&id).unwrap().mode {
+                picker.drag = previous.drag.take();
+            }
             if picker.undo.as_ref().is_some_and(|id| !self.deleted_workspaces.iter().any(|d| &d.workspace.id == id)) {
                 picker.undo = None;
                 picker.message = None;
@@ -598,6 +646,11 @@ impl Server {
         picker.source_workspaces = self.workspaces.iter().filter(|w| w.definition.is_some()).map(|w| w.id).collect();
         picker.review_workspaces = self.workspaces.iter().filter(|w| w.source_status.is_some()).map(|w| w.id).collect();
         picker.layout_undos = self.workspaces.iter().filter(|w| w.layout_undo.is_some()).map(|w| w.id).collect();
+        // Rows must not shift under a press when the new selection has different actions.
+        for index in 0..picker.filtered.len() {
+            picker.selected = index;
+            picker.min_items = picker.min_items.max(picker.action_keys().len());
+        }
         picker.selected = selected;
         picker
     }
@@ -844,7 +897,11 @@ mod tests {
                     mods: Mods::NONE,
                 })
             };
-            assert!(matches!(server.on_picker(client, p, click(MouseButton::Left)), Mode::Normal));
+            let Mode::Picker(p) = server.on_picker(client, p, click(MouseButton::Left)) else { panic!() };
+            assert_eq!(server.clients[&client].workspace, current);
+            let InputEvent::Mouse(press) = click(MouseButton::Left) else { panic!() };
+            let release = InputEvent::Mouse(MouseEvent { kind: MouseKind::Release(MouseButton::Left), ..press });
+            assert!(matches!(server.on_picker(client, p, release), Mode::Normal));
             assert_eq!(server.clients[&client].workspace, ws);
             assert!(!server.workspaces[1].closed());
             assert!(server.panes.is_empty());

@@ -71,7 +71,13 @@ pub const STATE_V2: Feature =
 /// What this kraal's server lists.
 pub const WORKSPACE_FILES: Feature =
     Feature { name: "workspace_files", does: "preview imports and export layouts safely", check_first: false };
-pub const FEATURES: [Feature; 6] = [LIST_AGENTS, BUFFERS, EDIT_SUDO, ACCOUNT_IDS, STATE_V2, WORKSPACE_FILES];
+pub const WORKSPACE_LIFECYCLE: Feature = Feature {
+    name: "workspace_lifecycle",
+    does: "create, rename, close, delete and restore workspaces",
+    check_first: false,
+};
+pub const FEATURES: [Feature; 7] =
+    [LIST_AGENTS, BUFFERS, EDIT_SUDO, ACCOUNT_IDS, STATE_V2, WORKSPACE_FILES, WORKSPACE_LIFECYCLE];
 
 /// The names of this kraal's server features, as it lists them.
 pub fn feature_names() -> Vec<String> {
@@ -317,6 +323,27 @@ pub enum Request {
     /// have `session`).
     ListAgents,
     ListWorkspaces,
+    ListDeletedWorkspaces,
+    CreateWorkspace {
+        name: String,
+        cwd: PathBuf,
+    },
+    RenameWorkspace {
+        workspace: String,
+        name: String,
+    },
+    CloseWorkspace {
+        workspace: String,
+        expected: Option<String>,
+    },
+    DeleteWorkspace {
+        workspace: String,
+        expected: Option<String>,
+    },
+    RestoreWorkspace {
+        workspace: String,
+        name: Option<String>,
+    },
     OpenWorkspace {
         name: String,
     },
@@ -544,6 +571,12 @@ impl Request {
             Request::EditRemote { sudo: true, .. } => Some(EDIT_SUDO),
             // An older server reads a restart as a stop, and `kraal restart` starts the next one.
             Request::KillServer { .. } => None,
+            Request::ListDeletedWorkspaces
+            | Request::CreateWorkspace { .. }
+            | Request::RenameWorkspace { .. }
+            | Request::CloseWorkspace { .. }
+            | Request::DeleteWorkspace { .. }
+            | Request::RestoreWorkspace { .. } => Some(WORKSPACE_LIFECYCLE),
             Request::Ping
             | Request::ListPanes
             | Request::ListWorkspaces
@@ -609,6 +642,11 @@ pub enum Response {
         token: String,
     },
     Path(PathBuf),
+    WorkspacePreview {
+        workspace: String,
+        revision: String,
+        question: Option<String>,
+    },
     ImportPreview(crate::workspace::ImportPreview),
     ExportPreview {
         identity: String,
@@ -697,6 +735,30 @@ pub struct WorkspaceInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn workspace_lifecycle_requests_advertise_their_feature_and_default_to_preview() {
+        for json in [
+            r#"{"cmd":"list_deleted_workspaces"}"#,
+            r#"{"cmd":"create_workspace","name":"api","cwd":"/tmp"}"#,
+            r#"{"cmd":"rename_workspace","workspace":"api","name":"backend"}"#,
+            r#"{"cmd":"close_workspace","workspace":"api"}"#,
+            r#"{"cmd":"delete_workspace","workspace":"api"}"#,
+            r#"{"cmd":"restore_workspace","workspace":"api"}"#,
+        ] {
+            let request: Request = serde_json::from_str(json).unwrap();
+            assert_eq!(request.needs(), Some(WORKSPACE_LIFECYCLE));
+            let copy: Request = serde_json::from_str(&serde_json::to_string(&request).unwrap()).unwrap();
+            assert_eq!(copy.name(), request.name());
+            match request {
+                Request::CloseWorkspace { expected, .. } | Request::DeleteWorkspace { expected, .. } => {
+                    assert!(expected.is_none())
+                }
+                _ => {}
+            }
+        }
+        assert!(feature_names().contains(&WORKSPACE_LIFECYCLE.name.to_string()));
+    }
 
     #[test]
     fn workspace_identity_is_optional_for_older_servers_and_clients() {
