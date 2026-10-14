@@ -45,8 +45,12 @@ name (or the search text) and shows the folder inherited from the current pane. 
 then Enter or click **Add**. **Add**, **From file...** and **Cancel** share one row when they fit.
 Tab moves between the field and buttons; Esc or **Cancel** returns
 to the list with its search and selection. A direct shortcut returns to the terminal.
-Names are checked against the whole session, including closed workspaces and workspace files.
-A taken or empty name keeps **Add** (or **Rename**) as the action: correct the name and submit
+Add, Rename, Duplicate, Restore and import use the same name rules, including from the command
+line: names cannot be empty, contain control characters (such as tabs or newlines), or be taken
+by another workspace. Spaces, Unicode, `/` and leading dots are allowed. Names are checked
+against the whole session, including closed workspaces, workspaces with restore errors and
+files not yet imported. Rename may keep its current name; import may use its own file's name.
+An invalid or taken name keeps **Add** (or **Rename**) as the action: correct the name and submit
 again. **Starts in** stays visible alongside an Add error.
 
 An immediate shell or save failure keeps the form and its input, with **Retry** and **Cancel**.
@@ -98,7 +102,7 @@ no longer matches the search, the search clears to show it.
 Select an open or closed saved workspace, press Tab and choose **Duplicate**. The shared Name
 form proposes an unused name: `api-copy`, then `api-copy-2`, and so on. Edit it if needed and
 press Enter or click **Duplicate**. Esc or **Cancel** returns to the same search and selection.
-A taken or empty name stays in the form so you can correct it.
+An invalid or taken name stays in the form so you can correct it.
 
 The result selects the new **Closed** workspace and says **Workspace duplicated · Enter Open**.
 It is saved before that result appears. Opening it is optional; the workspace currently shown

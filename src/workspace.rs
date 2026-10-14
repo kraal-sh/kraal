@@ -18,6 +18,37 @@ use anyhow::{Context as _, Result, anyhow};
 use kdl::{KdlDocument, KdlEntry, KdlError, KdlNode, KdlValue};
 use serde::{Deserialize, Serialize};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NameError {
+    Empty,
+    Control,
+    Used,
+}
+
+impl fmt::Display for NameError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Empty => "Type a name.",
+            Self::Control => "Choose a name without control characters.",
+            Self::Used => "This name is already used. Choose another name.",
+        })
+    }
+}
+
+impl std::error::Error for NameError {}
+
+pub fn validate_name(name: &str, used: bool) -> Result<(), NameError> {
+    if name.trim().is_empty() {
+        Err(NameError::Empty)
+    } else if name.chars().any(char::is_control) {
+        Err(NameError::Control)
+    } else if used {
+        Err(NameError::Used)
+    } else {
+        Ok(())
+    }
+}
+
 /// How a split arranges its children.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 pub enum Axis {
@@ -1419,6 +1450,36 @@ fn quote(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn workspace_name_rules() {
+        for (name, used, expected) in [
+            ("", false, Err(NameError::Empty)),
+            ("  \u{2003}", true, Err(NameError::Empty)),
+            ("\t\n", false, Err(NameError::Empty)),
+            ("work", true, Err(NameError::Used)),
+            ("work", false, Ok(())),
+            ("My workspace 日本", false, Ok(())),
+            (".hidden", false, Ok(())),
+            (".", false, Ok(())),
+            ("..", false, Ok(())),
+            ("a/b", false, Ok(())),
+            ("a\\b", false, Ok(())),
+            (" work ", false, Ok(())),
+        ] {
+            assert_eq!(validate_name(name, used), expected, "{name:?}, used={used}");
+        }
+        for control in ('\0'..='\u{1f}').chain('\u{7f}'..='\u{9f}') {
+            for name in [format!("{control}work"), format!("a{control}b"), format!("work{control}")] {
+                for used in [false, true] {
+                    assert_eq!(validate_name(&name, used), Err(NameError::Control), "{name:?}");
+                }
+            }
+        }
+        assert_eq!(NameError::Empty.to_string(), "Type a name.");
+        assert_eq!(NameError::Control.to_string(), "Choose a name without control characters.");
+        assert_eq!(NameError::Used.to_string(), "This name is already used. Choose another name.");
+    }
 
     #[test]
     fn file_names_stay_in_their_directory() {

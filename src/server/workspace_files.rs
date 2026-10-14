@@ -63,15 +63,7 @@ impl Server {
     ) -> Result<u32> {
         let preview = self.preview_import(path)?;
         anyhow::ensure!(preview.revision == *expected, "File changed since preview. Preview it again before adding.");
-        anyhow::ensure!(!name.trim().is_empty(), "Type a name.");
-        anyhow::ensure!(!name.chars().any(char::is_control), "Choose a name without control characters.");
-        let used = self.workspaces.iter().any(|w| w.name == name)
-            || self.unrestored.iter().any(|w| w.name == name)
-            || self.definitions().iter().any(|(p, def)| {
-                !paths::same_file(p, &preview.path)
-                    && def.as_ref().map_or_else(|_| p.file_stem().is_some_and(|s| s == name), |d| d.name == name)
-            });
-        anyhow::ensure!(!used, "This name is already used. Choose another name.");
+        workspace::validate_name(name, self.workspace_name_used(name, None, Some(&preview.path)))?;
         for missing in &preview.accounts {
             anyhow::ensure!(
                 choices.iter().any(|(reference, id)| reference == &missing.reference
@@ -157,6 +149,44 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("kraal-w10-{name}-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         (server, std::fs::canonicalize(dir).unwrap())
+    }
+
+    #[test]
+    fn import_uses_shared_name_occupancy_and_excludes_its_own_source() {
+        let (mut server, dir) = setup("names");
+        server.config.workspace_dirs.push(dir.display().to_string());
+        let path = dir.join("recipe.kdl");
+        let source = "layout { pane command=\"true\"; }";
+        std::fs::write(&path, source).unwrap();
+        std::fs::write(dir.join("invalid.kdl"), "{").unwrap();
+        let saved = super::super::persistence::tests::writer(&mut server, vec![]);
+        let preview = server.preview_import(&path).unwrap();
+        assert_eq!(
+            server.import_layout(&path, "new\n", &preview.revision, &[]).unwrap_err().to_string(),
+            "Choose a name without control characters."
+        );
+        assert_eq!(
+            server.import_layout(&path, "invalid", &preview.revision, &[]).unwrap_err().to_string(),
+            "This name is already used. Choose another name."
+        );
+        assert!(saved.lock().unwrap().is_empty());
+        let ws = server.import_layout(&path, "recipe", &preview.revision, &[]).unwrap();
+        server.rename_workspace(ws, "personal").unwrap();
+        assert!(!server.workspace_name_used("recipe", None, None));
+        assert!(!server.workspace_name_used("personal", Some(ws), None));
+        assert!(
+            server
+                .import_layout(&path, "another", &preview.revision, &[])
+                .unwrap_err()
+                .to_string()
+                .contains("already used by personal")
+        );
+        let other = dir.join("other.kdl");
+        std::fs::write(&other, source).unwrap();
+        let preview = server.preview_import(&other).unwrap();
+        server.import_layout(&other, "recipe", &preview.revision, &[]).unwrap();
+        assert_eq!(std::fs::read_to_string(path).unwrap(), source);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

@@ -32,6 +32,13 @@ pub struct WorkspaceForm {
     undo_layout: Option<Box<crate::persist::WorkspaceSnap>>,
 }
 
+fn name_form_error(error: crate::workspace::NameError) -> String {
+    match error {
+        crate::workspace::NameError::Used => "This name is already used.".into(),
+        _ => error.to_string(),
+    }
+}
+
 fn verb(p: &Prompt) -> &'static str {
     if matches!(p.action, PromptAction::ReviewWorkspace(_)) {
         let form = p.workspace_form.as_ref().unwrap();
@@ -272,7 +279,7 @@ impl Server {
 
     pub(super) fn add_workspace_form(&self, id: ClientId, from: Option<&Picker>) -> Prompt {
         let name = from.map(|p| p.query.trim()).filter(|s| !s.is_empty()).map(str::to_owned).unwrap_or_else(|| {
-            (1..).map(|n| format!("workspace-{n}")).find(|n| !self.workspace_name_used(n, None)).unwrap()
+            (1..).map(|n| format!("workspace-{n}")).find(|n| !self.workspace_name_used(n, None, None)).unwrap()
         });
         let mut p = Prompt::new("Add workspace", &name, PromptAction::NewWorkspace);
         let form = p.workspace_form.as_mut().unwrap();
@@ -298,15 +305,6 @@ impl Server {
         Mode::Prompt(p)
     }
 
-    pub(super) fn workspace_name_used(&self, name: &str, except: Option<u32>) -> bool {
-        self.workspaces.iter().any(|w| Some(w.id) != except && w.name == name)
-            || self.unrestored.iter().any(|w| w.name == name)
-            || self.definitions().iter().any(|(path, def)| {
-                !matches!(self.definition_workspace(path), Ok(Some(_)))
-                    && def.as_ref().map_or_else(|_| path.file_stem().is_some_and(|s| s == name), |def| def.name == name)
-            })
-    }
-
     pub(super) fn duplicate_workspace_form(&self, ws: u32, from: &Picker) -> Mode {
         let Some(wi) = self.ws_index(ws) else {
             return self.workspace_picker(0).result("Workspace unavailable. Select a workspace to duplicate.");
@@ -314,7 +312,7 @@ impl Server {
         let base = format!("{}-copy", self.workspaces[wi].name);
         let name = std::iter::once(base.clone())
             .chain((2..).map(|n| format!("{base}-{n}")))
-            .find(|n| !self.workspace_name_used(n, None))
+            .find(|n| !self.workspace_name_used(n, None, None))
             .unwrap();
         let mut p = Prompt::new("Duplicate workspace", &name, PromptAction::DuplicateWorkspace(ws));
         p.workspace_form.as_mut().unwrap().back = Some(from.state());
@@ -727,7 +725,10 @@ impl Server {
                     Some((a.reference.clone(), a.choices.get(form.choices[i].checked_sub(1)?)?.0.clone()))
                 })
                 .collect::<Vec<_>>();
-            return match self.import_layout(&preview.path, p.value.trim(), &preview.revision, &choices) {
+            let result = crate::workspace::validate_name(&p.value, false)
+                .map_err(anyhow::Error::new)
+                .and_then(|()| self.import_layout(&preview.path, p.value.trim(), &preview.revision, &choices));
+            return match result {
                 Ok(ws) => {
                     self.show_workspace(id, ws);
                     self.toast(id, "Workspace added. Commands wait for you to start them.");
@@ -742,20 +743,17 @@ impl Server {
                 }
             };
         }
+        if let Err(error) = crate::workspace::validate_name(&p.value, false) {
+            p.workspace_form.as_mut().unwrap().invalid_name = true;
+            p.error = Some(error.to_string());
+            p.scroll = 0;
+            return Mode::Prompt(p);
+        }
         let name = p.value.trim();
         if let PromptAction::DuplicateWorkspace(source) = p.action {
-            let validation = if name.is_empty() {
-                Some("Type a name.")
-            } else if self.workspace_name_used(name, None) {
-                Some("This name is already used.")
-            } else {
-                None
-            };
-            p.workspace_form.as_mut().unwrap().invalid_name = validation.is_some();
-            let result = match validation {
-                Some(error) => Err(error.into()),
-                None => self.duplicate_workspace(source, name),
-            };
+            let validation = self.validate_workspace_name(name, None);
+            p.workspace_form.as_mut().unwrap().invalid_name = validation.is_err();
+            let result = validation.map_err(name_form_error).and_then(|()| self.duplicate_workspace(source, name));
             return match result {
                 Ok(ws) => {
                     self.refresh_workspace_pickers();
@@ -776,11 +774,7 @@ impl Server {
             };
         }
         if let PromptAction::RestoreWorkspace(identity) = &p.action {
-            let result = if name.is_empty() {
-                Err("Type a name.".into())
-            } else {
-                self.restore_deleted_workspace(identity, name)
-            };
+            let result = self.restore_deleted_workspace(identity, name);
             return match result {
                 Ok(ws) => {
                     self.refresh_workspace_pickers();
@@ -802,16 +796,10 @@ impl Server {
             PromptAction::NewWorkspace => None,
             _ => unreachable!("a workspace name form"),
         };
-        let validation = if name.is_empty() {
-            Some("Type a name.")
-        } else if self.workspace_name_used(name, target) {
-            Some("This name is already used.")
-        } else {
-            None
-        };
-        p.workspace_form.as_mut().unwrap().invalid_name = validation.is_some();
-        let result = if let Some(error) = validation {
-            Err(error.into())
+        let validation = self.validate_workspace_name(name, target);
+        p.workspace_form.as_mut().unwrap().invalid_name = validation.is_err();
+        let result = if let Err(error) = validation {
+            Err(name_form_error(error))
         } else if let Some(ws) = target {
             self.rename_workspace(ws, name)
         } else {
@@ -833,18 +821,8 @@ impl Server {
         }
     }
 
-    pub(super) fn validate_workspace_name(&self, name: &str, except: Option<u32>) -> Result<(), String> {
-        if name.trim().is_empty() {
-            Err("Type a name.".into())
-        } else if self.workspace_name_used(name, except) {
-            Err("This name is already used. Choose another name.".into())
-        } else {
-            Ok(())
-        }
-    }
-
     pub(super) fn rename_workspace(&mut self, ws: u32, name: &str) -> Result<(), String> {
-        self.validate_workspace_name(name, Some(ws))?;
+        self.validate_workspace_name(name, Some(ws)).map_err(|e| e.to_string())?;
         let wi =
             self.ws_index(ws).ok_or("This workspace is no longer available. Cancel and choose another workspace.")?;
         let old = std::mem::replace(&mut self.workspaces[wi].name, name.to_string());
@@ -863,7 +841,7 @@ impl Server {
     }
 
     pub(super) fn add_workspace(&mut self, name: &str, cwd: Option<PathBuf>) -> Result<u32, String> {
-        self.validate_workspace_name(name, None)?;
+        self.validate_workspace_name(name, None).map_err(|e| e.to_string())?;
         if let Some(dir) = &cwd
             && !dir.is_dir()
         {
@@ -1186,6 +1164,13 @@ mod tests {
             for expected in ["File", "Name    personal", "1 tab · 1 pane", "Commands wait", "Enter Add"] {
                 assert!(text(&buf).contains(expected), "{}", text(&buf));
             }
+            p.value = "personal\n".into();
+            let Mode::Prompt(mut p) = server.on_workspace_form(client, p, key("enter")) else { panic!() };
+            assert_eq!(p.value, "personal\n");
+            assert_eq!(p.error.as_deref(), Some("Choose a name without control characters."));
+            assert!(p.workspace_form.as_ref().unwrap().preview.is_some());
+            assert!(server.panes.is_empty());
+            p.value = "personal".into();
             super::super::persistence::tests::writer(&mut server, vec![Ok(())]);
             assert!(matches!(server.on_workspace_form(client, p, key("enter")), Mode::Normal));
             assert!(server.panes.values().all(|p| p.suspended));
@@ -1452,7 +1437,7 @@ mod tests {
             list.query = "test".into();
             list.refilter();
             let Mode::Prompt(mut p) = server.duplicate_workspace_form(ws, &list) else { panic!() };
-            for value in ["", "test"] {
+            for value in ["", "test", "copy\n"] {
                 p.value = value.into();
                 let Mode::Prompt(next) = server.on_workspace_form(client, p, key("enter")) else { panic!() };
                 assert!(next.error.is_some());
@@ -1501,7 +1486,7 @@ mod tests {
             let (client, _peer) = super::super::tests::client(&mut server);
             let ws = server.workspaces[0].id;
             server.new_workspace("taken".into(), None);
-            for name in ["taken", " "] {
+            for name in ["taken", " ", "new\n"] {
                 for rename in [false, true] {
                     let mut p = if rename {
                         let Mode::Prompt(p) = server.rename_workspace_form(ws, None) else { panic!() };

@@ -13,7 +13,26 @@ pub enum DeleteTarget {
 }
 
 impl Server {
+    pub(super) fn workspace_name_used(&self, name: &str, except: Option<u32>, source: Option<&Path>) -> bool {
+        self.workspaces.iter().any(|w| Some(w.id) != except && w.name == name)
+            || self.unrestored.iter().any(|w| w.name == name)
+            || self.definitions().iter().any(|(path, def)| {
+                !source.is_some_and(|source| crate::paths::same_file(path, source))
+                    && !matches!(self.definition_workspace(path), Ok(Some(_)))
+                    && def.as_ref().map_or_else(|_| path.file_stem().is_some_and(|s| s == name), |def| def.name == name)
+            })
+    }
+
+    pub(super) fn validate_workspace_name(
+        &self,
+        name: &str,
+        except: Option<u32>,
+    ) -> Result<(), crate::workspace::NameError> {
+        crate::workspace::validate_name(name, self.workspace_name_used(name, except, None))
+    }
+
     pub(super) fn duplicate_workspace(&mut self, source: u32, name: &str) -> Result<u32, String> {
+        self.validate_workspace_name(name, None).map_err(|e| e.to_string())?;
         let wi = self
             .ws_index(source)
             .ok_or("This workspace is no longer available. Cancel and choose another workspace.")?;
@@ -299,11 +318,11 @@ impl Server {
             return self.deleted_workspace_picker().result("Workspace already restored");
         };
         let name = saved.workspace.name.clone();
-        if self.workspace_name_used(&name, None) {
+        if self.workspace_name_used(&name, None, None) {
             let base = format!("{name}-restored");
             let proposed = std::iter::once(base.clone())
                 .chain((2..).map(|n| format!("{base}-{n}")))
-                .find(|n| !self.workspace_name_used(n, None))
+                .find(|n| !self.workspace_name_used(n, None, None))
                 .unwrap();
             let mut p = Prompt::new("Restore workspace", &proposed, PromptAction::RestoreWorkspace(identity.into()));
             p.error = Some(format!("{name} is already used. Choose another name."));
@@ -351,7 +370,7 @@ impl Server {
             .iter()
             .position(|d| d.workspace.id == identity)
             .ok_or("This workspace was already restored. Cancel to return to the list.")?;
-        self.validate_workspace_name(name, None)?;
+        self.validate_workspace_name(name, None).map_err(|e| e.to_string())?;
         let deleted = self.deleted_workspaces.remove(at);
         let mut saved = deleted.workspace.clone();
         // A replacement keeps its source. The restored copy keeps its contents and can
@@ -427,6 +446,69 @@ mod tests {
             assert!(start.elapsed() < crate::testing::PATIENCE, "the copied pane did not reach the expected state");
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
+    }
+
+    #[test]
+    fn naming_mutations_reject_controls_before_changing_state() {
+        let (tx, _rx) = super::super::queue::channel(32);
+        let mut server = super::super::tests::server(tx);
+        let ws = server.new_workspace("original".into(), None);
+        let saved = writer(&mut server, vec![]);
+        let error = "Choose a name without control characters.";
+        assert_eq!(server.add_workspace("new\n", None).unwrap_err(), error);
+        assert_eq!(server.rename_workspace(ws, "\toriginal").unwrap_err(), error);
+        assert_eq!(server.duplicate_workspace(ws, "co\u{85}py").unwrap_err(), error);
+        assert_eq!(server.workspaces.len(), 1);
+        assert_eq!(server.workspaces[0].name, "original");
+        assert!(server.panes.is_empty());
+        assert!(saved.lock().unwrap().is_empty());
+
+        assert_eq!(
+            server.duplicate_workspace(ws, "original").unwrap_err(),
+            crate::workspace::NameError::Used.to_string()
+        );
+        let identity = server.keep_and_delete_workspace(ws).unwrap();
+        let writes = saved.lock().unwrap().len();
+        assert_eq!(server.restore_deleted_workspace(&identity, "restored\r").unwrap_err(), error);
+        assert!(server.workspaces.is_empty());
+        assert_eq!(server.deleted_workspaces[0].workspace.id, identity);
+        assert_eq!(server.deleted_workspaces[0].workspace.name, "original");
+        assert_eq!(saved.lock().unwrap().len(), writes);
+        let restored = server.restore_deleted_workspace(&identity, "restored").unwrap();
+        assert_eq!(server.workspaces[0].id, restored);
+        assert_eq!(server.workspaces[0].stable_id, identity);
+    }
+
+    #[test]
+    fn restore_preserves_spaces_in_an_existing_saved_name() {
+        let (tx, _rx) = super::super::queue::channel(32);
+        let mut server = super::super::tests::server(tx);
+        let ws = server.new_workspace(" personal ".into(), None);
+        writer(&mut server, vec![]);
+        let identity = server.keep_and_delete_workspace(ws).unwrap();
+        assert!(matches!(server.restore_workspace_mode(0, &identity, None), Mode::Picker(_)));
+        assert_eq!(server.workspaces[0].name, " personal ");
+        assert_eq!(server.workspaces[0].stable_id, identity);
+    }
+
+    #[test]
+    fn saved_names_remain_readable_and_restore_offers_a_correctable_name() {
+        let (tx, _rx) = super::super::queue::channel(32);
+        let mut server = super::super::tests::server(tx);
+        server.new_workspace("old\nname".into(), None);
+        let snapshot = persist::snapshot(&server);
+        server.workspaces.clear();
+        persist::apply(&mut server, snapshot).unwrap();
+        assert_eq!(server.workspaces[0].name, "old\nname");
+        writer(&mut server, vec![]);
+        let identity = server.keep_and_delete_workspace(server.workspaces[0].id).unwrap();
+        let Mode::Prompt(mut form) = server.restore_workspace_mode(0, &identity, None) else { panic!() };
+        assert_eq!(form.value, "old\nname");
+        assert_eq!(form.error.as_deref(), Some("Choose a name without control characters."));
+        form.value = "recovered".into();
+        assert!(matches!(server.submit_workspace_form(0, form), Mode::Picker(_)));
+        assert!(server.deleted_workspaces.is_empty());
+        assert_eq!(server.workspaces[0].name, "recovered");
     }
 
     #[test]
