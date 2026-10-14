@@ -553,7 +553,7 @@ impl Server {
                 );
             }
             buf.set_stringn(button.x, button.y, label, usize::from(button.width), Style::default().fg(th().accent));
-            if button.y + 2 < screen.bottom() {
+            if self.workspaces[wi].kept.is_some() && button.y + 2 < screen.bottom() {
                 buf.set_stringn(
                     button.x,
                     button.y + 2,
@@ -1232,10 +1232,8 @@ impl Server {
                     self.panes.get(p).filter(|pane| pane.agent.kind.is_some()).map(|pane| (*p, pane.agent.state))
                 })
                 .collect();
-            let (icon, color) = match states.iter().map(|(_, s)| *s).max_by_key(urgency) {
-                Some(s) => (t.icon(s), t.state_color(s)),
-                None => (t.icon(AgentState::Working), t.dim),
-            };
+            let color = states.iter().map(|(_, s)| *s).max_by_key(urgency).map_or(t.dim, |s| t.state_color(s));
+            let icon = t.icon(if ws.closed() { AgentState::Idle } else { AgentState::Working });
             let (tabs, panes) = ws.counts();
             let detail = format!("{}{sep}{}{sep}{}", ws.status(), plural(tabs, "tab"), plural(panes, "pane"));
             entry(
@@ -2053,6 +2051,71 @@ pub(super) fn key_list(list: &[(&str, &str)]) -> Vec<Span<'static>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn screen_close_marks_the_workspace_on_screen_as_current() {
+        for (cols, rows) in [(80, 24), (124, 36)] {
+            let (tx, _rx) = super::super::queue::channel(32);
+            let mut server = super::super::tests::server(tx);
+            let (client, _peer) = super::super::tests::client(&mut server);
+            let main = server.workspaces[0].id;
+            server.workspaces[0].name = "main".into();
+            let web = server.new_workspace("web".into(), None);
+            server.show_workspace(client, web);
+            let c = server.clients.get_mut(&client).unwrap();
+            (c.cols, c.rows) = (cols, rows);
+            super::super::persistence::tests::writer(&mut server, vec![Ok(()), Ok(())]);
+            let mode = server.close_workspace(client, web);
+            let Mode::Picker(p) = &mode else { panic!() };
+            assert_eq!(p.current().unwrap().action.workspace(), Some(web));
+            assert_eq!(server.clients[&client].workspace, main);
+            server.clients.get_mut(&client).unwrap().mode = mode;
+            let mut buf = Buffer::empty(Rect::new(0, 0, cols, rows));
+            server.compose(client, 0, &mut buf);
+            let shown: Vec<String> =
+                buf.content.chunks(cols as usize).map(|row| row.iter().map(|c| c.symbol()).collect()).collect();
+            let current: Vec<_> = shown.iter().enumerate().filter(|(_, row)| row.contains("Current")).collect();
+            assert_eq!(current.len(), 1, "{shown:?}");
+            let (index, row) = current[0];
+            assert!(row.contains("Open") && shown[index - 1].contains("main"), "{shown:?}");
+            assert!(!shown.iter().any(|row| row.contains("Closed") && row.contains("Current")));
+            if cols == 80 {
+                assert!(shown[0].contains("main"));
+            }
+        }
+    }
+
+    #[test]
+    fn screen_closed_workspaces_share_the_unopened_file_marker() {
+        let _batch = crate::pane::batch();
+        let (tx, _rx) = super::super::queue::channel(32);
+        let mut server = super::super::tests::server(tx);
+        let (client, _peer) = super::super::tests::client(&mut server);
+        server.workspaces[0].name = "main".into();
+        let pane = server
+            .spawn_pane_in(
+                server.workspaces[0].id,
+                None,
+                crate::pane::PaneSpec::default(),
+                crate::protocol::Placement::Auto,
+                None,
+            )
+            .unwrap();
+        let agent = &mut server.panes.get_mut(&pane).unwrap().agent;
+        agent.kind = Some("claude".into());
+        agent.state = AgentState::Idle;
+        let web = server.new_workspace("web".into(), None);
+        super::super::persistence::tests::writer(&mut server, vec![Ok(()), Ok(())]);
+        server.keep_and_close_workspace(web).unwrap();
+        server.def_files.push(("/unopened/first.kdl".into(), "first".into()));
+        let mut buf = Buffer::empty(Rect::new(0, 0, 124, 36));
+        server.compose(client, 0, &mut buf);
+        let rows: Vec<String> =
+            buf.content.chunks(124).map(|row| row.iter().take(28).map(|c| c.symbol()).collect()).collect();
+        for expected in ["● main", "○ web", "○ first"] {
+            assert!(rows.iter().any(|row| row.contains(expected)), "{rows:?}");
+        }
+    }
 
     #[test]
     fn the_cells_kept_are_all_but_those_changed() {

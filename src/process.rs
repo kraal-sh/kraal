@@ -216,6 +216,11 @@ fn sole_foreground_job_in(leader: u32, foreground: u32, members: Vec<libc::pid_t
 /// terminal (a prompt's daemon, `nohup`) is no job of the user's, nor are the processes `not`
 /// (whoever asks, when it runs there itself): a group of those alone is no job.
 pub fn background_jobs(leader: u32, not: &[u32]) -> Vec<Vec<String>> {
+    background_processes(leader, not).into_iter().filter_map(argv).collect()
+}
+
+/// The processes representing the terminal's background jobs (see [`background_jobs`]).
+pub fn background_processes(leader: u32, not: &[u32]) -> Vec<u32> {
     let (Ok(sid), Some(terminal)) = (libc::pid_t::try_from(leader), imp::terminal_of(leader)) else {
         return Vec::new();
     };
@@ -232,7 +237,7 @@ pub fn background_jobs(leader: u32, not: &[u32]) -> Vec<Vec<String>> {
             *process = pid;
         }
     }
-    shown.into_values().filter_map(|pid| argv(pid as u32)).collect()
+    shown.into_values().map(|pid| pid as u32).collect()
 }
 
 /// Whether the process `pid` exists, or the group `-pgid` has members, zombies included. One of
@@ -974,6 +979,7 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
         assert_eq!(imp::terminal_of(leader), pair.master.tty_name());
+        assert_eq!(background_processes(leader, &[]), [job]);
         assert_eq!(background_jobs(leader, &[]), [["sleep", "4254"]]);
         assert!(background_jobs(leader, &[job]).is_empty(), "a job made of whoever asks is none");
         // SAFETY: plain syscall on a process this test started.

@@ -512,7 +512,9 @@ impl Server {
         match self.keep_and_close_workspace(ws) {
             Ok(()) => {
                 self.toast(client, "Workspace closed. Enter opens it again.");
-                Mode::Picker(self.workspace_picker(ws))
+                let mut picker = self.workspace_picker(self.clients.get(&client).map_or(0, |c| c.workspace));
+                picker.select(|item| item.action.workspace() == Some(ws));
+                Mode::Picker(picker)
             }
             Err(message) => {
                 if let Some(wi) = self.ws_index(ws) {

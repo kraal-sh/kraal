@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use crossbeam_channel::Sender;
 
-use super::ui::{ConfirmAction, Mode};
+use super::ui::{ConfirmAction, Mode, Question};
 use super::{ClientId, Event, EventSender, Server};
 use crate::layout::PaneId;
 use crate::paths;
@@ -20,6 +20,34 @@ const SCROLLBACK_EVERY: Duration = Duration::from_secs(10);
 const SCROLLBACK_BUDGET: Duration = Duration::from_millis(4);
 /// The paste buffers' file is written again this long after a write of it failed.
 const BUFFERS_RETRY: Duration = Duration::from_secs(10);
+
+/// What a workspace close approves, independently of its shortened display labels.
+#[derive(Debug, PartialEq, Eq)]
+pub struct CloseInventory {
+    name: String,
+    panes: Vec<ClosePane>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct ClosePane {
+    id: PaneId,
+    leader: Option<CloseProcess>,
+    foreground: Option<CloseProcess>,
+    background: Vec<CloseProcess>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct CloseProcess {
+    pid: u32,
+    started: Option<u64>,
+    command: Option<Vec<String>>,
+}
+
+impl CloseProcess {
+    fn read(pid: u32) -> Self {
+        Self { pid, started: crate::process::start_time(pid), command: crate::process::argv(pid) }
+    }
+}
 
 impl Server {
     /// [`Server::persist`], unless the writer has not written the last state yet (a slow disk):
@@ -206,29 +234,42 @@ impl Server {
             return self.close_workspace(client, ws);
         }
         if self.workspaces[wi].closed() {
-            return Mode::Picker(self.workspace_picker(ws));
+            let mut picker = self.workspace_picker(self.clients.get(&client).map_or(0, |c| c.workspace));
+            picker.select(|item| item.action.workspace() == Some(ws));
+            return Mode::Picker(picker);
         }
         let Some(stops) = self.stops(Some(ws)) else { return self.close_workspace(client, ws) };
         let workspace = &self.workspaces[wi];
-        let mut message = format!(
-            "Close workspace \"{}\" and all its panes?\nThe layout will be kept.\nReopening uses the saved layout.",
-            workspace.name
-        );
-        if let Some(path) = &workspace.definition {
-            message.push_str(&format!(
-                "\nThe workspace file is kept unchanged:\n  {}\nClose and Open do not reread that file.",
-                paths::shorten_home(path)
-            ));
-        } else {
-            message.push_str("\nThis workspace has no linked file. It will stay in the list as Closed.");
-        }
-        if self.workspaces.iter().filter(|w| !w.closed()).count() == 1 {
-            message.push_str("\nThis is the last open workspace. The session will stay open.");
-        }
-        message.push('\n');
-        message.push_str(&stops);
-        message.push_str("\nUnsaved work in these programs may be lost.");
-        Mode::confirm(message, ConfirmAction::CloseWorkspace(ws))
+        let inventory = CloseInventory {
+            name: workspace.name.clone(),
+            panes: workspace
+                .panes()
+                .into_iter()
+                .filter_map(|id| {
+                    let pane = self.panes.get(&id)?;
+                    Some(ClosePane {
+                        id,
+                        leader: pane.pid().map(CloseProcess::read),
+                        foreground: pane.foreground_pid().map(CloseProcess::read),
+                        background: pane
+                            .pid()
+                            .map(|pid| crate::process::background_processes(pid, &[]))
+                            .unwrap_or_default()
+                            .into_iter()
+                            .map(CloseProcess::read)
+                            .collect(),
+                    })
+                })
+                .collect(),
+        };
+        Mode::Confirm(Question {
+            title: Some(format!("Close {}?", workspace.name)),
+            message: format!("{stops}\n\nThe layout will be kept.\nUnsaved work in these programs may be lost."),
+            action: ConfirmAction::CloseWorkspace { workspace: ws, inventory },
+            yes: false,
+            scroll: 0,
+            workspace_back: None,
+        })
     }
 
     /// What quitting or restarting the session, or closing just `workspace`, stops.
@@ -246,10 +287,22 @@ impl Server {
                 persist::stops_with_server(&info, program.as_deref(), &jobs)
             };
             for what in stops {
-                lines.push(format!("\n  {}", persist::stopping_line(&info, &what)));
+                let label = if workspace.is_some() { what } else { persist::stopping_line(&info, &what) };
+                lines.push((label, info.tab.clone()));
             }
         }
-        (!lines.is_empty()).then(|| format!("These programs stop:{}", lines.concat()))
+        if lines.is_empty() {
+            return None;
+        }
+        let mut message =
+            if workspace.is_some() { "These programs will stop:" } else { "These programs stop:" }.to_string();
+        for (label, tab) in &lines {
+            message.push_str(&format!("\n  {label}"));
+            if workspace.is_some() && lines.iter().filter(|(other, _)| other == label).count() > 1 {
+                message.push_str(&format!("  ({tab})"));
+            }
+        }
+        Some(message)
     }
 
     /// Quit: the server stops once the session is saved, as for `kraal kill`, and its clients
@@ -858,7 +911,64 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn closing_says_what_happens_to_the_layout_file_and_last_workspace() {
+    fn screen_close_names_programs_and_only_uses_tabs_for_repeated_names() {
+        let _batch = crate::pane::batch();
+        let (tx, _rx) = crate::server::queue::channel(32);
+        let mut server = crate::server::tests::server(tx);
+        let def = crate::workspace::parse_workspace(
+            "web",
+            concat!(
+                "layout { tab name=\"server\" { pane command=\"sleep\" { args \"600\"; }; }; ",
+                "tab name=\"worker\" { pane command=\"sleep\" { args \"600\"; }; }; ",
+                "tab name=\"logs\" { pane command=\"tail\" { args \"-f\" \"app.log\"; }; }; }",
+            ),
+        )
+        .unwrap();
+        let ws = server.start_definition_inner(&def, None).unwrap();
+        for linked in [false, true] {
+            server.workspaces[0].definition = linked.then(|| "/project/web.kdl".into());
+            let Mode::Confirm(q) = server.ask_close_workspace(0, ws) else { panic!() };
+            assert!(!q.yes);
+            for (cols, rows) in [(80, 24), (124, 36)] {
+                let area = ratatui::layout::Rect::new(0, 0, cols, rows);
+                let mut buf = ratatui::buffer::Buffer::empty(area);
+                super::super::overlays::draw_confirm(&q, area, &mut buf);
+                let shown: Vec<String> =
+                    buf.content.chunks(cols as usize).map(|row| row.iter().map(|c| c.symbol()).collect()).collect();
+                for expected in [
+                    "Close web?",
+                    "These programs will stop:",
+                    "sleep 600  (server)",
+                    "sleep 600  (worker)",
+                    "tail -f app.log",
+                    "The layout will be kept.",
+                    "Unsaved work in these programs may be lost.",
+                    "Cancel",
+                    "Stop and close",
+                ] {
+                    assert!(shown.iter().any(|row| row.contains(expected)), "missing {expected}: {shown:?}");
+                }
+                for absent in ["Confirm", "pane ", "file", "Reopening", "last open", "(logs)"] {
+                    assert!(!shown.iter().any(|row| row.contains(absent)), "unexpected {absent}: {shown:?}");
+                }
+            }
+        }
+        server.close_pane(server.workspaces[0].tabs[1].panes()[0]);
+        let Mode::Confirm(q) = server.ask_close_workspace(0, ws) else { panic!() };
+        for (cols, rows) in [(80, 24), (124, 36)] {
+            let area = ratatui::layout::Rect::new(0, 0, cols, rows);
+            let mut buf = ratatui::buffer::Buffer::empty(area);
+            super::super::overlays::draw_confirm(&q, area, &mut buf);
+            let shown: Vec<String> =
+                buf.content.chunks(cols as usize).map(|row| row.iter().map(|c| c.symbol()).collect()).collect();
+            assert!(shown.iter().any(|row| row.contains("sleep 600")));
+            assert!(!shown.iter().any(|row| row.contains("(server)")), "{shown:?}");
+        }
+    }
+
+    #[test]
+    fn closing_keeps_the_same_question_with_or_without_a_source_or_another_workspace() {
+        let _batch = crate::pane::batch();
         let dir = std::env::temp_dir().join(format!("kraal-close-layout-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("api.kdl");
@@ -879,19 +989,11 @@ pub(super) mod tests {
             server.workspaces[0].definition = linked.then(|| path.clone());
             let Mode::Confirm(q) = server.ask_close_workspace(0, ws) else { panic!("confirmation") };
             assert!(!q.yes);
-            assert!(q.message.starts_with("Close workspace \"api\" and all its panes?"));
-            assert!(q.message.contains("The layout will be kept."));
-            assert!(q.message.contains("Reopening uses the saved layout."));
-            assert!(q.message.contains("This is the last open workspace. The session will stay open."));
-            assert!(q.message.contains("These programs stop:"));
-            if linked {
-                assert!(q.message.contains(&format!("The workspace file is kept unchanged:\n  {}", path.display())));
-                assert!(q.message.contains("Close and Open do not reread that file."));
-                assert!(!q.message.contains("disappear"));
-            } else {
-                assert!(q.message.contains("This workspace has no linked file. It will stay in the list as Closed."));
-                assert!(!q.message.contains("The workspace file is kept unchanged:"));
-            }
+            assert_eq!(q.title.as_deref(), Some("Close api?"));
+            assert_eq!(
+                q.message,
+                "These programs will stop:\n  sleep 60\n\nThe layout will be kept.\nUnsaved work in these programs may be lost."
+            );
         }
         server.new_workspace("other".into(), None);
         let Mode::Confirm(q) = server.ask_close_workspace(0, ws) else { panic!("confirmation") };
@@ -921,11 +1023,8 @@ pub(super) mod tests {
             assert_eq!(server.workspaces[0].definition.as_ref(), Some(&path));
             let Mode::Confirm(q) = server.ask_close_workspace(0, ws) else { panic!("confirmation") };
             assert!(!q.yes);
-            assert!(q.message.contains("The workspace file is kept unchanged:"), "{}", q.message);
-            assert!(q.message.contains(&path.display().to_string()), "{}", q.message);
-            assert!(q.message.contains("Close and Open do not reread that file."), "{}", q.message);
-            assert!(q.message.contains("Reopening uses the saved layout."));
-            assert!(!q.message.contains("Reopening uses that file's layout."));
+            assert!(q.message.contains("The layout will be kept."));
+            assert!(!q.message.contains("file"));
             assert_eq!(server.workspaces[0].panes().len(), 1);
             assert_eq!(std::fs::read_to_string(&path).ok().as_deref(), replacement);
             let mut expected = serde_json::to_value(persist::snapshot(&server)).unwrap();
@@ -966,7 +1065,7 @@ pub(super) mod tests {
         assert!(pane.shell_waiting());
         assert!(pane.background_jobs().is_empty());
         let Mode::Confirm(q) = server.ask_close_workspace(0, ws) else { panic!("confirmation") };
-        assert!(q.message.contains("These programs stop:\n  sh -c 'sleep 600; echo done'"), "{}", q.message);
+        assert!(q.message.contains("These programs will stop:\n  sh -c 'sleep 600; echo done'"), "{}", q.message);
         assert!(q.message.contains("Unsaved work in these programs may be lost."), "{}", q.message);
     }
 

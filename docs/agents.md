@@ -254,6 +254,8 @@ Tab opens **Rename**, **Sign in**, and **Remove** (`ctrl+r`, `ctrl+l`, `ctrl+x`)
 agent's own sign-in are kept.
 Enter or Esc in details returns to the list with that account selected. Background account
 checks keep the list's search and selected row while updating its entries.
+The bottom-right count includes only accounts, showing matches over the total while searching.
+**+ Add account** is excluded from both counts.
 
 **+ Add account** opens one form, also reached directly with `ctrl+b A n`. It stays visible when
 filtering the list. **Agent** starts with the focused pane's agent, otherwise the last choice;

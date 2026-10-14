@@ -581,9 +581,11 @@ pub(super) fn draw_picker(p: &Picker, screen: Rect, buf: &mut Buffer) -> Option<
     let count = if let Some(message) = &p.message {
         message.clone()
     } else if p.query.is_empty() {
-        format!("{}", p.filtered.len())
+        p.filtered.iter().filter(|&&i| Some(i) != p.pinned).count().to_string()
     } else {
-        format!("{}/{}", p.filtered.len(), p.items.len())
+        let matching = p.filtered.iter().filter(|&&i| Some(i) != p.pinned).count();
+        let total = p.items.iter().enumerate().filter(|(i, _)| Some(*i) != p.pinned).count();
+        format!("{matching}/{total}")
     };
     let line = key_line(&footer, &count, inner.width.saturating_sub(2));
     buf.set_line(inner.x + 1, inner.y + inner.height - 1, &line, inner.width.saturating_sub(2));
@@ -719,10 +721,16 @@ pub(super) fn confirm_layout(q: &Question, screen: Rect) -> ConfirmLayout {
     let verb = q.action.verb();
     let max_w = screen.width.saturating_sub(2).max(1) as usize;
     let buttons_w = columns(&verb) + 15;
-    let widest = q.message.lines().map(columns).max().unwrap_or(0).max(buttons_w);
+    let widest = q.message.lines().chain(q.title.as_deref()).map(columns).max().unwrap_or(0).max(buttons_w);
     let w = (widest + 4).clamp(30.min(max_w), max_w.min(84)) as u16;
     let text_w = (w as usize).saturating_sub(4).max(1);
     let mut lines = Vec::new();
+    if matches!(q.action, super::ui::ConfirmAction::CloseWorkspace { .. })
+        && let Some(title) = q.title.as_deref().filter(|t| columns(t) > text_w)
+    {
+        // A truncated workspace name must still be readable, including after a resize.
+        lines.extend(fold(title, text_w).into_iter().map(|text| ConfirmRow { text, question: true, continued: false }));
+    }
     for (i, l) in q.message.lines().enumerate() {
         // What a question quotes (see [`Question::message`]) is cut as it is written; the rest
         // is prose, wrapped between words.
@@ -767,7 +775,8 @@ pub(super) fn draw_confirm(q: &Question, screen: Rect, buf: &mut Buffer) {
     let danger = q.action.danger(&q.message);
     let layout = confirm_layout(q, screen);
     let color = if danger { th().production } else { th().accent };
-    let inner = frame(layout.area, if danger { "Careful" } else { "Confirm" }, color, buf);
+    let title = q.title.as_deref().unwrap_or(if danger { "Careful" } else { "Confirm" });
+    let inner = frame(layout.area, title, color, buf);
     if inner.height == 0 || inner.width < 2 {
         return;
     }
@@ -902,7 +911,7 @@ mod tests {
         let menu = menu_items(&km.menu(&[]), true);
         let lines: Vec<Line<'static>> = (0..50).map(|i| entry("ctrl+b p r", &format!("line {i}"), 12)).collect();
         for (action, yes) in [(ConfirmAction::ClosePane(1), true), (ConfirmAction::TrustRunbook, false)] {
-            let q = Question { message: message.repeat(5), action, yes, scroll: 99, workspace_back: None };
+            let q = Question { title: None, message: message.repeat(5), action, yes, scroll: 99, workspace_back: None };
             draw_confirm(&q, screen, buf);
         }
         draw_picker(&picker, screen, buf);
@@ -998,6 +1007,60 @@ mod tests {
                 assert!(shown.contains("⏎ retry · pgup/pgdn scroll · esc cancel"), "{shown}");
                 for line in layout.lines.iter().skip(start.min(layout.max_scroll)).take(layout.body as usize) {
                     assert!(shown.contains(line), "missing {line:?}: {shown}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn screen_list_counts_exclude_add_rows() {
+        use super::super::ui::{PickAction, PickItem, PickerKind};
+        for (w, h) in [(80, 24), (124, 36)] {
+            for kind in [PickerKind::Workspace, PickerKind::Accounts] {
+                for total in [0, 2] {
+                    let workspace = kind == PickerKind::Workspace;
+                    let mut items: Vec<_> = (0..total)
+                        .map(|i| {
+                            PickItem::new(
+                                if i == 0 { "alpha" } else { "beta" },
+                                "",
+                                if workspace {
+                                    PickAction::SwitchWorkspace(i)
+                                } else {
+                                    PickAction::AccountDetails(i.to_string())
+                                },
+                            )
+                        })
+                        .collect();
+                    items.push(PickItem::new(
+                        if workspace { "+ Add workspace" } else { "+ Add account" },
+                        "",
+                        if workspace { PickAction::AddWorkspace } else { PickAction::AddAccount },
+                    ));
+                    let mut p = Picker::new(kind, "List", items);
+                    for query in ["", "alpha", "zzz"] {
+                        p.query = query.into();
+                        p.refilter();
+                        let area = Rect::new(0, 0, w, h);
+                        let mut buf = Buffer::empty(area);
+                        draw_picker(&p, area, &mut buf);
+                        let layout = picker_layout(&p, area);
+                        let footer = screen(
+                            &buf,
+                            Rect::new(layout.area.x + 1, layout.area.bottom() - 2, layout.area.width - 2, 1),
+                        );
+                        let expected = if query.is_empty() {
+                            total.to_string()
+                        } else {
+                            format!("{}/{total}", u32::from(query == "alpha" && total > 0))
+                        };
+                        assert_eq!(footer.split_whitespace().last(), Some(expected.as_str()), "{footer}");
+                        assert!(screen(&buf, area).contains(if workspace {
+                            "+ Add workspace"
+                        } else {
+                            "+ Add account"
+                        }));
+                    }
                 }
             }
         }
@@ -1209,8 +1272,14 @@ mod tests {
     fn every_line_of_a_long_question_can_be_read() {
         let message: String = (1..=30).map(|i| format!("line number {i}\n")).collect();
         let area = Rect::new(0, 0, 60, 12);
-        let mut q =
-            Question { message, action: ConfirmAction::ClosePane(1), yes: false, scroll: 0, workspace_back: None };
+        let mut q = Question {
+            title: None,
+            message,
+            action: ConfirmAction::ClosePane(1),
+            yes: false,
+            scroll: 0,
+            workspace_back: None,
+        };
         let layout = confirm_layout(&q, area);
         assert!(layout.max_scroll > 0 && layout.more.is_some() && layout.cancel.is_some());
         q.scroll = layout.max_scroll;
@@ -1232,7 +1301,14 @@ mod tests {
             "x".repeat(60)
         );
         let area = Rect::new(0, 0, 50, 20);
-        let q = Question { message, action: ConfirmAction::TrustRunbook, yes: false, scroll: 0, workspace_back: None };
+        let q = Question {
+            title: None,
+            message,
+            action: ConfirmAction::TrustRunbook,
+            yes: false,
+            scroll: 0,
+            workspace_back: None,
+        };
         let layout = confirm_layout(&q, area);
         let rows: Vec<(&str, bool)> = layout.lines.iter().map(|row| (row.text.as_str(), row.continued)).collect();
         let (cut, rest) = (format!("  2. echo {}", "x".repeat(34)), format!("  {}", "x".repeat(26)));

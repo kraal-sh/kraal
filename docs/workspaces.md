@@ -7,6 +7,7 @@ How kraal is organised, and how a workspace is declared once in a file and opene
 The **Workspaces** list (`ctrl+b w`) shows **Open** or **Closed**, retained tab and pane counts,
 and **Current** for the workspace on screen. Enter or one click opens the selected workspace.
 Search only filters the list. **+ Add workspace** stays visible even when nothing matches.
+The bottom-right count includes only workspaces, showing matches over the total while searching.
 Tab or a right click offers actions for that row: **Rename** for a saved workspace, and **Close**
 when it is open. A workspace file that has not been imported offers **Open**.
 
@@ -15,6 +16,8 @@ name (or the search text) and shows the folder inherited from the current pane. 
 then Enter or click **Add**. Tab moves between the field and buttons; Esc or **Cancel** returns
 to the list with its search and selection. A direct shortcut returns to the terminal.
 Names are checked against the whole session, including closed workspaces and workspace files.
+A taken or empty name keeps **Add** (or **Rename**) as the action: correct the name and submit
+again. **Starts in** stays visible alongside an Add error.
 
 An immediate shell or save failure keeps the form and its input, with **Retry** and **Cancel**.
 No workspace is added on that failure. **Workspace added** appears only after its state is saved.
@@ -38,6 +41,8 @@ no longer matches the search, the search clears to show it.
   With the sidebar visible, its **WORKSPACES** heading opens the same list, **+ Add workspace**
   opens the form, and a row's actions button or a right click opens that workspace's actions.
   All workspace operations remain available at 80x24 without the sidebar.
+  Closed workspaces use the same empty dot as workspace files that have not been opened;
+  open workspaces use a filled dot.
 - Several terminals can be attached at once. The panes have the size that fits the one used last
   (attached, resized or typed in), and each terminal shows them beside its own sidebar: a smaller
   one shows what fits.
@@ -111,8 +116,11 @@ rewritten or reread by Close or Open; editing, removing or breaking that file do
 the saved layout. To export a closed workspace with `kraal save`, open it first.
 
 Close lists the running programs, background jobs, agents and SSH connections before stopping them.
-**Cancel** is selected first; Enter cancels, and **Stop and close** confirms. Unsaved work in these
-programs may be lost. Other workspaces keep running, and clients showing the closed workspace move
+The question is titled **Close &lt;name&gt;?**. Programs are named as they appear in the terminal;
+a tab name is added only to distinguish repeated program descriptions. It says **The layout will
+be kept.** and **Unsaved work in these programs may be lost.**
+**Cancel** is selected first; Enter cancels, and **Stop and close** confirms.
+Other workspaces keep running, and clients showing the closed workspace move
 to another open workspace, or to Workspaces if none remain. Shells waiting at their prompt need no
 extra confirmation; unknown activity still asks. If another client changes
 the programs while the question is open, the updated inventory needs confirmation. Before signalling any
@@ -126,7 +134,8 @@ boot and process start times before signalling surviving programs.
 
 Closing an individual pane or tab removes it from the layout. When the last pane ends, including
 `exit` in the last shell, the workspace stays empty and saved. **+ Add pane** adds a shell with
-Enter or a click. The session and attached terminals stay open, and an empty workspace stays
+Enter or a click. The empty view shows **No panes.** and the selected **+ Add pane** action.
+The session and attached terminals stay open, and an empty workspace stays
 empty after a restart. Closing the last open workspace shows Workspaces. Use Quit (`ctrl+b q`)
 or `kraal kill` to stop the session explicitly. A command pane that shows its exit code remains
 in the layout until it is closed.

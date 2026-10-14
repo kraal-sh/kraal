@@ -18,10 +18,11 @@ pub struct WorkspaceForm {
     pending: Option<u32>,
     cwd: Option<PathBuf>,
     back: Option<PickerState>,
+    invalid_name: bool,
 }
 
 fn verb(p: &Prompt) -> &'static str {
-    if p.error.is_some() {
+    if p.error.is_some() && !p.workspace_form.as_ref().is_some_and(|f| f.invalid_name) {
         "Retry"
     } else if matches!(p.action, PromptAction::NewWorkspace) {
         "Add"
@@ -48,13 +49,18 @@ fn select_workspace(picker: &mut Picker, ws: u32) {
 }
 
 pub(super) fn form_layout(p: &Prompt, screen: Rect) -> forms::FormLayout {
-    let message = p.error.clone().unwrap_or_else(|| {
-        p.workspace_form
-            .as_ref()
-            .and_then(|f| f.cwd.as_deref())
-            .map(|cwd| format!("Starts in {}", crate::paths::shorten_home(cwd)))
-            .unwrap_or_default()
-    });
+    let mut message = p
+        .workspace_form
+        .as_ref()
+        .and_then(|f| f.cwd.as_deref())
+        .map(|cwd| format!("Starts in {}", crate::paths::shorten_home(cwd)))
+        .unwrap_or_default();
+    if let Some(error) = &p.error {
+        if !message.is_empty() {
+            message.push('\n');
+        }
+        message.push_str(error);
+    }
     forms::FormLayout::new(screen, 1, &message, &buttons(p))
 }
 
@@ -177,10 +183,16 @@ impl Server {
             PromptAction::NewWorkspace => None,
             _ => unreachable!("a workspace name form"),
         };
-        let result = if name.is_empty() {
-            Err("Type a name.".into())
+        let validation = if name.is_empty() {
+            Some("Type a name.")
         } else if self.workspace_name_used(name, target) {
-            Err("This name is already used.".into())
+            Some("This name is already used.")
+        } else {
+            None
+        };
+        p.workspace_form.as_mut().unwrap().invalid_name = validation.is_some();
+        let result = if let Some(error) = validation {
+            Err(error.into())
         } else if let Some(ws) = target {
             self.rename_workspace(ws, name)
         } else {
@@ -268,6 +280,60 @@ mod tests {
     }
 
     #[test]
+    fn screen_name_validation_keeps_add_and_rename_buttons() {
+        for (cols, rows) in [(80, 24), (124, 36)] {
+            let (tx, _rx) = super::super::queue::channel(32);
+            let mut server = super::super::tests::server(tx);
+            let (client, _peer) = super::super::tests::client(&mut server);
+            let ws = server.workspaces[0].id;
+            server.new_workspace("taken".into(), None);
+            for name in ["taken", " "] {
+                for rename in [false, true] {
+                    let mut p = if rename {
+                        let Mode::Prompt(p) = server.rename_workspace_form(ws, None) else { panic!() };
+                        p
+                    } else {
+                        server.add_workspace_form(client, None)
+                    };
+                    p.value = name.into();
+                    let Mode::Prompt(p) = server.on_workspace_form(client, p, key("enter")) else { panic!() };
+                    let mut buf = Buffer::empty(Rect::new(0, 0, cols, rows));
+                    draw_form(&p, buf.area, &mut buf);
+                    let shown: Vec<String> =
+                        buf.content.chunks(cols as usize).map(|row| row.iter().map(|c| c.symbol()).collect()).collect();
+                    let verb = if rename { "Rename" } else { "Add" };
+                    assert!(shown.iter().any(|row| row.contains(p.error.as_ref().unwrap())));
+                    assert!(shown.iter().any(|row| row.contains(&format!("[> {verb}]  [  Cancel]"))), "{shown:?}");
+                    assert!(
+                        shown.iter().any(|row| row.contains(&format!("Enter {verb} · Tab Next field · Esc Cancel")))
+                    );
+                    assert!(!shown.iter().any(|row| row.contains("Retry")));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn screen_add_keeps_the_starting_folder_beside_a_name_error() {
+        let (tx, _rx) = super::super::queue::channel(32);
+        let mut server = super::super::tests::server(tx);
+        let (client, _peer) = super::super::tests::client(&mut server);
+        server.workspaces[0].cwd = Some("/work/api".into());
+        let mut p = server.add_workspace_form(client, None);
+        p.value = "test".into();
+        let Mode::Prompt(p) = server.on_workspace_form(client, p, key("enter")) else { panic!() };
+        for (cols, rows) in [(80, 24), (124, 36)] {
+            let mut buf = Buffer::empty(Rect::new(0, 0, cols, rows));
+            draw_form(&p, buf.area, &mut buf);
+            let shown: Vec<String> =
+                buf.content.chunks(cols as usize).map(|row| row.iter().map(|c| c.symbol()).collect()).collect();
+            for expected in ["Name    test", "Starts in /work/api", "This name is already used."] {
+                assert!(shown.iter().any(|row| row.contains(expected)), "{shown:?}");
+            }
+        }
+    }
+
+    #[test]
     fn add_announces_the_inherited_folder_and_cancel_restores_the_search() {
         let (tx, _rx) = super::super::queue::channel(32);
         let mut server = super::super::tests::server(tx);
@@ -327,6 +393,14 @@ mod tests {
             let Mode::Prompt(p) = server.on_workspace_form(client, p, key("enter")) else { panic!() };
             assert_eq!((p.value.as_str(), p.cursor), ("test/review", 5));
             assert!(p.error.as_ref().unwrap().contains("Still named test."));
+            for (cols, rows) in [(80, 24), (124, 36)] {
+                let mut buf = Buffer::empty(Rect::new(0, 0, cols, rows));
+                draw_form(&p, buf.area, &mut buf);
+                let shown: Vec<String> =
+                    buf.content.chunks(cols as usize).map(|row| row.iter().map(|c| c.symbol()).collect()).collect();
+                assert!(shown.iter().any(|row| row.contains("[> Retry]  [  Cancel]")));
+                assert!(shown.iter().any(|row| row.contains("Enter Retry")));
+            }
             assert_eq!(server.workspaces[0].name, "test");
             assert!(server.clients[&client].toast.is_none());
             let Mode::Picker(p) = server.on_workspace_form(client, p, key("enter")) else { panic!() };
@@ -577,6 +651,15 @@ mod tests {
         let p = server.add_workspace_form(client, None);
         let Mode::Prompt(p) = server.on_workspace_form(client, p, key("enter")) else { panic!() };
         assert!(p.error.as_ref().unwrap().contains("Couldn't save the workspace. No workspace was added."));
+        for (cols, rows) in [(80, 24), (124, 36)] {
+            let mut buf = Buffer::empty(Rect::new(0, 0, cols, rows));
+            draw_form(&p, buf.area, &mut buf);
+            let shown: Vec<String> =
+                buf.content.chunks(cols as usize).map(|row| row.iter().map(|c| c.symbol()).collect()).collect();
+            assert!(shown.iter().any(|row| row.contains("[> Retry]  [  Cancel]")));
+            assert!(shown.iter().any(|row| row.contains("Enter Retry")));
+            assert!(shown.iter().any(|row| row.contains("Starts in")));
+        }
         assert_eq!(server.workspaces.len(), 1);
         assert!(server.panes.is_empty());
         assert_eq!(server.clients[&client].workspace, before);

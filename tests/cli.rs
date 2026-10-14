@@ -6667,13 +6667,14 @@ impl RawClient {
                 rows.iter().any(|r| r.contains("y yes")) && Some(below(rows)) != before
             });
             let left_to_read = below(&screen);
-            let top = screen.iter().position(|r| r.contains(" Confirm ") || r.contains(" Careful ")).unwrap();
             // The message may itself say "Cancel and save...": the button row comes last.
             let buttons = screen.iter().rposition(|r| r.contains(" Cancel ")).unwrap();
             // The Cancel button is two columns inside the box, after the margin.
             let left = screen[buttons].split("Cancel").next().unwrap().chars().count() - 3;
             let border = screen[buttons].chars().nth(left).unwrap();
             let right = left + 1 + screen[buttons].chars().skip(left + 1).position(|c| c == border).unwrap();
+            let top =
+                screen[..buttons].iter().rposition(|row| matches!(row.chars().nth(left), Some('╭' | '+'))).unwrap();
             // Above the buttons: an empty row and, when there is more to read, the row saying so.
             let body = &screen[top + 1..buttons - 1 - usize::from(left_to_read.is_some())];
             let at = *first.get_or_insert(left_to_read.unwrap_or(0)) - left_to_read.unwrap_or(0);
@@ -9061,7 +9062,7 @@ fn a_renamed_account_keeps_its_rules_its_usage_and_its_agents() {
         rows.iter().any(|r| r.contains("❯ alpha"))
             && rows.iter().any(|r| r.contains("▸ Claude · alpha"))
             && rows.iter().any(|r| r.contains("+ Add account"))
-            && rows.iter().any(|r| r.contains("⏎ details") && r.contains("2/"))
+            && rows.iter().any(|r| r.contains("⏎ details") && r.contains("1/1"))
     });
     client.send(b"\t");
     client.wait_for_row("Rename");
@@ -10139,13 +10140,11 @@ fn closing_a_workspace_lists_its_programs_and_background_jobs_from_both_entries(
             } else {
                 client.send(b"\x02Wx");
             }
-            client.wait_for_row("Close workspace \"api\"");
+            client.wait_for_row("Close api?");
             let question = client.read_question(b"\x1b[6~").join("\n");
             for text in [
                 "The layout will be kept.",
-                "The workspace file is kept unchanged:",
-                "Reopening uses the saved layout.",
-                "Close and Open do not reread that file.",
+                "These programs will stop:",
                 "sleep 4257 (in the background)",
                 "sleep 4258",
                 "Unsaved work in these programs may be lost.",
@@ -10153,6 +10152,8 @@ fn closing_a_workspace_lists_its_programs_and_background_jobs_from_both_entries(
                 assert!(question.contains(text), "{size:?}, picker={picker}: {question}");
             }
             assert!(!question.contains("4259"), "{question}");
+            assert!(!question.contains("linked file") && !question.contains("workspace file"), "{question}");
+            assert!(!question.contains("(pane "), "{question}");
             assert!(!question.contains("The session will stop."), "{question}");
             client.wait_for_row("Stop and close");
             client.send(b"\r");
