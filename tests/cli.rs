@@ -13670,7 +13670,7 @@ fn palette_attachment_transfers_a_complete_batch_over_host_attach_and_keeps_it_a
     let remote = Env::new("attachment-host");
     remote.workspace(
         "w",
-        "layout {\n    pane name=\"main\" command=\"sh\" { args \"-c\" \"stty -echo; echo READY; cat\"; }\n}\n",
+        "layout {\n    pane name=\"main\" command=\"sh\" { args \"-c\" \"stty -echo; trap 'echo CTRL_C_REACHED_PANE' INT; echo READY; while :; do cat; done\"; }\n}\n",
     );
     remote.run(&["open", "w"]);
     remote.wait_for_text("main", "READY");
@@ -13688,10 +13688,9 @@ fn palette_attachment_transfers_a_complete_batch_over_host_attach_and_keeps_it_a
     let mut host = TerminalClient::start(command);
     host.wait_for("READY");
     host.type_keys(b"\x02 Attach files\r");
-    host.wait_for("Enter sends, Ctrl+C cancels");
+    host.wait_for("Enter absolute local paths");
     host.type_keys(format!("'{}' {}\r", first.display(), second.display()).as_bytes());
-    host.wait_for("Files received.");
-    host.wait_for("Ctrl+C dismisses or cancels.");
+    host.wait_for("Sent 2 files to box");
     let root = remote.root.join("state/kraal/attachments-v1").join(&remote.session);
     let batches: Vec<_> = std::fs::read_dir(&root).unwrap().map(|e| e.unwrap().path()).collect();
     assert_eq!(batches.len(), 1);
@@ -13702,18 +13701,16 @@ fn palette_attachment_transfers_a_complete_batch_over_host_attach_and_keeps_it_a
     assert_eq!(std::fs::metadata(batch.join("1/capture.bin")).unwrap().permissions().mode() & 0o777, 0o600);
     // cat cannot print the paths until the user sends Enter.
     assert!(!remote.run(&["read", "-p", "main"]).contains("attachments-v1"));
-    host.type_keys(b"\x03");
-    // Cancellation consumes its whole terminal read. Wait for the result to be dismissed
-    // before typing Enter, so the two keys cannot be coalesced into that read.
-    wait_until(PATIENCE, "attachment result dismissed", || {
-        let written = host.written.lock().unwrap();
-        !text_after(&written, 100, 30).iter().any(|row| row.contains("Ctrl+C dismisses or cancels."))
-    });
     host.type_keys(b"\r");
     let pasted = remote.wait_for_text("main", "attachments-v1");
     assert!(pasted.contains("notes client.txt"));
     assert!(pasted.contains("capture.bin"));
     other.wait_for_screen("capture.bin");
+    host.type_keys(b"\x03");
+    remote.wait_for_text("main", "CTRL_C_REACHED_PANE");
+    wait_until(PATIENCE, "attachment success disappears", || {
+        !text_after(&host.written.lock().unwrap(), 100, 30).iter().any(|row| row.contains("Sent 2 files to box"))
+    });
     host.type_keys(b"\x02d");
     assert_eq!(host.left("attachment detach").0, 0);
     assert_eq!(std::fs::read(batch.join("1/capture.bin")).unwrap(), content);
@@ -13773,10 +13770,10 @@ fn clipboard_images_use_local_private_storage_and_host_attachment_transport() {
         } else {
             client.type_keys(b"\x02I");
         }
-        client.wait_for("Enter reads the local clipboard");
+        client.wait_for("Send reads the local clipboard once.");
         assert!(!log.exists(), "offering the action must not read the clipboard");
         client.type_keys(b"\r");
-        client.wait_for("Files received.");
+        client.wait_for(if remote { "Sent the image to box" } else { "Sent the image to this machine" });
         let root = destination.root.join("state/kraal/attachments-v1").join(&destination.session);
         let batches: Vec<_> = std::fs::read_dir(&root).unwrap().map(|e| e.unwrap().path()).collect();
         assert_eq!(batches.len(), 1);
@@ -13786,12 +13783,6 @@ fn clipboard_images_use_local_private_storage_and_host_attachment_transport() {
         assert_eq!(std::fs::metadata(&stored).unwrap().permissions().mode() & 0o777, 0o600);
         assert_eq!(std::fs::read_to_string(log).unwrap(), "read\n");
         assert!(!destination.run(&["read", "-p", "main"]).contains("clipboard.png"), "no Enter is added");
-        client.type_keys(b"\x03");
-        wait_until(PATIENCE, "image result dismissed", || {
-            !text_after(&client.written.lock().unwrap(), 100, 30)
-                .iter()
-                .any(|row| row.contains("Ctrl+C dismisses or cancels."))
-        });
         client.type_keys(b"\r");
         destination.wait_for_text("main", "clipboard.png");
         client.type_keys(b"\x02d");
@@ -13897,18 +13888,18 @@ fn host_pasted_paths_preserve_text_send_complete_batches_and_remember_revocable_
     // The markers can arrive across separate reads of the laptop's terminal.
     host.type_keys(&pasted.as_bytes()[..3]);
     host.type_keys(&pasted.as_bytes()[3..]);
-    visible(&host, "[>Send<]");
+    visible(&host, "Send 2 files to box?");
     let root = remote.root.join("state/kraal/attachments-v1").join(&remote.session);
     assert!(!root.exists());
     host.type_keys(b"\t\t\r");
-    visible(&host, "Text submitted");
+    visible(&host, "Text pasted");
     let output = remote.wait_for_text("main", "capture.bin");
     assert!(output.contains("notes client.txt") && output.contains("file://"), "{output}");
     assert!(!root.exists());
     host.type_keys(pasted.as_bytes());
-    visible(&host, "[>Send<]");
+    visible(&host, "Send 2 files to box?");
     host.type_keys(b"\t\r");
-    visible(&host, "2 files sent.");
+    visible(&host, "Sent 2 files to box");
     let permission = local.root.join("config/kraal/paste-files.toml");
     assert!(std::fs::read_to_string(&permission).unwrap().contains("pasted.invalid"));
     let batches = || {
@@ -13925,17 +13916,17 @@ fn host_pasted_paths_preserve_text_send_complete_batches_and_remember_revocable_
     }
     host.type_keys(pasted.as_bytes());
     wait_until(PATIENCE, "automatic second batch", || batches().len() == 2);
-    visible(&host, "2 files sent.");
+    visible(&host, "Sent 2 files to box");
     std::fs::remove_file(permission).unwrap();
     host.type_keys(pasted.as_bytes());
-    visible(&host, "[>Send<]");
+    visible(&host, "Send 2 files to box?");
     assert_eq!(batches().len(), 2);
     host.type_keys(b"\x03");
     visible(&host, "cancelled");
     assert_eq!(batches().len(), 2);
     host.type_keys(b"\x03");
     wait_until(PATIENCE, "cancel result dismissed", || {
-        !text_after(&host.written.lock().unwrap(), 100, 30).iter().any(|row| row.contains("Ctrl+C dismisses"))
+        !text_after(&host.written.lock().unwrap(), 100, 30).iter().any(|row| row.contains("Transfer interrupted"))
     });
     host.type_keys(b"\x02d");
     assert_eq!(host.left("pasted path detach").0, 0);

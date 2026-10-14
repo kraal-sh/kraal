@@ -700,7 +700,7 @@ impl Server {
             let command = Command::Action(a);
             let keys = self.keymap.all_hints(&command);
             let item = PickItem::new(a.describe(), keys.join("  ·  "), PickAction::Command(command));
-            items.push(if keys.is_empty() { item.dim() } else { item });
+            items.push(item);
         }
         for name in self.config.tools.iter().filter(|(_, t)| t.enabled).map(|(n, _)| n.clone()) {
             let command = Command::Tool(name.clone());
@@ -784,6 +784,26 @@ impl Server {
 #[cfg(test)]
 mod workspace_tests {
     use super::*;
+
+    #[test]
+    fn attachment_commands_are_not_dimmed_without_shortcuts() {
+        let (tx, _rx) = crate::server::queue::channel(32);
+        let server = crate::server::tests::server(tx);
+        let mut picker = server.command_picker();
+        for name in ["Attach files", "Attach clipboard image", "Purge attachments"] {
+            let item = picker.items.iter().find(|item| item.label == name).unwrap();
+            assert!(!item.dim, "{name}");
+            picker.filtered = vec![picker.items.iter().position(|item| item.label == name).unwrap()];
+            for cols in [124, 80] {
+                let area = ratatui::layout::Rect::new(0, 0, cols, 24);
+                let mut buf = ratatui::buffer::Buffer::empty(area);
+                super::super::super::overlays::draw_picker(&picker, area, &mut buf);
+                let label = buf.content.iter().find(|cell| cell.symbol() == "A" || cell.symbol() == "P").unwrap();
+                assert_ne!(label.fg, crate::theme::current().dim);
+                assert!(label.modifier.contains(ratatui::style::Modifier::BOLD));
+            }
+        }
+    }
 
     #[test]
     fn colliding_workspace_files_show_their_directories_before_either_is_opened() {

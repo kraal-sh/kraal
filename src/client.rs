@@ -1265,8 +1265,7 @@ pub fn attach(mut target: Target, mut workspace: Option<String>, mouse: bool, at
                 let lost = loop {
                     match next.take().unwrap_or_else(|| protocol::read_frame(&mut frames)) {
                         Ok(Some((protocol::BYTES, bytes))) => {
-                            let written = terminal().write(&bytes);
-                            attachments.draw();
+                            let written = attachments.output(&bytes);
                             match written {
                                 Ok(true) => {}
                                 Ok(false) => leaving(),

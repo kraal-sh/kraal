@@ -235,14 +235,18 @@ the server's, not yours: kraal keeps it in paste buffers, sends a copy to your t
 says where the address works instead of opening the wrong page.
 
 To send laptop files through this connection, choose **Attach files** in the command palette.
-For a clipboard image, choose **Attach clipboard image** and press Enter in the local prompt.
-It uses the same connection and retains the received image with the session attachments.
 Enter their absolute local paths and press Enter. The server receives the complete batch before
-submitting its private paths to the reserved pane, without Enter. Ctrl+C cancels. Files survive
-client disconnects and server restarts. See [Attachments](terminal.md#attachments) for limits,
-retention and cleanup. Pasting or dropping existing absolute laptop paths also offers **Send**,
-**Always for this server**, **Paste the text**, and **Cancel**. Always is remembered on the laptop
-and can be revoked in `paste-files.toml`. Ordinary text and local-session pastes stay unchanged.
+pasting its paths into the pane named in the form, without pressing Enter in that pane.
+For a clipboard image, choose **Attach clipboard image**, then **Send** in the local question.
+It reads the laptop clipboard once and sends the image through the same connection.
+Ctrl+C cancels a choice or a running transfer. A success such as **Sent 2 files to box** or
+**Sent the image to box** disappears after four seconds; typing and Ctrl+C reach the pane as
+usual. A failure stays open with choices to retry or close, and **Paste as text** for files.
+Files survive client disconnects and server restarts. See [Attachments](terminal.md#attachments)
+for limits, retention and cleanup. Pasting or dropping existing absolute laptop paths also
+offers **Send**, **Always for box**, **Paste as text**, and **Cancel** in a local question box.
+Always is remembered on the laptop and can be revoked in `paste-files.toml`. Ordinary text
+and local-session pastes stay unchanged.
 
 Copies travel back to the attaching machine as negotiated clipboard messages. A user selection
 tries its native clipboard, then OSC 52. A program's copy goes to the most recently used client

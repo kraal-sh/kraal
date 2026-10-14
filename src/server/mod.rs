@@ -24,7 +24,7 @@ mod graphics;
 mod hints;
 mod input;
 pub mod net;
-mod overlays;
+pub(crate) mod overlays;
 mod pane_ui;
 mod panes;
 mod persistence;

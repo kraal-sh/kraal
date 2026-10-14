@@ -257,6 +257,8 @@ pub enum ClientMsg {
     AttachmentRequest {
         token: String,
         text: Vec<u8>,
+        #[serde(default)]
+        image: bool,
     },
     AttachmentText {
         token: String,
@@ -959,6 +961,10 @@ mod tests {
             serde_json::from_str::<ServerMsg>(r#"{"type":"attached","version":"0.2.0"}"#),
             Ok(ServerMsg::Attached { features: None, .. })
         ));
+        assert!(matches!(
+            serde_json::from_str::<ClientMsg>(r#"{"type":"attachment_request","token":"ab","text":[]}"#),
+            Ok(ClientMsg::AttachmentRequest { image: false, .. })
+        ));
         let hello = r#"{"type":"attach","version":2,"cols":80,"rows":24,"workspace":null,"remote":false}"#;
         assert!(matches!(
             serde_json::from_str::<ClientMsg>(hello),
@@ -1169,7 +1175,8 @@ mod tests {
             ClientMsg::Resize { cols: 80, rows: 24 },
             ClientMsg::Detach,
             ClientMsg::PasteStart,
-            ClientMsg::AttachmentRequest { token: s("ab"), text: b"/tmp/a".to_vec() },
+            ClientMsg::AttachmentRequest { token: s("ab"), text: b"/tmp/a".to_vec(), image: false },
+            ClientMsg::AttachmentRequest { token: s("cd"), text: Vec::new(), image: true },
             ClientMsg::AttachmentText { token: s("ab"), text: b"/tmp/a".to_vec() },
             ClientMsg::AttachmentStart {
                 token: s("ab"),

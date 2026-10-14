@@ -248,8 +248,9 @@ arrives. Ordinary pasted text is unchanged. Clipboard images are not read by thi
 
 ### Clipboard images
 
-Choose **Attach clipboard image** in the command palette. The local prompt names the reserved
-pane. Press Enter to read the clipboard once and attach the image, or Ctrl+C to cancel. This
+Choose **Attach clipboard image** in the command palette. The local question is **Send the
+clipboard image to SERVER?**, with **Send** and **Cancel**. It names the destination pane.
+Press Enter on Send to read the clipboard once and send the image, or Esc or Ctrl+C to cancel. This
 local confirmation prevents a server message from reading your clipboard. Nothing watches the
 clipboard between actions. Ctrl+V and empty bracketed pastes keep their normal behavior.
 An optional `attach_clipboard_image` binding opens the same prompt.
@@ -259,7 +260,9 @@ Linux tries `wl-paste --no-newline --type image/png` when `WAYLAND_DISPLAY` is s
 or `xclip` for your desktop. macOS uses `osascript` to export the clipboard as PNG into a private
 file. Each helper has a two-second timeout. Missing tools, an unavailable PNG representation,
 failed reads and images larger than **16 MiB** produce a visible failure without pasting a path.
-Save a larger image and use **Attach files**. Dismiss a failure with Ctrl+C before trying again.
+Save a larger image and use **Attach files**. A failure stays open with **Retry** and **Close**.
+Retry shows the local question again before reading the clipboard. Success says **Sent the image
+to SERVER** and disappears after four seconds.
 
 The image uses the same acknowledged attachment chunks, quotas, reserved target and paste
 protections as files. A local session also stores `clipboard.png` in its private session
@@ -275,25 +278,44 @@ opens a local choice. The target, file count, total size and names appear before
 opened for transfer. At 124 columns:
 
 ```text
-SERVER / main / Claude | 2 local files, 3.2 MiB: capture.png, notes client.txt
-Send the files and paste their remote paths?
-[>Send<] [Always for SERVER] [Paste the text] [Cancel]
+╭ Send 2 files to SERVER? ─────────────────────────────────────────────────────────────────────────╮
+│ 0.3 MiB. Their paths on SERVER go to dev@anvil:~.                                                │
+│ capture one.png                                                                                  │
+│ notes.txt                                                                                        │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│  Send     Always for SERVER     Paste as text     Cancel                                         │
+│                                                                                                  │
+│                                                                                                  │
+│ Enter Send · Tab Choose · Esc Cancel                                                             │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────╯
 ```
 
 At 80 columns:
 
 ```text
-SERVER / main / Claude
-2 local files, 3.2 MiB: capture.png, notes client.txt
-Send the files and paste their remote paths?
-[>Send<] [Always here] [Text] [Cancel]
+╭ Send 2 files to SERVER? ─────────────────────────────────────────────────╮
+│ 0.3 MiB. Their paths on SERVER go to dev@anvil:~.                        │
+│ capture one.png                                                          │
+│ notes.txt                                                                │
+│                                                                          │
+│                                                                          │
+│                                                                          │
+│  Send     Always for SERVER     Paste as text     Cancel                 │
+│                                                                          │
+│                                                                          │
+│ Enter Send · Tab Choose · Esc Cancel                                     │
+╰──────────────────────────────────────────────────────────────────────────╯
 ```
 
-Tab or the arrow keys select a choice, Enter activates it, and clicking a choice does the same.
-Ctrl+C or Esc cancels. **Send** sends this batch once. **Always** remembers permission on the
-laptop for this SSH destination, including its connection arguments. Subsequent eligible pastes,
-including on another attach, send without asking. Broadcasting still asks to send only to the
-named pane. The choice is never permission for the server to read laptop files on its own.
+Tab or Left/Right selects a choice, Enter activates it, and clicking a choice does the same.
+Long filename lists scroll with Up/Down or PgUp/PgDn; the destination, broadcast warning and
+validation error stay visible. Ctrl+C or Esc cancels. **Send** sends this batch once. **Always**
+remembers permission on the laptop for this SSH destination, including its connection arguments.
+Subsequent eligible pastes, including on another attach, send without asking. Broadcasting still
+asks to send only to the named pane. The choice is never permission for the server to read laptop
+files on its own.
 
 Permissions are in `~/.config/kraal/paste-files.toml` (or
 `$XDG_CONFIG_HOME/kraal/paste-files.toml`). Remove the matching `[[server]]` entry to revoke it,
@@ -301,7 +323,7 @@ or remove that file to revoke all permissions. Revocation applies to the next pa
 reattaching. An unreadable or malformed file never grants permission. The file holds destination
 names and SSH arguments, not file contents or pasted text.
 
-**Paste the text** (or **Text**) preserves the original bytes, including quotes and escapes.
+**Paste as text** preserves the original bytes, including quotes and escapes.
 **Cancel** sends no file and pastes nothing. Spaces can be quoted or escaped with backslashes.
 Local `file:///...` URIs are percent decoded; remote authorities are refused. An unquoted name
 with spaces is recognized only when it has one interpretation. Commands, sentences, missing
@@ -310,16 +332,25 @@ executes none of them to recognize a path. Recognition buffers at most 64 KiB; l
 stream unchanged. A local session always pastes paths unchanged, including into an SSH pane.
 Use **Upload to this pane's server** or `kraal cp` for that topology.
 
-For a longer transfer, the choice is replaced after 200 ms by progress, for example:
+For a longer transfer, the choice is replaced after 200 ms by a box titled **Sending to SERVER**,
+with progress and a Cancel button:
 
 ```text
-Sending to SERVER: 2.1 / 3.2 MiB (66%) [Cancel: Ctrl+C]
+Sending to SERVER
+2.1 / 3.2 MiB (66%)
+Typing waits until it finishes.
+
+ Cancel
+Ctrl+C Cancel
 ```
 
-A short transfer goes directly to the result, without flashing progress. Files stay in their
-original order, and all remote paths are submitted together to the reserved pane after the
-whole batch succeeds. A failure retains the original text and offers **Retry**, **Paste the
-text**, and **Close**. Retry reserves the current pane and shows the choice again; Text pastes
+A short transfer goes directly to **Sent 2 files to SERVER**, without flashing progress.
+Success disappears after four seconds. Typing and Ctrl+C reach the pane as usual during that
+time. The client draws these boxes locally, above the bottom bar, and restores the covered
+frames and pane content when they close. Files stay in their original order, and all remote
+paths go together to the chosen pane after the whole batch succeeds. A failure retains the
+original text and offers **Retry**, **Paste as text**, and **Close** until answered. Retry
+reserves the current pane and shows the choice again; Paste as text pastes
 the original text into the current pane. After a connection loss, inspect the recovered result
 and the pane before retrying: finalized files are kept, and kraal never retries automatically.
 Directories, links and special files have an explicit refusal pointing to `kraal cp`.
@@ -333,9 +364,11 @@ Sending shows progress after 200 ms, with Ctrl+C to cancel. Typing waits in a bo
 (up to 64 KiB, for at most 60 seconds including the form) and follows the paths on success.
 Closing the pane, cancelling, exceeding the queue or timing out discards the queued typing
 and incomplete files, with a clear result. After failure, further typing is held out until
-Ctrl+C dismisses the result, so the tail of a large paste cannot reach the pane. If focus changed, the paths still go to the reserved
-pane but queued typing is discarded. Use **Attach files** to retry, selecting the files again. Dismiss a failure with Ctrl+C first.
-Results remain on the client until Ctrl+C dismisses them or another attachment opens.
+the result is closed or another choice is selected, so the tail of a large paste cannot reach
+the pane. If focus changed, the paths still go to the chosen pane but queued typing is discarded;
+the result asks you to select that pane before typing again. Retry returns to a local choice.
+Success disappears after four seconds and never captures Ctrl+C. Ctrl+C cancels only while a
+local choice is open or a transfer is running; on a failure box, it closes the box.
 
 The defaults are 64 MiB per file, 128 MiB per batch, 32 files and 1 GiB per session. All four
 are [configurable](configuration.md#attachments). No limit silently truncates content. The
