@@ -8,7 +8,7 @@ The **Workspaces** list (`ctrl+b w`) shows **Open** or **Closed**, retained tab 
 and **Current** for the workspace on screen. Enter or one click opens the selected workspace.
 Search only filters the list. **+ Add workspace** stays visible even when nothing matches.
 The bottom-right count includes only workspaces, showing matches over the total while searching.
-Tab or a right click offers actions for that row: **Rename** for a saved workspace, and **Close**
+Tab or a right click offers actions for that row: **Rename** and **Duplicate** for a saved workspace, and **Close**
 when it is open. **Delete** is available for saved workspaces and workspace files that have
 not been imported. **Move up** and **Move down** change the order of saved workspaces and
 unimported files. An unimported file also offers **Open**.
@@ -64,6 +64,31 @@ no longer matches the search, the search clears to show it.
 | `kraal kill` | stops the session's server and its programs; the layout is saved |
 | `kraal restart` | restarts the server on the kraal installed now (see below) |
 | `kraal forget` | deletes what a stopped session saved |
+
+### Duplicating a workspace
+
+Select an open or closed saved workspace, press Tab and choose **Duplicate**. The shared Name
+form proposes an unused name: `api-copy`, then `api-copy-2`, and so on. Edit it if needed and
+press Enter or click **Duplicate**. Esc or **Cancel** returns to the same search and selection.
+A taken or empty name stays in the form so you can correct it.
+
+The result selects the new **Closed** workspace and says **Workspace duplicated · Enter Open**.
+It is saved before that result appears. Opening it is optional; the workspace currently shown
+in each attached terminal stays unchanged. `workspace.opened` hooks run only when the copy is
+opened. A save failure keeps the name and offers **Retry**.
+The failed copy is removed; if a timed-out write's rollback also fails, the form says the saved
+session may still contain it and asks you to fix the save error and retry.
+
+The copy keeps the layout, names, pane folders, commands, previews and account bindings.
+It has its own workspace identity and gets new tab and pane numbers when opened. Shells can
+start on Open. All commands, including SSH and managed agents, wait for Enter. Managed agents
+start a new conversation; conversation selections and account-switch Undo history are removed.
+Scrollback and shell history shown in panes are not copied. Typing is not broadcast.
+
+The source stays unchanged. The copy has no association with its KDL file and writes no KDL
+file. Project files and pane folders remain shared; Duplicate does not copy a Git checkout or
+create a worktree. A workspace restored from Deleted workspaces before its first Open can also
+be duplicated from its retained contents, even if the original file is gone.
 
 ### Reordering workspaces
 

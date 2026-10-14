@@ -124,6 +124,106 @@ impl CloseIntent {
 }
 
 impl WorkspaceSnap {
+    pub fn duplicate(&self, name: &str) -> Result<Self> {
+        let mut copy = self.clone();
+        copy.id = crate::accounts::new_uuid();
+        copy.name = name.into();
+        copy.definition = None;
+        copy.definition_source = None;
+        copy.closed = true;
+        copy.close_pending = None;
+        copy.delete_pending = false;
+        copy.restore_error = None;
+        copy.sync = crate::server::SyncScope::Off;
+        if self.unopened {
+            let mut def = crate::workspace::parse_workspace(
+                name,
+                self.definition_source.as_deref().context("the saved source is missing")?,
+            )?;
+            fn pane(p: &mut crate::workspace::PaneDef) {
+                p.start_suspended = true;
+                let kind = match (&p.command, &p.agent) {
+                    (Some(command), _) => command.rsplit('/').next(),
+                    (None, Some(agent)) => agent.split(':').next(),
+                    _ => None,
+                }
+                .and_then(crate::accounts::agent_kind);
+                if let Some(kind) = kind {
+                    p.args = crate::accounts::duplicate_args(kind, &p.args);
+                }
+            }
+            fn node(n: &mut crate::workspace::LayoutNode) {
+                use crate::workspace::LayoutNode;
+                match n {
+                    LayoutNode::Pane(p) => pane(p),
+                    LayoutNode::Split { children, .. } => children.iter_mut().for_each(|(n, _)| node(n)),
+                    LayoutNode::Stack { panes, .. } => panes.iter_mut().for_each(pane),
+                }
+            }
+            for tab in &mut def.tabs {
+                node(&mut tab.root);
+                tab.floating.iter_mut().for_each(pane);
+            }
+            copy.definition_source = Some(crate::workspace::to_kdl(&def));
+        }
+        fn pane(p: &mut PaneSnap, name: &str) {
+            p.agent = None;
+            p.agent_session = None;
+            p.scrollback = None;
+            p.stopped |= !p.spec.command.is_empty();
+            p.spec.startup_input = None;
+            p.spec.session = None;
+            p.spec.account_undo = None;
+            p.spec.close_on_success = false;
+            // The folder is shared, but the copy must not own the source pane's worktree.
+            p.spec.worktree = None;
+            if let Some(program) = p.spec.command.first()
+                && let Some(kind) = p
+                    .spec
+                    .account
+                    .as_deref()
+                    .and_then(|account| account.split(':').next())
+                    .and_then(crate::accounts::agent_kind)
+                    .or_else(|| program.rsplit('/').next().and_then(crate::accounts::agent_kind))
+            {
+                let args = crate::accounts::duplicate_args(kind, &p.spec.command[1..]);
+                let mut command = vec![program.clone()];
+                if (p.spec.account.is_some() || p.spec.account_id.is_some())
+                    && let Some(flag) = kind.session_flag
+                {
+                    let id = crate::accounts::new_uuid();
+                    command.extend([flag.to_string(), id.clone()]);
+                    p.spec.session = Some(id);
+                }
+                command.extend(args);
+                p.spec.command = command;
+            }
+            if let Some(pending) = &mut p.spec.pending_agent {
+                pending.suspended = true;
+                pending.workspace = Some(name.into());
+                if let Some(kind) = crate::accounts::agent_kind(&pending.agent) {
+                    pending.args = crate::accounts::duplicate_args(kind, &pending.args);
+                }
+            }
+        }
+        fn node(n: &mut NodeSnap, name: &str) {
+            match n {
+                NodeSnap::Pane(p) => pane(p, name),
+                NodeSnap::Split { children, .. } => children.iter_mut().for_each(|(n, _)| node(n, name)),
+            }
+        }
+        for tab in &mut copy.tabs {
+            tab.sync = false;
+            if let Some(root) = &mut tab.root {
+                node(root, name);
+            }
+            for (p, _) in &mut tab.floating {
+                pane(p, name);
+            }
+        }
+        Ok(copy)
+    }
+
     fn clear_scrollback(&mut self) {
         fn clear(node: &mut NodeSnap) {
             match node {
@@ -254,7 +354,9 @@ pub fn snapshot(server: &Server) -> SessionSnapshot {
         let p = &server.panes[&id];
         let mut spec = p.spec.clone();
         server.accounts.bind_pane(&mut spec);
-        spec.startup_input = None;
+        if !p.suspended {
+            spec.startup_input = None;
+        }
         if let crate::pane::Content::Files(f) = &p.content {
             use crate::files::Side;
             spec.files = Some([f.location(Side::Left).display(), f.location(Side::Right).display()]);
@@ -815,14 +917,19 @@ pub fn apply(server: &mut Server, mut snap: SessionSnapshot) -> Result<()> {
 }
 
 pub(crate) fn apply_workspace(server: &mut Server, ws: &WorkspaceSnap) -> Result<()> {
-    let id = server.new_workspace(ws.name.clone(), ws.definition.clone());
+    let closed = ws.closed || ws.close_pending.is_some() || ws.delete_pending;
+    let id = if closed {
+        server.new_workspace_record(ws.name.clone(), ws.definition.clone())
+    } else {
+        server.new_workspace(ws.name.clone(), ws.definition.clone())
+    };
     let wi = server.ws_index(id).unwrap();
     server.workspaces[wi].stable_id = ws.id.clone();
     server.workspaces[wi].name = ws.name.clone();
     server.workspaces[wi].cwd = ws.cwd.clone();
     server.workspaces[wi].definition_source = ws.definition_source.clone();
     server.workspaces[wi].delete_pending = ws.delete_pending;
-    if ws.closed || ws.close_pending.is_some() || ws.delete_pending {
+    if closed {
         server.workspaces[wi].kept = Some(ws.clone());
     } else {
         restore_workspace_tabs(server, wi, ws)?;
@@ -920,7 +1027,7 @@ fn spawn(server: &mut Server, p: &PaneSnap) -> Result<PaneId> {
     let ssh_shell = spec.command.first().is_some_and(|c| c.rsplit('/').next() == Some("ssh"))
         && !crate::servers::ssh_runs_command(&spec.command[1..]);
     let auto = ssh_shell || resumed;
-    let id = if p.stopped || !spec.command.is_empty() && !auto {
+    let id = if p.stopped || (!spec.command.is_empty() || p.spec.startup_input.is_some()) && !auto {
         let why = if p.stopped { "it was not running before the restart" } else { "restored session" };
         server.spawn_pane_suspended(p.name.clone(), spec, why)?
     } else {
@@ -976,6 +1083,101 @@ mod tests {
                 "agent": null, "agent_session": null}}, "floating": [], "focus": 0,
                 "show_floating": false, "zoomed": false, "sync": false}]
         }]})
+    }
+
+    #[test]
+    fn duplicate_keeps_shell_stopped_state_and_stops_commands() {
+        for (stopped, command) in [(false, false), (true, false), (false, true), (true, true)] {
+            let mut snap: SessionSnapshot = serde_json::from_value(saved_state()).unwrap();
+            let ws = &mut snap.workspaces[0];
+            let Some(NodeSnap::Pane(p)) = &mut ws.tabs[0].root else { panic!() };
+            p.stopped = stopped;
+            if command {
+                p.spec.command = vec!["sh".into()];
+            }
+            let copied = ws.duplicate("copy").unwrap();
+            let Some(NodeSnap::Pane(p)) = &copied.tabs[0].root else { panic!() };
+            assert_eq!(p.stopped, stopped || command);
+        }
+    }
+
+    #[test]
+    fn duplicate_removes_conversations_scrollback_and_ownership_but_keeps_layout_and_accounts() {
+        let mut snap: SessionSnapshot = serde_json::from_value(saved_state()).unwrap();
+        let ws = &mut snap.workspaces[0];
+        ws.definition = Some("/source.kdl".into());
+        ws.definition_source = Some("original source".into());
+        ws.cwd = Some("/project".into());
+        ws.sync = crate::server::SyncScope::Workspace;
+        ws.tabs[0].sync = true;
+        ws.tabs[0].zoomed = true;
+        let Some(NodeSnap::Pane(p)) = &mut ws.tabs[0].root else { panic!() };
+        p.agent = Some("claude".into());
+        p.agent_session = Some("observed".into());
+        p.scrollback = Some("1-2-3.ans".into());
+        p.spec.command =
+            ["/bin/managed-agent", "--session-id", "reserved", "--model", "opus"].map(str::to_string).to_vec();
+        p.spec.account = Some("claude:work".into());
+        p.spec.account_id = Some("account-id".into());
+        p.spec.session = Some("reserved".into());
+        p.spec.startup_input = Some("continue\r".into());
+        p.spec.account_undo = Some(Box::new(p.spec.clone()));
+        p.spec.cwd = Some("/project/tree".into());
+        p.spec.worktree = Some(crate::git::Worktree {
+            repo: "/project".into(),
+            path: "/project/tree".into(),
+            branch: "kraal/1".into(),
+            base: "main".into(),
+            index: 1,
+        });
+        let mut floating = *p.clone();
+        floating.spec.pending_agent = Some(crate::pane::PendingAgent {
+            agent: "codex".into(),
+            args: vec!["resume".into(), "old".into()],
+            workspace: Some("w".into()),
+            ..Default::default()
+        });
+        floating.spec.close_on_success = true;
+        ws.tabs[0].floating.push((floating, FloatRect { x: 0.1, y: 0.2, w: 0.3, h: 0.4 }));
+        let original = serde_json::to_value(&*ws).unwrap();
+        let copied = ws.duplicate("copy").unwrap();
+        assert_eq!(serde_json::to_value(ws).unwrap(), original);
+        assert_ne!(copied.id, "kept");
+        assert!(copied.closed);
+        assert_eq!(copied.counts(), (1, 2));
+        assert!(copied.definition.is_none() && copied.definition_source.is_none());
+        assert_eq!(copied.sync, crate::server::SyncScope::Off);
+        let tab = &copied.tabs[0];
+        assert!(!tab.sync);
+        assert!(tab.zoomed);
+        assert_eq!(tab.focus, Some(0));
+        assert_eq!(tab.floating[0].1.x, 0.1);
+        let Some(NodeSnap::Pane(p)) = &tab.root else { panic!() };
+        for p in [p.as_ref(), &tab.floating[0].0] {
+            assert!(p.stopped);
+            assert!(p.agent.is_none() && p.agent_session.is_none() && p.scrollback.is_none());
+            let session = p.spec.session.as_deref().unwrap();
+            assert_ne!(session, "reserved");
+            assert_ne!(session, "observed");
+            assert!(p.spec.account_undo.is_none() && p.spec.startup_input.is_none());
+            assert!(p.spec.worktree.is_none());
+            assert!(!p.spec.close_on_success);
+            assert_eq!(p.spec.command, ["/bin/managed-agent", "--session-id", session, "--model", "opus"]);
+            assert_eq!(p.spec.cwd.as_deref(), Some(Path::new("/project/tree")));
+            assert_eq!(p.spec.account_id.as_deref(), Some("account-id"));
+            assert_eq!(p.spec.account.as_deref(), Some("claude:work"));
+        }
+        assert_ne!(p.spec.session, tab.floating[0].0.spec.session);
+        let pending = tab.floating[0].0.spec.pending_agent.as_ref().unwrap();
+        assert!(pending.suspended);
+        assert!(pending.args.is_empty());
+        assert_eq!(pending.workspace.as_deref(), Some("copy"));
+        snap.workspaces.push(copied);
+        let encoded = serde_json::to_vec(&snap).unwrap();
+        let restored = parse(&encoded).unwrap();
+        assert_eq!(restored.version, VERSION);
+        assert!(restored.workspaces[1].closed);
+        assert_eq!(scrollback_files(&restored), HashSet::from(["1-2-3.ans"]));
     }
 
     #[test]

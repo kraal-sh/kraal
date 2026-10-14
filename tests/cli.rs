@@ -1350,6 +1350,181 @@ fn workspace_search_add_and_closed_rename_work_at_both_sizes() {
 }
 
 #[test]
+fn workspace_duplicate_is_saved_closed_and_starts_commands_only_on_enter() {
+    for size in [(80, 24), (124, 36)] {
+        let env = Env::new(&format!("ws-duplicate-{}", size.0));
+        let bin = env.root.join("bin");
+        let account = env.root.join("agent-home");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::create_dir_all(&account).unwrap();
+        write_script(
+            &bin.join("claude"),
+            r#"#!/bin/sh
+[ "$2" = status ] && exit 0
+mkdir -p "$CLAUDE_CONFIG_DIR/projects/work"
+printf '{"message":1}\n' >> "$CLAUDE_CONFIG_DIR/projects/work/$2.jsonl"
+printf '%s\n' "$*" >> "$CLAUDE_CONFIG_DIR/launches"
+echo original-agent-output
+while IFS= read -r line; do :; done
+"#,
+        );
+        std::fs::write(
+            env.root.join("config/kraal/accounts.toml"),
+            format!(
+                "[[account]]\nid = \"test-claude-work\"\nname = \"work\"\nagent = \"claude\"\nhome = {:?}\n",
+                account.display().to_string()
+            ),
+        )
+        .unwrap();
+        let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap_or_default());
+        let job = format!("echo job >> {}/jobs; echo original-job-output; exec sleep 100", env.root.display());
+        let source = format!(
+            r#"// Keep the recipe unchanged.
+layout {{
+    cwd {:?}
+    tab name="work" focus=true {{
+        pane name="shell" focus=true
+        pane name="job" command="sh" {{ args "-c" {:?}; }}
+    }}
+    tab name="agent" {{ pane name="agent" agent="claude:work" account_id="test-claude-work" {{ args "--model" "opus"; }}; }}
+}}
+"#,
+            env.root.display().to_string(),
+            job
+        );
+        env.workspace("api", &source);
+        env.workspace("api-copy", "layout { pane; }\n");
+        let opened = env.cmd(&["open", "api"]).env("PATH", &path).output().unwrap();
+        assert!(opened.status.success(), "{}", String::from_utf8_lossy(&opened.stderr));
+        env.wait_for_text("job", "original-job-output");
+        env.wait_for_text("agent", "original-agent-output");
+        let original_launch = std::fs::read_to_string(account.join("launches")).unwrap();
+        assert!(original_launch.contains("--session-id"));
+        let original_id =
+            serde_json::from_str::<serde_json::Value>(&env.run(&["workspaces", "--json"])).unwrap()[0]["id"].clone();
+        let mut client = RawClient::attach_sized(&env, Some("api"), size);
+        client.wait_for_row("$ ");
+        // Output can arrive before the periodic scan recognises the agent.
+        wait_until(PATIENCE, "the original agent was not detected as idle", || {
+            let panes: serde_json::Value = serde_json::from_str(&env.run(&["panes", "--json"])).unwrap();
+            panes
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|p| p["name"] == "agent" && p["agent"] == "claude" && p["state"] == "idle")
+        });
+        let original_panes: serde_json::Value = serde_json::from_str(&env.run(&["panes", "--json"])).unwrap();
+        client.send(b"\x02wapi\t");
+        click_account_text(&mut client, "Duplicate");
+        client.wait_for_row("Name    api-copy-2");
+        client.wait_for_row("Programs wait for you to start them.");
+        client.send(b"\x1b");
+        client.wait_for_row("Search  api");
+        client.send(b"\t");
+        click_account_text(&mut client, "Duplicate");
+        client.wait_for_row("Name    api-copy-2");
+        client.send(b"\r");
+        client.wait_for_row("Workspace duplicated");
+        let list: serde_json::Value = serde_json::from_str(&env.run(&["workspaces", "--json"])).unwrap();
+        let copy = list.as_array().unwrap().iter().find(|w| w["name"] == "api-copy-2").unwrap();
+        assert_eq!(copy["open"], false);
+        assert_eq!(copy["tabs"], 2);
+        assert_eq!(copy["panes"], 3);
+        assert_ne!(copy["id"], original_id);
+        assert!(copy["definition"].is_null());
+        assert_eq!(serde_json::from_str::<serde_json::Value>(&env.run(&["panes", "--json"])).unwrap(), original_panes);
+        let saved: serde_json::Value = serde_json::from_slice(&std::fs::read(env.state_file()).unwrap()).unwrap();
+        assert!(saved["workspaces"].as_array().unwrap().iter().any(|w| w["id"] == copy["id"] && w["closed"] == true));
+        env.run(&["kill"]);
+        let opened = env.cmd(&["open", "api"]).env("PATH", &path).output().unwrap();
+        assert!(opened.status.success());
+        env.wait_for_text_since_restore("agent", "original-agent-output");
+        let launches = std::fs::read_to_string(account.join("launches")).unwrap();
+        let jobs = std::fs::read_to_string(env.root.join("jobs")).unwrap();
+        let list: serde_json::Value = serde_json::from_str(&env.run(&["workspaces", "--json"])).unwrap();
+        let restarted_copy = list.as_array().unwrap().iter().find(|w| w["name"] == "api-copy-2").unwrap();
+        assert_eq!(restarted_copy["id"], copy["id"]);
+        assert_eq!(restarted_copy["open"], false);
+        env.run(&["open", "api-copy-2"]);
+        let panes: serde_json::Value = serde_json::from_str(&env.run(&["panes", "--json"])).unwrap();
+        let current_source: Vec<_> = panes.as_array().unwrap().iter().filter(|p| p["workspace"] == "api").collect();
+        let copied: Vec<_> = panes.as_array().unwrap().iter().filter(|p| p["workspace"] == "api-copy-2").collect();
+        assert_eq!(copied.len(), 3);
+        for p in &copied {
+            assert!(current_source.iter().all(|original| original["id"] != p["id"]));
+            if p["name"] != "shell" {
+                assert_eq!(p["suspended"], true);
+                let output = env.run(&["read", "-p", &p["id"].to_string()]);
+                assert!(!output.contains("original-agent-output"));
+            }
+        }
+        assert_eq!(std::fs::read_to_string(account.join("launches")).unwrap(), launches);
+        assert_eq!(std::fs::read_to_string(env.root.join("jobs")).unwrap(), jobs);
+        let shell = copied.iter().find(|p| p["name"] == "shell").unwrap();
+        env.run(&["send", "-p", &shell["id"].to_string(), "--enter", "printf 'copy-shell-%s\\n' ready"]);
+        env.wait_for_text(&shell["id"].to_string(), "copy-shell-ready");
+        let agent = copied.iter().find(|p| p["name"] == "agent").unwrap();
+        assert_eq!(agent["account_id"], current_source.iter().find(|p| p["name"] == "agent").unwrap()["account_id"]);
+        let mut client = RawClient::attach_sized(&env, Some("api-copy-2"), size);
+        client.wait_for_message("\"attached\"");
+        client.send(format!("\x1b]7701;show;{}\x07", agent["id"]).as_bytes());
+        client.wait_for_row("--session-id");
+        client.wait_for_row("enter run");
+        client.send(b"\r");
+        wait_until(PATIENCE, "the copied agent did not start", || {
+            std::fs::read_to_string(account.join("launches")).unwrap().lines().count() == launches.lines().count() + 1
+        });
+        let all_launches = std::fs::read_to_string(account.join("launches")).unwrap();
+        let copied_launch = all_launches.lines().last().unwrap();
+        let copied_session = copied_launch.split_whitespace().nth(1).unwrap();
+        assert_eq!(copied_launch, format!("--session-id {copied_session} --model opus"));
+        assert_ne!(Some(copied_session), original_launch.split_whitespace().nth(1));
+        assert_eq!(std::fs::read_to_string(env.root.join("jobs")).unwrap(), jobs);
+        let job = copied.iter().find(|p| p["name"] == "job").unwrap();
+        client.send(format!("\x1b]7701;show;{}\x07", job["id"]).as_bytes());
+        client.wait_for_row("echo job");
+        client.wait_for_row("enter run");
+        client.send(b"\r");
+        wait_until(PATIENCE, "the copied command did not start", || {
+            std::fs::read_to_string(env.root.join("jobs")).unwrap().lines().count() == jobs.lines().count() + 1
+        });
+        let source_path = env.root.join("config/kraal/workspaces/api.kdl");
+        assert_eq!(std::fs::read_to_string(&source_path).unwrap(), source);
+        assert!(!source_path.with_extension("kdl.bak").exists());
+        assert!(!env.root.join("config/kraal/workspaces/api-copy-2.kdl").exists());
+
+        // The fake agent writes a transcript but never sends hooks. Close/Open and a server
+        // restart must both recover the copy's conversation, without borrowing the source's.
+        // The question lists the programs as the periodic scan knows them, and asks again when
+        // that list changed under it: answer once the scan has recognised the copied agent.
+        wait_until(PATIENCE, "the copied agent was not detected as idle", || {
+            let panes: serde_json::Value = serde_json::from_str(&env.run(&["panes", "--json"])).unwrap();
+            panes
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|p| p["id"] == agent["id"] && p["agent"] == "claude" && p["state"] == "idle")
+        });
+        client.send(b"\x02Wx");
+        client.wait_for_row("The layout will be kept.");
+        client.wait_for_row("claude: idle");
+        client.send(b"y");
+        client.wait_for_row("Closed · 2 tabs · 3 panes");
+        env.run(&["open", "api-copy-2"]);
+        let resumed = format!("--resume {copied_session} --model opus");
+        wait_until(PATIENCE, "Close/Open did not resume the copied conversation without hooks", || {
+            std::fs::read_to_string(account.join("launches")).unwrap().lines().filter(|l| *l == resumed).count() == 1
+        });
+        env.run(&["kill"]);
+        let opened = env.cmd(&["open", "api-copy-2"]).env("PATH", &path).output().unwrap();
+        assert!(opened.status.success());
+        wait_until(PATIENCE, "server restart did not resume the copied conversation without hooks", || {
+            std::fs::read_to_string(account.join("launches")).unwrap().lines().filter(|l| *l == resumed).count() == 2
+        });
+    }
+}
+
+#[test]
 fn workspace_moves_keep_focus_share_the_list_and_survive_restart() {
     for size in [(80, 24), (124, 36)] {
         let env = Env::new(&format!("ws-order-{}", size.0));
@@ -1372,7 +1547,7 @@ fn workspace_moves_keep_focus_share_the_list_and_survive_restart() {
         client.send(b"docs\t");
         click_account_text(&mut client, "Clear search to reorder");
         assert_eq!(listed_workspaces(&env), ["api: api.kdl (open)", "docs: docs.kdl", "web: web.kdl (open)"]);
-        client.send(b"\t\x1b[B\x1b[B\r");
+        client.send(b"\t\x1b[B\x1b[B\x1b[B\r");
         let reordered = ["docs: docs.kdl", "api: api.kdl (open)", "web: web.kdl (open)"];
         wait_until(PATIENCE, "workspace order was not saved", || listed_workspaces(&env) == reordered);
         other.wait_for_rows("the other client's list has the same order", |rows| {
@@ -1420,13 +1595,13 @@ fn workspace_delete_undo_and_restore_after_restart_keep_both_reused_names() {
         let path = env.root.join("config/kraal/workspaces/api.kdl");
         let mut client = RawClient::attach_sized(&env, Some("api"), size);
         client.wait_for_row("$ ");
-        client.send(b"\x02w\t\x1b[B\x1b[B\x1b[B\r");
+        client.send(b"\x02w\t\x1b[B\x1b[B\x1b[B\x1b[B\r");
         client.wait_for_row("Delete api?");
         client.wait_for_row("Project files will be kept.");
         client.send(b"\r");
         client.wait_for_row("Search");
         assert_eq!(env.run(&["workspaces", "--json"]), serde_json::to_string_pretty(&original).unwrap() + "\n");
-        client.send(b"\t\x1b[B\x1b[B\x1b[B\r");
+        client.send(b"\t\x1b[B\x1b[B\x1b[B\x1b[B\r");
         client.wait_for_row("Delete api?");
         client.send(b"y");
         client.wait_for_row("Ctrl+Z Undo");
@@ -1438,7 +1613,7 @@ fn workspace_delete_undo_and_restore_after_restart_keep_both_reused_names() {
         assert_eq!(restored[0]["id"], identity);
         assert_eq!(restored[0]["open"], false);
         assert_eq!(env.run(&["panes", "--json"]).trim(), "[]");
-        client.send(b"\t\x1b[B\x1b[B\r");
+        client.send(b"\t\x1b[B\x1b[B\x1b[B\r");
         client.wait_for_row("Delete api?");
         client.send(b"y");
         client.wait_for_row("Workspace deleted");
@@ -10818,7 +10993,7 @@ fn a_crash_during_delete_finishes_the_deletion_and_keeps_it_restorable() {
     env.wait_for_text("job", "ready");
     let mut client = RawClient::attach_sized(&env, Some("w"), (80, 24));
     client.wait_for_message("\"attached\"");
-    client.send(b"\x02w\t\x1b[B\x1b[B\x1b[B\r");
+    client.send(b"\x02w\t\x1b[B\x1b[B\x1b[B\x1b[B\r");
     client.wait_for_row("Stop and delete");
     client.send(b"y");
     wait_until(PATIENCE, "deletion was not prepared", || {

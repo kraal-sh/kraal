@@ -64,6 +64,13 @@ directory, name and stopped-state fields in `sessions-v2`. It adds no wire reque
 format. Old custom `rename_pane` bindings keep working; the default `ctrl+b P e` now opens the
 form whose Name field also renames. An older running server keeps its existing pane actions.
 
+Duplicate uses the same attached-terminal input protocol and existing saved-layout fields.
+Its closed copy has a new identity, no source-file association, and stopped command panes without
+conversation or scrollback references. No KDL, configuration or protocol format changes are
+needed. Copies stay in `sessions-v2`; the 0.2.0 and 0.3.0 paths and migration backups are untouched.
+Clients from those releases can use Duplicate on a current server. An older running server
+keeps its existing actions until restarted.
+
 ## For contributors: how the protocol changes
 
 The client and the server exchange JSON messages (`src/protocol.rs`, whose comments hold the

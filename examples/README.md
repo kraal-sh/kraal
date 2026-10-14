@@ -28,3 +28,8 @@ at its tag. The [documentation](../docs/README.md) explains what they use.
 
 The files of `config/` are each a whole `config.toml`: copy one, or add its tables to yours.
 `repository/` holds what a repository commits, at its top.
+
+After opening a workspace example, use Workspaces, Tab, **Duplicate** to keep an independent
+layout under a proposed free name. The copy is saved closed. Opening it starts shells, while
+commands and agents wait for Enter; agents start new conversations. The example file stays
+unchanged, and project folders remain shared. See [Duplicating a workspace](../docs/workspaces.md#duplicating-a-workspace).

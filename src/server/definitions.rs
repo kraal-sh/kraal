@@ -452,7 +452,7 @@ impl Server {
                 }
             }
         }
-        if def.start_suspended && !spec.command.is_empty() {
+        if def.start_suspended && (!spec.command.is_empty() || spec.startup_input.is_some()) {
             return self.spawn_pane_suspended(def.name.clone(), spec, "start_suspended");
         }
         self.spawn_pane(def.name.clone(), spec)

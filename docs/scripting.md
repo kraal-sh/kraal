@@ -104,6 +104,9 @@ connected), `production.entered/left` (`entered` again when the reason changes),
 `runbook.started/finished`, `command.finished` (a command the shell marks ended: its `command`
 line, `exit` status and `seconds`; see [Shell commands](terminal.md#shell-commands)).
 
+Duplicating or restoring a closed workspace emits no `workspace.opened` event and runs no
+matching hooks. A successful Open emits it once; selecting an already open workspace does not.
+
 Local agent events and pane JSON include an optional `account_id` alongside the readable
 `account` label. The identity stays the same across a rename and is kept after removal; a new
 account that reuses the name gets a different identity. Older sessions may omit this field.

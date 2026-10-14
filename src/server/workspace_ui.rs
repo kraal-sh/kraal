@@ -28,6 +28,8 @@ fn verb(p: &Prompt) -> &'static str {
         "Retry"
     } else if matches!(p.action, PromptAction::NewWorkspace) {
         "Add"
+    } else if matches!(p.action, PromptAction::DuplicateWorkspace(_)) {
+        "Duplicate"
     } else {
         "Rename"
     }
@@ -57,6 +59,9 @@ pub(super) fn form_layout(p: &Prompt, screen: Rect) -> forms::FormLayout {
         .and_then(|f| f.cwd.as_deref())
         .map(|cwd| format!("Starts in {}", crate::paths::shorten_home(cwd)))
         .unwrap_or_default();
+    if matches!(p.action, PromptAction::DuplicateWorkspace(_)) {
+        message = "Copies the layout.\nPrograms wait for you to start them.".into();
+    }
     if let Some(error) = &p.error {
         if !message.is_empty() {
             message.push('\n');
@@ -141,6 +146,20 @@ impl Server {
             })
     }
 
+    pub(super) fn duplicate_workspace_form(&self, ws: u32, from: &Picker) -> Mode {
+        let Some(wi) = self.ws_index(ws) else {
+            return self.workspace_picker(0).result("Workspace unavailable. Select a workspace to duplicate.");
+        };
+        let base = format!("{}-copy", self.workspaces[wi].name);
+        let name = std::iter::once(base.clone())
+            .chain((2..).map(|n| format!("{base}-{n}")))
+            .find(|n| !self.workspace_name_used(n, None))
+            .unwrap();
+        let mut p = Prompt::new("Duplicate workspace", &name, PromptAction::DuplicateWorkspace(ws));
+        p.workspace_form.as_mut().unwrap().back = Some(from.state());
+        Mode::Prompt(p)
+    }
+
     pub(super) fn workspace_restore_back(&self, p: &mut Prompt, from: Option<&Picker>) {
         p.workspace_form.as_mut().unwrap().back = from.map(Picker::state);
     }
@@ -194,6 +213,38 @@ impl Server {
 
     pub(super) fn submit_workspace_form(&mut self, id: ClientId, mut p: Prompt) -> Mode {
         let name = p.value.trim();
+        if let PromptAction::DuplicateWorkspace(source) = p.action {
+            let validation = if name.is_empty() {
+                Some("Type a name.")
+            } else if self.workspace_name_used(name, None) {
+                Some("This name is already used.")
+            } else {
+                None
+            };
+            p.workspace_form.as_mut().unwrap().invalid_name = validation.is_some();
+            let result = match validation {
+                Some(error) => Err(error.into()),
+                None => self.duplicate_workspace(source, name),
+            };
+            return match result {
+                Ok(ws) => {
+                    self.refresh_workspace_pickers();
+                    self.mark_dirty();
+                    self.toast(id, "Workspace duplicated");
+                    let mut picker = self.workspace_picker(self.clients.get(&id).map_or(0, |c| c.workspace));
+                    if let Some(back) = p.workspace_form.as_mut().and_then(|f| f.back.take()) {
+                        picker.restore(back);
+                    }
+                    select_workspace(&mut picker, ws);
+                    picker.result("Workspace duplicated · Enter Open")
+                }
+                Err(error) => {
+                    p.error = Some(error);
+                    p.scroll = 0;
+                    Mode::Prompt(p)
+                }
+            };
+        }
         if let PromptAction::RestoreWorkspace(identity) = &p.action {
             let result = if name.is_empty() {
                 Err("Type a name.".into())
@@ -315,6 +366,108 @@ mod tests {
 
     fn text(buf: &Buffer) -> String {
         buf.content.iter().map(|c| c.symbol()).collect()
+    }
+
+    #[test]
+    fn duplicate_form_proposes_a_free_name_and_cancel_keeps_search_and_selection() {
+        let (tx, _rx) = super::super::queue::channel(32);
+        let mut server = super::super::tests::server(tx);
+        let (client, _peer) = super::super::tests::client(&mut server);
+        let ws = server.workspaces[0].id;
+        server.new_workspace("test-copy".into(), None);
+        let mut kept = crate::persist::snapshot(&server).workspaces.remove(1);
+        kept.closed = true;
+        server.workspaces[1].kept = Some(kept);
+        server.new_workspace("test-copy-2".into(), None);
+        let failed = crate::persist::snapshot(&server).workspaces.remove(2);
+        server.workspaces.pop();
+        server.unrestored.push(failed);
+        let dir = std::env::temp_dir().join(format!("kraal-duplicate-name-{}", crate::accounts::new_uuid()));
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(dir.join("test-copy-3.kdl"), "layout { pane; }\n").unwrap();
+        server.config.workspace_dirs = vec![dir.display().to_string()];
+        let mut list = server.workspace_picker(ws);
+        list.query = "test".into();
+        list.cursor = 2;
+        list.refilter();
+        for size in [(80, 24), (124, 36)] {
+            let c = server.clients.get_mut(&client).unwrap();
+            (c.cols, c.rows) = size;
+            let Mode::Prompt(p) = server.duplicate_workspace_form(ws, &list) else { panic!() };
+            assert_eq!(p.value, "test-copy-4");
+            let mut buf = Buffer::empty(server.client_screen(client));
+            draw_form(&p, buf.area, &mut buf);
+            for expected in [
+                "Duplicate workspace",
+                "Name    test-copy-4",
+                "Copies the layout.",
+                "Programs wait for you to start them.",
+                "Enter Duplicate",
+                "Esc Cancel",
+            ] {
+                assert!(text(&buf).contains(expected));
+            }
+            let Mode::Picker(back) = server.on_workspace_form(client, p, key("esc")) else { panic!() };
+            assert_eq!((back.query.as_str(), back.cursor), ("test", 2));
+            assert_eq!(back.current().unwrap().action.workspace(), Some(ws));
+            assert_eq!(server.workspaces.len(), 2);
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn duplicate_form_keeps_errors_and_input_then_selects_the_durable_closed_copy() {
+        for size in [(80, 24), (124, 36)] {
+            let (tx, _rx) = super::super::queue::channel(32);
+            let mut server = super::super::tests::server(tx);
+            let (client, _peer) = super::super::tests::client(&mut server);
+            let ws = server.workspaces[0].id;
+            let c = server.clients.get_mut(&client).unwrap();
+            (c.cols, c.rows) = size;
+            let saved = super::super::persistence::tests::writer(&mut server, vec![Err("disk full".into()), Ok(())]);
+            let mut list = server.workspace_picker(ws);
+            list.query = "test".into();
+            list.refilter();
+            let Mode::Prompt(mut p) = server.duplicate_workspace_form(ws, &list) else { panic!() };
+            for value in ["", "test"] {
+                p.value = value.into();
+                let Mode::Prompt(next) = server.on_workspace_form(client, p, key("enter")) else { panic!() };
+                assert!(next.error.is_some());
+                assert_eq!(verb(&next), "Duplicate");
+                p = next;
+            }
+            p.value = "independent".into();
+            p.cursor = 3;
+            let Mode::Prompt(p) = server.on_workspace_form(client, p, key("enter")) else { panic!() };
+            assert_eq!((p.value.as_str(), p.cursor), ("independent", 3));
+            assert_eq!(verb(&p), "Retry");
+            assert!(p.error.as_ref().unwrap().contains("No workspace was added"));
+            let mut buf = Buffer::empty(server.client_screen(client));
+            draw_form(&p, buf.area, &mut buf);
+            assert!(text(&buf).contains("disk full"));
+            assert!(text(&buf).contains("Programs wait for you to start them."));
+            assert_eq!(server.workspaces.len(), 1);
+            let button = form_layout(&p, server.client_screen(client)).primary;
+            let Mode::Picker(p) = server.on_workspace_form(
+                client,
+                p,
+                InputEvent::Mouse(MouseEvent {
+                    kind: MouseKind::Press(MouseButton::Left),
+                    col: button.x,
+                    row: button.y,
+                    mods: Default::default(),
+                }),
+            ) else {
+                panic!()
+            };
+            assert_eq!(p.message.as_deref(), Some("Workspace duplicated · Enter Open"));
+            assert!(p.query.is_empty());
+            let copy = &server.workspaces[1];
+            assert_eq!(p.current().unwrap().action.workspace(), Some(copy.id));
+            assert!(copy.closed());
+            assert_eq!(server.clients[&client].workspace, ws);
+            assert_eq!(saved.lock().unwrap().last().unwrap()["workspaces"][1]["name"], "independent");
+        }
     }
 
     #[test]

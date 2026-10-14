@@ -537,6 +537,30 @@ mod tests {
     use super::*;
 
     #[test]
+    fn duplicate_and_closed_restore_emit_open_only_when_opened_successfully() {
+        let (tx, _rx) = super::super::queue::channel(32);
+        let mut server = super::super::tests::server(tx);
+        let source = server.new_workspace("source".into(), None);
+        let seq = server.events.seq;
+        super::super::persistence::tests::writer(&mut server, vec![Err("disk full".into()), Ok(())]);
+        assert!(server.duplicate_workspace(source, "copy").is_err());
+        assert_eq!(server.events.seq, seq);
+        let copy = server.duplicate_workspace(source, "copy").unwrap();
+        assert_eq!(server.events.seq, seq);
+        let snapshot = crate::persist::snapshot(&server);
+        server.reopen_workspace(copy).unwrap();
+        assert_eq!(server.events.seq, seq + 1);
+        assert_eq!(server.events.kept.back().unwrap()["type"], "workspace.opened");
+        assert_eq!(server.events.kept.back().unwrap()["workspace"], "copy");
+        server.reopen_workspace(copy).unwrap();
+        assert_eq!(server.events.seq, seq + 1);
+        let (tx, _rx) = super::super::queue::channel(32);
+        let mut restarted = super::super::tests::server(tx);
+        crate::persist::apply(&mut restarted, snapshot).unwrap();
+        assert!(restarted.events.kept.iter().all(|e| e["workspace"] != "copy"));
+    }
+
+    #[test]
     fn patterns() {
         assert!(matches("agent.*", "agent.blocked"));
         assert!(!matches("agent.*", "agents.x"));

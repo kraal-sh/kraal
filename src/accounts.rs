@@ -1241,6 +1241,82 @@ pub fn launch_args(kind: &AgentKind, argv: &[String]) -> Vec<String> {
     rest.get(skip..).unwrap_or_default().to_vec()
 }
 
+/// Keep launch options and prompts, but never select a conversation from the copied pane.
+pub fn duplicate_args(kind: &AgentKind, args: &[String]) -> Vec<String> {
+    let mut kept = Vec::new();
+    let mut prompt = Vec::new();
+    let mut args = args.iter().peekable();
+    let mut conversation = false;
+    let mut selected = false;
+    let mut positional = false;
+    while let Some(arg) = args.next() {
+        let (flag, attached) = arg.split_once('=').map_or((arg.as_str(), false), |(flag, _)| (flag, true));
+        if arg == "--" {
+            kept.push(arg.clone());
+            if conversation && !selected {
+                args.next();
+            }
+            kept.append(&mut prompt);
+            kept.extend(args.cloned());
+            break;
+        }
+        if kind.name == "claude" {
+            match flag {
+                "--session-id" | "--resume" | "-r" | "--from-pr" | "--teleport" => {
+                    if !attached {
+                        args.next_if(|v| !v.starts_with('-'));
+                    }
+                    continue;
+                }
+                "--continue" | "-c" | "--fork-session" => continue,
+                _ => {}
+            }
+        } else if kind.name == "codex" {
+            if !positional && matches!(flag, "exec" | "e") {
+                kept.push(arg.clone());
+                continue;
+            }
+            if !positional && CODEX_CONVERSATIONS.contains(&flag) {
+                conversation = true;
+                positional = true;
+                continue;
+            }
+            if conversation && CODEX_CHOOSERS.contains(&flag) {
+                selected |= flag == "--last";
+                continue;
+            }
+            if conversation && !arg.starts_with('-') {
+                if selected {
+                    prompt.push(arg.clone());
+                } else {
+                    selected = true;
+                }
+                continue;
+            }
+        }
+        kept.push(arg.clone());
+        let (single, several) =
+            if kind.name == "claude" { (CLAUDE_VALUE, CLAUDE_VALUES) } else { (CODEX_VALUE, CODEX_VALUES) };
+        if !attached && single.contains(&flag) {
+            kept.extend(args.next().cloned());
+        } else if several.contains(&flag) {
+            while let Some(value) = args.next_if(|v| !v.starts_with('-')) {
+                kept.push(value.clone());
+            }
+        } else if !arg.starts_with('-') {
+            positional = true;
+        }
+    }
+    // Removing resume/fork exposes the prompt to subcommand parsing. Keep options before
+    // the separator so they still apply, even when they originally followed the prompt.
+    if prompt.first().is_some_and(|p| CODEX_COMMANDS.contains(&p.as_str()) || CODEX_CONVERSATIONS.contains(&p.as_str()))
+    {
+        kept.push("--".into());
+    }
+    kept.extend(prompt);
+    kept
+}
+
 // The agents' options, from their own `--help`, by what follows them: a word after an option is
 // its value or the prompt given on the command line, which `resumable_args` tells apart.
 
@@ -1334,6 +1410,10 @@ const CLAUDE_VALUES: &[&str] = &[
 ];
 /// Codex's options that take one value.
 const CODEX_VALUE: &[&str] = &[
+    "-o",
+    "--output-last-message",
+    "--output-schema",
+    "--color",
     "-m",
     "--model",
     "-p",
@@ -1995,6 +2075,98 @@ pub fn describe_reset(resets_at: Option<i64>, now: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn duplicate_agent_arguments_keep_options_and_prompts_without_selecting_old_conversations() {
+        let words = |s: &str| s.split_whitespace().map(str::to_string).collect::<Vec<_>>();
+        for (agent, before, after) in [
+            ("claude", "--session-id old --model opus", "--model opus"),
+            ("claude", "--model opus --resume old --continue --fork-session prompt", "--model opus prompt"),
+            ("claude", "--resume=old --session-id=old -c -r old -p prompt", "-p prompt"),
+            ("claude", "--system-prompt --continue --model opus", "--system-prompt --continue --model opus"),
+            ("claude", "--model=opus -- --resume old", "--model=opus -- --resume old"),
+            ("codex", "resume old -m model prompt", "-m model prompt"),
+            ("codex", "-m model fork --last --all prompt", "-m model prompt"),
+            ("codex", "resume --all old -c mode=local prompt", "-c mode=local prompt"),
+            ("codex", "resume -- old prompt", "-- prompt"),
+            ("codex", "-m resume prompt", "-m resume prompt"),
+            ("codex", "exec prompt", "exec prompt"),
+            ("codex", "exec resume old --json prompt", "exec --json prompt"),
+            ("codex", "e resume --last prompt", "e prompt"),
+        ] {
+            assert_eq!(duplicate_args(agent_kind(agent).unwrap(), &words(before)), words(after), "{agent} {before}");
+        }
+    }
+
+    #[test]
+    fn duplicate_codex_exec_keeps_option_values_on_either_side_of_resume() {
+        let kind = agent_kind("codex").unwrap();
+        for option in ["-o", "--output-last-message", "--output-schema", "--color"] {
+            for value in ["report.txt", "resume", "review"] {
+                for args in [
+                    vec!["exec", "resume", option, value, "SESSION", "prompt"],
+                    vec!["exec", option, value, "resume", "SESSION", "prompt"],
+                ] {
+                    let args: Vec<_> = args.into_iter().map(str::to_string).collect();
+                    assert_eq!(duplicate_args(kind, &args), ["exec", option, value, "prompt"], "{args:?}");
+                }
+                let attached = format!("{option}={value}");
+                for args in [
+                    vec!["exec", "resume", &attached, "SESSION", "prompt"],
+                    vec!["exec", &attached, "resume", "SESSION", "prompt"],
+                ] {
+                    let args: Vec<_> = args.into_iter().map(str::to_string).collect();
+                    assert_eq!(duplicate_args(kind, &args), ["exec", &attached, "prompt"], "{args:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn duplicate_claude_removes_optional_and_attached_conversation_selectors() {
+        let kind = agent_kind("claude").unwrap();
+        for selector in ["--from-pr", "--teleport"] {
+            for selection in [vec![selector], vec![selector, "123"], vec![selector, "SESSION"]] {
+                let args: Vec<_> =
+                    selection.into_iter().chain(["--model", "opus", "prompt"]).map(str::to_string).collect();
+                assert_eq!(duplicate_args(kind, &args), ["--model", "opus", "prompt"], "{args:?}");
+            }
+            let args = [format!("{selector}=SESSION"), "prompt".into()];
+            assert_eq!(duplicate_args(kind, &args), ["prompt"]);
+            let args = [selector.into(), "--".into(), "prompt".into()];
+            assert_eq!(duplicate_args(kind, &args), ["--", "prompt"]);
+            let args = ["--system-prompt".into(), selector.into(), "--".into(), selector.into()];
+            assert_eq!(duplicate_args(kind, &args), args, "option values and literal prompts stay");
+        }
+    }
+
+    #[test]
+    fn duplicate_codex_keeps_subcommand_names_as_prompts_and_trailing_options_as_options() {
+        let kind = agent_kind("codex").unwrap();
+        for prefix in [vec![], vec!["exec"], vec!["e"]] {
+            for selector in ["resume", "fork"] {
+                for prompt in ["review", "resume", "fork", "exec", "help"] {
+                    for selection in ["SESSION", "--last"] {
+                        let args: Vec<_> = prefix
+                            .iter()
+                            .copied()
+                            .chain([selector, selection, prompt, "--model", "model"])
+                            .map(str::to_string)
+                            .collect();
+                        let expected: Vec<_> = prefix
+                            .iter()
+                            .copied()
+                            .chain(["--model", "model", "--", prompt])
+                            .map(str::to_string)
+                            .collect();
+                        assert_eq!(duplicate_args(kind, &args), expected, "{args:?}");
+                    }
+                }
+            }
+        }
+        let args = ["exec", "resume", "SESSION", "--", "review", "--model", "literal"].map(str::to_string);
+        assert_eq!(duplicate_args(kind, &args), ["exec", "--", "review", "--model", "literal"]);
+    }
 
     #[test]
     fn linked_files_rewrite_to_one_entry_per_account_with_all_references_and_legacy_fields() {

@@ -78,6 +78,11 @@ They keep the row selected and leave each terminal's workspace and pane focus un
 The order is shared and saved automatically. While searching, choose **Clear search to reorder**
 first; it keeps the selected row. See [Reordering workspaces](workspaces.md#reordering-workspaces).
 
+**Duplicate** is in the Tab actions of an open or closed saved workspace. Its Name form proposes
+a free name. Enter or **Duplicate** saves a closed copy and selects it in Workspaces; Enter then
+opens it, with commands waiting to be started. Esc cancels and keeps the search and selection.
+See [Duplicating a workspace](workspaces.md#duplicating-a-workspace).
+
 **Delete** is in the workspace's Tab actions, with no direct shortcut. It asks once before
 removing the row and stopping its programs. Click the result's **Undo**, or use **Ctrl+Z** in
 Workspaces while that result is shown. **Deleted workspaces** also offers **Enter Restore**
@@ -157,18 +162,18 @@ A successful, verified sign-in closes the pane automatically.
 
 In lists, type to filter, `↑↓` move, Enter or one click chooses, **Tab shows what else can be done** with the
 selected item (connect in a new tab, browse its files, run a command…). Most also have a key
-shown by the list; Move up, Move down and Delete are only in the workspace actions.
+shown by the list; Duplicate, Move up, Move down and Delete are only in the workspace actions.
 Esc closes. The footer says what Enter does on the selected line;
 only actions that apply to that line are offered. When there are no other actions, Tab moves
 to the next line. Text fields edit like a shell line (arrows, `home`/`end`,
-`alt+←→`, `ctrl+w`, `ctrl+u`, `ctrl+k`). In Add workspace, Rename workspace and Save workspace,
+`alt+←→`, `ctrl+w`, `ctrl+u`, `ctrl+k`). In Add workspace, Rename workspace, Duplicate workspace and Save workspace,
 errors wrap below the input and stay visible when moving the cursor.
 Long errors scroll with `pageup`/`pagedown` or the mouse wheel;
 the input and the keys to retry or cancel stay visible. Editing the value clears the error.
 Workspace search never creates a workspace. **+ Add workspace** or `ctrl+b W n` opens the
-shared form; Enter or its **Add** button creates it. In Add workspace and Rename workspace,
+shared form; Enter or its **Add** button creates it. In Add workspace, Rename workspace and Duplicate workspace,
 Tab moves between **Name**, the action button and **Cancel**. Esc returns to the list's search
-and selection. In Workspaces, Tab or a right click offers **Rename** for an open or closed saved
+and selection. In Workspaces, Tab or a right click offers **Rename** and **Duplicate** for an open or closed saved
 workspace, **Close** only while open, and **Delete** for a saved workspace or an unimported file.
 In **Deleted workspaces**, Enter or a click restores the selected row, and Esc goes back.
 If the old name is already used, the same Name form proposes a free name and offers **Restore**.
