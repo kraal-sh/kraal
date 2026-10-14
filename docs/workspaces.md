@@ -376,6 +376,11 @@ source paths, recorded source contents, account identities and initial order. It
 sources by name or rewrite KDL files, their backups, or accounts. Existing name collisions stay;
 a command that cannot choose one workspace by name asks you to select and rename a workspace.
 
+If the old session has no recorded source contents, migration records the file as it is then.
+Your saved layout stays as it was, even if you edited it since importing the file. Only later
+changes to the file report **File changed**, including after a restart. Unreadable or missing
+sources do not prevent migration; their workspaces keep the saved layout and show the source error.
+
 Separately, changing accounts in 0.4 binds old account names in saved sessions and readable KDL files
 before writing the account change. KDL files gain account identities while keeping their labels and
 formatting. This temporary migration is removed in 0.5.0; binding accounts in retained recipes during
@@ -600,6 +605,10 @@ An external edit never replaces your saved layout or stops its programs. The Wor
 and sidebar show **File changed**, **File error**, or **Source file missing** on the saved
 workspace. **Open** still uses your saved layout. A missing source is never recreated by an
 automatic save.
+
+**File changed** compares the file's contents with the source contents recorded when kraal
+imported, loaded, or exported it (or first migrated a session without that record). Editing tabs,
+panes, or workspace names never triggers it. The recorded contents survive a restart.
 
 Choose **Review** from the notification or the workspace's Actions. **Load from file** in Actions
 opens the same review, even when the source is unchanged. It is available only for a workspace

@@ -676,7 +676,9 @@ fn read_session(session: &str, convert: bool) -> Result<Option<SessionSnapshot>>
 
 fn read_from(path: &Path, legacy: &Path, scrollback: &Path, convert: bool) -> Result<Option<SessionSnapshot>> {
     if let Some(data) = read_state(path)? {
-        return parse(&data).map(Some).with_context(|| format!("parsing {}", path.display()));
+        return migration::read_current(path, &data, convert)
+            .map(Some)
+            .with_context(|| format!("reading {}", path.display()));
     }
     if path.with_extension("forgotten").try_exists()? {
         return Ok(None);

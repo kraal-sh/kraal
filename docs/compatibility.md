@@ -16,8 +16,12 @@ Each save writes the current state format only. Kraal does not also write a down
 for older versions. The untouched legacy session and the accounts backup are recovery copies,
 not synchronized views of the current session.
 Session migration preserves the personal layout, identities, source links, account references,
-restore failures and available scrollback. Account migration happens on the next change to the
-file, keeping comments, order and unknown keys. Before account changes, the 0.4 migration copies
+restore failures and available scrollback. When an old session has no recorded source contents,
+migration records the source file as it is then, without replacing the personal layout. This
+baseline survives restart, so local layout edits do not report **File changed**, but later file
+edits do. Missing or unreadable sources leave the saved layout available with a source error.
+Account migration happens on the next change to the file, keeping comments, order and unknown keys.
+Before account changes, the 0.4 migration copies
 legacy usage to identity-based caches, binds saved pane references (including layout Undo in kept
 and deleted workspaces), and adds account identities to readable KDL files in configured workspace
 directories. Unknown session fields and KDL formatting are preserved. If this preparation fails,
