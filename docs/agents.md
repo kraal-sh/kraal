@@ -388,6 +388,9 @@ selector or a hook from that process supplies the conversation id. An opaque wra
 override, unknown conversation or ambiguous command instead shows **Can't switch this process.**
 and offers **Open with another account**. That opens another pane and leaves the original running.
 Shells with other jobs are not stopped for an account change.
+If process information is temporarily unavailable, kraal keeps the last identified account
+label. It still requires a fresh check before stopping the agent. A failed check leaves the
+pane unchanged; open **Change account** to try again.
 
 ### Sign-in and recovery
 
