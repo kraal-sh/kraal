@@ -200,7 +200,10 @@ impl Batch {
         // Record uncertainty before publication: a crash must never cause an automatic second paste.
         crate::paths::write_private(
             &self.temp.join("result.json"),
-            &serde_json::to_vec("Files kept; paste outcome unavailable. Inspect the pane before attaching again.")?,
+            &serde_json::to_vec(&serde_json::json!({
+                "message": "Files kept; paste outcome unavailable. Inspect the pane before attaching again.",
+                "kind": crate::theme::NoticeKind::Warning,
+            }))?,
         )?;
         File::open(&self.temp)?.sync_all()?;
         fs::rename(&self.temp, &self.final_dir)?;
@@ -232,18 +235,31 @@ fn tree_size(path: &Path) -> std::io::Result<u64> {
     Ok(size)
 }
 
-pub fn result(session: &str, token: &str) -> Result<String> {
+pub fn result(session: &str, token: &str) -> Result<(String, crate::theme::NoticeKind)> {
     ensure!(token_valid(token), "invalid attachment token");
     let path = directory(session).join(token).join("result.json");
     let file = OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK).open(path)?;
     let mut bytes = Vec::new();
     file.take(4096).read_to_end(&mut bytes)?;
-    Ok(serde_json::from_slice(&bytes)?)
+    read_result(&bytes)
 }
 
-pub fn record(session: &str, token: &str, message: &str) -> Result<()> {
+fn read_result(bytes: &[u8]) -> Result<(String, crate::theme::NoticeKind)> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Stored {
+        Legacy(String),
+        Current { message: String, kind: crate::theme::NoticeKind },
+    }
+    Ok(match serde_json::from_slice(bytes)? {
+        Stored::Legacy(message) => (message, crate::theme::NoticeKind::Notice),
+        Stored::Current { message, kind } => (message, kind),
+    })
+}
+
+pub fn record(session: &str, token: &str, message: &str, kind: crate::theme::NoticeKind) -> Result<()> {
     ensure!(token_valid(token), "invalid attachment token");
-    let bytes = serde_json::to_vec(message)?;
+    let bytes = serde_json::to_vec(&serde_json::json!({ "message": message, "kind": kind }))?;
     ensure!(bytes.len() as u64 <= RESULT_RESERVE, "attachment result is too large");
     crate::paths::write_private(&directory(session).join(token).join("result.json"), &bytes)?;
     Ok(())
@@ -304,6 +320,18 @@ mod tests {
     }
 
     #[test]
+    fn result_records_keep_kinds_and_read_older_strings() {
+        use crate::theme::NoticeKind;
+
+        assert_eq!(read_result(br#""Files received.""#).unwrap(), ("Files received.".into(), NoticeKind::Notice));
+        for kind in [NoticeKind::Notice, NoticeKind::Warning, NoticeKind::Error] {
+            let bytes = serde_json::to_vec(&serde_json::json!({"message": "unchanged text", "kind": kind})).unwrap();
+            assert_eq!(read_result(&bytes).unwrap(), ("unchanged text".into(), kind));
+        }
+        assert!(read_result(br#"{"kind":"notice"}"#).is_err());
+    }
+
+    #[test]
     fn batch_is_private_atomic_and_keeps_duplicate_names_and_safe_aliases() {
         let root = root();
         let specs = [
@@ -319,6 +347,8 @@ mod tests {
         batch.chunk(0, 0, b"abc").unwrap();
         batch.chunk(2, 0, b"d").unwrap();
         let paths = batch.finish().unwrap();
+        let result = read_result(&fs::read(root.join("abc/result.json")).unwrap()).unwrap();
+        assert_eq!(result.1, crate::theme::NoticeKind::Warning);
         assert!(paths.contains("'\\''client'\\''"));
         assert!(paths.contains("attachment-3"));
         assert!(!root.join(".abc").exists());

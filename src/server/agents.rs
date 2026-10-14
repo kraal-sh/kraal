@@ -15,6 +15,7 @@ use crate::agent::AgentState;
 use crate::layout::PaneId;
 use crate::pane::{Login, LoginState, PaneSpec};
 use crate::protocol::Placement;
+use crate::theme::NoticeKind;
 
 /// What kraal last did about a pane being over its threshold, so it does not repeat itself.
 #[derive(Debug, Clone, PartialEq)]
@@ -306,7 +307,7 @@ impl Server {
         self.reload_usage();
         self.refresh_agent_pickers();
         self.mark_dirty();
-        self.toast(client, "Account updated");
+        self.toast(client, NoticeKind::Notice, "Account updated");
         Ok(())
     }
 
@@ -702,7 +703,7 @@ impl Server {
             },
         );
         if let Some(client) = client {
-            self.toast(client, format!("Checking sign-in for {}", accounts::label(to)));
+            self.toast(client, NoticeKind::Notice, format!("Checking sign-in for {}", accounts::label(to)));
         }
         self.check_switch(pane, false);
         Ok(())
@@ -760,7 +761,12 @@ impl Server {
             };
             self.mark_dirty();
         } else {
-            self.notify("Could not change account", &format!("{reason} Open Change account to try again."), Some(pane));
+            self.notify(
+                NoticeKind::Error,
+                "Could not change account",
+                &format!("{reason} Open Change account to try again."),
+                Some(pane),
+            );
         }
     }
 
@@ -845,6 +851,7 @@ impl Server {
         match stage {
             SwitchStage::Waiting => {
                 self.notify(
+                    NoticeKind::Notice,
                     "Switch after this turn",
                     &format!("{}; open Change account to cancel", accounts::label(&to)),
                     Some(pane),
@@ -856,11 +863,21 @@ impl Server {
                     if let Some(c) = self.clients.get_mut(&client).filter(|c| matches!(c.mode, Mode::Normal)) {
                         c.mode = mode;
                     } else {
-                        self.notify("Stop and switch?", "Open Change account to confirm or cancel", Some(pane));
+                        self.notify(
+                            NoticeKind::Warning,
+                            "Stop and switch?",
+                            "Open Change account to confirm or cancel",
+                            Some(pane),
+                        );
                     }
                 } else {
                     self.switches.remove(&pane);
-                    self.notify("Account change needs confirmation", "Open Change account to try again", Some(pane));
+                    self.notify(
+                        NoticeKind::Warning,
+                        "Account change needs confirmation",
+                        "Open Change account to try again",
+                        Some(pane),
+                    );
                 }
             }
             SwitchStage::Stopping => {
@@ -1179,7 +1196,7 @@ impl Server {
             p.agent = crate::agent::AgentTracker { session_id: p.spec.session.clone(), ..Default::default() };
             p.exit_code = Some(None);
         }
-        self.notify("Could not change account", &format!("{message} {reason}"), Some(pane));
+        self.notify(NoticeKind::Error, "Could not change account", &format!("{message} {reason}"), Some(pane));
         self.refresh_switch_views(pane);
         self.mark_persist();
     }
@@ -1188,6 +1205,7 @@ impl Server {
         let Some(switch) = self.switches.remove(&pane) else { return };
         if switch.stage == SwitchStage::Restoring {
             self.notify(
+                NoticeKind::Error,
                 "Could not change account",
                 &format!("Resumed on {}. Open Change account to try again.", switch.from.name),
                 Some(pane),
@@ -1203,9 +1221,9 @@ impl Server {
             }
             let message = format!("Using {}", switch.to.name);
             if switch.undo {
-                self.notify(&message, "Account change undone", Some(pane));
+                self.notify(NoticeKind::Notice, &message, "Account change undone", Some(pane));
             } else {
-                self.notify_action(&message, pane, super::attention::ToastAction::UndoAccount);
+                self.notify_action(NoticeKind::Notice, &message, pane, super::attention::ToastAction::UndoAccount);
             }
         }
         self.refresh_switch_views(pane);
@@ -1293,7 +1311,7 @@ impl Server {
                 (LimitMode::Auto, Some(alt)) if idle && already != Some(LimitAlert::Attempted) => {
                     self.limit_alerts.insert(id, LimitAlert::Attempted);
                     if let Err(e) = self.switch_account(id, alt, None, false) {
-                        self.notify(&what, &format!("could not switch: {e:#}"), Some(id));
+                        self.notify(NoticeKind::Error, &what, &format!("could not switch: {e:#}"), Some(id));
                     }
                 }
                 (LimitMode::Ask, Some(alt))
@@ -1304,10 +1322,10 @@ impl Server {
                     if let Some(c) = client {
                         self.limit_alerts.insert(id, LimitAlert::Asked);
                         if let Err(e) = self.switch_account(id, alt, Some(c), true) {
-                            self.notify(&what, &format!("could not switch: {e:#}"), Some(id));
+                            self.notify(NoticeKind::Error, &what, &format!("could not switch: {e:#}"), Some(id));
                         }
                     } else if already.is_none() {
-                        self.notify(&what, "open kraal to continue on another account", Some(id));
+                        self.notify(NoticeKind::Warning, &what, "open kraal to continue on another account", Some(id));
                         self.limit_alerts.insert(id, LimitAlert::Notified);
                     }
                 }
@@ -1315,6 +1333,7 @@ impl Server {
                 (LimitMode::Ask | LimitMode::Auto, Some(_)) => {}
                 _ if already.is_none() => {
                     self.notify_action(
+                        NoticeKind::Warning,
                         &format!("{} is at {peak:.0}% used", a.name),
                         id,
                         super::attention::ToastAction::ChangeAccount,
@@ -1373,6 +1392,7 @@ impl Server {
         let mut picker = Picker::new(PickerKind::Agent, title, items);
         if current.as_ref().is_some_and(|a| a.agent == "codex") {
             picker.message = Some("Undo returns to this conversation.".into());
+            picker.message_kind = NoticeKind::Notice;
         }
         picker.worktree = self.client_focus(client).and_then(|p| self.pane_git(p)).is_some()
             && self.client_focus(client).and_then(|p| self.panes.get(&p)).is_some_and(|p| p.ssh.is_none());
@@ -1529,7 +1549,7 @@ impl Server {
                 self.close_pane(id);
                 let message = format!("{} is signed in", accounts::label(&account));
                 for client in self.clients.keys().copied().collect::<Vec<_>>() {
-                    self.toast(client, &message);
+                    self.toast(client, NoticeKind::Notice, &message);
                 }
             }
         } else {
@@ -2414,7 +2434,7 @@ mod tests {
         assert_eq!(c.toast_action, Some((1, super::super::attention::ToastAction::ChangeAccount)));
         t.unchanged();
         assert!(t.server.switches.is_empty());
-        t.server.toast(client, "Dismissed");
+        t.server.toast(client, NoticeKind::Notice, "Dismissed");
         t.server.check_limits();
         assert_eq!(t.server.clients[&client].toast.as_ref().unwrap().0, "Dismissed", "one notification per crossing");
     }

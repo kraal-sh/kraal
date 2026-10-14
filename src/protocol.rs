@@ -359,6 +359,8 @@ pub enum ServerMsg {
         received: u64,
     },
     AttachmentResult {
+        #[serde(default)]
+        kind: crate::theme::NoticeKind,
         token: String,
         message: String,
         #[serde(default)]
@@ -1272,7 +1274,12 @@ mod tests {
             ServerMsg::ClipboardImageOffer { token: s("ab"), target: s("main"), limits: Default::default() },
             ServerMsg::AttachmentOffer { token: s("ab"), target: s("main"), limits: Default::default() },
             ServerMsg::AttachmentAck { token: s("ab"), received: 3 },
-            ServerMsg::AttachmentResult { pasted: true, token: s("ab"), message: s("Files received.") },
+            ServerMsg::AttachmentResult {
+                kind: crate::theme::NoticeKind::Notice,
+                pasted: true,
+                token: s("ab"),
+                message: s("Files received."),
+            },
             ServerMsg::Event { event: serde_json::json!({"v": 1, "type": "pane.opened"}) },
             ServerMsg::Events { events: vec![serde_json::json!({"v": 1, "type": "pane.closed"})] },
         ]);
@@ -1317,6 +1324,32 @@ mod tests {
 
     /// Whatever a newer peer adds (fields, request kinds, message types, answer kinds, enum
     /// values) never fails a message on either side, and new fields change nothing in it.
+    #[test]
+    fn attachment_result_kinds_are_optional_and_ignored_by_older_readers() {
+        use crate::theme::NoticeKind;
+
+        let old = serde_json::json!({"type": "attachment_result", "token": "ab", "message": "Files received."});
+        let ServerMsg::AttachmentResult { kind, message, .. } = serde_json::from_value(old).unwrap() else { panic!() };
+        assert_eq!(kind, NoticeKind::Notice);
+        assert_eq!(message, "Files received.");
+        #[derive(Deserialize)]
+        struct OlderResult {
+            token: String,
+            message: String,
+            pasted: bool,
+        }
+        for kind in [NoticeKind::Notice, NoticeKind::Warning, NoticeKind::Error] {
+            let msg = ServerMsg::AttachmentResult { kind, token: "ab".into(), message: "result".into(), pasted: true };
+            let json = serde_json::to_value(msg).unwrap();
+            let older: OlderResult = serde_json::from_value(json.clone()).unwrap();
+            assert_eq!((older.token.as_str(), older.message.as_str(), older.pasted), ("ab", "result", true));
+            let ServerMsg::AttachmentResult { kind: read, .. } = serde_json::from_value(json).unwrap() else {
+                panic!()
+            };
+            assert_eq!(read, kind);
+        }
+    }
+
     #[test]
     fn every_message_reads_whatever_a_newer_peer_adds() {
         // Where the message type, the request and the answer kind are named.

@@ -12,6 +12,7 @@ use crate::protocol::{Response, ServerMsg};
 use crate::runbooks::{self, Body, On, Source};
 use crate::server::ui::{ConfirmAction, Mode, PickAction, PickItem, Picker, PickerKind, Prompt, PromptAction};
 use crate::server::{ClientId, Server};
+use crate::theme::NoticeKind;
 use crate::{paths, servers};
 
 impl Server {
@@ -44,7 +45,7 @@ impl Server {
             (Some(cmd), None) if param.choices.is_empty() => {
                 let (cmd, cwd, vars) = (cmd.clone(), self.draft_cwd(d), self.draft_vars(d));
                 let (draft, asked) = (d.id, d.values.len());
-                self.toast(client, format!("listing choices for {}…", param.name));
+                self.toast(client, NoticeKind::Notice, format!("listing choices for {}…", param.name));
                 self.background(
                     move || list_choices(&cmd, cwd.as_deref(), &vars),
                     move |server, listed| {
@@ -56,7 +57,7 @@ impl Server {
                         }
                         let choices = listed.unwrap_or_else(|e| {
                             // Without its list, the parameter is asked as text.
-                            server.toast(client, format!("{e:#}"));
+                            server.toast(client, NoticeKind::Error, format!("{e:#}"));
                             Vec::new()
                         });
                         if let Some(d) = server.drafts.get_mut(&client) {
@@ -167,7 +168,7 @@ impl Server {
                 self.advance_draft(client)
             }
             Err(e) => {
-                self.toast(client, format!("{e:#}"));
+                self.toast(client, NoticeKind::Error, format!("{e:#}"));
                 Mode::Normal
             }
         }
@@ -319,11 +320,11 @@ impl Server {
     pub(in crate::server) fn confirm_runbook(&mut self, client: ClientId, yes: bool) {
         let Some(d) = self.drafts.remove(&client) else { return };
         if !yes {
-            self.toast(client, "runbook cancelled");
+            self.toast(client, NoticeKind::Notice, "runbook cancelled");
             return;
         }
         if let Err(e) = self.launch_runbook(d, super::Asker { client: Some(client), reply: None }) {
-            self.toast(client, format!("{e:#}"));
+            self.toast(client, NoticeKind::Error, format!("{e:#}"));
         }
     }
 

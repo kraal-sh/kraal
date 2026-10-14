@@ -6,6 +6,7 @@ use super::contexts::Production;
 use super::ui::{ConfirmAction, Mode, PickAction, PickItem, Picker, PickerKind};
 use super::{ClientId, Server};
 use crate::layout::PaneId;
+use crate::theme::NoticeKind;
 use crate::tools::ToolDef;
 
 impl Server {
@@ -122,12 +123,16 @@ impl Server {
     ) -> Mode {
         if let Some(p) = pane {
             if !self.panes.contains_key(&p) {
-                self.toast(client, format!("{name}: the pane it was for is gone"));
+                self.toast(client, NoticeKind::Warning, format!("{name}: the pane it was for is gone"));
                 return Mode::Normal;
             }
             if place.as_ref().is_some_and(|asked| *asked != self.tool_place(p)) {
                 let (label, now) = (self.pane_label(p), self.tool_context(p).place());
-                self.toast(client, format!("{name} was not started: {label} moved since it was asked for (now {now})"));
+                self.toast(
+                    client,
+                    NoticeKind::Warning,
+                    format!("{name} was not started: {label} moved since it was asked for (now {now})"),
+                );
                 return Mode::Normal;
             }
         }
@@ -149,7 +154,7 @@ impl Server {
             return Mode::confirm(message, action);
         }
         if let Err(e) = self.run_tool(client, pane, name, selection) {
-            self.toast(client, format!("{e:#}"));
+            self.toast(client, NoticeKind::Error, format!("{e:#}"));
         }
         Mode::Normal
     }

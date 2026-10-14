@@ -245,6 +245,10 @@ focus does not redirect the paths. Broadcasting asks whether to attach only to t
 A local session submits the original paths without copying files. No Enter is added, and the
 usual production paste protections still apply. No path is submitted unless the entire batch
 arrives. Ordinary pasted text is unchanged. Clipboard images are not read by this action.
+Attachment results use normal text for success, and the theme's blocked colour for errors or
+warnings, including a completed transfer whose queued typing was discarded. This also applies
+to the local result panel with `attach --host`, which uses your laptop's theme. Recovered results
+keep their kind; older results without a kind use normal text.
 
 ### Clipboard images
 

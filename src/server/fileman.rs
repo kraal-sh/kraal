@@ -14,6 +14,7 @@ use crate::layout::PaneId;
 use crate::pane::{Content, PaneSpec};
 use crate::paths;
 use crate::protocol::Placement;
+use crate::theme::NoticeKind;
 
 impl Server {
     /// `/path`, `~/x` or `server:path` as a panel location.
@@ -136,13 +137,18 @@ impl Server {
             _ => Vec::new(),
         };
         if places.iter().any(|l| l.exact_display().is_none()) {
-            self.toast(client, "a path here is not valid UTF-8: kraal cannot point at it safely; use a shell");
+            self.toast(
+                client,
+                NoticeKind::Error,
+                "a path here is not valid UTF-8: kraal cannot point at it safely; use a shell",
+            );
             return Mode::Normal;
         }
         if let Some(server) = self.stale_server(&places) {
             self.reconnect_panels(pane);
             self.toast(
                 client,
+                NoticeKind::Warning,
                 format!("{server} is not reached as when its panel was listed: check the panel and retry"),
             );
             return Mode::Normal;
@@ -217,7 +223,7 @@ impl Server {
                 let Some(ws) = self.clients.get(&client).map(|c| c.workspace) else { return Mode::Normal };
                 let spec = PaneSpec { preview: Some(path), ..Default::default() };
                 if let Err(e) = self.spawn_pane_in(ws, Some(pane), spec, Placement::Floating, None) {
-                    self.toast(client, format!("{e:#}"));
+                    self.toast(client, NoticeKind::Error, format!("{e:#}"));
                 }
                 Mode::Normal
             }
@@ -247,7 +253,7 @@ impl Server {
                     },
                 };
                 if let Err(e) = result {
-                    self.toast(client, format!("{e:#}"));
+                    self.toast(client, NoticeKind::Error, format!("{e:#}"));
                 }
                 Mode::Normal
             }
@@ -257,7 +263,7 @@ impl Server {
                 let name = path.file_name().map(|n| n.to_string_lossy().into_owned());
                 let spec = PaneSpec { command, close_on_exit: true, keep_on_failure: true, ..Default::default() };
                 if let Err(e) = self.spawn_pane_in(ws, Some(pane), spec, Placement::Floating, name) {
-                    self.toast(client, format!("{e:#}"));
+                    self.toast(client, NoticeKind::Error, format!("{e:#}"));
                 }
                 Mode::Normal
             }
@@ -281,7 +287,7 @@ impl Server {
             }
             FilesAction::PickLocation(side) => Mode::Picker(self.location_picker(pane, side)),
             FilesAction::Refused(why) => {
-                self.toast(client, why);
+                self.toast(client, NoticeKind::Error, why);
                 Mode::Normal
             }
             FilesAction::Close => {
@@ -389,7 +395,7 @@ impl Server {
                 }
                 self.relayout();
             }
-            Err(e) => self.toast(client, format!("{e:#}")),
+            Err(e) => self.toast(client, NoticeKind::Error, format!("{e:#}")),
         }
     }
 }

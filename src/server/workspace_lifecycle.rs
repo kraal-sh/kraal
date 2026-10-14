@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use super::ui::{ConfirmAction, Mode, PickAction, PickItem, Picker, PickerKind, Prompt, PromptAction};
 use super::{ClientId, Server};
 use crate::persist::{DeletedWorkspace, WorkspaceSnap};
+use crate::theme::NoticeKind;
 
 #[derive(Clone)]
 pub enum DeleteTarget {
@@ -67,7 +68,7 @@ impl Server {
         let (name, source, programs) = match &target {
             DeleteTarget::Workspace(ws) => {
                 let Some(wi) = self.ws_index(*ws) else {
-                    return self.workspace_picker(0).result("Workspace unavailable");
+                    return self.workspace_picker(0).result(NoticeKind::Warning, "Workspace unavailable");
                 };
                 let workspace = &self.workspaces[wi];
                 if workspace.delete_pending {
@@ -103,13 +104,13 @@ impl Server {
             Ok(identity) => {
                 self.refresh_workspace_pickers();
                 self.mark_dirty();
-                self.toast(client, "Workspace deleted · Undo");
+                self.toast(client, NoticeKind::Notice, "Workspace deleted · Undo");
                 if let Some(c) = self.clients.get_mut(&client) {
                     c.toast_action = Some((0, super::attention::ToastAction::RestoreWorkspace(identity.clone())));
                 }
                 let mut picker = self.workspace_picker(self.clients.get(&client).map_or(0, |c| c.workspace));
                 picker.undo = Some(identity);
-                picker.result("Workspace deleted")
+                picker.result(NoticeKind::Notice, "Workspace deleted")
             }
             Err(message) => {
                 if let DeleteTarget::Workspace(ws) = target
@@ -315,7 +316,7 @@ impl Server {
 
     pub(super) fn restore_workspace_mode(&mut self, client: ClientId, identity: &str, from: Option<&Picker>) -> Mode {
         let Some(saved) = self.deleted_workspaces.iter().find(|d| d.workspace.id == identity) else {
-            return self.deleted_workspace_picker().result("Workspace already restored");
+            return self.deleted_workspace_picker().result(NoticeKind::Notice, "Workspace already restored");
         };
         let name = saved.workspace.name.clone();
         if self.workspace_name_used(&name, None, None) {
@@ -345,14 +346,17 @@ impl Server {
             Ok(ws) => {
                 self.refresh_workspace_pickers();
                 self.mark_dirty();
-                self.toast(client, "Workspace restored");
+                self.toast(client, NoticeKind::Notice, "Workspace restored");
                 let mut picker = self.workspace_picker(0);
                 picker.select(|i| i.action.workspace() == Some(ws));
                 let workspace = &self.workspaces[self.ws_index(ws).unwrap()];
                 if had_source && workspace.definition.is_none() {
-                    picker.result("Workspace restored · Source belongs to another workspace · Enter Open")
+                    picker.result(
+                        NoticeKind::Warning,
+                        "Workspace restored · Source belongs to another workspace · Enter Open",
+                    )
                 } else {
-                    picker.result("Workspace restored · Enter Open")
+                    picker.result(NoticeKind::Notice, "Workspace restored · Enter Open")
                 }
             }
             Err(error) => {

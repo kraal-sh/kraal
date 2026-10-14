@@ -6,9 +6,28 @@ use std::sync::RwLock;
 
 use ratatui::style::Color;
 use ratatui::symbols::border;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::agent::AgentState;
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NoticeKind {
+    Warning,
+    Error,
+    #[default]
+    #[serde(other)]
+    Notice,
+}
+
+impl NoticeKind {
+    pub fn colour(self, theme: Theme) -> Color {
+        match self {
+            Self::Notice => theme.text,
+            Self::Warning | Self::Error => theme.blocked,
+        }
+    }
+}
 
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct ThemeConfig {
@@ -237,6 +256,20 @@ pub fn set(t: Theme) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn notice_kinds_use_the_themes_text_and_blocked_colours() {
+        for theme in [
+            Theme::DEFAULT,
+            Theme::HIGH_CONTRAST,
+            Theme::ASCII,
+            Theme { text: Color::Rgb(1, 2, 3), blocked: Color::Rgb(4, 5, 6), ..Theme::DEFAULT },
+        ] {
+            assert_eq!(NoticeKind::Notice.colour(theme), theme.text);
+            assert_eq!(NoticeKind::Warning.colour(theme), theme.blocked);
+            assert_eq!(NoticeKind::Error.colour(theme), theme.blocked);
+        }
+    }
 
     #[test]
     fn presets_and_overrides() {

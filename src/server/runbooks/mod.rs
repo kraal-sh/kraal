@@ -21,6 +21,7 @@ use crate::protocol::Placement;
 use crate::runbooks::{self, Block, Body, On, Param, Runbook, Source, Steps};
 use crate::servers;
 use crate::text::numbered;
+use crate::theme::NoticeKind;
 
 /// Where one copy of a runbook runs.
 #[expect(
@@ -286,7 +287,7 @@ impl Server {
             server.mark_dirty_client(client);
         });
         if !started {
-            self.toast(client, "kraal could not start reading: try again");
+            self.toast(client, NoticeKind::Error, "kraal could not start reading: try again");
             return Mode::Normal;
         }
         let mut picker = Picker::new(kind, title, Vec::new());
@@ -310,12 +311,16 @@ impl Server {
 
     fn runbook_picker(&mut self, client: ClientId, list: &[Runbook], errors: &[String]) -> Mode {
         if let Some(e) = errors.first() {
-            self.toast(client, e.clone());
+            self.toast(client, NoticeKind::Error, e.clone());
         }
         if list.is_empty() {
             if errors.is_empty() {
                 let dir = paths::shorten_home(&runbooks::user_dir());
-                self.toast(client, format!("no runbooks yet: `kraal runbook new <name>` creates one in {dir}"));
+                self.toast(
+                    client,
+                    NoticeKind::Notice,
+                    format!("no runbooks yet: `kraal runbook new <name>` creates one in {dir}"),
+                );
             }
             return Mode::Normal;
         }
@@ -352,7 +357,7 @@ impl Server {
             move |server, loaded| match loaded {
                 Ok(r) => server.open_runbook(client, r),
                 Err(e) => {
-                    server.toast(client, format!("{e:#}"));
+                    server.toast(client, NoticeKind::Error, format!("{e:#}"));
                     Mode::Normal
                 }
             },
@@ -380,7 +385,7 @@ impl Server {
             PaneSpec { command: crate::edit::editor_argv(path, None), close_on_exit: true, ..Default::default() };
         let name = path.file_name().map(|n| n.to_string_lossy().into_owned());
         if let Err(e) = self.spawn_pane_in(ws, None, spec, Placement::Floating, name) {
-            self.toast(client, format!("{e:#}"));
+            self.toast(client, NoticeKind::Error, format!("{e:#}"));
         }
     }
 }

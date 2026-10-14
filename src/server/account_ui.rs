@@ -16,6 +16,7 @@ use crate::ansi::Cursor;
 use crate::input::{InputEvent, KeyCode, MouseButton, MouseKind};
 use crate::layout::PaneId;
 use crate::text::wrap;
+use crate::theme::NoticeKind;
 
 /// Account labels and summaries do not depend on terminal output or the general chrome tick.
 pub(super) struct AccountDisplay {
@@ -377,7 +378,7 @@ impl Server {
     }
 
     fn account_added(&mut self, client: ClientId, account: &Account) {
-        let result = self.accounts_picker(Some(&account.id)).result("Account added");
+        let result = self.accounts_picker(Some(&account.id)).result(NoticeKind::Notice, "Account added");
         if let Some(c) = self.clients.get_mut(&client) {
             c.mode = result;
         }

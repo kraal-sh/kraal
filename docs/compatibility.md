@@ -121,6 +121,11 @@ The optional `[attachments]` configuration defaults preserve existing configurat
 result records use a separate `attachments-v1` directory. No saved-session, workspace KDL or
 legacy state format changes are introduced.
 
+Attachment results now include an optional notice `kind`. Missing or unknown kinds use normal
+text, and older clients ignore the field. New attachment result records keep the message and
+kind together; existing string records remain readable with normal text. These records are
+separate from saved sessions, workspace KDL and configuration files.
+
 Automatic pasted-path recognition additionally requires `pasted_paths` in both peers' lists.
 Reservation requests, prepared replies and original-text submission use that capability.
 An optional `pasted` field on attachment results defaults to false for older peers. Clients

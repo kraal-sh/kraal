@@ -11,6 +11,7 @@ use crate::layout::PaneId;
 use crate::pane::PaneSpec;
 use crate::runbooks::{self, Source};
 use crate::server::{ClientId, Server, Tab};
+use crate::theme::NoticeKind;
 use crate::tools::{Open, ToolContext, ToolDef, Where};
 use crate::{paths, shell};
 
@@ -185,7 +186,7 @@ impl Server {
             self.send_msg(r, &crate::protocol::ServerMsg::Response { result });
             self.clients.remove(&r);
         } else if let (Err(e), Some(c)) = (started, asker.client) {
-            self.toast(c, format!("{e:#}"));
+            self.toast(c, NoticeKind::Error, format!("{e:#}"));
         }
     }
 
@@ -444,7 +445,11 @@ impl Server {
         if still > 0 {
             let ids: Vec<ClientId> = self.clients.keys().copied().collect();
             for c in ids {
-                self.toast(c, format!("{name} stopped: {still} running target(s) will finish, nothing more starts"));
+                self.toast(
+                    c,
+                    NoticeKind::Notice,
+                    format!("{name} stopped: {still} running target(s) will finish, nothing more starts"),
+                );
             }
         }
         self.advance_run(ri);
@@ -668,7 +673,18 @@ impl Server {
         let _ = self.run_logs.send(crate::runbooks::LogJob::Then(Box::new(move || {
             let _ = tx.send(super::super::Event::Emit("runbook.finished", fields));
         })));
-        self.notify(&format!("runbook {}", run.name), &summary, None);
+        self.notify(
+            if failed > 0 {
+                NoticeKind::Error
+            } else if skipped > 0 {
+                NoticeKind::Warning
+            } else {
+                NoticeKind::Notice
+            },
+            &format!("runbook {}", run.name),
+            &summary,
+            None,
+        );
         self.mark_dirty();
     }
 

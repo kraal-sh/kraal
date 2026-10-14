@@ -4,6 +4,7 @@ use std::time::{Duration, Instant};
 
 use super::{ClientId, Server, frame_bytes};
 use crate::protocol::{ClipboardOrigin as Origin, ClipboardOutcome as Outcome, ServerMsg};
+use crate::theme::NoticeKind;
 
 pub(super) const RESULT_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -19,12 +20,18 @@ pub(super) struct Clipboard {
 }
 
 impl Clipboard {
-    fn prepare(&mut self, origin: Origin, text: &str, limit: usize, now: Instant) -> Result<Vec<u8>, &'static str> {
+    fn prepare(
+        &mut self,
+        origin: Origin,
+        text: &str,
+        limit: usize,
+        now: Instant,
+    ) -> Result<Vec<u8>, (NoticeKind, &'static str)> {
         if text.len() > limit.min(crate::clipboard::MAX_BYTES) {
-            return Err("copy too large; raise clipboard.max_bytes on the server");
+            return Err((NoticeKind::Error, "copy too large; raise clipboard.max_bytes on the server"));
         }
         if self.pending.is_some() || self.last.is_some_and(|at| now - at < crate::clipboard::INTERVAL) {
-            return Err(Outcome::Busy.message());
+            return Err((NoticeKind::Warning, Outcome::Busy.message()));
         }
         self.last = Some(now);
         if self.negotiated {
@@ -49,22 +56,22 @@ impl Server {
         let state = &mut c.clipboard;
         let frame = match state.prepare(origin, text, self.config.clipboard.max_bytes, Instant::now()) {
             Ok(frame) => frame,
-            Err(error) => {
+            Err((kind, error)) => {
                 let say = origin == Origin::User || !state.refused;
                 state.refused = true;
                 if say {
-                    self.toast(client, error);
+                    self.toast(client, kind, error);
                 }
                 return;
             }
         };
-        state.toast_before = c.toast.as_ref().map(|(_, until)| *until);
+        state.toast_before = c.toast.as_ref().map(|(_, until, _)| *until);
         let sent = c.out.try_send(frame).is_ok();
         if !sent {
             state.pending = None;
-            self.toast(client, "copy not sent: try again");
+            self.toast(client, NoticeKind::Error, "copy not sent: try again");
         } else if !state.negotiated && origin == Origin::User {
-            self.toast(client, "copy sent to terminal");
+            self.toast(client, NoticeKind::Notice, "copy sent to terminal");
         }
     }
 
@@ -76,19 +83,24 @@ impl Server {
             return;
         }
         state.pending = None;
-        let unchanged = c.toast.is_none() || c.toast.as_ref().map(|(_, until)| *until) == state.toast_before;
+        let unchanged = c.toast.is_none() || c.toast.as_ref().map(|(_, until, _)| *until) == state.toast_before;
         let diagnose = unavailable && !state.diagnosed;
         state.diagnosed |= unavailable;
         if diagnose {
             self.log_message(&format!(
                 "client {client}: native clipboard unavailable; using OSC 52. Check local clipboard tools and graphical session access"
-            ), false);
+            ), NoticeKind::Warning);
         }
+        let kind = match outcome {
+            Outcome::Native | Outcome::NativeStarted | Outcome::Terminal => NoticeKind::Notice,
+            Outcome::Disabled | Outcome::Busy => NoticeKind::Warning,
+            Outcome::TooLarge | Outcome::Failed | Outcome::Unknown => NoticeKind::Error,
+        };
         if origin == Origin::User || matches!(outcome, Outcome::TooLarge | Outcome::Failed | Outcome::Unknown) {
             if unchanged {
-                self.toast(client, outcome.message());
+                self.toast(client, kind, outcome.message());
             } else {
-                self.log_message(outcome.message(), false);
+                self.log_message(outcome.message(), kind);
             }
         }
     }
@@ -104,16 +116,16 @@ impl Server {
                 }
                 c.clipboard.pending = None;
                 let unchanged =
-                    c.toast.is_none() || c.toast.as_ref().map(|(_, until)| *until) == c.clipboard.toast_before;
+                    c.toast.is_none() || c.toast.as_ref().map(|(_, until, _)| *until) == c.clipboard.toast_before;
                 (origin == Origin::User).then_some((c.id, unchanged))
             })
             .collect();
         for (id, unchanged) in expired {
             let message = "copy result unavailable: try again";
             if unchanged {
-                self.toast(id, message);
+                self.toast(id, NoticeKind::Error, message);
             } else {
-                self.log_message(message, false);
+                self.log_message(message, NoticeKind::Error);
             }
         }
     }
@@ -199,12 +211,31 @@ mod tests {
         let now = Instant::now();
         for (copy, at) in [(1, now), (2, now + crate::clipboard::INTERVAL)] {
             server.clients.get_mut(&id).unwrap().clipboard.prepare(Origin::User, "text", 1024, at).unwrap();
-            server.toast(id, "the layout could not be saved: Disk full");
+            server.toast(id, NoticeKind::Error, "the layout could not be saved: Disk full");
             server.clipboard_result(id, copy, Outcome::Terminal, true);
             assert_eq!(server.clients[&id].toast.as_ref().unwrap().0, "the layout could not be saved: Disk full");
         }
         assert_eq!(server.messages.iter().filter(|m| m.text.contains("native clipboard unavailable")).count(), 1);
         assert_eq!(server.messages.iter().filter(|m| m.text == Outcome::Terminal.message()).count(), 2);
+        for message in server.messages.iter().filter(|m| m.text == Outcome::Terminal.message()) {
+            assert_eq!(message.kind, NoticeKind::Notice);
+        }
+        server.clients.get_mut(&id).unwrap().mode = crate::server::ui::Mode::Messages { scroll: 0 };
+        let screen = server.client_screen(id);
+        let mut buf = ratatui::buffer::Buffer::empty(screen);
+        server.compose(id, 1_000, &mut buf);
+        let mut found = 0;
+        for y in 0..screen.height {
+            let line: String = (0..screen.width).map(|x| buf[(x, y)].symbol()).collect();
+            if let Some(at) = line.find(Outcome::Terminal.message()) {
+                let x = line[..at].chars().count() as u16;
+                for x in x..x + Outcome::Terminal.message().len() as u16 {
+                    assert_eq!(buf[(x, y)].fg, crate::theme::current().text);
+                }
+                found += 1;
+            }
+        }
+        assert_eq!(found, 2);
         server
             .clients
             .get_mut(&id)
@@ -222,7 +253,10 @@ mod tests {
         let now = Instant::now();
         state.prepare(Origin::Program, "first", 1024, now).unwrap();
         state.pending = None;
-        assert_eq!(state.prepare(Origin::Program, "next", 1024, now).unwrap_err(), Outcome::Busy.message());
+        assert_eq!(
+            state.prepare(Origin::Program, "next", 1024, now).unwrap_err(),
+            (NoticeKind::Warning, Outcome::Busy.message())
+        );
         assert!(state.prepare(Origin::Program, "next", 1024, now + crate::clipboard::INTERVAL).is_ok());
         assert_eq!(Outcome::Unknown.message(), Outcome::Failed.message());
     }

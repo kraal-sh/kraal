@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 
 use super::Server;
 use crate::layout::PaneId;
+use crate::theme::NoticeKind;
 
 /// What a tunnel forwards; kept across restarts.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -514,7 +515,7 @@ impl Server {
                 Some((TunnelState::Up, _)) => self.open_for(client, &url),
                 Some((TunnelState::Down, error)) => {
                     let why = error.unwrap_or_else(|| "the tunnel is down".into());
-                    self.toast(client, format!("not opening {url}: {why}"));
+                    self.toast(client, NoticeKind::Error, format!("not opening {url}: {why}"));
                 }
                 Some((TunnelState::Connecting, _)) => self.pending_opens.push((client, tunnel, url)),
                 None => {}

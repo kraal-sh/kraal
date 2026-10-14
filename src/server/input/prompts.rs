@@ -8,6 +8,7 @@ use crate::paths;
 use crate::protocol::Placement;
 use crate::server::ui::{ConfirmAction, Mode, Prompt, PromptAction, Question};
 use crate::server::{ClientId, Server};
+use crate::theme::NoticeKind;
 
 impl Server {
     pub(super) fn on_prompt(&mut self, id: ClientId, mut p: Prompt, ev: InputEvent) -> Mode {
@@ -150,7 +151,7 @@ impl Server {
                 let Some(ws) = self.clients.get(&id).map(|c| c.workspace) else { return Ok(()) };
                 let spec = PaneSpec { preview: Some(path), ..Default::default() };
                 if let Err(e) = self.spawn_pane_in(ws, None, spec, Placement::Auto, None) {
-                    self.toast(id, format!("{e:#}"));
+                    self.toast(id, NoticeKind::Error, format!("{e:#}"));
                 }
             }
             PromptAction::UploadPick { server } => {
@@ -199,14 +200,14 @@ impl Server {
                 let spec = PaneSpec { command, ..Default::default() };
                 let label = format!("» {} on {}", value.chars().take(30).collect::<String>(), targets.join(" "));
                 if let Err(e) = self.spawn_pane_in(ws, None, spec, Placement::Floating, Some(label)) {
-                    self.toast(id, format!("{e:#}"));
+                    self.toast(id, NoticeKind::Error, format!("{e:#}"));
                 }
             }
             PromptAction::RenameAccount { agent, account } => {
                 if let Err(e) = self.rename_account(&agent, &account, &value) {
                     return Err((PromptAction::RenameAccount { agent, account }, format!("{e:#}")));
                 }
-                self.toast(id, format!("renamed account to {agent}·{value}"));
+                self.toast(id, NoticeKind::Notice, format!("renamed account to {agent}·{value}"));
             }
         }
         self.mark_persist();
@@ -288,7 +289,11 @@ impl Server {
         };
         // A yes needs the question to have been readable.
         if yes && (layout.body == 0 || layout.cancel.is_none()) {
-            self.toast(id, "The terminal is too small to show this question: make it larger to answer.");
+            self.toast(
+                id,
+                NoticeKind::Warning,
+                "The terminal is too small to show this question: make it larger to answer.",
+            );
             return Mode::Confirm(q);
         }
         let action = q.action;
@@ -334,9 +339,9 @@ impl Server {
                     match crate::accounts::Accounts::update(|all| Ok(all.remove(&a.agent, &a.key()))) {
                         Ok(_) => {
                             self.reload_accounts();
-                            self.toast(id, "Account removed");
+                            self.toast(id, NoticeKind::Notice, "Account removed");
                         }
-                        Err(e) => self.toast(id, format!("{e:#}")),
+                        Err(e) => self.toast(id, NoticeKind::Error, format!("{e:#}")),
                     }
                 }
                 return Mode::Picker(self.accounts_picker(Some(&a.id)));
@@ -364,7 +369,7 @@ impl Server {
             ConfirmAction::UseExisting { existing, target } => {
                 if yes {
                     if let Err(e) = self.confirm_existing_account(id, &existing, target.as_ref()) {
-                        self.toast(id, format!("{e:#}"));
+                        self.toast(id, NoticeKind::Error, format!("{e:#}"));
                         self.reload_accounts();
                         return Mode::Picker(self.accounts_picker(None));
                     }
@@ -484,7 +489,7 @@ impl Server {
                                 }
                             });
                         if let Err(e) = result {
-                            self.toast(id, format!("{e:#}"));
+                            self.toast(id, NoticeKind::Error, format!("{e:#}"));
                         }
                     }
                     ConfirmAction::SignInAccount(account) => {
@@ -495,7 +500,7 @@ impl Server {
                             .context("the target account changed; choose an account again")
                             .and_then(|a| self.open_login(id, &a));
                         if let Err(e) = result {
-                            self.toast(id, format!("{e:#}"));
+                            self.toast(id, NoticeKind::Error, format!("{e:#}"));
                         }
                     }
                 }

@@ -7,6 +7,7 @@ use crate::layout::PaneId;
 use crate::server::commands::NO_MARKS;
 use crate::server::ui::Mode;
 use crate::server::{ClientId, Server};
+use crate::theme::NoticeKind;
 
 impl Server {
     pub(super) fn on_scroll(&mut self, id: ClientId, ev: InputEvent) -> Mode {
@@ -76,13 +77,13 @@ impl Server {
                     // command's output, O the whole command with its prompt.
                     (KeyCode::Char(c @ ('p' | 'P' | 'o' | 'O')), false) => {
                         if !pane.has_prompts() {
-                            self.toast(id, NO_MARKS);
+                            self.toast(id, NoticeKind::Notice, NO_MARKS);
                         } else if !match c {
                             'p' | 'P' => pane.jump_to_prompt(c == 'p'),
                             _ => pane.select_command(c == 'O'),
                         } {
                             let what = if c == 'p' || c == 'P' { "no prompt that way" } else { "no command here" };
-                            self.toast(id, what);
+                            self.toast(id, NoticeKind::Notice, what);
                         }
                     }
                     (KeyCode::Esc, _) if pane.has_selection() => pane.clear_selection(),

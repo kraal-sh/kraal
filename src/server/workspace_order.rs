@@ -3,6 +3,7 @@
 use super::ui::{ConfirmAction, Mode, PickAction, Picker};
 use super::{ClientId, Server};
 use crate::persist::WorkspaceKey;
+use crate::theme::NoticeKind;
 
 impl Server {
     pub(super) fn workspace_key(&self, action: &PickAction) -> Option<WorkspaceKey> {
@@ -80,7 +81,7 @@ impl Server {
             let current = self.clients.get(&id).map_or(0, |c| c.workspace);
             let mut picker = self.workspace_picker(current);
             picker.restore(p.state());
-            return picker.result("Workspace unavailable. Select a workspace to move.");
+            return picker.result(NoticeKind::Warning, "Workspace unavailable. Select a workspace to move.");
         };
         let mode = self.reorder_workspace(id, workspace, neighbor, up);
         self.return_to_workspaces(id, mode, p.state())
@@ -111,16 +112,16 @@ impl Server {
         let (Some(at), Some(next)) =
             (keys.iter().position(|k| *k == workspace), keys.iter().position(|k| *k == neighbor))
         else {
-            return picker.result("Workspace unavailable. Select a workspace to move.");
+            return picker.result(NoticeKind::Warning, "Workspace unavailable. Select a workspace to move.");
         };
         if order.as_ref().is_some_and(|order| *order != keys) {
-            return picker.result("Order changed. Drag the workspace again.");
+            return picker.result(NoticeKind::Warning, "Order changed. Drag the workspace again.");
         }
         if at == next || (before && at + 1 == next) || (!before && next + 1 == at) {
             return Mode::Picker(picker);
         }
         if order.is_none() && ((before && next + 1 != at) || (!before && at + 1 != next)) {
-            return picker.result("Order changed. Choose Move up or Move down again.");
+            return picker.result(NoticeKind::Warning, "Order changed. Choose Move up or Move down again.");
         }
         let old = self.workspace_order.clone();
         let previous: Vec<_> = self.workspaces.iter().map(|w| w.id).collect();

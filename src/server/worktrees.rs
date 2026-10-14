@@ -16,6 +16,7 @@ use crate::layout::PaneId;
 use crate::pane::PaneSpec;
 use crate::protocol::Placement;
 use crate::shell;
+use crate::theme::NoticeKind;
 use crate::worktree_setup::{self, Plan, Prepared};
 
 /// A worktree about to be made for an agent, while the user is asked to trust its setup.
@@ -283,7 +284,7 @@ impl Server {
         anyhow::ensure!(git::valid_worktree_name(name), "invalid worktree name {name:?} (letters, digits, - _ .)");
         let user = worktree_setup::Setup::of_user(&self.config.worktrees);
         let (agent, account, name) = (agent.to_string(), account.to_string(), name.to_string());
-        self.toast(client, format!("creating worktree {name}…"));
+        self.toast(client, NoticeKind::Notice, format!("creating worktree {name}…"));
         self.background(
             move || Plan::new(&cwd, &name, None, user, true),
             move |server, plan| match plan {
@@ -293,7 +294,7 @@ impl Server {
                     server.set_mode_if_idle(client, Mode::confirm(question, ConfirmAction::TrustWorktreeSetup(new)));
                 }
                 Ok(plan) => server.create_worktree(client, NewWorktree { ws, agent, account, plan }),
-                Err(e) => server.toast(client, format!("{e:#}")),
+                Err(e) => server.toast(client, NoticeKind::Error, format!("{e:#}")),
             },
         );
         Ok(())
@@ -303,7 +304,7 @@ impl Server {
     /// version of it and makes the worktree; a no makes nothing.
     pub(super) fn confirm_worktree_setup(&mut self, client: ClientId, new: NewWorktree, yes: bool) {
         if !yes {
-            self.toast(client, format!("the worktree {} was not created", new.plan.name));
+            self.toast(client, NoticeKind::Notice, format!("the worktree {} was not created", new.plan.name));
             return;
         }
         if let Err(e) = new.plan.trust() {
@@ -319,7 +320,7 @@ impl Server {
             move |server, created| {
                 let result = created.and_then(|p| server.start_agent_in(ws, &agent, &account, p));
                 if let Err(e) = result {
-                    server.toast(client, format!("{e:#}"));
+                    server.toast(client, NoticeKind::Error, format!("{e:#}"));
                 }
             },
         );
@@ -398,7 +399,7 @@ impl Server {
                 move || git::worktree_states(&dir),
                 move |server, states| match states {
                     Ok(states) => server.ask_prune_worktrees(client, states),
-                    Err(e) => server.toast(client, format!("{e:#}")),
+                    Err(e) => server.toast(client, NoticeKind::Error, format!("{e:#}")),
                 },
             );
             return Mode::Normal;
@@ -452,7 +453,7 @@ impl Server {
     pub(super) fn commit_worktree(&mut self, client: ClientId, pane: PaneId, message: &str) {
         let Some(w) = self.pane_worktree(pane) else { return };
         if message.trim().is_empty() {
-            self.toast(client, "empty commit message");
+            self.toast(client, NoticeKind::Warning, "empty commit message");
             return;
         }
         let script = format!(
@@ -467,7 +468,7 @@ impl Server {
         let state = match state {
             Ok(s) => s,
             Err(e) => {
-                self.toast(client, format!("{e:#}"));
+                self.toast(client, NoticeKind::Error, format!("{e:#}"));
                 return;
             }
         };
@@ -506,7 +507,7 @@ impl Server {
         }
         if merged.is_empty() {
             let why = if kept.is_empty() { String::new() } else { format!("; kept: {}", kept.join(", ")) };
-            self.toast(client, format!("no merged worktree to remove{why}"));
+            self.toast(client, NoticeKind::Notice, format!("no merged worktree to remove{why}"));
             return;
         }
         let mut lines = vec![format!(
@@ -578,8 +579,9 @@ impl Server {
                         parts.push(format!("removed {} worktrees: {}", many.len(), names.join(", ")));
                     }
                 }
+                let kind = if errors.is_empty() { NoticeKind::Notice } else { NoticeKind::Error };
                 parts.extend(errors);
-                server.toast(client, parts.join("; "));
+                server.toast(client, kind, parts.join("; "));
             },
         );
     }
@@ -594,7 +596,7 @@ impl Server {
             ..Default::default()
         };
         if let Err(e) = self.spawn_pane_in(ws, None, spec, Placement::Floating, Some(format!("⎇ {label}"))) {
-            self.toast(client, format!("{e:#}"));
+            self.toast(client, NoticeKind::Error, format!("{e:#}"));
         }
         // Branch states change after these: git is asked again when its pane's program ends.
     }

@@ -8,6 +8,7 @@ use crate::pane::PaneSpec;
 use crate::protocol::Placement;
 use crate::server::ui::{ConfirmAction, Mode, Prompt, PromptAction};
 use crate::server::{ClientId, Server};
+use crate::theme::NoticeKind;
 
 impl Server {
     /// Give the focused pane a prefix key: `key` as pressed, or the first prefix.
@@ -40,7 +41,9 @@ impl Server {
                 return Mode::Picker(self.workspace_picker(self.clients.get(&id).map_or(0, |c| c.workspace)));
             }
             Action::PanePicker => return Mode::Picker(self.pane_picker()),
-            Action::EditPane if self.client_focus(id).is_none() => self.toast(id, "Add a pane before editing."),
+            Action::EditPane if self.client_focus(id).is_none() => {
+                self.toast(id, NoticeKind::Warning, "Add a pane before editing.")
+            }
             Action::Accounts => {
                 self.refresh_existing_accounts();
                 return Mode::Picker(self.accounts_picker(None));
@@ -54,7 +57,7 @@ impl Server {
                 let next = queue.iter().find(|a| !self.attention_shown(id, a)).or(queue.first()).cloned();
                 match next {
                     Some(a) => self.go_to(id, a),
-                    None => self.toast(id, "no agent needs you"),
+                    None => self.toast(id, NoticeKind::Notice, "no agent needs you"),
                 }
             }
             Action::ToggleSidebar => {
@@ -105,7 +108,7 @@ impl Server {
                     _ => Placement::Auto,
                 };
                 if let Err(e) = self.spawn_pane_in(ws, focus, PaneSpec::default(), placement, None) {
-                    self.toast(id, format!("{e:#}"));
+                    self.toast(id, NoticeKind::Error, format!("{e:#}"));
                 }
             }
             Action::ClosePane => {
@@ -140,7 +143,7 @@ impl Server {
                 let Some(tab) = self.workspaces[wi].tab_mut() else { return Mode::Normal };
                 if tab.floating.is_empty() {
                     if let Err(e) = self.spawn_pane_in(ws, focus, PaneSpec::default(), Placement::Floating, None) {
-                        self.toast(id, format!("{e:#}"));
+                        self.toast(id, NoticeKind::Error, format!("{e:#}"));
                     }
                 } else {
                     tab.show_floating = !tab.show_floating;
@@ -195,9 +198,9 @@ impl Server {
                         tab.preset = Some(preset);
                         tab.zoom = None;
                         self.relayout();
-                        self.toast(id, format!("Layout: {}", preset.describe()));
+                        self.toast(id, NoticeKind::Notice, format!("Layout: {}", preset.describe()));
                     }
-                    None => self.toast(id, "One pane fills the tab: there is no layout to choose."),
+                    None => self.toast(id, NoticeKind::Notice, "One pane fills the tab: there is no layout to choose."),
                 }
             }
             Action::StackLeft | Action::StackRight | Action::StackUp | Action::StackDown => {
@@ -208,7 +211,7 @@ impl Server {
                     _ => Dir::Down,
                 };
                 if let Err(why) = self.stack_focused(wi, dir) {
-                    self.toast(id, why);
+                    self.toast(id, NoticeKind::Warning, why);
                 }
             }
             Action::Unstack => {
@@ -224,7 +227,7 @@ impl Server {
                         tab.set_focus(f);
                         self.relayout();
                     }
-                    None => self.toast(id, "This pane is not in a stack."),
+                    None => self.toast(id, NoticeKind::Notice, "This pane is not in a stack."),
                 }
             }
             Action::NextTab => self.switch_tab(wi, 1),
@@ -286,6 +289,7 @@ impl Server {
                     let how = self.keymap.hint(Action::AgentPicker).unwrap_or_default();
                     self.toast(
                         id,
+                        NoticeKind::Warning,
                         format!("This pane is not in a git repository ({how} starts an agent in a worktree)."),
                     )
                 }
@@ -319,14 +323,14 @@ impl Server {
                 };
                 if scope == SyncScope::Marked && ws.marked.is_empty() {
                     let how = self.keymap.hint(Action::SelectForBroadcast).unwrap_or_default();
-                    self.toast(id, format!("Mark the panes first ({how} in each)."));
+                    self.toast(id, NoticeKind::Warning, format!("Mark the panes first ({how} in each)."));
                     return Mode::Normal;
                 }
                 ws.sync = scope;
                 if scope == SyncScope::Off {
                     ws.marked.clear();
                     ws.sync_approved.clear();
-                    self.toast(id, "Broadcast stopped: typing goes to the focused pane only.");
+                    self.toast(id, NoticeKind::Notice, "Broadcast stopped: typing goes to the focused pane only.");
                 } else if action == Action::BroadcastToggle && !std::mem::replace(&mut self.broadcast_tip_shown, true) {
                     // Once per server run: the key that starts it also stops it.
                     let again = self.keymap.hint(Action::BroadcastToggle).unwrap_or_default();
@@ -334,7 +338,7 @@ impl Server {
                         Some(more) => format!("{again} again stops it; {more} for more."),
                         None => format!("{again} again stops it."),
                     };
-                    self.toast(id, msg);
+                    self.toast(id, NoticeKind::Notice, msg);
                 }
                 self.mark_dirty();
             }
@@ -353,7 +357,7 @@ impl Server {
             Action::Files => {
                 let (left, right) = self.files_defaults(id);
                 if let Err(e) = self.open_files(ws, left, right) {
-                    self.toast(id, format!("{e:#}"));
+                    self.toast(id, NoticeKind::Error, format!("{e:#}"));
                 }
             }
             Action::Search => {
@@ -370,7 +374,7 @@ impl Server {
             }
             Action::Upload | Action::Download => {
                 let Some(server) = focus.and_then(|f| self.pane_server(f)) else {
-                    self.toast(id, "this pane is not connected to a server");
+                    self.toast(id, NoticeKind::Warning, "this pane is not connected to a server");
                     return Mode::Normal;
                 };
                 if action == Action::Upload {
@@ -394,7 +398,7 @@ impl Server {
                 let tiled =
                     self.workspaces[wi].tab().and_then(|t| t.root.as_ref()).is_some_and(|r| r.places().len() > 1);
                 if !tiled {
-                    self.toast(id, "One pane fills the tab: there is nothing to resize.");
+                    self.toast(id, NoticeKind::Notice, "One pane fills the tab: there is nothing to resize.");
                     return Mode::Normal;
                 }
                 return Mode::Resize;
@@ -445,7 +449,7 @@ impl Server {
 
     pub(in crate::server) fn show_workspace(&mut self, id: ClientId, ws: u32) {
         if let Err(e) = self.reopen_workspace(ws) {
-            self.toast(id, format!("{e:#}"));
+            self.toast(id, NoticeKind::Error, format!("{e:#}"));
             return;
         }
         if let Some(c) = self.clients.get_mut(&id) {

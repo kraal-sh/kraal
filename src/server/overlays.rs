@@ -587,7 +587,12 @@ pub(super) fn draw_picker(p: &Picker, screen: Rect, buf: &mut Buffer) -> Option<
         let total = p.items.iter().enumerate().filter(|(i, _)| Some(*i) != p.pinned).count();
         format!("{matching}/{total}")
     };
-    let line = key_line(&footer, &count, inner.width.saturating_sub(2));
+    let mut line = key_line(&footer, &count, inner.width.saturating_sub(2));
+    if p.message.is_some()
+        && let Some(span) = line.spans.last_mut().filter(|span| span.content == count)
+    {
+        span.style = Style::default().fg(p.message_kind.colour(th()));
+    }
     buf.set_line(inner.x + 1, inner.y + inner.height - 1, &line, inner.width.saturating_sub(2));
     if review || conflict {
         return None;
@@ -890,6 +895,42 @@ pub(super) fn entry(keys: &str, what: &str, key_w: usize) -> Line<'static> {
 mod tests {
     use super::super::ui::ConfirmAction;
     use super::*;
+
+    #[test]
+    fn picker_result_notices_use_their_kind_without_recolouring_keys() {
+        use super::super::ui::{Mode, PickerKind};
+        use crate::theme::NoticeKind;
+
+        for (cols, rows) in [(80, 24), (124, 36)] {
+            for (kind, message, colour) in [
+                (NoticeKind::Notice, "Saved", th().text),
+                (NoticeKind::Warning, "Check", th().blocked),
+                (NoticeKind::Error, "Failed", th().blocked),
+            ] {
+                let Mode::Picker(p) = Picker::new(PickerKind::Workspace, "Workspaces", vec![]).result(kind, message)
+                else {
+                    panic!()
+                };
+                let screen = Rect::new(0, 0, cols, rows);
+                let mut buf = Buffer::empty(screen);
+                draw_picker(&p, screen, &mut buf);
+                let mut found = false;
+                for y in 0..rows {
+                    let line: String = (0..cols).map(|x| buf[(x, y)].symbol()).collect();
+                    if let Some(at) = line.find(message) {
+                        let x = line[..at].chars().count() as u16;
+                        for x in x..x + message.len() as u16 {
+                            assert_eq!(buf[(x, y)].fg, colour);
+                        }
+                        let at = line.find("Esc").unwrap();
+                        assert_eq!(buf[(line[..at].chars().count() as u16, y)].fg, th().accent);
+                        found = true;
+                    }
+                }
+                assert!(found);
+            }
+        }
+    }
 
     /// Every kind of overlay, drawn in `screen` of `buf`: questions, a picker, a prompt, the menu
     /// and a viewer.

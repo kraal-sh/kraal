@@ -6,6 +6,7 @@ use super::{ClientId, Dirty, Server, frame_bytes};
 use crate::agent::AgentState;
 use crate::config::NotifyMode;
 use crate::layout::PaneId;
+use crate::theme::NoticeKind;
 /// Warnings kept while no client is attached.
 const MAX_PENDING_WARNINGS: usize = 50;
 
@@ -215,10 +216,10 @@ impl Server {
         match state {
             AgentState::Blocked if self.config.notifications.on_blocked => {
                 let msg = p.agent.message.clone().unwrap_or_else(|| "needs your input".into());
-                self.notify(&format!("{agent} · {label}"), &msg, Some(pane));
+                self.notify(NoticeKind::Notice, &format!("{agent} · {label}"), &msg, Some(pane));
             }
             AgentState::Done if self.config.notifications.on_done && before == AgentState::Working => {
-                self.notify(&format!("{agent} · {label}"), "finished", Some(pane));
+                self.notify(NoticeKind::Notice, &format!("{agent} · {label}"), "finished", Some(pane));
             }
             _ => {}
         }
@@ -226,7 +227,7 @@ impl Server {
     }
 
     /// Desktop notification through the attached terminals and/or notify-send.
-    pub fn notify(&mut self, title: &str, body: &str, pane: Option<PaneId>) {
+    pub fn notify(&mut self, kind: NoticeKind, title: &str, body: &str, pane: Option<PaneId>) {
         let mut fields = pane.map(|p| self.pane_fields(p)).unwrap_or_default();
         fields.insert("title".into(), title.into());
         fields.insert("body".into(), body.into());
@@ -250,18 +251,18 @@ impl Server {
             }
         }
         for c in self.clients.values_mut().filter(|c| c.attached) {
-            c.toast = Some((format!("{title}: {body}"), Instant::now() + Duration::from_secs(4)));
+            c.toast = Some((format!("{title}: {body}"), Instant::now() + Duration::from_secs(4), kind));
             c.toast_action = None;
             c.dirty = Dirty::Yes;
         }
         self.schedule_render();
     }
 
-    pub(super) fn notify_action(&mut self, message: &str, pane: PaneId, action: ToastAction) {
+    pub(super) fn notify_action(&mut self, kind: NoticeKind, message: &str, pane: PaneId, action: ToastAction) {
         let label = action.label();
-        self.notify(&format!("{message} · {label}"), "", Some(pane));
+        self.notify(kind, &format!("{message} · {label}"), "", Some(pane));
         for c in self.clients.values_mut().filter(|c| c.attached) {
-            c.toast = Some((format!("{message} · {label}"), Instant::now() + Duration::from_secs(6)));
+            c.toast = Some((format!("{message} · {label}"), Instant::now() + Duration::from_secs(6), kind));
             c.toast_action = Some((pane, action.clone()));
         }
         self.mark_dirty();
@@ -284,7 +285,7 @@ impl Server {
             ToastAction::ChangeAccount => self.change_account_mode(client, pane),
             ToastAction::UndoAccount => {
                 if let Err(e) = self.undo_account_change(pane, client) {
-                    self.toast(client, format!("{e:#}"));
+                    self.toast(client, NoticeKind::Error, format!("{e:#}"));
                 }
                 super::ui::Mode::Normal
             }
@@ -295,13 +296,13 @@ impl Server {
     }
 
     /// Tell a client something, briefly; the messages log keeps it.
-    pub fn toast(&mut self, client: ClientId, msg: impl Into<String>) {
+    pub fn toast(&mut self, client: ClientId, kind: NoticeKind, msg: impl Into<String>) {
         let msg = msg.into();
-        self.log_message(&msg, false);
+        self.log_message(&msg, kind);
         if let Some(c) = self.clients.get_mut(&client) {
             // Long messages stay longer.
             let secs = (3 + msg.chars().count() as u64 / 25).min(10);
-            c.toast = Some((msg, Instant::now() + Duration::from_secs(secs)));
+            c.toast = Some((msg, Instant::now() + Duration::from_secs(secs), kind));
             c.toast_action = None;
             c.dirty = Dirty::Yes;
         }
@@ -322,17 +323,17 @@ impl Server {
         );
         let Some(c) = self.clients.get_mut(&client) else { return };
         if c.toast.is_some() {
-            c.notice = Some(text);
+            c.notice = Some((text, NoticeKind::Notice));
         } else {
-            self.toast(client, text);
+            self.toast(client, NoticeKind::Notice, text);
         }
     }
 
-    pub(super) fn log_message(&mut self, text: &str, warning: bool) {
+    pub(super) fn log_message(&mut self, text: &str, kind: NoticeKind) {
         if self.messages.len() >= super::MAX_MESSAGES {
             self.messages.pop_front();
         }
-        self.messages.push_back(super::Message { at: std::time::SystemTime::now(), text: text.to_string(), warning });
+        self.messages.push_back(super::Message { at: std::time::SystemTime::now(), text: text.to_string(), kind });
     }
 
     /// Log pending warnings and show them to attached clients with no active message.
@@ -352,7 +353,7 @@ impl Server {
         }
         let warnings = std::mem::take(&mut self.warnings);
         for w in &warnings {
-            self.log_message(w, true);
+            self.log_message(w, NoticeKind::Warning);
         }
         let text = match warnings.len() {
             1 => warnings[0].clone(),
@@ -367,10 +368,10 @@ impl Server {
         for c in self.clients.values_mut().filter(|c| c.attached) {
             // A queued warning may already be obsolete after the user's action. Keep its
             // result visible, even before the first frame; the warning stays in Messages.
-            if c.toast.as_ref().is_some_and(|(_, until)| *until > now) {
+            if c.toast.as_ref().is_some_and(|(_, until, _)| *until > now) {
                 continue;
             }
-            c.toast = Some((text.clone(), now + Duration::from_secs(10)));
+            c.toast = Some((text.clone(), now + Duration::from_secs(10), NoticeKind::Warning));
             c.toast_action = None;
             c.dirty = Dirty::Yes;
         }
@@ -398,13 +399,14 @@ impl Server {
             if self.buffers.get(Some("0")).is_ok_and(|buffer| buffer.text == url) {
                 self.toast(
                     client,
+                    NoticeKind::Warning,
                     format!("{url} is on {host}, where kraal runs: kept in paste buffers (open it there, or ssh -L)"),
                 );
             }
             return;
         }
         self.send_msg(client, &crate::protocol::ServerMsg::Open { url: url.to_string() });
-        self.toast(client, format!("opening {url}"));
+        self.toast(client, NoticeKind::Notice, format!("opening {url}"));
     }
 }
 
@@ -481,7 +483,7 @@ mod tests {
                 if warning_first {
                     server.show_warnings();
                 }
-                server.toast(id, result);
+                server.toast(id, NoticeKind::Notice, result);
                 let until = server.clients[&id].toast.as_ref().unwrap().1;
                 // A watch can queue an error before the retry repairs the file. The tick
                 // can deliver it after the retry succeeds, before any frame shows success.
@@ -490,9 +492,9 @@ mod tests {
                 server.compose(id, crate::accounts::now(), &mut buffer);
                 let text: String = buffer.content.iter().map(|c| c.symbol()).collect();
                 assert!(text.contains(result), "{cols}x{rows}: {text}");
-                assert_eq!(server.clients[&id].toast, Some((result.into(), until)));
-                assert!(server.messages.iter().any(|m| m.warning && m.text == warning));
-                assert!(server.messages.iter().any(|m| !m.warning && m.text == result));
+                assert_eq!(server.clients[&id].toast, Some((result.into(), until, NoticeKind::Notice)));
+                assert!(server.messages.iter().any(|m| m.kind == NoticeKind::Warning && m.text == warning));
+                assert!(server.messages.iter().any(|m| m.kind != NoticeKind::Warning && m.text == result));
                 assert!(server.warnings.is_empty());
                 assert!(server.clients[&id].notice.is_none(), "an obsolete warning must not be replayed later");
             }
@@ -506,14 +508,14 @@ mod tests {
             let mut server = server(tx);
             let (id, _peer) = client(&mut server);
             server.config.notifications.mode = NotifyMode::Off;
-            server.notify_action("work", 42, action.clone());
+            server.notify_action(NoticeKind::Notice, "work", 42, action.clone());
             let before = server.clients[&id].toast.clone();
             server.warnings.push("could not save paste buffers".into());
             server.show_warnings();
             assert_eq!(server.clients[&id].toast, before);
             assert_eq!(server.clients[&id].toast_action, Some((42, action)));
             assert_eq!(server.messages.back().unwrap().text, "could not save paste buffers");
-            assert!(server.messages.back().unwrap().warning);
+            assert!(server.messages.back().unwrap().kind == NoticeKind::Warning);
         }
     }
 
@@ -523,9 +525,9 @@ mod tests {
         let mut server = server(tx);
         let [(busy, _busy_peer), (idle, _idle_peer), (expired, _expired_peer), (detached, _detached_peer)] =
             std::array::from_fn(|_| client(&mut server));
-        server.toast(busy, "Workspace renamed");
+        server.toast(busy, NoticeKind::Notice, "Workspace renamed");
         let c = server.clients.get_mut(&expired).unwrap();
-        c.toast = Some(("Using work · Undo".into(), Instant::now() - Duration::from_secs(1)));
+        c.toast = Some(("Using work · Undo".into(), Instant::now() - Duration::from_secs(1), NoticeKind::Notice));
         c.toast_action = Some((42, ToastAction::UndoAccount));
         server.clients.get_mut(&detached).unwrap().attached = false;
         server.warnings.extend(["first warning".into(), "second warning".into()]);
@@ -537,9 +539,9 @@ mod tests {
             assert!(c.toast_action.is_none(), "a warning must not retain an unrelated action");
         }
         assert!(server.clients[&detached].toast.is_none());
-        assert_eq!(server.messages.iter().filter(|m| m.warning).count(), 2);
+        assert_eq!(server.messages.iter().filter(|m| m.kind == NoticeKind::Warning).count(), 2);
         server.show_warnings();
-        assert_eq!(server.messages.iter().filter(|m| m.warning).count(), 2);
+        assert_eq!(server.messages.iter().filter(|m| m.kind == NoticeKind::Warning).count(), 2);
     }
 
     #[test]
@@ -557,7 +559,7 @@ mod tests {
         server.show_warnings();
         assert!(server.clients[&id].toast.as_ref().unwrap().0.starts_with("warning 10 (and 49 more:"));
         assert_eq!(server.messages.len(), MAX_PENDING_WARNINGS);
-        assert!(server.messages.iter().all(|m| m.warning));
+        assert!(server.messages.iter().all(|m| m.kind == NoticeKind::Warning));
         assert!(server.warnings.is_empty());
     }
 }
