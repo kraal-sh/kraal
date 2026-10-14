@@ -22,6 +22,8 @@ use crate::input::{InputEvent, InputParser, KeyCode};
 use crate::protocol::{self, ClientMsg, ServerMsg};
 use crate::theme::NoticeKind;
 
+const PROGRESS_INTERVAL: Duration = Duration::from_millis(200);
+
 type Writer = Arc<Mutex<Option<Box<dyn Write + Send>>>>;
 
 struct Prompt {
@@ -41,8 +43,34 @@ struct Active {
     cancelled: Arc<AtomicBool>,
     ack: Sender<u64>,
     started: Instant,
+    last_draw: Option<Instant>,
+    label: String,
     progress: Option<(u64, u64)>,
     failure: Option<String>,
+}
+
+impl Active {
+    fn status(&self, theme: crate::theme::Theme, now: Instant) -> String {
+        let frames = if theme.ascii {
+            &['|', '/', '-', '\\'][..]
+        } else {
+            &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'][..]
+        };
+        let frame = (now.saturating_duration_since(self.started).as_millis() / PROGRESS_INTERVAL.as_millis()) as usize;
+        let spinner = frames[frame % frames.len()];
+        let Some((received, total)) = self.progress else {
+            return format!("{spinner} Preparing attachment.\nTyping waits until it finishes.");
+        };
+        let percent = (received.saturating_mul(100)).checked_div(total).unwrap_or(100).min(100);
+        let label: String = self.label.chars().filter(|c| !c.is_control()).collect();
+        format!(
+            "{}\n{} / {} ({percent}%)\n{spinner} {}\nTyping waits until it finishes.",
+            crate::text::truncate(&label, 64),
+            crate::text::human_size(received),
+            crate::text::human_size(total),
+            theme.bar(percent as f64),
+        )
+    }
 }
 
 struct Dropped {
@@ -597,6 +625,7 @@ impl Controller {
                 {
                     let _ = active.ack.try_send(received);
                 }
+                return;
             }
             ServerMsg::AttachmentResult { token, mut message, pasted, mut kind } => {
                 let active = state.active.as_ref().is_some_and(|a| a.token == token);
@@ -949,6 +978,8 @@ impl Controller {
             cancelled: cancelled.clone(),
             ack,
             started: Instant::now(),
+            last_draw: None,
+            label: String::new(),
             progress: None,
             failure: None,
         });
@@ -1144,29 +1175,32 @@ impl Controller {
         let this = Arc::downgrade(self);
         let _ = crate::threads::named("attachment-progress").spawn(move || {
             loop {
-                std::thread::sleep(std::time::Duration::from_millis(50));
+                std::thread::sleep(PROGRESS_INTERVAL);
                 let Some(this) = this.upgrade() else { return };
-                let mut state = this.state.lock().unwrap();
-                let Some(active) = state.active.as_ref().filter(|active| active.token == token) else { return };
-                if active.started.elapsed() < std::time::Duration::from_millis(200) {
-                    continue;
+                let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
+                if !this.draw_progress_with(&token, Instant::now(), cols, rows, |bytes| {
+                    let _ = super::terminal().write(bytes);
+                }) {
+                    return;
                 }
-                state.status = Some(active.progress.map_or_else(
-                    || "Preparing attachment. Typing waits until it finishes.".into(),
-                    |(received, total)| {
-                        format!(
-                            "{:.1} / {:.1} MiB ({}%)\nTyping waits until it finishes.",
-                            received as f64 / 1048576.0,
-                            total as f64 / 1048576.0,
-                            (received * 100).checked_div(total).unwrap_or(100)
-                        )
-                    },
-                ));
-                state.status_kind = NoticeKind::Notice;
-                drop(state);
-                this.draw();
             }
         });
+    }
+
+    fn draw_progress_with(&self, token: &str, now: Instant, cols: u16, rows: u16, write: impl FnOnce(&[u8])) -> bool {
+        let mut state = self.state.lock().unwrap();
+        let Some(active) = state.active.as_mut().filter(|active| active.token == token) else { return false };
+        if now.saturating_duration_since(active.last_draw.unwrap_or(active.started)) < PROGRESS_INTERVAL {
+            return true;
+        }
+        active.last_draw = Some(now);
+        state.status = Some(active.status(crate::theme::current(), now));
+        state.status_kind = NoticeKind::Notice;
+        if let Some(view) = state.view(&self.host()) {
+            let (buf, _) = view.render(Rect::new(0, 0, cols, rows.saturating_sub(1)));
+            write(&crate::ansi::overlay(&buf));
+        }
+        true
     }
 
     fn upload(&self, prompt: &Prompt, replies: &Receiver<u64>, cancelled: &AtomicBool) -> Result<()> {
@@ -1207,6 +1241,12 @@ impl Controller {
             return Ok(());
         }
         let total = prompt.limits.check(&specs)?;
+        {
+            let mut state = self.state.lock().unwrap();
+            if let Some(active) = state.active.as_mut().filter(|active| active.token == *token) {
+                active.label = if specs.len() == 1 { specs[0].name.clone() } else { format!("{} files", specs.len()) };
+            }
+        }
         write(ClientMsg::AttachmentStart { token: token.clone(), files: specs })?;
         self.progress(token, 0, total);
         wait(0)?;
@@ -1649,6 +1689,153 @@ mod tests {
                     }
                     assert!(found, "missing result in attachment dialog: {message}");
                 }
+            }
+        }
+    }
+
+    fn progress_client() -> (Arc<Controller>, Reader, Instant) {
+        let (client, peer) = controller(true);
+        let started = Instant::now();
+        client.state.lock().unwrap().active = Some(Active {
+            token: "ab".into(),
+            cancelled: Arc::new(AtomicBool::new(false)),
+            ack: bounded(2).0,
+            started,
+            last_draw: None,
+            label: "capture.png".into(),
+            progress: Some((0, 4 * 1048576)),
+            failure: None,
+        });
+        (client, peer, started)
+    }
+
+    #[test]
+    fn progress_content_at_124_and_80_columns_in_each_theme() {
+        for theme in [crate::theme::Theme::DEFAULT, crate::theme::Theme::ASCII] {
+            for cols in [124, 80] {
+                for percent in [0, 50, 100] {
+                    for label in ["capture.png", "2 files"] {
+                        let (client, _peer, started) = progress_client();
+                        let mut state = client.state.lock().unwrap();
+                        let active = state.active.as_mut().unwrap();
+                        active.label = label.into();
+                        active.progress = Some((4 * 1048576 * percent / 100, 4 * 1048576));
+                        state.status = Some(active.status(theme, started + PROGRESS_INTERVAL));
+                        let (buf, buttons) = state.view("SERVER").unwrap().render(Rect::new(0, 0, cols, 23));
+                        let text = buf
+                            .content
+                            .chunks(buf.area.width as usize)
+                            .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        for expected in [
+                            "Sending to SERVER".to_string(),
+                            label.into(),
+                            format!("{} / 4.0 MiB ({percent}%)", crate::text::human_size(4 * 1048576 * percent / 100)),
+                            format!("{} {}", if theme.ascii { "/" } else { "⠙" }, theme.bar(percent as f64)),
+                            "Typing waits until it finishes.".into(),
+                            "Ctrl+C Cancel".into(),
+                        ] {
+                            assert!(text.contains(&expected), "missing {expected:?} at {cols} columns:\n{text}");
+                        }
+                        assert_eq!(buttons.len(), 1);
+                        if theme.ascii {
+                            assert!(state.status.as_ref().unwrap().is_ascii());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn progress_timer_bounds_redraws_and_animates_without_acknowledgements() {
+        let (client, peer, started) = progress_client();
+        let mut frames = Vec::new();
+        for millis in 0..=1000 {
+            client.message(ServerMsg::AttachmentAck { token: "ab".into(), received: millis });
+            assert!(client.draw_progress_with("ab", started + Duration::from_millis(millis), 80, 24, |bytes| {
+                frames.push((millis, bytes.to_vec()));
+            }));
+        }
+        assert_eq!(frames.iter().map(|(millis, _)| *millis).collect::<Vec<_>>(), [200, 400, 600, 800, 1000]);
+        assert!(frames.windows(2).all(|pair| pair[0].1 != pair[1].1));
+        assert!(peer.incoming.try_recv().is_err());
+        let mut stalled = Vec::new();
+        client.draw_progress_with("ab", started + Duration::from_millis(1200), 80, 24, |bytes| {
+            stalled.extend_from_slice(bytes);
+        });
+        assert_ne!(frames.last().unwrap().1, stalled);
+        assert!(String::from_utf8(stalled).unwrap().contains("0 B / 4.0 MiB (0%)"));
+    }
+
+    #[test]
+    fn acknowledgements_do_not_wait_for_terminal_redraw() {
+        let (client, _peer, started) = progress_client();
+        client.draw_progress_with("ab", started + PROGRESS_INTERVAL, 80, 24, |_| {});
+        let terminal = super::super::terminal();
+        let (finished, done) = bounded(1);
+        let worker = std::thread::spawn(move || {
+            for received in 0..1000 {
+                client.message(ServerMsg::AttachmentAck { token: "ab".into(), received });
+            }
+            finished.send(()).unwrap();
+        });
+        let completed = done.recv_timeout(Duration::from_secs(2)).is_ok();
+        drop(terminal);
+        worker.join().unwrap();
+        assert!(completed, "acknowledgements must not draw a frame for every chunk");
+    }
+
+    #[test]
+    fn results_replace_progress_and_short_transfers_never_show_it() {
+        for elapsed in [Duration::from_millis(199), PROGRESS_INTERVAL] {
+            for pasted in [false, true] {
+                let (client, mut peer, started) = progress_client();
+                let mut frames = Vec::new();
+                client.draw_progress_with("ab", started + elapsed, 80, 24, |bytes| frames.push(bytes.to_vec()));
+                assert_eq!(frames.len(), usize::from(elapsed == PROGRESS_INTERVAL));
+                let result = if pasted { "Files received." } else { "Transfer interrupted." };
+                client.message(ServerMsg::AttachmentResult {
+                    token: "ab".into(),
+                    kind: if pasted { NoticeKind::Notice } else { NoticeKind::Error },
+                    message: result.into(),
+                    pasted,
+                });
+                if pasted {
+                    assert!(matches!(read(&mut peer), ClientMsg::AttachmentDismiss { .. }));
+                }
+                assert!(matches!(read(&mut peer), ClientMsg::Repaint));
+                client.draw_with(80, 24, |bytes| {
+                    let text = String::from_utf8_lossy(bytes);
+                    assert!(text.contains(result));
+                    assert!(!text.contains("Sending to") && !text.contains("Ctrl+C Cancel"));
+                });
+                assert!(!client.draw_progress_with("ab", started + Duration::from_secs(1), 80, 24, |_| {
+                    panic!("progress must not repaint over a result");
+                }));
+            }
+        }
+    }
+
+    #[test]
+    fn progress_preparation_sizes_and_filename_are_readable() {
+        let (client, _peer, started) = progress_client();
+        let mut state = client.state.lock().unwrap();
+        let active = state.active.as_mut().unwrap();
+        for theme in [crate::theme::Theme::DEFAULT, crate::theme::Theme::ASCII] {
+            active.progress = None;
+            assert!(active.status(theme, started).contains("Preparing attachment."));
+            active.label = format!("capture\n\x1b{}", "界".repeat(80));
+            for (received, total, expected) in
+                [(0, 0, "0 B / 0 B (100%)"), (0, 3, "0 B / 3 B (0%)"), (512, 1024, "512 B / 1.0 KiB (50%)")]
+            {
+                active.progress = Some((received, total));
+                let status = active.status(theme, started);
+                assert!(status.contains(expected));
+                let label = status.lines().next().unwrap();
+                assert!(!label.contains('\x1b'));
+                assert!(crate::text::columns(label) <= 64);
             }
         }
     }
@@ -2595,6 +2782,8 @@ mod tests {
                     cancelled: cancelled.clone(),
                     ack: bounded(1).0,
                     started: Instant::now(),
+                    last_draw: None,
+                    label: String::new(),
                     progress: None,
                     failure: None,
                 });
@@ -2951,6 +3140,8 @@ mod tests {
                     cancelled: Arc::new(AtomicBool::new(false)),
                     ack: bounded(2).0,
                     started: Instant::now(),
+                    last_draw: None,
+                    label: String::new(),
                     progress: None,
                     failure: None,
                 });
@@ -3115,6 +3306,8 @@ mod tests {
                             cancelled: Arc::new(AtomicBool::new(false)),
                             ack: bounded(2).0,
                             started: Instant::now(),
+                            last_draw: None,
+                            label: String::new(),
                             progress: None,
                             failure: None,
                         });
@@ -3236,6 +3429,8 @@ mod tests {
                     cancelled: cancelled.clone(),
                     ack: bounded(2).0,
                     started: Instant::now(),
+                    last_draw: None,
+                    label: String::new(),
                     progress: None,
                     failure: None,
                 });
@@ -3316,6 +3511,8 @@ mod tests {
                                 cancelled: cancelled.clone(),
                                 ack: bounded(2).0,
                                 started: Instant::now(),
+                                last_draw: None,
+                                label: String::new(),
                                 progress: None,
                                 failure: None,
                             });
@@ -3397,7 +3594,8 @@ mod tests {
             let started = Instant::now();
             loop {
                 if let Some(status) = &client.state.lock().unwrap().status {
-                    assert!(status.contains("0.0 / 0.0 MiB (0%)"));
+                    assert!(status.contains(path.file_name().unwrap().to_str().unwrap()));
+                    assert!(status.contains("0 B / 3 B (0%)"));
                     assert!(status.contains("Typing waits"));
                     break;
                 }
@@ -3494,6 +3692,8 @@ mod tests {
             cancelled: cancelled.clone(),
             ack: acks,
             started: Instant::now(),
+            last_draw: None,
+            label: String::new(),
             progress: None,
             failure: None,
         });
@@ -3593,6 +3793,8 @@ mod tests {
                 cancelled: cancelled.clone(),
                 ack,
                 started: Instant::now(),
+                last_draw: None,
+                label: String::new(),
                 progress: None,
                 failure: None,
             });
