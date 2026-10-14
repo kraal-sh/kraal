@@ -295,6 +295,7 @@ pub(super) fn import(s: &Session, file: PathBuf, name: Option<String>, yes: bool
         bail!("unexpected answer")
     };
     let name = name.unwrap_or_else(|| preview.definition.name.clone());
+    workspace::validate_name(&name, false)?;
     println!("{}\nName: {name}\n{}", paths::shorten_home(&path), preview.summary());
     let mut accounts = Vec::new();
     for missing in &preview.accounts {

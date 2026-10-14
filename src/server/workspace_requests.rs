@@ -38,6 +38,7 @@ impl Server {
                 self.deleted_workspaces.iter().rev().map(|d| deleted_info(&d.workspace)).collect(),
             )),
             Request::CreateWorkspace { name, cwd } => {
+                crate::workspace::validate_name(&name, false).map_err(|e| e.to_string())?;
                 self.add_workspace(name.trim(), Some(cwd))?;
                 Ok(Response::Ok)
             }
@@ -45,6 +46,7 @@ impl Server {
                 let DeleteTarget::Workspace(ws) = self.workspace_target(&workspace)? else {
                     return Err("This file has not been imported. Open it before renaming its workspace.".into());
                 };
+                crate::workspace::validate_name(&name, false).map_err(|e| e.to_string())?;
                 self.rename_workspace(ws, name.trim())?;
                 Ok(Response::Ok)
             }
@@ -65,7 +67,9 @@ impl Server {
                 };
                 let identity = deleted.workspace.id.clone();
                 let name = name.unwrap_or_else(|| deleted.workspace.name.clone());
-                self.restore_deleted_workspace(&identity, name.trim())
+                crate::workspace::validate_name(&name, false)
+                    .map_err(|e| e.to_string())
+                    .and_then(|()| self.restore_deleted_workspace(&identity, name.trim()))
                     .map_err(|e| format!("{e}\nRetry `kraal workspaces restore {identity} --name NAME`."))?;
                 Ok(Response::Ok)
             }
@@ -215,7 +219,7 @@ mod tests {
         let current = server.clients[&client].workspace;
         let saved = writer(&mut server, vec![]);
         let cwd = std::env::temp_dir();
-        for name in ["", "  ", "test"] {
+        for name in ["", "  ", "test", "new\n"] {
             assert!(request(&mut server, Request::CreateWorkspace { name: name.into(), cwd: cwd.clone() }).is_err());
         }
         assert_eq!(server.workspaces.len(), 1);
@@ -227,6 +231,11 @@ mod tests {
         assert_eq!(saved.lock().unwrap().last().unwrap()["workspaces"][1]["name"], "api");
         request(&mut server, Request::RenameWorkspace { workspace: id.clone(), name: "backend".into() }).unwrap();
         assert_eq!(server.workspaces[1].stable_id, id);
+        assert_eq!(server.workspaces[1].name, "backend");
+        assert_eq!(
+            request(&mut server, Request::RenameWorkspace { workspace: id.clone(), name: "\tnew".into() }).unwrap_err(),
+            "Choose a name without control characters."
+        );
         assert_eq!(server.workspaces[1].name, "backend");
         assert!(request(&mut server, Request::RenameWorkspace { workspace: id, name: "test".into() }).is_err());
     }
@@ -264,6 +273,12 @@ mod tests {
                 .unwrap_err()
                 .contains("--name")
         );
+        assert!(
+            request(&mut restored, Request::RestoreWorkspace { workspace: id.clone(), name: Some("new\n".into()) })
+                .unwrap_err()
+                .starts_with("Choose a name without control characters.")
+        );
+        assert_eq!(restored.deleted_workspaces.len(), 1);
         request(&mut restored, Request::RestoreWorkspace { workspace: id.clone(), name: Some("recovered".into()) })
             .unwrap();
         assert!(restored.deleted_workspaces.is_empty());

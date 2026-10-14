@@ -13602,6 +13602,37 @@ fn workspace_commands_keep_identity_sources_and_recover_deletions_after_restart(
 }
 
 #[test]
+fn workspace_commands_reject_control_characters_without_losing_workspaces() {
+    let env = Env::new("workspace-name-rules");
+    env.run(&["workspaces", "create", "original"]);
+    let path = env.root.join("recipe.kdl");
+    std::fs::write(&path, "layout { pane command=\"true\"; }\n").unwrap();
+    for args in [
+        vec!["workspaces", "create", "new\n"],
+        vec!["workspaces", "rename", "original", "\tnew"],
+        vec!["import", path.to_str().unwrap(), "--name", "new\u{85}name", "--yes"],
+    ] {
+        let output = env.try_run(&args);
+        assert!(!output.status.success());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("Choose a name without control characters."));
+    }
+    let list: serde_json::Value = serde_json::from_str(&env.run(&["workspaces", "--json"])).unwrap();
+    assert_eq!(list.as_array().unwrap().len(), 1);
+    assert_eq!(list[0]["name"], "original");
+    let identity = list[0]["id"].clone();
+    env.run(&["workspaces", "delete", "original", "--yes"]);
+    let output = env.try_run(&["workspaces", "restore", "original", "--name", "new\r"]);
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("Choose a name without control characters."));
+    let deleted: serde_json::Value = serde_json::from_str(&env.run(&["workspaces", "--deleted", "--json"])).unwrap();
+    assert_eq!(deleted[0]["id"], identity);
+    env.run(&["workspaces", "restore", "original", "--name", "recovered"]);
+    let list: serde_json::Value = serde_json::from_str(&env.run(&["workspaces", "--json"])).unwrap();
+    assert_eq!(list[0]["id"], identity);
+    assert_eq!(list[0]["name"], "recovered");
+}
+
+#[test]
 fn workspace_commands_create_refuse_collisions_and_require_approval_to_stop_programs() {
     let env = Env::new("workspace-create-cli");
     let out = env.cmd(&["workspaces", "create", "api"]).current_dir(&env.root).output().unwrap();

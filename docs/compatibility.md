@@ -56,7 +56,9 @@ The running server determines the behavior. On a current server, attached client
 0.2.0 and 0.3.0 clients, can use the current lists, forms and actions through the existing
 terminal-input protocol. This includes workspace Close, Delete, Restore, Duplicate, ordering,
 source review and pane editing, as well as account, server and tunnel forms. Renaming a workspace
-leaves KDL files unchanged. Closed layouts and recovery records stay in the current session
+leaves KDL files unchanged. New workspace names reject control characters in forms and CLI
+commands. Existing saved names remain readable; Duplicate and Restore ask for a valid name
+when the old one contains control characters. Closed layouts and recovery records stay in the current session
 state; the legacy session is not rewritten to resemble them.
 
 CLI features that need newer requests are checked separately:
