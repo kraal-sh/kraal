@@ -1101,52 +1101,125 @@ fn layout_survives_a_server_restart() {
 }
 
 #[test]
-fn legacy_workspace_state_migrates_before_opening_and_keeps_its_own_layout() {
+fn legacy_files_stay_unchanged_through_migration_and_workspace_lifecycle() {
     let env = Env::new("wsidentity");
     let source = "// Keep this source\nlayout { pane name=\"source-pane\"; }\n";
     env.workspace("w", source);
     env.run(&["open", "w"]);
     env.run(&["rename", "-p", "source-pane", "personal-pane"]);
+    env.run(&["send", "-p", "personal-pane", "--enter", "echo legacy-$((40+2))"]);
+    env.wait_for_text("personal-pane", "legacy-42");
     env.run(&["kill"]);
-    let path = env.state_file();
-    let mut old: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    let mut old: serde_json::Value = serde_json::from_slice(&std::fs::read(env.state_file()).unwrap()).unwrap();
     old["version"] = serde_json::json!(1);
     old["revision"] = serde_json::json!(1);
     old["workspaces"][0].as_object_mut().unwrap().remove("id");
+    let mut undo = old["workspaces"][0].clone();
+    undo["tabs"][0]["root"]["Pane"]["spec"]["account"] = serde_json::json!("claude:work");
+    old["workspaces"][0]["layout_undo"] = undo;
     let bytes = serde_json::to_vec_pretty(&old).unwrap();
     let path = env.legacy_state_file();
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
     std::fs::write(&path, &bytes).unwrap();
     std::fs::remove_file(env.state_file()).unwrap();
+    let scrollback = env.root.join("state/kraal/scrollback").join(&env.session);
+    std::fs::create_dir_all(scrollback.parent().unwrap()).unwrap();
+    std::fs::rename(env.root.join("state/kraal/scrollback-v2").join(&env.session), &scrollback).unwrap();
+    std::fs::write(scrollback.join("9-9-9.ans"), b"unreferenced output\0\xff").unwrap();
+    let files = || {
+        let mut files: Vec<_> = std::fs::read_dir(&scrollback)
+            .unwrap()
+            .map(|e| {
+                let e = e.unwrap();
+                (e.file_name(), std::fs::read(e.path()).unwrap())
+            })
+            .collect();
+        files.sort();
+        files
+    };
+    let original_scrollback = files();
+    let unchanged = || {
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        assert_eq!(files(), original_scrollback);
+        assert_eq!(std::fs::read_dir(path.parent().unwrap()).unwrap().count(), 1);
+    };
     let stopped = env.run(&["ls"]);
     assert_eq!(stopped.lines().filter(|line| line.starts_with(&env.session)).count(), 1, "{stopped}");
+    unchanged();
+    let accounts = env.root.join("config/kraal/accounts.toml");
+    let original_accounts = "[[account]]\nname = \"work\"\nagent = \"claude\"\nhome = \"~/work\"\n";
+    std::fs::write(&accounts, original_accounts).unwrap();
+    env.run(&["accounts", "rename", "claude:work", "renamed"]);
+    let migrated: serde_json::Value = serde_json::from_slice(&std::fs::read(env.state_file()).unwrap()).unwrap();
+    assert_eq!(migrated["version"], 2);
+    assert!(migrated["workspaces"][0]["layout_undo"]["tabs"][0]["root"]["Pane"]["spec"]["account_id"].is_string());
+    assert_eq!(std::fs::read_to_string(accounts.with_extension("toml.kraal-bak")).unwrap(), original_accounts);
+    unchanged();
     env.run(&["open", "w"]);
+    env.wait_for_text("personal-pane", "legacy-42");
     let list = || serde_json::from_str::<serde_json::Value>(&env.run(&["workspaces", "--json"])).unwrap();
     let id = list()[0]["id"].as_str().unwrap().to_owned();
     assert!(!id.is_empty());
-    assert!(env.run(&["panes"]).contains("personal-pane"), "the saved layout wins over the KDL");
-    let backups = || {
-        std::fs::read_dir(path.parent().unwrap())
-            .unwrap()
-            .map(|e| e.unwrap().path())
-            .filter(|p| p.file_name().unwrap().to_string_lossy().starts_with("wsidentity.json.before-0.4-"))
-            .collect::<Vec<_>>()
-    };
-    assert_eq!(backups().len(), 1);
-    assert_eq!(std::fs::read(backups()[0].join("state.json")).unwrap(), bytes);
+    unchanged();
     env.run(&["kill"]);
+    unchanged();
     env.run(&["open", "w"]);
     assert_eq!(list()[0]["id"], id);
-    assert_eq!(backups().len(), 1);
-    assert_eq!(std::fs::read_to_string(env.root.join("config/kraal/workspaces/w.kdl")).unwrap(), source);
-    assert_eq!(std::fs::read(&path).unwrap(), bytes);
+    env.wait_for_text("personal-pane", "legacy-42");
+    unchanged();
+    let mut client = RawClient::attach(&env, "w");
+    client.wait_for_row("$ ");
+    env.run(&["workspaces", "close", &id, "--yes"]);
+    assert_eq!(list()[0]["open"], false);
+    unchanged();
+    client.wait_for_row("Closed");
+    client.send(b"\x02w\t");
+    click_account_text(&mut client, "Delete");
+    client.wait_for_row("Delete w?");
+    client.send(b"y");
+    client.wait_for_row("Ctrl+Z Undo");
+    assert!(list().as_array().unwrap().is_empty());
+    unchanged();
+    client.send(b"\x1a");
+    client.wait_for_row("Workspace restored");
+    assert_eq!(list()[0]["id"], id);
+    assert_eq!(list()[0]["open"], false);
+    unchanged();
+    env.run(&["workspaces", "delete", &id, "--yes"]);
     env.run(&["kill"]);
+    unchanged();
+    env.run(&["workspaces", "restore", &id]);
+    assert_eq!(list()[0]["id"], id);
+    unchanged();
+    env.run(&["open", "w"]);
+    env.wait_for_text("personal-pane", "legacy-42");
+    env.run(&["send", "-p", "personal-pane", "--enter", "exit"]);
+    wait_until(PATIENCE, "the last pane ending leaves the workspace empty", || list()[0]["panes"] == 0);
+    let empty = list();
+    assert_eq!(empty[0]["open"], true);
+    assert_eq!(empty[0]["tabs"], 0);
+    assert_eq!(empty[0]["id"], id);
+    unchanged();
+    env.run(&["kill"]);
+    unchanged();
+    env.run(&["open", "w"]);
+    assert_eq!(list(), empty, "the empty workspace stays empty after restoring");
+    unchanged();
+    env.run(&["kill"]);
+    unchanged();
     let stopped = env.run(&["ls"]);
     assert_eq!(stopped.lines().filter(|line| line.starts_with(&env.session)).count(), 1, "{stopped}");
     env.run(&["forget"]);
-    assert!(!path.exists() && !env.state_file().exists());
-    assert_eq!(std::fs::read(backups()[0].join("state.json")).unwrap(), bytes);
+    unchanged();
+    assert!(!env.state_file().exists());
+    assert!(!env.root.join("state/kraal/scrollback-v2").join(&env.session).exists());
     assert!(!env.run(&["ls"]).contains(&env.session));
+    assert!(env.run(&["forget"]).contains("nothing saved"));
+    env.run(&["open", "w"]);
+    assert!(env.run(&["panes"]).contains("source-pane"));
+    assert_ne!(list()[0]["id"], id);
+    unchanged();
+    assert_eq!(std::fs::read_to_string(env.root.join("config/kraal/workspaces/w.kdl")).unwrap(), source);
 }
 
 #[test]

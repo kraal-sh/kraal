@@ -556,6 +556,59 @@ fn saved_scrollback(env: &Env) -> std::collections::BTreeMap<PathBuf, Vec<u8>> {
 
 #[test]
 #[ignore = "needs KRAAL_OLD, another release's kraal: tests/compat.sh runs it"]
+fn a_forgotten_legacy_session_cannot_restart_until_its_marker_is_removed() {
+    let (old, this) = (Kraal::old(), Kraal::this());
+    let env = Env::new("compat-forgotten");
+    env.run(&old, &["open", "w"]);
+    env.run(&old, &["send", "-p", "first", "--enter", "echo", "before-$((40+2))"]);
+    env.wait_for_text(&old, "first", "before-42");
+    env.run(&old, &["kill"]);
+    let legacy = env.root.join("state/kraal/sessions").join(format!("{}.json", env.session));
+    let original = std::fs::read(&legacy).unwrap();
+    env.run(&this, &["forget"]);
+    assert_eq!(std::fs::read(&legacy).unwrap(), original);
+    let current = env.root.join("state/kraal/sessions-v2").join(format!("{}.json", env.session));
+    let marker = current.with_extension("forgotten");
+    assert!(marker.is_file());
+    assert!(!current.exists());
+    env.run(&old, &["open", "w"]);
+    env.wait_for_text(&old, "first", "before-42");
+    env.run(&old, &["rename", "-p", "first", "reopened"]);
+    env.run(&old, &["send", "-p", "reopened", "--enter", "echo", "reopened-$((40+2))"]);
+    env.wait_for_text(&old, "reopened", "reopened-42");
+    let pid = env.server_pid();
+    let panes = env.panes(&old);
+    for args in [&["restart"][..], &["restart", "--yes"][..]] {
+        let out = env.try_run(&this, args);
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(!out.status.success(), "restart discarded the forgotten legacy session: {err}");
+        assert!(err.contains(&format!("not restarting session {}", env.session)), "{err}");
+        assert!(err.contains("was forgotten") && err.contains(&*marker.to_string_lossy()), "{err}");
+        assert!(err.contains("instead of this running session's layout and scrollback"), "{err}");
+        assert!(err.contains("remove") && err.contains("import the legacy state"), "{err}");
+        assert!(err.contains(&format!("kraal -s {} kill", env.session)), "{err}");
+        assert!(!String::from_utf8_lossy(&out.stdout).contains("with its layout, scrollback"));
+        assert_eq!(env.server_pid(), pid, "the old server was stopped");
+        assert_eq!(env.panes(&old), panes);
+        assert!(marker.is_file());
+        assert!(!current.exists());
+    }
+    env.run(&old, &["send", "-p", "reopened", "--enter", "echo", "still-$((40+2))"]);
+    env.wait_for_text(&old, "reopened", "still-42");
+    // Follow the recovery guidance to import the old server's latest layout and scrollback.
+    env.run(&this, &["kill"]);
+    std::fs::remove_file(marker).unwrap();
+    env.run(&this, &["open", "w"]);
+    let restored = env.panes(&this);
+    assert_eq!(restored.len(), 1);
+    assert_eq!(restored[0]["name"], "reopened");
+    for text in ["before-42", "reopened-42", "still-42"] {
+        env.wait_for_text(&this, "reopened", text);
+    }
+}
+
+#[test]
+#[ignore = "needs KRAAL_OLD, another release's kraal: tests/compat.sh runs it"]
 fn a_downgrade_restores_the_upgrade_copy_and_cannot_overwrite_new_state() {
     let (old, this) = (Kraal::old(), Kraal::this());
     let env = Env::new("compat-downgrade");
@@ -569,6 +622,17 @@ fn a_downgrade_restores_the_upgrade_copy_and_cannot_overwrite_new_state() {
     env.run(&old, &["kill"]);
     let legacy = env.root.join("state/kraal/sessions").join(format!("{}.json", env.session));
     let original = std::fs::read(&legacy).unwrap();
+    let legacy_scrollback = || {
+        std::fs::read_dir(env.root.join("state/kraal/scrollback").join(&env.session))
+            .unwrap()
+            .map(|e| {
+                let e = e.unwrap();
+                (e.file_name(), std::fs::read(e.path()).unwrap())
+            })
+            .collect::<std::collections::BTreeMap<_, _>>()
+    };
+    let original_scrollback = legacy_scrollback();
+    assert!(!original_scrollback.is_empty());
     env.run(&this, &["open", "w"]);
     env.wait_for_text(&this, "at-upgrade", "upgrade-42");
     env.run(&this, &["rename", "-p", "at-upgrade", "after-upgrade"]);
@@ -583,14 +647,8 @@ fn a_downgrade_restores_the_upgrade_copy_and_cannot_overwrite_new_state() {
     let scrollback = saved_scrollback(&env);
     assert!(!scrollback.is_empty());
     assert_eq!(std::fs::read(&legacy).unwrap(), original);
-    let backups: Vec<_> = std::fs::read_dir(legacy.parent().unwrap())
-        .unwrap()
-        .flatten()
-        .map(|e| e.path())
-        .filter(|p| p.file_name().unwrap().to_string_lossy().starts_with(&format!("{}.json.before-0.4-", env.session)))
-        .collect();
-    assert_eq!(backups.len(), 1);
-    assert_eq!(std::fs::read(backups[0].join("state.json")).unwrap(), original);
+    assert_eq!(legacy_scrollback(), original_scrollback);
+    assert_eq!(std::fs::read_dir(legacy.parent().unwrap()).unwrap().count(), 1);
 
     env.run(&old, &["open", "w"]);
     let panes = env.panes(&old);
@@ -623,7 +681,6 @@ fn a_downgrade_restores_the_upgrade_copy_and_cannot_overwrite_new_state() {
     env.run(&old, &["forget"]);
     assert_eq!(std::fs::read(&current).unwrap(), saved);
     assert_eq!(saved_scrollback(&env), scrollback);
-    assert_eq!(std::fs::read(backups[0].join("state.json")).unwrap(), original);
 
     env.run(&this, &["open", "w"]);
     env.wait_for_text(&this, "after-upgrade", "new-42");

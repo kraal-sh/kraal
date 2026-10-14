@@ -69,23 +69,13 @@ pub(super) fn forget(s: &Session) -> Result<()> {
         bail!("session {session} is running; `kraal kill` it first");
     }
     let p = paths::session_state_path(session);
-    let legacy_path = paths::legacy_session_state_path(session);
-    let legacy = remove_saved(&legacy_path)?;
-    let state = remove_saved(&p)?;
-    let legacy_scrollback_path = paths::state_dir().join("scrollback").join(session);
-    let legacy_scrollback = match std::fs::remove_dir_all(&legacy_scrollback_path) {
-        Ok(()) => true,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
-        Err(e) => return Err(e.into()),
-    };
+    let state = crate::persist::forget(session)?;
     let attachments = crate::attachments::remove(session)?;
     let scrollback = crate::persist::forget_scrollback(session)?;
     let buffers_path = paths::buffers_path(session);
     let buffers = remove_saved(&buffers_path)?;
     for (removed, path) in [
-        (legacy, legacy_path),
         (state, p),
-        (legacy_scrollback, legacy_scrollback_path),
         (scrollback, paths::scrollback_dir(session)),
         (buffers, buffers_path),
         (attachments, crate::attachments::directory(session)),
@@ -94,7 +84,7 @@ pub(super) fn forget(s: &Session) -> Result<()> {
             println!("forgot {}", path.display());
         }
     }
-    if !state && !legacy && !scrollback && !legacy_scrollback && !buffers && !attachments {
+    if !state && !scrollback && !buffers && !attachments {
         println!("nothing saved for {session}");
     }
     Ok(())

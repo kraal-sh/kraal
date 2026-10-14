@@ -3,7 +3,8 @@
 ## Saved files and sessions
 
 Kraal 0.4 migrates sessions and `accounts.toml` from **0.2.0** and **0.3.0** once,
-keeping a copy before conversion. This migration belongs to 0.4 and is removed in **0.5.0**.
+leaving the old session and scrollback files untouched. The accounts file is backed up before
+conversion. This migration belongs to 0.4 and is removed in **0.5.0**.
 Existing workspace KDL and configuration files keep working.
 
 The unreleased `[keys.prefixed]` table is ignored with an unknown-key warning; use
@@ -12,7 +13,7 @@ revision: 2` is refused with `unsupported state revision 2; use a newer kraal`, 
 saved session untouched. Both supported releases wrote revision 1.
 
 Each save writes the current state format only. Kraal does not also write a downgraded copy
-for older versions. Migration backups and the untouched legacy session are recovery copies,
+for older versions. The untouched legacy session and the accounts backup are recovery copies,
 not synchronized views of the current session.
 Session migration preserves the personal layout, identities, source links, account references,
 restore failures and available scrollback. Account migration happens on the next change to the
@@ -31,6 +32,22 @@ Kraal 0.2.0 and 0.3.0 never open these paths. Going back to either finds the ses
 at upgrade, or no saved session if there was none before. Its saves and `kraal forget` cannot
 overwrite the newer session or its scrollback. Changes made after upgrade do not appear in the
 older kraal; changes made while downgraded do not replace the newer state when returning to 0.4.
+
+For recovery or a return to 0.2.0 or 0.3.0, stop the session first. The original files are
+`~/.local/state/kraal/sessions/<session>.json` and
+`~/.local/state/kraal/scrollback/<session>/` (under `$XDG_STATE_HOME/kraal` when set).
+Kraal 0.4 never rewrites or removes them, including on account changes, Close, Delete, Undo,
+or `kraal forget`. No additional session backup is made. An older kraal can still change
+these files; they are not a history of changes made after upgrading.
+
+`kraal forget` removes current state and scrollback. When legacy state exists, it first records
+`sessions-v2/<session>.forgotten` so the next start does not import that state again. To recover
+that legacy session in 0.4, while the session is stopped, move aside any current
+`sessions-v2/<session>.json` and `scrollback-v2/<session>/`, then remove the `.forgotten` marker
+if present. The next start imports the original files again.
+
+`accounts.toml` is rewritten in place, so its original remains in `accounts.toml.kraal-bak`
+beside it. Restore that backup before using the old account configuration with an older kraal.
 
 From 0.5.0, state older than 0.4 will be left untouched and refused with this next step:
 `run kraal 0.4 once first`. The one-way session and account migration is removed in 0.5.0.
@@ -139,7 +156,7 @@ details), and every change to them keeps both directions working:
 
 `tests/compat.sh` downloads 0.2.0 and 0.3.0 and checks their release checksums before running
 `tests/compat.rs` against each real binary. The tests cover clients and servers in both
-directions, migration with retained copies, and downgrade isolation, including saves and
+directions, migration with untouched original files, and downgrade isolation, including saves and
 Forget by the older binary. They also check that old workspace and configuration files keep
 working. CI runs these tests on Linux and macOS; terminal attachment is tested on Linux only.
 
