@@ -75,6 +75,10 @@ pub struct WorkspaceSnap {
     pub definition: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub definition_source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_reviewed: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub layout_undo: Option<Box<WorkspaceSnap>>,
     pub cwd: Option<PathBuf>,
     pub active: usize,
     pub tabs: Vec<TabSnap>,
@@ -94,6 +98,8 @@ pub struct WorkspaceSnap {
     pub sync: crate::server::SyncScope,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub restore_error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_layout: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -130,6 +136,9 @@ impl WorkspaceSnap {
         copy.name = name.into();
         copy.definition = None;
         copy.definition_source = None;
+        copy.source_reviewed = None;
+        copy.layout_undo = None;
+        copy.pending_layout = None;
         copy.closed = true;
         copy.close_pending = None;
         copy.delete_pending = false;
@@ -138,7 +147,10 @@ impl WorkspaceSnap {
         if self.unopened {
             let mut def = crate::workspace::parse_workspace(
                 name,
-                self.definition_source.as_deref().context("the saved source is missing")?,
+                self.pending_layout
+                    .as_deref()
+                    .or(self.definition_source.as_deref())
+                    .context("the saved source is missing")?,
             )?;
             fn pane(p: &mut crate::workspace::PaneDef) {
                 p.start_suspended = true;
@@ -164,7 +176,7 @@ impl WorkspaceSnap {
                 node(&mut tab.root);
                 tab.floating.iter_mut().for_each(pane);
             }
-            copy.definition_source = Some(crate::workspace::to_kdl(&def));
+            copy.pending_layout = Some(crate::workspace::to_kdl(&def));
         }
         fn pane(p: &mut PaneSnap, name: &str) {
             p.agent = None;
@@ -225,6 +237,9 @@ impl WorkspaceSnap {
     }
 
     fn clear_scrollback(&mut self) {
+        if let Some(undo) = &mut self.layout_undo {
+            undo.clear_scrollback();
+        }
         fn clear(node: &mut NodeSnap) {
             match node {
                 NodeSnap::Pane(p) => p.scrollback = None,
@@ -248,8 +263,9 @@ impl WorkspaceSnap {
     pub fn counts(&self) -> (usize, usize) {
         if self.unopened {
             return self
-                .definition_source
+                .pending_layout
                 .as_deref()
+                .or(self.definition_source.as_deref())
                 .and_then(|s| crate::workspace::parse_workspace(&self.name, s).ok())
                 .map_or((0, 0), |d| (d.tabs.len(), d.panes().len()));
         }
@@ -280,7 +296,7 @@ impl WorkspaceSnap {
                 }
             }
         }
-        let mut changed = false;
+        let mut changed = self.layout_undo.as_mut().is_some_and(|w| w.bind_accounts(accounts));
         for tab in &mut self.tabs {
             if let Some(root) = &mut tab.root {
                 changed |= node(root, accounts);
@@ -405,15 +421,17 @@ pub fn snapshot(server: &Server) -> SessionSnapshot {
         .map(|ws| {
             if let Some(kept) = &ws.kept {
                 let mut kept = kept.clone();
-                kept.bind_accounts(&server.accounts);
                 kept.name = ws.name.clone();
                 kept.definition = ws.definition.clone();
-                // An unopened workspace's source is its retained recipe. Export may have
-                // replaced the external file with a portable layout since it was restored.
-                if !kept.unopened {
-                    kept.definition_source = ws.definition_source.clone();
+                // Older snapshots kept the recipe in definition_source.
+                if kept.unopened && kept.pending_layout.is_none() {
+                    kept.pending_layout = kept.definition_source.clone();
                 }
+                kept.definition_source = ws.definition_source.clone();
+                kept.source_reviewed = ws.source_reviewed.clone();
+                kept.layout_undo = ws.layout_undo.clone();
                 kept.delete_pending = ws.delete_pending;
+                kept.bind_accounts(&server.accounts);
                 return kept;
             }
             let mut saved = WorkspaceSnap {
@@ -421,11 +439,14 @@ pub fn snapshot(server: &Server) -> SessionSnapshot {
                 name: ws.name.clone(),
                 definition: ws.definition.clone(),
                 definition_source: ws.definition_source.clone(),
+                source_reviewed: ws.source_reviewed.clone(),
+                layout_undo: ws.layout_undo.clone(),
                 cwd: ws.cwd.clone(),
                 active: ws.active,
                 // Typing is never broadcast after a restart: it starts again only when asked.
                 sync: crate::server::SyncScope::Off,
                 restore_error: None,
+                pending_layout: None,
                 closed: false,
                 empty: false,
                 close_pending: None,
@@ -459,6 +480,9 @@ pub fn snapshot(server: &Server) -> SessionSnapshot {
                     .collect(),
             };
             let has_panes = |t: &&TabSnap| t.root.is_some() || !t.floating.is_empty();
+            if let Some(undo) = &mut saved.layout_undo {
+                undo.bind_accounts(&server.accounts);
+            }
             saved.active = saved.tabs.iter().take(ws.active).filter(has_panes).count();
             saved.tabs.retain(|t| t.root.is_some() || !t.floating.is_empty());
             saved.empty = saved.tabs.is_empty();
@@ -618,7 +642,12 @@ pub fn scrollback_files(snap: &SessionSnapshot) -> HashSet<&str> {
         }
     }
     let mut out = HashSet::new();
-    for tab in snap.workspaces.iter().chain(snap.deleted_workspaces.iter().map(|d| &d.workspace)).flat_map(|w| &w.tabs)
+    for tab in snap
+        .workspaces
+        .iter()
+        .chain(snap.deleted_workspaces.iter().map(|d| &d.workspace))
+        .flat_map(|w| std::iter::successors(Some(w), |w| w.layout_undo.as_deref()))
+        .flat_map(|w| &w.tabs)
     {
         if let Some(root) = &tab.root {
             walk(root, &mut out);
@@ -630,14 +659,15 @@ pub fn scrollback_files(snap: &SessionSnapshot) -> HashSet<&str> {
 
 /// Delete the scrollback files of `session` that `snap`, just written, does not name: those of
 /// panes closed since, and of writes cut short.
-pub fn clean_scrollback(session: &str, snap: &SessionSnapshot) {
-    clean_scrollback_in(&paths::scrollback_dir(session), snap);
+pub fn clean_scrollback(session: &str, snap: &SessionSnapshot, retained: &HashSet<String>) {
+    clean_scrollback_in(&paths::scrollback_dir(session), snap, retained);
 }
 
 /// [`clean_scrollback`] in `dir`: only files kraal makes there, and never through a link that
 /// stands in its place (with files of another directory).
-fn clean_scrollback_in(dir: &Path, snap: &SessionSnapshot) {
-    let keep = scrollback_files(snap);
+pub(crate) fn clean_scrollback_in(dir: &Path, snap: &SessionSnapshot, retained: &HashSet<String>) {
+    let mut keep = scrollback_files(snap);
+    keep.extend(retained.iter().map(String::as_str));
     // Gone once nothing is left in it.
     if matches!(paths::remove_files_in(dir, |name| made_by_kraal(name) && !keep.contains(name)), Ok(0)) {
         let _ = std::fs::remove_dir(dir);
@@ -755,6 +785,9 @@ fn validate(snap: &SessionSnapshot, data: &[u8], missing_ids: bool) -> Result<()
     let state = value.as_object().context("saved session must be an object")?;
     fn workspace(ws: &serde_json::Value) -> Result<()> {
         let ws = ws.as_object().context("saved workspace must be an object")?;
+        if let Some(undo) = ws.get("layout_undo").filter(|v| !v.is_null()) {
+            workspace(undo)?;
+        }
         for tab in ws.get("tabs").and_then(serde_json::Value::as_array).context("saved tabs must be an array")? {
             tab.as_object().context("saved tab must be an object")?;
         }
@@ -932,6 +965,8 @@ pub(crate) fn apply_workspace(server: &mut Server, ws: &WorkspaceSnap) -> Result
     server.workspaces[wi].name = ws.name.clone();
     server.workspaces[wi].cwd = ws.cwd.clone();
     server.workspaces[wi].definition_source = ws.definition_source.clone();
+    server.workspaces[wi].source_reviewed = ws.source_reviewed.clone();
+    server.workspaces[wi].layout_undo = ws.layout_undo.clone();
     server.workspaces[wi].delete_pending = ws.delete_pending;
     if closed {
         server.workspaces[wi].kept = Some(ws.clone());
@@ -1290,8 +1325,25 @@ mod tests {
     fn positional_struct_arrays_refuse_restore_without_changing_state() {
         let source = saved_state();
         let mut workspace = source.clone();
-        workspace["workspaces"][0] =
-            serde_json::json!(["kept", "same", null, null, null, 0, [], false, false, null, false, false, "off", null]);
+        workspace["workspaces"][0] = serde_json::json!([
+            "kept",
+            "same",
+            null,
+            null,
+            null,
+            null,
+            null,
+            0,
+            [],
+            false,
+            false,
+            null,
+            false,
+            false,
+            "off",
+            null,
+            null
+        ]);
         let mut tab = source.clone();
         tab["workspaces"][0]["tabs"][0] = serde_json::json!(["tab 1", null, [], null, false, false, false, null]);
         let deleted = |workspace: serde_json::Value| {
@@ -1571,7 +1623,7 @@ mod tests {
         }
         let link = root.join("link");
         std::os::unix::fs::symlink(&elsewhere, &link).unwrap();
-        clean_scrollback_in(&link, &names(&[]));
+        clean_scrollback_in(&link, &names(&[]), &HashSet::new());
         assert!(elsewhere.join("notes.txt").exists() && elsewhere.join("1-2-3.ans").exists());
         assert!(link.exists());
         // In its own directory: the files of panes gone and of writes cut short go, the others stay.
@@ -1581,7 +1633,7 @@ mod tests {
             std::fs::write(dir.join(f), "text").unwrap();
         }
         std::os::unix::fs::symlink(elsewhere.join("1-2-3.ans"), dir.join("7-8-9.ans")).unwrap();
-        clean_scrollback_in(&dir, &names(&["1-2-3.ans"]));
+        clean_scrollback_in(&dir, &names(&["1-2-3.ans"]), &HashSet::new());
         let mut left: Vec<String> =
             std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
         left.sort();
@@ -1591,7 +1643,7 @@ mod tests {
         let empty = root.join("empty");
         std::fs::create_dir_all(&empty).unwrap();
         std::fs::write(empty.join("1-2-3.ans"), "text").unwrap();
-        clean_scrollback_in(&empty, &names(&[]));
+        clean_scrollback_in(&empty, &names(&[]), &HashSet::new());
         assert!(!empty.exists());
         std::fs::remove_dir_all(&root).unwrap();
     }

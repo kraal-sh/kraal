@@ -12431,11 +12431,14 @@ fn merged_worktrees_are_pruned_however_they_were_merged() {
 }
 
 fn click_account_text(client: &mut RawClient, text: &str) {
-    let rows = client.wait_for_row(text);
+    let clickable = |row: &str| !row.contains("Enter ") && !row.contains('⏎');
+    let rows = client.wait_for_rows(&format!("clickable {text}"), |rows| {
+        rows.iter().any(|row| clickable(row) && row.contains(text))
+    });
     let (x, y) = rows
         .iter()
         .enumerate()
-        .filter(|(_, r)| !r.contains("Enter ") && !r.contains('⏎'))
+        .filter(|(_, r)| clickable(r))
         .filter_map(|(y, r)| r.rfind(text).map(|at| (r[..at].chars().count(), y)))
         .max()
         .unwrap();
@@ -12978,4 +12981,70 @@ fn server_form_save_error_retries_without_losing_fields_and_concurrent_adds_do_n
     client.send(b"\x1b");
     client.wait_for_row("nothing-matches");
     assert_eq!(std::fs::read_to_string(&inventory).unwrap(), saved, "cancel does not save");
+}
+
+#[test]
+fn file_review_rechecks_changes_stops_only_on_confirmation_and_undo_keeps_the_local_layout() {
+    for size in [(80, 24), (124, 36)] {
+        let env = Env::new(&format!("source-review-{}", size.0));
+        env.workspace(
+            "source",
+            "layout { pane name=\"original\" command=\"sh\" { args \"-c\" \"echo running; exec sleep 60\"; }; }",
+        );
+        env.run(&["open", "source"]);
+        env.wait_for_text("original", "running");
+        let path = env.root.join("config/kraal/workspaces/source.kdl");
+        let marker = env.root.join("must-not-run");
+        let mut client = RawClient::attach_sized(&env, Some("source"), size);
+        client.wait_for_message("\"attached\"");
+        std::fs::write(&path, "layout { pane command=\"false\"; }").unwrap();
+        client.send(b"\x02w");
+        client.wait_for_row("File changed");
+        client.send(b"\t");
+        click_account_text(&mut client, "Review");
+        client.wait_for_row("Saved workspace:");
+        let changed = format!(
+            "layout {{ pane command=\"touch\" {{ args \"{}\"; }}; pane command=\"false\"; }}",
+            marker.display()
+        );
+        std::fs::write(&path, &changed).unwrap();
+        click_account_text(&mut client, "Load from file");
+        client.wait_for_row("File changed again");
+        let before: Vec<serde_json::Value> = serde_json::from_str(&env.run(&["panes", "--json"])).unwrap();
+        assert_eq!(before.len(), 1);
+        assert_eq!(before[0]["name"], "original");
+        click_account_text(&mut client, "Load from file");
+        client.wait_for_row("Stop and load");
+        client.send(b"n");
+        client.wait_for_row("Saved workspace:");
+        let cancelled: Vec<serde_json::Value> = serde_json::from_str(&env.run(&["panes", "--json"])).unwrap();
+        assert_eq!(cancelled.len(), 1);
+        assert_eq!(cancelled[0]["id"], before[0]["id"]);
+        click_account_text(&mut client, "Load from file");
+        client.wait_for_row("Stop and load");
+        client.send(b"y");
+        client.wait_for_row("Layout loaded");
+        let panes: Vec<serde_json::Value> = serde_json::from_str(&env.run(&["panes", "--json"])).unwrap();
+        assert_eq!(panes.len(), 2);
+        assert!(panes.iter().all(|p| p["suspended"] == true));
+        assert!(!marker.exists());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), changed);
+        client.send(b"\t");
+        click_account_text(&mut client, "Undo load");
+        client.wait_for_row("Layout restored");
+        let workspaces: Vec<serde_json::Value> = serde_json::from_str(&env.run(&["workspaces", "--json"])).unwrap();
+        assert_eq!(workspaces.len(), 1);
+        assert_eq!(workspaces[0]["open"], false);
+        assert_eq!(workspaces[0]["panes"], 1);
+        env.run(&["kill"]);
+        drop(client);
+        std::fs::remove_file(&path).unwrap();
+        env.run(&["open", "source"]);
+        let panes: Vec<serde_json::Value> = serde_json::from_str(&env.run(&["panes", "--json"])).unwrap();
+        assert_eq!(panes.len(), 1);
+        assert_eq!(panes[0]["name"], "original");
+        assert_eq!(panes[0]["suspended"], true);
+        assert!(!path.exists());
+        assert!(!marker.exists());
+    }
 }

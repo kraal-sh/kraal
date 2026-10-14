@@ -41,6 +41,7 @@ mod ui;
 mod workspace_files;
 mod workspace_lifecycle;
 mod workspace_order;
+mod workspace_sources;
 mod workspace_ui;
 mod worktrees;
 
@@ -286,6 +287,9 @@ pub struct Workspace {
     pub definition_inode: Option<(u64, u64)>,
     /// The exact KDL loaded or last saved, independent of later directory scans.
     pub definition_source: Option<String>,
+    pub source_reviewed: Option<String>,
+    pub layout_undo: Option<Box<persist::WorkspaceSnap>>,
+    pub source_status: Option<&'static str>,
     pub cwd: Option<PathBuf>,
     pub sync: SyncScope,
     /// Panes marked for typing in sync.
@@ -304,6 +308,8 @@ impl Workspace {
         self.definition_inode = path.and_then(crate::paths::file_id);
         if path.is_none() {
             self.definition_source = None;
+            self.source_reviewed = None;
+            self.source_status = None;
         }
     }
 

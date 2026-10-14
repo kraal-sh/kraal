@@ -488,7 +488,7 @@ persistence as soon as the save succeeds.
 The comparison uses the loaded or last saved contents, not just a timestamp, and survives a
 session restart. A session saved by an older version has no recorded contents, so its first
 replacement needs confirmation. Directory scans and renames do not accept external edits on
-your behalf. A missing source can still be recreated; a dangling symlink is refused.
+your behalf. An explicit export can recreate a missing source; a dangling symlink is refused.
 
 Saves from current kraal sessions use the same lock for a destination, including symlink
 aliases. A replacement first moves the existing file aside, checks those exact contents, and
@@ -499,3 +499,40 @@ the old file if the destination is free; otherwise it keeps both versions and re
 recovery file to inspect before retrying. After a crash during replacement, the old file is in
 `.kdl.bak` or a sibling named `.<file>.<pid>.<number>.recover`; move it back if the destination is
 missing. Recovery files are never removed by temporary-file cleanup.
+
+### Reviewing changes to a source file
+
+An external edit never replaces your saved layout or stops its programs. The Workspaces list
+and sidebar show **File changed**, **File error**, or **Source file missing** on the saved
+workspace. **Open** still uses your saved layout. A missing source is never recreated by an
+automatic save.
+
+Choose **Review** from the notification or the workspace's Actions. **Load from file** in Actions
+opens the same review, even when the source is unchanged. It is available only for a workspace
+with a source. Review shows the file name, saved and file tab and pane counts, and import warnings.
+**Cancel** is selected first. **Keep layout** keeps your personal layout and acknowledges only the
+file version reviewed. A later edit is reported again. It never grants permission to overwrite
+that file on export.
+
+**Load from file** keeps the previous local layout for Undo and saves the replacement. If programs
+or jobs need to stop, **Stop and load** lists them and requires confirmation. A file edited again
+or a changed set of programs requires another review before anything stops. New commands,
+including agents, wait for Enter. An open workspace opens the loaded layout; a closed workspace
+stays closed. Your workspace keeps its name, identity, source association, and list position.
+
+The **Undo** notification and **Undo load** in Actions restore the previous layout as **Closed**.
+Open it when ready. Undo does not restart stopped processes or recover their unsaved work.
+One previous layout is retained per workspace, including across restart. Another successful load
+replaces that Undo with the layout it replaced. Undo never edits the source file.
+
+An invalid or missing source opens **File error** with the parser or read diagnosis and
+**Open saved**. **Details** shows the full path and wrapped error, with scrolling when needed.
+Fix the source and choose **Retry** there to read it again. Invalid files not yet imported open
+the existing **Add workspace** form, keeping the file and name for Retry. No workspace is added
+until the file is valid and the import succeeds. If a load refers to an unavailable account,
+correct its reference in the file or add the account in Accounts, then review again.
+
+If saving fails before programs stop, they remain running. If a later step fails, the previous
+layout stays saved and the message gives the next action. An unfinished Close must be completed
+before retrying Load. If the replacement is saved but cannot open, retry **Open** or use
+**Undo load** from Actions.

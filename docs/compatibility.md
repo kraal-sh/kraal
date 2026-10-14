@@ -86,6 +86,14 @@ Remote attach still marks an existing matching entry for agent watching, but sug
 explicit save for an unknown connection. Older running servers keep their existing discovery
 behavior until restarted. No session format or legacy state path changes are needed.
 
+Review, Keep layout, Load from file and Undo load use the existing attached-terminal input
+protocol. Optional `source_reviewed`, `pending_layout` and `layout_undo` fields in `sessions-v2`
+retain the acknowledged source revision, prepared commands that wait for Enter, and the previous
+local layout. Missing fields mean no acknowledgement, pending load or Undo. Source KDL,
+configuration, protocol messages and the 0.2.0 and 0.3.0 state paths remain unchanged. Clients
+from those releases can use these actions on a current server. An older running server keeps
+its existing source-file behavior until restarted.
+
 ## For contributors: how the protocol changes
 
 The client and the server exchange JSON messages (`src/protocol.rs`, whose comments hold the

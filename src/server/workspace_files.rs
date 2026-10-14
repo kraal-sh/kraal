@@ -19,6 +19,10 @@ impl Server {
         {
             anyhow::bail!("This file is already used by {}. Fix its restore error and restart the session.", ws.name);
         }
+        self.preview_source(path)
+    }
+
+    pub(super) fn preview_source(&self, path: &Path) -> Result<ImportPreview> {
         let mut preview = ImportPreview::read(path)?;
         for pane in preview.definition.panes() {
             if pane.command.is_some() || !matches!(pane.kind, workspace::PaneKind::Terminal) {
@@ -91,16 +95,8 @@ impl Server {
                     pane.account_id = Some(a.id);
                 }
             }
-            // Legacy agent hints were shell input; represent them as a waiting command on import.
-            if let Some(agent) = &pane.agent
-                && accounts::agent_kind(agent.split(':').next().unwrap()).is_none()
-                && pane.command.is_none()
-            {
-                pane.command = Some("sh".into());
-                pane.args = vec!["-c".into(), agent.clone()];
-                pane.agent = None;
-            }
         });
+        suspend_import(&mut def);
         let panes = self.panes.keys().copied().collect();
         let workspaces = self.workspaces.iter().map(|w| w.id).collect::<Vec<_>>();
         let removed = self.removed_sources.clone();
@@ -133,6 +129,21 @@ impl Server {
         self.mark_dirty();
         Ok(id)
     }
+}
+
+pub(super) fn suspend_import(def: &mut workspace::WorkspaceDef) {
+    def.visit_panes(|pane| {
+        pane.start_suspended = true;
+        // Legacy agent hints were shell input; represent them as a waiting command on import.
+        if let Some(agent) = &pane.agent
+            && accounts::agent_kind(agent.split(':').next().unwrap()).is_none()
+            && pane.command.is_none()
+        {
+            pane.command = Some("sh".into());
+            pane.args = vec!["-c".into(), agent.clone()];
+            pane.agent = None;
+        }
+    });
 }
 
 #[cfg(test)]

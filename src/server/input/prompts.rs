@@ -130,6 +130,7 @@ impl Server {
             | PromptAction::AddServer
             | PromptAction::NewWorkspace
             | PromptAction::RestoreWorkspace(_)
+            | PromptAction::ReviewWorkspace(_)
             | PromptAction::ImportWorkspace
             | PromptAction::ExportWorkspace(_) => {
                 unreachable!("answered in submit_prompt")
@@ -320,6 +321,15 @@ impl Server {
                 }
                 return Mode::Normal;
             }
+            ConfirmAction::LoadWorkspace { prompt, inventory } => {
+                return if yes {
+                    self.load_source_form(id, prompt, Some(inventory))
+                } else if prompt.workspace_form.as_ref().unwrap().undo {
+                    self.workspace_form_back(id, prompt, None)
+                } else {
+                    Mode::Prompt(prompt)
+                };
+            }
             ConfirmAction::ApplyPane(form) => {
                 return if yes { self.submit_pane_form(id, *form, true) } else { Mode::PaneForm(form) };
             }
@@ -408,6 +418,7 @@ impl Server {
             true => {
                 match action {
                     ConfirmAction::RetrySsh(_)
+                    | ConfirmAction::LoadWorkspace { .. }
                     | ConfirmAction::RemoveAccount(_)
                     | ConfirmAction::ApplyPane(_)
                     | ConfirmAction::ReplaceWorkspaceFile { .. }

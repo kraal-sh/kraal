@@ -1,6 +1,6 @@
 //! Saving the session to disk and bringing it back after a restart.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -29,7 +29,7 @@ pub struct CloseInventory {
 }
 
 #[derive(Debug, PartialEq, Eq)]
-pub(super) struct ClosePane {
+pub struct ClosePane {
     id: PaneId,
     leader: Option<CloseProcess>,
     foreground: Option<CloseProcess>,
@@ -368,6 +368,8 @@ impl Server {
 
 /// What the writer thread does, in the order asked.
 pub(super) enum Persist {
+    /// Keep rollback files until the replacement or its rollback has been written.
+    RetainScrollback(HashSet<String>),
     Save(String, SessionSnapshot),
     /// A pane's scrollback, into its file (the state names it once written): the latest text
     /// [`Persisting`] has for that file, if an earlier job did not write it already.
@@ -443,6 +445,7 @@ pub(super) fn spawn_persister(
     crate::threads::named("persist").spawn(move || {
         let _held = held;
         let mut last: Result<(), String> = Ok(());
+        let mut retained = HashSet::new();
         // Scrollback files whose last write failed, and why.
         let mut failing: HashMap<String, String> = HashMap::new();
         // Why the last write of the paste buffers' file failed.
@@ -452,6 +455,7 @@ pub(super) fn spawn_persister(
             queue.extend(rx.try_iter());
             for (i, job) in queue.iter().enumerate() {
                 match job {
+                    Persist::RetainScrollback(files) => retained = files.clone(),
                     Persist::Save(session, snap) => {
                         if let Ok(mut s) = shared.lock() {
                             s.saves = s.saves.saturating_sub(1);
@@ -470,7 +474,7 @@ pub(super) fn spawn_persister(
                             }
                             // The files it does not name are no pane's any more.
                             Ok(()) => {
-                                persist::clean_scrollback(session, snap);
+                                persist::clean_scrollback(session, snap, &retained);
                                 let named = persist::scrollback_files(snap);
                                 failing.retain(|f, _| named.contains(f.as_str()));
                             }
