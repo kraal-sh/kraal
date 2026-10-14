@@ -369,18 +369,48 @@ fn list_definitions(session: &str, json: bool) -> Result<()> {
 }
 
 fn publish_import(s: &Session, path: PathBuf, source: String, expected: paths::FileRevision) -> Result<()> {
+    use std::io::ErrorKind;
+    use std::time::{Duration, Instant};
+
     let _not_restarting = client::keep_from_restart(&s.name)?;
-    if let Some(_held) = paths::SessionLock::acquire(&s.name).context("locking the session")?
-        && paths::nobody_listens(&s.socket())
-    {
-        let saved = crate::persist::inspect(&s.name)?;
-        let sources =
-            saved.iter().flat_map(|s| &s.workspaces).filter_map(|w| Some((w.name.as_str(), w.definition.as_deref()?)));
-        return workspace::publish_import(&path, &source, &expected, sources);
-    }
-    match s.request(Request::PublishWorkspaceFile { path, source, expected })? {
-        Response::Ok => Ok(()),
-        _ => bail!("unexpected answer"),
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let held = paths::SessionLock::acquire(&s.name).context("locking the session")?;
+        let socket = s.socket();
+        if let Some(_held) = held
+            && paths::nobody_listens(&socket)
+        {
+            let saved = crate::persist::inspect(&s.name)?;
+            let sources = saved
+                .iter()
+                .flat_map(|s| &s.workspaces)
+                .filter_map(|w| Some((w.name.as_str(), w.definition.as_deref()?)));
+            return workspace::publish_import(&path, &source, &expected, sources);
+        }
+        match paths::connect_now(&socket) {
+            Ok(stream) => {
+                stream.set_nonblocking(false)?;
+                return match client::request_connected(
+                    &socket,
+                    stream,
+                    Request::PublishWorkspaceFile { path, source, expected },
+                )? {
+                    Response::Ok => Ok(()),
+                    _ => bail!("unexpected answer"),
+                };
+            }
+            Err(e)
+                if matches!(e.kind(), ErrorKind::NotFound | ErrorKind::ConnectionRefused | ErrorKind::WouldBlock) => {}
+            Err(e) => return Err(e).context("connecting to the session"),
+        }
+        // A lock can outlive its owner until a forked child closes the inherited descriptor.
+        // A server starting or stopping also holds it without a reachable socket.
+        anyhow::ensure!(
+            Instant::now() < deadline,
+            "session {} is busy and no server is reachable; no file was changed. Retry the import",
+            s.name
+        );
+        std::thread::sleep(Duration::from_millis(20));
     }
 }
 
@@ -439,6 +469,41 @@ mod tests {
     use super::*;
 
     #[test]
+    fn publication_survives_a_peer_disconnect_before_writing() {
+        use std::os::unix::net::UnixListener;
+
+        if !crate::testing::in_own_process("cli::session::tests::publication_survives_a_peer_disconnect_before_writing")
+        {
+            return;
+        }
+        let dir = paths::private_runtime_dir().unwrap();
+        let socket = dir.join("publication.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let stream = paths::connect_now(&socket).unwrap();
+        let (peer, _) = listener.accept().unwrap();
+        // The peer is gone before any request bytes are written: no scheduling race can
+        // turn this into a disconnect after the complete request was sent.
+        drop(peer);
+        drop(listener);
+        let path = dir.join("copy.kdl");
+        let expected = paths::FileRevision::read(&path).unwrap();
+        // SAFETY: this test runs alone in its own process. Match the import command's
+        // disposition, so a socket that does not suppress SIGPIPE kills this child.
+        let previous = unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL) };
+        assert_ne!(previous, libc::SIG_ERR);
+        let result = client::request_connected(
+            &socket,
+            stream,
+            Request::PublishWorkspaceFile { path, source: "layout { pane; }".into(), expected },
+        );
+        // SAFETY: restore this process's disposition after the write.
+        assert_ne!(unsafe { libc::signal(libc::SIGPIPE, previous) }, libc::SIG_ERR);
+        let error = result.unwrap_err();
+        assert_eq!(error.downcast_ref::<std::io::Error>().unwrap().kind(), std::io::ErrorKind::BrokenPipe);
+        std::fs::remove_file(socket).unwrap();
+    }
+
+    #[test]
     fn batch_publication_cannot_bypass_a_held_session_lock() {
         let name = format!("batch-publication-{}", std::process::id());
         let session = Session { explicit: Some(name.clone()), name };
@@ -450,7 +515,8 @@ mod tests {
         std::fs::write(&path, original).unwrap();
         let expected = paths::FileRevision::read(&path).unwrap();
         let held = paths::SessionLock::acquire(&session.name).unwrap().unwrap();
-        assert!(publish_import(&session, path.clone(), replacement.into(), expected.clone()).is_err());
+        let error = publish_import(&session, path.clone(), replacement.into(), expected.clone()).unwrap_err();
+        assert!(error.to_string().contains("no file was changed. Retry the import"), "{error:#}");
         assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
         assert!(!path.with_extension("kdl.bak").exists());
         drop(held);
@@ -458,5 +524,114 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&path).unwrap(), replacement);
         assert_eq!(std::fs::read_to_string(path.with_extension("kdl.bak")).unwrap(), original);
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn batch_publication_waits_for_an_inherited_runtime_lock() {
+        use std::sync::mpsc;
+        use std::time::{Duration, Instant};
+
+        let name = format!("batch-inherited-{}", std::process::id());
+        let session = Session { explicit: Some(name.clone()), name };
+        let dir = std::env::temp_dir().join(format!("kraal-{}", session.name));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("copy.kdl");
+        let original = "layout { pane command=\"true\"; }";
+        let replacement = "layout { pane command=\"false\"; }";
+        std::fs::write(&path, original).unwrap();
+        let expected = paths::FileRevision::read(&path).unwrap();
+        paths::private_runtime_dir().unwrap();
+        let runtime = paths::runtime_dir().join(format!("{}.lock", session.name));
+        let held = std::fs::File::create(&runtime).unwrap();
+        assert!(paths::try_lock(&held).unwrap());
+        // A duplicate shares the open file and its flock, just as a forked child does before
+        // exec. Keep that window open until the publisher has tried to use the session.
+        let inherited = held.try_clone().unwrap();
+        drop(held);
+        assert!(paths::SessionLock::acquire(&session.name).unwrap().is_none());
+        assert!(paths::nobody_listens(&session.socket()));
+        std::thread::scope(|scope| {
+            let (sent, received) = mpsc::channel();
+            let (session, path) = (&session, &path);
+            scope.spawn(move || {
+                sent.send(publish_import(session, path.clone(), replacement.into(), expected)).unwrap();
+            });
+            let restart = paths::state_dir().join(format!("{}.restart", session.name));
+            let start = Instant::now();
+            while !restart.exists() {
+                assert!(
+                    matches!(received.try_recv(), Err(mpsc::TryRecvError::Empty)),
+                    "publication ended before waiting"
+                );
+                assert!(start.elapsed() < crate::testing::PATIENCE, "publication never started");
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            assert!(matches!(received.recv_timeout(Duration::from_millis(100)), Err(mpsc::RecvTimeoutError::Timeout)));
+            assert_eq!(std::fs::read_to_string(path).unwrap(), original);
+            assert!(!path.with_extension("kdl.bak").exists());
+            drop(inherited);
+            received.recv_timeout(crate::testing::PATIENCE).unwrap().unwrap();
+        });
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), replacement);
+        assert_eq!(std::fs::read_to_string(path.with_extension("kdl.bak")).unwrap(), original);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn batch_publication_keeps_the_servers_answer_and_never_replays_a_sent_request() {
+        use std::os::unix::net::UnixListener;
+
+        for answer in [Some(Ok(Response::Ok)), Some(Err("workspace owns this file".to_string())), None] {
+            let tag = match &answer {
+                Some(Ok(_)) => "ok",
+                Some(Err(_)) => "refused",
+                None => "lost",
+            };
+            let name = format!("batch-{tag}-{}", std::process::id());
+            let session = Session { explicit: Some(name.clone()), name };
+            let dir = std::env::temp_dir().join(format!("kraal-{}", session.name));
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = dir.join("copy.kdl");
+            let original = "layout { pane command=\"true\"; }";
+            let replacement = "layout { pane command=\"false\"; }";
+            std::fs::write(&path, original).unwrap();
+            let expected = paths::FileRevision::read(&path).unwrap();
+            let held = paths::SessionLock::acquire(&session.name).unwrap().unwrap();
+            let socket = session.socket();
+            let listener = UnixListener::bind(&socket).unwrap();
+            std::thread::scope(|scope| {
+                let server = scope.spawn(|| {
+                    let (mut stream, _) = listener.accept().unwrap();
+                    let (kind, bytes) = protocol::read_frame(&mut stream).unwrap().unwrap();
+                    assert_eq!(kind, protocol::JSON);
+                    let protocol::ClientMsg::Request { request, .. } = serde_json::from_slice(&bytes).unwrap() else {
+                        panic!("not a request");
+                    };
+                    let Request::PublishWorkspaceFile { path: sent_path, source, expected: sent_expected } = request
+                    else {
+                        panic!("not a publication");
+                    };
+                    assert_eq!(sent_path, path);
+                    assert_eq!(source, replacement);
+                    assert_eq!(sent_expected, expected);
+                    drop(listener);
+                    std::fs::remove_file(&socket).unwrap();
+                    drop(held);
+                    if let Some(result) = answer.clone() {
+                        protocol::write_json(&mut stream, &protocol::ServerMsg::Response { result }).unwrap();
+                    }
+                });
+                let result = publish_import(&session, path.clone(), replacement.into(), expected.clone());
+                match &answer {
+                    Some(Ok(_)) => result.unwrap(),
+                    Some(Err(why)) => assert_eq!(result.unwrap_err().to_string(), *why),
+                    None => assert!(result.is_err()),
+                }
+                server.join().unwrap();
+            });
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+            assert!(!path.with_extension("kdl.bak").exists());
+            std::fs::remove_dir_all(dir).unwrap();
+        }
     }
 }

@@ -292,7 +292,15 @@ pub fn request(socket: &Path, req: Request) -> Result<Response> {
             bail!(server.cannot(feature.does));
         }
     }
-    let mut stream = UnixStream::connect(socket).with_context(no_server)?;
+    let stream = UnixStream::connect(socket).with_context(no_server)?;
+    request_connected(socket, stream, req)
+}
+
+/// Send after any required feature check, on an established connection: a caller choosing
+/// between a server and a stopped session must not reconnect and mistake a failed request for
+/// a server that was never there. Once sent, the request may have changed the server's files.
+pub(crate) fn request_connected(socket: &Path, mut stream: UnixStream, req: Request) -> Result<Response> {
+    let needs = req.needs();
     let msg = ClientMsg::request(req);
     match exchange(&mut stream, &msg)? {
         Ok(answer) => Ok(answer),

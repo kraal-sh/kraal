@@ -570,8 +570,8 @@ pub fn locked_within<T>(path: &Path, limit: std::time::Duration, f: impl FnOnce(
     Ok(out)
 }
 
-/// Lock `file` for this process alone, without waiting: false when another holds it. The lock
-/// goes when the file is closed, by this process or as it ends, however it ends.
+/// Lock `file` exclusively, without waiting: false when another open file holds it. The lock
+/// goes when its last descriptor closes, including duplicates inherited by a forked child.
 pub(crate) fn try_lock(file: &std::fs::File) -> std::io::Result<bool> {
     use std::os::fd::AsRawFd;
     loop {
@@ -915,6 +915,23 @@ pub fn connect_now(socket: &Path) -> std::io::Result<std::os::unix::net::UnixStr
     }
     // SAFETY: a descriptor just made, owned by nothing else.
     let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+    #[cfg(target_os = "macos")]
+    {
+        let enabled: libc::c_int = 1;
+        // SAFETY: a descriptor we own and a pointer to an integer of the stated size.
+        if unsafe {
+            libc::setsockopt(
+                fd.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_NOSIGPIPE,
+                (&raw const enabled).cast(),
+                std::mem::size_of_val(&enabled) as libc::socklen_t,
+            )
+        } != 0
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
     // SAFETY: flags of a descriptor we own.
     unsafe {
         libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC);
@@ -1855,6 +1872,33 @@ mod tests {
         assert!(is_file_at(&runtime_lock, &lock(&here)));
         drop(once_free(|| hold(&here)));
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_session_stays_held_until_its_inherited_runtime_descriptor_closes() {
+        let dir = std::env::temp_dir().join(format!("kraal-inherited-lock-{}", std::process::id()));
+        let (state, runtime) = (dir.join("state"), dir.join("runtime"));
+        for d in [&state, &runtime] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        let state = state.join("main.lock");
+        let runtime = runtime.join("main.lock");
+        let holder = Holder { pid: 4242, host: "box".into(), runtime: dir.join("runtime") };
+        let hold = || SessionLock::acquire_at(state.clone(), runtime.clone(), &holder, try_lock);
+        let held = hold().unwrap().unwrap();
+        // dup and fork share the open file and its flock. An independent open only keeps the
+        // inode alive, and must not keep the next holder out once the duplicate closes.
+        let inherited = held._runtime.as_ref().unwrap().file.try_clone().unwrap();
+        let opened = std::fs::File::open(&runtime).unwrap();
+        drop(held);
+        assert!(!state.exists());
+        assert!(is_file_at(&opened, &runtime));
+        assert!(hold().unwrap().is_none(), "the inherited descriptor still holds the runtime lock");
+        assert!(!state.exists(), "a failed acquisition left its state lock behind");
+        drop(inherited);
+        drop(once_free(hold));
+        assert!(is_file_at(&opened, &runtime));
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     /// Where no lock can be had in the state directory (its file system locks no file, or the

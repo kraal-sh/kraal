@@ -435,6 +435,11 @@ allows replacement with a `.kdl.bak` backup; files owned by a retained workspace
 are skipped. It copies recipes without opening workspaces. Use **From file...** or `kraal import`
 for the preview and waiting-command workflow.
 
+Batch imports use the running server, or check saved workspace ownership while holding the
+stopped session. If the session is busy without a reachable server, the import waits briefly
+for it to become available. If it stays busy, that file is skipped unchanged with a message
+to retry the import.
+
 ### Exporting a layout
 
 **Export layout** is in a saved workspace's Tab actions, also while closed. The historical
