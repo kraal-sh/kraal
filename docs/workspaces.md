@@ -358,7 +358,12 @@ source paths, recorded source contents, account identities and initial order. It
 sources by name or rewrite KDL files, their backups, or accounts. Existing name collisions stay;
 a command that cannot choose one workspace by name asks you to select and rename a workspace.
 
-Before conversion, kraal creates a private directory beside the session file:
+Separately, changing accounts in 0.4 binds old account names in saved sessions and readable KDL files
+before writing the account change. KDL files gain account identities while keeping their labels and
+formatting. This temporary migration is removed in 0.5.0; binding accounts in retained recipes during
+ordinary workspace operations remains. See [Accounts](agents.md#accounts).
+
+Before session conversion, kraal creates a private directory beside the session file:
 `~/.local/state/kraal/sessions/<session>.json.before-0.4-<unique-id>/`.
 It contains the exact old `state.json` and copies of the available referenced files under
 `scrollback/`. A backup without `state.json` was interrupted and is incomplete. Completed

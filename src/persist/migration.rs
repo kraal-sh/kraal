@@ -1,4 +1,4 @@
-//! Migration from pre-0.4 state. Remove this module in 0.5.0.
+//! Temporary 0.4 session migration. See `accounts::migration` for the 0.5.0 removal boundary.
 
 use super::*;
 
@@ -118,9 +118,139 @@ fn backup_state(path: &Path, data: &[u8], snap: &SessionSnapshot, scrollback: &P
     Ok(backup)
 }
 
+/// Closed sessions still carry old names until their next restore. Bind them while the
+/// accounts file still tells what those names meant; a running server binds its own panes.
+pub(crate) fn bind_accounts(accounts: &crate::accounts::Accounts) -> Result<()> {
+    for session in paths::saved_sessions().context("reading saved sessions to migrate accounts")? {
+        let Some(_lock) = paths::SessionLock::acquire(&session)? else { continue };
+        // 0.2.0 does not hold a session lock. Its listening socket still owns this snapshot.
+        if !paths::nobody_listens(&paths::socket_path(&session)) {
+            continue;
+        }
+        match inspect(&session) {
+            Ok(Some(_)) => {}
+            Err(e) if e.is::<std::io::Error>() => return Err(e),
+            _ => continue,
+        }
+        if load(&session)?.is_none() {
+            continue;
+        }
+        let path = paths::session_state_path(&session);
+        let source = std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
+        let Some(updated) = bind_saved_accounts(&source, accounts)? else { continue };
+        paths::write_private(&path, &updated).with_context(|| format!("migrating accounts in {}", path.display()))?;
+    }
+    Ok(())
+}
+
+pub(super) fn bind_saved_accounts(source: &[u8], accounts: &crate::accounts::Accounts) -> Result<Option<Vec<u8>>> {
+    // An unreadable session is left for the restore path, which already explains how to recover it.
+    let Ok(snapshot) = serde_json::from_slice::<SessionSnapshot>(source) else { return Ok(None) };
+    if snapshot.version != VERSION {
+        return Ok(None);
+    }
+    let mut value: serde_json::Value = serde_json::from_slice(source)?;
+    fn pane(value: &mut serde_json::Value, accounts: &crate::accounts::Accounts) -> bool {
+        let Some(spec) = value.get_mut("spec") else { return false };
+        let Ok(mut pane) = serde_json::from_value::<PaneSpec>(spec.clone()) else { return false };
+        if pane.account.is_none() || pane.account_id.is_some() {
+            return false;
+        }
+        accounts.bind_pane(&mut pane);
+        let Some(spec) = spec.as_object_mut() else { return false };
+        spec.insert("account_id".into(), serde_json::json!(pane.account_id));
+        spec.insert("account".into(), serde_json::json!(pane.account));
+        spec.insert("env".into(), serde_json::json!(pane.env));
+        true
+    }
+    fn node(value: &mut serde_json::Value, accounts: &crate::accounts::Accounts) -> bool {
+        if let Some(p) = value.get_mut("Pane") {
+            return pane(p, accounts);
+        }
+        let mut changed = false;
+        if let Some(children) =
+            value.get_mut("Split").and_then(|s| s.get_mut("children")).and_then(serde_json::Value::as_array_mut)
+        {
+            for child in children {
+                if let Some(child) = child.get_mut(0) {
+                    changed |= node(child, accounts);
+                }
+            }
+        }
+        changed
+    }
+    fn workspace(value: &mut serde_json::Value, accounts: &crate::accounts::Accounts) -> bool {
+        let mut changed = value.get_mut("layout_undo").is_some_and(|undo| workspace(undo, accounts));
+        for tab in value.get_mut("tabs").and_then(serde_json::Value::as_array_mut).into_iter().flatten() {
+            if let Some(root) = tab.get_mut("root") {
+                changed |= node(root, accounts);
+            }
+            for floating in tab.get_mut("floating").and_then(serde_json::Value::as_array_mut).into_iter().flatten() {
+                if let Some(floating) = floating.get_mut(0) {
+                    changed |= pane(floating, accounts);
+                }
+            }
+        }
+        changed
+    }
+    let mut changed = false;
+    for saved in value.get_mut("workspaces").and_then(serde_json::Value::as_array_mut).into_iter().flatten() {
+        changed |= workspace(saved, accounts);
+    }
+    for deleted in value.get_mut("deleted_workspaces").and_then(serde_json::Value::as_array_mut).into_iter().flatten() {
+        if let Some(saved) = deleted.get_mut("workspace") {
+            changed |= workspace(saved, accounts);
+        }
+    }
+    if changed { Ok(Some(serde_json::to_vec_pretty(&value)?)) } else { Ok(None) }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn saved_account_names_gain_identity_without_losing_unknown_fields() {
+        let pane = serde_json::json!({
+            "name": "agent", "agent": "claude", "agent_session": null,
+            "future": "kept", "spec": { "account": "claude:default", "future": [1, 2] }
+        });
+        let source = serde_json::json!({ "version": VERSION, "future": { "spec": { "account": "claude:default" } }, "workspaces": [{
+            "name": "w", "definition": null, "cwd": null, "active": 0, "tabs": [{
+                "name": "t", "root": { "Pane": pane }, "floating": [], "focus": 0,
+                "show_floating": false, "zoomed": false, "sync": false
+            }]
+        }] });
+        let accounts = crate::accounts::Accounts::empty();
+        let bytes = bind_saved_accounts(&serde_json::to_vec(&source).unwrap(), &accounts).unwrap().unwrap();
+        let mut migrated: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let spec = &mut migrated["workspaces"][0]["tabs"][0]["root"]["Pane"]["spec"];
+        assert_eq!(spec["account_id"], "default-claude");
+        assert_eq!(spec["account"], "claude:default");
+        assert!(bind_saved_accounts(&bytes, &accounts).unwrap().is_none(), "an identity is never rebound");
+        spec.as_object_mut().unwrap().remove("account_id");
+        spec.as_object_mut().unwrap().remove("env");
+        assert_eq!(migrated, source, "unknown fields and all other state survive");
+        assert!(bind_saved_accounts(b"{broken", &accounts).unwrap().is_none());
+        let mut future = source.clone();
+        future["version"] = serde_json::json!(VERSION + 1);
+        assert!(bind_saved_accounts(&serde_json::to_vec(&future).unwrap(), &accounts).unwrap().is_none());
+        let restored: SessionSnapshot = serde_json::from_slice(&bytes).unwrap();
+        let NodeSnap::Pane(pane) = restored.workspaces[0].tabs[0].root.as_ref().unwrap() else { panic!("pane") };
+        assert_eq!(pane.spec.account_id.as_deref(), Some("default-claude"));
+        let mut deleted = source.clone();
+        deleted["deleted_workspaces"] = serde_json::json!([{
+            "workspace": source["workspaces"][0], "position": 0, "deleted_at": 1
+        }]);
+        deleted["workspaces"] = serde_json::json!([]);
+        let bytes = bind_saved_accounts(&serde_json::to_vec(&deleted).unwrap(), &accounts).unwrap().unwrap();
+        let migrated: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            migrated["deleted_workspaces"][0]["workspace"]["tabs"][0]["root"]["Pane"]["spec"]["account_id"],
+            "default-claude"
+        );
+        assert_eq!(migrated["future"], source["future"]);
+    }
 
     fn legacy_state() -> serde_json::Value {
         serde_json::json!({
