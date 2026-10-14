@@ -284,7 +284,7 @@ fn review_questions_and_confirmations_fit_both_terminal_sizes() {
         assert_eq!(picker.action_keys(), &[("enter", "Choose")]);
         let mut buf = Buffer::empty(screen);
         super::super::overlays::draw_picker(&picker, screen, &mut buf);
-        let text: String = buf.content.iter().map(|c| c.symbol()).collect();
+        let text: String = crate::testing::buffer_text(&buf);
         for label in
             ["Existing Claude account", "Which account is this?", "patron.bzh", "gmail", "A different account", "Back"]
         {
@@ -295,7 +295,7 @@ fn review_questions_and_confirmations_fit_both_terminal_sizes() {
         assert!(!question.yes);
         assert_eq!(question.action.verb(), "Use account");
         super::super::overlays::draw_confirm(&question, screen, &mut buf);
-        let text: String = buf.content.iter().map(|c| c.symbol()).collect();
+        let text: String = crate::testing::buffer_text(&buf);
         for label in [
             "Use patron.bzh?",
             "Your running agents will keep working.",

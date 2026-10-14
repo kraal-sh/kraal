@@ -598,7 +598,7 @@ mod tests {
             server.bottom_bar = bottom;
             let mut buffer = ratatui::buffer::Buffer::empty(ratatui::layout::Rect::new(0, 0, 10, 3));
             server.compose(client, 0, &mut buffer);
-            let text: String = buffer.content.iter().map(|c| c.symbol()).collect();
+            let text: String = crate::testing::buffer_text(&buffer);
             assert!(text.contains("+ Add pane"));
         }
     }
@@ -614,7 +614,7 @@ mod tests {
             server.workspaces[0].tabs.clear();
             let mut buffer = ratatui::buffer::Buffer::empty(ratatui::layout::Rect::new(0, 0, cols, rows));
             server.compose(client, 0, &mut buffer);
-            let text: String = buffer.content.iter().map(|c| c.symbol()).collect();
+            let text: String = crate::testing::buffer_text(&buffer);
             assert!(text.contains("No panes."));
             assert!(text.contains("+ Add pane"));
             let (button, _) = server.empty_workspace_button(client).unwrap();

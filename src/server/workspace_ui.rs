@@ -904,10 +904,6 @@ mod tests {
         InputEvent::Key(Key { code: k.code, mods: k.mods, raw: Vec::new() })
     }
 
-    fn text(buf: &Buffer) -> String {
-        buf.content.iter().map(|c| c.symbol()).collect()
-    }
-
     fn confirm(server: &mut Server, client: ClientId, q: super::super::ui::Question, bytes: &[u8]) -> Mode {
         server.clients.get_mut(&client).unwrap().mode = Mode::Confirm(q);
         server.client_input(client, bytes);
@@ -952,7 +948,7 @@ mod tests {
                 c.toast = None;
                 let mut buf = Buffer::empty(server.client_screen(client));
                 server.compose(client, 0, &mut buf);
-                assert!(text(&buf).contains("File changed"));
+                assert!(crate::testing::buffer_text(&buf).contains("File changed"));
             }
             let mut list = server.workspace_picker(ws);
             list.query = "personal".into();
@@ -967,7 +963,7 @@ mod tests {
                 "Keep layout",
                 "Load from file",
             ] {
-                assert!(text(&buf).contains(expected), "{}", text(&buf));
+                assert!(crate::testing::buffer_text(&buf).contains(expected), "{}", crate::testing::buffer_text(&buf));
             }
             let Mode::Picker(back) = server.on_workspace_form(client, p, key("enter")) else {
                 panic!("Cancel is selected first")
@@ -1182,7 +1178,7 @@ mod tests {
             let mut buf = Buffer::empty(server.client_screen(client));
             draw_form(&p, buf.area, &mut buf);
             for expected in ["File", "Name    personal", "1 tab · 1 pane", "Commands wait", "Enter Add"] {
-                assert!(text(&buf).contains(expected), "{}", text(&buf));
+                assert!(crate::testing::buffer_text(&buf).contains(expected), "{}", crate::testing::buffer_text(&buf));
             }
             p.value = "personal\n".into();
             let Mode::Prompt(mut p) = server.on_workspace_form(client, p, key("enter")) else { panic!() };
@@ -1230,7 +1226,7 @@ mod tests {
                 assert_eq!(layout.fields.len(), 3);
                 let mut buf = Buffer::empty(area);
                 draw_form(&p, area, &mut buf);
-                assert!(text(&buf).contains(&format!("claude:missing-{n}")));
+                assert!(crate::testing::buffer_text(&buf).contains(&format!("claude:missing-{n}")));
             }
             assert_eq!(p.workspace_form.as_ref().unwrap().choices[n], 0);
             p.workspace_form.as_mut().unwrap().field = 2;
@@ -1282,8 +1278,8 @@ mod tests {
         for size in [(80, 24), (124, 36)] {
             let mut buf = Buffer::empty(Rect::new(0, 0, size.0, size.1));
             draw_form(&p, buf.area, &mut buf);
-            assert!(text(&buf).contains("Enter Retry"));
-            assert!(text(&buf).contains("Workspaces are saved automatically."));
+            assert!(crate::testing::buffer_text(&buf).contains("Enter Retry"));
+            assert!(crate::testing::buffer_text(&buf).contains("Workspaces are saved automatically."));
             let layout = form_layout(&p, buf.area);
             assert!(layout.lines.join("").contains(p.error.as_ref().unwrap()));
             assert_eq!(buf[layout.body.as_position()].fg, crate::theme::current().text);
@@ -1353,7 +1349,7 @@ mod tests {
             let area = Rect::new(0, 0, cols, rows);
             let mut buf = Buffer::empty(area);
             draw_form(&p, area, &mut buf);
-            let shown = text(&buf);
+            let shown = crate::testing::buffer_text(&buf);
             assert_eq!(buf[form_layout(&p, area).primary.as_position()].bg, crate::theme::current().accent);
             assert!(
                 buf.content.chunks(cols as usize).any(|row| {
@@ -1385,12 +1381,15 @@ mod tests {
             let mut buf = Buffer::empty(area);
             assert!(draw_form(&p, area, &mut buf).is_none());
             for expected in ["Layout exported", "shared.kdl", "Enter Close", "Esc Close"] {
-                assert!(text(&buf).contains(expected), "{}", text(&buf));
+                assert!(crate::testing::buffer_text(&buf).contains(expected), "{}", crate::testing::buffer_text(&buf));
             }
             assert_eq!(layout.primary, layout.cancel);
             assert_eq!(buf[layout.cancel.as_position()].bg, crate::theme::current().accent);
             assert_eq!(buf[layout.body.as_position()].fg, crate::theme::current().text);
-            assert!(!text(&buf).contains("Done") && !text(&buf).contains("Tab Next"));
+            assert!(
+                !crate::testing::buffer_text(&buf).contains("Done")
+                    && !crate::testing::buffer_text(&buf).contains("Tab Next")
+            );
             let Mode::Picker(p) = server.on_workspace_form(client, p, key("enter")) else { panic!() };
             assert_eq!(p.current().unwrap().action.workspace(), Some(ws));
         }
@@ -1433,7 +1432,7 @@ mod tests {
                 "Enter Duplicate",
                 "Esc Cancel",
             ] {
-                assert!(text(&buf).contains(expected));
+                assert!(crate::testing::buffer_text(&buf).contains(expected));
             }
             let Mode::Picker(back) = server.on_workspace_form(client, p, key("esc")) else { panic!() };
             assert_eq!((back.query.as_str(), back.cursor), ("test", 2));
@@ -1472,8 +1471,8 @@ mod tests {
             assert!(p.error.as_ref().unwrap().contains("No workspace was added"));
             let mut buf = Buffer::empty(server.client_screen(client));
             draw_form(&p, buf.area, &mut buf);
-            assert!(text(&buf).contains("disk full"));
-            assert!(text(&buf).contains("Programs wait for you to start them."));
+            assert!(crate::testing::buffer_text(&buf).contains("disk full"));
+            assert!(crate::testing::buffer_text(&buf).contains("Programs wait for you to start them."));
             assert_eq!(server.workspaces.len(), 1);
             let button = form_layout(&p, server.client_screen(client)).primary;
             let Mode::Picker(p) = server.on_workspace_form(
@@ -1569,7 +1568,7 @@ mod tests {
             assert_eq!(p.value, "billing");
             let mut buf = Buffer::empty(server.client_screen(client));
             draw_form(&p, buf.area, &mut buf);
-            let shown = text(&buf);
+            let shown = crate::testing::buffer_text(&buf);
             for expected in ["Add workspace", "Name    billing", "Starts in /work/api", "Enter Add", "Esc Cancel"] {
                 assert!(shown.contains(expected), "{shown}");
             }
@@ -1923,7 +1922,7 @@ mod tests {
             let mut buf = Buffer::empty(server.client_screen(client));
             let cursor = draw_form(&p, buf.area, &mut buf).unwrap();
             assert!(layout.fields[0].contains((cursor.x, cursor.y).into()));
-            let shown = text(&buf);
+            let shown = crate::testing::buffer_text(&buf);
             for expected in ["café", "Final detail", "Enter Retry", "PgUp/PgDn Scroll", "Esc Cancel"] {
                 assert!(shown.contains(expected), "{shown}");
             }

@@ -287,7 +287,7 @@ mod tests {
                 let mut buf = Buffer::empty(screen);
                 draw_form(&p, screen, &mut buf);
                 assert_eq!(buf[layout.body.as_position()].fg, crate::theme::current().blocked);
-                let text = buf.content.iter().map(|c| c.symbol()).collect::<String>();
+                let text = crate::testing::buffer_text(&buf);
                 for expected in ["Address", "Name", "Last detail.", "Retry", "Cancel", "PgUp/PgDn"] {
                     assert!(text.contains(expected), "{expected}: {text}");
                 }

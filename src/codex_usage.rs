@@ -307,25 +307,8 @@ pub fn from_rollouts(home: &Path) -> Option<RateLimits> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static NEXT: AtomicU64 = AtomicU64::new(0);
-    struct Temp(PathBuf);
-    impl Temp {
-        fn new() -> Self {
-            let path = std::env::current_dir().unwrap().join(format!(
-                "test-tmp-{}-{}",
-                std::process::id(),
-                NEXT.fetch_add(1, Ordering::Relaxed)
-            ));
-            fs::create_dir(&path).unwrap();
-            Self(path)
-        }
-    }
-    impl Drop for Temp {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.0);
-        }
-    }
+    use crate::testing::TempDir;
+
     #[test]
     fn conversion_preserves_windows_and_saved_json() {
         for (five, week, expected) in [
@@ -414,7 +397,7 @@ mod tests {
     }
     #[test]
     fn rollout_days_and_malformed_lines() {
-        let tmp = Temp::new();
+        let tmp = TempDir::new("codex-usage");
         assert!(from_rollouts(&tmp.0).is_none());
         for (day, percent) in [(1, 10), (2, 20), (3, 30)] {
             let dir = tmp.0.join(format!("sessions/2026/10/{day:02}"));
@@ -431,7 +414,7 @@ mod tests {
     }
     #[test]
     fn rollout_tail_and_newest_file_budget() {
-        let tmp = Temp::new();
+        let tmp = TempDir::new("codex-usage");
         let dir = tmp.0.join("sessions");
         fs::create_dir(&dir).unwrap();
         for n in 0..6 {
@@ -445,14 +428,14 @@ mod tests {
         }
         assert_eq!(from_rollouts(&tmp.0).unwrap().five_hour.unwrap().used_percent, 5.0);
     }
-    fn script(tmp: &Temp, body: &str) -> PathBuf {
+    fn script(tmp: &TempDir, body: &str) -> PathBuf {
         let path = tmp.0.join("fake-codex");
         crate::testing::write_script(&path, &format!("#!/bin/sh\n{body}\n"));
         path
     }
     #[test]
     fn fetch_protocol() {
-        let tmp = Temp::new();
+        let tmp = TempDir::new("codex-usage");
         let path = script(
             &tmp,
             &r#"
@@ -474,7 +457,7 @@ printf '%s\n' '{"id":2,"result":{"rateLimits":{"primary":{"usedPercent":42,"wind
     }
     #[test]
     fn fetch_timeout_and_redacted_errors() {
-        let tmp = Temp::new();
+        let tmp = TempDir::new("codex-usage");
         let path = script(&tmp, "while :; do :; done");
         let start = std::time::Instant::now();
         assert!(

@@ -610,7 +610,7 @@ mod tests {
             let mut buf = Buffer::empty(screen);
             draw_message(&layout, *state.scroll, &mut buf);
             draw_buttons(&layout, &buttons, *state.field, *state.pending, "Add", &mut buf);
-            let text = buf.content.iter().map(|c| c.symbol()).collect::<String>();
+            let text = crate::testing::buffer_text(&buf);
             assert!(text.contains("final detail"));
             assert!(text.contains(" Add     Cancel "));
             assert_eq!(buf[layout.primary.as_position()].bg, crate::theme::current().accent);

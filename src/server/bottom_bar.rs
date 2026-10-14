@@ -223,7 +223,7 @@ mod tests {
     fn text(bar: &BottomBar, width: u16) -> String {
         let mut buf = Buffer::empty(ratatui::layout::Rect::new(0, 0, width, 1));
         bar.draw(0, &mut buf);
-        buf.content.iter().map(|c| c.symbol()).collect()
+        crate::testing::buffer_text(&buf)
     }
 
     fn shown(context: &Context, km: &Keymap) -> String {

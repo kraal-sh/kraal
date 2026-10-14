@@ -787,7 +787,7 @@ mod tests {
             }
             let mut buf = Buffer::empty(screen);
             draw_form(&draft, screen, &mut buf);
-            let text: String = buf.content.iter().map(|c| c.symbol()).collect();
+            let text: String = crate::testing::buffer_text(&buf);
             for value in ["Name", "Folder", "Command", "Apply", "Cancel", "final detail", "PgUp/PgDn"] {
                 assert!(text.contains(value), "missing {value} at {cols}x{rows}");
             }

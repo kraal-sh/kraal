@@ -3,6 +3,7 @@
 use super::listing::*;
 use super::view::*;
 use super::*;
+use crate::testing::TempDir;
 use crate::text::*;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -15,42 +16,6 @@ use std::time::{Duration, Instant, SystemTime};
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::Color;
-
-/// A unique scratch directory removed on drop.
-struct TempDir(PathBuf);
-
-impl TempDir {
-    fn new(name: &str) -> Self {
-        static COUNTER: AtomicUsize = AtomicUsize::new(0);
-        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!("kraal-files-{}-{name}-{id}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
-        TempDir(dir.canonicalize().unwrap())
-    }
-
-    fn write(&self, name: &str, contents: &str) -> PathBuf {
-        let path = self.0.join(name);
-        fs::write(&path, contents).unwrap();
-        path
-    }
-
-    fn mkdir(&self, name: &str) -> PathBuf {
-        let path = self.0.join(name);
-        fs::create_dir_all(&path).unwrap();
-        path
-    }
-
-    fn text(&self) -> String {
-        self.0.to_str().unwrap().to_owned()
-    }
-}
-
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
-    }
-}
 
 fn noop() -> Arc<dyn Fn() + Send + Sync> {
     Arc::new(|| {})

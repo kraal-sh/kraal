@@ -7,8 +7,12 @@
 #[path = "common/isolation.rs"]
 mod isolation;
 
+#[path = "common/script.rs"]
+mod script;
+use script::write_script;
+
 use std::io::{Read, Write};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
@@ -186,21 +190,6 @@ impl Drop for Env {
         let _ = self.try_run(&Kraal::this(), &["kill"]);
         let _ = std::fs::remove_dir_all(&self.root);
     }
-}
-
-fn write_script(path: &Path, body: &str) {
-    // A child process writes it: a file this process held open for writing could be inherited
-    // by a program another test starts, and running the script would fail with "text file busy".
-    let mut child = Command::new("sh")
-        .arg("-c")
-        .arg("cat > \"$1\" && chmod 755 \"$1\"")
-        .arg("sh")
-        .arg(path)
-        .stdin(Stdio::piped())
-        .spawn()
-        .unwrap();
-    child.stdin.take().unwrap().write_all(body.as_bytes()).unwrap();
-    assert!(child.wait().unwrap().success(), "writing {}", path.display());
 }
 
 /// Both real clients refuse a server of the other generation without changing its session.
