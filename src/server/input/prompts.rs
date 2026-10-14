@@ -2,7 +2,7 @@
 
 use anyhow::Context;
 
-use crate::input::{InputEvent, KeyCode, MouseButton, MouseKind, encode_paste};
+use crate::input::{InputEvent, KeyCode, MouseButton, MouseKind};
 use crate::pane::PaneSpec;
 use crate::paths;
 use crate::protocol::Placement;
@@ -26,16 +26,6 @@ impl Server {
             InputEvent::Key(k) => match k.code {
                 KeyCode::Esc => return self.cancel_account_prompt(&p),
                 KeyCode::Char('c' | 'g') if k.mods.ctrl => return self.cancel_account_prompt(&p),
-                // Files dropped on an SSH pane: paste their paths instead of uploading them.
-                KeyCode::Char('p') if k.mods.ctrl && matches!(p.action, PromptAction::Upload { .. }) => {
-                    if let PromptAction::Upload { raw, pane, .. } = p.action
-                        && let Some(pn) = self.panes.get_mut(&pane)
-                    {
-                        let bytes = encode_paste(&raw, pn.input_modes());
-                        pn.write_input(bytes);
-                    }
-                    return Mode::Normal;
-                }
                 KeyCode::Enter => return self.submit_prompt(id, p),
                 KeyCode::PageDown => {
                     p.scroll = (p.scroll + usize::from(layout.body).max(1)).min(layout.max_scroll);
@@ -161,15 +151,6 @@ impl Server {
                 let spec = PaneSpec { preview: Some(path), ..Default::default() };
                 if let Err(e) = self.spawn_pane_in(ws, None, spec, Placement::Auto, None) {
                     self.toast(id, format!("{e:#}"));
-                }
-            }
-            PromptAction::Upload { paths, .. } => {
-                let mut args: Vec<String> = paths.iter().map(|p| p.display().to_string()).collect();
-                args.push(value);
-                {
-                    args.insert(0, "--".into());
-                    args.insert(0, "cp".into());
-                    self.start_job(id, "upload", args);
                 }
             }
             PromptAction::UploadPick { server } => {

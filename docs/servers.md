@@ -131,8 +131,9 @@ files, `r` reads the directory again, `tab` goes to the other panel, `backspace`
 above, and `q` closes. Selected files carry a ✓. Transfers run in a small window that closes
 itself once done, and stays open to show why when one failed.
 
-Drop a file from your file manager on an SSH pane and kraal offers to upload it to that server
-(`ctrl+p` pastes the path instead). `ctrl+b S d` downloads a path from the pane's server
+In a local session, pasted paths stay unchanged, including in an SSH pane. Use **Upload to
+this pane's server** in the command palette or `kraal cp` to send files there.
+`ctrl+b S d` downloads a path from the pane's server
 (the selected text is prefilled), into `~/Downloads` by default.
 
 ## Editing a file on a server
@@ -237,7 +238,9 @@ To send laptop files through this connection, choose **Attach files** in the com
 Enter their absolute local paths and press Enter. The server receives the complete batch before
 submitting its private paths to the reserved pane, without Enter. Ctrl+C cancels. Files survive
 client disconnects and server restarts. See [Attachments](terminal.md#attachments) for limits,
-retention and cleanup. This explicit action does not change ordinary pasted text.
+retention and cleanup. Pasting or dropping existing absolute laptop paths also offers **Send**,
+**Always for this server**, **Paste the text**, and **Cancel**. Always is remembered on the laptop
+and can be revoked in `paste-files.toml`. Ordinary text and local-session pastes stay unchanged.
 
 Copies travel back to the attaching machine as negotiated clipboard messages. A user selection
 tries its native clipboard, then OSC 52. A program's copy goes to the most recently used client

@@ -374,7 +374,7 @@ impl Server {
                 };
                 if action == Action::Upload {
                     return Mode::Prompt(Prompt::new(
-                        &format!("Upload to {}:~/ (local paths, or drop files on the pane)", server.name),
+                        &format!("Upload to {}:~/ (local paths)", server.name),
                         "~/",
                         PromptAction::UploadPick { server: server.name },
                     ));

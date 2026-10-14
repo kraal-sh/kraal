@@ -113,6 +113,7 @@ impl Server {
                     c.attachments.blocked = None;
                     c.remote = remote;
                     c.attachments.negotiated = features.iter().any(|f| f == protocol::ATTACHMENTS.name);
+                    c.attachments.recognition = features.iter().any(|f| f == protocol::PASTED_PATHS.name);
                     c.clipboard.negotiated = features.iter().any(|f| f == protocol::CLIPBOARD.name);
                 }
                 let (cols, rows) = clamp_size(cols, rows);
@@ -146,7 +147,10 @@ impl Server {
             ClientMsg::ClipboardResult { id: copy, outcome, native_unavailable } => {
                 self.clipboard_result(id, copy, outcome, native_unavailable);
             }
-            msg @ (ClientMsg::AttachmentStart { .. }
+            ClientMsg::PasteStart => self.reserve_paste(id),
+            msg @ (ClientMsg::AttachmentRequest { .. }
+            | ClientMsg::AttachmentText { .. }
+            | ClientMsg::AttachmentStart { .. }
             | ClientMsg::AttachmentChunk { .. }
             | ClientMsg::AttachmentFinish { .. }
             | ClientMsg::AttachmentCancel { .. }

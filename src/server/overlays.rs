@@ -676,9 +676,6 @@ pub(super) fn draw_prompt(p: &Prompt, screen: Rect, buf: &mut Buffer) -> Option<
     if layout.max_scroll > 0 {
         keys.insert(1, ("PgUp/PgDn", "Scroll"));
     }
-    if matches!(p.action, super::ui::PromptAction::Upload { .. }) {
-        keys.insert(1, ("Ctrl+P", "Paste paths"));
-    }
     let line = key_line(&keys, "", inner.width.saturating_sub(2));
     buf.set_line(inner.x + 1, inner.y + inner.height - 1, &line, inner.width.saturating_sub(2));
     Some(Cursor { x, y: inner.y, shape: CursorShape::Bar, blinking: true })

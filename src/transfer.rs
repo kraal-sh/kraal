@@ -1811,34 +1811,38 @@ pub fn run(steps: &[Step]) -> Result<()> {
     Ok(())
 }
 
-/// Split text pasted by a terminal when files are dropped on it into paths: whitespace-separated
-/// words with shell quoting and backslash escapes. `None` unless every word is an existing
-/// absolute local path.
+/// Recognize complete local path lists without expanding shell expressions.
 pub fn dropped_paths(text: &str) -> Option<Vec<PathBuf>> {
+    if text.chars().any(|c| c.is_control() && !matches!(c, '\n' | '\r' | '\t')) {
+        return None;
+    }
+    let text = text.trim();
     let mut words = Vec::new();
     let mut cur = String::new();
     let mut in_word = false;
-    let mut chars = text.trim().chars().peekable();
-    let mut quote: Option<char> = None;
+    let mut chars = text.chars().peekable();
+    let mut quote = None;
     while let Some(c) = chars.next() {
         match (quote, c) {
             (Some(q), c) if c == q => quote = None,
             (Some('"'), '\\') => {
-                if let Some(n) = chars.next() {
-                    cur.push(n);
+                let next = chars.next()?;
+                if !matches!(next, '"' | '\\' | '$' | '`') {
+                    cur.push('\\');
                 }
+                cur.push(next);
             }
+            (Some('"') | None, '$' | '`') => return None,
             (Some(_), c) => cur.push(c),
             (None, '\'' | '"') => {
                 quote = Some(c);
                 in_word = true;
             }
             (None, '\\') => {
-                if let Some(n) = chars.next() {
-                    cur.push(n);
-                    in_word = true;
-                }
+                cur.push(chars.next()?);
+                in_word = true;
             }
+            (None, '*' | '?' | '[' | ']' | ';' | '|' | '&' | '<' | '>' | '(' | ')') => return None,
             (None, c) if c.is_whitespace() => {
                 if in_word {
                     words.push(std::mem::take(&mut cur));
@@ -1857,12 +1861,69 @@ pub fn dropped_paths(text: &str) -> Option<Vec<PathBuf>> {
     if in_word {
         words.push(cur);
     }
-    if words.is_empty() {
+    let parsed =
+        words.into_iter().map(|word| local_path(&word)).collect::<Option<Vec<_>>>().filter(|paths| !paths.is_empty());
+    // Some terminals leave spaces unquoted. Never choose between a whole name and a list.
+    let raw = (!text.contains(['\'', '"', '\\', '\n', '\r', '\t']))
+        .then(|| local_path(text))
+        .flatten()
+        .map(|path| vec![path]);
+    if parsed.is_some() {
+        let words: Vec<_> = text.split_whitespace().collect();
+        for (i, word) in words.iter().enumerate() {
+            let start = word.as_ptr() as usize - text.as_ptr() as usize;
+            let Some(next) = words.get(i + 1) else { break };
+            let next_start = next.as_ptr() as usize - text.as_ptr() as usize;
+            // Joining absolute words would need a directory whose name includes the separator.
+            if !Path::new(&text[start..next_start]).is_dir() {
+                continue;
+            }
+            for last in &words[i + 1..] {
+                let last_end = last.as_ptr() as usize - text.as_ptr() as usize + last.len();
+                if last_end - start > 4096 {
+                    break;
+                }
+                let joined = &text[start..last_end];
+                if !joined.contains(['\'', '"', '\\', '\n', '\r', '\t']) && local_path(joined).is_some() {
+                    return None;
+                }
+            }
+        }
+    }
+    match (parsed, raw) {
+        (Some(a), Some(b)) if a != b => None,
+        (Some(paths), _) | (_, Some(paths)) => Some(paths),
+        _ => None,
+    }
+}
+
+fn local_path(word: &str) -> Option<PathBuf> {
+    let decoded;
+    let word = if let Some(uri) = word.strip_prefix("file://") {
+        if !uri.starts_with('/') || uri.contains(['?', '#']) {
+            return None;
+        }
+        let mut bytes = Vec::new();
+        let mut input = uri.bytes();
+        while let Some(byte) = input.next() {
+            bytes.push(if byte == b'%' {
+                let hi = char::from(input.next()?).to_digit(16)?;
+                let lo = char::from(input.next()?).to_digit(16)?;
+                (hi * 16 + lo) as u8
+            } else {
+                byte
+            });
+        }
+        decoded = String::from_utf8(bytes).ok()?;
+        decoded.as_str()
+    } else {
+        word
+    };
+    if word.chars().any(char::is_control) {
         return None;
     }
-    let paths: Vec<PathBuf> =
-        words.into_iter().map(|w| PathBuf::from(w.strip_prefix("file://").map(String::from).unwrap_or(w))).collect();
-    paths.iter().all(|p| p.is_absolute() && p.exists()).then_some(paths)
+    let path = PathBuf::from(word);
+    (path.is_absolute() && std::fs::symlink_metadata(&path).is_ok()).then_some(path)
 }
 
 #[cfg(test)]
@@ -3163,6 +3224,60 @@ mod tests {
         )
         .unwrap();
         assert_eq!(crate::shell::unwrap_sh_c(steps[0].args.last().unwrap()), "tar cf - -C / .");
+    }
+
+    #[test]
+    fn dropped_paths_handle_local_uris_quotes_and_unique_raw_names_without_shell_expansion() {
+        let t = Tmp::new("dropped-paths");
+        let names =
+            ["notes client.txt", "single'quote", "double\"quote", "back\\slash", "$literal", "brackets[1]", "café.png"];
+        for name in names {
+            let path = t.0.join(name);
+            std::fs::write(&path, b"x").unwrap();
+            assert_eq!(dropped_paths(&crate::shell::quote(path.to_str().unwrap())), Some(vec![path.clone()]));
+        }
+        let path = t.0.join("notes client.txt");
+        assert_eq!(dropped_paths(path.to_str().unwrap()), Some(vec![path.clone()]));
+        let uri = format!("file://{}", path.display().to_string().replace(' ', "%20"));
+        assert_eq!(dropped_paths(&uri), Some(vec![path.clone()]));
+        assert_eq!(
+            dropped_paths(&format!("  '{uri}'\r\n'{}'\t", path.display())),
+            Some(vec![path.clone(), path.clone()])
+        );
+        for text in [
+            format!("cat {}", path.display()),
+            format!("{}\\", path.display()),
+            format!("'{}", path.display()),
+            format!("file://remote{}", path.display()),
+            format!("{uri}%"),
+            format!("{uri}%00"),
+            format!("{uri}?query"),
+            format!("{uri}#fragment"),
+            format!("{}/$literal", t.0.display()),
+            format!("{}/brackets[1]", t.0.display()),
+            "/$(touch /tmp/no)".into(),
+            "relative".into(),
+            String::new(),
+        ] {
+            assert_eq!(dropped_paths(&text), None, "{text}");
+        }
+        let a = t.0.join("a");
+        let b = t.0.join("b");
+        std::fs::write(&a, b"a").unwrap();
+        std::fs::write(&b, b"b").unwrap();
+        let text = format!("{} {}", a.display(), b.display());
+        let raw = PathBuf::from(&text);
+        std::fs::create_dir_all(raw.parent().unwrap()).unwrap();
+        std::fs::write(&raw, b"ambiguous").unwrap();
+        assert_eq!(dropped_paths(&text), None);
+        assert_eq!(dropped_paths(&format!("'{}' '{}'", a.display(), b.display())), Some(vec![a, b]));
+        assert_eq!(dropped_paths(&format!("'{text}'")), Some(vec![raw]));
+        let c = t.0.join("c");
+        std::fs::write(&c, b"c").unwrap();
+        assert_eq!(dropped_paths(&format!("{text} {}", c.display())), None);
+        assert_eq!(dropped_paths(&format!("'{}' {text}", c.display())), None);
+        let backslash = t.0.join("back\\slash");
+        assert_eq!(dropped_paths(&format!("\"{}\"", backslash.display())), Some(vec![backslash]));
     }
 
     #[test]

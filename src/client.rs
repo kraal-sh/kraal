@@ -1,6 +1,10 @@
 //! The attaching client and the one-shot control connection used by CLI commands.
 
 mod attachments;
+mod paste;
+
+#[cfg(test)]
+pub(crate) use attachments::Controller as AttachmentController;
 
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
@@ -370,6 +374,7 @@ fn exchange(stream: &mut UnixStream, msg: &ClientMsg) -> Result<Result<Response,
                 | ServerMsg::Events { .. }
                 | ServerMsg::Attached { .. }
                 | ServerMsg::Clipboard { .. }
+                | ServerMsg::AttachmentPrepared { .. }
                 | ServerMsg::AttachmentOffer { .. }
                 | ServerMsg::AttachmentAck { .. }
                 | ServerMsg::AttachmentResult { .. }
@@ -988,11 +993,13 @@ impl KeysPause {
 
 /// Read `fd` (the keyboard) into `forward` until it ends. Nothing is read while paused: the
 /// reader parks before it would read, and it reads only the bytes already waiting, so a read
-/// never blocks it past a pause. It sleeps until a key comes or the pause changes.
-fn read_keys(fd: std::os::unix::io::RawFd, pause: &KeysPause, mut forward: impl FnMut(&[u8])) {
+/// never blocks it past a pause. A true callback result requests one idle callback to resolve
+/// a pending escape prefix; otherwise it sleeps until a key comes or the pause changes.
+fn read_keys(fd: std::os::unix::io::RawFd, pause: &KeysPause, mut forward: impl FnMut(&[u8]) -> bool) {
     use std::os::fd::AsRawFd;
     let mut buf = [0u8; 16 * 1024];
     let wake = pause.wake.0.as_raw_fd();
+    let mut timeout = -1;
     loop {
         if pause.paused.load(Ordering::SeqCst) {
             pause.parked.store(pause.epoch.load(Ordering::SeqCst), Ordering::SeqCst);
@@ -1008,7 +1015,10 @@ fn read_keys(fd: std::os::unix::io::RawFd, pause: &KeysPause, mut forward: impl 
             libc::pollfd { fd: wake, events: libc::POLLIN, revents: 0 },
         ];
         // SAFETY: two valid pollfds.
-        let ready = unsafe { libc::poll(pfd.as_mut_ptr(), 2, -1) };
+        let ready = unsafe { libc::poll(pfd.as_mut_ptr(), 2, timeout) };
+        if ready == 0 {
+            timeout = if forward(&[]) { 50 } else { -1 };
+        }
         if ready < 0 && std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
             return;
         }
@@ -1040,7 +1050,7 @@ fn read_keys(fd: std::os::unix::io::RawFd, pause: &KeysPause, mut forward: impl 
                     return;
                 }
             }
-            n => forward(&buf[..n as usize]),
+            n => timeout = if forward(&buf[..n as usize]) { 50 } else { -1 },
         }
     }
 }
@@ -1134,7 +1144,7 @@ pub fn attach(mut target: Target, mut workspace: Option<String>, mouse: bool, at
 
     // The current connection's writer; None while reconnecting.
     let writer: Arc<Mutex<Option<Box<dyn Write + Send>>>> = Arc::new(Mutex::new(None));
-    let attachments = attachments::Controller::new(writer.clone(), matches!(target, Target::Remote { .. }));
+    let attachments = attachments::Controller::for_target(writer.clone(), &target);
     let quit = Arc::new(AtomicBool::new(false));
     let pause = Arc::new(KeysPause::new().context("creating a pipe")?);
 
@@ -1146,10 +1156,10 @@ pub fn attach(mut target: Target, mut workspace: Option<String>, mouse: bool, at
         let pause = pause.clone();
         crate::threads::named("stdin").spawn(move || {
             read_keys(0, &pause, |keys| {
-                if attachments.keys(keys) {
-                    return;
+                if attachments.input(keys) {
+                    return attachments.pending_keys();
                 }
-                let Ok(mut w) = writer.lock() else { return };
+                let Ok(mut w) = writer.lock() else { return false };
                 match w.as_mut() {
                     Some(w) => {
                         let _ = protocol::write_frame(w, protocol::BYTES, keys);
@@ -1157,6 +1167,7 @@ pub fn attach(mut target: Target, mut workspace: Option<String>, mouse: bool, at
                     None if is_ctrl_c(keys) => quit.store(true, Ordering::SeqCst),
                     None => {}
                 }
+                false
             });
         })?;
     }
@@ -1269,6 +1280,12 @@ pub fn attach(mut target: Target, mut workspace: Option<String>, mouse: bool, at
                                 attachments_negotiated = features
                                     .as_ref()
                                     .is_some_and(|fs| fs.iter().any(|f| f == protocol::ATTACHMENTS.name));
+                                attachments.negotiate(
+                                    attachments_negotiated
+                                        && features
+                                            .as_ref()
+                                            .is_some_and(|fs| fs.iter().any(|f| f == protocol::PASTED_PATHS.name)),
+                                );
                                 if attachments_negotiated {
                                     attachments.reconnect();
                                 }
@@ -1279,7 +1296,8 @@ pub fn attach(mut target: Target, mut workspace: Option<String>, mouse: bool, at
                                 clipboard.submit(id, origin, text);
                             }
                             Ok(
-                                msg @ (ServerMsg::AttachmentOffer { .. }
+                                msg @ (ServerMsg::AttachmentPrepared { .. }
+                                | ServerMsg::AttachmentOffer { .. }
                                 | ServerMsg::AttachmentAck { .. }
                                 | ServerMsg::AttachmentResult { .. }),
                             ) if attachments_negotiated => {
@@ -1569,7 +1587,12 @@ mod tests {
         let got = Arc::new(Mutex::new(Vec::new()));
         let reader = {
             let (pause, got) = (pause.clone(), got.clone());
-            std::thread::spawn(move || read_keys(keyboard, &pause, |k| got.lock().unwrap().extend_from_slice(k)))
+            std::thread::spawn(move || {
+                read_keys(keyboard, &pause, |k| {
+                    got.lock().unwrap().extend_from_slice(k);
+                    false
+                })
+            })
         };
         // Keys typed just before a pause are read or left for ssh; nothing typed after it is read.
         let mut left_for_ssh = 0;
@@ -1622,6 +1645,7 @@ mod tests {
                 let _ = tid_tx.send(unsafe { libc::gettid() });
                 read_keys(keyboard, &pause, |k| {
                     let _ = got_tx.send(k.to_vec());
+                    false
                 })
             })
         };

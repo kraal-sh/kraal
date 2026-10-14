@@ -763,12 +763,6 @@ pub enum PromptAction {
     ExportWorkspace(u32),
     ImportWorkspace,
     ReviewWorkspace(u32),
-    /// Files dropped on an SSH pane: the value is the destination. Cancelling pastes `raw`.
-    Upload {
-        paths: Vec<std::path::PathBuf>,
-        raw: Vec<u8>,
-        pane: PaneId,
-    },
     /// The value is local paths to upload to `server`.
     UploadPick {
         server: String,
@@ -813,7 +807,7 @@ impl PromptAction {
             PromptAction::ExportWorkspace(_) => "export",
             PromptAction::ImportWorkspace | PromptAction::AddServer | PromptAction::AddTunnel => "add",
             PromptAction::ReviewWorkspace(_) => "review",
-            PromptAction::Upload { .. } | PromptAction::UploadPick { .. } => "upload",
+            PromptAction::UploadPick { .. } => "upload",
             PromptAction::Download => "download",
             PromptAction::Commit { .. } => "commit",
             PromptAction::RunOn { .. } => "run",

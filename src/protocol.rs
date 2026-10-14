@@ -79,7 +79,9 @@ pub const WORKSPACE_LIFECYCLE: Feature = Feature {
 pub const CLIPBOARD: Feature =
     Feature { name: "clipboard", does: "copy through the client clipboard policy", check_first: false };
 pub const ATTACHMENTS: Feature = Feature { name: "attachments", does: "attach local files", check_first: false };
-pub const FEATURES: [Feature; 9] = [
+pub const PASTED_PATHS: Feature =
+    Feature { name: "pasted_paths", does: "recognize laptop paths in pastes", check_first: false };
+pub const FEATURES: [Feature; 10] = [
     LIST_AGENTS,
     BUFFERS,
     EDIT_SUDO,
@@ -89,6 +91,7 @@ pub const FEATURES: [Feature; 9] = [
     WORKSPACE_LIFECYCLE,
     CLIPBOARD,
     ATTACHMENTS,
+    PASTED_PATHS,
 ];
 
 /// The names of this kraal's server features, as it lists them.
@@ -102,7 +105,7 @@ pub const LENIENT: &str = "lenient";
 
 /// What this kraal's client can read beyond what one of the oldest supported release can. It
 /// lists them in its messages, for a later server to rely on.
-pub const CLIENT_FEATURES: [&str; 3] = [LENIENT, CLIPBOARD.name, ATTACHMENTS.name];
+pub const CLIENT_FEATURES: [&str; 4] = [LENIENT, CLIPBOARD.name, ATTACHMENTS.name, PASTED_PATHS.name];
 
 pub fn client_features() -> Vec<String> {
     CLIENT_FEATURES.iter().map(|f| f.to_string()).collect()
@@ -245,6 +248,16 @@ pub enum ClientMsg {
         rows: u16,
     },
     Detach,
+    /// Reserve the destination while a negotiated client classifies a buffered paste.
+    PasteStart,
+    AttachmentRequest {
+        token: String,
+        text: Vec<u8>,
+    },
+    AttachmentText {
+        token: String,
+        text: Vec<u8>,
+    },
     AttachmentStart {
         token: String,
         files: Vec<crate::attachments::FileSpec>,
@@ -319,6 +332,12 @@ pub enum ServerMsg {
     Response {
         result: Result<Response, String>,
     },
+    AttachmentPrepared {
+        token: String,
+        target: String,
+        limits: crate::attachments::Settings,
+        broadcast: bool,
+    },
     AttachmentOffer {
         token: String,
         target: String,
@@ -331,6 +350,8 @@ pub enum ServerMsg {
     AttachmentResult {
         token: String,
         message: String,
+        #[serde(default)]
+        pasted: bool,
     },
     Clipboard {
         id: u64,
@@ -1138,6 +1159,9 @@ mod tests {
             },
             ClientMsg::Resize { cols: 80, rows: 24 },
             ClientMsg::Detach,
+            ClientMsg::PasteStart,
+            ClientMsg::AttachmentRequest { token: s("ab"), text: b"/tmp/a".to_vec() },
+            ClientMsg::AttachmentText { token: s("ab"), text: b"/tmp/a".to_vec() },
             ClientMsg::AttachmentStart {
                 token: s("ab"),
                 files: vec![crate::attachments::FileSpec { name: s("notes.txt"), size: 3 }],
@@ -1223,9 +1247,15 @@ mod tests {
             ServerMsg::Attached { version: s("0.2.0"), features: Some(feature_names()) },
             ServerMsg::Open { url: s("https://example.com") },
             ServerMsg::Clipboard { id: 1, origin: ClipboardOrigin::User, text: s("hello") },
+            ServerMsg::AttachmentPrepared {
+                token: s("ab"),
+                target: s("main"),
+                limits: Default::default(),
+                broadcast: true,
+            },
             ServerMsg::AttachmentOffer { token: s("ab"), target: s("main"), limits: Default::default() },
             ServerMsg::AttachmentAck { token: s("ab"), received: 3 },
-            ServerMsg::AttachmentResult { token: s("ab"), message: s("Files received.") },
+            ServerMsg::AttachmentResult { pasted: true, token: s("ab"), message: s("Files received.") },
             ServerMsg::Event { event: serde_json::json!({"v": 1, "type": "pane.opened"}) },
             ServerMsg::Events { events: vec![serde_json::json!({"v": 1, "type": "pane.closed"})] },
         ]);

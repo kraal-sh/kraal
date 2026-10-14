@@ -18,12 +18,14 @@ use crate::protocol::{ClientMsg, ServerMsg};
 #[derive(Default)]
 pub(super) struct Attachments {
     pub negotiated: bool,
+    pub recognition: bool,
     pub pending: Option<Pending>,
     pub blocked: Option<String>,
 }
 
 pub(super) struct Pending {
     token: String,
+    from_paste: bool,
     pane: PaneId,
     started: Instant,
     batch: bool,
@@ -140,6 +142,7 @@ impl Server {
         let target = self.pane_label(pane);
         self.clients.get_mut(&id).unwrap().attachments.pending = Some(Pending {
             token: token.clone(),
+            from_paste: false,
             pane,
             started: Instant::now(),
             batch: false,
@@ -149,6 +152,61 @@ impl Server {
         });
         self.send_msg(id, &ServerMsg::AttachmentOffer { token, target, limits: self.config.attachments.clone() });
         Mode::Normal
+    }
+
+    fn request_attachment(&mut self, id: ClientId, token: String, text: Vec<u8>) {
+        if !attachments::token_valid(&token) || text.len() > 64 * 1024 {
+            return;
+        }
+        if !matches!(self.clients[&id].mode, Mode::Normal)
+            && self.clients[&id].attachments.pending.is_none()
+            && self.clients[&id].attachments.blocked.is_none()
+        {
+            self.client_input(id, &[b"\x1b[200~".as_slice(), &text, b"\x1b[201~"].concat());
+            self.send_msg(id, &ServerMsg::AttachmentResult { token, message: String::new(), pasted: true });
+            return;
+        }
+        let reserved = self.clients.get_mut(&id).unwrap().paste.take();
+        let (pane, broadcast) = match reserved {
+            Some(super::input::PasteFlow::Held { focused, targets, .. }) => (Some(focused), targets.len() != 1),
+            Some(_) => (None, false),
+            None => {
+                let pane = self.client_focus(id);
+                (pane, pane.is_some_and(|pane| self.input_targets(id, pane).len() != 1))
+            }
+        };
+        let error =
+            if self.clients[&id].attachments.pending.is_some() || self.clients[&id].attachments.blocked.is_some() {
+                Some("Finish or dismiss the current attachment first.")
+            } else if pane.is_none_or(|pane| !self.attachment_target(pane)) {
+                Some("Select a running terminal pane, then retry.")
+            } else {
+                None
+            };
+        if let Some(error) = error {
+            self.send_msg(
+                id,
+                &ServerMsg::AttachmentResult { pasted: false, token, message: format!("No paths pasted. {error}") },
+            );
+            return;
+        }
+        let pane = pane.unwrap();
+        let workspace = self.workspaces[self.ws_index(self.clients[&id].workspace).unwrap()].name.clone();
+        let target = format!("{workspace} / {}", self.pane_label(pane));
+        self.clients.get_mut(&id).unwrap().attachments.pending = Some(Pending {
+            token: token.clone(),
+            from_paste: true,
+            pane,
+            started: Instant::now(),
+            batch: false,
+            busy: false,
+            cancelled: Arc::new(AtomicBool::new(false)),
+            keys: Vec::new(),
+        });
+        self.send_msg(
+            id,
+            &ServerMsg::AttachmentPrepared { token, target, limits: self.config.attachments.clone(), broadcast },
+        );
     }
 
     fn attachment_target(&self, pane: PaneId) -> bool {
@@ -171,25 +229,44 @@ impl Server {
     }
 
     fn attachment_failed(&mut self, id: ClientId, token: String, error: &str) {
+        let from_paste = self
+            .clients
+            .get(&id)
+            .and_then(|c| c.attachments.pending.as_ref())
+            .is_some_and(|p| p.token == token && p.from_paste);
         if let Some(c) = self.clients.get_mut(&id)
             && c.attachments.pending.as_ref().is_none_or(|p| p.token == token)
         {
             c.attachments.pending = None;
             c.attachments.blocked = Some(token.clone());
         }
-        let message = format!(
-            "Attachment stopped: {error}. No paths or queued typing pasted. Press Ctrl+C, then use Attach files to retry."
-        );
+        let message = if from_paste {
+            format!("Transfer interrupted: {error}. No paths or queued typing pasted.")
+        } else {
+            format!(
+                "Attachment stopped: {error}. No paths or queued typing pasted. Press Ctrl+C, then use Attach files to retry."
+            )
+        };
         self.toast(id, &message);
-        self.send_msg(id, &ServerMsg::AttachmentResult { token, message });
+        self.send_msg(id, &ServerMsg::AttachmentResult { pasted: false, token, message });
     }
 
     pub(super) fn attachment_message(&mut self, id: ClientId, msg: ClientMsg) {
         if !self.clients.get(&id).is_some_and(|c| c.attached && c.attachments.negotiated) {
             return;
         }
+        if matches!(msg, ClientMsg::AttachmentRequest { .. } | ClientMsg::AttachmentText { .. })
+            && !self.clients[&id].attachments.recognition
+        {
+            return;
+        }
+        if let ClientMsg::AttachmentRequest { token, text } = msg {
+            self.request_attachment(id, token, text);
+            return;
+        }
         let token = match &msg {
-            ClientMsg::AttachmentStart { token, .. }
+            ClientMsg::AttachmentText { token, .. }
+            | ClientMsg::AttachmentStart { token, .. }
             | ClientMsg::AttachmentChunk { token, .. }
             | ClientMsg::AttachmentFinish { token }
             | ClientMsg::AttachmentCancel { token }
@@ -220,7 +297,7 @@ impl Server {
                 });
                 Completion::Status(message)
             }) {
-                self.send_msg(id, &ServerMsg::AttachmentResult { token, message: format!("Cannot read attachment result: {error}") });
+                self.send_msg(id, &ServerMsg::AttachmentResult { pasted: false, token, message: format!("Cannot read attachment result: {error}") });
             }
             return;
         }
@@ -289,6 +366,25 @@ impl Server {
                 })?;
                 self.clients.get_mut(&id).unwrap().attachments.pending.as_mut().unwrap().busy = true;
             }
+            ClientMsg::AttachmentText { text, .. } => {
+                ensure!(!pending.batch && text.len() <= 64 * 1024, "invalid text paste");
+                let pane = pending.pane;
+                self.buffer_paste(pane, std::str::from_utf8(&text)?).map_err(anyhow::Error::msg)?;
+                let pending = self.clients.get_mut(&id).unwrap().attachments.pending.take().unwrap();
+                let mode = self.paste_to(id, pane, &[pane], text);
+                self.clients.get_mut(&id).unwrap().mode = mode;
+                let same_focus = self.client_focus(id) == Some(pane);
+                let message = if !same_focus && !pending.keys.is_empty() {
+                    self.clients.get_mut(&id).unwrap().attachments.blocked = Some(token.clone());
+                    "Text submitted to the reserved pane. Focus changed: queued typing discarded. Press Ctrl+C, then select the pane before typing."
+                } else {
+                    "Text submitted to the reserved pane. No Enter added."
+                };
+                self.send_msg(id, &ServerMsg::AttachmentResult { pasted: true, token, message: message.into() });
+                if same_focus {
+                    self.client_input(id, &pending.keys);
+                }
+            }
             ClientMsg::AttachmentLocal { paths, .. } => {
                 ensure!(!self.clients[&id].remote, "remote attachments must transfer their files");
                 ensure!(!paths.is_empty() && paths.len() <= self.config.attachments.files, "invalid file count");
@@ -311,7 +407,7 @@ impl Server {
                 } else {
                     "Local paths submitted to the reserved pane. No Enter added."
                 };
-                self.send_msg(id, &ServerMsg::AttachmentResult { token, message: message.into() });
+                self.send_msg(id, &ServerMsg::AttachmentResult { pasted: true, token, message: message.into() });
                 if same_focus {
                     self.client_input(id, &pending.keys);
                 }
@@ -352,7 +448,9 @@ impl Server {
     pub(super) fn attachment_complete(&mut self, id: ClientId, token: String, result: Completion) {
         let result = match result {
             Completion::Status(message) => {
-                self.send_msg(id, &ServerMsg::AttachmentResult { token, message });
+                // Version 1 records store the result as prose. Preserve that readable format.
+                let pasted = message.starts_with("Files received. Paths submitted to the reserved pane.");
+                self.send_msg(id, &ServerMsg::AttachmentResult { pasted, token, message });
                 return;
             }
             Completion::Purged(result) => {
@@ -397,7 +495,7 @@ impl Server {
                         "Files kept, no paths or queued typing pasted: {error}. Press Ctrl+C, then use Attach files when the pane is ready."
                     );
                     self.record_attachment(id, &token, &message);
-                    self.send_msg(id, &ServerMsg::AttachmentResult { token, message: message.clone() });
+                    self.send_msg(id, &ServerMsg::AttachmentResult { pasted: false, token, message: message.clone() });
                     self.toast(id, message);
                     return;
                 }
@@ -411,7 +509,7 @@ impl Server {
                 };
                 self.clients.get_mut(&id).unwrap().mode = mode;
                 self.record_attachment(id, &token, message);
-                self.send_msg(id, &ServerMsg::AttachmentResult { token, message: message.into() });
+                self.send_msg(id, &ServerMsg::AttachmentResult { pasted: true, token, message: message.into() });
                 self.toast(id, message);
                 if same_focus {
                     self.client_input(id, &pending.keys);
@@ -519,6 +617,139 @@ mod tests {
             ClientMsg::AttachmentChunk { token: token.into(), file: 0, offset: 0, data: "YWJj".into() },
         );
         settle(server, rx);
+    }
+
+    #[test]
+    fn pasted_path_reservation_needs_negotiation_and_text_keeps_the_original_target() {
+        let (mut server, id, _peer, pane, _rx) = setup("pasted-text");
+        let original = b"  '/laptop/notes client.txt'  \n";
+        let request = || ClientMsg::AttachmentRequest { token: "ab".into(), text: original.to_vec() };
+        server.attachment_message(id, request());
+        assert!(server.clients[&id].attachments.pending.is_none());
+        server.clients.get_mut(&id).unwrap().attachments.recognition = true;
+        server.attachment_message(id, request());
+        assert_eq!(server.clients[&id].attachments.pending.as_ref().unwrap().pane, pane);
+        assert!(!attachments::directory(&server.session).exists());
+        let ws = server.clients[&id].workspace;
+        let _batch = crate::pane::batch();
+        let other = server
+            .spawn_pane_in(
+                ws,
+                None,
+                crate::pane::PaneSpec { command: vec!["true".into()], ..Default::default() },
+                crate::protocol::Placement::Tab,
+                None,
+            )
+            .unwrap();
+        assert_eq!(server.client_focus(id), Some(other));
+        server.panes.get_mut(&pane).unwrap().ssh =
+            Some(crate::servers::Server { name: "prod".into(), host: "prod".into(), ..Default::default() });
+        server.attachment_message(id, ClientMsg::AttachmentText { token: "ab".into(), text: original.to_vec() });
+        assert!(server.clients[&id].attachments.pending.is_none());
+        assert!(matches!(&server.clients[&id].mode, Mode::Confirm(confirm)
+            if matches!(&confirm.action, super::super::ui::ConfirmAction::Production { pending, .. }
+                if pending.targets.len() == 1 && pending.targets[0].0 == pane
+                    && matches!(pending.items.as_slice(), [super::super::ui::InputItem::Paste(text)] if text == original))));
+        assert!(!attachments::directory(&server.session).exists());
+    }
+
+    #[test]
+    fn client_splitter_reserves_text_and_files_before_focus_changes() {
+        use crate::protocol;
+        use std::sync::Mutex;
+        struct Wire(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Wire {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        for files in [false, true] {
+            let (mut server, id, _peer, pane, _rx) = setup(if files { "split-file" } else { "split-text" });
+            server.clients.get_mut(&id).unwrap().attachments.recognition = true;
+            let wire = Arc::new(Mutex::new(Vec::new()));
+            let frame = || {
+                let mut bytes = std::io::Cursor::new(std::mem::take(&mut *wire.lock().unwrap()));
+                let frame = protocol::read_frame(&mut bytes).unwrap().unwrap();
+                assert_eq!(bytes.position(), bytes.get_ref().len() as u64);
+                frame
+            };
+            let writer: Box<dyn std::io::Write + Send> = Box::new(Wire(wire.clone()));
+            let client = crate::client::AttachmentController::new(Arc::new(Mutex::new(Some(writer))), true);
+            client.negotiate(true);
+            let path = std::env::temp_dir().join(format!("kraal-split-target-{}", std::process::id()));
+            let text = if files {
+                std::fs::write(&path, b"abc").unwrap();
+                format!("'{}'\n", path.display()).into_bytes()
+            } else {
+                b"ordinary text\n".to_vec()
+            };
+            client.input(&[b"\x1b[200~".as_slice(), &text[..4]].concat());
+            let (kind, bytes) = frame();
+            assert!(matches!(serde_json::from_slice::<ClientMsg>(&bytes).unwrap(), ClientMsg::PasteStart));
+            server.client_frame(id, kind, bytes);
+            assert!(matches!(&server.clients[&id].paste,
+                Some(super::super::input::PasteFlow::Held { focused, targets, .. })
+                    if *focused == pane && targets == &[pane]));
+            let ws = server.clients[&id].workspace;
+            let _batch = crate::pane::batch();
+            let other = server
+                .spawn_pane_in(
+                    ws,
+                    None,
+                    crate::pane::PaneSpec { command: vec!["true".into()], ..Default::default() },
+                    protocol::Placement::Tab,
+                    None,
+                )
+                .unwrap();
+            assert_eq!(server.client_focus(id), Some(other));
+            server.panes.get_mut(&pane).unwrap().ssh =
+                Some(crate::servers::Server { name: "prod".into(), host: "prod".into(), ..Default::default() });
+            client.input(&[&text[4..], b"\x1b[201~"].concat());
+            let (kind, bytes) = frame();
+            server.client_frame(id, kind, bytes);
+            assert!(server.clients[&id].paste.is_none());
+            if files {
+                let pending = server.clients[&id].attachments.pending.as_ref().unwrap();
+                assert_eq!(pending.pane, pane);
+                let token = pending.token.clone();
+                server.attachment_message(id, ClientMsg::AttachmentText { token, text: text.clone() });
+                std::fs::remove_file(path).unwrap();
+            }
+            assert!(matches!(&server.clients[&id].mode, Mode::Confirm(confirm)
+                if matches!(&confirm.action, super::super::ui::ConfirmAction::Production { pending, .. }
+                    if pending.targets.len() == 1 && pending.targets[0].0 == pane
+                        && matches!(pending.items.as_slice(), [super::super::ui::InputItem::Paste(data)] if data == &text))));
+        }
+    }
+
+    #[test]
+    fn a_local_session_pastes_paths_unchanged_even_in_an_ssh_pane() {
+        let (mut server, id, _peer, pane, _rx) = setup("local-paste");
+        server.clients.get_mut(&id).unwrap().remote = false;
+        server.panes.get_mut(&pane).unwrap().ssh =
+            Some(crate::servers::Server { name: "dev".into(), host: "dev".into(), ..Default::default() });
+        let path = std::env::temp_dir().join(format!("kraal-local-path-{}", std::process::id()));
+        std::fs::write(&path, b"local").unwrap();
+        server.client_input(id, format!("\x1b[200~'{}'\x1b[201~", path.display()).as_bytes());
+        assert!(matches!(server.clients[&id].mode, Mode::Normal));
+        assert!(server.clients[&id].attachments.pending.is_none());
+        assert!(!attachments::directory(&server.session).exists());
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn pasted_paths_in_an_open_form_remain_text() {
+        let (mut server, id, _peer, _, _rx) = setup("pasted-form");
+        server.clients.get_mut(&id).unwrap().attachments.recognition = true;
+        server.clients.get_mut(&id).unwrap().mode =
+            Mode::Prompt(super::super::ui::Prompt::new("Path", "", super::super::ui::PromptAction::OpenPreview));
+        server.attachment_message(id, ClientMsg::AttachmentRequest { token: "ab".into(), text: b"/laptop/a".to_vec() });
+        assert!(server.clients[&id].attachments.pending.is_none());
+        assert!(matches!(&server.clients[&id].mode, Mode::Prompt(prompt) if prompt.value == "/laptop/a"));
     }
 
     #[test]
