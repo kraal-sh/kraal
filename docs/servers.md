@@ -218,7 +218,14 @@ it installs kraal on the server when it has none, then attaches.
 Attach from a terminal of your own: inside a kraal pane, `kraal attach` refuses to nest (the
 sidebar's agents and `alt+a` open such a tab for you, see below). Ctrl+click on a link in a
 remote session opens it on your machine. A `localhost` address there is
-the server's, not yours: kraal copies it and says so instead of opening the wrong page.
+the server's, not yours: kraal keeps it in paste buffers, sends a copy to your terminal, and
+says where the address works instead of opening the wrong page.
+
+Copies from the remote session travel back to a client's terminal as OSC 52. A selection goes
+to your client; a program's copy goes to the most recently used client viewing its workspace.
+The terminal must allow clipboard writes. **copy sent to terminal** does not confirm a system
+clipboard write. See [Clipboard](terminal.md#clipboard) for Ghostty, iTerm2, Terminal.app,
+tmux, local kraal, and programs that write the server's own graphical clipboard instead.
 
 ### Agents on your servers
 

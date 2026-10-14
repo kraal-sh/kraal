@@ -1087,22 +1087,50 @@ impl Server {
         }
     }
 
-    /// Copy `text` to the client's clipboard, and keep it as the newest paste buffer.
+    /// Send `text` to the client's terminal, and keep it as the newest paste buffer.
     pub(super) fn copy_to_client(&mut self, id: ClientId, text: &str) {
         self.keep_copy(text);
         self.send_clipboard(id, text);
     }
 
-    /// Copy `text` to the client's clipboard (through its terminal) only.
+    /// Ask the client's terminal to write its clipboard, without changing paste buffers.
     pub(super) fn send_clipboard(&mut self, id: ClientId, text: &str) {
-        if let Some(c) = self.clients.get(&id) {
-            let _ = c.out.try_send(super::frame_bytes(&osc52(text)));
-        }
-        let n = text.chars().count();
-        self.toast(id, format!("copied {n} character{}", if n == 1 { "" } else { "s" }));
+        let Some(c) = self.clients.get(&id) else { return };
+        let sent = c.out.try_send(super::frame_bytes(&osc52(text))).is_ok();
+        self.toast(id, if sent { "copy sent to terminal" } else { "copy not sent: try again" });
     }
 }
 
 pub(super) fn plural(n: usize) -> &'static str {
     if n == 1 { "" } else { "s" }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::server::{
+        queue,
+        tests::{client, server},
+    };
+
+    #[test]
+    fn clipboard_message_reports_sending_without_claiming_a_clipboard_write() {
+        let (tx, _events) = queue::channel(4096);
+        let mut server = server(tx);
+        let (id, peer) = client(&mut server);
+        server.copy_to_client(id, "hello");
+        assert_eq!(server.clients[&id].toast.as_ref().unwrap().0, "copy sent to terminal");
+        assert_eq!(server.buffers.get(None).unwrap().text, "hello");
+        drop(peer);
+        // The writer learns the peer is gone asynchronously on macOS.
+        let start = std::time::Instant::now();
+        loop {
+            server.copy_to_client(id, "next");
+            if server.clients[&id].toast.as_ref().unwrap().0 == "copy not sent: try again" {
+                break;
+            }
+            assert!(start.elapsed() < crate::testing::PATIENCE, "the closed client still accepts copies");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(server.buffers.get(None).unwrap().text, "next");
+    }
 }
