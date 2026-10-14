@@ -10,6 +10,7 @@ use crate::input::KeySpec;
 use crate::layout::PaneId;
 use crate::pane::PaneSpec;
 use crate::protocol::{self, Request, Response, ServerMsg, WorkspaceInfo};
+use crate::theme::NoticeKind;
 
 type Reply = Option<Result<Response, String>>;
 
@@ -239,7 +240,7 @@ impl Server {
                 Response::Ok
             }),
             Request::Notify { title, body } => {
-                self.notify(&title, &body, None);
+                self.notify(NoticeKind::Notice, &title, &body, None);
                 Ok(Response::Ok)
             }
             Request::ImportWorkspace { path, name, expected, accounts } => {

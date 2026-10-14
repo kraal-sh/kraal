@@ -8,6 +8,7 @@ use super::{ClientId, Server, forms, overlays};
 use crate::ansi::Cursor;
 use crate::input::InputEvent;
 use crate::servers::{self, Inventory};
+use crate::theme::NoticeKind;
 
 #[derive(Default)]
 pub struct ServerForm {
@@ -192,6 +193,7 @@ impl Server {
         if !active {
             self.toast(
                 id,
+                if result.is_ok() { NoticeKind::Notice } else { NoticeKind::Error },
                 match result {
                     Ok((_, true)) => "Server added".into(),
                     Ok((_, false)) => "Server already saved".into(),
@@ -216,7 +218,7 @@ impl Server {
                 }
                 picker.actions = None;
                 picker.select(|i| matches!(&i.action, super::ui::PickAction::Ssh(s) if *s == name));
-                picker.result(if added { "Server added" } else { "Server already saved" })
+                picker.result(NoticeKind::Notice, if added { "Server added" } else { "Server already saved" })
             }
             Err(e) => {
                 p.server_form.as_mut().unwrap().pending = None;

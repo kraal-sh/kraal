@@ -214,6 +214,10 @@ goes on in the rows below it, each marked `↪` in the margin.
 Background warnings leave an active message and its actions visible until it expires or another
 action replaces it. Those warnings stay in Messages; they are not shown later as a delayed error.
 When no message is active, warnings appear in the notice line too.
+Successes and other plain notices use the theme's normal text colour. Errors and warnings use
+its blocked colour (salmon red in the default theme), both in the bar and in Messages, including
+the notice line while an overlay is open. State icons, mode badges and production markers keep
+their own colours.
 
 ## Your own keys
 

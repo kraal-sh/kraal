@@ -17,6 +17,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail};
 
 use crate::protocol::{self, ClientMsg, Request, Response, ServerMsg};
+use crate::theme::NoticeKind;
 use crate::{paths, process};
 
 /// How long a session may take to have a server that listens, from the moment one is asked for.
@@ -895,12 +896,26 @@ fn connect(target: &Target) -> Result<Conn> {
 }
 
 /// Write a one-line status over the bottom of the screen (used while reconnecting).
-fn status_line(msg: &str) {
+fn status_line(kind: NoticeKind, msg: &str) {
     let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
+    let _ = terminal().write(&notice_lines(&[(msg.to_string(), Some(kind))], cols, rows));
+}
+
+fn notice_lines(lines: &[(String, Option<NoticeKind>)], cols: u16, rows: u16) -> Vec<u8> {
     // Leave the last column empty: writing there would scroll the screen.
-    let text = crate::text::truncate(msg, usize::from(cols).saturating_sub(2));
-    let line = format!("\x1b7\x1b[?7l\x1b[{rows};1H\x1b[0m\x1b[41;97m {text}\x1b[K\x1b[0m\x1b[?7h\x1b8");
-    let _ = terminal().write(line.as_bytes());
+    let width = usize::from(cols).saturating_sub(2);
+    let count = lines.len().min(usize::from(rows));
+    let mut out = b"\x1b7\x1b[?7l".to_vec();
+    for (i, (line, kind)) in lines.iter().take(count).enumerate() {
+        let row = usize::from(rows) - count + i + 1;
+        out.extend_from_slice(format!("\x1b[{row};1H\x1b[0m").as_bytes());
+        if let Some(kind) = kind {
+            crate::ansi::foreground(&mut out, kind.colour(crate::theme::current()));
+        }
+        out.extend_from_slice(format!(" {}\x1b[K\x1b[0m", crate::text::truncate(line, width)).as_bytes());
+    }
+    out.extend_from_slice(b"\x1b[?7h\x1b8");
+    out
 }
 
 /// A connection the server answered.
@@ -1100,8 +1115,12 @@ pub fn attach(mut target: Target, mut workspace: Option<String>, mouse: bool, at
     }
     // A malformed configuration must not prevent reaching an existing session, nor
     // grant clipboard access whose policy could not be read.
-    let clipboard_settings =
-        crate::config::Config::load().map(|cfg| cfg.clipboard).unwrap_or(crate::clipboard::Settings {
+    let clipboard_settings = crate::config::Config::load()
+        .map(|cfg| {
+            crate::theme::set(crate::theme::Theme::from_config(&cfg.theme).0);
+            cfg.clipboard
+        })
+        .unwrap_or(crate::clipboard::Settings {
             mode: crate::clipboard::Mode::Off,
             max_bytes: crate::clipboard::MAX_BYTES,
         });
@@ -1367,12 +1386,16 @@ pub fn attach(mut target: Target, mut workspace: Option<String>, mouse: bool, at
                 break 'session format!("gave up reconnecting to {label}");
             }
             let left = until.saturating_duration_since(Instant::now()).as_secs() + 1;
-            status_line(&format!(
-                "kraal: connection to {label} lost ({lost}). Reconnecting in {left}s… ctrl+c to quit"
-            ));
+            status_line(
+                NoticeKind::Warning,
+                &format!("kraal: connection to {label} lost ({lost}). Reconnecting in {left}s… ctrl+c to quit"),
+            );
             std::thread::sleep(Duration::from_millis(200));
         }
-        status_line(&format!("kraal: reconnecting to {label}… (ssh may ask for a password; ctrl+c to quit)"));
+        status_line(
+            NoticeKind::Notice,
+            &format!("kraal: reconnecting to {label}… (ssh may ask for a password; ctrl+c to quit)"),
+        );
         delay = (delay * 2).min(Duration::from_secs(15));
     };
     attachments.shutdown();
@@ -1427,7 +1450,7 @@ fn wait_restarted(session: &str, old: Option<libc::pid_t>, quit: &AtomicBool) ->
             let log = paths::log_path(session);
             return Err(format!("the session did not come back after its restart; see {}", log.display()));
         }
-        status_line("kraal: the session restarts… ctrl+c to quit");
+        status_line(NoticeKind::Notice, "kraal: the session restarts… ctrl+c to quit");
         std::thread::sleep(Duration::from_millis(100));
     }
 }
@@ -1466,6 +1489,18 @@ pub fn proxy(session: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn connection_notices_use_neutral_text_or_blocked_and_restore_the_cursor() {
+        for (kind, sgr) in [(NoticeKind::Notice, "37"), (NoticeKind::Warning, "91"), (NoticeKind::Error, "91")] {
+            for (cols, rows) in [(80, 24), (124, 36)] {
+                let bytes = String::from_utf8(notice_lines(&[("result".into(), Some(kind))], cols, rows)).unwrap();
+                assert!(bytes.contains(&format!("\x1b[{rows};1H\x1b[0m\x1b[{sgr}m result\x1b[K\x1b[0m")));
+                assert!(bytes.starts_with("\x1b7\x1b[?7l"));
+                assert!(bytes.ends_with("\x1b[?7h\x1b8"));
+            }
+        }
+    }
 
     #[test]
     fn clipboard_policy_requires_a_server_greeting_with_the_capability() {

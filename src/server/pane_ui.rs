@@ -14,6 +14,7 @@ use crate::ansi::Cursor;
 use crate::input::InputEvent;
 use crate::layout::PaneId;
 use crate::pane::{PaneSpec, ProcessHold};
+use crate::theme::NoticeKind;
 
 pub struct PaneForm {
     pane: PaneId,
@@ -101,7 +102,7 @@ impl Server {
             ));
         }
         if self.pane_edits.contains_key(&pane) {
-            self.toast(client, "Applying pane changes. Waiting for its programs to stop.");
+            self.toast(client, NoticeKind::Notice, "Applying pane changes. Waiting for its programs to stop.");
             return Mode::Normal;
         }
         let folder =
@@ -311,7 +312,7 @@ impl Server {
                 return Mode::PaneForm(Box::new(form));
             }
             self.mark_dirty();
-            self.toast(client, "Pane updated");
+            self.toast(client, NoticeKind::Notice, "Pane updated");
             return Mode::Normal;
         }
         // A crash during the stop restores the requested command waiting for Enter.
@@ -336,7 +337,7 @@ impl Server {
             stop.signal(libc::SIGHUP);
         }
         self.pane_edits.get_mut(&pane).unwrap().stopping = stop;
-        self.toast(client, "Applying pane changes. Waiting for its programs to stop.");
+        self.toast(client, NoticeKind::Notice, "Applying pane changes. Waiting for its programs to stop.");
         self.check_pane_edits();
         Mode::Normal
     }
@@ -417,9 +418,13 @@ impl Server {
             if let Err(e) = result {
                 let reason = format!("Could not start. Open Edit pane to correct it, or Enter to retry.\n{e:#}");
                 let _ = self.suspend_pane(id, edit.spec, &reason);
-                self.toast(edit.client, reason);
+                self.toast(edit.client, NoticeKind::Error, reason);
             } else {
-                self.toast(edit.client, if edit.run { "Pane updated" } else { "Pane updated · Enter Run" });
+                self.toast(
+                    edit.client,
+                    NoticeKind::Notice,
+                    if edit.run { "Pane updated" } else { "Pane updated · Enter Run" },
+                );
             }
             let ssh = self.panes.get(&id).and_then(|p| self.ssh_target_of(&p.spec));
             if let Some(pane) = self.panes.get_mut(&id) {

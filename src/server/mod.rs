@@ -70,6 +70,7 @@ use crate::pane::{Pane, PaneEnv, PaneSignal};
 use crate::paths;
 use crate::persist;
 use crate::protocol::ServerMsg;
+use crate::theme::NoticeKind;
 
 pub use agents::usage_text;
 pub use clients::frame_bytes;
@@ -427,10 +428,10 @@ pub struct Client {
     pub last_input: Instant,
     pub terminal_focused: bool,
     pub drag: Option<ui::Drag>,
-    pub toast: Option<(String, Instant)>,
+    pub toast: Option<(String, Instant, NoticeKind)>,
     pub toast_action: Option<(PaneId, attention::ToastAction)>,
     /// A message to show once the one shown now goes.
-    pub notice: Option<String>,
+    pub notice: Option<(String, NoticeKind)>,
     /// Click bookkeeping for double/triple click selection.
     pub last_click: Option<(Instant, u16, u16, u8)>,
     /// The first session's welcome note is showing.
@@ -457,7 +458,7 @@ pub struct Client {
 pub struct Message {
     pub at: std::time::SystemTime,
     pub text: String,
-    pub warning: bool,
+    pub kind: NoticeKind,
 }
 
 /// Messages kept for the log.
@@ -1086,8 +1087,11 @@ impl Server {
     pub fn set_mode_if_idle(&mut self, client: ClientId, mode: Mode) {
         let Some(c) = self.clients.get_mut(&client) else { return };
         if !matches!(c.mode, Mode::Normal | Mode::Leader { .. }) {
-            c.toast =
-                Some(("finish what you are doing, then ask again".into(), Instant::now() + Duration::from_secs(3)));
+            c.toast = Some((
+                "finish what you are doing, then ask again".into(),
+                Instant::now() + Duration::from_secs(3),
+                NoticeKind::Warning,
+            ));
             c.toast_action = None;
             return;
         }
@@ -1301,7 +1305,7 @@ impl Server {
             if let Some(p) = c.pending_since {
                 d = d.min(p + INPUT_FLUSH);
             }
-            if let Some((_, until)) = &c.toast {
+            if let Some((_, until, _)) = &c.toast {
                 d = d.min(*until);
             }
         }
@@ -1343,16 +1347,20 @@ impl Server {
         for id in flush {
             self.flush_client_input(id);
         }
-        let expired: Vec<ClientId> =
-            self.clients.values().filter(|c| c.toast.as_ref().is_some_and(|(_, t)| *t <= now)).map(|c| c.id).collect();
+        let expired: Vec<ClientId> = self
+            .clients
+            .values()
+            .filter(|c| c.toast.as_ref().is_some_and(|(_, t, _)| *t <= now))
+            .map(|c| c.id)
+            .collect();
         for id in expired {
             let notice = self.clients.get_mut(&id).and_then(|c| {
                 c.toast = None;
                 c.toast_action = None;
                 c.notice.take()
             });
-            if let Some(text) = notice {
-                self.toast(id, text);
+            if let Some((text, kind)) = notice {
+                self.toast(id, kind, text);
             }
             self.mark_dirty_client(id);
         }
@@ -1791,7 +1799,7 @@ impl Server {
             match s {
                 PaneSignal::Notification { title, body } => {
                     let title = if title.is_empty() { self.pane_label(id) } else { title };
-                    self.notify(&title, &body, Some(id));
+                    self.notify(NoticeKind::Notice, &title, &body, Some(id));
                 }
                 PaneSignal::Clipboard(text) => {
                     self.keep_copy(&text);

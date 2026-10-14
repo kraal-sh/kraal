@@ -545,6 +545,12 @@ fn named_index(c: Color) -> Option<u8> {
     })
 }
 
+pub fn foreground(out: &mut Vec<u8>, colour: Color) {
+    out.extend_from_slice(b"\x1b[");
+    color_param(out, colour, Layer::Fg);
+    out.push(b'm');
+}
+
 /// The SGR parameters that set colour `c` on `layer`, appended to `out`.
 fn color_param(out: &mut Vec<u8>, c: Color, layer: Layer) {
     let _ = match (layer, c) {

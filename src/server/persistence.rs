@@ -12,6 +12,7 @@ use super::{ClientId, Event, EventSender, Server};
 use crate::layout::PaneId;
 use crate::paths;
 use crate::persist::{self, SavedScrollback, SessionSnapshot};
+use crate::theme::NoticeKind;
 
 /// A pane that keeps printing has its scrollback saved again at most this often.
 const SCROLLBACK_EVERY: Duration = Duration::from_secs(10);
@@ -349,7 +350,7 @@ impl Server {
     pub(super) fn quit(&mut self, client: ClientId) {
         match self.save_now() {
             Ok(()) => self.quitting = true,
-            Err(e) => self.toast(client, format!("not quitting: {e}")),
+            Err(e) => self.toast(client, NoticeKind::Error, format!("not quitting: {e}")),
         }
     }
 
@@ -360,8 +361,8 @@ impl Server {
             .and_then(|exe| crate::client::restart_detached(&exe, &self.session))
             .map(crate::exec::reap_later);
         match started {
-            Ok(()) => self.toast(client, "restarting the session…"),
-            Err(e) => self.toast(client, format!("cannot restart: {e:#}")),
+            Ok(()) => self.toast(client, NoticeKind::Notice, "restarting the session…"),
+            Err(e) => self.toast(client, NoticeKind::Error, format!("cannot restart: {e:#}")),
         }
     }
 }
@@ -611,7 +612,7 @@ pub(super) mod tests {
             server.copy_to_client(client, "text");
             server.client_input(client, b"\x02q");
             assert!(matches!(server.clients[&client].mode, Mode::Confirm(_)));
-            let (text, until) = server.clients[&client].toast.as_ref().unwrap();
+            let (text, until, _) = server.clients[&client].toast.as_ref().unwrap();
             assert_eq!(text, "copy sent to terminal");
             assert!(*until > Instant::now());
             server.client_input(client, b"y");
@@ -627,7 +628,7 @@ pub(super) mod tests {
             let result = format!("not quitting: {error}");
             assert_eq!(server.clients[&client].toast.as_ref().unwrap().0, result);
             assert!(server.messages.iter().any(|m| m.text == result));
-            assert!(server.messages.iter().any(|m| m.warning && m.text == error));
+            assert!(server.messages.iter().any(|m| m.kind == NoticeKind::Warning && m.text == error));
             assert_eq!(saved.lock().unwrap().len(), 1);
             server.client_input(client, b"\x02qy");
             assert!(server.quitting, "Quit can be retried once saving works");

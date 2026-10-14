@@ -20,6 +20,7 @@ use crate::layout::PaneId;
 use crate::pane::PaneSpec;
 use crate::protocol::{PaneInfo, Placement};
 use crate::servers;
+use crate::theme::NoticeKind;
 
 /// A longer line is not a list kraal printed: it is dropped.
 const MAX_LINE: usize = 4 << 20;
@@ -378,10 +379,10 @@ impl Server {
             let title = format!("{} · {} on {server}", a.agent, a.name);
             match a.state {
                 AgentState::Blocked if self.config.notifications.on_blocked => {
-                    self.notify(&title, "needs your input", None)
+                    self.notify(NoticeKind::Notice, &title, "needs your input", None)
                 }
                 AgentState::Done if self.config.notifications.on_done && before == Some(AgentState::Working) => {
-                    self.notify(&title, "finished", None)
+                    self.notify(NoticeKind::Notice, &title, "finished", None)
                 }
                 _ => {}
             }
@@ -457,7 +458,7 @@ impl Server {
     /// shown there, or a new tab that attaches to it.
     pub(super) fn go_to_remote(&mut self, client: ClientId, server: &str, pane: u32) {
         let Some(w) = self.remotes.iter().find(|w| w.server.name == server) else {
-            self.toast(client, format!("{server} lists no agents any more"));
+            self.toast(client, NoticeKind::Notice, format!("{server} lists no agents any more"));
             return;
         };
         let (target, session) = (w.server.clone(), w.session.clone());
@@ -482,7 +483,7 @@ impl Server {
         // kraal in kraal: this attach is meant.
         let spec = PaneSpec { command, env_remove: vec!["KRAAL_PANE".into()], ..Default::default() };
         if let Err(e) = self.spawn_pane_in(ws, None, spec, Placement::Tab, Some(server.to_string())) {
-            self.toast(client, format!("{e:#}"));
+            self.toast(client, NoticeKind::Error, format!("{e:#}"));
         }
     }
 
@@ -505,7 +506,11 @@ impl Server {
             },
             move |server, result| {
                 if let Err(e) = result {
-                    server.toast(client, format!("{name} did not show that agent: {}", clean(&e, 200)));
+                    server.toast(
+                        client,
+                        NoticeKind::Error,
+                        format!("{name} did not show that agent: {}", clean(&e, 200)),
+                    );
                 }
             },
         );

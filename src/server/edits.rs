@@ -14,6 +14,7 @@ use crate::edit::{self, Channel, RemoteFile, Saved, Stamp};
 use crate::layout::PaneId;
 use crate::pane::PaneSpec;
 use crate::protocol::{Placement, Response, ServerMsg};
+use crate::theme::NoticeKind;
 
 /// How long the pane asking for a sudo password waits for it.
 const PASSWORD_WAIT: Duration = Duration::from_secs(300);
@@ -307,7 +308,7 @@ impl Server {
                 self.send_msg(r, &ServerMsg::Response { result: Err(why) });
                 self.clients.remove(&r);
             }
-            None => self.toast(client.unwrap_or(0), why),
+            None => self.toast(client.unwrap_or(0), NoticeKind::Error, why),
         }
     }
 
@@ -375,9 +376,9 @@ impl Server {
         asked.filter(attached).or(self.primary.filter(attached)).unwrap_or(0)
     }
 
-    fn edit_toast(&mut self, id: u32, message: String) {
+    fn edit_toast(&mut self, id: u32, kind: NoticeKind, message: String) {
         let client = self.edit_client(id);
-        self.toast(client, message);
+        self.toast(client, kind, message);
     }
 
     /// Look at each edited copy: send what was saved, ask what was not answered, and end the
@@ -460,13 +461,21 @@ impl Server {
             Checked::Unreadable(err) => {
                 let gone = err.kind() == std::io::ErrorKind::NotFound;
                 if closed && gone {
-                    self.edit_toast(id, format!("{name}: the editor's copy is gone, nothing more was saved"));
+                    self.edit_toast(
+                        id,
+                        NoticeKind::Warning,
+                        format!("{name}: the editor's copy is gone, nothing more was saved"),
+                    );
                     self.finish_edit(id);
                 } else if closed {
-                    self.edit_toast(id, format!("{name} was not saved: {err}; your copy stays in {}", dir.display()));
+                    self.edit_toast(
+                        id,
+                        NoticeKind::Error,
+                        format!("{name} was not saved: {err}; your copy stays in {}", dir.display()),
+                    );
                     self.forget_edit(id);
                 } else if !gone {
-                    self.edit_toast(id, format!("{name} was not saved: {err}"));
+                    self.edit_toast(id, NoticeKind::Error, format!("{name} was not saved: {err}"));
                 }
             }
             Checked::Same => {
@@ -477,13 +486,13 @@ impl Server {
             Checked::Kept(content) => {
                 e.remote = content;
                 let shown = e.kept.as_deref().map(crate::paths::shorten_home).unwrap_or_default();
-                self.edit_toast(id, format!("{name} saved in {shown}"));
+                self.edit_toast(id, NoticeKind::Notice, format!("{name} saved in {shown}"));
                 if closed {
                     self.finish_edit(id);
                 }
             }
             Checked::KeepFailed(err) => {
-                self.edit_toast(id, format!("{name}: {err}; your copy stays in {}", dir.display()));
+                self.edit_toast(id, NoticeKind::Error, format!("{name}: {err}; your copy stays in {}", dir.display()));
                 self.forget_edit(id);
             }
             Checked::Sent(content, result) => self.edit_sent(id, content, result),
@@ -500,7 +509,7 @@ impl Server {
                 e.identity = identity;
                 e.remote = content;
                 e.conflict = None;
-                self.edit_toast(id, format!("{name} saved to {server}"));
+                self.edit_toast(id, NoticeKind::Notice, format!("{name} saved to {server}"));
                 self.refresh_file_managers();
             }
             Ok(Saved::Changed(identity)) => {
@@ -508,14 +517,15 @@ impl Server {
                 e.asked = false;
                 self.edit_toast(
                     id,
+                    NoticeKind::Warning,
                     format!("{name} changed on {server} since you opened it: your version was not sent"),
                 );
             }
             Err(err) if closed => {
-                self.edit_toast(id, format!("{name} was not saved to {server}: {err:#}"));
+                self.edit_toast(id, NoticeKind::Error, format!("{name} was not saved to {server}: {err:#}"));
                 self.keep_edit_locally(id, "it could not be saved");
             }
-            Err(err) => self.edit_toast(id, format!("{name} was not saved to {server}: {err:#}")),
+            Err(err) => self.edit_toast(id, NoticeKind::Error, format!("{name} was not saved to {server}: {err:#}")),
         }
     }
 
@@ -582,7 +592,7 @@ impl Server {
     /// The user's answer about edit `id`.
     pub(super) fn answer_edit(&mut self, client: ClientId, id: u32, answer: Answer) {
         let Some(i) = self.edit_index(id) else {
-            self.toast(client, "that edit is over");
+            self.toast(client, NoticeKind::Notice, "that edit is over");
             return;
         };
         let e = &mut self.edits[i];
@@ -609,14 +619,14 @@ impl Server {
                             if let Some(i) = server.edit_index(id) {
                                 server.edits[i].busy = false;
                             }
-                            server.toast(client, format!("{name} was not saved: {err}"));
+                            server.toast(client, NoticeKind::Error, format!("{name} was not saved: {err}"));
                         }
                         checked => server.edit_checked(id, checked),
                     },
                 )
             }
             Answer::KeepServer if e.closed => {
-                self.toast(client, format!("{name}: the version of {server} stays"));
+                self.toast(client, NoticeKind::Notice, format!("{name}: the version of {server} stays"));
                 self.finish_edit(id);
                 return;
             }
@@ -665,12 +675,12 @@ impl Server {
                 e.remote = content;
                 let shown = crate::paths::shorten_home(&path);
                 let next = if e.closed { "" } else { "; your next saves go there" };
-                self.toast(client, format!("{name} kept in {shown}, {server} keeps its own{next}"));
+                self.toast(client, NoticeKind::Notice, format!("{name} kept in {shown}, {server} keeps its own{next}"));
                 if self.edits[i].closed {
                     self.finish_edit(id);
                 }
             }
-            Err(err) => self.toast(client, format!("{name} could not be kept: {err}")),
+            Err(err) => self.toast(client, NoticeKind::Error, format!("{name} could not be kept: {err}")),
         }
     }
 
@@ -684,25 +694,37 @@ impl Server {
         let (name, server) = (e.name(), e.target.server.clone());
         match reloaded {
             Ok((_, Some(_))) if !running => {
-                self.edit_toast(id, format!("{name}: the version of {server} stays"));
+                self.edit_toast(id, NoticeKind::Notice, format!("{name}: the version of {server} stays"));
                 self.finish_edit(id);
             }
             Ok((o, Some(stamp))) => {
                 e.seen = Some(stamp);
                 e.settling = false;
                 (e.file, e.remote, e.identity) = (o.file, o.content, o.identity);
-                self.edit_toast(id, format!("{name}: the editor's copy is the version of {server} now (reload it)"));
+                self.edit_toast(
+                    id,
+                    NoticeKind::Notice,
+                    format!("{name}: the editor's copy is the version of {server} now (reload it)"),
+                );
             }
             Ok((o, None)) => {
                 e.conflict = Some(o.identity);
                 e.asked = false;
-                self.edit_toast(id, format!("{name}: you saved again meanwhile, nothing was replaced"));
+                self.edit_toast(
+                    id,
+                    NoticeKind::Warning,
+                    format!("{name}: you saved again meanwhile, nothing was replaced"),
+                );
             }
             Err(err) => {
                 // Asked again at the next save, or when the editor ends.
                 e.conflict = Some(conflict);
                 e.asked = true;
-                self.edit_toast(id, format!("{name}: the version of {server} could not be read: {err:#}"));
+                self.edit_toast(
+                    id,
+                    NoticeKind::Error,
+                    format!("{name}: the version of {server} could not be read: {err:#}"),
+                );
             }
         }
     }
@@ -732,12 +754,17 @@ impl Server {
                         let shown = crate::paths::shorten_home(&path);
                         server.edit_toast(
                             id,
+                            NoticeKind::Warning,
                             format!("{name}: {why}; your version is in {shown}, {target} keeps its own"),
                         );
                         server.finish_edit(id);
                     }
                     Err(err) => {
-                        server.edit_toast(id, format!("{name}: {why}, and {err}: your copy stays in {dir}"));
+                        server.edit_toast(
+                            id,
+                            NoticeKind::Error,
+                            format!("{name}: {why}, and {err}: your copy stays in {dir}"),
+                        );
                         server.forget_edit(id);
                     }
                 }

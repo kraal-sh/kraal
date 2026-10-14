@@ -14,6 +14,7 @@ use super::{ClientId, Event, Mode, Server};
 use crate::attachments::{self, Batch};
 use crate::layout::PaneId;
 use crate::protocol::{ClientMsg, ServerMsg};
+use crate::theme::NoticeKind;
 
 #[derive(Default)]
 pub(super) struct Attachments {
@@ -45,7 +46,7 @@ impl Drop for Pending {
 pub enum Completion {
     Ack(Result<u64>),
     Finished(Result<String>),
-    Status(String),
+    Status(String, NoticeKind),
     Purged(std::io::Result<bool>),
     Recorded(Result<()>),
 }
@@ -116,30 +117,35 @@ impl Server {
         let Some(c) = self.clients.get(&id) else { return Mode::Normal };
         let action = if image { "Attach clipboard image" } else { "Attach files" };
         if !c.attached || !c.attachments.negotiated {
-            self.toast(id, format!("{action} needs a newer client. Update kraal on your laptop and attach again."));
+            self.toast(
+                id,
+                NoticeKind::Warning,
+                format!("{action} needs a newer client. Update kraal on your laptop and attach again."),
+            );
             return Mode::Normal;
         }
         if image && !c.attachments.images {
             self.toast(
                 id,
+                NoticeKind::Warning,
                 "Attach clipboard image needs a newer client. Update kraal on your laptop and attach again.",
             );
             return Mode::Normal;
         }
         if c.attachments.blocked.is_some() {
-            self.toast(id, "Close the attachment result before trying again.");
+            self.toast(id, NoticeKind::Warning, "Close the attachment result before trying again.");
             return Mode::Normal;
         }
         if c.attachments.pending.is_some() {
-            self.toast(id, "An attachment is already open. Finish it or press Ctrl+C to cancel.");
+            self.toast(id, NoticeKind::Warning, "An attachment is already open. Finish it or press Ctrl+C to cancel.");
             return Mode::Normal;
         }
         let Some(pane) = confirmed.or_else(|| self.client_focus(id)) else {
-            self.toast(id, "Add a terminal pane before attaching files.");
+            self.toast(id, NoticeKind::Warning, "Add a terminal pane before attaching files.");
             return Mode::Normal;
         };
         if !self.attachment_target(pane) {
-            self.toast(id, "Select a running terminal pane before attaching files.");
+            self.toast(id, NoticeKind::Warning, "Select a running terminal pane before attaching files.");
             return Mode::Normal;
         }
         if confirmed.is_none() && self.input_targets(id, pane).len() != 1 {
@@ -193,7 +199,10 @@ impl Server {
             && self.clients[&id].attachments.blocked.is_none()
         {
             self.client_input(id, &[b"\x1b[200~".as_slice(), &text, b"\x1b[201~"].concat());
-            self.send_msg(id, &ServerMsg::AttachmentResult { token, message: String::new(), pasted: true });
+            self.send_msg(
+                id,
+                &ServerMsg::AttachmentResult { kind: NoticeKind::Notice, token, message: String::new(), pasted: true },
+            );
             return;
         }
         let reserved = self.clients.get_mut(&id).unwrap().paste.take();
@@ -216,7 +225,12 @@ impl Server {
         if let Some(error) = error {
             self.send_msg(
                 id,
-                &ServerMsg::AttachmentResult { pasted: false, token, message: format!("No paths pasted. {error}") },
+                &ServerMsg::AttachmentResult {
+                    kind: NoticeKind::Error,
+                    pasted: false,
+                    token,
+                    message: format!("No paths pasted. {error}"),
+                },
             );
             return;
         }
@@ -283,8 +297,8 @@ impl Server {
                 if image { "Attach clipboard image" } else { "Attach files" }
             )
         };
-        self.toast(id, &message);
-        self.send_msg(id, &ServerMsg::AttachmentResult { pasted: false, token, message });
+        self.toast(id, NoticeKind::Error, &message);
+        self.send_msg(id, &ServerMsg::AttachmentResult { kind: NoticeKind::Error, pasted: false, token, message });
     }
 
     pub(super) fn attachment_message(&mut self, id: ClientId, msg: ClientMsg) {
@@ -327,16 +341,17 @@ impl Server {
             let session = self.session.clone();
             let lookup = token.clone();
             if let Err(error) = self.attachment_job(id, token.clone(), move |_| {
-                let message = attachments::result(&session, &lookup).unwrap_or_else(|_| {
-                    if status {
+                let (message, kind) = attachments::result(&session, &lookup).unwrap_or_else(|_| {
+                    let message = if status {
                         "No completed batch found. No automatic retry. Inspect the pane, then use Attach files to retry.".into()
                     } else {
                         "Attachment expired. Use Attach files to retry.".into()
-                    }
+                    };
+                    (message, NoticeKind::Warning)
                 });
-                Completion::Status(message)
+                Completion::Status(message, kind)
             }) {
-                self.send_msg(id, &ServerMsg::AttachmentResult { pasted: false, token, message: format!("Cannot read attachment result: {error}") });
+                self.send_msg(id, &ServerMsg::AttachmentResult { kind: NoticeKind::Error, pasted: false, token, message: format!("Cannot read attachment result: {error}") });
             }
             return;
         }
@@ -419,13 +434,15 @@ impl Server {
                 let mode = self.paste_to(id, pane, &[pane], text);
                 self.clients.get_mut(&id).unwrap().mode = mode;
                 let same_focus = self.client_focus(id) == Some(pane);
+                let kind =
+                    if !same_focus && !pending.keys.is_empty() { NoticeKind::Warning } else { NoticeKind::Notice };
                 let message = if !same_focus && !pending.keys.is_empty() {
                     self.clients.get_mut(&id).unwrap().attachments.blocked = Some(token.clone());
                     "Text submitted to the reserved pane. Focus changed: queued typing discarded. Press Ctrl+C, then select the pane before typing."
                 } else {
                     "Text submitted to the reserved pane. No Enter added."
                 };
-                self.send_msg(id, &ServerMsg::AttachmentResult { pasted: true, token, message: message.into() });
+                self.send_msg(id, &ServerMsg::AttachmentResult { kind, pasted: true, token, message: message.into() });
                 if same_focus {
                     self.client_input(id, &pending.keys);
                 }
@@ -446,13 +463,15 @@ impl Server {
                 let mode = self.paste_to(id, pane, &[pane], paths.into_bytes());
                 self.clients.get_mut(&id).unwrap().mode = mode;
                 let same_focus = self.client_focus(id) == Some(pane);
+                let kind =
+                    if !same_focus && !pending.keys.is_empty() { NoticeKind::Warning } else { NoticeKind::Notice };
                 let message = if !same_focus && !pending.keys.is_empty() {
                     self.clients.get_mut(&id).unwrap().attachments.blocked = Some(token.clone());
                     "Local paths submitted to the reserved pane. Focus changed: queued typing discarded. Press Ctrl+C, then select the pane before typing."
                 } else {
                     "Local paths submitted to the reserved pane. No Enter added."
                 };
-                self.send_msg(id, &ServerMsg::AttachmentResult { pasted: true, token, message: message.into() });
+                self.send_msg(id, &ServerMsg::AttachmentResult { kind, pasted: true, token, message: message.into() });
                 if same_focus {
                     self.client_input(id, &pending.keys);
                 }
@@ -479,37 +498,43 @@ impl Server {
             .map_err(|_| anyhow::anyhow!("attachment storage is busy; try again"))
     }
 
-    fn record_attachment(&mut self, id: ClientId, token: &str, message: &str) {
+    fn record_attachment(&mut self, id: ClientId, token: &str, message: &str, kind: NoticeKind) {
         let session = self.session.clone();
         let saved_token = token.to_string();
         let message = message.to_string();
         if let Err(error) = self.attachment_job(id, token.to_string(), move |_| {
-            Completion::Recorded(attachments::record(&session, &saved_token, &message))
+            Completion::Recorded(attachments::record(&session, &saved_token, &message, kind))
         }) {
-            self.log_message(&format!("attachment result could not be saved: {error:#}"), false);
+            self.log_message(&format!("attachment result could not be saved: {error:#}"), NoticeKind::Error);
         }
     }
 
     pub(super) fn attachment_complete(&mut self, id: ClientId, token: String, result: Completion) {
         let result = match result {
-            Completion::Status(message) => {
-                // Version 1 records store the result as prose. Preserve that readable format.
+            Completion::Status(message, kind) => {
+                // Older records have no kind; their message remains readable.
                 let pasted = message.starts_with("Files received. Paths submitted to the reserved pane.");
-                self.send_msg(id, &ServerMsg::AttachmentResult { pasted, token, message });
+                self.send_msg(id, &ServerMsg::AttachmentResult { kind, pasted, token, message });
                 return;
             }
             Completion::Purged(result) => {
                 match result {
-                    Ok(_) => self.toast(id, "Attachments removed. Previously pasted paths no longer exist."),
-                    Err(e) => {
-                        self.toast(id, format!("Attachments could not be removed: {e}. Retry Purge attachments."))
-                    }
+                    Ok(_) => self.toast(
+                        id,
+                        NoticeKind::Notice,
+                        "Attachments removed. Previously pasted paths no longer exist.",
+                    ),
+                    Err(e) => self.toast(
+                        id,
+                        NoticeKind::Error,
+                        format!("Attachments could not be removed: {e}. Retry Purge attachments."),
+                    ),
                 }
                 return;
             }
             Completion::Recorded(result) => {
                 if let Err(error) = result {
-                    self.log_message(&format!("attachment result could not be saved: {error:#}"), false);
+                    self.log_message(&format!("attachment result could not be saved: {error:#}"), NoticeKind::Error);
                 }
                 return;
             }
@@ -539,13 +564,23 @@ impl Server {
                     let message = format!(
                         "Files kept, no paths or queued typing pasted: {error}. Press Ctrl+C, then use Attach files when the pane is ready."
                     );
-                    self.record_attachment(id, &token, &message);
-                    self.send_msg(id, &ServerMsg::AttachmentResult { pasted: false, token, message: message.clone() });
-                    self.toast(id, message);
+                    self.record_attachment(id, &token, &message, NoticeKind::Error);
+                    self.send_msg(
+                        id,
+                        &ServerMsg::AttachmentResult {
+                            kind: NoticeKind::Error,
+                            pasted: false,
+                            token,
+                            message: message.clone(),
+                        },
+                    );
+                    self.toast(id, NoticeKind::Error, message);
                     return;
                 }
                 let mode = self.paste_to(id, pending.pane, &[pending.pane], paths.into_bytes());
                 let same_focus = self.client_focus(id) == Some(pending.pane);
+                let kind =
+                    if !same_focus && !pending.keys.is_empty() { NoticeKind::Warning } else { NoticeKind::Notice };
                 let message = if !same_focus && !pending.keys.is_empty() {
                     self.clients.get_mut(&id).unwrap().attachments.blocked = Some(token.clone());
                     "Files received. Paths submitted to the reserved pane. Focus changed: queued typing discarded. Press Ctrl+C, then select the pane before typing."
@@ -553,9 +588,9 @@ impl Server {
                     "Files received. Paths submitted to the reserved pane. No Enter added."
                 };
                 self.clients.get_mut(&id).unwrap().mode = mode;
-                self.record_attachment(id, &token, message);
-                self.send_msg(id, &ServerMsg::AttachmentResult { pasted: true, token, message: message.into() });
-                self.toast(id, if !same_focus && !pending.keys.is_empty() {
+                self.record_attachment(id, &token, message, kind);
+                self.send_msg(id, &ServerMsg::AttachmentResult { kind, pasted: true, token, message: message.into() });
+                self.toast(id, kind, if !same_focus && !pending.keys.is_empty() {
                     "Attachment sent. Focus changed: queued typing discarded. Select the destination pane before typing."
                 } else if pending.image { "Image sent." } else { "Files sent." });
                 if same_focus {
@@ -583,14 +618,18 @@ impl Server {
 
     pub(super) fn purge_attachments(&mut self, id: ClientId) {
         if self.clients.values().any(|c| c.attachments.pending.is_some()) {
-            self.toast(id, "Cancel active attachments before purging.");
+            self.toast(id, NoticeKind::Warning, "Cancel active attachments before purging.");
             return;
         }
         let session = self.session.clone();
         if let Err(error) =
             self.attachment_job(id, String::new(), move |_| Completion::Purged(attachments::remove(&session)))
         {
-            self.toast(id, format!("Attachments could not be removed: {error}. Retry Purge attachments."));
+            self.toast(
+                id,
+                NoticeKind::Error,
+                format!("Attachments could not be removed: {error}. Retry Purge attachments."),
+            );
         }
     }
 }
@@ -966,7 +1005,7 @@ mod tests {
             b"abc"
         );
         let result = attachments::result(&server.session, &token).unwrap();
-        assert!(result.contains("reserved pane"));
+        assert!(result.0.contains("reserved pane"));
         server.clients.get_mut(&id).unwrap().toast = None;
         server.attachment_message(id, ClientMsg::AttachmentFinish { token: token.clone() });
         settle(&mut server, &rx);
@@ -1061,7 +1100,7 @@ mod tests {
         chunk(&mut server, id, &token, &rx);
         server.attachment_message(id, ClientMsg::AttachmentFinish { token: token.clone() });
         settle(&mut server, &rx);
-        assert!(attachments::result(&server.session, &token).unwrap().contains("reserved pane"));
+        assert!(attachments::result(&server.session, &token).unwrap().0.contains("reserved pane"));
         assert!(server.clients[&id].toast.as_ref().unwrap().0.contains("queued typing discarded"));
         assert!(server.attachment_input(id, b"\x03"));
         server.attachment_message(id, ClientMsg::AttachmentDismiss { token });

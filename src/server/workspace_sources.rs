@@ -3,6 +3,7 @@
 use anyhow::Context;
 
 use super::{Server, ui::Mode};
+use crate::theme::NoticeKind;
 use crate::{paths, persist, workspace};
 
 pub(super) fn source_missing(error: &anyhow::Error) -> bool {
@@ -18,13 +19,13 @@ impl Server {
                     let source = preview.revision.bytes.as_deref();
                     (source != ws.definition_source.as_deref().map(str::as_bytes)
                         && source != ws.source_reviewed.as_deref().map(str::as_bytes))
-                    .then_some("File changed")
+                    .then_some(("File changed", NoticeKind::Notice))
                 }
-                Err(e) if source_missing(&e) => Some("Source file missing"),
-                Err(_) => Some("File error"),
+                Err(e) if source_missing(&e) => Some(("Source file missing", NoticeKind::Warning)),
+                Err(_) => Some(("File error", NoticeKind::Error)),
             });
-            if status != ws.source_status {
-                ws.source_status = status;
+            if status.map(|(text, _)| text) != ws.source_status {
+                ws.source_status = status.map(|(text, _)| text);
                 changed.push((ws.id, status));
             }
         }
@@ -32,10 +33,10 @@ impl Server {
             return;
         }
         for (ws, status) in changed {
-            if let Some(status) = status {
+            if let Some((status, kind)) = status {
                 let clients: Vec<_> = self.clients.values().filter(|c| c.workspace == ws).map(|c| c.id).collect();
                 for client in clients {
-                    self.toast(client, format!("{status} · Review"));
+                    self.toast(client, kind, format!("{status} · Review"));
                     self.clients.get_mut(&client).unwrap().toast_action =
                         Some((0, super::attention::ToastAction::ReviewWorkspace(ws)));
                 }
@@ -191,11 +192,10 @@ impl Server {
     pub(super) fn source_result(&self, client: super::ClientId, ws: u32, undo: bool) -> Mode {
         let mut picker = self.workspace_picker(self.clients.get(&client).map_or(0, |c| c.workspace));
         picker.select(|i| i.action.workspace() == Some(ws));
-        picker.result(if undo {
-            "Layout restored · Enter Open"
-        } else {
-            "Layout loaded · Actions: Undo load · Enter Open"
-        })
+        picker.result(
+            NoticeKind::Notice,
+            if undo { "Layout restored · Enter Open" } else { "Layout loaded · Actions: Undo load · Enter Open" },
+        )
     }
 }
 
@@ -206,6 +206,26 @@ pub(super) mod tests {
 
     const ORIGINAL: &str = "layout { pane command=\"old\"; }";
     const CHANGED: &str = "layout { pane command=\"new\"; pane agent=\"legacy-agent\"; }";
+
+    #[test]
+    fn source_changes_are_notices_and_missing_or_invalid_sources_need_attention() {
+        let (mut server, path, ws) = setup("notice-kinds");
+        let (client, _peer) = super::super::tests::client(&mut server);
+        server.clients.get_mut(&client).unwrap().workspace = ws;
+        for (source, kind) in
+            [(Some(CHANGED), NoticeKind::Notice), (Some("layout {"), NoticeKind::Error), (None, NoticeKind::Warning)]
+        {
+            if let Some(source) = source {
+                std::fs::write(&path, source).unwrap();
+            } else {
+                std::fs::remove_file(&path).unwrap();
+            }
+            server.refresh_source_status();
+            assert_eq!(server.clients[&client].toast.as_ref().unwrap().2, kind);
+            assert_eq!(server.messages.back().unwrap().kind, kind);
+        }
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
 
     pub(in crate::server) fn setup(name: &str) -> (Server, std::path::PathBuf, u32) {
         let (tx, _rx) = super::super::queue::channel(32);

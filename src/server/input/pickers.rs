@@ -13,6 +13,7 @@ use crate::paths;
 use crate::protocol::Placement;
 use crate::server::ui::{ConfirmAction, Mode, PickAction, PickItem, Picker, PickerKind, Prompt, PromptAction};
 use crate::server::{ClientId, Server};
+use crate::theme::NoticeKind;
 
 impl Server {
     pub(super) fn on_picker(&mut self, id: ClientId, mut p: Picker, ev: InputEvent) -> Mode {
@@ -41,12 +42,14 @@ impl Server {
                 {
                     return self.pick(id, &p, item);
                 }
-                return p.result("Workspace unavailable. Select a workspace.");
+                return p.result(NoticeKind::Warning, "Workspace unavailable. Select a workspace.");
             } else if matches!(m.kind, MouseKind::Drag(MouseButton::Left)) {
                 if p.query.is_empty() {
                     p.message = Some("Release to move here".into());
+                    p.message_kind = NoticeKind::Notice;
                 } else {
                     p.message = Some("Clear search to reorder".into());
+                    p.message_kind = NoticeKind::Warning;
                 }
                 p.drag = Some(drag);
             } else {
@@ -153,7 +156,7 @@ impl Server {
                             return self.change_account_mode(id, *pane);
                         }
                         if let Err(e) = self.undo_account_change(*pane, id) {
-                            self.toast(id, format!("{e:#}"));
+                            self.toast(id, NoticeKind::Error, format!("{e:#}"));
                         }
                         return Mode::Normal;
                     }
@@ -170,7 +173,7 @@ impl Server {
                     {
                         let (left, _) = self.files_defaults(id);
                         if let Err(e) = self.open_files(ws, left, format!("{name}:~")) {
-                            self.toast(id, format!("{e:#}"));
+                            self.toast(id, NoticeKind::Error, format!("{e:#}"));
                         }
                         return Mode::Normal;
                     }
@@ -179,7 +182,7 @@ impl Server {
                     if let Some(PickAction::AgentLaunch { agent, account }) = p.current().map(|i| i.action.clone()) {
                         let ws = self.clients.get(&id).map(|c| c.workspace).unwrap_or(0);
                         if let Err(e) = self.launch_agent(ws, None, &agent, Some(&account), Placement::Tab, None) {
-                            self.toast(id, format!("{e:#}"));
+                            self.toast(id, NoticeKind::Error, format!("{e:#}"));
                         }
                         return Mode::Normal;
                     }
@@ -214,7 +217,7 @@ impl Server {
                             }
                             'l' => {
                                 if let Err(e) = self.open_login(id, &a) {
-                                    self.toast(id, format!("{e:#}"));
+                                    self.toast(id, NoticeKind::Error, format!("{e:#}"));
                                 } else {
                                     return Mode::Normal;
                                 }
@@ -303,13 +306,15 @@ impl Server {
                     if let Some(PickAction::Ssh(name)) = p.current().map(|i| i.action.clone()) {
                         match self.forget_server(&name) {
                             Ok(true) => {
-                                self.toast(id, format!("forgot {name}"));
+                                self.toast(id, NoticeKind::Notice, format!("forgot {name}"));
                                 return Mode::Picker(self.ssh_picker());
                             }
-                            Ok(false) => {
-                                self.toast(id, format!("{name} comes from a workspace or ~/.ssh/config; edit it there"))
-                            }
-                            Err(e) => self.toast(id, format!("{e:#}")),
+                            Ok(false) => self.toast(
+                                id,
+                                NoticeKind::Warning,
+                                format!("{name} comes from a workspace or ~/.ssh/config; edit it there"),
+                            ),
+                            Err(e) => self.toast(id, NoticeKind::Error, format!("{e:#}")),
                         }
                     }
                 }
@@ -430,7 +435,7 @@ impl Server {
             PickAction::Ssh(spec) => self.connect(id, &spec, Placement::Auto),
             PickAction::SshGroup(group) => match self.open_group(&group, &[]) {
                 Ok(ws) => self.show_workspace(id, ws),
-                Err(e) => self.toast(id, format!("{e:#}")),
+                Err(e) => self.toast(id, NoticeKind::Error, format!("{e:#}")),
             },
             PickAction::FocusPane { pane, .. } => self.reveal(id, pane),
             PickAction::Buffer(b) => return self.paste_buffer(id, b),
@@ -462,7 +467,7 @@ impl Server {
                 let ws = self.clients.get(&id).map(|c| c.workspace).unwrap_or(0);
                 let focus = self.client_focus(id);
                 if let Err(e) = self.launch_agent(ws, focus, &agent, Some(&account), Placement::Auto, None) {
-                    self.toast(id, format!("{e:#}"));
+                    self.toast(id, NoticeKind::Error, format!("{e:#}"));
                 }
             }
             PickAction::OpenAnotherAccount(pane) => {
@@ -485,7 +490,7 @@ impl Server {
                     .context("no such account")
                     .and_then(|a| self.switch_account(pane, &a, Some(id), false));
                 if let Err(e) = result {
-                    self.toast(id, format!("{e:#}"));
+                    self.toast(id, NoticeKind::Error, format!("{e:#}"));
                     return self.change_account_mode(id, pane);
                 }
             }
@@ -755,11 +760,11 @@ impl Server {
     pub(super) fn connect(&mut self, id: ClientId, spec: &str, placement: Placement) {
         let Some(ws) = self.clients.get(&id).map(|c| c.workspace) else { return };
         let Some(server) = self.resolve_server(spec) else {
-            self.toast(id, format!("not a server: {spec}"));
+            self.toast(id, NoticeKind::Error, format!("not a server: {spec}"));
             return;
         };
         if let Err(e) = self.open_ssh(ws, None, &server, placement) {
-            self.toast(id, format!("{e:#}"));
+            self.toast(id, NoticeKind::Error, format!("{e:#}"));
         }
     }
 
@@ -769,14 +774,14 @@ impl Server {
         if !path.exists()
             && let Err(e) = crate::servers::Inventory::empty().save()
         {
-            self.toast(id, format!("{e:#}"));
+            self.toast(id, NoticeKind::Error, format!("{e:#}"));
             return;
         }
         let command = crate::edit::editor_argv(&path, None);
         let Some(ws) = self.clients.get(&id).map(|c| c.workspace) else { return };
         let spec = PaneSpec { command, close_on_exit: true, ..Default::default() };
         if let Err(e) = self.spawn_pane_in(ws, None, spec, Placement::Floating, Some("servers.toml".into())) {
-            self.toast(id, format!("{e:#}"));
+            self.toast(id, NoticeKind::Error, format!("{e:#}"));
         }
     }
 }

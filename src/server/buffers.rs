@@ -9,6 +9,7 @@ use crate::layout::PaneId;
 use crate::pane::{PaneSpec, ShownText};
 use crate::protocol::{BufferInfo, Placement, Response};
 use crate::text::human_size;
+use crate::theme::NoticeKind;
 
 impl Server {
     /// Keep what was just copied as the newest buffer.
@@ -42,7 +43,7 @@ impl Server {
     pub(super) fn picked_buffer(&mut self, client: ClientId, buffer: u64) -> Option<String> {
         let text = self.buffers.by_id(buffer).map(|b| b.text.clone());
         if text.is_none() {
-            self.toast(client, "that buffer is gone");
+            self.toast(client, NoticeKind::Warning, "that buffer is gone");
         }
         text
     }
@@ -55,7 +56,7 @@ impl Server {
         let title = format!("buffer {}", self.buffers.key_of(buffer).unwrap_or_default());
         let spec = PaneSpec { text: Some(ShownText { title: title.clone(), text }), ..Default::default() };
         if let Err(e) = self.spawn_pane_in(ws, None, spec, Placement::Floating, Some(title)) {
-            self.toast(client, format!("{e:#}"));
+            self.toast(client, NoticeKind::Error, format!("{e:#}"));
         }
     }
 
@@ -64,9 +65,9 @@ impl Server {
         match self.buffers.delete_id(buffer) {
             Some(_) => {
                 self.buffers_dirty = true;
-                self.toast(client, format!("deleted buffer {}", key.unwrap_or_default()));
+                self.toast(client, NoticeKind::Notice, format!("deleted buffer {}", key.unwrap_or_default()));
             }
-            None => self.toast(client, "that buffer is gone"),
+            None => self.toast(client, NoticeKind::Warning, "that buffer is gone"),
         }
     }
 

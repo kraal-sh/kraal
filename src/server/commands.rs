@@ -6,6 +6,7 @@ use std::time::Duration;
 use super::{ClientId, Server};
 use crate::layout::PaneId;
 use crate::pane::{Finished, short_duration};
+use crate::theme::NoticeKind;
 
 /// What to say where the shell marks no commands.
 pub(super) const NO_MARKS: &str =
@@ -38,7 +39,12 @@ impl Server {
         };
         let body = format!("{what}: {how} after {}", short_duration(done.duration));
         let title = self.pane_label(pane);
-        self.notify(&title, &body, Some(pane));
+        self.notify(
+            if done.exit.is_some_and(|code| code != 0) { NoticeKind::Error } else { NoticeKind::Notice },
+            &title,
+            &body,
+            Some(pane),
+        );
     }
 
     /// Copy the output of the focused pane's last command (the one running, or the last that
@@ -46,9 +52,11 @@ impl Server {
     pub(super) fn copy_last_output(&mut self, id: ClientId, focus: Option<PaneId>) {
         let found = focus.and_then(|p| self.panes.get_mut(&p)).and_then(|p| p.last_command_output());
         match found {
-            Some((_, output)) if output.is_empty() => self.toast(id, "the last command printed nothing"),
+            Some((_, output)) if output.is_empty() => {
+                self.toast(id, NoticeKind::Notice, "the last command printed nothing")
+            }
             Some((_, output)) => self.copy_to_client(id, &output),
-            None => self.toast(id, NO_MARKS),
+            None => self.toast(id, NoticeKind::Notice, NO_MARKS),
         }
     }
 }

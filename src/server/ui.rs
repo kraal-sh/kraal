@@ -2,6 +2,7 @@
 
 use crate::agent::AgentState;
 use crate::layout::{Border, PaneId};
+use crate::theme::NoticeKind;
 
 pub enum Mode {
     Normal,
@@ -461,6 +462,7 @@ pub struct Picker {
     pub loading: Option<u32>,
     pub worktree: bool,
     pub message: Option<String>,
+    pub message_kind: NoticeKind,
     pub undo: Option<String>,
     pub source_workspaces: Vec<u32>,
     pub review_workspaces: Vec<u32>,
@@ -482,6 +484,7 @@ pub struct PickerState {
     review_workspaces: Vec<u32>,
     layout_undos: Vec<u32>,
     message: Option<String>,
+    message_kind: NoticeKind,
     min_items: usize,
     undo: Option<String>,
     back: Option<Box<PickerState>>,
@@ -514,6 +517,7 @@ impl Picker {
             loading: None,
             worktree: false,
             message: None,
+            message_kind: NoticeKind::Notice,
             undo: None,
             source_workspaces: Vec::new(),
             review_workspaces: Vec::new(),
@@ -537,6 +541,7 @@ impl Picker {
             review_workspaces: self.review_workspaces.clone(),
             layout_undos: self.layout_undos.clone(),
             message: self.message.clone(),
+            message_kind: self.message_kind,
             min_items: self.min_items,
             undo: self.undo.clone(),
             back: self.back.clone(),
@@ -550,6 +555,7 @@ impl Picker {
     pub fn restore(&mut self, state: PickerState) {
         self.min_items = self.min_items.max(state.min_items);
         self.message = state.message;
+        self.message_kind = state.message_kind;
         self.undo = state.undo;
         self.back = state.back;
         self.query = state.query;
@@ -586,8 +592,9 @@ impl Picker {
         self.selected = self.filtered.iter().position(|&i| matches(&self.items[i])).unwrap_or(0);
     }
 
-    pub fn result(mut self, message: impl Into<String>) -> Mode {
+    pub fn result(mut self, kind: NoticeKind, message: impl Into<String>) -> Mode {
         self.message = Some(message.into());
+        self.message_kind = kind;
         Mode::Picker(self)
     }
 
@@ -1084,6 +1091,7 @@ mod tests {
         old.refilter();
         old.select(|i| i.label == "Two");
         old.message = Some("Account added".into());
+        old.message_kind = NoticeKind::Notice;
         let mut refreshed = Picker::new(PickerKind::Accounts, "Accounts", vec![item("Two"), item("One")]);
         refreshed.restore(old.state());
         assert_eq!(refreshed.query, "o");
@@ -1094,10 +1102,17 @@ mod tests {
         let mut missing = Picker::new(PickerKind::Accounts, "Accounts", vec![item("One")]);
         missing.restore(refreshed.state());
         assert_eq!(missing.current().unwrap().label, "One");
-        let Mode::Picker(result) = refreshed.result("Done") else { panic!() };
+        let Mode::Picker(result) = refreshed.result(NoticeKind::Notice, "Done") else { panic!() };
         assert_eq!(result.query, "o");
         assert_eq!(result.current().unwrap().label, "Two");
         assert_eq!(result.message.as_deref(), Some("Done"));
+        for kind in [NoticeKind::Notice, NoticeKind::Warning, NoticeKind::Error] {
+            let Mode::Picker(result) = missing.result(kind, "result") else { panic!() };
+            missing = Picker::new(PickerKind::Accounts, "Accounts", vec![item("One")]);
+            missing.restore(result.state());
+            assert_eq!(missing.message_kind, kind);
+            assert_eq!(missing.message.as_deref(), Some("result"));
+        }
     }
 
     #[test]

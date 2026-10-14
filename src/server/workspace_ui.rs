@@ -11,6 +11,7 @@ use crate::ansi::Cursor;
 use crate::input::InputEvent;
 use crate::pane::PaneSpec;
 use crate::protocol::Placement;
+use crate::theme::NoticeKind;
 
 #[derive(Default)]
 pub struct WorkspaceForm {
@@ -257,10 +258,12 @@ impl Server {
             Mode::Picker(mut p) => {
                 let workspace = p.current().and_then(|i| i.action.workspace());
                 let message = p.message.clone();
+                let message_kind = p.message_kind;
                 let undo = p.undo.clone();
                 p.restore(state);
                 if message.is_some() {
                     p.message = message;
+                    p.message_kind = message_kind;
                     p.undo = undo;
                 }
                 if let Some(ws) = workspace {
@@ -298,7 +301,7 @@ impl Server {
 
     pub(super) fn rename_workspace_form(&self, ws: u32, from: Option<&Picker>) -> Mode {
         let Some(wi) = self.ws_index(ws) else {
-            return self.workspace_picker(0).result("Workspace unavailable");
+            return self.workspace_picker(0).result(NoticeKind::Warning, "Workspace unavailable");
         };
         let mut p = Prompt::new("Rename workspace", &self.workspaces[wi].name, PromptAction::RenameWorkspace(ws));
         p.workspace_form.as_mut().unwrap().back = from.map(Picker::state);
@@ -307,7 +310,9 @@ impl Server {
 
     pub(super) fn duplicate_workspace_form(&self, ws: u32, from: &Picker) -> Mode {
         let Some(wi) = self.ws_index(ws) else {
-            return self.workspace_picker(0).result("Workspace unavailable. Select a workspace to duplicate.");
+            return self
+                .workspace_picker(0)
+                .result(NoticeKind::Warning, "Workspace unavailable. Select a workspace to duplicate.");
         };
         let base = format!("{}-copy", self.workspaces[wi].name);
         let name = std::iter::once(base.clone())
@@ -410,7 +415,7 @@ impl Server {
 
     pub(super) fn review_source_form(&self, ws: u32, from: Option<&Picker>, undo: bool) -> Mode {
         let Some(wi) = self.ws_index(ws) else {
-            return self.workspace_picker(0).result("Workspace unavailable");
+            return self.workspace_picker(0).result(NoticeKind::Warning, "Workspace unavailable");
         };
         let workspace = &self.workspaces[wi];
         let mut p = Prompt::new(
@@ -430,12 +435,12 @@ impl Server {
                 "Restore the layout from before the last Load from file?\nPrevious layout: {tabs} tabs · {panes} panes\nThe restored workspace will be Closed. Programs will not restart."
             );
             if workspace.layout_undo.is_none() {
-                return self.workspace_picker(ws).result("This replacement was already undone.");
+                return self.workspace_picker(ws).result(NoticeKind::Notice, "This replacement was already undone.");
             }
             return Mode::Prompt(p);
         }
         let Some(path) = &workspace.definition else {
-            return self.workspace_picker(ws).result("This workspace has no source file.");
+            return self.workspace_picker(ws).result(NoticeKind::Notice, "This workspace has no source file.");
         };
         let (tabs, panes) = workspace.counts();
         match self.preview_source(path) {
@@ -470,7 +475,7 @@ impl Server {
         let PromptAction::ReviewWorkspace(ws) = p.action else { unreachable!() };
         let old = p.workspace_form.as_mut().unwrap();
         let Mode::Prompt(mut next) = self.review_source_form(ws, None, old.undo) else {
-            return self.workspace_picker(ws).result("Workspace unavailable");
+            return self.workspace_picker(ws).result(NoticeKind::Warning, "Workspace unavailable");
         };
         next.workspace_form.as_mut().unwrap().back = old.back.take();
         next.error = message;
@@ -517,13 +522,15 @@ impl Server {
     ) -> Mode {
         let PromptAction::ReviewWorkspace(ws) = p.action else { unreachable!() };
         let Some(wi) = self.ws_index(ws) else {
-            return self.workspace_picker(0).result("Workspace unavailable");
+            return self.workspace_picker(0).result(NoticeKind::Warning, "Workspace unavailable");
         };
         if self.workspaces[wi].delete_pending
             || self.workspaces[wi].close_error.is_some()
             || self.workspaces[wi].kept.as_ref().is_some_and(|s| s.close_pending.is_some())
         {
-            return self.workspace_picker(ws).result("Finish Close or Delete, then retry the layout change.");
+            return self
+                .workspace_picker(ws)
+                .result(NoticeKind::Warning, "Finish Close or Delete, then retry the layout change.");
         }
         let form = p.workspace_form.as_ref().unwrap();
         let undo = form.undo;
@@ -562,15 +569,22 @@ impl Server {
             Ok(()) => {
                 if was_open && !undo {
                     if let Err(e) = self.reopen_workspace(ws) {
-                        return self.workspace_picker(ws).result(format!(
-                            "Layout loaded. Couldn't open it: {e:#}. Retry Open or choose Undo load in Actions."
-                        ));
+                        return self.workspace_picker(ws).result(
+                            NoticeKind::Error,
+                            format!(
+                                "Layout loaded. Couldn't open it: {e:#}. Retry Open or choose Undo load in Actions."
+                            ),
+                        );
                     }
                     for viewer in viewers {
                         self.show_workspace(viewer, ws);
                     }
                 }
-                self.toast(id, if undo { "Layout restored · Open from Workspaces" } else { "Layout loaded · Undo" });
+                self.toast(
+                    id,
+                    NoticeKind::Notice,
+                    if undo { "Layout restored · Open from Workspaces" } else { "Layout loaded · Undo" },
+                );
                 if !undo && let Some(c) = self.clients.get_mut(&id) {
                     c.toast_action = Some((0, super::attention::ToastAction::UndoLayout(ws)));
                 }
@@ -582,7 +596,7 @@ impl Server {
             }
             Err(e) => {
                 if self.workspaces[wi].close_error.is_some() {
-                    return self.workspace_picker(ws).result(format!("{e:#}"));
+                    return self.workspace_picker(ws).result(NoticeKind::Error, format!("{e:#}"));
                 }
                 self.refresh_source_form(p, Some(format!("{e:#}")))
             }
@@ -590,7 +604,9 @@ impl Server {
     }
 
     pub(super) fn export_workspace_form(&self, id: ClientId, ws: u32, from: Option<&Picker>) -> Mode {
-        let Some(wi) = self.ws_index(ws) else { return self.workspace_picker(0).result("Workspace unavailable") };
+        let Some(wi) = self.ws_index(ws) else {
+            return self.workspace_picker(0).result(NoticeKind::Warning, "Workspace unavailable");
+        };
         let file = crate::paths::shorten_home(&self.export_file_default(wi));
         let mut p = Prompt::new("Export layout", &file, PromptAction::ExportWorkspace(ws));
         let form = p.workspace_form.as_mut().unwrap();
@@ -647,7 +663,7 @@ impl Server {
         picker.restore(state);
         if let Some(ws) = renamed {
             select_workspace(&mut picker, ws);
-            picker.result("Workspace renamed")
+            picker.result(NoticeKind::Notice, "Workspace renamed")
         } else {
             Mode::Picker(picker)
         }
@@ -731,7 +747,7 @@ impl Server {
             return match result {
                 Ok(ws) => {
                     self.show_workspace(id, ws);
-                    self.toast(id, "Workspace added. Commands wait for you to start them.");
+                    self.toast(id, NoticeKind::Notice, "Workspace added. Commands wait for you to start them.");
                     Mode::Normal
                 }
                 Err(e) => {
@@ -758,13 +774,13 @@ impl Server {
                 Ok(ws) => {
                     self.refresh_workspace_pickers();
                     self.mark_dirty();
-                    self.toast(id, "Workspace duplicated");
+                    self.toast(id, NoticeKind::Notice, "Workspace duplicated");
                     let mut picker = self.workspace_picker(self.clients.get(&id).map_or(0, |c| c.workspace));
                     if let Some(back) = p.workspace_form.as_mut().and_then(|f| f.back.take()) {
                         picker.restore(back);
                     }
                     select_workspace(&mut picker, ws);
-                    picker.result("Workspace duplicated · Enter Open")
+                    picker.result(NoticeKind::Notice, "Workspace duplicated · Enter Open")
                 }
                 Err(error) => {
                     p.error = Some(error);
@@ -779,10 +795,10 @@ impl Server {
                 Ok(ws) => {
                     self.refresh_workspace_pickers();
                     self.mark_dirty();
-                    self.toast(id, "Workspace restored");
+                    self.toast(id, NoticeKind::Notice, "Workspace restored");
                     let mut picker = self.workspace_picker(0);
                     picker.select(|i| i.action.workspace() == Some(ws));
-                    picker.result("Workspace restored · Enter Open")
+                    picker.result(NoticeKind::Notice, "Workspace restored · Enter Open")
                 }
                 Err(error) => {
                     p.error = Some(error);
@@ -810,7 +826,11 @@ impl Server {
             Ok(()) => {
                 self.refresh_workspace_pickers();
                 self.mark_dirty();
-                self.toast(id, if target.is_some() { "Workspace renamed" } else { "Workspace added" });
+                self.toast(
+                    id,
+                    NoticeKind::Notice,
+                    if target.is_some() { "Workspace renamed" } else { "Workspace added" },
+                );
                 if target.is_some() { self.workspace_form_back(id, p, target) } else { Mode::Normal }
             }
             Err(error) => {

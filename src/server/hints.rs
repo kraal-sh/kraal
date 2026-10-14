@@ -14,6 +14,7 @@ use crate::input::{InputEvent, KeyCode, MouseKind};
 use crate::layout::PaneId;
 use crate::protocol::Placement;
 use crate::shell;
+use crate::theme::NoticeKind;
 use crate::tools::{Open, ToolDef, Where};
 
 /// A path seen in a pane on a server, as that server reads it: in the pane's directory there
@@ -36,7 +37,7 @@ impl Server {
     pub(super) fn start_hints(&mut self, id: ClientId) -> Mode {
         let Some(pane) = self.client_focus(id) else { return Mode::Normal };
         let Some(rows) = self.panes.get(&pane).filter(|p| p.is_terminal()).map(|p| p.screen_rows()) else {
-            self.toast(id, "hints work in terminal panes");
+            self.toast(id, NoticeKind::Notice, "hints work in terminal panes");
             return Mode::Normal;
         };
         let mut servers = HashSet::new();
@@ -49,7 +50,7 @@ impl Server {
         let found = hints::find(&rows, &servers, &self.hint_patterns, dir.as_deref());
         let hints = hints::label(found, &self.config.hints.alphabet);
         if hints.is_empty() {
-            self.toast(id, "nothing to act on in this pane");
+            self.toast(id, NoticeKind::Notice, "nothing to act on in this pane");
             return Mode::Normal;
         }
         // What is labelled stays in view as it was, while the pane's program goes on.
@@ -71,7 +72,11 @@ impl Server {
             KeyCode::Tab => h.act = !h.act,
             KeyCode::Char(c) if c.is_ascii_alphabetic() && !k.mods.ctrl && !k.mods.alt => {
                 if h.snapshot.as_ref().is_some_and(|s| self.pane_inner_rect(id, h.pane) != Some(s.area)) {
-                    self.toast(id, "The pane moved since the labels were made: ask for hints again.");
+                    self.toast(
+                        id,
+                        NoticeKind::Warning,
+                        "The pane moved since the labels were made: ask for hints again.",
+                    );
                     return Mode::Normal;
                 }
                 h.typed.push(c.to_ascii_lowercase());
@@ -80,7 +85,7 @@ impl Server {
                     return match self.hint_chosen(id, h.pane, m, h.act) {
                         Ok(next) => next,
                         Err(e) => {
-                            self.toast(id, format!("{e:#}"));
+                            self.toast(id, NoticeKind::Error, format!("{e:#}"));
                             Mode::Normal
                         }
                     };
@@ -213,7 +218,11 @@ impl Server {
             Some(found) => found,
             None => {
                 let info = self.add_tunnel_to(server.clone(), &port.to_string(), None)?;
-                self.toast(id, format!("tunnel localhost:{} → {}:{port}…", info.spec.local, server.name));
+                self.toast(
+                    id,
+                    NoticeKind::Notice,
+                    format!("tunnel localhost:{} → {}:{port}…", info.spec.local, server.name),
+                );
                 (info.id, info.spec.local)
             }
         };

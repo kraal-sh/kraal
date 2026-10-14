@@ -1052,8 +1052,8 @@ impl Server {
         let normal = matches!(c.mode, Mode::Normal);
         let waiting = self.attention_queue().len();
         let mut notice = Vec::new();
-        if let Some((msg, _)) = &c.toast {
-            let style = Style::default().fg(t.blocked);
+        if let Some((msg, _, kind)) = &c.toast {
+            let style = Style::default().fg(kind.colour(t));
             if let Some((_, action)) = &c.toast_action {
                 let label = action.label();
                 let prefix = msg.strip_suffix(&format!(" · {label}")).unwrap_or(msg);
@@ -1196,7 +1196,7 @@ impl Server {
         if let Some((pane, action)) = c
             .toast_action
             .as_ref()
-            .filter(|_| c.toast.as_ref().is_some_and(|(_, until)| *until > std::time::Instant::now()))
+            .filter(|_| c.toast.as_ref().is_some_and(|(_, until, _)| *until > std::time::Instant::now()))
         {
             let mut x = c.cols.saturating_sub(spans_width(&bar.right) + 1);
             for span in &bar.right {
@@ -1983,7 +1983,7 @@ impl Server {
             .rev()
             .map(|m| {
                 let when = crate::text::local_datetime(crate::text::unix_seconds(m.at));
-                let style = if m.warning { Style::default().fg(th().blocked) } else { Style::default() };
+                let style = Style::default().fg(m.kind.colour(th()));
                 Line::from(vec![
                     Span::styled(format!("{}  ", &when[11..]), Style::default().fg(th().dim)),
                     Span::styled(m.text.clone(), style),
@@ -2147,6 +2147,54 @@ thread_local! {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::theme::NoticeKind;
+
+    #[test]
+    fn notice_colours_in_bars_overlays_and_messages_for_local_and_remote_clients() {
+        use crate::protocol::{ClipboardOrigin, ClipboardOutcome};
+
+        for remote in [false, true] {
+            for (cols, rows) in [(80, 24), (124, 36)] {
+                for (outcome, kind, colour) in [
+                    (ClipboardOutcome::Native, NoticeKind::Notice, th().text),
+                    (ClipboardOutcome::Busy, NoticeKind::Warning, th().blocked),
+                    (ClipboardOutcome::Failed, NoticeKind::Error, th().blocked),
+                ] {
+                    let (tx, _rx) = super::super::event_channel(32);
+                    let mut server = super::super::tests::server(tx);
+                    let (id, _peer) = super::super::tests::client(&mut server);
+                    let c = server.clients.get_mut(&id).unwrap();
+                    (c.cols, c.rows, c.remote) = (cols, rows, remote);
+                    c.clipboard.negotiated = true;
+                    c.clipboard.pending = Some((1, ClipboardOrigin::User, Instant::now()));
+                    server.clipboard_result(id, 1, outcome, false);
+                    assert_eq!(server.clients[&id].toast.as_ref().unwrap().2, kind);
+                    assert_eq!(server.messages.back().unwrap().kind, kind);
+
+                    for mode in [Mode::Normal, Mode::Help { scroll: 0 }, Mode::Messages { scroll: 0 }] {
+                        let messages = matches!(mode, Mode::Messages { .. });
+                        server.clients.get_mut(&id).unwrap().mode = mode;
+                        server.mark_dirty();
+                        let mut buf = Buffer::empty(Rect::new(0, 0, cols, rows));
+                        server.compose(id, 1_000, &mut buf);
+                        let mut found = Vec::new();
+                        for y in 0..rows {
+                            let line: String = (0..cols).map(|x| buf[(x, y)].symbol()).collect();
+                            if let Some(start) = line.find(outcome.message()) {
+                                let x = line[..start].chars().count() as u16;
+                                for x in x..x + outcome.message().len() as u16 {
+                                    assert_eq!(buf[(x, y)].fg, colour, "{remote} {cols}x{rows}: {line}");
+                                }
+                                found.push(y);
+                            }
+                        }
+                        assert!(found.contains(&0), "the notice line remains visible over overlays");
+                        assert_eq!(found.len(), if messages { 2 } else { 1 });
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn tunnel_sidebar_shows_state_and_click_opens_details() {
@@ -2605,9 +2653,14 @@ mod tests {
                 ToastAction::ChangeAccount,
                 ToastAction::RestoreWorkspace("saved-workspace".into()),
             ] {
-                server.notify_action(&"A long account name ".repeat(8), 7, action.clone());
-                let bar = server.top_bar(&server.clients[&id]);
-                assert!(bar.right.iter().any(|s| s.content == action.label()));
+                for kind in [NoticeKind::Notice, NoticeKind::Warning, NoticeKind::Error] {
+                    server.notify_action(kind, &"A long account name ".repeat(8), 7, action.clone());
+                    let bar = server.top_bar(&server.clients[&id]);
+                    let label = bar.right.iter().find(|s| s.content == action.label()).unwrap();
+                    assert_eq!(label.style.fg, Some(kind.colour(th())));
+                    assert!(label.style.add_modifier.contains(Modifier::UNDERLINED));
+                    assert_eq!(bar.right[0].style.fg, Some(kind.colour(th())));
+                }
                 let hits: Vec<_> = (0..cols)
                     .filter(|&x| server.tab_bar_hit(id, x) == Some(BarItem::Toast(7, action.clone())))
                     .collect();
@@ -2616,7 +2669,7 @@ mod tests {
                 server.clients.get_mut(&id).unwrap().toast.as_mut().unwrap().1 =
                     std::time::Instant::now() - std::time::Duration::from_secs(1);
                 assert_ne!(server.tab_bar_hit(id, at), Some(BarItem::Toast(7, action)));
-                server.toast(id, "Another message");
+                server.toast(id, NoticeKind::Notice, "Another message");
                 assert!(server.clients[&id].toast_action.is_none());
             }
         }

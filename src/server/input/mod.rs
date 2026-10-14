@@ -16,6 +16,7 @@ use super::{ClientId, Dirty, Server};
 use crate::input::{InputEvent, Key, KeyCode, MouseEvent, MouseKind, encode_key, encode_paste_after};
 use crate::keymap::{Action, Command, Lookup};
 use crate::layout::{Dir, PaneId};
+use crate::theme::NoticeKind;
 
 /// Input kept while a pane it goes to has its context read again (see `Server::hold_input`),
 /// with where it goes as it was when it was typed: its workspace, the focused pane and the panes
@@ -172,11 +173,13 @@ impl Server {
             InputEvent::Paste(_) if !normal && self.clients.get(&id).is_some_and(|c| c.paste.is_some()) => {
                 // Something else took the keyboard while the paste was coming.
                 match self.clients.get_mut(&id).and_then(|c| c.paste.take()) {
-                    Some(PasteFlow::Held { .. }) => self.toast(id, "the paste was interrupted: nothing was pasted"),
+                    Some(PasteFlow::Held { .. }) => {
+                        self.toast(id, NoticeKind::Warning, "the paste was interrupted: nothing was pasted")
+                    }
                     Some(PasteFlow::Streaming { .. }) => {
                         // Pieces still waiting for a context read are part of the rest.
                         self.held_input.retain(|h| !(h.client == id && matches!(h.item, InputItem::Piece(..))));
-                        self.toast(id, "the paste was interrupted: the rest was not pasted")
+                        self.toast(id, NoticeKind::Warning, "the paste was interrupted: the rest was not pasted")
                     }
                     _ => {}
                 }
@@ -512,7 +515,7 @@ impl Server {
                             self.check_login(p)
                         };
                         if let Err(e) = result {
-                            self.toast(id, format!("{e:#}"));
+                            self.toast(id, NoticeKind::Error, format!("{e:#}"));
                         }
                     }
                     None => {}
@@ -543,7 +546,7 @@ impl Server {
                     {
                         if !exact {
                             if let Err(e) = self.suspend_pane(p, spec, super::agents::AMBIGUOUS) {
-                                self.toast(id, format!("{e:#}"));
+                                self.toast(id, NoticeKind::Error, format!("{e:#}"));
                             }
                             self.relayout();
                             return Mode::Normal;
@@ -552,7 +555,7 @@ impl Server {
                     }
                     let pane = self.panes.get_mut(&p).unwrap();
                     if let Err(e) = pane.respawn(&self.env, &self.tx) {
-                        self.toast(id, format!("{e:#}"));
+                        self.toast(id, NoticeKind::Error, format!("{e:#}"));
                     }
                     self.relayout();
                 }
@@ -689,7 +692,7 @@ impl Server {
             };
             if !there(self, front) {
                 self.drop_queue(id, queue);
-                self.toast(id, "a pane closed while what you typed waited: none of it was sent");
+                self.toast(id, NoticeKind::Warning, "a pane closed while what you typed waited: none of it was sent");
                 return;
             }
             if front.targets.iter().any(|t| self.pane_context_reading(*t)) {
@@ -704,7 +707,7 @@ impl Server {
                     self.stop_stream(id);
                     self.drop_queue(id, queue);
                     self.toast(
-                        id,
+                        id, NoticeKind::Warning,
                         "a pane became production during a long paste: the rest of it and what you typed after were not sent",
                     );
                     return;
@@ -724,7 +727,11 @@ impl Server {
             if let Some(named) = approved {
                 if named.iter().any(|(t, why)| self.pane_production(*t) != *why) {
                     self.drop_queue(id, queue);
-                    self.toast(id, "a pane changed production since the question: nothing was sent");
+                    self.toast(
+                        id,
+                        NoticeKind::Warning,
+                        "a pane changed production since the question: nothing was sent",
+                    );
                     return;
                 }
                 self.send_items(&targets, items);
@@ -857,13 +864,13 @@ impl Server {
             // What the client typed after it waited behind it: it goes too.
             self.drop_held(id);
             if approve.is_empty() {
-                self.toast(id, "paste cancelled: nothing was sent");
+                self.toast(id, NoticeKind::Notice, "paste cancelled: nothing was sent");
             } else {
                 let ws = &mut self.workspaces[wi];
                 ws.sync = super::SyncScope::Off;
                 ws.marked.clear();
                 ws.sync_approved.clear();
-                self.toast(id, "sync off · nothing was sent");
+                self.toast(id, NoticeKind::Notice, "sync off · nothing was sent");
                 self.mark_dirty();
             }
             return Mode::Normal;
@@ -891,7 +898,7 @@ impl Server {
         }
         if named.iter().any(|(t, why)| self.pane_production(*t) != *why) {
             self.drop_held(id);
-            self.toast(id, "a pane changed production since the question: nothing was sent");
+            self.toast(id, NoticeKind::Warning, "a pane changed production since the question: nothing was sent");
             return Mode::Normal;
         }
         self.send_items(&targets, items);
@@ -929,7 +936,7 @@ impl Server {
                 format!("{n} pane{} selected · {how} starts broadcasting to them", plural(n))
             }
         };
-        self.toast(id, msg);
+        self.toast(id, NoticeKind::Notice, msg);
         self.mark_dirty();
     }
 
@@ -1014,6 +1021,7 @@ impl Server {
         if targets.iter().any(|t| self.pane_production(*t).is_some() || self.pane_context_reading(*t)) {
             self.toast(
                 id,
+                NoticeKind::Warning,
                 format!("a paste of more than {} MiB into production: nothing was pasted", PASTE_HOLD >> 20),
             );
             return PasteFlow::Dropped;
@@ -1040,7 +1048,11 @@ impl Server {
     ) -> PasteFlow {
         if targets.iter().any(|t| self.pane_production(*t).is_some()) {
             self.held_input.retain(|h| !(h.client == id && matches!(h.item, InputItem::Piece(..))));
-            self.toast(id, "a pane became production during a long paste: the rest was not pasted");
+            self.toast(
+                id,
+                NoticeKind::Warning,
+                "a pane became production during a long paste: the rest was not pasted",
+            );
             return PasteFlow::Dropped;
         }
         let next_cr = data.last().map_or(after_cr, |b| *b == b'\r');
@@ -1056,7 +1068,11 @@ impl Server {
         if self.hold_input(id, focused, &targets, InputItem::Piece(data.to_vec(), after_cr)) {
             if waiting + data.len() > PASTE_HOLD {
                 self.held_input.retain(|h| !(h.client == id && matches!(h.item, InputItem::Piece(..))));
-                self.toast(id, "a long paste waited too long for a context read: the rest was not pasted");
+                self.toast(
+                    id,
+                    NoticeKind::Warning,
+                    "a long paste waited too long for a context read: the rest was not pasted",
+                );
                 return PasteFlow::Dropped;
             }
             return PasteFlow::Streaming { focused, targets, after_cr: next_cr };
@@ -1077,7 +1093,7 @@ impl Server {
     /// of it when one of them closed since the paste started.
     pub(super) fn paste_to(&mut self, id: ClientId, focused: PaneId, targets: &[PaneId], data: Vec<u8>) -> Mode {
         if !targets.iter().all(|t| self.panes.contains_key(t)) {
-            self.toast(id, "a pane closed during the paste: nothing was pasted");
+            self.toast(id, NoticeKind::Warning, "a pane closed during the paste: nothing was pasted");
             return Mode::Normal;
         }
         if self.hold_input(id, focused, targets, InputItem::Paste(data.clone())) {
@@ -1091,7 +1107,7 @@ impl Server {
         let Some(text) = self.picked_buffer(id, buffer) else { return Mode::Normal };
         let Some(focused) = self.client_focus(id) else { return Mode::Normal };
         if let Err(e) = self.buffer_paste(focused, &text) {
-            self.toast(id, e);
+            self.toast(id, NoticeKind::Error, e);
             return Mode::Normal;
         }
         self.paste(id, text.into_bytes())

@@ -10,6 +10,7 @@ use super::{ClientId, FloatRect, Floating, Server, SyncScope, Tab, Workspace};
 use crate::layout::{Axis, Node, PaneId};
 use crate::pane::{Pane, PaneSpec, ProcessHold};
 use crate::protocol;
+use crate::theme::NoticeKind;
 /// Keep the terminal's session and the agent's children identifiable after its shell exits.
 pub(super) struct ProgramStop {
     process: Option<crate::pane::ProcessHold>,
@@ -531,7 +532,7 @@ impl Server {
     pub(super) fn close_workspace(&mut self, client: ClientId, ws: u32) -> Mode {
         match self.keep_and_close_workspace(ws) {
             Ok(()) => {
-                self.toast(client, "Workspace closed. Enter opens it again.");
+                self.toast(client, NoticeKind::Notice, "Workspace closed. Enter opens it again.");
                 let mut picker = self.workspace_picker(self.clients.get(&client).map_or(0, |c| c.workspace));
                 picker.select(|item| item.action.workspace() == Some(ws));
                 Mode::Picker(picker)

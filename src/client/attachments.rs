@@ -19,6 +19,7 @@ use super::paste;
 use crate::attachments::{self, Source};
 use crate::input::{InputEvent, InputParser, KeyCode};
 use crate::protocol::{self, ClientMsg, ServerMsg};
+use crate::theme::NoticeKind;
 
 type Writer = Arc<Mutex<Option<Box<dyn Write + Send>>>>;
 
@@ -69,6 +70,7 @@ struct State {
     workers: Vec<Receiver<()>>,
     status: Option<String>,
     success_until: Option<Instant>,
+    status_kind: NoticeKind,
     uncertain: Option<String>,
     result_token: Option<String>,
     parser: InputParser,
@@ -261,11 +263,18 @@ impl Controller {
     }
 
     pub fn draw(&self) {
-        let state = self.state.lock().unwrap();
         let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
+        self.draw_with(cols, rows, |bytes| {
+            let _ = super::terminal().write(bytes);
+        });
+    }
+
+    fn draw_with(&self, cols: u16, rows: u16, write: impl FnOnce(&[u8])) {
+        // Keep the snapshot and its terminal write ordered with state changes and other draws.
+        let state = self.state.lock().unwrap();
         if let Some(view) = state.view(&self.host()) {
             let (buf, _) = view.render(Rect::new(0, 0, cols, rows.saturating_sub(1)));
-            let _ = super::terminal().write(&crate::ansi::overlay(&buf));
+            write(&crate::ansi::overlay(&buf));
         }
     }
 
@@ -379,7 +388,7 @@ impl Controller {
                     let _ = active.ack.try_send(received);
                 }
             }
-            ServerMsg::AttachmentResult { token, mut message, pasted } => {
+            ServerMsg::AttachmentResult { token, mut message, pasted, mut kind } => {
                 let active = state.active.as_ref().is_some_and(|a| a.token == token);
                 let prompt = state.prompt.as_ref().is_some_and(|p| p.token == token);
                 let uncertain = state.uncertain.as_ref() == Some(&token);
@@ -391,6 +400,7 @@ impl Controller {
                     active.cancelled.store(true, Ordering::SeqCst);
                     if let Some(failure) = active.failure {
                         message = failure;
+                        kind = NoticeKind::Error;
                     }
                 }
                 if prompt {
@@ -426,6 +436,7 @@ impl Controller {
                     let drop = state.dropped.as_mut().unwrap();
                     if let Some(error) = &drop.error {
                         message = format!("Could not send: {error}. Choose Retry to try again.");
+                        kind = NoticeKind::Error;
                     }
                     drop.result = true;
                     drop.selected = if drop.image { 1 } else { 2 };
@@ -442,6 +453,7 @@ impl Controller {
                         state.success_until = None;
                     }
                     state.result_token = Some(token);
+                    state.status_kind = kind;
                     state.status = (!message.is_empty()).then(|| friendly_result(&message, dropped));
                 }
             }
@@ -743,6 +755,7 @@ impl Controller {
         }) {
             let _ = send(&self.writer, &ClientMsg::AttachmentCancel { token: token.clone() });
             self.message(ServerMsg::AttachmentResult {
+                kind: NoticeKind::Error,
                 pasted: false,
                 token,
                 message: format!("Cannot start attachment: {error}. Use {action} to retry."),
@@ -777,7 +790,7 @@ impl Controller {
             }
         }
         if !dropped {
-            self.message(ServerMsg::AttachmentResult { pasted: false, token, message });
+            self.message(ServerMsg::AttachmentResult { kind: NoticeKind::Error, pasted: false, token, message });
         }
     }
 
@@ -886,6 +899,7 @@ impl Controller {
             })
         });
         let dismiss = state.result_token.take().or_else(|| state.uncertain.take());
+        state.status_kind = NoticeKind::Notice;
         state.status = token.as_ref().map(|_| "Cancelling attachment. Waiting for its result.".into());
         state.uncertain = token.clone();
         drop(state);
@@ -928,6 +942,7 @@ impl Controller {
                         )
                     },
                 ));
+                state.status_kind = NoticeKind::Notice;
                 drop(state);
                 this.draw();
             }
@@ -1058,6 +1073,8 @@ impl Dropped {
 
 struct View {
     title: String,
+    kind: NoticeKind,
+    error_start: Option<usize>,
     message: String,
     files: String,
     scroll: usize,
@@ -1070,6 +1087,8 @@ impl State {
     fn view(&self, host: &str) -> Option<View> {
         let mut view = View {
             title: String::new(),
+            kind: NoticeKind::Notice,
+            error_start: None,
             message: String::new(),
             files: String::new(),
             scroll: 0,
@@ -1089,6 +1108,7 @@ impl State {
             view.selected = d.selected;
             if d.result {
                 view.title = "Attachment failed".into();
+                view.kind = if d.error.is_some() { NoticeKind::Error } else { self.status_kind };
                 view.message =
                     self.status.clone().unwrap_or_else(|| "Transfer interrupted. Choose Retry to try again.".into());
                 view.buttons = if d.image {
@@ -1129,6 +1149,7 @@ impl State {
                     view.message.push_str("\nBroadcasting is on. Paths go only to this pane.");
                 }
                 if let Some(error) = &d.error {
+                    view.error_start = Some(view.message.len());
                     view.message.push_str(&format!("\n{error}"));
                 }
                 view.buttons = if d.image {
@@ -1159,6 +1180,7 @@ impl State {
                 )
             };
             if let Some(error) = &p.error {
+                view.error_start = Some(view.message.len());
                 view.message.push_str(&format!("\n{error}"));
             }
             view.buttons = vec!["Send".into(), "Cancel".into()];
@@ -1169,6 +1191,7 @@ impl State {
                 vec![("Enter", "Send"), ("Ctrl+U", "Clear"), ("Esc", "Cancel")]
             };
         } else if let Some(status) = &self.status {
+            view.kind = self.status_kind;
             view.title = if self.success_until.is_some() {
                 status.lines().next().unwrap_or(status).into()
             } else {
@@ -1230,14 +1253,17 @@ impl View {
             file_rows = file_rows.saturating_sub(1);
         }
         let max_scroll = files.len().saturating_sub(file_rows);
-        ViewLayout { area, message, files, file_rows, max_scroll }
+        let error_start = self.error_start.map(|start| crate::text::wrap(&self.message[..start], text_width).len());
+        ViewLayout { area, message, error_start, files, file_rows, max_scroll }
     }
 
     fn render(&self, screen: Rect) -> (Buffer, Vec<Rect>) {
         let layout = self.layout(screen);
         let area = layout.area;
         let mut buf = Buffer::empty(area);
-        let inner = overlays::frame(area, &self.title, crate::theme::current().accent, &mut buf);
+        let theme = crate::theme::current();
+        let title_colour = if self.buttons.is_empty() { self.kind.colour(theme) } else { theme.accent };
+        let inner = overlays::frame(area, &self.title, title_colour, &mut buf);
         let mut buttons = Vec::new();
         if inner.width < 3 || inner.height == 0 {
             return (buf, buttons);
@@ -1275,13 +1301,14 @@ impl View {
         for (row, line) in
             layout.message.iter().chain(layout.files.iter().skip(scroll).take(layout.file_rows)).take(body).enumerate()
         {
-            buf.set_stringn(
-                x,
-                inner.y + row as u16,
-                line,
-                width as usize,
-                Style::default().fg(crate::theme::current().text),
-            );
+            let kind = if row >= layout.message.len() {
+                NoticeKind::Notice
+            } else if layout.error_start.is_some_and(|start| row >= start) {
+                NoticeKind::Error
+            } else {
+                self.kind
+            };
+            buf.set_stringn(x, inner.y + row as u16, line, width as usize, Style::default().fg(kind.colour(theme)));
         }
         if layout.max_scroll > 0 && layout.message.len() < body {
             buf.set_stringn(
@@ -1311,6 +1338,7 @@ impl View {
 struct ViewLayout {
     area: Rect,
     message: Vec<String>,
+    error_start: Option<usize>,
     files: Vec<String>,
     file_rows: usize,
     max_scroll: usize,
@@ -1331,6 +1359,107 @@ mod tests {
     use super::*;
     use std::io::Read;
     use std::time::Duration;
+
+    #[test]
+    fn attachment_results_keep_their_kind_and_draw_it_locally_and_over_ssh() {
+        use alacritty_terminal::event::VoidListener;
+        use alacritty_terminal::grid::Dimensions;
+        use alacritty_terminal::index::{Column, Line};
+        use alacritty_terminal::term::{Config, Term};
+        use alacritty_terminal::vte::ansi::{Color, NamedColor, Processor};
+        struct Size(usize, usize);
+        impl Dimensions for Size {
+            fn total_lines(&self) -> usize {
+                self.1
+            }
+            fn screen_lines(&self) -> usize {
+                self.1
+            }
+            fn columns(&self) -> usize {
+                self.0
+            }
+        }
+        for remote in [false, true] {
+            let (client, _peer) = controller(remote);
+            for (kind, message, colour) in [
+                (NoticeKind::Notice, "Files received.", NamedColor::White),
+                (NoticeKind::Warning, "Focus changed: queued typing discarded.", NamedColor::BrightRed),
+                (NoticeKind::Error, "Transfer interrupted.", NamedColor::BrightRed),
+            ] {
+                client.state.lock().unwrap().uncertain = Some("ab".into());
+                client.message(ServerMsg::AttachmentResult {
+                    kind,
+                    token: "ab".into(),
+                    message: message.into(),
+                    pasted: kind != NoticeKind::Error,
+                });
+                assert_eq!(client.state.lock().unwrap().status_kind, kind);
+                for (cols, rows) in [(80, 24), (124, 36)] {
+                    let mut bytes = Vec::new();
+                    client.draw_with(cols, rows, |out| bytes.extend_from_slice(out));
+                    let mut terminal = Term::new(Config::default(), &Size(cols as usize, rows as usize), VoidListener);
+                    let mut parser: Processor = Processor::new();
+                    parser.advance(&mut terminal, &bytes);
+                    let mut found = false;
+                    for row in 0..rows {
+                        let line = Line(row as i32);
+                        let text: String = (0..cols).map(|col| terminal.grid()[line][Column(col as usize)].c).collect();
+                        if let Some(start) = text.find(message) {
+                            found = true;
+                            let start = text[..start].chars().count();
+                            for col in start..start + message.chars().count() {
+                                assert_eq!(terminal.grid()[line][Column(col)].fg, Color::Named(colour));
+                            }
+                        }
+                    }
+                    assert!(found, "missing result in attachment dialog: {message}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn progress_draw_keeps_state_locked_until_output_finishes() {
+        for (kind, message) in [(NoticeKind::Notice, "Files received."), (NoticeKind::Error, "Transfer interrupted.")] {
+            let (client, _peer) = controller(false);
+            client.state.lock().unwrap().status = Some("Sending".into());
+            let frames = Mutex::new(Vec::new());
+            let (snapshot_tx, snapshot_rx) = bounded(1);
+            let (resume_tx, resume_rx) = bounded(1);
+            let (locked_tx, locked_rx) = bounded(1);
+            std::thread::scope(|scope| {
+                let progress = scope.spawn(|| {
+                    client.draw_with(80, 24, |bytes| {
+                        snapshot_tx.send(()).unwrap();
+                        resume_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+                        frames.lock().unwrap().push(String::from_utf8(bytes.to_vec()).unwrap());
+                    });
+                });
+                snapshot_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+                let result = scope.spawn(|| {
+                    let locked = matches!(client.state.try_lock(), Err(std::sync::TryLockError::WouldBlock));
+                    locked_tx.send(locked).unwrap();
+                    {
+                        let mut state = client.state.lock().unwrap();
+                        state.status = Some(message.into());
+                        state.status_kind = kind;
+                    }
+                    client.draw_with(80, 24, |bytes| {
+                        frames.lock().unwrap().push(String::from_utf8(bytes.to_vec()).unwrap());
+                    });
+                });
+                let locked = locked_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+                resume_tx.send(()).unwrap();
+                progress.join().unwrap();
+                result.join().unwrap();
+                assert!(locked, "a result must wait until the progress snapshot is written");
+            });
+            let frames = frames.lock().unwrap();
+            assert_eq!(frames.len(), 2);
+            assert!(frames[0].contains("Sending"));
+            assert!(frames[1].contains(message));
+        }
+    }
 
     struct Wire(Sender<Vec<u8>>);
     impl Write for Wire {
@@ -1458,6 +1587,7 @@ mod tests {
             });
             let action = if image { "Attach clipboard image" } else { "Attach files" };
             client.message(ServerMsg::AttachmentResult {
+                kind: NoticeKind::Error,
                 token: token.clone(),
                 message: format!("Attachment stopped: the reserved pane closed or the attachment timed out. No paths or queued typing pasted. Close this result, then use {action} to retry."),
                 pasted: false,
@@ -1699,6 +1829,7 @@ mod tests {
                 assert!(matches!(read(&mut peer), ClientMsg::AttachmentFinish { .. }));
                 if attempt == 0 {
                     client.message(ServerMsg::AttachmentResult {
+                        kind: NoticeKind::Error,
                         token,
                         message: "Transfer interrupted. Choose Retry to try again.".into(),
                         pasted: false,
@@ -2065,7 +2196,12 @@ mod tests {
             assert_eq!(protocol::read_frame(&mut peer).unwrap().unwrap(), (protocol::BYTES, bytes.to_vec()));
         }
         assert!(client.state.lock().unwrap().uncertain.is_some());
-        client.message(ServerMsg::AttachmentResult { token, message: "Text submitted.".into(), pasted: true });
+        client.message(ServerMsg::AttachmentResult {
+            kind: NoticeKind::Notice,
+            token,
+            message: "Text submitted.".into(),
+            pasted: true,
+        });
         assert!(client.state.lock().unwrap().dropped.is_none());
         std::fs::remove_file(path).unwrap();
     }
@@ -2097,6 +2233,7 @@ mod tests {
                     let reply = client.clone();
                     let handle = std::thread::spawn(move || {
                         reply.message(ServerMsg::AttachmentResult {
+                            kind: NoticeKind::Error,
                             token,
                             message: "Transfer interrupted: cancelled.".into(),
                             pasted: false,
@@ -2163,6 +2300,7 @@ mod tests {
             let (client, mut peer) = controller(true);
             let token = prepare_drop(&client, &mut peer, &original);
             client.message(ServerMsg::AttachmentResult {
+                kind: NoticeKind::Error,
                 token: token.clone(),
                 message: "Transfer interrupted. No paths pasted.".into(),
                 pasted: false,
@@ -2187,7 +2325,12 @@ mod tests {
         let path = dropped_file("success");
         let (client, mut peer) = controller(true);
         let token = prepare_drop(&client, &mut peer, path.to_str().unwrap().as_bytes());
-        client.message(ServerMsg::AttachmentResult { token, message: "Files received.".into(), pasted: true });
+        client.message(ServerMsg::AttachmentResult {
+            kind: NoticeKind::Notice,
+            token,
+            message: "Files received.".into(),
+            pasted: true,
+        });
         assert!(client.state.lock().unwrap().dropped.is_none());
         std::fs::remove_file(path).unwrap();
     }
@@ -2364,6 +2507,7 @@ mod tests {
                 if phase == "progress" {
                     assert!(matches!(read(&mut peer), ClientMsg::Resize { .. }));
                     client.message(ServerMsg::AttachmentResult {
+                        kind: NoticeKind::Error,
                         token: token.clone(),
                         message: "Transfer cancelled.".into(),
                         pasted: false,
@@ -2432,6 +2576,7 @@ mod tests {
             let token = prepare_drop(&client, &mut peer, path.to_str().unwrap().as_bytes());
             client.state.lock().unwrap().dropped.as_mut().unwrap().image = image;
             client.message(ServerMsg::AttachmentResult {
+                kind: NoticeKind::Notice,
                 token: token.clone(),
                 message: "Files received. Paths submitted to the reserved pane. No Enter added.".into(),
                 pasted: true,
@@ -2765,6 +2910,7 @@ mod tests {
             });
         }
         client.message(ServerMsg::AttachmentResult {
+            kind: NoticeKind::Notice,
             pasted: true,
             token: "ab".into(),
             message: "Files received.".into(),

@@ -11,6 +11,7 @@ use crate::server::bottom_bar::Click;
 use crate::server::render::{BarItem, SideItem};
 use crate::server::ui::{Drag, Mode, Picker, WorkspaceDrag};
 use crate::server::{ClientId, Server};
+use crate::theme::NoticeKind;
 
 impl Server {
     /// A mouse event; returns the mode it opens (a picker, a question), if any.
@@ -411,7 +412,7 @@ impl Server {
         picker.select(|i| self.workspace_key(&i.action).as_ref() == Some(&drag.workspace));
         picker.message = None;
         if !picker.query.is_empty() {
-            return picker.result("Clear search to reorder");
+            return picker.result(NoticeKind::Warning, "Clear search to reorder");
         }
         let Some(target) = drag.target else { return Mode::Picker(picker) };
         let before =
@@ -837,6 +838,7 @@ mod workspace_drag_tests {
         server.new_workspace("new".into(), None);
         let Mode::Picker(picker) = release(&mut server, client, picker, col, row + 2) else { panic!() };
         assert_eq!(picker.message.as_deref(), Some("Order changed. Drag the workspace again."));
+        assert_eq!(picker.message_kind, crate::theme::NoticeKind::Warning);
         assert_eq!(names(&server), ["test", "test-b", "new"]);
         assert_eq!(server.clients[&client].workspace, current);
         assert!(saved.lock().unwrap().is_empty());

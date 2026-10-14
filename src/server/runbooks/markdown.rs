@@ -14,18 +14,23 @@ use crate::runbooks::{self, Body, Runbook, Source};
 use crate::server::ui::{ConfirmAction, Mode, PickAction, PickItem, Picker, PickerKind};
 use crate::server::{ClientId, Server};
 use crate::text::numbered;
+use crate::theme::NoticeKind;
 
 impl Server {
     pub(super) fn open_markdown(&mut self, client: ClientId, r: Runbook) -> Mode {
         let Body::Markdown { title, blocks } = r.body.clone() else { return Mode::Normal };
         if blocks.is_empty() {
-            self.toast(client, "no shell blocks (```sh) in this runbook");
+            self.toast(client, NoticeKind::Notice, "no shell blocks (```sh) in this runbook");
             return Mode::Normal;
         }
         let Some(target) = self.client_focus(client).filter(|p| self.panes.get(p).is_some_and(|p| p.is_terminal()))
         else {
             let key = self.runbooks_key();
-            self.toast(client, format!("focus the terminal pane the steps should run in, then {key}"));
+            self.toast(
+                client,
+                NoticeKind::Notice,
+                format!("focus the terminal pane the steps should run in, then {key}"),
+            );
             return Mode::Normal;
         };
         let ws = self.clients.get(&client).map(|c| c.workspace).unwrap_or(0);
@@ -33,7 +38,7 @@ impl Server {
         if !shown {
             let spec = PaneSpec { preview: Some(r.path.clone()), ..Default::default() };
             if let Err(e) = self.spawn_pane_in(ws, Some(target), spec, Placement::Right, Some(r.name.clone())) {
-                self.toast(client, format!("{e:#}"));
+                self.toast(client, NoticeKind::Error, format!("{e:#}"));
             }
             // Keep typing where the steps run.
             if let Some((wi, ti)) = self.workspace_of(target) {
@@ -80,7 +85,7 @@ impl Server {
         let concerns = match self.block_check(client, index) {
             Ok(c) => c,
             Err(why) => {
-                self.toast(client, why);
+                self.toast(client, NoticeKind::Warning, why);
                 return Mode::Normal;
             }
         };
@@ -149,20 +154,21 @@ impl Server {
                 let back = index.min(s.blocks.len() - 1);
                 self.toast(
                     client,
+                    NoticeKind::Warning,
                     "the preview shows another version of the runbook: wait for it to update, then choose again",
                 );
                 return Some(Mode::Picker(self.md_picker(client, back, false)));
             }
             Ok(r) => r,
             Err(e) => {
-                self.toast(client, format!("{e:#}"));
+                self.toast(client, NoticeKind::Error, format!("{e:#}"));
                 return Some(Mode::Normal);
             }
         };
         let Body::Markdown { title, blocks } = fresh.body.clone() else { return Some(Mode::Normal) };
         if blocks.is_empty() {
             self.md_sessions.remove(&client);
-            self.toast(client, "the runbook changed and has no shell blocks any more");
+            self.toast(client, NoticeKind::Warning, "the runbook changed and has no shell blocks any more");
             return Some(Mode::Normal);
         }
         let s = self.md_sessions.get_mut(&client)?;
@@ -171,7 +177,11 @@ impl Server {
         s.sent.clear();
         s.runbook = Runbook { name: s.runbook.name.clone(), ..fresh };
         let last = s.blocks.len() - 1;
-        self.toast(client, "the runbook changed since it was opened: these are its steps now, choose again");
+        self.toast(
+            client,
+            NoticeKind::Warning,
+            "the runbook changed since it was opened: these are its steps now, choose again",
+        );
         Some(Mode::Picker(self.md_picker(client, index.min(last), false)))
     }
 
@@ -257,7 +267,7 @@ impl Server {
             Ok(concerns) if concerns.is_empty() => self.send_block(client, index),
             Ok(_) => self.ask_block(client, index),
             Err(why) => {
-                self.toast(client, why);
+                self.toast(client, NoticeKind::Warning, why);
                 Mode::Normal
             }
         }
@@ -280,7 +290,7 @@ impl Server {
         } else {
             " · that was the last step".into()
         };
-        self.toast(client, format!("step {}/{total} sent to {label}{next}", index + 1));
+        self.toast(client, NoticeKind::Notice, format!("step {}/{total} sent to {label}{next}", index + 1));
         Mode::Normal
     }
 
