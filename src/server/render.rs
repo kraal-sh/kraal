@@ -37,7 +37,7 @@ pub enum BarItem {
 }
 
 /// One row of the sidebar.
-#[derive(PartialEq)]
+#[derive(Clone, PartialEq)]
 enum SideRow {
     /// The line that opens a section, with its name.
     Section(&'static str),
@@ -48,6 +48,12 @@ enum SideRow {
         selected: bool,
     },
     Blank,
+}
+
+pub(super) struct AccountRows {
+    width: u16,
+    room: usize,
+    rows: Vec<SideRow>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1219,6 +1225,8 @@ impl Server {
     /// a name after a state dot and a detail below. Accounts sit at the bottom when there is room,
     /// with their usage at `now`.
     fn sidebar_rows(&self, c: &Client, height: u16, now: i64) -> Vec<SideRow> {
+        #[cfg(test)]
+        SIDEBAR_BUILDS.with(|n| n.set(n.get() + 1));
         let t = th();
         let mut rows = vec![SideRow::Section("WORKSPACES")];
         let entry = |rows: &mut Vec<SideRow>,
@@ -1313,7 +1321,7 @@ impl Server {
                 let pane = &self.panes[&p];
                 let kind = match &pane.spec.account {
                     Some(a) => {
-                        self.pane_account(p).as_ref().map(crate::accounts::label).unwrap_or_else(|| a.replace(':', "·"))
+                        self.account_display_at(now).labels.get(&p).cloned().unwrap_or_else(|| a.replace(':', "·"))
                     }
                     None => pane.agent.kind.clone().unwrap_or_default(),
                 };
@@ -1388,16 +1396,21 @@ impl Server {
         }
 
         let room = (height as usize).saturating_sub(rows.len() + 1);
-        let mut items = self.accounts_picker_at(None, now).items;
-        for item in &mut items {
-            item.detail =
-                super::account_ui::sidebar_summary(&item.detail, self.sidebar_cols(c).saturating_sub(3) as usize);
+        let display = self.account_display_at(now);
+        let width = self.sidebar_cols(c).saturating_sub(3);
+        let mut cached = display.sidebar.borrow_mut();
+        if cached.as_ref().is_none_or(|rows| rows.width != width || rows.room != room) {
+            let mut items = display.items.clone();
+            for item in &mut items {
+                item.detail = super::account_ui::sidebar_summary(&item.detail, width as usize);
+            }
+            *cached = Some(AccountRows { width, room, rows: account_rows(items, room) });
         }
-        let accounts = account_rows(items, room);
+        let accounts = &cached.as_ref().unwrap().rows;
         if !accounts.is_empty() {
             let top = (height as usize).saturating_sub(accounts.len() + 1);
             rows.resize_with(top, || SideRow::Blank);
-            rows.extend(accounts);
+            rows.extend(accounts.iter().cloned());
         }
         rows
     }
@@ -1419,6 +1432,8 @@ impl Server {
 
     /// The sidebar: one box over the whole height, its sections split by lines across it.
     fn draw_sidebar(rows: &[SideRow], area: Rect, buf: &mut Buffer) {
+        #[cfg(test)]
+        SIDEBAR_DRAWS.with(|n| n.set(n.get() + 1));
         if area.width < 4 || area.height < 3 {
             return;
         }
@@ -1675,18 +1690,16 @@ impl Server {
         }
         if let Some(kind) = &pane.agent.kind {
             let state = pane.agent.state;
-            let account = self.pane_account(pid);
-            let kind = account.as_ref().map(crate::accounts::label).unwrap_or_else(|| kind.clone());
+            let account = self.pane_account_label(pid);
+            let linked = account.is_some();
+            let kind = account.unwrap_or_else(|| kind.clone());
             let sep = if th().ascii { "-" } else { "·" };
             out.push(Span::styled(
                 format!(" {} {} {sep} ", th().icon(state), state.label()),
                 Style::default().fg(th().state_color(state)),
             ));
             let style = Style::default().fg(th().state_color(state));
-            out.push(Span::styled(
-                kind,
-                if account.is_some() { style.add_modifier(Modifier::UNDERLINED) } else { style },
-            ));
+            out.push(Span::styled(kind, if linked { style.add_modifier(Modifier::UNDERLINED) } else { style }));
             out.push(Span::raw(" "));
         }
         // The last command the shell marked failed: its status, and how long it ran if that
@@ -2084,8 +2097,109 @@ pub(super) fn key_list(list: &[(&str, &str)]) -> Vec<Span<'static>> {
 }
 
 #[cfg(test)]
+thread_local! {
+    static SIDEBAR_BUILDS: Cell<usize> = const { Cell::new(0) };
+    static SIDEBAR_DRAWS: Cell<usize> = const { Cell::new(0) };
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn printing_four_panes_does_not_repeat_account_work() {
+        printing_account_work(false);
+    }
+
+    #[test]
+    fn printing_agent_frames_does_not_repeat_account_work() {
+        printing_account_work(true);
+    }
+
+    fn printing_account_work(agents: bool) {
+        let _batch = crate::pane::batch();
+        let (tx, _rx) = super::super::queue::channel(32);
+        let mut server = super::super::tests::server(tx);
+        let (client, _peer) = super::super::tests::client(&mut server);
+        let mut account = server.accounts.get("claude", "default").unwrap();
+        account.id = "printing-account".into();
+        account.name = "Work".into();
+        account.home = "/nonexistent/kraal-printing-account".into();
+        server.accounts.add(account.clone()).unwrap();
+        let panes: Vec<_> = (0..4)
+            .map(|_| {
+                let spec = crate::pane::PaneSpec {
+                    command: vec!["true".into()],
+                    account: Some("claude:Work".into()),
+                    account_id: Some(account.id.clone()),
+                    ..Default::default()
+                };
+                let pane = server.spawn_pane(None, spec).unwrap();
+                if agents {
+                    server.panes.get_mut(&pane).unwrap().agent.kind = Some("claude".into());
+                }
+                pane
+            })
+            .collect();
+        let mut buf = Buffer::empty(Rect::new(0, 0, 124, 36));
+        server.compose(client, 1_000, &mut buf);
+        crate::accounts::HOME_CHECKS.with(|n| n.set(0));
+        super::super::account_ui::ACCOUNT_BUILDS.with(|n| n.set(0));
+        SIDEBAR_BUILDS.with(|n| n.set(0));
+        SIDEBAR_DRAWS.with(|n| n.set(0));
+        for frame in 0..100 {
+            for &pane in &panes {
+                server.pane_output(pane, b"a log line\r\n");
+            }
+            // The periodic tick invalidates chrome even when the accounts have not changed.
+            if frame % 10 == 0 {
+                server.chrome_changed();
+            }
+            let _frame = crate::pane::Frame::start();
+            server.show_what_output_changed();
+            server.compose(client, 1_000, &mut buf);
+        }
+        let checks = crate::accounts::HOME_CHECKS.with(Cell::get);
+        let accounts = super::super::account_ui::ACCOUNT_BUILDS.with(Cell::get);
+        let builds = SIDEBAR_BUILDS.with(Cell::get);
+        let draws = SIDEBAR_DRAWS.with(Cell::get);
+        eprintln!(
+            "400 output chunks, 100 frames, 10 chrome invalidations: {checks} home checks, {accounts} account builds, {builds} sidebar builds, {draws} sidebar draws"
+        );
+        assert_eq!(checks, 0, "printing must not resolve account homes again");
+        assert_eq!(accounts, 0, "printing must not rebuild account labels and summaries");
+        assert_eq!(draws, 0, "unchanged sidebar cells must not be redrawn");
+    }
+
+    #[test]
+    fn cached_account_rows_follow_available_space_and_keep_click_targets() {
+        let (tx, _rx) = super::super::queue::channel(32);
+        let mut server = super::super::tests::server(tx);
+        let (client, _peer) = super::super::tests::client(&mut server);
+        let mut account = server.accounts.get("claude", "default").unwrap();
+        account.name = "Work".into();
+        server.accounts.add(account.clone()).unwrap();
+        for (width, height) in [(28, 36), (12, 24), (28, 7), (28, 36)] {
+            server.config.sidebar.width = width;
+            let c = &server.clients[&client];
+            let rows = server.sidebar_rows(c, height, 1_000);
+            assert!(rows.iter().any(|row| matches!(row, SideRow::Entry { item: Some(SideItem::AddAccount), .. })));
+            if height > 7 {
+                let details: Vec<_> = rows
+                    .iter()
+                    .filter_map(|row| match row {
+                        SideRow::Entry { item: Some(SideItem::Account(id)), line, .. } if *id == account.id => {
+                            Some(line.to_string())
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(details, ["Claude · Work", if width == 12 { "No usage" } else { "Usage unavailable" }]);
+            }
+            server.account_display.borrow_mut().take();
+            assert!(rows == server.sidebar_rows(c, height, 1_000), "cached rows differ at {width}x{height}");
+        }
+    }
 
     #[test]
     fn screen_close_marks_the_workspace_on_screen_as_current() {
@@ -2251,7 +2365,7 @@ mod tests {
     /// The accounts' rows made at one moment are those of any moment before the reset the usage
     /// says comes next (what a sidebar is kept until), and not those of that reset.
     #[test]
-    fn the_accounts_rows_hold_until_a_usage_window_resets() {
+    fn the_accounts_rows_hold_until_a_usage_window_resets_and_ages_refresh_on_redraw() {
         use crate::accounts::{Account, Usage, Window};
         let (tx, _) = super::super::queue::channel(16);
         let mut server = super::super::tests::server(tx);
@@ -2297,6 +2411,27 @@ mod tests {
         assert_eq!(server.account_summaries_until(1_300), Some(1_360));
         assert_eq!(rows(1_359), rows(1_300));
         assert_ne!(rows(1_360), rows(1_300));
+
+        let (client, _peer) = super::super::tests::client(&mut server);
+        let mut buf = Buffer::empty(Rect::new(0, 0, 124, 36));
+        let text = |buf: &Buffer| buf.content.iter().map(|cell| cell.symbol()).collect::<String>();
+        server.compose(client, 1_300, &mut buf);
+        assert!(text(&buf).contains("Last checked 5m ago"));
+        server.next_render = None;
+        server.clients.get_mut(&client).unwrap().dirty = super::super::Dirty::No;
+
+        // Expired windows leave no wake scheduled; a chrome tick only invalidates the cache.
+        server.await_usage_reset();
+        server.chrome_changed();
+        assert!(server.usage_reset.is_none());
+        assert!(server.next_render.is_none());
+        assert!(server.clients[&client].dirty == super::super::Dirty::No);
+
+        server.mark_dirty_client(client);
+        assert!(server.next_render.is_some());
+        server.compose(client, 1_360, &mut buf);
+        assert!(text(&buf).contains("Last checked 6m ago"));
+        assert!(!text(&buf).contains("Last checked 5m ago"));
     }
 
     #[test]

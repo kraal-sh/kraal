@@ -647,6 +647,7 @@ pub struct Server {
     chrome_gen: u64,
     /// What the chrome shows of each pane, while it holds (see `Server::pane_facts`).
     facts: render::FactsCache,
+    account_display: std::cell::RefCell<Option<std::rc::Rc<account_ui::AccountDisplay>>>,
     /// The panes that printed since the last frames: what the chrome shows of them is looked at
     /// before the next ones (see `Server::show_what_output_changed`).
     printed: Vec<PaneId>,
@@ -901,6 +902,7 @@ pub fn run(session: &str) -> Result<()> {
         typed_quietly: false,
         chrome_gen: 0,
         facts: Default::default(),
+        account_display: Default::default(),
         printed: Vec::new(),
         tilings: Default::default(),
         broadcast_tip_shown: false,
@@ -2111,6 +2113,7 @@ mod tests {
             typed_quietly: false,
             chrome_gen: 0,
             facts: Default::default(),
+            account_display: Default::default(),
             printed: Vec::new(),
             tilings: Default::default(),
             broadcast_tip_shown: false,
