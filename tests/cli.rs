@@ -1547,7 +1547,8 @@ fn workspace_moves_keep_focus_share_the_list_and_survive_restart() {
         client.send(b"docs\t");
         click_account_text(&mut client, "Clear search to reorder");
         assert_eq!(listed_workspaces(&env), ["api: api.kdl (open)", "docs: docs.kdl", "web: web.kdl (open)"]);
-        client.send(b"\t\x1b[B\x1b[B\x1b[B\r");
+        client.send(b"\t");
+        click_account_text(&mut client, "Move up");
         let reordered = ["docs: docs.kdl", "api: api.kdl (open)", "web: web.kdl (open)"];
         wait_until(PATIENCE, "workspace order was not saved", || listed_workspaces(&env) == reordered);
         other.wait_for_rows("the other client's list has the same order", |rows| {
@@ -1595,13 +1596,15 @@ fn workspace_delete_undo_and_restore_after_restart_keep_both_reused_names() {
         let path = env.root.join("config/kraal/workspaces/api.kdl");
         let mut client = RawClient::attach_sized(&env, Some("api"), size);
         client.wait_for_row("$ ");
-        client.send(b"\x02w\t\x1b[B\x1b[B\x1b[B\x1b[B\r");
+        client.send(b"\x02w\t");
+        click_account_text(&mut client, "Delete");
         client.wait_for_row("Delete api?");
         client.wait_for_row("Project files will be kept.");
         client.send(b"\r");
         client.wait_for_row("Search");
         assert_eq!(env.run(&["workspaces", "--json"]), serde_json::to_string_pretty(&original).unwrap() + "\n");
-        client.send(b"\t\x1b[B\x1b[B\x1b[B\x1b[B\r");
+        client.send(b"\t");
+        click_account_text(&mut client, "Delete");
         client.wait_for_row("Delete api?");
         client.send(b"y");
         client.wait_for_row("Ctrl+Z Undo");
@@ -1613,7 +1616,8 @@ fn workspace_delete_undo_and_restore_after_restart_keep_both_reused_names() {
         assert_eq!(restored[0]["id"], identity);
         assert_eq!(restored[0]["open"], false);
         assert_eq!(env.run(&["panes", "--json"]).trim(), "[]");
-        client.send(b"\t\x1b[B\x1b[B\x1b[B\r");
+        client.send(b"\t");
+        click_account_text(&mut client, "Delete");
         client.wait_for_row("Delete api?");
         client.send(b"y");
         client.wait_for_row("Workspace deleted");
