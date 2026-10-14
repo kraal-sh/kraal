@@ -461,6 +461,7 @@ impl Server {
                         return self.ask_delete_workspace(target);
                     }
                     ConfirmAction::Restart => self.restart(id),
+                    ConfirmAction::AttachClipboardImage(pane) => return self.offer_attachment(id, Some(pane), true),
                     ConfirmAction::AttachFiles(pane) => return self.offer_attachments(id, Some(pane)),
                     ConfirmAction::PurgeAttachments => self.purge_attachments(id),
                     ConfirmAction::Quit => self.quit(id),

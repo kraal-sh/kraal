@@ -9,6 +9,7 @@ use std::time::{Duration, SystemTime};
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 
+pub const IMAGE_BYTES: usize = 16 << 20;
 pub const CHUNK: usize = 64 * 1024;
 pub const RESULT_RESERVE: u64 = 4096;
 pub const TIMEOUT: Duration = Duration::from_secs(60);

@@ -297,10 +297,18 @@ read them as such. Key release events are not passed on yet.
 
 ## Attach files
 
-The command palette (`ctrl+b space`) includes **Attach files** and **Purge attachments**.
+The command palette (`ctrl+b space`) includes **Attach files**, **Attach clipboard image** and **Purge attachments**.
 **Attach files** opens a local path form: Enter sends, Ctrl+C cancels. It works with terminals
 that do not support bracketed paste. No key is assigned by default; custom bindings use
-`attach_files` and `purge_attachments`. On `attach --host`, pasting local file paths opens
+`attach_files`, `attach_clipboard_image` and `purge_attachments`. On `attach --host`, pasting local file paths opens
 Send, Always, Text and Cancel choices. Tab or arrows select, Enter activates, and a click also
 activates a choice. Ctrl+C or Esc cancels the choice; Ctrl+C cancels a transfer.
-See [Attachments](terminal.md#attachments) for remembered permissions and revocation.
+**Attach clipboard image** names the target and asks for local Enter before reading the clipboard.
+No default shortcut changes Ctrl+V. For example, to bind the image action after the leader:
+
+```toml config
+[keys.leader]
+attach_clipboard_image = ["I"]
+```
+
+See [Attachments](terminal.md#attachments) for image limits, remembered permissions and revocation.

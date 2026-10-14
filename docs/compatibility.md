@@ -105,6 +105,12 @@ without the capability retain ordinary paste bytes; no new requests reach an old
 The laptop's `paste-files.toml` permissions are separate from configuration, workspace and
 session formats. Existing 0.2.0 and 0.3.0 files and downgrade isolation remain unchanged.
 
+Clipboard image offers additionally require `clipboard_images` and `attachments` in both
+peers' lists. The new action tells older clients to update; older servers retain their existing
+palette. Image data uses the existing attachment messages. Local image batches also use that
+transport to create private session files. No configuration, workspace or saved-state format
+changes are needed, and existing configurations add no default image shortcut.
+
 ## For contributors: how the protocol changes
 
 The client and the server exchange JSON messages (`src/protocol.rs`, whose comments hold the

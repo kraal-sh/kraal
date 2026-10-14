@@ -73,6 +73,10 @@ impl Splitter {
         self.paste.is_none() && !self.streaming && !self.marker.is_empty()
     }
 
+    pub fn streaming(&self) -> bool {
+        self.streaming
+    }
+
     pub fn idle(&mut self) -> Vec<u8> {
         if self.paste.is_none() && !self.streaming { std::mem::take(&mut self.marker) } else { Vec::new() }
     }

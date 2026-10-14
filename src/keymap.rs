@@ -70,6 +70,7 @@ pub enum Action {
     Tunnels,
     EditServers,
     AttachFiles,
+    AttachClipboardImage,
     PurgeAttachments,
     Upload,
     Download,
@@ -155,6 +156,7 @@ const ACTIONS: &[(Action, &str, &str)] = &[
     (Upload, "upload", "Upload to this pane's server"),
     (Download, "download", "Download from this pane's server"),
     (AttachFiles, "attach_files", "Attach files"),
+    (AttachClipboardImage, "attach_clipboard_image", "Attach clipboard image"),
     (PurgeAttachments, "purge_attachments", "Purge attachments"),
     (Files, "files", "File manager"),
     (OpenPreview, "open_preview", "Preview a file"),
@@ -1110,6 +1112,23 @@ mod tests {
 
     fn key(c: char) -> Key {
         Key { code: KeyCode::Char(c), mods: Mods::NONE, raw: vec![c as u8] }
+    }
+
+    #[test]
+    fn clipboard_image_is_in_the_palette_with_only_opt_in_bindings() {
+        for preset in PRESETS {
+            let (km, warnings) = Keymap::build(&cfg(&format!("[keys]\npreset = '{}'", preset.name)).keys);
+            assert!(warnings.is_empty());
+            assert!(!km.direct.iter().any(|(_, action)| *action == AttachClipboardImage));
+            assert!(!km.leader.iter().any(|(_, command)| *command == Command::Action(AttachClipboardImage)));
+        }
+        assert!(ACTIONS.contains(&(AttachClipboardImage, "attach_clipboard_image", "Attach clipboard image")));
+        let (km, warnings) = Keymap::build(&cfg("[keys.direct]\nattach_clipboard_image = ['ctrl+v']").keys);
+        assert!(warnings.is_empty());
+        assert!(km.direct.iter().any(|(_, action)| *action == AttachClipboardImage));
+        let (km, warnings) = Keymap::build(&cfg("[keys.leader]\nattach_clipboard_image = ['I']").keys);
+        assert!(warnings.is_empty());
+        assert_eq!(km.lookup(&[key('I')]), Lookup::Run(Command::Action(AttachClipboardImage)));
     }
 
     #[test]

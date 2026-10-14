@@ -8,6 +8,7 @@
 set -eu
 
 # To send laptop files, open the command palette (ctrl+b space) and choose Attach files.
+# For an image, choose Attach clipboard image and press Enter in the local prompt.
 # Enter absolute local paths, quoting spaces. Enter sends the batch; Ctrl+C cancels.
 
 server=${1:-workstation}

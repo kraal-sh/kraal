@@ -246,6 +246,28 @@ A local session submits the original paths without copying files. No Enter is ad
 usual production paste protections still apply. No path is submitted unless the entire batch
 arrives. Ordinary pasted text is unchanged. Clipboard images are not read by this action.
 
+### Clipboard images
+
+Choose **Attach clipboard image** in the command palette. The local prompt names the reserved
+pane. Press Enter to read the clipboard once and attach the image, or Ctrl+C to cancel. This
+local confirmation prevents a server message from reading your clipboard. Nothing watches the
+clipboard between actions. Ctrl+V and empty bracketed pastes keep their normal behavior.
+An optional `attach_clipboard_image` binding opens the same prompt.
+
+Linux tries `wl-paste --no-newline --type image/png` when `WAYLAND_DISPLAY` is set, then
+`xclip -selection clipboard -out -target image/png` when `DISPLAY` is set. Install `wl-clipboard`
+or `xclip` for your desktop. macOS uses `osascript` to export the clipboard as PNG into a private
+file. Each helper has a two-second timeout. Missing tools, an unavailable PNG representation,
+failed reads and images larger than **16 MiB** produce a visible failure without pasting a path.
+Save a larger image and use **Attach files**. Dismiss a failure with Ctrl+C before trying again.
+
+The image uses the same acknowledged attachment chunks, quotas, reserved target and paste
+protections as files. A local session also stores `clipboard.png` in its private session
+attachment directory and pastes that path. Completed images survive detach and server restart;
+**Purge attachments** removes them with the other attachments. Temporary client exports are
+removed after transfer, failure or cancellation. Clipboard reads happen on the attaching machine,
+so run the client on your desktop to use its clipboard, including inside local tmux or kraal.
+
 ### Pasted laptop paths
 
 With `attach --host`, a complete bracketed paste containing only existing absolute laptop paths
