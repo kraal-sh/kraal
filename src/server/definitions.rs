@@ -945,6 +945,12 @@ mod tests {
     #[test]
     fn cli_links_are_marked_for_persistence_and_sources_survive_a_restart() {
         use crate::protocol::{Request, Response};
+        // Saves by name write in the workspaces directory, where the other tests list workspaces.
+        if !crate::testing::in_own_process(
+            "server::definitions::tests::cli_links_are_marked_for_persistence_and_sources_survive_a_restart",
+        ) {
+            return;
+        }
         let mut server = server();
         let name = format!("w2-cli-link-{}", std::process::id());
         let id = server.new_workspace(name.clone(), None);
@@ -988,6 +994,12 @@ mod tests {
 
     #[test]
     fn a_copy_keeps_the_original_link_and_first_save_collision_needs_confirmation() {
+        // Saves by name write in the workspaces directory, where the other tests list workspaces.
+        if !crate::testing::in_own_process(
+            "server::definitions::tests::a_copy_keeps_the_original_link_and_first_save_collision_needs_confirmation",
+        ) {
+            return;
+        }
         let dir = directory("copy");
         let path = dir.join("work.kdl");
         let mut server = server();

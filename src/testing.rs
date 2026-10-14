@@ -30,6 +30,28 @@ pub fn write_script(path: &Path, body: &str) {
     assert!(child.wait().unwrap().success(), "writing {}", path.display());
 }
 
+/// Whether this is the process where test `name` (its full path) runs alone, with a home of its
+/// own: for a test that writes where every test of this process looks, such as the workspaces
+/// directory. Called first, it starts that process, fails unless the test ran there and passed,
+/// and returns false for the test to return; in the process it started it returns true.
+pub fn in_own_process(name: &str) -> bool {
+    // Not a KRAAL_ name: the isolation clears those as the process loads, and the process it
+    // starts would start another.
+    const CHILD: &str = "UNIT_TEST_IN_OWN_PROCESS";
+    if std::env::var_os(CHILD).is_some() {
+        return true;
+    }
+    let output =
+        Command::new(std::env::current_exe().unwrap()).args(["--exact", name]).env(CHILD, "1").output().unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success() && stdout.contains(" 1 passed"),
+        "{name} in a process of its own:\n{stdout}\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    false
+}
+
 /// A function counting the context switches of thread `tid` of this process (both kinds): what
 /// tells a thread that sleeps from one that keeps waking up.
 #[cfg(target_os = "linux")]
