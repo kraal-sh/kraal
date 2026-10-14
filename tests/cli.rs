@@ -7967,7 +7967,7 @@ fn picker_actions_and_footers_follow_the_line_at_both_sizes() {
         client.wait_for_rows("the workspace picker closed", |rows| !rows.iter().any(|r| r.contains("Search  closed")));
 
         client.send(b"\x02s");
-        client.wait_for_row("Connect to");
+        client.wait_for_row("╭ Servers ");
         client.wait_for_row("⏎ open group");
         client.send(b"\t");
         let rows = client.wait_for_row("Run a command on it");
@@ -10145,6 +10145,26 @@ fn agents_of_a_remote_session_are_listed_and_reached() {
         std::thread::sleep(Duration::from_millis(50));
     }
     assert!(std::fs::read_to_string(&inventory).unwrap().contains("agents = \"main\""), "the others stay as written");
+
+    // A new remote connection is offered for explicit addition, never silently saved.
+    let before_unknown = std::fs::read_to_string(&inventory).unwrap();
+    local.run(&[
+        "run",
+        "-n",
+        "unsaved",
+        "--",
+        "env",
+        "-u",
+        "KRAAL_PANE",
+        kraal,
+        "-s",
+        "rremote",
+        "attach",
+        "--host",
+        "unsaved.lan",
+    ]);
+    local.wait_for_text("unsaved", "api");
+    assert_eq!(std::fs::read_to_string(&inventory).unwrap(), before_unknown);
 
     // A configuration that cannot be read does not say that servers may be added: none is,
     // though the attach works.
@@ -12828,4 +12848,134 @@ fn legacy_zellij_import_keeps_manual_bytes_and_backs_up_replacements() {
     assert_eq!(std::fs::read_to_string(&dest).unwrap(), source);
     assert_eq!(std::fs::read_to_string(dest.with_extension("kdl.bak")).unwrap(), old);
     assert!(env.server_pid().is_none());
+}
+
+#[test]
+fn servers_add_saves_before_connecting_and_a_failed_connection_keeps_the_entry() {
+    for size in [(80, 24), (124, 36)] {
+        let env = Env::new(&format!("server-form-{}", size.0));
+        let bin = env.root.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let log = env.root.join("ssh.log");
+        write_script(
+            &bin.join("ssh"),
+            &format!("#!/bin/sh\necho attempt >> '{}'\necho 'Connection refused' >&2\nexit 255\n", log.display()),
+        );
+        env.workspace("w", "layout {\n    pane name=\"main\"\n}\n");
+        let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap_or_default());
+        let out = env.cmd(&["open", "w"]).env("PATH", path).output().unwrap();
+        assert!(out.status.success());
+        let mut client = RawClient::attach_sized(&env, Some("w"), size);
+        client.send(b"\x02s");
+        click_account_text(&mut client, "+ Add server");
+        client.wait_for_row("Address");
+        client.send(b"admin@down.lan\r");
+        client.wait_for_row("Server added");
+        assert!(!log.exists(), "saving never invokes SSH");
+        let inventory = env.root.join("config/kraal/servers.toml");
+        let saved = std::fs::read_to_string(&inventory).unwrap();
+        assert!(saved.contains("name = \"down\""));
+        let panes: serde_json::Value = serde_json::from_str(&env.run(&["panes", "--json"])).unwrap();
+        assert_eq!(panes.as_array().unwrap().len(), 1);
+        client.send(b"\r");
+        client.wait_for_row("The server is saved.");
+        assert_eq!(std::fs::read_to_string(&log).unwrap().lines().count(), 1);
+        click_account_text(&mut client, "Try again");
+        common::wait_until(PATIENCE, "second SSH attempt", || {
+            std::fs::read_to_string(&log).unwrap().lines().count() == 2
+        });
+        client.wait_for_row("The server is saved.");
+        client.send(b"\r");
+        common::wait_until(PATIENCE, "failed SSH pane closed", || {
+            let panes: serde_json::Value = serde_json::from_str(&env.run(&["panes", "--json"])).unwrap();
+            panes.as_array().unwrap().len() == 1
+        });
+        assert_eq!(std::fs::read_to_string(&inventory).unwrap(), saved);
+        assert_eq!(std::fs::read_to_string(&log).unwrap().lines().count(), 2, "Enter defaults to Close");
+    }
+}
+
+#[test]
+fn saving_beside_a_watched_server_does_not_start_another_ssh() {
+    let env = Env::new("server-form-watched");
+    let bin = env.root.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let log = env.root.join("ssh.log");
+    write_script(
+        &bin.join("ssh"),
+        &format!("#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nexec sleep 60\n", log.display()),
+    );
+    let inventory = env.root.join("config/kraal/servers.toml");
+    let original = "[[server]]\nname = \"box\"\nhost = \"box.lan\"\nagents = \"main\"\n";
+    std::fs::write(&inventory, original).unwrap();
+    env.workspace("w", "layout { pane; }\n");
+    let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap_or_default());
+    let out = env.cmd(&["open", "w"]).env("PATH", path).output().unwrap();
+    assert!(out.status.success());
+    common::wait_until(PATIENCE, "the saved server's agent watch started", || {
+        std::fs::read_to_string(&log).is_ok_and(|text| text.lines().count() == 1)
+    });
+    let before = std::fs::read_to_string(&log).unwrap();
+    assert_eq!(before.lines().count(), 1);
+    let mut client = RawClient::attach_sized(&env, Some("w"), (80, 24));
+    client.send(b"\x02Sn");
+    client.wait_for_row("Address");
+    client.send(b"box.lan:22\t\x15box22\r");
+    client.wait_for_row("Server added");
+    client.settle();
+    assert_eq!(std::fs::read_to_string(&log).unwrap(), before, "saving must not start another SSH");
+    let saved = std::fs::read_to_string(&inventory).unwrap();
+    assert!(saved.starts_with(original));
+    let parsed: toml::Table = toml::from_str(&saved).unwrap();
+    let entries = parsed["server"].as_array().unwrap();
+    assert_eq!(entries.len(), 2);
+    assert_eq!(entries[1]["name"].as_str(), Some("box22"));
+    assert_eq!(entries[1]["host"].as_str(), Some("box.lan"));
+    assert_eq!(entries[1]["port"].as_integer(), Some(22));
+    assert!(entries[1].get("agents").is_none());
+    let panes: serde_json::Value = serde_json::from_str(&env.run(&["panes", "--json"])).unwrap();
+    assert_eq!(panes.as_array().unwrap().len(), 1);
+}
+
+#[test]
+fn server_form_save_error_retries_without_losing_fields_and_concurrent_adds_do_not_duplicate() {
+    let env = Env::new("server-form-retry");
+    env.workspace("w", "layout {\n    pane name=\"main\"\n}\n");
+    env.run(&["open", "w"]);
+    let inventory = env.root.join("config/kraal/servers.toml");
+    let broken = "# Keep this file\n[[server]\n";
+    std::fs::write(&inventory, broken).unwrap();
+    let mut client = RawClient::attach_sized(&env, Some("w"), (80, 24));
+    client.send(b"\x02Sn");
+    client.wait_for_row("Address");
+    client.send(b"admin@db.lan:2222\t\x15database\r");
+    client.wait_for_row("Couldn't save server.");
+    client.wait_for_row("admin@db.lan:2222");
+    client.wait_for_row("database");
+    assert_eq!(std::fs::read_to_string(&inventory).unwrap(), broken);
+    let original = "# Keep this file\n[[server]]\nname = \"web\"\nhost = \"web.lan\"\ncustom = \"kept\"\n";
+    std::fs::write(&inventory, original).unwrap();
+    let mut other = RawClient::attach_sized(&env, Some("w"), (124, 36));
+    other.send(b"\x02Sn");
+    other.wait_for_row("Address");
+    other.send(b"admin@db.lan:2222\t\x15database");
+    client.send(b"\r");
+    other.send(b"\r");
+    for client in [&mut client, &mut other] {
+        client.wait_for_rows("save result", |rows| {
+            rows.iter().any(|r| r.contains("Server added") || r.contains("Server already saved"))
+        });
+    }
+    let saved = std::fs::read_to_string(&inventory).unwrap();
+    assert!(saved.starts_with(original));
+    assert_eq!(saved.matches("name = \"database\"").count(), 1);
+    let panes: serde_json::Value = serde_json::from_str(&env.run(&["panes", "--json"])).unwrap();
+    assert_eq!(panes.as_array().unwrap().len(), 1);
+    client.send(b"\x15nothing-matches");
+    client.wait_for_row("+ Add server");
+    client.send(b"\r");
+    client.wait_for_row("Address   nothing-matches");
+    client.send(b"\x1b");
+    client.wait_for_row("nothing-matches");
+    assert_eq!(std::fs::read_to_string(&inventory).unwrap(), saved, "cancel does not save");
 }

@@ -1,5 +1,5 @@
 //! SSH-side features of the server: the known servers, SSH panes, whole groups in a grid,
-//! auto-adding servers you connect to, and the SSH picker.
+//! discovered server suggestions, and the SSH picker.
 
 use std::path::{Path, PathBuf};
 
@@ -155,8 +155,7 @@ impl Server {
         Ok(ws)
     }
 
-    /// An `ssh` process appeared in a pane: remember its server, and add it to the inventory
-    /// if kraal does not know it.
+    /// Remember a pane's SSH connection and offer unknown servers for explicit addition.
     pub(super) fn observe_ssh(&mut self, pane: PaneId, args: &[String]) {
         // The ssh kraal started in this pane is the connection it made, with what its command
         // line only spells (a jump host with its own key is a ProxyCommand there).
@@ -177,39 +176,47 @@ impl Server {
         {
             p.ssh = Some(s.clone());
         }
-        if known || !self.config.servers.auto_add || !self.discovered.insert(s.address()) {
+        if known || !self.config.servers.auto_add || self.discovered.iter().any(|old| old.same_connection(&s)) {
             return;
         }
         s.groups = vec!["discovered".into()];
-        let address = s.address();
-        // Off the event loop: another kraal may hold the inventory's lock, and the write syncs.
-        let observed = s.clone();
-        self.background(
-            move || Inventory::update(|inv| inv.add(s)),
-            move |server, result| match result {
-                Ok(name) => {
-                    let defs: Vec<WorkspaceDef> =
-                        server.definitions().into_iter().filter_map(|(_, d)| d.ok()).collect();
-                    server.refresh_known(&defs);
-                    // The pane may have moved on to another server meanwhile.
-                    if let Some(p) = server.panes.get_mut(&pane)
-                        && let Some(ssh) = &mut p.ssh
-                        && ssh.same_connection(&observed)
-                    {
-                        ssh.name = name.clone();
-                    }
-                    let ids: Vec<super::ClientId> = server.clients.keys().copied().collect();
-                    let see = match server.keymap.hint(crate::keymap::Action::SshPicker) {
-                        Some(k) => format!(" · {k} to see it"),
-                        None => String::new(),
-                    };
-                    for c in ids {
-                        server.toast(c, format!("new server saved as \"{name}\" (group discovered){see}"));
-                    }
-                }
-                Err(e) => server.warnings.push(format!("could not save server {address}: {e:#}")),
-            },
-        );
+        self.discovered.push(s);
+    }
+
+    pub(super) fn ssh_failure(&self, pane: PaneId, reason: &str) -> super::ui::Mode {
+        let Some(s) = self.panes.get(&pane).and_then(|p| p.spec.connection.as_ref()) else {
+            return super::ui::Mode::Normal;
+        };
+        let saved = self.known_servers.iter().any(|k| k.source == Source::Inventory && k.server.same_connection(s));
+        let message =
+            format!("Couldn't connect to {}.\n{reason}{}", s.name, if saved { "\nThe server is saved." } else { "" });
+        let super::ui::Mode::Confirm(mut q) =
+            super::ui::Mode::confirm(message, super::ui::ConfirmAction::RetrySsh(pane))
+        else {
+            unreachable!()
+        };
+        q.title = Some(format!("Connect · {}", s.name));
+        super::ui::Mode::Confirm(q)
+    }
+
+    pub(super) fn show_ssh_failure(&mut self, pane: PaneId) {
+        let Some(p) = self.panes.get(&pane) else { return };
+        if p.exit_code != Some(Some(255))
+            || p.spec.connection.as_ref().is_none_or(|s| p.spec.command.last() != Some(&s.destination()))
+        {
+            return;
+        }
+        let clients: Vec<_> = self
+            .clients
+            .iter()
+            .filter_map(|(&id, c)| {
+                (matches!(c.mode, super::ui::Mode::Normal) && self.client_focus(id) == Some(pane)).then_some(id)
+            })
+            .collect();
+        for id in clients {
+            let mode = self.ssh_failure(pane, "See the SSH output below.");
+            self.clients.get_mut(&id).unwrap().mode = mode;
+        }
     }
 
     pub(super) fn ssh_picker(&self) -> Picker {
@@ -247,7 +254,20 @@ impl Server {
                 dim: k.source == Source::SshConfig,
             });
         }
-        Picker::new(PickerKind::Ssh, "Connect to a server", items)
+        if self.config.servers.auto_add {
+            for s in &self.discovered {
+                if servers::is_known(&self.known_servers, s) {
+                    continue;
+                }
+                items.push(PickItem::new(
+                    format!("Add {}", s.name),
+                    format!("{} · discovered · not saved", s.address()),
+                    PickAction::AddServer(Some(Box::new(s.clone()))),
+                ));
+            }
+        }
+        items.push(PickItem::new("+ Add server", "", PickAction::AddServer(None)));
+        Picker::new(PickerKind::Ssh, "Servers", items)
     }
 
     /// The production servers among `target` (a server name or `@group`).
@@ -329,6 +349,86 @@ fn read_ssh_config(path: &Path, out: &mut Vec<String>, depth: u8) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn discovery_offers_a_form_without_a_write_or_a_connection() {
+        let (tx, _rx) = crate::server::event_channel(32);
+        let mut server = crate::server::tests::server(tx);
+        let args: Vec<String> = ["-i", "~/.ssh/db", "-J", "bastion", "admin@db.lan"].map(String::from).into();
+        server.config.servers.auto_add = false;
+        server.observe_ssh(0, &args);
+        assert!(server.discovered.is_empty());
+        server.config.servers.auto_add = true;
+        server.observe_ssh(0, &args);
+        server.observe_ssh(0, &args);
+        assert_eq!(server.discovered.len(), 1);
+        assert!(server.jobs.is_empty());
+        assert!(server.panes.is_empty());
+        let mut picker = server.ssh_picker();
+        assert_eq!(picker.title, "Servers");
+        assert_eq!(picker.action_keys(), [("enter", "Add")]);
+        assert!(picker.current().unwrap().detail.contains("not saved"));
+        let PickAction::AddServer(Some(s)) = &picker.current().unwrap().action else { panic!() };
+        assert_eq!(s.identity.as_deref(), Some("~/.ssh/db"));
+        assert_eq!(s.jump.as_deref(), Some("bastion"));
+        server.known_servers.push(servers::Known { server: *s.clone(), source: Source::Inventory });
+        picker = server.ssh_picker();
+        assert!(!picker.items.iter().any(|i| matches!(i.action, PickAction::AddServer(Some(_)))));
+        picker.select(|i| matches!(i.action, PickAction::Ssh(_)));
+        assert_eq!(picker.action_keys()[0], ("enter", "Connect"));
+    }
+
+    #[test]
+    fn failed_ssh_defaults_to_close_keeps_the_server_and_retry_failure_stays_actionable() {
+        use super::super::ui::Mode;
+        for size in [(80, 24), (124, 36)] {
+            let (tx, _rx) = crate::server::event_channel(128);
+            let mut server = crate::server::tests::server(tx);
+            let (client, _peer) = crate::server::tests::client(&mut server);
+            let c = server.clients.get_mut(&client).unwrap();
+            (c.cols, c.rows) = size;
+            let ws = c.workspace;
+            let s = servers::resolve(&[], "admin@db.lan").unwrap();
+            server.known_servers.push(servers::Known { server: s.clone(), source: Source::Inventory });
+            let pane = server
+                .spawn_pane_in(
+                    ws,
+                    None,
+                    PaneSpec { command: vec!["sh".into(), "-c".into(), "exit 0".into()], ..Default::default() },
+                    Placement::Tab,
+                    None,
+                )
+                .unwrap();
+            let p = server.panes.get_mut(&pane).unwrap();
+            p.spec.command = vec!["ssh".into(), s.destination()];
+            p.spec.connection = Some(s);
+            p.exit_code = Some(Some(255));
+            server.show_ssh_failure(pane);
+            let Mode::Confirm(q) = &server.clients[&client].mode else { panic!("failure dialog") };
+            assert!(!q.yes);
+            assert_eq!(q.action.cancel_label(), "Close");
+            assert_eq!(q.action.verb(), "Try again");
+            let screen = server.client_screen(client);
+            let mut buf = ratatui::buffer::Buffer::empty(screen);
+            super::super::overlays::draw_confirm(q, screen, &mut buf);
+            let text = buf.content.iter().map(|c| c.symbol()).collect::<String>();
+            assert!(text.contains("The server is saved."));
+            assert!(text.contains("Close") && text.contains("Try again"));
+            let retry = super::super::overlays::confirm_layout(q, screen).ok.unwrap();
+            // A missing SSH executable also keeps a retryable error, without running a network command.
+            server.panes.get_mut(&pane).unwrap().spec.command = vec!["/missing/ssh".into()];
+            if size.0 == 80 {
+                server.client_input(client, b"\t\r");
+            } else {
+                server.client_input(client, format!("\x1b[<0;{};{}M", retry.x + 1, retry.y + 1).as_bytes());
+            }
+            assert!(matches!(&server.clients[&client].mode, Mode::Confirm(q) if !q.yes));
+            server.client_input(client, b"\r");
+            assert!(!server.panes.contains_key(&pane));
+            assert!(server.ws_index(ws).is_some());
+            assert_eq!(server.known_servers.len(), 1);
+        }
+    }
 
     #[test]
     fn reopening_a_group_reports_restore_failure_and_keeps_its_identity() {

@@ -11,6 +11,9 @@ use crate::server::{ClientId, Server};
 
 impl Server {
     pub(super) fn on_prompt(&mut self, id: ClientId, mut p: Prompt, ev: InputEvent) -> Mode {
+        if p.server_form.is_some() {
+            return self.on_server_form(id, p, ev);
+        }
         if p.workspace_form.is_some() {
             return self.on_workspace_form(id, p, ev);
         }
@@ -64,6 +67,9 @@ impl Server {
 
     pub(super) fn submit_prompt(&mut self, id: ClientId, mut p: Prompt) -> Mode {
         p.scroll = 0;
+        if p.server_form.is_some() {
+            return self.submit_server_form(id, p);
+        }
         if p.workspace_form.is_some() {
             return self.submit_workspace_form(id, p);
         }
@@ -88,6 +94,7 @@ impl Server {
                 scroll: 0,
                 masked,
                 workspace_form: None,
+                server_form: None,
             }),
         }
     }
@@ -120,6 +127,7 @@ impl Server {
             }
             PromptAction::RenameWorkspace(_)
             | PromptAction::DuplicateWorkspace(_)
+            | PromptAction::AddServer
             | PromptAction::NewWorkspace
             | PromptAction::RestoreWorkspace(_)
             | PromptAction::ImportWorkspace
@@ -299,6 +307,19 @@ impl Server {
         }
         let action = q.action;
         match action {
+            ConfirmAction::RetrySsh(pane) => {
+                if yes {
+                    if let Some(p) = self.panes.get_mut(&pane).filter(|p| p.exit_code.is_some()) {
+                        if let Err(e) = p.respawn(&self.env, &self.tx) {
+                            return self.ssh_failure(pane, &format!("{e:#}"));
+                        }
+                        self.relayout();
+                    }
+                } else if self.panes.get(&pane).is_some_and(|p| p.exit_code.is_some()) {
+                    self.close_pane(pane);
+                }
+                return Mode::Normal;
+            }
             ConfirmAction::ApplyPane(form) => {
                 return if yes { self.submit_pane_form(id, *form, true) } else { Mode::PaneForm(form) };
             }
@@ -386,7 +407,8 @@ impl Server {
         match yes {
             true => {
                 match action {
-                    ConfirmAction::RemoveAccount(_)
+                    ConfirmAction::RetrySsh(_)
+                    | ConfirmAction::RemoveAccount(_)
                     | ConfirmAction::ApplyPane(_)
                     | ConfirmAction::ReplaceWorkspaceFile { .. }
                     | ConfirmAction::OpenWorkspace(_)

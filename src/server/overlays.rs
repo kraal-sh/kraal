@@ -553,7 +553,7 @@ pub(super) fn draw_picker(p: &Picker, screen: Rect, buf: &mut Buffer) -> Option<
         let msg = match p.kind {
             _ if p.loading.is_some() => if th().ascii { "Loading..." } else { "Loading…" }.into(),
             _ if !p.query.is_empty() => format!("Nothing matches \"{}\".", p.query),
-            K::Ssh => "No saved servers. Type user@host to connect (`kraal servers add` saves one).".into(),
+            K::Ssh => "No saved servers. Choose + Add server.".into(),
             K::Workspace => "No workspaces yet.".into(),
             K::DeletedWorkspaces => "No deleted workspaces.".into(),
             K::Runbook => "No runbooks yet: `kraal runbook new <name>` creates one.".into(),
@@ -644,6 +644,9 @@ pub(super) fn prompt_layout(p: &Prompt, screen: Rect) -> PromptLayout {
 }
 
 pub(super) fn draw_prompt(p: &Prompt, screen: Rect, buf: &mut Buffer) -> Option<Cursor> {
+    if p.server_form.is_some() {
+        return super::server_ui::draw_form(p, screen, buf);
+    }
     if p.workspace_form.is_some() {
         return super::workspace_ui::draw_form(p, screen, buf);
     }
@@ -761,8 +764,9 @@ pub(super) fn confirm_layout(q: &Question, screen: Rect) -> ConfirmLayout {
     let max_scroll = lines.len().saturating_sub(body as usize);
     let y = inner.y + inner.height.saturating_sub(2);
     let buttons = inner.height >= 3 && inner.width >= columns(&verb) as u16 + 15;
-    let cancel = buttons.then(|| Rect::new(inner.x + 1, y, 8, 1));
-    let ok = buttons.then(|| Rect::new(inner.x + 1 + 8 + 3, y, columns(&verb) as u16 + 2, 1));
+    let cancel_width = columns(q.action.cancel_label()) as u16 + 2;
+    let cancel = buttons.then(|| Rect::new(inner.x + 1, y, cancel_width, 1));
+    let ok = buttons.then(|| Rect::new(inner.x + 1 + cancel_width + 3, y, columns(&verb) as u16 + 2, 1));
     ConfirmLayout { area, lines, body, max_scroll, more, cancel, ok }
 }
 
@@ -813,7 +817,7 @@ pub(super) fn draw_confirm(q: &Question, screen: Rect, buf: &mut Buffer) {
         |label: &str, selected: bool, danger: bool| Span::styled(format!(" {label} "), button_style(selected, danger));
     if let Some(cancel) = layout.cancel {
         let row = Line::from(vec![
-            button("Cancel", !q.yes, false),
+            button(q.action.cancel_label(), !q.yes, false),
             Span::raw("   "),
             button(&q.action.verb(), q.yes, danger),
         ]);

@@ -24,7 +24,7 @@ agents = "main"      # optional: list the agents of the kraal session "main" the
 ```
 
 Only `name` and `host` are needed, and a name is given once. When kraal changes this file (a
-server added, removed or discovered), it edits what changes and leaves the rest as you wrote it:
+server added or removed), it edits what changes and leaves the rest as you wrote it:
 your comments, your order, and the keys only another version of kraal reads.
 
 It also knows the `ssh` panes of your workspace files (in a group named after the workspace) and
@@ -33,8 +33,12 @@ configuration leaves them out). A server of the inventory stays as its entry giv
 workspace pane that connects to it takes the entry's name and groups, and adds none, so the
 group of a workspace holds only the servers the inventory does not have. To run something on all
 the servers of a workspace, give their entries a group of their own. When you `ssh` somewhere
-new, from the picker or typed in any pane, kraal saves it in the group `discovered`, unless
-`[servers] auto_add = false`.
+new in a pane, kraal offers it in Servers as `discovered · not saved`. Choose it to review
+Address and Name in the Add server form. Its key and jump host are kept when the address is
+unchanged. Only Add saves it, in the group `discovered`; observing SSH never writes the inventory.
+The existing `[servers] auto_add` setting controls these suggestions: `true` offers them,
+`false` hides them. Suggestions last for this running session. Existing entries in the
+`discovered` group stay saved.
 
 | Command | |
 |---|---|
@@ -51,11 +55,28 @@ the one field it sets there; given another option that would change the entry, i
 the option and changes nothing: change those fields with `kraal servers edit`. The same host
 with another user or port is another address, and gets an entry of its own.
 
-`ctrl+b s` opens the same list: Enter connects (or opens a whole group); Tab shows the other
+`ctrl+b s` opens **Servers**. Choose **+ Add server**, or use `ctrl+b S n` directly.
+The shared form has **Address** (`user@host[:port]` or an SSH alias) and a suggested **Name**.
+Enter adds, Tab moves between fields and buttons, and Esc cancels. Search only filters the
+list; it never connects to a typed address or saves one. Choosing + Add server carries the
+search text into Address.
+
+Adding saves locally without starting SSH. The list returns with **Server added**, the saved
+row selected, and **Enter Connect** as a separate action. An already saved connection returns
+**Server already saved** without changing it. A conflicting name or SSH configuration stays
+in the form with a next step. A save failure keeps both fields for Retry. Cancel returns to
+the previous list and selection; the direct shortcut returns to the pane. Closing while a save
+is already running lets that save finish and reports its result.
+
+On a server row, Enter connects (or opens a whole group); Tab shows the other
 actions, each also on its own key: connect in a new tab (`ctrl+t`), browse its files (`ctrl+f`),
 run a command on it (`ctrl+r`), forward one of its ports (`ctrl+o`), edit the list (`ctrl+e`),
 remove a saved server (`ctrl+x`). On a group, Tab offers only opening the group, running a
 command on it and editing the saved servers; the footer says that Enter opens the group.
+On + Add server and discovery suggestions, Enter opens the form and no connection actions appear.
+If SSH fails with its connection error status, the focused pane shows **Connect**, with
+**Close** selected and **Try again** as a separate action. The saved server remains in the list;
+SSH's output stays visible behind the dialog. Closing the failed pane keeps its workspace.
 
 kraal's own connections to a server (a pane opened from the picker or `kraal ssh`, a transfer, a
 tool, the file manager) share one SSH connection, so the second one starts at once and asks for
@@ -188,8 +209,9 @@ The agents of a kraal session on a server show in your sidebar under AGENTS, aft
 name (`gpu › api`), with their state. `kraal attach --host gpu` sets `agents = "main"` (the
 session it attached to) on that server's entry in servers.toml; `kraal servers add … --agents
 main` or a line in the file does the same. Attaching leaves a value already there as it is, and
-`agents = "none"` turns it off. A server not in servers.toml yet is added, unless
-`auto_add = false`.
+`agents = "none"` turns it off. Attaching never adds an unknown server. With `auto_add = true`,
+it suggests `kraal servers edit` to save the connection and its `agents` session instead;
+`false` suppresses it.
 
 Only the servers marked this way are watched, each over one ssh that stays open and runs
 `kraal agents --follow` there. That ssh never asks anything (BatchMode): the server must take
@@ -208,5 +230,5 @@ these agents too, and their changes of state are `agent.*` events (see
 [Scripting](scripting.md#events)).
 
 A server's entry gets `agents` only when it reaches the account attached to the same way (user,
-port, key, jump host): `kraal attach --host bob@gpu` adds an entry of its own (`gpu-bob`) beside
-`gpu` for alice. A config.toml that cannot be read leaves servers.toml as it is.
+port, key, jump host). To watch another account such as bob beside alice, explicitly save
+its connection first. A config.toml that cannot be read leaves servers.toml as it is.

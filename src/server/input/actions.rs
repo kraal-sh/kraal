@@ -25,6 +25,7 @@ impl Server {
 
     pub(super) fn action(&mut self, id: ClientId, action: Action) -> Mode {
         match action {
+            Action::AddServer => return Mode::Prompt(self.add_server_form(None, None)),
             Action::NewWorkspace => return Mode::Prompt(self.add_workspace_form(id, None)),
             Action::WorkspacePicker => {
                 return Mode::Picker(self.workspace_picker(self.clients.get(&id).map_or(0, |c| c.workspace)));
@@ -389,7 +390,8 @@ impl Server {
                 }
                 return Mode::Resize;
             }
-            Action::NewWorkspace
+            Action::AddServer
+            | Action::NewWorkspace
             | Action::WorkspacePicker
             | Action::PanePicker
             | Action::Accounts

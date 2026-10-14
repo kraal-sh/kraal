@@ -367,6 +367,9 @@ impl Server {
             PickAction::AddWorkspace => {
                 return Mode::Prompt(self.add_workspace_form(id, Some(p)));
             }
+            PickAction::AddServer(server) => {
+                return Mode::Prompt(self.add_server_form(Some(p), server.as_deref()));
+            }
             PickAction::Ssh(spec) => self.connect(id, &spec, Placement::Auto),
             PickAction::SshGroup(group) => match self.open_group(&group, &[]) {
                 Ok(ws) => self.show_workspace(id, ws),

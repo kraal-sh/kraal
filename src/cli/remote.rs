@@ -9,7 +9,7 @@ use crate::protocol::{Placement, Request, Response};
 use crate::{client, config, fleet, paths, server, servers, transfer, workspace};
 
 pub(super) fn attach(session: &str, host: &str, workspace: Option<String>, pane: Option<String>) -> Result<()> {
-    // A configuration that cannot be read does not say what the user allows (`auto_add`):
+    // A configuration that cannot be read does not say what the user allows:
     // servers.toml is left as it is then.
     let (cfg, may_update) = match config::Config::load() {
         Ok(cfg) => (cfg, true),
@@ -31,9 +31,14 @@ pub(super) fn attach(session: &str, host: &str, workspace: Option<String>, pane:
         if !may_update {
             return;
         }
-        let marked = servers::Inventory::update(|inv| inv.watch_agents(&s, session, cfg.servers.auto_add));
-        if let Err(e) = marked {
-            eprintln!("kraal: the agents of {} will not be listed: {e:#}", s.name);
+        let marked = servers::Inventory::update(|inv| Ok(inv.watch_agents(&s, session)));
+        match marked {
+            Err(e) => eprintln!("kraal: the agents of {} will not be listed: {e:#}", s.name),
+            Ok(None) if cfg.servers.auto_add => eprintln!(
+                "kraal: {} is not saved. Use `kraal servers edit` to save its connection with agents = {session:?}.",
+                s.address()
+            ),
+            _ => {}
         }
     };
     client::attach(target, workspace, cfg.mouse, remember)
