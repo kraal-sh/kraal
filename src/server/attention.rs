@@ -328,7 +328,7 @@ impl Server {
         }
     }
 
-    fn log_message(&mut self, text: &str, warning: bool) {
+    pub(super) fn log_message(&mut self, text: &str, warning: bool) {
         if self.messages.len() >= super::MAX_MESSAGES {
             self.messages.pop_front();
         }
@@ -448,6 +448,7 @@ mod tests {
             // The writer learns the peer is gone asynchronously on macOS.
             let start = Instant::now();
             loop {
+                std::thread::sleep(crate::clipboard::INTERVAL);
                 server.open_for(id, url);
                 let message = &server.clients[&id].toast.as_ref().unwrap().0;
                 if message == "copy not sent: try again" {

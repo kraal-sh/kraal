@@ -15,8 +15,9 @@ use std::sync::OnceLock;
 pub const KEEP_OUT: &str = "KRAAL_TEST_KEEP_OUT";
 
 /// Programs a test reaches only where it put one of its own: the developer's agents are signed
-/// in to their accounts, and their kraal is not the one under test.
-const THEIRS: [&str; 3] = ["claude", "codex", "kraal"];
+/// in to their accounts, their kraal is not the one under test, and clipboard tools would
+/// change their desktop clipboard.
+const THEIRS: [&str; 7] = ["claude", "codex", "kraal", "pbcopy", "wl-copy", "xclip", "xsel"];
 
 /// The directory of this test process and its pid, set by [`isolate`].
 static ROOT: OnceLock<(PathBuf, u32)> = OnceLock::new();

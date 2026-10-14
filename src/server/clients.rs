@@ -57,6 +57,7 @@ impl Server {
                 id,
                 out,
                 attached: false,
+                clipboard: Default::default(),
                 cols: 80,
                 rows: 24,
                 workspace: ws,
@@ -103,9 +104,10 @@ impl Server {
             }
         };
         match msg {
-            ClientMsg::Attach { version, cols, rows, workspace, remote, pane, installed, .. } => {
+            ClientMsg::Attach { version, cols, rows, workspace, remote, pane, installed, features } => {
                 if let Some(c) = self.clients.get_mut(&id) {
                     c.remote = remote;
+                    c.clipboard.negotiated = features.iter().any(|f| f == protocol::CLIPBOARD.name);
                 }
                 let (cols, rows) = clamp_size(cols, rows);
                 if version != protocol::PROTOCOL_VERSION {
@@ -134,6 +136,9 @@ impl Server {
                 self.primary = Some(id);
                 self.probe_cell_size(id);
                 self.relayout();
+            }
+            ClientMsg::ClipboardResult { id: copy, outcome, native_unavailable } => {
+                self.clipboard_result(id, copy, outcome, native_unavailable);
             }
             ClientMsg::Detach => self.detach(id, "detached"),
             ClientMsg::Request { version, request, .. } => {

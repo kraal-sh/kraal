@@ -367,6 +367,7 @@ fn exchange(stream: &mut UnixStream, msg: &ClientMsg) -> Result<Result<Response,
                 | ServerMsg::Event { .. }
                 | ServerMsg::Events { .. }
                 | ServerMsg::Attached { .. }
+                | ServerMsg::Clipboard { .. }
                 | ServerMsg::Unknown(_) => continue,
             },
             Some(_) => continue,
@@ -783,6 +784,7 @@ pub enum Target {
         label: String,
         /// A pane of that session to show on the first connection (an id or a name).
         pane: Option<String>,
+        clipboard_native: bool,
     },
 }
 
@@ -1038,6 +1040,23 @@ fn read_keys(fd: std::os::unix::io::RawFd, pause: &KeysPause, mut forward: impl 
     }
 }
 
+fn clipboard_available(frame: &(u8, Vec<u8>)) -> bool {
+    frame.0 == protocol::JSON
+        && matches!(serde_json::from_slice(&frame.1),
+        Ok(ServerMsg::Attached { features: Some(features), .. })
+            if features.iter().any(|f| f == protocol::CLIPBOARD.name))
+}
+
+fn clipboard_restart(target: &Target) -> String {
+    let (session, where_to) = match target {
+        Target::Local { session } => (session, String::new()),
+        Target::Remote { session, label, .. } => (session, format!("on {label}, ")),
+    };
+    format!(
+        "this session cannot disable external copying; {where_to}run `kraal -s {session} restart`, then attach again"
+    )
+}
+
 /// Attach the current terminal to a session. Remote sessions reconnect by themselves when the
 /// connection drops; their programs keep running on the server meanwhile. `attached` runs once
 /// the session first answered, before the terminal changes.
@@ -1049,6 +1068,18 @@ pub fn attach(mut target: Target, mut workspace: Option<String>, mouse: bool, at
     if !std::io::stdin().is_terminal() {
         bail!("kraal needs a terminal");
     }
+    // A malformed configuration must not prevent reaching an existing session, nor
+    // grant clipboard access whose policy could not be read.
+    let clipboard_settings =
+        crate::config::Config::load().map(|cfg| cfg.clipboard).unwrap_or(crate::clipboard::Settings {
+            mode: crate::clipboard::Mode::Off,
+            max_bytes: crate::clipboard::MAX_BYTES,
+        });
+    let clipboard_policy = crate::clipboard::Policy {
+        settings: clipboard_settings,
+        allow_programs: matches!(&target, Target::Remote { clipboard_native: true, .. }),
+        intermediate: crate::clipboard::intermediate(),
+    };
     // Fail before touching the terminal when the first connection is impossible; ssh asks what
     // it has to ask in the terminal as it is.
     let first = greet(&target, &workspace).map_err(anyhow::Error::msg)?;
@@ -1059,19 +1090,26 @@ pub fn attach(mut target: Target, mut workspace: Option<String>, mouse: bool, at
     {
         bail!(reason);
     }
+    if clipboard_policy.settings.mode == crate::clipboard::Mode::Off && !clipboard_available(&first.first) {
+        bail!(clipboard_restart(&target));
+    }
     // The pane asked for is shown once: a reconnection leaves the session where it is.
     if let Target::Remote { pane, .. } = &mut target {
         *pane = None;
     }
     attached();
 
+    let clipboard_shutdown = Arc::new(crate::clipboard::Shutdown::default());
+
     // Being told to go (terminal closed, kill): leave the terminal usable, as a normal exit
     // does (destructors do not run on a signal). Set up before the terminal changes.
     {
+        let clipboard_shutdown = clipboard_shutdown.clone();
         use signal_hook::consts::{SIGHUP, SIGINT, SIGQUIT, SIGTERM};
         let mut signals = signal_hook::iterator::Signals::new([SIGTERM, SIGHUP, SIGINT, SIGQUIT])?;
         crate::threads::named("signals").spawn(move || {
             if let Some(sig) = signals.forever().next() {
+                clipboard_shutdown.cancel();
                 let pid = SSH_PID.load(Ordering::SeqCst);
                 if pid != 0 {
                     // SAFETY: signalling the ssh child this client started.
@@ -1173,7 +1211,28 @@ pub fn attach(mut target: Target, mut workspace: Option<String>, mouse: bool, at
                     let _ = terminal().write(said.as_bytes());
                 }
                 *writer.lock().unwrap() = Some(to_server);
+                if clipboard_policy.settings.mode == crate::clipboard::Mode::Off && !clipboard_available(&first) {
+                    break 'session clipboard_restart(&target);
+                }
+                let clipboard_writer = writer.clone();
+                let clipboard = crate::clipboard::Worker::start(
+                    clipboard_policy.clone(),
+                    &clipboard_shutdown,
+                    |bytes| terminal().write(bytes).unwrap_or(false),
+                    move |id, outcome, native_unavailable, cancelled| {
+                        if let Ok(mut w) = clipboard_writer.lock()
+                            && !cancelled.load(Ordering::SeqCst)
+                            && let Some(w) = w.as_mut()
+                        {
+                            let _ = protocol::write_json(
+                                w,
+                                &ClientMsg::ClipboardResult { id, outcome, native_unavailable },
+                            );
+                        }
+                    },
+                )?;
                 delay = Duration::from_secs(1);
+                let mut clipboard_negotiated = false;
                 let mut next = Some(Ok(Some(first)));
                 let lost = loop {
                     match next.take().unwrap_or_else(|| protocol::read_frame(&mut frames)) {
@@ -1193,7 +1252,14 @@ pub fn attach(mut target: Target, mut workspace: Option<String>, mouse: bool, at
                                 restarting = Some(c.server);
                                 break "the session restarts".to_string();
                             }
-                            Ok(ServerMsg::Attached { version, .. }) => server_version = Some(version),
+                            Ok(ServerMsg::Attached { version, features }) => {
+                                server_version = Some(version);
+                                clipboard_negotiated =
+                                    features.is_some_and(|fs| fs.iter().any(|f| f == protocol::CLIPBOARD.name));
+                            }
+                            Ok(ServerMsg::Clipboard { id, origin, text }) if clipboard_negotiated => {
+                                clipboard.submit(id, origin, text);
+                            }
                             Ok(ServerMsg::Open { url }) => {
                                 let _ = crate::pane::open_url(&url);
                             }
@@ -1203,6 +1269,7 @@ pub fn attach(mut target: Target, mut workspace: Option<String>, mouse: bool, at
                         Err(e) => break c.why_lost(&format!("connection error: {e}")),
                     }
                 };
+                clipboard.cancel();
                 *writer.lock().unwrap() = None;
                 if nested.is_some() {
                     let _ = terminal().write(NOT_ATTACHED);
@@ -1329,6 +1396,24 @@ pub fn proxy(session: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clipboard_policy_requires_a_server_greeting_with_the_capability() {
+        let frame = |json: &str| (protocol::JSON, json.as_bytes().to_vec());
+        assert!(!clipboard_available(&frame(r#"{"type":"attached","version":"0.2.0"}"#)));
+        assert!(!clipboard_available(&frame(r#"{"type":"attached","version":"0.3.0","features":["lenient"]}"#)));
+        assert!(clipboard_available(&frame(r#"{"type":"attached","version":"0.4.0","features":["clipboard"]}"#)));
+        assert!(!clipboard_available(&(protocol::BYTES, b"screen".to_vec())));
+        assert!(clipboard_restart(&Target::Local { session: "work".into() }).contains("`kraal -s work restart`"));
+        let remote = Target::Remote {
+            ssh: vec![],
+            session: "work".into(),
+            label: "box".into(),
+            pane: None,
+            clipboard_native: false,
+        };
+        assert!(clipboard_restart(&remote).contains("on box, run `kraal -s work restart`"));
+    }
 
     /// A terminal that keeps what is done to it, in order: `raw`, `line`, or the bytes written.
     #[derive(Default)]

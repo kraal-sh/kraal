@@ -106,6 +106,16 @@ restart guidance. Existing pane Close and Rename commands, workspace listing and
 keep their meanings. Workspace drag uses the attached-terminal input protocol and the existing
 saved order. These operations add no session, workspace-file or configuration format change.
 
+Clipboard messages and results use the optional `clipboard` capability in both peers' lists.
+A current server sends either a structured copy to a capable client or legacy OSC 52 bytes to
+an older client, never both. A new client applies native policy only after the server advertises
+the capability; with an older server it retains the legacy terminal path. Clipboard `off`
+requires the capability and otherwise refuses attach with restart guidance. The optional
+`[clipboard]` settings and `clipboard_native` server field default to native user copies with
+terminal fallback and no native program permission. Existing configurations keep working.
+Clipboard request IDs, pending results and policies add no saved-session fields; version 2
+state and the 0.2.0 and 0.3.0 legacy paths remain unchanged.
+
 ## For contributors: how the protocol changes
 
 The client and the server exchange JSON messages (`src/protocol.rs`, whose comments hold the

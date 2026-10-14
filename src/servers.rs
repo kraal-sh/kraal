@@ -62,6 +62,9 @@ pub struct Server {
     /// sets it); `none` turns that off for good.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agents: Option<String>,
+    /// Local permission for this server's programs to use native clipboard tools on attach.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub clipboard_native: bool,
 }
 
 /// Where a known server comes from.
@@ -372,6 +375,7 @@ pub fn parse_ssh_args(args: &[String]) -> Option<Server> {
         env: None,
         note: None,
         agents: None,
+        clipboard_native: false,
     })
 }
 
@@ -868,6 +872,8 @@ pub fn resolve(known: &[Known], spec: &str) -> Option<Server> {
         let mut s = k.server.clone();
         // `host:22` asked for port 22 even if the entry leaves it to ~/.ssh/config.
         s.port = s.port.or(probe.port);
+        // A port override is another destination, not permission to replace its clipboard.
+        s.clipboard_native &= s.same_connection(&k.server);
         return Some(s);
     }
     Some(Server { name: short_name(&probe.host), ..probe })
@@ -903,6 +909,22 @@ mod tests {
 
     fn argv(s: &str) -> Vec<String> {
         s.split_whitespace().map(String::from).collect()
+    }
+
+    #[test]
+    fn native_clipboard_permission_stays_with_the_saved_connection() {
+        let s: Server =
+            toml::from_str("name = 'box'\nhost = 'box.lan'\nuser = 'alice'\nclipboard_native = true").unwrap();
+        let known = [Known { server: s, source: Source::Inventory }];
+        for spec in ["box", "alice@box.lan"] {
+            assert!(resolve(&known, spec).unwrap().clipboard_native);
+        }
+        for spec in ["bob@box.lan", "box.lan", "alice@box.lan:22", "alice@elsewhere"] {
+            assert!(!resolve(&known, spec).unwrap().clipboard_native, "{spec}");
+        }
+        let old: Server = toml::from_str("name = 'old'\nhost = 'old.lan'").unwrap();
+        assert!(!old.clipboard_native);
+        assert!(!toml::to_string(&old).unwrap().contains("clipboard_native"));
     }
 
     #[test]
@@ -1558,6 +1580,7 @@ groups = [\"web\"]
             env: Some("prod".into()),
             note: Some("front".into()),
             agents: Some("main".into()),
+            clipboard_native: true,
         };
         Inventory { servers: vec![full.clone()], path: path.clone(), source: None }.save().unwrap();
         let (inv, warnings) = Inventory::read(&path).unwrap();

@@ -14,7 +14,8 @@ all with their defaults, and so does the program:
 A reload applies keys, theme, sidebar, bottom bar, mouse, pane frames, notifications, tools,
 hints, hooks, production words, contexts, saving scrollback and the paste buffers' settings at
 once; panes already open keep their shell and scrollback length, and `[graphics]` waits for the
-session's next start. When the file cannot be read, nothing changes and the command says why.
+session's next start. Client clipboard policy is read on attach; the server copy size limit
+updates on reload. When the file cannot be read, nothing changes and the command says why.
 
 The check also reads your runbooks and, run in a repository, its `.kraal/worktree.toml` and its
 runbooks. A key kraal does not know in `config.toml`, `servers.toml` or `accounts.toml` (a typo,
@@ -55,6 +56,20 @@ long_command = 30        # seconds a command runs before its end is announced; 0
 deletes what was saved. Account login panes and their text are never saved, even when this
 setting is `true`. `long_command` needs a shell that marks its commands
 ([Shell commands](terminal.md#shell-commands)).
+
+## Clipboard
+
+```toml config
+[clipboard]
+mode = "auto"          # native user copies with terminal fallback; "terminal" or "off" too
+max_bytes = 1048576     # UTF-8 bytes per external copy, from 1 through 8388608
+```
+
+These are the attaching machine's settings. The server also enforces its own `max_bytes`.
+An external copy must fit both limits and is never truncated. `off` preserves internal paste
+buffers subject to their limits. Programs use the terminal unless the attaching machine's
+saved server has `clipboard_native = true`. See [Clipboard](terminal.md#clipboard) for
+backends, messages, intermediate machines, older peers and how to revoke permission.
 
 ## Keys
 

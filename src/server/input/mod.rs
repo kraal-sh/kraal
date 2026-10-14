@@ -16,7 +16,6 @@ use super::{ClientId, Dirty, Server};
 use crate::input::{InputEvent, Key, KeyCode, MouseEvent, MouseKind, encode_key, encode_paste_after};
 use crate::keymap::{Action, Command, Lookup};
 use crate::layout::{Dir, PaneId};
-use crate::pane::osc52;
 
 /// Input kept while a pane it goes to has its context read again (see `Server::hold_input`),
 /// with where it goes as it was when it was typed: its workspace, the focused pane and the panes
@@ -1102,17 +1101,15 @@ impl Server {
         }
     }
 
-    /// Send `text` to the client's terminal, and keep it as the newest paste buffer.
+    /// Copy through the initiating client, and keep the newest paste buffer.
     pub(super) fn copy_to_client(&mut self, id: ClientId, text: &str) {
         self.keep_copy(text);
         self.send_clipboard(id, text);
     }
 
-    /// Ask the client's terminal to write its clipboard, without changing paste buffers.
+    /// Copy through the client policy, without changing paste buffers.
     pub(super) fn send_clipboard(&mut self, id: ClientId, text: &str) {
-        let Some(c) = self.clients.get(&id) else { return };
-        let sent = c.out.try_send(super::frame_bytes(&osc52(text))).is_ok();
-        self.toast(id, if sent { "copy sent to terminal" } else { "copy not sent: try again" });
+        self.send_copy(id, crate::protocol::ClipboardOrigin::User, text);
     }
 }
 
@@ -1139,6 +1136,7 @@ mod tests {
         // The writer learns the peer is gone asynchronously on macOS.
         let start = std::time::Instant::now();
         loop {
+            std::thread::sleep(crate::clipboard::INTERVAL);
             server.copy_to_client(id, "next");
             if server.clients[&id].toast.as_ref().unwrap().0 == "copy not sent: try again" {
                 break;

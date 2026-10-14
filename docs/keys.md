@@ -232,11 +232,11 @@ frame, marks the pane for broadcast. Hold Shift to use your terminal's own selec
 
 ## Paste buffers
 
-What you copy is sent to your terminal through OSC 52, and kraal keeps it too: a copy mode
-selection, a mouse selection, `ctrl+b V c` (the last command's output), a hint's text, and what
-programs copy through OSC 52. The terminal must allow clipboard writes; **copy sent to terminal**
-does not confirm that it wrote the clipboard. See [Clipboard](terminal.md#clipboard) for remote
-client routing and terminal settings.
+User copies try the attaching machine's native clipboard, then OSC 52, and kraal keeps them
+too: a copy mode selection, a mouse selection, `ctrl+b V c` (the last command's output), a hint's
+text, and what programs copy through OSC 52. Programs use the terminal unless locally allowed
+for that server. **copy sent to terminal via OSC 52** does not confirm a clipboard write.
+See [Clipboard](terminal.md#clipboard) for policy, limits and client routing.
 The newest copy is buffer 0, the one before it buffer 1, and so on; the same text copied twice in
 a row is kept once. At most 50 numbered buffers and 32 MB stay, the oldest going first; buffers
 set by name (`kraal buffer set notes`, see [Scripting](scripting.md#paste-buffers)) stay until

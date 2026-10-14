@@ -21,6 +21,7 @@ groups = ["staging"]
 env = "staging"      # optional: its stage; "prod" makes it production (see Production)
 note = "primary"     # optional: your own text, kept
 agents = "main"      # optional: list the agents of the kraal session "main" there (see below)
+clipboard_native = false # optional: allow this server's program copies to use native tools on attach
 ```
 
 Only `name` and `host` are needed, and a name is given once. When kraal changes this file (a
@@ -221,11 +222,13 @@ remote session opens it on your machine. A `localhost` address there is
 the server's, not yours: kraal keeps it in paste buffers, sends a copy to your terminal, and
 says where the address works instead of opening the wrong page.
 
-Copies from the remote session travel back to a client's terminal as OSC 52. A selection goes
-to your client; a program's copy goes to the most recently used client viewing its workspace.
-The terminal must allow clipboard writes. **copy sent to terminal** does not confirm a system
-clipboard write. See [Clipboard](terminal.md#clipboard) for Ghostty, iTerm2, Terminal.app,
-tmux, local kraal, and programs that write the server's own graphical clipboard instead.
+Copies travel back to the attaching machine as negotiated clipboard messages. A user selection
+tries its native clipboard, then OSC 52. A program's copy goes to the most recently used client
+viewing its workspace and uses OSC 52 unless that client has `clipboard_native = true` for
+this saved server. The setting is local to the attaching machine, applies on attach, and can
+be changed with `kraal servers edit`. **copy sent to terminal via OSC 52** does not confirm a
+clipboard write. Older peers retain OSC 52. See [Clipboard](terminal.md#clipboard) for policy,
+limits, native tools, terminal permissions and programs that write the server's own clipboard.
 
 ### Agents on your servers
 
