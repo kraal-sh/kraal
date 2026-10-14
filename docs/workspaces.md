@@ -1,6 +1,28 @@
 # Sessions and workspaces
 
 Workspaces are saved automatically. KDL files import and export reusable layouts.
+Kraal keeps the organization and launch information it knows, not unsaved editor buffers,
+process memory or every command typed in a shell.
+
+## Everyday use
+
+Open **Workspaces** with `ctrl+b w`. Search filters; **+ Add workspace** creates.
+Select a workspace and press Tab, or use its sidebar actions, for the operations below.
+
+| Task | Path and result |
+|---|---|
+| Create | **+ Add workspace**, edit **Name**, **Add**. A shell opens in the displayed folder. Success is confirmed after saving. |
+| Rename | **Rename**, edit **Name**, confirm. Open and closed workspaces keep their identity and source file. |
+| Close and return | **Close** stops programs and keeps the layout as **Closed**. Enter on its row reopens it under the [resume rules](#what-resumes). |
+| Delete and recover | **Delete**, confirm, then **Undo** in the result or **Deleted workspaces**, **Restore** later. The restored workspace is closed; project and source files stay intact. |
+| Copy the organization | **Duplicate**, confirm the new name. The independent copy is closed; commands wait for Enter when opened, and agents start new conversations. |
+| Import | **+ Add workspace**, **From file...**, enter **File**, review **Preview**, then **Add**. Commands wait for Enter. |
+| Share | **Export layout**, choose **File**, **Export**. Existing files need explicit replacement; a backup is kept. |
+
+A form error keeps the entered values. Correct the reported cause and use its retry action.
+Closing an individual pane removes it from the layout; use **Close** on the workspace to keep
+all its panes for reopening. The last pane's removal leaves an empty, open workspace with
+**+ Add pane**, rather than deleting it. Quit (`ctrl+b q`) stops the session.
 
 ## Concepts
 
@@ -186,9 +208,32 @@ write its source KDL file. A later session restart keeps ordinary commands stopp
 
 Sessions keep running when you close the terminal, lose the connection or detach (`ctrl+b d`):
 `kraal` attaches again. After a restart of the server, a quit or a reboot, the processes are gone,
-but kraal rebuilds the layout, reconnects SSH shells and resumes agent conversations; other
-commands wait for Enter before they run again. A workspace that cannot be brought back (its shell
-gone, say) stays saved as it was, and comes back at a later start.
+but kraal rebuilds the saved layout under the rules below. Closed workspaces remain closed.
+A workspace that cannot be brought back (its shell gone, say) stays saved as it was. Fix the
+reported cause and restart to retry.
+
+Automatic saves run in the background as the layout changes, with a periodic check every
+30 seconds. Scrollback is saved separately when enabled (`save_scrollback`, on by default).
+An abrupt crash can lose changes or output that have not reached disk. Save failures appear
+in **Messages** (`ctrl+b V j`) and are retried; automatic keeping is not a backup of project files.
+Close, Delete and Quit wait for a durable save before stopping programs.
+
+### What resumes
+
+These rules apply when reopening a closed workspace or restoring an open one after a server
+restart. Detaching leaves the original processes running and needs no restoration.
+
+| Saved pane | On reopening or restart |
+|---|---|
+| Local shell | A new shell starts in its saved directory. Commands previously typed into it are not replayed. A recognized Claude or Codex conversation in that shell may receive a resume command. |
+| Interactive SSH command, without a remote command | Reconnects. Remote jobs and terminal state are not restored by kraal. |
+| Claude or Codex | A known conversation can resume with supported launch arguments. The agent must still have its saved history and sign-in. See [agent resume limits](agents.md#resume-limits). |
+| Other command, including an SSH remote command | Waits for Enter. Check the displayed command before running it. |
+| Pane already stopped or suspended | Stays stopped, waiting for Enter. |
+| Preview | Reopens its file if available. |
+
+Restored scrollback is terminal output, not a running program or an agent transcript. A turn
+interrupted by stopping an agent is not continued in memory. Login panes are never restored.
 
 `ctrl+b q` (or `ctrl+b W q`; `Q` in the classic preset) quits: it lists the programs that would
 stop, as a restart does, and asks, Cancel selected. Then the server saves the session and stops
@@ -201,10 +246,10 @@ stopped: it keeps running, and the quit says why (`kraal kill` stops it all the 
 Closing a workspace (`ctrl+b W x`, or `ctrl+x` on an open workspace in the picker) keeps its current layout
 and stops its programs. The row stays **Closed**, including when it was the last open workspace.
 Enter in the picker, clicking its sidebar row, or `kraal open <name>` reopens that saved layout.
-Tabs, splits, floating panes, pane directories, commands, agent conversations and saved scrollback
-are kept. Reopening follows the same rules as a session restart: shells start, SSH shells reconnect,
-agent conversations resume, and other commands wait for Enter. The imported KDL file is not
-rewritten or reread by Close or Open; editing, removing or breaking that file does not replace
+Tabs, splits, floating panes, pane directories, commands, known conversation references and
+available saved scrollback are kept. Reopening follows the [resume rules](#what-resumes): new shells,
+interactive SSH reconnections, supported Claude or Codex resumes, and waiting commands.
+The imported KDL file is not rewritten or reread by Close or Open; editing, removing or breaking that file does not replace
 the saved layout. Export also works while the workspace is closed, without starting its programs.
 
 Close lists the running programs, background jobs, agents and SSH connections before stopping them.
@@ -225,7 +270,7 @@ server finishes the recorded close without reopening those programs. Recovery ch
 boot and process start times before signalling surviving programs.
 
 Closing an individual pane or tab removes it from the layout. When the last pane ends, including
-`exit` in the last shell, the workspace stays empty and saved. **+ Add pane** adds a shell with
+`exit` in the last shell, the workspace stays empty, open and saved. **+ Add pane** adds a shell with
 Enter or a click. The empty view shows **No panes.** and the selected **+ Add pane** action.
 The session and attached terminals stay open, and an empty workspace stays
 empty after a restart. Closing the last open workspace shows Workspaces. Use Quit (`ctrl+b q`)
@@ -381,8 +426,8 @@ What kraal does not know in a file is left out, and `kraal config check` says wh
 
 An agent pane is a command pane: kraal runs `claude` or `codex` itself, with the account's
 environment and no shell under it. When the agent exits, the pane stays with its exit code:
-Enter starts the agent again, resuming its conversation, `x` closes the pane, and
-`close_on_exit=true` closes it by itself. The name of another agent, which kraal keeps no accounts
+Enter starts it again, using a known conversation when supported ([resume limits](agents.md#resume-limits)),
+`x` closes the pane, and `close_on_exit=true` closes it by itself. The name of another agent, which kraal keeps no accounts
 for, is typed into a shell: that shell is what is left when the agent exits.
 
 A saved agent account keeps an internal `account_id` beside its readable `agent="claude:name"`.
@@ -413,7 +458,7 @@ From the command line:
 | Command | |
 |---|---|
 | `kraal workspaces` | its open and closed workspaces with retained tab and pane counts, plus files not imported (`--json` for scripts); saved workspaces remain listed when the server is stopped |
-| `kraal open shop` | reopens the saved workspace `shop`, switches to it if open, or imports its file the first time, without attaching (any name: `kraal open files` too) |
+| `kraal open shop` | ensures `shop` is open, reopening its saved layout or loading its file the first time; does not attach or change an attached terminal's displayed workspace (any name: `kraal open files` too) |
 | `kraal import ./shop.kdl` | previews the file, then asks to add it; commands and agents wait for Enter |
 | `kraal import ./shop.kdl --name shop-copy --yes` | accepts the preview with an explicit name, without prompting |
 | `kraal export ./shop.kdl --workspace shop` | exports an open or closed workspace, without conversations or private account names |
@@ -423,6 +468,13 @@ From the command line:
 | `kraal save shop-2` | writes `<name>.kdl` in the definitions directory |
 
 ### Importing a layout
+
+Use **From file...** or `kraal import` for a preview and commands that wait for Enter.
+The older named-file paths (`kraal shop`, `kraal attach shop`, `kraal open shop`, or opening an
+unimported file's row) still honor the file's launch settings on first open: commands can start
+immediately unless marked `start_suspended=true`. Once retained, Open uses the personal layout.
+`kraal open` does not change the workspace shown in attached terminals; choose it in Workspaces,
+or use `kraal attach shop` from outside a pane.
 
 Import and export output abbreviates paths under your home directory with `~`. Success
 messages quote workspace names, for example `Workspace "imported" added.`
@@ -465,8 +517,16 @@ name, identity and position; it does not add a second workspace to this session'
 previous screen. Errors keep the editable path with **Retry**.
 
 The exported KDL describes tabs, splits, stacks, floating panes, folders and startup commands.
-It contains no conversations or running process state. Managed agents use portable references
-such as `agent="claude"`; the recipient's account rules apply. Comments and unsupported KDL
+It contains no scrollback, conversations or running process state. Split sizes are rounded to
+percentages and floating-pane geometry is not preserved. A tab with only floating panes gains
+a shell underneath them. Ordinary commands typed into a shell are not turned into launch recipes.
+Recognized agents are an exception: exporting while `claude` is detected running in a plain
+shell produces `agent="claude"`. This keeps the agent kind, not the shell invocation's options,
+environment or conversation. On first open through a named-file path, that pane can start
+Claude automatically under the recipient's account rules. Use **From file...** or `kraal import`
+to make it wait for Enter instead.
+Folder paths and command arguments remain as configured; the recipient needs those folders
+and programs. Managed agents use portable references such as `agent="claude"`; the recipient's account rules apply. Comments and unsupported KDL
 cannot survive serialization, so every existing destination needs explicit replacement.
 The source is never overwritten automatically.
 
@@ -475,8 +535,9 @@ name and destination rules: the source file by default, or a named copy in the d
 directory. A first export with no source links that file for compatibility. It also keeps explicit
 agent account references and arguments. Waiting commands keep `start_suspended=true`.
 
-An open workspace stays linked to its file, across restarts too: the sidebar and
-`kraal workspaces` list it once, and `kraal open` with the name of its file switches to it.
+A retained workspace keeps its source association across Close and restart: the sidebar and
+`kraal workspaces` list it once, and `kraal open` with the name of its file opens that same
+workspace without switching an attached terminal's view.
 Renaming the workspace (`ctrl+b W e`, or **Rename** in the list) changes only its saved name.
 It works while open or closed, without starting programs or renaming any file. Names may contain
 `/` or start with `.` even when there is a source file. A file renamed on disk while its workspace

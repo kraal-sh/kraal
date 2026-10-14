@@ -1,9 +1,12 @@
 // The workspace the README shows: a production server, an agent and a live changelog.
-// Copy it to ~/.config/kraal/workspaces/release.kdl, then open it with `kraal release`
-// (the README saves it as shop.kdl, which `kraal shop` opens).
+// Copy it to ~/.config/kraal/workspaces/release.kdl, then open it with `kraal release`.
+// The README imports the same layout from shop.kdl with a preview.
 // Needs a checkout in ~/src/shop with a CHANGELOG.md, claude installed, and a server you
 // reach as deploy@web-prod-1. Its pane gets a red frame: its name says "prod".
 
+// Import with `kraal import examples/workspaces/release.kdl` to preview before adding.
+// Imported commands wait for Enter; the named-file opening above honors their launch settings.
+// After opening, the layout is kept automatically. Export writes a separate reusable recipe.
 layout {
     cwd "~/src/shop"
     tab name="release" {

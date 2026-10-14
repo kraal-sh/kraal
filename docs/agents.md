@@ -1,6 +1,35 @@
 # Coding agents
 
-kraal knows which panes run an agent and what each one is doing, gives each agent its own worktree, and spreads the work over several subscriptions.
+kraal follows recognized agents in panes. It manages named accounts, usage and account changes
+for Claude Code and Codex. Other agents use their own sign-in and account settings.
+
+## Launch, add, change and return
+
+| Task | Path and result |
+|---|---|
+| Start | `ctrl+b a`, choose a Claude or Codex account, Enter. Tab also offers **Start in new tab** and, in a local repository, **Start in worktree**. |
+| Add an account | `ctrl+b A l` opens **Accounts**. Choose **+ Add account**, select **Agent**, enter **Name** and submit. Complete the agent's sign-in; kraal verifies it before confirming success. `ctrl+b A n` opens the same form directly. |
+| Use an existing sign-in | Open Accounts. A verified standard home is adopted with a name; an uncertain match offers **Review**. Choose which account it is without logging in again. |
+| Change this pane's account | `ctrl+b A c`, or click its account name. Check **Continue conversation** or **New conversation**, then choose the destination. Sign-in is checked before anything stops. |
+| Return | Click **Undo** after a change, or use `ctrl+b p`, select the pane, Tab, **Undo account change**. The previous account is checked again. Undo does not revert project files. |
+
+Search filters these lists. **+ Add account** stays in Accounts, separate from launching.
+If sign-in fails, Enter closes its pane; **Try again** (`r`) explicitly starts another login.
+**Check again** (`c`) verifies the existing sign-in without a new login. An account awaiting
+verification stays marked **Sign-in required**. See [Accounts](#accounts) for recovery and review.
+
+| Capability | Claude Code | Codex | Other recognized agents |
+|---|---|---|---|
+| Launch from kraal's account picker | Yes | Yes | Run the agent in a shell instead |
+| Named accounts and reported usage | Yes | Yes | Managed by the agent |
+| Change account | Continue a readable, compatible transcript | Start a new conversation | Not supported by kraal |
+| Undo account change | Resume the latest conversation on the previous account | Reopen the original account's saved conversation | Not supported by kraal |
+| Resume after Close or restart | Supported launch and known conversation | Supported launch and known conversation | No kraal conversation resume |
+
+A requested change can wait for a reliable end-of-turn hook; otherwise it asks before stopping
+the agent. Missing sign-in or an unverifiable conversation leaves the current pane unchanged.
+The command `kraal agent codex --account work` starts a new agent. There is currently no CLI
+command to change the account of an existing pane; use **Change account** in kraal.
 
 ## States
 
@@ -73,13 +102,29 @@ The agents of kraal sessions on your servers are listed too, after the server's 
 `kraal agents` lists them with their server, and their changes of state are `agent.*` events with
 a `server` field, for scripts and hooks: see [Scripting](scripting.md).
 
-When the server restarts, panes that ran Claude Code or Codex with a known session resume it
-(`claude --resume <id>`, `codex resume <id>`), with the options they were started with. A prompt
-given on the command line is never sent again: the pane then shows the command that resumes,
-without the prompt, and waits for Enter. A one-shot run (`claude -p`, `codex exec`) is not
+## Resume limits
+
+Close and a server restart stop the processes, including any turn in progress. Kraal can request
+that Claude Code or Codex reopen a known conversation (`claude --resume <id>`, `codex resume <id>`)
+with supported launch options. The history must still exist in the agent's home, and the agent
+must be able to sign in. Kraal's saved scrollback is not a substitute for that history.
+A pane already stopped stays stopped. Without a known conversation, a managed launch may run
+its original command; it cannot promise to recover the previous conversation.
+
+For a supported resume, kraal removes a recognized command-line prompt so it is not sent again;
+the pane shows the resume command and waits for Enter. A one-shot run (`claude -p`, `codex exec`) is not
 resumed: it waits for Enter as any other command does. When kraal cannot tell an option's value
 from a prompt (an option it does not know), the pane also shows the command and waits: Enter runs
-it as shown. The same goes for Enter on an ended agent and for an account switch.
+it as shown. Enter on an ended agent uses the same argument checks. Account changes apply
+additional transcript and sign-in checks before stopping anything.
+
+A recognized Claude or Codex run inside a shell can receive a basic resume command after
+restoration; kraal does not reconstruct every option or environment variable typed into that
+shell. Other agents have no conversation resume in kraal. A shell comes back as a new shell;
+a command pane waits for Enter. Duplicate removes managed conversation selections and keeps
+commands waiting for Enter. Import also keeps commands waiting, but uses the arguments written
+in the file: review any explicit resume arguments before launching. Neither operation copies
+the agent's conversation history.
 
 ## Worktrees
 
@@ -184,6 +229,8 @@ a removal.
 
 ## Accounts
 
+### Add and manage
+
 Each account has a name and a sign-in home for an agent (`CLAUDE_CONFIG_DIR` for Claude Code,
 `CODEX_HOME` for Codex). kraal never reads or stores
 credentials; it chooses which directory a pane starts with and reads the usage the agents report.
@@ -237,9 +284,10 @@ An explicit `--home` with a verified sign-in is adopted without login, even with
 Adding another name for a listed home resolves to that same account. Use Rename to change its
 visible name. Old `default` references in commands, rules and saved sessions continue to resolve.
 
-New Claude accounts share
-`CLAUDE.md`, `settings.json`, skills, plugins, memory and conversations with it, so a conversation
-can continue on another account; Codex accounts share nothing, as Codex keeps databases in its home.
+New Claude account homes link shared settings, skills, plugins and project conversations from
+`~/.claude` when available; existing entries in a chosen home are left alone. A conversation can
+continue on another account only after its transcript is checked. Codex homes share no live
+files or databases; a new home receives a copy of `~/.codex/config.toml` when available.
 An agent kraal starts on an account gets `$KRAAL_ACCOUNT` (`claude:pro`) and an internal
 `$KRAAL_ACCOUNT_ID` that stays the same when renamed. It does not inherit the API keys of
 your environment (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`…), which would bill another account.
@@ -254,9 +302,6 @@ Tab opens **Rename**, **Sign in**, and **Remove** (`ctrl+r`, `ctrl+l`, `ctrl+x`)
 agent's own sign-in are kept.
 Enter or Esc in details returns to the list with that account selected. Background account
 checks keep the list's search and selected row while updating its entries.
-Account labels and summaries are reused while panes print. Account changes, pane associations,
-sign-in results and usage updates refresh them. Usage resets update without new terminal output;
-last-checked ages refresh on the next redraw.
 The bottom-right count includes only accounts, showing matches over the total while searching.
 **+ Add account** is excluded from both counts.
 
@@ -290,6 +335,8 @@ it is, and running agents go on under the new name. Removing an account keeps th
 launch environment of panes that use it. Adding another account with that name does not attach
 those panes, saved sessions, workspace bindings, rules or cached usage to the replacement.
 A workspace bound to a removed account asks you to choose an account again.
+
+### Change account and Undo
 
 Click the account name in a pane's frame, the bottom bar's **switch account**, or press
 `ctrl+b A c` to open **Change account** for that pane. It lists accounts of the same agent.
@@ -340,11 +387,14 @@ override, unknown conversation or ambiguous command instead shows **Can't switch
 and offers **Open with another account**. That opens another pane and leaves the original running.
 Shells with other jobs are not stopped for an account change.
 
+### Sign-in and recovery
+
 Sign-in from Accounts opens a dedicated login pane. Opening the same account's login again
 in that session focuses the existing pane, including through another account name for the same
 directory. After the login exits successfully, kraal checks with `claude auth status` or
 `codex login status`, in that account's environment. A confirmed sign-in closes the pane and
-says that the account is signed in. When adding, it returns to the new row in Accounts. A failed or cancelled sign-in stays open: Enter closes it,
+says that the account is signed in. When adding, it returns to the new row in Accounts.
+A failed or cancelled sign-in stays open: Enter closes it,
 and `r` is the separate **Try again** action. While a check runs, Enter also closes the pane;
 its late result is ignored. `c`, **Check again**, retries an unsuccessful check without running
 the login again. A check waits at most ten seconds and discards the agent's output.
@@ -369,7 +419,9 @@ not a missing agent. JSON keeps `logged_in` (`true`, `false`, or `null`) and add
 `signed_in`, `not_signed_in`, `not_installed`, or `could_not_check`.
 The command-line add and login commands also verify sign-in after the login succeeds.
 
-**Usage.** Claude Code passes the 5-hour and weekly usage to its status line;
+### Usage and rules
+
+Claude Code passes the 5-hour and weekly usage to its status line;
 `kraal integration install claude` puts a small status line in front of yours that records it,
 then runs yours unchanged. Codex accounts are asked through Codex's own app-server every few
 minutes (`kraal accounts refresh` asks now). Limit messages on screen ("You've hit your session

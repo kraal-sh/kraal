@@ -2097,6 +2097,54 @@ keybinds {
     }
 
     #[test]
+    fn exporting_a_detected_shell_agent_keeps_only_its_kind_as_a_launch_recipe() {
+        for (argv, agent) in [
+            (vec!["claude".into(), "--model".into(), "opus".into()], Some("claude")),
+            (vec!["sleep".into(), "600".into()], None),
+        ] {
+            let detected = crate::agent::detect_agent(&argv);
+            assert_eq!(detected, agent);
+            let snap: crate::persist::WorkspaceSnap = serde_json::from_value(serde_json::json!({
+                "name": "shell",
+                "definition": null,
+                "cwd": null,
+                "active": 0,
+                "tabs": [{
+                    "name": "shell",
+                    "root": {"Pane": crate::persist::PaneSnap {
+                        name: None,
+                        spec: crate::pane::PaneSpec {
+                            env: vec![("SHELL_ONLY".into(), "original-environment".into())],
+                            ..Default::default()
+                        },
+                        agent: detected.map(str::to_owned),
+                        agent_session: agent.map(|_| "original-conversation".into()),
+                        stopped: false,
+                        scrollback: None,
+                    }},
+                    "floating": [],
+                    "focus": 0,
+                    "show_floating": false,
+                    "zoomed": false,
+                    "sync": false
+                }]
+            }))
+            .unwrap();
+            let mut def = from_snapshot(&snap, "exported");
+            def.portable_accounts();
+            let text = to_kdl(&def);
+            let exported = parse_clean(&text);
+            assert_eq!(
+                exported.panes(),
+                [&PaneDef { agent: agent.map(str::to_owned), focus: true, ..Default::default() }]
+            );
+            for omitted in ["--model", "opus", "SHELL_ONLY", "original-environment", "original-conversation"] {
+                assert!(!text.contains(omitted), "{text}");
+            }
+        }
+    }
+
+    #[test]
     fn round_trips_every_feature() {
         let src = r#"
 layout {

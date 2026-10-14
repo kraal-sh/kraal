@@ -3,6 +3,10 @@
 // The sidebar shows each agent's state; `alt+a` goes to the next one that waits for you.
 // Needs claude and codex signed in, and checkouts in ~/src/shop and ~/src/shop-docs.
 // Run `kraal accounts` first; replace Personal below with the Claude account name it lists.
+
+// Import with `kraal import examples/workspaces/two-agents.kdl` to preview before adding.
+// Imported commands wait for Enter; the named-file opening above honors their launch settings.
+// After opening, the layout is kept automatically. Export writes a separate reusable recipe.
 layout {
     pane split_direction="vertical" {
         pane split_direction="horizontal" size="60%" {

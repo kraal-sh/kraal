@@ -29,11 +29,23 @@ at its tag. The [documentation](../docs/README.md) explains what they use.
 The files of `config/` are each a whole `config.toml`: copy one, or add its tables to yours.
 `repository/` holds what a repository commits, at its top.
 
+For a workspace, start with `kraal import examples/workspaces/first.kdl` from a checkout of this
+repository. Review the preview, then confirm Add. Shells can start; commands and agents wait for
+Enter. Your layout is kept automatically from then on. Rename changes only its name in kraal,
+and Close keeps it for reopening. Delete is recoverable through **Deleted workspaces**.
+
+The table's short commands assume you copied the KDL into `~/.config/kraal/workspaces/`.
+These legacy named-file openings honor the recipe immediately, including launching commands
+and agents unless marked `start_suspended=true`. Use Import for a preview and waiting commands.
+
 After opening a workspace example, use Workspaces, Tab, **Duplicate** to keep an independent
 layout under a proposed free name. The copy is saved closed. Opening it starts shells, while
 commands and agents wait for Enter; agents start new conversations. The example file stays
 unchanged, and project folders remain shared. See [Duplicating a workspace](../docs/workspaces.md#duplicating-a-workspace).
 
-Import a layout directly with `kraal import examples/workspaces/first.kdl`. Review the preview
-before adding it; commands wait for Enter. Export your personal layout with
-`kraal export ./first-copy.kdl --workspace first`. The example file and its comments stay intact.
+Export a reusable recipe with `kraal export ./first-copy.kdl --workspace first`. It contains no
+scrollback or conversations, and uses portable agent references. Replacing an existing file
+requires explicit confirmation and keeps a backup. Export is not needed before Close; reopening
+uses the retained layout and [resume rules](../docs/workspaces.md#what-resumes), even if the
+source file has changed. **Review** and **Load from file** explicitly adopt a changed source;
+**Undo load** can restore the previous layout as Closed.

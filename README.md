@@ -33,11 +33,12 @@ waiting for you.
   you.
 - **Several agents on one repository.** Start an agent in its own worktree and branch, then
   review, commit, open a pull request or merge without leaving kraal.
-- **Every subscription you pay for.** A personal and a work Claude plan, two Codex plans: kraal
-  shows each one's usage, picks one per project, and moves to another when one reaches its
-  limit.
-- **Your servers, one key away.** kraal remembers every host you ssh to. Open one, or a whole
-  group in a grid; type in all of them at once; copy files between any two; keep tunnels open.
+- **Named Claude and Codex accounts.** See reported usage, choose accounts per project, and
+  change an agent pane's account with an Undo action. Claude can continue a verified conversation;
+  changing Codex accounts starts a new one. [Accounts and limits](docs/agents.md#accounts)
+- **Your servers, one key away.** Add a server explicitly, or review a discovered connection
+  before saving it. Open one, or a whole group in a grid; type in all of them at once; copy files
+  between any two; keep tunnels open.
 - **Production looks like production.** A pane on a production server, cluster, Terraform
   workspace or AWS profile gets a red frame, and kraal asks before broadcast typing or a
   multi-line paste lands there.
@@ -46,8 +47,9 @@ waiting for you.
 - **Runbooks that stop at the first failure.** Procedures kept as files run server by server
   after showing their plan, and log everything. Your Markdown docs run block by block.
 - **Close the terminal, keep working.** Sessions keep running when the window closes or the
-  connection drops. After a reboot, kraal rebuilds the layout with each pane's scrollback,
-  reconnects SSH shells and resumes agent conversations.
+  connection drops. Workspaces keep their layout automatically, including after Close, and
+  Delete offers recovery. After a reboot, kraal restores saved layouts and available scrollback;
+  [resume rules](docs/workspaces.md#what-resumes) determine which programs restart.
 - **One binary, any modern terminal.** Linux and macOS. The kitty keyboard protocol (Shift+Enter
   reaches Claude Code), images in panes (kitty graphics and sixel), shell integration, the mouse.
 
@@ -75,8 +77,10 @@ kraal
 ```
 
 This starts a session, or attaches to the one already running. Press `ctrl+b` and let go: a menu
-shows what each next key does. `ctrl+b s` connects to a server, `ctrl+b a` starts an agent. The
-bar at the bottom shows what can be done in the focused pane, and its keys.
+shows what each next key does. `ctrl+b w` opens Workspaces, `ctrl+b s` opens Servers,
+`ctrl+b a` starts a Claude or Codex agent on a listed account. Use `ctrl+b A l` for Accounts
+and **+ Add account** if none is listed. Each management list has **+ Add**; search only filters.
+The bar at the bottom shows what can be done in the focused pane, and its keys.
 
 To leave, `ctrl+b d` detaches: programs keep running, and `kraal` brings you back where you were.
 `ctrl+b q` quits: programs stop, and the layout is saved for the next `kraal`.
@@ -98,10 +102,17 @@ every menu (`n` new, `x` close, `e` rename). Shortcuts work on any keyboard layo
 and every menu can move to the keys you want.
 [Keys](docs/keys.md)
 
-## Workspaces as files
+## Workspaces kept automatically
 
-Declare a workspace once and open it in one command (`kraal shop`): tabs, splits, stacks, servers,
-commands, agents and live previews, in a KDL file.
+Open Workspaces (`ctrl+b w`), choose **+ Add workspace**, give it a name and select **Add**.
+Arrange tabs and panes as you work. **Close** keeps the layout as **Closed**; **Open** brings it
+back. **Rename** changes its name in kraal, never a file. **Delete** moves it to **Deleted
+workspaces**, where **Restore** brings it back closed, even after a restart.
+
+KDL files are reusable startup layouts. Save the following as `shop.kdl`, then use
+`kraal import ./shop.kdl` to preview and add it. Shells can start; imported commands and agents
+wait for Enter. Export a copy with `kraal export ./shop-copy.kdl --workspace shop`.
+Neither operation is needed to keep your workspace, and exports contain no conversations.
 
 ```kdl
 layout {
