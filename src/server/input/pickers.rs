@@ -872,7 +872,8 @@ mod tests {
             let c = server.clients.get_mut(&client).unwrap();
             c.workspace = ws;
             c.cols = cols;
-            std::fs::write(&path, "layout { pane command=\"never-run\"; pane; }").unwrap();
+            // A bare pane starts a shell, whose startup can make Undo require confirmation.
+            std::fs::write(&path, "layout { pane command=\"never-run\"; pane command=\"also-never-run\"; }").unwrap();
             server.refresh_source_status();
             let mut picker = server.workspace_picker(ws);
             for action in [ToastAction::ReviewWorkspace(ws), ToastAction::UndoLayout(ws)] {
@@ -880,7 +881,7 @@ mod tests {
                 picker.actions = Some(0);
                 let col = (0..cols)
                     .find(|&col| server.tab_bar_hit(client, col) == Some(BarItem::Toast(0, action.clone())))
-                    .unwrap();
+                    .unwrap_or_else(|| panic!("{action:?} at width {cols}: notification action is not clickable"));
                 let click = InputEvent::Mouse(MouseEvent {
                     kind: MouseKind::Press(MouseButton::Left),
                     col,
@@ -889,12 +890,23 @@ mod tests {
                 });
                 let mode = server.on_picker(client, picker, click);
                 let mode = match mode {
-                    Mode::Prompt(p) => server.load_source_form(client, p, None),
+                    Mode::Prompt(p) if matches!(action, ToastAction::ReviewWorkspace(_)) => {
+                        server.load_source_form(client, p, None)
+                    }
                     mode => mode,
                 };
-                let Mode::Picker(p) = mode else { panic!() };
+                let Mode::Picker(p) = mode else {
+                    let detail = match &mode {
+                        Mode::Prompt(p) => format!("{}: {:?}", p.title, p.error),
+                        Mode::Confirm(q) => q.message.clone(),
+                        Mode::Normal => "Normal".into(),
+                        _ => String::new(),
+                    };
+                    panic!("{action:?} at width {cols}: expected Picker, got {}: {detail}", mode.label());
+                };
                 assert!(p.actions.is_none(), "the old action menu must not return after changing the layout");
                 let loaded = matches!(action, ToastAction::ReviewWorkspace(_));
+                assert!(server.panes.values().all(|p| p.suspended));
                 assert_eq!(p.action_keys().contains(&("", "Undo load")), loaded);
                 assert_eq!(server.workspaces[0].counts(), (1, if loaded { 2 } else { 1 }));
                 assert_eq!(server.workspaces[0].closed(), !loaded);

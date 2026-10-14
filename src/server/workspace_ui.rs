@@ -1091,19 +1091,49 @@ mod tests {
         server.new_workspace("another workspace".into(), None);
         std::fs::write(&path, "layout { pane command=\"never-run\"; }").unwrap();
         let Mode::Prompt(p) = server.review_source_form(ws, None, false) else { panic!() };
-        assert!(matches!(server.load_source_form(client, p, None), Mode::Picker(_)));
+        let mode = server.load_source_form(client, p, None);
+        assert!(matches!(mode, Mode::Picker(_)), "Load from file returned {}", mode.label());
         assert!(!server.workspaces[0].closed());
         assert!(server.panes.values().all(|p| p.suspended));
         for id in [client, other] {
             assert_eq!(server.clients[&id].workspace, ws);
         }
-        assert!(matches!(
-            server.toast_action(client, 0, super::super::attention::ToastAction::UndoLayout(ws)),
-            Mode::Picker(_)
-        ));
+        let mode = server.toast_action(client, 0, super::super::attention::ToastAction::UndoLayout(ws));
+        assert!(
+            matches!(mode, Mode::Picker(_)),
+            "UndoLayout at width {} returned {}",
+            server.clients[&client].cols,
+            mode.label()
+        );
         assert!(server.workspaces[0].closed());
         assert_eq!(server.workspaces[0].counts(), (1, 1));
         assert!(server.workspaces[0].layout_undo.is_none());
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn undo_notification_confirms_a_shell_whose_activity_cannot_yet_be_checked() {
+        // Hold the launch to reproduce Undo arriving before the shell's process is available.
+        let _batch = crate::pane::batch();
+        let (mut server, path, ws) = super::super::workspace_sources::tests::setup("undo-starting-shell");
+        let (client, _peer) = super::super::tests::client(&mut server);
+        server.clients.get_mut(&client).unwrap().workspace = ws;
+        std::fs::write(&path, "layout { pane command=\"never-run\"; pane; }").unwrap();
+        let Mode::Prompt(p) = server.review_source_form(ws, None, false) else { panic!() };
+        assert!(matches!(server.load_source_form(client, p, None), Mode::Picker(_)));
+        let panes = server.workspaces[0].panes();
+        assert!(panes.iter().any(|id| !server.panes[id].suspended && server.panes[id].pid().is_none()));
+        let mode = server.toast_action(client, 0, super::super::attention::ToastAction::UndoLayout(ws));
+        let Mode::Confirm(q) = mode else {
+            panic!("UndoLayout at width {}: expected Confirm, got {}", server.clients[&client].cols, mode.label());
+        };
+        assert!(q.message.contains("Undo load?"));
+        assert!(q.message.contains("Unknown program (activity could not be checked)"));
+        assert!(!q.yes);
+        assert!(matches!(confirm(&mut server, client, q, b"n"), Mode::Normal));
+        assert_eq!(server.workspaces[0].panes(), panes);
+        assert!(!server.workspaces[0].closed());
+        assert!(server.workspaces[0].layout_undo.is_some());
         std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 

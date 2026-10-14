@@ -616,6 +616,8 @@ stays closed. Your workspace keeps its name, identity, source association, and l
 
 The **Undo** notification and **Undo load** in Actions restore the previous layout as **Closed**.
 Open it when ready. Undo does not restart stopped processes or recover their unsaved work.
+If programs or jobs need to stop, Undo asks for confirmation. This also applies while a new
+shell's activity cannot yet be checked. Cancel keeps the current layout and leaves Undo available.
 One previous layout is retained per workspace, including across restart. Another successful load
 replaces that Undo with the layout it replaced. Undo never edits the source file.
 
