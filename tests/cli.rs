@@ -1154,12 +1154,21 @@ fn a_failed_state_migration_never_starts_an_empty_session_or_replaces_the_source
     let env = Env::new("wsbadstate");
     env.workspace("w", "layout { pane; }\n");
     std::fs::create_dir_all(env.legacy_state_file().parent().unwrap()).unwrap();
-    for bytes in ["{", r#"{"version":2,"workspaces":[]}"#, r#"{"version":1,"revision":3,"workspaces":[]}"#] {
+    for bytes in [
+        "{",
+        r#"{"version":2,"workspaces":[]}"#,
+        r#"{"version":1,"revision":3,"workspaces":[]}"#,
+        r#"{"version":1,"revision":2,"workspaces":[]}"#,
+    ] {
         std::fs::write(env.legacy_state_file(), bytes).unwrap();
         let out = env.try_run(&["open", "w"]);
         let said = String::from_utf8_lossy(&out.stderr);
         assert!(!out.status.success() && said.contains("the saved session is unchanged"), "{said}");
+        if bytes.contains("\"revision\":2") {
+            assert!(said.contains("unsupported state revision 2; use a newer kraal"), "{said}");
+        }
         assert_eq!(std::fs::read_to_string(env.legacy_state_file()).unwrap(), bytes);
+        assert!(!env.state_file().exists());
         assert!(env.server_pid().is_none());
     }
     // Repairing the original is sufficient; no hidden replacement needs to be removed first.

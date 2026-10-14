@@ -505,9 +505,6 @@ fn the_toml_examples_are_read_whole() {
     assert!(wrong.is_empty(), "examples kraal would not read as written:\n{}", wrong.join("\n"));
 }
 
-/// `[keys.leader]` as it was named before 0.1.0, which no release documented.
-const UNDOCUMENTED: &str = "keys.prefixed";
-
 /// The settings kraal reads under `path` that `shown` does not set, by their path
 /// (`sidebar.width`). A table whose keys are names the user gives (a tool, an event) is one
 /// setting.
@@ -534,8 +531,7 @@ fn the_reference_names_every_setting() {
     for (quote, _) in blocks(&reference, "toml").filter(|(_, file)| *file == "config") {
         merge(&mut named, quote.text.parse().unwrap());
     }
-    let mut missing = not_shown(&named, &mut Vec::new());
-    missing.retain(|setting| setting != UNDOCUMENTED);
+    let missing = not_shown(&named, &mut Vec::new());
     assert!(missing.is_empty(), "settings docs/configuration.md does not show: {missing:?}");
 }
 

@@ -54,8 +54,8 @@ fn migrate(data: &[u8]) -> Result<(SessionSnapshot, Vec<u8>)> {
     let old: SessionSnapshot = serde_json::from_slice(data)?;
     let revision = serde_json::from_slice::<Revision>(data)?.revision;
     anyhow::ensure!(old.version == 1, "unsupported state version {}; use a newer kraal", old.version);
-    anyhow::ensure!(revision <= 2, "unsupported state revision {revision}; use a newer kraal");
-    validate(&old, data, revision < 2)?;
+    anyhow::ensure!(revision <= 1, "unsupported state revision {revision}; use a newer kraal");
+    validate(&old, data, true)?;
     let mut ids: HashSet<_> = old.workspaces.iter().map(|w| w.id.clone()).collect();
     let mut value: serde_json::Value = serde_json::from_slice(data)?;
     for (ws, saved) in value["workspaces"].as_array_mut().unwrap().iter_mut().zip(&old.workspaces) {
@@ -65,9 +65,6 @@ fn migrate(data: &[u8]) -> Result<(SessionSnapshot, Vec<u8>)> {
                 id = crate::accounts::new_uuid();
             }
             ws["id"] = serde_json::json!(id);
-        }
-        if saved.empty {
-            ws["tabs"] = serde_json::json!([]);
         }
         for tab in ws["tabs"].as_array_mut().unwrap() {
             if revision == 0 && tab["name"].as_str().is_some_and(old_tab_name) {
@@ -227,16 +224,35 @@ mod tests {
     }
 
     #[test]
-    fn an_empty_workspace_loses_only_its_compatibility_shell() {
+    fn unreleased_revision_is_refused_without_changing_any_files() {
+        let dir = directory("unreleased");
+        let (path, _) = source_in(&dir);
+        let scrollback = dir.join("scrollback/main/1-2-3.ans");
+        std::fs::create_dir_all(scrollback.parent().unwrap()).unwrap();
+        std::fs::write(&scrollback, "original text").unwrap();
         let mut source = legacy_state();
         source["revision"] = serde_json::json!(2);
         source["workspaces"][0]["id"] = serde_json::json!("stable");
         source["workspaces"][0]["empty"] = serde_json::json!(true);
         source["workspaces"][0]["closed"] = serde_json::json!(true);
-        let (snap, _) = migrate(&serde_json::to_vec(&source).unwrap()).unwrap();
-        assert_eq!(snap.workspaces[0].id, "stable");
-        assert!(snap.workspaces[0].tabs.is_empty());
-        assert!(snap.workspaces[0].empty && snap.workspaces[0].closed);
+        let mut empty = source.clone();
+        empty["workspaces"] = serde_json::json!([]);
+        for source in [source, empty] {
+            let bytes = serde_json::to_vec(&source).unwrap();
+            std::fs::write(&path, &bytes).unwrap();
+            for convert in [false, true] {
+                let error =
+                    read_from(&dir.join("sessions-v2/main.json"), &path, &dir.join("scrollback-v2/main"), convert)
+                        .unwrap_err();
+                assert_eq!(error.to_string(), "unsupported state revision 2; use a newer kraal");
+                assert_eq!(std::fs::read(&path).unwrap(), bytes);
+                assert_eq!(std::fs::read_to_string(&scrollback).unwrap(), "original text");
+                assert!(backups(&dir).is_empty());
+                assert!(!dir.join("sessions-v2").exists());
+                assert!(!dir.join("scrollback-v2").exists());
+            }
+        }
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

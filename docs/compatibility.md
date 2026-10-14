@@ -6,6 +6,11 @@ Kraal 0.4 migrates sessions and `accounts.toml` from **0.2.0** and **0.3.0** onc
 keeping a copy before conversion. This migration belongs to 0.4 and is removed in **0.5.0**.
 Existing workspace KDL and configuration files keep working.
 
+The unreleased `[keys.prefixed]` table is ignored with an unknown-key warning; use
+`[keys.leader]` for bindings after the prefix. The unreleased session format `version: 1,
+revision: 2` is refused with `unsupported state revision 2; use a newer kraal`, leaving the
+saved session untouched. Both supported releases wrote revision 1.
+
 Each save writes the current state format only. Kraal does not also write a downgraded copy
 for older versions. Migration backups and the untouched legacy session are recovery copies,
 not synchronized views of the current session.
