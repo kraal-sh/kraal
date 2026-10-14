@@ -78,6 +78,13 @@ pub fn detect_agent(argv: &[String]) -> Option<&'static str> {
             return rest.starts_with(&command[1..]).then_some(agent.name);
         }
     }
+    if matches!(first.as_str(), "node" | "bun")
+        && argv.iter().skip(1).find(|arg| !arg.starts_with('-')).is_some_and(|script| {
+            script == "@anthropic-ai/claude-code/cli.js" || script.ends_with("/@anthropic-ai/claude-code/cli.js")
+        })
+    {
+        return Some("claude");
+    }
     let interpreted = INTERPRETERS.iter().any(|i| first.starts_with(i));
     let candidates: Vec<String> = if interpreted {
         argv.iter().skip(1).filter(|a| !a.starts_with('-')).take(2).map(|a| base(a)).collect()
@@ -406,6 +413,22 @@ mod tests {
         assert_eq!(detect_agent(&argv("node /usr/lib/node_modules/codex/bin/codex.js")), Some("codex"));
         assert_eq!(detect_agent(&argv("zsh")), None);
         assert_eq!(detect_agent(&argv("ssh claude@host")), None);
+    }
+
+    #[test]
+    fn claude_package_entry_point_is_recognized_without_matching_other_cli_scripts() {
+        for runtime in ["node", "bun", "/usr/bin/node"] {
+            assert_eq!(
+                detect_agent(&argv(&format!("{runtime} /usr/lib/node_modules/@anthropic-ai/claude-code/cli.js"))),
+                Some("claude")
+            );
+            for script in
+                ["/tmp/cli.js", "/tmp/not-@anthropic-ai/claude-code/cli.js", "/tmp/@anthropic-ai/other/cli.js"]
+            {
+                assert_eq!(detect_agent(&argv(&format!("{runtime} {script}"))), None);
+            }
+        }
+        assert_eq!(detect_agent(&argv("vim /usr/lib/node_modules/@anthropic-ai/claude-code/cli.js")), None);
     }
 
     /// Command lines as each agent's package or installer starts it.

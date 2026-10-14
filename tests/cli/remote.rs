@@ -1774,7 +1774,27 @@ fn host_control_v_sends_agent_images_and_preserves_shell_local_and_text_clipboar
     let mut client = attach(true);
     client.type_keys(b"\x16shell");
     wait_until(PATIENCE, "shell receives Ctrl+V", || received() == b"\x16shell");
-    assert!(!log.exists(), "shell panes do not inspect the clipboard");
+    client.wait_for("this pane is not recognized as an agent");
+    assert_eq!(std::fs::read_to_string(&log).unwrap(), "types\n", "shell panes inspect types but never read the image");
+    std::fs::remove_file(&log).unwrap();
+    // Expiry on this 100x30 terminal must not reclaim the layout from a 124x36 client.
+    let pane_size = || {
+        let panes: serde_json::Value = serde_json::from_str(&server.run(&["panes", "--json"])).unwrap();
+        (panes[0]["cols"].as_u64().unwrap(), panes[0]["rows"].as_u64().unwrap())
+    };
+    let first_size = pane_size();
+    let other = RawClient::attach_sized(&server, Some("w"), (124, 36));
+    other.wait_for_row("READY");
+    let working_size = pane_size();
+    assert_ne!(first_size, working_size);
+    assert!(
+        text_after(&client.written.lock().unwrap(), 100, 30).iter().any(|row| row.contains("Ctrl+V did not attach"))
+    );
+    wait_until(PATIENCE, "clipboard notice expires", || {
+        !text_after(&client.written.lock().unwrap(), 100, 30).iter().any(|row| row.contains("Ctrl+V did not attach"))
+    });
+    assert_eq!(pane_size(), working_size, "notice expiry must preserve the working client's PTY size");
+    drop(other);
     client.type_keys(b"\x02d");
     assert_eq!(client.left("shell detach").0, 0);
 

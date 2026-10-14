@@ -168,6 +168,8 @@ pub enum ClientMsg {
         cols: u16,
         rows: u16,
     },
+    /// Restore terminal content without taking layout control.
+    Repaint,
     Detach,
     /// Reserve the destination while the client classifies a buffered paste.
     PasteStart,
@@ -253,6 +255,7 @@ pub enum ServerMsg {
         result: Result<Response, String>,
     },
     ClipboardFocus {
+        /// The focused pane, only when the client mode allows a clipboard shortcut.
         pane: Option<crate::layout::PaneId>,
         agent: bool,
     },
@@ -933,6 +936,7 @@ mod tests {
                 installed: Some(s("0.2.0")),
             },
             ClientMsg::Resize { cols: 80, rows: 24 },
+            ClientMsg::Repaint,
             ClientMsg::Detach,
             ClientMsg::PasteStart,
             ClientMsg::AttachmentRequest { token: s("ab"), text: b"/tmp/a".to_vec(), image: false, pane: None },

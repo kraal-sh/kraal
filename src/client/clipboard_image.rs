@@ -49,7 +49,7 @@ fn run(cmd: &mut Command, cancelled: &AtomicBool, limit: usize, timeout: Duratio
     ensure!(!out.cancelled && !cancelled.load(Ordering::SeqCst), "clipboard read cancelled");
     ensure!(!out.timed_out, "clipboard tool timed out; copy the image again");
     ensure!(!out.truncated, "clipboard image exceeds 16 MiB; save it and use Attach files");
-    ensure!(out.success(), "clipboard tool could not read a PNG image; copy an image first");
+    ensure!(out.success(), "clipboard tool failed: {}; copy the image again", tool_error(&out));
     Ok(out.stdout)
 }
 
@@ -88,21 +88,121 @@ fn read_commands(commands: Vec<Command>, cancelled: &AtomicBool) -> Result<Vec<u
     Err(error.context("Cannot read clipboard image (wl-paste or xclip required)"))
 }
 
-// Inspect only advertised types: ordinary Ctrl+V must never read clipboard content.
-pub(super) fn available() -> bool {
-    advertised(probes(), &AtomicBool::new(false))
+#[derive(Debug)]
+pub(super) enum Diagnostic {
+    NoImage,
+    MissingTool(&'static str),
+    Failed(String),
+    NoDisplay,
+    NotAgent,
 }
 
-fn advertised(commands: Vec<Command>, cancelled: &AtomicBool) -> bool {
-    for mut command in commands {
-        if let Ok(types) = run(&mut command, cancelled, 16 * 1024, TIMEOUT) {
-            return offers_image(&String::from_utf8_lossy(&types));
+impl Diagnostic {
+    fn message(&self) -> String {
+        match self {
+            Self::NoImage => "No image in the laptop clipboard: copy a screenshot first".into(),
+            Self::MissingTool(tool) => format!("Ctrl+V could not read the laptop clipboard: install {tool}"),
+            Self::Failed(error) => format!("Ctrl+V could not read the laptop clipboard: {error}. Use Attach clipboard image to retry"),
+            Self::NoDisplay => "Ctrl+V could not read the laptop clipboard: run attach from your desktop terminal with WAYLAND_DISPLAY or DISPLAY set".into(),
+            Self::NotAgent => "Ctrl+V did not attach an image: this pane is not recognized as an agent. Use Attach clipboard image".into(),
         }
+    }
+}
+
+#[derive(Default)]
+pub(super) struct Notices {
+    seen: Vec<std::mem::Discriminant<Diagnostic>>,
+    current: Option<(String, std::time::Instant)>,
+}
+
+impl Notices {
+    pub fn is_active(&self) -> bool {
+        self.current.is_some()
+    }
+
+    pub fn show(&mut self, diagnostic: Diagnostic) -> bool {
+        let cause = std::mem::discriminant(&diagnostic);
+        if self.seen.contains(&cause) {
+            return false;
+        }
+        self.seen.push(cause);
+        self.current = Some((
+            diagnostic.message().chars().filter(|c| !c.is_control()).collect(),
+            std::time::Instant::now() + Duration::from_secs(4),
+        ));
+        true
+    }
+
+    pub fn clear(&mut self) {
+        self.current = None;
+    }
+
+    pub fn expire(&mut self, now: std::time::Instant) -> bool {
+        if self.current.as_ref().is_some_and(|(_, until)| now >= *until) {
+            self.clear();
+            return true;
+        }
+        false
+    }
+
+    pub fn render(&self, cols: u16, rows: u16) -> Vec<u8> {
+        let Some((message, _)) = &self.current else { return Vec::new() };
+        let lines = crate::text::wrap(message, usize::from(cols).saturating_sub(2).max(1))
+            .into_iter()
+            .map(|line| (line, Some(crate::theme::NoticeKind::Notice)))
+            .collect::<Vec<_>>();
+        super::notice_lines(&lines, cols, rows)
+    }
+}
+
+// Inspect only advertised types: ordinary Ctrl+V must never read clipboard content.
+pub(super) fn available() -> Result<bool, Diagnostic> {
+    advertised(probes(), &AtomicBool::new(false), TIMEOUT)
+}
+
+fn advertised(commands: Vec<Command>, cancelled: &AtomicBool, timeout: Duration) -> Result<bool, Diagnostic> {
+    let mut error = None;
+    for mut command in commands {
+        let tool = command.get_program().to_string_lossy().into_owned();
+        let failure = match crate::exec::run_cancellable(&mut command, timeout, 16 * 1024, cancelled) {
+            Ok(out) if out.success() && !out.truncated => {
+                return Ok(offers_image(&String::from_utf8_lossy(&out.stdout)));
+            }
+            Ok(out) => {
+                let reason = if out.timed_out {
+                    "timed out".into()
+                } else if out.cancelled {
+                    "cancelled".into()
+                } else if out.truncated {
+                    "type list exceeds 16 KiB".into()
+                } else {
+                    tool_error(&out)
+                };
+                Diagnostic::Failed(format!("{tool}: {reason}"))
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Diagnostic::MissingTool(match tool.as_str() {
+                "wl-paste" => "wl-clipboard",
+                "xclip" => "xclip",
+                _ => "osascript (macOS system tools)",
+            }),
+            Err(e) => Diagnostic::Failed(format!("{tool}: {e}")),
+        };
+        // A failed X11 fallback must not hide the Wayland diagnostic on a Wayland desktop.
+        error.get_or_insert(failure);
         if cancelled.load(Ordering::SeqCst) {
             break;
         }
     }
-    false
+    Err(error.unwrap_or(Diagnostic::NoDisplay))
+}
+
+fn tool_error(out: &crate::exec::Output) -> String {
+    let detail: String = out.stderr_text().chars().filter(|c| !c.is_control()).take(200).collect();
+    if detail.trim().is_empty() {
+        format!("exited with status {}", out.code.map_or_else(|| "unknown".into(), |code| code.to_string()))
+    } else {
+        detail.trim().into()
+    }
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -267,7 +367,14 @@ mod tests {
 
     #[test]
     fn control_v_is_a_local_key_not_paste_data_or_a_terminal_response() {
-        for key in [b"\x16".as_slice(), b"\x1b[118;5u", b"\x1b[118;5:1u", b"\x1b[118:86:118;5:2u"] {
+        for key in [
+            b"\x16".as_slice(),
+            b"\x1b[118;5u",
+            b"\x1b[118;5:1u",
+            b"\x1b[118:86:118;5:2u",
+            b"\x1b[118;133u",
+            b"\x1b[118;5;118u",
+        ] {
             let input = [b"before".as_slice(), key, b"after"].concat();
             for split in 0..=input.len() {
                 let mut parser = Keys::default();
@@ -300,14 +407,16 @@ mod tests {
     #[test]
     fn advertised_types_do_not_read_text_or_fall_back_from_a_text_clipboard() {
         let stop = AtomicBool::new(false);
-        assert!(!advertised(vec![shell("printf 'text/plain\\nUTF8_STRING\\n'"), shell("exit 99")], &stop));
+        assert!(
+            !advertised(vec![shell("printf 'text/plain\\nUTF8_STRING\\n'"), shell("exit 99")], &stop, TIMEOUT).unwrap()
+        );
         #[cfg(not(target_os = "macos"))]
         let image = "printf 'text/plain\\nimage/png\\n'";
         #[cfg(target_os = "macos")]
         let image = "printf '«class PNGf», 128, «class utf8», 7'";
-        assert!(advertised(vec![shell("exit 1"), shell(image)], &stop));
-        assert!(!advertised(vec![shell("printf text"), shell(image)], &stop));
-        assert!(!advertised(Vec::new(), &stop));
+        assert!(advertised(vec![shell("exit 1"), shell(image)], &stop, TIMEOUT).unwrap());
+        assert!(!advertised(vec![shell("printf text"), shell(image)], &stop, TIMEOUT).unwrap());
+        assert!(matches!(advertised(Vec::new(), &stop, TIMEOUT), Err(Diagnostic::NoDisplay)));
         #[cfg(not(target_os = "macos"))]
         {
             let commands = probe_commands(|_| true);
@@ -325,6 +434,69 @@ mod tests {
             assert_eq!(probes()[0].get_program(), "osascript");
             assert_eq!(probes()[0].get_args().collect::<Vec<_>>(), ["-e", "clipboard info"]);
         }
+    }
+
+    #[test]
+    fn probe_failures_keep_the_tool_error_and_distinguish_missing_tools_from_no_image() {
+        let stop = AtomicBool::new(false);
+        for (tool, package) in
+            [("wl-paste", "wl-clipboard"), ("xclip", "xclip"), ("osascript", "osascript (macOS system tools)")]
+        {
+            let mut command = Command::new(tool);
+            command.env("PATH", "/no-such-clipboard-bin");
+            let error = advertised(vec![command], &stop, TIMEOUT).unwrap_err();
+            assert!(matches!(error, Diagnostic::MissingTool(found) if found == package));
+            assert!(error.message().ends_with(&format!("install {package}")));
+        }
+        for (script, expected) in [
+            ("printf 'Failed to connect to a Wayland server\\n' >&2; exit 1", "Failed to connect to a Wayland server"),
+            ("exit 7", "exited with status 7"),
+            ("sleep 60", "timed out"),
+            ("head -c 16385 /dev/zero", "type list exceeds 16 KiB"),
+        ] {
+            let error =
+                advertised(vec![shell(script), shell("exit 99")], &stop, Duration::from_millis(100)).unwrap_err();
+            assert!(matches!(error, Diagnostic::Failed(_)));
+            assert!(error.message().contains(expected), "{}", error.message());
+        }
+        assert!(!advertised(vec![shell("exit 1"), shell("printf text/plain")], &stop, TIMEOUT).unwrap());
+        let error = run(&mut shell("echo 'permission denied' >&2; exit 1"), &stop, 4096, TIMEOUT).unwrap_err();
+        assert!(error.to_string().contains("permission denied"));
+    }
+
+    #[test]
+    fn notices_are_once_per_cause_wrap_in_notice_style_and_expire_without_consuming_keys() {
+        let mut notices = Notices::default();
+        for diagnostic in [
+            Diagnostic::NoImage,
+            Diagnostic::MissingTool("wl-clipboard"),
+            Diagnostic::Failed("wl-paste: permission denied".into()),
+            Diagnostic::NoDisplay,
+            Diagnostic::NotAgent,
+        ] {
+            let message = diagnostic.message();
+            assert!(notices.show(diagnostic));
+            for cols in [80, 124] {
+                let bytes = String::from_utf8(notices.render(cols, 24)).unwrap();
+                assert!(bytes.starts_with("\x1b7\x1b[?7l"));
+                assert!(bytes.ends_with("\x1b[?7h\x1b8"));
+                for line in crate::text::wrap(&message, cols as usize - 2) {
+                    assert!(bytes.contains(&line));
+                }
+            }
+            assert!(!notices.expire(std::time::Instant::now()));
+            assert!(notices.expire(std::time::Instant::now() + Duration::from_secs(5)));
+            assert!(notices.render(80, 24).is_empty());
+        }
+        assert!(!notices.show(Diagnostic::NoImage));
+        assert!(!notices.show(Diagnostic::MissingTool("xclip")));
+        assert!(!notices.show(Diagnostic::Failed("a different error".into())));
+        assert!(!notices.show(Diagnostic::NoDisplay));
+        assert!(!notices.show(Diagnostic::NotAgent));
+        assert!(Notices::default().show(Diagnostic::NoImage));
+        let mut notices = Notices::default();
+        notices.show(Diagnostic::Failed("bad\x1b[31m\nerror".into()));
+        assert!(!String::from_utf8(notices.render(124, 24)).unwrap().contains("bad\x1b"));
     }
 
     #[test]
@@ -385,6 +557,7 @@ mod tests {
     fn linux_prefers_wayland_then_x11_clipboard_and_falls_back_on_failure() {
         let both = commands(|_| true);
         assert_eq!(both[0].get_program(), "wl-paste");
+        assert_eq!(both[0].get_args().collect::<Vec<_>>(), ["--no-newline", "--type", "image/png"]);
         assert_eq!(both[1].get_program(), "xclip");
         assert_eq!(both[1].get_args().collect::<Vec<_>>(), ["-selection", "clipboard", "-out", "-target", "image/png"]);
         assert_eq!(commands(|key| key == "DISPLAY")[0].get_program(), "xclip");
