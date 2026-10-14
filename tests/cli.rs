@@ -1350,6 +1350,114 @@ fn workspace_search_add_and_closed_rename_work_at_both_sizes() {
 }
 
 #[test]
+fn workspace_delete_undo_and_restore_after_restart_keep_both_reused_names() {
+    for size in [(80, 24), (124, 36)] {
+        let env = Env::new(&format!("ws-delete-{}", size.0));
+        let source = "// shared layout\nlayout { pane name=\"original\"; }\n";
+        env.workspace("api", source);
+        env.run(&["open", "api"]);
+        let original: serde_json::Value = serde_json::from_str(&env.run(&["workspaces", "--json"])).unwrap();
+        let identity = original[0]["id"].clone();
+        let path = env.root.join("config/kraal/workspaces/api.kdl");
+        let mut client = RawClient::attach_sized(&env, Some("api"), size);
+        client.wait_for_row("$ ");
+        client.send(b"\x02w\t\x1b[B\x1b[B\x1b[B\r");
+        client.wait_for_row("Delete api?");
+        client.wait_for_row("Project files will be kept.");
+        client.send(b"\r");
+        client.wait_for_row("Search");
+        assert_eq!(env.run(&["workspaces", "--json"]), serde_json::to_string_pretty(&original).unwrap() + "\n");
+        client.send(b"\t\x1b[B\x1b[B\x1b[B\r");
+        client.wait_for_row("Delete api?");
+        client.send(b"y");
+        client.wait_for_row("Ctrl+Z Undo");
+        assert!(listed_workspaces(&env).is_empty());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), source);
+        client.send(b"\x1a");
+        client.wait_for_row("Workspace restored");
+        let restored: serde_json::Value = serde_json::from_str(&env.run(&["workspaces", "--json"])).unwrap();
+        assert_eq!(restored[0]["id"], identity);
+        assert_eq!(restored[0]["open"], false);
+        assert_eq!(env.run(&["panes", "--json"]).trim(), "[]");
+        client.send(b"\t\x1b[B\x1b[B\r");
+        client.wait_for_row("Delete api?");
+        client.send(b"y");
+        client.wait_for_row("Workspace deleted");
+        env.run(&["kill"]);
+        assert!(listed_workspaces(&env).is_empty(), "the stopped-session scan must also exclude the source");
+        env.run(&["tunnel", "list"]);
+        let mut client = RawClient::attach_sized(&env, None, size);
+        client.wait_for_row("Deleted workspaces (1)");
+        assert_eq!(env.run(&["panes", "--json"]).trim(), "[]", "attaching must not add a replacement workspace");
+        click_account_text(&mut client, "+ Add workspace");
+        client.wait_for_row("Add workspace");
+        client.send(b"\x01\x0bapi\r");
+        client.wait_for_row("Workspace added");
+        let replacement: serde_json::Value = serde_json::from_str(&env.run(&["workspaces", "--json"])).unwrap();
+        assert_ne!(replacement[0]["id"], identity);
+        let panes = env.run(&["panes", "--json"]);
+        client.send(b"\x02w");
+        click_account_text(&mut client, "Deleted workspaces (1)");
+        client.wait_for_row("Deleted today");
+        client.send(b"\r");
+        client.wait_for_row("Name    api-restored");
+        client.send(b"\x1b");
+        client.wait_for_row("Deleted today");
+        client.send(b"\r");
+        client.wait_for_row("Restore workspace");
+        client.send(b"\r");
+        client.wait_for_row("Workspace restored");
+        let restored: serde_json::Value = serde_json::from_str(&env.run(&["workspaces", "--json"])).unwrap();
+        let restored = restored.as_array().unwrap();
+        let old = restored.iter().find(|w| w["name"] == "api-restored").unwrap();
+        let new = restored.iter().find(|w| w["name"] == "api").unwrap();
+        assert_eq!(old["id"], identity);
+        assert_eq!(old["open"], false);
+        assert_eq!(new["id"], replacement[0]["id"]);
+        assert_eq!(env.run(&["panes", "--json"]), panes, "Restore starts no programs");
+        assert_eq!(std::fs::read_to_string(path).unwrap(), source);
+    }
+}
+
+#[test]
+fn deleting_a_scanned_source_never_runs_it_and_restores_its_saved_contents() {
+    let env = Env::new("ws-delete-source");
+    let marker = env.root.join("ran");
+    let command = format!("echo started > {}", marker.display());
+    let source = format!("layout {{ pane command=\"sh\" {{ args \"-c\" {command:?}; }}; }}\n");
+    env.workspace("recipe", &source);
+    env.run(&["tunnel", "list"]);
+    let mut client = RawClient::attach_sized(&env, None, (80, 24));
+    client.wait_for_message("\"attached\"");
+    client.send(b"\x02wrecipe\t\x1b[B\r");
+    client.wait_for_row("Delete recipe?");
+    client.send(b"y");
+    client.wait_for_row("Workspace deleted");
+    assert!(!marker.exists());
+    let path = env.root.join("config/kraal/workspaces/recipe.kdl");
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), source);
+    env.run(&["kill"]);
+    assert!(!env.run(&["workspaces", "--json"]).contains("recipe"));
+    std::fs::remove_file(&path).unwrap();
+    env.run(&["tunnel", "list"]);
+    let mut client = RawClient::attach_sized(&env, None, (80, 24));
+    client.wait_for_message("\"attached\"");
+    client.send(b"\x02w");
+    click_account_text(&mut client, "Deleted workspaces (1)");
+    client.wait_for_row("recipe");
+    client.send(b"\r");
+    client.wait_for_row("Workspace restored");
+    assert!(!marker.exists());
+    assert!(!path.exists());
+    let restored: serde_json::Value = serde_json::from_str(&env.run(&["workspaces", "--json"])).unwrap();
+    let recipe = restored.as_array().unwrap().iter().find(|w| w["name"] == "recipe").unwrap();
+    assert_eq!(recipe["open"], false);
+    assert_eq!(recipe["panes"], 1);
+    env.run(&["open", "recipe"]);
+    wait_until(PATIENCE, "the explicitly opened recipe did not run", || marker.exists());
+}
+
+#[test]
 fn workspace_save_errors_keep_the_name_and_full_reason_at_both_sizes() {
     let env = Env::new("wssaveerrors");
     let dir = env.root.join("config/kraal/workspaces");
@@ -7499,9 +7607,20 @@ fn picker_actions_and_footers_follow_the_line_at_both_sizes() {
         client.close_overlay("⏎ add account");
 
         client.send(b"\x02wclosed");
-        let rows = client.wait_for_row("Enter Open");
-        assert!(!rows.iter().any(|r| r.contains("Tab Actions")));
+        client.wait_for_row("Enter Open · Tab Actions · Esc Close");
         client.send(b"\t");
+        let rows = client.wait_for_row("Delete");
+        assert!(rows.iter().any(|r| r.contains("enter") && r.contains("Open")));
+        // Match action names as words: the sidebar can still show the status "Closed".
+        for absent in ["Rename", "Close"] {
+            assert!(
+                !rows.iter().any(|r| r.split_whitespace().any(|word| word == absent) && !r.contains("Esc Close")),
+                "{size:?}: {absent}\n{}",
+                rows.join("\n")
+            );
+        }
+        client.close_overlay("Delete");
+        client.send(b"\x1b[B");
         let rows = client.wait_for_row("Enter Add");
         assert!(!rows.iter().any(|r| r.contains("Tab Actions")));
         client.send(b"\x1b");
@@ -10537,6 +10656,49 @@ fn a_crash_during_close_finishes_stopping_without_reopening_the_workspace() {
     assert_eq!(ws["panes"], 1);
     let panes: serde_json::Value = serde_json::from_str(&env.run(&["panes", "--json"])).unwrap();
     assert!(panes.as_array().unwrap().iter().all(|p| p["workspace"] != "w"));
+}
+
+#[test]
+fn a_crash_during_delete_finishes_the_deletion_and_keeps_it_restorable() {
+    let env = Env::new("deletecrash");
+    env.workspace("w", "layout { pane name=\"job\" command=\"sh\" { args \"-c\" \"trap '' HUP TERM; echo ready; while :; do sleep 1; done\"; }; }\n");
+    env.run(&["open", "w"]);
+    env.wait_for_text("job", "ready");
+    let mut client = RawClient::attach_sized(&env, Some("w"), (80, 24));
+    client.wait_for_message("\"attached\"");
+    client.send(b"\x02w\t\x1b[B\x1b[B\x1b[B\r");
+    client.wait_for_row("Stop and delete");
+    client.send(b"y");
+    wait_until(PATIENCE, "deletion was not prepared", || {
+        std::fs::read(env.state_file())
+            .ok()
+            .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+            .is_some_and(|s| {
+                s["workspaces"][0]["delete_pending"] == true && s["workspaces"][0]["close_pending"].is_object()
+            })
+    });
+    let pid = env.server_pid().unwrap();
+    // SAFETY: only this test's server, after its deletion intent reached disk.
+    assert_eq!(unsafe { libc::kill(pid, libc::SIGKILL) }, 0);
+    wait_until(PATIENCE, "the crashed server still runs", || env.server_pid().is_none());
+    let socket = env.root.join("run/kraal/deletecrash.sock");
+    wait_until(PATIENCE, "the crashed server still listens", || {
+        std::os::unix::net::UnixStream::connect(&socket).is_err()
+    });
+    env.run(&["tunnel", "list"]);
+    assert!(listed_workspaces(&env).is_empty());
+    assert_eq!(env.run(&["panes", "--json"]).trim(), "[]");
+    let mut client = RawClient::attach_sized(&env, None, (80, 24));
+    client.wait_for_row("Deleted workspaces (1)");
+    click_account_text(&mut client, "Deleted workspaces (1)");
+    client.wait_for_row("Deleted today");
+    client.send(b"\r");
+    client.wait_for_row("Workspace restored");
+    let restored: serde_json::Value = serde_json::from_str(&env.run(&["workspaces", "--json"])).unwrap();
+    assert_eq!(restored[0]["name"], "w");
+    assert_eq!(restored[0]["open"], false);
+    assert_eq!(restored[0]["panes"], 1);
+    assert_eq!(env.run(&["panes", "--json"]).trim(), "[]");
 }
 
 /// A command pane stays open when its program ends, to show how it ended: it has not ended, and

@@ -61,9 +61,14 @@ changed outside kraal. **Cancel** is selected and returns to the entered name. A
 linked to another workspace is refused. See [Saving without replacing someone else's layout](workspaces.md#saving-without-replacing-someone-elses-layout).
 
 Closing a workspace (`ctrl+b W x`, or `ctrl+x` in the workspace picker) lists its running
-programs and background jobs, and explains that its current layout will be removed.
-**Cancel** is selected first; **Stop and close** confirms. Cancel and save the layout first
-to keep it. See [Closing a workspace](workspaces.md#closing-a-workspace).
+programs and background jobs, and keeps its current layout as **Closed**.
+**Cancel** is selected first; **Stop and close** confirms. See [Closing a workspace](workspaces.md#closing-a-workspace).
+
+**Delete** is in the workspace's Tab actions, with no direct shortcut. It asks once before
+removing the row and stopping its programs. Click the result's **Undo**, or use **Ctrl+Z** in
+Workspaces while that result is shown. **Deleted workspaces** also offers **Enter Restore**
+after the toast disappears or kraal restarts. Restore keeps it **Closed**; **Enter Open** starts
+it explicitly. See [Deleting and restoring a workspace](workspaces.md#deleting-and-restoring-a-workspace).
 
 ## The bottom bar
 
@@ -137,8 +142,8 @@ A successful, verified sign-in closes the pane automatically.
 ## Lists, fields and questions
 
 In lists, type to filter, `↑↓` move, Enter or one click chooses, **Tab shows what else can be done** with the
-selected item (connect in a new tab, browse its files, run a command…), each also on a key of its
-own that the list shows, Esc closes. The footer says what Enter does on the selected line;
+selected item (connect in a new tab, browse its files, run a command…). Most also have a key
+shown by the list; Delete is only in the workspace actions. Esc closes. The footer says what Enter does on the selected line;
 only actions that apply to that line are offered. When there are no other actions, Tab moves
 to the next line. Text fields edit like a shell line (arrows, `home`/`end`,
 `alt+←→`, `ctrl+w`, `ctrl+u`, `ctrl+k`). In Add workspace, Rename workspace and Save workspace,
@@ -149,7 +154,9 @@ Workspace search never creates a workspace. **+ Add workspace** or `ctrl+b W n` 
 shared form; Enter or its **Add** button creates it. In Add workspace and Rename workspace,
 Tab moves between **Name**, the action button and **Cancel**. Esc returns to the list's search
 and selection. In Workspaces, Tab or a right click offers **Rename** for an open or closed saved
-workspace, and **Close** only while open.
+workspace, **Close** only while open, and **Delete** for a saved workspace or an unimported file.
+In **Deleted workspaces**, Enter or a click restores the selected row, and Esc goes back.
+If the old name is already used, the same Name form proposes a free name and offers **Restore**.
 Questions show two buttons, Cancel first: `y` answers
 yes, `n` or Esc no, Enter takes the selected button (`←→` or Tab change it). A question longer
 than its box says how many lines are below and scrolls: `↑↓` (or `j` `k`) by a line, `pageup`

@@ -1845,7 +1845,13 @@ mod tests {
         t.server.env.shell = t.dir.join("missing-shell").display().to_string();
         crate::persist::apply(
             &mut t.server,
-            crate::persist::SessionSnapshot { version: 2, workspaces: vec![ws.clone()], tunnels: Vec::new() },
+            crate::persist::SessionSnapshot {
+                version: 2,
+                workspaces: vec![ws.clone()],
+                deleted_workspaces: Vec::new(),
+                removed_sources: Vec::new(),
+                tunnels: Vec::new(),
+            },
         )
         .unwrap();
         assert_eq!(t.server.unrestored.len(), 1, "the missing shell prevents restoration");

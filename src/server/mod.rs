@@ -36,6 +36,7 @@ pub mod runbooks;
 mod ssh;
 mod tools;
 mod ui;
+mod workspace_lifecycle;
 mod workspace_ui;
 mod worktrees;
 
@@ -272,6 +273,7 @@ pub struct Workspace {
     /// The layout retained while closing or closed, independent of the remaining processes.
     pub kept: Option<persist::WorkspaceSnap>,
     pub close_error: Option<String>,
+    pub delete_pending: bool,
     pub active: usize,
     /// The definition file it is linked to (see [`Workspace::set_definition`]): the one it was
     /// started from, or first saved to.
@@ -331,7 +333,9 @@ impl Workspace {
     }
 
     pub fn status(&self) -> &'static str {
-        if self.close_error.is_some() {
+        if self.delete_pending {
+            if self.close_error.is_some() { "Delete failed" } else { "Deleting" }
+        } else if self.close_error.is_some() {
             if self.closed() { "Programs stopped · Save failed" } else { "Open · Close failed" }
         } else if self.closed() {
             "Closed"
@@ -596,6 +600,8 @@ pub struct Server {
     pub scrollback: HashMap<PaneId, persist::SavedScrollback>,
     /// The saved workspaces that could not be restored: saved again as they were.
     pub unrestored: Vec<persist::WorkspaceSnap>,
+    pub deleted_workspaces: Vec<persist::DeletedWorkspace>,
+    pub removed_sources: Vec<PathBuf>,
     /// Starts the names of the scrollback files this server makes, so that none is a file an
     /// earlier server's state names.
     scrollback_tag: String,
@@ -927,6 +933,8 @@ pub fn run(session: &str) -> Result<()> {
         persisted: None,
         scrollback: HashMap::new(),
         unrestored: Vec::new(),
+        deleted_workspaces: Vec::new(),
+        removed_sources: Vec::new(),
         scrollback_tag: format!("{}-{}", crate::accounts::now(), std::process::id()),
         run_logs: {
             let warn = logs_tx;
@@ -2131,6 +2139,8 @@ mod tests {
             persisted: None,
             scrollback: HashMap::new(),
             unrestored: Vec::new(),
+            deleted_workspaces: Vec::new(),
+            removed_sources: Vec::new(),
             scrollback_tag: format!("{}-{}", crate::accounts::now(), std::process::id()),
             run_logs: crossbeam_channel::unbounded().0,
         }

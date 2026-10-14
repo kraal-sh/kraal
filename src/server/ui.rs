@@ -120,6 +120,11 @@ pub enum ConfirmAction {
         inventory: super::persistence::CloseInventory,
     },
     RetryCloseWorkspace(u32),
+    DeleteWorkspace {
+        target: super::workspace_lifecycle::DeleteTarget,
+        stop: bool,
+    },
+    RetryDeleteWorkspace(super::workspace_lifecycle::DeleteTarget),
     OpenWorkspace(PickAction),
     /// Restart the session on the kraal installed now.
     Restart,
@@ -190,6 +195,8 @@ impl ConfirmAction {
             ConfirmAction::ClosePane(_) => "Close pane".into(),
             ConfirmAction::CloseTab { .. } => "Close tab".into(),
             ConfirmAction::CloseWorkspace { .. } => "Stop and close".into(),
+            ConfirmAction::DeleteWorkspace { stop, .. } => if *stop { "Stop and delete" } else { "Delete" }.into(),
+            ConfirmAction::RetryDeleteWorkspace(_) => "Retry".into(),
             ConfirmAction::RetryCloseWorkspace(_) | ConfirmAction::OpenWorkspace(_) => "Retry".into(),
             ConfirmAction::Restart => "Restart".into(),
             ConfirmAction::Quit => "Quit".into(),
@@ -248,6 +255,7 @@ pub enum PickerKind {
     /// Every command, to search and run.
     Commands,
     Workspace,
+    DeletedWorkspaces,
     Ssh,
     Pane,
     Agent,
@@ -283,6 +291,9 @@ pub enum PickAction {
     SwitchWorkspace(u32),
     ReopenWorkspace(u32),
     RetryWorkspaceClose(u32),
+    RetryWorkspaceDelete(u32),
+    DeletedWorkspaces,
+    RestoreWorkspace(String),
     /// A definition not running, by its file.
     OpenDefinition(std::path::PathBuf),
     AddWorkspace,
@@ -350,7 +361,10 @@ pub enum PickAction {
 impl PickAction {
     pub fn workspace(&self) -> Option<u32> {
         match self {
-            Self::SwitchWorkspace(ws) | Self::ReopenWorkspace(ws) | Self::RetryWorkspaceClose(ws) => Some(*ws),
+            Self::SwitchWorkspace(ws)
+            | Self::ReopenWorkspace(ws)
+            | Self::RetryWorkspaceClose(ws)
+            | Self::RetryWorkspaceDelete(ws) => Some(*ws),
             _ => None,
         }
     }
@@ -402,9 +416,13 @@ pub struct Picker {
     pub loading: Option<u32>,
     pub worktree: bool,
     pub message: Option<String>,
+    pub undo: Option<String>,
+    pub back: Option<Box<PickerState>>,
 }
 
+#[derive(Clone)]
 pub struct PickerState {
+    pub kind: PickerKind,
     query: String,
     cursor: usize,
     selected: Option<String>,
@@ -412,6 +430,9 @@ pub struct PickerState {
     definition: Option<std::path::PathBuf>,
     message: Option<String>,
     min_items: usize,
+    undo: Option<String>,
+    back: Option<Box<PickerState>>,
+    restored: Option<String>,
 }
 
 impl Picker {
@@ -422,7 +443,7 @@ impl Picker {
             query: String::new(),
             cursor: 0,
             min_items: items.len(),
-            two_line: matches!(kind, PickerKind::Accounts | PickerKind::Workspace),
+            two_line: matches!(kind, PickerKind::Accounts | PickerKind::Workspace | PickerKind::DeletedWorkspaces),
             pinned: items.iter().position(|i| matches!(i.action, PickAction::AddAccount | PickAction::AddWorkspace)),
             items,
             filtered: Vec::new(),
@@ -431,6 +452,8 @@ impl Picker {
             loading: None,
             worktree: false,
             message: None,
+            undo: None,
+            back: None,
         };
         p.refilter();
         p
@@ -438,6 +461,7 @@ impl Picker {
 
     pub fn state(&self) -> PickerState {
         PickerState {
+            kind: self.kind,
             query: self.query.clone(),
             cursor: self.cursor,
             selected: self.current().map(|i| i.label.clone()),
@@ -448,16 +472,26 @@ impl Picker {
             }),
             message: self.message.clone(),
             min_items: self.min_items,
+            undo: self.undo.clone(),
+            back: self.back.clone(),
+            restored: self.current().and_then(|i| match &i.action {
+                PickAction::RestoreWorkspace(id) => Some(id.clone()),
+                _ => None,
+            }),
         }
     }
 
     pub fn restore(&mut self, state: PickerState) {
         self.min_items = self.min_items.max(state.min_items);
         self.message = state.message;
+        self.undo = state.undo;
+        self.back = state.back;
         self.query = state.query;
         self.cursor = state.cursor;
         self.refilter();
-        if let Some(ws) = state.workspace {
+        if let Some(id) = state.restored {
+            self.select(|i| matches!(&i.action, PickAction::RestoreWorkspace(w) if *w == id));
+        } else if let Some(ws) = state.workspace {
             self.select(|i| i.action.workspace() == Some(ws));
         } else if let Some(path) = state.definition {
             self.select(|i| matches!(&i.action, PickAction::OpenDefinition(p) if p == &path));
@@ -475,7 +509,7 @@ impl Picker {
         Mode::Picker(self)
     }
 
-    /// Actions offered by Tab, with the keys that run them.
+    /// An empty key keeps a destructive action in the menu without adding a direct shortcut.
     pub fn action_keys(&self) -> &'static [(&'static str, &'static str)] {
         use PickAction as A;
         use PickerKind as K;
@@ -506,9 +540,14 @@ impl Picker {
             (_, A::UseExisting { .. }) => &[("enter", "Choose")],
             (_, A::AddAccount) => &[("enter", "Add account")],
             (K::Workspace, A::RetryWorkspaceClose(_)) => &[("enter", "Retry Close")],
-            (K::Workspace, A::ReopenWorkspace(_)) => &[("enter", "Open"), ("ctrl+r", "Rename")],
-            (K::Workspace, A::SwitchWorkspace(_)) => &[("enter", "Open"), ("ctrl+r", "Rename"), ("ctrl+x", "Close")],
-            (_, A::OpenDefinition(_)) => &[("enter", "Open")],
+            (K::Workspace, A::RetryWorkspaceDelete(_)) => &[("enter", "Retry Delete")],
+            (K::Workspace, A::ReopenWorkspace(_)) => &[("enter", "Open"), ("ctrl+r", "Rename"), ("", "Delete")],
+            (K::Workspace, A::SwitchWorkspace(_)) => {
+                &[("enter", "Open"), ("ctrl+r", "Rename"), ("ctrl+x", "Close"), ("", "Delete")]
+            }
+            (_, A::OpenDefinition(_)) => &[("enter", "Open"), ("", "Delete")],
+            (_, A::DeletedWorkspaces) => &[("enter", "View")],
+            (_, A::RestoreWorkspace(_)) => &[("enter", "Restore")],
             (_, A::AddWorkspace) => &[("enter", "Add")],
             (K::Runbook, A::Runbook(_)) => &[("enter", "Run"), ("ctrl+e", "Edit")],
             (K::RunbookSteps, A::RunBlock(_)) => &[("enter", "Run step"), ("ctrl+y", "Copy step")],
@@ -540,6 +579,9 @@ impl Picker {
             .enumerate()
             .filter(|(i, _)| Some(*i) != self.pinned)
             .filter_map(|(i, it)| {
+                if matches!(it.action, PickAction::DeletedWorkspaces) {
+                    return Some((i32::MIN, i));
+                }
                 // The label matters most; details only rescue items whose label does not match.
                 fuzzy_score(&self.query, &it.label)
                     .or_else(|| fuzzy_score(&self.query, &it.detail).map(|s| s - 1000))
@@ -590,6 +632,7 @@ pub enum PromptAction {
     },
     RenamePane(PaneId),
     RenameWorkspace(u32),
+    RestoreWorkspace(String),
     /// The value is the new workspace's name.
     NewWorkspace,
     OpenPreview,
@@ -641,6 +684,7 @@ impl PromptAction {
             | PromptAction::RenameWorkspace(_)
             | PromptAction::RenameAccount { .. } => "rename",
             PromptAction::NewWorkspace | PromptAction::NewWorktree { .. } => "create",
+            PromptAction::RestoreWorkspace(_) => "restore",
             PromptAction::OpenPreview => "open",
             PromptAction::SaveWorkspace(_) => "save",
             PromptAction::Upload { .. } | PromptAction::UploadPick { .. } => "upload",
@@ -673,8 +717,11 @@ impl Prompt {
             title: title.into(),
             value: value.into(),
             cursor: value.chars().count(),
-            workspace_form: matches!(action, PromptAction::NewWorkspace | PromptAction::RenameWorkspace(_))
-                .then(super::workspace_ui::WorkspaceForm::default),
+            workspace_form: matches!(
+                action,
+                PromptAction::NewWorkspace | PromptAction::RenameWorkspace(_) | PromptAction::RestoreWorkspace(_)
+            )
+            .then(super::workspace_ui::WorkspaceForm::default),
             action,
             error: None,
             scroll: 0,
@@ -1040,9 +1087,9 @@ mod tests {
             (
                 PickerKind::Workspace,
                 PickAction::SwitchWorkspace(1),
-                &[("enter", "Open"), ("ctrl+r", "Rename"), ("ctrl+x", "Close")],
+                &[("enter", "Open"), ("ctrl+r", "Rename"), ("ctrl+x", "Close"), ("", "Delete")],
             ),
-            (PickerKind::Workspace, PickAction::OpenDefinition("w.kdl".into()), &[("enter", "Open")]),
+            (PickerKind::Workspace, PickAction::OpenDefinition("w.kdl".into()), &[("enter", "Open"), ("", "Delete")]),
             (PickerKind::RunbookSteps, PickAction::RunBlock(0), &[("enter", "Run step"), ("ctrl+y", "Copy step")]),
             (PickerKind::RunbookSteps, PickAction::RunbookList, &[("enter", "Back to runbooks")]),
             (

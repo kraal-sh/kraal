@@ -304,9 +304,28 @@ pub fn load_file(path: &Path) -> Result<WorkspaceDef> {
     parse_workspace(&name, &src).with_context(|| format!("parsing {}", path.display()))
 }
 
-/// Bind old labels before a rename or removal. Insert at source spans: serializing a v1
-/// document through the v2 parser can move comments and change how its booleans are read.
+/// Bind old labels before a rename or removal, keeping the source formatting.
 pub fn bind_accounts(path: &Path, accounts: &crate::accounts::Accounts) -> Result<()> {
+    // Unrelated definitions may be read-only. Require a lock only when something needs binding,
+    // then read again under it: a save may have replaced the definition since this first look.
+    let source = fs::read_to_string(path)?;
+    if bind_source_accounts(&source, accounts)? == source {
+        return Ok(());
+    }
+    let target = fs::canonicalize(path)?;
+    crate::paths::locked(&target, || {
+        let source = fs::read_to_string(&target)?;
+        let bound = bind_source_accounts(&source, accounts)?;
+        if bound != source {
+            crate::paths::write_atomic(&target, bound.as_bytes())?;
+        }
+        Ok(())
+    })?
+}
+
+/// Bind a retained recipe without writing its external file. Insert at source spans:
+/// serializing a v1 document through the v2 parser can change comments and booleans.
+pub fn bind_source_accounts(source: &str, accounts: &crate::accounts::Accounts) -> Result<String> {
     fn bindings(doc: &KdlDocument, accounts: &crate::accounts::Accounts) -> Vec<(usize, String)> {
         let mut out = Vec::new();
         for node in doc.nodes() {
@@ -325,26 +344,16 @@ pub fn bind_accounts(path: &Path, accounts: &crate::accounts::Accounts) -> Resul
         }
         out
     }
-    // Unrelated definitions may be read-only. Require a lock only when something needs binding,
-    // then read again under it: a save may have replaced the definition since this first look.
-    let source = fs::read_to_string(path)?;
-    if bindings(&parse_kdl(&source)?, accounts).is_empty() {
-        return Ok(());
-    }
-    let target = fs::canonicalize(path)?;
-    crate::paths::locked(&target, || {
-        let mut source = fs::read_to_string(&target)?;
-        let mut insertions = bindings(&parse_kdl(&source)?, accounts);
-        if !insertions.is_empty() {
-            insertions.sort_by_key(|(offset, _)| *offset);
-            for (offset, text) in insertions.into_iter().rev() {
-                source.insert_str(offset, &text);
-            }
-            parse_kdl(&source).context("checking migrated workspace accounts")?;
-            crate::paths::write_atomic(&target, source.as_bytes())?;
+    let mut insertions = bindings(&parse_kdl(source)?, accounts);
+    let mut source = source.to_string();
+    if !insertions.is_empty() {
+        insertions.sort_by_key(|(offset, _)| *offset);
+        for (offset, text) in insertions.into_iter().rev() {
+            source.insert_str(offset, &text);
         }
-        Ok(())
-    })?
+        parse_kdl(&source).context("checking migrated workspace accounts")?;
+    }
+    Ok(source)
 }
 
 /// Save the revision that was loaded or confirmed, keeping the replaced file beside it.

@@ -66,7 +66,12 @@ impl Server {
         self.last_persist = Instant::now();
         // Nothing to save before a session exists. Once one was queued, an empty state may
         // need to replace it, including a rollback of the first workspace's creation.
-        if self.workspaces.is_empty() && self.unrestored.is_empty() && self.persisted.is_none() {
+        if self.workspaces.is_empty()
+            && self.unrestored.is_empty()
+            && self.deleted_workspaces.is_empty()
+            && self.removed_sources.is_empty()
+            && self.persisted.is_none()
+        {
             return;
         }
         // Turned off: nothing is saved, and what was goes once this state is written.
@@ -186,17 +191,24 @@ impl Server {
             let closing: Vec<_> = self
                 .workspaces
                 .iter()
-                .filter(|w| w.kept.as_ref().is_some_and(|s| s.close_pending.is_some()))
+                .filter(|w| w.delete_pending || w.kept.as_ref().is_some_and(|s| s.close_pending.is_some()))
                 .map(|w| w.id)
                 .collect();
             for ws in closing {
-                if let Err(e) = self.keep_and_close_workspace(ws) {
+                let deleting = self.ws_index(ws).is_some_and(|wi| self.workspaces[wi].delete_pending);
+                let result = if deleting {
+                    self.keep_and_delete_workspace(ws).map(|_| ())
+                } else {
+                    self.keep_and_close_workspace(ws)
+                };
+                if let Err(e) = result {
                     if let Some(wi) = self.ws_index(ws) {
                         self.workspaces[wi].close_error = Some(e.clone());
                     }
                     self.warnings.push(e);
                 }
             }
+            self.scan_definitions();
         }
         Ok(())
     }
@@ -230,6 +242,9 @@ impl Server {
 
     pub(super) fn ask_close_workspace(&mut self, client: ClientId, ws: u32) -> Mode {
         let Some(wi) = self.ws_index(ws) else { return Mode::Normal };
+        if self.workspaces[wi].delete_pending {
+            return self.ask_delete_workspace(super::workspace_lifecycle::DeleteTarget::Workspace(ws));
+        }
         if self.workspaces[wi].close_error.is_some() && self.workspaces[wi].kept.is_some() {
             return self.close_workspace(client, ws);
         }
@@ -273,7 +288,7 @@ impl Server {
     }
 
     /// What quitting or restarting the session, or closing just `workspace`, stops.
-    fn stops(&self, workspace: Option<u32>) -> Option<String> {
+    pub(super) fn stops(&self, workspace: Option<u32>) -> Option<String> {
         let mut lines = Vec::new();
         for id in self.workspaces.iter().filter(|w| workspace.is_none_or(|id| w.id == id)).flat_map(|w| w.panes()) {
             let Some(pane) = self.panes.get(&id) else { continue };

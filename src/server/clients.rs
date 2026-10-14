@@ -197,15 +197,16 @@ impl Server {
                 Err(e) => self.warnings.push(format!("{e:#}")),
             }
         }
-        if self.workspaces.is_empty() {
+        if self.workspaces.is_empty() && self.deleted_workspaces.is_empty() && self.removed_sources.is_empty() {
             let ws = self.new_workspace("main".into(), None);
             if let Err(e) = self.spawn_pane_in(ws, None, PaneSpec::default(), crate::protocol::Placement::Tab, None) {
                 self.send_msg(id, &ServerMsg::exit(format!("cannot start a shell: {e:#}")));
                 return;
             }
         }
-        let ws =
-            target.unwrap_or_else(|| self.workspaces.iter().find(|w| !w.closed()).unwrap_or(&self.workspaces[0]).id);
+        let ws = target.unwrap_or_else(|| {
+            self.workspaces.iter().find(|w| !w.closed()).or(self.workspaces.first()).map_or(0, |w| w.id)
+        });
         let mode = self.workspaces.iter().all(|w| w.closed()).then(|| Mode::Picker(self.workspace_picker(ws)));
         let welcome = !crate::paths::state_dir().join("welcomed").exists();
         // Before anything is drawn: what this server is.

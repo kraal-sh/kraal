@@ -29,8 +29,19 @@ const VERSION: u32 = 2;
 pub struct SessionSnapshot {
     pub version: u32,
     pub workspaces: Vec<WorkspaceSnap>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub deleted_workspaces: Vec<DeletedWorkspace>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub removed_sources: Vec<PathBuf>,
     #[serde(default)]
     pub tunnels: Vec<crate::server::net::TunnelSpec>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeletedWorkspace {
+    pub workspace: WorkspaceSnap,
+    pub position: usize,
+    pub deleted_at: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -51,6 +62,11 @@ pub struct WorkspaceSnap {
     /// Process identities retained before signalling, so interrupted closes can finish safely.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub close_pending: Option<CloseIntent>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub delete_pending: bool,
+    /// An unimported source stays recoverable even if the external file changes or disappears.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub unopened: bool,
     #[serde(default)]
     pub sync: crate::server::SyncScope,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -107,6 +123,13 @@ impl WorkspaceSnap {
     }
 
     pub fn counts(&self) -> (usize, usize) {
+        if self.unopened {
+            return self
+                .definition_source
+                .as_deref()
+                .and_then(|s| crate::workspace::parse_workspace(&self.name, s).ok())
+                .map_or((0, 0), |d| (d.tabs.len(), d.panes().len()));
+        }
         fn panes(node: &NodeSnap) -> usize {
             match node {
                 NodeSnap::Pane(_) => 1,
@@ -258,6 +281,7 @@ pub fn snapshot(server: &Server) -> SessionSnapshot {
                 kept.name = ws.name.clone();
                 kept.definition = ws.definition.clone();
                 kept.definition_source = ws.definition_source.clone();
+                kept.delete_pending = ws.delete_pending;
                 return kept;
             }
             let mut saved = WorkspaceSnap {
@@ -273,6 +297,8 @@ pub fn snapshot(server: &Server) -> SessionSnapshot {
                 closed: false,
                 empty: false,
                 close_pending: None,
+                delete_pending: ws.delete_pending,
+                unopened: false,
                 tabs: ws
                     .tabs
                     .iter()
@@ -308,12 +334,22 @@ pub fn snapshot(server: &Server) -> SessionSnapshot {
         })
         .chain(server.unrestored.iter().cloned())
         .collect();
+    let mut deleted_workspaces = server.deleted_workspaces.clone();
+    for deleted in &mut deleted_workspaces {
+        deleted.workspace.bind_accounts(&server.accounts);
+    }
     if !server.config.save_scrollback {
-        for ws in &mut workspaces {
+        for ws in workspaces.iter_mut().chain(deleted_workspaces.iter_mut().map(|d| &mut d.workspace)) {
             ws.clear_scrollback();
         }
     }
-    SessionSnapshot { version: VERSION, workspaces, tunnels: server.tunnels.iter().map(|t| t.spec.clone()).collect() }
+    SessionSnapshot {
+        version: VERSION,
+        workspaces,
+        deleted_workspaces,
+        removed_sources: server.removed_sources.clone(),
+        tunnels: server.tunnels.iter().map(|t| t.spec.clone()).collect(),
+    }
 }
 
 /// Write the state, in place once a crash of the machine cannot undo it (and so the scrollback
@@ -366,9 +402,10 @@ fn bind_saved_accounts(source: &[u8], accounts: &crate::accounts::Accounts) -> R
             return false;
         }
         accounts.bind_pane(&mut pane);
-        spec["account_id"] = serde_json::json!(pane.account_id);
-        spec["account"] = serde_json::json!(pane.account);
-        spec["env"] = serde_json::json!(pane.env);
+        let Some(spec) = spec.as_object_mut() else { return false };
+        spec.insert("account_id".into(), serde_json::json!(pane.account_id));
+        spec.insert("account".into(), serde_json::json!(pane.account));
+        spec.insert("env".into(), serde_json::json!(pane.env));
         true
     }
     fn node(value: &mut serde_json::Value, accounts: &crate::accounts::Accounts) -> bool {
@@ -380,18 +417,34 @@ fn bind_saved_accounts(source: &[u8], accounts: &crate::accounts::Accounts) -> R
             value.get_mut("Split").and_then(|s| s.get_mut("children")).and_then(serde_json::Value::as_array_mut)
         {
             for child in children {
-                changed |= node(&mut child[0], accounts);
+                if let Some(child) = child.get_mut(0) {
+                    changed |= node(child, accounts);
+                }
+            }
+        }
+        changed
+    }
+    fn workspace(value: &mut serde_json::Value, accounts: &crate::accounts::Accounts) -> bool {
+        let mut changed = false;
+        for tab in value.get_mut("tabs").and_then(serde_json::Value::as_array_mut).into_iter().flatten() {
+            if let Some(root) = tab.get_mut("root") {
+                changed |= node(root, accounts);
+            }
+            for floating in tab.get_mut("floating").and_then(serde_json::Value::as_array_mut).into_iter().flatten() {
+                if let Some(floating) = floating.get_mut(0) {
+                    changed |= pane(floating, accounts);
+                }
             }
         }
         changed
     }
     let mut changed = false;
-    for workspace in value["workspaces"].as_array_mut().into_iter().flatten() {
-        for tab in workspace["tabs"].as_array_mut().into_iter().flatten() {
-            changed |= node(&mut tab["root"], accounts);
-            for floating in tab["floating"].as_array_mut().into_iter().flatten() {
-                changed |= pane(&mut floating[0], accounts);
-            }
+    for saved in value.get_mut("workspaces").and_then(serde_json::Value::as_array_mut).into_iter().flatten() {
+        changed |= workspace(saved, accounts);
+    }
+    for deleted in value.get_mut("deleted_workspaces").and_then(serde_json::Value::as_array_mut).into_iter().flatten() {
+        if let Some(saved) = deleted.get_mut("workspace") {
+            changed |= workspace(saved, accounts);
         }
     }
     if changed { Ok(Some(serde_json::to_vec_pretty(&value)?)) } else { Ok(None) }
@@ -432,7 +485,8 @@ pub fn scrollback_files(snap: &SessionSnapshot) -> HashSet<&str> {
         }
     }
     let mut out = HashSet::new();
-    for tab in snap.workspaces.iter().flat_map(|w| &w.tabs) {
+    for tab in snap.workspaces.iter().chain(snap.deleted_workspaces.iter().map(|d| &d.workspace)).flat_map(|w| &w.tabs)
+    {
         if let Some(root) = &tab.root {
             walk(root, &mut out);
         }
@@ -553,7 +607,7 @@ fn parse(data: &[u8]) -> Result<SessionSnapshot> {
 
 fn validate(snap: &SessionSnapshot, data: &[u8], missing_ids: bool) -> Result<()> {
     let mut ids = HashSet::new();
-    for ws in &snap.workspaces {
+    for ws in snap.workspaces.iter().chain(snap.deleted_workspaces.iter().map(|d| &d.workspace)) {
         if missing_ids && ws.id.is_empty() {
             continue;
         }
@@ -566,12 +620,22 @@ fn validate(snap: &SessionSnapshot, data: &[u8], missing_ids: bool) -> Result<()
     }
     let value: serde_json::Value = serde_json::from_slice(data)?;
     let state = value.as_object().context("saved session must be an object")?;
-    for ws in
-        state.get("workspaces").and_then(serde_json::Value::as_array).context("saved workspaces must be an array")?
-    {
+    fn workspace(ws: &serde_json::Value) -> Result<()> {
         let ws = ws.as_object().context("saved workspace must be an object")?;
         for tab in ws.get("tabs").and_then(serde_json::Value::as_array).context("saved tabs must be an array")? {
             tab.as_object().context("saved tab must be an object")?;
+        }
+        Ok(())
+    }
+    for ws in
+        state.get("workspaces").and_then(serde_json::Value::as_array).context("saved workspaces must be an array")?
+    {
+        workspace(ws)?;
+    }
+    if let Some(deleted) = state.get("deleted_workspaces") {
+        for deleted in deleted.as_array().context("saved deleted workspaces must be an array")? {
+            let deleted = deleted.as_object().context("saved deleted workspace must be an object")?;
+            workspace(deleted.get("workspace").context("saved deleted workspace must contain a workspace")?)?;
         }
     }
     Ok(())
@@ -681,6 +745,11 @@ pub fn resume_command(agent: &str, session: &str) -> Option<String> {
 }
 
 pub fn apply(server: &mut Server, snap: SessionSnapshot) -> Result<()> {
+    server.deleted_workspaces = snap.deleted_workspaces;
+    server.removed_sources = snap.removed_sources;
+    for deleted in &mut server.deleted_workspaces {
+        deleted.workspace.bind_accounts(&server.accounts);
+    }
     for t in &snap.tunnels {
         let host = if t.remote_host.contains(':') { format!("[{}]", t.remote_host) } else { t.remote_host.clone() };
         let remote = format!("{host}:{}", t.remote_port);
@@ -714,14 +783,15 @@ pub fn apply(server: &mut Server, snap: SessionSnapshot) -> Result<()> {
     Ok(())
 }
 
-fn apply_workspace(server: &mut Server, ws: &WorkspaceSnap) -> Result<()> {
+pub(crate) fn apply_workspace(server: &mut Server, ws: &WorkspaceSnap) -> Result<()> {
     let id = server.new_workspace(ws.name.clone(), ws.definition.clone());
     let wi = server.ws_index(id).unwrap();
     server.workspaces[wi].stable_id = ws.id.clone();
     server.workspaces[wi].name = ws.name.clone();
     server.workspaces[wi].cwd = ws.cwd.clone();
     server.workspaces[wi].definition_source = ws.definition_source.clone();
-    if ws.closed || ws.close_pending.is_some() {
+    server.workspaces[wi].delete_pending = ws.delete_pending;
+    if ws.closed || ws.close_pending.is_some() || ws.delete_pending {
         server.workspaces[wi].kept = Some(ws.clone());
     } else {
         restore_workspace_tabs(server, wi, ws)?;
@@ -945,18 +1015,54 @@ mod tests {
         let source = saved_state();
         let mut workspace = source.clone();
         workspace["workspaces"][0] =
-            serde_json::json!(["kept", "same", null, null, null, 0, [], false, false, null, "off", null]);
+            serde_json::json!(["kept", "same", null, null, null, 0, [], false, false, null, false, false, "off", null]);
         let mut tab = source.clone();
         tab["workspaces"][0]["tabs"][0] = serde_json::json!(["tab 1", null, [], null, false, false, false, null]);
+        let deleted = |workspace: serde_json::Value| {
+            let mut value = source.clone();
+            value["workspaces"] = serde_json::json!([]);
+            value["deleted_workspaces"] = serde_json::json!([{
+                "workspace": workspace, "position": 0, "deleted_at": 1
+            }]);
+            value
+        };
+        let mut record = deleted(source["workspaces"][0].clone());
+        record["deleted_workspaces"][0] = serde_json::json!([source["workspaces"][0], 0, 1]);
+        let deleted_workspace = deleted(workspace["workspaces"][0].clone());
+        let deleted_tab = deleted(tab["workspaces"][0].clone());
         for (value, reason) in [
             (serde_json::json!([VERSION, [], []]), "session must be an object"),
             (workspace, "workspace must be an object"),
             (tab, "tab must be an object"),
+            (record, "deleted workspace must be an object"),
+            (deleted_workspace, "workspace must be an object"),
+            (deleted_tab, "tab must be an object"),
         ] {
             let bytes = serde_json::to_vec(&value).unwrap();
             assert!(serde_json::from_slice::<SessionSnapshot>(&bytes).is_ok(), "Serde accepts positional structs");
             assert_state_refused(&bytes, reason);
+            assert!(bind_saved_accounts(&bytes, &crate::accounts::Accounts::empty()).unwrap().is_none());
         }
+    }
+
+    #[test]
+    fn deletion_records_are_optional_and_share_the_workspace_identity_checks() {
+        let original = saved_state();
+        let old = parse(&serde_json::to_vec(&original).unwrap()).unwrap();
+        assert!(old.deleted_workspaces.is_empty());
+        assert!(old.removed_sources.is_empty());
+        let mut deleted = original.clone();
+        let mut workspace = deleted["workspaces"][0].clone();
+        workspace["closed"] = true.into();
+        deleted["deleted_workspaces"] = serde_json::json!([{"workspace": workspace, "position": 0, "deleted_at": 1}]);
+        assert_state_refused(&serde_json::to_vec(&deleted).unwrap(), "duplicate workspace identity");
+        deleted["workspaces"] = serde_json::json!([]);
+        deleted["removed_sources"] = serde_json::json!(["/kept/api.kdl"]);
+        let snap = parse(&serde_json::to_vec(&deleted).unwrap()).unwrap();
+        assert!(snap.workspaces.is_empty());
+        assert_eq!(snap.deleted_workspaces.len(), 1);
+        assert_eq!(snap.deleted_workspaces[0].workspace.name, old.workspaces[0].name);
+        assert_eq!(snap.removed_sources, [PathBuf::from("/kept/api.kdl")]);
     }
 
     #[test]
@@ -988,6 +1094,18 @@ mod tests {
         let restored: SessionSnapshot = serde_json::from_slice(&bytes).unwrap();
         let NodeSnap::Pane(pane) = restored.workspaces[0].tabs[0].root.as_ref().unwrap() else { panic!("pane") };
         assert_eq!(pane.spec.account_id.as_deref(), Some("default-claude"));
+        let mut deleted = source.clone();
+        deleted["deleted_workspaces"] = serde_json::json!([{
+            "workspace": source["workspaces"][0], "position": 0, "deleted_at": 1
+        }]);
+        deleted["workspaces"] = serde_json::json!([]);
+        let bytes = bind_saved_accounts(&serde_json::to_vec(&deleted).unwrap(), &accounts).unwrap().unwrap();
+        let migrated: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            migrated["deleted_workspaces"][0]["workspace"]["tabs"][0]["root"]["Pane"]["spec"]["account_id"],
+            "default-claude"
+        );
+        assert_eq!(migrated["future"], source["future"]);
     }
 
     fn stopping_pane(fields: serde_json::Value) -> crate::protocol::PaneInfo {

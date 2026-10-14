@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 
-use super::ui::{Mode, Picker, PickerState, Prompt, PromptAction};
+use super::ui::{Mode, Picker, PickerKind, PickerState, Prompt, PromptAction};
 use super::{ClientId, Server, forms, overlays};
 use crate::ansi::Cursor;
 use crate::input::InputEvent;
@@ -22,7 +22,9 @@ pub struct WorkspaceForm {
 }
 
 fn verb(p: &Prompt) -> &'static str {
-    if p.error.is_some() && !p.workspace_form.as_ref().is_some_and(|f| f.invalid_name) {
+    if matches!(p.action, PromptAction::RestoreWorkspace(_)) {
+        "Restore"
+    } else if p.error.is_some() && !p.workspace_form.as_ref().is_some_and(|f| f.invalid_name) {
         "Retry"
     } else if matches!(p.action, PromptAction::NewWorkspace) {
         "Add"
@@ -84,7 +86,13 @@ impl Server {
             }
             Mode::Picker(mut p) => {
                 let workspace = p.current().and_then(|i| i.action.workspace());
+                let message = p.message.clone();
+                let undo = p.undo.clone();
                 p.restore(state);
+                if message.is_some() {
+                    p.message = message;
+                    p.undo = undo;
+                }
                 if let Some(ws) = workspace {
                     select_workspace(&mut p, ws);
                 }
@@ -124,13 +132,17 @@ impl Server {
         Mode::Prompt(p)
     }
 
-    fn workspace_name_used(&self, name: &str, except: Option<u32>) -> bool {
+    pub(super) fn workspace_name_used(&self, name: &str, except: Option<u32>) -> bool {
         self.workspaces.iter().any(|w| Some(w.id) != except && w.name == name)
             || self.unrestored.iter().any(|w| w.name == name)
             || self.definitions().iter().any(|(path, def)| {
                 !matches!(self.definition_workspace(path), Ok(Some(_)))
                     && def.as_ref().map_or_else(|_| path.file_stem().is_some_and(|s| s == name), |def| def.name == name)
             })
+    }
+
+    pub(super) fn workspace_restore_back(&self, p: &mut Prompt, from: Option<&Picker>) {
+        p.workspace_form.as_mut().unwrap().back = from.map(Picker::state);
     }
 
     pub(super) fn on_workspace_form(&mut self, id: ClientId, mut p: Prompt, event: InputEvent) -> Mode {
@@ -166,7 +178,11 @@ impl Server {
 
     fn workspace_form_back(&self, id: ClientId, mut p: Prompt, renamed: Option<u32>) -> Mode {
         let Some(state) = p.workspace_form.as_mut().and_then(|f| f.back.take()) else { return Mode::Normal };
-        let mut picker = self.workspace_picker(self.clients.get(&id).map_or(0, |c| c.workspace));
+        let mut picker = if state.kind == PickerKind::DeletedWorkspaces {
+            self.deleted_workspace_picker()
+        } else {
+            self.workspace_picker(self.clients.get(&id).map_or(0, |c| c.workspace))
+        };
         picker.restore(state);
         if let Some(ws) = renamed {
             select_workspace(&mut picker, ws);
@@ -178,6 +194,28 @@ impl Server {
 
     pub(super) fn submit_workspace_form(&mut self, id: ClientId, mut p: Prompt) -> Mode {
         let name = p.value.trim();
+        if let PromptAction::RestoreWorkspace(identity) = &p.action {
+            let result = if name.is_empty() {
+                Err("Type a name.".into())
+            } else {
+                self.restore_deleted_workspace(identity, name)
+            };
+            return match result {
+                Ok(ws) => {
+                    self.refresh_workspace_pickers();
+                    self.mark_dirty();
+                    self.toast(id, "Workspace restored");
+                    let mut picker = self.workspace_picker(0);
+                    picker.select(|i| i.action.workspace() == Some(ws));
+                    picker.result("Workspace restored · Enter Open")
+                }
+                Err(error) => {
+                    p.error = Some(error);
+                    p.scroll = 0;
+                    Mode::Prompt(p)
+                }
+            };
+        }
         let target = match p.action {
             PromptAction::RenameWorkspace(ws) => Some(ws),
             PromptAction::NewWorkspace => None,
