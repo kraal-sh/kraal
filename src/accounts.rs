@@ -1901,24 +1901,29 @@ impl Usage {
         self.five_hour.iter().chain(self.weekly.iter())
     }
 
-    /// Each window with the time it counts until: its reset or, when it does not say when it
+    /// Each valid window with the time it counts until: its reset or, when it does not say when it
     /// resets, the end of its period after it was seen.
-    fn ends(&self) -> impl Iterator<Item = (&Window, i64)> {
+    fn valid_windows(&self, now: i64) -> impl Iterator<Item = (&Window, i64)> {
         let end = |w: &Window, period: i64| w.resets_at.unwrap_or(self.observed_at.saturating_add(period));
         let five = self.five_hour.iter().map(move |w| (w, end(w, 5 * 3600)));
         let week = self.weekly.iter().map(move |w| (w, end(w, 7 * 24 * 3600)));
-        five.chain(week)
+        five.chain(week).filter(move |(_, end)| *end > now)
+    }
+
+    /// Highest usage still counting, or `None` when no windows are valid.
+    pub fn valid_peak(&self, now: i64) -> Option<f64> {
+        self.valid_windows(now).fold(None, |peak, (w, _)| Some(peak.unwrap_or(0.0).max(w.used_percent)))
     }
 
     /// Highest usage among windows that have not reset yet.
     pub fn peak(&self, now: i64) -> f64 {
-        self.ends().filter(|(_, end)| *end > now).map(|(w, _)| w.used_percent).fold(0.0, f64::max)
+        self.valid_peak(now).unwrap_or(0.0)
     }
 
     /// When [`Usage::peak`] changes next with nothing new seen: the earliest reset of a window
     /// that counts at `now`.
     pub fn next_end(&self, now: i64) -> Option<i64> {
-        self.ends().map(|(_, end)| end).filter(|end| *end > now).min()
+        self.valid_windows(now).map(|(_, end)| end).min()
     }
 
     /// A limit message seen on the agent's screen, saying `pct` percent of a window (weekly or

@@ -8,14 +8,8 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use crate::accounts::now;
+use crate::accounts::{Usage, Window, now};
 
-#[derive(Debug, Clone)]
-pub struct Window {
-    pub used_percent: f64,
-    /// Unix seconds.
-    pub resets_at: Option<i64>,
-}
 #[derive(Debug, Clone, Default)]
 pub struct RateLimits {
     /// The window of about five hours, if reported.
@@ -25,6 +19,18 @@ pub struct RateLimits {
     /// Unix seconds when observed.
     pub observed_at: i64,
 }
+
+impl From<RateLimits> for Usage {
+    fn from(limits: RateLimits) -> Self {
+        Self {
+            five_hour: limits.five_hour,
+            weekly: limits.weekly,
+            observed_at: limits.observed_at,
+            source: "codex".into(),
+        }
+    }
+}
+
 fn field<'a>(v: &'a Value, names: &[&str]) -> Option<&'a Value> {
     names.iter().find_map(|n| v.get(n).filter(|v| !v.is_null()))
 }
@@ -320,6 +326,41 @@ mod tests {
             let _ = fs::remove_dir_all(&self.0);
         }
     }
+    #[test]
+    fn conversion_preserves_windows_and_saved_json() {
+        for (five, week, expected) in [
+            (false, false, r#"{"five_hour":null,"weekly":null,"observed_at":1000,"source":"codex"}"#),
+            (
+                true,
+                false,
+                r#"{"five_hour":{"used_percent":42.5,"resets_at":2000},"weekly":null,"observed_at":1000,"source":"codex"}"#,
+            ),
+            (
+                false,
+                true,
+                r#"{"five_hour":null,"weekly":{"used_percent":71.0,"resets_at":null},"observed_at":1000,"source":"codex"}"#,
+            ),
+            (
+                true,
+                true,
+                r#"{"five_hour":{"used_percent":42.5,"resets_at":2000},"weekly":{"used_percent":71.0,"resets_at":null},"observed_at":1000,"source":"codex"}"#,
+            ),
+        ] {
+            let limits = RateLimits {
+                five_hour: five.then_some(Window { used_percent: 42.5, resets_at: Some(2000) }),
+                weekly: week.then_some(Window { used_percent: 71.0, resets_at: None }),
+                observed_at: 1000,
+            };
+            let usage = Usage::from(limits.clone());
+            assert_eq!(usage.five_hour, limits.five_hour);
+            assert_eq!(usage.weekly, limits.weekly);
+            assert_eq!(usage.observed_at, limits.observed_at);
+            assert_eq!(usage.source, "codex");
+            assert_eq!(serde_json::to_string(&usage).unwrap(), expected);
+            assert_eq!(serde_json::from_str::<Usage>(expected).unwrap(), usage);
+        }
+    }
+
     #[test]
     fn rpc_schema_and_classification() {
         let v = json!({"accountId":"ignored", "rateLimits":{"planType":"plus", "primary":{"usedPercent":80,"windowDurationMins":10080,"resetsAt":1700000000},"secondary":{"usedPercent":12,"windowDurationMins":300,"resetsAt":"1970-01-01T01:00:00+01:00"}},"rateLimitsByLimitId":null});

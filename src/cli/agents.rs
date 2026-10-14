@@ -188,15 +188,7 @@ pub(super) fn accounts(action: AccountsCmd) -> Result<()> {
                 let home = paths::expand_tilde(&a.home);
                 match codex_usage::fetch("codex", &home, std::time::Duration::from_secs(20)) {
                     Ok(l) => {
-                        let conv = |w: Option<codex_usage::Window>| {
-                            w.map(|w| accounts::Window { used_percent: w.used_percent, resets_at: w.resets_at })
-                        };
-                        let u = accounts::Usage {
-                            five_hour: conv(l.five_hour),
-                            weekly: conv(l.weekly),
-                            observed_at: l.observed_at,
-                            source: "codex".into(),
-                        };
+                        let u = accounts::Usage::from(l);
                         accounts::save_usage(&a, &u)?;
                         println!("{:<18} {}", accounts::label(&a), server::usage_text(&u, accounts::now()));
                     }

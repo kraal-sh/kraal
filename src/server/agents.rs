@@ -1579,15 +1579,7 @@ impl Server {
                     .ok()
                     .or_else(|| crate::codex_usage::from_rollouts(&home));
                 if let Some(l) = limits {
-                    let conv = |w: Option<crate::codex_usage::Window>| {
-                        w.map(|w| accounts::Window { used_percent: w.used_percent, resets_at: w.resets_at })
-                    };
-                    let u = accounts::Usage {
-                        five_hour: conv(l.five_hour),
-                        weekly: conv(l.weekly),
-                        observed_at: l.observed_at,
-                        source: "codex".into(),
-                    };
+                    let u = accounts::Usage::from(l);
                     let _ = accounts::save_usage(&a, &u);
                 }
             }
