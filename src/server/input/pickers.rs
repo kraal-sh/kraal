@@ -580,6 +580,12 @@ impl Server {
 
     fn picker_menu_action(&mut self, id: ClientId, mut p: Picker, action: &str) -> Mode {
         match action {
+            "Duplicate" => {
+                return match p.current().and_then(|i| i.action.workspace()) {
+                    Some(ws) => self.duplicate_workspace_form(ws, &p),
+                    None => Mode::Picker(p),
+                };
+            }
             "Move up" | "Move down" => return self.move_picker_workspace(id, p, action == "Move up"),
             "Clear search to reorder" => {
                 let selected = p.current().and_then(|i| self.workspace_key(&i.action));
@@ -1361,7 +1367,7 @@ mod deletion_tests {
 }
 
 #[cfg(test)]
-mod workspace_order_tests {
+mod workspace_action_tests {
     use super::*;
     use crate::input::{InputEvent, Key, KeySpec, Mods, MouseButton, MouseEvent, MouseKind};
     use crate::pane::PaneSpec;
@@ -1373,6 +1379,48 @@ mod workspace_order_tests {
     fn key(spec: &str) -> InputEvent {
         let spec = KeySpec::parse(spec).unwrap();
         InputEvent::Key(Key { code: spec.code, mods: spec.mods, raw: Vec::new() })
+    }
+
+    #[test]
+    fn duplicate_actions_target_the_selected_open_or_closed_row_with_keyboard_and_mouse() {
+        for (cols, rows) in [(80, 24), (124, 36)] {
+            for closed in [false, true] {
+                let (tx, _rx) = crate::server::queue::channel(32);
+                let mut server = crate::server::tests::server(tx);
+                let (client, _peer) = crate::server::tests::client(&mut server);
+                let current = server.clients[&client].workspace;
+                let source = server.new_workspace("other".into(), None);
+                let c = server.clients.get_mut(&client).unwrap();
+                (c.cols, c.rows) = (cols, rows);
+                if closed {
+                    let mut kept = crate::persist::snapshot(&server).workspaces.remove(1);
+                    kept.closed = true;
+                    server.workspaces[1].kept = Some(kept);
+                }
+                for mouse in [false, true] {
+                    let mut p = server.workspace_picker(current);
+                    p.select(|i| i.action.workspace() == Some(source));
+                    let Mode::Picker(mut p) = server.on_picker(client, p, key("tab")) else { panic!() };
+                    let at = p.action_keys().iter().position(|(_, action)| *action == "Duplicate").unwrap();
+                    let event = if mouse {
+                        let layout = overlays::picker_layout(&p, server.client_screen(client));
+                        InputEvent::Mouse(MouseEvent {
+                            kind: MouseKind::Press(MouseButton::Left),
+                            col: layout.list.x + 1,
+                            row: layout.list.y + at as u16,
+                            mods: Default::default(),
+                        })
+                    } else {
+                        p.actions = Some(at);
+                        key("enter")
+                    };
+                    let Mode::Prompt(p) = server.on_picker(client, p, event) else { panic!() };
+                    assert!(matches!(p.action, PromptAction::DuplicateWorkspace(ws) if ws == source));
+                    assert_eq!(p.value, "other-copy");
+                    assert_eq!(server.clients[&client].workspace, current);
+                }
+            }
+        }
     }
 
     fn choose(server: &mut Server, client: ClientId, p: Picker, action: &str, mouse: bool) -> Mode {

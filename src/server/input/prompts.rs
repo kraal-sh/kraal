@@ -121,7 +121,10 @@ impl Server {
             PromptAction::RenamePane(pane) => {
                 self.rename_pane(pane, (!value.is_empty()).then_some(value));
             }
-            PromptAction::RenameWorkspace(_) | PromptAction::NewWorkspace | PromptAction::RestoreWorkspace(_) => {
+            PromptAction::RenameWorkspace(_)
+            | PromptAction::DuplicateWorkspace(_)
+            | PromptAction::NewWorkspace
+            | PromptAction::RestoreWorkspace(_) => {
                 unreachable!("answered in submit_prompt")
             }
             PromptAction::OpenPreview => {

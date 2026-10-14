@@ -563,9 +563,11 @@ impl Picker {
             (_, A::AddAccount) => &[("enter", "Add account")],
             (K::Workspace, A::RetryWorkspaceClose(_)) => &[("enter", "Retry Close")],
             (K::Workspace, A::RetryWorkspaceDelete(_)) => &[("enter", "Retry Delete")],
-            (K::Workspace, A::ReopenWorkspace(_)) => &[("enter", "Open"), ("ctrl+r", "Rename"), ("", "Delete")],
+            (K::Workspace, A::ReopenWorkspace(_)) => {
+                &[("enter", "Open"), ("ctrl+r", "Rename"), ("", "Duplicate"), ("", "Delete")]
+            }
             (K::Workspace, A::SwitchWorkspace(_)) => {
-                &[("enter", "Open"), ("ctrl+r", "Rename"), ("ctrl+x", "Close"), ("", "Delete")]
+                &[("enter", "Open"), ("ctrl+r", "Rename"), ("", "Duplicate"), ("ctrl+x", "Close"), ("", "Delete")]
             }
             (_, A::OpenDefinition(_)) => &[("enter", "Open"), ("", "Delete")],
             (_, A::DeletedWorkspaces) => &[("enter", "View")],
@@ -681,6 +683,7 @@ pub enum PromptAction {
     },
     RenamePane(PaneId),
     RenameWorkspace(u32),
+    DuplicateWorkspace(u32),
     RestoreWorkspace(String),
     /// The value is the new workspace's name.
     NewWorkspace,
@@ -734,6 +737,7 @@ impl PromptAction {
             | PromptAction::RenameAccount { .. } => "rename",
             PromptAction::NewWorkspace | PromptAction::NewWorktree { .. } => "create",
             PromptAction::RestoreWorkspace(_) => "restore",
+            PromptAction::DuplicateWorkspace(_) => "duplicate",
             PromptAction::OpenPreview => "open",
             PromptAction::SaveWorkspace(_) => "save",
             PromptAction::Upload { .. } | PromptAction::UploadPick { .. } => "upload",
@@ -768,7 +772,10 @@ impl Prompt {
             cursor: value.chars().count(),
             workspace_form: matches!(
                 action,
-                PromptAction::NewWorkspace | PromptAction::RenameWorkspace(_) | PromptAction::RestoreWorkspace(_)
+                PromptAction::NewWorkspace
+                    | PromptAction::RenameWorkspace(_)
+                    | PromptAction::DuplicateWorkspace(_)
+                    | PromptAction::RestoreWorkspace(_)
             )
             .then(super::workspace_ui::WorkspaceForm::default),
             action,
@@ -1139,7 +1146,7 @@ mod tests {
             (
                 PickerKind::Workspace,
                 PickAction::SwitchWorkspace(1),
-                &[("enter", "Open"), ("ctrl+r", "Rename"), ("ctrl+x", "Close"), ("", "Delete")],
+                &[("enter", "Open"), ("ctrl+r", "Rename"), ("", "Duplicate"), ("ctrl+x", "Close"), ("", "Delete")],
             ),
             (PickerKind::Workspace, PickAction::OpenDefinition("w.kdl".into()), &[("enter", "Open"), ("", "Delete")]),
             (PickerKind::RunbookSteps, PickAction::RunBlock(0), &[("enter", "Run step"), ("ctrl+y", "Copy step")]),

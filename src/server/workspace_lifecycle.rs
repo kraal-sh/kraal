@@ -1,4 +1,4 @@
-//! Recoverable deletion shares Close's durable preparation and process identity checks.
+//! Workspace copies and recoverable deletion are durable before their result is shown.
 
 use std::path::{Path, PathBuf};
 
@@ -13,6 +13,33 @@ pub enum DeleteTarget {
 }
 
 impl Server {
+    pub(super) fn duplicate_workspace(&mut self, source: u32, name: &str) -> Result<u32, String> {
+        let wi = self
+            .ws_index(source)
+            .ok_or("This workspace is no longer available. Cancel and choose another workspace.")?;
+        let workspace = &self.workspaces[wi];
+        if workspace.delete_pending || workspace.kept.as_ref().is_some_and(|s| s.close_pending.is_some()) {
+            return Err("This workspace has an unfinished Close or Delete. Cancel and finish that action, then retry Duplicate.".into());
+        }
+        let copy = crate::persist::snapshot(self).workspaces[wi]
+            .duplicate(name)
+            .map_err(|e| format!("Couldn't copy the layout. Fix the saved layout and retry.\n{e:#}"))?;
+        crate::persist::apply_workspace(self, &copy).map_err(|e| format!("Couldn't copy the workspace.\n{e:#}"))?;
+        let ws = self.workspaces.last().unwrap().id;
+        if let Err(e) = self.save_now() {
+            self.workspaces.pop();
+            // A timed-out writer can still publish the copy. Queue its removal after it.
+            if let Err(rollback) = self.save_now() {
+                self.mark_persist();
+                return Err(format!(
+                    "Couldn't save the copy or confirm its rollback. The saved session may still contain {name}.\nFix the save error and retry.\n{e}\n{rollback}"
+                ));
+            }
+            return Err(format!("Couldn't save the copy. No workspace was added.\n{e}"));
+        }
+        Ok(ws)
+    }
+
     pub(super) fn source_removed(&self, path: &Path) -> bool {
         self.removed_sources.iter().any(|p| crate::paths::same_file(p, path))
     }
@@ -378,6 +405,265 @@ mod tests {
     use crate::persist::{self, NodeSnap};
     use crate::protocol::Placement;
     use crate::server::persistence::tests::writer;
+
+    fn until(server: &mut Server, rx: &super::super::queue::EventReceiver, done: impl Fn(&Server) -> bool) {
+        let start = std::time::Instant::now();
+        loop {
+            while let Ok(event) = rx.try_recv() {
+                server.handle(event);
+            }
+            if done(server) {
+                break;
+            }
+            assert!(start.elapsed() < crate::testing::PATIENCE, "the copied pane did not reach the expected state");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn duplicate_managed_claude_recovers_its_new_conversation_without_hooks() {
+        let (tx, rx) = super::super::queue::channel(4096);
+        let mut server = super::super::tests::server(tx);
+        let path = source(&mut server);
+        let dir = path.parent().unwrap();
+        let program = dir.join("claude");
+        crate::testing::write_script(
+            &program,
+            r#"#!/bin/sh
+mkdir -p "$CLAUDE_CONFIG_DIR/projects/work"
+printf '{"message":1}\n' >> "$CLAUDE_CONFIG_DIR/projects/work/$2.jsonl"
+printf '%s\n' "$*" >> "$CLAUDE_CONFIG_DIR/args-$2"
+while IFS= read -r line; do :; done
+"#,
+        );
+        let account = server
+            .accounts
+            .add(
+                serde_json::from_value(serde_json::json!({
+                    "name": "work", "agent": "claude", "home": dir
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+        let ws = server.new_workspace("api".into(), None);
+        let mut spec = server.agent_spec(&account, Some(dir.into()), None, &[]).unwrap();
+        spec.command[0] = program.display().to_string();
+        let original = spec.session.clone().unwrap();
+        server.spawn_pane_in(ws, None, spec, Placement::Tab, None).unwrap();
+        writer(&mut server, vec![]);
+        let copied = server.duplicate_workspace(ws, "api-copy").unwrap();
+        server.reopen_workspace(copied).unwrap();
+        let pane = server.workspaces[server.ws_index(copied).unwrap()].panes()[0];
+        let session = server.panes[&pane].spec.session.clone().expect("the copy reserves its own conversation");
+        assert_ne!(session, original);
+        let launches = dir.join(format!("args-{session}"));
+        assert!(!launches.exists());
+        let (client, _peer) = super::super::tests::client(&mut server);
+        server.reveal(client, pane);
+        until(&mut server, &rx, |s| s.panes[&pane].exit_code.is_some());
+        server.client_input(client, b"\r");
+        let fresh = format!("--session-id {session}\n");
+        until(&mut server, &rx, |_| std::fs::read_to_string(&launches).is_ok_and(|s| s == fresh));
+        assert!(!server.panes[&pane].agent.hooked);
+        assert!(server.panes[&pane].agent.session_id.is_none());
+        server.keep_and_close_workspace(copied).unwrap();
+        server.reopen_workspace(copied).unwrap();
+        let resumed = format!("{fresh}--resume {session}\n");
+        until(&mut server, &rx, |_| std::fs::read_to_string(&launches).is_ok_and(|s| s == resumed));
+        let saved = persist::snapshot(&server).workspaces.remove(server.ws_index(copied).unwrap());
+        server.keep_and_close_workspace(copied).unwrap();
+        server.keep_and_close_workspace(ws).unwrap();
+        let (tx, rx) = super::super::queue::channel(4096);
+        let mut restarted = super::super::tests::server(tx);
+        restarted.accounts.add(account).unwrap();
+        persist::apply_workspace(&mut restarted, &saved).unwrap();
+        let resumed = format!("{resumed}--resume {session}\n");
+        until(&mut restarted, &rx, |_| std::fs::read_to_string(&launches).is_ok_and(|s| s == resumed));
+        writer(&mut restarted, vec![]);
+        restarted.keep_and_close_workspace(restarted.workspaces[0].id).unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn duplicate_keeps_open_closed_and_empty_sources_and_opens_with_new_panes() {
+        for (closed, empty) in [(false, false), (true, false), (false, true)] {
+            let (tx, _rx) = super::super::queue::channel(4096);
+            let mut server = super::super::tests::server(tx);
+            let path = source(&mut server);
+            let original_file = std::fs::read(&path).unwrap();
+            let def = crate::workspace::parse_workspace("api", r#"layout {
+                cwd "/tmp"
+                tab name="work" {
+                    pane stacked=true {
+                        pane name="ssh" command="ssh" start_suspended=true { args "host"; }
+                        pane name="agent" command="claude" start_suspended=true expanded=true { args "--resume" "original" "--model" "opus"; }
+                    }
+                    floating_panes { pane name="job" command="sleep" start_suspended=true { args "60"; }; }
+                }
+                tab name="tests" focus=true { pane command="cargo" start_suspended=true { args "test"; }; }
+            }"#).unwrap();
+            let ws = if empty {
+                server.new_workspace("api".into(), Some(path.clone()))
+            } else {
+                server.start_definition_inner(&def, Some(path.clone())).unwrap()
+            };
+            let saved = writer(&mut server, vec![]);
+            if closed {
+                server.keep_and_close_workspace(ws).unwrap();
+            }
+            let source_before = serde_json::to_value(persist::snapshot(&server).workspaces.remove(0)).unwrap();
+            let pane_ids: std::collections::HashSet<_> = server.panes.keys().copied().collect();
+            let tab_ids: Vec<_> = server.workspaces[0].tabs.iter().map(|t| t.id).collect();
+            let copied = server.duplicate_workspace(ws, "api-copy").unwrap();
+            assert_eq!(server.panes.keys().copied().collect::<std::collections::HashSet<_>>(), pane_ids);
+            let copy = &server.workspaces[1];
+            assert_eq!(copy.id, copied);
+            assert!(copy.closed());
+            assert_ne!(copy.stable_id, server.workspaces[0].stable_id);
+            assert!(copy.definition.is_none());
+            assert_eq!(copy.counts(), server.workspaces[0].counts());
+            let persisted = saved.lock().unwrap().last().unwrap().clone();
+            assert_eq!(persisted["workspaces"][1]["closed"], true);
+            assert_eq!(persisted["workspaces"][1]["id"], copy.stable_id);
+            assert_eq!(persisted["workspaces"][0], source_before);
+            server.reopen_workspace(copied).unwrap();
+            for tab in &server.workspaces[1].tabs {
+                assert!(!tab_ids.contains(&tab.id));
+                for id in tab.panes() {
+                    assert!(!pane_ids.contains(&id));
+                    let pane = &server.panes[&id];
+                    assert!(pane.suspended);
+                    assert!(!pane.spec.command.iter().any(|s| s == "original" || s == "--resume"));
+                    assert!(pane.agent.session_id.is_none());
+                }
+            }
+            assert_eq!(serde_json::to_value(persist::snapshot(&server).workspaces.remove(0)).unwrap(), source_before);
+            let (tx, _rx) = super::super::queue::channel(4096);
+            let mut restarted = super::super::tests::server(tx);
+            persist::apply(&mut restarted, serde_json::from_value(persisted).unwrap()).unwrap();
+            assert!(restarted.workspaces[1].closed());
+            let ws = restarted.workspaces[1].id;
+            restarted.reopen_workspace(ws).unwrap();
+            assert!(restarted.workspaces[1].tabs.iter().flat_map(|t| t.panes()).all(|p| restarted.panes[&p].suspended));
+            assert_eq!(std::fs::read(&path).unwrap(), original_file);
+            assert!(!path.with_extension("kdl.bak").exists());
+            std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+        }
+    }
+
+    #[test]
+    fn duplicate_save_failure_rolls_back_and_retry_adds_only_one_copy() {
+        for rollback_fails in [false, true] {
+            let (tx, _rx) = super::super::queue::channel(4096);
+            let mut server = super::super::tests::server(tx);
+            let ws = workspace(&mut server);
+            let before = serde_json::to_value(persist::snapshot(&server)).unwrap();
+            let saved = writer(
+                &mut server,
+                vec![Err("disk full".into()), if rollback_fails { Err("still full".into()) } else { Ok(()) }],
+            );
+            let error = server.duplicate_workspace(ws, "api-copy").unwrap_err();
+            assert!(error.contains(if rollback_fails {
+                "saved session may still contain api-copy"
+            } else {
+                "No workspace was added"
+            }));
+            assert_eq!(serde_json::to_value(persist::snapshot(&server)).unwrap(), before);
+            assert_eq!(saved.lock().unwrap().last().unwrap(), &before);
+            let copied = server.duplicate_workspace(ws, "api-copy").unwrap();
+            assert_eq!(server.workspaces.len(), 2);
+            assert!(server.workspaces[server.ws_index(copied).unwrap()].closed());
+            assert_eq!(saved.lock().unwrap().last().unwrap()["workspaces"].as_array().unwrap().len(), 2);
+        }
+    }
+
+    #[test]
+    fn duplicate_refuses_a_disappeared_source_or_unfinished_lifecycle_action() {
+        let (tx, _rx) = super::super::queue::channel(32);
+        let mut server = super::super::tests::server(tx);
+        let ws = server.new_workspace("api".into(), None);
+        server.workspaces[0].delete_pending = true;
+        assert!(server.duplicate_workspace(ws, "copy").unwrap_err().contains("finish that action"));
+        server.workspaces.clear();
+        assert!(server.duplicate_workspace(ws, "copy").unwrap_err().contains("choose another workspace"));
+        assert!(server.workspaces.is_empty());
+    }
+
+    #[test]
+    fn duplicate_of_a_restored_unimported_file_uses_its_kept_contents_and_waits() {
+        let (tx, _rx) = super::super::queue::channel(4096);
+        let mut server = super::super::tests::server(tx);
+        let path = source(&mut server);
+        writer(&mut server, vec![]);
+        let deleted = server.delete_workspace_source(&path).unwrap();
+        let restored = server.restore_deleted_workspace(&deleted, "api").unwrap();
+        std::fs::remove_file(&path).unwrap();
+        let copied = server.duplicate_workspace(restored, "api-copy").unwrap();
+        assert!(server.panes.is_empty());
+        server.reopen_workspace(copied).unwrap();
+        assert!(server.panes.values().all(|p| p.suspended));
+        assert!(server.workspaces[server.ws_index(copied).unwrap()].definition.is_none());
+        assert!(!path.exists());
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn duplicate_retained_agents_wait_for_enter_in_the_shell_and_respect_command_precedence() {
+        for (agent, command) in [("q chat", false), ("q chat", true), ("claude:missing", true)] {
+            let (tx, rx) = super::super::queue::channel(4096);
+            let mut server = super::super::tests::server(tx);
+            let path = source(&mut server);
+            let dir = path.parent().unwrap();
+            let launched = dir.join("launches");
+            crate::testing::write_script(&dir.join("q"), "#!/bin/sh\nprintf '%s\\n' \"$*\" > launches\n");
+            let shell = dir.join("shell");
+            crate::testing::write_script(
+                &shell,
+                &format!(
+                    "#!/bin/sh\nexport PATH={}:\"$PATH\"\nexec sh\n",
+                    crate::shell::quote(&dir.display().to_string())
+                ),
+            );
+            server.env.shell = shell.display().to_string();
+            let command = if command { r#"command="sh" { args "-c" "printf explicit > launches"; }"# } else { "" };
+            std::fs::write(
+                &path,
+                format!("layout {{ cwd {:?}; pane agent={agent:?} {command}; }}", dir.display().to_string()),
+            )
+            .unwrap();
+            writer(&mut server, vec![]);
+            let deleted = server.delete_workspace_source(&path).unwrap();
+            let restored = server.restore_deleted_workspace(&deleted, "api").unwrap();
+            let copied = server.duplicate_workspace(restored, "api-copy").unwrap();
+            assert!(server.panes.is_empty());
+            server.reopen_workspace(copied).unwrap();
+            let pane = server.workspaces[server.ws_index(copied).unwrap()].panes()[0];
+            assert!(server.panes[&pane].suspended);
+            assert!(!launched.exists());
+            // Saving and reopening before Enter must keep the deferred shell input too.
+            server.keep_and_close_workspace(copied).unwrap();
+            server.reopen_workspace(copied).unwrap();
+            let pane = server.workspaces[server.ws_index(copied).unwrap()].panes()[0];
+            let (client, _peer) = super::super::tests::client(&mut server);
+            server.reveal(client, pane);
+            until(&mut server, &rx, |s| s.panes[&pane].exit_code.is_some());
+            assert!(!launched.exists());
+            if command.is_empty() {
+                assert!(server.panes[&pane].text(None).contains("q chat"));
+                assert!(server.panes[&pane].spec.command.is_empty());
+                assert_eq!(server.panes[&pane].spec.startup_input.as_deref(), Some("q chat\r"));
+            } else {
+                assert_eq!(server.panes[&pane].spec.command, ["sh", "-c", "printf explicit > launches"]);
+                assert!(server.panes[&pane].spec.startup_input.is_none());
+            }
+            server.client_input(client, b"\r");
+            let expected = if command.is_empty() { "chat\n" } else { "explicit" };
+            until(&mut server, &rx, |_| std::fs::read_to_string(&launched).is_ok_and(|s| s == expected));
+            assert!(!server.panes[&pane].suspended);
+            server.keep_and_close_workspace(copied).unwrap();
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
 
     fn workspace(server: &mut Server) -> u32 {
         let ws = server.new_workspace("api".into(), None);

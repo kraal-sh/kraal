@@ -102,6 +102,14 @@ impl Server {
     }
 
     pub fn new_workspace(&mut self, name: String, definition: Option<PathBuf>) -> u32 {
+        let id = self.new_workspace_record(name, definition);
+        let name = self.workspaces.last().map(|w| w.name.clone()).unwrap_or_default();
+        self.emit("workspace.opened", serde_json::json!({ "workspace": name }));
+        id
+    }
+
+    // A retained closed layout must not announce Open or run its hooks before the user opens it.
+    pub(crate) fn new_workspace_record(&mut self, name: String, definition: Option<PathBuf>) -> u32 {
         let id = self.alloc_id();
         let mut name = name;
         let mut n = 2;
@@ -130,8 +138,6 @@ impl Server {
         ws.set_definition(definition.as_deref());
         self.workspaces.push(ws);
         self.persist_dirty = true;
-        let name = self.workspaces.last().map(|w| w.name.clone()).unwrap_or_default();
-        self.emit("workspace.opened", serde_json::json!({ "workspace": name }));
         id
     }
 
@@ -674,6 +680,7 @@ impl Server {
         }
         self.workspaces[wi].kept = None;
         self.workspaces[wi].close_error = None;
+        self.emit("workspace.opened", serde_json::json!({ "workspace": self.workspaces[wi].name }));
         self.refresh_workspace_pickers();
         self.mark_persist();
         self.relayout();
@@ -744,7 +751,8 @@ impl Server {
 
 /// What a suspended pane shows until Enter runs `spec`: why it waits, and the command.
 fn placeholder(spec: &PaneSpec, reason: &str) -> PaneSpec {
-    let line = crate::shell::quote(&spec.command.join(" "));
+    let command = spec.command.join(" ");
+    let line = crate::shell::quote(spec.startup_input.as_deref().map(str::trim_end).unwrap_or(&command));
     PaneSpec {
         command: vec![
             "sh".into(),
