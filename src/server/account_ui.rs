@@ -1047,7 +1047,7 @@ mod tests {
     }
 
     #[test]
-    fn usage_callers_keep_their_expiry_rules_and_wording() {
+    fn usage_callers_share_expiry_rules_and_keep_their_wording() {
         let a = account();
         let window = |used_percent, resets_at| Some(Window { used_percent, resets_at });
         let usage = |five_hour, weekly| Usage { five_hour, weekly, observed_at: 1000, ..Default::default() };
@@ -1102,7 +1102,7 @@ mod tests {
                 None,
                 None,
                 "Last checked 5h ago",
-                bars(Some(57.0), None, ""),
+                bars(Some(0.0), None, ""),
             ),
             (
                 usage(window(95.0, None), window(71.0, None)),
@@ -1111,7 +1111,7 @@ mod tests {
                 Some(605800),
                 None,
                 "71% used",
-                bars(Some(95.0), Some(71.0), ""),
+                bars(Some(0.0), Some(71.0), ""),
             ),
             (
                 usage(None, window(71.0, None)),
@@ -1120,7 +1120,7 @@ mod tests {
                 None,
                 None,
                 "Last checked 7d ago",
-                bars(None, Some(71.0), ""),
+                bars(None, Some(0.0), ""),
             ),
             (
                 usage(window(57.0, Some(2000)), window(71.0, Some(3000))),

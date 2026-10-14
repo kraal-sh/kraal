@@ -1602,9 +1602,8 @@ pub(super) fn login_start_failed(command: &[String]) -> LoginState {
 /// "5h ▓▓▓▓░░░░ 48% · 7d ▓▓▓▓▓▓░░ 71% · resets in 1h20"
 pub fn usage_text(u: &accounts::Usage, now: i64) -> String {
     let mut parts = Vec::new();
-    for (name, w) in [("5h", &u.five_hour), ("7d", &u.weekly)] {
-        if let Some(w) = w {
-            let pct = if w.resets_at.is_some_and(|r| r <= now) { 0.0 } else { w.used_percent };
+    for (name, pct) in ["5h", "7d"].into_iter().zip(u.percentages(now)) {
+        if let Some(pct) = pct {
             parts.push(format!("{name} {} {pct:.0}%", crate::theme::current().bar(pct)));
         }
     }

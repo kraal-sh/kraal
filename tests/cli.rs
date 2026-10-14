@@ -8988,6 +8988,59 @@ while IFS= read -r line; do printf 'reply:%s\n' "$line"; done
     format!("{}:{}", bin.display(), std::env::var("PATH").unwrap_or_default())
 }
 
+#[test]
+fn accounts_cli_expires_usage_without_changing_the_saved_observation() {
+    let env = Env::new("usage-expiry");
+    let path = existing_sign_in_agent(&env, "claude");
+    existing_sign_in_agent(&env, "codex");
+    let home = env.root.join("home/work");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::write(home.join("status"), "0").unwrap();
+    std::fs::write(
+        env.root.join("config/kraal/accounts.toml"),
+        "[[account]]\nid = 'work'\nname = 'work'\nagent = 'claude'\nhome = '~/work'\n",
+    )
+    .unwrap();
+    let run = |json| {
+        let args = if json { vec!["accounts", "list", "--json"] } else { vec!["accounts", "list"] };
+        let out = env.cmd(&args).env("PATH", &path).output().unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        String::from_utf8(out.stdout).unwrap()
+    };
+    assert!(run(false).contains("no usage seen yet"));
+    let dir = env.root.join("state/kraal/usage/by-id");
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("claude-work.json");
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+    for (age, reset, reported, percentages) in [
+        (0, None, false, vec![]),
+        (0, None, true, vec!["95%", "71%"]),
+        (6 * 3600, None, true, vec!["0%", "71%"]),
+        (8 * 86400, None, true, vec!["0%", "0%"]),
+        (0, Some(now - 60), true, vec!["0%", "0%"]),
+        (8 * 86400, Some(now + 86400), true, vec!["95%", "71%"]),
+    ] {
+        let window = |percent| reported.then(|| serde_json::json!({"used_percent": percent, "resets_at": reset}));
+        let usage = serde_json::json!({
+            "five_hour": window(95.0), "weekly": window(71.0),
+            "observed_at": now - age, "source": "statusline",
+        });
+        let saved = usage.to_string();
+        std::fs::write(&file, &saved).unwrap();
+        let text = run(false);
+        let row = text.lines().find(|line| line.starts_with("claude·work")).unwrap();
+        if reported {
+            let shown: Vec<_> = row.split(" · ").take(2).map(|part| part.split_whitespace().last().unwrap()).collect();
+            assert_eq!(shown, percentages, "{usage}: {row}");
+        } else {
+            assert!(row.ends_with("no usage seen yet"), "{row}");
+        }
+        let list: serde_json::Value = serde_json::from_str(&run(true)).unwrap();
+        assert_eq!(list[0]["usage"], usage);
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), saved);
+    }
+}
+
 fn wait_for_account_review(client: &RawClient, agent: &str) -> Vec<String> {
     let label = format!("Existing {agent} account");
     client.wait_for_rows(&format!("{label} ready for Review"), |rows| {
