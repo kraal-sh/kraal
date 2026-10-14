@@ -349,7 +349,20 @@ mod tests {
         let (tx, tid) = binding.recv().unwrap();
         crate::testing::wait_asleep(tid);
         let switches = crate::testing::thread_switches(tid);
-        let before = switches();
+        // Asleep is not yet in the wait: on a busy machine the thread can block on its way there
+        // (a lock, a page), so count from when its switches have stopped. A thread that polls
+        // never stops, or switches again within the 700 ms that follow.
+        let mut before = switches();
+        let start = std::time::Instant::now();
+        loop {
+            std::thread::sleep(Duration::from_millis(200));
+            let now = switches();
+            if now == before {
+                break;
+            }
+            assert!(start.elapsed() < Duration::from_secs(10), "the thread keeps waking up: {now} switches");
+            before = now;
+        }
         std::thread::sleep(Duration::from_millis(700));
         assert_eq!(switches(), before, "no new polling interval");
         tx.wake();

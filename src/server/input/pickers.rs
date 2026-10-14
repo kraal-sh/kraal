@@ -1533,19 +1533,10 @@ mod workspace_action_tests {
         use crate::persist::WorkspaceKey;
         use crate::server::ui::{Prompt, PromptAction};
 
-        // Export uses the default definitions directory, so give this test its own HOME.
-        if std::env::var_os("WORKSPACE_EXPORT_ORDER_CHILD").is_none() {
-            let output = std::process::Command::new(std::env::current_exe().unwrap())
-                .args(["--exact", "server::input::pickers::workspace_order_tests::exporting_over_an_ordered_source_keeps_identity_and_allows_the_next_move"])
-                .env("WORKSPACE_EXPORT_ORDER_CHILD", "1")
-                .output()
-                .unwrap();
-            assert!(
-                output.status.success(),
-                "{}\n{}",
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr)
-            );
+        // Export writes in the workspaces directory, where the other tests list workspaces.
+        if !crate::testing::in_own_process(
+            "server::input::pickers::workspace_action_tests::exporting_over_an_ordered_source_keeps_identity_and_allows_the_next_move",
+        ) {
             return;
         }
         let (tx, _rx) = queue::channel(32);
