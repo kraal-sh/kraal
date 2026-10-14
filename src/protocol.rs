@@ -76,8 +76,10 @@ pub const WORKSPACE_LIFECYCLE: Feature = Feature {
     does: "create, rename, close, delete and restore workspaces",
     check_first: false,
 };
-pub const FEATURES: [Feature; 7] =
-    [LIST_AGENTS, BUFFERS, EDIT_SUDO, ACCOUNT_IDS, STATE_V2, WORKSPACE_FILES, WORKSPACE_LIFECYCLE];
+pub const CLIPBOARD: Feature =
+    Feature { name: "clipboard", does: "copy through the client clipboard policy", check_first: false };
+pub const FEATURES: [Feature; 8] =
+    [LIST_AGENTS, BUFFERS, EDIT_SUDO, ACCOUNT_IDS, STATE_V2, WORKSPACE_FILES, WORKSPACE_LIFECYCLE, CLIPBOARD];
 
 /// The names of this kraal's server features, as it lists them.
 pub fn feature_names() -> Vec<String> {
@@ -90,7 +92,7 @@ pub const LENIENT: &str = "lenient";
 
 /// What this kraal's client can read beyond what one of the oldest supported release can. It
 /// lists them in its messages, for a later server to rely on.
-pub const CLIENT_FEATURES: [&str; 1] = [LENIENT];
+pub const CLIENT_FEATURES: [&str; 2] = [LENIENT, CLIPBOARD.name];
 
 pub fn client_features() -> Vec<String> {
     CLIENT_FEATURES.iter().map(|f| f.to_string()).collect()
@@ -233,6 +235,12 @@ pub enum ClientMsg {
         rows: u16,
     },
     Detach,
+    ClipboardResult {
+        id: u64,
+        outcome: ClipboardOutcome,
+        #[serde(default)]
+        native_unavailable: bool,
+    },
     /// One control request; the server answers with [`ServerMsg::Response`] and closes.
     Request {
         version: u32,
@@ -275,6 +283,11 @@ pub enum ServerMsg {
     Response {
         result: Result<Response, String>,
     },
+    Clipboard {
+        id: u64,
+        origin: ClipboardOrigin,
+        text: String,
+    },
     /// Open a URL on the client's machine (Ctrl+click on a link).
     Open {
         url: String,
@@ -296,6 +309,44 @@ impl ServerMsg {
     /// The end of an interactive session that does not come back by itself.
     pub fn exit(reason: impl Into<String>) -> ServerMsg {
         ServerMsg::Exit { reason: reason.into(), reattach: None }
+    }
+}
+
+/// Unknown origins never gain permission to write the native clipboard.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClipboardOrigin {
+    User,
+    Program,
+    #[serde(other)]
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClipboardOutcome {
+    Native,
+    NativeStarted,
+    Terminal,
+    Disabled,
+    TooLarge,
+    Busy,
+    Failed,
+    #[serde(other)]
+    Unknown,
+}
+
+impl ClipboardOutcome {
+    pub fn message(self) -> &'static str {
+        match self {
+            Self::Native => "copied to laptop clipboard",
+            Self::NativeStarted => "copy handed to native clipboard owner",
+            Self::Terminal => "copy sent to terminal via OSC 52",
+            Self::Disabled => "external copy disabled; use paste buffers",
+            Self::TooLarge => "copy too large; raise clipboard.max_bytes and attach again",
+            Self::Busy => "copy busy: try again",
+            Self::Failed | Self::Unknown => "copy not completed: try again",
+        }
     }
 }
 
@@ -1038,6 +1089,7 @@ mod tests {
             },
             ClientMsg::Resize { cols: 80, rows: 24 },
             ClientMsg::Detach,
+            ClientMsg::ClipboardResult { id: 1, outcome: ClipboardOutcome::Terminal, native_unavailable: true },
         ]);
         let pane = PaneInfo {
             account: None,
@@ -1111,6 +1163,7 @@ mod tests {
             ServerMsg::Exit { reason: s("bye"), reattach: Some(s("w")) },
             ServerMsg::Attached { version: s("0.2.0"), features: Some(feature_names()) },
             ServerMsg::Open { url: s("https://example.com") },
+            ServerMsg::Clipboard { id: 1, origin: ClipboardOrigin::User, text: s("hello") },
             ServerMsg::Event { event: serde_json::json!({"v": 1, "type": "pane.opened"}) },
             ServerMsg::Events { events: vec![serde_json::json!({"v": 1, "type": "pane.closed"})] },
         ]);

@@ -9,6 +9,7 @@ mod attention;
 mod bottom_bar;
 mod buffers;
 mod clients;
+mod clipboard;
 mod commands;
 mod contexts;
 mod definitions;
@@ -400,6 +401,7 @@ pub struct Client {
     pub id: ClientId,
     pub out: clients::Outbox,
     pub attached: bool,
+    clipboard: clipboard::Clipboard,
     pub cols: u16,
     pub rows: u16,
     pub workspace: u32,
@@ -1284,6 +1286,9 @@ impl Server {
             d = d.min(g);
         }
         for c in self.clients.values() {
+            if let Some((_, _, at)) = c.clipboard.pending {
+                d = d.min(at + clipboard::RESULT_TIMEOUT);
+            }
             if let Some(p) = c.pending_since {
                 d = d.min(p + INPUT_FLUSH);
             }
@@ -1317,6 +1322,7 @@ impl Server {
         if self.usage_reset.is_some_and(|(_, wake)| wake <= now) {
             self.await_usage_reset();
         }
+        self.expire_copies(now);
         // Escape sequences that never completed.
         let flush: Vec<ClientId> = self
             .clients
@@ -1780,15 +1786,15 @@ impl Server {
                     self.keep_copy(&text);
                     // What a pane copies goes to one clipboard: that of the client looking at its
                     // workspace that was used last (another machine attached elsewhere keeps its own).
-                    let bytes = crate::pane::osc52(&text);
                     let ws = self.workspace_of(id).map(|(wi, _)| self.workspaces[wi].id);
-                    if let Some(c) = self
+                    if let Some(client) = self
                         .clients
                         .values()
                         .filter(|c| c.attached && Some(c.workspace) == ws)
                         .max_by_key(|c| c.last_input)
+                        .map(|c| c.id)
                     {
-                        let _ = c.out.try_send(frame_bytes(&bytes));
+                        self.send_copy(client, crate::protocol::ClipboardOrigin::Program, &text);
                     }
                 }
                 PaneSignal::CommandDone(done) => self.command_done(id, done),

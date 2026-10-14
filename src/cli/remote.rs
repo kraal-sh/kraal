@@ -25,6 +25,7 @@ pub(super) fn attach(session: &str, host: &str, workspace: Option<String>, pane:
         session: session.to_string(),
         label: s.name.clone(),
         pane,
+        clipboard_native: s.clipboard_native,
     };
     // Once a kraal there answered, the sidebar lists that session's agents from then on.
     let remember = || {
@@ -211,6 +212,7 @@ pub(super) fn servers(action: ServersCmd) -> Result<()> {
                 env,
                 note,
                 agents,
+                clipboard_native: false,
             };
             let file = paths::shorten_home(&servers::Inventory::path());
             let done = servers::Inventory::update(|inv| {

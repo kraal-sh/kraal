@@ -4,32 +4,81 @@ What kraal adds to the terminal inside each pane: the commands your shell ran, a
 
 ## Clipboard
 
-kraal sends text copies to the attached client's terminal using OSC 52. With
-`kraal attach --host db`, that terminal is on the machine where you ran the attach command.
-SSH carries the copy back from the server. kraal does not run a native clipboard tool on
-that machine.
+With a current client and server, kraal sends a structured copy to the attaching machine.
+A user copy tries that machine's native clipboard first, then falls back to OSC 52 through
+its terminal. With `kraal attach --host db`, the native tool runs where you launched attach.
+A copy uses one successful path, never both native and OSC 52.
 
 - A mouse selection, copy mode, a hint, the last command's output, or copying a paste buffer
   goes to the client that requested it.
 - A program's OSC 52 goes to one attached client: the most recently used client viewing that
   pane's workspace, even if another pane there has focus. It is never broadcast to all clients.
+  By default it still goes through the terminal's write permission, without native access.
 - Without a client viewing that workspace, a program's copy only enters the session's paste
   buffers. It is not sent later on attach.
 
-**copy sent to terminal** means kraal sent the request toward that terminal. OSC 52 writes
-have no acknowledgement, so kraal cannot confirm that the system clipboard changed. The
-terminal may refuse the request or impose a size limit. **copy not sent: try again** means the
-client's output queue could not accept it. If buffer limits allow it, the text remains in
-[Paste buffers](keys.md#paste-buffers), where `ctrl+y` sends it again. With `buffers.limit = 0`,
-or when the byte budget is exhausted (including by named buffers), the copy may not be kept.
+The attaching machine's `config.toml` controls its policy:
 
-### What the terminal must allow
+```toml config
+[clipboard]
+mode = "auto"             # native for user copies, then terminal fallback
+max_bytes = 1048576        # 1 MiB of UTF-8 text, without truncation
+```
+
+`mode = "terminal"` uses OSC 52 for every copy. `mode = "off"` disables external writes,
+while keeping internal paste buffers subject to their own limits. Settings apply on the next
+attach. To let programs in one remote session use native tools too, set
+`clipboard_native = true` on that server in the attaching machine's `servers.toml`
+([Servers](servers.md#the-inventory)). Remove it or set it to false and attach again to revoke.
+This permission applies to all programs of that server's session, including its SSH panes.
+It bypasses the terminal's OSC 52 write permission. A different user or an overridden port
+has no permission unless its own saved connection grants it.
+
+When the client itself runs under SSH, in a VS Code remote environment, or under WSL,
+`auto` uses the terminal even when native program copies are allowed. Its native clipboard
+may belong to an intermediate machine. `DISPLAY` alone does not prove locality. Local tmux
+or kraal nesting does not disable native copies.
+
+Native tools are `pbcopy` on macOS; on Linux, `wl-copy` when `WAYLAND_DISPLAY` is set, then
+`xclip -selection clipboard -in` or `xsel --clipboard --input` when `DISPLAY` is set.
+Tools must be installed and able to reach the graphical session. A missing or failing tool
+falls back to the next tool, then OSC 52. Native work runs off the input and display threads,
+with a two-second deadline per tool, including writing its stdin. Persistent selection owners
+are left running after handoff and detach, so Wayland does not lose the copied text.
+
+**copied to laptop clipboard** means the native tool reported success. A persistent tool that
+does not exit instead reports **copy handed to native clipboard owner** after startup; kraal
+cannot confirm that tool's eventual write. Neither message promises that another application
+will not replace the clipboard later. **copy sent to terminal via OSC 52** means the request
+was written to the terminal. OSC 52 writes have no acknowledgement: kraal cannot confirm that
+the system clipboard changed, and never reads it to check. The first native backend failure
+per connection is recorded in Messages, without an alert on every selection.
+
+Each side limits external copies to `clipboard.max_bytes` (1 MiB by default, configurable
+from 1 byte through 8 MiB). Both limits must allow the text. Oversized copies are refused,
+never truncated. Each client has at most one outstanding server request, a bounded worker
+queue, and at most ten attempts per second. **copy busy: try again** means the previous copy
+is still pending or a new copy came too soon. An unavailable result after ten seconds is
+reported without resending the copy. Disconnect cancels unfinished work, with no replay.
+
+**copy not sent: try again** means the client's output queue could not accept it. If buffer
+limits allow it, the text remains in [Paste buffers](keys.md#paste-buffers), where `ctrl+y`
+sends it again. With `buffers.limit = 0`, or when the byte budget is exhausted (including
+by named buffers), the copy may not be kept.
+
+Older clients receive only the legacy OSC 52 request and say **copy sent to terminal**.
+A current client attached to an older server also keeps that server's legacy path, without
+native copying or client size enforcement. `off` refuses such an attachment with restart
+guidance, since an old server cannot separate copies from display bytes. No session or
+workspace format changes are needed. See [Compatibility](compatibility.md#clients-and-servers).
+
+### What the terminal fallback must allow
 
 | Terminal or outer multiplexer | Requirement |
 |---|---|
 | Ghostty | `clipboard-write = allow`, the default. `ask` requires approval; `deny` blocks writes. See [Ghostty's clipboard setting](https://ghostty.org/docs/config/reference#clipboard-write). |
 | iTerm2 | Enable **Settings > General > Selection > Applications in terminal may access clipboard**. See [iTerm2's settings](https://iterm2.com/documentation-preferences-general.html#selection). |
-| macOS Terminal.app | No native OSC 52 clipboard support ([Terminal.app workaround project](https://github.com/roy2220/osc52pty)). Use Ghostty or iTerm2 for this copy path, or select visible text with the terminal's own selection and Copy action. |
+| macOS Terminal.app | No native OSC 52 clipboard support ([Terminal.app workaround project](https://github.com/roy2220/osc52pty)). Native user copies work through `pbcopy`; for program copies, grant native permission to that saved server or use the terminal's own selection and Copy action. |
 | tmux outside the client | Set `set -s set-clipboard on` and ensure tmux has the `Ms` capability for its outer terminal. `external` does not accept clipboard requests from applications inside tmux. The outer terminal must also allow writes. See [tmux's clipboard guide](https://github.com/tmux/tmux/wiki/Clipboard). |
 | A local kraal outside the remote tab | The outer kraal treats the remote copy as a program's OSC 52: it keeps a paste buffer and forwards to its most recently used client viewing that local workspace. That client's terminal must allow writes too. Use the remote agent tab from the sidebar or `alt+a`; plain attach inside a kraal pane refuses nesting. |
 
@@ -37,7 +86,7 @@ Allowing OSC 52 writes also allows programs in your panes to replace the clipboa
 it is a separate permission and is not needed for copying. kraal does not read it to check
 whether a write worked. See [the OSC 52 protocol](https://ghostty.org/docs/vt/osc/52).
 
-If a copy does not arrive, check the receiving terminal's write permission and any outer
+If a fallback copy does not arrive, check the receiving terminal's write permission and any outer
 multiplexer first. In Ghostty with its default permission, check whether the program actually
 uses OSC 52 and which attached client was last used. You can still paste a kept copy inside
 kraal with `ctrl+b =`, or use the terminal's own selection (hold Shift) and Copy action.

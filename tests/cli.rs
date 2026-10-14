@@ -10029,6 +10029,11 @@ fn host_attach_delivers_copies_to_one_clients_terminal() {
 
     let local = Env::new("copylocal");
     let remote = Env::new("copyremote");
+    for env in [&local, &remote] {
+        let config = env.root.join("config/kraal/config.toml");
+        let text = std::fs::read_to_string(&config).unwrap();
+        std::fs::write(config, format!("{text}\n[clipboard]\nmode = 'terminal'\n")).unwrap();
+    }
     // A noninteractive shell and no tty echo: only program output can satisfy the markers.
     remote.workspace(
         "w",
@@ -10048,6 +10053,7 @@ fn host_attach_delivers_copies_to_one_clients_terminal() {
 
     let osc = |text: &str| format!("\x1b]52;c;{}\x07", base64::engine::general_purpose::STANDARD.encode(text));
     let copy = |client: &mut TerminalClient, text: &str| {
+        std::thread::sleep(Duration::from_millis(150));
         let encoded = base64::engine::general_purpose::STANDARD.encode(text);
         client.type_keys(format!("printf '\\033]52;c;{encoded}\\007{text}\\n'\r").as_bytes());
     };
@@ -10066,9 +10072,10 @@ fn host_attach_delivers_copies_to_one_clients_terminal() {
     let x = row.split("SELECT-ME-PLEASE").next().unwrap().chars().count() + 1;
     let end = x + "SELECT-ME-PLEASE".len() - 1;
     let y = y + 1;
+    std::thread::sleep(Duration::from_millis(150));
     host.type_keys(format!("\x1b[<0;{x};{y}M\x1b[<32;{end};{y}M\x1b[<0;{end};{y}m").as_bytes());
     host.wait_for(&osc("SELECT-ME-PLEASE"));
-    host.wait_for("copy sent to terminal");
+    host.wait_for("copy sent to terminal via OSC 52");
     assert_eq!(remote.run(&["buffer", "show"]), "SELECT-ME-PLEASE");
     // A later frame on both clients also bounds the check for an unwanted broadcast.
     copy(&mut direct, "LOCAL-AGAIN");
@@ -10089,6 +10096,236 @@ fn host_attach_delivers_copies_to_one_clients_terminal() {
     host.type_keys(b"\x02d");
     assert_eq!(direct.left("local detach").0, 0);
     assert_eq!(host.left("host detach").0, 0);
+}
+
+#[cfg(unix)]
+#[test]
+fn host_clipboard_policy_is_local_and_native_copy_never_also_sends_osc52() {
+    use base64::Engine;
+
+    for (case, allowed, mode, limit, fails, intermediate) in [
+        ("native", false, "auto", 1048576, false, false),
+        ("allowed", true, "auto", 1048576, false, false),
+        ("off", true, "off", 1048576, false, false),
+        ("limit", true, "auto", 4, false, false),
+        ("failure", true, "auto", 1048576, true, false),
+        ("intermediate", true, "auto", 1048576, false, true),
+        ("vscode", true, "auto", 1048576, false, true),
+        ("broken", true, "off", 1048576, false, false),
+        #[cfg(target_os = "linux")]
+        ("x11", true, "auto", 1048576, false, false),
+        #[cfg(target_os = "linux")]
+        ("xsel", true, "auto", 1048576, false, false),
+    ] {
+        let local = Env::new(&format!("clip-{case}"));
+        let remote = Env::new(&format!("clip-server-{case}"));
+        remote.workspace("w", "layout {\n    pane name=\"main\" command=\"sh\" { args \"-c\" \"stty -echo; echo READY; cat | sh\"; }\n}\n");
+        remote.run(&["open", "w"]);
+        remote.wait_for_text("main", "READY");
+        let other = RawClient::attach(&remote, "w");
+        let (_, path) = fake_ssh(&local, &remote);
+        let bin = local.root.join("bin");
+        let native = local.root.join("clipboard");
+        let calls = local.root.join("calls");
+        for tool in ["pbcopy", "wl-copy", "xclip", "xsel"] {
+            write_script(
+                &bin.join(tool),
+                &format!(
+                    "#!/bin/sh\nprintf '%s\\n' \"$*\" >> {calls}\ncat > {native}\nexit {code}\n",
+                    calls = calls.display(),
+                    native = native.display(),
+                    code = if fails || (case == "xsel" && tool == "xclip") { 1 } else { 0 }
+                ),
+            );
+        }
+        let config = local.root.join("config/kraal/config.toml");
+        let text = std::fs::read_to_string(&config).unwrap();
+        let invalid = if case == "broken" { "mouse = [\n" } else { "" };
+        std::fs::write(config, format!("{text}\n[clipboard]\nmode = '{mode}'\nmax_bytes = {limit}\n{invalid}"))
+            .unwrap();
+        std::fs::write(
+            local.root.join("config/kraal/servers.toml"),
+            format!("[[server]]\nname = 'box'\nhost = 'copy.invalid'\nclipboard_native = {allowed}\n"),
+        )
+        .unwrap();
+        let mut cmd = local.isolated(Path::new(env!("CARGO_BIN_EXE_kraal")));
+        cmd.args(["-s", &remote.session, "attach", "--host", "box", "w"]);
+        cmd.env("PATH", path).env("WAYLAND_DISPLAY", "fake-wayland").env("DISPLAY", ":42");
+        if matches!(case, "x11" | "xsel") {
+            cmd.env_remove("WAYLAND_DISPLAY");
+        }
+        for name in [
+            "SSH_CONNECTION",
+            "SSH_CLIENT",
+            "SSH_TTY",
+            "VSCODE_IPC_HOOK_CLI",
+            "VSCODE_AGENT_FOLDER",
+            "WSL_DISTRO_NAME",
+            "WSL_INTEROP",
+        ] {
+            cmd.env_remove(name);
+        }
+        if intermediate {
+            cmd.env(if case == "vscode" { "VSCODE_IPC_HOOK_CLI" } else { "SSH_CONNECTION" }, "intermediate");
+        }
+        let mut host = TerminalClient::start(cmd);
+        host.wait_for("READY");
+        let encoded = base64::engine::general_purpose::STANDARD.encode("PROGRAM-COPY");
+        host.type_keys(format!("printf '\\033]52;c;{encoded}\\007PROGRAM-DONE\\n'\r").as_bytes());
+        host.wait_for("PROGRAM-DONE");
+        other.wait_for_screen("PROGRAM-DONE");
+        let program_native = allowed && mode == "auto" && limit > 4 && !intermediate && !fails;
+        let program_terminal = mode != "off" && limit > 4 && !program_native;
+        if program_native {
+            common::wait_until(Duration::from_secs(10), "native program copy", || {
+                std::fs::read_to_string(&native).ok().as_deref() == Some("PROGRAM-COPY")
+            });
+        } else if program_terminal {
+            host.wait_for(&format!("\x1b]52;c;{encoded}\x07"));
+        } else if limit == 4 {
+            host.wait_for("copy too large");
+        }
+        // Recopying a buffer is the user's own gesture even when a program filled it.
+        std::thread::sleep(Duration::from_millis(200));
+        let before = host.written.lock().unwrap().len();
+        host.type_keys(b"\x02=\x19");
+        let user_native = mode == "auto" && limit > 4 && !intermediate && !fails;
+        let expected = if mode == "off" {
+            "external copy disabled"
+        } else if limit == 4 {
+            "copy too large"
+        } else if user_native {
+            "copied to laptop clipboard"
+        } else {
+            "copy sent to terminal via OSC 52"
+        };
+        if limit == 4 {
+            // The same refusal is already drawn for the program copy and need not redraw.
+            host.wait_for(expected);
+        } else {
+            common::wait_until(Duration::from_secs(10), expected, || {
+                String::from_utf8_lossy(&host.written.lock().unwrap()[before..]).contains(expected)
+            });
+        }
+        assert_eq!(remote.run(&["buffer", "show"]), "PROGRAM-COPY", "{case}");
+        let written = host.written.clone();
+        host.type_keys(b"\x02d");
+        assert_eq!(host.left("clipboard detach").0, 0);
+        let terminal = String::from_utf8_lossy(&written.lock().unwrap()).into_owned();
+        assert_eq!(
+            terminal.matches("\x1b]52;").count(),
+            usize::from(program_terminal) + usize::from(!user_native && mode != "off" && limit > 4),
+            "{case}"
+        );
+        assert!(!String::from_utf8_lossy(&other.screen.lock().unwrap()).contains("\x1b]52;"), "{case}: broadcast");
+        if mode == "off" || limit == 4 || intermediate {
+            assert!(!calls.exists(), "{case}: native tool must not run");
+        } else if !fails {
+            assert_eq!(std::fs::read_to_string(native).unwrap(), "PROGRAM-COPY");
+            let calls = std::fs::read_to_string(calls).unwrap();
+            let attempts = if case == "xsel" { 2 } else { 1 };
+            assert_eq!(calls.lines().count(), attempts * (1 + usize::from(program_native)));
+            if case == "x11" {
+                assert!(calls.lines().all(|args| args == "-selection clipboard -in"));
+            } else if case == "xsel" {
+                assert_eq!(
+                    calls.lines().collect::<Vec<_>>(),
+                    [
+                        "-selection clipboard -in",
+                        "--clipboard --input",
+                        "-selection clipboard -in",
+                        "--clipboard --input"
+                    ]
+                );
+            } else {
+                #[cfg(target_os = "linux")]
+                assert!(calls.lines().all(|args| args == "--type text/plain;charset=utf-8"));
+            }
+        }
+    }
+}
+
+/// A helper stopped before reading cannot write after its client has detached or been
+/// signalled, even though its process group is independent of the client's.
+#[cfg(target_os = "linux")]
+#[test]
+fn client_exit_cancels_a_native_copy_before_its_pending_write() {
+    for signal in [None, Some(libc::SIGTERM), Some(libc::SIGHUP), Some(libc::SIGINT), Some(libc::SIGQUIT)] {
+        let env = Env::new(&format!("copy-exit-{}", signal.unwrap_or(0)));
+        env.workspace("w", "layout {\n    pane name=\"main\"\n}\n");
+        env.run(&["open", "w"]);
+        // More than a pipe can hold: the stopped helper cannot complete the handoff.
+        assert!(set_buffer(&env, &[], &"x".repeat(1 << 20)).status.success());
+        let bin = env.root.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let pidfile = env.root.join("helper-pid");
+        let copied = env.root.join("copied");
+        write_script(
+            &bin.join("wl-copy"),
+            &format!("#!/bin/sh\necho $$ > {}\nkill -STOP $$\ncat > {}\n", pidfile.display(), copied.display()),
+        );
+        let mut cmd = env.cmd(&["attach", "w"]);
+        cmd.env("PATH", format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()))
+            .env("WAYLAND_DISPLAY", "fake-wayland");
+        for name in [
+            "SSH_CONNECTION",
+            "SSH_CLIENT",
+            "SSH_TTY",
+            "VSCODE_AGENT_FOLDER",
+            "VSCODE_IPC_HOOK_CLI",
+            "WSL_DISTRO_NAME",
+            "WSL_INTEROP",
+            "DISPLAY",
+        ] {
+            cmd.env_remove(name);
+        }
+        let mut client = TerminalClient::start(cmd);
+        client.type_keys(b"\x02=\x19");
+        wait_until(PATIENCE, "clipboard helper paused", || {
+            std::fs::read_to_string(&pidfile).is_ok_and(|s| !s.trim().is_empty())
+        });
+        let pid: libc::pid_t = std::fs::read_to_string(&pidfile).unwrap().trim().parse().unwrap();
+        // Waiting for the stopped state makes the pause deterministic.
+        wait_until(PATIENCE, "clipboard helper stopped", || {
+            std::fs::read_to_string(format!("/proc/{pid}/status"))
+                .is_ok_and(|s| s.lines().any(|line| line.starts_with("State:") && line.contains("T (stopped)")))
+        });
+        if let Some(signal) = signal {
+            client.signal(signal);
+        } else {
+            client.type_keys(b"\x02d");
+        }
+        assert_eq!(client.left("pending clipboard copy").0, signal.map_or(0, |s| (128 + s) as u32));
+        // SIGKILL may still be pending until the kernel schedules the helper. It may
+        // briefly remain stopped, but it must disappear or become a zombie without writing.
+        let running = || {
+            std::fs::read_to_string(format!("/proc/{pid}/status"))
+                .is_ok_and(|s| !s.lines().any(|line| line.starts_with("State:") && line.contains("Z (zombie)")))
+        };
+        let start = Instant::now();
+        while running() && start.elapsed() < Duration::from_secs(1) {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let alive = running();
+        if alive {
+            // SAFETY: the paused helper this test started still owns its pid and group.
+            unsafe {
+                libc::kill(-pid, libc::SIGCONT);
+            }
+            let start = Instant::now();
+            while !copied.exists() && running() && start.elapsed() < Duration::from_secs(1) {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            if running() {
+                // SAFETY: this is still the helper whose pending write we resumed.
+                unsafe {
+                    libc::kill(-pid, libc::SIGKILL);
+                }
+            }
+        }
+        assert!(!alive, "unfinished clipboard helper survived client exit");
+        assert!(!copied.exists(), "clipboard was overwritten after client exit");
+    }
 }
 
 #[test]

@@ -119,6 +119,13 @@ confirm_sync = true
 # Ask before pasting several lines into a production pane that would run them at once.
 confirm_paste = true
 
+[clipboard]
+# On the attaching machine: "auto" tries native tools for user copies, then OSC 52.
+# "terminal" uses OSC 52 only; "off" keeps only the session's paste buffers.
+mode = "auto"
+# Maximum UTF-8 bytes per external copy (1 MiB), without truncation. At most 8 MiB.
+max_bytes = 1048576
+
 [buffers]
 # Paste buffers: what kraal copies (copy mode, mouse selections, hints, the last command's
 # output, what programs copy) is also kept here, newest first. ctrl+b V p (or ctrl+b =) lists
@@ -274,6 +281,7 @@ pub struct Config {
     pub contexts: ContextsConfig,
     pub production: ProductionConfig,
     pub buffers: BuffersConfig,
+    pub clipboard: crate::clipboard::Settings,
     pub worktrees: WorktreesConfig,
     pub hints: crate::hints::HintsConfig,
     #[serde(default)]
@@ -408,7 +416,12 @@ impl Config {
         let mut base: toml::Value = toml::from_str(DEFAULT_CONFIG)?;
         let user: toml::Value = toml::from_str(user)?;
         merge(&mut base, user);
-        Ok(crate::unknown_keys::deserialize(base)?)
+        let (config, warnings): (Config, _) = crate::unknown_keys::deserialize(base)?;
+        anyhow::ensure!(
+            (1..=crate::clipboard::MAX_BYTES).contains(&config.clipboard.max_bytes),
+            "clipboard.max_bytes must be between 1 and 8388608"
+        );
+        Ok((config, warnings))
     }
 
     pub fn shell(&self) -> String {

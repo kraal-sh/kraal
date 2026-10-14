@@ -38,3 +38,6 @@ env = "prod"                    # production, whatever its name says
 name = "workstation"
 host = "workstation.example.com"
 agents = "main"                 # the agents of its kraal session "main" show in your sidebar
+# Allow this server's programs to bypass terminal OSC 52 permissions using native clipboard
+# tools on the attaching machine. false is the default; change locally, then attach again.
+clipboard_native = false

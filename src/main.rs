@@ -7,6 +7,7 @@ mod ansi;
 mod buffers;
 mod cli;
 mod client;
+mod clipboard;
 mod codex_usage;
 mod config;
 mod context;
