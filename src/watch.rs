@@ -404,6 +404,7 @@ mod tests {
         let (tx, rx) = crossbeam_channel::unbounded();
         let (tid_tx, tid_rx) = crossbeam_channel::bounded(1);
         let mut w = Watcher::new(move |c| {
+            crate::testing::block_signals();
             // SAFETY: gettid has no preconditions.
             let _ = tid_tx.try_send(unsafe { libc::gettid() });
             let _ = tx.send(c);
@@ -413,10 +414,14 @@ mod tests {
         std::fs::write(dir.join("a"), "1").unwrap();
         assert!(next(&rx).iter().any(|c| c.id == id));
         quiet(&rx);
-        let switches = crate::testing::thread_switches(tid_rx.recv().unwrap());
+        let tid = tid_rx.recv().unwrap();
+        crate::testing::wait_asleep(tid);
+        let switches = crate::testing::thread_switches(tid);
         let before = switches();
-        std::thread::sleep(Duration::from_millis(700));
+        crate::testing::sleep_with_signals(tid, Duration::from_millis(700));
         assert_eq!(switches(), before, "the watcher woke up while nothing changed");
+        std::fs::write(dir.join("b"), "2").unwrap();
+        assert!(next(&rx).iter().any(|c| c.id == id));
         drop(w);
         let _ = std::fs::remove_dir_all(&dir);
     }

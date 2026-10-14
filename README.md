@@ -192,6 +192,10 @@ line, key, setting and example they quote):
 cargo test
 ```
 
+On Linux, the idle-worker tests count thread context switches to detect polling. The measured
+workers block signals so unrelated process activity cannot look like polling. These tests send
+SIGCHLD during the measurement and check that real work still wakes the workers afterwards.
+
 ## License
 
 Copyright 2026 vodhash and the kraal contributors.

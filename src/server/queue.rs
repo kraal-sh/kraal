@@ -341,6 +341,7 @@ mod tests {
     fn an_idle_selector_stays_asleep_until_publication() {
         let (bound, binding) = crossbeam_channel::bounded(1);
         let worker = std::thread::spawn(move || {
+            crate::testing::block_signals();
             let (tx, rx) = channel(1);
             // SAFETY: gettid has no preconditions.
             bound.send((tx, unsafe { libc::gettid() })).unwrap();
@@ -363,7 +364,7 @@ mod tests {
             assert!(start.elapsed() < Duration::from_secs(10), "the thread keeps waking up: {now} switches");
             before = now;
         }
-        std::thread::sleep(Duration::from_millis(700));
+        crate::testing::sleep_with_signals(tid, Duration::from_millis(700));
         assert_eq!(switches(), before, "no new polling interval");
         tx.wake();
         worker.join().unwrap();
