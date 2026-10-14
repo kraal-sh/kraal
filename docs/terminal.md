@@ -2,6 +2,68 @@
 
 What kraal adds to the terminal inside each pane: the commands your shell ran, and images.
 
+## Clipboard
+
+kraal sends text copies to the attached client's terminal using OSC 52. With
+`kraal attach --host db`, that terminal is on the machine where you ran the attach command.
+SSH carries the copy back from the server. kraal does not run a native clipboard tool on
+that machine.
+
+- A mouse selection, copy mode, a hint, the last command's output, or copying a paste buffer
+  goes to the client that requested it.
+- A program's OSC 52 goes to one attached client: the most recently used client viewing that
+  pane's workspace, even if another pane there has focus. It is never broadcast to all clients.
+- Without a client viewing that workspace, a program's copy only enters the session's paste
+  buffers. It is not sent later on attach.
+
+**copy sent to terminal** means kraal sent the request toward that terminal. OSC 52 writes
+have no acknowledgement, so kraal cannot confirm that the system clipboard changed. The
+terminal may refuse the request or impose a size limit. **copy not sent: try again** means the
+client's output queue could not accept it. If buffer limits allow it, the text remains in
+[Paste buffers](keys.md#paste-buffers), where `ctrl+y` sends it again. With `buffers.limit = 0`,
+or when the byte budget is exhausted (including by named buffers), the copy may not be kept.
+
+### What the terminal must allow
+
+| Terminal or outer multiplexer | Requirement |
+|---|---|
+| Ghostty | `clipboard-write = allow`, the default. `ask` requires approval; `deny` blocks writes. See [Ghostty's clipboard setting](https://ghostty.org/docs/config/reference#clipboard-write). |
+| iTerm2 | Enable **Settings > General > Selection > Applications in terminal may access clipboard**. See [iTerm2's settings](https://iterm2.com/documentation-preferences-general.html#selection). |
+| macOS Terminal.app | No native OSC 52 clipboard support ([Terminal.app workaround project](https://github.com/roy2220/osc52pty)). Use Ghostty or iTerm2 for this copy path, or select visible text with the terminal's own selection and Copy action. |
+| tmux outside the client | Set `set -s set-clipboard on` and ensure tmux has the `Ms` capability for its outer terminal. `external` does not accept clipboard requests from applications inside tmux. The outer terminal must also allow writes. See [tmux's clipboard guide](https://github.com/tmux/tmux/wiki/Clipboard). |
+| A local kraal outside the remote tab | The outer kraal treats the remote copy as a program's OSC 52: it keeps a paste buffer and forwards to its most recently used client viewing that local workspace. That client's terminal must allow writes too. Use the remote agent tab from the sidebar or `alt+a`; plain attach inside a kraal pane refuses nesting. |
+
+Allowing OSC 52 writes also allows programs in your panes to replace the clipboard. Reading
+it is a separate permission and is not needed for copying. kraal does not read it to check
+whether a write worked. See [the OSC 52 protocol](https://ghostty.org/docs/vt/osc/52).
+
+If a copy does not arrive, check the receiving terminal's write permission and any outer
+multiplexer first. In Ghostty with its default permission, check whether the program actually
+uses OSC 52 and which attached client was last used. You can still paste a kept copy inside
+kraal with `ctrl+b =`, or use the terminal's own selection (hold Shift) and Copy action.
+
+### Programs that write the server's clipboard
+
+An agent's own copy command may call `wl-copy`, `xclip`, `xsel`, or `pbcopy` instead of emitting
+OSC 52. Such a write never enters kraal's terminal stream or paste buffers. It targets the
+graphical session that tool can access where it runs. On a server with its own desktop, that
+can change the server's clipboard while leaving your laptop's clipboard untouched. Without an
+accessible graphical session it may fail; kraal cannot see that result as a clipboard operation.
+`DISPLAY` can also name a forwarded X11 display, so it does not by itself prove which machine's
+clipboard is used.
+
+Panes inherit `DISPLAY` and `WAYLAND_DISPLAY`, when set, from the environment of the kraal
+server process. This is the environment that started that server, not a fresh environment
+from each attaching client. Attaching through `--host` does not replace it with your laptop's
+variables. Pane environment overrides still apply.
+
+These variables should remain inherited: panes also launch graphical applications, and the
+same session can have local and remote clients. Removing them globally would break valid
+local use and would not reliably make programs choose OSC 52. For remote copying, configure
+the program to use OSC 52. If its backend selection depends on these variables, launch just
+that program with `env -u WAYLAND_DISPLAY -u DISPLAY program` and check its documented fallback;
+unsetting them alone does not guarantee terminal copying, and does not disable macOS `pbcopy`.
+
 ## Shell commands
 
 A shell can mark where each prompt, command line and output starts, and how each command ended

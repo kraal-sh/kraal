@@ -612,7 +612,7 @@ pub(super) mod tests {
             server.client_input(client, b"\x02q");
             assert!(matches!(server.clients[&client].mode, Mode::Confirm(_)));
             let (text, until) = server.clients[&client].toast.as_ref().unwrap();
-            assert_eq!(text, "copied 4 characters");
+            assert_eq!(text, "copy sent to terminal");
             assert!(*until > Instant::now());
             server.client_input(client, b"y");
             assert!(!server.quitting);

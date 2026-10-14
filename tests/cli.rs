@@ -357,7 +357,7 @@ fn raw_frame(w: &mut impl std::io::Write, kind: u8, payload: &[u8]) {
 
 /// A client attached in a terminal the test holds (a pty): what the client writes to it is kept
 /// byte for byte, and the terminal's line mode can be looked at.
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 struct TerminalClient {
     master: Box<dyn portable_pty::MasterPty + Send>,
     keys: Box<dyn std::io::Write + Send>,
@@ -366,13 +366,17 @@ struct TerminalClient {
     reader: std::thread::JoinHandle<()>,
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 impl TerminalClient {
     /// Attach to `env`'s session, and wait until it is drawn.
+    #[cfg(target_os = "linux")]
     fn attach(env: &Env) -> TerminalClient {
+        Self::start(env.cmd(&["attach"]))
+    }
+
+    fn start(attach: Command) -> TerminalClient {
         let size = portable_pty::PtySize { rows: 30, cols: 100, pixel_width: 0, pixel_height: 0 };
         let pair = portable_pty::native_pty_system().openpty(size).unwrap();
-        let attach = env.cmd(&["attach"]);
         let mut cmd = portable_pty::CommandBuilder::new(attach.get_program());
         cmd.args(attach.get_args());
         for (k, v) in attach.get_envs() {
@@ -432,6 +436,7 @@ impl TerminalClient {
         self.keys.flush().unwrap();
     }
 
+    #[cfg(target_os = "linux")]
     fn signal(&self, signal: libc::c_int) {
         // SAFETY: plain syscall to the client this test started (ended already, it is still ours
         // to wait for).
@@ -485,6 +490,16 @@ impl TerminalClient {
         let said = String::from_utf8_lossy(&written[order[3] + "\x1b[?25h".len()..]).into_owned();
         assert!(!said.contains('\x1b'), "{what}: written after the terminal was given back: {shown}");
         (status.exit_code(), said)
+    }
+}
+
+#[cfg(unix)]
+impl Drop for TerminalClient {
+    fn drop(&mut self) {
+        if self.child.try_wait().is_ok_and(|status| status.is_none()) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
     }
 }
 
@@ -9995,13 +10010,112 @@ fn fake_ssh(local: &Env, remote: &Env) -> (PathBuf, String) {
             "#!/bin/sh\necho \"$*\" >> {log}\nfor a; do cmd=$a; done\n\
              case \"$*\" in *down.lan*) echo 'ssh: connect to host down.lan port 22: Connection refused' >&2; exit 255;; esac\n\
              unset KRAAL KRAAL_SOCKET KRAAL_SESSION KRAAL_PANE\n\
-             export XDG_RUNTIME_DIR={r}/run XDG_STATE_HOME={r}/state XDG_CONFIG_HOME={r}/config\n\
+             export HOME={r}/home XDG_RUNTIME_DIR={r}/run XDG_STATE_HOME={r}/state XDG_CONFIG_HOME={r}/config\n\
              exec sh -c \"$cmd\"\n",
             log = log.display(),
             r = remote.root.display()
         ),
     );
     (log, format!("{}:{}", bin.display(), std::env::var("PATH").unwrap_or_default()))
+}
+
+#[cfg(unix)]
+#[test]
+fn host_attach_delivers_copies_to_one_clients_terminal() {
+    use base64::Engine;
+
+    let local = Env::new("copylocal");
+    let remote = Env::new("copyremote");
+    // A noninteractive shell and no tty echo: only program output can satisfy the markers.
+    remote.workspace(
+        "w",
+        "layout {\n    pane name=\"main\" command=\"sh\" { args \"-c\" \"stty -echo; echo SELECT-ME-PLEASE; cat | sh\"; }\n}\n",
+    );
+    remote.run(&["open", "w"]);
+    remote.wait_for_text("main", "SELECT-ME-PLEASE");
+    let (log, path) = fake_ssh(&local, &remote);
+    let mut direct = TerminalClient::start(remote.cmd(&["attach", "w"]));
+    let mut cmd = local.isolated(Path::new(env!("CARGO_BIN_EXE_kraal")));
+    cmd.args(["-s", &remote.session, "attach", "--host", "copy.invalid", "w"]);
+    cmd.env("PATH", &path);
+    let mut host = TerminalClient::start(cmd);
+    direct.wait_for("SELECT-ME-PLEASE");
+    host.wait_for("SELECT-ME-PLEASE");
+    assert!(std::fs::read_to_string(log).unwrap().contains("proxy -s copyremote"));
+
+    let osc = |text: &str| format!("\x1b]52;c;{}\x07", base64::engine::general_purpose::STANDARD.encode(text));
+    let copy = |client: &mut TerminalClient, text: &str| {
+        let encoded = base64::engine::general_purpose::STANDARD.encode(text);
+        client.type_keys(format!("printf '\\033]52;c;{encoded}\\007{text}\\n'\r").as_bytes());
+    };
+    // Each client's input precedes the copy its program emits. The other client's drawn
+    // marker is a barrier after that copy, so absence there is checked after delivery.
+    copy(&mut host, "FROM-HOST");
+    host.wait_for(&osc("FROM-HOST"));
+    direct.wait_for("FROM-HOST");
+    copy(&mut direct, "FROM-LOCAL");
+    direct.wait_for(&osc("FROM-LOCAL"));
+    host.wait_for("FROM-LOCAL");
+
+    // Coordinates come from the rendered cells, not a particular sidebar width or frame.
+    let rows = text_after(&host.written.lock().unwrap(), 100, 30);
+    let (y, row) = rows.iter().enumerate().find(|(_, row)| row.contains("SELECT-ME-PLEASE")).unwrap();
+    let x = row.split("SELECT-ME-PLEASE").next().unwrap().chars().count() + 1;
+    let end = x + "SELECT-ME-PLEASE".len() - 1;
+    let y = y + 1;
+    host.type_keys(format!("\x1b[<0;{x};{y}M\x1b[<32;{end};{y}M\x1b[<0;{end};{y}m").as_bytes());
+    host.wait_for(&osc("SELECT-ME-PLEASE"));
+    host.wait_for("copy sent to terminal");
+    assert_eq!(remote.run(&["buffer", "show"]), "SELECT-ME-PLEASE");
+    // A later frame on both clients also bounds the check for an unwanted broadcast.
+    copy(&mut direct, "LOCAL-AGAIN");
+    direct.wait_for(&osc("LOCAL-AGAIN"));
+    host.wait_for("LOCAL-AGAIN");
+    let count = |client: &TerminalClient, sequence: &str| {
+        client.written.lock().unwrap().windows(sequence.len()).filter(|w| *w == sequence.as_bytes()).count()
+    };
+    for (text, direct_count, host_count) in
+        [("FROM-HOST", 0, 1), ("FROM-LOCAL", 1, 0), ("SELECT-ME-PLEASE", 0, 1), ("LOCAL-AGAIN", 1, 0)]
+    {
+        assert_eq!(count(&direct, &osc(text)), direct_count, "local client: {text}");
+        assert_eq!(count(&host, &osc(text)), host_count, "host client: {text}");
+    }
+    assert_eq!(count(&direct, "\x1b]52;"), 2);
+    assert_eq!(count(&host, "\x1b]52;"), 2);
+    direct.type_keys(b"\x02d");
+    host.type_keys(b"\x02d");
+    assert_eq!(direct.left("local detach").0, 0);
+    assert_eq!(host.left("host detach").0, 0);
+}
+
+#[test]
+fn panes_keep_the_servers_display_environment_and_native_copy_stays_there() {
+    let env = Env::new("copydisplay");
+    env.workspace("w", "layout {\n    pane name=\"main\"\n}\n");
+    let out = env.cmd(&["open", "w"]).env("DISPLAY", ":42").env("WAYLAND_DISPLAY", "wayland-test").output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let client = RawClient::attach(&env, "w");
+    let clipboard = env.root.join("server-clipboard");
+    let native = env.root.join("native-copy");
+    // Stand in for a native clipboard tool without touching any graphical session.
+    write_script(&native, &format!("#!/bin/sh\ncat > {}\n", clipboard.display()));
+    // Keep the screen marker first so a narrow split cannot wrap it between terminal sequences.
+    let script = format!(
+        "printf 'server-only' | {}; printf 'NATIVE-DONE DISPLAY=%s WAYLAND_DISPLAY=%s\\n' \"$DISPLAY\" \"$WAYLAND_DISPLAY\"; exec sleep 60",
+        native.display()
+    );
+    let out = env
+        .cmd(&["run", "--name", "copy", "--", "sh", "-c", &script])
+        .env_remove("DISPLAY")
+        .env_remove("WAYLAND_DISPLAY")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    client.wait_for_screen("NATIVE-DONE");
+    env.wait_for_text("copy", "NATIVE-DONE DISPLAY=:42 WAYLAND_DISPLAY=wayland-test");
+    assert_eq!(std::fs::read_to_string(clipboard).unwrap(), "server-only");
+    assert!(buffer_list(&env).is_empty());
+    assert!(!String::from_utf8_lossy(&client.screen.lock().unwrap()).contains("\x1b]52;"));
 }
 
 #[cfg(unix)]

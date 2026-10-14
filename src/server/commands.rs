@@ -47,15 +47,7 @@ impl Server {
         let found = focus.and_then(|p| self.panes.get_mut(&p)).and_then(|p| p.last_command_output());
         match found {
             Some((_, output)) if output.is_empty() => self.toast(id, "the last command printed nothing"),
-            Some((command, output)) => {
-                let lines = output.lines().count();
-                self.copy_to_client(id, &output);
-                let what = command.map(|c| format!(" of {c}")).unwrap_or_default();
-                self.toast(
-                    id,
-                    format!("copied the output{what} ({} line{})", lines, if lines == 1 { "" } else { "s" }),
-                );
-            }
+            Some((_, output)) => self.copy_to_client(id, &output),
             None => self.toast(id, NO_MARKS),
         }
     }
@@ -70,6 +62,26 @@ fn announced(threshold: u64, ran: Duration, watched: bool) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn copying_command_output_keeps_the_terminal_delivery_message() {
+        use crate::pane::{Pane, PaneSpec};
+        use crate::server::{
+            queue,
+            tests::{client, server},
+        };
+
+        let (tx, _events) = queue::channel(4096);
+        let mut server = server(tx);
+        let (id, _peer) = client(&mut server);
+        let spec = PaneSpec { command: vec!["true".into()], ..Default::default() };
+        let mut pane = Pane::spawn(99, None, spec, 80, 24, &server.env, &server.tx).unwrap();
+        pane.feed(b"\x1b]133;A\x07$ \x1b]133;B\x07echo hello\r\n\x1b]133;C\x07hello\r\n\x1b]133;D;0\x07");
+        server.panes.insert(99, pane);
+        server.copy_last_output(id, Some(99));
+        assert_eq!(server.buffers.get(None).unwrap().text, "hello");
+        assert_eq!(server.clients[&id].toast.as_ref().unwrap().0, "copy sent to terminal");
+    }
 
     #[test]
     fn only_long_commands_ending_out_of_sight_are_announced() {

@@ -395,7 +395,12 @@ impl Server {
         if remote && crate::hints::loopback_port(url).is_some() {
             let host = crate::context::hostname().unwrap_or_else(|| "the server".into());
             self.copy_to_client(client, url);
-            self.toast(client, format!("{url} is on {host}, where kraal runs: copied (open it there, or ssh -L)"));
+            if self.buffers.get(Some("0")).is_ok_and(|buffer| buffer.text == url) {
+                self.toast(
+                    client,
+                    format!("{url} is on {host}, where kraal runs: kept in paste buffers (open it there, or ssh -L)"),
+                );
+            }
             return;
         }
         self.send_msg(client, &crate::protocol::ServerMsg::Open { url: url.to_string() });
@@ -410,6 +415,54 @@ mod tests {
         queue,
         tests::{client, server},
     };
+
+    #[test]
+    fn a_remote_loopback_link_reports_the_buffer_it_kept() {
+        let (tx, _rx) = queue::channel(16);
+        let mut server = server(tx);
+        let (id, _peer) = client(&mut server);
+        server.clients.get_mut(&id).unwrap().remote = true;
+        let url = "http://localhost:3000/";
+        server.open_for(id, url);
+        assert_eq!(server.buffers.get(None).unwrap().text, url);
+        let message = &server.clients[&id].toast.as_ref().unwrap().0;
+        assert!(message.contains("kept in paste buffers (open it there, or ssh -L)"), "{message}");
+    }
+
+    #[test]
+    fn a_remote_loopback_link_not_kept_reports_the_delivery_result() {
+        let url = "http://localhost:3000/";
+        for (limit, max_bytes, named) in [(0, 1024, false), (10, url.len(), true), (10, url.len() - 1, false)] {
+            let (tx, _rx) = queue::channel(4096);
+            let mut server = server(tx);
+            server.buffers.set_limits(limit, max_bytes);
+            if named {
+                server.buffers.set(Some("keep"), "held".into(), 0).unwrap();
+            }
+            let (id, peer) = client(&mut server);
+            server.clients.get_mut(&id).unwrap().remote = true;
+            server.open_for(id, url);
+            assert_eq!(server.clients[&id].toast.as_ref().unwrap().0, "copy sent to terminal");
+            assert!(!server.buffers.list().iter().any(|buffer| buffer.text == url));
+            drop(peer);
+            // The writer learns the peer is gone asynchronously on macOS.
+            let start = Instant::now();
+            loop {
+                server.open_for(id, url);
+                let message = &server.clients[&id].toast.as_ref().unwrap().0;
+                if message == "copy not sent: try again" {
+                    break;
+                }
+                assert_eq!(message, "copy sent to terminal");
+                assert!(start.elapsed() < crate::testing::PATIENCE, "the closed client still accepts copies");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            assert!(!server.buffers.list().iter().any(|buffer| buffer.text == url));
+            if named {
+                assert_eq!(server.buffers.get(Some("keep")).unwrap().text, "held");
+            }
+        }
+    }
 
     #[test]
     fn a_pending_warning_cannot_hide_a_result_before_its_first_frame() {

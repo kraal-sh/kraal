@@ -505,6 +505,11 @@ mod tests {
 
     #[test]
     fn batch_publication_cannot_bypass_a_held_session_lock() {
+        // Another test's child can inherit the runtime lock until it reaches exec, keeping it
+        // held briefly after drop. Run alone so the publication below sees the released lock.
+        if !crate::testing::in_own_process("cli::session::tests::batch_publication_cannot_bypass_a_held_session_lock") {
+            return;
+        }
         let name = format!("batch-publication-{}", std::process::id());
         let session = Session { explicit: Some(name.clone()), name };
         let dir = std::env::temp_dir().join(format!("kraal-{}", session.name));
