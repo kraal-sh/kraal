@@ -123,9 +123,7 @@ impl Server {
                 Response::Ok
             }),
             Request::RenamePane { pane, name } => self.resolve(&pane).map(|p| {
-                if let Some(pn) = self.panes.get_mut(&p) {
-                    pn.name = (!name.is_empty()).then_some(name);
-                }
+                self.rename_pane(p, (!name.is_empty()).then_some(name));
                 self.mark_persist();
                 self.mark_dirty();
                 Response::Ok

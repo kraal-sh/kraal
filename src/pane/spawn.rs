@@ -84,6 +84,23 @@ impl Launch {
     }
 }
 
+pub(super) fn check_program(spec: &super::PaneSpec, shell: &str) -> Result<()> {
+    let cwd = match &spec.cwd {
+        Some(cwd) => cwd.clone(),
+        None => std::env::current_dir()?,
+    };
+    let path = spec
+        .env
+        .iter()
+        .rev()
+        .find(|(key, _)| key == "PATH")
+        .map(|(_, value)| value.into())
+        .or_else(|| if spec.env_remove.iter().any(|key| key == "PATH") { None } else { std::env::var_os("PATH") });
+    let program = spec.command.first().map_or(shell, String::as_str);
+    anyhow::ensure!(super::pty::findable(program.as_ref(), &cwd, path.as_deref()), "starting {program:?}: not found");
+    Ok(())
+}
+
 mod native {
     use std::ffi::{CString, OsStr, OsString};
     use std::os::unix::ffi::OsStrExt;

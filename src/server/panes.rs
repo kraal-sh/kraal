@@ -258,12 +258,15 @@ impl Server {
         let ssh = self.ssh_target_of(&spec);
         let pane = self.panes.get_mut(&id).context("no such pane")?;
         pane.spec = placeholder(&spec, reason);
-        pane.respawn(&self.env, &self.tx)?;
+        let result = pane.respawn(&self.env, &self.tx);
         pane.ssh = ssh;
         pane.spec = spec;
         pane.suspended = true;
+        if result.is_err() {
+            pane.exit_code = Some(None);
+        }
         self.persist_dirty = true;
-        Ok(())
+        result
     }
 
     /// A pane in workspace `ws` that runs `prelude` (a new worktree's setup) before its own
@@ -381,6 +384,12 @@ impl Server {
         let Some(pane) = self.panes.get_mut(&id) else { return };
         if pid.is_some() && pane.pid() != pid {
             return; // an earlier process of a respawned pane
+        }
+        if self.pane_edits.contains_key(&id) {
+            pane.exit_code = Some(code);
+            self.check_pane_edits();
+            self.mark_dirty();
+            return;
         }
         if pane.spec.login.is_some() {
             self.login_exited(id, code);
@@ -570,6 +579,7 @@ impl Server {
         }
         for &id in &panes {
             self.switches.remove(&id);
+            self.pane_edits.remove(&id);
             if let Some(pane) = self.panes.get_mut(&id) {
                 pane.restart_with = None;
                 pane.preparing = false;

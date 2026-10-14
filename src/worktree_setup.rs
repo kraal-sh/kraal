@@ -543,6 +543,11 @@ pub fn carry_env(from: &[(String, String)], to: &mut Vec<(String, String)>) {
     }
 }
 
+/// Remove the variables of the previous worktree before changing a pane's folder.
+pub fn clear_env(env: &mut Vec<(String, String)>) {
+    env.retain(|(key, _)| !VARS.contains(&key.as_str()));
+}
+
 /// Whether `dir` is where kraal puts worktrees (`<repo>.worktrees/<name>`, or below it).
 pub fn in_worktrees_dir(dir: &Path) -> bool {
     dir.ancestors().filter_map(|a| a.parent()?.file_name()).any(|n| n.to_string_lossy().ends_with(".worktrees"))

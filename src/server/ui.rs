@@ -23,6 +23,7 @@ pub enum Mode {
     Picker(Picker),
     Prompt(Prompt),
     AccountForm(super::account_ui::AccountForm),
+    PaneForm(Box<super::pane_ui::PaneForm>),
     AccountDetails(super::account_ui::AccountDetails),
     Help {
         scroll: u16,
@@ -73,7 +74,7 @@ impl Mode {
             Mode::Scroll => "COPY",
             Mode::Search { .. } => "SEARCH",
             Mode::Picker(_) => "CHOOSE",
-            Mode::Prompt(_) | Mode::AccountForm(_) => "INPUT",
+            Mode::Prompt(_) | Mode::AccountForm(_) | Mode::PaneForm(_) => "INPUT",
             Mode::AccountDetails(_) => "ACCOUNT",
             Mode::Help { .. } => "HELP",
             Mode::Messages { .. } => "MESSAGES",
@@ -111,6 +112,7 @@ pub enum ConfirmAction {
         target: Option<crate::accounts::Account>,
     },
     ClosePane(PaneId),
+    ApplyPane(Box<super::pane_ui::PaneForm>),
     CloseTab {
         workspace: u32,
         tab: u32,
@@ -198,6 +200,7 @@ impl ConfirmAction {
             ConfirmAction::UseExisting { .. } => "Use account".into(),
             ConfirmAction::RemoveAccount(_) => "Remove".into(),
             ConfirmAction::ClosePane(_) => "Close pane".into(),
+            ConfirmAction::ApplyPane(_) => "Stop and apply".into(),
             ConfirmAction::CloseTab { .. } => "Close tab".into(),
             ConfirmAction::CloseWorkspace { .. } => "Stop and close".into(),
             ConfirmAction::DeleteWorkspace { stop, .. } => if *stop { "Stop and delete" } else { "Delete" }.into(),

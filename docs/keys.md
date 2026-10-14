@@ -21,7 +21,7 @@ any keyboard layout.
 | workspaces | `w` choose one | `W`: `w` choose, `n` add, `←`/`→` previous/next, `e` rename, `s` save the layout, `r` restart the session (on the kraal installed now), `q` quit, `x` close |
 | agents | `a` start one on an account | `A`: `a` start, `l` accounts, `n` add account, `g` go to the agent needing you, `c` change account |
 | tabs | `t` new tab | `T`: `t` new, `←`/`→` previous/next, `e` rename, `x` close |
-| panes | `p` find a pane | `P`: `p` find, `n` new, `→`/`↓` split, `e` rename, `r` resize with the arrows, `f` floating, `l` next layout, `s` then an arrow stack with the pane on that side, `u` unstack, `x` close |
+| panes | `p` find a pane | `P`: `p` find, `n` new, `→`/`↓` split, `e` edit name, folder and command, `r` resize with the arrows, `f` floating, `l` next layout, `s` then an arrow stack with the pane on that side, `u` unstack, `x` close |
 | view | `v` copy mode: scroll and select | `V`: `v` copy mode, `g` search the output, `o` links and paths, `c` copy the last command's output, `p` paste buffers, `f` floating panes, `l` sidebar, `k` bottom bar, `j` message log |
 | files | `f` file manager | `F`: `f` file manager, `p` preview a file, `u`/`d` upload/download |
 | run | `r` tools where the pane is | `R`: `r` tools, `b` runbooks, `g` git and worktrees |
@@ -30,9 +30,18 @@ Closing a workspace keeps its layout and leaves it **Closed** in Workspaces. Ent
 again. Closing its last pane leaves **+ Add pane**, available with Enter or a click. Neither
 closes the session; `ctrl+b q` quits it.
 
-Inside every menu the same letters do the same things: `n` new, `x` close, `e` rename, arrows
+Inside every menu the same letters do the same things: `n` new, `x` close, `e` edit or rename, arrows
 previous and next, and the theme's letter (or Enter) its main action again. Backspace goes back
 to the menu before, Esc closes.
+
+**Edit pane** (`ctrl+b P e`, or the command palette with either preset) opens **Name**, **Folder**
+and **Command**. Enter applies, Tab moves between fields and buttons, and Esc cancels.
+A name change keeps the program running. Changing a running pane's command or folder asks
+**Apply command?**, with **Cancel** selected and **Stop and apply** as the confirming action.
+Cancel returns to the entered fields. A stopped pane stays ready for **Enter Run**.
+Previews, file managers and sign-in panes offer their name only. The existing `rename_pane`
+action and the classic preset's `.` still rename without changing the launch.
+See [Editing a pane](workspaces.md#editing-a-pane).
 
 | Other keys after `ctrl+b` | |
 |---|---|

@@ -119,9 +119,7 @@ impl Server {
                 }
             }
             PromptAction::RenamePane(pane) => {
-                if let Some(pn) = self.panes.get_mut(&pane) {
-                    pn.name = (!value.is_empty()).then_some(value);
-                }
+                self.rename_pane(pane, (!value.is_empty()).then_some(value));
             }
             PromptAction::RenameWorkspace(_) | PromptAction::NewWorkspace | PromptAction::RestoreWorkspace(_) => {
                 unreachable!("answered in submit_prompt")
@@ -331,6 +329,9 @@ impl Server {
         }
         let action = q.action;
         match action {
+            ConfirmAction::ApplyPane(form) => {
+                return if yes { self.submit_pane_form(id, *form, true) } else { Mode::PaneForm(form) };
+            }
             ConfirmAction::OpenWorkspace(action) => {
                 let mut p = self.workspace_picker(self.clients[&id].workspace);
                 if let Some(state) = q.workspace_back {
@@ -417,6 +418,7 @@ impl Server {
             true => {
                 match action {
                     ConfirmAction::RemoveAccount(_)
+                    | ConfirmAction::ApplyPane(_)
                     | ConfirmAction::ReplaceWorkspaceFile { .. }
                     | ConfirmAction::OpenWorkspace(_)
                     | ConfirmAction::UseExisting { .. }
