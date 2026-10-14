@@ -2,6 +2,13 @@
 
 What kraal adds to the terminal inside each pane: the commands your shell ran, and images.
 
+## Input while panes are busy
+
+Keys, paste and mouse input interrupt busy panes between short slices of output, including
+when several panes are redrawing after a resize. The focused pane's echo can interrupt other
+panes' output even when that pane is already being watched for more output. Background panes
+still take turns, and interrupted output is kept for their next turn. No setting is needed.
+
 ## Clipboard
 
 With a current client and server, kraal sends a structured copy to the attaching machine.

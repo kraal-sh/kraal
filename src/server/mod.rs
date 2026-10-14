@@ -24,6 +24,8 @@ mod graphics;
 mod hints;
 mod input;
 pub mod net;
+#[cfg(test)]
+mod output_tests;
 pub(crate) mod overlays;
 mod pane_ui;
 mod panes;
@@ -1182,7 +1184,7 @@ impl Server {
     /// chunk: a pane printing without a pause keeps the queue busy, and must not starve the
     /// rest. A frame due once the focused panes are read (the echo of a key) goes before the
     /// others' output, every other time at most. A chunk is parsed a slice at a time: one that
-    /// comes while it is parsed (a key) waits for a slice, not for all of it.
+    /// comes while it is parsed (a key or its echo) waits for a slice, not for all of it.
     fn pump_output(&mut self, budget: Duration, rx: &EventReceiver) {
         let start = Instant::now();
         let focused: Vec<PaneId> =
@@ -1193,9 +1195,13 @@ impl Server {
             let now = Instant::now();
             start.elapsed() < budget
                 && rx.is_empty()
+                && !s.echo_ready()
                 && [s.next_render, s.image_wake].into_iter().flatten().all(|t| t > now)
         };
         for p in focused {
+            if !rx.is_empty() {
+                break;
+            }
             let mut first = true;
             while std::mem::take(&mut first) || more(self, budget / 2) {
                 if !self.take_output(p, &mut data, true) {
@@ -1207,8 +1213,14 @@ impl Server {
             }
         }
         // The frame due after a resize shows the panes as they drew themselves again, not as
-        // they were left: what they printed since is read before it.
+        // they were left: what they printed since is read before it. A frame already due
+        // (the focused pane's echo) goes first, with only the bounded turn below before it.
+        let now = Instant::now();
+        let due = [self.next_render, self.image_wake].into_iter().flatten().any(|t| t <= now);
         for p in self.redrawn() {
+            if due || !rx.is_empty() || self.echo_ready() {
+                break;
+            }
             if self.take_output(p, &mut data, true) {
                 self.parse_output(p, &data, rx, false);
             }
@@ -1248,7 +1260,7 @@ impl Server {
     }
 
     /// Parse output `data` of pane `id`, a slice at a time, until it is all parsed (true) or
-    /// something waits in `rx` (after one slice with `one`): then the rest is parsed before any
+    /// an event or an echo waits (after one slice with `one`): then the rest is parsed before any
     /// more of the pane's output, and the pane stays in the queue for it.
     fn parse_output(&mut self, id: PaneId, data: &[u8], rx: &EventReceiver, one: bool) -> bool {
         let typing = self.clients.values().any(|c| c.attached && c.last_input.elapsed() < TYPING);
@@ -1258,7 +1270,7 @@ impl Server {
             let end = (at + slice).min(data.len());
             self.pane_output(id, &data[at..end]);
             at = end;
-            if at < data.len() && (one || !rx.is_empty()) && self.panes.contains_key(&id) {
+            if at < data.len() && (one || !rx.is_empty() || self.echo_ready()) && self.panes.contains_key(&id) {
                 self.unparsed.insert(id, data[at..].to_vec());
                 if self.ready_set.insert(id) {
                     self.ready.push_back(id);
@@ -1267,6 +1279,15 @@ impl Server {
             }
         }
         true
+    }
+
+    fn echo_ready(&self) -> bool {
+        // Streaming panes need not publish another event. Their echo must interrupt another
+        // pane's batch even when the event queue is empty.
+        self.echo.iter().any(|(id, until)| {
+            Instant::now() <= *until
+                && (self.unparsed.contains_key(id) || self.panes.get(id).is_some_and(|p| p.has_output()))
+        })
     }
 
     /// Whether pane `id` printed just now: the server then comes back for its output on its own
