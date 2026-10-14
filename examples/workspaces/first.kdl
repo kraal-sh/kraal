@@ -3,6 +3,10 @@
 // (from a pane of kraal: `kraal open first`, or `ctrl+b w`).
 // Needs nothing installed. The pane on the right shows ~/notes.md rendered, and again each
 // time the file changes: write it from the shell on the left.
+
+// Import with `kraal import examples/workspaces/first.kdl` to preview before adding.
+// Imported commands wait for Enter; the named-file opening above honors their launch settings.
+// After opening, the layout is kept automatically. Export writes a separate reusable recipe.
 layout {
     cwd "~"
     tab name="notes" focus=true {

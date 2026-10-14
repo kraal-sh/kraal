@@ -3,7 +3,12 @@
 ## Saved files and sessions
 
 Kraal 0.4 migrates sessions and `accounts.toml` from **0.2.0** and **0.3.0** once,
-keeping a copy before conversion. Existing workspace KDL and configuration files keep working.
+keeping a copy before conversion. This migration belongs to 0.4 and is removed in **0.5.0**.
+Existing workspace KDL and configuration files keep working.
+
+Each save writes the current state format only. Kraal does not also write a downgraded copy
+for older versions. Migration backups and the untouched legacy session are recovery copies,
+not synchronized views of the current session.
 Session migration preserves the personal layout, identities, source links, account references,
 restore failures and available scrollback. Account migration happens on the next change to the
 file, keeping comments, order and unknown keys. See [Workspace migration](workspaces.md#workspace-identities-and-migration)
@@ -40,71 +45,32 @@ behavior until restarted: a new client cannot add file protections or lifecycle 
 A restart from 0.2.0 ends attached terminals; attach again afterwards. Later clients wait for
 the replacement server.
 
-Workspace Add and Rename use the attached terminal's existing input protocol. No new request or
-saved-state field is needed. A workspace's name is independent of its source path; older versions
-already read these separately. Renaming on a current server leaves every KDL file unchanged.
-A session still running 0.2.0 or 0.3.0 retains that server's old rename behavior.
+The running server determines the behavior. On a current server, attached clients, including
+0.2.0 and 0.3.0 clients, can use the current lists, forms and actions through the existing
+terminal-input protocol. This includes workspace Close, Delete, Restore, Duplicate, ordering,
+source review and pane editing, as well as account, server and tunnel forms. Renaming a workspace
+leaves KDL files unchanged. Closed layouts and recovery records stay in the current session
+state; the legacy session is not rewritten to resemble them.
 
-Delete, Undo and Deleted workspaces also use the existing attached-terminal input protocol.
-Their retained layouts, deletion intents and source exclusions stay in `sessions-v2` with the
-session's private state. Missing deletion fields in an earlier snapshot mean no deletions.
-The 0.2.0 and 0.3.0 session paths remain untouched, so those releases cannot read a session
-containing only deleted workspaces as an empty session or overwrite its recovery records.
-An older running server continues its existing workspace behavior until restarted.
+CLI features that need newer requests are checked separately:
 
-Move up and Move down use the existing attached-terminal input protocol too. The optional
-`workspace_order` field in `sessions-v2` records saved identities and the paths of files not yet
-imported. A snapshot without it keeps its saved sequence followed by scanned files. Importing
-a file replaces its order reference with the workspace's identity, without changing its position.
-The 0.2.0 and 0.3.0 state paths remain untouched. Their clients can use the actions when attached
-to a current server; an older running server keeps its existing order behavior.
+| Feature | Compatibility behavior |
+|---|---|
+| `kraal import` and `kraal export` | Require the server's `workspace_files` capability; older servers refuse with restart guidance. |
+| Workspace Create, Rename, Close, Delete, Restore and deleted listing | Require `workspace_lifecycle` when talking to a running server. |
+| `kraal save` | Keeps its existing request, name rules and explicit account references. Current servers treat it as legacy KDL export and refuse unconfirmed replacements. |
+| `kraal open`, workspace listing, pane Close and Rename | Keep their existing requests and meanings. Open does not switch an attached terminal's view. |
 
-Edit pane uses the existing attached-terminal input protocol and the existing pane command,
-directory, name and stopped-state fields in `sessions-v2`. It adds no wire request or saved-state
-format. Old custom `rename_pane` bindings keep working; the default `ctrl+b P e` now opens the
-form whose Name field also renames. An older running server keeps its existing pane actions.
+Existing `rename_pane` key bindings still rename; the default `ctrl+b P e` opens Edit pane.
+The existing `[servers] auto_add` boolean now controls discovery suggestions on a current server;
+only explicit Add saves an unknown server. Previously saved entries remain usable. Tunnels keep
+the wire states `connecting`, `up` and `down`; the current UI labels `up` as **Ready**. Their CLI
+still chooses an available local port when `--local` is omitted.
 
-Duplicate uses the same attached-terminal input protocol and existing saved-layout fields.
-Its closed copy has a new identity, no source-file association, and stopped command panes without
-conversation or scrollback references. No KDL, configuration or protocol format changes are
-needed. Copies stay in `sessions-v2`; the 0.2.0 and 0.3.0 paths and migration backups are untouched.
-Clients from those releases can use Duplicate on a current server. An older running server
-keeps its existing actions until restarted.
-
-Import and Export use new requests gated by the `workspace_files` capability. Older running
-servers refuse them with the usual restart guidance. `kraal save` keeps its existing wire request,
-name rules and account references, and now explains that it exports KDL. Current servers refuse
-unconfirmed replacements, including unchanged sources; old servers retain their own behavior.
-No new session format is introduced. Imported source bytes and export listing exclusions use
-existing version 2 fields, leaving all legacy state paths untouched.
-
-Add server uses the existing attached-terminal input protocol and the existing `servers.toml`
-format. Saving is separate from SSH. The `auto_add` configuration key still reads as a boolean;
-on a current server it controls discovery suggestions, which require explicit addition.
-Previously saved servers, including the `discovered` group, keep working without migration.
-Remote attach still marks an existing matching entry for agent watching, but suggests an
-explicit save for an unknown connection. Older running servers keep their existing discovery
-behavior until restarted. No session format or legacy state path changes are needed.
-
-Review, Keep layout, Load from file and Undo load use the existing attached-terminal input
-protocol. Optional `source_reviewed`, `pending_layout` and `layout_undo` fields in `sessions-v2`
-retain the acknowledged source revision, prepared commands that wait for Enter, and the previous
-local layout. Missing fields mean no acknowledgement, pending load or Undo. Source KDL,
-configuration, protocol messages and the 0.2.0 and 0.3.0 state paths remain unchanged. Clients
-from those releases can use these actions on a current server. An older running server keeps
-its existing source-file behavior until restarted.
-
-The tunnel form, list and result controls use the existing attached-terminal input protocol.
-They keep the saved tunnel fields and wire state names (`connecting`, `up`, `down`) unchanged;
-**Ready** is the UI label for `up`. The CLI still chooses an available port when `--local` is
-omitted. No configuration, KDL or session format changes are needed, and legacy state paths
-remain untouched. Older running servers keep their existing tunnel UI until restarted.
-
-Workspace Create, Rename, Close, Delete, Restore and the deleted-workspace list use new
-requests advertised as `workspace_lifecycle`. An older server refuses them with the usual
-restart guidance. Existing pane Close and Rename commands, workspace listing and Open requests
-keep their meanings. Workspace drag uses the attached-terminal input protocol and the existing
-saved order. These operations add no session, workspace-file or configuration format change.
+New optional fields in the current session format retain deleted workspaces, source review,
+layout Undo and workspace order. Missing fields retain their older defaults. These additions
+never put current state into the 0.2.0 or 0.3.0 paths. See [Workspaces](workspaces.md) and
+[Accounts](agents.md#accounts) for the retained state and its limits.
 
 Clipboard messages and results use the optional `clipboard` capability in both peers' lists.
 A current server sends either a structured copy to a capable client or legacy OSC 52 bytes to

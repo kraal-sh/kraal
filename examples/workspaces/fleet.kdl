@@ -4,6 +4,10 @@
 // and kraal asks before broadcast keys or a paste of several lines reach it.
 // Needs servers you can ssh to, in place of the example.com hosts. With examples/servers.toml
 // in place, each pane takes its entry's name, env and groups: the three are `@web`, not `@fleet`.
+
+// Import with `kraal import examples/workspaces/fleet.kdl` to preview before adding.
+// Imported commands wait for Enter; the named-file opening above honors their launch settings.
+// After opening, the layout is kept automatically. Export writes a separate reusable recipe.
 layout {
     tab name="web" {
         pane split_direction="vertical" {

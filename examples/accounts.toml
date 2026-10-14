@@ -10,7 +10,9 @@ threshold = 85                  # percent of the 5-hour or weekly window: the ac
 mode = "ask"                    # "notify" tells you, "ask" offers, "auto" checks before moving
 # Changes need known usage below the threshold and verified sign-in. Unknown usage is not zero.
 # Notify messages include Change account; choosing it opens the affected pane's picker.
+# Claude changes require a readable, compatible conversation; Codex starts a new one.
 # A successful change offers Undo, also kept in the pane's actions.
+# Undo returns Codex to its original account's conversation and never reverts project files.
 # A failed automatic change waits for a manual retry or a new crossing of the threshold.
 
 # Names can also be written as agent:name. On rewriting, kraal binds known accounts to internal

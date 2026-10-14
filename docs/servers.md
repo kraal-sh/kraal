@@ -2,6 +2,17 @@
 
 Every machine you SSH to, at hand: an inventory, file transfers in every direction, its files in your own editor, commands and logs across a fleet, tunnels, and kraal itself on a server.
 
+## Add, then connect
+
+Open **Servers** (`ctrl+b s`), choose **+ Add server**, fill **Address** and **Name**, then
+select **Add**. **Server added** means the entry was saved locally. Enter on that row connects;
+SSH success is a separate result. Search only filters the list.
+
+To forward a port, select a server, press Tab and choose **Add tunnel**. Check **Server**,
+**Remote** and **Local**, then **Add**. Follow **Connecting**, **Ready** or **Error** in
+**Tunnels** (`ctrl+b S o`); open a row for details, **Retry now** or **Stop**. Ready confirms
+SSH's local listener, not that the remote application answers.
+
 ## The inventory
 
 kraal keeps an inventory in `~/.config/kraal/servers.toml`
@@ -166,7 +177,7 @@ asks for more than a password (a one-time code), or that requires a terminal, is
 | `kraal exec web01 db -- 'df -h /var'` | or on named servers |
 | `kraal exec @prod --parallel 4 --timeout 10 --json -- uptime` | four servers at a time (16 by default), ten seconds each (60 by default), results as JSON |
 | `kraal ssh @prod --group -- journalctl -fu nginx` | one pane per server running it, in a grid |
-| `kraal tunnel add db 5432` | `localhost:5432` goes to db's 5432, and stays open |
+| `kraal tunnel add db 5432` | forwards to db's port 5432 on an available local port, printed by the command |
 | `kraal tunnel add bastion db.internal:5432 --local 15432` | a port of a machine that server reaches, on the local port you choose |
 | `kraal tunnel list` | the tunnels: their state, the server and its port, and the local port each one is on |
 | `kraal tunnel rm 15432` | closes one, by its local port: the list shows it, and no two tunnels share one |

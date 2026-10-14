@@ -27,8 +27,8 @@ any keyboard layout.
 | run | `r` tools where the pane is | `R`: `r` tools, `b` runbooks, `g` git and worktrees |
 
 Closing a workspace keeps its layout and leaves it **Closed** in Workspaces. Enter opens it
-again. Closing its last pane leaves **+ Add pane**, available with Enter or a click. Neither
-closes the session; `ctrl+b q` quits it.
+again. Closing its last pane keeps an empty, open workspace with **+ Add pane**, available
+with Enter or a click. Neither closes the session; `ctrl+b q` quits it.
 
 Inside every menu the same letters do the same things: `n` new, `x` close, `e` edit or rename, arrows
 previous and next, and the theme's letter (or Enter) its main action again. Backspace goes back
@@ -65,13 +65,17 @@ Without the prefix: `alt+arrows` move the focus (left/right at the edge go to th
 the keys of the default preset: with another preset or keys of your own, the menu, the help
 (`ctrl+b h` here) and `kraal config keys` show yours.
 
+In **Add workspace**, **From file...** accepts a KDL path and previews it before **Add**.
+Imported commands and agents wait for Enter. Neither import nor export is needed to retain
+your personal workspace. See [Importing a layout](workspaces.md#importing-a-layout).
+
 Exporting a workspace layout (`ctrl+b W s`) proposes a copy and asks before replacing any existing
 file. **Cancel** is selected and returns to the entered path. A destination
 linked to another workspace is refused. See [Saving without replacing someone else's layout](workspaces.md#saving-without-replacing-someone-elses-layout).
 
-Closing a workspace (`ctrl+b W x`, or `ctrl+x` in the workspace picker) lists its running
-programs and background jobs, and keeps its current layout as **Closed**.
-**Cancel** is selected first; **Stop and close** confirms. See [Closing a workspace](workspaces.md#closing-a-workspace).
+Closing a workspace (`ctrl+b W x`, or `ctrl+x` on its open row in Workspaces) keeps its current
+layout as **Closed**. When programs or background jobs need to stop, it lists them with
+**Cancel** selected first; **Stop and close** confirms. Idle shells need no extra confirmation. See [Closing a workspace](workspaces.md#closing-a-workspace).
 
 **Move up** and **Move down** are in the workspace's Tab actions, with no direct shortcut.
 They keep the row selected and leave each terminal's workspace and pane focus unchanged.
@@ -156,11 +160,22 @@ unstack.
 the match and goes on in copy mode, Esc cancels. `ctrl+b P r` resizes: the arrows (or `hjkl`)
 move the focused pane's border, Enter or Esc ends it.
 
+The account name in a Claude or Codex pane's frame opens **Change account** too. Claude can
+continue a verified conversation; Codex starts a new one. After a change, click **Undo** in its
+message, or use **Find a pane** (`ctrl+b p`), select the pane and press Tab for **Undo account
+change**. The action remains after the message disappears and after session restoration.
+See [Change account and Undo](agents.md#change-account-and-undo) for checks and recovery.
+
 An account login pane has its own ending: Enter closes it after failure or cancellation,
 `r` explicitly tries the login again, and `c` checks sign-in again after an unsuccessful check.
 A successful, verified sign-in closes the pane automatically.
 
 ## Lists, fields and questions
+
+Accounts (`ctrl+b A l`), Workspaces (`ctrl+b w`), Servers (`ctrl+b s`) and Tunnels (`ctrl+b S o`)
+use the same path: list, **+ Add**, form, result. Search only filters. The Add row stays available
+with no matches. Errors keep the form's values; correct the cause and retry. Adding a server
+saves it before a separate Connect action; adding a tunnel shows its connection state.
 
 In lists, type in **Search** to filter, `↑↓` move, Enter or one click chooses, **Tab shows what else can be done** with the
 selected item (connect in a new tab, browse its files, run a command…). Most also have a key
@@ -273,11 +288,3 @@ the prefix, without Shift. On a non-Latin layout, a key stands for the letter at
 US keyboard, so Ctrl+B is still the prefix on a Russian layout. A key the keymap binds by its
 character keeps that meaning. Terminals without the protocol send characters only, and shortcuts
 read them as such. Key release events are not passed on yet.
-
-The account name in a pane's frame opens **Change account** too. After a change, click **Undo**
-in its message, or open **Find a pane** (`ctrl+b p`), select the pane and press Tab for
-**Undo account change**. The action remains after the message disappears.
-
-In **Add workspace**, **From file...** accepts a KDL path and previews it before **Add**.
-Imported commands and agents wait for you to start them. Export layout uses **File**; neither
-import nor export is needed to retain your personal workspace.
