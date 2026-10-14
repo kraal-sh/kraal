@@ -582,7 +582,7 @@ fn bind_saved_accounts(source: &[u8], accounts: &crate::accounts::Accounts) -> R
         changed
     }
     fn workspace(value: &mut serde_json::Value, accounts: &crate::accounts::Accounts) -> bool {
-        let mut changed = false;
+        let mut changed = value.get_mut("layout_undo").is_some_and(|undo| workspace(undo, accounts));
         for tab in value.get_mut("tabs").and_then(serde_json::Value::as_array_mut).into_iter().flatten() {
             if let Some(root) = tab.get_mut("root") {
                 changed |= node(root, accounts);

@@ -469,7 +469,9 @@ untouched. Kraal 0.4 reads files from 0.2.0 and 0.3.0 without identifiers. On th
 it adds identifiers and binds existing rules to them, keeping a first backup as `accounts.toml.kraal-bak`.
 This one-way migration is removed in 0.5.0; run kraal 0.4 once first to convert an older file.
 Before changing accounts, it also binds readable closed sessions and workspace definitions in
-the configured directories. Rules accept bare names and `agent:name`; kraal writes resolved
+the configured directories. This includes saved layout Undo in both kept and deleted workspaces,
+so restoring a previous layout keeps the same account even after its name is reused.
+Rules accept bare names and `agent:name`; kraal writes resolved
 references as `agent:@id`. Workspace files keep the readable `agent="claude:name"` and add
 `account_id` when bound or saved. These are generated details: keep them when editing a label;
 use names when writing a new rule or choosing a different account in a workspace, removing that
