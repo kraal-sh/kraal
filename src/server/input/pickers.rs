@@ -935,10 +935,10 @@ mod tests {
         let close = InputEvent::Key(Key { code: KeyCode::Char('x'), mods: Mods::CTRL, raw: Vec::new() });
         let Mode::Confirm(picked) = server.on_picker(client, picker, close) else { panic!("confirmation") };
         assert_eq!(direct.message, picked.message);
-        assert!(matches!(picked.action, ConfirmAction::CloseWorkspace(id) if id == ws));
+        assert!(matches!(picked.action, ConfirmAction::CloseWorkspace { workspace: id, .. } if id == ws));
         assert!(!picked.yes);
         for name in ["first", "second", "floating"] {
-            assert!(picked.message.contains(&format!("sleep {name}  (pane ")), "{}", picked.message);
+            assert!(picked.message.lines().any(|line| line == format!("  sleep {name}")), "{}", picked.message);
         }
         assert!(!picked.message.contains("elsewhere"));
         assert!(picked.message.contains("Unsaved work in these programs may be lost."));
@@ -992,7 +992,9 @@ mod tests {
             if stale {
                 assert!(matches!(next, Mode::Picker(_)), "a stale workspace returns to the list");
             } else if open {
-                assert!(matches!(next, Mode::Confirm(q) if matches!(q.action, ConfirmAction::CloseWorkspace(1))));
+                assert!(
+                    matches!(next, Mode::Confirm(q) if matches!(q.action, ConfirmAction::CloseWorkspace { workspace: 1, .. }))
+                );
             } else {
                 assert!(matches!(next, Mode::Picker(p) if p.query == "new" && p.selected == 0));
             }

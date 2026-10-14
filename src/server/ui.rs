@@ -38,6 +38,7 @@ pub enum Mode {
 
 /// A question with two buttons.
 pub struct Question {
+    pub title: Option<String>,
     /// The question on its first line, then what there is to know before answering. A line
     /// that starts with a space quotes what the question is about (a command, a list entry):
     /// the box shows it with its spacing, all of it.
@@ -88,7 +89,14 @@ impl Mode {
 
     /// A question, Cancel selected.
     pub fn confirm(message: impl Into<String>, action: ConfirmAction) -> Mode {
-        Mode::Confirm(Question { message: message.into(), action, yes: false, scroll: 0, workspace_back: None })
+        Mode::Confirm(Question {
+            title: None,
+            message: message.into(),
+            action,
+            yes: false,
+            scroll: 0,
+            workspace_back: None,
+        })
     }
 }
 
@@ -107,7 +115,10 @@ pub enum ConfirmAction {
         workspace: u32,
         tab: u32,
     },
-    CloseWorkspace(u32),
+    CloseWorkspace {
+        workspace: u32,
+        inventory: super::persistence::CloseInventory,
+    },
     RetryCloseWorkspace(u32),
     OpenWorkspace(PickAction),
     /// Restart the session on the kraal installed now.
@@ -178,7 +189,7 @@ impl ConfirmAction {
             ConfirmAction::RemoveAccount(_) => "Remove".into(),
             ConfirmAction::ClosePane(_) => "Close pane".into(),
             ConfirmAction::CloseTab { .. } => "Close tab".into(),
-            ConfirmAction::CloseWorkspace(_) => "Stop and close".into(),
+            ConfirmAction::CloseWorkspace { .. } => "Stop and close".into(),
             ConfirmAction::RetryCloseWorkspace(_) | ConfirmAction::OpenWorkspace(_) => "Retry".into(),
             ConfirmAction::Restart => "Restart".into(),
             ConfirmAction::Quit => "Quit".into(),

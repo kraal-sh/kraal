@@ -438,9 +438,11 @@ impl Server {
                             }
                         }
                     }
-                    ConfirmAction::CloseWorkspace(ws) => {
+                    ConfirmAction::CloseWorkspace { workspace: ws, inventory } => {
                         let current = self.ask_close_workspace(id, ws);
-                        if matches!(&current, Mode::Confirm(next) if matches!(next.action, ConfirmAction::CloseWorkspace(_)) && next.message == q.message)
+                        if matches!(&current, Mode::Confirm(next)
+                            if matches!(&next.action, ConfirmAction::CloseWorkspace { inventory: next, .. } if *next == inventory)
+                                && next.message == q.message)
                         {
                             return self.close_workspace(id, ws);
                         }
@@ -559,19 +561,27 @@ mod tests {
         let (tx, _rx) = crate::server::queue::channel(32);
         let mut server = crate::server::tests::server(tx);
         let ws = server.new_workspace("work".into(), None);
-        let spec = crate::pane::PaneSpec { command: vec!["sleep".into(), "60".into()], ..Default::default() };
+        let mut spec = crate::pane::PaneSpec { command: vec!["sleep".into(), "60".into()], ..Default::default() };
         let first = server
             .spawn_pane_in(ws, None, spec.clone(), crate::protocol::Placement::Tab, Some("first".into()))
             .unwrap();
         let Mode::Confirm(question) = server.ask_close_workspace(0, ws) else { panic!("confirm the program") };
+        spec.command[1] = "61".into();
         let second =
             server.spawn_pane_in(ws, None, spec, crate::protocol::Placement::Tab, Some("second".into())).unwrap();
+        for (pane, seconds) in [(first, "60"), (second, "61")] {
+            let start = std::time::Instant::now();
+            while server.panes[&pane].foreground_argv().is_none_or(|args| args != ["sleep", seconds]) {
+                assert!(start.elapsed() < crate::testing::PATIENCE, "the program never started");
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
         let Mode::Confirm(updated) = server.on_confirm(0, question, key(KeyCode::Char('y'))) else {
             panic!("confirm the new inventory")
         };
-        assert!(updated.message.contains("first") && updated.message.contains("second"));
+        assert!(updated.message.contains("sleep 60") && updated.message.contains("sleep 61"), "{}", updated.message);
         assert!(!updated.yes);
-        assert!(matches!(updated.action, ConfirmAction::CloseWorkspace(id) if id == ws));
+        assert!(matches!(updated.action, ConfirmAction::CloseWorkspace { workspace: id, .. } if id == ws));
         assert!(server.workspaces[0].kept.is_none());
         for pane in [first, second] {
             assert!(server.panes[&pane].process_hold().unwrap().group_running());
@@ -579,6 +589,162 @@ mod tests {
         assert!(matches!(server.on_confirm(0, updated, key(KeyCode::Enter)), Mode::Normal));
         for pane in [first, second] {
             server.close_pane(pane);
+        }
+    }
+
+    #[test]
+    fn close_asks_again_when_the_same_command_replaces_a_pane_or_process() {
+        for same_pane in [false, true] {
+            let (tx, _rx) = crate::server::queue::channel(32);
+            let mut server = crate::server::tests::server(tx);
+            let ws = server.new_workspace("work".into(), None);
+            let spec = crate::pane::PaneSpec { command: vec!["sleep".into(), "60".into()], ..Default::default() };
+            let first = server
+                .spawn_pane_in(ws, None, spec.clone(), crate::protocol::Placement::Tab, Some("editor".into()))
+                .unwrap();
+            let ready = |server: &Server, pane| {
+                let start = std::time::Instant::now();
+                while server.panes[&pane].foreground_argv().is_none_or(|args| args != ["sleep", "60"]) {
+                    assert!(start.elapsed() < crate::testing::PATIENCE, "the program never started");
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+            };
+            ready(&server, first);
+            let first_pid = server.panes[&first].pid().unwrap();
+            let Mode::Confirm(mut question) = server.ask_close_workspace(0, ws) else { panic!("confirmation") };
+            question.yes = true;
+            let message = question.message.clone();
+            let second = if same_pane {
+                server.panes.get_mut(&first).unwrap().respawn(&server.env, &server.tx).unwrap();
+                first
+            } else {
+                let second = server
+                    .spawn_pane_in(ws, None, spec, crate::protocol::Placement::Tab, Some("editor".into()))
+                    .unwrap();
+                server.close_pane(first);
+                second
+            };
+            ready(&server, second);
+            assert_ne!(server.panes[&second].pid(), Some(first_pid));
+            let Mode::Confirm(updated) = server.on_confirm(0, question, key(KeyCode::Enter)) else {
+                panic!("the replacement needs its own confirmation")
+            };
+            assert_eq!(updated.message, message, "the labels did not change");
+            assert!(!updated.yes);
+            assert!(matches!(updated.action, ConfirmAction::CloseWorkspace { workspace: id, .. } if id == ws));
+            assert!(server.workspaces[0].kept.is_none());
+            assert!(server.panes[&second].process_hold().unwrap().group_running());
+            crate::server::persistence::tests::writer(&mut server, vec![Ok(()), Ok(())]);
+            assert!(matches!(server.on_confirm(0, updated, key(KeyCode::Char('y'))), Mode::Picker(_)));
+            assert!(server.workspaces[0].closed());
+            assert!(server.panes.is_empty());
+        }
+    }
+
+    #[test]
+    fn close_asks_again_when_the_workspace_is_renamed() {
+        let _batch = crate::pane::batch();
+        let (tx, _rx) = crate::server::queue::channel(32);
+        let mut server = crate::server::tests::server(tx);
+        let ws = server.new_workspace("before".into(), None);
+        let pane = server
+            .spawn_pane_in(
+                ws,
+                None,
+                crate::pane::PaneSpec { command: vec!["vim".into()], ..Default::default() },
+                crate::protocol::Placement::Tab,
+                None,
+            )
+            .unwrap();
+        let Mode::Confirm(question) = server.ask_close_workspace(0, ws) else { panic!("confirmation") };
+        assert_eq!(question.title.as_deref(), Some("Close before?"));
+        let message = question.message.clone();
+        server.workspaces[0].name = "after".into();
+        let Mode::Confirm(updated) = server.on_confirm(0, question, key(KeyCode::Char('y'))) else {
+            panic!("the renamed workspace needs confirmation")
+        };
+        assert_eq!(updated.title.as_deref(), Some("Close after?"));
+        assert_eq!(updated.message, message);
+        assert!(!updated.yes);
+        assert!(matches!(updated.action, ConfirmAction::CloseWorkspace { workspace: id, .. } if id == ws));
+        assert!(server.workspaces[0].kept.is_none());
+        assert!(server.panes.contains_key(&pane));
+        assert!(matches!(server.on_confirm(0, updated, key(KeyCode::Enter)), Mode::Normal));
+        assert!(server.panes.contains_key(&pane));
+    }
+
+    #[test]
+    fn close_keeps_the_full_workspace_name_readable_when_the_title_is_truncated() {
+        use crate::server::overlays::{confirm_layout, draw_confirm};
+        use ratatui::buffer::Buffer;
+
+        let _batch = crate::pane::batch();
+        let (tx, _rx) = crate::server::queue::channel(32);
+        let mut server = crate::server::tests::server(tx);
+        let (client, _peer) = crate::server::tests::client(&mut server);
+        let ws = server.clients[&client].workspace;
+        server
+            .spawn_pane_in(
+                ws,
+                None,
+                crate::pane::PaneSpec { command: vec!["vim".into()], ..Default::default() },
+                crate::protocol::Placement::Tab,
+                None,
+            )
+            .unwrap();
+        for prefix in ["x".repeat(60), "x".repeat(66), "🦀".repeat(1400)] {
+            for suffix in ["alpha", "omega"] {
+                let name = format!("{prefix}  {suffix}");
+                server.workspaces[0].name = name.clone();
+                let Mode::Confirm(mut q) = server.ask_close_workspace(client, ws) else { panic!("confirmation") };
+                for (cols, rows) in [(80, 24), (124, 36), (80, 24)] {
+                    let c = server.clients.get_mut(&client).unwrap();
+                    c.cols = cols;
+                    c.rows = rows;
+                    q.scroll = 0;
+                    let screen = server.client_screen(client);
+                    let layout = confirm_layout(&q, screen);
+                    let title = format!("Close {name}?");
+                    assert_eq!(q.title.as_deref(), Some(title.as_str()));
+                    let truncated = crate::text::columns(&title) > usize::from(layout.area.width - 4);
+                    let mut read = vec![String::new(); layout.lines.len()];
+                    loop {
+                        let mut buf = Buffer::empty(screen);
+                        draw_confirm(&q, screen, &mut buf);
+                        let shown: Vec<String> = buf
+                            .content
+                            .chunks(cols as usize)
+                            .map(|row| row.iter().map(|c| c.symbol()).collect())
+                            .collect();
+                        assert!(shown.iter().any(|row| row.contains("Cancel") && row.contains("Stop and close")));
+                        assert!(!q.yes);
+                        if !truncated {
+                            assert!(shown.iter().any(|row| row.contains(&title)));
+                            assert_eq!(layout.lines[0].text, "These programs will stop:");
+                            break;
+                        }
+                        for row in 0..usize::from(layout.body).min(layout.lines.len() - q.scroll) {
+                            let y = layout.area.y + 1 + row as u16;
+                            let mut text = String::new();
+                            let mut x = layout.area.x + 2;
+                            while x < layout.area.right() - 2 {
+                                let symbol = buf[(x, y)].symbol();
+                                text.push_str(symbol);
+                                x += crate::text::columns(symbol).max(1) as u16;
+                            }
+                            read[q.scroll + row] = text;
+                        }
+                        if q.scroll == layout.max_scroll {
+                            break;
+                        }
+                        let Mode::Confirm(next) = server.on_confirm(client, q, key(KeyCode::PageDown)) else {
+                            panic!("scroll the complete name")
+                        };
+                        q = next;
+                    }
+                    assert!(!truncated || read.concat().contains(&title), "{cols}x{rows}: {read:?}");
+                }
+            }
         }
     }
 
@@ -606,6 +772,11 @@ mod tests {
                     Some("new editor".into()),
                 )
                 .unwrap();
+            let start = std::time::Instant::now();
+            while server.panes[&pane].foreground_argv().is_none_or(|args| args != ["sleep", "60"]) {
+                assert!(start.elapsed() < crate::testing::PATIENCE, "the program never started");
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
             let next = match entry {
                 0 => server.on_confirm(client, retry, key(KeyCode::Char('y'))),
                 1 => {
@@ -627,8 +798,8 @@ mod tests {
                 _ => server.empty_workspace_enter(client),
             };
             let Mode::Confirm(question) = next else { panic!("confirm the new program") };
-            assert!(question.message.contains("new editor"));
-            assert!(matches!(question.action, ConfirmAction::CloseWorkspace(w) if w == ws));
+            assert!(question.message.contains("sleep 60"));
+            assert!(matches!(question.action, ConfirmAction::CloseWorkspace { workspace: w, .. } if w == ws));
             assert!(!question.yes);
             assert!(server.panes[&pane].process_hold().unwrap().group_running());
             let cancelled = server.on_confirm(client, question, key(KeyCode::Enter));

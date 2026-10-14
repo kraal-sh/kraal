@@ -562,7 +562,7 @@ mod tests {
     }
 
     #[test]
-    fn empty_workspaces_render_and_add_a_pane_with_enter_or_a_click() {
+    fn screen_empty_workspaces_render_and_add_a_pane_with_enter_or_a_click() {
         for (cols, rows, mouse) in [(80, 24, false), (124, 36, true)] {
             let (tx, _rx) = crate::server::event_channel(4096);
             let mut server = crate::server::tests::server(tx);
@@ -575,6 +575,14 @@ mod tests {
             let text: String = buffer.content.iter().map(|c| c.symbol()).collect();
             assert!(text.contains("No panes."));
             assert!(text.contains("+ Add pane"));
+            let (button, _) = server.empty_workspace_button(client).unwrap();
+            let content: Vec<String> = (button.y - 2..=button.y + 2)
+                .map(|y| {
+                    (button.x..button.right()).map(|x| buffer[(x, y)].symbol()).collect::<String>().trim().to_string()
+                })
+                .filter(|row| !row.is_empty())
+                .collect();
+            assert_eq!(content, ["No panes.", "+ Add pane"]);
             for action in [Action::CloseTab, Action::RenameTab, Action::NextLayout, Action::ToggleZoom, Action::Unstack]
             {
                 server.action(client, action);
