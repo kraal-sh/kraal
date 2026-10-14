@@ -551,6 +551,8 @@ fn identity_join_requires_one_exact_public_identity_and_saves_the_answer_once() 
         "other-email",
         "other-agent",
         "stale",
+        "login-pending",
+        "login-finished",
         "added",
         "personal",
         "pending",
@@ -592,6 +594,15 @@ fn identity_join_requires_one_exact_public_identity_and_saves_the_answer_once() 
         }
         if case == "stale" {
             named[0].0.home = "/old-home".into();
+        }
+        if matches!(case, "login-pending" | "login-finished") {
+            all.set_sign_in_required(&named[0].0, true);
+            if case == "login-pending" {
+                // The status command still reports A while an unfinished login is changing it.
+                named[0].0 = all.by_id(&named[0].0.id).unwrap();
+            } else {
+                all.set_sign_in_required(&named[0].0, false);
+            }
         }
         if case == "pending" {
             all.adopt_checked(&existing, None).unwrap();
@@ -858,6 +869,7 @@ fn conversations_are_found_by_their_transcript() {
         threshold: None,
         note: None,
         sign_in_required: false,
+        login_revision: String::new(),
         review: false,
         public_identity: None,
         linked_to: None,
@@ -909,6 +921,7 @@ pub(super) fn acct(agent: &str, name: &str, home: &str) -> Account {
         threshold: None,
         note: None,
         sign_in_required: false,
+        login_revision: String::new(),
         review: false,
         public_identity: None,
         linked_to: None,
@@ -942,9 +955,17 @@ fn unfinished_sign_in_survives_reload_and_verification_clears_only_its_home() {
     assert!(loaded.get("claude", "work").unwrap().sign_in_required);
     assert!(loaded.get("claude", "alias").unwrap().sign_in_required);
     assert!(!loaded.get("codex", "work").unwrap().sign_in_required);
+    let revision = loaded.get("claude", "work").unwrap().login_revision;
+    assert!(!revision.is_empty());
+    assert_eq!(loaded.get("claude", "alias").unwrap().login_revision, revision);
+    assert!(loaded.get("codex", "work").unwrap().login_revision.is_empty());
     loaded.set_sign_in_required(&a, false);
     loaded.save().unwrap();
-    assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+    let saved = std::fs::read_to_string(&path).unwrap();
+    let revision_line = format!("login_revision = {revision:?}\n");
+    assert_eq!(saved.matches(&revision_line).count(), 1);
+    assert_eq!(saved.replace(&revision_line, ""), original);
+    assert_eq!(Accounts::load_from(&path).unwrap().get("claude", "work").unwrap().login_revision, revision);
     loaded.remove("claude", "work");
     loaded.remove("claude", "alias");
     loaded.set_sign_in_required(&a, false);

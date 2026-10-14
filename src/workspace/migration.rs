@@ -2,13 +2,42 @@
 
 use super::*;
 
+/// Exact bytes replaced by the adapter, so a baseline never accepts an outside edit.
+#[derive(Clone)]
+pub(crate) struct SourceWrite {
+    pub path: PathBuf,
+    pub before: String,
+    pub after: String,
+}
+
+impl SourceWrite {
+    pub fn update(&self, path: Option<&Path>, baseline: &mut Option<String>) -> bool {
+        if baseline.as_deref() == Some(&self.before)
+            && path.is_some_and(|path| crate::paths::same_file(path, &self.path))
+        {
+            *baseline = Some(self.after.clone());
+            return true;
+        }
+        false
+    }
+
+    pub fn update_saved(&self, ws: &mut crate::persist::WorkspaceSnap) -> bool {
+        let mut changed = self.update(ws.definition.as_deref(), &mut ws.definition_source);
+        changed |= self.update(ws.definition.as_deref(), &mut ws.source_reviewed);
+        if let Some(undo) = &mut ws.layout_undo {
+            changed |= self.update_saved(undo);
+        }
+        changed
+    }
+}
+
 /// Bind old labels before a rename or removal, keeping the source formatting.
-pub(crate) fn bind_accounts(path: &Path, accounts: &crate::accounts::Accounts) -> Result<()> {
+pub(crate) fn bind_accounts(path: &Path, accounts: &crate::accounts::Accounts) -> Result<Option<SourceWrite>> {
     // Unrelated definitions may be read-only. Require a lock only when something needs binding,
     // then read again under it: a save may have replaced the definition since this first look.
     let source = fs::read_to_string(path)?;
     if bind_source_accounts(&source, accounts)? == source {
-        return Ok(());
+        return Ok(None);
     }
     let target = fs::canonicalize(path)?;
     crate::paths::locked(&target, || {
@@ -16,8 +45,9 @@ pub(crate) fn bind_accounts(path: &Path, accounts: &crate::accounts::Accounts) -
         let bound = bind_source_accounts(&source, accounts)?;
         if bound != source {
             crate::paths::write_atomic(&target, bound.as_bytes())?;
+            return Ok(Some(SourceWrite { path: target.clone(), before: source, after: bound }));
         }
-        Ok(())
+        Ok(None)
     })?
 }
 

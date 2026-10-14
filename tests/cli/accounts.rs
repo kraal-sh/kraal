@@ -1321,6 +1321,123 @@ fn account_list_joins_only_one_exact_identity_and_reports_the_joined_home_and_us
 }
 
 #[test]
+fn automatic_join_rejects_pending_and_completed_cli_logins() {
+    for pending in [true, false] {
+        let env = Env::new(if pending { "join-login-pending" } else { "join-login-completed" });
+        let path = existing_sign_in_agent(&env, "claude");
+        let standard = env.root.join("home/.claude");
+        let named = env.root.join("work");
+        for home in [&standard, &named] {
+            std::fs::create_dir_all(home).unwrap();
+            std::fs::write(home.join("identity"), r#"{"loggedIn":true,"email":"a@example.com"}"#).unwrap();
+        }
+        let file = env.root.join("config/kraal/accounts.toml");
+        std::fs::write(
+            &file,
+            format!("[[account]]\nagent = 'claude'\nname = 'work'\nhome = {:?}\n", named.display().to_string()),
+        )
+        .unwrap();
+        let assert_not_joined = || {
+            let saved: toml::Value = toml::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+            let work =
+                saved["account"].as_array().unwrap().iter().find(|a| a["name"].as_str() == Some("work")).unwrap();
+            assert_eq!(work["home"].as_str(), named.to_str());
+            assert!(work.get("linked_to").is_none());
+            // Adopting the standard home keeps its old name as a reference under its own review.
+            assert!(work.get("references").is_none(), "the standard home must not join the named account");
+        };
+        write_script(
+            &env.root.join("bin/claude"),
+            r#"#!/bin/sh
+home="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
+case "$*" in
+    'auth status')
+        cat "$home/identity"
+        echo checked > "$home/checked"
+        while test -f "$home/hold-check"; do sleep 0.01; done
+        ;;
+    'auth login')
+        echo started > "$home/login-started"
+        while test -d "$home" && test ! -f "$home/finish-login"; do sleep 0.01; done
+        test -d "$home" || exit 1
+        printf '%s' '{"loggedIn":true,"email":"b@example.com"}' > "$home/identity"
+        ;;
+    *) exit 2 ;;
+esac
+"#,
+        );
+        let start_login = || {
+            env.cmd(&["accounts", "login", "claude:work"])
+                .env("PATH", &path)
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .unwrap()
+        };
+        let start_discovery = || {
+            env.cmd(&["accounts", "list", "--json"])
+                .env("PATH", &path)
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .unwrap()
+        };
+        let (login, discovery) = if pending {
+            let mut login = start_login();
+            wait_until(PATIENCE, "CLI login started", || {
+                assert!(login.try_wait().unwrap().is_none(), "CLI login exited before authentication started");
+                named.join("login-started").exists()
+            });
+            assert!(std::fs::read_to_string(&file).unwrap().contains("sign_in_required = true"));
+            (login, start_discovery())
+        } else {
+            // Keep A's standard-home result pending while the named home completes a login to B.
+            std::fs::write(standard.join("hold-check"), "").unwrap();
+            let discovery = start_discovery();
+            wait_until(PATIENCE, "both identities were inspected", || {
+                standard.join("checked").exists() && named.join("checked").exists()
+            });
+            let mut login = start_login();
+            wait_until(PATIENCE, "CLI login started", || {
+                assert!(login.try_wait().unwrap().is_none(), "CLI login exited before authentication started");
+                named.join("login-started").exists()
+            });
+            std::fs::write(named.join("finish-login"), "").unwrap();
+            (login, discovery)
+        };
+        if pending {
+            let out = discovery.wait_with_output().unwrap();
+            assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+            assert_not_joined();
+            assert!(!String::from_utf8_lossy(&out.stderr).contains("is Claude"));
+            std::fs::write(named.join("finish-login"), "").unwrap();
+            let out = login.wait_with_output().unwrap();
+            assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        } else {
+            let out = login.wait_with_output().unwrap();
+            assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+            assert!(!std::fs::read_to_string(&file).unwrap().contains("sign_in_required = true"));
+            std::fs::remove_file(standard.join("hold-check")).unwrap();
+            let out = discovery.wait_with_output().unwrap();
+            assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+            assert_not_joined();
+            assert!(!String::from_utf8_lossy(&out.stderr).contains("is Claude"));
+        }
+        let out = env.cmd(&["accounts", "list", "--json"]).env("PATH", &path).output().unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        let list: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        let list = list.as_array().unwrap();
+        assert_eq!(list.len(), 2, "A's standard home stays separate from B's named account");
+        assert_eq!(list.iter().filter(|a| a["status"] == "review_required").count(), 1);
+        let review = list.iter().find(|a| a["status"] == "review_required").unwrap();
+        assert_eq!(review["home"], "~/.claude");
+        let work = list.iter().find(|a| a["name"] == "work").unwrap();
+        assert_eq!(work["joined_homes"], serde_json::json!([]));
+        assert_not_joined();
+    }
+}
+
+#[test]
 fn automatic_join_preserves_a_live_agent_and_caches_the_named_home_checks() {
     let env = Env::new("auto-join-live");
     let path = existing_sign_in_agent(&env, "claude");
@@ -1353,14 +1470,22 @@ fn automatic_join_preserves_a_live_agent_and_caches_the_named_home_checks() {
     client.close_overlay("Enter Details");
     std::fs::write(standard.join("status"), "0").unwrap();
     client.send(b"\x02Al");
-    client.wait_for_row("~/.claude is Claude · patron.bzh");
-    client.wait_for_row("1 pane");
+    client.wait_for_rows("the live pane has joined patron.bzh", |rows| {
+        rows.iter().any(|r| r.contains("claude·patron.bzh"))
+            && rows.windows(2).any(|pair| pair[0].contains("Claude · patron.bzh") && pair[1].contains("1 pane"))
+    });
     assert!(!client.rows().iter().any(|r| r.contains("Which account is this?") || r.contains("? Account for")));
     for _ in 0..2 {
         client.close_overlay("Enter Details");
         client.send(b"\x02Al");
         client.wait_for_row("Claude · patron.bzh");
     }
+    // The toast can expire or be replaced before the next frame. Messages retains the
+    // notice independently of background check order.
+    client.close_overlay("Enter Details");
+    client.send(b"\x02Vj");
+    client.wait_for_row("Messages");
+    client.wait_for_row("~/.claude is Claude · patron.bzh");
     let checks = std::fs::read_to_string(env.root.join("home/status-checks")).unwrap();
     assert_eq!(checks.lines().filter(|line| *line == named.to_str().unwrap()).count(), 1);
     env.run(&["send", "-p", "agent", "alive\r"]);

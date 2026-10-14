@@ -164,6 +164,10 @@ pub(super) const AMBIGUOUS: &str =
     "kraal cannot tell this command's options from a prompt it would send again: check it, Enter runs it as shown";
 
 impl Server {
+    pub(super) fn update_accounts<T>(&mut self, f: impl FnOnce(&mut Accounts) -> Result<T>) -> Result<T> {
+        Accounts::update_with_sources(&Accounts::path(), f, |written| self.record_source_write(written))
+    }
+
     pub(super) fn reload_accounts(&mut self) {
         match Accounts::load() {
             Ok(a) => {
@@ -218,34 +222,70 @@ impl Server {
                     if server.account_identity_generations.get(&a.agent).copied().unwrap_or_default() != generation {
                         return;
                     }
-                    let status = result.status;
-                    let saved = if matches!(status, Status::SignedIn | Status::CouldNotCheck) {
-                        Accounts::update(|all| account_status::reconcile(all, &a, &result, &cached))
+                    if matches!(result.status, Status::SignedIn | Status::CouldNotCheck) {
+                        server.save_existing_account(a, result, cached, generation);
                     } else {
-                        Ok(None)
-                    };
-                    server.account_identities.extend(cached.into_iter().map(|(a, c)| (a.id.clone(), (a, c))));
-                    server.existing_checks.insert(a.agent.clone(), ExistingCheck::Checked(status));
-                    match saved {
-                        Ok(notice) => {
-                            server.account_notices.extend(notice);
-                            server.reload_accounts();
-                            server.reload_usage();
-                        }
-                        Err(e) => {
-                            server.existing_checks.insert(a.agent, ExistingCheck::SaveFailed);
-                            server
-                                .warnings
-                                .push(format!("Could not adopt the existing account: {e:#}. Open Check again."));
-                        }
+                        server.existing_checks.insert(a.agent, ExistingCheck::Checked(result.status));
+                        server.reload_accounts();
+                        server.reload_usage();
+                        server.refresh_agent_pickers();
+                        server.mark_dirty();
                     }
-                    server.refresh_agent_pickers();
-                    server.mark_dirty();
                 },
             );
             if !started {
                 self.existing_checks.insert(agent, ExistingCheck::Checked(Status::CouldNotCheck));
             }
+        }
+    }
+
+    fn save_existing_account(
+        &mut self,
+        a: Account,
+        result: account_status::Checked,
+        cached: Vec<(Account, account_status::Checked)>,
+        generation: u64,
+    ) {
+        let agent = a.agent.clone();
+        let status = result.status;
+        let started = self.background(
+            move || {
+                let mut written = Vec::new();
+                let saved = account_status::save_discovery(&[(a.clone(), result)], &cached, |source| {
+                    written.push(source.clone());
+                });
+                (a, cached, saved, written)
+            },
+            move |server, (a, cached, saved, written)| {
+                // Migrations may have succeeded even when saving failed or a login started.
+                for source in written {
+                    server.record_source_write(&source);
+                }
+                if server.account_identity_generations.get(&a.agent).copied().unwrap_or_default() != generation {
+                    server.reload_accounts();
+                    return;
+                }
+                server.account_identities.extend(cached.into_iter().map(|(a, c)| (a.id.clone(), (a, c))));
+                server.existing_checks.insert(a.agent.clone(), ExistingCheck::Checked(status));
+                match saved {
+                    Ok(notices) => {
+                        for notice in notices {
+                            server.queue_account_notice(notice);
+                        }
+                        server.reload_accounts();
+                        server.reload_usage();
+                    }
+                    Err(e) => {
+                        server.existing_checks.insert(a.agent, ExistingCheck::SaveFailed);
+                        server.warnings.push(format!("Could not adopt the existing account: {e:#}. Open Check again."));
+                    }
+                }
+                server.refresh_agent_pickers();
+                server.mark_dirty();
+            },
+        );
+        if !started {
+            self.existing_checks.insert(agent, ExistingCheck::SaveFailed);
         }
     }
 
@@ -318,14 +358,14 @@ impl Server {
                 PickItem::new(
                     a.name.clone(),
                     "",
-                    PickAction::UseExisting { existing: existing.clone(), target: Some(a) },
+                    PickAction::UseExisting { existing: Box::new(existing.clone()), target: Some(a) },
                 )
             })
             .collect();
         items.push(PickItem::new(
             "A different account",
             "",
-            PickAction::UseExisting { existing: existing.clone(), target: None },
+            PickAction::UseExisting { existing: Box::new(existing.clone()), target: None },
         ));
         Picker::new(PickerKind::AccountReview, &accounts::existing_label(&existing.agent), items)
     }
@@ -336,7 +376,7 @@ impl Server {
         existing: &Account,
         target: Option<&Account>,
     ) -> Result<()> {
-        Accounts::update(|all| all.review(existing, target))?;
+        self.update_accounts(|all| all.review(existing, target))?;
         self.reload_accounts();
         self.reload_usage();
         self.refresh_agent_pickers();
@@ -364,7 +404,7 @@ impl Server {
 
     /// Rename account `old` of `agent` to `new` ([`accounts::rename`]).
     pub(super) fn rename_account(&mut self, agent: &str, old: &str, new: &str) -> Result<()> {
-        accounts::rename(agent, old, new)?;
+        self.update_accounts(|all| all.rename(agent, old, new))?;
         self.reload_accounts();
         self.reload_usage();
         Ok(())
@@ -1550,12 +1590,13 @@ impl Server {
             threshold: None,
             note: None,
             sign_in_required: true,
+            login_revision: String::new(),
             review: false,
             public_identity: None,
             linked_to: None,
             references: Vec::new(),
         };
-        let a = Accounts::update(|all| {
+        let a = self.update_accounts(|all| {
             let a = all.add(a)?;
             accounts::prepare_home(&a)?;
             Ok(a)
@@ -1575,7 +1616,7 @@ impl Server {
         let l = accounts::login(a)?;
         let ws = self.clients.get(&client).map(|c| c.workspace).context("no client")?;
         let lock = accounts::lock_login(a)?;
-        Accounts::update(|all| {
+        self.update_accounts(|all| {
             all.set_sign_in_required(a, true);
             Ok(())
         })?;
@@ -1638,14 +1679,15 @@ impl Server {
         login.state = LoginState::Checked(status);
         let account = login.account.clone();
         self.invalidate_account_identities(&account.agent);
-        let login = self.panes.get_mut(&id).unwrap().spec.login.as_mut().unwrap();
         if status == Status::SignedIn {
-            if Accounts::update(|all| {
-                all.set_sign_in_required(&account, false);
-                Ok(())
-            })
-            .is_err()
+            if self
+                .update_accounts(|all| {
+                    all.set_sign_in_required(&account, false);
+                    Ok(())
+                })
+                .is_err()
             {
+                let login = self.panes.get_mut(&id).unwrap().spec.login.as_mut().unwrap();
                 login.state = LoginState::SaveFailed;
                 login.lock = None;
             } else {
@@ -1658,7 +1700,7 @@ impl Server {
                 }
             }
         } else {
-            login.lock = None;
+            self.panes.get_mut(&id).unwrap().spec.login.as_mut().unwrap().lock = None;
         }
         self.mark_dirty();
     }
@@ -1667,7 +1709,7 @@ impl Server {
         let Some(login) = self.panes.get(&id).and_then(|p| p.spec.login.as_ref()) else { return Ok(()) };
         let account = login.account.clone();
         let lock = accounts::lock_login(&account)?;
-        Accounts::update(|all| {
+        self.update_accounts(|all| {
             all.set_sign_in_required(&account, true);
             Ok(())
         })?;

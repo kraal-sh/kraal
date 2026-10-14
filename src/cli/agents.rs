@@ -107,6 +107,7 @@ pub(super) fn accounts(action: AccountsCmd) -> Result<()> {
                 threshold,
                 note: None,
                 sign_in_required: !no_login,
+                login_revision: String::new(),
                 review: false,
                 public_identity: None,
                 linked_to: None,

@@ -157,6 +157,7 @@ fn finishing_discovery_keeps_the_clicked_account_in_place() {
                         threshold: None,
                         note: None,
                         sign_in_required: false,
+                        login_revision: String::new(),
                         review: false,
                         public_identity: None,
                         linked_to: None,
@@ -295,6 +296,106 @@ fn signed_in(home: &std::path::Path, email: &str) {
 }
 
 #[test]
+fn automatic_join_records_its_source_write_and_keeps_the_notice_until_attachment() {
+    use crate::{paths, persist};
+
+    if !crate::testing::in_own_process(
+        "server::agents::tests::automatic_join_records_its_source_write_and_keeps_the_notice_until_attachment",
+    ) {
+        return;
+    }
+    for edited in [false, true] {
+        let (mut t, work, standard) = identity_discovery(if edited { "join-edited-source" } else { "join-source" });
+        signed_in(std::path::Path::new(&work.home), "a@example.com");
+        signed_in(&standard, "a@example.com");
+        let original = "// My layout.\nlayout { pane agent=\"claude:default\"; }\n";
+        let source = if edited { format!("{original}// Outside edit before joining.\n") } else { original.into() };
+        let target = t.dir.join("source.kdl");
+        std::fs::write(&target, &source).unwrap();
+        std::fs::create_dir_all(paths::workspaces_dir()).unwrap();
+        let path = paths::workspaces_dir().join("joined.kdl");
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+        t.server.new_workspace("w".into(), Some(path.clone()));
+        t.server.workspaces[0].definition_source = Some(original.into());
+
+        t.server.check_existing_accounts();
+        t.until("the account joins", |t| t.server.jobs.is_empty());
+        assert_eq!(t.server.accounts.get("claude", "default").unwrap().id, work.id);
+        let migrated = std::fs::read_to_string(&target).unwrap();
+        assert_eq!(migrated, source.replace("; }", " account_id=\"default-claude\"; }"));
+        let baseline = if edited { original } else { &migrated };
+        assert_eq!(t.server.workspaces[0].definition_source.as_deref(), Some(baseline));
+        t.server.refresh_source_status();
+        assert_eq!(t.server.workspaces[0].source_status, edited.then_some("File changed"));
+        let snapshot = persist::snapshot(&t.server);
+        assert_eq!(snapshot.workspaces[0].definition_source.as_deref(), Some(baseline));
+
+        let notice = "~/.claude is Claude · work";
+        t.server.show_warnings();
+        assert_eq!(t.server.account_notices, [notice]);
+        assert_eq!(t.server.messages.iter().filter(|m| m.text == notice).count(), 1);
+        let (client, _peer) = super::super::tests::client(&mut t.server);
+        t.server.clients.get_mut(&client).unwrap().mode = Mode::Picker(t.server.accounts_picker(None));
+        t.server.show_warnings();
+        let mut buffer = ratatui::buffer::Buffer::empty(ratatui::layout::Rect::new(0, 0, 124, 36));
+        t.server.compose(client, 1_000, &mut buffer);
+        let row: String = (0..124).map(|x| buffer[(x, 0)].symbol()).collect();
+        assert!(row.contains(notice), "the Accounts overlay keeps the notice visible: {row}");
+        assert!(t.server.account_notices.is_empty());
+        // Expiring or replacing the toast cannot lose the one message-log entry.
+        t.server.clients.get_mut(&client).unwrap().toast = None;
+        t.server.show_warnings();
+        assert!(t.server.clients[&client].toast.is_none());
+        assert_eq!(t.server.messages.iter().filter(|m| m.text == notice).count(), 1);
+
+        std::fs::write(&target, format!("{migrated}// Outside edit after joining.\n")).unwrap();
+        t.server.refresh_source_status();
+        assert_eq!(t.server.workspaces[0].source_status, Some("File changed"));
+        assert_eq!(t.server.workspaces[0].definition_source.as_deref(), Some(baseline));
+        std::fs::remove_file(path).unwrap();
+    }
+}
+
+#[test]
+fn discovery_saves_off_the_event_loop_while_the_accounts_lock_is_held() {
+    use super::super::{Event, queue::Wait};
+
+    if !crate::testing::in_own_process(
+        "server::agents::tests::discovery_saves_off_the_event_loop_while_the_accounts_lock_is_held",
+    ) {
+        return;
+    }
+    let (mut t, work, standard) = identity_discovery("discovery-locked");
+    // Opening Accounts shares this unrelated pending check.
+    t.server.existing_checks.insert("codex".into(), ExistingCheck::Checking);
+    signed_in(std::path::Path::new(&work.home), "a@example.com");
+    signed_in(&standard, "a@example.com");
+    t.server.check_existing_accounts();
+    let Wait::Event(event @ Event::Job(..)) = t.rx.wait(crate::testing::PATIENCE) else {
+        panic!("discovery did not finish");
+    };
+    let (client, _peer) = super::super::tests::client(&mut t.server);
+    crate::paths::locked(&Accounts::path(), || {
+        let start = Instant::now();
+        t.server.handle(event);
+        t.server.handle(Event::Warning("server-responsive".into()));
+        assert_eq!(t.server.warnings, ["server-responsive"]);
+        t.server.client_input(client, b"\x02Al");
+        assert!(matches!(&t.server.clients[&client].mode, Mode::Picker(p) if p.kind == PickerKind::Accounts));
+        let mut buffer = ratatui::buffer::Buffer::empty(ratatui::layout::Rect::new(0, 0, 124, 36));
+        t.server.compose(client, 1_000, &mut buffer);
+        assert!(crate::testing::buffer_text(&buffer).contains("Checking sign-in"));
+        assert!(start.elapsed() < Duration::from_millis(500), "the event loop waited for the accounts lock");
+        assert_eq!(t.server.jobs.len(), 1, "the save stays on its worker until the lock is released");
+        assert_eq!(Accounts::load().unwrap().get("claude", "default").unwrap().name, "default");
+    })
+    .unwrap();
+    t.until("the unlocked save finishes", |t| t.server.jobs.is_empty());
+    assert_eq!(t.server.accounts.get("claude", "default").unwrap().id, work.id);
+    assert_eq!(t.server.account_notices, ["~/.claude is Claude · work"]);
+}
+
+#[test]
 fn discovery_without_a_verified_identity_does_not_check_named_homes() {
     if !crate::testing::in_own_process(
         "server::agents::tests::discovery_without_a_verified_identity_does_not_check_named_homes",
@@ -351,7 +452,9 @@ fn login_invalidates_cached_and_in_flight_identity_results() {
         signed_in(home, "b@example.com");
         t.server.check_login(login).unwrap();
         t.until("login is verified", |t| !t.server.panes.contains_key(&login));
-        assert_eq!(t.server.accounts.by_id(&work.id).unwrap(), work);
+        let current = t.server.accounts.by_id(&work.id).unwrap();
+        assert_ne!(current.login_revision, work.login_revision);
+        assert_eq!(current, Account { login_revision: current.login_revision.clone(), ..work.clone() });
         t.until("post-login discovery finishes", |t| t.server.jobs.len() == usize::from(in_flight));
         signed_in(&standard, "a@example.com");
         t.server.refresh_existing_accounts();
@@ -365,6 +468,74 @@ fn login_invalidates_cached_and_in_flight_identity_results() {
         assert_ne!(saved.by_home("claude", &standard).unwrap().id, work.id);
         assert_eq!(t.server.account_identities[&work.id].1.identity.as_ref().unwrap().email, "b@example.com");
         assert!(t.server.account_notices.is_empty(), "stale discovery must not announce a join");
+    }
+}
+
+#[test]
+fn another_servers_login_invalidates_pending_cached_and_in_flight_discovery() {
+    use super::super::{Event, queue::Wait};
+
+    if !crate::testing::in_own_process(
+        "server::agents::tests::another_servers_login_invalidates_pending_cached_and_in_flight_discovery",
+    ) {
+        return;
+    }
+    for phase in ["pending", "cached", "in-flight"] {
+        let (mut t, work, standard) = identity_discovery(&format!("other-login-{phase}"));
+        let home = std::path::Path::new(&work.home);
+        signed_in(home, "a@example.com");
+        signed_in(&standard, if phase == "cached" { "c@example.com" } else { "a@example.com" });
+        let mut other = SwitchTest::new(&format!("login-owner-{phase}"));
+        other.server.switches.clear();
+        other.server.panes.clear();
+        other.server.accounts = Accounts::load().unwrap();
+        // Suppress discovery until the other server opens its real login pane.
+        for agent in accounts::agents() {
+            other.server.existing_checks.insert(agent.name.into(), ExistingCheck::Checking);
+        }
+        let late = if phase == "in-flight" {
+            t.server.check_existing_accounts();
+            let Wait::Event(event @ Event::Job(..)) = t.rx.wait(crate::testing::PATIENCE) else {
+                panic!("discovery did not finish");
+            };
+            Some(event)
+        } else {
+            if phase == "cached" {
+                t.server.check_existing_accounts();
+                t.until("the named identity is cached", |t| t.server.jobs.is_empty());
+                assert_eq!(t.server.account_identities[&work.id].1.identity.as_ref().unwrap().email, "a@example.com");
+            }
+            None
+        };
+        let (client, _peer) = super::super::tests::client(&mut other.server);
+        let login = other.server.open_login(client, &work).unwrap();
+        if phase == "pending" {
+            t.server.reload_accounts();
+            t.until("discovery during login finishes", |t| t.server.jobs.is_empty());
+            assert_ne!(Accounts::load().unwrap().by_home("claude", &standard).unwrap().id, work.id);
+        }
+        signed_in(home, "b@example.com");
+        other.server.check_login(login).unwrap();
+        other.until("the other server verifies login", |t| !t.server.panes.contains_key(&login));
+        other.until("the other server finishes discovery", |t| t.server.jobs.is_empty());
+        signed_in(&standard, "a@example.com");
+        assert!(
+            t.server.account_identity_generations.is_empty(),
+            "another server cannot invalidate the local generation"
+        );
+        if let Some(late) = late {
+            t.server.handle(late);
+        } else {
+            // Keep the old cached account snapshot to exercise revalidation at commit too.
+            t.server.existing_checks.remove("claude");
+            t.server.check_existing_accounts();
+        }
+        t.until("discovery finishes", |t| t.server.jobs.is_empty());
+        let saved = Accounts::load().unwrap();
+        assert_eq!(saved.reviews().len(), 1, "{phase}: A stays separate from B");
+        assert_ne!(saved.by_home("claude", &standard).unwrap().id, work.id);
+        assert!(saved.entries().iter().all(|a| a.linked_to.as_deref() != Some(&work.id)));
+        assert!(t.server.account_notices.is_empty());
     }
 }
 
@@ -392,6 +563,7 @@ fn a_failed_automatic_join_on_a_saved_review_can_retry_and_recover() {
     std::fs::rename(&path, &backup).unwrap();
     std::fs::create_dir(&path).unwrap();
     t.server.handle(event);
+    t.until("the save fails", |t| t.server.jobs.is_empty());
     assert!(matches!(t.server.existing_checks.get("claude"), Some(ExistingCheck::SaveFailed)));
     assert_eq!(t.server.accounts.reviews().len(), 1);
     assert!(t.server.account_notices.is_empty());
@@ -614,6 +786,7 @@ impl SwitchTest {
             threshold: None,
             note: None,
             sign_in_required: false,
+            login_revision: String::new(),
             review: false,
             public_identity: None,
             linked_to: None,

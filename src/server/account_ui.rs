@@ -417,7 +417,7 @@ impl Server {
                 {
                     return;
                 }
-                let result = Accounts::update(|all| name_existing_account(all, &existing, &status, &name));
+                let result = server.update_accounts(|all| name_existing_account(all, &existing, &status, &name));
                 server.reload_accounts();
                 let mut form = saved_form;
                 form.state().complete(token, result.as_ref().err().map(|e| format!("{e:#}")));
@@ -754,6 +754,7 @@ mod tests {
             threshold: None,
             note: None,
             sign_in_required: false,
+            login_revision: String::new(),
             review: false,
             public_identity: None,
             linked_to: None,

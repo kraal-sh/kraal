@@ -106,6 +106,9 @@ pub struct Account {
     /// A login was started but has not yet been verified by the agent.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub sign_in_required: bool,
+    /// Changes on every login attempt, so completed logins also invalidate identity checks.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub login_revision: String,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub review: bool,
     /// A name collision may add a suffix to the label; the identity shown in Review must stay exact.
@@ -449,6 +452,15 @@ impl Accounts {
 
     /// [`Accounts::update`] on the accounts file at `path`.
     pub fn update_at<T>(path: &Path, f: impl FnOnce(&mut Accounts) -> Result<T>) -> Result<T> {
+        Self::update_with_sources(path, f, |_| {})
+    }
+
+    /// Record each completed source migration even if a later migration or account save fails.
+    pub(crate) fn update_with_sources<T>(
+        path: &Path,
+        f: impl FnOnce(&mut Accounts) -> Result<T>,
+        mut source_written: impl FnMut(&crate::workspace::migration::SourceWrite),
+    ) -> Result<T> {
         paths::locked(path, || {
             let mut all = Self::load_from(path)?;
             let before = all.text()?;
@@ -460,7 +472,7 @@ impl Accounts {
             let out = f(&mut all)?;
             all.bind_rules();
             if joined || all.text()? != before {
-                migration::before_account_change(&previous)?;
+                migration::before_account_change(&previous, &mut source_written)?;
                 all.save()?;
             }
             Ok(out)
@@ -504,6 +516,7 @@ impl Accounts {
             threshold: None,
             note: None,
             sign_in_required: false,
+            login_revision: String::new(),
             review: false,
             public_identity: None,
             linked_to: None,
@@ -729,16 +742,21 @@ impl Accounts {
         if self.by_id(&account.id).is_none() {
             return;
         }
+        let revision = required.then(new_uuid);
         let mut found = false;
         for a in &mut self.accounts {
             if a.id == account.id || a.same_home(account) && a.linked_to.is_none() {
                 a.sign_in_required = required;
+                if let Some(revision) = &revision {
+                    a.login_revision = revision.clone();
+                }
                 found = true;
             }
         }
         if required && !found {
             let mut account = account.clone();
             account.sign_in_required = true;
+            account.login_revision = revision.unwrap();
             self.accounts.push(account);
         }
     }

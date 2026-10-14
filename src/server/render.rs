@@ -2995,6 +2995,7 @@ mod tests {
                 threshold: None,
                 note: None,
                 sign_in_required: false,
+                login_revision: String::new(),
                 review: false,
                 public_identity: None,
                 linked_to: None,

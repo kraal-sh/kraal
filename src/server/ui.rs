@@ -313,7 +313,7 @@ pub enum PickAction {
         agent: String,
     },
     UseExisting {
-        existing: crate::accounts::Account,
+        existing: Box<crate::accounts::Account>,
         target: Option<crate::accounts::Account>,
     },
     CancelSwitch {

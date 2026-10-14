@@ -128,6 +128,13 @@ pub fn reconcile(
     checked: &Checked,
     named: &[(Account, Checked)],
 ) -> anyhow::Result<Option<String>> {
+    if existing.sign_in_required
+        || all
+            .by_id(&existing.id)
+            .is_none_or(|a| a.sign_in_required || a.login_revision != existing.login_revision || !a.same_home(existing))
+    {
+        return Ok(None);
+    }
     let current = all.for_agent(&existing.agent);
     if checked.status == Status::SignedIn || checked.status == Status::CouldNotCheck && !current.is_empty() {
         all.adopt_checked(existing, checked.identity.as_ref().map(|i| i.email.as_str()))?;
@@ -140,7 +147,8 @@ pub fn reconcile(
     };
     // An unchecked home could hide a second match, including one changed during the check.
     if current.iter().any(|a| {
-        !named.iter().any(|(b, result)| a == b && result.status == Status::SignedIn && result.identity.is_some())
+        a.sign_in_required
+            || !named.iter().any(|(b, result)| a == b && result.status == Status::SignedIn && result.identity.is_some())
     }) {
         return Ok(None);
     }
@@ -164,6 +172,35 @@ pub fn reconcile(
     Ok(None)
 }
 
+/// Hold the login locks through the account save, after revalidating the inspected revisions.
+/// A login that already holds a home lock wins without making discovery wait for it.
+pub fn save_discovery(
+    checked: &[(Account, Checked)],
+    named: &[(Account, Checked)],
+    source_written: impl FnMut(&crate::workspace::migration::SourceWrite),
+) -> anyhow::Result<Vec<String>> {
+    let mut locks = Vec::new();
+    accounts::Accounts::update_with_sources(
+        &accounts::Accounts::path(),
+        |all| {
+            let mut notices = Vec::new();
+            for (existing, result) in checked {
+                if !matches!(result.status, Status::SignedIn | Status::CouldNotCheck) {
+                    continue;
+                }
+                let homes =
+                    std::iter::once(existing).chain(named.iter().map(|(a, _)| a).filter(|a| a.agent == existing.agent));
+                let held: Result<Vec<_>, _> = homes.map(accounts::lock_login).collect();
+                let Ok(held) = held else { continue };
+                locks.extend(held);
+                notices.extend(reconcile(all, existing, result, named)?);
+            }
+            Ok(notices)
+        },
+        source_written,
+    )
+}
+
 /// Verify first, then re-read under the accounts lock before publishing any discovery.
 pub fn discover(all: &accounts::Accounts) -> anyhow::Result<Vec<(Account, Status)>> {
     let candidates: Vec<_> = all.unlisted().into_iter().chain(all.reviews()).collect();
@@ -171,13 +208,7 @@ pub fn discover(all: &accounts::Accounts) -> anyhow::Result<Vec<(Account, Status
     homes.extend(all.all().into_iter().filter(|a| candidates.iter().any(|b| a.agent == b.agent)));
     let mut checked = inspect_accounts(&homes);
     let named = checked.split_off(candidates.len());
-    let notices = accounts::Accounts::update(|all| {
-        let mut notices = Vec::new();
-        for (a, checked) in &checked {
-            notices.extend(reconcile(all, a, checked, &named)?);
-        }
-        Ok(notices)
-    })?;
+    let notices = save_discovery(&checked, &named, |_| {})?;
     for notice in notices {
         eprintln!("{notice}");
     }

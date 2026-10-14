@@ -458,12 +458,12 @@ impl Server {
             }
             PickAction::UseExisting { existing, target } => {
                 if target.is_none() {
-                    return Mode::AccountForm(self.name_existing_form(id, existing));
+                    return Mode::AccountForm(self.name_existing_form(id, *existing));
                 }
                 let name = target.as_ref().map_or(existing.name.as_str(), |a| &a.name);
                 return Mode::confirm(
                     format!("Use {name}?\nYour running agents will keep working.\nThis account will appear once."),
-                    ConfirmAction::UseExisting { existing: Box::new(existing), target },
+                    ConfirmAction::UseExisting { existing, target },
                 );
             }
             PickAction::AgentLaunch { agent, account } => {
@@ -1274,6 +1274,7 @@ mod tests {
                 threshold: None,
                 note: None,
                 sign_in_required: false,
+                login_revision: String::new(),
                 review: false,
                 public_identity: None,
                 linked_to: None,
@@ -1317,6 +1318,7 @@ mod tests {
                 threshold: None,
                 note: None,
                 sign_in_required: false,
+                login_revision: String::new(),
                 review: false,
                 public_identity: None,
                 linked_to: None,
