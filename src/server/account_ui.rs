@@ -122,15 +122,8 @@ pub(super) fn usage_summary(a: &Account, usage: Option<&Usage>, now: i64) -> Str
     if u.five_hour.is_none() && u.weekly.is_none() {
         return "Usage unavailable".into();
     }
-    let mut live = [&u.five_hour, &u.weekly]
-        .into_iter()
-        .zip([5 * 3600, 7 * 86400])
-        .filter_map(|(w, period)| {
-            w.as_ref().filter(|w| w.resets_at.unwrap_or(u.observed_at.saturating_add(period)) > now)
-        })
-        .peekable();
-    if live.peek().is_some() {
-        format!("{:.0}% used", live.map(|w| w.used_percent).fold(0.0, f64::max))
+    if let Some(peak) = u.valid_peak(now) {
+        format!("{peak:.0}% used")
     } else if u.observed_at > 0 {
         format!("Last checked {}", age(u.observed_at, now))
     } else {
@@ -1051,6 +1044,132 @@ mod tests {
         assert_eq!(usage_summary(&a, Some(&u), 2000), "71% used");
         a.sign_in_required = true;
         assert_eq!(usage_summary(&a, Some(&u), 1100), "Sign-in required");
+    }
+
+    #[test]
+    fn usage_callers_keep_their_expiry_rules_and_wording() {
+        let a = account();
+        let window = |used_percent, resets_at| Some(Window { used_percent, resets_at });
+        let usage = |five_hour, weekly| Usage { five_hour, weekly, observed_at: 1000, ..Default::default() };
+        let bars = |five, week, reset: &str| {
+            let bar = |name, pct| format!("{name} {} {pct:.0}%", crate::theme::current().bar(pct));
+            let mut parts = Vec::new();
+            if let Some(pct) = five {
+                parts.push(bar("5h", pct));
+            }
+            if let Some(pct) = week {
+                parts.push(bar("7d", pct));
+            }
+            if !reset.is_empty() {
+                parts.push(reset.into());
+            }
+            parts.join(" · ")
+        };
+        for (u, now, peak, end, reset, summary, text) in [
+            (usage(None, None), 1100, None, None, None, "Usage unavailable", "no usage seen yet".into()),
+            (usage(window(0.0, None), None), 1100, Some(0.0), Some(19000), None, "0% used", bars(Some(0.0), None, "")),
+            (
+                usage(window(57.0, Some(2000)), None),
+                1100,
+                Some(57.0),
+                Some(2000),
+                Some(2000),
+                "57% used",
+                bars(Some(57.0), None, "resets in 15m"),
+            ),
+            (
+                usage(window(57.0, Some(2000)), None),
+                2000,
+                None,
+                None,
+                None,
+                "Last checked 16m ago",
+                bars(Some(0.0), None, ""),
+            ),
+            (
+                usage(window(57.0, None), None),
+                18999,
+                Some(57.0),
+                Some(19000),
+                None,
+                "57% used",
+                bars(Some(57.0), None, ""),
+            ),
+            (
+                usage(window(57.0, None), None),
+                19000,
+                None,
+                None,
+                None,
+                "Last checked 5h ago",
+                bars(Some(57.0), None, ""),
+            ),
+            (
+                usage(window(95.0, None), window(71.0, None)),
+                19000,
+                Some(71.0),
+                Some(605800),
+                None,
+                "71% used",
+                bars(Some(95.0), Some(71.0), ""),
+            ),
+            (
+                usage(None, window(71.0, None)),
+                605800,
+                None,
+                None,
+                None,
+                "Last checked 7d ago",
+                bars(None, Some(71.0), ""),
+            ),
+            (
+                usage(window(57.0, Some(2000)), window(71.0, Some(3000))),
+                1100,
+                Some(71.0),
+                Some(2000),
+                Some(3000),
+                "71% used",
+                bars(Some(57.0), Some(71.0), "resets in 31m"),
+            ),
+            (
+                usage(window(57.0, None), None),
+                900,
+                Some(57.0),
+                Some(19000),
+                None,
+                "57% used",
+                bars(Some(57.0), None, ""),
+            ),
+            (
+                usage(window(57.0, Some(800)), None),
+                900,
+                None,
+                None,
+                None,
+                "Last checked just now",
+                bars(Some(0.0), None, ""),
+            ),
+            (
+                Usage { observed_at: 0, ..usage(window(57.0, Some(800)), None) },
+                900,
+                None,
+                None,
+                None,
+                "Usage unavailable",
+                bars(Some(0.0), None, ""),
+            ),
+        ] {
+            assert_eq!(u.valid_peak(now), peak, "{u:?} at {now}");
+            assert_eq!(u.peak(now), peak.unwrap_or(0.0), "{u:?} at {now}");
+            assert_eq!(u.next_end(now), end, "{u:?} at {now}");
+            assert_eq!(u.next_reset(now), reset, "{u:?} at {now}");
+            assert_eq!(usage_summary(&a, Some(&u), now), summary, "{u:?} at {now}");
+            assert_eq!(super::super::usage_text(&u, now), text, "{u:?} at {now}");
+            let map = accounts::UsageMap(HashMap::from([(a.key(), u.clone())]));
+            let expected = (u.five_hour.is_some() || u.weekly.is_some()).then_some(peak.unwrap_or(0.0));
+            assert_eq!(map.peak(&a, now), expected, "{u:?} at {now}");
+            assert_eq!(map.next_end(now), end, "{u:?} at {now}");
+        }
     }
 
     #[test]
