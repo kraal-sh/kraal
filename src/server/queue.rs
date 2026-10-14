@@ -144,6 +144,10 @@ impl EventReceiver {
         self.events.is_empty()
     }
 
+    pub fn is_idle(&self) -> bool {
+        self.events.is_empty() && self.token.is_empty()
+    }
+
     pub fn reconcile(&self, selected: bool) -> Notifications {
         if !selected && self.token.try_recv().is_err() {
             return Notifications::default();
