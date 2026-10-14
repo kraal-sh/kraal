@@ -15,7 +15,6 @@ use crate::protocol::Placement;
 #[derive(Default)]
 pub struct WorkspaceForm {
     field: usize,
-    pending: Option<u32>,
     cwd: Option<PathBuf>,
     back: Option<PickerState>,
     invalid_name: bool,
@@ -237,7 +236,7 @@ pub(super) fn draw_form(p: &Prompt, screen: Rect, buf: &mut Buffer) -> Option<Cu
     } else {
         verb(p)
     };
-    forms::draw_buttons(&layout, &buttons, form.field, form.pending, action, buf);
+    forms::draw_buttons(&layout, &buttons, form.field, None, action, buf);
     cursor
 }
 
@@ -354,13 +353,9 @@ impl Server {
         if importing && form.preview.as_ref().is_some_and(|p| !p.accounts.is_empty()) {
             fields.push(forms::Field { id: 2, area: layout.fields[2], value: forms::FieldValue::Choice });
         }
-        let outcome = forms::FormState {
-            field: &mut form.field,
-            scroll: &mut p.scroll,
-            error: &mut p.error,
-            pending: &mut form.pending,
-        }
-        .handle(event, &mut fields, &buttons, &layout);
+        let outcome =
+            forms::FormState { field: &mut form.field, scroll: &mut p.scroll, error: &mut p.error, pending: &mut None }
+                .handle(event, &mut fields, &buttons, &layout);
         if form.file != file_before {
             form.preview = None;
             form.existing = None;

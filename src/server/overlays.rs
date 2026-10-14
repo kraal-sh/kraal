@@ -522,12 +522,6 @@ pub(super) fn draw_picker(p: &Picker, screen: Rect, buf: &mut Buffer) -> Option<
                 let keys = truncate(&item.detail, room);
                 spans.push(Span::raw(" ".repeat(room.saturating_sub(columns(&keys)) + 1)));
                 spans.push(Span::styled(keys, key_style()));
-            } else if matches!(item.action, super::ui::PickAction::OpenDefinition(_)) {
-                // Keep the end of the path visible: it distinguishes same-named workspace files.
-                let used: usize = spans.iter().map(|s| columns(&s.content)).sum();
-                let room = (list.width as usize).saturating_sub(used + 2);
-                let detail = crate::text::truncate_start(&item.detail, room);
-                spans.push(Span::styled(format!("  {detail}"), dim()));
             } else {
                 spans.push(Span::styled(format!("  {}", item.detail), dim()));
             }
@@ -558,8 +552,6 @@ pub(super) fn draw_picker(p: &Picker, screen: Rect, buf: &mut Buffer) -> Option<
         let msg = match p.kind {
             _ if p.loading.is_some() => if th().ascii { "Loading..." } else { "Loading…" }.into(),
             _ if !p.query.is_empty() => format!("Nothing matches \"{}\".", p.query),
-            K::Ssh => "No saved servers. Choose + Add server.".into(),
-            K::Workspace => "No workspaces yet.".into(),
             K::DeletedWorkspaces => "No deleted workspaces.".into(),
             K::Runbook => "No runbooks yet: `kraal runbook new <name>` creates one.".into(),
             K::Tool => "No tools: add some under [tools] in config.toml.".into(),
@@ -679,14 +671,7 @@ pub(super) fn draw_prompt(p: &Prompt, screen: Rect, buf: &mut Buffer) -> Option<
     for (i, line) in layout.lines.iter().skip(scroll).take(layout.body as usize).enumerate() {
         buf.set_stringn(inner.x + 1, inner.y + 1 + i as u16, line, room, Style::default().fg(th().production));
     }
-    let verb = if p.error.is_some()
-        && matches!(p.action, super::ui::PromptAction::NewWorkspace | super::ui::PromptAction::ExportWorkspace(_))
-    {
-        "retry"
-    } else {
-        p.action.verb()
-    };
-    let verb = upper_first(verb);
+    let verb = upper_first(p.action.verb());
     let mut keys = vec![("Enter", verb.as_str()), ("Esc", "Cancel")];
     if layout.max_scroll > 0 {
         keys.insert(1, ("PgUp/PgDn", "Scroll"));

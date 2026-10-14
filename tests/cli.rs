@@ -2003,8 +2003,8 @@ fn a_workspace_rename_never_replaces_a_file() {
     assert_eq!(std::fs::read_to_string(dir.join("b.kdl")).unwrap(), "layout { pane name=\"two\"; }\n");
 }
 
-/// A session where a workspace was renamed without its file, by an older kraal, keeps it linked
-/// to that file: listed once, opened by the file's name, saved to it. Renaming again keeps it.
+/// Changing a workspace's name in the saved session preserves its source link: opening by the
+/// source file's name reuses it. Explicit export and another rename keep the same files.
 #[test]
 fn a_workspace_renamed_without_its_file_is_still_that_files() {
     let env = Env::new("wslegacy");
@@ -6906,12 +6906,15 @@ fn a_long_paste_keeps_going_where_it_started_and_never_into_production() {
     let (got, prod_got) = (env.root.join("pasted"), env.root.join("prod-pasted"));
     env.workspace("w", "layout {\n    pane name=\"main\"\n}\n");
     env.run(&["open", "w"]);
-    let take = |file: &Path| format!("stty raw -echo; cat > {}", file.display());
+    let take = |file: &Path| format!("stty raw -echo && cat > {}", file.display());
     env.run(&["run", "--cwd", &tf.display().to_string(), "--name", "ops", "--", "sh", "-c", &take(&prod_got)]);
     wait_production(&env, "ops");
     env.run(&["run", "--name", "sink", "--", "sh", "-c", &take(&got)]);
     env.run(&["focus", "sink"]);
+    // The panes exist before their programs have entered raw mode and opened the files.
+    wait_until(PATIENCE, "the paste receivers never became ready", || got.exists() && prod_got.exists());
     let mut client = RawClient::attach(&env, "w");
+    client.wait_for_screen("sink");
     // More than kraal holds back (8 MiB): it goes out as it comes.
     let line = "x".repeat(99) + "\n";
     client.send(b"\x1b[200~");
@@ -6921,7 +6924,7 @@ fn a_long_paste_keeps_going_where_it_started_and_never_into_production() {
     let size = |f: &Path| std::fs::metadata(f).map(|m| m.len()).unwrap_or(0);
     let start = Instant::now();
     while size(&got) == 0 {
-        assert!(start.elapsed() < Duration::from_secs(10), "the paste never started going out");
+        assert!(start.elapsed() < PATIENCE, "the paste never started going out:\n{}", client.rows().join("\n"));
         std::thread::sleep(Duration::from_millis(50));
     }
     // The focus moves to a production pane while the rest comes: the rest still goes where the
@@ -6933,7 +6936,7 @@ fn a_long_paste_keeps_going_where_it_started_and_never_into_production() {
     client.send(b"\x1b[201~");
     let start = Instant::now();
     while size(&got) < 10_000_000 {
-        assert!(start.elapsed() < Duration::from_secs(20), "only {} bytes arrived", size(&got));
+        assert!(start.elapsed() < PATIENCE, "only {} bytes arrived:\n{}", size(&got), client.rows().join("\n"));
         std::thread::sleep(Duration::from_millis(50));
     }
     std::thread::sleep(Duration::from_millis(300));
