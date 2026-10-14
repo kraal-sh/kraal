@@ -1903,16 +1903,29 @@ impl Usage {
 
     /// Each valid window with the time it counts until: its reset or, when it does not say when it
     /// resets, the end of its period after it was seen.
-    fn valid_windows(&self, now: i64) -> impl Iterator<Item = (&Window, i64)> {
-        let end = |w: &Window, period: i64| w.resets_at.unwrap_or(self.observed_at.saturating_add(period));
-        let five = self.five_hour.iter().map(move |w| (w, end(w, 5 * 3600)));
-        let week = self.weekly.iter().map(move |w| (w, end(w, 7 * 24 * 3600)));
-        five.chain(week).filter(move |(_, end)| *end > now)
+    fn valid_windows(&self, now: i64) -> [Option<(&Window, i64)>; 2] {
+        [(&self.five_hour, 5 * 3600), (&self.weekly, 7 * 24 * 3600)].map(|(window, period)| {
+            window
+                .as_ref()
+                .map(|w| (w, w.resets_at.unwrap_or(self.observed_at.saturating_add(period))))
+                .filter(|(_, end)| *end > now)
+        })
+    }
+
+    /// Five-hour and weekly percentages: absent when unreported, zero when expired.
+    pub fn percentages(&self, now: i64) -> impl Iterator<Item = Option<f64>> {
+        [&self.five_hour, &self.weekly]
+            .into_iter()
+            .zip(self.valid_windows(now))
+            .map(|(reported, valid)| reported.as_ref().map(|_| valid.map_or(0.0, |(w, _)| w.used_percent)))
     }
 
     /// Highest usage still counting, or `None` when no windows are valid.
     pub fn valid_peak(&self, now: i64) -> Option<f64> {
-        self.valid_windows(now).fold(None, |peak, (w, _)| Some(peak.unwrap_or(0.0).max(w.used_percent)))
+        self.valid_windows(now)
+            .into_iter()
+            .flatten()
+            .fold(None, |peak, (w, _)| Some(peak.unwrap_or(0.0).max(w.used_percent)))
     }
 
     /// Highest usage among windows that have not reset yet.
@@ -1923,7 +1936,7 @@ impl Usage {
     /// When [`Usage::peak`] changes next with nothing new seen: the earliest reset of a window
     /// that counts at `now`.
     pub fn next_end(&self, now: i64) -> Option<i64> {
-        self.valid_windows(now).map(|(_, end)| end).min()
+        self.valid_windows(now).into_iter().flatten().map(|(_, end)| end).min()
     }
 
     /// A limit message seen on the agent's screen, saying `pct` percent of a window (weekly or
@@ -3288,6 +3301,38 @@ mod tests {
         };
         assert_eq!(u.peak(1_000 + 3600), 100.0);
         assert_eq!(u.peak(1_000 + 5 * 3600 + 1), 0.0, "five hours later it has reset");
+    }
+
+    #[test]
+    fn usage_percentages_keep_missing_windows_and_expire_at_their_deadlines() {
+        assert_eq!(Usage::default().percentages(1000).collect::<Vec<_>>(), [None, None]);
+        for resets in [[None, None], [Some(19000), Some(605800)]] {
+            let u = Usage {
+                five_hour: Some(Window { used_percent: 95.0, resets_at: resets[0] }),
+                weekly: Some(Window { used_percent: 71.0, resets_at: resets[1] }),
+                observed_at: 1000,
+                ..Default::default()
+            };
+            let saved = serde_json::to_vec(&u).unwrap();
+            for (now, expected) in [
+                (18999, [Some(95.0), Some(71.0)]),
+                (19000, [Some(0.0), Some(71.0)]),
+                (605799, [Some(0.0), Some(71.0)]),
+                (605800, [Some(0.0), Some(0.0)]),
+                (605801, [Some(0.0), Some(0.0)]),
+                (900, [Some(95.0), Some(71.0)]),
+            ] {
+                assert_eq!(u.percentages(now).collect::<Vec<_>>(), expected, "{resets:?} at {now}");
+            }
+            assert_eq!(serde_json::to_vec(&u).unwrap(), saved);
+        }
+        let u = Usage {
+            weekly: Some(Window { used_percent: 71.0, resets_at: None }),
+            observed_at: i64::MAX - 1,
+            ..Default::default()
+        };
+        assert_eq!(u.percentages(i64::MAX - 1).collect::<Vec<_>>(), [None, Some(71.0)]);
+        assert_eq!(u.percentages(i64::MAX).collect::<Vec<_>>(), [None, Some(0.0)]);
     }
 
     /// What is worked out of the usage at one moment holds until the reset said to come next,

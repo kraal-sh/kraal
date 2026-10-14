@@ -427,13 +427,13 @@ then runs yours unchanged. Codex accounts are asked through Codex's own app-serv
 minutes (`kraal accounts refresh` asks now). Limit messages on screen ("You've hit your session
 limit") count too.
 
-Account summaries and thresholds use the highest percentage among windows that still count.
+The CLI usage bars, account summaries and thresholds share the same expiry rule.
 A reported reset ends a window at that time. Without a reset time, it counts for five hours
-or seven days after the observation. When all reported windows have expired, account summaries
-show **Last checked ...** and thresholds use zero. No reported windows means usage is unknown.
-The CLI usage bars currently show zero only after an explicit reset; without a reset time,
-they keep the reported percentage. Account details keep the reported percentages and show
-**Reset unavailable** when no reset time was supplied.
+or seven days after the observation. CLI bars show zero for expired windows. Account summaries
+and thresholds use the highest percentage among windows that still count. When all reported
+windows have expired, account summaries show **Last checked ...** and thresholds use zero.
+No reported windows means usage is unknown. Account details and `kraal accounts list --json`
+keep the reported percentages. Details show **Reset unavailable** when no reset time was supplied.
 
 **Rules and thresholds** live in `~/.config/kraal/accounts.toml` (`kraal accounts edit`):
 
