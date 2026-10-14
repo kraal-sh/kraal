@@ -160,6 +160,28 @@ also subject to these file, batch and session quotas. Bind `attach_clipboard_ima
 Larger or recursive transfers use `kraal cp`. See
 [Attachments](terminal.md#attachments) for retention, cancellation and quota recovery.
 
+## Laptop files
+
+This setting belongs to the laptop running `attach --host`. It is read again for each file
+manager listing request. The local client asks for permission before listing anything.
+
+```toml config
+[laptop_files]
+scope = "home"
+```
+
+`laptop_files.scope` accepts `"home"` (the default), `"all"` or `"off"`. Home excludes hidden
+entries directly inside your home, and `~/Library` on macOS, even when hidden files are shown.
+Hidden files in deeper directories follow the file manager's `.` key. All allows directories
+anywhere your user can read; off refuses every request, including remembered permissions.
+Neither enabled scope follows symbolic links. An unreadable or invalid config refuses listing.
+
+**Allow** lasts for the current attach, including reconnects. **Always** stores a `[[server]]`
+entry with `name` and `ssh` in `~/.config/kraal/laptop-files.toml` (or under
+`$XDG_CONFIG_HOME/kraal`). Removing the matching entry revokes Always at the next request;
+remove the file to revoke all remembered servers. This is separate from `paste-files.toml`.
+See the [file manager](servers.md#the-file-manager) and [example](../examples/config/laptop-files.toml).
+
 ## Paste buffers
 
 `[buffers]` sets what the [paste buffers](keys.md#paste-buffers) keep:

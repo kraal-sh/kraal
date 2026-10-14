@@ -13,6 +13,35 @@ use std::process::Command;
 use std::process::Output;
 use std::time::{Duration, Instant};
 
+#[cfg(target_os = "linux")]
+#[test]
+fn a_protocol_three_remote_refusal_names_remote_install_for_the_selected_session() {
+    let mut env = Env::new("rproto3");
+    let bin = env.root.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let refusal = env.root.join("refusal");
+    write_script(&bin.join("ssh"), &format!("#!/bin/sh\ncat '{}'\n", refusal.display()));
+    for session in ["main", "work"] {
+        let reason = format!(
+            "protocol mismatch: client protocol 4, server protocol 3 (kraal 0.4.0, session {session}); run `kraal -s {session} restart`"
+        );
+        let payload = serde_json::to_vec(&serde_json::json!({ "type": "exit", "reason": reason })).unwrap();
+        let mut frame = (payload.len() as u32).to_le_bytes().to_vec();
+        frame.push(0);
+        frame.extend(payload);
+        std::fs::write(&refusal, frame).unwrap();
+        env.session = session.into();
+        let mut command = env.cmd(&["attach", "--host", "box"]);
+        command.env("PATH", format!("{}:{}", bin.display(), std::env::var("PATH").unwrap_or_default()));
+        let shown = in_terminal(command, b"");
+        let recovery = if session == "main" { "kraal remote-install box" } else { "kraal -s work remote-install box" };
+        assert!(shown.contains(recovery), "{shown}");
+        assert!(shown.contains("client protocol 4, server protocol 3 (kraal 0.4.0"), "{shown}");
+        assert!(shown.contains(&format!("session {session}")), "{shown}");
+        assert!(!shown.contains(" restart") && !shown.contains("\x1b[?1049h"), "{shown}");
+    }
+}
+
 /// A name given where a workspace's goes that names no workspace but reads as a server
 /// (`user@host`, or a server kraal knows) is answered with the command that was meant, and
 /// kraal attaches nowhere; any other name gets the plain answer. No session is started only to
@@ -1868,7 +1897,7 @@ fn attachment_wire_cancellation_disconnect_and_repeated_finish_do_not_paste_part
         raw_frame(
             &mut client.stream,
             0,
-            br#"{"type":"attach","version":3,"cols":120,"rows":40,"workspace":"w","remote":true}"#,
+            br#"{"type":"attach","version":4,"cols":120,"rows":40,"workspace":"w","remote":true}"#,
         );
         client.send(b"\x02 Attach files\r");
         client.wait_for_message("attachment_offer");

@@ -59,7 +59,8 @@ A state from a newer format is also left untouched, with a message to use a newe
 
 ## Clients and servers
 
-Kraal 0.4 uses protocol 3. Kraal 0.2.0 and 0.3.0 use protocol 2.
+This version uses protocol 4 for laptop listings. Kraal 0.4.0 used protocol 3;
+Kraal 0.2.0 and 0.3.0 use protocol 2.
 Different protocol versions refuse attachment and ordinary commands. There are no older-peer
 adapters or optional feature negotiation. A refusal names both protocol versions and one next step:
 
@@ -86,9 +87,22 @@ A 0.3.0 client waiting for a restarted server receives the protocol refusal and 
 
 Workspaces are saved automatically. KDL is imported and exported explicitly with `kraal import`
 and `kraal export`; `kraal save` and its historical `SaveWorkspace` request are removed.
-Clipboard, file attachments, pasted paths and clipboard images are part of protocol 3.
+Clipboard, file attachments, pasted paths and clipboard images introduced in protocol 3 remain
+part of protocol 4.
 The client applies its clipboard policy, including the terminal OSC 52 fallback where configured.
 The server no longer emits OSC 52 as an adapter for old clients.
+
+## Laptop listings on Linux and macOS
+
+Laptop browsing uses the same attachment connection on both systems, with consent drawn by
+the laptop client. Each directory component is opened without following symbolic links.
+On macOS, the system may also ask for access when listing Documents or Desktop. Declining
+system access leaves a listing error; grant access on the laptop and press `r` to retry.
+The default scope excludes `~/Library`. Laptop file copying and filesystem-specific staging
+are not available in this version.
+
+Laptop panels save as the session machine's home directory, with no laptop paths or listings
+in the saved session. The session format and its downgrade isolation remain unchanged.
 
 ## For contributors: how the protocol changes
 

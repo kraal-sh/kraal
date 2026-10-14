@@ -12,6 +12,7 @@ at its tag. The [documentation](../docs/README.md) explains what they use.
 | [workspaces/two-agents.kdl](workspaces/two-agents.kdl) | Two agents side by side, one on a named account, and a stack of helper panes | claude, codex, two checkouts | `kraal two-agents` |
 | [workspaces/release.kdl](workspaces/release.kdl) | The workspace of the README: a production server, an agent, a live changelog | claude, a checkout, a server | `kraal release` |
 | [config/keys-classic.toml](config/keys-classic.toml) | The classic preset, another prefix, keys moved and unbound | nothing | `kraal config keys` |
+| [config/laptop-files.toml](config/laptop-files.toml) | The scope of laptop browsing in remote sessions | ssh access to a session | `kraal config check` |
 | [config/theme.toml](config/theme.toml) | A preset, colours, frames, the sidebar and the bottom bar | nothing | `kraal config reload` |
 | [config/tools.toml](config/tools.toml) | Two tools of your own and a hint pattern that runs one | kubectl, the aws CLI | `ctrl+b r`, `ctrl+b o` |
 | [config/hooks.toml](config/hooks.toml) | A command on `agent.blocked`, on `pane.failed` and on `ssh.started` | curl, notify-send, logger | `kraal config check` |

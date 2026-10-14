@@ -375,7 +375,7 @@ pub fn snapshot(server: &Server) -> SessionSnapshot {
         }
         if let crate::pane::Content::Files(f) = &p.content {
             use crate::files::Side;
-            spec.files = Some([f.location(Side::Left).display(), f.location(Side::Right).display()]);
+            spec.files = Some([f.location(Side::Left).saved(), f.location(Side::Right).saved()]);
         }
         if spec.preview.is_none()
             && let Some(cwd) = p.current_cwd()

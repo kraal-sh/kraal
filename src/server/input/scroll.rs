@@ -102,8 +102,11 @@ impl Server {
     }
 
     /// Scrolling a preview or file manager pane (no cursor there).
-    pub(super) fn scroll_other(&mut self, _id: ClientId, p: PaneId, k: &Key) -> Mode {
+    pub(super) fn scroll_other(&mut self, id: ClientId, p: PaneId, k: &Key) -> Mode {
         let Some(pane) = self.panes.get_mut(&p) else { return Mode::Normal };
+        if let crate::pane::Content::Files(f) = &mut pane.content {
+            f.set_viewer(id);
+        }
         let half = (pane.rows / 2).max(1) as i32;
         match (k.code, k.mods.ctrl) {
             (KeyCode::Up, _) | (KeyCode::Char('k'), false) => pane.scroll(1),

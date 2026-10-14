@@ -104,6 +104,7 @@ impl Server {
         };
         let view = self.files_view(client, pane);
         let Some(Content::Files(f)) = self.panes.get_mut(&pane).map(|p| &mut p.content) else { return Mode::Normal };
+        f.set_viewer(client);
         if let Some((w, h)) = view {
             f.set_view(client, w, h);
         }
@@ -116,6 +117,7 @@ impl Server {
     pub(super) fn files_click(&mut self, client: ClientId, pane: PaneId, col: u16, row: u16, double: bool) -> Mode {
         let view = self.files_view(client, pane);
         let Some(Content::Files(f)) = self.panes.get_mut(&pane).map(|p| &mut p.content) else { return Mode::Normal };
+        f.set_viewer(client);
         if let Some((w, h)) = view {
             f.set_view(client, w, h);
         }
@@ -136,6 +138,14 @@ impl Server {
             FilesAction::Shell(loc) | FilesAction::Edit(loc) => vec![loc],
             _ => Vec::new(),
         };
+        if places.iter().any(|l| matches!(l, Location::Laptop { .. })) {
+            self.toast(
+                client,
+                NoticeKind::Error,
+                "Laptop copy, move and delete: not yet available. Open files on the laptop",
+            );
+            return Mode::Normal;
+        }
         if places.iter().any(|l| l.exact_display().is_none()) {
             self.toast(
                 client,
@@ -157,7 +167,7 @@ impl Server {
             .iter()
             .filter_map(|l| match l {
                 Location::Remote(r) => Some(format!("--expect={}={}", r.server, crate::shell::join(&r.ssh_args))),
-                Location::Local(_) => None,
+                Location::Local(_) | Location::Laptop { .. } => None,
             })
             .collect();
         let dir_arg = |l: &Location| {
@@ -230,6 +240,7 @@ impl Server {
             FilesAction::Shell(loc) => {
                 let Some(ws) = self.clients.get(&client).map(|c| c.workspace) else { return Mode::Normal };
                 let result = match &loc {
+                    Location::Laptop { .. } => unreachable!("laptop actions are refused before launching jobs"),
                     Location::Local(p) => {
                         let spec = PaneSpec { cwd: Some(p.clone()), ..Default::default() };
                         self.spawn_pane_in(ws, None, spec, Placement::Tab, None)
@@ -257,6 +268,7 @@ impl Server {
                 }
                 Mode::Normal
             }
+            FilesAction::Edit(Location::Laptop { .. }) => Mode::Normal,
             FilesAction::Edit(Location::Local(path)) => {
                 let Some(ws) = self.clients.get(&client).map(|c| c.workspace) else { return Mode::Normal };
                 let command = crate::edit::editor_argv(&path, None);
@@ -285,7 +297,7 @@ impl Server {
                 };
                 self.edit_request(client, target, production)
             }
-            FilesAction::PickLocation(side) => Mode::Picker(self.location_picker(pane, side)),
+            FilesAction::PickLocation(side) => Mode::Picker(self.location_picker(client, pane, side)),
             FilesAction::Refused(why) => {
                 self.toast(client, NoticeKind::Error, why);
                 Mode::Normal
@@ -297,14 +309,27 @@ impl Server {
         }
     }
 
-    fn location_picker(&self, pane: PaneId, side: Side) -> Picker {
+    fn location_picker(&self, client: ClientId, pane: PaneId, side: Side) -> Picker {
         let mut items = vec![PickItem {
-            label: "local".into(),
-            detail: format!("this machine · {}", paths::shorten_home(&dirs::home_dir().unwrap_or_default())),
+            label: if self.clients.get(&client).is_some_and(|c| c.remote) {
+                crate::context::hostname().unwrap_or_else(|| "session".into()).split('.').next().unwrap().into()
+            } else {
+                "local".into()
+            },
+            detail: "the session's machine · ~".into(),
             action: PickAction::FilesSet { pane, side, target: "~".into() },
             state: None,
             dim: false,
         }];
+        if let Some(laptop) = self.clients.get(&client).and_then(|c| c.laptop.as_ref()) {
+            items.push(PickItem {
+                label: laptop.host.clone(),
+                detail: "this laptop · ~ · asks first".into(),
+                action: PickAction::FilesLaptop { pane, side },
+                state: None,
+                dim: false,
+            });
+        }
         for k in &self.known_servers {
             items.push(PickItem {
                 label: k.server.name.clone(),
@@ -353,9 +378,60 @@ impl Server {
         self.mark_dirty();
     }
 
-    pub(super) fn files_set(&mut self, pane: PaneId, side: Side, target: &str) {
+    pub(super) fn files_laptop(&mut self, client: ClientId, pane: PaneId, side: Side) {
+        let Some(laptop) = self.clients.get(&client).and_then(|c| c.laptop.as_ref()) else {
+            return;
+        };
+        let loc = Location::Laptop { owner_id: laptop.id.clone(), host: laptop.host.clone(), path: "~".into() };
+        if let Some(Content::Files(f)) = self.panes.get_mut(&pane).map(|p| &mut p.content)
+            && !f.set_laptop(side, loc, client)
+        {
+            self.toast(
+                client,
+                NoticeKind::Error,
+                "Only one panel can show the laptop: choose the session's machine for the other panel",
+            );
+            return;
+        }
+        self.mark_persist();
+        self.mark_dirty();
+    }
+
+    pub(super) fn laptop_requests(&mut self) {
+        let mut requests = Vec::new();
+        for (&pane, p) in &mut self.panes {
+            if let Content::Files(f) = &mut p.content {
+                requests.extend(
+                    f.laptop_requests()
+                        .into_iter()
+                        .map(|(client, side, request, path)| (client, pane, side, request, path)),
+                );
+            }
+        }
+        for (client, pane, side, request, path) in requests {
+            let mut bytes = Vec::new();
+            let sent = crate::protocol::write_json(
+                &mut bytes,
+                &crate::protocol::ServerMsg::LaptopList { pane, side, request, path },
+            )
+            .is_ok()
+                && self.clients.get(&client).is_some_and(|c| {
+                    c.attached && c.out.send_timeout(bytes, std::time::Duration::from_millis(200)).is_ok()
+                });
+            if !sent && let Some(Content::Files(f)) = self.panes.get_mut(&pane).map(|p| &mut p.content) {
+                f.laptop_result(client, side, request, Err("Cannot reach the laptop: reconnect and press r".into()));
+                self.mark_dirty();
+            }
+        }
+    }
+
+    pub(super) fn files_set(&mut self, client: ClientId, pane: PaneId, side: Side, target: &str) {
         let loc = self.files_location(target);
         if let Some(Content::Files(f)) = self.panes.get_mut(&pane).map(|p| &mut p.content) {
+            if !f.can_set(side, client) {
+                self.toast(client, NoticeKind::Error, "This panel belongs to another laptop: use the other panel");
+                return;
+            }
             f.set_location(side, loc);
         }
         self.mark_persist();
@@ -418,4 +494,85 @@ fn names(list: &[String]) -> String {
         out.push_str(&format!(" and {} more", list.len() - 5));
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::laptop::Identity;
+    use crate::protocol::{self, ClientMsg, ServerMsg};
+    use crate::server::tests::{client, server};
+
+    #[test]
+    fn picker_offers_only_this_clients_laptop_and_names_the_sessions_machine() {
+        let (tx, _rx) = super::super::queue::channel(32);
+        let mut server = server(tx);
+        let (id, _peer) = client(&mut server);
+        let picker = server.location_picker(id, 1, Side::Left);
+        assert_eq!(picker.items[0].label, "local");
+        assert!(!picker.items.iter().any(|i| matches!(i.action, PickAction::FilesLaptop { .. })));
+        let c = server.clients.get_mut(&id).unwrap();
+        c.remote = true;
+        c.laptop = Some(Identity { id: "abc123".into(), host: "travel".into(), os: "linux".into() });
+        let picker = server.location_picker(id, 1, Side::Left);
+        assert_ne!(picker.items[0].label, "local");
+        assert_eq!(picker.items[0].detail, "the session's machine · ~");
+        assert_eq!(picker.items[1].label, "travel");
+        let (other, _peer) = client(&mut server);
+        assert!(!server.location_picker(other, 1, Side::Left).items.iter().any(|i| i.label == "travel"));
+    }
+
+    #[test]
+    fn listing_routes_to_owner_saves_without_laptop_paths_and_detach_clears_it() {
+        let (tx, _rx) = super::super::queue::channel(32);
+        let mut server = server(tx);
+        let (id, _peer) = client(&mut server);
+
+        let c = server.clients.get_mut(&id).unwrap();
+        c.remote = true;
+        c.laptop = Some(Identity { id: "abc123".into(), host: "travel".into(), os: "linux".into() });
+        let ws = c.workspace;
+        let pane = server.open_files(ws, "~".into(), "~".into()).unwrap();
+        let incoming = server.clients.get_mut(&id).unwrap().out.capture();
+        server.files_laptop(id, pane, Side::Left);
+        server.laptop_requests();
+        let (requested, side, request, path) = loop {
+            let frame = incoming.recv_timeout(crate::testing::PATIENCE).unwrap();
+            let (_, bytes) = protocol::read_frame(&mut frame.as_slice()).unwrap().unwrap();
+            if let ServerMsg::LaptopList { pane, side, request, path } = serde_json::from_slice(&bytes).unwrap() {
+                break (pane, side, request, path);
+            }
+        };
+        assert_eq!((requested, side, path.as_str()), (pane, Side::Left, "~"));
+        let reply = ClientMsg::LaptopListed {
+            pane,
+            side,
+            request,
+            result: Ok((
+                "~/private-path".into(),
+                vec![crate::files::Entry {
+                    name: "secret-entry".into(),
+                    is_dir: false,
+                    is_link: false,
+                    size: 1,
+                    mtime: 0,
+                    exact: true,
+                }],
+            )),
+        };
+        let (other, _peer) = client(&mut server);
+        server.client_frame(other, protocol::JSON, serde_json::to_vec(&reply).unwrap());
+        let Content::Files(f) = &server.panes[&pane].content else { panic!("not files") };
+        assert_eq!(f.location(side).display(), "travel:~");
+        server.client_frame(id, protocol::JSON, serde_json::to_vec(&reply).unwrap());
+        let Content::Files(f) = &server.panes[&pane].content else { panic!("not files") };
+        assert_eq!(f.location(side).display(), "travel:~/private-path");
+        let saved = serde_json::to_string(&crate::persist::snapshot(&server)).unwrap();
+        assert!(!saved.contains("private-path") && !saved.contains("secret-entry") && !saved.contains("abc123"));
+        server.clients.get_mut(&other).unwrap().dirty = crate::server::Dirty::No;
+        server.drop_client(id);
+        assert!(matches!(server.clients[&other].dirty, crate::server::Dirty::Yes));
+        let Content::Files(f) = &server.panes[&pane].content else { panic!("not files") };
+        assert!(f.visible_text().contains("travel is not attached"));
+    }
 }
