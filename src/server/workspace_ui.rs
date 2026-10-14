@@ -26,9 +26,24 @@ pub struct WorkspaceForm {
     account: usize,
     existing: Option<u32>,
     result: Option<String>,
+    source_message: String,
+    source_details: Option<String>,
+    details: bool,
+    pub(super) undo: bool,
+    undo_layout: Option<Box<crate::persist::WorkspaceSnap>>,
 }
 
 fn verb(p: &Prompt) -> &'static str {
+    if matches!(p.action, PromptAction::ReviewWorkspace(_)) {
+        let form = p.workspace_form.as_ref().unwrap();
+        return if form.undo {
+            "Undo load"
+        } else if form.source_details.is_some() {
+            "Open saved"
+        } else {
+            "Load from file"
+        };
+    }
     if p.workspace_form.as_ref().is_some_and(|f| f.result.is_some()) {
         return "Done";
     }
@@ -61,6 +76,9 @@ fn verb(p: &Prompt) -> &'static str {
 }
 
 fn field_count(p: &Prompt) -> usize {
+    if matches!(p.action, PromptAction::ReviewWorkspace(_)) {
+        return 0;
+    }
     if p.workspace_form.as_ref().is_some_and(|f| f.result.is_some()) {
         return 0;
     }
@@ -77,6 +95,21 @@ fn field_count(p: &Prompt) -> usize {
 
 fn buttons(p: &Prompt) -> forms::Buttons<'static> {
     let count = field_count(p);
+    if matches!(p.action, PromptAction::ReviewWorkspace(_)) {
+        let form = p.workspace_form.as_ref().unwrap();
+        return forms::Buttons {
+            primary: forms::Button { field: 0, label: verb(p) },
+            alternate: (!form.undo).then_some(forms::Button {
+                field: 2,
+                label: if form.source_details.is_some() {
+                    if form.details { "Retry" } else { "Details" }
+                } else {
+                    "Keep layout"
+                },
+            }),
+            cancel: forms::Button { field: 1, label: if form.source_details.is_some() { "Close" } else { "Cancel" } },
+        };
+    }
     forms::Buttons {
         primary: forms::Button { field: count, label: verb(p) },
         alternate: matches!(p.action, PromptAction::NewWorkspace)
@@ -113,6 +146,15 @@ pub(super) fn form_layout(p: &Prompt, screen: Rect) -> forms::FormLayout {
     {
         message.push_str(&format!("\nChoose a {} account for {}.", account.agent, account.reference));
     }
+    if matches!(p.action, PromptAction::ReviewWorkspace(_)) {
+        let form = p.workspace_form.as_ref().unwrap();
+        message = form.source_message.clone();
+        if form.details
+            && let Some(details) = &form.source_details
+        {
+            message.push_str(&format!("\n{details}"));
+        }
+    }
     if let Some(error) = &p.error {
         if !message.is_empty() {
             message.push('\n');
@@ -123,7 +165,10 @@ pub(super) fn form_layout(p: &Prompt, screen: Rect) -> forms::FormLayout {
         message = result.clone();
     }
     let mut layout = forms::FormLayout::new(screen, field_count(p), &message, &buttons(p));
-    if matches!(p.action, PromptAction::ExportWorkspace(_)) {
+    if matches!(
+        p.action,
+        PromptAction::ExportWorkspace(_) | PromptAction::ReviewWorkspace(_) | PromptAction::ImportWorkspace
+    ) {
         // File paths in errors and results must retain spaces that prose wrapping would collapse.
         layout.lines = message.lines().flat_map(|l| crate::text::fold(l, layout.body.width as usize)).collect();
         layout.max_scroll = layout.lines.len().saturating_sub(layout.body.height as usize);
@@ -136,7 +181,7 @@ pub(super) fn draw_form(p: &Prompt, screen: Rect, buf: &mut Buffer) -> Option<Cu
     let layout = form_layout(p, screen);
     overlays::frame(layout.area, &p.title, crate::theme::current().accent, buf);
     let mut cursor = None;
-    if form.result.is_none() {
+    if form.result.is_none() && !matches!(p.action, PromptAction::ReviewWorkspace(_)) {
         let importing = matches!(p.action, PromptAction::ImportWorkspace);
         if importing {
             cursor = forms::draw_text_field(
@@ -180,7 +225,7 @@ pub(super) fn draw_form(p: &Prompt, screen: Rect, buf: &mut Buffer) -> Option<Cu
     let action = if form.field == buttons.cancel.field {
         buttons.cancel.label
     } else if buttons.alternate.as_ref().is_some_and(|b| b.field == form.field) {
-        "From file..."
+        buttons.alternate.as_ref().unwrap().label
     } else {
         verb(p)
     };
@@ -291,14 +336,14 @@ impl Server {
                 value: forms::FieldValue::Text { value: &mut form.file, cursor: &mut form.file_cursor },
             });
         }
-        if form.result.is_none() {
+        if form.result.is_none() && !matches!(p.action, PromptAction::ReviewWorkspace(_)) {
             fields.push(forms::Field {
                 id: usize::from(importing),
                 area: layout.fields[usize::from(importing)],
                 value: forms::FieldValue::Text { value: &mut p.value, cursor: &mut p.cursor },
             });
         }
-        if form.preview.as_ref().is_some_and(|p| !p.accounts.is_empty()) {
+        if importing && form.preview.as_ref().is_some_and(|p| !p.accounts.is_empty()) {
             fields.push(forms::Field { id: 2, area: layout.fields[2], value: forms::FieldValue::Choice });
         }
         let outcome = forms::FormState {
@@ -327,6 +372,9 @@ impl Server {
                 form.field = 0;
                 Mode::Prompt(p)
             }
+            forms::FormEvent::Submit if matches!(p.action, PromptAction::ReviewWorkspace(_)) => {
+                self.submit_source_form(id, p)
+            }
             forms::FormEvent::Submit => self.submit_workspace_form(id, p),
             forms::FormEvent::Choice { .. } if importing => {
                 let i = form.account;
@@ -339,6 +387,204 @@ impl Server {
                 self.preview_import_form(p)
             }
             _ => Mode::Prompt(p),
+        }
+    }
+
+    pub(super) fn import_source_form(&self, id: ClientId, path: &std::path::Path, from: &Picker) -> Mode {
+        let mut p = self.add_workspace_form(id, Some(from));
+        p.action = PromptAction::ImportWorkspace;
+        p.value = path.file_stem().unwrap_or_default().to_string_lossy().into_owned();
+        p.cursor = p.value.chars().count();
+        p.workspace_form.as_mut().unwrap().file = path.display().to_string();
+        p.workspace_form.as_mut().unwrap().file_cursor = p.workspace_form.as_ref().unwrap().file.chars().count();
+        self.preview_import_form(p)
+    }
+
+    pub(super) fn undo_source_layout(&mut self, client: ClientId, ws: u32, from: Option<&Picker>) -> Mode {
+        match self.review_source_form(ws, from, true) {
+            Mode::Prompt(p) => self.load_source_form(client, p, None),
+            mode => mode,
+        }
+    }
+
+    pub(super) fn review_source_form(&self, ws: u32, from: Option<&Picker>, undo: bool) -> Mode {
+        let Some(wi) = self.ws_index(ws) else {
+            return self.workspace_picker(0).result("Workspace unavailable");
+        };
+        let workspace = &self.workspaces[wi];
+        let mut p = Prompt::new(
+            &format!("{} · {}", workspace.source_status.unwrap_or("Load from file"), workspace.name),
+            "",
+            PromptAction::ReviewWorkspace(ws),
+        );
+        let form = p.workspace_form.as_mut().unwrap();
+        form.field = 1;
+        form.back = from.map(Picker::state);
+        form.undo = undo;
+        if undo {
+            form.undo_layout = workspace.layout_undo.clone();
+            p.title = format!("Undo load · {}", workspace.name);
+            let (tabs, panes) = workspace.layout_undo.as_ref().map_or((0, 0), |w| w.counts());
+            form.source_message = format!(
+                "Restore the layout from before the last Load from file?\nPrevious layout: {tabs} tabs · {panes} panes\nThe restored workspace will be Closed. Programs will not restart."
+            );
+            if workspace.layout_undo.is_none() {
+                return self.workspace_picker(ws).result("This replacement was already undone.");
+            }
+            return Mode::Prompt(p);
+        }
+        let Some(path) = &workspace.definition else {
+            return self.workspace_picker(ws).result("This workspace has no source file.");
+        };
+        let (tabs, panes) = workspace.counts();
+        match self.preview_source(path) {
+            Ok(preview) => {
+                form.source_message = format!(
+                    "{}\nSaved workspace: {tabs} tab{} · {panes} pane{}\nFile: {}\nThe current layout will be kept for Undo.",
+                    crate::paths::shorten_home(path),
+                    if tabs == 1 { "" } else { "s" },
+                    if panes == 1 { "" } else { "s" },
+                    preview.summary()
+                );
+                form.preview = Some(Box::new(preview));
+            }
+            Err(e) => {
+                p.title = format!("File error · {}", workspace.name);
+                form.source_message = format!(
+                    "Couldn't read {}.\n{}\nYour saved workspace is unchanged.\nFix the file, then Retry in Details.",
+                    path.file_name().unwrap_or_default().to_string_lossy(),
+                    if super::workspace_sources::source_missing(&e) {
+                        "Source file missing.".into()
+                    } else {
+                        e.root_cause().to_string()
+                    }
+                );
+                form.source_details = Some(format!("{}\n{e:#}", path.display()));
+            }
+        }
+        Mode::Prompt(p)
+    }
+
+    fn refresh_source_form(&self, mut p: Prompt, message: Option<String>) -> Mode {
+        let PromptAction::ReviewWorkspace(ws) = p.action else { unreachable!() };
+        let old = p.workspace_form.as_mut().unwrap();
+        let Mode::Prompt(mut next) = self.review_source_form(ws, None, old.undo) else {
+            return self.workspace_picker(ws).result("Workspace unavailable");
+        };
+        next.workspace_form.as_mut().unwrap().back = old.back.take();
+        next.error = message;
+        Mode::Prompt(next)
+    }
+
+    fn submit_source_form(&mut self, id: ClientId, mut p: Prompt) -> Mode {
+        let PromptAction::ReviewWorkspace(ws) = p.action else { unreachable!() };
+        let form = p.workspace_form.as_mut().unwrap();
+        if form.source_details.is_some() {
+            if form.field == 2 {
+                if form.details {
+                    return self.refresh_source_form(p, None);
+                }
+                form.details = true;
+                p.scroll = 0;
+                return Mode::Prompt(p);
+            }
+            return match self.reopen_workspace(ws) {
+                Ok(()) => {
+                    self.show_workspace(id, ws);
+                    Mode::Normal
+                }
+                Err(e) => {
+                    p.error = Some(format!("{e:#}"));
+                    Mode::Prompt(p)
+                }
+            };
+        }
+        if form.field == 2 {
+            return match self.keep_source_layout(ws, form.preview.as_ref().unwrap()) {
+                Ok(()) => self.workspace_form_back(id, p, None),
+                Err(e) => self.refresh_source_form(p, Some(format!("{e:#}"))),
+            };
+        }
+        self.load_source_form(id, p, None)
+    }
+
+    pub(super) fn load_source_form(
+        &mut self,
+        id: ClientId,
+        mut p: Prompt,
+        approved: Option<Vec<super::persistence::ClosePane>>,
+    ) -> Mode {
+        let PromptAction::ReviewWorkspace(ws) = p.action else { unreachable!() };
+        let Some(wi) = self.ws_index(ws) else {
+            return self.workspace_picker(0).result("Workspace unavailable");
+        };
+        if self.workspaces[wi].delete_pending
+            || self.workspaces[wi].close_error.is_some()
+            || self.workspaces[wi].kept.as_ref().is_some_and(|s| s.close_pending.is_some())
+        {
+            return self.workspace_picker(ws).result("Finish Close or Delete, then retry the layout change.");
+        }
+        let form = p.workspace_form.as_ref().unwrap();
+        let undo = form.undo;
+        if undo
+            && serde_json::to_value(&form.undo_layout).ok()
+                != serde_json::to_value(&self.workspaces[wi].layout_undo).ok()
+        {
+            return self.refresh_source_form(p, Some("The retained layout changed. Review Undo again.".into()));
+        }
+        let was_open = !self.workspaces[wi].closed();
+        let viewers: Vec<_> = self.clients.values().filter(|c| c.workspace == ws).map(|c| c.id).collect();
+        if let Some(preview) = &form.preview
+            && (self.workspaces[wi].definition.as_ref() != Some(&preview.path)
+                || crate::paths::FileRevision::read(&preview.path).ok().as_ref() != Some(&preview.revision))
+        {
+            return self
+                .refresh_source_form(p, Some("File changed again. Review the current file before loading.".into()));
+        }
+        if form.preview.as_ref().is_some_and(|p| !p.accounts.is_empty()) {
+            return self.refresh_source_form(p, Some("The file refers to an unavailable account. Fix the account in the source file or add it in Accounts, then Load from file again.".into()));
+        }
+        let inventory = self.source_close_inventory(wi);
+        if let Some(stops) = self.stops(Some(ws))
+            && approved.as_ref() != Some(&inventory)
+        {
+            return Mode::confirm(
+                format!(
+                    "{}\n{stops}\nThe current layout will be kept{}.\nNew commands will wait for you to start them.",
+                    if undo { "Undo load?" } else { "Load layout?" },
+                    if undo { " until the replacement is saved" } else { " for Undo" }
+                ),
+                super::ui::ConfirmAction::LoadWorkspace { prompt: p, inventory },
+            );
+        }
+        match self.replace_source_layout(ws, form.preview.as_deref(), Some(&inventory)) {
+            Ok(()) => {
+                if was_open && !undo {
+                    if let Err(e) = self.reopen_workspace(ws) {
+                        return self.workspace_picker(ws).result(format!(
+                            "Layout loaded. Couldn't open it: {e:#}. Retry Open or choose Undo load in Actions."
+                        ));
+                    }
+                    for viewer in viewers {
+                        self.show_workspace(viewer, ws);
+                    }
+                }
+                self.toast(id, if undo { "Layout restored · Open from Workspaces" } else { "Layout loaded · Undo" });
+                if !undo && let Some(c) = self.clients.get_mut(&id) {
+                    c.toast_action = Some((0, super::attention::ToastAction::UndoLayout(ws)));
+                }
+                let mode = self.source_result(id, ws, undo);
+                match p.workspace_form.as_mut().unwrap().back.take() {
+                    Some(back) => self.return_to_workspaces(id, mode, back),
+                    None => mode,
+                }
+            }
+            Err(e) => {
+                if self.workspaces[wi].close_error.is_some() {
+                    return self.workspace_picker(ws).result(format!("{e:#}"));
+                }
+                self.refresh_source_form(p, Some(format!("{e:#}")))
+            }
         }
     }
 
@@ -390,7 +636,7 @@ impl Server {
         Mode::Prompt(p)
     }
 
-    fn workspace_form_back(&self, id: ClientId, mut p: Prompt, renamed: Option<u32>) -> Mode {
+    pub(super) fn workspace_form_back(&self, id: ClientId, mut p: Prompt, renamed: Option<u32>) -> Mode {
         let Some(state) = p.workspace_form.as_mut().and_then(|f| f.back.take()) else { return Mode::Normal };
         let mut picker = if state.kind == PickerKind::DeletedWorkspaces {
             self.deleted_workspace_picker()
@@ -653,6 +899,235 @@ mod tests {
         server.clients.get_mut(&client).unwrap().mode = Mode::Confirm(q);
         server.client_input(client, bytes);
         std::mem::replace(&mut server.clients.get_mut(&client).unwrap().mode, Mode::Normal)
+    }
+
+    #[test]
+    fn permission_errors_stay_file_errors_in_the_list_and_initial_review() {
+        use std::os::unix::fs::PermissionsExt;
+        let (mut server, path, ws) = super::super::workspace_sources::tests::setup("permission");
+        let parent = path.parent().unwrap();
+        let permissions = std::fs::metadata(parent).unwrap().permissions();
+        std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let error = server.preview_source(&path).unwrap_err();
+        server.refresh_source_status();
+        let status = server.workspaces[0].source_status;
+        let mode = server.review_source_form(ws, None, false);
+        std::fs::set_permissions(parent, permissions).unwrap();
+        assert_eq!(error.downcast_ref::<std::io::Error>().unwrap().kind(), std::io::ErrorKind::PermissionDenied);
+        assert_eq!(status, Some("File error"));
+        let Mode::Prompt(prompt) = mode else { panic!() };
+        let form = prompt.workspace_form.unwrap();
+        assert!(form.source_message.contains(&error.root_cause().to_string()));
+        assert!(!form.source_message.contains("Source file missing"));
+        assert!(!form.details);
+        std::fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[test]
+    fn source_review_buttons_diagnosis_retry_and_cancel_work_at_both_sizes() {
+        for size in [(80, 24), (124, 36)] {
+            let (mut server, path, ws) = super::super::workspace_sources::tests::setup(&format!("review-{}", size.0));
+            let (client, _peer) = super::super::tests::client(&mut server);
+            let c = server.clients.get_mut(&client).unwrap();
+            (c.cols, c.rows) = size;
+            c.workspace = ws;
+            std::fs::write(&path, "layout { pane command=\"new\"; pane; }").unwrap();
+            server.scan_definitions();
+            if size.0 == 124 {
+                let c = server.clients.get_mut(&client).unwrap();
+                c.sidebar = Some(true);
+                c.toast = None;
+                let mut buf = Buffer::empty(server.client_screen(client));
+                server.compose(client, 0, &mut buf);
+                assert!(text(&buf).contains("File changed"));
+            }
+            let mut list = server.workspace_picker(ws);
+            list.query = "personal".into();
+            list.refilter();
+            let Mode::Prompt(p) = server.review_source_form(ws, Some(&list), false) else { panic!() };
+            let mut buf = Buffer::empty(server.client_screen(client));
+            draw_form(&p, buf.area, &mut buf);
+            for expected in [
+                "File changed",
+                "Saved workspace: 1 tab · 1 pane",
+                "File: 1 tab · 2 panes",
+                "Keep layout",
+                "Load from file",
+            ] {
+                assert!(text(&buf).contains(expected), "{}", text(&buf));
+            }
+            let Mode::Picker(back) = server.on_workspace_form(client, p, key("enter")) else {
+                panic!("Cancel is selected first")
+            };
+            assert_eq!(back.query, "personal");
+            assert_eq!(server.workspaces[0].source_status, Some("File changed"));
+            let Mode::Prompt(p) = server.review_source_form(ws, Some(&list), false) else { panic!() };
+            let area = form_layout(&p, server.client_screen(client)).alternate.unwrap();
+            let click = |area: Rect| {
+                InputEvent::Mouse(MouseEvent {
+                    kind: MouseKind::Press(MouseButton::Left),
+                    col: area.x,
+                    row: area.y,
+                    mods: Default::default(),
+                })
+            };
+            assert!(matches!(server.on_workspace_form(client, p, click(area)), Mode::Picker(_)));
+            assert_eq!(server.workspaces[0].source_status, None);
+            std::fs::write(&path, "layout {\n pane {\n").unwrap();
+            server.scan_definitions();
+            let Mode::Prompt(p) = server.review_source_form(ws, Some(&list), false) else { panic!() };
+            let layout = form_layout(&p, server.client_screen(client));
+            let Mode::Prompt(p) = server.on_workspace_form(client, p, click(layout.alternate.unwrap())) else {
+                panic!()
+            };
+            assert!(p.workspace_form.as_ref().unwrap().details);
+            let lines = form_layout(&p, server.client_screen(client)).lines.join("\n");
+            assert!(lines.contains("line"), "{lines}");
+            assert!(lines.contains("Your saved workspace is unchanged"));
+            assert!(lines.contains("source.kdl"));
+            assert_eq!(buttons(&p).alternate.unwrap().label, "Retry");
+            std::fs::write(&path, "layout { pane command=\"fixed\"; }").unwrap();
+            let Mode::Prompt(p) = server.on_workspace_form(client, p, key("enter")) else { panic!() };
+            assert!(p.workspace_form.as_ref().unwrap().source_details.is_none());
+            assert!(p.workspace_form.as_ref().unwrap().preview.is_some());
+            assert_eq!(server.panes.len(), 1);
+            std::fs::remove_file(&path).unwrap();
+            let Mode::Prompt(p) = server.review_source_form(ws, Some(&list), false) else { panic!() };
+            let layout = form_layout(&p, server.client_screen(client));
+            assert!(matches!(server.on_workspace_form(client, p, click(layout.primary)), Mode::Normal));
+            assert_eq!(server.panes.len(), 1);
+            assert!(!path.exists());
+            let workspaces = server.workspaces.len();
+            let invalid = path.with_file_name("new-source.kdl");
+            std::fs::write(&invalid, "layout {").unwrap();
+            let list = server.workspace_picker(ws);
+            let item = list
+                .items
+                .iter()
+                .find(|i| matches!(&i.action, PickAction::UnavailableDefinition(p) if p == &invalid))
+                .unwrap()
+                .clone();
+            let Mode::Prompt(mut p) = server.pick(client, &list, item) else { panic!() };
+            assert!(matches!(p.action, PromptAction::ImportWorkspace));
+            assert!(p.error.as_ref().unwrap().contains("No workspace was added"));
+            p.value = "chosen name".into();
+            std::fs::write(&invalid, "layout { pane command=\"true\"; }").unwrap();
+            let Mode::Prompt(p) = server.on_workspace_form(client, p, key("enter")) else { panic!() };
+            assert_eq!(p.value, "chosen name");
+            assert!(p.workspace_form.as_ref().unwrap().preview.is_some());
+            assert_eq!(server.workspaces.len(), workspaces);
+            std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+        }
+    }
+
+    #[test]
+    fn load_confirmation_rechecks_the_file_and_programs_and_cancel_stops_nothing() {
+        let _batch = crate::pane::batch();
+        let (mut server, path, ws) = super::super::workspace_sources::tests::setup("confirm");
+        let (client, _peer) = super::super::tests::client(&mut server);
+        server.clients.get_mut(&client).unwrap().workspace = ws;
+        server
+            .spawn_pane_in(
+                ws,
+                None,
+                PaneSpec { command: vec!["sleep".into(), "60".into()], ..Default::default() },
+                Placement::Tab,
+                None,
+            )
+            .unwrap();
+        std::fs::write(&path, "layout { pane command=\"new\"; }").unwrap();
+        let Mode::Prompt(p) = server.review_source_form(ws, None, false) else { panic!() };
+        let Mode::Confirm(q) = server.load_source_form(client, p, None) else { panic!() };
+        assert!(q.message.contains("sleep"));
+        assert!(q.message.contains("kept for Undo"));
+        assert!(!q.yes);
+        let Mode::Prompt(p) = confirm(&mut server, client, q, b"n") else { panic!() };
+        assert_eq!(server.panes.len(), 2);
+        let Mode::Confirm(q) = server.load_source_form(client, p, None) else { panic!() };
+        std::fs::write(&path, "layout { pane command=\"newer\"; pane; }").unwrap();
+        let Mode::Prompt(p) = confirm(&mut server, client, q, b"y") else { panic!() };
+        assert!(p.error.as_ref().unwrap().contains("File changed again"));
+        assert_eq!(p.workspace_form.as_ref().unwrap().preview.as_ref().unwrap().definition.panes().len(), 2);
+        assert_eq!(server.panes.len(), 2);
+        let Mode::Confirm(q) = server.load_source_form(client, p, None) else { panic!() };
+        server
+            .spawn_pane_in(
+                ws,
+                None,
+                PaneSpec { command: vec!["sleep".into(), "90".into()], ..Default::default() },
+                Placement::Tab,
+                None,
+            )
+            .unwrap();
+        let Mode::Confirm(q) = confirm(&mut server, client, q, b"y") else { panic!() };
+        assert!(q.message.contains("sleep 90"));
+        assert!(!q.yes);
+        assert_eq!(server.panes.len(), 3);
+        assert!(!server.workspaces[0].closed());
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn loading_an_open_workspace_keeps_its_viewers_and_waits_to_run_commands() {
+        let (mut server, path, ws) = super::super::workspace_sources::tests::setup("open-load");
+        let (client, _peer) = super::super::tests::client(&mut server);
+        let (other, _other_peer) = super::super::tests::client(&mut server);
+        for id in [client, other] {
+            server.clients.get_mut(&id).unwrap().workspace = ws;
+        }
+        server.new_workspace("another workspace".into(), None);
+        std::fs::write(&path, "layout { pane command=\"never-run\"; }").unwrap();
+        let Mode::Prompt(p) = server.review_source_form(ws, None, false) else { panic!() };
+        assert!(matches!(server.load_source_form(client, p, None), Mode::Picker(_)));
+        assert!(!server.workspaces[0].closed());
+        assert!(server.panes.values().all(|p| p.suspended));
+        for id in [client, other] {
+            assert_eq!(server.clients[&id].workspace, ws);
+        }
+        assert!(matches!(
+            server.toast_action(client, 0, super::super::attention::ToastAction::UndoLayout(ws)),
+            Mode::Picker(_)
+        ));
+        assert!(server.workspaces[0].closed());
+        assert_eq!(server.workspaces[0].counts(), (1, 1));
+        assert!(server.workspaces[0].layout_undo.is_none());
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn a_failed_close_returns_to_the_workspace_with_retry_close() {
+        let (mut server, path, ws) = super::super::workspace_sources::tests::setup("close-result");
+        std::fs::write(&path, "layout { pane command=\"new\"; }").unwrap();
+        super::super::persistence::tests::writer(&mut server, vec![Ok(()), Err("disk full".into())]);
+        let Mode::Prompt(p) = server.review_source_form(ws, None, false) else { panic!() };
+        let Mode::Picker(p) = server.load_source_form(0, p, None) else { panic!() };
+        assert!(matches!(p.current().unwrap().action, PickAction::RetryWorkspaceClose(id) if id == ws));
+        assert_eq!(p.action_keys(), [("enter", "Retry Close")]);
+        assert!(server.workspaces[0].closed());
+        assert_eq!(server.workspaces[0].counts(), (1, 1));
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn a_closed_load_has_durable_undo_and_a_stale_undo_reviews_the_latest_layout() {
+        let (mut server, path, ws) = super::super::workspace_sources::tests::setup("ui-undo");
+        server.keep_and_close_workspace(ws).unwrap();
+        std::fs::write(&path, "layout { pane command=\"first\"; }").unwrap();
+        let Mode::Prompt(p) = server.review_source_form(ws, None, false) else { panic!() };
+        let Mode::Picker(p) = server.load_source_form(0, p, None) else { panic!() };
+        assert!(p.action_keys().contains(&("", "Undo load")));
+        let Mode::Prompt(undo) = server.review_source_form(ws, Some(&p), true) else { panic!() };
+        std::fs::write(&path, "layout { pane command=\"second\"; pane command=\"third\"; }").unwrap();
+        let preview = server.preview_source(&path).unwrap();
+        server.replace_source_layout(ws, Some(&preview), None).unwrap();
+        let Mode::Prompt(undo) = server.load_source_form(0, undo, None) else { panic!() };
+        assert!(undo.error.as_ref().unwrap().contains("retained layout changed"));
+        assert!(matches!(server.load_source_form(0, undo, None), Mode::Picker(_)));
+        assert!(server.workspaces[0].closed());
+        assert_eq!(server.workspaces[0].counts(), (1, 1));
+        server.reopen_workspace(ws).unwrap();
+        assert!(server.panes.values().all(|p| p.suspended));
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 
     #[test]

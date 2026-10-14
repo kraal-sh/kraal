@@ -28,12 +28,14 @@ impl Server {
         // Their changes are told, and those of accounts.toml and of the accounts' usage,
         // wherever they can be.
         let mut dirs = self.config.workspace_dirs();
+        dirs.extend(self.workspaces.iter().filter_map(|w| w.definition.as_ref()?.parent().map(Path::to_path_buf)));
         dirs.push(paths::config_dir());
         dirs.push(paths::state_dir().join("usage"));
         dirs.push(paths::state_dir().join("usage/by-id"));
         self.dirwatch.watch_config(&dirs);
         let listed = self.definitions();
         self.follow_definitions(&listed);
+        self.refresh_source_status();
         let files: Vec<(PathBuf, String)> =
             listed.iter().filter_map(|(p, d)| Some((p.clone(), d.as_ref().ok()?.name.clone()))).collect();
         if files != self.def_files {
@@ -46,8 +48,7 @@ impl Server {
     }
 
     /// Keep each saved workspace linked to its definition file: a file renamed on disk is found
-    /// again by its inode. A file that is gone keeps its path, where saving the layout writes it
-    /// again (an editor may be replacing it), but not its inode, which a new file may take.
+    /// again by its inode. A missing file keeps its path, but not its inode, which a new file may take.
     fn follow_definitions(&mut self, listed: &[(PathBuf, Result<WorkspaceDef>)]) {
         for wi in 0..self.workspaces.len() {
             let ws = &mut self.workspaces[wi];
@@ -292,6 +293,8 @@ impl Server {
             self.workspace_order = self.updated_workspace_order();
             self.workspaces[wi].set_definition(Some(&save.path));
             self.workspaces[wi].definition_source = Some(source);
+            self.workspaces[wi].source_reviewed = None;
+            self.refresh_source_status();
             self.bind_workspace_order(self.workspaces[wi].id);
             self.mark_persist();
         }
@@ -625,8 +628,9 @@ impl Server {
         if snap.unopened {
             return workspace::parse_workspace(
                 name,
-                snap.definition_source
+                snap.pending_layout
                     .as_deref()
+                    .or(snap.definition_source.as_deref())
                     .context("No retained source. Open the workspace before exporting.")?,
             );
         }

@@ -205,7 +205,10 @@ impl ImportPreview {
     pub fn read(path: &Path) -> Result<Self> {
         let path = definition_path(path);
         let revision = crate::paths::FileRevision::read(&path)?;
-        let source = std::str::from_utf8(revision.bytes.as_deref().context("File missing. Choose a KDL file.")?)?;
+        let source =
+            std::str::from_utf8(revision.bytes.as_deref().ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::NotFound, "File missing. Choose a KDL file.")
+            })?)?;
         let name = path.file_stem().unwrap_or_default().to_string_lossy();
         let definition = parse_workspace(&name, source).with_context(|| format!("parsing {}", path.display()))?;
         Ok(Self { path, revision, definition, accounts: Vec::new() })

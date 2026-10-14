@@ -1264,7 +1264,10 @@ impl Server {
             let color = states.iter().map(|(_, s)| *s).max_by_key(urgency).map_or(t.dim, |s| t.state_color(s));
             let icon = t.icon(if ws.closed() { AgentState::Idle } else { AgentState::Working });
             let (tabs, panes) = ws.counts();
-            let detail = format!("{}{sep}{}{sep}{}", ws.status(), plural(tabs, "tab"), plural(panes, "pane"));
+            let detail = match ws.source_status {
+                Some(status) => status.to_string(),
+                None => format!("{}{sep}{}{sep}{}", ws.status(), plural(tabs, "tab"), plural(panes, "pane")),
+            };
             entry(
                 &mut rows,
                 SideItem::Workspace(ws.id),

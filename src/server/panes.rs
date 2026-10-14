@@ -130,6 +130,9 @@ impl Server {
             definition: None,
             definition_inode: None,
             definition_source: None,
+            source_reviewed: None,
+            layout_undo: None,
+            source_status: None,
             cwd: None,
             sync: SyncScope::Off,
             marked: Default::default(),
@@ -545,9 +548,18 @@ impl Server {
     }
 
     pub(super) fn keep_and_close_workspace(&mut self, ws: u32) -> Result<(), String> {
+        self.keep_and_close_workspace_checked(ws, |_| Ok(()))
+    }
+
+    pub(super) fn keep_and_close_workspace_checked(
+        &mut self,
+        ws: u32,
+        check: impl FnOnce(&Self) -> Result<(), String>,
+    ) -> Result<(), String> {
         let wi = self.ws_index(ws).ok_or("This workspace is no longer available.")?;
         if self.workspaces[wi].closed() {
             self.save_now().map_err(|e| format!("Programs stopped. Couldn't save the final state.\n{e}"))?;
+            check(self)?;
             self.finish_workspace_close(ws);
             return Ok(());
         }
@@ -583,6 +595,14 @@ impl Server {
                 "Couldn't save the workspace.\n{}\n{e}",
                 if retry { "The workspace is still open. Retry to finish closing." } else { "Nothing was stopped." }
             ));
+        }
+        if let Err(e) = check(self) {
+            if !retry {
+                self.workspaces[wi].kept = None;
+                // The durable close intent must not survive a cancelled review.
+                self.persist();
+            }
+            return Err(e);
         }
         for &id in &panes {
             self.switches.remove(&id);
@@ -660,8 +680,9 @@ impl Server {
             let result = if saved.unopened {
                 server.starting_workspace = Some(saved.name.clone());
                 let result = saved
-                    .definition_source
+                    .pending_layout
                     .as_deref()
+                    .or(saved.definition_source.as_deref())
                     .context("the saved source is missing")
                     .and_then(|s| crate::workspace::parse_workspace(&saved.name, s))
                     .and_then(|d| server.populate_definition(wi, &d));

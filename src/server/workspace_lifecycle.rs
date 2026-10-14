@@ -199,7 +199,7 @@ impl Server {
         let definition = crate::workspace::parse_workspace(&name, &source).map_err(|e| {
             format!("Couldn't keep the layout. Nothing was deleted. Fix the source file and retry.\n{e:#}")
         })?;
-        let source = crate::workspace::bind_source_accounts(&source, &self.accounts)
+        let pending_layout = crate::workspace::bind_source_accounts(&source, &self.accounts)
             .map_err(|e| format!("Couldn't keep the accounts. Nothing was deleted.\n{e:#}"))?;
         let identity = crate::accounts::new_uuid();
         let saved = WorkspaceSnap {
@@ -207,6 +207,8 @@ impl Server {
             name,
             definition: Some(crate::workspace::definition_path(path)),
             definition_source: Some(source),
+            source_reviewed: None,
+            layout_undo: None,
             cwd: definition.cwd,
             active: 0,
             tabs: Vec::new(),
@@ -217,6 +219,7 @@ impl Server {
             unopened: true,
             sync: super::SyncScope::Off,
             restore_error: None,
+            pending_layout: Some(pending_layout),
         };
         let position = self
             .workspace_picker(0)
@@ -955,7 +958,7 @@ while IFS= read -r line; do :; done
             writer(&mut server, vec![]);
             let identity = server.delete_workspace_source(&path).unwrap();
             assert!(server.panes.is_empty());
-            let retained = server.deleted_workspaces[0].workspace.definition_source.as_ref().unwrap();
+            let retained = server.deleted_workspaces[0].workspace.pending_layout.as_ref().unwrap();
             let definition = crate::workspace::parse_workspace("api", retained).unwrap();
             assert_eq!(definition.panes()[0].account_id.as_deref(), Some(account.id.as_str()));
             assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
@@ -980,6 +983,9 @@ while IFS= read -r line; do :; done
             server.accounts = accounts.clone();
             let ws = server.restore_deleted_workspace(&identity, "api").unwrap();
             assert!(server.panes.is_empty(), "Restore starts no programs");
+            server.refresh_source_status();
+            assert_eq!(server.workspaces[server.ws_index(ws).unwrap()].source_status, None);
+            assert_eq!(server.workspaces[server.ws_index(ws).unwrap()].definition_source.as_deref(), Some(original));
             // Scans reload the accounts file. Keep this test's account changes in memory.
             server.accounts = accounts;
             let _batch = crate::pane::batch();
@@ -1015,7 +1021,7 @@ while IFS= read -r line; do :; done
         let ws = server.restore_deleted_workspace(&identity, "api").unwrap();
         server.accounts = accounts.clone();
         let wi = server.ws_index(ws).unwrap();
-        let retained = server.workspaces[wi].kept.as_ref().unwrap().definition_source.clone().unwrap();
+        let retained = server.workspaces[wi].kept.as_ref().unwrap().pending_layout.clone().unwrap();
         let save = server.prepare_layout_export(wi, &path).unwrap();
         assert!(save.question.is_some());
         server.write_definition(wi, "api", &save).unwrap();
@@ -1032,10 +1038,11 @@ while IFS= read -r line; do :; done
         recovered.apply_snapshot(serde_json::from_slice(&bytes).unwrap()).unwrap();
         assert!(recovered.panes.is_empty());
         let wi = recovered.workspaces.iter().position(|w| w.stable_id == identity).unwrap();
-        assert_eq!(
-            recovered.workspaces[wi].kept.as_ref().unwrap().definition_source.as_deref(),
-            Some(retained.as_str())
-        );
+        assert_eq!(recovered.workspaces[wi].kept.as_ref().unwrap().pending_layout.as_deref(), Some(retained.as_str()));
+        recovered.refresh_source_status();
+        assert_eq!(recovered.workspaces[wi].source_status, None);
+        assert_eq!(recovered.workspaces[wi].definition_source.as_deref(), Some(exported.as_str()));
+        assert!(!recovered.prepare_layout_export(wi, &path).unwrap().question.unwrap().contains("File changed"));
         recovered.reopen_workspace(recovered.workspaces[wi].id).unwrap();
         let pane = recovered.panes.values().next().unwrap();
         assert!(pane.suspended);

@@ -17,12 +17,21 @@ use crate::server::{ClientId, Server};
 impl Server {
     pub(super) fn on_picker(&mut self, id: ClientId, mut p: Picker, ev: InputEvent) -> Mode {
         if let InputEvent::Mouse(MouseEvent { kind: MouseKind::Press(MouseButton::Left), col, row: 0, .. }) = &ev
-            && let Some(super::super::render::BarItem::Toast(
-                _,
-                super::super::attention::ToastAction::RestoreWorkspace(identity),
-            )) = self.tab_bar_hit(id, *col)
+            && let Some(super::super::render::BarItem::Toast(_, action)) = self.tab_bar_hit(id, *col)
         {
-            return self.restore_workspace_mode(id, &identity, Some(&p));
+            use super::super::attention::ToastAction;
+            match action {
+                ToastAction::RestoreWorkspace(identity) => return self.restore_workspace_mode(id, &identity, Some(&p)),
+                ToastAction::ReviewWorkspace(ws) => {
+                    p.actions = None;
+                    return self.review_source_form(ws, Some(&p), false);
+                }
+                ToastAction::UndoLayout(ws) => {
+                    p.actions = None;
+                    return self.undo_source_layout(id, ws, Some(&p));
+                }
+                _ => {}
+            }
         }
         // The list of what can be done with the selected item (Tab).
         if let Some(at) = p.actions {
@@ -435,10 +444,8 @@ impl Server {
             PickAction::Worktree { pane, op } => return self.worktree_op(id, pane, &op),
             PickAction::AddAccount => return Mode::AccountForm(self.account_form(id)),
             PickAction::AccountDetails(account) => return self.account_details(&account),
-            PickAction::UnavailableDefinition(_) => {
-                let mut next = Picker::new(p.kind, &p.title, p.items.clone());
-                next.restore(p.state());
-                return Mode::Picker(next);
+            PickAction::UnavailableDefinition(path) => {
+                return self.import_source_form(id, &path, p);
             }
         }
         Mode::Normal
@@ -484,6 +491,9 @@ impl Server {
             }
             let (tabs, count) = ws.counts();
             let mut detail = format!("{} · {tabs} tab{} · {count} pane{}", ws.status(), plural(tabs), plural(count));
+            if let Some(status) = ws.source_status {
+                detail.push_str(&format!(" · {status}"));
+            }
             if blocked + working + done > 0 {
                 detail.push_str(&format!(" · ▲{blocked} ●{working} ✓{done}"));
             }
@@ -526,11 +536,11 @@ impl Server {
             }
         }
         for (path, def) in definitions {
+            if !matches!(self.definition_workspace(&path), Ok(None)) {
+                continue;
+            }
             match def {
                 Ok(def) => {
-                    if !matches!(self.definition_workspace(&path), Ok(None)) {
-                        continue;
-                    }
                     let n = def.panes().len();
                     let source = if collisions.contains(&def.name) {
                         format!(" · {}", paths::shorten_home(&path))
@@ -582,12 +592,22 @@ impl Server {
             })
             .unwrap_or(0);
         let mut picker = Picker::new(PickerKind::Workspace, "Workspaces", items);
+        picker.source_workspaces = self.workspaces.iter().filter(|w| w.definition.is_some()).map(|w| w.id).collect();
+        picker.review_workspaces = self.workspaces.iter().filter(|w| w.source_status.is_some()).map(|w| w.id).collect();
+        picker.layout_undos = self.workspaces.iter().filter(|w| w.layout_undo.is_some()).map(|w| w.id).collect();
         picker.selected = selected;
         picker
     }
 
     fn picker_menu_action(&mut self, id: ClientId, mut p: Picker, action: &str) -> Mode {
         match action {
+            "Review" | "Load from file" | "Undo load" => {
+                return match p.current().and_then(|i| i.action.workspace()) {
+                    Some(ws) if action == "Undo load" => self.undo_source_layout(id, ws, Some(&p)),
+                    Some(ws) => self.review_source_form(ws, Some(&p), false),
+                    None => Mode::Picker(p),
+                };
+            }
             "Duplicate" => {
                 return match p.current().and_then(|i| i.action.workspace()) {
                     Some(ws) => self.duplicate_workspace_form(ws, &p),
@@ -757,6 +777,48 @@ mod workspace_tests {
 mod tests {
     use super::*;
     use crate::input::Mods;
+
+    #[test]
+    fn source_toast_actions_return_to_a_fresh_workspace_list() {
+        use crate::server::{attention::ToastAction, render::BarItem};
+
+        for cols in [80, 124] {
+            let (mut server, path, ws) = crate::server::workspace_sources::tests::setup("toast-actions");
+            let (client, _peer) = crate::server::tests::client(&mut server);
+            let c = server.clients.get_mut(&client).unwrap();
+            c.workspace = ws;
+            c.cols = cols;
+            std::fs::write(&path, "layout { pane command=\"never-run\"; pane; }").unwrap();
+            server.refresh_source_status();
+            let mut picker = server.workspace_picker(ws);
+            for action in [ToastAction::ReviewWorkspace(ws), ToastAction::UndoLayout(ws)] {
+                // A notification can be clicked while the selected row's Actions are open.
+                picker.actions = Some(0);
+                let col = (0..cols)
+                    .find(|&col| server.tab_bar_hit(client, col) == Some(BarItem::Toast(0, action.clone())))
+                    .unwrap();
+                let click = InputEvent::Mouse(MouseEvent {
+                    kind: MouseKind::Press(MouseButton::Left),
+                    col,
+                    row: 0,
+                    mods: Mods::NONE,
+                });
+                let mode = server.on_picker(client, picker, click);
+                let mode = match mode {
+                    Mode::Prompt(p) => server.load_source_form(client, p, None),
+                    mode => mode,
+                };
+                let Mode::Picker(p) = mode else { panic!() };
+                assert!(p.actions.is_none(), "the old action menu must not return after changing the layout");
+                let loaded = matches!(action, ToastAction::ReviewWorkspace(_));
+                assert_eq!(p.action_keys().contains(&("", "Undo load")), loaded);
+                assert_eq!(server.workspaces[0].counts(), (1, if loaded { 2 } else { 1 }));
+                assert_eq!(server.workspaces[0].closed(), !loaded);
+                picker = p;
+            }
+            std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+        }
+    }
 
     #[test]
     fn closed_rows_open_once_and_their_actions_rename_without_switching() {

@@ -22,11 +22,15 @@ pub enum ToastAction {
     ChangeAccount,
     UndoAccount,
     RestoreWorkspace(String),
+    ReviewWorkspace(u32),
+    UndoLayout(u32),
 }
 
 impl ToastAction {
     pub(super) fn label(&self) -> &'static str {
         match self {
+            Self::ReviewWorkspace(_) => "Review",
+            Self::UndoLayout(_) => "Undo",
             Self::ChangeAccount => "Change account",
             Self::UndoAccount | Self::RestoreWorkspace(_) => "Undo",
         }
@@ -264,6 +268,12 @@ impl Server {
     }
 
     pub(super) fn toast_action(&mut self, client: ClientId, pane: PaneId, action: ToastAction) -> super::ui::Mode {
+        if let ToastAction::UndoLayout(ws) = &action {
+            return self.undo_source_layout(client, *ws, None);
+        }
+        if let ToastAction::ReviewWorkspace(ws) = &action {
+            return self.review_source_form(*ws, None, false);
+        }
         if let ToastAction::RestoreWorkspace(identity) = &action {
             return self.restore_workspace_mode(client, identity, None);
         }
@@ -278,7 +288,9 @@ impl Server {
                 }
                 super::ui::Mode::Normal
             }
-            ToastAction::RestoreWorkspace(_) => unreachable!("answered above"),
+            ToastAction::ReviewWorkspace(_) | ToastAction::UndoLayout(_) | ToastAction::RestoreWorkspace(_) => {
+                unreachable!("answered above")
+            }
         }
     }
 

@@ -102,6 +102,10 @@ impl Mode {
 }
 
 pub enum ConfirmAction {
+    LoadWorkspace {
+        prompt: Prompt,
+        inventory: Vec<super::persistence::ClosePane>,
+    },
     RemoveAccount(crate::accounts::Account),
     ReplaceWorkspaceFile {
         prompt: Prompt,
@@ -197,6 +201,9 @@ impl ConfirmAction {
     /// The confirming button: what will happen.
     pub fn verb(&self) -> String {
         match self {
+            ConfirmAction::LoadWorkspace { prompt, .. } => {
+                if prompt.workspace_form.as_ref().unwrap().undo { "Stop and undo" } else { "Stop and load" }.into()
+            }
             ConfirmAction::ReplaceWorkspaceFile { .. } => "Replace file".into(),
             ConfirmAction::UseExisting { .. } => "Use account".into(),
             ConfirmAction::RemoveAccount(_) => "Remove".into(),
@@ -440,6 +447,9 @@ pub struct Picker {
     pub worktree: bool,
     pub message: Option<String>,
     pub undo: Option<String>,
+    pub source_workspaces: Vec<u32>,
+    pub review_workspaces: Vec<u32>,
+    pub layout_undos: Vec<u32>,
     pub back: Option<Box<PickerState>>,
 }
 
@@ -453,6 +463,9 @@ pub struct PickerState {
     definition: Option<std::path::PathBuf>,
     /// Keep an open menu's actions, target and neighbors as they were when shown.
     actions: Option<(usize, Vec<PickItem>)>,
+    source_workspaces: Vec<u32>,
+    review_workspaces: Vec<u32>,
+    layout_undos: Vec<u32>,
     message: Option<String>,
     min_items: usize,
     undo: Option<String>,
@@ -480,6 +493,9 @@ impl Picker {
             worktree: false,
             message: None,
             undo: None,
+            source_workspaces: Vec::new(),
+            review_workspaces: Vec::new(),
+            layout_undos: Vec::new(),
             back: None,
         };
         p.refilter();
@@ -495,6 +511,9 @@ impl Picker {
             workspace: self.current().and_then(|i| i.action.workspace()),
             definition: self.current().and_then(|i| i.action.definition().map(std::path::Path::to_path_buf)),
             actions: self.actions.map(|at| (at, self.items.clone())),
+            source_workspaces: self.source_workspaces.clone(),
+            review_workspaces: self.review_workspaces.clone(),
+            layout_undos: self.layout_undos.clone(),
             message: self.message.clone(),
             min_items: self.min_items,
             undo: self.undo.clone(),
@@ -514,6 +533,9 @@ impl Picker {
         self.query = state.query;
         self.cursor = state.cursor;
         if let Some((at, items)) = state.actions {
+            self.source_workspaces = state.source_workspaces;
+            self.review_workspaces = state.review_workspaces;
+            self.layout_undos = state.layout_undos;
             self.items = items;
             self.pinned = self.items.iter().position(|i| {
                 matches!(i.action, PickAction::AddAccount | PickAction::AddWorkspace | PickAction::AddServer(None))
@@ -610,10 +632,23 @@ impl Picker {
                 ("ctrl+o", "Show in a preview pane"),
                 ("ctrl+x", "Delete"),
             ],
-            (_, A::UnavailableDefinition(_)) => &[],
+            (_, A::UnavailableDefinition(_)) => &[("enter", "Review")],
             _ => &[("enter", "Choose")],
         };
         let mut keys = keys.to_vec();
+        if let Some(ws) = item.action.workspace()
+            && matches!(item.action, A::SwitchWorkspace(_) | A::ReopenWorkspace(_))
+        {
+            if self.source_workspaces.contains(&ws) {
+                keys.push(("", "Load from file"));
+                if self.review_workspaces.contains(&ws) {
+                    keys.push(("", "Review"));
+                }
+            }
+            if self.layout_undos.contains(&ws) {
+                keys.push(("", "Undo load"));
+            }
+        }
         if self.kind == K::Workspace
             && matches!(item.action, A::SwitchWorkspace(_) | A::ReopenWorkspace(_) | A::OpenDefinition(_))
         {
@@ -696,6 +731,7 @@ pub enum PromptAction {
     OpenPreview,
     ExportWorkspace(u32),
     ImportWorkspace,
+    ReviewWorkspace(u32),
     /// Files dropped on an SSH pane: the value is the destination. Cancelling pastes `raw`.
     Upload {
         paths: Vec<std::path::PathBuf>,
@@ -748,6 +784,7 @@ impl PromptAction {
             PromptAction::OpenPreview => "open",
             PromptAction::ExportWorkspace(_) => "export",
             PromptAction::ImportWorkspace | PromptAction::AddServer => "add",
+            PromptAction::ReviewWorkspace(_) => "review",
             PromptAction::Upload { .. } | PromptAction::UploadPick { .. } => "upload",
             PromptAction::Download => "download",
             PromptAction::Commit { .. } => "commit",
@@ -787,6 +824,7 @@ impl Prompt {
                     | PromptAction::RenameWorkspace(_)
                     | PromptAction::DuplicateWorkspace(_)
                     | PromptAction::RestoreWorkspace(_)
+                    | PromptAction::ReviewWorkspace(_)
                     | PromptAction::ImportWorkspace
                     | PromptAction::ExportWorkspace(_)
             )
@@ -1149,6 +1187,35 @@ mod tests {
     }
 
     #[test]
+    fn source_actions_stay_stable_while_their_menu_is_open() {
+        let list = || {
+            Picker::new(
+                PickerKind::Workspace,
+                "Workspaces",
+                vec![PickItem::new("personal", "Open", PickAction::SwitchWorkspace(1))],
+            )
+        };
+        let mut shown = list();
+        assert!(!shown.action_keys().iter().any(|(_, label)| *label == "Load from file"));
+        shown.source_workspaces.push(1);
+        shown.review_workspaces.push(1);
+        shown.layout_undos.push(1);
+        let expected = shown.action_keys();
+        for action in ["Load from file", "Review", "Undo load"] {
+            assert!(expected.contains(&("", action)));
+        }
+        shown.actions = Some(expected.len() - 1);
+        let mut refreshed = list();
+        refreshed.restore(shown.state());
+        assert_eq!(refreshed.action_keys(), expected);
+        assert_eq!(refreshed.actions, shown.actions);
+        refreshed.actions = None;
+        let mut fresh = list();
+        fresh.restore(refreshed.state());
+        assert!(!fresh.action_keys().iter().any(|(_, label)| *label == "Undo load"));
+    }
+
+    #[test]
     fn picker_actions_require_the_line_their_handlers_use() {
         let cases = [
             (
@@ -1177,7 +1244,7 @@ mod tests {
                 &[("enter", "Open directory")],
             ),
             (PickerKind::Pane, PickAction::Worktree { pane: 1, op: "review".into() }, &[("enter", "Choose")]),
-            (PickerKind::Workspace, PickAction::UnavailableDefinition("invalid.kdl".into()), &[]),
+            (PickerKind::Workspace, PickAction::UnavailableDefinition("invalid.kdl".into()), &[("enter", "Review")]),
         ];
         for (kind, action, expected) in cases {
             let p = Picker::new(kind, "List", vec![PickItem::new("item", "", action)]);
