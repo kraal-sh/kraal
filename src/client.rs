@@ -295,13 +295,17 @@ pub fn request(socket: &Path, req: Request) -> Result<Response> {
     let needs = req.needs();
     // A server without this feature would not refuse the request: it would quietly do less.
     if let Some(feature) = needs.filter(|f| f.check_first) {
-        let server = ping(socket).with_context(no_server)?;
-        if !server.has(feature) {
-            bail!(server.cannot(feature.does));
-        }
+        require_feature(socket, feature)?;
     }
     let stream = UnixStream::connect(socket).with_context(no_server)?;
     request_connected(socket, stream, req)
+}
+
+/// Check before local preparation for an action that needs a running server's feature.
+pub(crate) fn require_feature(socket: &Path, feature: protocol::Feature) -> Result<()> {
+    let server = ping(socket).with_context(|| format!("no kraal server at {} (is it running?)", socket.display()))?;
+    anyhow::ensure!(server.has(feature), "{}", server.cannot(feature.does));
+    Ok(())
 }
 
 /// Send after any required feature check, on an established connection: a caller choosing

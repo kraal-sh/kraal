@@ -101,6 +101,8 @@ pub(super) fn check_program(spec: &super::PaneSpec, shell: &str) -> Result<()> {
     Ok(())
 }
 
+pub(crate) use native::find_program;
+
 mod native {
     use std::ffi::{CString, OsStr, OsString};
     use std::os::unix::ffi::OsStrExt;
@@ -114,7 +116,7 @@ mod native {
     /// Where `exe` is, looked for as portable-pty does (and with the same errors): relative to
     /// `dir` when it starts with `./` or `../`, on `path` (relative entries to `dir`) when it is a
     /// bare name or another relative path, as it is when absolute.
-    pub(super) fn find_program(exe: &OsStr, dir: &Path, path: Option<&OsStr>) -> Result<PathBuf> {
+    pub(crate) fn find_program(exe: &OsStr, dir: &Path, path: Option<&OsStr>) -> Result<PathBuf> {
         let exe_path = Path::new(exe);
         if exe_path.is_relative() {
             if matches!(exe_path.components().next(), Some(Component::CurDir | Component::ParentDir)) {

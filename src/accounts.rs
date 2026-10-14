@@ -26,66 +26,29 @@ pub struct AgentKind {
     pub home_env: &'static str,
     /// The home the agent uses when that variable is unset: the account the user had before
     /// kraal, which needs no variable.
-    default_home: &'static str,
+    pub(crate) default_home: &'static str,
     /// Arguments of the agent's own login command.
     pub login: &'static [&'static str],
     /// Arguments of its command that says whether an account is logged in (exit status).
     pub login_status: &'static [&'static str],
     /// Arguments that resume a conversation; `{session}` is replaced by its id.
-    resume: &'static [&'static str],
+    pub(crate) resume: &'static [&'static str],
     /// Flag that sets the id of a new conversation, so kraal knows it without reading files.
     pub session_flag: Option<&'static str>,
     /// Entries of the default home shared with every other account (symlinked).
     pub shared: &'static [&'static str],
     /// Entries copied once into a new account home.
-    copied: &'static [&'static str],
+    pub(crate) copied: &'static [&'static str],
     /// Variables that would override the account's login; cleared in the pane.
     pub clear_env: &'static [&'static str],
 }
 
-/// The agents whose accounts kraal manages; other agents run with their own single home.
-pub const AGENTS: &[AgentKind] = &[
-    AgentKind {
-        name: "claude",
-        command: "claude",
-        home_env: "CLAUDE_CONFIG_DIR",
-        default_home: "~/.claude",
-        login: &["auth", "login"],
-        login_status: &["auth", "status"],
-        resume: &["--resume", "{session}"],
-        session_flag: Some("--session-id"),
-        shared: &[
-            "CLAUDE.md",
-            "settings.json",
-            "skills",
-            "agents",
-            "commands",
-            "output-styles",
-            "plugins",
-            "projects",
-            "plans",
-        ],
-        copied: &[],
-        clear_env: &["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN"],
-    },
-    AgentKind {
-        name: "codex",
-        command: "codex",
-        home_env: "CODEX_HOME",
-        default_home: "~/.codex",
-        login: &["login"],
-        login_status: &["login", "status"],
-        resume: &["resume", "{session}"],
-        session_flag: None,
-        // Codex keeps databases and locks in its home: nothing is shared.
-        shared: &[],
-        copied: &["config.toml"],
-        clear_env: &["OPENAI_API_KEY", "CODEX_API_KEY"],
-    },
-];
+pub fn agents() -> impl Iterator<Item = &'static AgentKind> + Clone {
+    crate::agent_registry::AGENTS.iter().filter_map(|a| a.accounts.as_ref())
+}
 
 pub fn agent_kind(name: &str) -> Option<&'static AgentKind> {
-    AGENTS.iter().find(|a| a.name == name)
+    crate::agent_registry::find(name)?.accounts.as_ref()
 }
 
 /// What kraal does when an account reaches its usage threshold (`[limits] mode`).
@@ -524,7 +487,7 @@ impl Accounts {
     }
 
     pub fn all(&self) -> Vec<Account> {
-        AGENTS.iter().flat_map(|k| self.for_agent(k.name)).collect()
+        agents().flat_map(|k| self.for_agent(k.name)).collect()
     }
 
     pub fn reviews(&self) -> Vec<Account> {
@@ -550,8 +513,7 @@ impl Accounts {
 
     /// Unlisted homes are checked off the event loop, never inferred from credential files.
     pub fn unlisted(&self) -> Vec<Account> {
-        AGENTS
-            .iter()
+        agents()
             .filter_map(|kind| {
                 let standard = Self::standard(kind.name)?;
                 let found = self
@@ -569,7 +531,7 @@ impl Accounts {
 
     fn known(&self) -> Vec<Account> {
         let mut all = self.accounts.clone();
-        for kind in AGENTS {
+        for kind in agents() {
             let standard = Self::standard(kind.name).unwrap();
             if !all.iter().any(|a| a.agent == kind.name && (a.same_home(&standard) || a.name == "default")) {
                 all.push(standard);
@@ -874,8 +836,10 @@ impl Accounts {
     }
 
     pub fn add(&mut self, mut account: Account) -> Result<Account> {
-        let kind = agent_kind(&account.agent)
-            .with_context(|| format!("unknown agent {:?} (known: {})", account.agent, agent_names()))?;
+        let kind = agent_kind(&account.agent).with_context(|| match crate::agent_registry::find(&account.agent) {
+            Some(agent) => agent.account_message(),
+            None => format!("unknown agent {:?} (known: {})", account.agent, agent_names()),
+        })?;
         account.home = absolute_home(&account.home)?;
         if account.id.is_empty() {
             account.id = new_uuid();
@@ -996,7 +960,7 @@ impl Accounts {
             if ws_ok && path_ok {
                 let references = rule.account_ids.as_ref().unwrap_or(&rule.accounts);
                 let picked: Vec<Account> = references.iter().filter_map(|n| self.get(agent, n)).collect();
-                let dangling = !references.iter().any(|n| AGENTS.iter().any(|kind| self.get(kind.name, n).is_some()));
+                let dangling = !references.iter().any(|n| agents().any(|kind| self.get(kind.name, n).is_some()));
                 if !picked.is_empty()
                     || rule.agent.is_some()
                     || dangling
@@ -1064,6 +1028,9 @@ impl Accounts {
 }
 
 pub fn missing_account(agent: &str, reference: &str) -> String {
+    if let Some(agent) = crate::agent_registry::find(agent).filter(|a| a.accounts.is_none()) {
+        return agent.account_message();
+    }
     if reference.starts_with('@') || reference.contains(":@") {
         "the account was removed; choose an account again".into()
     } else {
@@ -1072,7 +1039,7 @@ pub fn missing_account(agent: &str, reference: &str) -> String {
 }
 
 pub fn agent_names() -> String {
-    AGENTS.iter().map(|a| a.name).collect::<Vec<_>>().join(", ")
+    agents().map(|a| a.name).collect::<Vec<_>>().join(", ")
 }
 
 fn valid_name(name: &str) -> bool {
@@ -2380,7 +2347,7 @@ mod tests {
 
     #[test]
     fn verified_existing_sign_ins_are_ordinary_renameable_accounts() {
-        for kind in AGENTS {
+        for kind in agents() {
             let mut all = Accounts::empty();
             let original = all.get(kind.name, "default").unwrap();
             assert!(all.all().is_empty());

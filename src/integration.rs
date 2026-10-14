@@ -14,22 +14,9 @@ use crate::agent::{AgentState, hook_state};
 use crate::client;
 use crate::protocol::Request;
 
-/// The agents whose hooks kraal installs.
-pub const AGENTS: &[&str] = &[
-    "claude",
-    "codex",
-    "gemini",
-    "qwen",
-    "droid",
-    "codebuddy",
-    "auggie",
-    "cursor",
-    "copilot",
-    "kimi",
-    "opencode",
-    "kilo",
-    "pi",
-];
+fn agents() -> impl Iterator<Item = &'static str> {
+    crate::agent_registry::AGENTS.iter().filter(|a| a.integration).map(|a| a.name)
+}
 
 /// Hooks laid out as Claude Code lays them out, in a JSON file: each event holds a list of
 /// groups, `{ "matcher": …, "hooks": [{ "type": "command", "command": …, "timeout": … }] }`.
@@ -249,11 +236,15 @@ fn agent_file(agent: &str) -> (PathBuf, bool) {
 
 /// The agents `all` covers: Claude Code and Codex, and every other one used on this machine.
 pub fn agents_here() -> Vec<&'static str> {
-    AGENTS.iter().copied().filter(|a| matches!(*a, "claude" | "codex") || agent_dir(a).is_dir()).collect()
+    agents().filter(|a| matches!(*a, "claude" | "codex") || agent_dir(a).is_dir()).collect()
 }
 
 fn unknown(agent: &str) -> anyhow::Error {
-    anyhow::anyhow!("unknown agent or shell {agent:?} (supported: {}, {})", AGENTS.join(", "), SHELLS.join(", "))
+    anyhow::anyhow!(
+        "unknown agent or shell {agent:?} (supported: {}, {})",
+        agents().collect::<Vec<_>>().join(", "),
+        SHELLS.join(", ")
+    )
 }
 
 /// The command the agent's hooks run: a shell parses it, so the path is quoted whatever it holds.
@@ -286,7 +277,7 @@ pub fn install(agent: &str) -> Result<String> {
     if let Some(s) = SHELLS.iter().find(|s| **s == agent) {
         return install_shell(s, &shell_rc_path(s));
     }
-    if !AGENTS.contains(&agent) {
+    if !agents().any(|a| a == agent) {
         return Err(unknown(agent));
     }
     let (path, top_level) = agent_file(agent);
@@ -320,7 +311,7 @@ pub fn uninstall(agent: &str) -> Result<String> {
     if let Some(s) = SHELLS.iter().find(|s| **s == agent) {
         return uninstall_shell(s, &shell_rc_path(s));
     }
-    if !AGENTS.contains(&agent) {
+    if !agents().any(|a| a == agent) {
         return Err(unknown(agent));
     }
     let (path, top_level) = agent_file(agent);
@@ -348,7 +339,7 @@ pub fn status(agent: &str) -> Result<String> {
     if let Some(s) = SHELLS.iter().find(|s| **s == agent) {
         return Ok(shell_status(s, &shell_rc_path(s)));
     }
-    if !AGENTS.contains(&agent) {
+    if !agents().any(|a| a == agent) {
         return Err(unknown(agent));
     }
     let (path, top_level) = agent_file(agent);

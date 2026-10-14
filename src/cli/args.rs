@@ -370,7 +370,7 @@ pub enum Cmd {
     /// Start an agent on the right account: in a new pane inside kraal (with
     /// --right/--down/--tab/--floating, or by default), whose id is printed, else right here.
     Agent {
-        /// claude or codex.
+        /// Registered agent name (see docs/agents.md).
         agent: String,
         #[arg(short, long)]
         account: Option<String>,

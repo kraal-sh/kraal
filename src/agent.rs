@@ -63,53 +63,6 @@ impl AgentState {
     }
 }
 
-/// Executable names of the agents kraal recognises (or the name of the script an interpreter
-/// runs for them), and the name kraal gives each agent.
-const KNOWN_AGENTS: &[(&str, &str)] = &[
-    ("claude", "claude"),
-    ("codex", "codex"),
-    ("opencode", "opencode"),
-    ("opencode2", "opencode"),
-    ("gemini", "gemini"),
-    ("aider", "aider"),
-    ("cursor-agent", "cursor"),
-    ("amp", "amp"),
-    ("pi", "pi"),
-    ("grok", "grok"),
-    ("copilot", "copilot"),
-    ("goose", "goose"),
-    ("crush", "crush"),
-    ("qwen", "qwen"),
-    ("kimi", "kimi"),
-    ("droid", "droid"),
-    ("auggie", "auggie"),
-    ("kiro-cli", "kiro"),
-    ("kilo", "kilo"),
-    ("kilocode", "kilo"),
-    ("cline", "cline"),
-    ("codebuff", "codebuff"),
-    ("freebuff", "codebuff"),
-    ("qoder", "qoder"),
-    ("qodercli", "qoder"),
-    ("codebuddy", "codebuddy"),
-    ("junie", "junie"),
-    ("llxprt", "llxprt"),
-    ("kode", "kode"),
-    ("openhands", "openhands"),
-    ("vibe-rs", "vibe"),
-    // Mistral Vibe's Python launcher renames its process.
-    ("Vibe CLI", "vibe"),
-];
-
-/// Names other programs use too: they count only as the script of the runtime an agent's
-/// package runs on (Letta's server is a Python `letta`, Letta Code a Node one).
-const SCRIPT_ONLY: &[(&str, &str, &str)] =
-    &[("cn", "node", "continue"), ("letta", "node", "letta"), ("vibe", "python", "vibe")];
-
-/// Agents that run as a subcommand of a broader program: the program, the words that must
-/// follow it, and the agent.
-const SUBCOMMANDS: &[(&str, &[&str], &str)] = &[("acli", &["rovodev", "run"], "rovodev"), ("q", &["chat"], "kiro")];
-
 const INTERPRETERS: &[&str] = &["node", "bun", "deno", "python", "python3", "uv", "npx", "sh", "bash", "zsh", "dash"];
 
 /// Agent name for a process command line, looking through script interpreters.
@@ -117,11 +70,13 @@ pub fn detect_agent(argv: &[String]) -> Option<&'static str> {
     let base = |s: &str| s.rsplit('/').next().unwrap_or(s).to_string();
     let first = base(argv.first()?);
     if runs_cursor(argv) {
-        return Some("cursor");
+        return crate::agent_registry::find("cursor").map(|a| a.name);
     }
-    if let Some((_, words, name)) = SUBCOMMANDS.iter().find(|(program, ..)| *program == first) {
-        let rest: Vec<&str> = argv.iter().skip(1).filter(|a| !a.starts_with('-')).map(String::as_str).collect();
-        return rest.starts_with(words).then_some(*name);
+    for agent in crate::agent_registry::AGENTS {
+        if let Some(command) = agent.subcommands.iter().find(|command| command[0] == first) {
+            let rest: Vec<&str> = argv.iter().skip(1).filter(|a| !a.starts_with('-')).map(String::as_str).collect();
+            return rest.starts_with(&command[1..]).then_some(agent.name);
+        }
     }
     let interpreted = INTERPRETERS.iter().any(|i| first.starts_with(i));
     let candidates: Vec<String> = if interpreted {
@@ -133,14 +88,16 @@ pub fn detect_agent(argv: &[String]) -> Option<&'static str> {
         |c: &str| [".js", ".mjs", ".cjs"].iter().find_map(|ext| c.strip_suffix(ext)).unwrap_or(c).to_string();
     if interpreted
         && let Some(script) = candidates.first().map(|c| script_name(c))
-        && let Some((.., name)) = SCRIPT_ONLY.iter().find(|(s, runtime, _)| *s == script && first.starts_with(runtime))
+        && let Some(agent) = crate::agent_registry::AGENTS
+            .iter()
+            .find(|a| a.scripts.iter().any(|(s, runtime)| *s == script && first.starts_with(runtime)))
     {
-        return Some(name);
+        return Some(agent.name);
     }
     for c in candidates {
         let c = script_name(&c);
-        if let Some((_, name)) = KNOWN_AGENTS.iter().find(|(exe, _)| *exe == c) {
-            return Some(name);
+        if let Some(agent) = crate::agent_registry::AGENTS.iter().find(|a| a.executables.contains(&c.as_str())) {
+            return Some(agent.name);
         }
     }
     None
@@ -358,7 +315,7 @@ impl AgentTracker {
 /// event for a question to the user, and Gemini CLI's none when one is declined or a tool
 /// cancelled: the screen still tells that.
 pub fn hooks_cover_lifecycle(agent: &str) -> bool {
-    matches!(agent, "claude" | "qwen" | "droid" | "codebuddy" | "copilot" | "kimi" | "opencode" | "kilo" | "pi")
+    crate::agent_registry::find(agent).is_some_and(|a| a.reliable_turn_end)
 }
 
 /// Map an agent's hook payload to a state change. `event` is the hook's event, for agents that
@@ -433,10 +390,7 @@ mod tests {
     /// README.md names four agents and counts the others; docs/agents.md counts them all.
     #[test]
     fn the_pages_count_the_agents_recognised() {
-        let scripts = SCRIPT_ONLY.iter().map(|(.., name)| *name);
-        let subcommands = SUBCOMMANDS.iter().map(|(.., name)| *name);
-        let known = KNOWN_AGENTS.iter().map(|(_, name)| *name);
-        let agents = known.chain(scripts).chain(subcommands).collect::<std::collections::BTreeSet<_>>().len();
+        let agents = crate::agent_registry::AGENTS.len();
         let page = |name: &str| std::fs::read_to_string(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(name));
         assert!(page("README.md").unwrap().contains(&format!("and {} others", agents - 4)), "{agents} agents");
         assert!(

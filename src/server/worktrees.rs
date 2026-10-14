@@ -23,7 +23,7 @@ use crate::worktree_setup::{self, Plan, Prepared};
 pub struct NewWorktree {
     ws: u32,
     agent: String,
-    account: String,
+    account: Option<String>,
     plan: Plan,
 }
 
@@ -273,7 +273,13 @@ impl Server {
     /// Create a worktree from the focused pane's repository, prepare it as the repository and
     /// the config say, then start `agent` in it in a new tab. Git runs in the background (it
     /// can be slow); the repository's setup commands are approved first.
-    pub(super) fn agent_in_worktree(&mut self, client: ClientId, agent: &str, account: &str, name: &str) -> Result<()> {
+    pub(super) fn agent_in_worktree(
+        &mut self,
+        client: ClientId,
+        agent: &str,
+        account: Option<&str>,
+        name: &str,
+    ) -> Result<()> {
         let ws = self.clients.get(&client).map(|c| c.workspace).context("no client")?;
         let cwd = self
             .client_focus(client)
@@ -283,7 +289,7 @@ impl Server {
             .context("no local directory to take the repository from")?;
         anyhow::ensure!(git::valid_worktree_name(name), "invalid worktree name {name:?} (letters, digits, - _ .)");
         let user = worktree_setup::Setup::of_user(&self.config.worktrees);
-        let (agent, account, name) = (agent.to_string(), account.to_string(), name.to_string());
+        let (agent, account, name) = (agent.to_string(), account.map(String::from), name.to_string());
         self.toast(client, NoticeKind::Notice, format!("creating worktree {name}…"));
         self.background(
             move || Plan::new(&cwd, &name, None, user, true),
@@ -318,7 +324,7 @@ impl Server {
         self.background(
             move || plan.create(),
             move |server, created| {
-                let result = created.and_then(|p| server.start_agent_in(ws, &agent, &account, p));
+                let result = created.and_then(|p| server.start_agent_in(ws, &agent, account.as_deref(), p));
                 if let Err(e) = result {
                     server.toast(client, NoticeKind::Error, format!("{e:#}"));
                 }
@@ -328,13 +334,20 @@ impl Server {
 
     /// Start `agent` in its new worktree, in a tab named after it; the worktree's setup runs in
     /// its pane first.
-    fn start_agent_in(&mut self, ws: u32, agent: &str, account: &str, prepared: Prepared) -> Result<()> {
+    fn start_agent_in(&mut self, ws: u32, agent: &str, account: Option<&str>, prepared: Prepared) -> Result<()> {
         self.ws_index(ws).context("the workspace was closed")?;
         let wt = prepared.worktree.clone();
         let name = wt.name();
-        let account =
-            self.accounts.get(agent, account).context("The account was removed. Open Accounts to choose another.")?;
-        let mut spec = self.agent_spec(&account, Some(wt.path.clone()), None, &[])?;
+        let registered = crate::agent_registry::find(agent).context("unknown agent")?;
+        let mut spec = if registered.accounts.is_some() {
+            let account = account
+                .and_then(|account| self.accounts.get(agent, account))
+                .context("The account was removed. Open Accounts to choose another.")?;
+            self.agent_spec(&account, Some(wt.path.clone()), None, &[])?
+        } else {
+            let launch = registered.native_launch(account, &[], Some(&wt.path))?;
+            PaneSpec { command: launch.argv, cwd: Some(wt.path.clone()), ..Default::default() }
+        };
         spec.worktree = Some(wt.clone());
         let title = Some(format!("{agent} {name}"));
         let id = match prepared.script() {

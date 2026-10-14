@@ -323,7 +323,7 @@ impl Server {
             })
             .filter(|a| accounts::agent_kind(a).is_some())
             .or_else(|| self.clients.get(&client).and_then(|c| c.last_account_agent.clone()));
-        let agent = accounts::AGENTS.iter().position(|k| Some(k.name) == agent.as_deref()).unwrap_or(0);
+        let agent = accounts::agents().position(|k| Some(k.name) == agent.as_deref()).unwrap_or(0);
         let mut form = AccountForm {
             agent,
             name: String::new(),
@@ -342,7 +342,7 @@ impl Server {
 
     pub(super) fn fill_account_form(&self, form: &mut AccountForm) {
         let choosing = form.choosing();
-        let kind = accounts::AGENTS[form.agent];
+        let kind = accounts::agents().nth(form.agent).unwrap();
         form.installed = crate::transfer::have_program(kind.command);
         if matches!(form.choice, Some(AccountChoice::Existing)) {
             return;
@@ -367,8 +367,8 @@ impl Server {
 
     pub(super) fn name_existing_form(&self, client: ClientId, existing: Account) -> AccountForm {
         let mut form = self.account_form(client);
-        form.agent = accounts::AGENTS.iter().position(|k| k.name == existing.agent).unwrap_or(0);
-        form.installed = crate::transfer::have_program(accounts::AGENTS[form.agent].command);
+        form.agent = accounts::agents().position(|k| k.name == existing.agent).unwrap_or(0);
+        form.installed = crate::transfer::have_program(accounts::agents().nth(form.agent).unwrap().command);
         form.name = self.accounts.proposed_name(&existing.agent, existing.public_identity.as_deref());
         form.cursor = form.name.chars().count();
         form.existing = Some(existing);
@@ -448,7 +448,7 @@ impl Server {
             };
         }
         if let forms::FormEvent::Choice { field: 0, keyboard } = outcome {
-            form.agent = (form.agent + 1) % accounts::AGENTS.len();
+            form.agent = (form.agent + 1) % accounts::agents().count();
             form.choice = None;
             self.fill_account_form(&mut form);
             if keyboard {
@@ -457,7 +457,7 @@ impl Server {
             }
         }
         if let Some(c) = self.clients.get_mut(&client) {
-            c.last_account_agent = Some(accounts::AGENTS[form.agent].name.into());
+            c.last_account_agent = Some(accounts::agents().nth(form.agent).unwrap().name.into());
         }
         if matches!(outcome, forms::FormEvent::Cancel) {
             return Mode::Picker(self.accounts_picker(None));
@@ -476,7 +476,7 @@ impl Server {
                 }
                 return Mode::AccountForm(self.name_existing_form(client, existing.clone()));
             }
-            form.installed = crate::transfer::have_program(accounts::AGENTS[form.agent].command);
+            form.installed = crate::transfer::have_program(accounts::agents().nth(form.agent).unwrap().command);
             form.scroll = 0;
             if !form.installed {
                 form.error = Some(install_message(form.agent));
@@ -486,7 +486,7 @@ impl Server {
             } else if matches!(form.choice, Some(AccountChoice::Existing)) {
                 return self.use_existing_form(client, form);
             } else {
-                match self.add_account(client, accounts::AGENTS[form.agent].name, form.name.trim()) {
+                match self.add_account(client, accounts::agents().nth(form.agent).unwrap().name, form.name.trim()) {
                     Ok(pane) => {
                         if let Some(c) = self.clients.get_mut(&client) {
                             c.adding_account = Some(pane);
@@ -611,7 +611,7 @@ fn name_existing_account(
 }
 
 fn install_message(agent: usize) -> String {
-    let kind = accounts::AGENTS[agent];
+    let kind = accounts::agents().nth(agent).unwrap();
     format!(
         "{} is not installed. Install {} and make `{}` available on PATH, then try again.",
         agent_name(kind.name),
@@ -668,13 +668,14 @@ pub(super) fn draw_form(form: &AccountForm, screen: Rect, buf: &mut Buffer) -> O
     }
     let theme = crate::theme::current();
     overlays::frame(l.area, "Add account", theme.accent, buf);
-    let mut agent = format!("Agent   {}  (Left/Right)", agent_name(accounts::AGENTS[form.agent].name));
+    let mut agent = format!("Agent   {}  (Left/Right)", agent_name(accounts::agents().nth(form.agent).unwrap().name));
     if !form.installed {
         agent.push_str(" · Not installed");
     }
     buf.set_stringn(l.agent.x, l.agent.y, agent, l.agent.width as usize, forms::field_style(form.field == 0));
     let cursor = if form.choosing() {
-        let message = format!("Existing {} sign-in needs review.", agent_name(accounts::AGENTS[form.agent].name));
+        let message =
+            format!("Existing {} sign-in needs review.", agent_name(accounts::agents().nth(form.agent).unwrap().name));
         buf.set_stringn(l.name.x, l.name.y, message, l.name.width as usize, Style::default());
         None
     } else {

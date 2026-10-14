@@ -279,7 +279,7 @@ fn find_account(all: &accounts::Accounts, spec: &str) -> Result<accounts::Accoun
     if let Some((agent, name)) = spec.split_once(':').or_else(|| spec.split_once('·')) {
         return all.get(agent, name).with_context(|| accounts::missing_account(agent, name));
     }
-    let matches: Vec<accounts::Account> = accounts::AGENTS.iter().filter_map(|kind| all.get(kind.name, spec)).collect();
+    let matches: Vec<accounts::Account> = accounts::agents().filter_map(|kind| all.get(kind.name, spec)).collect();
     match matches.len() {
         1 => Ok(matches.into_iter().next().unwrap()),
         0 => bail!("no account named {spec:?} (see `kraal accounts`)"),
@@ -357,6 +357,12 @@ fn exec_agent(
     args: &[String],
     env: &[(String, String)],
 ) -> Result<()> {
+    let registered = crate::agent_registry::find(agent).with_context(|| format!("unknown agent {agent:?}"))?;
+    if registered.accounts.is_none() {
+        let mut launch = registered.native_launch(account, args, Some(&std::env::current_dir()?))?;
+        launch.env.extend(env.iter().cloned());
+        return run_with(&launch, true).map(|_| ());
+    }
     let all = accounts::Accounts::load()?;
     accounts::agent_kind(agent)
         .with_context(|| format!("unknown agent {agent:?} (known: {})", accounts::agent_names()))?;
@@ -388,6 +394,11 @@ pub(super) fn worktrees(s: &Session, action: WtCmd) -> Result<()> {
     match action {
         WtCmd::New { name, agent, base, yes, no_setup } => {
             use std::io::{BufRead, IsTerminal, Write};
+            if std::env::var_os("KRAAL_SOCKET").is_some()
+                && agent.as_deref().and_then(crate::agent_registry::find).is_some_and(|a| a.accounts.is_none())
+            {
+                crate::client::require_feature(&s.socket(), crate::protocol::NATIVE_AGENTS)?;
+            }
             let cfg = crate::config::Config::load()?;
             let user = worktree_setup::Setup::of_user(&cfg.worktrees);
             let plan = worktree_setup::Plan::new(&cwd, &name, base.as_deref(), user, !no_setup)?;
@@ -590,6 +601,77 @@ pub(super) fn integration(action: &str, agent: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_launches_check_both_older_servers_before_worktree_preparation() {
+        if !crate::testing::in_own_process(
+            "cli::agents::tests::native_launches_check_both_older_servers_before_worktree_preparation",
+        ) {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("kraal-native-compat-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let previous = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&dir).unwrap();
+        for version in ["0.2.0", "0.3.0"] {
+            for worktree in [false, true] {
+                let socket = dir.join(format!("{version}-{worktree}.sock"));
+                let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+                // This test runs alone in its own process, before starting the server thread.
+                unsafe { std::env::set_var("KRAAL_SOCKET", &socket) };
+                let server = std::thread::spawn(move || {
+                    let (mut stream, _) = listener.accept().unwrap();
+                    let (_, payload) = crate::protocol::read_frame(&mut stream).unwrap().unwrap();
+                    let msg: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+                    let cmd = msg["request"]["cmd"].as_str().unwrap();
+                    let result = if cmd == "ping" {
+                        serde_json::json!({"Ok": {"kind": "pong", "data": {
+                            "pid": 1, "session": "old", "version": version
+                        }}})
+                    } else {
+                        serde_json::json!({"Err": "unknown agent"})
+                    };
+                    crate::protocol::write_json(
+                        &mut stream,
+                        &serde_json::json!({
+                            "type": "response", "result": result
+                        }),
+                    )
+                    .unwrap();
+                    cmd.to_string()
+                });
+                let session = Session { name: "old".into(), explicit: None };
+                let result = if worktree {
+                    worktrees(
+                        &session,
+                        WtCmd::New {
+                            name: "fix".into(),
+                            agent: Some("gemini".into()),
+                            base: None,
+                            yes: true,
+                            no_setup: false,
+                        },
+                    )
+                } else {
+                    agent(&session, "gemini".into(), None, Placement::Auto, false, Vec::new())
+                };
+                let error = result.unwrap_err().to_string();
+                assert_eq!(
+                    error,
+                    format!(
+                        "session old runs kraal {version}, which cannot start agents with native account management: \
+                     `kraal -s old restart` updates it (its layout and scrollback are kept)"
+                    )
+                );
+                assert_eq!(server.join().unwrap(), "ping", "no launch request reaches an older server");
+                std::fs::remove_file(&socket).unwrap();
+                assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0, "no worktree preparation or creation");
+            }
+        }
+        std::env::set_current_dir(previous).unwrap();
+        unsafe { std::env::remove_var("KRAAL_SOCKET") };
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn run_with_preserves_arguments_and_the_accounts_environment() {

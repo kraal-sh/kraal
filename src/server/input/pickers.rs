@@ -181,17 +181,20 @@ impl Server {
                 (KeyCode::Char('t'), true) if p.kind == PickerKind::Agent => {
                     if let Some(PickAction::AgentLaunch { agent, account }) = p.current().map(|i| i.action.clone()) {
                         let ws = self.clients.get(&id).map(|c| c.workspace).unwrap_or(0);
-                        if let Err(e) = self.launch_agent(ws, None, &agent, Some(&account), Placement::Tab, None) {
+                        if let Err(e) = self.launch_agent(ws, None, &agent, account.as_deref(), Placement::Tab, None) {
                             self.toast(id, NoticeKind::Error, format!("{e:#}"));
                         }
                         return Mode::Normal;
                     }
                 }
                 (KeyCode::Char('d'), true) if p.kind == PickerKind::Agent => {
-                    if let Some(PickAction::AgentLaunch { agent, account }) = p.current().map(|i| &i.action)
-                        && let Some(a) = self.accounts.get(agent, account)
-                    {
-                        return self.account_details(&a.id);
+                    if let Some(PickAction::AgentLaunch { agent, account }) = p.current().map(|i| &i.action) {
+                        if let Some(a) = account.as_deref().and_then(|account| self.accounts.get(agent, account)) {
+                            return self.account_details(&a.id);
+                        }
+                        if let Some(agent) = crate::agent_registry::find(agent).filter(|a| a.accounts.is_none()) {
+                            p.message = Some(agent.account_message());
+                        }
                     }
                 }
                 (KeyCode::Char('w'), true) if p.kind == PickerKind::Agent && p.worktree => {
@@ -466,7 +469,7 @@ impl Server {
             PickAction::AgentLaunch { agent, account } => {
                 let ws = self.clients.get(&id).map(|c| c.workspace).unwrap_or(0);
                 let focus = self.client_focus(id);
-                if let Err(e) = self.launch_agent(ws, focus, &agent, Some(&account), Placement::Auto, None) {
+                if let Err(e) = self.launch_agent(ws, focus, &agent, account.as_deref(), Placement::Auto, None) {
                     self.toast(id, NoticeKind::Error, format!("{e:#}"));
                 }
             }

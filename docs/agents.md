@@ -7,7 +7,7 @@ for Claude Code and Codex. Other agents use their own sign-in and account settin
 
 | Task | Path and result |
 |---|---|
-| Start | `ctrl+b a`, choose a Claude or Codex account, Enter. Tab also offers **Start in new tab** and, in a local repository, **Start in worktree**. |
+| Start | `ctrl+b a`, choose an installed agent (or a Claude or Codex account), Enter. Tab also offers **Start in new tab** and, in a local repository, **Start in worktree**. |
 | Add an account | `ctrl+b A l` opens **Accounts**. Choose **+ Add account**, select **Agent**, enter **Name** and submit. Complete the agent's sign-in; kraal verifies it before confirming success. `ctrl+b A n` opens the same form directly. |
 | Use an existing sign-in | Open Accounts. A verified standard home is adopted with a name; an uncertain match offers **Review**. Choose which account it is without logging in again. |
 | Change this pane's account | `ctrl+b A c`, or click its account name. Check **Continue conversation** or **New conversation**, then choose the destination. Sign-in is checked before anything stops. |
@@ -20,7 +20,7 @@ verification stays marked **Sign-in required**. See [Accounts](#accounts) for re
 
 | Capability | Claude Code | Codex | Other recognized agents |
 |---|---|---|---|
-| Launch from kraal's account picker | Yes | Yes | Run the agent in a shell instead |
+| Launch from Start an agent | Yes | Yes | Yes, when installed on PATH |
 | Named accounts and reported usage | Yes | Yes | Managed by the agent |
 | Change account | Continue a readable, compatible transcript | Start a new conversation | Not supported by kraal |
 | Undo account change | Resume the latest conversation on the previous account | Reopen the original account's saved conversation | Not supported by kraal |
@@ -30,6 +30,58 @@ A requested change can wait for a reliable end-of-turn hook; otherwise it asks b
 the agent. Missing sign-in or an unverifiable conversation leaves the current pane unchanged.
 The command `kraal agent codex --account work` starts a new agent. There is currently no CLI
 command to change the account of an existing pane; use **Change account** in kraal.
+
+## Registered capabilities
+
+These are kraal's validated capabilities, not a claim about everything the agent itself can do.
+Launch commands are tried in the order shown; executable aliases produce one picker entry.
+Native sign-in, checks and isolation below mean kraal can manage named accounts through the
+agent's own commands. Conversation identification means kraal can identify a conversation for
+its supported resume flow. Reliable turn end requires the installed integration to cover the
+whole lifecycle; partial hooks and screen heuristics do not qualify for deferred switching.
+
+| Agent | Launch on PATH | Native sign-in | Reliable check | Account isolation | Conversation identification | Cross-account resume | Reliable turn end |
+|---|---|---|---|---|---|---|---|
+| `claude` | `claude` | Yes | Yes | Yes | Yes | Yes | Yes |
+| `codex` | `codex` | Yes | Yes | Yes | Yes | No | No |
+| `opencode` | `opencode`, `opencode2` | No | No | No | No | No | Yes |
+| `gemini` | `gemini` | No | No | No | No | No | No |
+| `aider` | `aider` | No | No | No | No | No | No |
+| `cursor` | `cursor-agent` | No | No | No | No | No | No |
+| `amp` | `amp` | No | No | No | No | No | No |
+| `pi` | `pi` | No | No | No | No | No | Yes |
+| `grok` | `grok` | No | No | No | No | No | No |
+| `copilot` | `copilot` | No | No | No | No | No | Yes |
+| `goose` | `goose` | No | No | No | No | No | No |
+| `crush` | `crush` | No | No | No | No | No | No |
+| `qwen` | `qwen` | No | No | No | No | No | Yes |
+| `kimi` | `kimi` | No | No | No | No | No | Yes |
+| `droid` | `droid` | No | No | No | No | No | Yes |
+| `auggie` | `auggie` | No | No | No | No | No | No |
+| `kiro` | `kiro-cli`, `q chat` | No | No | No | No | No | No |
+| `kilo` | `kilo`, `kilocode` | No | No | No | No | No | Yes |
+| `cline` | `cline` | No | No | No | No | No | No |
+| `codebuff` | `codebuff`, `freebuff` | No | No | No | No | No | No |
+| `qoder` | `qoder`, `qodercli` | No | No | No | No | No | No |
+| `codebuddy` | `codebuddy` | No | No | No | No | No | Yes |
+| `junie` | `junie` | No | No | No | No | No | No |
+| `llxprt` | `llxprt` | No | No | No | No | No | No |
+| `kode` | `kode` | No | No | No | No | No | No |
+| `openhands` | `openhands` | No | No | No | No | No | No |
+| `vibe` | `vibe-rs`, `vibe` | No | No | No | No | No | No |
+| `continue` | `cn` | No | No | No | No | No | No |
+| `letta` | `letta` | No | No | No | No | No | No |
+| `rovodev` | `acli rovodev run` | No | No | No | No | No | No |
+
+Only Claude and Codex have account adapters. Other agents keep their own account settings;
+kraal supplies no account environment overrides or conversation resume arguments for them.
+Continue, Letta and Python Vibe are detected through their runtime scripts; broad command names
+alone do not identify a running agent. Cursor's generic `agent` process also needs its bundled
+script path for detection; the launch picker looks for `cursor-agent`.
+
+`kraal agent gemini` also launches the registered command with its native account. The same
+applies to `kraal wt new fix --agent gemini`. An explicit `--account` for an agent without
+account support is refused with **Accounts are managed in <agent>**.
 
 ## States
 
@@ -131,7 +183,7 @@ the agent's conversation history.
 Panes in a git repository show their branch in their frame (`⎇ main*? ↑2`: `*` changes, `?`
 untracked files, commits ahead).
 
-In the agent picker (`ctrl+b a`), select an account and press Tab, then **Start in worktree**: kraal creates a branch
+In the agent picker (`ctrl+b a`), select an agent or account and press Tab, then **Start in worktree**: kraal creates a branch
 `kraal/<name>` and a directory next to the repository (`<repo>.worktrees/<name>`), and starts the
 agent there in its own tab. Several agents can work on the same repository without stepping on each
 other. `ctrl+b R g` in that tab reviews the changes (your pager, delta included), commits them, opens
@@ -326,11 +378,15 @@ Esc or **Cancel** in the form returns to Accounts. While **Checking sign-in...**
 the form accepts cancellation but no second submission. A cancelled check cannot later replace
 the screen you are using with its result.
 
-The launch picker (`ctrl+b a`) lists installed agents' accounts that do not require sign-in.
-Enter or one click starts the selected account. Tab offers **Start in new tab** (`ctrl+t`),
+The launch picker (`ctrl+b a`) lists registered agents with an executable on PATH, with Claude
+and Codex first. For these two, it lists accounts that do not require sign-in, as before. Other
+agents appear once and use their native sign-in and environment. Missing agents are omitted.
+Enter or one click starts the selected agent or account. Tab offers **Start in new tab** (`ctrl+t`),
 **Start in worktree** (`ctrl+w`) when the focused pane is in a local repository, and **Account
-details** (`ctrl+d`). Worktree launches keep the selected account. Account management is in
-Accounts.
+details** (`ctrl+d`). Worktree launches keep the selected account, or the native account for other agents.
+For agents without account support, **Accounts** (`ctrl+d`) explains **Accounts are managed in
+<agent>**. **Change account** and the direct **Add account** shortcut on their pane give the same
+explanation. Manage Claude and Codex accounts in Accounts.
 
 The name is a label: renaming keeps the same account, rules and usage. Its directory stays where
 it is, and running agents go on under the new name. Removing an account keeps the label and

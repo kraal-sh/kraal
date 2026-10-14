@@ -387,7 +387,7 @@ pub fn snapshot(server: &Server) -> SessionSnapshot {
         let agent = p.agent.kind.clone().or_else(|| {
             let program = spec.command.first()?.rsplit('/').next()?;
             p.agent.session_id.as_ref()?;
-            crate::accounts::AGENTS.iter().find(|k| k.command == program).map(|k| k.name.to_string())
+            crate::accounts::agents().find(|k| k.command == program).map(|k| k.name.to_string())
         });
         PaneSnap {
             name: p.name.clone(),

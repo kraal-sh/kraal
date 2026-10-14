@@ -1323,7 +1323,7 @@ pub fn of_the_developer() -> Option<String> {
         ("the data directory", Some(data_home())),
         ("the runtime directory", Some(runtime_dir())),
     ];
-    let agents = crate::accounts::AGENTS.iter().map(|a| (a.home_env, std::env::var_os(a.home_env).map(PathBuf::from)));
+    let agents = crate::accounts::agents().map(|a| (a.home_env, std::env::var_os(a.home_env).map(PathBuf::from)));
     let path = std::env::var_os("PATH").unwrap_or_default();
     let used: Vec<(&str, PathBuf)> = own
         .into_iter()

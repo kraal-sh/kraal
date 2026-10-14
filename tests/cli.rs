@@ -9523,6 +9523,87 @@ fn reviewing_the_existing_account_keeps_live_agents_and_reports_usage_once() {
 }
 
 #[test]
+fn a_registered_native_agent_keeps_its_environment_and_rejects_account_overrides() {
+    let env = Env::new("native-agent-cli");
+    let bin = env.root.join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    write_script(
+        &bin.join("gemini"),
+        "#!/bin/sh\nprintf 'native=%s account=%s arg=%s\\n' \"$OPENAI_API_KEY\" \"${KRAAL_ACCOUNT-unset}\" \"$1\"\n",
+    );
+    let output = env
+        .cmd(&["agent", "gemini", "--here", "--", "hello"])
+        .env("PATH", &bin)
+        .env("OPENAI_API_KEY", "stand-in-key")
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "native=stand-in-key account=unset arg=hello\n");
+    let output = env.cmd(&["agent", "gemini", "--here", "--account", "work"]).env("PATH", &bin).output().unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("Accounts are managed in Gemini"));
+    let output = env.cmd(&["accounts", "add", "gemini", "work"]).env("PATH", &bin).output().unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("Accounts are managed in Gemini"));
+    let output = env.cmd(&["agent", "aider", "--here"]).env("PATH", &bin).output().unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("Aider is not installed. Install Aider"));
+    assert!(!env.root.join("config/kraal/accounts.toml").exists());
+}
+
+#[test]
+fn the_launch_picker_starts_native_agents_in_panes_tabs_and_worktrees() {
+    for (action, name) in [(b"\r".as_slice(), "pane"), (b"\x14", "tab"), (b"\x17", "worktree")] {
+        let env = Env::new(&format!("native-agent-{name}"));
+        let bin = env.root.join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        write_script(
+            &bin.join("gemini"),
+            "#!/bin/sh\nprintf 'NATIVE_READY account=%s\\n' \"${KRAAL_ACCOUNT-unset}\"\nwhile IFS= read -r line; do printf 'reply:%s\\n' \"$line\"; done\n",
+        );
+        let repo = env.root.join("repo");
+        let _git = git_repo(&repo, &[("file", "content\n")]);
+        env.workspace("w", &format!("layout {{ pane name=\"shell\" cwd={:?} }}\n", repo.display().to_string()));
+        let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap_or_default());
+        let output = env.cmd(&["open", "w"]).env("PATH", path).output().unwrap();
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        let mut client = RawClient::attach_sized(&env, Some("w"), (80, 24)).traced();
+        client.send(b"\x02a");
+        client.wait_for_row("Start an agent");
+        client.send(b"Gemini");
+        client.wait_for_row("Accounts are managed in Gemini");
+        client.send(b"\x04");
+        client.wait_for_row("Accounts are managed in Gemini");
+        if name == "worktree" {
+            // Git discovery controls whether the worktree action is available.
+            client.close_overlay("Start an agent");
+            client.wait_for_row("main");
+            client.send(b"\x02aGemini");
+            client.wait_for_row("Accounts are managed in Gemini");
+        }
+        client.send(action);
+        if name == "worktree" {
+            client.wait_for_row("Name of the worktree for gemini");
+            client.send(b"native\r");
+        }
+        client.wait_for_row("NATIVE_READY account=unset");
+        wait_until(PATIENCE, "the native agent is detected", || {
+            let agents: serde_json::Value = serde_json::from_str(&env.run(&["agents", "--json"])).unwrap();
+            agents.as_array().unwrap().iter().any(|agent| agent["agent"] == "gemini")
+        });
+        client.send(b"\x02Ac");
+        client.wait_for_row("Accounts are managed in Gemini");
+        client.send(b"still-running\r");
+        client.wait_for_row("reply:still-running");
+        let panes: serde_json::Value = serde_json::from_str(&env.run(&["panes", "--json"])).unwrap();
+        assert!(panes.as_array().unwrap().iter().all(|p| p["account"].is_null()));
+        if name == "worktree" {
+            assert!(env.root.join("repo.worktrees/native").is_dir());
+        }
+    }
+}
+
+#[test]
 fn a_missing_agent_keeps_the_add_form_and_creates_nothing() {
     let env = Env::new("login-missing");
     env.workspace("w", "layout { pane name=\"shell\" }\n");

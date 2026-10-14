@@ -182,7 +182,7 @@ impl Server {
                 self.start_job(id, "download", vec!["cp".into(), "--".into(), value, format!("{}/", dir.display())]);
             }
             PromptAction::NewWorktree { agent, account } => {
-                if let Err(e) = self.agent_in_worktree(id, &agent, &account, &value) {
+                if let Err(e) = self.agent_in_worktree(id, &agent, account.as_deref(), &value) {
                     return Err((PromptAction::NewWorktree { agent, account }, format!("{e:#}")));
                 }
             }

@@ -352,7 +352,7 @@ pub enum PickAction {
     },
     AgentLaunch {
         agent: String,
-        account: String,
+        account: Option<String>,
     },
     AgentSwitch {
         pane: PaneId,
@@ -616,6 +616,12 @@ impl Picker {
             (K::Ssh, A::SshGroup(_)) => {
                 &[("enter", "Open group"), ("ctrl+r", "Run a command on it"), ("ctrl+e", "Edit saved servers")]
             }
+            (K::Agent, A::AgentLaunch { account: None, .. }) if self.worktree => {
+                &[("ctrl+t", "Start in new tab"), ("ctrl+w", "Start in worktree"), ("ctrl+d", "Accounts")]
+            }
+            (K::Agent, A::AgentLaunch { account: None, .. }) => {
+                &[("ctrl+t", "Start in new tab"), ("ctrl+d", "Accounts")]
+            }
             (K::Agent, A::AgentLaunch { .. }) if self.worktree => {
                 &[("ctrl+t", "Start in new tab"), ("ctrl+w", "Start in worktree"), ("ctrl+d", "Account details")]
             }
@@ -785,7 +791,7 @@ pub enum PromptAction {
     /// The value is the worktree's name.
     NewWorktree {
         agent: String,
-        account: String,
+        account: Option<String>,
     },
     /// The value is a commit message for the pane's worktree.
     Commit {
@@ -1177,6 +1183,25 @@ mod tests {
     }
 
     #[test]
+    fn native_agent_actions_keep_tab_and_worktree_launches() {
+        let mut picker = Picker::new(
+            PickerKind::Agent,
+            "Start an agent",
+            vec![PickItem::new(
+                "Gemini",
+                "Accounts are managed in Gemini",
+                PickAction::AgentLaunch { agent: "gemini".into(), account: None },
+            )],
+        );
+        assert_eq!(picker.action_keys(), [("ctrl+t", "Start in new tab"), ("ctrl+d", "Accounts")]);
+        picker.worktree = true;
+        assert_eq!(
+            picker.action_keys(),
+            [("ctrl+t", "Start in new tab"), ("ctrl+w", "Start in worktree"), ("ctrl+d", "Accounts"),]
+        );
+    }
+
+    #[test]
     fn workspace_search_keeps_a_uniform_add_row() {
         let items = vec![
             PickItem {
@@ -1211,7 +1236,7 @@ mod tests {
             vec![PickItem::new(
                 "Claude · work",
                 "",
-                PickAction::AgentLaunch { agent: "claude".into(), account: "work".into() },
+                PickAction::AgentLaunch { agent: "claude".into(), account: Some("work".into()) },
             )],
         );
         assert_eq!(p.action_keys(), &[("ctrl+t", "Start in new tab"), ("ctrl+d", "Account details")]);
@@ -1319,7 +1344,7 @@ mod tests {
         p.items.push(PickItem::new(
             "claude",
             "",
-            PickAction::AgentLaunch { agent: "claude".into(), account: "work".into() },
+            PickAction::AgentLaunch { agent: "claude".into(), account: Some("work".into()) },
         ));
         p.query = "no match".into();
         p.refilter();
