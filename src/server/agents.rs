@@ -1848,6 +1848,7 @@ mod tests {
             crate::persist::SessionSnapshot {
                 version: 2,
                 workspaces: vec![ws.clone()],
+                workspace_order: Vec::new(),
                 deleted_workspaces: Vec::new(),
                 removed_sources: Vec::new(),
                 tunnels: Vec::new(),

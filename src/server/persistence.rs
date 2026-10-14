@@ -67,6 +67,7 @@ impl Server {
         // Nothing to save before a session exists. Once one was queued, an empty state may
         // need to replace it, including a rollback of the first workspace's creation.
         if self.workspaces.is_empty()
+            && self.workspace_order.is_empty()
             && self.unrestored.is_empty()
             && self.deleted_workspaces.is_empty()
             && self.removed_sources.is_empty()

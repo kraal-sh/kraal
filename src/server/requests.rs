@@ -552,6 +552,9 @@ impl Server {
                 done: 0,
             });
         }
+        out.sort_by_key(|w| {
+            crate::persist::WorkspaceKey::position(&self.workspace_order, w.id.as_deref(), w.definition.as_deref())
+        });
         out
     }
 }

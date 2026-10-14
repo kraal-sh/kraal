@@ -125,6 +125,11 @@ pub enum ConfirmAction {
         stop: bool,
     },
     RetryDeleteWorkspace(super::workspace_lifecycle::DeleteTarget),
+    ReorderWorkspace {
+        workspace: crate::persist::WorkspaceKey,
+        neighbor: crate::persist::WorkspaceKey,
+        before: bool,
+    },
     OpenWorkspace(PickAction),
     /// Restart the session on the kraal installed now.
     Restart,
@@ -197,6 +202,7 @@ impl ConfirmAction {
             ConfirmAction::CloseWorkspace { .. } => "Stop and close".into(),
             ConfirmAction::DeleteWorkspace { stop, .. } => if *stop { "Stop and delete" } else { "Delete" }.into(),
             ConfirmAction::RetryDeleteWorkspace(_) => "Retry".into(),
+            ConfirmAction::ReorderWorkspace { .. } => "Retry".into(),
             ConfirmAction::RetryCloseWorkspace(_) | ConfirmAction::OpenWorkspace(_) => "Retry".into(),
             ConfirmAction::Restart => "Restart".into(),
             ConfirmAction::Quit => "Quit".into(),
@@ -296,6 +302,7 @@ pub enum PickAction {
     RestoreWorkspace(String),
     /// A definition not running, by its file.
     OpenDefinition(std::path::PathBuf),
+    UnavailableDefinition(std::path::PathBuf),
     AddWorkspace,
     /// A server name or `user@host[:port]`.
     Ssh(String),
@@ -355,10 +362,16 @@ pub enum PickAction {
         side: crate::files::Side,
         target: String,
     },
-    None,
 }
 
 impl PickAction {
+    pub fn definition(&self) -> Option<&std::path::Path> {
+        match self {
+            Self::OpenDefinition(path) | Self::UnavailableDefinition(path) => Some(path),
+            _ => None,
+        }
+    }
+
     pub fn workspace(&self) -> Option<u32> {
         match self {
             Self::SwitchWorkspace(ws)
@@ -428,6 +441,8 @@ pub struct PickerState {
     selected: Option<String>,
     workspace: Option<u32>,
     definition: Option<std::path::PathBuf>,
+    /// Keep an open menu's actions, target and neighbors as they were when shown.
+    actions: Option<(usize, Vec<PickItem>)>,
     message: Option<String>,
     min_items: usize,
     undo: Option<String>,
@@ -466,10 +481,8 @@ impl Picker {
             cursor: self.cursor,
             selected: self.current().map(|i| i.label.clone()),
             workspace: self.current().and_then(|i| i.action.workspace()),
-            definition: self.current().and_then(|i| match &i.action {
-                PickAction::OpenDefinition(path) => Some(path.clone()),
-                _ => None,
-            }),
+            definition: self.current().and_then(|i| i.action.definition().map(std::path::Path::to_path_buf)),
+            actions: self.actions.map(|at| (at, self.items.clone())),
             message: self.message.clone(),
             min_items: self.min_items,
             undo: self.undo.clone(),
@@ -488,13 +501,19 @@ impl Picker {
         self.back = state.back;
         self.query = state.query;
         self.cursor = state.cursor;
+        if let Some((at, items)) = state.actions {
+            self.items = items;
+            self.pinned =
+                self.items.iter().position(|i| matches!(i.action, PickAction::AddAccount | PickAction::AddWorkspace));
+            self.actions = Some(at);
+        }
         self.refilter();
         if let Some(id) = state.restored {
             self.select(|i| matches!(&i.action, PickAction::RestoreWorkspace(w) if *w == id));
         } else if let Some(ws) = state.workspace {
             self.select(|i| i.action.workspace() == Some(ws));
         } else if let Some(path) = state.definition {
-            self.select(|i| matches!(&i.action, PickAction::OpenDefinition(p) if p == &path));
+            self.select(|i| i.action.definition() == Some(path.as_path()));
         } else if let Some(label) = state.selected {
             self.select(|i| i.label == label);
         }
@@ -509,12 +528,12 @@ impl Picker {
         Mode::Picker(self)
     }
 
-    /// An empty key keeps a destructive action in the menu without adding a direct shortcut.
-    pub fn action_keys(&self) -> &'static [(&'static str, &'static str)] {
+    /// An empty key keeps an action in the menu without adding a direct shortcut.
+    pub fn action_keys(&self) -> Vec<(&'static str, &'static str)> {
         use PickAction as A;
         use PickerKind as K;
-        let Some(item) = self.current() else { return &[] };
-        match (self.kind, &item.action) {
+        let Some(item) = self.current() else { return Vec::new() };
+        let keys: &[(&str, &str)] = match (self.kind, &item.action) {
             (K::Ssh, A::Ssh(_)) => &[
                 ("enter", "Connect"),
                 ("ctrl+t", "Connect in a new tab"),
@@ -567,9 +586,36 @@ impl Picker {
                 ("ctrl+o", "Show in a preview pane"),
                 ("ctrl+x", "Delete"),
             ],
-            (_, A::None) => &[],
+            (_, A::UnavailableDefinition(_)) => &[],
             _ => &[("enter", "Choose")],
+        };
+        let mut keys = keys.to_vec();
+        if self.kind == K::Workspace
+            && matches!(item.action, A::SwitchWorkspace(_) | A::ReopenWorkspace(_) | A::OpenDefinition(_))
+        {
+            let rows: Vec<_> = self
+                .items
+                .iter()
+                .enumerate()
+                .filter(|(_, i)| i.action.workspace().is_some() || i.action.definition().is_some())
+                .map(|(i, _)| i)
+                .collect();
+            let at = rows.iter().position(|i| Some(i) == self.filtered.get(self.selected)).unwrap();
+            let insert = keys.iter().position(|(_, action)| matches!(*action, "Close" | "Delete")).unwrap();
+            let mut moves = Vec::new();
+            if rows.len() > 1 && !self.query.is_empty() {
+                moves.push(("", "Clear search to reorder"));
+            } else {
+                if at > 0 {
+                    moves.push(("", "Move up"));
+                }
+                if at + 1 < rows.len() {
+                    moves.push(("", "Move down"));
+                }
+            }
+            keys.splice(insert..insert, moves);
         }
+        keys
     }
 
     pub fn refilter(&mut self) {
@@ -930,7 +976,7 @@ mod tests {
 
     #[test]
     fn list_refresh_and_result_keep_the_query_selection_and_room_for_removed_rows() {
-        let item = |name: &str| PickItem::new(name, "", PickAction::None);
+        let item = |name: &str| PickItem::new(name, "", PickAction::AccountDetails(name.into()));
         let mut old = Picker::new(PickerKind::Accounts, "Accounts", vec![item("One"), item("Two"), item("Other")]);
         old.query = "o".into();
         old.cursor = 1;
@@ -958,7 +1004,10 @@ mod tests {
         let mut p = Picker::new(
             PickerKind::Tool,
             "List",
-            vec![PickItem::new("One", "Details", PickAction::None), PickItem::new("Add", "", PickAction::None)],
+            vec![
+                PickItem::new("One", "Details", PickAction::UnavailableDefinition("invalid.kdl".into())),
+                PickItem::new("Add", "", PickAction::UnavailableDefinition("invalid.kdl".into())),
+            ],
         );
         p.pinned = Some(1);
         p.two_line = true;
@@ -1098,7 +1147,7 @@ mod tests {
                 &[("enter", "Open directory")],
             ),
             (PickerKind::Pane, PickAction::Worktree { pane: 1, op: "review".into() }, &[("enter", "Choose")]),
-            (PickerKind::Workspace, PickAction::None, &[]),
+            (PickerKind::Workspace, PickAction::UnavailableDefinition("invalid.kdl".into()), &[]),
         ];
         for (kind, action, expected) in cases {
             let p = Picker::new(kind, "List", vec![PickItem::new("item", "", action)]);

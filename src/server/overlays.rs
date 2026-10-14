@@ -906,7 +906,7 @@ mod tests {
                     super::super::ui::PickItem::new(
                         format!("web-{i}"),
                         "deploy@web",
-                        super::super::ui::PickAction::None,
+                        super::super::ui::PickAction::UnavailableDefinition("invalid.kdl".into()),
                     )
                 })
                 .collect(),
@@ -1132,7 +1132,7 @@ mod tests {
             let p = Picker::new(
                 PickerKind::Workspace,
                 "Workspaces",
-                vec![PickItem::new("invalid", "error", PickAction::None)],
+                vec![PickItem::new("invalid", "error", PickAction::UnavailableDefinition("invalid.kdl".into()))],
             );
             draw_picker(&p, area, &mut buf);
             let layout = picker_layout(&p, area);

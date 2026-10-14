@@ -453,6 +453,9 @@ impl Server {
                     ConfirmAction::RetryCloseWorkspace(ws) => {
                         return self.ask_close_workspace(id, ws);
                     }
+                    ConfirmAction::ReorderWorkspace { workspace, neighbor, before } => {
+                        return self.reorder_workspace(id, workspace, neighbor, before);
+                    }
                     ConfirmAction::DeleteWorkspace { target, .. } => {
                         let current = self.ask_delete_workspace(target.clone());
                         if matches!(&current, Mode::Confirm(next) if matches!(next.action, ConfirmAction::DeleteWorkspace { .. }) && next.message == q.message)

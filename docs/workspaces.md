@@ -10,7 +10,8 @@ Search only filters the list. **+ Add workspace** stays visible even when nothin
 The bottom-right count includes only workspaces, showing matches over the total while searching.
 Tab or a right click offers actions for that row: **Rename** for a saved workspace, and **Close**
 when it is open. **Delete** is available for saved workspaces and workspace files that have
-not been imported. An unimported file also offers **Open**.
+not been imported. **Move up** and **Move down** change the order of saved workspaces and
+unimported files. An unimported file also offers **Open**.
 
 **+ Add workspace** and `ctrl+b W n` open the same **Add workspace** form. It proposes an unused
 name (or the search text) and shows the folder inherited from the current pane. Edit **Name**,
@@ -32,9 +33,9 @@ no longer matches the search, the search clears to show it.
 - A session holds **workspaces**, each with **tabs** (named after their focused pane until you
   rename them), each with **panes**:
   tiled (some may share a place as a stack, one open at a time), or floating on top.
-- The **sidebar**, at the left from the first screen on, lists the saved workspaces, open and
-  closed, then the workspace files that have not been opened and, when there are some, the agents, the tunnels
-  and the ports, with the agents' accounts at the bottom once one is listed or used.
+- The **sidebar**, at the left from the first screen on, lists open and closed workspaces and
+  unimported workspace files in the same order as Workspaces. Then come the agents, tunnels
+  and ports, with the agents' accounts at the bottom once one is listed or used.
   `ctrl+b V l` hides it, or shows it again, in the terminal you type it in until that terminal
   detaches; `[sidebar] visible = false` in the configuration hides it for good. A terminal less
   than three times as wide as the sidebar (84 columns with the default width) has none: the panes
@@ -63,6 +64,21 @@ no longer matches the search, the search clears to show it.
 | `kraal kill` | stops the session's server and its programs; the layout is saved |
 | `kraal restart` | restarts the server on the kraal installed now (see below) |
 | `kraal forget` | deletes what a stopped session saved |
+
+### Reordering workspaces
+
+Select a row in **Workspaces**, press Tab and choose **Move up** or **Move down**.
+The row stays selected and the workspace, tab and pane on each attached terminal stay focused.
+The sidebar, Workspaces and `kraal workspaces` share the order. It is saved automatically,
+including while the server is stopped and after restart. Opening or closing a workspace keeps
+its place. Moving an unimported file starts no programs and changes no KDL file.
+The first row has no Move up action, and the last has no Move down action.
+
+While searching, **Clear search to reorder** replaces the move actions. Choose it to clear the
+search and keep the selected row, then choose a move in the full list.
+If saving fails, kraal keeps the previous order and offers **Retry** and **Cancel**.
+If a timed-out write's rollback also fails, the dialog says the saved order may differ and asks
+you to fix the save error and retry. Cancel returns to the list with the same row selected.
 
 ### One server for what a session saves
 
