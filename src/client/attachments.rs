@@ -2745,7 +2745,8 @@ mod tests {
             client.keys(b"\r");
             let started = Instant::now();
             let pid: libc::pid_t = loop {
-                if let Some(pid) = std::fs::read_to_string(&ready).ok().and_then(|text| text.trim().parse().ok()) {
+                if let Some(pid) = crate::testing::read_complete_lines(&ready).and_then(|text| text.trim().parse().ok())
+                {
                     break pid;
                 }
                 assert!(started.elapsed() < crate::testing::PATIENCE);

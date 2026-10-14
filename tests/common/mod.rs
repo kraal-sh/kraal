@@ -2,7 +2,7 @@
 
 pub mod isolation;
 mod script;
-pub use script::write_script;
+pub use script::{read_complete_lines, write_script};
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};

@@ -71,7 +71,7 @@ fn fake(env: &Env, name: &str, then: &str) {
 
 /// What the fakes noted.
 fn called(env: &Env) -> String {
-    std::fs::read_to_string(env.root.join("called")).unwrap_or_default()
+    common::read_complete_lines(env.root.join("called")).unwrap_or_default()
 }
 
 /// `program` in the test's directories, with the fakes first in its `PATH`: an example never
@@ -382,6 +382,7 @@ fn the_repository_example_prepares_a_worktree() {
 /// with a fake curl, in a session whose pane a hook says is blocked.
 #[test]
 fn the_scripts_are_shell_and_one_tells_of_a_blocked_agent() {
+    use std::io::Write;
     use std::os::unix::fs::PermissionsExt;
     let scripts = examples().join("scripts");
     for file in files(&scripts) {
@@ -404,14 +405,17 @@ fn the_scripts_are_shell_and_one_tells_of_a_blocked_agent() {
     // The script tells of what happens once it listens: the agent stops and asks in turn until
     // it is told of one of the two.
     let mut asks = false;
+    let mut told = String::new();
     wait_until(Duration::from_secs(20), "the script never called curl", || {
         asks = !asks;
         let event = if asks { r#""Notification","notification_type":"permission_prompt""# } else { r#""Stop""# };
         claude_hook(&env, "api", &format!(r#"{{"hook_event_name":{event},"session_id":"s-1"}}"#));
         std::thread::sleep(Duration::from_millis(100));
-        !called(&env).is_empty()
+        told = called(&env);
+        !told.is_empty()
     });
-    let told = called(&env);
+    // A queued notification can begin another line after the successful read.
+    std::fs::OpenOptions::new().append(true).open(env.root.join("called")).unwrap().write_all(b"curl ").unwrap();
     let told = told.lines().next().unwrap();
     assert!(told.contains("Title: claude ") && told.contains("-d api in w https://ntfy.sh/kraal-test"), "{told}");
     wait_until(Duration::from_secs(5), "no cursor kept", || {

@@ -6,7 +6,7 @@ pub mod isolation;
 
 #[path = "../tests/common/script.rs"]
 mod script;
-pub use script::write_script;
+pub use script::{read_complete_lines, write_script};
 
 use std::path::PathBuf;
 use std::process::Command;

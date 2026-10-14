@@ -139,7 +139,16 @@ fn workspace_duplicate_is_saved_closed_and_starts_commands_only_on_enter() {
 [ "$2" = status ] && exit 0
 mkdir -p "$CLAUDE_CONFIG_DIR/projects/work"
 printf '{"message":1}\n' >> "$CLAUDE_CONFIG_DIR/projects/work/$2.jsonl"
-printf '%s\n' "$*" >> "$CLAUDE_CONFIG_DIR/launches"
+if [ -e "$CLAUDE_CONFIG_DIR/split-launch" ]; then
+    printf '%s' "$1" >> "$CLAUDE_CONFIG_DIR/launches"
+    touch "$CLAUDE_CONFIG_DIR/partial-launch"
+    while [ ! -e "$CLAUDE_CONFIG_DIR/finish-launch" ]; do sleep 0.01; done
+    shift
+    printf ' %s' "$@" >> "$CLAUDE_CONFIG_DIR/launches"
+    printf '\n' >> "$CLAUDE_CONFIG_DIR/launches"
+else
+    printf '%s\n' "$*" >> "$CLAUDE_CONFIG_DIR/launches"
+fi
 echo original-agent-output
 while IFS= read -r line; do :; done
 "#,
@@ -246,11 +255,22 @@ layout {{
         client.send(format!("\x1b]7701;show;{}\x07", agent["id"]).as_bytes());
         client.wait_for_row("--session-id");
         client.wait_for_row("enter run");
+        std::fs::write(account.join("split-launch"), "").unwrap();
         client.send(b"\r");
-        wait_until(PATIENCE, "the copied agent did not start", || {
-            std::fs::read_to_string(account.join("launches")).unwrap().lines().count() == launches.lines().count() + 1
+        wait_until(PATIENCE, "the copied agent did not begin writing its arguments", || {
+            account.join("partial-launch").exists()
         });
-        let all_launches = std::fs::read_to_string(account.join("launches")).unwrap();
+        let mut all_launches = String::new();
+        wait_until(PATIENCE, "the copied agent did not start", || {
+            all_launches = crate::common::read_complete_lines(account.join("launches")).unwrap_or_default();
+            // The first read sees an unterminated argument, before the stand-in may finish it.
+            if !account.join("finish-launch").exists() {
+                assert!(all_launches.is_empty(), "an unterminated launch is not ready");
+                std::fs::write(account.join("finish-launch"), "").unwrap();
+            }
+            all_launches.lines().count() == launches.lines().count() + 1
+        });
+        std::fs::remove_file(account.join("split-launch")).unwrap();
         let copied_launch = all_launches.lines().last().unwrap();
         let copied_session = copied_launch.split_whitespace().nth(1).unwrap();
         assert_eq!(copied_launch, format!("--session-id {copied_session} --model opus"));
@@ -470,7 +490,9 @@ fn deleting_a_scanned_source_never_runs_it_and_restores_its_saved_contents() {
     assert_eq!(recipe["open"], false);
     assert_eq!(recipe["panes"], 1);
     env.run(&["open", "recipe"]);
-    wait_until(PATIENCE, "the explicitly opened recipe did not run", || marker.exists());
+    wait_until(PATIENCE, "the explicitly opened recipe did not run", || {
+        crate::common::read_complete_lines(&marker).is_some()
+    });
 }
 
 #[test]
@@ -795,7 +817,7 @@ fn closing_a_workspace_lists_its_programs_and_background_jobs_from_both_entries(
     let job_pid = env.root.join("job.pid");
     env.run(&["send", "-p", "shell", "--enter", &format!("sleep 4257 & echo $! > '{}'", job_pid.display())]);
     wait_until(Duration::from_secs(10), "the background job never started", || {
-        let pid = std::fs::read_to_string(&job_pid).unwrap_or_default();
+        let Some(pid) = crate::common::read_complete_lines(&job_pid) else { return false };
         !pid.trim().is_empty()
             && Command::new("ps")
                 .args(["-p", pid.trim(), "-o", "comm="])

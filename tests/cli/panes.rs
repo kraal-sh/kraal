@@ -439,7 +439,8 @@ fn a_timed_out_target_is_stopped_but_not_what_replaced_it() {
         // A zombie has no command line: it is gone for what matters here.
         std::fs::read(format!("/proc/{pid}/cmdline")).is_ok_and(|c| !c.is_empty())
     };
-    let read_pid = |path: &Path| std::fs::read_to_string(path).ok().and_then(|t| t.trim().parse::<libc::pid_t>().ok());
+    let read_pid =
+        |path: &Path| crate::common::read_complete_lines(path).and_then(|t| t.trim().parse::<libc::pid_t>().ok());
     let wait_until = |what: &str, mut ok: Box<dyn FnMut() -> bool + '_>| {
         let start = Instant::now();
         while !ok() {
@@ -515,7 +516,8 @@ fn a_timed_out_target_is_stopped_but_not_what_replaced_it() {
 #[test]
 fn a_timed_out_target_is_stopped_whatever_happens_to_kraal_meanwhile() {
     let alive = |pid: libc::pid_t| std::fs::read(format!("/proc/{pid}/cmdline")).is_ok_and(|c| !c.is_empty());
-    let read_pid = |path: &Path| std::fs::read_to_string(path).ok().and_then(|t| t.trim().parse::<libc::pid_t>().ok());
+    let read_pid =
+        |path: &Path| crate::common::read_complete_lines(path).and_then(|t| t.trim().parse::<libc::pid_t>().ok());
     let wait_until = |what: &str, limit: u64, mut ok: Box<dyn FnMut() -> bool + '_>| {
         let start = Instant::now();
         while !ok() {

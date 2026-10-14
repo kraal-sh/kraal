@@ -486,7 +486,7 @@ mod tests {
             run(&mut cmd, &vec![b'x'; 1 << 20], false, &worker_stop, crate::testing::PATIENCE)
         });
         let start = Instant::now();
-        while !std::fs::read_to_string(&ready).is_ok_and(|s| !s.trim().is_empty()) {
+        while crate::testing::read_complete_lines(&ready).is_none() {
             assert!(start.elapsed() < crate::testing::PATIENCE, "helper never started");
             std::thread::sleep(Duration::from_millis(5));
         }

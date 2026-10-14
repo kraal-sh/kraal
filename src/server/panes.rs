@@ -830,7 +830,7 @@ mod tests {
                 std::thread::sleep(Duration::from_millis(10));
             }
         };
-        wait(&|| ready.exists());
+        wait(&|| crate::testing::read_complete_lines(&ready).is_some());
         let parent = server.panes[&pane].pid().unwrap();
         let stop = ProgramStop::new(&server.panes[&pane]).unwrap();
         let mut other = stop.sessions[0].clone();
@@ -840,7 +840,7 @@ mod tests {
         let prepared = serde_json::to_vec(&intent).unwrap();
         assert!(!child_file.exists(), "the survivor is not in the preparation's process inventory");
         stop.signal(libc::SIGHUP);
-        let read_child = || std::fs::read_to_string(&child_file).ok().and_then(|s| s.trim().parse::<u32>().ok());
+        let read_child = || crate::testing::read_complete_lines(&child_file).and_then(|s| s.trim().parse::<u32>().ok());
         wait(&|| read_child().is_some() && !crate::process::running(parent as libc::pid_t));
         let child = read_child().unwrap();
         let started = crate::process::start_time(child).unwrap();

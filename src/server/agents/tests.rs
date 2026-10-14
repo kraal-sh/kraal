@@ -1128,7 +1128,7 @@ while IFS= read -r line; do :; done
     let mut observed = None;
     t.until("the shell's foreground agent is observed", |t| {
         observed = t.server.observed_agent(1).ok().flatten();
-        t.dir.join("child").exists() && observed.is_some()
+        crate::testing::read_complete_lines(t.dir.join("child")).is_some() && observed.is_some()
     });
     let observed = observed.unwrap();
     assert_eq!(observed.cwd, project);
@@ -1143,7 +1143,7 @@ while IFS= read -r line; do :; done
     t.server.switches.get_mut(&1).unwrap().stopping.as_mut().unwrap().since = Instant::now() + crate::testing::PATIENCE;
     t.until("the shell exits while its agent survives", |t| t.server.panes[&1].exit_code.is_some());
     assert!(crate::process::still_running(observed.pid, observed.started));
-    let child: u32 = std::fs::read_to_string(t.dir.join("child")).unwrap().trim().parse().unwrap();
+    let child: u32 = crate::testing::read_complete_lines(t.dir.join("child")).unwrap().trim().parse().unwrap();
     let child_started = crate::process::start_time(child).unwrap();
     let copied = t.dir.join("to/projects/work/session.jsonl");
     t.server.check_switches();
@@ -1162,10 +1162,13 @@ while IFS= read -r line; do :; done
     std::fs::write(t.dir.join("release-child"), "").unwrap();
     t.until("the child finishes writing", |_| !crate::process::still_running(child, child_started));
     t.server.check_switches();
-    t.until("the replacement runs", |t| t.dir.join("replacement-cwd").exists());
+    t.until("the replacement runs", |t| crate::testing::read_complete_lines(t.dir.join("replacement-cwd")).is_some());
     assert_eq!(std::fs::read_to_string(copied).unwrap(), "{\"message\":1}\n{\"message\":2}\n");
     assert_eq!(t.server.panes[&1].spec.cwd, Some(project.clone()));
-    assert_eq!(std::fs::read_to_string(t.dir.join("replacement-cwd")).unwrap().trim(), project.to_str().unwrap());
+    assert_eq!(
+        crate::testing::read_complete_lines(t.dir.join("replacement-cwd")).unwrap().trim(),
+        project.to_str().unwrap()
+    );
     // Recovery uses the same verified directory, even though the original pane was a shell.
     std::fs::remove_file(t.dir.join("release-agent")).unwrap();
     std::fs::remove_file(t.dir.join("release-child")).unwrap();
@@ -1191,7 +1194,7 @@ fn silent_replacement_and_recovery_that_ignore_hangup_are_stopped() {
         ..t.server.panes[&1].spec.clone()
     };
     t.spawn(original.clone());
-    t.until("the source starts", |t| t.dir.join("from/started").exists());
+    t.until("the source starts", |t| crate::testing::read_complete_lines(t.dir.join("from/started")).is_some());
     t.server.panes[&1].process_hold().unwrap().signal(libc::SIGKILL);
     t.until("the source stops", |t| t.server.panes[&1].exit_code.is_some());
     std::fs::remove_file(t.dir.join("from/started")).unwrap();
@@ -1204,7 +1207,9 @@ fn silent_replacement_and_recovery_that_ignore_hangup_are_stopped() {
         ("to", SwitchStage::Starting, SwitchStage::Recovering),
         ("from", SwitchStage::Restoring, SwitchStage::RecoveryStopping),
     ] {
-        t.until("the silent agent starts", |t| t.dir.join(home).join("started").exists());
+        t.until("the silent agent starts", |t| {
+            crate::testing::read_complete_lines(t.dir.join(home).join("started")).is_some()
+        });
         assert_eq!(t.server.switches[&1].stage, starting);
         let pid = t.server.panes[&1].pid().unwrap();
         let started = crate::process::start_time(pid).unwrap();
@@ -1287,7 +1292,7 @@ fn enter_after_a_synchronous_recovery_failure_resumes_the_source_conversation() 
         switch.stage = SwitchStage::Starting;
         t.server.start_switch_spec(1, destination).unwrap();
         assert_eq!(t.server.panes[&1].agent.session_id.as_deref(), Some("destination"));
-        t.until("the destination runs", |t| t.dir.join("to/args").exists());
+        t.until("the destination runs", |t| crate::testing::read_complete_lines(t.dir.join("to/args")).is_some());
         std::fs::remove_file(&program).unwrap();
         t.server.panes.get_mut(&1).unwrap().write_input(b"exit\n".to_vec());
         t.until("recovery fails synchronously", |t| t.server.switches.is_empty());
@@ -1306,8 +1311,12 @@ fn enter_after_a_synchronous_recovery_failure_resumes_the_source_conversation() 
         tab.root = Some(crate::layout::Node::Leaf(1));
         tab.set_focus(1);
         t.server.client_input(client, b"\r");
-        t.until("Enter resumes the source", |t| t.dir.join("from/args").exists());
-        assert_eq!(std::fs::read_to_string(t.dir.join("from/args")).unwrap().trim(), "resume source");
+        let mut args = None;
+        t.until("Enter resumes the source", |t| {
+            args = crate::testing::read_complete_lines(t.dir.join("from/args"));
+            args.is_some()
+        });
+        assert_eq!(args.unwrap().trim(), "resume source");
         assert_eq!(t.server.panes[&1].spec.account_id, Some(from.id));
     }
 }

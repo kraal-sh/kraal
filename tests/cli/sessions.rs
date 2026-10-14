@@ -37,7 +37,7 @@ fn supervise_ends_what_its_program_left_however_it_left() {
     let mut supervisor =
         quiet(env.cmd(&["supervise", "sh", "-c", &format!("{helper}; exec sleep 600")])).spawn().unwrap();
     let start = Instant::now();
-    while std::fs::read_to_string(&pidfile).map_or(true, |p| p.trim().is_empty()) {
+    while common::read_complete_lines(&pidfile).is_none() {
         assert!(start.elapsed() < Duration::from_secs(5), "the helper never started");
         std::thread::sleep(Duration::from_millis(20));
     }
@@ -1778,9 +1778,9 @@ fn a_restart_from_the_last_pane_outlives_it() {
     env.run(&["send", "-p", "only", "--enter", &format!("echo $$ > '{}'", pidfile.display())]);
     let mut pane = PathBuf::new();
     wait_until(Duration::from_secs(10), "the shell never said its pid", || {
-        let pid = std::fs::read_to_string(&pidfile).unwrap_or_default();
+        let Some(pid) = crate::common::read_complete_lines(&pidfile) else { return false };
         pane = PathBuf::from(format!("/proc/{}", pid.trim()));
-        pid.ends_with('\n')
+        true
     });
     let cmdline = |process: &Path| std::fs::read(process.join("cmdline")).unwrap_or_default();
     let kraal = env!("CARGO_BIN_EXE_kraal");

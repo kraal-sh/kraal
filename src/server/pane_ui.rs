@@ -953,8 +953,8 @@ mod tests {
         p.spec.command =
             vec!["/bin/sh".into(), "-c".into(), format!("{} & wait", crate::shell::quote(child.to_str().unwrap()))];
         p.respawn(&t.server.env, &t.server.tx).unwrap();
-        t.until(|_| child_file.exists());
-        let child_pid: u32 = std::fs::read_to_string(&child_file).unwrap().trim().parse().unwrap();
+        t.until(|_| crate::testing::read_complete_lines(&child_file).is_some());
+        let child_pid: u32 = crate::testing::read_complete_lines(&child_file).unwrap().trim().parse().unwrap();
         let child_started = crate::process::start_time(child_pid).unwrap();
         let marker = t.dir.join("replacement");
         let mut draft = t.form();
@@ -966,7 +966,7 @@ mod tests {
         assert!(crate::process::still_running(child_pid, child_started));
         t.server.pane_edits.get_mut(&t.pane).unwrap().stopping.as_mut().unwrap().since =
             Instant::now() - Duration::from_secs(3);
-        t.until(|t| t.server.pane_edits.is_empty() && marker.exists());
+        t.until(|t| t.server.pane_edits.is_empty() && crate::testing::read_complete_lines(&marker).is_some());
         assert!(!crate::process::still_running(child_pid, child_started));
     }
 
