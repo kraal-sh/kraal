@@ -42,9 +42,9 @@ A session's server keeps the version it started with. After installing, `kraal u
 sessions still on an older kraal, with the programs a restart would stop in them, and offers to
 [restart](workspaces.md#persistence) them: no by default when programs would stop, and without a
 terminal to ask on; `--restart` or `--no-restart` answer beforehand. Later, `kraal ls` shows the
-version each session runs, kraal says so when you detach from a session on an older kraal (and as
-soon as you attach, in the top bar, when that session runs 0.3.0 or later), and `kraal restart`
-(or `ctrl+b W r`) restarts it.
+version each session runs. A different protocol version refuses attachment with a message
+naming both versions. Run `kraal restart` to bring an older local server onto the installed
+binary. See [Compatibility](compatibility.md#clients-and-servers).
 
 ## With Cargo
 
@@ -70,4 +70,6 @@ distribution.
 ## On a server
 
 `kraal remote-install <server>` copies the running binary to `~/.local/bin` on a server of the
-same OS and CPU, for [remote sessions](servers.md#remote-sessions).
+same OS and CPU, for [remote sessions](servers.md#remote-sessions). If the selected session
+(default `main`, or `-s NAME`) is running, it then uses the installed binary to restart it,
+showing what stops and asking for confirmation. Layout and scrollback are kept.

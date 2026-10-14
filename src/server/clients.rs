@@ -107,23 +107,19 @@ impl Server {
             }
         };
         match msg {
-            ClientMsg::Attach { version, cols, rows, workspace, remote, pane, installed, features } => {
+            ClientMsg::Attach { version, cols, rows, workspace, remote, pane, installed } => {
+                if version != protocol::PROTOCOL_VERSION {
+                    self.send_msg(id, &ServerMsg::exit(self.version_mismatch(version)));
+                    self.clients.remove(&id);
+                    return;
+                }
                 if let Some(c) = self.clients.get_mut(&id) {
                     c.attachments.pending = None;
                     c.attachments.blocked = None;
                     c.remote = remote;
-                    c.attachments.negotiated = features.iter().any(|f| f == protocol::ATTACHMENTS.name);
                     c.attachments.focus = None;
-                    c.attachments.agent_clipboard = features.iter().any(|f| f == protocol::AGENT_CLIPBOARD.name);
-                    c.attachments.images = features.iter().any(|f| f == protocol::CLIPBOARD_IMAGES.name);
-                    c.attachments.recognition = features.iter().any(|f| f == protocol::PASTED_PATHS.name);
-                    c.clipboard.negotiated = features.iter().any(|f| f == protocol::CLIPBOARD.name);
                 }
                 let (cols, rows) = clamp_size(cols, rows);
-                if version != protocol::PROTOCOL_VERSION {
-                    self.send_msg(id, &ServerMsg::exit(self.version_mismatch(version)));
-                    return;
-                }
                 self.attach(id, cols, rows, workspace);
                 if let Some(installed) = installed {
                     self.version_notice(id, &installed);
@@ -162,7 +158,12 @@ impl Server {
             | ClientMsg::AttachmentLocal { .. }) => self.attachment_message(id, msg),
             ClientMsg::Detach => self.detach(id, "detached"),
             ClientMsg::Request { version, request, .. } => {
-                let result = if version != protocol::PROTOCOL_VERSION {
+                let result = if version != protocol::PROTOCOL_VERSION
+                    && !(version == protocol::upgrade_protocol()
+                        && matches!(
+                            request,
+                            crate::protocol::Request::Ping | crate::protocol::Request::KillServer { .. }
+                        )) {
                     Some(Err(self.version_mismatch(version)))
                 } else {
                     self.request(id, request)
@@ -186,14 +187,7 @@ impl Server {
     /// What a client of another protocol generation is told. `kraal restart` and `kraal kill`
     /// stop a server of any version.
     fn version_mismatch(&self, version: u32) -> String {
-        let (session, release) = (&self.session, protocol::KRAAL_VERSION);
-        if version > protocol::PROTOCOL_VERSION {
-            format!(
-                "session {session} runs kraal {release}, too old for this kraal: `kraal -s {session} restart` restarts it on this one (its layout is kept)"
-            )
-        } else {
-            format!("session {session} runs kraal {release}, too new for this kraal: update this one (`kraal update`)")
-        }
+        protocol::version_mismatch(version, protocol::PROTOCOL_VERSION, protocol::KRAAL_VERSION, &self.session, None)
     }
 
     pub(super) fn attach(&mut self, id: ClientId, cols: u16, rows: u16, workspace: Option<String>) {
@@ -235,8 +229,10 @@ impl Server {
         let mode = self.workspaces.iter().all(|w| w.closed()).then(|| Mode::Picker(self.workspace_picker(ws)));
         let welcome = !crate::paths::state_dir().join("welcomed").exists();
         // Before anything is drawn: what this server is.
-        let features = Some(protocol::feature_names());
-        self.send_msg(id, &ServerMsg::Attached { version: protocol::KRAAL_VERSION.into(), features });
+        self.send_msg(
+            id,
+            &ServerMsg::Attached { version: protocol::KRAAL_VERSION.into(), protocol: protocol::PROTOCOL_VERSION },
+        );
         if let Some(c) = self.clients.get_mut(&id) {
             c.attached = true;
             c.workspace = ws;
@@ -463,6 +459,62 @@ mod tests {
         };
         assert_eq!(set, 0);
         (server_end, client_end)
+    }
+
+    fn outgoing(server: &mut Server, id: ClientId) -> crossbeam_channel::Receiver<Vec<u8>> {
+        let (send, receive) = crossbeam_channel::bounded(4);
+        let out = &mut server.clients.get_mut(&id).unwrap().out;
+        out.queue = send;
+        // Keep handler tests on the queue, independent of the socket writer's scheduling.
+        out.queued.store(1, Ordering::Release);
+        receive
+    }
+
+    #[test]
+    fn mismatched_attach_and_mutations_leave_the_session_unchanged() {
+        use super::super::tests::{client, server};
+        let (tx, _rx) = super::super::queue::channel(32);
+        let mut server = server(tx);
+        for version in [2, protocol::PROTOCOL_VERSION + 1] {
+            for message in [
+                serde_json::json!({"type":"attach", "version":version, "cols":80, "rows":24, "workspace":"unwanted"}),
+                serde_json::json!({"type":"request", "version":version, "request":{"cmd":"create_workspace", "name":"unwanted", "cwd":"/tmp"}}),
+            ] {
+                let (id, _peer) = client(&mut server);
+                let receive = outgoing(&mut server, id);
+                server.clients.get_mut(&id).unwrap().attached = false;
+                let before = server.workspaces.len();
+                server.client_frame(id, protocol::JSON, serde_json::to_vec(&message).unwrap());
+                let frame = receive.recv_timeout(Duration::from_secs(2)).unwrap();
+                let (kind, payload) = protocol::read_frame(&mut frame.as_slice()).unwrap().unwrap();
+                assert_eq!(kind, protocol::JSON);
+                let reason = match serde_json::from_slice(&payload).unwrap() {
+                    ServerMsg::Exit { reason, .. } | ServerMsg::Response { result: Err(reason) } => reason,
+                    other => panic!("{other:?}"),
+                };
+                assert_eq!(reason, server.version_mismatch(version));
+                assert!(!server.clients.contains_key(&id));
+                assert_eq!(server.workspaces.len(), before);
+            }
+        }
+    }
+
+    #[test]
+    fn upgrade_ping_uses_the_released_envelope_and_reports_the_current_protocol() {
+        use super::super::tests::{client, server};
+        let (tx, _rx) = super::super::queue::channel(32);
+        let mut server = server(tx);
+        let (id, _peer) = client(&mut server);
+        let receive = outgoing(&mut server, id);
+        server.client_frame(id, protocol::JSON, br#"{"type":"request","version":2,"request":{"cmd":"ping"}}"#.to_vec());
+        let frame = receive.recv_timeout(Duration::from_secs(2)).unwrap();
+        let (_, payload) = protocol::read_frame(&mut frame.as_slice()).unwrap().unwrap();
+        assert!(matches!(
+            serde_json::from_slice(&payload).unwrap(),
+            ServerMsg::Response {
+                result: Ok(crate::protocol::Response::Pong { protocol: protocol::PROTOCOL_VERSION, .. })
+            }
+        ));
     }
 
     #[test]

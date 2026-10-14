@@ -388,16 +388,33 @@ fn exec_agent(
     run_with(&launch, true).map(|_| ())
 }
 
+/// Panes that protect worktrees from removal. Only an absent server means there are none.
+fn worktree_panes(s: &Session) -> Result<Vec<PaneInfo>> {
+    let socket = s.socket();
+    if socket.starts_with(paths::runtime_dir()) {
+        paths::private_runtime_dir().context("checking the runtime directory")?;
+    }
+    let stream = match std::os::unix::net::UnixStream::connect(&socket) {
+        Ok(stream) => stream,
+        Err(e) if matches!(e.kind(), std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused) => {
+            return Ok(Vec::new());
+        }
+        Err(e) => return Err(e).context("checking panes before removing worktrees"),
+    };
+    match crate::client::request_connected(&socket, stream, Request::ListPanes)? {
+        Response::Panes(panes) => Ok(panes),
+        _ => bail!("unexpected answer when checking panes before removing worktrees"),
+    }
+}
+
 /// `kraal wt`: git worktrees for agents.
 pub(super) fn worktrees(s: &Session, action: WtCmd) -> Result<()> {
     let cwd = std::env::current_dir()?;
     match action {
         WtCmd::New { name, agent, base, yes, no_setup } => {
             use std::io::{BufRead, IsTerminal, Write};
-            if std::env::var_os("KRAAL_SOCKET").is_some()
-                && agent.as_deref().and_then(crate::agent_registry::find).is_some_and(|a| a.accounts.is_none())
-            {
-                crate::client::require_feature(&s.socket(), crate::protocol::NATIVE_AGENTS)?;
+            if std::env::var_os("KRAAL_SOCKET").is_some() && agent.is_some() {
+                crate::client::require_protocol(&s.socket())?;
             }
             let cfg = crate::config::Config::load()?;
             let user = worktree_setup::Setup::of_user(&cfg.worktrees);
@@ -476,10 +493,7 @@ pub(super) fn worktrees(s: &Session, action: WtCmd) -> Result<()> {
         }
         WtCmd::Prune { dry_run, discard_ignored } => {
             // Panes of the running session that work in a worktree keep it: close them first.
-            let panes = match s.request(Request::ListPanes) {
-                Ok(Response::Panes(panes)) => panes,
-                _ => Vec::new(),
-            };
+            let panes = worktree_panes(s)?;
             let discard = if discard_ignored { git::Discard::Ignored } else { git::Discard::Nothing };
             let mut failed = 0;
             for (w, state) in git::worktree_states(&cwd)? {
@@ -530,7 +544,8 @@ pub(super) fn worktrees(s: &Session, action: WtCmd) -> Result<()> {
                 .find(|w| w.name() == name)
                 .with_context(|| format!("no kraal worktree named {name:?} here"))?;
             // Panes of the running session that work inside it go first, or stop us.
-            if let Ok(Response::Panes(panes)) = s.request(Request::ListPanes) {
+            let panes = worktree_panes(s)?;
+            if !panes.is_empty() {
                 let inside: Vec<&PaneInfo> =
                     panes.iter().filter(|p| p.cwd.as_ref().is_some_and(|c| git::is_within(c, &w.path))).collect();
                 if !inside.is_empty() && !force {
@@ -603,10 +618,91 @@ mod tests {
     use super::*;
 
     #[test]
-    fn native_launches_check_both_older_servers_before_worktree_preparation() {
+    fn worktree_removal_refuses_old_servers_and_allows_absent_servers() {
         if !crate::testing::in_own_process(
-            "cli::agents::tests::native_launches_check_both_older_servers_before_worktree_preparation",
+            "cli::agents::tests::worktree_removal_refuses_old_servers_and_allows_absent_servers",
         ) {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("kraal-wt-removal-{}", std::process::id()));
+        let repo = dir.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        for args in [vec!["init", "-q", "-b", "main"], vec!["commit", "-q", "--allow-empty", "-m", "initial"]] {
+            let out = std::process::Command::new("git")
+                .current_dir(&repo)
+                .args(["-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false"])
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        }
+        let previous = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&repo).unwrap();
+        let socket = dir.join("server.sock");
+        // The test runs alone, before starting its server thread.
+        unsafe { std::env::set_var("KRAAL_SOCKET", &socket) };
+        let session = Session { name: "old".into(), explicit: None };
+        for prune in [true, false] {
+            let w = git::add_worktree(&repo, "fix", None).unwrap();
+            let remove = || {
+                worktrees(
+                    &session,
+                    if prune {
+                        WtCmd::Prune { dry_run: false, discard_ignored: false }
+                    } else {
+                        WtCmd::Rm { name: "fix".into(), force: false, discard_ignored: false }
+                    },
+                )
+            };
+            for version in ["0.2.0", "0.3.0"] {
+                let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+                let server = std::thread::spawn(move || {
+                    for expected in ["list_panes", "ping"] {
+                        let (mut stream, _) = listener.accept().unwrap();
+                        let (_, payload) = crate::protocol::read_frame(&mut stream).unwrap().unwrap();
+                        let msg: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+                        assert_eq!(msg["request"]["cmd"], expected);
+                        let result = if expected == "ping" {
+                            serde_json::json!({"Ok": {"kind": "pong", "data": {
+                                "pid": 1, "session": "old", "version": version
+                            }}})
+                        } else {
+                            serde_json::json!({"Err": "bad message: incompatible protocol"})
+                        };
+                        crate::protocol::write_json(
+                            &mut stream,
+                            &serde_json::json!({"type": "response", "result": result}),
+                        )
+                        .unwrap();
+                    }
+                });
+                let result = remove();
+                server.join().unwrap();
+                assert_eq!(
+                    result.unwrap_err().to_string(),
+                    crate::protocol::version_mismatch(crate::protocol::PROTOCOL_VERSION, 2, version, "old", None)
+                );
+                assert!(w.path.is_dir(), "a running pane's worktree must survive");
+                assert_eq!(git::list_worktrees(&repo).unwrap().len(), 1);
+                std::fs::remove_file(&socket).unwrap();
+            }
+            // Both a missing socket and one left by a stopped server allow cleanup.
+            if !prune {
+                drop(std::os::unix::net::UnixListener::bind(&socket).unwrap());
+            }
+            remove().unwrap();
+            assert!(!w.path.exists());
+            assert!(git::list_worktrees(&repo).unwrap().is_empty());
+        }
+        std::env::set_current_dir(previous).unwrap();
+        unsafe { std::env::remove_var("KRAAL_SOCKET") };
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn worktrees_refuse_mismatched_servers_before_preparation() {
+        if !crate::testing::in_own_process("cli::agents::tests::worktrees_refuse_mismatched_servers_before_preparation")
+        {
             return;
         }
         let dir = std::env::temp_dir().join(format!("kraal-native-compat-{}", std::process::id()));
@@ -614,8 +710,8 @@ mod tests {
         let previous = std::env::current_dir().unwrap();
         std::env::set_current_dir(&dir).unwrap();
         for version in ["0.2.0", "0.3.0"] {
-            for worktree in [false, true] {
-                let socket = dir.join(format!("{version}-{worktree}.sock"));
+            for agent in ["claude", "gemini"] {
+                let socket = dir.join(format!("{version}-{agent}.sock"));
                 let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
                 // This test runs alone in its own process, before starting the server thread.
                 unsafe { std::env::set_var("KRAAL_SOCKET", &socket) };
@@ -641,27 +737,20 @@ mod tests {
                     cmd.to_string()
                 });
                 let session = Session { name: "old".into(), explicit: None };
-                let result = if worktree {
-                    worktrees(
-                        &session,
-                        WtCmd::New {
-                            name: "fix".into(),
-                            agent: Some("gemini".into()),
-                            base: None,
-                            yes: true,
-                            no_setup: false,
-                        },
-                    )
-                } else {
-                    agent(&session, "gemini".into(), None, Placement::Auto, false, Vec::new())
-                };
+                let result = worktrees(
+                    &session,
+                    WtCmd::New {
+                        name: "fix".into(),
+                        agent: Some(agent.into()),
+                        base: None,
+                        yes: true,
+                        no_setup: false,
+                    },
+                );
                 let error = result.unwrap_err().to_string();
                 assert_eq!(
                     error,
-                    format!(
-                        "session old runs kraal {version}, which cannot start agents with native account management: \
-                     `kraal -s old restart` updates it (its layout and scrollback are kept)"
-                    )
+                    crate::protocol::version_mismatch(crate::protocol::PROTOCOL_VERSION, 2, version, "old", None)
                 );
                 assert_eq!(server.join().unwrap(), "ping", "no launch request reaches an older server");
                 std::fs::remove_file(&socket).unwrap();

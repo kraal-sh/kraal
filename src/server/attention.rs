@@ -444,7 +444,10 @@ mod tests {
             let (id, peer) = client(&mut server);
             server.clients.get_mut(&id).unwrap().remote = true;
             server.open_for(id, url);
-            assert_eq!(server.clients[&id].toast.as_ref().unwrap().0, "copy sent to terminal");
+            assert!(server.clients[&id].toast.is_none());
+            let (copy, _, _) = server.clients[&id].clipboard.pending.unwrap();
+            server.clipboard_result(id, copy, crate::protocol::ClipboardOutcome::Terminal, false);
+            assert_eq!(server.clients[&id].toast.as_ref().unwrap().0, "copy sent to terminal via OSC 52");
             assert!(!server.buffers.list().iter().any(|buffer| buffer.text == url));
             drop(peer);
             // The writer learns the peer is gone asynchronously on macOS.
@@ -452,11 +455,12 @@ mod tests {
             loop {
                 std::thread::sleep(crate::clipboard::INTERVAL);
                 server.open_for(id, url);
+                server.clients.get_mut(&id).unwrap().clipboard.pending = None;
                 let message = &server.clients[&id].toast.as_ref().unwrap().0;
                 if message == "copy not sent: try again" {
                     break;
                 }
-                assert_eq!(message, "copy sent to terminal");
+                assert_eq!(message, "copy sent to terminal via OSC 52");
                 assert!(start.elapsed() < crate::testing::PATIENCE, "the closed client still accepts copies");
                 std::thread::sleep(Duration::from_millis(10));
             }

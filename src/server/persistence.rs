@@ -610,10 +610,13 @@ pub(super) mod tests {
             let error = "the layout could not be saved: Disk full";
             let saved = writer(&mut server, vec![Err(error.into()), Ok(())]);
             server.copy_to_client(client, "text");
+            assert!(server.clients[&client].toast.is_none());
+            let (copy, _, _) = server.clients[&client].clipboard.pending.unwrap();
+            server.clipboard_result(client, copy, crate::protocol::ClipboardOutcome::Terminal, false);
             server.client_input(client, b"\x02q");
             assert!(matches!(server.clients[&client].mode, Mode::Confirm(_)));
             let (text, until, _) = server.clients[&client].toast.as_ref().unwrap();
-            assert_eq!(text, "copy sent to terminal");
+            assert_eq!(text, "copy sent to terminal via OSC 52");
             assert!(*until > Instant::now());
             server.client_input(client, b"y");
             assert!(!server.quitting);

@@ -68,7 +68,11 @@ pub(super) fn after_update(exe: &Path, installed: &str, choice: Option<bool>) ->
     let older: Vec<Running> = super::session::live_sockets()
         .into_iter()
         .map(|(name, socket)| Running::at(name, socket))
-        .filter(|r| r.server.as_ref().is_none_or(|s| protocol::newer(installed, &s.version)))
+        .filter(|r| {
+            r.server
+                .as_ref()
+                .is_none_or(|s| s.protocol < protocol::PROTOCOL_VERSION || protocol::newer(installed, &s.version))
+        })
         .collect();
     if older.is_empty() {
         return Ok(());
@@ -139,7 +143,7 @@ impl Running {
     fn stops(&self) -> Vec<String> {
         let unknown = || vec!["whatever runs in its panes (its server does not say)".to_string()];
         let Some(server) = &self.server else { return unknown() };
-        let listed = client::request_within(&self.socket, Request::ListPanes, LIST_PANES_TIMEOUT);
+        let listed = client::upgrade_request_within(&self.socket, Request::ListPanes, LIST_PANES_TIMEOUT);
         let Ok(Response::Panes(panes)) = listed else { return unknown() };
         let running = in_panes(server.pid, &self.socket);
         let mut lines = Vec::new();

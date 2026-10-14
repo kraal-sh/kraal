@@ -104,7 +104,7 @@ fn run(cli: Cli) -> Result<()> {
         None => session::attach(&s.name, cli.workspace),
         Some(Cmd::Attach { workspace, host: None, .. }) => session::attach(&s.name, workspace),
         Some(Cmd::Attach { workspace, host: Some(host), pane }) => remote::attach(&s.name, &host, workspace, pane),
-        Some(Cmd::RemoteInstall { server }) => remote::install(&server),
+        Some(Cmd::RemoteInstall { server }) => remote::install(&s.name, &server),
         Some(Cmd::Update { check, to, force, restart, no_restart }) => {
             let restart = (restart || no_restart).then_some(restart);
             update::update(check, to, force, restart)
@@ -119,7 +119,6 @@ fn run(cli: Cli) -> Result<()> {
         Some(Cmd::Open { name }) => session::open(&s, name),
         Some(Cmd::Import { file, name, yes }) => session::import(&s, file, name, yes),
         Some(Cmd::Export { file, workspace, replace }) => session::export(&s, file, workspace, replace),
-        Some(Cmd::Save { name, workspace }) => session::save(&s, name, workspace),
         Some(Cmd::ImportZellij { from, force }) => session::import_zellij(&s, from, force),
         Some(Cmd::Panes { json }) => panes::list(&s, json, false),
         Some(Cmd::Agents { follow: true, .. }) => panes::follow_agents(&s),

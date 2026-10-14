@@ -66,11 +66,8 @@ limits allow it, the text remains in [Paste buffers](keys.md#paste-buffers), whe
 sends it again. With `buffers.limit = 0`, or when the byte budget is exhausted (including
 by named buffers), the copy may not be kept.
 
-Older clients receive only the legacy OSC 52 request and say **copy sent to terminal**.
-A current client attached to an older server also keeps that server's legacy path, without
-native copying or client size enforcement. `off` refuses such an attachment with restart
-guidance, since an old server cannot separate copies from display bytes. No session or
-workspace format changes are needed. See [Compatibility](compatibility.md#clients-and-servers).
+Client and server must use the same protocol version. Clipboard policy applies to every
+attachment. See [Compatibility](compatibility.md#clients-and-servers).
 
 ### What the terminal fallback must allow
 
@@ -378,7 +375,7 @@ the original text into the current pane. After a connection loss, inspect the re
 and the pane before retrying: finalized files are kept, and kraal never retries automatically.
 Directories, links and special files have an explicit refusal pointing to `kraal cp`.
 
-Without bracketed paste or with an older peer, text continues unchanged. Use **Attach files**
+Without bracketed paste, text continues unchanged. Use **Attach files**
 when the terminal cannot mark pastes. Empty pastes never read clipboard images.
 
 ### Transfer lifetime and limits

@@ -87,8 +87,11 @@ mod tests {
         pane.feed(b"\x1b]133;A\x07$ \x1b]133;B\x07echo hello\r\n\x1b]133;C\x07hello\r\n\x1b]133;D;0\x07");
         server.panes.insert(99, pane);
         server.copy_last_output(id, Some(99));
+        assert!(server.clients[&id].toast.is_none());
+        let (copy, _, _) = server.clients[&id].clipboard.pending.unwrap();
+        server.clipboard_result(id, copy, crate::protocol::ClipboardOutcome::Terminal, false);
         assert_eq!(server.buffers.get(None).unwrap().text, "hello");
-        assert_eq!(server.clients[&id].toast.as_ref().unwrap().0, "copy sent to terminal");
+        assert_eq!(server.clients[&id].toast.as_ref().unwrap().0, "copy sent to terminal via OSC 52");
     }
 
     #[test]

@@ -64,7 +64,7 @@ struct Dropped {
 #[derive(Default)]
 struct State {
     dropped: Option<Dropped>,
-    negotiated: bool,
+    connected: bool,
     focus: Option<(Option<crate::layout::PaneId>, bool)>,
     image_approved: bool,
     image_keys: super::clipboard_image::Keys,
@@ -101,8 +101,8 @@ impl Controller {
         Arc::new(Self { state: Mutex::new(State::default()), writer, remote: destination.is_some(), destination })
     }
 
-    pub fn negotiate(&self, enabled: bool) {
-        self.state.lock().unwrap().negotiated = enabled;
+    pub fn connected(&self) {
+        self.state.lock().unwrap().connected = true;
     }
 
     pub fn pending_keys(&self) -> bool {
@@ -119,10 +119,10 @@ impl Controller {
 
     fn input_with_probe(self: &Arc<Self>, bytes: &[u8], available: impl Fn() -> bool) -> bool {
         let mut state = self.state.lock().unwrap();
-        if !state.negotiated && state.dropped.is_some() {
+        if !state.connected && state.dropped.is_some() {
             return false;
         }
-        if !self.remote || !state.negotiated {
+        if !self.remote || !state.connected {
             drop(state);
             return self.keys(bytes);
         }
@@ -239,7 +239,7 @@ impl Controller {
     fn offer_clipboard(self: &Arc<Self>, raw: &[u8], available: &impl Fn() -> bool) -> bool {
         let state = self.state.lock().unwrap();
         let eligible = self.remote
-            && state.negotiated
+            && state.connected
             && state.focus.is_some_and(|(pane, agent)| pane.is_some() && agent)
             && state.prompt.is_none()
             && state.dropped.is_none()
@@ -257,7 +257,7 @@ impl Controller {
             || state.active.is_some()
             || state.uncertain.is_some()
             || state.focus != focus
-            || !state.negotiated
+            || !state.connected
         {
             return false;
         }
@@ -1143,7 +1143,7 @@ impl Controller {
 
     pub fn disconnect(&self) {
         let mut state = self.state.lock().unwrap();
-        state.negotiated = false;
+        state.connected = false;
         state.focus = None;
         state.image_keys = Default::default();
         state.splitter = Default::default();
@@ -1628,6 +1628,7 @@ mod tests {
     fn automatic_controller() -> (Arc<Controller>, Reader) {
         let target = super::super::Target::Remote {
             ssh: vec!["alice@preparing-test".into()],
+            host: "alice@preparing-test".into(),
             session: "main".into(),
             label: "box".into(),
             pane: None,
@@ -1663,7 +1664,7 @@ mod tests {
     }
 
     fn prepare_drop(client: &Arc<Controller>, peer: &mut Reader, original: &[u8]) -> String {
-        client.negotiate(true);
+        client.connected();
         client.input(&paste::bracket(original));
         assert!(matches!(read(peer), ClientMsg::PasteStart));
         let ClientMsg::AttachmentRequest { token, text, image: false, .. } = read(peer) else { panic!() };
@@ -1681,7 +1682,7 @@ mod tests {
     fn pending_keys_stay_before_pastes_and_pasted_control_v_never_probes() {
         for text in [b"".as_slice(), b"text\x16\x1b[118;5u"] {
             let (client, mut peer) = controller(true);
-            client.negotiate(true);
+            client.connected();
             client.message(ServerMsg::ClipboardFocus { pane: Some(7), agent: true });
             let bytes = [b"\x1b".as_slice(), &paste::bracket(text), b"after"].concat();
             client.input_with_probe(&bytes, || panic!("paste data cannot inspect the clipboard"));
@@ -1703,10 +1704,12 @@ mod tests {
     fn control_v_only_probes_remote_agent_panes_and_forwards_exact_keys_without_an_image() {
         for remote in [false, true] {
             for agent in [false, true] {
-                for negotiated in [false, true] {
+                for connected in [false, true] {
                     for key in [b"\x16".as_slice(), b"\x1b[118;5u"] {
                         let (client, mut peer) = controller(remote);
-                        client.negotiate(negotiated);
+                        if connected {
+                            client.connected();
+                        }
                         client.message(ServerMsg::ClipboardFocus { pane: Some(7), agent });
                         let probes = std::cell::Cell::new(0);
                         let handled = client.input_with_probe(key, || {
@@ -1716,7 +1719,7 @@ mod tests {
                         if !handled {
                             client.forward(key);
                         }
-                        assert_eq!(probes.get(), usize::from(remote && agent && negotiated));
+                        assert_eq!(probes.get(), usize::from(remote && agent && connected));
                         assert_eq!(protocol::read_frame(&mut peer).unwrap().unwrap(), (protocol::BYTES, key.to_vec()));
                         assert!(peer.incoming.try_recv().is_err());
                         assert!(client.state.lock().unwrap().workers.is_empty());
@@ -1725,8 +1728,8 @@ mod tests {
             }
         }
         let (client, mut peer) = controller(true);
-        client.negotiate(true);
-        client.input_with_probe(b"\x16", || panic!("no negotiated focus"));
+        client.connected();
+        client.input_with_probe(b"\x16", || panic!("no focus received"));
         assert_eq!(protocol::read_frame(&mut peer).unwrap().unwrap(), (protocol::BYTES, vec![0x16]));
         client.message(ServerMsg::ClipboardFocus { pane: Some(7), agent: true });
         client.disconnect();
@@ -1738,7 +1741,7 @@ mod tests {
         for key in [b"\x16".as_slice(), b"\x1b[118;5u"] {
             for coalesced in [false, true] {
                 let (client, mut peer) = controller(true);
-                client.negotiate(true);
+                client.connected();
                 client.message(ServerMsg::ClipboardFocus { pane: Some(7), agent: true });
                 let prefix = b"\x02v";
                 if coalesced {
@@ -1779,7 +1782,7 @@ mod tests {
     fn closing_a_cancelled_image_result_preserves_coalesced_typing() {
         for close in [b"\r".as_slice(), b"\x1b[13u", b"\x03"] {
             let (client, mut peer) = controller(true);
-            client.negotiate(true);
+            client.connected();
             client.message(ServerMsg::ClipboardFocus { pane: Some(7), agent: true });
             client.input_with_probe(b"\x16", || true);
             let ClientMsg::AttachmentRequest { token, .. } = read(&mut peer) else { panic!() };
@@ -1815,7 +1818,7 @@ mod tests {
             for split in 1..=key.len() {
                 for cancel in [b"\x1b".as_slice(), b"\t\t\r", b"\x03"] {
                     let (client, mut peer) = controller(true);
-                    client.negotiate(true);
+                    client.connected();
                     client.message(ServerMsg::ClipboardFocus { pane: Some(7), agent: true });
                     client.input_with_probe(&key[..split], || true);
                     if split < key.len() {
@@ -1892,6 +1895,7 @@ mod tests {
         let make_client = || {
             let target = super::super::Target::Remote {
                 ssh: vec!["alice@clipboard-test".into()],
+                host: "alice@clipboard-test".into(),
                 session: "main".into(),
                 label: "box".into(),
                 pane: None,
@@ -1899,7 +1903,7 @@ mod tests {
             };
             let (writer, peer) = wire();
             let client = Controller::for_target(Arc::new(Mutex::new(Some(writer))), &target);
-            client.negotiate(true);
+            client.connected();
             client.message(ServerMsg::ClipboardFocus { pane: Some(7), agent: true });
             (client, peer)
         };
@@ -1959,7 +1963,7 @@ mod tests {
         for remote in [false, true] {
             for image in [false, true] {
                 let (client, mut peer) = controller(remote);
-                client.negotiate(true);
+                client.connected();
                 let token = "ab".to_string();
                 client.message(if image {
                     ServerMsg::ClipboardImageOffer {
@@ -2096,7 +2100,7 @@ mod tests {
     fn image_offer_requires_local_enter_and_ordinary_paste_never_reads_the_clipboard() {
         for remote in [false, true] {
             let (client, mut peer) = controller(remote);
-            client.negotiate(true);
+            client.connected();
             client.message(ServerMsg::ClipboardImageOffer {
                 token: "ab".into(),
                 target: "pane".into(),
@@ -2162,7 +2166,7 @@ mod tests {
             let bytes = paste::bracket(&[text, b"\r".to_vec()].concat());
             for split in [1, 5, 6, bytes.len() - 7, bytes.len() - 3] {
                 let (client, _peer) = controller(true);
-                client.negotiate(true);
+                client.connected();
                 client.input(&bytes[..split]);
                 client.message(ServerMsg::ClipboardImageOffer {
                     token: "ab".into(),
@@ -2371,6 +2375,7 @@ mod tests {
         let ssh = vec!["alice@box".into()];
         let target = super::super::Target::Remote {
             ssh: ssh.clone(),
+            host: "alice@box".into(),
             session: "main".into(),
             label: "box".into(),
             pane: None,
@@ -2390,7 +2395,7 @@ mod tests {
             }
             let (writer, mut peer) = wire();
             let client = Controller::for_target(Arc::new(Mutex::new(Some(writer))), &target);
-            client.negotiate(true);
+            client.connected();
             // A server cannot create a local gesture, even with permission already granted.
             client.message(ServerMsg::AttachmentPrepared {
                 token: "ab".into(),
@@ -2415,7 +2420,7 @@ mod tests {
     }
 
     #[test]
-    fn paste_recognition_requires_remote_negotiation_and_preserves_ordinary_bytes() {
+    fn paste_recognition_requires_remote_connection_and_preserves_ordinary_bytes() {
         let path = dropped_file("ordinary");
         for remote in [false, true] {
             let (client, peer) = controller(remote);
@@ -2423,12 +2428,12 @@ mod tests {
             assert!(!client.input(&input));
             assert!(peer.incoming.try_recv().is_err());
             if !remote {
-                client.negotiate(true);
+                client.connected();
                 assert!(!client.input(&input));
             }
         }
         let (client, mut peer) = controller(true);
-        client.negotiate(true);
+        client.connected();
         for original in [b"echo /some/path".as_slice(), b"/does/not/exist", b"\xff", b"", b"multiple\nlines"] {
             let input = paste::bracket(original);
             for byte in &input {
@@ -2449,7 +2454,7 @@ mod tests {
         let path = dropped_file("text with spaces");
         let original = format!("  '{}'\r\n", path.display()).into_bytes();
         let (client, mut peer) = controller(true);
-        client.negotiate(true);
+        client.connected();
         client.input(&[paste::bracket(&original), b"\r".to_vec()].concat());
         assert!(matches!(read(&mut peer), ClientMsg::PasteStart));
         let ClientMsg::AttachmentRequest { token, text, image: false, .. } = read(&mut peer) else { panic!() };
@@ -2523,7 +2528,7 @@ mod tests {
             for coalesced in [false, true] {
                 for cancel in [b"\x03".as_slice(), b"\x1b[99;5u"] {
                     let (client, mut peer) = if automatic { automatic_controller() } else { controller(true) };
-                    client.negotiate(true);
+                    client.connected();
                     let paste = paste::bracket(path.to_str().unwrap().as_bytes());
                     if coalesced {
                         client.input(&[paste.as_slice(), cancel, b"\r"].concat());
@@ -2574,7 +2579,7 @@ mod tests {
         for automatic in [false, true] {
             for coalesced in [false, true] {
                 let (client, mut peer) = if automatic { automatic_controller() } else { controller(true) };
-                client.negotiate(true);
+                client.connected();
                 let first = paste::bracket(path.to_str().unwrap().as_bytes());
                 let second = paste::bracket(b"Please review this file.\n");
                 if coalesced {

@@ -486,9 +486,6 @@ From the command line:
 | `kraal import ./shop.kdl --name shop-copy --yes` | accepts the preview with an explicit name, without prompting |
 | `kraal export ./shop.kdl --workspace shop` | exports an open or closed workspace, without conversations or private account names |
 | `kraal export ./shop.kdl --workspace shop --replace` | confirms replacement of the reviewed file, keeping a backup |
-| `kraal save` | legacy export: in a pane, that pane's workspace; outside one, the workspace on screen |
-| `kraal save --workspace shop` | the same for the workspace you name |
-| `kraal save shop-2` | writes `<name>.kdl` in the definitions directory |
 
 ### Importing a layout
 
@@ -553,11 +550,6 @@ and programs. Managed agents use portable references such as `agent="claude"`; t
 cannot survive serialization, so every existing destination needs explicit replacement.
 The source is never overwritten automatically.
 
-`kraal save` remains a legacy export alias and prints a transition message. It keeps its existing
-name and destination rules: the source file by default, or a named copy in the definitions
-directory. A first export with no source links that file for compatibility. It also keeps explicit
-agent account references and arguments. Waiting commands keep `start_suspended=true`.
-
 A retained workspace keeps its source association across Close and restart: the sidebar and
 `kraal workspaces` list it once, and `kraal open` with the name of its file opens that same
 workspace without switching an attached terminal's view.
@@ -584,11 +576,8 @@ wider terminal sizes. If a diagnostic is taller than the dialog, `pageup`/`paged
 wheel scrolls it while the input and footer stay visible. Moving the cursor keeps the error;
 editing the value clears it.
 
-`kraal save` refuses a replacement that needs confirmation. Use `kraal save <name>` with a new
-name for a copy, or **Export layout** in kraal to confirm replacement. `kraal export <file> --replace`
-confirms replacement from the CLI. There is no
-permanent overwrite permission. The CLI's first file association is queued for session
-persistence as soon as the save succeeds.
+`kraal export <file> --replace` confirms replacement from the CLI. There is no permanent
+overwrite permission. Exporting a copy leaves the workspace's source association unchanged.
 
 The comparison uses the loaded or last saved contents, not just a timestamp, and survives a
 session restart. A session saved by an older version has no recorded contents, so its first

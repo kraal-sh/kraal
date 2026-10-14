@@ -216,7 +216,7 @@ the network drops, and its programs keep running on the server meanwhile:
 
 | Command | |
 |---|---|
-| `kraal remote-install db` | copies this binary to `~/.local/bin` on db (same OS and CPU) |
+| `kraal remote-install db` | copies this binary to `~/.local/bin` on db (same OS and CPU), then restarts the selected session if running |
 | `kraal attach --host db` | attaches to db's kraal; ctrl+c gives up while reconnecting |
 | `kraal attach --host db --pane api` | the same, showing that pane of the session first |
 | `kraal -s work attach --host deploy@db.lan:2222` | another session there, on a server named by its address |
@@ -248,7 +248,7 @@ offers **Send**, **Always for box**, **Paste as text**, and **Cancel** in a loca
 Always is remembered on the laptop and can be revoked in `paste-files.toml`. Ordinary text
 and local-session pastes stay unchanged.
 
-Copies travel back to the attaching machine as negotiated clipboard messages. A user selection
+Copies travel back to the attaching machine as structured clipboard messages. A user selection
 tries its native clipboard, then OSC 52. A program's copy goes to the most recently used client
 viewing its workspace and uses OSC 52 unless that client has `clipboard_native = true` for
 this saved server. The setting is local to the attaching machine, applies on attach, and can
@@ -281,8 +281,7 @@ agents leave the list until it is back.
 A click on one, Enter in the pane finder (`ctrl+b p`), or `alt+a` when it waits for you opens a
 tab attached to that session, with the agent's pane shown; a tab already attached to it is used
 instead, however it was started, and shows that pane, whatever another terminal attached to that
-session shows (with an older kraal on the server, the session is only asked to show it). An agent
-there that gets blocked or finishes is announced like a local one, unless a tab is attached to its
+session shows. An agent there that gets blocked or finishes is announced like a local one, unless a tab is attached to its
 session: that session's own notification then comes through the tab, once. `kraal agents` lists
 these agents too, and their changes of state are `agent.*` events (see
 [Scripting](scripting.md#events)).

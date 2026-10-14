@@ -155,7 +155,12 @@ pub(super) fn workspaces(
     }
     let r = match s.request(Request::ListWorkspaces) {
         Ok(r) => r,
-        Err(_) => return list_definitions(&s.name, json),
+        Err(error) => {
+            if std::os::unix::net::UnixStream::connect(s.socket()).is_ok() {
+                return Err(error);
+            }
+            return list_definitions(&s.name, json);
+        }
     };
     let Response::Workspaces(list) = r else { bail!("unexpected answer") };
     print_workspaces(&list, json)
@@ -248,17 +253,6 @@ pub(super) fn open(s: &Session, name: String) -> Result<()> {
     client::ensure_server(&s.name)?;
     s.request(Request::OpenWorkspace { name: name.clone() })?;
     println!("workspace \"{name}\" is open; `kraal attach {name}` to see it");
-    Ok(())
-}
-
-/// `kraal save`: the workspace named, else the one of the pane this runs in, else (outside a
-/// pane) the one on screen, which the server knows.
-pub(super) fn save(s: &Session, name: Option<String>, workspace: Option<String>) -> Result<()> {
-    let workspace = workspace.or_else(|| s.own_workspace());
-    if let Response::Path(p) = s.request(Request::SaveWorkspace { workspace, name })? {
-        eprintln!("Workspaces are saved automatically. `kraal save` exports a KDL layout.");
-        println!("saved {}", paths::shorten_home(&p));
-    }
     Ok(())
 }
 
@@ -394,7 +388,9 @@ pub(super) fn list_sessions() -> Result<()> {
     let mut names = std::collections::BTreeMap::<String, String>::new();
     for (name, socket) in live_sockets() {
         let state = match client::ping(&socket) {
-            Ok(client::ServerInfo { version, .. }) if protocol::newer(protocol::KRAAL_VERSION, &version) => {
+            Ok(client::ServerInfo { version, protocol: generation, .. })
+                if generation < protocol::PROTOCOL_VERSION || protocol::newer(protocol::KRAAL_VERSION, &version) =>
+            {
                 format!("running  {version} ({} is installed: kraal -s {name} restart)", protocol::KRAAL_VERSION)
             }
             Ok(client::ServerInfo { version, .. }) => format!("running  {version}"),

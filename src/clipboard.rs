@@ -207,7 +207,7 @@ impl Worker {
     }
 
     pub fn submit(&self, id: u64, origin: Origin, text: String) {
-        // The negotiated server allows only one outstanding copy. An overproducing peer
+        // The server allows only one outstanding copy. An overproducing peer
         // cannot allocate an unbounded queue or create a thread per copy.
         let _ = self.tx.try_send(Job { id, origin, text });
     }

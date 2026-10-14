@@ -60,7 +60,7 @@ impl Server {
                 pid: std::process::id(),
                 session: self.session.clone(),
                 version: protocol::KRAAL_VERSION.into(),
-                features: Some(protocol::feature_names()),
+                protocol: protocol::PROTOCOL_VERSION,
             }),
             Request::Unknown(request) => Err(protocol::unsupported(&request)),
             Request::ListPanes => {
@@ -297,22 +297,6 @@ impl Server {
                     })()
                     .map_err(|e: anyhow::Error| format!("{e:#}")),
                 );
-            }
-            Request::SaveWorkspace { workspace, name } => {
-                let wi = match workspace {
-                    Some(w) => match self.named_workspace(&w) {
-                        Ok(wi) => wi,
-                        Err(e) => return Some(Err(format!("{e:#}"))),
-                    },
-                    None => self.available_workspace(None).and_then(|ws| self.ws_index(ws)),
-                };
-                match wi.filter(|i| *i < self.workspaces.len()) {
-                    None => Err("no such workspace".into()),
-                    Some(wi) => {
-                        let name = name.unwrap_or_else(|| self.definition_file_name(wi));
-                        self.save_definition(wi, &name).map(Response::Path).map_err(|e| format!("{e:#}"))
-                    }
-                }
             }
             Request::OpenSsh { target, group, placement, near, command } => {
                 if group {

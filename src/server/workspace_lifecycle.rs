@@ -1184,8 +1184,8 @@ while IFS= read -r line; do :; done
             } else {
                 server.delete_workspace_source(&path).unwrap()
             };
-            let replacement = server.new_workspace(name.clone(), None);
-            let save = server.prepare_definition_save(0, &name).unwrap();
+            let replacement = server.new_workspace(name.clone(), Some(path.clone()));
+            let save = server.prepare_layout_export(0, &path).unwrap();
             assert!(save.question.as_ref().unwrap().contains("Replace file?"));
             server.write_definition(0, &name, &save).unwrap();
             let replaced = std::fs::read_to_string(&path).unwrap();
@@ -1202,15 +1202,17 @@ while IFS= read -r line; do :; done
             assert_eq!(std::fs::read_to_string(&path).unwrap(), replaced);
             let ri = server.ws_index(replacement).unwrap();
             // The saved link resolves directory aliases, including macOS's /tmp.
-            let save = server.prepare_definition_save(ri, &name).unwrap();
+            let save = server.prepare_layout_export(ri, &path).unwrap();
             assert!(save.question.is_some());
             assert_eq!(server.write_definition(ri, &name, &save).unwrap(), path.canonicalize().unwrap());
             server.reopen_workspace(restored).unwrap();
             assert_eq!(server.workspaces[wi].counts(), (1, 1));
             assert_eq!(server.panes[&server.workspaces[wi].panes()[0]].spec.command, ["sleep", "60"]);
-            let restored_path = server.save_definition(wi, &restored_name).unwrap();
+            let restored_path = path.with_file_name(format!("{restored_name}.kdl"));
+            let save = server.prepare_layout_export(wi, &restored_path).unwrap();
+            server.write_definition(wi, &restored_name, &save).unwrap();
             assert_ne!(restored_path, path);
-            assert_eq!(server.definition_workspace(&restored_path).unwrap(), Some(restored));
+            assert_eq!(server.definition_workspace(&restored_path).unwrap(), None);
             assert_eq!(server.definition_workspace(&path).unwrap(), Some(replacement));
             assert_eq!(std::fs::read_to_string(&path).unwrap(), replaced);
             for file in [&path, &path.with_extension("kdl.bak"), &restored_path] {
