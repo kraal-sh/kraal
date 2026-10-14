@@ -111,21 +111,20 @@ fn a_tool_asks_when_the_kubeconfig_just_switched_to_production() {
         assert!(start.elapsed() < PATIENCE, "the pane's context is read: {panes}");
         std::thread::sleep(Duration::from_millis(100));
     }
-    let mut client = env.client();
+    let mut client = RawClient::attach(&env, "w").traced();
+    client.first_frame();
     // Switched to production, then the tool at once: before the next look at the file.
     std::fs::write(&kube, config("prod-eks")).unwrap();
-    std::io::Write::write_all(client.stdin.as_mut().unwrap(), b"\x02Rm").unwrap();
-    std::thread::sleep(Duration::from_millis(1500));
+    client.send(b"\x02Rm");
+    client.wait_for_row("Run mark where w › k is?");
     assert!(!marked.exists(), "the tool ran on production without asking");
     // It asked: yes runs it.
-    std::io::Write::write_all(client.stdin.as_mut().unwrap(), b"y").unwrap();
+    client.send(b"y");
     let start = Instant::now();
     while !marked.exists() {
         assert!(start.elapsed() < Duration::from_secs(10), "the tool runs once allowed");
         std::thread::sleep(Duration::from_millis(50));
     }
-    let _ = client.kill();
-    let _ = client.wait();
 }
 
 /// A pane that runs kubectl on `kube` for 2 s, then is a shell: its kubeconfig is known, and
@@ -164,21 +163,20 @@ fn wait_for_context(env: &Env, context: &str) {
     }
 }
 
-/// Wait until the server reads `file` again, a kubeconfig that was just changed and whose reads
+/// Wait until the server reads `file` again, a context file that was just changed and whose reads
 /// `<file>.slow` makes last: the next scan starts that read (within 3.4 s, later on a loaded
 /// machine), and what is typed from here on finds it under way.
 #[cfg(target_os = "linux")]
 fn wait_for_slow_read(file: &Path) {
     let reading = slow_read_marker(file);
-    wait_until(PATIENCE, "the changed kubeconfig is never read again", || reading.exists());
+    wait_until(PATIENCE, "the context file is never read again", || reading.exists());
 }
 
-/// Wait until that read of `file` has ended, then for the server to have taken what it said.
+/// Wait until the slow part of the read ends; its result must still be observed in the server.
 #[cfg(target_os = "linux")]
 fn wait_for_slow_read_to_end(file: &Path) {
     let reading = slow_read_marker(file);
-    wait_until(PATIENCE, "the read of the kubeconfig never ended", || !reading.exists());
-    std::thread::sleep(Duration::from_millis(1500));
+    wait_until(PATIENCE, "the read of the context file never ended", || !reading.exists());
 }
 
 /// What sits next to `file` while the server reads it slowly.
@@ -268,16 +266,16 @@ fn broadcast_waits_while_a_pane_context_is_read_again() {
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     wait_for_context(&env, "dev");
     env.wait_for_text("b", "$");
-    let mut client = env.client();
-    let mut typed = |bytes: &[u8]| std::io::Write::write_all(client.stdin.as_mut().unwrap(), bytes).unwrap();
+    let mut client = RawClient::attach(&env, "w").traced();
+    client.wait_for_row("$");
     env.run(&["focus", "a"]);
-    typed(b"\x02b");
-    std::thread::sleep(Duration::from_millis(500));
+    client.send(b"\x02b");
+    client.wait_for_row("BROADCAST");
     // `kubectx prod-x`: the next scan (within 3.4 s) starts a read that lasts 4.8 s.
     std::fs::write(env.root.join("kube.yaml.slow"), "").unwrap();
     std::fs::write(&kube, kubeconfig_text("prod-x")).unwrap();
     wait_for_slow_read(&kube);
-    typed(b"echo hello-bcast");
+    client.send(b"echo hello-bcast");
     std::thread::sleep(Duration::from_millis(600));
     for pane in ["a", "b"] {
         let screen = env.run(&["read", "-p", pane]);
@@ -285,13 +283,12 @@ fn broadcast_waits_while_a_pane_context_is_read_again() {
     }
     // The read ends, says production: the keys are asked about, not sent.
     wait_for_slow_read_to_end(&kube);
+    client.wait_for_row("Typing is synced to production:");
     let screen = env.run(&["read", "-p", "b"]);
     assert!(!screen.contains("hello-bcast"), "keys reached a production pane unasked:\n{screen}");
-    typed(b"y");
+    client.send(b"y");
     env.wait_for_text("b", "echo hello-bcast");
     env.wait_for_text("a", "echo hello-bcast");
-    let _ = client.kill();
-    let _ = client.wait();
 }
 
 /// What is typed while a broadcast pane's context is read again goes as one: when the read
@@ -313,26 +310,25 @@ fn a_no_drops_everything_typed_while_a_context_was_read() {
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     wait_for_context(&env, "dev");
     env.wait_for_text("b", "$");
-    let mut client = env.client();
-    let mut typed = |bytes: &[u8]| std::io::Write::write_all(client.stdin.as_mut().unwrap(), bytes).unwrap();
+    let mut client = RawClient::attach(&env, "w").traced();
+    client.wait_for_row("$");
     env.run(&["focus", "a"]);
-    typed(b"\x02b");
-    std::thread::sleep(Duration::from_millis(500));
+    client.send(b"\x02b");
+    client.wait_for_row("BROADCAST");
     std::fs::write(env.root.join("kube.yaml.slow"), "").unwrap();
     std::fs::write(&kube, kubeconfig_text("prod-x")).unwrap();
     wait_for_slow_read(&kube);
     // A whole command, Enter included, typed while the read goes on.
-    typed(b" echo should-not-run\r");
+    client.send(b" echo should-not-run\r");
     wait_for_slow_read_to_end(&kube);
     // The read said production: the question is about all of it. No.
-    typed(b"n");
-    std::thread::sleep(Duration::from_millis(1500));
+    client.wait_for_row("Typing is synced to production:");
+    client.send(b"n");
+    client.wait_for_row("sync off · nothing was sent");
     for pane in ["a", "b"] {
         let screen = env.run(&["read", "-p", pane]);
         assert!(!screen.contains("should-not-run"), "sent to {pane} after a no:\n{screen}");
     }
-    let _ = client.kill();
-    let _ = client.wait();
 }
 
 /// A yes is for the panes the question named, as they were then: given while one of them has
@@ -359,37 +355,51 @@ fn a_yes_waits_for_a_context_read_and_holds_only_if_nothing_changed() {
     wait_for_context(&env, "dev");
     env.wait_for_text("b", "$");
     env.wait_for_text("c", "$");
-    let mut client = env.client();
-    let mut typed = |bytes: &[u8]| std::io::Write::write_all(client.stdin.as_mut().unwrap(), bytes).unwrap();
+    // Leave room for the full rejection message beside the broadcast indicator and tab.
+    let mut client = RawClient::attach_sized(&env, Some("w"), (200, 40)).traced();
+    client.wait_for_row("$");
     env.run(&["focus", "a"]);
-    typed(b"\x02b");
-    std::thread::sleep(Duration::from_millis(500));
+    client.send(b"\x02b");
+    client.wait_for_row("BROADCAST");
     // b is production: the paste is asked about.
-    typed(b"\x1b[200~echo answered-early\x1b[201~");
-    std::thread::sleep(Duration::from_millis(500));
+    client.send(b"\x1b[200~echo answered-early\x1b[201~");
+    client.wait_for_row("Typing is synced to production:");
     // Meanwhile c becomes production, and its read lasts.
     std::fs::write(env.root.join("kube-c.yaml.slow"), "").unwrap();
     std::fs::write(&kube_c, kubeconfig_text("prod-x")).unwrap();
     wait_for_slow_read(&kube_c);
     // Yes, before c's read ends: it was not production when asked.
-    typed(b"y");
-    std::thread::sleep(Duration::from_millis(6000));
+    client.send(b"y");
+    client.wait_for_rows("the answer was taken", |rows| {
+        !rows.iter().any(|row| row.contains("Typing is synced to production:"))
+    });
+    assert!(slow_read_marker(&kube_c).exists(), "c's read ended before the answer was taken");
+    wait_for_slow_read_to_end(&kube_c);
+    client.wait_for_row("a pane changed production since the question: nothing was sent");
     for pane in ["a", "b", "c"] {
         let screen = env.run(&["read", "-p", pane]);
         assert!(!screen.contains("answered-early"), "sent to {pane} though c changed after the question:\n{screen}");
     }
     // Asked again (c is production now), answered during a read that changes nothing: it goes,
     // once the read has ended.
-    typed(b"\x1b[200~echo answered-again\x1b[201~");
-    std::thread::sleep(Duration::from_millis(500));
+    client.send(b"\x1b[200~echo answered-again\x1b[201~");
+    client.wait_for_row("Typing is synced to production:");
     std::fs::write(&kube_c, kubeconfig_text("prod-x")).unwrap();
     wait_for_slow_read(&kube_c);
-    typed(b"y");
+    client.send(b"y");
+    client.wait_for_rows("the answer was taken", |rows| {
+        !rows.iter().any(|row| row.contains("Typing is synced to production:"))
+    });
     for pane in ["a", "b", "c"] {
-        env.wait_for_text(pane, "echo answered-again");
+        let screen = env.run(&["read", "-p", pane]);
+        assert!(!screen.contains("answered-again"), "sent to {pane} before c's read ended:\n{screen}");
     }
-    let _ = client.kill();
-    let _ = client.wait();
+    assert!(slow_read_marker(&kube_c).exists(), "c's read ended before the answer was checked");
+    wait_for_slow_read_to_end(&kube_c);
+    for pane in ["a", "b", "c"] {
+        let screen = env.wait_for_text(pane, "echo answered-again");
+        assert_eq!(screen.matches("echo answered-again").count(), 1, "sent more than once to {pane}:\n{screen}");
+    }
 }
 
 /// What is typed in a tab while a broadcast pane's context is read again goes to that tab's
@@ -411,28 +421,29 @@ fn input_that_waited_goes_where_it_was_typed() {
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     wait_for_context(&env, "dev");
     env.wait_for_text("b", "$");
-    let mut client = env.client();
-    let mut typed = |bytes: &[u8]| std::io::Write::write_all(client.stdin.as_mut().unwrap(), bytes).unwrap();
+    env.run(&["send", "-p", "c", "--enter", "echo TAB-TWO"]);
+    env.wait_for_text("c", "TAB-TWO");
+    let mut client = RawClient::attach(&env, "w").traced();
+    client.wait_for_row("$");
     env.run(&["focus", "a"]);
-    typed(b"\x02b");
-    std::thread::sleep(Duration::from_millis(500));
+    client.send(b"\x02b");
+    client.wait_for_row("BROADCAST");
     // The same context written again: a read that changes nothing, and lasts.
     std::fs::write(env.root.join("kube.yaml.slow"), "").unwrap();
     std::fs::write(&kube, kubeconfig_text("dev")).unwrap();
     wait_for_slow_read(&kube);
-    typed(b"echo typed-in-one");
-    std::thread::sleep(Duration::from_millis(300));
+    client.send(b"echo typed-in-one");
     // Tab two is shown before the read ends.
-    typed(b"\x022");
-    std::thread::sleep(Duration::from_millis(6000));
+    client.send(b"\x022");
+    client.wait_for_row("TAB-TWO");
+    assert!(slow_read_marker(&kube).exists(), "the read ended before the tab changed");
+    wait_for_slow_read_to_end(&kube);
+    env.wait_for_text("a", "echo typed-in-one");
+    env.wait_for_text("b", "echo typed-in-one");
     for pane in ["c", "d"] {
         let screen = env.run(&["read", "-p", pane]);
         assert!(!screen.contains("typed-in-one"), "reached {pane} in the tab shown later:\n{screen}");
     }
-    env.wait_for_text("a", "echo typed-in-one");
-    env.wait_for_text("b", "echo typed-in-one");
-    let _ = client.kill();
-    let _ = client.wait();
 }
 
 /// A yes given while a pane's kubeconfig is read again and the read does not answer is not
@@ -456,26 +467,33 @@ fn a_yes_during_a_read_that_does_not_answer_sends_nothing() {
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     wait_for_context(&env, "prod-x");
     env.wait_for_text("b", "$");
-    let mut client = env.client();
-    let mut typed = |bytes: &[u8]| std::io::Write::write_all(client.stdin.as_mut().unwrap(), bytes).unwrap();
+    // Leave room for the full rejection message beside the broadcast indicator and tab.
+    let mut client = RawClient::attach_sized(&env, Some("w"), (200, 40)).traced();
+    client.wait_for_row("$");
     env.run(&["focus", "a"]);
-    typed(b"\x02b");
-    std::thread::sleep(Duration::from_millis(500));
+    client.send(b"\x02b");
+    client.wait_for_row("BROADCAST");
     // b is production: the paste is asked about.
-    typed(b"\x1b[200~echo stalled-yes\x1b[201~");
-    std::thread::sleep(Duration::from_millis(500));
+    client.send(b"\x1b[200~echo stalled-yes\x1b[201~");
+    client.wait_for_row("Typing is synced to production:");
     // Meanwhile b's kubeconfig changes, and the read of it does not answer.
     std::fs::write(env.root.join("kube.yaml.slow"), "").unwrap();
     std::fs::write(&kube, kubeconfig_text("dev")).unwrap();
-    std::thread::sleep(Duration::from_millis(9500));
-    typed(b"y");
-    std::thread::sleep(Duration::from_millis(1500));
+    wait_for_slow_read(&kube);
+    // Later scans must not start another slow read after this one ends.
+    std::fs::remove_file(env.root.join("kube.yaml.slow")).unwrap();
+    wait_until(PATIENCE, "the context never became unknown", || {
+        pane_json(&env, "b")["production"].as_str().is_some_and(|why| why.contains("does not answer"))
+    });
+    assert!(slow_read_marker(&kube).exists(), "the stalled read ended before the answer");
+    client.send(b"y");
+    client.wait_for_row("a pane changed production since the question: nothing was sent");
+    wait_for_slow_read_to_end(&kube);
+    wait_for_contexts(&env, "b", &["⎈ dev"], None);
     for pane in ["a", "b"] {
         let screen = env.run(&["read", "-p", pane]);
         assert!(!screen.contains("stalled-yes"), "sent to {pane} on a yes for what the file said before:\n{screen}");
     }
-    let _ = client.kill();
-    let _ = client.wait();
 }
 
 /// As for a kubeconfig: once the directory a Terraform run worked on is read again and does not
@@ -509,26 +527,33 @@ fn a_yes_during_a_terraform_read_that_does_not_answer_sends_nothing() {
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     wait_for_context(&env, "tf:prod-a");
     env.wait_for_text("b", "$");
-    let mut client = env.client();
-    let mut typed = |bytes: &[u8]| std::io::Write::write_all(client.stdin.as_mut().unwrap(), bytes).unwrap();
+    // Leave room for the full rejection message beside the broadcast indicator and tab.
+    let mut client = RawClient::attach_sized(&env, Some("w"), (200, 40)).traced();
+    client.wait_for_row("$");
     env.run(&["focus", "a"]);
-    typed(b"\x02b");
-    std::thread::sleep(Duration::from_millis(500));
+    client.send(b"\x02b");
+    client.wait_for_row("BROADCAST");
     // b is production: the paste is asked about.
-    typed(b"\x1b[200~echo stalled-tf-yes\x1b[201~");
-    std::thread::sleep(Duration::from_millis(500));
+    client.send(b"\x1b[200~echo stalled-tf-yes\x1b[201~");
+    client.wait_for_row("Typing is synced to production:");
     // Meanwhile b's workspace changes, and the read of it does not answer.
     std::fs::write(infra.join(".terraform/environment.slow"), "").unwrap();
     std::fs::write(&environment, "prod-b\n").unwrap();
-    std::thread::sleep(Duration::from_millis(9500));
-    typed(b"y");
-    std::thread::sleep(Duration::from_millis(1500));
+    wait_for_slow_read(&environment);
+    // Later scans must not start another slow read after this one ends.
+    std::fs::remove_file(infra.join(".terraform/environment.slow")).unwrap();
+    wait_until(PATIENCE, "the context never became unknown", || {
+        pane_json(&env, "b")["production"].as_str().is_some_and(|why| why.contains("does not answer"))
+    });
+    assert!(slow_read_marker(&environment).exists(), "the stalled read ended before the answer");
+    client.send(b"y");
+    client.wait_for_row("a pane changed production since the question: nothing was sent");
+    wait_for_slow_read_to_end(&environment);
+    wait_for_contexts(&env, "b", &["tf:prod-b"], Some("Terraform workspace prod-b"));
     for pane in ["a", "b"] {
         let screen = env.run(&["read", "-p", pane]);
         assert!(!screen.contains("stalled-tf-yes"), "sent to {pane} on a yes for the workspace before:\n{screen}");
     }
-    let _ = client.kill();
-    let _ = client.wait();
 }
 
 /// The same with no Terraform run seen: the workspace is that of the directory the pane is in.
@@ -556,26 +581,33 @@ fn a_yes_during_a_read_of_the_directory_a_pane_is_in_that_does_not_answer_sends_
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     wait_for_context(&env, "tf:prod-a");
     env.wait_for_text("b", "$");
-    let mut client = env.client();
-    let mut typed = |bytes: &[u8]| std::io::Write::write_all(client.stdin.as_mut().unwrap(), bytes).unwrap();
+    // Leave room for the full rejection message beside the broadcast indicator and tab.
+    let mut client = RawClient::attach_sized(&env, Some("w"), (200, 40)).traced();
+    client.wait_for_row("$");
     env.run(&["focus", "a"]);
-    typed(b"\x02b");
-    std::thread::sleep(Duration::from_millis(500));
+    client.send(b"\x02b");
+    client.wait_for_row("BROADCAST");
     // b is production: the paste is asked about.
-    typed(b"\x1b[200~echo stalled-dir-yes\x1b[201~");
-    std::thread::sleep(Duration::from_millis(500));
+    client.send(b"\x1b[200~echo stalled-dir-yes\x1b[201~");
+    client.wait_for_row("Typing is synced to production:");
     // Meanwhile the directory's workspace changes, and the read of it does not answer.
     std::fs::write(infra.join(".terraform/environment.slow"), "").unwrap();
     std::fs::write(&environment, "prod-b\n").unwrap();
-    std::thread::sleep(Duration::from_millis(9500));
-    typed(b"y");
-    std::thread::sleep(Duration::from_millis(1500));
+    wait_for_slow_read(&environment);
+    // Later scans must not start another slow read after this one ends.
+    std::fs::remove_file(infra.join(".terraform/environment.slow")).unwrap();
+    wait_until(PATIENCE, "the context never became unknown", || {
+        pane_json(&env, "b")["production"].as_str().is_some_and(|why| why.contains("does not answer"))
+    });
+    assert!(slow_read_marker(&environment).exists(), "the stalled read ended before the answer");
+    client.send(b"y");
+    client.wait_for_row("a pane changed production since the question: nothing was sent");
+    wait_for_slow_read_to_end(&environment);
+    wait_for_contexts(&env, "b", &["tf:prod-b"], Some("Terraform workspace prod-b"));
     for pane in ["a", "b"] {
         let screen = env.run(&["read", "-p", pane]);
         assert!(!screen.contains("stalled-dir-yes"), "sent to {pane} on a yes for the workspace before:\n{screen}");
     }
-    let _ = client.kill();
-    let _ = client.wait();
 }
 
 /// A directory known to hold a production Terraform workspace stays known after the pane leaves

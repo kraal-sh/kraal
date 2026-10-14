@@ -23,6 +23,12 @@ panes get a red frame and a PROD badge, their tab turns red, and kraal asks befo
   its pane);
 - a runbook runs on production targets (its plan says which).
 
+Broadcast input waits while a target's context is being read. A **Yes** given during that
+read waits too: it sends the input only if the panes still have the production status named
+in the question. If that status changes or the read stops answering, nothing is sent and kraal
+tells you why. Type or paste the input again to ask about the new context. Input kept during
+a read stays with the panes it was typed for, even if you switch tabs before the read ends.
+
 Scripts and agents get no prompt: `kraal send`, `kraal keys` and `kraal buffer paste` refuse a
 production pane, and `kraal edit` a production server's file, unless given `--production`.
 
