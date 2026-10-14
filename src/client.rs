@@ -1,5 +1,7 @@
 //! The attaching client and the one-shot control connection used by CLI commands.
 
+mod attachments;
+
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
@@ -368,6 +370,9 @@ fn exchange(stream: &mut UnixStream, msg: &ClientMsg) -> Result<Result<Response,
                 | ServerMsg::Events { .. }
                 | ServerMsg::Attached { .. }
                 | ServerMsg::Clipboard { .. }
+                | ServerMsg::AttachmentOffer { .. }
+                | ServerMsg::AttachmentAck { .. }
+                | ServerMsg::AttachmentResult { .. }
                 | ServerMsg::Unknown(_) => continue,
             },
             Some(_) => continue,
@@ -1129,6 +1134,7 @@ pub fn attach(mut target: Target, mut workspace: Option<String>, mouse: bool, at
 
     // The current connection's writer; None while reconnecting.
     let writer: Arc<Mutex<Option<Box<dyn Write + Send>>>> = Arc::new(Mutex::new(None));
+    let attachments = attachments::Controller::new(writer.clone(), matches!(target, Target::Remote { .. }));
     let quit = Arc::new(AtomicBool::new(false));
     let pause = Arc::new(KeysPause::new().context("creating a pipe")?);
 
@@ -1136,9 +1142,13 @@ pub fn attach(mut target: Target, mut workspace: Option<String>, mouse: bool, at
     {
         let writer = writer.clone();
         let quit = quit.clone();
+        let attachments = attachments.clone();
         let pause = pause.clone();
         crate::threads::named("stdin").spawn(move || {
             read_keys(0, &pause, |keys| {
+                if attachments.keys(keys) {
+                    return;
+                }
                 let Ok(mut w) = writer.lock() else { return };
                 match w.as_mut() {
                     Some(w) => {
@@ -1233,11 +1243,13 @@ pub fn attach(mut target: Target, mut workspace: Option<String>, mouse: bool, at
                 )?;
                 delay = Duration::from_secs(1);
                 let mut clipboard_negotiated = false;
+                let mut attachments_negotiated = false;
                 let mut next = Some(Ok(Some(first)));
                 let lost = loop {
                     match next.take().unwrap_or_else(|| protocol::read_frame(&mut frames)) {
                         Ok(Some((protocol::BYTES, bytes))) => {
                             let written = terminal().write(&bytes);
+                            attachments.draw();
                             match written {
                                 Ok(true) => {}
                                 Ok(false) => leaving(),
@@ -1254,11 +1266,24 @@ pub fn attach(mut target: Target, mut workspace: Option<String>, mouse: bool, at
                             }
                             Ok(ServerMsg::Attached { version, features }) => {
                                 server_version = Some(version);
+                                attachments_negotiated = features
+                                    .as_ref()
+                                    .is_some_and(|fs| fs.iter().any(|f| f == protocol::ATTACHMENTS.name));
+                                if attachments_negotiated {
+                                    attachments.reconnect();
+                                }
                                 clipboard_negotiated =
                                     features.is_some_and(|fs| fs.iter().any(|f| f == protocol::CLIPBOARD.name));
                             }
                             Ok(ServerMsg::Clipboard { id, origin, text }) if clipboard_negotiated => {
                                 clipboard.submit(id, origin, text);
+                            }
+                            Ok(
+                                msg @ (ServerMsg::AttachmentOffer { .. }
+                                | ServerMsg::AttachmentAck { .. }
+                                | ServerMsg::AttachmentResult { .. }),
+                            ) if attachments_negotiated => {
+                                attachments.message(msg);
                             }
                             Ok(ServerMsg::Open { url }) => {
                                 let _ = crate::pane::open_url(&url);
@@ -1270,6 +1295,7 @@ pub fn attach(mut target: Target, mut workspace: Option<String>, mouse: bool, at
                     }
                 };
                 clipboard.cancel();
+                attachments.disconnect();
                 *writer.lock().unwrap() = None;
                 if nested.is_some() {
                     let _ = terminal().write(NOT_ATTACHED);
@@ -1306,6 +1332,7 @@ pub fn attach(mut target: Target, mut workspace: Option<String>, mouse: bool, at
         status_line(&format!("kraal: reconnecting to {label}… (ssh may ask for a password; ctrl+c to quit)"));
         delay = (delay * 2).min(Duration::from_secs(15));
     };
+    attachments.disconnect();
     if nested.is_some() {
         let _ = terminal().write(NOT_ATTACHED);
     }

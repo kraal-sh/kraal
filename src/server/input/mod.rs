@@ -72,13 +72,33 @@ impl Server {
             return;
         }
         c.last_input = Instant::now();
-        let events = c.parser.feed(bytes);
-        c.pending_since = c.parser.has_pending().then(Instant::now);
         if self.primary != Some(id) {
             self.primary = Some(id);
             self.relayout();
         }
-        self.client_events(id, events);
+        // An action can reserve input midway through this frame. Keep the remaining raw
+        // bytes before parsing them, just as if they had arrived in the next frame.
+        let mut quiet = true;
+        for (index, byte) in bytes.iter().enumerate() {
+            if self.attachment_input(id, &bytes[index..]) {
+                break;
+            }
+            let Some(c) = self.clients.get_mut(&id) else { break };
+            let events = c.parser.feed(std::slice::from_ref(byte));
+            c.pending_since = c.parser.has_pending().then(Instant::now);
+            // Reserve the destination before a focus change, without waiting for a piece
+            // or the parser's idle timeout. An empty paste reserves nothing.
+            if c.paste.is_none() && matches!(c.mode, Mode::Normal) && c.parser.has_pending_paste() {
+                self.paste_piece(id, Vec::new());
+            }
+            for event in events {
+                quiet &= self.client_event(id, event);
+            }
+        }
+        if !quiet {
+            self.chrome_changed();
+        }
+        self.typed_quietly = quiet;
     }
 
     pub(super) fn flush_client_input(&mut self, id: ClientId) {
@@ -879,7 +899,7 @@ impl Server {
     }
 
     /// Panes that receive typed input: the focused one, plus the sync targets.
-    fn input_targets(&self, id: ClientId, focused: PaneId) -> Vec<PaneId> {
+    pub(super) fn input_targets(&self, id: ClientId, focused: PaneId) -> Vec<PaneId> {
         let Some(c) = self.clients.get(&id) else { return vec![focused] };
         let Some(wi) = self.ws_index(c.workspace) else { return vec![focused] };
         self.workspaces[wi].sync_targets(focused)
@@ -1063,7 +1083,7 @@ impl Server {
 
     /// Paste `data` into `targets`, `focused` among them, through the production guard: none
     /// of it when one of them closed since the paste started.
-    fn paste_to(&mut self, id: ClientId, focused: PaneId, targets: &[PaneId], data: Vec<u8>) -> Mode {
+    pub(super) fn paste_to(&mut self, id: ClientId, focused: PaneId, targets: &[PaneId], data: Vec<u8>) -> Mode {
         if !targets.iter().all(|t| self.panes.contains_key(t)) {
             self.toast(id, "a pane closed during the paste: nothing was pasted");
             return Mode::Normal;
@@ -1119,10 +1139,35 @@ pub(super) fn plural(n: usize) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    use super::PasteFlow;
     use crate::server::{
         queue,
         tests::{client, server},
     };
+
+    #[test]
+    fn a_paste_reserves_its_destination_before_the_parser_flushes() {
+        let (tx, _events) = queue::channel(4096);
+        let mut server = server(tx);
+        let (id, _peer) = client(&mut server);
+        server.workspaces[0].tabs[0].focus = Some(100);
+        server.client_input(id, b"\x1b[200~\x1b[201~");
+        assert!(server.clients[&id].paste.is_none());
+        server.client_input(id, b"\x1b[200~first");
+        assert!(matches!(
+            &server.clients[&id].paste,
+            Some(PasteFlow::Held { focused: 100, targets, data }) if targets == &[100] && data.is_empty()
+        ));
+        server.workspaces[0].tabs[0].focus = Some(200);
+        server.client_input(id, b" second");
+        server.flush_client_input(id);
+        assert!(matches!(
+            &server.clients[&id].paste,
+            Some(PasteFlow::Held { focused: 100, targets, data }) if targets == &[100] && data == b"first second"
+        ));
+        server.client_input(id, b"\x1b[201~");
+        assert!(server.clients[&id].paste.is_none());
+    }
 
     #[test]
     fn clipboard_message_reports_sending_without_claiming_a_clipboard_write() {

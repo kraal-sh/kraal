@@ -82,6 +82,15 @@ terminal fallback and no native program permission. Existing configurations keep
 Clipboard request IDs, pending results and policies add no saved-session fields; version 2
 state and the 0.2.0 and 0.3.0 legacy paths remain unchanged.
 
+Attachment offers, start, chunk, acknowledgement, finish, cancel, local-path and result/status
+and result dismissal messages require the `attachments` capability in both peers' lists. Older clients keep their
+existing input behavior; choosing Attach files on a current server tells them to update the
+client and attach again. Older servers keep their existing palette until restarted. No new
+message is sent to an older server. Unknown messages retain the existing fallback behavior.
+The optional `[attachments]` configuration defaults preserve existing configurations. Files and
+result records use a separate `attachments-v1` directory. No saved-session, workspace KDL or
+legacy state format changes are introduced.
+
 ## For contributors: how the protocol changes
 
 The client and the server exchange JSON messages (`src/protocol.rs`, whose comments hold the

@@ -7,6 +7,9 @@
 # Needs ssh access to the server: an entry of servers.toml (examples/servers.toml), or user@host.
 set -eu
 
+# To send laptop files, open the command palette (ctrl+b space) and choose Attach files.
+# Enter absolute local paths, quoting spaces. Enter sends the batch; Ctrl+C cancels.
+
 server=${1:-workstation}
 pane=${2:-}
 

@@ -233,6 +233,12 @@ remote session opens it on your machine. A `localhost` address there is
 the server's, not yours: kraal keeps it in paste buffers, sends a copy to your terminal, and
 says where the address works instead of opening the wrong page.
 
+To send laptop files through this connection, choose **Attach files** in the command palette.
+Enter their absolute local paths and press Enter. The server receives the complete batch before
+submitting its private paths to the reserved pane, without Enter. Ctrl+C cancels. Files survive
+client disconnects and server restarts. See [Attachments](terminal.md#attachments) for limits,
+retention and cleanup. This explicit action does not change ordinary pasted text.
+
 Copies travel back to the attaching machine as negotiated clipboard messages. A user selection
 tries its native clipboard, then OSC 52. A program's copy goes to the most recently used client
 viewing its workspace and uses OSC 52 unless that client has `clipboard_native = true` for

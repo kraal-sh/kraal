@@ -134,6 +134,23 @@ memory_mb = 256          # what all panes keep for images
 
 See [Images](terminal.md#images).
 
+## Attachments
+
+The receiving server applies these limits before accepting a batch and checks every chunk:
+
+```toml config
+[attachments]
+file_bytes = 67108864         # 64 MiB per file
+batch_bytes = 134217728       # 128 MiB per batch
+files = 32                   # files per batch, configurable from 1 to 1024
+session_bytes = 1073741824    # 1 GiB of retained files and result records
+```
+
+Byte limits must be positive. Changes apply to new batches after config reload. Existing
+configurations use these defaults. Use **Attach files** in the command palette to select local
+files explicitly. Larger or recursive transfers use `kraal cp`. See
+[Attachments](terminal.md#attachments) for retention, cancellation and quota recovery.
+
 ## Paste buffers
 
 `[buffers]` sets what the [paste buffers](keys.md#paste-buffers) keep:

@@ -5,6 +5,7 @@
 
 mod account_ui;
 mod agents;
+mod attachments;
 mod attention;
 mod bottom_bar;
 mod buffers;
@@ -40,6 +41,7 @@ mod ssh;
 mod tools;
 mod tunnel_ui;
 mod ui;
+pub(crate) use ui::{edit_line, paste_line};
 mod workspace_files;
 mod workspace_lifecycle;
 mod workspace_order;
@@ -93,6 +95,7 @@ pub enum Event {
     Connection(UnixStream),
     ClientFrame(ClientId, u8, Vec<u8>),
     ClientGone(ClientId),
+    Attachment(ClientId, String, attachments::Completion),
     /// A background job (file listing) finished; poll and redraw.
     Wake,
     /// `git status` of a directory, from the git thread.
@@ -402,6 +405,7 @@ pub struct Client {
     pub out: clients::Outbox,
     pub attached: bool,
     clipboard: clipboard::Clipboard,
+    attachments: attachments::Attachments,
     pub cols: u16,
     pub rows: u16,
     pub workspace: u32,
@@ -478,6 +482,7 @@ pub struct Server {
     pub workspaces: Vec<Workspace>,
     pub workspace_order: Vec<persist::WorkspaceKey>,
     pub clients: HashMap<ClientId, Client>,
+    attachment_worker: Option<attachments::Worker>,
     next_id: u32,
     /// The client whose terminal size drives pane sizes.
     pub primary: Option<ClientId>,
@@ -774,6 +779,9 @@ pub fn run(session: &str) -> Result<()> {
     let own_socket = paths::file_id(&socket);
     let (config, mut warnings) =
         Config::load_with_warnings().unwrap_or_else(|e| (Config::default(), vec![format!("config: {e:#}")]));
+    if let Err(e) = crate::attachments::cleanup(session) {
+        warnings.push(format!("attachment cleanup: {e:#}"));
+    }
     // In the log too: the list is shown to who attaches, and none may.
     if let Some(refused) = paths::runtime_dir_refused() {
         eprintln!("kraal: warning: {refused}");
@@ -853,6 +861,7 @@ pub fn run(session: &str) -> Result<()> {
         workspaces: Vec::new(),
         workspace_order: Vec::new(),
         clients: HashMap::new(),
+        attachment_worker: None,
         next_id: 1,
         primary: None,
         // A 120×40 terminal's, until a client attaches.
@@ -1323,6 +1332,7 @@ impl Server {
             self.await_usage_reset();
         }
         self.expire_copies(now);
+        self.expire_attachments(now);
         // Escape sequences that never completed.
         let flush: Vec<ClientId> = self
             .clients
@@ -1655,6 +1665,7 @@ impl Server {
             }
             Event::Watched(changes) => self.watched(&changes),
             Event::ClientGone(id) => self.drop_client(id),
+            Event::Attachment(id, token, result) => self.attachment_complete(id, token, result),
             Event::Git(dir, info) => self.git_result(dir, info),
             Event::Warning(w) => self.warnings.push(w),
             Event::Emit(ty, fields) => self.emit(ty, fields),
@@ -2068,6 +2079,7 @@ mod tests {
             workspaces: Vec::new(),
             workspace_order: Vec::new(),
             clients: HashMap::new(),
+            attachment_worker: None,
             next_id: 1,
             primary: None,
             // A 120×40 terminal's, until a client attaches.
