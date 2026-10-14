@@ -1714,6 +1714,7 @@ mod tests {
         let reader = {
             let pause = pause.clone();
             std::thread::spawn(move || {
+                crate::testing::block_signals();
                 // SAFETY: gettid has no preconditions.
                 let _ = tid_tx.send(unsafe { libc::gettid() });
                 read_keys(keyboard, &pause, |k| {
@@ -1727,7 +1728,7 @@ mod tests {
         // Once it sleeps (it was just started).
         crate::testing::wait_asleep(tid);
         let before = switches();
-        std::thread::sleep(Duration::from_millis(700));
+        crate::testing::sleep_with_signals(tid, Duration::from_millis(700));
         assert_eq!(switches(), before, "the reader woke up while nothing was typed");
         typing.write_all(b"a").unwrap();
         assert_eq!(got_rx.recv_timeout(Duration::from_secs(10)).unwrap(), b"a");
@@ -1744,7 +1745,7 @@ mod tests {
         // Once it went to sleep (it says it parked just before).
         crate::testing::wait_asleep(tid);
         let parked = switches();
-        std::thread::sleep(Duration::from_millis(300));
+        crate::testing::sleep_with_signals(tid, Duration::from_millis(300));
         assert_eq!(switches(), parked, "a paused reader sleeps too");
         pause.resume();
         typing.write_all(b"b").unwrap();

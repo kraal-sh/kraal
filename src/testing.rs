@@ -52,6 +52,37 @@ pub fn in_own_process(name: &str) -> bool {
     false
 }
 
+/// Keep unrelated process signals on other threads: handling one would count as waking up,
+/// even when the measured worker never polls. Called only on workers that end with the test.
+#[cfg(target_os = "linux")]
+pub fn block_signals() {
+    // SAFETY: sigfillset initializes the set; pthread_sigmask changes only this thread's mask.
+    unsafe {
+        let mut signals = std::mem::zeroed();
+        assert_eq!(libc::sigfillset(&mut signals), 0);
+        assert_eq!(libc::pthread_sigmask(libc::SIG_BLOCK, &signals, std::ptr::null_mut()), 0);
+    }
+}
+
+/// Exercise signal isolation throughout a switch measurement. A handler makes SIGCHLD wake
+/// an unmasked worker even when this test runs alone, where it would otherwise be ignored.
+#[cfg(target_os = "linux")]
+pub fn sleep_with_signals(tid: libc::pid_t, duration: std::time::Duration) {
+    let handled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let signal = signal_hook::flag::register(libc::SIGCHLD, handled).unwrap();
+    let start = std::time::Instant::now();
+    while start.elapsed() < duration {
+        // SAFETY: both targets belong to this test process; the worker lives until after the
+        // measurement. Target it too so the test cannot pass just by choosing another thread.
+        unsafe {
+            assert_eq!(libc::kill(libc::getpid(), libc::SIGCHLD), 0);
+            assert_eq!(libc::syscall(libc::SYS_tgkill, libc::getpid(), tid, libc::SIGCHLD), 0);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100).min(duration.saturating_sub(start.elapsed())));
+    }
+    signal_hook::low_level::unregister(signal);
+}
+
 /// A function counting the context switches of thread `tid` of this process (both kinds): what
 /// tells a thread that sleeps from one that keeps waking up.
 #[cfg(target_os = "linux")]

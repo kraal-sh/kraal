@@ -1203,6 +1203,7 @@ mod tests {
         let (tid_tx, tid_rx) = crossbeam_channel::bounded(1);
         let (read_tx, read_rx) = crossbeam_channel::unbounded();
         let thread = std::thread::spawn(move || {
+            crate::testing::block_signals();
             // SAFETY: gettid has no preconditions.
             let _ = tid_tx.send(unsafe { libc::gettid() });
             let mut buf = [0u8; 64];
@@ -1212,9 +1213,9 @@ mod tests {
         });
         let tid = tid_rx.recv().unwrap();
         let switches = crate::testing::thread_switches(tid);
-        std::thread::sleep(Duration::from_millis(50));
+        crate::testing::wait_asleep(tid);
         let before = switches();
-        std::thread::sleep(Duration::from_millis(700));
+        crate::testing::sleep_with_signals(tid, Duration::from_millis(700));
         assert_eq!(switches(), before, "the reader woke up while nothing happened");
         // Output wakes it at once (the slave echoes what is typed into the master).
         writer.write_all(b"x").unwrap();
