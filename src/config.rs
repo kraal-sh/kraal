@@ -126,6 +126,13 @@ mode = "auto"
 # Maximum UTF-8 bytes per external copy (1 MiB), without truncation. At most 8 MiB.
 max_bytes = 1048576
 
+[attachments]
+# Limits on the receiving session. Files arrive through the existing attach connection.
+file_bytes = 67108864
+batch_bytes = 134217728
+files = 32
+session_bytes = 1073741824
+
 [buffers]
 # Paste buffers: what kraal copies (copy mode, mouse selections, hints, the last command's
 # output, what programs copy) is also kept here, newest first. ctrl+b V p (or ctrl+b =) lists
@@ -282,6 +289,8 @@ pub struct Config {
     pub production: ProductionConfig,
     pub buffers: BuffersConfig,
     pub clipboard: crate::clipboard::Settings,
+    #[serde(default)]
+    pub attachments: crate::attachments::Settings,
     pub worktrees: WorktreesConfig,
     pub hints: crate::hints::HintsConfig,
     #[serde(default)]
@@ -421,6 +430,7 @@ impl Config {
             (1..=crate::clipboard::MAX_BYTES).contains(&config.clipboard.max_bytes),
             "clipboard.max_bytes must be between 1 and 8388608"
         );
+        config.attachments.validate()?;
         Ok((config, warnings))
     }
 

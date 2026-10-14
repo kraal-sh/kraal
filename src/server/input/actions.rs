@@ -25,6 +25,13 @@ impl Server {
 
     pub(super) fn action(&mut self, id: ClientId, action: Action) -> Mode {
         match action {
+            Action::AttachFiles => return self.offer_attachments(id, None),
+            Action::PurgeAttachments => {
+                return Mode::confirm(
+                    "Remove all attachments from this session? Previously pasted paths will stop working.",
+                    ConfirmAction::PurgeAttachments,
+                );
+            }
             Action::Tunnels => return Mode::Picker(self.tunnel_picker()),
             Action::AddServer => return Mode::Prompt(self.add_server_form(None, None)),
             Action::NewWorkspace => return Mode::Prompt(self.add_workspace_form(id, None)),
@@ -406,6 +413,8 @@ impl Server {
             | Action::Help
             | Action::Messages
             | Action::CommandPalette
+            | Action::AttachFiles
+            | Action::PurgeAttachments
             | Action::Restart
             | Action::Quit => unreachable!("handled before selecting a workspace"),
             Action::CloseWorkspace => return self.ask_close_workspace(id, ws),

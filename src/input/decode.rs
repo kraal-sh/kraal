@@ -101,6 +101,11 @@ impl InputParser {
         }
     }
 
+    /// Paste content has arrived, even if no piece or end has been emitted yet.
+    pub fn has_pending_paste(&self) -> bool {
+        self.paste.as_ref().is_some_and(|content| !content.is_empty())
+    }
+
     /// Called after a short timeout when [`has_pending`](Self::has_pending): turn whatever is
     /// pending into events. `ESC` + one printable byte (e.g. `ESC [`) becomes Alt+that key, other
     /// partial sequences become [`InputEvent::Raw`]. Inside a bracketed paste, the content

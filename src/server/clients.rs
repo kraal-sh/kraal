@@ -58,6 +58,7 @@ impl Server {
                 out,
                 attached: false,
                 clipboard: Default::default(),
+                attachments: Default::default(),
                 cols: 80,
                 rows: 24,
                 workspace: ws,
@@ -93,7 +94,9 @@ impl Server {
 
     pub(super) fn client_frame(&mut self, id: ClientId, kind: u8, payload: Vec<u8>) {
         if kind == protocol::BYTES {
-            self.client_input(id, &payload);
+            if !self.attachment_input(id, &payload) {
+                self.client_input(id, &payload);
+            }
             return;
         }
         let msg: ClientMsg = match serde_json::from_slice(&payload) {
@@ -106,7 +109,10 @@ impl Server {
         match msg {
             ClientMsg::Attach { version, cols, rows, workspace, remote, pane, installed, features } => {
                 if let Some(c) = self.clients.get_mut(&id) {
+                    c.attachments.pending = None;
+                    c.attachments.blocked = None;
                     c.remote = remote;
+                    c.attachments.negotiated = features.iter().any(|f| f == protocol::ATTACHMENTS.name);
                     c.clipboard.negotiated = features.iter().any(|f| f == protocol::CLIPBOARD.name);
                 }
                 let (cols, rows) = clamp_size(cols, rows);
@@ -140,6 +146,13 @@ impl Server {
             ClientMsg::ClipboardResult { id: copy, outcome, native_unavailable } => {
                 self.clipboard_result(id, copy, outcome, native_unavailable);
             }
+            msg @ (ClientMsg::AttachmentStart { .. }
+            | ClientMsg::AttachmentChunk { .. }
+            | ClientMsg::AttachmentFinish { .. }
+            | ClientMsg::AttachmentCancel { .. }
+            | ClientMsg::AttachmentStatus { .. }
+            | ClientMsg::AttachmentDismiss { .. }
+            | ClientMsg::AttachmentLocal { .. }) => self.attachment_message(id, msg),
             ClientMsg::Detach => self.detach(id, "detached"),
             ClientMsg::Request { version, request, .. } => {
                 let result = if version != protocol::PROTOCOL_VERSION {

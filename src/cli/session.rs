@@ -78,6 +78,7 @@ pub(super) fn forget(s: &Session) -> Result<()> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
         Err(e) => return Err(e.into()),
     };
+    let attachments = crate::attachments::remove(session)?;
     let scrollback = crate::persist::forget_scrollback(session)?;
     let buffers_path = paths::buffers_path(session);
     let buffers = remove_saved(&buffers_path)?;
@@ -87,12 +88,13 @@ pub(super) fn forget(s: &Session) -> Result<()> {
         (legacy_scrollback, legacy_scrollback_path),
         (scrollback, paths::scrollback_dir(session)),
         (buffers, buffers_path),
+        (attachments, crate::attachments::directory(session)),
     ] {
         if removed {
             println!("forgot {}", path.display());
         }
     }
-    if !state && !legacy && !scrollback && !legacy_scrollback && !buffers {
+    if !state && !legacy && !scrollback && !legacy_scrollback && !buffers && !attachments {
         println!("nothing saved for {session}");
     }
     Ok(())

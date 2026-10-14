@@ -13564,3 +13564,130 @@ fn workspace_commands_create_refuse_collisions_and_require_approval_to_stop_prog
     assert_eq!(recovered["open"], false);
     assert_eq!(recovered["panes"], 2);
 }
+
+#[cfg(unix)]
+#[test]
+fn palette_attachment_transfers_a_complete_batch_over_host_attach_and_keeps_it_after_detach() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let local = Env::new("attachment-local");
+    let remote = Env::new("attachment-host");
+    remote.workspace(
+        "w",
+        "layout {\n    pane name=\"main\" command=\"sh\" { args \"-c\" \"stty -echo; echo READY; cat\"; }\n}\n",
+    );
+    remote.run(&["open", "w"]);
+    remote.wait_for_text("main", "READY");
+    let other = RawClient::attach(&remote, "w");
+    let (_, path) = fake_ssh(&local, &remote);
+    std::fs::write(local.root.join("config/kraal/servers.toml"), "[[server]]\nname='box'\nhost='attachment.invalid'\n")
+        .unwrap();
+    let first = local.root.join("notes client.txt");
+    let second = local.root.join("capture.bin");
+    std::fs::write(&first, b"notes from the laptop").unwrap();
+    let content = vec![0x91; 2 * 64 * 1024 + 7];
+    std::fs::write(&second, &content).unwrap();
+    let mut command = local.isolated(Path::new(env!("CARGO_BIN_EXE_kraal")));
+    command.args(["-s", &remote.session, "attach", "--host", "box", "w"]).env("PATH", path);
+    let mut host = TerminalClient::start(command);
+    host.wait_for("READY");
+    host.type_keys(b"\x02 Attach files\r");
+    host.wait_for("Enter sends, Ctrl+C cancels");
+    host.type_keys(format!("'{}' {}\r", first.display(), second.display()).as_bytes());
+    host.wait_for("Files received.");
+    host.wait_for("Ctrl+C dismisses or cancels.");
+    let root = remote.root.join("state/kraal/attachments-v1").join(&remote.session);
+    let batches: Vec<_> = std::fs::read_dir(&root).unwrap().map(|e| e.unwrap().path()).collect();
+    assert_eq!(batches.len(), 1);
+    let batch = &batches[0];
+    assert_eq!(std::fs::read(batch.join("0/notes client.txt")).unwrap(), b"notes from the laptop");
+    assert_eq!(std::fs::read(batch.join("1/capture.bin")).unwrap(), content);
+    assert_eq!(std::fs::metadata(batch).unwrap().permissions().mode() & 0o777, 0o700);
+    assert_eq!(std::fs::metadata(batch.join("1/capture.bin")).unwrap().permissions().mode() & 0o777, 0o600);
+    // cat cannot print the paths until the user sends Enter.
+    assert!(!remote.run(&["read", "-p", "main"]).contains("attachments-v1"));
+    host.type_keys(b"\x03");
+    // Cancellation consumes its whole terminal read. Wait for the result to be dismissed
+    // before typing Enter, so the two keys cannot be coalesced into that read.
+    wait_until(PATIENCE, "attachment result dismissed", || {
+        let written = host.written.lock().unwrap();
+        !text_after(&written, 100, 30).iter().any(|row| row.contains("Ctrl+C dismisses or cancels."))
+    });
+    host.type_keys(b"\r");
+    let pasted = remote.wait_for_text("main", "attachments-v1");
+    assert!(pasted.contains("notes client.txt"));
+    assert!(pasted.contains("capture.bin"));
+    other.wait_for_screen("capture.bin");
+    host.type_keys(b"\x02d");
+    assert_eq!(host.left("attachment detach").0, 0);
+    assert_eq!(std::fs::read(batch.join("1/capture.bin")).unwrap(), content);
+    remote.run(&["kill"]);
+    assert!(batch.exists());
+    remote.run(&["forget"]);
+    assert!(!root.exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn attachment_wire_cancellation_disconnect_and_repeated_finish_do_not_paste_partial_or_duplicate_paths() {
+    let env = Env::new("attachment-wire");
+    env.workspace(
+        "w",
+        "layout {\n    pane name=\"main\" command=\"sh\" { args \"-c\" \"stty -echo; echo READY; cat\"; }\n}\n",
+    );
+    env.run(&["open", "w"]);
+    env.wait_for_text("main", "READY");
+    let root = env.root.join("state/kraal/attachments-v1").join(&env.session);
+    for outcome in ["cancel", "disconnect", "finish"] {
+        let mut client = RawClient::attach(&env, "w");
+        raw_frame(&mut client.stream, 0, br#"{"type":"attach","version":2,"cols":120,"rows":40,"workspace":"w","remote":true,"features":["attachments"]}"#);
+        client.send(b"\x02 Attach files\r");
+        client.wait_for_message("attachment_offer");
+        let token = client
+            .messages
+            .lock()
+            .unwrap()
+            .iter()
+            .find_map(|m| {
+                let value: serde_json::Value = serde_json::from_str(m).ok()?;
+                (value["type"] == "attachment_offer").then(|| value["token"].as_str().unwrap().to_string())
+            })
+            .unwrap();
+        let send = |client: &mut RawClient, value: serde_json::Value| {
+            raw_frame(&mut client.stream, 0, &serde_json::to_vec(&value).unwrap())
+        };
+        send(
+            &mut client,
+            serde_json::json!({"type":"attachment_start","token":token,"files":[{"name":"note","size":3}]}),
+        );
+        client.wait_for_message("attachment_ack");
+        send(
+            &mut client,
+            serde_json::json!({"type":"attachment_chunk","token":token,"file":0,"offset":0,"data":"YWJj"}),
+        );
+        assert!(!env.run(&["read", "-p", "main"]).contains("attachments-v1"));
+        match outcome {
+            "cancel" => {
+                send(&mut client, serde_json::json!({"type":"attachment_cancel","token":token}));
+                client.wait_for_message("No paths or queued typing pasted");
+            }
+            "disconnect" => {
+                drop(client);
+            }
+            "finish" => {
+                send(&mut client, serde_json::json!({"type":"attachment_finish","token":token}));
+                client.wait_for_message("Files received");
+                send(&mut client, serde_json::json!({"type":"attachment_finish","token":token}));
+                client.send(b"\r");
+                let text = env.wait_for_text("main", "attachments-v1");
+                assert_eq!(text.matches("attachments-v1").count(), 1);
+                assert_eq!(std::fs::read(root.join(&token).join("0/note")).unwrap(), b"abc");
+            }
+            _ => unreachable!(),
+        }
+        wait_until(PATIENCE, "incomplete attachment removed", || !root.join(format!(".{token}")).exists());
+        if outcome != "finish" {
+            assert!(!root.join(token).exists());
+        }
+    }
+}

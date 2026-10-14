@@ -294,3 +294,10 @@ the prefix, without Shift. On a non-Latin layout, a key stands for the letter at
 US keyboard, so Ctrl+B is still the prefix on a Russian layout. A key the keymap binds by its
 character keeps that meaning. Terminals without the protocol send characters only, and shortcuts
 read them as such. Key release events are not passed on yet.
+
+## Attach files
+
+The command palette (`ctrl+b space`) includes **Attach files** and **Purge attachments**.
+**Attach files** opens a local path form: Enter sends, Ctrl+C cancels. It works with terminals
+that do not support bracketed paste. No key is assigned by default; custom bindings use
+`attach_files` and `purge_attachments`. See [Attachments](terminal.md#attachments).

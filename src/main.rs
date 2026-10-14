@@ -4,6 +4,7 @@ mod account_status;
 mod accounts;
 mod agent;
 mod ansi;
+mod attachments;
 mod buffers;
 mod cli;
 mod client;

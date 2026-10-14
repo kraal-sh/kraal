@@ -228,3 +228,52 @@ And everywhere:
   images off: their sequences then reach the emulator, which ignores them, and previews draw their
   image with half blocks. Both settings are read when the session starts.
 - Not supported: animations, images under the text (negative z-index), offsets within a cell.
+
+## Attachments
+
+Open the command palette (`ctrl+b space`) and choose **Attach files**. Enter existing absolute
+paths on your laptop, separated by spaces. Quote paths containing spaces, for example
+`'/home/me/notes client.txt' /home/me/capture.png`. Press Enter to send their contents and submit
+the resulting paths to the pane named in the form. Ctrl+C cancels. The form is local: a server
+message alone cannot read files. URI paths, directories, symlinks and special files are refused.
+Use `kraal cp` for directories and larger transfers.
+
+With `attach --host`, files travel through the existing attach connection, in 64 KiB chunks
+with only one unacknowledged chunk. The target pane is reserved when the action opens. Changing
+focus does not redirect the paths. Broadcasting asks whether to attach only to that pane.
+A local session submits the original paths without copying files. No Enter is added, and the
+usual production paste protections still apply. No path is submitted unless the entire batch
+arrives. Ordinary pasted text is unchanged; automatic dropped-path recognition and clipboard
+images are separate features.
+
+Sending shows progress after 200 ms, with Ctrl+C to cancel. Typing waits in a bounded queue
+(up to 64 KiB, for at most 60 seconds including the form) and follows the paths on success.
+Closing the pane, cancelling, exceeding the queue or timing out discards the queued typing
+and incomplete files, with a clear result. After failure, further typing is held out until
+Ctrl+C dismisses the result, so the tail of a large paste cannot reach the pane. If focus changed, the paths still go to the reserved
+pane but queued typing is discarded. Use **Attach files** to retry, selecting the files again. Dismiss a failure with Ctrl+C first.
+Results remain on the client until Ctrl+C dismisses them or another attachment opens.
+
+The defaults are 64 MiB per file, 128 MiB per batch, 32 files and 1 GiB per session. All four
+are [configurable](configuration.md#attachments). No limit silently truncates content. The
+session quota includes small result records, with 4 KiB reserved per in-progress batch for its
+result. At most 4096 completed batches are retained to bound bookkeeping even for empty files.
+
+The server chooses every destination under
+`~/.local/state/kraal/attachments-v1/<session>/` (or `$XDG_STATE_HOME/kraal/attachments-v1/`).
+Directories are private (0700) and files are 0600. Each file gets its own numbered subdirectory,
+so equal names never overwrite each other. Ordinary filenames are retained and shell quoted;
+control characters, separators and oversized names use an `attachment-N` alias visible in
+the pasted path. Processes running under the same Unix account can read these files.
+
+Completed files survive detaching and server restarts. `kraal forget` removes them with the
+session. **Purge attachments** in the palette asks before removing all of the session's
+attachments; previously pasted paths then stop working. Cancel active attachments first.
+Startup removes incomplete batches left by a crash. It also removes orphan session directories
+older than seven days, only after checking under the session lock that no server or saved
+session owns them. Active and saved sessions are never purged just for their age.
+
+A disconnect cancels an incomplete batch. After reconnect, the client queries the last batch's
+result without resending bytes or pasting again. The server retains a result beside each
+completed batch. If a crash prevents knowing whether the paste happened, the result says so:
+inspect the pane before retrying. There is no byte resume.

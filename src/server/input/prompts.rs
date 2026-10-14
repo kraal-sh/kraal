@@ -480,6 +480,8 @@ impl Server {
                         return self.ask_delete_workspace(target);
                     }
                     ConfirmAction::Restart => self.restart(id),
+                    ConfirmAction::AttachFiles(pane) => return self.offer_attachments(id, Some(pane)),
+                    ConfirmAction::PurgeAttachments => self.purge_attachments(id),
                     ConfirmAction::Quit => self.quit(id),
                     ConfirmAction::Job { label, args } => self.start_job(id, &label, args),
                     ConfirmAction::GitJob { label, script } => {

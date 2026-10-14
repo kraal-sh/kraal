@@ -1,0 +1,732 @@
+//! Attachment state belongs to a connection; completed files belong to the session.
+
+use std::collections::HashMap;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use anyhow::{Context, Result, ensure};
+use base64::Engine;
+
+use super::{ClientId, Event, Mode, Server};
+use crate::attachments::{self, Batch};
+use crate::layout::PaneId;
+use crate::protocol::{ClientMsg, ServerMsg};
+
+#[derive(Default)]
+pub(super) struct Attachments {
+    pub negotiated: bool,
+    pub pending: Option<Pending>,
+    pub blocked: Option<String>,
+}
+
+pub(super) struct Pending {
+    token: String,
+    pane: PaneId,
+    started: Instant,
+    batch: bool,
+    busy: bool,
+    cancelled: Arc<AtomicBool>,
+    keys: Vec<u8>,
+}
+
+impl Drop for Pending {
+    fn drop(&mut self) {
+        self.cancelled.store(true, Ordering::SeqCst);
+    }
+}
+
+pub enum Completion {
+    Ack(Result<u64>),
+    Finished(Result<String>),
+    Status(String),
+    Purged(std::io::Result<bool>),
+    Recorded(Result<()>),
+}
+
+type Batches = HashMap<String, (Batch, Arc<AtomicBool>)>;
+type Work = Box<dyn FnOnce(&mut Batches) -> Completion + Send>;
+
+struct Job {
+    id: ClientId,
+    token: String,
+    work: Work,
+}
+
+#[cfg(test)]
+type Pause = Arc<std::sync::Mutex<Option<(crossbeam_channel::Sender<()>, crossbeam_channel::Receiver<()>)>>>;
+
+pub(super) struct Worker {
+    jobs: crossbeam_channel::Sender<Job>,
+    #[cfg(test)]
+    pause: Pause,
+}
+
+impl Worker {
+    fn start(events: super::EventSender) -> Result<Self> {
+        let (jobs, incoming) = crossbeam_channel::bounded::<Job>(32);
+        #[cfg(test)]
+        let pause =
+            Arc::new(std::sync::Mutex::new(None::<(crossbeam_channel::Sender<()>, crossbeam_channel::Receiver<()>)>));
+        #[cfg(test)]
+        let paused = pause.clone();
+        crate::threads::named("attachment-storage").spawn(move || {
+            let mut batches = Batches::new();
+            loop {
+                let job = incoming.recv_timeout(Duration::from_millis(100));
+                // Cleanup, including Batch::drop, stays on this thread even after disconnect.
+                batches.retain(|_, (_, cancelled)| !cancelled.load(Ordering::SeqCst));
+                match job {
+                    Ok(job) => {
+                        #[cfg(test)]
+                        if let Some((entered, resume)) = paused.lock().unwrap().take() {
+                            entered.send(()).unwrap();
+                            resume.recv().unwrap();
+                        }
+                        let result = (job.work)(&mut batches);
+                        if events.send(Event::Attachment(job.id, job.token, result)).is_err() {
+                            break;
+                        }
+                    }
+                    Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
+                    Err(_) => break,
+                }
+            }
+        })?;
+        Ok(Self {
+            jobs,
+            #[cfg(test)]
+            pause,
+        })
+    }
+}
+
+impl Server {
+    pub(super) fn offer_attachments(&mut self, id: ClientId, confirmed: Option<PaneId>) -> Mode {
+        let Some(c) = self.clients.get(&id) else { return Mode::Normal };
+        if !c.attached || !c.attachments.negotiated {
+            self.toast(id, "Attach files needs a newer client. Update kraal on your laptop and attach again.");
+            return Mode::Normal;
+        }
+        if c.attachments.blocked.is_some() {
+            self.toast(id, "Press Ctrl+C to dismiss the attachment result before trying again.");
+            return Mode::Normal;
+        }
+        if c.attachments.pending.is_some() {
+            self.toast(id, "An attachment is already open. Finish it or press Ctrl+C to cancel.");
+            return Mode::Normal;
+        }
+        let Some(pane) = confirmed.or_else(|| self.client_focus(id)) else {
+            self.toast(id, "Add a terminal pane before attaching files.");
+            return Mode::Normal;
+        };
+        if !self.attachment_target(pane) {
+            self.toast(id, "Select a running terminal pane before attaching files.");
+            return Mode::Normal;
+        }
+        if confirmed.is_none() && self.input_targets(id, pane).len() != 1 {
+            return Mode::confirm(
+                format!("Broadcasting is on. Attach files only to {}?", self.pane_label(pane)),
+                super::ui::ConfirmAction::AttachFiles(pane),
+            );
+        }
+        let token = format!(
+            "{:x}-{:x}",
+            SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos(),
+            self.alloc_id()
+        );
+        let target = self.pane_label(pane);
+        self.clients.get_mut(&id).unwrap().attachments.pending = Some(Pending {
+            token: token.clone(),
+            pane,
+            started: Instant::now(),
+            batch: false,
+            busy: false,
+            cancelled: Arc::new(AtomicBool::new(false)),
+            keys: Vec::new(),
+        });
+        self.send_msg(id, &ServerMsg::AttachmentOffer { token, target, limits: self.config.attachments.clone() });
+        Mode::Normal
+    }
+
+    fn attachment_target(&self, pane: PaneId) -> bool {
+        self.panes.get(&pane).is_some_and(|p| p.is_terminal() && p.exit_code.is_none())
+    }
+
+    pub(super) fn attachment_input(&mut self, id: ClientId, bytes: &[u8]) -> bool {
+        let Some(client) = self.clients.get_mut(&id) else { return false };
+        if client.attachments.blocked.is_some() {
+            return true;
+        }
+        let Some(pending) = client.attachments.pending.as_mut() else { return false };
+        if pending.keys.len() + bytes.len() > 64 * 1024 {
+            let token = pending.token.clone();
+            self.attachment_failed(id, token, "too much typing while sending; attach again after typing");
+        } else {
+            pending.keys.extend_from_slice(bytes);
+        }
+        true
+    }
+
+    fn attachment_failed(&mut self, id: ClientId, token: String, error: &str) {
+        if let Some(c) = self.clients.get_mut(&id)
+            && c.attachments.pending.as_ref().is_none_or(|p| p.token == token)
+        {
+            c.attachments.pending = None;
+            c.attachments.blocked = Some(token.clone());
+        }
+        let message = format!(
+            "Attachment stopped: {error}. No paths or queued typing pasted. Press Ctrl+C, then use Attach files to retry."
+        );
+        self.toast(id, &message);
+        self.send_msg(id, &ServerMsg::AttachmentResult { token, message });
+    }
+
+    pub(super) fn attachment_message(&mut self, id: ClientId, msg: ClientMsg) {
+        if !self.clients.get(&id).is_some_and(|c| c.attached && c.attachments.negotiated) {
+            return;
+        }
+        let token = match &msg {
+            ClientMsg::AttachmentStart { token, .. }
+            | ClientMsg::AttachmentChunk { token, .. }
+            | ClientMsg::AttachmentFinish { token }
+            | ClientMsg::AttachmentCancel { token }
+            | ClientMsg::AttachmentStatus { token }
+            | ClientMsg::AttachmentDismiss { token }
+            | ClientMsg::AttachmentLocal { token, .. } => token.clone(),
+            _ => return,
+        };
+        if matches!(msg, ClientMsg::AttachmentDismiss { .. }) {
+            let state = &mut self.clients.get_mut(&id).unwrap().attachments;
+            if state.blocked.as_ref() == Some(&token) {
+                state.blocked = None;
+            }
+            return;
+        }
+        let status = matches!(msg, ClientMsg::AttachmentStatus { .. });
+        if status || self.clients[&id].attachments.pending.as_ref().is_none_or(|p| p.token != token) {
+            // A repeated finish reports the durable result, never pastes again.
+            let session = self.session.clone();
+            let lookup = token.clone();
+            if let Err(error) = self.attachment_job(id, token.clone(), move |_| {
+                let message = attachments::result(&session, &lookup).unwrap_or_else(|_| {
+                    if status {
+                        "No completed batch found. No automatic retry. Inspect the pane, then use Attach files to retry.".into()
+                    } else {
+                        "Attachment expired. Use Attach files to retry.".into()
+                    }
+                });
+                Completion::Status(message)
+            }) {
+                self.send_msg(id, &ServerMsg::AttachmentResult { token, message: format!("Cannot read attachment result: {error}") });
+            }
+            return;
+        }
+        if matches!(msg, ClientMsg::AttachmentCancel { .. }) {
+            self.attachment_failed(id, token, "cancelled");
+            return;
+        }
+        if let Err(error) = self.receive_attachment(id, msg) {
+            self.attachment_failed(id, token, &format!("{error:#}"));
+        }
+    }
+
+    fn receive_attachment(&mut self, id: ClientId, msg: ClientMsg) -> Result<()> {
+        let pending = self.clients[&id].attachments.pending.as_ref().unwrap();
+        ensure!(self.attachment_target(pending.pane), "the reserved pane closed");
+        ensure!(pending.started.elapsed() < attachments::TIMEOUT, "transfer timed out");
+        let token = pending.token.clone();
+        match msg {
+            ClientMsg::AttachmentStart { files, .. } => {
+                ensure!(!pending.batch && !pending.busy, "batch already started");
+                ensure!(self.clients[&id].remote, "local attachments use their original paths");
+                self.config.attachments.check(&files)?;
+                let root = attachments::directory(&self.session);
+                let settings = self.config.attachments.clone();
+                let cancelled = pending.cancelled.clone();
+                let batch_token = token.clone();
+                self.attachment_job(id, token, move |batches| {
+                    let result = (|| {
+                        ensure!(!cancelled.load(Ordering::SeqCst), "attachment cancelled");
+                        let reserved = batches
+                            .values()
+                            .map(|(b, _)| b.total.saturating_add(attachments::RESULT_RESERVE))
+                            .fold(0u64, u64::saturating_add);
+                        let batch = Batch::start(&root, &batch_token, &files, &settings, reserved)?;
+                        batches.insert(batch_token, (batch, cancelled));
+                        Ok(0)
+                    })();
+                    Completion::Ack(result)
+                })?;
+                let pending = self.clients.get_mut(&id).unwrap().attachments.pending.as_mut().unwrap();
+                pending.batch = true;
+                pending.busy = true;
+            }
+            ClientMsg::AttachmentChunk { file, offset, data, .. } => {
+                ensure!(pending.batch && !pending.busy, "batch is not ready");
+                ensure!(data.len() <= attachments::CHUNK.div_ceil(3) * 4, "attachment chunk too large");
+                let bytes = base64::engine::general_purpose::STANDARD.decode(data)?;
+                let batch_token = token.clone();
+                self.attachment_job(id, token, move |batches| {
+                    Completion::Ack((|| {
+                        let (batch, _) = batches.get_mut(&batch_token).context("batch has not started")?;
+                        batch.chunk(file, offset, &bytes)?;
+                        Ok(batch.received)
+                    })())
+                })?;
+                self.clients.get_mut(&id).unwrap().attachments.pending.as_mut().unwrap().busy = true;
+            }
+            ClientMsg::AttachmentFinish { .. } => {
+                ensure!(pending.batch && !pending.busy, "batch is not ready");
+                let batch_token = token.clone();
+                self.attachment_job(id, token, move |batches| {
+                    Completion::Finished((|| {
+                        let (batch, _) = batches.remove(&batch_token).context("batch has not started")?;
+                        batch.finish()
+                    })())
+                })?;
+                self.clients.get_mut(&id).unwrap().attachments.pending.as_mut().unwrap().busy = true;
+            }
+            ClientMsg::AttachmentLocal { paths, .. } => {
+                ensure!(!self.clients[&id].remote, "remote attachments must transfer their files");
+                ensure!(!paths.is_empty() && paths.len() <= self.config.attachments.files, "invalid file count");
+                ensure!(
+                    paths.iter().all(|p| p.len() <= 4096
+                        && std::path::Path::new(p).is_absolute()
+                        && !p.chars().any(char::is_control)),
+                    "invalid local attachment path"
+                );
+                let paths = paths.iter().map(|p| crate::shell::quote(p)).collect::<Vec<_>>().join(" ");
+                let pane = pending.pane;
+                self.buffer_paste(pane, &paths).map_err(anyhow::Error::msg)?;
+                let pending = self.clients.get_mut(&id).unwrap().attachments.pending.take().unwrap();
+                let mode = self.paste_to(id, pane, &[pane], paths.into_bytes());
+                self.clients.get_mut(&id).unwrap().mode = mode;
+                let same_focus = self.client_focus(id) == Some(pane);
+                let message = if !same_focus && !pending.keys.is_empty() {
+                    self.clients.get_mut(&id).unwrap().attachments.blocked = Some(token.clone());
+                    "Local paths submitted to the reserved pane. Focus changed: queued typing discarded. Press Ctrl+C, then select the pane before typing."
+                } else {
+                    "Local paths submitted to the reserved pane. No Enter added."
+                };
+                self.send_msg(id, &ServerMsg::AttachmentResult { token, message: message.into() });
+                if same_focus {
+                    self.client_input(id, &pending.keys);
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn attachment_job(
+        &mut self,
+        id: ClientId,
+        token: String,
+        work: impl FnOnce(&mut Batches) -> Completion + Send + 'static,
+    ) -> Result<()> {
+        if self.attachment_worker.is_none() {
+            self.attachment_worker = Some(Worker::start(self.tx.clone())?);
+        }
+        self.attachment_worker
+            .as_ref()
+            .unwrap()
+            .jobs
+            .try_send(Job { id, token, work: Box::new(work) })
+            .map_err(|_| anyhow::anyhow!("attachment storage is busy; try again"))
+    }
+
+    fn record_attachment(&mut self, id: ClientId, token: &str, message: &str) {
+        let session = self.session.clone();
+        let saved_token = token.to_string();
+        let message = message.to_string();
+        if let Err(error) = self.attachment_job(id, token.to_string(), move |_| {
+            Completion::Recorded(attachments::record(&session, &saved_token, &message))
+        }) {
+            self.log_message(&format!("attachment result could not be saved: {error:#}"), false);
+        }
+    }
+
+    pub(super) fn attachment_complete(&mut self, id: ClientId, token: String, result: Completion) {
+        let result = match result {
+            Completion::Status(message) => {
+                self.send_msg(id, &ServerMsg::AttachmentResult { token, message });
+                return;
+            }
+            Completion::Purged(result) => {
+                match result {
+                    Ok(_) => self.toast(id, "Attachments removed. Previously pasted paths no longer exist."),
+                    Err(e) => {
+                        self.toast(id, format!("Attachments could not be removed: {e}. Retry Purge attachments."))
+                    }
+                }
+                return;
+            }
+            Completion::Recorded(result) => {
+                if let Err(error) = result {
+                    self.log_message(&format!("attachment result could not be saved: {error:#}"), false);
+                }
+                return;
+            }
+            result => result,
+        };
+        let Some(pending) =
+            self.clients.get(&id).and_then(|c| c.attachments.pending.as_ref()).filter(|p| p.token == token)
+        else {
+            return;
+        };
+        if pending.started.elapsed() >= attachments::TIMEOUT || !self.attachment_target(pending.pane) {
+            self.attachment_failed(id, token, "the reserved pane closed or the attachment timed out");
+            return;
+        }
+        match result {
+            Completion::Ack(Ok(received)) => {
+                self.clients.get_mut(&id).unwrap().attachments.pending.as_mut().unwrap().busy = false;
+                self.send_msg(id, &ServerMsg::AttachmentAck { token, received });
+            }
+            Completion::Ack(Err(error)) | Completion::Finished(Err(error)) => {
+                self.attachment_failed(id, token, &format!("{error:#}"));
+            }
+            Completion::Finished(Ok(paths)) => {
+                let pending = self.clients.get_mut(&id).unwrap().attachments.pending.take().unwrap();
+                if let Err(error) = self.buffer_paste(pending.pane, &paths) {
+                    self.clients.get_mut(&id).unwrap().attachments.blocked = Some(token.clone());
+                    let message = format!(
+                        "Files kept, no paths or queued typing pasted: {error}. Press Ctrl+C, then use Attach files when the pane is ready."
+                    );
+                    self.record_attachment(id, &token, &message);
+                    self.send_msg(id, &ServerMsg::AttachmentResult { token, message: message.clone() });
+                    self.toast(id, message);
+                    return;
+                }
+                let mode = self.paste_to(id, pending.pane, &[pending.pane], paths.into_bytes());
+                let same_focus = self.client_focus(id) == Some(pending.pane);
+                let message = if !same_focus && !pending.keys.is_empty() {
+                    self.clients.get_mut(&id).unwrap().attachments.blocked = Some(token.clone());
+                    "Files received. Paths submitted to the reserved pane. Focus changed: queued typing discarded. Press Ctrl+C, then select the pane before typing."
+                } else {
+                    "Files received. Paths submitted to the reserved pane. No Enter added."
+                };
+                self.clients.get_mut(&id).unwrap().mode = mode;
+                self.record_attachment(id, &token, message);
+                self.send_msg(id, &ServerMsg::AttachmentResult { token, message: message.into() });
+                self.toast(id, message);
+                if same_focus {
+                    self.client_input(id, &pending.keys);
+                }
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    pub(super) fn expire_attachments(&mut self, now: Instant) {
+        let expired: Vec<_> = self
+            .clients
+            .values()
+            .filter_map(|c| {
+                let p = c.attachments.pending.as_ref()?;
+                (now.duration_since(p.started) >= attachments::TIMEOUT || !self.attachment_target(p.pane))
+                    .then(|| (c.id, p.token.clone()))
+            })
+            .collect();
+        for (id, token) in expired {
+            self.attachment_failed(id, token, "the reserved pane closed or the attachment timed out");
+        }
+    }
+
+    pub(super) fn purge_attachments(&mut self, id: ClientId) {
+        if self.clients.values().any(|c| c.attachments.pending.is_some()) {
+            self.toast(id, "Cancel active attachments before purging.");
+            return;
+        }
+        let session = self.session.clone();
+        if let Err(error) =
+            self.attachment_job(id, String::new(), move |_| Completion::Purged(attachments::remove(&session)))
+        {
+            self.toast(id, format!("Attachments could not be removed: {error}. Retry Purge attachments."));
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::attachments::FileSpec;
+    use crate::server::{
+        queue,
+        tests::{client, server},
+    };
+
+    fn setup(name: &str) -> (Server, ClientId, std::os::unix::net::UnixStream, PaneId, queue::EventReceiver) {
+        let (tx, rx) = queue::channel(4096);
+        let mut server = server(tx);
+        server.session = format!("attachment-{name}");
+        let (id, peer) = client(&mut server);
+        let ws = server.clients[&id].workspace;
+        let _batch = crate::pane::batch();
+        let pane = server
+            .spawn_pane_in(
+                ws,
+                None,
+                crate::pane::PaneSpec { command: vec!["true".into()], ..Default::default() },
+                crate::protocol::Placement::Tab,
+                None,
+            )
+            .unwrap();
+        let c = server.clients.get_mut(&id).unwrap();
+        c.remote = true;
+        c.attachments.negotiated = true;
+        (server, id, peer, pane, rx)
+    }
+
+    fn settle(server: &mut Server, rx: &queue::EventReceiver) {
+        // A completion may enqueue the durable result. A second barrier also waits for it.
+        for _ in 0..2 {
+            server.attachment_job(0, "barrier".into(), |_| Completion::Recorded(Ok(()))).unwrap();
+            loop {
+                let event = rx.recv_timeout(crate::testing::PATIENCE).unwrap();
+                if let Event::Attachment(id, token, result) = event {
+                    if token == "barrier" {
+                        break;
+                    }
+                    server.attachment_complete(id, token, result);
+                }
+            }
+        }
+    }
+
+    fn begin(server: &mut Server, id: ClientId, rx: &queue::EventReceiver) -> String {
+        server.offer_attachments(id, None);
+        let token = server.clients[&id].attachments.pending.as_ref().unwrap().token.clone();
+        server.attachment_message(
+            id,
+            ClientMsg::AttachmentStart {
+                token: token.clone(),
+                files: vec![FileSpec { name: "a.txt".into(), size: 3 }],
+            },
+        );
+        settle(server, rx);
+        assert!(server.clients[&id].attachments.pending.as_ref().unwrap().batch);
+        assert!(!server.clients[&id].attachments.pending.as_ref().unwrap().busy);
+        token
+    }
+
+    fn chunk(server: &mut Server, id: ClientId, token: &str, rx: &queue::EventReceiver) {
+        server.attachment_message(
+            id,
+            ClientMsg::AttachmentChunk { token: token.into(), file: 0, offset: 0, data: "YWJj".into() },
+        );
+        settle(server, rx);
+    }
+
+    #[test]
+    fn attachment_action_holds_the_same_input_in_combined_and_split_frames() {
+        for split in [false, true] {
+            let (mut server, id, _peer, _, _rx) = setup(if split { "split" } else { "combined" });
+            let action = b"\x02 Attach files\r";
+            let tail = b"/tmp/example\r";
+            if split {
+                server.client_frame(id, crate::protocol::BYTES, action.to_vec());
+                server.client_frame(id, crate::protocol::BYTES, tail.to_vec());
+            } else {
+                server.client_frame(id, crate::protocol::BYTES, [action.as_slice(), tail].concat());
+            }
+            let pending = server.clients[&id].attachments.pending.as_ref().unwrap();
+            assert_eq!(pending.keys, tail);
+            let token = pending.token.clone();
+            server.attachment_message(id, ClientMsg::AttachmentCancel { token });
+            assert!(server.clients[&id].attachments.pending.is_none());
+            assert!(server.clients[&id].attachments.blocked.is_some());
+        }
+    }
+
+    #[test]
+    fn stalled_write_and_flush_leave_other_clients_and_cancellation_responsive() {
+        for flush in [false, true] {
+            let (mut server, id, _peer, _, rx) = setup(if flush { "stalled-flush" } else { "stalled-write" });
+            let token = begin(&mut server, id, &rx);
+            if flush {
+                chunk(&mut server, id, &token, &rx);
+            }
+            let (other, _peer2) = client(&mut server);
+            let (entered, waiting) = crossbeam_channel::bounded(1);
+            let (resume, resumed) = crossbeam_channel::bounded(1);
+            *server.attachment_worker.as_ref().unwrap().pause.lock().unwrap() = Some((entered, resumed));
+            server.attachment_message(
+                id,
+                if flush {
+                    ClientMsg::AttachmentFinish { token: token.clone() }
+                } else {
+                    ClientMsg::AttachmentChunk { token: token.clone(), file: 0, offset: 0, data: "YWJj".into() }
+                },
+            );
+            waiting.recv_timeout(crate::testing::PATIENCE).unwrap();
+            assert!(server.clients[&id].attachments.pending.as_ref().unwrap().busy);
+            assert!(!attachments::directory(&server.session).join(&token).exists());
+            server.client_frame(other, crate::protocol::BYTES, b"\x02 ".to_vec());
+            assert!(matches!(server.clients[&other].mode, Mode::Picker(_)));
+            assert!(server.attachment_input(id, b"must not reach the pane\r"));
+            if flush {
+                server.expire_attachments(Instant::now() + attachments::TIMEOUT);
+            } else {
+                server.attachment_message(id, ClientMsg::AttachmentCancel { token: token.clone() });
+            }
+            assert!(server.clients[&id].attachments.pending.is_none());
+            assert!(server.clients[&id].attachments.blocked.is_some());
+            let message = server.clients[&id].toast.as_ref().unwrap().0.clone();
+            resume.send(()).unwrap();
+            settle(&mut server, &rx);
+            assert_eq!(server.clients[&id].toast.as_ref().unwrap().0, message);
+            assert!(server.clients[&id].attachments.blocked.is_some());
+            assert!(!attachments::directory(&server.session).join(format!(".{token}")).exists());
+            attachments::remove(&server.session).unwrap();
+        }
+    }
+
+    #[test]
+    fn reservation_is_connection_bound_and_duplicate_finish_only_reports_the_result() {
+        let (mut server, id, _peer, pane, rx) = setup("finish");
+        let token = begin(&mut server, id, &rx);
+        let (other, _peer2) = client(&mut server);
+        server.clients.get_mut(&other).unwrap().attachments.negotiated = true;
+        server.attachment_message(other, ClientMsg::AttachmentCancel { token: token.clone() });
+        assert!(server.clients[&id].attachments.pending.is_some());
+        assert_eq!(server.clients[&id].attachments.pending.as_ref().unwrap().pane, pane);
+        chunk(&mut server, id, &token, &rx);
+        assert!(!attachments::directory(&server.session).join(&token).exists());
+        server.attachment_message(id, ClientMsg::AttachmentFinish { token: token.clone() });
+        settle(&mut server, &rx);
+        assert!(server.clients[&id].attachments.pending.is_none());
+        assert_eq!(
+            std::fs::read(attachments::directory(&server.session).join(&token).join("0/a.txt")).unwrap(),
+            b"abc"
+        );
+        let result = attachments::result(&server.session, &token).unwrap();
+        assert!(result.contains("reserved pane"));
+        server.clients.get_mut(&id).unwrap().toast = None;
+        server.attachment_message(id, ClientMsg::AttachmentFinish { token: token.clone() });
+        settle(&mut server, &rx);
+        assert!(server.clients[&id].toast.is_none());
+        server.drop_client(id);
+        assert_eq!(attachments::result(&server.session, &token).unwrap(), result);
+        attachments::remove(&server.session).unwrap();
+    }
+
+    #[test]
+    fn cancel_disconnect_timeout_and_closed_pane_remove_partial_batches() {
+        for cause in ["cancel", "disconnect", "timeout", "closed", "overflow", "invalid", "incomplete"] {
+            let (mut server, id, _peer, pane, rx) = setup(cause);
+            let token = begin(&mut server, id, &rx);
+            assert!(server.attachment_input(id, b"echo later\r"));
+            let root = attachments::directory(&server.session);
+            match cause {
+                "cancel" => server.attachment_message(id, ClientMsg::AttachmentCancel { token: token.clone() }),
+                "disconnect" => server.drop_client(id),
+                "timeout" => server.expire_attachments(Instant::now() + attachments::TIMEOUT),
+                "closed" => {
+                    server.panes.get_mut(&pane).unwrap().exit_code = Some(Some(0));
+                    server.expire_attachments(Instant::now());
+                }
+                "overflow" => {
+                    assert!(server.attachment_input(id, &vec![b'x'; 64 * 1024]));
+                }
+                "invalid" => server.attachment_message(
+                    id,
+                    ClientMsg::AttachmentChunk { token: token.clone(), file: 0, offset: 1, data: "YQ==".into() },
+                ),
+                "incomplete" => server.attachment_message(id, ClientMsg::AttachmentFinish { token: token.clone() }),
+                _ => unreachable!(),
+            }
+            settle(&mut server, &rx);
+            assert!(!root.join(format!(".{token}")).exists(), "{cause}");
+            assert!(!root.join(&token).exists(), "{cause}");
+            if let Some(c) = server.clients.get(&id) {
+                assert!(c.attachments.pending.is_none());
+                assert!(c.toast.as_ref().unwrap().0.contains("No paths or queued typing pasted"));
+            }
+            if cause != "disconnect" {
+                assert!(server.attachment_input(id, b"tail of a paste\x1b[201~\r"));
+                server.attachment_message(id, ClientMsg::AttachmentDismiss { token: "wrong".into() });
+                assert!(server.attachment_input(id, b"still blocked"));
+                server.attachment_message(id, ClientMsg::AttachmentDismiss { token: token.clone() });
+                assert!(!server.attachment_input(id, b"new input"));
+            }
+            attachments::remove(&server.session).unwrap();
+        }
+    }
+
+    #[test]
+    fn negotiation_and_local_paths_do_not_create_storage() {
+        let (mut server, id, _peer, _, _rx) = setup("local");
+        server.clients.get_mut(&id).unwrap().attachments.negotiated = false;
+        server.offer_attachments(id, None);
+        assert!(server.clients[&id].attachments.pending.is_none());
+        assert!(server.clients[&id].toast.as_ref().unwrap().0.contains("Update kraal"));
+        server.clients.get_mut(&id).unwrap().attachments.negotiated = true;
+        server.clients.get_mut(&id).unwrap().remote = false;
+        server.offer_attachments(id, None);
+        let token = server.clients[&id].attachments.pending.as_ref().unwrap().token.clone();
+        server.attachment_message(
+            id,
+            ClientMsg::AttachmentLocal { token, paths: vec!["/local/notes client.txt".into()] },
+        );
+        assert!(server.clients[&id].attachments.pending.is_none());
+        assert!(!attachments::directory(&server.session).exists());
+    }
+
+    #[test]
+    fn focus_changes_keep_the_reserved_target_and_purge_refuses_live_transfers() {
+        let (mut server, id, _peer, pane, rx) = setup("focus");
+        let token = begin(&mut server, id, &rx);
+        let ws = server.clients[&id].workspace;
+        let _batch = crate::pane::batch();
+        let other = server
+            .spawn_pane_in(
+                ws,
+                None,
+                crate::pane::PaneSpec { command: vec!["true".into()], ..Default::default() },
+                crate::protocol::Placement::Tab,
+                None,
+            )
+            .unwrap();
+        assert_eq!(server.client_focus(id), Some(other));
+        assert_eq!(server.clients[&id].attachments.pending.as_ref().unwrap().pane, pane);
+        server.purge_attachments(id);
+        assert!(server.clients[&id].attachments.pending.is_some());
+        assert!(server.attachment_input(id, b"later"));
+        chunk(&mut server, id, &token, &rx);
+        server.attachment_message(id, ClientMsg::AttachmentFinish { token: token.clone() });
+        settle(&mut server, &rx);
+        assert!(attachments::result(&server.session, &token).unwrap().contains("reserved pane"));
+        assert!(server.clients[&id].toast.as_ref().unwrap().0.contains("queued typing discarded"));
+        server.purge_attachments(id);
+        settle(&mut server, &rx);
+        assert!(!attachments::directory(&server.session).exists());
+    }
+    #[test]
+    fn broadcast_requires_confirmation_and_still_reserves_only_one_pane() {
+        let (mut server, id, _peer, pane, _rx) = setup("broadcast");
+        let ws = server.clients[&id].workspace;
+        let _batch = crate::pane::batch();
+        server
+            .spawn_pane_in(
+                ws,
+                None,
+                crate::pane::PaneSpec { command: vec!["true".into()], ..Default::default() },
+                crate::protocol::Placement::Tab,
+                None,
+            )
+            .unwrap();
+        let wi = server.ws_index(ws).unwrap();
+        server.workspaces[wi].sync = crate::server::SyncScope::Workspace;
+        let mode = server.offer_attachments(id, None);
+        assert!(
+            matches!(mode, Mode::Confirm(q) if matches!(q.action, crate::server::ui::ConfirmAction::AttachFiles(_)))
+        );
+        assert!(server.clients[&id].attachments.pending.is_none());
+        assert!(matches!(server.offer_attachments(id, Some(pane)), Mode::Normal));
+        assert_eq!(server.clients[&id].attachments.pending.as_ref().unwrap().pane, pane);
+    }
+}

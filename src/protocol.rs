@@ -78,8 +78,18 @@ pub const WORKSPACE_LIFECYCLE: Feature = Feature {
 };
 pub const CLIPBOARD: Feature =
     Feature { name: "clipboard", does: "copy through the client clipboard policy", check_first: false };
-pub const FEATURES: [Feature; 8] =
-    [LIST_AGENTS, BUFFERS, EDIT_SUDO, ACCOUNT_IDS, STATE_V2, WORKSPACE_FILES, WORKSPACE_LIFECYCLE, CLIPBOARD];
+pub const ATTACHMENTS: Feature = Feature { name: "attachments", does: "attach local files", check_first: false };
+pub const FEATURES: [Feature; 9] = [
+    LIST_AGENTS,
+    BUFFERS,
+    EDIT_SUDO,
+    ACCOUNT_IDS,
+    STATE_V2,
+    WORKSPACE_FILES,
+    WORKSPACE_LIFECYCLE,
+    CLIPBOARD,
+    ATTACHMENTS,
+];
 
 /// The names of this kraal's server features, as it lists them.
 pub fn feature_names() -> Vec<String> {
@@ -92,7 +102,7 @@ pub const LENIENT: &str = "lenient";
 
 /// What this kraal's client can read beyond what one of the oldest supported release can. It
 /// lists them in its messages, for a later server to rely on.
-pub const CLIENT_FEATURES: [&str; 2] = [LENIENT, CLIPBOARD.name];
+pub const CLIENT_FEATURES: [&str; 3] = [LENIENT, CLIPBOARD.name, ATTACHMENTS.name];
 
 pub fn client_features() -> Vec<String> {
     CLIENT_FEATURES.iter().map(|f| f.to_string()).collect()
@@ -235,6 +245,32 @@ pub enum ClientMsg {
         rows: u16,
     },
     Detach,
+    AttachmentStart {
+        token: String,
+        files: Vec<crate::attachments::FileSpec>,
+    },
+    AttachmentChunk {
+        token: String,
+        file: usize,
+        offset: u64,
+        data: String,
+    },
+    AttachmentFinish {
+        token: String,
+    },
+    AttachmentCancel {
+        token: String,
+    },
+    AttachmentStatus {
+        token: String,
+    },
+    AttachmentDismiss {
+        token: String,
+    },
+    AttachmentLocal {
+        token: String,
+        paths: Vec<String>,
+    },
     ClipboardResult {
         id: u64,
         outcome: ClipboardOutcome,
@@ -282,6 +318,19 @@ pub enum ServerMsg {
     },
     Response {
         result: Result<Response, String>,
+    },
+    AttachmentOffer {
+        token: String,
+        target: String,
+        limits: crate::attachments::Settings,
+    },
+    AttachmentAck {
+        token: String,
+        received: u64,
+    },
+    AttachmentResult {
+        token: String,
+        message: String,
     },
     Clipboard {
         id: u64,
@@ -1089,6 +1138,16 @@ mod tests {
             },
             ClientMsg::Resize { cols: 80, rows: 24 },
             ClientMsg::Detach,
+            ClientMsg::AttachmentStart {
+                token: s("ab"),
+                files: vec![crate::attachments::FileSpec { name: s("notes.txt"), size: 3 }],
+            },
+            ClientMsg::AttachmentChunk { token: s("ab"), file: 0, offset: 0, data: s("YWJj") },
+            ClientMsg::AttachmentFinish { token: s("ab") },
+            ClientMsg::AttachmentCancel { token: s("ab") },
+            ClientMsg::AttachmentStatus { token: s("ab") },
+            ClientMsg::AttachmentDismiss { token: s("ab") },
+            ClientMsg::AttachmentLocal { token: s("ab"), paths: vec![s("/tmp/notes.txt")] },
             ClientMsg::ClipboardResult { id: 1, outcome: ClipboardOutcome::Terminal, native_unavailable: true },
         ]);
         let pane = PaneInfo {
@@ -1164,6 +1223,9 @@ mod tests {
             ServerMsg::Attached { version: s("0.2.0"), features: Some(feature_names()) },
             ServerMsg::Open { url: s("https://example.com") },
             ServerMsg::Clipboard { id: 1, origin: ClipboardOrigin::User, text: s("hello") },
+            ServerMsg::AttachmentOffer { token: s("ab"), target: s("main"), limits: Default::default() },
+            ServerMsg::AttachmentAck { token: s("ab"), received: 3 },
+            ServerMsg::AttachmentResult { token: s("ab"), message: s("Files received.") },
             ServerMsg::Event { event: serde_json::json!({"v": 1, "type": "pane.opened"}) },
             ServerMsg::Events { events: vec![serde_json::json!({"v": 1, "type": "pane.closed"})] },
         ]);
