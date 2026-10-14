@@ -66,6 +66,8 @@ pub const EDIT_SUDO: Feature = Feature { name: "edit_sudo", does: "edit a server
 
 pub const ACCOUNT_IDS: Feature =
     Feature { name: "account_ids", does: "select an account by its identity", check_first: true };
+pub const NATIVE_AGENTS: Feature =
+    Feature { name: "native_agents", does: "start agents with native account management", check_first: true };
 pub const STATE_V2: Feature =
     Feature { name: "state_v2", does: "save sessions in the version 2 format", check_first: false };
 /// What this kraal's server lists.
@@ -83,11 +85,12 @@ pub const PASTED_PATHS: Feature =
     Feature { name: "pasted_paths", does: "recognize laptop paths in pastes", check_first: false };
 pub const CLIPBOARD_IMAGES: Feature =
     Feature { name: "clipboard_images", does: "attach clipboard images", check_first: false };
-pub const FEATURES: [Feature; 11] = [
+pub const FEATURES: [Feature; 12] = [
     LIST_AGENTS,
     BUFFERS,
     EDIT_SUDO,
     ACCOUNT_IDS,
+    NATIVE_AGENTS,
     STATE_V2,
     WORKSPACE_FILES,
     WORKSPACE_LIFECYCLE,
@@ -696,6 +699,11 @@ impl Request {
             | Request::ExportWorkspace { .. }
             | Request::PublishWorkspaceFile { .. } => Some(WORKSPACE_FILES),
             Request::ListAgents => Some(LIST_AGENTS),
+            Request::OpenAgent { agent, .. }
+                if crate::agent_registry::find(agent).is_some_and(|a| a.accounts.is_none()) =>
+            {
+                Some(NATIVE_AGENTS)
+            }
             Request::OpenAgent { account_id: Some(_), .. } => Some(ACCOUNT_IDS),
             Request::BufferList
             | Request::BufferShow { .. }
@@ -1038,6 +1046,28 @@ mod tests {
         // In an answer, it is shown as unknown.
         assert_eq!(serde_json::from_str::<AgentState>(r#""compacting""#).unwrap(), AgentState::Unknown);
         assert_eq!(serde_json::to_string(&AgentState::Unknown).unwrap(), r#""unknown""#);
+    }
+
+    #[test]
+    fn native_agents_require_negotiation_but_managed_agents_keep_their_request() {
+        assert!(feature_names().iter().any(|name| name == NATIVE_AGENTS.name));
+        for agent in crate::agent_registry::AGENTS {
+            let request = Request::OpenAgent {
+                agent: agent.name.into(),
+                account: None,
+                account_id: None,
+                placement: Placement::Auto,
+                near: None,
+                cwd: None,
+                args: Vec::new(),
+            };
+            if agent.accounts.is_none() {
+                assert_eq!(request.needs(), Some(NATIVE_AGENTS));
+                assert!(request.needs().unwrap().check_first);
+            } else {
+                assert_eq!(request.needs(), None);
+            }
+        }
     }
 
     #[test]

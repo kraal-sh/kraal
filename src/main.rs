@@ -3,6 +3,7 @@
 mod account_status;
 mod accounts;
 mod agent;
+mod agent_registry;
 mod ansi;
 mod attachments;
 mod buffers;

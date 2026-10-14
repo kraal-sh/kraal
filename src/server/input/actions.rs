@@ -49,6 +49,16 @@ impl Server {
                 return Mode::Picker(self.accounts_picker(None));
             }
             Action::AddAccount => {
+                if let Some(agent) = self
+                    .client_focus(id)
+                    .and_then(|p| self.panes.get(&p))
+                    .and_then(|p| p.agent.kind.as_deref())
+                    .and_then(crate::agent_registry::find)
+                    .filter(|a| a.accounts.is_none())
+                {
+                    self.toast(id, NoticeKind::Notice, agent.account_message());
+                    return Mode::Normal;
+                }
                 self.refresh_existing_accounts();
                 return Mode::AccountForm(self.account_form(id));
             }

@@ -156,7 +156,7 @@ fn cannot_switch_mode(pane: PaneId) -> Mode {
 
 /// Whether a conversation can move between accounts of this agent (they share its storage).
 fn conversations_move(agent: &str) -> bool {
-    accounts::agent_kind(agent).is_some_and(|k| k.shared.contains(&"projects"))
+    crate::agent_registry::find(agent).is_some_and(|a| a.cross_account_resume)
 }
 
 /// Why a pane waits for Enter before its agent starts again.
@@ -375,7 +375,11 @@ impl Server {
         if p.exit_code.is_some() || p.ssh.is_some() || p.spec.login.is_some() {
             return Ok(None);
         }
-        let Some(kind) = p.agent.kind.as_deref().and_then(accounts::agent_kind) else { return Ok(None) };
+        let Some(registered) = p.agent.kind.as_deref().and_then(crate::agent_registry::find) else { return Ok(None) };
+        if !registered.conversation_id {
+            return Ok(None);
+        }
+        let Some(kind) = registered.accounts.as_ref() else { return Ok(None) };
         let Some(leader) = p.pid() else { return Ok(None) };
         let pid = p.foreground_pid().context(PROCESS_UNVERIFIED)?;
         let started = crate::process::start_time(pid).context(PROCESS_UNVERIFIED)?;
@@ -456,6 +460,16 @@ impl Server {
     }
 
     pub(super) fn change_account_mode(&mut self, client: ClientId, pane: PaneId) -> Mode {
+        if let Some(agent) = self
+            .panes
+            .get(&pane)
+            .and_then(|p| p.agent.kind.as_deref())
+            .and_then(crate::agent_registry::find)
+            .filter(|a| a.accounts.is_none())
+        {
+            self.toast(client, NoticeKind::Notice, agent.account_message());
+            return Mode::Normal;
+        }
         if self.switches.contains_key(&pane) {
             return self.pending_switch_mode(pane);
         }
@@ -579,7 +593,7 @@ impl Server {
             return Some(self.resume_spec(&pane.spec, session));
         }
         let program = pane.spec.command.first()?.rsplit('/').next()?;
-        let kind = accounts::AGENTS.iter().find(|k| k.command == program)?;
+        let kind = accounts::agents().find(|k| k.command == program)?;
         let (command, exact) = accounts::resume_argv(kind, &pane.spec.command, session?)?;
         Some((PaneSpec { command, ..pane.spec.clone() }, exact))
     }
@@ -621,8 +635,13 @@ impl Server {
         cwd: Option<PathBuf>,
         args: &[String],
     ) -> Result<PaneId> {
-        accounts::agent_kind(agent)
-            .with_context(|| format!("unknown agent {agent:?} (known: {})", accounts::agent_names()))?;
+        let registered = crate::agent_registry::find(agent).with_context(|| format!("unknown agent {agent:?}"))?;
+        if registered.accounts.is_none() {
+            let cwd = self.agent_cwd(ws, target, cwd);
+            let launch = registered.native_launch(account, args, cwd.as_deref())?;
+            let spec = PaneSpec { command: launch.argv, cwd, ..Default::default() };
+            return self.spawn_pane_in(ws, target, spec, placement, Some(agent.into()));
+        }
         let wi = self.ws_index(ws).context("no such workspace")?;
         let ws_name = self.workspaces[wi].name.clone();
         let cwd = self.agent_cwd(ws, target, cwd);
@@ -1376,14 +1395,33 @@ impl Server {
     }
 
     pub(super) fn agent_picker(&mut self, client: ClientId, switch_for: Option<PaneId>) -> Picker {
+        self.agent_picker_on_path(client, switch_for, &std::env::var_os("PATH").unwrap_or_default())
+    }
+
+    fn agent_picker_on_path(&mut self, client: ClientId, switch_for: Option<PaneId>, path: &std::ffi::OsStr) -> Picker {
+        let cwd = self
+            .clients
+            .get(&client)
+            .and_then(|c| self.agent_cwd(c.workspace, self.client_focus(client), None))
+            .unwrap_or_else(|| dirs::home_dir().unwrap_or_else(|| "/".into()));
         let now = accounts::now();
         let current = switch_for.and_then(|p| self.pane_account(p));
         let mut items = Vec::new();
-        for kind in accounts::AGENTS {
+        for registered in crate::agent_registry::AGENTS {
+            let Some(kind) = registered.accounts.as_ref() else {
+                if switch_for.is_none() && registered.command_on_path(path, &cwd).is_some() {
+                    items.push(PickItem::new(
+                        registered.label,
+                        registered.account_message(),
+                        PickAction::AgentLaunch { agent: registered.name.into(), account: None },
+                    ));
+                }
+                continue;
+            };
             if current.as_ref().is_some_and(|c| c.agent != kind.name) {
                 continue;
             }
-            let installed = crate::transfer::have_program(kind.command);
+            let installed = registered.command_on_path(path, &cwd).is_some();
             for a in self.accounts.for_agent(kind.name) {
                 if switch_for.is_none() && (!installed || a.sign_in_required) {
                     continue;
@@ -1407,7 +1445,7 @@ impl Server {
                     Some(pane) => {
                         PickAction::AgentSwitch { pane, agent: a.agent.clone(), account: a.key(), current: is_current }
                     }
-                    None => PickAction::AgentLaunch { agent: a.agent.clone(), account: a.key() },
+                    None => PickAction::AgentLaunch { agent: a.agent.clone(), account: Some(a.key()) },
                 };
                 items.push(PickItem {
                     label: if switch_for.is_some() { accounts::label(&a) } else { super::account_ui::label(&a) },
@@ -1669,6 +1707,146 @@ mod tests {
     use super::*;
 
     #[test]
+    fn launch_picker_lists_only_installed_registry_entries() {
+        let mut t = SwitchTest::new("registry-picker");
+        let bin = t.dir.join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        assert!(t.server.agent_picker_on_path(99, None, bin.as_os_str()).items.is_empty());
+        crate::testing::write_script(&bin.join("gemini"), "#!/bin/sh\nexit 99\n");
+        let picker = t.server.agent_picker_on_path(99, None, bin.as_os_str());
+        assert_eq!(picker.items.len(), 1);
+        assert_eq!(picker.items[0].label, "Gemini");
+        assert_eq!(picker.items[0].detail, "Accounts are managed in Gemini");
+        assert!(
+            matches!(&picker.items[0].action, PickAction::AgentLaunch { agent, account: None } if agent == "gemini")
+        );
+        assert!(!picker.items.iter().any(|i| i.label == "Aider"));
+
+        let mut codex = t.server.accounts.get("claude", "from").unwrap();
+        codex.id = accounts::new_uuid();
+        codex.agent = "codex".into();
+        codex.home = t.dir.join("codex").display().to_string();
+        t.server.accounts.add(codex).unwrap();
+        for agent in crate::agent_registry::AGENTS {
+            let name = agent.launches[0][0];
+            let runtime = agent.scripts.iter().find(|(s, _)| *s == name).map_or("sh", |(_, runtime)| *runtime);
+            crate::testing::write_script(&bin.join(name), &format!("#!/usr/bin/env {runtime}\n"));
+        }
+        let picker = t.server.agent_picker_on_path(99, None, bin.as_os_str());
+        let listed: Vec<_> = picker
+            .items
+            .iter()
+            .map(|i| match &i.action {
+                PickAction::AgentLaunch { agent, .. } => agent.as_str(),
+                _ => panic!("only launch destinations"),
+            })
+            .collect();
+        assert_eq!(&listed[..3], ["claude", "claude", "codex"]);
+        assert_eq!(
+            listed.into_iter().collect::<std::collections::BTreeSet<_>>(),
+            crate::agent_registry::AGENTS.iter().map(|a| a.name).collect()
+        );
+    }
+
+    #[test]
+    fn launch_picker_rejects_python_letta_and_offers_node_letta() {
+        let mut t = SwitchTest::new("letta-runtime");
+        let bin = t.dir.join("bin");
+        let later = t.dir.join("later");
+        std::fs::create_dir(&bin).unwrap();
+        std::fs::create_dir(&later).unwrap();
+        crate::testing::write_script(&bin.join("letta"), "#!/usr/bin/python3\nraise SystemExit(99)\n");
+        crate::testing::write_script(&later.join("letta"), "#!/usr/bin/env node\nprocess.exit(99);\n");
+        let path = std::env::join_paths([&bin, &later]).unwrap();
+        assert!(
+            t.server.agent_picker_on_path(99, None, &path).items.is_empty(),
+            "the Python launcher shadows the later Node launcher"
+        );
+        let package = t.dir.join("index.js");
+        crate::testing::write_script(&package, "#!/usr/bin/env node\nprocess.exit(99);\n");
+        std::fs::remove_file(bin.join("letta")).unwrap();
+        std::os::unix::fs::symlink(package, bin.join("letta")).unwrap();
+        let picker = t.server.agent_picker_on_path(99, None, &path);
+        assert_eq!(picker.items.len(), 1);
+        assert!(matches!(&picker.items[0].action,
+            PickAction::AgentLaunch { agent, account: None } if agent == "letta"));
+    }
+
+    #[test]
+    fn relative_path_agents_use_the_focused_panes_directory() {
+        if !crate::testing::in_own_process(
+            "server::agents::tests::relative_path_agents_use_the_focused_panes_directory",
+        ) {
+            return;
+        }
+        let mut t = SwitchTest::new("relative-agent-path");
+        let server_dir = t.dir.join("home");
+        let repo = t.dir.join("repo");
+        std::fs::create_dir(&server_dir).unwrap();
+        std::fs::create_dir_all(repo.join(".venv/bin")).unwrap();
+        crate::testing::write_script(&repo.join(".venv/bin/aider"), "#!/bin/sh\nexit 0\n");
+        let (client, _peer) = super::super::tests::client(&mut t.server);
+        let ws = t.server.clients[&client].workspace;
+        let tab = &mut t.server.workspaces.last_mut().unwrap().tabs[0];
+        tab.root = Some(crate::layout::Node::Leaf(1));
+        tab.set_focus(1);
+        t.server.panes.get_mut(&1).unwrap().reported_cwd = Some(repo.clone());
+        let previous = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&server_dir).unwrap();
+        let path = ".venv/bin:/usr/bin";
+        // This test has its own process, with no concurrent tests reading PATH.
+        unsafe { std::env::set_var("PATH", path) };
+        let registered = crate::agent_registry::find("aider").unwrap();
+        assert!(registered.command_on_path(path.as_ref(), &server_dir).is_none());
+        let picker = t.server.agent_picker(client, None);
+        assert!(picker.items.iter().any(|item| matches!(&item.action,
+            PickAction::AgentLaunch { agent, account: None } if agent == "aider")));
+        let pane = t.server.launch_agent(ws, Some(1), "aider", None, Placement::Tab, None).unwrap();
+        assert_eq!(t.server.panes[&pane].spec.command, ["aider"]);
+        assert_eq!(t.server.panes[&pane].spec.cwd.as_ref(), Some(&repo));
+        std::env::set_current_dir(previous).unwrap();
+    }
+
+    #[test]
+    fn native_account_actions_explain_the_limit_without_offering_a_switch() {
+        let mut t = SwitchTest::new("native-account");
+        t.server.switches.clear();
+        let (client, _peer) = super::super::tests::client(&mut t.server);
+        let pane = t.server.panes.get_mut(&1).unwrap();
+        pane.spec.account = None;
+        pane.spec.account_id = None;
+        pane.agent.kind = Some("gemini".into());
+        let before = pane.spec.clone();
+        assert!(matches!(t.server.change_account_mode(client, 1), Mode::Normal));
+        assert_eq!(t.server.clients[&client].toast.as_ref().unwrap().0, "Accounts are managed in Gemini");
+        assert_eq!(t.server.panes[&1].spec.command, before.command);
+        assert!(t.server.switches.is_empty());
+
+        let picker = Picker::new(
+            PickerKind::Agent,
+            "Start an agent",
+            vec![PickItem::new(
+                "Gemini",
+                "Accounts are managed in Gemini",
+                PickAction::AgentLaunch { agent: "gemini".into(), account: None },
+            )],
+        );
+        t.server.clients.get_mut(&client).unwrap().mode = Mode::Picker(picker);
+        t.server.client_input(client, b"\x04");
+        let Mode::Picker(picker) = &t.server.clients[&client].mode else { panic!("keep the launch list") };
+        assert_eq!(picker.message.as_deref(), Some("Accounts are managed in Gemini"));
+
+        t.server.clients.get_mut(&client).unwrap().mode = Mode::Normal;
+        let tab = &mut t.server.workspaces.last_mut().unwrap().tabs[0];
+        tab.root = Some(crate::layout::Node::Leaf(1));
+        tab.set_focus(1);
+        t.server.client_input(client, b"\x02An");
+        assert!(matches!(t.server.clients[&client].mode, Mode::Normal));
+        assert_eq!(t.server.clients[&client].toast.as_ref().unwrap().0, "Accounts are managed in Gemini");
+        assert!(t.server.accounts.for_agent("gemini").is_empty());
+    }
+
+    #[test]
     fn finishing_discovery_keeps_the_clicked_account_in_place() {
         for (cols, rows) in [(80, 24), (124, 36)] {
             for finished in [&["claude"][..], &["codex"], &["claude", "codex"], &["codex", "claude"]] {
@@ -1734,15 +1912,15 @@ mod tests {
             let (tx, rx) = super::super::queue::channel(16);
             let mut server = super::super::tests::server(tx);
             server.check_existing_accounts();
-            assert_eq!(server.jobs.len(), accounts::AGENTS.len());
+            assert_eq!(server.jobs.len(), accounts::agents().count());
             assert!(server.existing_checks.values().all(|s| *s == ExistingCheck::Checking));
             server.refresh_existing_accounts();
-            assert_eq!(server.jobs.len(), accounts::AGENTS.len(), "opening Accounts shares the pending checks");
+            assert_eq!(server.jobs.len(), accounts::agents().count(), "opening Accounts shares the pending checks");
 
             // The isolated PATH has neither agent. Keep their completed jobs, not a status
             // subprocess racing its watchdog, and deliver them in each order.
             let mut results = Vec::new();
-            for _ in accounts::AGENTS {
+            for _ in accounts::agents() {
                 let Wait::Event(Event::Job(id, result)) = rx.wait(crate::testing::PATIENCE) else {
                     panic!("the check did not publish its result");
                 };
@@ -1757,7 +1935,7 @@ mod tests {
             let last_tick = server.last_tick;
             for (i, (id, result)) in results.into_iter().enumerate() {
                 server.handle(Event::Job(id, result));
-                assert_eq!(server.jobs.len(), accounts::AGENTS.len() - i - 1);
+                assert_eq!(server.jobs.len(), accounts::agents().count() - i - 1);
                 assert_eq!(
                     server
                         .existing_checks

@@ -1153,7 +1153,7 @@ mod tests {
                 (PickerKind::Accounts, PickAction::AccountDetails("work".into()), "Details"),
                 (
                     PickerKind::Agent,
-                    PickAction::AgentLaunch { agent: "claude".into(), account: "work".into() },
+                    PickAction::AgentLaunch { agent: "claude".into(), account: Some("work".into()) },
                     "Start",
                 ),
                 (PickerKind::Tunnels, PickAction::Tunnel { id: 1, retry: true }, "Details"),

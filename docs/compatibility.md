@@ -86,6 +86,7 @@ CLI features that need newer requests are checked separately:
 
 | Feature | Compatibility behavior |
 |---|---|
+| Native agents (`kraal agent gemini`, `kraal wt new fix --agent gemini`) | Require `native_agents`; older servers refuse with restart guidance before launch or worktree creation. |
 | `kraal import` and `kraal export` | Require the server's `workspace_files` capability; older servers refuse with restart guidance. |
 | Workspace Create, Rename, Close, Delete, Restore and deleted listing | Require `workspace_lifecycle` when talking to a running server. |
 | `kraal save` | Keeps its existing request, name rules and explicit account references. Current servers treat it as legacy KDL export and refuse unconfirmed replacements. |

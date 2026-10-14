@@ -31,6 +31,7 @@ mod scrollback;
 mod spawn;
 mod store;
 
+pub(crate) use spawn::find_program;
 pub use spawn::{batch, batching, close_inherited, open_descriptors, reserve_descriptors};
 
 pub use cache::ScreenCache;

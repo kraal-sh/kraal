@@ -78,7 +78,7 @@ kraal
 
 This starts a session, or attaches to the one already running. Press `ctrl+b` and let go: a menu
 shows what each next key does. `ctrl+b w` opens Workspaces, `ctrl+b s` opens Servers,
-`ctrl+b a` starts a Claude or Codex agent on a listed account. Use `ctrl+b A l` for Accounts
+`ctrl+b a` starts an installed agent, with named accounts for Claude and Codex. Use `ctrl+b A l` for Accounts
 and **+ Add account** if none is listed. Each management list has **+ Add**; search only filters.
 The bar at the bottom shows what can be done in the focused pane, and its keys.
 
