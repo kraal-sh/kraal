@@ -157,6 +157,11 @@ pub struct Account {
     pub references: Vec<Account>,
 }
 
+#[cfg(test)]
+thread_local! {
+    pub(crate) static HOME_CHECKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 impl Account {
     pub fn key(&self) -> String {
         key(&self.agent, &format!("@{}", self.id))
@@ -170,6 +175,8 @@ impl Account {
     }
 
     pub fn same_home(&self, other: &Account) -> bool {
+        #[cfg(test)]
+        HOME_CHECKS.with(|n| n.set(n.get() + 1));
         let home = |a: &Account| {
             let path = paths::expand_tilde(&a.home);
             std::fs::canonicalize(&path).unwrap_or(path)
@@ -514,6 +521,10 @@ impl Accounts {
             }
             Ok(out)
         })?
+    }
+
+    pub(crate) fn entries(&self) -> &[Account] {
+        &self.accounts
     }
 
     /// Confirmed accounts, with one entry per home or reviewed identity.

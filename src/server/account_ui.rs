@@ -1,5 +1,8 @@
 //! Account management shared by the list, sidebar and add form.
 
+use std::collections::HashMap;
+use std::rc::Rc;
+
 use anyhow::{Context, Result};
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
@@ -13,6 +16,36 @@ use crate::ansi::Cursor;
 use crate::input::{InputEvent, KeyCode, MouseButton, MouseKind};
 use crate::layout::PaneId;
 use crate::text::wrap;
+
+/// Account labels and summaries do not depend on terminal output or the general chrome tick.
+pub(super) struct AccountDisplay {
+    accounts: Vec<Account>,
+    panes: HashMap<PaneId, PaneAccountInput>,
+    usage: HashMap<String, Usage>,
+    checks: HashMap<String, super::agents::ExistingCheck>,
+    since: i64,
+    pub until: Option<i64>,
+    pub items: Vec<PickItem>,
+    pub labels: HashMap<PaneId, String>,
+    pub sidebar: std::cell::RefCell<Option<super::render::AccountRows>>,
+}
+
+#[derive(PartialEq)]
+struct PaneAccountInput {
+    reference: Option<String>,
+    id: Option<String>,
+    env: Vec<(String, String)>,
+    observed: Option<Account>,
+}
+
+impl PaneAccountInput {
+    fn matches(&self, pane: &crate::pane::Pane, observed: Option<&Account>) -> bool {
+        self.reference == pane.spec.account
+            && self.id == pane.spec.account_id
+            && self.env == pane.spec.env
+            && self.observed.as_ref() == observed
+    }
+}
 
 #[derive(Clone)]
 pub enum AccountChoice {
@@ -125,6 +158,65 @@ pub(super) fn sidebar_summary(summary: &str, width: usize) -> String {
 }
 
 impl Server {
+    pub(super) fn account_display_at(&self, now: i64) -> Rc<AccountDisplay> {
+        self.account_display(Some(now))
+    }
+
+    pub(super) fn pane_account_label(&self, pane: PaneId) -> Option<String> {
+        // Frame labels do not age; composing a frame uses one moment for its usage rows.
+        self.account_display(None).labels.get(&pane).cloned()
+    }
+
+    fn account_display(&self, now: Option<i64>) -> Rc<AccountDisplay> {
+        let mut cached = self.account_display.borrow_mut();
+        if let Some(display) = cached.as_ref()
+            && display.accounts == self.accounts.entries()
+            && display.usage == self.usage.0
+            && display.checks == self.existing_checks
+            && now.is_none_or(|now| now >= display.since && display.until.is_none_or(|until| now < until))
+            && display.panes.len() == self.panes.len()
+            && self.panes.iter().all(|(id, pane)| {
+                display
+                    .panes
+                    .get(id)
+                    .is_some_and(|input| input.matches(pane, self.observed_agents.get(id).map(|a| &a.account)))
+            })
+        {
+            return display.clone();
+        }
+        let now = now.unwrap_or_else(accounts::now);
+        let panes = self
+            .panes
+            .iter()
+            .map(|(&id, pane)| {
+                (
+                    id,
+                    PaneAccountInput {
+                        reference: pane.spec.account.clone(),
+                        id: pane.spec.account_id.clone(),
+                        env: pane.spec.env.clone(),
+                        observed: self.observed_agents.get(&id).map(|a| a.account.clone()),
+                    },
+                )
+            })
+            .collect();
+        let labels =
+            self.panes.keys().filter_map(|&id| self.pane_account(id).map(|a| (id, accounts::label(&a)))).collect();
+        let display = Rc::new(AccountDisplay {
+            accounts: self.accounts.entries().to_vec(),
+            panes,
+            usage: self.usage.0.clone(),
+            checks: self.existing_checks.clone(),
+            since: now,
+            until: self.account_summaries_until(now),
+            items: self.account_items_at(now),
+            labels,
+            sidebar: Default::default(),
+        });
+        *cached = Some(display.clone());
+        display
+    }
+
     pub(super) fn account_summary(&self, a: &Account) -> String {
         self.account_summary_at(a, accounts::now())
     }
@@ -144,6 +236,16 @@ impl Server {
     }
 
     pub(super) fn accounts_picker_at(&self, selected: Option<&str>, now: i64) -> Picker {
+        let mut p = Picker::new(PickerKind::Accounts, "Accounts", self.account_display_at(now).items.clone());
+        if let Some(id) = selected {
+            p.select(|i| matches!(&i.action, PickAction::AccountDetails(a) if a == id));
+        }
+        p
+    }
+
+    fn account_items_at(&self, now: i64) -> Vec<PickItem> {
+        #[cfg(test)]
+        ACCOUNT_BUILDS.with(|n| n.set(n.get() + 1));
         let mut items: Vec<_> = self
             .accounts
             .all()
@@ -171,11 +273,7 @@ impl Server {
             ));
         }
         items.push(PickItem::new("+ Add account", "", PickAction::AddAccount));
-        let mut p = Picker::new(PickerKind::Accounts, "Accounts", items);
-        if let Some(id) = selected {
-            p.select(|i| matches!(&i.action, PickAction::AccountDetails(a) if a == id));
-        }
-        p
+        items
     }
 
     /// Account rows hold until a usage window resets or a "Last checked" age changes.
@@ -658,6 +756,97 @@ mod tests {
         super::super::tests::server(tx)
     }
 
+    #[test]
+    fn cached_accounts_follow_identity_pane_and_sign_in_changes() {
+        let _batch = crate::pane::batch();
+        let mut server = server();
+        let a = server.accounts.add(account()).unwrap();
+        let display = server.account_display_at(1_000);
+        assert!(Rc::ptr_eq(&display, &server.account_display_at(1_001)));
+        let spec = crate::pane::PaneSpec {
+            command: vec!["true".into()],
+            account: Some("claude:work".into()),
+            account_id: Some(a.id.clone()),
+            ..Default::default()
+        };
+        let pane = server.spawn_pane(None, spec).unwrap();
+        let display = server.account_display_at(1_001);
+        assert_eq!(display.items[0].detail, "Usage unavailable · 1 pane");
+        assert_eq!(display.labels[&pane], "claude·work");
+        server.accounts.rename("claude", "work", "renamed").unwrap();
+        let display = server.account_display_at(1_001);
+        assert_eq!(display.items[0].label, "Claude · renamed");
+        assert_eq!(display.labels[&pane], "claude·renamed");
+        server.accounts.set_sign_in_required(&a, true);
+        assert_eq!(server.account_display_at(1_001).items[0].detail, "Sign-in required");
+        server.accounts.remove("claude", "renamed");
+        let replacement = server.accounts.add(Account { id: "replacement".into(), ..a.clone() }).unwrap();
+        let display = server.account_display_at(1_001);
+        assert!(!display.labels.contains_key(&pane), "a reused name must not rebind the old pane");
+        assert_eq!(display.items[0].detail, "Usage unavailable");
+        server.panes.get_mut(&pane).unwrap().spec.account_id = Some(replacement.id);
+        assert_eq!(server.account_display_at(1_001).items[0].detail, "Usage unavailable · 1 pane");
+        server.panes.remove(&pane);
+        assert_eq!(server.account_display_at(1_001).items[0].detail, "Usage unavailable");
+    }
+
+    #[test]
+    fn cached_accounts_follow_usage_resets_ages_and_clock_changes() {
+        let mut server = server();
+        let a = server.accounts.add(account()).unwrap();
+        let before = server.account_display_at(1_000);
+        server.usage.0.insert(
+            a.key(),
+            Usage {
+                five_hour: Some(Window { used_percent: 57.0, resets_at: Some(2_000) }),
+                observed_at: 1_000,
+                ..Default::default()
+            },
+        );
+        let display = server.account_display_at(1_000);
+        assert!(!Rc::ptr_eq(&before, &display));
+        assert_eq!(display.items[0].detail, "57% used");
+        assert!(Rc::ptr_eq(&display, &server.account_display_at(1_999)));
+        let display = server.account_display_at(2_000);
+        assert_eq!(display.items[0].detail, "Last checked 16m ago");
+        assert_eq!(display.until, Some(2_020));
+        assert!(Rc::ptr_eq(&display, &server.account_display_at(2_019)));
+        assert_eq!(server.account_display_at(2_020).items[0].detail, "Last checked 17m ago");
+        assert_eq!(server.account_display_at(1_500).items[0].detail, "57% used");
+        server.usage.0.clear();
+        assert_eq!(server.account_display_at(1_500).items[0].detail, "Usage unavailable");
+    }
+
+    #[test]
+    fn cached_accounts_follow_discovery_results_and_review() {
+        use super::super::agents::ExistingCheck;
+        let mut server = server();
+        let existing = server.accounts.get("claude", "default").unwrap();
+        assert_eq!(server.account_display_at(1_000).items.len(), 1);
+        for (state, detail) in [
+            (ExistingCheck::Checking, "Checking sign-in"),
+            (ExistingCheck::SaveFailed, "Could not save · Check again"),
+            (ExistingCheck::Checked(Status::CouldNotCheck), "Could not verify · Check again"),
+        ] {
+            server.existing_checks.insert("claude".into(), state);
+            let display = server.account_display_at(1_000);
+            assert_eq!(display.items[0].label, "Existing Claude account");
+            assert_eq!(display.items[0].detail, detail);
+        }
+        server.existing_checks.insert("claude".into(), ExistingCheck::Checked(Status::NotSignedIn));
+        assert_eq!(server.account_display_at(1_000).items.len(), 1);
+        let target = server.accounts.add(account()).unwrap();
+        server.accounts.adopt_checked(&existing, None).unwrap();
+        let display = server.account_display_at(1_000);
+        assert_eq!(display.items[1].detail, "Review");
+        let pending = server.accounts.reviews().pop().unwrap();
+        server.accounts.review(&pending, Some(&target)).unwrap();
+        let display = server.account_display_at(1_000);
+        assert_eq!(display.items.len(), 2);
+        assert_eq!(display.items[0].label, "Claude · work");
+        assert_eq!(display.items[1].label, "+ Add account");
+    }
+
     fn key(spec: &str) -> InputEvent {
         let k = KeySpec::parse(spec).unwrap();
         InputEvent::Key(Key { code: k.code, mods: k.mods, raw: Vec::new() })
@@ -1093,4 +1282,9 @@ mod tests {
         assert!(!text.contains("Enter Sign in"));
         assert!(matches!(server.on_account_form(0, form, key("esc")), Mode::Picker(_)));
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(super) static ACCOUNT_BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }

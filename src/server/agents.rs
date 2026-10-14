@@ -64,7 +64,7 @@ pub(super) struct ObservedAgent {
     pid: u32,
     started: u64,
     command: Vec<String>,
-    account: Account,
+    pub(super) account: Account,
     session: String,
     cwd: PathBuf,
     path: String,
@@ -165,6 +165,7 @@ impl Server {
             Ok(a) => {
                 self.follow_renamed_accounts();
                 self.accounts = a;
+                self.account_display.get_mut().take();
                 self.accounts_error = None;
                 self.check_existing_accounts();
                 self.follow_renamed_accounts();
@@ -1821,10 +1822,14 @@ mod tests {
         spec.account_id = Some(old.id.clone());
         spec.env = accounts::launch(&old, &[], None, None).unwrap().env;
         let command = spec.command.clone();
+        let before = t.server.account_display_at(1_000);
         t.server.accounts.review(&pending, Some(&target)).unwrap();
         t.server.follow_renamed_accounts();
         assert_eq!(t.server.pane_account(1).unwrap().home, old.home);
         assert_eq!(t.server.pane_account(1).unwrap().id, target.id);
+        let after = t.server.account_display_at(1_000);
+        assert!(!std::rc::Rc::ptr_eq(&before, &after));
+        assert_eq!(after.labels[&1], accounts::label(&target));
         assert_eq!(t.server.panes[&1].spec.command, command);
         assert!(t.server.panes[&1].exit_code.is_none());
         t.server.switch_account(1, &target, None, false).unwrap();
@@ -1888,6 +1893,41 @@ mod tests {
         t.server.follow_renamed_accounts();
         check(&t.server);
         assert!(t.server.accounts.by_id(&old.id).is_none());
+    }
+
+    #[test]
+    fn cached_labels_follow_observed_accounts_and_legacy_launch_environments() {
+        let mut t = SwitchTest::new("cached-observed");
+        t.server.switches.clear();
+        let from = t.server.accounts.get("claude", "from").unwrap();
+        let to = t.server.accounts.get("claude", "to").unwrap();
+        let spec = &mut t.server.panes.get_mut(&1).unwrap().spec;
+        spec.account = None;
+        spec.account_id = None;
+        assert_eq!(t.server.pane_account_label(1), None);
+        t.server.observed_agents.insert(
+            1,
+            ObservedAgent {
+                pid: 1,
+                started: 1,
+                command: vec!["claude".into()],
+                account: from.clone(),
+                session: "test".into(),
+                cwd: t.dir.clone(),
+                path: String::new(),
+            },
+        );
+        assert_eq!(t.server.pane_account_label(1), Some(accounts::label(&from)));
+        t.server.observed_agents.get_mut(&1).unwrap().account = to.clone();
+        assert_eq!(t.server.pane_account_label(1), Some(accounts::label(&to)));
+        t.server.observed_agents.clear();
+        assert_eq!(t.server.pane_account_label(1), None);
+        let spec = &mut t.server.panes.get_mut(&1).unwrap().spec;
+        spec.account = Some("claude:old-name".into());
+        spec.env = vec![("CLAUDE_CONFIG_DIR".into(), from.home.clone())];
+        assert_eq!(t.server.pane_account_label(1), Some(accounts::label(&from)));
+        t.server.panes.get_mut(&1).unwrap().spec.env = vec![("CLAUDE_CONFIG_DIR".into(), to.home.clone())];
+        assert_eq!(t.server.pane_account_label(1), Some(accounts::label(&to)));
     }
 
     struct SwitchTest {
