@@ -15,6 +15,7 @@ use anyhow::{Context, Result, bail, ensure};
 use base64::Engine;
 use crossbeam_channel::{Receiver, Sender, bounded};
 
+use super::clipboard_image::{Diagnostic, Notices};
 use super::paste;
 use crate::attachments::{self, Source};
 use crate::input::{InputEvent, InputParser, KeyCode};
@@ -67,6 +68,8 @@ struct State {
     connected: bool,
     focus: Option<(Option<crate::layout::PaneId>, bool)>,
     image_approved: bool,
+    image_probe: Option<Receiver<()>>,
+    image_notices: Notices,
     image_keys: super::clipboard_image::Keys,
     splitter: paste::Splitter,
     prompt: Option<Prompt>,
@@ -117,7 +120,11 @@ impl Controller {
         self.input_with_probe(bytes, super::clipboard_image::available)
     }
 
-    fn input_with_probe(self: &Arc<Self>, bytes: &[u8], available: impl Fn() -> bool) -> bool {
+    fn input_with_probe(
+        self: &Arc<Self>,
+        bytes: &[u8],
+        available: impl Fn() -> Result<bool, Diagnostic> + Clone + Send + 'static,
+    ) -> bool {
         let mut state = self.state.lock().unwrap();
         if !state.connected && state.dropped.is_some() {
             return false;
@@ -236,20 +243,54 @@ impl Controller {
         true
     }
 
-    fn offer_clipboard(self: &Arc<Self>, raw: &[u8], available: &impl Fn() -> bool) -> bool {
-        let state = self.state.lock().unwrap();
+    fn offer_clipboard(
+        self: &Arc<Self>,
+        raw: &[u8],
+        available: &(impl Fn() -> Result<bool, Diagnostic> + Clone + Send + 'static),
+    ) -> bool {
+        let mut state = self.state.lock().unwrap();
         let eligible = self.remote
             && state.connected
-            && state.focus.is_some_and(|(pane, agent)| pane.is_some() && agent)
+            && state.focus.is_some_and(|(pane, _)| pane.is_some())
             && state.prompt.is_none()
             && state.dropped.is_none()
             && state.active.is_none()
             && state.uncertain.is_none();
         let focus = state.focus;
-        drop(state);
-        if !eligible || !available() {
+        if !eligible {
             return false;
         }
+        if !focus.is_some_and(|(_, agent)| agent) {
+            if state
+                .image_probe
+                .as_ref()
+                .is_some_and(|done| matches!(done.try_recv(), Err(crossbeam_channel::TryRecvError::Empty)))
+            {
+                return false;
+            }
+            let (finished, done) = bounded(1);
+            state.image_probe = Some(done);
+            drop(state);
+            let available = available.clone();
+            let this = Arc::downgrade(self);
+            let _ = crate::threads::named("clipboard-probe").spawn(move || {
+                let availability = available();
+                if let Some(this) = this.upgrade() {
+                    let mut state = this.state.lock().unwrap();
+                    if matches!(availability, Ok(true))
+                        && state.connected
+                        && state.focus == focus
+                        && state.view(&this.host()).is_none()
+                    {
+                        this.show_image_notice(&mut state, Diagnostic::NotAgent);
+                    }
+                }
+                let _ = finished.send(());
+            });
+            return false;
+        }
+        drop(state);
+        let availability = available();
         let mut state = self.state.lock().unwrap();
         // A reply arriving during the type probe cannot authorize an image or replace a question.
         if state.prompt.is_some()
@@ -260,6 +301,14 @@ impl Controller {
             || !state.connected
         {
             return false;
+        }
+        match availability {
+            Ok(true) => {}
+            result => {
+                drop(state);
+                self.image_notice(result.err().unwrap_or(Diagnostic::NoImage));
+                return false;
+            }
         }
         let token = format!(
             "{:x}-{:x}",
@@ -368,30 +417,84 @@ impl Controller {
         if let Some(view) = state.view(&self.host()) {
             let (buf, _) = view.render(Rect::new(0, 0, cols, rows.saturating_sub(1)));
             write(&crate::ansi::overlay(&buf));
+        } else {
+            write(&state.image_notices.render(cols, rows));
         }
     }
 
     pub fn output(&self, bytes: &[u8]) -> std::io::Result<bool> {
+        let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
+        self.output_with(bytes, cols, rows, |out| super::terminal().write(out))
+    }
+
+    fn output_with(
+        &self,
+        bytes: &[u8],
+        cols: u16,
+        rows: u16,
+        write: impl FnOnce(&[u8]) -> std::io::Result<bool>,
+    ) -> std::io::Result<bool> {
         // A server frame and the local question are one write, so incoming output cannot
         // briefly replace the question while a local key is authorizing a transfer.
         let state = self.state.lock().unwrap();
-        let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
-        let Some(view) = state.view(&self.host()) else { return super::terminal().write(bytes) };
+        let view = state.view(&self.host());
+        let notice = state.image_notices.render(cols, rows);
+        if view.is_none() && notice.is_empty() {
+            return write(bytes);
+        }
         let mut out = b"\x1b[?2026h".to_vec();
         // The server ends its own synchronized frame. Keep the local box in that frame.
         for part in bytes.split_inclusive(|b| *b == b'l') {
             out.extend_from_slice(part.strip_suffix(b"\x1b[?2026l").unwrap_or(part));
         }
-        let (buf, _) = view.render(Rect::new(0, 0, cols, rows.saturating_sub(1)));
-        out.extend(crate::ansi::overlay(&buf));
+        if let Some(view) = view {
+            let (buf, _) = view.render(Rect::new(0, 0, cols, rows.saturating_sub(1)));
+            out.extend(crate::ansi::overlay(&buf));
+        } else {
+            out.extend(notice);
+        }
         out.extend_from_slice(b"\x1b[?2026l");
-        super::terminal().write(&out)
+        write(&out)
     }
 
     fn button_at(&self, state: &State, col: u16, row: u16) -> Option<usize> {
         let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
         let (_, buttons) = state.view(&self.host())?.render(Rect::new(0, 0, cols, rows.saturating_sub(1)));
         buttons.iter().position(|area| area.contains((col, row).into()))
+    }
+
+    fn image_notice(self: &Arc<Self>, diagnostic: Diagnostic) {
+        let mut state = self.state.lock().unwrap();
+        self.show_image_notice(&mut state, diagnostic);
+    }
+
+    fn show_image_notice(self: &Arc<Self>, state: &mut State, diagnostic: Diagnostic) {
+        let replacing = state.image_notices.is_active();
+        if !state.image_notices.show(diagnostic) {
+            return;
+        }
+        // A full server frame restores every row covered by the previous notice.
+        if replacing {
+            self.redraw();
+        }
+        let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
+        if state.view(&self.host()).is_none() {
+            let _ = super::terminal().write(&state.image_notices.render(cols, rows));
+        }
+        let this = Arc::downgrade(self);
+        let _ = crate::threads::named("clipboard-notice").spawn(move || {
+            std::thread::sleep(Duration::from_secs(4));
+            if let Some(this) = this.upgrade() {
+                this.expire_image_notice(Instant::now());
+            }
+        });
+    }
+
+    fn expire_image_notice(&self, now: Instant) {
+        let mut state = self.state.lock().unwrap();
+        if state.image_notices.expire(now) {
+            self.redraw();
+        }
     }
 
     fn expire_success(&self, now: Instant) {
@@ -407,8 +510,7 @@ impl Controller {
     }
 
     fn redraw(&self) {
-        let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
-        let _ = send(&self.writer, &ClientMsg::Resize { cols, rows });
+        let _ = send(&self.writer, &ClientMsg::Repaint);
     }
 
     pub fn message(self: &Arc<Self>, msg: ServerMsg) {
@@ -1144,6 +1246,7 @@ impl Controller {
     pub fn disconnect(&self) {
         let mut state = self.state.lock().unwrap();
         state.connected = false;
+        state.image_notices.clear();
         state.focus = None;
         state.image_keys = Default::default();
         state.splitter = Default::default();
@@ -1492,25 +1595,25 @@ mod tests {
     use std::io::Read;
     use std::time::Duration;
 
+    struct Size(usize, usize);
+    impl alacritty_terminal::grid::Dimensions for Size {
+        fn total_lines(&self) -> usize {
+            self.1
+        }
+        fn screen_lines(&self) -> usize {
+            self.1
+        }
+        fn columns(&self) -> usize {
+            self.0
+        }
+    }
+
     #[test]
     fn attachment_results_keep_their_kind_and_draw_it_locally_and_over_ssh() {
         use alacritty_terminal::event::VoidListener;
-        use alacritty_terminal::grid::Dimensions;
         use alacritty_terminal::index::{Column, Line};
         use alacritty_terminal::term::{Config, Term};
         use alacritty_terminal::vte::ansi::{Color, NamedColor, Processor};
-        struct Size(usize, usize);
-        impl Dimensions for Size {
-            fn total_lines(&self) -> usize {
-                self.1
-            }
-            fn screen_lines(&self) -> usize {
-                self.1
-            }
-            fn columns(&self) -> usize {
-                self.0
-            }
-        }
         for remote in [false, true] {
             let (client, _peer) = controller(remote);
             for (kind, message, colour) in [
@@ -1648,10 +1751,10 @@ mod tests {
         serde_json::from_slice(&data).unwrap()
     }
 
-    fn read_without_resize(peer: &mut Reader) -> ClientMsg {
+    fn read_without_repaint(peer: &mut Reader) -> ClientMsg {
         loop {
             match read(peer) {
-                ClientMsg::Resize { .. } => {}
+                ClientMsg::Repaint | ClientMsg::Resize { .. } => {}
                 message => return message,
             }
         }
@@ -1701,7 +1804,7 @@ mod tests {
     }
 
     #[test]
-    fn control_v_only_probes_remote_agent_panes_and_forwards_exact_keys_without_an_image() {
+    fn control_v_only_probes_remote_panes_and_forwards_exact_keys_without_an_image() {
         for remote in [false, true] {
             for agent in [false, true] {
                 for connected in [false, true] {
@@ -1711,18 +1814,22 @@ mod tests {
                             client.connected();
                         }
                         client.message(ServerMsg::ClipboardFocus { pane: Some(7), agent });
-                        let probes = std::cell::Cell::new(0);
-                        let handled = client.input_with_probe(key, || {
-                            probes.set(probes.get() + 1);
-                            false
+                        let probes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                        let count = Arc::clone(&probes);
+                        let handled = client.input_with_probe(key, move || {
+                            count.fetch_add(1, Ordering::SeqCst);
+                            Ok(false)
                         });
                         if !handled {
                             client.forward(key);
                         }
-                        assert_eq!(probes.get(), usize::from(remote && agent && connected));
+                        wait_for_probe(&client);
+                        assert_eq!(probes.load(Ordering::SeqCst), usize::from(remote && connected));
                         assert_eq!(protocol::read_frame(&mut peer).unwrap().unwrap(), (protocol::BYTES, key.to_vec()));
                         assert!(peer.incoming.try_recv().is_err());
-                        assert!(client.state.lock().unwrap().workers.is_empty());
+                        let state = client.state.lock().unwrap();
+                        assert!(state.workers.is_empty());
+                        assert_eq!(state.image_notices.render(80, 24).is_empty(), !(remote && agent && connected));
                     }
                 }
             }
@@ -1737,6 +1844,164 @@ mod tests {
     }
 
     #[test]
+    fn image_diagnostics_forward_keys_once_per_cause_and_survive_reconnection() {
+        for key in [b"\x16".as_slice(), b"\x1b[118;5u", b"\x1b[118;133u", b"\x1b[118;5:1;118u"] {
+            let (client, mut peer) = controller(true);
+            client.connected();
+            client.message(ServerMsg::ClipboardFocus { pane: Some(7), agent: true });
+            for failure in 0..4 {
+                for attempt in 0..2 {
+                    client.input_with_probe(key, move || match failure {
+                        0 => Ok(false),
+                        1 => Err(Diagnostic::MissingTool("wl-clipboard")),
+                        2 => Err(Diagnostic::Failed("wl-paste: permission denied".into())),
+                        _ => Err(Diagnostic::NoDisplay),
+                    });
+                    assert_eq!(protocol::read_frame(&mut peer).unwrap().unwrap(), (protocol::BYTES, key.to_vec()));
+                    let mut drawn = Vec::new();
+                    client.draw_with(80, 24, |bytes| drawn.extend_from_slice(bytes));
+                    assert_eq!(drawn.is_empty(), attempt != 0);
+                    let mut state = client.state.lock().unwrap();
+                    assert!(state.view("box").is_none(), "a diagnostic must not open a form");
+                    assert!(state.dropped.is_none());
+                    state.image_notices.clear();
+                }
+            }
+            client.disconnect();
+            client.connected();
+            client.message(ServerMsg::ClipboardFocus { pane: Some(7), agent: true });
+            client.input_with_probe(key, || Ok(false));
+            assert_eq!(protocol::read_frame(&mut peer).unwrap().unwrap(), (protocol::BYTES, key.to_vec()));
+            assert!(client.state.lock().unwrap().image_notices.render(80, 24).is_empty());
+            client.input_with_probe(b"\r", || panic!("ordinary input must not probe"));
+            assert_eq!(protocol::read_frame(&mut peer).unwrap().unwrap(), (protocol::BYTES, vec![b'\r']));
+        }
+    }
+
+    fn wait_for_probe(client: &Controller) {
+        let done = client.state.lock().unwrap().image_probe.clone();
+        if let Some(done) = done {
+            done.recv_timeout(crate::testing::PATIENCE).unwrap();
+        }
+    }
+
+    #[test]
+    fn a_stalled_non_agent_probe_does_not_hold_control_v_or_following_typing() {
+        for key in [b"\x16".as_slice(), b"\x1b[118;5u"] {
+            let (client, mut peer) = controller(true);
+            client.connected();
+            client.message(ServerMsg::ClipboardFocus { pane: Some(7), agent: false });
+            let (entered, started) = bounded(1);
+            let (resume, paused) = bounded(1);
+            let input = Arc::clone(&client);
+            let bytes = [key, b"same read"].concat();
+            let thread = std::thread::spawn(move || {
+                input.input_with_probe(&bytes, move || {
+                    entered.send(()).unwrap();
+                    paused.recv_timeout(crate::testing::PATIENCE).unwrap();
+                    Ok(true)
+                });
+                input.input(b"next read");
+            });
+            started.recv_timeout(crate::testing::PATIENCE).unwrap();
+            let expected = [key, b"same readnext read"].concat();
+            let mut received = Vec::new();
+            while received.len() < expected.len() {
+                let (kind, bytes) = protocol::read_frame(&mut peer).unwrap().unwrap();
+                assert_eq!(kind, protocol::BYTES);
+                received.extend(bytes);
+            }
+            assert_eq!(received, expected);
+            assert!(!client.state.lock().unwrap().image_notices.is_active());
+            resume.send(()).unwrap();
+            thread.join().unwrap();
+            wait_for_probe(&client);
+            assert!(client.state.lock().unwrap().image_notices.is_active());
+        }
+    }
+
+    #[test]
+    fn copy_mode_control_v_neither_probes_nor_spends_the_unrecognized_notice() {
+        let (client, mut peer) = controller(true);
+        client.connected();
+        client.message(ServerMsg::ClipboardFocus { pane: None, agent: true });
+        client.input_with_probe(b"\x16", || panic!("copy mode must not inspect the clipboard"));
+        assert_eq!(protocol::read_frame(&mut peer).unwrap().unwrap(), (protocol::BYTES, vec![0x16]));
+        assert!(!client.state.lock().unwrap().image_notices.is_active());
+        client.message(ServerMsg::ClipboardFocus { pane: Some(7), agent: false });
+        client.input_with_probe(b"\x16", || Ok(true));
+        wait_for_probe(&client);
+        assert_eq!(protocol::read_frame(&mut peer).unwrap().unwrap(), (protocol::BYTES, vec![0x16]));
+        assert!(client.state.lock().unwrap().image_notices.is_active());
+    }
+
+    #[test]
+    fn replacing_a_taller_notice_restores_its_whole_footprint_and_expiry_repaints() {
+        use alacritty_terminal::event::VoidListener;
+        use alacritty_terminal::index::{Column, Line};
+        use alacritty_terminal::term::{Config, Term};
+        use alacritty_terminal::vte::ansi::Processor;
+        let (client, mut peer) = controller(true);
+        let mut terminal = Term::new(Config::default(), &Size(80, 24), VoidListener);
+        let mut parser: Processor = Processor::new();
+        let background = b"\x1b[2J\x1b[23;1Hpane content on row 23\x1b[24;1Hpane content on row 24";
+        parser.advance(&mut terminal, background);
+        client.image_notice(Diagnostic::NotAgent);
+        client.draw_with(80, 24, |out| parser.advance(&mut terminal, out));
+        let row = |terminal: &Term<VoidListener>, row| -> String {
+            (0..80).map(|col| terminal.grid()[Line(row)][Column(col)].c).collect::<String>().trim_end().to_owned()
+        };
+        assert!(row(&terminal, 22).contains("not recognized as an agent"));
+        client.image_notice(Diagnostic::NoImage);
+        assert!(matches!(read(&mut peer), ClientMsg::Repaint));
+        client
+            .output_with(background, 80, 24, |out| {
+                parser.advance(&mut terminal, out);
+                Ok(true)
+            })
+            .unwrap();
+        assert_eq!(row(&terminal, 22), "pane content on row 23");
+        assert!(row(&terminal, 23).contains("No image in the laptop clipboard"));
+        client.expire_image_notice(Instant::now() + Duration::from_secs(5));
+        assert!(matches!(read(&mut peer), ClientMsg::Repaint));
+        client
+            .output_with(background, 80, 24, |out| {
+                parser.advance(&mut terminal, out);
+                Ok(true)
+            })
+            .unwrap();
+        assert_eq!(row(&terminal, 22), "pane content on row 23");
+        assert_eq!(row(&terminal, 23), "pane content on row 24");
+        assert!(peer.incoming.try_recv().is_err());
+    }
+
+    #[test]
+    fn an_unrecognized_pane_only_explains_a_clipboard_that_advertises_an_image() {
+        let (client, mut peer) = controller(true);
+        client.connected();
+        client.message(ServerMsg::ClipboardFocus { pane: Some(7), agent: false });
+        for result in
+            [Ok(false), Err(Diagnostic::MissingTool("wl-clipboard")), Err(Diagnostic::Failed("failed".into()))]
+        {
+            let result = Arc::new(Mutex::new(Some(result)));
+            client.input_with_probe(b"\x16", move || result.lock().unwrap().take().unwrap());
+            wait_for_probe(&client);
+            assert_eq!(protocol::read_frame(&mut peer).unwrap().unwrap(), (protocol::BYTES, vec![0x16]));
+            assert!(client.state.lock().unwrap().image_notices.render(80, 24).is_empty());
+        }
+        for attempt in 0..2 {
+            client.input_with_probe(b"\x16", || Ok(true));
+            wait_for_probe(&client);
+            assert_eq!(protocol::read_frame(&mut peer).unwrap().unwrap(), (protocol::BYTES, vec![0x16]));
+            let mut state = client.state.lock().unwrap();
+            assert_eq!(state.image_notices.render(124, 24).is_empty(), attempt != 0);
+            assert!(state.dropped.is_none());
+            state.image_notices.clear();
+        }
+        assert!(peer.incoming.try_recv().is_err());
+    }
+
+    #[test]
     fn delayed_focus_updates_preserve_shortcut_and_coalesced_mode_keys_in_wire_order() {
         for key in [b"\x16".as_slice(), b"\x1b[118;5u"] {
             for coalesced in [false, true] {
@@ -1745,10 +2010,10 @@ mod tests {
                 client.message(ServerMsg::ClipboardFocus { pane: Some(7), agent: true });
                 let prefix = b"\x02v";
                 if coalesced {
-                    client.input_with_probe(&[prefix.as_slice(), key, b"l"].concat(), || true);
+                    client.input_with_probe(&[prefix.as_slice(), key, b"l"].concat(), || Ok(true));
                 } else {
                     client.input(prefix);
-                    client.input_with_probe(key, || true);
+                    client.input_with_probe(key, || Ok(true));
                     client.input(b"l");
                 }
                 assert_eq!(protocol::read_frame(&mut peer).unwrap().unwrap(), (protocol::BYTES, prefix.to_vec()));
@@ -1758,7 +2023,7 @@ mod tests {
                 assert_eq!(text, key, "the server can replay the exact key before later input");
                 assert_eq!(protocol::read_frame(&mut peer).unwrap().unwrap(), (protocol::BYTES, b"l".to_vec()));
                 // The server has already entered copy mode, but its focus update arrives late.
-                client.message(ServerMsg::ClipboardFocus { pane: Some(7), agent: false });
+                client.message(ServerMsg::ClipboardFocus { pane: None, agent: true });
                 client.message(ServerMsg::AttachmentResult {
                     token: token.clone(),
                     pasted: true,
@@ -1766,9 +2031,9 @@ mod tests {
                     kind: NoticeKind::Notice,
                 });
                 assert!(
-                    matches!(read_without_resize(&mut peer), ClientMsg::AttachmentDismiss { token: sent } if sent == token)
+                    matches!(read_without_repaint(&mut peer), ClientMsg::AttachmentDismiss { token: sent } if sent == token)
                 );
-                assert!(matches!(read(&mut peer), ClientMsg::Resize { .. }));
+                assert!(matches!(read(&mut peer), ClientMsg::Repaint));
                 let state = client.state.lock().unwrap();
                 assert!(state.dropped.is_none());
                 assert!(state.view("box").is_none(), "normal input opens no failure dialog");
@@ -1784,7 +2049,7 @@ mod tests {
             let (client, mut peer) = controller(true);
             client.connected();
             client.message(ServerMsg::ClipboardFocus { pane: Some(7), agent: true });
-            client.input_with_probe(b"\x16", || true);
+            client.input_with_probe(b"\x16", || Ok(true));
             let ClientMsg::AttachmentRequest { token, .. } = read(&mut peer) else { panic!() };
             client.message(ServerMsg::AttachmentPrepared {
                 token: token.clone(),
@@ -1794,18 +2059,18 @@ mod tests {
             });
             client.input(b"\t\t\r");
             assert!(matches!(read(&mut peer), ClientMsg::AttachmentCancel { token: sent } if sent == token));
-            assert!(matches!(read(&mut peer), ClientMsg::Resize { .. }));
+            assert!(matches!(read(&mut peer), ClientMsg::Repaint));
             client.message(ServerMsg::AttachmentResult {
                 token: token.clone(),
                 pasted: false,
                 message: "Attachment stopped: cancelled".into(),
                 kind: NoticeKind::Error,
             });
-            assert!(matches!(read(&mut peer), ClientMsg::Resize { .. }));
+            assert!(matches!(read(&mut peer), ClientMsg::Repaint));
             assert_eq!(client.state.lock().unwrap().view("box").unwrap().buttons, ["Close"]);
             client.input(&[close, b"cancelled"].concat());
             assert!(matches!(read(&mut peer), ClientMsg::AttachmentDismiss { token: sent } if sent == token));
-            assert!(matches!(read(&mut peer), ClientMsg::Resize { .. }));
+            assert!(matches!(read(&mut peer), ClientMsg::Repaint));
             assert_eq!(protocol::read_frame(&mut peer).unwrap().unwrap(), (protocol::BYTES, b"cancelled".to_vec()));
             assert!(client.state.lock().unwrap().view("box").is_none());
             assert!(peer.incoming.try_recv().is_err());
@@ -1820,9 +2085,9 @@ mod tests {
                     let (client, mut peer) = controller(true);
                     client.connected();
                     client.message(ServerMsg::ClipboardFocus { pane: Some(7), agent: true });
-                    client.input_with_probe(&key[..split], || true);
+                    client.input_with_probe(&key[..split], || Ok(true));
                     if split < key.len() {
-                        client.input_with_probe(&key[split..], || true);
+                        client.input_with_probe(&key[split..], || Ok(true));
                     }
                     let ClientMsg::AttachmentRequest { token, text, image: true, pane: Some(7) } = read(&mut peer)
                     else {
@@ -1849,7 +2114,7 @@ mod tests {
                     client.input(cancel);
                     client.input(&[]);
                     assert!(matches!(read(&mut peer), ClientMsg::AttachmentCancel { token: sent } if sent == token));
-                    assert!(matches!(read(&mut peer), ClientMsg::Resize { .. }));
+                    assert!(matches!(read(&mut peer), ClientMsg::Repaint));
                     assert!(peer.incoming.try_recv().is_err());
                     let state = client.state.lock().unwrap();
                     assert!(!state.image_approved);
@@ -1873,7 +2138,7 @@ mod tests {
         let (tool, script) = (
             "wl-paste",
             format!(
-                "#!/bin/sh\nif [ \"$1\" = --list-types ]; then echo image/png; exit; fi\necho read >> '{}'\nprintf '\\211PNG\\r\\n\\032\\n'\n",
+                "#!/bin/sh\n[ \"$WAYLAND_DISPLAY\" = test ] || exit 7\nif [ \"$1\" = --list-types ]; then printf 'image/png\\ntext/plain\\n'; exit; fi\necho read >> '{}'\nprintf '\\211PNG\\r\\n\\032\\n'\n",
                 log.display()
             ),
         );
@@ -1926,21 +2191,21 @@ mod tests {
                     client.input(if always { b"\t\r" } else { b"\r" });
                 }
                 assert!(client.state.lock().unwrap().active.is_some());
-                let ClientMsg::AttachmentStart { files, .. } = read_without_resize(&mut peer) else { panic!() };
+                let ClientMsg::AttachmentStart { files, .. } = read_without_repaint(&mut peer) else { panic!() };
                 assert_eq!(files[0].name, "clipboard.png");
                 client.message(ServerMsg::AttachmentAck { token: token.clone(), received: 0 });
-                let ClientMsg::AttachmentChunk { data, .. } = read_without_resize(&mut peer) else { panic!() };
+                let ClientMsg::AttachmentChunk { data, .. } = read_without_repaint(&mut peer) else { panic!() };
                 assert_eq!(base64::engine::general_purpose::STANDARD.decode(data).unwrap(), b"\x89PNG\r\n\x1a\n");
                 client.message(ServerMsg::AttachmentAck { token: token.clone(), received: 8 });
-                assert!(matches!(read_without_resize(&mut peer), ClientMsg::AttachmentFinish { .. }));
+                assert!(matches!(read_without_repaint(&mut peer), ClientMsg::AttachmentFinish { .. }));
                 client.message(ServerMsg::AttachmentResult {
                     token,
                     pasted: true,
                     kind: NoticeKind::Notice,
                     message: "Image path pasted.".into(),
                 });
-                assert!(matches!(read_without_resize(&mut peer), ClientMsg::AttachmentDismiss { .. }));
-                assert!(matches!(read(&mut peer), ClientMsg::Resize { .. }));
+                assert!(matches!(read_without_repaint(&mut peer), ClientMsg::AttachmentDismiss { .. }));
+                assert!(matches!(read(&mut peer), ClientMsg::Repaint));
             }
             client.shutdown();
             let (client, mut peer) = make_client();
@@ -1987,7 +2252,7 @@ mod tests {
                 assert!(
                     matches!(read(&mut peer), ClientMsg::AttachmentCancel { token: cancelled } if cancelled == token)
                 );
-                assert!(matches!(read(&mut peer), ClientMsg::Resize { .. }));
+                assert!(matches!(read(&mut peer), ClientMsg::Repaint));
                 assert!(client.state.lock().unwrap().active.is_none());
             }
         }
@@ -2023,7 +2288,7 @@ mod tests {
                 assert!(view.message.contains(&format!("Close this result, then use {action} to retry.")));
                 assert!(!view.message.contains("Choose Retry"));
             }
-            assert!(matches!(read(&mut peer), ClientMsg::Resize { .. }));
+            assert!(matches!(read(&mut peer), ClientMsg::Repaint));
             assert!(client.input(b"\r"));
             assert!(matches!(read(&mut peer), ClientMsg::AttachmentDismiss { token: dismissed } if dismissed == token));
             assert!(client.state.lock().unwrap().view("host").is_none());
@@ -2234,7 +2499,7 @@ mod tests {
                         .unwrap()
                 };
                 client.keys(b"\r");
-                let ClientMsg::AttachmentStart { files, .. } = read_without_resize(&mut peer) else {
+                let ClientMsg::AttachmentStart { files, .. } = read_without_repaint(&mut peer) else {
                     panic!("image did not use attachment transport")
                 };
                 assert_eq!(files.len(), 1);
@@ -2243,11 +2508,11 @@ mod tests {
                 // Redraws share the writer with the upload worker, including between acknowledgements.
                 send(&client.writer, &ClientMsg::Resize { cols: 90, rows: 30 }).unwrap();
                 client.message(ServerMsg::AttachmentAck { token: token.clone(), received: 0 });
-                let ClientMsg::AttachmentChunk { data, .. } = read_without_resize(&mut peer) else { panic!() };
+                let ClientMsg::AttachmentChunk { data, .. } = read_without_repaint(&mut peer) else { panic!() };
                 assert_eq!(base64::engine::general_purpose::STANDARD.decode(data).unwrap(), b"\x89PNG\r\n\x1a\n");
                 send(&client.writer, &ClientMsg::Resize { cols: 91, rows: 30 }).unwrap();
                 client.message(ServerMsg::AttachmentAck { token: token.clone(), received: 8 });
-                assert!(matches!(read_without_resize(&mut peer), ClientMsg::AttachmentFinish { .. }));
+                assert!(matches!(read_without_repaint(&mut peer), ClientMsg::AttachmentFinish { .. }));
                 if attempt == 0 {
                     client.message(ServerMsg::AttachmentResult {
                         kind: NoticeKind::Error,
@@ -2258,8 +2523,9 @@ mod tests {
                     assert_eq!(client.state.lock().unwrap().view("server").unwrap().buttons, ["Retry", "Close"]);
                     let reads = std::fs::read_to_string(&log).unwrap();
                     client.keys(b"\t\r");
-                    assert!(matches!(read_without_resize(&mut peer), ClientMsg::AttachmentDismiss { .. }));
-                    let ClientMsg::AttachmentRequest { token, image: true, .. } = read_without_resize(&mut peer) else {
+                    assert!(matches!(read_without_repaint(&mut peer), ClientMsg::AttachmentDismiss { .. }));
+                    let ClientMsg::AttachmentRequest { token, image: true, .. } = read_without_repaint(&mut peer)
+                    else {
                         panic!()
                     };
                     client.message(ServerMsg::AttachmentPrepared {
@@ -2502,7 +2768,7 @@ mod tests {
                             assert_eq!(sent, token);
                             cancelled = true;
                         }
-                        ClientMsg::Resize { .. } => {}
+                        ClientMsg::Repaint => {}
                         other => panic!("unexpected message: {other:?}"),
                     }
                 }
@@ -2550,7 +2816,7 @@ mod tests {
                         }
                         assert!(!bytes.contains(&3));
                     }
-                    assert!(matches!(read(&mut peer), ClientMsg::Resize { .. }));
+                    assert!(matches!(read(&mut peer), ClientMsg::Repaint));
                     assert_eq!(protocol::read_frame(&mut peer).unwrap().unwrap(), (protocol::BYTES, b"\r".to_vec()));
                     client.message(ServerMsg::AttachmentPrepared {
                         token,
@@ -2612,7 +2878,7 @@ mod tests {
         let token = prepare_drop(&client, &mut peer, path.to_str().unwrap().as_bytes());
         client.input(b"\t\t\r");
         assert!(matches!(read(&mut peer), ClientMsg::AttachmentText { token: sent, .. } if sent == token));
-        assert!(matches!(read(&mut peer), ClientMsg::Resize { .. }));
+        assert!(matches!(read(&mut peer), ClientMsg::Repaint));
         for bytes in [b"later".as_slice(), b" typing", b"\r", &paste::bracket(b"instructions")] {
             client.input(bytes);
             assert_eq!(protocol::read_frame(&mut peer).unwrap().unwrap(), (protocol::BYTES, bytes.to_vec()));
@@ -2727,7 +2993,7 @@ mod tests {
                 message: "Transfer interrupted. No paths pasted.".into(),
                 pasted: false,
             });
-            assert!(matches!(read(&mut peer), ClientMsg::Resize { .. }));
+            assert!(matches!(read(&mut peer), ClientMsg::Repaint));
             client.expire_success(Instant::now() + Duration::from_secs(60));
             assert_eq!(
                 client.state.lock().unwrap().view("server").unwrap().buttons,
@@ -2927,20 +3193,20 @@ mod tests {
                     assert!(matches!(message, ClientMsg::AttachmentCancel { token: sent } if sent == token));
                 }
                 if phase == "progress" {
-                    assert!(matches!(read(&mut peer), ClientMsg::Resize { .. }));
+                    assert!(matches!(read(&mut peer), ClientMsg::Repaint));
                     client.message(ServerMsg::AttachmentResult {
                         kind: NoticeKind::Error,
                         token: token.clone(),
                         message: "Transfer cancelled.".into(),
                         pasted: false,
                     });
-                    assert!(matches!(read(&mut peer), ClientMsg::Resize { .. }));
+                    assert!(matches!(read(&mut peer), ClientMsg::Repaint));
                     client.keys(b"\x1b");
                     client.keys(&[]);
                     assert!(matches!(read(&mut peer), ClientMsg::AttachmentDismiss { .. }));
                 }
             }
-            assert!(matches!(read(&mut peer), ClientMsg::Resize { .. }));
+            assert!(matches!(read(&mut peer), ClientMsg::Repaint));
             assert!(client.state.lock().unwrap().view("fakehost").is_none());
             encoder.invalidate();
             bytes.clear();
@@ -3004,7 +3270,7 @@ mod tests {
                 pasted: true,
             });
             assert!(matches!(read(&mut peer), ClientMsg::AttachmentDismiss { token: sent } if sent == token));
-            assert!(matches!(read(&mut peer), ClientMsg::Resize { .. }));
+            assert!(matches!(read(&mut peer), ClientMsg::Repaint));
             let until = {
                 let state = client.state.lock().unwrap();
                 assert_eq!(
@@ -3022,7 +3288,7 @@ mod tests {
             assert!(client.state.lock().unwrap().status.is_some());
             client.expire_success(until);
             assert!(client.state.lock().unwrap().view("this machine").is_none());
-            assert!(matches!(read(&mut peer), ClientMsg::Resize { .. }));
+            assert!(matches!(read(&mut peer), ClientMsg::Repaint));
             client.input(b"\x03");
             assert_eq!(protocol::read_frame(&mut peer).unwrap().unwrap(), (protocol::BYTES, b"\x03".to_vec()));
         }
@@ -3123,10 +3389,10 @@ mod tests {
                 limits: Default::default(),
             });
             client.keys(format!("{}\r", path.display()).as_bytes());
-            assert!(matches!(read_without_resize(&mut peer), ClientMsg::AttachmentStart { .. }));
+            assert!(matches!(read_without_repaint(&mut peer), ClientMsg::AttachmentStart { .. }));
             if acknowledge_start {
                 client.message(ServerMsg::AttachmentAck { token: "ab".into(), received: 0 });
-                assert!(matches!(read_without_resize(&mut peer), ClientMsg::AttachmentChunk { .. }));
+                assert!(matches!(read_without_repaint(&mut peer), ClientMsg::AttachmentChunk { .. }));
             }
             let started = Instant::now();
             loop {

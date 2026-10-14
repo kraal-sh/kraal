@@ -143,6 +143,13 @@ impl Server {
                 self.probe_cell_size(id);
                 self.relayout();
             }
+            ClientMsg::Repaint => {
+                if let Some(c) = self.clients.get_mut(&id).filter(|c| c.attached) {
+                    c.encoder.invalidate();
+                    c.dirty = Dirty::Yes;
+                    self.render_now();
+                }
+            }
             ClientMsg::ClipboardResult { id: copy, outcome, native_unavailable } => {
                 self.clipboard_result(id, copy, outcome, native_unavailable);
             }

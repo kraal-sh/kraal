@@ -113,11 +113,11 @@ impl Server {
             return None;
         }
         let pane = self.client_focus(id);
-        let agent = matches!(client.mode, Mode::Normal)
-            && pane
-                .and_then(|pane| self.panes.get(&pane))
-                .is_some_and(|pane| pane.agent.kind.is_some() && pane.exit_code.is_none() && !pane.shell_waiting());
-        Some((pane, agent))
+        let agent = pane
+            .and_then(|pane| self.panes.get(&pane))
+            .is_some_and(|pane| pane.agent.kind.is_some() && pane.exit_code.is_none() && !pane.shell_waiting());
+        let eligible_pane = pane.filter(|_| matches!(client.mode, Mode::Normal));
+        Some((eligible_pane, agent))
     }
 
     pub(super) fn offer_attachments(&mut self, id: ClientId, confirmed: Option<PaneId>) -> Mode {
@@ -753,6 +753,36 @@ mod tests {
     }
 
     #[test]
+    fn notice_repaint_keeps_the_other_clients_layout_and_pty_size() {
+        let (mut server, first, _peer, pane, _events) = setup_command("notice-repaint", vec!["cat".into()]);
+        wait_for_program(&server, pane, "cat");
+        let (second, _peer2) = client(&mut server);
+        server.clients.get_mut(&second).unwrap().workspace = server.clients[&first].workspace;
+        for (id, cols, rows) in [(first, 80, 24), (second, 124, 36)] {
+            server.client_frame(
+                id,
+                crate::protocol::JSON,
+                serde_json::to_vec(&ClientMsg::Resize { cols, rows }).unwrap(),
+            );
+        }
+        server.render_clients();
+        let size = (server.panes[&pane].cols, server.panes[&pane].rows);
+        let last_input = server.clients[&first].last_input;
+        assert_eq!(server.primary, Some(second));
+        assert_eq!(server.clients[&first].dirty, super::super::Dirty::No);
+        server.client_frame(first, crate::protocol::JSON, serde_json::to_vec(&ClientMsg::Repaint).unwrap());
+        assert_eq!(server.clients[&first].dirty, super::super::Dirty::Yes);
+        assert!(server.clients[&first].encoder.redraws_all(ratatui::layout::Rect::new(0, 0, 80, 24)));
+        assert_eq!(server.clients[&second].dirty, super::super::Dirty::No);
+        server.render_clients();
+        assert_eq!(server.primary, Some(second));
+        assert_eq!((server.panes[&pane].cols, server.panes[&pane].rows), size);
+        assert_eq!(server.clients[&first].last_input, last_input);
+        assert_eq!((server.clients[&first].cols, server.clients[&first].rows), (80, 24));
+        assert_eq!((server.clients[&second].cols, server.clients[&second].rows), (124, 36));
+    }
+
+    #[test]
     fn focus_updates_follow_agent_mode_and_pane_changes() {
         let (mut server, id, _peer, pane, _events) = setup_command("agent-focus", vec!["cat".into()]);
         wait_for_program(&server, pane, "cat");
@@ -762,7 +792,7 @@ mod tests {
             assert_eq!(server.clipboard_focus(id), Some((Some(pane), true)));
             server.clients.get_mut(&id).unwrap().mode =
                 Mode::Prompt(super::super::ui::Prompt::new("Path", "", super::super::ui::PromptAction::OpenPreview));
-            assert_eq!(server.clipboard_focus(id), Some((Some(pane), false)));
+            assert_eq!(server.clipboard_focus(id), Some((None, true)));
             server.clients.get_mut(&id).unwrap().mode = Mode::Normal;
             assert_eq!(server.clipboard_focus(id), Some((Some(pane), true)));
             server.panes.get_mut(&pane).unwrap().agent.kind = None;
@@ -783,6 +813,36 @@ mod tests {
             )
             .unwrap();
         assert_eq!(server.clipboard_focus(id), Some((Some(other), false)));
+    }
+
+    #[test]
+    fn host_attach_advertises_claude_with_kitty_flags_and_reserves_its_image_target() {
+        for argv in [
+            vec!["/home/user/.local/bin/claude".into()],
+            vec!["node".into(), "/usr/lib/node_modules/@anthropic-ai/claude-code/cli.js".into()],
+        ] {
+            let (mut server, id, _peer, pane, _events) = setup_command("claude-kitty", vec!["cat".into()]);
+            wait_for_program(&server, pane, "cat");
+            assert!(server.clients[&id].remote);
+            let target = server.panes.get_mut(&pane).unwrap();
+            target.agent.set_process(crate::agent::detect_agent(&argv), |_, _| false);
+            target.feed(b"\x1b[>31u");
+            assert_eq!(target.input_modes().kitty_flags, 31);
+            server.render_clients();
+            assert_eq!(server.clients[&id].attachments.focus, Some((Some(pane), true)));
+            server.attachment_message(
+                id,
+                ClientMsg::AttachmentRequest {
+                    token: "ab".into(),
+                    text: b"\x1b[118;5u".to_vec(),
+                    image: true,
+                    pane: Some(pane),
+                },
+            );
+            let pending = server.clients[&id].attachments.pending.as_ref().unwrap();
+            assert_eq!(pending.pane, pane);
+            assert!(pending.image);
+        }
     }
 
     #[test]
@@ -834,6 +894,7 @@ mod tests {
             assert_eq!(server.clipboard_focus(id), Some((Some(pane), true)));
             server.client_input(id, b"\x02v");
             assert!(server.panes[&pane].in_copy_mode());
+            assert_eq!(server.clipboard_focus(id), Some((None, true)), "copy mode retains agent recognition");
             server.attachment_message(
                 id,
                 ClientMsg::AttachmentRequest { token: "ab".into(), text: key.to_vec(), image: true, pane: Some(pane) },

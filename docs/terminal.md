@@ -274,10 +274,15 @@ Always also remembers the SSH destination in the laptop's `paste-files.toml`, in
 to revoke it. Tab or arrows select a button, Enter or a click activates it. Cancel, Esc or Ctrl+C
 sends neither the image nor Ctrl+V. Broadcasting still asks before sending only to the named pane.
 
-With no image, Ctrl+V goes straight to the pane without reading clipboard content. In a shell,
-an editor, any pane without a recognized agent, or a local session, Ctrl+V is unchanged. Both
-raw Ctrl+V and kitty keyboard presses work. Empty bracketed pastes never trigger an image read.
-Older clients or servers keep their existing Ctrl+V behavior until both support this feature.
+With no image, Ctrl+V goes straight to the pane without reading clipboard content. In a recognized
+agent pane, a short notice says **No image in the laptop clipboard: copy a screenshot first**.
+If the clipboard advertises an image but the pane is not recognized as an agent, the key still
+goes through and a notice points to **Attach clipboard image**. Ordinary Ctrl+V with text in a
+shell or editor stays silent, including when clipboard tools are unavailable. Local sessions
+leave Ctrl+V unchanged. Both raw Ctrl+V and kitty keyboard presses work, including in Ghostty
+when Claude Code enables kitty keyboard flags. Empty bracketed pastes never trigger an image read.
+Each cause is shown at most once per attach, including across reconnects. Notices use kraal's
+notice style, disappear after four seconds, and do not consume Ctrl+V or subsequent typing.
 
 **Attach clipboard image** remains available in the palette and pane menu, including in local
 sessions. It names the destination and asks for **Send** or **Cancel** before reading once.
@@ -286,8 +291,13 @@ confirmation can authorize reading the clipboard. Server focus updates cannot tr
 and nothing watches the clipboard between actions.
 
 Ctrl+V checks `wl-paste --list-types` on Wayland, `xclip -selection clipboard -out -target TARGETS`
-on X11, or `osascript -e 'clipboard info'` on macOS. If the type check is unavailable, the key
-is forwarded unchanged; use **Attach clipboard image** for an explicit read and diagnostic.
+on X11, or `osascript -e 'clipboard info'` on macOS. If the type check is unavailable in an agent
+pane, the key is forwarded unchanged and a notice explains the next step. A missing Wayland tool
+says **Ctrl+V could not read the laptop clipboard: install wl-clipboard**; X11 names `xclip`, and
+macOS names `osascript`. A failed tool includes its error and points to **Attach clipboard image**
+to retry. If neither `WAYLAND_DISPLAY` nor `DISPLAY` is set on Linux, run attach from a desktop
+terminal with its display environment. The environment must belong to the laptop client, not
+the server. On GNOME Wayland, a screenshot copied as `image/png` is supported.
 Linux reads PNG using `wl-paste --no-newline --type image/png` when `WAYLAND_DISPLAY` is set, then
 `xclip -selection clipboard -out -target image/png` when `DISPLAY` is set. Install `wl-clipboard`
 or `xclip` for your desktop. macOS uses `osascript` to export the clipboard as PNG into a private
