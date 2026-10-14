@@ -1,0 +1,32 @@
+layout {
+    default_tab_template {
+        pane size=1 borderless=true {
+            plugin location="zellij:tab-bar"
+        }
+        children
+        pane size=1 borderless=true {
+            plugin location="zellij:status-bar"
+        }
+    }
+    tab name="development" focus=true cwd="/srv/project" {
+        pane split_direction="vertical" {
+            pane name="editor" command="nvim" size="60%" focus=true {
+                args "src/main.rs"
+            }
+            pane stacked=true {
+                pane name="shell"
+                pane name="logs" command="tail" expanded=true {
+                    args "-f" "app.log"
+                }
+            }
+        }
+        floating_panes {
+            pane command="lazygit" width="80%" height="80%" x="10%" y="10%"
+        }
+    }
+    tab name="remote" {
+        pane name="server" command="ssh" start_suspended=true {
+            args "deploy@server.example.net"
+        }
+    }
+}
