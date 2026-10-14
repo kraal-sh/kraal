@@ -106,6 +106,7 @@ impl Mode {
 pub enum ConfirmAction {
     PurgeAttachments,
     AttachFiles(PaneId),
+    AttachClipboardImage(PaneId),
     LoadWorkspace {
         prompt: Prompt,
         inventory: Vec<super::persistence::ClosePane>,
@@ -222,7 +223,7 @@ impl ConfirmAction {
             ConfirmAction::ReorderWorkspace { .. } => "Retry".into(),
             ConfirmAction::RetryCloseWorkspace(_) | ConfirmAction::OpenWorkspace(_) => "Retry".into(),
             ConfirmAction::Restart => "Restart".into(),
-            ConfirmAction::AttachFiles(_) => "Attach".into(),
+            ConfirmAction::AttachFiles(_) | ConfirmAction::AttachClipboardImage(_) => "Attach".into(),
             ConfirmAction::PurgeAttachments => "Purge".into(),
             ConfirmAction::Quit => "Quit".into(),
             ConfirmAction::Job { label, .. } | ConfirmAction::GitJob { label, .. } => {

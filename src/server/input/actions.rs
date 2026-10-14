@@ -25,6 +25,7 @@ impl Server {
 
     pub(super) fn action(&mut self, id: ClientId, action: Action) -> Mode {
         match action {
+            Action::AttachClipboardImage => return self.offer_attachment(id, None, true),
             Action::AttachFiles => return self.offer_attachments(id, None),
             Action::PurgeAttachments => {
                 return Mode::confirm(
@@ -413,6 +414,7 @@ impl Server {
             | Action::Help
             | Action::Messages
             | Action::CommandPalette
+            | Action::AttachClipboardImage
             | Action::AttachFiles
             | Action::PurgeAttachments
             | Action::Restart

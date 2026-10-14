@@ -81,7 +81,9 @@ pub const CLIPBOARD: Feature =
 pub const ATTACHMENTS: Feature = Feature { name: "attachments", does: "attach local files", check_first: false };
 pub const PASTED_PATHS: Feature =
     Feature { name: "pasted_paths", does: "recognize laptop paths in pastes", check_first: false };
-pub const FEATURES: [Feature; 10] = [
+pub const CLIPBOARD_IMAGES: Feature =
+    Feature { name: "clipboard_images", does: "attach clipboard images", check_first: false };
+pub const FEATURES: [Feature; 11] = [
     LIST_AGENTS,
     BUFFERS,
     EDIT_SUDO,
@@ -92,6 +94,7 @@ pub const FEATURES: [Feature; 10] = [
     CLIPBOARD,
     ATTACHMENTS,
     PASTED_PATHS,
+    CLIPBOARD_IMAGES,
 ];
 
 /// The names of this kraal's server features, as it lists them.
@@ -105,7 +108,8 @@ pub const LENIENT: &str = "lenient";
 
 /// What this kraal's client can read beyond what one of the oldest supported release can. It
 /// lists them in its messages, for a later server to rely on.
-pub const CLIENT_FEATURES: [&str; 4] = [LENIENT, CLIPBOARD.name, ATTACHMENTS.name, PASTED_PATHS.name];
+pub const CLIENT_FEATURES: [&str; 5] =
+    [LENIENT, CLIPBOARD.name, ATTACHMENTS.name, PASTED_PATHS.name, CLIPBOARD_IMAGES.name];
 
 pub fn client_features() -> Vec<String> {
     CLIENT_FEATURES.iter().map(|f| f.to_string()).collect()
@@ -337,6 +341,11 @@ pub enum ServerMsg {
         target: String,
         limits: crate::attachments::Settings,
         broadcast: bool,
+    },
+    ClipboardImageOffer {
+        token: String,
+        target: String,
+        limits: crate::attachments::Settings,
     },
     AttachmentOffer {
         token: String,
@@ -1253,6 +1262,7 @@ mod tests {
                 limits: Default::default(),
                 broadcast: true,
             },
+            ServerMsg::ClipboardImageOffer { token: s("ab"), target: s("main"), limits: Default::default() },
             ServerMsg::AttachmentOffer { token: s("ab"), target: s("main"), limits: Default::default() },
             ServerMsg::AttachmentAck { token: s("ab"), received: 3 },
             ServerMsg::AttachmentResult { pasted: true, token: s("ab"), message: s("Files received.") },

@@ -19,6 +19,7 @@ use crate::protocol::{ClientMsg, ServerMsg};
 pub(super) struct Attachments {
     pub negotiated: bool,
     pub recognition: bool,
+    pub images: bool,
     pub pending: Option<Pending>,
     pub blocked: Option<String>,
 }
@@ -26,6 +27,7 @@ pub(super) struct Attachments {
 pub(super) struct Pending {
     token: String,
     from_paste: bool,
+    image: bool,
     pane: PaneId,
     started: Instant,
     batch: bool,
@@ -107,9 +109,21 @@ impl Worker {
 
 impl Server {
     pub(super) fn offer_attachments(&mut self, id: ClientId, confirmed: Option<PaneId>) -> Mode {
+        self.offer_attachment(id, confirmed, false)
+    }
+
+    pub(super) fn offer_attachment(&mut self, id: ClientId, confirmed: Option<PaneId>, image: bool) -> Mode {
         let Some(c) = self.clients.get(&id) else { return Mode::Normal };
+        let action = if image { "Attach clipboard image" } else { "Attach files" };
         if !c.attached || !c.attachments.negotiated {
-            self.toast(id, "Attach files needs a newer client. Update kraal on your laptop and attach again.");
+            self.toast(id, format!("{action} needs a newer client. Update kraal on your laptop and attach again."));
+            return Mode::Normal;
+        }
+        if image && !c.attachments.images {
+            self.toast(
+                id,
+                "Attach clipboard image needs a newer client. Update kraal on your laptop and attach again.",
+            );
             return Mode::Normal;
         }
         if c.attachments.blocked.is_some() {
@@ -130,8 +144,12 @@ impl Server {
         }
         if confirmed.is_none() && self.input_targets(id, pane).len() != 1 {
             return Mode::confirm(
-                format!("Broadcasting is on. Attach files only to {}?", self.pane_label(pane)),
-                super::ui::ConfirmAction::AttachFiles(pane),
+                format!("Broadcasting is on. {action} only to {}?", self.pane_label(pane)),
+                if image {
+                    super::ui::ConfirmAction::AttachClipboardImage(pane)
+                } else {
+                    super::ui::ConfirmAction::AttachFiles(pane)
+                },
             );
         }
         let token = format!(
@@ -143,6 +161,7 @@ impl Server {
         self.clients.get_mut(&id).unwrap().attachments.pending = Some(Pending {
             token: token.clone(),
             from_paste: false,
+            image,
             pane,
             started: Instant::now(),
             batch: false,
@@ -150,7 +169,17 @@ impl Server {
             cancelled: Arc::new(AtomicBool::new(false)),
             keys: Vec::new(),
         });
-        self.send_msg(id, &ServerMsg::AttachmentOffer { token, target, limits: self.config.attachments.clone() });
+        let mut limits = self.config.attachments.clone();
+        if image {
+            limits.file_bytes = limits.file_bytes.min(attachments::IMAGE_BYTES as u64);
+            limits.files = 1;
+        }
+        let offer = if image {
+            ServerMsg::ClipboardImageOffer { token, target, limits }
+        } else {
+            ServerMsg::AttachmentOffer { token, target, limits }
+        };
+        self.send_msg(id, &offer);
         Mode::Normal
     }
 
@@ -196,6 +225,7 @@ impl Server {
         self.clients.get_mut(&id).unwrap().attachments.pending = Some(Pending {
             token: token.clone(),
             from_paste: true,
+            image: false,
             pane,
             started: Instant::now(),
             batch: false,
@@ -229,6 +259,11 @@ impl Server {
     }
 
     fn attachment_failed(&mut self, id: ClientId, token: String, error: &str) {
+        let image = self
+            .clients
+            .get(&id)
+            .and_then(|c| c.attachments.pending.as_ref())
+            .is_some_and(|p| p.token == token && p.image);
         let from_paste = self
             .clients
             .get(&id)
@@ -244,7 +279,8 @@ impl Server {
             format!("Transfer interrupted: {error}. No paths or queued typing pasted.")
         } else {
             format!(
-                "Attachment stopped: {error}. No paths or queued typing pasted. Press Ctrl+C, then use Attach files to retry."
+                "Attachment stopped: {error}. No paths or queued typing pasted. Press Ctrl+C, then use {} to retry.",
+                if image { "Attach clipboard image" } else { "Attach files" }
             )
         };
         self.toast(id, &message);
@@ -318,7 +354,13 @@ impl Server {
         match msg {
             ClientMsg::AttachmentStart { files, .. } => {
                 ensure!(!pending.batch && !pending.busy, "batch already started");
-                ensure!(self.clients[&id].remote, "local attachments use their original paths");
+                ensure!(self.clients[&id].remote || pending.image, "local attachments use their original paths");
+                if pending.image {
+                    ensure!(
+                        files.len() == 1 && files[0].size <= attachments::IMAGE_BYTES as u64,
+                        "clipboard image exceeds 16 MiB or contains multiple files"
+                    );
+                }
                 self.config.attachments.check(&files)?;
                 let root = attachments::directory(&self.session);
                 let settings = self.config.attachments.clone();
@@ -386,7 +428,7 @@ impl Server {
                 }
             }
             ClientMsg::AttachmentLocal { paths, .. } => {
-                ensure!(!self.clients[&id].remote, "remote attachments must transfer their files");
+                ensure!(!self.clients[&id].remote && !pending.image, "this attachment must transfer its files");
                 ensure!(!paths.is_empty() && paths.len() <= self.config.attachments.files, "invalid file count");
                 ensure!(
                     paths.iter().all(|p| p.len() <= 4096
@@ -617,6 +659,51 @@ mod tests {
             ClientMsg::AttachmentChunk { token: token.into(), file: 0, offset: 0, data: "YWJj".into() },
         );
         settle(server, rx);
+    }
+
+    #[test]
+    fn image_offers_require_capability_and_accept_private_storage_in_local_sessions() {
+        let (mut server, id, _peer, pane, rx) = setup("image-local");
+        server.offer_attachment(id, None, true);
+        assert!(server.clients[&id].attachments.pending.is_none());
+        assert!(server.clients[&id].toast.as_ref().unwrap().0.contains("Update kraal on your laptop"));
+        server.clients.get_mut(&id).unwrap().attachments.images = true;
+        server.clients.get_mut(&id).unwrap().remote = false;
+        server.offer_attachment(id, None, true);
+        let pending = server.clients[&id].attachments.pending.as_ref().unwrap();
+        assert!(pending.image);
+        assert_eq!(pending.pane, pane);
+        let token = pending.token.clone();
+        assert!(
+            server
+                .receive_attachment(
+                    id,
+                    ClientMsg::AttachmentLocal { token: token.clone(), paths: vec!["/tmp/image.png".into()] }
+                )
+                .is_err()
+        );
+        for files in [
+            vec![FileSpec { name: "clipboard.png".into(), size: attachments::IMAGE_BYTES as u64 + 1 }],
+            vec![FileSpec { name: "clipboard.png".into(), size: 1 }; 2],
+        ] {
+            assert!(server.receive_attachment(id, ClientMsg::AttachmentStart { token: token.clone(), files }).is_err());
+        }
+        server
+            .receive_attachment(
+                id,
+                ClientMsg::AttachmentStart {
+                    token: token.clone(),
+                    files: vec![FileSpec { name: "clipboard.png".into(), size: attachments::IMAGE_BYTES as u64 }],
+                },
+            )
+            .unwrap();
+        settle(&mut server, &rx);
+        let root = attachments::directory(&server.session);
+        assert!(root.join(format!(".{token}/0/clipboard.png")).exists());
+        server.attachment_message(id, ClientMsg::AttachmentCancel { token });
+        settle(&mut server, &rx);
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
+        attachments::remove(&server.session).unwrap();
     }
 
     #[test]
@@ -952,11 +1039,17 @@ mod tests {
             .unwrap();
         let wi = server.ws_index(ws).unwrap();
         server.workspaces[wi].sync = crate::server::SyncScope::Workspace;
-        let mode = server.offer_attachments(id, None);
-        assert!(
-            matches!(mode, Mode::Confirm(q) if matches!(q.action, crate::server::ui::ConfirmAction::AttachFiles(_)))
-        );
-        assert!(server.clients[&id].attachments.pending.is_none());
+        server.clients.get_mut(&id).unwrap().attachments.images = true;
+        for image in [false, true] {
+            let mode = server.offer_attachment(id, None, image);
+            let Mode::Confirm(confirm) = mode else { panic!("broadcast did not ask") };
+            assert!(match confirm.action {
+                crate::server::ui::ConfirmAction::AttachFiles(_) => !image,
+                crate::server::ui::ConfirmAction::AttachClipboardImage(_) => image,
+                _ => false,
+            });
+            assert!(server.clients[&id].attachments.pending.is_none());
+        }
         assert!(matches!(server.offer_attachments(id, Some(pane)), Mode::Normal));
         assert_eq!(server.clients[&id].attachments.pending.as_ref().unwrap().pane, pane);
     }

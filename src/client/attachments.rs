@@ -17,6 +17,7 @@ use crate::protocol::{self, ClientMsg, ServerMsg};
 type Writer = Arc<Mutex<Option<Box<dyn Write + Send>>>>;
 
 struct Prompt {
+    image: bool,
     token: String,
     target: String,
     limits: attachments::Settings,
@@ -33,6 +34,7 @@ struct Active {
     ack: Sender<u64>,
     started: Instant,
     progress: Option<(u64, u64)>,
+    failure: Option<String>,
 }
 
 struct Dropped {
@@ -56,6 +58,7 @@ struct State {
     splitter: paste::Splitter,
     prompt: Option<Prompt>,
     active: Option<Active>,
+    workers: Vec<Receiver<()>>,
     status: Option<String>,
     uncertain: Option<String>,
     result_token: Option<String>,
@@ -100,7 +103,7 @@ impl Controller {
         if !state.negotiated && state.dropped.is_some() {
             return false;
         }
-        if !self.remote || !state.negotiated || state.prompt.is_some() {
+        if !self.remote || !state.negotiated {
             drop(state);
             return self.keys(bytes);
         }
@@ -112,7 +115,11 @@ impl Controller {
             match part {
                 paste::Part::Start => {
                     let mut state = self.state.lock().unwrap();
-                    if state.dropped.is_none() && state.active.is_none() && state.uncertain.is_none() {
+                    if state.prompt.is_none()
+                        && state.dropped.is_none()
+                        && state.active.is_none()
+                        && state.uncertain.is_none()
+                    {
                         if let Some(token) = state.result_token.take() {
                             let _ = send(&self.writer, &ClientMsg::AttachmentDismiss { token });
                         }
@@ -129,6 +136,11 @@ impl Controller {
                 paste::Part::Paste(text) => {
                     let paths = std::str::from_utf8(&text).ok().and_then(crate::transfer::dropped_paths);
                     let mut state = self.state.lock().unwrap();
+                    if state.prompt.is_some() {
+                        drop(state);
+                        self.keys(&paste::bracket(&text));
+                        continue;
+                    }
                     if state.dropped.is_none()
                         && state.active.is_none()
                         && state.uncertain.is_none()
@@ -236,15 +248,24 @@ impl Controller {
             )
         } else if let Some(p) = &state.prompt {
             let before: String = p.text.chars().take(p.cursor).collect();
-            vec![
-                format!("Attach files to {}", p.target),
-                format!("Paths: {}", crate::text::truncate_start(&before, width.saturating_sub(7))),
-                p.error.clone().unwrap_or_else(|| "Absolute paths, quote spaces. Enter sends, Ctrl+C cancels.".into()),
-            ]
+            if p.image {
+                vec![
+                    format!("Attach clipboard image to {}", p.target),
+                    "Enter reads the local clipboard and attaches its image. Ctrl+C cancels.".into(),
+                ]
+            } else {
+                vec![
+                    format!("Attach files to {}", p.target),
+                    format!("Paths: {}", crate::text::truncate_start(&before, width.saturating_sub(7))),
+                    p.error
+                        .clone()
+                        .unwrap_or_else(|| "Absolute paths, quote spaces. Enter sends, Ctrl+C cancels.".into()),
+                ]
+            }
         } else if let Some(status) = &state.status {
             let mut lines = crate::text::wrap(status, width);
             lines.truncate(4);
-            lines.push("Ctrl+C dismisses or cancels. Use Attach files to send another batch.".into());
+            lines.push("Ctrl+C dismisses or cancels. Use the command palette to attach again.".into());
             lines
         } else {
             return;
@@ -267,6 +288,7 @@ impl Controller {
     pub fn message(self: &Arc<Self>, msg: ServerMsg) {
         let mut state = self.state.lock().unwrap();
         let repaint = state.dropped.is_some() && matches!(&msg, ServerMsg::AttachmentResult { .. });
+        let image = matches!(&msg, ServerMsg::ClipboardImageOffer { .. });
         match msg {
             ServerMsg::AttachmentPrepared { token, target, limits, broadcast } => {
                 if state.uncertain.as_ref() == Some(&token) {
@@ -293,7 +315,8 @@ impl Controller {
                 }
                 return;
             }
-            ServerMsg::AttachmentOffer { token, target, limits } => {
+            ServerMsg::AttachmentOffer { token, target, limits }
+            | ServerMsg::ClipboardImageOffer { token, target, limits } => {
                 if state.dropped.is_some()
                     || state.prompt.is_some()
                     || state.active.is_some()
@@ -302,7 +325,13 @@ impl Controller {
                     return;
                 }
                 state.status = None;
+                let mut parser = InputParser::new();
+                if state.splitter.streaming() {
+                    // The splitter already forwarded the start of this oversized paste.
+                    parser.feed(b"\x1b[200~");
+                }
                 state.prompt = Some(Prompt {
+                    image,
                     token,
                     target: target.chars().filter(|c| !c.is_control()).collect(),
                     limits,
@@ -310,7 +339,7 @@ impl Controller {
                     cursor: 0,
                     error: None,
                     paste_failed: false,
-                    parser: InputParser::new(),
+                    parser,
                 });
             }
             ServerMsg::AttachmentAck { token, received } => {
@@ -330,6 +359,9 @@ impl Controller {
                 }
                 if active && let Some(active) = state.active.take() {
                     active.cancelled.store(true, Ordering::SeqCst);
+                    if let Some(failure) = active.failure {
+                        message = failure;
+                    }
                 }
                 if prompt {
                     state.prompt = None;
@@ -489,6 +521,7 @@ impl Controller {
                         self.cancel();
                         return true;
                     }
+                    _ if prompt.image => {}
                     InputEvent::Key(key) if matches!(key.code, KeyCode::Char(_)) && !key.mods.ctrl && !key.mods.alt => {
                         let KeyCode::Char(c) = key.code else { unreachable!() };
                         if let Err(error) =
@@ -550,12 +583,16 @@ impl Controller {
         let mut state = self.state.lock().unwrap();
         let (ack, replies) = bounded(2);
         let cancelled = Arc::new(AtomicBool::new(false));
+        let (finished, completion) = bounded(1);
+        state.workers.retain(|worker| matches!(worker.try_recv(), Err(crossbeam_channel::TryRecvError::Empty)));
+        state.workers.push(completion);
         state.active = Some(Active {
             token: prompt.token.clone(),
             cancelled: cancelled.clone(),
             ack,
             started: Instant::now(),
             progress: None,
+            failure: None,
         });
         state.status = None;
         state.parser = InputParser::new();
@@ -563,25 +600,35 @@ impl Controller {
         self.start_progress(prompt.token.clone());
         let this = self.clone();
         let token = prompt.token.clone();
+        let action = if prompt.image { "Attach clipboard image" } else { "Attach files" };
         if let Err(error) = crate::threads::named("attachments").spawn(move || {
+            let _finished = finished;
             if let Err(error) = this.upload(&prompt, &replies, &cancelled)
                 && !cancelled.load(Ordering::SeqCst)
             {
-                this.upload_failed(prompt.token, &cancelled, &error);
+                this.upload_failed(prompt.token, &cancelled, &error, prompt.image);
             }
         }) {
             let _ = send(&self.writer, &ClientMsg::AttachmentCancel { token: token.clone() });
             self.message(ServerMsg::AttachmentResult {
                 pasted: false,
                 token,
-                message: format!("Cannot start attachment: {error}. Use Attach files to retry."),
+                message: format!("Cannot start attachment: {error}. Use {action} to retry."),
             });
         }
     }
 
-    fn upload_failed(self: &Arc<Self>, token: String, cancelled: &AtomicBool, error: &anyhow::Error) {
+    fn upload_failed(self: &Arc<Self>, token: String, cancelled: &AtomicBool, error: &anyhow::Error, image: bool) {
+        let message = if image {
+            format!("Image not attached: {error:#}. Press Ctrl+C to dismiss.")
+        } else {
+            format!("Attachment stopped: {error:#}. Use Attach files to retry.")
+        };
         let dropped = {
             let mut state = self.state.lock().unwrap();
+            if let Some(active) = state.active.as_mut().filter(|a| a.token == token) {
+                active.failure = Some(message.clone());
+            }
             if let Some(dropped) = state.dropped.as_mut().filter(|d| d.token == token) {
                 dropped.error = Some(format!("{error:#}"));
                 true
@@ -598,11 +645,7 @@ impl Controller {
             }
         }
         if !dropped {
-            self.message(ServerMsg::AttachmentResult {
-                pasted: false,
-                token,
-                message: format!("Attachment stopped: {error:#}. Use Attach files to retry."),
-            });
+            self.message(ServerMsg::AttachmentResult { pasted: false, token, message });
         }
     }
 
@@ -683,6 +726,7 @@ impl Controller {
             return;
         }
         let prompt = Prompt {
+            image: false,
             token: dropped.token.clone(),
             target: dropped.target.clone(),
             limits: dropped.limits.clone(),
@@ -765,7 +809,8 @@ impl Controller {
 
     fn upload(&self, prompt: &Prompt, replies: &Receiver<u64>, cancelled: &AtomicBool) -> Result<()> {
         let started = Instant::now();
-        let paths = explicit_paths(&prompt.text)?;
+        let image = prompt.image.then(|| super::clipboard_image::read(cancelled)).transpose()?;
+        let paths = if let Some(image) = &image { vec![image.path.clone()] } else { explicit_paths(&prompt.text)? };
         ensure!(paths.len() <= prompt.limits.files, "too many files; use kraal cp");
         let mut sources = paths.into_iter().map(Source::open).collect::<Result<Vec<_>>>()?;
         let specs: Vec<_> = sources.iter().map(|s| s.spec.clone()).collect();
@@ -791,7 +836,7 @@ impl Controller {
                 }
             }
         };
-        if !self.remote {
+        if !self.remote && !prompt.image {
             let paths = sources
                 .iter()
                 .map(|s| s.path.to_str().context("path is not UTF-8").map(String::from))
@@ -825,6 +870,15 @@ impl Controller {
         }
         write(ClientMsg::AttachmentFinish { token: token.clone() })?;
         Ok(())
+    }
+
+    pub fn shutdown(&self) {
+        self.disconnect();
+        let workers = self.state.lock().unwrap().workers.clone();
+        for finished in workers {
+            // Signal exit skips destructors, so let the worker reap its helper and remove staging first.
+            let _ = finished.recv_timeout(std::time::Duration::from_secs(3));
+        }
     }
 
     pub fn disconnect(&self) {
@@ -1033,6 +1087,212 @@ mod tests {
             broadcast: false,
         });
         token
+    }
+
+    #[test]
+    fn image_offer_requires_local_enter_and_ordinary_paste_never_reads_the_clipboard() {
+        for remote in [false, true] {
+            let (client, mut peer) = controller(remote);
+            client.negotiate(true);
+            client.message(ServerMsg::ClipboardImageOffer {
+                token: "ab".into(),
+                target: "pane".into(),
+                limits: Default::default(),
+            });
+            assert!(peer.incoming.try_recv().is_err());
+            client.keys(b"\x16\x1b[200~\r\x1b[201~");
+            assert!(client.state.lock().unwrap().active.is_none());
+            assert!(client.state.lock().unwrap().prompt.as_ref().unwrap().image);
+            assert!(peer.incoming.try_recv().is_err());
+            client.keys(b"\x03");
+            assert!(matches!(read(&mut peer), ClientMsg::AttachmentCancel { .. }));
+            assert!(client.state.lock().unwrap().prompt.is_none());
+        }
+    }
+
+    #[test]
+    fn image_offer_between_paste_fragments_requires_enter_outside_the_paste() {
+        if !crate::testing::in_own_process(
+            "client::attachments::tests::image_offer_between_paste_fragments_requires_enter_outside_the_paste",
+        ) {
+            return;
+        }
+        let root = crate::paths::state_dir().join("fragmented-image-test");
+        std::fs::create_dir_all(&root).unwrap();
+        for tool in ["wl-paste", "xclip", "osascript"] {
+            crate::testing::write_script(&root.join(tool), "#!/bin/sh\nexit 1\n");
+        }
+        // This process has not started any workers yet. Never read the desktop clipboard.
+        unsafe {
+            std::env::set_var("PATH", &root);
+            std::env::set_var("WAYLAND_DISPLAY", "test");
+        }
+        for text in [b"text".to_vec(), vec![b'x'; paste::LIMIT + 1]] {
+            let bytes = paste::bracket(&[text, b"\r".to_vec()].concat());
+            for split in [1, 5, 6, bytes.len() - 7, bytes.len() - 3] {
+                let (client, _peer) = controller(true);
+                client.negotiate(true);
+                client.input(&bytes[..split]);
+                client.message(ServerMsg::ClipboardImageOffer {
+                    token: "ab".into(),
+                    target: "pane".into(),
+                    limits: Default::default(),
+                });
+                client.input(&bytes[split..]);
+                let state = client.state.lock().unwrap();
+                assert!(state.active.is_none(), "paste authorized an image at split {split}");
+                assert!(state.prompt.as_ref().is_some_and(|p| p.image), "prompt lost at split {split}");
+                drop(state);
+                client.input(b"\r");
+                assert!(client.state.lock().unwrap().prompt.is_none());
+                client.shutdown();
+            }
+        }
+    }
+
+    #[test]
+    fn images_read_once_and_use_acknowledged_chunks_even_for_local_sessions() {
+        if !crate::testing::in_own_process(
+            "client::attachments::tests::images_read_once_and_use_acknowledged_chunks_even_for_local_sessions",
+        ) {
+            return;
+        }
+        let root = crate::paths::state_dir().join("image-test");
+        std::fs::create_dir_all(&root).unwrap();
+        let log = root.join("reads");
+        let temporary = root.join("tmp");
+        std::fs::create_dir_all(&temporary).unwrap();
+        #[cfg(not(target_os = "macos"))]
+        let (tool, script) =
+            ("wl-paste", format!("#!/bin/sh\necho read >> '{}'\nprintf '\\211PNG\\r\\n\\032\\n'\n", log.display()));
+        #[cfg(target_os = "macos")]
+        let (tool, script) = (
+            "osascript",
+            format!(
+                "#!/bin/sh\necho read >> '{}'\nfor arg; do file=$arg; done\nprintf '\\211PNG\\r\\n\\032\\n' > \"$file\"\n",
+                log.display()
+            ),
+        );
+        crate::testing::write_script(&root.join(tool), &script);
+        // This test runs alone, before starting clipboard or attachment workers.
+        unsafe {
+            std::env::set_var("PATH", format!("{}:{}", root.display(), std::env::var("PATH").unwrap()));
+            std::env::set_var("TMPDIR", &temporary);
+            std::env::set_var("WAYLAND_DISPLAY", "test");
+            std::env::remove_var("DISPLAY");
+        }
+        for remote in [false, true] {
+            let (client, mut peer) = controller(remote);
+            client.message(ServerMsg::ClipboardImageOffer {
+                token: "ab".into(),
+                target: "pane".into(),
+                limits: Default::default(),
+            });
+            client.keys(b"\r");
+            let files = loop {
+                match read(&mut peer) {
+                    ClientMsg::AttachmentStart { files, .. } => break files,
+                    ClientMsg::Resize { .. } => {}
+                    _ => panic!("image did not use attachment transport"),
+                }
+            };
+            assert_eq!(files.len(), 1);
+            assert_eq!(files[0].name, "clipboard.png");
+            assert_eq!(files[0].size, 8);
+            client.message(ServerMsg::AttachmentAck { token: "ab".into(), received: 0 });
+            let ClientMsg::AttachmentChunk { data, .. } = read(&mut peer) else { panic!() };
+            assert_eq!(base64::engine::general_purpose::STANDARD.decode(data).unwrap(), b"\x89PNG\r\n\x1a\n");
+            client.message(ServerMsg::AttachmentAck { token: "ab".into(), received: 8 });
+            assert!(matches!(read(&mut peer), ClientMsg::AttachmentFinish { .. }));
+            client.shutdown();
+        }
+        assert_eq!(std::fs::read_to_string(log).unwrap(), "read\nread\n");
+        assert_eq!(std::fs::read_dir(&temporary).unwrap().count(), 0);
+        let ready = root.join("ready");
+        crate::testing::write_script(
+            &root.join(tool),
+            &format!("#!/bin/sh\necho $$ > '{}'\nexec sleep 60\n", ready.display()),
+        );
+        for stop in [None, Some(Controller::cancel as fn(&Controller)), Some(Controller::disconnect)] {
+            let (client, _peer) = controller(true);
+            client.message(ServerMsg::ClipboardImageOffer {
+                token: "ab".into(),
+                target: "pane".into(),
+                limits: Default::default(),
+            });
+            client.keys(b"\r");
+            let started = Instant::now();
+            let pid: libc::pid_t = loop {
+                if let Some(pid) = std::fs::read_to_string(&ready).ok().and_then(|text| text.trim().parse().ok()) {
+                    break pid;
+                }
+                assert!(started.elapsed() < crate::testing::PATIENCE);
+                std::thread::sleep(Duration::from_millis(5));
+            };
+            if let Some(stop) = stop {
+                stop(&client);
+            }
+            client.shutdown();
+            assert!(client.state.lock().unwrap().active.is_none());
+            assert_eq!(
+                std::fs::read_dir(&temporary).unwrap().count(),
+                0,
+                "shutdown left an unfinished clipboard export"
+            );
+            // SAFETY: signal zero only checks whether the helper still exists.
+            assert_eq!(unsafe { libc::kill(pid, 0) }, -1, "shutdown left the clipboard helper running");
+            assert_eq!(std::io::Error::last_os_error().raw_os_error(), Some(libc::ESRCH));
+            std::fs::remove_file(&ready).unwrap();
+        }
+    }
+
+    #[test]
+    fn concurrent_shutdowns_wait_for_cancelled_workers_to_finish_cleanup() {
+        for stop in [Controller::cancel as fn(&Controller), Controller::disconnect] {
+            let (client, _peer) = controller(true);
+            let (finished, completion) = bounded(1);
+            let cancelled = Arc::new(AtomicBool::new(false));
+            {
+                let mut state = client.state.lock().unwrap();
+                state.workers.push(completion);
+                state.active = Some(Active {
+                    token: "ab".into(),
+                    cancelled: cancelled.clone(),
+                    ack: bounded(1).0,
+                    started: Instant::now(),
+                    progress: None,
+                    failure: None,
+                });
+            }
+            stop(&client);
+            assert!(cancelled.load(Ordering::SeqCst));
+            assert!(client.state.lock().unwrap().active.is_none());
+            let (entered, entering) = bounded(2);
+            let (done, completed) = bounded(2);
+            let threads: Vec<_> = (0..2)
+                .map(|_| {
+                    let client = client.clone();
+                    let entered = entered.clone();
+                    let done = done.clone();
+                    std::thread::spawn(move || {
+                        entered.send(()).unwrap();
+                        client.shutdown();
+                        done.send(()).unwrap();
+                    })
+                })
+                .collect();
+            for _ in 0..2 {
+                entering.recv_timeout(crate::testing::PATIENCE).unwrap();
+            }
+            // The worker still owns its completion sender while its destructors run.
+            let early = completed.recv_timeout(Duration::from_millis(100));
+            drop(finished);
+            for thread in threads {
+                thread.join().unwrap();
+            }
+            assert!(matches!(early, Err(crossbeam_channel::RecvTimeoutError::Timeout)));
+            assert_eq!(completed.len(), 2);
+        }
     }
 
     #[test]
@@ -1309,7 +1569,14 @@ mod tests {
                 {
                     let client = self.client.upgrade().unwrap();
                     // Deliver the reply before the cancellation write returns.
-                    client.state.lock().unwrap().dropped.as_mut().unwrap().error.as_ref().expect("error before cancel");
+                    {
+                        let state = client.state.lock().unwrap();
+                        if let Some(dropped) = &state.dropped {
+                            dropped.error.as_ref().expect("error before cancel");
+                        } else {
+                            state.active.as_ref().unwrap().failure.as_ref().expect("image error before cancel");
+                        }
+                    }
                     let reply = client.clone();
                     let handle = std::thread::spawn(move || {
                         reply.message(ServerMsg::AttachmentResult {
@@ -1319,7 +1586,7 @@ mod tests {
                         })
                     });
                     let started = Instant::now();
-                    while !client.state.lock().unwrap().dropped.as_ref().unwrap().result {
+                    while client.state.lock().unwrap().status.is_none() {
                         assert!(started.elapsed() < Duration::from_secs(2));
                         std::thread::sleep(Duration::from_millis(1));
                     }
@@ -1333,21 +1600,42 @@ mod tests {
                 Ok(())
             }
         }
-        let path = dropped_file("immediate-error");
-        let (client, mut peer) = controller(true);
-        prepare_drop(&client, &mut peer, path.to_str().unwrap().as_bytes());
-        let reply = Arc::new(Mutex::new(None));
-        *client.writer.lock().unwrap() =
-            Some(Box::new(ReplyOnCancel { client: Arc::downgrade(&client), bytes: Vec::new(), reply: reply.clone() }));
-        std::fs::remove_file(&path).unwrap();
-        let error = Source::open(path).err().unwrap();
-        let token = client.state.lock().unwrap().dropped.as_ref().unwrap().token.clone();
-        client.upload_failed(token, &AtomicBool::new(false), &error);
-        reply.lock().unwrap().take().unwrap().join().unwrap();
-        let state = client.state.lock().unwrap();
-        let status = state.status.as_ref().unwrap();
-        assert!(status.contains(&format!("{error:#}")));
-        assert!(status.contains("Transfer interrupted: cancelled."));
+        for image in [false, true] {
+            let path = dropped_file("immediate-error");
+            let (client, mut peer) = controller(true);
+            let token = if image {
+                client.state.lock().unwrap().active = Some(Active {
+                    token: "ab".into(),
+                    cancelled: Arc::new(AtomicBool::new(false)),
+                    ack: bounded(2).0,
+                    started: Instant::now(),
+                    progress: None,
+                    failure: None,
+                });
+                "ab".to_string()
+            } else {
+                prepare_drop(&client, &mut peer, path.to_str().unwrap().as_bytes())
+            };
+            let reply = Arc::new(Mutex::new(None));
+            *client.writer.lock().unwrap() = Some(Box::new(ReplyOnCancel {
+                client: Arc::downgrade(&client),
+                bytes: Vec::new(),
+                reply: reply.clone(),
+            }));
+            std::fs::remove_file(&path).unwrap();
+            let error = Source::open(path).err().unwrap();
+            client.upload_failed(token, &AtomicBool::new(false), &error, image);
+            reply.lock().unwrap().take().unwrap().join().unwrap();
+            let state = client.state.lock().unwrap();
+            let status = state.status.as_ref().unwrap();
+            assert!(status.contains(&format!("{error:#}")));
+            if image {
+                assert!(status.contains("Image not attached:"));
+                assert!(status.contains("Ctrl+C to dismiss"));
+            } else {
+                assert!(status.contains("Transfer interrupted: cancelled."));
+            }
+        }
     }
 
     #[test]
@@ -1463,6 +1751,7 @@ mod tests {
                 ack: bounded(2).0,
                 started: Instant::now(),
                 progress: None,
+                failure: None,
             });
             state.status = Some(status.into());
         }
@@ -1501,6 +1790,7 @@ mod tests {
                                 ack: bounded(2).0,
                                 started: Instant::now(),
                                 progress: None,
+                                failure: None,
                             });
                         } else {
                             state.status = Some("Failed".into());
@@ -1597,6 +1887,7 @@ mod tests {
     fn a_server_offer_never_opens_or_sends_a_file_without_local_confirmation() {
         let (client, mut peer) = controller(true);
         client.state.lock().unwrap().prompt = Some(Prompt {
+            image: false,
             token: "ab".into(),
             target: "pane".into(),
             limits: Default::default(),
@@ -1620,6 +1911,7 @@ mod tests {
         let path = std::env::temp_dir().join(format!("kraal-attachment-window-{}", std::process::id()));
         std::fs::write(&path, vec![b'x'; attachments::CHUNK + 7]).unwrap();
         let prompt = Prompt {
+            image: false,
             token: "ab".into(),
             target: "pane".into(),
             limits: Default::default(),
@@ -1658,6 +1950,7 @@ mod tests {
         let path = std::env::temp_dir().join(format!("kraal-attachment-cancel-{}", std::process::id()));
         std::fs::write(&path, b"abc").unwrap();
         let prompt = Prompt {
+            image: false,
             token: "ab".into(),
             target: "pane".into(),
             limits: Default::default(),
@@ -1675,6 +1968,7 @@ mod tests {
             ack: acks,
             started: Instant::now(),
             progress: None,
+            failure: None,
         });
         let worker = client.clone();
         let handle = std::thread::spawn(move || worker.upload(&prompt, &replies, &cancelled));
@@ -1695,6 +1989,7 @@ mod tests {
         let path = std::env::temp_dir().join(format!("kraal-attachment-local-{}", std::process::id()));
         std::fs::write(&path, b"abc").unwrap();
         let prompt = Prompt {
+            image: false,
             token: "ab".into(),
             target: "pane".into(),
             limits: Default::default(),
@@ -1717,6 +2012,7 @@ mod tests {
         let path = std::env::temp_dir().join(format!("kraal-attachment-form-{}", std::process::id()));
         std::fs::write(&path, b"abc").unwrap();
         client.state.lock().unwrap().prompt = Some(Prompt {
+            image: false,
             token: "ab".into(),
             target: "pane".into(),
             limits: Default::default(),
@@ -1771,6 +2067,7 @@ mod tests {
                 ack,
                 started: Instant::now(),
                 progress: None,
+                failure: None,
             });
         }
         client.message(ServerMsg::AttachmentResult {

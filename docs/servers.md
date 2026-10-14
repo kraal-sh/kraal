@@ -235,6 +235,8 @@ the server's, not yours: kraal keeps it in paste buffers, sends a copy to your t
 says where the address works instead of opening the wrong page.
 
 To send laptop files through this connection, choose **Attach files** in the command palette.
+For a clipboard image, choose **Attach clipboard image** and press Enter in the local prompt.
+It uses the same connection and retains the received image with the session attachments.
 Enter their absolute local paths and press Enter. The server receives the complete batch before
 submitting its private paths to the reserved pane, without Enter. Ctrl+C cancels. Files survive
 client disconnects and server restarts. See [Attachments](terminal.md#attachments) for limits,

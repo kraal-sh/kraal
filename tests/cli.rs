@@ -13694,6 +13694,83 @@ fn palette_attachment_transfers_a_complete_batch_over_host_attach_and_keeps_it_a
 
 #[cfg(unix)]
 #[test]
+fn clipboard_images_use_local_private_storage_and_host_attachment_transport() {
+    use std::os::unix::fs::PermissionsExt;
+
+    for remote in [false, true] {
+        let local = Env::new(if remote { "image-host-client" } else { "image-local-client" });
+        let server = Env::new(if remote { "image-host-server" } else { "image-local-server" });
+        let destination = if remote { &server } else { &local };
+        let config = destination.root.join("config/kraal/config.toml");
+        let text = std::fs::read_to_string(&config).unwrap();
+        std::fs::write(config, format!("{text}\n[keys.leader]\nattach_clipboard_image = ['I']\n")).unwrap();
+        destination.workspace(
+            "w",
+            "layout {\n    pane name=\"main\" command=\"sh\" { args \"-c\" \"stty -echo; echo READY; cat\"; }\n}\n",
+        );
+        destination.run(&["open", "w"]);
+        destination.wait_for_text("main", "READY");
+        let (_, path) = fake_ssh(&local, &server);
+        let png = local.root.join("source.png");
+        image::RgbaImage::new(2, 2).save(&png).unwrap();
+        let log = local.root.join("image-reads");
+        #[cfg(not(target_os = "macos"))]
+        let (tool, script) =
+            ("wl-paste", format!("#!/bin/sh\necho read >> '{}'\ncat '{}'\n", log.display(), png.display()));
+        #[cfg(target_os = "macos")]
+        let (tool, script) = (
+            "osascript",
+            format!(
+                "#!/bin/sh\necho read >> '{}'\nfor arg; do file=$arg; done\ncat '{}' > \"$file\"\n",
+                log.display(),
+                png.display()
+            ),
+        );
+        write_script(&local.root.join("bin").join(tool), &script);
+        std::fs::write(local.root.join("config/kraal/servers.toml"), "[[server]]\nname='box'\nhost='image.invalid'\n")
+            .unwrap();
+        let mut command = local.isolated(Path::new(env!("CARGO_BIN_EXE_kraal")));
+        command.args(["-s", &destination.session, "attach"]);
+        if remote {
+            command.args(["--host", "box"]);
+        }
+        command.arg("w").env("PATH", path).env("WAYLAND_DISPLAY", "test").env_remove("DISPLAY");
+        let mut client = TerminalClient::start(command);
+        client.wait_for("READY");
+        if remote {
+            client.type_keys(b"\x02 Attach clipboard image\r");
+        } else {
+            client.type_keys(b"\x02I");
+        }
+        client.wait_for("Enter reads the local clipboard");
+        assert!(!log.exists(), "offering the action must not read the clipboard");
+        client.type_keys(b"\r");
+        client.wait_for("Files received.");
+        let root = destination.root.join("state/kraal/attachments-v1").join(&destination.session);
+        let batches: Vec<_> = std::fs::read_dir(&root).unwrap().map(|e| e.unwrap().path()).collect();
+        assert_eq!(batches.len(), 1);
+        let stored = batches[0].join("0/clipboard.png");
+        assert_eq!(std::fs::read(&stored).unwrap(), std::fs::read(&png).unwrap());
+        assert_eq!(std::fs::metadata(&batches[0]).unwrap().permissions().mode() & 0o777, 0o700);
+        assert_eq!(std::fs::metadata(&stored).unwrap().permissions().mode() & 0o777, 0o600);
+        assert_eq!(std::fs::read_to_string(log).unwrap(), "read\n");
+        assert!(!destination.run(&["read", "-p", "main"]).contains("clipboard.png"), "no Enter is added");
+        client.type_keys(b"\x03");
+        wait_until(PATIENCE, "image result dismissed", || {
+            !text_after(&client.written.lock().unwrap(), 100, 30)
+                .iter()
+                .any(|row| row.contains("Ctrl+C dismisses or cancels."))
+        });
+        client.type_keys(b"\r");
+        destination.wait_for_text("main", "clipboard.png");
+        client.type_keys(b"\x02d");
+        assert_eq!(client.left("image detach").0, 0);
+        assert!(stored.exists());
+    }
+}
+
+#[cfg(unix)]
+#[test]
 fn attachment_wire_cancellation_disconnect_and_repeated_finish_do_not_paste_partial_or_duplicate_paths() {
     let env = Env::new("attachment-wire");
     env.workspace(

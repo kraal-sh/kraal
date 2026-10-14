@@ -1,6 +1,7 @@
 //! The attaching client and the one-shot control connection used by CLI commands.
 
 mod attachments;
+mod clipboard_image;
 mod paste;
 
 #[cfg(test)]
@@ -375,6 +376,7 @@ fn exchange(stream: &mut UnixStream, msg: &ClientMsg) -> Result<Result<Response,
                 | ServerMsg::Attached { .. }
                 | ServerMsg::Clipboard { .. }
                 | ServerMsg::AttachmentPrepared { .. }
+                | ServerMsg::ClipboardImageOffer { .. }
                 | ServerMsg::AttachmentOffer { .. }
                 | ServerMsg::AttachmentAck { .. }
                 | ServerMsg::AttachmentResult { .. }
@@ -1114,17 +1116,23 @@ pub fn attach(mut target: Target, mut workspace: Option<String>, mouse: bool, at
     }
     attached();
 
+    // The current connection's writer; None while reconnecting.
+    let writer: Arc<Mutex<Option<Box<dyn Write + Send>>>> = Arc::new(Mutex::new(None));
+    let attachments = attachments::Controller::for_target(writer.clone(), &target);
+
     let clipboard_shutdown = Arc::new(crate::clipboard::Shutdown::default());
 
     // Being told to go (terminal closed, kill): leave the terminal usable, as a normal exit
     // does (destructors do not run on a signal). Set up before the terminal changes.
     {
         let clipboard_shutdown = clipboard_shutdown.clone();
+        let attachments = attachments.clone();
         use signal_hook::consts::{SIGHUP, SIGINT, SIGQUIT, SIGTERM};
         let mut signals = signal_hook::iterator::Signals::new([SIGTERM, SIGHUP, SIGINT, SIGQUIT])?;
         crate::threads::named("signals").spawn(move || {
             if let Some(sig) = signals.forever().next() {
                 clipboard_shutdown.cancel();
+                attachments.shutdown();
                 let pid = SSH_PID.load(Ordering::SeqCst);
                 if pid != 0 {
                     // SAFETY: signalling the ssh child this client started.
@@ -1142,9 +1150,6 @@ pub fn attach(mut target: Target, mut workspace: Option<String>, mouse: bool, at
     terminal().enter()?;
     terminal().set_modes(true, mouse);
 
-    // The current connection's writer; None while reconnecting.
-    let writer: Arc<Mutex<Option<Box<dyn Write + Send>>>> = Arc::new(Mutex::new(None));
-    let attachments = attachments::Controller::for_target(writer.clone(), &target);
     let quit = Arc::new(AtomicBool::new(false));
     let pause = Arc::new(KeysPause::new().context("creating a pipe")?);
 
@@ -1255,6 +1260,7 @@ pub fn attach(mut target: Target, mut workspace: Option<String>, mouse: bool, at
                 delay = Duration::from_secs(1);
                 let mut clipboard_negotiated = false;
                 let mut attachments_negotiated = false;
+                let mut images_negotiated = false;
                 let mut next = Some(Ok(Some(first)));
                 let lost = loop {
                     match next.take().unwrap_or_else(|| protocol::read_frame(&mut frames)) {
@@ -1280,6 +1286,10 @@ pub fn attach(mut target: Target, mut workspace: Option<String>, mouse: bool, at
                                 attachments_negotiated = features
                                     .as_ref()
                                     .is_some_and(|fs| fs.iter().any(|f| f == protocol::ATTACHMENTS.name));
+                                images_negotiated = attachments_negotiated
+                                    && features
+                                        .as_ref()
+                                        .is_some_and(|fs| fs.iter().any(|f| f == protocol::CLIPBOARD_IMAGES.name));
                                 attachments.negotiate(
                                     attachments_negotiated
                                         && features
@@ -1294,6 +1304,9 @@ pub fn attach(mut target: Target, mut workspace: Option<String>, mouse: bool, at
                             }
                             Ok(ServerMsg::Clipboard { id, origin, text }) if clipboard_negotiated => {
                                 clipboard.submit(id, origin, text);
+                            }
+                            Ok(msg @ ServerMsg::ClipboardImageOffer { .. }) if images_negotiated => {
+                                attachments.message(msg);
                             }
                             Ok(
                                 msg @ (ServerMsg::AttachmentPrepared { .. }
@@ -1313,7 +1326,7 @@ pub fn attach(mut target: Target, mut workspace: Option<String>, mouse: bool, at
                     }
                 };
                 clipboard.cancel();
-                attachments.disconnect();
+                attachments.shutdown();
                 *writer.lock().unwrap() = None;
                 if nested.is_some() {
                     let _ = terminal().write(NOT_ATTACHED);
@@ -1350,7 +1363,7 @@ pub fn attach(mut target: Target, mut workspace: Option<String>, mouse: bool, at
         status_line(&format!("kraal: reconnecting to {label}… (ssh may ask for a password; ctrl+c to quit)"));
         delay = (delay * 2).min(Duration::from_secs(15));
     };
-    attachments.disconnect();
+    attachments.shutdown();
     if nested.is_some() {
         let _ = terminal().write(NOT_ATTACHED);
     }
