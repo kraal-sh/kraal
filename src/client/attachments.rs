@@ -9,6 +9,7 @@ use anyhow::{Context, Result, bail, ensure};
 use base64::Engine;
 use crossbeam_channel::{Receiver, Sender, bounded};
 
+use super::paste;
 use crate::attachments::{self, Source};
 use crate::input::{InputEvent, InputParser, KeyCode};
 use crate::protocol::{self, ClientMsg, ServerMsg};
@@ -34,8 +35,25 @@ struct Active {
     progress: Option<(u64, u64)>,
 }
 
+struct Dropped {
+    token: String,
+    original: Vec<u8>,
+    paths: Vec<std::path::PathBuf>,
+    target: String,
+    limits: attachments::Settings,
+    broadcast: bool,
+    ready: bool,
+    result: bool,
+    retry: bool,
+    selected: usize,
+    error: Option<String>,
+}
+
 #[derive(Default)]
 struct State {
+    dropped: Option<Dropped>,
+    negotiated: bool,
+    splitter: paste::Splitter,
     prompt: Option<Prompt>,
     active: Option<Active>,
     status: Option<String>,
@@ -44,22 +62,179 @@ struct State {
     parser: InputParser,
 }
 
-pub(super) struct Controller {
+pub(crate) struct Controller {
     state: Mutex<State>,
     writer: Writer,
     remote: bool,
+    destination: Option<(Vec<String>, String)>,
 }
 
 impl Controller {
+    #[cfg(test)]
     pub fn new(writer: Writer, remote: bool) -> Arc<Self> {
-        Arc::new(Self { state: Mutex::new(State::default()), writer, remote })
+        Arc::new(Self { state: Mutex::new(State::default()), writer, remote, destination: None })
+    }
+
+    pub fn for_target(writer: Writer, target: &super::Target) -> Arc<Self> {
+        let destination = match target {
+            super::Target::Remote { ssh, label, .. } => Some((ssh.clone(), label.clone())),
+            super::Target::Local { .. } => None,
+        };
+        Arc::new(Self { state: Mutex::new(State::default()), writer, remote: destination.is_some(), destination })
+    }
+
+    pub fn negotiate(&self, enabled: bool) {
+        self.state.lock().unwrap().negotiated = enabled;
+    }
+
+    pub fn pending_keys(&self) -> bool {
+        let state = self.state.lock().unwrap();
+        state.splitter.has_pending() || state.dropped.is_some() && state.parser.has_pending()
+    }
+
+    pub fn input(self: &Arc<Self>, bytes: &[u8]) -> bool {
+        let mut state = self.state.lock().unwrap();
+        if bytes.is_empty() && (!self.remote || !state.negotiated) {
+            return true;
+        }
+        if !state.negotiated && state.dropped.is_some() {
+            return false;
+        }
+        if !self.remote || !state.negotiated || state.prompt.is_some() {
+            drop(state);
+            return self.keys(bytes);
+        }
+        let parts =
+            if bytes.is_empty() { vec![paste::Part::Bytes(state.splitter.idle())] } else { state.splitter.feed(bytes) };
+        drop(state);
+        let mut following_paste = false;
+        for part in parts {
+            match part {
+                paste::Part::Start => {
+                    let mut state = self.state.lock().unwrap();
+                    if state.dropped.is_none() && state.active.is_none() && state.uncertain.is_none() {
+                        if let Some(token) = state.result_token.take() {
+                            let _ = send(&self.writer, &ClientMsg::AttachmentDismiss { token });
+                        }
+                        let _ = send(&self.writer, &ClientMsg::PasteStart);
+                    }
+                }
+                paste::Part::Bytes(bytes) => {
+                    if following_paste {
+                        self.preparing_keys(&bytes);
+                    } else if !bytes.is_empty() && !self.keys(&bytes) {
+                        self.forward(&bytes);
+                    }
+                }
+                paste::Part::Paste(text) => {
+                    let paths = std::str::from_utf8(&text).ok().and_then(crate::transfer::dropped_paths);
+                    let mut state = self.state.lock().unwrap();
+                    if state.dropped.is_none()
+                        && state.active.is_none()
+                        && state.uncertain.is_none()
+                        && let Some(paths) = paths
+                    {
+                        let token = format!(
+                            "{:x}-{:x}",
+                            std::process::id(),
+                            std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_nanos()
+                        );
+                        state.dropped = Some(Dropped {
+                            token: token.clone(),
+                            original: text.clone(),
+                            paths,
+                            target: String::new(),
+                            limits: Default::default(),
+                            broadcast: false,
+                            ready: false,
+                            result: false,
+                            retry: false,
+                            selected: 0,
+                            error: None,
+                        });
+                        state.status = None;
+                        let dismiss = state.result_token.take();
+                        state.parser = InputParser::new();
+                        drop(state);
+                        if let Some(token) = dismiss {
+                            let _ = send(&self.writer, &ClientMsg::AttachmentDismiss { token });
+                        }
+                        let _ = send(&self.writer, &ClientMsg::AttachmentRequest { token, text });
+                        following_paste = true;
+                    } else {
+                        let blocked = state.uncertain.is_none()
+                            && state.dropped.as_ref().is_some_and(|d| d.ready || d.result)
+                            && state.active.is_none();
+                        drop(state);
+                        if following_paste || !blocked {
+                            self.forward(&paste::bracket(&text));
+                        }
+                    }
+                }
+            }
+        }
+        if bytes.is_empty() {
+            self.keys(&[]);
+        }
+        true
+    }
+
+    // Preparation queues typing on the server, but cancellation stays local. A tail in
+    // the same read as a drop cannot select a choice, even if the reply has arrived.
+    fn preparing_keys(self: &Arc<Self>, bytes: &[u8]) {
+        let mut state = self.state.lock().unwrap();
+        if bytes.is_empty() {
+            state.parser.flush();
+            return;
+        }
+        for (index, byte) in bytes.iter().enumerate() {
+            let cancel =
+                state.parser.feed(std::slice::from_ref(byte)).iter().any(
+                    |event| matches!(event, InputEvent::Key(key) if key.code == KeyCode::Char('c') && key.mods.ctrl),
+                );
+            if cancel && (state.dropped.is_some() || state.active.is_some()) {
+                let active = state.active.is_some();
+                drop(state);
+                if active {
+                    self.cancel();
+                } else {
+                    self.drop_action(3);
+                }
+                let tail = &bytes[index + 1..];
+                if !tail.is_empty() && !self.keys(tail) {
+                    self.forward(tail);
+                }
+                return;
+            }
+        }
+        drop(state);
+        if !bytes.is_empty() {
+            self.forward(bytes);
+        }
+    }
+
+    fn forward(&self, bytes: &[u8]) {
+        let mut writer = self.writer.lock().unwrap();
+        if let Some(writer) = writer.as_mut() {
+            let _ = protocol::write_frame(writer, protocol::BYTES, bytes);
+        }
     }
 
     pub fn draw(&self) {
         let state = self.state.lock().unwrap();
         let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
         let width = usize::from(cols).saturating_sub(2).max(1);
-        let lines = if let Some(p) = &state.prompt {
+        let lines = if let Some(dropped) = &state.dropped {
+            dropped.lines(
+                width,
+                self.destination.as_ref().map_or("server", |(_, label)| label),
+                state.active.is_some(),
+                state.status.as_deref(),
+            )
+        } else if let Some(p) = &state.prompt {
             let before: String = p.text.chars().take(p.cursor).collect();
             vec![
                 format!("Attach files to {}", p.target),
@@ -89,11 +264,41 @@ impl Controller {
         let _ = send(&self.writer, &ClientMsg::Resize { cols, rows });
     }
 
-    pub fn message(&self, msg: ServerMsg) {
+    pub fn message(self: &Arc<Self>, msg: ServerMsg) {
         let mut state = self.state.lock().unwrap();
+        let repaint = state.dropped.is_some() && matches!(&msg, ServerMsg::AttachmentResult { .. });
         match msg {
+            ServerMsg::AttachmentPrepared { token, target, limits, broadcast } => {
+                if state.uncertain.as_ref() == Some(&token) {
+                    return;
+                }
+                let Some(dropped) = state.dropped.as_mut().filter(|d| d.token == token && !d.ready && !d.result) else {
+                    return;
+                };
+                dropped.target = target.chars().filter(|c| !c.is_control()).collect();
+                dropped.limits = limits;
+                dropped.broadcast = broadcast;
+                dropped.ready = true;
+                dropped.error = dropped.validate().err().map(|e| format!("{e:#}"));
+                let automatic = !dropped.retry
+                    && dropped.selected == 0
+                    && dropped.error.is_none()
+                    && !broadcast
+                    && self.destination.as_ref().is_some_and(|(ssh, _)| paste::allowed(&paste::permission_path(), ssh));
+                drop(state);
+                if automatic {
+                    self.drop_action(0);
+                } else {
+                    self.draw();
+                }
+                return;
+            }
             ServerMsg::AttachmentOffer { token, target, limits } => {
-                if state.prompt.is_some() || state.active.is_some() || !attachments::token_valid(&token) {
+                if state.dropped.is_some()
+                    || state.prompt.is_some()
+                    || state.active.is_some()
+                    || !attachments::token_valid(&token)
+                {
                     return;
                 }
                 state.status = None;
@@ -115,11 +320,12 @@ impl Controller {
                     let _ = active.ack.try_send(received);
                 }
             }
-            ServerMsg::AttachmentResult { token, message } => {
+            ServerMsg::AttachmentResult { token, mut message, pasted } => {
                 let active = state.active.as_ref().is_some_and(|a| a.token == token);
                 let prompt = state.prompt.as_ref().is_some_and(|p| p.token == token);
                 let uncertain = state.uncertain.as_ref() == Some(&token);
-                if !active && !prompt && !uncertain {
+                let dropped = state.dropped.as_ref().is_some_and(|d| d.token == token);
+                if !active && !prompt && !uncertain && !dropped {
                     return;
                 }
                 if active && let Some(active) = state.active.take() {
@@ -131,25 +337,133 @@ impl Controller {
                 if uncertain {
                     state.uncertain = None;
                 }
+                if pasted && dropped {
+                    let drop = state.dropped.take().unwrap();
+                    if active
+                        && let Some(tail) =
+                            message.strip_prefix("Files received. Paths submitted to the reserved pane.")
+                    {
+                        let noun = if drop.paths.len() == 1 { "file" } else { "files" };
+                        message =
+                            format!("{} {noun} sent. Paths submitted to {}.{tail}", drop.paths.len(), drop.target);
+                    }
+                } else if dropped {
+                    let drop = state.dropped.as_mut().unwrap();
+                    if let Some(error) = &drop.error {
+                        message = format!("{error}. {message}");
+                    }
+                    drop.result = true;
+                    drop.selected = 2;
+                }
                 if state.active.is_none() && state.prompt.is_none() {
                     state.result_token = Some(token);
-                    state.status = Some(message.chars().filter(|c| !c.is_control()).collect());
+                    state.status = (!message.is_empty()).then(|| message.chars().filter(|c| !c.is_control()).collect());
                 }
             }
             _ => {}
         }
         drop(state);
+        if repaint {
+            self.redraw();
+        }
         self.draw();
     }
 
     /// True when the local form consumed the input. Normal typing stays on the same wire.
     pub fn keys(self: &Arc<Self>, bytes: &[u8]) -> bool {
         let mut state = self.state.lock().unwrap();
+        if state.dropped.is_some() && state.active.is_none() && state.uncertain.is_none() {
+            if state.dropped.as_ref().is_some_and(|d| !d.ready && !d.result) {
+                drop(state);
+                self.preparing_keys(bytes);
+                return true;
+            }
+            let mut action = None;
+            let mut tail = &bytes[bytes.len()..];
+            'input: for index in 0..bytes.len().max(1) {
+                let events =
+                    if bytes.is_empty() { state.parser.flush() } else { state.parser.feed(&bytes[index..=index]) };
+                for event in events {
+                    if let InputEvent::Mouse(mouse) = event {
+                        let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
+                        if mouse.row + 1 == rows
+                            && mouse.kind == crate::input::MouseKind::Press(crate::input::MouseButton::Left)
+                        {
+                            let dropped = state.dropped.as_ref().unwrap();
+                            let lines = dropped.lines(
+                                usize::from(cols).saturating_sub(2).max(1),
+                                self.destination.as_ref().map_or("server", |(_, label)| label),
+                                false,
+                                state.status.as_deref(),
+                            );
+                            if let Some(line) = lines.last() {
+                                action = button_at(line, usize::from(mouse.col));
+                            }
+                        }
+                        if action.is_some() {
+                            tail = &bytes[(index + 1).min(bytes.len())..];
+                            break 'input;
+                        }
+                        continue;
+                    }
+                    let InputEvent::Key(key) = event else { continue };
+                    let dropped = state.dropped.as_mut().unwrap();
+                    let count = if dropped.result { 3 } else { 4 };
+                    match key.code {
+                        KeyCode::Char('c') if key.mods.ctrl => action = Some(if dropped.result { 2 } else { 3 }),
+                        KeyCode::Esc => action = Some(if dropped.result { 2 } else { 3 }),
+                        KeyCode::Tab | KeyCode::Right => dropped.selected = (dropped.selected + 1) % count,
+                        KeyCode::BackTab | KeyCode::Left => dropped.selected = (dropped.selected + count - 1) % count,
+                        KeyCode::Enter if dropped.ready || dropped.result => action = Some(dropped.selected),
+                        _ => {}
+                    }
+                    if action.is_some() {
+                        tail = &bytes[(index + 1).min(bytes.len())..];
+                        break 'input;
+                    }
+                }
+            }
+            drop(state);
+            if let Some(action) = action {
+                self.drop_action(action);
+                if !tail.is_empty() && !self.keys(tail) {
+                    self.forward(tail);
+                }
+            } else {
+                self.draw();
+            }
+            return true;
+        }
         if state.prompt.is_none() {
+            let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
+            let cancel_column = state.dropped.as_ref().and_then(|dropped| {
+                dropped
+                    .lines(
+                        usize::from(cols).saturating_sub(2).max(1),
+                        self.destination.as_ref().map_or("server", |(_, label)| label),
+                        true,
+                        state.status.as_deref(),
+                    )
+                    .last()
+                    .and_then(|line| {
+                        line.rfind('[').map(|at| {
+                            (
+                                unicode_width::UnicodeWidthStr::width(&line[..at]) + 1,
+                                unicode_width::UnicodeWidthStr::width(line.as_str()) + 1,
+                            )
+                        })
+                    })
+            });
             if (state.active.is_some() || state.status.is_some())
-                && state.parser.feed(bytes).iter().any(
-                    |event| matches!(event, InputEvent::Key(key) if key.code == KeyCode::Char('c') && key.mods.ctrl),
-                )
+                && state.parser.feed(bytes).iter().any(|event| match event {
+                    InputEvent::Key(key) => key.code == KeyCode::Char('c') && key.mods.ctrl,
+                    InputEvent::Mouse(mouse) => {
+                        mouse.kind == crate::input::MouseKind::Press(crate::input::MouseButton::Left)
+                            && mouse.row + 1 == rows
+                            && cancel_column.is_some_and(|(start, end)| (start..end).contains(&usize::from(mouse.col)))
+                    }
+                    _ => false,
+                })
             {
                 drop(state);
                 self.cancel();
@@ -219,6 +533,21 @@ impl Controller {
             return true;
         }
         let prompt = state.prompt.take().unwrap();
+        drop(state);
+        self.start(prompt);
+        if !tail.is_empty() && !self.keys(tail) {
+            let mut writer = self.writer.lock().unwrap();
+            if let Some(writer) = writer.as_mut() {
+                let _ = protocol::write_frame(writer, protocol::BYTES, tail);
+            }
+        }
+        self.redraw();
+        self.draw();
+        true
+    }
+
+    fn start(self: &Arc<Self>, prompt: Prompt) {
+        let mut state = self.state.lock().unwrap();
         let (ack, replies) = bounded(2);
         let cancelled = Arc::new(AtomicBool::new(false));
         state.active = Some(Active {
@@ -238,36 +567,135 @@ impl Controller {
             if let Err(error) = this.upload(&prompt, &replies, &cancelled)
                 && !cancelled.load(Ordering::SeqCst)
             {
-                {
-                    let mut writer = this.writer.lock().unwrap();
-                    if !cancelled.load(Ordering::SeqCst)
-                        && let Some(writer) = writer.as_mut()
-                    {
-                        let _ =
-                            protocol::write_json(writer, &ClientMsg::AttachmentCancel { token: prompt.token.clone() });
-                    }
-                }
-                this.message(ServerMsg::AttachmentResult {
-                    token: prompt.token,
-                    message: format!("Attachment stopped: {error:#}. Use Attach files to retry."),
-                });
+                this.upload_failed(prompt.token, &cancelled, &error);
             }
         }) {
             let _ = send(&self.writer, &ClientMsg::AttachmentCancel { token: token.clone() });
             self.message(ServerMsg::AttachmentResult {
+                pasted: false,
                 token,
                 message: format!("Cannot start attachment: {error}. Use Attach files to retry."),
             });
         }
-        if !tail.is_empty() && !self.keys(tail) {
+    }
+
+    fn upload_failed(self: &Arc<Self>, token: String, cancelled: &AtomicBool, error: &anyhow::Error) {
+        let dropped = {
+            let mut state = self.state.lock().unwrap();
+            if let Some(dropped) = state.dropped.as_mut().filter(|d| d.token == token) {
+                dropped.error = Some(format!("{error:#}"));
+                true
+            } else {
+                false
+            }
+        };
+        {
             let mut writer = self.writer.lock().unwrap();
-            if let Some(writer) = writer.as_mut() {
-                let _ = protocol::write_frame(writer, protocol::BYTES, tail);
+            if !cancelled.load(Ordering::SeqCst)
+                && let Some(writer) = writer.as_mut()
+            {
+                let _ = protocol::write_json(writer, &ClientMsg::AttachmentCancel { token: token.clone() });
             }
         }
+        if !dropped {
+            self.message(ServerMsg::AttachmentResult {
+                pasted: false,
+                token,
+                message: format!("Attachment stopped: {error:#}. Use Attach files to retry."),
+            });
+        }
+    }
+
+    fn drop_action(self: &Arc<Self>, action: usize) {
+        let mut state = self.state.lock().unwrap();
+        let Some(mut dropped) = state.dropped.take() else { return };
+        if dropped.result {
+            if let Some(token) = state.result_token.take() {
+                let _ = send(&self.writer, &ClientMsg::AttachmentDismiss { token });
+            }
+            state.status = None;
+            if action == 1 {
+                drop(state);
+                self.forward(&paste::bracket(&dropped.original));
+                self.redraw();
+                return;
+            }
+            if action == 2 {
+                drop(state);
+                self.redraw();
+                return;
+            }
+            // A retry reserves the current pane again and shows it before anything is sent.
+            dropped.token = format!(
+                "{:x}-{:x}",
+                std::process::id(),
+                std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos()
+            );
+            dropped.result = false;
+            dropped.ready = false;
+            dropped.selected = 0;
+            dropped.retry = true;
+            let token = dropped.token.clone();
+            let text = dropped.original.clone();
+            state.dropped = Some(dropped);
+            drop(state);
+            let _ = send(&self.writer, &ClientMsg::AttachmentRequest { token, text });
+            self.redraw();
+            return;
+        }
+        if action == 3 {
+            state.uncertain = Some(dropped.token.clone());
+            drop(state);
+            let _ = send(&self.writer, &ClientMsg::AttachmentCancel { token: dropped.token });
+            self.redraw();
+            return;
+        }
+        if !dropped.ready {
+            state.dropped = Some(dropped);
+            return;
+        }
+        if action == 2 {
+            let token = dropped.token.clone();
+            let text = dropped.original.clone();
+            state.uncertain = Some(token.clone());
+            dropped.ready = false;
+            state.dropped = Some(dropped);
+            drop(state);
+            let _ = send(&self.writer, &ClientMsg::AttachmentText { token, text });
+            self.redraw();
+            return;
+        }
+        if let Err(error) = dropped.validate() {
+            dropped.error = Some(format!("{error:#}"));
+            state.dropped = Some(dropped);
+            drop(state);
+            self.draw();
+            return;
+        }
+        if action == 1
+            && let Some((ssh, label)) = &self.destination
+            && let Err(error) = paste::remember(&paste::permission_path(), ssh, label)
+        {
+            dropped.error = Some(format!("Cannot remember this server: {error}. Choose Send to send once."));
+            state.dropped = Some(dropped);
+            drop(state);
+            self.draw();
+            return;
+        }
+        let prompt = Prompt {
+            token: dropped.token.clone(),
+            target: dropped.target.clone(),
+            limits: dropped.limits.clone(),
+            text: dropped.paths.iter().map(|p| crate::shell::quote(p.to_str().unwrap())).collect::<Vec<_>>().join(" "),
+            cursor: 0,
+            error: None,
+            paste_failed: false,
+            parser: InputParser::new(),
+        };
+        state.dropped = Some(dropped);
+        drop(state);
+        self.start(prompt);
         self.redraw();
-        self.draw();
-        true
     }
 
     fn cancel(&self) {
@@ -314,7 +742,21 @@ impl Controller {
                     || "Preparing files".into(),
                     |(received, total)| format!("Sending: {received}/{total} bytes"),
                 );
-                state.status = Some(format!("{progress}. Typing waits. Ctrl+C cancels."));
+                state.status = Some(if state.dropped.is_some() {
+                    active.progress.map_or_else(
+                        || "Preparing files. Ctrl+C cancels.".into(),
+                        |(received, total)| {
+                            format!(
+                                "Sending: {:.1} / {:.1} MiB ({}%) [Cancel: Ctrl+C]",
+                                received as f64 / 1048576.0,
+                                total as f64 / 1048576.0,
+                                (received * 100).checked_div(total).unwrap_or(100)
+                            )
+                        },
+                    )
+                } else {
+                    format!("{progress}. Typing waits. Ctrl+C cancels.")
+                });
                 drop(state);
                 this.draw();
             }
@@ -387,6 +829,13 @@ impl Controller {
 
     pub fn disconnect(&self) {
         let mut state = self.state.lock().unwrap();
+        state.negotiated = false;
+        state.splitter = Default::default();
+        state.parser = InputParser::new();
+        if let Some(dropped) = &mut state.dropped {
+            dropped.ready = false;
+            state.uncertain = Some(dropped.token.clone());
+        }
         state.prompt = None;
         if let Some(active) = state.active.take() {
             active.cancelled.store(true, Ordering::SeqCst);
@@ -404,6 +853,97 @@ impl Controller {
     }
 }
 
+impl Dropped {
+    fn validate(&self) -> Result<u64> {
+        let mut specs = Vec::new();
+        for path in &self.paths {
+            let meta = std::fs::symlink_metadata(path)?;
+            ensure!(
+                meta.is_file(),
+                "Only regular files can be sent. Use kraal cp for directories, links and special files."
+            );
+            specs.push(attachments::FileSpec {
+                name: path.file_name().and_then(|s| s.to_str()).unwrap_or("").into(),
+                size: meta.len(),
+            });
+        }
+        self.limits.check(&specs)
+    }
+
+    fn lines(&self, width: usize, server: &str, active: bool, status: Option<&str>) -> Vec<String> {
+        let server: String = server.chars().filter(|c| !c.is_control()).collect();
+        if active {
+            return status
+                .map(|text| {
+                    vec![if width >= 100 {
+                        text.replacen("Sending:", &format!("Sending to {}:", crate::text::truncate(&server, 24)), 1)
+                    } else {
+                        text.to_string()
+                    }]
+                })
+                .unwrap_or_default();
+        }
+        if self.result {
+            let mut lines =
+                crate::text::wrap(status.unwrap_or("Transfer interrupted. Check the pane before retrying."), width);
+            lines.push(buttons(&["Retry", "Paste the text", "Close"], self.selected));
+            return lines;
+        }
+        let names = self
+            .paths
+            .iter()
+            .map(|p| p.file_name().unwrap_or_default().to_string_lossy())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let size = self.validate().unwrap_or(0);
+        let noun = if self.paths.len() == 1 { "file" } else { "files" };
+        let summary = format!("{} local {noun}, {:.1} MiB: {names}", self.paths.len(), size as f64 / 1048576.0);
+        let target = format!("{server} / {}", self.target);
+        let mut lines = if width >= 100 { vec![format!("{target} | {summary}")] } else { vec![target, summary] };
+        let question = self.error.clone().unwrap_or_else(|| {
+            if !self.ready {
+                "Preparing attachment. Ctrl+C cancels.".into()
+            } else if self.broadcast {
+                "Broadcasting is on. Send files and paste paths only to this pane?".into()
+            } else {
+                "Send the files and paste their remote paths?".into()
+            }
+        });
+        lines.extend(crate::text::wrap(&question, width).into_iter().take(6));
+        let always = if width >= 100 {
+            format!("Always for {}", crate::text::truncate(&server, 24))
+        } else {
+            "Always here".into()
+        };
+        lines.push(buttons(
+            &["Send", &always, if width >= 100 { "Paste the text" } else { "Text" }, "Cancel"],
+            self.selected,
+        ));
+        lines
+    }
+}
+
+fn button_at(line: &str, col: usize) -> Option<usize> {
+    let mut start = 1;
+    for (index, button) in line.split("] [").enumerate() {
+        let width = unicode_width::UnicodeWidthStr::width(button.trim_start_matches('[').trim_end_matches(']')) + 2;
+        if (start..start + width).contains(&col) {
+            return Some(index);
+        }
+        start += width + 1;
+    }
+    None
+}
+
+fn buttons(labels: &[&str], selected: usize) -> String {
+    labels
+        .iter()
+        .enumerate()
+        .map(|(i, label)| if i == selected { format!("[>{label}<]") } else { format!("[{label}]") })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 fn send(writer: &Writer, msg: &ClientMsg) -> Result<()> {
     let mut writer = writer.lock().unwrap();
     protocol::write_json(writer.as_mut().context("connection closed")?, msg)?;
@@ -411,10 +951,6 @@ fn send(writer: &Writer, msg: &ClientMsg) -> Result<()> {
 }
 
 fn explicit_paths(text: &str) -> Result<Vec<std::path::PathBuf>> {
-    ensure!(
-        !text.contains("file://") && !text.ends_with('\\') && !text.chars().any(char::is_control),
-        "enter absolute paths, quoting spaces; URI paths are not supported here"
-    );
     crate::transfer::dropped_paths(text).context("enter existing absolute paths, quoting spaces")
 }
 
@@ -456,10 +992,491 @@ mod tests {
         let (writer, peer) = wire();
         (Controller::new(Arc::new(Mutex::new(Some(writer))), remote), peer)
     }
+    fn automatic_controller() -> (Arc<Controller>, Reader) {
+        let target = super::super::Target::Remote {
+            ssh: vec!["alice@preparing-test".into()],
+            session: "main".into(),
+            label: "box".into(),
+            pane: None,
+            clipboard_native: false,
+        };
+        let (writer, peer) = wire();
+        let client = Controller::for_target(Arc::new(Mutex::new(Some(writer))), &target);
+        let (ssh, label) = client.destination.as_ref().unwrap();
+        paste::remember(&paste::permission_path(), ssh, label).unwrap();
+        assert!(paste::allowed(&paste::permission_path(), ssh));
+        (client, peer)
+    }
+
     fn read(peer: &mut Reader) -> ClientMsg {
         let (kind, data) = protocol::read_frame(peer).unwrap().unwrap();
         assert_eq!(kind, protocol::JSON);
         serde_json::from_slice(&data).unwrap()
+    }
+
+    fn dropped_file(name: &str) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!("kraal-pasted-{name}-{}", std::process::id()));
+        std::fs::write(&path, b"abc").unwrap();
+        path
+    }
+
+    fn prepare_drop(client: &Arc<Controller>, peer: &mut Reader, original: &[u8]) -> String {
+        client.negotiate(true);
+        client.input(&paste::bracket(original));
+        assert!(matches!(read(peer), ClientMsg::PasteStart));
+        let ClientMsg::AttachmentRequest { token, text } = read(peer) else { panic!() };
+        assert_eq!(text, original);
+        client.message(ServerMsg::AttachmentPrepared {
+            token: token.clone(),
+            target: "main / Claude".into(),
+            limits: Default::default(),
+            broadcast: false,
+        });
+        token
+    }
+
+    #[test]
+    fn always_is_local_reused_on_next_attach_and_revoked_before_the_next_paste() {
+        if !crate::testing::in_own_process(
+            "client::attachments::tests::always_is_local_reused_on_next_attach_and_revoked_before_the_next_paste",
+        ) {
+            return;
+        }
+        let path = dropped_file("permission");
+        let ssh = vec!["alice@box".into()];
+        let target = super::super::Target::Remote {
+            ssh: ssh.clone(),
+            session: "main".into(),
+            label: "box".into(),
+            pane: None,
+            clipboard_native: false,
+        };
+        let (writer, mut peer) = wire();
+        let client = Controller::for_target(Arc::new(Mutex::new(Some(writer))), &target);
+        prepare_drop(&client, &mut peer, path.to_str().unwrap().as_bytes());
+        assert!(!paste::allowed(&paste::permission_path(), &ssh));
+        client.keys(b"\t\r");
+        assert!(paste::allowed(&paste::permission_path(), &ssh));
+        assert!(client.state.lock().unwrap().active.is_some());
+        client.disconnect();
+        for (broadcast, revoke) in [(false, false), (true, false), (false, true)] {
+            if revoke {
+                std::fs::remove_file(paste::permission_path()).unwrap();
+            }
+            let (writer, mut peer) = wire();
+            let client = Controller::for_target(Arc::new(Mutex::new(Some(writer))), &target);
+            client.negotiate(true);
+            // A server cannot create a local gesture, even with permission already granted.
+            client.message(ServerMsg::AttachmentPrepared {
+                token: "ab".into(),
+                target: "pane".into(),
+                limits: Default::default(),
+                broadcast: false,
+            });
+            assert!(client.state.lock().unwrap().active.is_none());
+            client.input(&paste::bracket(path.to_str().unwrap().as_bytes()));
+            assert!(matches!(read(&mut peer), ClientMsg::PasteStart));
+            let ClientMsg::AttachmentRequest { token, .. } = read(&mut peer) else { panic!() };
+            client.message(ServerMsg::AttachmentPrepared {
+                token,
+                target: "main / Claude".into(),
+                limits: Default::default(),
+                broadcast,
+            });
+            assert_eq!(client.state.lock().unwrap().active.is_some(), !broadcast && !revoke);
+            client.disconnect();
+        }
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn paste_recognition_requires_remote_negotiation_and_preserves_ordinary_bytes() {
+        let path = dropped_file("ordinary");
+        for remote in [false, true] {
+            let (client, peer) = controller(remote);
+            let input = paste::bracket(path.to_str().unwrap().as_bytes());
+            assert!(!client.input(&input));
+            assert!(peer.incoming.try_recv().is_err());
+            if !remote {
+                client.negotiate(true);
+                assert!(!client.input(&input));
+            }
+        }
+        let (client, mut peer) = controller(true);
+        client.negotiate(true);
+        for original in [b"echo /some/path".as_slice(), b"/does/not/exist", b"\xff", b"", b"multiple\nlines"] {
+            let input = paste::bracket(original);
+            for byte in &input {
+                assert!(client.input(&[*byte]));
+            }
+            if !original.is_empty() {
+                assert!(matches!(read(&mut peer), ClientMsg::PasteStart));
+            }
+            let (kind, data) = protocol::read_frame(&mut peer).unwrap().unwrap();
+            assert_eq!(kind, protocol::BYTES);
+            assert_eq!(data, input);
+        }
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn original_text_is_kept_and_a_coalesced_tail_cannot_authorize_sending() {
+        let path = dropped_file("text with spaces");
+        let original = format!("  '{}'\r\n", path.display()).into_bytes();
+        let (client, mut peer) = controller(true);
+        client.negotiate(true);
+        client.input(&[paste::bracket(&original), b"\r".to_vec()].concat());
+        assert!(matches!(read(&mut peer), ClientMsg::PasteStart));
+        let ClientMsg::AttachmentRequest { token, text } = read(&mut peer) else { panic!() };
+        assert_eq!(text, original);
+        let (kind, tail) = protocol::read_frame(&mut peer).unwrap().unwrap();
+        assert_eq!(kind, protocol::BYTES);
+        assert_eq!(tail, b"\r");
+        client.message(ServerMsg::AttachmentPrepared {
+            token: token.clone(),
+            target: "main / Claude".into(),
+            limits: Default::default(),
+            broadcast: false,
+        });
+        assert!(client.state.lock().unwrap().active.is_none());
+        assert!(peer.incoming.try_recv().is_err());
+        client.keys(b"\t\t\r");
+        assert!(
+            matches!(read(&mut peer), ClientMsg::AttachmentText { token: sent, text } if sent == token && text == original)
+        );
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn first_choice_action_keeps_coalesced_trailing_input() {
+        let path = dropped_file("choice-tail");
+        for (keys, cancel) in [(b"\x03\r".as_slice(), true), (b"\rafter".as_slice(), false)] {
+            let (client, mut peer) = controller(true);
+            let token = prepare_drop(&client, &mut peer, path.to_str().unwrap().as_bytes());
+            client.input(keys);
+            let mut started = false;
+            let mut cancelled = false;
+            let mut tail = Vec::new();
+            // The action, redraw, and trailing bytes each produce a frame.
+            for _ in 0..3 {
+                let (kind, bytes) = protocol::read_frame(&mut peer).unwrap().unwrap();
+                if kind == protocol::BYTES {
+                    tail.extend(bytes);
+                } else {
+                    match serde_json::from_slice::<ClientMsg>(&bytes).unwrap() {
+                        ClientMsg::AttachmentStart { token: sent, .. } => {
+                            assert_eq!(sent, token);
+                            started = true;
+                        }
+                        ClientMsg::AttachmentCancel { token: sent } => {
+                            assert_eq!(sent, token);
+                            cancelled = true;
+                        }
+                        ClientMsg::Resize { .. } => {}
+                        other => panic!("unexpected message: {other:?}"),
+                    }
+                }
+            }
+            assert_eq!(cancelled, cancel);
+            assert_eq!(started, !cancel);
+            assert_eq!(tail, if cancel { b"\r".as_slice() } else { b"after" });
+            assert_eq!(client.state.lock().unwrap().active.is_some(), !cancel);
+            client.disconnect();
+        }
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn cancellation_before_prepared_prevents_automatic_sending() {
+        if !crate::testing::in_own_process(
+            "client::attachments::tests::cancellation_before_prepared_prevents_automatic_sending",
+        ) {
+            return;
+        }
+        let path = dropped_file("cancel-preparing");
+        for automatic in [false, true] {
+            for coalesced in [false, true] {
+                for cancel in [b"\x03".as_slice(), b"\x1b[99;5u"] {
+                    let (client, mut peer) = if automatic { automatic_controller() } else { controller(true) };
+                    client.negotiate(true);
+                    let paste = paste::bracket(path.to_str().unwrap().as_bytes());
+                    if coalesced {
+                        client.input(&[paste.as_slice(), cancel, b"\r"].concat());
+                    } else {
+                        client.input(&paste);
+                        for byte in cancel {
+                            client.input(std::slice::from_ref(byte));
+                        }
+                        client.input(b"\r");
+                    }
+                    assert!(matches!(read(&mut peer), ClientMsg::PasteStart));
+                    let ClientMsg::AttachmentRequest { token, .. } = read(&mut peer) else { panic!() };
+                    loop {
+                        let (kind, bytes) = protocol::read_frame(&mut peer).unwrap().unwrap();
+                        if kind == protocol::JSON {
+                            assert!(matches!(serde_json::from_slice::<ClientMsg>(&bytes).unwrap(),
+                            ClientMsg::AttachmentCancel { token: sent } if sent == token));
+                            break;
+                        }
+                        assert!(!bytes.contains(&3));
+                    }
+                    assert!(matches!(read(&mut peer), ClientMsg::Resize { .. }));
+                    assert_eq!(protocol::read_frame(&mut peer).unwrap().unwrap(), (protocol::BYTES, b"\r".to_vec()));
+                    client.message(ServerMsg::AttachmentPrepared {
+                        token,
+                        target: "main / Claude".into(),
+                        limits: Default::default(),
+                        broadcast: false,
+                    });
+                    let state = client.state.lock().unwrap();
+                    assert!(state.dropped.is_none());
+                    assert!(state.active.is_none());
+                    assert!(peer.incoming.try_recv().is_err());
+                }
+            }
+        }
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn consecutive_pastes_are_forwarded_while_preparing() {
+        if !crate::testing::in_own_process(
+            "client::attachments::tests::consecutive_pastes_are_forwarded_while_preparing",
+        ) {
+            return;
+        }
+        let path = dropped_file("consecutive");
+        for automatic in [false, true] {
+            for coalesced in [false, true] {
+                let (client, mut peer) = if automatic { automatic_controller() } else { controller(true) };
+                client.negotiate(true);
+                let first = paste::bracket(path.to_str().unwrap().as_bytes());
+                let second = paste::bracket(b"Please review this file.\n");
+                if coalesced {
+                    client.input(&[first, second.clone()].concat());
+                } else {
+                    client.input(&first);
+                    client.input(&second);
+                }
+                assert!(matches!(read(&mut peer), ClientMsg::PasteStart));
+                let ClientMsg::AttachmentRequest { token, .. } = read(&mut peer) else { panic!() };
+                assert_eq!(protocol::read_frame(&mut peer).unwrap().unwrap(), (protocol::BYTES, second));
+                assert!(peer.incoming.try_recv().is_err());
+                client.message(ServerMsg::AttachmentPrepared {
+                    token,
+                    target: "main / Claude".into(),
+                    limits: Default::default(),
+                    broadcast: false,
+                });
+                assert_eq!(client.state.lock().unwrap().active.is_some(), automatic);
+                client.disconnect();
+            }
+        }
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn text_choice_preserves_separate_reads_before_its_result() {
+        let path = dropped_file("text-tail");
+        let (client, mut peer) = controller(true);
+        let token = prepare_drop(&client, &mut peer, path.to_str().unwrap().as_bytes());
+        client.input(b"\t\t\r");
+        assert!(matches!(read(&mut peer), ClientMsg::AttachmentText { token: sent, .. } if sent == token));
+        assert!(matches!(read(&mut peer), ClientMsg::Resize { .. }));
+        for bytes in [b"later".as_slice(), b" typing", b"\r", &paste::bracket(b"instructions")] {
+            client.input(bytes);
+            assert_eq!(protocol::read_frame(&mut peer).unwrap().unwrap(), (protocol::BYTES, bytes.to_vec()));
+        }
+        assert!(client.state.lock().unwrap().uncertain.is_some());
+        client.message(ServerMsg::AttachmentResult { token, message: "Text submitted.".into(), pasted: true });
+        assert!(client.state.lock().unwrap().dropped.is_none());
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn immediate_cancellation_reply_keeps_the_local_upload_error() {
+        struct ReplyOnCancel {
+            client: std::sync::Weak<Controller>,
+            bytes: Vec<u8>,
+            reply: Arc<Mutex<Option<std::thread::JoinHandle<()>>>>,
+        }
+        impl Write for ReplyOnCancel {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.bytes.extend_from_slice(bytes);
+                let mut input = std::io::Cursor::new(&self.bytes);
+                if let Ok(Some((protocol::JSON, json))) = protocol::read_frame(&mut input)
+                    && let Ok(ClientMsg::AttachmentCancel { token }) = serde_json::from_slice(&json)
+                {
+                    let client = self.client.upgrade().unwrap();
+                    // Deliver the reply before the cancellation write returns.
+                    client.state.lock().unwrap().dropped.as_mut().unwrap().error.as_ref().expect("error before cancel");
+                    let reply = client.clone();
+                    let handle = std::thread::spawn(move || {
+                        reply.message(ServerMsg::AttachmentResult {
+                            token,
+                            message: "Transfer interrupted: cancelled.".into(),
+                            pasted: false,
+                        })
+                    });
+                    let started = Instant::now();
+                    while !client.state.lock().unwrap().dropped.as_ref().unwrap().result {
+                        assert!(started.elapsed() < Duration::from_secs(2));
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    // Redraw finishes after this write releases the writer.
+                    *self.reply.lock().unwrap() = Some(handle);
+                    self.bytes.clear();
+                }
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let path = dropped_file("immediate-error");
+        let (client, mut peer) = controller(true);
+        prepare_drop(&client, &mut peer, path.to_str().unwrap().as_bytes());
+        let reply = Arc::new(Mutex::new(None));
+        *client.writer.lock().unwrap() =
+            Some(Box::new(ReplyOnCancel { client: Arc::downgrade(&client), bytes: Vec::new(), reply: reply.clone() }));
+        std::fs::remove_file(&path).unwrap();
+        let error = Source::open(path).err().unwrap();
+        let token = client.state.lock().unwrap().dropped.as_ref().unwrap().token.clone();
+        client.upload_failed(token, &AtomicBool::new(false), &error);
+        reply.lock().unwrap().take().unwrap().join().unwrap();
+        let state = client.state.lock().unwrap();
+        let status = state.status.as_ref().unwrap();
+        assert!(status.contains(&format!("{error:#}")));
+        assert!(status.contains("Transfer interrupted: cancelled."));
+    }
+
+    #[test]
+    fn failed_drop_retains_text_retry_and_close_and_success_does_not_offer_retry() {
+        for action in [0, 1, 2] {
+            let path = dropped_file(&format!("failure-{action}"));
+            let original = format!("'{}'", path.display()).into_bytes();
+            let (client, mut peer) = controller(true);
+            let token = prepare_drop(&client, &mut peer, &original);
+            client.message(ServerMsg::AttachmentResult {
+                token: token.clone(),
+                message: "Transfer interrupted. No paths pasted.".into(),
+                pasted: false,
+            });
+            assert!(matches!(read(&mut peer), ClientMsg::Resize { .. }));
+            client.drop_action(action);
+            assert!(matches!(read(&mut peer), ClientMsg::AttachmentDismiss { token: sent } if sent == token));
+            if action == 0 {
+                assert!(matches!(read(&mut peer), ClientMsg::AttachmentRequest { text, .. } if text == original));
+            } else if action == 1 {
+                let (kind, text) = protocol::read_frame(&mut peer).unwrap().unwrap();
+                assert_eq!(kind, protocol::BYTES);
+                assert_eq!(text, paste::bracket(&original));
+            }
+            std::fs::remove_file(path).unwrap();
+        }
+        let path = dropped_file("success");
+        let (client, mut peer) = controller(true);
+        let token = prepare_drop(&client, &mut peer, path.to_str().unwrap().as_bytes());
+        client.message(ServerMsg::AttachmentResult { token, message: "Files received.".into(), pasted: true });
+        assert!(client.state.lock().unwrap().dropped.is_none());
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn directories_links_special_files_and_limits_are_refused_before_sending() {
+        use std::os::unix::fs::symlink;
+        let root = std::env::temp_dir().join(format!("kraal-drop-refusal-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let file = root.join("file");
+        std::fs::write(&file, b"abc").unwrap();
+        symlink(&file, root.join("link")).unwrap();
+        let fifo = std::ffi::CString::new(root.join("fifo").to_str().unwrap()).unwrap();
+        // SAFETY: a valid C path, created inside this test directory.
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+        for path in [&root, &root.join("link"), &root.join("fifo")] {
+            let (client, mut peer) = controller(true);
+            prepare_drop(&client, &mut peer, path.to_str().unwrap().as_bytes());
+            assert!(
+                client.state.lock().unwrap().dropped.as_ref().unwrap().error.as_ref().unwrap().contains("kraal cp")
+            );
+            client.keys(b"\r");
+            assert!(client.state.lock().unwrap().active.is_none());
+            assert!(peer.incoming.try_recv().is_err());
+        }
+        let (client, mut peer) = controller(true);
+        prepare_drop(&client, &mut peer, file.to_str().unwrap().as_bytes());
+        client.state.lock().unwrap().dropped.as_mut().unwrap().limits.file_bytes = 2;
+        client.keys(b"\r");
+        assert!(client.state.lock().unwrap().active.is_none());
+        assert!(peer.incoming.try_recv().is_err());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn drop_layouts_at_124_and_80_columns_keep_all_four_choices() {
+        let path = dropped_file("layout");
+        let (client, mut peer) = controller(true);
+        prepare_drop(&client, &mut peer, path.to_str().unwrap().as_bytes());
+        let state = client.state.lock().unwrap();
+        let dropped = state.dropped.as_ref().unwrap();
+        let wide = dropped.lines(122, "SERVER", false, None);
+        assert!(wide[0].starts_with("SERVER / main / Claude | 1 local file, 0.0 MiB:"));
+        assert_eq!(wide[1], "Send the files and paste their remote paths?");
+        assert_eq!(wide[2], "[>Send<] [Always for SERVER] [Paste the text] [Cancel]");
+        let narrow = dropped.lines(78, "SERVER", false, None);
+        assert_eq!(narrow[0], "SERVER / main / Claude");
+        assert_eq!(narrow[3], "[>Send<] [Always here] [Text] [Cancel]");
+        assert!(dropped.lines(78, "SERVER", true, None).is_empty());
+        assert_eq!(
+            dropped.lines(78, "SERVER", true, Some("Sending: 1 / 3 MiB (33%) [Cancel: Ctrl+C]")),
+            ["Sending: 1 / 3 MiB (33%) [Cancel: Ctrl+C]"]
+        );
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn mouse_choices_and_progress_cancellation_use_the_displayed_buttons() {
+        let path = dropped_file("mouse");
+        let (client, mut peer) = controller(true);
+        let token = prepare_drop(&client, &mut peer, path.to_str().unwrap().as_bytes());
+        let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
+        let lines = client.state.lock().unwrap().dropped.as_ref().unwrap().lines(
+            usize::from(cols).saturating_sub(2).max(1),
+            "server",
+            false,
+            None,
+        );
+        let line = lines.last().unwrap();
+        let column = line.find("Text").or_else(|| line.find("Paste the text")).unwrap() + 2;
+        assert_eq!(button_at(line, column - 1), Some(2));
+        client.keys(format!("\x1b[<0;{column};{rows}M").as_bytes());
+        assert!(matches!(read(&mut peer), ClientMsg::AttachmentText { token: sent, .. } if sent == token));
+        let (client, mut peer) = controller(true);
+        let token = prepare_drop(&client, &mut peer, path.to_str().unwrap().as_bytes());
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let status = "Sending: 0.0 / 3.2 MiB (0%) [Cancel: Ctrl+C]";
+        {
+            let mut state = client.state.lock().unwrap();
+            state.active = Some(Active {
+                token: token.clone(),
+                cancelled: cancelled.clone(),
+                ack: bounded(2).0,
+                started: Instant::now(),
+                progress: None,
+            });
+            state.status = Some(status.into());
+        }
+        let lines = client.state.lock().unwrap().dropped.as_ref().unwrap().lines(
+            usize::from(cols).saturating_sub(2).max(1),
+            "server",
+            true,
+            Some(status),
+        );
+        let column = lines[0].find("Cancel").unwrap() + 2;
+        client.keys(format!("\x1b[<0;{column};{rows}M").as_bytes());
+        assert!(matches!(read(&mut peer), ClientMsg::AttachmentCancel { token: sent } if sent == token));
+        assert!(cancelled.load(Ordering::SeqCst));
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
@@ -756,7 +1773,11 @@ mod tests {
                 progress: None,
             });
         }
-        client.message(ServerMsg::AttachmentResult { token: "ab".into(), message: "Files received.".into() });
+        client.message(ServerMsg::AttachmentResult {
+            pasted: true,
+            token: "ab".into(),
+            message: "Files received.".into(),
+        });
         let state = client.state.lock().unwrap();
         assert_eq!(state.active.as_ref().unwrap().token, "cd");
         assert!(!cancelled.load(Ordering::SeqCst));

@@ -13703,3 +13703,79 @@ fn attachment_wire_cancellation_disconnect_and_repeated_finish_do_not_paste_part
         }
     }
 }
+
+#[cfg(unix)]
+#[test]
+fn host_pasted_paths_preserve_text_send_complete_batches_and_remember_revocable_permission() {
+    let local = Env::new("pasted-path-local");
+    let remote = Env::new("pasted-path-host");
+    remote.workspace(
+        "w",
+        "layout {\n    pane name=\"main\" command=\"sh\" { args \"-c\" \"stty -echo -icanon; echo READY; cat\"; }\n}\n",
+    );
+    remote.run(&["open", "w"]);
+    remote.wait_for_text("main", "READY");
+    let (_, path) = fake_ssh(&local, &remote);
+    std::fs::write(local.root.join("config/kraal/servers.toml"), "[[server]]\nname='box'\nhost='pasted.invalid'\n")
+        .unwrap();
+    let first = local.root.join("notes client.txt");
+    let second = local.root.join("capture.bin");
+    std::fs::write(&first, b"laptop notes").unwrap();
+    std::fs::write(&second, b"laptop capture").unwrap();
+    let mut command = local.isolated(Path::new(env!("CARGO_BIN_EXE_kraal")));
+    command.args(["-s", &remote.session, "attach", "--host", "box", "w"]).env("PATH", path);
+    let mut host = TerminalClient::start(command);
+    host.wait_for("READY");
+    let original = format!("  '{}' file://{}  ", first.display(), second.display());
+    let pasted = format!("\x1b[200~{original}\x1b[201~");
+    let visible = |host: &TerminalClient, text: &str| {
+        wait_until(PATIENCE, text, || {
+            text_after(&host.written.lock().unwrap(), 100, 30).iter().any(|row| row.contains(text))
+        });
+    };
+    // The markers can arrive across separate reads of the laptop's terminal.
+    host.type_keys(&pasted.as_bytes()[..3]);
+    host.type_keys(&pasted.as_bytes()[3..]);
+    visible(&host, "[>Send<]");
+    let root = remote.root.join("state/kraal/attachments-v1").join(&remote.session);
+    assert!(!root.exists());
+    host.type_keys(b"\t\t\r");
+    visible(&host, "Text submitted");
+    let output = remote.wait_for_text("main", "capture.bin");
+    assert!(output.contains("notes client.txt") && output.contains("file://"), "{output}");
+    assert!(!root.exists());
+    host.type_keys(pasted.as_bytes());
+    visible(&host, "[>Send<]");
+    host.type_keys(b"\t\r");
+    visible(&host, "2 files sent.");
+    let permission = local.root.join("config/kraal/paste-files.toml");
+    assert!(std::fs::read_to_string(&permission).unwrap().contains("pasted.invalid"));
+    let batches = || {
+        std::fs::read_dir(&root)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|p| !p.file_name().unwrap().to_string_lossy().starts_with('.'))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(batches().len(), 1);
+    for batch in batches() {
+        assert_eq!(std::fs::read(batch.join("0/notes client.txt")).unwrap(), b"laptop notes");
+        assert_eq!(std::fs::read(batch.join("1/capture.bin")).unwrap(), b"laptop capture");
+    }
+    host.type_keys(pasted.as_bytes());
+    wait_until(PATIENCE, "automatic second batch", || batches().len() == 2);
+    visible(&host, "2 files sent.");
+    std::fs::remove_file(permission).unwrap();
+    host.type_keys(pasted.as_bytes());
+    visible(&host, "[>Send<]");
+    assert_eq!(batches().len(), 2);
+    host.type_keys(b"\x03");
+    visible(&host, "cancelled");
+    assert_eq!(batches().len(), 2);
+    host.type_keys(b"\x03");
+    wait_until(PATIENCE, "cancel result dismissed", || {
+        !text_after(&host.written.lock().unwrap(), 100, 30).iter().any(|row| row.contains("Ctrl+C dismisses"))
+    });
+    host.type_keys(b"\x02d");
+    assert_eq!(host.left("pasted path detach").0, 0);
+}

@@ -300,4 +300,7 @@ read them as such. Key release events are not passed on yet.
 The command palette (`ctrl+b space`) includes **Attach files** and **Purge attachments**.
 **Attach files** opens a local path form: Enter sends, Ctrl+C cancels. It works with terminals
 that do not support bracketed paste. No key is assigned by default; custom bindings use
-`attach_files` and `purge_attachments`. See [Attachments](terminal.md#attachments).
+`attach_files` and `purge_attachments`. On `attach --host`, pasting local file paths opens
+Send, Always, Text and Cancel choices. Tab or arrows select, Enter activates, and a click also
+activates a choice. Ctrl+C or Esc cancels the choice; Ctrl+C cancels a transfer.
+See [Attachments](terminal.md#attachments) for remembered permissions and revocation.

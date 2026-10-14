@@ -11,7 +11,7 @@ mod scroll;
 use std::time::Instant;
 
 use super::contexts::Production;
-use super::ui::{ConfirmAction, InputItem, Mode, PendingInput, Prompt, PromptAction};
+use super::ui::{ConfirmAction, InputItem, Mode, PendingInput};
 use super::{ClientId, Dirty, Server};
 use crate::input::{InputEvent, Key, KeyCode, MouseEvent, MouseKind, encode_key, encode_paste_after};
 use crate::keymap::{Action, Command, Lookup};
@@ -933,6 +933,19 @@ impl Server {
         self.mark_dirty();
     }
 
+    pub(super) fn reserve_paste(&mut self, id: ClientId) {
+        if self.clients.get(&id).is_some_and(|c| {
+            c.attached
+                && c.attachments.recognition
+                && c.attachments.pending.is_none()
+                && c.attachments.blocked.is_none()
+                && c.paste.is_none()
+                && matches!(c.mode, Mode::Normal)
+        }) {
+            self.paste_piece(id, Vec::new());
+        }
+    }
+
     /// A paste starts: it goes to the focused pane and to those typing is broadcast to now.
     fn paste_start(&self, id: ClientId) -> PasteFlow {
         match self.client_focus(id) {
@@ -973,7 +986,7 @@ impl Server {
         match flow {
             PasteFlow::Held { focused, targets, mut data } if data.len() + last.len() <= PASTE_HOLD => {
                 data.extend_from_slice(&last);
-                if data.is_empty() { Mode::Normal } else { self.paste_or_upload(id, focused, &targets, data) }
+                if data.is_empty() { Mode::Normal } else { self.paste_to(id, focused, &targets, data) }
             }
             PasteFlow::Held { focused, targets, data } => {
                 self.paste_overflow(id, focused, targets, &data, &last);
@@ -1050,27 +1063,6 @@ impl Server {
         }
         self.paste_into_after(&targets, data, after_cr);
         PasteFlow::Streaming { focused, targets, after_cr: next_cr }
-    }
-
-    /// Paste into the panes the paste started going to (see [`Server::paste_to`]), or offer an
-    /// upload when files were dropped on an SSH pane.
-    fn paste_or_upload(&mut self, id: ClientId, focused: PaneId, targets: &[PaneId], data: Vec<u8>) -> Mode {
-        if let Some(server) = self.pane_server(focused)
-            && let Some(paths) = crate::transfer::dropped_paths(&String::from_utf8_lossy(&data))
-        {
-            let n = paths.len();
-            let what = if n == 1 {
-                paths[0].file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_default()
-            } else {
-                format!("{n} items")
-            };
-            return Mode::Prompt(Prompt::new(
-                &format!("Upload {what} to"),
-                &format!("{}:~/", server.name),
-                PromptAction::Upload { paths, raw: data, pane: focused },
-            ));
-        }
-        self.paste_to(id, focused, targets, data)
     }
 
     /// Paste `data` as the terminal would: into the focused pane and those typing is broadcast

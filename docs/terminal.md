@@ -235,7 +235,8 @@ Open the command palette (`ctrl+b space`) and choose **Attach files**. Enter exi
 paths on your laptop, separated by spaces. Quote paths containing spaces, for example
 `'/home/me/notes client.txt' /home/me/capture.png`. Press Enter to send their contents and submit
 the resulting paths to the pane named in the form. Ctrl+C cancels. The form is local: a server
-message alone cannot read files. URI paths, directories, symlinks and special files are refused.
+message alone cannot read files. Local `file:///...` URIs are accepted with percent decoding;
+remote URI authorities, directories, symlinks and special files are refused.
 Use `kraal cp` for directories and larger transfers.
 
 With `attach --host`, files travel through the existing attach connection, in 64 KiB chunks
@@ -243,8 +244,68 @@ with only one unacknowledged chunk. The target pane is reserved when the action 
 focus does not redirect the paths. Broadcasting asks whether to attach only to that pane.
 A local session submits the original paths without copying files. No Enter is added, and the
 usual production paste protections still apply. No path is submitted unless the entire batch
-arrives. Ordinary pasted text is unchanged; automatic dropped-path recognition and clipboard
-images are separate features.
+arrives. Ordinary pasted text is unchanged. Clipboard images are not read by this action.
+
+### Pasted laptop paths
+
+With `attach --host`, a complete bracketed paste containing only existing absolute laptop paths
+opens a local choice. The target, file count, total size and names appear before any file is
+opened for transfer. At 124 columns:
+
+```text
+SERVER / main / Claude | 2 local files, 3.2 MiB: capture.png, notes client.txt
+Send the files and paste their remote paths?
+[>Send<] [Always for SERVER] [Paste the text] [Cancel]
+```
+
+At 80 columns:
+
+```text
+SERVER / main / Claude
+2 local files, 3.2 MiB: capture.png, notes client.txt
+Send the files and paste their remote paths?
+[>Send<] [Always here] [Text] [Cancel]
+```
+
+Tab or the arrow keys select a choice, Enter activates it, and clicking a choice does the same.
+Ctrl+C or Esc cancels. **Send** sends this batch once. **Always** remembers permission on the
+laptop for this SSH destination, including its connection arguments. Subsequent eligible pastes,
+including on another attach, send without asking. Broadcasting still asks to send only to the
+named pane. The choice is never permission for the server to read laptop files on its own.
+
+Permissions are in `~/.config/kraal/paste-files.toml` (or
+`$XDG_CONFIG_HOME/kraal/paste-files.toml`). Remove the matching `[[server]]` entry to revoke it,
+or remove that file to revoke all permissions. Revocation applies to the next paste without
+reattaching. An unreadable or malformed file never grants permission. The file holds destination
+names and SSH arguments, not file contents or pasted text.
+
+**Paste the text** (or **Text**) preserves the original bytes, including quotes and escapes.
+**Cancel** sends no file and pastes nothing. Spaces can be quoted or escaped with backslashes.
+Local `file:///...` URIs are percent decoded; remote authorities are refused. An unquoted name
+with spaces is recognized only when it has one interpretation. Commands, sentences, missing
+paths, ambiguous lists, variables, globs and shell substitutions remain ordinary text. Kraal
+executes none of them to recognize a path. Recognition buffers at most 64 KiB; larger pastes
+stream unchanged. A local session always pastes paths unchanged, including into an SSH pane.
+Use **Upload to this pane's server** or `kraal cp` for that topology.
+
+For a longer transfer, the choice is replaced after 200 ms by progress, for example:
+
+```text
+Sending to SERVER: 2.1 / 3.2 MiB (66%) [Cancel: Ctrl+C]
+```
+
+A short transfer goes directly to the result, without flashing progress. Files stay in their
+original order, and all remote paths are submitted together to the reserved pane after the
+whole batch succeeds. A failure retains the original text and offers **Retry**, **Paste the
+text**, and **Close**. Retry reserves the current pane and shows the choice again; Text pastes
+the original text into the current pane. After a connection loss, inspect the recovered result
+and the pane before retrying: finalized files are kept, and kraal never retries automatically.
+Directories, links and special files have an explicit refusal pointing to `kraal cp`.
+
+Without bracketed paste or with an older peer, text continues unchanged. Use **Attach files**
+when the terminal cannot mark pastes. Empty pastes never read clipboard images.
+
+### Transfer lifetime and limits
 
 Sending shows progress after 200 ms, with Ctrl+C to cancel. Typing waits in a bounded queue
 (up to 64 KiB, for at most 60 seconds including the form) and follows the paths on success.

@@ -96,6 +96,13 @@ The optional `[attachments]` configuration defaults preserve existing configurat
 result records use a separate `attachments-v1` directory. No saved-session, workspace KDL or
 legacy state format changes are introduced.
 
+Automatic pasted-path recognition additionally requires `pasted_paths` in both peers' lists.
+Reservation requests, prepared replies and original-text submission use that capability.
+An optional `pasted` field on attachment results defaults to false for older peers. Clients
+without the capability retain ordinary paste bytes; no new requests reach an older server.
+The laptop's `paste-files.toml` permissions are separate from configuration, workspace and
+session formats. Existing 0.2.0 and 0.3.0 files and downgrade isolation remain unchanged.
+
 ## For contributors: how the protocol changes
 
 The client and the server exchange JSON messages (`src/protocol.rs`, whose comments hold the
