@@ -169,7 +169,7 @@ impl TabDef {
 /// A parsed workspace file.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkspaceDef {
-    /// Workspace name (the file stem).
+    /// Display name, independent of the source file name.
     pub name: String,
     /// Workspace-wide working directory (Zellij `cwd "..."` inside `layout`).
     pub cwd: Option<PathBuf>,

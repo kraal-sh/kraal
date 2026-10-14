@@ -880,14 +880,14 @@ mod tests {
     }
 
     #[test]
-    fn workspace_prompt_errors_scroll_without_changing_input_and_stay_until_an_edit() {
+    fn preview_prompt_errors_scroll_without_changing_input_and_stay_until_an_edit() {
         let (tx, _rx) = crate::server::queue::channel(32);
         let mut server = crate::server::tests::server(tx);
         let (client, _peer) = crate::server::tests::client(&mut server);
         for (cols, rows, action) in [(80, 24, PromptAction::OpenPreview), (124, 36, PromptAction::OpenPreview)] {
             let c = server.clients.get_mut(&client).unwrap();
             (c.cols, c.rows) = (cols, rows);
-            let mut p = Prompt::new("Workspace", " café 日 ", action);
+            let mut p = Prompt::new("Preview file (path)", " café 日 ", action);
             let error = "Read this diagnostic.\n".repeat(100);
             p.error = Some(error.clone());
             let layout = crate::server::overlays::prompt_layout(&p, server.client_screen(client));

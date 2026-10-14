@@ -84,7 +84,6 @@ impl Server {
         let mut def = preview.definition;
         def.name = name.into();
         def.visit_panes(|pane| {
-            pane.start_suspended = true;
             if let Some(agent) = &pane.agent {
                 let reference = pane.account_id.as_deref().unwrap_or(agent);
                 if let Some((_, id)) = choices.iter().find(|(r, _)| r == reference)

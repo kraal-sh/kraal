@@ -1589,17 +1589,10 @@ fn resolved(path: &Path) -> Option<PathBuf> {
 
 /// Whether two paths name the same file or directory (same device and inode).
 fn same_file(a: &Path, b: &Path) -> bool {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        match (std::fs::metadata(a), std::fs::metadata(b)) {
-            (Ok(x), Ok(y)) => x.dev() == y.dev() && x.ino() == y.ino(),
-            _ => false,
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        matches!((a.canonicalize(), b.canonicalize()), (Ok(x), Ok(y)) if x == y)
+    use std::os::unix::fs::MetadataExt;
+    match (std::fs::metadata(a), std::fs::metadata(b)) {
+        (Ok(x), Ok(y)) => x.dev() == y.dev() && x.ino() == y.ino(),
+        _ => false,
     }
 }
 
