@@ -13245,3 +13245,66 @@ fn tunnel_form_shows_the_port_and_live_results_can_retry_and_stop() {
         );
     }
 }
+
+#[test]
+fn workspace_commands_keep_identity_sources_and_recover_deletions_after_restart() {
+    let env = Env::new("workspace-lifecycle-cli");
+    let source = "// Keep this recipe.\nlayout { pane command=\"sleep 60\" start_suspended=true; }\n";
+    env.workspace("api", source);
+    env.run(&["open", "api"]);
+    let list = || serde_json::from_str::<serde_json::Value>(&env.run(&["workspaces", "--json"])).unwrap();
+    let id = list()[0]["id"].as_str().unwrap().to_string();
+    env.run(&["workspaces", "rename", &id, "backend"]);
+    assert_eq!(list()[0]["id"], id);
+    assert_eq!(list()[0]["name"], "backend");
+    let path = env.root.join("config/kraal/workspaces/api.kdl");
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), source);
+    assert!(!path.with_extension("kdl.bak").exists());
+    env.run(&["workspaces", "close", &id]);
+    assert_eq!(list()[0]["open"], false);
+    assert!(env.run(&["panes", "--json"]).trim() == "[]");
+    let denied = env.try_run(&["workspaces", "delete", &id]);
+    assert!(!denied.status.success());
+    assert!(String::from_utf8_lossy(&denied.stderr).contains("--yes"));
+    assert_eq!(list()[0]["id"], id);
+    env.run(&["workspaces", "delete", &id, "--yes"]);
+    assert_eq!(list(), serde_json::json!([]));
+    env.run(&["kill"]);
+    let deleted = env.run(&["workspaces", "--deleted", "--json"]);
+    let deleted: serde_json::Value = serde_json::from_str(&deleted).unwrap();
+    assert_eq!(deleted[0]["id"], id);
+    env.run(&["workspaces", "restore", &id]);
+    assert_eq!(list()[0]["id"], id);
+    assert_eq!(list()[0]["open"], false);
+    assert!(env.run(&["panes", "--json"]).trim() == "[]");
+    assert_eq!(std::fs::read_to_string(path).unwrap(), source);
+}
+
+#[test]
+fn workspace_commands_create_refuse_collisions_and_require_approval_to_stop_programs() {
+    let env = Env::new("workspace-create-cli");
+    let out = env.cmd(&["workspaces", "create", "api"]).current_dir(&env.root).output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(!env.try_run(&["workspaces", "create", "api"]).status.success());
+    let panes: serde_json::Value = serde_json::from_str(&env.run(&["panes", "--json"])).unwrap();
+    assert_eq!(panes.as_array().unwrap().len(), 1);
+    assert_eq!(Path::new(panes[0]["cwd"].as_str().unwrap()).canonicalize().unwrap(), env.root.canonicalize().unwrap());
+    env.run(&["run", "--name", "busy", "sh", "-c", "echo workspace-ready; sleep 60"]);
+    env.wait_for_text("busy", "workspace-ready");
+    let denied = env.try_run(&["workspaces", "close", "api"]);
+    assert!(!denied.status.success());
+    let preview = String::from_utf8_lossy(&denied.stdout);
+    assert!(preview.contains("These programs will stop:"), "{preview}");
+    assert!(preview.contains("sleep 60"), "{preview}");
+    assert!(String::from_utf8_lossy(&denied.stderr).contains("--yes"));
+    assert!(env.run(&["panes", "--json"]).contains("busy"));
+    env.run(&["workspaces", "close", "api", "--yes"]);
+    env.run(&["workspaces", "delete", "api", "--yes"]);
+    env.run(&["workspaces", "create", "api"]);
+    assert!(!env.try_run(&["workspaces", "restore", "api"]).status.success());
+    env.run(&["workspaces", "restore", "api", "--name", "recovered"]);
+    let list: serde_json::Value = serde_json::from_str(&env.run(&["workspaces", "--json"])).unwrap();
+    let recovered = list.as_array().unwrap().iter().find(|w| w["name"] == "recovered").unwrap();
+    assert_eq!(recovered["open"], false);
+    assert_eq!(recovered["panes"], 2);
+}

@@ -100,6 +100,12 @@ They keep the saved tunnel fields and wire state names (`connecting`, `up`, `dow
 omitted. No configuration, KDL or session format changes are needed, and legacy state paths
 remain untouched. Older running servers keep their existing tunnel UI until restarted.
 
+Workspace Create, Rename, Close, Delete, Restore and the deleted-workspace list use new
+requests advertised as `workspace_lifecycle`. An older server refuses them with the usual
+restart guidance. Existing pane Close and Rename commands, workspace listing and Open requests
+keep their meanings. Workspace drag uses the attached-terminal input protocol and the existing
+saved order. These operations add no session, workspace-file or configuration format change.
+
 ## For contributors: how the protocol changes
 
 The client and the server exchange JSON messages (`src/protocol.rs`, whose comments hold the

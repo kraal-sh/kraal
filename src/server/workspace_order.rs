@@ -93,6 +93,17 @@ impl Server {
         neighbor: WorkspaceKey,
         before: bool,
     ) -> Mode {
+        self.reorder_workspace_checked(id, workspace, neighbor, before, None)
+    }
+
+    pub(super) fn reorder_workspace_checked(
+        &mut self,
+        id: ClientId,
+        workspace: WorkspaceKey,
+        neighbor: WorkspaceKey,
+        before: bool,
+        order: Option<Vec<WorkspaceKey>>,
+    ) -> Mode {
         let current = self.clients.get(&id).map_or(0, |c| c.workspace);
         let mut picker = self.workspace_picker(current);
         let keys: Vec<_> = picker.items.iter().filter_map(|i| self.workspace_key(&i.action)).collect();
@@ -102,23 +113,33 @@ impl Server {
         else {
             return picker.result("Workspace unavailable. Select a workspace to move.");
         };
-        if (before && at + 1 == next) || (!before && next + 1 == at) {
+        if order.as_ref().is_some_and(|order| *order != keys) {
+            return picker.result("Order changed. Drag the workspace again.");
+        }
+        if at == next || (before && at + 1 == next) || (!before && next + 1 == at) {
             return Mode::Picker(picker);
         }
-        if (before && next + 1 != at) || (!before && at + 1 != next) {
+        if order.is_none() && ((before && next + 1 != at) || (!before && at + 1 != next)) {
             return picker.result("Order changed. Choose Move up or Move down again.");
         }
         let old = self.workspace_order.clone();
         let previous: Vec<_> = self.workspaces.iter().map(|w| w.id).collect();
         // Retain deleted entries' slots so Undo can still put them back among these rows.
-        for key in keys {
-            if !self.workspace_order.contains(&key) {
-                self.workspace_order.push(key);
+        for key in &keys {
+            if !self.workspace_order.contains(key) {
+                self.workspace_order.push(key.clone());
             }
         }
-        let at = self.workspace_order.iter().position(|k| *k == workspace).unwrap();
-        let next = self.workspace_order.iter().position(|k| *k == neighbor).unwrap();
-        self.workspace_order.swap(at, next);
+        let mut moved = keys.clone();
+        moved.remove(at);
+        let next = moved.iter().position(|k| *k == neighbor).unwrap();
+        moved.insert(next + usize::from(!before), workspace.clone());
+        let mut moved = moved.into_iter();
+        for key in &mut self.workspace_order {
+            if keys.contains(key) {
+                *key = moved.next().unwrap();
+            }
+        }
         self.sort_workspaces();
         if let Err(error) = self.save_now() {
             self.workspace_order = old;
@@ -133,7 +154,7 @@ impl Server {
                     )
                 }
             };
-            return Mode::confirm(message, ConfirmAction::ReorderWorkspace { workspace, neighbor, before });
+            return Mode::confirm(message, ConfirmAction::ReorderWorkspace { workspace, neighbor, before, order });
         }
         self.refresh_workspace_pickers();
         self.mark_dirty();

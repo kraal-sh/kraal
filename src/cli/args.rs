@@ -65,6 +65,35 @@ impl Cli {
 }
 
 #[derive(Subcommand)]
+pub enum WorkspaceCmd {
+    /// Create a saved workspace with a shell in the calling directory.
+    Create { name: String },
+    /// Rename a saved workspace without renaming its source file.
+    Rename { workspace: String, name: String },
+    /// Stop a workspace's programs and keep its layout as Closed.
+    Close {
+        workspace: String,
+        /// Accept stopping the programs shown in the preview.
+        #[arg(short, long)]
+        yes: bool,
+    },
+    /// Delete a workspace recoverably, keeping project and source files.
+    Delete {
+        workspace: String,
+        /// Accept the deletion and stopping the programs shown in the preview.
+        #[arg(short, long)]
+        yes: bool,
+    },
+    /// Restore a deleted workspace as Closed, without starting programs.
+    Restore {
+        workspace: String,
+        /// Use another name if the old one is taken.
+        #[arg(long)]
+        name: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
 pub enum Cmd {
     /// Attach to the session (starting it if needed), optionally opening a workspace. With
     /// --host, attach to the kraal running on that server, reconnecting by itself if the
@@ -114,13 +143,18 @@ pub enum Cmd {
     },
     /// Forget a session's saved layout and scrollback (and its paste buffers, when they are kept).
     Forget,
-    /// List workspaces: open ones and definitions on disk.
-    #[command(alias = "ws")]
+    /// List saved workspaces and definitions, or manage a workspace.
+    #[command(alias = "ws", args_conflicts_with_subcommands = true)]
     Workspaces {
         #[arg(long)]
         json: bool,
+        /// List recoverable deletions, including their IDs.
+        #[arg(long)]
+        deleted: bool,
+        #[command(subcommand)]
+        command: Option<WorkspaceCmd>,
     },
-    /// Start a workspace from its definition (or switch to it if open).
+    /// Open a saved workspace or import its definition, without changing attached terminals.
     Open { name: String },
     /// List panes.
     Panes {
@@ -727,6 +761,27 @@ mod tests {
             Some(_) => "another command".to_owned(),
         };
         format!("session {:?}, {command}, workspace {:?}", cli.session, cli.workspace)
+    }
+
+    #[test]
+    fn workspace_management_keeps_the_existing_list_and_pane_commands() {
+        for alias in ["ws", "workspaces"] {
+            assert!(Cli::try_parse_from(["kraal", "-s", "dev", alias, "create", "api"]).is_ok());
+            assert!(matches!(
+                Cli::try_parse_from(["kraal", alias, "--json"]).unwrap().command,
+                Some(Cmd::Workspaces { json: true, command: None, .. })
+            ));
+            assert!(matches!(
+                Cli::try_parse_from(["kraal", alias, "close", "api", "--yes"]).unwrap().command,
+                Some(Cmd::Workspaces { command: Some(WorkspaceCmd::Close { yes: true, .. }), .. })
+            ));
+            assert!(
+                matches!(Cli::try_parse_from(["kraal", alias, "restore", "api", "--name", "restored"]).unwrap().command, Some(Cmd::Workspaces { command: Some(WorkspaceCmd::Restore { name: Some(name), .. }), .. }) if name == "restored")
+            );
+            assert!(Cli::try_parse_from(["kraal", alias, "--deleted", "create", "api"]).is_err());
+        }
+        assert!(matches!(Cli::try_parse_from(["kraal", "close", "42"]).unwrap().command, Some(Cmd::Close { .. })));
+        assert!(matches!(Cli::try_parse_from(["kraal", "rename", "shell"]).unwrap().command, Some(Cmd::Rename { .. })));
     }
 
     /// The command lines read without clap say what clap reads from them.

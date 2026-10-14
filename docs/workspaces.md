@@ -93,6 +93,10 @@ be duplicated from its retained contents, even if the original file is gone.
 ### Reordering workspaces
 
 Select a row in **Workspaces**, press Tab and choose **Move up** or **Move down**.
+You can also drag a workspace row onto another row in the list or sidebar. Moving upward
+places it before that row; moving downward places it after that row. The destination is
+highlighted while dragging. A click opens on release; dragging starts no programs and does
+not switch workspaces. Release outside workspace rows or press Esc to cancel.
 The row stays selected and the workspace, tab and pane on each attached terminal stay focused.
 The sidebar, Workspaces and `kraal workspaces` share the order. It is saved automatically,
 including while the server is stopped and after restart. Opening or closing a workspace keeps
@@ -100,7 +104,9 @@ its place. Moving an unimported file starts no programs and changes no KDL file.
 The first row has no Move up action, and the last has no Move down action.
 
 While searching, **Clear search to reorder** replaces the move actions. Choose it to clear the
-search and keep the selected row, then choose a move in the full list.
+search and keep the selected row, then move or drag in the full list. Dragging a filtered
+list says **Clear search to reorder** and keeps the order. If another client changes the
+order during a drag, kraal asks you to drag again against the current list.
 If saving fails, kraal keeps the previous order and offers **Retry** and **Cancel**.
 If a timed-out write's rollback also fails, the dialog says the saved order may differ and asks
 you to fix the save error and retry. Cancel returns to the list with the same row selected.
@@ -541,3 +547,35 @@ If saving fails before programs stop, they remain running. If a later step fails
 layout stays saved and the message gives the next action. An unfinished Close must be completed
 before retrying Load. If the replacement is saved but cannot open, retry **Open** or use
 **Undo load** from Actions.
+
+### Workspace commands
+
+`kraal workspaces` (also `kraal ws`) lists open and closed workspaces and unimported files.
+`kraal workspaces --json` includes saved workspace IDs. The commands below accept a saved
+workspace's name or ID. IDs disambiguate saved workspaces with the same name.
+
+| Command | Result |
+|---|---|
+| `kraal workspaces create api` | Creates and saves a workspace with a shell in the calling directory |
+| `kraal workspaces rename api backend` | Renames the saved workspace, keeping its source file unchanged |
+| `kraal workspaces close backend` | Stops its programs and keeps the layout as Closed |
+| `kraal workspaces close backend --yes` | Accepts stopping the programs shown in the preview |
+| `kraal workspaces delete backend` | Confirms recoverable deletion, keeping project and source files |
+| `kraal workspaces delete backend --yes` | Accepts deletion and stopping the programs shown in the preview |
+| `kraal workspaces --deleted` | Lists deleted workspaces with their IDs, even with the server stopped |
+| `kraal workspaces --deleted --json` | Lists the same recoverable workspaces as JSON |
+| `kraal workspaces restore backend` | Restores the deleted workspace as Closed, without starting programs |
+| `kraal workspaces restore backend --name backend-restored` | Restores under another name when the old name is taken |
+
+Mutating commands start the session server if needed, with its usual session restoration.
+Create and Rename do not change the workspace shown by attached terminals. Close and Delete
+use the same durable operations as the list. Close lists running programs and background jobs
+before asking; idle shells need no extra confirmation. Delete always asks. Without a terminal,
+commands that need confirmation stop with instructions to use `--yes`. If the workspace or its
+programs change after the preview, nothing is stopped: run the command again to review them.
+
+Delete also accepts an unimported file's workspace name and remembers its removal without
+removing the file. Rename requires importing that file first with `kraal open NAME`.
+If several deleted workspaces share a name, use the ID from `kraal workspaces --deleted`.
+Restore never replaces a workspace that now uses the old name; use `--name` to choose another.
+After Restore, `kraal open NAME` opens it. `kraal close` and `kraal rename NAME` still act on panes.

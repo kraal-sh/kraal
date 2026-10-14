@@ -1606,6 +1606,11 @@ mod tests {
             err,
             "session old runs kraal 0.1.9, which cannot keep paste buffers: `kraal -s old restart` updates it (its layout and scrollback are kept)"
         );
+        let err = request(&socket, Request::CreateWorkspace { name: "api".into(), cwd: "/tmp".into() })
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("cannot create, rename, close, delete and restore workspaces"), "{err}");
+        assert!(err.contains("kraal -s old restart"), "{err}");
         let edit =
             |sudo| Request::EditRemote { target: "web:/a".into(), line: None, near: None, production: false, sudo };
         let err = request(&socket, edit(true)).unwrap_err().to_string();

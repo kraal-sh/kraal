@@ -1310,6 +1310,23 @@ impl Server {
             _ => usize::MAX,
         });
 
+        if let Some(super::ui::Drag::Workspace { drag, .. }) = &c.drag
+            && drag.moved
+        {
+            for row in &mut rows {
+                if let SideRow::Entry { item: Some(item), line, .. } = row {
+                    let key = match item {
+                        SideItem::Workspace(ws) => self.workspace_key(&super::ui::PickAction::SwitchWorkspace(*ws)),
+                        SideItem::Definition(path) => Some(crate::persist::WorkspaceKey::Source(path.clone())),
+                        _ => None,
+                    };
+                    if key.is_some() && key == drag.target {
+                        line.style = line.style.add_modifier(Modifier::REVERSED);
+                    }
+                }
+            }
+        }
+
         // Reserve the add row even when the workspace list fills the sidebar.
         let visible = height.saturating_sub(3) as usize / 2;
         rows.truncate(1 + visible * 2);
@@ -2327,6 +2344,30 @@ mod tests {
                 .iter()
                 .any(|r| matches!(r, SideRow::Entry { item: Some(SideItem::Definition(_)), .. }))
         );
+    }
+
+    #[test]
+    fn sidebar_workspace_drag_marks_both_destination_rows_without_changing_current() {
+        let (tx, _rx) = super::super::queue::channel(32);
+        let mut server = super::super::tests::server(tx);
+        let (client, _peer) = super::super::tests::client(&mut server);
+        let current = server.clients[&client].workspace;
+        let other = server.new_workspace("other".into(), None);
+        let row = |server: &Server, ws| {
+            (0..36).find(|&r| server.sidebar_hit(client, r) == Some(SideItem::Workspace(ws))).unwrap()
+        };
+        let from = row(&server, other);
+        let to = row(&server, current);
+        server.client_input(client, format!("\x1b[<0;4;{}M", from + 1).as_bytes());
+        server.client_input(client, format!("\x1b[<32;4;{}M", to + 1).as_bytes());
+        let rows = server.sidebar_rows(&server.clients[&client], 36, 0);
+        for r in &rows[to as usize..to as usize + 2] {
+            let SideRow::Entry { line, selected, .. } = r else { panic!() };
+            assert!(line.style.add_modifier.contains(Modifier::REVERSED));
+            assert!(selected);
+        }
+        assert_eq!(server.clients[&client].workspace, current);
+        assert!(server.workspace_order.is_empty());
     }
 
     #[test]

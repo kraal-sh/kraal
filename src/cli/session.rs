@@ -109,13 +109,118 @@ fn remove_saved(path: &Path) -> std::io::Result<bool> {
 }
 
 /// `kraal workspaces`: saved workspaces and file definitions, also when the server is stopped.
-pub(super) fn workspaces(s: &Session, json: bool) -> Result<()> {
+pub(super) fn workspaces(
+    s: &Session,
+    json: bool,
+    deleted: bool,
+    command: Option<super::args::WorkspaceCmd>,
+) -> Result<()> {
+    if let Some(command) = command {
+        return workspace_command(s, command);
+    }
+    if deleted {
+        let list = match s.request(Request::ListDeletedWorkspaces) {
+            Ok(Response::Workspaces(list)) => list,
+            Ok(_) => bail!("unexpected answer"),
+            Err(error) => {
+                if std::os::unix::net::UnixStream::connect(s.socket()).is_ok() {
+                    return Err(error);
+                }
+                crate::persist::inspect(&s.name)?
+                    .map(|saved| {
+                        saved
+                            .deleted_workspaces
+                            .iter()
+                            .rev()
+                            .map(|d| {
+                                let w = &d.workspace;
+                                let (tabs, panes) = w.counts();
+                                protocol::WorkspaceInfo {
+                                    id: Some(w.id.clone()),
+                                    name: w.name.clone(),
+                                    open: false,
+                                    definition: w.definition.clone(),
+                                    tabs,
+                                    panes,
+                                    working: 0,
+                                    blocked: 0,
+                                    done: 0,
+                                }
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default()
+            }
+        };
+        if json {
+            println!("{}", serde_json::to_string_pretty(&list)?);
+        } else {
+            for w in list {
+                println!("{}  {}  deleted", w.id.as_deref().unwrap_or_default(), w.name);
+            }
+        }
+        return Ok(());
+    }
     let r = match s.request(Request::ListWorkspaces) {
         Ok(r) => r,
         Err(_) => return list_definitions(&s.name, json),
     };
     let Response::Workspaces(list) = r else { bail!("unexpected answer") };
     print_workspaces(&list, json)
+}
+
+fn workspace_command(s: &Session, command: super::args::WorkspaceCmd) -> Result<()> {
+    use super::args::WorkspaceCmd;
+    client::ensure_server(&s.name)?;
+    let (request, message) = match command {
+        WorkspaceCmd::Create { name } => {
+            (Request::CreateWorkspace { name, cwd: std::env::current_dir()? }, "Workspace added")
+        }
+        WorkspaceCmd::Rename { workspace, name } => (Request::RenameWorkspace { workspace, name }, "Workspace renamed"),
+        WorkspaceCmd::Restore { workspace, name } => (
+            Request::RestoreWorkspace { workspace, name },
+            "Workspace restored · Closed. Use `kraal open NAME` to open it.",
+        ),
+        WorkspaceCmd::Close { workspace, yes } => return stop_workspace(s, workspace, yes, false),
+        WorkspaceCmd::Delete { workspace, yes } => return stop_workspace(s, workspace, yes, true),
+    };
+    s.request(request)?;
+    println!("{message}");
+    Ok(())
+}
+
+fn stop_workspace(s: &Session, workspace: String, yes: bool, delete: bool) -> Result<()> {
+    let request = |workspace, expected| {
+        if delete {
+            Request::DeleteWorkspace { workspace, expected }
+        } else {
+            Request::CloseWorkspace { workspace, expected }
+        }
+    };
+    let Response::WorkspacePreview { workspace, revision, question } = s.request(request(workspace, None))? else {
+        bail!("unexpected answer")
+    };
+    if let Some(question) = question {
+        println!("{question}");
+        if !yes
+            && !confirm_layout(
+                if delete { "Delete workspace?" } else { "Close workspace?" },
+                "Nothing was stopped or deleted. Run in a terminal to confirm, or use --yes to accept the preview.",
+            )?
+        {
+            return Ok(());
+        }
+    }
+    s.request(request(workspace, Some(revision)))?;
+    println!(
+        "{}",
+        if delete {
+            "Workspace deleted. Use `kraal workspaces --deleted` to restore it."
+        } else {
+            "Workspace closed. The layout is kept."
+        }
+    );
+    Ok(())
 }
 
 fn print_workspaces(list: &[protocol::WorkspaceInfo], json: bool) -> Result<()> {

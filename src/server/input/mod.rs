@@ -105,6 +105,15 @@ impl Server {
     /// Act on one thing a client typed: whether it only went to programs, changing nothing on
     /// screen until they answer.
     fn client_event(&mut self, id: ClientId, ev: InputEvent) -> bool {
+        if !matches!(ev, InputEvent::Mouse(_))
+            && let Some(client) = self.clients.get_mut(&id)
+            && matches!(client.drag, Some(super::ui::Drag::Workspace { .. }))
+        {
+            client.drag = None;
+            if matches!(ev, InputEvent::Key(Key { code: KeyCode::Esc, .. })) {
+                return false;
+            }
+        }
         if let InputEvent::Raw(raw) = &ev
             && (self.keyboard_reply(id, raw) || self.attached_request(id, raw) || self.terminal_reply(id, raw))
         {
@@ -115,6 +124,12 @@ impl Server {
                 let gained = matches!(ev, InputEvent::FocusGained);
                 if let Some(c) = self.clients.get_mut(&id) {
                     c.terminal_focused = gained;
+                    if !gained
+                        && let Mode::Picker(p) = &mut c.mode
+                        && p.drag.take().is_some()
+                    {
+                        p.message = None;
+                    }
                 }
                 if gained {
                     self.mark_seen_focused(id);

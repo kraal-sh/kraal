@@ -42,6 +42,7 @@ mod ui;
 mod workspace_files;
 mod workspace_lifecycle;
 mod workspace_order;
+mod workspace_requests;
 mod workspace_sources;
 mod workspace_ui;
 mod worktrees;

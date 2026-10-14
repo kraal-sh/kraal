@@ -430,7 +430,7 @@ pub(super) fn picker_layout(p: &Picker, screen: Rect) -> PickerLayout {
     };
     let shown = (list.height / row_height).max(1) as usize;
     let selected = if pinned.is_some_and(|(_, i)| i == p.selected) { p.selected.saturating_sub(1) } else { p.selected };
-    let start = selected.saturating_sub(shown.saturating_sub(1));
+    let start = p.drag.as_ref().map_or_else(|| selected.saturating_sub(shown.saturating_sub(1)), |d| d.list_start);
     PickerLayout { area, list, start, row_height, pinned }
 }
 
@@ -501,7 +501,8 @@ pub(super) fn draw_picker(p: &Picker, screen: Rect, buf: &mut Buffer) -> Option<
     let pinned = layout.pinned.map(|(area, i)| (i, p.filtered[i], area.y));
     for (i, idx, y) in visible.chain(pinned) {
         let item = &p.items[idx];
-        let selected = i == p.selected;
+        let selected =
+            p.drag.as_ref().filter(|d| d.moved && p.query.is_empty()).map_or(i == p.selected, |d| d.hover == Some(i));
         let mut spans = vec![Span::raw(pointer(selected))];
         if let Some(s) = item.state {
             spans.push(Span::styled(format!("{} ", t.icon(s)), Style::default().fg(t.state_color(s))));

@@ -461,8 +461,8 @@ impl Server {
                     ConfirmAction::RetryCloseWorkspace(ws) => {
                         return self.ask_close_workspace(id, ws);
                     }
-                    ConfirmAction::ReorderWorkspace { workspace, neighbor, before } => {
-                        return self.reorder_workspace(id, workspace, neighbor, before);
+                    ConfirmAction::ReorderWorkspace { workspace, neighbor, before, order } => {
+                        return self.reorder_workspace_checked(id, workspace, neighbor, before, order);
                     }
                     ConfirmAction::DeleteWorkspace { target, .. } => {
                         let current = self.ask_delete_workspace(target.clone());
@@ -815,12 +815,10 @@ mod tests {
                     let row = (0..36)
                         .find(|&r| matches!(server.sidebar_hit(client, r), Some(SideItem::Workspace(w)) if w == ws))
                         .unwrap();
+                    let press = MouseEvent { kind: MouseKind::Press(MouseButton::Left), col: 2, row, mods: Mods::NONE };
+                    assert!(server.on_mouse(client, press, false).is_none());
                     server
-                        .on_mouse(
-                            client,
-                            MouseEvent { kind: MouseKind::Press(MouseButton::Left), col: 2, row, mods: Mods::NONE },
-                            false,
-                        )
+                        .on_mouse(client, MouseEvent { kind: MouseKind::Release(MouseButton::Left), ..press }, false)
                         .unwrap()
                 }
                 _ => server.empty_workspace_enter(client),

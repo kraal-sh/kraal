@@ -75,6 +75,8 @@ programs and background jobs, and keeps its current layout as **Closed**.
 
 **Move up** and **Move down** are in the workspace's Tab actions, with no direct shortcut.
 They keep the row selected and leave each terminal's workspace and pane focus unchanged.
+Dragging a workspace row in the list or sidebar uses the same saved order. A click opens on
+release; a drag only reorders. Release outside workspace rows or press Esc to cancel.
 The order is shared and saved automatically. While searching, choose **Clear search to reorder**
 first; it keeps the selected row. See [Reordering workspaces](workspaces.md#reordering-workspaces).
 
