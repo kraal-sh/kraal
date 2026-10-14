@@ -1116,6 +1116,7 @@ impl Server {
             } else {
                 Duration::ZERO
             };
+            self.yield_before_poll(rx, timeout, std::thread::yield_now);
             if !self.event_phase(rx, rx.wait(timeout)) {
                 break;
             }
@@ -1143,6 +1144,24 @@ impl Server {
             }
         }
         Ok(())
+    }
+
+    fn yield_before_poll(&self, rx: &EventReceiver, timeout: Duration, mut yield_now: impl FnMut()) {
+        if !timeout.is_zero() || self.ready.is_empty() || self.ready_set.len() <= 2 {
+            return;
+        }
+        // On a scarce CPU, the client and pane readers carrying a key and its echo need
+        // to run between output passes. Before #80, an expired recv_timeout yielded up
+        // to four times. On 2026-10-14, release compare.rs with 16 panes on one CPU
+        // measured 2.82 -> 1.79 ms with 15 floods after restoring these yields.
+        // Count active and watched panes: one flood plus its echo stays on the fast
+        // path, preserving #80's one-flood CPU gain and 0.074/0.082 ms key latency.
+        for _ in 0..4 {
+            if !rx.is_idle() {
+                break;
+            }
+            yield_now();
+        }
     }
 
     fn event_phase(&mut self, rx: &EventReceiver, first: Wait) -> bool {
@@ -2237,6 +2256,68 @@ mod tests {
             run_logs: crossbeam_channel::unbounded().0,
         }
     }
+    #[test]
+    fn output_poll_yields_only_with_more_than_two_active_or_watched_panes() {
+        for (ready, watched, expected) in [(0, 0, 0), (0, 3, 0), (1, 0, 0), (2, 0, 0), (1, 1, 0), (3, 0, 4), (1, 2, 4)]
+        {
+            for timeout in [Duration::ZERO, Duration::from_millis(1)] {
+                let (tx, rx) = queue::channel(1);
+                let mut server = server(tx);
+                server.ready.extend(0..ready);
+                server.watched.extend(ready..ready + watched);
+                server.ready_set.extend(0..ready + watched);
+                let mut yields = 0;
+                server.yield_before_poll(&rx, timeout, || yields += 1);
+                assert_eq!(
+                    yields,
+                    if timeout.is_zero() { expected } else { 0 },
+                    "ready={ready}, watched={watched}, timeout={timeout:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn output_poll_stops_yielding_as_soon_as_an_event_or_overflow_waits() {
+        for overflow in [false, true] {
+            for after in 0..=4 {
+                let (tx, rx) = queue::channel(1);
+                let mut server = server(tx);
+                server.ready.extend(0..3);
+                server.ready_set.extend(0..3);
+                let publish = || {
+                    assert!(server.tx.wake());
+                    if overflow {
+                        assert!(server.tx.pane_ready(9));
+                        assert!(matches!(rx.try_recv(), Ok(Event::Wake)));
+                    }
+                };
+                if after == 0 {
+                    publish();
+                }
+                let mut yields = 0;
+                server.yield_before_poll(&rx, Duration::ZERO, || {
+                    yields += 1;
+                    if yields == after {
+                        publish();
+                    }
+                });
+                assert_eq!(yields, after);
+                // Yielding must leave the event or token for the ordinary event phase.
+                let first = rx.wait(Duration::ZERO);
+                if overflow {
+                    assert!(matches!(first, Wait::Overflow));
+                    let notifications = rx.reconcile(true);
+                    assert!(notifications.panes);
+                    assert!(!notifications.wake);
+                } else {
+                    assert!(matches!(first, Wait::Event(Event::Wake)));
+                }
+                assert!(matches!(rx.wait(Duration::ZERO), Wait::Timeout));
+            }
+        }
+    }
+
     #[test]
     fn a_folded_pane_opens_when_it_gets_the_focus() {
         let mut tab = Tab::new(1, String::new());
