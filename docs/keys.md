@@ -313,7 +313,12 @@ that do not support bracketed paste. No key is assigned by default; custom bindi
 Send, Always, Text and Cancel choices. Tab or arrows select, Enter activates, and a click also
 activates a choice. Ctrl+C or Esc cancels the choice; Ctrl+C cancels a transfer.
 **Attach clipboard image** names the target and asks for local Enter before reading the clipboard.
-No default shortcut changes Ctrl+V. For example, to bind the image action after the leader:
+With `attach --host`, Ctrl+V in a recognized agent pane offers the laptop clipboard image,
+then pastes its server path after sending. The first image asks Send, Always for SERVER or Cancel.
+Send permits later images during this attachment; Always remembers that server. Cancel sends
+nothing, including the key. Without an image, in a pane without an agent, or in a local session,
+Ctrl+V is unchanged. Clipboard content is not read when the type check finds no image.
+For example, to bind the explicit image action after the leader:
 
 ```toml config
 [keys.leader]

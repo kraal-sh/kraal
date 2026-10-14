@@ -1,4 +1,4 @@
-//! Clipboard reads require a local confirmation and share the attachment worker's cancellation.
+//! Clipboard reads follow a local gesture and share the attachment worker's cancellation.
 
 use std::fs;
 use std::os::unix::fs::DirBuilderExt;
@@ -88,6 +88,108 @@ fn read_commands(commands: Vec<Command>, cancelled: &AtomicBool) -> Result<Vec<u
     Err(error.context("Cannot read clipboard image (wl-paste or xclip required)"))
 }
 
+// Inspect only advertised types: ordinary Ctrl+V must never read clipboard content.
+pub(super) fn available() -> bool {
+    advertised(probes(), &AtomicBool::new(false))
+}
+
+fn advertised(commands: Vec<Command>, cancelled: &AtomicBool) -> bool {
+    for mut command in commands {
+        if let Ok(types) = run(&mut command, cancelled, 16 * 1024, TIMEOUT) {
+            return offers_image(&String::from_utf8_lossy(&types));
+        }
+        if cancelled.load(Ordering::SeqCst) {
+            break;
+        }
+    }
+    false
+}
+
+#[cfg(not(target_os = "macos"))]
+fn probes() -> Vec<Command> {
+    probe_commands(|key| std::env::var_os(key).is_some_and(|v| !v.is_empty()))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn probe_commands(present: impl Fn(&str) -> bool) -> Vec<Command> {
+    let mut commands = Vec::new();
+    if present("WAYLAND_DISPLAY") {
+        let mut command = Command::new("wl-paste");
+        command.arg("--list-types");
+        commands.push(command);
+    }
+    if present("DISPLAY") {
+        let mut command = Command::new("xclip");
+        command.args(["-selection", "clipboard", "-out", "-target", "TARGETS"]);
+        commands.push(command);
+    }
+    commands
+}
+
+#[cfg(target_os = "macos")]
+fn probes() -> Vec<Command> {
+    let mut command = Command::new("osascript");
+    command.args(["-e", "clipboard info"]);
+    vec![command]
+}
+
+fn offers_image(types: &str) -> bool {
+    #[cfg(not(target_os = "macos"))]
+    {
+        types.lines().any(|line| line.trim() == "image/png")
+    }
+    #[cfg(target_os = "macos")]
+    {
+        ["PNGf", "TIFF", "JPEG", "GIFf", "PICT"].iter().any(|kind| types.contains(kind))
+    }
+}
+
+#[derive(Default)]
+pub(super) struct Keys {
+    parser: crate::input::InputParser,
+    raw: Vec<u8>,
+}
+
+impl Keys {
+    pub fn pending(&self) -> bool {
+        !self.raw.is_empty()
+    }
+
+    pub fn feed(&mut self, bytes: &[u8]) -> Vec<(Vec<u8>, bool)> {
+        use crate::input::{InputEvent, KeyCode, Mods};
+        let mut parts = Vec::new();
+        for index in 0..bytes.len().max(1) {
+            let events = if bytes.is_empty() {
+                self.parser.flush()
+            } else {
+                self.raw.push(bytes[index]);
+                self.parser.feed(&bytes[index..=index])
+            };
+            for event in &events {
+                if let InputEvent::Key(key) = event
+                    && key.code == KeyCode::Char('v')
+                    && key.mods == Mods::CTRL
+                    && self.raw.ends_with(&key.raw)
+                {
+                    let key_bytes = self.raw.split_off(self.raw.len() - key.raw.len());
+                    if !self.raw.is_empty() {
+                        parts.push((std::mem::take(&mut self.raw), false));
+                    }
+                    parts.push((key_bytes, true));
+                }
+            }
+            if (!events.is_empty() || !self.parser.has_pending()) && !self.raw.is_empty() {
+                if let Some((raw, false)) = parts.last_mut() {
+                    raw.append(&mut self.raw);
+                } else {
+                    parts.push((std::mem::take(&mut self.raw), false));
+                }
+            }
+        }
+        parts
+    }
+}
+
 pub(super) fn read(cancelled: &AtomicBool) -> Result<Image> {
     let image = Image::new()?;
     #[cfg(not(target_os = "macos"))]
@@ -161,6 +263,68 @@ mod tests {
         let mut command = Command::new("sh");
         command.args(["-c", script]);
         command
+    }
+
+    #[test]
+    fn control_v_is_a_local_key_not_paste_data_or_a_terminal_response() {
+        for key in [b"\x16".as_slice(), b"\x1b[118;5u", b"\x1b[118;5:1u", b"\x1b[118:86:118;5:2u"] {
+            let input = [b"before".as_slice(), key, b"after"].concat();
+            for split in 0..=input.len() {
+                let mut parser = Keys::default();
+                let mut parts = parser.feed(&input[..split]);
+                parts.extend(parser.feed(&input[split..]));
+                assert_eq!(parts.iter().filter(|(_, image)| *image).count(), 1, "split {split}");
+                assert_eq!(parts.iter().find(|(_, image)| *image).unwrap().0, key);
+                assert_eq!(parts.into_iter().flat_map(|(raw, _)| raw).collect::<Vec<_>>(), input);
+            }
+        }
+        for input in [
+            b"\x1b[200~\x16\x1b[118;5u\x1b[201~".as_slice(),
+            b"\x1b]52;c;\x16\x07",
+            b"\x1b[118;5:3u",
+            b"\x1b[118;7u",
+            b"\x1b[118;6u",
+        ] {
+            let mut parser = Keys::default();
+            let parts: Vec<_> = input.iter().flat_map(|b| parser.feed(&[*b])).collect();
+            assert!(parts.iter().all(|(_, image)| !image));
+            assert_eq!(parts.into_iter().flat_map(|(raw, _)| raw).collect::<Vec<_>>(), input);
+        }
+        let mut parser = Keys::default();
+        assert!(parser.feed(b"\x1b").is_empty());
+        assert!(parser.pending());
+        assert_eq!(parser.feed(&[]), [(b"\x1b".to_vec(), false)]);
+        assert!(!parser.pending());
+    }
+
+    #[test]
+    fn advertised_types_do_not_read_text_or_fall_back_from_a_text_clipboard() {
+        let stop = AtomicBool::new(false);
+        assert!(!advertised(vec![shell("printf 'text/plain\\nUTF8_STRING\\n'"), shell("exit 99")], &stop));
+        #[cfg(not(target_os = "macos"))]
+        let image = "printf 'text/plain\\nimage/png\\n'";
+        #[cfg(target_os = "macos")]
+        let image = "printf '«class PNGf», 128, «class utf8», 7'";
+        assert!(advertised(vec![shell("exit 1"), shell(image)], &stop));
+        assert!(!advertised(vec![shell("printf text"), shell(image)], &stop));
+        assert!(!advertised(Vec::new(), &stop));
+        #[cfg(not(target_os = "macos"))]
+        {
+            let commands = probe_commands(|_| true);
+            assert_eq!(commands[0].get_program(), "wl-paste");
+            assert_eq!(commands[0].get_args().collect::<Vec<_>>(), ["--list-types"]);
+            assert_eq!(commands[1].get_program(), "xclip");
+            assert_eq!(
+                commands[1].get_args().collect::<Vec<_>>(),
+                ["-selection", "clipboard", "-out", "-target", "TARGETS"]
+            );
+            assert!(probe_commands(|_| false).is_empty());
+        }
+        #[cfg(target_os = "macos")]
+        {
+            assert_eq!(probes()[0].get_program(), "osascript");
+            assert_eq!(probes()[0].get_args().collect::<Vec<_>>(), ["-e", "clipboard info"]);
+        }
     }
 
     #[test]

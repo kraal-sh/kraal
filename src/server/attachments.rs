@@ -21,6 +21,8 @@ pub(super) struct Attachments {
     pub negotiated: bool,
     pub recognition: bool,
     pub images: bool,
+    pub agent_clipboard: bool,
+    pub focus: Option<(Option<PaneId>, bool)>,
     pub pending: Option<Pending>,
     pub blocked: Option<String>,
 }
@@ -109,6 +111,19 @@ impl Worker {
 }
 
 impl Server {
+    pub(super) fn clipboard_focus(&self, id: ClientId) -> Option<(Option<PaneId>, bool)> {
+        let client = self.clients.get(&id)?;
+        if !client.attachments.agent_clipboard {
+            return None;
+        }
+        let pane = self.client_focus(id);
+        let agent = matches!(client.mode, Mode::Normal)
+            && pane
+                .and_then(|pane| self.panes.get(&pane))
+                .is_some_and(|pane| pane.agent.kind.is_some() && pane.exit_code.is_none() && !pane.shell_waiting());
+        Some((pane, agent))
+    }
+
     pub(super) fn offer_attachments(&mut self, id: ClientId, confirmed: Option<PaneId>) -> Mode {
         self.offer_attachment(id, confirmed, false)
     }
@@ -310,8 +325,30 @@ impl Server {
         {
             return;
         }
-        if let ClientMsg::AttachmentRequest { token, text, image } = msg {
+        if let ClientMsg::AttachmentRequest { token, text, image, pane } = msg {
             if image && !self.clients[&id].attachments.images {
+                return;
+            }
+            if !attachments::token_valid(&token) || text.len() > 64 * 1024 {
+                return;
+            }
+            if let Some(pane) = pane
+                && (!image
+                    || !self.clients[&id].attachments.agent_clipboard
+                    || self.clipboard_focus(id) != Some((Some(pane), true)))
+            {
+                // The request occupies the original key's place on the input wire. Replay it
+                // here, before later typing, when the client's focus information was stale.
+                self.client_input(id, &text);
+                self.send_msg(
+                    id,
+                    &ServerMsg::AttachmentResult {
+                        kind: NoticeKind::Notice,
+                        token,
+                        pasted: true,
+                        message: String::new(),
+                    },
+                );
                 return;
             }
             self.request_attachment(id, token, text, image);
@@ -644,17 +681,24 @@ mod tests {
     };
 
     fn setup(name: &str) -> (Server, ClientId, std::os::unix::net::UnixStream, PaneId, queue::EventReceiver) {
+        let _batch = crate::pane::batch();
+        setup_command(name, vec!["true".into()])
+    }
+
+    fn setup_command(
+        name: &str,
+        command: Vec<String>,
+    ) -> (Server, ClientId, std::os::unix::net::UnixStream, PaneId, queue::EventReceiver) {
         let (tx, rx) = queue::channel(4096);
         let mut server = server(tx);
         server.session = format!("attachment-{name}");
         let (id, peer) = client(&mut server);
         let ws = server.clients[&id].workspace;
-        let _batch = crate::pane::batch();
         let pane = server
             .spawn_pane_in(
                 ws,
                 None,
-                crate::pane::PaneSpec { command: vec!["true".into()], ..Default::default() },
+                crate::pane::PaneSpec { command, ..Default::default() },
                 crate::protocol::Placement::Tab,
                 None,
             )
@@ -663,6 +707,14 @@ mod tests {
         c.remote = true;
         c.attachments.negotiated = true;
         (server, id, peer, pane, rx)
+    }
+
+    fn wait_for_program(server: &Server, pane: PaneId, program: &str) {
+        let start = Instant::now();
+        while server.panes[&pane].foreground_argv().is_none_or(|argv| argv.first().is_none_or(|p| p != program)) {
+            assert!(start.elapsed() < crate::testing::PATIENCE, "{program} never reached the foreground");
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 
     fn settle(server: &mut Server, rx: &queue::EventReceiver) {
@@ -703,6 +755,156 @@ mod tests {
             ClientMsg::AttachmentChunk { token: token.into(), file: 0, offset: 0, data: "YWJj".into() },
         );
         settle(server, rx);
+    }
+
+    #[test]
+    fn a_shortcut_reserves_the_advertised_agent_or_refuses_before_reading() {
+        let (mut server, id, _peer, pane, _rx) = setup_command("shortcut-target", vec!["cat".into()]);
+        wait_for_program(&server, pane, "cat");
+        server.clients.get_mut(&id).unwrap().attachments.images = true;
+        let request =
+            |pane| ClientMsg::AttachmentRequest { token: "ab".into(), text: Vec::new(), image: true, pane: Some(pane) };
+        for phase in ["old", "shell", "wrong", "form", "agent"] {
+            server.clients.get_mut(&id).unwrap().attachments.agent_clipboard = phase != "old";
+            server.panes.get_mut(&pane).unwrap().agent.kind = (phase != "shell").then(|| "claude".into());
+            server.clients.get_mut(&id).unwrap().mode = if phase == "form" {
+                Mode::Prompt(super::super::ui::Prompt::new("Path", "", super::super::ui::PromptAction::OpenPreview))
+            } else {
+                Mode::Normal
+            };
+            server.attachment_message(id, request(if phase == "wrong" { pane + 100 } else { pane }));
+            if phase == "agent" {
+                assert_eq!(server.clients[&id].attachments.pending.as_ref().unwrap().pane, pane);
+            } else {
+                assert!(server.clients[&id].attachments.pending.is_none());
+            }
+        }
+        assert!(!attachments::directory(&server.session).exists());
+    }
+
+    #[test]
+    fn focus_updates_are_negotiated_and_follow_agent_mode_and_pane_changes() {
+        let (mut server, id, _peer, pane, _events) = setup_command("agent-focus", vec!["cat".into()]);
+        wait_for_program(&server, pane, "cat");
+        assert_eq!(server.clipboard_focus(id), None, "older clients receive no new message");
+        server.clients.get_mut(&id).unwrap().attachments.agent_clipboard = true;
+        assert_eq!(server.clipboard_focus(id), Some((Some(pane), false)));
+        for agent in ["claude", "codex"] {
+            server.panes.get_mut(&pane).unwrap().agent.kind = Some(agent.into());
+            assert_eq!(server.clipboard_focus(id), Some((Some(pane), true)));
+            server.clients.get_mut(&id).unwrap().mode =
+                Mode::Prompt(super::super::ui::Prompt::new("Path", "", super::super::ui::PromptAction::OpenPreview));
+            assert_eq!(server.clipboard_focus(id), Some((Some(pane), false)));
+            server.clients.get_mut(&id).unwrap().mode = Mode::Normal;
+            assert_eq!(server.clipboard_focus(id), Some((Some(pane), true)));
+            server.panes.get_mut(&pane).unwrap().agent.kind = None;
+            assert_eq!(server.clipboard_focus(id), Some((Some(pane), false)));
+        }
+        server.panes.get_mut(&pane).unwrap().agent.kind = Some("claude".into());
+        server.panes.get_mut(&pane).unwrap().exit_code = Some(Some(0));
+        assert_eq!(server.clipboard_focus(id), Some((Some(pane), false)), "an exited agent is not eligible");
+        let ws = server.clients[&id].workspace;
+        let _batch = crate::pane::batch();
+        let other = server
+            .spawn_pane_in(
+                ws,
+                None,
+                crate::pane::PaneSpec { command: vec!["true".into()], ..Default::default() },
+                crate::protocol::Placement::Tab,
+                None,
+            )
+            .unwrap();
+        assert_eq!(server.clipboard_focus(id), Some((Some(other), false)));
+    }
+
+    #[test]
+    fn a_suspended_hooked_agent_refreshes_focus_and_cannot_reserve_the_shell() {
+        let (mut server, id, _peer, pane, _events) = setup_command("suspended-agent", vec!["sh".into()]);
+        wait_for_program(&server, pane, "sh");
+        server.panes.get_mut(&pane).unwrap().write_input(b"sleep 60\n".to_vec());
+        wait_for_program(&server, pane, "sleep");
+        let agent = &mut server.panes.get_mut(&pane).unwrap().agent;
+        agent.kind = Some("claude".into());
+        agent.hooked = true;
+        let client = server.clients.get_mut(&id).unwrap();
+        client.attachments.agent_clipboard = true;
+        client.attachments.images = true;
+        assert_eq!(server.clipboard_focus(id), Some((Some(pane), true)));
+        server.render_clients();
+        assert_eq!(server.clients[&id].attachments.focus, Some((Some(pane), true)));
+
+        server.panes.get_mut(&pane).unwrap().write_input(vec![0x1a]);
+        wait_for_program(&server, pane, "sh");
+        server.clients.get_mut(&id).unwrap().dirty = super::super::Dirty::No;
+        server.tick(Instant::now());
+        assert_eq!(server.panes[&pane].agent.kind.as_deref(), Some("claude"));
+        assert!(server.panes[&pane].agent.hooked);
+        assert_eq!(server.clipboard_focus(id), Some((Some(pane), false)));
+        assert_eq!(server.clients[&id].dirty, super::super::Dirty::Yes);
+        server.render_clients();
+        assert_eq!(server.clients[&id].attachments.focus, Some((Some(pane), false)));
+        server.attachment_message(
+            id,
+            ClientMsg::AttachmentRequest { token: "ab".into(), text: vec![0x16], image: true, pane: Some(pane) },
+        );
+        assert!(server.clients[&id].attachments.pending.is_none());
+        assert!(server.clients[&id].attachments.blocked.is_none());
+        assert!(!attachments::directory(&server.session).exists());
+
+        // Ctrl+V in the shell quotes the next byte; finish that quoted input before resuming.
+        server.panes.get_mut(&pane).unwrap().write_input(b"\nfg\n".to_vec());
+        wait_for_program(&server, pane, "sleep");
+        server.clients.get_mut(&id).unwrap().dirty = super::super::Dirty::No;
+        server.tick(Instant::now());
+        assert_eq!(server.clients[&id].dirty, super::super::Dirty::Yes);
+        assert_eq!(server.clipboard_focus(id), Some((Some(pane), true)));
+    }
+
+    #[test]
+    fn stale_shortcut_requests_replay_the_key_in_copy_mode_before_following_input() {
+        for key in [b"\x16".as_slice(), b"\x1b[118;5u"] {
+            let (mut server, id, mut peer, pane, _events) = setup_command("shortcut-copy", vec!["cat".into()]);
+            wait_for_program(&server, pane, "cat");
+            server.clients.get_mut(&id).unwrap().attachments.agent_clipboard = true;
+            server.clients.get_mut(&id).unwrap().attachments.images = true;
+            server.panes.get_mut(&pane).unwrap().agent.kind = Some("claude".into());
+            assert_eq!(server.clipboard_focus(id), Some((Some(pane), true)));
+            server.client_input(id, b"\x02v");
+            assert!(server.panes[&pane].in_copy_mode());
+            server.attachment_message(
+                id,
+                ClientMsg::AttachmentRequest { token: "ab".into(), text: key.to_vec(), image: true, pane: Some(pane) },
+            );
+            let term = server.panes[&pane].term().unwrap();
+            assert_eq!(term.term.selection.as_ref().unwrap().ty, alacritty_terminal::selection::SelectionType::Block);
+            let before = term.term.vi_mode_cursor.point;
+            server.client_input(id, b"l");
+            assert_eq!(server.panes[&pane].term().unwrap().term.vi_mode_cursor.point.column.0, before.column.0 + 1);
+            assert!(server.clients[&id].attachments.pending.is_none());
+            assert!(server.clients[&id].attachments.blocked.is_none());
+            assert!(server.clients[&id].toast.is_none());
+            let (reply, received) = crossbeam_channel::bounded(1);
+            std::thread::spawn(move || {
+                // Entering and leaving the leader menu updates the terminal's keyboard mode.
+                for bytes in [b"\x1b[=29;1u\x1b[?u".as_slice(), b"\x1b[=5;1u"] {
+                    assert_eq!(
+                        crate::protocol::read_frame(&mut peer).unwrap().unwrap(),
+                        (crate::protocol::BYTES, bytes.to_vec())
+                    );
+                }
+                let _ = reply.send(crate::protocol::read_frame(&mut peer));
+            });
+            let (kind, bytes) = received.recv_timeout(crate::testing::PATIENCE).unwrap().unwrap().unwrap();
+            assert_eq!(kind, crate::protocol::JSON);
+            let ServerMsg::AttachmentResult { token, pasted, message, kind } = serde_json::from_slice(&bytes).unwrap()
+            else {
+                panic!("the shortcut must acknowledge its fallback");
+            };
+            assert_eq!(token, "ab");
+            assert!(pasted);
+            assert!(message.is_empty());
+            assert_eq!(kind, NoticeKind::Notice);
+        }
     }
 
     #[test]
@@ -754,7 +956,7 @@ mod tests {
     fn image_retry_reserves_its_kind_and_completes_locally() {
         let (mut server, id, _peer, pane, rx) = setup("image-retry");
         server.clients.get_mut(&id).unwrap().remote = false;
-        let request = || ClientMsg::AttachmentRequest { token: "ab".into(), text: Vec::new(), image: true };
+        let request = || ClientMsg::AttachmentRequest { token: "ab".into(), text: Vec::new(), image: true, pane: None };
         server.attachment_message(id, request());
         assert!(server.clients[&id].attachments.pending.is_none(), "images need their capability");
         server.clients.get_mut(&id).unwrap().attachments.images = true;
@@ -790,7 +992,8 @@ mod tests {
     fn pasted_path_reservation_needs_negotiation_and_text_keeps_the_original_target() {
         let (mut server, id, _peer, pane, _rx) = setup("pasted-text");
         let original = b"  '/laptop/notes client.txt'  \n";
-        let request = || ClientMsg::AttachmentRequest { token: "ab".into(), text: original.to_vec(), image: false };
+        let request =
+            || ClientMsg::AttachmentRequest { token: "ab".into(), text: original.to_vec(), image: false, pane: None };
         server.attachment_message(id, request());
         assert!(server.clients[&id].attachments.pending.is_none());
         server.clients.get_mut(&id).unwrap().attachments.recognition = true;
@@ -916,7 +1119,7 @@ mod tests {
             Mode::Prompt(super::super::ui::Prompt::new("Path", "", super::super::ui::PromptAction::OpenPreview));
         server.attachment_message(
             id,
-            ClientMsg::AttachmentRequest { token: "ab".into(), text: b"/laptop/a".to_vec(), image: false },
+            ClientMsg::AttachmentRequest { token: "ab".into(), text: b"/laptop/a".to_vec(), image: false, pane: None },
         );
         assert!(server.clients[&id].attachments.pending.is_none());
         assert!(matches!(&server.clients[&id].mode, Mode::Prompt(prompt) if prompt.value == "/laptop/a"));

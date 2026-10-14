@@ -14024,6 +14024,129 @@ fn clipboard_images_use_local_private_storage_and_host_attachment_transport() {
 
 #[cfg(unix)]
 #[test]
+fn host_control_v_sends_agent_images_and_preserves_shell_local_and_text_clipboards() {
+    use std::io::Write;
+    let local = Env::new("image-key-client");
+    let server = Env::new("image-key-server");
+    let input = server.root.join("input");
+    let script = format!("stty raw -echo; echo READY; exec cat > '{}'", input.display());
+    server.workspace("w", &format!("layout {{ pane name=\"main\" command=\"sh\" {{ args \"-c\" {script:?}; }} }}"));
+    server.run(&["open", "w"]);
+    server.wait_for_text("main", "READY");
+    let (_, path) = fake_ssh(&local, &server);
+    let png = local.root.join("source.png");
+    image::RgbaImage::new(2, 2).save(&png).unwrap();
+    let types = local.root.join("types");
+    let log = local.root.join("clipboard-calls");
+    #[cfg(not(target_os = "macos"))]
+    let (tool, image_types, script) = (
+        "wl-paste",
+        "image/png\n",
+        format!(
+            "#!/bin/sh\nif [ \"$1\" = --list-types ]; then echo types >> '{}'; cat '{}'; else echo image >> '{}'; cat '{}'; fi\n",
+            log.display(),
+            types.display(),
+            log.display(),
+            png.display()
+        ),
+    );
+    #[cfg(target_os = "macos")]
+    let (tool, image_types, script) = (
+        "osascript",
+        "«class PNGf», 80\n",
+        format!(
+            "#!/bin/sh\nif [ \"$2\" = 'clipboard info' ]; then echo types >> '{}'; cat '{}'; else echo image >> '{}'; for arg; do file=$arg; done; cat '{}' > \"$file\"; fi\n",
+            log.display(),
+            types.display(),
+            log.display(),
+            png.display()
+        ),
+    );
+    write_script(&local.root.join("bin").join(tool), &script);
+    std::fs::write(&types, image_types).unwrap();
+    std::fs::write(local.root.join("config/kraal/servers.toml"), "[[server]]\nname='box'\nhost='image-key.invalid'\n")
+        .unwrap();
+    let attach = |remote: bool| {
+        let mut command = if remote {
+            local.isolated(Path::new(env!("CARGO_BIN_EXE_kraal")))
+        } else {
+            server.isolated(Path::new(env!("CARGO_BIN_EXE_kraal")))
+        };
+        command.args(["-s", &server.session, "attach"]);
+        if remote {
+            command.args(["--host", "box"]);
+        }
+        command.arg("w").env("PATH", &path).env("WAYLAND_DISPLAY", "test").env_remove("DISPLAY");
+        let client = TerminalClient::start(command);
+        client.wait_for("READY");
+        client
+    };
+    let received = || std::fs::read(&input).unwrap_or_default();
+    let mut client = attach(true);
+    client.type_keys(b"\x16shell");
+    wait_until(PATIENCE, "shell receives Ctrl+V", || received() == b"\x16shell");
+    assert!(!log.exists(), "shell panes do not inspect the clipboard");
+    client.type_keys(b"\x02d");
+    assert_eq!(client.left("shell detach").0, 0);
+
+    let mut hook = server.cmd(&["hook", "claude"]);
+    hook.env("KRAAL_PANE", "main")
+        .env("KRAAL_SOCKET", server.root.join("run/kraal").join(format!("{}.sock", server.session)))
+        .stdin(std::process::Stdio::piped());
+    let mut child = hook.spawn().unwrap();
+    child.stdin.take().unwrap().write_all(br#"{"hook_event_name":"SessionStart","session_id":"image-key"}"#).unwrap();
+    assert!(child.wait().unwrap().success());
+    assert!(server.run(&["agents"]).contains("claude"));
+
+    let mut client = attach(false);
+    client.type_keys(b"\x16local");
+    wait_until(PATIENCE, "local agent receives Ctrl+V", || received() == b"\x16shell\x16local");
+    assert!(!log.exists(), "local sessions do not inspect the clipboard");
+    client.type_keys(b"\x02d");
+    assert_eq!(client.left("local detach").0, 0);
+
+    std::fs::write(&types, "text/plain\n").unwrap();
+    let mut client = attach(true);
+    client.type_keys(b"\x16text");
+    wait_until(PATIENCE, "text clipboard forwards Ctrl+V", || received() == b"\x16shell\x16local\x16text");
+    assert_eq!(std::fs::read_to_string(&log).unwrap(), "types\n");
+    std::fs::write(&types, image_types).unwrap();
+    client.type_keys(b"\x16");
+    client.wait_for("Always for box");
+    client.type_keys(b"\t\t\r");
+    client.wait_for("Attachment stopped: cancelled");
+    client.type_keys(b"\rcancelled");
+    wait_until(PATIENCE, "cancel releases typing", || received().ends_with(b"cancelled"));
+    assert_eq!(std::fs::read_to_string(&log).unwrap(), "types\ntypes\n");
+    let before = received();
+    client.type_keys(b"\x1b[118;5u");
+    wait_until(PATIENCE, "second image question", || {
+        text_after(&client.written.lock().unwrap(), 100, 30).iter().any(|row| row.contains("Always for box"))
+    });
+    client.type_keys(b"\t\r");
+    client.wait_for("Sent the image to box");
+    wait_until(PATIENCE, "server image path pasted", || received().ends_with(b"clipboard.png"));
+    let pasted = String::from_utf8(received()[before.len()..].to_vec()).unwrap();
+    assert!(!pasted.contains('\x16'));
+    assert!(!pasted.contains('\n'), "no Enter is added");
+    assert_eq!(std::fs::read(pasted.trim_matches('\'')).unwrap(), std::fs::read(&png).unwrap());
+    let permission = std::fs::read_to_string(local.root.join("config/kraal/paste-files.toml")).unwrap();
+    assert!(permission.contains("[[clipboard_image]]"));
+    client.type_keys(b"\x02d");
+    assert_eq!(client.left("image detach").0, 0);
+    let before = received().len();
+    let mut client = attach(true);
+    client.type_keys(b"\x16");
+    client.wait_for("Sent the image to box");
+    wait_until(PATIENCE, "remembered image path pasted", || received().len() > before);
+    assert!(!String::from_utf8_lossy(&client.written.lock().unwrap()).contains("Send the clipboard image"));
+    assert_eq!(received().iter().filter(|&&b| b == 0x16).count(), 3);
+    client.type_keys(b"\x02d");
+    assert_eq!(client.left("remembered image detach").0, 0);
+}
+
+#[cfg(unix)]
+#[test]
 fn attachment_wire_cancellation_disconnect_and_repeated_finish_do_not_paste_partial_or_duplicate_paths() {
     let env = Env::new("attachment-wire");
     env.workspace(

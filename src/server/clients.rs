@@ -113,6 +113,8 @@ impl Server {
                     c.attachments.blocked = None;
                     c.remote = remote;
                     c.attachments.negotiated = features.iter().any(|f| f == protocol::ATTACHMENTS.name);
+                    c.attachments.focus = None;
+                    c.attachments.agent_clipboard = features.iter().any(|f| f == protocol::AGENT_CLIPBOARD.name);
                     c.attachments.images = features.iter().any(|f| f == protocol::CLIPBOARD_IMAGES.name);
                     c.attachments.recognition = features.iter().any(|f| f == protocol::PASTED_PATHS.name);
                     c.clipboard.negotiated = features.iter().any(|f| f == protocol::CLIPBOARD.name);

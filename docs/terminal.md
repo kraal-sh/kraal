@@ -252,14 +252,33 @@ keep their kind; older results without a kind use normal text.
 
 ### Clipboard images
 
-Choose **Attach clipboard image** in the command palette. The local question is **Send the
-clipboard image to SERVER?**, with **Send** and **Cancel**. It names the destination pane.
-Press Enter on Send to read the clipboard once and send the image, or Esc or Ctrl+C to cancel. This
-local confirmation prevents a server message from reading your clipboard. Nothing watches the
-clipboard between actions. Ctrl+V and empty bracketed pastes keep their normal behavior.
-An optional `attach_clipboard_image` binding opens the same prompt.
+With `kraal attach --host SERVER`, press Ctrl+V in a pane where kraal recognizes an agent, including
+Claude Code and Codex. The laptop checks the clipboard's advertised types first. If an image is
+available, kraal sends it through the attachment connection and pastes its server path into that
+pane, without adding Enter. The agent can read the image at that path.
 
-Linux tries `wl-paste --no-newline --type image/png` when `WAYLAND_DISPLAY` is set, then
+The first image for a server opens **Send the clipboard image to SERVER?**, with **Send**,
+**Always for SERVER** and **Cancel**. Send allows subsequent Ctrl+V images during this attachment.
+Always also remembers the SSH destination in the laptop's `paste-files.toml`, in separate
+`[[clipboard_image]]` entries beside file-drop permissions. Remove that entry and attach again
+to revoke it. Tab or arrows select a button, Enter or a click activates it. Cancel, Esc or Ctrl+C
+sends neither the image nor Ctrl+V. Broadcasting still asks before sending only to the named pane.
+
+With no image, Ctrl+V goes straight to the pane without reading clipboard content. In a shell,
+an editor, any pane without a recognized agent, or a local session, Ctrl+V is unchanged. Both
+raw Ctrl+V and kitty keyboard presses work. Empty bracketed pastes never trigger an image read.
+Older clients or servers keep their existing Ctrl+V behavior until both support this feature.
+
+**Attach clipboard image** remains available in the palette and pane menu, including in local
+sessions. It names the destination and asks for **Send** or **Cancel** before reading once.
+An optional `attach_clipboard_image` binding opens the same prompt. Only a local key press or
+confirmation can authorize reading the clipboard. Server focus updates cannot trigger a read,
+and nothing watches the clipboard between actions.
+
+Ctrl+V checks `wl-paste --list-types` on Wayland, `xclip -selection clipboard -out -target TARGETS`
+on X11, or `osascript -e 'clipboard info'` on macOS. If the type check is unavailable, the key
+is forwarded unchanged; use **Attach clipboard image** for an explicit read and diagnostic.
+Linux reads PNG using `wl-paste --no-newline --type image/png` when `WAYLAND_DISPLAY` is set, then
 `xclip -selection clipboard -out -target image/png` when `DISPLAY` is set. Install `wl-clipboard`
 or `xclip` for your desktop. macOS uses `osascript` to export the clipboard as PNG into a private
 file. Each helper has a two-second timeout. Missing tools, an unavailable PNG representation,
