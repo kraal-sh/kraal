@@ -1,6 +1,6 @@
 //! The server inventory: every machine you SSH to, with a short name and groups.
 //!
-//! `~/.config/kraal/servers.toml` holds the servers you saved (or that kraal discovered when you
+//! `~/.config/kraal/servers.toml` holds the servers you saved (including accepted discoveries when you
 //! ran `ssh` somewhere). Workspace files and `~/.ssh/config` contribute more, read-only. The
 //! inventory names servers for the SSH picker, `kraal ssh`, `kraal cp` and file panes.
 
@@ -564,7 +564,7 @@ struct File {
 
 const HEADER: &str = "# kraal servers. Each [[server]] needs a name and a host; user, port, jump (ProxyJump),\n\
 # identity, groups, env (\"prod\", \"staging\"…), note and agents (the kraal session there whose\n\
-# agents the sidebar lists) are optional. kraal adds servers here when you ssh somewhere new.\n\n";
+# agents the sidebar lists) are optional. Add servers with + Add server or `kraal servers add`.\n\n";
 
 /// servers.toml as loaded, saved back to the file it came from.
 pub struct Inventory {
@@ -683,6 +683,23 @@ impl Inventory {
         self.insert(server)
     }
 
+    /// Save a form without silently changing its name or replacing another connection.
+    pub fn add_named(&mut self, server: Server) -> Result<(String, bool)> {
+        if !valid_name(&server.name) {
+            bail!("Use letters, digits, hyphens, underscores or periods for Name.");
+        }
+        if let Some(existing) = self.servers.iter().find(|s| s.same_connection(&server)) {
+            return Ok((existing.name.clone(), false));
+        }
+        if self.find_target(&server).is_some() {
+            bail!("This address is saved with different SSH options. Use Edit saved servers.");
+        }
+        if self.get(&server.name).is_some() {
+            bail!("The name {:?} is already used. Choose another name.", server.name);
+        }
+        self.insert(server).map(|name| (name, true))
+    }
+
     /// Add a server under a free name, whatever other entries reach its address.
     fn insert(&mut self, mut server: Server) -> Result<String> {
         if server.host.is_empty() {
@@ -709,11 +726,11 @@ impl Inventory {
     }
 
     /// Have the agents of the kraal session `session` on `s` listed: its entry gets `agents`,
-    /// unless it already names a session (or `none`); a server the inventory does not have is
-    /// added when `add`. Returns the entry's name, if there is one. The entry is the one that
+    /// unless it already names a session (or `none`). Returns the entry's name, if there is
+    /// one; a server the inventory does not have is left unsaved. The entry is the one that
     /// reaches the same account the same way: one of the same name on that machine may be
     /// another account's, and one reached through another key or jump host another machine.
-    pub fn watch_agents(&mut self, s: &Server, session: &str, add: bool) -> Result<Option<String>> {
+    pub fn watch_agents(&mut self, s: &Server, session: &str) -> Option<String> {
         let found = self
             .servers
             .iter()
@@ -723,11 +740,9 @@ impl Inventory {
             Some(i) => {
                 let entry = &mut self.servers[i];
                 entry.agents.get_or_insert_with(|| session.to_string());
-                Ok(Some(entry.name.clone()))
+                Some(entry.name.clone())
             }
-            // Beside an entry for the same address reached otherwise, never in its place.
-            None if add => self.insert(Server { agents: Some(session.to_string()), ..s.clone() }).map(Some),
-            None => Ok(None),
+            None => None,
         }
     }
 
@@ -1322,19 +1337,20 @@ mod tests {
         // Attaching marks the entry, by name or by address; a session already named, or none,
         // stays as written.
         let gpu = inv.get("gpu").unwrap().clone();
-        assert_eq!(inv.watch_agents(&gpu, "main", false).unwrap().as_deref(), Some("gpu"));
+        assert_eq!(inv.watch_agents(&gpu, "main").as_deref(), Some("gpu"));
         assert_eq!(session(&inv, "gpu").as_deref(), Some("main"));
         let db = Server { name: "db.lan".into(), host: "db.lan".into(), ..Default::default() };
-        assert_eq!(inv.watch_agents(&db, "main", false).unwrap().as_deref(), Some("db"));
+        assert_eq!(inv.watch_agents(&db, "main").as_deref(), Some("db"));
         assert_eq!(session(&inv, "db").as_deref(), Some("work"));
         let web = inv.get("web").unwrap().clone();
-        inv.watch_agents(&web, "main", true).unwrap();
+        inv.watch_agents(&web, "main");
         assert_eq!(session(&inv, "web"), None);
-        // A server the inventory does not have is added only when asked.
+        // Watching never adds an unknown server; explicitly save it before watching.
         let new = parse_ssh_args(&argv("ops@build.lan")).unwrap();
-        assert_eq!(inv.watch_agents(&new, "main", false).unwrap(), None);
+        assert_eq!(inv.watch_agents(&new, "main"), None);
         assert_eq!(inv.servers.len(), 3);
-        let name = inv.watch_agents(&new, "main", true).unwrap().unwrap();
+        let name = inv.add(new.clone()).unwrap();
+        assert_eq!(inv.watch_agents(&new, "main").as_deref(), Some(name.as_str()));
         assert_eq!(session(&inv, &name).as_deref(), Some("main"));
         inv.save().unwrap();
         let again = Inventory::load_from(&path).unwrap();
@@ -1353,22 +1369,51 @@ mod tests {
         let known = [Known { server: inv.servers[0].clone(), source: Source::Inventory }];
         let bob = resolve(&known, "bob@gpu.lan").unwrap();
         assert_eq!((bob.name.as_str(), bob.user.as_deref()), ("gpu", Some("bob")));
-        assert_eq!(inv.watch_agents(&bob, "work", false).unwrap(), None);
+        assert_eq!(inv.watch_agents(&bob, "work"), None);
         assert_eq!(inv.get("gpu").unwrap().agents, None, "alice's entry is not bob's");
-        let name = inv.watch_agents(&bob, "work", true).unwrap().unwrap();
+        assert_eq!(inv.servers.len(), 1);
+        let name = inv.add(bob.clone()).unwrap();
+        assert_eq!(inv.watch_agents(&bob, "work").as_deref(), Some(name.as_str()));
         assert_eq!(name, "gpu-bob");
         let added = inv.get(&name).unwrap();
         assert_eq!((added.user.as_deref(), added.agents.as_deref()), (Some("bob"), Some("work")));
         assert_eq!(inv.get("gpu").unwrap().agents, None);
         // The same account through another key may be another machine: an entry of its own too.
         let other = Server { identity: Some("~/.ssh/other".into()), ..inv.get("gpu").unwrap().clone() };
-        assert_eq!(inv.watch_agents(&other, "main", false).unwrap(), None);
+        assert_eq!(inv.watch_agents(&other, "main"), None);
+        assert_eq!(inv.servers.len(), 2);
         assert_eq!(inv.get("gpu").unwrap().agents, None);
         // Alice's own attach marks hers.
         let alice = resolve(&known, "alice@gpu.lan").unwrap();
-        assert_eq!(inv.watch_agents(&alice, "main", false).unwrap().as_deref(), Some("gpu"));
+        assert_eq!(inv.watch_agents(&alice, "main").as_deref(), Some("gpu"));
         assert_eq!(inv.get("gpu").unwrap().agents.as_deref(), Some("main"));
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn form_add_is_idempotent_refuses_name_and_connection_conflicts_and_preserves_old_files() {
+        let mut inv = Inventory::empty();
+        let s = resolve(&[], "admin@db.lan:22").unwrap();
+        assert_eq!(inv.add_named(s.clone()).unwrap(), ("db".into(), true));
+        assert_eq!(inv.add_named(s.clone()).unwrap(), ("db".into(), false));
+        assert!(
+            inv.add_named(Server { host: "elsewhere".into(), ..s.clone() })
+                .unwrap_err()
+                .to_string()
+                .contains("another name")
+        );
+        assert!(
+            inv.add_named(Server { identity: Some("key".into()), ..s.clone() })
+                .unwrap_err()
+                .to_string()
+                .contains("different SSH options")
+        );
+        assert_eq!(inv.servers.len(), 1);
+        assert!(inv.servers[0].same_connection(&s));
+        let text = changed("form-add", |inv| inv.add_named(s).map(drop));
+        assert!(text.starts_with(BY_HAND));
+        assert!(text.contains("tags = [\"blue\"]"));
+        assert!(text.contains("port = 22"));
     }
 
     #[test]
@@ -1425,7 +1470,10 @@ groups = [\"web\"]
         // A server it has already: nothing is written.
         assert_eq!(changed("same", |inv| inv.add(web.clone()).map(drop)), BY_HAND);
         // `kraal attach --host web`: the entry gets `agents`, after its other keys.
-        let text = changed("agents", |inv| inv.watch_agents(&web, "main", true).map(drop));
+        let text = changed("agents", |inv| {
+            assert_eq!(inv.watch_agents(&web, "main").as_deref(), Some("web"));
+            Ok(())
+        });
         assert_eq!(text, format!("{BY_HAND}agents = \"main\"\n"));
         // A server kraal saw, `kraal servers add`, `kraal servers import`: one more entry, last.
         let db = Server {

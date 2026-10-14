@@ -111,6 +111,7 @@ pub enum ConfirmAction {
         existing: Box<crate::accounts::Account>,
         target: Option<crate::accounts::Account>,
     },
+    RetrySsh(PaneId),
     ClosePane(PaneId),
     ApplyPane(Box<super::pane_ui::PaneForm>),
     CloseTab {
@@ -199,6 +200,7 @@ impl ConfirmAction {
             ConfirmAction::ReplaceWorkspaceFile { .. } => "Replace file".into(),
             ConfirmAction::UseExisting { .. } => "Use account".into(),
             ConfirmAction::RemoveAccount(_) => "Remove".into(),
+            ConfirmAction::RetrySsh(_) => "Try again".into(),
             ConfirmAction::ClosePane(_) => "Close pane".into(),
             ConfirmAction::ApplyPane(_) => "Stop and apply".into(),
             ConfirmAction::CloseTab { .. } => "Close tab".into(),
@@ -229,6 +231,10 @@ impl ConfirmAction {
             ConfirmAction::RunBlock { .. } => "Send to the pane".into(),
             ConfirmAction::Production { .. } => "Send".into(),
         }
+    }
+
+    pub fn cancel_label(&self) -> &'static str {
+        if matches!(self, Self::RetrySsh(_)) { "Close" } else { "Cancel" }
     }
 
     /// Production is involved, or the action destroys something.
@@ -307,6 +313,7 @@ pub enum PickAction {
     OpenDefinition(std::path::PathBuf),
     UnavailableDefinition(std::path::PathBuf),
     AddWorkspace,
+    AddServer(Option<Box<crate::servers::Server>>),
     /// A server name or `user@host[:port]`.
     Ssh(String),
     SshGroup(String),
@@ -462,7 +469,9 @@ impl Picker {
             cursor: 0,
             min_items: items.len(),
             two_line: matches!(kind, PickerKind::Accounts | PickerKind::Workspace | PickerKind::DeletedWorkspaces),
-            pinned: items.iter().position(|i| matches!(i.action, PickAction::AddAccount | PickAction::AddWorkspace)),
+            pinned: items.iter().position(|i| {
+                matches!(i.action, PickAction::AddAccount | PickAction::AddWorkspace | PickAction::AddServer(None))
+            }),
             items,
             filtered: Vec::new(),
             selected: 0,
@@ -506,8 +515,9 @@ impl Picker {
         self.cursor = state.cursor;
         if let Some((at, items)) = state.actions {
             self.items = items;
-            self.pinned =
-                self.items.iter().position(|i| matches!(i.action, PickAction::AddAccount | PickAction::AddWorkspace));
+            self.pinned = self.items.iter().position(|i| {
+                matches!(i.action, PickAction::AddAccount | PickAction::AddWorkspace | PickAction::AddServer(None))
+            });
             self.actions = Some(at);
         }
         self.refilter();
@@ -581,7 +591,7 @@ impl Picker {
             (_, A::OpenDefinition(_)) => &[("enter", "Open"), ("", "Delete")],
             (_, A::DeletedWorkspaces) => &[("enter", "View")],
             (_, A::RestoreWorkspace(_)) => &[("enter", "Restore")],
-            (_, A::AddWorkspace) => &[("enter", "Add")],
+            (_, A::AddWorkspace | A::AddServer(_)) => &[("enter", "Add")],
             (K::Runbook, A::Runbook(_)) => &[("enter", "Run"), ("ctrl+e", "Edit")],
             (K::RunbookSteps, A::RunBlock(_)) => &[("enter", "Run step"), ("ctrl+y", "Copy step")],
             (_, A::RunbookList) => &[("enter", "Back to runbooks")],
@@ -652,20 +662,6 @@ impl Picker {
             scored.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
         }
         self.filtered = scored.into_iter().map(|(_, i)| i).collect();
-        if self.kind == PickerKind::Ssh && !self.query.trim().is_empty() && !self.query.contains(' ') {
-            let host = self.query.trim().to_string();
-            if !self.items.iter().any(|it| it.label == host) {
-                self.items.retain(|it| it.detail != "typed");
-                self.items.push(PickItem {
-                    label: host.clone(),
-                    detail: "typed".into(),
-                    action: PickAction::Ssh(host),
-                    state: None,
-                    dim: false,
-                });
-                self.filtered.push(self.items.len() - 1);
-            }
-        }
         if let Some(i) = self.pinned.filter(|&i| i < self.items.len()) {
             self.filtered.push(i);
         }
@@ -686,6 +682,7 @@ impl Picker {
 }
 
 pub enum PromptAction {
+    AddServer,
     RenameTab {
         workspace: u32,
         tab: u32,
@@ -750,7 +747,7 @@ impl PromptAction {
             PromptAction::DuplicateWorkspace(_) => "duplicate",
             PromptAction::OpenPreview => "open",
             PromptAction::ExportWorkspace(_) => "export",
-            PromptAction::ImportWorkspace => "add",
+            PromptAction::ImportWorkspace | PromptAction::AddServer => "add",
             PromptAction::Upload { .. } | PromptAction::UploadPick { .. } => "upload",
             PromptAction::Download => "download",
             PromptAction::Commit { .. } => "commit",
@@ -772,6 +769,7 @@ pub struct Prompt {
     pub scroll: usize,
     /// What is typed is not shown (a secret).
     pub masked: bool,
+    pub server_form: Option<Box<super::server_ui::ServerForm>>,
     pub workspace_form: Option<Box<super::workspace_ui::WorkspaceForm>>,
 }
 
@@ -781,6 +779,8 @@ impl Prompt {
             title: title.into(),
             value: value.into(),
             cursor: value.chars().count(),
+            server_form: matches!(action, PromptAction::AddServer)
+                .then(|| Box::new(super::server_ui::ServerForm::default())),
             workspace_form: matches!(
                 action,
                 PromptAction::NewWorkspace

@@ -34,6 +34,7 @@ pub mod remote;
 mod render;
 mod requests;
 pub mod runbooks;
+mod server_ui;
 mod ssh;
 mod tools;
 mod ui;
@@ -530,7 +531,7 @@ pub struct Server {
     /// Servers from the inventory, workspaces and ~/.ssh/config.
     pub known_servers: Vec<crate::servers::Known>,
     /// ssh destinations already looked at for auto-adding.
-    discovered: std::collections::HashSet<String>,
+    discovered: Vec<crate::servers::Server>,
     pub accounts: crate::accounts::Accounts,
     existing_checks: HashMap<String, agents::ExistingCheck>,
     /// Name of the workspace whose definition is being started (for account rules).

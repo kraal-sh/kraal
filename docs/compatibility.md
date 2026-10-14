@@ -78,6 +78,14 @@ unconfirmed replacements, including unchanged sources; old servers retain their 
 No new session format is introduced. Imported source bytes and export listing exclusions use
 existing version 2 fields, leaving all legacy state paths untouched.
 
+Add server uses the existing attached-terminal input protocol and the existing `servers.toml`
+format. Saving is separate from SSH. The `auto_add` configuration key still reads as a boolean;
+on a current server it controls discovery suggestions, which require explicit addition.
+Previously saved servers, including the `discovered` group, keep working without migration.
+Remote attach still marks an existing matching entry for agent watching, but suggests an
+explicit save for an unknown connection. Older running servers keep their existing discovery
+behavior until restarted. No session format or legacy state path changes are needed.
+
 ## For contributors: how the protocol changes
 
 The client and the server exchange JSON messages (`src/protocol.rs`, whose comments hold the

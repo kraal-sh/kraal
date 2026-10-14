@@ -42,8 +42,8 @@ workspace_dirs = []
 ssh_config_hosts = true
 
 [servers]
-# Remember servers you ssh to that kraal does not know yet (saved in ~/.config/kraal/servers.toml,
-# group "discovered").
+# Offer discovered servers as temporary suggestions until restart. Only Add saves them
+# in ~/.config/kraal/servers.toml, in the group "discovered".
 auto_add = true
 # Share one SSH connection per server between panes, file transfers and file panes, so a
 # second pane or a copy to the same server starts instantly without asking for a password.
@@ -466,6 +466,16 @@ mod tests {
         let path = format!("~/.local/state/kraal/{name}");
         assert!(DEFAULT_CONFIG.contains(&format!("{path},")));
         assert!(include_str!("../docs/configuration.md").contains(&format!("`{path}`")));
+    }
+
+    #[test]
+    fn auto_add_guidance_describes_temporary_suggestions_and_explicit_saving() {
+        let guidance = DEFAULT_CONFIG.split("[servers]\n").nth(1).unwrap().split("auto_add = true").next().unwrap();
+        assert!(guidance.contains("temporary suggestions until restart"));
+        assert!(guidance.contains("Only Add saves them"));
+        assert!(guidance.contains("~/.config/kraal/servers.toml"));
+        let docs = include_str!("../docs/configuration.md");
+        assert!(docs.contains("temporary suggestions until restart; only Add saves them"));
     }
 
     #[test]

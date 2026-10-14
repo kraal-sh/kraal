@@ -11,12 +11,12 @@ shows what each next key does; press that key (or click it).
 
 One rule: after `ctrl+b`, **a theme's letter runs its main action, and the same letter in
 capitals opens the theme's menu**. `ctrl+b s` connects to a server; `ctrl+b S` opens the Servers
-menu (upload, download, edit the list). Letters are taken for what they mean, so the rule holds on
+menu (add, upload, download, edit the list). Letters are taken for what they mean, so the rule holds on
 any keyboard layout.
 
 | Theme | `ctrl+b` + letter | `ctrl+b` + capital: the menu |
 |---|---|---|
-| servers | `s` connect (or a group in a grid) | `S`: `s` connect, `u` upload, `d` download, `e` edit the list |
+| servers | `s` connect (or a group in a grid) | `S`: `s` connect, `n` add server, `u` upload, `d` download, `e` edit the list |
 | broadcast | `b` typing goes to the whole tab, `b` again stops | `B`: `b` this tab, `w` the whole workspace, `m` mark this pane, `s` the marked panes, `o` stop |
 | workspaces | `w` choose one | `W`: `w` choose, `n` add, `←`/`→` previous/next, `e` rename, `s` export the layout, `r` restart the session (on the kraal installed now), `q` quit, `x` close |
 | agents | `a` start one on an account | `A`: `a` start, `l` accounts, `n` add account, `g` go to the agent needing you, `c` change account |

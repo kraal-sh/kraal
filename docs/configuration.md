@@ -91,7 +91,7 @@ A look to copy, with the sidebar and the bottom bar: [theme.toml](../examples/co
 
 ```toml config
 [servers]
-auto_add = true                # remember the servers you ssh to, in the group "discovered"
+auto_add = true                # offer temporary suggestions until restart; only Add saves them
 multiplex = true               # one SSH connection per server for kraal's panes, transfers and tools
 max_panes_per_tab = 9          # opening a whole group puts at most this many servers in a tab
 download_dir = "~/Downloads"   # where downloads go, and the versions of a server's file you keep

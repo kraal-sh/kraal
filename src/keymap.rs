@@ -66,6 +66,7 @@ pub enum Action {
     NextAttention,
     SwitchAccount,
     SshPicker,
+    AddServer,
     EditServers,
     Upload,
     Download,
@@ -144,6 +145,7 @@ const ACTIONS: &[(Action, &str, &str)] = &[
     (AddAccount, "add_account", "Add account"),
     (NextAttention, "next_attention", "Next agent needing you"),
     (SwitchAccount, "switch_account", "Change the agent's account"),
+    (AddServer, "add_server", "Add server"),
     (SshPicker, "ssh_picker", "Connect to a server"),
     (EditServers, "edit_servers", "Edit saved servers"),
     (Upload, "upload", "Upload to this pane's server"),
@@ -303,6 +305,7 @@ const KRAAL: Preset = Preset {
         ("rename_tab", &["{tabs} e"]),
         ("close_tab", &["{tabs} x"]),
         ("new_workspace", &["{workspaces} n"]),
+        ("add_server", &["{servers} n"]),
         ("prev_workspace", &["{workspaces} left"]),
         ("next_workspace", &["{workspaces} right"]),
         ("rename_workspace", &["{workspaces} e"]),
@@ -1188,6 +1191,7 @@ mod tests {
         assert_eq!(km.hint(ToggleBottomBar).as_deref(), Some("ctrl+b V k"));
         assert!(km.menu(&[key('V')]).iter().any(|e| e.label == "Bottom bar"));
         assert_eq!(km.hint(SshPicker).as_deref(), Some("ctrl+b s"));
+        assert_eq!(km.hint(AddServer).as_deref(), Some("ctrl+b S n"));
         assert_eq!(km.hint(NewPane).as_deref(), Some("alt+n"));
         assert_eq!(km.menu_hint("broadcast").as_deref(), Some("ctrl+b B"));
         // A restart is about the whole session: in the Workspaces menu, under its first letter.

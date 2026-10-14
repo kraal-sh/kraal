@@ -485,6 +485,7 @@ impl Server {
             self.mark_dirty();
             self.check_waits();
             self.runbook_pane_exited(id, code);
+            self.show_ssh_failure(id);
         } else {
             self.close_pane(id);
         }
