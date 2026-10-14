@@ -71,6 +71,11 @@ impl Server {
                 }
             }
             Action::ToggleSidebar => {
+                if let Some(c) = self.clients.get(&id)
+                    && (c.cols < 40 || self.sidebar_width(c.cols) == 0)
+                {
+                    return Mode::Picker(self.workspace_picker(c.workspace));
+                }
                 let shown = self.clients.get(&id).is_some_and(|c| self.sidebar_shown(c));
                 if let Some(c) = self.clients.get_mut(&id) {
                     c.sidebar = Some(!shown);

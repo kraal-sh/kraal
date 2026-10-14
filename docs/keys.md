@@ -77,9 +77,14 @@ Closing a workspace (`ctrl+b W x`, or `ctrl+x` on its open row in Workspaces) ke
 layout as **Closed**. When programs or background jobs need to stop, it lists them with
 **Cancel** selected first; **Stop and close** confirms. Idle shells need no extra confirmation. See [Closing a workspace](workspaces.md#closing-a-workspace).
 
+`ctrl+b V l` switches the full sidebar and its four-column strip when the full sidebar fits.
+On a narrower terminal it opens Workspaces without changing the folding preference. The strip's
+bottom arrow does the same. **WS** and **AG** open Workspaces and the pane picker; its numbers
+are list positions, while `ctrl+b 1` to `9` still select tabs.
+
 **Move up** and **Move down** are in the workspace's Tab actions, with no direct shortcut.
 They keep the row selected and leave each terminal's workspace and pane focus unchanged.
-Dragging a workspace row in the list or sidebar uses the same saved order. A click opens on
+Dragging a workspace row in the list or full sidebar uses the same saved order. A click opens on
 release; a drag only reorders. Release outside workspace rows or press Esc to cancel.
 The order is shared and saved automatically. While searching, choose **Clear search to reorder**
 first; it keeps the selected row. See [Reordering workspaces](workspaces.md#reordering-workspaces).

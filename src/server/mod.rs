@@ -420,8 +420,8 @@ pub struct Client {
     /// The last frame composed for it, kept to compose the next one over it.
     pub(in crate::server) frame: ratatui::buffer::Buffer,
     pub(in crate::server) memo: render::FrameMemo,
-    /// Whether it has the sidebar, once it showed or hid it itself: `[sidebar] visible` says
-    /// until then.
+    /// Whether it requests the full sidebar, once it chose itself: `[sidebar] visible` says
+    /// until then. Narrow terminals show the strip without changing this preference.
     pub sidebar: Option<bool>,
     pub dirty: Dirty,
     pub(in crate::server) printed: Printed,

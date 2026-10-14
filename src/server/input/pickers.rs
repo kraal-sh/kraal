@@ -1388,8 +1388,13 @@ mod deletion_tests {
             server.action(client, Action::ToggleBottomBar);
             assert_eq!(server.bottom_bar, !before);
             let before = server.sidebar_shown(&server.clients[&client]);
-            server.action(client, Action::ToggleSidebar);
-            assert_eq!(server.sidebar_shown(&server.clients[&client]), !before);
+            let mode = server.action(client, Action::ToggleSidebar);
+            if server.clients[&client].cols < 84 {
+                assert!(matches!(mode, Mode::Picker(_)));
+                assert_eq!(server.sidebar_shown(&server.clients[&client]), before);
+            } else {
+                assert_eq!(server.sidebar_shown(&server.clients[&client]), !before);
+            }
             server.client_input(client, b"\x02d");
             assert!(!server.clients.contains_key(&client));
             assert!(server.workspaces.is_empty());

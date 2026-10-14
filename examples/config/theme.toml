@@ -17,7 +17,7 @@ production = "lightred"       # frames and badges of production panes
 frames = "thick"              # "rounded", "plain", "thick", "double" or "ascii"
 
 [sidebar]
-visible = true                # false hides it
+visible = true                # false folds to the four-column strip
 width = 32                    # in terminals at least three times as wide
 
 [bar]

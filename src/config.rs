@@ -66,8 +66,9 @@ preset = "default"
 # frames = "rounded"
 
 [sidebar]
-# The workspaces, agents, tunnels, ports and accounts, at the left of every terminal at least
-# three times as wide as it. false hides it; ctrl+b V l shows or hides it in one terminal.
+# Full sidebar at three times its width (84 columns by default). Otherwise a four-column
+# workspace and agent strip from 40 columns; nothing below 40. false folds to the strip.
+# ctrl+b V l folds or expands in one terminal, or opens Workspaces when too narrow.
 visible = true
 width = 28
 

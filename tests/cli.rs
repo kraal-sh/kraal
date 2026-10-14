@@ -1649,10 +1649,11 @@ fn workspace_moves_keep_focus_share_the_list_and_survive_restart() {
         let reordered = ["docs: docs.kdl", "api: api.kdl (open)", "web: web.kdl (open)"];
         wait_until(PATIENCE, "workspace order was not saved", || listed_workspaces(&env) == reordered);
         other.wait_for_rows("the other client's list has the same order", |rows| {
+            // From the right: the pane's border, then the list's, regardless of the sidebar.
             let names: Vec<_> = rows
                 .iter()
                 .filter_map(|row| {
-                    let row = row.split('│').nth(2)?.trim();
+                    let row = row.rsplit('│').nth(2)?.trim();
                     ["docs", "api", "web"].into_iter().find(|name| row.ends_with(name))
                 })
                 .collect();
@@ -1811,10 +1812,11 @@ fn workspace_save_errors_keep_the_name_and_full_reason_at_both_sizes() {
         client.send(format!("\x01\x0b {}\r", path.display()).as_bytes());
         let expected = format!("{} is not a regular file", path.canonicalize().unwrap().display());
         let rows = client.wait_for_rows("the full export error and Retry", |rows| {
+            // The pane and prompt keep their right borders even when the strip is covered.
             // Remove only the prompt's padding: a path can continue across rows and contain spaces.
             let message: String = rows
                 .iter()
-                .filter_map(|r| r.split('│').nth(2))
+                .filter_map(|r| r.rsplit('│').nth(2))
                 .filter_map(|r| r.strip_prefix(' ')?.strip_suffix(' '))
                 .collect();
             message.contains(&expected) && rows.iter().any(|r| r.contains("Enter Retry"))
@@ -2251,9 +2253,9 @@ fn stacks_and_layouts_from_the_keys() {
             std::thread::sleep(Duration::from_millis(50));
         }
     };
-    let mut client = RawClient::attach(&env, "w");
+    let mut client = RawClient::attach_sized(&env, Some("w"), (124, 40));
     client.wait_for_message("\"attached\"");
-    // 120×40: the panes take rows 1 to 38, between the bars, a third of the width each.
+    // 124×40 with a four-column strip: the panes take rows 1 to 38, between the bars, a third of the width each.
     until("three columns", &|| size("alpha") == (37, 36));
     env.run(&["focus", "bravo"]);
 
@@ -7446,12 +7448,9 @@ fn a_bell_in_another_tab_is_drawn_by_a_whole_frame() {
 #[test]
 fn a_command_that_starts_is_drawn_by_a_whole_frame() {
     let env = Env::new("starts");
-    let config = env.root.join("config/kraal/config.toml");
-    let text = std::fs::read_to_string(&config).unwrap();
-    std::fs::write(&config, format!("{text}[sidebar]\nvisible = false\n")).unwrap();
     env.workspace("w", "layout {\n    pane name=\"shell\"\n}\n");
     let frames = env.open_noting_frames("w");
-    let client = RawClient::attach(&env, "w");
+    let client = RawClient::attach_sized(&env, Some("w"), (39, 40));
     // What a shell that marks its commands prints around them: one that failed, then one that
     // starts and runs on.
     let failed = "printf '\\033]133;A\\007$ \\033]133;B\\007x\\n\\033]133;C\\007\\033]133;D;7\\007'";
@@ -7472,18 +7471,91 @@ fn frame_columns(rows: &[String]) -> (Option<usize>, Option<usize>) {
     (at('╭'), at('╮'))
 }
 
+#[test]
+fn sidebar_strip_cells_clicks_and_pty_sizes() {
+    for (cols, height, pane_cols, pane_rows) in [(124, 36, 118, 32), (80, 24, 74, 20), (60, 20, 54, 16)] {
+        let env = Env::new(&format!("strip-{cols}"));
+        let config = env.root.join("config/kraal/config.toml");
+        let defaults = std::fs::read_to_string(&config).unwrap();
+        std::fs::write(&config, format!("{defaults}\n[theme]\npreset = \"ascii\"\n")).unwrap();
+        for (ws, pane) in [("api", "review"), ("docs", "writer")] {
+            env.workspace(ws, &format!("layout {{\n    pane name=\"{pane}\"\n}}\n"));
+            env.run(&["open", ws]);
+            claude_hook(&env, pane, r#"{"hook_event_name":"SessionStart"}"#);
+            claude_hook(&env, pane, r#"{"hook_event_name":"UserPromptSubmit"}"#);
+        }
+        claude_hook(&env, "review", r#"{"hook_event_name":"Notification","message":"Claude needs your permission"}"#);
+        let mut client = RawClient::attach_sized(&env, Some("api"), (cols, height));
+        if cols >= 84 {
+            client.wait_for_row("WORKSPACES");
+            client.send(b"\x02Vl");
+        }
+        let screen = client.wait_for_rows("both workspaces and agents in the strip", |rows| {
+            ["WS | api ", " 1*|", " 2*|", "AG |", " 1!|", " 2*|"]
+                .iter()
+                .enumerate()
+                .all(|(y, prefix)| rows[y].starts_with(prefix))
+                && rows[height - 2].starts_with(" > |")
+        });
+        assert_eq!(screen[1].chars().nth(4), Some('+'));
+        assert_eq!(screen[1].chars().last(), Some('+'));
+        let panes: serde_json::Value = serde_json::from_str(&env.run(&["panes", "--json"])).unwrap();
+        for pane in panes.as_array().unwrap() {
+            assert_eq!((pane["cols"].as_u64(), pane["rows"].as_u64()), (Some(pane_cols), Some(pane_rows)));
+        }
+        env.run(&["send", "-p", "review", "--enter", "printf 'strip-pty '; stty size"]);
+        env.wait_for_text("review", &format!("strip-pty {pane_rows} {pane_cols}"));
+
+        // Selecting a workspace or an agent keeps the strip, including its entire row's hit area.
+        client.send(b"\x1b[<0;2;3M\x1b[<0;2;3m");
+        client.wait_for_rows("docs selected from the strip", |rows| rows[0].starts_with("WS | docs "));
+        client.send(b"\x1b[<0;3;5M\x1b[<0;3;5m");
+        client.wait_for_rows("review revealed from the strip", |rows| rows[0].starts_with("WS | api "));
+
+        // State changes of an agent off screen keep their exact symbols without acknowledging done.
+        for (hook, icon) in [("Notification", "!"), ("UserPromptSubmit", "*"), ("Stop", "+")] {
+            claude_hook(
+                &env,
+                "writer",
+                &format!(r#"{{"hook_event_name":"{hook}","message":"Claude needs your permission"}}"#),
+            );
+            client.wait_for_rows("the writer's state in the strip", |rows| rows[5].starts_with(&format!(" 2{icon}|")));
+        }
+        client.settle();
+        assert!(client.rows()[5].starts_with(" 2+|"));
+        client.send(b"\x1b[<0;2;6M\x1b[<0;2;6m");
+        client.wait_for_rows("visiting writer acknowledges done", |rows| {
+            rows[0].starts_with("WS | docs ") && rows[5].starts_with(" 2o|")
+        });
+
+        client.send(b"\x1b[<2;2;2M");
+        client.wait_for_row("Rename");
+        client.close_overlay("Rename");
+        client.close_overlay("+ Add workspace");
+        client.send(format!("\x1b[<0;2;{}M\x1b[<0;2;{}m", height - 1, height - 1).as_bytes());
+        if cols >= 84 {
+            client.wait_for_row("WORKSPACES");
+        } else {
+            client.wait_for_row("+ Add workspace");
+            client.close_overlay("+ Add workspace");
+            client.resize((124, 36));
+            client.wait_for_row("WORKSPACES");
+        }
+    }
+}
+
 /// The sidebar is there from the first screen of a new session, with one workspace and nothing
-/// else to list. The key hides it and shows it again in the terminal it is typed in, `[sidebar]
+/// else to list. The key folds it and expands it again in the terminal it is typed in, `[sidebar]
 /// visible` says for the terminals that did not choose, and a terminal less than three times as
-/// wide as the sidebar has none: its panes keep the whole width.
+/// wide as the sidebar has a four-column strip, down to 40 columns.
 #[test]
 fn the_sidebar_is_there_from_the_first_screen() {
     let env = Env::new("sidebar");
     let shown = |rows: &[String]| rows[0].starts_with("╭─ WORKSPACES");
-    // Without the sidebar, the top bar names the workspace.
-    let hidden = |rows: &[String]| rows[0].starts_with(" main ");
+    // With the strip, the top bar names the workspace.
+    let folded = |rows: &[String]| rows[0].starts_with("WS │ main ");
     let shows = |client: &RawClient, what: &str| client.wait_for_rows(what, shown);
-    let hides = |client: &RawClient, what: &str| client.wait_for_rows(what, hidden);
+    let folds = |client: &RawClient, what: &str| client.wait_for_rows(what, folded);
     let size = || {
         let panes: serde_json::Value = serde_json::from_str(&env.run(&["panes", "--json"])).unwrap();
         (panes[0]["cols"].as_u64().unwrap(), panes[0]["rows"].as_u64().unwrap())
@@ -7510,14 +7582,14 @@ fn the_sidebar_is_there_from_the_first_screen() {
     let sections = rows.iter().filter(|r| r.starts_with("├─ ")).collect::<Vec<_>>();
     assert!(sections.iter().all(|s| s.starts_with("├─ ACCOUNTS")), "{sections:?}");
 
-    // The key hides it in the terminal it is typed in, which gives its room to the panes, and
+    // The key folds it in the terminal it is typed in, which gives room to the panes, and
     // shows it again. Another terminal keeps its own.
     let other = RawClient::attach(&env, "main");
     shows(&other, "the sidebar of a second terminal");
     client.send(b"\x02Vl");
-    let rows = hides(&client, "the sidebar hidden with the key");
-    assert_eq!(frame_columns(&rows), (Some(0), Some(119)), "{}", rows.join("\n"));
-    assert_eq!(size(), (118, 36));
+    let rows = folds(&client, "the sidebar folded with the key");
+    assert_eq!(frame_columns(&rows), (Some(4), Some(119)), "{}", rows.join("\n"));
+    assert_eq!(size(), (114, 36));
     other.settle();
     assert!(shown(&other.rows()), "{}", other.rows().join("\n"));
     client.send(b"\x02Vl");
@@ -7530,28 +7602,27 @@ fn the_sidebar_is_there_from_the_first_screen() {
     assert!(shown(&rows), "{}", rows.join("\n"));
     env.run(&["close", "second"]);
 
-    // `visible = false` hides it where no one chose: the terminal that asked for it keeps it, a
-    // terminal attaching then has none, and the key shows it there too.
+    // `visible = false` folds it where no one chose. A terminal that requested it keeps it;
+    // a terminal attaching starts with the strip, and the key expands it there too.
     configure("[sidebar]\nvisible = false\n");
-    hides(&other, "the sidebar hidden by the configuration");
+    folds(&other, "the sidebar folded by the configuration");
     client.settle();
     assert!(shown(&client.rows()), "{}", client.rows().join("\n"));
     let mut late = RawClient::attach(&env, "main");
-    hides(&late, "no sidebar for a terminal attaching");
+    folds(&late, "the strip for a terminal attaching");
     late.send(b"\x02Vl");
     shows(&late, "the sidebar asked for with the key");
-    // So wide that no terminal has room for it, it is left out, whoever asked.
+    // So wide that no terminal has room for it, the strip takes its place.
     configure("[sidebar]\nwidth = 30000\n");
-    hides(&client, "no room for the sidebar");
+    folds(&client, "no room for the sidebar");
 
-    // A terminal less than three times as wide as the sidebar (28 columns) has none, and its pane
-    // the whole width; one column more and the sidebar is there.
+    // A terminal less than three times the sidebar width gets the strip; below 40 it disappears.
     configure("");
     let mut narrow = RawClient::attach_sized(&env, Some("main"), (80, 24));
-    let rows = hides(&narrow, "no sidebar in 80 columns");
-    assert_eq!(frame_columns(&rows), (Some(0), Some(79)), "{}", rows.join("\n"));
-    assert_eq!(size(), (78, 20));
-    for (cols, frame) in [(60, (0, 59)), (83, (0, 82)), (84, (29, 83)), (80, (0, 79))] {
+    let rows = folds(&narrow, "the strip in 80 columns");
+    assert_eq!(frame_columns(&rows), (Some(4), Some(79)), "{}", rows.join("\n"));
+    assert_eq!(size(), (74, 20));
+    for (cols, frame) in [(39, (0, 38)), (40, (4, 39)), (60, (4, 59)), (83, (4, 82)), (84, (29, 83)), (80, (4, 79))] {
         narrow.resize((cols, 24));
         let what = format!("the pane of a terminal of {cols} columns");
         let rows = narrow.wait_for_rows(&what, |rows| frame_columns(rows) == (Some(frame.0), Some(frame.1)));
@@ -7561,16 +7632,15 @@ fn the_sidebar_is_there_from_the_first_screen() {
     // What a terminal chose is its own, and is not saved: after a restart, the configuration
     // says again.
     client.send(b"\x02Vl");
-    hides(&client, "the sidebar hidden before a restart");
+    folds(&client, "the sidebar folded before a restart");
     env.run(&["restart", "--yes"]);
     let back = RawClient::attach_sized(&env, None, (120, 40));
     shows(&back, "the sidebar after a restart");
 }
 
 /// The panes have one size, that of the terminal typed in last, and every attached terminal has
-/// its own sidebar: shown, hidden with the key, or left out where the terminal is too narrow for
-/// it. Each terminal draws the panes beside its own sidebar: never over it, and never leaving its
-/// place empty.
+/// its own sidebar: full, folded with the key, or automatically compact in a narrow terminal.
+/// Each terminal draws panes beside its sidebar, without overlapping it or leaving its place empty.
 #[test]
 fn each_terminal_draws_the_panes_beside_its_own_sidebar() {
     let env = Env::new("beside");
@@ -7591,29 +7661,29 @@ fn each_terminal_draws_the_panes_beside_its_own_sidebar() {
     let sidebar = side(&shows(&wide, (29, 119), "the pane beside the sidebar"));
     assert!(sidebar[0].starts_with("╭─ WORKSPACES"), "{sidebar:?}");
 
-    // A second terminal hides its sidebar: the panes are laid out for it, from its first column.
+    // A second terminal folds its sidebar: panes start after the strip.
     // The first one keeps its sidebar, and shows of the panes what fits beside it.
     let mut bare = RawClient::attach(&env, "w");
     bare.send(b"\x02Vl");
-    shows(&bare, (0, 119), "the pane from the first column");
+    shows(&bare, (4, 119), "the pane beside the strip");
     assert_eq!(side(&shows(&wide, (29, 119), "the pane beside the sidebar still")), sidebar);
     // Typed in, the first terminal has the panes laid out beside its sidebar: the other one
-    // shows them from its first column all the same, with room left at its right.
+    // shows them beside its strip, with room left at its right.
     wide.send(b"echo typed-in-wide\r");
-    shows(&bare, (0, 90), "the narrower pane from the first column");
+    shows(&bare, (4, 94), "the narrower pane beside the strip");
     assert_eq!(side(&shows(&wide, (29, 119), "the pane laid out beside the sidebar")), sidebar);
 
-    // A terminal too narrow for a sidebar has none, and the panes are laid out for it.
+    // A narrow terminal gets the strip, and the panes are laid out for it.
     let mut narrow = RawClient::attach_sized(&env, Some("w"), (80, 24));
-    let rows = shows(&narrow, (0, 79), "the pane over the whole width");
-    assert!(rows[0].starts_with(" w "), "the workspace is named in the top bar: {:?}", rows[0]);
-    shows(&bare, (0, 79), "the narrow terminal's pane from the first column");
-    assert_eq!(side(&shows(&wide, (29, 108), "the narrow terminal's pane beside the sidebar")), sidebar);
-    // And it shows the panes of a wider one from its first column, as far as its last.
+    let rows = shows(&narrow, (4, 79), "the pane beside the strip");
+    assert!(rows[0].starts_with("WS │ w "), "the workspace is named in the top bar: {:?}", rows[0]);
+    shows(&bare, (4, 79), "the narrow terminal's pane beside the strip");
+    assert_eq!(side(&shows(&wide, (29, 104), "the narrow terminal's pane beside the sidebar")), sidebar);
+    // It shows the panes of a wider one beside the strip, clipped to its last column.
     wide.send(b"echo typed-again\r");
     narrow.wait_for_row("typed-again");
-    shows(&narrow, (0, 79), "the wide terminal's pane from the first column");
-    shows(&bare, (0, 90), "the wide terminal's pane");
+    shows(&narrow, (4, 79), "the wide terminal's pane beside the strip");
+    shows(&bare, (4, 94), "the wide terminal's pane");
     assert_eq!(side(&shows(&wide, (29, 119), "the pane beside the sidebar again")), sidebar);
     // Once wide enough, it has the sidebar too.
     narrow.resize((120, 40));
@@ -10686,12 +10756,19 @@ fn agents_of_a_remote_session_are_listed_and_reached() {
         std::thread::sleep(Duration::from_millis(50));
     }
     std::thread::sleep(Duration::from_millis(500));
-    client.send(b"\x1ba");
+    client.send(b"\x02Vl");
+    let rows = client.wait_for_rows("the remote agent in the strip", |rows| {
+        rows.iter().position(|r| r.starts_with("AG │")).is_some_and(|y| rows[y + 1].starts_with(" 1●│"))
+    });
+    let row = rows.iter().position(|r| r.starts_with("AG │")).unwrap() + 2;
+    client.send(format!("\x1b[<0;2;{row}M\x1b[<0;2;{row}m").as_bytes());
     let start = Instant::now();
     while remote_api()["focused"] != true {
         assert!(start.elapsed() < Duration::from_secs(10), "the agent's pane is not shown again: {}", remote_api());
         std::thread::sleep(Duration::from_millis(50));
     }
+    client.send(b"\x02Vl");
+    client.wait_for_row("WORKSPACES");
     assert!(!ssh_log().contains(" focus "), "asked through the tab, not over another connection: {}", ssh_log());
     assert_eq!(local_panes().len(), 2, "{:?}", local_panes());
 

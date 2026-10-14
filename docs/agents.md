@@ -149,6 +149,12 @@ next to them in the sidebar and in pane frames: yellow working, red blocked (wai
 done (not seen yet), `○` idle. A blocked or finished agent you are not
 looking at triggers a desktop notification through your terminal (OSC 777/9) or `notify-send`.
 
+In the four-column sidebar strip, **AG** lists local agents then remote agents with the same
+state icons and colours, including the ASCII and high-contrast themes. Click an agent to reveal
+its pane, or **AG** to find it by name. Overflow keeps blocked then done agents visible and
+provides a list row. Showing a done icon does not acknowledge the result; visiting the pane
+uses the usual acknowledgement. Accounts stay in `ctrl+b A l` and the full sidebar.
+
 The agents of kraal sessions on your servers are listed too, after the server's name, and
 `alt+a` goes to them as well: see [Agents on your servers](servers.md#agents-on-your-servers).
 `kraal agents` lists them with their server, and their changes of state are `agent.*` events with

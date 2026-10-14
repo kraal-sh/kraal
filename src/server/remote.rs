@@ -528,6 +528,49 @@ mod tests {
     use super::*;
 
     #[test]
+    fn strip_lists_remote_agents_after_local_agents_and_click_attaches_to_their_pane() {
+        use crate::server::render::SideItem;
+        let _batch = crate::pane::batch();
+        for (cols, rows) in [(124, 36), (80, 24), (60, 20)] {
+            let (tx, _rx) = crate::server::event_channel(32);
+            let mut server = crate::server::tests::server(tx);
+            let (client, _peer) = crate::server::tests::client(&mut server);
+            let c = server.clients.get_mut(&client).unwrap();
+            (c.cols, c.rows, c.sidebar) = (cols, rows, Some(false));
+            let ws = c.workspace;
+            let local =
+                server.spawn_pane_in(ws, None, PaneSpec::default(), Placement::Auto, Some("local".into())).unwrap();
+            server.panes.get_mut(&local).unwrap().agent.kind = Some("claude".into());
+            let mut watch = Watch::new(
+                servers::Server { name: "gpu".into(), host: "gpu.invalid".into(), ..Default::default() },
+                "main".into(),
+            );
+            watch.agents = parse_list(
+                r#"[{"id":42,"name":"review","workspace":"api","agent":"claude","state":"blocked"}]"#,
+                Instant::now(),
+            )
+            .unwrap();
+            server.remotes.push(watch);
+            let remote = SideItem::Remote { server: "gpu".into(), pane: 42 };
+            let y = (0..rows).find(|&y| server.sidebar_hit(client, y) == Some(remote.clone())).unwrap();
+            assert_eq!(server.sidebar_hit(client, y - 1), Some(SideItem::Pane(local)));
+            let mut buf = ratatui::buffer::Buffer::empty(ratatui::layout::Rect::new(0, 0, cols, rows));
+            server.compose(client, 0, &mut buf);
+            assert_eq!(buf[(1, y)].symbol(), "2");
+            assert_eq!(buf[(2, y)].symbol(), crate::theme::current().icon(AgentState::Blocked));
+            assert_eq!(buf[(2, y)].fg, crate::theme::current().blocked);
+            server.client_input(client, format!("\x1b[<0;2;{}M\x1b[<0;2;{}m", y + 1, y + 1).as_bytes());
+            let attached = server.attach_pane("gpu", "main").unwrap();
+            assert_eq!(server.client_focus(client), Some(attached));
+            assert_eq!(
+                &server.panes[&attached].spec.command[1..],
+                ["-s", "main", "attach", "--host", "gpu", "--pane", "42"]
+            );
+            assert_eq!(server.clients[&client].sidebar, Some(false));
+        }
+    }
+
+    #[test]
     fn lists_are_read_bounded_and_cleaned() {
         let now = Instant::now();
         let line = r#"[{"id":3,"name":null,"title":"✳ Fix login","workspace":"api","agent":"claude","state":"blocked","focused":true,"cols":80},

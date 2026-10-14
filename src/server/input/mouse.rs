@@ -21,6 +21,7 @@ impl Server {
         }
         let c = self.clients.get(&id)?;
         let (rows, sw) = (c.rows, self.sidebar_cols(c));
+        let full_sidebar = matches!(self.sidebar_presentation(c), crate::server::geometry::Sidebar::Full(_));
         let area = self.client_area(id);
 
         // A drag in progress owns the mouse until release.
@@ -36,6 +37,9 @@ impl Server {
                             item.action = crate::server::ui::PickAction::OpenDefinition(path);
                         }
                         return Some(self.pick(id, &picker, item));
+                    }
+                    if !full_sidebar {
+                        return None;
                     }
                     let mode = self.drop_workspace(id, *picker, drag);
                     return match mode {
@@ -82,7 +86,8 @@ impl Server {
         }
         // The sidebar runs from the top, beside the top bar.
         if m.col < sw {
-            if (matches!(m.kind, MouseKind::Press(MouseButton::Right)) || press_left && m.col >= sw.saturating_sub(4))
+            if (matches!(m.kind, MouseKind::Press(MouseButton::Right))
+                || press_left && full_sidebar && m.col >= sw.saturating_sub(4))
                 && let Some(SideItem::Workspace(ws)) = self.sidebar_hit(id, m.row)
                 && (matches!(m.kind, MouseKind::Press(MouseButton::Right))
                     || self.sidebar_hit(id, m.row.saturating_sub(1)) != Some(SideItem::Workspace(ws)))
@@ -96,6 +101,8 @@ impl Server {
             if press_left {
                 match self.sidebar_hit(id, m.row) {
                     Some(SideItem::Workspaces) => return Some(self.action(id, Action::WorkspacePicker)),
+                    Some(SideItem::Panes) => return Some(self.action(id, Action::PanePicker)),
+                    Some(SideItem::ToggleSidebar) => return Some(self.action(id, Action::ToggleSidebar)),
                     Some(SideItem::AddWorkspace) => return Some(self.action(id, Action::NewWorkspace)),
                     Some(SideItem::Accounts) => return Some(self.action(id, Action::Accounts)),
                     Some(SideItem::Account(account)) => return Some(self.account_details(&account)),
@@ -563,6 +570,99 @@ mod tests {
     use crate::server::ui::PickerKind;
 
     #[test]
+    fn strip_clicks_keep_the_strip_and_never_use_the_full_sidebar_actions_area() {
+        let event = |kind, col, row| MouseEvent { kind, col, row, mods: Default::default() };
+        for (cols, rows) in [(124, 36), (80, 24), (60, 20)] {
+            let (tx, _rx) = crate::server::event_channel(32);
+            let mut server = crate::server::tests::server(tx);
+            let (client, _peer) = crate::server::tests::client(&mut server);
+            let current = server.clients[&client].workspace;
+            let other = server.new_workspace("other".into(), None);
+            let c = server.clients.get_mut(&client).unwrap();
+            (c.cols, c.rows, c.sidebar) = (cols, rows, Some(false));
+            server.bottom_bar = true;
+            let order = server.workspace_order.clone();
+            let row = (0..rows).find(|&r| server.sidebar_hit(client, r) == Some(SideItem::Workspace(other))).unwrap();
+            for col in 0..4 {
+                server.clients.get_mut(&client).unwrap().workspace = current;
+                let press = event(MouseKind::Press(MouseButton::Left), col, row);
+                assert!(server.on_mouse(client, press, false).is_none());
+                assert_eq!(server.clients[&client].workspace, current);
+                assert!(matches!(
+                    server.on_mouse(client, event(MouseKind::Release(MouseButton::Left), col, row), false),
+                    Some(Mode::Normal)
+                ));
+                assert_eq!(server.clients[&client].workspace, other);
+                assert_eq!(server.clients[&client].sidebar, Some(false));
+                let Mode::Picker(p) =
+                    server.on_mouse(client, event(MouseKind::Press(MouseButton::Right), col, row), false).unwrap()
+                else {
+                    panic!()
+                };
+                assert!(p.actions.is_some());
+                assert_eq!(p.current().unwrap().action.workspace(), Some(other));
+            }
+            server.on_mouse(client, event(MouseKind::Press(MouseButton::Left), 1, row), false);
+            server.on_mouse(client, event(MouseKind::Drag(MouseButton::Left), 1, 1), false);
+            server.on_mouse(client, event(MouseKind::Release(MouseButton::Left), 1, 1), false);
+            assert_eq!(server.workspace_order, order, "the strip does not reorder workspaces");
+            for (item, kind) in [(SideItem::Workspaces, PickerKind::Workspace), (SideItem::Panes, PickerKind::Pane)] {
+                let row = (0..rows).find(|&r| server.sidebar_hit(client, r) == Some(item.clone())).unwrap();
+                let Mode::Picker(p) =
+                    server.on_mouse(client, event(MouseKind::Press(MouseButton::Left), 1, row), false).unwrap()
+                else {
+                    panic!()
+                };
+                assert!(p.kind == kind);
+            }
+            let mode = server.on_mouse(client, event(MouseKind::Press(MouseButton::Left), 1, rows - 2), false).unwrap();
+            if cols >= 84 {
+                assert!(matches!(mode, Mode::Normal));
+                assert_eq!(server.clients[&client].sidebar, Some(true));
+            } else {
+                assert!(matches!(mode, Mode::Picker(p) if p.kind == PickerKind::Workspace));
+                assert_eq!(server.clients[&client].sidebar, Some(false));
+            }
+        }
+    }
+
+    #[test]
+    fn strip_overflow_rows_open_the_complete_lists() {
+        let _batch = crate::pane::batch();
+        let (tx, _rx) = crate::server::event_channel(32);
+        let mut server = crate::server::tests::server(tx);
+        let (client, _peer) = crate::server::tests::client(&mut server);
+        let ws = server.clients[&client].workspace;
+        let c = server.clients.get_mut(&client).unwrap();
+        (c.cols, c.rows) = (60, 8);
+        for i in 0..8 {
+            server.new_workspace(format!("extra-{i}"), None);
+            let pane = server
+                .spawn_pane_in(ws, None, crate::pane::PaneSpec::default(), crate::protocol::Placement::Tab, None)
+                .unwrap();
+            let agent = &mut server.panes.get_mut(&pane).unwrap().agent;
+            agent.kind = Some("claude".into());
+            agent.state = if i == 7 { crate::agent::AgentState::Blocked } else { crate::agent::AgentState::Working };
+        }
+        for (item, kind, count) in
+            [(SideItem::Workspaces, PickerKind::Workspace, 9), (SideItem::Panes, PickerKind::Pane, 8)]
+        {
+            let rows: Vec<_> = (0..8).filter(|&row| server.sidebar_hit(client, row) == Some(item.clone())).collect();
+            assert_eq!(rows.len(), 2, "the header and overflow both open the list");
+            let click = MouseEvent {
+                kind: MouseKind::Press(MouseButton::Left),
+                col: 1,
+                row: rows[1],
+                mods: Default::default(),
+            };
+            let Mode::Picker(p) = server.on_mouse(client, click, false).unwrap() else { panic!() };
+            assert!(p.kind == kind);
+            assert!(p.items.len() >= count);
+        }
+        assert_eq!(server.clients[&client].sidebar, None);
+    }
+
+    #[test]
     fn a_stale_sidebar_file_click_keeps_its_target_and_offers_retry() {
         let (tx, _rx) = crate::server::queue::channel(32);
         let mut server = crate::server::tests::server(tx);
@@ -583,8 +683,8 @@ mod tests {
     }
 
     #[test]
-    fn workspace_entries_and_actions_work_with_and_without_the_sidebar() {
-        for (cols, rows) in [(80, 24), (124, 36)] {
+    fn workspace_entries_and_actions_work_in_all_sidebar_presentations() {
+        for (cols, rows) in [(39, 20), (60, 20), (80, 24), (124, 36)] {
             let (tx, _rx) = crate::server::queue::channel(32);
             let mut server = crate::server::tests::server(tx);
             let (client, _peer) = crate::server::tests::client(&mut server);
@@ -595,7 +695,7 @@ mod tests {
             let click =
                 |button, col, row| MouseEvent { kind: MouseKind::Press(button), col, row, mods: Default::default() };
             let sidebar = server.sidebar_cols(&server.clients[&client]);
-            assert_eq!(sidebar == 0, cols == 80);
+            assert_eq!(sidebar == 0, cols < 40);
             let col = if sidebar > 0 {
                 2
             } else {
@@ -624,13 +724,20 @@ mod tests {
             if sidebar > 0 {
                 let row =
                     (0..rows).find(|&r| server.sidebar_hit(client, r) == Some(SideItem::Workspace(other))).unwrap();
-                for (button, col) in [(MouseButton::Right, 3), (MouseButton::Left, sidebar - 3)] {
+                let mut clicks = vec![(MouseButton::Right, 2)];
+                if sidebar > 4 {
+                    clicks.push((MouseButton::Left, sidebar - 3));
+                }
+                for (button, col) in clicks {
                     let Mode::Picker(p) = server.on_mouse(client, click(button, col, row), false).unwrap() else {
                         panic!()
                     };
                     assert!(p.actions.is_some());
                     assert_eq!(p.current().unwrap().action.workspace(), Some(other));
                     assert_eq!(server.clients[&client].workspace, current);
+                }
+                if sidebar == 4 {
+                    continue;
                 }
                 for i in 0..50 {
                     server.new_workspace(format!("extra-{i}"), None);

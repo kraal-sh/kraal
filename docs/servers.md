@@ -266,6 +266,11 @@ main` or a line in the file does the same. Attaching leaves a value already ther
 it suggests `kraal servers edit` to save the connection and its `agents` session instead;
 `false` suppresses it.
 
+In the four-column sidebar strip they follow local agents under **AG**, with their state icon
+and colour. Clicking one uses the same remote attachment; **AG** opens the pane picker to see
+names and servers. Tunnels and PORTS stay in the full sidebar. Use `ctrl+b S o` for Tunnels
+while the sidebar is folded.
+
 Only the servers marked this way are watched, each over one ssh that stays open and runs
 `kraal agents --follow` there. That ssh never asks anything (BatchMode): the server must take
 your key without a prompt. A server that does not answer, or has no kraal (`kraal remote-install
