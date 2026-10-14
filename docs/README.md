@@ -15,7 +15,7 @@ New here? Start with the [README](../README.md): install, quick start and a tour
 | [Shell integration and images](terminal.md) | commands marked by your shell (OSC 133), here and over SSH, images in panes |
 | [Scripting, events and hooks](scripting.md) | driving kraal from scripts and agents, paste buffers, the event stream, hooks |
 | [Configuration](configuration.md) | every setting of `config.toml` with its default, checking and reloading it |
-| [Compatibility](compatibility.md) | sessions started by another kraal version, what an older one cannot do, the cross-version test |
+| [Compatibility](compatibility.md) | protocol refusal, upgrading older sessions, the cross-version test |
 
 `kraal config default` prints every setting with its default, and `kraal config keys` every key.
 The [examples](../examples/README.md) are files to copy: workspaces, configurations, an

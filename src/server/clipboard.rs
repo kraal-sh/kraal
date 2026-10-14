@@ -2,7 +2,7 @@
 
 use std::time::{Duration, Instant};
 
-use super::{ClientId, Server, frame_bytes};
+use super::{ClientId, Server};
 use crate::protocol::{ClipboardOrigin as Origin, ClipboardOutcome as Outcome, ServerMsg};
 use crate::theme::NoticeKind;
 
@@ -10,7 +10,6 @@ pub(super) const RESULT_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Default)]
 pub(super) struct Clipboard {
-    pub negotiated: bool,
     next: u64,
     pub pending: Option<(u64, Origin, Instant)>,
     last: Option<Instant>,
@@ -34,19 +33,15 @@ impl Clipboard {
             return Err((NoticeKind::Warning, Outcome::Busy.message()));
         }
         self.last = Some(now);
-        if self.negotiated {
-            self.next = self.next.wrapping_add(1);
-            self.pending = Some((self.next, origin, now));
-            let mut frame = Vec::new();
-            crate::protocol::write_json(
-                &mut frame,
-                &ServerMsg::Clipboard { id: self.next, origin, text: text.to_string() },
-            )
-            .expect("bounded clipboard frame");
-            Ok(frame)
-        } else {
-            Ok(frame_bytes(&crate::pane::osc52(text)))
-        }
+        self.next = self.next.wrapping_add(1);
+        self.pending = Some((self.next, origin, now));
+        let mut frame = Vec::new();
+        crate::protocol::write_json(
+            &mut frame,
+            &ServerMsg::Clipboard { id: self.next, origin, text: text.to_string() },
+        )
+        .expect("bounded clipboard frame");
+        Ok(frame)
     }
 }
 
@@ -70,13 +65,11 @@ impl Server {
         if !sent {
             state.pending = None;
             self.toast(client, NoticeKind::Error, "copy not sent: try again");
-        } else if !state.negotiated && origin == Origin::User {
-            self.toast(client, NoticeKind::Notice, "copy sent to terminal");
         }
     }
 
     pub(super) fn clipboard_result(&mut self, client: ClientId, id: u64, outcome: Outcome, unavailable: bool) {
-        let Some(c) = self.clients.get_mut(&client).filter(|c| c.attached && c.clipboard.negotiated) else { return };
+        let Some(c) = self.clients.get_mut(&client).filter(|c| c.attached) else { return };
         let state = &mut c.clipboard;
         let Some((pending, origin, _)) = state.pending else { return };
         if pending != id {
@@ -141,58 +134,42 @@ mod tests {
     };
 
     #[test]
-    fn negotiation_sends_structured_or_legacy_never_both_and_results_are_correlated() {
-        for negotiated in [false, true] {
-            let (tx, _events) = queue::channel(4096);
-            let mut server = server(tx);
-            let (id, _peer) = client(&mut server);
-            server.clients.get_mut(&id).unwrap().clipboard.negotiated = negotiated;
-            server.keep_copy("hello");
-            let wire = server
-                .clients
-                .get_mut(&id)
-                .unwrap()
-                .clipboard
-                .prepare(Origin::User, "hello", 1024, Instant::now())
-                .unwrap();
-            let mut frames = wire.as_slice();
-            let (kind, payload) = protocol::read_frame(&mut frames).unwrap().unwrap();
-            if negotiated {
-                assert_eq!(kind, protocol::JSON);
-                let ServerMsg::Clipboard { id: copy, origin, text } = serde_json::from_slice(&payload).unwrap() else {
-                    panic!()
-                };
-                assert_eq!((origin, text.as_str()), (Origin::User, "hello"));
-                assert!(server.clients[&id].toast.is_none(), "no success before the client reports");
-                server.clipboard_result(id, copy + 1, Outcome::Native, false);
-                assert!(server.clients[&id].toast.is_none());
-                server.clipboard_result(id, copy, Outcome::Terminal, true);
-                assert_eq!(server.clients[&id].toast.as_ref().unwrap().0, Outcome::Terminal.message());
-                assert_eq!(
-                    server.messages.iter().filter(|m| m.text.contains("native clipboard unavailable")).count(),
-                    1
-                );
-                server.clipboard_result(id, copy, Outcome::Native, false);
-                assert_eq!(server.clients[&id].toast.as_ref().unwrap().0, Outcome::Terminal.message());
-            } else {
-                assert_eq!((kind, payload), (protocol::BYTES, crate::pane::osc52("hello")));
-            }
-            assert_eq!(server.buffers.get(None).unwrap().text, "hello");
-            assert!(protocol::read_frame(&mut frames).unwrap().is_none(), "a copy must have only one transport");
-        }
-    }
-
-    #[test]
-    fn attach_capability_is_optional_and_only_the_requesting_client_gets_the_copy() {
+    fn copies_use_one_structured_message_and_results_are_correlated() {
         let (tx, _events) = queue::channel(4096);
         let mut server = server(tx);
         let (id, _peer) = client(&mut server);
-        for features in [vec![], protocol::client_features()] {
-            let attach = serde_json::json!({"type":"attach", "version":protocol::PROTOCOL_VERSION,
-                "cols":80, "rows":24, "workspace":null, "features":features});
-            server.client_frame(id, protocol::JSON, serde_json::to_vec(&attach).unwrap());
-            assert_eq!(server.clients[&id].clipboard.negotiated, !features.is_empty());
-        }
+        server.keep_copy("hello");
+        let wire = server
+            .clients
+            .get_mut(&id)
+            .unwrap()
+            .clipboard
+            .prepare(Origin::User, "hello", 1024, Instant::now())
+            .unwrap();
+        let mut frames = wire.as_slice();
+        let (kind, payload) = protocol::read_frame(&mut frames).unwrap().unwrap();
+        assert_eq!(kind, protocol::JSON);
+        let ServerMsg::Clipboard { id: copy, origin, text } = serde_json::from_slice(&payload).unwrap() else {
+            panic!()
+        };
+        assert_eq!((origin, text.as_str()), (Origin::User, "hello"));
+        assert!(server.clients[&id].toast.is_none(), "no success before the client reports");
+        server.clipboard_result(id, copy + 1, Outcome::Native, false);
+        assert!(server.clients[&id].toast.is_none());
+        server.clipboard_result(id, copy, Outcome::Terminal, true);
+        assert_eq!(server.clients[&id].toast.as_ref().unwrap().0, Outcome::Terminal.message());
+        assert_eq!(server.messages.iter().filter(|m| m.text.contains("native clipboard unavailable")).count(), 1);
+        server.clipboard_result(id, copy, Outcome::Native, false);
+        assert_eq!(server.clients[&id].toast.as_ref().unwrap().0, Outcome::Terminal.message());
+        assert_eq!(server.buffers.get(None).unwrap().text, "hello");
+        assert!(protocol::read_frame(&mut frames).unwrap().is_none(), "a copy must have only one transport");
+    }
+
+    #[test]
+    fn only_the_requesting_client_gets_the_copy() {
+        let (tx, _events) = queue::channel(4096);
+        let mut server = server(tx);
+        let (id, _peer) = client(&mut server);
         let (other, _peer) = client(&mut server);
         server.clients.get_mut(&id).unwrap().clipboard.prepare(Origin::User, "mine", 1024, Instant::now()).unwrap();
         assert!(server.clients[&id].clipboard.pending.is_some());
@@ -207,7 +184,6 @@ mod tests {
         let (tx, _events) = queue::channel(4096);
         let mut server = server(tx);
         let (id, _peer) = client(&mut server);
-        server.clients.get_mut(&id).unwrap().clipboard.negotiated = true;
         let now = Instant::now();
         for (copy, at) in [(1, now), (2, now + crate::clipboard::INTERVAL)] {
             server.clients.get_mut(&id).unwrap().clipboard.prepare(Origin::User, "text", 1024, at).unwrap();
@@ -249,7 +225,7 @@ mod tests {
 
     #[test]
     fn completed_copies_are_rate_limited_and_unknown_results_never_claim_success() {
-        let mut state = Clipboard { negotiated: true, ..Default::default() };
+        let mut state = Clipboard::default();
         let now = Instant::now();
         state.prepare(Origin::Program, "first", 1024, now).unwrap();
         state.pending = None;
@@ -266,7 +242,6 @@ mod tests {
         let (tx, _events) = queue::channel(4096);
         let mut server = server(tx);
         let (id, _peer) = client(&mut server);
-        server.clients.get_mut(&id).unwrap().clipboard.negotiated = true;
         server.config.clipboard.max_bytes = 5;
         server.copy_to_client(id, "too big");
         assert!(server.clients[&id].toast.as_ref().unwrap().0.contains("too large"));

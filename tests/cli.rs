@@ -270,7 +270,7 @@ impl RawClient {
         let (cols, rows) = size;
         let workspace = serde_json::json!(workspace);
         let hello = format!(
-            r#"{{"type":"attach","version":2,"cols":{cols},"rows":{rows},"workspace":{workspace},"remote":false{installed}}}"#
+            r#"{{"type":"attach","version":3,"cols":{cols},"rows":{rows},"workspace":{workspace},"remote":false{installed}}}"#
         );
         raw_frame(&mut stream, 0, hello.as_bytes());
         let screen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -1293,38 +1293,6 @@ fn newer_state_is_refused_without_falling_back_or_overwriting_either_format() {
     }
 }
 
-#[test]
-fn save_writes_a_definition_that_reopens() {
-    let env = Env::new("save");
-    env.workspace("w", "layout {\n    pane split_direction=\"vertical\" {\n        pane name=\"left\"\n        pane name=\"right\"\n    }\n}\n");
-    env.run(&["open", "w"]);
-    let out = env.run(&["save", "copy", "--workspace", "w"]);
-    assert!(out.contains("copy.kdl"), "{out}");
-    let list = env.run(&["workspaces"]);
-    assert!(list.contains("copy"), "{list}");
-    env.run(&["open", "copy"]);
-    let json = env.run(&["panes", "--json"]);
-    let v: serde_json::Value = serde_json::from_str(&json).unwrap();
-    let lefts = v.as_array().unwrap().iter().filter(|p| p["name"] == "left").count();
-    assert_eq!(lefts, 2, "one in each workspace: {json}");
-    // What has not run yet still waits, and a tab of floating panes alone is kept.
-    env.workspace(
-        "w2",
-        "layout {\n    tab {\n        pane name=\"tiled\"\n        floating_panes {\n            pane name=\"float\" command=\"sleep\" start_suspended=true { args \"100\"; }\n        }\n    }\n}\n",
-    );
-    env.run(&["open", "w2"]);
-    env.run(&["close", "w2:tiled"]);
-    env.run(&["save", "copy2", "--workspace", "w2"]);
-    let saved = std::fs::read_to_string(env.root.join("config/kraal/workspaces/copy2.kdl")).unwrap();
-    assert!(saved.contains("name=\"float\"") && saved.contains("start_suspended=true"), "{saved}");
-    // A name is a file name in the definitions directory, nothing else.
-    for name in ["../escape", "/tmp/escape", ".hidden"] {
-        let out = env.try_run(&["save", name, "--workspace", "w"]);
-        assert!(!out.status.success(), "{name} was accepted");
-    }
-    assert!(!env.root.join("config/kraal/escape.kdl").exists());
-}
-
 /// Saves never take another workspace's source. Other existing files need a confirmation
 /// which preserves the input on Cancel and expires when the file changes again.
 #[test]
@@ -1841,13 +1809,13 @@ fn workspace_saves_check_ownership_and_confirm_the_exact_file() {
     env.workspace("copy", old);
     env.run(&["open", "a"]);
     env.run(&["open", "b"]);
-    let refused = env.try_run(&["save", "b", "--workspace", "a"]);
+    let refused = env.try_run(&["export", dir.join("b.kdl").to_str().unwrap(), "--workspace", "a"]);
     assert!(!refused.status.success());
     assert!(String::from_utf8_lossy(&refused.stderr).contains("belongs to workspace"));
     assert_eq!(std::fs::read_to_string(dir.join("b.kdl")).unwrap(), old);
-    let refused = env.try_run(&["save", "copy", "--workspace", "a"]);
+    let refused = env.try_run(&["export", dir.join("copy.kdl").to_str().unwrap(), "--workspace", "a"]);
     assert!(!refused.status.success());
-    assert!(String::from_utf8_lossy(&refused.stderr).contains("confirm replacement"));
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("--replace"));
     assert!(!dir.join("copy.kdl.bak").exists());
 
     let mut client = RawClient::attach(&env, "a");
@@ -1885,31 +1853,6 @@ fn workspace_saves_check_ownership_and_confirm_the_exact_file() {
     assert_eq!(env.run(&["panes"]).lines().count(), 2);
 }
 
-#[test]
-fn a_cli_save_persists_its_first_link_before_the_periodic_save() {
-    let env = Env::new("wssavelink");
-    env.workspace("base", "layout { pane; }\n");
-    env.run(&["open", "base"]);
-    let mut client = RawClient::attach(&env, "base");
-    client.wait_for_message("\"attached\"");
-    client.send(b"\x02Wn");
-    client.wait_for_row("Name    ");
-    client.send(b"\x01\x0bscratch\r");
-    wait_until(PATIENCE, "scratch was not created", || listed_workspaces(&env).iter().any(|w| w == "scratch:  (open)"));
-    env.run(&["save", "linked", "--workspace", "scratch"]);
-    wait_until(Duration::from_secs(10), "the CLI link was not persisted promptly", || {
-        let Ok(text) = std::fs::read_to_string(env.state_file()) else { return false };
-        let Ok(state) = serde_json::from_str::<serde_json::Value>(&text) else { return false };
-        state["workspaces"].as_array().is_some_and(|list| {
-            list.iter()
-                .any(|w| w["name"] == "scratch" && w["definition"].as_str().is_some_and(|p| p.ends_with("/linked.kdl")))
-        })
-    });
-    env.run(&["kill"]);
-    env.run(&["open", "linked"]);
-    assert_eq!(listed_workspaces(&env), ["base: base.kdl (open)", "scratch: linked.kdl (open)"]);
-}
-
 /// Independent sessions share files, not revisions. They cannot overwrite each other's saves,
 /// including when both try to create the same copy at once.
 #[test]
@@ -1928,17 +1871,19 @@ fn two_sessions_cannot_silently_replace_each_others_layouts() {
     second.run(&["run", "--name", "second", "--", "sleep", "100"]);
     first.run(&["export", shared.join("work.kdl").to_str().unwrap(), "--workspace", "work", "--replace"]);
     let winner = std::fs::read_to_string(shared.join("work.kdl")).unwrap();
-    let refused = second.try_run(&["save", "--workspace", "work"]);
+    let refused = second.try_run(&["export", shared.join("work.kdl").to_str().unwrap(), "--workspace", "work"]);
     assert!(!refused.status.success());
-    assert!(String::from_utf8_lossy(&refused.stderr).contains("File changed"));
+    assert!(String::from_utf8_lossy(&refused.stdout).contains("File changed"));
     assert_eq!(std::fs::read_to_string(shared.join("work.kdl")).unwrap(), winner);
     assert_eq!(std::fs::read_to_string(shared.join("work.kdl.bak")).unwrap(), old);
     // Restarting cannot silently adopt the version written by the other session.
     second.run(&["kill"]);
     second.run(&["open", "work"]);
-    assert!(!second.try_run(&["save", "--workspace", "work"]).status.success());
-    let mut one = first.cmd(&["save", "copy", "--workspace", "work"]);
-    let mut two = second.cmd(&["save", "copy", "--workspace", "work"]);
+    assert!(
+        !second.try_run(&["export", shared.join("work.kdl").to_str().unwrap(), "--workspace", "work"]).status.success()
+    );
+    let mut one = first.cmd(&["export", shared.join("copy.kdl").to_str().unwrap(), "--workspace", "work"]);
+    let mut two = second.cmd(&["export", shared.join("copy.kdl").to_str().unwrap(), "--workspace", "work"]);
     one.stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped());
     two.stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped());
     let one = one.spawn().unwrap();
@@ -1951,11 +1896,11 @@ fn two_sessions_cannot_silently_replace_each_others_layouts() {
     assert!(!shared.join("copy.kdl.bak").exists());
 }
 
-/// `kraal save` run in a pane saves that pane's workspace, as every command run in a pane acts
+/// `kraal export` run in a pane exports that pane's workspace, as every command run in a pane acts
 /// where it runs: not the workspace a terminal shows, nor the first one. `--workspace` names
 /// another, and outside a pane the one on screen is saved.
 #[test]
-fn save_in_a_pane_saves_the_workspace_of_that_pane() {
+fn export_in_a_pane_uses_the_workspace_of_that_pane() {
     let env = Env::new("savehere");
     let dir = env.root.join("config/kraal/workspaces");
     env.workspace("w", "layout {\n    pane name=\"first\"\n}\n");
@@ -1975,16 +1920,16 @@ fn save_in_a_pane_saves_the_workspace_of_that_pane() {
     let saved = |name: &str| std::fs::read_to_string(dir.join(name)).unwrap_or_default();
 
     std::fs::remove_file(dir.join("v.kdl")).unwrap();
-    assert!(in_pane(&["save"]).contains("/v.kdl"));
+    assert!(in_pane(&["export", dir.join("v.kdl").to_str().unwrap()]).contains("/v.kdl"));
     // Recreating a missing definition keeps the persistent lock shared with account migration.
     assert_eq!(names_in(&dir), [".v.kdl.lock", "v.kdl", "w.kdl"]);
-    assert!(in_pane(&["save", "copy"]).contains("/copy.kdl"));
+    assert!(in_pane(&["export", dir.join("copy.kdl").to_str().unwrap()]).contains("/copy.kdl"));
     assert!(saved("copy.kdl").contains("name=\"second\"") && !saved("copy.kdl").contains("first"));
-    assert!(in_pane(&["save", "named", "--workspace", "w"]).contains("/named.kdl"));
+    assert!(in_pane(&["export", dir.join("named.kdl").to_str().unwrap(), "--workspace", "w"]).contains("/named.kdl"));
     assert!(saved("named.kdl").contains("name=\"first\""), "{}", saved("named.kdl"));
     // Outside a pane: the workspace on screen.
     std::fs::remove_file(dir.join("w.kdl")).unwrap();
-    assert!(env.run(&["save"]).contains("/w.kdl"));
+    assert!(env.run(&["export", dir.join("w.kdl").to_str().unwrap()]).contains("/w.kdl"));
 }
 
 /// `kraal workspaces --json`, a line each: name, file, and whether it is open.
@@ -2125,7 +2070,7 @@ fn a_definition_renamed_on_disk_stays_linked() {
     env.run(&["open", "moved"]);
     assert_eq!(env.run(&["panes"]).lines().count(), 1);
     std::fs::remove_file(dir.join("moved.kdl")).unwrap();
-    env.run(&["save", "--workspace", "perso"]);
+    env.run(&["export", dir.join("moved.kdl").to_str().unwrap(), "--workspace", "perso"]);
     assert_eq!(names_in(&dir), [".moved.kdl.lock", "moved.kdl"]);
 }
 
@@ -2300,10 +2245,16 @@ fn stacks_and_layouts_from_the_keys() {
     until("delta stacked", &|| panes().len() == 4 && size("delta") == (46, 34) && size("bravo") == (46, 34));
 
     // Saved, the stack is `stacked=true`, with the pane open `expanded=true`, and opens as one.
-    env.run(&["save", "copy", "--workspace", "w"]);
+    env.run(&["export", env.root.join("config/kraal/workspaces/copy.kdl").to_str().unwrap(), "--workspace", "w"]);
     let saved = std::fs::read_to_string(env.root.join("config/kraal/workspaces/copy.kdl")).unwrap();
     assert!(saved.contains("pane stacked=true") && saved.contains("expanded=true"), "{saved}");
-    env.run(&["open", "copy"]);
+    env.run(&[
+        "import",
+        env.root.join("config/kraal/workspaces/copy.kdl").to_str().unwrap(),
+        "--name",
+        "copy",
+        "--yes",
+    ]);
     let copies = || -> Vec<(u64, u64)> {
         let v: serde_json::Value = serde_json::from_str(&env.run(&["panes", "--json"])).unwrap();
         let mut sizes: Vec<(u64, u64)> = v
@@ -4090,7 +4041,7 @@ fn notify(env: &Env, title: &str, body: &str) {
     let socket = env.root.join("run/kraal").join(format!("{}.sock", env.session));
     let mut stream = std::os::unix::net::UnixStream::connect(socket).unwrap();
     let request = serde_json::json!({ "cmd": "notify", "title": title, "body": body });
-    let message = serde_json::json!({ "type": "request", "version": 2, "request": request });
+    let message = serde_json::json!({ "type": "request", "version": 3, "request": request });
     raw_frame(&mut stream, 0, message.to_string().as_bytes());
     // Answered: the event is out.
     stream.read_exact(&mut [0u8; 5]).unwrap();
@@ -4610,7 +4561,7 @@ fn raw_request(env: &Env, request: serde_json::Value) -> serde_json::Value {
     let socket = env.root.join("run/kraal").join(format!("{}.sock", env.session));
     let mut stream = std::os::unix::net::UnixStream::connect(socket).unwrap();
     stream.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
-    let message = serde_json::json!({ "type": "request", "version": 2, "request": request }).to_string();
+    let message = serde_json::json!({ "type": "request", "version": 3, "request": request }).to_string();
     raw_frame(&mut stream, 0, message.as_bytes());
     let mut header = [0u8; 5];
     stream.read_exact(&mut header).unwrap();
@@ -8910,7 +8861,7 @@ fn login_panes_verify_success_once_and_never_save_the_terminal() {
         open_account_login(&mut second);
         assert_eq!(login_panes(&env)[0]["id"], first[0]["id"], "another client must reuse the login");
         assert_eq!(std::fs::read_to_string(home.join("logins")).unwrap(), "login\n");
-        env.run(&["save", "saved", "--workspace", "w"]);
+        env.run(&["export", env.root.join("config/kraal/workspaces/saved.kdl").to_str().unwrap(), "--workspace", "w"]);
         let layout = std::fs::read_to_string(env.root.join("config/kraal/workspaces/saved.kdl")).unwrap();
         // The shell's cwd contains "login" too: check the pane name and command instead.
         assert!(!layout.contains("name=\"login "), "{layout}");
@@ -9873,7 +9824,7 @@ fn reused_account_names_leave_running_and_saved_references_on_the_original_accou
         panes().as_array().unwrap().iter().find(|p| p["id"].as_u64() == pane.parse::<u64>().ok()).unwrap().clone();
     let id = old["account_id"].as_str().unwrap();
     env.workspace("closed", "// Kept closed.\nlayout { pane agent=\"claude:alpha\" }\n");
-    env.run(&["save", "saved", "--workspace", "w"]);
+    env.workspace("saved", &format!("layout {{ pane agent=\"claude:alpha\" account_id={id:?}; }}\n"));
     env.run(&["accounts", "rename", "claude:alpha", "work"]);
     wait_until(PATIENCE, "pane follows its renamed label", || {
         panes().as_array().unwrap().iter().any(|p| p["account"] == "claude:work" && p["account_id"] == id)
@@ -9928,7 +9879,7 @@ fn reused_account_names_leave_running_and_saved_references_on_the_original_accou
         "account": "alpha", "account_id": id, "placement": "tab", "near": null, "cwd": null }),
     );
     assert!(refused["Err"].as_str().unwrap().contains("account was removed"));
-    // A 0.2 or 0.3 client still selects the current account by name.
+    // An explicit account name selects its current identity.
     let opened = raw_request(
         &env,
         serde_json::json!({ "cmd": "open_agent", "agent": "claude",
@@ -11088,7 +11039,7 @@ fn a_client_with_a_newer_kraal_installed_is_told_the_session_runs_an_older_one()
     env.run(&["open", "w"]);
     let version = env!("CARGO_PKG_VERSION");
     let newer = RawClient::attach_installed(&env, "w", Some("99.0.0"));
-    newer.wait_for_message(&format!(r#"{{"type":"attached","version":"{version}","features":["#));
+    newer.wait_for_message(&format!(r#"{{"type":"attached","version":"{version}","protocol":3"#));
     newer.wait_for_screen(&format!("kraal 99.0.0 installed; this session runs {version}: ctrl+b W r restarts it"));
     let same = RawClient::attach_installed(&env, "w", Some(version));
     same.wait_for_message("\"attached\"");
@@ -11194,7 +11145,7 @@ fn a_restart_wait_given_up_gives_the_terminal_back_once() {
         let mut client = TerminalClient::attach(&env);
         let socket = env.root.join("run/kraal").join(format!("{}.sock", env.session));
         let mut asking = std::os::unix::net::UnixStream::connect(socket).unwrap();
-        raw_frame(&mut asking, 0, br#"{"type":"request","version":2,"request":{"cmd":"kill_server","restart":true}}"#);
+        raw_frame(&mut asking, 0, br#"{"type":"request","version":3,"request":{"cmd":"kill_server","restart":true}}"#);
         client.wait_for("kraal: the session restarts");
         if by_signal {
             client.signal(libc::SIGINT);
@@ -12597,12 +12548,12 @@ fn the_paste_buffers_list_pastes_shows_and_deletes() {
     env.run(&["focus", "src"]);
     let mut client = RawClient::attach(&env, "w");
     client.wait_for_screen("COPY-ME-LINE");
-    // Copy mode: up to the line, select it, copy. It goes to the terminal and to the buffers.
+    // Copy mode sends one structured copy to the client and keeps the text in buffers.
     for key in [&b"\x02v"[..], b"k", b"V", b"y"] {
         client.send(key);
         std::thread::sleep(Duration::from_millis(150));
     }
-    client.wait_for_screen("\x1b]52;c;");
+    client.wait_for_message("\"type\":\"clipboard\"");
     assert!(env.run(&["buffer", "show"]).contains("COPY-ME-LINE"));
     assert!(set_buffer(&env, &[], "older-text").status.success());
     assert!(set_buffer(&env, &[], "newest-text").status.success());
@@ -13414,10 +13365,6 @@ fn importing_a_file_previews_then_keeps_commands_waiting_and_export_preserves_th
     env.run(&["open", "personal"]);
     assert!(!marker.exists());
     assert!(!listed_workspaces(&env).iter().any(|w| w.starts_with("shared:")));
-    let saved = env.try_run(&["save", "legacy-copy", "--workspace", "personal"]);
-    assert!(saved.status.success());
-    assert!(String::from_utf8_lossy(&saved.stderr).contains("Workspaces are saved automatically"));
-    assert!(String::from_utf8_lossy(&saved.stdout).trim_end().ends_with("legacy-copy.kdl"));
 }
 
 #[test]
@@ -14158,7 +14105,11 @@ fn attachment_wire_cancellation_disconnect_and_repeated_finish_do_not_paste_part
     let root = env.root.join("state/kraal/attachments-v1").join(&env.session);
     for outcome in ["cancel", "disconnect", "finish"] {
         let mut client = RawClient::attach(&env, "w");
-        raw_frame(&mut client.stream, 0, br#"{"type":"attach","version":2,"cols":120,"rows":40,"workspace":"w","remote":true,"features":["attachments"]}"#);
+        raw_frame(
+            &mut client.stream,
+            0,
+            br#"{"type":"attach","version":3,"cols":120,"rows":40,"workspace":"w","remote":true}"#,
+        );
         client.send(b"\x02 Attach files\r");
         client.wait_for_message("attachment_offer");
         let token = client
@@ -14284,4 +14235,55 @@ fn host_pasted_paths_preserve_text_send_complete_batches_and_remember_revocable_
     });
     host.type_keys(b"\x02d");
     assert_eq!(host.left("pasted path detach").0, 0);
+}
+
+#[test]
+fn remote_install_restarts_only_the_selected_running_session_and_keeps_failed_restarts_explicit() {
+    for running in [false, true] {
+        for succeeds in [false, true] {
+            let env = Env::new(&format!("remote-install-{running}-{succeeds}"));
+            let bin = env.root.join("bin");
+            std::fs::create_dir_all(&bin).unwrap();
+            let log = env.root.join("ssh.log");
+            write_script(
+                &bin.join("ssh"),
+                r#"#!/bin/sh
+for command do :; done
+printf '%s\n' "$command" >> "$SSH_LOG"
+case "$command" in
+    'uname -sm') uname -sm ;;
+    *' ls'*)
+        printf 'other-session        running  0.2.0\n'
+        if [ "$REMOTE_RUNNING" = true ]; then printf '%s  running  0.2.0\n' "$REMOTE_SESSION"; fi
+        ;;
+    *' restart'*) [ "$RESTART_SUCCEEDS" = true ] ;;
+    *) cat >/dev/null; printf 'kraal installed\n' ;;
+esac
+"#,
+            );
+            let out = env
+                .cmd(&["remote-install", "box"])
+                .env("PATH", format!("{}:{}", bin.display(), std::env::var("PATH").unwrap_or_default()))
+                .env("SSH_LOG", &log)
+                .env("REMOTE_SESSION", &env.session)
+                .env("REMOTE_RUNNING", running.to_string())
+                .env("RESTART_SUCCEEDS", succeeds.to_string())
+                .stdin(std::process::Stdio::null())
+                .output()
+                .unwrap();
+            let commands = std::fs::read_to_string(log).unwrap();
+            assert_eq!(commands.contains(" restart"), running, "{commands}");
+            assert!(!commands.contains("-s other-session"), "{commands}");
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert_eq!(out.status.success(), !running || succeeds, "{stdout}\n{stderr}");
+            if running && !succeeds {
+                assert!(stderr.contains("was not restarted"), "{stderr}");
+                assert!(stderr.contains(&format!("kraal -s {} remote-install box", env.session)), "{stderr}");
+                assert!(!stdout.contains("Attach with"));
+            } else {
+                assert!(stdout.contains(&format!("kraal -s {} attach --host box", env.session)), "{stdout}");
+            }
+        }
+    }
 }

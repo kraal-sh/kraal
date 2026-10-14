@@ -1,7 +1,6 @@
 //! Workspace definitions (`.kdl` files): finding, opening and saving them.
 
 use std::collections::HashSet;
-use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -18,8 +17,6 @@ pub struct DefinitionSave {
     pub path: PathBuf,
     pub revision: paths::FileRevision,
     pub question: Option<String>,
-    link: bool,
-    portable: bool,
 }
 
 impl Server {
@@ -168,24 +165,6 @@ impl Server {
         Ok(id)
     }
 
-    pub(super) fn prepare_definition_save(&self, wi: usize, name: &str) -> Result<DefinitionSave> {
-        anyhow::ensure!(workspace::valid_file_name(name), "{}, not {name:?}", workspace::FILE_NAME_RULE);
-        let ws = &self.workspaces[wi];
-        let own = ws.definition.as_ref().filter(|p| p.file_stem() == Some(OsStr::new(name)));
-        let path = own.cloned().unwrap_or_else(|| self.definition_dir().join(format!("{name}.kdl")));
-        self.check_definition_owner(wi, &path)?;
-        std::fs::create_dir_all(path.parent().context("no destination directory")?)?;
-        let revision = paths::FileRevision::read(&path)
-            .with_context(|| format!("reading {}; choose another name or fix the file", path.display()))?;
-        if revision.bytes.is_some() {
-            self.check_definition_owner(wi, &revision.target.with_extension("kdl.bak"))?;
-        }
-        let question = revision.bytes.as_ref().map(|_| {
-            replacement_question(&path, own.and(ws.definition_source.as_ref()).map(String::as_str), &revision)
-        });
-        Ok(DefinitionSave { path, revision, question, link: own.is_some() || ws.definition.is_none(), portable: false })
-    }
-
     pub(super) fn prepare_layout_export(&self, wi: usize, path: &Path) -> Result<DefinitionSave> {
         self.check_definition_owner(wi, path)?;
         let parent = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
@@ -199,7 +178,7 @@ impl Server {
         let source =
             ws.definition.as_deref().filter(|p| paths::same_file(p, &path)).and(ws.definition_source.as_deref());
         let question = revision.bytes.as_ref().map(|_| replacement_question(&path, source, &revision));
-        Ok(DefinitionSave { path, revision, question, link: false, portable: true })
+        Ok(DefinitionSave { path, revision, question })
     }
 
     pub(super) fn export_file_default(&self, wi: usize) -> PathBuf {
@@ -236,48 +215,40 @@ impl Server {
     }
 
     pub(super) fn write_definition(&mut self, wi: usize, name: &str, save: &DefinitionSave) -> Result<PathBuf> {
-        let current = if save.portable {
-            self.prepare_layout_export(wi, &save.path)?
-        } else {
-            self.prepare_definition_save(wi, name)?
-        };
+        let current = self.prepare_layout_export(wi, &save.path)?;
         anyhow::ensure!(
-            current.path == save.path && current.link == save.link && current.revision == save.revision,
+            current.path == save.path && current.revision == save.revision,
             "File changed while saving; retry to review {}",
             save.path.display()
         );
         let mut def = self.snapshot_definition(wi, name)?;
-        if save.portable {
-            def.portable_accounts();
-        }
+        def.portable_accounts();
         let removed = self.removed_sources.clone();
-        if save.portable {
-            // Publication replaces a directory entry. A hard link to the source becomes
-            // a separate file, while a symlink still writes through to the source entry.
-            if self.workspaces[wi].definition.as_deref().is_none_or(|p| {
-                std::fs::canonicalize(p).unwrap_or_else(|_| workspace::definition_path(p)) != save.revision.target
-            }) && !self.removed_sources.contains(&save.path)
-            {
-                // Keep a scanned export from appearing as a second workspace, including after a crash.
-                self.removed_sources.push(save.path.clone());
-            }
-            if let Err(e) = self.save_now() {
-                self.removed_sources = removed;
-                self.mark_persist();
-                let rollback = self.save_now();
-                anyhow::bail!(
-                    "Couldn't prepare the export. The file is unchanged. Fix the save error and Retry.\n{e}{}",
-                    rollback
-                        .err()
-                        .map(|e| format!("\nCouldn't restore the saved listing; retry will repair it.\n{e}"))
-                        .unwrap_or_default()
-                );
-            }
+        // Publication replaces a directory entry. A hard link to the source becomes
+        // a separate file, while a symlink still writes through to the source entry.
+        if self.workspaces[wi].definition.as_deref().is_none_or(|p| {
+            std::fs::canonicalize(p).unwrap_or_else(|_| workspace::definition_path(p)) != save.revision.target
+        }) && !self.removed_sources.contains(&save.path)
+        {
+            // Keep a scanned export from appearing as a second workspace, including after a crash.
+            self.removed_sources.push(save.path.clone());
+        }
+        if let Err(e) = self.save_now() {
+            self.removed_sources = removed;
+            self.mark_persist();
+            let rollback = self.save_now();
+            anyhow::bail!(
+                "Couldn't prepare the export. The file is unchanged. Fix the save error and Retry.\n{e}{}",
+                rollback
+                    .err()
+                    .map(|e| format!("\nCouldn't restore the saved listing; retry will repair it.\n{e}"))
+                    .unwrap_or_default()
+            );
         }
         let source = match workspace::save_file(&save.path, &def, &save.revision) {
             Ok(source) => source,
             Err(e) => {
-                if save.portable && self.removed_sources != removed {
+                if self.removed_sources != removed {
                     self.removed_sources = removed;
                     self.mark_persist();
                     if let Err(rollback) = self.save_now() {
@@ -289,7 +260,7 @@ impl Server {
                 return Err(e);
             }
         };
-        if save.link || self.workspaces[wi].definition.as_deref().is_some_and(|p| paths::same_file(p, &save.path)) {
+        if self.workspaces[wi].definition.as_deref().is_some_and(|p| paths::same_file(p, &save.path)) {
             self.workspace_order = self.updated_workspace_order();
             self.workspaces[wi].set_definition(Some(&save.path));
             self.workspaces[wi].definition_source = Some(source);
@@ -298,35 +269,13 @@ impl Server {
             self.bind_workspace_order(self.workspaces[wi].id);
             self.mark_persist();
         }
-        if save.portable {
-            self.workspace_order.retain(|key| {
-                !matches!(key, crate::persist::WorkspaceKey::Source(path) if path == &save.path && self.removed_sources.contains(path))
-            });
-            self.mark_persist();
-            self.refresh_workspace_pickers();
-        }
+        self.workspace_order.retain(|key| {
+            !matches!(key, crate::persist::WorkspaceKey::Source(path) if path == &save.path && self.removed_sources.contains(path))
+        });
+        self.mark_persist();
+        self.refresh_workspace_pickers();
         self.mark_dirty();
         Ok(save.path.clone())
-    }
-
-    pub(super) fn save_definition(&mut self, wi: usize, name: &str) -> Result<PathBuf> {
-        let save = self.prepare_definition_save(wi, name)?;
-        if let Some(question) = &save.question {
-            anyhow::bail!(
-                "{question} Choose another name with `kraal save <name>`, or use Export layout in kraal to confirm replacement."
-            );
-        }
-        self.write_definition(wi, name, &save)
-    }
-
-    /// The name workspace `wi` is saved under when none is given: its definition file's, else
-    /// one made from its own name.
-    pub(super) fn definition_file_name(&self, wi: usize) -> String {
-        let ws = &self.workspaces[wi];
-        match ws.definition.as_deref().and_then(Path::file_stem) {
-            Some(stem) => stem.to_string_lossy().into_owned(),
-            None => workspace::file_name_from(&ws.name),
-        }
     }
 
     /// Spawn every pane of a definition into a new workspace.
@@ -672,7 +621,9 @@ mod tests {
 
     fn server() -> Server {
         let (tx, _rx) = super::super::queue::channel(32);
-        super::super::tests::server(tx)
+        let mut server = super::super::tests::server(tx);
+        super::super::persistence::tests::writer(&mut server, vec![]);
+        server
     }
 
     fn directory(name: &str) -> PathBuf {
@@ -719,8 +670,15 @@ mod tests {
             ws.tabs.push(crate::server::Tab::new(99, String::new()));
         }
         assert!(server.open_workspace("same").unwrap_err().to_string().contains("several saved workspaces"));
-        let result =
-            server.request(0, crate::protocol::Request::SaveWorkspace { workspace: Some("same".into()), name: None });
+        let result = server.request(
+            0,
+            crate::protocol::Request::ExportWorkspace {
+                workspace: Some("same".into()),
+                identity: None,
+                path: "/unused.kdl".into(),
+                expected: None,
+            },
+        );
         assert!(result.unwrap().unwrap_err().contains("several saved workspaces"));
         server.unrestored = crate::persist::snapshot(&server).workspaces.into_iter().skip(1).collect();
         server.workspaces.pop();
@@ -769,7 +727,7 @@ mod tests {
         let mut server = server();
         let wi = linked(&mut server, &path, "layout { pane; }");
         let other = server.new_workspace("other".into(), Some(path.clone()));
-        assert!(server.save_definition(wi, "work").unwrap_err().to_string().contains("belongs to workspace"));
+        assert!(server.prepare_layout_export(wi, &path).err().unwrap().to_string().contains("belongs to workspace"));
         let oi = server.ws_index(other).unwrap();
         for alias in ["symlink.kdl", "hardlink.kdl"] {
             let alias = dir.join(alias);
@@ -779,18 +737,18 @@ mod tests {
                 std::fs::hard_link(&path, &alias).unwrap();
             }
             server.workspaces[oi].set_definition(Some(&alias));
-            assert!(server.save_definition(wi, "work").is_err());
+            assert!(server.prepare_layout_export(wi, &path).is_err());
             assert_eq!(server.definition_workspace(&alias).unwrap(), Some(other));
         }
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "layout { pane; }");
         assert!(!path.with_extension("kdl.bak").exists());
         std::fs::remove_file(&path).unwrap();
         server.workspaces[oi].set_definition(Some(&dir.join("symlink.kdl")));
-        assert!(server.save_definition(wi, "work").is_err(), "a missing file is still owned through its symlink");
+        assert!(server.prepare_layout_export(wi, &path).is_err(), "a missing file is still owned through its symlink");
         // A workspace whose panes could not be restored owns its file too.
         server.unrestored = crate::persist::snapshot(&server).workspaces.into_iter().skip(1).collect();
         server.workspaces.pop();
-        assert!(server.save_definition(wi, "work").is_err());
+        assert!(server.prepare_layout_export(wi, &path).is_err());
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -808,18 +766,18 @@ mod tests {
         let mut server = server();
         let id = server.open_definition(&a).unwrap();
         let wi = server.ws_index(id).unwrap();
-        let save = server.prepare_definition_save(wi, "a").unwrap();
+        let save = server.prepare_layout_export(wi, &a).unwrap();
         assert!(save.question.is_some());
         server.open_definition(&b).unwrap();
         assert_eq!(server.workspaces.len(), 2);
         let error = server.write_definition(wi, "a", &save).unwrap_err().to_string();
         assert!(error.contains("belongs to workspace \"b\""), "{error}");
         assert!(error.contains(&backup.display().to_string()), "{error}");
-        assert!(server.save_definition(wi, "a").unwrap_err().to_string().contains("belongs to workspace \"b\""));
+        assert!(server.prepare_layout_export(wi, &a).err().unwrap().to_string().contains("belongs to workspace \"b\""));
         // A workspace that could not restore its panes also owns its backup destination.
         server.unrestored = crate::persist::snapshot(&server).workspaces.into_iter().skip(1).collect();
         server.workspaces.pop();
-        assert!(server.save_definition(wi, "a").unwrap_err().to_string().contains("belongs to workspace \"b\""));
+        assert!(server.prepare_layout_export(wi, &a).err().unwrap().to_string().contains("belongs to workspace \"b\""));
         assert_eq!(std::fs::read_to_string(&a).unwrap(), source);
         assert_eq!(std::fs::read_to_string(&b).unwrap(), other);
         assert_eq!(std::fs::read_link(&a).unwrap(), target);
@@ -897,7 +855,7 @@ mod tests {
         assert_eq!(server.workspaces[wi].definition.as_deref(), Some(moved.as_path()));
         assert_eq!(server.workspaces[wi].definition_source.as_deref(), Some(source));
         std::fs::write(&moved, "a later edit").unwrap();
-        assert!(server.prepare_definition_save(wi, "moved").unwrap().question.is_some());
+        assert!(server.prepare_layout_export(wi, &moved).unwrap().question.is_some());
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -908,27 +866,28 @@ mod tests {
         let mut server = server();
         let wi = linked(&mut server, &path, "layout { pane; }");
         server.persist_dirty = false;
-        assert!(server.save_definition(wi, "work").is_err());
-        let confirmed = server.prepare_definition_save(wi, "work").unwrap();
+        assert!(server.prepare_layout_export(wi, &path).unwrap().question.is_some());
+        let confirmed = server.prepare_layout_export(wi, &path).unwrap();
         assert!(confirmed.question.as_ref().unwrap().contains("Comments and unsupported KDL"));
         server.write_definition(wi, "work", &confirmed).unwrap();
         assert!(server.persist_dirty);
         let saved = std::fs::read_to_string(&path).unwrap();
         assert_eq!(server.workspaces[wi].definition_source.as_deref(), Some(saved.as_str()));
-        assert!(server.prepare_definition_save(wi, "work").unwrap().question.is_some());
+        assert!(server.prepare_layout_export(wi, &path).unwrap().question.is_some());
         std::fs::write(&path, "invalid external KDL").unwrap();
         server.follow_definitions(&[(path.clone(), workspace::load_file(&path))]);
         assert_eq!(server.workspaces[wi].definition_source.as_deref(), Some(saved.as_str()));
-        assert!(server.save_definition(wi, "work").unwrap_err().to_string().contains("File changed"));
-        let confirmed = server.prepare_definition_save(wi, "work").unwrap();
+        assert!(server.prepare_layout_export(wi, &path).unwrap().question.unwrap().contains("File changed"));
+        let confirmed = server.prepare_layout_export(wi, &path).unwrap();
         std::fs::write(&path, "another external edit").unwrap();
         assert!(server.write_definition(wi, "work", &confirmed).is_err());
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "another external edit");
-        let confirmed = server.prepare_definition_save(wi, "work").unwrap();
+        let confirmed = server.prepare_layout_export(wi, &path).unwrap();
         server.write_definition(wi, "work", &confirmed).unwrap();
         assert_eq!(std::fs::read_to_string(path.with_extension("kdl.bak")).unwrap(), "another external edit");
         std::fs::remove_file(&path).unwrap();
-        server.save_definition(wi, "work").unwrap();
+        let save = server.prepare_layout_export(wi, &path).unwrap();
+        server.write_definition(wi, "work", &save).unwrap();
         assert!(path.exists());
         std::fs::remove_dir_all(dir).unwrap();
     }
@@ -939,89 +898,10 @@ mod tests {
         let path = dir.join("work.kdl");
         let mut server = server();
         let wi = linked(&mut server, &path, "layout { pane; }");
-        let save = server.prepare_definition_save(wi, "work").unwrap();
+        let save = server.prepare_layout_export(wi, &path).unwrap();
         server.new_workspace("other".into(), Some(path.clone()));
         assert!(server.write_definition(wi, "work", &save).unwrap_err().to_string().contains("belongs to workspace"));
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "layout { pane; }");
-        std::fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[test]
-    fn cli_links_are_marked_for_persistence_and_sources_survive_a_restart() {
-        use crate::protocol::{Request, Response};
-        // Saves by name write in the workspaces directory, where the other tests list workspaces.
-        if !crate::testing::in_own_process(
-            "server::definitions::tests::cli_links_are_marked_for_persistence_and_sources_survive_a_restart",
-        ) {
-            return;
-        }
-        let mut server = server();
-        let name = format!("w2-cli-link-{}", std::process::id());
-        let id = server.new_workspace(name.clone(), None);
-        let dir = directory("persistence");
-        let preview = dir.join("preview.txt");
-        std::fs::write(&preview, "kept").unwrap();
-        server
-            .spawn_pane_in(
-                id,
-                None,
-                PaneSpec { preview: Some(preview), ..Default::default() },
-                crate::protocol::Placement::Tab,
-                None,
-            )
-            .unwrap();
-        server.persist_dirty = false;
-        let response = server.request(0, Request::SaveWorkspace { workspace: Some(name), name: None });
-        let Some(Ok(Response::Path(path))) = response else { panic!("save failed") };
-        assert!(server.persist_dirty);
-        let snap = crate::persist::snapshot(&server);
-        assert_eq!(snap.workspaces[0].definition, Some(workspace::definition_path(&path)));
-        let source = snap.workspaces[0].definition_source.clone().unwrap();
-        std::fs::write(&path, "layout { pane name=\"edited while stopped\"; }").unwrap();
-        let mut json = serde_json::to_value(&snap).unwrap();
-        let mut restored = self::server();
-        crate::persist::apply(&mut restored, serde_json::from_value(json.clone()).unwrap()).unwrap();
-        assert_eq!(restored.workspaces[0].definition_source.as_deref(), Some(source.as_str()));
-        let name = restored.definition_file_name(0);
-        assert!(restored.save_definition(0, &name).is_err());
-        // Old snapshots have no baseline. They load, but cannot silently authorize replacement.
-        json["workspaces"][0].as_object_mut().unwrap().remove("definition_source");
-        let mut legacy = self::server();
-        crate::persist::apply(&mut legacy, serde_json::from_value(json).unwrap()).unwrap();
-        assert_eq!(legacy.workspaces.len(), 1);
-        assert!(legacy.workspaces[0].definition_source.is_none());
-        assert!(legacy.save_definition(0, &name).is_err());
-        assert_eq!(server.workspaces[0].id, id);
-        std::fs::remove_file(path).unwrap();
-        std::fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[test]
-    fn a_copy_keeps_the_original_link_and_first_save_collision_needs_confirmation() {
-        // Saves by name write in the workspaces directory, where the other tests list workspaces.
-        if !crate::testing::in_own_process(
-            "server::definitions::tests::a_copy_keeps_the_original_link_and_first_save_collision_needs_confirmation",
-        ) {
-            return;
-        }
-        let dir = directory("copy");
-        let path = dir.join("work.kdl");
-        let mut server = server();
-        let wi = linked(&mut server, &path, "layout { pane; }");
-        let name = format!("w2-copy-{}", std::process::id());
-        let copy = server.save_definition(wi, &name).unwrap();
-        assert_eq!(server.workspaces[wi].definition.as_deref(), Some(path.as_path()));
-        assert!(server.save_definition(wi, &name).unwrap_err().to_string().contains("Replace file?"));
-        let scratch = server.new_workspace("scratch".into(), None);
-        let si = server.ws_index(scratch).unwrap();
-        assert!(server.save_definition(si, &name).is_err());
-        assert!(server.workspaces[si].definition.is_none());
-        let save = server.prepare_definition_save(si, &name).unwrap();
-        server.write_definition(si, &name, &save).unwrap();
-        assert_eq!(server.workspaces[si].definition, Some(workspace::definition_path(&copy)));
-        assert!(server.save_definition(wi, &name).unwrap_err().to_string().contains("belongs to workspace"));
-        std::fs::remove_file(copy.with_extension("kdl.bak")).unwrap();
-        std::fs::remove_file(copy).unwrap();
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

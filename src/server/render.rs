@@ -2576,7 +2576,6 @@ mod tests {
                     let (id, _peer) = super::super::tests::client(&mut server);
                     let c = server.clients.get_mut(&id).unwrap();
                     (c.cols, c.rows, c.remote) = (cols, rows, remote);
-                    c.clipboard.negotiated = true;
                     c.clipboard.pending = Some((1, ClipboardOrigin::User, Instant::now()));
                     server.clipboard_result(id, 1, outcome, false);
                     assert_eq!(server.clients[&id].toast.as_ref().unwrap().2, kind);

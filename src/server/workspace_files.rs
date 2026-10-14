@@ -297,11 +297,6 @@ mod tests {
         for absent in [account.id.as_str(), account.name.as_str(), session.as_str(), "--resume", "--session-id"] {
             assert!(!bytes.contains(absent), "{bytes}");
         }
-        let legacy = server.prepare_definition_save(wi, "agent").unwrap();
-        server.write_definition(wi, "agent", &legacy).unwrap();
-        let bytes = std::fs::read_to_string(&path).unwrap();
-        assert!(bytes.contains(&account.id) && bytes.contains("claude:local-private"));
-        assert!(!bytes.contains(&session));
         std::fs::remove_dir_all(dir).unwrap();
     }
 

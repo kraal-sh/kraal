@@ -292,64 +292,41 @@ pub fn request(socket: &Path, req: Request) -> Result<Response> {
         paths::private_runtime_dir().context("checking the runtime directory")?;
     }
     let no_server = || format!("no kraal server at {} (is it running?)", socket.display());
-    let needs = req.needs();
-    // A server without this feature would not refuse the request: it would quietly do less.
-    if let Some(feature) = needs.filter(|f| f.check_first) {
-        require_feature(socket, feature)?;
-    }
     let stream = UnixStream::connect(socket).with_context(no_server)?;
     request_connected(socket, stream, req)
 }
 
-/// Check before local preparation for an action that needs a running server's feature.
-pub(crate) fn require_feature(socket: &Path, feature: protocol::Feature) -> Result<()> {
-    let server = ping(socket).with_context(|| format!("no kraal server at {} (is it running?)", socket.display()))?;
-    anyhow::ensure!(server.has(feature), "{}", server.cannot(feature.does));
+/// Refuse before preparation that would otherwise modify local files.
+pub(crate) fn require_protocol(socket: &Path) -> Result<()> {
+    let server = ping(socket)?;
+    anyhow::ensure!(server.protocol == protocol::PROTOCOL_VERSION, "{}", server.mismatch(None));
     Ok(())
 }
 
-/// Send after any required feature check, on an established connection: a caller choosing
-/// between a server and a stopped session must not reconnect and mistake a failed request for
-/// a server that was never there. Once sent, the request may have changed the server's files.
+/// Use the established connection so a failed mutation is never treated as a stopped session.
 pub(crate) fn request_connected(socket: &Path, mut stream: UnixStream, req: Request) -> Result<Response> {
-    let needs = req.needs();
-    let msg = ClientMsg::request(req);
-    match exchange(&mut stream, &msg)? {
+    match exchange(&mut stream, &ClientMsg::request(req))? {
         Ok(answer) => Ok(answer),
-        Err(e) if protocol::refused_as_unknown(&e) => {
-            let name = match &msg {
-                ClientMsg::Request { request, .. } => request.name(),
-                _ => String::new(),
-            };
-            bail!(refusal(socket, needs, &name, e))
+        Err(error) => {
+            if (legacy_refusal_release(&error).is_some()
+                || error.starts_with("bad message:")
+                || error.starts_with(protocol::UNSUPPORTED))
+                && let Ok(server) = ping(socket)
+                && server.protocol != protocol::PROTOCOL_VERSION
+            {
+                bail!(server.mismatch(None));
+            }
+            bail!(error)
         }
-        Err(e) => bail!(e),
     }
 }
 
-/// What to say when the server behind `socket` could not read the request `name`: the
-/// server's own words, unless it is a kraal that lacks what the request needs.
-fn refusal(socket: &Path, needs: Option<protocol::Feature>, name: &str, said: String) -> String {
-    let Ok(server) = ping(socket) else { return said };
-    if needs.is_some_and(|f| server.has(f)) {
-        return said;
-    }
-    if protocol::newer(&server.version, protocol::KRAAL_VERSION) {
-        let (session, version) = (&server.session, &server.version);
-        return format!("{said} (session {session} runs kraal {version}, newer than this one: `kraal update`)");
-    }
-    match needs {
-        Some(feature) => server.cannot(feature.does),
-        None => server.cannot(&format!("answer `{name}`")),
-    }
-}
-
-/// One request to a server that may not answer, given up on after `limit`; a refusal is said
-/// as the server said it.
-pub fn request_within(socket: &Path, req: Request, limit: Duration) -> Result<Response> {
+/// Upgrade inspection of a server, including protocol 2 migration sources.
+pub fn upgrade_request_within(socket: &Path, req: Request, limit: Duration) -> Result<Response> {
     let deadline = Instant::now() + limit;
+    let version = if matches!(req, Request::Ping) { protocol::upgrade_protocol() } else { ping(socket)?.protocol };
     let mut stream = UnixStream::connect(socket)?;
-    exchange_until(&mut stream, &ClientMsg::request(req), deadline)?.map_err(anyhow::Error::msg)
+    exchange_until(&mut stream, &ClientMsg::Request { version, request: req }, deadline)?.map_err(anyhow::Error::msg)
 }
 
 /// [`exchange`], given up on at `deadline`: the server sends one answer.
@@ -400,18 +377,17 @@ pub struct ServerInfo {
     pub session: String,
     /// Its kraal release.
     pub version: String,
-    /// Its [`protocol::Feature`]s; `None` from a server older than that list.
-    pub features: Option<Vec<String>>,
+    pub protocol: u32,
 }
 
 impl ServerInfo {
-    pub fn has(&self, feature: protocol::Feature) -> bool {
-        self.features.as_ref().is_some_and(|list| list.iter().any(|f| f == feature.name))
+    fn mismatch(&self, host: Option<&str>) -> String {
+        protocol::version_mismatch(protocol::PROTOCOL_VERSION, self.protocol, &self.version, &self.session, host)
     }
 
     /// A downgraded server saves separately: restarting it cannot replace newer state or undo Forget.
     pub fn check_restart(&self) -> Result<()> {
-        if self.has(protocol::STATE_V2) {
+        if self.protocol > protocol::upgrade_protocol() {
             return Ok(());
         }
         let (session, version) = (&self.session, &self.version);
@@ -437,14 +413,6 @@ impl ServerInfo {
         }
         Ok(())
     }
-
-    /// That this server's kraal cannot do `what`, and that a restart updates it.
-    pub fn cannot(&self, what: &str) -> String {
-        let (session, version) = (&self.session, &self.version);
-        format!(
-            "session {session} runs kraal {version}, which cannot {what}: `kraal -s {session} restart` updates it (its layout and scrollback are kept)"
-        )
-    }
 }
 
 /// Whether a stopped server saved its layout.
@@ -457,7 +425,7 @@ pub enum Saved {
 }
 
 /// Stop the server behind `socket` and wait until it has exited ([`STOP_TIMEOUT`] at most). A
-/// server from another kraal version refuses every request, so when asking fails it gets
+/// server whose upgrade control requests are unknown gets
 /// SIGTERM, which every version handles the same way: save the layout, then exit.
 pub fn kill_server(socket: &Path) -> Result<Saved> {
     stop_server(socket, false)
@@ -495,8 +463,8 @@ pub fn keep_from_restart(session: &str) -> Result<paths::Restarting> {
 
 /// What the server behind `socket` is, given up on quickly when it does not answer.
 pub fn ping(socket: &Path) -> Result<ServerInfo> {
-    match request_within(socket, Request::Ping, Duration::from_secs(2))? {
-        Response::Pong { pid, session, version, features } => Ok(ServerInfo { pid, session, version, features }),
+    match upgrade_request_within(socket, Request::Ping, Duration::from_secs(2))? {
+        Response::Pong { pid, session, version, protocol } => Ok(ServerInfo { pid, session, version, protocol }),
         _ => bail!("unexpected answer from the server"),
     }
 }
@@ -551,8 +519,8 @@ const STOP_TIMEOUT: Duration = Duration::from_secs(30);
 
 fn stop_server(socket: &Path, restart: bool) -> Result<Saved> {
     let deadline = Instant::now() + STOP_TIMEOUT;
-    // A server that answers speaks this protocol: its refusal to restart stands (it could not
-    // save the session first). One of another protocol refuses every request.
+    // A known server can refuse a restart when saving fails. Never replace that refusal
+    // with a signal that would lose the session.
     let refusal_stands = restart && ping(socket).is_ok();
     let mut stream = UnixStream::connect(socket)
         .with_context(|| format!("no kraal server at {} (is it running?)", socket.display()))?;
@@ -561,7 +529,7 @@ fn stop_server(socket: &Path, restart: bool) -> Result<Saved> {
     if uid != unsafe { libc::getuid() } {
         bail!("{} belongs to another user", socket.display());
     }
-    let ask = ClientMsg::request(Request::KillServer { restart });
+    let ask = ClientMsg::Request { version: protocol::upgrade_protocol(), request: Request::KillServer { restart } };
     let answer = exchange_until(&mut stream, &ask, deadline).and_then(|a| a.map_err(anyhow::Error::msg));
     let saved = match answer {
         Ok(Response::Text(why)) => Saved::No(why),
@@ -597,6 +565,7 @@ pub fn subscribe(
     on_ready: impl FnOnce(),
     mut on_event: impl FnMut(&serde_json::Value) -> bool,
 ) -> Result<()> {
+    require_protocol(socket)?;
     let mut on_ready = Some(on_ready);
     let mut stream = UnixStream::connect(socket)
         .with_context(|| format!("no kraal server at {} (is it running?)", socket.display()))?;
@@ -813,6 +782,8 @@ pub enum Target {
         ssh: Vec<String>,
         session: String,
         label: String,
+        /// The original `--host` argument, used in recovery commands.
+        host: String,
         /// A pane of that session to show on the first connection (an id or a name).
         pane: Option<String>,
         clipboard_native: bool,
@@ -950,7 +921,6 @@ fn greet(target: &Target, workspace: &Option<String>) -> Result<Greeted, String>
         },
         // A local client is the kraal installed on the server's machine; a remote one may not be.
         installed: matches!(target, Target::Local { .. }).then(|| protocol::KRAAL_VERSION.to_string()),
-        features: protocol::client_features(),
     };
     if protocol::write_json(&mut conn.writer, &hello).is_err() {
         return Err(conn.why_lost("could not talk to the server"));
@@ -958,10 +928,40 @@ fn greet(target: &Target, workspace: &Option<String>) -> Result<Greeted, String>
     let mut frames =
         std::io::BufReader::with_capacity(256 * 1024, std::mem::replace(&mut conn.reader, Box::new(std::io::empty())));
     match protocol::read_frame(&mut frames) {
-        Ok(Some(first)) => Ok(Greeted { conn, frames, first }),
+        Ok(Some(mut first)) => {
+            if first.0 == protocol::JSON
+                && let Ok(ServerMsg::Exit { reason, .. }) = serde_json::from_slice(&first.1)
+                && let Some(release) = legacy_refusal_release(&reason)
+            {
+                let (session, host) = match target {
+                    Target::Local { session } => (session, None),
+                    Target::Remote { session, host, .. } => (session, Some(host.as_str())),
+                };
+                let reason = protocol::version_mismatch(
+                    protocol::PROTOCOL_VERSION,
+                    protocol::upgrade_protocol(),
+                    release,
+                    session,
+                    host,
+                );
+                first.1 = serde_json::to_vec(&ServerMsg::exit(reason)).expect("exit message");
+            }
+            Ok(Greeted { conn, frames, first })
+        }
         Ok(None) => Err(conn.why_lost("the connection closed")),
         Err(e) => Err(conn.why_lost(&format!("connection error: {e}"))),
     }
+}
+
+// Released servers use different refusal messages. Normalize them so a remote attachment
+// names a recovery command to run on this machine.
+fn legacy_refusal_release(reason: &str) -> Option<&str> {
+    if reason.starts_with("protocol mismatch: server v2, client v") {
+        return Some("0.2.0");
+    }
+    let (_, rest) = reason.split_once(" runs kraal ")?;
+    let (release, rest) = rest.split_once(", ")?;
+    rest.starts_with("too old for this kraal:").then_some(release)
 }
 
 /// Whether keyboard reading is paused (ssh is asking something in the terminal). Each pause has
@@ -1090,23 +1090,6 @@ fn read_keys(fd: std::os::unix::io::RawFd, pause: &KeysPause, mut forward: impl 
     }
 }
 
-fn clipboard_available(frame: &(u8, Vec<u8>)) -> bool {
-    frame.0 == protocol::JSON
-        && matches!(serde_json::from_slice(&frame.1),
-        Ok(ServerMsg::Attached { features: Some(features), .. })
-            if features.iter().any(|f| f == protocol::CLIPBOARD.name))
-}
-
-fn clipboard_restart(target: &Target) -> String {
-    let (session, where_to) = match target {
-        Target::Local { session } => (session, String::new()),
-        Target::Remote { session, label, .. } => (session, format!("on {label}, ")),
-    };
-    format!(
-        "this session cannot disable external copying; {where_to}run `kraal -s {session} restart`, then attach again"
-    )
-}
-
 /// Attach the current terminal to a session. Remote sessions reconnect by themselves when the
 /// connection drops; their programs keep running on the server meanwhile. `attached` runs once
 /// the session first answered, before the terminal changes.
@@ -1143,9 +1126,6 @@ pub fn attach(mut target: Target, mut workspace: Option<String>, mouse: bool, at
         (first.first.0, serde_json::from_slice(&first.first.1))
     {
         bail!(reason);
-    }
-    if clipboard_policy.settings.mode == crate::clipboard::Mode::Off && !clipboard_available(&first.first) {
-        bail!(clipboard_restart(&target));
     }
     // The pane asked for is shown once: a reconnection leaves the session where it is.
     if let Target::Remote { pane, .. } = &mut target {
@@ -1274,9 +1254,6 @@ pub fn attach(mut target: Target, mut workspace: Option<String>, mouse: bool, at
                     let _ = terminal().write(said.as_bytes());
                 }
                 *writer.lock().unwrap() = Some(to_server);
-                if clipboard_policy.settings.mode == crate::clipboard::Mode::Off && !clipboard_available(&first) {
-                    break 'session clipboard_restart(&target);
-                }
                 let clipboard_writer = writer.clone();
                 let clipboard = crate::clipboard::Worker::start(
                     clipboard_policy.clone(),
@@ -1295,10 +1272,6 @@ pub fn attach(mut target: Target, mut workspace: Option<String>, mouse: bool, at
                     },
                 )?;
                 delay = Duration::from_secs(1);
-                let mut clipboard_negotiated = false;
-                let mut attachments_negotiated = false;
-                let mut images_negotiated = false;
-                let mut agent_clipboard = false;
                 let mut next = Some(Ok(Some(first)));
                 let lost = loop {
                     match next.take().unwrap_or_else(|| protocol::read_frame(&mut frames)) {
@@ -1318,38 +1291,18 @@ pub fn attach(mut target: Target, mut workspace: Option<String>, mouse: bool, at
                                 restarting = Some(c.server);
                                 break "the session restarts".to_string();
                             }
-                            Ok(ServerMsg::Attached { version, features }) => {
+                            Ok(ServerMsg::Attached { version, .. }) => {
                                 server_version = Some(version);
-                                attachments_negotiated = features
-                                    .as_ref()
-                                    .is_some_and(|fs| fs.iter().any(|f| f == protocol::ATTACHMENTS.name));
-                                images_negotiated = attachments_negotiated
-                                    && features
-                                        .as_ref()
-                                        .is_some_and(|fs| fs.iter().any(|f| f == protocol::CLIPBOARD_IMAGES.name));
-                                agent_clipboard = images_negotiated
-                                    && features
-                                        .as_ref()
-                                        .is_some_and(|fs| fs.iter().any(|f| f == protocol::AGENT_CLIPBOARD.name));
-                                attachments.negotiate(
-                                    attachments_negotiated
-                                        && features
-                                            .as_ref()
-                                            .is_some_and(|fs| fs.iter().any(|f| f == protocol::PASTED_PATHS.name)),
-                                );
-                                if attachments_negotiated {
-                                    attachments.reconnect();
-                                }
-                                clipboard_negotiated =
-                                    features.is_some_and(|fs| fs.iter().any(|f| f == protocol::CLIPBOARD.name));
+                                attachments.connected();
+                                attachments.reconnect();
                             }
-                            Ok(ServerMsg::Clipboard { id, origin, text }) if clipboard_negotiated => {
+                            Ok(ServerMsg::Clipboard { id, origin, text }) => {
                                 clipboard.submit(id, origin, text);
                             }
-                            Ok(msg @ ServerMsg::ClipboardFocus { .. }) if agent_clipboard => {
+                            Ok(msg @ ServerMsg::ClipboardFocus { .. }) => {
                                 attachments.message(msg);
                             }
-                            Ok(msg @ ServerMsg::ClipboardImageOffer { .. }) if images_negotiated => {
+                            Ok(msg @ ServerMsg::ClipboardImageOffer { .. }) => {
                                 attachments.message(msg);
                             }
                             Ok(
@@ -1357,7 +1310,7 @@ pub fn attach(mut target: Target, mut workspace: Option<String>, mouse: bool, at
                                 | ServerMsg::AttachmentOffer { .. }
                                 | ServerMsg::AttachmentAck { .. }
                                 | ServerMsg::AttachmentResult { .. }),
-                            ) if attachments_negotiated => {
+                            ) => {
                                 attachments.message(msg);
                             }
                             Ok(ServerMsg::Open { url }) => {
@@ -1504,6 +1457,29 @@ mod tests {
     use super::*;
 
     #[test]
+    fn released_attach_refusals_are_recognized_without_rewriting_other_errors() {
+        assert_eq!(
+            legacy_refusal_release(
+                "protocol mismatch: server v2, client v3; run `kraal kill`, then `kraal` again (the layout is kept)"
+            ),
+            Some("0.2.0")
+        );
+        assert_eq!(
+            legacy_refusal_release(
+                "session work runs kraal 0.3.0, too old for this kraal: `kraal -s work restart` restarts it on this one (its layout is kept)"
+            ),
+            Some("0.3.0")
+        );
+        assert_eq!(legacy_refusal_release("no such workspace"), None);
+        assert_eq!(
+            legacy_refusal_release(
+                "session work runs kraal 0.4.0, too new for this kraal: update this one (`kraal update`)"
+            ),
+            None
+        );
+    }
+
+    #[test]
     fn connection_notices_use_neutral_text_or_blocked_and_restore_the_cursor() {
         for (kind, sgr) in [(NoticeKind::Notice, "37"), (NoticeKind::Warning, "91"), (NoticeKind::Error, "91")] {
             for (cols, rows) in [(80, 24), (124, 36)] {
@@ -1513,24 +1489,6 @@ mod tests {
                 assert!(bytes.ends_with("\x1b[?7h\x1b8"));
             }
         }
-    }
-
-    #[test]
-    fn clipboard_policy_requires_a_server_greeting_with_the_capability() {
-        let frame = |json: &str| (protocol::JSON, json.as_bytes().to_vec());
-        assert!(!clipboard_available(&frame(r#"{"type":"attached","version":"0.2.0"}"#)));
-        assert!(!clipboard_available(&frame(r#"{"type":"attached","version":"0.3.0","features":["lenient"]}"#)));
-        assert!(clipboard_available(&frame(r#"{"type":"attached","version":"0.4.0","features":["clipboard"]}"#)));
-        assert!(!clipboard_available(&(protocol::BYTES, b"screen".to_vec())));
-        assert!(clipboard_restart(&Target::Local { session: "work".into() }).contains("`kraal -s work restart`"));
-        let remote = Target::Remote {
-            ssh: vec![],
-            session: "work".into(),
-            label: "box".into(),
-            pane: None,
-            clipboard_native: false,
-        };
-        assert!(clipboard_restart(&remote).contains("on box, run `kraal -s work restart`"));
     }
 
     /// A terminal that keeps what is done to it, in order: `raw`, `line`, or the bytes written.
@@ -1761,23 +1719,22 @@ mod tests {
             pid: 1,
             session: format!("restart-forgotten-{}", crate::accounts::new_uuid()),
             version: protocol::KRAAL_VERSION.into(),
-            features: None,
+            protocol: 2,
         };
         let marker = paths::session_state_path(&server.session).with_extension("forgotten");
         paths::ensure_private_dir(marker.parent().unwrap()).unwrap();
         paths::write_private(&marker, b"").unwrap();
-        for features in [None, Some(vec![protocol::BUFFERS.name.into()])] {
-            server.features = features;
+        {
             let err = server.check_restart().unwrap_err().to_string();
             assert!(err.contains("was forgotten") && err.contains(&*marker.to_string_lossy()), "{err}");
             assert!(err.contains("instead of this running session's layout and scrollback"), "{err}");
             assert!(err.contains("remove") && err.contains("import the legacy state"), "{err}");
         }
-        server.features = Some(protocol::feature_names());
+        server.protocol = protocol::PROTOCOL_VERSION;
         assert!(server.check_restart().is_ok(), "this format can save and restart after Forget");
         assert_eq!(std::fs::read(&marker).unwrap(), b"");
         std::fs::remove_file(marker).unwrap();
-        server.features = None;
+        server.protocol = 2;
         assert!(server.check_restart().is_ok(), "removing the marker allows migration again");
     }
 
@@ -1787,77 +1744,21 @@ mod tests {
             pid: 1,
             session: format!("restart-state-{}", crate::accounts::new_uuid()),
             version: protocol::KRAAL_VERSION.into(),
-            features: None,
+            protocol: 2,
         };
         assert!(server.check_restart().is_ok(), "the first upgrade can migrate the server's state");
         let saved = paths::session_state_path(&server.session);
         paths::ensure_private_dir(saved.parent().unwrap()).unwrap();
         paths::write_private(&saved, b"newer state").unwrap();
-        for features in [None, Some(vec![protocol::BUFFERS.name.into()])] {
-            server.features = features;
+        {
             let err = server.check_restart().unwrap_err().to_string();
             assert!(err.contains("newer saved state") && err.contains(&*saved.to_string_lossy()), "{err}");
             assert!(err.contains("instead of this running session's layout and scrollback"), "{err}");
         }
-        server.features = Some(protocol::feature_names());
+        server.protocol = protocol::PROTOCOL_VERSION;
         assert!(server.check_restart().is_ok(), "a server using this format can restart on its own state");
         assert_eq!(std::fs::read(&saved).unwrap(), b"newer state");
         std::fs::remove_file(saved).unwrap();
-    }
-
-    /// A server of a release before feature lists: what it lacks is said with the way out, and
-    /// what it would quietly do less of is not even sent.
-    #[test]
-    fn what_an_older_server_cannot_do_is_said_with_the_way_out() {
-        let dir = std::env::temp_dir().join(format!("kraal-older-server-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let socket = dir.join("old.sock");
-        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
-        let asked = Arc::new(Mutex::new(Vec::<String>::new()));
-        {
-            let asked = asked.clone();
-            std::thread::spawn(move || {
-                for mut stream in listener.incoming().map_while(Result::ok) {
-                    let Ok(Some((_, payload))) = protocol::read_frame(&mut stream) else { continue };
-                    let msg: serde_json::Value = serde_json::from_slice(&payload).unwrap();
-                    let cmd = msg["request"]["cmd"].as_str().unwrap_or_default().to_string();
-                    let answer = match cmd.as_str() {
-                        "ping" => {
-                            serde_json::json!({"Ok": {"kind": "pong", "data": {"pid": 1, "session": "old", "version": "0.1.9"}}})
-                        }
-                        "read_pane" => serde_json::json!({"Err": "no such pane: 9"}),
-                        _ => {
-                            serde_json::json!({"Err": format!("bad message: unknown variant `{cmd}`, expected `ping`")})
-                        }
-                    };
-                    asked.lock().unwrap().push(cmd);
-                    let _ =
-                        protocol::write_json(&mut stream, &serde_json::json!({"type": "response", "result": answer}));
-                }
-            });
-        }
-        let err = request(&socket, Request::BufferList).unwrap_err().to_string();
-        assert_eq!(
-            err,
-            "session old runs kraal 0.1.9, which cannot keep paste buffers: `kraal -s old restart` updates it (its layout and scrollback are kept)"
-        );
-        let err = request(&socket, Request::CreateWorkspace { name: "api".into(), cwd: "/tmp".into() })
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("cannot create, rename, close, delete and restore workspaces"), "{err}");
-        assert!(err.contains("kraal -s old restart"), "{err}");
-        let edit =
-            |sudo| Request::EditRemote { target: "web:/a".into(), line: None, near: None, production: false, sudo };
-        let err = request(&socket, edit(true)).unwrap_err().to_string();
-        assert!(err.contains("runs kraal 0.1.9, which cannot edit a server's files as root"), "{err}");
-        assert!(!asked.lock().unwrap().iter().any(|c| c == "edit_remote"), "asked about before it is sent");
-        let err = request(&socket, edit(false)).unwrap_err().to_string();
-        assert!(err.contains("which cannot answer `edit_remote`"), "{err}");
-        // A refusal for another reason is said as the server said it.
-        let err = request(&socket, Request::ReadPane { pane: "9".into(), lines: None }).unwrap_err().to_string();
-        assert_eq!(err, "no such pane: 9");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

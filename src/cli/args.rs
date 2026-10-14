@@ -107,7 +107,7 @@ pub enum Cmd {
         #[arg(long, requires = "host")]
         pane: Option<String>,
     },
-    /// Install this kraal binary on a server (same OS and architecture), for `attach --host`.
+    /// Install this binary on a server (same OS and architecture) and restart the selected session.
     RemoteInstall { server: String },
     /// Replace this kraal with the latest release from GitHub, after checking its checksum.
     Update {
@@ -275,13 +275,6 @@ pub enum Cmd {
         /// Replace the reviewed destination, keeping a backup.
         #[arg(long)]
         replace: bool,
-    },
-    /// Export KDL using the legacy name and destination rules.
-    Save {
-        name: Option<String>,
-        /// The workspace to save (default: inside a pane, its workspace; else the one on screen).
-        #[arg(short, long)]
-        workspace: Option<String>,
     },
     /// Copy Zellij layouts into kraal's workspace directory.
     ImportZellij {

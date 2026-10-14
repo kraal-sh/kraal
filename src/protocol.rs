@@ -5,32 +5,8 @@
 //! terminal bytes (keyboard input from the client, screen updates from the server). A frame of
 //! another kind is skipped.
 //!
-//! # Compatibility
-//!
-//! A kraal works with sessions started by another release, older or newer, from the oldest
-//! supported release on (0.2.0, `RELEASES` in tests/compat.sh, which tests it): an update never
-//! forces a restart (docs/compatibility.md). The protocol changes only in these ways:
-//!
-//! - A new field is optional: it has `#[serde(default)]`, so that a message from a peer that
-//!   does not send it still reads, and every reader ignores fields it does not know (never
-//!   `deny_unknown_fields`). A field never changes type or meaning; a unit answer kind never
-//!   gets data; a request kind, message type or [`Feature`] name is never reused.
-//! - A new request or client message is refused by a server that does not know it, with an
-//!   error that starts with [`UNSUPPORTED`] (`bad message` from older releases), and the client
-//!   then says which release the session runs and that `kraal restart` updates it. A request
-//!   that an older server would take and quietly do less of (it drops an option it does not
-//!   know) needs a [`Feature`] with `check_first`: the client asks the server before sending it.
-//! - A server lists its [`Feature`]s in [`Response::Pong`] and [`ServerMsg::Attached`]; one that
-//!   lists none is older than these lists. A client lists in its messages what it can read
-//!   beyond the oldest supported release ([`CLIENT_FEATURES`]).
-//! - A new server message type goes to attached clients only (every release skips the ones it
-//!   does not know there), a new answer kind only answers a new request, and a new value of an
-//!   enum in an answer goes only to clients that list [`LENIENT`]: older ones fail on it. Every
-//!   message and enum read here takes what it does not know as a fallback (an `Unknown`
-//!   variant, `#[serde(other)]`), never as an error.
-//! - [`PROTOCOL_VERSION`] changes only for what these rules cannot express. Peers of different
-//!   protocol versions refuse each other; `kraal restart` and `kraal kill` still stop the
-//!   server, whatever its version.
+//! Peers must use the same protocol version. Only the upgrade control requests retain
+//! protocol 2 so 0.4 can inspect, save and stop 0.2.0 and 0.3.0 sessions.
 
 use std::io::{self, Read, Write};
 use std::path::PathBuf;
@@ -39,86 +15,30 @@ use serde::{Deserialize, Serialize};
 
 use crate::agent::AgentState;
 
-/// The protocol's generation: what the rules above cannot express changes it, and peers of
-/// different generations refuse each other.
-pub const PROTOCOL_VERSION: u32 = 2;
-
-/// This kraal's release.
+pub const PROTOCOL_VERSION: u32 = 3;
 pub const KRAAL_VERSION: &str = env!("CARGO_PKG_VERSION");
 
-/// Something a server can do that one of the oldest supported release cannot. A server lists
-/// the names of those it has in [`Response::Pong`] and [`ServerMsg::Attached`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Feature {
-    /// Its name in the server's list.
-    pub name: &'static str,
-    /// What it lets a client do, as said to the user ("which cannot …").
-    pub does: &'static str,
-    /// A server without it would take the request and do less (an option it does not know is
-    /// dropped), rather than refuse it: the client asks before sending.
-    pub check_first: bool,
+/// Both released migration sources used protocol 2 and omitted it from Pong.
+pub const fn upgrade_protocol() -> u32 {
+    2
 }
 
-pub const LIST_AGENTS: Feature =
-    Feature { name: "list_agents", does: "list the agents of the sessions on your servers", check_first: false };
-pub const BUFFERS: Feature = Feature { name: "buffers", does: "keep paste buffers", check_first: false };
-pub const EDIT_SUDO: Feature = Feature { name: "edit_sudo", does: "edit a server's files as root", check_first: true };
-
-pub const ACCOUNT_IDS: Feature =
-    Feature { name: "account_ids", does: "select an account by its identity", check_first: true };
-pub const NATIVE_AGENTS: Feature =
-    Feature { name: "native_agents", does: "start agents with native account management", check_first: true };
-pub const STATE_V2: Feature =
-    Feature { name: "state_v2", does: "save sessions in the version 2 format", check_first: false };
-/// What this kraal's server lists.
-pub const WORKSPACE_FILES: Feature =
-    Feature { name: "workspace_files", does: "preview imports and export layouts safely", check_first: false };
-pub const WORKSPACE_LIFECYCLE: Feature = Feature {
-    name: "workspace_lifecycle",
-    does: "create, rename, close, delete and restore workspaces",
-    check_first: false,
-};
-pub const CLIPBOARD: Feature =
-    Feature { name: "clipboard", does: "copy through the client clipboard policy", check_first: false };
-pub const ATTACHMENTS: Feature = Feature { name: "attachments", does: "attach local files", check_first: false };
-pub const PASTED_PATHS: Feature =
-    Feature { name: "pasted_paths", does: "recognize laptop paths in pastes", check_first: false };
-pub const CLIPBOARD_IMAGES: Feature =
-    Feature { name: "clipboard_images", does: "attach clipboard images", check_first: false };
-pub const AGENT_CLIPBOARD: Feature =
-    Feature { name: "agent_clipboard", does: "paste laptop clipboard images into agents", check_first: false };
-pub const FEATURES: [Feature; 13] = [
-    LIST_AGENTS,
-    BUFFERS,
-    EDIT_SUDO,
-    ACCOUNT_IDS,
-    NATIVE_AGENTS,
-    STATE_V2,
-    WORKSPACE_FILES,
-    WORKSPACE_LIFECYCLE,
-    CLIPBOARD,
-    ATTACHMENTS,
-    PASTED_PATHS,
-    CLIPBOARD_IMAGES,
-    AGENT_CLIPBOARD,
-];
-
-/// The names of this kraal's server features, as it lists them.
-pub fn feature_names() -> Vec<String> {
-    FEATURES.iter().map(|f| f.name.to_string()).collect()
-}
-
-/// Said by a client that reads message types, answer kinds and enum values it does not know as
-/// their fallback (see the rules above) instead of failing on them.
-pub const LENIENT: &str = "lenient";
-
-/// What this kraal's client can read beyond what one of the oldest supported release can. It
-/// lists them in its messages, for a later server to rely on.
-pub const CLIENT_FEATURES: [&str; 6] =
-    [LENIENT, CLIPBOARD.name, ATTACHMENTS.name, PASTED_PATHS.name, CLIPBOARD_IMAGES.name, AGENT_CLIPBOARD.name];
-
-pub fn client_features() -> Vec<String> {
-    CLIENT_FEATURES.iter().map(|f| f.to_string()).collect()
+pub fn version_mismatch(client: u32, server: u32, release: &str, session: &str, host: Option<&str>) -> String {
+    let fix = if client < server {
+        "update this machine with `kraal update`".to_string()
+    } else if let Some(host) = host {
+        let host = crate::shell::quote(host);
+        if session == "main" {
+            format!("run `kraal remote-install {host}`")
+        } else {
+            format!("run `kraal -s {session} remote-install {host}`")
+        }
+    } else {
+        format!("run `kraal -s {session} restart`")
+    };
+    format!(
+        "protocol mismatch: client protocol {client}, server protocol {server} (kraal {release}, session {session}); {fix}"
+    )
 }
 
 /// How a server begins its answer to a request or message it does not know or cannot read.
@@ -129,12 +49,6 @@ pub const UNSUPPORTED: &str = "unsupported request";
 pub fn unsupported(msg: &serde_json::Value) -> String {
     let name = msg.get("cmd").or_else(|| msg.get("type")).and_then(|n| n.as_str()).unwrap_or("?");
     format!("{UNSUPPORTED} `{name}`: kraal {KRAAL_VERSION} does not know it")
-}
-
-/// Whether `error`, a server's answer, says that it could not read what it was sent: the client
-/// is newer than the server, or speaks a request the server does not know.
-pub fn refused_as_unknown(error: &str) -> bool {
-    error.starts_with(UNSUPPORTED) || error.starts_with("bad message:")
 }
 
 /// Whether release `a` (`0.2.1`, `v0.3.0-rc.1`) comes after release `b`, as semver orders them:
@@ -249,16 +163,13 @@ pub enum ClientMsg {
         /// (a local client is that binary): the server says when it is newer than its own.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         installed: Option<String>,
-        /// What the client can read ([`CLIENT_FEATURES`]).
-        #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        features: Vec<String>,
     },
     Resize {
         cols: u16,
         rows: u16,
     },
     Detach,
-    /// Reserve the destination while a negotiated client classifies a buffered paste.
+    /// Reserve the destination while the client classifies a buffered paste.
     PasteStart,
     AttachmentRequest {
         token: String,
@@ -309,9 +220,6 @@ pub enum ClientMsg {
     Request {
         version: u32,
         request: Request,
-        /// What the client can read ([`CLIENT_FEATURES`]).
-        #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        features: Vec<String>,
     },
     /// A message from a newer client, or one this kraal cannot read (only ever read).
     #[serde(untagged)]
@@ -321,7 +229,7 @@ pub enum ClientMsg {
 impl ClientMsg {
     /// `request`, as this kraal sends it.
     pub fn request(request: Request) -> ClientMsg {
-        ClientMsg::Request { version: PROTOCOL_VERSION, request, features: client_features() }
+        ClientMsg::Request { version: PROTOCOL_VERSION, request }
     }
 }
 
@@ -336,13 +244,10 @@ pub enum ServerMsg {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reattach: Option<String>,
     },
-    /// The first answer to an attach: the server's kraal release. A server that does not send
-    /// it is older than this message.
+    /// The first answer to an accepted attach.
     Attached {
         version: String,
-        /// Its [`Feature`]s; `None` from a server older than this list.
-        #[serde(default)]
-        features: Option<Vec<String>>,
+        protocol: u32,
     },
     Response {
         result: Result<Response, String>,
@@ -635,11 +540,6 @@ pub enum Request {
         #[serde(default)]
         sudo: bool,
     },
-    /// Write the current layout of a workspace as a KDL definition file.
-    SaveWorkspace {
-        workspace: Option<String>,
-        name: Option<String>,
-    },
     ImportWorkspace {
         path: PathBuf,
         name: Option<String>,
@@ -700,72 +600,6 @@ pub enum Request {
     Unknown(serde_json::Value),
 }
 
-impl Request {
-    /// The [`Feature`] a server needs for this request, beyond what every server since the
-    /// oldest supported release does.
-    pub fn needs(&self) -> Option<Feature> {
-        match self {
-            Request::ImportWorkspace { .. }
-            | Request::ExportWorkspace { .. }
-            | Request::PublishWorkspaceFile { .. } => Some(WORKSPACE_FILES),
-            Request::ListAgents => Some(LIST_AGENTS),
-            Request::OpenAgent { agent, .. }
-                if crate::agent_registry::find(agent).is_some_and(|a| a.accounts.is_none()) =>
-            {
-                Some(NATIVE_AGENTS)
-            }
-            Request::OpenAgent { account_id: Some(_), .. } => Some(ACCOUNT_IDS),
-            Request::BufferList
-            | Request::BufferShow { .. }
-            | Request::BufferSet { .. }
-            | Request::BufferPaste { .. }
-            | Request::BufferDelete { .. } => Some(BUFFERS),
-            Request::EditRemote { sudo: true, .. } => Some(EDIT_SUDO),
-            // An older server reads a restart as a stop, and `kraal restart` starts the next one.
-            Request::KillServer { .. } => None,
-            Request::ListDeletedWorkspaces
-            | Request::CreateWorkspace { .. }
-            | Request::RenameWorkspace { .. }
-            | Request::CloseWorkspace { .. }
-            | Request::DeleteWorkspace { .. }
-            | Request::RestoreWorkspace { .. } => Some(WORKSPACE_LIFECYCLE),
-            Request::Ping
-            | Request::ListPanes
-            | Request::ListWorkspaces
-            | Request::OpenWorkspace { .. }
-            | Request::NewPane { .. }
-            | Request::ClosePane { .. }
-            | Request::FocusPane { .. }
-            | Request::RenamePane { .. }
-            | Request::SendText { .. }
-            | Request::SendKeys { .. }
-            | Request::ReadPane { .. }
-            | Request::Wait { .. }
-            | Request::AgentReport { .. }
-            | Request::Notify { .. }
-            | Request::RunbookPlan { .. }
-            | Request::RunbookRun { .. }
-            | Request::Subscribe { .. }
-            | Request::OpenSsh { .. }
-            | Request::OpenAgent { .. }
-            | Request::TunnelAdd { .. }
-            | Request::TunnelRemove { .. }
-            | Request::TunnelList
-            | Request::OpenFiles { .. }
-            | Request::EditRemote { .. }
-            | Request::SaveWorkspace { .. }
-            | Request::ReloadConfig
-            | Request::Unknown(_) => None,
-        }
-    }
-
-    /// Its name on the wire (`list_panes`).
-    pub fn name(&self) -> String {
-        let v = serde_json::to_value(self).unwrap_or_default();
-        v.get("cmd").and_then(|c| c.as_str()).unwrap_or("?").to_string()
-    }
-}
-
 /// A reported agent state, `None` for one this kraal does not know.
 fn known_state<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<AgentState>, D::Error> {
     let v = Option::<serde_json::Value>::deserialize(d)?;
@@ -780,9 +614,8 @@ pub enum Response {
         pid: u32,
         session: String,
         version: String,
-        /// Its [`Feature`]s; `None` from a server older than this list.
-        #[serde(default)]
-        features: Option<Vec<String>>,
+        #[serde(default = "upgrade_protocol")]
+        protocol: u32,
     },
     Pane(Box<PaneInfo>),
     Panes(Vec<PaneInfo>),
@@ -889,7 +722,32 @@ mod tests {
     use super::*;
 
     #[test]
-    fn workspace_lifecycle_requests_advertise_their_feature_and_default_to_preview() {
+    fn the_removed_save_request_is_not_an_export_alias() {
+        let request: Request =
+            serde_json::from_str(r#"{"cmd":"save_workspace","workspace":"w","name":"copy"}"#).unwrap();
+        let Request::Unknown(value) = request else { panic!("legacy save was accepted") };
+        assert!(unsupported(&value).contains("`save_workspace`"));
+    }
+
+    #[test]
+    fn mismatches_name_both_protocols_and_one_fix() {
+        for (client, server, host, fix) in [
+            (3, 2, None, "run `kraal -s work restart`"),
+            (3, 2, Some("box"), "run `kraal -s work remote-install box`"),
+            (2, 3, None, "update this machine with `kraal update`"),
+            (2, 3, Some("box"), "update this machine with `kraal update`"),
+        ] {
+            assert_eq!(
+                version_mismatch(client, server, "0.4.0", "work", host),
+                format!(
+                    "protocol mismatch: client protocol {client}, server protocol {server} (kraal 0.4.0, session work); {fix}"
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn workspace_lifecycle_requests_default_to_preview() {
         for json in [
             r#"{"cmd":"list_deleted_workspaces"}"#,
             r#"{"cmd":"create_workspace","name":"api","cwd":"/tmp"}"#,
@@ -899,9 +757,8 @@ mod tests {
             r#"{"cmd":"restore_workspace","workspace":"api"}"#,
         ] {
             let request: Request = serde_json::from_str(json).unwrap();
-            assert_eq!(request.needs(), Some(WORKSPACE_LIFECYCLE));
             let copy: Request = serde_json::from_str(&serde_json::to_string(&request).unwrap()).unwrap();
-            assert_eq!(copy.name(), request.name());
+            assert_eq!(serde_json::to_value(copy).unwrap(), serde_json::to_value(&request).unwrap());
             match request {
                 Request::CloseWorkspace { expected, .. } | Request::DeleteWorkspace { expected, .. } => {
                     assert!(expected.is_none())
@@ -909,20 +766,6 @@ mod tests {
                 _ => {}
             }
         }
-        assert!(feature_names().contains(&WORKSPACE_LIFECYCLE.name.to_string()));
-    }
-
-    #[test]
-    fn workspace_identity_is_optional_for_older_servers_and_clients() {
-        let old = serde_json::json!({ "name": "w", "open": true, "definition": null,
-            "tabs": 1, "panes": 2, "working": 0, "blocked": 0, "done": 0 });
-        let mut workspace: WorkspaceInfo = serde_json::from_value(old.clone()).unwrap();
-        assert_eq!(workspace.id, None);
-        assert_eq!(serde_json::to_value(&workspace).unwrap(), old);
-        workspace.id = Some("stable".into());
-        let mut new = serde_json::to_value(&workspace).unwrap();
-        assert_eq!(new.as_object_mut().unwrap().remove("id"), Some(serde_json::json!("stable")));
-        assert_eq!(new, old, "the fields an old client reads have not changed");
     }
 
     #[test]
@@ -943,60 +786,11 @@ mod tests {
         assert!(!newer(KRAAL_VERSION, KRAAL_VERSION));
     }
 
-    #[test]
-    fn older_and_newer_peers_read_what_they_know() {
-        // A kraal before these fields reads the messages as it always did.
-        #[derive(Deserialize)]
-        #[serde(tag = "cmd", rename_all = "snake_case")]
-        enum OldRequest {
-            KillServer,
-        }
-        #[derive(Deserialize)]
-        #[serde(tag = "type", rename_all = "snake_case")]
-        enum OldServerMsg {
-            Exit { reason: String },
-        }
-        let kill = serde_json::to_string(&Request::KillServer { restart: true }).unwrap();
-        assert!(matches!(serde_json::from_str::<OldRequest>(&kill), Ok(OldRequest::KillServer)), "{kill}");
-        let exit =
-            serde_json::to_string(&ServerMsg::Exit { reason: "bye".into(), reattach: Some("w".into()) }).unwrap();
-        assert!(
-            matches!(serde_json::from_str::<OldServerMsg>(&exit), Ok(OldServerMsg::Exit { reason }) if reason == "bye")
-        );
-        let attached =
-            serde_json::to_string(&ServerMsg::Attached { version: "0.2.1".into(), features: Some(feature_names()) })
-                .unwrap();
-        assert!(attached.starts_with(r#"{"type":"attached","version":"0.2.1","features":["#), "{attached}");
-        assert!(serde_json::from_str::<OldServerMsg>(&attached).is_err(), "an older client skips it");
-        // And this kraal reads what older ones send.
-        assert!(matches!(
-            serde_json::from_str::<Request>(r#"{"cmd":"kill_server"}"#),
-            Ok(Request::KillServer { restart: false })
-        ));
-        assert!(matches!(
-            serde_json::from_str::<ServerMsg>(r#"{"type":"exit","reason":"detached"}"#),
-            Ok(ServerMsg::Exit { reattach: None, .. })
-        ));
-        assert!(matches!(
-            serde_json::from_str::<ServerMsg>(r#"{"type":"attached","version":"0.2.0"}"#),
-            Ok(ServerMsg::Attached { features: None, .. })
-        ));
-        assert!(matches!(
-            serde_json::from_str::<ClientMsg>(r#"{"type":"attachment_request","token":"ab","text":[]}"#),
-            Ok(ClientMsg::AttachmentRequest { image: false, pane: None, .. })
-        ));
-        let hello = r#"{"type":"attach","version":2,"cols":80,"rows":24,"workspace":null,"remote":false}"#;
-        assert!(matches!(
-            serde_json::from_str::<ClientMsg>(hello),
-            Ok(ClientMsg::Attach { installed: None, ref features, .. }) if features.is_empty()
-        ));
-    }
-
     /// What a server of the oldest supported release (0.2.0) sends, as it sends it.
     #[test]
     fn answers_of_the_oldest_supported_release_read() {
         let pong = r#"{"type":"response","result":{"Ok":{"kind":"pong","data":{"pid":7,"session":"main","version":"0.2.0"}}}}"#;
-        let Ok(ServerMsg::Response { result: Ok(Response::Pong { pid: 7, features: None, .. }) }) =
+        let Ok(ServerMsg::Response { result: Ok(Response::Pong { pid: 7, protocol: 2, .. }) }) =
             serde_json::from_str::<ServerMsg>(pong)
         else {
             panic!("{pong}")
@@ -1012,18 +806,18 @@ mod tests {
         let Ok(ServerMsg::Response { result: Err(e) }) = serde_json::from_str::<ServerMsg>(refused) else {
             panic!("{refused}")
         };
-        assert!(refused_as_unknown(&e));
+        assert!(e.starts_with("bad message:"));
         // And what such a client sends.
         let request = r#"{"type":"request","version":2,"request":{"cmd":"list_panes"}}"#;
         assert!(matches!(
             serde_json::from_str::<ClientMsg>(request),
-            Ok(ClientMsg::Request { request: Request::ListPanes, ref features, .. }) if features.is_empty()
+            Ok(ClientMsg::Request { request: Request::ListPanes, .. })
         ));
     }
 
     #[test]
     fn what_this_kraal_does_not_know_is_refused_by_name() {
-        let from_newer = r#"{"type":"request","version":2,"request":{"cmd":"teleport","to":"mars"},"features":["x"]}"#;
+        let from_newer = r#"{"type":"request","version":3,"request":{"cmd":"teleport","to":"mars"}}"#;
         let Ok(ClientMsg::Request { request: Request::Unknown(request), .. }) =
             serde_json::from_str::<ClientMsg>(from_newer)
         else {
@@ -1031,13 +825,10 @@ mod tests {
         };
         let answer = unsupported(&request);
         assert!(answer.starts_with(UNSUPPORTED) && answer.contains("`teleport`"), "{answer}");
-        assert!(refused_as_unknown(&answer));
-        assert!(!refused_as_unknown("no such pane: 12"));
         let Ok(ClientMsg::Unknown(msg)) = serde_json::from_str::<ClientMsg>(r#"{"type":"zoom","factor":2}"#) else {
             panic!()
         };
         assert!(unsupported(&msg).contains("`zoom`"));
-        assert_eq!(Request::BufferList.name(), "buffer_list");
     }
 
     #[test]
@@ -1056,77 +847,6 @@ mod tests {
         // In an answer, it is shown as unknown.
         assert_eq!(serde_json::from_str::<AgentState>(r#""compacting""#).unwrap(), AgentState::Unknown);
         assert_eq!(serde_json::to_string(&AgentState::Unknown).unwrap(), r#""unknown""#);
-    }
-
-    #[test]
-    fn native_agents_require_negotiation_but_managed_agents_keep_their_request() {
-        assert!(feature_names().iter().any(|name| name == NATIVE_AGENTS.name));
-        for agent in crate::agent_registry::AGENTS {
-            let request = Request::OpenAgent {
-                agent: agent.name.into(),
-                account: None,
-                account_id: None,
-                placement: Placement::Auto,
-                near: None,
-                cwd: None,
-                args: Vec::new(),
-            };
-            if agent.accounts.is_none() {
-                assert_eq!(request.needs(), Some(NATIVE_AGENTS));
-                assert!(request.needs().unwrap().check_first);
-            } else {
-                assert_eq!(request.needs(), None);
-            }
-        }
-    }
-
-    #[test]
-    fn account_identity_is_optional_and_requires_a_server_that_understands_it() {
-        let old = serde_json::json!({ "cmd": "open_agent", "agent": "claude", "account": "work",
-            "placement": "auto", "near": null, "cwd": null });
-        let request: Request = serde_json::from_value(old.clone()).unwrap();
-        assert!(matches!(request, Request::OpenAgent { account_id: None, .. }));
-        assert_eq!(request.needs(), None);
-        let mut new = old;
-        new["account_id"] = serde_json::json!("stable");
-        let request: Request = serde_json::from_value(new).unwrap();
-        assert_eq!(request.needs(), Some(ACCOUNT_IDS));
-        assert!(request.needs().unwrap().check_first, "an old server must not silently select by a reused label");
-        let wire = serde_json::to_value(request).unwrap();
-        assert_eq!(wire["account"], "work");
-        assert_eq!(wire["account_id"], "stable");
-    }
-
-    #[test]
-    fn file_transfer_requests_require_the_new_capability_and_old_save_still_reads() {
-        for value in [
-            serde_json::json!({"cmd": "import_workspace", "path": "/layout.kdl", "name": null, "expected": null}),
-            serde_json::json!({"cmd": "export_workspace", "path": "/layout.kdl", "workspace": null, "expected": null}),
-        ] {
-            let request: Request = serde_json::from_value(value.clone()).unwrap();
-            assert_eq!(request.needs(), Some(WORKSPACE_FILES));
-            assert_eq!(serde_json::to_value(request).unwrap()["cmd"], value["cmd"]);
-        }
-        let old: Request =
-            serde_json::from_value(serde_json::json!({"cmd": "save_workspace", "workspace": "api", "name": null}))
-                .unwrap();
-        assert!(matches!(old, Request::SaveWorkspace { .. }));
-        assert_eq!(old.needs(), None);
-        assert!(feature_names().contains(&WORKSPACE_FILES.name.to_string()));
-    }
-
-    #[test]
-    fn requests_say_what_an_older_server_lacks() {
-        assert_eq!(Request::ListAgents.needs(), Some(LIST_AGENTS));
-        assert_eq!(Request::BufferDelete { buffer: None, all: true }.needs(), Some(BUFFERS));
-        let edit = |sudo| Request::EditRemote { target: "a:b".into(), line: None, near: None, production: false, sudo };
-        assert_eq!(edit(true).needs(), Some(EDIT_SUDO));
-        assert_eq!(edit(false).needs(), None);
-        assert_eq!(Request::KillServer { restart: true }.needs(), None);
-        assert_eq!(Request::ListPanes.needs(), None);
-        // A name is never listed twice.
-        let names = feature_names();
-        assert_eq!(names.iter().collect::<std::collections::HashSet<_>>().len(), names.len());
     }
 
     /// One message of each kind, both ways.
@@ -1193,7 +913,6 @@ mod tests {
             Request::TunnelList,
             Request::OpenFiles { left: s("/"), right: s("web:/"), near: None },
             Request::EditRemote { target: s("web:/a"), line: Some(3), near: None, production: true, sudo: true },
-            Request::SaveWorkspace { workspace: Some(s("w")), name: Some(s("n")) },
             Request::BufferList,
             Request::BufferShow { buffer: Some(s("0")) },
             Request::BufferSet { name: Some(s("n")), text: s("t") },
@@ -1212,7 +931,6 @@ mod tests {
                 remote: true,
                 pane: Some(s("3")),
                 installed: Some(s("0.2.0")),
-                features: client_features(),
             },
             ClientMsg::Resize { cols: 80, rows: 24 },
             ClientMsg::Detach,
@@ -1271,7 +989,7 @@ mod tests {
         };
         let answers = vec![
             Response::Ok,
-            Response::Pong { pid: 1, session: s("main"), version: s("0.2.0"), features: Some(feature_names()) },
+            Response::Pong { pid: 1, session: s("main"), version: s(KRAAL_VERSION), protocol: PROTOCOL_VERSION },
             Response::Pane(Box::new(pane.clone())),
             Response::Panes(vec![pane]),
             Response::Workspaces(vec![WorkspaceInfo {
@@ -1302,7 +1020,7 @@ mod tests {
         server.extend([
             ServerMsg::Response { result: Err(s("no")) },
             ServerMsg::Exit { reason: s("bye"), reattach: Some(s("w")) },
-            ServerMsg::Attached { version: s("0.2.0"), features: Some(feature_names()) },
+            ServerMsg::Attached { version: s(KRAAL_VERSION), protocol: PROTOCOL_VERSION },
             ServerMsg::Open { url: s("https://example.com") },
             ServerMsg::ClipboardFocus { pane: Some(7), agent: true },
             ServerMsg::ClipboardFocus { pane: None, agent: false },
@@ -1328,112 +1046,18 @@ mod tests {
         (client, server)
     }
 
-    /// `v` with a field no kraal knows yet in each of its objects, except the free-form events
-    /// and the `Ok`/`Err` of a result, which hold one key.
-    fn with_new_fields(v: &serde_json::Value) -> serde_json::Value {
-        use serde_json::Value;
-        match v {
-            Value::Object(map) => {
-                let result = map.len() == 1 && (map.contains_key("Ok") || map.contains_key("Err"));
-                let mut out: serde_json::Map<String, Value> = map
-                    .iter()
-                    .map(|(k, v)| {
-                        let v = if k == "event" || k == "events" { v.clone() } else { with_new_fields(v) };
-                        (k.clone(), v)
-                    })
-                    .collect();
-                if !result {
-                    out.insert("zz_new".into(), serde_json::json!({"a": [1, "b", null]}));
-                }
-                Value::Object(out)
-            }
-            Value::Array(items) => Value::Array(items.iter().map(with_new_fields).collect()),
-            v => v.clone(),
-        }
-    }
-
-    /// The JSON pointers to every string in `v`.
-    fn strings(v: &serde_json::Value, at: String, out: &mut Vec<String>) {
-        match v {
-            serde_json::Value::String(_) => out.push(at),
-            serde_json::Value::Object(map) => map.iter().for_each(|(k, v)| strings(v, format!("{at}/{k}"), out)),
-            serde_json::Value::Array(items) => {
-                items.iter().enumerate().for_each(|(i, v)| strings(v, format!("{at}/{i}"), out))
-            }
-            _ => {}
-        }
-    }
-
-    /// Whatever a newer peer adds (fields, request kinds, message types, answer kinds, enum
-    /// values) never fails a message on either side, and new fields change nothing in it.
     #[test]
-    fn attachment_result_kinds_are_optional_and_ignored_by_older_readers() {
-        use crate::theme::NoticeKind;
-
-        let old = serde_json::json!({"type": "attachment_result", "token": "ab", "message": "Files received."});
-        let ServerMsg::AttachmentResult { kind, message, .. } = serde_json::from_value(old).unwrap() else { panic!() };
-        assert_eq!(kind, NoticeKind::Notice);
-        assert_eq!(message, "Files received.");
-        #[derive(Deserialize)]
-        struct OlderResult {
-            token: String,
-            message: String,
-            pasted: bool,
+    fn messages_round_trip() {
+        let (clients, servers) = samples();
+        for msg in clients {
+            let value = serde_json::to_value(msg).unwrap();
+            let read: ClientMsg = serde_json::from_value(value.clone()).unwrap();
+            assert_eq!(serde_json::to_value(read).unwrap(), value);
         }
-        for kind in [NoticeKind::Notice, NoticeKind::Warning, NoticeKind::Error] {
-            let msg = ServerMsg::AttachmentResult { kind, token: "ab".into(), message: "result".into(), pasted: true };
-            let json = serde_json::to_value(msg).unwrap();
-            let older: OlderResult = serde_json::from_value(json.clone()).unwrap();
-            assert_eq!((older.token.as_str(), older.message.as_str(), older.pasted), ("ab", "result", true));
-            let ServerMsg::AttachmentResult { kind: read, .. } = serde_json::from_value(json).unwrap() else {
-                panic!()
-            };
-            assert_eq!(read, kind);
-        }
-    }
-
-    #[test]
-    fn every_message_reads_whatever_a_newer_peer_adds() {
-        // Where the message type, the request and the answer kind are named.
-        const TAGS: [&str; 3] = ["/type", "/request/cmd", "/result/Ok/kind"];
-        /// `unknown` says whether a message was read as one this kraal does not know.
-        fn check<T: Serialize + serde::de::DeserializeOwned>(msg: &T, unknown: fn(&T) -> bool) {
-            let v = serde_json::to_value(msg).unwrap();
-            let extended = with_new_fields(&v);
-            let read: T = serde_json::from_value(extended.clone()).unwrap_or_else(|e| panic!("{extended}: {e}"));
-            assert_eq!(serde_json::to_value(&read).unwrap(), v, "new fields changed {extended}");
-            let mut pointers = Vec::new();
-            strings(&v, String::new(), &mut pointers);
-            for at in pointers {
-                let mut changed = v.clone();
-                *changed.pointer_mut(&at).unwrap() = "zz_new".into();
-                let read = serde_json::from_value::<T>(changed.clone())
-                    .unwrap_or_else(|e| panic!("a new value at {at} fails {changed}: {e}"));
-                // A new value anywhere else is read in the message it belongs to.
-                assert_eq!(unknown(&read), TAGS.contains(&at.as_str()), "a new value at {at}: {changed}");
-            }
-        }
-        let (client, server) = samples();
-        for msg in &client {
-            check(msg, |m| {
-                matches!(m, ClientMsg::Unknown(_) | ClientMsg::Request { request: Request::Unknown(_), .. })
-            });
-        }
-        for msg in &server {
-            check(msg, |m| {
-                matches!(m, ServerMsg::Unknown(_) | ServerMsg::Response { result: Ok(Response::Unknown(_)) })
-            });
-        }
-        // A new kind of answer with data, or a unit answer that got some.
-        for answer in [r#"{"kind":"maps","data":[{"x":1}]}"#, r#"{"kind":"ok","data":{"x":1}}"#] {
-            let msg = format!(r#"{{"type":"response","result":{{"Ok":{answer}}}}}"#);
-            assert!(
-                matches!(
-                    serde_json::from_str::<ServerMsg>(&msg),
-                    Ok(ServerMsg::Response { result: Ok(Response::Unknown(_)) })
-                ),
-                "{msg}"
-            );
+        for msg in servers {
+            let value = serde_json::to_value(msg).unwrap();
+            let read: ServerMsg = serde_json::from_value(value.clone()).unwrap();
+            assert_eq!(serde_json::to_value(read).unwrap(), value);
         }
     }
 
@@ -1452,7 +1076,6 @@ mod tests {
                         remote: rng.one_in(2),
                         pane: None,
                         installed: None,
-                        features: client_features(),
                     })
                     .unwrap(),
                     1 => br#"{"type":"exit","reason":"x"}"#.to_vec(),

@@ -75,7 +75,7 @@ These are the attaching machine's settings. The server also enforces its own `ma
 An external copy must fit both limits and is never truncated. `off` preserves internal paste
 buffers subject to their limits. Programs use the terminal unless the attaching machine's
 saved server has `clipboard_native = true`. See [Clipboard](terminal.md#clipboard) for
-backends, messages, intermediate machines, older peers and how to revoke permission.
+backends, messages, intermediate machines and how to revoke permission.
 
 ## Keys
 

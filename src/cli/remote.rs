@@ -24,6 +24,7 @@ pub(super) fn attach(session: &str, host: &str, workspace: Option<String>, pane:
         ssh: remote_ssh_args(&known, &s),
         session: session.to_string(),
         label: s.name.clone(),
+        host: host.to_string(),
         pane,
         clipboard_native: s.clipboard_native,
     };
@@ -70,7 +71,7 @@ fn remote_ssh_args(known: &[servers::Known], s: &servers::Server) -> Vec<String>
     args
 }
 
-pub(super) fn install(server: &str) -> Result<()> {
+pub(super) fn install(session: &str, server: &str) -> Result<()> {
     let cfg = config::Config::load()?;
     let known = known_servers(&cfg)?;
     let s = servers::resolve(&known, server).with_context(|| format!("not a server: {server}"))?;
@@ -122,7 +123,28 @@ pub(super) fn install(server: &str) -> Result<()> {
         bail!("installing on {} failed: {}", s.name, out.stderr_text().trim());
     }
     let version = out.stdout_text().trim().to_string();
-    println!("{version} installed on {} (~/.local/bin/kraal). Attach with `kraal attach --host {}`", s.name, s.name);
+    println!("{version} installed on {} (~/.local/bin/kraal).", s.name);
+    let sessions = run(&crate::shell::sh_c("exec \"$HOME/.local/bin/kraal\" ls"))?;
+    if sessions.lines().any(|line| {
+        let mut fields = line.split_whitespace();
+        fields.next() == Some(session) && fields.next() == Some("running")
+    }) {
+        use std::io::IsTerminal;
+        let mut restart = std::process::Command::new("ssh");
+        restart.args(&ssh);
+        if std::io::stdin().is_terminal() {
+            restart.arg("-t");
+        }
+        let command = format!("exec \"$HOME/.local/bin/kraal\" -s {} restart", crate::shell::quote(session));
+        let status =
+            restart.arg(&dest).arg(crate::shell::sh_c(&command)).status().context("restarting the remote session")?;
+        anyhow::ensure!(
+            status.success(),
+            "kraal is installed on {}, but session {session} was not restarted; retry with `kraal -s {session} remote-install {server}`",
+            s.name
+        );
+    }
+    println!("Attach with `kraal -s {session} attach --host {server}`");
     Ok(())
 }
 
@@ -553,6 +575,55 @@ pub(super) fn tunnel(s: &Session, action: TunnelCmd) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn attach_refusal_preserves_the_explicit_destination() {
+        if !crate::testing::in_own_process("cli::remote::tests::attach_refusal_preserves_the_explicit_destination") {
+            return;
+        }
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+        let (mut master, mut slave) = (-1, -1);
+        // SAFETY: valid output pointers; no custom terminal settings or size.
+        assert_eq!(
+            unsafe {
+                libc::openpty(&mut master, &mut slave, std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut())
+            },
+            0
+        );
+        // SAFETY: these descriptors were just opened and are owned only here.
+        let (_master, slave) = unsafe { (OwnedFd::from_raw_fd(master), OwnedFd::from_raw_fd(slave)) };
+        // SAFETY: this isolated process owns stdin; attach needs a terminal but refuses before reading it.
+        assert_eq!(unsafe { libc::dup2(slave.as_raw_fd(), libc::STDIN_FILENO) }, libc::STDIN_FILENO);
+        let dir = std::env::temp_dir().join(format!("kraal-remote-refusal-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let reply = dir.join("reply");
+        crate::testing::write_script(
+            &dir.join("ssh"),
+            &format!("#!/bin/sh\ncat {}\nexec cat >/dev/null\n", crate::shell::quote(reply.to_str().unwrap())),
+        );
+        // The isolated test has not started any workers yet.
+        unsafe {
+            std::env::set_var("PATH", format!("{}:{}", dir.display(), std::env::var("PATH").unwrap()));
+        }
+        for reason in [
+            "protocol mismatch: server v2, client v3; run `kraal kill`, then `kraal` again (the layout is kept)",
+            "session work runs kraal 0.3.0, too old for this kraal: `kraal -s work restart` restarts it on this one (its layout is kept)",
+        ] {
+            let mut bytes = Vec::new();
+            crate::protocol::write_json(&mut bytes, &crate::protocol::ServerMsg::exit(reason)).unwrap();
+            std::fs::write(&reply, bytes).unwrap();
+            for (host, word) in
+                [("deploy@db.lan:2222", "deploy@db.lan:2222"), ("deploy@[::1]:2222", "'deploy@[::1]:2222'")]
+            {
+                for (session, prefix) in [("main", "kraal"), ("work", "kraal -s work")] {
+                    let error = attach(session, host, None, None).unwrap_err().to_string();
+                    assert!(error.starts_with("protocol mismatch:"), "{error}");
+                    assert!(error.ends_with(&format!("run `{prefix} remote-install {word}`")), "{error}");
+                }
+            }
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn a_panel_server_must_still_be_the_one_listed() {

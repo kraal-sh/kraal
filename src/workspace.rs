@@ -414,10 +414,6 @@ pub fn parse_workspace(name: &str, src: &str) -> Result<WorkspaceDef> {
     })
 }
 
-/// What [`valid_file_name`] accepts, said to the user.
-pub const FILE_NAME_RULE: &str =
-    "a workspace file name is one plain name: not empty, no \"/\" or control character, not starting with \".\"";
-
 /// Whether `name` can name a definition file (`<name>.kdl`) inside the definitions directory:
 /// one plain path component, so that it never reaches another directory, and no control
 /// character (a newline would split the list of saved workspaces).

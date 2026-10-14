@@ -42,9 +42,10 @@ For `kraal wait`, `--until` takes the states of an agent (`working`, `blocked`, 
 the wait ends on `blocked`, `done`, `idle` or `exit`. It fails when `--timeout` (in seconds)
 passes first, or when the pane closes.
 
-Scripts keep working when kraal is updated while a session runs: commands work with a session
-that another kraal version started, and what the session's kraal cannot do yet fails with the
-reason and `kraal restart`, never half done ([Compatibility](compatibility.md)).
+Commands require the same protocol version as the running session. After an update that changes
+the protocol, a command fails with both versions and the restart or update command to run before
+retrying. `kraal kill` and `kraal restart` can still save and stop a 0.2.0 or 0.3.0 session
+([Compatibility](compatibility.md)).
 
 `kraal agents` also lists the agents of the kraal sessions on your servers that kraal watches (see
 [Agents on your servers](servers.md#agents-on-your-servers)), after this session's own, as

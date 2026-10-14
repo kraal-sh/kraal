@@ -943,7 +943,6 @@ impl Server {
     pub(super) fn reserve_paste(&mut self, id: ClientId) {
         if self.clients.get(&id).is_some_and(|c| {
             c.attached
-                && c.attachments.recognition
                 && c.attachments.pending.is_none()
                 && c.attachments.blocked.is_none()
                 && c.paste.is_none()
@@ -1183,7 +1182,10 @@ mod tests {
         let mut server = server(tx);
         let (id, peer) = client(&mut server);
         server.copy_to_client(id, "hello");
-        assert_eq!(server.clients[&id].toast.as_ref().unwrap().0, "copy sent to terminal");
+        assert!(server.clients[&id].toast.is_none());
+        let (copy, _, _) = server.clients[&id].clipboard.pending.unwrap();
+        server.clipboard_result(id, copy, crate::protocol::ClipboardOutcome::Terminal, false);
+        assert_eq!(server.clients[&id].toast.as_ref().unwrap().0, "copy sent to terminal via OSC 52");
         assert_eq!(server.buffers.get(None).unwrap().text, "hello");
         drop(peer);
         // The writer learns the peer is gone asynchronously on macOS.
@@ -1191,6 +1193,7 @@ mod tests {
         loop {
             std::thread::sleep(crate::clipboard::INTERVAL);
             server.copy_to_client(id, "next");
+            server.clients.get_mut(&id).unwrap().clipboard.pending = None;
             if server.clients[&id].toast.as_ref().unwrap().0 == "copy not sent: try again" {
                 break;
             }

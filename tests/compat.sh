@@ -1,6 +1,7 @@
 #!/bin/sh
 # The cross-version test (tests/compat.rs): this kraal with sessions that other releases started,
-# and their commands with a session this kraal started. It also checks one-way migration and
+# refusing attachment in both directions, saving and stopping old servers, restarting them,
+# and checking one-way migration and
 # downgrade isolation against 0.2.0 and 0.3.0, or against the releases given:
 #
 #   tests/compat.sh                    # 0.2.0 and 0.3.0
