@@ -46,7 +46,7 @@ pub(super) fn draw_form(p: &Prompt, screen: Rect, buf: &mut Buffer) -> Option<Cu
     let form = p.tunnel_form.as_ref()?;
     let suggestion = suggestion(p);
     let buttons = buttons(&suggestion);
-    let layout = forms::FormLayout::new(screen, 3, p.error.as_deref().unwrap_or(""), &buttons);
+    let layout = forms::FormLayout::new(screen, 3, "", p.error.as_deref(), &buttons);
     overlays::frame(layout.area, "Add tunnel", crate::theme::current().accent, buf);
     let server = forms::draw_text_field(
         layout.fields[0],
@@ -184,7 +184,7 @@ impl Server {
     pub(super) fn on_tunnel_form(&mut self, client: ClientId, mut p: Prompt, event: InputEvent) -> Mode {
         let suggestion = suggestion(&p);
         let buttons = buttons(&suggestion);
-        let layout = forms::FormLayout::new(self.client_screen(client), 3, p.error.as_deref().unwrap_or(""), &buttons);
+        let layout = forms::FormLayout::new(self.client_screen(client), 3, "", p.error.as_deref(), &buttons);
         let form = p.tunnel_form.as_mut().unwrap();
         let before = (p.value.clone(), form.local.clone(), form.server.clone());
         let outcome =
@@ -380,14 +380,21 @@ impl Server {
 }
 
 fn result_layout(screen: Rect, message: &str, retry: bool, exists: bool) -> forms::FormLayout {
-    let mut layout = forms::FormLayout::new(screen, 0, message, &result_buttons(false, exists));
-    // Reserve separate columns for Retry, Stop and Close even when Retry is absent.
-    // A queued Retry click must never hit Stop after the message or state changes.
-    let retry_area = Rect { width: 13, ..layout.primary };
-    let stop_area = Rect { x: retry_area.right() + 2, width: 8, ..retry_area };
-    layout.primary = if retry { retry_area } else { stop_area };
-    layout.alternate = retry.then_some(stop_area);
-    layout.cancel.x = stop_area.right() + 2;
+    let (message, error) = if retry { ("", Some(message)) } else { (message, None) };
+    // Fix the height and action slots so a queued Retry click never hits Stop after a state change,
+    // including when the buttons stack vertically.
+    let mut layout = forms::FormLayout::with_height(
+        screen,
+        0,
+        message,
+        error,
+        &result_buttons(true, true),
+        Some(screen.height.saturating_sub(2)),
+    );
+    if !retry {
+        layout.primary = if exists { layout.alternate.unwrap() } else { layout.cancel };
+        layout.alternate = None;
+    }
     layout
 }
 
@@ -556,7 +563,8 @@ mod tests {
                 for expected in ["Server    db", "Remote    localhost:5432", "Local     5432", "Use 10000"] {
                     assert!(text.contains(expected), "{text}");
                 }
-                let layout = forms::FormLayout::new(screen, 3, p.error.as_deref().unwrap(), &buttons("Use 10000"));
+                let layout = forms::FormLayout::new(screen, 3, "", p.error.as_deref(), &buttons("Use 10000"));
+                assert_eq!(buf[layout.body.as_position()].fg, crate::theme::current().blocked);
                 let event = if mouse {
                     click(layout.alternate.unwrap())
                 } else {
@@ -569,7 +577,7 @@ mod tests {
                 assert_eq!(p.value, "localhost:5432");
                 assert!(server.tunnels.is_empty(), "Use only changes the field");
                 p.error = Some("A long connection error. ".repeat(300) + "Final detail.");
-                let layout = forms::FormLayout::new(screen, 3, p.error.as_deref().unwrap(), &buttons(""));
+                let layout = forms::FormLayout::new(screen, 3, "", p.error.as_deref(), &buttons(""));
                 assert!(layout.max_scroll > 0);
                 while p.scroll < layout.max_scroll {
                     p = prompt(server.on_tunnel_form(client, p, key("pagedown")));
@@ -616,7 +624,7 @@ mod tests {
 
     #[test]
     fn a_retry_click_after_the_state_changes_cannot_stop_the_tunnel() {
-        for (cols, rows) in [(80, 24), (124, 36)] {
+        for (cols, rows) in [(32, 24), (80, 24), (124, 36)] {
             for state in [TunnelState::Connecting, TunnelState::Up] {
                 let (tx, _rx) = crate::server::event_channel(32);
                 let mut server = crate::server::tests::server(tx);
@@ -636,9 +644,18 @@ mod tests {
                 let screen = server.client_screen(client);
                 let (_, message, _, _) = server.tunnel_result(42);
                 let layout = result_layout(screen, &message, true, true);
+                for message in ["Error".into(), "Cannot reach db. ".repeat(300)] {
+                    let changed = result_layout(screen, &message, true, true);
+                    assert_eq!(changed.primary, layout.primary);
+                    assert_eq!(changed.alternate, layout.alternate);
+                    assert_eq!(changed.cancel, layout.cancel);
+                    assert_eq!(changed.area, layout.area);
+                }
+                let stop = layout.alternate.unwrap();
+                let close = layout.cancel;
                 let mut buf = Buffer::empty(screen);
                 server.draw_tunnel_details(&details, screen, &mut buf);
-                assert_eq!(buf[(layout.primary.x + 3, layout.primary.y)].symbol(), "R");
+                assert_eq!(buf[(layout.primary.x + 1, layout.primary.y)].symbol(), "R");
                 server.tunnels[0].state = state;
                 for _ in 0..2 {
                     let Mode::TunnelDetails(next) = server.on_tunnel_details(client, details, click(layout.primary))
@@ -652,6 +669,10 @@ mod tests {
                 }
                 let (_, message, _, _) = server.tunnel_result(42);
                 let layout = result_layout(screen, &message, false, true);
+                assert_eq!(layout.primary, stop);
+                assert_eq!(layout.cancel, close);
+                server.draw_tunnel_details(&details, screen, &mut buf);
+                assert_eq!(buf[(stop.x + 1, stop.y)].symbol(), "S");
                 assert!(matches!(server.on_tunnel_details(client, details, click(layout.primary)), Mode::Picker(_)));
                 assert!(server.tunnels.is_empty(), "Stop still works at its own coordinates");
             }
@@ -724,10 +745,21 @@ mod tests {
                 let mut buf = Buffer::empty(screen);
                 server.draw_tunnel_details(&details, screen, &mut buf);
                 let text: String = buf.content.iter().map(|c| c.symbol()).collect();
-                for expected in [label, "localhost:15432", "[> Close]", "Stop"] {
+                for expected in [label, "localhost:15432", "Enter Close", "Stop"] {
                     assert!(text.contains(expected), "{text}");
                 }
                 assert_eq!(text.contains("Retry now"), state == TunnelState::Down);
+                let (_, message, retry, exists) = server.tunnel_result(42);
+                let layout = result_layout(screen, &message, retry, exists);
+                assert_eq!(buf[layout.cancel.as_position()].bg, crate::theme::current().accent);
+                assert_eq!(
+                    buf[layout.body.as_position()].fg,
+                    match state {
+                        TunnelState::Up => crate::theme::current().done,
+                        TunnelState::Connecting => crate::theme::current().working,
+                        TunnelState::Down => crate::theme::current().blocked,
+                    }
+                );
                 assert!(matches!(server.on_tunnel_details(client, details, key("enter")), Mode::Picker(_)));
                 assert_eq!(server.tunnels.len(), 1);
             }
@@ -751,7 +783,7 @@ mod tests {
             let mut buf = Buffer::empty(screen);
             server.draw_tunnel_details(&details, screen, &mut buf);
             let text: String = buf.content.iter().map(|c| c.symbol()).collect();
-            assert!(text.contains("Stopped") && !text.contains("[  Stop]"), "{text}");
+            assert!(text.contains("Stopped") && !text.contains(" Stop "), "{text}");
             let Mode::TunnelDetails(details) = server.tunnel_details(43, None) else { panic!() };
             let (_, message, _, _) = server.tunnel_result(43);
             let layout = result_layout(server.client_screen(client), &message, false, true);

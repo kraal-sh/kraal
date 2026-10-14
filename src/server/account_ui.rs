@@ -656,12 +656,14 @@ fn form_buttons(form: &AccountForm) -> forms::Buttons<'static> {
 }
 
 fn form_layout(form: &AccountForm, screen: Rect) -> FormLayout {
-    let message = if form.checking.is_some() {
-        "Checking sign-in...".into()
+    let (message, error) = if form.checking.is_some() {
+        ("Checking sign-in...".into(), None)
+    } else if let Some(error) = form.error.as_deref() {
+        (String::new(), Some(error))
     } else {
-        form.error.clone().unwrap_or_else(|| if form.installed { String::new() } else { install_message(form.agent) })
+        (if form.installed { String::new() } else { install_message(form.agent) }, None)
     };
-    let layout = forms::FormLayout::new(screen, 2, &message, &form_buttons(form));
+    let layout = forms::FormLayout::new(screen, 2, &message, error, &form_buttons(form));
     FormLayout { agent: layout.fields[0], name: layout.fields[1], form: layout }
 }
 
@@ -1098,10 +1100,11 @@ mod tests {
             let text = buf.content.iter().map(|c| c.symbol()).collect::<String>();
             assert!(text.contains("Existing Claude sign-in needs review."));
             assert!(!text.contains("Name    "));
-            assert!(text.contains("[> Use existing account]"));
-            assert!(text.contains("[  Sign in to another account]"));
-            assert!(text.contains("[  Cancel]"));
+            assert!(text.contains(" Use existing account "));
+            assert!(text.contains(" Sign in to another account "));
+            assert!(text.contains(" Cancel "));
             let l = form_layout(&form, screen);
+            assert_eq!(buf[l.primary.as_position()].bg, crate::theme::current().accent);
             assert_eq!(l.primary.y, l.name.y + 2);
             assert_eq!(l.alternate.unwrap().y, l.primary.y);
             assert_eq!(l.cancel.y, l.primary.y);
@@ -1111,9 +1114,7 @@ mod tests {
             assert_eq!(form.field, 3);
             let mut buf = Buffer::empty(screen);
             draw_form(&form, screen, &mut buf);
-            assert!(
-                buf.content.iter().map(|c| c.symbol()).collect::<String>().contains("[> Sign in to another account]")
-            );
+            assert_eq!(buf[l.alternate.unwrap().as_position()].bg, crate::theme::current().accent);
             let Mode::AccountForm(form) = server.on_account_form(0, form, key("enter")) else { panic!() };
             assert!(!form.choosing());
             assert!(matches!(form.choice, Some(AccountChoice::New)));
@@ -1123,7 +1124,8 @@ mod tests {
             assert!(draw_form(&form, screen, &mut buf).is_some());
             let text = buf.content.iter().map(|c| c.symbol()).collect::<String>();
             assert!(text.contains("Name    e.g. Work or Personal"));
-            assert!(text.contains("[> Sign in]  [  Cancel]"));
+            assert!(text.contains(" Sign in     Cancel "));
+            assert_eq!(buf[form_layout(&form, screen).primary.as_position()].bg, crate::theme::current().accent);
             let Mode::AccountForm(form) = server.on_account_form(0, form, key("enter")) else { panic!() };
             assert!(form.error.is_some());
         }
@@ -1230,6 +1232,7 @@ mod tests {
                 form.scroll = scroll;
                 let mut buf = Buffer::empty(screen);
                 draw_form(&form, screen, &mut buf);
+                assert_eq!(buf[l.body.as_position()].fg, crate::theme::current().blocked);
                 seen.push_str(&buf.content.iter().map(|c| c.symbol()).collect::<String>());
             }
             for n in 0..50 {

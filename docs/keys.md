@@ -181,7 +181,9 @@ In lists, type in **Search** to filter, `↑↓` move, Enter or one click choose
 selected item (connect in a new tab, browse its files, run a command…). Most also have a key
 shown by the list; Duplicate, Move up, Move down and Delete are only in the workspace actions.
 Esc closes. Shared lists, forms, action menus and questions spell out their keys, for example
-**Enter Open · Tab Actions · Esc Close**. The footer says what Enter does on the selected line;
+**Enter Open · Tab Actions · Esc Close**. Keys are bold in the accent colour, with their actions
+dimmed. Leaving comes last; shorter footers keep Enter and Esc before other hints.
+The footer says what Enter does on the selected line;
 only actions that apply to that line are offered. When there are no other actions, Tab moves
 to the next line. Text fields edit like a shell line (arrows, `home`/`end`,
 `alt+←→`, `ctrl+w`, `ctrl+u`, `ctrl+k`). In Add workspace, Rename workspace, Duplicate workspace and Export layout,
@@ -191,7 +193,11 @@ the input and the keys to retry or cancel stay visible. Editing the value clears
 Workspace search never creates a workspace. **+ Add workspace** or `ctrl+b W n` opens the
 shared form; Enter or its **Add** button creates it. In Add workspace, Rename workspace and Duplicate workspace,
 Tab moves between **Name** and the buttons, including **From file...** in Add workspace.
-Buttons share one row whenever they fit. Esc returns to the list's search
+Forms and questions use padded button labels: the focused button is filled,
+and the others are underlined. Form buttons share one row whenever they fit and stack otherwise;
+each drawn button is clickable. Explanations and results use the normal text colour; form errors
+and failed results use red. Tunnel connection states retain their status colours.
+Esc returns to the list's search
 and selection. In Workspaces, Tab or a right click offers **Rename** and **Duplicate** for an open or closed saved
 workspace, **Export layout** also while closed, **Close** only while open, and **Delete** for a
 saved workspace or an unimported file.

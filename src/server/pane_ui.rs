@@ -58,11 +58,7 @@ fn form_layout(form: &PaneForm, screen: Rect) -> forms::FormLayout {
     if form.original.account.is_some() || form.original.account_id.is_some() {
         message.push_str("\nChanging Command starts a plain command without this agent's account or conversation.");
     }
-    if let Some(error) = &form.error {
-        message.push('\n');
-        message.push_str(error);
-    }
-    forms::FormLayout::new(screen, 3, &message, &buttons())
+    forms::FormLayout::new(screen, 3, &message, form.error.as_deref(), &buttons())
 }
 
 pub(super) fn draw_form(form: &PaneForm, screen: Rect, buf: &mut Buffer) -> Option<Cursor> {
@@ -774,6 +770,13 @@ mod tests {
             draft.error = Some(format!("{}final detail", "An error with readable details. ".repeat(150)));
             let screen = t.server.client_screen(t.client);
             let layout = form_layout(&draft, screen);
+            let mut buf = Buffer::empty(screen);
+            draw_form(&draft, screen, &mut buf);
+            assert_eq!(buf[layout.body.as_position()].fg, crate::theme::current().text);
+            assert_eq!(
+                buf[(layout.body.x, layout.body.y + layout.error_start as u16)].fg,
+                crate::theme::current().blocked
+            );
             while draft.scroll < layout.max_scroll {
                 draft = form(t.server.on_pane_form(t.client, draft, key("pagedown")));
             }

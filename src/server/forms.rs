@@ -24,6 +24,7 @@ pub(super) struct FormLayout {
     pub fields: Vec<Rect>,
     pub body: Rect,
     pub lines: Vec<String>,
+    pub error_start: usize,
     pub max_scroll: usize,
     pub primary: Rect,
     pub alternate: Option<Rect>,
@@ -32,21 +33,37 @@ pub(super) struct FormLayout {
 }
 
 impl FormLayout {
-    pub fn new(screen: Rect, fields: usize, message: &str, buttons: &Buttons<'_>) -> Self {
+    pub fn new(screen: Rect, fields: usize, message: &str, error: Option<&str>, buttons: &Buttons<'_>) -> Self {
+        Self::with_height(screen, fields, message, error, buttons, None)
+    }
+
+    pub fn with_height(
+        screen: Rect,
+        fields: usize,
+        message: &str,
+        error: Option<&str>,
+        buttons: &Buttons<'_>,
+        height: Option<u16>,
+    ) -> Self {
         let width = screen.width.saturating_sub(4).clamp(4, 76);
-        let lines: Vec<_> =
-            message.lines().flat_map(|l| crate::text::wrap(l, width.saturating_sub(4).max(1) as usize)).collect();
+        let wrap = |text: &str| {
+            text.lines().flat_map(|l| crate::text::wrap(l, width.saturating_sub(4).max(1) as usize)).collect::<Vec<_>>()
+        };
+        let mut lines = wrap(message);
+        let error_start = lines.len();
+        lines.extend(wrap(error.unwrap_or("")));
         // A result with only Close uses the same action for Enter and Esc.
         let single = buttons.primary.field == buttons.cancel.field;
-        let button_width = |button: &Button<'_>| crate::text::columns(button.label) as u16 + 4;
+        let button_width =
+            |button: &Button<'_>| (crate::text::columns(button.label) as u16 + 2).min(width.saturating_sub(4));
         let button_count = if single { 1 } else { 2 + u16::from(buttons.alternate.is_some()) };
         let total_width = button_width(&buttons.primary)
             + if single { 0 } else { button_width(&buttons.cancel) }
             + buttons.alternate.as_ref().map_or(0, button_width)
-            + 2 * (button_count - 1);
+            + 3 * (button_count - 1);
         let stacked = total_width > width.saturating_sub(4);
         let base = fields as u16 + 5 + if stacked { button_count - 1 } else { 0 };
-        let height = (lines.len() as u16 + base).min(screen.height.saturating_sub(2)).max(base);
+        let height = height.unwrap_or(lines.len() as u16 + base).min(screen.height.saturating_sub(2)).max(base);
         let area = overlays::centered(screen, width, height);
         let row = |y| Rect::new(area.x + 2, area.y + y, area.width.saturating_sub(4), 1);
         let body = Rect { height: area.height.saturating_sub(base), ..row(fields as u16 + 1) };
@@ -59,7 +76,7 @@ impl FormLayout {
             ..if stacked {
                 Rect { y: previous.y + 1, ..previous }
             } else {
-                Rect { x: previous.right() + 2, ..previous }
+                Rect { x: previous.right() + 3, ..previous }
             }
         };
         let alternate = buttons.alternate.as_ref().map(|b| next(primary, b));
@@ -70,6 +87,7 @@ impl FormLayout {
             body,
             max_scroll: lines.len().saturating_sub(body.height as usize),
             lines,
+            error_start,
             primary,
             alternate,
             cancel,
@@ -268,7 +286,11 @@ pub(super) fn draw_message(layout: &FormLayout, scroll: usize, buf: &mut Buffer)
             layout.body.y + i as u16,
             line,
             layout.body.width as usize,
-            Style::default().fg(crate::theme::current().blocked),
+            Style::default().fg(if scroll + i >= layout.error_start {
+                crate::theme::current().blocked
+            } else {
+                crate::theme::current().text
+            }),
         );
     }
 }
@@ -283,47 +305,34 @@ pub(super) fn draw_buttons(
 ) {
     let button = |buf: &mut Buffer, rect: Rect, button: &Button<'_>| {
         let selected = field == button.field || button.field == buttons.primary.field && field < button.field;
-        let marker = if selected { "> " } else { "  " };
         buf.set_stringn(
             rect.x,
             rect.y,
-            format!("[{marker}{}]", button.label),
+            format!(" {} ", button.label),
             rect.width as usize,
             overlays::button_style(selected, false),
         );
     };
     button(buf, layout.cancel, &buttons.cancel);
-    let cancel = buttons.cancel.label;
-    let footer = if pending.is_some() {
-        format!("Esc {cancel}")
-    } else {
+    let mut keys = Vec::new();
+    if pending.is_none() {
         if buttons.primary.field != buttons.cancel.field {
             button(buf, layout.primary, &buttons.primary);
         }
         if let Some((area, alternate)) = layout.alternate.zip(buttons.alternate.as_ref()) {
             button(buf, area, alternate);
         }
-        if layout.max_scroll > 0 {
-            if buttons.primary.field == buttons.cancel.field {
-                format!("Enter {verb} · PgUp/PgDn Scroll · Esc {cancel}")
-            } else {
-                format!("Enter {verb} · Tab Next · PgUp/PgDn Scroll · Esc {cancel}")
-            }
-        } else if buttons.primary.field == buttons.cancel.field {
-            format!("Enter {verb} · Esc {cancel}")
-        } else if layout.fields.is_empty() {
-            format!("Enter {verb} · Tab Next · Esc {cancel}")
-        } else {
-            format!("Enter {verb} · Tab Next field · Esc {cancel}")
+        keys.push(("Enter", verb));
+        if buttons.primary.field != buttons.cancel.field {
+            keys.push(("Tab", if layout.max_scroll > 0 || layout.fields.is_empty() { "Next" } else { "Next field" }));
         }
-    };
-    buf.set_stringn(
-        layout.footer.x,
-        layout.footer.y,
-        footer,
-        layout.footer.width as usize,
-        Style::default().fg(crate::theme::current().dim),
-    );
+        if layout.max_scroll > 0 {
+            keys.push(("PgUp/PgDn", "Scroll"));
+        }
+    }
+    keys.push(("Esc", buttons.cancel.label));
+    let line = overlays::key_line(&keys, "", layout.footer.width);
+    buf.set_line(layout.footer.x, layout.footer.y, &line, layout.footer.width);
 }
 
 #[cfg(test)]
@@ -349,10 +358,136 @@ mod tests {
     }
 
     #[test]
+    fn footers_share_key_styles_and_keep_leaving_last() {
+        let close = Buttons {
+            primary: Button { field: 0, label: "Close" },
+            alternate: None,
+            cancel: Button { field: 0, label: "Close" },
+        };
+        for (buttons, fields, message, pending, width, expected) in [
+            (buttons(false), 1, "", None, 80, "Enter Add · Tab Next field · Esc Cancel"),
+            (buttons(false), 0, "", None, 80, "Enter Add · Tab Next · Esc Cancel"),
+            (buttons(false), 1, "", Some(1), 80, "Esc Cancel"),
+            (buttons(false), 1, "", None, 32, "Enter Add · Esc Cancel"),
+            (buttons(false), 1, "line\nline\nline", None, 80, "Enter Add · Tab Next · PgUp/PgDn Scroll · Esc Cancel"),
+            (close, 0, "line\nline\nline\nline", None, 80, "Enter Close · PgUp/PgDn Scroll · Esc Close"),
+        ] {
+            let screen = Rect::new(0, 0, width, 10);
+            let layout = FormLayout::new(screen, fields, message, None, &buttons);
+            let mut buf = Buffer::empty(screen);
+            draw_buttons(&layout, &buttons, buttons.primary.field, pending, buttons.primary.label, &mut buf);
+            let row: String =
+                (layout.footer.x..layout.footer.right()).map(|x| buf[(x, layout.footer.y)].symbol()).collect();
+            assert_eq!(row.trim_end(), expected);
+            for key in ["Enter", "Tab", "PgUp/PgDn", "Esc"] {
+                if let Some(at) = expected.find(key) {
+                    let x = layout.footer.x + crate::text::columns(&expected[..at]) as u16;
+                    for col in x..x + key.len() as u16 {
+                        assert_eq!(buf[(col, layout.footer.y)].fg, crate::theme::current().accent);
+                        assert!(buf[(col, layout.footer.y)].modifier.contains(Modifier::BOLD));
+                    }
+                    let action = &buf[(x + key.len() as u16 + 1, layout.footer.y)];
+                    assert_eq!(action.fg, crate::theme::current().dim);
+                    assert!(!action.modifier.contains(Modifier::BOLD));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn buttons_share_question_padding_spacing_focus_and_mouse_targets_when_stacked() {
+        for width in [80, 124, 30, 16] {
+            let screen = Rect::new(0, 0, width, 24);
+            let buttons = buttons(true);
+            let layout = FormLayout::new(screen, 1, "", None, &buttons);
+            let areas = [
+                (layout.primary, &buttons.primary),
+                (layout.alternate.unwrap(), buttons.alternate.as_ref().unwrap()),
+                (layout.cancel, &buttons.cancel),
+            ];
+            for selected in [0, 10, 11, 12] {
+                let mut buf = Buffer::empty(screen);
+                draw_buttons(&layout, &buttons, selected, None, "Add", &mut buf);
+                for (area, button) in areas {
+                    assert_eq!(area.width, (crate::text::columns(button.label) as u16 + 2).min(layout.body.width));
+                    let label: String = format!(" {} ", button.label).chars().take(area.width as usize).collect();
+                    let drawn: String = (area.x..area.right()).map(|x| buf[(x, area.y)].symbol()).collect();
+                    assert_eq!(drawn, label);
+                    let focused = selected == button.field || selected == 0 && button.field == 10;
+                    for x in area.x..area.right() {
+                        let style = overlays::button_style(focused, false);
+                        let cell = &buf[(x, area.y)];
+                        assert_eq!(cell.fg, style.fg.unwrap());
+                        assert_eq!(cell.bg, style.bg.unwrap_or(ratatui::style::Color::Reset));
+                        assert_eq!(cell.modifier, style.add_modifier);
+                        let (mut field, mut scroll, mut error, mut pending) = (0, 0, None, None);
+                        let outcome = FormState {
+                            field: &mut field,
+                            scroll: &mut scroll,
+                            error: &mut error,
+                            pending: &mut pending,
+                        }
+                        .handle(
+                            mouse(MouseKind::Press(MouseButton::Left), Rect::new(x, area.y, 1, 1)),
+                            &mut [],
+                            &buttons,
+                            &layout,
+                        );
+                        if button.field == buttons.cancel.field {
+                            assert!(matches!(outcome, FormEvent::Cancel));
+                        } else {
+                            assert!(matches!(outcome, FormEvent::Submit));
+                            assert_eq!(field, button.field);
+                        }
+                    }
+                }
+            }
+            for pair in areas.windows(2) {
+                let (previous, next) = (pair[0].0, pair[1].0);
+                if width >= 80 {
+                    assert_eq!(next.x, previous.right() + 3);
+                    assert_eq!(next.y, previous.y);
+                } else {
+                    assert_eq!(next.x, previous.x);
+                    assert_eq!(next.y, previous.y + 1);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn explanations_and_results_use_text_colour_and_only_errors_are_red_after_scrolling() {
+        let message = "Starts in ~\nCommand uses sh syntax. Leave it empty for your shell.\nLayout exported";
+        let error = "Cannot save. Check the folder and retry. ".repeat(30);
+        for screen in [Rect::new(0, 0, 80, 24), Rect::new(0, 0, 124, 36)] {
+            for (message, error) in [(message, None), (message, Some(error.as_str())), ("", Some(error.as_str()))] {
+                let layout = FormLayout::new(screen, 1, message, error, &buttons(false));
+                assert_eq!(layout.error_start == 0, message.is_empty());
+                assert_eq!(layout.error_start == layout.lines.len(), error.is_none());
+                for scroll in 0..=layout.max_scroll {
+                    let mut buf = Buffer::empty(screen);
+                    draw_message(&layout, scroll, &mut buf);
+                    for row in 0..layout.body.height as usize {
+                        let Some(line) = layout.lines.get(scroll + row) else { break };
+                        let color = if scroll + row < layout.error_start {
+                            crate::theme::current().text
+                        } else {
+                            crate::theme::current().blocked
+                        };
+                        for col in 0..crate::text::columns(line) {
+                            assert_eq!(buf[(layout.body.x + col as u16, layout.body.y + row as u16)].fg, color);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn fields_keep_unicode_input_and_buttons_use_the_same_keyboard_and_mouse_actions() {
         for alternate in [false, true] {
             let buttons = buttons(alternate);
-            let layout = FormLayout::new(Rect::new(0, 0, 80, 24), 2, "", &buttons);
+            let layout = FormLayout::new(Rect::new(0, 0, 80, 24), 2, "", None, &buttons);
             let (mut field, mut scroll, mut error, mut pending) = (1, 0, Some("Try again".into()), None);
             let mut state =
                 FormState { field: &mut field, scroll: &mut scroll, error: &mut error, pending: &mut pending };
@@ -414,7 +549,7 @@ mod tests {
     #[test]
     fn a_pending_operation_accepts_only_cancel_and_a_result_must_match_its_token() {
         let buttons = buttons(true);
-        let layout = FormLayout::new(Rect::new(0, 0, 80, 24), 1, "Checking...", &buttons);
+        let layout = FormLayout::new(Rect::new(0, 0, 80, 24), 1, "Checking...", None, &buttons);
         let (mut field, mut scroll, mut error, mut pending) = (0, 0, None, None);
         let mut state = FormState { field: &mut field, scroll: &mut scroll, error: &mut error, pending: &mut pending };
         let (mut value, mut cursor) = ("draft".to_string(), 5);
@@ -462,7 +597,7 @@ mod tests {
         for screen in [Rect::new(0, 0, 80, 24), Rect::new(0, 0, 124, 36)] {
             let buttons = buttons(false);
             let message = format!("{}final detail", "A long error with café and 日本語. ".repeat(150));
-            let layout = FormLayout::new(screen, 2, &message, &buttons);
+            let layout = FormLayout::new(screen, 2, "", Some(&message), &buttons);
             assert!(layout.max_scroll > 0);
             assert!(layout.lines.iter().all(|l| crate::text::columns(l) <= layout.body.width as usize));
             let (mut field, mut scroll, mut error, mut pending) = (1, 0, Some(message), None);
@@ -477,7 +612,8 @@ mod tests {
             draw_buttons(&layout, &buttons, *state.field, *state.pending, "Add", &mut buf);
             let text = buf.content.iter().map(|c| c.symbol()).collect::<String>();
             assert!(text.contains("final detail"));
-            assert!(text.contains("[> Add]  [  Cancel]"));
+            assert!(text.contains(" Add     Cancel "));
+            assert_eq!(buf[layout.primary.as_position()].bg, crate::theme::current().accent);
             assert!(text.contains("PgUp/PgDn Scroll"));
             state.handle(mouse(MouseKind::ScrollUp, layout.body), &mut [], &buttons, &layout);
             assert_eq!(*state.scroll, layout.max_scroll - 2);

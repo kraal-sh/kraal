@@ -30,12 +30,12 @@ fn buttons(p: &Prompt) -> forms::Buttons<'static> {
 }
 
 fn form_layout(p: &Prompt, screen: Rect) -> forms::FormLayout {
-    let message = if p.server_form.as_ref().is_some_and(|f| f.pending.is_some()) {
-        "Saving server..."
+    let (message, error) = if p.server_form.as_ref().is_some_and(|f| f.pending.is_some()) {
+        ("Saving server...", None)
     } else {
-        p.error.as_deref().unwrap_or("")
+        ("", p.error.as_deref())
     };
-    forms::FormLayout::new(screen, 2, message, &buttons(p))
+    forms::FormLayout::new(screen, 2, message, error, &buttons(p))
 }
 
 pub(super) fn draw_form(p: &Prompt, screen: Rect, buf: &mut Buffer) -> Option<Cursor> {
@@ -284,6 +284,7 @@ mod tests {
                 p.scroll = layout.max_scroll;
                 let mut buf = Buffer::empty(screen);
                 draw_form(&p, screen, &mut buf);
+                assert_eq!(buf[layout.body.as_position()].fg, crate::theme::current().blocked);
                 let text = buf.content.iter().map(|c| c.symbol()).collect::<String>();
                 for expected in ["Address", "Name", "Last detail.", "Retry", "Cancel", "PgUp/PgDn"] {
                     assert!(text.contains(expected), "{expected}: {text}");
