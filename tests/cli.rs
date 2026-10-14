@@ -1495,8 +1495,19 @@ layout {{
 
         // The fake agent writes a transcript but never sends hooks. Close/Open and a server
         // restart must both recover the copy's conversation, without borrowing the source's.
+        // The question lists the programs as the periodic scan knows them, and asks again when
+        // that list changed under it: answer once the scan has recognised the copied agent.
+        wait_until(PATIENCE, "the copied agent was not detected as idle", || {
+            let panes: serde_json::Value = serde_json::from_str(&env.run(&["panes", "--json"])).unwrap();
+            panes
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|p| p["id"] == agent["id"] && p["agent"] == "claude" && p["state"] == "idle")
+        });
         client.send(b"\x02Wx");
         client.wait_for_row("The layout will be kept.");
+        client.wait_for_row("claude: idle");
         client.send(b"y");
         client.wait_for_row("Closed · 2 tabs · 3 panes");
         env.run(&["open", "api-copy-2"]);
