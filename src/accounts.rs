@@ -1213,6 +1213,18 @@ pub struct Launch {
     pub env_remove: Vec<String>,
 }
 
+impl Launch {
+    pub fn command(&self) -> std::process::Command {
+        let mut cmd = std::process::Command::new(&self.argv[0]);
+        cmd.args(&self.argv[1..]);
+        for key in &self.env_remove {
+            cmd.env_remove(key);
+        }
+        cmd.envs(self.env.iter().cloned());
+        cmd
+    }
+}
+
 /// How to start `a`'s agent: resuming `resume` if given, else a new conversation with
 /// `new_session` as its id when the agent supports choosing it.
 pub fn launch(a: &Account, args: &[String], resume: Option<&str>, new_session: Option<&str>) -> Result<Launch> {
@@ -2104,6 +2116,30 @@ pub fn describe_reset(resets_at: Option<i64>, now: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn launch_command_preserves_arguments_and_environment_overrides() {
+        use std::ffi::OsStr;
+
+        let mut launch = Launch {
+            argv: vec!["agent".into()],
+            env: vec![("ACCOUNT".into(), "first".into()), ("ACCOUNT".into(), "last".into())],
+            env_remove: vec!["API_KEY".into(), "ACCOUNT".into()],
+        };
+        let cmd = launch.command();
+        assert_eq!(cmd.get_program(), "agent");
+        assert_eq!(cmd.get_args().count(), 0);
+        assert_eq!(
+            cmd.get_envs().collect::<Vec<_>>(),
+            [(OsStr::new("ACCOUNT"), Some(OsStr::new("last"))), (OsStr::new("API_KEY"), None)]
+        );
+        assert_eq!(cmd.get_current_dir(), None);
+
+        launch.argv.extend(["two words".into(), "".into(), "$HOME;*".into()]);
+        let cmd = launch.command();
+        assert_eq!(cmd.get_program(), "agent");
+        assert_eq!(cmd.get_args().collect::<Vec<_>>(), ["two words", "", "$HOME;*"]);
+    }
 
     #[test]
     fn duplicate_agent_arguments_keep_options_and_prompts_without_selecting_old_conversations() {

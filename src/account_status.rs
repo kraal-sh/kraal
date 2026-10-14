@@ -1,6 +1,6 @@
 //! Sign-in checks shared by the account list and login panes. The agent's output stays private.
 
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::time::{Duration, Instant};
 
 use crate::accounts::{self, Account, Launch};
@@ -51,12 +51,7 @@ pub fn inspect(account: &Account) -> Checked {
 }
 
 fn inspect_launch(launch: &Launch, limit: Duration, agent: &str) -> Checked {
-    let mut cmd = Command::new(&launch.argv[0]);
-    cmd.args(&launch.argv[1..]);
-    for key in &launch.env_remove {
-        cmd.env_remove(key);
-    }
-    cmd.envs(launch.env.iter().cloned());
+    let mut cmd = launch.command();
     cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut child = match crate::exec::own_group(&mut cmd).spawn() {
         Ok(child) => child,
@@ -161,11 +156,24 @@ mod tests {
     }
 
     #[test]
-    fn checks_use_the_accounts_environment() {
+    fn checks_preserve_arguments_and_the_accounts_environment() {
         let launch = Launch {
-            argv: vec!["sh".into(), "-c".into(), "test \"$KRAAL_STATUS_HOME\" = account && test -z \"$HOME\"".into()],
-            env: vec![("KRAAL_STATUS_HOME".into(), "account".into())],
-            env_remove: vec!["HOME".into()],
+            argv: vec![
+                "sh".into(),
+                "-c".into(),
+                r#"test "$#" = 3 && test "$1" = 'two words' && test -z "$2" && test "$3" = '$HOME;*' &&
+                   test "$KRAAL_STATUS_HOME" = 'account home' && test "${HOME+x}" != x && test -n "$PATH""#
+                    .into(),
+                "sh".into(),
+                "two words".into(),
+                "".into(),
+                "$HOME;*".into(),
+            ],
+            env: vec![
+                ("KRAAL_STATUS_HOME".into(), "first".into()),
+                ("KRAAL_STATUS_HOME".into(), "account home".into()),
+            ],
+            env_remove: vec!["HOME".into(), "KRAAL_STATUS_HOME".into()],
         };
         assert_eq!(run(&launch, crate::testing::PATIENCE), Status::SignedIn);
     }
