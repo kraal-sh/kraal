@@ -37,7 +37,7 @@ workspace_dirs = []      # more directories of workspace files, after ~/.config/
 ssh_config_hosts = true  # offer the hosts of ~/.ssh/config in the server picker
 
 [sidebar]
-visible = true           # false hides it
+visible = true           # false folds to the four-column strip
 width = 28               # in terminals at least three times as wide
 
 [bar]
@@ -49,6 +49,12 @@ on_blocked = true        # an agent that waits for you
 on_done = true           # an agent that finished
 long_command = 30        # seconds a command runs before its end is announced; 0: never
 ```
+
+The full sidebar needs at least three times `sidebar.width`, 84 columns by default.
+At 40 to 83 columns it becomes a four-column workspace and agent strip; below 40 it disappears.
+`visible = false` also folds to this strip, including on wide terminals. `ctrl+b V l` toggles
+full sidebar and strip for the attached terminal. When too narrow for the full sidebar, it opens
+Workspaces and leaves that preference unchanged. See [the strip](workspaces.md) for its controls.
 
 `save_scrollback` saves what each pane shows, its scrollback included, in
 `~/.local/state/kraal/scrollback-v2`, so that panes show it again after a restart (see

@@ -6,6 +6,14 @@ use ratatui::layout::Rect;
 
 use super::{Client, ClientId, Dirty, Server, Tab};
 use crate::layout::{Node, PaneId};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Sidebar {
+    Hidden,
+    Strip,
+    Full(u16),
+}
+
 /// A layout worked out: the tiles of the tree `root` in `area`, with frames or not.
 pub(super) struct Tiling {
     root: Node,
@@ -15,8 +23,7 @@ pub(super) struct Tiling {
 }
 
 impl Server {
-    /// Main pane area of client `c`: below the top bar, above the bottom bar, one column of space
-    /// right of the sidebar.
+    /// Main pane area of client `c`: below the top bar and above the bottom bar.
     pub(super) fn main_area(&self, c: &Client) -> Rect {
         let top = 1;
         let height = c.rows.saturating_sub(top + self.bottom_rows()).max(1);
@@ -24,11 +31,12 @@ impl Server {
         Rect::new(left, top, c.cols.saturating_sub(left).max(1), height)
     }
 
-    /// The column client `c`'s panes start at: after its sidebar and a column of space.
-    fn panes_left(&self, c: &Client) -> u16 {
-        match self.sidebar_cols(c) {
-            0 => 0,
-            sidebar => sidebar + 1,
+    /// Only the full sidebar needs an extra column of space beside its border.
+    pub(super) fn panes_left(&self, c: &Client) -> u16 {
+        match self.sidebar_presentation(c) {
+            Sidebar::Hidden => 0,
+            Sidebar::Strip => 4,
+            Sidebar::Full(width) => width + 1,
         }
     }
 
@@ -65,16 +73,28 @@ impl Server {
         if cols / 3 < w { 0 } else { w }
     }
 
-    /// Whether a client has the sidebar: as `[sidebar] visible` says, until it shows or hides it
-    /// itself.
+    /// Whether a client requests the full sidebar, until it chooses for itself.
     pub fn sidebar_shown(&self, c: &Client) -> bool {
         c.sidebar.unwrap_or(self.config.sidebar.visible)
     }
 
-    /// The columns client `c`'s sidebar takes: none when it has none, or a screen too narrow for
-    /// one.
+    pub(super) fn sidebar_presentation(&self, c: &Client) -> Sidebar {
+        if c.cols < 40 {
+            Sidebar::Hidden
+        } else if self.sidebar_shown(c) && self.sidebar_width(c.cols) > 0 {
+            Sidebar::Full(self.sidebar_width(c.cols))
+        } else {
+            Sidebar::Strip
+        }
+    }
+
+    /// The columns client `c`'s sidebar takes, including its separator.
     pub(super) fn sidebar_cols(&self, c: &Client) -> u16 {
-        if self.sidebar_shown(c) { self.sidebar_width(c.cols) } else { 0 }
+        match self.sidebar_presentation(c) {
+            Sidebar::Hidden => 0,
+            Sidebar::Strip => 4,
+            Sidebar::Full(width) => width,
+        }
     }
 
     /// Where every visible pane of a tab goes, in draw order (tiled, then floating): its frame,
@@ -238,5 +258,72 @@ impl Server {
             }
         }
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::server::ui::Mode;
+
+    #[test]
+    fn sidebar_thresholds_and_folding_belong_to_each_client() {
+        let (tx, _rx) = crate::server::event_channel(32);
+        let mut server = crate::server::tests::server(tx);
+        let (client, _peer) = crate::server::tests::client(&mut server);
+        let (other, _other_peer) = crate::server::tests::client(&mut server);
+        server.bottom_bar = true;
+        let toggle = |server: &mut Server, id| {
+            server.clients.get_mut(&id).unwrap().mode = Mode::Normal;
+            server.client_input(id, b"\x02Vl");
+        };
+        for (cols, rows, sidebar, inner) in [
+            (39, 20, Sidebar::Hidden, (37, 16)),
+            (40, 20, Sidebar::Strip, (34, 16)),
+            (60, 20, Sidebar::Strip, (54, 16)),
+            (80, 24, Sidebar::Strip, (74, 20)),
+            (83, 24, Sidebar::Strip, (77, 20)),
+            (84, 24, Sidebar::Full(28), (53, 20)),
+            (124, 36, Sidebar::Full(28), (93, 32)),
+        ] {
+            let c = server.clients.get_mut(&client).unwrap();
+            (c.cols, c.rows) = (cols, rows);
+            assert_eq!(server.sidebar_presentation(&server.clients[&client]), sidebar);
+            let area = server.inner(server.main_area(&server.clients[&client]));
+            assert_eq!((area.width, area.height), inner);
+            if cols < 84 {
+                toggle(&mut server, client);
+                assert!(matches!(server.clients[&client].mode, Mode::Picker(_)));
+                assert_eq!(server.clients[&client].sidebar, None);
+            }
+        }
+        toggle(&mut server, client);
+        assert_eq!(server.clients[&client].sidebar, Some(false));
+        assert_eq!(server.clients[&other].sidebar, None);
+        assert_eq!(server.sidebar_presentation(&server.clients[&other]), Sidebar::Full(28));
+        for cols in [124, 83, 39, 40, 84, 124] {
+            server.clients.get_mut(&client).unwrap().cols = cols;
+            assert_eq!(
+                server.sidebar_presentation(&server.clients[&client]),
+                if cols < 40 { Sidebar::Hidden } else { Sidebar::Strip }
+            );
+            assert_eq!(server.clients[&client].sidebar, Some(false));
+        }
+        let area = server.inner(server.main_area(&server.clients[&client]));
+        assert_eq!((area.width, area.height), (118, 32));
+        server.config.sidebar.visible = false;
+        assert_eq!(server.sidebar_presentation(&server.clients[&other]), Sidebar::Strip);
+        toggle(&mut server, other);
+        assert_eq!(server.sidebar_presentation(&server.clients[&other]), Sidebar::Full(28));
+        server.config.sidebar.width = 32;
+        for (cols, expected) in [(95, Sidebar::Strip), (96, Sidebar::Full(32))] {
+            server.clients.get_mut(&other).unwrap().cols = cols;
+            assert_eq!(server.sidebar_presentation(&server.clients[&other]), expected);
+        }
+        server.config.sidebar.width = 30000;
+        assert_eq!(server.sidebar_presentation(&server.clients[&other]), Sidebar::Strip);
+        toggle(&mut server, other);
+        assert!(matches!(server.clients[&other].mode, Mode::Picker(_)));
+        assert_eq!(server.clients[&other].sidebar, Some(true));
     }
 }

@@ -14,6 +14,7 @@ use ratatui::widgets::{Block, Borders, Clear, Widget};
 use unicode_width::UnicodeWidthStr;
 
 use super::bottom_bar::BottomBar;
+use super::geometry::Sidebar;
 use super::overlays;
 use super::ui::Mode;
 use super::{Client, ClientId, Server};
@@ -56,9 +57,78 @@ pub(super) struct AccountRows {
     rows: Vec<SideRow>,
 }
 
+struct StripEntry {
+    item: SideItem,
+    state: Option<AgentState>,
+    icon: AgentState,
+    selected: bool,
+}
+
+fn agent_urgency(state: &AgentState) -> u8 {
+    match state {
+        AgentState::Blocked => 4,
+        AgentState::Done => 3,
+        AgentState::Working => 2,
+        AgentState::Idle => 1,
+        AgentState::Unknown => 0,
+    }
+}
+
+fn strip_label(text: &str, item: SideItem, theme: crate::theme::Theme) -> SideRow {
+    SideRow::Entry {
+        item: Some(item),
+        line: Line::styled(text.to_owned(), Style::default().fg(theme.accent).add_modifier(Modifier::BOLD)),
+        selected: false,
+    }
+}
+
+fn strip_entries(entries: Vec<StripEntry>, room: usize, list: SideItem, theme: crate::theme::Theme) -> Vec<SideRow> {
+    if room == 0 {
+        return Vec::new();
+    }
+    let overflow = entries.len() > room || entries.len() > 99;
+    let has_current = entries.iter().any(|e| e.selected);
+    let mut entries: Vec<_> = entries.into_iter().enumerate().take(99).collect();
+    if overflow {
+        // Keep the current workspace and urgent agents, but retain their original list numbers.
+        entries.sort_by_key(|(i, e)| (std::cmp::Reverse((e.selected, e.state.as_ref().map_or(0, agent_urgency))), *i));
+        entries.truncate(room - 1);
+        entries.sort_by_key(|(i, _)| *i);
+    }
+    let current_in_list = has_current && !entries.iter().any(|(_, e)| e.selected);
+    let mut rows: Vec<_> = entries
+        .into_iter()
+        .map(|(i, e)| {
+            let number = Style::default().fg(if e.selected { theme.text } else { theme.dim });
+            let number = if e.selected { number.add_modifier(Modifier::BOLD) } else { number };
+            SideRow::Entry {
+                item: Some(e.item),
+                line: Line::from(vec![
+                    Span::styled(format!("{:>2}", i + 1), number),
+                    Span::styled(
+                        theme.icon(e.icon),
+                        Style::default().fg(e.state.map_or(theme.dim, |s| theme.state_color(s))),
+                    ),
+                ]),
+                selected: e.selected,
+            }
+        })
+        .collect();
+    if overflow {
+        let mut row = strip_label(if theme.ascii { "..." } else { " ⋮ " }, list, theme);
+        if let SideRow::Entry { selected, .. } = &mut row {
+            *selected = current_in_list;
+        }
+        rows.push(row);
+    }
+    rows
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum SideItem {
     Workspaces,
+    Panes,
+    ToggleSidebar,
     AddWorkspace,
     Workspace(u32),
     ReviewAccount(String),
@@ -454,16 +524,17 @@ impl Server {
         // they are taken from it rather than made again.
         let mut last = memo.chrome.take();
         let bar_from = self.bar_inputs(c);
-        let (bar, bar_same) = match last.as_mut().filter(|l| l.bar_from == bar_from) {
+        let (bar, bar_same) = match last.as_mut().filter(|l| l.side == side && l.bar_from == bar_from) {
             Some(l) => (std::mem::take(&mut l.bar), true),
             None => (self.top_bar(c), false),
         };
         let sidebar_from = if sw > 0 { self.sidebar_inputs(side.height, now) } else { Inputs::default() };
-        let (sidebar, sidebar_same) = match last.as_mut().filter(|l| sw > 0 && l.sidebar_from == sidebar_from) {
-            Some(l) => (std::mem::take(&mut l.sidebar), true),
-            None if sw > 0 => (self.sidebar_rows(c, side.height, now), false),
-            None => (Vec::new(), false),
-        };
+        let (sidebar, sidebar_same) =
+            match last.as_mut().filter(|l| sw > 0 && l.side == side && l.sidebar_from == sidebar_from) {
+                Some(l) => (std::mem::take(&mut l.sidebar), true),
+                None if sw > 0 => (self.sidebar_rows(c, side.height, now), false),
+                None => (Vec::new(), false),
+            };
         let bottom_from = if self.bottom_bar { self.bottom_inputs(c) } else { Inputs::default() };
         let (bottom, bottom_same) = match last.as_mut().filter(|l| self.bottom_bar && l.bottom_from == bottom_from) {
             Some(l) => (std::mem::take(&mut l.bottom), true),
@@ -538,7 +609,11 @@ impl Server {
         clear_except(buf, &kept);
 
         if sw > 0 && sidebar_changed {
-            Self::draw_sidebar(&chrome.sidebar, side, buf);
+            if self.sidebar_presentation(c) == Sidebar::Strip {
+                Self::draw_strip(&chrome.sidebar, side, buf, th());
+            } else {
+                Self::draw_sidebar(&chrome.sidebar, side, buf);
+            }
         }
         if bar_changed {
             Self::draw_top_bar(&chrome.bar, cols, buf);
@@ -837,35 +912,34 @@ impl Server {
 
     // ---- top bar ----------------------------------------------------------------------
 
-    /// The top bar, on the first row, right of the sidebar. Left: the workspace when there is no
-    /// sidebar to show it, a broadcast in progress (never hidden), then the tabs, or the keys of
+    /// The top bar, on the first row, right of the sidebar. Left: the workspace without a full
+    /// sidebar to name it, a broadcast in progress (never hidden), then the tabs, or the keys of
     /// the mode in use instead. Right: a message, what the focused pane works on when it has no
     /// frame, agents across workspaces, the menu key unless the bottom bar shows it, and the
     /// session unless it is the default one. When room runs out, the right side gives way first.
     pub fn top_bar(&self, c: &Client) -> TopBar {
         let mut bar = TopBar::default();
         let Some(wi) = self.ws_index(c.workspace) else {
-            let sidebar = self.sidebar_cols(c);
-            let used = if sidebar == 0 {
+            let left = self.panes_left(c);
+            let used = if !matches!(self.sidebar_presentation(c), Sidebar::Full(_)) {
                 let label = " Workspaces ";
                 bar.items.push((
-                    0,
+                    left,
                     label.len() as u16,
                     BarItem::Workspace,
                     vec![Span::styled(label, Style::default().fg(th().accent).add_modifier(Modifier::BOLD))],
                 ));
-                label.len() as u16
+                left + label.len() as u16
             } else {
-                sidebar + 1
+                left
             };
             bar.right = self.bar_right(c, c.cols.saturating_sub(used + 1));
             return bar;
         };
         let ws = &self.workspaces[wi];
         let cols = c.cols;
-        let sw = self.sidebar_cols(c);
-        let mut x = if sw > 0 { sw + 1 } else { 0 };
-        if sw == 0 {
+        let mut x = self.panes_left(c);
+        if !matches!(self.sidebar_presentation(c), Sidebar::Full(_)) {
             // A broadcast in progress always shows, if need be with a shorter workspace name.
             let broadcasting = ws.sync != super::SyncScope::Off && ws.tab().and_then(|t| t.focus).is_some();
             let name_room = if broadcasting { (cols as usize / 4).clamp(1, 20) } else { 20 };
@@ -1225,6 +1299,87 @@ impl Server {
 
     // ---- sidebar ----------------------------------------------------------------------
 
+    fn strip_rows(&self, c: &Client, height: u16, theme: crate::theme::Theme) -> Vec<SideRow> {
+        let mut workspaces = Vec::new();
+        let mut agents = Vec::new();
+        for ws in &self.workspaces {
+            let states: Vec<_> = ws
+                .panes()
+                .into_iter()
+                .filter_map(|p| self.panes.get(&p).filter(|p| p.agent.kind.is_some()).map(|pane| (p, pane.agent.state)))
+                .collect();
+            workspaces.push(StripEntry {
+                item: SideItem::Workspace(ws.id),
+                state: states.iter().map(|(_, s)| *s).max_by_key(agent_urgency),
+                icon: if ws.closed() { AgentState::Idle } else { AgentState::Working },
+                selected: ws.id == c.workspace,
+            });
+            agents.extend(states.into_iter().map(|(p, state)| StripEntry {
+                item: SideItem::Pane(p),
+                state: Some(state),
+                icon: state,
+                selected: false,
+            }));
+        }
+        for (path, _) in self
+            .def_files
+            .iter()
+            .filter(|(p, _)| !self.source_removed(p) && matches!(self.definition_workspace(p), Ok(None)))
+        {
+            workspaces.push(StripEntry {
+                item: SideItem::Definition(path.clone()),
+                state: None,
+                icon: AgentState::Idle,
+                selected: false,
+            });
+        }
+        workspaces.sort_by_key(|entry| match &entry.item {
+            SideItem::Workspace(ws) => self.workspace_position(&super::ui::PickAction::SwitchWorkspace(*ws)),
+            SideItem::Definition(path) => {
+                crate::persist::WorkspaceKey::position(&self.workspace_order, None, Some(path))
+            }
+            _ => usize::MAX,
+        });
+        agents.extend(self.remote_agents().map(|(server, a)| StripEntry {
+            item: SideItem::Remote { server: server.to_owned(), pane: a.pane },
+            state: Some(a.state),
+            icon: a.state,
+            selected: false,
+        }));
+
+        let room = height.saturating_sub(3) as usize;
+        let ws_need = workspaces.len().min(100);
+        let ag_need = agents.len().min(100);
+        let ws_room = ws_need.min(room.saturating_sub(ag_need.min(room / 2)));
+        let ag_room = ag_need.min(room - ws_room);
+        let mut rows = vec![strip_label("WS", SideItem::Workspaces, theme)];
+        rows.extend(strip_entries(workspaces, ws_room, SideItem::Workspaces, theme));
+        rows.push(strip_label("AG", SideItem::Panes, theme));
+        rows.extend(strip_entries(agents, ag_room, SideItem::Panes, theme));
+        rows.resize(height.saturating_sub(1) as usize, SideRow::Blank);
+        if height > 0 {
+            rows.push(strip_label(&format!(" {} ", theme.pointer()), SideItem::ToggleSidebar, theme));
+        }
+        rows
+    }
+
+    fn draw_strip(rows: &[SideRow], area: Rect, buf: &mut Buffer, theme: crate::theme::Theme) {
+        for (y, row) in (area.y..area.bottom()).zip(rows) {
+            for x in area.x..area.right() {
+                buf[(x, y)].reset();
+            }
+            buf[(area.right() - 1, y)].set_symbol(if theme.ascii { "|" } else { "│" }).set_fg(theme.dim);
+            if let SideRow::Entry { line, selected, .. } = row {
+                if *selected {
+                    for x in area.x..area.right() - 1 {
+                        buf[(x, y)].set_bg(theme.selection);
+                    }
+                }
+                buf.set_line(area.x, y, line, 3);
+            }
+        }
+    }
+
     /// The sidebar's rows from the top of the screen, `height` rows in all. Each section opens on
     /// a line that carries its name, the first one on the top border; its entries take two rows,
     /// a name after a state dot and a detail below. Accounts sit at the bottom when there is room,
@@ -1232,6 +1387,9 @@ impl Server {
     fn sidebar_rows(&self, c: &Client, height: u16, now: i64) -> Vec<SideRow> {
         #[cfg(test)]
         SIDEBAR_BUILDS.with(|n| n.set(n.get() + 1));
+        if self.sidebar_presentation(c) == Sidebar::Strip {
+            return self.strip_rows(c, height, th());
+        }
         let t = th();
         let mut rows = vec![SideRow::Section("WORKSPACES")];
         let entry = |rows: &mut Vec<SideRow>,
@@ -1248,13 +1406,6 @@ impl Server {
         let faint = |text: String, color: Color| Span::styled(text, Style::default().fg(color));
         let plural = |n: usize, what: &str| format!("{n} {what}{}", if n == 1 { "" } else { "s" });
         let sep = if t.ascii { " - " } else { " · " };
-        let urgency = |s: &AgentState| match s {
-            AgentState::Blocked => 4,
-            AgentState::Done => 3,
-            AgentState::Working => 2,
-            AgentState::Idle => 1,
-            AgentState::Unknown => 0,
-        };
 
         // Saved workspaces keep their place when opened or closed.
         let mut agents = Vec::new();
@@ -1266,7 +1417,7 @@ impl Server {
                     self.panes.get(p).filter(|pane| pane.agent.kind.is_some()).map(|pane| (*p, pane.agent.state))
                 })
                 .collect();
-            let color = states.iter().map(|(_, s)| *s).max_by_key(urgency).map_or(t.dim, |s| t.state_color(s));
+            let color = states.iter().map(|(_, s)| *s).max_by_key(agent_urgency).map_or(t.dim, |s| t.state_color(s));
             let icon = t.icon(if ws.closed() { AgentState::Idle } else { AgentState::Working });
             let (tabs, panes) = ws.counts();
             let detail = match ws.source_status {
@@ -1444,8 +1595,11 @@ impl Server {
     pub fn sidebar_hit(&self, id: ClientId, row: u16) -> Option<SideItem> {
         let c = self.clients.get(&id)?;
         let height = c.rows.saturating_sub(self.bottom_rows());
-        // The last row is the box's bottom border, whatever would follow there.
-        if row.saturating_add(1) >= height {
+        if self.sidebar_cols(c) == 0 || row >= height {
+            return None;
+        }
+        // The full sidebar ends with a border; the strip ends with its folding action.
+        if self.sidebar_presentation(c) != Sidebar::Strip && row.saturating_add(1) >= height {
             return None;
         }
         match self.sidebar_rows(c, height, crate::accounts::now()).into_iter().nth(row as usize)? {
@@ -2148,6 +2302,263 @@ thread_local! {
 mod tests {
     use super::*;
     use crate::theme::NoticeKind;
+
+    #[test]
+    fn strip_cells_colours_selection_and_state_changes_at_the_delivery_sizes() {
+        let _batch = crate::pane::batch();
+        let (tx, _rx) = super::super::event_channel(32);
+        let mut server = super::super::tests::server(tx);
+        let (client, _peer) = super::super::tests::client(&mut server);
+        server.bottom_bar = true;
+        server.primary = Some(client);
+        let api = server.clients[&client].workspace;
+        server.workspaces[0].name = "api".into();
+        let docs = server.new_workspace("docs".into(), None);
+        let mut panes = Vec::new();
+        for (ws, name) in [(api, "review"), (docs, "writer")] {
+            let pane = server
+                .spawn_pane_in(
+                    ws,
+                    None,
+                    crate::pane::PaneSpec { command: vec!["true".into()], ..Default::default() },
+                    crate::protocol::Placement::Tab,
+                    Some(name.into()),
+                )
+                .unwrap();
+            let agent = &mut server.panes.get_mut(&pane).unwrap().agent;
+            agent.kind = Some("claude".into());
+            agent.state = AgentState::Working;
+            panes.push(pane);
+        }
+        server.workspaces[0].active = 1;
+        for (cols, height, size) in [(124, 36, (118, 32)), (80, 24, (74, 20)), (60, 20, (54, 16))] {
+            let c = server.clients.get_mut(&client).unwrap();
+            (c.cols, c.rows, c.sidebar) = (cols, height, Some(false));
+            server.relayout();
+            assert_eq!((server.panes[&panes[0]].cols, server.panes[&panes[0]].rows), size);
+            assert_eq!(server.client_area(client).x, 4);
+            for theme in [crate::theme::Theme::DEFAULT, crate::theme::Theme::ASCII, crate::theme::Theme::HIGH_CONTRAST]
+            {
+                for state in
+                    [AgentState::Blocked, AgentState::Working, AgentState::Done, AgentState::Idle, AgentState::Unknown]
+                {
+                    server.panes.get_mut(&panes[0]).unwrap().agent.state = state;
+                    server.mark_dirty();
+                    let rows = server.strip_rows(&server.clients[&client], height - 1, theme);
+                    let mut buf = Buffer::empty(Rect::new(0, 0, cols, height));
+                    Server::draw_strip(&rows, Rect::new(0, 0, 4, height - 1), &mut buf, theme);
+                    let line = |y| -> String { (0..4).map(|x| buf[(x, y)].symbol()).collect() };
+                    let sep = if theme.ascii { "|" } else { "│" };
+                    assert_eq!(line(0), format!("WS {sep}"));
+                    assert_eq!(line(1), format!(" 1{}{sep}", theme.icon(AgentState::Working)));
+                    assert_eq!(line(2), format!(" 2{}{sep}", theme.icon(AgentState::Working)));
+                    assert_eq!(line(3), format!("AG {sep}"));
+                    assert_eq!(line(4), format!(" 1{}{sep}", theme.icon(state)));
+                    assert_eq!(line(5), format!(" 2{}{sep}", theme.icon(AgentState::Working)));
+                    for x in 0..3 {
+                        assert_eq!(buf[(x, 1)].bg, theme.selection);
+                        assert_ne!(buf[(x, 2)].bg, theme.selection);
+                    }
+                    assert!(buf[(1, 1)].modifier.contains(Modifier::BOLD));
+                    for y in [1, 4] {
+                        assert_eq!(buf[(2, y)].fg, theme.state_color(state));
+                    }
+                    for y in [2, 5] {
+                        assert_eq!(buf[(2, y)].fg, theme.working);
+                    }
+                    assert_eq!(line(height - 2), format!(" {} {sep}", theme.pointer()));
+                    for y in 6..height - 2 {
+                        assert_eq!(line(y), format!("   {sep}"));
+                    }
+                    assert_eq!(server.panes[&panes[0]].agent.state, state, "drawing never acknowledges done");
+                    assert_eq!(server.sidebar_hit(client, 1), Some(SideItem::Workspace(api)));
+                    assert_eq!(server.sidebar_hit(client, 4), Some(SideItem::Pane(panes[0])));
+                    assert_eq!(server.sidebar_hit(client, height - 2), Some(SideItem::ToggleSidebar));
+                    assert_eq!(server.sidebar_hit(client, height - 1), None);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn strip_overflow_keeps_original_numbers_current_workspace_and_urgent_agents() {
+        let theme = th();
+        let entries = |selected| {
+            (0..12)
+                .map(|i| StripEntry {
+                    item: SideItem::Workspace(i),
+                    state: None,
+                    icon: AgentState::Working,
+                    selected: i == selected,
+                })
+                .collect()
+        };
+        let rows = strip_entries(entries(10), 4, SideItem::Workspaces, theme);
+        let labels: Vec<_> = rows
+            .iter()
+            .map(|r| match r {
+                SideRow::Entry { line, .. } => line.to_string(),
+                _ => panic!(),
+            })
+            .collect();
+        assert_eq!(labels, [" 1●", " 2●", "11●", " ⋮ "]);
+        assert!(matches!(&rows[2], SideRow::Entry { selected: true, item: Some(SideItem::Workspace(10)), .. }));
+        let agents =
+            [AgentState::Idle, AgentState::Working, AgentState::Done, AgentState::Blocked, AgentState::Unknown]
+                .into_iter()
+                .enumerate()
+                .map(|(i, state)| StripEntry {
+                    item: SideItem::Pane(i as u32),
+                    state: Some(state),
+                    icon: state,
+                    selected: false,
+                })
+                .collect();
+        let rows = strip_entries(agents, 3, SideItem::Panes, theme);
+        assert!(matches!(&rows[0], SideRow::Entry { item: Some(SideItem::Pane(2)), .. }));
+        assert!(matches!(&rows[1], SideRow::Entry { item: Some(SideItem::Pane(3)), .. }));
+        assert!(matches!(&rows[2], SideRow::Entry { item: Some(SideItem::Panes), .. }));
+        let entries = (0..105)
+            .map(|i| StripEntry {
+                item: SideItem::Workspace(i),
+                state: None,
+                icon: AgentState::Working,
+                selected: i == 100,
+            })
+            .collect();
+        let rows = strip_entries(entries, 120, SideItem::Workspaces, theme);
+        assert_eq!(rows.len(), 100);
+        assert!(matches!(&rows[99], SideRow::Entry { item: Some(SideItem::Workspaces), selected: true, .. }));
+        for row in rows {
+            if let SideRow::Entry { line, .. } = row {
+                assert_eq!(line.width(), 3);
+            }
+        }
+    }
+
+    #[test]
+    fn strip_workspace_colour_uses_its_most_urgent_agent() {
+        let _batch = crate::pane::batch();
+        let (tx, _rx) = super::super::event_channel(32);
+        let mut server = super::super::tests::server(tx);
+        let (client, _peer) = super::super::tests::client(&mut server);
+        let ws = server.clients[&client].workspace;
+        let states =
+            [AgentState::Unknown, AgentState::Idle, AgentState::Working, AgentState::Done, AgentState::Blocked];
+        let mut panes = Vec::new();
+        for state in states {
+            let pane = server
+                .spawn_pane_in(ws, None, crate::pane::PaneSpec::default(), crate::protocol::Placement::Tab, None)
+                .unwrap();
+            let agent = &mut server.panes.get_mut(&pane).unwrap().agent;
+            agent.kind = Some("claude".into());
+            agent.state = state;
+            panes.push(pane);
+        }
+        for (pane, state) in panes.into_iter().zip(states).rev() {
+            let rows = server.strip_rows(&server.clients[&client], 20, th());
+            let SideRow::Entry { line, .. } = &rows[1] else { panic!() };
+            assert_eq!(line.spans[1].style.fg, Some(th().state_color(state)));
+            server.panes.get_mut(&pane).unwrap().agent.kind = None;
+        }
+    }
+
+    #[test]
+    fn strip_and_full_sidebar_transitions_match_a_fresh_frame() {
+        let _batch = crate::pane::batch();
+        let (tx, _rx) = super::super::event_channel(32);
+        let mut server = super::super::tests::server(tx);
+        let (client, _peer) = super::super::tests::client(&mut server);
+        server.primary = Some(client);
+        server.bottom_bar = true;
+        let pane = server
+            .spawn_pane_in(
+                server.clients[&client].workspace,
+                None,
+                crate::pane::PaneSpec::default(),
+                crate::protocol::Placement::Auto,
+                None,
+            )
+            .unwrap();
+        server.pane_output(pane, b"sidebar transition\r\n");
+        let mut buf = Buffer::empty(Rect::default());
+        for (cols, sidebar) in [
+            (124, true),
+            (124, false),
+            (80, false),
+            (60, true),
+            (39, true),
+            (40, true),
+            (83, true),
+            (84, true),
+            (84, false),
+            (124, true),
+        ] {
+            let c = server.clients.get_mut(&client).unwrap();
+            c.cols = cols;
+            c.sidebar = Some(sidebar);
+            server.relayout();
+            server.compose(client, 1_000, &mut buf);
+            let mut fresh = Buffer::empty(buf.area);
+            server.clients.get_mut(&client).unwrap().memo = FrameMemo::default();
+            server.compose(client, 1_000, &mut fresh);
+            assert_eq!(buf, fresh, "{cols} columns, full requested: {sidebar}");
+            let full = matches!(server.sidebar_presentation(&server.clients[&client]), Sidebar::Full(_));
+            assert_eq!(
+                server
+                    .top_bar(&server.clients[&client])
+                    .items
+                    .iter()
+                    .any(|(_, _, item, _)| *item == BarItem::Workspace),
+                !full
+            );
+        }
+    }
+
+    #[test]
+    fn strip_keeps_workspace_order_closed_markers_and_access_in_short_terminals() {
+        let (tx, _rx) = super::super::event_channel(32);
+        let mut server = super::super::tests::server(tx);
+        let (client, _peer) = super::super::tests::client(&mut server);
+        let current = server.clients[&client].workspace;
+        let closed = server.new_workspace("closed".into(), None);
+        super::super::persistence::tests::writer(&mut server, vec![Ok(()), Ok(())]);
+        server.keep_and_close_workspace(closed).unwrap();
+        let source = PathBuf::from("/unopened/strip.kdl");
+        server.def_files.push((source.clone(), "file".into()));
+        server.workspace_order = vec![
+            crate::persist::WorkspaceKey::Source(source.clone()),
+            server.workspace_key(&super::super::ui::PickAction::SwitchWorkspace(closed)).unwrap(),
+            server.workspace_key(&super::super::ui::PickAction::SwitchWorkspace(current)).unwrap(),
+        ];
+        let c = server.clients.get_mut(&client).unwrap();
+        (c.cols, c.rows) = (60, 20);
+        let check = |server: &Server, closed_icon| {
+            let rows = server.strip_rows(&server.clients[&client], 20, th());
+            for (y, item, text) in [
+                (1, SideItem::Definition(source.clone()), " 1○".to_string()),
+                (2, SideItem::Workspace(closed), format!(" 2{closed_icon}")),
+                (3, SideItem::Workspace(current), " 3●".to_string()),
+            ] {
+                assert_eq!(server.sidebar_hit(client, y), Some(item));
+                let SideRow::Entry { line, .. } = &rows[y as usize] else { panic!() };
+                assert_eq!(line.to_string(), text);
+                assert_eq!(line.spans[1].style.fg, Some(th().dim));
+            }
+        };
+        check(&server, "○");
+        server.reopen_workspace(closed).unwrap();
+        check(&server, "●");
+        for height in 3..8 {
+            let rows = server.strip_rows(&server.clients[&client], height, th());
+            assert_eq!(rows.len(), height as usize);
+            assert!(matches!(&rows[0], SideRow::Entry { item: Some(SideItem::Workspaces), .. }));
+            assert!(rows.iter().any(|r| matches!(r, SideRow::Entry { item: Some(SideItem::Panes), .. })));
+            assert!(matches!(rows.last(), Some(SideRow::Entry { item: Some(SideItem::ToggleSidebar), .. })));
+        }
+        server.removed_sources.push(source.clone());
+        assert!(!(0..20).any(|y| server.sidebar_hit(client, y) == Some(SideItem::Definition(source.clone()))));
+    }
 
     #[test]
     fn notice_colours_in_bars_overlays_and_messages_for_local_and_remote_clients() {

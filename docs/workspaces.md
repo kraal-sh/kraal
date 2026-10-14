@@ -68,15 +68,32 @@ no longer matches the search, the search clears to show it.
 - The **sidebar**, at the left from the first screen on, lists open and closed workspaces and
   unimported workspace files in the same order as Workspaces. Then come the agents, tunnels
   and ports, with the agents' accounts at the bottom once one is listed or used.
-  `ctrl+b V l` hides it, or shows it again, in the terminal you type it in until that terminal
-  detaches; `[sidebar] visible = false` in the configuration hides it for good. A terminal less
-  than three times as wide as the sidebar (84 columns with the default width) has none: the panes
-  keep that room, and the top bar names the workspace. Click that name to open **Workspaces**.
-  With the sidebar visible, its **WORKSPACES** heading opens the same list, **+ Add workspace**
+  The full sidebar appears from three times its configured width, 84 columns by default.
+  `ctrl+b V l` folds it to a **four-column strip**, separator included, or expands it again.
+  The choice belongs to this attached terminal until it detaches. `[sidebar] visible = false`
+  starts folded, with the strip still available. There is no setting to hide it entirely.
+  With the default width, the strip appears automatically at 40 to 83 columns; below 40 it disappears.
+  Growing the terminal restores the full sidebar if it was requested; a manual fold stays folded.
+  In the strip, the top bar names the current workspace. Click that name to open **Workspaces**.
+  With the full sidebar visible, its **WORKSPACES** heading opens the same list, **+ Add workspace**
   opens the form, and a row's actions button or a right click opens that workspace's actions.
-  All workspace operations remain available at 80x24 without the sidebar.
   Closed workspaces use the same empty dot as workspace files that have not been opened;
-  open workspaces use a filled dot.
+  open workspaces use a filled dot (the ASCII theme uses `o` and `*`).
+  The workspace dot takes the colour of its most urgent agent: blocked, done, working, idle,
+  then unknown. Without an agent it is dim.
+- The strip has **WS** then **AG** sections, with no empty space reserved between them.
+  WS opens Workspaces; AG opens the pane picker. Each row has its original list number and
+  state icon. The current workspace has the selection background and a bold number.
+  Numbers are positions, not identifiers or shortcuts: `ctrl+b 1` to `9` still select tabs.
+  Click a workspace to open or select it, right click for its actions, or click an agent to
+  reveal its pane. These clicks keep the strip. Reordering is in Workspaces or the full sidebar.
+  When rows run out, `⋮` (`...` in ASCII) opens the corresponding list. The current workspace
+  and blocked then done agents take priority. Numbers above 99 are reached through that list,
+  never shortened to ambiguous digits. If that includes the current workspace, its list row
+  keeps the selection background. The bottom `▸` (`>` in ASCII) runs `ctrl+b V l`:
+  when the full sidebar cannot fit, it opens Workspaces without changing the folding preference.
+  Accounts (`ctrl+b A l`), Tunnels (`ctrl+b S o`) and ports remain in the full sidebar and their
+  existing views; accounts and ports have no miniature rows in the strip.
 - Several terminals can be attached at once. The panes have the size that fits the one used last
   (attached, resized or typed in), and each terminal shows them beside its own sidebar: a smaller
   one shows what fits.
@@ -125,7 +142,7 @@ be duplicated from its retained contents, even if the original file is gone.
 ### Reordering workspaces
 
 Select a row in **Workspaces**, press Tab and choose **Move up** or **Move down**.
-You can also drag a workspace row onto another row in the list or sidebar. Moving upward
+You can also drag a workspace row onto another row in the list or full sidebar. Moving upward
 places it before that row; moving downward places it after that row. The destination is
 highlighted while dragging. A click opens on release; dragging starts no programs and does
 not switch workspaces. Release outside workspace rows or press Esc to cancel.
