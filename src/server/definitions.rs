@@ -154,9 +154,13 @@ impl Server {
         let source = paths::read_regular_text(path, u64::MAX)?;
         let name = path.file_stem().unwrap_or_default().to_string_lossy();
         let def = workspace::parse_workspace(&name, &source).with_context(|| format!("parsing {}", path.display()))?;
+        let order = self.updated_workspace_order();
         let id = self.start_definition(&def, Some(path.to_path_buf()))?;
         let wi = self.ws_index(id).unwrap();
         self.workspaces[wi].definition_source = Some(source);
+        self.workspace_order = order;
+        self.bind_workspace_order(id);
+        self.sort_workspaces();
         self.removed_sources.retain(|p| !paths::same_file(p, path));
         self.mark_persist();
         Ok(id)
@@ -218,8 +222,10 @@ impl Server {
         let def = self.snapshot_definition(wi, name);
         let source = workspace::save_file(&save.path, &def, &save.revision)?;
         if save.link {
+            self.workspace_order = self.updated_workspace_order();
             self.workspaces[wi].set_definition(Some(&save.path));
             self.workspaces[wi].definition_source = Some(source);
+            self.bind_workspace_order(self.workspaces[wi].id);
             self.mark_persist();
         }
         self.mark_dirty();

@@ -37,6 +37,7 @@ mod ssh;
 mod tools;
 mod ui;
 mod workspace_lifecycle;
+mod workspace_order;
 mod workspace_ui;
 mod worktrees;
 
@@ -462,6 +463,7 @@ pub struct Server {
     pub tx: EventSender,
     pub panes: HashMap<PaneId, Pane>,
     pub workspaces: Vec<Workspace>,
+    pub workspace_order: Vec<persist::WorkspaceKey>,
     pub clients: HashMap<ClientId, Client>,
     next_id: u32,
     /// The client whose terminal size drives pane sizes.
@@ -834,6 +836,7 @@ pub fn run(session: &str) -> Result<()> {
         tx,
         panes: HashMap::new(),
         workspaces: Vec::new(),
+        workspace_order: Vec::new(),
         clients: HashMap::new(),
         next_id: 1,
         primary: None,
@@ -2040,6 +2043,7 @@ mod tests {
             tx,
             panes: HashMap::new(),
             workspaces: Vec::new(),
+            workspace_order: Vec::new(),
             clients: HashMap::new(),
             next_id: 1,
             primary: None,

@@ -1350,6 +1350,65 @@ fn workspace_search_add_and_closed_rename_work_at_both_sizes() {
 }
 
 #[test]
+fn workspace_moves_keep_focus_share_the_list_and_survive_restart() {
+    for size in [(80, 24), (124, 36)] {
+        let env = Env::new(&format!("ws-order-{}", size.0));
+        let docs = "// Keep this recipe.\nlayout { pane command=\"true\" start_suspended=true; }\n";
+        env.workspace("api", "layout { pane name=\"api-shell\"; }\n");
+        env.workspace("docs", docs);
+        env.workspace("web", "layout { pane name=\"web-shell\"; }\n");
+        for name in ["api", "docs", "web"] {
+            env.run(&["open", name]);
+        }
+        let mut client = RawClient::attach_sized(&env, Some("docs"), size);
+        client.wait_for_message("\"attached\"");
+        client.send(b"\x02Wx");
+        client.wait_for_row("Closed · 1 tab · 1 pane");
+        let mut other = RawClient::attach_sized(&env, Some("web"), size);
+        other.wait_for_row("$ ");
+        other.send(b"\x02w");
+        other.wait_for_row("Search");
+        let panes = env.run(&["panes", "--json"]);
+        client.send(b"docs\t");
+        click_account_text(&mut client, "Clear search to reorder");
+        assert_eq!(listed_workspaces(&env), ["api: api.kdl (open)", "docs: docs.kdl", "web: web.kdl (open)"]);
+        client.send(b"\t\x1b[B\x1b[B\r");
+        let reordered = ["docs: docs.kdl", "api: api.kdl (open)", "web: web.kdl (open)"];
+        wait_until(PATIENCE, "workspace order was not saved", || listed_workspaces(&env) == reordered);
+        other.wait_for_rows("the other client's list has the same order", |rows| {
+            let names: Vec<_> = rows
+                .iter()
+                .filter_map(|row| {
+                    let row = row.split('│').nth(2)?.trim();
+                    ["docs", "api", "web"].into_iter().find(|name| row.ends_with(name))
+                })
+                .collect();
+            names.windows(3).any(|rows| rows == ["docs", "api", "web"])
+        });
+        assert_eq!(env.run(&["panes", "--json"]), panes, "moving a closed workspace starts no programs");
+        client.close_overlay("Search");
+        other.close_overlay("Search");
+        client.send(b"printf 'focus-api\\n'\r");
+        other.send(b"printf 'focus-web\\n'\r");
+        env.wait_for_text("api-shell", "focus-api");
+        env.wait_for_text("web-shell", "focus-web");
+        assert!(!env.run(&["read", "-p", "api-shell"]).contains("focus-web"));
+        assert!(!env.run(&["read", "-p", "web-shell"]).contains("focus-api"));
+        let before: serde_json::Value = serde_json::from_str(&env.run(&["workspaces", "--json"])).unwrap();
+        env.run(&["kill"]);
+        assert_eq!(listed_workspaces(&env), ["docs: docs.kdl", "api: api.kdl", "web: web.kdl"]);
+        env.run(&["open", "api"]);
+        assert_eq!(listed_workspaces(&env), reordered);
+        let after: serde_json::Value = serde_json::from_str(&env.run(&["workspaces", "--json"])).unwrap();
+        for i in 0..3 {
+            assert_eq!(after[i]["id"], before[i]["id"]);
+        }
+        assert_eq!(std::fs::read_to_string(env.root.join("config/kraal/workspaces/docs.kdl")).unwrap(), docs);
+        assert!(!env.root.join("config/kraal/workspaces/docs.kdl.bak").exists());
+    }
+}
+
+#[test]
 fn workspace_delete_undo_and_restore_after_restart_keep_both_reused_names() {
     for size in [(80, 24), (124, 36)] {
         let env = Env::new(&format!("ws-delete-{}", size.0));
@@ -1429,7 +1488,8 @@ fn deleting_a_scanned_source_never_runs_it_and_restores_its_saved_contents() {
     env.run(&["tunnel", "list"]);
     let mut client = RawClient::attach_sized(&env, None, (80, 24));
     client.wait_for_message("\"attached\"");
-    client.send(b"\x02wrecipe\t\x1b[B\r");
+    client.send(b"\x02wrecipe\t");
+    click_account_text(&mut client, "Delete");
     client.wait_for_row("Delete recipe?");
     client.send(b"y");
     client.wait_for_row("Workspace deleted");
@@ -2784,7 +2844,8 @@ fn a_workspace_that_cannot_be_restored_stays_saved() {
     // A released server saved only the name and launch home. The failing shell precedes
     // the agent, so binding only panes that successfully spawn would miss it.
     let mut state: serde_json::Value = serde_json::from_slice(&std::fs::read(env.state_file()).unwrap()).unwrap();
-    let spec = &mut state["workspaces"][0]["tabs"][0]["root"]["Split"]["children"][1][0]["Pane"]["spec"];
+    let workspace = state["workspaces"].as_array_mut().unwrap().iter_mut().find(|ws| ws["name"] == "shells").unwrap();
+    let spec = &mut workspace["tabs"][0]["root"]["Split"]["children"][1][0]["Pane"]["spec"];
     assert_eq!(spec["account_id"], original_id);
     spec.as_object_mut().unwrap().remove("account_id");
     spec["env"].as_array_mut().unwrap().retain(|pair| pair[0] != "KRAAL_ACCOUNT_ID");

@@ -36,22 +36,20 @@ impl Server {
                 p.actions = None;
                 if let Some(i) = i.filter(|i| *i < keys.len()) {
                     if keys[i].0.is_empty() {
-                        return self.delete_picker_workspace(id, p);
+                        return self.picker_menu_action(id, p, keys[i].1);
                     }
                     let spec = crate::input::KeySpec::parse(keys[i].0).expect("picker action keys are valid");
                     let key = Key { code: spec.code, mods: spec.mods, raw: Vec::new() };
                     return self.on_picker(id, p, InputEvent::Key(key));
                 }
-                return Mode::Picker(p);
-            }
-            if let InputEvent::Key(k) = ev {
+            } else if let InputEvent::Key(k) = ev {
                 match k.code {
                     KeyCode::Up => p.actions = Some(at.checked_sub(1).unwrap_or(keys.len() - 1)),
                     KeyCode::Down => p.actions = Some((at + 1) % keys.len()),
                     KeyCode::Enter => {
                         p.actions = None;
                         if keys[at].0.is_empty() {
-                            return self.delete_picker_workspace(id, p);
+                            return self.picker_menu_action(id, p, keys[at].1);
                         }
                         // The action is its key, pressed in the list.
                         let spec = crate::input::KeySpec::parse(keys[at].0).expect("picker action keys are valid");
@@ -61,7 +59,11 @@ impl Server {
                     _ => p.actions = None,
                 }
             }
-            return Mode::Picker(p);
+            return if p.kind == PickerKind::Workspace && p.actions.is_none() {
+                self.return_to_workspaces(id, Mode::Normal, p.state())
+            } else {
+                Mode::Picker(p)
+            };
         }
         match ev {
             InputEvent::Key(k) => match (k.code, k.mods.ctrl) {
@@ -425,7 +427,7 @@ impl Server {
             PickAction::Worktree { pane, op } => return self.worktree_op(id, pane, &op),
             PickAction::AddAccount => return Mode::AccountForm(self.account_form(id)),
             PickAction::AccountDetails(account) => return self.account_details(&account),
-            PickAction::None => {
+            PickAction::UnavailableDefinition(_) => {
                 let mut next = Picker::new(p.kind, &p.title, p.items.clone());
                 next.restore(p.state());
                 return Mode::Picker(next);
@@ -543,12 +545,13 @@ impl Server {
                 Err(e) => items.push(PickItem {
                     label: path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default(),
                     detail: format!("error: {e:#}"),
-                    action: PickAction::None,
+                    action: PickAction::UnavailableDefinition(path),
                     state: None,
                     dim: false,
                 }),
             }
         }
+        items.sort_by_key(|i| self.workspace_position(&i.action));
         if !self.deleted_workspaces.is_empty() {
             items.push(PickItem::new(
                 format!("Deleted workspaces ({})", self.deleted_workspaces.len()),
@@ -575,7 +578,20 @@ impl Server {
         picker
     }
 
-    fn delete_picker_workspace(&self, id: ClientId, p: Picker) -> Mode {
+    fn picker_menu_action(&mut self, id: ClientId, mut p: Picker, action: &str) -> Mode {
+        match action {
+            "Move up" | "Move down" => return self.move_picker_workspace(id, p, action == "Move up"),
+            "Clear search to reorder" => {
+                let selected = p.current().and_then(|i| self.workspace_key(&i.action));
+                p.query.clear();
+                p.cursor = 0;
+                p.refilter();
+                p.select(|i| self.workspace_key(&i.action) == selected);
+                return Mode::Picker(p);
+            }
+            "Delete" => {}
+            _ => return Mode::Picker(p),
+        }
         use super::super::workspace_lifecycle::DeleteTarget;
         let target = match p.current().map(|i| &i.action) {
             Some(PickAction::SwitchWorkspace(ws) | PickAction::ReopenWorkspace(ws)) => DeleteTarget::Workspace(*ws),
@@ -1035,7 +1051,7 @@ mod tests {
             PickAction::ReopenWorkspace(1),
             PickAction::OpenDefinition("closed.kdl".into()),
             PickAction::AddWorkspace,
-            PickAction::None,
+            PickAction::UnavailableDefinition("invalid.kdl".into()),
         ] {
             let open = matches!(action, PickAction::SwitchWorkspace(_));
             let stale = matches!(action, PickAction::SwitchWorkspace(u32::MAX));
@@ -1043,7 +1059,10 @@ mod tests {
             let mut p = Picker::new(
                 PickerKind::Workspace,
                 "Workspaces",
-                vec![PickItem::new("", "", action), PickItem::new("scratch", "", PickAction::None)],
+                vec![
+                    PickItem::new("", "", action),
+                    PickItem::new("scratch", "", PickAction::UnavailableDefinition("invalid.kdl".into())),
+                ],
             );
             p.query = "new".into();
             p.filtered = vec![0, 1];
@@ -1337,6 +1356,386 @@ mod deletion_tests {
             let Mode::Picker(restored) = server.on_picker(client, deleted, click) else { panic!() };
             assert!(restored.message.as_ref().unwrap().contains("Workspace restored"));
             assert!(server.workspaces[0].closed());
+        }
+    }
+}
+
+#[cfg(test)]
+mod workspace_order_tests {
+    use super::*;
+    use crate::input::{InputEvent, Key, KeySpec, Mods, MouseButton, MouseEvent, MouseKind};
+    use crate::pane::PaneSpec;
+    use crate::persist;
+    use crate::protocol::Placement;
+    use crate::server::{overlays, persistence, queue, tests};
+    use ratatui::buffer::Buffer;
+
+    fn key(spec: &str) -> InputEvent {
+        let spec = KeySpec::parse(spec).unwrap();
+        InputEvent::Key(Key { code: spec.code, mods: spec.mods, raw: Vec::new() })
+    }
+
+    fn choose(server: &mut Server, client: ClientId, p: Picker, action: &str, mouse: bool) -> Mode {
+        let Mode::Picker(mut p) = server.on_picker(client, p, key("tab")) else { panic!() };
+        assert_eq!(p.actions, Some(0));
+        let at = p.action_keys().iter().position(|(_, label)| *label == action).unwrap();
+        if mouse {
+            let layout = overlays::picker_layout(&p, server.client_screen(client));
+            server.on_picker(
+                client,
+                p,
+                InputEvent::Mouse(MouseEvent {
+                    kind: MouseKind::Press(MouseButton::Left),
+                    col: layout.list.x + 2,
+                    row: layout.list.y + at as u16,
+                    mods: Mods::NONE,
+                }),
+            )
+        } else {
+            for _ in 0..at {
+                let Mode::Picker(next) = server.on_picker(client, p, key("down")) else { panic!() };
+                p = next;
+            }
+            server.on_picker(client, p, key("enter"))
+        }
+    }
+
+    fn names(server: &Server) -> Vec<String> {
+        server
+            .workspace_picker(0)
+            .items
+            .into_iter()
+            .filter(|i| i.action.workspace().is_some() || i.action.definition().is_some())
+            .map(|i| i.label)
+            .collect()
+    }
+
+    #[test]
+    fn workspace_moves_preserve_clients_panes_and_selection_and_survive_restore() {
+        let (tx, _rx) = queue::channel(32);
+        let mut server = tests::server(tx);
+        let (client, _peer) = tests::client(&mut server);
+        let api = server.clients[&client].workspace;
+        server.workspaces[0].name = "api".into();
+        let (other, _peer2) = tests::client(&mut server);
+        let web = server.clients[&other].workspace;
+        server.workspaces[1].name = "web".into();
+        let docs = server.new_workspace("docs".into(), None);
+        let mut closed = persist::snapshot(&server).workspaces.remove(2);
+        closed.closed = true;
+        server.workspaces[2].kept = Some(closed);
+        let _batch = crate::pane::batch();
+        let a = server.spawn_pane_in(api, None, PaneSpec::default(), Placement::Tab, None).unwrap();
+        let b = server.spawn_pane_in(web, None, PaneSpec::default(), Placement::Tab, None).unwrap();
+        let identities: Vec<_> = server.workspaces.iter().map(|w| w.stable_id.clone()).collect();
+        let tabs: Vec<_> = server.workspaces.iter().map(|w| (w.id, w.active, w.tab().map(|t| t.id))).collect();
+        let saved = persistence::tests::writer(&mut server, vec![]);
+        let mut other_list = server.workspace_picker(web);
+        other_list.select(|i| i.action.workspace() == Some(api));
+        server.clients.get_mut(&other).unwrap().mode = Mode::Picker(other_list);
+        let mut p = server.workspace_picker(api);
+        p.select(|i| i.action.workspace() == Some(docs));
+        let Mode::Picker(p) = choose(&mut server, client, p, "Move up", false) else { panic!() };
+        assert_eq!(names(&server), ["api", "docs", "web"]);
+        assert_eq!(p.current().unwrap().action.workspace(), Some(docs));
+        assert!(p.actions.is_none());
+        let Mode::Picker(p) = choose(&mut server, client, p, "Move up", true) else { panic!() };
+        assert_eq!(names(&server), ["docs", "api", "web"]);
+        assert!(!p.action_keys().iter().any(|(_, a)| *a == "Move up"));
+        assert_eq!((server.clients[&client].workspace, server.clients[&other].workspace), (api, web));
+        assert_eq!((server.client_focus(client), server.client_focus(other)), (Some(a), Some(b)));
+        for (id, active, tab) in tabs {
+            let w = &server.workspaces[server.ws_index(id).unwrap()];
+            assert_eq!((w.active, w.tab().map(|t| t.id)), (active, tab));
+        }
+        assert_eq!(server.panes.len(), 2);
+        let Mode::Picker(other_list) = &server.clients[&other].mode else { panic!() };
+        assert_eq!(other_list.current().unwrap().action.workspace(), Some(api));
+        assert_eq!(
+            other_list.items.iter().take(3).map(|i| i.label.as_str()).collect::<Vec<_>>(),
+            ["docs", "api", "web"]
+        );
+        let Mode::Picker(p) = choose(&mut server, client, p, "Move down", false) else { panic!() };
+        assert_eq!(p.current().unwrap().action.workspace(), Some(docs));
+        let snap = saved.lock().unwrap().last().unwrap().clone();
+        assert_eq!(
+            snap["workspaces"].as_array().unwrap().iter().map(|w| w["name"].as_str().unwrap()).collect::<Vec<_>>(),
+            ["api", "docs", "web"]
+        );
+        let (tx, _rx2) = queue::channel(32);
+        let mut restored = tests::server(tx);
+        persist::apply(&mut restored, serde_json::from_value(snap).unwrap()).unwrap();
+        assert_eq!(names(&restored), ["api", "docs", "web"]);
+        assert_eq!(
+            restored.workspaces.iter().map(|w| &w.stable_id).collect::<Vec<_>>(),
+            [&identities[0], &identities[2], &identities[1]]
+        );
+        assert!(restored.workspaces[1].closed());
+        restored.reopen_workspace(restored.workspaces[1].id).unwrap();
+        assert_eq!(names(&restored), ["api", "docs", "web"]);
+    }
+
+    #[test]
+    fn exporting_over_an_ordered_source_keeps_identity_and_allows_the_next_move() {
+        use crate::persist::WorkspaceKey;
+        use crate::server::ui::{Prompt, PromptAction};
+
+        // Export uses the default definitions directory, so give this test its own HOME.
+        if std::env::var_os("WORKSPACE_EXPORT_ORDER_CHILD").is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "server::input::pickers::workspace_order_tests::exporting_over_an_ordered_source_keeps_identity_and_allows_the_next_move"])
+                .env("WORKSPACE_EXPORT_ORDER_CHILD", "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let (tx, _rx) = queue::channel(32);
+        let mut server = tests::server(tx);
+        let (client, _peer) = tests::client(&mut server);
+        let a = server.clients[&client].workspace;
+        server.workspaces[0].name = "a".into();
+        let b = server.new_workspace("b".into(), None);
+        let dir = crate::paths::workspaces_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("x.kdl");
+        let source = "layout { pane command=\"true\" start_suspended=true; }\n";
+        std::fs::write(&path, source).unwrap();
+        server.config.workspace_dirs = vec![dir.display().to_string()];
+        let x = WorkspaceKey::Source(crate::workspace::definition_path(&path));
+        let a_key = server.workspace_key(&PickAction::SwitchWorkspace(a)).unwrap();
+        let b_key = server.workspace_key(&PickAction::SwitchWorkspace(b)).unwrap();
+        let saved = persistence::tests::writer(&mut server, vec![]);
+        server.reorder_workspace(client, x.clone(), b_key.clone(), true);
+        server.reorder_workspace(client, x.clone(), a_key.clone(), true);
+        assert_eq!(names(&server), ["x", "a", "b"]);
+        let prompt = Prompt::new("Save workspace layout as", "x", PromptAction::SaveWorkspace(a));
+        let Mode::Confirm(q) = server.on_prompt(client, prompt, key("enter")) else { panic!() };
+        assert_eq!(q.action.verb(), "Replace file");
+        assert!(matches!(server.on_confirm(client, q, key("y")), Mode::Normal));
+        assert_eq!(names(&server), ["a", "b"]);
+        let Mode::Picker(p) = server.reorder_workspace(client, a_key.clone(), b_key.clone(), false) else { panic!() };
+        assert!(p.message.is_none());
+        assert_eq!(names(&server), ["b", "a"]);
+        assert_eq!(server.workspace_order, [b_key, a_key]);
+        assert_eq!(std::fs::read_to_string(path.with_extension("kdl.bak")).unwrap(), source);
+        let snap = saved.lock().unwrap().last().unwrap().clone();
+        let (tx, _rx2) = queue::channel(32);
+        let mut restored = tests::server(tx);
+        restored.config.workspace_dirs = server.config.workspace_dirs.clone();
+        persist::apply(&mut restored, serde_json::from_value(snap).unwrap()).unwrap();
+        assert_eq!(names(&restored), ["b", "a"]);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn concurrent_workspace_moves_preserve_pending_menus_and_reject_changed_neighbors() {
+        for changed_neighbor in [false, true] {
+            let (tx, _rx) = queue::channel(32);
+            let mut server = tests::server(tx);
+            let (client, _peer) = tests::client(&mut server);
+            let current = server.clients[&client].workspace;
+            server.workspaces[0].name = "api".into();
+            let (other, _peer2) = tests::client(&mut server);
+            let other_ws = server.clients[&other].workspace;
+            server.workspaces[1].name = "web".into();
+            let middle = server.new_workspace("middle".into(), None);
+            let docs = server.new_workspace("docs".into(), None);
+            let mut closed = persist::snapshot(&server).workspaces.remove(3);
+            closed.closed = true;
+            server.workspaces[3].kept = Some(closed);
+            let saved = persistence::tests::writer(&mut server, vec![]);
+            let mut p = server.workspace_picker(current);
+            p.select(|i| i.action.workspace() == Some(docs));
+            let Mode::Picker(mut p) = server.on_picker(client, p, key("tab")) else { panic!() };
+            let at = p.action_keys().iter().position(|(_, label)| *label == "Move up").unwrap();
+            for _ in 0..at {
+                let Mode::Picker(next) = server.on_picker(client, p, key("down")) else { panic!() };
+                p = next;
+            }
+            server.clients.get_mut(&client).unwrap().mode = Mode::Picker(p);
+            let mut p = server.workspace_picker(other_ws);
+            p.select(|i| i.action.workspace() == Some(if changed_neighbor { middle } else { other_ws }));
+            assert!(matches!(choose(&mut server, other, p, "Move up", false), Mode::Picker(_)));
+            let Mode::Picker(p) = std::mem::replace(&mut server.clients.get_mut(&client).unwrap().mode, Mode::Normal)
+            else {
+                panic!()
+            };
+            assert_eq!(p.action_keys()[p.actions.expect("keep the pending menu")].1, "Move up");
+            assert_eq!(p.current().unwrap().action.workspace(), Some(docs));
+            let mut dismissed = server.workspace_picker(current);
+            dismissed.restore(p.state());
+            let Mode::Picker(dismissed) = server.on_picker(client, dismissed, key("esc")) else { panic!() };
+            assert!(dismissed.actions.is_none());
+            assert_eq!(dismissed.current().unwrap().action.workspace(), Some(docs));
+            assert_eq!(
+                dismissed.items.iter().map(|i| &i.label).collect::<Vec<_>>(),
+                server.workspace_picker(current).items.iter().map(|i| &i.label).collect::<Vec<_>>()
+            );
+            let Mode::Picker(p) = server.on_picker(client, p, key("enter")) else { panic!() };
+            assert_eq!(p.current().unwrap().action.workspace(), Some(docs));
+            assert!(p.actions.is_none());
+            if changed_neighbor {
+                assert_eq!(p.message.as_deref(), Some("Order changed. Choose Move up or Move down again."));
+                assert_eq!(names(&server), ["api", "middle", "web", "docs"]);
+                assert_eq!(saved.lock().unwrap().len(), 1);
+            } else {
+                assert_eq!(names(&server), ["web", "api", "docs", "middle"]);
+                assert_eq!(saved.lock().unwrap().len(), 2);
+            }
+            assert!(server.workspaces[server.ws_index(docs).unwrap()].closed());
+            assert!(server.panes.is_empty());
+            assert_eq!((server.clients[&client].workspace, server.clients[&other].workspace), (current, other_ws));
+        }
+    }
+
+    #[test]
+    fn pending_workspace_moves_reject_deleted_targets_and_neighbors() {
+        for delete_target in [false, true] {
+            let (tx, _rx) = queue::channel(32);
+            let mut server = tests::server(tx);
+            let (client, _peer) = tests::client(&mut server);
+            let current = server.clients[&client].workspace;
+            let (other, _peer2) = tests::client(&mut server);
+            let neighbor = server.new_workspace("neighbor".into(), None);
+            let target = server.new_workspace("target".into(), None);
+            let saved = persistence::tests::writer(&mut server, vec![]);
+            let mut p = server.workspace_picker(current);
+            p.select(|i| i.action.workspace() == Some(target));
+            p.actions = Some(p.action_keys().iter().position(|(_, label)| *label == "Move up").unwrap());
+            server.clients.get_mut(&client).unwrap().mode = Mode::Picker(p);
+            let deleted = if delete_target { target } else { neighbor };
+            assert!(matches!(
+                server.delete_workspace(other, crate::server::workspace_lifecycle::DeleteTarget::Workspace(deleted)),
+                Mode::Picker(_)
+            ));
+            // Reusing the name must not retarget the pending move either.
+            server.new_workspace(if delete_target { "target" } else { "neighbor" }.into(), None);
+            server.refresh_workspace_pickers();
+            let before = names(&server);
+            let writes = saved.lock().unwrap().len();
+            let Mode::Picker(p) = std::mem::replace(&mut server.clients.get_mut(&client).unwrap().mode, Mode::Normal)
+            else {
+                panic!()
+            };
+            assert_eq!(p.action_keys()[p.actions.unwrap()].1, "Move up");
+            let Mode::Picker(p) = server.on_picker(client, p, key("enter")) else { panic!() };
+            assert_eq!(p.message.as_deref(), Some("Workspace unavailable. Select a workspace to move."));
+            assert!(p.actions.is_none());
+            if !delete_target {
+                assert_eq!(p.current().unwrap().action.workspace(), Some(target));
+            }
+            assert_eq!(names(&server), before);
+            assert_eq!(saved.lock().unwrap().len(), writes);
+            assert_eq!(server.clients[&client].workspace, current);
+            assert!(server.panes.is_empty());
+        }
+    }
+
+    #[test]
+    fn workspace_search_clears_without_moving_and_keeps_the_same_named_row_at_both_sizes() {
+        for size in [(80, 24), (124, 36)] {
+            let (tx, _rx) = queue::channel(32);
+            let mut server = tests::server(tx);
+            let (client, _peer) = tests::client(&mut server);
+            server.workspaces[0].name = "same".into();
+            let ws = server.new_workspace("other".into(), None);
+            server.workspaces[1].name = "same".into();
+            let c = server.clients.get_mut(&client).unwrap();
+            (c.cols, c.rows) = size;
+            let saved = persistence::tests::writer(&mut server, vec![]);
+            let mut p = server.workspace_picker(0);
+            p.query = "same".into();
+            p.cursor = 2;
+            p.refilter();
+            p.select(|i| i.action.workspace() == Some(ws));
+            let keys = p.action_keys();
+            assert!(keys.contains(&("", "Clear search to reorder")));
+            assert!(!keys.iter().any(|(_, a)| matches!(*a, "Move up" | "Move down")));
+            p.actions = Some(keys.iter().position(|(_, a)| *a == "Clear search to reorder").unwrap());
+            let mut buf = Buffer::empty(server.client_screen(client));
+            overlays::draw_picker(&p, buf.area, &mut buf);
+            let text: String = buf.content.iter().map(|c| c.symbol()).collect();
+            assert!(text.contains("Clear search to reorder"));
+            let Mode::Picker(p) = server.on_picker(client, p, key("enter")) else { panic!() };
+            assert_eq!((p.query.as_str(), p.cursor), ("", 0));
+            assert_eq!(p.current().unwrap().action.workspace(), Some(ws));
+            assert!(!p.action_keys().iter().any(|(_, a)| *a == "Move down"));
+            assert!(server.workspace_order.is_empty());
+            assert!(saved.lock().unwrap().is_empty());
+            let Mode::Picker(p) = choose(&mut server, client, p, "Move up", false) else { panic!() };
+            assert_eq!(p.current().unwrap().action.workspace(), Some(ws));
+            assert_eq!(server.workspaces[0].id, ws);
+        }
+    }
+
+    #[test]
+    fn workspace_order_failures_roll_back_and_retry_without_switching_or_repeating_a_move() {
+        for rollback in [Ok(()), Err("still full".into())] {
+            let (tx, _rx) = queue::channel(32);
+            let mut server = tests::server(tx);
+            let (client, _peer) = tests::client(&mut server);
+            let current = server.clients[&client].workspace;
+            let ws = server.new_workspace("docs".into(), None);
+            let saved =
+                persistence::tests::writer(&mut server, vec![Err("disk full".into()), rollback.clone(), Ok(())]);
+            let mut p = server.workspace_picker(current);
+            p.select(|i| i.action.workspace() == Some(ws));
+            let Mode::Confirm(q) = choose(&mut server, client, p, "Move up", false) else { panic!() };
+            assert!(q.message.contains("disk full"));
+            assert_eq!(q.action.verb(), "Retry");
+            if rollback.is_err() {
+                assert!(q.message.contains("The saved order may differ. Fix the save error and retry."));
+                assert!(server.persist_dirty);
+            } else {
+                assert!(q.message.contains("Couldn't save the order. Previous order kept."));
+            }
+            assert_eq!(names(&server), ["test", "docs"]);
+            assert!(server.workspace_order.is_empty());
+            assert_eq!(server.clients[&client].workspace, current);
+            assert_eq!(saved.lock().unwrap().last().unwrap()["workspaces"][0]["name"], "test");
+            let Mode::Picker(p) = server.on_confirm(client, q, key("y")) else { panic!() };
+            assert_eq!(p.current().unwrap().action.workspace(), Some(ws));
+            assert_eq!(names(&server), ["docs", "test"]);
+            let wanted = server.workspace_key(&PickAction::SwitchWorkspace(ws)).unwrap();
+            let neighbor = server.workspace_key(&PickAction::SwitchWorkspace(current)).unwrap();
+            assert!(matches!(server.reorder_workspace(client, wanted, neighbor, true), Mode::Picker(_)));
+            assert_eq!(names(&server), ["docs", "test"]);
+            assert_eq!(server.clients[&client].workspace, current);
+        }
+    }
+
+    #[test]
+    fn workspace_order_error_cancel_keeps_the_row_and_shows_retry_at_both_sizes() {
+        for size in [(80, 24), (124, 36)] {
+            let (tx, _rx) = queue::channel(32);
+            let mut server = tests::server(tx);
+            let (client, _peer) = tests::client(&mut server);
+            let current = server.clients[&client].workspace;
+            let ws = server.new_workspace("docs".into(), None);
+            let c = server.clients.get_mut(&client).unwrap();
+            (c.cols, c.rows) = size;
+            let saved = persistence::tests::writer(&mut server, vec![Err("disk full".into()), Ok(())]);
+            let mut p = server.workspace_picker(current);
+            p.select(|i| i.action.workspace() == Some(ws));
+            let Mode::Confirm(q) = choose(&mut server, client, p, "Move up", false) else { panic!() };
+            let mut buf = Buffer::empty(server.client_screen(client));
+            overlays::draw_confirm(&q, buf.area, &mut buf);
+            let text: String = buf.content.iter().map(|c| c.symbol()).collect();
+            for message in ["Couldn't save the order.", "Previous order kept.", "disk full", "Retry", "Cancel"] {
+                assert!(text.contains(message), "{text}");
+            }
+            let count = saved.lock().unwrap().len();
+            let Mode::Picker(p) = server.on_confirm(client, q, key("esc")) else { panic!() };
+            assert_eq!(p.current().unwrap().action.workspace(), Some(ws));
+            assert_eq!(names(&server), ["test", "docs"]);
+            assert_eq!(server.clients[&client].workspace, current);
+            assert_eq!(saved.lock().unwrap().len(), count);
         }
     }
 }

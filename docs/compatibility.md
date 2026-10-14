@@ -52,6 +52,13 @@ The 0.2.0 and 0.3.0 session paths remain untouched, so those releases cannot rea
 containing only deleted workspaces as an empty session or overwrite its recovery records.
 An older running server continues its existing workspace behavior until restarted.
 
+Move up and Move down use the existing attached-terminal input protocol too. The optional
+`workspace_order` field in `sessions-v2` records saved identities and the paths of files not yet
+imported. A snapshot without it keeps its saved sequence followed by scanned files. Importing
+a file replaces its order reference with the workspace's identity, without changing its position.
+The 0.2.0 and 0.3.0 state paths remain untouched. Their clients can use the actions when attached
+to a current server; an older running server keeps its existing order behavior.
+
 ## For contributors: how the protocol changes
 
 The client and the server exchange JSON messages (`src/protocol.rs`, whose comments hold the

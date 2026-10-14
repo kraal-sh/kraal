@@ -30,6 +30,8 @@ pub struct SessionSnapshot {
     pub version: u32,
     pub workspaces: Vec<WorkspaceSnap>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub workspace_order: Vec<WorkspaceKey>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub deleted_workspaces: Vec<DeletedWorkspace>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub removed_sources: Vec<PathBuf>,
@@ -37,10 +39,31 @@ pub struct SessionSnapshot {
     pub tunnels: Vec<crate::server::net::TunnelSpec>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum WorkspaceKey {
+    Id(String),
+    Source(PathBuf),
+}
+
+impl WorkspaceKey {
+    pub fn position(order: &[Self], id: Option<&str>, source: Option<&Path>) -> usize {
+        order
+            .iter()
+            .position(|key| match (key, id) {
+                (Self::Id(saved), Some(id)) => saved == id,
+                (Self::Source(path), None) => source.is_some_and(|p| p == path),
+                _ => false,
+            })
+            .unwrap_or(usize::MAX)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeletedWorkspace {
     pub workspace: WorkspaceSnap,
     pub position: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub order_position: Option<usize>,
     pub deleted_at: i64,
 }
 
@@ -344,6 +367,7 @@ pub fn snapshot(server: &Server) -> SessionSnapshot {
         }
     }
     SessionSnapshot {
+        workspace_order: server.workspace_order.clone(),
         version: VERSION,
         workspaces,
         deleted_workspaces,
@@ -744,7 +768,8 @@ pub fn resume_command(agent: &str, session: &str) -> Option<String> {
     }
 }
 
-pub fn apply(server: &mut Server, snap: SessionSnapshot) -> Result<()> {
+pub fn apply(server: &mut Server, mut snap: SessionSnapshot) -> Result<()> {
+    server.workspace_order = snap.workspace_order;
     server.deleted_workspaces = snap.deleted_workspaces;
     server.removed_sources = snap.removed_sources;
     for deleted in &mut server.deleted_workspaces {
@@ -762,6 +787,8 @@ pub fn apply(server: &mut Server, snap: SessionSnapshot) -> Result<()> {
             server.warnings.push(format!("tunnel {}: {e:#}", t.describe()));
         }
     }
+    snap.workspaces
+        .sort_by_key(|w| WorkspaceKey::position(&server.workspace_order, Some(&w.id), w.definition.as_deref()));
     for mut ws in snap.workspaces {
         if ws.id.is_empty() {
             ws.id = crate::accounts::new_uuid();
@@ -779,6 +806,7 @@ pub fn apply(server: &mut Server, snap: SessionSnapshot) -> Result<()> {
             server.unrestored.push(ws);
         }
     }
+    server.sort_workspaces();
     server.relayout();
     Ok(())
 }
@@ -948,6 +976,45 @@ mod tests {
     }
 
     #[test]
+    fn workspace_order_resolves_saved_workspaces_by_identity() {
+        let path = Path::new("/layouts/x.kdl");
+        let order = [WorkspaceKey::Source(path.into()), WorkspaceKey::Id("a".into()), WorkspaceKey::Id("b".into())];
+        assert_eq!(WorkspaceKey::position(&order, Some("a"), Some(path)), 1);
+        assert_eq!(WorkspaceKey::position(&order, Some("b"), Some(path)), 2);
+        assert_eq!(WorkspaceKey::position(&order, Some("new"), Some(path)), usize::MAX);
+        assert_eq!(WorkspaceKey::position(&order, None, Some(path)), 0);
+    }
+
+    #[test]
+    fn workspace_order_is_optional_and_does_not_change_legacy_state_paths() {
+        let mut state = saved_state();
+        state["workspaces"][0]["empty"] = serde_json::json!(true);
+        state["workspaces"][0]["tabs"] = serde_json::json!([]);
+        let mut second = state["workspaces"][0].clone();
+        second["id"] = serde_json::json!("second");
+        second["name"] = serde_json::json!("second");
+        state["workspaces"].as_array_mut().unwrap().push(second);
+        let mut snap: SessionSnapshot = serde_json::from_value(state).unwrap();
+        assert!(snap.workspace_order.is_empty());
+        assert_eq!(snap.workspaces.iter().map(|w| w.name.as_str()).collect::<Vec<_>>(), ["w", "second"]);
+        snap.workspace_order = vec![WorkspaceKey::Id("second".into()), WorkspaceKey::Id("kept".into())];
+        snap.workspaces.swap(0, 1);
+        let session = format!("workspace-order-compat-{}", std::process::id());
+        let legacy = paths::legacy_session_state_path(&session);
+        std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        let original = b"{\"version\":1,\"workspaces\":[]}";
+        std::fs::write(&legacy, original).unwrap();
+        save(&session, &snap).unwrap();
+        let kept = load(&session).unwrap().unwrap();
+        assert_eq!(kept.workspace_order, snap.workspace_order);
+        assert_eq!(kept.workspaces[0].id, "second");
+        assert_eq!(std::fs::read(&legacy).unwrap(), original);
+        assert!(paths::session_state_path(&session).parent().unwrap().ends_with("sessions-v2"));
+        std::fs::remove_file(paths::session_state_path(&session)).unwrap();
+        std::fs::remove_file(legacy).unwrap();
+    }
+
+    #[test]
     fn close_recovery_never_signals_a_different_machine_boot_or_process() {
         let pid = std::process::id();
         let start = crate::process::start_time(pid).unwrap();
@@ -1027,7 +1094,7 @@ mod tests {
             value
         };
         let mut record = deleted(source["workspaces"][0].clone());
-        record["deleted_workspaces"][0] = serde_json::json!([source["workspaces"][0], 0, 1]);
+        record["deleted_workspaces"][0] = serde_json::json!([source["workspaces"][0], 0, null, 1]);
         let deleted_workspace = deleted(workspace["workspaces"][0].clone());
         let deleted_tab = deleted(tab["workspaces"][0].clone());
         for (value, reason) in [
@@ -1061,6 +1128,7 @@ mod tests {
         let snap = parse(&serde_json::to_vec(&deleted).unwrap()).unwrap();
         assert!(snap.workspaces.is_empty());
         assert_eq!(snap.deleted_workspaces.len(), 1);
+        assert_eq!(snap.deleted_workspaces[0].order_position, None);
         assert_eq!(snap.deleted_workspaces[0].workspace.name, old.workspaces[0].name);
         assert_eq!(snap.removed_sources, [PathBuf::from("/kept/api.kdl")]);
     }

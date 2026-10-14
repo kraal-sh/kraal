@@ -215,8 +215,9 @@ pub(super) fn list_sessions() -> Result<()> {
 
 fn list_definitions(session: &str, json: bool) -> Result<()> {
     let cfg = config::Config::load()?;
-    let (saved, removed) =
-        crate::persist::inspect(session)?.map(|s| (s.workspaces, s.removed_sources)).unwrap_or_default();
+    let (saved, removed, order) = crate::persist::inspect(session)?
+        .map(|s| (s.workspaces, s.removed_sources, s.workspace_order))
+        .unwrap_or_default();
     let mut list: Vec<_> = saved
         .iter()
         .map(|w| {
@@ -260,6 +261,7 @@ fn list_definitions(session: &str, json: bool) -> Result<()> {
             Err(_) => {}
         }
     }
+    list.sort_by_key(|w| crate::persist::WorkspaceKey::position(&order, w.id.as_deref(), w.definition.as_deref()));
     print_workspaces(&list, json)
 }
 

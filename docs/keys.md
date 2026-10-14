@@ -64,6 +64,11 @@ Closing a workspace (`ctrl+b W x`, or `ctrl+x` in the workspace picker) lists it
 programs and background jobs, and keeps its current layout as **Closed**.
 **Cancel** is selected first; **Stop and close** confirms. See [Closing a workspace](workspaces.md#closing-a-workspace).
 
+**Move up** and **Move down** are in the workspace's Tab actions, with no direct shortcut.
+They keep the row selected and leave each terminal's workspace and pane focus unchanged.
+The order is shared and saved automatically. While searching, choose **Clear search to reorder**
+first; it keeps the selected row. See [Reordering workspaces](workspaces.md#reordering-workspaces).
+
 **Delete** is in the workspace's Tab actions, with no direct shortcut. It asks once before
 removing the row and stopping its programs. Click the result's **Undo**, or use **Ctrl+Z** in
 Workspaces while that result is shown. **Deleted workspaces** also offers **Enter Restore**
@@ -143,7 +148,8 @@ A successful, verified sign-in closes the pane automatically.
 
 In lists, type to filter, `↑↓` move, Enter or one click chooses, **Tab shows what else can be done** with the
 selected item (connect in a new tab, browse its files, run a command…). Most also have a key
-shown by the list; Delete is only in the workspace actions. Esc closes. The footer says what Enter does on the selected line;
+shown by the list; Move up, Move down and Delete are only in the workspace actions.
+Esc closes. The footer says what Enter does on the selected line;
 only actions that apply to that line are offered. When there are no other actions, Tab moves
 to the next line. Text fields edit like a shell line (arrows, `home`/`end`,
 `alt+←→`, `ctrl+w`, `ctrl+u`, `ctrl+k`). In Add workspace, Rename workspace and Save workspace,

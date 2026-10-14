@@ -105,6 +105,10 @@ impl Server {
         let mut saved = crate::persist::snapshot(self).workspaces.remove(wi);
         saved.delete_pending = false;
         let identity = saved.id.clone();
+        let order_position = self
+            .updated_workspace_order()
+            .iter()
+            .position(|key| *key == crate::persist::WorkspaceKey::Id(identity.clone()));
         let sources = self.removed_sources.clone();
         if let Some(path) = &saved.definition {
             self.remove_workspace_source(path);
@@ -113,6 +117,7 @@ impl Server {
         self.deleted_workspaces.push(DeletedWorkspace {
             workspace: saved,
             position: wi,
+            order_position,
             deleted_at: crate::accounts::now(),
         });
         if let Err(e) = self.save_now() {
@@ -195,12 +200,22 @@ impl Server {
         self.deleted_workspaces.push(DeletedWorkspace {
             workspace: saved,
             position,
+            order_position: self.updated_workspace_order().iter().position(
+                |key| matches!(key, crate::persist::WorkspaceKey::Source(p) if crate::paths::same_file(p, path)),
+            ),
             deleted_at: crate::accounts::now(),
         });
+        let order = self.workspace_order.clone();
+        for key in &mut self.workspace_order {
+            if matches!(key, crate::persist::WorkspaceKey::Source(p) if crate::paths::same_file(p, path)) {
+                *key = crate::persist::WorkspaceKey::Id(identity.clone());
+            }
+        }
         let sources = self.removed_sources.clone();
         self.remove_workspace_source(path);
         if let Err(e) = self.save_now() {
             self.deleted_workspaces.pop();
+            self.workspace_order = order;
             self.removed_sources = sources;
             if let Err(rollback) = self.save_now() {
                 self.mark_persist();
@@ -328,8 +343,18 @@ impl Server {
         if let Some(path) = &saved.definition {
             self.removed_sources.retain(|p| !crate::paths::same_file(p, path));
         }
+        let order = self.workspace_order.clone();
+        self.bind_workspace_order(ws);
+        let key = crate::persist::WorkspaceKey::Id(saved.id.clone());
+        if !self.workspace_order.contains(&key) {
+            self.workspace_order = self.updated_workspace_order();
+            self.workspace_order.retain(|k| *k != key);
+            self.workspace_order
+                .insert(deleted.order_position.unwrap_or(deleted.position).min(self.workspace_order.len()), key);
+        }
         if let Err(e) = self.save_now() {
             self.workspaces.remove(position);
+            self.workspace_order = order;
             self.deleted_workspaces.insert(at, deleted);
             self.removed_sources = sources;
             if let Err(rollback) = self.save_now() {
@@ -340,6 +365,7 @@ impl Server {
             }
             return Err(format!("Couldn't save the restore. The workspace stays in Deleted workspaces.\n{e}"));
         }
+        self.sort_workspaces();
         self.scan_definitions();
         Ok(ws)
     }

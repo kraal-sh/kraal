@@ -1281,6 +1281,16 @@ impl Server {
             );
         }
 
+        rows[1..].sort_by_key(|row| match row {
+            SideRow::Entry { item: Some(SideItem::Workspace(ws)), .. } => {
+                self.workspace_position(&super::ui::PickAction::SwitchWorkspace(*ws))
+            }
+            SideRow::Entry { item: Some(SideItem::Definition(path)), .. } => {
+                crate::persist::WorkspaceKey::position(&self.workspace_order, None, Some(path))
+            }
+            _ => usize::MAX,
+        });
+
         // Reserve the add row even when the workspace list fills the sidebar.
         let visible = height.saturating_sub(3) as usize / 2;
         rows.truncate(1 + visible * 2);
@@ -2159,6 +2169,38 @@ mod tests {
                 .iter()
                 .any(|r| matches!(r, SideRow::Entry { item: Some(SideItem::Definition(_)), .. }))
         );
+    }
+
+    #[test]
+    fn sidebar_workspace_order_keeps_both_rows_and_the_current_marker_together() {
+        let (tx, _rx) = super::super::queue::channel(32);
+        let mut server = super::super::tests::server(tx);
+        let (client, _peer) = super::super::tests::client(&mut server);
+        let current = server.clients[&client].workspace;
+        let other = server.new_workspace("other".into(), None);
+        let source = PathBuf::from("/missing/source.kdl");
+        server.def_files.push((source.clone(), "source".into()));
+        server.workspace_order = vec![
+            crate::persist::WorkspaceKey::Id(server.workspaces[1].stable_id.clone()),
+            crate::persist::WorkspaceKey::Source(source.clone()),
+            crate::persist::WorkspaceKey::Id(server.workspaces[0].stable_id.clone()),
+        ];
+        server.sort_workspaces();
+        for height in [24, 36] {
+            let rows = server.sidebar_rows(&server.clients[&client], height, 0);
+            for (pair, item) in rows[1..7].as_chunks::<2>().0.iter().zip([
+                SideItem::Workspace(other),
+                SideItem::Definition(source.clone()),
+                SideItem::Workspace(current),
+            ]) {
+                for row in pair {
+                    let SideRow::Entry { item: Some(found), selected, .. } = row else { panic!() };
+                    assert_eq!(*found, item);
+                    assert_eq!(*selected, item == SideItem::Workspace(current));
+                }
+            }
+            assert!(matches!(&rows[7], SideRow::Entry { item: Some(SideItem::AddWorkspace), .. }));
+        }
     }
 
     #[test]
