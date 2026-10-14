@@ -997,11 +997,11 @@ mod tests {
         let reads_elsewhere =
             || std::fs::read_link(format!("/proc/{leader}/fd/0")).is_ok_and(|f| f == Path::new("/dev/null"));
         let start = std::time::Instant::now();
-        while !(pidfile.exists() && reads_elsewhere()) {
+        while !(crate::testing::read_complete_lines(&pidfile).is_some() && reads_elsewhere()) {
             assert!(start.elapsed() < std::time::Duration::from_secs(5), "the shell never got there");
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
-        let job: u32 = std::fs::read_to_string(&pidfile).unwrap().trim().parse().unwrap();
+        let job: u32 = crate::testing::read_complete_lines(&pidfile).unwrap().trim().parse().unwrap();
         // The job may still be the shell's copy of itself for an instant.
         while argv(job).is_none_or(|argv| argv != ["sleep", "4254"]) {
             assert!(start.elapsed() < std::time::Duration::from_secs(5), "the job never started");

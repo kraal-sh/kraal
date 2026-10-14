@@ -35,10 +35,10 @@ fn events_stream_and_hooks() {
     let _ = events.kill();
     let _ = events.wait();
     let start = Instant::now();
-    while !marker.exists() && start.elapsed() < Duration::from_secs(5) {
+    while crate::common::read_complete_lines(&marker).is_none() && start.elapsed() < Duration::from_secs(5) {
         std::thread::sleep(Duration::from_millis(20));
     }
-    assert_eq!(std::fs::read_to_string(&marker).unwrap().trim(), "pane.failed 3 job");
+    assert_eq!(crate::common::read_complete_lines(&marker).unwrap().trim(), "pane.failed 3 job");
     // Live events come too, after the replay.
     let (mut live, lines) = env.follow(&["events", "--since", "0", "pane.failed"]);
     let line = lines.recv_timeout(Duration::from_secs(10)).expect("replayed event");

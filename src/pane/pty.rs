@@ -1538,7 +1538,7 @@ mod tests {
         let process = Process::of(child);
         let start = Instant::now();
         let job: libc::pid_t = loop {
-            if let Some(j) = std::fs::read_to_string(&pidfile).ok().and_then(|s| s.trim().parse().ok()) {
+            if let Some(j) = crate::testing::read_complete_lines(&pidfile).and_then(|s| s.trim().parse().ok()) {
                 break j;
             }
             assert!(start.elapsed() < Duration::from_secs(5), "the job never started");

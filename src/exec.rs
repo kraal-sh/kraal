@@ -532,12 +532,10 @@ mod tests {
         let script = format!("setsid sh -c 'echo $$ > {}; exec sleep 30' & sleep 30", pidfile.display());
         let mut child = own_group(&mut sh(&script)).stdin(Stdio::null()).spawn().unwrap();
         let start = Instant::now();
-        while std::fs::read_to_string(&pidfile).map_or(true, |s| s.trim().is_empty())
-            && start.elapsed() < crate::testing::PATIENCE
-        {
+        while crate::testing::read_complete_lines(&pidfile).is_none() && start.elapsed() < crate::testing::PATIENCE {
             std::thread::sleep(Duration::from_millis(10));
         }
-        let escaped: libc::pid_t = std::fs::read_to_string(&pidfile).unwrap().trim().parse().unwrap();
+        let escaped: libc::pid_t = crate::testing::read_complete_lines(&pidfile).unwrap().trim().parse().unwrap();
         assert!(crate::process::running(escaped), "the escaped sleep runs");
         kill_tree(&mut child);
         let start = Instant::now();
@@ -556,7 +554,7 @@ mod tests {
         // A wrapper that starts a daemon (out of its group, session and tree) and exits at once.
         let script = format!(
             "daemon() {{ if command -v setsid >/dev/null; then setsid sh -c 'echo $$ > {f}; exec sleep 30'; \
-             else perl -MPOSIX -e 'POSIX::setsid(); open(F, \">{f}\"); print F $$; close F; exec \"sleep\", \"30\"'; fi; }}; \
+             else perl -MPOSIX -e 'POSIX::setsid(); open(F, \">{f}\"); print F \"$$\\n\"; close F; exec \"sleep\", \"30\"'; fi; }}; \
              daemon & exit 0",
             f = pidfile.display()
         );
@@ -564,12 +562,10 @@ mod tests {
         let mut child = own_group(&mut sh(&script)).env(TAG, &tag).stdin(Stdio::null()).spawn().unwrap();
         child.wait().unwrap();
         let start = Instant::now();
-        while std::fs::read_to_string(&pidfile).map_or(true, |s| s.trim().is_empty())
-            && start.elapsed() < crate::testing::PATIENCE
-        {
+        while crate::testing::read_complete_lines(&pidfile).is_none() && start.elapsed() < crate::testing::PATIENCE {
             std::thread::sleep(Duration::from_millis(10));
         }
-        let daemon: libc::pid_t = std::fs::read_to_string(&pidfile).unwrap().trim().parse().unwrap();
+        let daemon: libc::pid_t = crate::testing::read_complete_lines(&pidfile).unwrap().trim().parse().unwrap();
         // The wrapper is gone: its tree and group no longer hold the daemon.
         kill_tree(&mut child);
         std::thread::sleep(Duration::from_millis(100));

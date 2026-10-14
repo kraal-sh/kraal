@@ -293,7 +293,9 @@ fn an_unsigned_target_offers_sign_in_without_stopping_the_agent() {
     choose_switch_target(&mut client, "Sign-in required");
     client.wait_for_row("The current agent keeps running");
     client.send(b"y");
-    wait_until(PATIENCE, "sign-in was offered and started", || env.root.join("beta/logins").exists());
+    wait_until(PATIENCE, "sign-in was offered and started", || {
+        common::read_complete_lines(env.root.join("beta/logins")).is_some()
+    });
     account_still_runs(&env, &pane, "during-sign-in");
 }
 
@@ -356,7 +358,7 @@ fn cancelling_a_check_from_another_client_ignores_its_late_success() {
     first.wait_for_row("checking sign-in");
     first.send(b"\r");
     wait_until(PATIENCE, "both the picker and change check sign-in", || {
-        std::fs::read_to_string(env.root.join("beta/checks")).is_ok_and(|s| s.lines().count() == 2)
+        common::read_complete_lines(env.root.join("beta/checks")).is_some_and(|s| s.lines().count() == 2)
     });
     second.send(b"\x02Ac");
     second.wait_for_row("Checking sign-in");
@@ -365,7 +367,7 @@ fn cancelling_a_check_from_another_client_ignores_its_late_success() {
         .wait_for_rows("the pending change is cancelled", |rows| !rows.iter().any(|r| r.contains("Checking sign-in")));
     std::fs::remove_file(hold).unwrap();
     wait_until(PATIENCE, "both checks returned", || {
-        std::fs::read_to_string(env.root.join("beta/checked")).is_ok_and(|s| s.lines().count() == 2)
+        common::read_complete_lines(env.root.join("beta/checked")).is_some_and(|s| s.lines().count() == 2)
     });
     account_still_runs(&env, &pane, "late-success");
     first.send(b"\x02Ac");
@@ -407,7 +409,9 @@ fn a_switch_waits_for_the_turn_is_cancelled_by_another_client_and_rechecks_sign_
 
     std::fs::write(env.root.join("beta/status"), "0").unwrap();
     choose_switch_target(&mut first, "Continue conversation");
-    wait_until(PATIENCE, "the same conversation starts on beta", || env.root.join("beta/starts").exists());
+    wait_until(PATIENCE, "the same conversation starts on beta", || {
+        common::read_complete_lines(env.root.join("beta/starts")).is_some()
+    });
     let text = env.wait_for_text(&pane, "--resume").replace('\n', "");
     assert!(text.contains(&format!("home={}", env.root.join("beta").display())));
     assert_eq!(std::fs::read_to_string(env.root.join("beta/starts")).unwrap().lines().count(), 1);
@@ -431,7 +435,9 @@ fn codex_discloses_the_new_conversation_and_stop_confirmation_selects_cancel() {
     choose_switch_target(&mut client, "New conversation");
     client.wait_for_row("Stop and switch?");
     client.send(b"y");
-    wait_until(PATIENCE, "Codex starts on beta", || env.root.join("beta/starts").exists());
+    wait_until(PATIENCE, "Codex starts on beta", || {
+        common::read_complete_lines(env.root.join("beta/starts")).is_some()
+    });
     env.wait_for_text(&pane, &format!("home={} args=", env.root.join("beta").display()));
     assert_eq!(std::fs::read_to_string(env.root.join("beta/starts")).unwrap().lines().count(), 1);
 }
@@ -617,7 +623,9 @@ fn an_ambiguous_shell_agent_offers_another_pane_without_stopping_it() {
         client.wait_for_row("Open with another account");
         client.send(b"beta\r");
         env.wait_for_text("shell", "READY");
-        wait_until(PATIENCE, "another pane starts on beta", || env.root.join("beta/starts").exists());
+        wait_until(PATIENCE, "another pane starts on beta", || {
+            common::read_complete_lines(env.root.join("beta/starts")).is_some()
+        });
         let panes: serde_json::Value = serde_json::from_str(&env.run(&["panes", "--json"])).unwrap();
         let original = panes.as_array().unwrap().iter().find(|p| p["name"] == "shell").unwrap();
         assert!(original["exit_code"].is_null());
@@ -633,7 +641,9 @@ fn switching_waits_for_the_replacement_to_produce_output_before_offering_undo() 
     std::fs::write(env.root.join("beta/hold-start"), "").unwrap();
     claude_hook(&env, &pane, r#"{"hook_event_name":"Stop"}"#);
     choose_switch_target(&mut client, "Continue conversation");
-    wait_until(PATIENCE, "the replacement was spawned", || env.root.join("beta/starts").exists());
+    wait_until(PATIENCE, "the replacement was spawned", || {
+        common::read_complete_lines(env.root.join("beta/starts")).is_some()
+    });
     std::thread::sleep(Duration::from_secs(2));
     assert!(!client.rows().iter().any(|r| r.contains("Using beta") || r.contains("Switched")));
     std::fs::remove_file(env.root.join("beta/hold-start")).unwrap();
@@ -673,7 +683,9 @@ fn threshold_ask_checks_the_destination_then_needs_one_confirmation() {
     assert!(env.root.join("beta/checked").exists());
     assert!(!env.root.join("beta/starts").exists());
     client.send(b"y");
-    wait_until(PATIENCE, "one confirmation starts the verified alternative", || env.root.join("beta/starts").exists());
+    wait_until(PATIENCE, "one confirmation starts the verified alternative", || {
+        common::read_complete_lines(env.root.join("beta/starts")).is_some()
+    });
     env.wait_for_text(&pane, "--resume");
     assert_eq!(std::fs::read_to_string(env.root.join("beta/starts")).unwrap().lines().count(), 1);
 }
@@ -691,7 +703,9 @@ fn automatic_switches_need_known_usage_and_do_not_retry_a_failed_check_each_tick
     account_still_runs(&env, &pane, "unknown-usage");
     std::fs::write(env.root.join("beta/status"), "1").unwrap();
     usage("beta", 0);
-    wait_until(PATIENCE, "the automatic switch checks sign-in", || env.root.join("beta/checks").exists());
+    wait_until(PATIENCE, "the automatic switch checks sign-in", || {
+        common::read_complete_lines(env.root.join("beta/checks")).is_some()
+    });
     client.wait_for_row("The current agent keeps running");
     std::thread::sleep(Duration::from_secs(3));
     let checks = std::fs::read_to_string(env.root.join("beta/checks")).unwrap();
@@ -810,7 +824,7 @@ fn failed_and_cancelled_logins_close_on_enter_and_retry_only_when_asked() {
     client.send(b"r");
     common::wait_until(PATIENCE, "explicit retry starts once", || {
         let panes = login_panes(&env);
-        std::fs::read_to_string(home.join("logins")).unwrap().lines().count() == 3
+        common::read_complete_lines(home.join("logins")).is_some_and(|s| s.lines().count() == 3)
             && panes.len() == 1
             && panes[0]["exit_code"].is_null()
     });
@@ -898,14 +912,15 @@ fn closing_a_check_ignores_its_late_success() {
     std::fs::write(home.join("hold-check"), "").unwrap();
     open_account_login(&mut client);
     client.wait_for_row("checking sign-in");
-    common::wait_until(PATIENCE, "check is running", || home.join("checks").exists());
+    common::wait_until(PATIENCE, "check is running", || common::read_complete_lines(home.join("checks")).is_some());
     client.send(b"\r");
     common::wait_until(PATIENCE, "checking pane closes", || login_panes(&env).is_empty());
     std::fs::write(home.join("status"), "2").unwrap();
     open_account_login(&mut client);
     client.wait_for_row("checking sign-in");
     common::wait_until(PATIENCE, "the replacement check read its status", || {
-        std::fs::read_to_string(home.join("checks")).is_ok_and(|s| s.lines().filter(|l| *l == "check").count() == 2)
+        common::read_complete_lines(home.join("checks"))
+            .is_some_and(|s| s.lines().filter(|l| *l == "check").count() == 2)
     });
     std::fs::remove_file(home.join("hold-check")).unwrap();
     client.wait_for_row("could not check sign-in");
@@ -1932,8 +1947,9 @@ fn the_add_form_names_an_existing_sign_in_without_running_login() {
     click_account_text(&mut client, "A different account");
     client.wait_for_row("Name    e.g. Work or Personal");
     let before = std::fs::read_to_string(&file).unwrap();
-    let checks = || std::fs::read_to_string(env.root.join("home/status-checks")).unwrap_or_default().lines().count();
-    let finished = || std::fs::read_to_string(standard.join("check-finished")).unwrap_or_default().lines().count();
+    let checks =
+        || common::read_complete_lines(env.root.join("home/status-checks")).unwrap_or_default().lines().count();
+    let finished = || common::read_complete_lines(standard.join("check-finished")).unwrap_or_default().lines().count();
     let (before_checks, before_finished) = (checks(), finished());
     std::fs::write(standard.join("hold-check"), "").unwrap();
     client.send(b"\x15cancelled\r\r");
@@ -2005,7 +2021,9 @@ fn a_different_account_review_after_sign_out_exposes_sign_in() {
     client.send(b"\t");
     client.wait_for_row("Sign in");
     click_account_text(&mut client, "Sign in");
-    common::wait_until(PATIENCE, "the account's Sign in action starts login", || env.root.join("home/logins").exists());
+    common::wait_until(PATIENCE, "the account's Sign in action starts login", || {
+        common::read_complete_lines(env.root.join("home/logins")).is_some()
+    });
     assert_eq!(std::fs::read_to_string(env.root.join("home/logins")).unwrap(), "unexpected\n");
 }
 
@@ -2027,7 +2045,9 @@ fn sidebar_accounts_discover_a_sign_in_completed_after_startup() {
         let out = env.cmd(&["open", "w"]).env("PATH", &path).output().unwrap();
         assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
         let mut client = RawClient::attach_sized(&env, Some("w"), (124, 36)).traced();
-        common::wait_until(PATIENCE, "startup checked the unsigned home", || standard.join("check-finished").exists());
+        common::wait_until(PATIENCE, "startup checked the unsigned home", || {
+            common::read_complete_lines(standard.join("check-finished")).is_some()
+        });
         client.wait_for_rows("startup discovery completed", |rows| {
             rows.iter().any(|r| r.contains("ACCOUNTS")) && !rows.iter().any(|r| r.contains("Checking sign-in"))
         });

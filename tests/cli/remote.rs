@@ -708,10 +708,8 @@ fn client_exit_cancels_a_native_copy_before_its_pending_write() {
         }
         let mut client = TerminalClient::start(cmd);
         client.type_keys(b"\x02=\x19");
-        wait_until(PATIENCE, "clipboard helper paused", || {
-            std::fs::read_to_string(&pidfile).is_ok_and(|s| !s.trim().is_empty())
-        });
-        let pid: libc::pid_t = std::fs::read_to_string(&pidfile).unwrap().trim().parse().unwrap();
+        wait_until(PATIENCE, "clipboard helper paused", || common::read_complete_lines(&pidfile).is_some());
+        let pid: libc::pid_t = crate::common::read_complete_lines(&pidfile).unwrap().trim().parse().unwrap();
         // Waiting for the stopped state makes the pause deterministic.
         wait_until(PATIENCE, "clipboard helper stopped", || {
             std::fs::read_to_string(format!("/proc/{pid}/status"))
@@ -1431,7 +1429,7 @@ fn saving_beside_a_watched_server_does_not_start_another_ssh() {
     let out = env.cmd(&["open", "w"]).env("PATH", path).output().unwrap();
     assert!(out.status.success());
     common::wait_until(PATIENCE, "the saved server's agent watch started", || {
-        std::fs::read_to_string(&log).is_ok_and(|text| text.lines().count() == 1)
+        common::read_complete_lines(&log).is_some_and(|text| text.lines().count() == 1)
     });
     let before = std::fs::read_to_string(&log).unwrap();
     assert_eq!(before.lines().count(), 1);
