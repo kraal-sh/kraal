@@ -162,23 +162,24 @@ pub(super) fn form_layout(p: &Prompt, screen: Rect) -> forms::FormLayout {
             message.push_str(&format!("\n{details}"));
         }
     }
-    if let Some(error) = &p.error {
-        if !message.is_empty() {
-            message.push('\n');
-        }
-        message.push_str(error);
-    }
     if let Some(result) = p.workspace_form.as_ref().and_then(|f| f.result.as_ref()) {
         message = result.clone();
     }
-    let mut layout = forms::FormLayout::new(screen, field_count(p), &message, &buttons(p));
+    let error = p.error.as_deref().filter(|_| p.workspace_form.as_ref().is_none_or(|f| f.result.is_none()));
+    let mut layout = forms::FormLayout::new(screen, field_count(p), &message, error, &buttons(p));
     if matches!(
         p.action,
         PromptAction::ExportWorkspace(_) | PromptAction::ReviewWorkspace(_) | PromptAction::ImportWorkspace
     ) {
         // File paths in errors and results must retain spaces that prose wrapping would collapse.
         layout.lines = message.lines().flat_map(|l| crate::text::fold(l, layout.body.width as usize)).collect();
+        layout.error_start = layout.lines.len();
+        layout.lines.extend(error.unwrap_or("").lines().flat_map(|l| crate::text::fold(l, layout.body.width as usize)));
         layout.max_scroll = layout.lines.len().saturating_sub(layout.body.height as usize);
+    }
+    if p.workspace_form.as_ref().is_some_and(|f| f.source_details.is_some()) {
+        // An unreadable source is a failed result, before Retry sets the form error.
+        layout.error_start = 0;
     }
     layout
 }
@@ -1000,7 +1001,11 @@ mod tests {
                 panic!()
             };
             assert!(p.workspace_form.as_ref().unwrap().details);
-            let lines = form_layout(&p, server.client_screen(client)).lines.join("\n");
+            let layout = form_layout(&p, server.client_screen(client));
+            let mut buf = Buffer::empty(server.client_screen(client));
+            draw_form(&p, buf.area, &mut buf);
+            assert_eq!(buf[layout.body.as_position()].fg, crate::theme::current().blocked);
+            let lines = layout.lines.join("\n");
             assert!(lines.contains("line"), "{lines}");
             assert!(lines.contains("Your saved workspace is unchanged"));
             assert!(lines.contains("source.kdl"));
@@ -1279,7 +1284,13 @@ mod tests {
             draw_form(&p, buf.area, &mut buf);
             assert!(text(&buf).contains("Enter Retry"));
             assert!(text(&buf).contains("Workspaces are saved automatically."));
-            assert!(form_layout(&p, buf.area).lines.join("").contains(p.error.as_ref().unwrap()));
+            let layout = form_layout(&p, buf.area);
+            assert!(layout.lines.join("").contains(p.error.as_ref().unwrap()));
+            assert_eq!(buf[layout.body.as_position()].fg, crate::theme::current().text);
+            assert_eq!(
+                buf[(layout.body.x, layout.body.y + layout.error_start as u16)].fg,
+                crate::theme::current().blocked
+            );
         }
         let Mode::Confirm(q) = server.on_workspace_form(client, p, key("enter")) else { panic!() };
         std::fs::create_dir(&lock).unwrap();
@@ -1343,10 +1354,11 @@ mod tests {
             let mut buf = Buffer::empty(area);
             draw_form(&p, area, &mut buf);
             let shown = text(&buf);
+            assert_eq!(buf[form_layout(&p, area).primary.as_position()].bg, crate::theme::current().accent);
             assert!(
                 buf.content.chunks(cols as usize).any(|row| {
                     let row: String = row.iter().map(|c| c.symbol()).collect();
-                    row.contains("[> Add]") && row.contains("[  From file...]") && row.contains("[  Cancel]")
+                    row.contains(" Add     From file...     Cancel ")
                 }),
                 "{shown}"
             );
@@ -1375,7 +1387,9 @@ mod tests {
             for expected in ["Layout exported", "shared.kdl", "Enter Close", "Esc Close"] {
                 assert!(text(&buf).contains(expected), "{}", text(&buf));
             }
-            assert_eq!(text(&buf).matches("[> Close]").count(), 1);
+            assert_eq!(layout.primary, layout.cancel);
+            assert_eq!(buf[layout.cancel.as_position()].bg, crate::theme::current().accent);
+            assert_eq!(buf[layout.body.as_position()].fg, crate::theme::current().text);
             assert!(!text(&buf).contains("Done") && !text(&buf).contains("Tab Next"));
             let Mode::Picker(p) = server.on_workspace_form(client, p, key("enter")) else { panic!() };
             assert_eq!(p.current().unwrap().action.workspace(), Some(ws));
@@ -1508,7 +1522,7 @@ mod tests {
                         buf.content.chunks(cols as usize).map(|row| row.iter().map(|c| c.symbol()).collect()).collect();
                     let verb = if rename { "Rename" } else { "Add" };
                     assert!(shown.iter().any(|row| row.contains(p.error.as_ref().unwrap())));
-                    assert!(shown.iter().any(|row| row.contains(&format!("[> {verb}]"))), "{shown:?}");
+                    assert_eq!(buf[form_layout(&p, buf.area).primary.as_position()].bg, crate::theme::current().accent);
                     assert!(
                         shown.iter().any(|row| row.contains(&format!("Enter {verb} · Tab Next field · Esc Cancel")))
                     );
@@ -1603,7 +1617,7 @@ mod tests {
                 draw_form(&p, buf.area, &mut buf);
                 let shown: Vec<String> =
                     buf.content.chunks(cols as usize).map(|row| row.iter().map(|c| c.symbol()).collect()).collect();
-                assert!(shown.iter().any(|row| row.contains("[> Retry]")));
+                assert_eq!(buf[form_layout(&p, buf.area).primary.as_position()].bg, crate::theme::current().accent);
                 assert!(shown.iter().any(|row| row.contains("Enter Retry")));
             }
             assert_eq!(server.workspaces[0].name, "test");
@@ -1861,9 +1875,15 @@ mod tests {
             draw_form(&p, buf.area, &mut buf);
             let shown: Vec<String> =
                 buf.content.chunks(cols as usize).map(|row| row.iter().map(|c| c.symbol()).collect()).collect();
-            assert!(shown.iter().any(|row| row.contains("[> Retry]")));
+            assert_eq!(buf[form_layout(&p, buf.area).primary.as_position()].bg, crate::theme::current().accent);
             assert!(shown.iter().any(|row| row.contains("Enter Retry")));
             assert!(shown.iter().any(|row| row.contains("Starts in")));
+            let layout = form_layout(&p, buf.area);
+            assert_eq!(buf[layout.body.as_position()].fg, crate::theme::current().text);
+            assert_eq!(
+                buf[(layout.body.x, layout.body.y + layout.error_start as u16)].fg,
+                crate::theme::current().blocked
+            );
         }
         assert_eq!(server.workspaces.len(), 1);
         assert!(server.panes.is_empty());

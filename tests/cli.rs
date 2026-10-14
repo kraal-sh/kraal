@@ -1334,7 +1334,7 @@ fn workspace_search_add_and_closed_rename_work_at_both_sizes() {
         client.wait_for_row("Search  billing");
         client.send(b"\r");
         client.wait_for_row("Name    billing");
-        click_account_text(&mut client, "[> Add]");
+        click_account_text(&mut client, " Add ");
         client.wait_for_row("Workspace added");
         let panes: serde_json::Value = serde_json::from_str(&env.run(&["panes", "--json"])).unwrap();
         let added = panes.as_array().unwrap().iter().find(|p| p["workspace"] == "billing").unwrap();
@@ -12948,7 +12948,7 @@ fn the_add_form_names_an_existing_sign_in_without_running_login() {
     client.send(b"\x02Al");
     wait_for_account_review(&client, "Claude");
     click_account_text(&mut client, "+ Add account");
-    let rows = client.wait_for_row("[> Use existing account]");
+    let rows = client.wait_for_row("Enter Review");
     assert!(rows.iter().any(|r| r.contains("Existing Claude sign-in needs review.")));
     assert!(!rows.iter().any(|r| r.contains("Name    ")));
     let pending_file = std::fs::read_to_string(&file).unwrap();
@@ -12961,7 +12961,7 @@ fn the_add_form_names_an_existing_sign_in_without_running_login() {
     click_account_text(&mut client, "Cancel");
     client.wait_for_row("+ Add account");
     click_account_text(&mut client, "+ Add account");
-    client.wait_for_row("[> Use existing account]");
+    client.wait_for_row("Enter Review");
     client.send(b"\r");
     client.wait_for_row("Which account is this?");
     click_account_text(&mut client, "A different account");
@@ -12981,7 +12981,7 @@ fn the_add_form_names_an_existing_sign_in_without_running_login() {
     assert_eq!(checks(), before_checks + 1, "Enter while checking did not start another check");
     assert_eq!(std::fs::read_to_string(&file).unwrap(), before);
     click_account_text(&mut client, "+ Add account");
-    client.wait_for_row("[> Use existing account]");
+    client.wait_for_row("Enter Review");
     click_account_text(&mut client, "Use existing account");
     client.wait_for_row("Which account is this?");
     click_account_text(&mut client, "A different account");
@@ -13472,17 +13472,17 @@ fn tunnel_form_shows_the_port_and_live_results_can_retry_and_stop() {
         click_account_text(&mut client, &format!("Use {suggested}"));
         client.wait_for_row(&format!("Local     {suggested}"));
         assert_eq!(env.run(&["tunnel", "list"]).trim(), "no tunnels");
-        click_account_text(&mut client, "Add]");
+        click_account_text(&mut client, " Add ");
         client.wait_for_row("Connecting");
         assert!(env.run(&["tunnel", "list"]).contains(&format!("localhost:{suggested}")));
         client.send(b"\r");
         client.wait_for_row("Tunnel · db");
-        client.wait_for_row("[> Close]");
+        client.wait_for_row("Enter Close");
         std::fs::write(env.root.join("home/tunnel-release"), "").unwrap();
         client.wait_for_row("Cannot reach db");
         client.wait_for_row("Retrying in ");
         std::fs::write(env.root.join("home/tunnel-ready"), "").unwrap();
-        click_account_text(&mut client, "Retry now]");
+        click_account_text(&mut client, " Retry now ");
         client.wait_for_row("Ready");
         assert!(env.run(&["tunnel", "list"]).starts_with("up"));
         client.close_overlay("Tunnel · db");
