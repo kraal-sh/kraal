@@ -71,6 +71,9 @@ pub(super) struct ObservedAgent {
     path: String,
 }
 
+const PROCESS_UNVERIFIED: &str =
+    "Could not verify the running agent. The current pane is unchanged. Open Change account to try again.";
+
 /// Only a direct executable or a runtime's script has arguments we can safely reuse.
 fn observed_command(argv: &[String], agent: &str) -> Option<Vec<String>> {
     fn base(s: &str) -> &str {
@@ -367,27 +370,28 @@ impl Server {
         }
     }
 
-    fn observed_agent(&self, pane: PaneId) -> Option<ObservedAgent> {
-        let p = self.panes.get(&pane)?;
+    fn observed_agent(&self, pane: PaneId) -> Result<Option<ObservedAgent>> {
+        let Some(p) = self.panes.get(&pane) else { return Ok(None) };
         if p.exit_code.is_some() || p.ssh.is_some() || p.spec.login.is_some() {
-            return None;
+            return Ok(None);
         }
-        let kind = accounts::agent_kind(p.agent.kind.as_deref()?)?;
-        let pid = p.foreground_pid()?;
-        let started = crate::process::start_time(pid)?;
+        let Some(kind) = p.agent.kind.as_deref().and_then(accounts::agent_kind) else { return Ok(None) };
+        let Some(leader) = p.pid() else { return Ok(None) };
+        let pid = p.foreground_pid().context(PROCESS_UNVERIFIED)?;
+        let started = crate::process::start_time(pid).context(PROCESS_UNVERIFIED)?;
         let mut names = vec!["HOME", "PATH", kind.home_env];
         names.extend(kind.clear_env);
-        let (argv, env) = crate::process::command_env(pid, &names)?;
-        let mut command = observed_command(&argv, kind.name)?;
+        let (argv, env) = crate::process::command_env(pid, &names).context(PROCESS_UNVERIFIED)?;
+        let Some(mut command) = observed_command(&argv, kind.name) else { return Ok(None) };
         // A shell's other jobs and opaque wrappers must not be stopped with its foreground job.
-        if !crate::process::sole_foreground_job(p.pid()?, pid)
+        if !crate::process::sole_foreground_job(leader, pid).context(PROCESS_UNVERIFIED)?
             || !p.spec.command.is_empty() && observed_command(&p.spec.command, kind.name).is_none()
-            || pid != p.pid()? && crate::process::ppid(pid) != p.pid()
+            || pid != leader && crate::process::ppid(pid).context(PROCESS_UNVERIFIED)? != leader
         {
-            return None;
+            return Ok(None);
         }
-        let account = self.accounts.process_account(kind, &env)?;
-        let session = p
+        let Some(account) = self.accounts.process_account(kind, &env) else { return Ok(None) };
+        let Some(session) = p
             .agent
             .session_process
             .filter(|process| *process == (pid, started))
@@ -395,8 +399,12 @@ impl Server {
             .or_else(|| {
                 let selector = if kind.name == "claude" { &["--resume", "--session-id"][..] } else { &["resume"][..] };
                 selector.contains(&command.get(1)?.as_str()).then(|| command.get(2).cloned()).flatten()
-            })?;
-        let cwd = crate::process::cwd(pid)?;
+            })
+        else {
+            return Ok(None);
+        };
+        let cwd = crate::process::cwd(pid).context(PROCESS_UNVERIFIED)?;
+        let Some(path) = env.get("PATH") else { return Ok(None) };
         let program = std::path::Path::new(&command[0]);
         let executable = |path: &std::path::Path| {
             use std::os::unix::fs::PermissionsExt;
@@ -405,16 +413,27 @@ impl Server {
         let program = if program.components().count() > 1 {
             cwd.join(program)
         } else {
-            std::env::split_paths(env.get("PATH")?).map(|dir| cwd.join(dir).join(program)).find(|p| executable(p))?
+            let Some(program) =
+                std::env::split_paths(path).map(|dir| cwd.join(dir).join(program)).find(|p| executable(p))
+            else {
+                return Ok(None);
+            };
+            program
         };
         if !executable(&program) {
-            return None;
+            return Ok(None);
         }
-        command[0] = program.to_str()?.into();
-        if !crate::process::still_running(pid, started) {
-            return None;
+        let Some(program) = program.to_str() else { return Ok(None) };
+        command[0] = program.into();
+        if !crate::process::running(pid as libc::pid_t) {
+            anyhow::ensure!(!crate::process::exists(pid as libc::pid_t), PROCESS_UNVERIFIED);
+            return Ok(None);
         }
-        Some(ObservedAgent { pid, started, command, account, session, cwd, path: env.get("PATH")?.clone() })
+        if crate::process::start_time(pid).context(PROCESS_UNVERIFIED)? != started {
+            return Ok(None);
+        }
+        anyhow::ensure!(p.foreground_pid() == Some(pid), PROCESS_UNVERIFIED);
+        Ok(Some(ObservedAgent { pid, started, command, account, session, cwd, path: path.clone() }))
     }
 
     pub(super) fn refresh_observed_accounts(&mut self) {
@@ -425,7 +444,10 @@ impl Server {
                 let spec = &self.panes[id].spec;
                 spec.account.is_none() && spec.account_id.is_none()
             })
-            .filter_map(|&id| self.observed_agent(id).map(|a| (id, a)))
+            .filter_map(|&id| {
+                // Keep the label through an unreadable process table. Switching still requires a fresh check.
+                self.observed_agent(id).unwrap_or_else(|_| self.observed_agents.get(&id).cloned()).map(|a| (id, a))
+            })
             .collect();
         if self.observed_agents != observed {
             self.observed_agents = observed;
@@ -439,11 +461,17 @@ impl Server {
         }
         let managed = self.panes.get(&pane).is_some_and(|p| p.spec.account.is_some() || p.spec.account_id.is_some());
         if !managed {
-            self.observed_agents.remove(&pane);
-            if let Some(a) =
-                self.observed_agent(pane).filter(|a| accounts::check_resume(&a.account, &a.session).is_ok())
-            {
-                self.observed_agents.insert(pane, a);
+            match self.observed_agent(pane) {
+                Ok(Some(a)) if accounts::check_resume(&a.account, &a.session).is_ok() => {
+                    self.observed_agents.insert(pane, a);
+                }
+                Ok(_) => {
+                    self.observed_agents.remove(&pane);
+                }
+                Err(error) => {
+                    self.toast(client, NoticeKind::Error, error.to_string());
+                    return Mode::Normal;
+                }
             }
         }
         if self.pane_account(pane).is_some() {
@@ -650,7 +678,7 @@ impl Server {
     ) -> Result<()> {
         let p = self.panes.get(&pane).context("no such pane")?;
         let observed = if p.spec.account.is_none() && p.spec.account_id.is_none() {
-            Some(self.observed_agent(pane).context("Can't switch this process. Open with another account.")?)
+            Some(self.observed_agent(pane)?.context("Can't switch this process. Open with another account.")?)
         } else {
             None
         };
@@ -745,8 +773,10 @@ impl Server {
     fn switch_failed(&mut self, pane: PaneId, reason: &str, sign_in: bool) {
         let Some(switch) = self.switches.remove(&pane) else { return };
         self.refresh_switch_views(pane);
-        let unsupported =
-            switch.observed.as_ref().is_some_and(|before| self.observed_agent(pane).as_ref() != Some(before));
+        let unsupported = switch
+            .observed
+            .as_ref()
+            .is_some_and(|before| self.observed_agent(pane).is_ok_and(|now| now.as_ref() != Some(before)));
         let client = switch.client.or(self.primary);
         if let Some(c) = client.and_then(|id| self.clients.get_mut(&id)).filter(|c| matches!(c.mode, Mode::Normal)) {
             let action = if sign_in {
@@ -781,7 +811,7 @@ impl Server {
         anyhow::ensure!(same_process, "the pane's process changed; choose an account again");
         if let Some(observed) = &switch.observed {
             anyhow::ensure!(
-                self.observed_agent(pane).as_ref() == Some(observed),
+                self.observed_agent(pane)?.as_ref() == Some(observed),
                 "Can't switch this process. Open with another account."
             );
         }
@@ -1401,7 +1431,7 @@ impl Server {
 
     fn check_switch_row(&mut self, client: ClientId, pane: PaneId, to: &Account) {
         let Some(from) = self.pane_account(pane) else { return };
-        let session = self.observed_agent(pane).map(|a| a.session).or_else(|| {
+        let session = self.observed_agent(pane).ok().flatten().map(|a| a.session).or_else(|| {
             self.panes.get(&pane).and_then(|p| p.agent.session_id.clone().or_else(|| p.spec.session.clone()))
         });
         let to = to.clone();
@@ -2017,7 +2047,7 @@ mod tests {
             self.server.finish_exits();
         }
 
-        fn until(&mut self, what: &str, check: impl Fn(&Self) -> bool) {
+        fn until(&mut self, what: &str, mut check: impl FnMut(&Self) -> bool) {
             let start = Instant::now();
             loop {
                 self.pump();
@@ -2517,6 +2547,8 @@ mod tests {
     #[test]
     fn a_live_detected_process_is_rechecked_before_any_stop() {
         let mut t = SwitchTest::new("observed-process");
+        let (client, _peer) = super::super::tests::client(&mut t.server);
+        t.server.switches.get_mut(&1).unwrap().client = Some(client);
         let program = t.dir.join("claude");
         crate::testing::write_script(&program, "#!/bin/sh\nwhile IFS= read -r line; do :; done\n");
         let from = t.server.switches[&1].from.clone();
@@ -2526,12 +2558,12 @@ mod tests {
             cwd: Some(t.dir.clone()),
             ..Default::default()
         };
-        let mut pane = crate::pane::Pane::spawn(1, None, spec, 80, 24, &t.server.env, &t.server.tx).unwrap();
-        pane.agent.kind = Some("claude".into());
+        let pane = crate::pane::Pane::spawn(1, None, spec, 80, 24, &t.server.env, &t.server.tx).unwrap();
         t.server.panes.insert(1, pane);
         let started = Instant::now();
         let observed = loop {
-            if let Some(a) = t.server.observed_agent(1) {
+            t.server.tick(Instant::now());
+            if let Ok(Some(a)) = t.server.observed_agent(1) {
                 break a;
             }
             assert!(started.elapsed() < crate::testing::PATIENCE);
@@ -2539,15 +2571,59 @@ mod tests {
         };
         assert_eq!(observed.account.id, from.id);
         assert_eq!(observed.session, "session");
+        assert!(!t.server.panes[&1].agent.hooked);
+        t.server.refresh_observed_accounts();
+        assert_eq!(t.server.pane_account(1).unwrap().id, from.id);
+        // A failed detection between scans must not forget the kind needed to verify the account.
+        t.server.last_scan = Instant::now();
+        crate::process::FAIL_ARGV.with(|fail| fail.set(true));
+        t.server.tick(t.server.last_scan);
+        assert!(!crate::process::FAIL_ARGV.with(|fail| fail.get()));
+        assert_eq!(t.server.panes[&1].agent.kind.as_deref(), Some("claude"));
+        // The scan also keeps the cached label when both process reads fail.
+        crate::process::FAIL_ARGV.with(|fail| fail.set(true));
+        crate::process::FAIL_COMMAND_ENV.with(|fail| fail.set(true));
+        t.server.last_scan = Instant::now() - super::super::SCAN_EVERY;
+        t.server.tick(Instant::now());
+        assert!(!crate::process::FAIL_ARGV.with(|fail| fail.get()));
+        assert!(!crate::process::FAIL_COMMAND_ENV.with(|fail| fail.get()));
+        assert_eq!(t.server.pane_account(1).unwrap().id, from.id, "an unreadable process keeps its account");
+        let switch = t.server.switches.remove(&1).unwrap();
+        crate::process::FAIL_COMMAND_ENV.with(|fail| fail.set(true));
+        assert!(matches!(t.server.change_account_mode(client, 1), Mode::Normal));
+        assert_eq!(t.server.pane_account(1).unwrap().id, from.id);
+        crate::process::FAIL_COMMAND_ENV.with(|fail| fail.set(true));
+        assert_eq!(
+            t.server.begin_switch(1, &switch.to, Some(client), false, false).unwrap_err().to_string(),
+            PROCESS_UNVERIFIED
+        );
+        assert!(t.server.switches.is_empty());
+        t.server.switches.insert(1, switch);
         let hold = t.server.panes[&1].process_hold();
         let s = t.server.switches.get_mut(&1).unwrap();
         s.process = hold;
-        s.observed = Some(ObservedAgent { started: observed.started.wrapping_add(1), ..observed });
+        s.observed = Some(observed.clone());
+        crate::process::FAIL_COMMAND_ENV.with(|fail| fail.set(true));
+        let result = t.server.prepare_switch(1, true);
+        assert!(result.unwrap_err().to_string().contains("Could not verify the running agent"));
+        assert_eq!(t.server.switches[&1].stage, SwitchStage::Checking);
+        assert!(crate::process::still_running(observed.pid, observed.started));
+        t.server.switches.get_mut(&1).unwrap().observed =
+            Some(ObservedAgent { started: observed.started.wrapping_add(1), ..observed });
         let result = t.server.prepare_switch(1, true);
         assert!(result.unwrap_err().to_string().contains("Can't switch this process."));
         let pid = t.server.panes[&1].pid().unwrap();
         assert!(crate::process::running(pid as libc::pid_t));
+        crate::process::FAIL_COMMAND_ENV.with(|fail| fail.set(true));
+        t.server.switch_failed(1, PROCESS_UNVERIFIED, false);
+        assert!(matches!(
+            &t.server.clients[&client].mode,
+            Mode::Confirm(q) if matches!(q.action, ConfirmAction::RetryAccountSwitch { .. })
+        ));
         t.server.panes.get_mut(&1).unwrap().kill();
+        t.until("the agent exits", |t| t.server.panes[&1].exit_code.is_some());
+        t.server.refresh_observed_accounts();
+        assert!(t.server.pane_account(1).is_none(), "an ended pane must lose the cached account");
     }
 
     #[test]
@@ -2591,10 +2667,12 @@ while IFS= read -r line; do :; done
         let pane = t.server.panes.get_mut(&1).unwrap();
         pane.agent.kind = Some("claude".into());
         pane.write_input(b"(cd \"$PROJECT_B\"; exec \"$FAKE_AGENT\" --resume session)\n".to_vec());
+        let mut observed = None;
         t.until("the shell's foreground agent is observed", |t| {
-            t.dir.join("child").exists() && t.server.observed_agent(1).is_some()
+            observed = t.server.observed_agent(1).ok().flatten();
+            t.dir.join("child").exists() && observed.is_some()
         });
-        let observed = t.server.observed_agent(1).unwrap();
+        let observed = observed.unwrap();
         assert_eq!(observed.cwd, project);
         assert_eq!(t.server.panes[&1].current_cwd(), Some(t.dir.clone()));
         t.server.begin_switch(1, &to, Some(99), false, false).unwrap();

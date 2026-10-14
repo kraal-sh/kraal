@@ -1515,6 +1515,15 @@ mod tests {
         serde_json::from_slice(&data).unwrap()
     }
 
+    fn read_without_resize(peer: &mut Reader) -> ClientMsg {
+        loop {
+            match read(peer) {
+                ClientMsg::Resize { .. } => {}
+                message => return message,
+            }
+        }
+    }
+
     fn dropped_file(name: &str) -> std::path::PathBuf {
         let path = std::env::temp_dir().join(format!("kraal-pasted-{name}-{}", std::process::id()));
         std::fs::write(&path, b"abc").unwrap();
@@ -1812,21 +1821,20 @@ mod tests {
                         .unwrap()
                 };
                 client.keys(b"\r");
-                let files = loop {
-                    match read(&mut peer) {
-                        ClientMsg::AttachmentStart { files, .. } => break files,
-                        ClientMsg::Resize { .. } => {}
-                        _ => panic!("image did not use attachment transport"),
-                    }
+                let ClientMsg::AttachmentStart { files, .. } = read_without_resize(&mut peer) else {
+                    panic!("image did not use attachment transport")
                 };
                 assert_eq!(files.len(), 1);
                 assert_eq!(files[0].name, "clipboard.png");
                 assert_eq!(files[0].size, 8);
+                // Redraws share the writer with the upload worker, including between acknowledgements.
+                send(&client.writer, &ClientMsg::Resize { cols: 90, rows: 30 }).unwrap();
                 client.message(ServerMsg::AttachmentAck { token: token.clone(), received: 0 });
-                let ClientMsg::AttachmentChunk { data, .. } = read(&mut peer) else { panic!() };
+                let ClientMsg::AttachmentChunk { data, .. } = read_without_resize(&mut peer) else { panic!() };
                 assert_eq!(base64::engine::general_purpose::STANDARD.decode(data).unwrap(), b"\x89PNG\r\n\x1a\n");
+                send(&client.writer, &ClientMsg::Resize { cols: 91, rows: 30 }).unwrap();
                 client.message(ServerMsg::AttachmentAck { token: token.clone(), received: 8 });
-                assert!(matches!(read(&mut peer), ClientMsg::AttachmentFinish { .. }));
+                assert!(matches!(read_without_resize(&mut peer), ClientMsg::AttachmentFinish { .. }));
                 if attempt == 0 {
                     client.message(ServerMsg::AttachmentResult {
                         kind: NoticeKind::Error,
@@ -1834,13 +1842,13 @@ mod tests {
                         message: "Transfer interrupted. Choose Retry to try again.".into(),
                         pasted: false,
                     });
-                    assert!(matches!(read(&mut peer), ClientMsg::Resize { .. }));
                     assert_eq!(client.state.lock().unwrap().view("server").unwrap().buttons, ["Retry", "Close"]);
                     let reads = std::fs::read_to_string(&log).unwrap();
                     client.keys(b"\t\r");
-                    assert!(matches!(read(&mut peer), ClientMsg::AttachmentDismiss { .. }));
-                    let ClientMsg::AttachmentRequest { token, image: true, .. } = read(&mut peer) else { panic!() };
-                    assert!(matches!(read(&mut peer), ClientMsg::Resize { .. }));
+                    assert!(matches!(read_without_resize(&mut peer), ClientMsg::AttachmentDismiss { .. }));
+                    let ClientMsg::AttachmentRequest { token, image: true, .. } = read_without_resize(&mut peer) else {
+                        panic!()
+                    };
                     client.message(ServerMsg::AttachmentPrepared {
                         token,
                         target: "pane".into(),
@@ -2701,10 +2709,10 @@ mod tests {
                 limits: Default::default(),
             });
             client.keys(format!("{}\r", path.display()).as_bytes());
-            while !matches!(read(&mut peer), ClientMsg::AttachmentStart { .. }) {}
+            assert!(matches!(read_without_resize(&mut peer), ClientMsg::AttachmentStart { .. }));
             if acknowledge_start {
                 client.message(ServerMsg::AttachmentAck { token: "ab".into(), received: 0 });
-                while !matches!(read(&mut peer), ClientMsg::AttachmentChunk { .. }) {}
+                assert!(matches!(read_without_resize(&mut peer), ClientMsg::AttachmentChunk { .. }));
             }
             let started = Instant::now();
             loop {

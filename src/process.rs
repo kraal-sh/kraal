@@ -29,6 +29,10 @@ impl SessionOwner {
 
 /// The command line of a process; `None` when it cannot be read, or is empty (a kernel thread).
 pub fn argv(pid: u32) -> Option<Vec<String>> {
+    #[cfg(test)]
+    if FAIL_ARGV.with(|fail| fail.replace(false)) {
+        return None;
+    }
     let (argv, _) = imp::args_and_env(pid)?;
     (!argv.is_empty()).then_some(argv)
 }
@@ -40,6 +44,10 @@ pub fn environ(pid: u32, names: &[&str]) -> HashMap<String, String> {
 
 /// Read the command and selected environment together; unreadable is not an empty environment.
 pub fn command_env(pid: u32, names: &[&str]) -> Option<(Vec<String>, HashMap<String, String>)> {
+    #[cfg(test)]
+    if FAIL_COMMAND_ENV.with(|fail| fail.replace(false)) {
+        return None;
+    }
     #[cfg(target_os = "linux")]
     let (argv, env) = (
         nul_strings(&std::fs::read(format!("/proc/{pid}/cmdline")).ok()?),
@@ -55,6 +63,12 @@ pub fn command_env(pid: u32, names: &[&str]) -> Option<(Vec<String>, HashMap<Str
         })
         .collect();
     Some((argv, env))
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static FAIL_ARGV: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    pub(crate) static FAIL_COMMAND_ENV: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// The working directory of a process; `None` when the system does not show it (a process of
@@ -191,22 +205,36 @@ pub fn session_members(sid: libc::pid_t) -> Vec<libc::pid_t> {
     if sid <= 1 {
         return Vec::new();
     }
-    imp::session_members(sid)
+    imp::session_parents(sid).into_iter().map(|(pid, _)| pid).collect()
 }
 
 /// Whether stopping this terminal would affect only its shell and the foreground agent's children.
-pub fn sole_foreground_job(leader: u32, foreground: u32) -> bool {
-    sole_foreground_job_in(leader, foreground, session_members(leader as libc::pid_t))
+/// `None` means the process table could not establish the ancestry of every member.
+pub fn sole_foreground_job(leader: u32, foreground: u32) -> Option<bool> {
+    sole_foreground_job_in(leader, foreground, imp::session_parents(leader as libc::pid_t))
 }
 
-fn sole_foreground_job_in(leader: u32, foreground: u32, members: Vec<libc::pid_t>) -> bool {
-    members.contains(&(leader as libc::pid_t))
-        && members.contains(&(foreground as libc::pid_t))
-        && members.into_iter().all(|pid| {
-            // A short-lived child may be reaped between listing the session and reading its
-            // ancestry. Only a process that is still there can be an unrelated job we must keep.
-            pid as u32 == leader || lineage(pid as u32).contains(&foreground) || !exists(pid)
-        })
+fn sole_foreground_job_in(leader: u32, foreground: u32, members: Vec<(libc::pid_t, u32)>) -> Option<bool> {
+    // Keep the parents read with the session membership. A child's ancestry may no longer be
+    // readable after it exits, even while kill(pid, 0) still sees its unreaped process on macOS.
+    let parents: HashMap<_, _> = members.into_iter().map(|(pid, parent)| (pid as u32, parent)).collect();
+    if !parents.contains_key(&leader) || !parents.contains_key(&foreground) {
+        return None;
+    }
+    for &pid in parents.keys().filter(|&&pid| pid != leader) {
+        let mut next = pid;
+        let mut seen = HashSet::new();
+        while next != foreground {
+            if next == leader || next <= 1 {
+                return Some(false);
+            }
+            if !seen.insert(next) {
+                return None;
+            }
+            next = *parents.get(&next)?;
+        }
+    }
+    Some(true)
 }
 
 /// The jobs left in the background of the terminal of the session `leader` leads (a shell's
@@ -379,7 +407,7 @@ mod imp {
         !matches!(stat[end + 1..].iter().find(|b| !b.is_ascii_whitespace()), Some(b'Z' | b'X'))
     }
 
-    pub fn session_members(sid: libc::pid_t) -> Vec<libc::pid_t> {
+    pub fn session_parents(sid: libc::pid_t) -> Vec<(libc::pid_t, u32)> {
         let Ok(dir) = std::fs::read_dir("/proc") else { return Vec::new() };
         dir.filter_map(|e| e.ok())
             .filter_map(|e| {
@@ -390,7 +418,8 @@ mod imp {
                 let fields: Vec<&[u8]> =
                     stat[end + 1..].split(u8::is_ascii_whitespace).filter(|f| !f.is_empty()).take(4).collect();
                 let session = std::str::from_utf8(fields.get(3)?).ok()?.parse::<libc::pid_t>().ok()?;
-                (session == sid && !matches!(fields[0], b"Z" | b"X")).then_some(pid)
+                let parent = std::str::from_utf8(fields.get(1)?).ok()?.parse().ok()?;
+                (session == sid && !matches!(fields[0], b"Z" | b"X")).then_some((pid, parent))
             })
             .collect()
     }
@@ -616,7 +645,7 @@ mod imp {
         (n == size).then_some(info)
     }
 
-    pub fn session_members(sid: libc::pid_t) -> Vec<libc::pid_t> {
+    pub fn session_parents(sid: libc::pid_t) -> Vec<(libc::pid_t, u32)> {
         let mut pids = vec![0 as libc::pid_t; 8192];
         let size = (pids.len() * std::mem::size_of::<libc::pid_t>()) as libc::c_int;
         // SAFETY: the buffer is `size` bytes long; unused entries stay 0.
@@ -627,7 +656,10 @@ mod imp {
             .filter(|p| *p > 0)
             // SAFETY: getsid only reads the process table.
             .filter(|p| unsafe { libc::getsid(*p) } == sid)
-            .filter(|p| short_info(*p).is_some_and(|info| info.pbsi_status != libc::SZOMB))
+            .filter_map(|p| {
+                let info = short_info(p)?;
+                (info.pbsi_status != libc::SZOMB).then_some((p, info.pbsi_ppid))
+            })
             .collect()
     }
 
@@ -781,25 +813,22 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_foreground_check_allows_a_member_that_disappeared_after_the_session_was_listed() {
-        use std::process::{Command, Stdio};
-
-        let waiting = || Command::new("sh").args(["-c", "read line"]).stdin(Stdio::piped()).spawn().unwrap();
-        let mut foreground = waiting();
-        let mut other = waiting();
-        let leader = std::process::id();
-        let members = vec![leader as libc::pid_t, foreground.id() as libc::pid_t, other.id() as libc::pid_t];
-        let only_foreground = sole_foreground_job_in(leader, foreground.id(), members[..2].to_vec());
-        let with_other_job = sole_foreground_job_in(leader, foreground.id(), members.clone());
-        // Keep the list, but let a process in it exit and be reaped before its ancestry is read.
-        drop(other.stdin.take());
-        other.wait().unwrap();
-        let after_exit = sole_foreground_job_in(leader, foreground.id(), members);
-        drop(foreground.stdin.take());
-        foreground.wait().unwrap();
-        assert!(only_foreground);
-        assert!(!with_other_job, "a live unrelated job must still prevent switching");
-        assert!(after_exit, "a process that no longer exists cannot be stopped by switching");
+    fn a_foreground_check_uses_the_parents_read_with_the_session() {
+        let members = vec![(10, 1), (20, 10), (30, 20), (40, 30)];
+        assert_eq!(sole_foreground_job_in(10, 20, members.clone()), Some(true));
+        let mut unrelated = members.clone();
+        unrelated.push((50, 10));
+        assert_eq!(sole_foreground_job_in(10, 20, unrelated), Some(false));
+        let mut missing_parent = members.clone();
+        missing_parent.retain(|&(pid, _)| pid != 30);
+        assert_eq!(sole_foreground_job_in(10, 20, missing_parent), None);
+        let mut missing_foreground = members.clone();
+        missing_foreground.retain(|&(pid, _)| pid != 20);
+        assert_eq!(sole_foreground_job_in(10, 20, missing_foreground), None);
+        let mut cycle = members;
+        cycle.push((50, 60));
+        cycle.push((60, 50));
+        assert_eq!(sole_foreground_job_in(10, 20, cycle), None);
     }
 
     #[test]

@@ -1518,8 +1518,9 @@ impl Server {
             {
                 read_contexts |= contexts::observe_tools(&self.config.contexts, pane, a);
             }
-            let agent = argv.as_deref().and_then(detect_agent);
-            let mut moved = pane.agent.set_process(agent, crate::process::still_running);
+            // An unreadable command says nothing about whether the last detected agent is gone.
+            let mut moved =
+                argv.as_deref().is_some_and(|a| pane.agent.set_process(detect_agent(a), crate::process::still_running));
             if pane.agent.kind.is_some() {
                 let screen = pane.live_text();
                 let quiet = pane.last_output.elapsed();
