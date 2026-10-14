@@ -1,6 +1,39 @@
-//! Migration of pre-0.4 accounts and usage. Remove this module in 0.5.0.
+//! Temporary 0.4 migration, including the files that must be bound before accounts change.
+//!
+//! In 0.5.0 remove this module and its hooks (legacy ID synthesis, empty TOML sections, backups,
+//! usage copying and fallback reads, and `before_account_change`), `persist::migration`
+//! (legacy session conversion, backups and saved reference rewriting), `workspace::migration`
+//! (external KDL binding), and their migration tests. Keep ordinary account resolution,
+//! retained references and homes, `WorkspaceSnap::bind_accounts`, and
+//! `workspace::bind_source_accounts`: current operations still use them.
 
 use super::*;
+
+/// Bind names while they still identify the accounts from before the change. A failure
+/// must reach the caller before it publishes accounts.toml.
+pub(super) fn before_account_change(previous: &Accounts) -> Result<()> {
+    if previous.path == Accounts::path() {
+        for a in previous.known() {
+            migrate_usage(&usage_dir(), &a)?;
+        }
+        crate::persist::migration::bind_accounts(previous).context(
+            "could not migrate saved account references; accounts.toml is unchanged; check the saved session and retry",
+        )?;
+        for dir in crate::config::Config::load()?.workspace_dirs() {
+            for (file, definition) in crate::workspace::load_dir(&dir) {
+                if definition.is_ok() {
+                    crate::workspace::migration::bind_accounts(&file, previous).with_context(|| {
+                        format!(
+                            "could not migrate {}; accounts.toml is unchanged; check this file and retry",
+                            file.display()
+                        )
+                    })?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
 
 pub(super) fn identify(file: &mut File) {
     for account in file.accounts.iter_mut().chain(&mut file.forgotten) {

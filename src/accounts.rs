@@ -14,7 +14,6 @@ use serde::{Deserialize, Serialize};
 use crate::paths;
 
 mod migration;
-use migration::{legacy_usage_name, migrate_usage};
 
 /// How kraal runs one kind of agent.
 #[derive(Debug, Clone, Copy)]
@@ -498,25 +497,7 @@ impl Accounts {
             let out = f(&mut all)?;
             all.bind_rules();
             if joined || all.text()? != before {
-                if path == Self::path() {
-                    for a in previous.known() {
-                        migrate_usage(&usage_dir(), &a)?;
-                    }
-                    crate::persist::bind_accounts(&previous)
-                        .context("could not migrate saved account references; accounts.toml is unchanged; check the saved session and retry")?;
-                    for dir in crate::config::Config::load()?.workspace_dirs() {
-                        for (file, definition) in crate::workspace::load_dir(&dir) {
-                            if definition.is_ok() {
-                                crate::workspace::bind_accounts(&file, &previous).with_context(|| {
-                                    format!(
-                                        "could not migrate {}; accounts.toml is unchanged; check this file and retry",
-                                        file.display()
-                                    )
-                                })?;
-                            }
-                        }
-                    }
-                }
+                migration::before_account_change(&previous)?;
                 all.save()?;
             }
             Ok(out)
@@ -1126,7 +1107,7 @@ fn rename_in(file: &Path, usage: &Path, agent: &str, old: &str, new: &str) -> Re
     Accounts::update_at(file, |all| {
         let a = all.get(agent, old).with_context(|| missing_account(agent, old))?;
         all.rename(agent, old, new)?;
-        migrate_usage(usage, &a)
+        migration::migrate_usage(usage, &a)
     })
 }
 
@@ -2015,11 +1996,11 @@ impl UsageMap {
         let mut usage = UsageMap::default();
         for a in accounts.known() {
             let Some(target) = accounts.by_id(&a.id) else { continue };
-            let _ = migrate_usage(dir, &a);
+            let _ = migration::migrate_usage(dir, &a);
             if let Some(u) = load_usage(dir, &a.agent, &a.id) {
                 usage.observe(&target, u);
             }
-            if let Some(name) = legacy_usage_name(&a)
+            if let Some(name) = migration::legacy_usage_name(&a)
                 && let Ok(bytes) = std::fs::read(dir.join(usage_file(&a.agent, name)))
                 && let Ok(u) = serde_json::from_slice(&bytes)
             {
@@ -3500,7 +3481,7 @@ mod tests {
         all.bind_pane(&mut pane);
         let definition = dir.join("w.kdl");
         std::fs::write(&definition, "layout { pane agent=\"claude:default\" }\n").unwrap();
-        crate::workspace::bind_accounts(&definition, &all).unwrap();
+        crate::workspace::migration::bind_accounts(&definition, &all).unwrap();
         std::fs::write(
             dir.join("claude-default.json"),
             serde_json::to_vec(&Usage {
@@ -3510,7 +3491,7 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
-        migrate_usage(&dir, &old).unwrap();
+        migration::migrate_usage(&dir, &old).unwrap();
         let adopted = all.add(Account { id: new_uuid(), name: "personal".into(), ..old.clone() }).unwrap();
         assert_eq!(adopted.id, old.id, "callers get the adopted identity too");
         assert_eq!(all.for_agent("claude"), std::slice::from_ref(&adopted));
