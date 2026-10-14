@@ -324,7 +324,7 @@ pub fn write_atomic(path: &Path, data: &[u8]) -> std::io::Result<()> {
 
 /// The bytes and resolved destination a file operation was prepared against. A confirmation
 /// must not authorize a new file reached through a changed symlink or a replaced directory.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct FileRevision {
     pub target: PathBuf,
     pub bytes: Option<Vec<u8>>,

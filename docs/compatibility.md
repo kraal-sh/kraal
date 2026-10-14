@@ -71,6 +71,13 @@ needed. Copies stay in `sessions-v2`; the 0.2.0 and 0.3.0 paths and migration ba
 Clients from those releases can use Duplicate on a current server. An older running server
 keeps its existing actions until restarted.
 
+Import and Export use new requests gated by the `workspace_files` capability. Older running
+servers refuse them with the usual restart guidance. `kraal save` keeps its existing wire request,
+name rules and account references, and now explains that it exports KDL. Current servers refuse
+unconfirmed replacements, including unchanged sources; old servers retain their own behavior.
+No new session format is introduced. Imported source bytes and export listing exclusions use
+existing version 2 fields, leaving all legacy state paths untouched.
+
 ## For contributors: how the protocol changes
 
 The client and the server exchange JSON messages (`src/protocol.rs`, whose comments hold the

@@ -994,6 +994,57 @@ while IFS= read -r line; do :; done
     }
 
     #[test]
+    fn exporting_a_restored_unopened_source_keeps_its_account_recipe_through_restart() {
+        let (tx, _rx) = super::super::queue::channel(4096);
+        let mut server = super::super::tests::server(tx.clone());
+        let path = source(&mut server);
+        let original = "layout { pane agent=\"claude:work\" start_suspended=true; }\n";
+        std::fs::write(&path, original).unwrap();
+        let account = server
+            .accounts
+            .add(crate::accounts::Account {
+                id: crate::accounts::new_uuid(),
+                name: "work".into(),
+                home: path.parent().unwrap().join("work").display().to_string(),
+                ..server.accounts.get("claude", "default").unwrap()
+            })
+            .unwrap();
+        let accounts = server.accounts.clone();
+        writer(&mut server, vec![]);
+        let identity = server.delete_workspace_source(&path).unwrap();
+        let ws = server.restore_deleted_workspace(&identity, "api").unwrap();
+        server.accounts = accounts.clone();
+        let wi = server.ws_index(ws).unwrap();
+        let retained = server.workspaces[wi].kept.as_ref().unwrap().definition_source.clone().unwrap();
+        let save = server.prepare_layout_export(wi, &path).unwrap();
+        assert!(save.question.is_some());
+        server.write_definition(wi, "api", &save).unwrap();
+        assert!(server.panes.is_empty());
+        let exported = std::fs::read_to_string(&path).unwrap();
+        assert!(exported.contains("agent=\"claude\""));
+        assert!(!exported.contains(&account.id));
+        assert!(!exported.contains("claude:work"));
+        assert_eq!(std::fs::read_to_string(path.with_extension("kdl.bak")).unwrap(), original);
+        assert_eq!(server.workspaces[wi].definition_source.as_deref(), Some(exported.as_str()));
+        let bytes = serde_json::to_vec(&persist::snapshot(&server)).unwrap();
+        let mut recovered = super::super::tests::server(tx);
+        recovered.accounts = accounts;
+        recovered.apply_snapshot(serde_json::from_slice(&bytes).unwrap()).unwrap();
+        assert!(recovered.panes.is_empty());
+        let wi = recovered.workspaces.iter().position(|w| w.stable_id == identity).unwrap();
+        assert_eq!(
+            recovered.workspaces[wi].kept.as_ref().unwrap().definition_source.as_deref(),
+            Some(retained.as_str())
+        );
+        recovered.reopen_workspace(recovered.workspaces[wi].id).unwrap();
+        let pane = recovered.panes.values().next().unwrap();
+        assert!(pane.suspended);
+        assert_eq!(pane.spec.account_id.as_deref(), Some(account.id.as_str()));
+        assert_eq!(pane.spec.account.as_deref(), Some("claude:work"));
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
     fn restoring_with_a_reused_name_and_source_keeps_the_replacements_ownership() {
         // Saving uses the default workspace directory. Give it its own home so other
         // tests scanning their sources never see these files.
@@ -1052,7 +1103,9 @@ while IFS= read -r line; do :; done
             assert_eq!(std::fs::read_to_string(&path).unwrap(), replaced);
             let ri = server.ws_index(replacement).unwrap();
             // The saved link resolves directory aliases, including macOS's /tmp.
-            assert_eq!(server.save_definition(ri, &name).unwrap(), path.canonicalize().unwrap());
+            let save = server.prepare_definition_save(ri, &name).unwrap();
+            assert!(save.question.is_some());
+            assert_eq!(server.write_definition(ri, &name, &save).unwrap(), path.canonicalize().unwrap());
             server.reopen_workspace(restored).unwrap();
             assert_eq!(server.workspaces[wi].counts(), (1, 1));
             assert_eq!(server.panes[&server.workspaces[wi].panes()[0]].spec.command, ["sleep", "60"]);

@@ -69,7 +69,9 @@ pub const ACCOUNT_IDS: Feature =
 pub const STATE_V2: Feature =
     Feature { name: "state_v2", does: "save sessions in the version 2 format", check_first: false };
 /// What this kraal's server lists.
-pub const FEATURES: [Feature; 5] = [LIST_AGENTS, BUFFERS, EDIT_SUDO, ACCOUNT_IDS, STATE_V2];
+pub const WORKSPACE_FILES: Feature =
+    Feature { name: "workspace_files", does: "preview imports and export layouts safely", check_first: false };
+pub const FEATURES: [Feature; 6] = [LIST_AGENTS, BUFFERS, EDIT_SUDO, ACCOUNT_IDS, STATE_V2, WORKSPACE_FILES];
 
 /// The names of this kraal's server features, as it lists them.
 pub fn feature_names() -> Vec<String> {
@@ -464,6 +466,26 @@ pub enum Request {
         workspace: Option<String>,
         name: Option<String>,
     },
+    ImportWorkspace {
+        path: PathBuf,
+        name: Option<String>,
+        expected: Option<crate::paths::FileRevision>,
+        #[serde(default)]
+        accounts: Vec<(String, String)>,
+    },
+    ExportWorkspace {
+        workspace: Option<String>,
+        #[serde(default)]
+        identity: Option<String>,
+        path: PathBuf,
+        expected: Option<crate::paths::FileRevision>,
+    },
+    /// Publish a batch import while the server holds workspace ownership stable.
+    PublishWorkspaceFile {
+        path: PathBuf,
+        source: String,
+        expected: crate::paths::FileRevision,
+    },
     /// The paste buffers, newest first.
     BufferList,
     /// A buffer's text: by number (0 is the newest numbered buffer) or name; the newest without.
@@ -509,6 +531,9 @@ impl Request {
     /// oldest supported release does.
     pub fn needs(&self) -> Option<Feature> {
         match self {
+            Request::ImportWorkspace { .. }
+            | Request::ExportWorkspace { .. }
+            | Request::PublishWorkspaceFile { .. } => Some(WORKSPACE_FILES),
             Request::ListAgents => Some(LIST_AGENTS),
             Request::OpenAgent { account_id: Some(_), .. } => Some(ACCOUNT_IDS),
             Request::BufferList
@@ -584,6 +609,13 @@ pub enum Response {
         token: String,
     },
     Path(PathBuf),
+    ImportPreview(crate::workspace::ImportPreview),
+    ExportPreview {
+        identity: String,
+        path: PathBuf,
+        revision: crate::paths::FileRevision,
+        question: Option<String>,
+    },
     Tunnels(Vec<crate::server::net::TunnelInfo>),
     Buffers(Vec<BufferInfo>),
     /// An answer from a newer server, or one this kraal cannot read (only ever read).
@@ -823,6 +855,24 @@ mod tests {
         let wire = serde_json::to_value(request).unwrap();
         assert_eq!(wire["account"], "work");
         assert_eq!(wire["account_id"], "stable");
+    }
+
+    #[test]
+    fn file_transfer_requests_require_the_new_capability_and_old_save_still_reads() {
+        for value in [
+            serde_json::json!({"cmd": "import_workspace", "path": "/layout.kdl", "name": null, "expected": null}),
+            serde_json::json!({"cmd": "export_workspace", "path": "/layout.kdl", "workspace": null, "expected": null}),
+        ] {
+            let request: Request = serde_json::from_value(value.clone()).unwrap();
+            assert_eq!(request.needs(), Some(WORKSPACE_FILES));
+            assert_eq!(serde_json::to_value(request).unwrap()["cmd"], value["cmd"]);
+        }
+        let old: Request =
+            serde_json::from_value(serde_json::json!({"cmd": "save_workspace", "workspace": "api", "name": null}))
+                .unwrap();
+        assert!(matches!(old, Request::SaveWorkspace { .. }));
+        assert_eq!(old.needs(), None);
+        assert!(feature_names().contains(&WORKSPACE_FILES.name.to_string()));
     }
 
     #[test]

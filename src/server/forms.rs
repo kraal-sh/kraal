@@ -282,17 +282,20 @@ pub(super) fn draw_buttons(
         );
     };
     button(buf, layout.cancel, &buttons.cancel);
+    let cancel = buttons.cancel.label;
     let footer = if pending.is_some() {
-        "Esc Cancel".into()
+        format!("Esc {cancel}")
     } else {
         button(buf, layout.primary, &buttons.primary);
         if let Some((area, alternate)) = layout.alternate.zip(buttons.alternate.as_ref()) {
             button(buf, area, alternate);
         }
         if layout.max_scroll > 0 {
-            format!("Enter {verb} · Tab Next · PgUp/PgDn Scroll · Esc Cancel")
+            format!("Enter {verb} · Tab Next · PgUp/PgDn Scroll · Esc {cancel}")
+        } else if layout.fields.is_empty() {
+            format!("Enter {verb} · Tab Next · Esc {cancel}")
         } else {
-            format!("Enter {verb} · Tab Next field · Esc Cancel")
+            format!("Enter {verb} · Tab Next field · Esc {cancel}")
         }
     };
     buf.set_stringn(

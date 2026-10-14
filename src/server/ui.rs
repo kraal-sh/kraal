@@ -563,12 +563,21 @@ impl Picker {
             (_, A::AddAccount) => &[("enter", "Add account")],
             (K::Workspace, A::RetryWorkspaceClose(_)) => &[("enter", "Retry Close")],
             (K::Workspace, A::RetryWorkspaceDelete(_)) => &[("enter", "Retry Delete")],
-            (K::Workspace, A::ReopenWorkspace(_)) => {
-                &[("enter", "Open"), ("ctrl+r", "Rename"), ("", "Duplicate"), ("", "Delete")]
-            }
-            (K::Workspace, A::SwitchWorkspace(_)) => {
-                &[("enter", "Open"), ("ctrl+r", "Rename"), ("", "Duplicate"), ("ctrl+x", "Close"), ("", "Delete")]
-            }
+            (K::Workspace, A::ReopenWorkspace(_)) => &[
+                ("enter", "Open"),
+                ("ctrl+r", "Rename"),
+                ("", "Duplicate"),
+                ("ctrl+s", "Export layout"),
+                ("", "Delete"),
+            ],
+            (K::Workspace, A::SwitchWorkspace(_)) => &[
+                ("enter", "Open"),
+                ("ctrl+r", "Rename"),
+                ("", "Duplicate"),
+                ("ctrl+x", "Close"),
+                ("ctrl+s", "Export layout"),
+                ("", "Delete"),
+            ],
             (_, A::OpenDefinition(_)) => &[("enter", "Open"), ("", "Delete")],
             (_, A::DeletedWorkspaces) => &[("enter", "View")],
             (_, A::RestoreWorkspace(_)) => &[("enter", "Restore")],
@@ -688,7 +697,8 @@ pub enum PromptAction {
     /// The value is the new workspace's name.
     NewWorkspace,
     OpenPreview,
-    SaveWorkspace(u32),
+    ExportWorkspace(u32),
+    ImportWorkspace,
     /// Files dropped on an SSH pane: the value is the destination. Cancelling pastes `raw`.
     Upload {
         paths: Vec<std::path::PathBuf>,
@@ -739,7 +749,8 @@ impl PromptAction {
             PromptAction::RestoreWorkspace(_) => "restore",
             PromptAction::DuplicateWorkspace(_) => "duplicate",
             PromptAction::OpenPreview => "open",
-            PromptAction::SaveWorkspace(_) => "save",
+            PromptAction::ExportWorkspace(_) => "export",
+            PromptAction::ImportWorkspace => "add",
             PromptAction::Upload { .. } | PromptAction::UploadPick { .. } => "upload",
             PromptAction::Download => "download",
             PromptAction::Commit { .. } => "commit",
@@ -761,7 +772,7 @@ pub struct Prompt {
     pub scroll: usize,
     /// What is typed is not shown (a secret).
     pub masked: bool,
-    pub workspace_form: Option<super::workspace_ui::WorkspaceForm>,
+    pub workspace_form: Option<Box<super::workspace_ui::WorkspaceForm>>,
 }
 
 impl Prompt {
@@ -776,8 +787,10 @@ impl Prompt {
                     | PromptAction::RenameWorkspace(_)
                     | PromptAction::DuplicateWorkspace(_)
                     | PromptAction::RestoreWorkspace(_)
+                    | PromptAction::ImportWorkspace
+                    | PromptAction::ExportWorkspace(_)
             )
-            .then(super::workspace_ui::WorkspaceForm::default),
+            .then(|| Box::new(super::workspace_ui::WorkspaceForm::default())),
             action,
             error: None,
             scroll: 0,
@@ -1146,7 +1159,14 @@ mod tests {
             (
                 PickerKind::Workspace,
                 PickAction::SwitchWorkspace(1),
-                &[("enter", "Open"), ("ctrl+r", "Rename"), ("", "Duplicate"), ("ctrl+x", "Close"), ("", "Delete")],
+                &[
+                    ("enter", "Open"),
+                    ("ctrl+r", "Rename"),
+                    ("", "Duplicate"),
+                    ("ctrl+x", "Close"),
+                    ("ctrl+s", "Export layout"),
+                    ("", "Delete"),
+                ],
             ),
             (PickerKind::Workspace, PickAction::OpenDefinition("w.kdl".into()), &[("enter", "Open"), ("", "Delete")]),
             (PickerKind::RunbookSteps, PickAction::RunBlock(0), &[("enter", "Run step"), ("ctrl+y", "Copy step")]),

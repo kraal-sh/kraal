@@ -18,7 +18,7 @@ any keyboard layout.
 |---|---|---|
 | servers | `s` connect (or a group in a grid) | `S`: `s` connect, `u` upload, `d` download, `e` edit the list |
 | broadcast | `b` typing goes to the whole tab, `b` again stops | `B`: `b` this tab, `w` the whole workspace, `m` mark this pane, `s` the marked panes, `o` stop |
-| workspaces | `w` choose one | `W`: `w` choose, `n` add, `←`/`→` previous/next, `e` rename, `s` save the layout, `r` restart the session (on the kraal installed now), `q` quit, `x` close |
+| workspaces | `w` choose one | `W`: `w` choose, `n` add, `←`/`→` previous/next, `e` rename, `s` export the layout, `r` restart the session (on the kraal installed now), `q` quit, `x` close |
 | agents | `a` start one on an account | `A`: `a` start, `l` accounts, `n` add account, `g` go to the agent needing you, `c` change account |
 | tabs | `t` new tab | `T`: `t` new, `←`/`→` previous/next, `e` rename, `x` close |
 | panes | `p` find a pane | `P`: `p` find, `n` new, `→`/`↓` split, `e` edit name, folder and command, `r` resize with the arrows, `f` floating, `l` next layout, `s` then an arrow stack with the pane on that side, `u` unstack, `x` close |
@@ -65,8 +65,8 @@ Without the prefix: `alt+arrows` move the focus (left/right at the edge go to th
 the keys of the default preset: with another preset or keys of your own, the menu, the help
 (`ctrl+b h` here) and `kraal config keys` show yours.
 
-Saving a workspace layout (`ctrl+b W s`) asks before replacing another existing file or a source
-changed outside kraal. **Cancel** is selected and returns to the entered name. A destination
+Exporting a workspace layout (`ctrl+b W s`) proposes a copy and asks before replacing any existing
+file. **Cancel** is selected and returns to the entered path. A destination
 linked to another workspace is refused. See [Saving without replacing someone else's layout](workspaces.md#saving-without-replacing-someone-elses-layout).
 
 Closing a workspace (`ctrl+b W x`, or `ctrl+x` in the workspace picker) lists its running
@@ -166,7 +166,7 @@ shown by the list; Duplicate, Move up, Move down and Delete are only in the work
 Esc closes. The footer says what Enter does on the selected line;
 only actions that apply to that line are offered. When there are no other actions, Tab moves
 to the next line. Text fields edit like a shell line (arrows, `home`/`end`,
-`alt+←→`, `ctrl+w`, `ctrl+u`, `ctrl+k`). In Add workspace, Rename workspace, Duplicate workspace and Save workspace,
+`alt+←→`, `ctrl+w`, `ctrl+u`, `ctrl+k`). In Add workspace, Rename workspace, Duplicate workspace and Export layout,
 errors wrap below the input and stay visible when moving the cursor.
 Long errors scroll with `pageup`/`pagedown` or the mouse wheel;
 the input and the keys to retry or cancel stay visible. Editing the value clears the error.
@@ -174,7 +174,8 @@ Workspace search never creates a workspace. **+ Add workspace** or `ctrl+b W n` 
 shared form; Enter or its **Add** button creates it. In Add workspace, Rename workspace and Duplicate workspace,
 Tab moves between **Name**, the action button and **Cancel**. Esc returns to the list's search
 and selection. In Workspaces, Tab or a right click offers **Rename** and **Duplicate** for an open or closed saved
-workspace, **Close** only while open, and **Delete** for a saved workspace or an unimported file.
+workspace, **Export layout** also while closed, **Close** only while open, and **Delete** for a
+saved workspace or an unimported file.
 In **Deleted workspaces**, Enter or a click restores the selected row, and Esc goes back.
 If the old name is already used, the same Name form proposes a free name and offers **Restore**.
 Questions show two buttons, Cancel first: `y` answers
@@ -268,3 +269,7 @@ read them as such. Key release events are not passed on yet.
 The account name in a pane's frame opens **Change account** too. After a change, click **Undo**
 in its message, or open **Find a pane** (`ctrl+b p`), select the pane and press Tab for
 **Undo account change**. The action remains after the message disappears.
+
+In **Add workspace**, **From file...** accepts a KDL path and previews it before **Add**.
+Imported commands and agents wait for you to start them. Export layout uses **File**; neither
+import nor export is needed to retain your personal workspace.

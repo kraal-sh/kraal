@@ -674,7 +674,7 @@ pub(super) fn draw_prompt(p: &Prompt, screen: Rect, buf: &mut Buffer) -> Option<
         buf.set_stringn(inner.x + 1, inner.y + 1 + i as u16, line, room, Style::default().fg(th().production));
     }
     let verb = if p.error.is_some()
-        && matches!(p.action, super::ui::PromptAction::NewWorkspace | super::ui::PromptAction::SaveWorkspace(_))
+        && matches!(p.action, super::ui::PromptAction::NewWorkspace | super::ui::PromptAction::ExportWorkspace(_))
     {
         "retry"
     } else {
@@ -960,13 +960,13 @@ mod tests {
     }
 
     #[test]
-    fn workspace_prompt_errors_wrap_and_keep_input_and_retry_visible_at_both_sizes() {
+    fn prompt_errors_wrap_and_keep_input_and_actions_visible_at_both_sizes() {
         use super::super::ui::PromptAction;
         let path = format!("/{}a  b.kdl", "long-日-folder/".repeat(18));
         let error = format!("Couldn't write {path}.\nPermission denied. Fix the destination and retry.");
         for (w, h) in [(80, 24), (124, 36)] {
             let area = Rect::new(0, 0, w, h);
-            for action in [PromptAction::SaveWorkspace(1)] {
+            for action in [PromptAction::OpenPreview] {
                 let mut p = Prompt::new("Workspace", " café 日 ", action);
                 p.cursor = 3;
                 let mut buf = Buffer::empty(area);
@@ -982,7 +982,7 @@ mod tests {
                 let shown = screen(&buf, area);
                 assert!(shown.contains(" café 日 "), "{shown}");
                 assert!(shown.contains("Permission denied. Fix the destination and retry."), "{shown}");
-                assert!(shown.contains("⏎ retry") && shown.contains("esc cancel"), "{shown}");
+                assert!(shown.contains("⏎ open") && shown.contains("esc cancel"), "{shown}");
                 assert!(!shown.contains("scroll"), "{shown}");
                 for (i, line) in layout.lines.iter().enumerate() {
                     let mut x = layout.area.x + 2;
@@ -1001,8 +1001,7 @@ mod tests {
     fn a_prompt_diagnostic_taller_than_the_terminal_is_readable_in_pages() {
         for (w, h) in [(80, 24), (124, 36)] {
             let area = Rect::new(0, 0, w, h);
-            let mut p =
-                Prompt::new("Save workspace layout as", "scratch", super::super::ui::PromptAction::SaveWorkspace(1));
+            let mut p = Prompt::new("Preview file", "scratch", super::super::ui::PromptAction::OpenPreview);
             p.error = Some((0..100).map(|i| format!("Diagnostic line {i}\n")).collect());
             let layout = prompt_layout(&p, area);
             assert!(layout.max_scroll > 0);
@@ -1012,7 +1011,7 @@ mod tests {
                 draw_prompt(&p, area, &mut buf);
                 let shown = screen(&buf, area);
                 assert!(shown.contains("scratch"), "{shown}");
-                assert!(shown.contains("⏎ retry · pgup/pgdn scroll · esc cancel"), "{shown}");
+                assert!(shown.contains("⏎ open · pgup/pgdn scroll · esc cancel"), "{shown}");
                 for line in layout.lines.iter().skip(start.min(layout.max_scroll)).take(layout.body as usize) {
                     assert!(shown.contains(line), "missing {line:?}: {shown}");
                 }

@@ -159,7 +159,110 @@ pub(super) fn open(s: &Session, name: String) -> Result<()> {
 pub(super) fn save(s: &Session, name: Option<String>, workspace: Option<String>) -> Result<()> {
     let workspace = workspace.or_else(|| s.own_workspace());
     if let Response::Path(p) = s.request(Request::SaveWorkspace { workspace, name })? {
+        eprintln!("Workspaces are saved automatically. `kraal save` exports a KDL layout.");
         println!("saved {}", p.display());
+    }
+    Ok(())
+}
+
+fn confirm_layout(question: &str, next: &str) -> Result<bool> {
+    use std::io::{IsTerminal, Write};
+    anyhow::ensure!(std::io::stdin().is_terminal(), "{next}");
+    eprint!("{question} [y/N] ");
+    std::io::stderr().flush()?;
+    let mut line = String::new();
+    std::io::stdin().read_line(&mut line)?;
+    Ok(matches!(line.trim(), "y" | "Y" | "yes"))
+}
+
+pub(super) fn import(s: &Session, file: PathBuf, name: Option<String>, yes: bool) -> Result<()> {
+    let path = paths::expand_tilde(&file.to_string_lossy());
+    let path = if path.is_absolute() { path } else { std::env::current_dir()?.join(path) };
+    let path = workspace::definition_path(&path);
+    // Invalid files never start a server just to report a parser error.
+    workspace::ImportPreview::read(&path)?;
+    client::ensure_server(&s.name)?;
+    let Response::ImportPreview(preview) =
+        s.request(Request::ImportWorkspace { path: path.clone(), name: None, expected: None, accounts: Vec::new() })?
+    else {
+        bail!("unexpected answer")
+    };
+    let name = name.unwrap_or_else(|| preview.definition.name.clone());
+    println!("{}\nName: {name}\n{}", path.display(), preview.summary());
+    let mut accounts = Vec::new();
+    for missing in &preview.accounts {
+        use std::io::{IsTerminal, Write};
+        anyhow::ensure!(
+            !missing.choices.is_empty(),
+            "Add a {} account with `kraal accounts add {}`, then retry. No workspace was added.",
+            missing.agent,
+            missing.agent
+        );
+        anyhow::ensure!(
+            !yes && std::io::stdin().is_terminal(),
+            "Account {} is unavailable. Run `kraal import` in a terminal without --yes to choose an account. No workspace was added.",
+            missing.reference
+        );
+        println!("Choose a {} account for {}:", missing.agent, missing.reference);
+        for (i, (_, name)) in missing.choices.iter().enumerate() {
+            println!("{}. {name}", i + 1);
+        }
+        eprint!("Choose a number (Enter cancels): ");
+        std::io::stderr().flush()?;
+        let mut line = String::new();
+        std::io::stdin().read_line(&mut line)?;
+        if line.trim().is_empty() {
+            return Ok(());
+        }
+        let index = line
+            .trim()
+            .parse::<usize>()
+            .ok()
+            .and_then(|i| i.checked_sub(1))
+            .filter(|&i| i < missing.choices.len())
+            .context("No account chosen. Retry and choose a listed number.")?;
+        accounts.push((missing.reference.clone(), missing.choices[index].0.clone()));
+    }
+    if !yes
+        && !confirm_layout(
+            "Add workspace?",
+            "No workspace was added. Run in a terminal to confirm, or use --yes to accept the preview.",
+        )?
+    {
+        return Ok(());
+    }
+    s.request(Request::ImportWorkspace { path, name: Some(name.clone()), expected: Some(preview.revision), accounts })?;
+    println!("Workspace {name} added. Commands wait for you to start them.");
+    Ok(())
+}
+
+pub(super) fn export(s: &Session, file: PathBuf, workspace: Option<String>, replace: bool) -> Result<()> {
+    let path = paths::expand_tilde(&file.to_string_lossy());
+    let path = if path.is_absolute() { path } else { std::env::current_dir()?.join(path) };
+    let workspace = workspace.or_else(|| s.own_workspace());
+    let Response::ExportPreview { identity, path, revision, question } =
+        s.request(Request::ExportWorkspace { workspace, identity: None, path, expected: None })?
+    else {
+        bail!("unexpected answer")
+    };
+    if let Some(question) = question {
+        println!("{question}");
+        if !replace
+            && !confirm_layout(
+                "Replace file?",
+                "File unchanged. Choose another file or use --replace to keep a backup and replace it.",
+            )?
+        {
+            return Ok(());
+        }
+    }
+    if let Response::Path(path) = s.request(Request::ExportWorkspace {
+        workspace: None,
+        identity: Some(identity),
+        path,
+        expected: Some(revision),
+    })? {
+        println!("Layout exported\n{}", path.display());
     }
     Ok(())
 }
@@ -265,7 +368,23 @@ fn list_definitions(session: &str, json: bool) -> Result<()> {
     print_workspaces(&list, json)
 }
 
-pub(super) fn import_zellij(from: Option<PathBuf>, force: bool) -> Result<()> {
+fn publish_import(s: &Session, path: PathBuf, source: String, expected: paths::FileRevision) -> Result<()> {
+    let _not_restarting = client::keep_from_restart(&s.name)?;
+    if let Some(_held) = paths::SessionLock::acquire(&s.name).context("locking the session")?
+        && paths::nobody_listens(&s.socket())
+    {
+        let saved = crate::persist::inspect(&s.name)?;
+        let sources =
+            saved.iter().flat_map(|s| &s.workspaces).filter_map(|w| Some((w.name.as_str(), w.definition.as_deref()?)));
+        return workspace::publish_import(&path, &source, &expected, sources);
+    }
+    match s.request(Request::PublishWorkspaceFile { path, source, expected })? {
+        Response::Ok => Ok(()),
+        _ => bail!("unexpected answer"),
+    }
+}
+
+pub(super) fn import_zellij(s: &Session, from: Option<PathBuf>, force: bool) -> Result<()> {
     let from = from.unwrap_or_else(|| paths::expand_tilde("~/.config/zellij/layouts"));
     let to = paths::workspaces_dir();
     std::fs::create_dir_all(&to)?;
@@ -274,22 +393,38 @@ pub(super) fn import_zellij(from: Option<PathBuf>, force: bool) -> Result<()> {
         let name = path.file_name().unwrap_or_default();
         match def {
             Err(e) => eprintln!("skipped {}: {e:#}", path.display()),
-            Ok(def) => {
+            Ok(_) => {
                 let dest = to.join(name);
                 if dest.exists() && !force {
                     eprintln!("skipped {} ({} exists; --force to overwrite)", path.display(), dest.display());
                     continue;
                 }
-                for w in &def.warnings {
-                    eprintln!("{}: {w}", path.display());
+                let preview = workspace::ImportPreview::read(&path)?;
+                let revision = paths::FileRevision::read(&dest)?;
+                if revision.bytes.is_some() && !force {
+                    eprintln!("skipped {} (destination appeared; retry with --force to replace it)", path.display());
+                    continue;
                 }
-                std::fs::copy(&path, &dest)?;
+                for warning in &preview.definition.warnings {
+                    eprintln!("{}: {warning}", path.display());
+                }
+                println!(
+                    "Preview: {} ({} tabs, {} panes)",
+                    path.display(),
+                    preview.definition.tabs.len(),
+                    preview.definition.panes().len()
+                );
+                let source = String::from_utf8(preview.revision.bytes.unwrap())?;
+                if let Err(e) = publish_import(s, dest.clone(), source, revision) {
+                    eprintln!("skipped {} ({e:#})", path.display());
+                    continue;
+                }
                 println!(
                     "{} → {} ({} tabs, {} panes)",
                     path.display(),
                     paths::shorten_home(&dest),
-                    def.tabs.len(),
-                    def.panes().len()
+                    preview.definition.tabs.len(),
+                    preview.definition.panes().len()
                 );
                 n += 1;
             }
@@ -297,4 +432,31 @@ pub(super) fn import_zellij(from: Option<PathBuf>, force: bool) -> Result<()> {
     }
     println!("imported {n} workspace{}", if n == 1 { "" } else { "s" });
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn batch_publication_cannot_bypass_a_held_session_lock() {
+        let name = format!("batch-publication-{}", std::process::id());
+        let session = Session { explicit: Some(name.clone()), name };
+        let dir = std::env::temp_dir().join(format!("kraal-{}", session.name));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("copy.kdl");
+        let original = "layout { pane command=\"true\"; }";
+        let replacement = "layout { pane command=\"false\"; }";
+        std::fs::write(&path, original).unwrap();
+        let expected = paths::FileRevision::read(&path).unwrap();
+        let held = paths::SessionLock::acquire(&session.name).unwrap().unwrap();
+        assert!(publish_import(&session, path.clone(), replacement.into(), expected.clone()).is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        assert!(!path.with_extension("kdl.bak").exists());
+        drop(held);
+        publish_import(&session, path.clone(), replacement.into(), expected).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), replacement);
+        assert_eq!(std::fs::read_to_string(path.with_extension("kdl.bak")).unwrap(), original);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 }

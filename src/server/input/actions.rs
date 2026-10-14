@@ -356,8 +356,7 @@ impl Server {
                 return Mode::Prompt(Prompt::new("Preview file (path)", "", PromptAction::OpenPreview));
             }
             Action::SaveWorkspace => {
-                let name = self.definition_file_name(wi);
-                return Mode::Prompt(Prompt::new("Save workspace layout as", &name, PromptAction::SaveWorkspace(ws)));
+                return self.export_workspace_form(id, ws, None);
             }
             Action::Upload | Action::Download => {
                 let Some(server) = focus.and_then(|f| self.pane_server(f)) else {

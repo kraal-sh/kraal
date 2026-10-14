@@ -408,7 +408,11 @@ pub fn snapshot(server: &Server) -> SessionSnapshot {
                 kept.bind_accounts(&server.accounts);
                 kept.name = ws.name.clone();
                 kept.definition = ws.definition.clone();
-                kept.definition_source = ws.definition_source.clone();
+                // An unopened workspace's source is its retained recipe. Export may have
+                // replaced the external file with a portable layout since it was restored.
+                if !kept.unopened {
+                    kept.definition_source = ws.definition_source.clone();
+                }
                 kept.delete_pending = ws.delete_pending;
                 return kept;
             }
