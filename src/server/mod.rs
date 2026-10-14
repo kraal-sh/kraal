@@ -23,6 +23,7 @@ mod hints;
 mod input;
 pub mod net;
 mod overlays;
+mod pane_ui;
 mod panes;
 mod persistence;
 #[cfg(test)]
@@ -544,6 +545,7 @@ pub struct Server {
     screen_limits: HashMap<PaneId, (bool, f64)>,
     /// Account changes shared by every client attached to this session.
     switches: HashMap<PaneId, agents::AccountSwitch>,
+    pane_edits: HashMap<PaneId, pane_ui::PaneEdit>,
     observed_agents: HashMap<PaneId, agents::ObservedAgent>,
     /// Panes whose account is over its threshold, already reported as an event.
     limit_events: std::collections::HashSet<PaneId>,
@@ -881,6 +883,7 @@ pub fn run(session: &str) -> Result<()> {
         limit_alerts: HashMap::new(),
         screen_limits: HashMap::new(),
         switches: HashMap::new(),
+        pane_edits: HashMap::new(),
         observed_agents: HashMap::new(),
         limit_events: Default::default(),
         ready: Default::default(),
@@ -1404,6 +1407,7 @@ impl Server {
             || !self.held_input.is_empty()
             || !self.waits.is_empty()
             || !self.exiting.is_empty()
+            || !self.pane_edits.is_empty()
             || self.switches.values().any(|s| {
                 matches!(
                     s.stage,
@@ -1514,6 +1518,7 @@ impl Server {
             self.refresh_observed_accounts();
         }
         self.check_switches();
+        self.check_pane_edits();
         self.forget_ended_reports();
         self.diff_pane_states();
         self.hooks.reap();
@@ -2088,6 +2093,7 @@ mod tests {
             limit_alerts: HashMap::new(),
             screen_limits: HashMap::new(),
             switches: HashMap::new(),
+            pane_edits: HashMap::new(),
             observed_agents: HashMap::new(),
             limit_events: Default::default(),
             ready: Default::default(),

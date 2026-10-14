@@ -564,7 +564,7 @@ fn command_in(program: &[&OsStr], dir: &Path, strict: bool) -> CommandBuilder {
 
 /// Whether `program` can be started in `dir` with this PATH, looked for as portable-pty does: a
 /// path relative to `dir`, else a name on PATH.
-fn findable(program: &OsStr, dir: &Path, path: Option<&OsStr>) -> bool {
+pub(super) fn findable(program: &OsStr, dir: &Path, path: Option<&OsStr>) -> bool {
     use std::os::unix::ffi::OsStrExt;
     let executable = |p: &Path| {
         let Ok(c) = std::ffi::CString::new(p.as_os_str().as_bytes()) else { return false };

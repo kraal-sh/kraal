@@ -171,6 +171,7 @@ impl Server {
             Mode::Picker(p) => self.on_picker(id, p, ev),
             Mode::Prompt(p) => self.on_prompt(id, p, ev),
             Mode::AccountForm(form) => self.on_account_form(id, form, ev),
+            Mode::PaneForm(form) => self.on_pane_form(id, *form, ev),
             Mode::AccountDetails(details) => self.on_account_details(id, details, ev),
             Mode::Help { scroll } => {
                 let lines = self.help_lines().len();
@@ -458,6 +459,9 @@ impl Server {
             return Mode::Normal;
         };
         let Some(pane) = self.panes.get_mut(&p) else { return Mode::Normal };
+        if self.pane_edits.contains_key(&p) {
+            return Mode::Normal;
+        }
         if matches!(pane.content, crate::pane::Content::Files(_)) {
             return self.files_key(id, p, k);
         }

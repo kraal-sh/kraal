@@ -132,7 +132,7 @@ impl ItemState {
         matches!(self, ItemState::Failed(_) | ItemState::TimedOut)
     }
 
-    fn pending(self) -> bool {
+    pub(super) fn pending(self) -> bool {
         matches!(self, ItemState::Waiting | ItemState::Running | ItemState::Stopping(_))
     }
 }

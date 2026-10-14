@@ -170,6 +170,12 @@ pub struct PaneSpec {
     pub text: Option<ShownText>,
 }
 
+impl PaneSpec {
+    pub fn check_program(&self, shell: &str) -> Result<()> {
+        spawn::check_program(self, shell)
+    }
+}
+
 /// Text a preview pane shows, under a title. Debug output says how long it is, not what it says.
 #[derive(Clone)]
 pub struct ShownText {
@@ -843,6 +849,9 @@ impl Pane {
     /// same while the pane prints nothing, for [`CWD_SHOWN`]: a shell that changes directory
     /// prints its prompt.
     pub fn current_cwd(&self) -> Option<PathBuf> {
+        if self.suspended {
+            return self.spec.cwd.clone();
+        }
         if let Some(p) = &self.reported_cwd
             && !self.reported_remotely()
         {

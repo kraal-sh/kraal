@@ -248,6 +248,9 @@ pub struct SavedScrollback {
 
 pub fn snapshot(server: &Server) -> SessionSnapshot {
     let pane_snap = |id: PaneId| -> PaneSnap {
+        if let Some(pane) = server.edited_pane_snapshot(id) {
+            return pane;
+        }
         let p = &server.panes[&id];
         let mut spec = p.spec.clone();
         server.accounts.bind_pane(&mut spec);
@@ -917,7 +920,7 @@ fn spawn(server: &mut Server, p: &PaneSnap) -> Result<PaneId> {
     let ssh_shell = spec.command.first().is_some_and(|c| c.rsplit('/').next() == Some("ssh"))
         && !crate::servers::ssh_runs_command(&spec.command[1..]);
     let auto = ssh_shell || resumed;
-    let id = if !spec.command.is_empty() && (p.stopped || !auto) {
+    let id = if p.stopped || !spec.command.is_empty() && !auto {
         let why = if p.stopped { "it was not running before the restart" } else { "restored session" };
         server.spawn_pane_suspended(p.name.clone(), spec, why)?
     } else {

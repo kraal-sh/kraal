@@ -107,6 +107,44 @@ state on a local disk (`XDG_STATE_HOME`). Where the state directory cannot lock 
 kraal starts no session and forgets none, and says so: it would have no way to keep a second
 server from the same files.
 
+## Editing a pane
+
+Open **Edit pane** with `ctrl+b P e`, or find it in the command palette. It edits the focused
+terminal pane's **Name**, **Folder** and **Command** without a KDL file. Previews, file managers
+and sign-in panes offer their name only. An empty Name restores the pane's automatic name.
+
+Folder initially shows the pane's current local directory. It accepts an absolute path,
+`~`, or a path relative to that displayed directory. For an SSH pane this is the local launch
+directory, not a remote directory. Command initially shows the saved launch, not a command
+guessed from shell history. A changed Command uses `/bin/sh` syntax, including quoting and
+pipes; an empty Command starts your configured shell. Unchanged commands retain their original
+arguments and launch settings.
+
+Enter or **Apply** submits the form; Tab and Shift+Tab move between fields and buttons. Fields
+and buttons also accept clicks. Esc or **Cancel** leaves the pane unchanged. An invalid folder
+or command syntax keeps all the entered values with a correction to make. Long errors wrap and
+scroll with PageUp/PageDown or the mouse wheel at both 80x24 and 124x36.
+
+Changing only Name does not restart anything. A command or folder change on a stopped pane
+keeps it stopped, showing **Ready to run**; Enter runs it explicitly. For a running pane,
+**Apply command?** lists what will stop, including background jobs, and shows the replacement
+command and folder. **Cancel** is selected first, so Enter returns to the entered fields.
+**Stop and apply** saves the requested launch before stopping the old programs, waits for their
+exit and final output, then starts the replacement in the same pane with its scrollback.
+Another client's changes cannot be overwritten by an old form; changed activity needs a fresh
+confirmation.
+
+For a managed agent, changing only Folder uses the existing conversation resume checks. An
+unverifiable conversation or ambiguous command is refused before stopping. Changing Command
+explicitly creates a plain command without the managed account or conversation; the form says
+so before applying. Account changes and pane edits cannot run concurrently in the same pane.
+
+If saving fails, nothing stops and the form keeps its values to retry. If the replacement cannot
+start, the pane keeps the requested launch and its output: correct it in Edit pane, or fix the
+reported problem and press Enter to retry. An interruption during the stop restores the edited
+command waiting for Enter. The changes are part of the automatically kept workspace and never
+write its source KDL file. A later session restart keeps ordinary commands stopped as usual.
+
 ## Persistence
 
 Sessions keep running when you close the terminal, lose the connection or detach (`ctrl+b d`):

@@ -45,6 +45,7 @@ pub enum Action {
     Unstack,
     PanePicker,
     RenamePane,
+    EditPane,
     NewTab,
     NextTab,
     PrevTab,
@@ -124,6 +125,7 @@ const ACTIONS: &[(Action, &str, &str)] = &[
     (Unstack, "unstack", "Unstack (take the pane out of its stack)"),
     (PanePicker, "pane_picker", "Find a pane"),
     (RenamePane, "rename_pane", "Rename pane"),
+    (EditPane, "edit_pane", "Edit pane"),
     (NewTab, "new_tab", "New tab"),
     (NextTab, "next_tab", "Next tab"),
     (PrevTab, "prev_tab", "Previous tab"),
@@ -287,7 +289,7 @@ const KRAAL: Preset = Preset {
         // The rest of each menu.
         ("split_right", &["{panes} right"]),
         ("split_down", &["{panes} down"]),
-        ("rename_pane", &["{panes} e"]),
+        ("edit_pane", &["{panes} e"]),
         ("resize_mode", &["{panes} r"]),
         ("new_floating", &["{panes} f"]),
         ("next_layout", &["{panes} l"]),
@@ -1394,6 +1396,7 @@ mod tests {
         let arrow = |code: KeyCode| Key { code, mods: Mods::NONE, raw: Vec::new() };
         let run = |a: Action| Lookup::Run(Command::Action(a));
         let (km, _) = Keymap::build(&cfg("").keys);
+        assert_eq!(km.lookup(&[key('P'), key('e')]), run(EditPane));
         assert_eq!(km.lookup(&[key('P'), key('l')]), run(NextLayout));
         assert_eq!(km.lookup(&[key('P'), key('u')]), run(Unstack));
         assert_eq!(km.lookup(&[key('P'), key('s')]), Lookup::More);
@@ -1421,6 +1424,8 @@ mod tests {
         let (classic, warnings) = Keymap::build(&cfg("[keys]\npreset = \"classic\"\n").keys);
         assert!(warnings.is_empty(), "{warnings:?}");
         assert_eq!(classic.lookup(&[key('E')]), run(NextLayout));
+        assert_eq!(classic.lookup(&[key('.')]), run(RenamePane));
+        assert_eq!(Action::parse("rename_pane"), Some(RenamePane));
         assert_eq!(classic.lookup(&[key('u')]), run(Unstack));
         assert_eq!(classic.lookup(&[key('M'), key('h')]), run(StackLeft));
         assert_eq!(classic.lookup(&[key('M'), arrow(KeyCode::Down)]), run(StackDown));

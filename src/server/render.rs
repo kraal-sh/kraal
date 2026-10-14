@@ -606,6 +606,7 @@ impl Server {
             Mode::Picker(p) => Some(overlays::draw_picker(p, screen, buf)),
             Mode::Prompt(p) => Some(overlays::draw_prompt(p, screen, buf)),
             Mode::AccountForm(form) => Some(super::account_ui::draw_form(form, screen, buf)),
+            Mode::PaneForm(form) => Some(super::pane_ui::draw_form(form, screen, buf)),
             Mode::AccountDetails(details) => {
                 super::account_ui::draw_details(details, screen, buf);
                 None
@@ -662,7 +663,9 @@ impl Server {
         };
         let c = &self.clients[&id];
         match &c.mode {
-            Mode::Picker(_) | Mode::Prompt(_) | Mode::AccountForm(_) => cursor = overlay_cursor.flatten(),
+            Mode::Picker(_) | Mode::Prompt(_) | Mode::AccountForm(_) | Mode::PaneForm(_) => {
+                cursor = overlay_cursor.flatten();
+            }
             Mode::Leader { .. }
             | Mode::Help { .. }
             | Mode::Messages { .. }

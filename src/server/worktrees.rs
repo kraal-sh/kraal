@@ -184,6 +184,26 @@ impl Server {
         }
     }
 
+    /// Refresh an edited launch from its physical folder, including paths through links or `..`.
+    pub(super) fn refresh_worktree_env(&self, spec: &mut PaneSpec) {
+        let cwd = spec.cwd.as_deref().and_then(|p| p.canonicalize().ok());
+        let contains =
+            |root: &Path| cwd.as_ref().is_some_and(|cwd| root.canonicalize().is_ok_and(|root| cwd.starts_with(root)));
+        spec.worktree = self
+            .panes
+            .values()
+            .filter_map(|p| p.spec.worktree.as_ref())
+            .find(|w| contains(&w.path))
+            .cloned()
+            .or_else(|| self.git.values().flatten().filter(|g| contains(&g.root)).find_map(worktree_of));
+        if spec.env.iter().any(|(key, _)| key == "KRAAL_WORKTREE") {
+            worktree_setup::clear_env(&mut spec.env);
+        }
+        if let Some(w) = &spec.worktree {
+            spec.env.extend(worktree_setup::env(&w.name(), w.index, &self.config.worktrees));
+        }
+    }
+
     /// The kraal worktree `cwd` is in, and its number, as known without asking git: what git
     /// said about that very directory, else from a pane kraal started for one, or from what git
     /// said about a pane's directory.

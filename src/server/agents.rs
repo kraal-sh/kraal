@@ -662,6 +662,7 @@ impl Server {
             return Ok(());
         }
         anyhow::ensure!(!self.switches.contains_key(&pane), "an account change is already pending for this pane");
+        anyhow::ensure!(!self.pane_edits.contains_key(&pane), "a pane edit is already being applied");
         let kind = accounts::agent_kind(&to.agent).context("unknown agent")?;
         let mut original = match &observed {
             Some(a) => PaneSpec {

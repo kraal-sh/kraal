@@ -59,6 +59,11 @@ a file replaces its order reference with the workspace's identity, without chang
 The 0.2.0 and 0.3.0 state paths remain untouched. Their clients can use the actions when attached
 to a current server; an older running server keeps its existing order behavior.
 
+Edit pane uses the existing attached-terminal input protocol and the existing pane command,
+directory, name and stopped-state fields in `sessions-v2`. It adds no wire request or saved-state
+format. Old custom `rename_pane` bindings keep working; the default `ctrl+b P e` now opens the
+form whose Name field also renames. An older running server keeps its existing pane actions.
+
 ## For contributors: how the protocol changes
 
 The client and the server exchange JSON messages (`src/protocol.rs`, whose comments hold the

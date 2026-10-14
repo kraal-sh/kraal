@@ -741,6 +741,7 @@ impl Server {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::server::ui::Mode;
 
     fn draft() -> Draft {
         let content = "steps = ['true']".to_string();
@@ -794,6 +795,81 @@ mod tests {
             assert_eq!(server.workspaces.len(), 1);
             assert!(server.runs.is_empty());
         }
+    }
+
+    #[test]
+    fn pending_rolling_targets_allow_renames_but_refuse_launch_edits() {
+        let (tx, rx) = crate::server::event_channel(4096);
+        let mut server = crate::server::tests::server(tx);
+        let (client, _peer) = crate::server::tests::client(&mut server);
+        crate::server::persistence::tests::writer(&mut server, vec![]);
+        let dir = std::env::temp_dir().join(format!("kraal-run-edit-{}", crate::accounts::new_uuid()));
+        std::fs::create_dir_all(dir.join("next")).unwrap();
+        let release = dir.join("release");
+        let marker = dir.join("queued-must-not-run");
+        let mut d = draft();
+        d.steps.stop_on_failure = true;
+        let spec = |command: String| PaneSpec {
+            command: vec!["/bin/sh".into(), "-c".into(), command],
+            cwd: Some(dir.clone()),
+            ..Default::default()
+        };
+        server
+            .start_run(
+                &d,
+                50,
+                &dir.join("run.log"),
+                vec![
+                    (
+                        "active".into(),
+                        spec(format!(
+                            "while [ ! -f {} ]; do sleep 0.02; done; exit 7",
+                            shell::quote(release.to_str().unwrap())
+                        )),
+                    ),
+                    ("queued".into(), spec(format!("touch {}", shell::quote(marker.to_str().unwrap())))),
+                ],
+                1,
+                Some(client),
+            )
+            .unwrap();
+        let panes: Vec<_> = server.runs[0].items.iter().map(|i| i.pane).collect();
+        for &pane in &panes {
+            let before = serde_json::to_value(&server.panes[&pane].spec).unwrap();
+            for input in [b"\t\t\x15true\r".as_slice(), b"\t\x15next\r".as_slice()] {
+                let mode = server.edit_pane_form(client, pane);
+                server.clients.get_mut(&client).unwrap().mode = mode;
+                server.client_input(client, input);
+                assert!(matches!(server.clients[&client].mode, Mode::PaneForm(_)));
+                assert_eq!(serde_json::to_value(&server.panes[&pane].spec).unwrap(), before);
+                assert!(server.pane_edits.is_empty());
+            }
+            let mode = server.edit_pane_form(client, pane);
+            server.clients.get_mut(&client).unwrap().mode = mode;
+            server.client_input(client, b"\x15renamed\r");
+            assert!(matches!(server.clients[&client].mode, Mode::Normal));
+            assert_eq!(server.panes[&pane].name.as_deref(), Some("renamed"));
+            assert_eq!(serde_json::to_value(&server.panes[&pane].spec).unwrap(), before);
+        }
+        assert_eq!(server.runs[0].items[0].state, ItemState::Running);
+        assert_eq!(server.runs[0].items[1].state, ItemState::Waiting);
+        std::fs::write(release, "").unwrap();
+        let start = Instant::now();
+        while !server.runs.is_empty() {
+            while let Ok(event) = rx.try_recv() {
+                server.handle(event);
+            }
+            server.finish_exits();
+            assert!(start.elapsed() < crate::testing::PATIENCE);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(server.panes[&panes[0]].exit_code, Some(Some(7)));
+        assert!(server.panes[&panes[1]].name.as_deref().unwrap().contains("skipped"));
+        assert!(!marker.exists());
+        for pane in panes {
+            server.close_pane(pane);
+        }
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

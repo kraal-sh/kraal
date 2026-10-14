@@ -30,6 +30,7 @@ impl Server {
                 return Mode::Picker(self.workspace_picker(self.clients.get(&id).map_or(0, |c| c.workspace)));
             }
             Action::PanePicker => return Mode::Picker(self.pane_picker()),
+            Action::EditPane if self.client_focus(id).is_none() => self.toast(id, "Add a pane before editing."),
             Action::Accounts => {
                 self.refresh_existing_accounts();
                 return Mode::Picker(self.accounts_picker(None));
@@ -241,6 +242,11 @@ impl Server {
                     &tab.name,
                     PromptAction::RenameTab { workspace: ws, tab: tab.id },
                 ));
+            }
+            Action::EditPane => {
+                if let Some(pane) = focus {
+                    return self.edit_pane_form(id, pane);
+                }
             }
             Action::RenamePane => {
                 if let Some(p) = focus {

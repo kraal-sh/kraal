@@ -29,11 +29,44 @@ pub struct CloseInventory {
 }
 
 #[derive(Debug, PartialEq, Eq)]
-struct ClosePane {
+pub(super) struct ClosePane {
     id: PaneId,
     leader: Option<CloseProcess>,
     foreground: Option<CloseProcess>,
     background: Vec<CloseProcess>,
+    members: Vec<CloseProcess>,
+}
+
+impl ClosePane {
+    pub(super) fn read(pane: &crate::pane::Pane) -> Self {
+        let mut members = pane.process_hold().map(|p| p.session_members()).unwrap_or_default();
+        for pid in members.clone() {
+            members.extend(crate::process::descendants(pid));
+        }
+        members.sort_unstable();
+        members.dedup();
+        Self {
+            id: pane.id,
+            leader: pane.pid().map(CloseProcess::read),
+            foreground: pane.foreground_pid().map(CloseProcess::read),
+            background: pane
+                .pid()
+                .map(|pid| crate::process::background_processes(pid, &[]))
+                .unwrap_or_default()
+                .into_iter()
+                .map(CloseProcess::read)
+                .collect(),
+            members: members.into_iter().map(CloseProcess::read).collect(),
+        }
+    }
+
+    pub(super) fn running(&self) -> bool {
+        !self.members.is_empty()
+    }
+
+    pub(super) fn commands(&self) -> Vec<String> {
+        self.members.iter().filter_map(|p| p.command.as_ref().map(|argv| crate::shell::join(argv))).collect()
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -263,18 +296,7 @@ impl Server {
                 .into_iter()
                 .filter_map(|id| {
                     let pane = self.panes.get(&id)?;
-                    Some(ClosePane {
-                        id,
-                        leader: pane.pid().map(CloseProcess::read),
-                        foreground: pane.foreground_pid().map(CloseProcess::read),
-                        background: pane
-                            .pid()
-                            .map(|pid| crate::process::background_processes(pid, &[]))
-                            .unwrap_or_default()
-                            .into_iter()
-                            .map(CloseProcess::read)
-                            .collect(),
-                    })
+                    Some(ClosePane::read(pane))
                 })
                 .collect(),
         };

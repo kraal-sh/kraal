@@ -1842,6 +1842,97 @@ fn a_definition_renamed_on_disk_stays_linked() {
     assert_eq!(names_in(&dir), [".moved.kdl.lock", "moved.kdl"]);
 }
 
+#[test]
+fn pane_edit_confirms_a_restart_and_keeps_the_same_pane_and_source_file() {
+    for size in [(80, 24), (124, 36)] {
+        let env = Env::new("pane-edit-live");
+        let starts = env.root.join("starts");
+        let quoted = format!("'{}'", starts.display().to_string().replace('\'', "'\\''"));
+        let record = format!("printf '%s\\n' \"$$\" >> {quoted}");
+        let script = format!("{record}; printf 'original output\\n'; exec sleep 60");
+        let layout = format!(
+            "layout {{\n    pane name=\"tests\" command=\"sh\" {{\n        args \"-c\" {}\n    }}\n}}\n",
+            serde_json::to_string(&script).unwrap()
+        );
+        env.workspace("edit", &layout);
+        env.run(&["open", "edit"]);
+        env.wait_for_text("tests", "original output");
+        let pane = || {
+            let panes: serde_json::Value = serde_json::from_str(&env.run(&["panes", "--json"])).unwrap();
+            panes.as_array().unwrap().iter().find(|p| p["workspace"] == "edit").unwrap().clone()
+        };
+        let before = pane();
+        let started = std::fs::read_to_string(&starts).unwrap();
+        assert_eq!(started.lines().count(), 1);
+        let mut client = RawClient::attach_sized(&env, Some("edit"), size).traced();
+        client.wait_for_message("\"attached\"");
+        client.send(b"\x02Pe");
+        client.wait_for_row("Edit pane");
+        client.send(b"\x15renamed\r");
+        client.wait_for_row("Pane updated");
+        assert_eq!(pane()["id"], before["id"]);
+        assert_eq!(std::fs::read_to_string(&starts).unwrap(), started);
+        assert_eq!(pane()["command"], before["command"]);
+        client.send(b"\x02Pe");
+        client.wait_for_row("Edit pane");
+        client.send(b"\t\t\x15");
+        client.paste(format!("{record}; printf 'replacement output\\n'; exec sleep 60").as_bytes());
+        client.send(b"\r");
+        client.wait_for_row("Apply command?");
+        client.send(b"\r");
+        client.wait_for_row("Edit pane");
+        assert_eq!(std::fs::read_to_string(&starts).unwrap(), started);
+        client.send(b"\r");
+        client.wait_for_row("Apply command?");
+        client.send(b"\t\r");
+        env.wait_for_text("renamed", "replacement output");
+        assert_eq!(pane()["id"], before["id"]);
+        let replaced = std::fs::read_to_string(&starts).unwrap();
+        assert_eq!(replaced.lines().count(), 2);
+        assert_ne!(replaced.lines().last(), started.lines().next());
+        assert!(env.run(&["read", "-p", "renamed"]).contains("original output"));
+        assert_eq!(std::fs::read_to_string(env.root.join("config/kraal/workspaces/edit.kdl")).unwrap(), layout);
+    }
+}
+
+#[test]
+fn pane_edit_keeps_errors_and_restores_a_stopped_command_until_enter() {
+    let env = Env::new("pane-edit-stopped");
+    env.workspace("edit", "layout {\n    pane name=\"tests\" command=\"true\"\n}\n");
+    env.run(&["open", "edit"]);
+    wait_until(PATIENCE, "command did not end", || {
+        let panes: serde_json::Value = serde_json::from_str(&env.run(&["panes", "--json"])).unwrap();
+        panes.as_array().unwrap().iter().any(|p| p["name"] == "tests" && !p["exit_code"].is_null())
+    });
+    let folder = env.root.join("project folder");
+    std::fs::create_dir(&folder).unwrap();
+    let marker = folder.join("ran");
+    let mut client = RawClient::attach_sized(&env, Some("edit"), (80, 24)).traced();
+    client.wait_for_message("\"attached\"");
+    client.send(b"\x02Pe");
+    client.wait_for_row("Edit pane");
+    client.send(b"\t\x15/nonexistent/kraal-pane-edit\r");
+    client.wait_for_row("is not available.");
+    client.send(b"\x15");
+    client.paste(folder.to_str().unwrap().as_bytes());
+    client.send(b"\t\x15");
+    client.paste(b"pwd > ran; printf 'edited command ran\\n'");
+    client.send(b"\r");
+    client.wait_for_row("Ready to run");
+    assert!(!marker.exists());
+    drop(client);
+    env.run(&["kill"]);
+    env.run(&["open", "edit"]);
+    let mut client = RawClient::attach_sized(&env, Some("edit"), (124, 36)).traced();
+    client.wait_for_row("enter run");
+    assert!(!marker.exists());
+    client.send(b"\r");
+    wait_until(PATIENCE, "edited command did not run", || {
+        env.run(&["read", "-p", "tests"]).lines().any(|line| line.trim() == "edited command ran")
+    });
+    assert_eq!(std::fs::read_to_string(marker).unwrap().trim(), folder.canonicalize().unwrap().to_str().unwrap());
+}
+
 /// Panes stacked from the keys share one place and keep one size; the one the focus reaches
 /// opens (a key, a click on its row); a pane comes out again; one key goes through the layouts;
 /// stacks and the layout chosen survive a restart, and a saved workspace keeps its stacks.
