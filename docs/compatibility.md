@@ -16,7 +16,9 @@ for older versions. Migration backups and the untouched legacy session are recov
 not synchronized views of the current session.
 Session migration preserves the personal layout, identities, source links, account references,
 restore failures and available scrollback. Account migration happens on the next change to the
-file, keeping comments, order and unknown keys. See [Workspace migration](workspaces.md#workspace-identities-and-migration)
+file, keeping comments, order and unknown keys. Before account changes, saved pane references
+are bound to account identities, including layout Undo in kept and deleted workspaces. Unknown
+session fields are preserved. See [Workspace migration](workspaces.md#workspace-identities-and-migration)
 and [Accounts](agents.md#accounts).
 
 A kraal older than the saved state does not read that state. Starting with 0.4, sessions use

@@ -213,6 +213,68 @@ mod tests {
     }
 
     #[test]
+    fn legacy_layout_undo_accounts_are_bound_without_changing_other_saved_state() {
+        for deleted in [false, true] {
+            let dir = directory("undo-accounts");
+            let (path, _) = source_in(&dir);
+            let mut source = legacy_state();
+            let mut undo = source["workspaces"][0].clone();
+            let pane = &mut undo["tabs"][0]["root"]["Pane"];
+            pane["future"] = serde_json::json!({ "spec": { "account": "claude:default" } });
+            pane["spec"] = serde_json::json!({
+                "account": "claude:default",
+                "env": [],
+                "future": ["kept", { "account": "claude:default" }]
+            });
+            let pane = pane.clone();
+            undo["tabs"][0]["root"] = serde_json::json!({ "Split": {
+                "axis": "Row", "children": [[{ "Pane": pane }, 1.0]]
+            } });
+            undo["tabs"][0]["floating"] = serde_json::json!([
+                [pane, { "x": 0.1, "y": 0.2, "w": 0.3, "h": 0.4 }]
+            ]);
+            undo["layout_undo"] = undo.clone();
+            source["workspaces"][0]["layout_undo"] = undo;
+            if deleted {
+                source["workspaces"][0]["id"] = serde_json::json!("deleted-workspace");
+                source["deleted_workspaces"] = serde_json::json!([{
+                    "workspace": source["workspaces"][0], "position": 0, "deleted_at": 1
+                }]);
+                source["workspaces"] = serde_json::json!([]);
+            }
+            let original = serde_json::to_vec_pretty(&source).unwrap();
+            std::fs::write(&path, &original).unwrap();
+            load_from(&dir).unwrap().unwrap();
+            let current = dir.join("sessions-v2/main.json");
+            let before = std::fs::read(&current).unwrap();
+            let accounts = crate::accounts::Accounts::empty();
+            let updated = bind_saved_accounts(&before, &accounts).unwrap().expect("Undo accounts are bound");
+            let mut expected: serde_json::Value = serde_json::from_slice(&before).unwrap();
+            let workspace = if deleted {
+                &mut expected["deleted_workspaces"][0]["workspace"]
+            } else {
+                &mut expected["workspaces"][0]
+            };
+            for path in ["/layout_undo", "/layout_undo/layout_undo"] {
+                let tab = &mut workspace.pointer_mut(path).unwrap()["tabs"][0];
+                for path in ["/root/Split/children/0/0/Pane/spec", "/floating/0/0/spec"] {
+                    let spec = tab.pointer_mut(path).unwrap();
+                    spec["account_id"] = serde_json::json!("default-claude");
+                    spec["env"] = serde_json::json!([
+                        ["KRAAL_ACCOUNT_ID", "default-claude"],
+                        ["KRAAL_ACCOUNT", "claude:default"]
+                    ]);
+                }
+            }
+            assert_eq!(updated, serde_json::to_vec_pretty(&expected).unwrap(), "only account bindings change");
+            assert!(bind_saved_accounts(&updated, &accounts).unwrap().is_none(), "identities are never rebound");
+            assert_eq!(std::fs::read(&path).unwrap(), original);
+            assert_eq!(std::fs::read(backups(&dir)[0].join("state.json")).unwrap(), original);
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    #[test]
     fn migration_preserves_the_meaning_of_legacy_tab_names() {
         let mut source = legacy_state();
         source.as_object_mut().unwrap().remove("revision");
