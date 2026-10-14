@@ -291,6 +291,8 @@ files or databases; a new home receives a copy of `~/.codex/config.toml` when av
 An agent kraal starts on an account gets `$KRAAL_ACCOUNT` (`claude:pro`) and an internal
 `$KRAAL_ACCOUNT_ID` that stays the same when renamed. It does not inherit the API keys of
 your environment (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`…), which would bill another account.
+Command-line logins and sign-in checks use the same account environment. Logins use your
+terminal; checks run with no terminal input and keep the agent's output private.
 
 Open **Accounts** from the Agents menu (`ctrl+b A l`), or click the sidebar's **ACCOUNTS**
 heading. Each account has two lines: `Claude · work` and `57% used · 2 panes`. Unknown usage

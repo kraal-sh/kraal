@@ -312,14 +312,7 @@ fn login(a: &accounts::Account) -> Result<()> {
 
 /// Run a command with an account's environment in this terminal.
 fn run_with(l: &accounts::Launch, exec: bool) -> Result<std::process::ExitStatus> {
-    let mut cmd = std::process::Command::new(&l.argv[0]);
-    cmd.args(&l.argv[1..]);
-    for k in &l.env_remove {
-        cmd.env_remove(k);
-    }
-    for (k, v) in &l.env {
-        cmd.env(k, v);
-    }
+    let mut cmd = l.command();
     if exec {
         use std::os::unix::process::CommandExt;
         let err = cmd.exec();
@@ -592,4 +585,29 @@ pub(super) fn integration(action: &str, agent: &str) -> Result<()> {
         bail!("{action} failed for {}", failed.join(", "));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn run_with_preserves_arguments_and_the_accounts_environment() {
+        let launch = accounts::Launch {
+            argv: vec![
+                "sh".into(),
+                "-c".into(),
+                r#"test "$#" = 3 && test "$1" = 'two words' && test -z "$2" && test "$3" = '$HOME;*' &&
+                   test "$KRAAL_LOGIN_HOME" = 'account home' && test "${HOME+x}" != x && test -n "$PATH""#
+                    .into(),
+                "sh".into(),
+                "two words".into(),
+                "".into(),
+                "$HOME;*".into(),
+            ],
+            env: vec![("KRAAL_LOGIN_HOME".into(), "first".into()), ("KRAAL_LOGIN_HOME".into(), "account home".into())],
+            env_remove: vec!["HOME".into(), "KRAAL_LOGIN_HOME".into()],
+        };
+        assert!(run_with(&launch, false).unwrap().success());
+    }
 }
