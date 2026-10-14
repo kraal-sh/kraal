@@ -465,11 +465,6 @@ pub struct KeysConfig {
     /// keys that open a menu (`menu_servers = ["M"]`).
     #[serde(default)]
     pub leader: BTreeMap<String, Vec<String>>,
-    /// `leader` as it was named before 0.1.0, still read with it (`leader` wins for a menu's
-    /// keys): a configuration written then keeps its bindings. No release documented it; it can
-    /// go in any release.
-    #[serde(default)]
-    prefixed: BTreeMap<String, Vec<String>>,
     /// Per action, replacing the preset's: single keys that need no leader.
     #[serde(default)]
     pub direct: BTreeMap<String, Vec<String>>,
@@ -579,13 +574,12 @@ fn expand(text: &str, menus: &[Menu], prefix: &[KeySpec]) -> Result<Vec<Vec<KeyS
 /// Entries naming a menu (`menu_<id>`) are not actions: [`Keymap::build`] reads them.
 fn bindings(
     preset: Table,
-    user: &[&BTreeMap<String, Vec<String>>],
+    user: &BTreeMap<String, Vec<String>>,
     ctx: &str,
     (menus, prefix): (&[Menu], &[KeySpec]),
     warnings: &mut Vec<String>,
 ) -> Vec<(Vec<KeySpec>, Action)> {
     let is_menu = |name: &str| name.starts_with("menu_");
-    let overridden: Vec<&str> = user.iter().flat_map(|m| m.keys()).map(String::as_str).collect();
     let mut out = Vec::new();
     let mut add = |name: &str, seqs: &[String], warnings: &mut Vec<String>| {
         let Some(action) = Action::parse(name) else {
@@ -599,14 +593,12 @@ fn bindings(
             }
         }
     };
-    for (name, seqs) in preset.iter().filter(|(n, _)| !overridden.contains(n)) {
+    for (name, seqs) in preset.iter().filter(|(n, _)| !user.contains_key(*n)) {
         let seqs: Vec<String> = seqs.iter().map(|s| s.to_string()).collect();
         add(name, &seqs, warnings);
     }
-    for map in user {
-        for (name, seqs) in map.iter().filter(|(n, _)| !is_menu(n)) {
-            add(name, seqs, warnings);
-        }
+    for (name, seqs) in user.iter().filter(|(n, _)| !is_menu(n)) {
+        add(name, seqs, warnings);
     }
     out
 }
@@ -719,11 +711,10 @@ impl Keymap {
             })
             .collect();
         // The menus first: the leader's sequences name them.
-        let user = [&cfg.prefixed, &cfg.leader];
         let mut menus = Vec::new();
         for &(id, key, title, main) in preset.menus {
             let name = format!("menu_{id}");
-            let keys = match user.iter().rev().find_map(|m| m.get(&name)) {
+            let keys = match cfg.leader.get(&name) {
                 Some(list) => list
                     .iter()
                     .filter_map(|k| {
@@ -734,13 +725,13 @@ impl Keymap {
             };
             menus.push(Menu { id, keys, title, main });
         }
-        for name in user.iter().flat_map(|m| m.keys()).filter(|n| n.starts_with("menu_")) {
+        for name in cfg.leader.keys().filter(|n| n.starts_with("menu_")) {
             if !menus.iter().any(|m| name[5..] == *m.id) {
                 warnings.push(format!("keys.leader: no menu {name:?} in the {} preset", preset.name));
             }
         }
         let direct: Vec<(KeySpec, Action)> =
-            bindings(preset.direct, &[&cfg.direct], "keys.direct", (&menus, &prefix), &mut warnings)
+            bindings(preset.direct, &cfg.direct, "keys.direct", (&menus, &prefix), &mut warnings)
                 .into_iter()
                 .filter_map(|(mut keys, a)| {
                     if keys.len() > 1 {
@@ -765,7 +756,7 @@ impl Keymap {
         // menu, the help, `kraal config keys`). Only the listing: a key two actions ask for
         // went to the preset's, as before.
         kept.sort_by_key(|(_, a)| place(preset.direct, *a));
-        let leader = bindings(preset.leader, &user, "keys.leader", (&menus, &prefix), &mut warnings);
+        let leader = bindings(preset.leader, &cfg.leader, "keys.leader", (&menus, &prefix), &mut warnings);
         let tool_menu = match preset.tool_menu {
             "" => vec![Vec::new()],
             t => expand(t, &menus, &prefix).unwrap_or_default(),
@@ -1262,12 +1253,26 @@ mod tests {
         assert_eq!(km.lookup(&[key('%')]), Lookup::Run(Command::Action(SplitRight)));
         assert!(km.all_hints(&Command::Action(SplitRight)).iter().all(|h| !h.contains("right")));
         assert_eq!(warnings.len(), 1, "P is the Panes menu: {warnings:?}");
-        // The older table name still works.
-        let (km, warnings) = Keymap::build(&cfg("[keys.prefixed]\ntoggle_sync = [\"y\"]\n").keys);
-        assert!(warnings.is_empty(), "{warnings:?}");
-        assert_eq!(km.lookup(&[key('y')]), Lookup::Run(Command::Action(BroadcastToggle)));
         let (_, warnings) = Keymap::build(&cfg("[keys]\npreset = \"emacs\"\n").keys);
         assert_eq!(warnings.len(), 1);
+    }
+
+    #[test]
+    fn prefixed_is_an_unknown_key_and_does_not_change_bindings() {
+        let (cfg, warnings) = crate::config::Config::parse(
+            "[keys.prefixed]\nsplit_right = [\"~\"]\nmenu_servers = [\"J\"]\n\
+             [keys.leader]\nsplit_right = [\"%\"]\nmenu_servers = [\"M\"]\n\
+             [keys.direct]\nnew_tab = [\"alt+;\"]\n",
+        )
+        .unwrap();
+        assert_eq!(warnings, ["keys.prefixed: unknown key (did you mean prefix?)"]);
+        let (km, warnings) = Keymap::build(&cfg.keys);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(km.lookup(&[key('~')]), Lookup::Nothing);
+        assert_eq!(km.lookup(&[key('J')]), Lookup::Nothing);
+        assert_eq!(km.lookup(&[key('%')]), Lookup::Run(Command::Action(SplitRight)));
+        assert_eq!(km.lookup(&[key('M'), key('u')]), Lookup::Run(Command::Action(Upload)));
+        assert_eq!(km.direct(&Key { mods: Mods::ALT, ..key(';') }), Some(NewTab));
     }
 
     #[test]
