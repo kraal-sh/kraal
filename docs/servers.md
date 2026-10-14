@@ -239,6 +239,9 @@ Enter their absolute local paths and press Enter. The server receives the comple
 pasting its paths into the pane named in the form, without pressing Enter in that pane.
 For a clipboard image, choose **Attach clipboard image**, then **Send** in the local question.
 It reads the laptop clipboard once and sends the image through the same connection.
+Transfers lasting at least 200 ms show **Sending to SERVER**, the filename or file count,
+sent and total size, percentage, a progress bar and a spinner. The box updates at most five
+times per second and is replaced by the result. Short transfers go straight to the result.
 Ctrl+C cancels a choice or a running transfer. A success such as **Sent 2 files to box** or
 **Sent the image to box** disappears after four seconds; typing and Ctrl+C reach the pane as
 usual. A failure stays open with choices to retry or close, and **Paste as text** for files.

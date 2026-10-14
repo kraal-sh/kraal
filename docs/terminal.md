@@ -376,11 +376,16 @@ stream unchanged. A local session always pastes paths unchanged, including into 
 Use **Upload to this pane's server** or `kraal cp` for that topology.
 
 For a longer transfer, the choice is replaced after 200 ms by a box titled **Sending to SERVER**,
-with progress and a Cancel button:
+with the filename (or file count), sent and total size, percentage, a progress bar, an
+animated spinner and a Cancel button. Progress updates at most five times per second.
+The spinner keeps moving while waiting for the server. The ASCII theme uses ASCII spinner
+and bar characters:
 
 ```text
 Sending to SERVER
-2.1 / 3.2 MiB (66%)
+2 files
+2.1 MiB / 3.2 MiB (66%)
+⠙ ▓▓▓▓▓░░░
 Typing waits until it finishes.
 
  Cancel
