@@ -138,7 +138,16 @@ Clipboard image offers additionally require `clipboard_images` and `attachments`
 peers' lists. The new action tells older clients to update; older servers retain their existing
 palette. Image data uses the existing attachment messages. Local image batches also use that
 transport to create private session files. No configuration, workspace or saved-state format
-changes are needed, and existing configurations add no default image shortcut.
+changes are needed. The explicit image action has no default key binding.
+
+Ctrl+V image handling additionally negotiates `agent_clipboard`. Only clients advertising it
+receive `clipboard_focus`, containing the focused pane and whether an agent accepts input there.
+A client acts on that information only after its own local Ctrl+V key press; older peers retain
+ordinary key forwarding. Image transfers reuse the existing attachment protocol. An optional
+pane on image reservation requests checks that the advertised agent is still the destination
+before a read is authorized. Optional
+`[[clipboard_image]]` entries in the laptop's `paste-files.toml` grant image permission separately
+from existing file-drop entries. No session, workspace or configuration format changes are needed.
 
 ## For contributors: how the protocol changes
 

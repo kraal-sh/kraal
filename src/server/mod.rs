@@ -1539,6 +1539,16 @@ impl Server {
             }
             self.mark_dirty();
         }
+        // A hooked agent keeps its identity when suspended, even while its shell is quiet.
+        let clipboard_changed: Vec<_> = self
+            .clients
+            .iter()
+            .filter(|(id, c)| self.clipboard_focus(**id) != c.attachments.focus)
+            .map(|(&id, _)| id)
+            .collect();
+        for id in clipboard_changed {
+            self.mark_dirty_client(id);
+        }
         for (id, args) in ssh_seen {
             self.observe_ssh(id, &args);
         }
@@ -1946,7 +1956,18 @@ impl Server {
             // Or, for a terminal that draws sixel, the images' visible parts go over the cells.
             let (erase, images, still) = self.paint_images(id, &mut buf);
             let shown = self.client_focus(id);
+            let clipboard_focus = self.clipboard_focus(id);
             let Some(c) = self.clients.get_mut(&id) else { continue };
+            if let Some((pane, agent)) = clipboard_focus
+                && c.attachments.focus != clipboard_focus
+            {
+                let msg = ServerMsg::ClipboardFocus { pane, agent };
+                let mut frame = Vec::new();
+                let _ = crate::protocol::write_json(&mut frame, &msg);
+                if c.out.try_send(frame).is_ok() {
+                    c.attachments.focus = clipboard_focus;
+                }
+            }
             // A kraal that asked is told which pane it shows, when that changed.
             let tell = c.told_shown.is_some_and(|told| told != shown);
             if tell {

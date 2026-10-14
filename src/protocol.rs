@@ -85,7 +85,9 @@ pub const PASTED_PATHS: Feature =
     Feature { name: "pasted_paths", does: "recognize laptop paths in pastes", check_first: false };
 pub const CLIPBOARD_IMAGES: Feature =
     Feature { name: "clipboard_images", does: "attach clipboard images", check_first: false };
-pub const FEATURES: [Feature; 12] = [
+pub const AGENT_CLIPBOARD: Feature =
+    Feature { name: "agent_clipboard", does: "paste laptop clipboard images into agents", check_first: false };
+pub const FEATURES: [Feature; 13] = [
     LIST_AGENTS,
     BUFFERS,
     EDIT_SUDO,
@@ -98,6 +100,7 @@ pub const FEATURES: [Feature; 12] = [
     ATTACHMENTS,
     PASTED_PATHS,
     CLIPBOARD_IMAGES,
+    AGENT_CLIPBOARD,
 ];
 
 /// The names of this kraal's server features, as it lists them.
@@ -111,8 +114,8 @@ pub const LENIENT: &str = "lenient";
 
 /// What this kraal's client can read beyond what one of the oldest supported release can. It
 /// lists them in its messages, for a later server to rely on.
-pub const CLIENT_FEATURES: [&str; 5] =
-    [LENIENT, CLIPBOARD.name, ATTACHMENTS.name, PASTED_PATHS.name, CLIPBOARD_IMAGES.name];
+pub const CLIENT_FEATURES: [&str; 6] =
+    [LENIENT, CLIPBOARD.name, ATTACHMENTS.name, PASTED_PATHS.name, CLIPBOARD_IMAGES.name, AGENT_CLIPBOARD.name];
 
 pub fn client_features() -> Vec<String> {
     CLIENT_FEATURES.iter().map(|f| f.to_string()).collect()
@@ -259,9 +262,12 @@ pub enum ClientMsg {
     PasteStart,
     AttachmentRequest {
         token: String,
+        /// Paste content, or the original shortcut key when `image` and `pane` are set.
         text: Vec<u8>,
         #[serde(default)]
         image: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pane: Option<crate::layout::PaneId>,
     },
     AttachmentText {
         token: String,
@@ -340,6 +346,10 @@ pub enum ServerMsg {
     },
     Response {
         result: Result<Response, String>,
+    },
+    ClipboardFocus {
+        pane: Option<crate::layout::PaneId>,
+        agent: bool,
     },
     AttachmentPrepared {
         token: String,
@@ -973,7 +983,7 @@ mod tests {
         ));
         assert!(matches!(
             serde_json::from_str::<ClientMsg>(r#"{"type":"attachment_request","token":"ab","text":[]}"#),
-            Ok(ClientMsg::AttachmentRequest { image: false, .. })
+            Ok(ClientMsg::AttachmentRequest { image: false, pane: None, .. })
         ));
         let hello = r#"{"type":"attach","version":2,"cols":80,"rows":24,"workspace":null,"remote":false}"#;
         assert!(matches!(
@@ -1207,8 +1217,8 @@ mod tests {
             ClientMsg::Resize { cols: 80, rows: 24 },
             ClientMsg::Detach,
             ClientMsg::PasteStart,
-            ClientMsg::AttachmentRequest { token: s("ab"), text: b"/tmp/a".to_vec(), image: false },
-            ClientMsg::AttachmentRequest { token: s("cd"), text: Vec::new(), image: true },
+            ClientMsg::AttachmentRequest { token: s("ab"), text: b"/tmp/a".to_vec(), image: false, pane: None },
+            ClientMsg::AttachmentRequest { token: s("cd"), text: Vec::new(), image: true, pane: Some(7) },
             ClientMsg::AttachmentText { token: s("ab"), text: b"/tmp/a".to_vec() },
             ClientMsg::AttachmentStart {
                 token: s("ab"),
@@ -1294,6 +1304,8 @@ mod tests {
             ServerMsg::Exit { reason: s("bye"), reattach: Some(s("w")) },
             ServerMsg::Attached { version: s("0.2.0"), features: Some(feature_names()) },
             ServerMsg::Open { url: s("https://example.com") },
+            ServerMsg::ClipboardFocus { pane: Some(7), agent: true },
+            ServerMsg::ClipboardFocus { pane: None, agent: false },
             ServerMsg::Clipboard { id: 1, origin: ClipboardOrigin::User, text: s("hello") },
             ServerMsg::AttachmentPrepared {
                 token: s("ab"),

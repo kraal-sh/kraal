@@ -90,6 +90,8 @@ pub fn bracket(text: &[u8]) -> Vec<u8> {
 struct Permissions {
     #[serde(default)]
     server: Vec<Permission>,
+    #[serde(default)]
+    clipboard_image: Vec<Permission>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -114,14 +116,27 @@ pub fn allowed(path: &Path, ssh: &[String]) -> bool {
     permissions(path).is_ok_and(|p| p.server.iter().any(|server| server.ssh == ssh))
 }
 
+pub fn image_allowed(path: &Path, ssh: &[String]) -> bool {
+    permissions(path).is_ok_and(|p| p.clipboard_image.iter().any(|server| server.ssh == ssh))
+}
+
+pub fn remember_image(path: &Path, ssh: &[String], name: &str) -> Result<()> {
+    remember_permission(path, ssh, name, true)
+}
+
 pub fn remember(path: &Path, ssh: &[String], name: &str) -> Result<()> {
+    remember_permission(path, ssh, name, false)
+}
+
+fn remember_permission(path: &Path, ssh: &[String], name: &str, image: bool) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
     crate::paths::locked(path, || {
         let mut p = permissions(path)?;
-        if !p.server.iter().any(|server| server.ssh == ssh) {
-            p.server.push(Permission { name: name.into(), ssh: ssh.to_vec() });
+        let entries = if image { &mut p.clipboard_image } else { &mut p.server };
+        if !entries.iter().any(|server| server.ssh == ssh) {
+            entries.push(Permission { name: name.into(), ssh: ssh.to_vec() });
         }
         crate::paths::write_atomic(path, toml::to_string_pretty(&p)?.as_bytes())?;
         Ok(())
@@ -178,6 +193,33 @@ mod tests {
         assert!(matches!(parser.feed(b"\x1b[200~/some/path\x1b[20").as_slice(), [Part::Start]));
         assert!(parser.idle().is_empty());
         assert!(matches!(parser.feed(b"1~").as_slice(), [Part::Paste(text)] if text == b"/some/path"));
+    }
+
+    #[test]
+    fn clipboard_permission_is_separate_from_existing_drop_permissions() {
+        let root = std::env::temp_dir().join(format!("kraal-image-permission-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("paste-files.toml");
+        let ssh = vec!["alice@box".into()];
+        std::fs::write(&path, "[[server]]\nname='box'\nssh=['alice@box']\n").unwrap();
+        assert!(allowed(&path, &ssh));
+        assert!(!image_allowed(&path, &ssh));
+        remember_image(&path, &ssh, "box").unwrap();
+        remember_image(&path, &ssh, "box").unwrap();
+        assert!(allowed(&path, &ssh));
+        assert!(image_allowed(&path, &ssh));
+        assert!(!image_allowed(&path, &["bob@box".into()]));
+        assert_eq!(permissions(&path).unwrap().clipboard_image.len(), 1);
+        let image_only = root.join("image-only.toml");
+        remember_image(&image_only, &ssh, "box").unwrap();
+        assert!(!allowed(&image_only, &ssh));
+        assert!(image_allowed(&image_only, &ssh));
+        std::fs::write(&path, "not valid toml").unwrap();
+        assert!(!image_allowed(&path, &ssh));
+        assert!(remember_image(&path, &ssh, "box").is_err());
+        std::fs::remove_file(&image_only).unwrap();
+        assert!(!image_allowed(&image_only, &ssh));
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

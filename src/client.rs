@@ -379,6 +379,7 @@ fn exchange(stream: &mut UnixStream, msg: &ClientMsg) -> Result<Result<Response,
                 | ServerMsg::Event { .. }
                 | ServerMsg::Events { .. }
                 | ServerMsg::Attached { .. }
+                | ServerMsg::ClipboardFocus { .. }
                 | ServerMsg::Clipboard { .. }
                 | ServerMsg::AttachmentPrepared { .. }
                 | ServerMsg::ClipboardImageOffer { .. }
@@ -1297,6 +1298,7 @@ pub fn attach(mut target: Target, mut workspace: Option<String>, mouse: bool, at
                 let mut clipboard_negotiated = false;
                 let mut attachments_negotiated = false;
                 let mut images_negotiated = false;
+                let mut agent_clipboard = false;
                 let mut next = Some(Ok(Some(first)));
                 let lost = loop {
                     match next.take().unwrap_or_else(|| protocol::read_frame(&mut frames)) {
@@ -1325,6 +1327,10 @@ pub fn attach(mut target: Target, mut workspace: Option<String>, mouse: bool, at
                                     && features
                                         .as_ref()
                                         .is_some_and(|fs| fs.iter().any(|f| f == protocol::CLIPBOARD_IMAGES.name));
+                                agent_clipboard = images_negotiated
+                                    && features
+                                        .as_ref()
+                                        .is_some_and(|fs| fs.iter().any(|f| f == protocol::AGENT_CLIPBOARD.name));
                                 attachments.negotiate(
                                     attachments_negotiated
                                         && features
@@ -1339,6 +1345,9 @@ pub fn attach(mut target: Target, mut workspace: Option<String>, mouse: bool, at
                             }
                             Ok(ServerMsg::Clipboard { id, origin, text }) if clipboard_negotiated => {
                                 clipboard.submit(id, origin, text);
+                            }
+                            Ok(msg @ ServerMsg::ClipboardFocus { .. }) if agent_clipboard => {
+                                attachments.message(msg);
                             }
                             Ok(msg @ ServerMsg::ClipboardImageOffer { .. }) if images_negotiated => {
                                 attachments.message(msg);
