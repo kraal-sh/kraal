@@ -613,6 +613,10 @@ impl Server {
             Mode::Prompt(p) => Some(overlays::draw_prompt(p, screen, buf)),
             Mode::AccountForm(form) => Some(super::account_ui::draw_form(form, screen, buf)),
             Mode::PaneForm(form) => Some(super::pane_ui::draw_form(form, screen, buf)),
+            Mode::TunnelDetails(details) => {
+                self.draw_tunnel_details(details, screen, buf);
+                Some(None)
+            }
             Mode::AccountDetails(details) => {
                 super::account_ui::draw_details(details, screen, buf);
                 None
@@ -677,6 +681,7 @@ impl Server {
             | Mode::Messages { .. }
             | Mode::Confirm(_)
             | Mode::Hints(_)
+            | Mode::TunnelDetails(_)
             | Mode::AccountDetails(_) => cursor = None,
             Mode::Search { .. } => {
                 // After the query, in the top bar.
@@ -1365,14 +1370,15 @@ impl Server {
                     super::net::TunnelState::Connecting => (t.icon(AgentState::Idle), t.working),
                     super::net::TunnelState::Down => (t.icon(AgentState::Blocked), t.blocked),
                 };
-                let detail = format!("{}:{}", tunnel.spec.server, tunnel.spec.remote_port);
-                let name = strong(format!(":{}", tunnel.spec.local));
+                let detail = format!("{} · localhost:{}", tunnel.state.label(), tunnel.spec.local);
+                let name =
+                    strong(format!("{} · {}:{}", tunnel.spec.server, tunnel.spec.remote_host, tunnel.spec.remote_port));
                 entry(
                     &mut rows,
                     SideItem::Tunnel(tunnel.spec.local),
                     dot(icon, color),
                     name,
-                    faint(detail, t.dim),
+                    faint(detail, color),
                     false,
                 );
             }
@@ -2108,6 +2114,38 @@ thread_local! {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tunnel_sidebar_shows_state_and_click_opens_details() {
+        let (tx, _rx) = super::super::event_channel(32);
+        let mut server = super::super::tests::server(tx);
+        let (client, _peer) = super::super::tests::client(&mut server);
+        let c = server.clients.get_mut(&client).unwrap();
+        (c.cols, c.rows) = (124, 36);
+        c.sidebar = Some(true);
+        for (state, label) in [
+            (super::super::net::TunnelState::Connecting, "Connecting"),
+            (super::super::net::TunnelState::Up, "Ready"),
+            (super::super::net::TunnelState::Down, "Error"),
+        ] {
+            server.tunnels = vec![super::super::net::test_tunnel(42, 15432, state)];
+            server.mark_dirty();
+            let rows = server.sidebar_rows(&server.clients[&client], 35, 1_000);
+            let shown: Vec<_> = rows
+                .iter()
+                .filter_map(|row| match row {
+                    SideRow::Entry { item: Some(SideItem::Tunnel(15432)), line, .. } => Some(line.to_string()),
+                    _ => None,
+                })
+                .collect();
+            assert!(shown.iter().any(|line| line.contains(label)), "{shown:?}");
+            assert!(shown.iter().any(|line| line.contains("localhost:15432")), "{shown:?}");
+            let y = (0..36).find(|&y| matches!(server.sidebar_hit(client, y), Some(SideItem::Tunnel(15432)))).unwrap();
+            server.clients.get_mut(&client).unwrap().mode = Mode::Normal;
+            server.client_input(client, format!("\x1b[<0;2;{}M", y + 1).as_bytes());
+            assert!(matches!(server.clients[&client].mode, Mode::TunnelDetails(_)));
+        }
+    }
 
     #[test]
     fn printing_four_panes_does_not_repeat_account_work() {

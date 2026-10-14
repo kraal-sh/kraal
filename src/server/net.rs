@@ -47,6 +47,16 @@ pub enum TunnelState {
     Down,
 }
 
+impl TunnelState {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Up => "Ready",
+            Self::Connecting => "Connecting",
+            Self::Down => "Error",
+        }
+    }
+}
+
 pub struct Tunnel {
     pub id: u32,
     pub spec: TunnelSpec,
@@ -66,6 +76,17 @@ pub struct Tunnel {
 }
 
 impl Tunnel {
+    pub(super) fn retry_seconds(&self) -> Option<u64> {
+        self.retry_at.map(|at| at.saturating_duration_since(Instant::now()).as_secs() + 1)
+    }
+
+    fn failed(&mut self, message: String) {
+        self.state = TunnelState::Down;
+        self.error = Some(message);
+        self.failures += 1;
+        self.retry_at = Some(Instant::now() + Duration::from_secs((2u64 << self.failures.min(5)).min(60)));
+    }
+
     /// Stop its ssh with what that started, and the reader of its stderr, never waiting for
     /// ssh; how it ended, if it had.
     fn stop(&mut self) -> Option<std::process::ExitStatus> {
@@ -351,6 +372,7 @@ impl Server {
         self.start_tunnel(&mut t);
         let info = TunnelInfo { id, spec: t.spec.clone(), state: t.state, error: t.error.clone() };
         self.tunnels.push(t);
+        self.refresh_tunnel_pickers();
         self.mark_persist();
         self.mark_dirty();
         Ok(info)
@@ -371,24 +393,32 @@ impl Server {
             .with_context(|| format!("no tunnel on localhost:{port} (see `kraal tunnel list`)"))?;
         let mut t = self.tunnels.remove(i);
         t.stop();
+        self.refresh_tunnel_pickers();
         self.mark_persist();
         self.mark_dirty();
         Ok(())
     }
 
+    pub(super) fn retry_tunnel(&mut self, id: u32) {
+        let Some(i) = self.tunnels.iter().position(|t| t.id == id && t.state == TunnelState::Down) else { return };
+        let mut t = self.tunnels.remove(i);
+        t.stop();
+        t.retry_at = None;
+        self.start_tunnel(&mut t);
+        self.tunnels.insert(i, t);
+        self.refresh_tunnel_pickers();
+        self.mark_dirty();
+    }
+
     fn start_tunnel(&self, t: &mut Tunnel) {
         let Some(s) = self.tunnel_target(&t.spec) else {
-            t.state = TunnelState::Down;
-            t.error = Some(format!("unknown server {}", t.spec.server));
+            t.failed(format!("unknown server {}", t.spec.server));
             return;
         };
         let args = tunnel_args(&s, &self.known_servers, &t.spec);
         // The port listening is how the tunnel shows it is up: it must not be another program's.
         if let Err(why) = port_free(t.spec.local) {
-            t.state = TunnelState::Down;
-            t.error = Some(why);
-            t.failures += 1;
-            t.retry_at = Some(Instant::now() + Duration::from_secs((2u64 << t.failures.min(5)).min(60)));
+            t.failed(why);
             return;
         }
         let mut cmd = Command::new("ssh");
@@ -415,11 +445,12 @@ impl Server {
                 }
                 t.child = Some(c);
                 t.state = TunnelState::Connecting;
+                t.error = None;
+                t.retry_at = None;
                 t.started = Instant::now();
             }
             Err(e) => {
-                t.state = TunnelState::Down;
-                t.error = Some(format!("cannot run ssh: {e}"));
+                t.failed(format!("cannot run ssh: {e}"));
             }
         }
     }
@@ -438,14 +469,10 @@ impl Server {
                 // What ssh started (a ProxyCommand) goes too, before ssh is reaped: until then
                 // its group id cannot be another's.
                 let status = t.stop();
-                t.failures += 1;
-                t.state = TunnelState::Down;
                 let msg = t.said.lock().map(|s| s.clone()).unwrap_or_default();
                 let status = status.map(|s| s.to_string()).unwrap_or_else(|| "ended".into());
-                t.error = Some(if msg.is_empty() { format!("ssh exited ({status})") } else { msg });
+                t.failed(if msg.is_empty() { format!("ssh exited ({status})") } else { msg });
                 events.push(("tunnel.down", t.spec.clone(), t.error.clone()));
-                let backoff = Duration::from_secs((2u64 << t.failures.min(5)).min(60));
-                t.retry_at = Some(Instant::now() + backoff);
                 changed = true;
             }
             if t.child.is_none() && t.retry_at.is_some_and(|r| r <= Instant::now()) {
@@ -463,6 +490,7 @@ impl Server {
         }
         self.tunnels = tunnels;
         if changed {
+            self.refresh_tunnel_pickers();
             self.mark_dirty();
         }
         for (ty, spec, error) in events {
@@ -474,6 +502,7 @@ impl Server {
             });
             self.emit(ty, fields);
         }
+        self.refresh_tunnel_results();
         self.open_pending();
     }
 
@@ -552,6 +581,23 @@ impl Server {
 }
 
 #[cfg(test)]
+pub(super) fn test_tunnel(id: u32, local: u16, state: TunnelState) -> Tunnel {
+    Tunnel {
+        id,
+        spec: TunnelSpec { server: "db".into(), via: None, local, remote_host: "localhost".into(), remote_port: 5432 },
+        state,
+        error: None,
+        child: None,
+        said: Default::default(),
+        ready: Default::default(),
+        stop_reading: Default::default(),
+        started: Instant::now(),
+        retry_at: None,
+        failures: 0,
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -616,6 +662,66 @@ mod tests {
         assert_eq!(parse_remote("db.internal:5432").unwrap(), ("db.internal".to_string(), 5432));
         assert_eq!(parse_remote("[::1]:80").unwrap(), ("::1".to_string(), 80));
         assert!(parse_remote("x:notaport").is_err());
+    }
+
+    #[test]
+    fn retries_keep_the_port_report_backoff_and_stop_cancels_them() {
+        let (tx, _rx) = super::super::event_channel(32);
+        let mut server = super::super::tests::server(tx);
+        let busy = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = busy.local_addr().unwrap().port();
+        let mut tunnel = test_tunnel(42, port, TunnelState::Down);
+        tunnel.failed("Can't reach db.".into());
+        assert_eq!(tunnel.retry_seconds(), Some(4));
+        server.tunnels.push(tunnel);
+        server.retry_tunnel(42);
+        let t = &mut server.tunnels[0];
+        assert_eq!(t.state, TunnelState::Down);
+        assert_eq!(t.spec.local, port);
+        assert!(t.error.as_deref().unwrap().contains(&port.to_string()));
+        assert_eq!(t.retry_seconds(), Some(8));
+        t.retry_at = Some(Instant::now());
+        server.check_tunnels();
+        assert_eq!(server.tunnels[0].retry_seconds(), Some(16));
+        assert_eq!(server.tunnels[0].spec.local, port);
+        server.remove_tunnel(&port.to_string()).unwrap();
+        server.check_tunnels();
+        assert!(server.tunnels.is_empty());
+        assert!(server.persist_dirty);
+    }
+
+    #[test]
+    fn readiness_and_later_failure_update_the_list_and_keep_wire_state_names() {
+        let (tx, _rx) = super::super::event_channel(32);
+        let mut server = super::super::tests::server(tx);
+        let (client, _peer) = super::super::tests::client(&mut server);
+        let mut t = test_tunnel(42, 15432, TunnelState::Connecting);
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "read line"]).stdin(Stdio::piped());
+        t.child = Some(crate::exec::own_group(&mut cmd).spawn().unwrap());
+        t.ready.store(true, Ordering::SeqCst);
+        server.tunnels.push(t);
+        server.clients.get_mut(&client).unwrap().mode = super::super::ui::Mode::Picker(server.tunnel_picker());
+        server.check_tunnels();
+        assert_eq!(server.tunnels[0].state, TunnelState::Up);
+        assert_eq!(serde_json::to_value(server.tunnel_infos()).unwrap()[0]["state"], "up");
+        let super::super::ui::Mode::Picker(picker) = &server.clients[&client].mode else { panic!() };
+        assert_eq!(picker.current().unwrap().detail, "Ready");
+        server.tunnels[0].child.as_mut().unwrap().stdin.take();
+        let start = Instant::now();
+        while !crate::exec::has_exited(server.tunnels[0].child.as_ref().unwrap()) {
+            assert!(start.elapsed() < crate::testing::PATIENCE);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        *server.tunnels[0].said.lock().unwrap() = "Connection lost".into();
+        server.check_tunnels();
+        assert_eq!(server.tunnels[0].state, TunnelState::Down);
+        assert_eq!(server.tunnels[0].error.as_deref(), Some("Connection lost"));
+        assert!(server.tunnels[0].retry_at.is_some());
+        let super::super::ui::Mode::Picker(picker) = &server.clients[&client].mode else { panic!() };
+        assert_eq!(picker.current().unwrap().detail, "Error: Connection lost");
+        assert_eq!(serde_json::to_value(server.tunnel_infos()).unwrap()[0]["state"], "down");
+        server.remove_tunnel("15432").unwrap();
     }
 
     #[test]

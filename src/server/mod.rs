@@ -37,6 +37,7 @@ pub mod runbooks;
 mod server_ui;
 mod ssh;
 mod tools;
+mod tunnel_ui;
 mod ui;
 mod workspace_files;
 mod workspace_lifecycle;

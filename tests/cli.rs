@@ -7971,7 +7971,7 @@ fn picker_actions_and_footers_follow_the_line_at_both_sizes() {
         client.wait_for_row("⏎ open group");
         client.send(b"\t");
         let rows = client.wait_for_row("Run a command on it");
-        for absent in ["Connect in a new tab", "Browse its files", "Forward one", "Remove saved server"] {
+        for absent in ["Connect in a new tab", "Browse its files", "Add tunnel", "Remove saved server"] {
             assert!(!rows.iter().any(|r| r.contains(absent)), "{size:?}: {absent}");
         }
         click(&mut client, "Run a command on it");
@@ -13046,5 +13046,88 @@ fn file_review_rechecks_changes_stops_only_on_confirmation_and_undo_keeps_the_lo
         assert_eq!(panes[0]["suspended"], true);
         assert!(!path.exists());
         assert!(!marker.exists());
+    }
+}
+
+#[test]
+fn tunnel_form_shows_the_port_and_live_results_can_retry_and_stop() {
+    for size in [(80, 24), (124, 36)] {
+        let env = Env::new(&format!("tunnel-form-{}", size.0));
+        let bin = env.root.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        write_script(
+            &bin.join("ssh"),
+            "#!/bin/sh\n\
+             prev=; for a; do [ \"$prev\" = -L ] && fwd=$a; prev=$a; done\n\
+             echo started >> \"$HOME/tunnel-starts\"\n\
+             while [ ! -f \"$HOME/tunnel-release\" ]; do sleep 0.05; done\n\
+             if [ ! -f \"$HOME/tunnel-ready\" ]; then echo 'Cannot reach db' >&2; exit 255; fi\n\
+             port=${fwd#127.0.0.1:}; port=${port%%:*}\n\
+             echo \"debug1: Local forwarding listening on 127.0.0.1 port $port.\" >&2\n\
+             echo 'debug1: channel 0: new port-listener [port listener]' >&2\n\
+             exec sleep 600\n",
+        );
+        let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap_or_default());
+        let config = env.root.join("config/kraal/config.toml");
+        let text = std::fs::read_to_string(&config).unwrap();
+        std::fs::write(&config, format!("{text}[sidebar]\nvisible = false\n")).unwrap();
+        std::fs::write(env.root.join("config/kraal/servers.toml"), "[[server]]\nname = \"db\"\nhost = \"db.lan\"\n")
+            .unwrap();
+        env.workspace("w", "layout {\n    pane name=\"shell\"\n}\n");
+        let out = env.cmd(&["open", "w"]).env("PATH", &path).output().unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        let mut client = RawClient::attach_sized(&env, Some("w"), size);
+        client.send(b"\x02So");
+        client.wait_for_row("+ Add tunnel");
+        click_account_text(&mut client, "+ Add tunnel");
+        client.wait_for_row("Server    Name or user@host");
+        client.close_overlay("Server    Name or user@host");
+        client.close_overlay("+ Add tunnel");
+        client.send(b"\x02sdb\x0f");
+        client.wait_for_row("Server    db");
+        let busy = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = busy.local_addr().unwrap().port();
+        client.send(format!("localhost:{port}").as_bytes());
+        client.wait_for_row(&format!("Local     {port}"));
+        client.send(b"\r");
+        client.wait_for_row("used by another program");
+        let rows = client.wait_for_row("Use ");
+        let suggested: u16 = rows
+            .iter()
+            .filter_map(|r| r.split("Use ").nth(1))
+            .find_map(|s| s.chars().take_while(char::is_ascii_digit).collect::<String>().parse().ok())
+            .unwrap();
+        assert_ne!(suggested, port);
+        assert_eq!(env.run(&["tunnel", "list"]).trim(), "no tunnels");
+        click_account_text(&mut client, &format!("Use {suggested}"));
+        client.wait_for_row(&format!("Local     {suggested}"));
+        assert_eq!(env.run(&["tunnel", "list"]).trim(), "no tunnels");
+        click_account_text(&mut client, "Add]");
+        client.wait_for_row("Connecting");
+        assert!(env.run(&["tunnel", "list"]).contains(&format!("localhost:{suggested}")));
+        client.send(b"\r");
+        client.wait_for_row("Tunnel · db");
+        client.wait_for_row("[> Close]");
+        std::fs::write(env.root.join("home/tunnel-release"), "").unwrap();
+        client.wait_for_row("Cannot reach db");
+        client.wait_for_row("Retrying in ");
+        std::fs::write(env.root.join("home/tunnel-ready"), "").unwrap();
+        click_account_text(&mut client, "Retry now]");
+        client.wait_for_row("Ready");
+        assert!(env.run(&["tunnel", "list"]).starts_with("up"));
+        client.close_overlay("Tunnel · db");
+        client.wait_for_row("Ready");
+        client.send(b"\t");
+        client.wait_for_row("Stop");
+        click_account_text(&mut client, "Stop");
+        client.wait_for_rows("the stopped tunnel left the list", |rows| {
+            rows.iter().any(|r| r.contains("+ Add tunnel")) && !rows.iter().any(|r| r.contains("Ready"))
+        });
+        assert_eq!(env.run(&["tunnel", "list"]).trim(), "no tunnels");
+        let workspaces: serde_json::Value = serde_json::from_str(&env.run(&["workspaces", "--json"])).unwrap();
+        assert!(
+            workspaces.as_array().unwrap().iter().any(|w| w["name"] == "w" && w["open"] == true),
+            "stopping the tunnel keeps the workspace open"
+        );
     }
 }

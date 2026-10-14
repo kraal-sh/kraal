@@ -94,6 +94,12 @@ configuration, protocol messages and the 0.2.0 and 0.3.0 state paths remain unch
 from those releases can use these actions on a current server. An older running server keeps
 its existing source-file behavior until restarted.
 
+The tunnel form, list and result controls use the existing attached-terminal input protocol.
+They keep the saved tunnel fields and wire state names (`connecting`, `up`, `down`) unchanged;
+**Ready** is the UI label for `up`. The CLI still chooses an available port when `--local` is
+omitted. No configuration, KDL or session format changes are needed, and legacy state paths
+remain untouched. Older running servers keep their existing tunnel UI until restarted.
+
 ## For contributors: how the protocol changes
 
 The client and the server exchange JSON messages (`src/protocol.rs`, whose comments hold the

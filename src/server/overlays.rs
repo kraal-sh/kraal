@@ -644,6 +644,9 @@ pub(super) fn prompt_layout(p: &Prompt, screen: Rect) -> PromptLayout {
 }
 
 pub(super) fn draw_prompt(p: &Prompt, screen: Rect, buf: &mut Buffer) -> Option<Cursor> {
+    if p.tunnel_form.is_some() {
+        return super::tunnel_ui::draw_form(p, screen, buf);
+    }
     if p.server_form.is_some() {
         return super::server_ui::draw_form(p, screen, buf);
     }
