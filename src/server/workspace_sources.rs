@@ -252,6 +252,46 @@ pub(super) mod tests {
     }
 
     #[test]
+    fn personal_layout_edits_never_change_the_source_status_even_after_restart() {
+        let (mut server, path, ws) = setup("personal-edits");
+        server.refresh_source_status();
+        assert_eq!(server.workspaces[0].source_status, None);
+        server.workspaces[0].name = "personal name".into();
+        server
+            .spawn_pane_in(
+                ws,
+                None,
+                crate::pane::PaneSpec { files: Some(["/missing".into(), "/missing".into()]), ..Default::default() },
+                crate::protocol::Placement::Tab,
+                Some("another local pane".into()),
+            )
+            .unwrap();
+        server.refresh_source_status();
+        assert_eq!(server.workspaces[0].source_status, None);
+        assert_eq!(server.workspaces[0].counts(), (2, 2));
+
+        for changed in [false, true] {
+            if changed {
+                std::fs::write(&path, CHANGED).unwrap();
+            }
+            let expected = changed.then_some("File changed");
+            server.refresh_source_status();
+            assert_eq!(server.workspaces[0].source_status, expected);
+            let saved = serde_json::to_vec(&persist::snapshot(&server)).unwrap();
+            let (tx, _rx) = super::super::queue::channel(32);
+            let mut restored = super::super::tests::server(tx);
+            restored.apply_snapshot(serde_json::from_slice(&saved).unwrap()).unwrap();
+            restored.refresh_source_status();
+            assert_eq!(restored.workspaces[0].source_status, expected);
+            assert_eq!(restored.workspaces[0].counts(), (2, 2));
+            let picker = restored.workspace_picker(restored.workspaces[0].id);
+            assert_eq!(picker.items[0].detail.contains("File changed"), changed);
+        }
+        assert_eq!(server.workspaces[0].definition_source.as_deref(), Some(ORIGINAL));
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
     fn changed_twice_keep_layout_is_revision_specific_and_never_authorizes_export() {
         let (mut server, path, ws) = setup("twice");
         let before = serde_json::to_value(persist::snapshot(&server)).unwrap();

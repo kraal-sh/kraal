@@ -102,6 +102,81 @@ fn layout_survives_a_server_restart() {
 }
 
 #[test]
+fn migrated_source_status_tracks_disk_edits_across_restarts() {
+    source_status_tracks_disk_edits_across_restarts(false);
+}
+
+#[test]
+fn already_migrated_source_status_tracks_disk_edits_across_restarts() {
+    source_status_tracks_disk_edits_across_restarts(true);
+}
+
+fn source_status_tracks_disk_edits_across_restarts(already_migrated: bool) {
+    let env = Env::new(if already_migrated { "current-source-baseline" } else { "source-baseline" });
+    let source = "// Original source\nlayout { pane name=\"original\"; }\n";
+    env.workspace("source", source);
+    env.workspace("closed", source);
+    env.run(&["open", "source"]);
+    env.run(&["run", "--tab", "--name", "local", "--", "sh"]);
+    env.run(&["kill"]);
+    let mut old: serde_json::Value = serde_json::from_slice(&std::fs::read(env.state_file()).unwrap()).unwrap();
+    old["workspaces"][0].as_object_mut().unwrap().remove("definition_source");
+    if already_migrated {
+        std::fs::write(env.state_file(), serde_json::to_vec(&old).unwrap()).unwrap();
+    }
+    old["version"] = serde_json::json!(1);
+    old["revision"] = serde_json::json!(1);
+    old.as_object_mut().unwrap().remove("workspace_order");
+    for field in ["id", "definition_source"] {
+        old["workspaces"][0].as_object_mut().unwrap().remove(field);
+    }
+    let legacy = serde_json::to_vec(&old).unwrap();
+    std::fs::create_dir_all(env.legacy_state_file().parent().unwrap()).unwrap();
+    std::fs::write(env.legacy_state_file(), &legacy).unwrap();
+    if !already_migrated {
+        std::fs::remove_file(env.state_file()).unwrap();
+    }
+
+    for restart in [false, true] {
+        env.run(&["open", "source"]);
+        if !restart {
+            env.run(&["run", "--tab", "--name", "later", "--", "sh"]);
+        }
+        let mut client = RawClient::attach(&env, "source");
+        client.wait_for_message("\"attached\"");
+        client.send(b"\x02w");
+        let rows = client.wait_for_row("3 tabs · 3 panes");
+        assert!(!rows.iter().any(|r| r.contains("File changed")), "{rows:?}");
+        assert!(rows.iter().any(|r| r.contains("Closed")), "{rows:?}");
+        env.run(&["kill"]);
+        let saved: serde_json::Value = serde_json::from_slice(&std::fs::read(env.state_file()).unwrap()).unwrap();
+        assert_eq!(saved["workspaces"][0]["definition_source"], source);
+    }
+
+    env.run(&["open", "source"]);
+    let path = env.root.join("config/kraal/workspaces/source.kdl");
+    std::fs::write(&path, "layout { pane name=\"changed\"; }").unwrap();
+    for restart in [false, true] {
+        if restart {
+            env.run(&["open", "source"]);
+        }
+        let mut client = RawClient::attach(&env, "source");
+        client.wait_for_message("\"attached\"");
+        client.send(b"\x02w");
+        // In-place writes do not wake the directory watcher. An idle server scans every 30 seconds.
+        wait_until(PATIENCE, "the source edit was not noticed", || {
+            client.rows().iter().any(|r| r.contains("File changed"))
+        });
+        client.wait_for_row("File changed");
+        client.send(b"\t");
+        click_account_text(&mut client, "Review");
+        client.wait_for_row("Saved workspace: 3 tabs · 3 panes");
+        env.run(&["kill"]);
+    }
+    assert_eq!(std::fs::read(env.legacy_state_file()).unwrap(), legacy);
+}
+
+#[test]
 fn legacy_files_stay_unchanged_through_migration_and_workspace_lifecycle() {
     let env = Env::new("wsidentity");
     let source = "// Keep this source\nlayout { pane name=\"source-pane\"; }\n";

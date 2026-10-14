@@ -2,6 +2,40 @@
 
 use super::*;
 
+pub(super) fn read_current(path: &Path, data: &[u8], convert: bool) -> Result<SessionSnapshot> {
+    let snap = parse(data)?;
+    if !convert {
+        return Ok(snap);
+    }
+    let mut value: serde_json::Value = serde_json::from_slice(data)?;
+    let mut changed = false;
+    for (ws, saved) in value["workspaces"].as_array_mut().unwrap().iter_mut().zip(&snap.workspaces) {
+        changed |= record_source(ws, saved);
+    }
+    if !changed {
+        return Ok(snap);
+    }
+    let updated = serde_json::to_vec_pretty(&value)?;
+    let snap = parse(&updated)?;
+    anyhow::ensure!(paths::read_regular(path, u64::MAX)? == data, "state changed during migration; retry");
+    paths::write_private(path, &updated).context("saving missing workspace source baselines")?;
+    sync_directory(path.parent().context("no directory for the state")?)?;
+    Ok(snap)
+}
+
+fn record_source(ws: &mut serde_json::Value, saved: &WorkspaceSnap) -> bool {
+    // Older sessions lack source contents. Use the file at migration as the baseline,
+    // never the independently edited personal layout.
+    if saved.definition_source.is_none()
+        && let Some(path) = &saved.definition
+        && let Ok(source) = paths::read_regular_text(path, u64::MAX)
+    {
+        ws["definition_source"] = serde_json::json!(source);
+        return true;
+    }
+    false
+}
+
 pub(super) fn read(path: &Path, data: &[u8], to: &Path, scrollback: &Path, convert: bool) -> Result<SessionSnapshot> {
     let (snap, updated) = migrate(data)?;
     if !convert {
@@ -70,6 +104,7 @@ fn migrate(data: &[u8]) -> Result<(SessionSnapshot, Vec<u8>)> {
             }
             ws["id"] = serde_json::json!(id);
         }
+        record_source(ws, saved);
         for tab in ws["tabs"].as_array_mut().unwrap() {
             if revision == 0 && tab["name"].as_str().is_some_and(old_tab_name) {
                 tab["name"] = serde_json::json!("");
@@ -280,6 +315,110 @@ mod tests {
         assert_eq!(std::fs::read(&path).unwrap(), source);
         assert!(!paths::session_state_path(&session).exists());
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn migration_records_missing_source_contents_once_without_changing_the_personal_layout() {
+        let dir = directory("source-baseline");
+        let (path, _) = source_in(&dir);
+        let source_path = dir.join("source.kdl");
+        let source = "// Keep comments and formatting.\nlayout { pane; pane; }\n";
+        std::fs::write(&source_path, source).unwrap();
+        let mut old = legacy_state();
+        old["workspaces"][0]["definition"] = serde_json::json!(source_path);
+        old["workspaces"][0].as_object_mut().unwrap().remove("definition_source");
+        let original = serde_json::to_vec(&old).unwrap();
+        std::fs::write(&path, &original).unwrap();
+
+        let migrated = load_from(&dir).unwrap().unwrap();
+        assert_eq!(migrated.workspaces[0].definition_source.as_deref(), Some(source));
+        assert_eq!(migrated.workspaces[0].counts(), (1, 1));
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        assert_eq!(std::fs::read_to_string(&source_path).unwrap(), source);
+        let current = std::fs::read(dir.join("sessions-v2/main.json")).unwrap();
+        let mut value: serde_json::Value = serde_json::from_slice(&current).unwrap();
+        value["version"] = serde_json::json!(1);
+        value["revision"] = serde_json::json!(1);
+        value["workspaces"][0].as_object_mut().unwrap().remove("id");
+        value["workspaces"][0].as_object_mut().unwrap().remove("definition_source");
+        assert_eq!(value, old, "only migration metadata and the source baseline change");
+
+        for contents in [source, "layout { pane command=\"changed\"; }"] {
+            std::fs::write(&source_path, contents).unwrap();
+            let restarted = load_from(&dir).unwrap().unwrap();
+            assert_eq!(restarted.workspaces[0].definition_source.as_deref(), Some(source));
+            assert_eq!(std::fs::read(dir.join("sessions-v2/main.json")).unwrap(), current);
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn loading_current_state_records_only_missing_source_baselines_once() {
+        let dir = directory("current-source-baseline");
+        let (legacy, original) = source_in(&dir);
+        load_from(&dir).unwrap().unwrap();
+        let path = dir.join("sessions-v2/main.json");
+        let source_path = dir.join("source.kdl");
+        let source = "// Source differs from the personal layout.\nlayout { pane; pane; }\n";
+        std::fs::write(&source_path, source).unwrap();
+        let mut old: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        old["workspaces"][0]["definition"] = serde_json::json!(source_path);
+        let mut known = old["workspaces"][0].clone();
+        known["id"] = serde_json::json!("known-source");
+        known["closed"] = serde_json::json!(true);
+        old["workspaces"].as_array_mut().unwrap().push(known);
+        old["workspaces"][0].as_object_mut().unwrap().remove("definition_source");
+        let bytes = serde_json::to_vec(&old).unwrap();
+        std::fs::write(&path, &bytes).unwrap();
+
+        let inspected = read_from(&path, &legacy, &dir.join("scrollback-v2/main"), false).unwrap().unwrap();
+        assert!(inspected.workspaces[0].definition_source.is_none());
+        assert_eq!(std::fs::read(&path).unwrap(), bytes, "inspection never writes a baseline");
+        let loaded = load_from(&dir).unwrap().unwrap();
+        assert_eq!(loaded.workspaces[0].definition_source.as_deref(), Some(source));
+        assert_eq!(loaded.workspaces[0].counts(), (1, 1));
+        let current = std::fs::read(&path).unwrap();
+        let mut value: serde_json::Value = serde_json::from_slice(&current).unwrap();
+        value["workspaces"][0].as_object_mut().unwrap().remove("definition_source");
+        assert_eq!(value, old, "the layout, existing baseline and unknown fields stay unchanged");
+
+        for contents in [source, "layout { pane command=\"changed\"; }"] {
+            std::fs::write(&source_path, contents).unwrap();
+            let restarted = load_from(&dir).unwrap().unwrap();
+            assert_eq!(restarted.workspaces[0].definition_source.as_deref(), Some(source));
+            assert_eq!(std::fs::read(&path).unwrap(), current);
+            assert_eq!(std::fs::read_to_string(&source_path).unwrap(), contents);
+        }
+        assert_eq!(std::fs::read(&legacy).unwrap(), original);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn migration_preserves_known_sources_and_tolerates_unavailable_ones() {
+        let dir = directory("source-errors");
+        let path = dir.join("source.kdl");
+        let mut old = legacy_state();
+        old["workspaces"][0]["definition"] = serde_json::json!(path);
+        std::fs::write(&path, "layout { pane command=\"edited\"; }").unwrap();
+        let (snap, _) = migrate(&serde_json::to_vec(&old).unwrap()).unwrap();
+        assert_eq!(snap.workspaces[0].definition_source.as_deref(), old["workspaces"][0]["definition_source"].as_str());
+
+        old["workspaces"][0]["definition_source"] = serde_json::Value::Null;
+        std::fs::remove_file(&path).unwrap();
+        for unavailable in [&path, &dir] {
+            old["workspaces"][0]["definition"] = serde_json::json!(unavailable);
+            let (snap, _) = migrate(&serde_json::to_vec(&old).unwrap()).unwrap();
+            assert!(snap.workspaces[0].definition_source.is_none());
+            assert_eq!(snap.workspaces[0].tabs.len(), 1);
+        }
+        old["workspaces"][0]["definition"] = serde_json::json!(path);
+        std::fs::write(&path, [0xff]).unwrap();
+        let (snap, _) = migrate(&serde_json::to_vec(&old).unwrap()).unwrap();
+        assert!(snap.workspaces[0].definition_source.is_none());
+        std::fs::write(&path, "layout {").unwrap();
+        let (snap, _) = migrate(&serde_json::to_vec(&old).unwrap()).unwrap();
+        assert_eq!(snap.workspaces[0].definition_source.as_deref(), Some("layout {"));
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
