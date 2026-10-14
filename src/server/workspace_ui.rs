@@ -45,7 +45,7 @@ fn verb(p: &Prompt) -> &'static str {
         };
     }
     if p.workspace_form.as_ref().is_some_and(|f| f.result.is_some()) {
-        return "Done";
+        return "Close";
     }
     if matches!(p.action, PromptAction::ExportWorkspace(_)) {
         if p.error.is_some() { "Retry" } else { "Export" }
@@ -95,6 +95,13 @@ fn field_count(p: &Prompt) -> usize {
 
 fn buttons(p: &Prompt) -> forms::Buttons<'static> {
     let count = field_count(p);
+    if p.workspace_form.as_ref().is_some_and(|f| f.result.is_some()) {
+        return forms::Buttons {
+            primary: forms::Button { field: 0, label: "Close" },
+            alternate: None,
+            cancel: forms::Button { field: 0, label: "Close" },
+        };
+    }
     if matches!(p.action, PromptAction::ReviewWorkspace(_)) {
         let form = p.workspace_form.as_ref().unwrap();
         return forms::Buttons {
@@ -1329,6 +1336,24 @@ mod tests {
     }
 
     #[test]
+    fn add_workspace_buttons_share_one_rendered_row() {
+        for (cols, rows) in [(80, 24), (124, 36)] {
+            let p = Prompt::new("Add workspace", "web", PromptAction::NewWorkspace);
+            let area = Rect::new(0, 0, cols, rows);
+            let mut buf = Buffer::empty(area);
+            draw_form(&p, area, &mut buf);
+            let shown = text(&buf);
+            assert!(
+                buf.content.chunks(cols as usize).any(|row| {
+                    let row: String = row.iter().map(|c| c.symbol()).collect();
+                    row.contains("[> Add]") && row.contains("[  From file...]") && row.contains("[  Cancel]")
+                }),
+                "{shown}"
+            );
+        }
+    }
+
+    #[test]
     fn export_result_keeps_the_full_path_readable_and_returns_to_the_list() {
         let (tx, _rx) = super::super::queue::channel(32);
         let mut server = super::super::tests::server(tx);
@@ -1347,9 +1372,11 @@ mod tests {
             p.scroll = layout.max_scroll;
             let mut buf = Buffer::empty(area);
             assert!(draw_form(&p, area, &mut buf).is_none());
-            for expected in ["Layout exported", "shared.kdl", "Enter Done", "Esc Close"] {
+            for expected in ["Layout exported", "shared.kdl", "Enter Close", "Esc Close"] {
                 assert!(text(&buf).contains(expected), "{}", text(&buf));
             }
+            assert_eq!(text(&buf).matches("[> Close]").count(), 1);
+            assert!(!text(&buf).contains("Done") && !text(&buf).contains("Tab Next"));
             let Mode::Picker(p) = server.on_workspace_form(client, p, key("enter")) else { panic!() };
             assert_eq!(p.current().unwrap().action.workspace(), Some(ws));
         }

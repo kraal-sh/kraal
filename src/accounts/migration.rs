@@ -25,7 +25,7 @@ impl Account {
 }
 
 /// Remove the empty sections older kraal versions wrote, using their source spans so that
-/// comments and everything outside those sections keep their exact spelling and position.
+/// comments and unrelated formatting stay intact.
 pub(super) fn without_empty_sections(mut text: String) -> Result<String> {
     let doc = toml_edit::Document::parse(text.as_str())?;
     let mut remove = Vec::new();
@@ -46,6 +46,13 @@ pub(super) fn without_empty_sections(mut text: String) -> Result<String> {
         let end = text[span.end..].find('\n').map_or(text.len(), |i| span.end + i + 1);
         // Drop a line only when removing its syntax leaves no comment on it.
         if text[start..span.start].trim().is_empty() && text[span.end..end].trim().is_empty() {
+            let mut end = end;
+            if text[..start].lines().next_back().is_some_and(|line| line.trim().is_empty()) {
+                // Removing a section joins its surrounding blank lines into one separator.
+                while let Some(line) = text[end..].split_inclusive('\n').next().filter(|line| line.trim().is_empty()) {
+                    end += line.len();
+                }
+            }
             text.replace_range(start..end, "");
         } else {
             text.replace_range(span, "");
@@ -189,13 +196,24 @@ mod tests {
     }
 
     #[test]
+    fn removed_legacy_sections_leave_one_blank_line_without_reformatting_other_content() {
+        for newline in ["\n", "\r\n"] {
+            let source = "# Accounts.\n\nrule = []\n\n[limits]\nthreshold = 90\nmode = 'notify'\n\n[claude]\n\n# My settings.\n\n\n[custom]\ncolor = 'blue'\n".replace('\n', newline);
+            let expected = "# Accounts.\n\n[limits]\nthreshold = 90\nmode = 'notify'\n\n# My settings.\n\n\n[custom]\ncolor = 'blue'\n".replace('\n', newline);
+            let written = changed_text("empty-spacing", &source, |all| all.save());
+            assert_eq!(written, expected);
+            assert_eq!(changed_text("empty-spacing-again", &written, |all| all.save()), written);
+        }
+    }
+
+    #[test]
     fn empty_sections_go_when_the_file_is_rewritten_and_their_comments_stay() {
         let old = "# My accounts.\nrule = []\n\n[claude]\n\n[limits]\nthreshold = 85 # mine\n";
         let text = changed_text("empty", old, |all| {
             all.limits.threshold = 70;
             Ok(())
         });
-        assert_eq!(text, old.replace("rule = []\n", "").replace("[claude]\n", "").replace("85", "70"));
+        assert_eq!(text, "# My accounts.\n\n[limits]\nthreshold = 70 # mine\n");
         assert_eq!(changed_text("empty-again", &text, |all| all.save()), text);
 
         let old = "# My accounts.\n'rule' = [ # contexts\n    # No rules yet.\n] # later\ncolor = 'blue'\n\n\

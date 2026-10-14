@@ -162,10 +162,11 @@ A successful, verified sign-in closes the pane automatically.
 
 ## Lists, fields and questions
 
-In lists, type to filter, `↑↓` move, Enter or one click chooses, **Tab shows what else can be done** with the
+In lists, type in **Search** to filter, `↑↓` move, Enter or one click chooses, **Tab shows what else can be done** with the
 selected item (connect in a new tab, browse its files, run a command…). Most also have a key
 shown by the list; Duplicate, Move up, Move down and Delete are only in the workspace actions.
-Esc closes. The footer says what Enter does on the selected line;
+Esc closes. Shared lists, forms, action menus and questions spell out their keys, for example
+**Enter Open · Tab Actions · Esc Close**. The footer says what Enter does on the selected line;
 only actions that apply to that line are offered. When there are no other actions, Tab moves
 to the next line. Text fields edit like a shell line (arrows, `home`/`end`,
 `alt+←→`, `ctrl+w`, `ctrl+u`, `ctrl+k`). In Add workspace, Rename workspace, Duplicate workspace and Export layout,
@@ -174,13 +175,15 @@ Long errors scroll with `pageup`/`pagedown` or the mouse wheel;
 the input and the keys to retry or cancel stay visible. Editing the value clears the error.
 Workspace search never creates a workspace. **+ Add workspace** or `ctrl+b W n` opens the
 shared form; Enter or its **Add** button creates it. In Add workspace, Rename workspace and Duplicate workspace,
-Tab moves between **Name**, the action button and **Cancel**. Esc returns to the list's search
+Tab moves between **Name** and the buttons, including **From file...** in Add workspace.
+Buttons share one row whenever they fit. Esc returns to the list's search
 and selection. In Workspaces, Tab or a right click offers **Rename** and **Duplicate** for an open or closed saved
 workspace, **Export layout** also while closed, **Close** only while open, and **Delete** for a
 saved workspace or an unimported file.
 In **Deleted workspaces**, Enter or a click restores the selected row, and Esc goes back.
 If the old name is already used, the same Name form proposes a free name and offers **Restore**.
-Questions show two buttons, Cancel first: `y` answers
+A question uses the question itself as its title and shows two buttons, Cancel first.
+Its footer follows the selected button: **Enter Cancel · Tab Choose · Esc Cancel** initially. `y` answers
 yes, `n` or Esc no, Enter takes the selected button (`←→` or Tab change it). A question longer
 than its box says how many lines are below and scrolls: `↑↓` (or `j` `k`) by a line, `pageup`
 `pagedown` (or `space`) by what the box shows, `home` (or `g`) back to the top. What a question

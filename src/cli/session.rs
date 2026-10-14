@@ -255,7 +255,7 @@ pub(super) fn open(s: &Session, name: String) -> Result<()> {
     }
     client::ensure_server(&s.name)?;
     s.request(Request::OpenWorkspace { name: name.clone() })?;
-    println!("workspace {name} is open; `kraal attach {name}` to see it");
+    println!("workspace \"{name}\" is open; `kraal attach {name}` to see it");
     Ok(())
 }
 
@@ -265,7 +265,7 @@ pub(super) fn save(s: &Session, name: Option<String>, workspace: Option<String>)
     let workspace = workspace.or_else(|| s.own_workspace());
     if let Response::Path(p) = s.request(Request::SaveWorkspace { workspace, name })? {
         eprintln!("Workspaces are saved automatically. `kraal save` exports a KDL layout.");
-        println!("saved {}", p.display());
+        println!("saved {}", paths::shorten_home(&p));
     }
     Ok(())
 }
@@ -293,7 +293,7 @@ pub(super) fn import(s: &Session, file: PathBuf, name: Option<String>, yes: bool
         bail!("unexpected answer")
     };
     let name = name.unwrap_or_else(|| preview.definition.name.clone());
-    println!("{}\nName: {name}\n{}", path.display(), preview.summary());
+    println!("{}\nName: {name}\n{}", paths::shorten_home(&path), preview.summary());
     let mut accounts = Vec::new();
     for missing in &preview.accounts {
         use std::io::{IsTerminal, Write};
@@ -337,7 +337,7 @@ pub(super) fn import(s: &Session, file: PathBuf, name: Option<String>, yes: bool
         return Ok(());
     }
     s.request(Request::ImportWorkspace { path, name: Some(name.clone()), expected: Some(preview.revision), accounts })?;
-    println!("Workspace {name} added. Commands wait for you to start them.");
+    println!("Workspace \"{name}\" added. Commands wait for you to start them.");
     Ok(())
 }
 
@@ -367,7 +367,7 @@ pub(super) fn export(s: &Session, file: PathBuf, workspace: Option<String>, repl
         path,
         expected: Some(revision),
     })? {
-        println!("Layout exported\n{}", path.display());
+        println!("Layout exported\n{}", paths::shorten_home(&path));
     }
     Ok(())
 }

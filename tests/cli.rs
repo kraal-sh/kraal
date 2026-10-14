@@ -7127,11 +7127,14 @@ impl RawClient {
         loop {
             // The footer is drawn last: the box above it is whole.
             let screen = self.wait_for_rows("the question, further down", |rows| {
-                rows.iter().any(|r| r.contains("y yes")) && Some(below(rows)) != before
+                rows.iter().any(|r| r.contains("Enter Cancel") && r.contains("Esc Cancel"))
+                    && Some(below(rows)) != before
             });
             let left_to_read = below(&screen);
-            // The message may itself say "Cancel and save...": the button row comes last.
-            let buttons = screen.iter().rposition(|r| r.contains(" Cancel ")).unwrap();
+            // The message may itself say "Cancel and save...": the button row comes last,
+            // before the footer that also names Cancel.
+            let footer = screen.iter().rposition(|r| r.contains("Enter Cancel") && r.contains("Esc Cancel")).unwrap();
+            let buttons = screen[..footer].iter().rposition(|r| r.contains(" Cancel ")).unwrap();
             // The Cancel button is two columns inside the box, after the margin.
             let left = screen[buttons].split("Cancel").next().unwrap().chars().count() - 3;
             let border = screen[buttons].chars().nth(left).unwrap();
@@ -7947,7 +7950,7 @@ fn picker_actions_and_footers_follow_the_line_at_both_sizes() {
     for size in [(124, 36), (80, 24)] {
         let mut client = RawClient::attach_sized(&env, Some("w"), size);
         client.send(b"\x02Al");
-        client.wait_for_row("⏎ add account");
+        client.wait_for_row("Enter Add account");
         let label = "+ Add account";
         let rows = client.wait_for_row(label);
         let y = rows.iter().position(|r| r.contains(label)).unwrap();
@@ -7959,13 +7962,13 @@ fn picker_actions_and_footers_follow_the_line_at_both_sizes() {
         client.wait_for_row("Agent   Claude");
         client.close_overlay("Agent   Claude");
         client.wait_for_row("+ Add account");
-        client.close_overlay("⏎ add account");
+        client.close_overlay("Enter Add account");
 
         client.send(b"\x02wclosed");
         client.wait_for_row("Enter Open · Tab Actions · Esc Close");
         client.send(b"\t");
         let rows = client.wait_for_row("Delete");
-        assert!(rows.iter().any(|r| r.contains("enter") && r.contains("Open")));
+        assert!(rows.iter().any(|r| r.contains("Enter") && r.contains("Open")));
         // Match action names as words: the sidebar can still show the status "Closed".
         for absent in ["Rename", "Close"] {
             assert!(
@@ -7983,7 +7986,7 @@ fn picker_actions_and_footers_follow_the_line_at_both_sizes() {
 
         client.send(b"\x02s");
         client.wait_for_row("╭ Servers ");
-        client.wait_for_row("⏎ open group");
+        client.wait_for_row("Enter Open group");
         client.send(b"\t");
         let rows = client.wait_for_row("Run a command on it");
         for absent in ["Connect in a new tab", "Browse its files", "Add tunnel", "Remove saved server"] {
@@ -8036,18 +8039,18 @@ fn choosing_the_current_account_keeps_running_and_exited_panes_as_they_are() {
         let mut client = RawClient::attach_sized(&env, Some("w"), size).traced();
         for exited in [false, true] {
             client.send(b"\x02Ac\x1b[B");
-            let rows = client.wait_for_row("⏎ keep current account");
+            let rows = client.wait_for_row("Enter Keep current account");
             assert!(rows.iter().any(|r| r.contains(&format!("{agent}·work")) && r.contains("current")));
             assert!(!rows.iter().any(|r| r.contains("more actions")));
             // Tab moves to the other account rather than opening launch or login actions.
             client.send(b"\t");
-            let rows = client.wait_for_row("⏎ switch account");
+            let rows = client.wait_for_row("Enter Switch account");
             assert!(!rows.iter().any(|r| r.contains("more actions")));
             client.send(b"\x1b[A");
-            client.wait_for_row("⏎ keep current account");
+            client.wait_for_row("Enter Keep current account");
             client.send(b"\r");
             client.wait_for_rows("the account picker closed", |rows| {
-                !rows.iter().any(|r| r.contains("⏎ keep current account"))
+                !rows.iter().any(|r| r.contains("Enter Keep current account"))
             });
             if !exited {
                 client.send(b"alive\r");
@@ -8820,7 +8823,7 @@ fn failed_and_cancelled_logins_close_on_enter_and_retry_only_when_asked() {
     client.send(b"\x02Al");
     client.wait_for_row("Claude · work");
     client.wait_for_row("Sign-in required");
-    client.close_overlay("⏎ details");
+    client.close_overlay("Enter Details");
 
     std::fs::remove_file(home.join("finish-login")).unwrap();
     open_account_login(&mut client);
@@ -9007,7 +9010,7 @@ fn account_discovery_updates_each_agent_without_waiting_for_the_other() {
     let checks = std::fs::read_to_string(env.root.join("home/status-checks")).unwrap();
     assert_eq!(checks.lines().count(), 2);
     for _ in 0..3 {
-        client.close_overlay("⏎ details");
+        client.close_overlay("Enter Details");
         client.send(b"\x02Al");
         client.wait_for_row("Claude · Personal");
         client.wait_for_row("Codex · Personal");
@@ -9397,15 +9400,15 @@ fn a_missing_agent_keeps_the_add_form_and_creates_nothing() {
     assert!(!std::fs::read_to_string(file).unwrap_or_default().contains("unfinished"));
     client.close_overlay("Name    unfinished");
     client.wait_for_row("+ Add account");
-    client.close_overlay("⏎ add account");
+    client.close_overlay("Enter Add account");
     client.send(b"\x02An\x1b[Z\x1b[C");
     client.wait_for_row("Agent   Codex");
     client.close_overlay("Agent   Codex");
-    client.close_overlay("⏎ add account");
+    client.close_overlay("Enter Add account");
     client.send(b"\x02An");
     client.wait_for_row("Agent   Codex");
     client.close_overlay("Agent   Codex");
-    client.close_overlay("⏎ add account");
+    client.close_overlay("Enter Add account");
     client.send(b"\x02a");
     let rows = client.wait_for_row("No accounts ready.");
     assert!(!rows.iter().any(|r| r.contains("Add account")));
@@ -9533,10 +9536,10 @@ fn a_renamed_account_keeps_its_rules_its_usage_and_its_agents() {
     client.wait_for_row("Accounts");
     client.send(b"alpha");
     client.wait_for_rows("alpha selected beside Add account", |rows| {
-        rows.iter().any(|r| r.contains("❯ alpha"))
+        rows.iter().any(|r| r.contains("Search  alpha"))
             && rows.iter().any(|r| r.contains("▸ Claude · alpha"))
             && rows.iter().any(|r| r.contains("+ Add account"))
-            && rows.iter().any(|r| r.contains("⏎ details") && r.contains("1/1"))
+            && rows.iter().any(|r| r.contains("Enter Details") && r.contains("1/1"))
     });
     client.send(b"\t");
     client.wait_for_row("Rename");
@@ -11784,7 +11787,9 @@ fn a_server_file_is_edited_in_the_local_editor() {
         client.send(key);
         std::thread::sleep(Duration::from_millis(150));
     }
-    client.wait_for_screen("Careful");
+    client.wait_for_row("It is production");
+    client.wait_for_row("Each save in the editor goes to the server.");
+    client.wait_for_row("Enter Cancel");
     assert!(!env.root.join("editing").exists(), "nothing opens before the answer");
     client.send(b"y");
     let editing = env.root.join("editing");
@@ -12599,14 +12604,14 @@ while IFS= read -r line; do printf 'reply:%s\n' "$line"; done
                 rows.iter().any(|r| r.contains("ACCOUNTS")) && !rows.iter().any(|r| r.contains("Existing "))
             });
             click_account_text(&mut client, "ACCOUNTS");
-            client.wait_for_row("⏎ details");
+            client.wait_for_row("Enter Details");
             client.send(b"\x1b");
-            client.wait_for_rows("Accounts closed", |rows| !rows.iter().any(|r| r.contains("⏎ details")));
+            client.wait_for_rows("Accounts closed", |rows| !rows.iter().any(|r| r.contains("Enter Details")));
             click_account_text(&mut client, "No usage · 1 pane");
             client.wait_for_row("Enter Back · Tab Actions");
             client.send(b"\r\x1b");
             client.wait_for_rows("Details closed", |rows| {
-                !rows.iter().any(|r| r.contains("Enter Back") || r.contains("⏎ details"))
+                !rows.iter().any(|r| r.contains("Enter Back") || r.contains("Enter Details"))
             });
         } else {
             assert!(!client.rows().iter().any(|r| r.contains("ACCOUNTS")));
@@ -12635,7 +12640,7 @@ while IFS= read -r line; do printf 'reply:%s\n' "$line"; done
         let second_home = PathBuf::from(second["home"].as_str().unwrap());
         assert_eq!(std::fs::read_to_string(second_home.join("logins")).unwrap(), "login\n");
         assert!(second.get("sign_in_required").is_none());
-        client.close_overlay("⏎ details");
+        client.close_overlay("Enter Details");
         client.send(b"\x02a");
         client.wait_for_row("Start an agent");
         client.send(b"\t");
@@ -12655,7 +12660,7 @@ while IFS= read -r line; do printf 'reply:%s\n' "$line"; done
         let launched: serde_json::Value = serde_json::from_str(&env.run(&["panes", "--json"])).unwrap();
         assert_eq!(launched.as_array().unwrap().iter().filter(|p| p["account"] == "codex:second").count(), 1);
         client.send(b"\x02Al");
-        client.wait_for_row("⏎ details");
+        client.wait_for_row("Enter Details");
         click_account_text(&mut client, "Codex · second");
         client.wait_for_row("Enter Back · Tab Actions");
         client.send(b"\t");
@@ -12666,13 +12671,13 @@ while IFS= read -r line; do printf 'reply:%s\n' "$line"; done
         client.send(b"\r");
         client.wait_for_row("Enter Back · Tab Actions");
         client.send(b"\x1b");
-        client.wait_for_row("⏎ details");
+        client.wait_for_row("Enter Details");
         click_account_text(&mut client, "Codex · work");
         client.send(b"\t");
         click_account_text(&mut client, "Remove");
         client.wait_for_row("Conversations and the agent's own sign-in are kept.");
         client.send(b"\r");
-        client.wait_for_row("⏎ details");
+        client.wait_for_row("Enter Details");
         client.send(b"\x18");
         client.wait_for_row("Conversations and the agent's own sign-in are kept.");
         client.send(b"y");
@@ -12856,7 +12861,7 @@ fn importing_a_file_previews_then_keeps_commands_waiting_and_export_preserves_th
     assert!(String::from_utf8_lossy(&refused.stderr).contains("No workspace was added"));
     assert!(!marker.exists());
     let added = env.run(&["import", file, "--name", "personal", "--yes"]);
-    assert!(added.contains("unknown") && added.contains("Workspace personal added"), "{added}");
+    assert!(added.contains("unknown") && added.contains("Workspace \"personal\" added"), "{added}");
     let panes: serde_json::Value = serde_json::from_str(&env.run(&["panes", "--json"])).unwrap();
     assert!(panes.as_array().unwrap().iter().filter(|p| p["workspace"] == "personal").all(|p| p["suspended"] == true));
     assert!(!marker.exists());
@@ -12883,6 +12888,20 @@ fn importing_a_file_previews_then_keeps_commands_waiting_and_export_preserves_th
 }
 
 #[test]
+fn workspace_cli_quotes_names_and_shortens_home_paths_in_rendered_output() {
+    let env = Env::new("workspace-messages");
+    let path = env.root.join("home/recipe.kdl");
+    std::fs::write(&path, "layout { pane command=\"true\"; }").unwrap();
+    let imported = env.run(&["import", path.to_str().unwrap(), "--name", "imported", "--yes"]);
+    assert!(imported.lines().any(|line| line == "~/recipe.kdl"), "{imported}");
+    assert!(imported.contains("Workspace \"imported\" added."), "{imported}");
+    let exported = env.run(&["export", "~/shared.kdl", "--workspace", "imported"]);
+    assert_eq!(exported.trim(), "Layout exported\n~/shared.kdl");
+    let opened = env.run(&["open", "imported"]);
+    assert!(opened.contains("workspace \"imported\" is open"), "{opened}");
+}
+
+#[test]
 fn importing_a_bare_filename_uses_the_callers_directory() {
     let env = Env::new("import-relative");
     let project = env.root.join("project");
@@ -12893,7 +12912,7 @@ fn importing_a_bare_filename_uses_the_callers_directory() {
     std::fs::write(env.root.join("home/layout.kdl"), other).unwrap();
     let out = env.cmd(&["import", "layout.kdl", "--yes"]).current_dir(&project).output().unwrap();
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
-    assert!(String::from_utf8_lossy(&out.stdout).contains("Workspace layout added"));
+    assert!(String::from_utf8_lossy(&out.stdout).contains("Workspace \"layout\" added"));
     let panes: serde_json::Value = serde_json::from_str(&env.run(&["panes", "--json"])).unwrap();
     let pane = panes.as_array().unwrap().iter().find(|p| p["workspace"] == "layout").unwrap();
     assert_eq!(pane["command"], serde_json::json!(["true"]));

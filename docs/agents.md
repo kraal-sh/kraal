@@ -402,7 +402,8 @@ See [Compatibility](compatibility.md) for migration and clients of different ver
 kraal edits what it changes there and leaves the rest as you wrote it, including comments, order
 and unknown keys. A new file includes an explanatory header and omits empty rules and an empty `[claude]`
 table. When kraal next rewrites an older file, it removes an empty top-level `rule = []` and an
-empty `[claude]` table, keeping their comments. A `[claude]` table with a saved `statusline`
+empty `[claude]` table, keeping their comments and leaving one blank line where the
+surrounding separators meet. A `[claude]` table with a saved `statusline`
 command or other settings stays, as do existing rules. A file that cannot be parsed is left
 untouched. Kraal 0.4 reads files from 0.2.0 and 0.3.0 without identifiers. On the next rewrite,
 it adds identifiers and binds existing rules to them, keeping a first backup as `accounts.toml.kraal-bak`.
