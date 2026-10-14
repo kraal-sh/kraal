@@ -252,17 +252,180 @@ fn account_discovery_starts_each_check_once_and_handles_results_without_a_tick()
     }
 }
 
+// These tests run in their own processes because discovery reads the agent from PATH.
+fn identity_discovery(name: &str) -> (SwitchTest, Account, PathBuf) {
+    let mut t = SwitchTest::new(name);
+    t.server.switches.clear();
+    t.server.panes.clear();
+    t.server.accounts.remove("claude", "to");
+    t.server.accounts.rename("claude", "from", "work").unwrap();
+    let work = t.server.accounts.get("claude", "work").unwrap();
+    t.server.accounts.save().unwrap();
+    t.server.existing_checks.insert("codex".into(), ExistingCheck::Checked(Status::NotInstalled));
+    let standard = dirs::home_dir().unwrap().join(".claude");
+    std::fs::create_dir_all(&standard).unwrap();
+    let bin = t.dir.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    crate::testing::write_script(
+        &bin.join("claude"),
+        r#"#!/bin/sh
+home="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
+case "$*" in
+    'auth status')
+        echo check >> "$home/checks"
+        test ! -f "$home/identity" || cat "$home/identity"
+        exit "$(cat "$home/status" 2>/dev/null || echo 1)"
+        ;;
+    'auth login') exec sleep 100 ;;
+    *) exit 2 ;;
+esac
+"#,
+    );
+    let path =
+        std::env::join_paths(std::iter::once(bin).chain(std::env::split_paths(&std::env::var_os("PATH").unwrap())))
+            .unwrap();
+    // SAFETY: this test runs alone in its own process, before any checks start.
+    unsafe { std::env::set_var("PATH", path) };
+    (t, work, standard)
+}
+
+fn signed_in(home: &std::path::Path, email: &str) {
+    std::fs::write(home.join("status"), "0").unwrap();
+    std::fs::write(home.join("identity"), format!(r#"{{"loggedIn":true,"email":"{email}"}}"#)).unwrap();
+}
+
+#[test]
+fn discovery_without_a_verified_identity_does_not_check_named_homes() {
+    if !crate::testing::in_own_process(
+        "server::agents::tests::discovery_without_a_verified_identity_does_not_check_named_homes",
+    ) {
+        return;
+    }
+    let (mut t, work, standard) = identity_discovery("discovery-no-identity");
+    signed_in(std::path::Path::new(&work.home), "a@example.com");
+    for status in ["1", "2", "0"] {
+        std::fs::write(standard.join("status"), status).unwrap();
+        t.server.existing_checks.remove("claude");
+        t.server.check_existing_accounts();
+        t.until("discovery finishes", |t| t.server.jobs.is_empty());
+        assert!(!std::path::Path::new(&work.home).join("checks").exists());
+        assert!(t.server.account_identities.is_empty());
+    }
+}
+
+#[test]
+fn login_invalidates_cached_and_in_flight_identity_results() {
+    use super::super::{Event, queue::Wait};
+
+    if !crate::testing::in_own_process("server::agents::tests::login_invalidates_cached_and_in_flight_identity_results")
+    {
+        return;
+    }
+    for in_flight in [false, true] {
+        let (mut t, work, standard) = identity_discovery(if in_flight { "identity-late" } else { "identity-cached" });
+        let home = std::path::Path::new(&work.home);
+        signed_in(home, "a@example.com");
+        std::fs::write(standard.join("status"), "1").unwrap();
+        t.server.check_existing_accounts();
+        t.until("unsigned home discovery finishes", |t| t.server.jobs.is_empty());
+        // An identity observed before login must not survive the account fields returning
+        // to their original values, even when its discovery result arrives after login.
+        let checked = account_status::inspect(&work);
+        t.server.account_identities.insert(work.id.clone(), (work.clone(), checked));
+        let late = if in_flight {
+            signed_in(&standard, "a@example.com");
+            t.server.existing_checks.remove("claude");
+            t.server.check_existing_accounts();
+            let Wait::Event(event @ Event::Job(..)) = t.rx.wait(crate::testing::PATIENCE) else {
+                panic!("discovery did not finish");
+            };
+            assert!(Accounts::load().unwrap().reviews().is_empty(), "the worker must not save before validation");
+            Some(event)
+        } else {
+            None
+        };
+        let (client, _peer) = super::super::tests::client(&mut t.server);
+        let login = t.server.open_login(client, &work).unwrap();
+        assert!(!t.server.account_identities.contains_key(&work.id));
+        assert!(!t.server.existing_checks.contains_key("claude"), "discovery waits while login changes credentials");
+        signed_in(home, "b@example.com");
+        t.server.check_login(login).unwrap();
+        t.until("login is verified", |t| !t.server.panes.contains_key(&login));
+        assert_eq!(t.server.accounts.by_id(&work.id).unwrap(), work);
+        t.until("post-login discovery finishes", |t| t.server.jobs.len() == usize::from(in_flight));
+        signed_in(&standard, "a@example.com");
+        t.server.refresh_existing_accounts();
+        if let Some(late) = late {
+            t.server.handle(late);
+        }
+        t.until("fresh discovery finishes", |t| t.server.jobs.is_empty());
+        let saved = Accounts::load().unwrap();
+        assert_eq!(saved.reviews().len(), 1, "A must remain separate from B");
+        assert!(saved.entries().iter().all(|a| a.linked_to.as_deref() != Some(&work.id)));
+        assert_ne!(saved.by_home("claude", &standard).unwrap().id, work.id);
+        assert_eq!(t.server.account_identities[&work.id].1.identity.as_ref().unwrap().email, "b@example.com");
+        assert!(t.server.account_notices.is_empty(), "stale discovery must not announce a join");
+    }
+}
+
+#[test]
+fn a_failed_automatic_join_on_a_saved_review_can_retry_and_recover() {
+    use super::super::{Event, queue::Wait};
+
+    if !crate::testing::in_own_process(
+        "server::agents::tests::a_failed_automatic_join_on_a_saved_review_can_retry_and_recover",
+    ) {
+        return;
+    }
+    let (mut t, work, standard) = identity_discovery("review-save-retry");
+    signed_in(std::path::Path::new(&work.home), "a@example.com");
+    signed_in(&standard, "a@example.com");
+    let existing = t.server.accounts.get("claude", "default").unwrap();
+    t.server.accounts.adopt_checked(&existing, None).unwrap();
+    t.server.accounts.save().unwrap();
+    t.server.check_existing_accounts();
+    let Wait::Event(event @ Event::Job(..)) = t.rx.wait(crate::testing::PATIENCE) else {
+        panic!("discovery did not finish");
+    };
+    let path = Accounts::path();
+    let backup = path.with_extension("kept");
+    std::fs::rename(&path, &backup).unwrap();
+    std::fs::create_dir(&path).unwrap();
+    t.server.handle(event);
+    assert!(matches!(t.server.existing_checks.get("claude"), Some(ExistingCheck::SaveFailed)));
+    assert_eq!(t.server.accounts.reviews().len(), 1);
+    assert!(t.server.account_notices.is_empty());
+    std::fs::remove_dir(&path).unwrap();
+    std::fs::rename(&backup, &path).unwrap();
+    t.server.refresh_existing_accounts();
+    let mut picker = t.server.accounts_picker(None);
+    picker.select(|i| i.detail == "Could not save · Check again");
+    let item = picker.current().unwrap();
+    assert!(matches!(&item.action, PickAction::CheckExisting { agent } if agent == "claude"));
+    assert_eq!(picker.action_keys(), &[("enter", "Check again")]);
+    t.server.pick(99, &picker, item.clone());
+    t.until("retry joins the saved review", |t| t.server.jobs.is_empty());
+    assert!(t.server.accounts.reviews().is_empty());
+    let saved = Accounts::load().unwrap();
+    assert_eq!(saved.get("claude", "default").unwrap().id, work.id);
+    assert_eq!(saved.all().len(), 1);
+    assert_eq!(t.server.account_notices, ["~/.claude is Claude · work"]);
+}
+
 #[test]
 fn a_verified_account_opens_review_without_rechecking_or_waiting_for_another_agent() {
     let mut t = SwitchTest::new("review-checked");
     let original = t.server.accounts.get("claude", "default").unwrap();
     t.server.accounts.adopt_checked(&original, None).unwrap();
     t.server.existing_checks.insert("codex".into(), ExistingCheck::Checking);
+    t.server.existing_checks.insert("claude".into(), ExistingCheck::Checked(Status::SignedIn));
     for _ in 0..3 {
         t.server.refresh_existing_accounts();
         let picker = t.server.accounts_picker(None);
         let item = picker.items.iter().find(|i| matches!(i.action, PickAction::ReviewAccount(_))).unwrap();
-        assert_eq!(item.detail, "Review");
+        assert_eq!(item.label, "? Which account is ~/.claude");
+        assert!(item.detail.is_empty());
+        assert!(item.dim);
         let Mode::Picker(review) = t.server.pick(99, &picker, item.clone()) else { panic!("review") };
         assert!(review.kind == PickerKind::AccountReview);
         assert!(t.server.jobs.is_empty(), "a verified home needs no new status command to open Review");

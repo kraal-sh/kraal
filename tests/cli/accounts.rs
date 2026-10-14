@@ -987,12 +987,10 @@ fn accounts_cli_expires_usage_without_changing_the_saved_observation() {
 }
 
 fn wait_for_account_review(client: &RawClient, agent: &str) -> Vec<String> {
-    let label = format!("Existing {agent} account");
-    client.wait_for_rows(&format!("{label} ready for Review"), |rows| {
-        rows.iter().enumerate().any(|(i, row)| {
-            row.contains(&label)
-                && (row.contains("Review") || rows.get(i + 1).is_some_and(|detail| detail.contains("Review")))
-        })
+    let home = format!("~/.{}", agent.to_lowercase());
+    client.wait_for_rows(&format!("{home} ready for Review"), |rows| {
+        rows.iter()
+            .any(|row| row.contains(&home) && (row.contains("? Which account is") || row.contains("? Account for")))
     })
 }
 
@@ -1238,6 +1236,140 @@ fn an_uncertain_existing_sign_in_never_starts_login_or_creates_an_account() {
 }
 
 #[test]
+fn account_list_joins_only_one_exact_identity_and_reports_the_joined_home_and_usage() {
+    for case in ["unique", "review", "two", "unreadable", "failed", "organization", "plan", "personal"] {
+        let env = Env::new(&format!("identity-{case}"));
+        let path = existing_sign_in_agent(&env, "claude");
+        let standard = env.root.join("home/.claude");
+        let mut config = String::new();
+        let homes = if case == "personal" {
+            vec![standard.clone()]
+        } else {
+            vec![standard.clone(), env.root.join("patron"), env.root.join("gmail")]
+        };
+        for (i, home) in homes.iter().enumerate() {
+            std::fs::create_dir_all(home).unwrap();
+            std::fs::write(home.join("status"), if i == 0 && case == "failed" { "2" } else { "0" }).unwrap();
+            std::fs::write(home.join("credential"), "untouched").unwrap();
+            if !(i == 0 && matches!(case, "unreadable" | "personal")) {
+                let email = if i == 2 && case != "two" { "other@example.com" } else { "me@example.com" };
+                let org = if i == 1 && case == "organization" { "org-2" } else { "org-1" };
+                let plan = if i == 1 && case == "plan" { "pro" } else { "max" };
+                std::fs::write(
+                    home.join("public-status"),
+                    serde_json::json!({
+                        "loggedIn": true, "email": email, "orgId": org, "subscriptionType": plan,
+                    })
+                    .to_string(),
+                )
+                .unwrap();
+            }
+            if i > 0 {
+                let name = if i == 1 { "patron.bzh" } else { "gmail" };
+                config.push_str(&format!(
+                    "[[account]]\nagent = 'claude'\nname = {name:?}\nhome = {:?}\n",
+                    home.display().to_string()
+                ));
+            }
+        }
+        let file = env.root.join("config/kraal/accounts.toml");
+        std::fs::write(&file, config).unwrap();
+        let usage = env.root.join("state/kraal/usage");
+        std::fs::create_dir_all(&usage).unwrap();
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        std::fs::write(usage.join("claude-default.json"), serde_json::json!({
+            "five_hour": { "used_percent": 57, "resets_at": now + 3600 }, "observed_at": now, "source": "statusline",
+        }).to_string()).unwrap();
+        if case == "review" {
+            let out = env.cmd(&["accounts", "review", "claude"]).env("PATH", &path).output().unwrap();
+            assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+            assert!(String::from_utf8_lossy(&out.stderr).contains("~/.claude is Claude · patron.bzh"));
+        }
+        let out = env.cmd(&["accounts", "list", "--json"]).env("PATH", &path).output().unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        let list: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        let list = list.as_array().unwrap();
+        if case == "unique" || case == "review" {
+            assert_eq!(list.len(), 2);
+            let account = list.iter().find(|a| a["name"] == "patron.bzh").unwrap();
+            assert_eq!(account["usage"]["five_hour"]["used_percent"], 57.0);
+            assert_eq!(account["joined_homes"], serde_json::json!(["~/.claude"]));
+            assert_eq!(
+                String::from_utf8_lossy(&out.stderr).matches("~/.claude is Claude · patron.bzh").count(),
+                usize::from(case == "unique")
+            );
+            let saved = std::fs::read_to_string(&file).unwrap();
+            let again = env.cmd(&["accounts", "list"]).env("PATH", &path).output().unwrap();
+            assert!(again.status.success());
+            assert!(!String::from_utf8_lossy(&again.stderr).contains("is Claude"));
+            assert!(String::from_utf8_lossy(&again.stdout).contains("~/.claude (joined sign-in)"));
+            assert_eq!(std::fs::read_to_string(&file).unwrap(), saved);
+        } else if case == "personal" {
+            assert_eq!(list.len(), 1);
+            assert_eq!(list[0]["name"], "Personal");
+        } else {
+            assert_eq!(list.iter().filter(|a| a["status"] == "review_required").count(), 1, "{case}: {list:?}");
+            assert!(String::from_utf8_lossy(&out.stderr).is_empty());
+            let question = list.iter().find(|a| a["status"] == "review_required").unwrap();
+            assert_eq!(question["name"], "? Which account is ~/.claude");
+        }
+        for home in homes {
+            assert_eq!(std::fs::read_to_string(home.join("credential")).unwrap(), "untouched");
+        }
+        assert!(!env.root.join("home/logins").exists());
+    }
+}
+
+#[test]
+fn automatic_join_preserves_a_live_agent_and_caches_the_named_home_checks() {
+    let env = Env::new("auto-join-live");
+    let path = existing_sign_in_agent(&env, "claude");
+    let standard = env.root.join("home/.claude");
+    let named = env.root.join("patron");
+    for home in [&standard, &named] {
+        std::fs::create_dir_all(home).unwrap();
+        std::fs::write(home.join("status"), if home == &standard { "1" } else { "0" }).unwrap();
+        std::fs::write(
+            home.join("public-status"),
+            r#"{"loggedIn":true,"email":"me@example.com","orgId":"org-1","subscriptionType":"max"}"#,
+        )
+        .unwrap();
+    }
+    std::fs::write(
+        env.root.join("config/kraal/accounts.toml"),
+        format!("[[account]]\nagent = 'claude'\nname = 'patron.bzh'\nhome = {:?}\n", named.display().to_string()),
+    )
+    .unwrap();
+    env.workspace("w", "layout { pane name=\"agent\" agent=\"claude:default\" }\n");
+    let out = env.cmd(&["open", "w"]).env("PATH", &path).output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    env.wait_for_text("agent", &format!("READY home={}", standard.display()));
+    let starts = std::fs::read_to_string(standard.join("starts")).unwrap();
+    let mut client = RawClient::attach_sized(&env, Some("w"), (124, 36)).traced();
+    client.send(b"\x02Al");
+    client.wait_for_rows("unsigned standard home check finished", |rows| {
+        rows.iter().any(|r| r.contains("Claude · patron.bzh")) && !rows.iter().any(|r| r.contains("Checking"))
+    });
+    client.close_overlay("Enter Details");
+    std::fs::write(standard.join("status"), "0").unwrap();
+    client.send(b"\x02Al");
+    client.wait_for_row("~/.claude is Claude · patron.bzh");
+    client.wait_for_row("1 pane");
+    assert!(!client.rows().iter().any(|r| r.contains("Which account is this?") || r.contains("? Account for")));
+    for _ in 0..2 {
+        client.close_overlay("Enter Details");
+        client.send(b"\x02Al");
+        client.wait_for_row("Claude · patron.bzh");
+    }
+    let checks = std::fs::read_to_string(env.root.join("home/status-checks")).unwrap();
+    assert_eq!(checks.lines().filter(|line| *line == named.to_str().unwrap()).count(), 1);
+    env.run(&["send", "-p", "agent", "alive\r"]);
+    env.wait_for_text("agent", "reply:alive");
+    assert_eq!(std::fs::read_to_string(standard.join("starts")).unwrap(), starts);
+    assert!(!env.root.join("home/logins").exists());
+}
+
+#[test]
 fn command_line_review_can_keep_a_different_account_without_login() {
     let env = Env::new("review-cli");
     let path = existing_sign_in_agent(&env, "claude");
@@ -1255,7 +1387,7 @@ fn command_line_review_can_keep_a_different_account_without_login() {
     .unwrap();
     let out = env.cmd(&["accounts", "list"]).env("PATH", &path).output().unwrap();
     assert!(out.status.success());
-    assert!(String::from_utf8_lossy(&out.stdout).contains("Existing Claude account · Review"));
+    assert!(String::from_utf8_lossy(&out.stdout).contains("? Which account is ~/.claude"));
     let before = std::fs::read_to_string(&file).unwrap();
     let out = env.cmd(&["accounts", "review", "claude"]).env("PATH", &path).output().unwrap();
     assert!(!out.status.success());
@@ -1330,16 +1462,16 @@ fn reviewing_the_existing_account_keeps_live_agents_and_reports_usage_once() {
         let mut client = RawClient::attach_sized(&env, Some("w"), size).traced();
         if size.0 == 124 {
             client.wait_for_row("Codex · Personal");
-            // The name is also shown while checking sign-in; only Review opens the review picker.
+            // The question is a single sidebar action, below the named accounts.
             let rows = wait_for_account_review(&client, "Claude");
-            let row = rows.iter().position(|r| r.contains("Existing Claude account")).unwrap() + 1;
+            let row = rows.iter().position(|r| r.contains("? Account for ~/.claude")).unwrap() + 1;
             client.send(format!("\x1b[<0;10;{row}M\x1b[<0;10;{row}m").as_bytes());
         } else {
             client.send(b"\x02Al");
             client.wait_for_row("Codex · Personal");
             wait_for_account_review(&client, "Claude");
             assert!(!client.rows().iter().any(|r| r.contains("claude·default") || r.contains("codex·default")));
-            client.send(b"Existing Claude");
+            client.send(b"Which account is");
             client.send(b"\r");
         }
         client.wait_for_row("Which account is this?");
@@ -1995,12 +2127,11 @@ fn a_different_account_review_after_sign_out_exposes_sign_in() {
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     let mut client = RawClient::attach_sized(&env, Some("w"), (80, 24));
     client.send(b"\x02Al");
-    client.wait_for_row("Existing Claude account");
-    client.wait_for_row("Review");
+    wait_for_account_review(&client, "Claude");
     assert!(std::fs::read_to_string(&file).unwrap().contains("review = true"));
     // Discovery succeeded, but the agent signs out before the user resolves its review.
     std::fs::write(standard.join("status"), "1").unwrap();
-    click_account_text(&mut client, "Existing Claude account");
+    click_account_text(&mut client, "? Which account is ~/.claude");
     client.wait_for_row("Which account is this?");
     click_account_text(&mut client, "A different account");
     client.wait_for_row("Name    e.g. Work or Personal");
@@ -2048,8 +2179,10 @@ fn sidebar_accounts_discover_a_sign_in_completed_after_startup() {
         common::wait_until(PATIENCE, "startup checked the unsigned home", || {
             common::read_complete_lines(standard.join("check-finished")).is_some()
         });
+        // The script's marker precedes the server's result. Both "Checking sign-in" and
+        // "Checking ~/.claude" must be gone before the external sign-in and refresh.
         client.wait_for_rows("startup discovery completed", |rows| {
-            rows.iter().any(|r| r.contains("ACCOUNTS")) && !rows.iter().any(|r| r.contains("Checking sign-in"))
+            rows.iter().any(|r| r.contains("ACCOUNTS")) && !rows.iter().any(|r| r.contains("Checking"))
         });
         assert!(!std::fs::read_to_string(&file).unwrap().contains("review = true"));
 

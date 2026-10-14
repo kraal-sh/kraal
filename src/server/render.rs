@@ -1580,6 +1580,12 @@ impl Server {
             let mut items = display.items.clone();
             for item in &mut items {
                 item.detail = super::account_ui::sidebar_summary(&item.detail, width as usize);
+                if let super::ui::PickAction::ReviewAccount(a) = &item.action
+                    && crate::text::columns(&item.label) > width as usize
+                {
+                    item.label =
+                        format!("? Account for {}", crate::paths::shorten_home(&crate::paths::expand_tilde(&a.home)));
+                }
             }
             *cached = Some(AccountRows { width, room, rows: account_rows(items, room) });
         }
@@ -2254,7 +2260,11 @@ fn account_rows(mut items: Vec<super::ui::PickItem>, room: usize) -> Vec<SideRow
         return Vec::new();
     }
     let Some(add) = items.pop() else { return Vec::new() };
-    items.truncate((room - 2) / 2);
+    let questions: Vec<_> =
+        items.extract_if(.., |item| matches!(item.action, super::ui::PickAction::ReviewAccount(_))).collect();
+    let question_count = questions.len().min(room - 2);
+    items.truncate((room - 2 - question_count) / 2);
+    items.extend(questions.into_iter().take(question_count));
     items.push(add);
     let mut rows = vec![SideRow::Section("ACCOUNTS")];
     for entry in items {
@@ -2265,7 +2275,11 @@ fn account_rows(mut items: Vec<super::ui::PickItem>, room: usize) -> Vec<SideRow
             _ => SideItem::Accounts,
         };
         for text in [entry.label, entry.detail].into_iter().filter(|s| !s.is_empty()) {
-            rows.push(SideRow::Entry { item: Some(item.clone()), line: Line::from(text), selected: false });
+            rows.push(SideRow::Entry {
+                item: Some(item.clone()),
+                line: Line::from(if entry.dim { dim_span(&text) } else { Span::raw(text) }),
+                selected: false,
+            });
         }
     }
     rows
@@ -2935,6 +2949,33 @@ mod tests {
         assert_eq!(rows.len(), 2);
         assert!(matches!(rows[0], SideRow::Section("ACCOUNTS")));
         assert!(matches!(rows[1], SideRow::Entry { item: Some(SideItem::AddAccount), .. }));
+    }
+
+    #[test]
+    fn unresolved_sign_in_is_one_dim_question_above_add_even_when_space_is_short() {
+        use super::super::ui::{PickAction, PickItem};
+        let existing = crate::accounts::Accounts::empty().get("claude", "default").unwrap();
+        let items = vec![
+            PickItem::new("Claude · work", "57% used · 2 panes", PickAction::AccountDetails("work-id".into())),
+            PickItem::new(crate::accounts::review_question(&existing), "", PickAction::ReviewAccount(existing.clone()))
+                .dim(),
+            PickItem::new("+ Add account", "", PickAction::AddAccount),
+        ];
+        for room in [3, 4, 5, 6, 20] {
+            let rows = account_rows(items.clone(), room);
+            assert!(rows.len() <= room);
+            let SideRow::Entry { item, line, .. } = &rows[rows.len() - 2] else { panic!() };
+            assert_eq!(item, &Some(SideItem::ReviewAccount(existing.id.clone())));
+            assert_eq!(line.to_string(), "? Which account is ~/.claude");
+            assert_eq!(line.spans[0].style.fg, Some(th().dim));
+            assert!(matches!(rows.last(), Some(SideRow::Entry { item: Some(SideItem::AddAccount), .. })));
+            assert_eq!(
+                rows.iter()
+                    .filter(|r| matches!(r, SideRow::Entry { item: Some(SideItem::ReviewAccount(_)), .. }))
+                    .count(),
+                1
+            );
+        }
     }
 
     /// The accounts' rows made at one moment are those of any moment before the reset the usage

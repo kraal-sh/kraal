@@ -762,8 +762,11 @@ impl Accounts {
             return None;
         }
         let canonical = home.canonicalize().ok()?;
-        let mut matches = self.all().into_iter().filter(|a| {
-            a.agent == kind.name && paths::expand_tilde(&a.home).canonicalize().ok().as_ref() == Some(&canonical)
+        let mut matches = self.known().into_iter().filter_map(|a| {
+            if a.agent != kind.name || paths::expand_tilde(&a.home).canonicalize().ok().as_ref() != Some(&canonical) {
+                return None;
+            }
+            self.resolve(&a).filter(|a| !a.review && a.name != "default")
         });
         let mut account = matches.next()?;
         if matches.any(|a| a.id != account.id) {
@@ -1076,6 +1079,10 @@ fn rename_in(file: &Path, usage: &Path, agent: &str, old: &str, new: &str) -> Re
         all.rename(agent, old, new)?;
         migration::migrate_usage(usage, &a)
     })
+}
+
+pub fn review_question(account: &Account) -> String {
+    format!("? Which account is {}", paths::shorten_home(&paths::expand_tilde(&account.home)))
 }
 
 pub fn existing_label(agent: &str) -> String {

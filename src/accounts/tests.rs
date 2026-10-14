@@ -304,7 +304,7 @@ fn verified_existing_sign_ins_are_ordinary_renameable_accounts() {
 }
 
 #[test]
-fn public_identity_proposes_a_name_but_does_not_prove_two_sign_ins_are_the_same() {
+fn public_identity_proposes_a_name_but_a_matching_label_is_not_a_checked_identity() {
     let mut all = Accounts::empty();
     let existing = all.get("claude", "default").unwrap();
     let email = "me+personal@example.com";
@@ -317,7 +317,7 @@ fn public_identity_proposes_a_name_but_does_not_prove_two_sign_ins_are_the_same(
     other.add(acct("claude", email, "/a-different-home")).unwrap();
     other.adopt_checked(&existing, Some(email)).unwrap();
     assert_eq!(other.all().len(), 1);
-    assert_eq!(other.reviews().len(), 1, "matching email alone still needs review");
+    assert_eq!(other.reviews().len(), 1, "an account label is not its provider identity");
     let pending = other.reviews().pop().unwrap();
     assert_eq!(pending.public_identity.as_deref(), Some(email));
     other.review(&pending, None).unwrap();
@@ -526,6 +526,144 @@ fn same_canonical_home_is_one_account_and_keeps_legacy_names_ids_and_notes() {
     std::fs::remove_dir_all(dir).unwrap();
 }
 
+fn checked_identity(email: &str, organization: Option<&str>, plan: Option<&str>) -> crate::account_status::Checked {
+    crate::account_status::Checked {
+        status: crate::account_status::Status::SignedIn,
+        identity: crate::account_status::Identity::from_status(&serde_json::json!({
+            "email": email, "orgId": organization, "subscriptionType": plan,
+        })),
+    }
+}
+
+#[test]
+fn identity_join_requires_one_exact_public_identity_and_saves_the_answer_once() {
+    use crate::account_status::{Checked, Status, reconcile};
+    for case in [
+        "unique",
+        "email",
+        "two",
+        "unreadable",
+        "unreadable-other",
+        "failed",
+        "organization",
+        "plan",
+        "missing-context",
+        "other-email",
+        "other-agent",
+        "stale",
+        "added",
+        "personal",
+        "pending",
+    ] {
+        let mut all = Accounts::empty();
+        let existing = all.get("claude", "default").unwrap();
+        let context = (case != "email").then_some("org-1");
+        let checked = if case == "unreadable" || case == "personal" {
+            Checked { status: Status::SignedIn, identity: None }
+        } else if case == "failed" {
+            Checked { status: Status::CouldNotCheck, identity: None }
+        } else {
+            checked_identity("me@example.com", context, if case == "email" { None } else { Some("max") })
+        };
+        let mut named = Vec::new();
+        if case != "personal" {
+            let target =
+                all.add(acct(if case == "other-agent" { "codex" } else { "claude" }, "patron.bzh", "/patron")).unwrap();
+            let identity = checked_identity(
+                if case == "other-email" { "other@example.com" } else { "me@example.com" },
+                if case == "organization" {
+                    Some("org-2")
+                } else if case == "missing-context" {
+                    None
+                } else {
+                    context
+                },
+                if case == "email" { None } else { Some(if case == "plan" { "pro" } else { "max" }) },
+            );
+            named.push((target, identity));
+        }
+        if matches!(case, "two" | "added" | "unreadable-other") {
+            let second = all.add(acct("claude", "gmail", "/gmail")).unwrap();
+            if case == "two" {
+                named.push((second, checked_identity("me@example.com", context, Some("max"))));
+            } else if case == "unreadable-other" {
+                named.push((second, Checked { status: Status::CouldNotCheck, identity: None }));
+            }
+        }
+        if case == "stale" {
+            named[0].0.home = "/old-home".into();
+        }
+        if case == "pending" {
+            all.adopt_checked(&existing, None).unwrap();
+        }
+        let notice = reconcile(&mut all, &existing, &checked, &named).unwrap();
+        if matches!(case, "unique" | "email" | "pending") {
+            assert_eq!(notice.as_deref(), Some("~/.claude is Claude · patron.bzh"), "{case}");
+            assert!(all.reviews().is_empty());
+            assert_eq!(all.get("claude", "default").unwrap().name, "patron.bzh");
+            assert_eq!(all.get("claude", "default").unwrap().home, "/patron");
+            assert_eq!(reconcile(&mut all, &existing, &checked, &named).unwrap(), None, "the notice is emitted once");
+        } else if case == "personal" || case == "other-agent" {
+            assert!(notice.is_none());
+            assert!(all.reviews().is_empty());
+            assert_eq!(all.for_agent("claude").len(), 1);
+            assert_eq!(all.for_agent("claude")[0].home, existing.home);
+            if case == "personal" {
+                assert_eq!(all.for_agent("claude")[0].name, "Personal");
+            }
+        } else {
+            assert!(notice.is_none(), "{case}");
+            assert_eq!(all.reviews().len(), 1, "{case}");
+        }
+    }
+}
+
+#[test]
+fn automatic_join_keeps_pane_launch_home_and_persists_without_repeating_the_notice() {
+    let dir = std::env::temp_dir().join(format!("kraal-auto-join-{}", new_uuid()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("accounts.toml");
+    let (existing, target) = Accounts::update_at(&file, |all| {
+        let existing = all.get("claude", "default").unwrap();
+        let target = all.add(acct("claude", "patron.bzh", "/patron"))?;
+        Ok((existing, target))
+    })
+    .unwrap();
+    let mut pane = crate::pane::PaneSpec {
+        account: Some("claude:default".into()),
+        command: vec!["claude".into()],
+        session: Some("conversation".into()),
+        ..Default::default()
+    };
+    Accounts::load_from(&file).unwrap().bind_pane(&mut pane);
+    let before = pane.clone();
+    let checked = checked_identity("me@example.com", Some("org"), Some("max"));
+    let named = vec![(target.clone(), checked.clone())];
+    let notice =
+        Accounts::update_at(&file, |all| crate::account_status::reconcile(all, &existing, &checked, &named)).unwrap();
+    assert_eq!(notice.as_deref(), Some("~/.claude is Claude · patron.bzh"));
+    let all = Accounts::load_from(&file).unwrap();
+    all.bind_pane(&mut pane);
+    assert_eq!(pane.command, before.command);
+    assert_eq!(pane.session, before.session);
+    assert_eq!(
+        pane.env.iter().find(|(k, _)| k == "CLAUDE_CONFIG_DIR"),
+        before.env.iter().find(|(k, _)| k == "CLAUDE_CONFIG_DIR")
+    );
+    assert_eq!(pane.account_id.as_deref(), Some(target.id.as_str()));
+    assert_eq!(all.at_launch_home(target.clone(), &pane.env).home, existing.home);
+    assert_eq!(all.get("claude", "default").unwrap().home, target.home);
+    let saved = std::fs::read_to_string(&file).unwrap();
+    assert_eq!(toml::from_str::<toml::Table>(&saved).unwrap()["account"].as_array().unwrap().len(), 1);
+    assert!(saved.contains("[[account.references]]"));
+    assert_eq!(
+        Accounts::update_at(&file, |all| crate::account_status::reconcile(all, &existing, &checked, &named)).unwrap(),
+        None
+    );
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), saved);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
 #[test]
 fn linked_usage_uses_the_latest_observation_and_never_adds_two_homes() {
     let dir = std::env::temp_dir().join(format!("kraal-linked-usage-{}", std::process::id()));
@@ -533,9 +671,12 @@ fn linked_usage_uses_the_latest_observation_and_never_adds_two_homes() {
     let mut all = Accounts::empty();
     let target = all.add(acct("claude", "patron.bzh", "/patron")).unwrap();
     let original = all.get("claude", "default").unwrap();
-    all.adopt_checked(&original, None).unwrap();
-    let pending = all.reviews().pop().unwrap();
-    all.review(&pending, Some(&target)).unwrap();
+    let checked = checked_identity("me@example.com", Some("org"), Some("max"));
+    assert!(
+        crate::account_status::reconcile(&mut all, &original, &checked, &[(target.clone(), checked.clone())])
+            .unwrap()
+            .is_some()
+    );
     let observation = |percent, at| Usage {
         observed_at: at,
         five_hour: Some(Window { used_percent: percent, resets_at: None }),
@@ -1741,6 +1882,13 @@ fn a_process_account_uses_its_own_home_and_refuses_credential_overrides() {
     env.insert("CLAUDE_CONFIG_DIR".into(), "relative".into());
     assert!(all.process_account(kind, &env).is_none());
     assert!(all.process_account(kind, &HashMap::new()).is_none());
+    let target = all.add(acct("claude", "work", "/work")).unwrap();
+    all.accounts.iter_mut().find(|b| b.id == a.id).unwrap().review = true;
+    all.review(&a, Some(&target)).unwrap();
+    env.insert("CLAUDE_CONFIG_DIR".into(), a.home.clone());
+    let joined = all.process_account(kind, &env).unwrap();
+    assert_eq!(joined.id, target.id);
+    assert_eq!(joined.home, a.home, "a process in a joined home keeps its launch home");
     std::fs::remove_dir_all(dir).unwrap();
 }
 

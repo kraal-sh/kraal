@@ -37,15 +37,16 @@ pub(super) fn accounts(action: AccountsCmd) -> Result<()> {
                         serde_json::json!({
                             "agent": a.agent, "name": a.name, "home": a.home, "logged_in": st.logged_in(), "status": st,
                             "threshold": all.threshold(a), "usage": usage.get(a),
+                            "joined_homes": joined_homes(&all, a),
                         })
                     })
                     .collect();
                 for a in all.reviews() {
-                    v.push(serde_json::json!({ "agent": a.agent, "name": accounts::existing_label(&a.agent),
-                        "home": a.home, "logged_in": true, "status": "review_required", "usage": null }));
+                    v.push(serde_json::json!({ "agent": a.agent, "name": accounts::review_question(&a),
+                        "home": a.home, "logged_in": null, "status": "review_required", "usage": null }));
                 }
                 for (a, status) in &discovered {
-                    if *status == account_status::Status::CouldNotCheck {
+                    if *status == account_status::Status::CouldNotCheck && all.unlisted().iter().any(|b| b.id == a.id) {
                         v.push(serde_json::json!({ "agent": a.agent, "name": accounts::existing_label(&a.agent),
                             "home": a.home, "logged_in": null, "status": status, "usage": null }));
                     }
@@ -62,12 +63,15 @@ pub(super) fn accounts(action: AccountsCmd) -> Result<()> {
                     login,
                     paths::shorten_home(&paths::expand_tilde(&a.home))
                 );
+                for home in joined_homes(&all, a) {
+                    println!("  {} (joined sign-in)", paths::shorten_home(&paths::expand_tilde(&home)));
+                }
             }
             for a in all.reviews() {
-                println!("{} · Review: `kraal accounts review {}`", accounts::existing_label(&a.agent), a.agent);
+                println!("{} · `kraal accounts review {}`", accounts::review_question(&a), a.agent);
             }
             for (a, status) in &discovered {
-                if *status == account_status::Status::CouldNotCheck {
+                if *status == account_status::Status::CouldNotCheck && all.unlisted().iter().any(|b| b.id == a.id) {
                     println!(
                         "{} · Could not verify. Run `kraal accounts list` to check again.",
                         accounts::existing_label(&a.agent)
@@ -161,7 +165,16 @@ pub(super) fn accounts(action: AccountsCmd) -> Result<()> {
             println!("logging in with {}'s own login…", a.agent);
             login(&a)
         }
-        AccountsCmd::Review { agent } => review_account(&all, &agent),
+        AccountsCmd::Review { agent } => {
+            if discovered
+                .iter()
+                .any(|(a, _)| a.agent == agent && all.by_id(&a.id).is_some_and(|b| !b.review && !b.same_home(a)))
+            {
+                Ok(())
+            } else {
+                review_account(&all, &agent)
+            }
+        }
         AccountsCmd::Login { account } => {
             let a = find_account(&all, &account)?;
             login(&a)
@@ -229,6 +242,20 @@ pub(super) fn accounts(action: AccountsCmd) -> Result<()> {
             accounts::Accounts::load().map(|_| ())
         }
     }
+}
+
+fn joined_homes(all: &accounts::Accounts, account: &accounts::Account) -> Vec<String> {
+    let mut homes = Vec::new();
+    for a in all.entries() {
+        if a.linked_to.is_some()
+            && !a.same_home(account)
+            && all.by_id(&a.id).is_some_and(|target| target.id == account.id)
+            && !homes.contains(&a.home)
+        {
+            homes.push(a.home.clone());
+        }
+    }
+    homes
 }
 
 fn review_account(all: &accounts::Accounts, agent: &str) -> Result<()> {
