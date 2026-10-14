@@ -1,5 +1,7 @@
 //! Control requests from the CLI and from agents (`kraal run`, `kraal read`, hooks, …).
 
+use anyhow::Context;
+
 use std::time::{Duration, Instant};
 
 use super::{ClientId, PendingWait, Server};
@@ -233,6 +235,61 @@ impl Server {
             Request::Notify { title, body } => {
                 self.notify(&title, &body, None);
                 Ok(Response::Ok)
+            }
+            Request::ImportWorkspace { path, name, expected, accounts } => {
+                return Some(
+                    (|| {
+                        if let Some(expected) = expected {
+                            let name = name.context("Choose a workspace name.")?;
+                            self.import_layout(&path, &name, &expected, &accounts)?;
+                            Ok(Response::Ok)
+                        } else {
+                            self.preview_import(&path).map(Response::ImportPreview)
+                        }
+                    })()
+                    .map_err(|e: anyhow::Error| format!("{e:#}")),
+                );
+            }
+            Request::PublishWorkspaceFile { path, source, expected } => {
+                let sources =
+                    self.workspaces.iter().filter_map(|w| Some((w.name.as_str(), w.definition.as_deref()?))).chain(
+                        self.unrestored.iter().filter_map(|w| Some((w.name.as_str(), w.definition.as_deref()?))),
+                    );
+                crate::workspace::publish_import(&path, &source, &expected, sources)
+                    .map(|()| Response::Ok)
+                    .map_err(|e| format!("{e:#}"))
+            }
+            Request::ExportWorkspace { workspace, identity, path, expected } => {
+                return Some(
+                    (|| {
+                        let wi = if expected.is_some() {
+                            let identity = identity.context("Preview the workspace before exporting.")?;
+                            self.workspaces.iter().position(|w| w.stable_id == identity)
+                        } else {
+                            match workspace {
+                                Some(name) => self.named_workspace(&name)?,
+                                None => self.available_workspace(None).and_then(|id| self.ws_index(id)),
+                            }
+                        }
+                        .context("no such workspace")?;
+                        let save = self.prepare_layout_export(wi, &path)?;
+                        if let Some(expected) = expected {
+                            anyhow::ensure!(
+                                save.revision == expected,
+                                "File changed. Retry to review the destination."
+                            );
+                            self.write_definition(wi, &self.workspaces[wi].name.clone(), &save).map(Response::Path)
+                        } else {
+                            Ok(Response::ExportPreview {
+                                identity: self.workspaces[wi].stable_id.clone(),
+                                path: save.path,
+                                revision: save.revision,
+                                question: save.question,
+                            })
+                        }
+                    })()
+                    .map_err(|e: anyhow::Error| format!("{e:#}")),
+                );
             }
             Request::SaveWorkspace { workspace, name } => {
                 let wi = match workspace {

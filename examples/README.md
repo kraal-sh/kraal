@@ -33,3 +33,7 @@ After opening a workspace example, use Workspaces, Tab, **Duplicate** to keep an
 layout under a proposed free name. The copy is saved closed. Opening it starts shells, while
 commands and agents wait for Enter; agents start new conversations. The example file stays
 unchanged, and project folders remain shared. See [Duplicating a workspace](../docs/workspaces.md#duplicating-a-workspace).
+
+Import a layout directly with `kraal import examples/workspaces/first.kdl`. Review the preview
+before adding it; commands wait for Enter. Export your personal layout with
+`kraal export ./first-copy.kdl --workspace first`. The example file and its comments stay intact.

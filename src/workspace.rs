@@ -186,6 +186,170 @@ impl WorkspaceDef {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImportPreview {
+    pub path: PathBuf,
+    pub revision: crate::paths::FileRevision,
+    pub definition: WorkspaceDef,
+    pub accounts: Vec<ImportAccount>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImportAccount {
+    pub reference: String,
+    pub agent: String,
+    pub choices: Vec<(String, String)>,
+}
+
+impl ImportPreview {
+    pub fn read(path: &Path) -> Result<Self> {
+        let path = definition_path(path);
+        let revision = crate::paths::FileRevision::read(&path)?;
+        let source = std::str::from_utf8(revision.bytes.as_deref().context("File missing. Choose a KDL file.")?)?;
+        let name = path.file_stem().unwrap_or_default().to_string_lossy();
+        let definition = parse_workspace(&name, source).with_context(|| format!("parsing {}", path.display()))?;
+        Ok(Self { path, revision, definition, accounts: Vec::new() })
+    }
+
+    pub fn summary(&self) -> String {
+        let mut text = format!(
+            "{} tab{} · {} pane{}\nCommands wait for you to start them.",
+            self.definition.tabs.len(),
+            if self.definition.tabs.len() == 1 { "" } else { "s" },
+            self.definition.panes().len(),
+            if self.definition.panes().len() == 1 { "" } else { "s" }
+        );
+        for warning in &self.definition.warnings {
+            write!(text, "\n{warning}").unwrap();
+        }
+        text
+    }
+}
+
+impl WorkspaceDef {
+    pub fn visit_panes(&mut self, mut visit: impl FnMut(&mut PaneDef)) {
+        fn node(n: &mut LayoutNode, visit: &mut impl FnMut(&mut PaneDef)) {
+            match n {
+                LayoutNode::Pane(p) => visit(p),
+                LayoutNode::Stack { panes, .. } => panes.iter_mut().for_each(visit),
+                LayoutNode::Split { children, .. } => {
+                    for (n, _) in children {
+                        node(n, visit);
+                    }
+                }
+            }
+        }
+        for tab in &mut self.tabs {
+            node(&mut tab.root, &mut visit);
+            tab.floating.iter_mut().for_each(&mut visit);
+        }
+    }
+
+    pub fn portable_accounts(&mut self) {
+        self.visit_panes(|pane| {
+            if let Some(agent) = &mut pane.agent
+                && crate::accounts::agent_kind(agent.split(':').next().unwrap()).is_some()
+            {
+                *agent = agent.split(':').next().unwrap().to_string();
+                pane.account_id = None;
+            }
+        });
+    }
+}
+
+pub fn from_snapshot(ws: &crate::persist::WorkspaceSnap, name: &str) -> WorkspaceDef {
+    use crate::persist::{NodeSnap, PaneSnap};
+    fn pane(p: &PaneSnap, focused: bool) -> PaneDef {
+        let spec = &p.spec;
+        let mut def = PaneDef {
+            name: p.name.clone(),
+            cwd: spec.cwd.clone(),
+            focus: focused,
+            close_on_exit: spec.close_on_exit,
+            start_suspended: p.stopped,
+            ..Default::default()
+        };
+        if let Some(path) = &spec.preview {
+            def.kind = PaneKind::Preview(path.clone());
+        } else if let Some(pending) = &spec.pending_agent {
+            def.agent = Some(pending.agent.clone());
+            def.args = pending.args.clone();
+            def.start_suspended = pending.suspended;
+        } else if let Some(account) = &spec.account {
+            def.agent = Some(account.clone());
+            def.account_id = spec.account_id.clone();
+            let kind = account.split_once(':').and_then(|(k, _)| crate::accounts::agent_kind(k));
+            def.args = kind.map(|k| crate::accounts::launch_args(k, &spec.command)).unwrap_or_default();
+            def.start_suspended |=
+                !kind.and_then(|k| crate::accounts::resumable_args(k, &def.args)).is_some_and(|(_, exact)| exact);
+        } else {
+            def.command = spec.command.first().cloned();
+            def.args = spec.command.iter().skip(1).cloned().collect();
+            if spec.command.is_empty() {
+                def.agent = p.agent.clone();
+            }
+        }
+        def
+    }
+    fn node(n: &NodeSnap, focus: Option<usize>, index: &mut usize) -> LayoutNode {
+        match n {
+            NodeSnap::Pane(p) => {
+                let def = pane(p, focus == Some(*index));
+                *index += 1;
+                LayoutNode::Pane(def)
+            }
+            NodeSnap::Split { axis, children, stacked, open } => {
+                let sum = children.iter().map(|(_, w)| w).sum::<f32>().max(f32::EPSILON);
+                let children: Vec<_> = children
+                    .iter()
+                    .map(|(n, w)| {
+                        (node(n, focus, index), Some(SizeSpec::Percent(((w / sum) * 100.0).round().max(1.0) as u16)))
+                    })
+                    .collect();
+                if *stacked {
+                    LayoutNode::Stack {
+                        panes: children.iter().flat_map(|(n, _)| n.panes().into_iter().cloned()).collect(),
+                        expanded: open.unwrap_or(0),
+                    }
+                } else {
+                    LayoutNode::Split { axis: *axis, children }
+                }
+            }
+        }
+    }
+    let tabs = ws
+        .tabs
+        .iter()
+        .enumerate()
+        .map(|(ti, tab)| {
+            let mut index = 0;
+            let root = tab
+                .root
+                .as_ref()
+                .map(|n| node(n, tab.focus, &mut index))
+                .unwrap_or_else(|| LayoutNode::Pane(PaneDef { cwd: ws.cwd.clone(), ..Default::default() }));
+            let floating = tab
+                .floating
+                .iter()
+                .filter(|(p, _)| p.spec.login.is_none())
+                .map(|(p, _)| {
+                    let def = pane(p, tab.focus == Some(index));
+                    index += 1;
+                    def
+                })
+                .collect();
+            TabDef {
+                name: (!tab.name.is_empty()).then(|| tab.name.clone()),
+                focus: ti == ws.active,
+                cwd: None,
+                root,
+                floating,
+            }
+        })
+        .collect();
+    WorkspaceDef { name: name.into(), cwd: ws.cwd.clone(), tabs, warnings: Vec::new() }
+}
+
 /// Parse a workspace file. `name` is the workspace name (file stem).
 ///
 /// Fails only on invalid KDL or a missing `layout` node. Relative `cwd` values are
@@ -362,6 +526,27 @@ pub fn save_file(path: &Path, def: &WorkspaceDef, expected: &crate::paths::FileR
     crate::paths::write_checked(path, source.as_bytes(), expected)
         .with_context(|| format!("saving {}", path.display()))?;
     Ok(source)
+}
+
+/// Ownership must stay stable through publication: called by the server, or under the
+/// stopped session's lock. A file revision alone cannot detect a workspace being opened.
+pub fn publish_import<'a>(
+    path: &Path,
+    source: &str,
+    expected: &crate::paths::FileRevision,
+    sources: impl Iterator<Item = (&'a str, &'a Path)>,
+) -> Result<()> {
+    for (name, owned) in sources {
+        anyhow::ensure!(
+            !(crate::paths::same_file(owned, path)
+                || expected.bytes.is_some()
+                    && crate::paths::same_file(owned, &expected.target.with_extension("kdl.bak"))),
+            "destination belongs to workspace {name:?}; choose another file name"
+        );
+    }
+    parse_workspace(&path.file_stem().unwrap_or_default().to_string_lossy(), source)?;
+    crate::paths::write_checked(path, source.as_bytes(), expected)?;
+    Ok(())
 }
 
 /// What to say when no workspace is named `name`: none is open under that name, and no file of

@@ -1547,7 +1547,8 @@ fn workspace_moves_keep_focus_share_the_list_and_survive_restart() {
         client.send(b"docs\t");
         click_account_text(&mut client, "Clear search to reorder");
         assert_eq!(listed_workspaces(&env), ["api: api.kdl (open)", "docs: docs.kdl", "web: web.kdl (open)"]);
-        client.send(b"\t\x1b[B\x1b[B\x1b[B\r");
+        client.send(b"\t");
+        click_account_text(&mut client, "Move up");
         let reordered = ["docs: docs.kdl", "api: api.kdl (open)", "web: web.kdl (open)"];
         wait_until(PATIENCE, "workspace order was not saved", || listed_workspaces(&env) == reordered);
         other.wait_for_rows("the other client's list has the same order", |rows| {
@@ -1595,13 +1596,15 @@ fn workspace_delete_undo_and_restore_after_restart_keep_both_reused_names() {
         let path = env.root.join("config/kraal/workspaces/api.kdl");
         let mut client = RawClient::attach_sized(&env, Some("api"), size);
         client.wait_for_row("$ ");
-        client.send(b"\x02w\t\x1b[B\x1b[B\x1b[B\x1b[B\r");
+        client.send(b"\x02w\t");
+        click_account_text(&mut client, "Delete");
         client.wait_for_row("Delete api?");
         client.wait_for_row("Project files will be kept.");
         client.send(b"\r");
         client.wait_for_row("Search");
         assert_eq!(env.run(&["workspaces", "--json"]), serde_json::to_string_pretty(&original).unwrap() + "\n");
-        client.send(b"\t\x1b[B\x1b[B\x1b[B\x1b[B\r");
+        client.send(b"\t");
+        click_account_text(&mut client, "Delete");
         client.wait_for_row("Delete api?");
         client.send(b"y");
         client.wait_for_row("Ctrl+Z Undo");
@@ -1613,7 +1616,8 @@ fn workspace_delete_undo_and_restore_after_restart_keep_both_reused_names() {
         assert_eq!(restored[0]["id"], identity);
         assert_eq!(restored[0]["open"], false);
         assert_eq!(env.run(&["panes", "--json"]).trim(), "[]");
-        client.send(b"\t\x1b[B\x1b[B\x1b[B\r");
+        client.send(b"\t");
+        click_account_text(&mut client, "Delete");
         client.wait_for_row("Delete api?");
         client.send(b"y");
         client.wait_for_row("Workspace deleted");
@@ -1695,7 +1699,8 @@ fn deleting_a_scanned_source_never_runs_it_and_restores_its_saved_contents() {
 #[test]
 fn workspace_save_errors_keep_the_name_and_full_reason_at_both_sizes() {
     let env = Env::new("wssaveerrors");
-    let dir = env.root.join("config/kraal/workspaces");
+    let dir = env.root.join("workspaces-link");
+    std::os::unix::fs::symlink(env.root.join("config/kraal/workspaces"), &dir).unwrap();
     env.workspace("w", "layout {\n    pane name=\"shell\"\n}\n");
     env.run(&["open", "w"]);
     for size in [(80, 24), (124, 36)] {
@@ -1705,21 +1710,22 @@ fn workspace_save_errors_keep_the_name_and_full_reason_at_both_sizes() {
         let mut client = RawClient::attach_sized(&env, Some("w"), size);
         client.wait_for_message("\"attached\"");
         client.send(b"\x02Ws");
-        client.wait_for_row("Save workspace layout as");
-        client.send(format!("\x01\x0b {name} \r").as_bytes());
-        let rows = client.wait_for_row("⏎ retry");
-        // Inside the prompt, after the pane's border: remove only the prompt's one-column padding.
-        let message: String = rows
-            .iter()
-            .filter_map(|r| r.split('│').nth(2))
-            .filter_map(|r| r.strip_prefix(' ')?.strip_suffix(' '))
-            .collect();
-        assert!(message.contains(&format!("{} is not a regular file", path.display())), "{}", rows.join("\n"));
-        assert!(rows.iter().any(|r| r.contains(&name)), "{}", rows.join("\n"));
-        assert!(rows.iter().any(|r| r.contains("esc cancel")));
+        client.wait_for_row("Export layout");
+        client.send(format!("\x01\x0b {}\r", path.display()).as_bytes());
+        let expected = format!("{} is not a regular file", path.canonicalize().unwrap().display());
+        let rows = client.wait_for_rows("the full export error and Retry", |rows| {
+            // Remove only the prompt's padding: a path can continue across rows and contain spaces.
+            let message: String = rows
+                .iter()
+                .filter_map(|r| r.split('│').nth(2))
+                .filter_map(|r| r.strip_prefix(' ')?.strip_suffix(' '))
+                .collect();
+            message.contains(&expected) && rows.iter().any(|r| r.contains("Enter Retry"))
+        });
+        assert!(rows.iter().any(|r| r.contains("Esc Cancel")));
         std::fs::remove_dir(&path).unwrap();
         client.send(b"\r");
-        client.wait_for_row("saved ");
+        client.wait_for_row("Layout exported");
         assert!(path.is_file());
         assert!(!path.with_extension("kdl.bak").exists());
         assert_eq!(env.run(&["panes"]).lines().count(), 1);
@@ -1748,11 +1754,11 @@ fn workspace_saves_check_ownership_and_confirm_the_exact_file() {
     let mut client = RawClient::attach(&env, "a");
     client.wait_for_message("\"attached\"");
     client.send(b"\x02Ws");
-    client.wait_for_row("Save workspace layout as");
-    client.send(b"\x01\x0bcopy\r");
+    client.wait_for_row("Export layout");
+    client.send(format!("\x01\x0b{}\r", dir.join("copy.kdl").display()).as_bytes());
     client.wait_for_row("Replace file?");
     client.send(b"\r");
-    client.wait_for_row("Save workspace layout as");
+    client.wait_for_row("Export layout");
     assert_eq!(std::fs::read_to_string(dir.join("copy.kdl")).unwrap(), old);
     client.send(b"\r");
     client.wait_for_row("Replace file?");
@@ -1763,15 +1769,17 @@ fn workspace_saves_check_ownership_and_confirm_the_exact_file() {
     client.send(b"\r");
     client.wait_for_row("Replace file?");
     client.send(b"y");
-    client.wait_for_row("saved ");
+    client.wait_for_row("Layout exported");
     assert_eq!(std::fs::read_to_string(dir.join("copy.kdl.bak")).unwrap(), "edited after confirmation");
-    assert_eq!(listed_workspaces(&env), ["a: a.kdl (open)", "b: b.kdl (open)", "copy: copy.kdl"]);
+    assert_eq!(listed_workspaces(&env), ["a: a.kdl (open)", "b: b.kdl (open)"]);
     // Saving the linked source after a manual edit also asks, without restarting its panes.
     std::fs::write(dir.join("a.kdl"), "invalid KDL from an editor").unwrap();
-    client.send(b"\x02Ws\r");
+    client.send(b"\x1b\x1b\x02Ws");
+    client.wait_for_row("Export layout");
+    client.send(format!("\x01\x0b{}\r", dir.join("a.kdl").display()).as_bytes());
     client.wait_for_row("File changed");
     client.send(b"y");
-    client.wait_for_row("saved ");
+    client.wait_for_row("Layout exported");
     wait_until(PATIENCE, "the confirmed source was not saved", || {
         std::fs::read_to_string(dir.join("a.kdl.bak")).is_ok_and(|s| s == "invalid KDL from an editor")
     });
@@ -1819,7 +1827,7 @@ fn two_sessions_cannot_silently_replace_each_others_layouts() {
     second.run(&["open", "work"]);
     first.run(&["run", "--name", "first", "--", "sleep", "100"]);
     second.run(&["run", "--name", "second", "--", "sleep", "100"]);
-    first.run(&["save", "--workspace", "work"]);
+    first.run(&["export", shared.join("work.kdl").to_str().unwrap(), "--workspace", "work", "--replace"]);
     let winner = std::fs::read_to_string(shared.join("work.kdl")).unwrap();
     let refused = second.try_run(&["save", "--workspace", "work"]);
     assert!(!refused.status.success());
@@ -1867,15 +1875,17 @@ fn save_in_a_pane_saves_the_workspace_of_that_pane() {
     };
     let saved = |name: &str| std::fs::read_to_string(dir.join(name)).unwrap_or_default();
 
-    assert!(in_pane(&["save"]).trim().ends_with("/v.kdl"));
-    // Saving keeps the previous definition and a persistent lock shared with account migration.
-    assert_eq!(names_in(&dir), [".v.kdl.lock", "v.kdl", "v.kdl.bak", "w.kdl"]);
-    assert!(in_pane(&["save", "copy"]).trim().ends_with("/copy.kdl"));
+    std::fs::remove_file(dir.join("v.kdl")).unwrap();
+    assert!(in_pane(&["save"]).contains("/v.kdl"));
+    // Recreating a missing definition keeps the persistent lock shared with account migration.
+    assert_eq!(names_in(&dir), [".v.kdl.lock", "v.kdl", "w.kdl"]);
+    assert!(in_pane(&["save", "copy"]).contains("/copy.kdl"));
     assert!(saved("copy.kdl").contains("name=\"second\"") && !saved("copy.kdl").contains("first"));
-    assert!(in_pane(&["save", "named", "--workspace", "w"]).trim().ends_with("/named.kdl"));
+    assert!(in_pane(&["save", "named", "--workspace", "w"]).contains("/named.kdl"));
     assert!(saved("named.kdl").contains("name=\"first\""), "{}", saved("named.kdl"));
     // Outside a pane: the workspace on screen.
-    assert!(env.run(&["save"]).trim().ends_with("/w.kdl"));
+    std::fs::remove_file(dir.join("w.kdl")).unwrap();
+    assert!(env.run(&["save"]).contains("/w.kdl"));
 }
 
 /// `kraal workspaces --json`, a line each: name, file, and whether it is open.
@@ -1931,11 +1941,13 @@ fn a_renamed_workspace_keeps_its_file_unchanged() {
     assert_eq!(listed_workspaces(&env), ["infra - perso: perso.kdl (open)", "work: work.kdl"]);
     let text = env.run(&["workspaces"]);
     assert!(!text.lines().any(|l| l.starts_with("perso ")), "{text}");
-    // Saved from the menu under the name it proposes: to its file.
+    // Export proposes a copy; replacing the source is an explicit choice.
     client.send(b"\x02Ws");
-    client.wait_for_row("Save workspace layout as");
-    client.send(b"\r");
-    client.wait_for_row("saved ");
+    client.wait_for_row("Export layout");
+    client.send(format!("\x01\x0b{}\r", dir.join("perso.kdl").display()).as_bytes());
+    client.wait_for_row("Replace file?");
+    client.send(b"y");
+    client.wait_for_row("Layout exported");
     assert_eq!(names_in(&dir), [".perso.kdl.lock", "perso.kdl", "perso.kdl.bak", "work.kdl"]);
     // Restored after a restart, still linked to its file.
     env.run(&["kill"]);
@@ -1988,7 +2000,8 @@ fn a_workspace_renamed_without_its_file_is_still_that_files() {
     client.wait_for_message("\"attached\"");
     let shown = closed_sidebar_rows(&client);
     assert!(shown.len() == 1 && shown[0].contains("work"), "{shown:?}");
-    let saved = env.run(&["save", "--workspace", "infra - perso"]);
+    let saved =
+        env.run(&["export", dir.join("perso.kdl").to_str().unwrap(), "--workspace", "infra - perso", "--replace"]);
     assert!(saved.trim_end().ends_with("/perso.kdl"), "{saved}");
     assert_eq!(names_in(&dir), [".perso.kdl.lock", "perso.kdl", "perso.kdl.bak", "work.kdl"]);
     client.send(b"\x02We");
@@ -10993,7 +11006,8 @@ fn a_crash_during_delete_finishes_the_deletion_and_keeps_it_restorable() {
     env.wait_for_text("job", "ready");
     let mut client = RawClient::attach_sized(&env, Some("w"), (80, 24));
     client.wait_for_message("\"attached\"");
-    client.send(b"\x02w\t\x1b[B\x1b[B\x1b[B\x1b[B\r");
+    client.send(b"\x02w\t");
+    click_account_text(&mut client, "Delete");
     client.wait_for_row("Stop and delete");
     client.send(b"y");
     wait_until(PATIENCE, "deletion was not prepared", || {
@@ -12686,4 +12700,132 @@ fn sidebar_accounts_discover_a_sign_in_completed_after_startup() {
         assert!(std::fs::read_to_string(&file).unwrap().contains("review = true"));
         assert!(!env.root.join("home/logins").exists());
     }
+}
+
+#[test]
+fn importing_a_file_previews_then_keeps_commands_waiting_and_export_preserves_the_source() {
+    let env = Env::new("layout-transfer");
+    let path = env.root.join("recipe.kdl");
+    let marker = env.root.join("must-not-run");
+    let source = format!(
+        "// handwritten\nlayout {{ pane command=\"touch\" {{ args {:?}; }}; unknown; }}\n",
+        marker.display().to_string()
+    );
+    std::fs::write(&path, &source).unwrap();
+    let file = path.to_str().unwrap();
+    let refused = env.try_run(&["import", file]);
+    assert!(!refused.status.success());
+    assert!(String::from_utf8_lossy(&refused.stdout).contains("Commands wait for you to start them"));
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("No workspace was added"));
+    assert!(!marker.exists());
+    let added = env.run(&["import", file, "--name", "personal", "--yes"]);
+    assert!(added.contains("unknown") && added.contains("Workspace personal added"), "{added}");
+    let panes: serde_json::Value = serde_json::from_str(&env.run(&["panes", "--json"])).unwrap();
+    assert!(panes.as_array().unwrap().iter().filter(|p| p["workspace"] == "personal").all(|p| p["suspended"] == true));
+    assert!(!marker.exists());
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), source);
+    let again = env.try_run(&["import", file, "--name", "duplicate", "--yes"]);
+    assert!(!again.status.success());
+    assert!(String::from_utf8_lossy(&again.stderr).contains("already used by personal"));
+    let exported = env.root.join("config/kraal/workspaces/shared.kdl");
+    assert!(env.run(&["export", exported.to_str().unwrap(), "--workspace", "personal"]).contains("Layout exported"));
+    assert!(!listed_workspaces(&env).iter().any(|w| w.starts_with("shared:")));
+    let refused = env.try_run(&["export", file, "--workspace", "personal"]);
+    assert!(!refused.status.success());
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), source);
+    env.run(&["export", file, "--workspace", "personal", "--replace"]);
+    assert_eq!(std::fs::read_to_string(path.with_extension("kdl.bak")).unwrap(), source);
+    env.run(&["kill"]);
+    env.run(&["open", "personal"]);
+    assert!(!marker.exists());
+    assert!(!listed_workspaces(&env).iter().any(|w| w.starts_with("shared:")));
+    let saved = env.try_run(&["save", "legacy-copy", "--workspace", "personal"]);
+    assert!(saved.status.success());
+    assert!(String::from_utf8_lossy(&saved.stderr).contains("Workspaces are saved automatically"));
+    assert!(String::from_utf8_lossy(&saved.stdout).trim_end().ends_with("legacy-copy.kdl"));
+}
+
+#[test]
+fn importing_a_bare_filename_uses_the_callers_directory() {
+    let env = Env::new("import-relative");
+    let project = env.root.join("project");
+    std::fs::create_dir(&project).unwrap();
+    let source = "layout { pane command=\"true\"; }";
+    let other = "layout { pane command=\"false\"; }";
+    std::fs::write(project.join("layout.kdl"), source).unwrap();
+    std::fs::write(env.root.join("home/layout.kdl"), other).unwrap();
+    let out = env.cmd(&["import", "layout.kdl", "--yes"]).current_dir(&project).output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(String::from_utf8_lossy(&out.stdout).contains("Workspace layout added"));
+    let panes: serde_json::Value = serde_json::from_str(&env.run(&["panes", "--json"])).unwrap();
+    let pane = panes.as_array().unwrap().iter().find(|p| p["workspace"] == "layout").unwrap();
+    assert_eq!(pane["command"], serde_json::json!(["true"]));
+    assert_eq!(pane["suspended"], true);
+    let workspaces: serde_json::Value = serde_json::from_str(&env.run(&["workspaces", "--json"])).unwrap();
+    let workspace = workspaces.as_array().unwrap().iter().find(|w| w["name"] == "layout").unwrap();
+    assert_eq!(workspace["definition"], std::fs::canonicalize(project.join("layout.kdl")).unwrap().to_str().unwrap());
+    assert_eq!(std::fs::read_to_string(project.join("layout.kdl")).unwrap(), source);
+    assert_eq!(std::fs::read_to_string(env.root.join("home/layout.kdl")).unwrap(), other);
+}
+
+#[test]
+fn from_file_and_export_use_the_shared_forms_at_both_sizes() {
+    for size in [(80, 24), (124, 36)] {
+        let env = Env::new(&format!("file-forms-{}", size.0));
+        env.workspace("base", "layout { pane; }");
+        env.run(&["open", "base"]);
+        let path = env.root.join("imported.kdl");
+        let original = "// retain this\nlayout { pane command=\"false\"; }\n";
+        std::fs::write(&path, original).unwrap();
+        let mut client = RawClient::attach_sized(&env, Some("base"), size);
+        client.wait_for_message("\"attached\"");
+        client.send(b"\x02Wn");
+        client.wait_for_row("From file...");
+        click_account_text(&mut client, "From file...");
+        client.send(format!("{}\t", path.display()).as_bytes());
+        client.wait_for_row("Commands wait for you to start them.");
+        client.send(b"\r");
+        client.wait_for_row("Workspace added");
+        let panes: serde_json::Value = serde_json::from_str(&env.run(&["panes", "--json"])).unwrap();
+        let imported = panes.as_array().unwrap().iter().find(|p| p["workspace"] == "imported").unwrap();
+        assert_eq!(imported["suspended"], true);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        client.send(b"\x02Ws");
+        client.wait_for_row("Workspaces are saved automatically.");
+        let copy = env.root.join("copy.kdl");
+        client.send(format!("\x01\x0b{}\r", copy.display()).as_bytes());
+        client.wait_for_row("Layout exported");
+        assert!(std::fs::read_to_string(copy).unwrap().contains("command=\"false\""));
+        assert_eq!(std::fs::read_to_string(path).unwrap(), original);
+    }
+}
+
+#[test]
+fn legacy_zellij_import_keeps_manual_bytes_and_backs_up_replacements() {
+    let env = Env::new("import-zellij-backup");
+    let from = env.root.join("layouts");
+    std::fs::create_dir(&from).unwrap();
+    let source = "// keep all comments\nlayout { pane; unknown; }\n";
+    std::fs::write(from.join("manual.kdl"), source).unwrap();
+    env.workspace("manual", "layout { pane name=\"before\"; }");
+    let dest = env.root.join("config/kraal/workspaces/manual.kdl");
+    let old = std::fs::read_to_string(&dest).unwrap();
+    env.run(&["import-zellij", "--from", from.to_str().unwrap()]);
+    assert_eq!(std::fs::read_to_string(&dest).unwrap(), old);
+    env.run(&["import-zellij", "--from", from.to_str().unwrap(), "--force"]);
+    assert_eq!(std::fs::read_to_string(&dest).unwrap(), source);
+    assert_eq!(std::fs::read_to_string(dest.with_extension("kdl.bak")).unwrap(), old);
+    env.run(&["open", "manual"]);
+    std::fs::write(from.join("manual.kdl"), "layout { pane name=\"replacement\"; }").unwrap();
+    let skipped = env.try_run(&["import-zellij", "--from", from.to_str().unwrap(), "--force"]);
+    assert!(skipped.status.success());
+    assert!(String::from_utf8_lossy(&skipped.stderr).contains("belongs to workspace"));
+    assert_eq!(std::fs::read_to_string(&dest).unwrap(), source);
+    env.run(&["kill"]);
+    let skipped = env.try_run(&["import-zellij", "--from", from.to_str().unwrap(), "--force"]);
+    assert!(skipped.status.success());
+    assert!(String::from_utf8_lossy(&skipped.stderr).contains("belongs to workspace"));
+    assert_eq!(std::fs::read_to_string(&dest).unwrap(), source);
+    assert_eq!(std::fs::read_to_string(dest.with_extension("kdl.bak")).unwrap(), old);
+    assert!(env.server_pid().is_none());
 }

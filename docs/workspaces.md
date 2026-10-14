@@ -1,6 +1,6 @@
 # Sessions and workspaces
 
-How kraal is organised, and how a workspace is declared once in a file and opened in one command.
+Workspaces are saved automatically. KDL files import and export reusable layouts.
 
 ## Concepts
 
@@ -193,7 +193,7 @@ Tabs, splits, floating panes, pane directories, commands, agent conversations an
 are kept. Reopening follows the same rules as a session restart: shells start, SSH shells reconnect,
 agent conversations resume, and other commands wait for Enter. The imported KDL file is not
 rewritten or reread by Close or Open; editing, removing or breaking that file does not replace
-the saved layout. To export a closed workspace with `kraal save`, open it first.
+the saved layout. Export also works while the workspace is closed, without starting its programs.
 
 Close lists the running programs, background jobs, agents and SSH connections before stopping them.
 The question is titled **Close &lt;name&gt;?**. Programs are named as they appear in the terminal;
@@ -325,8 +325,8 @@ opening its source does not replace the saved workspace with a fresh copy.
 
 ## Workspace files
 
-Workspaces live in `~/.config/kraal/workspaces/*.kdl` (and in the directories `workspace_dirs`
-names in the configuration), in KDL. Two to copy and change:
+Workspace layouts can be imported from any KDL file. Files in `~/.config/kraal/workspaces/*.kdl`
+and the directories `workspace_dirs` names also appear in Workspaces. Two to import and change:
 [first.kdl](../examples/workspaces/first.kdl) (tabs, a split, a live preview, a command pane) and
 [two-agents.kdl](../examples/workspaces/two-agents.kdl) (two agents, a stack of helper panes).
 One with servers and an agent:
@@ -402,16 +402,57 @@ From the command line:
 |---|---|
 | `kraal workspaces` | its open and closed workspaces with retained tab and pane counts, plus files not imported (`--json` for scripts); saved workspaces remain listed when the server is stopped |
 | `kraal open shop` | reopens the saved workspace `shop`, switches to it if open, or imports its file the first time, without attaching (any name: `kraal open files` too) |
-| `kraal save` | writes the layout of a workspace to its file: in a pane, that pane's workspace; outside one, the workspace on screen |
+| `kraal import ./shop.kdl` | previews the file, then asks to add it; commands and agents wait for Enter |
+| `kraal import ./shop.kdl --name shop-copy --yes` | accepts the preview with an explicit name, without prompting |
+| `kraal export ./shop.kdl --workspace shop` | exports an open or closed workspace, without conversations or private account names |
+| `kraal export ./shop.kdl --workspace shop --replace` | confirms replacement of the reviewed file, keeping a backup |
+| `kraal save` | legacy export: in a pane, that pane's workspace; outside one, the workspace on screen |
 | `kraal save --workspace shop` | the same for the workspace you name |
-| `kraal save shop-2` | writes it under that name |
+| `kraal save shop-2` | writes `<name>.kdl` in the definitions directory |
 
-`ctrl+b W s` or `kraal save` writes the layout back to the workspace's file, stacks included. A
-workspace that has none yet gets one in the definitions directory: `<its name>.kdl`, or the name
-given (`kraal save <name>`). For a workspace that has one, another name writes a copy there. The
-file it replaces is kept as `.kdl.bak`. An agent started on an account is saved as
-`agent="claude:pro"` with its arguments, and a command that has not run yet keeps
-`start_suspended=true`.
+### Importing a layout
+
+In **Add workspace**, choose **From file...**. Enter **File**, then Tab or **Preview** to see
+the tab and pane counts and any unsupported KDL warnings. **Name** starts with the file's name
+and remains editable. **Add** opens the workspace only after that preview. Parsing and previewing
+run no programs. Shells may start on Add; commands and agents wait for Enter, even if the file
+asked to start them immediately. The original file stays unchanged, with no copy required in
+kraal's configuration. Later openings use the retained personal layout and normal resume rules.
+
+An invalid file keeps the path and name in the form. Fix the file and **Retry**. A file that
+changes after preview must be previewed again. A file already associated with a workspace offers
+**Open** for that workspace, and never creates a duplicate. A taken name must be changed.
+Missing explicit account references require a choice of an available account. Use the arrow keys
+on the account field to choose, then **Next** if there are more references. If none is available,
+add one in **Accounts**, then retry.
+The CLI offers the same account choice in a terminal. `--yes` cannot choose a missing account
+for you. A failed durable save rolls back the addition and leaves the form ready to retry.
+
+The legacy batch command `kraal import-zellij --from ~/layouts` still copies valid layouts into
+kraal's workspace directory, preserving their exact bytes, comments and unsupported nodes.
+It uses the same parser and checked file writer. `kraal import-zellij --from ~/layouts --force`
+allows replacement with a `.kdl.bak` backup; files owned by a retained workspace in this session
+are skipped. It copies recipes without opening workspaces. Use **From file...** or `kraal import`
+for the preview and waiting-command workflow.
+
+### Exporting a layout
+
+**Export layout** is in a saved workspace's Tab actions, also while closed. The historical
+`ctrl+b W s` shortcut opens the same form. **File** proposes an unused copy path. Change it to
+export elsewhere, including to the source file explicitly. Export preserves the workspace's
+name, identity and position; it does not add a second workspace to this session's list.
+**Layout exported** reports the full path written; **Done** returns to the previous screen. Errors keep the editable path with **Retry**.
+
+The exported KDL describes tabs, splits, stacks, floating panes, folders and startup commands.
+It contains no conversations or running process state. Managed agents use portable references
+such as `agent="claude"`; the recipient's account rules apply. Comments and unsupported KDL
+cannot survive serialization, so every existing destination needs explicit replacement.
+The source is never overwritten automatically.
+
+`kraal save` remains a legacy export alias and prints a transition message. It keeps its existing
+name and destination rules: the source file by default, or a named copy in the definitions
+directory. A first export with no source links that file for compatibility. It also keeps explicit
+agent account references and arguments. Waiting commands keep `start_suspended=true`.
 
 An open workspace stays linked to its file, across restarts too: the sidebar and
 `kraal workspaces` list it once, and `kraal open` with the name of its file switches to it.
@@ -426,20 +467,21 @@ A destination linked to another workspace in this session is refused, including 
 or symlink to the same file. Choose another name. Workspaces whose panes could not be restored
 also keep their file association.
 
-Saving an unchanged linked file needs no extra step. Any other existing destination asks
+Every existing destination, including an unchanged source, asks
 **Replace file?**, with **Cancel** selected. A linked file edited outside kraal, including by
-another session, asks **File changed** instead. Cancel returns to the name you entered, where
-you can choose a name for a copy. Confirming **Replace file** keeps the replaced file as
+another session, asks **File changed** instead. Cancel returns to the file path you entered, where
+you can choose a path for a copy. Confirming **Replace file** keeps the replaced file as
 `.kdl.bak` beside the resolved target, including when saving through a symlink. Even an invalid
 KDL file needs this explicit confirmation. If the file changes again while the question is open,
 replacement is refused: retry to review the new version. Errors keep the form and its input open.
-Enter retries with the same name; Esc cancels. Errors wrap below the input at both 80-column and
+Enter retries with the same path; Esc cancels. Errors wrap below the input at both 80-column and
 wider terminal sizes. If a diagnostic is taller than the dialog, `pageup`/`pagedown` or the mouse
 wheel scrolls it while the input and footer stay visible. Moving the cursor keeps the error;
 editing the value clears it.
 
 `kraal save` refuses a replacement that needs confirmation. Use `kraal save <name>` with a new
-name for a copy, or **Save workspace layout** in kraal to confirm replacement. There is no
+name for a copy, or **Export layout** in kraal to confirm replacement. `kraal export <file> --replace`
+confirms replacement from the CLI. There is no
 permanent overwrite permission. The CLI's first file association is queued for session
 persistence as soon as the save succeeds.
 

@@ -19,6 +19,7 @@ pub struct DefinitionSave {
     pub revision: paths::FileRevision,
     pub question: Option<String>,
     link: bool,
+    portable: bool,
 }
 
 impl Server {
@@ -169,7 +170,6 @@ impl Server {
     pub(super) fn prepare_definition_save(&self, wi: usize, name: &str) -> Result<DefinitionSave> {
         anyhow::ensure!(workspace::valid_file_name(name), "{}, not {name:?}", workspace::FILE_NAME_RULE);
         let ws = &self.workspaces[wi];
-        anyhow::ensure!(ws.kept.is_none(), "Open the workspace before exporting its layout.");
         let own = ws.definition.as_ref().filter(|p| p.file_stem() == Some(OsStr::new(name)));
         let path = own.cloned().unwrap_or_else(|| self.definition_dir().join(format!("{name}.kdl")));
         self.check_definition_owner(wi, &path)?;
@@ -179,18 +179,40 @@ impl Server {
         if revision.bytes.is_some() {
             self.check_definition_owner(wi, &revision.target.with_extension("kdl.bak"))?;
         }
-        let question = revision.bytes.as_deref().and_then(|bytes| {
-            if own.is_some() && ws.definition_source.as_ref().is_some_and(|s| s.as_bytes() == bytes) {
-                None
-            } else if own.is_some() && ws.definition_source.is_some() {
-                Some(format!("File changed\n{} changed since it was loaded.", path.display()))
-            } else if own.is_some() {
-                Some(format!("Replace file?\n{} has no recorded contents in this session.", path.display()))
-            } else {
-                Some(format!("Replace file?\n{} already exists.", path.display()))
-            }
+        let question = revision.bytes.as_ref().map(|_| {
+            replacement_question(&path, own.and(ws.definition_source.as_ref()).map(String::as_str), &revision)
         });
-        Ok(DefinitionSave { path, revision, question, link: own.is_some() || ws.definition.is_none() })
+        Ok(DefinitionSave { path, revision, question, link: own.is_some() || ws.definition.is_none(), portable: false })
+    }
+
+    pub(super) fn prepare_layout_export(&self, wi: usize, path: &Path) -> Result<DefinitionSave> {
+        self.check_definition_owner(wi, path)?;
+        let parent = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
+        std::fs::create_dir_all(parent)?;
+        let path = workspace::definition_path(path);
+        let revision = paths::FileRevision::read(&path)?;
+        if revision.bytes.is_some() {
+            self.check_definition_owner(wi, &revision.target.with_extension("kdl.bak"))?;
+        }
+        let ws = &self.workspaces[wi];
+        let source =
+            ws.definition.as_deref().filter(|p| paths::same_file(p, &path)).and(ws.definition_source.as_deref());
+        let question = revision.bytes.as_ref().map(|_| replacement_question(&path, source, &revision));
+        Ok(DefinitionSave { path, revision, question, link: false, portable: true })
+    }
+
+    pub(super) fn export_file_default(&self, wi: usize) -> PathBuf {
+        let base = workspace::file_name_from(&self.workspaces[wi].name);
+        (0..)
+            .map(|n| {
+                self.definition_dir().join(if n == 0 { format!("{base}.kdl") } else { format!("{base}-copy-{n}.kdl") })
+            })
+            .find(|p| {
+                !p.exists()
+                    && self.check_definition_owner(wi, p).is_ok()
+                    && self.workspaces[wi].definition.as_deref().is_none_or(|own| !paths::same_file(own, p))
+            })
+            .unwrap()
     }
 
     fn check_definition_owner(&self, wi: usize, path: &Path) -> Result<()> {
@@ -213,20 +235,72 @@ impl Server {
     }
 
     pub(super) fn write_definition(&mut self, wi: usize, name: &str, save: &DefinitionSave) -> Result<PathBuf> {
-        let current = self.prepare_definition_save(wi, name)?;
+        let current = if save.portable {
+            self.prepare_layout_export(wi, &save.path)?
+        } else {
+            self.prepare_definition_save(wi, name)?
+        };
         anyhow::ensure!(
             current.path == save.path && current.link == save.link && current.revision == save.revision,
             "File changed while saving; retry to review {}",
             save.path.display()
         );
-        let def = self.snapshot_definition(wi, name);
-        let source = workspace::save_file(&save.path, &def, &save.revision)?;
-        if save.link {
+        let mut def = self.snapshot_definition(wi, name)?;
+        if save.portable {
+            def.portable_accounts();
+        }
+        let removed = self.removed_sources.clone();
+        if save.portable {
+            // Publication replaces a directory entry. A hard link to the source becomes
+            // a separate file, while a symlink still writes through to the source entry.
+            if self.workspaces[wi].definition.as_deref().is_none_or(|p| {
+                std::fs::canonicalize(p).unwrap_or_else(|_| workspace::definition_path(p)) != save.revision.target
+            }) && !self.removed_sources.contains(&save.path)
+            {
+                // Keep a scanned export from appearing as a second workspace, including after a crash.
+                self.removed_sources.push(save.path.clone());
+            }
+            if let Err(e) = self.save_now() {
+                self.removed_sources = removed;
+                self.mark_persist();
+                let rollback = self.save_now();
+                anyhow::bail!(
+                    "Couldn't prepare the export. The file is unchanged. Fix the save error and Retry.\n{e}{}",
+                    rollback
+                        .err()
+                        .map(|e| format!("\nCouldn't restore the saved listing; retry will repair it.\n{e}"))
+                        .unwrap_or_default()
+                );
+            }
+        }
+        let source = match workspace::save_file(&save.path, &def, &save.revision) {
+            Ok(source) => source,
+            Err(e) => {
+                if save.portable && self.removed_sources != removed {
+                    self.removed_sources = removed;
+                    self.mark_persist();
+                    if let Err(rollback) = self.save_now() {
+                        anyhow::bail!(
+                            "{e:#}\nCouldn't restore the saved listing. Fix the save error and Retry.\n{rollback}"
+                        );
+                    }
+                }
+                return Err(e);
+            }
+        };
+        if save.link || self.workspaces[wi].definition.as_deref().is_some_and(|p| paths::same_file(p, &save.path)) {
             self.workspace_order = self.updated_workspace_order();
             self.workspaces[wi].set_definition(Some(&save.path));
             self.workspaces[wi].definition_source = Some(source);
             self.bind_workspace_order(self.workspaces[wi].id);
             self.mark_persist();
+        }
+        if save.portable {
+            self.workspace_order.retain(|key| {
+                !matches!(key, crate::persist::WorkspaceKey::Source(path) if path == &save.path && self.removed_sources.contains(path))
+            });
+            self.mark_persist();
+            self.refresh_workspace_pickers();
         }
         self.mark_dirty();
         Ok(save.path.clone())
@@ -236,7 +310,7 @@ impl Server {
         let save = self.prepare_definition_save(wi, name)?;
         if let Some(question) = &save.question {
             anyhow::bail!(
-                "{question} Choose another name with `kraal save <name>`, or use Save workspace layout in kraal to confirm replacement."
+                "{question} Choose another name with `kraal save <name>`, or use Export layout in kraal to confirm replacement."
             );
         }
         self.write_definition(wi, name, &save)
@@ -253,7 +327,7 @@ impl Server {
     }
 
     /// Spawn every pane of a definition into a new workspace.
-    fn start_definition(&mut self, def: &WorkspaceDef, path: Option<PathBuf>) -> Result<u32> {
+    pub(super) fn start_definition(&mut self, def: &WorkspaceDef, path: Option<PathBuf>) -> Result<u32> {
         // Every pane is set up before the programs start.
         self.with_batch(|server| {
             server.starting_workspace = Some(def.name.clone());
@@ -541,116 +615,37 @@ impl Server {
         );
     }
 
-    /// Current layout of a workspace as a definition (for "save workspace").
-    pub fn snapshot_definition(&self, wi: usize, name: &str) -> WorkspaceDef {
-        let ws = &self.workspaces[wi];
-        let to_def = |id: PaneId, focused: bool| -> workspace::PaneDef {
-            let p = &self.panes[&id];
-            let mut agent = if p.spec.command.is_empty() { p.agent.kind.clone() } else { None };
-            // A command that has not run yet still waits for Enter when the definition opens.
-            let mut wait = p.suspended && !p.spec.command.is_empty();
-            if let Some(pending) = &p.spec.pending_agent {
-                return workspace::PaneDef {
-                    account_id: None,
-                    name: p.name.clone(),
-                    command: None,
-                    args: pending.args.clone(),
-                    cwd: p.spec.cwd.clone(),
-                    focus: focused,
-                    kind: PaneKind::Terminal,
-                    agent: Some(pending.agent.clone()),
-                    start_suspended: pending.suspended,
-                    close_on_exit: pending.close_on_exit,
-                };
-            }
-            let (kind, command, args) = match (&p.spec.preview, &p.spec.account) {
-                (Some(path), _) => (PaneKind::Preview(path.clone()), None, Vec::new()),
-                // An agent kraal started on an account is saved as that agent on that account,
-                // with the arguments it was given: opening the definition starts a new
-                // conversation, with the account's environment. A prompt or a one-shot run
-                // (`-p`) given on its command line then waits for Enter: it would run again.
-                (None, Some(account)) => {
-                    agent = Some(account.clone());
-                    let kind = account.split_once(':').and_then(|(k, _)| crate::accounts::agent_kind(k));
-                    let args = kind.map(|k| crate::accounts::launch_args(k, &p.spec.command)).unwrap_or_default();
-                    let options_only =
-                        kind.and_then(|k| crate::accounts::resumable_args(k, &args)).is_some_and(|(_, exact)| exact);
-                    wait |= !options_only;
-                    (PaneKind::Terminal, None, args)
-                }
-                (None, None) => {
-                    let mut it = p.spec.command.iter().cloned();
-                    (PaneKind::Terminal, it.next(), it.collect())
-                }
-            };
-            workspace::PaneDef {
-                name: p.name.clone(),
-                command,
-                args,
-                cwd: p.current_cwd().or_else(|| p.spec.cwd.clone()),
-                focus: focused,
-                kind,
-                agent,
-                account_id: p.spec.account_id.clone(),
-                start_suspended: wait,
-                close_on_exit: p.spec.close_on_exit,
-            }
-        };
-        fn conv(n: &Node, focus: Option<PaneId>, to_def: &dyn Fn(PaneId, bool) -> workspace::PaneDef) -> LayoutNode {
-            match n {
-                Node::Leaf(id) => LayoutNode::Pane(to_def(*id, focus == Some(*id))),
-                Node::Stack { panes, open } => LayoutNode::Stack {
-                    panes: panes.iter().map(|id| to_def(*id, focus == Some(*id))).collect(),
-                    expanded: panes.iter().position(|id| id == open).unwrap_or(0),
-                },
-                Node::Split { axis, children } => {
-                    let sum: f32 = children.iter().map(|(_, w)| *w).sum::<f32>().max(f32::EPSILON);
-                    LayoutNode::Split {
-                        axis: *axis,
-                        children: children
-                            .iter()
-                            .map(|(c, w)| {
-                                (
-                                    conv(c, focus, to_def),
-                                    Some(SizeSpec::Percent(((w / sum) * 100.0).round().max(1.0) as u16)),
-                                )
-                            })
-                            .collect(),
-                    }
-                }
-            }
+    /// Export from retained data so a closed workspace needs no processes.
+    fn snapshot_definition(&self, wi: usize, name: &str) -> Result<WorkspaceDef> {
+        let snap = crate::persist::snapshot(self)
+            .workspaces
+            .into_iter()
+            .find(|w| w.id == self.workspaces[wi].stable_id)
+            .unwrap();
+        if snap.unopened {
+            return workspace::parse_workspace(
+                name,
+                snap.definition_source
+                    .as_deref()
+                    .context("No retained source. Open the workspace before exporting.")?,
+            );
         }
-        let tabs = ws
-            .tabs
-            .iter()
-            .enumerate()
-            .map(|(i, t)| {
-                // A definition always has tiled panes: a tab of floating panes alone gets a shell
-                // under them (as Zellij gives it) rather than being left out.
-                let root = match &t.root {
-                    Some(root) => conv(root, t.focus, &to_def),
-                    None => LayoutNode::Pane(workspace::PaneDef { cwd: ws.cwd.clone(), ..Default::default() }),
-                };
-                workspace::TabDef {
-                    name: (!t.name.is_empty()).then(|| t.name.clone()),
-                    focus: i == ws.active,
-                    cwd: None,
-                    root,
-                    floating: t
-                        .floating
-                        .iter()
-                        .filter(|f| self.panes.get(&f.pane).is_none_or(|p| p.spec.login.is_none()))
-                        .map(|f| to_def(f.pane, t.focus == Some(f.pane)))
-                        .collect(),
-                }
-            })
-            .collect();
-        WorkspaceDef { name: name.to_string(), cwd: ws.cwd.clone(), tabs, warnings: Vec::new() }
+        Ok(workspace::from_snapshot(&snap, name))
     }
 
     pub fn definition_dir(&self) -> PathBuf {
         self.config.workspace_dirs().into_iter().next().unwrap_or_else(paths::workspaces_dir)
     }
+}
+
+fn replacement_question(path: &Path, source: Option<&str>, revision: &paths::FileRevision) -> String {
+    let changed = source.is_some_and(|s| Some(s.as_bytes()) != revision.bytes.as_deref());
+    format!(
+        "{}\n{} {}\nComments and unsupported KDL will not be preserved.\nA backup will be kept. Cancel to export a copy.",
+        if changed { "File changed" } else { "Replace file?" },
+        path.display(),
+        if changed { "changed since it was loaded." } else { "already exists." }
+    )
 }
 
 /// The waiting pane of an agent whose account is not chosen yet: it says why, and keeps what to
@@ -810,7 +805,7 @@ mod tests {
         let id = server.open_definition(&a).unwrap();
         let wi = server.ws_index(id).unwrap();
         let save = server.prepare_definition_save(wi, "a").unwrap();
-        assert!(save.question.is_none());
+        assert!(save.question.is_some());
         server.open_definition(&b).unwrap();
         assert_eq!(server.workspaces.len(), 2);
         let error = server.write_definition(wi, "a", &save).unwrap_err().to_string();
@@ -903,17 +898,20 @@ mod tests {
     }
 
     #[test]
-    fn only_an_unchanged_source_saves_without_confirmation() {
+    fn even_an_unchanged_source_needs_confirmation() {
         let dir = directory("revisions");
         let path = dir.join("work.kdl");
         let mut server = server();
         let wi = linked(&mut server, &path, "layout { pane; }");
         server.persist_dirty = false;
-        server.save_definition(wi, "work").unwrap();
+        assert!(server.save_definition(wi, "work").is_err());
+        let confirmed = server.prepare_definition_save(wi, "work").unwrap();
+        assert!(confirmed.question.as_ref().unwrap().contains("Comments and unsupported KDL"));
+        server.write_definition(wi, "work", &confirmed).unwrap();
         assert!(server.persist_dirty);
         let saved = std::fs::read_to_string(&path).unwrap();
         assert_eq!(server.workspaces[wi].definition_source.as_deref(), Some(saved.as_str()));
-        assert!(server.prepare_definition_save(wi, "work").unwrap().question.is_none());
+        assert!(server.prepare_definition_save(wi, "work").unwrap().question.is_some());
         std::fs::write(&path, "invalid external KDL").unwrap();
         server.follow_definitions(&[(path.clone(), workspace::load_file(&path))]);
         assert_eq!(server.workspaces[wi].definition_source.as_deref(), Some(saved.as_str()));

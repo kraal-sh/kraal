@@ -347,9 +347,6 @@ fn the_command_lines_quoted_parse() {
     assert!(wrong.is_empty(), "command lines the program does not take:\n{}", wrong.join("\n"));
 }
 
-/// Left out of the pages on purpose: they name no other program of kraal's kind.
-const UNQUOTED: &str = "kraal import-zellij";
-
 /// What a page quotes of the program: what its command lines name, and the options it quotes
 /// alone (`--check`, `--to v0.2.0`).
 fn quoted(page: &Page) -> (BTreeSet<String>, BTreeSet<&str>) {
@@ -374,7 +371,7 @@ fn every_command_and_option_is_quoted() {
                 || alone.is_some_and(|(command, option)| named.contains(command) && options.contains(option))
         })
     };
-    let missing: Vec<String> = all.into_iter().filter(|name| !name.starts_with(UNQUOTED) && !found(name)).collect();
+    let missing: Vec<String> = all.into_iter().filter(|name| !found(name)).collect();
     assert!(missing.is_empty(), "no page quotes:\n{}", missing.join("\n"));
 }
 

@@ -70,9 +70,6 @@ impl Server {
         if matches!(p.action, PromptAction::RunbookValue) {
             return self.set_draft_value(id, p.value);
         }
-        if matches!(p.action, PromptAction::SaveWorkspace(_)) {
-            return self.save_workspace_prompt(id, p);
-        }
         let title = p.title.clone();
         let (value, cursor, masked) = (p.value.clone(), p.cursor, p.masked);
         let renamed = match &p.action {
@@ -124,7 +121,9 @@ impl Server {
             PromptAction::RenameWorkspace(_)
             | PromptAction::DuplicateWorkspace(_)
             | PromptAction::NewWorkspace
-            | PromptAction::RestoreWorkspace(_) => {
+            | PromptAction::RestoreWorkspace(_)
+            | PromptAction::ImportWorkspace
+            | PromptAction::ExportWorkspace(_) => {
                 unreachable!("answered in submit_prompt")
             }
             PromptAction::OpenPreview => {
@@ -215,42 +214,10 @@ impl Server {
                 }
                 self.toast(id, format!("renamed account to {agent}·{value}"));
             }
-            PromptAction::SaveWorkspace(_) => unreachable!("answered in submit_prompt"),
         }
         self.mark_persist();
         self.mark_dirty();
         Ok(())
-    }
-
-    fn save_workspace_prompt(&mut self, id: ClientId, mut p: Prompt) -> Mode {
-        let PromptAction::SaveWorkspace(ws) = p.action else { unreachable!() };
-        let Some(wi) = self.ws_index(ws) else {
-            p.error = Some("This workspace is no longer open; cancel and choose a workspace.".into());
-            return Mode::Prompt(p);
-        };
-        let name = p.value.trim();
-        match self.prepare_definition_save(wi, name) {
-            Ok(save) => {
-                if let Some(question) = &save.question {
-                    return Mode::confirm(
-                        format!(
-                            "{question}\nA backup will be kept as {}.\nCancel to choose another name.",
-                            save.revision.target.with_extension("kdl.bak").display()
-                        ),
-                        ConfirmAction::ReplaceWorkspaceFile { prompt: p, save },
-                    );
-                }
-                match self.write_definition(wi, name, &save) {
-                    Ok(path) => {
-                        self.toast(id, format!("saved {}", paths::shorten_home(&path)));
-                        return Mode::Normal;
-                    }
-                    Err(e) => p.error = Some(format!("{e:#}")),
-                }
-            }
-            Err(e) => p.error = Some(format!("{e:#}")),
-        }
-        Mode::Prompt(p)
     }
 
     pub(super) fn on_confirm(&mut self, id: ClientId, mut q: Question, ev: InputEvent) -> Mode {
@@ -362,15 +329,14 @@ impl Server {
                 if !yes {
                     return Mode::Prompt(prompt);
                 }
-                let PromptAction::SaveWorkspace(ws) = prompt.action else { unreachable!() };
+                let PromptAction::ExportWorkspace(ws) = prompt.action else { unreachable!() };
                 let result = self
                     .ws_index(ws)
-                    .context("This workspace is no longer open; cancel and choose a workspace.")
+                    .context("This workspace is no longer available; cancel and choose a workspace.")
                     .and_then(|wi| self.write_definition(wi, prompt.value.trim(), &save));
                 match result {
                     Ok(path) => {
-                        self.toast(id, format!("saved {}", paths::shorten_home(&path)));
-                        return Mode::Normal;
+                        return self.exported_layout(prompt, &path);
                     }
                     Err(e) => {
                         prompt.error = Some(format!("{e:#}"));
@@ -881,9 +847,7 @@ mod tests {
         let (tx, _rx) = crate::server::queue::channel(32);
         let mut server = crate::server::tests::server(tx);
         let (client, _peer) = crate::server::tests::client(&mut server);
-        for (cols, rows, action) in
-            [(80, 24, PromptAction::SaveWorkspace(1)), (124, 36, PromptAction::SaveWorkspace(1))]
-        {
+        for (cols, rows, action) in [(80, 24, PromptAction::OpenPreview), (124, 36, PromptAction::OpenPreview)] {
             let c = server.clients.get_mut(&client).unwrap();
             (c.cols, c.rows) = (cols, rows);
             let mut p = Prompt::new("Workspace", " café 日 ", action);
@@ -927,96 +891,5 @@ mod tests {
             }
             assert_eq!(p.value, " café 日xy ");
         }
-    }
-
-    #[test]
-    fn workspace_write_failures_keep_the_prompt_and_retry_after_the_cause_is_fixed() {
-        let (tx, _rx) = crate::server::queue::channel(32);
-        let mut server = crate::server::tests::server(tx);
-        let dir = std::env::temp_dir().join(format!("kraal-save-write-prompt-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("work.kdl");
-        let lock = dir.join(".work.kdl.lock");
-        let ws = server.new_workspace("work".into(), Some(path.clone()));
-        for confirm in [false, true] {
-            std::fs::write(&path, "original contents").unwrap();
-            server.workspaces[0].definition_source = (!confirm).then(|| "original contents".into());
-            let mut p = Prompt::new("Save workspace layout as", " work ", PromptAction::SaveWorkspace(ws));
-            p.cursor = 2;
-            // Reading the destination succeeds, but opening its write lock fails.
-            std::fs::create_dir(&lock).unwrap();
-            let next = server.on_prompt(0, p, key(KeyCode::Enter));
-            let next = if confirm {
-                let Mode::Confirm(q) = next else { panic!("confirmation") };
-                server.on_confirm(0, q, key(KeyCode::Char('y')))
-            } else {
-                next
-            };
-            let Mode::Prompt(p) = next else { panic!("write failure keeps input") };
-            assert_eq!((p.value.as_str(), p.cursor), (" work ", 2));
-            assert!(p.error.is_some());
-            assert!(matches!(p.action, PromptAction::SaveWorkspace(id) if id == ws));
-            assert_eq!(std::fs::read_to_string(&path).unwrap(), "original contents");
-            std::fs::remove_dir(&lock).unwrap();
-            let next = server.on_prompt(0, p, key(KeyCode::Enter));
-            let next = if confirm {
-                let Mode::Confirm(q) = next else { panic!("confirmation") };
-                server.on_confirm(0, q, key(KeyCode::Char('y')))
-            } else {
-                next
-            };
-            assert!(matches!(next, Mode::Normal));
-            assert_eq!(std::fs::read_to_string(path.with_extension("kdl.bak")).unwrap(), "original contents");
-            assert_eq!(server.workspaces[0].definition_source, Some(std::fs::read_to_string(&path).unwrap()));
-            std::fs::remove_file(&lock).unwrap();
-        }
-        std::fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[test]
-    fn replacing_a_file_defaults_to_cancel_and_keeps_the_prompt_on_failure() {
-        let (tx, _rx) = crate::server::queue::channel(32);
-        let mut server = crate::server::tests::server(tx);
-        let dir = std::env::temp_dir().join(format!("kraal-save-prompt-{}-{}", std::process::id(), "long-".repeat(16)));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("work.kdl");
-        std::fs::write(&path, "external contents").unwrap();
-        let ws = server.new_workspace("work".into(), Some(path.clone()));
-        let p = Prompt::new("Save workspace layout as", " work ", PromptAction::SaveWorkspace(ws));
-        let Mode::Confirm(q) = server.on_prompt(0, p, key(KeyCode::Enter)) else { panic!("confirmation") };
-        assert!(!q.yes);
-        assert_eq!(q.action.verb(), "Replace file");
-        for (cols, rows) in [(80, 24), (124, 36)] {
-            let layout = crate::server::overlays::confirm_layout(&q, ratatui::layout::Rect::new(0, 0, cols, rows));
-            assert!(layout.cancel.is_some() && layout.ok.is_some());
-        }
-        let Mode::Prompt(p) = server.on_confirm(0, q, key(KeyCode::Enter)) else { panic!("cancel returns to input") };
-        assert_eq!(p.value, " work ");
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), "external contents");
-        let Mode::Confirm(q) = server.on_prompt(0, p, key(KeyCode::Enter)) else { panic!("confirmation") };
-        std::fs::write(&path, "a second edit").unwrap();
-        let Mode::Prompt(p) = server.on_confirm(0, q, key(KeyCode::Char('y'))) else { panic!("stale confirmation") };
-        assert!(p.error.as_ref().unwrap().contains("changed while saving"));
-        // The error's reason and next step stay visible even when its path fills the row.
-        for (cols, rows) in [(80, 24), (124, 36)] {
-            let screen = ratatui::layout::Rect::new(0, 0, cols, rows);
-            let mut buf = ratatui::buffer::Buffer::empty(screen);
-            crate::server::overlays::draw_prompt(&p, screen, &mut buf);
-            let shown: String = buf.content.iter().map(|c| c.symbol()).collect();
-            assert!(shown.contains("changed while saving; retry to review"), "{shown}");
-        }
-        assert_eq!(p.value, " work ");
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), "a second edit");
-        let Mode::Confirm(q) = server.on_prompt(0, p, key(KeyCode::Enter)) else { panic!("ask again") };
-        assert!(matches!(server.on_confirm(0, q, key(KeyCode::Char('y'))), Mode::Normal));
-        assert_eq!(std::fs::read_to_string(path.with_extension("kdl.bak")).unwrap(), "a second edit");
-        // An I/O failure stays in the form, including its name and cursor.
-        std::fs::remove_file(&path).unwrap();
-        std::fs::create_dir(&path).unwrap();
-        let p = Prompt::new("Save workspace layout as", "work", PromptAction::SaveWorkspace(ws));
-        let Mode::Prompt(p) = server.on_prompt(0, p, key(KeyCode::Enter)) else { panic!("keep the input") };
-        assert_eq!((p.value.as_str(), p.cursor), ("work", 4));
-        assert!(p.error.as_ref().unwrap().contains("not a regular file"));
-        std::fs::remove_dir_all(dir).unwrap();
     }
 }

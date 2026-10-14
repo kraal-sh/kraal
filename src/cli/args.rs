@@ -224,7 +224,25 @@ pub enum Cmd {
         #[arg(long, requires = "since")]
         boot: Option<u64>,
     },
-    /// Save a workspace's current layout to its definition file, or as `<name>.kdl`.
+    /// Preview a KDL file, then add a workspace with its commands waiting.
+    Import {
+        file: PathBuf,
+        #[arg(long)]
+        name: Option<String>,
+        /// Accept the preview without prompting (commands still wait).
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Export a workspace layout to a KDL file, without conversations or private account names.
+    Export {
+        file: PathBuf,
+        #[arg(short, long)]
+        workspace: Option<String>,
+        /// Replace the reviewed destination, keeping a backup.
+        #[arg(long)]
+        replace: bool,
+    },
+    /// Export KDL using the legacy name and destination rules.
     Save {
         name: Option<String>,
         /// The workspace to save (default: inside a pane, its workspace; else the one on screen).
@@ -235,7 +253,7 @@ pub enum Cmd {
     ImportZellij {
         #[arg(long)]
         from: Option<PathBuf>,
-        /// Overwrite existing kraal workspaces with the same name.
+        /// Replace existing files, keeping a backup of their exact contents.
         #[arg(long)]
         force: bool,
     },

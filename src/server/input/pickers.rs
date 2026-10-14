@@ -84,6 +84,11 @@ impl Server {
                     let Some(item) = p.current().cloned() else { return Mode::Picker(p) };
                     return self.pick(id, &p, item);
                 }
+                (KeyCode::Char('s'), true) if p.kind == PickerKind::Workspace => {
+                    if let Some(ws) = p.current().and_then(|i| i.action.workspace()) {
+                        return self.export_workspace_form(id, ws, Some(&p));
+                    }
+                }
                 (KeyCode::Char('z'), true) if p.undo.is_some() => {
                     return self.restore_workspace_mode(id, p.undo.as_deref().unwrap(), Some(&p));
                 }
@@ -1562,10 +1567,14 @@ mod workspace_action_tests {
         server.reorder_workspace(client, x.clone(), b_key.clone(), true);
         server.reorder_workspace(client, x.clone(), a_key.clone(), true);
         assert_eq!(names(&server), ["x", "a", "b"]);
-        let prompt = Prompt::new("Save workspace layout as", "x", PromptAction::SaveWorkspace(a));
+        let prompt = Prompt::new("Export layout", path.to_str().unwrap(), PromptAction::ExportWorkspace(a));
         let Mode::Confirm(q) = server.on_prompt(client, prompt, key("enter")) else { panic!() };
         assert_eq!(q.action.verb(), "Replace file");
-        assert!(matches!(server.on_confirm(client, q, key("y")), Mode::Normal));
+        let Mode::Prompt(p) = server.on_confirm(client, q, key("y")) else { panic!() };
+        assert_eq!(p.title, "Layout exported");
+        assert!(p.error.is_none());
+        assert_eq!(p.value, path.to_str().unwrap());
+        assert!(matches!(server.on_prompt(client, p, key("enter")), Mode::Normal));
         assert_eq!(names(&server), ["a", "b"]);
         let Mode::Picker(p) = server.reorder_workspace(client, a_key.clone(), b_key.clone(), false) else { panic!() };
         assert!(p.message.is_none());

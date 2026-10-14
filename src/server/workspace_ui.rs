@@ -19,10 +19,35 @@ pub struct WorkspaceForm {
     cwd: Option<PathBuf>,
     back: Option<PickerState>,
     invalid_name: bool,
+    file: String,
+    file_cursor: usize,
+    preview: Option<Box<crate::workspace::ImportPreview>>,
+    choices: Vec<usize>,
+    account: usize,
+    existing: Option<u32>,
+    result: Option<String>,
 }
 
 fn verb(p: &Prompt) -> &'static str {
-    if matches!(p.action, PromptAction::RestoreWorkspace(_)) {
+    if p.workspace_form.as_ref().is_some_and(|f| f.result.is_some()) {
+        return "Done";
+    }
+    if matches!(p.action, PromptAction::ExportWorkspace(_)) {
+        if p.error.is_some() { "Retry" } else { "Export" }
+    } else if matches!(p.action, PromptAction::ImportWorkspace) {
+        let form = p.workspace_form.as_ref().unwrap();
+        if form.existing.is_some() {
+            "Open"
+        } else if p.error.is_some() {
+            "Retry"
+        } else if form.preview.as_ref().is_some_and(|p| form.account + 1 < p.accounts.len()) {
+            "Next"
+        } else if form.preview.is_some() {
+            "Add"
+        } else {
+            "Preview"
+        }
+    } else if matches!(p.action, PromptAction::RestoreWorkspace(_)) {
         "Restore"
     } else if p.error.is_some() && !p.workspace_form.as_ref().is_some_and(|f| f.invalid_name) {
         "Retry"
@@ -35,11 +60,28 @@ fn verb(p: &Prompt) -> &'static str {
     }
 }
 
+fn field_count(p: &Prompt) -> usize {
+    if p.workspace_form.as_ref().is_some_and(|f| f.result.is_some()) {
+        return 0;
+    }
+    if matches!(p.action, PromptAction::ImportWorkspace) {
+        2 + p
+            .workspace_form
+            .as_ref()
+            .and_then(|f| f.preview.as_ref())
+            .map_or(0, |p| usize::from(!p.accounts.is_empty()))
+    } else {
+        1
+    }
+}
+
 fn buttons(p: &Prompt) -> forms::Buttons<'static> {
+    let count = field_count(p);
     forms::Buttons {
-        primary: forms::Button { field: 1, label: verb(p) },
-        alternate: None,
-        cancel: forms::Button { field: 2, label: "Cancel" },
+        primary: forms::Button { field: count, label: verb(p) },
+        alternate: matches!(p.action, PromptAction::NewWorkspace)
+            .then_some(forms::Button { field: 3, label: "From file..." }),
+        cancel: forms::Button { field: count + 1, label: if count == 0 { "Close" } else { "Cancel" } },
     }
 }
 
@@ -61,6 +103,15 @@ pub(super) fn form_layout(p: &Prompt, screen: Rect) -> forms::FormLayout {
         .unwrap_or_default();
     if matches!(p.action, PromptAction::DuplicateWorkspace(_)) {
         message = "Copies the layout.\nPrograms wait for you to start them.".into();
+    } else if matches!(p.action, PromptAction::ExportWorkspace(_)) {
+        message = "Workspaces are saved automatically.\nExports the layout, without conversations.\nAgents use portable references, without private account names.".into();
+    } else if matches!(p.action, PromptAction::ImportWorkspace) {
+        message = p.workspace_form.as_ref().and_then(|f| f.preview.as_ref()).map(|p| p.summary()).unwrap_or_default();
+    }
+    if let Some(form) = &p.workspace_form
+        && let Some(account) = form.preview.as_ref().and_then(|p| p.accounts.get(form.account))
+    {
+        message.push_str(&format!("\nChoose a {} account for {}.", account.agent, account.reference));
     }
     if let Some(error) = &p.error {
         if !message.is_empty() {
@@ -68,17 +119,72 @@ pub(super) fn form_layout(p: &Prompt, screen: Rect) -> forms::FormLayout {
         }
         message.push_str(error);
     }
-    forms::FormLayout::new(screen, 1, &message, &buttons(p))
+    if let Some(result) = p.workspace_form.as_ref().and_then(|f| f.result.as_ref()) {
+        message = result.clone();
+    }
+    let mut layout = forms::FormLayout::new(screen, field_count(p), &message, &buttons(p));
+    if matches!(p.action, PromptAction::ExportWorkspace(_)) {
+        // File paths in errors and results must retain spaces that prose wrapping would collapse.
+        layout.lines = message.lines().flat_map(|l| crate::text::fold(l, layout.body.width as usize)).collect();
+        layout.max_scroll = layout.lines.len().saturating_sub(layout.body.height as usize);
+    }
+    layout
 }
 
 pub(super) fn draw_form(p: &Prompt, screen: Rect, buf: &mut Buffer) -> Option<Cursor> {
     let form = p.workspace_form.as_ref()?;
     let layout = form_layout(p, screen);
     overlays::frame(layout.area, &p.title, crate::theme::current().accent, buf);
-    let cursor = forms::draw_text_field(layout.fields[0], "Name    ", &p.value, p.cursor, "", form.field == 0, buf);
+    let mut cursor = None;
+    if form.result.is_none() {
+        let importing = matches!(p.action, PromptAction::ImportWorkspace);
+        if importing {
+            cursor = forms::draw_text_field(
+                layout.fields[0],
+                "File    ",
+                &form.file,
+                form.file_cursor,
+                "Path to a KDL file",
+                form.field == 0,
+                buf,
+            );
+            if let Some(preview) = &form.preview
+                && let Some(account) = preview.accounts.get(form.account)
+            {
+                let selected = form.choices[form.account].checked_sub(1).and_then(|n| account.choices.get(n));
+                let label = format!(
+                    "Account {}/{}    {}",
+                    form.account + 1,
+                    preview.accounts.len(),
+                    selected.map_or("Choose with arrows", |(_, n)| n)
+                );
+                let area = layout.fields[2];
+                buf.set_stringn(area.x, area.y, label, area.width as usize, forms::field_style(form.field == 2));
+            }
+        }
+        let name_field = usize::from(importing);
+        let label = if matches!(p.action, PromptAction::ExportWorkspace(_)) { "File    " } else { "Name    " };
+        cursor = forms::draw_text_field(
+            layout.fields[name_field],
+            label,
+            &p.value,
+            p.cursor,
+            "",
+            form.field == name_field,
+            buf,
+        )
+        .or(cursor);
+    }
     forms::draw_message(&layout, p.scroll, buf);
-    let action = if form.field == 2 { "Cancel" } else { verb(p) };
-    forms::draw_buttons(&layout, &buttons(p), form.field, form.pending, action, buf);
+    let buttons = buttons(p);
+    let action = if form.field == buttons.cancel.field {
+        buttons.cancel.label
+    } else if buttons.alternate.as_ref().is_some_and(|b| b.field == form.field) {
+        "From file..."
+    } else {
+        verb(p)
+    };
+    forms::draw_buttons(&layout, &buttons, form.field, form.pending, action, buf);
     cursor
 }
 
@@ -118,14 +224,17 @@ impl Server {
         });
         let mut p = Prompt::new("Add workspace", &name, PromptAction::NewWorkspace);
         let form = p.workspace_form.as_mut().unwrap();
-        form.cwd = self
-            .client_focus(id)
+        form.cwd = self.workspace_form_cwd(id);
+        form.back = from.map(Picker::state);
+        p
+    }
+
+    fn workspace_form_cwd(&self, id: ClientId) -> Option<PathBuf> {
+        self.client_focus(id)
             .and_then(|p| self.panes.get(&p))
             .and_then(|p| p.current_cwd())
             .or_else(|| self.current_ws(id).and_then(|(_, wi)| self.workspaces[wi].cwd.clone()))
-            .or_else(|| std::env::current_dir().ok());
-        form.back = from.map(Picker::state);
-        p
+            .or_else(|| std::env::current_dir().ok())
     }
 
     pub(super) fn rename_workspace_form(&self, ws: u32, from: Option<&Picker>) -> Mode {
@@ -168,14 +277,30 @@ impl Server {
         let layout = form_layout(&p, self.client_screen(id));
         let buttons = buttons(&p);
         p.scroll = p.scroll.min(layout.max_scroll);
+        let importing = matches!(p.action, PromptAction::ImportWorkspace);
         let before = p.value.clone();
         let error = p.error.clone();
         let form = p.workspace_form.as_mut().unwrap();
-        let mut fields = [forms::Field {
-            id: 0,
-            area: layout.fields[0],
-            value: forms::FieldValue::Text { value: &mut p.value, cursor: &mut p.cursor },
-        }];
+        let file_before = form.file.clone();
+        let old_field = form.field;
+        let mut fields = Vec::new();
+        if importing {
+            fields.push(forms::Field {
+                id: 0,
+                area: layout.fields[0],
+                value: forms::FieldValue::Text { value: &mut form.file, cursor: &mut form.file_cursor },
+            });
+        }
+        if form.result.is_none() {
+            fields.push(forms::Field {
+                id: usize::from(importing),
+                area: layout.fields[usize::from(importing)],
+                value: forms::FieldValue::Text { value: &mut p.value, cursor: &mut p.cursor },
+            });
+        }
+        if form.preview.as_ref().is_some_and(|p| !p.accounts.is_empty()) {
+            fields.push(forms::Field { id: 2, area: layout.fields[2], value: forms::FieldValue::Choice });
+        }
         let outcome = forms::FormState {
             field: &mut form.field,
             scroll: &mut p.scroll,
@@ -183,16 +308,86 @@ impl Server {
             pending: &mut form.pending,
         }
         .handle(event, &mut fields, &buttons, &layout);
-        if p.value == before && p.error.is_none() {
+        if form.file != file_before {
+            form.preview = None;
+            form.existing = None;
+            p.scroll = 0;
+        } else if p.value == before && p.error.is_none() {
             p.error = error;
         } else if p.value != before {
             p.scroll = 0;
         }
         match outcome {
             forms::FormEvent::Cancel => self.workspace_form_back(id, p, None),
+            forms::FormEvent::Submit if matches!(p.action, PromptAction::NewWorkspace) && form.field == 3 => {
+                p.action = PromptAction::ImportWorkspace;
+                p.value.clear();
+                p.cursor = 0;
+                p.error = None;
+                form.field = 0;
+                Mode::Prompt(p)
+            }
             forms::FormEvent::Submit => self.submit_workspace_form(id, p),
+            forms::FormEvent::Choice { .. } if importing => {
+                let i = form.account;
+                let choices = &form.preview.as_ref().unwrap().accounts[i].choices;
+                form.choices[i] = (form.choices[i] + 1) % (choices.len() + 1);
+                p.error = None;
+                Mode::Prompt(p)
+            }
+            _ if importing && old_field == 0 && form.field == 1 && form.preview.is_none() => {
+                self.preview_import_form(p)
+            }
             _ => Mode::Prompt(p),
         }
+    }
+
+    pub(super) fn export_workspace_form(&self, id: ClientId, ws: u32, from: Option<&Picker>) -> Mode {
+        let Some(wi) = self.ws_index(ws) else { return self.workspace_picker(0).result("Workspace unavailable") };
+        let file = crate::paths::shorten_home(&self.export_file_default(wi));
+        let mut p = Prompt::new("Export layout", &file, PromptAction::ExportWorkspace(ws));
+        let form = p.workspace_form.as_mut().unwrap();
+        form.cwd = self.workspace_form_cwd(id);
+        form.back = from.map(Picker::state);
+        Mode::Prompt(p)
+    }
+
+    fn workspace_form_path(p: &Prompt, value: &str) -> PathBuf {
+        let form = p.workspace_form.as_ref().unwrap();
+        let path = crate::paths::expand_tilde(value.trim());
+        if path.is_relative() { form.cwd.as_ref().map_or(path.clone(), |cwd| cwd.join(&path)) } else { path }
+    }
+
+    fn preview_import_form(&self, mut p: Prompt) -> Mode {
+        let path = Self::workspace_form_path(&p, &p.workspace_form.as_ref().unwrap().file);
+        let form = p.workspace_form.as_mut().unwrap();
+        form.preview = None;
+        form.existing = self.definition_workspace(&path).ok().flatten();
+        match self.preview_import(&path) {
+            Ok(preview) => {
+                if p.value.is_empty() {
+                    p.value = preview.definition.name.clone();
+                    p.cursor = p.value.chars().count();
+                }
+                form.choices = vec![0; preview.accounts.len()];
+                form.account = 0;
+                form.preview = Some(Box::new(preview));
+                form.field = 1;
+                p.error = None;
+            }
+            Err(e) => p.error = Some(format!("{e:#}\nNo workspace was added.")),
+        }
+        Mode::Prompt(p)
+    }
+
+    pub(super) fn exported_layout(&self, mut p: Prompt, path: &std::path::Path) -> Mode {
+        p.title = "Layout exported".into();
+        p.error = None;
+        p.scroll = 0;
+        let form = p.workspace_form.as_mut().unwrap();
+        form.result = Some(crate::paths::shorten_home(path));
+        form.field = 0;
+        Mode::Prompt(p)
     }
 
     fn workspace_form_back(&self, id: ClientId, mut p: Prompt, renamed: Option<u32>) -> Mode {
@@ -212,6 +407,92 @@ impl Server {
     }
 
     pub(super) fn submit_workspace_form(&mut self, id: ClientId, mut p: Prompt) -> Mode {
+        if p.workspace_form.as_ref().is_some_and(|f| f.result.is_some()) {
+            return self.workspace_form_back(id, p, None);
+        }
+        if let PromptAction::ExportWorkspace(ws) = p.action {
+            let result = self
+                .ws_index(ws)
+                .ok_or_else(|| anyhow::anyhow!("Workspace unavailable. Cancel and choose a workspace."))
+                .and_then(|wi| {
+                    self.prepare_layout_export(wi, &Self::workspace_form_path(&p, &p.value)).map(|save| (wi, save))
+                });
+            return match result {
+                Ok((wi, save)) => {
+                    if let Some(question) = &save.question {
+                        return Mode::confirm(
+                            question.clone(),
+                            super::ui::ConfirmAction::ReplaceWorkspaceFile { prompt: p, save },
+                        );
+                    }
+                    match self.write_definition(wi, &self.workspaces[wi].name.clone(), &save) {
+                        Ok(path) => self.exported_layout(p, &path),
+                        Err(e) => {
+                            p.error = Some(format!("{e:#}"));
+                            Mode::Prompt(p)
+                        }
+                    }
+                }
+                Err(e) => {
+                    p.error = Some(format!("{e:#}"));
+                    Mode::Prompt(p)
+                }
+            };
+        }
+        if matches!(p.action, PromptAction::ImportWorkspace) {
+            let form = p.workspace_form.as_ref().unwrap();
+            if let Some(ws) = form.existing {
+                return match self.reopen_workspace(ws) {
+                    Ok(()) => {
+                        self.show_workspace(id, ws);
+                        Mode::Normal
+                    }
+                    Err(e) => {
+                        p.error = Some(format!("{e:#}"));
+                        Mode::Prompt(p)
+                    }
+                };
+            }
+            let Some(preview) = &form.preview else { return self.preview_import_form(p) };
+            if !preview.accounts.is_empty() && form.choices[form.account] == 0 {
+                p.error = Some(format!(
+                    "Choose a {} account for {}. If none is available, add one in Accounts and Retry.",
+                    preview.accounts[form.account].agent, preview.accounts[form.account].reference
+                ));
+                if preview.accounts[form.account].choices.is_empty() {
+                    p.workspace_form.as_mut().unwrap().preview = None;
+                }
+                return Mode::Prompt(p);
+            }
+            if form.account + 1 < preview.accounts.len() {
+                let form = p.workspace_form.as_mut().unwrap();
+                form.account += 1;
+                form.field = 2;
+                return Mode::Prompt(p);
+            }
+            let choices = preview
+                .accounts
+                .iter()
+                .enumerate()
+                .filter_map(|(i, a)| {
+                    Some((a.reference.clone(), a.choices.get(form.choices[i].checked_sub(1)?)?.0.clone()))
+                })
+                .collect::<Vec<_>>();
+            return match self.import_layout(&preview.path, p.value.trim(), &preview.revision, &choices) {
+                Ok(ws) => {
+                    self.show_workspace(id, ws);
+                    self.toast(id, "Workspace added. Commands wait for you to start them.");
+                    Mode::Normal
+                }
+                Err(e) => {
+                    p.error = Some(format!("{e:#}"));
+                    if crate::paths::FileRevision::read(&preview.path).ok().as_ref() != Some(&preview.revision) {
+                        p.workspace_form.as_mut().unwrap().preview = None;
+                    }
+                    Mode::Prompt(p)
+                }
+            };
+        }
         let name = p.value.trim();
         if let PromptAction::DuplicateWorkspace(source) = p.action {
             let validation = if name.is_empty() {
@@ -368,6 +649,225 @@ mod tests {
         buf.content.iter().map(|c| c.symbol()).collect()
     }
 
+    fn confirm(server: &mut Server, client: ClientId, q: super::super::ui::Question, bytes: &[u8]) -> Mode {
+        server.clients.get_mut(&client).unwrap().mode = Mode::Confirm(q);
+        server.client_input(client, bytes);
+        std::mem::replace(&mut server.clients.get_mut(&client).unwrap().mode, Mode::Normal)
+    }
+
+    #[test]
+    fn import_form_previews_keeps_errors_and_offers_existing_workspace_at_both_sizes() {
+        for size in [(80, 24), (124, 36)] {
+            let (tx, _rx) = super::super::queue::channel(32);
+            let mut server = super::super::tests::server(tx);
+            let (client, _peer) = super::super::tests::client(&mut server);
+            let c = server.clients.get_mut(&client).unwrap();
+            (c.cols, c.rows) = size;
+            let path = std::env::temp_dir().join(format!("kraal-w10-form-{}-{}.kdl", std::process::id(), size.0));
+            std::fs::write(&path, "broken {").unwrap();
+            let mut p = server.add_workspace_form(client, None);
+            let layout = form_layout(&p, server.client_screen(client));
+            let area = layout.alternate.unwrap();
+            let event = InputEvent::Mouse(MouseEvent {
+                kind: MouseKind::Press(MouseButton::Left),
+                col: area.x,
+                row: area.y,
+                mods: Default::default(),
+            });
+            let Mode::Prompt(next) = server.on_workspace_form(client, p, event) else { panic!() };
+            p = next;
+            assert!(matches!(p.action, PromptAction::ImportWorkspace));
+            p.workspace_form.as_mut().unwrap().file = path.display().to_string();
+            p.value = "personal".into();
+            let Mode::Prompt(mut p) = server.on_workspace_form(client, p, key("enter")) else { panic!() };
+            assert!(p.error.as_ref().unwrap().contains("No workspace was added"));
+            assert_eq!(p.value, "personal");
+            std::fs::write(&path, "layout { pane command=\"true\"; }").unwrap();
+            let Mode::Prompt(next) = server.on_workspace_form(client, p, key("enter")) else { panic!() };
+            p = next;
+            assert!(p.workspace_form.as_ref().unwrap().preview.is_some());
+            assert!(server.panes.is_empty());
+            let mut buf = Buffer::empty(server.client_screen(client));
+            draw_form(&p, buf.area, &mut buf);
+            for expected in ["File", "Name    personal", "1 tab · 1 pane", "Commands wait", "Enter Add"] {
+                assert!(text(&buf).contains(expected), "{}", text(&buf));
+            }
+            super::super::persistence::tests::writer(&mut server, vec![Ok(())]);
+            assert!(matches!(server.on_workspace_form(client, p, key("enter")), Mode::Normal));
+            assert!(server.panes.values().all(|p| p.suspended));
+            let mut p = Prompt::new("Add workspace", "", PromptAction::ImportWorkspace);
+            p.workspace_form.as_mut().unwrap().file = path.display().to_string();
+            let Mode::Prompt(p) = server.on_workspace_form(client, p, key("enter")) else { panic!() };
+            assert_eq!(verb(&p), "Open");
+            assert!(p.error.as_ref().unwrap().contains("already used by personal"));
+            assert!(matches!(server.on_workspace_form(client, p, key("enter")), Mode::Normal));
+            assert_eq!(server.workspaces.len(), 2);
+            std::fs::remove_file(path).unwrap();
+        }
+    }
+
+    #[test]
+    fn missing_accounts_are_chosen_explicitly_one_at_a_time_without_overflowing_the_form() {
+        let (tx, _rx) = super::super::queue::channel(32);
+        let mut server = super::super::tests::server(tx);
+        let (client, _peer) = super::super::tests::client(&mut server);
+        let path = std::env::temp_dir().join(format!("kraal-w10-many-accounts-{}.kdl", std::process::id()));
+        let panes = (0..30).map(|n| format!("pane agent=\"claude:missing-{n}\"; ")).collect::<String>();
+        std::fs::write(&path, format!("layout {{ {panes} }}")).unwrap();
+        let account: crate::accounts::Account = serde_json::from_value(serde_json::json!({
+            "id": "choice-id", "name": "chosen", "agent": "claude", "home": "/tmp/kraal-w10-choice"
+        }))
+        .unwrap();
+        server.accounts.add(account).unwrap();
+        let mut p = Prompt::new("Add workspace", "chosen-name", PromptAction::ImportWorkspace);
+        p.workspace_form.as_mut().unwrap().file = path.display().to_string();
+        let Mode::Prompt(next) = server.preview_import_form(p) else { panic!() };
+        p = next;
+        for n in 0..30 {
+            for (cols, rows) in [(80, 24), (124, 36)] {
+                let area = Rect::new(0, 0, cols, rows);
+                let layout = form_layout(&p, area);
+                assert!(layout.area.bottom() < rows);
+                assert_eq!(layout.fields.len(), 3);
+                let mut buf = Buffer::empty(area);
+                draw_form(&p, area, &mut buf);
+                assert!(text(&buf).contains(&format!("claude:missing-{n}")));
+            }
+            assert_eq!(p.workspace_form.as_ref().unwrap().choices[n], 0);
+            p.workspace_form.as_mut().unwrap().field = 2;
+            let Mode::Prompt(next) = server.on_workspace_form(client, p, key("right")) else { panic!() };
+            p = next;
+            assert_eq!(p.workspace_form.as_ref().unwrap().choices[n], 1);
+            if n < 29 {
+                assert_eq!(verb(&p), "Next");
+                let Mode::Prompt(next) = server.on_workspace_form(client, p, key("enter")) else { panic!() };
+                p = next;
+            }
+        }
+        assert_eq!(verb(&p), "Add");
+        assert!(server.panes.is_empty());
+        assert!(matches!(server.on_workspace_form(client, p, key("esc")), Mode::Normal));
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn export_confirmation_defaults_to_cancel_and_retries_with_the_path_intact() {
+        let (tx, _rx) = super::super::queue::channel(32);
+        let mut server = super::super::tests::server(tx);
+        let (client, _peer) = super::super::tests::client(&mut server);
+        let ws = server.workspaces[0].id;
+        let dir = std::env::temp_dir().join(format!("kraal-w10-export-form-{}", std::process::id()));
+        let files = dir.join("files");
+        std::fs::create_dir_all(&files).unwrap();
+        let alias = dir.join("alias");
+        std::os::unix::fs::symlink(&files, &alias).unwrap();
+        let path = alias.join("work  layout.kdl");
+        let lock = files.join(".work  layout.kdl.lock");
+        std::fs::write(&path, "// manual\nlayout { pane; }").unwrap();
+        super::super::persistence::tests::writer(&mut server, vec![Ok(())]);
+        let mut list = server.workspace_picker(ws);
+        list.query = "test".into();
+        list.refilter();
+        let Mode::Prompt(mut p) = server.export_workspace_form(client, ws, Some(&list)) else { panic!() };
+        p.value = path.display().to_string();
+        p.cursor = 4;
+        let Mode::Confirm(q) = server.on_workspace_form(client, p, key("enter")) else { panic!() };
+        assert!(!q.yes);
+        assert!(q.message.contains("Comments and unsupported KDL"));
+        let Mode::Prompt(p) = confirm(&mut server, client, q, b"\r") else { panic!() };
+        assert_eq!(p.cursor, 4);
+        let Mode::Confirm(q) = server.on_workspace_form(client, p, key("enter")) else { panic!() };
+        std::fs::write(&path, "second edit").unwrap();
+        let Mode::Prompt(p) = confirm(&mut server, client, q, b"y") else { panic!() };
+        assert!(p.error.as_ref().unwrap().contains("changed while saving"));
+        for size in [(80, 24), (124, 36)] {
+            let mut buf = Buffer::empty(Rect::new(0, 0, size.0, size.1));
+            draw_form(&p, buf.area, &mut buf);
+            assert!(text(&buf).contains("Enter Retry"));
+            assert!(text(&buf).contains("Workspaces are saved automatically."));
+            assert!(form_layout(&p, buf.area).lines.join("").contains(p.error.as_ref().unwrap()));
+        }
+        let Mode::Confirm(q) = server.on_workspace_form(client, p, key("enter")) else { panic!() };
+        std::fs::create_dir(&lock).unwrap();
+        let Mode::Prompt(p) = confirm(&mut server, client, q, b"y") else { panic!() };
+        assert!(p.error.is_some());
+        assert_eq!(p.value, path.display().to_string());
+        std::fs::remove_dir(&lock).unwrap();
+        let Mode::Confirm(q) = server.on_workspace_form(client, p, key("enter")) else { panic!() };
+        let Mode::Prompt(p) = confirm(&mut server, client, q, b"y") else { panic!() };
+        assert_eq!(p.title, "Layout exported");
+        assert_eq!(
+            p.workspace_form.as_ref().unwrap().result.as_deref(),
+            Some(path.canonicalize().unwrap().to_str().unwrap())
+        );
+        let Mode::Picker(p) = server.on_workspace_form(client, p, key("enter")) else { panic!() };
+        assert_eq!(p.query, "test");
+        assert_eq!(std::fs::read_to_string(path.with_extension("kdl.bak")).unwrap(), "second edit");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn relative_export_paths_use_the_directory_captured_when_the_form_opens() {
+        let (tx, _rx) = super::super::queue::channel(32);
+        let mut server = super::super::tests::server(tx);
+        let (client, _peer) = super::super::tests::client(&mut server);
+        let ws = server.workspaces[0].id;
+        let dir = std::env::temp_dir().join(format!("kraal-export-relative-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir = std::fs::canonicalize(dir).unwrap();
+        let pane = server
+            .spawn_pane_suspended(
+                None,
+                PaneSpec { cwd: Some(dir.clone()), command: vec!["true".into()], ..Default::default() },
+                "start_suspended",
+            )
+            .unwrap();
+        server.workspaces[0].tabs[0].root = Some(crate::layout::Node::Leaf(pane));
+        server.workspaces[0].tabs[0].focus = Some(pane);
+        super::super::persistence::tests::writer(&mut server, vec![]);
+        for value in ["copy.kdl", "./copy.kdl"] {
+            server.panes.get_mut(&pane).unwrap().reported_cwd = Some(dir.clone());
+            let Mode::Prompt(mut prompt) = server.export_workspace_form(client, ws, None) else { panic!() };
+            assert_eq!(prompt.workspace_form.as_ref().unwrap().cwd.as_ref(), Some(&dir));
+            server.panes.get_mut(&pane).unwrap().reported_cwd = Some(dir.join("elsewhere"));
+            prompt.value = value.into();
+            let Mode::Prompt(result) = server.submit_workspace_form(client, prompt) else { panic!() };
+            assert_eq!(result.title, "Layout exported", "{:?}", result.error);
+            let path = dir.join("copy.kdl");
+            assert!(path.is_file());
+            assert_eq!(crate::workspace::load_file(&path).unwrap().panes()[0].command.as_deref(), Some("true"));
+            std::fs::remove_file(path).unwrap();
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn export_result_keeps_the_full_path_readable_and_returns_to_the_list() {
+        let (tx, _rx) = super::super::queue::channel(32);
+        let mut server = super::super::tests::server(tx);
+        let (client, _peer) = super::super::tests::client(&mut server);
+        let ws = server.workspaces[0].id;
+        let list = server.workspace_picker(ws);
+        let path = PathBuf::from(format!("/{}shared.kdl", "long folder 日本/".repeat(200)));
+        for (cols, rows) in [(80, 24), (124, 36)] {
+            let Mode::Prompt(p) = server.export_workspace_form(client, ws, Some(&list)) else { panic!() };
+            let Mode::Prompt(mut p) = server.exported_layout(p, &path) else { panic!() };
+            let area = Rect::new(0, 0, cols, rows);
+            let layout = form_layout(&p, area);
+            assert!(layout.fields.is_empty());
+            assert!(layout.max_scroll > 0);
+            assert_eq!(layout.lines.join(""), path.to_str().unwrap());
+            p.scroll = layout.max_scroll;
+            let mut buf = Buffer::empty(area);
+            assert!(draw_form(&p, area, &mut buf).is_none());
+            for expected in ["Layout exported", "shared.kdl", "Enter Done", "Esc Close"] {
+                assert!(text(&buf).contains(expected), "{}", text(&buf));
+            }
+            let Mode::Picker(p) = server.on_workspace_form(client, p, key("enter")) else { panic!() };
+            assert_eq!(p.current().unwrap().action.workspace(), Some(ws));
+        }
+    }
+
     #[test]
     fn duplicate_form_proposes_a_free_name_and_cancel_keeps_search_and_selection() {
         let (tx, _rx) = super::super::queue::channel(32);
@@ -494,7 +994,7 @@ mod tests {
                         buf.content.chunks(cols as usize).map(|row| row.iter().map(|c| c.symbol()).collect()).collect();
                     let verb = if rename { "Rename" } else { "Add" };
                     assert!(shown.iter().any(|row| row.contains(p.error.as_ref().unwrap())));
-                    assert!(shown.iter().any(|row| row.contains(&format!("[> {verb}]  [  Cancel]"))), "{shown:?}");
+                    assert!(shown.iter().any(|row| row.contains(&format!("[> {verb}]"))), "{shown:?}");
                     assert!(
                         shown.iter().any(|row| row.contains(&format!("Enter {verb} · Tab Next field · Esc Cancel")))
                     );
@@ -589,7 +1089,7 @@ mod tests {
                 draw_form(&p, buf.area, &mut buf);
                 let shown: Vec<String> =
                     buf.content.chunks(cols as usize).map(|row| row.iter().map(|c| c.symbol()).collect()).collect();
-                assert!(shown.iter().any(|row| row.contains("[> Retry]  [  Cancel]")));
+                assert!(shown.iter().any(|row| row.contains("[> Retry]")));
                 assert!(shown.iter().any(|row| row.contains("Enter Retry")));
             }
             assert_eq!(server.workspaces[0].name, "test");
@@ -847,7 +1347,7 @@ mod tests {
             draw_form(&p, buf.area, &mut buf);
             let shown: Vec<String> =
                 buf.content.chunks(cols as usize).map(|row| row.iter().map(|c| c.symbol()).collect()).collect();
-            assert!(shown.iter().any(|row| row.contains("[> Retry]  [  Cancel]")));
+            assert!(shown.iter().any(|row| row.contains("[> Retry]")));
             assert!(shown.iter().any(|row| row.contains("Enter Retry")));
             assert!(shown.iter().any(|row| row.contains("Starts in")));
         }
