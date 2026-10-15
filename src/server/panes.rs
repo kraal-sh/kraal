@@ -149,6 +149,7 @@ impl Server {
     pub fn spawn_pane(&mut self, name: Option<String>, spec: PaneSpec) -> Result<PaneId> {
         let mut spec = spec;
         self.accounts.bind_pane(&mut spec);
+        spec.prepare_agent_clipboard();
         self.add_worktree_env(&mut spec);
         let id = self.alloc_id();
         let inner = self.inner(self.layout_area);
@@ -187,6 +188,7 @@ impl Server {
     pub fn spawn_pane_suspended(&mut self, name: Option<String>, spec: PaneSpec, reason: &str) -> Result<PaneId> {
         let mut spec = spec;
         self.accounts.bind_pane(&mut spec);
+        spec.prepare_agent_clipboard();
         self.add_worktree_env(&mut spec);
         let id = self.alloc_id();
         let inner = self.inner(self.layout_area);
@@ -293,6 +295,7 @@ impl Server {
         let id = self.spawn_pane_in(ws, None, prelude, placement, name)?;
         let mut spec = spec;
         self.accounts.bind_pane(&mut spec);
+        spec.prepare_agent_clipboard();
         self.add_worktree_env(&mut spec);
         if let Some(p) = self.panes.get_mut(&id) {
             // A prelude that could not start waits for Enter: Enter starts the command instead.

@@ -1147,6 +1147,7 @@ pub fn attach(mut target: Target, mut workspace: Option<String>, mouse: bool, at
     let writer: Arc<Mutex<Option<Box<dyn Write + Send>>>> = Arc::new(Mutex::new(None));
     let laptop = laptop::Controller::new(writer.clone(), &target, identity.clone());
     let attachments = attachments::Controller::for_target(writer.clone(), &target, Some(laptop.clone()));
+    attachments.set_clipboard_limit(clipboard_policy.settings.max_bytes);
 
     let clipboard_shutdown = Arc::new(crate::clipboard::Shutdown::default());
 

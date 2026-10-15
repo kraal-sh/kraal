@@ -145,6 +145,9 @@ fn spawn(server: &mut Server, p: &PaneSnap) -> Result<PaneId> {
         return Ok(id);
     }
     let mut spec = p.spec.clone();
+    if p.agent.as_deref().is_some_and(|agent| crate::agent_registry::find(agent).is_some()) {
+        spec.agent_clipboard();
+    }
     let mut resumed = false;
     if spec.account.is_some() {
         // Agents started from the agent manager resume on their account; a one-shot run or a
@@ -153,6 +156,7 @@ fn spawn(server: &mut Server, p: &PaneSnap) -> Result<PaneId> {
     } else if let (Some(agent), Some(session)) = (&p.agent, &p.agent_session) {
         if spec.command.is_empty() {
             spec.startup_input = resume_command(agent, session);
+            spec.agent_clipboard();
         } else if let Some(kind) = crate::accounts::agent_kind(agent)
             && let Some((command, exact)) = crate::accounts::resume_argv(kind, &spec.command, session)
         {
@@ -355,5 +359,56 @@ mod tests {
             server.warnings,
             ["tunnel saved-connection:invalid host:5432 → localhost:15432: not a host: \"invalid host\""]
         );
+    }
+
+    #[test]
+    fn old_agent_panes_remove_displays_even_when_stopped_without_a_conversation() {
+        let (tx, _rx) = crate::server::queue::channel(64);
+        let mut server = crate::server::tests::server(tx);
+        for (command, account, agent, session, startup, removed) in [
+            (vec!["codex"], None, Some("codex"), None, None, true),
+            (vec!["gemini"], None, Some("gemini"), None, None, true),
+            (vec!["claude"], Some("claude:removed"), Some("claude"), None, None, true),
+            (vec![], None, Some("claude"), Some("conversation"), None, true),
+            (vec![], None, None, None, Some("gemini\r"), true),
+            (vec![], None, None, None, None, false),
+        ] {
+            let json = serde_json::json!({
+                "name": null, "spec": { "command": command, "account": account, "startup_input": startup },
+                "agent": agent, "agent_session": session, "stopped": true
+            });
+            let saved: PaneSnap = serde_json::from_value(json).unwrap();
+            assert!(saved.spec.env_remove.is_empty());
+            let id = spawn(&mut server, &saved).unwrap();
+            for key in ["DISPLAY", "WAYLAND_DISPLAY"] {
+                assert_eq!(server.panes[&id].spec.env_remove.iter().any(|name| name == key), removed);
+            }
+        }
+    }
+
+    #[test]
+    fn old_scripted_agent_snapshots_remove_displays_without_a_session() {
+        let (tx, _rx) = crate::server::queue::channel(4096);
+        let mut server = crate::server::tests::server(tx);
+        for (agent, program) in [("continue", "cn"), ("letta", "letta"), ("vibe", "vibe"), ("shell", "sh")] {
+            let saved = PaneSnap {
+                name: None,
+                spec: crate::pane::PaneSpec {
+                    command: vec![program.into()],
+                    env: vec![("DISPLAY".into(), ":0".into()), ("WAYLAND_DISPLAY".into(), "wayland-0".into())],
+                    ..Default::default()
+                },
+                agent: (agent != "shell").then(|| agent.into()),
+                agent_session: None,
+                stopped: true,
+                scrollback: None,
+            };
+            let pane = spawn(&mut server, &saved).unwrap();
+            let spec = &server.panes[&pane].spec;
+            for key in ["DISPLAY", "WAYLAND_DISPLAY"] {
+                assert_eq!(spec.env_remove.iter().filter(|name| *name == key).count(), usize::from(agent != "shell"));
+                assert_eq!(spec.env.iter().any(|(name, _)| name == key), agent == "shell");
+            }
+        }
     }
 }

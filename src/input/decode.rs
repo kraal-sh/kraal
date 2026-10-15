@@ -61,7 +61,7 @@ pub(super) const MAX_CSI_LEN: usize = 256;
 const MAX_STRING_LEN: usize = 64 * 1024;
 
 /// Incremental parser for the bytes the client forwards from its terminal.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct InputParser {
     /// Bytes not consumed yet (an incomplete sequence, or a possible paste end marker prefix).
     buf: Vec<u8>,

@@ -1760,9 +1760,10 @@ fn host_control_v_sends_agent_images_and_preserves_shell_local_and_text_clipboar
         "wl-paste",
         "image/png\n",
         format!(
-            "#!/bin/sh\nif [ \"$1\" = --list-types ]; then echo types >> '{}'; cat '{}'; else echo image >> '{}'; cat '{}'; fi\n",
+            "#!/bin/sh\nif [ \"$1\" = --list-types ]; then echo types >> '{}'; cat '{}'; elif [ \"$3\" = text/plain ]; then echo text >> '{}'; printf 'clipboard text'; else echo image >> '{}'; cat '{}'; fi\n",
             log.display(),
             types.display(),
+            log.display(),
             log.display(),
             png.display()
         ),
@@ -1780,6 +1781,11 @@ fn host_control_v_sends_agent_images_and_preserves_shell_local_and_text_clipboar
         ),
     );
     write_script(&local.root.join("bin").join(tool), &script);
+    #[cfg(target_os = "macos")]
+    write_script(
+        &local.root.join("bin/pbpaste"),
+        &format!("#!/bin/sh\necho text >> '{}'; printf 'clipboard text'\n", log.display()),
+    );
     std::fs::write(&types, image_types).unwrap();
     std::fs::write(local.root.join("config/kraal/servers.toml"), "[[server]]\nname='box'\nhost='image-key.invalid'\n")
         .unwrap();
@@ -1837,16 +1843,33 @@ fn host_control_v_sends_agent_images_and_preserves_shell_local_and_text_clipboar
 
     let mut client = attach(false);
     client.type_keys(b"\x16local");
-    wait_until(PATIENCE, "local agent receives Ctrl+V", || received() == b"\x16shell\x16local");
-    assert!(!log.exists(), "local sessions do not inspect the clipboard");
+    wait_until(PATIENCE, "local image path precedes typing", || received().ends_with(b"clipboard.pnglocal"));
+    assert!(!String::from_utf8_lossy(&client.written.lock().unwrap()).contains("Send the clipboard image"));
+    let local_input = received();
+    let pasted = std::str::from_utf8(&local_input[b"\x16shell".len()..local_input.len() - b"local".len()]).unwrap();
+    assert_eq!(std::fs::read(pasted.trim_matches('\'')).unwrap(), std::fs::read(&png).unwrap());
+    assert!(!pasted.contains('\n'), "no Enter is added");
+    assert_eq!(std::fs::read_to_string(&log).unwrap(), "types\nimage\n");
+    std::fs::remove_file(&log).unwrap();
     client.type_keys(b"\x02d");
     assert_eq!(client.left("local detach").0, 0);
 
     std::fs::write(&types, "text/plain\n").unwrap();
+    let mut expected = received();
+    for remote in [false, true] {
+        let mut client = attach(remote);
+        client.type_keys(b"\x16text");
+        expected.extend_from_slice(b"clipboard texttext");
+        wait_until(PATIENCE, "clipboard text precedes following typing", || received() == expected);
+        client.type_keys(b"\x02d");
+        assert_eq!(client.left("text detach").0, 0);
+    }
+    #[cfg(not(target_os = "macos"))]
+    let text_calls = "types\ntypes\ntext\ntypes\ntypes\ntext\n";
+    #[cfg(target_os = "macos")]
+    let text_calls = "types\ntext\ntypes\ntext\n";
+    assert_eq!(std::fs::read_to_string(&log).unwrap(), text_calls);
     let mut client = attach(true);
-    client.type_keys(b"\x16text");
-    wait_until(PATIENCE, "text clipboard forwards Ctrl+V", || received() == b"\x16shell\x16local\x16text");
-    assert_eq!(std::fs::read_to_string(&log).unwrap(), "types\n");
     std::fs::write(&types, image_types).unwrap();
     client.type_keys(b"\x16");
     client.wait_for("Always for box");
@@ -1854,7 +1877,7 @@ fn host_control_v_sends_agent_images_and_preserves_shell_local_and_text_clipboar
     client.wait_for("Attachment stopped: cancelled");
     client.type_keys(b"\rcancelled");
     wait_until(PATIENCE, "cancel releases typing", || received().ends_with(b"cancelled"));
-    assert_eq!(std::fs::read_to_string(&log).unwrap(), "types\ntypes\n");
+    assert_eq!(std::fs::read_to_string(&log).unwrap(), format!("{text_calls}types\n"));
     let before = received();
     client.type_keys(b"\x1b[118;5u");
     wait_until(PATIENCE, "second image question", || {
@@ -1881,7 +1904,7 @@ fn host_control_v_sends_agent_images_and_preserves_shell_local_and_text_clipboar
     client.wait_for("(100%)");
     wait_until(PATIENCE, "remembered image path pasted", || received().len() > before);
     assert!(!String::from_utf8_lossy(&client.written.lock().unwrap()).contains("Send the clipboard image"));
-    assert_eq!(received().iter().filter(|&&b| b == 0x16).count(), 3);
+    assert_eq!(received().iter().filter(|&&b| b == 0x16).count(), 1);
     client.type_keys(b"\x02d");
     assert_eq!(client.left("remembered image detach").0, 0);
 }

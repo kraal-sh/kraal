@@ -200,6 +200,13 @@ pub enum ClientMsg {
     Detach,
     /// Reserve the destination while the client classifies a buffered paste.
     PasteStart,
+    /// A client clipboard read bound to the agent that received the shortcut.
+    ClipboardPaste {
+        pane: crate::layout::PaneId,
+        key: Vec<u8>,
+        text: Vec<u8>,
+        token: Option<String>,
+    },
     AttachmentRequest {
         token: String,
         /// Paste content, or the original shortcut key when `image` and `pane` are set.
@@ -1001,6 +1008,8 @@ mod tests {
             ClientMsg::Repaint,
             ClientMsg::Detach,
             ClientMsg::PasteStart,
+            ClientMsg::ClipboardPaste { pane: 7, key: vec![0x16], text: b"text".to_vec(), token: None },
+            ClientMsg::ClipboardPaste { pane: 7, key: vec![0x16], text: b"/tmp/a".to_vec(), token: Some(s("ab")) },
             ClientMsg::AttachmentRequest { token: s("ab"), text: b"/tmp/a".to_vec(), image: false, pane: None },
             ClientMsg::AttachmentRequest { token: s("cd"), text: Vec::new(), image: true, pane: Some(7) },
             ClientMsg::AttachmentText { token: s("ab"), text: b"/tmp/a".to_vec() },

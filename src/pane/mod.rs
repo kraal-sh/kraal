@@ -172,6 +172,26 @@ pub struct PaneSpec {
 }
 
 impl PaneSpec {
+    pub fn agent_clipboard(&mut self) {
+        // Agent copies must reach the attached terminal, not the server's desktop.
+        for key in ["DISPLAY", "WAYLAND_DISPLAY"] {
+            self.env.retain(|(name, _)| name != key);
+            if !self.env_remove.iter().any(|name| name == key) {
+                self.env_remove.push(key.into());
+            }
+        }
+    }
+
+    pub fn prepare_agent_clipboard(&mut self) {
+        let startup_agent =
+            self.startup_input.as_deref().is_some_and(|input| crate::agent_registry::find(input.trim()).is_some());
+        if self.login.is_none()
+            && (self.account.is_some() || crate::agent::detect_agent(&self.command).is_some() || startup_agent)
+        {
+            self.agent_clipboard();
+        }
+    }
+
     pub fn check_program(&self, shell: &str) -> Result<()> {
         spawn::check_program(self, shell)
     }

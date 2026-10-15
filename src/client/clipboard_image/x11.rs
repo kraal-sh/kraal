@@ -30,6 +30,36 @@ pub(super) fn read_png(cancelled: &AtomicBool) -> Result<Option<Vec<u8>>> {
     Ok(Some(clipboard.convert(clipboard.png, clipboard.png, 8, MAX_BYTES)?))
 }
 
+pub(super) fn read_text(cancelled: &AtomicBool, limit: usize) -> Result<Option<Vec<u8>>> {
+    let deadline = Deadline::new(cancelled);
+    let Some(clipboard) = Clipboard::connect(&deadline)? else { return Ok(None) };
+    if clipboard.connection.get_selection_owner(clipboard.clipboard)?.reply()?.owner == NONE {
+        return Ok(Some(Vec::new()));
+    }
+    let utf8 = clipboard.connection.intern_atom(false, b"UTF8_STRING")?.reply()?.atom;
+    let targets = clipboard.convert(clipboard.targets, AtomEnum::ATOM.into(), 32, 16 * 1024)?;
+    let Some(target) = text_target(&targets, utf8)? else { return Ok(Some(Vec::new())) };
+    let bytes = clipboard.convert(target, target, 8, limit).map_err(|error| {
+        if error.to_string() == size_error(limit) { anyhow::anyhow!(super::TEXT_TOO_LARGE) } else { error }
+    })?;
+    Ok(Some(decode_text(bytes, target == Atom::from(AtomEnum::STRING), limit)?))
+}
+
+fn text_target(bytes: &[u8], utf8: Atom) -> Result<Option<Atom>> {
+    for target in [utf8, AtomEnum::STRING.into()] {
+        if offers_png(bytes, target)? {
+            return Ok(Some(target));
+        }
+    }
+    Ok(None)
+}
+
+fn decode_text(bytes: Vec<u8>, latin1: bool, limit: usize) -> Result<Vec<u8>> {
+    let bytes = if latin1 { bytes.into_iter().map(char::from).collect::<String>().into_bytes() } else { bytes };
+    ensure!(bytes.len() <= limit, super::TEXT_TOO_LARGE);
+    Ok(bytes)
+}
+
 struct TimedStream<'a, 'b> {
     stream: DefaultStream,
     deadline: &'a Deadline<'b>,
@@ -288,6 +318,20 @@ mod tests {
     }
     fn header(minimum: u32) -> Value {
         Value { kind: INCR, format: 32, bytes: minimum.to_ne_bytes().to_vec() }
+    }
+
+    #[test]
+    fn text_targets_prefer_utf8_and_string_is_latin1_with_a_utf8_size_limit() {
+        let utf8: Atom = 999;
+        let string: Atom = AtomEnum::STRING.into();
+        let targets = [string.to_ne_bytes(), utf8.to_ne_bytes()].concat();
+        assert_eq!(text_target(&targets, utf8).unwrap(), Some(utf8));
+        assert_eq!(text_target(&string.to_ne_bytes(), utf8).unwrap(), Some(string));
+        assert_eq!(text_target(&[], utf8).unwrap(), None);
+        assert!(text_target(&[1], utf8).is_err());
+        assert_eq!(decode_text(vec![b'a', 0xe9, b'\n'], true, 4).unwrap(), "aé\n".as_bytes());
+        assert_eq!(decode_text("aé\n".as_bytes().to_vec(), false, 4).unwrap(), "aé\n".as_bytes());
+        assert_eq!(decode_text(vec![0xe9], true, 1).unwrap_err().to_string(), super::super::TEXT_TOO_LARGE);
     }
 
     #[test]

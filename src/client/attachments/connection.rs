@@ -30,6 +30,11 @@ impl Controller {
         let image = matches!(&msg, ServerMsg::ClipboardImageOffer { .. });
         match msg {
             ServerMsg::ClipboardFocus { pane, agent } => {
+                if state.focus != Some((pane, agent))
+                    && let Some(read) = state.clipboard_read.take()
+                {
+                    read.cancelled.store(true, Ordering::SeqCst);
+                }
                 state.focus = Some((pane, agent));
                 return;
             }
@@ -51,13 +56,14 @@ impl Controller {
                 dropped.error = dropped.validate().err().map(|e| format!("{e:#}"));
                 let image = dropped.image;
                 let shortcut = dropped.shortcut;
-                let automatic = !dropped.retry
+                let automatic = (!dropped.retry || !self.remote && image && shortcut)
                     && dropped.selected == 0
                     && dropped.error.is_none()
-                    && !broadcast
+                    && (!broadcast || !self.remote && image)
                     && if image {
                         shortcut
-                            && (state.image_approved
+                            && (!self.remote
+                                || state.image_approved
                                 || self
                                     .destination
                                     .as_ref()
@@ -222,6 +228,9 @@ impl Controller {
     pub fn disconnect(&self) {
         let mut state = self.state.lock().unwrap();
         state.connected = false;
+        if let Some(read) = state.clipboard_read.take() {
+            read.cancelled.store(true, Ordering::SeqCst);
+        }
         state.image_notices.clear();
         state.focus = None;
         state.image_keys = Default::default();

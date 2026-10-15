@@ -46,7 +46,7 @@ impl<'a> Deadline<'a> {
         if self.cancelled.load(Ordering::SeqCst) {
             Err(io::Error::other("clipboard read cancelled"))
         } else if Instant::now() >= self.until {
-            Err(io::Error::new(io::ErrorKind::TimedOut, "clipboard read timed out; copy the image again"))
+            Err(io::Error::new(io::ErrorKind::TimedOut, "clipboard read timed out; copy again"))
         } else {
             Ok(())
         }

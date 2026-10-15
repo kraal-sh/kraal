@@ -27,7 +27,8 @@ impl Server {
             None => kind.session_flag.map(|_| crate::identity::new_uuid()),
         };
         let new_session = if resume.is_none() { session.as_deref() } else { None };
-        let l = accounts::launch(a, args, resume, new_session)?;
+        let mut l = accounts::launch(a, args, resume, new_session)?;
+        l.env_remove.extend(["DISPLAY".into(), "WAYLAND_DISPLAY".into()]);
         Ok(PaneSpec {
             command: l.argv,
             env: l.env,
@@ -50,6 +51,7 @@ impl Server {
     pub fn resume_spec(&self, spec: &PaneSpec, session: Option<&str>) -> (PaneSpec, bool) {
         let mut bound = spec.clone();
         self.accounts.bind_pane(&mut bound);
+        bound.prepare_agent_clipboard();
         let spec = &bound;
         let Some(a) = self.spec_account(spec) else {
             return (spec.clone(), false);
@@ -144,7 +146,8 @@ impl Server {
         if registered.accounts.is_none() {
             let cwd = self.agent_cwd(ws, target, cwd);
             let launch = registered.native_launch(account, args, cwd.as_deref())?;
-            let spec = PaneSpec { command: launch.argv, cwd, ..Default::default() };
+            let mut spec = PaneSpec { command: launch.argv, cwd, ..Default::default() };
+            spec.agent_clipboard();
             return self.spawn_pane_in(ws, target, spec, placement, Some(agent.into()));
         }
         let wi = self.ws_index(ws).context("no such workspace")?;

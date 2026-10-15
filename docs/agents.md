@@ -74,7 +74,7 @@ whole lifecycle; partial hooks and screen heuristics do not qualify for deferred
 | `rovodev` | `acli rovodev run` | No | No | No | No | No | No |
 
 Only Claude and Codex have account adapters. Other agents keep their own account settings;
-kraal supplies no account environment overrides or conversation resume arguments for them.
+kraal supplies no account-specific environment overrides or conversation resume arguments for them.
 Continue, Letta and Python Vibe are detected through their runtime scripts; broad command names
 alone do not identify a running agent. Cursor's generic `agent` process also needs its bundled
 script path for detection; the launch picker looks for `cursor-agent`.
@@ -365,6 +365,12 @@ your environment (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`…), which would bill an
 Removing an account does not let a replacement with the same name or home take over its
 panes. Refreshing a pane's account label keeps the home it launched with, including after
 accounts are joined.
+Agent panes kraal starts, including workspace agents and restored sessions, run without
+`DISPLAY` and `WAYLAND_DISPLAY` so agents such as Codex use terminal clipboard copying.
+Ctrl+V in an agent pane reads images or text on the attaching client, locally or over `--host`.
+See [Clipboard images](terminal.md#clipboard-images). Shell panes keep their display environment.
+Account sign-in panes also keep it because sign-in may open a browser.
+
 Command-line logins and sign-in checks use the same account environment. Logins use your
 terminal; checks run with no terminal input and keep the agent's output private.
 
