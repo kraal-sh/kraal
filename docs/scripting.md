@@ -40,7 +40,13 @@ the pane when the command exits, where it would otherwise stay open with its exi
 For `kraal wait`, `--until` takes the states of an agent (`working`, `blocked`, `done`, `idle`),
 `exit` (the pane's program ended) and `quiet` (it printed nothing for two seconds); without it,
 the wait ends on `blocked`, `done`, `idle` or `exit`. It fails when `--timeout` (in seconds)
-passes first, or when the pane closes.
+passes first, or when the pane closes. Disconnecting the waiting command removes its wait;
+it does not close the pane. The event stream likewise ends when its subscriber disconnects.
+
+Commands that prepare work in the background keep their request open until that operation
+answers: for example, a remote edit waits for its file and editor, and a runbook waits for
+its plan or for its recorded run to start. Disconnecting the command does not cancel those
+operations. `kraal kill` answers after the final save attempt and reports a save failure.
 
 Commands require the same protocol version as the running session. After an update that changes
 the protocol, a command fails with both versions and the restart or update command to run before

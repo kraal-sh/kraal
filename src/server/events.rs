@@ -401,6 +401,20 @@ impl Server {
     /// Start streaming events to a `kraal events` client, after replaying those after `since`.
     pub(super) fn subscribe(
         &mut self,
+        reply: super::requests::ReplyHandle,
+        filters: Vec<String>,
+        since: Option<u64>,
+        boot: Option<u64>,
+    ) -> super::requests::RequestOutcome {
+        use super::requests::RequestOutcome;
+        match self.start_subscription(reply.client(), filters, since, boot) {
+            Ok(()) => RequestOutcome::Streaming,
+            Err(e) => RequestOutcome::Immediate { reply, result: Err(e) },
+        }
+    }
+
+    fn start_subscription(
+        &mut self,
         client: ClientId,
         filters: Vec<String>,
         since: Option<u64>,
@@ -535,6 +549,60 @@ pub type PaneStates = HashMap<PaneId, (Option<String>, Option<String>)>;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn subscriptions_transfer_the_connection_and_keep_replay_before_live_events() {
+        use crate::protocol::{Request, Response};
+        use crate::server::requests::{RequestOutcome, tests::response};
+        use crate::server::tests::{client, server};
+        let (tx, _rx) = crate::server::event_channel(32);
+        let mut server = server(tx);
+        server.emit("pane.opened", json!({"pane": 17}));
+        let (id, _peer) = client(&mut server);
+        let receive = server.clients.get_mut(&id).unwrap().out.capture();
+        assert!(matches!(
+            server.request(id, Request::Subscribe { events: vec!["pane.*".into()], since: Some(0), boot: None }),
+            RequestOutcome::Streaming
+        ));
+        assert!(!server.clients.contains_key(&id));
+        assert_eq!(server.subscribers.len(), 1);
+        assert!(matches!(response(&receive), Ok(Response::Ok)));
+        let frame = receive.recv_timeout(crate::testing::PATIENCE).unwrap();
+        let (_, payload) = protocol::read_frame(&mut frame.as_slice()).unwrap().unwrap();
+        let replay: ServerMsg = serde_json::from_slice(&payload).unwrap();
+        assert!(matches!(replay, ServerMsg::Events { events } if events.len() == 1 && events[0]["pane"] == 17));
+        server.emit("pane.closed", json!({"pane": 17}));
+        let frame = receive.recv_timeout(crate::testing::PATIENCE).unwrap();
+        let (_, payload) = protocol::read_frame(&mut frame.as_slice()).unwrap().unwrap();
+        assert!(
+            matches!(serde_json::from_slice(&payload).unwrap(), ServerMsg::Event { event } if event["type"] == "pane.closed")
+        );
+        server.drop_client(id);
+        assert!(server.subscribers.is_empty());
+        server.emit("pane.opened", json!({"pane": 18}));
+        assert!(matches!(receive.try_recv(), Err(crossbeam_channel::TryRecvError::Disconnected)));
+    }
+
+    #[test]
+    fn invalid_subscriptions_keep_an_immediate_error_and_no_stream() {
+        use crate::protocol::Request;
+        use crate::server::requests::{RequestOutcome, tests::response};
+        use crate::server::tests::{client, server};
+        let (tx, _rx) = crate::server::event_channel(32);
+        let mut server = server(tx);
+        let (id, _peer) = client(&mut server);
+        let receive = server.clients.get_mut(&id).unwrap().out.capture();
+        let RequestOutcome::Immediate { reply, result } =
+            server.request(id, Request::Subscribe { events: vec!["unknown".into()], since: None, boot: None })
+        else {
+            panic!("invalid subscription")
+        };
+        assert!(receive.is_empty());
+        assert!(server.subscribers.is_empty());
+        reply.complete(&mut server, result);
+        assert_eq!(response(&receive).unwrap_err(), "no such event: unknown (see `kraal events --list`)");
+        assert!(matches!(receive.try_recv(), Err(crossbeam_channel::TryRecvError::Disconnected)));
+    }
 
     #[test]
     fn duplicate_and_closed_restore_emit_open_only_when_opened_successfully() {

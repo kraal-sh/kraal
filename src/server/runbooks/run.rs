@@ -20,7 +20,7 @@ impl Server {
     /// is first written in the ledger (by the log writer, which may be busy: the event loop does
     /// not wait for it); its targets start once it is on record, if they are still where the
     /// plan said. `asker` hears how it went; an `Err` here means nothing was started.
-    pub(in crate::server) fn launch_runbook(&mut self, d: Draft, asker: Asker) -> Result<()> {
+    pub(in crate::server) fn launch_runbook(&mut self, d: Draft, asker: &mut Asker) -> Result<()> {
         self.check_launch(&d)?;
         let specs = self.launch_specs(&d)?;
         let labels: Vec<String> = specs.iter().map(|(l, _)| l.clone()).collect();
@@ -48,16 +48,17 @@ impl Server {
         self.launching.push(entry);
         let ledger = self.ledger_entries();
         let job = super::super::jobs::JobId(self.alloc_id());
-        let delivery = self.jobs.register(job, self.tx.clone(), move |server, recorded| {
-            let started = server.start_recorded(d, id, &log, recorded, asker.client);
-            server.report_launch(asker, started);
-        });
+        let (delivery, rx) = super::super::jobs::Delivery::channel(job, self.tx.clone());
         let done = Box::new(move |r: Result<(), String>| delivery.complete(Ok(r)));
         if self.run_logs.send(runbooks::LogJob::LedgerSync(self.session.clone(), ledger, done)).is_err() {
-            self.jobs.take(job);
             self.launching.retain(|r| r.id != id);
             bail!("the run log writer is gone: nothing was started");
         }
+        let asker = Asker { client: asker.client, reply: asker.reply.take() };
+        self.jobs.insert(job, rx, move |server, recorded| {
+            let started = server.start_recorded(d, id, &log, recorded, asker.client);
+            server.report_launch(asker, started);
+        });
         Ok(())
     }
 
@@ -173,8 +174,7 @@ impl Server {
         if let Some(r) = asker.reply {
             let result =
                 started.map(|id| crate::protocol::Response::Text(id.to_string())).map_err(|e| format!("{e:#}"));
-            self.send_msg(r, &crate::protocol::ServerMsg::Response { result });
-            self.clients.remove(&r);
+            r.complete(self, result);
         } else if let (Err(e), Some(c)) = (started, asker.client) {
             self.toast(c, NoticeKind::Error, format!("{e:#}"));
         }
@@ -763,6 +763,66 @@ mod tests {
     }
 
     #[test]
+    fn run_requests_keep_the_reply_through_ledger_success_failure_and_disconnect() {
+        use crate::protocol::{Request, Response};
+        use crate::server::requests::{
+            RequestOutcome,
+            tests::{finish_job, response},
+        };
+        for mode in ["started", "record failed", "writer gone", "disconnected"] {
+            let (tx, rx) = crate::server::event_channel(32);
+            let mut server = crate::server::tests::server(tx);
+            let (id, _peer) = crate::server::tests::client(&mut server);
+            let receive = server.clients.get_mut(&id).unwrap().out.capture();
+            server.plans.insert("plan".into(), (Instant::now(), draft()));
+            let (logs, pending) = crossbeam_channel::unbounded();
+            server.run_logs = logs;
+            if mode == "writer gone" {
+                server.run_logs = crossbeam_channel::unbounded().0;
+            }
+            let outcome = server.request(id, Request::RunbookRun { token: "plan".into() });
+            assert!(receive.is_empty());
+            if mode == "writer gone" {
+                let RequestOutcome::Immediate { reply, result } = outcome else { panic!("writer gone") };
+                reply.complete(&mut server, result);
+                assert_eq!(response(&receive).unwrap_err(), "the run log writer is gone: nothing was started");
+            } else {
+                assert!(matches!(outcome, RequestOutcome::Deferred));
+                if mode == "disconnected" {
+                    server.drop_client(id);
+                }
+                let runbooks::LogJob::LedgerSync(_, _, done) = pending.try_recv().unwrap() else { panic!("ledger") };
+                std::thread::spawn(move || {
+                    done(if mode == "record failed" { Err("disk full".into()) } else { Ok(()) })
+                })
+                .join()
+                .unwrap();
+                let _batch = crate::pane::batch();
+                finish_job(&mut server, &rx);
+                if mode == "record failed" {
+                    assert_eq!(
+                        response(&receive).unwrap_err(),
+                        "could not record the run (disk full): nothing was started"
+                    );
+                    assert!(server.runs.is_empty());
+                } else {
+                    assert_eq!(server.runs.len(), 1);
+                    if mode != "disconnected" {
+                        assert!(
+                            matches!(response(&receive), Ok(Response::Text(text)) if text == server.runs[0].id.to_string())
+                        );
+                    }
+                }
+            }
+            assert!(server.jobs.is_empty());
+            assert!(server.launching.is_empty());
+            assert!(server.plans.is_empty());
+            assert!(!server.clients.contains_key(&id));
+            assert!(matches!(receive.try_recv(), Err(crossbeam_channel::TryRecvError::Disconnected)));
+        }
+    }
+
+    #[test]
     fn ledger_completion_starts_targets_only_after_a_successful_write() {
         for recorded in [Ok(()), Err(String::from("ledger write failed"))] {
             let (tx, rx) = crate::server::event_channel(16);
@@ -771,7 +831,7 @@ mod tests {
             let (logs, pending) = crossbeam_channel::unbounded();
             server.run_logs = logs;
             let run_id = server.next_id;
-            server.launch_runbook(draft(), Asker { client: Some(client), reply: None }).unwrap();
+            server.launch_runbook(draft(), &mut Asker { client: Some(client), reply: None }).unwrap();
             assert_eq!(server.next_id, run_id + 2, "the run and its job share the server allocator");
             assert_eq!(server.jobs.len(), 1);
             assert_eq!(server.launching.len(), 1);
@@ -821,7 +881,7 @@ mod tests {
         server.run_logs = logs;
         drop(pending);
         let next = server.next_id;
-        let error = server.launch_runbook(draft(), Asker { client: None, reply: None }).unwrap_err();
+        let error = server.launch_runbook(draft(), &mut Asker { client: None, reply: None }).unwrap_err();
         assert_eq!(error.to_string(), "the run log writer is gone: nothing was started");
         assert_eq!(server.next_id, next + 2);
         assert!(server.jobs.is_empty());

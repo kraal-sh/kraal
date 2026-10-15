@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use crossbeam_channel::Sender;
+use crossbeam_channel::{Receiver, Sender};
 
 use super::{Event, EventSender, Server};
 
@@ -27,7 +27,17 @@ impl Jobs {
         events: EventSender,
         then: impl FnOnce(&mut Server, T) + 'static,
     ) -> Delivery<T> {
-        let (result, rx) = crossbeam_channel::bounded(1);
+        let (delivery, rx) = Delivery::channel(id, events);
+        self.insert(id, rx, then);
+        delivery
+    }
+
+    pub(super) fn insert<T: Send + 'static>(
+        &mut self,
+        id: JobId,
+        rx: Receiver<T>,
+        then: impl FnOnce(&mut Server, T) + 'static,
+    ) {
         self.pending.insert(
             id,
             Box::new(move |server| {
@@ -36,7 +46,6 @@ impl Jobs {
                 }
             }),
         );
-        Delivery { id, result, events }
     }
 
     pub(super) fn take(&mut self, id: JobId) -> Option<Continuation> {
@@ -55,6 +64,11 @@ impl Jobs {
 }
 
 impl<T> Delivery<T> {
+    pub(super) fn channel(id: JobId, events: EventSender) -> (Self, Receiver<T>) {
+        let (result, rx) = crossbeam_channel::bounded(1);
+        (Self { id, result, events }, rx)
+    }
+
     pub(super) fn complete(self, result: std::thread::Result<T>) {
         let result = result.map(|value| {
             // The value must be ready before the event wakes the server.
@@ -94,11 +108,28 @@ impl Server {
         }
         true
     }
+
+    /// Keep ownership with the caller if the worker cannot start.
+    pub(super) fn background_owned<T: Send + 'static, S: 'static>(
+        &mut self,
+        state: S,
+        work: impl FnOnce() -> T + Send + 'static,
+        then: impl FnOnce(&mut Server, S, T) + 'static,
+    ) -> Result<(), S> {
+        let id = JobId(self.alloc_id());
+        let (delivery, rx) = Delivery::channel(id, self.tx.clone());
+        if let Err(e) = delivery.start(work) {
+            self.warnings.push(format!("cannot start a background job: {e}"));
+            return Err(state);
+        }
+        self.jobs.insert(id, rx, move |server, result| then(server, state, result));
+        Ok(())
+    }
 }
 
 #[cfg(test)]
 thread_local! {
-    static FAIL_START: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    pub(super) static FAIL_START: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 #[cfg(test)]
@@ -109,6 +140,61 @@ mod tests {
     use super::*;
     use crate::server::{queue, tests::server};
     use crate::testing::PATIENCE;
+
+    #[test]
+    fn owned_replies_return_on_start_failure_and_transfer_on_success() {
+        use crate::protocol::Response;
+        use crate::server::requests::{
+            ReplyHandle,
+            tests::{finish_job, response},
+        };
+        for fail in [false, true] {
+            let (tx, rx) = queue::channel(32);
+            let mut server = server(tx);
+            let (id, _peer) = crate::server::tests::client(&mut server);
+            let receive = server.clients.get_mut(&id).unwrap().out.capture();
+            FAIL_START.set(fail);
+            let started = server.background_owned(
+                ReplyHandle::new(id),
+                || "ready",
+                |server, reply, value| {
+                    reply.complete(server, Ok(Response::Text(value.into())));
+                },
+            );
+            assert!(receive.is_empty());
+            if fail {
+                let reply = started.err().unwrap();
+                assert!(server.jobs.is_empty());
+                assert_eq!(server.warnings, ["cannot start a background job: thread start failed"]);
+                reply.complete(&mut server, Err("could not start".into()));
+                assert_eq!(response(&receive).unwrap_err(), "could not start");
+            } else {
+                assert!(started.is_ok());
+                finish_job(&mut server, &rx);
+                assert!(matches!(response(&receive), Ok(Response::Text(text)) if text == "ready"));
+            }
+            assert!(server.jobs.is_empty());
+            assert!(!server.clients.contains_key(&id));
+            assert!(matches!(receive.try_recv(), Err(crossbeam_channel::TryRecvError::Disconnected)));
+        }
+    }
+
+    #[test]
+    fn a_panicking_owned_worker_drops_its_reply_without_answering() {
+        use crate::server::requests::{ReplyHandle, tests::finish_job};
+        let (tx, rx) = queue::channel(32);
+        let mut server = server(tx);
+        let (id, _peer) = crate::server::tests::client(&mut server);
+        let receive = server.clients.get_mut(&id).unwrap().out.capture();
+        assert!(
+            server.background_owned(ReplyHandle::new(id), || panic!("failed"), |_, _, ()| panic!("not called")).is_ok()
+        );
+        finish_job(&mut server, &rx);
+        assert!(server.jobs.is_empty());
+        assert_eq!(server.warnings, ["a background job failed: failed"]);
+        assert!(receive.is_empty());
+        assert!(server.clients.contains_key(&id));
+    }
 
     #[test]
     fn typed_results_follow_completion_order_on_the_server_thread() {

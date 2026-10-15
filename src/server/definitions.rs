@@ -768,7 +768,7 @@ mod tests {
                 expected: None,
             },
         );
-        assert!(result.unwrap().unwrap_err().contains("several saved workspaces"));
+        assert!(result.immediate().unwrap_err().contains("several saved workspaces"));
         server.unrestored = crate::server::persistence::snapshot(&server).workspaces.into_iter().skip(1).collect();
         server.workspaces.pop();
         assert!(server.open_workspace("same").unwrap_err().to_string().contains("several saved workspaces"));

@@ -38,12 +38,11 @@ pub enum Target {
 }
 
 /// Who asked for a run, and how to tell them how its start went.
-#[derive(Clone, Copy)]
 pub(in crate::server) struct Asker {
     /// The client whose workspace gets the run's tab (and who hears if it does not start).
     client: Option<ClientId>,
     /// A `kraal runbook run` waiting for the run's number as its answer.
-    reply: Option<ClientId>,
+    reply: Option<super::requests::ReplyHandle>,
 }
 
 /// A runbook being prepared: trust, target and parameters are asked one at a time, then the

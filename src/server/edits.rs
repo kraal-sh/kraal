@@ -8,12 +8,13 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use super::contexts::Production;
+use super::requests::ReplyHandle;
 use super::ui::{ConfirmAction, Mode, PickAction, PickItem, Picker, PickerKind};
 use super::{ClientId, Dirty, Server};
 use crate::edit::{self, Channel, RemoteFile, Saved, Stamp};
 use crate::layout::PaneId;
 use crate::pane::PaneSpec;
-use crate::protocol::{Placement, Response, ServerMsg};
+use crate::protocol::{Placement, Response};
 use crate::theme::NoticeKind;
 
 /// How long the pane asking for a sudo password waits for it.
@@ -165,29 +166,31 @@ impl Server {
 
     /// Read the file off the event loop, then open the editor on a private copy of it. `reply`
     /// is a control request (`kraal edit`) waiting to know how that went.
-    pub(super) fn start_edit(&mut self, client: Option<ClientId>, target: EditTarget, reply: Option<ClientId>) {
+    pub(super) fn start_edit(&mut self, client: Option<ClientId>, target: EditTarget, reply: Option<ReplyHandle>) {
         if target.sudo {
             return self.start_sudo_edit(client, target, reply);
         }
         let (channel, path) = (Channel::Ssh(target.ssh.clone()), target.path.clone());
-        let started = self.background(
+        let started = self.background_owned(
+            reply,
             move || read_into_copy(channel, &path, None),
-            move |server, ready| server.edit_ready(client, target, reply, ready),
+            move |server, reply, ready| server.edit_ready(client, target, reply, ready),
         );
-        if !started {
+        if let Err(reply) = started {
             self.edit_failed(client, reply, "cannot start reading the file".into());
         }
     }
 
     /// Through sudo: one connection runs it for the whole edit. When it needs a password, a
     /// pane asks for it, and the file is read once sudo has it.
-    fn start_sudo_edit(&mut self, client: Option<ClientId>, target: EditTarget, reply: Option<ClientId>) {
+    fn start_sudo_edit(&mut self, client: Option<ClientId>, target: EditTarget, reply: Option<ReplyHandle>) {
         enum Started {
             Ready(Ready),
             Password(edit::Session, PathBuf, PathBuf),
         }
         let (ssh, path) = (target.ssh.clone(), target.path.clone());
-        let started = self.background(
+        let started = self.background_owned(
+            reply,
             move || -> anyhow::Result<Started> {
                 let session = edit::Session::start(&ssh, &path)?;
                 if session.needs_password {
@@ -204,7 +207,7 @@ impl Server {
                     read_into_copy(Channel::Sudo(Arc::new(Mutex::new(session))), &path, None).map(Started::Ready)
                 }
             },
-            move |server, started| match started {
+            move |server, reply, started| match started {
                 Ok(Started::Ready(ready)) => server.edit_ready(client, target, reply, Ok(ready)),
                 Ok(Started::Password(session, dir, fifo)) => {
                     server.ask_sudo_password(client, target, reply, session, dir, fifo)
@@ -212,7 +215,7 @@ impl Server {
                 Err(e) => server.edit_ready(client, target, reply, Err(e)),
             },
         );
-        if !started {
+        if let Err(reply) = started {
             self.edit_failed(client, reply, "cannot start sudo".into());
         }
     }
@@ -223,7 +226,7 @@ impl Server {
         &mut self,
         client: Option<ClientId>,
         target: EditTarget,
-        reply: Option<ClientId>,
+        reply: Option<ReplyHandle>,
         session: edit::Session,
         dir: PathBuf,
         fifo: PathBuf,
@@ -242,7 +245,8 @@ impl Server {
             self.background(move || drop((session, std::fs::remove_dir_all(&dir))), |_, ()| {});
             return self.edit_failed(client, reply, format!("cannot edit {}: {e:#}", target.server));
         }
-        let started = self.background(
+        let started = self.background_owned(
+            reply,
             move || -> anyhow::Result<Ready> {
                 let mut session = session;
                 let result = (|| {
@@ -261,9 +265,9 @@ impl Server {
                 }
                 result
             },
-            move |server, ready| server.edit_ready(client, target, reply, ready),
+            move |server, reply, ready| server.edit_ready(client, target, reply, ready),
         );
-        if !started {
+        if let Err(reply) = started {
             self.edit_failed(client, reply, "cannot wait for the password".into());
         }
     }
@@ -274,12 +278,12 @@ impl Server {
         &mut self,
         client: Option<ClientId>,
         target: EditTarget,
-        reply: Option<ClientId>,
+        reply: Option<ReplyHandle>,
         ready: anyhow::Result<Ready>,
     ) {
         let shown = format!("{}:{}", target.server, printable(&target.path));
         let not_permitted = ready.as_ref().err().and_then(|e| e.downcast_ref::<edit::NotPermitted>());
-        if let (Some(why), None, false, Some(c)) = (not_permitted, reply, target.sudo, client) {
+        if let (Some(why), None, false, Some(c)) = (not_permitted, reply.as_ref(), target.sudo, client) {
             let message = format!(
                 "{shown}: {why}.\nEdit it as root, through sudo on {}? A pane asks for your password; kraal does not keep it.",
                 target.server
@@ -293,20 +297,18 @@ impl Server {
         match (result, reply) {
             (Ok(p), Some(r)) => {
                 let result = Ok(Response::Pane(Box::new(self.pane_info(p))));
-                self.send_msg(r, &ServerMsg::Response { result });
-                self.clients.remove(&r);
+                r.complete(self, result);
             }
             (Ok(_), None) => {}
-            (Err(e), _) => self.edit_failed(client, reply, e),
+            (Err(e), reply) => self.edit_failed(client, reply, e),
         }
     }
 
     /// Say why an edit did not start: to the waiting control request, else to the client.
-    fn edit_failed(&mut self, client: Option<ClientId>, reply: Option<ClientId>, why: String) {
+    fn edit_failed(&mut self, client: Option<ClientId>, reply: Option<ReplyHandle>, why: String) {
         match reply {
             Some(r) => {
-                self.send_msg(r, &ServerMsg::Response { result: Err(why) });
-                self.clients.remove(&r);
+                r.complete(self, Err(why));
             }
             None => self.toast(client.unwrap_or(0), NoticeKind::Error, why),
         }
@@ -814,6 +816,50 @@ impl Server {
                     let _ = std::fs::remove_dir_all(&e.dir);
                 }
                 Err(err) => eprintln!("kraal: {} was not saved: {err}; it stays in {}", e.name(), e.dir.display()),
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::server::requests::tests::{finish_job, response};
+    use crate::server::tests::{client, server};
+
+    #[test]
+    fn remote_edit_start_and_read_failures_keep_their_single_reply() {
+        for sudo in [false, true] {
+            for fail_start in [false, true] {
+                let (tx, rx) = crate::server::event_channel(32);
+                let mut server = server(tx);
+                let (id, _peer) = client(&mut server);
+                let receive = server.clients.get_mut(&id).unwrap().out.capture();
+                let target = EditTarget {
+                    server: "test".into(),
+                    ssh: vec![],
+                    path: "/file".into(),
+                    line: None,
+                    ws: None,
+                    near: None,
+                    sudo,
+                };
+                super::super::jobs::FAIL_START.set(fail_start);
+                server.start_edit(None, target, Some(ReplyHandle::new(id)));
+                if !fail_start {
+                    assert!(receive.is_empty());
+                    finish_job(&mut server, &rx);
+                }
+                let expected = match (sudo, fail_start) {
+                    (false, true) => "cannot start reading the file",
+                    (true, true) => "cannot start sudo",
+                    (_, false) => "cannot edit test:/file: no ssh destination",
+                };
+                assert_eq!(response(&receive).unwrap_err(), expected);
+                assert!(server.panes.is_empty());
+                assert!(server.jobs.is_empty());
+                assert!(!server.clients.contains_key(&id));
+                assert!(matches!(receive.try_recv(), Err(crossbeam_channel::TryRecvError::Disconnected)));
             }
         }
     }

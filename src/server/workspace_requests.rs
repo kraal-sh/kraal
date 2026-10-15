@@ -102,7 +102,7 @@ mod tests {
     use crate::server::{persistence::tests::writer, queue, tests};
 
     fn request(server: &mut Server, request: Request) -> Result<Response, String> {
-        server.request(0, request).unwrap()
+        server.request(0, request).immediate()
     }
 
     fn preview(server: &mut Server, workspace: &str, delete: bool) -> (String, String, Option<String>) {

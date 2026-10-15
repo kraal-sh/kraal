@@ -202,7 +202,7 @@ mod tests {
                 0,
                 Request::ImportWorkspace { path: path.clone(), name: None, expected: None, accounts: Vec::new() },
             )
-            .unwrap()
+            .immediate()
             .unwrap()
         else {
             panic!()
@@ -339,7 +339,7 @@ mod tests {
         let source = "layout { pane command=\"true\" start_suspended=true; }";
         std::fs::write(&path, source).unwrap();
         server.config.workspace_dirs.push(dir.display().to_string());
-        let Response::Workspaces(before) = server.request(0, Request::ListWorkspaces).unwrap().unwrap() else {
+        let Response::Workspaces(before) = server.request(0, Request::ListWorkspaces).immediate().unwrap() else {
             panic!()
         };
         assert!(before.iter().any(|w| w.definition.as_ref() == Some(&path) && w.id.is_none()));
@@ -355,7 +355,7 @@ mod tests {
                     expected,
                 },
             )
-            .unwrap()
+            .immediate()
             .unwrap_err();
         assert!(error.contains("belongs to workspace"), "{error}");
         assert_eq!(std::fs::read_to_string(&path).unwrap(), source);
@@ -386,7 +386,7 @@ mod tests {
                         expected: None,
                     },
                 )
-                .unwrap()
+                .immediate()
                 .unwrap()
             else {
                 panic!()
@@ -403,7 +403,7 @@ mod tests {
                 path: path.clone(),
                 expected: Some(revision),
             };
-            assert!(matches!(server.request(client, request).unwrap().unwrap(), Response::Path(_)));
+            assert!(matches!(server.request(client, request).immediate().unwrap(), Response::Path(_)));
             assert_eq!(workspace::load_file(&path).unwrap().cwd, Some(dir.join("selected")));
             // Losing the selected identity must not make its reused name a substitute.
             server.workspaces.remove(wi);
@@ -418,7 +418,7 @@ mod tests {
                         expected: Some(expected.clone()),
                     },
                 )
-                .unwrap()
+                .immediate()
                 .unwrap_err();
             assert!(error.contains("no such workspace"), "{error}");
             assert_eq!(paths::FileRevision::read(&path).unwrap(), expected);
@@ -440,7 +440,7 @@ mod tests {
         let ws = server.import_layout(&path, "kept", &preview.revision, &[]).unwrap();
         let wi = server.ws_index(ws).unwrap();
         let list = |server: &mut Server| {
-            let Response::Workspaces(list) = server.request(0, Request::ListWorkspaces).unwrap().unwrap() else {
+            let Response::Workspaces(list) = server.request(0, Request::ListWorkspaces).immediate().unwrap() else {
                 panic!()
             };
             list.into_iter().map(|w| (w.id, w.name, w.definition)).collect::<Vec<_>>()

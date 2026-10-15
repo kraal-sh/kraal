@@ -988,7 +988,7 @@ mod tests {
                 t.client,
                 crate::protocol::Request::RenamePane { pane: t.pane.to_string(), name: "latest name".into() },
             )
-            .unwrap();
+            .immediate();
         assert!(reply.is_ok());
         assert_eq!(t.server.edited_pane_snapshot(t.pane).unwrap().name.as_deref(), Some("latest name"));
         t.until(|t| t.server.pane_edits.is_empty());

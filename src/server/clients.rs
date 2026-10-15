@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 
 use crossbeam_channel::{SendTimeoutError, TrySendError};
 
+use super::requests::{ReplyHandle, RequestOutcome};
 use super::{Client, ClientId, Dirty, Event, Mode, Printed, Server};
 use crate::ansi::Encoder;
 use crate::input::InputParser;
@@ -214,13 +215,15 @@ impl Server {
                             request,
                             crate::protocol::Request::Ping | crate::protocol::Request::KillServer { .. }
                         )) {
-                    Some(Err(self.version_mismatch(version)))
+                    RequestOutcome::Immediate {
+                        reply: ReplyHandle::new(id),
+                        result: Err(self.version_mismatch(version)),
+                    }
                 } else {
                     self.request(id, request)
                 };
-                if let Some(result) = result {
-                    self.send_msg(id, &ServerMsg::Response { result });
-                    self.clients.remove(&id);
+                if let RequestOutcome::Immediate { reply, result } = result {
+                    reply.complete(self, result);
                 }
             }
             // From a newer client: an attached one goes on without it, a connection that came
@@ -319,7 +322,7 @@ impl Server {
         self.cancel_laptop_client(id);
         self.clients.remove(&id);
         // A `kraal wait` or `kraal events` whose caller went away is dropped with it.
-        self.waits.retain(|w| w.client != id);
+        self.waits.retain(|w| w.reply.client() != id);
         self.subscribers.retain(|s| s.client != id);
         // What the client was in the middle of goes with it.
         self.drafts.remove(&id);
@@ -530,6 +533,57 @@ mod tests {
     }
 
     #[test]
+    fn connection_limit_counts_commands_waits_and_streams() {
+        use crate::protocol::{Request, Response};
+        use crate::server::tests::{client, server};
+        let (tx, _rx) = super::super::queue::channel(32);
+        let mut server = server(tx);
+        let (command, _command_peer) = client(&mut server);
+        assert!(matches!(server.request(command, Request::KillServer { restart: false }), RequestOutcome::Deferred));
+        let (wait, _wait_peer) = client(&mut server);
+        let Response::Pane(pane) = server
+            .request(0, Request::OpenFiles { left: "/missing".into(), right: "/missing".into(), near: None })
+            .immediate()
+            .unwrap()
+        else {
+            panic!("files pane")
+        };
+        assert!(matches!(
+            server.request(
+                wait,
+                Request::Wait { pane: pane.id.to_string(), until: vec!["exit".into()], timeout_ms: None }
+            ),
+            RequestOutcome::Deferred
+        ));
+        let (stream, _stream_peer) = client(&mut server);
+        assert!(matches!(
+            server.request(stream, Request::Subscribe { events: vec![], since: None, boot: None }),
+            RequestOutcome::Streaming
+        ));
+        assert_eq!((server.clients.len(), server.waits.len(), server.subscribers.len()), (1, 1, 1));
+        // Streams awaiting removal still count until the next subscriber cleanup.
+        server.subscribers.extend((3..MAX_CLIENTS).map(|n| super::super::events::Subscriber {
+            client: 10_000 + n as u32,
+            out: None,
+            filters: vec![],
+        }));
+        let (local, mut peer) = UnixStream::pair().unwrap();
+        peer.set_nonblocking(true).unwrap();
+        let next = server.next_id;
+        server.new_connection(local);
+        let (_, payload) = protocol::read_frame(&mut peer).unwrap().unwrap();
+        assert!(
+            matches!(serde_json::from_slice(&payload).unwrap(), ServerMsg::Response { result: Err(e) } if e == "too many connections (256)")
+        );
+        assert_eq!(server.next_id, next);
+        server.drop_client(wait);
+        let (local, _peer) = UnixStream::pair().unwrap();
+        server.new_connection(local);
+        assert!(server.clients.contains_key(&next));
+        assert_eq!(server.next_id, next + 1);
+    }
+
+    #[test]
     fn only_remote_attachments_advertise_a_laptop() {
         use super::super::tests::{client, server};
         let (tx, _rx) = super::super::queue::channel(32);
@@ -600,6 +654,28 @@ mod tests {
                 result: Ok(crate::protocol::Response::Pong { protocol: protocol::PROTOCOL_VERSION, .. })
             }
         ));
+    }
+
+    #[test]
+    fn upgrade_kill_keeps_its_reply_until_the_final_save() {
+        use super::super::tests::{client, server};
+        let (tx, _rx) = super::super::queue::channel(32);
+        let mut server = server(tx);
+        let saved = super::super::persistence::tests::writer(&mut server, vec![Ok(())]);
+        let (id, _peer) = client(&mut server);
+        let receive = outgoing(&mut server, id);
+        server.client_frame(
+            id,
+            protocol::JSON,
+            br#"{"type":"request","version":2,"request":{"cmd":"kill_server"}}"#.to_vec(),
+        );
+        assert!(receive.is_empty());
+        assert!(saved.lock().unwrap().is_empty());
+        assert_eq!(server.kill_waiters.len(), 1);
+        server.shutdown();
+        assert_eq!(saved.lock().unwrap().len(), 1);
+        assert!(matches!(super::super::requests::tests::response(&receive), Ok(crate::protocol::Response::Ok)));
+        assert!(matches!(receive.try_recv(), Err(crossbeam_channel::TryRecvError::Disconnected)));
     }
 
     #[test]

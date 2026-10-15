@@ -2454,7 +2454,7 @@ mod tests {
         assert_eq!(picker.items[1].action.workspace(), Some(current));
         assert!(matches!(&picker.items[2].action, PickAction::UnavailableDefinition(p) if p == &broken));
         assert!(picker.items[2].detail.starts_with("error: "));
-        let Response::Workspaces(infos) = server.request(client, Request::ListWorkspaces).unwrap().unwrap() else {
+        let Response::Workspaces(infos) = server.request(client, Request::ListWorkspaces).immediate().unwrap() else {
             panic!()
         };
         assert_eq!(infos.len(), 2);

@@ -12,16 +12,58 @@ use crate::pane::PaneSpec;
 use crate::protocol::{self, Request, Response, ServerMsg, WorkspaceInfo};
 use crate::theme::NoticeKind;
 
-type Reply = Option<Result<Response, String>>;
+// This lives only for dispatch; boxing would allocate for every immediate reply.
+#[allow(clippy::large_enum_variant)]
+pub(super) enum RequestOutcome {
+    Immediate { reply: ReplyHandle, result: Result<Response, String> },
+    Deferred,
+    Streaming,
+}
+
+/// The right to answer one control request. Dropping it sends nothing.
+pub(super) struct ReplyHandle {
+    client: ClientId,
+    out: Option<super::clients::Outbox>,
+}
+
+impl ReplyHandle {
+    pub(super) fn new(client: ClientId) -> Self {
+        Self { client, out: None }
+    }
+
+    pub(super) fn client(&self) -> ClientId {
+        self.client
+    }
+
+    pub(super) fn complete(self, server: &mut Server, result: Result<Response, String>) {
+        if let Some(out) = self.out {
+            let mut buf = Vec::new();
+            if protocol::write_json(&mut buf, &ServerMsg::Response { result }).is_ok() {
+                let _ = out.send_timeout(buf, Duration::from_millis(200));
+            }
+        } else {
+            server.send_msg(self.client, &ServerMsg::Response { result });
+            server.clients.remove(&self.client);
+        }
+    }
+}
+
+impl RequestOutcome {
+    #[cfg(test)]
+    pub(super) fn immediate(self) -> Result<Response, String> {
+        let Self::Immediate { result, .. } = self else { panic!("expected an immediate response") };
+        result
+    }
+}
 
 impl Server {
-    /// Handle one request. `None` means the answer comes later, once what the request waits for
-    /// is done: a `kraal wait` condition met, a remote file fetched and its editor open, a
-    /// runbook's plan made or its run started, the server stopped, or the git details read of
-    /// the directory a new pane or agent opens in. A subscription is answered by its stream of
-    /// events.
-    pub(super) fn request(&mut self, client: ClientId, req: Request) -> Reply {
-        self.with_workspace_cleanup(|server| server.answer(client, req).transpose()).transpose()
+    pub(super) fn request(&mut self, client: ClientId, req: Request) -> RequestOutcome {
+        let before: Vec<_> = self.workspaces.iter().map(|w| w.id).collect();
+        let outcome = self.answer(ReplyHandle::new(client), req);
+        if matches!(&outcome, RequestOutcome::Immediate { result: Err(_), .. }) {
+            self.workspaces.retain(|w| before.contains(&w.id) || !w.tabs.is_empty() || w.kept.is_some());
+        }
+        outcome
     }
 
     /// Failed requests discard only the empty workspaces they just created.
@@ -34,28 +76,215 @@ impl Server {
         result
     }
 
-    fn answer(&mut self, client: ClientId, req: Request) -> Reply {
-        Some(match req {
+    fn answer(&mut self, reply: ReplyHandle, req: Request) -> RequestOutcome {
+        match req {
+            req @ (Request::RunbookPlan { .. } | Request::RunbookRun { .. }) => self.answer_runbook_request(reply, req),
+            req @ (Request::NewPane { .. } | Request::OpenAgent { .. } | Request::EditRemote { .. }) => {
+                self.answer_launch(reply, req)
+            }
+            Request::Wait { pane, until, timeout_ms } => self.answer_wait(reply, pane, until, timeout_ms),
+            Request::KillServer { restart } => self.answer_shutdown(reply, restart),
+            Request::Subscribe { events, since, boot } => self.subscribe(reply, events, since, boot),
+            req => {
+                let result = self.answer_immediate(reply.client(), req);
+                RequestOutcome::Immediate { reply, result }
+            }
+        }
+    }
+
+    fn answer_runbook_request(&mut self, reply: ReplyHandle, req: Request) -> RequestOutcome {
+        let mut reply = Some(reply);
+        let result = match req {
             Request::RunbookPlan { path, target, params, pane } => {
                 let pane = match pane.as_deref().map(|p| self.resolve(p)).transpose() {
                     Ok(p) => p,
-                    Err(e) => return Some(Err(e)),
+                    Err(e) => return RequestOutcome::Immediate { reply: reply.take().unwrap(), result: Err(e) },
                 };
                 // Answered once the choices a parameter's command lists are known.
-                match self.prepare_runbook(&path, target.as_deref(), params, pane, client) {
-                    Ok(()) => return None,
+                match self.prepare_runbook(&path, target.as_deref(), params, pane, &mut reply) {
+                    Ok(()) => return RequestOutcome::Deferred,
                     Err(e) => Err(format!("{e:#}")),
                 }
             }
             // Answered once the run is on record and its targets have started.
-            Request::RunbookRun { token } => match self.run_prepared(&token, client) {
-                Ok(()) => return None,
+            Request::RunbookRun { token } => match self.run_prepared(&token, &mut reply) {
+                Ok(()) => return RequestOutcome::Deferred,
                 Err(e) => Err(format!("{e:#}")),
             },
-            Request::Subscribe { events, since, boot } => match self.subscribe(client, events, since, boot) {
-                Ok(()) => return None,
-                Err(e) => Err(e),
-            },
+            _ => unreachable!("runbook request"),
+        };
+        RequestOutcome::Immediate { reply: reply.take().unwrap(), result }
+    }
+
+    fn answer_launch(&mut self, reply: ReplyHandle, req: Request) -> RequestOutcome {
+        let result = match req {
+            req @ Request::NewPane { .. } => {
+                // A kraal worktree git has not been asked about yet gives its number to the
+                // pane's variables: git is asked first, off the loop, and the pane opens once it
+                // has answered.
+                let unknown = match &req {
+                    Request::NewPane { cwd: Some(dir), .. } if self.worktree_unknown(dir) => Some(dir.clone()),
+                    _ => None,
+                };
+                if let Some(dir) = unknown {
+                    self.background(
+                        move || {
+                            let info = crate::git::status(&dir);
+                            (dir, info)
+                        },
+                        move |server, (dir, info)| {
+                            server.git_result(dir, info.map(Box::new));
+                            let result = server.with_workspace_cleanup(|server| server.new_pane(req));
+                            reply.complete(server, result);
+                        },
+                    );
+                    return RequestOutcome::Deferred;
+                }
+                self.new_pane(req)
+            }
+
+            Request::OpenAgent { agent, account, account_id, placement, near, cwd, args } => {
+                let account = match account_id {
+                    Some(id) => match self.accounts.by_id(&id).filter(|a| a.agent == agent) {
+                        Some(a) => Some(format!("@{}", a.id)),
+                        None => {
+                            return RequestOutcome::Immediate {
+                                reply,
+                                result: Err("the account was removed; choose an account again".into()),
+                            };
+                        }
+                    },
+                    None => account,
+                };
+                let near = match near.as_deref().map(|n| self.resolve(n)).transpose() {
+                    Ok(n) => n,
+                    Err(e) => return RequestOutcome::Immediate { reply, result: Err(e) },
+                };
+                // The account rules may depend on which repository the directory belongs to (a
+                // worktree anywhere counts as its repository), and a kraal worktree not seen yet
+                // gives its number to the agent's variables: git is asked first, off the loop,
+                // and the agent starts once it has answered.
+                let ws = self.agent_workspace(near);
+                let dir = ws.and_then(|ws| self.agent_cwd(ws, near, cwd.clone()));
+                let undecided =
+                    account.is_none() && dir.as_ref().is_some_and(|d| self.accounts.undecided(&agent, Some(d)));
+                let new_worktree = dir
+                    .as_ref()
+                    .is_some_and(|d| crate::worktree_setup::in_worktrees_dir(d) && !self.git.contains_key(d));
+                if let Some(dir) = dir.filter(|_| undecided || new_worktree) {
+                    self.background(
+                        move || {
+                            crate::git::project_path(&dir);
+                            let info = new_worktree.then(|| crate::git::status(&dir)).flatten();
+                            (dir, info)
+                        },
+                        move |server, (dir, info)| {
+                            if info.is_some() {
+                                server.git_result(dir, info.map(Box::new));
+                            }
+                            let result = server.with_workspace_cleanup(|server| {
+                                server.open_agent(near, &agent, account.as_deref(), placement, cwd, &args)
+                            });
+                            reply.complete(server, result);
+                        },
+                    );
+                    return RequestOutcome::Deferred;
+                }
+                self.open_agent(near, &agent, account.as_deref(), placement, cwd, &args)
+            }
+            Request::EditRemote { target, line, near, production, sudo } => {
+                let near = match near.as_deref().map(|n| self.resolve(n)).transpose() {
+                    Ok(n) => n,
+                    Err(e) => return RequestOutcome::Immediate { reply, result: Err(e) },
+                };
+                let (server, path) = match crate::transfer::parse_endpoint(&target, &self.known_servers) {
+                    Ok(crate::transfer::Endpoint::Remote { server, path }) => (server, path),
+                    Ok(crate::transfer::Endpoint::Local(_)) => {
+                        return RequestOutcome::Immediate {
+                            reply,
+                            result: Err(format!("{target} is not on a server: kraal edit takes SERVER:PATH")),
+                        };
+                    }
+                    Err(e) => return RequestOutcome::Immediate { reply, result: Err(format!("{e:#}")) },
+                };
+                if path.is_empty() {
+                    return RequestOutcome::Immediate {
+                        reply,
+                        result: Err("which file? kraal edit takes SERVER:PATH".into()),
+                    };
+                }
+                if !production && let Some(why) = self.server_production(&server) {
+                    return RequestOutcome::Immediate {
+                        reply,
+                        result: Err(format!("{} is production ({why}): pass --production to edit there", server.name)),
+                    };
+                }
+                // Create a workspace, if needed, once the file is ready for its editor.
+                let ws = match near.and_then(|n| self.workspace_of(n)) {
+                    Some((wi, _)) => Some(self.workspaces[wi].id),
+                    None => self.available_workspace(None),
+                };
+                // Told about saves and asked about changes: a client showing that workspace.
+                let shows = |c: &&super::Client| c.attached && Some(c.workspace) == ws;
+                let viewer = self.primary.filter(|p| self.clients.get(p).is_some_and(|c| shows(&c)));
+                let viewer = viewer.or_else(|| self.clients.values().find(shows).map(|c| c.id)).or(self.primary);
+                let mut ssh = self.ssh_options(&server);
+                ssh.push(server.destination());
+                let target = super::edits::EditTarget { server: server.name.clone(), ssh, path, line, ws, near, sudo };
+                self.start_edit(viewer, target, Some(reply));
+                return RequestOutcome::Deferred;
+            }
+            _ => unreachable!("launch request"),
+        };
+        RequestOutcome::Immediate { reply, result }
+    }
+
+    fn answer_wait(
+        &mut self,
+        reply: ReplyHandle,
+        pane: String,
+        until: Vec<String>,
+        timeout_ms: Option<u64>,
+    ) -> RequestOutcome {
+        let result = match self.resolve(&pane) {
+            Ok(p) => {
+                let until = if until.is_empty() {
+                    vec!["blocked".into(), "done".into(), "idle".into(), "exit".into()]
+                } else {
+                    until
+                };
+                for u in &until {
+                    if !matches!(u.as_str(), "exit" | "quiet") && AgentState::parse(u).is_none() {
+                        return RequestOutcome::Immediate {
+                            reply,
+                            result: Err(format!(
+                                "unknown condition {u:?} (use working, blocked, done, idle, exit, quiet)"
+                            )),
+                        };
+                    }
+                }
+                self.add_wait(reply, p, until, timeout_ms.map(Duration::from_millis));
+                return RequestOutcome::Deferred;
+            }
+            Err(e) => Err(e),
+        };
+        RequestOutcome::Immediate { reply, result }
+    }
+
+    fn answer_shutdown(&mut self, reply: ReplyHandle, restart: bool) -> RequestOutcome {
+        if restart && let Err(e) = self.save_now() {
+            let why = format!("not restarting: {e}");
+            self.warnings.push(why.clone());
+            return RequestOutcome::Immediate { reply, result: Err(why) };
+        }
+        self.quitting = true;
+        self.restarting |= restart;
+        self.kill_waiters.push(reply);
+        RequestOutcome::Deferred
+    }
+
+    fn answer_immediate(&mut self, client: ClientId, req: Request) -> Result<Response, String> {
+        match req {
             Request::Ping => Ok(Response::Pong {
                 pid: std::process::id(),
                 session: self.session.clone(),
@@ -88,32 +317,6 @@ impl Server {
             Request::OpenWorkspace { name } => {
                 self.open_workspace(&name).map(|_| Response::Ok).map_err(|e| format!("{e:#}"))
             }
-            req @ Request::NewPane { .. } => {
-                // A kraal worktree git has not been asked about yet gives its number to the
-                // pane's variables: git is asked first, off the loop, and the pane opens once it
-                // has answered.
-                let unknown = match &req {
-                    Request::NewPane { cwd: Some(dir), .. } if self.worktree_unknown(dir) => Some(dir.clone()),
-                    _ => None,
-                };
-                if let Some(dir) = unknown {
-                    self.background(
-                        move || {
-                            let info = crate::git::status(&dir);
-                            (dir, info)
-                        },
-                        move |server, (dir, info)| {
-                            server.git_result(dir, info.map(Box::new));
-                            let result = server.with_workspace_cleanup(|server| server.new_pane(req));
-                            server.send_msg(client, &ServerMsg::Response { result });
-                            server.clients.remove(&client);
-                        },
-                    );
-                    return None;
-                }
-                self.new_pane(req)
-            }
-
             Request::ClosePane { pane } => self.resolve(&pane).map(|p| {
                 self.close_pane(p);
                 Response::Ok
@@ -166,25 +369,6 @@ impl Server {
             Request::ReadPane { pane, lines } => {
                 self.resolve(&pane).map(|p| Response::Text(self.panes[&p].text(lines)))
             }
-            Request::Wait { pane, until, timeout_ms } => match self.resolve(&pane) {
-                Ok(p) => {
-                    let until = if until.is_empty() {
-                        vec!["blocked".into(), "done".into(), "idle".into(), "exit".into()]
-                    } else {
-                        until
-                    };
-                    for u in &until {
-                        if !matches!(u.as_str(), "exit" | "quiet") && AgentState::parse(u).is_none() {
-                            return Some(Err(format!(
-                                "unknown condition {u:?} (use working, blocked, done, idle, exit, quiet)"
-                            )));
-                        }
-                    }
-                    self.add_wait(client, p, until, timeout_ms.map(Duration::from_millis));
-                    return None;
-                }
-                Err(e) => Err(e),
-            },
             Request::AgentReport { pane, agent, state, session_id, message } => self.resolve(&pane).map(|p| {
                 // Some agents run other agents' hooks (Cursor and Continue run Claude Code's):
                 // a report that names another agent than the one running here is not about it.
@@ -243,20 +427,16 @@ impl Server {
                 self.notify(NoticeKind::Notice, &title, &body, None);
                 Ok(Response::Ok)
             }
-            Request::ImportWorkspace { path, name, expected, accounts } => {
-                return Some(
-                    (|| {
-                        if let Some(expected) = expected {
-                            let name = name.context("Choose a workspace name.")?;
-                            self.import_layout(&path, &name, &expected, &accounts)?;
-                            Ok(Response::Ok)
-                        } else {
-                            self.preview_import(&path).map(Response::ImportPreview)
-                        }
-                    })()
-                    .map_err(|e: anyhow::Error| format!("{e:#}")),
-                );
-            }
+            Request::ImportWorkspace { path, name, expected, accounts } => (|| {
+                if let Some(expected) = expected {
+                    let name = name.context("Choose a workspace name.")?;
+                    self.import_layout(&path, &name, &expected, &accounts)?;
+                    Ok(Response::Ok)
+                } else {
+                    self.preview_import(&path).map(Response::ImportPreview)
+                }
+            })()
+            .map_err(|e: anyhow::Error| format!("{e:#}")),
             Request::PublishWorkspaceFile { path, source, expected } => {
                 let sources =
                     self.workspaces.iter().filter_map(|w| Some((w.name.as_str(), w.definition.as_deref()?))).chain(
@@ -266,49 +446,39 @@ impl Server {
                     .map(|()| Response::Ok)
                     .map_err(|e| format!("{e:#}"))
             }
-            Request::ExportWorkspace { workspace, identity, path, expected } => {
-                return Some(
-                    (|| {
-                        let wi = if expected.is_some() {
-                            let identity = identity.context("Preview the workspace before exporting.")?;
-                            self.workspaces.iter().position(|w| w.stable_id == identity)
-                        } else {
-                            match workspace {
-                                Some(name) => self.named_workspace(&name)?,
-                                None => self.available_workspace(None).and_then(|id| self.ws_index(id)),
-                            }
-                        }
-                        .context("no such workspace")?;
-                        let save = self.prepare_layout_export(wi, &path)?;
-                        if let Some(expected) = expected {
-                            anyhow::ensure!(
-                                save.revision == expected,
-                                "File changed. Retry to review the destination."
-                            );
-                            self.write_definition(wi, &self.workspaces[wi].name.clone(), &save).map(Response::Path)
-                        } else {
-                            Ok(Response::ExportPreview {
-                                identity: self.workspaces[wi].stable_id.clone(),
-                                path: save.path,
-                                revision: save.revision,
-                                question: save.question,
-                            })
-                        }
-                    })()
-                    .map_err(|e: anyhow::Error| format!("{e:#}")),
-                );
-            }
+            Request::ExportWorkspace { workspace, identity, path, expected } => (|| {
+                let wi = if expected.is_some() {
+                    let identity = identity.context("Preview the workspace before exporting.")?;
+                    self.workspaces.iter().position(|w| w.stable_id == identity)
+                } else {
+                    match workspace {
+                        Some(name) => self.named_workspace(&name)?,
+                        None => self.available_workspace(None).and_then(|id| self.ws_index(id)),
+                    }
+                }
+                .context("no such workspace")?;
+                let save = self.prepare_layout_export(wi, &path)?;
+                if let Some(expected) = expected {
+                    anyhow::ensure!(save.revision == expected, "File changed. Retry to review the destination.");
+                    self.write_definition(wi, &self.workspaces[wi].name.clone(), &save).map(Response::Path)
+                } else {
+                    Ok(Response::ExportPreview {
+                        identity: self.workspaces[wi].stable_id.clone(),
+                        path: save.path,
+                        revision: save.revision,
+                        question: save.question,
+                    })
+                }
+            })()
+            .map_err(|e: anyhow::Error| format!("{e:#}")),
             Request::OpenSsh { target, group, placement, near, command } => {
                 if group {
                     let group = target.strip_prefix('@').unwrap_or(&target);
-                    return Some(self.open_group(group, &command).map(|_| Response::Ok).map_err(|e| format!("{e:#}")));
+                    return self.open_group(group, &command).map(|_| Response::Ok).map_err(|e| format!("{e:#}"));
                 }
-                let near = match near.as_deref().map(|n| self.resolve(n)).transpose() {
-                    Ok(n) => n,
-                    Err(e) => return Some(Err(e)),
-                };
+                let near = near.as_deref().map(|n| self.resolve(n)).transpose()?;
                 let Some(server) = self.resolve_server(&target) else {
-                    return Some(Err(format!("not a server: {target}")));
+                    return Err(format!("not a server: {target}"));
                 };
                 let ws = match near.and_then(|n| self.workspace_of(n)) {
                     Some((wi, _)) => self.workspaces[wi].id,
@@ -318,56 +488,8 @@ impl Server {
                     .map(|p| Response::Pane(Box::new(self.pane_info(p))))
                     .map_err(|e| format!("{e:#}"))
             }
-            Request::OpenAgent { agent, account, account_id, placement, near, cwd, args } => {
-                let account = match account_id {
-                    Some(id) => match self.accounts.by_id(&id).filter(|a| a.agent == agent) {
-                        Some(a) => Some(format!("@{}", a.id)),
-                        None => return Some(Err("the account was removed; choose an account again".into())),
-                    },
-                    None => account,
-                };
-                let near = match near.as_deref().map(|n| self.resolve(n)).transpose() {
-                    Ok(n) => n,
-                    Err(e) => return Some(Err(e)),
-                };
-                // The account rules may depend on which repository the directory belongs to (a
-                // worktree anywhere counts as its repository), and a kraal worktree not seen yet
-                // gives its number to the agent's variables: git is asked first, off the loop,
-                // and the agent starts once it has answered.
-                let ws = self.agent_workspace(near);
-                let dir = ws.and_then(|ws| self.agent_cwd(ws, near, cwd.clone()));
-                let undecided =
-                    account.is_none() && dir.as_ref().is_some_and(|d| self.accounts.undecided(&agent, Some(d)));
-                let new_worktree = dir
-                    .as_ref()
-                    .is_some_and(|d| crate::worktree_setup::in_worktrees_dir(d) && !self.git.contains_key(d));
-                if let Some(dir) = dir.filter(|_| undecided || new_worktree) {
-                    self.background(
-                        move || {
-                            crate::git::project_path(&dir);
-                            let info = new_worktree.then(|| crate::git::status(&dir)).flatten();
-                            (dir, info)
-                        },
-                        move |server, (dir, info)| {
-                            if info.is_some() {
-                                server.git_result(dir, info.map(Box::new));
-                            }
-                            let result = server.with_workspace_cleanup(|server| {
-                                server.open_agent(near, &agent, account.as_deref(), placement, cwd, &args)
-                            });
-                            server.send_msg(client, &ServerMsg::Response { result });
-                            server.clients.remove(&client);
-                        },
-                    );
-                    return None;
-                }
-                self.open_agent(near, &agent, account.as_deref(), placement, cwd, &args)
-            }
             Request::OpenFiles { left, right, near } => {
-                let near = match near.as_deref().map(|n| self.resolve(n)).transpose() {
-                    Ok(n) => n,
-                    Err(e) => return Some(Err(e)),
-                };
+                let near = near.as_deref().map(|n| self.resolve(n)).transpose()?;
                 let ws = match near.and_then(|n| self.workspace_of(n)) {
                     Some((wi, _)) => self.workspaces[wi].id,
                     None => self.available_workspace(None).unwrap_or_else(|| self.new_workspace("main".into(), None)),
@@ -375,42 +497,6 @@ impl Server {
                 self.open_files(ws, left, right)
                     .map(|p| Response::Pane(Box::new(self.pane_info(p))))
                     .map_err(|e| format!("{e:#}"))
-            }
-            Request::EditRemote { target, line, near, production, sudo } => {
-                let near = match near.as_deref().map(|n| self.resolve(n)).transpose() {
-                    Ok(n) => n,
-                    Err(e) => return Some(Err(e)),
-                };
-                let (server, path) = match crate::transfer::parse_endpoint(&target, &self.known_servers) {
-                    Ok(crate::transfer::Endpoint::Remote { server, path }) => (server, path),
-                    Ok(crate::transfer::Endpoint::Local(_)) => {
-                        return Some(Err(format!("{target} is not on a server: kraal edit takes SERVER:PATH")));
-                    }
-                    Err(e) => return Some(Err(format!("{e:#}"))),
-                };
-                if path.is_empty() {
-                    return Some(Err("which file? kraal edit takes SERVER:PATH".into()));
-                }
-                if !production && let Some(why) = self.server_production(&server) {
-                    return Some(Err(format!(
-                        "{} is production ({why}): pass --production to edit there",
-                        server.name
-                    )));
-                }
-                // Create a workspace, if needed, once the file is ready for its editor.
-                let ws = match near.and_then(|n| self.workspace_of(n)) {
-                    Some((wi, _)) => Some(self.workspaces[wi].id),
-                    None => self.available_workspace(None),
-                };
-                // Told about saves and asked about changes: a client showing that workspace.
-                let shows = |c: &&super::Client| c.attached && Some(c.workspace) == ws;
-                let viewer = self.primary.filter(|p| self.clients.get(p).is_some_and(|c| shows(&c)));
-                let viewer = viewer.or_else(|| self.clients.values().find(shows).map(|c| c.id)).or(self.primary);
-                let mut ssh = self.ssh_options(&server);
-                ssh.push(server.destination());
-                let target = super::edits::EditTarget { server: server.name.clone(), ssh, path, line, ws, near, sudo };
-                self.start_edit(viewer, target, Some(client));
-                return None;
             }
             Request::TunnelAdd { server, remote, local } => self
                 .add_tunnel(&server, &remote, local)
@@ -431,21 +517,15 @@ impl Server {
             }),
             Request::BufferDelete { buffer, all } => self.delete_buffer(buffer.as_deref(), all),
             Request::ReloadConfig => self.reload_config().map(|warnings| Response::Text(warnings.join("\n"))),
-            // Answered when the server stops, once its last state is written or has failed to
-            // be: `kraal kill` then says whether the layout a restart brings back is saved. A
-            // restart stops every program only once that layout is on disk.
-            Request::KillServer { restart } => {
-                if restart && let Err(e) = self.save_now() {
-                    let why = format!("not restarting: {e}");
-                    self.warnings.push(why.clone());
-                    return Some(Err(why));
-                }
-                self.quitting = true;
-                self.restarting |= restart;
-                self.kill_waiters.push(client);
-                return None;
-            }
-        })
+            Request::RunbookPlan { .. }
+            | Request::RunbookRun { .. }
+            | Request::Subscribe { .. }
+            | Request::NewPane { .. }
+            | Request::OpenAgent { .. }
+            | Request::EditRemote { .. }
+            | Request::Wait { .. }
+            | Request::KillServer { .. } => unreachable!("request family dispatched"),
+        }
     }
 
     /// Open a pane as `kraal run` asks.
@@ -580,9 +660,16 @@ impl Server {
 }
 
 impl Server {
-    pub(super) fn add_wait(&mut self, client: ClientId, pane: PaneId, until: Vec<String>, timeout: Option<Duration>) {
-        let Some(c) = self.clients.remove(&client) else { return };
-        self.waits.push(PendingWait { client, out: c.out, pane, until, deadline: timeout.map(|t| Instant::now() + t) });
+    pub(super) fn add_wait(
+        &mut self,
+        mut reply: ReplyHandle,
+        pane: PaneId,
+        until: Vec<String>,
+        timeout: Option<Duration>,
+    ) {
+        let Some(c) = self.clients.remove(&reply.client()) else { return };
+        reply.out = Some(c.out);
+        self.waits.push(PendingWait { reply, pane, until, deadline: timeout.map(|t| Instant::now() + t) });
         self.check_waits();
     }
 
@@ -612,10 +699,7 @@ impl Server {
             match result {
                 Some(result) => {
                     let w = self.waits.remove(i);
-                    let mut buf = Vec::new();
-                    if protocol::write_json(&mut buf, &ServerMsg::Response { result }).is_ok() {
-                        let _ = w.out.send_timeout(buf, Duration::from_millis(200));
-                    }
+                    w.reply.complete(self, result);
                 }
                 None => i += 1,
             }
@@ -624,8 +708,266 @@ impl Server {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
+
+    use crate::server::{
+        persistence::tests::writer,
+        tests::{client, server},
+    };
+    use crate::testing::PATIENCE;
+
+    pub(in crate::server) fn response(receive: &crossbeam_channel::Receiver<Vec<u8>>) -> Result<Response, String> {
+        let frame = receive.recv_timeout(PATIENCE).unwrap();
+        let (kind, payload) = protocol::read_frame(&mut frame.as_slice()).unwrap().unwrap();
+        assert_eq!(kind, protocol::JSON);
+        let ServerMsg::Response { result } = serde_json::from_slice(&payload).unwrap() else {
+            panic!("expected a response");
+        };
+        result
+    }
+
+    pub(in crate::server) fn finish_job(server: &mut Server, rx: &crate::server::queue::EventReceiver) {
+        loop {
+            let event = rx.recv_timeout(PATIENCE).unwrap();
+            if matches!(event, crate::server::Event::Job(..)) {
+                server.handle(event);
+                return;
+            }
+        }
+    }
+
+    fn files(server: &mut Server) -> PaneId {
+        let Response::Pane(pane) = server
+            .request(0, Request::OpenFiles { left: "/missing".into(), right: "/missing".into(), near: None })
+            .immediate()
+            .unwrap()
+        else {
+            panic!("files pane")
+        };
+        pane.id
+    }
+
+    #[test]
+    fn immediate_replies_answer_once_and_release_the_connection() {
+        let (tx, _rx) = crate::server::event_channel(32);
+        let mut server = server(tx);
+        for req in [Request::Ping, Request::Unknown(serde_json::json!({"cmd": "future_request"}))] {
+            let success = matches!(req, Request::Ping);
+            let (id, _peer) = client(&mut server);
+            let receive = server.clients.get_mut(&id).unwrap().out.capture();
+            let RequestOutcome::Immediate { reply, result } = server.request(id, req) else {
+                panic!("immediate reply");
+            };
+            assert!(receive.is_empty());
+            reply.complete(&mut server, result);
+            if success {
+                assert!(matches!(response(&receive), Ok(Response::Pong { protocol: protocol::PROTOCOL_VERSION, .. })));
+            } else {
+                assert_eq!(
+                    response(&receive).unwrap_err(),
+                    protocol::unsupported(&serde_json::json!({"cmd": "future_request"}))
+                );
+            }
+            assert!(!server.clients.contains_key(&id));
+            assert!(matches!(receive.try_recv(), Err(crossbeam_channel::TryRecvError::Disconnected)));
+        }
+    }
+
+    #[test]
+    fn waits_own_the_connection_until_a_condition_timeout_or_closed_pane() {
+        for end in ["already done", "done", "timeout", "closed"] {
+            let (tx, _rx) = crate::server::event_channel(32);
+            let mut server = server(tx);
+            let pane = files(&mut server);
+            server.panes.get_mut(&pane).unwrap().agent.set(if end == "already done" {
+                AgentState::Done
+            } else {
+                AgentState::Working
+            });
+            let (id, _peer) = client(&mut server);
+            let receive = server.clients.get_mut(&id).unwrap().out.capture();
+            let outcome = server.request(
+                id,
+                Request::Wait { pane: pane.to_string(), until: vec!["done".into()], timeout_ms: Some(60_000) },
+            );
+            assert!(matches!(outcome, RequestOutcome::Deferred));
+            assert!(!server.clients.contains_key(&id));
+            if end != "already done" {
+                assert!(receive.is_empty());
+                assert_eq!(server.waits.len(), 1);
+                match end {
+                    "done" => {
+                        server.panes.get_mut(&pane).unwrap().agent.set(AgentState::Done);
+                    }
+                    "timeout" => server.waits[0].deadline = Some(Instant::now()),
+                    "closed" => {
+                        server.panes.remove(&pane);
+                    }
+                    _ => unreachable!(),
+                }
+                server.check_waits();
+            }
+            match end {
+                "timeout" => assert_eq!(response(&receive).unwrap_err(), "timeout"),
+                "closed" => assert_eq!(response(&receive).unwrap_err(), "pane closed"),
+                _ => assert!(matches!(response(&receive), Ok(Response::Pane(p)) if p.id == pane)),
+            }
+            assert!(server.waits.is_empty());
+            server.check_waits();
+            assert!(matches!(receive.try_recv(), Err(crossbeam_channel::TryRecvError::Disconnected)));
+        }
+    }
+
+    #[test]
+    fn disconnected_waits_are_removed_without_closing_the_pane() {
+        let (tx, _rx) = crate::server::event_channel(32);
+        let mut server = server(tx);
+        let pane = files(&mut server);
+        let (id, _peer) = client(&mut server);
+        let receive = server.clients.get_mut(&id).unwrap().out.capture();
+        let invalid = server
+            .request(id, Request::Wait { pane: pane.to_string(), until: vec!["invalid".into()], timeout_ms: None });
+        assert_eq!(
+            invalid.immediate().unwrap_err(),
+            "unknown condition \"invalid\" (use working, blocked, done, idle, exit, quiet)"
+        );
+        assert!(server.waits.is_empty());
+        assert!(server.clients.contains_key(&id));
+        assert!(matches!(
+            server.request(id, Request::Wait { pane: pane.to_string(), until: vec!["exit".into()], timeout_ms: None }),
+            RequestOutcome::Deferred
+        ));
+        server.drop_client(id);
+        assert!(server.waits.is_empty());
+        assert!(server.panes.contains_key(&pane));
+        assert!(matches!(receive.try_recv(), Err(crossbeam_channel::TryRecvError::Disconnected)));
+    }
+
+    #[test]
+    fn dropping_or_completing_after_disconnect_does_not_send_an_extra_response() {
+        let (tx, _rx) = crate::server::event_channel(32);
+        let mut server = server(tx);
+        let (id, _peer) = client(&mut server);
+        let receive = server.clients.get_mut(&id).unwrap().out.capture();
+        let reply = ReplyHandle::new(id);
+        drop(reply);
+        assert!(receive.is_empty());
+        assert!(server.clients.contains_key(&id));
+        let reply = ReplyHandle::new(id);
+        server.drop_client(id);
+        reply.complete(&mut server, Ok(Response::Ok));
+        assert!(matches!(receive.try_recv(), Err(crossbeam_channel::TryRecvError::Disconnected)));
+    }
+
+    #[test]
+    fn shutdown_replies_follow_the_final_save_attempt() {
+        for failure in [false, true] {
+            let (tx, _rx) = crate::server::event_channel(32);
+            let mut server = server(tx);
+            let saved = writer(&mut server, vec![if failure { Err("disk full".into()) } else { Ok(()) }]);
+            let (id, _peer) = client(&mut server);
+            let receive = server.clients.get_mut(&id).unwrap().out.capture();
+            assert!(matches!(server.request(id, Request::KillServer { restart: false }), RequestOutcome::Deferred));
+            assert!(receive.is_empty());
+            assert!(saved.lock().unwrap().is_empty());
+            assert_eq!(server.kill_waiters.len(), 1);
+            server.shutdown();
+            assert_eq!(saved.lock().unwrap().len(), 1);
+            if failure {
+                let Response::Text(text) = response(&receive).unwrap() else { panic!("save failure") };
+                assert!(text.contains("disk full"));
+            } else {
+                assert!(matches!(response(&receive), Ok(Response::Ok)));
+            }
+            assert!(server.kill_waiters.is_empty());
+            assert!(matches!(receive.try_recv(), Err(crossbeam_channel::TryRecvError::Disconnected)));
+        }
+    }
+
+    #[test]
+    fn restart_refusal_is_immediate_and_disconnect_does_not_cancel_shutdown() {
+        let (tx, _rx) = crate::server::event_channel(32);
+        let mut server = server(tx);
+        let saved = writer(&mut server, vec![Err("disk full".into()), Ok(()), Ok(())]);
+        let (id, _peer) = client(&mut server);
+        let receive = server.clients.get_mut(&id).unwrap().out.capture();
+        let error = server.request(id, Request::KillServer { restart: true }).immediate().unwrap_err();
+        assert!(error.starts_with("not restarting: "));
+        assert!(error.contains("disk full"));
+        assert!(!server.quitting);
+        assert!(!server.restarting);
+        assert!(server.kill_waiters.is_empty());
+        assert!(matches!(server.request(id, Request::KillServer { restart: true }), RequestOutcome::Deferred));
+        assert!(receive.is_empty());
+        assert_eq!(saved.lock().unwrap().len(), 2);
+        server.drop_client(id);
+        server.workspaces[0].name = "changed before shutdown".into();
+        server.shutdown();
+        assert_eq!(saved.lock().unwrap().len(), 3);
+        assert!(server.quitting && server.restarting);
+        assert!(server.kill_waiters.is_empty());
+        assert!(matches!(receive.try_recv(), Err(crossbeam_channel::TryRecvError::Disconnected)));
+    }
+
+    #[test]
+    fn git_lookup_replies_preserve_completion_disconnect_and_start_failure() {
+        for mode in ["completed", "disconnected", "start failure"] {
+            for agent in [false, true] {
+                let (tx, rx) = crate::server::event_channel(32);
+                let mut server = server(tx);
+                let dir = crate::testing::TempDir::new("reply-launch");
+                let cwd = dir.mkdir("app.worktrees/topic");
+                let (id, _peer) = client(&mut server);
+                let receive = server.clients.get_mut(&id).unwrap().out.capture();
+                let req = if agent {
+                    let Request::OpenAgent { agent, account, account_id, placement, near, args, .. } =
+                        missing_account()
+                    else {
+                        unreachable!()
+                    };
+                    Request::OpenAgent { agent, account, account_id, placement, near, cwd: Some(cwd), args }
+                } else {
+                    Request::NewPane {
+                        target: None,
+                        command: vec!["true".into()],
+                        cwd: Some(cwd),
+                        name: None,
+                        placement: protocol::Placement::Tab,
+                        preview: None,
+                        focus: false,
+                        close_on_exit: false,
+                    }
+                };
+                super::super::jobs::FAIL_START.set(mode == "start failure");
+                assert!(matches!(server.request(id, req), RequestOutcome::Deferred));
+                assert!(receive.is_empty());
+                if mode == "start failure" {
+                    assert!(server.jobs.is_empty());
+                    assert!(server.clients.contains_key(&id));
+                    assert!(server.panes.is_empty());
+                    assert_eq!(server.warnings, ["cannot start a background job: thread start failed"]);
+                    continue;
+                }
+                if mode == "disconnected" {
+                    server.drop_client(id);
+                }
+                let _batch = crate::pane::batch();
+                finish_job(&mut server, &rx);
+                if mode != "disconnected" {
+                    if agent {
+                        assert!(response(&receive).unwrap_err().contains("missing"));
+                    } else {
+                        assert!(matches!(response(&receive), Ok(Response::Pane(_))));
+                    }
+                }
+                assert_eq!(server.panes.len(), usize::from(!agent));
+                assert!(!server.clients.contains_key(&id));
+                assert!(server.jobs.is_empty());
+                assert!(matches!(receive.try_recv(), Err(crossbeam_channel::TryRecvError::Disconnected)));
+            }
+        }
+    }
 
     fn missing_account() -> Request {
         Request::OpenAgent {
@@ -643,10 +985,10 @@ mod tests {
     fn failed_requests_remove_only_the_empty_workspaces_they_created() {
         let (tx, _rx) = crate::server::event_channel(4096);
         let mut server = super::super::tests::server(tx);
-        assert!(server.request(0, missing_account()).unwrap().is_err());
+        assert!(server.request(0, missing_account()).immediate().is_err());
         assert!(server.workspaces.is_empty());
         let existing = server.new_workspace("empty".into(), None);
-        assert!(server.request(0, missing_account()).unwrap().is_err());
+        assert!(server.request(0, missing_account()).immediate().is_err());
         assert_eq!(server.workspaces.len(), 1);
         assert_eq!(server.workspaces[0].id, existing);
         assert!(server.workspaces[0].tabs.is_empty());
@@ -674,10 +1016,10 @@ mod tests {
             focus: false,
             close_on_exit: false,
         };
-        let Response::Pane(pane) = server.request(0, request).unwrap().unwrap() else { panic!("new pane") };
+        let Response::Pane(pane) = server.request(0, request).immediate().unwrap() else { panic!("new pane") };
         assert_eq!(pane.workspace, "b");
         let request = Request::OpenFiles { left: "/missing".into(), right: "/missing".into(), near: None };
-        let Response::Pane(files) = server.request(0, request).unwrap().unwrap() else { panic!("files pane") };
+        let Response::Pane(files) = server.request(0, request).immediate().unwrap() else { panic!("files pane") };
         assert_eq!(files.workspace, "b");
         assert!(server.workspaces[0].closed());
         assert!(server.workspaces[0].panes().is_empty());
