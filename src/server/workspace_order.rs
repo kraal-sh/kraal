@@ -142,18 +142,17 @@ impl Server {
             }
         }
         self.sort_workspaces();
-        if let Err(error) = self.save_now() {
-            self.workspace_order = old;
-            self.workspaces.sort_by_key(|w| previous.iter().position(|id| *id == w.id));
-            // A timed-out writer may still finish; the original order must follow that write.
-            let message = match self.save_now() {
-                Ok(()) => format!("Couldn't save the order. Previous order kept.\n{error}"),
-                Err(rollback) => {
-                    self.mark_persist();
-                    format!(
-                        "Couldn't save the order or confirm its rollback. Previous order kept on screen.\nThe saved order may differ. Fix the save error and retry.\n{error}\n{rollback}"
-                    )
+        if let Err(failure) = self.save_reversible(|server| {
+            server.workspace_order = old;
+            server.workspaces.sort_by_key(|w| previous.iter().position(|id| *id == w.id));
+        }) {
+            let message = match failure {
+                super::persistence::SaveFailure::Initial(error) => {
+                    format!("Couldn't save the order. Previous order kept.\n{error}")
                 }
+                super::persistence::SaveFailure::Rollback { error, rollback } => format!(
+                    "Couldn't save the order or confirm its rollback. Previous order kept on screen.\nThe saved order may differ. Fix the save error and retry.\n{error}\n{rollback}"
+                ),
             };
             return Mode::confirm(message, ConfirmAction::ReorderWorkspace { workspace, neighbor, before, order });
         }

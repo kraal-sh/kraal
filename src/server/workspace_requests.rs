@@ -1,8 +1,6 @@
 //! CLI workspace operations use the same durable mutations as the Workspaces list.
 
 use super::Server;
-use super::persistence::ClosePane;
-use super::ui::Mode;
 use super::workspace_lifecycle::DeleteTarget;
 use crate::protocol::{Request, Response};
 
@@ -79,12 +77,6 @@ impl Server {
         }
     }
 
-    fn workspace_stop_revision(&self, ws: u32, delete: bool) -> String {
-        let w = &self.workspaces[self.ws_index(ws).unwrap()];
-        let panes: Vec<_> = w.panes().iter().filter_map(|p| self.panes.get(p).map(ClosePane::read)).collect();
-        serde_json::to_string(&(delete, &w.stable_id, &w.name, panes)).unwrap()
-    }
-
     fn stop_workspace_request(
         &mut self,
         reference: &str,
@@ -92,92 +84,22 @@ impl Server {
         delete: bool,
     ) -> Result<Response, String> {
         let target = self.workspace_target(reference)?;
-        let (workspace, revision, question) = match &target {
-            DeleteTarget::Workspace(ws) => {
-                let w = &self.workspaces[self.ws_index(*ws).unwrap()];
-                if !delete && w.delete_pending {
-                    return Err(
-                        "This workspace has an unfinished Delete. Retry `kraal workspaces delete` with its name or ID."
-                            .into(),
-                    );
-                }
-                let revision = self.workspace_stop_revision(*ws, delete);
-                let question = if delete {
-                    let Mode::Confirm(q) = self.ask_delete_workspace(target.clone()) else { unreachable!() };
-                    Some(q.message)
-                } else {
-                    self.stops(Some(*ws)).map(|stops| format!("Close {}?\n{stops}\n\nThe layout will be kept.\nUnsaved work in these programs may be lost.", w.name))
-                };
-                (w.stable_id.clone(), revision, question)
-            }
-            DeleteTarget::Source(path) => {
-                if !delete {
-                    return Err("This workspace file is already Closed. No programs were stopped.".into());
-                }
-                let revision = crate::paths::FileRevision::read(path).map_err(|e| format!("{e:#}"))?;
-                #[cfg(test)]
-                let revision = tests::source_revision(revision);
-                let revision = serde_json::to_string(&(delete, path, revision))
-                    .map_err(|e| format!("Couldn't prepare workspace deletion: {e}"))?;
-                let Mode::Confirm(q) = self.ask_delete_workspace(target.clone()) else { unreachable!() };
-                (reference.to_string(), revision, Some(q.message))
-            }
-        };
+        let prepared = self.prepare_workspace_stop(target, delete)?;
+        let revision = prepared.revision()?;
         let Some(expected) = expected else {
-            return Ok(Response::WorkspacePreview { workspace, revision, question });
+            let workspace = prepared.workspace().unwrap_or(reference).to_string();
+            return Ok(Response::WorkspacePreview { workspace, revision, question: prepared.warning });
         };
-        if expected != revision {
-            return Err(
-                "The workspace or its programs changed. Nothing was stopped. Run the command again to review them."
-                    .into(),
-            );
-        }
-        match target {
-            DeleteTarget::Workspace(ws) => {
-                let check = |server: &Self| {
-                    if server.workspace_stop_revision(ws, delete) == expected {
-                        Ok(())
-                    } else {
-                        Err("The workspace or its programs changed. Nothing was stopped. Run the command again to review them.".into())
-                    }
-                };
-                let result = if delete {
-                    self.keep_and_delete_workspace_checked(ws, check).map(|_| ())
-                } else {
-                    self.keep_and_close_workspace_checked(ws, check)
-                };
-                if let Err(error) = result {
-                    if let Some(wi) = self.ws_index(ws)
-                        && (!delete || self.workspaces[wi].delete_pending)
-                    {
-                        self.workspaces[wi].close_error = Some(error.clone());
-                    }
-                    return Err(error);
-                }
-            }
-            DeleteTarget::Source(path) => {
-                self.delete_workspace_source(&path)?;
-            }
-        }
+        self.finish_workspace_stop(prepared, &expected)?;
         Ok(Response::Ok)
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use super::super::workspace_lifecycle::tests::SOURCE_REVISION_TARGET;
     use super::*;
     use crate::server::{persistence::tests::writer, queue, tests};
-
-    thread_local! {
-        static SOURCE_REVISION_TARGET: std::cell::RefCell<Option<std::path::PathBuf>> = const { std::cell::RefCell::new(None) };
-    }
-
-    pub(super) fn source_revision(mut revision: crate::paths::FileRevision) -> crate::paths::FileRevision {
-        if let Some(target) = SOURCE_REVISION_TARGET.with_borrow_mut(Option::take) {
-            revision.target = target;
-        }
-        revision
-    }
 
     fn request(server: &mut Server, request: Request) -> Result<Response, String> {
         server.request(0, request).unwrap()

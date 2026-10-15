@@ -944,3 +944,18 @@ layout {
 "#;
     assert!(parse_workspace("fine", fine).is_ok(), "{:?}", parse_workspace("fine", fine));
 }
+
+#[test]
+fn exports_choose_a_kdl_backup_beside_the_resolved_target() {
+    let dir = crate::testing::TempDir::new("export-backup-policy");
+    let target = dir.write("personal.txt", "// old layout\nlayout { pane; }");
+    let link = dir.0.join("export.kdl");
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+    let expected = crate::paths::FileRevision::read(&link).unwrap();
+    let definition = parse_workspace("personal", "layout { pane command=\"true\"; }").unwrap();
+    let source = save_file(&link, &definition, &expected).unwrap();
+    assert_eq!(fs::read_to_string(&target).unwrap(), source);
+    assert_eq!(fs::read_to_string(target.with_extension("kdl.bak")).unwrap(), "// old layout\nlayout { pane; }");
+    assert!(!link.with_extension("kdl.bak").exists());
+    assert_eq!(fs::read_link(&link).unwrap(), target);
+}

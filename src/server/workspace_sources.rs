@@ -152,18 +152,16 @@ impl Server {
             .collect();
         let _ = self.persister.send(super::persistence::Persist::RetainScrollback(retained));
         self.install_source_layout(wi, next);
-        if let Err(e) = self.save_now() {
-            self.install_source_layout(wi, old);
-            let rollback = self.save_now();
+        if let Err(failure) = self.save_reversible(|server| server.install_source_layout(wi, old)) {
             let _ = self.persister.send(super::persistence::Persist::RetainScrollback(Default::default()));
             self.mark_persist();
-            anyhow::bail!(
-                "Programs stopped. The previous layout is kept closed. Retry {action}.\n{e}{}",
-                rollback
-                    .err()
-                    .map(|e| format!("\nCouldn't confirm the rollback: {e}. Retry before restarting."))
-                    .unwrap_or_default()
-            );
+            let (error, rollback) = match failure {
+                super::persistence::SaveFailure::Initial(error) => (error, String::new()),
+                super::persistence::SaveFailure::Rollback { error, rollback } => {
+                    (error, format!("\nCouldn't confirm the rollback: {rollback}. Retry before restarting."))
+                }
+            };
+            anyhow::bail!("Programs stopped. The previous layout is kept closed. Retry {action}.\n{error}{rollback}");
         }
         let _ = self.persister.send(super::persistence::Persist::RetainScrollback(Default::default()));
         self.refresh_source_status();

@@ -5,12 +5,11 @@ use std::path::PathBuf;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 
-use super::ui::{Mode, Picker, PickerState, Prompt, PromptAction};
+use super::ui::{ConfirmAction, Mode, PickAction, PickItem, Picker, PickerKind, PickerState, Prompt, PromptAction};
+use super::workspace_lifecycle::DeleteTarget;
 use super::{ClientId, Server, forms, overlays};
 use crate::ansi::Cursor;
 use crate::input::InputEvent;
-use crate::pane::PaneSpec;
-use crate::protocol::Placement;
 use crate::theme::NoticeKind;
 
 #[derive(Default)]
@@ -249,6 +248,127 @@ pub(super) fn draw_form(p: &Prompt, screen: Rect, buf: &mut Buffer) -> Option<Cu
 }
 
 impl Server {
+    pub(super) fn delete_workspace(&mut self, client: ClientId, target: DeleteTarget) -> Mode {
+        let result = match &target {
+            DeleteTarget::Workspace(ws) => self.keep_and_delete_workspace(*ws),
+            DeleteTarget::Source(path) => self.delete_workspace_source(path),
+        };
+        match result {
+            Ok(identity) => {
+                self.refresh_workspace_pickers();
+                self.mark_dirty();
+                self.toast(client, NoticeKind::Notice, "Workspace deleted · Undo");
+                if let Some(c) = self.clients.get_mut(&client) {
+                    c.toast_action = Some((0, super::attention::ToastAction::RestoreWorkspace(identity.clone())));
+                }
+                let mut picker = self.workspace_picker(self.clients.get(&client).map_or(0, |c| c.workspace));
+                picker.undo = Some(identity);
+                picker.result(NoticeKind::Notice, "Workspace deleted")
+            }
+            Err(message) => {
+                if let DeleteTarget::Workspace(ws) = target
+                    && let Some(wi) = self.ws_index(ws)
+                    && self.workspaces[wi].delete_pending
+                {
+                    self.workspaces[wi].close_error = Some(message.clone());
+                }
+                self.refresh_workspace_pickers();
+                self.mark_dirty();
+                Mode::confirm(message, ConfirmAction::RetryDeleteWorkspace(target))
+            }
+        }
+    }
+
+    pub(super) fn deleted_workspace_picker(&self) -> Picker {
+        let items = self
+            .deleted_workspaces
+            .iter()
+            .rev()
+            .map(|d| {
+                let (tabs, panes) = d.workspace.counts();
+                let days = crate::accounts::now().saturating_sub(d.deleted_at).max(0) / 86400;
+                let when = if days == 0 {
+                    "Deleted today".into()
+                } else {
+                    format!("Deleted {days} day{} ago", super::input::plural(days as usize))
+                };
+                PickItem::new(
+                    &d.workspace.name,
+                    format!(
+                        "{when} · {tabs} tab{} · {panes} pane{}",
+                        super::input::plural(tabs),
+                        super::input::plural(panes)
+                    ),
+                    PickAction::RestoreWorkspace(d.workspace.id.clone()),
+                )
+            })
+            .collect();
+        Picker::new(PickerKind::DeletedWorkspaces, "Deleted workspaces", items)
+    }
+
+    pub(super) fn restore_workspace_mode(&mut self, client: ClientId, identity: &str, from: Option<&Picker>) -> Mode {
+        let Some(saved) = self.deleted_workspaces.iter().find(|d| d.workspace.id == identity) else {
+            return self.deleted_workspace_picker().result(NoticeKind::Notice, "Workspace already restored");
+        };
+        let name = saved.workspace.name.clone();
+        if self.workspace_name_used(&name, None, None) {
+            let base = format!("{name}-restored");
+            let proposed = self.available_workspace_name(&base);
+            let mut p = Prompt::new("Restore workspace", &proposed, PromptAction::RestoreWorkspace(identity.into()));
+            p.error = Some(format!("{name} is already used. Choose another name."));
+            self.workspace_restore_back(&mut p, from);
+            return Mode::Prompt(p);
+        }
+        self.restore_workspace_result(client, identity, &name, from)
+    }
+
+    pub(super) fn restore_workspace_result(
+        &mut self,
+        client: ClientId,
+        identity: &str,
+        name: &str,
+        from: Option<&Picker>,
+    ) -> Mode {
+        let had_source =
+            self.deleted_workspaces.iter().any(|d| d.workspace.id == identity && d.workspace.definition.is_some());
+        match self.restore_deleted_workspace(identity, name) {
+            Ok(ws) => {
+                self.refresh_workspace_pickers();
+                self.mark_dirty();
+                self.toast(client, NoticeKind::Notice, "Workspace restored");
+                let mut picker = self.workspace_picker(0);
+                picker.select(|i| i.action.workspace() == Some(ws));
+                let workspace = &self.workspaces[self.ws_index(ws).unwrap()];
+                if had_source && workspace.definition.is_none() {
+                    picker.result(
+                        NoticeKind::Warning,
+                        "Workspace restored · Source belongs to another workspace · Enter Open",
+                    )
+                } else {
+                    picker.result(NoticeKind::Notice, "Workspace restored · Enter Open")
+                }
+            }
+            Err(error) => {
+                let mut p = Prompt::new("Restore workspace", name, PromptAction::RestoreWorkspace(identity.into()));
+                p.error = Some(error);
+                self.workspace_restore_back(&mut p, from);
+                Mode::Prompt(p)
+            }
+        }
+    }
+
+    pub(super) fn ask_delete_workspace(&self, target: DeleteTarget) -> Mode {
+        let Some(warning) = self.delete_workspace_warning(&target) else {
+            return self.workspace_picker(0).result(NoticeKind::Warning, "Workspace unavailable");
+        };
+        let action = if warning.retry {
+            ConfirmAction::RetryDeleteWorkspace(target)
+        } else {
+            ConfirmAction::DeleteWorkspace { target, stop: warning.stop }
+        };
+        Mode::confirm(warning.message, action)
+    }
+
     pub(super) fn return_to_workspaces(&self, id: ClientId, mode: Mode, state: PickerState) -> Mode {
         match mode {
             Mode::Confirm(mut q) => {
@@ -315,10 +435,7 @@ impl Server {
                 .result(NoticeKind::Warning, "Workspace unavailable. Select a workspace to duplicate.");
         };
         let base = format!("{}-copy", self.workspaces[wi].name);
-        let name = std::iter::once(base.clone())
-            .chain((2..).map(|n| format!("{base}-{n}")))
-            .find(|n| !self.workspace_name_used(n, None, None))
-            .unwrap();
+        let name = self.available_workspace_name(&base);
         let mut p = Prompt::new("Duplicate workspace", &name, PromptAction::DuplicateWorkspace(ws));
         p.workspace_form.as_mut().unwrap().back = from.and_then(Picker::form_back);
         Mode::Prompt(p)
@@ -838,63 +955,14 @@ impl Server {
             }
         }
     }
-
-    pub(super) fn rename_workspace(&mut self, ws: u32, name: &str) -> Result<(), String> {
-        self.validate_workspace_name(name, Some(ws)).map_err(|e| e.to_string())?;
-        let wi =
-            self.ws_index(ws).ok_or("This workspace is no longer available. Cancel and choose another workspace.")?;
-        let old = std::mem::replace(&mut self.workspaces[wi].name, name.to_string());
-        if let Err(e) = self.save_now() {
-            self.workspaces[wi].name = old.clone();
-            // A timed-out writer may still finish. Confirm the original name is written after it.
-            if let Err(rollback) = self.save_now() {
-                self.mark_persist();
-                return Err(format!(
-                    "Couldn't save the name or confirm its rollback. The saved session may still use {name}.\nFix the save error and retry.\n{e}\n{rollback}"
-                ));
-            }
-            return Err(format!("Couldn't save the name. Still named {old}.\n{e}"));
-        }
-        Ok(())
-    }
-
-    pub(super) fn add_workspace(&mut self, name: &str, cwd: Option<PathBuf>) -> Result<u32, String> {
-        self.validate_workspace_name(name, None).map_err(|e| e.to_string())?;
-        if let Some(dir) = &cwd
-            && !dir.is_dir()
-        {
-            return Err(format!(
-                "The starting folder {} is no longer available. Restore it and retry, or cancel and open Add workspace from another folder.",
-                crate::paths::shorten_home(dir)
-            ));
-        }
-        let panes = self.panes.keys().copied().collect();
-        let workspaces: Vec<_> = self.workspaces.iter().map(|w| w.id).collect();
-        let ws = self.new_workspace(name.into(), None);
-        let wi = self.ws_index(ws).unwrap();
-        self.workspaces[wi].cwd = cwd.clone();
-        if let Err(e) = self.spawn_pane_in(ws, None, PaneSpec { cwd, ..Default::default() }, Placement::Tab, None) {
-            self.rollback(&panes, &workspaces);
-            return Err(format!("Couldn't start the shell. No workspace was added.\n{e:#}"));
-        }
-        if let Err(e) = self.save_now() {
-            self.rollback(&panes, &workspaces);
-            if let Err(rollback) = self.save_now() {
-                self.mark_persist();
-                return Err(format!(
-                    "Couldn't save the workspace or confirm its rollback. The saved session may still contain {name}.\nFix the save error and retry.\n{e}\n{rollback}"
-                ));
-            }
-            return Err(format!("Couldn't save the workspace. No workspace was added.\n{e}"));
-        }
-        Ok(ws)
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::input::{Key, KeySpec, MouseButton, MouseEvent, MouseKind};
+    use crate::pane::PaneSpec;
+    use crate::protocol::Placement;
     use crate::server::ui::PickAction;
 
     fn key(spec: &str) -> InputEvent {

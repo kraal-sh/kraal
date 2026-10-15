@@ -284,16 +284,18 @@ impl Server {
             // Keep a scanned export from appearing as a second workspace, including after a crash.
             self.removed_sources.push(save.path.clone());
         }
-        if let Err(e) = self.save_now() {
-            self.removed_sources = removed;
-            self.mark_persist();
-            let rollback = self.save_now();
+        if let Err(failure) = self.save_reversible(|server| {
+            server.removed_sources = removed.clone();
+            server.mark_persist();
+        }) {
+            let (error, rollback) = match failure {
+                super::persistence::SaveFailure::Initial(error) => (error, String::new()),
+                super::persistence::SaveFailure::Rollback { error, rollback } => {
+                    (error, format!("\nCouldn't restore the saved listing; retry will repair it.\n{rollback}"))
+                }
+            };
             anyhow::bail!(
-                "Couldn't prepare the export. The file is unchanged. Fix the save error and Retry.\n{e}{}",
-                rollback
-                    .err()
-                    .map(|e| format!("\nCouldn't restore the saved listing; retry will repair it.\n{e}"))
-                    .unwrap_or_default()
+                "Couldn't prepare the export. The file is unchanged. Fix the save error and Retry.\n{error}{rollback}"
             );
         }
         let source = match workspace::save_file(&save.path, &def, &save.revision) {

@@ -206,7 +206,7 @@ fn file_changed(path: &Path) -> std::io::Error {
 /// the old entry is moved aside and checked before a no-replace publication. An editor that
 /// creates the destination meanwhile wins; writes through its old descriptor stay in the
 /// backup. There is briefly no file at the destination, also after a crash at that point.
-pub fn write_checked(path: &Path, data: &[u8], expected: &FileRevision) -> std::io::Result<()> {
+pub fn write_checked(path: &Path, data: &[u8], expected: &FileRevision, backup: &Path) -> std::io::Result<()> {
     locked(&expected.target, || {
         if FileRevision::read(path)? != *expected {
             return Err(file_changed(path));
@@ -222,7 +222,7 @@ pub fn write_checked(path: &Path, data: &[u8], expected: &FileRevision) -> std::
             let kept = temp_beside(&expected.target).with_extension("recover");
             rename_no_replace(&expected.target, &kept)?;
             sync_dir(expected.target.parent().unwrap());
-            replace_kept(path, &tmp, &kept, expected)
+            replace_kept(path, &tmp, &kept, expected, backup)
         });
         let _ = std::fs::remove_file(&tmp);
         if result.is_ok() {
@@ -232,7 +232,13 @@ pub fn write_checked(path: &Path, data: &[u8], expected: &FileRevision) -> std::
     })?
 }
 
-pub(super) fn replace_kept(path: &Path, tmp: &Path, kept: &Path, expected: &FileRevision) -> std::io::Result<()> {
+pub(super) fn replace_kept(
+    path: &Path,
+    tmp: &Path,
+    kept: &Path,
+    expected: &FileRevision,
+    backup: &Path,
+) -> std::io::Result<()> {
     let mut recovery = kept.to_path_buf();
     let result = (|| {
         if file_id(kept) != expected.inode || read_regular(kept, u64::MAX)? != *expected.bytes.as_ref().unwrap() {
@@ -243,15 +249,14 @@ pub(super) fn replace_kept(path: &Path, tmp: &Path, kept: &Path, expected: &File
         if file_target(path)? != expected.target {
             return Err(file_changed(path));
         }
-        let backup = expected.target.with_extension("kdl.bak");
         // Rename the entry, never copy through a symlink at the backup's name.
-        std::fs::rename(kept, &backup).map_err(|e| {
+        std::fs::rename(kept, backup).map_err(|e| {
             std::io::Error::new(
                 e.kind(),
                 format!("keeping a backup at {}: {e}; fix that destination and retry", backup.display()),
             )
         })?;
-        recovery = backup;
+        recovery = backup.to_path_buf();
         sync_dir(recovery.parent().unwrap());
         rename_no_replace(tmp, &expected.target)
     })();
@@ -260,7 +265,7 @@ pub(super) fn replace_kept(path: &Path, tmp: &Path, kept: &Path, expected: &File
             sync_dir(expected.target.parent().unwrap());
             return Err(error);
         }
-        // Do not leave a failed save's recovery at .bak, which a later save would replace.
+        // A later save can replace the backup, so failed recovery must keep its own path.
         if recovery != kept && rename_no_replace(&recovery, kept).is_ok() {
             recovery = kept.to_path_buf();
         }
@@ -290,10 +295,19 @@ fn file_target(path: &Path) -> std::io::Result<PathBuf> {
     Err(std::io::Error::from_raw_os_error(libc::ELOOP))
 }
 
-/// Whether two definition paths reach the same file, including symlinks and hard links.
+/// Resolve the parent directory while keeping the final entry, so renaming a symlink
+/// acts on the link itself. Missing directories retain their original spelling.
+pub fn normalized_entry(path: &Path) -> PathBuf {
+    match (path.parent().and_then(|dir| std::fs::canonicalize(dir).ok()), path.file_name()) {
+        (Some(dir), Some(name)) => dir.join(name),
+        _ => path.to_path_buf(),
+    }
+}
+
+/// Whether two paths reach the same file, including symlinks and hard links.
 pub fn same_file(a: &Path, b: &Path) -> bool {
     use std::os::unix::fs::MetadataExt;
-    if crate::workspace::definition_path(a) == crate::workspace::definition_path(b) {
+    if normalized_entry(a) == normalized_entry(b) {
         return true;
     }
     if let (Ok(a), Ok(b)) = (std::fs::metadata(a), std::fs::metadata(b))

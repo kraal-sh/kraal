@@ -5,6 +5,7 @@ use std::path::Path;
 use anyhow::{Context, Result};
 
 use super::Server;
+use super::persistence::SaveFailure;
 use crate::{accounts, paths, workspace};
 use workspace::{ImportAccount, ImportPreview};
 
@@ -101,20 +102,20 @@ impl Server {
         self.bind_workspace_order(id);
         self.sort_workspaces();
         self.removed_sources.retain(|p| !paths::same_file(p, &preview.path));
-        if let Err(error) = self.save_now() {
-            self.rollback(&panes, &workspaces);
-            self.workspace_order = previous_order;
-            self.workspaces.sort_by_key(|w| workspaces.iter().position(|id| *id == w.id));
-            self.removed_sources = removed;
-            if let Err(rollback) = self.save_now() {
-                self.mark_persist();
-                anyhow::bail!(
+        if let Err(failure) = self.save_reversible(|server| {
+            server.rollback(&panes, &workspaces);
+            server.workspace_order = previous_order;
+            server.workspaces.sort_by_key(|w| workspaces.iter().position(|id| *id == w.id));
+            server.removed_sources = removed;
+        }) {
+            match failure {
+                SaveFailure::Initial(error) => anyhow::bail!(
+                    "Couldn't save the workspace. No workspace was added. Fix the save error and Retry.\n{error}"
+                ),
+                SaveFailure::Rollback { error, rollback } => anyhow::bail!(
                     "Couldn't save the workspace or confirm its rollback. The saved session may still contain {name}.\nFix the save error and Retry.\n{error}\n{rollback}"
-                );
-            }
-            anyhow::bail!(
-                "Couldn't save the workspace. No workspace was added. Fix the save error and Retry.\n{error}"
-            );
+                ),
+            };
         }
         self.refresh_workspace_pickers();
         self.mark_dirty();

@@ -42,8 +42,8 @@ const BUFFERS_RETRY: Duration = Duration::from_secs(10);
 /// What a workspace close approves, independently of its shortened display labels.
 #[derive(Debug, PartialEq, Eq)]
 pub struct CloseInventory {
-    name: String,
-    panes: Vec<ClosePane>,
+    pub(super) name: String,
+    pub(super) panes: Vec<ClosePane>,
 }
 
 #[derive(Debug, PartialEq, Eq, serde::Serialize)]
@@ -100,7 +100,29 @@ impl CloseProcess {
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum SaveFailure {
+    Initial(String),
+    Rollback { error: String, rollback: String },
+}
+
 impl Server {
+    pub(super) fn save_reversible(&mut self, rollback: impl FnOnce(&mut Self)) -> Result<(), SaveFailure> {
+        self.save_now().map_err(|error| self.rollback_save(error, rollback))
+    }
+
+    pub(super) fn rollback_save(&mut self, error: String, rollback: impl FnOnce(&mut Self)) -> SaveFailure {
+        rollback(self);
+        // A timed-out writer may still publish. Its cancellation must be queued after it.
+        match self.save_now() {
+            Ok(()) => SaveFailure::Initial(error),
+            Err(rollback) => {
+                self.mark_persist();
+                SaveFailure::Rollback { error, rollback }
+            }
+        }
+    }
+
     /// [`Server::persist`], unless the writer has not written the last state yet (a slow disk):
     /// then this one goes once that one is written, with what changed meanwhile, so that states
     /// never pile up.
@@ -307,17 +329,7 @@ impl Server {
         }
         let Some(stops) = self.stops(Some(ws)) else { return self.close_workspace(client, ws) };
         let workspace = &self.workspaces[wi];
-        let inventory = CloseInventory {
-            name: workspace.name.clone(),
-            panes: workspace
-                .panes()
-                .into_iter()
-                .filter_map(|id| {
-                    let pane = self.panes.get(&id)?;
-                    Some(ClosePane::read(pane))
-                })
-                .collect(),
-        };
+        let inventory = self.workspace_close_inventory(ws);
         Mode::Confirm(Question {
             title: Some(format!("Close {}?", workspace.name)),
             message: format!("{stops}\n\nThe layout will be kept.\nUnsaved work in these programs may be lost."),
@@ -594,6 +606,38 @@ pub(super) mod tests {
             }
         });
         saved
+    }
+
+    #[test]
+    fn reversible_saves_distinguish_failure_from_unconfirmed_rollback() {
+        for answers in
+            [vec![Ok(())], vec![Err("initial".into()), Ok(())], vec![Err("initial".into()), Err("rollback".into())]]
+        {
+            let (tx, _rx) = super::super::queue::channel(32);
+            let mut server = super::super::tests::server(tx);
+            server.new_workspace("changed".into(), None);
+            let saved = writer(&mut server, answers.clone());
+            let result = server.save_reversible(|server| server.workspaces[0].name = "original".into());
+            let saved = saved.lock().unwrap();
+            assert_eq!(saved.len(), answers.len());
+            assert_eq!(saved[0]["workspaces"][0]["name"], "changed");
+            if answers.len() == 1 {
+                assert_eq!(result, Ok(()));
+                assert_eq!(server.workspaces[0].name, "changed");
+            } else {
+                assert_eq!(saved[1]["workspaces"][0]["name"], "original");
+                assert_eq!(server.workspaces[0].name, "original");
+                if answers[1].is_err() {
+                    assert_eq!(
+                        result,
+                        Err(SaveFailure::Rollback { error: "initial".into(), rollback: "rollback".into() })
+                    );
+                    assert!(server.persist_dirty);
+                } else {
+                    assert_eq!(result, Err(SaveFailure::Initial("initial".into())));
+                }
+            }
+        }
     }
 
     fn workspace(server: &mut Server) -> u32 {
