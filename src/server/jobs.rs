@@ -323,8 +323,10 @@ mod tests {
             move |server, text| server.toast(client, crate::theme::NoticeKind::Notice, text)
         ));
         server.clients.remove(&client);
-        server.handle(rx.recv_timeout(PATIENCE).unwrap());
-        assert!(server.jobs.is_empty());
+        // Removing the client also ends its reader, whose ClientGone may arrive first.
+        while !server.jobs.is_empty() {
+            server.handle(rx.recv_timeout(PATIENCE).unwrap());
+        }
         assert!(server.clients.is_empty());
         assert!(server.warnings.is_empty());
     }
