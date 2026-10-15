@@ -229,17 +229,27 @@ mod tests {
     }
 
     #[test]
-    fn special_files_are_skipped_and_non_utf8_names_stay_inexact() {
+    fn special_files_are_skipped() {
         let home = TempDir::new("laptop-entries");
         let fifo = CString::new(home.0.join("fifo").as_os_str().as_bytes()).unwrap();
         // SAFETY: the test owns this directory and passes a NUL terminated path.
         assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
-        let name = std::ffi::OsStr::from_bytes(b"bad\xff");
-        std::fs::write(home.0.join(name), b"data").unwrap();
+        home.write("file", b"data");
+        let entries = list("~", &home.0, Scope::Home, false).unwrap().1;
+        assert_eq!(entries.len(), 1);
+        assert!(entries[0].exact);
+        assert_eq!(entries[0].size, 4);
+    }
+
+    // APFS refuses file names that are not UTF-8.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn non_utf8_names_stay_inexact() {
+        let home = TempDir::new("laptop-non-utf8");
+        std::fs::write(home.0.join(std::ffi::OsStr::from_bytes(b"bad\xff")), b"data").unwrap();
         let entries = list("~", &home.0, Scope::Home, false).unwrap().1;
         assert_eq!(entries.len(), 1);
         assert!(!entries[0].exact);
-        assert_eq!(entries[0].size, 4);
     }
 
     #[test]
