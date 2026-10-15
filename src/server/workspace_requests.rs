@@ -4,7 +4,7 @@ use super::Server;
 use super::persistence::ClosePane;
 use super::ui::Mode;
 use super::workspace_lifecycle::DeleteTarget;
-use crate::protocol::{Request, Response, WorkspaceInfo};
+use crate::protocol::{Request, Response};
 
 impl Server {
     pub(super) fn workspace_request(&mut self, request: Request) -> Result<Response, String> {
@@ -34,9 +34,9 @@ impl Server {
 
     fn answer_workspace(&mut self, request: Request) -> Result<Response, String> {
         match request {
-            Request::ListDeletedWorkspaces => Ok(Response::Workspaces(
-                self.deleted_workspaces.iter().rev().map(|d| deleted_info(&d.workspace)).collect(),
-            )),
+            Request::ListDeletedWorkspaces => {
+                Ok(Response::Workspaces(crate::workspace::catalog::deleted_infos(&self.deleted_workspaces)))
+            }
             Request::CreateWorkspace { name, cwd } => {
                 crate::workspace::validate_name(&name, false).map_err(|e| e.to_string())?;
                 self.add_workspace(name.trim(), Some(cwd))?;
@@ -160,21 +160,6 @@ impl Server {
             }
         }
         Ok(Response::Ok)
-    }
-}
-
-fn deleted_info(w: &crate::persist::WorkspaceSnap) -> WorkspaceInfo {
-    let (tabs, panes) = w.counts();
-    WorkspaceInfo {
-        id: Some(w.id.clone()),
-        name: w.name.clone(),
-        open: false,
-        definition: w.definition.clone(),
-        tabs,
-        panes,
-        working: 0,
-        blocked: 0,
-        done: 0,
     }
 }
 

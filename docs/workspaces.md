@@ -398,7 +398,12 @@ Fix that cause and restart to retry; opening its source does not replace the sav
 ## Workspace files
 
 Workspace layouts can be imported from any KDL file. Files in `~/.config/kraal/workspaces/*.kdl`
-and the directories `workspace_dirs` names also appear in Workspaces. Two to import and change:
+and the directories `workspace_dirs` names also appear in Workspaces. The picker shows an
+error for an invalid file; `kraal workspaces --json` omits that file. The full sidebar and
+compact strip show valid files from the last source scan. Drawing them does not rescan or
+reload those files. A source associated with a workspace already listed does not add another row.
+
+Two to import and change:
 [first.kdl](../examples/workspaces/first.kdl) (tabs, a split, a live preview, a command pane) and
 [two-agents.kdl](../examples/workspaces/two-agents.kdl) (two agents, a stack of helper panes).
 One with servers and an agent:
