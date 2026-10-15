@@ -1496,14 +1496,14 @@ mod tests {
         let (client, _peer) = super::super::tests::client(&mut server);
         let ws = server.workspaces[0].id;
         server.new_workspace("test-copy".into(), None);
-        let mut kept = crate::persist::snapshot(&server).workspaces.remove(1);
+        let mut kept = crate::server::persistence::snapshot(&server).workspaces.remove(1);
         kept.closed = true;
         server.workspaces[1].kept = Some(kept);
         server.new_workspace("test-copy-2".into(), None);
-        let failed = crate::persist::snapshot(&server).workspaces.remove(2);
+        let failed = crate::server::persistence::snapshot(&server).workspaces.remove(2);
         server.workspaces.pop();
         server.unrestored.push(failed);
-        let dir = std::env::temp_dir().join(format!("kraal-duplicate-name-{}", crate::accounts::new_uuid()));
+        let dir = std::env::temp_dir().join(format!("kraal-duplicate-name-{}", crate::identity::new_uuid()));
         std::fs::create_dir(&dir).unwrap();
         std::fs::write(dir.join("test-copy-3.kdl"), "layout { pane; }\n").unwrap();
         server.config.workspace_dirs = vec![dir.display().to_string()];
@@ -1695,7 +1695,7 @@ mod tests {
             let source = server.workspaces[0].definition.clone();
             let identity = server.workspaces[0].stable_id.clone();
             if closed {
-                let mut snap = crate::persist::snapshot(&server).workspaces.remove(0);
+                let mut snap = crate::server::persistence::snapshot(&server).workspaces.remove(0);
                 snap.closed = true;
                 server.workspaces[0].kept = Some(snap);
             }
@@ -1743,7 +1743,7 @@ mod tests {
             let ws = server.workspaces[0].id;
             server.workspaces[0].name = "zebra".into();
             if closed {
-                let mut snap = crate::persist::snapshot(&server).workspaces.remove(0);
+                let mut snap = crate::server::persistence::snapshot(&server).workspaces.remove(0);
                 snap.closed = true;
                 server.workspaces[0].kept = Some(snap);
             }
@@ -1826,7 +1826,7 @@ mod tests {
             }
             server.session = format!("workspace-rollback-{rename}-{empty}-{rollback_fails}");
             server.config.save_scrollback = false;
-            let before = crate::persist::snapshot(&server);
+            let before = crate::server::persistence::snapshot(&server);
             crate::persist::save(&server.session, &before).unwrap();
             let (writer, jobs) = crossbeam_channel::unbounded();
             server.persister = writer;
@@ -1923,7 +1923,7 @@ mod tests {
         let mut server = super::super::tests::server(tx);
         let (client, _peer) = super::super::tests::client(&mut server);
         let ws = server.workspaces[0].id;
-        let mut snap = crate::persist::snapshot(&server).workspaces.remove(0);
+        let mut snap = crate::server::persistence::snapshot(&server).workspaces.remove(0);
         snap.name = "unrestored".into();
         server.unrestored.push(snap.clone());
         let closed = server.new_workspace("closed".into(), None);

@@ -668,7 +668,7 @@ mod tests {
         server.client_frame(id, protocol::JSON, serde_json::to_vec(&reply).unwrap());
         let Content::Files(f) = &server.panes[&pane].content else { panic!("not files") };
         assert_eq!(f.location(side).display(), "travel:~/private-path");
-        let saved = serde_json::to_string(&crate::persist::snapshot(&server)).unwrap();
+        let saved = serde_json::to_string(&crate::server::persistence::snapshot(&server)).unwrap();
         assert!(!saved.contains("private-path") && !saved.contains("secret-entry") && !saved.contains("abc123"));
         server.clients.get_mut(&other).unwrap().dirty = crate::server::Dirty::No;
         server.drop_client(id);

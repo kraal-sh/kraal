@@ -547,7 +547,7 @@ mod tests {
         assert_eq!(server.events.seq, seq);
         let copy = server.duplicate_workspace(source, "copy").unwrap();
         assert_eq!(server.events.seq, seq);
-        let snapshot = crate::persist::snapshot(&server);
+        let snapshot = crate::server::persistence::snapshot(&server);
         server.reopen_workspace(copy).unwrap();
         assert_eq!(server.events.seq, seq + 1);
         assert_eq!(server.events.kept.back().unwrap()["type"], "workspace.opened");
@@ -556,7 +556,7 @@ mod tests {
         assert_eq!(server.events.seq, seq + 1);
         let (tx, _rx) = super::super::queue::channel(32);
         let mut restarted = super::super::tests::server(tx);
-        crate::persist::apply(&mut restarted, snapshot).unwrap();
+        crate::server::persistence::apply(&mut restarted, snapshot).unwrap();
         assert!(restarted.events.kept.iter().all(|e| e["workspace"] != "copy"));
     }
 

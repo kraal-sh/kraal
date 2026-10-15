@@ -121,7 +121,7 @@ impl Server {
         }
         let mut ws = Workspace {
             id,
-            stable_id: crate::accounts::new_uuid(),
+            stable_id: crate::identity::new_uuid(),
             name,
             tabs: Vec::new(),
             kept: None,
@@ -580,7 +580,7 @@ impl Server {
         let retry = self.workspaces[wi].kept.is_some();
         if !retry {
             self.save_scrollback(true);
-            let mut saved = crate::persist::snapshot(self).workspaces.remove(wi);
+            let mut saved = crate::server::persistence::snapshot(self).workspaces.remove(wi);
             saved.close_pending = Some(crate::persist::CloseIntent::new(
                 stops.iter().flat_map(|s| s.members.iter().copied()).collect(),
                 stops.iter().flat_map(|s| s.sessions.iter().cloned()).collect(),
@@ -691,7 +691,7 @@ impl Server {
                 server.starting_workspace = None;
                 result
             } else {
-                crate::persist::restore_workspace_tabs(server, wi, &saved)
+                crate::server::persistence::restore_workspace_tabs(server, wi, &saved)
             };
             if result.is_err() {
                 server.rollback(&before, &workspaces);
@@ -798,7 +798,7 @@ mod tests {
 
     #[test]
     fn close_recovery_stops_children_forked_after_preparation_and_their_parent_exits() {
-        let dir = std::env::temp_dir().join(format!("kraal-close-survivor-{}", crate::accounts::new_uuid()));
+        let dir = std::env::temp_dir().join(format!("kraal-close-survivor-{}", crate::identity::new_uuid()));
         std::fs::create_dir(&dir).unwrap();
         let child_file = dir.join("child");
         let ready = dir.join("ready");

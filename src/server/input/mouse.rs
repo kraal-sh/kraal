@@ -1117,7 +1117,7 @@ mod workspace_drag_tests {
             let snap = serde_json::from_value(saved.lock().unwrap().last().unwrap().clone()).unwrap();
             let (tx, _rx3) = queue::channel(32);
             let mut restored = tests::server(tx);
-            crate::persist::apply(&mut restored, snap).unwrap();
+            crate::server::persistence::apply(&mut restored, snap).unwrap();
             assert_eq!(names(&restored), names(&server));
             let (picker, col, row) = press(&mut server, client, 0);
             assert!(matches!(release(&mut server, client, picker, col, row + 6), Mode::Picker(_)));

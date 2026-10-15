@@ -22,6 +22,7 @@ mod fuzz;
 mod git;
 mod graphics;
 mod hints;
+mod identity;
 mod input;
 mod integration;
 mod keymap;

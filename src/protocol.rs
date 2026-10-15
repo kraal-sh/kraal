@@ -1043,7 +1043,7 @@ mod tests {
         };
         let tunnel = crate::server::net::TunnelInfo {
             id: 1,
-            spec: crate::server::net::TunnelSpec {
+            spec: crate::servers::TunnelSpec {
                 server: s("web"),
                 via: Some(crate::servers::Server { name: s("web"), host: s("10.0.0.1"), ..Default::default() }),
                 local: 8080,

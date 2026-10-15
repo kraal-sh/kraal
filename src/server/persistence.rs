@@ -11,8 +11,25 @@ use super::ui::{ConfirmAction, Mode, Question};
 use super::{ClientId, Event, EventSender, Server};
 use crate::layout::PaneId;
 use crate::paths;
-use crate::persist::{self, SavedScrollback, SessionSnapshot};
+use crate::persist::{self, SessionSnapshot};
 use crate::theme::NoticeKind;
+
+mod restore;
+mod snapshot;
+
+pub(super) use restore::{apply, apply_workspace, restore_workspace_tabs};
+pub(super) use snapshot::snapshot;
+
+/// What is saved of a pane's scrollback.
+#[derive(Debug, Clone)]
+pub struct SavedScrollback {
+    /// Its file in the session's scrollback directory, once there was text to save.
+    pub file: Option<String>,
+    /// When it was read from the pane: output since is not in it.
+    pub taken: Instant,
+    /// Writing it failed: it is saved again, whether the pane printed since or not.
+    pub retry: bool,
+}
 
 /// A pane that keeps printing has its scrollback saved again at most this often.
 const SCROLLBACK_EVERY: Duration = Duration::from_secs(10);
@@ -115,7 +132,7 @@ impl Server {
         }
         let panes = &self.panes;
         self.scrollback.retain(|id, _| panes.contains_key(id));
-        let snap = persist::snapshot(self);
+        let snap = crate::server::persistence::snapshot(self);
         // The state the last save wrote, and that save worked: there is nothing to write.
         let text = serde_json::to_vec(&snap).ok();
         let failed = self.persisting.lock().map_or(true, |p| p.state_failed);
@@ -250,7 +267,7 @@ impl Server {
 
     pub(super) fn apply_snapshot(&mut self, snap: SessionSnapshot) -> Result<()> {
         // Every pane is set up before the programs start.
-        self.with_batch(|server| persist::apply(server, snap))
+        self.with_batch(|server| crate::server::persistence::apply(server, snap))
     }
 
     /// The question before a restart, with what it stops.
@@ -645,14 +662,14 @@ pub(super) mod tests {
         let mut server = crate::server::tests::server(tx.clone());
         server.new_workspace("empty".into(), None);
         for closed in [false, true] {
-            let mut snap = persist::snapshot(&server);
+            let mut snap = crate::server::persistence::snapshot(&server);
             snap.workspaces[0].closed = closed;
             let value = serde_json::to_value(&snap).unwrap();
             assert_eq!(value["version"], 2);
             assert!(value.get("revision").is_none());
             assert_eq!(value["workspaces"][0]["tabs"], serde_json::json!([]));
             let mut restored = crate::server::tests::server(tx.clone());
-            persist::apply(&mut restored, snap).unwrap();
+            crate::server::persistence::apply(&mut restored, snap).unwrap();
             assert_eq!(restored.workspaces.len(), 1);
             assert_eq!(restored.workspaces[0].name, "empty");
             assert_eq!(restored.workspaces[0].closed(), closed);
@@ -666,7 +683,7 @@ pub(super) mod tests {
         let (tx, _rx) = crate::server::event_channel(4096);
         let mut server = super::super::tests::server(tx.clone());
         let ws = workspace(&mut server);
-        let original = serde_json::to_value(persist::snapshot(&server)).unwrap();
+        let original = serde_json::to_value(crate::server::persistence::snapshot(&server)).unwrap();
         let saved = writer(&mut server, vec![Ok(()), Ok(())]);
         server.keep_and_close_workspace(ws).unwrap();
         assert!(!server.quitting);
@@ -681,11 +698,11 @@ pub(super) mod tests {
         assert_eq!(writes[0]["workspaces"][0]["tabs"], original["workspaces"][0]["tabs"]);
         drop(writes);
         let mut restored = super::super::tests::server(tx);
-        restored.apply_snapshot(persist::snapshot(&server)).unwrap();
+        restored.apply_snapshot(crate::server::persistence::snapshot(&server)).unwrap();
         assert!(restored.panes.is_empty(), "closed workspaces start no programs");
         assert!(restored.workspaces[0].closed());
         restored.open_workspace("personal").unwrap();
-        assert_eq!(serde_json::to_value(persist::snapshot(&restored)).unwrap(), original);
+        assert_eq!(serde_json::to_value(crate::server::persistence::snapshot(&restored)).unwrap(), original);
         assert_eq!(restored.workspaces.len(), 1, "the missing source is never imported again");
     }
 
@@ -694,7 +711,7 @@ pub(super) mod tests {
         let (tx, _rx) = crate::server::event_channel(4096);
         let mut server = super::super::tests::server(tx);
         let ws = workspace(&mut server);
-        let before = serde_json::to_value(persist::snapshot(&server)).unwrap();
+        let before = serde_json::to_value(crate::server::persistence::snapshot(&server)).unwrap();
         writer(&mut server, vec![Err("Disk full".into()), Ok(()), Ok(())]);
         let Mode::Confirm(question) = server.close_workspace(0, ws) else { panic!("retry") };
         assert!(question.message.contains("Nothing was stopped."));
@@ -705,7 +722,7 @@ pub(super) mod tests {
             matches!(server.workspace_picker(ws).current().unwrap().action, super::super::ui::PickAction::RetryWorkspaceClose(id) if id == ws)
         );
         assert_eq!(server.panes.len(), 4);
-        assert_eq!(serde_json::to_value(persist::snapshot(&server)).unwrap(), before);
+        assert_eq!(serde_json::to_value(crate::server::persistence::snapshot(&server)).unwrap(), before);
         assert!(matches!(server.close_workspace(0, ws), Mode::Picker(_)));
         assert!(server.workspaces[0].closed());
         assert!(server.workspaces[0].close_error.is_none());
@@ -748,7 +765,7 @@ pub(super) mod tests {
         assert!(!server.quitting);
         assert!(server.workspaces[0].tabs.is_empty());
         assert!(server.workspaces[0].tab().is_none());
-        let saved = persist::snapshot(&server);
+        let saved = crate::server::persistence::snapshot(&server);
         assert!(saved.workspaces[0].empty);
         assert_eq!(saved.workspaces[0].counts(), (0, 0));
         assert!(saved.workspaces[0].tabs.is_empty(), "empty workspaces have no fallback panes");
@@ -770,7 +787,7 @@ pub(super) mod tests {
         let (tx, _rx) = crate::server::event_channel(4096);
         let mut server = super::super::tests::server(tx);
         let ws = workspace(&mut server);
-        let mut saved = persist::snapshot(&server).workspaces.remove(0);
+        let mut saved = crate::server::persistence::snapshot(&server).workspaces.remove(0);
         saved.close_pending = Some(persist::CloseIntent::new(Vec::new(), Vec::new()));
         let persist::NodeSnap::Pane(pane) = saved.tabs[1].root.as_mut().unwrap() else { panic!() };
         pane.scrollback = Some("1-2-3.ans".into());
@@ -778,12 +795,12 @@ pub(super) mod tests {
         for pane in server.workspaces[0].panes() {
             server.close_pane(pane);
         }
-        let partial = persist::snapshot(&server);
+        let partial = crate::server::persistence::snapshot(&server);
         assert_eq!(serde_json::to_value(&partial.workspaces[0]).unwrap(), serde_json::to_value(saved).unwrap());
         assert!(persist::scrollback_files(&partial).contains("1-2-3.ans"));
         assert!(server.reopen_workspace(ws).unwrap_err().to_string().contains("Retry Close"));
         server.config.save_scrollback = false;
-        assert!(persist::scrollback_files(&persist::snapshot(&server)).is_empty());
+        assert!(persist::scrollback_files(&crate::server::persistence::snapshot(&server)).is_empty());
     }
 
     #[test]
@@ -917,14 +934,14 @@ pub(super) mod tests {
         server.workspaces[1].name = "renamed".into();
         server.workspaces[0].set_definition(Some(std::path::Path::new("/elsewhere/source.kdl")));
         server.workspaces.reverse();
-        let mut saved = persist::snapshot(&server);
+        let mut saved = crate::server::persistence::snapshot(&server);
         saved.workspaces[0].restore_error = Some("previous failure".into());
         let mut restored = super::super::tests::server(tx);
         // Runtime ids change across restores and must not become the saved identity.
         restored.alloc_id();
-        persist::apply(&mut restored, saved).unwrap();
+        crate::server::persistence::apply(&mut restored, saved).unwrap();
         assert!(restored.unrestored.is_empty());
-        let saved = persist::snapshot(&restored);
+        let saved = crate::server::persistence::snapshot(&restored);
         assert!(saved.workspaces[0].restore_error.is_none());
         assert_eq!(saved.workspaces.iter().map(|w| &w.id).collect::<Vec<_>>(), [&ids[1], &ids[0]]);
         assert_eq!(saved.workspaces[0].name, "renamed", "saved name collisions are kept");
@@ -941,9 +958,9 @@ pub(super) mod tests {
             "id": "stable", "name": "kept", "definition": "/missing/source.kdl",
             "definition_source": "// source kept verbatim", "cwd": null, "active": 0, "tabs": []
         }] });
-        persist::apply(&mut server, serde_json::from_value(value).unwrap()).unwrap();
+        crate::server::persistence::apply(&mut server, serde_json::from_value(value).unwrap()).unwrap();
         assert!(server.workspaces.is_empty());
-        let saved = persist::snapshot(&server);
+        let saved = crate::server::persistence::snapshot(&server);
         let failed = &saved.workspaces[0];
         assert_eq!(failed.id, "stable");
         assert_eq!(failed.definition_source.as_deref(), Some("// source kept verbatim"));
@@ -951,7 +968,7 @@ pub(super) mod tests {
         assert!(server.open_workspace("kept").unwrap_err().to_string().contains("fix the cause and restart"));
         let reason = failed.restore_error.clone();
         let mut restored = super::super::tests::server(tx);
-        persist::apply(&mut restored, saved).unwrap();
+        crate::server::persistence::apply(&mut restored, saved).unwrap();
         assert_eq!(restored.unrestored[0].id, "stable");
         assert_eq!(restored.unrestored[0].restore_error, reason);
     }
@@ -1073,14 +1090,14 @@ pub(super) mod tests {
             assert!(!q.message.contains("file"));
             assert_eq!(server.workspaces[0].panes().len(), 1);
             assert_eq!(std::fs::read_to_string(&path).ok().as_deref(), replacement);
-            let mut expected = serde_json::to_value(persist::snapshot(&server)).unwrap();
+            let mut expected = serde_json::to_value(crate::server::persistence::snapshot(&server)).unwrap();
             expected["workspaces"][0]["tabs"][0]["root"]["Pane"]["stopped"] = true.into();
             writer(&mut server, vec![Ok(()), Ok(())]);
             server.keep_and_close_workspace(ws).unwrap();
             assert!(server.workspaces[0].closed());
             assert!(server.panes.is_empty());
             server.reopen_workspace(ws).unwrap();
-            let after = serde_json::to_value(persist::snapshot(&server)).unwrap();
+            let after = serde_json::to_value(crate::server::persistence::snapshot(&server)).unwrap();
             assert_eq!(after["workspaces"][0]["tabs"], expected["workspaces"][0]["tabs"]);
             assert_eq!(std::fs::read_to_string(&path).ok().as_deref(), replacement);
         }

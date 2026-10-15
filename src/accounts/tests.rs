@@ -1,3 +1,5 @@
+use crate::identity::new_uuid;
+
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -844,7 +846,7 @@ fn agents_started_directly_resume_with_their_arguments() {
 fn conversations_are_found_by_their_transcript() {
     let home = std::env::temp_dir().join(format!("kraal-conv-{}", std::process::id()));
     let a = Account {
-        id: crate::accounts::new_uuid(),
+        id: crate::identity::new_uuid(),
         name: "t".into(),
         agent: "claude".into(),
         home: home.display().to_string(),
@@ -1537,14 +1539,6 @@ fn naming_the_default_home_keeps_its_identity_and_bindings() {
     all.save().unwrap();
     assert_eq!(Accounts::load_from(&file).unwrap().get("claude", "personal"), Some(adopted));
     std::fs::remove_dir_all(dir).unwrap();
-}
-
-#[test]
-fn uuids_are_v4() {
-    let u = new_uuid();
-    assert_eq!(u.len(), 36);
-    assert_eq!(&u[14..15], "4");
-    assert_ne!(u, new_uuid());
 }
 
 #[test]

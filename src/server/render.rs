@@ -3362,7 +3362,7 @@ mod tests {
         let account = server
             .accounts
             .add(Account {
-                id: crate::accounts::new_uuid(),
+                id: crate::identity::new_uuid(),
                 agent: "claude".into(),
                 name: "work".into(),
                 home: "/nonexistent/work".into(),

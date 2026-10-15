@@ -27,7 +27,7 @@ impl Server {
         let kind = accounts::agent_kind(&a.agent).context("unknown agent")?;
         let session = match resume {
             Some(id) => Some(id.to_string()),
-            None => kind.session_flag.map(|_| accounts::new_uuid()),
+            None => kind.session_flag.map(|_| crate::identity::new_uuid()),
         };
         let new_session = if resume.is_none() { session.as_deref() } else { None };
         let l = accounts::launch(a, args, resume, new_session)?;

@@ -119,7 +119,7 @@ impl Server {
             self.check_source_revision(wi, preview)
                 .context("Programs stopped. Your previous layout is kept closed.")?;
         }
-        let old = persist::snapshot(self).workspaces.remove(wi);
+        let old = crate::server::persistence::snapshot(self).workspaces.remove(wi);
         let mut next = if let Some(preview) = preview {
             let mut backup = old.clone();
             backup.layout_undo = None;
@@ -146,7 +146,10 @@ impl Server {
         next.sync = super::SyncScope::Off;
         // Writer jobs stay ordered even after save_now times out. Protect every file
         // the rollback can name until the replacement or queued rollback is written.
-        let retained = persist::scrollback_files(&persist::snapshot(self)).into_iter().map(str::to_owned).collect();
+        let retained = persist::scrollback_files(&crate::server::persistence::snapshot(self))
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
         let _ = self.persister.send(super::persistence::Persist::RetainScrollback(retained));
         self.install_source_layout(wi, next);
         if let Err(e) = self.save_now() {
@@ -277,7 +280,7 @@ pub(super) mod tests {
             let expected = changed.then_some("File changed");
             server.refresh_source_status();
             assert_eq!(server.workspaces[0].source_status, expected);
-            let saved = serde_json::to_vec(&persist::snapshot(&server)).unwrap();
+            let saved = serde_json::to_vec(&crate::server::persistence::snapshot(&server)).unwrap();
             let (tx, _rx) = super::super::queue::channel(32);
             let mut restored = super::super::tests::server(tx);
             restored.apply_snapshot(serde_json::from_slice(&saved).unwrap()).unwrap();
@@ -294,11 +297,11 @@ pub(super) mod tests {
     #[test]
     fn changed_twice_keep_layout_is_revision_specific_and_never_authorizes_export() {
         let (mut server, path, ws) = setup("twice");
-        let before = serde_json::to_value(persist::snapshot(&server)).unwrap();
+        let before = serde_json::to_value(crate::server::persistence::snapshot(&server)).unwrap();
         std::fs::write(&path, CHANGED).unwrap();
         server.scan_definitions();
         assert_eq!(server.workspaces[0].source_status, Some("File changed"));
-        assert_eq!(serde_json::to_value(persist::snapshot(&server)).unwrap(), before);
+        assert_eq!(serde_json::to_value(crate::server::persistence::snapshot(&server)).unwrap(), before);
         let preview = server.preview_source(&path).unwrap();
         let twice = "layout { pane command=\"second\"; }";
         std::fs::write(&path, twice).unwrap();
@@ -320,7 +323,7 @@ pub(super) mod tests {
         let (tx, _rx) = super::super::queue::channel(32);
         let mut restored = super::super::tests::server(tx);
         server.keep_and_close_workspace(ws).unwrap();
-        restored.apply_snapshot(persist::snapshot(&server)).unwrap();
+        restored.apply_snapshot(crate::server::persistence::snapshot(&server)).unwrap();
         restored.refresh_source_status();
         assert_eq!(restored.workspaces[0].source_status, None);
         std::fs::write(&path, CHANGED).unwrap();
@@ -364,7 +367,7 @@ pub(super) mod tests {
         server.replace_source_layout(ws, Some(&preview), None).unwrap();
         assert!(server.workspaces[0].closed());
         assert_eq!(server.workspaces[0].counts(), (1, 2));
-        let snap = persist::snapshot(&server);
+        let snap = crate::server::persistence::snapshot(&server);
         let (tx, _rx) = super::super::queue::channel(32);
         let mut restored = super::super::tests::server(tx);
         restored.apply_snapshot(serde_json::from_value(serde_json::to_value(snap).unwrap()).unwrap()).unwrap();
@@ -534,7 +537,7 @@ pub(super) mod tests {
         assert!(!server.workspaces[0].closed());
         assert!(server.workspaces[0].kept.is_none());
         server.save_now().unwrap();
-        assert!(persist::snapshot(&server).workspaces[0].close_pending.is_none());
+        assert!(crate::server::persistence::snapshot(&server).workspaces[0].close_pending.is_none());
         drop(server);
         writer.join().unwrap();
         std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
@@ -618,7 +621,7 @@ pub(super) mod tests {
         assert_ne!(exported, CHANGED);
         let (tx, _rx) = super::super::queue::channel(32);
         let mut restored = super::super::tests::server(tx);
-        restored.apply_snapshot(persist::snapshot(&server)).unwrap();
+        restored.apply_snapshot(crate::server::persistence::snapshot(&server)).unwrap();
         restored.refresh_source_status();
         assert_eq!(restored.workspaces[0].source_status, None);
         assert_eq!(restored.workspaces[0].definition_source.as_deref(), Some(exported.as_str()));
@@ -633,7 +636,7 @@ pub(super) mod tests {
         let (mut server, path, ws) = setup("account-and-keep");
         std::fs::write(&path, "layout { pane agent=\"claude:missing-account\"; }").unwrap();
         let preview = server.preview_source(&path).unwrap();
-        let before = serde_json::to_value(persist::snapshot(&server)).unwrap();
+        let before = serde_json::to_value(crate::server::persistence::snapshot(&server)).unwrap();
         assert!(
             server
                 .replace_source_layout(ws, Some(&preview), None)
@@ -641,7 +644,7 @@ pub(super) mod tests {
                 .to_string()
                 .contains("unavailable account")
         );
-        assert_eq!(serde_json::to_value(persist::snapshot(&server)).unwrap(), before);
+        assert_eq!(serde_json::to_value(crate::server::persistence::snapshot(&server)).unwrap(), before);
         writer(&mut server, vec![Err("disk full".into())]);
         assert!(server.keep_source_layout(ws, &preview).unwrap_err().to_string().contains("Retry"));
         assert!(server.workspaces[0].source_reviewed.is_none());
@@ -659,10 +662,10 @@ pub(super) mod tests {
         std::fs::write(&path, CHANGED).unwrap();
         let preview = server.preview_source(&path).unwrap();
         server.replace_source_layout(ws, Some(&preview), None).unwrap();
-        let snap = persist::snapshot(&server);
+        let snap = crate::server::persistence::snapshot(&server);
         assert!(persist::scrollback_files(&snap).contains("1-2-3.ans"));
         server.config.save_scrollback = false;
-        assert!(persist::scrollback_files(&persist::snapshot(&server)).is_empty());
+        assert!(persist::scrollback_files(&crate::server::persistence::snapshot(&server)).is_empty());
         let copy = snap.workspaces[0].duplicate("copy").unwrap();
         assert!(copy.layout_undo.is_none());
         assert!(copy.source_reviewed.is_none());

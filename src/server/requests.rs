@@ -677,7 +677,7 @@ mod tests {
         assert_eq!(server.workspaces[0].id, existing);
         assert!(server.workspaces[0].tabs.is_empty());
         assert!(server.workspaces[0].kept.is_none());
-        assert_eq!(crate::persist::snapshot(&server).workspaces.len(), 1);
+        assert_eq!(crate::server::persistence::snapshot(&server).workspaces.len(), 1);
     }
 
     #[test]

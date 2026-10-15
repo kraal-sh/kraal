@@ -786,7 +786,7 @@ mod tests {
 
     fn account() -> Account {
         Account {
-            id: accounts::new_uuid(),
+            id: crate::identity::new_uuid(),
             agent: "claude".into(),
             name: "work".into(),
             home: "/nonexistent/work".into(),
@@ -1199,7 +1199,7 @@ mod tests {
 
     #[test]
     fn an_existing_form_rejects_concurrent_review_and_rename_without_changing_the_file() {
-        let dir = std::env::temp_dir().join(format!("kraal-stale-account-form-{}", accounts::new_uuid()));
+        let dir = std::env::temp_dir().join(format!("kraal-stale-account-form-{}", crate::identity::new_uuid()));
         std::fs::create_dir_all(&dir).unwrap();
         for reviewed in [false, true] {
             let file = dir.join(format!("{reviewed}.toml"));
@@ -1246,7 +1246,7 @@ mod tests {
             }
             let mut stale = existing.clone();
             let checked = account_status::Checked { status: Status::SignedIn, identity: None };
-            stale.id = accounts::new_uuid();
+            stale.id = crate::identity::new_uuid();
             assert!(name_existing_account(&mut all, &stale, &checked, "wrong-id").is_err());
             stale = existing.clone();
             stale.home = "/nonexistent/replaced".into();
@@ -1262,7 +1262,7 @@ mod tests {
 
     #[test]
     fn a_pending_review_can_be_named_after_sign_out_but_uncertain_checks_change_nothing() {
-        let dir = std::env::temp_dir().join(format!("kraal-signed-out-review-{}", accounts::new_uuid()));
+        let dir = std::env::temp_dir().join(format!("kraal-signed-out-review-{}", crate::identity::new_uuid()));
         std::fs::create_dir_all(&dir).unwrap();
         for review in [false, true] {
             for status in [Status::SignedIn, Status::NotSignedIn, Status::NotInstalled, Status::CouldNotCheck] {

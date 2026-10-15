@@ -195,7 +195,7 @@ mod tests {
         let path = dir.join("recipe.kdl");
         let source = "// handwritten\nlayout { pane command=\"touch\" { args \"never\"; }; pane agent=\"unmanaged-agent\"; mystery; }";
         std::fs::write(&path, source).unwrap();
-        let before = crate::persist::snapshot(&server);
+        let before = crate::server::persistence::snapshot(&server);
         let Response::ImportPreview(preview) = server
             .request(
                 0,
@@ -210,7 +210,7 @@ mod tests {
         assert!(preview.summary().contains("mystery"));
         assert!(server.panes.is_empty());
         assert_eq!(
-            serde_json::to_value(crate::persist::snapshot(&server)).unwrap(),
+            serde_json::to_value(crate::server::persistence::snapshot(&server)).unwrap(),
             serde_json::to_value(before).unwrap()
         );
         let saved = super::super::persistence::tests::writer(&mut server, vec![Ok(())]);
@@ -260,7 +260,7 @@ mod tests {
         let snap = serde_json::from_value(saved.lock().unwrap().last().unwrap().clone()).unwrap();
         let (tx, _rx) = super::super::queue::channel(32);
         let mut restored = super::super::tests::server(tx);
-        persist::apply(&mut restored, snap).unwrap();
+        crate::server::persistence::apply(&mut restored, snap).unwrap();
         assert_eq!(restored.workspace_order, order);
         assert_eq!(restored.workspaces[0].name, "personal");
         assert_eq!(restored.workspaces[1].name, "existing");
@@ -452,7 +452,7 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&path).unwrap(), source);
         assert_eq!(server.workspaces[wi].definition.as_ref(), Some(&path));
         assert_eq!(list(&mut server), before);
-        let bytes = serde_json::to_vec(&crate::persist::snapshot(&server)).unwrap();
+        let bytes = serde_json::to_vec(&crate::server::persistence::snapshot(&server)).unwrap();
         let (tx, _rx) = super::super::queue::channel(32);
         let mut recovered = super::super::tests::server(tx);
         recovered.config.workspace_dirs = server.config.workspace_dirs.clone();
@@ -551,7 +551,7 @@ mod tests {
         let id = server.import_layout(&source, "kept", &preview.revision, &[]).unwrap();
         let wi = server.ws_index(id).unwrap();
         let identity = server.workspaces[wi].stable_id.clone();
-        let mut snap = crate::persist::snapshot(&server).workspaces.remove(wi);
+        let mut snap = crate::server::persistence::snapshot(&server).workspaces.remove(wi);
         snap.closed = true;
         server.workspaces[wi].kept = Some(snap);
         server.workspaces[wi].tabs.clear();

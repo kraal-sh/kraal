@@ -261,7 +261,7 @@ mod tests {
         let snap = serde_json::from_value(saved.lock().unwrap().last().unwrap().clone()).unwrap();
         let (tx, _rx2) = queue::channel(32);
         let mut restored = tests::server(tx);
-        crate::persist::apply(&mut restored, snap).unwrap();
+        crate::server::persistence::apply(&mut restored, snap).unwrap();
         let _saved = writer(&mut restored, vec![]);
         let Response::Workspaces(deleted) = request(&mut restored, Request::ListDeletedWorkspaces).unwrap() else {
             panic!()

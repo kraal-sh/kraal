@@ -454,7 +454,7 @@ mod tests {
 
     impl EditTest {
         fn new(stopped: bool) -> Self {
-            let dir = std::env::temp_dir().join(format!("kraal-pane-edit-{}", crate::accounts::new_uuid()));
+            let dir = std::env::temp_dir().join(format!("kraal-pane-edit-{}", crate::identity::new_uuid()));
             std::fs::create_dir_all(dir.join("next folder")).unwrap();
             let dir = dir.canonicalize().unwrap();
             let (tx, rx) = super::super::event_channel(4096);
@@ -681,7 +681,7 @@ mod tests {
         assert_eq!(pane.current_cwd(), Some(t.dir.join("next folder")));
         assert!(pane.text(None).contains("old output"));
         assert!(!marker.exists());
-        let saved = serde_json::to_vec(&crate::persist::snapshot(&t.server)).unwrap();
+        let saved = serde_json::to_vec(&crate::server::persistence::snapshot(&t.server)).unwrap();
         let snap = serde_json::from_slice(&saved).unwrap();
         t.server.close_pane(t.pane);
         t.server.apply_snapshot(snap).unwrap();
@@ -726,7 +726,7 @@ mod tests {
         let mut t = EditTest::new(false);
         t.server.save_now().unwrap();
         for command in [false, true] {
-            let before = serde_json::to_value(crate::persist::snapshot(&t.server)).unwrap();
+            let before = serde_json::to_value(crate::server::persistence::snapshot(&t.server)).unwrap();
             let saved = super::super::persistence::tests::writer(&mut t.server, vec![Err("Disk full".into()), Ok(())]);
             let mut draft = t.form();
             draft.values[0] = "renamed".into();
@@ -738,7 +738,7 @@ mod tests {
             assert!(back.error.as_deref().unwrap().contains("Nothing was changed or stopped"));
             assert_eq!(back.values[0], "renamed");
             assert!(t.server.panes[&t.pane].process_hold().unwrap().group_running());
-            assert_eq!(serde_json::to_value(crate::persist::snapshot(&t.server)).unwrap(), before);
+            assert_eq!(serde_json::to_value(crate::server::persistence::snapshot(&t.server)).unwrap(), before);
             assert_eq!(saved.lock().unwrap().last(), Some(&before));
         }
     }
@@ -881,7 +881,7 @@ mod tests {
         let transcript = home.join("projects/work/session.jsonl");
         std::fs::create_dir_all(transcript.parent().unwrap()).unwrap();
         let account: crate::accounts::Account = serde_json::from_value(serde_json::json!({
-            "id": crate::accounts::new_uuid(), "agent": "claude", "name": "work", "home": home,
+            "id": crate::identity::new_uuid(), "agent": "claude", "name": "work", "home": home,
         }))
         .unwrap();
         t.server.accounts.add(account.clone()).unwrap();
@@ -964,7 +964,7 @@ mod tests {
         t.apply(draft);
         t.until(|t| t.server.pane_edits.is_empty() && t.server.panes[&t.pane].exit_code.is_some());
         assert!(t.server.panes[&t.pane].suspended);
-        let snap = crate::persist::snapshot(&t.server);
+        let snap = crate::server::persistence::snapshot(&t.server);
         t.server.close_pane(t.pane);
         t.server.apply_snapshot(snap).unwrap();
         assert!(t.server.panes.values().all(|p| p.suspended && p.spec.command.is_empty()));
@@ -1122,7 +1122,7 @@ mod tests {
             let ws = t.server.clients[&t.client].workspace;
             if retry {
                 // A saved Close intent that could not yet stop all programs owns this layout.
-                let mut saved = crate::persist::snapshot(&t.server).workspaces.remove(0);
+                let mut saved = crate::server::persistence::snapshot(&t.server).workspaces.remove(0);
                 saved.close_pending = Some(crate::persist::CloseIntent::new(Vec::new(), Vec::new()));
                 t.server.workspaces[0].kept = Some(saved);
                 t.server.save_now().unwrap();
@@ -1136,7 +1136,7 @@ mod tests {
                 assert_eq!(command_text(&t.server.panes[&t.pane].spec), "printf 'old output\\n'; exec sleep 60");
             }
             assert!(!marker.exists());
-            let saved = serde_json::to_string(&crate::persist::snapshot(&t.server)).unwrap();
+            let saved = serde_json::to_string(&crate::server::persistence::snapshot(&t.server)).unwrap();
             assert!(saved.contains("must-not-restart"), "Close preserves the requested launch for reopening");
         }
     }
@@ -1314,7 +1314,7 @@ mod tests {
         let mut t = EditTest::new(false);
         let account = |name: &str| {
             serde_json::from_value::<crate::accounts::Account>(serde_json::json!({
-                "id": crate::accounts::new_uuid(), "agent": "claude", "name": name, "home": t.dir.join(name),
+                "id": crate::identity::new_uuid(), "agent": "claude", "name": name, "home": t.dir.join(name),
             }))
             .unwrap()
         };

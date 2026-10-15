@@ -237,7 +237,8 @@ Sessions keep running when you close the terminal, lose the connection or detach
 `kraal` attaches again. After a restart of the server, a quit or a reboot, the processes are gone,
 but kraal rebuilds the saved layout under the rules below. Closed workspaces remain closed.
 A workspace that cannot be brought back (its shell gone, say) stays saved as it was. Fix the
-reported cause and restart to retry.
+reported cause and restart to retry. Other workspaces still restore; panes created for a
+workspace whose restoration fails are removed.
 
 Automatic saves run in the background as the layout changes, with a periodic check every
 30 seconds. Scrollback is saved separately when enabled (`save_scrollback`, on by default).
@@ -258,6 +259,7 @@ restart. Detaching leaves the original processes running and needs no restoratio
 | Other command, including an SSH remote command | Waits for Enter. Check the displayed command before running it. |
 | Pane already stopped or suspended | Stays stopped, waiting for Enter. |
 | Preview | Reopens its file if available. |
+| Laptop file panel | Reopens at the session machine's home directory. Laptop paths and listings are not saved. |
 
 Restored scrollback is terminal output, not a running program or an agent transcript. A turn
 interrupted by stopping an agent is not continued in memory. Login panes are never restored.
