@@ -462,7 +462,22 @@ Sign-in and the conversation are checked again after waiting, before stopping an
 A Claude conversation must have a readable transcript on the current account. If it is missing,
 empty, unreadable, or has diverged from the destination's copy, kraal refuses and says why, leaving the
 agent running. This also applies before Claude has written its first transcript: let it finish
-a turn before changing accounts. Codex changes start a **New conversation**, stated in both the
+a turn before changing accounts. Transcript searches, checks and copies run in the background.
+Kraal refuses a destination whose account home is in use by another process, or whose separate
+transcript is open in another process. Stop that agent before trying again. Shared transcripts
+need no copy. Transfers of the same conversation lock both account stores; another transfer
+must finish before retrying.
+
+When replacing an older destination transcript, kraal checks the revision it actually moved
+and keeps that file at `projects/<project>/.kraal-transfer-<id>-<unique>/previous.jsonl` in the
+destination account home. Writes through an already open file remain recoverable there.
+A concurrent change refuses the transfer and reports this recovery path; a newly created
+destination is never overwritten. These recovery copies are kept until you remove them.
+Process checks cannot prevent an external agent from starting afterward, so avoid running the
+same conversation on two accounts during a change. A failure after stopping follows the
+recovery procedure below.
+
+Codex changes start a **New conversation**, stated in both the
 picker and the confirmation; the original history stays in the original account's directory.
 Kraal needs its conversation id and saved history before stopping Codex. If the id is not yet
 known, finish a turn with kraal's integration enabled, then try again.

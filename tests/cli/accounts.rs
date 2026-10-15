@@ -232,6 +232,14 @@ while IFS= read -r line; do :; done
     let screen = env.run(&["read", "-p", &odd]).replace('\n', "");
     assert!(screen.contains("--brand-new-flag Deploy now"), "everything after the unknown option stays: {screen}");
 
+    // The destination must be idle before another conversation can be transferred into it.
+    env.run(&["close", &odd]);
+    let odd_id: u64 = odd.parse().unwrap();
+    wait_until(PATIENCE, "the first destination agent stops", || {
+        let panes: serde_json::Value = serde_json::from_str(&env.run(&["panes", "--json"])).unwrap();
+        !panes.as_array().unwrap().iter().any(|p| p["id"] == odd_id)
+    });
+
     // 2. If copying fails after stopping, the source resumes without another keystroke.
     let plain = agent(&["--verbose"]);
     env.wait_for_text(&plain, &on_alpha);

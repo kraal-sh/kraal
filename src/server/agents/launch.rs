@@ -21,24 +21,7 @@ impl Server {
         resume: Option<&str>,
         args: &[String],
     ) -> Result<PaneSpec> {
-        let kind = accounts::agent_kind(&a.agent).context("unknown agent")?;
-        let session = match resume {
-            Some(id) => Some(id.to_string()),
-            None => kind.session_flag.map(|_| crate::identity::new_uuid()),
-        };
-        let new_session = if resume.is_none() { session.as_deref() } else { None };
-        let mut l = accounts::launch(a, args, resume, new_session)?;
-        l.env_remove.extend(["DISPLAY".into(), "WAYLAND_DISPLAY".into()]);
-        Ok(PaneSpec {
-            command: l.argv,
-            env: l.env,
-            env_remove: l.env_remove,
-            cwd,
-            account: Some(accounts::key(&a.agent, &a.name)),
-            account_id: Some(a.id.clone()),
-            session,
-            ..Default::default()
-        })
+        agent_spec(a, cwd, resume, args)
     }
 
     /// Rebuild an agent pane's spec so that starting it again resumes its conversation, with
@@ -49,44 +32,7 @@ impl Server {
     /// restore): not for a one-shot run (`claude -p`), which stays as it was, nor when a prompt
     /// was left out or would be sent; those wait for Enter.
     pub fn resume_spec(&self, spec: &PaneSpec, session: Option<&str>) -> (PaneSpec, bool) {
-        let mut bound = spec.clone();
-        self.accounts.bind_pane(&mut bound);
-        bound.prepare_agent_clipboard();
-        let spec = &bound;
-        let Some(a) = self.spec_account(spec) else {
-            return (spec.clone(), false);
-        };
-        let Some(kind) = accounts::agent_kind(&a.agent) else {
-            return (spec.clone(), false);
-        };
-        let Some((args, exact)) = accounts::resumable_args(kind, &accounts::launch_args(kind, &spec.command)) else {
-            return (spec.clone(), false);
-        };
-        // When its files cannot be read, the conversation may exist: resume it, but only on Enter.
-        let (reserved, readable) = match spec.session.as_deref().map(|id| (id, accounts::conversation_exists(&a, id))) {
-            Some((id, Ok(seen))) => ((seen != Some(false)).then_some(id), true),
-            Some((id, Err(_))) => (Some(id), false),
-            None => (None, true),
-        };
-        let exact = exact && readable;
-        let Some(session) = session.or(reserved) else { return (spec.clone(), exact) };
-        match self.agent_spec(&a, spec.cwd.clone(), Some(session), &args) {
-            Ok(fresh) => {
-                let mut fresh = PaneSpec {
-                    worktree: spec.worktree.clone(),
-                    close_on_exit: spec.close_on_exit,
-                    account_undo: spec.account_undo.clone(),
-                    ..fresh
-                };
-                if let Some(program) = spec.command.first().filter(|p| std::path::Path::new(p).is_absolute()) {
-                    fresh.command[0] = program.clone();
-                }
-                fresh.env.extend(spec.env.iter().filter(|(k, _)| k == "PATH").cloned());
-                crate::worktree_setup::carry_env(&spec.env, &mut fresh.env);
-                (fresh, exact)
-            }
-            Err(_) => (spec.clone(), false),
-        }
+        resume_spec(&self.accounts, spec, session)
     }
 
     /// The spec to start pane `p` with again, if it is an agent that had a conversation: the
@@ -187,5 +133,67 @@ impl Server {
             let focus = target.or_else(|| w.tabs.get(w.active).and_then(|t| t.focus));
             focus.and_then(|p| self.panes.get(&p)).filter(|p| p.ssh.is_none()).and_then(|p| p.current_cwd())
         })
+    }
+}
+
+fn agent_spec(a: &Account, cwd: Option<PathBuf>, resume: Option<&str>, args: &[String]) -> Result<PaneSpec> {
+    let kind = accounts::agent_kind(&a.agent).context("unknown agent")?;
+    let session = match resume {
+        Some(id) => Some(id.to_string()),
+        None => kind.session_flag.map(|_| crate::identity::new_uuid()),
+    };
+    let new_session = if resume.is_none() { session.as_deref() } else { None };
+    let mut l = accounts::launch(a, args, resume, new_session)?;
+    l.env_remove.extend(["DISPLAY".into(), "WAYLAND_DISPLAY".into()]);
+    Ok(PaneSpec {
+        command: l.argv,
+        env: l.env,
+        env_remove: l.env_remove,
+        cwd,
+        account: Some(accounts::key(&a.agent, &a.name)),
+        account_id: Some(a.id.clone()),
+        session,
+        ..Default::default()
+    })
+}
+
+pub(super) fn resume_spec(accounts: &accounts::Accounts, spec: &PaneSpec, session: Option<&str>) -> (PaneSpec, bool) {
+    let mut bound = spec.clone();
+    accounts.bind_pane(&mut bound);
+    bound.prepare_agent_clipboard();
+    let spec = &bound;
+    let Some(a) = accounts.pane_account(spec) else {
+        return (spec.clone(), false);
+    };
+    let Some(kind) = accounts::agent_kind(&a.agent) else {
+        return (spec.clone(), false);
+    };
+    let Some((args, exact)) = accounts::resumable_args(kind, &accounts::launch_args(kind, &spec.command)) else {
+        return (spec.clone(), false);
+    };
+    // When its files cannot be read, the conversation may exist: resume it, but only on Enter.
+    let (reserved, readable) = match spec.session.as_deref().map(|id| (id, accounts::conversation_exists(&a, id))) {
+        Some((id, Ok(seen))) => ((seen != Some(false)).then_some(id), true),
+        Some((id, Err(_))) => (Some(id), false),
+        None => (None, true),
+    };
+    let exact = exact && readable;
+    let Some(session) = session.or(reserved) else { return (spec.clone(), exact) };
+    match agent_spec(&a, spec.cwd.clone(), Some(session), &args) {
+        Ok(fresh) => {
+            let mut fresh = PaneSpec {
+                worktree: spec.worktree.clone(),
+                close_on_exit: spec.close_on_exit,
+                account_undo: spec.account_undo.clone(),
+                ..fresh
+            };
+            if let Some(program) = spec.command.first().filter(|p| std::path::Path::new(p).is_absolute()) {
+                fresh.command[0] = program.clone();
+            }
+            fresh.env.extend(spec.env.iter().filter(|(k, _)| k == "PATH").cloned());
+            crate::worktree_setup::carry_env(&spec.env, &mut fresh.env);
+            (fresh, exact)
+        }
+        Err(_) => (spec.clone(), false),
     }
 }

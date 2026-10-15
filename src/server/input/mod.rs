@@ -505,7 +505,7 @@ impl Server {
             return Mode::Normal;
         };
         let Some(pane) = self.panes.get_mut(&p) else { return Mode::Normal };
-        if self.pane_edits.contains_key(&p) {
+        if self.pane_edits.contains_key(&p) || self.switches.blocks_restart(p) {
             return Mode::Normal;
         }
         if matches!(pane.content, crate::pane::Content::Files(_)) {

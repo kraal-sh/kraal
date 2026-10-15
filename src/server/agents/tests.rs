@@ -968,6 +968,26 @@ impl SwitchTest {
 
     fn checked(&mut self, status: Status) {
         self.server.switch_checked(1, 2, status, false);
+        self.conversation_jobs();
+    }
+
+    fn conversation_jobs(&mut self) {
+        self.until("conversation work completes", |t| {
+            t.server.switches.get(&1).is_none_or(|s| {
+                !matches!(s.stage, SwitchStage::Verifying | SwitchStage::Transferring | SwitchStage::RecoveryChecking)
+            })
+        });
+    }
+
+    fn prepare(&mut self, approved: bool) -> anyhow::Result<()> {
+        let result = self.server.prepare_switch(1, approved);
+        self.conversation_jobs();
+        result
+    }
+
+    fn finish(&mut self) {
+        self.server.finish_switch(1);
+        self.conversation_jobs();
     }
 
     fn unchanged(&self) {
@@ -1137,7 +1157,7 @@ fn ask_and_unreliable_turns_require_one_confirmation_before_stopping() {
         assert_eq!(t.server.switches.pending[&1].stage, SwitchStage::Confirm);
         let Mode::Confirm(q) = t.server.pending_switch_mode(1) else { panic!("confirmation") };
         assert!(!q.yes);
-        t.server.prepare_switch(1, true).unwrap();
+        t.prepare(true).unwrap();
         assert_eq!(t.server.switches.pending[&1].stage, SwitchStage::Stopping);
         t.server.cancel_switch(1, 2);
         assert_eq!(t.server.switches.pending[&1].stage, SwitchStage::Stopping);
@@ -1239,7 +1259,7 @@ fn undo_is_saved_only_with_a_started_change_and_survives_resuming_the_pane() {
     t.server.limit_alerts.insert(1, LimitAlert::Notified);
     t.server.switches.pending.get_mut(&1).unwrap().stage = SwitchStage::Stopping;
     t.server.switches.pending.get_mut(&1).unwrap().session = Some("session".into());
-    t.server.finish_switch(1);
+    t.finish();
     assert_eq!(t.server.switches.pending[&1].stage, SwitchStage::Starting);
     assert!(t.server.messages.is_empty(), "preparing a command is not success");
     t.server.switch_started(1);
@@ -1268,7 +1288,7 @@ fn claude_undo_carries_the_latest_transcript_and_refuses_divergence() {
         let mut t = SwitchTest::new(if diverged { "undo-diverged" } else { "undo-latest" });
         t.server.switches.pending.get_mut(&1).unwrap().stage = SwitchStage::Stopping;
         t.server.switches.pending.get_mut(&1).unwrap().session = Some("session".into());
-        t.server.finish_switch(1);
+        t.finish();
         t.server.switch_started(1);
         let original = t.server.panes[&1].spec.clone();
         let from = t.server.accounts.get("claude", "to").unwrap();
@@ -1295,13 +1315,14 @@ fn claude_undo_carries_the_latest_transcript_and_refuses_divergence() {
                 stage: SwitchStage::Checking,
             },
         );
-        let result = t.server.prepare_switch(1, true);
+        let result = t.prepare(true);
         if diverged {
-            assert!(result.is_err());
+            result.unwrap();
+            assert!(t.server.switches.pending.is_empty());
             assert_eq!(t.server.panes[&1].spec.account.as_deref(), Some("claude:to"));
         } else {
             result.unwrap();
-            t.server.finish_switch(1);
+            t.finish();
             t.server.switch_started(1);
             assert_eq!(t.server.panes[&1].spec.account.as_deref(), Some("claude:from"));
             assert!(t.server.panes[&1].spec.account_undo.is_none());
@@ -1320,11 +1341,13 @@ fn failed_start_restores_the_source_and_a_failed_recovery_keeps_one_retry() {
     let target = t.server.switches.pending[&1].to.clone();
     t.server.panes.get_mut(&1).unwrap().spec = t.server.agent_spec(&target, None, Some("session"), &[]).unwrap();
     t.server.switch_start_failed(1, "target exited");
+    t.conversation_jobs();
     assert_eq!(t.server.switches.pending[&1].stage, SwitchStage::Restoring);
     assert_eq!(t.server.panes[&1].spec.account.as_deref(), Some("claude:from"));
     assert!(t.server.panes[&1].spec.command.windows(2).any(|w| w == ["--resume", "session"]));
     assert!(t.server.panes[&1].spec.account_undo.is_none());
     t.server.switch_start_failed(1, "source exited too");
+    t.conversation_jobs();
     assert!(t.server.switches.pending.is_empty());
     assert!(t.server.panes[&1].exit_code.is_some());
     assert_eq!(t.server.panes[&1].spec.account.as_deref(), Some("claude:from"));
@@ -1395,7 +1418,7 @@ fn codex_undo_resumes_the_original_id_and_keeps_both_histories() {
         s.original = spec;
         s.session = Some("original".into());
         s.stage = SwitchStage::Stopping;
-        t.server.finish_switch(1);
+        t.finish();
         assert_eq!(t.server.panes[&1].agent.session_id, None, "new Codex never inherits the original id");
         t.server.switch_started(1);
         if completed {
@@ -1420,8 +1443,8 @@ fn codex_undo_resumes_the_original_id_and_keeps_both_histories() {
                 stage: SwitchStage::Checking,
             },
         );
-        t.server.prepare_switch(1, true).unwrap();
-        t.server.finish_switch(1);
+        t.prepare(true).unwrap();
+        t.finish();
         assert!(t.server.panes[&1].spec.command.windows(2).any(|w| w == ["resume", "original"]));
         t.server.switch_started(1);
         accounts::check_resume(&from, "original").unwrap();
@@ -1505,13 +1528,13 @@ fn a_live_detected_process_is_rechecked_before_any_stop() {
     s.process = hold;
     s.observed = Some(observed.clone());
     crate::process::FAIL_COMMAND_ENV.with(|fail| fail.set(true));
-    let result = t.server.prepare_switch(1, true);
+    let result = t.prepare(true);
     assert!(result.unwrap_err().to_string().contains("Could not verify the running agent"));
     assert_eq!(t.server.switches.pending[&1].stage, SwitchStage::Checking);
     assert!(crate::process::still_running(observed.pid, observed.started));
     t.server.switches.pending.get_mut(&1).unwrap().observed =
         Some(ObservedAgent { started: observed.started.wrapping_add(1), ..observed });
-    let result = t.server.prepare_switch(1, true);
+    let result = t.prepare(true);
     assert!(result.unwrap_err().to_string().contains("Can't switch this process."));
     let pid = t.server.panes[&1].pid().unwrap();
     assert!(crate::process::running(pid as libc::pid_t));
@@ -1579,9 +1602,10 @@ while IFS= read -r line; do :; done
     t.server.begin_switch(1, &to, Some(99), false, false).unwrap();
     let token = t.server.switches.pending[&1].token;
     t.server.switch_checked(1, token, Status::SignedIn, false);
+    t.conversation_jobs();
     assert_eq!(t.server.switches.pending[&1].stage, SwitchStage::Confirm);
     assert_eq!(t.server.switches.pending[&1].original.cwd, Some(project.clone()));
-    t.server.prepare_switch(1, true).unwrap();
+    t.prepare(true).unwrap();
     // Keep the survivors alive past the shell's output-drain deadline.
     t.server.switches.pending.get_mut(&1).unwrap().stopping.as_mut().unwrap().since =
         Instant::now() + crate::testing::PATIENCE;
@@ -1642,10 +1666,11 @@ fn silent_replacement_and_recovery_that_ignore_hangup_are_stopped() {
     t.server.panes[&1].process_hold().unwrap().signal(libc::SIGKILL);
     t.until("the source stops", |t| t.server.panes[&1].exit_code.is_some());
     std::fs::remove_file(t.dir.join("from/started")).unwrap();
+    t.server.switches.pending.get_mut(&1).unwrap().process = t.server.panes[&1].process_hold();
     t.server.switches.pending.get_mut(&1).unwrap().original = original;
     t.server.switches.pending.get_mut(&1).unwrap().stage = SwitchStage::Stopping;
     t.server.switches.pending.get_mut(&1).unwrap().session = Some("session".into());
-    t.server.finish_switch(1);
+    t.finish();
 
     for (home, starting, stopping) in [
         ("to", SwitchStage::Starting, SwitchStage::Recovering),
@@ -1670,6 +1695,7 @@ fn silent_replacement_and_recovery_that_ignore_hangup_are_stopped() {
             t.server.switches.pending.get(&1).is_none_or(|s| s.stage != stopping)
         });
     }
+    t.conversation_jobs();
     assert!(t.server.switches.pending.is_empty());
     assert!(t.server.panes[&1].exit_code.is_some());
     assert_eq!(t.server.panes[&1].spec.account.as_deref(), Some("claude:from"));
@@ -1695,6 +1721,7 @@ fn a_deferred_switch_launch_failure_recovers_without_an_exit_event() {
     let pending = t.server.panes.get_mut(&1).unwrap().take_pending().unwrap();
     let crate::pane::Started::Failed(id, process, why) = pending.start() else { panic!("cannot start") };
     t.server.pane_failed(id, &process, &why);
+    t.conversation_jobs();
     assert_eq!(t.server.switches.pending[&1].stage, SwitchStage::Restoring);
     assert_eq!(t.server.panes[&1].spec.account.as_deref(), Some("claude:from"));
     t.until("the source starts without waiting for a nonexistent process to exit", |t| {
@@ -1769,7 +1796,7 @@ fn removing_the_destination_after_the_stop_resumes_the_source() {
     let mut t = SwitchTest::new("removed-after-stop");
     t.server.switches.pending.get_mut(&1).unwrap().stage = SwitchStage::Stopping;
     t.server.accounts.remove("claude", "to");
-    t.server.finish_switch(1);
+    t.finish();
     assert_eq!(t.server.switches.pending[&1].stage, SwitchStage::Restoring);
     assert_eq!(t.server.panes[&1].spec.account.as_deref(), Some("claude:from"));
     assert!(t.server.panes[&1].spec.account_undo.is_none());
@@ -1858,6 +1885,259 @@ fn scripted_picker_launches_remove_display_environment() {
         assert!(crate::agent::detect_agent(&spec.command).is_none());
         for key in ["DISPLAY", "WAYLAND_DISPLAY"] {
             assert_eq!(spec.env_remove.iter().filter(|name| *name == key).count(), 1);
+        }
+    }
+}
+
+impl SwitchTest {
+    fn conversation_result(&mut self) -> super::super::Event {
+        use super::super::{Event, queue::Wait};
+        let deadline = Instant::now() + crate::testing::PATIENCE;
+        loop {
+            match self.rx.wait(deadline.saturating_duration_since(Instant::now())) {
+                Wait::Event(event @ Event::Job(..)) => return event,
+                Wait::Event(event) => self.server.handle(event),
+                Wait::Overflow => {}
+                _ => panic!("the conversation worker must finish"),
+            }
+        }
+    }
+}
+
+#[test]
+fn conversation_checks_apply_only_to_the_reserved_process_session_and_accounts() {
+    for change in ["cancel", "token", "closed", "session", "process", "from", "to", "home"] {
+        let mut t = SwitchTest::new(&format!("verification-result-{change}"));
+        t.server.switch_checked(1, 2, Status::SignedIn, false);
+        assert_eq!(t.server.switches.pending[&1].stage, SwitchStage::Verifying);
+        t.unchanged();
+        let result = t.conversation_result();
+        match change {
+            "cancel" => t.server.cancel_switch(1, 2),
+            "token" => t.server.switches.pending.get_mut(&1).unwrap().token = 3,
+            "closed" => {
+                t.server.panes.remove(&1);
+            }
+            "session" => t.server.panes.get_mut(&1).unwrap().agent.session_id = Some("other".into()),
+            "process" => {
+                t.spawn(PaneSpec {
+                    command: vec!["sh".into(), "-c".into(), "read line".into()],
+                    text: None,
+                    ..t.server.panes[&1].spec.clone()
+                });
+                t.server.panes.get_mut(&1).unwrap().agent.state = AgentState::Working;
+            }
+            "home" => {
+                let mut to = t.server.accounts.get("claude", "to").unwrap();
+                t.server.accounts.remove("claude", "to");
+                to.home = t.dir.join("other").display().to_string();
+                t.server.accounts.add(to).unwrap();
+            }
+            name => {
+                t.server.accounts.remove("claude", name);
+            }
+        }
+        t.server.handle(result);
+        if change == "token" {
+            assert_eq!(t.server.switches.pending[&1].token, 3);
+            assert_eq!(t.server.switches.pending[&1].stage, SwitchStage::Verifying);
+        } else {
+            assert!(t.server.switches.pending.is_empty(), "{change}");
+        }
+        if change != "closed" {
+            t.unchanged();
+        }
+    }
+}
+
+#[test]
+fn transfer_results_recheck_the_token_and_both_accounts_before_launching() {
+    for change in ["token", "closed", "from", "to", "home"] {
+        let mut t = SwitchTest::new(&format!("transfer-result-{change}"));
+        let switch = t.server.switches.pending.get_mut(&1).unwrap();
+        switch.stage = SwitchStage::Stopping;
+        switch.session = Some("session".into());
+        t.server.finish_switch(1);
+        assert_eq!(t.server.switches.pending[&1].stage, SwitchStage::Transferring);
+        assert_eq!(t.server.jobs.len(), 1);
+        t.server.finish_switch(1);
+        assert_eq!(t.server.jobs.len(), 1, "ticks cannot start duplicate transfers");
+        let result = t.conversation_result();
+        match change {
+            "token" => t.server.switches.pending.get_mut(&1).unwrap().token = 3,
+            "closed" => {
+                t.server.panes.remove(&1);
+            }
+            "home" => {
+                let mut to = t.server.accounts.get("claude", "to").unwrap();
+                t.server.accounts.remove("claude", "to");
+                to.home = t.dir.join("other").display().to_string();
+                t.server.accounts.add(to).unwrap();
+            }
+            name => {
+                t.server.accounts.remove("claude", name);
+            }
+        }
+        t.server.handle(result);
+        if change == "closed" {
+            assert!(t.server.switches.pending.is_empty());
+        } else {
+            assert_eq!(t.server.panes[&1].spec.account.as_deref(), Some("claude:from"));
+            assert_eq!(
+                t.server.switches.pending[&1].stage,
+                match change {
+                    "token" => SwitchStage::Transferring,
+                    _ => SwitchStage::RecoveryChecking,
+                }
+            );
+        }
+        if matches!(change, "from" | "to" | "home") {
+            t.conversation_jobs();
+            if change == "from" {
+                assert!(t.server.switches.pending.is_empty());
+            } else {
+                assert_eq!(t.server.switches.pending[&1].stage, SwitchStage::Restoring);
+            }
+        }
+        assert_eq!(
+            std::fs::read_to_string(t.dir.join("from/projects/work/session.jsonl")).unwrap(),
+            "{\"message\":1}\n"
+        );
+    }
+}
+
+#[test]
+fn conversation_worker_start_failures_leave_a_running_source_or_restore_it() {
+    for stopped in [false, true] {
+        let mut t = SwitchTest::new(if stopped { "transfer-worker-failure" } else { "check-worker-failure" });
+        super::super::jobs::FAIL_START.set(true);
+        if stopped {
+            t.server.switches.pending.get_mut(&1).unwrap().stage = SwitchStage::Stopping;
+            t.server.finish_switch(1);
+            t.conversation_jobs();
+            assert_eq!(t.server.switches.pending[&1].stage, SwitchStage::Restoring);
+            assert_eq!(t.server.panes[&1].spec.account.as_deref(), Some("claude:from"));
+        } else {
+            t.server.switch_checked(1, 2, Status::SignedIn, false);
+            assert!(t.server.switches.pending.is_empty());
+            t.unchanged();
+        }
+        assert!(t.server.jobs.is_empty());
+    }
+}
+
+#[test]
+fn switching_from_a_joined_home_keeps_the_launch_home_and_conversation() {
+    let mut t = SwitchTest::new("joined-home");
+    let old = t.server.accounts.get("claude", "from").unwrap();
+    t.server.accounts.remove("claude", "from");
+    let old = t.server.accounts.add(Account { review: true, ..old }).unwrap();
+    let named = t
+        .server
+        .accounts
+        .add(Account::new("claude", "named", t.dir.join("named").display().to_string(), None, false))
+        .unwrap();
+    t.server.accounts.review(&old, Some(&named)).unwrap();
+    let spec = &mut t.server.panes.get_mut(&1).unwrap().spec;
+    spec.env.push(("CLAUDE_CONFIG_DIR".into(), old.home.clone()));
+    t.server.accounts.bind_pane(spec);
+    let from = t.server.accounts.pane_account(spec).unwrap();
+    assert_eq!(from.id, named.id);
+    assert_eq!(from.home, old.home);
+    let switch = t.server.switches.pending.get_mut(&1).unwrap();
+    switch.from = from;
+    switch.original = spec.clone();
+    t.checked(Status::SignedIn);
+    assert_eq!(t.server.switches.pending[&1].stage, SwitchStage::Waiting);
+    t.server.switches.pending.get_mut(&1).unwrap().stage = SwitchStage::Stopping;
+    t.finish();
+    assert_eq!(t.server.switches.pending[&1].stage, SwitchStage::Starting);
+    assert_eq!(t.server.panes[&1].spec.account.as_deref(), Some("claude:to"));
+    assert_eq!(
+        std::fs::read(t.dir.join("to/projects/work/session.jsonl")).unwrap(),
+        std::fs::read(t.dir.join("from/projects/work/session.jsonl")).unwrap()
+    );
+}
+
+#[test]
+fn transfer_and_recovery_results_own_the_process_and_block_enter() {
+    for stage in [SwitchStage::Transferring, SwitchStage::RecoveryChecking] {
+        for replace in [false, true] {
+            let mut t = SwitchTest::new(&format!("worker-enter-{stage:?}-{replace}"));
+            let (client, _peer) = super::super::tests::client(&mut t.server);
+            let tab = &mut t.server.workspaces.last_mut().unwrap().tabs[0];
+            tab.root = Some(crate::layout::Node::Leaf(1));
+            tab.set_focus(1);
+            t.spawn(PaneSpec { command: vec!["sh".into(), "-c".into(), "exit".into()], ..Default::default() });
+            t.until("the source exits", |t| t.server.panes[&1].exit_code.is_some());
+            let pane = t.server.panes.get_mut(&1).unwrap();
+            pane.spec.command = vec!["sh".into(), "-c".into(), "read line".into()];
+            let before = pane.process_hold().unwrap();
+            let program = t.dir.join("claude");
+            crate::testing::write_script(&program, "#!/bin/sh\necho READY\nread -r line\n");
+            let switch = t.server.switches.pending.get_mut(&1).unwrap();
+            switch.original.command[0] = program.display().to_string();
+            switch.process = Some(before.clone());
+            switch.session = Some("session".into());
+            switch.stage =
+                if stage == SwitchStage::Transferring { SwitchStage::Stopping } else { SwitchStage::Restoring };
+            if stage == SwitchStage::Transferring {
+                t.server.finish_switch(1);
+            } else {
+                t.server.switch_start_failed(1, "source failed");
+            }
+            assert_eq!(t.server.switches.pending[&1].stage, stage);
+            let result = t.conversation_result();
+            t.server.client_input(client, b"\r");
+            assert!(t.server.panes[&1].process_hold().unwrap().is(&before), "Enter must wait for the worker");
+            assert!(t.server.panes[&1].exit_code.is_some());
+            let replacement = if replace {
+                t.spawn(t.server.panes[&1].spec.clone());
+                Some(t.server.panes[&1].process_hold().unwrap())
+            } else {
+                None
+            };
+            t.server.handle(result);
+            if let Some(process) = replacement {
+                assert!(t.server.panes[&1].process_hold().unwrap().is(&process));
+                assert!(t.server.panes[&1].exit_code.is_none());
+                assert_eq!(t.server.panes[&1].spec.command, ["sh", "-c", "read line"]);
+                assert!(t.server.switches.pending.is_empty());
+            } else if stage == SwitchStage::Transferring {
+                assert_eq!(t.server.panes[&1].spec.account.as_deref(), Some("claude:to"));
+                assert_eq!(t.server.switches.pending[&1].stage, SwitchStage::Starting);
+            } else {
+                assert!(t.server.switches.pending.is_empty());
+                assert!(t.server.panes[&1].exit_code.is_some());
+                assert!(t.server.panes[&1].spec.command.windows(2).any(|a| a == ["--resume", "session"]));
+            }
+        }
+    }
+}
+
+#[test]
+fn recovery_lookups_leave_the_server_free_to_handle_input() {
+    for stage in [SwitchStage::Starting, SwitchStage::Restoring] {
+        let mut t = SwitchTest::new(&format!("recovery-lookup-{stage:?}"));
+        let (client, _peer) = super::super::tests::client(&mut t.server);
+        let (release, pending) = std::sync::mpsc::channel();
+        super::switching::RECOVERY_LOOKUP.with(|gate| *gate.borrow_mut() = Some(pending));
+        t.server.switches.pending.get_mut(&1).unwrap().stage = stage;
+        t.server.switch_start_failed(1, "launch failed");
+        assert_eq!(t.server.switches.pending[&1].stage, SwitchStage::RecoveryChecking);
+        assert_eq!(t.server.jobs.len(), 1);
+        t.server.client_input(client, b"\x02?");
+        assert!(
+            !matches!(t.server.clients[&client].mode, Mode::Normal),
+            "another event is handled while the filesystem lookup is pending"
+        );
+        release.send(()).unwrap();
+        t.conversation_jobs();
+        if stage == SwitchStage::Starting {
+            assert_eq!(t.server.switches.pending[&1].stage, SwitchStage::Restoring);
+        } else {
+            assert!(t.server.switches.pending.is_empty());
+            assert!(t.server.panes[&1].exit_code.is_some());
         }
     }
 }
