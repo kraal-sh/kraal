@@ -1592,7 +1592,7 @@ impl Server {
             let mut items = display.items.clone();
             for item in &mut items {
                 if !matches!(item.action, super::ui::PickAction::AccountDetails(_)) {
-                    item.detail = super::account_ui::sidebar_summary(&item.detail, width as usize);
+                    item.detail = super::account_ui::sidebar_summary(&item.detail, width.saturating_sub(2) as usize);
                 }
                 if let super::ui::PickAction::ReviewAccount(a) = &item.action
                     && crate::text::columns(&item.label) > width as usize
@@ -2325,7 +2325,6 @@ impl Server {
                     || entry.detail.clone(),
                     |a| super::account_ui::usage_summary(a, self.usage.get(a), now),
                 );
-                let summary = summary.replace("Usage unavailable", "No usage yet");
                 let mut detail =
                     vec![Span::styled(summary, Style::default().fg(if error { th().blocked } else { th().dim }))];
                 if count > 0 {
@@ -2344,17 +2343,22 @@ impl Server {
                 continue;
             }
             let item = match entry.action {
-                super::ui::PickAction::AccountDetails(id) => SideItem::Account(id),
                 super::ui::PickAction::ReviewAccount(a) => SideItem::ReviewAccount(a.id),
                 super::ui::PickAction::AddAccount => SideItem::AddAccount,
                 _ => SideItem::Accounts,
             };
-            for text in [entry.label, entry.detail].into_iter().filter(|s| !s.is_empty()) {
-                rows.push(SideRow::Entry {
-                    item: Some(item.clone()),
-                    line: Line::from(if entry.dim { dim_span(&text) } else { Span::raw(text) }),
-                    selected: false,
-                });
+            // Indented like the workspaces' rows, and the add row as bold as theirs.
+            for (indent, text) in [(" ", entry.label), ("   ", entry.detail)].into_iter().filter(|(_, s)| !s.is_empty())
+            {
+                let text = format!("{indent}{text}");
+                let span = if entry.dim {
+                    dim_span(&text)
+                } else if matches!(item, SideItem::AddAccount) {
+                    Span::styled(text, Style::default().fg(th().text).add_modifier(Modifier::BOLD))
+                } else {
+                    Span::raw(text)
+                };
+                rows.push(SideRow::Entry { item: Some(item.clone()), line: Line::from(span), selected: false });
             }
         }
         rows
@@ -3179,7 +3183,7 @@ mod tests {
         let mut server = super::super::tests::server(tx);
         let (client, _peer) = super::super::tests::client(&mut server);
         server.existing_checks.insert("claude".into(), super::super::agents::ExistingCheck::Checking);
-        for (width, expected) in [(28, "Checking sign-in"), (12, "Checking")] {
+        for (width, expected) in [(28, "   Checking sign-in"), (14, "   Checking")] {
             server.config.sidebar.width = width;
             let rows = server.sidebar_rows(&server.clients[&client], 36, 1_000);
             let mut buf = Buffer::empty(Rect::new(0, 0, width, 36));
@@ -3275,9 +3279,11 @@ mod tests {
             assert!(rows.len() <= room);
             let SideRow::Entry { item, line, .. } = &rows[rows.len() - 2] else { panic!() };
             assert_eq!(item, &Some(SideItem::ReviewAccount(existing.id.clone())));
-            assert_eq!(line.to_string(), "? Which account is ~/.claude");
+            assert_eq!(line.to_string(), " ? Which account is ~/.claude");
             assert_eq!(line.spans[0].style.fg, Some(th().dim));
-            assert!(matches!(rows.last(), Some(SideRow::Entry { item: Some(SideItem::AddAccount), .. })));
+            let Some(SideRow::Entry { item: Some(SideItem::AddAccount), line, .. }) = rows.last() else { panic!() };
+            assert_eq!(line.to_string(), " + Add account");
+            assert!(line.spans[0].style.add_modifier.contains(Modifier::BOLD));
             assert_eq!(
                 rows.iter()
                     .filter(|r| matches!(r, SideRow::Entry { item: Some(SideItem::ReviewAccount(_)), .. }))

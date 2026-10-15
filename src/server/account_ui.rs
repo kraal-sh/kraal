@@ -121,10 +121,9 @@ pub(super) fn usage_summary(a: &Account, usage: Option<&Usage>, now: i64) -> Str
     if a.sign_in_required {
         return "Sign-in required".into();
     }
-    let Some(u) = usage else { return "Usage unavailable".into() };
-    if u.five_hour.is_none() && u.weekly.is_none() {
-        return "Usage unavailable".into();
-    }
+    let Some(u) = usage.filter(|u| u.five_hour.is_some() || u.weekly.is_some()) else {
+        return "No usage yet".into();
+    };
     if let Some(peak) = u.valid_peak(now) {
         format!("{peak:.0}% used")
     } else if u.observed_at > 0 {
@@ -791,7 +790,7 @@ mod tests {
         };
         let pane = server.spawn_pane(None, spec).unwrap();
         let display = server.account_display_at(1_001);
-        assert_eq!(display.items[0].detail, "Usage unavailable · 1 pane");
+        assert_eq!(display.items[0].detail, "No usage yet · 1 pane");
         assert_eq!(display.labels[&pane], "claude·work");
         server.accounts.rename("claude", "work", "renamed").unwrap();
         let display = server.account_display_at(1_001);
@@ -803,11 +802,11 @@ mod tests {
         let replacement = server.accounts.add(Account { id: "replacement".into(), ..a.clone() }).unwrap();
         let display = server.account_display_at(1_001);
         assert!(!display.labels.contains_key(&pane), "a reused name must not rebind the old pane");
-        assert_eq!(display.items[0].detail, "Usage unavailable");
+        assert_eq!(display.items[0].detail, "No usage yet");
         server.panes.get_mut(&pane).unwrap().spec.account_id = Some(replacement.id);
-        assert_eq!(server.account_display_at(1_001).items[0].detail, "Usage unavailable · 1 pane");
+        assert_eq!(server.account_display_at(1_001).items[0].detail, "No usage yet · 1 pane");
         server.panes.remove(&pane);
-        assert_eq!(server.account_display_at(1_001).items[0].detail, "Usage unavailable");
+        assert_eq!(server.account_display_at(1_001).items[0].detail, "No usage yet");
     }
 
     #[test]
@@ -834,7 +833,7 @@ mod tests {
         assert_eq!(server.account_display_at(2_020).items[0].detail, "Last checked 17m ago");
         assert_eq!(server.account_display_at(1_500).items[0].detail, "57% used");
         server.usage.0.clear();
-        assert_eq!(server.account_display_at(1_500).items[0].detail, "Usage unavailable");
+        assert_eq!(server.account_display_at(1_500).items[0].detail, "No usage yet");
     }
 
     #[test]
@@ -1063,8 +1062,8 @@ mod tests {
             observed_at: 1000,
             ..Default::default()
         };
-        assert_eq!(usage_summary(&a, None, 1100), "Usage unavailable");
-        assert_eq!(usage_summary(&a, Some(&Usage::default()), 1100), "Usage unavailable");
+        assert_eq!(usage_summary(&a, None, 1100), "No usage yet");
+        assert_eq!(usage_summary(&a, Some(&Usage::default()), 1100), "No usage yet");
         assert_eq!(usage_summary(&a, Some(&u), 1100), "57% used");
         assert_eq!(usage_summary(&a, Some(&u), 2000), "Last checked 16m ago");
         u.weekly = Some(Window { used_percent: 71.0, resets_at: None });
@@ -1093,7 +1092,7 @@ mod tests {
             parts.join(" · ")
         };
         for (u, now, peak, end, reset, summary, text) in [
-            (usage(None, None), 1100, None, None, None, "Usage unavailable", "no usage seen yet".into()),
+            (usage(None, None), 1100, None, None, None, "No usage yet", "no usage seen yet".into()),
             (usage(window(0.0, None), None), 1100, Some(0.0), Some(19000), None, "0% used", bars(Some(0.0), None, "")),
             (
                 usage(window(57.0, Some(2000)), None),
@@ -1215,7 +1214,7 @@ mod tests {
         }
         let mut server = server();
         let a = server.accounts.add(account()).unwrap();
-        assert_eq!(server.account_summary_at(&a, 1100), "Usage unavailable");
+        assert_eq!(server.account_summary_at(&a, 1100), "No usage yet");
         server.usage.0.insert(
             a.key(),
             Usage {
@@ -1322,7 +1321,7 @@ mod tests {
         let a = server.accounts.add(account()).unwrap();
         let mut p = server.accounts_picker(Some(&a.id));
         assert_eq!(p.current().unwrap().label, "Claude · work");
-        assert_eq!(p.current().unwrap().detail, "Usage unavailable");
+        assert_eq!(p.current().unwrap().detail, "No usage yet");
         assert_eq!(p.items.len(), 2);
         p.query = "nothing matches".into();
         p.refilter();
@@ -1414,7 +1413,7 @@ mod tests {
         let text = crate::testing::buffer_text(&buf);
         assert!(text.find("Use existing account").unwrap() < text.find("Sign in to another account").unwrap());
         let Mode::AccountDetails(details) = server.account_details(&a.id) else { panic!() };
-        assert_eq!(details.text, "Usage unavailable");
+        assert_eq!(details.text, "No usage yet");
         assert!(matches!(server.on_account_details(0, details, key("tab")), Mode::Picker(p) if p.actions == Some(0)));
     }
     #[test]

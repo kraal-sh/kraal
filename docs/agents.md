@@ -367,9 +367,9 @@ Open **Accounts** from the Agents menu (`ctrl+b A l`), or click the sidebar's **
 heading. In the sidebar, accounts use the same two-line rows as workspaces: a bold
 `Claude · work` label after `●` when panes use the account, or `○` when none do, then an
 indented, dimmed `57% used · 2 panes`. Only the usage turns red at or above the account's
-threshold. Zero panes are omitted. The sidebar says **No usage yet** before any measurement;
-the Accounts list says **Usage unavailable**. A login still to verify says **Sign-in required**
-(in red in the sidebar), and expired observations say **Last checked ...**.
+threshold. Zero panes are omitted. Before any measurement, the sidebar and the Accounts list say
+**No usage yet**. A login still to verify says **Sign-in required** (in red in the sidebar), and
+expired observations say **Last checked ...**.
 A narrow sidebar omits whole status parts that do not fit. Clicking either line opens details
 with the usage windows, when they were checked and their resets. The **⋮** marker on a selected
 or hovered account opens its actions, as does a right-click. Enter in the list opens details.
