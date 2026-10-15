@@ -2325,8 +2325,8 @@ impl Server {
         let Some(add) = items.pop() else { return Vec::new() };
         let questions: Vec<_> =
             items.extract_if(.., |item| matches!(item.action, super::ui::PickAction::ReviewAccount(_))).collect();
-        let question_count = questions.len().min(room - 2);
-        items.truncate((room - 2 - question_count) / 2);
+        let question_count = questions.len().min((room - 2) / 2);
+        items.truncate((room - 2) / 2 - question_count);
         items.extend(questions.into_iter().take(question_count));
         items.push(add);
         let mut rows = vec![SideRow::Section("ACCOUNTS")];
@@ -2345,14 +2345,14 @@ impl Server {
                     .filter_map(|pane| pane.agent.kind.as_ref().map(|_| pane.agent.state))
                     .max_by_key(agent_urgency)
                     .map_or(th().dim, |state| th().state_color(state));
-                let error = account.as_ref().is_some_and(|a| {
-                    a.sign_in_required
-                        || self.usage.peak(a, now).is_some_and(|peak| peak >= f64::from(self.accounts.threshold(a)))
-                });
                 let summary = account.as_ref().map_or_else(
                     || entry.detail.clone(),
-                    |a| super::account_ui::usage_summary(a, self.usage.get(a), now),
+                    |a| super::account_ui::usage_summary(a, self.account_discovery.status(a), self.usage.get(a), now),
                 );
+                let error = matches!(summary.as_str(), "Sign-in required" | "Not installed")
+                    || account.as_ref().is_some_and(|a| {
+                        self.usage.peak(a, now).is_some_and(|peak| peak >= f64::from(self.accounts.threshold(a)))
+                    });
                 let mut detail =
                     vec![Span::styled(summary, Style::default().fg(if error { th().blocked } else { th().dim }))];
                 if count > 0 {
@@ -3160,6 +3160,70 @@ mod tests {
         assert_eq!(cut.iter().map(|s| s.content.as_ref()).collect::<String>(), "deploy fail…");
     }
     #[test]
+    fn account_rows_follow_cached_sign_in_status_with_and_without_usage() {
+        use crate::account_status::Status;
+        use crate::accounts::{Account, Usage, Window};
+        for used in [false, true] {
+            let (tx, _rx) = super::super::queue::channel(16);
+            let mut server = super::super::tests::server(tx);
+            let (client, _peer) = super::super::tests::client(&mut server);
+            server.config.sidebar.width = 28;
+            let account =
+                server.accounts.add(Account::new("claude", "gmail", "/nonexistent/gmail".into(), None, false)).unwrap();
+            if used {
+                server.usage.0.insert(
+                    account.key(),
+                    Usage {
+                        five_hour: Some(Window { used_percent: 77.0, resets_at: Some(2_000) }),
+                        observed_at: 1_000,
+                        ..Default::default()
+                    },
+                );
+            }
+            for status in [
+                None,
+                Some(Status::NotSignedIn),
+                Some(Status::NotInstalled),
+                Some(Status::CouldNotCheck),
+                Some(Status::SignedIn),
+            ] {
+                if let Some(status) = status {
+                    server.account_discovery.set_status(&account, status);
+                }
+                let expected = match status {
+                    Some(Status::NotSignedIn) => "Sign-in required",
+                    Some(Status::NotInstalled) => "Not installed",
+                    _ if used => "77% used",
+                    _ => "No usage yet",
+                };
+                let picker = server.accounts_picker_at(Some(&account.id), 1_100);
+                assert_eq!(picker.current().unwrap().detail, expected);
+                let rows = server.sidebar_rows(&server.clients[&client], 36, 1_100);
+                let details: Vec<_> = rows
+                    .iter()
+                    .filter_map(|row| match row {
+                        SideRow::Entry { item: Some(SideItem::Account(id)), line, .. } if id == &account.id => {
+                            Some(line)
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(details.len(), 2);
+                assert_eq!(details[1].to_string().trim(), expected);
+                assert_eq!(
+                    details[1].spans.last().unwrap().style.fg,
+                    Some(if matches!(status, Some(Status::NotSignedIn | Status::NotInstalled)) {
+                        th().blocked
+                    } else {
+                        th().dim
+                    })
+                );
+            }
+            assert!(server.jobs.is_empty(), "building rows must not start checks");
+        }
+    }
+
+    #[test]
     fn account_sidebar_rows_show_usage_counts_and_styles_at_full_and_narrow_widths() {
         use crate::accounts::{Usage, Window};
         let (tx, _rx) = super::super::queue::channel(32);
@@ -3413,33 +3477,76 @@ mod tests {
     }
 
     #[test]
-    fn unresolved_sign_in_is_one_dim_question_above_add_even_when_space_is_short() {
-        use super::super::ui::{PickAction, PickItem};
-        let existing = crate::accounts::Accounts::empty().get("claude", "default").unwrap();
-        let items = vec![
-            PickItem::new("Claude · work", "57% used · 2 panes", PickAction::AccountDetails("work-id".into())),
-            PickItem::new(crate::accounts::review_question(&existing), "", PickAction::ReviewAccount(existing.clone()))
-                .dim(),
-            PickItem::new("+ Add account", "", PickAction::AddAccount),
-        ];
+    fn unresolved_sign_in_shows_usage_below_the_question_and_fits_the_sidebar() {
+        use crate::accounts::{Account, Usage, Window};
         let (tx, _rx) = super::super::queue::channel(16);
-        let server = super::super::tests::server(tx);
-        for room in [3, 4, 5, 6, 20] {
-            let rows = server.account_rows(items.clone(), room, 0);
-            assert!(rows.len() <= room);
-            let SideRow::Entry { item, line, .. } = &rows[rows.len() - 2] else { panic!() };
-            assert_eq!(item, &Some(SideItem::ReviewAccount(existing.id.clone())));
-            assert_eq!(line.to_string(), " ? Which account is ~/.claude");
-            assert_eq!(line.spans[0].style.fg, Some(th().dim));
-            let Some(SideRow::Entry { item: Some(SideItem::AddAccount), line, .. }) = rows.last() else { panic!() };
-            assert_eq!(line.to_string(), " + Add account");
-            assert!(line.spans[0].style.add_modifier.contains(Modifier::BOLD));
-            assert_eq!(
-                rows.iter()
-                    .filter(|r| matches!(r, SideRow::Entry { item: Some(SideItem::ReviewAccount(_)), .. }))
-                    .count(),
-                1
-            );
+        let mut server = super::super::tests::server(tx);
+        let (client, _peer) = super::super::tests::client(&mut server);
+        server.config.sidebar.width = 28;
+        server.accounts.add(Account::new("claude", "work", "/nonexistent/work".into(), None, false)).unwrap();
+        let existing = server.accounts.get("claude", "default").unwrap();
+        server.accounts.adopt_checked(&existing, None).unwrap();
+        let existing = server.accounts.reviews().pop().unwrap();
+        for used in [false, true] {
+            if used {
+                server.usage.0.insert(
+                    existing.key(),
+                    Usage {
+                        five_hour: Some(Window { used_percent: 77.0, resets_at: Some(2_000) }),
+                        observed_at: 1_000,
+                        ..Default::default()
+                    },
+                );
+            }
+            let expected = if used { "77% used" } else { "No usage yet" };
+            let items = server.accounts_picker_at(None, 1_100).items;
+            assert_eq!(items[1].label, "? Which account is ~/.claude");
+            assert_eq!(items[1].detail, expected);
+            assert!(items[1].dim);
+            for room in 0..9 {
+                let rows = server.account_rows(items.clone(), room, 1_100);
+                assert!(rows.len() <= room);
+                let question: Vec<_> = rows
+                    .iter()
+                    .filter_map(|row| match row {
+                        SideRow::Entry { item: Some(SideItem::ReviewAccount(id)), line, .. } => {
+                            assert_eq!(id, &existing.id);
+                            assert_eq!(line.spans[0].style.fg, Some(th().dim));
+                            Some(line.to_string())
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                if room >= 4 {
+                    assert_eq!(question, [" ? Which account is ~/.claude".to_string(), format!("   {expected}")]);
+                } else {
+                    assert!(question.is_empty());
+                }
+                if room >= 2 {
+                    assert!(matches!(rows[0], SideRow::Section("ACCOUNTS")));
+                    let Some(SideRow::Entry { item: Some(SideItem::AddAccount), line, .. }) = rows.last() else {
+                        panic!()
+                    };
+                    assert_eq!(line.to_string(), " + Add account");
+                    assert!(line.spans[0].style.add_modifier.contains(Modifier::BOLD));
+                }
+            }
+            let rows = server.sidebar_rows(&server.clients[&client], 36, 1_100);
+            let y = rows
+                .iter()
+                .position(|row| {
+                    matches!(row,
+                SideRow::Entry { item: Some(SideItem::ReviewAccount(id)), .. } if id == &existing.id)
+                })
+                .unwrap();
+            for (offset, expected) in [(0, "? Account for ~/.claude"), (1, expected)] {
+                let SideRow::Entry { line, .. } = &rows[y + offset] else { panic!() };
+                assert_eq!(line.to_string().trim(), expected);
+                assert_eq!(
+                    server.sidebar_hit(client, (y + offset) as u16),
+                    Some(SideItem::ReviewAccount(existing.id.clone()))
+                );
+            }
         }
     }
 

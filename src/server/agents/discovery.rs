@@ -94,6 +94,18 @@ impl Discovery {
         self.identities.get(&account.id).filter(|(a, _)| a == account).cloned()
     }
 
+    pub(in crate::server) fn status(&self, account: &Account) -> Option<Status> {
+        self.identities
+            .get(&account.id)
+            .filter(|(a, _)| {
+                a.agent == account.agent
+                    && a.home == account.home
+                    && a.login_revision == account.login_revision
+                    && a.sign_in_required == account.sign_in_required
+            })
+            .map(|(_, checked)| checked.status)
+    }
+
     fn is_current(&self, agent: &str, generation: u64) -> bool {
         self.generations.get(agent).copied().unwrap_or_default() == generation
     }
@@ -132,6 +144,12 @@ impl Discovery {
         *self.generations.entry(agent.into()).or_default() += 1;
         self.identities.retain(|_, (a, _)| a.agent != agent);
         self.checks.remove(agent);
+    }
+
+    #[cfg(test)]
+    pub(in crate::server) fn set_status(&mut self, account: &Account, status: Status) {
+        self.identities
+            .insert(account.id.clone(), (account.clone(), account_status::Checked { status, identity: None }));
     }
 
     #[cfg(test)]
@@ -413,6 +431,29 @@ impl Server {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn display_status_survives_metadata_changes_but_not_identity_home_or_login_changes() {
+        let mut discovery = Discovery::default();
+        let account = Account::new("claude", "gmail", "/unused/claude".into(), None, false);
+        discovery.set_status(&account, Status::NotSignedIn);
+        for changed in [
+            Account { name: "renamed".into(), ..account.clone() },
+            Account { note: Some("Work account".into()), ..account.clone() },
+            Account { threshold: Some(75), ..account.clone() },
+        ] {
+            assert_eq!(discovery.status(&changed), Some(Status::NotSignedIn));
+        }
+        for changed in [
+            Account { id: "replacement".into(), ..account.clone() },
+            Account { agent: "codex".into(), ..account.clone() },
+            Account { home: "/unused/other".into(), ..account.clone() },
+            Account { login_revision: "new-login".into(), ..account.clone() },
+            Account { sign_in_required: true, ..account },
+        ] {
+            assert_eq!(discovery.status(&changed), None);
+        }
+    }
 
     #[test]
     fn invalidation_rejects_late_completion_and_keeps_other_agents_cached() {

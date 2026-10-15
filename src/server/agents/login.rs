@@ -102,6 +102,7 @@ impl Server {
                 login.lock = None;
             } else {
                 self.reload_accounts();
+                self.refresh_agent_pickers();
                 self.added_login_finished(id, &account);
                 self.close_pane(id);
                 let message = format!("{} is signed in", accounts::label(&account));

@@ -156,7 +156,7 @@ impl Server {
                 if switch_for.is_none() && (!installed || a.sign_in_required) {
                     continue;
                 }
-                let mut detail = super::super::account_ui::usage_summary(&a, self.usage.get(&a), now);
+                let mut detail = super::super::account_ui::usage_summary(&a, None, self.usage.get(&a), now);
                 let is_current = current.as_ref().is_some_and(|c| c.id == a.id || c.same_home(&a));
                 if is_current {
                     detail = format!("current · {detail}");
