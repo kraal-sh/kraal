@@ -37,7 +37,7 @@ impl Server {
         let ids: Vec<PaneId> = self.panes.keys().copied().collect();
         let panes = &self.panes;
         self.screen_limits.retain(|p, _| panes.contains_key(p));
-        self.switches.retain(|p, _| panes.contains_key(p));
+        self.switches.retain_panes(|p| panes.contains_key(&p));
         for id in ids {
             let Some(a) = self.pane_account(id) else { continue };
             // Limit messages on screen are the freshest signal there is (one saved before a
@@ -63,7 +63,7 @@ impl Server {
                 self.usage.0.insert(a.key(), u);
                 self.await_usage_reset();
             }
-            if self.switches.contains_key(&id) {
+            if self.switches.contains(id) {
                 continue;
             }
             let Some(peak) = self.usage.peak(&a, now) else { continue };
@@ -172,19 +172,4 @@ impl Server {
             self.warnings.push(format!("cannot ask Codex for its limits: {e}"));
         }
     }
-}
-
-/// "5h ▓▓▓▓░░░░ 48% · 7d ▓▓▓▓▓▓░░ 71% · resets in 1h20"
-pub fn usage_text(u: &accounts::Usage, now: i64) -> String {
-    let mut parts = Vec::new();
-    for (name, pct) in ["5h", "7d"].into_iter().zip(u.percentages(now)) {
-        if let Some(pct) = pct {
-            parts.push(format!("{name} {} {pct:.0}%", crate::theme::current().bar(pct)));
-        }
-    }
-    let reset = accounts::describe_reset(u.next_reset(now), now);
-    if !reset.is_empty() {
-        parts.push(reset);
-    }
-    if parts.is_empty() { "no usage seen yet".into() } else { parts.join(" · ") }
 }

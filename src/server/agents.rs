@@ -17,8 +17,20 @@ mod limits;
 mod login;
 mod switching;
 
-pub use limits::usage_text;
 pub(super) use login::login_start_failed;
+
+#[derive(Default)]
+pub(super) struct Discovery {
+    checks: std::collections::HashMap<String, ExistingCheck>,
+    generations: std::collections::HashMap<String, u64>,
+    identities: std::collections::HashMap<String, (Account, crate::account_status::Checked)>,
+    observed: std::collections::HashMap<crate::layout::PaneId, ObservedAgent>,
+}
+
+#[derive(Default)]
+pub(super) struct AccountSwitches {
+    pending: std::collections::HashMap<crate::layout::PaneId, AccountSwitch>,
+}
 
 /// What kraal last did about a pane being over its threshold, so it does not repeat itself.
 #[derive(Debug, Clone, PartialEq)]

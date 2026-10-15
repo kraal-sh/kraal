@@ -1014,8 +1014,8 @@ mod tests {
             let (tx, _rx) = crate::server::queue::channel(16);
             let mut server = crate::server::tests::server(tx);
             let (client, _peer) = crate::server::tests::client(&mut server);
-            server.existing_checks.insert("claude".into(), ExistingCheck::Checked(Status::NotSignedIn));
-            server.existing_checks.insert("codex".into(), ExistingCheck::Checking);
+            server.account_discovery.set_check("claude", ExistingCheck::Checked(Status::NotSignedIn));
+            server.account_discovery.set_check("codex", ExistingCheck::Checking);
             let row = (0..36)
                 .find(|&row| {
                     matches!(
@@ -1031,7 +1031,7 @@ mod tests {
             } else {
                 assert!(matches!(mode, Mode::Picker(p) if p.kind == PickerKind::Accounts));
             }
-            assert!(matches!(server.existing_checks["claude"], ExistingCheck::Checking));
+            assert!(matches!(server.account_discovery.checks()["claude"], ExistingCheck::Checking));
             assert_eq!(server.jobs.len(), 1, "retry the cached result without duplicating the check in progress");
         }
     }

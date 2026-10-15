@@ -75,7 +75,6 @@ use crate::persist;
 use crate::protocol::ServerMsg;
 use crate::theme::NoticeKind;
 
-pub use agents::usage_text;
 pub use clients::frame_bytes;
 use persistence::spawn_persister;
 use queue::Wait;
@@ -515,9 +514,7 @@ pub struct Server {
     /// ssh destinations already looked at for auto-adding.
     discovered: Vec<crate::servers::Server>,
     pub accounts: crate::accounts::Accounts,
-    existing_checks: HashMap<String, agents::ExistingCheck>,
-    account_identity_generations: HashMap<String, u64>,
-    account_identities: HashMap<String, (crate::accounts::Account, crate::account_status::Checked)>,
+    account_discovery: agents::Discovery,
     account_notices: Vec<String>,
     /// Name of the workspace whose definition is being started (for account rules).
     starting_workspace: Option<String>,
@@ -531,9 +528,8 @@ pub struct Server {
     /// screen is one observation, not a new one at every check.
     screen_limits: HashMap<PaneId, (bool, f64)>,
     /// Account changes shared by every client attached to this session.
-    switches: HashMap<PaneId, agents::AccountSwitch>,
+    switches: agents::AccountSwitches,
     pane_edits: HashMap<PaneId, pane_ui::PaneEdit>,
-    observed_agents: HashMap<PaneId, agents::ObservedAgent>,
     /// Panes whose account is over its threshold, already reported as an event.
     limit_events: std::collections::HashSet<PaneId>,
     /// Branch and changes per directory (None: not a repository).
@@ -871,9 +867,7 @@ pub fn run(session: &str) -> Result<()> {
         known_servers: Vec::new(),
         discovered: Default::default(),
         accounts: crate::accounts::Accounts::empty(),
-        existing_checks: HashMap::new(),
-        account_identity_generations: HashMap::new(),
-        account_identities: HashMap::new(),
+        account_discovery: agents::Discovery::default(),
         account_notices: Vec::new(),
         starting_workspace: None,
         usage: Default::default(),
@@ -881,9 +875,8 @@ pub fn run(session: &str) -> Result<()> {
         last_codex_poll: Instant::now() - Duration::from_secs(3600),
         limit_alerts: HashMap::new(),
         screen_limits: HashMap::new(),
-        switches: HashMap::new(),
+        switches: agents::AccountSwitches::default(),
         pane_edits: HashMap::new(),
-        observed_agents: HashMap::new(),
         limit_events: Default::default(),
         ready: Default::default(),
         ready_set: Default::default(),
@@ -1458,16 +1451,7 @@ impl Server {
             || !self.waits.is_empty()
             || !self.exiting.is_empty()
             || !self.pane_edits.is_empty()
-            || self.switches.values().any(|s| {
-                matches!(
-                    s.stage,
-                    agents::SwitchStage::Stopping
-                        | agents::SwitchStage::Starting
-                        | agents::SwitchStage::Restoring
-                        | agents::SwitchStage::Recovering
-                        | agents::SwitchStage::RecoveryStopping
-                )
-            })
+            || self.switches.busy()
             || self.hooks.busy()
             || self.panes.values().any(|p| {
                 p.close_at.is_some()
@@ -2161,9 +2145,7 @@ mod tests {
             known_servers: Vec::new(),
             discovered: Default::default(),
             accounts: crate::accounts::Accounts::empty(),
-            existing_checks: HashMap::new(),
-            account_identity_generations: HashMap::new(),
-            account_identities: HashMap::new(),
+            account_discovery: agents::Discovery::default(),
             account_notices: Vec::new(),
             starting_workspace: None,
             usage: Default::default(),
@@ -2171,9 +2153,8 @@ mod tests {
             last_codex_poll: Instant::now() - Duration::from_secs(3600),
             limit_alerts: HashMap::new(),
             screen_limits: HashMap::new(),
-            switches: HashMap::new(),
+            switches: agents::AccountSwitches::default(),
             pane_edits: HashMap::new(),
-            observed_agents: HashMap::new(),
             limit_events: Default::default(),
             ready: Default::default(),
             ready_set: Default::default(),

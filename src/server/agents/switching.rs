@@ -7,7 +7,7 @@ use super::super::panes::ProgramStop;
 use super::super::ui::{ConfirmAction, Mode, PickAction, PickItem, Picker, PickerKind};
 use super::super::{ClientId, Server};
 use super::choices::cannot_switch_mode;
-use super::{AMBIGUOUS, AccountSwitch, SwitchStage};
+use super::{AMBIGUOUS, AccountSwitch, AccountSwitches, SwitchStage};
 use crate::account_status::{self, Status};
 use crate::accounts::{self, Account};
 use crate::agent::AgentState;
@@ -28,6 +28,149 @@ pub(super) fn switch_timing(hooked: bool, state: AgentState, exited: bool) -> Sw
 /// Whether a conversation can move between accounts of this agent (they share its storage).
 fn conversations_move(agent: &str) -> bool {
     crate::agent_registry::find(agent).is_some_and(|a| a.cross_account_resume)
+}
+
+enum StartProgress {
+    Pending,
+    Started,
+    Stop(SwitchStage),
+    Failed,
+}
+
+impl AccountSwitches {
+    pub(in crate::server) fn get(&self, pane: &PaneId) -> Option<&AccountSwitch> {
+        self.pending.get(pane)
+    }
+
+    pub(in crate::server) fn contains(&self, pane: PaneId) -> bool {
+        self.pending.contains_key(&pane)
+    }
+
+    pub(in crate::server) fn finish(&mut self, pane: PaneId) -> Option<AccountSwitch> {
+        self.pending.remove(&pane)
+    }
+
+    pub(in crate::server) fn retain_panes(&mut self, exists: impl Fn(PaneId) -> bool) {
+        self.pending.retain(|&pane, _| exists(pane));
+    }
+
+    pub(in crate::server) fn busy(&self) -> bool {
+        self.pending.values().any(|s| {
+            matches!(
+                s.stage,
+                SwitchStage::Stopping
+                    | SwitchStage::Starting
+                    | SwitchStage::Restoring
+                    | SwitchStage::Recovering
+                    | SwitchStage::RecoveryStopping
+            )
+        })
+    }
+
+    fn in_stages<'a>(&'a self, stages: &'a [SwitchStage]) -> impl Iterator<Item = (PaneId, SwitchStage)> + 'a {
+        self.pending.iter().filter_map(|(&id, s)| stages.contains(&s.stage).then_some((id, s.stage)))
+    }
+
+    fn start_progress(&mut self, pane: &crate::pane::Pane) -> StartProgress {
+        let s = self.pending.get_mut(&pane.id).unwrap();
+        let elapsed = s.started.get_or_insert_with(Instant::now).elapsed();
+        let expected = if s.stage == SwitchStage::Restoring { &s.from.agent } else { &s.to.agent };
+        let running = pane.pid().is_some_and(|pid| crate::process::running(pid as libc::pid_t));
+        if running
+            && pane.has_printed()
+            && pane.agent.kind.as_ref() == Some(expected)
+            && elapsed >= Duration::from_secs(1)
+        {
+            StartProgress::Started
+        } else if elapsed >= Duration::from_secs(10) {
+            if running {
+                // Wait for the last output and exit before another process takes this pane.
+                StartProgress::Stop(if s.stage == SwitchStage::Restoring {
+                    SwitchStage::RecoveryStopping
+                } else {
+                    SwitchStage::Recovering
+                })
+            } else {
+                StartProgress::Failed
+            }
+        } else {
+            StartProgress::Pending
+        }
+    }
+
+    fn reserve(&mut self, pane: PaneId, switch: AccountSwitch) {
+        self.pending.insert(pane, switch);
+    }
+
+    fn check(&mut self, pane: PaneId) -> Option<(u32, Account)> {
+        let switch = self.pending.get_mut(&pane)?;
+        switch.stage = SwitchStage::Checking;
+        Some((switch.token, switch.to.clone()))
+    }
+
+    fn checked(&self, pane: PaneId, token: u32) -> Option<&AccountSwitch> {
+        self.pending.get(&pane).filter(|s| s.token == token && s.stage == SwitchStage::Checking)
+    }
+
+    fn cancel(&mut self, pane: PaneId, token: u32) -> bool {
+        if self.pending.get(&pane).is_some_and(|s| {
+            s.token == token && matches!(s.stage, SwitchStage::Checking | SwitchStage::Waiting | SwitchStage::Confirm)
+        }) {
+            self.pending.remove(&pane);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn confirm(&mut self, pane: PaneId, token: u32, client: ClientId) -> bool {
+        let Some(switch) = self.pending.get_mut(&pane).filter(|s| s.token == token && s.stage == SwitchStage::Confirm)
+        else {
+            return false;
+        };
+        switch.client = Some(client);
+        true
+    }
+
+    fn prepared(&mut self, pane: PaneId, session: Option<String>, cwd: Option<std::path::PathBuf>, stage: SwitchStage) {
+        let switch = self.pending.get_mut(&pane).unwrap();
+        switch.original.session = session.clone();
+        if switch.observed.is_none() {
+            switch.original.cwd = cwd.or_else(|| switch.original.cwd.clone());
+        }
+        switch.session = session;
+        switch.stage = stage;
+    }
+
+    fn stop(&mut self, pane: PaneId, stage: SwitchStage, stop: Option<ProgramStop>) {
+        let switch = self.pending.get_mut(&pane).unwrap();
+        switch.stage = stage;
+        switch.stopping = stop;
+        if let Some(stop) = &switch.stopping {
+            stop.signal(libc::SIGHUP);
+        }
+    }
+
+    fn stopped(&mut self, pane: PaneId, exited: bool) -> bool {
+        let Some(stop) = self.pending.get_mut(&pane).and_then(|s| s.stopping.as_mut()) else { return true };
+        stop.finished() && exited
+    }
+
+    fn spawned(&mut self, pane: PaneId) {
+        let switch = self.pending.get_mut(&pane).unwrap();
+        switch.started = Some(Instant::now());
+        switch.stopping = None;
+    }
+
+    fn starting(&mut self, pane: PaneId) {
+        self.pending.get_mut(&pane).unwrap().stage = SwitchStage::Starting;
+    }
+
+    fn restore(&mut self, pane: PaneId) -> Option<PaneSpec> {
+        let switch = self.pending.get_mut(&pane)?;
+        switch.stage = SwitchStage::Restoring;
+        Some(switch.original.clone())
+    }
 }
 
 impl Server {
@@ -72,7 +215,7 @@ impl Server {
         if from.id == to.id || from.same_home(to) {
             return Ok(());
         }
-        anyhow::ensure!(!self.switches.contains_key(&pane), "an account change is already pending for this pane");
+        anyhow::ensure!(!self.switches.contains(pane), "an account change is already pending for this pane");
         anyhow::ensure!(!self.pane_edits.contains_key(&pane), "a pane edit is already being applied");
         let kind = accounts::agent_kind(&to.agent).context("unknown agent")?;
         let mut original = match &observed {
@@ -93,7 +236,7 @@ impl Server {
             .context("a one-shot run (-p, exec) is not a conversation to continue")?;
         let process = p.process_hold();
         let token = self.alloc_id();
-        self.switches.insert(
+        self.switches.reserve(
             pane,
             AccountSwitch {
                 token,
@@ -119,9 +262,7 @@ impl Server {
     }
 
     fn check_switch(&mut self, pane: PaneId, approved: bool) {
-        let Some(switch) = self.switches.get_mut(&pane) else { return };
-        switch.stage = SwitchStage::Checking;
-        let (token, to) = (switch.token, switch.to.clone());
+        let Some((token, to)) = self.switches.check(pane) else { return };
         if !self.background(
             move || account_status::check(&to),
             move |server, status| server.switch_checked(pane, token, status, approved),
@@ -133,12 +274,11 @@ impl Server {
     }
 
     pub(super) fn switch_checked(&mut self, pane: PaneId, token: u32, status: Status, approved: bool) {
-        let Some(switch) = self.switches.get(&pane).filter(|s| s.token == token && s.stage == SwitchStage::Checking)
-        else {
+        let Some(switch) = self.switches.checked(pane, token) else {
             return;
         };
         if !self.panes.contains_key(&pane) {
-            self.switches.remove(&pane);
+            self.switches.finish(pane);
             self.refresh_switch_views(pane);
             return;
         }
@@ -152,7 +292,7 @@ impl Server {
     }
 
     pub(super) fn switch_failed(&mut self, pane: PaneId, reason: &str, sign_in: bool) {
-        let Some(switch) = self.switches.remove(&pane) else { return };
+        let Some(switch) = self.switches.finish(pane) else { return };
         self.refresh_switch_views(pane);
         let unsupported = switch
             .observed
@@ -252,13 +392,8 @@ impl Server {
         };
         let exited = p.exit_code.is_some();
         let client = switch.client;
-        let switch = self.switches.get_mut(&pane).unwrap();
-        switch.original.session = session.clone();
-        if switch.observed.is_none() {
-            switch.original.cwd = p.current_cwd().or_else(|| switch.original.cwd.clone());
-        }
-        switch.session = session;
-        switch.stage = stage;
+        let cwd = switch.observed.is_none().then(|| p.current_cwd()).flatten();
+        self.switches.prepared(pane, session, cwd, stage);
         match stage {
             SwitchStage::Waiting => {
                 self.notify(
@@ -282,7 +417,7 @@ impl Server {
                         );
                     }
                 } else {
-                    self.switches.remove(&pane);
+                    self.switches.finish(pane);
                     self.notify(
                         NoticeKind::Warning,
                         "Account change needs confirmation",
@@ -388,10 +523,7 @@ impl Server {
     }
 
     pub(in crate::server) fn cancel_switch(&mut self, pane: PaneId, token: u32) {
-        if self.switches.get(&pane).is_some_and(|s| {
-            s.token == token && matches!(s.stage, SwitchStage::Checking | SwitchStage::Waiting | SwitchStage::Confirm)
-        }) {
-            self.switches.remove(&pane);
+        if self.switches.cancel(pane, token) {
             self.refresh_switch_views(pane);
             self.mark_dirty();
         }
@@ -402,7 +534,7 @@ impl Server {
             return;
         }
         if yes {
-            self.switches.get_mut(&pane).unwrap().client = Some(client);
+            self.switches.confirm(pane, token, client);
             self.check_switch(pane, true);
         } else {
             self.cancel_switch(pane, token);
@@ -410,14 +542,13 @@ impl Server {
     }
 
     pub(in crate::server) fn check_switches(&mut self) {
-        self.switches.retain(|p, _| self.panes.contains_key(p));
+        self.switches.retain_panes(|p| self.panes.contains_key(&p));
         let ready: Vec<PaneId> = self
             .switches
-            .iter()
-            .filter_map(|(&id, s)| {
+            .in_stages(&[SwitchStage::Waiting])
+            .filter_map(|(id, _)| {
                 let p = self.panes.get(&id)?;
-                (s.stage == SwitchStage::Waiting
-                    && switch_timing(p.agent.hooked, p.agent.state, p.exit_code.is_some()) != SwitchStage::Waiting)
+                (switch_timing(p.agent.hooked, p.agent.state, p.exit_code.is_some()) != SwitchStage::Waiting)
                     .then_some(id)
             })
             .collect();
@@ -426,11 +557,7 @@ impl Server {
         }
         let stopping: Vec<_> = self
             .switches
-            .iter()
-            .filter_map(|(&id, s)| {
-                matches!(s.stage, SwitchStage::Stopping | SwitchStage::Recovering | SwitchStage::RecoveryStopping)
-                    .then_some((id, s.stage))
-            })
+            .in_stages(&[SwitchStage::Stopping, SwitchStage::Recovering, SwitchStage::RecoveryStopping])
             .collect();
         for (id, stage) in stopping {
             if stage == SwitchStage::Stopping {
@@ -439,52 +566,24 @@ impl Server {
                 self.switch_start_failed(id, "the agent did not start");
             }
         }
-        let starting: Vec<_> = self
-            .switches
-            .iter()
-            .filter_map(|(&id, s)| matches!(s.stage, SwitchStage::Starting | SwitchStage::Restoring).then_some(id))
-            .collect();
-        for id in starting {
+        let starting: Vec<_> = self.switches.in_stages(&[SwitchStage::Starting, SwitchStage::Restoring]).collect();
+        for (id, _) in starting {
             let Some(p) = self.panes.get(&id).filter(|p| !p.suspended) else { continue };
-            let s = self.switches.get_mut(&id).unwrap();
-            let elapsed = s.started.get_or_insert_with(Instant::now).elapsed();
-            let expected = if s.stage == SwitchStage::Restoring { &s.from.agent } else { &s.to.agent };
-            let running = p.pid().is_some_and(|pid| crate::process::running(pid as libc::pid_t));
-            if running
-                && p.has_printed()
-                && p.agent.kind.as_ref() == Some(expected)
-                && elapsed >= Duration::from_secs(1)
-            {
-                self.switch_started(id);
-            } else if elapsed >= Duration::from_secs(10) {
-                if running {
-                    // Wait for the last output and exit before another process takes this pane.
-                    let stage = if s.stage == SwitchStage::Restoring {
-                        SwitchStage::RecoveryStopping
-                    } else {
-                        SwitchStage::Recovering
-                    };
-                    self.stop_switch(id, stage);
-                } else {
-                    self.switch_start_failed(id, "the agent did not start");
-                }
+            match self.switches.start_progress(p) {
+                StartProgress::Pending => {}
+                StartProgress::Started => self.switch_started(id),
+                StartProgress::Stop(stage) => self.stop_switch(id, stage),
+                StartProgress::Failed => self.switch_start_failed(id, "the agent did not start"),
             }
         }
     }
 
     fn stop_switch(&mut self, pane: PaneId, stage: SwitchStage) {
-        let switch = self.switches.get_mut(&pane).unwrap();
-        switch.stage = stage;
-        let p = &self.panes[&pane];
-        switch.stopping = ProgramStop::new(p);
-        if let Some(stop) = &switch.stopping {
-            stop.signal(libc::SIGHUP);
-        }
+        self.switches.stop(pane, stage, ProgramStop::new(&self.panes[&pane]));
     }
 
     fn switch_stopped(&mut self, pane: PaneId) -> bool {
-        let Some(stop) = self.switches.get_mut(&pane).and_then(|s| s.stopping.as_mut()) else { return true };
-        stop.finished() && self.panes.get(&pane).is_none_or(|p| p.exit_code.is_some())
+        self.switches.stopped(pane, self.panes.get(&pane).is_none_or(|p| p.exit_code.is_some()))
     }
 
     /// Keep the source until the replacement reports a usable start, including an early exit.
@@ -526,7 +625,7 @@ impl Server {
             }
             spec.env.extend(source.env.iter().filter(|(k, _)| k == "PATH").cloned());
             crate::worktree_setup::carry_env(&original.env, &mut spec.env);
-            self.switches.get_mut(&pane).unwrap().stage = SwitchStage::Starting;
+            self.switches.starting(pane);
             if !undo {
                 let mut previous = original.clone();
                 previous.account_undo = None;
@@ -554,9 +653,7 @@ impl Server {
         p.respawn(&self.env, &self.tx)?;
         // A new Codex conversation must not inherit the source conversation's hook identity.
         p.agent.session_id = p.spec.session.clone();
-        let switch = self.switches.get_mut(&pane).unwrap();
-        switch.started = Some(Instant::now());
-        switch.stopping = None;
+        self.switches.spawned(pane);
         Ok(())
     }
 
@@ -574,13 +671,12 @@ impl Server {
         if !self.switch_stopped(pane) {
             return;
         }
-        let Some(switch) = self.switches.get_mut(&pane) else { return };
+        let Some(switch) = self.switches.get(&pane) else { return };
         if matches!(switch.stage, SwitchStage::Restoring | SwitchStage::RecoveryStopping) {
             self.switch_recovery_failed(pane, reason);
             return;
         }
-        switch.stage = SwitchStage::Restoring;
-        let original = switch.original.clone();
+        let original = self.switches.restore(pane).unwrap();
         let (spec, exact) = self.resume_spec(&original, original.session.as_deref());
         if !exact {
             self.switch_recovery_failed(pane, "the previous command needs review before it can run again");
@@ -594,7 +690,7 @@ impl Server {
     }
 
     fn switch_recovery_failed(&mut self, pane: PaneId, reason: &str) {
-        let Some(switch) = self.switches.remove(&pane) else { return };
+        let Some(switch) = self.switches.finish(pane) else { return };
         let saved = switch.original.session.as_deref().is_some_and(|s| accounts::check_resume(&switch.from, s).is_ok());
         let message = if saved {
             "Couldn't resume. Your conversation is saved. Enter retries on the previous account."
@@ -613,7 +709,7 @@ impl Server {
     }
 
     pub(super) fn switch_started(&mut self, pane: PaneId) {
-        let Some(switch) = self.switches.remove(&pane) else { return };
+        let Some(switch) = self.switches.finish(pane) else { return };
         if switch.stage == SwitchStage::Restoring {
             self.notify(
                 NoticeKind::Error,
@@ -640,5 +736,61 @@ impl Server {
         self.refresh_switch_views(pane);
         self.mark_persist();
         self.mark_dirty();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn change(stage: SwitchStage) -> AccountSwitch {
+        AccountSwitch {
+            token: 7,
+            from: Account::new("claude", "from", "/unused/from".into(), None, false),
+            to: Account::new("claude", "to", "/unused/to".into(), None, false),
+            session: None,
+            process: None,
+            client: None,
+            ask: false,
+            original: PaneSpec::default(),
+            undo: false,
+            observed: None,
+            started: None,
+            stopping: None,
+            stage,
+        }
+    }
+
+    #[test]
+    fn cancellation_and_completion_belong_to_the_reserved_change() {
+        let mut switches = AccountSwitches::default();
+        for stage in [
+            SwitchStage::Checking,
+            SwitchStage::Waiting,
+            SwitchStage::Confirm,
+            SwitchStage::Stopping,
+            SwitchStage::Starting,
+            SwitchStage::Restoring,
+            SwitchStage::Recovering,
+            SwitchStage::RecoveryStopping,
+        ] {
+            switches.reserve(1, change(stage));
+            assert!(!switches.cancel(1, 6));
+            assert!(!switches.confirm(1, 6, 99));
+            assert!(switches.checked(1, 6).is_none());
+            assert_eq!(switches.checked(1, 7).is_some(), stage == SwitchStage::Checking);
+            let cancellable = matches!(stage, SwitchStage::Checking | SwitchStage::Waiting | SwitchStage::Confirm);
+            assert_eq!(switches.cancel(1, 7), cancellable);
+            assert_eq!(switches.contains(1), !cancellable);
+            assert_eq!(switches.finish(1).is_some(), !cancellable);
+            assert!(switches.checked(1, 7).is_none());
+        }
+        switches.reserve(1, change(SwitchStage::Confirm));
+        assert!(switches.confirm(1, 7, 99));
+        assert_eq!(switches.get(&1).unwrap().client, Some(99));
+        assert_eq!(switches.check(1).unwrap().0, 7);
+        switches.retain_panes(|_| false);
+        assert!(!switches.contains(1));
+        assert!(switches.checked(1, 7).is_none());
     }
 }

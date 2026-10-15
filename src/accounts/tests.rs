@@ -154,7 +154,9 @@ fn linked_files_rewrite_to_one_entry_per_account_with_all_references_and_unknown
     assert_eq!(all.by_id("old-codex").unwrap().name, "Personal");
     assert_eq!(all.choose("claude", Some("w"), None, &UsageMap::default(), 0).unwrap().id, "work");
     let env = vec![("CLAUDE_CONFIG_DIR".into(), paths::expand_tilde("~/.claude").display().to_string())];
-    let launched = all.launched_on("claude:default", &env).unwrap();
+    let launched = all
+        .pane_account(&crate::pane::PaneSpec { account: Some("claude:default".into()), env, ..Default::default() })
+        .unwrap();
     assert_eq!(launched.id, "work");
     assert!(launched.same_home(&Accounts::standard("claude").unwrap()));
 
@@ -375,7 +377,16 @@ fn review_links_old_references_without_moving_a_running_or_saved_panes_home() {
     assert_eq!(spec.session.as_deref(), Some("conversation"));
     assert_eq!(spec.account_id.as_deref(), Some(target.id.as_str()));
     assert_eq!(spec.account.as_deref(), Some("claude:patron.bzh"));
-    assert_eq!(all.launched_on("claude:default", &home_env).unwrap().home, "~/.claude");
+    assert_eq!(
+        all.pane_account(&crate::pane::PaneSpec {
+            account: Some("claude:default".into()),
+            env: home_env.to_vec(),
+            ..Default::default()
+        })
+        .unwrap()
+        .home,
+        "~/.claude"
+    );
     assert_eq!(all.at_launch_home(target.clone(), &spec.env).home, "~/.claude");
     assert_eq!(all.by_home("claude", &paths::expand_tilde("~/.claude")).unwrap().id, target.id);
     assert_eq!(all.by_id(&original.id).unwrap().id, target.id);
@@ -653,6 +664,7 @@ fn automatic_join_keeps_pane_launch_home_and_persists_without_repeating_the_noti
     );
     assert_eq!(pane.account_id.as_deref(), Some(target.id.as_str()));
     assert_eq!(all.at_launch_home(target.clone(), &pane.env).home, existing.home);
+    assert_eq!(all.pane_account(&pane).unwrap().home, existing.home);
     assert_eq!(all.get("claude", "default").unwrap().home, target.home);
     let saved = std::fs::read_to_string(&file).unwrap();
     assert_eq!(toml::from_str::<toml::Table>(&saved).unwrap()["account"].as_array().unwrap().len(), 1);
@@ -1283,10 +1295,45 @@ fn a_pane_follows_its_account_renamed() {
     let (pro, perso) = (env(&a.get("claude", "pro").unwrap()), env(&a.get("claude", "perso").unwrap()));
     a.rename("claude", "pro", "work").unwrap();
     a.rename("claude", "perso", "me").unwrap();
-    assert_eq!(a.launched_on("claude:pro", &pro).unwrap().name, "work");
-    assert_eq!(a.launched_on("claude:perso", &perso).unwrap().name, "me", "in the default home");
-    assert_eq!(a.launched_on("claude:work", &pro).unwrap().name, "work");
-    assert!(a.launched_on("codex:gone", &[("CODEX_HOME".into(), "/tmp/kraal-test-nowhere".into())]).is_none());
+    assert_eq!(
+        a.pane_account(&crate::pane::PaneSpec {
+            account: Some("claude:pro".into()),
+            env: pro.to_vec(),
+            ..Default::default()
+        })
+        .unwrap()
+        .name,
+        "work"
+    );
+    assert_eq!(
+        a.pane_account(&crate::pane::PaneSpec {
+            account: Some("claude:perso".into()),
+            env: perso.to_vec(),
+            ..Default::default()
+        })
+        .unwrap()
+        .name,
+        "me",
+        "in the default home"
+    );
+    assert_eq!(
+        a.pane_account(&crate::pane::PaneSpec {
+            account: Some("claude:work".into()),
+            env: pro.to_vec(),
+            ..Default::default()
+        })
+        .unwrap()
+        .name,
+        "work"
+    );
+    assert!(
+        a.pane_account(&crate::pane::PaneSpec {
+            account: Some("codex:gone".into()),
+            env: vec![("CODEX_HOME".into(), "/tmp/kraal-test-nowhere".into())],
+            ..Default::default()
+        })
+        .is_none()
+    );
 }
 
 #[test]
@@ -1435,13 +1482,13 @@ fn reused_names_and_homes_do_not_capture_panes_rules_or_late_login_results() {
     assert_eq!(pane.account.as_deref(), Some("claude:work"));
     let replacement = Account { id: new_uuid(), home: "/replacement".into(), sign_in_required: true, ..old.clone() };
     all.add(replacement.clone()).unwrap();
-    assert_eq!(all.launched_on("claude:pro", &pane.env).unwrap().id, old.id);
+    assert_eq!(all.pane_account(&pane).unwrap().id, old.id);
     all.remove("claude", "work");
     all.bind_pane(&mut pane);
     assert_eq!(pane.account.as_deref(), Some("claude:work"), "the removed account remains readable");
     assert_eq!(pane.account_id.as_deref(), Some(old.id.as_str()));
     assert!(all.by_id(&old.id).is_none());
-    assert!(all.launched_on("claude:pro", &pane.env).is_none());
+    assert!(all.pane_account(&pane).is_none());
     assert!(all.choose("claude", Some("work"), None, &UsageMap::default(), 0).is_none());
     all.set_sign_in_required(&old, false);
     assert!(all.get("claude", "pro").unwrap().sign_in_required, "a late login belongs to the removed identity");
@@ -1526,7 +1573,7 @@ fn naming_the_default_home_keeps_its_identity_and_bindings() {
     all.bind_pane(&mut pane);
     assert_eq!(pane.account.as_deref(), Some("claude:personal"));
     assert_eq!(pane.account_id.as_deref(), Some(old.id.as_str()));
-    assert_eq!(all.launched_on("claude:default", &pane.env), Some(adopted.clone()));
+    assert_eq!(all.pane_account(&pane), Some(adopted.clone()));
     let def = crate::workspace::load_file(&definition).unwrap();
     assert_eq!(all.by_id(def.panes()[0].account_id.as_deref().unwrap()), Some(adopted.clone()));
     let usage: Usage =
@@ -1833,7 +1880,7 @@ fn fuzz_accounts_usage() {
             for w in usage.five_hour.iter().chain(usage.weekly.iter()) {
                 let _ = describe_reset(w.resets_at, now);
             }
-            let _ = crate::server::usage_text(&usage, now);
+            let _ = crate::accounts::usage_text(&usage, now);
         }
         // A usage file, as kraal wrote it or damaged.
         let mut saved = serde_json::to_vec(&Usage {
@@ -1848,7 +1895,7 @@ fn fuzz_accounts_usage() {
             let _ = usage.peak(now);
             let _ = usage.next_reset(now);
             usage.observe_screen(rng.one_in(2), 85.0, now);
-            let _ = crate::server::usage_text(&usage, now);
+            let _ = crate::accounts::usage_text(&usage, now);
         }
         let screen = String::from_utf8_lossy(&rng.text(400)).into_owned()
             + *rng.pick(&["You've used 85% of your weekly limit", "used 1e309% of your session limit", "used -5%"]);
@@ -1947,4 +1994,90 @@ fn usage_reads_only_identity_caches_and_leaves_name_caches_untouched() {
     assert_eq!(UsageMap::load_from(&all, &dir).get(&account).unwrap().observed_at, 20);
     assert_eq!(std::fs::read(&legacy).unwrap(), bytes);
     std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn pane_resolution_prioritizes_opaque_ids_without_reusing_names_or_homes() {
+    let mut all = accounts();
+    let old = all.get("claude", "pro").unwrap();
+    let other = all.get("claude", "perso").unwrap();
+    all.rename("claude", "pro", "work").unwrap();
+    for (id, env_id, reference, expected) in [
+        (Some(old.id.as_str()), Some(other.id.as_str()), "claude:perso", Some(old.id.as_str())),
+        (Some("removed-id"), Some(old.id.as_str()), "claude:work", None),
+        (None, Some(old.id.as_str()), "claude:perso", Some(old.id.as_str())),
+        (None, Some("removed-id"), "claude:work", None),
+        (None, None, old.key().as_str(), Some(old.id.as_str())),
+        (None, None, "claude:@removed-id", None),
+        (None, None, "claude:pro", Some(old.id.as_str())),
+    ] {
+        let mut pane = crate::pane::PaneSpec {
+            account: Some(reference.into()),
+            account_id: id.map(String::from),
+            env: vec![("CLAUDE_CONFIG_DIR".into(), old.home.clone())],
+            ..Default::default()
+        };
+        if let Some(id) = env_id {
+            pane.env.push(("KRAAL_ACCOUNT_ID".into(), id.into()));
+        }
+        let home = pane.env[0].clone();
+        assert_eq!(all.pane_account(&pane).as_ref().map(|a| a.id.as_str()), expected);
+        all.bind_pane(&mut pane);
+        assert_eq!(pane.env[0], home, "refreshing the label preserves the launch home");
+        assert_eq!(all.pane_account(&pane).as_ref().map(|a| a.id.as_str()), expected);
+        if expected.is_some() {
+            assert_eq!(pane.account.as_deref(), Some("claude:work"));
+        }
+    }
+    let identity_only = crate::pane::PaneSpec { account_id: Some(old.id.clone()), ..Default::default() };
+    assert_eq!(all.pane_account(&identity_only).unwrap().id, old.id);
+    let mut unlabelled = identity_only.clone();
+    all.bind_pane(&mut unlabelled);
+    assert!(unlabelled.account.is_none());
+    let environment_only =
+        crate::pane::PaneSpec { env: vec![("KRAAL_ACCOUNT_ID".into(), old.id.clone())], ..Default::default() };
+    assert!(all.pane_account(&environment_only).is_none());
+    let mut pane = crate::pane::PaneSpec {
+        account: Some("claude:work".into()),
+        account_id: Some(old.id.clone()),
+        env: vec![("CLAUDE_CONFIG_DIR".into(), old.home.clone())],
+        ..Default::default()
+    };
+    all.remove("claude", "work");
+    all.add(Account { id: "replacement-id".into(), name: "work".into(), ..old }).unwrap();
+    all.bind_pane(&mut pane);
+    assert!(all.pane_account(&pane).is_none());
+}
+
+#[test]
+fn prepared_add_revalidates_before_creating_a_home_and_keeps_verified_homes() {
+    if !crate::testing::in_own_process(
+        "accounts::tests::prepared_add_revalidates_before_creating_a_home_and_keeps_verified_homes",
+    ) {
+        return;
+    }
+    let dir = crate::testing::TempDir::new("prepared-add");
+    let path = dir.0.join("accounts.toml");
+    let new = Account::new("codex", "work", dir.0.join("work").display().to_string(), Some(80), true);
+    let wrong = Account { id: "another-identity".into(), ..new.clone() };
+    let error = Accounts::update_at(&path, |all| all.add_prepared(new.clone(), Some((&wrong, false)))).unwrap_err();
+    assert_eq!(error.to_string(), "the account changed while checking sign-in; run the add command again");
+    assert!(!dir.0.join("work").exists());
+    assert!(!path.exists());
+
+    let (added, _) = Accounts::update_at(&path, |all| all.add_prepared(new.clone(), None)).unwrap();
+    assert_eq!(added, new);
+    assert!(dir.0.join("work").is_dir());
+    assert_eq!(Accounts::load_from(&path).unwrap().by_id(&new.id), Some(new.clone()));
+
+    let alias = Account::new("codex", "alias", new.home.clone(), None, true);
+    let (verified, notes) = Accounts::update_at(&path, |all| all.add_prepared(alias, Some((&new, true)))).unwrap();
+    assert_eq!(verified.id, new.id);
+    assert!(!verified.sign_in_required);
+    assert!(notes.is_empty());
+    assert!(!Accounts::load_from(&path).unwrap().by_id(&new.id).unwrap().sign_in_required);
+
+    let untouched = Account::new("codex", "verified", dir.0.join("untouched").display().to_string(), None, false);
+    Accounts::update_at(&path, |all| all.add_prepared(untouched.clone(), Some((&untouched, true)))).unwrap();
+    assert!(!dir.0.join("untouched").exists(), "verified homes need no preparation");
 }

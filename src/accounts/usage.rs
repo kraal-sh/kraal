@@ -228,3 +228,18 @@ pub fn describe_reset(resets_at: Option<i64>, now: i64) -> String {
         format!("resets in {}m", secs / 60)
     }
 }
+
+/// "5h ▓▓▓▓░░░░ 48% · 7d ▓▓▓▓▓▓░░ 71% · resets in 1h20"
+pub fn usage_text(u: &Usage, now: i64) -> String {
+    let mut parts = Vec::new();
+    for (name, pct) in ["5h", "7d"].into_iter().zip(u.percentages(now)) {
+        if let Some(pct) = pct {
+            parts.push(format!("{name} {} {pct:.0}%", crate::theme::current().bar(pct)));
+        }
+    }
+    let reset = describe_reset(u.next_reset(now), now);
+    if !reset.is_empty() {
+        parts.push(reset);
+    }
+    if parts.is_empty() { "no usage seen yet".into() } else { parts.join(" · ") }
+}

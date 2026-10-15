@@ -169,14 +169,14 @@ impl Server {
         if let Some(display) = cached.as_ref()
             && display.accounts == self.accounts.entries()
             && display.usage == self.usage.0
-            && display.checks == self.existing_checks
+            && display.checks == *self.account_discovery.checks()
             && now.is_none_or(|now| now >= display.since && display.until.is_none_or(|until| now < until))
             && display.panes.len() == self.panes.len()
             && self.panes.iter().all(|(id, pane)| {
                 display
                     .panes
                     .get(id)
-                    .is_some_and(|input| input.matches(pane, self.observed_agents.get(id).map(|a| &a.account)))
+                    .is_some_and(|input| input.matches(pane, self.account_discovery.observed(id).map(|a| &a.account)))
             })
         {
             return display.clone();
@@ -192,7 +192,7 @@ impl Server {
                         reference: pane.spec.account.clone(),
                         id: pane.spec.account_id.clone(),
                         env: pane.spec.env.clone(),
-                        observed: self.observed_agents.get(&id).map(|a| a.account.clone()),
+                        observed: self.account_discovery.observed(&id).map(|a| a.account.clone()),
                         state: pane.agent.kind.as_ref().map(|_| pane.agent.state),
                     },
                 )
@@ -204,7 +204,7 @@ impl Server {
             accounts: self.accounts.entries().to_vec(),
             panes,
             usage: self.usage.0.clone(),
-            checks: self.existing_checks.clone(),
+            checks: self.account_discovery.checks().clone(),
             since: now,
             until: self.account_summaries_until(now),
             items: self.account_items_at(now),
@@ -252,7 +252,7 @@ impl Server {
             .collect();
         for a in self.accounts.unlisted() {
             use super::agents::ExistingCheck;
-            let detail = match self.existing_checks.get(&a.agent) {
+            let detail = match self.account_discovery.checks().get(&a.agent) {
                 Some(ExistingCheck::Checking) => "Checking sign-in",
                 Some(ExistingCheck::SaveFailed) => "Could not save · Check again",
                 Some(ExistingCheck::Checked(Status::CouldNotCheck)) => "Could not verify · Check again",
@@ -262,17 +262,21 @@ impl Server {
                 PickItem::new(accounts::existing_label(&a.agent), detail, PickAction::CheckExisting { agent: a.agent })
             } else {
                 let home = crate::paths::shorten_home(&crate::paths::expand_tilde(&a.home));
-                let (label, detail) = if matches!(self.existing_checks.get(&a.agent), Some(ExistingCheck::Checking)) {
-                    (format!("Checking {home}"), "")
-                } else {
-                    (format!("Could not check {home}"), detail)
-                };
+                let (label, detail) =
+                    if matches!(self.account_discovery.checks().get(&a.agent), Some(ExistingCheck::Checking)) {
+                        (format!("Checking {home}"), "")
+                    } else {
+                        (format!("Could not check {home}"), detail)
+                    };
                 PickItem::new(label, detail, PickAction::CheckExisting { agent: a.agent }).dim()
             };
             items.push(item);
         }
         for a in self.accounts.reviews() {
-            let item = if matches!(self.existing_checks.get(&a.agent), Some(super::agents::ExistingCheck::SaveFailed)) {
+            let item = if matches!(
+                self.account_discovery.checks().get(&a.agent),
+                Some(super::agents::ExistingCheck::SaveFailed)
+            ) {
                 PickItem::new(
                     accounts::review_question(&a),
                     "Could not save · Check again",
@@ -375,7 +379,7 @@ impl Server {
             a.agent == kind.name
                 && (a.review
                     || matches!(
-                        self.existing_checks.get(&a.agent),
+                        self.account_discovery.checks().get(&a.agent),
                         Some(
                             super::agents::ExistingCheck::Checked(Status::SignedIn)
                                 | super::agents::ExistingCheck::SaveFailed
@@ -1095,12 +1099,12 @@ mod tests {
             (ExistingCheck::SaveFailed, "Could not save · Check again"),
             (ExistingCheck::Checked(Status::CouldNotCheck), "Could not verify · Check again"),
         ] {
-            server.existing_checks.insert("claude".into(), state);
+            server.account_discovery.set_check("claude", state);
             let display = server.account_display_at(1_000);
             assert_eq!(display.items[0].label, "Existing Claude account");
             assert_eq!(display.items[0].detail, detail);
         }
-        server.existing_checks.insert("claude".into(), ExistingCheck::Checked(Status::NotSignedIn));
+        server.account_discovery.set_check("claude", ExistingCheck::Checked(Status::NotSignedIn));
         assert_eq!(server.account_display_at(1_000).items.len(), 1);
         let target = server.accounts.add(account()).unwrap();
         server.accounts.adopt_checked(&existing, None).unwrap();
@@ -1438,7 +1442,7 @@ mod tests {
             assert_eq!(u.next_end(now), end, "{u:?} at {now}");
             assert_eq!(u.next_reset(now), reset, "{u:?} at {now}");
             assert_eq!(usage_summary(&a, Some(&u), now), summary, "{u:?} at {now}");
-            assert_eq!(super::super::usage_text(&u, now), text, "{u:?} at {now}");
+            assert_eq!(accounts::usage_text(&u, now), text, "{u:?} at {now}");
             let map = accounts::UsageMap(HashMap::from([(a.key(), u.clone())]));
             let expected = (u.five_hour.is_some() || u.weekly.is_some()).then_some(peak.unwrap_or(0.0));
             assert_eq!(map.peak(&a, now), expected, "{u:?} at {now}");
