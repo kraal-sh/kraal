@@ -165,7 +165,9 @@ Larger or recursive transfers use `kraal cp`. See
 This setting belongs to the laptop running `attach --host`. It is read again for each file
 manager request. The local client asks for permission before listing or
 reading or writing anything. Permission to copy works between the laptop and the session
-machine in both directions. Deleting, moving files away or replacing an item on the laptop
+machine or an SSH server in both directions. SSH copies relay through the session machine's
+private spool, with a separate confirmation for production servers. Moves between the laptop
+and an SSH server are refused. Deleting, moving files away or replacing an item on the laptop
 always asks in the local client box, even with Always. Moving to the laptop asks locally
 if it replaces existing items.
 

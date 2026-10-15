@@ -1510,7 +1510,7 @@ mod tests {
         assert_eq!(refusal_version("no such workspace"), None);
         assert_eq!(
             refusal_version(
-                "protocol mismatch: client protocol 7, server protocol 3 (kraal 0.4.0, session work); run `kraal -s work restart`"
+                "protocol mismatch: client protocol 8, server protocol 3 (kraal 0.4.0, session work); run `kraal -s work restart`"
             ),
             Some((3, "0.4.0")),
         );
@@ -1534,7 +1534,7 @@ mod tests {
                 clipboard_native: false,
             };
             let reason = format!(
-                "protocol mismatch: client protocol 7, server protocol 3 (kraal 0.4.0, session {session}); run `kraal -s {session} restart`"
+                "protocol mismatch: client protocol 8, server protocol 3 (kraal 0.4.0, session {session}); run `kraal -s {session} restart`"
             );
             let rewritten = attach_refusal(&reason, &target).unwrap();
             let command =
@@ -1542,7 +1542,7 @@ mod tests {
             assert_eq!(
                 rewritten,
                 format!(
-                    "protocol mismatch: client protocol 7, server protocol 3 (kraal 0.4.0, session {session}); run `{command}`"
+                    "protocol mismatch: client protocol 8, server protocol 3 (kraal 0.4.0, session {session}); run `{command}`"
                 )
             );
             assert_eq!(attach_refusal("no such workspace", &target), None);

@@ -349,6 +349,7 @@ pub(super) fn copy(
     move_: bool,
     no_replace: Option<&[String]>,
     expect: &[String],
+    laptop_spool: bool,
 ) -> Result<()> {
     let cfg = config::Config::load()?;
     let known = known_servers(&cfg)?;
@@ -362,6 +363,9 @@ pub(super) fn copy(
     }
     let ssh = |s: &servers::Server| servers::ssh_args(s, &known, cfg.servers.multiplex);
     check_expected(sources.iter().chain([&dest]), expect, &ssh)?;
+    if laptop_spool {
+        return crate::laptop::copy::fetch(&sources, &dest, &ssh);
+    }
     if let Some(allowed) = no_replace {
         let there: Vec<String> =
             transfer::existing_in(&sources, &dest, &ssh)?.into_iter().filter(|n| !allowed.contains(n)).collect();

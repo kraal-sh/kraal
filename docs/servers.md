@@ -97,7 +97,8 @@ no password; `[servers] multiplex = false` turns that off. An `ssh` you type you
 
 ## Copying files
 
-Copying files works in every direction and reuses the SSH connection kraal has to the server:
+Copying files works in every direction and reuses the SSH connection kraal has to the server.
+The tar fallback reports transferred bytes too, including during a single large file:
 
 | Command | |
 |---|---|
@@ -155,11 +156,11 @@ laptop. Disconnecting clears the listing; an automatic reconnect lists it again.
 has a new identity and sees **is not attached** until a machine is chosen with `o`.
 
 Laptop browsing is available in one panel at a time. To copy from it, select files or
-folders, choose a destination on the session's machine in the other panel, and press `c`
-or `F5`. To copy to the laptop, select files on the session's machine and choose the laptop
+folders, choose a destination on the session's machine or an SSH server in the other panel,
+and press `c` or `F5`. To copy to the laptop, select files on either machine and choose the laptop
 as the destination in the other panel. The local permission covers listing and copying in
-both directions. Press `m` or `F6` to move the selection to the other panel, or `d`, `Delete`
-or `F8` to delete the laptop selection for good. Deleting, moving files away or replacing
+both directions. Between the laptop and the session machine, press `m` or `F6` to move
+the selection to the other panel. Press `d`, `Delete` or `F8` to delete the laptop selection for good. Deleting, moving files away or replacing
 anything on the laptop always asks in the laptop client's own box, including with Always.
 Moving to the laptop first asks to remove the sources on the session machine.
 Approved folders are replaced in full. Cancel keeps the existing items. The client checks actual
@@ -177,15 +178,16 @@ fails or the connection is lost before it is acknowledged, no source removal sta
 interruption during removal can leave some sources removed and others kept; installed copies
 remain at the destination.
 
-The receiving job checks the announced total against free space in its private spool and the
-destination before accepting contents. There is no per-file size limit; recursive copies
-visit at most 100,000 entries. A selected folder includes its nested hidden files. Symbolic
+For copies to the session machine, the receiving job checks the announced total against
+free space in its private spool and the destination before accepting contents. There is no
+per-file size limit; recursive copies visit at most 100,000 entries. A selected folder includes its nested hidden files. Symbolic
 links are copied as links only when their targets resolve inside the allowed scope; FIFOs
 and devices are skipped. File modes (without setuid or setgid) and modification times are
 preserved, but owners, extended attributes and ACLs are not.
 
-For copies from the laptop, the job receives into a private spool under `~/.local/state/kraal/laptop-v1/` (under
-`$XDG_STATE_HOME/kraal` when set), then uses the existing local move and no-replace copy
+For copies from the laptop to the session machine, the job receives into a private spool
+under `~/.local/state/kraal/laptop-v1/` (under `$XDG_STATE_HOME/kraal` when set), then uses
+the existing local move and no-replace copy
 handling to install it. The spool is removed when the job ends; abandoned spools are removed
 on session startup. If an installation race leaves files in staging, the failed transfer
 window names that staging directory. Check that message and the destination before retrying.
@@ -207,8 +209,22 @@ unlinked without following its target, including a broken link or one pointing o
 the scope. FIFOs and devices are skipped; a folder containing them stays and is named in
 the error. The home directory itself cannot be removed. Cancel keeps the selected items.
 
-Transfers between the laptop and an SSH server are unavailable: copy to the session's
-machine first, or run `kraal cp` on the laptop. Editing, previews and shells are unavailable on the laptop panel. There is no
+Copies between the laptop and an SSH server relay through the session machine's private spool.
+From the laptop, the job receives the selection into the spool, then runs the usual SSH copy.
+In the other direction, it waits for laptop permission, downloads the selection into the spool,
+then streams it to the laptop's staging directory. The spool must have room for the selection;
+the laptop checks the announced total against its free space before receiving contents.
+The SSH leg uses the existing rsync or tar copy engine. The window shows each leg's progress;
+closing it cancels both legs and removes the spool. Originals stay on the source machine.
+
+The file manager asks before a relay involving a production server, including downloads.
+Replacements on an SSH server use the usual named replacement confirmation; replacements on
+the laptop always ask locally. The SSH leg checks `--expect` against the connection that listed
+the panel. If the inventory changes to reach another machine, the copy fails: refresh the panel
+and retry. Moves between the laptop and an SSH server are refused: copy, then delete after
+checking the destination.
+
+Editing, previews and shells are unavailable on the laptop panel. There is no
 laptop path syntax in `kraal files`, `kraal cp` or ordinary control requests.
 
 In a local session, pasted paths stay unchanged, including in an SSH pane. Use **Upload to
@@ -315,8 +331,9 @@ remote session opens it on your machine. A `localhost` address there is
 the server's, not yours: kraal keeps it in paste buffers, sends a copy to your terminal, and
 says where the address works instead of opening the wrong page.
 
-To browse this laptop or transfer files between it and the session machine, open the
-[file manager](#the-file-manager) and choose it with `o`.
+To browse this laptop or copy files between it and the session machine or an SSH server,
+open the [file manager](#the-file-manager) and choose it with `o`. SSH copies relay through
+the session machine; moving is available only between the laptop and the session machine.
 Its local consent is separate from attachment and clipboard permissions.
 
 To send laptop files through this connection, choose **Attach files** in the command palette.

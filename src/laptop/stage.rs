@@ -595,6 +595,7 @@ mod tests {
         Spec {
             operation: crate::laptop::copy::Operation::Copy,
             to_laptop: true,
+            remote: None,
             sources: vec![source.0.join(item).to_str().unwrap().into()],
             destination: destination.0.clone(),
             allow: vec![item.into()],

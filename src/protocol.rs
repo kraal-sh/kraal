@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::agent::AgentState;
 
-pub const PROTOCOL_VERSION: u32 = 7;
+pub const PROTOCOL_VERSION: u32 = 8;
 pub const KRAAL_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Both released migration sources used protocol 2 and omitted it from Pong.
@@ -1130,6 +1130,7 @@ mod tests {
                 message: ToClient::Ready(Spec {
                     operation: crate::laptop::copy::Operation::Copy,
                     to_laptop: false,
+                    remote: None,
                     sources: vec![s("~/report")],
                     destination: p("/destination"),
                     allow: vec![s("report")],
@@ -1141,6 +1142,11 @@ mod tests {
                 message: ToClient::Write(Spec {
                     operation: crate::laptop::copy::Operation::Copy,
                     to_laptop: true,
+                    remote: Some(crate::files::Remote {
+                        server: s("web"),
+                        ssh_args: vec![s("web.lan")],
+                        path: s("/server/report"),
+                    }),
                     sources: vec![s("/server/report")],
                     destination: p("~/Downloads"),
                     allow: vec![],
@@ -1153,6 +1159,7 @@ mod tests {
                 message: ToClient::Move(Spec {
                     operation: crate::laptop::copy::Operation::Move,
                     to_laptop: false,
+                    remote: None,
                     sources: vec![s("~/report")],
                     destination: p("/destination"),
                     allow: vec![],

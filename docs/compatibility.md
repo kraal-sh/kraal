@@ -59,8 +59,8 @@ A state from a newer format is also left untouched, with a message to use a newe
 
 ## Clients and servers
 
-This version uses protocol 7 for laptop listings, copies, moves and deletion. Kraal 0.4.0 used protocol 3;
-Kraal 0.2.0 and 0.3.0 use protocol 2.
+This version uses protocol 8 for laptop listings, copies, moves, deletion and SSH copy relays.
+Kraal 0.4.0 used protocol 3; Kraal 0.2.0 and 0.3.0 use protocol 2.
 Different protocol versions refuse attachment and ordinary commands. There are no older-peer
 adapters or optional feature negotiation. A refusal names both protocol versions and one next step:
 
@@ -88,7 +88,7 @@ A 0.3.0 client waiting for a restarted server receives the protocol refusal and 
 Workspaces are saved automatically. KDL is imported and exported explicitly with `kraal import`
 and `kraal export`; `kraal save` and its historical `SaveWorkspace` request are removed.
 Clipboard, file attachments, pasted paths and clipboard images introduced in protocol 3 remain
-part of protocol 7.
+part of protocol 8.
 The client applies its clipboard policy, including the terminal OSC 52 fallback where configured.
 The server no longer emits OSC 52 as an adapter for old clients.
 
@@ -101,10 +101,15 @@ system access leaves a listing error; grant access on the laptop and press `r` t
 The default scope excludes `~/Library`. Copies from the laptop use the same scoped component
 walk and a dedicated client reader thread on both systems. The server routes bounded messages
 between that client and a job authorized by a one-use token for the operation and paths.
-The server loop does no file I/O for the transfer.
+The server loop does no file I/O for the transfer. Copies between the laptop and an SSH server
+use the session machine's private spool and the existing rsync or tar SSH copy engine on both
+Linux and macOS. Both directions preserve the source originals, check the listed connection
+with `--expect` and ask before accessing a production server. Moves on this route are refused.
+Downloads wait for laptop permission before the SSH copy starts; its progress keeps the
+attachment transfer alive. Cancellation and disconnection remove the spool.
 
-The job receives into a private spool, then uses the existing local copy engine with move and
-no-replace semantics. Linux uses `renameat2(RENAME_NOREPLACE)` and macOS uses
+For copies from the laptop to the session machine, the job receives into a private spool, then
+uses the existing local copy engine with move and no-replace semantics. Linux uses `renameat2(RENAME_NOREPLACE)` and macOS uses
 `renamex_np(RENAME_EXCL)` for exclusive installation. Filesystems that cannot support the
 copy engine's exclusive installation fail without silently replacing an unapproved name.
 Copies into the laptop use a private `.kraal-stage-*` directory in the destination, in

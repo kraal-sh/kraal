@@ -231,9 +231,14 @@ impl ConfirmAction {
             ConfirmAction::Restart => "Restart".into(),
             ConfirmAction::AttachFiles(_) | ConfirmAction::AttachClipboardImage(_) => "Attach".into(),
             ConfirmAction::PurgeAttachments => "Purge".into(),
-            ConfirmAction::LaptopCopy { spec, .. } => {
-                if spec.operation == crate::laptop::copy::Operation::Move { "Move" } else { "Copy and replace" }.into()
+            ConfirmAction::LaptopCopy { spec, .. } => if spec.operation == crate::laptop::copy::Operation::Move {
+                "Move"
+            } else if spec.allow.is_empty() {
+                "Copy"
+            } else {
+                "Copy and replace"
             }
+            .into(),
             ConfirmAction::Quit => "Quit".into(),
             ConfirmAction::Job { label, .. } | ConfirmAction::GitJob { label, .. } => {
                 let mut l = label.clone();
