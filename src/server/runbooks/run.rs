@@ -853,14 +853,14 @@ mod tests {
         for &pane in &panes {
             let before = serde_json::to_value(&server.panes[&pane].spec).unwrap();
             for input in [b"\t\t\x15true\r".as_slice(), b"\t\x15next\r".as_slice()] {
-                let mode = server.edit_pane_form(client, pane);
+                let mode = server.edit_pane_form(client, pane, None);
                 server.clients.get_mut(&client).unwrap().mode = mode;
                 server.client_input(client, input);
                 assert!(matches!(server.clients[&client].mode, Mode::PaneForm(_)));
                 assert_eq!(serde_json::to_value(&server.panes[&pane].spec).unwrap(), before);
                 assert!(server.pane_edits.is_empty());
             }
-            let mode = server.edit_pane_form(client, pane);
+            let mode = server.edit_pane_form(client, pane, None);
             server.clients.get_mut(&client).unwrap().mode = mode;
             server.client_input(client, b"\x15renamed\r");
             assert!(matches!(server.clients[&client].mode, Mode::Normal));

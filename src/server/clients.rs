@@ -67,6 +67,7 @@ impl Server {
                 mode: Mode::Normal,
                 last_account_agent: None,
                 adding_account: None,
+                adding_account_back: None,
                 encoder: Encoder::new(),
                 frame: Default::default(),
                 memo: Default::default(),

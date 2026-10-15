@@ -418,6 +418,7 @@ pub struct Client {
     pub last_account_agent: Option<String>,
     /// The login pane opened by this client's Add account form.
     pub adding_account: Option<PaneId>,
+    pub adding_account_back: Option<ui::PickerState>,
     pub encoder: Encoder,
     /// The last frame composed for it, kept to compose the next one over it.
     pub(in crate::server) frame: ratatui::buffer::Buffer,

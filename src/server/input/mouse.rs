@@ -33,6 +33,7 @@ impl Server {
         }
         let SideItem::Account(account) = item else { unreachable!() };
         let mut picker = self.accounts_picker(Some(&account));
+        picker.standalone_actions = true;
         picker.actions = (picker.action_keys().len() > 1).then_some(0);
         Some(Mode::Picker(picker))
     }
@@ -127,6 +128,7 @@ impl Server {
                     || self.sidebar_hit(id, m.row.saturating_sub(1)).as_ref() != Some(&item))
             {
                 let mut picker = self.workspace_picker(self.clients[&id].workspace);
+                picker.standalone_actions = true;
                 picker.select(|i| i.action.workspace() == Some(ws));
                 picker.actions = (picker.action_keys().len() > 1).then_some(0);
                 return Some(Mode::Picker(picker));
@@ -138,7 +140,7 @@ impl Server {
                     Some(SideItem::ToggleSidebar) => return Some(self.action(id, Action::ToggleSidebar)),
                     Some(SideItem::AddWorkspace) => return Some(self.action(id, Action::NewWorkspace)),
                     Some(SideItem::Accounts) => return Some(self.action(id, Action::Accounts)),
-                    Some(SideItem::Account(account)) => return Some(self.account_details(&account)),
+                    Some(SideItem::Account(account)) => return Some(self.account_details(&account, None)),
                     Some(SideItem::AddAccount) => return Some(self.action(id, Action::AddAccount)),
                     Some(SideItem::Workspace(ws)) => {
                         let mut picker = self.workspace_picker(self.clients[&id].workspace);
@@ -602,6 +604,37 @@ mod tests {
     use crate::account_status::Status;
     use crate::server::agents::ExistingCheck;
     use crate::server::ui::PickerKind;
+
+    #[test]
+    fn sidebar_add_and_workspace_actions_cancel_to_the_panes() {
+        let (tx, _rx) = crate::server::event_channel(32);
+        let mut server = crate::server::tests::server(tx);
+        let (client, _peer) = crate::server::tests::client(&mut server);
+        let ws = server.clients[&client].workspace;
+        for item in [SideItem::AddAccount, SideItem::AddWorkspace] {
+            let row = (0..36).find(|&row| server.sidebar_hit(client, row) == Some(item.clone())).unwrap();
+            let click = MouseEvent { kind: MouseKind::Press(MouseButton::Left), col: 2, row, mods: Default::default() };
+            let mode = server.on_mouse(client, click, false).unwrap();
+            assert!(matches!(mode, Mode::Prompt(_) | Mode::AccountForm(_)));
+            server.clients.get_mut(&client).unwrap().mode = mode;
+            server.client_input(client, b"\x1b");
+            server.flush_client_input(client);
+            assert!(matches!(server.clients[&client].mode, Mode::Normal));
+        }
+        let row = (0..36).find(|&row| server.sidebar_hit(client, row) == Some(SideItem::Workspace(ws))).unwrap();
+        for action in ["Rename", "Duplicate", "Export layout"] {
+            let click =
+                MouseEvent { kind: MouseKind::Press(MouseButton::Right), col: 2, row, mods: Default::default() };
+            let Mode::Picker(mut picker) = server.on_mouse(client, click, false).unwrap() else { panic!() };
+            picker.actions = Some(picker.action_keys().iter().position(|(_, label)| *label == action).unwrap());
+            server.clients.get_mut(&client).unwrap().mode = Mode::Picker(picker);
+            server.client_input(client, b"\r");
+            assert!(matches!(server.clients[&client].mode, Mode::Prompt(_)));
+            server.client_input(client, b"\x1b");
+            server.flush_client_input(client);
+            assert!(matches!(server.clients[&client].mode, Mode::Normal));
+        }
+    }
 
     #[test]
     fn strip_clicks_keep_the_strip_and_never_use_the_full_sidebar_actions_area() {

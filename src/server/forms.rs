@@ -8,6 +8,23 @@ use super::{overlays, ui};
 use crate::ansi::{Cursor, CursorShape};
 use crate::input::{InputEvent, KeyCode, MouseButton, MouseKind};
 
+impl super::Server {
+    pub(super) fn form_back(&self, client: super::ClientId, back: Option<ui::PickerState>) -> ui::Mode {
+        let Some(state) = back else { return ui::Mode::Normal };
+        let mut picker = match state.kind {
+            ui::PickerKind::Accounts => self.accounts_picker(None),
+            ui::PickerKind::Workspace => self.workspace_picker(self.clients.get(&client).map_or(0, |c| c.workspace)),
+            ui::PickerKind::DeletedWorkspaces => self.deleted_workspace_picker(),
+            ui::PickerKind::Pane => self.pane_picker(),
+            ui::PickerKind::Ssh => self.ssh_picker(),
+            ui::PickerKind::Tunnels => self.tunnel_picker(),
+            _ => return ui::Mode::Normal,
+        };
+        picker.restore(state);
+        ui::Mode::Picker(picker)
+    }
+}
+
 pub(super) struct Button<'a> {
     pub field: usize,
     pub label: &'a str,
@@ -333,6 +350,24 @@ pub(super) fn draw_buttons(
     keys.push(("Esc", buttons.cancel.label));
     let line = overlays::key_line(&keys, "", layout.footer.width);
     buf.set_line(layout.footer.x, layout.footer.y, &line, layout.footer.width);
+}
+
+#[cfg(test)]
+pub(super) fn assert_return(mode: ui::Mode, from: Option<&ui::Picker>) {
+    if let Some(from) = from.filter(|p| !p.standalone_actions) {
+        let ui::Mode::Picker(back) = mode else { panic!("expected the original list") };
+        assert!(back.kind == from.kind);
+        assert_eq!((&back.query, back.cursor), (&from.query, from.cursor));
+        assert_eq!(back.current().map(|i| &i.label), from.current().map(|i| &i.label));
+        if let Some(ui::PickAction::FocusPane { pane, .. }) = from.current().map(|i| &i.action) {
+            assert!(
+                matches!(back.current().map(|i| &i.action), Some(ui::PickAction::FocusPane { pane: p, .. }) if p == pane)
+            );
+        }
+        assert!(back.actions.is_none());
+    } else {
+        assert!(matches!(mode, ui::Mode::Normal), "expected the panes");
+    }
 }
 
 #[cfg(test)]

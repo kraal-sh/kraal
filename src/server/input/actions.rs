@@ -273,7 +273,7 @@ impl Server {
             }
             Action::EditPane => {
                 if let Some(pane) = focus {
-                    return self.edit_pane_form(id, pane);
+                    return self.edit_pane_form(id, pane, None);
                 }
             }
             Action::RenamePane => {

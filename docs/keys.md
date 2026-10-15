@@ -35,7 +35,9 @@ previous and next, and the theme's letter (or Enter) its main action again. Back
 to the menu before, Esc closes.
 
 **Edit pane** (`ctrl+b P e`, or the command palette with either preset) opens **Name**, **Folder**
-and **Command**. Enter applies, Tab moves between fields and buttons, and Esc cancels.
+and **Command**. The Panes list also offers **Edit pane** (`ctrl+e`) for its selected row.
+Enter applies, Tab moves between fields and buttons, and Esc cancels. Cancel returns to the
+list with its search and selection when opened there, or to the panes when opened directly.
 A name change keeps the program running. Changing a running pane's command or folder asks
 **Apply command?**, with **Cancel** selected and **Stop and apply** as the confirming action.
 Cancel returns to the entered fields. A stopped pane stays ready for **Enter Run**.

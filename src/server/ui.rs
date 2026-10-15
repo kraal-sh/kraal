@@ -119,6 +119,7 @@ pub enum ConfirmAction {
     },
     UseExisting {
         existing: Box<crate::accounts::Account>,
+        back: Option<Box<PickerState>>,
         target: Option<crate::accounts::Account>,
     },
     RetrySsh(PaneId),
@@ -472,6 +473,10 @@ pub struct Picker {
     pub review_workspaces: Vec<u32>,
     pub layout_undos: Vec<u32>,
     pub back: Option<Box<PickerState>>,
+    /// Actions opened without a list must not make that list the form's return destination.
+    pub standalone_actions: bool,
+    /// Results may select a new row; Close restores the list that opened the form.
+    pub close_to: Option<Box<PickerState>>,
 }
 
 #[derive(Clone)]
@@ -480,6 +485,7 @@ pub struct PickerState {
     query: String,
     cursor: usize,
     selected: Option<String>,
+    pane: Option<PaneId>,
     workspace: Option<u32>,
     definition: Option<std::path::PathBuf>,
     /// Keep an open menu's actions, target and neighbors as they were when shown.
@@ -493,6 +499,8 @@ pub struct PickerState {
     undo: Option<String>,
     back: Option<Box<PickerState>>,
     restored: Option<String>,
+    standalone_actions: bool,
+    close_to: Option<Box<PickerState>>,
 }
 
 impl Picker {
@@ -527,17 +535,37 @@ impl Picker {
             review_workspaces: Vec::new(),
             layout_undos: Vec::new(),
             back: None,
+            standalone_actions: false,
+            close_to: None,
         };
         p.refilter();
         p
     }
 
+    pub fn form_back(&self) -> Option<PickerState> {
+        if self.kind == PickerKind::AccountReview {
+            return self.close_to.as_deref().cloned();
+        }
+        if self.standalone_actions || self.kind == PickerKind::Commands {
+            return None;
+        }
+        let mut state = self.state();
+        state.actions = None;
+        Some(state)
+    }
+
     pub fn state(&self) -> PickerState {
         PickerState {
             kind: self.kind,
+            standalone_actions: self.standalone_actions,
+            close_to: self.close_to.clone(),
             query: self.query.clone(),
             cursor: self.cursor,
             selected: self.current().map(|i| i.label.clone()),
+            pane: self.current().and_then(|i| match i.action {
+                PickAction::FocusPane { pane, .. } => Some(pane),
+                _ => None,
+            }),
             workspace: self.current().and_then(|i| i.action.workspace()),
             definition: self.current().and_then(|i| i.action.definition().map(std::path::Path::to_path_buf)),
             actions: self.actions.map(|at| (at, self.items.clone())),
@@ -557,6 +585,8 @@ impl Picker {
     }
 
     pub fn restore(&mut self, state: PickerState) {
+        self.standalone_actions = state.standalone_actions;
+        self.close_to = state.close_to;
         self.min_items = self.min_items.max(state.min_items);
         self.message = state.message;
         self.message_kind = state.message_kind;
@@ -587,6 +617,8 @@ impl Picker {
             self.select(|i| i.action.workspace() == Some(ws));
         } else if let Some(path) = state.definition {
             self.select(|i| i.action.definition() == Some(path.as_path()));
+        } else if let Some(pane) = state.pane {
+            self.select(|i| matches!(i.action, PickAction::FocusPane { pane: p, .. } if p == pane));
         } else if let Some(label) = state.selected {
             self.select(|i| i.label == label);
         }
@@ -665,11 +697,17 @@ impl Picker {
             (K::RunbookSteps, A::RunBlock(_)) => &[("enter", "Run step"), ("ctrl+y", "Copy step")],
             (_, A::RunbookList) => &[("enter", "Back to runbooks")],
             (_, A::Command(_)) => &[("enter", "Run")],
-            (_, A::FocusPane { undo: true, .. }) => {
-                &[("enter", "Go to pane"), ("ctrl+a", "Change account"), ("ctrl+u", "Undo account change")]
+            (_, A::FocusPane { undo: true, .. }) => &[
+                ("enter", "Go to pane"),
+                ("ctrl+e", "Edit pane"),
+                ("ctrl+a", "Change account"),
+                ("ctrl+u", "Undo account change"),
+            ],
+            (_, A::FocusPane { agent: true, .. }) => {
+                &[("enter", "Go to pane"), ("ctrl+e", "Edit pane"), ("ctrl+a", "Change account")]
             }
-            (_, A::FocusPane { agent: true, .. }) => &[("enter", "Go to pane"), ("ctrl+a", "Change account")],
-            (_, A::FocusPane { .. } | A::RemoteAgent { .. }) => &[("enter", "Go to pane")],
+            (_, A::FocusPane { .. }) => &[("enter", "Go to pane"), ("ctrl+e", "Edit pane")],
+            (_, A::RemoteAgent { .. }) => &[("enter", "Go to pane")],
             (_, A::OpenAnotherAccount(_)) => &[("enter", "Open with another account")],
             (_, A::FilesSet { .. } | A::FilesLaptop { .. }) => &[("enter", "Open directory")],
             (_, A::Tool { .. }) => &[("enter", "Start tool")],
@@ -848,6 +886,7 @@ pub struct Prompt {
     pub tunnel_form: Option<Box<super::tunnel_ui::TunnelForm>>,
     pub server_form: Option<Box<super::server_ui::ServerForm>>,
     pub workspace_form: Option<Box<super::workspace_ui::WorkspaceForm>>,
+    pub back: Option<PickerState>,
 }
 
 impl Prompt {
@@ -875,6 +914,7 @@ impl Prompt {
             error: None,
             scroll: 0,
             masked: false,
+            back: None,
         }
     }
 }

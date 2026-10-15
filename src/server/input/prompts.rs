@@ -25,8 +25,8 @@ impl Server {
         p.scroll = p.scroll.min(layout.max_scroll);
         match ev {
             InputEvent::Key(k) => match k.code {
-                KeyCode::Esc => return self.cancel_account_prompt(&p),
-                KeyCode::Char('c' | 'g') if k.mods.ctrl => return self.cancel_account_prompt(&p),
+                KeyCode::Esc => return self.form_back(id, p.back),
+                KeyCode::Char('c' | 'g') if k.mods.ctrl => return self.form_back(id, p.back),
                 KeyCode::Enter => return self.submit_prompt(id, p),
                 KeyCode::PageDown => {
                     p.scroll = (p.scroll + usize::from(layout.body).max(1)).min(layout.max_scroll);
@@ -75,12 +75,22 @@ impl Server {
         }
         let title = p.title.clone();
         let (value, cursor, masked) = (p.value.clone(), p.cursor, p.masked);
+        let back = p.back.clone();
         let renamed = match &p.action {
             PromptAction::RenameAccount { agent, account } => self.accounts.get(agent, account).map(|a| a.id),
             _ => None,
         };
         match self.commit_prompt(id, p) {
-            Ok(()) => renamed.map_or(Mode::Normal, |a| Mode::Picker(self.accounts_picker(Some(&a)))),
+            Ok(()) => {
+                let mode = self.form_back(id, back);
+                match (renamed, mode) {
+                    (Some(a), Mode::Picker(mut picker)) => {
+                        crate::server::account_ui::select_account(&mut picker, &a);
+                        Mode::Picker(picker)
+                    }
+                    (_, mode) => mode,
+                }
+            }
             // Not accepted: the prompt stays, with the reason under it.
             Err((action, why)) => Mode::Prompt(Prompt {
                 title,
@@ -93,16 +103,8 @@ impl Server {
                 workspace_form: None,
                 server_form: None,
                 tunnel_form: None,
+                back,
             }),
-        }
-    }
-
-    fn cancel_account_prompt(&self, prompt: &Prompt) -> Mode {
-        if let PromptAction::RenameAccount { agent, account } = &prompt.action {
-            let a = self.accounts.get(agent, account);
-            Mode::Picker(self.accounts_picker(a.as_ref().map(|a| a.id.as_str())))
-        } else {
-            Mode::Normal
         }
     }
 
@@ -366,16 +368,18 @@ impl Server {
                     }
                 }
             }
-            ConfirmAction::UseExisting { existing, target } => {
-                if yes {
+            ConfirmAction::UseExisting { existing, target, back } => {
+                let mut picker = if yes {
                     if let Err(e) = self.confirm_existing_account(id, &existing, target.as_ref()) {
                         self.toast(id, NoticeKind::Error, format!("{e:#}"));
                         self.reload_accounts();
-                        return Mode::Picker(self.accounts_picker(None));
                     }
-                    return Mode::Picker(self.accounts_picker(None));
-                }
-                return Mode::Picker(self.review_account_picker(&existing));
+                    self.accounts_picker(None)
+                } else {
+                    self.review_account_picker(&existing)
+                };
+                picker.close_to = back;
+                return Mode::Picker(picker);
             }
             ConfirmAction::StopAndSwitch { pane, token } => {
                 self.confirm_switch(pane, token, id, yes);

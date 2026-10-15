@@ -158,26 +158,13 @@ impl Server {
         }
     }
 
-    fn tunnel_back(&self, back: Option<PickerState>) -> Mode {
-        let mut picker = if back.as_ref().is_some_and(|b| b.kind == PickerKind::Ssh) {
-            self.ssh_picker()
-        } else {
-            self.tunnel_picker()
-        };
-        if let Some(back) = back {
-            picker.restore(back);
-        }
-        picker.actions = None;
-        Mode::Picker(picker)
-    }
-
     pub(super) fn add_tunnel_form(&self, from: Option<&Picker>, server: &str) -> Prompt {
         let mut p = Prompt::new("Add tunnel", "", PromptAction::AddTunnel);
         let form = p.tunnel_form.as_mut().unwrap();
         form.server = server.into();
         form.server_cursor = server.chars().count();
         form.field = usize::from(!server.is_empty());
-        form.back = from.map(Picker::state);
+        form.back = from.and_then(Picker::form_back);
         p
     }
 
@@ -228,7 +215,7 @@ impl Server {
             p.scroll = 0;
         }
         match outcome {
-            forms::FormEvent::Cancel => self.tunnel_back(form.back.take()),
+            forms::FormEvent::Cancel => self.form_back(client, form.back.take()),
             forms::FormEvent::Submit if form.field == 4 && form.suggestion.is_some() => {
                 form.local = form.suggestion.take().unwrap().to_string();
                 form.local_cursor = form.local.len();
@@ -280,6 +267,7 @@ impl Server {
         match result {
             Ok(tunnel) => {
                 let mut picker = self.tunnel_picker();
+                picker.close_to = form.back.take().map(Box::new);
                 picker.select(|i| matches!(i.action, PickAction::Tunnel { id, .. } if id == tunnel.id));
                 Mode::Picker(picker)
             }
@@ -308,7 +296,7 @@ impl Server {
             if let Some(t) = self.tunnels.iter().find(|t| t.id == id) {
                 let _ = self.remove_tunnel(&t.spec.local.to_string());
             }
-            self.tunnel_back(back)
+            self.form_back(0, back)
         }
     }
 
@@ -371,8 +359,8 @@ impl Server {
         }
         .handle(event, &mut [], &buttons, &layout);
         match outcome {
-            forms::FormEvent::Cancel => self.tunnel_back(details.back),
-            forms::FormEvent::Submit if !exists => self.tunnel_back(details.back),
+            forms::FormEvent::Cancel => self.form_back(client, details.back),
+            forms::FormEvent::Submit if !exists => self.form_back(client, details.back),
             forms::FormEvent::Submit => self.tunnel_action(details.id, retry && details.field == 0, details.back),
             _ => Mode::TunnelDetails(details),
         }
@@ -437,6 +425,53 @@ mod tests {
     fn prompt(mode: Mode) -> Prompt {
         let Mode::Prompt(p) = mode else { panic!("expected the form") };
         p
+    }
+
+    #[test]
+    fn tunnel_cancel_and_result_close_return_to_the_origin() {
+        let (tx, _rx) = crate::server::event_channel(32);
+        let mut server = crate::server::tests::server(tx);
+        let (client, _peer) = crate::server::tests::client(&mut server);
+        for kind in [PickerKind::Tunnels, PickerKind::Ssh] {
+            for origin in 0..3 {
+                let mut list = if kind == PickerKind::Ssh { server.ssh_picker() } else { server.tunnel_picker() };
+                list.query = "db".into();
+                list.cursor = 1;
+                list.refilter();
+                list.standalone_actions = origin == 1;
+                let from = (origin != 2).then_some(&list);
+                for leave in 0..3 {
+                    let mut p = server.add_tunnel_form(from, "db");
+                    let layout = forms::FormLayout::new(server.client_screen(client), 3, "", None, &buttons(""));
+                    let event = match leave {
+                        0 => key("esc"),
+                        1 => click(layout.cancel),
+                        _ => {
+                            p.tunnel_form.as_mut().unwrap().field = 5;
+                            key("enter")
+                        }
+                    };
+                    forms::assert_return(server.on_tunnel_form(client, p, event), from);
+                    for state in [TunnelState::Connecting, TunnelState::Up, TunnelState::Down] {
+                        server.tunnels = vec![net::test_tunnel(42, 15432, state)];
+                        let Mode::TunnelDetails(details) = server.tunnel_details(42, from.and_then(Picker::form_back))
+                        else {
+                            panic!()
+                        };
+                        let (_, message, retry, exists) = server.tunnel_result(42);
+                        let layout = result_layout(server.client_screen(client), &message, retry, exists);
+                        let event = match leave {
+                            0 => key("esc"),
+                            1 => click(layout.cancel),
+                            _ => key("enter"),
+                        };
+                        forms::assert_return(server.on_tunnel_details(client, details, event), from);
+                        assert_eq!(server.tunnels.len(), 1);
+                        server.tunnels.clear();
+                    }
+                }
+            }
+        }
     }
 
     #[test]
@@ -673,7 +708,7 @@ mod tests {
                 assert_eq!(layout.cancel, close);
                 server.draw_tunnel_details(&details, screen, &mut buf);
                 assert_eq!(buf[(stop.x + 1, stop.y)].symbol(), "S");
-                assert!(matches!(server.on_tunnel_details(client, details, click(layout.primary)), Mode::Picker(_)));
+                assert!(matches!(server.on_tunnel_details(client, details, click(layout.primary)), Mode::Normal));
                 assert!(server.tunnels.is_empty(), "Stop still works at its own coordinates");
             }
         }
@@ -773,7 +808,7 @@ mod tests {
             let Mode::Picker(p) = &server.clients[&client].mode else { panic!() };
             assert!(p.actions.is_none());
             assert!(!p.action_keys().contains(&("ctrl+r", "Retry now")));
-            assert!(matches!(server.on_tunnel_details(client, details, key("enter")), Mode::Picker(_)));
+            assert!(matches!(server.on_tunnel_details(client, details, key("enter")), Mode::Normal));
             assert_eq!(server.tunnels.len(), 1, "a focused Retry must not become Stop");
             let Mode::TunnelDetails(details) = server.tunnel_details(42, None) else { panic!() };
             server.remove_tunnel("15432").unwrap();
@@ -787,7 +822,7 @@ mod tests {
             let Mode::TunnelDetails(details) = server.tunnel_details(43, None) else { panic!() };
             let (_, message, _, _) = server.tunnel_result(43);
             let layout = result_layout(server.client_screen(client), &message, false, true);
-            assert!(matches!(server.on_tunnel_details(client, details, click(layout.primary)), Mode::Picker(_)));
+            assert!(matches!(server.on_tunnel_details(client, details, click(layout.primary)), Mode::Normal));
             assert!(server.tunnels.is_empty());
             let Mode::Picker(picker) = &server.clients[&client].mode else { panic!() };
             assert_eq!(picker.items.len(), 1, "removing the last tunnel refreshes other lists");

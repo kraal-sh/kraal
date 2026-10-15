@@ -375,8 +375,10 @@ with the usage windows, when they were checked and their resets. The **⋮** mar
 or hovered account opens its actions, as does a right-click. Enter in the list opens details.
 Tab opens **Rename**, **Sign in**, and **Remove** (`ctrl+r`, `ctrl+l`, `ctrl+x`). Remove asks first, with Cancel selected, and explains that conversations and the
 agent's own sign-in are kept.
-Enter or Esc in details returns to the list with that account selected. Background account
-checks keep the list's search and selected row while updating its entries.
+Enter or Esc in details returns to the originating list with its search and selection, or to
+the panes when opened from the sidebar or directly. Rename opened through details keeps the
+same return path. Background account checks keep the list's search and selected row while
+updating its entries.
 The bottom-right count includes only accounts, showing matches over the total while searching.
 **+ Add account** is excluded from both counts.
 
@@ -395,7 +397,10 @@ how to retry. An error keeps both fields; long errors wrap and scroll with PageU
 the wheel. Enter or one click on a button submits it. Successful addition returns to Accounts,
 selects the new account and says **Account added**. These screens also work at 80x24 without
 the sidebar.
-Esc or **Cancel** in the form returns to Accounts. While **Checking sign-in...** is shown,
+Esc or **Cancel** returns to Accounts with its search and selection when the form was opened
+from that list. From the sidebar, command palette or a direct shortcut, it closes to the panes.
+Closing the **Account added** result follows the same return path. Rename follows this rule too.
+While **Checking sign-in...** is shown,
 the form accepts cancellation but no second submission. A cancelled check cannot later replace
 the screen you are using with its result.
 

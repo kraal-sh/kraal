@@ -3232,7 +3232,7 @@ mod tests {
         server.client_input(client, b"\x1b[<35;41;1M");
         server.compose(client, 1_000, &mut buf);
         assert_eq!(buf[(25, y)].symbol(), " ");
-        server.clients.get_mut(&client).unwrap().mode = server.account_details(&account.id);
+        server.clients.get_mut(&client).unwrap().mode = server.account_details(&account.id, None);
         let rows = server.sidebar_rows(&server.clients[&client], 36, 1_000);
         Server::draw_sidebar(&rows, Rect::new(0, 0, 28, 36), &mut buf);
         assert_eq!(buf[(25, y)].symbol(), "⋮");
