@@ -41,10 +41,9 @@ pub fn own_group(cmd: &mut Command) -> &mut Command {
 }
 
 /// Whether anything still runs in the process group of a child started with [`own_group`]
-/// (the child itself, or what it left in the background).
+/// (the child itself, or what it left in the background), excluding zombies.
 pub fn group_alive(child: &Child) -> bool {
-    // SAFETY: signal 0 only checks that the group exists.
-    unsafe { libc::kill(-(child.id() as libc::pid_t), 0) == 0 }
+    crate::process::group_running(child.id() as libc::pid_t)
 }
 
 /// Whether `child` has ended, without reaping it: until it is reaped, its pid (and the id of
@@ -580,21 +579,31 @@ mod tests {
     }
 
     #[test]
-    fn a_group_lives_while_what_it_left_runs() {
-        let mut child = own_group(&mut sh("sleep 5 & exit 0"))
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap();
-        child.wait().unwrap();
-        assert!(group_alive(&child), "the background sleep is still in the group");
-        kill_group(&mut child);
+    fn a_group_lives_until_only_zombies_remain() {
+        use std::os::unix::process::CommandExt;
+        let (input, release_leader) = std::io::pipe().unwrap();
+        let mut leader = own_group(&mut sh("read release")).stdin(input).spawn().unwrap();
+        let (input, release_member) = std::io::pipe().unwrap();
+        // Both are our children so their zombies remain until this test reaps them.
+        let mut member = sh("read release").process_group(leader.id() as libc::pid_t).stdin(input).spawn().unwrap();
+        assert!(group_alive(&leader));
+        drop(release_leader);
         let start = Instant::now();
-        while group_alive(&child) && start.elapsed() < crate::testing::PATIENCE {
+        while !has_exited(&leader) && start.elapsed() < crate::testing::PATIENCE {
             std::thread::sleep(Duration::from_millis(10));
         }
-        assert!(!group_alive(&child));
+        assert!(has_exited(&leader));
+        assert!(group_alive(&leader), "a live member outlasts its leader");
+        drop(release_member);
+        let start = Instant::now();
+        while !has_exited(&member) && start.elapsed() < crate::testing::PATIENCE {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(has_exited(&member));
+        let alive = group_alive(&leader);
+        member.wait().unwrap();
+        leader.wait().unwrap();
+        assert!(!alive, "neither the zombie leader nor a zombie member keeps the group running");
     }
 
     #[test]

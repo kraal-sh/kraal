@@ -69,6 +69,8 @@ pub fn command_env(pid: u32, names: &[&str]) -> Option<(Vec<String>, HashMap<Str
 thread_local! {
     pub(crate) static FAIL_ARGV: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     pub(crate) static FAIL_COMMAND_ENV: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    #[cfg(target_os = "linux")]
+    pub(crate) static AFTER_GROUP_ENUMERATION: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
 }
 
 /// The working directory of a process; `None` when the system does not show it (a process of
@@ -196,7 +198,20 @@ pub fn boot_id() -> String {
 /// Whether something still runs in process group `pgid`. A member that ended but was not reaped
 /// yet does not count: a pane keeps its ended leader unreaped (see `pane::pty::Process`).
 pub fn group_running(pgid: libc::pid_t) -> bool {
-    pgid > 1 && exists(-pgid) && imp::group_running(pgid)
+    pgid > 1 && exists(-pgid) && group_running_in(|| imp::group_snapshot(pgid))
+}
+
+fn group_running_in(mut snapshot: impl FnMut() -> Option<Vec<(libc::pid_t, bool)>>) -> bool {
+    let Some(mut before) = snapshot() else { return true };
+    if before.iter().any(|(_, running)| *running) {
+        return true;
+    }
+    // A member may fork after enumeration, then exit before its state is read. Only complete,
+    // matching lists of dead members establish completion: dead members cannot fork again.
+    let Some(mut after) = snapshot() else { return true };
+    before.sort_unstable();
+    after.sort_unstable();
+    before != after
 }
 
 /// The processes of session `sid` (a pane's program leads one, with everything started from
@@ -453,20 +468,41 @@ mod imp {
         named.then_some(path)
     }
 
-    pub fn group_running(pgid: libc::pid_t) -> bool {
-        let Ok(dir) = std::fs::read_dir("/proc") else { return true };
-        dir.filter_map(|e| e.ok()).any(|e| {
-            if !e.file_name().as_encoded_bytes().iter().all(u8::is_ascii_digit) {
-                return false;
+    pub fn group_snapshot(pgid: libc::pid_t) -> Option<Vec<(libc::pid_t, bool)>> {
+        let mut pids = Vec::new();
+        for entry in std::fs::read_dir("/proc").ok()? {
+            let entry = entry.ok()?;
+            let Some(pid) = entry.file_name().to_str().and_then(|s| s.parse::<libc::pid_t>().ok()) else {
+                continue;
+            };
+            // SAFETY: getpgid only reads the process table. Select the group before reading
+            // states, so unrelated processes exiting cannot invalidate its snapshot.
+            let group = unsafe { libc::getpgid(pid) };
+            if group == pgid {
+                pids.push(pid);
+            } else if group < 0 && std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH) {
+                return None;
             }
-            let Ok(stat) = std::fs::read(e.path().join("stat")) else { return false };
-            let Some(end) = stat.iter().rposition(|b| *b == b')') else { return false };
+        }
+        #[cfg(test)]
+        if let Some(after) = AFTER_GROUP_ENUMERATION.with(|after| after.borrow_mut().take()) {
+            after();
+        }
+        let mut members = Vec::new();
+        for pid in pids {
+            let stat = std::fs::read(format!("/proc/{pid}/stat")).ok()?;
+            let end = stat.iter().rposition(|b| *b == b')')?;
             // After the name: state, parent, process group.
             let mut fields = stat[end + 1..].split(u8::is_ascii_whitespace).filter(|f| !f.is_empty());
-            let (Some(state), _, Some(group)) = (fields.next(), fields.next(), fields.next()) else { return false };
-            !matches!(state, b"Z" | b"X")
-                && std::str::from_utf8(group).ok().and_then(|g| g.parse::<libc::pid_t>().ok()) == Some(pgid)
-        })
+            let state = fields.next()?;
+            fields.next()?;
+            let group = std::str::from_utf8(fields.next()?).ok()?.parse::<libc::pid_t>().ok()?;
+            if group != pgid {
+                return None;
+            }
+            members.push((pid, !matches!(state, b"Z" | b"X")));
+        }
+        Some(members)
     }
 
     pub fn listening_ports() -> HashSet<u16> {
@@ -622,12 +658,11 @@ mod imp {
     }
 
     pub fn running(pid: libc::pid_t) -> bool {
-        // A zombie still exists for kill(), but proc_pidinfo no longer describes it. kraal only
-        // looks at its user's processes, which proc_pidinfo describes while they run.
+        // A zombie still exists for kill(), but no longer runs.
         exists(pid) && short_info(pid).is_some_and(|info| info.pbsi_status != libc::SZOMB)
     }
 
-    /// The kernel's short description of a process (state, group, session), when it gives one.
+    /// The kernel's short description of a process, including zombies, when it gives one.
     fn short_info(pid: libc::pid_t) -> Option<libc::proc_bsdshortinfo> {
         // SAFETY: plain C data (integers, arrays): all zero bytes are a valid value.
         let mut info: libc::proc_bsdshortinfo = unsafe { std::mem::zeroed() };
@@ -637,7 +672,8 @@ mod imp {
             libc::proc_pidinfo(
                 pid,
                 libc::PROC_PIDT_SHORTBSDINFO,
-                0,
+                // Include zombies: group snapshots must distinguish them from unreadable members.
+                1,
                 (&mut info as *mut libc::proc_bsdshortinfo).cast::<libc::c_void>(),
                 size,
             )
@@ -667,29 +703,21 @@ mod imp {
         short_info(pid).and_then(|info| libc::pid_t::try_from(info.pbsi_pgid).ok())
     }
 
-    pub fn group_running(pgid: libc::pid_t) -> bool {
+    pub fn group_snapshot(pgid: libc::pid_t) -> Option<Vec<(libc::pid_t, bool)>> {
         let mut pids = vec![0 as libc::pid_t; 1024];
         let size = (pids.len() * std::mem::size_of::<libc::pid_t>()) as libc::c_int;
-        // SAFETY: the buffer is `size` bytes long; unused entries stay 0.
-        if unsafe { libc::proc_listpgrppids(pgid, pids.as_mut_ptr().cast(), size) } <= 0 {
-            return true;
+        // SAFETY: the buffer is `size` bytes long. A full buffer may omit members.
+        let n = unsafe { libc::proc_listpgrppids(pgid, pids.as_mut_ptr().cast(), size) };
+        if n <= 0 || n as usize >= pids.len() {
+            return None;
         }
-        pids.into_iter().filter(|p| *p > 0).any(|pid| {
-            // SAFETY: plain C data (integers, arrays): all zero bytes are a valid value.
-            let mut info: libc::proc_bsdshortinfo = unsafe { std::mem::zeroed() };
-            let size = std::mem::size_of::<libc::proc_bsdshortinfo>() as libc::c_int;
-            // SAFETY: proc_pidinfo writes at most `size` bytes into `info`.
-            let n = unsafe {
-                libc::proc_pidinfo(
-                    pid,
-                    libc::PROC_PIDT_SHORTBSDINFO,
-                    0,
-                    (&mut info as *mut libc::proc_bsdshortinfo).cast::<libc::c_void>(),
-                    size,
-                )
-            };
-            n == size && info.pbsi_status != libc::SZOMB
-        })
+        pids.truncate(n as usize);
+        pids.into_iter()
+            .map(|pid| {
+                let info = short_info(pid)?;
+                (info.pbsi_pgid == pgid as u32).then_some((pid, info.pbsi_status != libc::SZOMB))
+            })
+            .collect()
     }
 
     /// The kernel's description of a process, when it gives one.
@@ -811,6 +839,65 @@ compile_error!("kraal builds for Linux and macOS only");
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn group_completion_requires_complete_stable_dead_membership() {
+        let dead = vec![(10, false), (20, false)];
+        for snapshots in [
+            vec![None],
+            vec![Some(dead.clone()), None],
+            vec![Some(vec![(10, true)])],
+            vec![Some(dead.clone()), Some(vec![(10, false)])],
+            vec![Some(dead.clone()), Some(vec![(10, false), (20, false), (30, false)])],
+            vec![Some(dead.clone()), Some(vec![(10, false), (20, true)])],
+        ] {
+            let mut snapshots = snapshots.into_iter();
+            assert!(group_running_in(|| snapshots.next().unwrap()));
+        }
+        let mut snapshots = [Some(dead), Some(vec![(20, false), (10, false)])].into_iter();
+        assert!(!group_running_in(|| snapshots.next().unwrap()), "enumeration order does not matter");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn unrelated_exits_do_not_invalidate_a_group_snapshot() {
+        use std::cell::RefCell;
+        use std::os::unix::process::CommandExt;
+        use std::process::{Child, Command};
+        use std::rc::Rc;
+
+        fn end_during_scan(children: Rc<RefCell<Vec<Child>>>) {
+            AFTER_GROUP_ENUMERATION.with(|after| {
+                *after.borrow_mut() = Some(Box::new(move || {
+                    let mut child = children.borrow_mut().pop().unwrap();
+                    child.kill().unwrap();
+                    child.wait().unwrap();
+                    if !children.borrow().is_empty() {
+                        end_during_scan(children);
+                    }
+                }));
+            });
+        }
+
+        let mut leader = Command::new("true").process_group(0).spawn().unwrap();
+        let start = std::time::Instant::now();
+        while !crate::exec::has_exited(&leader) && start.elapsed() < crate::testing::PATIENCE {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(crate::exec::has_exited(&leader));
+        // Each retry loses another unrelated process, so retries cannot hide the race.
+        let unrelated =
+            Rc::new(RefCell::new((0..3).map(|_| Command::new("sleep").arg("60").spawn().unwrap()).collect::<Vec<_>>()));
+        end_during_scan(unrelated.clone());
+        let snapshot = imp::group_snapshot(leader.id() as libc::pid_t);
+        AFTER_GROUP_ENUMERATION.with(|after| after.borrow_mut().take());
+        for mut child in unrelated.borrow_mut().drain(..) {
+            child.kill().unwrap();
+            child.wait().unwrap();
+        }
+        leader.wait().unwrap();
+        assert_eq!(snapshot, Some(vec![(leader.id() as libc::pid_t, false)]));
+    }
 
     #[test]
     fn a_foreground_check_uses_the_parents_read_with_the_session() {

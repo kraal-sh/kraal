@@ -167,7 +167,11 @@ is `1`, and one that is false or empty is the empty string. A hook can call kraa
 the session's `KRAAL_SOCKET`, so `kraal read -p "$KRAAL_PANE"` reads the pane the event is about.
 [hooks.toml](../examples/config/hooks.toml) is this table as a file to copy.
 
-At most 20 hooks start per second and 32 run at once; a hook running for 10 minutes is stopped
-with everything it started; 64 KiB of each hook's output are kept, in a log only you can read,
+At most 20 hooks start per second and 32 run at once. A hook counts as running while any process
+in its group is still alive, even after its shell exits. Kraal keeps the shell's process id
+reserved until supervision ends, so a later stop cannot target an unrelated group that reused
+that id. After 10 minutes, or when the session stops, kraal kills the hook's process group.
+Processes that leave that group are outside this supervision.
+64 KiB of each hook's output are kept, in a log only you can read,
 renamed `hooks.log.1` once past 1 MB. Hooks and scripts reading the stream run as you, like any
 script: kraal does not sandbox them.

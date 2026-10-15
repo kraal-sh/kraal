@@ -7,7 +7,9 @@
 
 # A key is an event type (`kraal events --list`) or a prefix ("agent.*"). sh runs the
 # command, with the event's fields in $KRAAL_<FIELD> and the whole event in $KRAAL_EVENT_JSON.
-# At most 20 hooks start per second, and one that runs for 10 minutes is stopped.
+# At most 20 hooks start per second and 32 run at once, including background group members.
+# After 10 minutes or when the session stops, the hook's process group is killed.
+# Processes that leave that group are outside this supervision.
 [hooks]
 # An agent asks a question or a permission: tell your phone.
 "agent.blocked" = 'curl -fsS -d "$KRAAL_AGENT needs you: $KRAAL_NAME" https://ntfy.sh/my-kraal-topic'
