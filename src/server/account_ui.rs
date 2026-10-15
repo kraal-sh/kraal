@@ -21,6 +21,7 @@ use crate::theme::NoticeKind;
 /// Account labels and summaries do not depend on terminal output or the general chrome tick.
 pub(super) struct AccountDisplay {
     accounts: Vec<Account>,
+    statuses: Vec<Option<Status>>,
     panes: HashMap<PaneId, PaneAccountInput>,
     usage: HashMap<String, Usage>,
     checks: HashMap<String, super::agents::ExistingCheck>,
@@ -119,8 +120,11 @@ fn age(observed: i64, now: i64) -> String {
     }
 }
 
-pub(super) fn usage_summary(a: &Account, usage: Option<&Usage>, now: i64) -> String {
-    if a.sign_in_required {
+pub(super) fn usage_summary(a: &Account, status: Option<Status>, usage: Option<&Usage>, now: i64) -> String {
+    if status == Some(Status::NotInstalled) {
+        return "Not installed".into();
+    }
+    if a.sign_in_required || status == Some(Status::NotSignedIn) {
         return "Sign-in required".into();
     }
     let Some(u) = usage.filter(|u| u.five_hour.is_some() || u.weekly.is_some()) else {
@@ -168,6 +172,11 @@ impl Server {
         let mut cached = self.account_display.borrow_mut();
         if let Some(display) = cached.as_ref()
             && display.accounts == self.accounts.entries()
+            && display
+                .accounts
+                .iter()
+                .zip(&display.statuses)
+                .all(|(a, status)| self.account_discovery.status(a) == *status)
             && display.usage == self.usage.0
             && display.checks == *self.account_discovery.checks()
             && now.is_none_or(|now| now >= display.since && display.until.is_none_or(|until| now < until))
@@ -202,6 +211,7 @@ impl Server {
             self.panes.keys().filter_map(|&id| self.pane_account(id).map(|a| (id, accounts::label(&a)))).collect();
         let display = Rc::new(AccountDisplay {
             accounts: self.accounts.entries().to_vec(),
+            statuses: self.accounts.entries().iter().map(|a| self.account_discovery.status(a)).collect(),
             panes,
             usage: self.usage.0.clone(),
             checks: self.account_discovery.checks().clone(),
@@ -220,8 +230,8 @@ impl Server {
     }
 
     fn account_summary_at(&self, a: &Account, now: i64) -> String {
-        let summary = usage_summary(a, self.usage.get(a), now);
-        if summary == "Sign-in required" || summary.starts_with("Last checked") {
+        let summary = usage_summary(a, self.account_discovery.status(a), self.usage.get(a), now);
+        if matches!(summary.as_str(), "Sign-in required" | "Not installed") || summary.starts_with("Last checked") {
             summary
         } else {
             let count = self.panes.keys().filter(|&&p| self.pane_account(p).is_some_and(|b| b.id == a.id)).count();
@@ -283,7 +293,11 @@ impl Server {
                     PickAction::CheckExisting { agent: a.agent },
                 )
             } else {
-                PickItem::new(accounts::review_question(&a), "", PickAction::ReviewAccount(a))
+                PickItem::new(
+                    accounts::review_question(&a),
+                    usage_summary(&a, self.account_discovery.status(&a), self.usage.get(&a), now),
+                    PickAction::ReviewAccount(a),
+                )
             };
             items.push(item.dim());
         }
@@ -1057,6 +1071,17 @@ mod tests {
     }
 
     #[test]
+    fn cached_status_does_not_follow_a_changed_account_home() {
+        let mut server = server();
+        let a = server.accounts.add(account()).unwrap();
+        server.account_discovery.set_status(&a, Status::NotSignedIn);
+        assert_eq!(server.account_display_at(1_000).items[0].detail, "Sign-in required");
+        server.accounts.remove("claude", "work");
+        server.accounts.add(Account { home: "/nonexistent/other".into(), ..a }).unwrap();
+        assert_eq!(server.account_display_at(1_000).items[0].detail, "No usage yet");
+    }
+
+    #[test]
     fn cached_accounts_follow_usage_resets_ages_and_clock_changes() {
         let mut server = server();
         let a = server.accounts.add(account()).unwrap();
@@ -1105,7 +1130,7 @@ mod tests {
         server.accounts.adopt_checked(&existing, None).unwrap();
         let display = server.account_display_at(1_000);
         assert_eq!(display.items[1].label, "? Which account is ~/.claude");
-        assert!(display.items[1].detail.is_empty());
+        assert_eq!(display.items[1].detail, "No usage yet");
         assert!(display.items[1].dim);
         let pending = server.accounts.reviews().pop().unwrap();
         server.accounts.review(&pending, Some(&target)).unwrap();
@@ -1313,14 +1338,14 @@ mod tests {
             observed_at: 1000,
             ..Default::default()
         };
-        assert_eq!(usage_summary(&a, None, 1100), "No usage yet");
-        assert_eq!(usage_summary(&a, Some(&Usage::default()), 1100), "No usage yet");
-        assert_eq!(usage_summary(&a, Some(&u), 1100), "57% used");
-        assert_eq!(usage_summary(&a, Some(&u), 2000), "Last checked 16m ago");
+        assert_eq!(usage_summary(&a, None, None, 1100), "No usage yet");
+        assert_eq!(usage_summary(&a, None, Some(&Usage::default()), 1100), "No usage yet");
+        assert_eq!(usage_summary(&a, None, Some(&u), 1100), "57% used");
+        assert_eq!(usage_summary(&a, None, Some(&u), 2000), "Last checked 16m ago");
         u.weekly = Some(Window { used_percent: 71.0, resets_at: None });
-        assert_eq!(usage_summary(&a, Some(&u), 2000), "71% used");
+        assert_eq!(usage_summary(&a, None, Some(&u), 2000), "71% used");
         a.sign_in_required = true;
-        assert_eq!(usage_summary(&a, Some(&u), 1100), "Sign-in required");
+        assert_eq!(usage_summary(&a, None, Some(&u), 1100), "Sign-in required");
     }
 
     #[test]
@@ -1440,7 +1465,7 @@ mod tests {
             assert_eq!(u.peak(now), peak.unwrap_or(0.0), "{u:?} at {now}");
             assert_eq!(u.next_end(now), end, "{u:?} at {now}");
             assert_eq!(u.next_reset(now), reset, "{u:?} at {now}");
-            assert_eq!(usage_summary(&a, Some(&u), now), summary, "{u:?} at {now}");
+            assert_eq!(usage_summary(&a, None, Some(&u), now), summary, "{u:?} at {now}");
             assert_eq!(accounts::usage_text(&u, now), text, "{u:?} at {now}");
             let map = accounts::UsageMap(HashMap::from([(a.key(), u.clone())]));
             let expected = (u.five_hour.is_some() || u.weekly.is_some()).then_some(peak.unwrap_or(0.0));

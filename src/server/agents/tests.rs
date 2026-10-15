@@ -431,6 +431,85 @@ fn discovery_without_a_verified_identity_does_not_check_named_homes() {
 }
 
 #[test]
+fn renaming_an_unsigned_account_keeps_the_warning_in_both_views() {
+    if !crate::testing::in_own_process(
+        "server::agents::tests::renaming_an_unsigned_account_keeps_the_warning_in_both_views",
+    ) {
+        return;
+    }
+    let (mut t, work, standard) = identity_discovery("renamed-unsigned-account");
+    signed_in(&standard, "a@example.com");
+    t.server.check_existing_accounts();
+    t.until("discovery checks the unsigned named home", |t| t.server.jobs.is_empty());
+    assert_eq!(t.server.account_discovery.status(&work), Some(Status::NotSignedIn));
+    let (client, _peer) = super::super::tests::client(&mut t.server);
+    for name in ["work", "renamed"] {
+        if name != work.name {
+            t.server.rename_account("claude", &work.name, name).unwrap();
+        }
+        let mut buffer = ratatui::buffer::Buffer::empty(ratatui::layout::Rect::new(0, 0, 124, 36));
+        t.server.compose(client, 1_000, &mut buffer);
+        let text = crate::testing::buffer_text(&buffer);
+        assert!(text.contains(&format!("Claude · {name}")));
+        assert!(text.contains("Sign-in required"));
+        t.server.refresh_existing_accounts();
+        t.until("reopening Accounts finishes discovery", |t| t.server.jobs.is_empty());
+        let picker = t.server.accounts_picker_at(Some(&work.id), 1_000);
+        assert_eq!(picker.current().unwrap().label, format!("Claude · {name}"));
+        assert_eq!(picker.current().unwrap().detail, "Sign-in required");
+        assert!(matches!(t.server.account_discovery.checks()["claude"], ExistingCheck::Checked(Status::SignedIn)));
+        assert_eq!(std::fs::read_to_string(standard.join("checks")).unwrap(), "check\n");
+        assert_eq!(std::fs::read_to_string(std::path::Path::new(&work.home).join("checks")).unwrap(), "check\n");
+    }
+}
+
+#[test]
+fn successful_login_clears_the_cached_sign_in_required_row() {
+    use super::super::queue::Wait;
+
+    if !crate::testing::in_own_process("server::agents::tests::successful_login_clears_the_cached_sign_in_required_row")
+    {
+        return;
+    }
+    let (mut t, work, standard) = identity_discovery("unsigned-account-row");
+    signed_in(&standard, "a@example.com");
+    t.server.check_existing_accounts();
+    t.until("discovery checks the unsigned named home", |t| t.server.jobs.is_empty());
+    assert_eq!(t.server.account_discovery.status(&work), Some(Status::NotSignedIn));
+    let (client, _peer) = super::super::tests::client(&mut t.server);
+    let mut buffer = ratatui::buffer::Buffer::empty(ratatui::layout::Rect::new(0, 0, 124, 36));
+    t.server.compose(client, 1_000, &mut buffer);
+    assert!(crate::testing::buffer_text(&buffer).contains("Sign-in required"));
+    let picker = t.server.accounts_picker_at(Some(&work.id), 1_000);
+    assert_eq!(picker.current().unwrap().detail, "Sign-in required");
+    let (other, _other_peer) = super::super::tests::client(&mut t.server);
+    t.server.clients.get_mut(&other).unwrap().mode = Mode::Picker(t.server.accounts_picker_at(Some(&work.id), 1_000));
+    t.server.clients.get_mut(&client).unwrap().mode = Mode::Picker(picker);
+    t.server.client_input(client, b"\r");
+    assert!(matches!(&t.server.clients[&client].mode, Mode::AccountDetails(d) if d.account == work.id));
+    t.server.client_input(client, b"\t");
+    let Mode::Picker(picker) = &t.server.clients[&client].mode else { panic!("account actions did not open") };
+    assert!(picker.actions.is_some());
+    assert!(picker.action_keys().contains(&("ctrl+l", "Sign in")));
+    let login = t.server.open_login(client, &work).unwrap();
+    signed_in(std::path::Path::new(&work.home), "b@example.com");
+    t.server.check_login(login).unwrap();
+    while t.server.panes.contains_key(&login) {
+        let Wait::Event(event) = t.rx.wait(crate::testing::PATIENCE) else { panic!("login was not verified") };
+        t.server.handle(event);
+    }
+    let picker = t.server.accounts_picker_at(Some(&work.id), 1_000);
+    assert_eq!(picker.current().unwrap().detail, "No usage yet");
+    let Mode::Picker(picker) = &t.server.clients[&other].mode else { panic!("the other client's list closed") };
+    assert_eq!(picker.current().unwrap().detail, "No usage yet");
+    t.server.clients.get_mut(&client).unwrap().mode = Mode::Normal;
+    t.server.compose(client, 1_000, &mut buffer);
+    assert!(!crate::testing::buffer_text(&buffer).contains("Sign-in required"));
+    assert!(!t.server.accounts.by_id(&work.id).unwrap().sign_in_required);
+    t.until("post-login discovery finishes", |t| t.server.jobs.is_empty());
+}
+
+#[test]
 fn login_invalidates_cached_and_in_flight_identity_results() {
     use super::super::{Event, queue::Wait};
 
@@ -618,7 +697,7 @@ fn a_verified_account_opens_review_without_rechecking_or_waiting_for_another_age
         let picker = t.server.accounts_picker(None);
         let item = picker.items.iter().find(|i| matches!(i.action, PickAction::ReviewAccount(_))).unwrap();
         assert_eq!(item.label, "? Which account is ~/.claude");
-        assert!(item.detail.is_empty());
+        assert_eq!(item.detail, "No usage yet");
         assert!(item.dim);
         let Mode::Picker(review) = t.server.pick(99, &picker, item.clone()) else { panic!("review") };
         assert!(review.kind == PickerKind::AccountReview);

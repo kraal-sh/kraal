@@ -332,8 +332,10 @@ proof. The saved answer produces one notice, for example: `~/.claude is Claude �
 An unresolved sign-in never appears as an extra account. No match, several matches, or an
 unreadable identity leave one dim question just above **+ Add account**:
 **? Which account is ~/.claude** (or ~/.codex). A narrow sidebar shortens this to
-**? Account for ~/.claude**. Open the question in Accounts (`ctrl+b A l`), click it in the
-sidebar, or run `kraal accounts review claude`. The existing **Which account is this?**
+**? Account for ~/.claude**. Its second line shows that home's measured usage, such as
+**77% used**, or **No usage yet** before any measurement. Open the question in Accounts
+(`ctrl+b A l`), click it in the sidebar, or run `kraal accounts review claude`.
+The existing **Which account is this?**
 question lists your named accounts and **A different account**. Choose one, then confirm
 **Use account**. Cancel is selected first. Opening the question does not run another status
 command or start a login. Reopening Accounts checks unsigned standard homes again, so a
@@ -371,8 +373,14 @@ heading. In the sidebar, accounts use the same two-line rows as workspaces: a bo
 `Claude · work` label after `●` when panes use the account, or `○` when none do, then an
 indented, dimmed `57% used · 2 panes`. Only the usage turns red at or above the account's
 threshold. Zero panes are omitted. Before any measurement, the sidebar and the Accounts list say
-**No usage yet**. A login still to verify says **Sign-in required** (in red in the sidebar), and
-expired observations say **Last checked ...**.
+**No usage yet**. A login still to verify, or an account whose last sign-in check found it
+unsigned, says **Sign-in required** (in red in the sidebar). A check that found the agent
+missing says **Not installed**. These statuses take precedence over saved usage. An
+inconclusive check, or no check yet, leaves the usual usage text. Expired observations say
+**Last checked ...**. Rows use the checks already collected by discovery at startup and
+when opening Accounts. Discovery checks named homes when it needs them to identify an
+existing sign-in. Signing in through kraal invalidates the old checks, verifies the login,
+and refreshes the rows.
 A narrow sidebar omits whole status parts that do not fit. Clicking either line opens details
 with the usage windows, when they were checked and their resets. The **⋮** marker on a selected
 or hovered account opens its actions, as does a right-click. Enter in the list opens details.
