@@ -413,7 +413,7 @@ impl TerminalClient {
                 return;
             }
             let shown = String::from_utf8_lossy(&written).replace('\x1b', "^[");
-            assert!(start.elapsed() < Duration::from_secs(10), "{frames} frame(s) never written: {shown}");
+            assert!(start.elapsed() < PATIENCE, "{frames} frame(s) never written: {shown}");
             std::thread::sleep(Duration::from_millis(10));
         }
     }
@@ -426,7 +426,7 @@ impl TerminalClient {
             if written.contains(text) {
                 return;
             }
-            assert!(start.elapsed() < Duration::from_secs(10), "{text:?} never written: {written:?}");
+            assert!(start.elapsed() < PATIENCE, "{text:?} never written: {written:?}");
             std::thread::sleep(Duration::from_millis(10));
         }
     }
@@ -695,7 +695,7 @@ impl RawClient {
                 self.trace_step_at(bytes.len(), ClientAction::Observed(what.into()));
                 return rows;
             }
-            assert!(start.elapsed() < Duration::from_secs(10), "never {what}:\n{}", rows.join("\n"));
+            assert!(start.elapsed() < PATIENCE, "never {what}:\n{}", rows.join("\n"));
             std::thread::sleep(Duration::from_millis(50));
         }
     }
@@ -772,7 +772,7 @@ impl RawClient {
                 return now;
             }
             seen = now;
-            assert!(start.elapsed() < Duration::from_secs(10), "the screen never settles");
+            assert!(start.elapsed() < PATIENCE, "the screen never settles");
         }
     }
 }
