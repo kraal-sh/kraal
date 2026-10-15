@@ -2081,7 +2081,7 @@ while IFS= read -r line; do printf 'reply:%s\n' "$line"; done
             client.wait_for_row("Enter Details");
             client.send(b"\x1b");
             client.wait_for_rows("Accounts closed", |rows| !rows.iter().any(|r| r.contains("Enter Details")));
-            click_account_text(&mut client, "No usage · 1 pane");
+            click_account_text(&mut client, "No usage yet · 1 pane");
             client.wait_for_row("Enter Back · Tab Actions");
             client.send(b"\r\x1b");
             client.wait_for_rows("Details closed", |rows| {

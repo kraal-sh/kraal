@@ -14,6 +14,29 @@ use crate::server::{ClientId, Server};
 use crate::theme::NoticeKind;
 
 impl Server {
+    /// Actions for an account row. Overlays call this only for exposed sidebar cells.
+    pub(in crate::server) fn sidebar_account_actions(&self, id: ClientId, m: MouseEvent) -> Option<Mode> {
+        let c = self.clients.get(&id)?;
+        let sw = self.sidebar_cols(c);
+        if !self.config.mouse
+            || m.col >= sw
+            || !matches!(m.kind, MouseKind::Press(MouseButton::Left | MouseButton::Right))
+        {
+            return None;
+        }
+        let Some(item @ SideItem::Account(_)) = self.sidebar_hit(id, m.row) else { return None };
+        let marker = matches!(self.sidebar_presentation(c), crate::server::geometry::Sidebar::Full(_))
+            && m.col >= sw.saturating_sub(4)
+            && self.sidebar_hit(id, m.row.saturating_sub(1)).as_ref() != Some(&item);
+        if !marker && !matches!(m.kind, MouseKind::Press(MouseButton::Right)) {
+            return None;
+        }
+        let SideItem::Account(account) = item else { unreachable!() };
+        let mut picker = self.accounts_picker(Some(&account));
+        picker.actions = (picker.action_keys().len() > 1).then_some(0);
+        Some(Mode::Picker(picker))
+    }
+
     /// A mouse event; returns the mode it opens (a picker, a question), if any.
     pub(super) fn on_mouse(&mut self, id: ClientId, m: MouseEvent, scroll_mode: bool) -> Option<Mode> {
         if !self.config.mouse {
@@ -23,6 +46,14 @@ impl Server {
         let (rows, sw) = (c.rows, self.sidebar_cols(c));
         let full_sidebar = matches!(self.sidebar_presentation(c), crate::server::geometry::Sidebar::Full(_));
         let area = self.client_area(id);
+        let hover = (full_sidebar && m.col > 0 && m.col < sw.saturating_sub(1))
+            .then(|| self.sidebar_hit(id, m.row))
+            .flatten()
+            .filter(|item| matches!(item, SideItem::Account(_)));
+        if self.clients[&id].sidebar_hover != hover {
+            self.clients.get_mut(&id)?.sidebar_hover = hover;
+            self.mark_dirty();
+        }
 
         // A drag in progress owns the mouse until release.
         if let Some(drag) = self.clients.get_mut(&id).and_then(|c| c.drag.take()) {
@@ -86,14 +117,16 @@ impl Server {
         }
         // The sidebar runs from the top, beside the top bar.
         if m.col < sw {
+            if let Some(mode) = self.sidebar_account_actions(id, m) {
+                return Some(mode);
+            }
             if (matches!(m.kind, MouseKind::Press(MouseButton::Right))
                 || press_left && full_sidebar && m.col >= sw.saturating_sub(4))
-                && let Some(SideItem::Workspace(ws)) = self.sidebar_hit(id, m.row)
+                && let Some(item @ SideItem::Workspace(ws)) = self.sidebar_hit(id, m.row)
                 && (matches!(m.kind, MouseKind::Press(MouseButton::Right))
-                    || self.sidebar_hit(id, m.row.saturating_sub(1)) != Some(SideItem::Workspace(ws)))
+                    || self.sidebar_hit(id, m.row.saturating_sub(1)).as_ref() != Some(&item))
             {
-                let current = self.clients[&id].workspace;
-                let mut picker = self.workspace_picker(current);
+                let mut picker = self.workspace_picker(self.clients[&id].workspace);
                 picker.select(|i| i.action.workspace() == Some(ws));
                 picker.actions = (picker.action_keys().len() > 1).then_some(0);
                 return Some(Mode::Picker(picker));
@@ -750,6 +783,196 @@ mod tests {
                 assert_eq!(p.title, "Add workspace");
             }
         }
+    }
+
+    #[test]
+    fn account_sidebar_clicks_open_details_or_the_accounts_own_actions() {
+        for width in [28, 12] {
+            let (tx, _rx) = crate::server::queue::channel(32);
+            let mut server = crate::server::tests::server(tx);
+            let (client, _peer) = crate::server::tests::client(&mut server);
+            server.config.sidebar.width = width;
+            let mut a = server.accounts.get("claude", "default").unwrap();
+            a.name = "work".into();
+            let a = server.accounts.add(a).unwrap();
+            let row =
+                (0..36).find(|&row| server.sidebar_hit(client, row) == Some(SideItem::Account(a.id.clone()))).unwrap();
+            for offset in [0, 1] {
+                for col in 1..width - 1 {
+                    let click = MouseEvent {
+                        kind: MouseKind::Press(MouseButton::Left),
+                        col,
+                        row: row + offset,
+                        mods: Default::default(),
+                    };
+                    let mode = server.on_mouse(client, click, false).unwrap();
+                    if offset == 0 && col >= width - 4 {
+                        let Mode::Picker(p) = mode else { panic!() };
+                        assert!(p.kind == PickerKind::Accounts);
+                        assert!(p.actions.is_some());
+                        assert!(matches!(&p.current().unwrap().action,
+                            crate::server::ui::PickAction::AccountDetails(id) if id == &a.id));
+                    } else {
+                        assert!(matches!(mode, Mode::AccountDetails(d) if d.account == a.id));
+                    }
+                }
+                let click = MouseEvent {
+                    kind: MouseKind::Press(MouseButton::Right),
+                    col: 3,
+                    row: row + offset,
+                    mods: Default::default(),
+                };
+                assert!(matches!(server.on_mouse(client, click, false), Some(Mode::Picker(p)) if p.actions.is_some()));
+            }
+        }
+    }
+
+    #[test]
+    fn full_sidebar_requests_pointer_motion_and_releases_it_when_hidden() {
+        let (tx, _rx) = crate::server::queue::channel(32);
+        let mut server = crate::server::tests::server(tx);
+        let (client, _peer) = crate::server::tests::client(&mut server);
+        assert!(!server.wants_pointer_motion(&server.clients[&client]));
+        let mut account = server.accounts.get("claude", "default").unwrap();
+        account.name = "work".into();
+        server.accounts.add(account).unwrap();
+        assert!(server.wants_pointer_motion(&server.clients[&client]));
+        server.clients.get_mut(&client).unwrap().sidebar = Some(false);
+        assert!(!server.wants_pointer_motion(&server.clients[&client]));
+        server.clients.get_mut(&client).unwrap().sidebar = Some(true);
+        assert!(server.wants_pointer_motion(&server.clients[&client]));
+        server.clients.get_mut(&client).unwrap().cols = 80;
+        assert!(!server.wants_pointer_motion(&server.clients[&client]));
+        server.clients.get_mut(&client).unwrap().cols = 124;
+        server.config.mouse = false;
+        assert!(!server.wants_pointer_motion(&server.clients[&client]));
+    }
+
+    #[test]
+    fn repeated_follow_focus_does_not_check_account_homes() {
+        let (tx, _rx) = crate::server::queue::channel(32);
+        let mut server = crate::server::tests::server(tx);
+        let (client, _peer) = crate::server::tests::client(&mut server);
+        for name in ["work", "personal"] {
+            let mut account = server.accounts.get("claude", "default").unwrap();
+            account.id = name.into();
+            account.name = name.into();
+            account.home = format!("/nonexistent/kraal-focus-{name}");
+            server.accounts.add(account).unwrap();
+        }
+        crate::accounts::HOME_CHECKS.with(|n| n.set(0));
+        for _ in 0..100 {
+            server.follow_focus();
+        }
+        assert!(server.clients[&client].pointer_motion);
+        assert_eq!(crate::accounts::HOME_CHECKS.with(std::cell::Cell::get), 0);
+    }
+
+    #[test]
+    fn oversized_mouse_coordinates_do_not_hover_an_account() {
+        let (tx, _rx) = crate::server::queue::channel(32);
+        let mut server = crate::server::tests::server(tx);
+        let (client, _peer) = crate::server::tests::client(&mut server);
+        let mut account = server.accounts.get("claude", "default").unwrap();
+        account.name = "work".into();
+        let account = server.accounts.add(account).unwrap();
+        let row = (0..36)
+            .find(|&row| server.sidebar_hit(client, row) == Some(SideItem::Account(account.id.clone())))
+            .unwrap();
+        server.client_input(client, format!("\x1b[<35;2;{}M", row + 1).as_bytes());
+        assert_eq!(server.clients[&client].sidebar_hover, Some(SideItem::Account(account.id)));
+        server.client_input(client, format!("\x1b[<35;99999;{}M", row + 1).as_bytes());
+        assert_eq!(server.clients[&client].sidebar_hover, None);
+        server.client_input(client, b"\x1b[<35;99999;1M");
+        assert_eq!(server.clients[&client].sidebar_hover, None);
+        assert!(matches!(server.clients[&client].mode, Mode::Normal));
+    }
+
+    #[test]
+    fn exposed_account_markers_open_actions_from_details_and_the_picker() {
+        let (tx, _rx) = crate::server::queue::channel(32);
+        let mut server = crate::server::tests::server(tx);
+        let (client, _peer) = crate::server::tests::client(&mut server);
+        let mut account = server.accounts.get("claude", "default").unwrap();
+        account.name = "work".into();
+        let account = server.accounts.add(account).unwrap();
+        server.bottom_bar = true;
+        let row = (0..36)
+            .find(|&row| server.sidebar_hit(client, row) == Some(SideItem::Account(account.id.clone())))
+            .unwrap();
+        let marker = server.sidebar_cols(&server.clients[&client]) - 3;
+        for details in [true, false] {
+            server.clients.get_mut(&client).unwrap().mode = Mode::Normal;
+            if details {
+                server.client_input(client, format!("\x1b[<0;2;{}M", row + 1).as_bytes());
+                assert!(matches!(&server.clients[&client].mode, Mode::AccountDetails(d) if d.account == account.id));
+            } else {
+                server.client_input(client, b"\x02Al");
+                assert!(
+                    matches!(&server.clients[&client].mode, Mode::Picker(p) if p.kind == PickerKind::Accounts && p.actions.is_none())
+                );
+            }
+            let row = (0..36)
+                .find(|&row| server.sidebar_hit(client, row) == Some(SideItem::Account(account.id.clone())))
+                .unwrap();
+            let mut buf = ratatui::buffer::Buffer::empty(server.client_screen(client));
+            server.compose(client, crate::accounts::now(), &mut buf);
+            assert_eq!(buf[(marker, row)].symbol(), "⋮");
+            server.client_input(client, format!("\x1b[<0;{};{}M", marker + 1, row + 1).as_bytes());
+            let Mode::Picker(p) = &server.clients[&client].mode else { panic!() };
+            assert!(p.kind == PickerKind::Accounts);
+            assert_eq!(p.actions, Some(0));
+            assert!(matches!(&p.current().unwrap().action,
+                crate::server::ui::PickAction::AccountDetails(id) if id == &account.id));
+        }
+    }
+
+    #[test]
+    fn passive_hover_keeps_the_primary_client_activity_and_pane_sizes() {
+        let (tx, _rx) = crate::server::queue::channel(32);
+        let mut server = crate::server::tests::server(tx);
+        let (primary, _peer) = crate::server::tests::client(&mut server);
+        let (other, _other_peer) = crate::server::tests::client(&mut server);
+        let mut account = server.accounts.get("claude", "default").unwrap();
+        account.name = "work".into();
+        let account = server.accounts.add(account).unwrap();
+        let c = server.clients.get_mut(&other).unwrap();
+        (c.cols, c.rows) = (150, 45);
+        c.workspace = server.workspaces[0].id;
+        let pane = server
+            .spawn_pane(None, crate::pane::PaneSpec { command: vec!["true".into()], ..Default::default() })
+            .unwrap();
+        let tab = &mut server.workspaces[0].tabs[0];
+        tab.root = Some(crate::layout::Node::Leaf(pane));
+        tab.focus = Some(pane);
+        server.primary = Some(primary);
+        server.relayout();
+        server.follow_focus();
+        assert!(server.clients[&other].pointer_motion);
+        let size = (server.panes[&pane].cols, server.panes[&pane].rows);
+        let area = server.layout_area;
+        let last_input = server.clients[&other].last_input;
+        let row =
+            (0..45).find(|&row| server.sidebar_hit(other, row) == Some(SideItem::Account(account.id.clone()))).unwrap();
+        let motion = format!("\x1b[<35;2;{}M", row + 1);
+        // Split reports must stay passive before and after the decoder completes them.
+        for byte in motion.bytes() {
+            server.client_input(other, &[byte]);
+            assert_eq!(server.primary, Some(primary));
+            assert_eq!(server.clients[&other].last_input, last_input);
+            assert_eq!(server.layout_area, area);
+            assert_eq!((server.panes[&pane].cols, server.panes[&pane].rows), size);
+        }
+        assert_eq!(server.clients[&other].sidebar_hover, Some(SideItem::Account(account.id)));
+        server.client_input(other, b"\x1b[<35;40;5M");
+        assert_eq!(server.clients[&other].sidebar_hover, None);
+        assert_eq!(server.primary, Some(primary));
+        assert_eq!(server.clients[&other].last_input, last_input);
+        assert_eq!((server.panes[&pane].cols, server.panes[&pane].rows), size);
+        server.client_input(other, b"\x1b[<0;40;5M");
+        assert_eq!(server.primary, Some(other));
+        assert!(server.clients[&other].last_input > last_input);
+        assert_ne!((server.panes[&pane].cols, server.panes[&pane].rows), size);
     }
 
     #[test]
