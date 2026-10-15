@@ -11,6 +11,23 @@ pub(super) fn source_missing(error: &anyhow::Error) -> bool {
 }
 
 impl Server {
+    pub(super) fn record_source_write(&mut self, written: &workspace::migration::SourceWrite) {
+        let mut changed = false;
+        for ws in &mut self.workspaces {
+            changed |= written.update(ws.definition.as_deref(), &mut ws.definition_source);
+            changed |= written.update(ws.definition.as_deref(), &mut ws.source_reviewed);
+            for saved in ws.kept.iter_mut().chain(ws.layout_undo.as_deref_mut()) {
+                changed |= written.update_saved(saved);
+            }
+        }
+        for ws in self.unrestored.iter_mut().chain(self.deleted_workspaces.iter_mut().map(|w| &mut w.workspace)) {
+            changed |= written.update_saved(ws);
+        }
+        if changed {
+            self.mark_persist();
+        }
+    }
+
     pub(super) fn refresh_source_status(&mut self) {
         let mut changed = Vec::new();
         for ws in &mut self.workspaces {

@@ -9,7 +9,7 @@ for Claude Code and Codex. Other agents use their own sign-in and account settin
 |---|---|
 | Start | `ctrl+b a`, choose an installed agent (or a Claude or Codex account), Enter. Tab also offers **Start in new tab** and, in a local repository, **Start in worktree**. |
 | Add an account | `ctrl+b A l` opens **Accounts**. Choose **+ Add account**, select **Agent**, enter **Name** and submit. Complete the agent's sign-in; kraal verifies it before confirming success. `ctrl+b A n` opens the same form directly. |
-| Use an existing sign-in | Open Accounts. A verified standard home is adopted with a name; an uncertain match offers **Review**. Choose which account it is without logging in again. |
+| Use an existing sign-in | Open Accounts. A verified standard home is adopted with a name; an uncertain match asks **Which account is ~/.claude** (or ~/.codex). Choose which account it is without logging in again. |
 | Change this pane's account | `ctrl+b A c`, or click its account name. Check **Continue conversation** or **New conversation**, then choose the destination. Sign-in is checked before anything stops. |
 | Return | Click **Undo** after a change, or use `ctrl+b p`, select the pane, Tab, **Undo account change**. The previous account is checked again. Undo does not revert project files. |
 
@@ -305,7 +305,7 @@ kraal accounts add claude pro
 | `kraal accounts add codex work` | the same for Codex, with `codex login` |
 | `kraal accounts add claude team --home ~/claude-team --no-login --threshold 80` | in a directory you choose (`~/.local/share/kraal/accounts/claude-team` otherwise), without logging in now, with a threshold of its own |
 | `kraal accounts` | every account: sign-in status, 5-hour and weekly usage (`kraal accounts list --json` for scripts) |
-| `kraal accounts review claude` | identifies an existing sign-in marked Review, without another login |
+| `kraal accounts review claude` | answers which account an existing sign-in belongs to, without another login |
 | `kraal accounts login claude:pro` | logs an account in again |
 | `kraal accounts rename claude:pro work` | renames it: rules and usage follow, the directory stays |
 | `kraal accounts rm claude:work` | forgets it; its directory is kept |
@@ -314,28 +314,39 @@ kraal accounts add claude pro
 | `kraal agent codex --account work --right` | on that account, in a split on the right (`--down`, `--floating` and `--tab` place it too; `--here` runs it in this terminal even inside kraal) |
 | `kraal agent claude -- --model opus` | what follows `--` goes to the agent |
 
-When the agent verifies its existing sign-in in `~/.claude` or `~/.codex`, kraal adopts it as
-**Personal**, or uses a public identity returned by the agent, such as Claude's email. You can
-rename it like any other account. No login is started and no credentials are copied. An absent
-agent or an unsigned home adds no account. **Could not verify** offers **Check again**, without
-starting a login; on the command line, run `kraal accounts list` again.
+When there are no named accounts for the agent, a verified sign-in in `~/.claude` or
+`~/.codex` is adopted as **Personal**, or with a public identity returned by the agent, such
+as Claude's email. You can rename it like any other account. No login is started and no
+credentials are copied. An absent agent or an unsigned home adds no account.
+**Could not verify** offers **Check again**, without starting a login; on the command line,
+run `kraal accounts list` again.
 
-Accounts opens immediately. Discovery checks Claude and Codex independently in the background;
-each result appears as soon as it finishes. **Checking sign-in** is still pending: wait for
-**Review** before choosing which account it is. Opening a verified account or its Review does
-not run another status command. Reopening Accounts checks unsigned standard homes again, so
-a sign-in completed outside kraal can be found; an uncertain result waits for **Check again**.
+Accounts opens immediately. Discovery checks Claude and Codex independently in the background.
+When named accounts already exist, kraal also asks the agent for their public identity in each
+account's own home and caches the results. If exactly one named account has the same reported
+email and organization or plan fields, kraal joins the existing sign-in to it automatically.
+An email can match when neither sign-in reports additional context. A different or missing
+organization or plan does not match. Account names and usage percentages are never identity
+proof. The saved answer produces one notice, for example: `~/.claude is Claude · patron.bzh`.
 
-If named accounts already exist, the existing sign-in appears as **Existing Claude account ·
-Review** (or Codex). Open it in Accounts (`ctrl+b A l`), click Review in the sidebar, or use
-`kraal accounts review claude`. **Which account is this?** lists your named accounts and
-**A different account**. Choose one, then confirm **Use account**. Cancel is selected first.
-Running agents keep their process and home. New launches use the selected named account's
-home. The account appears once, and its latest usage observation is used without adding usage
-from two homes. No home or credential is deleted. Choosing **A different account** asks for its name and keeps the
-existing home as a separate named account. The command-line review keeps its proposed name. The answer is saved, so Review does not return.
-Two names for the same canonical home are joined automatically; an email alone never joins
-accounts.
+An unresolved sign-in never appears as an extra account. No match, several matches, or an
+unreadable identity leave one dim question just above **+ Add account**:
+**? Which account is ~/.claude** (or ~/.codex). A narrow sidebar shortens this to
+**? Account for ~/.claude**. Open the question in Accounts (`ctrl+b A l`), click it in the
+sidebar, or run `kraal accounts review claude`. The existing **Which account is this?**
+question lists your named accounts and **A different account**. Choose one, then confirm
+**Use account**. Cancel is selected first. Opening the question does not run another status
+command or start a login. Reopening Accounts checks unsigned standard homes again, so a
+sign-in completed outside kraal can be found.
+
+Automatic joins and answers to the question have the same effect. Running agents keep their
+process and home. New launches use the selected named account's home. Panes count once under
+that account, and its latest usage observation is used without adding usage from two homes.
+No home or credential is changed. `kraal accounts list` shows joined sign-in homes under their
+account; `--json` includes them in that account's `joined_homes` array. Choosing
+**A different account** asks for its name and keeps the existing home as a separate named
+account. Command-line review keeps its proposed name. The answer is saved, so the question
+does not return. Two names for the same canonical home are also joined automatically.
 
 `kraal accounts add` also adopts an unlisted verified sign-in when there are no named accounts.
 An explicit `--home` with a verified sign-in is adopted without login, even without `--no-login`.

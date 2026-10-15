@@ -11,7 +11,10 @@ use super::*;
 
 /// Bind names while they still identify the accounts from before the change. A failure
 /// must reach the caller before it publishes accounts.toml.
-pub(super) fn before_account_change(previous: &Accounts) -> Result<()> {
+pub(super) fn before_account_change(
+    previous: &Accounts,
+    source_written: &mut impl FnMut(&crate::workspace::migration::SourceWrite),
+) -> Result<()> {
     if previous.path == Accounts::path() {
         for a in previous.known() {
             migrate_usage(&usage_dir(), &a)?;
@@ -22,12 +25,16 @@ pub(super) fn before_account_change(previous: &Accounts) -> Result<()> {
         for dir in crate::config::Config::load()?.workspace_dirs() {
             for (file, definition) in crate::workspace::load_dir(&dir) {
                 if definition.is_ok() {
-                    crate::workspace::migration::bind_accounts(&file, previous).with_context(|| {
+                    let written = crate::workspace::migration::bind_accounts(&file, previous).with_context(|| {
                         format!(
                             "could not migrate {}; accounts.toml is unchanged; check this file and retry",
                             file.display()
                         )
                     })?;
+                    if let Some(written) = written {
+                        source_written(&written);
+                        crate::persist::migration::record_source_write(&written)?;
+                    }
                 }
             }
         }

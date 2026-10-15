@@ -336,8 +336,22 @@ impl Server {
         self.messages.push_back(super::Message { at: std::time::SystemTime::now(), text: text.to_string(), kind });
     }
 
+    pub(super) fn queue_account_notice(&mut self, text: String) {
+        self.log_message(&text, NoticeKind::Notice);
+        self.account_notices.push(text);
+    }
+
     /// Log pending warnings and show them to attached clients with no active message.
     pub(super) fn show_warnings(&mut self) {
+        if !self.account_notices.is_empty() && self.clients.values().any(|c| c.attached && c.toast.is_none()) {
+            let notice = self.account_notices.remove(0);
+            for c in self.clients.values_mut().filter(|c| c.attached && c.toast.is_none()) {
+                c.toast = Some((notice.clone(), Instant::now() + Duration::from_secs(6), NoticeKind::Notice));
+                c.toast_action = None;
+                c.dirty = Dirty::Yes;
+            }
+            self.schedule_render();
+        }
         if self.warnings.is_empty() {
             return;
         }
@@ -417,6 +431,35 @@ mod tests {
         queue,
         tests::{client, server},
     };
+
+    #[test]
+    fn automatic_account_notice_waits_for_a_client_and_is_shown_once_as_a_plain_notice() {
+        let (tx, _rx) = queue::channel(16);
+        let mut server = server(tx);
+        let text = "~/.claude is Claude · patron.bzh";
+        server.queue_account_notice(text.into());
+        server.show_warnings();
+        assert_eq!(server.account_notices, [text]);
+        assert_eq!(server.messages.back().unwrap().text, text);
+        let (client, _peer) = client(&mut server);
+        server.clients.get_mut(&client).unwrap().attached = false;
+        server.show_warnings();
+        assert_eq!(server.account_notices, [text], "a CLI connection cannot consume the notice");
+        server.clients.get_mut(&client).unwrap().attached = true;
+        server.toast(client, NoticeKind::Notice, "Another result");
+        server.show_warnings();
+        assert_eq!(server.account_notices, [text], "wait until the attached client can show it");
+        server.clients.get_mut(&client).unwrap().toast = None;
+        server.show_warnings();
+        assert!(server.account_notices.is_empty());
+        let toast = server.clients[&client].toast.as_ref().unwrap();
+        assert_eq!(toast.0, text);
+        assert_eq!(toast.2, NoticeKind::Notice);
+        server.clients.get_mut(&client).unwrap().toast = None;
+        server.show_warnings();
+        assert!(server.clients[&client].toast.is_none());
+        assert_eq!(server.messages.iter().filter(|m| m.text == text).count(), 1);
+    }
 
     #[test]
     fn a_remote_loopback_link_reports_the_buffer_it_kept() {

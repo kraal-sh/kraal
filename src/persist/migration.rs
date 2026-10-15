@@ -134,6 +134,43 @@ fn copy_scrollback(from: &Path, to: &Path, bytes: &[u8]) -> Result<()> {
 /// Closed sessions still carry old names until their next restore. Bind them while the
 /// accounts file still tells what those names meant; a running server binds its own panes.
 pub(crate) fn bind_accounts(accounts: &crate::accounts::Accounts) -> Result<()> {
+    update_saved_sessions(|source| bind_saved_accounts(source, accounts))
+}
+
+pub(crate) fn record_source_write(written: &crate::workspace::migration::SourceWrite) -> Result<()> {
+    update_saved_sessions(|source| record_saved_source_write(source, written))
+}
+
+fn record_saved_source_write(
+    source: &[u8],
+    written: &crate::workspace::migration::SourceWrite,
+) -> Result<Option<Vec<u8>>> {
+    let mut value: serde_json::Value = serde_json::from_slice(source)?;
+    fn workspace(value: &mut serde_json::Value, written: &crate::workspace::migration::SourceWrite) -> bool {
+        let mut changed = value.get_mut("layout_undo").is_some_and(|undo| workspace(undo, written));
+        let path = value.get("definition").and_then(|p| p.as_str()).map(PathBuf::from);
+        for field in ["definition_source", "source_reviewed"] {
+            let mut baseline = value.get(field).and_then(|s| s.as_str()).map(str::to_owned);
+            if written.update(path.as_deref(), &mut baseline) {
+                value[field] = serde_json::json!(baseline);
+                changed = true;
+            }
+        }
+        changed
+    }
+    let mut changed = false;
+    for ws in value.get_mut("workspaces").and_then(|v| v.as_array_mut()).into_iter().flatten() {
+        changed |= workspace(ws, written);
+    }
+    for deleted in value.get_mut("deleted_workspaces").and_then(|v| v.as_array_mut()).into_iter().flatten() {
+        if let Some(ws) = deleted.get_mut("workspace") {
+            changed |= workspace(ws, written);
+        }
+    }
+    if changed { Ok(Some(serde_json::to_vec_pretty(&value)?)) } else { Ok(None) }
+}
+
+fn update_saved_sessions(update: impl Fn(&[u8]) -> Result<Option<Vec<u8>>>) -> Result<()> {
     for session in paths::saved_sessions().context("reading saved sessions to migrate accounts")? {
         let Some(_lock) = paths::SessionLock::acquire(&session)? else { continue };
         // 0.2.0 does not hold a session lock. Its listening socket still owns this snapshot.
@@ -150,7 +187,7 @@ pub(crate) fn bind_accounts(accounts: &crate::accounts::Accounts) -> Result<()> 
         }
         let path = paths::session_state_path(&session);
         let source = std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
-        let Some(updated) = bind_saved_accounts(&source, accounts)? else { continue };
+        let Some(updated) = update(&source)? else { continue };
         paths::write_private(&path, &updated).with_context(|| format!("migrating accounts in {}", path.display()))?;
     }
     Ok(())
@@ -221,6 +258,38 @@ pub(super) fn bind_saved_accounts(source: &[u8], accounts: &crate::accounts::Acc
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn source_writes_update_only_matching_saved_baselines_including_review_and_undo() {
+        let dir = directory("source-write");
+        let path = dir.join("work.kdl");
+        let alias = dir.join("alias.kdl");
+        let before = "layout { pane agent=\"claude:default\"; }\n";
+        std::fs::write(&path, before).unwrap();
+        std::os::unix::fs::symlink(&path, &alias).unwrap();
+        let written =
+            crate::workspace::migration::bind_accounts(&path, &crate::accounts::Accounts::empty()).unwrap().unwrap();
+        let ws = serde_json::json!({
+            "definition": alias,
+            "definition_source": before,
+            "source_reviewed": before,
+            "future": "kept"
+        });
+        let mut source = serde_json::json!({"workspaces": [ws], "deleted_workspaces": [{"workspace": ws}]});
+        source["workspaces"][0]["layout_undo"] = ws.clone();
+        source["workspaces"][0]["layout_undo"]["definition_source"] = "outside edit".into();
+        let bytes = serde_json::to_vec(&source).unwrap();
+        let updated = record_saved_source_write(&bytes, &written).unwrap().unwrap();
+        for pointer in ["/workspaces/0", "/deleted_workspaces/0/workspace"] {
+            let ws = source.pointer_mut(pointer).unwrap();
+            ws["definition_source"] = written.after.clone().into();
+            ws["source_reviewed"] = written.after.clone().into();
+        }
+        source["workspaces"][0]["layout_undo"]["source_reviewed"] = written.after.clone().into();
+        assert_eq!(serde_json::from_slice::<serde_json::Value>(&updated).unwrap(), source);
+        assert!(record_saved_source_write(&updated, &written).unwrap().is_none());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn saved_account_names_gain_identity_without_losing_unknown_fields() {

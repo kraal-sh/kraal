@@ -336,7 +336,7 @@ impl Server {
             }
             ConfirmAction::RemoveAccount(a) => {
                 if yes {
-                    match crate::accounts::Accounts::update(|all| Ok(all.remove(&a.agent, &a.key()))) {
+                    match self.update_accounts(|all| Ok(all.remove(&a.agent, &a.key()))) {
                         Ok(_) => {
                             self.reload_accounts();
                             self.toast(id, NoticeKind::Notice, "Account removed");

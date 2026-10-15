@@ -33,10 +33,32 @@ impl Status {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Identity {
+    pub email: String,
+    context: std::collections::BTreeMap<String, String>,
+}
+
+impl Identity {
+    pub(crate) fn from_status(v: &serde_json::Value) -> Option<Self> {
+        let email =
+            v["email"].as_str().filter(|s| s.len() <= 120 && s.contains('@') && !s.chars().any(char::is_control))?;
+        let mut context = std::collections::BTreeMap::new();
+        for key in ["orgId", "orgName", "orgUuid", "organization", "organizationId", "plan", "subscriptionType"] {
+            if let Some(value) = v.get(key).filter(|v| !v.is_null()) {
+                let value =
+                    value.as_str().filter(|s| !s.is_empty() && s.len() <= 256 && !s.chars().any(char::is_control))?;
+                context.insert(key.into(), value.into());
+            }
+        }
+        Some(Self { email: email.into(), context })
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct Checked {
     pub status: Status,
-    pub identity: Option<String>,
+    pub identity: Option<Identity>,
 }
 
 pub fn check(account: &Account) -> Status {
@@ -83,29 +105,114 @@ fn inspect_launch(launch: &Launch, limit: Duration, agent: &str) -> Checked {
         .then(|| serde_json::from_slice::<serde_json::Value>(&stdout).ok())
         .flatten()
         .filter(|v| v["loggedIn"] == true)
-        .and_then(|v| v["email"].as_str().filter(|email| email.len() <= 120 && email.contains('@')).map(String::from));
+        .and_then(|v| Identity::from_status(&v));
     Checked { status, identity }
+}
+
+pub fn inspect_accounts(list: &[Account]) -> Vec<(Account, Checked)> {
+    std::thread::scope(|scope| {
+        let tasks: Vec<_> = list.iter().map(|a| (a, scope.spawn(move || inspect(a)))).collect();
+        tasks
+            .into_iter()
+            .map(|(a, task)| {
+                (a.clone(), task.join().unwrap_or(Checked { status: Status::CouldNotCheck, identity: None }))
+            })
+            .collect()
+    })
+}
+
+/// Only unchanged homes checked in this batch may supply a unique match.
+pub fn reconcile(
+    all: &mut accounts::Accounts,
+    existing: &Account,
+    checked: &Checked,
+    named: &[(Account, Checked)],
+) -> anyhow::Result<Option<String>> {
+    if existing.sign_in_required
+        || all
+            .by_id(&existing.id)
+            .is_none_or(|a| a.sign_in_required || a.login_revision != existing.login_revision || !a.same_home(existing))
+    {
+        return Ok(None);
+    }
+    let current = all.for_agent(&existing.agent);
+    if checked.status == Status::SignedIn || checked.status == Status::CouldNotCheck && !current.is_empty() {
+        all.adopt_checked(existing, checked.identity.as_ref().map(|i| i.email.as_str()))?;
+    }
+    let Some(pending) = all.by_id(&existing.id).filter(|a| a.review && a.same_home(existing)) else {
+        return Ok(None);
+    };
+    let Some(identity) = checked.identity.as_ref().filter(|_| checked.status == Status::SignedIn) else {
+        return Ok(None);
+    };
+    // An unchecked home could hide a second match, including one changed during the check.
+    if current.iter().any(|a| {
+        a.sign_in_required
+            || !named.iter().any(|(b, result)| a == b && result.status == Status::SignedIn && result.identity.is_some())
+    }) {
+        return Ok(None);
+    }
+    let matches: Vec<_> = current
+        .iter()
+        .filter(|a| {
+            named.iter().any(|(b, result)| {
+                *a == b && result.status == Status::SignedIn && result.identity.as_ref() == Some(identity)
+            })
+        })
+        .collect();
+    if let [target] = matches.as_slice() {
+        let target = all.review(&pending, Some(target))?;
+        return Ok(Some(format!(
+            "{} is {} · {}",
+            crate::paths::shorten_home(&crate::paths::expand_tilde(&existing.home)),
+            if target.agent == "claude" { "Claude" } else { "Codex" },
+            target.name
+        )));
+    }
+    Ok(None)
+}
+
+/// Hold the login locks through the account save, after revalidating the inspected revisions.
+/// A login that already holds a home lock wins without making discovery wait for it.
+pub fn save_discovery(
+    checked: &[(Account, Checked)],
+    named: &[(Account, Checked)],
+    source_written: impl FnMut(&crate::workspace::migration::SourceWrite),
+) -> anyhow::Result<Vec<String>> {
+    let mut locks = Vec::new();
+    accounts::Accounts::update_with_sources(
+        &accounts::Accounts::path(),
+        |all| {
+            let mut notices = Vec::new();
+            for (existing, result) in checked {
+                if !matches!(result.status, Status::SignedIn | Status::CouldNotCheck) {
+                    continue;
+                }
+                let homes =
+                    std::iter::once(existing).chain(named.iter().map(|(a, _)| a).filter(|a| a.agent == existing.agent));
+                let held: Result<Vec<_>, _> = homes.map(accounts::lock_login).collect();
+                let Ok(held) = held else { continue };
+                locks.extend(held);
+                notices.extend(reconcile(all, existing, result, named)?);
+            }
+            Ok(notices)
+        },
+        source_written,
+    )
 }
 
 /// Verify first, then re-read under the accounts lock before publishing any discovery.
 pub fn discover(all: &accounts::Accounts) -> anyhow::Result<Vec<(Account, Status)>> {
-    let candidates = all.unlisted();
-    let checked: Vec<_> = std::thread::scope(|scope| {
-        let tasks: Vec<_> = candidates.iter().map(|a| scope.spawn(move || inspect(a))).collect();
-        tasks
-            .into_iter()
-            .map(|t| t.join().unwrap_or(Checked { status: Status::CouldNotCheck, identity: None }))
-            .collect()
-    });
-    accounts::Accounts::update(|all| {
-        for (a, checked) in candidates.iter().zip(&checked) {
-            if checked.status == Status::SignedIn {
-                all.adopt_checked(a, checked.identity.as_deref())?;
-            }
-        }
-        Ok(())
-    })?;
-    Ok(candidates.into_iter().zip(checked.into_iter().map(|c| c.status)).collect())
+    let candidates: Vec<_> = all.unlisted().into_iter().chain(all.reviews()).collect();
+    let mut homes = candidates.clone();
+    homes.extend(all.all().into_iter().filter(|a| candidates.iter().any(|b| a.agent == b.agent)));
+    let mut checked = inspect_accounts(&homes);
+    let named = checked.split_off(candidates.len());
+    let notices = save_discovery(&checked, &named, |_| {})?;
+    for notice in notices {
+        eprintln!("{notice}");
+    }
+    Ok(checked.into_iter().map(|(a, c)| (a, c.status)).collect())
 }
 
 #[cfg(test)]
@@ -132,8 +239,35 @@ mod tests {
         ] {
             let launch = Launch { argv: vec!["sh".into(), "-c".into(), script.into()], ..Default::default() };
             let result = inspect_launch(&launch, crate::testing::PATIENCE, agent);
-            assert_eq!(result.identity.as_deref(), expected);
+            assert_eq!(result.identity.as_ref().map(|i| i.email.as_str()), expected);
             assert!(!format!("{result:?}").contains("PRIVATE"));
+        }
+    }
+
+    #[test]
+    fn public_identity_keeps_provider_context_and_rejects_malformed_context() {
+        for (extra, expected) in [
+            (r#", "orgId":"org-1", "orgName":"Work", "subscriptionType":"max""#, true),
+            (r#", "orgId":null, "subscriptionType":null"#, true),
+            (r#", "orgId":42"#, false),
+            (r#", "subscriptionType":"max\nPRIVATE""#, false),
+        ] {
+            let launch = Launch {
+                argv: vec![
+                    "sh".into(),
+                    "-c".into(),
+                    format!(r#"printf '%s' '{{"loggedIn":true,"email":"me@example.com"{extra}}}'"#),
+                ],
+                ..Default::default()
+            };
+            let checked = inspect_launch(&launch, crate::testing::PATIENCE, "claude");
+            assert_eq!(checked.identity.is_some(), expected, "{extra}");
+            if extra.contains("org-1") {
+                let identity = checked.identity.unwrap();
+                assert_eq!(identity.context["orgId"], "org-1");
+                assert_eq!(identity.context["orgName"], "Work");
+                assert_eq!(identity.context["subscriptionType"], "max");
+            }
         }
     }
 
@@ -208,7 +342,7 @@ mod tests {
             }
             assert!(!running, "the status wrapper left its child running");
             assert_eq!(checked.status, [Status::SignedIn, Status::NotSignedIn, Status::CouldNotCheck][code]);
-            assert_eq!(checked.identity.as_deref(), (code == 0).then_some("me@example.com"));
+            assert_eq!(checked.identity.as_ref().map(|i| i.email.as_str()), (code == 0).then_some("me@example.com"));
         }
         std::fs::remove_dir_all(dir).unwrap();
     }

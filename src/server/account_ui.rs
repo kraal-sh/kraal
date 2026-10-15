@@ -246,12 +246,6 @@ impl Server {
             .iter()
             .map(|a| PickItem::new(label(a), self.account_summary_at(a, now), PickAction::AccountDetails(a.id.clone())))
             .collect();
-        items.extend(
-            self.accounts
-                .reviews()
-                .into_iter()
-                .map(|a| PickItem::new(accounts::existing_label(&a.agent), "Review", PickAction::ReviewAccount(a))),
-        );
         for a in self.accounts.unlisted() {
             use super::agents::ExistingCheck;
             let detail = match self.existing_checks.get(&a.agent) {
@@ -260,11 +254,30 @@ impl Server {
                 Some(ExistingCheck::Checked(Status::CouldNotCheck)) => "Could not verify · Check again",
                 _ => continue,
             };
-            items.push(PickItem::new(
-                accounts::existing_label(&a.agent),
-                detail,
-                PickAction::CheckExisting { agent: a.agent },
-            ));
+            let item = if self.accounts.for_agent(&a.agent).is_empty() {
+                PickItem::new(accounts::existing_label(&a.agent), detail, PickAction::CheckExisting { agent: a.agent })
+            } else {
+                let home = crate::paths::shorten_home(&crate::paths::expand_tilde(&a.home));
+                let (label, detail) = if matches!(self.existing_checks.get(&a.agent), Some(ExistingCheck::Checking)) {
+                    (format!("Checking {home}"), "")
+                } else {
+                    (format!("Could not check {home}"), detail)
+                };
+                PickItem::new(label, detail, PickAction::CheckExisting { agent: a.agent }).dim()
+            };
+            items.push(item);
+        }
+        for a in self.accounts.reviews() {
+            let item = if matches!(self.existing_checks.get(&a.agent), Some(super::agents::ExistingCheck::SaveFailed)) {
+                PickItem::new(
+                    accounts::review_question(&a),
+                    "Could not save · Check again",
+                    PickAction::CheckExisting { agent: a.agent },
+                )
+            } else {
+                PickItem::new(accounts::review_question(&a), "", PickAction::ReviewAccount(a))
+            };
+            items.push(item.dim());
         }
         items.push(PickItem::new("+ Add account", "", PickAction::AddAccount));
         items
@@ -404,7 +417,7 @@ impl Server {
                 {
                     return;
                 }
-                let result = Accounts::update(|all| name_existing_account(all, &existing, &status, &name));
+                let result = server.update_accounts(|all| name_existing_account(all, &existing, &status, &name));
                 server.reload_accounts();
                 let mut form = saved_form;
                 form.state().complete(token, result.as_ref().err().map(|e| format!("{e:#}")));
@@ -599,7 +612,7 @@ fn name_existing_account(
     let a = if existing.review {
         all.review(existing, None)?
     } else {
-        all.adopt_checked(existing, checked.identity.as_deref())?;
+        all.adopt_checked(existing, checked.identity.as_ref().map(|i| i.email.as_str()))?;
         let a = all.by_id(&existing.id).context("The existing account changed. Try again.")?;
         if a.review { all.review(&a, None)? } else { a }
     };
@@ -741,6 +754,7 @@ mod tests {
             threshold: None,
             note: None,
             sign_in_required: false,
+            login_revision: String::new(),
             review: false,
             public_identity: None,
             linked_to: None,
@@ -835,7 +849,9 @@ mod tests {
         let target = server.accounts.add(account()).unwrap();
         server.accounts.adopt_checked(&existing, None).unwrap();
         let display = server.account_display_at(1_000);
-        assert_eq!(display.items[1].detail, "Review");
+        assert_eq!(display.items[1].label, "? Which account is ~/.claude");
+        assert!(display.items[1].detail.is_empty());
+        assert!(display.items[1].dim);
         let pending = server.accounts.reviews().pop().unwrap();
         server.accounts.review(&pending, Some(&target)).unwrap();
         let display = server.account_display_at(1_000);
