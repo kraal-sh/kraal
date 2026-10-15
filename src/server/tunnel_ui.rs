@@ -5,10 +5,12 @@ use ratatui::layout::Rect;
 use ratatui::style::Style;
 
 use super::net::{self, TunnelState};
-use super::ui::{Mode, PickAction, PickItem, Picker, PickerKind, PickerState, Prompt, PromptAction};
+use super::ui::{Mode, PickAction, PickItem, Picker, PickerKind, PickerState, Prompt};
 use super::{ClientId, Server, forms, overlays};
 use crate::ansi::Cursor;
 use crate::input::InputEvent;
+
+type TunnelPrompt = Prompt<Box<TunnelForm>>;
 
 #[derive(Default)]
 pub struct TunnelForm {
@@ -38,12 +40,12 @@ fn buttons(suggestion: &str) -> forms::Buttons<'_> {
     }
 }
 
-fn suggestion(p: &Prompt) -> String {
-    p.tunnel_form.as_ref().and_then(|f| f.suggestion).map_or_else(String::new, |port| format!("Use {port}"))
+fn suggestion(p: &TunnelPrompt) -> String {
+    p.data.suggestion.map_or_else(String::new, |port| format!("Use {port}"))
 }
 
-pub(super) fn draw_form(p: &Prompt, screen: Rect, buf: &mut Buffer) -> Option<Cursor> {
-    let form = p.tunnel_form.as_ref()?;
+pub(super) fn draw_form(p: &TunnelPrompt, screen: Rect, buf: &mut Buffer) -> Option<Cursor> {
+    let form = p.data.as_ref();
     let suggestion = suggestion(p);
     let buttons = buttons(&suggestion);
     let layout = forms::FormLayout::new(screen, 3, "", p.error.as_deref(), &buttons);
@@ -158,9 +160,9 @@ impl Server {
         }
     }
 
-    pub(super) fn add_tunnel_form(&self, from: Option<&Picker>, server: &str) -> Prompt {
-        let mut p = Prompt::new("Add tunnel", "", PromptAction::AddTunnel);
-        let form = p.tunnel_form.as_mut().unwrap();
+    pub(super) fn add_tunnel_form(&self, from: Option<&Picker>, server: &str) -> TunnelPrompt {
+        let mut p = Prompt::new("Add tunnel", "", Box::<TunnelForm>::default());
+        let form = p.data.as_mut();
         form.server = server.into();
         form.server_cursor = server.chars().count();
         form.field = usize::from(!server.is_empty());
@@ -168,11 +170,11 @@ impl Server {
         p
     }
 
-    pub(super) fn on_tunnel_form(&mut self, client: ClientId, mut p: Prompt, event: InputEvent) -> Mode {
+    pub(super) fn on_tunnel_form(&mut self, client: ClientId, mut p: TunnelPrompt, event: InputEvent) -> Mode {
         let suggestion = suggestion(&p);
         let buttons = buttons(&suggestion);
         let layout = forms::FormLayout::new(self.client_screen(client), 3, "", p.error.as_deref(), &buttons);
-        let form = p.tunnel_form.as_mut().unwrap();
+        let form = p.data.as_mut();
         let before = (p.value.clone(), form.local.clone(), form.server.clone());
         let outcome =
             forms::FormState { field: &mut form.field, scroll: &mut p.scroll, error: &mut p.error, pending: &mut None }
@@ -223,15 +225,15 @@ impl Server {
                 form.field = 3;
                 p.error = None;
                 p.scroll = 0;
-                Mode::Prompt(p)
+                Mode::TunnelForm(p)
             }
             forms::FormEvent::Submit => self.submit_tunnel_form(p),
-            _ => Mode::Prompt(p),
+            _ => Mode::TunnelForm(p),
         }
     }
 
-    pub(super) fn submit_tunnel_form(&mut self, mut p: Prompt) -> Mode {
-        let form = p.tunnel_form.as_mut().unwrap();
+    pub(super) fn submit_tunnel_form(&mut self, mut p: TunnelPrompt) -> Mode {
+        let form = p.data.as_mut();
         form.suggestion = None;
         p.scroll = 0;
         let result = (|| {
@@ -273,7 +275,7 @@ impl Server {
             }
             Err(error) => {
                 p.error = Some(format!("{error:#}"));
-                Mode::Prompt(p)
+                Mode::TunnelForm(p)
             }
         }
     }
@@ -422,8 +424,8 @@ mod tests {
         })
     }
 
-    fn prompt(mode: Mode) -> Prompt {
-        let Mode::Prompt(p) = mode else { panic!("expected the form") };
+    fn prompt(mode: Mode) -> TunnelPrompt {
+        let Mode::TunnelForm(p) = mode else { panic!("expected the form") };
         p
     }
 
@@ -447,7 +449,7 @@ mod tests {
                         0 => key("esc"),
                         1 => click(layout.cancel),
                         _ => {
-                            p.tunnel_form.as_mut().unwrap().field = 5;
+                            p.data.field = 5;
                             key("enter")
                         }
                     };
@@ -494,7 +496,7 @@ mod tests {
                 server.clients.get_mut(&client).unwrap().mode = Mode::Picker(picker);
                 server.client_input(client, input.as_bytes());
                 let p = prompt(std::mem::replace(&mut server.clients.get_mut(&client).unwrap().mode, Mode::Normal));
-                assert!(p.tunnel_form.as_ref().unwrap().server.is_empty());
+                assert!(p.data.server.is_empty());
             }
             let mut inv = crate::servers::Inventory::empty();
             inv.servers.push(crate::servers::Server { name: "db".into(), host: "db.lan".into(), ..Default::default() });
@@ -507,8 +509,8 @@ mod tests {
             server.clients.get_mut(&client).unwrap().mode = Mode::Picker(picker);
             server.client_input(client, b"\x0f");
             let p = prompt(std::mem::replace(&mut server.clients.get_mut(&client).unwrap().mode, Mode::Normal));
-            assert_eq!(p.tunnel_form.as_ref().unwrap().server, "db");
-            assert_eq!(p.tunnel_form.as_ref().unwrap().field, 1);
+            assert_eq!(p.data.server, "db");
+            assert_eq!(p.data.field, 1);
             let Mode::Picker(back) = server.on_tunnel_form(client, p, key("esc")) else { panic!() };
             assert_eq!(back.query, "db");
             assert!(matches!(&back.current().unwrap().action, PickAction::Ssh(s) if s == "db"));
@@ -524,7 +526,7 @@ mod tests {
         let (client, _peer) = crate::server::tests::client(&mut server);
         let mut p = server.add_tunnel_form(None, "db");
         p = prompt(server.on_tunnel_form(client, p, InputEvent::Paste(b"[::1]:5432".to_vec())));
-        assert_eq!(p.tunnel_form.as_ref().unwrap().local, "5432");
+        assert_eq!(p.data.local, "5432");
         for event in [
             key("tab"),
             key("ctrl+u"),
@@ -535,7 +537,7 @@ mod tests {
         ] {
             p = prompt(server.on_tunnel_form(client, p, event));
         }
-        assert_eq!(p.tunnel_form.as_ref().unwrap().local, "15432");
+        assert_eq!(p.data.local, "15432");
         for (remote, local, expected) in [
             ("no-port", "15432", "not a port"),
             ("0", "15432", "Remote port"),
@@ -543,12 +545,12 @@ mod tests {
             ("5432", "65536", "Local port"),
         ] {
             p.value = remote.into();
-            p.tunnel_form.as_mut().unwrap().local = local.into();
+            p.data.local = local.into();
             p = prompt(server.submit_tunnel_form(p));
             assert!(p.error.as_deref().unwrap().contains(expected));
             assert_eq!(p.value, remote);
-            assert_eq!(p.tunnel_form.as_ref().unwrap().local, local);
-            assert_eq!(p.tunnel_form.as_ref().unwrap().server, "db");
+            assert_eq!(p.data.local, local);
+            assert_eq!(p.data.server, "db");
             assert!(server.tunnels.is_empty());
         }
     }
@@ -565,12 +567,12 @@ mod tests {
             }
             let mut p = server.add_tunnel_form(Some(&server.tunnel_picker()), "db");
             p.value = "5432".into();
-            p.tunnel_form.as_mut().unwrap().local = port.to_string();
+            p.data.local = port.to_string();
             p = prompt(server.submit_tunnel_form(p));
             assert!(p.error.as_deref().unwrap().contains(&port.to_string()));
-            let suggested = p.tunnel_form.as_ref().unwrap().suggestion.unwrap();
+            let suggested = p.data.suggestion.unwrap();
             assert_ne!(suggested, port);
-            assert_eq!(p.tunnel_form.as_ref().unwrap().local, port.to_string());
+            assert_eq!(p.data.local, port.to_string());
             assert_eq!(p.value, "5432");
             assert_eq!(server.tunnels.len(), usize::from(reserved));
         }
@@ -588,7 +590,7 @@ mod tests {
                 let screen = server.client_screen(client);
                 let mut p = server.add_tunnel_form(Some(&server.tunnel_picker()), "db");
                 p.value = "localhost:5432".into();
-                let form = p.tunnel_form.as_mut().unwrap();
+                let form = p.data.as_mut();
                 form.local = "5432".into();
                 form.suggestion = Some(10000);
                 p.error = Some("Port 5432 is in use.".into());
@@ -603,12 +605,12 @@ mod tests {
                 let event = if mouse {
                     click(layout.alternate.unwrap())
                 } else {
-                    p.tunnel_form.as_mut().unwrap().field = 4;
+                    p.data.field = 4;
                     key("enter")
                 };
                 p = prompt(server.on_tunnel_form(client, p, event));
-                assert_eq!(p.tunnel_form.as_ref().unwrap().local, "10000");
-                assert_eq!(p.tunnel_form.as_ref().unwrap().server, "db");
+                assert_eq!(p.data.local, "10000");
+                assert_eq!(p.data.server, "db");
                 assert_eq!(p.value, "localhost:5432");
                 assert!(server.tunnels.is_empty(), "Use only changes the field");
                 p.error = Some("A long connection error. ".repeat(300) + "Final detail.");

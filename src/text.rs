@@ -45,6 +45,20 @@ pub fn columns(text: &str) -> usize {
     text.chars().map(|c| c.width().unwrap_or(0)).sum()
 }
 
+/// Leave one column for the cursor while showing the preceding characters that fit.
+pub fn input_window(chars: &[char], cursor: usize, room: usize) -> (String, usize) {
+    let (mut start, mut before) = (cursor.min(chars.len()), 0);
+    while start > 0 {
+        let width = chars[start - 1].width().unwrap_or(0);
+        if before + width >= room {
+            break;
+        }
+        before += width;
+        start -= 1;
+    }
+    (chars[start..].iter().collect(), before)
+}
+
 /// Cuts `text` to `width` columns, ending with `…` when shortened.
 pub fn truncate(text: &str, width: usize) -> String {
     if columns(text) <= width {
@@ -212,6 +226,23 @@ pub fn local_minutes(secs: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn input_windows_preserve_wide_and_combining_characters_and_reserve_the_cursor() {
+        for (value, cursor, room, shown, column) in [
+            ("abcdef", 4, 4, "bcdef", 3),
+            ("abc日e\u{301}Z", 6, 4, "日e\u{301}Z", 3),
+            ("abc日e\u{301}Z", 6, 3, "e\u{301}Z", 1),
+            ("abc日e\u{301}Z", 4, 3, "日e\u{301}Z", 2),
+            ("abc", 0, 2, "abc", 0),
+            ("abc", 99, 2, "c", 1),
+            ("abc", 2, 0, "c", 0),
+            ("日", 1, 1, "", 0),
+            ("", 99, 0, "", 0),
+        ] {
+            assert_eq!(input_window(&value.chars().collect::<Vec<_>>(), cursor, room), (shown.into(), column));
+        }
+    }
 
     #[test]
     fn a_wall_clock_time_read_as_local_shows_as_itself() {

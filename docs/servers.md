@@ -79,7 +79,10 @@ row selected, and **Enter Connect** as a separate action. An already saved conne
 in the form with a next step. A save failure keeps both fields for Retry. Cancel returns to
 the previous list, search and selection; the command palette and direct shortcut return to the
 panes. Closing the result follows the same return path. Closing while a save
-is already running lets that save finish and reports its result.
+is already running lets that save finish and reports its result. Further submissions while saving
+do not start another save. A result received after closing leaves the current screen open.
+The saved row keeps the search when it is visible; otherwise the result clears the search
+to reveal it. Closing the result restores the original search and selection.
 
 On a server row, Enter connects (or opens a whole group); Tab shows the other
 actions, each also on its own key: connect in a new tab (`ctrl+t`), browse its files (`ctrl+f`),

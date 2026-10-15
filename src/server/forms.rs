@@ -267,16 +267,7 @@ pub(super) fn draw_text_field(
     let label_width = crate::text::columns(label) as u16;
     let room = area.width.saturating_sub(label_width) as usize;
     let chars: Vec<_> = value.chars().collect();
-    let (mut start, mut before) = (cursor.min(chars.len()), 0);
-    while start > 0 {
-        let width = unicode_width::UnicodeWidthChar::width(chars[start - 1]).unwrap_or(0);
-        if before + width >= room {
-            break;
-        }
-        before += width;
-        start -= 1;
-    }
-    let shown: String = chars[start..].iter().collect();
+    let (shown, before) = crate::text::input_window(&chars, cursor, room);
     buf.set_stringn(area.x, area.y, format!("{label}{shown}"), area.width as usize, field_style(selected));
     if value.is_empty() {
         buf.set_stringn(

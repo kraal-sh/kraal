@@ -641,42 +641,22 @@ pub(super) fn prompt_layout(p: &Prompt, screen: Rect) -> PromptLayout {
 }
 
 pub(super) fn draw_prompt(p: &Prompt, screen: Rect, buf: &mut Buffer) -> Option<Cursor> {
-    if p.tunnel_form.is_some() {
-        return super::tunnel_ui::draw_form(p, screen, buf);
-    }
-    if p.server_form.is_some() {
-        return super::server_ui::draw_form(p, screen, buf);
-    }
-    if p.workspace_form.is_some() {
-        return super::workspace_ui::draw_form(p, screen, buf);
-    }
     let layout = prompt_layout(p, screen);
     let inner = frame(layout.area, &p.title, th().accent, buf);
     if inner.height < 2 || inner.width < 4 {
         return None;
     }
-    // The part of the value around the cursor that fits: back from the cursor, one pass.
     let room = inner.width.saturating_sub(2) as usize;
     // A secret shows as dots, one per character.
     let chars: Vec<char> = if p.masked { p.value.chars().map(|_| '•').collect() } else { p.value.chars().collect() };
-    let cursor = p.cursor.min(chars.len());
-    let (mut start, mut before) = (cursor, 0);
-    while start > 0 {
-        let w = unicode_width::UnicodeWidthChar::width(chars[start - 1]).unwrap_or(0);
-        if before + w >= room {
-            break;
-        }
-        before += w;
-        start -= 1;
-    }
-    let shown: String = chars[start..].iter().collect();
+    let (shown, before) = crate::text::input_window(&chars, p.cursor, room);
     buf.set_stringn(inner.x + 1, inner.y, &shown, room, Style::default());
     let x = inner.x + 1 + before as u16;
     let scroll = p.scroll.min(layout.max_scroll);
     for (i, line) in layout.lines.iter().skip(scroll).take(layout.body as usize).enumerate() {
         buf.set_stringn(inner.x + 1, inner.y + 1 + i as u16, line, room, Style::default().fg(th().production));
     }
-    let verb = upper_first(p.action.verb());
+    let verb = upper_first(p.data.verb());
     let mut keys = vec![("Enter", verb.as_str()), ("Esc", "Cancel")];
     if layout.max_scroll > 0 {
         keys.insert(1, ("PgUp/PgDn", "Scroll"));
@@ -897,6 +877,38 @@ mod tests {
     use super::*;
 
     #[test]
+    fn prompts_and_fields_share_unicode_windows_and_mask_each_secret_character() {
+        let value = "prefix café 日本e\u{301}語 suffix";
+        for width in [12, 20, 32, 80] {
+            let area = Rect::new(0, 0, width, 12);
+            for masked in [false, true] {
+                for at in (0..=value.chars().count()).chain([usize::MAX]) {
+                    let mut prompt = Prompt::new("Name", value, super::super::ui::PromptAction::RunbookValue);
+                    prompt.masked = masked;
+                    prompt.cursor = at;
+                    let mut buf = Buffer::empty(area);
+                    let cursor = draw_prompt(&prompt, area, &mut buf).unwrap();
+                    assert!(area.contains(ratatui::layout::Position::new(cursor.x, cursor.y)));
+                    let layout = prompt_layout(&prompt, area);
+                    let field = Rect::new(layout.area.x + 2, layout.area.y + 1, layout.area.width - 4, 1);
+                    let shown = if masked { "•".repeat(value.chars().count()) } else { value.into() };
+                    let mut fields = Buffer::empty(area);
+                    let field_cursor =
+                        super::super::forms::draw_text_field(field, "", &shown, at, "", true, &mut fields).unwrap();
+                    assert_eq!((cursor.x, cursor.y), (field_cursor.x, field_cursor.y));
+                    for x in field.x..field.right() {
+                        assert_eq!(buf[(x, field.y)].symbol(), fields[(x, field.y)].symbol());
+                    }
+                    if masked {
+                        assert!(!screen(&buf, area).contains("café"));
+                        assert!((field.x..field.right()).all(|x| matches!(buf[(x, field.y)].symbol(), "•" | " ")));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn picker_result_notices_use_their_kind_without_recolouring_keys() {
         use super::super::ui::{Mode, PickerKind};
         use crate::theme::NoticeKind;
@@ -1011,7 +1023,7 @@ mod tests {
                 p.cursor = 3;
                 let mut buf = Buffer::empty(area);
                 draw_prompt(&p, area, &mut buf);
-                assert!(screen(&buf, area).contains(&upper_first(p.action.verb())));
+                assert!(screen(&buf, area).contains(&upper_first(p.data.verb())));
                 p.error = Some(error.clone());
                 let layout = prompt_layout(&p, area);
                 assert_eq!(layout.max_scroll, 0);

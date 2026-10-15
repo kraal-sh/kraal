@@ -35,8 +35,8 @@ impl Server {
                 );
             }
             Action::Tunnels => return Mode::Picker(self.tunnel_picker()),
-            Action::AddServer => return Mode::Prompt(self.add_server_form(None, None)),
-            Action::NewWorkspace => return Mode::Prompt(self.add_workspace_form(id, None)),
+            Action::AddServer => return Mode::ServerForm(self.add_server_form(None, None)),
+            Action::NewWorkspace => return Mode::WorkspaceForm(self.add_workspace_form(id, None)),
             Action::WorkspacePicker => {
                 return Mode::Picker(self.workspace_picker(self.clients.get(&id).map_or(0, |c| c.workspace)));
             }

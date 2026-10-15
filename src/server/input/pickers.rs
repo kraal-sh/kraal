@@ -275,7 +275,7 @@ impl Server {
                 }
                 (KeyCode::Char('o'), true) if p.kind == PickerKind::Ssh => {
                     if let Some(PickAction::Ssh(name)) = p.current().map(|i| i.action.clone()) {
-                        return Mode::Prompt(self.add_tunnel_form(Some(&p), &name));
+                        return Mode::TunnelForm(self.add_tunnel_form(Some(&p), &name));
                     }
                 }
                 (KeyCode::Char('e'), true) if p.kind == PickerKind::Runbook => {
@@ -440,12 +440,12 @@ impl Server {
                 }
             },
             PickAction::AddWorkspace => {
-                return Mode::Prompt(self.add_workspace_form(id, Some(p)));
+                return Mode::WorkspaceForm(self.add_workspace_form(id, Some(p)));
             }
-            PickAction::AddTunnel => return Mode::Prompt(self.add_tunnel_form(Some(p), "")),
+            PickAction::AddTunnel => return Mode::TunnelForm(self.add_tunnel_form(Some(p), "")),
             PickAction::Tunnel { id, .. } => return self.tunnel_details(id, p.form_back()),
             PickAction::AddServer(server) => {
-                return Mode::Prompt(self.add_server_form(Some(p), server.as_deref()));
+                return Mode::ServerForm(self.add_server_form(Some(p), server.as_deref()));
             }
             PickAction::Ssh(spec) => self.connect(id, &spec, Placement::Auto),
             PickAction::SshGroup(group) => match self.open_group(&group, &[]) {
@@ -814,7 +814,10 @@ mod workspace_tests {
         for bytes in [b"\x02An".as_slice(), b"\x02Wn", b"\x02We", b"\x02Ws", b"\x02Sn"] {
             server.clients.get_mut(&client).unwrap().mode = Mode::Normal;
             server.client_input(client, bytes);
-            assert!(matches!(server.clients[&client].mode, Mode::Prompt(_) | Mode::AccountForm(_)));
+            assert!(matches!(
+                server.clients[&client].mode,
+                Mode::WorkspaceForm(_) | Mode::ServerForm(_) | Mode::AccountForm(_)
+            ));
             server.client_input(client, b"\x1b");
             server.flush_client_input(client);
             assert!(matches!(server.clients[&client].mode, Mode::Normal));
@@ -823,7 +826,7 @@ mod workspace_tests {
             let picker = server.command_picker();
             let item = PickItem::new("", "", PickAction::Command(Command::Action(action)));
             let mode = server.pick(client, &picker, item);
-            assert!(matches!(mode, Mode::Prompt(_) | Mode::AccountForm(_)));
+            assert!(matches!(mode, Mode::WorkspaceForm(_) | Mode::ServerForm(_) | Mode::AccountForm(_)));
             server.clients.get_mut(&client).unwrap().mode = mode;
             server.client_input(client, b"\x1b");
             server.flush_client_input(client);
@@ -928,6 +931,7 @@ mod workspace_tests {
 mod tests {
     use super::*;
     use crate::input::Mods;
+    use crate::server::workspace_ui::WorkspaceAction;
 
     #[test]
     fn source_toast_actions_return_to_a_fresh_workspace_list() {
@@ -957,14 +961,14 @@ mod tests {
                 });
                 let mode = server.on_picker(client, picker, click);
                 let mode = match mode {
-                    Mode::Prompt(p) if matches!(action, ToastAction::ReviewWorkspace(_)) => {
+                    Mode::WorkspaceForm(p) if matches!(action, ToastAction::ReviewWorkspace(_)) => {
                         server.load_source_form(client, p, None)
                     }
                     mode => mode,
                 };
                 let Mode::Picker(p) = mode else {
                     let detail = match &mode {
-                        Mode::Prompt(p) => format!("{}: {:?}", p.title, p.error),
+                        Mode::WorkspaceForm(p) => format!("{}: {:?}", p.title, p.error),
                         Mode::Confirm(q) => q.message.clone(),
                         Mode::Normal => "Normal".into(),
                         _ => String::new(),
@@ -1019,8 +1023,8 @@ mod tests {
             assert_eq!(p.actions, Some(0));
             let key = |code| InputEvent::Key(Key { code, mods: Mods::NONE, raw: Vec::new() });
             let Mode::Picker(p) = server.on_picker(client, p, key(KeyCode::Down)) else { panic!() };
-            let Mode::Prompt(p) = server.on_picker(client, p, key(KeyCode::Enter)) else { panic!() };
-            assert!(matches!(p.action, PromptAction::RenameWorkspace(id) if id == ws));
+            let Mode::WorkspaceForm(p) = server.on_picker(client, p, key(KeyCode::Enter)) else { panic!() };
+            assert!(matches!(p.data.action, WorkspaceAction::Rename(id) if id == ws));
             assert_eq!(server.clients[&client].workspace, current);
             assert!(server.workspaces[1].closed());
         }
@@ -1169,8 +1173,8 @@ mod tests {
                     row: layout.list.bottom(),
                     mods: Mods::NONE,
                 });
-                let Mode::Prompt(p) = server.on_picker(client, p, event) else { panic!("Add opens its form") };
-                assert!(matches!(p.action, PromptAction::NewWorkspace));
+                let Mode::WorkspaceForm(p) = server.on_picker(client, p, event) else { panic!("Add opens its form") };
+                assert!(matches!(p.data.action, WorkspaceAction::New));
             }
         }
     }
@@ -1187,8 +1191,8 @@ mod tests {
             let Mode::Picker(p) = server.action(client, Action::WorkspacePicker) else { panic!() };
             assert!(p.kind == PickerKind::Workspace);
             assert!(p.items.iter().any(|i| matches!(i.action, PickAction::AddWorkspace)));
-            let Mode::Prompt(p) = server.action(client, Action::NewWorkspace) else { panic!() };
-            assert!(matches!(p.action, PromptAction::NewWorkspace));
+            let Mode::WorkspaceForm(p) = server.action(client, Action::NewWorkspace) else { panic!() };
+            assert!(matches!(p.data.action, WorkspaceAction::New));
         }
     }
 
@@ -1209,13 +1213,13 @@ mod tests {
                 server.workspaces[0].name = "café 日".into();
             }
             let event = InputEvent::Key(Key { code: KeyCode::Enter, mods: Mods::NONE, raw: Vec::new() });
-            let Mode::Prompt(p) = server.on_picker(client, p, event) else { panic!("keep input") };
+            let Mode::WorkspaceForm(p) = server.on_picker(client, p, event) else { panic!("keep input") };
             assert_eq!(p.value, "café 日");
-            assert!(matches!(p.action, PromptAction::NewWorkspace));
+            assert!(matches!(p.data.action, WorkspaceAction::New));
             assert!(p.error.is_none());
             assert_eq!(server.workspaces.len(), 1, "Add opens the form without creating");
             let event = InputEvent::Key(Key { code: KeyCode::Enter, mods: Mods::NONE, raw: Vec::new() });
-            let Mode::Prompt(p) = server.on_prompt(client, p, event) else { panic!("keep input") };
+            let Mode::WorkspaceForm(p) = server.on_workspace_form(client, p, event) else { panic!("keep input") };
             let reason = if stale { "already used" } else { "No workspace was added." };
             assert!(p.error.as_ref().unwrap().contains(reason));
             assert_eq!(server.workspaces.len(), 1);
@@ -1463,7 +1467,7 @@ mod deletion_tests {
             assert!(matches!(server.action(client, Action::CommandPalette), Mode::Picker(_)));
             assert!(matches!(server.action(client, Action::Accounts), Mode::Picker(_)));
             assert!(matches!(server.action(client, Action::AddAccount), Mode::AccountForm(_)));
-            assert!(matches!(server.action(client, Action::NewWorkspace), Mode::Prompt(_)));
+            assert!(matches!(server.action(client, Action::NewWorkspace), Mode::WorkspaceForm(_)));
             assert!(matches!(server.action(client, Action::WorkspacePicker), Mode::Picker(_)));
             let before = server.bottom_bar;
             server.action(client, Action::ToggleBottomBar);
@@ -1616,6 +1620,7 @@ mod workspace_action_tests {
     use crate::input::{InputEvent, Key, KeySpec, Mods, MouseButton, MouseEvent, MouseKind};
     use crate::pane::PaneSpec;
     use crate::protocol::Placement;
+    use crate::server::workspace_ui::{WorkspaceAction, WorkspaceForm};
     use crate::server::{overlays, persistence, queue, tests};
     use ratatui::buffer::Buffer;
 
@@ -1657,8 +1662,8 @@ mod workspace_action_tests {
                         p.actions = Some(at);
                         key("enter")
                     };
-                    let Mode::Prompt(p) = server.on_picker(client, p, event) else { panic!() };
-                    assert!(matches!(p.action, PromptAction::DuplicateWorkspace(ws) if ws == source));
+                    let Mode::WorkspaceForm(p) = server.on_picker(client, p, event) else { panic!() };
+                    assert!(matches!(p.data.action, WorkspaceAction::Duplicate(ws) if ws == source));
                     assert_eq!(p.value, "other-copy");
                     assert_eq!(server.clients[&client].workspace, current);
                 }
@@ -1769,7 +1774,7 @@ mod workspace_action_tests {
     #[test]
     fn exporting_over_an_ordered_source_keeps_identity_and_allows_the_next_move() {
         use crate::persist::WorkspaceKey;
-        use crate::server::ui::{Prompt, PromptAction};
+        use crate::server::ui::Prompt;
 
         // Export writes in the workspaces directory, where the other tests list workspaces.
         if !crate::testing::in_own_process(
@@ -1796,14 +1801,15 @@ mod workspace_action_tests {
         server.reorder_workspace(client, x.clone(), b_key.clone(), true);
         server.reorder_workspace(client, x.clone(), a_key.clone(), true);
         assert_eq!(names(&server), ["x", "a", "b"]);
-        let prompt = Prompt::new("Export layout", path.to_str().unwrap(), PromptAction::ExportWorkspace(a));
-        let Mode::Confirm(q) = server.on_prompt(client, prompt, key("enter")) else { panic!() };
+        let prompt =
+            Prompt::new("Export layout", path.to_str().unwrap(), WorkspaceForm::new(WorkspaceAction::Export(a)));
+        let Mode::Confirm(q) = server.on_workspace_form(client, prompt, key("enter")) else { panic!() };
         assert_eq!(q.action.verb(), "Replace file");
-        let Mode::Prompt(p) = server.on_confirm(client, q, key("y")) else { panic!() };
+        let Mode::WorkspaceForm(p) = server.on_confirm(client, q, key("y")) else { panic!() };
         assert_eq!(p.title, "Layout exported");
         assert!(p.error.is_none());
         assert_eq!(p.value, path.to_str().unwrap());
-        assert!(matches!(server.on_prompt(client, p, key("enter")), Mode::Normal));
+        assert!(matches!(server.on_workspace_form(client, p, key("enter")), Mode::Normal));
         assert_eq!(names(&server), ["a", "b"]);
         let Mode::Picker(p) = server.reorder_workspace(client, a_key.clone(), b_key.clone(), false) else { panic!() };
         assert!(p.message.is_none());

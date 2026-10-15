@@ -736,7 +736,7 @@ pub(super) mod tests {
         assert_eq!(server.workspaces[0].name, "old\nname");
         writer(&mut server, vec![]);
         let identity = server.keep_and_delete_workspace(server.workspaces[0].id).unwrap();
-        let Mode::Prompt(mut form) = server.restore_workspace_mode(0, &identity, None) else { panic!() };
+        let Mode::WorkspaceForm(mut form) = server.restore_workspace_mode(0, &identity, None) else { panic!() };
         assert_eq!(form.value, "old\nname");
         assert_eq!(form.error.as_deref(), Some("Choose a name without control characters."));
         form.value = "recovered".into();
@@ -1517,12 +1517,14 @@ while IFS= read -r line; do :; done
         let new_identity = recovered.workspaces[0].stable_id.clone();
         recovered.new_workspace("api-restored".into(), None);
         let list = recovered.deleted_workspace_picker();
-        let Mode::Prompt(mut form) = recovered.restore_workspace_mode(0, &identity, Some(&list)) else { panic!() };
+        let Mode::WorkspaceForm(mut form) = recovered.restore_workspace_mode(0, &identity, Some(&list)) else {
+            panic!()
+        };
         assert_eq!(form.value, "api-restored-2");
         assert!(form.error.as_ref().unwrap().contains("api is already used"));
         form.cursor = 2;
         writer(&mut recovered, vec![Err("disk full".into()), Ok(())]);
-        let Mode::Prompt(form) = recovered.submit_workspace_form(0, form) else { panic!() };
+        let Mode::WorkspaceForm(form) = recovered.submit_workspace_form(0, form) else { panic!() };
         assert_eq!((form.value.as_str(), form.cursor), ("api-restored-2", 2));
         assert!(form.error.as_ref().unwrap().contains("stays in Deleted workspaces"));
         assert_eq!(recovered.deleted_workspaces.len(), 1);
