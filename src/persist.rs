@@ -478,27 +478,71 @@ pub(crate) fn scrollback_name(file: &str) -> bool {
 
 /// Inspect a stopped session.
 pub fn inspect(session: &str) -> Result<Option<SessionSnapshot>> {
-    read_session(session)
+    read_session(session, false)
 }
 
 pub fn load(session: &str) -> Result<Option<SessionSnapshot>> {
-    read_session(session).with_context(|| {
-        format!("could not restore {}; the saved session is unchanged", paths::session_state_path(session).display())
-    })
+    read_session(session, true)
 }
 
-fn read_session(session: &str) -> Result<Option<SessionSnapshot>> {
-    read_from(&paths::session_state_path(session), &paths::legacy_session_state_path(session))
+/// `load` also records what kraal 0.4.0 left out of the state (see `record_source_baselines`);
+/// inspecting never writes.
+fn read_session(session: &str, load: bool) -> Result<Option<SessionSnapshot>> {
+    read_from(&paths::session_state_path(session), &paths::legacy_session_state_path(session), load)
 }
 
-fn read_from(path: &Path, legacy: &Path) -> Result<Option<SessionSnapshot>> {
-    if let Some(data) = read_state(path)? {
-        return parse(&data).map(Some).with_context(|| format!("reading {}", path.display()));
+fn read_from(path: &Path, legacy: &Path, load: bool) -> Result<Option<SessionSnapshot>> {
+    let mut replaced = false;
+    let result = (|| {
+        if let Some(data) = read_state(path)? {
+            let snap = if load { record_source_baselines(path, &data, &mut replaced) } else { parse(&data) };
+            return snap.map(Some).with_context(|| format!("reading {}", path.display()));
+        }
+        let Some(data) = read_state(legacy)? else { return Ok(None) };
+        let version = state_version(&data)?;
+        anyhow::ensure!(version <= 1, "unsupported state version {version} in {}; use a newer kraal", legacy.display());
+        anyhow::bail!("state predates kraal 0.4; run kraal 0.4 once first")
+    })();
+    if load {
+        result.with_context(|| {
+            let state = if replaced {
+                "the saved session was updated, but its durability could not be confirmed"
+            } else {
+                "the saved session is unchanged"
+            };
+            format!("could not restore {}; {state}", path.display())
+        })
+    } else {
+        result
     }
-    let Some(data) = read_state(legacy)? else { return Ok(None) };
-    let version = state_version(&data)?;
-    anyhow::ensure!(version <= 1, "unsupported state version {version} in {}; use a newer kraal", legacy.display());
-    anyhow::bail!("state predates kraal 0.4; run kraal 0.4 once first")
+}
+
+/// Kraal 0.4.0 saved some workspaces without the contents of their KDL source, so each one
+/// said File changed. The first load records the source as it is then, once, never the
+/// personal layout; the file's other contents stay as they are. Remove with 0.4.0's state.
+fn record_source_baselines(path: &Path, data: &[u8], replaced: &mut bool) -> Result<SessionSnapshot> {
+    let snap = parse(data)?;
+    let mut value: serde_json::Value = serde_json::from_slice(data)?;
+    let mut changed = false;
+    for (ws, saved) in value["workspaces"].as_array_mut().into_iter().flatten().zip(&snap.workspaces) {
+        if saved.definition_source.is_none()
+            && let Some(source_path) = &saved.definition
+            && let Ok(source) = paths::read_regular_text(source_path, u64::MAX)
+        {
+            ws["definition_source"] = serde_json::json!(source);
+            changed = true;
+        }
+    }
+    if !changed {
+        return Ok(snap);
+    }
+    let updated = serde_json::to_vec_pretty(&value)?;
+    let snap = parse(&updated)?;
+    anyhow::ensure!(paths::read_regular(path, u64::MAX)? == data, "the saved session changed while loading; retry");
+    paths::write_private(path, &updated).context("saving missing workspace source baselines")?;
+    *replaced = true;
+    sync_directory(path.parent().context("no directory for the state")?)?;
+    Ok(snap)
 }
 
 fn read_state(path: &Path) -> Result<Option<Vec<u8>>> {
@@ -722,6 +766,98 @@ mod tests {
     }
 
     #[test]
+    fn loading_records_only_missing_source_baselines_once() {
+        let dir = std::env::temp_dir().join(format!("kraal-source-baselines-{}", crate::identity::new_uuid()));
+        let current = dir.join("sessions-v2/main.json");
+        let legacy = dir.join("sessions/main.json");
+        std::fs::create_dir_all(current.parent().unwrap()).unwrap();
+        let source_path = dir.join("source.kdl");
+        let source = "// Source differs from the personal layout.\nlayout { pane; pane; }\n";
+        std::fs::write(&source_path, source).unwrap();
+        let mut old = saved_state();
+        old["unknown"] = serde_json::json!("kept");
+        old["workspaces"][0]["definition"] = serde_json::json!(source_path);
+        old["workspaces"][0].as_object_mut().unwrap().remove("definition_source");
+        let mut known = old["workspaces"][0].clone();
+        known["id"] = serde_json::json!("known-source");
+        known["definition_source"] = serde_json::json!("layout { pane; }");
+        old["workspaces"].as_array_mut().unwrap().push(known);
+        let bytes = serde_json::to_vec(&old).unwrap();
+        std::fs::write(&current, &bytes).unwrap();
+
+        let inspected = read_from(&current, &legacy, false).unwrap().unwrap();
+        assert!(inspected.workspaces[0].definition_source.is_none());
+        assert_eq!(std::fs::read(&current).unwrap(), bytes, "inspection never writes a baseline");
+        let loaded = read_from(&current, &legacy, true).unwrap().unwrap();
+        assert_eq!(loaded.workspaces[0].definition_source.as_deref(), Some(source));
+        assert_eq!(loaded.workspaces[1].definition_source.as_deref(), Some("layout { pane; }"));
+        let saved = std::fs::read(&current).unwrap();
+        let mut value: serde_json::Value = serde_json::from_slice(&saved).unwrap();
+        value["workspaces"][0].as_object_mut().unwrap().remove("definition_source");
+        assert_eq!(value, old, "the layout, an existing baseline and unknown fields stay as they were");
+
+        for contents in [source, "layout { pane command=\"changed\"; }"] {
+            std::fs::write(&source_path, contents).unwrap();
+            let again = read_from(&current, &legacy, true).unwrap().unwrap();
+            assert_eq!(again.workspaces[0].definition_source.as_deref(), Some(source));
+            assert_eq!(std::fs::read(&current).unwrap(), saved, "recorded once");
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn loading_reports_whether_source_baselines_replaced_the_state_on_failure() {
+        use std::os::unix::fs::PermissionsExt;
+        // Root can open and write directories regardless of these permissions.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("kraal-baseline-failure-{}", crate::identity::new_uuid()));
+        let current = dir.join("sessions-v2/main.json");
+        let legacy = dir.join("sessions/main.json");
+        let parent = current.parent().unwrap();
+        std::fs::create_dir_all(parent).unwrap();
+        let source_path = dir.join("source.kdl");
+        let source = "layout { pane; pane; }\n";
+        std::fs::write(&source_path, source).unwrap();
+        let mut old = saved_state();
+        old["workspaces"][0]["definition"] = serde_json::json!(source_path);
+        old["workspaces"][0].as_object_mut().unwrap().remove("definition_source");
+        let bytes = serde_json::to_vec(&old).unwrap();
+
+        for mode in [0o500, 0o300] {
+            std::fs::write(&current, &bytes).unwrap();
+            std::fs::set_permissions(parent, std::fs::Permissions::from_mode(mode)).unwrap();
+            let result = read_from(&current, &legacy, true);
+            std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let error = result.unwrap_err();
+            assert_eq!(error.downcast_ref::<std::io::Error>().unwrap().kind(), std::io::ErrorKind::PermissionDenied);
+            let error = format!("{error:#}");
+            assert!(error.contains(&format!("could not restore {}", current.display())), "{error}");
+            if mode == 0o500 {
+                assert!(error.contains("the saved session is unchanged"), "{error}");
+                assert!(error.contains("saving missing workspace source baselines"), "{error}");
+                assert_eq!(std::fs::read(&current).unwrap(), bytes);
+            } else {
+                assert!(
+                    error.contains("the saved session was updated, but its durability could not be confirmed"),
+                    "{error}"
+                );
+                assert!(!error.contains("the saved session is unchanged"), "{error}");
+                assert!(error.contains(&format!("making {} durable", parent.display())), "{error}");
+                let mut expected = old.clone();
+                expected["workspaces"][0]["definition_source"] = serde_json::json!(source);
+                let updated = std::fs::read(&current).unwrap();
+                assert_eq!(serde_json::from_slice::<serde_json::Value>(&updated).unwrap(), expected);
+                let loaded = read_from(&current, &legacy, true).unwrap().unwrap();
+                assert_eq!(loaded.workspaces[0].definition_source.as_deref(), Some(source));
+                assert_eq!(std::fs::read(&current).unwrap(), updated);
+            }
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn old_state_is_refused_and_current_state_takes_precedence() {
         let dir = std::env::temp_dir().join(format!("kraal-state-refusal-{}", crate::identity::new_uuid()));
         let current = dir.join("sessions-v2/main.json");
@@ -733,7 +869,7 @@ mod tests {
         for version in [0, 1] {
             let bytes = serde_json::to_vec(&serde_json::json!({"version": version, "workspaces": []})).unwrap();
             std::fs::write(&legacy, &bytes).unwrap();
-            let error = read_from(&current, &legacy).unwrap_err();
+            let error = read_from(&current, &legacy, false).unwrap_err();
             assert!(error.to_string().ends_with("run kraal 0.4 once first"), "{error:#}");
             assert_eq!(std::fs::read(&legacy).unwrap(), bytes);
             assert_eq!(std::fs::read(&scrollback).unwrap(), b"saved output");
@@ -747,16 +883,16 @@ mod tests {
         saved["workspaces"][0].as_object_mut().unwrap().remove("definition_source");
         let bytes = serde_json::to_vec(&saved).unwrap();
         std::fs::write(&current, &bytes).unwrap();
-        let loaded = read_from(&current, &legacy).unwrap().unwrap();
+        let loaded = read_from(&current, &legacy, false).unwrap().unwrap();
         assert_eq!(loaded.version, VERSION);
         assert!(loaded.workspaces[0].definition_source.is_none());
         assert_eq!(std::fs::read(&current).unwrap(), bytes);
         std::fs::write(&current, br#"{"version":3}"#).unwrap();
-        assert!(format!("{:#}", read_from(&current, &legacy).unwrap_err()).ends_with("use a newer kraal"));
+        assert!(format!("{:#}", read_from(&current, &legacy, false).unwrap_err()).ends_with("use a newer kraal"));
         assert_eq!(std::fs::read(&current).unwrap(), br#"{"version":3}"#);
         assert!(forget_from(&current).unwrap());
         assert!(!forget_from(&current).unwrap());
-        assert!(read_from(&current, &legacy).unwrap_err().to_string().ends_with("run kraal 0.4 once first"));
+        assert!(read_from(&current, &legacy, false).unwrap_err().to_string().ends_with("run kraal 0.4 once first"));
         assert_eq!(std::fs::read_dir(current.parent().unwrap()).unwrap().count(), 0);
         assert_eq!(std::fs::read(&scrollback).unwrap(), b"saved output");
         std::fs::remove_dir_all(dir).unwrap();
