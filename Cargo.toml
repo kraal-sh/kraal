@@ -41,6 +41,13 @@ toml = "0.9"
 toml_edit = "0.24"
 unicode-width = "0.2"
 
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+rustix = { version = "1", features = ["net"] }
+wayland-client = { version = "0.31", default-features = false }
+wayland-protocols = { version = "0.32", default-features = false, features = ["client", "staging"] }
+wayland-protocols-wlr = { version = "0.3", default-features = false, features = ["client"] }
+x11rb = { version = "0.13", default-features = false }
+
 [profile.release]
 lto = "thin"
 codegen-units = 4

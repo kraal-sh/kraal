@@ -290,18 +290,23 @@ An optional `attach_clipboard_image` binding opens the same prompt. Only a local
 confirmation can authorize reading the clipboard. Server focus updates cannot trigger a read,
 and nothing watches the clipboard between actions.
 
-Ctrl+V checks `wl-paste --list-types` on Wayland, `xclip -selection clipboard -out -target TARGETS`
-on X11, or `osascript -e 'clipboard info'` on macOS. If the type check is unavailable in an agent
-pane, the key is forwarded unchanged and a notice explains the next step. A missing Wayland tool
-says **Ctrl+V could not read the laptop clipboard: install wl-clipboard**; X11 names `xclip`, and
-macOS names `osascript`. A failed tool includes its error and points to **Attach clipboard image**
-to retry. If neither `WAYLAND_DISPLAY` nor `DISPLAY` is set on Linux, run attach from a desktop
-terminal with its display environment. The environment must belong to the laptop client, not
-the server. On GNOME Wayland, a screenshot copied as `image/png` is supported.
-Linux reads PNG using `wl-paste --no-newline --type image/png` when `WAYLAND_DISPLAY` is set, then
-`xclip -selection clipboard -out -target image/png` when `DISPLAY` is set. Install `wl-clipboard`
-or `xclip` for your desktop. macOS uses `osascript` to export the clipboard as PNG into a private
-file. Each helper has a two-second timeout. Missing tools, an unavailable PNG representation,
+On Linux, kraal reads the clipboard itself on Wayland compositors with data-control and on
+X11 or XWayland. It checks the advertised types before requesting `image/png`. Wayland prefers
+ext-data-control, then wlr-data-control version 2 or later. On GNOME Wayland, kraal uses the
+clipboard bridge to XWayland through `DISPLAY`. If neither native backend is available, kraal
+tries `wl-paste` and then `xclip`, according to `WAYLAND_DISPLAY` and `DISPLAY`.
+
+If the type check is unavailable in an agent pane, the key is forwarded unchanged and a notice
+explains the next step. Only when native access and the fallback tools are unavailable does the
+notice say **Ctrl+V could not read the laptop clipboard: install wl-clipboard** or name `xclip`.
+A failed native read includes its error and points to **Attach clipboard image** to retry;
+it does not switch to a tool after connecting. If neither display variable is set, run attach
+from a desktop terminal with its display environment. The environment must belong to the
+laptop client, not the server.
+
+macOS uses `osascript -e 'clipboard info'` to check types and `osascript` to export the clipboard
+as PNG into a private file. Each native operation or helper has a two-second timeout.
+Missing tools, an unavailable PNG representation,
 failed reads and images larger than **16 MiB** produce a visible failure without pasting a path.
 Save a larger image and use **Attach files**. A failure stays open with **Retry** and **Close**.
 Retry shows the local question again before reading the clipboard. Success shows **Sent to SERVER**,

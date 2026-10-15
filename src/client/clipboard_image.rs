@@ -11,6 +11,15 @@ use anyhow::{Context, Result, ensure};
 
 use crate::attachments::IMAGE_BYTES as MAX_BYTES;
 const TIMEOUT: Duration = Duration::from_secs(2);
+#[cfg(not(target_os = "macos"))]
+mod native;
+#[cfg(not(target_os = "macos"))]
+mod wayland;
+#[cfg(not(target_os = "macos"))]
+mod x11;
+
+#[cfg(not(target_os = "macos"))]
+const TOO_LARGE: &str = "clipboard image exceeds 16 MiB; save it and use Attach files";
 const PNG: &[u8] = b"\x89PNG\r\n\x1a\n";
 
 pub(super) struct Image {
@@ -70,22 +79,32 @@ fn commands(present: impl Fn(&str) -> bool) -> Vec<Command> {
 }
 
 #[cfg(not(target_os = "macos"))]
-fn read_commands(commands: Vec<Command>, cancelled: &AtomicBool) -> Result<Vec<u8>> {
-    let mut error = anyhow::anyhow!("no graphical clipboard available; run attach on your desktop");
+fn read_commands(commands: Vec<Command>, cancelled: &AtomicBool) -> Result<Vec<u8>, Diagnostic> {
+    let mut error = None;
     for mut command in commands {
         let result = run(&mut command, cancelled, MAX_BYTES, TIMEOUT).and_then(|bytes| {
             validate(&bytes)?;
             Ok(bytes)
         });
-        match result {
+        let failure = match result {
             Ok(bytes) => return Ok(bytes),
-            Err(e) => error = e,
+            Err(error)
+                if error
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
+            {
+                Diagnostic::MissingTool(if command.get_program() == "wl-paste" { "wl-clipboard" } else { "xclip" })
+            }
+            Err(error) => Diagnostic::Failed(format!("{error:#}")),
+        };
+        if error.is_none() || matches!((&error, &failure), (Some(Diagnostic::MissingTool(_)), Diagnostic::Failed(_))) {
+            error = Some(failure);
         }
         if cancelled.load(Ordering::SeqCst) {
             break;
         }
     }
-    Err(error.context("Cannot read clipboard image (wl-paste or xclip required)"))
+    Err(error.unwrap_or(Diagnostic::NoDisplay))
 }
 
 #[derive(Debug)]
@@ -157,7 +176,22 @@ impl Notices {
 
 // Inspect only advertised types: ordinary Ctrl+V must never read clipboard content.
 pub(super) fn available() -> Result<bool, Diagnostic> {
-    advertised(probes(), &AtomicBool::new(false), TIMEOUT)
+    let cancelled = AtomicBool::new(false);
+    #[cfg(target_os = "macos")]
+    {
+        advertised(probes(), &cancelled, TIMEOUT)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        native::select(
+            display_present,
+            |backend| match backend {
+                native::Backend::Wayland => wayland::list_types(&cancelled),
+                native::Backend::X11 => x11::list_types(&cancelled),
+            },
+            || advertised(probes(), &cancelled, TIMEOUT),
+        )
+    }
 }
 
 fn advertised(commands: Vec<Command>, cancelled: &AtomicBool, timeout: Duration) -> Result<bool, Diagnostic> {
@@ -187,8 +221,10 @@ fn advertised(commands: Vec<Command>, cancelled: &AtomicBool, timeout: Duration)
             }),
             Err(e) => Diagnostic::Failed(format!("{tool}: {e}")),
         };
-        // A failed X11 fallback must not hide the Wayland diagnostic on a Wayland desktop.
-        error.get_or_insert(failure);
+        // Keep the first tool failure, but never suggest installation if another tool ran.
+        if error.is_none() || matches!((&error, &failure), (Some(Diagnostic::MissingTool(_)), Diagnostic::Failed(_))) {
+            error = Some(failure);
+        }
         if cancelled.load(Ordering::SeqCst) {
             break;
         }
@@ -206,8 +242,13 @@ fn tool_error(out: &crate::exec::Output) -> String {
 }
 
 #[cfg(not(target_os = "macos"))]
+fn display_present(key: &str) -> bool {
+    std::env::var_os(key).is_some_and(|value| !value.is_empty())
+}
+
+#[cfg(not(target_os = "macos"))]
 fn probes() -> Vec<Command> {
-    probe_commands(|key| std::env::var_os(key).is_some_and(|v| !v.is_empty()))
+    probe_commands(display_present)
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -294,7 +335,16 @@ pub(super) fn read(cancelled: &AtomicBool) -> Result<Image> {
     let image = Image::new()?;
     #[cfg(not(target_os = "macos"))]
     {
-        let bytes = read_commands(commands(|key| std::env::var_os(key).is_some_and(|v| !v.is_empty())), cancelled)?;
+        let bytes = native::select(
+            display_present,
+            |backend| match backend {
+                native::Backend::Wayland => wayland::read_png(cancelled),
+                native::Backend::X11 => x11::read_png(cancelled),
+            },
+            || read_commands(commands(display_present), cancelled),
+        )
+        .map_err(|diagnostic| anyhow::anyhow!(diagnostic.message()))?;
+        validate(&bytes)?;
         crate::paths::write_private(&image.path, &bytes)?;
     }
     #[cfg(target_os = "macos")]
@@ -448,6 +498,11 @@ mod tests {
             assert!(matches!(error, Diagnostic::MissingTool(found) if found == package));
             assert!(error.message().ends_with(&format!("install {package}")));
         }
+        let mut missing = Command::new("wl-paste");
+        missing.env("PATH", "/no-such-clipboard-bin");
+        let error = advertised(vec![missing, shell("echo 'owner gone' >&2; exit 1")], &stop, TIMEOUT).unwrap_err();
+        assert!(matches!(error, Diagnostic::Failed(_)));
+        assert!(error.message().contains("owner gone"));
         for (script, expected) in [
             ("printf 'Failed to connect to a Wayland server\\n' >&2; exit 1", "Failed to connect to a Wayland server"),
             ("exit 7", "exited with status 7"),

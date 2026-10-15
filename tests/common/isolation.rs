@@ -85,7 +85,11 @@ fn developers_directories(home: Option<&Path>) -> OsString {
 /// pane the tests are run in has set, which would send a program to their files, their accounts
 /// or their session. `KRAAL_OLD` and `KRAAL_FUZZ_*` are said to the tests themselves.
 fn is_theirs(name: &OsStr) -> bool {
-    const NAMES: [&str; 15] = [
+    const NAMES: [&str; 19] = [
+        "DISPLAY",
+        "WAYLAND_DISPLAY",
+        "WAYLAND_SOCKET",
+        "XAUTHORITY",
         "XDG_CONFIG_HOME",
         "XDG_STATE_HOME",
         "XDG_DATA_HOME",
