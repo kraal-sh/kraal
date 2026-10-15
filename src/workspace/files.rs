@@ -112,15 +112,7 @@ pub fn load_dir(dir: &Path) -> Vec<(PathBuf, Result<WorkspaceDef>)> {
         .collect()
 }
 
-/// The path a definition file is known by: its directory resolved (links, `..`), so that a
-/// workspace opened through another spelling of that directory is still linked to its file. The
-/// file itself is not resolved: a definition that is a link is renamed as a link.
-pub fn definition_path(path: &Path) -> PathBuf {
-    match (path.parent().and_then(|dir| fs::canonicalize(dir).ok()), path.file_name()) {
-        (Some(dir), Some(name)) => dir.join(name),
-        _ => path.to_path_buf(),
-    }
-}
+pub use crate::paths::normalized_entry as definition_path;
 
 /// The definition in the file at `path`, named after the file.
 pub fn load_file(path: &Path) -> Result<WorkspaceDef> {
@@ -133,7 +125,7 @@ pub fn load_file(path: &Path) -> Result<WorkspaceDef> {
 /// Save the revision that was loaded or confirmed, keeping the replaced file beside it.
 pub fn save_file(path: &Path, def: &WorkspaceDef, expected: &crate::paths::FileRevision) -> Result<String> {
     let source = to_kdl(def);
-    crate::paths::write_checked(path, source.as_bytes(), expected)
+    crate::paths::write_checked(path, source.as_bytes(), expected, &expected.target.with_extension("kdl.bak"))
         .with_context(|| format!("saving {}", path.display()))?;
     Ok(source)
 }
@@ -155,6 +147,6 @@ pub fn publish_import<'a>(
         );
     }
     parse_workspace(&path.file_stem().unwrap_or_default().to_string_lossy(), source)?;
-    crate::paths::write_checked(path, source.as_bytes(), expected)?;
+    crate::paths::write_checked(path, source.as_bytes(), expected, &expected.target.with_extension("kdl.bak"))?;
     Ok(())
 }

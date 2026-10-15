@@ -1,11 +1,13 @@
-//! Workspace copies and recoverable deletion are durable before their result is shown.
+//! Workspace mutations are durable before their result is shown.
 
 use std::path::{Path, PathBuf};
 
-use super::ui::{ConfirmAction, Mode, PickAction, PickItem, Picker, PickerKind, Prompt, PromptAction};
-use super::{ClientId, Server};
+use super::Server;
+use super::persistence::{CloseInventory, ClosePane, SaveFailure};
+use super::ui::{Mode, PickAction};
+use crate::pane::PaneSpec;
 use crate::persist::{DeletedWorkspace, WorkspaceSnap};
-use crate::theme::NoticeKind;
+use crate::protocol::Placement;
 
 #[derive(Clone)]
 pub enum DeleteTarget {
@@ -13,7 +15,201 @@ pub enum DeleteTarget {
     Source(PathBuf),
 }
 
+pub(super) struct DeleteWarning {
+    pub message: String,
+    pub stop: bool,
+    pub retry: bool,
+}
+
+pub(super) struct PreparedWorkspaceStop {
+    target: StopTarget,
+    delete: bool,
+    pub warning: Option<String>,
+}
+
+enum StopTarget {
+    Workspace { ws: u32, identity: String, inventory: CloseInventory },
+    Source { path: PathBuf, revision: crate::paths::FileRevision },
+}
+
+impl PreparedWorkspaceStop {
+    pub fn workspace(&self) -> Option<&str> {
+        match &self.target {
+            StopTarget::Workspace { identity, .. } => Some(identity),
+            StopTarget::Source { .. } => None,
+        }
+    }
+
+    pub fn revision(&self) -> Result<String, String> {
+        match &self.target {
+            StopTarget::Workspace { identity, inventory, .. } => {
+                Ok(serde_json::to_string(&(self.delete, identity, &inventory.name, &inventory.panes)).unwrap())
+            }
+            StopTarget::Source { path, revision } => serde_json::to_string(&(self.delete, path, revision))
+                .map_err(|e| format!("Couldn't prepare workspace deletion: {e}")),
+        }
+    }
+}
+
 impl Server {
+    pub(super) fn workspace_close_inventory(&self, ws: u32) -> CloseInventory {
+        let w = &self.workspaces[self.ws_index(ws).unwrap()];
+        CloseInventory {
+            name: w.name.clone(),
+            panes: w.panes().iter().filter_map(|p| self.panes.get(p).map(ClosePane::read)).collect(),
+        }
+    }
+
+    fn workspace_stop_revision(&self, ws: u32, delete: bool) -> String {
+        let w = &self.workspaces[self.ws_index(ws).unwrap()];
+        let inventory = self.workspace_close_inventory(ws);
+        serde_json::to_string(&(delete, &w.stable_id, &inventory.name, inventory.panes)).unwrap()
+    }
+
+    pub(super) fn prepare_workspace_stop(
+        &self,
+        target: DeleteTarget,
+        delete: bool,
+    ) -> Result<PreparedWorkspaceStop, String> {
+        let (prepared, warning) = match &target {
+            DeleteTarget::Workspace(ws) => {
+                let wi = self.ws_index(*ws).ok_or("This workspace is no longer available.")?;
+                let w = &self.workspaces[wi];
+                if !delete && w.delete_pending {
+                    return Err(
+                        "This workspace has an unfinished Delete. Retry `kraal workspaces delete` with its name or ID."
+                            .into(),
+                    );
+                }
+                let prepared = StopTarget::Workspace {
+                    ws: *ws,
+                    identity: w.stable_id.clone(),
+                    inventory: self.workspace_close_inventory(*ws),
+                };
+                let warning = if delete {
+                    Some(self.delete_workspace_warning(&target).unwrap().message)
+                } else {
+                    self.stops(Some(*ws)).map(|stops| format!("Close {}?\n{stops}\n\nThe layout will be kept.\nUnsaved work in these programs may be lost.", w.name))
+                };
+                (prepared, warning)
+            }
+            DeleteTarget::Source(path) => {
+                if !delete {
+                    return Err("This workspace file is already Closed. No programs were stopped.".into());
+                }
+                let revision = crate::paths::FileRevision::read(path).map_err(|e| format!("{e:#}"))?;
+                #[cfg(test)]
+                let revision = tests::source_revision(revision);
+                (
+                    StopTarget::Source { path: path.clone(), revision },
+                    Some(self.delete_workspace_warning(&target).unwrap().message),
+                )
+            }
+        };
+        Ok(PreparedWorkspaceStop { target: prepared, delete, warning })
+    }
+
+    pub(super) fn finish_workspace_stop(
+        &mut self,
+        prepared: PreparedWorkspaceStop,
+        expected: &str,
+    ) -> Result<(), String> {
+        if expected != prepared.revision()? {
+            return Err(
+                "The workspace or its programs changed. Nothing was stopped. Run the command again to review them."
+                    .into(),
+            );
+        }
+        let delete = prepared.delete;
+        match prepared.target {
+            StopTarget::Workspace { ws, .. } => {
+                let check = |server: &Self| {
+                    if server.workspace_stop_revision(ws, delete) == expected {
+                        Ok(())
+                    } else {
+                        Err("The workspace or its programs changed. Nothing was stopped. Run the command again to review them.".into())
+                    }
+                };
+                let result = if delete {
+                    self.keep_and_delete_workspace_checked(ws, check).map(|_| ())
+                } else {
+                    self.keep_and_close_workspace_checked(ws, check)
+                };
+                if let Err(error) = result {
+                    if let Some(wi) = self.ws_index(ws)
+                        && (!delete || self.workspaces[wi].delete_pending)
+                    {
+                        self.workspaces[wi].close_error = Some(error.clone());
+                    }
+                    return Err(error);
+                }
+            }
+            StopTarget::Source { path, .. } => {
+                self.delete_workspace_source(&path)?;
+            }
+        }
+        Ok(())
+    }
+
+    pub(super) fn available_workspace_name(&self, base: &str) -> String {
+        std::iter::once(base.to_string())
+            .chain((2..).map(|n| format!("{base}-{n}")))
+            .find(|n| !self.workspace_name_used(n, None, None))
+            .unwrap()
+    }
+
+    pub(super) fn rename_workspace(&mut self, ws: u32, name: &str) -> Result<(), String> {
+        self.validate_workspace_name(name, Some(ws)).map_err(|e| e.to_string())?;
+        let wi =
+            self.ws_index(ws).ok_or("This workspace is no longer available. Cancel and choose another workspace.")?;
+        let old = std::mem::replace(&mut self.workspaces[wi].name, name.to_string());
+        if let Err(failure) = self.save_reversible(|server| {
+            server.workspaces[wi].name = old.clone();
+        }) {
+            return match failure {
+                SaveFailure::Initial(error) => Err(format!("Couldn't save the name. Still named {old}.\n{error}")),
+                SaveFailure::Rollback { error, rollback } => Err(format!(
+                    "Couldn't save the name or confirm its rollback. The saved session may still use {name}.\nFix the save error and retry.\n{error}\n{rollback}"
+                )),
+            };
+        }
+        Ok(())
+    }
+
+    pub(super) fn add_workspace(&mut self, name: &str, cwd: Option<PathBuf>) -> Result<u32, String> {
+        self.validate_workspace_name(name, None).map_err(|e| e.to_string())?;
+        if let Some(dir) = &cwd
+            && !dir.is_dir()
+        {
+            return Err(format!(
+                "The starting folder {} is no longer available. Restore it and retry, or cancel and open Add workspace from another folder.",
+                crate::paths::shorten_home(dir)
+            ));
+        }
+        let panes = self.panes.keys().copied().collect();
+        let workspaces: Vec<_> = self.workspaces.iter().map(|w| w.id).collect();
+        let ws = self.new_workspace(name.into(), None);
+        let wi = self.ws_index(ws).unwrap();
+        self.workspaces[wi].cwd = cwd.clone();
+        if let Err(e) = self.spawn_pane_in(ws, None, PaneSpec { cwd, ..Default::default() }, Placement::Tab, None) {
+            self.rollback(&panes, &workspaces);
+            return Err(format!("Couldn't start the shell. No workspace was added.\n{e:#}"));
+        }
+        if let Err(failure) = self.save_reversible(|server| {
+            server.rollback(&panes, &workspaces);
+        }) {
+            return match failure {
+                SaveFailure::Initial(error) => {
+                    Err(format!("Couldn't save the workspace. No workspace was added.\n{error}"))
+                }
+                SaveFailure::Rollback { error, rollback } => Err(format!(
+                    "Couldn't save the workspace or confirm its rollback. The saved session may still contain {name}.\nFix the save error and retry.\n{error}\n{rollback}"
+                )),
+            };
+        }
+        Ok(ws)
+    }
+
     pub(super) fn workspace_name_used(&self, name: &str, except: Option<u32>, source: Option<&Path>) -> bool {
         self.workspaces.iter().any(|w| Some(w.id) != except && w.name == name)
             || self.unrestored.iter().any(|w| w.name == name)
@@ -47,16 +243,15 @@ impl Server {
         crate::server::persistence::apply_workspace(self, &copy)
             .map_err(|e| format!("Couldn't copy the workspace.\n{e:#}"))?;
         let ws = self.workspaces.last().unwrap().id;
-        if let Err(e) = self.save_now() {
-            self.workspaces.pop();
-            // A timed-out writer can still publish the copy. Queue its removal after it.
-            if let Err(rollback) = self.save_now() {
-                self.mark_persist();
-                return Err(format!(
-                    "Couldn't save the copy or confirm its rollback. The saved session may still contain {name}.\nFix the save error and retry.\n{e}\n{rollback}"
-                ));
-            }
-            return Err(format!("Couldn't save the copy. No workspace was added.\n{e}"));
+        if let Err(failure) = self.save_reversible(|server| {
+            server.workspaces.pop();
+        }) {
+            return match failure {
+                SaveFailure::Initial(error) => Err(format!("Couldn't save the copy. No workspace was added.\n{error}")),
+                SaveFailure::Rollback { error, rollback } => Err(format!(
+                    "Couldn't save the copy or confirm its rollback. The saved session may still contain {name}.\nFix the save error and retry.\n{error}\n{rollback}"
+                )),
+            };
         }
         Ok(ws)
     }
@@ -65,18 +260,20 @@ impl Server {
         self.removed_sources.iter().any(|p| crate::paths::same_file(p, path))
     }
 
-    pub(super) fn ask_delete_workspace(&self, target: DeleteTarget) -> Mode {
-        let (name, source, programs) = match &target {
+    pub(super) fn delete_workspace_warning(&self, target: &DeleteTarget) -> Option<DeleteWarning> {
+        let (name, source, programs) = match target {
             DeleteTarget::Workspace(ws) => {
-                let Some(wi) = self.ws_index(*ws) else {
-                    return self.workspace_picker(0).result(NoticeKind::Warning, "Workspace unavailable");
-                };
+                let wi = self.ws_index(*ws)?;
                 let workspace = &self.workspaces[wi];
                 if workspace.delete_pending {
-                    return Mode::confirm(
-                        workspace.close_error.clone().unwrap_or_else(|| "Finish deleting this workspace?".into()),
-                        ConfirmAction::RetryDeleteWorkspace(target),
-                    );
+                    return Some(DeleteWarning {
+                        message: workspace
+                            .close_error
+                            .clone()
+                            .unwrap_or_else(|| "Finish deleting this workspace?".into()),
+                        stop: false,
+                        retry: true,
+                    });
                 }
                 (workspace.name.clone(), workspace.definition.clone(), self.stops(Some(*ws)))
             }
@@ -93,38 +290,7 @@ impl Server {
         if let Some(programs) = programs {
             message.push_str(&format!("\n{programs}\nUnsaved program work cannot be restored."));
         }
-        Mode::confirm(message, ConfirmAction::DeleteWorkspace { target, stop })
-    }
-
-    pub(super) fn delete_workspace(&mut self, client: ClientId, target: DeleteTarget) -> Mode {
-        let result = match &target {
-            DeleteTarget::Workspace(ws) => self.keep_and_delete_workspace(*ws),
-            DeleteTarget::Source(path) => self.delete_workspace_source(path),
-        };
-        match result {
-            Ok(identity) => {
-                self.refresh_workspace_pickers();
-                self.mark_dirty();
-                self.toast(client, NoticeKind::Notice, "Workspace deleted · Undo");
-                if let Some(c) = self.clients.get_mut(&client) {
-                    c.toast_action = Some((0, super::attention::ToastAction::RestoreWorkspace(identity.clone())));
-                }
-                let mut picker = self.workspace_picker(self.clients.get(&client).map_or(0, |c| c.workspace));
-                picker.undo = Some(identity);
-                picker.result(NoticeKind::Notice, "Workspace deleted")
-            }
-            Err(message) => {
-                if let DeleteTarget::Workspace(ws) = target
-                    && let Some(wi) = self.ws_index(ws)
-                    && self.workspaces[wi].delete_pending
-                {
-                    self.workspaces[wi].close_error = Some(message.clone());
-                }
-                self.refresh_workspace_pickers();
-                self.mark_dirty();
-                Mode::confirm(message, ConfirmAction::RetryDeleteWorkspace(target))
-            }
-        }
+        Some(DeleteWarning { message, stop, retry: false })
     }
 
     pub(super) fn keep_and_delete_workspace(&mut self, ws: u32) -> Result<String, String> {
@@ -144,15 +310,19 @@ impl Server {
             // A failed preparation must cancel even a writer that finishes after its timeout.
             let prepared = self.workspaces[wi].kept.as_ref().is_some_and(|s| s.close_pending.is_some() || s.closed);
             if !retry && (!prepared || was_kept.as_ref().is_some_and(|s| s.closed)) {
-                self.workspaces[wi].delete_pending = false;
-                self.workspaces[wi].kept = was_kept;
-                if let Err(rollback) = self.save_now() {
-                    self.mark_persist();
-                    return Err(format!(
-                        "Couldn't confirm cancellation of the deletion. Nothing was stopped.\nFix the save error and retry Delete.\n{e}\n{rollback}"
-                    ));
-                }
-                return Err(format!("Couldn't save the deletion.\nNothing was stopped or deleted.\n{e}"));
+                return Err(
+                    match self.rollback_save(e, |server| {
+                        server.workspaces[wi].delete_pending = false;
+                        server.workspaces[wi].kept = was_kept;
+                    }) {
+                        SaveFailure::Initial(error) => {
+                            format!("Couldn't save the deletion.\nNothing was stopped or deleted.\n{error}")
+                        }
+                        SaveFailure::Rollback { error, rollback } => format!(
+                            "Couldn't confirm cancellation of the deletion. Nothing was stopped.\nFix the save error and retry Delete.\n{error}\n{rollback}"
+                        ),
+                    },
+                );
             }
             return Err(format!(
                 "Couldn't finish deleting the workspace. Its layout is kept.\nRetry Delete to finish.\n{e}"
@@ -272,101 +442,22 @@ impl Server {
         }
         let sources = self.removed_sources.clone();
         self.remove_workspace_source(path);
-        if let Err(e) = self.save_now() {
-            self.deleted_workspaces.pop();
-            self.workspace_order = order;
-            self.removed_sources = sources;
-            if let Err(rollback) = self.save_now() {
-                self.mark_persist();
-                return Err(format!(
-                    "Couldn't confirm cancellation of the deletion. The source file is kept.\nFix the save error and retry.\n{e}\n{rollback}"
-                ));
-            }
-            return Err(format!("Couldn't save the deletion. Nothing was stopped or deleted.\n{e}"));
+        if let Err(failure) = self.save_reversible(|server| {
+            server.deleted_workspaces.pop();
+            server.workspace_order = order;
+            server.removed_sources = sources;
+        }) {
+            return Err(match failure {
+                SaveFailure::Initial(error) => {
+                    format!("Couldn't save the deletion. Nothing was stopped or deleted.\n{error}")
+                }
+                SaveFailure::Rollback { error, rollback } => format!(
+                    "Couldn't confirm cancellation of the deletion. The source file is kept.\nFix the save error and retry.\n{error}\n{rollback}"
+                ),
+            });
         }
         self.scan_definitions();
         Ok(identity)
-    }
-
-    pub(super) fn deleted_workspace_picker(&self) -> Picker {
-        let items = self
-            .deleted_workspaces
-            .iter()
-            .rev()
-            .map(|d| {
-                let (tabs, panes) = d.workspace.counts();
-                let days = crate::accounts::now().saturating_sub(d.deleted_at).max(0) / 86400;
-                let when = if days == 0 {
-                    "Deleted today".into()
-                } else {
-                    format!("Deleted {days} day{} ago", super::input::plural(days as usize))
-                };
-                PickItem::new(
-                    &d.workspace.name,
-                    format!(
-                        "{when} · {tabs} tab{} · {panes} pane{}",
-                        super::input::plural(tabs),
-                        super::input::plural(panes)
-                    ),
-                    PickAction::RestoreWorkspace(d.workspace.id.clone()),
-                )
-            })
-            .collect();
-        Picker::new(PickerKind::DeletedWorkspaces, "Deleted workspaces", items)
-    }
-
-    pub(super) fn restore_workspace_mode(&mut self, client: ClientId, identity: &str, from: Option<&Picker>) -> Mode {
-        let Some(saved) = self.deleted_workspaces.iter().find(|d| d.workspace.id == identity) else {
-            return self.deleted_workspace_picker().result(NoticeKind::Notice, "Workspace already restored");
-        };
-        let name = saved.workspace.name.clone();
-        if self.workspace_name_used(&name, None, None) {
-            let base = format!("{name}-restored");
-            let proposed = std::iter::once(base.clone())
-                .chain((2..).map(|n| format!("{base}-{n}")))
-                .find(|n| !self.workspace_name_used(n, None, None))
-                .unwrap();
-            let mut p = Prompt::new("Restore workspace", &proposed, PromptAction::RestoreWorkspace(identity.into()));
-            p.error = Some(format!("{name} is already used. Choose another name."));
-            self.workspace_restore_back(&mut p, from);
-            return Mode::Prompt(p);
-        }
-        self.restore_workspace_result(client, identity, &name, from)
-    }
-
-    pub(super) fn restore_workspace_result(
-        &mut self,
-        client: ClientId,
-        identity: &str,
-        name: &str,
-        from: Option<&Picker>,
-    ) -> Mode {
-        let had_source =
-            self.deleted_workspaces.iter().any(|d| d.workspace.id == identity && d.workspace.definition.is_some());
-        match self.restore_deleted_workspace(identity, name) {
-            Ok(ws) => {
-                self.refresh_workspace_pickers();
-                self.mark_dirty();
-                self.toast(client, NoticeKind::Notice, "Workspace restored");
-                let mut picker = self.workspace_picker(0);
-                picker.select(|i| i.action.workspace() == Some(ws));
-                let workspace = &self.workspaces[self.ws_index(ws).unwrap()];
-                if had_source && workspace.definition.is_none() {
-                    picker.result(
-                        NoticeKind::Warning,
-                        "Workspace restored · Source belongs to another workspace · Enter Open",
-                    )
-                } else {
-                    picker.result(NoticeKind::Notice, "Workspace restored · Enter Open")
-                }
-            }
-            Err(error) => {
-                let mut p = Prompt::new("Restore workspace", name, PromptAction::RestoreWorkspace(identity.into()));
-                p.error = Some(error);
-                self.workspace_restore_back(&mut p, from);
-                Mode::Prompt(p)
-            }
-        }
     }
 
     pub(super) fn restore_deleted_workspace(&mut self, identity: &str, name: &str) -> Result<u32, String> {
@@ -412,18 +503,20 @@ impl Server {
             self.workspace_order
                 .insert(deleted.order_position.unwrap_or(deleted.position).min(self.workspace_order.len()), key);
         }
-        if let Err(e) = self.save_now() {
-            self.workspaces.remove(position);
-            self.workspace_order = order;
-            self.deleted_workspaces.insert(at, deleted);
-            self.removed_sources = sources;
-            if let Err(rollback) = self.save_now() {
-                self.mark_persist();
-                return Err(format!(
-                    "Couldn't confirm the restore or its rollback. No programs were started.\nFix the save error and retry.\n{e}\n{rollback}"
-                ));
-            }
-            return Err(format!("Couldn't save the restore. The workspace stays in Deleted workspaces.\n{e}"));
+        if let Err(failure) = self.save_reversible(|server| {
+            server.workspaces.remove(position);
+            server.workspace_order = order;
+            server.deleted_workspaces.insert(at, deleted);
+            server.removed_sources = sources;
+        }) {
+            return match failure {
+                SaveFailure::Initial(error) => {
+                    Err(format!("Couldn't save the restore. The workspace stays in Deleted workspaces.\n{error}"))
+                }
+                SaveFailure::Rollback { error, rollback } => Err(format!(
+                    "Couldn't confirm the restore or its rollback. No programs were started.\nFix the save error and retry.\n{error}\n{rollback}"
+                )),
+            };
         }
         self.sort_workspaces();
         self.scan_definitions();
@@ -432,12 +525,24 @@ impl Server {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use crate::pane::PaneSpec;
     use crate::persist::{self, NodeSnap};
     use crate::protocol::Placement;
     use crate::server::persistence::tests::writer;
+    use crate::server::ui::ConfirmAction;
+
+    thread_local! {
+        pub(in crate::server) static SOURCE_REVISION_TARGET: std::cell::RefCell<Option<std::path::PathBuf>> = const { std::cell::RefCell::new(None) };
+    }
+
+    pub(in crate::server) fn source_revision(mut revision: crate::paths::FileRevision) -> crate::paths::FileRevision {
+        if let Some(target) = SOURCE_REVISION_TARGET.with_borrow_mut(Option::take) {
+            revision.target = target;
+        }
+        revision
+    }
 
     fn until(server: &mut Server, rx: &super::super::queue::EventReceiver, done: impl Fn(&Server) -> bool) {
         let start = std::time::Instant::now();
@@ -450,6 +555,130 @@ mod tests {
             }
             assert!(start.elapsed() < crate::testing::PATIENCE, "the copied pane did not reach the expected state");
             std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn prepared_stops_keep_revision_bytes_and_screen_warnings() {
+        let (tx, _rx) = super::super::queue::channel(32);
+        let mut server = super::super::tests::server(tx);
+        let ws = server.new_workspace("personal".into(), None);
+        let identity = server.workspaces[0].stable_id.clone();
+        let saved = writer(&mut server, vec![]);
+        for delete in [false, true] {
+            let prepared = server.prepare_workspace_stop(DeleteTarget::Workspace(ws), delete).unwrap();
+            assert_eq!(prepared.workspace(), Some(identity.as_str()));
+            assert_eq!(
+                prepared.revision().unwrap(),
+                serde_json::to_string(&(delete, &identity, "personal", Vec::<ClosePane>::new())).unwrap()
+            );
+            if delete {
+                let Mode::Confirm(question) = server.ask_delete_workspace(DeleteTarget::Workspace(ws)) else {
+                    panic!()
+                };
+                assert_eq!(prepared.warning.as_deref(), Some(question.message.as_str()));
+                assert_eq!(
+                    question.message,
+                    "Delete personal?\nYou can restore it from Deleted workspaces.\nProject files will be kept."
+                );
+            } else {
+                assert!(prepared.warning.is_none());
+            }
+        }
+        server.workspaces[0].delete_pending = true;
+        server.workspaces[0].close_error = Some("retry deletion".into());
+        let prepared = server.prepare_workspace_stop(DeleteTarget::Workspace(ws), true).unwrap();
+        assert_eq!(prepared.warning.as_deref(), Some("retry deletion"));
+        assert!(server.prepare_workspace_stop(DeleteTarget::Workspace(ws), false).is_err());
+        let dir = crate::testing::TempDir::new("prepared-source");
+        let path = dir.write("recipe.kdl", "layout { pane; }");
+        let revision = crate::paths::FileRevision::read(&path).unwrap();
+        let prepared = server.prepare_workspace_stop(DeleteTarget::Source(path.clone()), true).unwrap();
+        assert_eq!(prepared.revision().unwrap(), serde_json::to_string(&(true, &path, revision)).unwrap());
+        let Mode::Confirm(question) = server.ask_delete_workspace(DeleteTarget::Source(path)) else { panic!() };
+        assert_eq!(prepared.warning, Some(question.message));
+        assert!(saved.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn available_names_include_closed_unrestored_and_invalid_sources() {
+        let (tx, _rx) = super::super::queue::channel(32);
+        let mut server = super::super::tests::server(tx);
+        assert_eq!(server.available_workspace_name("copy"), "copy");
+        server.new_workspace("copy".into(), None);
+        let mut closed = crate::server::persistence::snapshot(&server).workspaces.remove(0);
+        closed.closed = true;
+        server.workspaces[0].kept = Some(closed.clone());
+        closed.name = "copy-2".into();
+        server.unrestored.push(closed);
+        let dir = crate::testing::TempDir::new("available-workspace-name");
+        dir.write("copy-3.kdl", "layout { pane; }");
+        dir.write("copy-4.kdl", "{");
+        dir.write("copy-6.kdl", "layout { pane; }");
+        server.config.workspace_dirs.push(dir.text());
+        assert_eq!(server.available_workspace_name("copy"), "copy-5");
+    }
+
+    #[test]
+    fn reversible_workspace_mutations_restore_the_saved_state_and_retry_once() {
+        for operation in ["duplicate", "import", "delete", "restore"] {
+            for rollback_fails in [false, true] {
+                let (tx, _rx) = super::super::queue::channel(32);
+                let mut server = super::super::tests::server(tx);
+                let ws = server.new_workspace("original".into(), None);
+                let dir = crate::testing::TempDir::new("reversible-workspace");
+                let source = "// Keep this source.\nlayout { pane command=\"true\"; }";
+                let path = dir.write("recipe.kdl", source);
+                server.config.workspace_dirs.push(dir.text());
+                writer(&mut server, vec![]);
+                let identity = if operation == "restore" {
+                    server.keep_and_delete_workspace(ws).unwrap()
+                } else {
+                    server.workspaces[0].stable_id.clone()
+                };
+                let before = serde_json::to_value(crate::server::persistence::snapshot(&server)).unwrap();
+                let revision = crate::paths::FileRevision::read(&path).unwrap();
+                let mutate = |server: &mut Server| -> Result<(), String> {
+                    match operation {
+                        "duplicate" => server.duplicate_workspace(ws, "copy").map(|_| ()),
+                        "import" => server
+                            .import_layout(&path, "imported", &revision, &[])
+                            .map(|_| ())
+                            .map_err(|e| e.to_string()),
+                        "delete" => server.delete_workspace_source(&path).map(|_| ()),
+                        "restore" => server.restore_deleted_workspace(&identity, "restored").map(|_| ()),
+                        _ => unreachable!(),
+                    }
+                };
+                let saved = writer(
+                    &mut server,
+                    vec![
+                        Err("initial save failed".into()),
+                        if rollback_fails { Err("rollback failed".into()) } else { Ok(()) },
+                    ],
+                );
+                let error = mutate(&mut server).unwrap_err();
+                assert!(error.contains("initial save failed"), "{operation}: {error}");
+                assert_eq!(error.contains("rollback failed"), rollback_fails, "{operation}: {error}");
+                assert_eq!(
+                    serde_json::to_value(crate::server::persistence::snapshot(&server)).unwrap(),
+                    before,
+                    "{operation}"
+                );
+                assert_eq!(saved.lock().unwrap().len(), 2, "{operation}");
+                assert_eq!(*saved.lock().unwrap().last().unwrap(), before, "{operation}");
+                assert_eq!(std::fs::read_to_string(&path).unwrap(), source);
+                mutate(&mut server).unwrap();
+                let after = serde_json::to_value(crate::server::persistence::snapshot(&server)).unwrap();
+                assert_ne!(after, before, "{operation}");
+                assert!(mutate(&mut server).is_err(), "{operation}: repeated submission must be refused");
+                assert_eq!(
+                    serde_json::to_value(crate::server::persistence::snapshot(&server)).unwrap(),
+                    after,
+                    "{operation}"
+                );
+                assert_eq!(std::fs::read_to_string(&path).unwrap(), source);
+            }
         }
     }
 

@@ -62,6 +62,12 @@ Renaming also waits for the saved name: if saving fails, the old name stays and 
 the proposed name for retry. A rename from the list selects the renamed row; if its new name
 no longer matches the search, the search clears to show it.
 
+If saving a reversible workspace change fails, kraal restores the previous local state and
+saves it again. A writer that timed out may still finish, so this second save must follow it.
+If that rollback cannot be confirmed, the error explains the uncertainty about the saved
+state and asks you to fix the save error and retry. This does not restart stopped programs
+or recover unsaved program work.
+
 - A **session** is one background server. It owns the processes; clients attach and detach.
   `kraal` uses the session `main`; `kraal -s work` (or `KRAAL_SESSION_NAME=work` in the
   environment) another one, and inside a pane every command uses that pane's session.

@@ -894,7 +894,7 @@ fn concurrent_creates_and_replacements_have_one_winner() {
                 let (expected, barrier) = (expected.clone(), barrier.clone());
                 std::thread::spawn(move || {
                     barrier.wait();
-                    write_checked(&path, data, &expected)
+                    write_checked(&path, data, &expected, &expected.target.with_extension("kdl.bak"))
                 })
             })
             .collect();
@@ -925,7 +925,7 @@ fn edits_with_the_same_size_and_timestamp_are_not_overwritten() {
         .unwrap()
         .set_times(std::fs::FileTimes::new().set_modified(time))
         .unwrap();
-    assert!(write_checked(&path, b"ours", &expected).is_err());
+    assert!(write_checked(&path, b"ours", &expected, &expected.target.with_extension("kdl.bak")).is_err());
     assert_eq!(std::fs::read_to_string(&path).unwrap(), "new");
     assert!(!path.with_extension("kdl.bak").exists());
     std::fs::remove_dir_all(dir).unwrap();
@@ -942,7 +942,7 @@ fn an_edit_between_comparison_and_moving_the_file_is_restored() {
     // The editor changed it after the initial comparison, before the entry was moved aside.
     std::fs::write(&path, "edited").unwrap();
     rename_no_replace(&path, &kept).unwrap();
-    assert!(replace_kept(&path, &tmp, &kept, &expected).is_err());
+    assert!(replace_kept(&path, &tmp, &kept, &expected, &expected.target.with_extension("kdl.bak")).is_err());
     assert_eq!(std::fs::read_to_string(&path).unwrap(), "edited");
     assert!(!kept.exists());
     assert!(!path.with_extension("kdl.bak").exists());
@@ -959,7 +959,9 @@ fn an_editor_that_creates_the_destination_wins_and_both_versions_survive() {
     std::fs::write(&tmp, "ours").unwrap();
     rename_no_replace(&path, &kept).unwrap();
     std::fs::write(&path, "editor").unwrap();
-    let error = replace_kept(&path, &tmp, &kept, &expected).unwrap_err().to_string();
+    let error = replace_kept(&path, &tmp, &kept, &expected, &expected.target.with_extension("kdl.bak"))
+        .unwrap_err()
+        .to_string();
     assert!(error.contains(&kept.display().to_string()), "{error}");
     assert!(error.contains("inspect that file before retrying"), "{error}");
     assert_eq!(std::fs::read_to_string(&path).unwrap(), "editor");
@@ -977,12 +979,12 @@ fn backup_failures_restore_the_file_and_backup_links_are_not_followed() {
     std::fs::write(&path, "old").unwrap();
     let expected = FileRevision::read(&path).unwrap();
     std::fs::create_dir(&backup).unwrap();
-    assert!(write_checked(&path, b"ours", &expected).is_err());
+    assert!(write_checked(&path, b"ours", &expected, &expected.target.with_extension("kdl.bak")).is_err());
     assert_eq!(std::fs::read_to_string(&path).unwrap(), "old");
     std::fs::remove_dir(&backup).unwrap();
     std::fs::write(&precious, "kept").unwrap();
     std::os::unix::fs::symlink(&precious, &backup).unwrap();
-    write_checked(&path, b"ours", &expected).unwrap();
+    write_checked(&path, b"ours", &expected, &expected.target.with_extension("kdl.bak")).unwrap();
     assert_eq!(std::fs::read_to_string(&precious).unwrap(), "kept");
     assert_eq!(std::fs::read_to_string(&backup).unwrap(), "old");
     std::fs::remove_dir_all(dir).unwrap();
@@ -1001,7 +1003,7 @@ fn checked_saves_preserve_symlinks_modes_and_writes_to_the_old_descriptor() {
     std::os::unix::fs::symlink("alias.kdl", &second).unwrap();
     let expected = FileRevision::read(&second).unwrap();
     let mut editor = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
-    write_checked(&second, b"ours", &expected).unwrap();
+    write_checked(&second, b"ours", &expected, &expected.target.with_extension("kdl.bak")).unwrap();
     editor.write_all(b" edited").unwrap();
     assert_eq!(std::fs::read_to_string(&path).unwrap(), "ours");
     assert_eq!(std::fs::read_to_string(path.with_extension("kdl.bak")).unwrap(), "old edited");
@@ -1013,7 +1015,7 @@ fn checked_saves_preserve_symlinks_modes_and_writes_to_the_old_descriptor() {
     std::fs::write(&other, "ours").unwrap();
     std::fs::remove_file(&alias).unwrap();
     std::os::unix::fs::symlink(&other, &alias).unwrap();
-    assert!(write_checked(&alias, b"wrong", &expected).is_err());
+    assert!(write_checked(&alias, b"wrong", &expected, &expected.target.with_extension("kdl.bak")).is_err());
     assert_eq!(std::fs::read_to_string(&other).unwrap(), "ours");
     std::fs::remove_file(&other).unwrap();
     assert!(FileRevision::read(&alias).is_err());
@@ -1102,4 +1104,38 @@ fn the_abandoned_copies_of_one_file_are_removed_and_no_others() {
     // Nothing to remove where nothing was written.
     remove_abandoned_temps(&dir.join("never/main.json")).unwrap();
     let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn checked_writes_keep_the_backup_at_the_callers_path() {
+    let dir = crate::testing::TempDir::new("explicit-backup");
+    let path = dir.write("settings.txt", "old");
+    let backup = dir.0.join("previous.txt");
+    let expected = FileRevision::read(&path).unwrap();
+    write_checked(&path, b"new", &expected, &backup).unwrap();
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "new");
+    assert_eq!(std::fs::read_to_string(&backup).unwrap(), "old");
+    assert!(!path.with_extension("kdl.bak").exists());
+}
+
+#[test]
+fn entry_normalization_and_file_identity_keep_missing_paths_and_links() {
+    let dir = crate::testing::TempDir::new("normalized-entry");
+    let real = dir.mkdir("real");
+    let alias = dir.0.join("alias");
+    std::os::unix::fs::symlink(&real, &alias).unwrap();
+    let missing = real.join("missing");
+    assert_eq!(normalized_entry(&alias.join("missing")), missing);
+    assert!(same_file(&alias.join("missing"), &missing));
+    let link = real.join("link");
+    std::os::unix::fs::symlink("missing", &link).unwrap();
+    assert_eq!(normalized_entry(&alias.join("link")), link);
+    assert!(same_file(&link, &missing));
+    std::fs::write(&missing, "contents").unwrap();
+    let hard = real.join("hard");
+    std::fs::hard_link(&missing, &hard).unwrap();
+    assert!(same_file(&link, &hard));
+    assert!(!same_file(&link, &real.join("another")));
+    let absent_parent = dir.0.join("absent/child");
+    assert_eq!(normalized_entry(&absent_parent), absent_parent);
 }
