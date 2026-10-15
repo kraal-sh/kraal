@@ -1065,7 +1065,7 @@ fn laptop_lists_only_through_owner_and_hides_paths_and_entries_from_other_views(
 }
 
 #[test]
-fn laptop_detach_discards_listing_and_reconnect_accepts_only_the_same_identity() {
+fn laptop_detach_discards_listing_and_reconnect_accepts_the_same_laptop() {
     let mut pane = offline(local(LEFT), local(RIGHT));
     assert!(pane.set_laptop(Side::Left, laptop("~"), 7));
     let request = pane.laptop_requests()[0].2;
@@ -1075,15 +1075,22 @@ fn laptop_detach_discards_listing_and_reconnect_accepts_only_the_same_identity()
     assert!(pane.visible_text().contains("travel is not attached"));
     pane.laptop_result(7, Side::Left, request, Ok(("~".into(), vec![file("late.txt", 42)])));
     assert!(pane.panel(Side::Left).entries.is_empty());
-    pane.reconnect_laptop("different", 9);
-    assert!(pane.laptop_requests().is_empty());
-    pane.reconnect_laptop("abc123", 10);
+    pane.reconnect_laptop("different", "elsewhere", 9);
+    assert!(pane.laptop_requests().is_empty(), "another laptop is not given the panel");
+    pane.reconnect_laptop("abc123", "travel", 10);
     let requests = pane.laptop_requests();
     assert_eq!(requests.len(), 1);
     assert_eq!(requests[0].0, 10);
     assert_ne!(requests[0].2, request);
     pane.laptop_result(10, Side::Left, requests[0].2, Ok(("~".into(), vec![file("new.txt", 42)])));
     assert_eq!(pane.panel(Side::Left).entries[0].name, "new.txt");
+    pane.reconnect_laptop("second-attach", "travel", 11);
+    assert!(pane.laptop_requests().is_empty(), "an attached laptop keeps its panel");
+    pane.forget_viewer(10);
+    pane.reconnect_laptop("second-attach", "travel", 11);
+    let requests = pane.laptop_requests();
+    assert_eq!((requests.len(), requests[0].0), (1, 11), "a new attach of the same laptop lists it again");
+    assert!(matches!(pane.location(Side::Left), Location::Laptop { owner_id, .. } if owner_id == "second-attach"));
 }
 
 #[test]
@@ -1101,7 +1108,7 @@ fn laptop_chunks_publish_only_complete_current_listings_and_discard_aborted_byte
     assert_eq!(pane.location(Side::Left).display(), "travel:~");
     pane.forget_viewer(7);
     assert!(pane.panel(Side::Left).laptop_bytes.is_empty());
-    pane.reconnect_laptop("abc123", 9);
+    pane.reconnect_laptop("abc123", "travel", 9);
     let current = pane.laptop_requests()[0].2;
     pane.laptop_chunk(7, Side::Left, request, bytes[10..].to_vec(), true);
     assert!(pane.panel(Side::Left).laptop_bytes.is_empty());
@@ -1109,14 +1116,14 @@ fn laptop_chunks_publish_only_complete_current_listings_and_discard_aborted_byte
     pane.laptop_result(9, Side::Left, current, Err("stalled".into()));
     assert!(pane.panel(Side::Left).laptop_bytes.is_empty());
     assert!(pane.panel(Side::Left).entries.is_empty());
-    pane.reconnect_laptop("abc123", 9);
+    pane.reconnect_laptop("abc123", "travel", 9);
     let current = pane.laptop_requests()[0].2;
     pane.laptop_chunk(9, Side::Left, current, bytes[..10].to_vec(), false);
     pane.laptop_chunk(9, Side::Left, current, bytes[10..].to_vec(), true);
     assert_eq!(pane.panel(Side::Left).entries[0].name, "complete.txt");
     assert_eq!(pane.location(Side::Left).display(), "travel:~/private");
     assert!(pane.panel(Side::Left).laptop_bytes.is_empty());
-    pane.reconnect_laptop("abc123", 9);
+    pane.reconnect_laptop("abc123", "travel", 9);
     let current = pane.laptop_requests()[0].2;
     pane.laptop_chunk(9, Side::Left, current, vec![0; crate::protocol::LAPTOP_CHUNK + 1], true);
     assert_eq!(pane.panel(Side::Left).error.as_deref(), Some("Laptop listing is too large"));
