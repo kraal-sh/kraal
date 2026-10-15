@@ -139,12 +139,7 @@ impl Server {
             _ => Vec::new(),
         };
         if places.iter().any(|l| matches!(l, Location::Laptop { .. })) {
-            self.toast(
-                client,
-                NoticeKind::Error,
-                "Laptop copy, move and delete: not yet available. Open files on the laptop",
-            );
-            return Mode::Normal;
+            return self.laptop_files_action(client, action);
         }
         if places.iter().any(|l| l.exact_display().is_none()) {
             self.toast(
@@ -449,11 +444,21 @@ impl Server {
 
     /// Run `kraal <args>` in a floating pane that closes itself a few seconds after success.
     pub(super) fn start_job(&mut self, client: ClientId, label: &str, args: Vec<String>) {
-        let Some(ws) = self.clients.get(&client).map(|c| c.workspace) else { return };
+        self.start_job_env(client, label, args, Vec::new());
+    }
+
+    pub(super) fn start_job_env(
+        &mut self,
+        client: ClientId,
+        label: &str,
+        args: Vec<String>,
+        env: Vec<(String, String)>,
+    ) -> Option<PaneId> {
+        let ws = self.clients.get(&client)?.workspace;
         let exe = std::env::current_exe().map(|p| p.display().to_string()).unwrap_or_else(|_| "kraal".into());
         let mut command = vec![exe];
         command.extend(args);
-        let spec = PaneSpec { command, close_on_success: true, ..Default::default() };
+        let spec = PaneSpec { command, env, close_on_success: true, ..Default::default() };
         let previous = self.client_focus(client);
         match self.spawn_pane_in(ws, None, spec, Placement::Floating, Some(format!("⇅ {label}"))) {
             Ok(id) => {
@@ -470,8 +475,12 @@ impl Server {
                     }
                 }
                 self.relayout();
+                Some(id)
             }
-            Err(e) => self.toast(client, NoticeKind::Error, format!("{e:#}")),
+            Err(e) => {
+                self.toast(client, NoticeKind::Error, format!("{e:#}"));
+                None
+            }
         }
     }
 }

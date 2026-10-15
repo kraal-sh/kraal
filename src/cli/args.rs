@@ -284,6 +284,8 @@ pub enum Cmd {
         #[arg(long)]
         force: bool,
     },
+    #[command(hide = true)]
+    LaptopCp,
     /// Copy files between this machine and servers, or between servers:
     /// `kraal cp report.pdf db:/tmp/`, `kraal cp db:/var/log/app.log .`, `kraal cp a:/data b:/backup`.
     Cp {
@@ -834,5 +836,24 @@ mod tests {
         }
         let not_text: OsString = std::os::unix::ffi::OsStringExt::from_vec(vec![0xff]);
         assert!(Cli::plain(&[OsString::from("attach"), not_text]).is_none());
+    }
+    #[test]
+    fn laptop_copy_helper_is_hidden_and_installs_literal_approved_names() {
+        use clap::CommandFactory;
+        assert!(Cli::command().find_subcommand("laptop-cp").unwrap().is_hide_set());
+        assert!(matches!(Cli::try_parse_from(["kraal", "laptop-cp"]).unwrap().command, Some(Cmd::LaptopCp)));
+        assert!(Cli::try_parse_from(["kraal", "laptop-cp", "~/secret", "/destination"]).is_err());
+        let spec = crate::laptop::copy::Spec {
+            sources: vec!["~/-file with 'quotes'".into()],
+            destination: "/destination".into(),
+            allow: vec!["-file with 'quotes'".into()],
+        };
+        for rsync in [true, false] {
+            let args = crate::laptop::copy::install_args(&spec, std::path::Path::new("/private/spool"), rsync);
+            let parsed = Cli::try_parse_from(std::iter::once("kraal".to_string()).chain(args)).unwrap();
+            assert!(
+                matches!(parsed.command, Some(Cmd::Cp { move_, no_replace: true, allow, expect, .. }) if move_ == rsync && allow == spec.allow && expect.is_empty())
+            );
+        }
     }
 }

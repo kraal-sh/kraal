@@ -110,7 +110,9 @@ impl Server {
             }
         };
         match msg {
+            ClientMsg::LaptopCopy { token, message } => self.laptop_copy_message(id, token, message),
             ClientMsg::Attach { version, cols, rows, workspace, remote, laptop, pane, installed } => {
+                self.cancel_laptop_client(id);
                 if version != protocol::PROTOCOL_VERSION {
                     self.send_msg(id, &ServerMsg::exit(self.version_mismatch(version)));
                     self.clients.remove(&id);
@@ -227,7 +229,7 @@ impl Server {
 
     /// What a client of another protocol generation is told. `kraal restart` and `kraal kill`
     /// stop a server of any version.
-    fn version_mismatch(&self, version: u32) -> String {
+    pub(super) fn version_mismatch(&self, version: u32) -> String {
         protocol::version_mismatch(version, protocol::PROTOCOL_VERSION, protocol::KRAAL_VERSION, &self.session, None)
     }
 
@@ -307,6 +309,7 @@ impl Server {
     }
 
     pub(super) fn drop_client(&mut self, id: ClientId) {
+        self.cancel_laptop_client(id);
         self.clients.remove(&id);
         // A `kraal wait` or `kraal events` whose caller went away is dropped with it.
         self.waits.retain(|w| w.client != id);

@@ -1131,8 +1131,12 @@ fn laptop_actions_are_explicitly_refused_and_only_one_panel_can_use_it() {
     assert!(!pane.set_laptop(Side::Right, laptop("~"), 7));
     let request = pane.laptop_requests()[0].2;
     pane.laptop_result(7, Side::Left, request, Ok(("~".into(), vec![file("note.txt", 42)])));
-    for key in [FileKey::Char('c'), FileKey::Char('m'), FileKey::Char('d'), FileKey::F(5), FileKey::F(6), FileKey::F(8)]
-    {
+    for key in [FileKey::Char('c'), FileKey::F(5)] {
+        assert!(
+            matches!(pane.key(key), FilesAction::Copy { sources, dest: Location::Local(_), .. } if sources == vec![laptop("~/note.txt")])
+        );
+    }
+    for key in [FileKey::Char('m'), FileKey::Char('d'), FileKey::F(6), FileKey::F(8)] {
         assert!(matches!(pane.key(key), FilesAction::Refused(why) if why.contains("not yet")));
     }
     for key in [FileKey::Char('e'), FileKey::Char('s'), FileKey::Enter, FileKey::F(3)] {

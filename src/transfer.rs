@@ -699,7 +699,8 @@ fn plan_group(
                 steps.push(Step::new("mkdir", vec!["-p".into(), "--".into(), local_operand(d)]));
             }
             // Links are copied as links, never followed.
-            let mut args = vec!["-RP".to_string(), "--".to_string()];
+            // Preserve metadata like rsync -a and report each item during local installation.
+            let mut args = vec!["-RpvP".to_string(), "--".to_string()];
             args.extend(local_paths());
             args.push(local_operand(d));
             steps.push(Step::new("cp", args));

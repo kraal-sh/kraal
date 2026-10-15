@@ -29,7 +29,7 @@ pub fn main() {
     let cli = Cli::read();
     // Plain CLI commands should die quietly when piped into `head`; the server and the attached
     // client handle broken sockets themselves.
-    if !matches!(cli.command, None | Some(Cmd::Attach { .. }) | Some(Cmd::Server)) {
+    if !matches!(cli.command, None | Some(Cmd::Attach { .. }) | Some(Cmd::Server) | Some(Cmd::LaptopCp)) {
         // SAFETY: setting a signal disposition before any thread starts.
         unsafe {
             libc::signal(libc::SIGPIPE, libc::SIG_DFL);
@@ -141,6 +141,7 @@ fn run(cli: Cli) -> Result<()> {
         Some(Cmd::Buffer { action }) => buffers::run(&s, action),
         Some(Cmd::Events { types, list, since, boot }) => panes::events(&s, types, list, since, boot),
         Some(Cmd::Runbook { action }) => runbooks::run(action, &s.socket(), s.own_pane()),
+        Some(Cmd::LaptopCp) => crate::laptop::copy::run(&s.socket(), &s.name),
         Some(Cmd::Cp { paths, dry_run, move_, no_replace, allow, expect }) => {
             remote::copy(&paths, dry_run, move_, no_replace.then_some(allow.as_slice()), &expect)
         }

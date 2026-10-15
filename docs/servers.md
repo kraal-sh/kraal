@@ -143,7 +143,7 @@ reconnections. **Always** remembers the SSH destination and arguments in
 The default scope is your home directory without hidden top-level entries such as `.ssh` and
 `.config`, and without `~/Library` on macOS. Hidden files deeper inside it follow `.`.
 The laptop's [configuration](configuration.md#laptop-files) can allow all directories or turn
-listing off. Symbolic links are shown but never followed, including links within the scope;
+laptop files off. Symbolic links are shown but never followed, including links within the scope;
 special files are omitted. Listings are limited to 16 MiB and 100,000 entries.
 
 Only the client that chose the laptop sees its listing. Other clients and `kraal read` see
@@ -152,10 +152,34 @@ path. Saving keeps that panel as the session machine's `~`, so restoring never d
 laptop. Disconnecting clears the listing; an automatic reconnect lists it again. A new attach
 has a new identity and sees **is not attached** until a machine is chosen with `o`.
 
-Laptop browsing is available in one panel at a time. Copy, move and delete involving it say
-**not yet available**. Editing, previews and shells are unavailable there. Open those on the
-laptop, or run `kraal cp` on the laptop to transfer files. There is no laptop path syntax in
-`kraal files`, `kraal cp` or control requests.
+Laptop browsing is available in one panel at a time. To copy from it, select files or
+folders, choose a destination on the session's machine in the other panel, and press `c`
+or `F5`. The local permission covers listing and copying from the laptop. Existing names
+are confirmed before copying; a name taken after that is never silently replaced.
+
+The usual transfer window shows the announced total and received bytes. Closing that window
+cancels. Chunks are 64 KiB with acknowledgements and at most 256 KiB in flight; 30 seconds
+without transfer progress fails the copy. A lost connection also fails it, without resuming.
+Reconnect and copy again. The laptop originals stay untouched, even if installation fails.
+
+The receiving job checks the announced total against free space in its private spool and the
+destination before accepting contents. There is no per-file size limit; recursive copies
+visit at most 100,000 entries. A selected folder includes its nested hidden files. Symbolic
+links are copied as links only when their targets resolve inside the allowed scope; FIFOs
+and devices are skipped. File modes (without setuid or setgid) and modification times are
+preserved, but owners, extended attributes and ACLs are not.
+
+The job receives into a private spool under `~/.local/state/kraal/laptop-v1/` (under
+`$XDG_STATE_HOME/kraal` when set), then uses the existing local move and no-replace copy
+handling to install it. The spool is removed when the job ends; abandoned spools are removed
+on session startup. If an installation race leaves files in staging, the failed transfer
+window names that staging directory. Check that message and the destination before retrying.
+The client shows a local notice for four seconds when the copy finishes or fails.
+
+Copying into the laptop, moving and deleting are **not yet available**. Copying between the
+laptop and an SSH server is unavailable: copy to the session's machine first, or run `kraal cp`
+on the laptop. Editing, previews and shells are unavailable on the laptop panel. There is no
+laptop path syntax in `kraal files`, `kraal cp` or ordinary control requests.
 
 In a local session, pasted paths stay unchanged, including in an SSH pane. Use **Upload to
 this pane's server** in the command palette or `kraal cp` to send files there.
@@ -261,7 +285,8 @@ remote session opens it on your machine. A `localhost` address there is
 the server's, not yours: kraal keeps it in paste buffers, sends a copy to your terminal, and
 says where the address works instead of opening the wrong page.
 
-To browse this laptop, open the [file manager](#the-file-manager) and choose it with `o`.
+To browse this laptop or copy its files to the session machine, open the
+[file manager](#the-file-manager) and choose it with `o`.
 Its local consent is separate from attachment and clipboard permissions.
 
 To send laptop files through this connection, choose **Attach files** in the command palette.

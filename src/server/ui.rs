@@ -150,6 +150,10 @@ pub enum ConfirmAction {
     Restart,
     /// Stop the session, its layout saved.
     Quit,
+    LaptopCopy {
+        owner: String,
+        spec: crate::laptop::copy::Spec,
+    },
     /// Run `kraal <args>` in a job pane.
     Job {
         label: String,
@@ -227,6 +231,7 @@ impl ConfirmAction {
             ConfirmAction::Restart => "Restart".into(),
             ConfirmAction::AttachFiles(_) | ConfirmAction::AttachClipboardImage(_) => "Attach".into(),
             ConfirmAction::PurgeAttachments => "Purge".into(),
+            ConfirmAction::LaptopCopy { .. } => "Copy and replace".into(),
             ConfirmAction::Quit => "Quit".into(),
             ConfirmAction::Job { label, .. } | ConfirmAction::GitJob { label, .. } => {
                 let mut l = label.clone();
@@ -256,8 +261,10 @@ impl ConfirmAction {
 
     /// Production is involved, or the action destroys something.
     pub fn danger(&self, message: &str) -> bool {
-        matches!(self, ConfirmAction::Production { .. } | ConfirmAction::RemoveWorktrees(_))
-            || matches!(self, ConfirmAction::Job { label, .. } if label == "delete" || label.contains("replace"))
+        matches!(
+            self,
+            ConfirmAction::Production { .. } | ConfirmAction::RemoveWorktrees(_) | ConfirmAction::LaptopCopy { .. }
+        ) || matches!(self, ConfirmAction::Job { label, .. } if label == "delete" || label.contains("replace"))
             || message.contains("PRODUCTION")
             || message.contains(" is production (")
     }

@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::agent::AgentState;
 
-pub const PROTOCOL_VERSION: u32 = 4;
+pub const PROTOCOL_VERSION: u32 = 5;
 pub const KRAAL_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Both released migration sources used protocol 2 and omitted it from Pong.
@@ -148,6 +148,10 @@ pub fn read_frame(r: &mut impl Read) -> io::Result<Option<(u8, Vec<u8>)>> {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ClientMsg {
+    LaptopCopy {
+        token: String,
+        message: crate::laptop::copy::FromClient,
+    },
     /// Start an interactive session; raw input frames follow.
     Attach {
         version: u32,
@@ -255,6 +259,10 @@ impl ClientMsg {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServerMsg {
+    LaptopCopy {
+        token: String,
+        message: crate::laptop::copy::ToClient,
+    },
     LaptopListAck {
         pane: crate::layout::PaneId,
         side: crate::files::Side,
@@ -1097,6 +1105,63 @@ mod tests {
             ServerMsg::Event { event: serde_json::json!({"v": 1, "type": "pane.opened"}) },
             ServerMsg::Events { events: vec![serde_json::json!({"v": 1, "type": "pane.closed"})] },
         ]);
+        use crate::laptop::copy::{Entry, FromClient, Kind, Packet, Spec, ToClient};
+        client.extend([
+            ClientMsg::LaptopCopy { token: s("abc"), message: FromClient::Open { version: PROTOCOL_VERSION } },
+            ClientMsg::LaptopCopy { token: s("abc"), message: FromClient::Ack(3) },
+            ClientMsg::LaptopCopy { token: s("abc"), message: FromClient::Finish(Ok(())) },
+            ClientMsg::LaptopCopy { token: s("abc"), message: FromClient::Finish(Err(s("cancelled"))) },
+        ]);
+        server.extend([
+            ServerMsg::LaptopCopy {
+                token: s("abc"),
+                message: ToClient::Ready(Spec {
+                    sources: vec![s("~/report")],
+                    destination: p("/destination"),
+                    allow: vec![s("report")],
+                }),
+            },
+            ServerMsg::LaptopCopy { token: s("abc"), message: ToClient::Start { sources: vec![s("~/report")] } },
+            ServerMsg::LaptopCopy { token: s("abc"), message: ToClient::Ack(3) },
+            ServerMsg::LaptopCopy { token: s("abc"), message: ToClient::Finish(Ok(())) },
+            ServerMsg::LaptopCopy { token: s("abc"), message: ToClient::Finish(Err(s("connection lost"))) },
+        ]);
+        for packet in [
+            Packet::Begin { bytes: u64::MAX, entries: 100_000 },
+            Packet::Entry(Entry {
+                path: s("folder/report"),
+                kind: Kind::File,
+                size: 3,
+                mode: 0o644,
+                seconds: -1,
+                nanos: 123,
+            }),
+            Packet::Entry(Entry {
+                path: s("folder"),
+                kind: Kind::Directory,
+                size: 0,
+                mode: 0o755,
+                seconds: 0,
+                nanos: 0,
+            }),
+            Packet::Entry(Entry {
+                path: s("link"),
+                kind: Kind::Link(s("folder/report")),
+                size: 0,
+                mode: 0o777,
+                seconds: 0,
+                nanos: 0,
+            }),
+            Packet::Chunk(s("YWJj")),
+            Packet::End,
+            Packet::Done,
+        ] {
+            client.push(ClientMsg::LaptopCopy {
+                token: s("abc"),
+                message: FromClient::Data { sequence: 1, packet: packet.clone() },
+            });
+            server.push(ServerMsg::LaptopCopy { token: s("abc"), message: ToClient::Data { sequence: 1, packet } });
+        }
         (client, server)
     }
 

@@ -23,6 +23,7 @@ mod geometry;
 mod graphics;
 mod hints;
 mod input;
+mod laptop;
 pub mod net;
 #[cfg(test)]
 mod output_tests;
@@ -593,6 +594,7 @@ pub struct Server {
     pub hint_patterns: crate::hints::Custom,
     /// `kraal events` clients.
     subscribers: Vec<events::Subscriber>,
+    laptop_copies: HashMap<String, laptop::Copy>,
     events: events::EventLog,
     /// Panes `pane.opened` was said for.
     announced: std::collections::HashSet<PaneId>,
@@ -788,6 +790,9 @@ pub fn run(session: &str) -> Result<()> {
     let own_socket = paths::file_id(&socket);
     let (config, mut warnings) =
         Config::load_with_warnings().unwrap_or_else(|e| (Config::default(), vec![format!("config: {e:#}")]));
+    if let Err(e) = crate::laptop::copy::cleanup(session) {
+        warnings.push(format!("laptop copy cleanup: {e:#}"));
+    }
     if let Err(e) = crate::attachments::cleanup(session) {
         warnings.push(format!("attachment cleanup: {e:#}"));
     }
@@ -954,6 +959,7 @@ pub fn run(session: &str) -> Result<()> {
         tf_dirs: Default::default(),
         hint_patterns,
         subscribers: Vec::new(),
+        laptop_copies: HashMap::new(),
         events: Default::default(),
         announced: Default::default(),
         hooks: events::Hooks::new(hook_list),
@@ -1517,6 +1523,7 @@ impl Server {
 
     /// Periodic work: agent detection, preview reloads, persistence.
     fn tick(&mut self, now: Instant) {
+        self.expire_laptop_copies(now);
         // Contexts first: their reads run on threads of their own meanwhile, and are mostly
         // done when the tick ends (their answers then wake nothing).
         let scan = due(now, self.last_scan, SCAN_EVERY);
@@ -2243,6 +2250,7 @@ mod tests {
             tf_dirs: Default::default(),
             hint_patterns,
             subscribers: Vec::new(),
+            laptop_copies: HashMap::new(),
             events: Default::default(),
             announced: Default::default(),
             hooks: events::Hooks::new(Vec::new()),
