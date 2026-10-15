@@ -30,6 +30,37 @@ fn conversations_move(agent: &str) -> bool {
     crate::agent_registry::find(agent).is_some_and(|a| a.cross_account_resume)
 }
 
+#[derive(Clone, PartialEq, Eq)]
+struct ConversationCheck {
+    from: Account,
+    to: Account,
+    session: Option<String>,
+    undo: bool,
+    undo_session: Option<String>,
+}
+
+impl ConversationCheck {
+    fn verify(&self) -> Result<()> {
+        if conversations_move(&self.from.agent) {
+            let id = self.session.as_deref().context("could not verify the Claude conversation id")?;
+            accounts::check_carry(&self.from, &self.to, id)?;
+        } else {
+            if let Some(id) = self.session.as_deref() {
+                accounts::check_resume(&self.from, id)?;
+            } else {
+                anyhow::ensure!(self.undo, "conversation id is unavailable; finish a turn and try again");
+            }
+            if self.undo {
+                accounts::check_resume(
+                    &self.to,
+                    self.undo_session.as_deref().context("the original conversation id is unavailable")?,
+                )?;
+            }
+        }
+        Ok(())
+    }
+}
+
 enum StartProgress {
     Pending,
     Started,
@@ -54,11 +85,17 @@ impl AccountSwitches {
         self.pending.retain(|&pane, _| exists(pane));
     }
 
+    pub(in crate::server) fn blocks_restart(&self, pane: PaneId) -> bool {
+        self.get(&pane).is_some_and(|s| matches!(s.stage, SwitchStage::Transferring | SwitchStage::RecoveryChecking))
+    }
+
     pub(in crate::server) fn busy(&self) -> bool {
         self.pending.values().any(|s| {
             matches!(
                 s.stage,
                 SwitchStage::Stopping
+                    | SwitchStage::Transferring
+                    | SwitchStage::RecoveryChecking
                     | SwitchStage::Starting
                     | SwitchStage::Restoring
                     | SwitchStage::Recovering
@@ -114,7 +151,11 @@ impl AccountSwitches {
 
     fn cancel(&mut self, pane: PaneId, token: u32) -> bool {
         if self.pending.get(&pane).is_some_and(|s| {
-            s.token == token && matches!(s.stage, SwitchStage::Checking | SwitchStage::Waiting | SwitchStage::Confirm)
+            s.token == token
+                && matches!(
+                    s.stage,
+                    SwitchStage::Checking | SwitchStage::Verifying | SwitchStage::Waiting | SwitchStage::Confirm
+                )
         }) {
             self.pending.remove(&pane);
             true
@@ -166,10 +207,8 @@ impl AccountSwitches {
         self.pending.get_mut(&pane).unwrap().stage = SwitchStage::Starting;
     }
 
-    fn restore(&mut self, pane: PaneId) -> Option<PaneSpec> {
-        let switch = self.pending.get_mut(&pane)?;
-        switch.stage = SwitchStage::Restoring;
-        Some(switch.original.clone())
+    fn restore(&mut self, pane: PaneId) {
+        self.pending.get_mut(&pane).unwrap().stage = SwitchStage::Restoring;
     }
 }
 
@@ -321,7 +360,7 @@ impl Server {
         }
     }
 
-    pub(super) fn prepare_switch(&mut self, pane: PaneId, approved: bool) -> Result<()> {
+    fn switch_conversation(&self, pane: PaneId) -> Result<ConversationCheck> {
         let switch = self.switches.get(&pane).context("no pending account change")?;
         let p = self.panes.get(&pane).context("the pane was closed")?;
         let same_process = match (&switch.process, p.process_hold()) {
@@ -346,6 +385,10 @@ impl Server {
             from.id == switch.from.id && from.same_home(&switch.from),
             "the pane's account changed; choose an account again"
         );
+        anyhow::ensure!(
+            self.switch_source_current(&switch.from),
+            "the source account changed; choose an account again"
+        );
         let to = self.accounts.by_id(&switch.to.id).context("the target account was removed")?;
         anyhow::ensure!(to.same_home(&switch.to), "the target account changed; choose an account again");
         if switch.client.is_none() {
@@ -361,25 +404,64 @@ impl Server {
         } else {
             p.agent.session_id.clone().or_else(|| switch.original.session.clone())
         };
-        if conversations_move(&from.agent) {
-            let id = session.as_deref().context("could not verify the Claude conversation id")?;
-            accounts::check_carry(&from, &to, id)?;
-        } else {
-            // A fresh Codex launch has no hook id until its first completed turn. Undo can
-            // already return to the saved conversation; any new transcript stays in this home.
-            if let Some(id) = session.as_deref() {
-                accounts::check_resume(&from, id)?;
-            } else {
-                anyhow::ensure!(switch.undo, "conversation id is unavailable; finish a turn and try again");
-            }
-            if switch.undo {
-                let saved = switch.original.account_undo.as_deref().context("no account change to undo")?;
-                accounts::check_resume(
-                    &to,
-                    saved.session.as_deref().context("the original conversation id is unavailable")?,
-                )?;
-            }
+        Ok(ConversationCheck {
+            from,
+            to,
+            session,
+            undo: switch.undo,
+            undo_session: switch.original.account_undo.as_ref().and_then(|s| s.session.clone()),
+        })
+    }
+
+    pub(super) fn prepare_switch(&mut self, pane: PaneId, approved: bool) -> Result<()> {
+        let check = self.switch_conversation(pane)?;
+        let token = self.switches.get(&pane).unwrap().token;
+        self.switches.pending.get_mut(&pane).unwrap().stage = SwitchStage::Verifying;
+        let work = check.clone();
+        anyhow::ensure!(
+            self.background(
+                move || work.verify(),
+                move |server, result| server.conversation_checked(pane, token, check, approved, result),
+            ),
+            "could not start the conversation check"
+        );
+        self.refresh_switch_views(pane);
+        self.mark_dirty();
+        Ok(())
+    }
+
+    fn conversation_checked(
+        &mut self,
+        pane: PaneId,
+        token: u32,
+        check: ConversationCheck,
+        approved: bool,
+        result: Result<()>,
+    ) {
+        if !self.switches.get(&pane).is_some_and(|s| s.token == token && s.stage == SwitchStage::Verifying) {
+            return;
         }
+        let result = result.and_then(|()| {
+            anyhow::ensure!(
+                self.switch_conversation(pane)? == check,
+                "the conversation or accounts changed; choose an account again"
+            );
+            self.prepare_verified_switch(pane, approved)
+        });
+        if let Err(e) = result {
+            self.switch_failed(pane, &format!("{e:#}. The current pane is unchanged."), false);
+        }
+    }
+
+    fn prepare_verified_switch(&mut self, pane: PaneId, approved: bool) -> Result<()> {
+        let switch = self.switches.get(&pane).context("no pending account change")?;
+        let p = self.panes.get(&pane).context("the pane was closed")?;
+        let to = switch.to.clone();
+        let session = if switch.observed.is_some() {
+            switch.original.session.clone()
+        } else {
+            p.agent.session_id.clone().or_else(|| switch.original.session.clone())
+        };
         let hooked = p.agent.hooked
             && switch.observed.as_ref().is_none_or(|a| p.agent.session_process == Some((a.pid, a.started)));
         let timing = switch_timing(hooked, p.agent.state, p.exit_code.is_some());
@@ -433,6 +515,9 @@ impl Server {
                 }
             }
             SwitchStage::Checking
+            | SwitchStage::Verifying
+            | SwitchStage::Transferring
+            | SwitchStage::RecoveryChecking
             | SwitchStage::Starting
             | SwitchStage::Restoring
             | SwitchStage::Recovering
@@ -472,6 +557,8 @@ impl Server {
         if matches!(
             switch.stage,
             SwitchStage::Stopping
+                | SwitchStage::Transferring
+                | SwitchStage::RecoveryChecking
                 | SwitchStage::Starting
                 | SwitchStage::Restoring
                 | SwitchStage::Recovering
@@ -502,7 +589,10 @@ impl Server {
         let detail = match switch.stage {
             SwitchStage::Waiting => "Switch after this turn",
             SwitchStage::Checking => "Checking sign-in",
+            SwitchStage::Verifying => "Checking conversation",
             SwitchStage::Stopping
+            | SwitchStage::Transferring
+            | SwitchStage::RecoveryChecking
             | SwitchStage::Confirm
             | SwitchStage::Starting
             | SwitchStage::Restoring
@@ -592,21 +682,71 @@ impl Server {
             return;
         }
         let Some(switch) = self.switches.get(&pane).filter(|s| s.stage == SwitchStage::Stopping) else { return };
-        let (from, to, session, original, undo) =
-            (switch.from.clone(), switch.to.clone(), switch.session.clone(), switch.original.clone(), switch.undo);
+        let (token, from, to, session) = (switch.token, switch.from.clone(), switch.to.clone(), switch.session.clone());
+        if let Err(e) = self.switch_accounts_current(pane) {
+            self.switch_start_failed(pane, &format!("{e:#}"));
+            return;
+        }
+        self.switches.pending.get_mut(&pane).unwrap().stage = SwitchStage::Transferring;
+        if !self.background(
+            move || session.as_deref().map(|id| accounts::carry_conversation(&from, &to, id)).transpose(),
+            move |server, result| server.conversation_carried(pane, token, result),
+        ) {
+            self.conversation_carried(pane, token, Err(anyhow::anyhow!("could not start the conversation transfer")));
+        }
+    }
+
+    fn switch_source_current(&self, from: &Account) -> bool {
+        self.accounts
+            .by_home(&from.agent, &crate::paths::expand_tilde(&from.home))
+            .is_some_and(|a| a.id == from.id && a.agent == from.agent)
+    }
+
+    fn switch_process_current(&self, pane: PaneId) -> bool {
+        let Some(switch) = self.switches.get(&pane) else { return false };
+        let Some(p) = self.panes.get(&pane) else { return false };
+        match (&switch.process, p.process_hold()) {
+            (Some(before), Some(now)) => before.is(&now),
+            (None, None) => true,
+            _ => false,
+        }
+    }
+
+    fn switch_accounts_current(&self, pane: PaneId) -> Result<()> {
+        let switch = self.switches.get(&pane).context("no pending account change")?;
+        anyhow::ensure!(self.panes.contains_key(&pane), "the pane was closed");
+        anyhow::ensure!(
+            self.switch_source_current(&switch.from),
+            "the source account changed during the account switch"
+        );
+        anyhow::ensure!(
+            self.accounts.by_id(&switch.to.id).is_some_and(|a| a.agent == switch.to.agent && a.same_home(&switch.to)),
+            "the target account changed during the account switch"
+        );
+        Ok(())
+    }
+
+    fn conversation_carried(&mut self, pane: PaneId, token: u32, result: Result<Option<bool>>) {
+        let Some(switch) =
+            self.switches.get(&pane).filter(|s| s.token == token && s.stage == SwitchStage::Transferring)
+        else {
+            return;
+        };
+        if !self.switch_process_current(pane) {
+            self.switches.finish(pane);
+            self.refresh_switch_views(pane);
+            return;
+        }
+        let (to, session, original, undo) =
+            (switch.to.clone(), switch.session.clone(), switch.original.clone(), switch.undo);
         let result = (|| -> Result<()> {
-            anyhow::ensure!(
-                self.accounts.by_id(&to.id).is_some_and(|a| a.same_home(&to)),
-                "the target account changed while the agent was stopping"
-            );
+            self.switch_accounts_current(pane)?;
+            let carried = result?;
             let kind = accounts::agent_kind(&to.agent).context("unknown agent")?;
             let resume = if undo && to.agent == "codex" {
                 original.account_undo.as_ref().and_then(|s| s.session.clone())
             } else {
-                match &session {
-                    Some(id) => accounts::carry_conversation(&from, &to, id)?.then(|| id.clone()),
-                    None => None,
-                }
+                session.filter(|_| carried == Some(true))
             };
             let source = if undo && to.agent == "codex" {
                 original.account_undo.as_deref().context("no account change to undo")?
@@ -640,6 +780,7 @@ impl Server {
             self.start_switch_spec(pane, spec)
         })();
         if let Err(e) = result {
+            self.notify(NoticeKind::Error, "Could not change account", &format!("{e:#}"), Some(pane));
             self.switch_start_failed(pane, &format!("{e:#}"));
         }
         self.refresh_switch_views(pane);
@@ -653,6 +794,7 @@ impl Server {
         p.respawn(&self.env, &self.tx)?;
         // A new Codex conversation must not inherit the source conversation's hook identity.
         p.agent.session_id = p.spec.session.clone();
+        self.switches.pending.get_mut(&pane).unwrap().process = p.process_hold();
         self.switches.spawned(pane);
         Ok(())
     }
@@ -676,30 +818,76 @@ impl Server {
             self.switch_recovery_failed(pane, reason);
             return;
         }
-        let original = self.switches.restore(pane).unwrap();
-        let (spec, exact) = self.resume_spec(&original, original.session.as_deref());
-        if !exact {
-            self.switch_recovery_failed(pane, "the previous command needs review before it can run again");
-            return;
-        }
-        if let Err(e) = self.start_switch_spec(pane, spec) {
-            self.switch_recovery_failed(pane, &format!("{e:#}"));
-        }
-        self.mark_persist();
-        self.relayout();
+        self.check_switch_recovery(pane, reason, true);
     }
 
     fn switch_recovery_failed(&mut self, pane: PaneId, reason: &str) {
-        let Some(switch) = self.switches.finish(pane) else { return };
-        let saved = switch.original.session.as_deref().is_some_and(|s| accounts::check_resume(&switch.from, s).is_ok());
+        self.check_switch_recovery(pane, reason, false);
+    }
+
+    fn check_switch_recovery(&mut self, pane: PaneId, reason: &str, retry: bool) {
+        let Some(switch) = self.switches.pending.get_mut(&pane) else { return };
+        switch.stage = SwitchStage::RecoveryChecking;
+        // Recovery can follow a failed destination or source launch, so reserve that process.
+        switch.process = self.panes.get(&pane).and_then(|p| p.process_hold());
+        let (token, from, original) = (switch.token, switch.from.clone(), switch.original.clone());
+        let accounts = self.accounts.clone();
+        let reason = reason.to_string();
+        let failure = reason.clone();
+        let fallback = original.clone();
+        #[cfg(test)]
+        let pending = RECOVERY_LOOKUP.with(|gate| gate.borrow_mut().take());
+        if !self.background(
+            move || {
+                #[cfg(test)]
+                if let Some(pending) = pending {
+                    pending.recv().unwrap();
+                }
+                let (spec, exact) = super::launch::resume_spec(&accounts, &original, original.session.as_deref());
+                let saved = original.session.as_deref().is_some_and(|s| accounts::check_resume(&from, s).is_ok());
+                (spec, exact, saved)
+            },
+            move |server, result| server.switch_recovery_checked(pane, token, &reason, retry, result),
+        ) {
+            self.switch_recovery_checked(pane, token, &failure, false, (fallback, false, false));
+        }
+    }
+
+    fn switch_recovery_checked(
+        &mut self,
+        pane: PaneId,
+        token: u32,
+        reason: &str,
+        retry: bool,
+        (spec, exact, saved): (PaneSpec, bool, bool),
+    ) {
+        if !self.switches.get(&pane).is_some_and(|s| s.token == token && s.stage == SwitchStage::RecoveryChecking) {
+            return;
+        }
+        if !self.switch_process_current(pane) {
+            self.switches.finish(pane);
+            self.refresh_switch_views(pane);
+            return;
+        }
+        let current = self.switch_source_current(&self.switches.get(&pane).unwrap().from);
+        if retry && exact && current {
+            self.switches.restore(pane);
+            if let Err(e) = self.start_switch_spec(pane, spec) {
+                self.switch_recovery_failed(pane, &format!("{e:#}"));
+            }
+            self.mark_persist();
+            self.relayout();
+            return;
+        }
+        let saved = saved && current;
+        let switch = self.switches.finish(pane).unwrap();
         let message = if saved {
             "Couldn't resume. Your conversation is saved. Enter retries on the previous account."
         } else {
             "Couldn't resume. The previous command and pane output are available. Enter retries."
         };
-        let (spec, _) = self.resume_spec(&switch.original, switch.original.session.as_deref());
         if let Some(p) = self.panes.get_mut(&pane) {
-            p.spec = spec;
+            p.spec = if current { spec } else { switch.original };
             p.agent = crate::agent::AgentTracker { session_id: p.spec.session.clone(), ..Default::default() };
             p.exit_code = Some(None);
         }
@@ -740,6 +928,11 @@ impl Server {
 }
 
 #[cfg(test)]
+thread_local! {
+    pub(super) static RECOVERY_LOOKUP: std::cell::RefCell<Option<std::sync::mpsc::Receiver<()>>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -766,6 +959,9 @@ mod tests {
         let mut switches = AccountSwitches::default();
         for stage in [
             SwitchStage::Checking,
+            SwitchStage::Verifying,
+            SwitchStage::Transferring,
+            SwitchStage::RecoveryChecking,
             SwitchStage::Waiting,
             SwitchStage::Confirm,
             SwitchStage::Stopping,
@@ -779,7 +975,10 @@ mod tests {
             assert!(!switches.confirm(1, 6, 99));
             assert!(switches.checked(1, 6).is_none());
             assert_eq!(switches.checked(1, 7).is_some(), stage == SwitchStage::Checking);
-            let cancellable = matches!(stage, SwitchStage::Checking | SwitchStage::Waiting | SwitchStage::Confirm);
+            let cancellable = matches!(
+                stage,
+                SwitchStage::Checking | SwitchStage::Verifying | SwitchStage::Waiting | SwitchStage::Confirm
+            );
             assert_eq!(switches.cancel(1, 7), cancellable);
             assert_eq!(switches.contains(1), !cancellable);
             assert_eq!(switches.finish(1).is_some(), !cancellable);

@@ -43,9 +43,12 @@ pub enum LimitAlert {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum SwitchStage {
     Checking,
+    Verifying,
     Waiting,
     Confirm,
     Stopping,
+    Transferring,
+    RecoveryChecking,
     Starting,
     Restoring,
     Recovering,
