@@ -2,12 +2,13 @@ use std::collections::HashMap;
 
 use crossbeam_channel::{Receiver, Sender};
 
+use super::requests::ReplyHandle;
 use super::{Event, EventSender, Server};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct JobId(pub(super) u32);
 
-type Continuation = Box<dyn FnOnce(&mut Server)>;
+type Continuation = Box<dyn FnOnce(&mut Server, Result<(), String>)>;
 
 #[derive(Default)]
 pub(super) struct Jobs {
@@ -40,8 +41,10 @@ impl Jobs {
     ) {
         self.pending.insert(
             id,
-            Box::new(move |server| {
-                if let Ok(value) = rx.try_recv() {
+            Box::new(move |server, result| {
+                if result.is_ok()
+                    && let Ok(value) = rx.try_recv()
+                {
                     then(server, value);
                 }
             }),
@@ -109,8 +112,8 @@ impl Server {
         true
     }
 
-    /// Keep ownership with the caller if the worker cannot start.
-    pub(super) fn background_owned<T: Send + 'static, S: 'static>(
+    /// Keep the reply with the caller if the worker cannot start; answer it if the worker panics.
+    pub(super) fn background_owned<T: Send + 'static, S: Into<Option<ReplyHandle>> + 'static>(
         &mut self,
         state: S,
         work: impl FnOnce() -> T + Send + 'static,
@@ -122,7 +125,21 @@ impl Server {
             self.warnings.push(format!("cannot start a background job: {e}"));
             return Err(state);
         }
-        self.jobs.insert(id, rx, move |server, result| then(server, state, result));
+        self.jobs.pending.insert(
+            id,
+            Box::new(move |server, result| match result {
+                Ok(()) => {
+                    if let Ok(value) = rx.try_recv() {
+                        then(server, state, value);
+                    }
+                }
+                Err(why) => {
+                    if let Some(reply) = state.into() {
+                        reply.complete(server, Err(why));
+                    }
+                }
+            }),
+        );
         Ok(())
     }
 }
@@ -180,20 +197,69 @@ mod tests {
     }
 
     #[test]
-    fn a_panicking_owned_worker_drops_its_reply_without_answering() {
-        use crate::server::requests::{ReplyHandle, tests::finish_job};
+    fn a_panicking_owned_worker_answers_and_releases_its_request() {
+        use crate::server::requests::tests::{finish_job, response};
+        for disconnected in [false, true] {
+            for kind in 0..3 {
+                let (tx, rx) = queue::channel(32);
+                let mut server = server(tx);
+                let (id, _peer) = crate::server::tests::client(&mut server);
+                let receive = server.clients.get_mut(&id).unwrap().out.capture();
+                assert!(
+                    server
+                        .background_owned(
+                            ReplyHandle::new(id),
+                            move || match kind {
+                                0 => panic!("worker failed"),
+                                1 => std::panic::panic_any(String::from("owned failure")),
+                                _ => std::panic::panic_any(7),
+                            },
+                            |_, _, ()| panic!("not called"),
+                        )
+                        .is_ok()
+                );
+                if disconnected {
+                    server.drop_client(id);
+                }
+                finish_job(&mut server, &rx);
+                assert!(server.jobs.is_empty());
+                let text = ["worker failed", "owned failure", "it panicked"][kind];
+                let error = format!("a background job failed: {text}");
+                assert_eq!(server.warnings, std::slice::from_ref(&error));
+                if !disconnected {
+                    assert!(!receive.is_empty());
+                    assert_eq!(response(&receive).unwrap_err(), error);
+                }
+                assert!(!server.clients.contains_key(&id));
+                assert!(matches!(receive.try_recv(), Err(crossbeam_channel::TryRecvError::Disconnected)));
+            }
+        }
+    }
+
+    #[test]
+    fn a_panicking_worker_answers_an_optional_reply() {
+        use crate::server::requests::tests::{finish_job, response};
         let (tx, rx) = queue::channel(32);
         let mut server = server(tx);
         let (id, _peer) = crate::server::tests::client(&mut server);
         let receive = server.clients.get_mut(&id).unwrap().out.capture();
         assert!(
-            server.background_owned(ReplyHandle::new(id), || panic!("failed"), |_, _, ()| panic!("not called")).is_ok()
+            server
+                .background_owned(Some(ReplyHandle::new(id)), || panic!("failed"), |_, _, ()| panic!("not called"))
+                .is_ok()
         );
         finish_job(&mut server, &rx);
         assert!(server.jobs.is_empty());
         assert_eq!(server.warnings, ["a background job failed: failed"]);
-        assert!(receive.is_empty());
-        assert!(server.clients.contains_key(&id));
+        assert_eq!(response(&receive).unwrap_err(), "a background job failed: failed");
+        assert!(!server.clients.contains_key(&id));
+        assert!(matches!(receive.try_recv(), Err(crossbeam_channel::TryRecvError::Disconnected)));
+
+        assert!(server.background_owned(None, || panic!("no requester"), |_, _, ()| panic!("not called")).is_ok());
+        finish_job(&mut server, &rx);
+        assert!(server.jobs.is_empty());
+        assert!(server.clients.is_empty());
+        assert_eq!(server.warnings, ["a background job failed: failed", "a background job failed: no requester"]);
     }
 
     #[test]

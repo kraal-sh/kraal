@@ -45,7 +45,9 @@ it does not close the pane. The event stream likewise ends when its subscriber d
 
 Commands that prepare work in the background keep their request open until that operation
 answers: for example, a remote edit waits for its file and editor, and a runbook waits for
-its plan or for its recorded run to start. Disconnecting the command does not cancel those
+its plan or for its recorded run to start. If a helper worker cannot start or panics, the
+command receives an error and its request closes. This also applies to the Git lookup before
+opening a pane or an agent. Disconnecting the command does not cancel those
 operations. `kraal kill` answers after the final save attempt and reports a save failure.
 
 Commands require the same protocol version as the running session. After an update that changes
