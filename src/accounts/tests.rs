@@ -1,4 +1,12 @@
+use std::collections::HashMap;
+use std::path::Path;
+
+use anyhow::Result;
+
+use super::store::HEADER;
+use super::usage::usage_file;
 use super::*;
+use crate::paths;
 
 #[test]
 fn launch_command_preserves_arguments_and_environment_overrides() {
