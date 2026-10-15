@@ -11,6 +11,7 @@ use super::{FloatRect, Floating, Server, Tab};
 use crate::layout::{Axis, Node, PaneId};
 use crate::pane::PaneSpec;
 use crate::paths;
+use crate::workspace::catalog::{self, Entry, Kept, Source};
 use crate::workspace::{self, LayoutNode, PaneKind, SizeSpec, WorkspaceDef};
 
 pub struct DefinitionSave {
@@ -20,6 +21,56 @@ pub struct DefinitionSave {
 }
 
 impl Server {
+    pub(super) fn workspace_catalog<'a>(
+        &'a self,
+        sources: impl IntoIterator<Item = Source<'a>>,
+    ) -> Vec<Entry<'a, &'a super::Workspace>> {
+        catalog::entries(
+            self.workspaces.iter().map(|w| Kept {
+                workspace: w,
+                id: Some(&w.stable_id),
+                definition: w.definition.as_deref(),
+            }),
+            sources,
+            |path| matches!(self.definition_workspace(path), Ok(None)),
+        )
+    }
+
+    pub(super) fn cached_workspace_catalog(&self) -> Vec<Entry<'_, &super::Workspace>> {
+        self.workspace_catalog(self.def_files.iter().filter(|(path, _)| !self.source_removed(path)).map(Source::cached))
+    }
+
+    pub(super) fn workspace_activity(&self, ws: &super::Workspace) -> (usize, usize, usize) {
+        use crate::agent::AgentState;
+
+        let (mut working, mut blocked, mut done) = (0, 0, 0);
+        for pane in ws.panes() {
+            match self.panes.get(&pane).map(|p| p.agent.state) {
+                Some(AgentState::Working) => working += 1,
+                Some(AgentState::Blocked) => blocked += 1,
+                Some(AgentState::Done) => done += 1,
+                _ => {}
+            }
+        }
+        (working, blocked, done)
+    }
+
+    pub(super) fn workspace_info(&self, ws: &super::Workspace) -> crate::protocol::WorkspaceInfo {
+        let (working, blocked, done) = self.workspace_activity(ws);
+        let (tabs, pane_count) = ws.counts();
+        crate::protocol::WorkspaceInfo {
+            id: Some(ws.stable_id.clone()),
+            name: ws.name.clone(),
+            open: !ws.closed(),
+            definition: ws.definition.clone(),
+            tabs,
+            panes: pane_count,
+            working,
+            blocked,
+            done,
+        }
+    }
+
     pub(super) fn scan_definitions(&mut self) {
         self.last_def_scan = Instant::now();
         // Their changes are told, and those of accounts.toml and of the accounts' usage,
@@ -638,6 +689,42 @@ mod tests {
         let wi = server.ws_index(id).unwrap();
         server.workspaces[wi].definition_source = Some(source.into());
         wi
+    }
+
+    #[test]
+    fn catalog_keeps_live_counts_and_picker_actions_through_close_and_pending_operations() {
+        use crate::agent::AgentState;
+        use crate::server::ui::PickAction;
+
+        let mut server = server();
+        let def = workspace::parse_workspace(
+            "personal",
+            "layout { pane command=\"true\" start_suspended=true; pane command=\"true\" start_suspended=true; pane command=\"true\" start_suspended=true; }",
+        ).unwrap();
+        let ws = server.start_definition_inner(&def, None).unwrap();
+        for (pane, state) in
+            server.workspaces[0].panes().into_iter().zip([AgentState::Working, AgentState::Blocked, AgentState::Done])
+        {
+            server.panes.get_mut(&pane).unwrap().agent.state = state;
+        }
+        let info = server.workspace_info(&server.workspaces[0]);
+        assert_eq!((info.tabs, info.panes, info.working, info.blocked, info.done), (1, 3, 1, 1, 1));
+        assert!(info.open);
+        let picker = server.workspace_picker(ws);
+        assert_eq!(picker.items[0].detail, "Open · 1 tab · 3 panes · ▲1 ●1 ✓1 · Current");
+        assert_eq!(picker.items[0].state, Some(AgentState::Blocked));
+        assert!(matches!(picker.items[0].action, PickAction::SwitchWorkspace(id) if id == ws));
+        server.keep_and_close_workspace(ws).unwrap();
+        let info = server.workspace_info(&server.workspaces[0]);
+        assert_eq!((info.tabs, info.panes, info.working, info.blocked, info.done), (1, 3, 0, 0, 0));
+        assert!(!info.open);
+        assert!(matches!(server.workspace_picker(ws).items[0].action, PickAction::ReopenWorkspace(id) if id == ws));
+        server.workspaces[0].close_error = Some("disk full".into());
+        assert!(matches!(server.workspace_picker(ws).items[0].action, PickAction::RetryWorkspaceClose(id) if id == ws));
+        server.workspaces[0].delete_pending = true;
+        assert!(
+            matches!(server.workspace_picker(ws).items[0].action, PickAction::RetryWorkspaceDelete(id) if id == ws)
+        );
     }
 
     #[test]

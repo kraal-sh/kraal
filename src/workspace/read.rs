@@ -13,6 +13,8 @@ use super::model::{Axis, LayoutNode, PaneDef, PaneKind, SizeSpec, TabDef, Worksp
 /// resolved against the enclosing cwd (pane, then tab, then workspace) and a
 /// leading `~/` is expanded with `$HOME`; panes and tabs without a `cwd` inherit it.
 pub fn parse_workspace(name: &str, src: &str) -> Result<WorkspaceDef> {
+    #[cfg(test)]
+    WORKSPACE_PARSES.with(|n| n.set(n.get() + 1));
     let doc = parse_kdl(src)?;
     let mut parser = Parser { src, warnings: Vec::new() };
     let mut layout = None;
@@ -701,4 +703,9 @@ impl Parser<'_> {
         }
         out
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static WORKSPACE_PARSES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }

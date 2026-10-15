@@ -22,6 +22,7 @@ use crate::agent::AgentState;
 use crate::ansi::{Cursor, Kept};
 use crate::keymap::Action;
 use crate::layout::PaneId;
+use crate::workspace::catalog::Entry as WorkspaceEntry;
 
 fn th() -> crate::theme::Theme {
     crate::theme::current()
@@ -1320,36 +1321,39 @@ impl Server {
     fn strip_rows(&self, c: &Client, height: u16, theme: crate::theme::Theme) -> Vec<SideRow> {
         let mut workspaces = Vec::new();
         let mut agents = Vec::new();
-        for ws in &self.workspaces {
-            let states: Vec<_> = ws
-                .panes()
-                .into_iter()
-                .filter_map(|p| self.panes.get(&p).filter(|p| p.agent.kind.is_some()).map(|pane| (p, pane.agent.state)))
-                .collect();
-            workspaces.push(StripEntry {
-                item: SideItem::Workspace(ws.id),
-                state: states.iter().map(|(_, s)| *s).max_by_key(agent_urgency),
-                icon: if ws.closed() { AgentState::Idle } else { AgentState::Working },
-                selected: ws.id == c.workspace,
-            });
-            agents.extend(states.into_iter().map(|(p, state)| StripEntry {
-                item: SideItem::Pane(p),
-                state: Some(state),
-                icon: state,
-                selected: false,
-            }));
-        }
-        for (path, _) in self
-            .def_files
-            .iter()
-            .filter(|(p, _)| !self.source_removed(p) && matches!(self.definition_workspace(p), Ok(None)))
-        {
-            workspaces.push(StripEntry {
-                item: SideItem::Definition(path.clone()),
-                state: None,
-                icon: AgentState::Idle,
-                selected: false,
-            });
+        for entry in self.cached_workspace_catalog() {
+            match entry {
+                WorkspaceEntry::Kept(w) => {
+                    let ws = w.workspace;
+                    let states: Vec<_> = ws
+                        .panes()
+                        .into_iter()
+                        .filter_map(|p| {
+                            self.panes.get(&p).filter(|p| p.agent.kind.is_some()).map(|pane| (p, pane.agent.state))
+                        })
+                        .collect();
+                    workspaces.push(StripEntry {
+                        item: SideItem::Workspace(ws.id),
+                        state: states.iter().map(|(_, s)| *s).max_by_key(agent_urgency),
+                        icon: if ws.closed() { AgentState::Idle } else { AgentState::Working },
+                        selected: ws.id == c.workspace,
+                    });
+                    agents.extend(states.into_iter().map(|(p, state)| StripEntry {
+                        item: SideItem::Pane(p),
+                        state: Some(state),
+                        icon: state,
+                        selected: false,
+                    }));
+                }
+                WorkspaceEntry::Source(source) => {
+                    workspaces.push(StripEntry {
+                        item: SideItem::Definition(source.path.to_path_buf()),
+                        state: None,
+                        icon: AgentState::Idle,
+                        selected: false,
+                    });
+                }
+            }
         }
         workspaces.sort_by_key(|entry| match &entry.item {
             SideItem::Workspace(ws) => self.workspace_position(&super::ui::PickAction::SwitchWorkspace(*ws)),
@@ -1418,46 +1422,51 @@ impl Server {
 
         // Saved workspaces keep their place when opened or closed.
         let mut agents = Vec::new();
-        for ws in &self.workspaces {
-            let panes = ws.panes();
-            let states: Vec<(PaneId, AgentState)> = panes
-                .iter()
-                .filter_map(|p| {
-                    self.panes.get(p).filter(|pane| pane.agent.kind.is_some()).map(|pane| (*p, pane.agent.state))
-                })
-                .collect();
-            let color = states.iter().map(|(_, s)| *s).max_by_key(agent_urgency).map_or(t.dim, |s| t.state_color(s));
-            let icon = t.icon(if ws.closed() { AgentState::Idle } else { AgentState::Working });
-            let (tabs, panes) = ws.counts();
-            let detail = match ws.source_status {
-                Some(status) => status.to_string(),
-                None => format!("{}{sep}{}{sep}{}", ws.status(), plural(tabs, "tab"), plural(panes, "pane")),
-            };
-            side_entry(
-                &mut rows,
-                SideItem::Workspace(ws.id),
-                dot(icon, color),
-                strong(ws.name.clone()),
-                faint(detail, t.dim),
-                ws.id == c.workspace,
-            );
-            agents.extend(states.into_iter().map(|(p, s)| (p, s, ws)));
-        }
-        for (path, n) in self
-            .def_files
-            .iter()
-            .filter(|(p, _)| !self.source_removed(p) && matches!(self.definition_workspace(p), Ok(None)))
-        {
-            let name = strong(n.clone());
-            let detail = faint("Closed".into(), t.dim);
-            side_entry(
-                &mut rows,
-                SideItem::Definition(path.clone()),
-                dot(t.icon(AgentState::Idle), t.dim),
-                name,
-                detail,
-                false,
-            );
+        for entry in self.cached_workspace_catalog() {
+            match entry {
+                WorkspaceEntry::Kept(w) => {
+                    let ws = w.workspace;
+                    let panes = ws.panes();
+                    let states: Vec<(PaneId, AgentState)> = panes
+                        .iter()
+                        .filter_map(|p| {
+                            self.panes
+                                .get(p)
+                                .filter(|pane| pane.agent.kind.is_some())
+                                .map(|pane| (*p, pane.agent.state))
+                        })
+                        .collect();
+                    let color =
+                        states.iter().map(|(_, s)| *s).max_by_key(agent_urgency).map_or(t.dim, |s| t.state_color(s));
+                    let icon = t.icon(if ws.closed() { AgentState::Idle } else { AgentState::Working });
+                    let (tabs, panes) = ws.counts();
+                    let detail = match ws.source_status {
+                        Some(status) => status.to_string(),
+                        None => format!("{}{sep}{}{sep}{}", ws.status(), plural(tabs, "tab"), plural(panes, "pane")),
+                    };
+                    side_entry(
+                        &mut rows,
+                        SideItem::Workspace(ws.id),
+                        dot(icon, color),
+                        strong(ws.name.clone()),
+                        faint(detail, t.dim),
+                        ws.id == c.workspace,
+                    );
+                    agents.extend(states.into_iter().map(|(p, s)| (p, s, ws)));
+                }
+                WorkspaceEntry::Source(source) => {
+                    let name = strong(source.name().unwrap().to_owned());
+                    let detail = faint("Closed".into(), t.dim);
+                    side_entry(
+                        &mut rows,
+                        SideItem::Definition(source.path.to_path_buf()),
+                        dot(t.icon(AgentState::Idle), t.dim),
+                        name,
+                        detail,
+                        false,
+                    );
+                }
+            }
         }
 
         rows[1..].sort_by_key(|row| match row {
@@ -2406,6 +2415,79 @@ thread_local! {
 mod tests {
     use super::*;
     use crate::theme::NoticeKind;
+
+    #[test]
+    fn workspace_views_share_rows_but_render_only_cached_sources_until_the_next_scan() {
+        use crate::protocol::{Request, Response};
+        use crate::server::ui::PickAction;
+        use crate::workspace::{SOURCE_LOADS, SOURCE_SCANS, WORKSPACE_PARSES};
+
+        let dir = crate::testing::TempDir::new("catalog-views");
+        let linked = dir.write("linked.kdl", "layout { pane; }");
+        let source = dir.write("source.kdl", "layout { pane; pane; }");
+        let broken = dir.write("broken.kdl", "layout {");
+        std::os::unix::fs::symlink(&linked, dir.0.join("alias.kdl")).unwrap();
+        let (tx, _rx) = super::super::queue::channel(32);
+        let mut server = super::super::tests::server(tx);
+        let (client, _peer) = super::super::tests::client(&mut server);
+        let current = server.clients[&client].workspace;
+        server.workspaces[0].set_definition(Some(&linked));
+        server.config.workspace_dirs = vec![dir.text()];
+        server.workspace_order = vec![
+            crate::persist::WorkspaceKey::Source(source.clone()),
+            crate::persist::WorkspaceKey::Id(server.workspaces[0].stable_id.clone()),
+        ];
+        server.scan_definitions();
+        let picker = server.workspace_picker(current);
+        assert_eq!(picker.items.len(), 4);
+        assert!(matches!(&picker.items[0].action, PickAction::OpenDefinition(p) if p == &source));
+        assert_eq!(picker.items[0].detail, "Closed · 1 tab · 2 panes");
+        assert_eq!(picker.items[1].action.workspace(), Some(current));
+        assert!(matches!(&picker.items[2].action, PickAction::UnavailableDefinition(p) if p == &broken));
+        assert!(picker.items[2].detail.starts_with("error: "));
+        let Response::Workspaces(infos) = server.request(client, Request::ListWorkspaces).unwrap().unwrap() else {
+            panic!()
+        };
+        assert_eq!(infos.len(), 2);
+        assert_eq!(infos[0].name, "source");
+        assert_eq!((infos[0].tabs, infos[0].panes), (1, 2));
+        assert_eq!(infos[1].id.as_deref(), Some(server.workspaces[0].stable_id.as_str()));
+
+        let items = |rows: Vec<SideRow>| {
+            let mut items: Vec<_> = rows
+                .into_iter()
+                .filter_map(|row| match row {
+                    SideRow::Entry {
+                        item: Some(item @ (SideItem::Workspace(_) | SideItem::Definition(_))), ..
+                    } => Some(item),
+                    _ => None,
+                })
+                .collect();
+            items.dedup();
+            items
+        };
+        let counts = || (SOURCE_SCANS.get(), SOURCE_LOADS.get(), WORKSPACE_PARSES.get());
+        let before = counts();
+        assert!(before.0 > 0 && before.1 > 0 && before.2 > 0);
+        std::fs::write(&source, "layout {").unwrap();
+        let moved = dir.0.join("moved.kdl");
+        std::fs::rename(&linked, &moved).unwrap();
+        for _ in 0..3 {
+            let expected = vec![SideItem::Definition(source.clone()), SideItem::Workspace(current)];
+            assert_eq!(items(server.sidebar_rows(&server.clients[&client], 36, 0)), expected);
+            assert_eq!(items(server.strip_rows(&server.clients[&client], 36, th())), expected);
+        }
+        assert_eq!(counts(), before);
+        server.scan_definitions();
+        assert_eq!(server.workspaces[0].definition.as_ref(), Some(&moved));
+        assert_eq!(items(server.sidebar_rows(&server.clients[&client], 36, 0)), [SideItem::Workspace(current)]);
+        assert_eq!(items(server.strip_rows(&server.clients[&client], 36, th())), [SideItem::Workspace(current)]);
+        std::fs::remove_file(&moved).unwrap();
+        server.scan_definitions();
+        assert_eq!(server.workspaces[0].source_status, Some("Source file missing"));
+        assert_eq!(items(server.sidebar_rows(&server.clients[&client], 36, 0)), [SideItem::Workspace(current)]);
+        assert_eq!(items(server.strip_rows(&server.clients[&client], 36, th())), [SideItem::Workspace(current)]);
+    }
 
     #[test]
     fn an_agent_without_an_account_is_named_once_in_its_frame() {

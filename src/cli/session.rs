@@ -119,28 +119,7 @@ pub(super) fn workspaces(
                     return Err(error);
                 }
                 crate::persist::inspect(&s.name)?
-                    .map(|saved| {
-                        saved
-                            .deleted_workspaces
-                            .iter()
-                            .rev()
-                            .map(|d| {
-                                let w = &d.workspace;
-                                let (tabs, panes) = w.counts();
-                                protocol::WorkspaceInfo {
-                                    id: Some(w.id.clone()),
-                                    name: w.name.clone(),
-                                    open: false,
-                                    definition: w.definition.clone(),
-                                    tabs,
-                                    panes,
-                                    working: 0,
-                                    blocked: 0,
-                                    done: 0,
-                                }
-                            })
-                            .collect::<Vec<_>>()
-                    })
+                    .map(|saved| workspace::catalog::deleted_infos(&saved.deleted_workspaces))
                     .unwrap_or_default()
             }
         };
@@ -415,50 +394,26 @@ fn list_definitions(session: &str, json: bool) -> Result<()> {
     let (saved, removed, order) = crate::persist::inspect(session)?
         .map(|s| (s.workspaces, s.removed_sources, s.workspace_order))
         .unwrap_or_default();
-    let mut list: Vec<_> = saved
-        .iter()
-        .map(|w| {
-            let (tabs, panes) = w.counts();
-            protocol::WorkspaceInfo {
-                id: (!w.id.is_empty()).then(|| w.id.clone()),
-                name: w.name.clone(),
-                open: false,
-                definition: w.definition.clone(),
-                tabs,
-                panes,
-                working: 0,
-                blocked: 0,
-                done: 0,
-            }
-        })
-        .collect();
     let defs: Vec<_> = cfg.workspace_dirs().iter().flat_map(|d| workspace::load_dir(d)).collect();
-    for (path, def) in defs {
-        if removed.iter().any(|p| paths::same_file(p, &path))
-            || saved.iter().any(|w| w.definition.as_deref().is_some_and(|p| paths::same_file(p, &path)))
-        {
-            continue;
-        }
-        match def {
-            Ok(def) => {
-                let panes = def.panes().len();
-                list.push(protocol::WorkspaceInfo {
-                    id: None,
-                    name: def.name,
-                    open: false,
-                    definition: Some(path),
-                    tabs: def.tabs.len(),
-                    panes,
-                    working: 0,
-                    blocked: 0,
-                    done: 0,
-                });
+    let mut entries = workspace::catalog::saved(&saved, &defs, &removed);
+    // File errors precede the listing in scan order, regardless of workspace positions.
+    if !json {
+        for entry in &entries {
+            if let workspace::catalog::Entry::Source(source) = entry
+                && let workspace::catalog::SourceData::Invalid(e) = source.data
+            {
+                println!("{:<20} error: {e:#}", source.path.display());
             }
-            Err(e) if !json => println!("{:<20} error: {e:#}", path.display()),
-            Err(_) => {}
         }
     }
-    list.sort_by_key(|w| crate::persist::WorkspaceKey::position(&order, w.id.as_deref(), w.definition.as_deref()));
+    entries.sort_by_key(|entry| entry.position(&order));
+    let list: Vec<_> = entries
+        .into_iter()
+        .filter_map(|entry| match entry {
+            workspace::catalog::Entry::Kept(w) => Some(workspace::catalog::saved_info(w.workspace)),
+            workspace::catalog::Entry::Source(s) => s.info(),
+        })
+        .collect();
     print_workspaces(&list, json)
 }
 

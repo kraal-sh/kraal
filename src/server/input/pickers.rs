@@ -1,7 +1,5 @@
 //! Lists to choose from: the generic picker, and the workspace, command and pane lists.
 
-use std::collections::HashSet;
-
 use anyhow::Context;
 
 use super::plural;
@@ -561,99 +559,89 @@ impl Server {
     }
 
     pub(in crate::server) fn workspace_picker(&self, current: u32) -> Picker {
-        let mut items = Vec::new();
-        for ws in &self.workspaces {
-            let panes = ws.panes();
-            let (mut working, mut blocked, mut done) = (0, 0, 0);
-            for p in &panes {
-                match self.panes.get(p).map(|x| x.agent.state) {
-                    Some(AgentState::Working) => working += 1,
-                    Some(AgentState::Blocked) => blocked += 1,
-                    Some(AgentState::Done) => done += 1,
-                    _ => {}
-                }
-            }
-            let (tabs, count) = ws.counts();
-            let mut detail = format!("{} · {tabs} tab{} · {count} pane{}", ws.status(), plural(tabs), plural(count));
-            if let Some(status) = ws.source_status {
-                detail.push_str(&format!(" · {status}"));
-            }
-            if blocked + working + done > 0 {
-                detail.push_str(&format!(" · ▲{blocked} ●{working} ✓{done}"));
-            }
-            if ws.id == current {
-                detail.push_str(" · Current");
-            }
-            let state = if blocked > 0 {
-                Some(AgentState::Blocked)
-            } else if done > 0 {
-                Some(AgentState::Done)
-            } else if working > 0 {
-                Some(AgentState::Working)
-            } else {
-                None
-            };
-            items.push(PickItem {
-                label: ws.name.clone(),
-                detail,
-                action: if ws.delete_pending {
-                    PickAction::RetryWorkspaceDelete(ws.id)
-                } else if ws.close_error.is_some() {
-                    PickAction::RetryWorkspaceClose(ws.id)
-                } else if ws.closed() {
-                    PickAction::ReopenWorkspace(ws.id)
-                } else {
-                    PickAction::SwitchWorkspace(ws.id)
-                },
-                state,
-                dim: false,
-            });
-        }
+        use crate::workspace::catalog::{Entry, Source, SourceData};
+
         let definitions = self.definitions();
-        let mut names = HashSet::new();
-        let mut collisions = HashSet::new();
-        for (_, def) in &definitions {
-            if let Ok(def) = def
-                && !names.insert(&def.name)
-            {
-                collisions.insert(def.name.clone());
-            }
-        }
-        for (path, def) in definitions {
-            if !matches!(self.definition_workspace(&path), Ok(None)) {
-                continue;
-            }
-            match def {
-                Ok(def) => {
-                    let n = def.panes().len();
-                    let source = if collisions.contains(&def.name) {
-                        format!(" · {}", paths::shorten_home(&path))
+        let mut items = Vec::new();
+        let mut catalog = self.workspace_catalog(definitions.iter().map(Source::loaded));
+        catalog.sort_by_key(|entry| entry.position(&self.workspace_order));
+        for entry in catalog {
+            match entry {
+                Entry::Kept(w) => {
+                    let ws = w.workspace;
+                    let (working, blocked, done) = self.workspace_activity(ws);
+                    let (tabs, count) = ws.counts();
+                    let mut detail =
+                        format!("{} · {tabs} tab{} · {count} pane{}", ws.status(), plural(tabs), plural(count));
+                    if let Some(status) = ws.source_status {
+                        detail.push_str(&format!(" · {status}"));
+                    }
+                    if blocked + working + done > 0 {
+                        detail.push_str(&format!(" · ▲{blocked} ●{working} ✓{done}"));
+                    }
+                    if ws.id == current {
+                        detail.push_str(" · Current");
+                    }
+                    let state = if blocked > 0 {
+                        Some(AgentState::Blocked)
+                    } else if done > 0 {
+                        Some(AgentState::Done)
+                    } else if working > 0 {
+                        Some(AgentState::Working)
                     } else {
-                        String::new()
+                        None
                     };
                     items.push(PickItem {
-                        label: def.name,
-                        detail: format!(
-                            "Closed · {} tab{} · {n} pane{}{source}",
-                            def.tabs.len(),
-                            plural(def.tabs.len()),
-                            plural(n)
-                        ),
-                        action: PickAction::OpenDefinition(path),
-                        state: None,
+                        label: ws.name.clone(),
+                        detail,
+                        action: if ws.delete_pending {
+                            PickAction::RetryWorkspaceDelete(ws.id)
+                        } else if ws.close_error.is_some() {
+                            PickAction::RetryWorkspaceClose(ws.id)
+                        } else if ws.closed() {
+                            PickAction::ReopenWorkspace(ws.id)
+                        } else {
+                            PickAction::SwitchWorkspace(ws.id)
+                        },
+                        state,
                         dim: false,
                     });
                 }
-                Err(e) => items.push(PickItem {
-                    label: path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default(),
-                    detail: format!("error: {e:#}"),
-                    action: PickAction::UnavailableDefinition(path),
-                    state: None,
-                    dim: false,
-                }),
+                Entry::Source(source) => {
+                    let path = source.path;
+                    match source.data {
+                        SourceData::Loaded(def) => {
+                            let n = def.panes().len();
+                            let source = if source.collision {
+                                format!(" · {}", paths::shorten_home(path))
+                            } else {
+                                String::new()
+                            };
+                            items.push(PickItem {
+                                label: def.name.clone(),
+                                detail: format!(
+                                    "Closed · {} tab{} · {n} pane{}{source}",
+                                    def.tabs.len(),
+                                    plural(def.tabs.len()),
+                                    plural(n)
+                                ),
+                                action: PickAction::OpenDefinition(path.to_path_buf()),
+                                state: None,
+                                dim: false,
+                            });
+                        }
+                        SourceData::Invalid(e) => items.push(PickItem {
+                            label: path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default(),
+                            detail: format!("error: {e:#}"),
+                            action: PickAction::UnavailableDefinition(path.to_path_buf()),
+                            state: None,
+                            dim: false,
+                        }),
+                        SourceData::Cached(_) => unreachable!("picker uses loaded definitions"),
+                    }
+                }
             }
         }
-        items.sort_by_key(|i| self.workspace_position(&i.action));
         if !self.deleted_workspaces.is_empty() {
             items.push(PickItem::new(
                 format!("Deleted workspaces ({})", self.deleted_workspaces.len()),

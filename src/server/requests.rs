@@ -564,44 +564,18 @@ impl Server {
     }
 
     fn workspace_infos(&self) -> Vec<WorkspaceInfo> {
-        let mut out = Vec::new();
-        for ws in &self.workspaces {
-            let panes = ws.panes();
-            let count =
-                |s: AgentState| panes.iter().filter(|p| self.panes.get(p).is_some_and(|x| x.agent.state == s)).count();
-            out.push(WorkspaceInfo {
-                id: Some(ws.stable_id.clone()),
-                name: ws.name.clone(),
-                open: !ws.closed(),
-                definition: ws.definition.clone(),
-                tabs: ws.counts().0,
-                panes: ws.counts().1,
-                working: count(AgentState::Working),
-                blocked: count(AgentState::Blocked),
-                done: count(AgentState::Done),
-            });
-        }
-        for (path, def) in self.definitions() {
-            let Ok(def) = def else { continue };
-            if !matches!(self.definition_workspace(&path), Ok(None)) {
-                continue;
-            }
-            out.push(WorkspaceInfo {
-                id: None,
-                name: def.name.clone(),
-                open: false,
-                definition: Some(path),
-                tabs: def.tabs.len(),
-                panes: def.panes().len(),
-                working: 0,
-                blocked: 0,
-                done: 0,
-            });
-        }
-        out.sort_by_key(|w| {
-            crate::persist::WorkspaceKey::position(&self.workspace_order, w.id.as_deref(), w.definition.as_deref())
-        });
-        out
+        use crate::workspace::catalog::{Entry, Source};
+
+        let definitions = self.definitions();
+        let mut catalog = self.workspace_catalog(definitions.iter().map(Source::loaded));
+        catalog.sort_by_key(|entry| entry.position(&self.workspace_order));
+        catalog
+            .into_iter()
+            .filter_map(|entry| match entry {
+                Entry::Kept(w) => Some(self.workspace_info(w.workspace)),
+                Entry::Source(s) => s.info(),
+            })
+            .collect()
     }
 }
 

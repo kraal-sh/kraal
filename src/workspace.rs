@@ -10,6 +10,7 @@
 //! Zellij rejects unknown properties, so files using them are kraal-only. Stacks are
 //! Zellij's: `pane stacked=true { ... }`, with `expanded=true` on the pane open in it.
 
+pub mod catalog;
 mod files;
 mod model;
 mod read;

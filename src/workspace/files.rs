@@ -8,6 +8,12 @@ use super::model::{ImportPreview, WorkspaceDef};
 use super::read::parse_workspace;
 use super::write::to_kdl;
 
+#[cfg(test)]
+thread_local! {
+    pub(crate) static SOURCE_SCANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    pub(crate) static SOURCE_LOADS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 impl ImportPreview {
     pub fn read(path: &Path) -> Result<Self> {
         let path = definition_path(path);
@@ -81,6 +87,8 @@ pub fn file_name_from(name: &str) -> String {
 /// A missing directory yields an empty list; any other error reading it yields a
 /// single `Err` entry for `dir` itself.
 pub fn load_dir(dir: &Path) -> Vec<(PathBuf, Result<WorkspaceDef>)> {
+    #[cfg(test)]
+    SOURCE_SCANS.with(|n| n.set(n.get() + 1));
     let dir = &fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
     let entries = match fs::read_dir(dir) {
         Ok(entries) => entries,
@@ -116,6 +124,8 @@ pub fn definition_path(path: &Path) -> PathBuf {
 
 /// The definition in the file at `path`, named after the file.
 pub fn load_file(path: &Path) -> Result<WorkspaceDef> {
+    #[cfg(test)]
+    SOURCE_LOADS.with(|n| n.set(n.get() + 1));
     let src = fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
     let name = path.file_stem().map(|stem| stem.to_string_lossy().into_owned()).unwrap_or_default();
     parse_workspace(&name, &src).with_context(|| format!("parsing {}", path.display()))
