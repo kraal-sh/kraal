@@ -120,6 +120,40 @@ impl Server {
         Some((eligible_pane, agent))
     }
 
+    pub(super) fn clipboard_paste(
+        &mut self,
+        id: ClientId,
+        pane: PaneId,
+        key: Vec<u8>,
+        text: Vec<u8>,
+        token: Option<String>,
+    ) {
+        if !self.clients.get(&id).is_some_and(|client| client.attached)
+            || text.len() > self.config.clipboard.max_bytes
+            || token.as_deref().is_some_and(|token| !attachments::token_valid(token))
+        {
+            return;
+        }
+        if self.clipboard_focus(id) != Some((Some(pane), true)) {
+            self.client_input(id, &key);
+            if let Some(token) = token {
+                self.send_msg(
+                    id,
+                    &ServerMsg::AttachmentResult {
+                        kind: NoticeKind::Notice,
+                        token,
+                        pasted: true,
+                        message: String::new(),
+                    },
+                );
+            }
+        } else if let Some(token) = token {
+            self.request_attachment(id, token, text, false);
+        } else {
+            self.client_input(id, &[b"\x1b[200~".as_slice(), &text, b"\x1b[201~"].concat());
+        }
+    }
+
     pub(super) fn offer_attachments(&mut self, id: ClientId, confirmed: Option<PaneId>) -> Mode {
         self.offer_attachment(id, confirmed, false)
     }
@@ -750,6 +784,94 @@ mod tests {
             }
         }
         assert!(!attachments::directory(&server.session).exists());
+    }
+
+    #[test]
+    fn clipboard_text_keeps_the_agent_target_and_production_guard() {
+        for paths in [false, true] {
+            let (mut server, id, _peer, pane, _events) = setup_command("clipboard-production", vec!["cat".into()]);
+            wait_for_program(&server, pane, "cat");
+            server.panes.get_mut(&pane).unwrap().agent.kind = Some("claude".into());
+            server.panes.get_mut(&pane).unwrap().ssh =
+                Some(crate::servers::Server { name: "prod".into(), host: "prod".into(), ..Default::default() });
+            let text = b"/laptop/file\n".to_vec();
+            let msg = ClientMsg::ClipboardPaste {
+                pane,
+                key: vec![0x16],
+                text: text.clone(),
+                token: paths.then(|| "ab".into()),
+            };
+            server.client_frame(id, crate::protocol::JSON, serde_json::to_vec(&msg).unwrap());
+            if paths {
+                assert_eq!(server.clients[&id].attachments.pending.as_ref().unwrap().pane, pane);
+                server.attachment_message(id, ClientMsg::AttachmentText { token: "ab".into(), text: text.clone() });
+            }
+            assert!(matches!(&server.clients[&id].mode, Mode::Confirm(confirm)
+                if matches!(&confirm.action, super::super::ui::ConfirmAction::Production { pending, .. }
+                    if pending.targets.len() == 1 && pending.targets[0].0 == pane
+                        && matches!(pending.items.as_slice(), [super::super::ui::InputItem::Paste(data)] if data == &text))));
+        }
+    }
+
+    #[test]
+    fn delayed_clipboard_focus_replays_text_shortcuts_into_the_new_shell() {
+        for remote in [false, true] {
+            for paths in [false, true] {
+                let dir = crate::testing::TempDir::new("stale-text-focus");
+                let output = dir.0.join("input");
+                let (mut server, id, _peer, agent, _events) = setup_command("stale-text-focus", vec!["cat".into()]);
+                wait_for_program(&server, agent, "cat");
+                server.clients.get_mut(&id).unwrap().remote = remote;
+                server.panes.get_mut(&agent).unwrap().agent.kind = Some("claude".into());
+                let advertised = server.clipboard_focus(id);
+                server.clients.get_mut(&id).unwrap().attachments.focus = advertised;
+                let ws = server.clients[&id].workspace;
+                let shell = server
+                    .spawn_pane_in(
+                        ws,
+                        None,
+                        crate::pane::PaneSpec {
+                            command: vec![
+                                "sh".into(),
+                                "-c".into(),
+                                format!("stty raw -echo; exec cat > '{}'", output.display()),
+                            ],
+                            ..Default::default()
+                        },
+                        crate::protocol::Placement::Tab,
+                        None,
+                    )
+                    .unwrap();
+                wait_for_program(&server, shell, "cat");
+                assert_eq!(server.clipboard_focus(id), Some((Some(shell), false)));
+                assert_eq!(
+                    server.clients[&id].attachments.focus, advertised,
+                    "the client has not received the focus update"
+                );
+                for key in [b"\x16".as_slice(), b"\x1b[118;5u"] {
+                    let msg = ClientMsg::ClipboardPaste {
+                        pane: agent,
+                        key: key.to_vec(),
+                        text: b"private clipboard".to_vec(),
+                        token: paths.then(|| "ab".into()),
+                    };
+                    server.client_frame(id, crate::protocol::JSON, serde_json::to_vec(&msg).unwrap());
+                }
+                server.client_input(id, b"following");
+                let start = Instant::now();
+                loop {
+                    let received = std::fs::read(&output).unwrap_or_default();
+                    if received.ends_with(b"following") {
+                        assert_eq!(received, b"\x16\x16following");
+                        break;
+                    }
+                    assert!(start.elapsed() < crate::testing::PATIENCE);
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                assert!(server.clients[&id].attachments.pending.is_none());
+                assert!(server.clients[&id].paste.is_none());
+            }
+        }
     }
 
     #[test]

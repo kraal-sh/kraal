@@ -28,6 +28,7 @@ impl Controller {
     pub fn pending_keys(&self) -> bool {
         let state = self.state.lock().unwrap();
         self.laptop.as_ref().is_some_and(|laptop| laptop.pending_keys())
+            || state.clipboard_read.is_some()
             || state.image_keys.pending()
             || state.splitter.has_pending()
             || state.dropped.is_some() && state.parser.has_pending()
@@ -35,21 +36,91 @@ impl Controller {
     }
 
     pub fn input(self: &Arc<Self>, bytes: &[u8]) -> bool {
-        self.input_with_probe(bytes, super::super::clipboard_image::available)
+        self.input_with_clipboard(
+            bytes,
+            super::super::clipboard_image::available,
+            super::super::clipboard_image::read_text,
+        )
     }
 
+    #[cfg(test)]
     pub(super) fn input_with_probe(
         self: &Arc<Self>,
         bytes: &[u8],
         available: impl Fn() -> Result<bool, Diagnostic> + Clone + Send + 'static,
     ) -> bool {
+        self.input_with_clipboard(bytes, available, |_, _| Ok(Vec::new()))
+    }
+
+    pub(super) fn input_with_clipboard(
+        self: &Arc<Self>,
+        bytes: &[u8],
+        available: impl Fn() -> Result<bool, Diagnostic> + Clone + Send + 'static,
+        read_text: impl Fn(&std::sync::atomic::AtomicBool, usize) -> Result<Vec<u8>> + Clone + Send + 'static,
+    ) -> bool {
+        self.finish_clipboard_text();
+        let mut remaining = bytes;
+        let mut split = false;
+        loop {
+            if self.clipboard_keys(remaining) {
+                return true;
+            }
+            let (end, preparing) = {
+                let state = self.state.lock().unwrap();
+                (state.image_keys.control_v_end(remaining).unwrap_or(remaining.len()), state.dropped.is_some())
+            };
+            let handled = self.input_chunk(&remaining[..end], &available, &read_text);
+            if end == remaining.len() {
+                if split && !handled {
+                    self.forward(remaining);
+                }
+                return split || handled;
+            }
+            if !handled {
+                self.forward(&remaining[..end]);
+            }
+            split = true;
+            remaining = &remaining[end..];
+            if !preparing && self.state.lock().unwrap().dropped.is_some() {
+                self.preparing_keys(remaining);
+                return true;
+            }
+        }
+    }
+
+    fn input_chunk(
+        self: &Arc<Self>,
+        bytes: &[u8],
+        available: &(impl Fn() -> Result<bool, Diagnostic> + Clone + Send + 'static),
+        read_text: &(impl Fn(&std::sync::atomic::AtomicBool, usize) -> Result<Vec<u8>> + Clone + Send + 'static),
+    ) -> bool {
         let mut state = self.state.lock().unwrap();
         if !state.connected && state.dropped.is_some() {
             return false;
         }
-        if !self.remote || !state.connected {
+        if !state.connected {
             drop(state);
             return self.keys(bytes);
+        }
+        if !self.remote {
+            if !state.focus.is_some_and(|(pane, agent)| pane.is_some() && agent) && !state.image_keys.pending() {
+                drop(state);
+                return self.keys(bytes);
+            }
+            let parts = state.image_keys.feed(bytes);
+            drop(state);
+            for (raw, image_key) in parts {
+                if self.clipboard_keys(&raw) {
+                    continue;
+                }
+                if image_key && self.offer_clipboard(&raw, available, read_text) {
+                    continue;
+                }
+                if !self.keys(&raw) {
+                    self.forward(&raw);
+                }
+            }
+            return true;
         }
         let parts = if bytes.is_empty() {
             vec![paste::Part::Bytes(state.splitter.idle()), paste::Part::Bytes(Vec::new())]
@@ -92,7 +163,7 @@ impl Controller {
                     for (raw, image_key) in parts {
                         if following_paste {
                             self.preparing_keys(&raw);
-                        } else if image_key && self.offer_clipboard(&raw, &available) {
+                        } else if image_key && self.offer_clipboard(&raw, available, read_text) {
                             following_paste = true;
                         } else if !self.keys(&raw) {
                             self.forward(&raw);
@@ -101,7 +172,7 @@ impl Controller {
                 }
                 paste::Part::Paste(text) => {
                     let paths = std::str::from_utf8(&text).ok().and_then(crate::transfer::dropped_paths);
-                    let mut state = self.state.lock().unwrap();
+                    let state = self.state.lock().unwrap();
                     if state.prompt.is_some() {
                         drop(state);
                         self.keys(&paste::bracket(&text));
@@ -112,40 +183,8 @@ impl Controller {
                         && state.uncertain.is_none()
                         && let Some(paths) = paths
                     {
-                        let token = format!(
-                            "{:x}-{:x}",
-                            std::process::id(),
-                            std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .unwrap_or_default()
-                                .as_nanos()
-                        );
-                        state.dropped = Some(Dropped {
-                            image: false,
-                            shortcut: false,
-                            token: token.clone(),
-                            original: text.clone(),
-                            paths,
-                            target: String::new(),
-                            limits: Default::default(),
-                            broadcast: false,
-                            ready: false,
-                            result: false,
-                            retry: false,
-                            selected: 0,
-                            scroll: 0,
-                            error: None,
-                        });
-                        state.status = None;
-                        state.success_until = None;
-                        let dismiss = state.result_token.take();
-                        state.parser = InputParser::new();
                         drop(state);
-                        if let Some(token) = dismiss {
-                            let _ = send(&self.writer, &ClientMsg::AttachmentDismiss { token });
-                        }
-                        let _ =
-                            send(&self.writer, &ClientMsg::AttachmentRequest { token, text, image: false, pane: None });
+                        self.request_pasted_paths(text, paths, None);
                         following_paste = true;
                     } else {
                         let blocked = state.uncertain.is_none()
@@ -165,14 +204,57 @@ impl Controller {
         true
     }
 
+    fn request_pasted_paths(
+        &self,
+        text: Vec<u8>,
+        paths: Vec<std::path::PathBuf>,
+        clipboard: Option<(crate::layout::PaneId, Vec<u8>)>,
+    ) {
+        let mut state = self.state.lock().unwrap();
+        let token = format!(
+            "{:x}-{:x}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos()
+        );
+        state.dropped = Some(Dropped {
+            image: false,
+            shortcut: false,
+            token: token.clone(),
+            original: text.clone(),
+            paths,
+            target: String::new(),
+            limits: Default::default(),
+            broadcast: false,
+            ready: false,
+            result: false,
+            retry: false,
+            selected: 0,
+            scroll: 0,
+            error: None,
+        });
+        state.status = None;
+        state.success_until = None;
+        let dismiss = state.result_token.take();
+        state.parser = InputParser::new();
+        drop(state);
+        if let Some(token) = dismiss {
+            let _ = send(&self.writer, &ClientMsg::AttachmentDismiss { token });
+        }
+        let msg = match clipboard {
+            Some((pane, key)) => ClientMsg::ClipboardPaste { pane, key, text, token: Some(token) },
+            None => ClientMsg::AttachmentRequest { token, text, image: false, pane: None },
+        };
+        let _ = send(&self.writer, &msg);
+    }
+
     fn offer_clipboard(
         self: &Arc<Self>,
         raw: &[u8],
         available: &(impl Fn() -> Result<bool, Diagnostic> + Clone + Send + 'static),
+        read_text: &(impl Fn(&std::sync::atomic::AtomicBool, usize) -> Result<Vec<u8>> + Clone + Send + 'static),
     ) -> bool {
         let mut state = self.state.lock().unwrap();
-        let eligible = self.remote
-            && state.connected
+        let eligible = state.connected
             && state.focus.is_some_and(|(pane, _)| pane.is_some())
             && state.prompt.is_none()
             && state.dropped.is_none()
@@ -226,9 +308,14 @@ impl Controller {
         }
         match availability {
             Ok(true) => {}
+            Ok(false) => {
+                drop(state);
+                self.read_clipboard_text(raw.to_vec(), read_text.clone());
+                return true;
+            }
             result => {
                 drop(state);
-                self.image_notice(result.err().unwrap_or(Diagnostic::NoImage));
+                self.image_notice(result.err().unwrap());
                 return false;
             }
         }
@@ -271,9 +358,131 @@ impl Controller {
         true
     }
 
+    fn clipboard_keys(self: &Arc<Self>, bytes: &[u8]) -> bool {
+        use std::sync::atomic::Ordering;
+        let mut state = self.state.lock().unwrap();
+        let Some(read) = &mut state.clipboard_read else { return false };
+        if bytes.is_empty() {
+            read.parser.flush();
+        }
+        for (index, byte) in bytes.iter().enumerate() {
+            let events = read.parser.feed(std::slice::from_ref(byte));
+            if events
+                .iter()
+                .any(|event| matches!(event, InputEvent::Key(key) if key.code == KeyCode::Char('c') && key.mods.ctrl))
+            {
+                read.cancelled.store(true, Ordering::SeqCst);
+                state.clipboard_read = None;
+                drop(state);
+                let tail = &bytes[index + 1..];
+                if !tail.is_empty() && !self.input(tail) {
+                    self.forward(tail);
+                }
+                return true;
+            }
+        }
+        read.queued.extend_from_slice(bytes);
+        true
+    }
+
+    fn read_clipboard_text(
+        self: &Arc<Self>,
+        key: Vec<u8>,
+        read: impl FnOnce(&std::sync::atomic::AtomicBool, usize) -> Result<Vec<u8>> + Send + 'static,
+    ) {
+        use std::sync::atomic::AtomicBool;
+        let mut state = self.state.lock().unwrap();
+        let focus = state.focus;
+        let limit = state.clipboard_limit.unwrap_or(1024 * 1024).min(crate::clipboard::MAX_BYTES);
+        let cancelled = Arc::new(AtomicBool::new(false));
+        state.clipboard_read = Some(super::ClipboardRead {
+            key,
+            focus,
+            result: None,
+            cancelled: cancelled.clone(),
+            queued: Vec::new(),
+            parser: InputParser::new(),
+        });
+        let (finished, completion) = bounded(1);
+        state.workers.retain(|worker| matches!(worker.try_recv(), Err(crossbeam_channel::TryRecvError::Empty)));
+        state.workers.push(completion);
+        drop(state);
+        let this = self.clone();
+        if let Err(error) = crate::threads::named("clipboard-text").spawn(move || {
+            let _finished = finished;
+            let result = read(&cancelled, limit).map_err(|error| format!("{error:#}"));
+            if let Some(pending) = this
+                .state
+                .lock()
+                .unwrap()
+                .clipboard_read
+                .as_mut()
+                .filter(|pending| Arc::ptr_eq(&pending.cancelled, &cancelled))
+            {
+                pending.result = Some(result);
+            }
+        }) {
+            self.state.lock().unwrap().clipboard_read = None;
+            self.image_notice(Diagnostic::Failed(error.to_string()));
+        }
+    }
+
+    fn finish_clipboard_text(self: &Arc<Self>) {
+        use std::sync::atomic::Ordering;
+        let mut state = self.state.lock().unwrap();
+        if state.clipboard_read.as_ref().is_none_or(|read| read.result.is_none()) {
+            return;
+        }
+        let pending = state.clipboard_read.take().unwrap();
+        if pending.cancelled.load(Ordering::SeqCst)
+            || !state.connected
+            || state.focus != pending.focus
+            || state.prompt.is_some()
+            || state.dropped.is_some()
+            || state.active.is_some()
+            || state.uncertain.is_some()
+        {
+            return;
+        }
+        let limit = state.clipboard_limit.unwrap_or(1024 * 1024).min(crate::clipboard::MAX_BYTES);
+        drop(state);
+        match pending.result.unwrap() {
+            Ok(bytes) if bytes.len() > limit => {
+                self.image_notice(Diagnostic::Failed(super::super::clipboard_image::TEXT_TOO_LARGE.into()))
+            }
+            Ok(bytes) if bytes.is_empty() => self.image_notice(Diagnostic::Empty),
+            Ok(bytes) => {
+                let pane = pending.focus.and_then(|(pane, _)| pane).unwrap();
+                let paths = (self.remote && bytes.len() <= paste::LIMIT)
+                    .then(|| std::str::from_utf8(&bytes).ok().and_then(crate::transfer::dropped_paths))
+                    .flatten();
+                if let Some(paths) = paths {
+                    self.request_pasted_paths(bytes, paths, Some((pane, pending.key)));
+                } else {
+                    let _ = send(
+                        &self.writer,
+                        &ClientMsg::ClipboardPaste { pane, key: pending.key, text: bytes, token: None },
+                    );
+                }
+            }
+            Err(error) => self.image_notice(Diagnostic::Failed(error)),
+        }
+        if !pending.queued.is_empty() {
+            if self.state.lock().unwrap().dropped.is_some() {
+                // Typing queued during the read must not approve a pasted-path question.
+                self.preparing_keys(&pending.queued);
+            } else if !self.input(&pending.queued) {
+                self.forward(&pending.queued);
+            }
+        }
+    }
+
     // Preparation queues typing on the server, but cancellation stays local. A tail in
     // the same read as a drop cannot select a choice, even if the reply has arrived.
     fn preparing_keys(self: &Arc<Self>, bytes: &[u8]) {
+        if self.clipboard_keys(bytes) {
+            return;
+        }
         let mut state = self.state.lock().unwrap();
         if bytes.is_empty() {
             state.parser.flush();

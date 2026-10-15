@@ -75,8 +75,19 @@ struct Dropped {
     error: Option<String>,
 }
 
+struct ClipboardRead {
+    key: Vec<u8>,
+    focus: Option<(Option<crate::layout::PaneId>, bool)>,
+    result: Option<Result<Vec<u8>, String>>,
+    cancelled: Arc<AtomicBool>,
+    queued: Vec<u8>,
+    parser: InputParser,
+}
+
 #[derive(Default)]
 struct State {
+    clipboard_read: Option<ClipboardRead>,
+    clipboard_limit: Option<usize>,
     dropped: Option<Dropped>,
     connected: bool,
     focus: Option<(Option<crate::layout::PaneId>, bool)>,
@@ -108,6 +119,10 @@ pub(crate) struct Controller {
 }
 
 impl Controller {
+    pub fn set_clipboard_limit(&self, limit: usize) {
+        self.state.lock().unwrap().clipboard_limit = Some(limit);
+    }
+
     #[cfg(test)]
     pub fn new(writer: Writer, remote: bool) -> Arc<Self> {
         Arc::new(Self { state: Mutex::new(State::default()), writer, remote, destination: None, laptop: None })

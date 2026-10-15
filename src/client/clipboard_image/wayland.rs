@@ -47,12 +47,41 @@ fn read_png_with(cancelled: &AtomicBool, env: impl Fn(&str) -> Option<std::ffi::
     Ok(Some(read_pipe(reader, &deadline)?))
 }
 
-fn read_pipe(mut reader: io::PipeReader, deadline: &Deadline<'_>) -> Result<Vec<u8>> {
+pub(super) fn read_text(cancelled: &AtomicBool, limit: usize) -> Result<Option<Vec<u8>>> {
+    let deadline = Deadline::new(cancelled);
+    let Some(clipboard) = Clipboard::connect(&deadline, |name| std::env::var_os(name))? else { return Ok(None) };
+    let offer = clipboard.state.selection.as_ref().and_then(Option::as_ref);
+    let mime = offer.and_then(|offer| clipboard.state.types.get(&offer.id())).and_then(|types| text_type(&types.mime));
+    let Some(mime) = mime else { return Ok(Some(Vec::new())) };
+    let (reader, writer) = io::pipe()?;
+    match offer.unwrap() {
+        Offer::Ext(offer) => offer.receive(mime.into(), writer.as_fd()),
+        Offer::Wlr(offer) => offer.receive(mime.into(), writer.as_fd()),
+    }
+    drop(writer);
+    flush(&clipboard.connection, &deadline)?;
+    Ok(Some(read_pipe_limit(reader, &deadline, limit, super::TEXT_TOO_LARGE)?))
+}
+
+fn text_type(types: &[String]) -> Option<&'static str> {
+    ["text/plain;charset=utf-8", "text/plain"].into_iter().find(|mime| types.iter().any(|t| t == mime))
+}
+
+fn read_pipe(reader: io::PipeReader, deadline: &Deadline<'_>) -> Result<Vec<u8>> {
+    read_pipe_limit(reader, deadline, MAX_BYTES, TOO_LARGE)
+}
+
+fn read_pipe_limit(
+    mut reader: io::PipeReader,
+    deadline: &Deadline<'_>,
+    limit: usize,
+    too_large: &str,
+) -> Result<Vec<u8>> {
     let mut bytes = Vec::new();
     let mut buffer = [0; 8192];
     loop {
         deadline.poll(reader.as_fd(), libc::POLLIN)?;
-        let remaining = MAX_BYTES - bytes.len();
+        let remaining = limit - bytes.len();
         if remaining == 0 {
             let mut pending: libc::c_int = 0;
             // SAFETY: FIONREAD writes one integer and reader owns a valid pipe descriptor.
@@ -60,7 +89,7 @@ fn read_pipe(mut reader: io::PipeReader, deadline: &Deadline<'_>) -> Result<Vec<
                 unsafe { libc::ioctl(reader.as_raw_fd(), libc::FIONREAD, &mut pending) } == 0,
                 "cannot inspect clipboard pipe"
             );
-            ensure!(pending == 0, TOO_LARGE);
+            ensure!(pending == 0, "{too_large}");
             return Ok(bytes);
         }
         let length = remaining.min(buffer.len());
@@ -358,6 +387,29 @@ delegate_noop!(State: ignore wlr_manager::ZwlrDataControlManagerV1);
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn text_mimes_prefer_utf8_and_pipe_reads_preserve_text_and_bound_bytes() {
+        assert_eq!(
+            text_type(&["text/plain".into(), "text/plain;charset=utf-8".into()]),
+            Some("text/plain;charset=utf-8")
+        );
+        assert_eq!(text_type(&["text/plain".into()]), Some("text/plain"));
+        assert_eq!(text_type(&["text/plain;charset=other".into(), "image/png".into()]), None);
+        use std::io::Write;
+        for text in ["", "a\nβ", "12345"] {
+            let (reader, mut writer) = io::pipe().unwrap();
+            writer.write_all(text.as_bytes()).unwrap();
+            drop(writer);
+            let stop = AtomicBool::new(false);
+            let result = read_pipe_limit(reader, &Deadline::new(&stop), 4, super::super::TEXT_TOO_LARGE);
+            if text.len() > 4 {
+                assert_eq!(result.unwrap_err().to_string(), super::super::TEXT_TOO_LARGE);
+            } else {
+                assert_eq!(result.unwrap(), text.as_bytes());
+            }
+        }
+    }
 
     #[test]
     fn overlapping_probe_and_read_leave_the_inherited_socket_alone() {

@@ -105,6 +105,9 @@ fn relative_path_agents_use_the_focused_panes_directory() {
             PickAction::AgentLaunch { agent, account: None } if agent == "aider")));
     let pane = t.server.launch_agent(ws, Some(1), "aider", None, Placement::Tab, None).unwrap();
     assert_eq!(t.server.panes[&pane].spec.command, ["aider"]);
+    for key in ["DISPLAY", "WAYLAND_DISPLAY"] {
+        assert!(t.server.panes[&pane].spec.env_remove.iter().any(|name| name == key));
+    }
     assert_eq!(t.server.panes[&pane].spec.cwd.as_ref(), Some(&repo));
     std::env::set_current_dir(previous).unwrap();
 }
@@ -492,6 +495,9 @@ fn successful_login_clears_the_cached_sign_in_required_row() {
     assert!(picker.actions.is_some());
     assert!(picker.action_keys().contains(&("ctrl+l", "Sign in")));
     let login = t.server.open_login(client, &work).unwrap();
+    for key in ["DISPLAY", "WAYLAND_DISPLAY"] {
+        assert!(!t.server.panes[&login].spec.env_remove.iter().any(|name| name == key));
+    }
     signed_in(std::path::Path::new(&work.home), "b@example.com");
     t.server.check_login(login).unwrap();
     while t.server.panes.contains_key(&login) {
@@ -1789,4 +1795,69 @@ fn a_process_that_changes_during_verification_offers_another_pane() {
     assert!(matches!(p.items[0].action, PickAction::OpenAnotherAccount(1)));
     assert!(t.server.switches.pending.is_empty());
     t.unchanged();
+}
+
+#[test]
+fn launched_workspace_and_old_agent_specs_remove_displays_but_shells_keep_them() {
+    let mut t = SwitchTest::new("agent-clipboard-env");
+    let account = t.server.accounts.get("claude", "from").unwrap();
+    let check = |spec: &PaneSpec| {
+        for key in ["DISPLAY", "WAYLAND_DISPLAY"] {
+            assert_eq!(spec.env_remove.iter().filter(|name| *name == key).count(), 1);
+            assert!(!spec.env.iter().any(|(name, _)| name == key));
+        }
+    };
+    check(&t.server.agent_spec(&account, None, None, &[]).unwrap());
+    for command in [vec!["claude"], vec!["claude", "-p", "prompt"], vec!["missing-agent"]] {
+        let mut old = PaneSpec {
+            command: command.into_iter().map(String::from).collect(),
+            account: Some("claude:from".into()),
+            env: vec![("DISPLAY".into(), ":0".into()), ("WAYLAND_DISPLAY".into(), "wayland-0".into())],
+            ..Default::default()
+        };
+        check(&t.server.resume_spec(&old, None).0);
+        old.account = Some("claude:removed".into());
+        check(&t.server.resume_spec(&old, None).0);
+    }
+    for agent in ["claude:from", "gemini"] {
+        let def = crate::workspace::PaneDef { agent: Some(agent.into()), start_suspended: true, ..Default::default() };
+        let pane = t.server.spawn_from_def(&def, None).unwrap();
+        check(&t.server.panes[&pane].spec);
+    }
+    for program in ["codex", "gemini"] {
+        let spec = PaneSpec { command: vec![program.into()], ..Default::default() };
+        let pane = t.server.spawn_pane_suspended(None, spec, "test").unwrap();
+        check(&t.server.panes[&pane].spec);
+    }
+    let shell = t.server.spawn_from_def(&crate::workspace::PaneDef::default(), None).unwrap();
+    assert!(t.server.panes[&shell].spec.env_remove.is_empty());
+}
+
+#[test]
+fn scripted_picker_launches_remove_display_environment() {
+    if !crate::testing::in_own_process("server::agents::tests::scripted_picker_launches_remove_display_environment") {
+        return;
+    }
+    let mut t = SwitchTest::new("scripted-clipboard-env");
+    let bin = t.dir.join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    for (program, runtime) in [("cn", "node"), ("letta", "node"), ("vibe", "python")] {
+        crate::testing::write_script(&bin.join(program), &format!("#!/usr/bin/env {runtime}\n"));
+    }
+    // This test runs alone in its own process, and the batch holds the scripts unstarted.
+    unsafe { std::env::set_var("PATH", &bin) };
+    let _batch = crate::pane::batch();
+    let (client, _peer) = super::super::tests::client(&mut t.server);
+    let ws = t.server.clients[&client].workspace;
+    for (agent, program) in [("continue", "cn"), ("letta", "letta"), ("vibe", "vibe")] {
+        assert!(t.server.agent_picker(client, None).items.iter().any(|item| matches!(&item.action,
+            PickAction::AgentLaunch { agent: name, account: None } if name == agent)));
+        let pane = t.server.launch_agent(ws, None, agent, None, Placement::Tab, None).unwrap();
+        let spec = &t.server.panes[&pane].spec;
+        assert_eq!(spec.command, [program]);
+        assert!(crate::agent::detect_agent(&spec.command).is_none());
+        for key in ["DISPLAY", "WAYLAND_DISPLAY"] {
+            assert_eq!(spec.env_remove.iter().filter(|name| *name == key).count(), 1);
+        }
+    }
 }

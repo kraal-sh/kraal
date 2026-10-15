@@ -455,8 +455,55 @@ fn pending_keys_stay_before_pastes_and_pasted_control_v_never_probes() {
     }
 }
 
+fn assert_clipboard_paste(peer: &mut Reader, expected_key: &[u8], expected_text: &[u8], paths: bool) {
+    let ClientMsg::ClipboardPaste { pane, key, text, token } = read(peer) else {
+        panic!("clipboard text must be bound to its agent pane");
+    };
+    assert_eq!(pane, 7);
+    assert_eq!(key, expected_key);
+    assert_eq!(text, expected_text);
+    assert_eq!(token.is_some(), paths);
+}
+
 #[test]
-fn control_v_only_probes_remote_panes_and_forwards_exact_keys_without_an_image() {
+fn cancelling_a_blocked_text_read_preserves_coalesced_and_later_typing() {
+    for remote in [false, true] {
+        for key in [b"\x03".as_slice(), b"\x1b[99;5u", b"\x1b[27;5;99~"] {
+            for split in 0..=key.len() {
+                let (client, mut peer) = controller(remote);
+                client.connected();
+                client.message(ServerMsg::ClipboardFocus { pane: Some(7), agent: true });
+                let (release, wait) = bounded(1);
+                client.input_with_clipboard(
+                    b"\x16discard",
+                    || Ok(false),
+                    move |cancelled, _| {
+                        wait.recv_timeout(crate::testing::PATIENCE).unwrap();
+                        assert!(cancelled.load(Ordering::SeqCst));
+                        Ok(b"discard clipboard".to_vec())
+                    },
+                );
+                client.input(&key[..split]);
+                let tail = [&key[split..], b"following"].concat();
+                if !client.input(&tail) {
+                    client.forward(&tail);
+                }
+                assert!(client.state.lock().unwrap().clipboard_read.is_none());
+                if !client.input(b"later") {
+                    client.forward(b"later");
+                }
+                assert_eq!(protocol::read_frame(&mut peer).unwrap().unwrap(), (protocol::BYTES, b"following".to_vec()));
+                assert_eq!(protocol::read_frame(&mut peer).unwrap().unwrap(), (protocol::BYTES, b"later".to_vec()));
+                release.send(()).unwrap();
+                client.wait_for_reads();
+                assert!(peer.incoming.try_recv().is_err());
+            }
+        }
+    }
+}
+
+#[test]
+fn control_v_reads_agent_text_locally_and_remotely_and_leaves_shell_keys_alone() {
     for remote in [false, true] {
         for agent in [false, true] {
             for connected in [false, true] {
@@ -466,33 +513,199 @@ fn control_v_only_probes_remote_panes_and_forwards_exact_keys_without_an_image()
                         client.connected();
                     }
                     client.message(ServerMsg::ClipboardFocus { pane: Some(7), agent });
-                    let probes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-                    let count = Arc::clone(&probes);
-                    let handled = client.input_with_probe(key, move || {
-                        count.fetch_add(1, Ordering::SeqCst);
-                        Ok(false)
-                    });
+                    let handled = client.input_with_clipboard(
+                        key,
+                        || Ok(false),
+                        move |_, _| {
+                            assert!(agent && connected);
+                            Ok(b"hello\nworld".to_vec())
+                        },
+                    );
                     if !handled {
                         client.forward(key);
                     }
-                    wait_for_probe(&client);
-                    assert_eq!(probes.load(Ordering::SeqCst), usize::from(remote && connected));
-                    assert_eq!(protocol::read_frame(&mut peer).unwrap().unwrap(), (protocol::BYTES, key.to_vec()));
+                    client.wait_for_reads();
+                    if connected && agent {
+                        assert_clipboard_paste(&mut peer, key, b"hello\nworld", false);
+                    } else {
+                        assert_eq!(protocol::read_frame(&mut peer).unwrap().unwrap(), (protocol::BYTES, key.to_vec()));
+                    }
                     assert!(peer.incoming.try_recv().is_err());
-                    let state = client.state.lock().unwrap();
-                    assert!(state.workers.is_empty());
-                    assert_eq!(state.image_notices.render(80, 24).is_empty(), !(remote && agent && connected));
                 }
             }
         }
     }
-    let (client, mut peer) = controller(true);
-    client.connected();
-    client.input_with_probe(b"\x16", || panic!("no focus received"));
-    assert_eq!(protocol::read_frame(&mut peer).unwrap().unwrap(), (protocol::BYTES, vec![0x16]));
-    client.message(ServerMsg::ClipboardFocus { pane: Some(7), agent: true });
-    client.disconnect();
-    assert!(client.state.lock().unwrap().focus.is_none());
+}
+
+impl Controller {
+    fn wait_for_reads(self: &Arc<Self>) {
+        let workers = self.state.lock().unwrap().workers.clone();
+        for done in workers {
+            let _ = done.recv_timeout(crate::testing::PATIENCE);
+        }
+        self.input(&[]);
+    }
+}
+
+#[test]
+fn agent_text_clipboard_empty_overflow_and_exact_limit() {
+    for remote in [false, true] {
+        for bytes in [Vec::new(), b"12345".to_vec(), b"1234".to_vec()] {
+            let (client, mut peer) = controller(remote);
+            client.connected();
+            client.set_clipboard_limit(4);
+            client.message(ServerMsg::ClipboardFocus { pane: Some(7), agent: true });
+            let content = bytes.clone();
+            client.input_with_clipboard(
+                b"\x16",
+                || Ok(false),
+                move |_, limit| {
+                    assert_eq!(limit, 4);
+                    Ok(content.clone())
+                },
+            );
+            client.wait_for_reads();
+            if bytes.len() == 4 {
+                assert_clipboard_paste(&mut peer, b"\x16", &bytes, false);
+            } else {
+                assert!(peer.incoming.try_recv().is_err());
+                let shown = String::from_utf8(client.state.lock().unwrap().image_notices.render(160, 24)).unwrap();
+                assert!(shown.contains(if bytes.is_empty() {
+                    "The clipboard is empty"
+                } else {
+                    super::super::clipboard_image::TEXT_TOO_LARGE
+                }));
+            }
+        }
+    }
+}
+
+#[test]
+fn text_clipboard_uses_the_normal_laptop_path_paste_flow() {
+    let path = dropped_file("clipboard-path");
+    for remote in [false, true] {
+        let (client, mut peer) = controller(remote);
+        client.connected();
+        client.message(ServerMsg::ClipboardFocus { pane: Some(7), agent: true });
+        let text = path.to_str().unwrap().as_bytes().to_vec();
+        let content = text.clone();
+        client.input_with_clipboard(b"\x16", || Ok(false), move |_, _| Ok(content.clone()));
+        client.wait_for_reads();
+        assert_clipboard_paste(&mut peer, b"\x16", &text, remote);
+        assert_eq!(client.state.lock().unwrap().dropped.is_some(), remote);
+        assert!(client.state.lock().unwrap().active.is_none());
+    }
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn pending_text_reads_cancel_on_control_c_focus_change_and_disconnect() {
+    for remote in [false, true] {
+        for action in 0..4 {
+            let (client, mut peer) = controller(remote);
+            client.connected();
+            client.message(ServerMsg::ClipboardFocus { pane: Some(7), agent: true });
+            let (release, wait) = bounded(1);
+            client.input_with_clipboard(
+                b"\x16after",
+                || Ok(false),
+                move |cancelled, _| {
+                    wait.recv_timeout(crate::testing::PATIENCE).unwrap();
+                    assert_eq!(cancelled.load(Ordering::SeqCst), action != 0);
+                    Ok(b"text".to_vec())
+                },
+            );
+            match action {
+                1 => {
+                    client.input(b"\x03");
+                }
+                2 => client.message(ServerMsg::ClipboardFocus { pane: Some(8), agent: true }),
+                3 => client.disconnect(),
+                _ => {}
+            }
+            release.send(()).unwrap();
+            client.wait_for_reads();
+            if action == 0 {
+                assert_clipboard_paste(&mut peer, b"\x16", b"text", false);
+                assert_eq!(protocol::read_frame(&mut peer).unwrap().unwrap(), (protocol::BYTES, b"after".to_vec()));
+            } else {
+                assert!(peer.incoming.try_recv().is_err());
+            }
+        }
+    }
+}
+
+#[test]
+fn a_cancelled_text_read_cannot_replace_a_later_reads_result() {
+    for remote in [false, true] {
+        let (client, mut peer) = controller(remote);
+        client.connected();
+        client.message(ServerMsg::ClipboardFocus { pane: Some(7), agent: true });
+        let (release_old, wait_old) = bounded(1);
+        client.input_with_clipboard(
+            b"\x16",
+            || Ok(false),
+            move |_, _| {
+                wait_old.recv_timeout(crate::testing::PATIENCE).unwrap();
+                Ok(b"old".to_vec())
+            },
+        );
+        let old_finished = client.state.lock().unwrap().workers[0].clone();
+        client.disconnect();
+        client.connected();
+        client.message(ServerMsg::ClipboardFocus { pane: Some(7), agent: true });
+        let (release_new, wait_new) = bounded(1);
+        client.input_with_clipboard(
+            b"\x16",
+            || Ok(false),
+            move |_, _| {
+                wait_new.recv_timeout(crate::testing::PATIENCE).unwrap();
+                Ok(b"new".to_vec())
+            },
+        );
+        release_old.send(()).unwrap();
+        assert!(matches!(
+            old_finished.recv_timeout(crate::testing::PATIENCE),
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected)
+        ));
+        assert!(client.state.lock().unwrap().clipboard_read.as_ref().unwrap().result.is_none());
+        release_new.send(()).unwrap();
+        client.wait_for_reads();
+        assert_clipboard_paste(&mut peer, b"\x16", b"new", false);
+        assert!(peer.incoming.try_recv().is_err());
+    }
+}
+
+#[test]
+fn a_terminal_paste_after_control_v_stays_after_the_clipboard_text() {
+    for remote in [false, true] {
+        for key in [b"\x16".as_slice(), b"\x1b[118;5u"] {
+            let following = paste::bracket(b"terminal paste");
+            for split in 0..=following.len() {
+                let (client, mut peer) = controller(remote);
+                client.connected();
+                client.message(ServerMsg::ClipboardFocus { pane: Some(7), agent: true });
+                let (release, wait) = bounded(1);
+                client.input_with_clipboard(
+                    &[key, &following[..split]].concat(),
+                    || Ok(false),
+                    move |_, _| {
+                        wait.recv_timeout(crate::testing::PATIENCE).unwrap();
+                        Ok(b"clipboard text".to_vec())
+                    },
+                );
+                client.input(&following[split..]);
+                release.send(()).unwrap();
+                client.wait_for_reads();
+                assert_clipboard_paste(&mut peer, key, b"clipboard text", false);
+                if remote {
+                    assert!(matches!(read(&mut peer), ClientMsg::PasteStart));
+                }
+                assert_eq!(protocol::read_frame(&mut peer).unwrap().unwrap(), (protocol::BYTES, following.clone()));
+                assert!(peer.incoming.try_recv().is_err());
+            }
+        }
+    }
 }
 
 #[test]
@@ -501,7 +714,7 @@ fn image_diagnostics_forward_keys_once_per_cause_and_survive_reconnection() {
         let (client, mut peer) = controller(true);
         client.connected();
         client.message(ServerMsg::ClipboardFocus { pane: Some(7), agent: true });
-        for failure in 0..4 {
+        for failure in 1..4 {
             for attempt in 0..2 {
                 client.input_with_probe(key, move || match failure {
                     0 => Ok(false),
@@ -522,7 +735,7 @@ fn image_diagnostics_forward_keys_once_per_cause_and_survive_reconnection() {
         client.disconnect();
         client.connected();
         client.message(ServerMsg::ClipboardFocus { pane: Some(7), agent: true });
-        client.input_with_probe(key, || Ok(false));
+        client.input_with_probe(key, || Err(Diagnostic::NoDisplay));
         assert_eq!(protocol::read_frame(&mut peer).unwrap().unwrap(), (protocol::BYTES, key.to_vec()));
         assert!(client.state.lock().unwrap().image_notices.render(80, 24).is_empty());
         client.input_with_probe(b"\r", || panic!("ordinary input must not probe"));
@@ -604,7 +817,7 @@ fn replacing_a_taller_notice_restores_its_whole_footprint_and_expiry_repaints() 
         (0..80).map(|col| terminal.grid()[Line(row)][Column(col)].c).collect::<String>().trim_end().to_owned()
     };
     assert!(row(&terminal, 22).contains("not recognized as an agent"));
-    client.image_notice(Diagnostic::NoImage);
+    client.image_notice(Diagnostic::Empty);
     assert!(matches!(read(&mut peer), ClientMsg::Repaint));
     client
         .output_with(background, 80, 24, |out| {
@@ -613,7 +826,7 @@ fn replacing_a_taller_notice_restores_its_whole_footprint_and_expiry_repaints() 
         })
         .unwrap();
     assert_eq!(row(&terminal, 22), "pane content on row 23");
-    assert!(row(&terminal, 23).contains("No image in the laptop clipboard"));
+    assert!(row(&terminal, 23).contains("The clipboard is empty"));
     client.expire_image_notice(Instant::now() + Duration::from_secs(5));
     assert!(matches!(read(&mut peer), ClientMsg::Repaint));
     client
@@ -1122,13 +1335,30 @@ fn images_read_once_and_use_acknowledged_chunks_even_for_local_sessions() {
         std::env::set_var("WAYLAND_DISPLAY", "test");
         std::env::remove_var("DISPLAY");
     }
-    for remote in [false, true] {
+    for (remote, shortcut) in
+        [false, true].into_iter().flat_map(|remote| [false, true].map(|shortcut| (remote, shortcut)))
+    {
         let (client, mut peer) = controller(remote);
-        client.message(ServerMsg::ClipboardImageOffer {
-            token: "ab".into(),
-            target: "pane".into(),
-            limits: Default::default(),
-        });
+        if shortcut {
+            client.connected();
+            client.message(ServerMsg::ClipboardFocus { pane: Some(7), agent: true });
+            client.input_with_probe(b"\x16", || Ok(true));
+            let ClientMsg::AttachmentRequest { token, image: true, .. } = read(&mut peer) else { panic!() };
+            assert!(client.state.lock().unwrap().active.is_none());
+            client.message(ServerMsg::AttachmentPrepared {
+                token,
+                target: "pane".into(),
+                limits: Default::default(),
+                broadcast: false,
+            });
+            assert_eq!(client.state.lock().unwrap().active.is_some(), !remote);
+        } else {
+            client.message(ServerMsg::ClipboardImageOffer {
+                token: "ab".into(),
+                target: "pane".into(),
+                limits: Default::default(),
+            });
+        }
         for attempt in 0..2 {
             let token = {
                 let state = client.state.lock().unwrap();
@@ -1139,7 +1369,9 @@ fn images_read_once_and_use_acknowledged_chunks_even_for_local_sessions() {
                     .or_else(|| state.dropped.as_ref().map(|d| d.token.clone()))
                     .unwrap()
             };
-            client.keys(b"\r");
+            if !shortcut || remote {
+                client.keys(b"\r");
+            }
             let ClientMsg::AttachmentStart { files, .. } = read_without_repaint(&mut peer) else {
                 panic!("image did not use attachment transport")
             };
@@ -1174,14 +1406,19 @@ fn images_read_once_and_use_acknowledged_chunks_even_for_local_sessions() {
                     limits: Default::default(),
                     broadcast: false,
                 });
-                assert!(client.state.lock().unwrap().active.is_none());
-                assert_eq!(std::fs::read_to_string(&log).unwrap(), reads, "retry must wait for local Send");
-                assert_eq!(client.state.lock().unwrap().view("server").unwrap().buttons, ["Send", "Cancel"]);
+                assert_eq!(client.state.lock().unwrap().active.is_some(), shortcut && !remote);
+                if !shortcut || remote {
+                    assert_eq!(std::fs::read_to_string(&log).unwrap(), reads, "retry must wait for local Send");
+                    assert_eq!(
+                        client.state.lock().unwrap().view("server").unwrap().buttons.len(),
+                        if shortcut { 3 } else { 2 }
+                    );
+                }
             }
         }
         client.shutdown();
     }
-    assert_eq!(std::fs::read_to_string(log).unwrap(), "read\nread\nread\nread\n");
+    assert_eq!(std::fs::read_to_string(log).unwrap(), "read\n".repeat(8));
     assert_eq!(std::fs::read_dir(&temporary).unwrap().count(), 0);
     let ready = root.join("ready");
     crate::testing::write_script(

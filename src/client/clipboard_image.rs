@@ -20,6 +20,7 @@ mod x11;
 
 #[cfg(not(target_os = "macos"))]
 const TOO_LARGE: &str = "clipboard image exceeds 16 MiB; save it and use Attach files";
+pub(super) const TEXT_TOO_LARGE: &str = "copy too large; raise clipboard.max_bytes and attach again";
 const PNG: &[u8] = b"\x89PNG\r\n\x1a\n";
 
 pub(super) struct Image {
@@ -109,7 +110,7 @@ fn read_commands(commands: Vec<Command>, cancelled: &AtomicBool) -> Result<Vec<u
 
 #[derive(Debug)]
 pub(super) enum Diagnostic {
-    NoImage,
+    Empty,
     MissingTool(&'static str),
     Failed(String),
     NoDisplay,
@@ -119,10 +120,10 @@ pub(super) enum Diagnostic {
 impl Diagnostic {
     fn message(&self) -> String {
         match self {
-            Self::NoImage => "No image in the laptop clipboard: copy a screenshot first".into(),
-            Self::MissingTool(tool) => format!("Ctrl+V could not read the laptop clipboard: install {tool}"),
-            Self::Failed(error) => format!("Ctrl+V could not read the laptop clipboard: {error}. Use Attach clipboard image to retry"),
-            Self::NoDisplay => "Ctrl+V could not read the laptop clipboard: run attach from your desktop terminal with WAYLAND_DISPLAY or DISPLAY set".into(),
+            Self::Empty => "The clipboard is empty".into(),
+            Self::MissingTool(tool) => format!("Ctrl+V could not read the clipboard: install {tool}"),
+            Self::Failed(error) => format!("Ctrl+V could not read the clipboard: {error}. Try Ctrl+V again"),
+            Self::NoDisplay => "Ctrl+V could not read the clipboard: run attach from your desktop terminal with WAYLAND_DISPLAY or DISPLAY set".into(),
             Self::NotAgent => "Ctrl+V did not attach an image: this pane is not recognized as an agent. Use Attach clipboard image".into(),
         }
     }
@@ -174,7 +175,7 @@ impl Notices {
     }
 }
 
-// Inspect only advertised types: ordinary Ctrl+V must never read clipboard content.
+// A probe reads only types; image content waits for local authorization.
 pub(super) fn available() -> Result<bool, Diagnostic> {
     let cancelled = AtomicBool::new(false);
     #[cfg(target_os = "macos")]
@@ -285,13 +286,23 @@ fn offers_image(types: &str) -> bool {
     }
 }
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub(super) struct Keys {
     parser: crate::input::InputParser,
     raw: Vec<u8>,
 }
 
 impl Keys {
+    pub fn control_v_end(&self, bytes: &[u8]) -> Option<usize> {
+        let mut parser = self.clone();
+        for (index, byte) in bytes.iter().enumerate() {
+            if parser.feed(std::slice::from_ref(byte)).iter().any(|(_, control_v)| *control_v) {
+                return Some(index + 1);
+            }
+        }
+        None
+    }
+
     pub fn pending(&self) -> bool {
         !self.raw.is_empty()
     }
@@ -370,6 +381,100 @@ pub(super) fn read(cancelled: &AtomicBool) -> Result<Image> {
     Ok(image)
 }
 
+pub(super) fn read_text(cancelled: &AtomicBool, limit: usize) -> Result<Vec<u8>> {
+    #[cfg(not(target_os = "macos"))]
+    let bytes = native::select(
+        display_present,
+        |backend| match backend {
+            native::Backend::Wayland => wayland::read_text(cancelled, limit),
+            native::Backend::X11 => x11::read_text(cancelled, limit),
+        },
+        || read_text_tools(cancelled, limit),
+    )
+    .map_err(|diagnostic| anyhow::anyhow!(diagnostic.message()))?;
+    #[cfg(target_os = "macos")]
+    let bytes = read_text_commands(vec![Command::new("pbpaste")], cancelled, limit)
+        .map_err(|diagnostic| anyhow::anyhow!(diagnostic.message()))?;
+    ensure!(!cancelled.load(Ordering::SeqCst), "clipboard read cancelled");
+    ensure!(bytes.len() <= limit, TEXT_TOO_LARGE);
+    std::str::from_utf8(&bytes).context("clipboard text is not UTF-8")?;
+    Ok(bytes)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn read_text_tools(cancelled: &AtomicBool, limit: usize) -> Result<Vec<u8>, Diagnostic> {
+    let mut failure = Diagnostic::NoDisplay;
+    for mut probe in probes() {
+        let out = match crate::exec::run_cancellable(&mut probe, TIMEOUT, 16 * 1024, cancelled) {
+            Ok(out) => out,
+            Err(error) => {
+                failure = Diagnostic::Failed(error.to_string());
+                continue;
+            }
+        };
+        if out.cancelled || cancelled.load(Ordering::SeqCst) {
+            return Err(Diagnostic::Failed("clipboard read cancelled".into()));
+        }
+        if out.timed_out {
+            return Err(Diagnostic::Failed("clipboard read timed out".into()));
+        }
+        if out.truncated {
+            return Err(Diagnostic::Failed("clipboard type list exceeds 16 KiB".into()));
+        }
+        if !out.success() {
+            failure = Diagnostic::Failed(tool_error(&out));
+            continue;
+        }
+        let wayland = probe.get_program() == "wl-paste";
+        let types = String::from_utf8_lossy(&out.stdout);
+        let Some(target) = tool_text_type(&types, wayland) else { return Ok(Vec::new()) };
+        let mut command = Command::new(probe.get_program());
+        if wayland {
+            command.args(["--no-newline", "--type", target]);
+        } else {
+            command.args(["-selection", "clipboard", "-out", "-target", target]);
+        }
+        return read_text_commands(vec![command], cancelled, limit);
+    }
+    Err(failure)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn tool_text_type(types: &str, wayland: bool) -> Option<&'static str> {
+    let targets = if wayland { ["text/plain;charset=utf-8", "text/plain"] } else { ["UTF8_STRING", "STRING"] };
+    targets.into_iter().find(|target| types.lines().any(|line| line.trim() == *target))
+}
+
+fn read_text_commands(commands: Vec<Command>, cancelled: &AtomicBool, limit: usize) -> Result<Vec<u8>, Diagnostic> {
+    let mut failure = Diagnostic::NoDisplay;
+    for mut command in commands {
+        let result = crate::exec::run_cancellable(&mut command, TIMEOUT, limit, cancelled);
+        match result {
+            Ok(out) => {
+                if out.cancelled || cancelled.load(Ordering::SeqCst) {
+                    return Err(Diagnostic::Failed("clipboard read cancelled".into()));
+                }
+                if out.truncated {
+                    return Err(Diagnostic::Failed(TEXT_TOO_LARGE.into()));
+                }
+                if out.timed_out {
+                    return Err(Diagnostic::Failed("clipboard read timed out".into()));
+                }
+                if out.success() {
+                    #[cfg(not(target_os = "macos"))]
+                    if command.get_args().last().is_some_and(|arg| arg == "STRING") {
+                        return Ok(out.stdout.into_iter().map(char::from).collect::<String>().into_bytes());
+                    }
+                    return Ok(out.stdout);
+                }
+                failure = Diagnostic::Failed(tool_error(&out));
+            }
+            Err(error) => failure = Diagnostic::Failed(error.to_string()),
+        }
+    }
+    Err(failure)
+}
+
 #[cfg(any(target_os = "macos", test))]
 fn limit_export(command: &mut Command) {
     use std::os::unix::process::CommandExt;
@@ -413,6 +518,32 @@ mod tests {
         let mut command = Command::new("sh");
         command.args(["-c", script]);
         command
+    }
+
+    #[test]
+    fn text_tools_preserve_bytes_and_refuse_overflow_timeout_and_cancellation() {
+        let stop = AtomicBool::new(false);
+        assert_eq!(read_text_commands(vec![shell("printf 'a\\nβ'")], &stop, 4).unwrap(), "a\nβ".as_bytes());
+        assert!(
+            read_text_commands(vec![shell("printf 12345")], &stop, 4).unwrap_err().message().contains(TEXT_TOO_LARGE)
+        );
+        assert_eq!(read_text_commands(vec![shell("printf ''")], &stop, 4).unwrap(), b"");
+        assert!(read_text_commands(vec![shell("sleep 60")], &stop, 4).unwrap_err().message().contains("timed out"));
+        stop.store(true, Ordering::SeqCst);
+        assert!(
+            read_text_commands(vec![shell("printf secret")], &stop, 100).unwrap_err().message().contains("cancelled")
+        );
+        #[cfg(not(target_os = "macos"))]
+        {
+            assert_eq!(
+                tool_text_type("text/plain\ntext/plain;charset=utf-8\n", true),
+                Some("text/plain;charset=utf-8")
+            );
+            assert_eq!(tool_text_type("STRING\nUTF8_STRING\n", false), Some("UTF8_STRING"));
+            assert_eq!(tool_text_type("STRING\n", false), Some("STRING"));
+            assert_eq!(tool_text_type("image/png\n", true), None);
+            assert_eq!(tool_text_type("", false), None);
+        }
     }
 
     #[test]
@@ -523,7 +654,7 @@ mod tests {
     fn notices_are_once_per_cause_wrap_in_notice_style_and_expire_without_consuming_keys() {
         let mut notices = Notices::default();
         for diagnostic in [
-            Diagnostic::NoImage,
+            Diagnostic::Empty,
             Diagnostic::MissingTool("wl-clipboard"),
             Diagnostic::Failed("wl-paste: permission denied".into()),
             Diagnostic::NoDisplay,
@@ -543,12 +674,12 @@ mod tests {
             assert!(notices.expire(std::time::Instant::now() + Duration::from_secs(5)));
             assert!(notices.render(80, 24).is_empty());
         }
-        assert!(!notices.show(Diagnostic::NoImage));
+        assert!(!notices.show(Diagnostic::Empty));
         assert!(!notices.show(Diagnostic::MissingTool("xclip")));
         assert!(!notices.show(Diagnostic::Failed("a different error".into())));
         assert!(!notices.show(Diagnostic::NoDisplay));
         assert!(!notices.show(Diagnostic::NotAgent));
-        assert!(Notices::default().show(Diagnostic::NoImage));
+        assert!(Notices::default().show(Diagnostic::Empty));
         let mut notices = Notices::default();
         notices.show(Diagnostic::Failed("bad\x1b[31m\nerror".into()));
         assert!(!String::from_utf8(notices.render(124, 24)).unwrap().contains("bad\x1b"));

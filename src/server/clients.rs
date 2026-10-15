@@ -197,6 +197,7 @@ impl Server {
             ClientMsg::ClipboardResult { id: copy, outcome, native_unavailable } => {
                 self.clipboard_result(id, copy, outcome, native_unavailable);
             }
+            ClientMsg::ClipboardPaste { pane, key, text, token } => self.clipboard_paste(id, pane, key, text, token),
             ClientMsg::PasteStart => self.reserve_paste(id),
             msg @ (ClientMsg::AttachmentRequest { .. }
             | ClientMsg::AttachmentText { .. }

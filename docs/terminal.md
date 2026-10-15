@@ -110,17 +110,17 @@ accessible graphical session it may fail; kraal cannot see that result as a clip
 `DISPLAY` can also name a forwarded X11 display, so it does not by itself prove which machine's
 clipboard is used.
 
-Panes inherit `DISPLAY` and `WAYLAND_DISPLAY`, when set, from the environment of the kraal
-server process. This is the environment that started that server, not a fresh environment
-from each attaching client. Attaching through `--host` does not replace it with your laptop's
-variables. Pane environment overrides still apply.
+Agent panes kraal launches, including workspace agents and restored agent panes, run without
+`DISPLAY` and `WAYLAND_DISPLAY`. Agents whose clipboard backend depends on these variables,
+including Codex, can then use OSC 52 so copies reach the attached client's terminal, locally
+or through `--host`. Account sign-in panes keep the variables because they may open a browser.
 
-These variables should remain inherited: panes also launch graphical applications, and the
-same session can have local and remote clients. Removing them globally would break valid
-local use and would not reliably make programs choose OSC 52. For remote copying, configure
-the program to use OSC 52. If its backend selection depends on these variables, launch just
-that program with `env -u WAYLAND_DISPLAY -u DISPLAY program` and check its documented fallback;
-unsetting them alone does not guarantee terminal copying, and does not disable macOS `pbcopy`.
+Shell panes inherit these variables from the environment that started the kraal server.
+Attaching through `--host` does not replace them with your laptop's variables. Programs you
+start in a shell keep that shell's environment. Configure those programs to use OSC 52, or
+start them with `env -u DISPLAY -u WAYLAND_DISPLAY program` when their backend selection depends
+on these variables. Unsetting them alone does not guarantee terminal copying and does not
+disable macOS `pbcopy`.
 
 ## Shell commands
 
@@ -261,27 +261,33 @@ keep their kind; older results without a kind use normal text.
 
 ### Clipboard images
 
-With `kraal attach --host SERVER`, press Ctrl+V in a pane where kraal recognizes an agent, including
-Claude Code and Codex. The laptop checks the clipboard's advertised types first. If an image is
+With a local attachment or `kraal attach --host SERVER`, press Ctrl+V in a pane where kraal
+recognizes an agent, including Claude Code and Codex. The client checks the clipboard's
+advertised types first. If an image is
 available, kraal sends it through the attachment connection and pastes its server path into that
 pane, without adding Enter. The agent can read the image at that path.
 
-The first image for a server opens **Send the clipboard image to SERVER?**, with **Send**,
-**Always for SERVER** and **Cancel**. Send allows subsequent Ctrl+V images during this attachment.
+Local attachments deliver the image without a consent question because it stays on the same
+machine. With `--host`, the first image for a server opens **Send the clipboard image to SERVER?**,
+with **Send**, **Always for SERVER** and **Cancel**. Send allows subsequent Ctrl+V images during this attachment.
 Always also remembers the SSH destination in the laptop's `paste-files.toml`, in separate
 `[[clipboard_image]]` entries beside file-drop permissions. Remove that entry and attach again
 to revoke it. Tab or arrows select a button, Enter or a click activates it. Cancel, Esc or Ctrl+C
 sends neither the image nor Ctrl+V. Broadcasting still asks before sending only to the named pane.
 
-With no image, Ctrl+V goes straight to the pane without reading clipboard content. In a recognized
-agent pane, a short notice says **No image in the laptop clipboard: copy a screenshot first**.
-If the clipboard advertises an image but the pane is not recognized as an agent, the key still
-goes through and a notice points to **Attach clipboard image**. Ordinary Ctrl+V with text in a
-shell or editor stays silent, including when clipboard tools are unavailable. Local sessions
-leave Ctrl+V unchanged. Both raw Ctrl+V and kitty keyboard presses work, including in Ghostty
-when Claude Code enables kitty keyboard flags. Empty bracketed pastes never trigger an image read.
-Each cause is shown at most once per attach, including across reconnects. Notices use kraal's
-notice style, disappear after four seconds, and do not consume Ctrl+V or subsequent typing.
+With no image, Ctrl+V reads text from the client's clipboard and submits it as the same
+bracketed paste the terminal would send. Pasted laptop paths use the normal file-drop flow,
+and the pane's bracketed paste mode applies. Text is limited by the attaching client's
+`clipboard.max_bytes`; oversized text is refused with **copy too large; raise
+clipboard.max_bytes and attach again**. An empty clipboard says **The clipboard is empty**.
+Ctrl+C cancels a pending text read; a focus change or disconnect discards its result.
+
+Non-agent panes keep their Ctrl+V behavior. With `--host`, an advertised image also produces
+a notice pointing to **Attach clipboard image**. Ordinary Ctrl+V with text in a shell or editor
+stays silent, including when clipboard tools are unavailable. Both raw Ctrl+V and kitty keyboard
+presses work, including in Ghostty when Claude Code enables kitty keyboard flags. Empty
+bracketed pastes never trigger a clipboard read. Each notice cause is shown at most once per
+attach, including across reconnects, and disappears after four seconds.
 
 **Attach clipboard image** remains available in the palette and pane menu, including in local
 sessions. It names the destination and asks for **Send** or **Cancel** before reading once.
@@ -297,18 +303,22 @@ tries `wl-paste` and then `xclip`, according to `WAYLAND_DISPLAY` and `DISPLAY`.
 
 If the type check is unavailable in an agent pane, the key is forwarded unchanged and a notice
 explains the next step. Only when native access and the fallback tools are unavailable does the
-notice say **Ctrl+V could not read the laptop clipboard: install wl-clipboard** or name `xclip`.
-A failed native read includes its error and points to **Attach clipboard image** to retry;
+notice say **Ctrl+V could not read the clipboard: install wl-clipboard** or name `xclip`.
+A failed native read includes its error and suggests retrying Ctrl+V;
 it does not switch to a tool after connecting. If neither display variable is set, run attach
 from a desktop terminal with its display environment. The environment must belong to the
-laptop client, not the server.
+attaching client, not the server.
 
 macOS uses `osascript -e 'clipboard info'` to check types and `osascript` to export the clipboard
-as PNG into a private file. Each native operation or helper has a two-second timeout.
+as PNG into a private file, and `pbpaste` for text. On Wayland, text prefers
+`text/plain;charset=utf-8`, then `text/plain`. X11 prefers `UTF8_STRING`, then `STRING`
+(converted from Latin-1). Text uses the same native backends before trying tools. Each native
+operation or helper has a two-second timeout.
 Missing tools, an unavailable PNG representation,
 failed reads and images larger than **16 MiB** produce a visible failure without pasting a path.
 Save a larger image and use **Attach files**. A failure stays open with **Retry** and **Close**.
-Retry shows the local question again before reading the clipboard. Success shows **Sent to SERVER**,
+Retry asks again before reading, except for local Ctrl+V images, which retry immediately.
+Success shows **Sent to SERVER**,
 the image filename, its final size and full progress bar, and **Path pasted into PANE.**
 It disappears after 1.5 seconds and passes typing to the pane.
 

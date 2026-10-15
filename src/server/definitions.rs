@@ -527,6 +527,7 @@ impl Server {
                         spec = agent_spec;
                     } else {
                         spec.startup_input = Some(format!("{agent}\r"));
+                        spec.agent_clipboard();
                     }
                 }
             }
