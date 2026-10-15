@@ -17,6 +17,7 @@ use serde::{Deserialize, Serialize};
 
 use super::Scope;
 use crate::protocol::{self, ClientMsg, ServerMsg};
+use crate::text::human_size;
 
 pub const CHUNK: usize = 64 * 1024;
 pub const WINDOW: usize = 256 * 1024 / CHUNK;
@@ -538,7 +539,7 @@ impl Receiver {
                 enough_space(bytes, free_space(&self.fd)?, &self.root)?;
                 enough_space(bytes, free_space(&self.destination_fd)?, &self.destination)?;
                 if !self.quiet {
-                    eprintln!("Copying {entries} entries ({bytes} bytes). Close this window to cancel.");
+                    announce(entries, bytes);
                 }
                 self.announced = Some((bytes, entries));
             }
@@ -573,7 +574,7 @@ impl Receiver {
                 *written += bytes.len() as u64;
                 self.written += bytes.len() as u64;
                 if !self.quiet {
-                    eprint!("\rReceived {} / {total} bytes", self.written);
+                    progress("Received", self.written, total);
                 }
             }
             Packet::End => {
@@ -602,7 +603,8 @@ impl Receiver {
                 }
                 self.done = true;
                 if !self.quiet {
-                    eprintln!("\nReceived {bytes} bytes. Installing the copy.");
+                    // Below the progress line, when there was one.
+                    eprintln!("{}Installing the copy.", if bytes > 0 { "\n" } else { "" });
                 }
             }
         }
@@ -799,6 +801,25 @@ impl Drop for Connection {
     }
 }
 
+/// What a copy window says first, e.g. "Copying 3 entries (2.9 MiB). Close this window to cancel."
+fn announce(entries: usize, bytes: u64) {
+    let noun = if entries == 1 { "entry" } else { "entries" };
+    eprintln!("Copying {entries} {noun} ({}). Close this window to cancel.", human_size(bytes));
+}
+
+/// A copy window's progress line, rewritten in place: "Sent 1.5 MiB / 2.9 MiB".
+fn progress(verb: &str, done: u64, total: u64) {
+    let (cols, _) = crossterm::terminal::size().unwrap_or((80, 24));
+    eprint!("{}", progress_line(verb, done, total, cols));
+}
+
+fn progress_line(verb: &str, done: u64, total: u64, cols: u16) -> String {
+    let mut line = format!("{verb} {} / {}", human_size(done), human_size(total));
+    // ASCII text: leave the last column free and erase any longer previous update.
+    line.truncate(usize::from(cols.saturating_sub(1)));
+    format!("\r{line}\x1b[K")
+}
+
 impl Connection {
     fn new(stream: UnixStream, token: String) -> Result<Self> {
         let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -898,7 +919,7 @@ impl Connection {
                 &mut || self.check(),
             )?;
             let mut window = Window::new();
-            let mut sent = 0;
+            let (mut sent, mut total) = (0, 0);
             let cancelled = self.cancelled.clone();
             let removal = send_sources(
                 sources,
@@ -911,12 +932,18 @@ impl Connection {
                         }
                     }
                     let wait = matches!(packet, Packet::Begin { .. } | Packet::Done);
-                    if let Packet::Begin { bytes, entries } = &packet {
-                        eprintln!("Copying {entries} entries ({bytes} bytes). Close this window to cancel.");
-                    }
-                    if let Packet::Chunk(data) = &packet {
-                        sent += data.len() / 4 * 3 - data.bytes().rev().take_while(|b| *b == b'=').count();
-                        eprint!("\rSent {sent} bytes");
+                    match &packet {
+                        Packet::Begin { bytes, entries } => {
+                            total = *bytes;
+                            announce(*entries, *bytes);
+                        }
+                        Packet::Chunk(data) => {
+                            sent += (data.len() / 4 * 3 - data.bytes().rev().take_while(|b| *b == b'=').count()) as u64;
+                            progress("Sent", sent, total);
+                        }
+                        // The next line goes below the progress line.
+                        Packet::Done if sent > 0 => eprintln!(),
+                        _ => {}
                     }
                     let sequence = window.sent()?;
                     self.send(FromClient::Data { sequence, packet })?;
@@ -1051,10 +1078,7 @@ pub fn run(socket: &Path, session: &str) -> Result<()> {
         ToClient::Ready(spec) => spec,
         _ => bail!("laptop copy was not authorized"),
     };
-    ensure!(
-        spec.remote.is_none() || spec.operation == Operation::Copy,
-        "Moving between the laptop and an SSH server is unavailable: copy, then delete"
-    );
+    ensure!(spec.remote.is_none() || spec.operation == Operation::Copy, crate::files::LAPTOP_SERVER_MOVE);
     if spec.operation == Operation::Delete {
         loop {
             match connection.receive()? {
@@ -1125,6 +1149,49 @@ mod tests {
 
     fn entry(path: &str, kind: Kind, size: u64) -> Packet {
         Packet::Entry(Entry { path: path.into(), kind, size, mode: 0o6755, seconds: 1_600_000_000, nanos: 123_456_789 })
+    }
+
+    #[test]
+    fn progress_stays_on_one_row_in_narrow_copy_windows() {
+        use alacritty_terminal::event::VoidListener;
+        use alacritty_terminal::grid::Dimensions;
+        use alacritty_terminal::index::{Column, Line};
+        use alacritty_terminal::term::{Config, Term};
+        use alacritty_terminal::vte::ansi::Processor;
+
+        struct Size(usize);
+        impl Dimensions for Size {
+            fn total_lines(&self) -> usize {
+                3
+            }
+            fn screen_lines(&self) -> usize {
+                3
+            }
+            fn columns(&self) -> usize {
+                self.0
+            }
+        }
+
+        // A 48% copy window in a 64-column terminal has fewer than 32 content columns.
+        for cols in [1, 12, 28, 30, 80] {
+            for verb in ["Sent", "Received"] {
+                let mut term = Term::new(Config::default(), &Size(cols), VoidListener);
+                let mut parser: Processor = Processor::new();
+                for (done, total) in [(9_999_999, 10_485_760), (10_485_760, 10_485_760), (3, 3)] {
+                    let output = progress_line(verb, done, total, cols as u16);
+                    parser.advance(&mut term, output.as_bytes());
+                    assert_eq!(term.grid().cursor.point.line, Line(0), "{cols} columns: {output:?}");
+                }
+                let row: String = (0..cols).map(|col| term.grid()[Line(0)][Column(col)].c).collect();
+                let expected = format!("{verb} 3 B / 3 B");
+                assert_eq!(row.trim_end(), expected[..expected.len().min(cols - 1)].trim_end());
+                assert!(
+                    !term.grid()[Line(0)][Column(cols - 1)]
+                        .flags
+                        .contains(alacritty_terminal::term::cell::Flags::WRAPLINE)
+                );
+            }
+        }
     }
 
     #[test]

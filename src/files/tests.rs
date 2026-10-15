@@ -1222,6 +1222,34 @@ fn copy_refreshes_only_its_owners_laptop_destination() {
 }
 
 #[test]
+fn laptop_panel_hints_name_its_operations() {
+    let hints = |pane: &FilesPane| pane.hints().iter().map(|h| format!("{} {}", h.label, h.text)).collect::<Vec<_>>();
+    let mut pane = offline(local(LEFT), local(RIGHT));
+    pane.set_viewer(7);
+    assert!(pane.set_laptop(Side::Left, laptop("~"), 7));
+    let request = pane.laptop_requests()[0].2;
+    pane.laptop_result(7, Side::Left, request, Ok(("~".into(), vec![file("report", 3)])));
+    let laptop_hints = [
+        "tab switch",
+        "enter directory",
+        "⌫ up",
+        "space mark",
+        "c copy →",
+        "m move",
+        "d delete",
+        "o machine",
+        "r refresh",
+        ". hidden",
+        "/ filter",
+        "q close",
+    ];
+    assert_eq!(hints(&pane), laptop_hints);
+    pane.key(FileKey::Tab);
+    let session_hints = hints(&pane);
+    assert!(["c copy ←", "m move", "e edit", "s shell"].iter().all(|h| session_hints.iter().any(|s| s == h)));
+}
+
+#[test]
 fn laptop_ssh_copies_keep_replacements_and_moves_are_refused_in_both_directions() {
     for to_laptop in [false, true] {
         let mut pane = offline(local(LEFT), remote("/destination"));
@@ -1234,6 +1262,7 @@ fn laptop_ssh_copies_keep_replacements_and_moves_are_refused_in_both_directions(
         if to_laptop {
             pane.key(FileKey::Tab);
         }
+        assert!(!pane.hints().iter().any(|h| h.label == "m"), "no move is offered between the laptop and a server");
         for key in [FileKey::Char('m'), FileKey::F(6)] {
             assert!(matches!(pane.key(key), FilesAction::Refused(why) if why.contains("copy, then delete")));
         }

@@ -305,35 +305,35 @@ impl FilesPane {
             hints.push(Hint::new("q", "close", Some(FileKey::Char('q'))));
             return hints;
         }
-        if matches!(self.panel(self.active).location, super::Location::Laptop { .. }) {
-            return vec![
-                Hint::new("tab", "switch", Some(FileKey::Tab)),
-                Hint::new("enter", "directory", Some(FileKey::Enter)),
-                Hint::new("⌫", "up", Some(FileKey::Backspace)),
-                Hint::new("o", "machine", Some(FileKey::Char('o'))),
-                Hint::new("r", "refresh", Some(FileKey::Char('r'))),
-                Hint::new(".", "hidden", Some(FileKey::Char('.'))),
-                Hint::new("/", "filter", Some(FileKey::Char('/'))),
-                Hint::new("q", "close", Some(FileKey::Char('q'))),
-            ];
-        }
         let arrow = if self.active == Side::Left { "→" } else { "←" };
-        vec![
+        let laptop = matches!(self.panel(self.active).location, super::Location::Laptop { .. });
+        let mut hints = vec![
             Hint::new("tab", "switch", Some(FileKey::Tab)),
-            Hint::new("enter", "open", Some(FileKey::Enter)),
+            Hint::new("enter", if laptop { "directory" } else { "open" }, Some(FileKey::Enter)),
             Hint::new("⌫", "up", Some(FileKey::Backspace)),
             Hint::new("space", "mark", Some(FileKey::Char(' '))),
             Hint { label: "c", text: format!("copy {arrow}"), key: Some(FileKey::Char('c')) },
-            Hint::new("m", "move", Some(FileKey::Char('m'))),
-            Hint::new("d", "delete", Some(FileKey::Char('d'))),
-            Hint::new("e", "edit", Some(FileKey::Char('e'))),
-            Hint::new("s", "shell", Some(FileKey::Char('s'))),
-            Hint::new("o", "server", Some(FileKey::Char('o'))),
+        ];
+        if !self.laptop_and_server() {
+            hints.push(Hint::new("m", "move", Some(FileKey::Char('m'))));
+        }
+        hints.push(Hint::new("d", "delete", Some(FileKey::Char('d'))));
+        if laptop {
+            hints.push(Hint::new("o", "machine", Some(FileKey::Char('o'))));
+        } else {
+            hints.extend([
+                Hint::new("e", "edit", Some(FileKey::Char('e'))),
+                Hint::new("s", "shell", Some(FileKey::Char('s'))),
+                Hint::new("o", "server", Some(FileKey::Char('o'))),
+            ]);
+        }
+        hints.extend([
             Hint::new("r", "refresh", Some(FileKey::Char('r'))),
             Hint::new(".", "hidden", Some(FileKey::Char('.'))),
             Hint::new("/", "filter", Some(FileKey::Char('/'))),
             Hint::new("q", "close", Some(FileKey::Char('q'))),
-        ]
+        ]);
+        hints
     }
 }
 
