@@ -615,7 +615,7 @@ mod tests {
             let row = (0..36).find(|&row| server.sidebar_hit(client, row) == Some(item.clone())).unwrap();
             let click = MouseEvent { kind: MouseKind::Press(MouseButton::Left), col: 2, row, mods: Default::default() };
             let mode = server.on_mouse(client, click, false).unwrap();
-            assert!(matches!(mode, Mode::Prompt(_) | Mode::AccountForm(_)));
+            assert!(matches!(mode, Mode::WorkspaceForm(_) | Mode::AccountForm(_)));
             server.clients.get_mut(&client).unwrap().mode = mode;
             server.client_input(client, b"\x1b");
             server.flush_client_input(client);
@@ -629,7 +629,7 @@ mod tests {
             picker.actions = Some(picker.action_keys().iter().position(|(_, label)| *label == action).unwrap());
             server.clients.get_mut(&client).unwrap().mode = Mode::Picker(picker);
             server.client_input(client, b"\r");
-            assert!(matches!(server.clients[&client].mode, Mode::Prompt(_)));
+            assert!(matches!(server.clients[&client].mode, Mode::WorkspaceForm(_)));
             server.client_input(client, b"\x1b");
             server.flush_client_input(client);
             assert!(matches!(server.clients[&client].mode, Mode::Normal));
@@ -810,7 +810,8 @@ mod tests {
                     server.new_workspace(format!("extra-{i}"), None);
                 }
                 let row = (0..rows).find(|&r| server.sidebar_hit(client, r) == Some(SideItem::AddWorkspace)).unwrap();
-                let Mode::Prompt(p) = server.on_mouse(client, click(MouseButton::Left, 3, row), false).unwrap() else {
+                let Mode::WorkspaceForm(p) = server.on_mouse(client, click(MouseButton::Left, 3, row), false).unwrap()
+                else {
                     panic!()
                 };
                 assert_eq!(p.title, "Add workspace");

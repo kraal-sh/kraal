@@ -705,6 +705,9 @@ impl Server {
         let overlay_cursor = match &c.mode {
             Mode::Picker(p) => Some(overlays::draw_picker(p, screen, buf)),
             Mode::Prompt(p) => Some(overlays::draw_prompt(p, screen, buf)),
+            Mode::ServerForm(p) => Some(super::server_ui::draw_form(p, screen, buf)),
+            Mode::TunnelForm(p) => Some(super::tunnel_ui::draw_form(p, screen, buf)),
+            Mode::WorkspaceForm(p) => Some(super::workspace_ui::draw_form(p, screen, buf)),
             Mode::AccountForm(form) => Some(super::account_ui::draw_form(form, screen, buf)),
             Mode::PaneForm(form) => Some(super::pane_ui::draw_form(form, screen, buf)),
             Mode::TunnelDetails(details) => {
@@ -767,7 +770,13 @@ impl Server {
         };
         let c = &self.clients[&id];
         match &c.mode {
-            Mode::Picker(_) | Mode::Prompt(_) | Mode::AccountForm(_) | Mode::PaneForm(_) => {
+            Mode::Picker(_)
+            | Mode::Prompt(_)
+            | Mode::ServerForm(_)
+            | Mode::TunnelForm(_)
+            | Mode::WorkspaceForm(_)
+            | Mode::AccountForm(_)
+            | Mode::PaneForm(_) => {
                 cursor = overlay_cursor.flatten();
             }
             Mode::Leader { .. }

@@ -20,6 +20,9 @@ Select a workspace and press Tab, or use its sidebar actions, for the operations
 | Share | **Export layout**, choose **File**, **Export**. Existing files need explicit replacement; a backup is kept. |
 
 A form error keeps the entered values. Correct the reported cause and use its retry action.
+Text fields scroll horizontally around the cursor, counting wide characters in terminal columns.
+When a result selects a workspace hidden by the current search, the list clears that search
+to reveal the workspace. A result whose row is already visible keeps the search.
 Closing an individual pane removes it from the layout; use **Close** on the workspace to keep
 all its panes for reopening. The last pane's removal leaves an empty, open workspace with
 **+ Add pane**, rather than deleting it. Quit (`ctrl+b q`) stops the session.

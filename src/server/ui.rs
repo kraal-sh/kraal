@@ -23,6 +23,9 @@ pub enum Mode {
     },
     Picker(Picker),
     Prompt(Prompt),
+    ServerForm(Prompt<Box<super::server_ui::ServerForm>>),
+    TunnelForm(Prompt<Box<super::tunnel_ui::TunnelForm>>),
+    WorkspaceForm(Prompt<Box<super::workspace_ui::WorkspaceForm>>),
     AccountForm(super::account_ui::AccountForm),
     PaneForm(Box<super::pane_ui::PaneForm>),
     AccountDetails(super::account_ui::AccountDetails),
@@ -76,7 +79,12 @@ impl Mode {
             Mode::Scroll => "COPY",
             Mode::Search { .. } => "SEARCH",
             Mode::Picker(_) => "CHOOSE",
-            Mode::Prompt(_) | Mode::AccountForm(_) | Mode::PaneForm(_) => "INPUT",
+            Mode::Prompt(_)
+            | Mode::ServerForm(_)
+            | Mode::TunnelForm(_)
+            | Mode::WorkspaceForm(_)
+            | Mode::AccountForm(_)
+            | Mode::PaneForm(_) => "INPUT",
             Mode::AccountDetails(_) => "ACCOUNT",
             Mode::TunnelDetails(_) => "TUNNEL",
             Mode::Help { .. } => "HELP",
@@ -109,12 +117,12 @@ pub enum ConfirmAction {
     AttachFiles(PaneId),
     AttachClipboardImage(PaneId),
     LoadWorkspace {
-        prompt: Prompt,
+        prompt: Prompt<Box<super::workspace_ui::WorkspaceForm>>,
         inventory: Vec<super::persistence::ClosePane>,
     },
     RemoveAccount(crate::accounts::Account),
     ReplaceWorkspaceFile {
-        prompt: Prompt,
+        prompt: Prompt<Box<super::workspace_ui::WorkspaceForm>>,
         save: super::definitions::DefinitionSave,
     },
     UseExisting {
@@ -214,7 +222,7 @@ impl ConfirmAction {
     pub fn verb(&self) -> String {
         match self {
             ConfirmAction::LoadWorkspace { prompt, .. } => {
-                if prompt.workspace_form.as_ref().unwrap().undo { "Stop and undo" } else { "Stop and load" }.into()
+                if prompt.data.undo { "Stop and undo" } else { "Stop and load" }.into()
             }
             ConfirmAction::ReplaceWorkspaceFile { .. } => "Replace file".into(),
             ConfirmAction::UseExisting { .. } => "Use account".into(),
@@ -642,6 +650,17 @@ impl Picker {
         self.selected = self.filtered.iter().position(|&i| matches(&self.items[i])).unwrap_or(0);
     }
 
+    /// Clear the search only when no matching row is visible, even if the target is absent.
+    /// Keep an open action menu; callers decide whether their result closes it.
+    pub fn reveal(&mut self, matches: impl Fn(&PickItem) -> bool) {
+        if !self.filtered.iter().any(|&i| matches(&self.items[i])) {
+            self.query.clear();
+            self.cursor = 0;
+            self.refilter();
+        }
+        self.select(matches);
+    }
+
     pub fn result(mut self, kind: NoticeKind, message: impl Into<String>) -> Mode {
         self.message = Some(message.into());
         self.message_kind = kind;
@@ -818,21 +837,12 @@ impl Picker {
 }
 
 pub enum PromptAction {
-    AddServer,
     RenameTab {
         workspace: u32,
         tab: u32,
     },
     RenamePane(PaneId),
-    RenameWorkspace(u32),
-    DuplicateWorkspace(u32),
-    RestoreWorkspace(String),
-    /// The value is the new workspace's name.
-    NewWorkspace,
     OpenPreview,
-    ExportWorkspace(u32),
-    ImportWorkspace,
-    ReviewWorkspace(u32),
     /// The value is local paths to upload to `server`.
     UploadPick {
         server: String,
@@ -857,7 +867,6 @@ pub enum PromptAction {
     RunOn {
         targets: Vec<String>,
     },
-    AddTunnel,
     /// The value of the runbook parameter being asked.
     RunbookValue,
 }
@@ -866,17 +875,11 @@ impl PromptAction {
     /// What Enter does, for the prompt's footer.
     pub fn verb(&self) -> &'static str {
         match self {
-            PromptAction::RenameTab { .. }
-            | PromptAction::RenamePane(_)
-            | PromptAction::RenameWorkspace(_)
-            | PromptAction::RenameAccount { .. } => "rename",
-            PromptAction::NewWorkspace | PromptAction::NewWorktree { .. } => "create",
-            PromptAction::RestoreWorkspace(_) => "restore",
-            PromptAction::DuplicateWorkspace(_) => "duplicate",
+            PromptAction::RenameTab { .. } | PromptAction::RenamePane(_) | PromptAction::RenameAccount { .. } => {
+                "rename"
+            }
+            PromptAction::NewWorktree { .. } => "create",
             PromptAction::OpenPreview => "open",
-            PromptAction::ExportWorkspace(_) => "export",
-            PromptAction::ImportWorkspace | PromptAction::AddServer | PromptAction::AddTunnel => "add",
-            PromptAction::ReviewWorkspace(_) => "review",
             PromptAction::UploadPick { .. } => "upload",
             PromptAction::Download => "download",
             PromptAction::Commit { .. } => "commit",
@@ -886,45 +889,27 @@ impl PromptAction {
     }
 }
 
-pub struct Prompt {
+pub struct Prompt<T = PromptAction> {
     pub title: String,
     pub value: String,
     /// Cursor in `value`, in characters.
     pub cursor: usize,
-    pub action: PromptAction,
+    pub data: T,
     /// Why the value was not accepted; the prompt stays open to fix it.
     pub error: Option<String>,
     pub scroll: usize,
     /// What is typed is not shown (a secret).
     pub masked: bool,
-    pub tunnel_form: Option<Box<super::tunnel_ui::TunnelForm>>,
-    pub server_form: Option<Box<super::server_ui::ServerForm>>,
-    pub workspace_form: Option<Box<super::workspace_ui::WorkspaceForm>>,
     pub back: Option<PickerState>,
 }
 
-impl Prompt {
-    pub fn new(title: &str, value: &str, action: PromptAction) -> Prompt {
-        Prompt {
+impl<T> Prompt<T> {
+    pub fn new(title: &str, value: &str, data: T) -> Self {
+        Self {
             title: title.into(),
             value: value.into(),
             cursor: value.chars().count(),
-            tunnel_form: matches!(action, PromptAction::AddTunnel)
-                .then(|| Box::new(super::tunnel_ui::TunnelForm::default())),
-            server_form: matches!(action, PromptAction::AddServer)
-                .then(|| Box::new(super::server_ui::ServerForm::default())),
-            workspace_form: matches!(
-                action,
-                PromptAction::NewWorkspace
-                    | PromptAction::RenameWorkspace(_)
-                    | PromptAction::DuplicateWorkspace(_)
-                    | PromptAction::RestoreWorkspace(_)
-                    | PromptAction::ReviewWorkspace(_)
-                    | PromptAction::ImportWorkspace
-                    | PromptAction::ExportWorkspace(_)
-            )
-            .then(|| Box::new(super::workspace_ui::WorkspaceForm::default())),
-            action,
+            data,
             error: None,
             scroll: 0,
             masked: false,
@@ -1123,6 +1108,42 @@ fn fuzzy_score(query: &str, text: &str) -> Option<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reveal_clears_only_a_hidden_target_search_and_preserves_open_actions() {
+        for (query, target, expected_query, expected_row) in [
+            ("b", "beta", "b", "beta"),
+            ("alpha", "beta", "", "beta"),
+            ("alpha", "missing", "", "alpha"),
+            ("missing", "+ Add server", "missing", "+ Add server"),
+        ] {
+            let mut picker = Picker::new(
+                PickerKind::Ssh,
+                "Servers",
+                vec![
+                    PickItem::new("alpha", "", PickAction::Ssh("alpha".into())),
+                    PickItem::new("beta", "", PickAction::Ssh("beta".into())),
+                    PickItem::new("+ Add server", "", PickAction::AddServer(None)),
+                ],
+            );
+            picker.query = query.into();
+            picker.cursor = 1;
+            picker.refilter();
+            picker.actions = Some(1);
+            picker.reveal(|item| item.label == target);
+            assert_eq!(picker.query, expected_query);
+            assert_eq!(picker.cursor, usize::from(!expected_query.is_empty()));
+            assert_eq!(picker.current().unwrap().label, expected_row);
+            assert_eq!(picker.actions, Some(1));
+            assert_eq!(picker.filtered.last(), Some(&2));
+        }
+        let mut picker = Picker::new(PickerKind::Ssh, "Servers", Vec::new());
+        picker.query = "missing".into();
+        picker.cursor = 7;
+        picker.reveal(|_| true);
+        assert_eq!((picker.query.as_str(), picker.cursor, picker.selected), ("", 0, 0));
+        assert!(picker.current().is_none());
+    }
 
     #[test]
     fn workspace_selection_survives_renames_and_distinguishes_same_named_files() {

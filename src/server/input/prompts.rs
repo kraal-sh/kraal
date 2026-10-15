@@ -7,20 +7,12 @@ use crate::pane::PaneSpec;
 use crate::paths;
 use crate::protocol::Placement;
 use crate::server::ui::{ConfirmAction, Mode, Prompt, PromptAction, Question};
+use crate::server::workspace_ui::WorkspaceAction;
 use crate::server::{ClientId, Server};
 use crate::theme::NoticeKind;
 
 impl Server {
     pub(super) fn on_prompt(&mut self, id: ClientId, mut p: Prompt, ev: InputEvent) -> Mode {
-        if p.tunnel_form.is_some() {
-            return self.on_tunnel_form(id, p, ev);
-        }
-        if p.server_form.is_some() {
-            return self.on_server_form(id, p, ev);
-        }
-        if p.workspace_form.is_some() {
-            return self.on_workspace_form(id, p, ev);
-        }
         let layout = crate::server::overlays::prompt_layout(&p, self.client_screen(id));
         p.scroll = p.scroll.min(layout.max_scroll);
         match ev {
@@ -61,22 +53,13 @@ impl Server {
 
     pub(super) fn submit_prompt(&mut self, id: ClientId, mut p: Prompt) -> Mode {
         p.scroll = 0;
-        if p.tunnel_form.is_some() {
-            return self.submit_tunnel_form(p);
-        }
-        if p.server_form.is_some() {
-            return self.submit_server_form(id, p);
-        }
-        if p.workspace_form.is_some() {
-            return self.submit_workspace_form(id, p);
-        }
-        if matches!(p.action, PromptAction::RunbookValue) {
+        if matches!(p.data, PromptAction::RunbookValue) {
             return self.set_draft_value(id, p.value);
         }
         let title = p.title.clone();
         let (value, cursor, masked) = (p.value.clone(), p.cursor, p.masked);
         let back = p.back.clone();
-        let renamed = match &p.action {
+        let renamed = match &p.data {
             PromptAction::RenameAccount { agent, account } => self.accounts.get(agent, account).map(|a| a.id),
             _ => None,
         };
@@ -92,26 +75,16 @@ impl Server {
                 }
             }
             // Not accepted: the prompt stays, with the reason under it.
-            Err((action, why)) => Mode::Prompt(Prompt {
-                title,
-                value,
-                cursor,
-                action,
-                error: Some(why),
-                scroll: 0,
-                masked,
-                workspace_form: None,
-                server_form: None,
-                tunnel_form: None,
-                back,
-            }),
+            Err((action, why)) => {
+                Mode::Prompt(Prompt { title, value, cursor, data: action, error: Some(why), scroll: 0, masked, back })
+            }
         }
     }
 
     /// Act on a prompt's value; a value that cannot be used gives the action back with why.
     pub(super) fn commit_prompt(&mut self, id: ClientId, p: Prompt) -> Result<(), (PromptAction, String)> {
         let value = p.value.trim().to_string();
-        match p.action {
+        match p.data {
             // Answered in submit_prompt, which goes on to the next question.
             PromptAction::RunbookValue => {}
             PromptAction::RenameTab { workspace, tab } => {
@@ -125,20 +98,9 @@ impl Server {
             PromptAction::RenamePane(pane) => {
                 self.rename_pane(pane, (!value.is_empty()).then_some(value));
             }
-            PromptAction::RenameWorkspace(_)
-            | PromptAction::DuplicateWorkspace(_)
-            | PromptAction::AddTunnel
-            | PromptAction::AddServer
-            | PromptAction::NewWorkspace
-            | PromptAction::RestoreWorkspace(_)
-            | PromptAction::ReviewWorkspace(_)
-            | PromptAction::ImportWorkspace
-            | PromptAction::ExportWorkspace(_) => {
-                unreachable!("answered in submit_prompt")
-            }
             PromptAction::OpenPreview => {
                 if value.is_empty() {
-                    return Err((p.action, "Type the path of a file or directory.".into()));
+                    return Err((p.data, "Type the path of a file or directory.".into()));
                 }
                 let base = self.client_focus(id).and_then(|p| self.panes.get(&p)).and_then(|p| p.current_cwd());
                 let mut path = paths::expand_tilde(&value);
@@ -148,7 +110,7 @@ impl Server {
                     path = b.join(path);
                 }
                 if !path.exists() {
-                    return Err((p.action, format!("{} does not exist.", paths::shorten_home(&path))));
+                    return Err((p.data, format!("{} does not exist.", paths::shorten_home(&path))));
                 }
                 let Some(ws) = self.clients.get(&id).map(|c| c.workspace) else { return Ok(()) };
                 let spec = PaneSpec { preview: Some(path), ..Default::default() };
@@ -175,11 +137,11 @@ impl Server {
             }
             PromptAction::Download => {
                 if !value.contains(':') {
-                    return Err((p.action, "Type server:path, the file to download.".into()));
+                    return Err((p.data, "Type server:path, the file to download.".into()));
                 }
                 let dir = paths::expand_tilde(&self.config.servers.download_dir);
                 if let Err(e) = std::fs::create_dir_all(&dir) {
-                    return Err((p.action, format!("{}: {e}", dir.display())));
+                    return Err((p.data, format!("{}: {e}", dir.display())));
                 }
                 self.start_job(id, "download", vec!["cp".into(), "--".into(), value, format!("{}/", dir.display())]);
             }
@@ -316,10 +278,10 @@ impl Server {
             ConfirmAction::LoadWorkspace { prompt, inventory } => {
                 return if yes {
                     self.load_source_form(id, prompt, Some(inventory))
-                } else if prompt.workspace_form.as_ref().unwrap().undo {
+                } else if prompt.data.undo {
                     self.workspace_form_back(id, prompt, None)
                 } else {
-                    Mode::Prompt(prompt)
+                    Mode::WorkspaceForm(prompt)
                 };
             }
             ConfirmAction::ApplyPane(form) => {
@@ -350,9 +312,9 @@ impl Server {
             }
             ConfirmAction::ReplaceWorkspaceFile { mut prompt, save } => {
                 if !yes {
-                    return Mode::Prompt(prompt);
+                    return Mode::WorkspaceForm(prompt);
                 }
-                let PromptAction::ExportWorkspace(ws) = prompt.action else { unreachable!() };
+                let WorkspaceAction::Export(ws) = prompt.data.action else { unreachable!() };
                 let result = self
                     .ws_index(ws)
                     .context("This workspace is no longer available; cancel and choose a workspace.")
@@ -364,7 +326,7 @@ impl Server {
                     Err(e) => {
                         prompt.error = Some(format!("{e:#}"));
                         prompt.scroll = 0;
-                        return Mode::Prompt(prompt);
+                        return Mode::WorkspaceForm(prompt);
                     }
                 }
             }
@@ -840,19 +802,25 @@ mod tests {
         let (client, _peer) = crate::server::tests::client(&mut server);
         let current = server.clients[&client].workspace;
         server.env.shell = "/nonexistent/kraal-shell".into();
-        let mut p = Prompt::new("New workspace", " café 日 ", PromptAction::NewWorkspace);
+        let mut p = Prompt::new(
+            "New workspace",
+            " café 日 ",
+            crate::server::workspace_ui::WorkspaceForm::new(WorkspaceAction::New),
+        );
         p.cursor = 3;
         for _ in 0..2 {
-            let Mode::Prompt(next) = server.on_prompt(client, p, key(KeyCode::Enter)) else { panic!("keep input") };
+            let Mode::WorkspaceForm(next) = server.on_workspace_form(client, p, key(KeyCode::Enter)) else {
+                panic!("keep input")
+            };
             assert_eq!((next.value.as_str(), next.cursor), (" café 日 ", 3));
-            assert!(matches!(next.action, PromptAction::NewWorkspace));
+            assert!(matches!(next.data.action, WorkspaceAction::New));
             assert!(next.error.as_ref().unwrap().contains("Couldn't start the shell. No workspace was added."));
             assert_eq!(server.workspaces.len(), 1);
             assert_eq!(server.clients[&client].workspace, current);
             assert!(server.panes.is_empty());
             p = next;
         }
-        assert!(matches!(server.on_prompt(client, p, key(KeyCode::Esc)), Mode::Normal));
+        assert!(matches!(server.on_workspace_form(client, p, key(KeyCode::Esc)), Mode::Normal));
         assert_eq!(server.workspaces[0].id, current);
     }
 
@@ -862,8 +830,14 @@ mod tests {
         let mut server = crate::server::tests::server(tx);
         let (client, _peer) = crate::server::tests::client(&mut server);
         for (value, error) in [("  ", "Type a name."), (" test ", "already used")] {
-            let p = Prompt::new("New workspace", value, PromptAction::NewWorkspace);
-            let Mode::Prompt(p) = server.on_prompt(client, p, key(KeyCode::Enter)) else { panic!("keep input") };
+            let p = Prompt::new(
+                "New workspace",
+                value,
+                crate::server::workspace_ui::WorkspaceForm::new(WorkspaceAction::New),
+            );
+            let Mode::WorkspaceForm(p) = server.on_workspace_form(client, p, key(KeyCode::Enter)) else {
+                panic!("keep input")
+            };
             assert_eq!(p.value, value);
             assert!(p.error.as_ref().unwrap().contains(error));
             assert_eq!(server.workspaces.len(), 1);

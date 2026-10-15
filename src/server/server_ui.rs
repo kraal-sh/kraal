@@ -3,12 +3,14 @@
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 
-use super::ui::{Mode, Picker, PickerState, Prompt, PromptAction};
+use super::ui::{Mode, Picker, PickerState, Prompt};
 use super::{ClientId, Server, forms, overlays};
 use crate::ansi::Cursor;
 use crate::input::InputEvent;
 use crate::servers::{self, Inventory};
 use crate::theme::NoticeKind;
+
+type ServerPrompt = Prompt<Box<ServerForm>>;
 
 #[derive(Default)]
 pub struct ServerForm {
@@ -21,8 +23,19 @@ pub struct ServerForm {
     named: bool,
 }
 
-fn buttons(p: &Prompt) -> forms::Buttons<'static> {
-    let pending = p.server_form.as_ref().is_some_and(|f| f.pending.is_some());
+impl ServerPrompt {
+    fn state(&mut self) -> forms::FormState<'_> {
+        forms::FormState {
+            field: &mut self.data.field,
+            scroll: &mut self.scroll,
+            error: &mut self.error,
+            pending: &mut self.data.pending,
+        }
+    }
+}
+
+fn buttons(p: &ServerPrompt) -> forms::Buttons<'static> {
+    let pending = p.data.pending.is_some();
     forms::Buttons {
         primary: forms::Button { field: 2, label: if p.error.is_some() { "Retry" } else { "Add" } },
         alternate: None,
@@ -30,17 +43,13 @@ fn buttons(p: &Prompt) -> forms::Buttons<'static> {
     }
 }
 
-fn form_layout(p: &Prompt, screen: Rect) -> forms::FormLayout {
-    let (message, error) = if p.server_form.as_ref().is_some_and(|f| f.pending.is_some()) {
-        ("Saving server...", None)
-    } else {
-        ("", p.error.as_deref())
-    };
+fn form_layout(p: &ServerPrompt, screen: Rect) -> forms::FormLayout {
+    let (message, error) = if p.data.pending.is_some() { ("Saving server...", None) } else { ("", p.error.as_deref()) };
     forms::FormLayout::new(screen, 2, message, error, &buttons(p))
 }
 
-pub(super) fn draw_form(p: &Prompt, screen: Rect, buf: &mut Buffer) -> Option<Cursor> {
-    let form = p.server_form.as_ref()?;
+pub(super) fn draw_form(p: &ServerPrompt, screen: Rect, buf: &mut Buffer) -> Option<Cursor> {
+    let form = p.data.as_ref();
     let layout = form_layout(p, screen);
     overlays::frame(layout.area, &p.title, crate::theme::current().accent, buf);
     let address = forms::draw_text_field(
@@ -60,8 +69,8 @@ pub(super) fn draw_form(p: &Prompt, screen: Rect, buf: &mut Buffer) -> Option<Cu
     address.or(name)
 }
 
-fn target(p: &Prompt, known: &[servers::Known]) -> Option<servers::Server> {
-    let form = p.server_form.as_ref()?;
+fn target(p: &ServerPrompt, known: &[servers::Known]) -> Option<servers::Server> {
+    let form = p.data.as_ref();
     let address = form.address.trim();
     // Keep keys and jump hosts from a discovered command when its address has not been edited.
     form.suggested
@@ -81,11 +90,11 @@ fn target(p: &Prompt, known: &[servers::Known]) -> Option<servers::Server> {
 }
 
 impl Server {
-    pub(super) fn add_server_form(&self, from: Option<&Picker>, suggested: Option<&servers::Server>) -> Prompt {
+    pub(super) fn add_server_form(&self, from: Option<&Picker>, suggested: Option<&servers::Server>) -> ServerPrompt {
         let address =
             suggested.map(servers::Server::address).unwrap_or_else(|| from.map_or("", |p| p.query.trim()).into());
-        let mut p = Prompt::new("Add server", "", PromptAction::AddServer);
-        let form = p.server_form.as_mut().unwrap();
+        let mut p = Prompt::new("Add server", "", Box::<ServerForm>::default());
+        let form = p.data.as_mut();
         form.cursor = address.chars().count();
         form.address = address;
         form.suggested = suggested.cloned();
@@ -94,18 +103,18 @@ impl Server {
         p
     }
 
-    fn suggest_server_name(&self, p: &mut Prompt) {
-        if !p.server_form.as_ref().unwrap().named {
+    fn suggest_server_name(&self, p: &mut ServerPrompt) {
+        if !p.data.named {
             p.value = target(p, &self.known_servers).map_or_else(String::new, |s| s.name.replace(':', "-"));
             p.cursor = p.value.chars().count();
         }
     }
 
-    pub(super) fn on_server_form(&mut self, id: ClientId, mut p: Prompt, event: InputEvent) -> Mode {
+    pub(super) fn on_server_form(&mut self, id: ClientId, mut p: ServerPrompt, event: InputEvent) -> Mode {
         let layout = form_layout(&p, self.client_screen(id));
         let buttons = buttons(&p);
         let before = p.value.clone();
-        let form = p.server_form.as_mut().unwrap();
+        let form = p.data.as_mut();
         let address = form.address.clone();
         let outcome = forms::FormState {
             field: &mut form.field,
@@ -137,38 +146,39 @@ impl Server {
             self.suggest_server_name(&mut p);
         }
         match outcome {
-            forms::FormEvent::Cancel => self.form_back(id, p.server_form.as_mut().unwrap().back.take()),
+            forms::FormEvent::Cancel => self.form_back(id, p.data.back.take()),
             forms::FormEvent::Submit => self.submit_server_form(id, p),
-            _ => Mode::Prompt(p),
+            _ => Mode::ServerForm(p),
         }
     }
 
-    pub(super) fn submit_server_form(&mut self, id: ClientId, mut p: Prompt) -> Mode {
-        if p.server_form.as_ref().unwrap().pending.is_some() {
-            return Mode::Prompt(p);
+    pub(super) fn submit_server_form(&mut self, id: ClientId, mut p: ServerPrompt) -> Mode {
+        if p.data.pending.is_some() {
+            return Mode::ServerForm(p);
         }
         let Some(mut entry) = target(&p, &self.known_servers) else {
             p.error = Some("Enter an address such as admin@db.lan or admin@db.lan:2222.".into());
-            return Mode::Prompt(p);
+            return Mode::ServerForm(p);
         };
         entry.name = p.value.trim().to_string();
         entry.agents = None;
         if !servers::valid_name(&entry.name) {
             p.error = Some("Use letters, digits, hyphens, underscores or periods for Name.".into());
-            return Mode::Prompt(p);
+            return Mode::ServerForm(p);
         }
         let token = self.alloc_id();
-        p.server_form.as_mut().unwrap().pending = Some(token);
+        if !p.state().begin(token) {
+            return Mode::ServerForm(p);
+        }
         p.error = None;
         p.scroll = 0;
         if !self.background(
             move || Inventory::update(|inv| inv.add_named(entry)),
             move |server, result| server.server_form_saved(id, token, result),
         ) {
-            p.server_form.as_mut().unwrap().pending = None;
-            p.error = Some("Couldn't start saving. Retry.".into());
+            p.state().complete(token, Some("Couldn't start saving. Retry.".into()));
         }
-        Mode::Prompt(p)
+        Mode::ServerForm(p)
     }
 
     fn server_form_saved(&mut self, id: ClientId, token: u32, result: anyhow::Result<(String, bool)>) {
@@ -176,9 +186,10 @@ impl Server {
             let defs = self.definitions().into_iter().filter_map(|(_, d)| d.ok()).collect::<Vec<_>>();
             self.refresh_known(&defs);
         }
-        let active = self.clients.get(&id).is_some_and(
-            |c| matches!(&c.mode, Mode::Prompt(p) if p.server_form.as_ref().is_some_and(|f| f.pending == Some(token))),
-        );
+        let active = self
+            .clients
+            .get(&id)
+            .is_some_and(|c| matches!(&c.mode, Mode::ServerForm(p) if p.data.pending == Some(token)));
         if !active {
             self.toast(
                 id,
@@ -191,30 +202,26 @@ impl Server {
             );
             return;
         }
-        let Mode::Prompt(mut p) = std::mem::replace(&mut self.clients.get_mut(&id).unwrap().mode, Mode::Normal) else {
+        let Mode::ServerForm(mut p) = std::mem::replace(&mut self.clients.get_mut(&id).unwrap().mode, Mode::Normal)
+        else {
             unreachable!()
         };
         let mode = match result {
             Ok((name, added)) => {
+                p.state().complete(token, None);
                 let mut picker = self.ssh_picker();
-                let back = p.server_form.as_mut().unwrap().back.take();
+                let back = p.data.back.take();
                 if let Some(state) = back.clone() {
                     picker.restore(state);
                 }
                 picker.close_to = back.map(Box::new);
-                if !picker.filtered.iter().any(|&i| picker.items[i].label == name) {
-                    picker.query.clear();
-                    picker.cursor = 0;
-                    picker.refilter();
-                }
                 picker.actions = None;
-                picker.select(|i| matches!(&i.action, super::ui::PickAction::Ssh(s) if *s == name));
+                picker.reveal(|i| matches!(&i.action, super::ui::PickAction::Ssh(s) if *s == name));
                 picker.result(NoticeKind::Notice, if added { "Server added" } else { "Server already saved" })
             }
             Err(e) => {
-                p.server_form.as_mut().unwrap().pending = None;
-                p.error = Some(format!("Couldn't save server.\n{e:#}\nFix the cause and retry."));
-                Mode::Prompt(p)
+                p.state().complete(token, Some(format!("Couldn't save server.\n{e:#}\nFix the cause and retry.")));
+                Mode::ServerForm(p)
             }
         };
         self.clients.get_mut(&id).unwrap().mode = mode;
@@ -243,6 +250,69 @@ mod tests {
     }
 
     #[test]
+    fn late_save_errors_preserve_each_kind_of_input_and_a_new_pending_save() {
+        let (tx, _rx) = crate::server::event_channel(32);
+        let mut server = crate::server::tests::server(tx);
+        let (client, _peer) = crate::server::tests::client(&mut server);
+        let mut pending = server.add_server_form(None, None);
+        assert!(pending.state().begin(43));
+        for mode in [
+            Mode::Prompt(Prompt::new("Name", "", super::super::ui::PromptAction::RenamePane(0))),
+            Mode::ServerForm(pending),
+            Mode::TunnelForm(server.add_tunnel_form(None, "db")),
+            Mode::WorkspaceForm(server.add_workspace_form(client, None)),
+        ] {
+            let kind = std::mem::discriminant(&mode);
+            server.clients.get_mut(&client).unwrap().mode = mode;
+            server.client_input(client, b"draft");
+            server.server_form_saved(client, 42, Err(anyhow::anyhow!("late failure")));
+            let c = &server.clients[&client];
+            assert_eq!(std::mem::discriminant(&c.mode), kind);
+            assert_eq!(c.toast.as_ref().unwrap().0, "Couldn't save server: late failure. Open Add server to retry.");
+            match &c.mode {
+                Mode::Prompt(p) => assert_eq!(p.value, "draft"),
+                Mode::ServerForm(p) => {
+                    assert_eq!(p.data.pending, Some(43));
+                    assert!(p.data.address.is_empty());
+                    assert!(p.error.is_none());
+                }
+                Mode::TunnelForm(p) => assert_eq!(p.value, "draft"),
+                Mode::WorkspaceForm(p) => assert!(p.value.ends_with("draft")),
+                _ => panic!("input was closed"),
+            }
+        }
+        assert!(server.jobs.is_empty());
+    }
+
+    #[test]
+    fn pending_server_forms_ignore_mouse_submissions_and_close_without_losing_the_result() {
+        let (tx, _rx) = crate::server::event_channel(32);
+        let mut server = crate::server::tests::server(tx);
+        let (client, _peer) = crate::server::tests::client(&mut server);
+        for (width, height) in [(20, 12), (32, 12), (80, 24)] {
+            let c = server.clients.get_mut(&client).unwrap();
+            (c.cols, c.rows) = (width, height);
+            let mut p = server.add_server_form(None, None);
+            assert!(p.state().begin(42));
+            let layout = form_layout(&p, server.client_screen(client));
+            let mut buf = Buffer::empty(server.client_screen(client));
+            let cursor = draw_form(&p, buf.area, &mut buf).unwrap();
+            assert!(buf.area.contains(ratatui::layout::Position::new(cursor.x, cursor.y)));
+            for event in [click(layout.primary), key("enter"), click(layout.fields[1]), key("tab")] {
+                let Mode::ServerForm(next) = server.on_server_form(client, p, event) else { panic!("keep saving") };
+                p = next;
+                assert_eq!(p.data.pending, Some(42));
+                assert_eq!(p.data.field, 0);
+            }
+            assert!(matches!(server.on_server_form(client, p, click(layout.cancel)), Mode::Normal));
+            server.clients.get_mut(&client).unwrap().mode = Mode::Normal;
+            server.server_form_saved(client, 42, Err(anyhow::anyhow!("closed")));
+            assert!(matches!(server.clients[&client].mode, Mode::Normal));
+        }
+        assert!(server.jobs.is_empty());
+    }
+
+    #[test]
     fn server_cancel_and_saved_result_close_return_to_the_origin() {
         let (tx, _rx) = crate::server::event_channel(32);
         let mut server = crate::server::tests::server(tx);
@@ -262,14 +332,14 @@ mod tests {
                     0 => key("esc"),
                     1 => click(layout.cancel),
                     _ => {
-                        p.server_form.as_mut().unwrap().field = buttons(&p).cancel.field;
+                        p.data.field = buttons(&p).cancel.field;
                         key("enter")
                     }
                 };
                 forms::assert_return(server.on_server_form(client, p, event), from);
                 let mut p = server.add_server_form(from, None);
-                p.server_form.as_mut().unwrap().pending = Some(42);
-                server.clients.get_mut(&client).unwrap().mode = Mode::Prompt(p);
+                p.data.pending = Some(42);
+                server.clients.get_mut(&client).unwrap().mode = Mode::ServerForm(p);
                 server.server_form_saved(client, 42, Ok(("db".into(), true)));
                 server.client_input(client, b"\x1b");
                 server.flush_client_input(client);
@@ -300,13 +370,13 @@ mod tests {
                     if mouse { format!("\x1b[<0;{};{}M", layout.list.x + 1, layout.list.y + 1) } else { "\r".into() };
                 server.clients.get_mut(&client).unwrap().mode = Mode::Picker(picker);
                 server.client_input(client, input.as_bytes());
-                let Mode::Prompt(mut p) =
+                let Mode::ServerForm(mut p) =
                     std::mem::replace(&mut server.clients.get_mut(&client).unwrap().mode, Mode::Normal)
                 else {
                     panic!("Add form")
                 };
                 assert_eq!(p.value, "db");
-                assert_eq!(p.server_form.as_ref().unwrap().address, "admin@db.lan:2222");
+                assert_eq!(p.data.address, "admin@db.lan:2222");
                 p.error = Some("A detailed error. ".repeat(300) + "Last detail.");
                 let screen = server.client_screen(client);
                 let layout = form_layout(&p, screen);
@@ -344,7 +414,7 @@ mod tests {
             key("ctrl+u"),
             InputEvent::Paste(b"ops@[::1]:22".to_vec()),
         ] {
-            let Mode::Prompt(next) = server.on_server_form(client, p, event) else { panic!() };
+            let Mode::ServerForm(next) = server.on_server_form(client, p, event) else { panic!() };
             p = next;
         }
         assert_eq!(p.value, "café");
@@ -360,9 +430,9 @@ mod tests {
         assert!(servers::valid_name(&p.value));
         assert!(target(&p, &[]).unwrap().same_connection(&s));
         assert_eq!(target(&p, &[]).unwrap().groups, s.groups);
-        p.server_form.as_mut().unwrap().field = 1;
+        p.data.field = 1;
         let cursor = p.cursor;
-        let Mode::Prompt(p) = server.on_server_form(client, p, key("left")) else { panic!() };
+        let Mode::ServerForm(p) = server.on_server_form(client, p, key("left")) else { panic!() };
         assert_eq!(p.cursor, cursor - 1, "the suggested name is editable from any position");
         assert!(matches!(server.on_server_form(client, p, key("esc")), Mode::Normal));
         assert!(server.jobs.is_empty());
@@ -383,7 +453,7 @@ mod tests {
             ("box22", Some(22), "box22", false),
         ] {
             let mut p = server.add_server_form(None, None);
-            p.server_form.as_mut().unwrap().address = address.into();
+            p.data.address = address.into();
             let s = target(&p, &server.known_servers).unwrap();
             assert_eq!(s.port, port, "{address}");
             assert_eq!(inv.add_named(s).unwrap(), (name.into(), added));
@@ -405,7 +475,7 @@ mod tests {
         });
         server.known_servers = servers::known(&inv, &[], &[]);
         let mut p = server.add_server_form(None, None);
-        p.server_form.as_mut().unwrap().address = "box.lan:22".into();
+        p.data.address = "box.lan:22".into();
         let mut s = target(&p, &server.known_servers).unwrap();
         s.name = "box22".into();
         assert_eq!(s.agents, None);
@@ -429,7 +499,7 @@ mod tests {
                 let known = servers::known(&inv, &[], &[]);
                 for entry in &entries {
                     let mut p = server.add_server_form(None, None);
-                    p.server_form.as_mut().unwrap().address = entry.name.clone();
+                    p.data.address = entry.name.clone();
                     let s = target(&p, &known).unwrap();
                     assert!(s.same_connection(entry));
                     assert_eq!(inv.add_named(s).unwrap(), (entry.name.clone(), false));
@@ -458,8 +528,8 @@ mod tests {
         picker.query = "not-a-match".into();
         picker.refilter();
         let mut p = server.add_server_form(Some(&picker), Some(&s));
-        p.server_form.as_mut().unwrap().pending = Some(42);
-        server.clients.get_mut(&client).unwrap().mode = Mode::Prompt(p);
+        p.data.pending = Some(42);
+        server.clients.get_mut(&client).unwrap().mode = Mode::ServerForm(p);
         server.server_form_saved(client, 42, Ok(saved));
         let Mode::Picker(result) = &server.clients[&client].mode else { panic!("saved list") };
         assert_eq!(result.message.as_deref(), Some("Server added"));
@@ -467,7 +537,7 @@ mod tests {
         assert!(matches!(&result.current().unwrap().action, PickAction::Ssh(name) if name == "db"));
         assert_eq!(result.action_keys()[0], ("enter", "Connect"));
         let mut p = server.add_server_form(None, Some(&s));
-        p.server_form.as_mut().unwrap().pending = Some(43);
+        p.data.pending = Some(43);
         server.clients.get_mut(&client).unwrap().mode = server.on_server_form(client, p, key("esc"));
         server.server_form_saved(client, 43, Ok(("db".into(), false)));
         assert!(matches!(server.clients[&client].mode, Mode::Normal));
@@ -489,29 +559,29 @@ mod tests {
             ("db.lan", "bad/name", "Use letters"),
         ] {
             let mut p = server.add_server_form(None, None);
-            p.server_form.as_mut().unwrap().address = address.into();
+            p.data.address = address.into();
             p.value = name.into();
-            let Mode::Prompt(p) = server.submit_server_form(client, p) else { panic!() };
+            let Mode::ServerForm(p) = server.submit_server_form(client, p) else { panic!() };
             assert!(p.error.as_ref().unwrap().contains(error));
             assert_eq!(p.value, name);
-            assert_eq!(p.server_form.as_ref().unwrap().address, address);
+            assert_eq!(p.data.address, address);
         }
         let mut p = server.add_server_form(None, Some(&servers::resolve(&[], "admin@db.lan").unwrap()));
-        p.server_form.as_mut().unwrap().pending = Some(42);
+        p.data.pending = Some(42);
         for event in [key("enter"), key("tab"), InputEvent::Paste(b"ignored".to_vec())] {
-            let Mode::Prompt(next) = server.on_server_form(client, p, event) else { panic!() };
+            let Mode::ServerForm(next) = server.on_server_form(client, p, event) else { panic!() };
             p = next;
         }
         assert_eq!(p.value, "db");
-        server.clients.get_mut(&client).unwrap().mode = Mode::Prompt(p);
+        server.clients.get_mut(&client).unwrap().mode = Mode::ServerForm(p);
         server.server_form_saved(client, 41, Err(anyhow::anyhow!("stale")));
-        assert!(matches!(&server.clients[&client].mode, Mode::Prompt(p) if p.error.is_none()));
+        assert!(matches!(&server.clients[&client].mode, Mode::ServerForm(p) if p.error.is_none()));
         server.server_form_saved(client, 42, Err(anyhow::anyhow!("permission denied")));
-        let Mode::Prompt(p) = &server.clients[&client].mode else { panic!() };
+        let Mode::ServerForm(p) = &server.clients[&client].mode else { panic!() };
         assert!(p.error.as_ref().unwrap().contains("permission denied"));
         assert_eq!(p.value, "db");
-        assert_eq!(p.server_form.as_ref().unwrap().address, "admin@db.lan");
-        assert!(p.server_form.as_ref().unwrap().pending.is_none());
+        assert_eq!(p.data.address, "admin@db.lan");
+        assert!(p.data.pending.is_none());
         assert!(server.jobs.is_empty());
         assert!(server.panes.is_empty());
     }

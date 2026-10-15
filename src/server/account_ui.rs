@@ -630,12 +630,7 @@ impl Server {
 
 pub(super) fn select_account(picker: &mut Picker, account: &str) {
     let matches = |i: &PickItem| matches!(&i.action, PickAction::AccountDetails(id) if id == account);
-    if !picker.filtered.iter().any(|&i| matches(&picker.items[i])) {
-        picker.query.clear();
-        picker.cursor = 0;
-        picker.refilter();
-    }
-    picker.select(matches);
+    picker.reveal(matches);
 }
 
 /// Called under the accounts lock, after the sign-in check completes.
@@ -1127,7 +1122,8 @@ mod tests {
 
     #[test]
     fn delayed_added_login_preserves_drafts_and_only_returns_from_its_own_pane() {
-        use super::super::ui::{Prompt, PromptAction};
+        use super::super::ui::Prompt;
+        use super::super::workspace_ui::{WorkspaceAction, WorkspaceForm};
 
         let mut server = server();
         let (client, _peer) = super::super::tests::client(&mut server);
@@ -1135,11 +1131,14 @@ mod tests {
         let login = server.alloc_id();
         server.workspaces[0].tab_mut().unwrap().focus = Some(login);
         server.clients.get_mut(&client).unwrap().adding_account = Some(login);
-        server.clients.get_mut(&client).unwrap().mode =
-            Mode::Prompt(Prompt::new("Rename workspace", "", PromptAction::RenameWorkspace(server.workspaces[0].id)));
+        server.clients.get_mut(&client).unwrap().mode = Mode::WorkspaceForm(Prompt::new(
+            "Rename workspace",
+            "",
+            WorkspaceForm::new(WorkspaceAction::Rename(server.workspaces[0].id)),
+        ));
         server.client_input(client, b"unfinished draft");
         server.added_login_finished(login, &a);
-        let Mode::Prompt(prompt) = &server.clients[&client].mode else { panic!("draft discarded") };
+        let Mode::WorkspaceForm(prompt) = &server.clients[&client].mode else { panic!("draft discarded") };
         assert_eq!(prompt.value, "unfinished draft");
         assert_eq!(prompt.cursor, "unfinished draft".len());
         assert_eq!(server.clients[&client].adding_account, None);

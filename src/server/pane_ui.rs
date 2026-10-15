@@ -1288,7 +1288,7 @@ mod tests {
             )
             .unwrap();
         assert!(
-            matches!(t.server.edit_pane_form(t.client, pane, None), Mode::Prompt(p) if matches!(p.action, PromptAction::RenamePane(id) if id == pane))
+            matches!(t.server.edit_pane_form(t.client, pane, None), Mode::Prompt(p) if matches!(p.data, PromptAction::RenamePane(id) if id == pane))
         );
     }
 
