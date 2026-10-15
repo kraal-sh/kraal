@@ -295,11 +295,13 @@ pasting its paths into the pane named in the form, without pressing Enter in tha
 For a clipboard image, choose **Attach clipboard image**, then **Send** in the local question.
 It reads the laptop clipboard once and sends the image through the same connection.
 Transfers lasting at least 200 ms show **Sending to SERVER**, the filename or file count,
-sent and total size, percentage, a progress bar and a spinner. The box updates at most five
-times per second and is replaced by the result. Short transfers go straight to the result.
-Ctrl+C cancels a choice or a running transfer. A success such as **Sent 2 files to box** or
-**Sent the image to box** disappears after four seconds; typing and Ctrl+C reach the pane as
-usual. A failure stays open with choices to retry or close, and **Paste as text** for files.
+sent and total size, percentage, a progress bar spanning the box beside a spinner. The box
+updates at most five times per second. Success shows **Sent to SERVER**, the same details at 100%, a full bar with
+a done mark, and **Paths pasted into PANE.** (singular for one file or an image). If focus
+changed, the warning to select the destination pane appears instead. Short transfers go straight
+to this final state. Ctrl+C cancels a choice or a running transfer. Success disappears after
+1.5 seconds; typing and Ctrl+C reach the pane as usual. A failure stays open with choices to
+retry or close, and **Paste as text** for files.
 Files survive client disconnects and server restarts. See [Attachments](terminal.md#attachments)
 for limits, retention and cleanup. Pasting or dropping existing absolute laptop paths also
 offers **Send**, **Always for box**, **Paste as text**, and **Cancel** in a local question box.
