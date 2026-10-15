@@ -750,7 +750,7 @@ pub(super) fn confirm_layout(q: &Question, screen: Rect) -> ConfirmLayout {
         }
     }
     let max_h = screen.height.saturating_sub(2).max(3) as usize;
-    let h = (lines.len().max(1) + 5).min(max_h) as u16;
+    let h = (if lines.is_empty() { 4 } else { lines.len() + 5 }).min(max_h) as u16;
     let area = centered(screen, w, h);
     let inner = Rect::new(area.x + 1, area.y + 1, area.width.saturating_sub(2), area.height.saturating_sub(2));
     let mut body = inner.height.saturating_sub(3);
@@ -761,7 +761,7 @@ pub(super) fn confirm_layout(q: &Question, screen: Rect) -> ConfirmLayout {
     });
     let max_scroll = lines.len().saturating_sub(body as usize);
     let y = inner.y + inner.height.saturating_sub(2);
-    let buttons = inner.height >= 3 && inner.width >= columns(&verb) as u16 + 15;
+    let buttons = inner.height >= 2 && inner.width >= columns(&verb) as u16 + 15;
     let cancel_width = columns(q.action.cancel_label()) as u16 + 2;
     let cancel = buttons.then(|| Rect::new(inner.x + 1, y, cancel_width, 1));
     let ok = buttons.then(|| Rect::new(inner.x + 1 + cancel_width + 3, y, columns(&verb) as u16 + 2, 1));
@@ -1202,7 +1202,8 @@ mod tests {
                     let mut buf = Buffer::empty(area);
                     draw_confirm(&q, area, &mut buf);
                     let layout = confirm_layout(&q, area);
-                    assert!(layout.body > 0 && layout.cancel.is_some() && layout.ok.is_some());
+                    assert_eq!(layout.area.height, if message.contains('\n') { 6 } else { 4 });
+                    assert!(layout.cancel.is_some() && layout.ok.is_some());
                     let title = screen(&buf, Rect::new(layout.area.x, layout.area.y, layout.area.width, 1));
                     assert!(title.contains(message.lines().next().unwrap()), "{title}");
                     let shown = screen(&buf, area);

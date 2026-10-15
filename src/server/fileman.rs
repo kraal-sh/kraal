@@ -191,7 +191,7 @@ impl Server {
                 let message = format!(
                     "Copy {} to {}?\nIt replaces what is there:\n  {}",
                     describe(&sources),
-                    dest.display(),
+                    dest.short_display(),
                     replaces.join("\n  ")
                 );
                 Mode::confirm(message, ConfirmAction::Job { label: "copy and replace".into(), args })
@@ -205,7 +205,7 @@ impl Server {
                 args.push("--".into());
                 args.extend(sources.iter().map(|s| s.display()));
                 args.push(dir_arg(&dest));
-                let mut message = format!("Move {} to {}?", describe(&sources), dest.display());
+                let mut message = format!("Move {} to {}?", describe(&sources), dest.short_display());
                 if !replaces.is_empty() {
                     message.push_str(&format!("\nIt replaces what is there:\n  {}", replaces.join("\n  ")));
                 }
@@ -216,7 +216,7 @@ impl Server {
                 args.extend(expect);
                 args.push("--".into());
                 args.extend(targets.iter().map(|s| s.display()));
-                let list: Vec<String> = targets.iter().map(|t| t.display()).collect();
+                let list: Vec<String> = targets.iter().map(Location::short_display).collect();
                 let what = if list.len() == 1 { list[0].clone() } else { format!("these {} items", list.len()) };
                 let mut message = format!("Delete {what} for good?");
                 if list.len() > 1 {
@@ -490,7 +490,7 @@ impl Server {
 /// What a file operation acts on: the place, or the items by name.
 pub(super) fn describe(locs: &[Location]) -> String {
     match locs {
-        [one] => one.display(),
+        [one] => one.short_display(),
         many => {
             let shown: Vec<String> = many.iter().filter_map(Location::name).collect();
             format!("{} items ({})", many.len(), names(&shown))
@@ -513,6 +513,96 @@ mod tests {
     use crate::laptop::Identity;
     use crate::protocol::{self, ClientMsg, ServerMsg};
     use crate::server::tests::{client, server};
+
+    #[test]
+    fn file_questions_shorten_only_session_paths_and_fit_their_contents() {
+        use crate::server::overlays::{confirm_layout, draw_confirm};
+        use ratatui::{buffer::Buffer, layout::Rect};
+
+        let (tx, _rx) = super::super::queue::channel(32);
+        let mut server = server(tx);
+        let (owner, _peer) = client(&mut server);
+        server.clients.get_mut(&owner).unwrap().laptop =
+            Some(Identity { id: "abc".into(), host: "travel".into(), os: "linux".into() });
+        let laptop = Location::Laptop { owner_id: "abc".into(), host: "travel".into(), path: "~/Docs".into() };
+        for (root, shown) in [(dirs::home_dir().unwrap(), "~"), ("/outside".into(), "/outside")] {
+            let source = Location::Local(root.join("work"));
+            let dest = Location::Local(root.join("Docs"));
+            for (action, message, verb, height) in [
+                (FilesAction::Delete(vec![source.clone()]), format!("Delete {shown}/work for good?"), "Delete", 4),
+                (
+                    FilesAction::Delete(vec![source.clone(), dest.clone()]),
+                    format!("Delete these 2 items for good?\n  {shown}/work\n  {shown}/Docs"),
+                    "Delete",
+                    7,
+                ),
+                (
+                    FilesAction::Move { sources: vec![source.clone()], dest: laptop.clone(), replaces: vec![] },
+                    format!("Move {shown}/work to travel:~/Docs?"),
+                    "Move",
+                    4,
+                ),
+                (
+                    FilesAction::Move { sources: vec![source.clone()], dest: dest.clone(), replaces: vec![] },
+                    format!("Move {shown}/work to {shown}/Docs?"),
+                    "Move",
+                    4,
+                ),
+                (
+                    FilesAction::Copy {
+                        sources: vec![source.clone()],
+                        dest: dest.clone(),
+                        replaces: vec!["work".into()],
+                    },
+                    format!("Copy {shown}/work to {shown}/Docs?\nIt replaces what is there:\n  work"),
+                    "Copy and replace",
+                    7,
+                ),
+                (
+                    FilesAction::Copy {
+                        sources: vec![laptop.clone()],
+                        dest: dest.clone(),
+                        replaces: vec!["Docs".into()],
+                    },
+                    format!("Copy travel:~/Docs to {shown}/Docs?\nIt replaces what is there:\n  Docs"),
+                    "Copy and replace",
+                    7,
+                ),
+            ] {
+                let Mode::Confirm(q) = server.files_action(owner, 1, action) else { panic!("confirmation") };
+                assert_eq!(q.message, message);
+                assert_eq!(q.action.verb(), verb);
+                match &q.action {
+                    ConfirmAction::Job { args, .. } => {
+                        assert!(args.iter().any(|a| a.starts_with(root.to_str().unwrap())))
+                    }
+                    ConfirmAction::LaptopCopy { spec, .. } if spec.to_laptop => {
+                        assert_eq!(spec.sources, [source.display()])
+                    }
+                    ConfirmAction::LaptopCopy { spec, .. } => assert_eq!(spec.destination, root.join("Docs")),
+                    _ => panic!("file action"),
+                }
+                for (w, h) in [(80, 24), (124, 36)] {
+                    let screen = Rect::new(0, 0, w, h);
+                    let layout = confirm_layout(&q, screen);
+                    assert_eq!(layout.area.height, height, "{message}");
+                    let mut buf = Buffer::empty(screen);
+                    draw_confirm(&q, screen, &mut buf);
+                    let rows: Vec<String> = (layout.area.y..layout.area.bottom())
+                        .map(|y| (layout.area.x..layout.area.right()).map(|x| buf[(x, y)].symbol()).collect())
+                        .collect();
+                    assert!(rows[0].contains(message.lines().next().unwrap()), "{rows:?}");
+                    assert!(rows[height as usize - 3].contains(verb), "{rows:?}");
+                    assert!(rows[height as usize - 2].contains("Enter Cancel · Tab Choose · Esc Cancel"), "{rows:?}");
+                    for line in message.lines().skip(1) {
+                        assert!(rows.iter().any(|row| row.contains(line)), "{rows:?}");
+                    }
+                }
+            }
+            let remote = Location::Remote(Remote { server: "web".into(), ssh_args: vec![], path: source.display() });
+            assert_eq!(describe(&[remote]), format!("web:{}", root.join("work").display()));
+        }
+    }
 
     #[test]
     fn picker_offers_only_this_clients_laptop_and_names_the_sessions_machine() {

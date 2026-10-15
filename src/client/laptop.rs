@@ -1785,11 +1785,16 @@ mod tests {
                     to_laptop: false,
                     remote: None,
                     sources: vec!["~/report".into()],
-                    destination: "/destination".into(),
+                    destination: "~/work".into(),
                     allow: vec![],
                 }),
             );
             wait_for_destructive_prompt(&client);
+            {
+                let state = client.state.lock().unwrap();
+                let view = client.view(state.prompt.as_ref().unwrap());
+                assert!(view.message.starts_with("anvil asks to move these items to ~/work on anvil."));
+            }
             client.input(b"\t\r");
             loop {
                 let FromClient::Data { sequence, packet } = copy_packet(&mut peer).1 else { panic!("expected data") };
@@ -1833,10 +1838,7 @@ mod tests {
             }
             client.copy_message("abc".into(), ToClient::Finish(result));
             if outcome == "success" {
-                assert_eq!(
-                    client.state.lock().unwrap().notice.as_ref().unwrap().1,
-                    "anvil moved 1 item to /destination"
-                );
+                assert_eq!(client.state.lock().unwrap().notice.as_ref().unwrap().1, "anvil moved 1 item to ~/work");
             }
         }
     }

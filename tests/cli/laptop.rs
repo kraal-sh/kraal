@@ -115,6 +115,18 @@ fn copy_job_output_describes_both_directions_and_finishes_below_progress() {
                 let output = job.join().unwrap();
                 let output_text = String::from_utf8(output.stderr).unwrap();
                 assert!(output.status.success(), "{output_text}");
+                let stdout = String::from_utf8(output.stdout).unwrap();
+                for text in [&output_text, &stdout] {
+                    assert!(!text.contains("laptop-v1"), "{text:?}");
+                    assert!(!text.contains("/payload/report"), "{text:?}");
+                }
+                if !to_laptop {
+                    let (_, installation) = output_text.split_once("Installing the copy.\n").unwrap();
+                    let (progress, _) = installation.split_once("\n$ kraal put ").unwrap();
+                    assert!(progress.starts_with("\rInstalling files"), "{output_text:?}");
+                    assert!(progress.split("\rInstalling files").all(str::is_empty), "{output_text:?}");
+                    assert!(output_text.contains("\ndone\n"), "{output_text:?}");
+                }
                 let noun = if entries == 1 { "entry" } else { "entries" };
                 let announcement = format!("Copying {entries} {noun} ({size}). Close this window to cancel.\n");
                 assert!(output_text.starts_with(&announcement), "{output_text:?}");
@@ -122,7 +134,8 @@ fn copy_job_output_describes_both_directions_and_finishes_below_progress() {
                 let verb = if to_laptop { "Sent" } else { "Received" };
                 let after_progress = if to_laptop { "Laptop copy complete." } else { "Installing the copy." };
                 if bytes == 0 {
-                    assert!(!output_text.contains('\r'), "{output_text:?}");
+                    let (transfer, _) = output_text.split_once(after_progress).unwrap();
+                    assert!(!transfer.contains('\r'), "{output_text:?}");
                     assert!(output_text.starts_with(&format!("{announcement}{after_progress}\n")), "{output_text:?}");
                 } else {
                     assert!(

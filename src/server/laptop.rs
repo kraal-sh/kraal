@@ -128,7 +128,7 @@ impl Server {
             "{} {} to {}?",
             if operation == Operation::Move { "Move" } else { "Copy" },
             super::fileman::describe(&sources),
-            dest.display()
+            dest.short_display()
         );
         let spec = Spec {
             operation,
@@ -268,8 +268,11 @@ impl Server {
                 copy.job = Some(client);
                 copy.progress = Instant::now();
                 let owner = copy.owner;
-                let spec = copy.spec.clone();
+                let mut spec = copy.spec.clone();
                 self.copy_send(client, &token, ToClient::Ready(spec.clone()));
+                if !spec.to_laptop && spec.remote.is_none() {
+                    spec.destination = crate::paths::shorten_home(&spec.destination).into();
+                }
                 self.copy_send(
                     owner,
                     &token,
@@ -619,6 +622,31 @@ mod tests {
         assert!(matches!(take(&job_out).1, ToClient::Finish(Ok(()))));
         assert!(matches!(take(&owner_out).1, ToClient::Finish(Ok(()))));
         assert!(other_out.try_recv().is_err());
+    }
+
+    #[test]
+    fn move_destination_is_shortened_only_for_the_laptop_owner() {
+        let home = dirs::home_dir().unwrap();
+        for (destination, shown) in
+            [(home.clone(), "~"), (home.join("work"), "~/work"), ("/outside/work".into(), "/outside/work")]
+        {
+            let (tx, _rx) = super::super::queue::channel(32);
+            let mut server = server(tx);
+            let (owner, _a) = client(&mut server);
+            let (job, _b) = client(&mut server);
+            let owner_out = server.clients.get_mut(&owner).unwrap().out.capture();
+            let job_out = server.clients.get_mut(&job).unwrap().out.capture();
+            grant(&mut server, owner, "abc");
+            let spec = &mut server.laptop_copies.get_mut("abc").unwrap().spec;
+            spec.operation = Operation::Move;
+            spec.destination = destination.clone();
+            open(&mut server, job, "abc");
+            assert!(matches!(take(&job_out).1, ToClient::Ready(spec) if spec.destination == destination));
+            assert!(
+                matches!(take(&owner_out).1, ToClient::Move(spec) if spec.destination == std::path::Path::new(shown))
+            );
+            assert_eq!(server.laptop_copies["abc"].spec.destination, destination);
+        }
     }
 
     #[test]

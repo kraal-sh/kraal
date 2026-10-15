@@ -363,7 +363,9 @@ pub(super) fn copy(
     }
     let ssh = |s: &servers::Server| servers::ssh_args(s, &known, cfg.servers.multiplex);
     check_expected(sources.iter().chain([&dest]), expect, &ssh)?;
-    if laptop_spool {
+    let laptop_install = laptop_spool && sources.iter().all(|source| matches!(source, transfer::Endpoint::Local(_)));
+    if laptop_spool && !laptop_install {
+        anyhow::ensure!(!move_, "a laptop spool download cannot move sources");
         return crate::laptop::copy::fetch(&sources, &dest, &ssh);
     }
     if let Some(allowed) = no_replace {
@@ -395,15 +397,19 @@ pub(super) fn copy(
     if move_ {
         transfer::check_move_across(&sources, &dest, &ssh)?;
     }
-    let sources = if move_ { transfer::rename_local(&sources, &dest, &opts)? } else { sources };
+    let sources = if move_ && !laptop_install { transfer::rename_local(&sources, &dest, &opts)? } else { sources };
     if sources.is_empty() {
         eprintln!("done");
         return Ok(());
     }
     let steps = transfer::plan(&sources, &dest, &ssh, &opts)?;
-    let what: Vec<String> = sources.iter().map(|s| s.display()).collect();
-    eprintln!("{} {} → {}", if move_ { "moving" } else { "copying" }, what.join(", "), dest.display());
-    transfer::run(&steps)?;
+    if laptop_install {
+        transfer::run_laptop_install(&steps)?;
+    } else {
+        let what: Vec<String> = sources.iter().map(|s| s.display()).collect();
+        eprintln!("{} {} → {}", if move_ { "moving" } else { "copying" }, what.join(", "), dest.display());
+        transfer::run(&steps)?;
+    }
     if move_ {
         let kept = transfer::prune_moved(&sources, &ssh)?;
         if !kept.is_empty() {

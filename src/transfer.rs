@@ -1832,14 +1832,75 @@ fn copy_stream(
 /// Run the steps in the foreground, showing their output. Falls back to a tar stream when rsync
 /// is missing on the server (rsync exits with 12 or 127 then).
 pub fn run(steps: &[Step]) -> Result<()> {
+    run_inner(steps, false)
+}
+
+pub fn run_laptop_install(steps: &[Step]) -> Result<()> {
+    run_inner(steps, true)
+}
+
+/// Keep copy progress live without exposing spool or staging paths. Errors keep their paths.
+fn run_install_copy(step: &Step, output: &mut impl std::io::Write) -> Result<std::process::ExitStatus> {
+    use std::io::Read;
+
+    let mut child = std::process::Command::new(&step.program)
+        .args(&step.args)
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .with_context(|| format!("running {}", step.program))?;
+    let mut input = child.stdout.take().context("no pipe")?;
+    let result = (|| -> std::io::Result<()> {
+        let mut buffer = [0; 16 * 1024];
+        let mut reported = false;
+        loop {
+            match input.read(&mut buffer) {
+                Ok(0) => {
+                    if reported {
+                        output.write_all(b"\n")?;
+                        output.flush()?;
+                    }
+                    return Ok(());
+                }
+                Ok(_) => {
+                    output.write_all(b"\rInstalling files")?;
+                    output.flush()?;
+                    reported = true;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(error) => return Err(error),
+            }
+        }
+    })();
+    if result.is_err() {
+        let _ = child.kill();
+    }
+    let status = child.wait()?;
+    result.context("reading installation progress")?;
+    Ok(status)
+}
+
+fn run_inner(steps: &[Step], laptop_install: bool) -> Result<()> {
     for step in steps {
-        eprintln!("$ {}", step.shell_line());
+        if !laptop_install || step.here.is_some() {
+            eprintln!("$ {}", step.shell_line());
+        }
         if let Some(install) = &step.here {
             install_here(install)?;
             continue;
         }
         let partial = step.partial.as_deref().map(PartialRun::start).transpose()?;
-        let status = run_step(step)?;
+        let status = if laptop_install && step.pipe_to.is_none() && matches!(step.program.as_str(), "cp" | "rsync") {
+            run_install_copy(step, &mut std::io::stderr())?
+        } else if laptop_install && step.pipe_to.is_none() {
+            // Other installation steps keep their internal paths quiet; errors still name them.
+            std::process::Command::new(&step.program)
+                .args(&step.args)
+                .stdout(std::process::Stdio::null())
+                .status()
+                .with_context(|| format!("running {}", step.program))?
+        } else {
+            run_step(step)?
+        };
         if !status.success() {
             let Some(fb) = step.fallback.as_deref().filter(|_| matches!(status.code(), Some(12) | Some(127))) else {
                 bail!("{} failed ({status})", step.program);
@@ -2244,6 +2305,23 @@ mod tests {
         fn read(&self, rel: &str) -> String {
             std::fs::read_to_string(self.dir.0.join(rel)).unwrap_or_default()
         }
+    }
+
+    #[test]
+    fn laptop_install_copy_hides_paths_and_preserves_the_exit_status() {
+        for code in [0, 7] {
+            let step = Step::new(
+                "sh",
+                vec!["-c".into(), format!("printf '/private/spool/file -> /private/staging/file\\r'; exit {code}")],
+            );
+            let mut output = Vec::new();
+            assert_eq!(run_install_copy(&step, &mut output).unwrap().code(), Some(code));
+            assert_eq!(output, b"\rInstalling files\n");
+        }
+        let step = Step::new("sh", vec!["-c".into(), "exit 0".into()]);
+        let mut output = Vec::new();
+        assert!(run_install_copy(&step, &mut output).unwrap().success());
+        assert!(output.is_empty(), "a quiet child must not report progress");
     }
 
     #[test]
