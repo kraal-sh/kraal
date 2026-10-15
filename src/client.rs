@@ -2,7 +2,9 @@
 
 mod attachments;
 mod clipboard_image;
+mod laptop;
 mod paste;
+mod writer;
 
 #[cfg(test)]
 pub(crate) use attachments::Controller as AttachmentController;
@@ -363,6 +365,8 @@ fn exchange(stream: &mut UnixStream, msg: &ClientMsg) -> Result<Result<Response,
                 | ServerMsg::AttachmentOffer { .. }
                 | ServerMsg::AttachmentAck { .. }
                 | ServerMsg::AttachmentResult { .. }
+                | ServerMsg::LaptopList { .. }
+                | ServerMsg::LaptopListAck { .. }
                 | ServerMsg::Unknown(_) => continue,
             },
             Some(_) => continue,
@@ -800,7 +804,7 @@ pub fn remote_kraal(args: &str) -> String {
 struct Conn {
     reader: Box<dyn Read + Send>,
     writer: Box<dyn Write + Send>,
-    child: Option<std::process::Child>,
+    child: Option<Arc<Mutex<std::process::Child>>>,
     /// The server's process, when it runs on this machine.
     server: Option<libc::pid_t>,
     /// The last thing ssh said on stderr (host key, authentication, remote errors).
@@ -811,7 +815,8 @@ impl Conn {
     /// `what` went wrong, with ssh's last words if it said something: ssh is given a moment to
     /// end and say them (a refused key, an unknown host).
     fn why_lost(&mut self, what: &str) -> String {
-        if let Some(child) = &mut self.child {
+        if let Some(child) = &self.child {
+            let mut child = child.lock().unwrap();
             let start = Instant::now();
             while matches!(child.try_wait(), Ok(None)) && start.elapsed() < Duration::from_secs(1) {
                 std::thread::sleep(Duration::from_millis(20));
@@ -825,7 +830,8 @@ impl Conn {
 
 impl Drop for Conn {
     fn drop(&mut self) {
-        if let Some(c) = &mut self.child {
+        if let Some(c) = &self.child {
+            let mut c = c.lock().unwrap();
             let _ = c.kill();
             let _ = c.wait();
         }
@@ -859,13 +865,15 @@ fn connect(target: &Target) -> Result<Conn> {
                 .context("starting ssh")?;
             SSH_PID.store(child.id(), Ordering::SeqCst);
             let reader = Box::new(child.stdout.take().context("ssh stdout")?);
-            let writer = Box::new(child.stdin.take().context("ssh stdin")?);
+            let stdin = child.stdin.take().context("ssh stdin")?;
             // Keep ssh's last error line to explain a lost connection (it would garble the
             // screen if it went to the terminal).
             let ssh_said = match child.stderr.take() {
                 Some(stderr) => crate::exec::last_line(stderr),
                 None => Default::default(),
             };
+            let child = Arc::new(Mutex::new(child));
+            let writer = Box::new(writer::TimedWriter::new(stdin, Duration::from_secs(2), Some(child.clone()))?);
             Ok(Conn { reader, writer, child: Some(child), server: None, ssh_said })
         }
     }
@@ -905,7 +913,11 @@ struct Greeted {
 /// Connect, say hello, and wait for the server's first answer (returned, still to be shown).
 /// Until then, over ssh, ssh has the terminal: it may ask for a password or about a host key,
 /// and the terminal is in its usual mode, where ctrl+c ends kraal. `Err` says why it failed.
-fn greet(target: &Target, workspace: &Option<String>) -> Result<Greeted, String> {
+fn greet(
+    target: &Target,
+    workspace: &Option<String>,
+    laptop: &Option<crate::laptop::Identity>,
+) -> Result<Greeted, String> {
     let mut conn = connect(target).map_err(|e| format!("{e:#}"))?;
     let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
     // The workspace asked for is asked again after a reconnection.
@@ -915,6 +927,7 @@ fn greet(target: &Target, workspace: &Option<String>) -> Result<Greeted, String>
         rows,
         workspace: workspace.clone(),
         remote: matches!(target, Target::Remote { .. }),
+        laptop: laptop.clone(),
         pane: match target {
             Target::Remote { pane, .. } => pane.clone(),
             Target::Local { .. } => None,
@@ -931,19 +944,8 @@ fn greet(target: &Target, workspace: &Option<String>) -> Result<Greeted, String>
         Ok(Some(mut first)) => {
             if first.0 == protocol::JSON
                 && let Ok(ServerMsg::Exit { reason, .. }) = serde_json::from_slice(&first.1)
-                && let Some(release) = legacy_refusal_release(&reason)
+                && let Some(reason) = attach_refusal(&reason, target)
             {
-                let (session, host) = match target {
-                    Target::Local { session } => (session, None),
-                    Target::Remote { session, host, .. } => (session, Some(host.as_str())),
-                };
-                let reason = protocol::version_mismatch(
-                    protocol::PROTOCOL_VERSION,
-                    protocol::upgrade_protocol(),
-                    release,
-                    session,
-                    host,
-                );
                 first.1 = serde_json::to_vec(&ServerMsg::exit(reason)).expect("exit message");
             }
             Ok(Greeted { conn, frames, first })
@@ -955,6 +957,26 @@ fn greet(target: &Target, workspace: &Option<String>) -> Result<Greeted, String>
 
 // Released servers use different refusal messages. Normalize them so a remote attachment
 // names a recovery command to run on this machine.
+fn attach_refusal(reason: &str, target: &Target) -> Option<String> {
+    let (server, release) = refusal_version(reason)?;
+    let (session, host) = match target {
+        Target::Local { session } => (session, None),
+        Target::Remote { session, host, .. } => (session, Some(host.as_str())),
+    };
+    Some(protocol::version_mismatch(protocol::PROTOCOL_VERSION, server, release, session, host))
+}
+
+fn refusal_version(reason: &str) -> Option<(u32, &str)> {
+    if let Some(release) = legacy_refusal_release(reason) {
+        return Some((protocol::upgrade_protocol(), release));
+    }
+    let rest = reason.strip_prefix("protocol mismatch: client protocol ")?;
+    let (_, rest) = rest.split_once(", server protocol ")?;
+    let (server, rest) = rest.split_once(" (kraal ")?;
+    let (release, _) = rest.split_once(", session ")?;
+    Some((server.parse().ok()?, release))
+}
+
 fn legacy_refusal_release(reason: &str) -> Option<&str> {
     if reason.starts_with("protocol mismatch: server v2, client v") {
         return Some("0.2.0");
@@ -1119,7 +1141,8 @@ pub fn attach(mut target: Target, mut workspace: Option<String>, mouse: bool, at
     };
     // Fail before touching the terminal when the first connection is impossible; ssh asks what
     // it has to ask in the terminal as it is.
-    let first = greet(&target, &workspace).map_err(anyhow::Error::msg)?;
+    let identity = matches!(&target, Target::Remote { .. }).then(crate::laptop::Identity::new).transpose()?;
+    let first = greet(&target, &workspace, &identity).map_err(anyhow::Error::msg)?;
     // So does a session that refuses at once (a kraal of another generation, a name that is no
     // workspace of its own): nothing was attached.
     if let (protocol::JSON, Ok(ServerMsg::Exit { reason, reattach: None })) =
@@ -1135,7 +1158,8 @@ pub fn attach(mut target: Target, mut workspace: Option<String>, mouse: bool, at
 
     // The current connection's writer; None while reconnecting.
     let writer: Arc<Mutex<Option<Box<dyn Write + Send>>>> = Arc::new(Mutex::new(None));
-    let attachments = attachments::Controller::for_target(writer.clone(), &target);
+    let laptop = laptop::Controller::new(writer.clone(), &target, identity.clone());
+    let attachments = attachments::Controller::for_target(writer.clone(), &target, Some(laptop.clone()));
 
     let clipboard_shutdown = Arc::new(crate::clipboard::Shutdown::default());
 
@@ -1144,11 +1168,13 @@ pub fn attach(mut target: Target, mut workspace: Option<String>, mouse: bool, at
     {
         let clipboard_shutdown = clipboard_shutdown.clone();
         let attachments = attachments.clone();
+        let laptop = laptop.clone();
         use signal_hook::consts::{SIGHUP, SIGINT, SIGQUIT, SIGTERM};
         let mut signals = signal_hook::iterator::Signals::new([SIGTERM, SIGHUP, SIGINT, SIGQUIT])?;
         crate::threads::named("signals").spawn(move || {
             if let Some(sig) = signals.forever().next() {
                 clipboard_shutdown.cancel();
+                laptop.disconnect();
                 attachments.shutdown();
                 let pid = SSH_PID.load(Ordering::SeqCst);
                 if pid != 0 {
@@ -1232,7 +1258,7 @@ pub fn attach(mut target: Target, mut workspace: Option<String>, mouse: bool, at
                 // already (see below).
                 if pause.pause() {
                     let _ = terminal().set_raw(false);
-                    let greeted = greet(&target, &workspace);
+                    let greeted = greet(&target, &workspace, &identity);
                     let _ = terminal().set_raw(true);
                     if greeted.is_ok() {
                         terminal().set_modes(true, mouse);
@@ -1296,6 +1322,12 @@ pub fn attach(mut target: Target, mut workspace: Option<String>, mouse: bool, at
                                 attachments.connected();
                                 attachments.reconnect();
                             }
+                            Ok(ServerMsg::LaptopListAck { pane, side, request }) => {
+                                laptop.acknowledge(pane, side, request)
+                            }
+                            Ok(ServerMsg::LaptopList { pane, side, request, path }) => {
+                                laptop.request(pane, side, request, path)
+                            }
                             Ok(ServerMsg::Clipboard { id, origin, text }) => {
                                 clipboard.submit(id, origin, text);
                             }
@@ -1322,6 +1354,7 @@ pub fn attach(mut target: Target, mut workspace: Option<String>, mouse: bool, at
                         Err(e) => break c.why_lost(&format!("connection error: {e}")),
                     }
                 };
+                laptop.disconnect();
                 clipboard.cancel();
                 attachments.shutdown();
                 *writer.lock().unwrap() = None;
@@ -1364,6 +1397,7 @@ pub fn attach(mut target: Target, mut workspace: Option<String>, mouse: bool, at
         );
         delay = (delay * 2).min(Duration::from_secs(15));
     };
+    laptop.disconnect();
     attachments.shutdown();
     if nested.is_some() {
         let _ = terminal().write(NOT_ATTACHED);
@@ -1471,12 +1505,46 @@ mod tests {
             Some("0.3.0")
         );
         assert_eq!(legacy_refusal_release("no such workspace"), None);
+        assert_eq!(refusal_version("no such workspace"), None);
+        assert_eq!(
+            refusal_version(
+                "protocol mismatch: client protocol 4, server protocol 3 (kraal 0.4.0, session work); run `kraal -s work restart`"
+            ),
+            Some((3, "0.4.0")),
+        );
         assert_eq!(
             legacy_refusal_release(
                 "session work runs kraal 0.4.0, too new for this kraal: update this one (`kraal update`)"
             ),
             None
         );
+    }
+
+    #[test]
+    fn protocol_three_remote_refusals_keep_the_session_and_name_remote_install() {
+        for session in ["main", "work"] {
+            let target = Target::Remote {
+                ssh: vec!["box.internal".into()],
+                session: session.into(),
+                label: "box".into(),
+                host: "box".into(),
+                pane: None,
+                clipboard_native: false,
+            };
+            let reason = format!(
+                "protocol mismatch: client protocol 4, server protocol 3 (kraal 0.4.0, session {session}); run `kraal -s {session} restart`"
+            );
+            let rewritten = attach_refusal(&reason, &target).unwrap();
+            let command =
+                if session == "main" { "kraal remote-install box" } else { "kraal -s work remote-install box" };
+            assert_eq!(
+                rewritten,
+                format!(
+                    "protocol mismatch: client protocol 4, server protocol 3 (kraal 0.4.0, session {session}); run `{command}`"
+                )
+            );
+            assert_eq!(attach_refusal("no such workspace", &target), None);
+        }
     }
 
     #[test]

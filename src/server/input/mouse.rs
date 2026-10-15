@@ -368,6 +368,7 @@ impl Server {
         let up = matches!(m.kind, MouseKind::ScrollUp);
         if let crate::pane::Content::Files(f) = &mut pane.content {
             // Counted in what this client shows, as a click is.
+            f.set_viewer(id);
             if let Some((w, h)) = view {
                 f.set_view(id, w, h);
             }

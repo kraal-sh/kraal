@@ -364,6 +364,9 @@ impl Server {
                     if pane.is_terminal() {
                         pane.copy_mode(true);
                     } else {
+                        if let crate::pane::Content::Files(f) = &mut pane.content {
+                            f.set_viewer(id);
+                        }
                         pane.scroll_page(true);
                     }
                     return Mode::Scroll;

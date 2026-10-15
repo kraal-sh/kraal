@@ -440,6 +440,7 @@ pub struct Client {
     pub welcome: bool,
     /// The client runs on another machine: `localhost` there is not the server's.
     pub remote: bool,
+    pub laptop: Option<crate::laptop::Identity>,
     /// Its terminal reports every pointer motion (mode 1003), for a pane that asked for it.
     pub pointer_motion: bool,
     /// Its terminal can send every key with its place and its text (kitty keyboard protocol):
@@ -1747,6 +1748,7 @@ impl Server {
             }
             Event::RemoteAgents(conn, list) => self.remote_list(conn, list),
             Event::Wake => {
+                self.laptop_requests();
                 // A preview's file changed, or a file listing is ready.
                 self.check_previews();
                 let mut changed = false;

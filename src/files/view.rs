@@ -120,7 +120,7 @@ impl Panel {
 }
 
 impl FilesPane {
-    pub(super) fn draw(&self, area: Rect, buf: &mut Buffer) {
+    pub(super) fn draw(&self, area: Rect, buf: &mut Buffer, private: bool) {
         let area = area.intersection(buf.area);
         for y in area.top()..area.bottom() {
             for x in area.left()..area.right() {
@@ -132,7 +132,7 @@ impl FilesPane {
         }
         let geo = geometry(area, self.active);
         for side in [Side::Left, Side::Right] {
-            self.draw_panel(side, geo.panels[side.index()], &geo, buf);
+            self.draw_panel(side, geo.panels[side.index()], &geo, buf, private);
         }
         if let Some(x) = geo.separator {
             let bottom = geo.footer.unwrap_or(area.bottom());
@@ -155,11 +155,26 @@ impl FilesPane {
         }
     }
 
-    pub(super) fn draw_panel(&self, side: Side, rect: Rect, geo: &Geometry, buf: &mut Buffer) {
+    pub(super) fn draw_panel(&self, side: Side, rect: Rect, geo: &Geometry, buf: &mut Buffer, private: bool) {
         if rect.is_empty() {
             return;
         }
         let panel = self.panel(side);
+        if let super::Location::Laptop { host, .. } = &panel.location
+            && (private || panel.owner != Some(self.viewer))
+        {
+            let text = if panel.owner.is_none() {
+                format!("{host} is not attached: press o to choose a machine")
+            } else {
+                format!("{host}: shown on that machine only")
+            };
+            for (row, line) in
+                crate::text::wrap(&text, usize::from(rect.width)).iter().take(usize::from(rect.height)).enumerate()
+            {
+                put(buf, rect, rect.x, rect.y + row as u16, line, usize::from(rect.width), dim());
+            }
+            return;
+        }
         let active = side == self.active;
         let width = usize::from(rect.width);
         let inner = width.saturating_sub(1);
@@ -280,6 +295,26 @@ impl FilesPane {
                 Hint::new("type", "to filter", None),
                 Hint::new("enter", "keep", Some(FileKey::Enter)),
                 Hint::new("esc", "clear", Some(FileKey::Esc)),
+            ];
+        }
+        if self.restricted(self.active).is_some() {
+            let mut hints = vec![Hint::new("tab", "switch", Some(FileKey::Tab))];
+            if self.panel(self.active).owner.is_none() {
+                hints.push(Hint::new("o", "machine", Some(FileKey::Char('o'))));
+            }
+            hints.push(Hint::new("q", "close", Some(FileKey::Char('q'))));
+            return hints;
+        }
+        if matches!(self.panel(self.active).location, super::Location::Laptop { .. }) {
+            return vec![
+                Hint::new("tab", "switch", Some(FileKey::Tab)),
+                Hint::new("enter", "directory", Some(FileKey::Enter)),
+                Hint::new("⌫", "up", Some(FileKey::Backspace)),
+                Hint::new("o", "machine", Some(FileKey::Char('o'))),
+                Hint::new("r", "refresh", Some(FileKey::Char('r'))),
+                Hint::new(".", "hidden", Some(FileKey::Char('.'))),
+                Hint::new("/", "filter", Some(FileKey::Char('/'))),
+                Hint::new("q", "close", Some(FileKey::Char('q'))),
             ];
         }
         let arrow = if self.active == Side::Left { "→" } else { "←" };

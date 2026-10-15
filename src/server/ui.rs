@@ -389,6 +389,10 @@ pub enum PickAction {
     /// A paste buffer, by its id.
     Buffer(u64),
     /// Point a file manager panel at `~` (local) or `server:~`.
+    FilesLaptop {
+        pane: PaneId,
+        side: crate::files::Side,
+    },
     FilesSet {
         pane: PaneId,
         side: crate::files::Side,
@@ -667,7 +671,7 @@ impl Picker {
             (_, A::FocusPane { agent: true, .. }) => &[("enter", "Go to pane"), ("ctrl+a", "Change account")],
             (_, A::FocusPane { .. } | A::RemoteAgent { .. }) => &[("enter", "Go to pane")],
             (_, A::OpenAnotherAccount(_)) => &[("enter", "Open with another account")],
-            (_, A::FilesSet { .. }) => &[("enter", "Open directory")],
+            (_, A::FilesSet { .. } | A::FilesLaptop { .. }) => &[("enter", "Open directory")],
             (_, A::Tool { .. }) => &[("enter", "Start tool")],
             (K::Buffers, A::Buffer(_)) => &[
                 ("enter", "Paste into the pane"),

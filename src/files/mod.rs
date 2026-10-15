@@ -39,6 +39,11 @@ pub enum Location {
     Local(PathBuf),
     /// A directory on a server, listed over SSH.
     Remote(Remote),
+    Laptop {
+        owner_id: String,
+        host: String,
+        path: String,
+    },
 }
 
 /// A directory on a server.
@@ -54,9 +59,20 @@ pub struct Remote {
 }
 
 impl Location {
+    pub fn saved(&self) -> String {
+        if matches!(self, Self::Laptop { .. }) { "~".into() } else { self.display() }
+    }
+
+    fn title(&self) -> String {
+        if let Self::Laptop { host, .. } = self { host.clone() } else { self.short_display() }
+    }
+
     /// The child entry `name` of this directory.
     pub fn join(&self, name: &str) -> Location {
         match self {
+            Location::Laptop { owner_id, host, path } => {
+                Location::Laptop { owner_id: owner_id.clone(), host: host.clone(), path: join_remote(path, name) }
+            }
             Location::Local(path) => Location::Local(path.join(name)),
             Location::Remote(remote) => Location::Remote(remote.with_path(join_remote(&remote.path, name))),
         }
@@ -65,6 +81,11 @@ impl Location {
     /// The parent directory, or `None` at the root (and at an unresolved `~`).
     fn parent(&self) -> Option<Location> {
         match self {
+            Location::Laptop { owner_id, host, path } => parent_remote(path).map(|path| Location::Laptop {
+                owner_id: owner_id.clone(),
+                host: host.clone(),
+                path,
+            }),
             Location::Local(path) => {
                 path.parent().filter(|p| !p.as_os_str().is_empty()).map(|p| Location::Local(p.to_path_buf()))
             }
@@ -79,6 +100,7 @@ impl Location {
         match self {
             Location::Local(path) => path.display().to_string(),
             Location::Remote(remote) => format!("{}:{}", remote.server, remote.path),
+            Location::Laptop { host, path, .. } => format!("{host}:{path}"),
         }
     }
 
@@ -88,6 +110,7 @@ impl Location {
         match self {
             Location::Local(path) => path.to_str().map(str::to_owned),
             Location::Remote(_) => Some(self.display()),
+            Location::Laptop { .. } => None,
         }
     }
 
@@ -99,7 +122,7 @@ impl Location {
                 Some(rest) => format!("~/{}", rest.display()),
                 None => path.display().to_string(),
             },
-            Location::Remote(_) => self.display(),
+            Location::Remote(_) | Location::Laptop { .. } => self.display(),
         }
     }
 
@@ -107,8 +130,8 @@ impl Location {
     pub fn name(&self) -> Option<String> {
         match self {
             Location::Local(path) => path.file_name().map(|n| n.to_string_lossy().into_owned()),
-            Location::Remote(remote) => {
-                let trimmed = remote.path.trim_end_matches('/');
+            Location::Remote(Remote { path, .. }) | Location::Laptop { path, .. } => {
+                let trimmed = path.trim_end_matches('/');
                 if trimmed.is_empty() || (trimmed.starts_with('~') && !trimmed.contains('/')) {
                     return None;
                 }
@@ -152,18 +175,18 @@ fn parent_remote(path: &str) -> Option<String> {
 }
 
 /// One directory entry.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct Entry {
-    name: String,
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct Entry {
+    pub(crate) name: String,
     /// A directory, or a symbolic link to one.
-    is_dir: bool,
-    is_link: bool,
-    size: u64,
+    pub(crate) is_dir: bool,
+    pub(crate) is_link: bool,
+    pub(crate) size: u64,
     /// unix seconds
-    mtime: i64,
+    pub(crate) mtime: i64,
     /// `name` is the entry's real name. A name that is not UTF-8 is shown approximately, and
     /// nothing is done to such an entry: an approximate name could designate another file.
-    exact: bool,
+    pub(crate) exact: bool,
 }
 
 /// Keys the pane understands (the server maps its own key type to these).
@@ -221,7 +244,7 @@ pub enum FilesAction {
 const INEXACT: &str = "a name here is not valid UTF-8: kraal cannot point at it safely; use a shell (key s)";
 
 /// One of the two panels.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Side {
     Left,
     Right,
@@ -260,6 +283,9 @@ enum Row<'a> {
 /// One side of the pane: a directory listing with its cursor and marks.
 struct Panel {
     location: Location,
+    owner: Option<u32>,
+    pending: bool,
+    laptop_bytes: Vec<u8>,
     /// Every entry of the last listing, sorted.
     entries: Vec<Entry>,
     /// Indices into `entries` of the rows shown after the `..` row.
@@ -288,6 +314,9 @@ struct Panel {
 impl Panel {
     fn new(location: Location) -> Panel {
         Panel {
+            owner: None,
+            pending: false,
+            laptop_bytes: Vec::new(),
             has_parent: location.parent().is_some(),
             location,
             entries: Vec::new(),
@@ -310,6 +339,7 @@ impl Panel {
         self.cancel.store(true, Ordering::Relaxed);
         self.cancel = Arc::new(AtomicBool::new(false));
         self.request = self.request.wrapping_add(1);
+        self.laptop_bytes.clear();
         self.loading = true;
         (self.request, Arc::clone(&self.cancel))
     }
@@ -520,7 +550,7 @@ impl FilesPane {
     /// E.g. "files · ~/Dev ⇄ edge-proxy:/var/log".
     pub fn title(&self) -> String {
         let [left, right] = &self.panels;
-        format!("files · {} ⇄ {}", left.location.short_display(), right.location.short_display())
+        format!("files · {} ⇄ {}", left.location.title(), right.location.title())
     }
 
     pub fn location(&self, side: Side) -> &Location {
@@ -529,13 +559,114 @@ impl FilesPane {
 
     /// Points a panel at `loc` and lists it.
     pub fn set_location(&mut self, side: Side, loc: Location) {
+        self.panel_mut(side).owner = None;
         self.navigate(side, loc, None);
     }
 
-    /// Reloads both panels, keeping cursors and marks where the names still exist.
+    fn restricted(&self, side: Side) -> Option<String> {
+        let panel = self.panel(side);
+        match &panel.location {
+            Location::Laptop { host, .. } if panel.owner != Some(self.viewer) => {
+                Some(format!("{host}: shown on that machine only"))
+            }
+            _ => None,
+        }
+    }
+
+    pub fn can_set(&self, side: Side, client: u32) -> bool {
+        let panel = self.panel(side);
+        !matches!(panel.location, Location::Laptop { .. }) || panel.owner.is_none_or(|owner| owner == client)
+    }
+
+    pub fn set_laptop(&mut self, side: Side, location: Location, client: u32) -> bool {
+        if !self.can_set(side, client) || matches!(self.panel(side.other()).location, Location::Laptop { .. }) {
+            return false;
+        }
+        self.panel_mut(side).owner = Some(client);
+        self.navigate(side, location, None);
+        true
+    }
+
+    pub fn reconnect_laptop(&mut self, owner_id: &str, client: u32) {
+        for side in [Side::Left, Side::Right] {
+            if matches!(&self.panel(side).location, Location::Laptop { owner_id: owner, .. } if owner == owner_id) {
+                self.panel_mut(side).owner = Some(client);
+                self.load(side);
+            }
+        }
+    }
+
+    pub fn laptop_requests(&mut self) -> Vec<(u32, Side, u64, String)> {
+        let mut requests = Vec::new();
+        for side in [Side::Left, Side::Right] {
+            let panel = self.panel_mut(side);
+            if !std::mem::take(&mut panel.pending) {
+                continue;
+            }
+            if let Location::Laptop { path, host, .. } = &panel.location {
+                if let Some(owner) = panel.owner {
+                    requests.push((owner, side, panel.request, path.clone()));
+                } else {
+                    let error = format!("{host} is not attached: press o to choose a machine");
+                    panel.apply(Err(error), false);
+                }
+            }
+        }
+        requests
+    }
+
+    pub fn laptop_chunk(&mut self, client: u32, side: Side, request: u64, data: Vec<u8>, done: bool) {
+        let panel = self.panel_mut(side);
+        if panel.owner != Some(client)
+            || panel.request != request
+            || !panel.loading
+            || !matches!(panel.location, Location::Laptop { .. })
+        {
+            return;
+        }
+        if data.len() > crate::protocol::LAPTOP_CHUNK
+            || panel.laptop_bytes.len() + data.len() > crate::protocol::LAPTOP_LIST_LIMIT
+        {
+            self.laptop_result(client, side, request, Err("Laptop listing is too large".into()));
+            return;
+        }
+        panel.laptop_bytes.extend(data);
+        if done {
+            let result =
+                serde_json::from_slice(&panel.laptop_bytes).unwrap_or_else(|_| Err("Invalid laptop listing".into()));
+            self.laptop_result(client, side, request, result);
+        }
+    }
+
+    pub fn laptop_result(
+        &mut self,
+        client: u32,
+        side: Side,
+        request: u64,
+        result: Result<(String, Vec<Entry>), String>,
+    ) {
+        let hidden = self.show_hidden;
+        let panel = self.panel_mut(side);
+        if panel.owner != Some(client) || panel.request != request || !panel.loading {
+            return;
+        }
+        let Location::Laptop { owner_id, host, .. } = &panel.location else {
+            return;
+        };
+        panel.laptop_bytes.clear();
+        let result = result.map(|(path, entries)| {
+            (Location::Laptop { owner_id: owner_id.clone(), host: host.clone(), path }, entries)
+        });
+        panel.apply(result, hidden);
+    }
+
+    /// Reloads session and SSH panels after a job finishes.
     pub fn refresh(&mut self) {
-        self.load(Side::Left);
-        self.load(Side::Right);
+        for side in [Side::Left, Side::Right] {
+            if !matches!(self.panel(side).location, Location::Laptop { .. }) {
+                self.load(side);
+            }
+        }
     }
 
     /// Applies finished background listings; true if something changed.
@@ -562,7 +693,7 @@ impl FilesPane {
             let offset = panel.scroll_offset(viewer, height);
             panel.set_offset(viewer, offset);
         }
-        self.draw(area, buf);
+        self.draw(area, buf, false);
     }
 
     /// The client about to draw the pane: what it shows is remembered as its own.
@@ -571,10 +702,21 @@ impl FilesPane {
     }
 
     /// A client went away: what it showed is forgotten.
-    pub fn forget_viewer(&mut self, viewer: u32) {
+    pub fn forget_viewer(&mut self, viewer: u32) -> bool {
+        let mut changed = false;
         for panel in &mut self.panels {
             panel.offsets.remove(&viewer);
+            if panel.owner == Some(viewer) {
+                changed = true;
+                panel.owner = None;
+                panel.pending = false;
+                panel.supersede();
+                if let Location::Laptop { host, .. } = &panel.location {
+                    panel.apply(Err(format!("{host} is not attached: press o to choose a machine")), self.show_hidden);
+                }
+            }
         }
+        changed
     }
 
     /// Text of what is shown, for tests and the CLI `read` command.
@@ -584,13 +726,24 @@ impl FilesPane {
         let (width, height) = self.view.unwrap_or(DEFAULT_VIEW);
         let area = Rect::new(0, 0, width, height);
         let mut buf = Buffer::empty(area);
-        self.draw(area, &mut buf);
+        self.draw(area, &mut buf, true);
         buffer_rows(&buf, area).join("\n")
     }
 
     /// Handles a key; the returned action is for the server to carry out.
     pub fn key(&mut self, key: FileKey) -> FilesAction {
         let side = self.active;
+        if let Some(why) = self.restricted(side) {
+            return match key {
+                FileKey::Tab => {
+                    self.active = side.other();
+                    FilesAction::None
+                }
+                FileKey::Esc | FileKey::Char('q') | FileKey::F(10) => FilesAction::Close,
+                FileKey::Char('o' | ':') if self.panel(side).owner.is_none() => FilesAction::PickLocation(side),
+                _ => FilesAction::Refused(why),
+            };
+        }
         let show_hidden = self.show_hidden;
         if self.panel(side).editing {
             let panel = self.panel_mut(side);
@@ -621,6 +774,20 @@ impl FilesPane {
                 // Navigation keys keep working while typing.
                 _ => {}
             }
+        }
+        let laptop = matches!(self.panel(side).location, Location::Laptop { .. });
+        if laptop && matches!(key, FileKey::Char('e' | 's') | FileKey::F(4)) {
+            return FilesAction::Refused(
+                "Editing and shells are unavailable on the laptop: open them on that machine".into(),
+            );
+        }
+        if (laptop && matches!(key, FileKey::Char('d') | FileKey::Delete | FileKey::F(8)))
+            || (self.panels.iter().any(|p| matches!(p.location, Location::Laptop { .. }))
+                && matches!(key, FileKey::Char('c' | 'm') | FileKey::F(5 | 6)))
+        {
+            return FilesAction::Refused(
+                "Laptop copy, move and delete: not yet available. Use kraal cp on the laptop to copy files".into(),
+            );
         }
         let page = isize::try_from(self.list_height().saturating_sub(1).max(1)).unwrap_or(1);
         match key {
@@ -671,7 +838,13 @@ impl FilesPane {
             FileKey::Char('e') | FileKey::F(4) => return self.edit(side),
             FileKey::Char('s') => return FilesAction::Shell(self.panel(side).location.clone()),
             FileKey::Char('o' | ':') => return FilesAction::PickLocation(side),
-            FileKey::Char('r') => self.refresh(),
+            FileKey::Char('r') => {
+                for side in [Side::Left, Side::Right] {
+                    if self.restricted(side).is_none() {
+                        self.load(side);
+                    }
+                }
+            }
             FileKey::Char('.') => {
                 self.show_hidden = !self.show_hidden;
                 for panel in &mut self.panels {
@@ -717,6 +890,9 @@ impl FilesPane {
         if row < list_y || row - list_y >= list_height {
             return FilesAction::None;
         }
+        if let Some(why) = self.restricted(side) {
+            return FilesAction::Refused(why);
+        }
         let viewer = self.viewer;
         let panel = self.panel_mut(side);
         let index = panel.scroll_offset(viewer, usize::from(list_height)).saturating_add(usize::from(row - list_y));
@@ -748,6 +924,9 @@ impl FilesPane {
     }
 
     fn scroll_side(&mut self, side: Side, delta: i32) {
+        if self.restricted(side).is_some() {
+            return;
+        }
         let height = usize::from(self.geometry().list.1).max(1);
         let viewer = self.viewer;
         let panel = self.panel_mut(side);
@@ -787,6 +966,14 @@ impl FilesPane {
     fn load(&mut self, side: Side) {
         let panel = self.panel_mut(side);
         let (request, cancel) = panel.supersede();
+        if matches!(panel.location, Location::Laptop { .. }) {
+            panel.entries.clear();
+            panel.shown.clear();
+            panel.marked.clear();
+            panel.pending = true;
+            (self.wake)();
+            return;
+        }
         let location = panel.location.clone();
         let (done, wake, ssh) = (Arc::clone(&self.done), Arc::clone(&self.wake), self.ssh.clone());
         let spawned = crate::threads::named("kraal-files").spawn(move || {
@@ -814,6 +1001,11 @@ impl FilesPane {
                 self.navigate(side, target, None);
             }
             Some(Row::Entry(entry)) => {
+                if matches!(panel.location, Location::Laptop { .. }) {
+                    return FilesAction::Refused(
+                        "Preview is unavailable on the laptop: open the file on that machine".into(),
+                    );
+                }
                 if let Location::Local(path) = panel.location.join(&entry.name) {
                     return FilesAction::Preview(path);
                 }

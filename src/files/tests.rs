@@ -47,7 +47,7 @@ fn remote(path: &str) -> Location {
 fn remote_path(location: &Location) -> &str {
     match location {
         Location::Remote(remote) => &remote.path,
-        Location::Local(_) => panic!("not remote: {location:?}"),
+        Location::Local(_) | Location::Laptop { .. } => panic!("not remote: {location:?}"),
     }
 }
 
@@ -1021,4 +1021,158 @@ fn ssh_failures_and_timeouts_are_shown() {
     settle(&mut pane);
     assert!(error(&pane, Side::Left).starts_with("cannot run kraal-test-no-ssh"), "{}", error(&pane, Side::Left));
     assert_eq!(error(&pane, Side::Right), "no ssh destination for srv");
+}
+
+fn laptop(path: &str) -> Location {
+    Location::Laptop { owner_id: "abc123".into(), host: "travel".into(), path: path.into() }
+}
+
+#[test]
+fn laptop_lists_only_through_owner_and_hides_paths_and_entries_from_other_views() {
+    let mut pane = offline(local(LEFT), local(RIGHT));
+    pane.set_view(7, 120, 24);
+    assert!(pane.set_laptop(Side::Left, laptop("~/private"), 7));
+    let requests = pane.laptop_requests();
+    assert_eq!(requests.len(), 1);
+    let (owner, side, request, path) = &requests[0];
+    assert_eq!((*owner, *side, path.as_str()), (7, Side::Left, "~/private"));
+    let result = Ok(("~/private".into(), vec![file("confidential.txt", 42)]));
+    pane.laptop_result(8, Side::Left, *request, result.clone());
+    assert!(pane.panel(Side::Left).entries.is_empty());
+    pane.laptop_result(7, Side::Left, request.wrapping_sub(1), result.clone());
+    assert!(pane.panel(Side::Left).entries.is_empty());
+    pane.laptop_result(7, Side::Left, *request, result);
+    let area = Rect::new(0, 0, 120, 24);
+    let mut buf = Buffer::empty(area);
+    pane.render(area, &mut buf);
+    assert!(crate::testing::buffer_text(&buf).contains("confidential.txt"));
+    assert!(!pane.title().contains("private"));
+    assert_eq!(pane.location(Side::Left).saved(), "~");
+    let text = pane.visible_text();
+    assert!(text.contains("travel: shown on that machine only"));
+    assert!(!text.contains("confidential") && !text.contains("private"));
+    pane.set_viewer(8);
+    pane.render(area, &mut buf);
+    let text = crate::testing::buffer_text(&buf);
+    assert!(text.contains("travel: shown on that machine only"));
+    assert!(!text.contains("confidential") && !text.contains("private"));
+    for key in [FileKey::Enter, FileKey::Char('o'), FileKey::Char('r'), FileKey::Char('.'), FileKey::Char('c')] {
+        assert!(matches!(pane.key(key), FilesAction::Refused(_)));
+    }
+    assert!(!pane.can_set(Side::Left, 8));
+    assert!(!pane.set_laptop(Side::Left, laptop("~"), 8));
+    assert!(matches!(pane.click(2, 4, true), FilesAction::Refused(_)));
+}
+
+#[test]
+fn laptop_detach_discards_listing_and_reconnect_accepts_only_the_same_identity() {
+    let mut pane = offline(local(LEFT), local(RIGHT));
+    assert!(pane.set_laptop(Side::Left, laptop("~"), 7));
+    let request = pane.laptop_requests()[0].2;
+    pane.laptop_result(7, Side::Left, request, Ok(("~".into(), vec![file("old.txt", 42)])));
+    pane.forget_viewer(7);
+    assert!(pane.panel(Side::Left).entries.is_empty());
+    assert!(pane.visible_text().contains("travel is not attached"));
+    pane.laptop_result(7, Side::Left, request, Ok(("~".into(), vec![file("late.txt", 42)])));
+    assert!(pane.panel(Side::Left).entries.is_empty());
+    pane.reconnect_laptop("different", 9);
+    assert!(pane.laptop_requests().is_empty());
+    pane.reconnect_laptop("abc123", 10);
+    let requests = pane.laptop_requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].0, 10);
+    assert_ne!(requests[0].2, request);
+    pane.laptop_result(10, Side::Left, requests[0].2, Ok(("~".into(), vec![file("new.txt", 42)])));
+    assert_eq!(pane.panel(Side::Left).entries[0].name, "new.txt");
+}
+
+#[test]
+fn laptop_chunks_publish_only_complete_current_listings_and_discard_aborted_bytes() {
+    let mut pane = offline(local(LEFT), local(RIGHT));
+    assert!(pane.set_laptop(Side::Left, laptop("~"), 7));
+    let request = pane.laptop_requests()[0].2;
+    let listing: crate::laptop::Listing = Ok(("~/private".into(), vec![file("complete.txt", 42)]));
+    let bytes = serde_json::to_vec(&listing).unwrap();
+    pane.laptop_chunk(8, Side::Left, request, bytes.clone(), false);
+    pane.laptop_chunk(7, Side::Left, request - 1, bytes.clone(), false);
+    assert!(pane.panel(Side::Left).laptop_bytes.is_empty());
+    pane.laptop_chunk(7, Side::Left, request, bytes[..10].to_vec(), false);
+    assert!(pane.panel(Side::Left).entries.is_empty());
+    assert_eq!(pane.location(Side::Left).display(), "travel:~");
+    pane.forget_viewer(7);
+    assert!(pane.panel(Side::Left).laptop_bytes.is_empty());
+    pane.reconnect_laptop("abc123", 9);
+    let current = pane.laptop_requests()[0].2;
+    pane.laptop_chunk(7, Side::Left, request, bytes[10..].to_vec(), true);
+    assert!(pane.panel(Side::Left).laptop_bytes.is_empty());
+    pane.laptop_chunk(9, Side::Left, current, bytes[..10].to_vec(), false);
+    pane.laptop_result(9, Side::Left, current, Err("stalled".into()));
+    assert!(pane.panel(Side::Left).laptop_bytes.is_empty());
+    assert!(pane.panel(Side::Left).entries.is_empty());
+    pane.reconnect_laptop("abc123", 9);
+    let current = pane.laptop_requests()[0].2;
+    pane.laptop_chunk(9, Side::Left, current, bytes[..10].to_vec(), false);
+    pane.laptop_chunk(9, Side::Left, current, bytes[10..].to_vec(), true);
+    assert_eq!(pane.panel(Side::Left).entries[0].name, "complete.txt");
+    assert_eq!(pane.location(Side::Left).display(), "travel:~/private");
+    assert!(pane.panel(Side::Left).laptop_bytes.is_empty());
+    pane.reconnect_laptop("abc123", 9);
+    let current = pane.laptop_requests()[0].2;
+    pane.laptop_chunk(9, Side::Left, current, vec![0; crate::protocol::LAPTOP_CHUNK + 1], true);
+    assert_eq!(pane.panel(Side::Left).error.as_deref(), Some("Laptop listing is too large"));
+    assert!(pane.panel(Side::Left).laptop_bytes.is_empty());
+}
+
+#[test]
+fn laptop_actions_are_explicitly_refused_and_only_one_panel_can_use_it() {
+    let mut pane = offline(local(LEFT), local(RIGHT));
+    pane.set_viewer(7);
+    assert!(pane.set_laptop(Side::Left, laptop("~"), 7));
+    assert!(!pane.set_laptop(Side::Right, laptop("~"), 7));
+    let request = pane.laptop_requests()[0].2;
+    pane.laptop_result(7, Side::Left, request, Ok(("~".into(), vec![file("note.txt", 42)])));
+    for key in [FileKey::Char('c'), FileKey::Char('m'), FileKey::Char('d'), FileKey::F(5), FileKey::F(6), FileKey::F(8)]
+    {
+        assert!(matches!(pane.key(key), FilesAction::Refused(why) if why.contains("not yet")));
+    }
+    for key in [FileKey::Char('e'), FileKey::Char('s'), FileKey::Enter, FileKey::F(3)] {
+        assert!(matches!(pane.key(key), FilesAction::Refused(_)));
+    }
+    assert!(matches!(pane.key(FileKey::Tab), FilesAction::None));
+    assert!(matches!(pane.key(FileKey::Char('c')), FilesAction::Refused(why) if why.contains("not yet")));
+    pane.set_location(Side::Left, local(LEFT));
+    assert!(pane.panel(Side::Left).owner.is_none());
+    assert!(pane.set_laptop(Side::Right, laptop("~"), 7));
+}
+
+#[test]
+fn another_clients_refresh_does_not_request_a_laptop_listing() {
+    let mut pane = offline(local(LEFT), local(RIGHT));
+    assert!(pane.set_laptop(Side::Left, laptop("~"), 7));
+    pane.laptop_requests();
+    pane.set_viewer(8);
+    pane.key(FileKey::Tab);
+    pane.key(FileKey::Char('r'));
+    assert!(pane.laptop_requests().is_empty());
+    pane.refresh();
+    assert!(pane.laptop_requests().is_empty());
+    pane.set_viewer(7);
+    pane.key(FileKey::Char('r'));
+    assert_eq!(pane.laptop_requests().len(), 1);
+}
+
+#[test]
+fn laptop_filter_accepts_letters_used_by_unavailable_actions() {
+    let mut pane = offline(local(LEFT), local(RIGHT));
+    pane.set_viewer(7);
+    assert!(pane.set_laptop(Side::Left, laptop("~"), 7));
+    pane.key(FileKey::Char('/'));
+    for c in "secret.md".chars() {
+        assert_eq!(pane.key(FileKey::Char(c)), FilesAction::None);
+    }
+    assert_eq!(pane.panel(Side::Left).filter, "secret.md");
+    pane.set_viewer(8);
+    assert!(matches!(pane.key(FileKey::Char('x')), FilesAction::Refused(_)));
+    assert_eq!(pane.key(FileKey::Esc), FilesAction::Close);
+    assert_eq!(pane.panel(Side::Left).filter, "secret.md");
 }

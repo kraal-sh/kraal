@@ -1,0 +1,7 @@
+# Choose which laptop directories a remote file manager can list.
+# Needs ssh access to a session through kraal attach --host.
+# Put this in config.toml on the laptop. Permission is still asked locally.
+[laptop_files]
+# "home" excludes hidden top-level entries and ~/Library on macOS.
+# "all" allows directories anywhere your user can read. "off" refuses listing.
+scope = "home"

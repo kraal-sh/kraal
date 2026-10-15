@@ -87,6 +87,7 @@ impl Server {
                 last_click: None,
                 welcome: false,
                 remote: false,
+                laptop: None,
                 peer,
             },
         );
@@ -107,7 +108,7 @@ impl Server {
             }
         };
         match msg {
-            ClientMsg::Attach { version, cols, rows, workspace, remote, pane, installed } => {
+            ClientMsg::Attach { version, cols, rows, workspace, remote, laptop, pane, installed } => {
                 if version != protocol::PROTOCOL_VERSION {
                     self.send_msg(id, &ServerMsg::exit(self.version_mismatch(version)));
                     self.clients.remove(&id);
@@ -117,10 +118,24 @@ impl Server {
                     c.attachments.pending = None;
                     c.attachments.blocked = None;
                     c.remote = remote;
+                    c.laptop = laptop.filter(|l| {
+                        remote
+                            && crate::attachments::token_valid(&l.id)
+                            && !l.host.is_empty()
+                            && l.host.len() <= 255
+                            && !l.host.chars().any(char::is_control)
+                    });
                     c.attachments.focus = None;
                 }
                 let (cols, rows) = clamp_size(cols, rows);
                 self.attach(id, cols, rows, workspace);
+                if let Some(laptop) = self.clients.get(&id).and_then(|c| c.laptop.clone()) {
+                    for p in self.panes.values_mut() {
+                        if let crate::pane::Content::Files(f) = &mut p.content {
+                            f.reconnect_laptop(&laptop.id, id);
+                        }
+                    }
+                }
                 if let Some(installed) = installed {
                     self.version_notice(id, &installed);
                 }
@@ -130,6 +145,23 @@ impl Server {
                         Ok(p) => self.reveal(id, p),
                         Err(e) => self.warnings.push(e),
                     }
+                }
+            }
+            ClientMsg::LaptopListChunk { pane, side, request, data, done } => {
+                if self.clients.get(&id).is_some_and(|c| c.attached && c.laptop.is_some()) {
+                    if let Some(crate::pane::Content::Files(f)) = self.panes.get_mut(&pane).map(|p| &mut p.content) {
+                        f.laptop_chunk(id, side, request, data, done);
+                    }
+                    self.send_msg(id, &ServerMsg::LaptopListAck { pane, side, request });
+                    self.mark_dirty();
+                }
+            }
+            ClientMsg::LaptopListed { pane, side, request, result } => {
+                if self.clients.get(&id).is_some_and(|c| c.attached && c.laptop.is_some()) {
+                    if let Some(crate::pane::Content::Files(f)) = self.panes.get_mut(&pane).map(|p| &mut p.content) {
+                        f.laptop_result(id, side, request, result);
+                    }
+                    self.mark_dirty();
                 }
             }
             ClientMsg::Resize { cols, rows } => {
@@ -280,10 +312,14 @@ impl Server {
         // What the client was in the middle of goes with it.
         self.drafts.remove(&id);
         self.md_sessions.remove(&id);
+        let mut files_changed = false;
         for p in self.panes.values_mut() {
             if let crate::pane::Content::Files(f) = &mut p.content {
-                f.forget_viewer(id);
+                files_changed |= f.forget_viewer(id);
             }
+        }
+        if files_changed {
+            self.mark_dirty();
         }
         if self.primary == Some(id) {
             self.primary = self.clients.values().filter(|c| c.attached).max_by_key(|c| c.last_input).map(|c| c.id);
@@ -335,6 +371,15 @@ pub struct Outbox {
 const QUEUE: usize = 64;
 
 impl Outbox {
+    #[cfg(test)]
+    pub(super) fn capture(&mut self) -> crossbeam_channel::Receiver<Vec<u8>> {
+        let (send, receive) = crossbeam_channel::bounded(4);
+        self.queue = send;
+        // Keep handler tests on the queue, independent of the socket writer's scheduling.
+        self.queued.store(1, Ordering::Release);
+        receive
+    }
+
     /// The outbox of a client connected on `stream`, and its writer thread.
     fn start(stream: UnixStream, id: ClientId) -> std::io::Result<Outbox> {
         let (tx, rx) = crossbeam_channel::bounded::<Vec<u8>>(QUEUE);
@@ -469,12 +514,33 @@ mod tests {
     }
 
     fn outgoing(server: &mut Server, id: ClientId) -> crossbeam_channel::Receiver<Vec<u8>> {
-        let (send, receive) = crossbeam_channel::bounded(4);
-        let out = &mut server.clients.get_mut(&id).unwrap().out;
-        out.queue = send;
-        // Keep handler tests on the queue, independent of the socket writer's scheduling.
-        out.queued.store(1, Ordering::Release);
-        receive
+        server.clients.get_mut(&id).unwrap().out.capture()
+    }
+
+    #[test]
+    fn only_remote_attachments_advertise_a_laptop() {
+        use super::super::tests::{client, server};
+        let (tx, _rx) = super::super::queue::channel(32);
+        let mut server = server(tx);
+        for remote in [false, true] {
+            let (id, _peer) = client(&mut server);
+            let message = ClientMsg::Attach {
+                version: protocol::PROTOCOL_VERSION,
+                cols: 80,
+                rows: 24,
+                workspace: None,
+                remote,
+                pane: None,
+                installed: None,
+                laptop: Some(crate::laptop::Identity {
+                    id: "abc123".into(),
+                    host: "travel".into(),
+                    os: "macos".into(),
+                }),
+            };
+            server.client_frame(id, protocol::JSON, serde_json::to_vec(&message).unwrap());
+            assert_eq!(server.clients[&id].laptop.is_some(), remote);
+        }
     }
 
     #[test]

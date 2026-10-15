@@ -120,6 +120,10 @@ confirm_sync = true
 # Ask before pasting several lines into a production pane that would run them at once.
 confirm_paste = true
 
+[laptop_files]
+# Files listed by this client for a remote session: "home", "all" or "off".
+scope = "home"
+
 [clipboard]
 # On the attaching machine: "auto" tries native tools for user copies, then OSC 52.
 # "terminal" uses OSC 52 only; "off" keeps only the session's paste buffers.
@@ -290,6 +294,8 @@ pub struct Config {
     pub production: ProductionConfig,
     pub buffers: BuffersConfig,
     pub clipboard: crate::clipboard::Settings,
+    #[serde(default)]
+    pub laptop_files: crate::laptop::Settings,
     #[serde(default)]
     pub attachments: crate::attachments::Settings,
     pub worktrees: WorktreesConfig,

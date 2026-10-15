@@ -118,7 +118,7 @@ directory in the destination, and the same command again goes on from it.
 
 `ctrl+b f` opens a two-panel file manager (Midnight Commander style) on the focused pane's
 directory and, for an SSH pane, its server; `kraal files ~/Dev db:/var/log` from the command line.
-Each panel shows this machine or any server (`o` to choose). `space` marks, `c` copies to the
+Each panel shows the session's machine or any server (`o` to choose). `space` marks, `c` copies to the
 other panel (it asks first when that would replace files there, and what you did not agree to
 replace is never replaced, even if it appears during the copy: that copy then waits in a hidden
 `.kraal-stage-…` directory in the destination, and kraal never removes one it cannot tell is over
@@ -130,6 +130,31 @@ first), `enter` opens a directory or previews a local file, `e` edits a file in 
 files, `r` reads the directory again, `tab` goes to the other panel, `backspace` to the directory
 above, and `q` closes. Selected files carry a ✓. Transfers run in a small window that closes
 itself once done, and stays open to show why when one failed.
+
+With `attach --host`, `o` also offers **this laptop**. The session's machine is named by its
+hostname instead of **local**. Choosing the laptop opens a question drawn by your local client;
+nothing is listed before you agree. **Allow** lasts until this attach ends, including automatic
+reconnections. **Always** remembers the SSH destination and arguments in
+`~/.config/kraal/laptop-files.toml` (under `$XDG_CONFIG_HOME/kraal` when set). Remove its
+`[[server]]` entry, or the file, to revoke Always. Permission is checked again for every request.
+**Cancel** leaves the panel saying **refused: nothing was listed**; `r` asks again.
+
+The default scope is your home directory without hidden top-level entries such as `.ssh` and
+`.config`, and without `~/Library` on macOS. Hidden files deeper inside it follow `.`.
+The laptop's [configuration](configuration.md#laptop-files) can allow all directories or turn
+listing off. Symbolic links are shown but never followed, including links within the scope;
+special files are omitted. Listings are limited to 16 MiB and 100,000 entries.
+
+Only the client that chose the laptop sees its listing. Other clients and `kraal read` see
+**shown on that machine only** and cannot act on that panel. The pane title omits the laptop
+path. Saving keeps that panel as the session machine's `~`, so restoring never depends on a
+laptop. Disconnecting clears the listing; an automatic reconnect lists it again. A new attach
+has a new identity and sees **is not attached** until a machine is chosen with `o`.
+
+Laptop browsing is available in one panel at a time. Copy, move and delete involving it say
+**not yet available**. Editing, previews and shells are unavailable there. Open those on the
+laptop, or run `kraal cp` on the laptop to transfer files. There is no laptop path syntax in
+`kraal files`, `kraal cp` or control requests.
 
 In a local session, pasted paths stay unchanged, including in an SSH pane. Use **Upload to
 this pane's server** in the command palette or `kraal cp` to send files there.
@@ -233,6 +258,9 @@ sidebar's agents and `alt+a` open such a tab for you, see below). Ctrl+click on 
 remote session opens it on your machine. A `localhost` address there is
 the server's, not yours: kraal keeps it in paste buffers, sends a copy to your terminal, and
 says where the address works instead of opening the wrong page.
+
+To browse this laptop, open the [file manager](#the-file-manager) and choose it with `o`.
+Its local consent is separate from attachment and clipboard permissions.
 
 To send laptop files through this connection, choose **Attach files** in the command palette.
 Enter their absolute local paths and press Enter. The server receives the complete batch before

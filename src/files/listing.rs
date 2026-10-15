@@ -37,6 +37,7 @@ impl Default for Ssh {
 /// Lists `location`; runs on a background thread.
 pub(super) fn list(location: &Location, ssh: &Ssh, cancel: &AtomicBool) -> Listing {
     match location {
+        Location::Laptop { .. } => Err("laptop listings belong to the attached client".into()),
         Location::Local(path) => {
             let (path, entries) = list_local(path)?;
             Ok((Location::Local(path), entries))

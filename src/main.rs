@@ -25,6 +25,7 @@ mod hints;
 mod input;
 mod integration;
 mod keymap;
+mod laptop;
 mod layout;
 mod pane;
 mod paths;

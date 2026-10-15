@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::agent::AgentState;
 
-pub const PROTOCOL_VERSION: u32 = 3;
+pub const PROTOCOL_VERSION: u32 = 4;
 pub const KRAAL_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Both released migration sources used protocol 2 and omitted it from Pong.
@@ -99,6 +99,8 @@ pub const JSON: u8 = 0;
 pub const BYTES: u8 = 1;
 
 const MAX_FRAME: usize = 64 << 20;
+pub const LAPTOP_CHUNK: usize = 4096;
+pub const LAPTOP_LIST_LIMIT: usize = 64 << 20;
 
 pub fn write_frame(w: &mut impl Write, kind: u8, payload: &[u8]) -> io::Result<()> {
     // The other side would refuse it: say so here instead of sending it.
@@ -156,6 +158,8 @@ pub enum ClientMsg {
         /// The client runs on another machine than the server (attached over ssh).
         #[serde(default)]
         remote: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        laptop: Option<crate::laptop::Identity>,
         /// A pane to show first (an id or a name), in place of the workspace.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pane: Option<String>,
@@ -163,6 +167,19 @@ pub enum ClientMsg {
         /// (a local client is that binary): the server says when it is newer than its own.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         installed: Option<String>,
+    },
+    LaptopListChunk {
+        pane: crate::layout::PaneId,
+        side: crate::files::Side,
+        request: u64,
+        data: Vec<u8>,
+        done: bool,
+    },
+    LaptopListed {
+        pane: crate::layout::PaneId,
+        side: crate::files::Side,
+        request: u64,
+        result: crate::laptop::Listing,
     },
     Resize {
         cols: u16,
@@ -238,6 +255,17 @@ impl ClientMsg {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServerMsg {
+    LaptopListAck {
+        pane: crate::layout::PaneId,
+        side: crate::files::Side,
+        request: u64,
+    },
+    LaptopList {
+        pane: crate::layout::PaneId,
+        side: crate::files::Side,
+        request: u64,
+        path: String,
+    },
     /// The interactive session ended (detach, server shutdown, …).
     Exit {
         reason: String,
@@ -932,8 +960,28 @@ mod tests {
                 rows: 24,
                 workspace: Some(s("w")),
                 remote: true,
+                laptop: Some(crate::laptop::Identity { id: s("abc123"), host: s("travel"), os: s("macos") }),
                 pane: Some(s("3")),
                 installed: Some(s("0.2.0")),
+            },
+            ClientMsg::LaptopListChunk {
+                pane: 3,
+                side: crate::files::Side::Left,
+                request: 7,
+                data: b"{}".to_vec(),
+                done: true,
+            },
+            ClientMsg::LaptopListed {
+                pane: 3,
+                side: crate::files::Side::Left,
+                request: 7,
+                result: Ok((s("~"), Vec::new())),
+            },
+            ClientMsg::LaptopListed {
+                pane: 3,
+                side: crate::files::Side::Right,
+                request: 8,
+                result: Err(s("refused: nothing was listed")),
             },
             ClientMsg::Resize { cols: 80, rows: 24 },
             ClientMsg::Repaint,
@@ -1024,6 +1072,8 @@ mod tests {
         server.extend([
             ServerMsg::Response { result: Err(s("no")) },
             ServerMsg::Exit { reason: s("bye"), reattach: Some(s("w")) },
+            ServerMsg::LaptopListAck { pane: 3, side: crate::files::Side::Left, request: 7 },
+            ServerMsg::LaptopList { pane: 3, side: crate::files::Side::Left, request: 7, path: s("~") },
             ServerMsg::Attached { version: s(KRAAL_VERSION), protocol: PROTOCOL_VERSION },
             ServerMsg::Open { url: s("https://example.com") },
             ServerMsg::ClipboardFocus { pane: Some(7), agent: true },
@@ -1078,6 +1128,7 @@ mod tests {
                         rows: rng.number() as u16,
                         workspace: None,
                         remote: rng.one_in(2),
+                        laptop: None,
                         pane: None,
                         installed: None,
                     })

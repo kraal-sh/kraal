@@ -116,20 +116,31 @@ pub(crate) struct Controller {
     writer: Writer,
     remote: bool,
     destination: Option<(Vec<String>, String)>,
+    laptop: Option<Arc<super::laptop::Controller>>,
 }
 
 impl Controller {
     #[cfg(test)]
     pub fn new(writer: Writer, remote: bool) -> Arc<Self> {
-        Arc::new(Self { state: Mutex::new(State::default()), writer, remote, destination: None })
+        Arc::new(Self { state: Mutex::new(State::default()), writer, remote, destination: None, laptop: None })
     }
 
-    pub fn for_target(writer: Writer, target: &super::Target) -> Arc<Self> {
+    pub fn for_target(
+        writer: Writer,
+        target: &super::Target,
+        laptop: Option<Arc<super::laptop::Controller>>,
+    ) -> Arc<Self> {
         let destination = match target {
             super::Target::Remote { ssh, label, .. } => Some((ssh.clone(), label.clone())),
             super::Target::Local { .. } => None,
         };
-        Arc::new(Self { state: Mutex::new(State::default()), writer, remote: destination.is_some(), destination })
+        Arc::new(Self {
+            state: Mutex::new(State::default()),
+            writer,
+            remote: destination.is_some(),
+            destination,
+            laptop,
+        })
     }
 
     pub fn connected(&self) {
@@ -138,7 +149,8 @@ impl Controller {
 
     pub fn pending_keys(&self) -> bool {
         let state = self.state.lock().unwrap();
-        state.image_keys.pending()
+        self.laptop.as_ref().is_some_and(|laptop| laptop.pending_keys())
+            || state.image_keys.pending()
             || state.splitter.has_pending()
             || state.dropped.is_some() && state.parser.has_pending()
             || state.prompt.as_ref().is_some_and(|p| p.parser.has_pending())
@@ -167,6 +179,10 @@ impl Controller {
             state.splitter.feed(bytes)
         };
         drop(state);
+        // Both parsers see the uninterrupted stream before either dialog consumes input.
+        if self.laptop.as_ref().is_some_and(|laptop| laptop.input(bytes)) {
+            return true;
+        }
         let mut following_paste = false;
         for part in parts {
             if matches!(&part, paste::Part::Start | paste::Part::Paste(_)) {
@@ -432,10 +448,17 @@ impl Controller {
             .collect()
     }
 
+    fn output_local(&self, bytes: &[u8]) -> std::io::Result<bool> {
+        match &self.laptop {
+            Some(laptop) => laptop.output(bytes),
+            None => super::terminal().write(bytes),
+        }
+    }
+
     pub fn draw(&self) {
         let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
         self.draw_with(cols, rows, |bytes| {
-            let _ = super::terminal().write(bytes);
+            let _ = self.output_local(bytes);
         });
     }
 
@@ -452,7 +475,7 @@ impl Controller {
 
     pub fn output(&self, bytes: &[u8]) -> std::io::Result<bool> {
         let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
-        self.output_with(bytes, cols, rows, |out| super::terminal().write(out))
+        self.output_with(bytes, cols, rows, |bytes| self.output_local(bytes))
     }
 
     fn output_with(
@@ -507,7 +530,7 @@ impl Controller {
         }
         let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
         if state.view(&self.host()).is_none() {
-            let _ = super::terminal().write(&state.image_notices.render(cols, rows));
+            let _ = self.output_local(&state.image_notices.render(cols, rows));
         }
         let this = Arc::downgrade(self);
         let _ = crate::threads::named("clipboard-notice").spawn(move || {
@@ -1179,7 +1202,7 @@ impl Controller {
                 let Some(this) = this.upgrade() else { return };
                 let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
                 if !this.draw_progress_with(&token, Instant::now(), cols, rows, |bytes| {
-                    let _ = super::terminal().write(bytes);
+                    let _ = this.output_local(bytes);
                 }) {
                     return;
                 }
@@ -1344,16 +1367,16 @@ impl Dropped {
     }
 }
 
-struct View {
-    title: String,
-    kind: NoticeKind,
-    error_start: Option<usize>,
-    message: String,
-    files: String,
-    scroll: usize,
-    buttons: Vec<String>,
-    selected: usize,
-    keys: Vec<(&'static str, &'static str)>,
+pub(super) struct View {
+    pub(super) title: String,
+    pub(super) kind: NoticeKind,
+    pub(super) error_start: Option<usize>,
+    pub(super) message: String,
+    pub(super) files: String,
+    pub(super) scroll: usize,
+    pub(super) buttons: Vec<String>,
+    pub(super) selected: usize,
+    pub(super) keys: Vec<(&'static str, &'static str)>,
 }
 
 impl State {
@@ -1532,7 +1555,7 @@ impl View {
         ViewLayout { area, message, error_start, files, file_rows, max_scroll }
     }
 
-    fn render(&self, screen: Rect) -> (Buffer, Vec<Rect>) {
+    pub(super) fn render(&self, screen: Rect) -> (Buffer, Vec<Rect>) {
         let layout = self.layout(screen);
         let area = layout.area;
         let mut buf = Buffer::empty(area);
@@ -1925,7 +1948,7 @@ mod tests {
             clipboard_native: false,
         };
         let (writer, peer) = wire();
-        let client = Controller::for_target(Arc::new(Mutex::new(Some(writer))), &target);
+        let client = Controller::for_target(Arc::new(Mutex::new(Some(writer))), &target, None);
         let (ssh, label) = client.destination.as_ref().unwrap();
         paste::remember(&paste::permission_path(), ssh, label).unwrap();
         assert!(paste::allowed(&paste::permission_path(), ssh));
@@ -2354,7 +2377,7 @@ mod tests {
                 clipboard_native: false,
             };
             let (writer, peer) = wire();
-            let client = Controller::for_target(Arc::new(Mutex::new(Some(writer))), &target);
+            let client = Controller::for_target(Arc::new(Mutex::new(Some(writer))), &target, None);
             client.connected();
             client.message(ServerMsg::ClipboardFocus { pane: Some(7), agent: true });
             (client, peer)
@@ -2838,7 +2861,7 @@ mod tests {
             clipboard_native: false,
         };
         let (writer, mut peer) = wire();
-        let client = Controller::for_target(Arc::new(Mutex::new(Some(writer))), &target);
+        let client = Controller::for_target(Arc::new(Mutex::new(Some(writer))), &target, None);
         prepare_drop(&client, &mut peer, path.to_str().unwrap().as_bytes());
         assert!(!paste::allowed(&paste::permission_path(), &ssh));
         client.keys(b"\t\r");
@@ -2850,7 +2873,7 @@ mod tests {
                 std::fs::remove_file(paste::permission_path()).unwrap();
             }
             let (writer, mut peer) = wire();
-            let client = Controller::for_target(Arc::new(Mutex::new(Some(writer))), &target);
+            let client = Controller::for_target(Arc::new(Mutex::new(Some(writer))), &target, None);
             client.connected();
             // A server cannot create a local gesture, even with permission already granted.
             client.message(ServerMsg::AttachmentPrepared {

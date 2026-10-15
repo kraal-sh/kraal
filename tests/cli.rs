@@ -14,6 +14,8 @@ mod config;
 mod events;
 #[path = "cli/input.rs"]
 mod input;
+#[path = "cli/laptop.rs"]
+mod laptop;
 #[path = "cli/panes.rs"]
 mod panes;
 #[path = "cli/production.rs"]
