@@ -300,8 +300,8 @@ pub enum Cmd {
         /// Refuse to replace what is already in the destination directory (say what it is).
         #[arg(long)]
         no_replace: bool,
-        /// Download into the private laptop relay spool, refusing filesystem name collisions.
-        #[arg(long, hide = true, conflicts_with_all = ["move_", "dry_run"])]
+        /// Transfer into or from the private laptop spool, keeping its internal paths out of the output.
+        #[arg(long, hide = true, conflicts_with = "dry_run")]
         laptop_spool: bool,
         /// With --no-replace: a name that may be replaced all the same (repeatable).
         #[arg(long = "allow", value_name = "NAME", requires = "no_replace")]
@@ -844,6 +844,15 @@ mod tests {
     fn laptop_copy_helper_is_hidden_and_installs_literal_approved_names() {
         use clap::CommandFactory;
         assert!(Cli::command().find_subcommand("laptop-cp").unwrap().is_hide_set());
+        assert!(
+            Cli::command()
+                .find_subcommand("cp")
+                .unwrap()
+                .get_arguments()
+                .find(|arg| arg.get_id() == "laptop_spool")
+                .unwrap()
+                .is_hide_set()
+        );
         assert!(matches!(Cli::try_parse_from(["kraal", "laptop-cp"]).unwrap().command, Some(Cmd::LaptopCp)));
         assert!(Cli::try_parse_from(["kraal", "laptop-cp", "~/secret", "/destination"]).is_err());
         let spec = crate::laptop::copy::Spec {
@@ -858,7 +867,7 @@ mod tests {
             let args = crate::laptop::copy::install_args(&spec, std::path::Path::new("/private/spool"), rsync);
             let parsed = Cli::try_parse_from(std::iter::once("kraal".to_string()).chain(args)).unwrap();
             assert!(
-                matches!(parsed.command, Some(Cmd::Cp { move_, no_replace: true, allow, expect, .. }) if move_ == rsync && allow == spec.allow && expect.is_empty())
+                matches!(parsed.command, Some(Cmd::Cp { move_, no_replace: true, laptop_spool: true, allow, expect, .. }) if move_ == rsync && allow == spec.allow && expect.is_empty())
             );
         }
     }

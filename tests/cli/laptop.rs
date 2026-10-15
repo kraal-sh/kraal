@@ -115,6 +115,15 @@ fn copy_job_output_describes_both_directions_and_finishes_below_progress() {
                 let output = job.join().unwrap();
                 let output_text = String::from_utf8(output.stderr).unwrap();
                 assert!(output.status.success(), "{output_text}");
+                let stdout = String::from_utf8(output.stdout).unwrap();
+                for text in [&output_text, &stdout] {
+                    assert!(!text.contains("laptop-v1"), "{text:?}");
+                    assert!(!text.contains("/payload/report"), "{text:?}");
+                }
+                if !to_laptop {
+                    assert!(output_text.contains("$ kraal put "), "{output_text:?}");
+                    assert!(output_text.contains("\ndone\n"), "{output_text:?}");
+                }
                 let noun = if entries == 1 { "entry" } else { "entries" };
                 let announcement = format!("Copying {entries} {noun} ({size}). Close this window to cancel.\n");
                 assert!(output_text.starts_with(&announcement), "{output_text:?}");

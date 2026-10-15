@@ -115,7 +115,7 @@ impl Location {
     }
 
     /// Like [`Location::display`], with the home directory shown as `~`.
-    fn short_display(&self) -> String {
+    pub(crate) fn short_display(&self) -> String {
         match self {
             Location::Local(path) => match home_dir().and_then(|home| path.strip_prefix(home).ok()) {
                 Some(rest) if rest.as_os_str().is_empty() => "~".to_owned(),

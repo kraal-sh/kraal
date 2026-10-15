@@ -194,7 +194,8 @@ handling to install it. The spool is removed when the job ends; abandoned spools
 on session startup. If an installation race leaves files in staging, the failed transfer
 window names that staging directory. Check that message and the destination before retrying.
 The client shows a local notice for four seconds when an operation finishes or fails, such
-as **anvil copied 3 items to ~/Downloads**. Notices use the client's name for the server.
+as **anvil copied 3 items to ~/Downloads** or **anvil moved 1 item to ~/work**. Notices use
+the client's name for the server and show paths under either machine's home with `~`.
 The affected laptop panel refreshes after a copy, move or deletion.
 
 For copies into the laptop, the job reads without following links and the client writes

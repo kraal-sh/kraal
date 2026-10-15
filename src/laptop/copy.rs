@@ -685,6 +685,9 @@ pub fn cleanup(session: &str) -> Result<()> {
 
 pub fn install_args(spec: &Spec, root: &Path, rsync: bool) -> Vec<String> {
     let mut args = vec!["cp".into()];
+    if spec.remote.is_none() {
+        args.push("--laptop-spool".into());
+    }
     // The spool is disposable: system cp can merge and cross filesystems without modern rsync.
     if rsync && spec.remote.is_none() {
         args.push("--move".into());
@@ -1894,6 +1897,7 @@ mod tests {
             install_args(&spec, Path::new("/private/spool"), true),
             [
                 "cp",
+                "--laptop-spool",
                 "--move",
                 "--no-replace",
                 "--allow=-file with 'quotes'",
@@ -2084,6 +2088,80 @@ mod tests {
         assert!(
             matches!(serde_json::from_slice::<ClientMsg>(&bytes).unwrap(), ClientMsg::LaptopCopy { token, message: FromClient::Progress } if token == "abc")
         );
+    }
+
+    #[test]
+    fn spool_installation_progress_outlasts_the_deadline_with_and_without_rsync() {
+        const CHILD: &str = "UNIT_TEST_INSTALL_PROGRESS";
+        if let Ok(program) = std::env::var(CHILD) {
+            let spool = TempDir::new("install-progress-spool");
+            let destination = TempDir::new("install-progress-destination");
+            let source = spool.mkdir("folder");
+            for i in 0..16 {
+                spool.write(&format!("folder/{i}"), format!("contents {i}"));
+            }
+            let rsync = program == "rsync";
+            let steps = crate::transfer::plan(
+                &[crate::transfer::Endpoint::Local(source)],
+                &crate::transfer::Endpoint::Local(destination.0.clone()),
+                &|_| panic!("installation is local"),
+                &crate::transfer::Options { rsync, moving: rsync, replace: Some(vec![]), ..Default::default() },
+            )
+            .unwrap();
+            assert!(steps.iter().any(|step| step.program == program));
+            crate::transfer::run_laptop_install(&steps).unwrap();
+            for i in 0..16 {
+                assert_eq!(
+                    fs::read_to_string(destination.0.join(format!("folder/{i}"))).unwrap(),
+                    format!("contents {i}")
+                );
+            }
+            return;
+        }
+        for program in ["cp", "rsync"] {
+            let bin = TempDir::new("install-progress-bin");
+            // Pace real file copies, reporting only when the planned command requests progress.
+            // Each installation exceeds the deadline, but no individual copy does.
+            crate::testing::write_script(
+                &bin.0.join(program),
+                "#!/bin/sh\n\
+                 verbose=no; source=; target=\n\
+                 for arg do\n\
+                   source=$target; target=$arg\n\
+                   case $arg in -RpvP|--info=progress2) verbose=yes;; esac\n\
+                 done\n\
+                 mkdir -p \"$target/folder\" || exit 1\n\
+                 for file in \"$source\"/*; do\n\
+                   /bin/cp \"$file\" \"$target/folder/\" || exit 1\n\
+                   if [ \"$verbose\" = yes ]; then printf '%s\\r' \"$file -> $target/folder/\"; fi\n\
+                   sleep 0.1\n\
+                 done\n",
+            );
+            let path = std::env::join_paths(
+                [bin.0.clone()].into_iter().chain(std::env::split_paths(&std::env::var_os("PATH").unwrap())),
+            )
+            .unwrap();
+            let (stream, mut peer) = UnixStream::pair().unwrap();
+            let mut connection = Connection::new(stream, "abc".into()).unwrap();
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command
+                .args([
+                    "--exact",
+                    "laptop::copy::tests::spool_installation_progress_outlasts_the_deadline_with_and_without_rsync",
+                    "--nocapture",
+                ])
+                .env(CHILD, program)
+                .env("PATH", path);
+            let timeout = Duration::from_millis(800);
+            let before = Instant::now();
+            connection.install_with_timeout(&mut command, timeout).unwrap();
+            assert!(before.elapsed() > timeout);
+            peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            let (_, bytes) = protocol::read_frame(&mut peer).unwrap().unwrap();
+            assert!(
+                matches!(serde_json::from_slice::<ClientMsg>(&bytes).unwrap(), ClientMsg::LaptopCopy { token, message: FromClient::Progress } if token == "abc")
+            );
+        }
     }
 
     #[test]

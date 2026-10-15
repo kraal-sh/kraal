@@ -290,7 +290,7 @@ impl Server {
             _ => return Mode::Confirm(q),
         };
         // A yes needs the question to have been readable.
-        if yes && (layout.body == 0 || layout.cancel.is_none()) {
+        if yes && ((!layout.lines.is_empty() && layout.body == 0) || layout.cancel.is_none()) {
             self.toast(
                 id,
                 NoticeKind::Warning,

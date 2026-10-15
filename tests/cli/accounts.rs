@@ -2070,10 +2070,16 @@ while IFS= read -r line; do printf 'reply:%s\n' "$line"; done
         if size.0 == 124 {
             // Discovery removes the unsigned standard accounts and moves the heading.
             client.wait_for_rows("startup account discovery completed", |rows| {
-                rows.iter().any(|r| r.contains("ACCOUNTS")) && !rows.iter().any(|r| r.contains("Existing "))
+                rows.iter().any(|r| r.contains("ACCOUNTS"))
+                    && !rows.iter().any(|r| r.contains("Existing ") || r.contains("Checking"))
             });
             click_account_text(&mut client, "ACCOUNTS");
-            client.wait_for_row("Enter Details");
+            // Opening Accounts checks the unsigned homes again. Wait for the rows to settle
+            // before closing the list and taking coordinates for the sidebar detail click.
+            client.wait_for_rows("Accounts discovery completed", |rows| {
+                rows.iter().any(|r| r.contains("Enter Details"))
+                    && !rows.iter().any(|r| r.contains("Existing ") || r.contains("Checking"))
+            });
             client.send(b"\x1b");
             client.wait_for_rows("Accounts closed", |rows| !rows.iter().any(|r| r.contains("Enter Details")));
             click_account_text(&mut client, "No usage yet · 1 pane");
