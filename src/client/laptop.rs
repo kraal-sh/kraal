@@ -544,6 +544,7 @@ impl Controller {
                 let spec = copy::Spec {
                     operation,
                     to_laptop: true,
+                    remote: None,
                     sources: sources.clone(),
                     destination: path.clone().into(),
                     allow: Vec::new(),
@@ -598,6 +599,9 @@ impl Controller {
                     let message = incoming
                         .recv_timeout(copy::TIMEOUT)
                         .map_err(|_| anyhow::anyhow!("Laptop copy stalled: retry from the file manager"))?;
+                    if matches!(message, ToClient::Progress) {
+                        continue;
+                    }
                     let ToClient::Data { sequence: received, packet } = message else {
                         bail!("Laptop copy cancelled: retry from the file manager")
                     };
@@ -1697,6 +1701,7 @@ mod tests {
                 ToClient::Move(copy::Spec {
                     operation,
                     to_laptop: false,
+                    remote: None,
                     sources: vec!["~/report".into()],
                     destination: "/destination".into(),
                     allow: vec![],
@@ -1778,6 +1783,7 @@ mod tests {
                 ToClient::Move(copy::Spec {
                     operation: Operation::Move,
                     to_laptop: false,
+                    remote: None,
                     sources: vec!["~/report".into()],
                     destination: "/destination".into(),
                     allow: vec![],
@@ -1899,6 +1905,7 @@ mod tests {
                 ToClient::Write(copy::Spec {
                     operation,
                     to_laptop: true,
+                    remote: None,
                     sources: vec!["/server/report".into()],
                     destination: "~".into(),
                     allow: vec!["report".into()],
@@ -1957,12 +1964,14 @@ mod tests {
                 ToClient::Write(copy::Spec {
                     operation,
                     to_laptop: true,
+                    remote: None,
                     sources: vec!["/server/report".into()],
                     destination: "~".into(),
                     allow: vec![],
                 }),
             );
             assert!(matches!(copy_packet(&mut peer).1, FromClient::Ack(0)));
+            client.copy_message("abc".into(), ToClient::Progress);
             let packets = [
                 Packet::Begin { bytes: 3, entries: 1 },
                 Packet::Entry(copy::Entry {
@@ -2008,6 +2017,7 @@ mod tests {
                 ToClient::Write(copy::Spec {
                     operation: crate::laptop::copy::Operation::Copy,
                     to_laptop: true,
+                    remote: None,
                     sources: vec!["/server/report".into()],
                     destination: "~".into(),
                     allow: vec![],
@@ -2110,6 +2120,7 @@ mod tests {
             ToClient::Write(copy::Spec {
                 operation: crate::laptop::copy::Operation::Copy,
                 to_laptop: true,
+                remote: None,
                 sources: vec!["/server/report".into()],
                 destination: "~".into(),
                 allow: vec![],

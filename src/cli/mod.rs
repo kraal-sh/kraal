@@ -142,8 +142,8 @@ fn run(cli: Cli) -> Result<()> {
         Some(Cmd::Events { types, list, since, boot }) => panes::events(&s, types, list, since, boot),
         Some(Cmd::Runbook { action }) => runbooks::run(action, &s.socket(), s.own_pane()),
         Some(Cmd::LaptopCp) => crate::laptop::copy::run(&s.socket(), &s.name),
-        Some(Cmd::Cp { paths, dry_run, move_, no_replace, allow, expect }) => {
-            remote::copy(&paths, dry_run, move_, no_replace.then_some(allow.as_slice()), &expect)
+        Some(Cmd::Cp { paths, dry_run, move_, no_replace, laptop_spool, allow, expect }) => {
+            remote::copy(&paths, dry_run, move_, no_replace.then_some(allow.as_slice()), &expect, laptop_spool)
         }
         Some(Cmd::Rm { paths, expect }) => remote::remove(&paths, &expect),
         Some(Cmd::Files { left, right }) => remote::files(&s, left, right),

@@ -47,7 +47,7 @@ pub enum Location {
 }
 
 /// A directory on a server.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Remote {
     /// Display name of the server (e.g. "edge-proxy").
     pub server: String,
@@ -1062,12 +1062,15 @@ impl FilesPane {
     }
 
     fn transfer(&mut self, side: Side, is_move: bool) -> FilesAction {
-        if (matches!(self.panel(side).location, Location::Laptop { .. })
-            && matches!(self.panel(side.other()).location, Location::Remote(_)))
-            || (matches!(self.panel(side.other()).location, Location::Laptop { .. })
-                && matches!(self.panel(side).location, Location::Remote(_)))
+        if is_move
+            && ((matches!(self.panel(side).location, Location::Laptop { .. })
+                && matches!(self.panel(side.other()).location, Location::Remote(_)))
+                || (matches!(self.panel(side.other()).location, Location::Laptop { .. })
+                    && matches!(self.panel(side).location, Location::Remote(_))))
         {
-            return FilesAction::Refused("Copy to the session's machine first, or run kraal cp on the laptop".into());
+            return FilesAction::Refused(
+                "Moving between the laptop and an SSH server is unavailable: copy, then delete".into(),
+            );
         }
         let sources = match self.sources(side) {
             Ok(s) => s,

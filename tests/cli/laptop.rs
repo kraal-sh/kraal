@@ -1,9 +1,9 @@
-use super::support::{PATIENCE, RawClient, raw_frame};
-use crate::common::{Env, wait_until};
+use super::support::{PATIENCE, RawClient, fake_ssh, raw_frame};
+use crate::common::{Env, wait_until, write_script};
 
 fn advertise(client: &mut RawClient, id: &str) {
     let message = serde_json::json!({
-        "type": "attach", "version": 7, "cols": 120, "rows": 40,
+        "type": "attach", "version": 8, "cols": 120, "rows": 40,
         "workspace": "w", "remote": true,
         "laptop": { "id": id, "host": "travel", "os": "linux" }
     });
@@ -69,30 +69,7 @@ fn laptop_copy(env: &Env, destination: &std::path::Path, replace: bool) -> (RawC
 }
 
 fn laptop_action(env: &Env, destination: &std::path::Path, replace: bool, action: &str) -> (RawClient, String) {
-    env.workspace("w", "layout { pane name=\"shell\" }\n");
-    env.run(&["open", "w"]);
-    let mut owner = RawClient::attach(env, "w");
-    advertise(&mut owner, "abc123");
-    env.run(&["files", "~", destination.to_str().unwrap()]);
-    owner.wait_for_row("files");
-    owner.send(b"o");
-    owner.wait_for_row("this laptop");
-    owner.send(b"travel\r");
-    owner.wait_for_message("laptop_list");
-    let request = owner
-        .messages
-        .lock()
-        .unwrap()
-        .iter()
-        .filter_map(|m| serde_json::from_str::<serde_json::Value>(m).ok())
-        .find(|m| m["type"] == "laptop_list")
-        .unwrap();
-    let response = serde_json::json!({
-        "type": "laptop_listed", "pane": request["pane"], "side": request["side"], "request": request["request"],
-        "result": { "Ok": ["~", [{"name":"report", "is_dir":false, "is_link":false, "size":3, "mtime":0, "exact":true}]] }
-    });
-    raw_frame(&mut owner.stream, 0, response.to_string().as_bytes());
-    owner.wait_for_row("report");
+    let mut owner = laptop_panels(env, destination, false);
     owner.send(match action {
         "Move" => b"m",
         "Delete" => b"d",
@@ -119,6 +96,38 @@ fn laptop_action(env: &Env, destination: &std::path::Path, replace: bool, action
         .unwrap();
     assert_eq!(start["message"][action]["sources"], serde_json::json!(["~/report"]));
     (owner, start["token"].as_str().unwrap().into())
+}
+
+fn laptop_panels(env: &Env, destination: &std::path::Path, to_laptop: bool) -> RawClient {
+    env.workspace("w", "layout { pane name=\"shell\" }\n");
+    env.run(&["open", "w"]);
+    let mut owner = RawClient::attach(env, "w");
+    advertise(&mut owner, "abc123");
+    let destination = destination.to_str().unwrap();
+    env.run(&if to_laptop { ["files", destination, "~"] } else { ["files", "~", destination] });
+    owner.wait_for_row("files");
+    owner.wait_for_rows("both directory listings are ready", |rows| {
+        rows.iter().any(|row| row.contains("item")) && !rows.iter().any(|row| row.contains("loading"))
+    });
+    owner.send(if to_laptop { b"\to" } else { b"o" });
+    owner.wait_for_row("this laptop");
+    owner.send(b"travel\r");
+    owner.wait_for_message("laptop_list");
+    let request = owner
+        .messages
+        .lock()
+        .unwrap()
+        .iter()
+        .filter_map(|m| serde_json::from_str::<serde_json::Value>(m).ok())
+        .find(|m| m["type"] == "laptop_list")
+        .unwrap();
+    let response = serde_json::json!({
+        "type": "laptop_listed", "pane": request["pane"], "side": request["side"], "request": request["request"],
+        "result": { "Ok": ["~", [{"name":"report", "is_dir":false, "is_link":false, "size":3, "mtime":0, "exact":true}]] }
+    });
+    raw_frame(&mut owner.stream, 0, response.to_string().as_bytes());
+    owner.wait_for_row("report");
+    owner
 }
 
 fn copy_packet(owner: &mut RawClient, token: &str, sequence: u64, packet: serde_json::Value) {
@@ -407,5 +416,185 @@ fn session_copy_to_laptop_sends_only_after_client_readiness_and_refuses_source_l
             }
         }
         assert_eq!(std::fs::read(secret).unwrap(), b"not transferred");
+    }
+}
+
+fn relay_session(env: &Env, remote: &Env) -> std::path::PathBuf {
+    let (log, path) = fake_ssh(env, remote);
+    // The shared fake SSH executes shell commands; use the portable tar leg on both systems.
+    write_script(&env.root.join("bin/rsync"), "#!/bin/sh\nexit 127\n");
+    std::fs::write(env.root.join("config/kraal/servers.toml"), "[[server]]\nname = \"web\"\nhost = \"web.lan\"\n")
+        .unwrap();
+    env.workspace("w", "layout { pane name=\"shell\" }\n");
+    let output = env.cmd(&["open", "w"]).env("PATH", path).output().unwrap();
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    log
+}
+
+#[test]
+fn laptop_to_ssh_relay_installs_and_refuses_changed_connections_and_racing_names() {
+    for outcome in ["copy", "replace", "race", "changed"] {
+        let env = Env::new(&format!("laptop-ssh-{outcome}"));
+        let remote = Env::new(&format!("laptop-ssh-target-{outcome}"));
+        let log = relay_session(&env, &remote);
+        let destination = remote.root.join("home");
+        if outcome == "replace" {
+            std::fs::write(destination.join("report"), b"old").unwrap();
+        }
+        let target = std::path::PathBuf::from(format!("web:{}", destination.display()));
+        let (mut owner, token) = laptop_copy(&env, &target, outcome == "replace");
+        copy_packet(&mut owner, &token, 0, serde_json::json!({"Begin":{"bytes":3,"entries":1}}));
+        if outcome == "race" {
+            std::fs::write(destination.join("report"), b"racing file").unwrap();
+        }
+        let calls = std::fs::read_to_string(&log).unwrap();
+        if outcome == "changed" {
+            std::fs::write(
+                env.root.join("config/kraal/servers.toml"),
+                "[[server]]\nname = \"web\"\nhost = \"other.lan\"\n",
+            )
+            .unwrap();
+        }
+        send_report(&mut owner, &token);
+        let result = copy_finished(&owner, &token);
+        if matches!(outcome, "copy" | "replace") {
+            assert!(result.get("Ok").is_some(), "{result}");
+            assert_eq!(std::fs::read(destination.join("report")).unwrap(), b"abc");
+        } else {
+            assert!(result.get("Err").is_some(), "{result}");
+            if outcome == "race" {
+                assert_eq!(std::fs::read(destination.join("report")).unwrap(), b"racing file");
+            } else {
+                assert!(!destination.join("report").exists());
+                let after = std::fs::read_to_string(&log).unwrap();
+                assert!(
+                    !after[calls.len()..].contains("other.lan"),
+                    "--expect must refuse the changed server before SSH"
+                );
+            }
+        }
+        let spool = env.root.join("state/kraal/laptop-v1").join(&env.session).join(&token);
+        wait_until(PATIENCE, "relay spool removed", || !spool.exists());
+    }
+}
+
+#[test]
+fn ssh_to_laptop_relay_waits_for_consent_streams_the_spool_and_keeps_sources() {
+    for outcome in ["copy", "changed", "disconnect", "link"] {
+        let env = Env::new(&format!("ssh-laptop-{outcome}"));
+        let remote = Env::new(&format!("ssh-laptop-source-{outcome}"));
+        let log = relay_session(&env, &remote);
+        let source = remote.root.join("home/report");
+        if outcome == "link" {
+            std::fs::write(remote.root.join("home/release-v1"), b"abc").unwrap();
+            std::os::unix::fs::symlink("release-v1", &source).unwrap();
+        } else {
+            std::fs::write(&source, b"abc").unwrap();
+        }
+        let target = std::path::PathBuf::from(format!("web:{}", source.parent().unwrap().display()));
+        let mut owner = laptop_panels(&env, &target, true);
+        owner.send(if outcome == "link" { b"\t\x1b[B\x1b[Bc" } else { b"\t\x1b[Bc" });
+        let mut write = None;
+        wait_until(PATIENCE, "relay prepares the laptop destination", || {
+            write = owner
+                .messages
+                .lock()
+                .unwrap()
+                .iter()
+                .filter_map(|m| serde_json::from_str::<serde_json::Value>(m).ok())
+                .find(|m| m["message"]["Write"].is_object());
+            write.is_some()
+        });
+        let write = write.unwrap();
+        let token = write["token"].as_str().unwrap();
+        assert_eq!(write["message"]["Write"]["allow"], serde_json::json!([]));
+        assert!(!owner.messages.lock().unwrap().iter().any(|m| m.contains("\"Data\"")));
+        let before = std::fs::read_to_string(&log).unwrap();
+        assert!(!before.contains("rsync") && !before.contains("tar "), "no SSH download before consent: {before}");
+        if outcome == "changed" {
+            std::fs::write(
+                env.root.join("config/kraal/servers.toml"),
+                "[[server]]\nname = \"web\"\nhost = \"other.lan\"\n",
+            )
+            .unwrap();
+        }
+        let ack = |owner: &mut RawClient, sequence| {
+            let message = serde_json::json!({"type":"laptop_copy", "token":token, "message":{"Ack":sequence}});
+            raw_frame(&mut owner.stream, 0, message.to_string().as_bytes());
+        };
+        ack(&mut owner, 0);
+        let spool = env.root.join("state/kraal/laptop-v1").join(&env.session).join(token);
+        if outcome == "changed" {
+            assert!(copy_finished(&owner, token).get("Err").is_some());
+            assert!(!std::fs::read_to_string(&log).unwrap()[before.len()..].contains("other.lan"));
+        } else {
+            for sequence in 0..if outcome == "link" { 4 } else { 5 } {
+                let mut data = None;
+                wait_until(PATIENCE, "relay sends bounded packets", || {
+                    data = owner
+                        .messages
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .filter_map(|m| serde_json::from_str::<serde_json::Value>(m).ok())
+                        .find(|m| m["token"] == token && m["message"]["Data"]["sequence"] == sequence);
+                    data.is_some()
+                });
+                if outcome == "link" {
+                    assert_eq!(
+                        std::fs::read_link(spool.join("payload/report")).unwrap(),
+                        std::path::Path::new("release-v1")
+                    );
+                    assert!(!spool.join("payload/release-v1").exists());
+                    if sequence == 1 {
+                        assert_eq!(
+                            data.as_ref().unwrap()["message"]["Data"]["packet"]["Entry"]["kind"]["Link"],
+                            "release-v1"
+                        );
+                    }
+                } else {
+                    assert_eq!(std::fs::read(spool.join("payload/report")).unwrap(), b"abc");
+                }
+                if outcome == "disconnect" {
+                    owner.stream.shutdown(std::net::Shutdown::Both).unwrap();
+                    break;
+                }
+                if sequence == 2 && outcome != "link" {
+                    assert_eq!(data.unwrap()["message"]["Data"]["packet"]["Chunk"], "YWJj");
+                }
+                ack(&mut owner, sequence);
+            }
+            if matches!(outcome, "copy" | "link") {
+                let finished =
+                    serde_json::json!({"type":"laptop_copy", "token":token, "message":{"Finish":{"Ok":null}}});
+                raw_frame(&mut owner.stream, 0, finished.to_string().as_bytes());
+                assert!(copy_finished(&owner, token).get("Ok").is_some());
+            }
+        }
+        wait_until(PATIENCE, "download spool removed", || !spool.exists());
+        assert_eq!(std::fs::read(source).unwrap(), b"abc");
+    }
+}
+
+#[test]
+fn laptop_ssh_moves_are_refused_without_starting_a_job_in_both_directions() {
+    for to_laptop in [false, true] {
+        let env = Env::new(if to_laptop { "ssh-laptop-move" } else { "laptop-ssh-move" });
+        let remote = Env::new(if to_laptop { "ssh-laptop-move-source" } else { "laptop-ssh-move-target" });
+        relay_session(&env, &remote);
+        let file = remote.root.join("home/report");
+        std::fs::write(&file, b"original").unwrap();
+        let target = std::path::PathBuf::from(format!("web:{}", file.parent().unwrap().display()));
+        let mut owner = laptop_panels(&env, &target, to_laptop);
+        // The refusal's final advice must fit beside the file-manager title in the top bar.
+        owner.resize((200, 40));
+        if to_laptop {
+            owner.send(b"\t\x1b[B");
+        }
+        owner.send(b"m");
+        owner.wait_for_row("copy, then delete");
+        assert!(!owner.messages.lock().unwrap().iter().any(|message| message.contains("laptop_copy")));
+        assert!(!env.run(&["panes", "--json"]).contains("laptop-cp"));
+        assert_eq!(std::fs::read(file).unwrap(), b"original");
     }
 }

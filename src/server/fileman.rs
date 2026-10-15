@@ -138,10 +138,7 @@ impl Server {
             FilesAction::Shell(loc) | FilesAction::Edit(loc) => vec![loc],
             _ => Vec::new(),
         };
-        if places.iter().any(|l| matches!(l, Location::Laptop { .. })) {
-            return self.laptop_files_action(client, action);
-        }
-        if places.iter().any(|l| l.exact_display().is_none()) {
+        if places.iter().any(|l| !matches!(l, Location::Laptop { .. }) && l.exact_display().is_none()) {
             self.toast(
                 client,
                 NoticeKind::Error,
@@ -157,6 +154,9 @@ impl Server {
                 format!("{server} is not reached as when its panel was listed: check the panel and retry"),
             );
             return Mode::Normal;
+        }
+        if places.iter().any(|l| matches!(l, Location::Laptop { .. })) {
+            return self.laptop_files_action(client, action);
         }
         let expect: Vec<String> = places
             .iter()
@@ -339,7 +339,7 @@ impl Server {
     }
 
     /// The ssh arguments that reach `server` now, destination last (what a panel lists with).
-    fn panel_ssh_args(&self, server: &str) -> Option<Vec<String>> {
+    pub(super) fn panel_ssh_args(&self, server: &str) -> Option<Vec<String>> {
         let s = self.known_servers.iter().find(|k| k.server.name == server)?.server.clone();
         let mut args = self.ssh_options(&s);
         args.push(s.destination());

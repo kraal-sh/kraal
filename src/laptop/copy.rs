@@ -3,7 +3,7 @@
 use std::collections::{HashSet, VecDeque};
 use std::ffi::CString;
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Write};
+use std::io::{Read, Seek, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
@@ -37,6 +37,7 @@ pub struct Spec {
     #[serde(default)]
     pub operation: Operation,
     pub to_laptop: bool,
+    pub remote: Option<crate::files::Remote>,
     pub sources: Vec<String>,
     pub destination: PathBuf,
     pub allow: Vec<String>,
@@ -136,14 +137,22 @@ fn open_file(path: &Path) -> Result<File> {
     Ok(unsafe { File::from_raw_fd(fd) })
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SourceMode {
+    Copy,
+    Spool,
+    Delete,
+}
+
 fn manifest(
     paths: &[String],
     home: &Path,
     scope: Scope,
     macos: bool,
-    deleting: bool,
+    mode: SourceMode,
     check: &mut impl FnMut() -> Result<()>,
 ) -> Result<Vec<Source>> {
+    let deleting = mode == SourceMode::Delete;
     ensure!(!paths.is_empty() && paths.len() <= ENTRIES, "choose between 1 and 100,000 items");
     let mut pending = Vec::new();
     let mut tops = HashSet::new();
@@ -184,13 +193,15 @@ fn manifest(
             );
             bytes.truncate(len as usize);
             let target = String::from_utf8(bytes).context("symbolic link is not UTF-8")?;
-            let resolved = path
-                .parent()
-                .unwrap()
-                .join(&target)
-                .canonicalize()
-                .context("cannot resolve symbolic link inside the source scope")?;
-            super::scoped_path(resolved.to_str().context("link target is not UTF-8")?, home, scope, macos)?;
+            if mode != SourceMode::Spool {
+                let resolved = path
+                    .parent()
+                    .unwrap()
+                    .join(&target)
+                    .canonicalize()
+                    .context("cannot resolve symbolic link inside the source scope")?;
+                super::scoped_path(resolved.to_str().context("link target is not UTF-8")?, home, scope, macos)?;
+            }
             (Kind::Link(target), None)
         } else {
             let file =
@@ -266,10 +277,19 @@ pub fn send(
     paths: &[String],
     home: &Path,
     scope: Scope,
+    emit: impl FnMut(Packet) -> Result<()>,
+    mut check: impl FnMut() -> Result<()>,
+) -> Result<Removal> {
+    let sources = manifest(paths, home, scope, cfg!(target_os = "macos"), SourceMode::Copy, &mut check)?;
+    send_sources(sources, home, emit, check)
+}
+
+fn send_sources(
+    sources: Vec<Source>,
+    home: &Path,
     mut emit: impl FnMut(Packet) -> Result<()>,
     mut check: impl FnMut() -> Result<()>,
 ) -> Result<Removal> {
-    let sources = manifest(paths, home, scope, cfg!(target_os = "macos"), false, &mut check)?;
     let total = sources.iter().try_fold(0u64, |n, s| n.checked_add(s.entry.size).context("copy size overflow"))?;
     emit(Packet::Begin { bytes: total, entries: sources.len() })?;
     let mut bytes = vec![0u8; CHUNK];
@@ -311,7 +331,7 @@ pub struct Removal {
 
 impl Removal {
     pub fn read(paths: &[String], home: &Path, scope: Scope, mut check: impl FnMut() -> Result<()>) -> Result<Self> {
-        let sources = manifest(paths, home, scope, cfg!(target_os = "macos"), true, &mut check)?;
+        let sources = manifest(paths, home, scope, cfg!(target_os = "macos"), SourceMode::Delete, &mut check)?;
         Ok(Self { sources, home: super::open_directory(&home.canonicalize()?)? })
     }
 
@@ -479,7 +499,8 @@ impl Receiver {
         // Writes beneath it still use the receiver's descriptor-relative component walk.
         let root = root.canonicalize().context("cannot resolve the session spool")?;
         let fd = super::open_directory(&root)?;
-        let destination = OpenOptions::new().read(true).custom_flags(libc::O_DIRECTORY).open(&spec.destination)?;
+        let destination = if spec.remote.is_some() { &root } else { &spec.destination };
+        let destination = OpenOptions::new().read(true).custom_flags(libc::O_DIRECTORY).open(destination)?;
         Self::at(root, fd, destination.into(), spec)
     }
 
@@ -590,6 +611,22 @@ impl Receiver {
 }
 
 struct Spool(PathBuf);
+
+impl Spool {
+    fn create(session: &str, token: &str) -> Result<(Self, File)> {
+        let root = spool_root(session);
+        crate::paths::ensure_private_dir(&crate::paths::state_dir().join("laptop-v1"))?;
+        crate::paths::ensure_private_dir(&root)?;
+        let path = root.join(token);
+        fs::create_dir(&path)?;
+        let spool = Self(path);
+        crate::paths::ensure_private_dir(&spool.0)?;
+        let lock = lock_spool(&spool.0)?.context("laptop spool is already in use")?;
+        crate::paths::ensure_private_dir(&spool.0.join("payload"))?;
+        Ok((spool, lock))
+    }
+}
+
 impl Drop for Spool {
     fn drop(&mut self) {
         // Copied directories may be read-only; make our private copy removable again.
@@ -647,20 +684,102 @@ pub fn cleanup(session: &str) -> Result<()> {
 pub fn install_args(spec: &Spec, root: &Path, rsync: bool) -> Vec<String> {
     let mut args = vec!["cp".into()];
     // The spool is disposable: system cp can merge and cross filesystems without modern rsync.
-    if rsync {
+    if rsync && spec.remote.is_none() {
         args.push("--move".into());
     }
     args.push("--no-replace".into());
     for name in &spec.allow {
         args.push(format!("--allow={name}"));
     }
-    // Both endpoints are local, so --expect has no SSH identity to check.
+    if let Some(remote) = &spec.remote {
+        args.push(format!("--expect={}={}", remote.server, crate::shell::join(&remote.ssh_args)));
+    }
     args.push("--".into());
     for source in &spec.sources {
         args.push(root.join(Path::new(source).file_name().unwrap()).to_string_lossy().into_owned());
     }
-    args.push(format!("{}/", spec.destination.display()));
+    args.push(match &spec.remote {
+        Some(remote) => format!("{}:{}/", remote.server, spec.destination.display()),
+        None => format!("{}/", spec.destination.display()),
+    });
     args
+}
+
+fn fetch_args(spec: &Spec, root: &Path) -> Vec<String> {
+    let remote = spec.remote.as_ref().unwrap();
+    let mut args = vec![
+        "cp".into(),
+        "--laptop-spool".into(),
+        "--no-replace".into(),
+        format!("--expect={}={}", remote.server, crate::shell::join(&remote.ssh_args)),
+        "--".into(),
+    ];
+    args.extend(spec.sources.iter().map(|path| format!("{}:{path}", remote.server)));
+    args.push(format!("{}/", root.display()));
+    args
+}
+
+/// Keep the archive intact until every name has been checked on the spool's filesystem.
+pub fn fetch(
+    sources: &[crate::transfer::Endpoint],
+    destination: &crate::transfer::Endpoint,
+    ssh: crate::transfer::SshOptions,
+) -> Result<()> {
+    use crate::transfer::{Endpoint, Options};
+    let Endpoint::Local(root) = destination else { bail!("a laptop spool must be local") };
+    ensure!(sources.iter().all(|s| matches!(s, Endpoint::Remote { .. })), "a laptop spool needs SSH sources");
+    ensure!(fs::read_dir(root)?.next().is_none(), "a laptop spool must be empty");
+    let archive = root.join(".archive");
+    let opts = Options { dest_dir: Some(true), ..Options::default() };
+    let mut steps = crate::transfer::plan(sources, destination, ssh, &opts)?;
+    ensure!(steps.len() == 1, "a laptop spool needs one SSH source server");
+    let output = steps[0].pipe_to.as_mut().context("missing SSH archive stream")?;
+    output.program = "sh".into();
+    output.args =
+        vec!["-c".into(), format!("cat > {}", crate::shell::quote(archive.to_str().context("invalid spool path")?))];
+    crate::transfer::run(&steps)?;
+    unpack_spool(&archive, root)
+}
+
+fn unpack_spool(archive: &Path, root: &Path) -> Result<()> {
+    let names = root.join(".names");
+    let mut file = File::open(archive)?;
+    check_archive_names(&mut file, &names)?;
+    fs::remove_dir_all(&names)?;
+    // Remove the archive's pathname before extraction so it cannot collide with a source name.
+    fs::remove_file(archive)?;
+    file.rewind()?;
+    let mut archive = tar::Archive::new(file);
+    archive.set_preserve_permissions(true);
+    archive.set_mask(0o6000);
+    archive.unpack(root)?;
+    Ok(())
+}
+
+fn check_archive_names(file: &mut File, root: &Path) -> Result<()> {
+    fs::create_dir(root)?;
+    let mut names = HashSet::new();
+    let mut entries = HashSet::new();
+    for entry in tar::Archive::new(file).entries_with_seek()? {
+        let entry = entry?;
+        let path = entry.path()?;
+        ensure!(entries.len() < ENTRIES && path.as_os_str().len() <= 16 * 1024, "too many entries or path too long");
+        let mut relative = PathBuf::new();
+        for component in path.components() {
+            match component {
+                Component::CurDir => continue,
+                Component::Normal(name) => relative.push(name),
+                _ => bail!("invalid SSH archive path"),
+            }
+            if names.insert(relative.clone()) {
+                fs::create_dir(root.join(&relative)).with_context(|| {
+                    format!("SSH source names collide in the session spool: {}", relative.display())
+                })?;
+            }
+        }
+        ensure!(!relative.as_os_str().is_empty() && entries.insert(relative), "duplicate SSH archive path");
+    }
+    Ok(())
 }
 
 struct Connection {
@@ -742,17 +861,48 @@ impl Connection {
         }
     }
 
-    fn send_files(&mut self, spec: &Spec) -> Result<()> {
+    fn send_files(&mut self, spec: &Spec, session: &str) -> Result<()> {
         let result = (|| -> Result<()> {
             ensure!(matches!(self.receive()?, ToClient::Ack(0)), "laptop destination was not prepared");
-            let sources = session_sources(&spec.sources)?;
+            let spool = if spec.remote.is_some() {
+                let (spool, lock) = Spool::create(session, &self.token)?;
+                let mut command = std::process::Command::new(std::env::current_exe()?);
+                command.args(fetch_args(spec, &spool.0.join("payload"))).env_remove(TOKEN_ENV);
+                self.install(&mut command)?;
+                Some((spool, lock))
+            } else {
+                None
+            };
+            let paths = match &spool {
+                Some((spool, _lock)) => spec
+                    .sources
+                    .iter()
+                    .map(|path| {
+                        spool
+                            .0
+                            .join("payload")
+                            .join(Path::new(path).file_name().unwrap())
+                            .to_string_lossy()
+                            .into_owned()
+                    })
+                    .collect(),
+                None => spec.sources.clone(),
+            };
+            let paths = session_sources(&paths)?;
+            let sources = manifest(
+                &paths,
+                Path::new("/"),
+                Scope::All,
+                cfg!(target_os = "macos"),
+                if spool.is_some() { SourceMode::Spool } else { SourceMode::Copy },
+                &mut || self.check(),
+            )?;
             let mut window = Window::new();
             let mut sent = 0;
             let cancelled = self.cancelled.clone();
-            let removal = send(
-                &sources,
+            let removal = send_sources(
+                sources,
                 Path::new("/"),
-                Scope::All,
                 |packet| {
                     if window.full() {
                         match self.receive()? {
@@ -901,6 +1051,10 @@ pub fn run(socket: &Path, session: &str) -> Result<()> {
         ToClient::Ready(spec) => spec,
         _ => bail!("laptop copy was not authorized"),
     };
+    ensure!(
+        spec.remote.is_none() || spec.operation == Operation::Copy,
+        "Moving between the laptop and an SSH server is unavailable: copy, then delete"
+    );
     if spec.operation == Operation::Delete {
         loop {
             match connection.receive()? {
@@ -913,19 +1067,11 @@ pub fn run(socket: &Path, session: &str) -> Result<()> {
         return Ok(());
     }
     if spec.to_laptop {
-        return connection.send_files(&spec);
+        return connection.send_files(&spec, session);
     }
     let result = (|| -> Result<()> {
-        let root = spool_root(session);
-        crate::paths::ensure_private_dir(&crate::paths::state_dir().join("laptop-v1"))?;
-        crate::paths::ensure_private_dir(&root)?;
-        let path = root.join(&token);
-        fs::create_dir(&path)?;
-        let spool = Spool(path);
-        crate::paths::ensure_private_dir(&spool.0)?;
-        let _lock = lock_spool(&spool.0)?.context("laptop spool is already in use")?;
+        let (spool, _lock) = Spool::create(session, &token)?;
         let payload = spool.0.join("payload");
-        crate::paths::ensure_private_dir(&payload)?;
         let mut receiver = Receiver::new(payload.clone(), &spec)?;
         let mut sequence = 0;
         loop {
@@ -970,6 +1116,7 @@ mod tests {
         Spec {
             operation: crate::laptop::copy::Operation::Copy,
             to_laptop: false,
+            remote: None,
             sources: vec![home.0.join(name).to_str().unwrap().into()],
             destination: destination.0.clone(),
             allow: vec![],
@@ -978,6 +1125,132 @@ mod tests {
 
     fn entry(path: &str, kind: Kind, size: u64) -> Packet {
         Packet::Entry(Entry { path: path.into(), kind, size, mode: 0o6755, seconds: 1_600_000_000, nanos: 123_456_789 })
+    }
+
+    #[test]
+    fn ssh_relay_arguments_pin_the_connection_and_never_move_remote_sources() {
+        let source = TempDir::new("relay-source");
+        let destination = TempDir::new("relay-destination");
+        let mut spec = spec(&source, &destination, "report");
+        spec.remote = Some(crate::files::Remote {
+            server: "web".into(),
+            ssh_args: vec!["-p".into(), "2222".into(), "me@web".into()],
+            path: "/files".into(),
+        });
+        spec.destination = "/files".into();
+        spec.allow = vec!["report".into()];
+        for rsync in [false, true] {
+            assert_eq!(
+                install_args(&spec, Path::new("/spool"), rsync),
+                [
+                    "cp",
+                    "--no-replace",
+                    "--allow=report",
+                    "--expect=web=-p 2222 me@web",
+                    "--",
+                    "/spool/report",
+                    "web:/files/",
+                ]
+            );
+        }
+        spec.to_laptop = true;
+        spec.sources = vec!["/files/report".into(), "/files/a b'c".into()];
+        assert_eq!(
+            fetch_args(&spec, Path::new("/spool")),
+            [
+                "cp",
+                "--laptop-spool",
+                "--no-replace",
+                "--expect=web=-p 2222 me@web",
+                "--",
+                "web:/files/report",
+                "web:/files/a b'c",
+                "/spool/",
+            ]
+        );
+    }
+
+    #[test]
+    fn receiving_for_ssh_checks_the_spool_without_opening_the_remote_destination_locally() {
+        let source = TempDir::new("relay-receive-source");
+        let spool = TempDir::new("relay-receive-spool");
+        source.write("report", "abc");
+        let mut spec = spec(&source, &spool, "report");
+        spec.destination = "/kraal-test-remote-only/destination".into();
+        spec.remote = Some(crate::files::Remote {
+            server: "web".into(),
+            ssh_args: vec!["web".into()],
+            path: "/destination".into(),
+        });
+        let mut receiver = Receiver::new(spool.0.clone(), &spec).unwrap();
+        send(&spec.sources, &source.0, Scope::Home, |packet| receiver.receive(packet).map(|_| ()), || Ok(())).unwrap();
+        assert_eq!(fs::read(spool.0.join("report")).unwrap(), b"abc");
+        assert_eq!(fs::read(source.0.join("report")).unwrap(), b"abc");
+    }
+
+    #[test]
+    fn ssh_spool_checks_nested_case_collisions_before_extracting() {
+        // Build a Linux-style archive directly: default APFS cannot hold these source names.
+        for paths in [["tree/A", "tree/a"], ["tree/A/one", "tree/a/two"]] {
+            let spool = TempDir::new("relay-case-collision");
+            let sensitive =
+                super::super::stage::case_sensitive(&super::super::open_directory(&spool.0).unwrap()).unwrap();
+            let archive = spool.0.join(".archive");
+            let mut builder = tar::Builder::new(File::create(&archive).unwrap());
+            for path in paths {
+                let mut header = tar::Header::new_gnu();
+                header.set_size(path.len() as u64);
+                header.set_mode(0o644);
+                header.set_cksum();
+                builder.append_data(&mut header, path, path.as_bytes()).unwrap();
+            }
+            builder.finish().unwrap();
+            drop(builder);
+            let result = unpack_spool(&archive, &spool.0);
+            if sensitive {
+                result.unwrap();
+                for path in paths {
+                    assert_eq!(fs::read(spool.0.join(path)).unwrap(), path.as_bytes());
+                }
+            } else {
+                assert!(result.unwrap_err().to_string().contains("names collide"));
+                assert!(!spool.0.join("tree").exists(), "no source entry is extracted before the check passes");
+            }
+        }
+    }
+
+    #[test]
+    fn ssh_spool_links_use_the_laptop_destination_scope() {
+        for target in ["release-v1", "../outside"] {
+            let spool = TempDir::new("relay-link-spool");
+            let laptop = TempDir::new("relay-link-laptop");
+            laptop.write("release-v1", "existing release");
+            symlink(target, spool.0.join("current")).unwrap();
+            let mut spec = spec(&spool, &laptop, "current");
+            spec.to_laptop = true;
+            assert!(send(&spec.sources, &spool.0, Scope::Home, |_| Ok(()), || Ok(())).is_err());
+            let sources = manifest(
+                &spec.sources,
+                Path::new("/"),
+                Scope::All,
+                cfg!(target_os = "macos"),
+                SourceMode::Spool,
+                &mut || Ok(()),
+            )
+            .unwrap();
+            let mut stage = super::super::stage::Stage::new(&spec, &laptop.0, Scope::Home).unwrap();
+            send_sources(sources, Path::new("/"), |p| stage.receive(p).map(|_| ()), || Ok(())).unwrap();
+            let result = stage.install(|| Ok(()));
+            if target == "release-v1" {
+                result.unwrap();
+                assert_eq!(fs::read_link(laptop.0.join("current")).unwrap(), Path::new(target));
+                assert_eq!(fs::read(laptop.0.join("current")).unwrap(), b"existing release");
+            } else {
+                assert!(result.is_err());
+                assert!(fs::symlink_metadata(laptop.0.join("current")).is_err());
+            }
+            assert_eq!(fs::read(laptop.0.join("release-v1")).unwrap(), b"existing release");
+        }
     }
 
     #[test]
@@ -1128,7 +1401,7 @@ mod tests {
             &alias,
             Scope::All,
             cfg!(target_os = "macos"),
-            true,
+            SourceMode::Delete,
             &mut || Ok(()),
         )
         .unwrap();
@@ -1366,14 +1639,16 @@ mod tests {
         assert!(send(&["~/file".into()], &home.0, Scope::Off, |_| panic!("scope off"), || Ok(())).is_err());
         home.mkdir("Library");
         home.write("Library/file", "private");
-        assert!(manifest(&["~/Library/file".into()], &home.0, Scope::Home, true, false, &mut || Ok(())).is_err());
+        assert!(
+            manifest(&["~/Library/file".into()], &home.0, Scope::Home, true, SourceMode::Copy, &mut || Ok(())).is_err()
+        );
         assert!(
             manifest(
                 &[outside.0.join("secret").to_str().unwrap().into()],
                 &home.0,
                 Scope::All,
                 false,
-                false,
+                SourceMode::Copy,
                 &mut || Ok(())
             )
             .is_ok()
@@ -1387,7 +1662,8 @@ mod tests {
         home.write("dir/file", "");
         let fifo = CString::new(home.0.join("dir/fifo").as_os_str().as_bytes()).unwrap();
         assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
-        let sources = manifest(&["~/dir".into()], &home.0, Scope::Home, false, false, &mut || Ok(())).unwrap();
+        let sources =
+            manifest(&["~/dir".into()], &home.0, Scope::Home, false, SourceMode::Copy, &mut || Ok(())).unwrap();
         assert_eq!(sources.len(), 3);
         assert!(sources.iter().all(|s| s.entry.size == 0));
     }
@@ -1448,14 +1724,20 @@ mod tests {
         let home = TempDir::new("copy-limits");
         let file = home.write("large", "");
         File::options().write(true).open(file).unwrap().set_len(100 * 1024 * 1024).unwrap();
-        let source = manifest(&["~/large".into()], &home.0, Scope::Home, false, false, &mut || Ok(())).unwrap();
+        let source =
+            manifest(&["~/large".into()], &home.0, Scope::Home, false, SourceMode::Copy, &mut || Ok(())).unwrap();
         assert_eq!(source[0].entry.size, 100 * 1024 * 1024);
         assert!(
-            manifest(&vec!["~/large".into(); ENTRIES + 1], &home.0, Scope::Home, false, false, &mut || Ok(())).is_err()
+            manifest(&vec!["~/large".into(); ENTRIES + 1], &home.0, Scope::Home, false, SourceMode::Copy, &mut || Ok(
+                ()
+            ))
+            .is_err()
         );
         assert!(
-            manifest(&["~/large".into(), "~/large".into()], &home.0, Scope::Home, false, false, &mut || Ok(()))
-                .is_err()
+            manifest(&["~/large".into(), "~/large".into()], &home.0, Scope::Home, false, SourceMode::Copy, &mut || Ok(
+                ()
+            ))
+            .is_err()
         );
     }
 
@@ -1536,6 +1818,7 @@ mod tests {
         let spec = Spec {
             operation: crate::laptop::copy::Operation::Copy,
             to_laptop: false,
+            remote: None,
             sources: vec!["~/dir/-file with 'quotes'".into()],
             destination: "/dest space".into(),
             allow: vec!["-file with 'quotes'".into()],
@@ -1601,7 +1884,7 @@ mod tests {
             spec.operation = Operation::Move;
             let (stream, mut peer) = UnixStream::pair().unwrap();
             let mut connection = Connection::new(stream, "abc".into()).unwrap();
-            let job = std::thread::spawn(move || connection.send_files(&spec));
+            let job = std::thread::spawn(move || connection.send_files(&spec, "test"));
             let reply = |peer: &mut UnixStream, message| {
                 protocol::write_json(peer, &ServerMsg::LaptopCopy { token: "abc".into(), message }).unwrap();
             };

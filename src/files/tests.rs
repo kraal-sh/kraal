@@ -1220,3 +1220,29 @@ fn copy_refreshes_only_its_owners_laptop_destination() {
     assert_eq!((requests[0].0, requests[0].1, requests[0].3.as_str()), (7, Side::Right, "~/Downloads"));
     assert_ne!(requests[0].2, request);
 }
+
+#[test]
+fn laptop_ssh_copies_keep_replacements_and_moves_are_refused_in_both_directions() {
+    for to_laptop in [false, true] {
+        let mut pane = offline(local(LEFT), remote("/destination"));
+        pane.set_viewer(7);
+        assert!(pane.set_laptop(Side::Left, laptop("~"), 7));
+        let request = pane.laptop_requests()[0].2;
+        pane.laptop_result(7, Side::Left, request, Ok(("~".into(), vec![file("report", 3)])));
+        inject(&mut pane, Side::Right, remote("/destination"), vec![file("report", 3)]);
+        pane.panel_mut(Side::Right).cursor = 1;
+        if to_laptop {
+            pane.key(FileKey::Tab);
+        }
+        for key in [FileKey::Char('m'), FileKey::F(6)] {
+            assert!(matches!(pane.key(key), FilesAction::Refused(why) if why.contains("copy, then delete")));
+        }
+        for key in [FileKey::Char('c'), FileKey::F(5)] {
+            let FilesAction::Copy { sources, dest, replaces } = pane.key(key) else { panic!("copy must work") };
+            assert_eq!(sources.len(), 1);
+            assert_eq!(replaces, ["report"]);
+            assert_eq!(matches!(dest, Location::Laptop { .. }), to_laptop);
+            assert_eq!(matches!(sources[0], Location::Remote(_)), to_laptop);
+        }
+    }
+}

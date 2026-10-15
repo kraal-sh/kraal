@@ -1776,11 +1776,57 @@ fn run_step(step: &Step) -> Result<std::process::ExitStatus> {
         .stdout(std::process::Stdio::piped())
         .spawn()
         .with_context(|| format!("running {}", step.program))?;
-    let pipe = left.stdout.take().context("no pipe")?;
-    let right = std::process::Command::new(&next.program).args(&next.args).stdin(pipe).status();
+    let mut input = left.stdout.take().context("no pipe")?;
+    let right = std::process::Command::new(&next.program).args(&next.args).stdin(std::process::Stdio::piped()).spawn();
+    let mut right = match right {
+        Ok(child) => child,
+        Err(error) => {
+            let _ = left.kill();
+            let _ = left.wait();
+            return Err(error).with_context(|| format!("running {}", next.program));
+        }
+    };
+    let mut output = right.stdin.take().context("no pipe")?;
+    let mut reported = std::time::Instant::now();
+    // A quiet tar stream still makes progress, including while copying one large file.
+    let copied = copy_stream(&mut input, &mut output, |bytes| {
+        if reported.elapsed() >= std::time::Duration::from_millis(500) {
+            eprint!("\rTransferred {bytes} bytes");
+            reported = std::time::Instant::now();
+        }
+    });
+    drop(output);
+    drop(input);
+    if copied.is_err() {
+        let _ = left.kill();
+        let _ = right.kill();
+    }
     let left = left.wait()?;
-    let right = right.with_context(|| format!("running {}", next.program))?;
+    let right = right.wait()?;
+    let bytes = copied.context("copying the transfer stream")?;
+    eprintln!("\rTransferred {bytes} bytes");
     Ok(if left.success() { right } else { left })
+}
+
+fn copy_stream(
+    input: &mut impl std::io::Read,
+    output: &mut impl std::io::Write,
+    mut progress: impl FnMut(u64),
+) -> std::io::Result<u64> {
+    let mut buffer = [0; 64 * 1024];
+    let mut bytes = 0;
+    loop {
+        let count = match input.read(&mut buffer) {
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            other => other?,
+        };
+        if count == 0 {
+            return Ok(bytes);
+        }
+        output.write_all(&buffer[..count])?;
+        bytes += count as u64;
+        progress(bytes);
+    }
 }
 
 /// Run the steps in the foreground, showing their output. Falls back to a tar stream when rsync
@@ -1930,6 +1976,37 @@ fn local_path(word: &str) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tar_stream_reports_written_bytes_before_eof_and_propagates_write_failures() {
+        let contents = vec![42; 256 * 1024 + 17];
+        let mut output = Vec::new();
+        let mut reports = Vec::new();
+        copy_stream(&mut contents.as_slice(), &mut output, |bytes| reports.push(bytes)).unwrap();
+        assert_eq!(output, contents);
+        assert!(reports.iter().any(|bytes| *bytes < contents.len() as u64));
+        assert_eq!(reports.last(), Some(&(contents.len() as u64)));
+        let mut limited = [0; 1024];
+        let error = copy_stream(&mut contents.as_slice(), &mut limited.as_mut_slice(), |_| {
+            panic!("a failed write must not report progress")
+        })
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::WriteZero);
+        assert_eq!(limited, [42; 1024]);
+    }
+
+    #[test]
+    fn tar_pipeline_checks_both_commands_and_handles_a_missing_receiver() {
+        for (source, destination, expected) in [(0, 0, 0), (7, 0, 7), (0, 9, 9)] {
+            let mut step = Step::new("sh", vec!["-c".into(), format!("printf payload; exit {source}")]);
+            step.pipe_to =
+                Some(Box::new(Step::new("sh", vec!["-c".into(), format!("cat >/dev/null; exit {destination}")])));
+            assert_eq!(run_step(&step).unwrap().code(), Some(expected));
+        }
+        let mut step = Step::new("sh", vec!["-c".into(), "printf payload".into()]);
+        step.pipe_to = Some(Box::new(Step::new("kraal-test-missing-receiver", vec![])));
+        assert!(run_step(&step).unwrap_err().to_string().contains("running kraal-test-missing-receiver"));
+    }
 
     #[test]
     fn existing_names_in_a_local_directory() {

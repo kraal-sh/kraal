@@ -54,73 +54,102 @@ impl Server {
                 self.start_laptop_copy(
                     client,
                     &owner,
-                    Spec { operation, to_laptop: false, sources, destination: Default::default(), allow: Vec::new() },
+                    Spec {
+                        operation,
+                        to_laptop: false,
+                        remote: None,
+                        sources,
+                        destination: Default::default(),
+                        allow: Vec::new(),
+                    },
                 );
                 return Mode::Normal;
             }
         }
-        if let FilesAction::Copy { sources, dest: Location::Laptop { owner_id, host, path }, .. }
-        | FilesAction::Move { sources, dest: Location::Laptop { owner_id, host, path }, .. } = &action
-        {
-            let paths: Option<Vec<_>> = sources
-                .iter()
-                .map(|s| match s {
-                    Location::Local(path) if path.is_absolute() => path.to_str().map(str::to_owned),
-                    _ => None,
-                })
-                .collect();
-            let description = super::fileman::describe(sources);
-            if let Some(sources) = paths.filter(|paths| !paths.is_empty()) {
-                let spec = Spec { operation, to_laptop: true, sources, destination: path.into(), allow: Vec::new() };
-                if operation == Operation::Move {
-                    return Mode::confirm(
-                        format!("Move {description} to {host}:{path}?"),
-                        ConfirmAction::LaptopCopy { owner: owner_id.clone(), spec },
-                    );
-                }
-                self.start_laptop_copy(client, owner_id, spec);
-                return Mode::Normal;
+        let (sources, dest, replaces) = match action {
+            FilesAction::Copy { sources, dest, replaces } | FilesAction::Move { sources, dest, replaces } => {
+                (sources, dest, replaces)
             }
+            _ => return Mode::Normal,
+        };
+        let remote = sources.iter().chain([&dest]).find_map(|location| match location {
+            Location::Remote(remote) => Some(remote.clone()),
+            _ => None,
+        });
+        if remote.is_some() && operation == Operation::Move {
+            self.toast(
+                client,
+                NoticeKind::Error,
+                "Moving between the laptop and an SSH server is unavailable: copy, then delete",
+            );
+            return Mode::Normal;
         }
-        if let FilesAction::Copy { sources, dest: Location::Local(destination), replaces }
-        | FilesAction::Move { sources, dest: Location::Local(destination), replaces } = action
-        {
-            if destination.to_str().is_none() || !destination.is_absolute() {
-                self.toast(
-                    client,
-                    NoticeKind::Error,
-                    "Choose an absolute destination with a valid UTF-8 path and retry the copy",
-                );
-                return Mode::Normal;
-            }
-            let Some(identity) = self.clients.get(&client).and_then(|c| c.laptop.as_ref()) else { return Mode::Normal };
-            let owner = identity.id.clone();
-            let paths: Option<Vec<_>> = sources
-                .iter()
-                .map(|s| match s {
-                    Location::Laptop { owner_id, path, .. } if owner_id == &owner => Some(path.clone()),
-                    _ => None,
-                })
-                .collect();
-            let description = super::fileman::describe(&sources);
-            if let Some(sources) = paths.filter(|p| !p.is_empty()) {
-                let spec = Spec { operation, to_laptop: false, sources, destination, allow: replaces };
-                if spec.allow.is_empty() {
-                    self.start_laptop_copy(client, &owner, spec);
-                } else {
-                    let message = format!(
-                        "{} {} to {}?\nIt replaces what is there:\n  {}",
-                        if operation == Operation::Move { "Move" } else { "Copy" },
-                        description,
-                        spec.destination.display(),
-                        spec.allow.join("\n  ")
-                    );
-                    return Mode::confirm(message, ConfirmAction::LaptopCopy { owner, spec });
+        let Some(identity) = self.clients.get(&client).and_then(|c| c.laptop.as_ref()) else { return Mode::Normal };
+        let owner = identity.id.clone();
+        let to_laptop = matches!(&dest, Location::Laptop { owner_id, .. } if owner_id == &owner);
+        let paths: Option<Vec<_>> = sources
+            .iter()
+            .map(|source| match source {
+                Location::Local(path) if to_laptop && remote.is_none() && path.is_absolute() => {
+                    path.to_str().map(str::to_owned)
                 }
-                return Mode::Normal;
-            }
+                Location::Remote(r)
+                    if to_laptop
+                        && remote
+                            .as_ref()
+                            .is_some_and(|expected| expected.server == r.server && expected.ssh_args == r.ssh_args) =>
+                {
+                    Some(r.path.clone())
+                }
+                Location::Laptop { owner_id, path, .. } if !to_laptop && owner_id == &owner => Some(path.clone()),
+                _ => None,
+            })
+            .collect();
+        let destination = match &dest {
+            Location::Local(path) if path.is_absolute() && path.to_str().is_some() => Some(path.clone()),
+            Location::Remote(r) => Some(r.path.clone().into()),
+            Location::Laptop { path, .. } if to_laptop => Some(path.clone().into()),
+            _ => None,
+        };
+        let (Some(paths), Some(destination)) = (paths.filter(|paths| !paths.is_empty()), destination) else {
+            self.toast(
+                client,
+                NoticeKind::Error,
+                "This laptop operation is unavailable: choose a destination in the other panel and retry",
+            );
+            return Mode::Normal;
+        };
+        let production = remote.as_ref().and_then(|r| {
+            self.known_servers
+                .iter()
+                .find(|k| k.server.name == r.server)
+                .and_then(|k| self.server_production(&k.server))
+                .map(|why| format!("{} is production ({why}).", r.server))
+        });
+        let mut message = format!(
+            "{} {} to {}?",
+            if operation == Operation::Move { "Move" } else { "Copy" },
+            super::fileman::describe(&sources),
+            dest.display()
+        );
+        let spec = Spec {
+            operation,
+            to_laptop,
+            remote,
+            sources: paths,
+            destination,
+            allow: if to_laptop { Vec::new() } else { replaces },
+        };
+        if !spec.allow.is_empty() {
+            message.push_str(&format!("\nIt replaces what is there:\n  {}", spec.allow.join("\n  ")));
         }
-        self.toast(client, NoticeKind::Error, "This laptop operation is unavailable: copy between your laptop and the session's machine, or run kraal cp on the laptop");
+        if let Some(why) = &production {
+            message.push_str(&format!("\n{why}"));
+        }
+        if !spec.allow.is_empty() || (to_laptop && operation == Operation::Move) || production.is_some() {
+            return Mode::confirm(message, ConfirmAction::LaptopCopy { owner, spec });
+        }
+        self.start_laptop_copy(client, &owner, spec);
         Mode::Normal
     }
 
@@ -128,6 +157,27 @@ impl Server {
         if !self.clients.get(&client).is_some_and(|c| c.attached && c.laptop.as_ref().is_some_and(|l| l.id == owner)) {
             self.toast(client, NoticeKind::Error, "The laptop is not attached: reconnect and retry the operation");
             return;
+        }
+        if let Some(remote) = &spec.remote {
+            if spec.operation != Operation::Copy {
+                self.toast(
+                    client,
+                    NoticeKind::Error,
+                    "Moving between the laptop and an SSH server is unavailable: copy, then delete",
+                );
+                return;
+            }
+            if self.panel_ssh_args(&remote.server).as_ref() != Some(&remote.ssh_args) {
+                self.toast(
+                    client,
+                    NoticeKind::Warning,
+                    format!(
+                        "{} is not reached as when its panel was listed: refresh the panel and retry",
+                        remote.server
+                    ),
+                );
+                return;
+            }
         }
         let mut bytes = [0u8; 32];
         // getentropy is available on Linux and macOS and does not open a file in the loop.
@@ -282,7 +332,12 @@ impl Server {
                 self.copy_send(sender, &token, ToClient::Ack(sequence));
             }
             FromClient::Progress
-                if (Some(client) == copy.receiver() && copy.installing)
+                if (Some(client) == copy.job
+                    && copy.spec.to_laptop
+                    && copy.spec.remote.is_some()
+                    && copy.prepared
+                    && copy.done.is_none())
+                    || (Some(client) == copy.receiver() && copy.installing)
                     || (Some(client) == copy.sender() && copy.removing)
                     || (copy.spec.operation == Operation::Delete && client == copy.owner && copy.job.is_some()) =>
             {
@@ -379,6 +434,7 @@ mod tests {
                 spec: Spec {
                     operation: crate::laptop::copy::Operation::Copy,
                     to_laptop: false,
+                    remote: None,
                     sources: vec!["~/report".into()],
                     destination: "/destination".into(),
                     allow: vec!["report".into()],
@@ -405,6 +461,99 @@ mod tests {
             ServerMsg::LaptopCopy { token, message } => (token, message),
             other => panic!("unexpected message {other:?}"),
         }
+    }
+
+    #[test]
+    fn ssh_relay_confirms_production_and_replacements_and_rechecks_identity_after_confirmation() {
+        for to_laptop in [false, true] {
+            let (tx, _rx) = super::super::queue::channel(32);
+            let mut server = server(tx);
+            let (owner, _peer) = client(&mut server);
+            server.clients.get_mut(&owner).unwrap().laptop =
+                Some(crate::laptop::Identity { id: "abc".into(), host: "travel".into(), os: "linux".into() });
+            server.known_servers.push(crate::servers::Known {
+                server: crate::servers::Server {
+                    name: "web-prod".into(),
+                    host: "web.lan".into(),
+                    ..Default::default()
+                },
+                source: crate::servers::Source::Inventory,
+            });
+            let remote = crate::files::Remote {
+                server: "web-prod".into(),
+                ssh_args: server.panel_ssh_args("web-prod").unwrap(),
+                path: "/files".into(),
+            };
+            let laptop = Location::Laptop { owner_id: "abc".into(), host: "travel".into(), path: "~/Downloads".into() };
+            let (source, dest) = if to_laptop {
+                (Location::Remote(remote.clone()).join("report"), laptop)
+            } else {
+                (laptop.join("report"), Location::Remote(remote.clone()))
+            };
+            let mode = server.laptop_files_action(
+                owner,
+                FilesAction::Copy {
+                    sources: vec![source.clone()],
+                    dest: dest.clone(),
+                    replaces: vec!["report".into()],
+                },
+            );
+            let Mode::Confirm(question) = mode else { panic!("production must ask before creating a job") };
+            assert!(question.message.contains("web-prod is production"));
+            assert_eq!(question.message.contains("It replaces"), !to_laptop);
+            assert_eq!(question.action.verb(), if to_laptop { "Copy" } else { "Copy and replace" });
+            assert!(!question.yes);
+            let ConfirmAction::LaptopCopy { owner: identity, spec } = question.action else {
+                panic!("laptop confirmation")
+            };
+            assert_eq!(spec.remote.as_ref().unwrap().ssh_args, remote.ssh_args);
+            assert_eq!(spec.to_laptop, to_laptop);
+            assert_eq!(spec.allow.is_empty(), to_laptop);
+            assert!(server.laptop_copies.is_empty());
+            server.known_servers.last_mut().unwrap().server.host = "other.lan".into();
+            server.start_laptop_copy(owner, &identity, spec);
+            assert!(server.laptop_copies.is_empty(), "changed identity cannot mint a grant");
+            assert!(matches!(
+                server.laptop_files_action(owner, FilesAction::Move { sources: vec![source], dest, replaces: vec![] }),
+                Mode::Normal
+            ));
+            assert!(server.laptop_copies.is_empty(), "SSH relay never moves sources");
+        }
+    }
+
+    #[test]
+    fn ssh_download_progress_is_routed_only_after_laptop_preparation() {
+        let (tx, _rx) = super::super::queue::channel(32);
+        let mut server = server(tx);
+        let (owner, _a) = client(&mut server);
+        let (job, _b) = client(&mut server);
+        let owner_out = server.clients.get_mut(&owner).unwrap().out.capture();
+        let job_out = server.clients.get_mut(&job).unwrap().out.capture();
+        grant(&mut server, owner, "abc");
+        let spec = &mut server.laptop_copies.get_mut("abc").unwrap().spec;
+        spec.to_laptop = true;
+        spec.remote =
+            Some(crate::files::Remote { server: "web".into(), ssh_args: vec!["web".into()], path: "/files".into() });
+        open(&mut server, job, "abc");
+        take(&job_out);
+        take(&owner_out);
+        let old = Instant::now() - TIMEOUT;
+        server.laptop_copies.get_mut("abc").unwrap().progress = old;
+        server.laptop_copy_message(job, "abc".into(), FromClient::Progress);
+        assert_eq!(server.laptop_copies["abc"].progress, old);
+        server.laptop_copy_message(owner, "abc".into(), FromClient::Ack(0));
+        take(&job_out);
+        server.laptop_copies.get_mut("abc").unwrap().progress = old;
+        server.laptop_copy_message(owner, "abc".into(), FromClient::Progress);
+        assert_eq!(server.laptop_copies["abc"].progress, old);
+        server.laptop_copy_message(job, "abc".into(), FromClient::Progress);
+        assert!(server.laptop_copies["abc"].progress > old);
+        assert!(matches!(take(&owner_out).1, ToClient::Progress));
+        server.expire_laptop_copies(old + TIMEOUT);
+        assert!(server.laptop_copies.contains_key("abc"));
+        server.cancel_laptop_client(owner);
+        assert!(matches!(take(&job_out).1, ToClient::Finish(Err(_))));
+        assert!(server.laptop_copies.is_empty());
     }
 
     #[test]

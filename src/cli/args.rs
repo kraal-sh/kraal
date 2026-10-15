@@ -300,6 +300,9 @@ pub enum Cmd {
         /// Refuse to replace what is already in the destination directory (say what it is).
         #[arg(long)]
         no_replace: bool,
+        /// Download into the private laptop relay spool, refusing filesystem name collisions.
+        #[arg(long, hide = true, conflicts_with_all = ["move_", "dry_run"])]
+        laptop_spool: bool,
         /// With --no-replace: a name that may be replaced all the same (repeatable).
         #[arg(long = "allow", value_name = "NAME", requires = "no_replace")]
         allow: Vec<String>,
@@ -846,6 +849,7 @@ mod tests {
         let spec = crate::laptop::copy::Spec {
             operation: crate::laptop::copy::Operation::Copy,
             to_laptop: false,
+            remote: None,
             sources: vec!["~/-file with 'quotes'".into()],
             destination: "/destination".into(),
             allow: vec!["-file with 'quotes'".into()],
