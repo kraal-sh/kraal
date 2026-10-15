@@ -1,5 +1,7 @@
 //! One-use grants and routing for the laptop copy job. No file contents are handled here.
 
+use std::fs::File;
+use std::io::Read;
 use std::time::Instant;
 
 use crate::files::{FilesAction, Location};
@@ -172,8 +174,7 @@ impl Server {
             }
         }
         let mut bytes = [0u8; 32];
-        // getentropy is available on Linux and macOS and does not open a file in the loop.
-        if unsafe { libc::getentropy(bytes.as_mut_ptr().cast(), bytes.len()) } != 0 {
+        if File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut bytes)).is_err() {
             self.toast(client, NoticeKind::Error, "Cannot create a laptop copy token: retry the copy");
             return;
         }
