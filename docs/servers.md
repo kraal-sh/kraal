@@ -17,7 +17,9 @@ SSH's local listener, not that the remote application answers.
 
 kraal keeps an inventory in `~/.config/kraal/servers.toml`
 ([one to start from](../examples/servers.toml), and [a workspace](../examples/workspaces/fleet.kdl)
-on its servers):
+on its servers). The inventory must be regular UTF-8 text of at most 1 MiB; symlinks to
+regular files are supported. See [Configuration](configuration.md) for file checks and
+background reads.
 
 ```toml servers
 [[server]]

@@ -82,6 +82,7 @@ impl Server {
             req @ (Request::NewPane { .. } | Request::OpenAgent { .. } | Request::EditRemote { .. }) => {
                 self.answer_launch(reply, req)
             }
+            Request::ReloadConfig => self.reload_config(reply),
             Request::Wait { pane, until, timeout_ms } => self.answer_wait(reply, pane, until, timeout_ms),
             Request::KillServer { restart } => self.answer_shutdown(reply, restart),
             Request::Subscribe { events, since, boot } => self.subscribe(reply, events, since, boot),
@@ -516,7 +517,6 @@ impl Server {
                 self.paste_buffer_to(p, buffer.as_deref())
             }),
             Request::BufferDelete { buffer, all } => self.delete_buffer(buffer.as_deref(), all),
-            Request::ReloadConfig => self.reload_config().map(|warnings| Response::Text(warnings.join("\n"))),
             Request::RunbookPlan { .. }
             | Request::RunbookRun { .. }
             | Request::Subscribe { .. }
@@ -524,6 +524,7 @@ impl Server {
             | Request::OpenAgent { .. }
             | Request::EditRemote { .. }
             | Request::Wait { .. }
+            | Request::ReloadConfig
             | Request::KillServer { .. } => unreachable!("request family dispatched"),
         }
     }

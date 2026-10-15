@@ -11,6 +11,8 @@ use serde::Deserialize;
 
 use crate::paths;
 
+const CONFIG_MAX: u64 = 1 << 20;
+
 pub const DEFAULT_CONFIG: &str = r##"# kraal configuration. Every setting is optional; this file shows the defaults.
 # Print it again with `kraal config default`.
 
@@ -412,8 +414,11 @@ impl Config {
 
     /// [`Config::load`], and a warning for each key of the file that kraal does not read.
     pub fn load_with_warnings() -> Result<(Config, Vec<String>)> {
-        let path = paths::config_path();
-        let user = match std::fs::read_to_string(&path) {
+        Self::load_from(&paths::config_path())
+    }
+
+    fn load_from(path: &std::path::Path) -> Result<(Config, Vec<String>)> {
+        let user = match paths::read_regular_text(path, CONFIG_MAX) {
             Ok(s) => s,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((Config::default(), Vec::new())),
             Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
@@ -476,6 +481,43 @@ fn merge(base: &mut toml::Value, over: toml::Value) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn loading_requires_bounded_regular_utf8_files() {
+        use crate::testing::{PATIENCE, TempDir};
+
+        let dir = TempDir::new("config-reader");
+        let path = dir.0.join("settings.toml");
+        assert!(Config::load_from(&path).is_ok(), "missing files keep their defaults");
+        let target = dir.write("regular.toml", "#".to_owned() + &" ".repeat(CONFIG_MAX as usize - 2) + "\n");
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+        assert!(Config::load_from(&path).is_ok(), "a regular file at the limit, through a symlink");
+        std::fs::write(&target, "#".to_owned() + &" ".repeat(CONFIG_MAX as usize)).unwrap();
+        let error = Config::load_from(&path).err().unwrap();
+        assert!(format!("{error:#}").contains("larger than 1024 KiB"));
+        std::fs::write(&target, [0xff]).unwrap();
+        let error = Config::load_from(&path).err().unwrap();
+        assert!(format!("{error:#}").contains("not UTF-8 text"));
+        std::fs::remove_file(&path).unwrap();
+        std::os::unix::fs::symlink("/dev/null", &path).unwrap();
+        let error = Config::load_from(&path).err().unwrap();
+        assert!(format!("{error:#}").contains("not a regular file"));
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        let error = Config::load_from(&path).err().unwrap();
+        assert!(format!("{error:#}").contains("not a regular file"));
+        std::fs::remove_dir(&path).unwrap();
+        let name = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: the path is terminated and belongs to this test.
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            tx.send(Config::load_from(&path).map(|_| ()).map_err(|e| format!("{e:#}"))).unwrap();
+        });
+        let error = rx.recv_timeout(PATIENCE).expect("a FIFO without a writer must not block").unwrap_err();
+        assert!(error.contains("not a regular file"), "{error}");
+        worker.join().unwrap();
+    }
 
     #[test]
     fn defaults_parse() {

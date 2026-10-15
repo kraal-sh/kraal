@@ -539,7 +539,9 @@ windows have expired, account summaries show **Last checked ...** and thresholds
 No reported windows means usage is unknown. Account details and `kraal accounts list --json`
 keep the reported percentages. Details show **Reset unavailable** when no reset time was supplied.
 
-**Rules and thresholds** live in `~/.config/kraal/accounts.toml` (`kraal accounts edit`):
+**Rules and thresholds** live in `~/.config/kraal/accounts.toml` (`kraal accounts edit`).
+The file must be regular UTF-8 text of at most 1 MiB; symlinks to regular files are supported.
+See [Configuration](configuration.md) for file checks and background reads.
 
 ```toml accounts
 [limits]

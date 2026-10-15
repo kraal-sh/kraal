@@ -9,6 +9,8 @@ use super::{Account, Accounts, ClaudeOptions, Limits, Rule, absolute_home, agent
 use crate::identity::new_uuid;
 use crate::paths;
 
+const ACCOUNTS_MAX: u64 = 1 << 20;
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct File {
     #[serde(default)]
@@ -115,7 +117,7 @@ impl Accounts {
     }
 
     pub(super) fn read(path: &Path) -> Result<(Accounts, Vec<String>)> {
-        let source = match std::fs::read_to_string(path) {
+        let source = match paths::read_regular_text(path, ACCOUNTS_MAX) {
             Ok(text) => Some(text),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
             Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
@@ -242,10 +244,16 @@ impl Accounts {
     }
 
     pub fn save(&self) -> Result<()> {
+        let text = self.text()?;
+        anyhow::ensure!(
+            text.len() as u64 <= ACCOUNTS_MAX,
+            "writing {}: file is larger than {} KiB",
+            self.path.display(),
+            ACCOUNTS_MAX / 1024
+        );
         if let Some(dir) = self.path.parent() {
             std::fs::create_dir_all(dir)?;
         }
-        let text = self.text()?;
         paths::write_atomic(&self.path, text.as_bytes()).with_context(|| format!("writing {}", self.path.display()))
     }
 
@@ -388,5 +396,63 @@ impl Accounts {
             a.name = new.to_string();
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_update_crossing_the_read_limit_preserves_the_original() {
+        let dir = crate::testing::TempDir::new("accounts-save-limit");
+        let original = "#".to_owned() + &" ".repeat(ACCOUNTS_MAX as usize - 2) + "\n";
+        let path = dir.write("accounts.toml", &original);
+        let before = Accounts::load_from(&path).unwrap().limits.threshold;
+        let error = Accounts::update_at(&path, |accounts| {
+            accounts.limits.threshold = 81;
+            Ok(())
+        })
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("larger than 1024 KiB"), "{error:#}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        assert_eq!(Accounts::load_from(&path).unwrap().limits.threshold, before);
+    }
+
+    #[test]
+    fn loading_requires_bounded_regular_utf8_files() {
+        use crate::testing::{PATIENCE, TempDir};
+
+        let dir = TempDir::new("config-reader");
+        let path = dir.0.join("settings.toml");
+        assert!(Accounts::read(&path).is_ok(), "missing files keep their defaults");
+        let target = dir.write("regular.toml", "#".to_owned() + &" ".repeat(ACCOUNTS_MAX as usize - 2) + "\n");
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+        assert!(Accounts::read(&path).is_ok(), "a regular file at the limit, through a symlink");
+        std::fs::write(&target, "#".to_owned() + &" ".repeat(ACCOUNTS_MAX as usize)).unwrap();
+        let error = Accounts::read(&path).err().unwrap();
+        assert!(format!("{error:#}").contains("larger than 1024 KiB"));
+        std::fs::write(&target, [0xff]).unwrap();
+        let error = Accounts::read(&path).err().unwrap();
+        assert!(format!("{error:#}").contains("not UTF-8 text"));
+        std::fs::remove_file(&path).unwrap();
+        std::os::unix::fs::symlink("/dev/null", &path).unwrap();
+        let error = Accounts::read(&path).err().unwrap();
+        assert!(format!("{error:#}").contains("not a regular file"));
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        let error = Accounts::read(&path).err().unwrap();
+        assert!(format!("{error:#}").contains("not a regular file"));
+        std::fs::remove_dir(&path).unwrap();
+        let name = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: the path is terminated and belongs to this test.
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            tx.send(Accounts::read(&path).map(|_| ()).map_err(|e| format!("{e:#}"))).unwrap();
+        });
+        let error = rx.recv_timeout(PATIENCE).expect("a FIFO without a writer must not block").unwrap_err();
+        assert!(error.contains("not a regular file"), "{error}");
+        worker.join().unwrap();
     }
 }

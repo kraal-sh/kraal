@@ -72,6 +72,17 @@ impl Server {
     }
 
     pub(super) fn scan_definitions(&mut self) {
+        let defs = self.scan_workspace_definitions();
+        self.refresh_known(&defs);
+        self.reload_accounts();
+    }
+
+    pub(super) fn scan_definitions_async(&mut self) {
+        let defs = self.scan_workspace_definitions();
+        self.scan_inventories(defs);
+    }
+
+    fn scan_workspace_definitions(&mut self) -> Vec<WorkspaceDef> {
         self.last_def_scan = Instant::now();
         // Their changes are told, and those of accounts.toml and of the accounts' usage,
         // wherever they can be.
@@ -90,9 +101,7 @@ impl Server {
             self.def_files = files;
             self.mark_dirty();
         }
-        let defs: Vec<WorkspaceDef> = listed.into_iter().filter_map(|(_, d)| d.ok()).collect();
-        self.refresh_known(&defs);
-        self.reload_accounts();
+        listed.into_iter().filter_map(|(_, d)| d.ok()).collect()
     }
 
     /// Keep each saved workspace linked to its definition file: a file renamed on disk is found

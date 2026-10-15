@@ -16,6 +16,14 @@ hints, hooks, production words, contexts, saving scrollback and the paste buffer
 once; panes already open keep their shell and scrollback length, and `[graphics]` waits for the
 session's next start. Client clipboard policy is read on attach; the server copy size limit
 updates on reload. When the file cannot be read, nothing changes and the command says why.
+If another reload is requested before the first finishes, the older request is refused; only
+the newest request can apply its configuration.
+
+`config.toml`, `accounts.toml` and `servers.toml` must be regular UTF-8 files of at most
+1 MiB (1,048,576 bytes) each. Symlinks to regular files are supported; directories, FIFOs and
+devices are refused. Missing files still use defaults. Config reloads and automatic account
+and server inventory reads run in the background, so slow storage does not hold up terminal
+input while these files are read.
 
 The check also reads your runbooks and, run in a repository, its `.kraal/worktree.toml` and its
 runbooks. A key kraal does not know in `config.toml`, `servers.toml` or `accounts.toml` (a typo,
