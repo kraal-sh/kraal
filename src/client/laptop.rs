@@ -1497,7 +1497,7 @@ mod tests {
             let mut pane = crate::files::FilesPane::new(local.clone(), local, Arc::new(|| {}));
             assert!(pane.set_laptop(Side::Left, location, 7));
             pane.forget_viewer(7);
-            pane.reconnect_laptop("abc123", 8);
+            pane.reconnect_laptop("abc123", "travel", 8);
             pane
         });
         let first = panes[0].laptop_requests().pop().unwrap();

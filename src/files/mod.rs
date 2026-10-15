@@ -591,10 +591,16 @@ impl FilesPane {
         true
     }
 
-    pub fn reconnect_laptop(&mut self, owner_id: &str, client: u32) {
+    /// A laptop attached: its panels list again through `client`. That is the same identity
+    /// after an automatic reconnect, or a new attach from the same host to a panel its last
+    /// owner left; the laptop still checks its own permission for the listing.
+    pub fn reconnect_laptop(&mut self, owner_id: &str, host: &str, client: u32) {
         for side in [Side::Left, Side::Right] {
-            if matches!(&self.panel(side).location, Location::Laptop { owner_id: owner, .. } if owner == owner_id) {
-                self.panel_mut(side).owner = Some(client);
+            let panel = self.panel_mut(side);
+            let Location::Laptop { owner_id: id, host: h, .. } = &mut panel.location else { continue };
+            if id == owner_id || (panel.owner.is_none() && h == host) {
+                *id = owner_id.to_owned();
+                panel.owner = Some(client);
                 self.load(side);
             }
         }

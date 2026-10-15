@@ -171,6 +171,7 @@ pub(super) struct Facts {
     name: String,
     production: Option<String>,
     details: Vec<Span<'static>>,
+    frame_details: Vec<Span<'static>>,
 }
 
 /// The facts of each pane, with what they were worked out from (the chrome's generation and
@@ -478,7 +479,8 @@ impl Server {
         let facts = Facts {
             name: pane.display_name(),
             production: self.pane_production_shown(id),
-            details: self.pane_details(id),
+            details: self.pane_details(id, false),
+            frame_details: self.pane_details(id, true),
         };
         let mut panes = self.facts.panes.borrow_mut();
         if let Some(e) = panes.get_mut(&id)
@@ -1913,7 +1915,7 @@ impl Server {
 
     /// What a pane works on: git, contexts (production ones in red), the agent and its state,
     /// how far back it is scrolled.
-    fn pane_details(&self, pid: PaneId) -> Vec<Span<'static>> {
+    fn pane_details(&self, pid: PaneId, with_title: bool) -> Vec<Span<'static>> {
         let Some(pane) = self.panes.get(&pid) else { return Vec::new() };
         let mut out = Vec::new();
         if let Some(g) = self.pane_git(pid) {
@@ -1926,17 +1928,25 @@ impl Server {
         }
         if let Some(kind) = &pane.agent.kind {
             let state = pane.agent.state;
+            let style = Style::default().fg(th().state_color(state));
+            let state = format!(" {} {} ", th().icon(state), state.label());
+            // The account, or else the agent unless a displayed title already names it.
             let account = self.pane_account_label(pid);
             let linked = account.is_some();
-            let kind = account.unwrap_or_else(|| kind.clone());
-            let sep = if th().ascii { "-" } else { "·" };
-            out.push(Span::styled(
-                format!(" {} {} {sep} ", th().icon(state), state.label()),
-                Style::default().fg(th().state_color(state)),
-            ));
-            let style = Style::default().fg(th().state_color(state));
-            out.push(Span::styled(kind, if linked { style.add_modifier(Modifier::UNDERLINED) } else { style }));
-            out.push(Span::raw(" "));
+            let named = with_title
+                && pane.display_name().split_whitespace().next().is_some_and(|w| w.eq_ignore_ascii_case(kind));
+            match account.or_else(|| (!named).then(|| kind.clone())) {
+                Some(label) => {
+                    let sep = if th().ascii { "-" } else { "·" };
+                    out.push(Span::styled(format!("{state}{sep} "), style));
+                    out.push(Span::styled(
+                        label,
+                        if linked { style.add_modifier(Modifier::UNDERLINED) } else { style },
+                    ));
+                    out.push(Span::raw(" "));
+                }
+                None => out.push(Span::styled(state, style)),
+            }
         }
         // The last command the shell marked failed: its status, and how long it ran if that
         // was long enough to matter.
@@ -2084,7 +2094,7 @@ impl Server {
         if marked {
             title.insert(0, Span::styled(" ◆", Style::default().fg(th().sync).add_modifier(Modifier::BOLD)));
         }
-        Some(FrameLook { tile, color, title, details: facts.details.clone() })
+        Some(FrameLook { tile, color, title, details: facts.frame_details.clone() })
     }
 
     pub(super) fn frame_account_hit(&self, pane: PaneId, tile: Rect, floating: bool, marked: bool, col: u16) -> bool {
@@ -2396,6 +2406,55 @@ thread_local! {
 mod tests {
     use super::*;
     use crate::theme::NoticeKind;
+
+    #[test]
+    fn an_agent_without_an_account_is_named_once_in_its_frame() {
+        let _batch = crate::pane::batch();
+        let (tx, _rx) = super::super::event_channel(32);
+        let mut server = super::super::tests::server(tx);
+        let (client, _peer) = super::super::tests::client(&mut server);
+        let ws = server.clients[&client].workspace;
+        let spec = crate::pane::PaneSpec { command: vec!["true".into()], ..Default::default() };
+        let pane =
+            server.spawn_pane_in(ws, None, spec, crate::protocol::Placement::Tab, Some("gemini".into())).unwrap();
+        let agent = &mut server.panes.get_mut(&pane).unwrap().agent;
+        agent.kind = Some("gemini".into());
+        agent.state = crate::agent::AgentState::Idle;
+        let details = |server: &Server| {
+            server
+                .frame_look(pane, Rect::new(0, 0, 124, 36), true, false, false, false)
+                .unwrap()
+                .details
+                .iter()
+                .map(|s| s.content.to_string())
+                .collect::<String>()
+        };
+        let text = details(&server);
+        assert!(text.contains("idle") && !text.contains("gemini"), "the title names the agent already: {text:?}");
+        server.panes.get_mut(&pane).unwrap().name = Some("review".into());
+        server.chrome_changed();
+        assert!(details(&server).contains("idle · gemini"), "{:?}", details(&server));
+    }
+
+    #[test]
+    fn a_frameless_agent_is_named_in_the_top_bar() {
+        let _batch = crate::pane::batch();
+        let (tx, _rx) = super::super::event_channel(32);
+        let mut server = super::super::tests::server(tx);
+        let (client, _peer) = super::super::tests::client(&mut server);
+        server.config.pane_frames = false;
+        let ws = server.clients[&client].workspace;
+        let spec = crate::pane::PaneSpec { command: vec!["true".into()], ..Default::default() };
+        let pane =
+            server.spawn_pane_in(ws, None, spec, crate::protocol::Placement::Tab, Some("gemini".into())).unwrap();
+        server.workspaces[0].tab_mut().unwrap().name = "work".into();
+        let agent = &mut server.panes.get_mut(&pane).unwrap().agent;
+        agent.kind = Some("gemini".into());
+        agent.state = AgentState::Idle;
+        let bar = server.top_bar(&server.clients[&client]);
+        let text: String = bar.right.iter().map(|s| s.content.as_ref()).collect();
+        assert!(text.contains("idle · gemini"), "the top bar must name the frameless agent: {text:?}");
+    }
 
     #[test]
     fn strip_cells_colours_selection_and_state_changes_at_the_delivery_sizes() {

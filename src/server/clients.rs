@@ -136,7 +136,7 @@ impl Server {
                 if let Some(laptop) = self.clients.get(&id).and_then(|c| c.laptop.clone()) {
                     for p in self.panes.values_mut() {
                         if let crate::pane::Content::Files(f) = &mut p.content {
-                            f.reconnect_laptop(&laptop.id, id);
+                            f.reconnect_laptop(&laptop.id, &laptop.host, id);
                         }
                     }
                 }

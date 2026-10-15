@@ -152,8 +152,10 @@ special files are omitted. Listings are limited to 16 MiB and 100,000 entries.
 Only the client that chose the laptop sees its listing. Other clients and `kraal read` see
 **shown on that machine only** and cannot act on that panel. The pane title omits the laptop
 path. Saving keeps that panel as the session machine's `~`, so restoring never depends on a
-laptop. Disconnecting clears the listing; an automatic reconnect lists it again. A new attach
-has a new identity and sees **is not attached** until a machine is chosen with `o`.
+laptop. Disconnecting clears the listing; an automatic reconnect lists it again, and so does a
+new attach from the same laptop (same host name) once the previous one is gone, after the
+laptop's usual permission check. Otherwise the panel says **is not attached** until a machine
+is chosen with `o`.
 
 Laptop browsing is available in one panel at a time. To copy from it, select files or
 folders, choose a destination on the session's machine or an SSH server in the other panel,
