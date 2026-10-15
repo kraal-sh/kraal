@@ -364,11 +364,15 @@ Command-line logins and sign-in checks use the same account environment. Logins 
 terminal; checks run with no terminal input and keep the agent's output private.
 
 Open **Accounts** from the Agents menu (`ctrl+b A l`), or click the sidebar's **ACCOUNTS**
-heading. Each account has two lines: `Claude · work` and `57% used · 2 panes`. Unknown usage
-says **Usage unavailable**, a login still to verify says **Sign-in required**, and expired
-observations say **Last checked ...**. Enter or one click opens details with the usage windows,
-when they were checked and their resets. Zero panes are omitted. In a narrow sidebar, **No usage**
-and **Checked ...** keep the second line readable; clicking either line opens those details.
+heading. In the sidebar, accounts use the same two-line rows as workspaces: a bold
+`Claude · work` label after `●` when panes use the account, or `○` when none do, then an
+indented, dimmed `57% used · 2 panes`. Only the usage turns red at or above the account's
+threshold. Zero panes are omitted. The sidebar says **No usage yet** before any measurement;
+the Accounts list says **Usage unavailable**. A login still to verify says **Sign-in required**
+(in red in the sidebar), and expired observations say **Last checked ...**.
+A narrow sidebar omits whole status parts that do not fit. Clicking either line opens details
+with the usage windows, when they were checked and their resets. The **⋮** marker on a selected
+or hovered account opens its actions, as does a right-click. Enter in the list opens details.
 Tab opens **Rename**, **Sign in**, and **Remove** (`ctrl+r`, `ctrl+l`, `ctrl+x`). Remove asks first, with Cancel selected, and explains that conversations and the
 agent's own sign-in are kept.
 Enter or Esc in details returns to the list with that account selected. Background account

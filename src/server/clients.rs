@@ -71,6 +71,7 @@ impl Server {
                 frame: Default::default(),
                 memo: Default::default(),
                 sidebar: None,
+                sidebar_hover: None,
                 dirty: Dirty::No,
                 printed: Printed::None,
                 last_input: Instant::now(),

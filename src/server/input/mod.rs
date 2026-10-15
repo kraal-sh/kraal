@@ -72,11 +72,6 @@ impl Server {
         if !c.attached {
             return;
         }
-        c.last_input = Instant::now();
-        if self.primary != Some(id) {
-            self.primary = Some(id);
-            self.relayout();
-        }
         // An action can reserve input midway through this frame. Keep the remaining raw
         // bytes before parsing them, just as if they had arrived in the next frame.
         let mut quiet = true;
@@ -125,6 +120,16 @@ impl Server {
     /// Act on one thing a client typed: whether it only went to programs, changing nothing on
     /// screen until they answer.
     fn client_event(&mut self, id: ClientId, ev: InputEvent) -> bool {
+        // Motion reports update hover without taking control of the shared pane sizes.
+        if !matches!(ev, InputEvent::Mouse(MouseEvent { kind: MouseKind::Move, .. })) {
+            if let Some(c) = self.clients.get_mut(&id) {
+                c.last_input = Instant::now();
+            }
+            if self.primary != Some(id) {
+                self.primary = Some(id);
+                self.relayout();
+            }
+        }
         if !matches!(ev, InputEvent::Mouse(_))
             && let Some(client) = self.clients.get_mut(&id)
             && matches!(client.drag, Some(super::ui::Drag::Workspace { .. }))

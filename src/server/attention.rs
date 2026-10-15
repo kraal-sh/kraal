@@ -67,10 +67,10 @@ impl Server {
     }
 
     /// After anything that may have moved the focus: the panes that gained or lost it are told
-    /// (mode 1004), and each client's terminal reports pointer motion only while the pane it
-    /// shows asks for it (mode 1003). A pane has the focus while an attached client whose
-    /// terminal has the focus shows it. Each terminal's keyboard level follows its client's mode
-    /// too ([`Server::follow_keyboard`]).
+    /// (mode 1004), and each client's terminal reports pointer motion while the full sidebar has
+    /// accounts or the pane it shows asks for it (mode 1003). A pane has the focus while an
+    /// attached client whose terminal has the focus shows it. Each terminal's keyboard level
+    /// follows its client's mode too ([`Server::follow_keyboard`]).
     pub(super) fn follow_focus(&mut self) {
         let shown = || {
             self.clients.values().filter(|c| c.attached && c.terminal_focused).filter_map(|c| self.client_focus(c.id))
@@ -93,12 +93,7 @@ impl Server {
             .values()
             .filter(|c| c.attached)
             .filter_map(|c| {
-                let wants = self.config.mouse
-                    && matches!(c.mode, super::ui::Mode::Normal)
-                    && self
-                        .client_focus(c.id)
-                        .and_then(|p| self.panes.get(&p))
-                        .is_some_and(|p| p.wants_pointer_motion());
+                let wants = self.wants_pointer_motion(c);
                 (c.pointer_motion != wants).then_some((c.id, wants))
             })
             .collect();
@@ -116,6 +111,19 @@ impl Server {
             }
         }
         self.follow_keyboard();
+    }
+
+    pub(super) fn wants_pointer_motion(&self, c: &super::Client) -> bool {
+        self.config.mouse
+            && matches!(c.mode, super::ui::Mode::Normal)
+            && (matches!(self.sidebar_presentation(c), super::geometry::Sidebar::Full(_))
+                && self.accounts.entries().iter().any(|a| {
+                    a.linked_to.is_none()
+                        && !a.review
+                        && a.name != "default"
+                        && crate::accounts::agent_kind(&a.agent).is_some()
+                })
+                || self.client_focus(c.id).and_then(|p| self.panes.get(&p)).is_some_and(|p| p.wants_pointer_motion()))
     }
 
     fn report_focus(&mut self, pane: PaneId, gained: bool) {

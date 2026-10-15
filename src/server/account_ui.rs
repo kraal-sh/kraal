@@ -37,6 +37,7 @@ struct PaneAccountInput {
     id: Option<String>,
     env: Vec<(String, String)>,
     observed: Option<Account>,
+    state: Option<crate::agent::AgentState>,
 }
 
 impl PaneAccountInput {
@@ -45,6 +46,7 @@ impl PaneAccountInput {
             && self.id == pane.spec.account_id
             && self.env == pane.spec.env
             && self.observed.as_ref() == observed
+            && self.state == pane.agent.kind.as_ref().map(|_| pane.agent.state)
     }
 }
 
@@ -190,6 +192,7 @@ impl Server {
                         id: pane.spec.account_id.clone(),
                         env: pane.spec.env.clone(),
                         observed: self.observed_agents.get(&id).map(|a| a.account.clone()),
+                        state: pane.agent.kind.as_ref().map(|_| pane.agent.state),
                     },
                 )
             })
@@ -520,6 +523,12 @@ impl Server {
         event: InputEvent,
     ) -> Mode {
         let area = details_area(self.client_screen(client));
+        if let InputEvent::Mouse(m) = &event
+            && !area.contains((m.col, m.row).into())
+            && let Some(mode) = self.sidebar_account_actions(client, *m)
+        {
+            return mode;
+        }
         let footer_y = area.bottom().saturating_sub(2);
         let mut actions = false;
         let back = match event {

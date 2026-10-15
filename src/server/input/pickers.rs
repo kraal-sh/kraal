@@ -17,6 +17,13 @@ use crate::theme::NoticeKind;
 
 impl Server {
     pub(super) fn on_picker(&mut self, id: ClientId, mut p: Picker, ev: InputEvent) -> Mode {
+        if p.kind == PickerKind::Accounts
+            && let InputEvent::Mouse(m) = &ev
+            && !crate::server::overlays::picker_layout(&p, self.client_screen(id)).area.contains((m.col, m.row).into())
+            && let Some(mode) = self.sidebar_account_actions(id, *m)
+        {
+            return mode;
+        }
         if p.drag.is_some() && !matches!(ev, InputEvent::Mouse(_)) {
             p.drag = None;
             p.message = None;

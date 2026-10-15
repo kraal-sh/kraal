@@ -51,9 +51,25 @@ enum SideRow {
     Blank,
 }
 
+fn side_entry(
+    rows: &mut Vec<SideRow>,
+    item: SideItem,
+    dot: Span<'static>,
+    name: Span<'static>,
+    detail: impl Into<Line<'static>>,
+    selected: bool,
+) {
+    rows.push(SideRow::Entry { item: Some(item.clone()), line: Line::from(vec![dot, name]), selected });
+    let mut detail = detail.into();
+    detail.spans.insert(0, dim_span("   "));
+    rows.push(SideRow::Entry { item: Some(item), line: detail, selected });
+}
+
 pub(super) struct AccountRows {
     width: u16,
     room: usize,
+    threshold: u8,
+    theme: crate::theme::Theme,
     rows: Vec<SideRow>,
 }
 
@@ -1392,15 +1408,6 @@ impl Server {
         }
         let t = th();
         let mut rows = vec![SideRow::Section("WORKSPACES")];
-        let entry = |rows: &mut Vec<SideRow>,
-                     item: SideItem,
-                     dot: Span<'static>,
-                     name: Span<'static>,
-                     detail: Span<'static>,
-                     selected: bool| {
-            rows.push(SideRow::Entry { item: Some(item.clone()), line: Line::from(vec![dot, name]), selected });
-            rows.push(SideRow::Entry { item: Some(item), line: Line::from(vec![Span::raw("   "), detail]), selected });
-        };
         let dot = |icon: &str, color: Color| Span::styled(format!(" {icon} "), Style::default().fg(color));
         let strong = |text: String| Span::styled(text, Style::default().fg(t.text).add_modifier(Modifier::BOLD));
         let faint = |text: String, color: Color| Span::styled(text, Style::default().fg(color));
@@ -1424,7 +1431,7 @@ impl Server {
                 Some(status) => status.to_string(),
                 None => format!("{}{sep}{}{sep}{}", ws.status(), plural(tabs, "tab"), plural(panes, "pane")),
             };
-            entry(
+            side_entry(
                 &mut rows,
                 SideItem::Workspace(ws.id),
                 dot(icon, color),
@@ -1441,7 +1448,7 @@ impl Server {
         {
             let name = strong(n.clone());
             let detail = faint("Closed".into(), t.dim);
-            entry(
+            side_entry(
                 &mut rows,
                 SideItem::Definition(path.clone()),
                 dot(t.icon(AgentState::Idle), t.dim),
@@ -1506,7 +1513,7 @@ impl Server {
                     detail = format!("{detail}{sep}{}", ws.name);
                 }
                 let color = t.state_color(s);
-                entry(
+                side_entry(
                     &mut rows,
                     SideItem::Pane(p),
                     dot(t.icon(s), color),
@@ -1541,7 +1548,7 @@ impl Server {
                 let detail = format!("{} · localhost:{}", tunnel.state.label(), tunnel.spec.local);
                 let name =
                     strong(format!("{} · {}:{}", tunnel.spec.server, tunnel.spec.remote_host, tunnel.spec.remote_port));
-                entry(
+                side_entry(
                     &mut rows,
                     SideItem::Tunnel(tunnel.spec.local),
                     dot(icon, color),
@@ -1561,7 +1568,7 @@ impl Server {
                     name = format!("{name}{sep}{wt}");
                 }
                 let icon = t.icon(AgentState::Working);
-                entry(
+                side_entry(
                     &mut rows,
                     SideItem::Port(*port),
                     dot(icon, t.accent),
@@ -1576,10 +1583,17 @@ impl Server {
         let display = self.account_display_at(now);
         let width = self.sidebar_cols(c).saturating_sub(3);
         let mut cached = display.sidebar.borrow_mut();
-        if cached.as_ref().is_none_or(|rows| rows.width != width || rows.room != room) {
+        if cached.as_ref().is_none_or(|rows| {
+            rows.width != width
+                || rows.room != room
+                || rows.threshold != self.accounts.limits.threshold
+                || rows.theme != t
+        }) {
             let mut items = display.items.clone();
             for item in &mut items {
-                item.detail = super::account_ui::sidebar_summary(&item.detail, width as usize);
+                if !matches!(item.action, super::ui::PickAction::AccountDetails(_)) {
+                    item.detail = super::account_ui::sidebar_summary(&item.detail, width as usize);
+                }
                 if let super::ui::PickAction::ReviewAccount(a) = &item.action
                     && crate::text::columns(&item.label) > width as usize
                 {
@@ -1587,13 +1601,27 @@ impl Server {
                         format!("? Account for {}", crate::paths::shorten_home(&crate::paths::expand_tilde(&a.home)));
                 }
             }
-            *cached = Some(AccountRows { width, room, rows: account_rows(items, room) });
+            *cached = Some(AccountRows {
+                width,
+                room,
+                threshold: self.accounts.limits.threshold,
+                theme: t,
+                rows: self.account_rows(items, room, now),
+            });
         }
         let accounts = &cached.as_ref().unwrap().rows;
         if !accounts.is_empty() {
             let top = (height as usize).saturating_sub(accounts.len() + 1);
             rows.resize_with(top, || SideRow::Blank);
-            rows.extend(accounts.iter().cloned());
+            rows.extend(accounts.iter().cloned().map(|mut row| {
+                if let SideRow::Entry { item: Some(SideItem::Account(id)), selected, .. } = &mut row {
+                    *selected = c.sidebar_hover.as_ref() == Some(&SideItem::Account(id.clone()))
+                        || matches!(&c.mode, Mode::AccountDetails(details) if details.account == *id)
+                        || matches!(&c.mode, Mode::Picker(p) if p.current().is_some_and(|i|
+                            matches!(&i.action, super::ui::PickAction::AccountDetails(a) if a == id)));
+                }
+                row
+            }));
         }
         rows
     }
@@ -1657,23 +1685,29 @@ impl Server {
                             buf[(x, y)].set_bg(th().selection);
                         }
                     }
-                    let actions = matches!(item, Some(SideItem::Workspace(_)))
+                    let actions = (matches!(item, Some(SideItem::Workspace(_)))
+                        || *selected && matches!(item, Some(SideItem::Account(_))))
                         && text.spans.first().is_some_and(|s| s.content != "   ");
                     let mut text = text.clone();
-                    if matches!(item, Some(SideItem::Workspace(_)))
+                    if matches!(item, Some(SideItem::Workspace(_) | SideItem::Account(_)))
                         && text.spans.first().is_some_and(|s| s.content == "   ")
-                        && let Some(detail) = text.spans.get_mut(1)
                     {
                         let sep = if th().ascii { " - " } else { " · " };
                         let mut shown = String::new();
-                        for part in detail.content.split(sep) {
+                        let detail: String = text.spans.iter().skip(1).map(|s| s.content.as_ref()).collect();
+                        for part in detail.split(sep) {
                             let next = if shown.is_empty() { part.to_string() } else { format!("{shown}{sep}{part}") };
                             if crate::text::columns(&next) > width.saturating_sub(3) as usize {
                                 break;
                             }
                             shown = next;
                         }
-                        detail.content = shown.into();
+                        let mut remaining = 3 + shown.len();
+                        for span in &mut text.spans {
+                            let kept = remaining.min(span.content.len());
+                            span.content = span.content[..kept].to_owned().into();
+                            remaining -= kept;
+                        }
                     }
                     buf.set_line(area.x + 1, y, &text, width.saturating_sub(if actions { 3 } else { 0 }));
                     if actions {
@@ -2255,34 +2289,76 @@ fn fit_spans(spans: Vec<Span<'static>>, max: u16) -> Vec<Span<'static>> {
     out
 }
 
-fn account_rows(mut items: Vec<super::ui::PickItem>, room: usize) -> Vec<SideRow> {
-    if room < 2 {
-        return Vec::new();
-    }
-    let Some(add) = items.pop() else { return Vec::new() };
-    let questions: Vec<_> =
-        items.extract_if(.., |item| matches!(item.action, super::ui::PickAction::ReviewAccount(_))).collect();
-    let question_count = questions.len().min(room - 2);
-    items.truncate((room - 2 - question_count) / 2);
-    items.extend(questions.into_iter().take(question_count));
-    items.push(add);
-    let mut rows = vec![SideRow::Section("ACCOUNTS")];
-    for entry in items {
-        let item = match entry.action {
-            super::ui::PickAction::AccountDetails(id) => SideItem::Account(id),
-            super::ui::PickAction::ReviewAccount(a) => SideItem::ReviewAccount(a.id),
-            super::ui::PickAction::AddAccount => SideItem::AddAccount,
-            _ => SideItem::Accounts,
-        };
-        for text in [entry.label, entry.detail].into_iter().filter(|s| !s.is_empty()) {
-            rows.push(SideRow::Entry {
-                item: Some(item.clone()),
-                line: Line::from(if entry.dim { dim_span(&text) } else { Span::raw(text) }),
-                selected: false,
-            });
+impl Server {
+    fn account_rows(&self, mut items: Vec<super::ui::PickItem>, room: usize, now: i64) -> Vec<SideRow> {
+        if room < 2 {
+            return Vec::new();
         }
+        let Some(add) = items.pop() else { return Vec::new() };
+        let questions: Vec<_> =
+            items.extract_if(.., |item| matches!(item.action, super::ui::PickAction::ReviewAccount(_))).collect();
+        let question_count = questions.len().min(room - 2);
+        items.truncate((room - 2 - question_count) / 2);
+        items.extend(questions.into_iter().take(question_count));
+        items.push(add);
+        let mut rows = vec![SideRow::Section("ACCOUNTS")];
+        for entry in items {
+            if let super::ui::PickAction::AccountDetails(id) = &entry.action {
+                let account = self.accounts.by_id(id);
+                let panes: Vec<_> = self
+                    .panes
+                    .iter()
+                    .filter(|(p, _)| self.pane_account(**p).is_some_and(|a| a.id == *id))
+                    .map(|(_, pane)| pane)
+                    .collect();
+                let count = panes.len();
+                let color = panes
+                    .iter()
+                    .filter_map(|pane| pane.agent.kind.as_ref().map(|_| pane.agent.state))
+                    .max_by_key(agent_urgency)
+                    .map_or(th().dim, |state| th().state_color(state));
+                let error = account.as_ref().is_some_and(|a| {
+                    a.sign_in_required
+                        || self.usage.peak(a, now).is_some_and(|peak| peak >= f64::from(self.accounts.threshold(a)))
+                });
+                let summary = account.as_ref().map_or_else(
+                    || entry.detail.clone(),
+                    |a| super::account_ui::usage_summary(a, self.usage.get(a), now),
+                );
+                let summary = summary.replace("Usage unavailable", "No usage yet");
+                let mut detail =
+                    vec![Span::styled(summary, Style::default().fg(if error { th().blocked } else { th().dim }))];
+                if count > 0 {
+                    let sep = if th().ascii { " - " } else { " · " };
+                    detail.push(dim_span(&format!("{sep}{count} pane{}", if count == 1 { "" } else { "s" })));
+                }
+                let icon = th().icon(if count > 0 { AgentState::Working } else { AgentState::Idle });
+                side_entry(
+                    &mut rows,
+                    SideItem::Account(id.clone()),
+                    Span::styled(format!(" {icon} "), Style::default().fg(color)),
+                    Span::styled(entry.label, Style::default().fg(th().text).add_modifier(Modifier::BOLD)),
+                    detail,
+                    false,
+                );
+                continue;
+            }
+            let item = match entry.action {
+                super::ui::PickAction::AccountDetails(id) => SideItem::Account(id),
+                super::ui::PickAction::ReviewAccount(a) => SideItem::ReviewAccount(a.id),
+                super::ui::PickAction::AddAccount => SideItem::AddAccount,
+                _ => SideItem::Accounts,
+            };
+            for text in [entry.label, entry.detail].into_iter().filter(|s| !s.is_empty()) {
+                rows.push(SideRow::Entry {
+                    item: Some(item.clone()),
+                    line: Line::from(if entry.dim { dim_span(&text) } else { Span::raw(text) }),
+                    selected: false,
+                });
+            }
+        }
+        rows
     }
-    rows
 }
 
 fn badge_span(text: &str, color: Color) -> Span<'static> {
@@ -2740,7 +2816,7 @@ mod tests {
                         _ => None,
                     })
                     .collect();
-                assert_eq!(details, ["Claude · Work", if width == 12 { "No usage" } else { "Usage unavailable" }]);
+                assert_eq!(details, [" ○ Claude · Work", "   No usage yet"]);
             }
             server.account_display.borrow_mut().take();
             assert!(rows == server.sidebar_rows(c, height, 1_000), "cached rows differ at {width}x{height}");
@@ -2930,6 +3006,235 @@ mod tests {
         assert_eq!(cut.iter().map(|s| s.content.as_ref()).collect::<String>(), "deploy fail…");
     }
     #[test]
+    fn account_sidebar_rows_show_usage_counts_and_styles_at_full_and_narrow_widths() {
+        use crate::accounts::{Usage, Window};
+        let (tx, _rx) = super::super::queue::channel(32);
+        let mut server = super::super::tests::server(tx);
+        let (client, _peer) = super::super::tests::client(&mut server);
+        let mut accounts = Vec::new();
+        for (name, usage, count, required, threshold) in [
+            ("patron.bzh", Some(87.0), 3, false, None),
+            ("gmail", None, 0, false, None),
+            ("Personal", Some(93.0), 1, false, None),
+            ("unused", Some(42.0), 0, false, None),
+            ("sign-in", None, 1, true, None),
+            ("limit", Some(80.0), 0, false, Some(80)),
+        ] {
+            let mut a = server.accounts.get("claude", "default").unwrap();
+            a.id = name.into();
+            a.name = name.into();
+            a.home = format!("/nonexistent/{name}");
+            a.sign_in_required = required;
+            a.threshold = threshold;
+            if name == "Personal" {
+                a.agent = "codex".into();
+            }
+            let a = server.accounts.add(a).unwrap();
+            if let Some(used_percent) = usage {
+                server.usage.0.insert(
+                    a.key(),
+                    Usage {
+                        five_hour: Some(Window { used_percent, resets_at: Some(2_000) }),
+                        observed_at: 1_000,
+                        ..Default::default()
+                    },
+                );
+            }
+            for _ in 0..count {
+                let id = server.alloc_id();
+                let spec = crate::pane::PaneSpec {
+                    account_id: Some(a.id.clone()),
+                    account: Some(format!("{}:{}", a.agent, a.name)),
+                    text: Some(crate::pane::ShownText { title: String::new(), text: String::new() }),
+                    ..Default::default()
+                };
+                let pane = crate::pane::Pane::spawn(id, None, spec, 80, 24, &server.env, &server.tx).unwrap();
+                server.panes.insert(id, pane);
+            }
+            accounts.push(a);
+        }
+        for width in [28, 16, 12] {
+            server.config.sidebar.width = width;
+            let rows = server.sidebar_rows(&server.clients[&client], 36, 1_100);
+            let mut buf = Buffer::empty(Rect::new(0, 0, width, 36));
+            Server::draw_sidebar(&rows, buf.area, &mut buf);
+            for (a, summary, count, error) in [
+                (&accounts[0], "87% used", 3, false),
+                (&accounts[1], "No usage yet", 0, false),
+                (&accounts[2], "93% used", 1, true),
+                (&accounts[3], "42% used", 0, false),
+                (&accounts[4], "Sign-in required", 1, true),
+                (&accounts[5], "80% used", 0, true),
+            ] {
+                let y = rows
+                    .iter()
+                    .position(|row| {
+                        matches!(row,
+                    SideRow::Entry { item: Some(SideItem::Account(id)), .. } if id == &a.id)
+                    })
+                    .unwrap() as u16;
+                let SideRow::Entry { line, .. } = &rows[y as usize] else { panic!() };
+                assert_eq!(
+                    line.to_string(),
+                    format!(
+                        " {} {} · {}",
+                        if count > 0 { "●" } else { "○" },
+                        if a.agent == "codex" { "Codex" } else { "Claude" },
+                        a.name
+                    )
+                );
+                assert_eq!(buf[(2, y)].fg, th().dim);
+                assert!(buf[(4, y)].modifier.contains(Modifier::BOLD));
+                let detail = if count == 0 {
+                    summary.to_string()
+                } else {
+                    format!("{summary} · {count} pane{}", if count == 1 { "" } else { "s" })
+                };
+                let expected = if width == 28 && summary != "Sign-in required" {
+                    detail.as_str()
+                } else if summary.len() <= usize::from(width - 5) {
+                    summary
+                } else {
+                    ""
+                };
+                let shown: String = (1..width - 1).map(|x| buf[(x, y + 1)].symbol()).collect();
+                assert_eq!(shown.trim(), expected, "{} at {width} columns", a.name);
+                assert_eq!(buf[(1, y + 1)].fg, th().dim, "indentation stays dim");
+                if !expected.is_empty() {
+                    for x in 4..4 + summary.len() as u16 {
+                        assert_eq!(buf[(x, y + 1)].fg, if error { th().blocked } else { th().dim });
+                    }
+                }
+                if width == 28 && count > 0 && summary != "Sign-in required" {
+                    for x in 4 + summary.len() as u16..4 + crate::text::columns(&detail) as u16 {
+                        assert_eq!(buf[(x, y + 1)].fg, th().dim, "separator and count stay dim");
+                    }
+                }
+                for row in [y, y + 1] {
+                    assert_eq!(server.sidebar_hit(client, row), Some(SideItem::Account(a.id.clone())));
+                }
+            }
+        }
+        server.config.sidebar.width = 28;
+        server.accounts.limits.threshold = 85;
+        let rows = server.sidebar_rows(&server.clients[&client], 36, 1_100);
+        assert!(rows.iter().any(|row| matches!(row,
+            SideRow::Entry { item: Some(SideItem::Account(id)), line, .. }
+            if id == &accounts[0].id && line.spans.iter().any(|s| s.content == "87% used" && s.style.fg == Some(th().blocked)))));
+        for state in [AgentState::Blocked, AgentState::Done, AgentState::Working, AgentState::Idle, AgentState::Unknown]
+        {
+            for pane in server.panes.values_mut() {
+                pane.agent.kind = Some("claude".into());
+                pane.agent.state = state;
+            }
+            let rows = server.sidebar_rows(&server.clients[&client], 36, 1_100);
+            assert!(rows.iter().any(|row| matches!(row,
+                SideRow::Entry { item: Some(SideItem::Account(id)), line, .. }
+                if id == &accounts[0].id && line.spans[0].content == " ● "
+                    && line.spans[0].style.fg == Some(th().state_color(state)))));
+        }
+        server.panes.clear();
+        let rows = server.sidebar_rows(&server.clients[&client], 36, 1_100);
+        assert!(rows.iter().any(|row| matches!(row,
+            SideRow::Entry { item: Some(SideItem::Account(id)), line, .. }
+            if id == &accounts[0].id && line.to_string() == " ○ Claude · patron.bzh")));
+    }
+
+    #[test]
+    fn cached_account_sidebar_rows_follow_theme_changes() {
+        if !crate::testing::in_own_process("server::render::tests::cached_account_sidebar_rows_follow_theme_changes") {
+            return;
+        }
+        let (tx, _rx) = super::super::queue::channel(32);
+        let mut server = super::super::tests::server(tx);
+        let (client, _peer) = super::super::tests::client(&mut server);
+        let mut account = server.accounts.get("claude", "default").unwrap();
+        account.name = "work".into();
+        account.sign_in_required = true;
+        let account = server.accounts.add(account).unwrap();
+        for theme in [
+            crate::theme::Theme::DEFAULT,
+            crate::theme::Theme { dim: Color::Blue, blocked: Color::Magenta, ..crate::theme::Theme::ASCII },
+        ] {
+            crate::theme::set(theme);
+            let rows = server.sidebar_rows(&server.clients[&client], 36, 1_000);
+            let y = rows
+                .iter()
+                .position(|row| {
+                    matches!(row,
+                SideRow::Entry { item: Some(SideItem::Account(id)), .. } if id == &account.id)
+                })
+                .unwrap() as u16;
+            let mut buf = Buffer::empty(Rect::new(0, 0, 28, 36));
+            Server::draw_sidebar(&rows, buf.area, &mut buf);
+            assert_eq!(buf[(2, y)].symbol(), if theme.ascii { "o" } else { "○" });
+            assert_eq!(buf[(2, y)].fg, theme.dim);
+            assert_eq!(buf[(4, y + 1)].fg, theme.blocked);
+        }
+    }
+
+    #[test]
+    fn account_sidebar_preserves_checking_sign_in() {
+        let (tx, _rx) = super::super::queue::channel(32);
+        let mut server = super::super::tests::server(tx);
+        let (client, _peer) = super::super::tests::client(&mut server);
+        server.existing_checks.insert("claude".into(), super::super::agents::ExistingCheck::Checking);
+        for (width, expected) in [(28, "Checking sign-in"), (12, "Checking")] {
+            server.config.sidebar.width = width;
+            let rows = server.sidebar_rows(&server.clients[&client], 36, 1_000);
+            let mut buf = Buffer::empty(Rect::new(0, 0, width, 36));
+            Server::draw_sidebar(&rows, buf.area, &mut buf);
+            assert!(crate::testing::buffer_text(&buf).contains(expected));
+        }
+    }
+
+    #[test]
+    fn account_sidebar_hover_marker_refreshes_and_selection_uses_the_same_row() {
+        let (tx, _rx) = super::super::queue::channel(32);
+        let mut server = super::super::tests::server(tx);
+        let (client, _peer) = super::super::tests::client(&mut server);
+        let (other_client, _other_peer) = super::super::tests::client(&mut server);
+        let mut account = server.accounts.get("claude", "default").unwrap();
+        account.name = "work".into();
+        let account = server.accounts.add(account).unwrap();
+        let y =
+            (0..36).find(|&y| server.sidebar_hit(client, y) == Some(SideItem::Account(account.id.clone()))).unwrap();
+        let mut buf = Buffer::empty(Rect::new(0, 0, 124, 36));
+        server.compose(client, 1_000, &mut buf);
+        assert_eq!(buf[(25, y)].symbol(), " ");
+        for row in [y, y + 1] {
+            server.client_input(client, format!("\x1b[<35;6;{}M", row + 1).as_bytes());
+            server.compose(client, 1_000, &mut buf);
+            assert_eq!(buf[(25, y)].symbol(), "⋮");
+            assert_ne!(buf[(25, y + 1)].symbol(), "⋮");
+            let mut fresh = Buffer::empty(buf.area);
+            Server::draw_sidebar(
+                &server.sidebar_rows(&server.clients[&client], 36, 1_000),
+                Rect::new(0, 0, 28, 36),
+                &mut fresh,
+            );
+            for y in 0..36 {
+                for x in 0..28 {
+                    assert_eq!(buf[(x, y)], fresh[(x, y)]);
+                }
+            }
+        }
+        let other = server.sidebar_rows(&server.clients[&other_client], 36, 1_000);
+        assert!(
+            other
+                .iter()
+                .all(|row| !matches!(row, SideRow::Entry { item: Some(SideItem::Account(_)), selected: true, .. }))
+        );
+        server.client_input(client, b"\x1b[<35;41;1M");
+        server.compose(client, 1_000, &mut buf);
+        assert_eq!(buf[(25, y)].symbol(), " ");
+        server.clients.get_mut(&client).unwrap().mode = server.account_details(&account.id);
+        let rows = server.sidebar_rows(&server.clients[&client], 36, 1_000);
+        Server::draw_sidebar(&rows, Rect::new(0, 0, 28, 36), &mut buf);
+        assert_eq!(buf[(25, y)].symbol(), "⋮");
+    }
+
+    #[test]
     fn sidebar_accounts_share_two_lines_and_keep_the_list_and_add_accessible() {
         use super::super::ui::{PickAction, PickItem};
         let items = vec![
@@ -2937,15 +3242,17 @@ mod tests {
             PickItem::new("Codex · home", "Sign-in required", PickAction::AccountDetails("home-id".into())),
             PickItem::new("+ Add account", "", PickAction::AddAccount),
         ];
-        let rows = account_rows(items.clone(), 20);
+        let (tx, _rx) = super::super::queue::channel(16);
+        let server = super::super::tests::server(tx);
+        let rows = server.account_rows(items.clone(), 20, 0);
         assert!(matches!(rows[0], SideRow::Section("ACCOUNTS")));
-        for (i, text) in [(1, "Claude · work"), (2, "57% used · 2 panes")] {
+        for (i, text) in [(1, " ○ Claude · work"), (2, "   57% used · 2 panes")] {
             let SideRow::Entry { item, line, .. } = &rows[i] else { panic!() };
             assert_eq!(item, &Some(SideItem::Account("work-id".into())));
             assert_eq!(line.to_string(), text);
         }
         assert!(matches!(&rows[5], SideRow::Entry { item: Some(SideItem::AddAccount), .. }));
-        let rows = account_rows(items, 2);
+        let rows = server.account_rows(items, 2, 0);
         assert_eq!(rows.len(), 2);
         assert!(matches!(rows[0], SideRow::Section("ACCOUNTS")));
         assert!(matches!(rows[1], SideRow::Entry { item: Some(SideItem::AddAccount), .. }));
@@ -2961,8 +3268,10 @@ mod tests {
                 .dim(),
             PickItem::new("+ Add account", "", PickAction::AddAccount),
         ];
+        let (tx, _rx) = super::super::queue::channel(16);
+        let server = super::super::tests::server(tx);
         for room in [3, 4, 5, 6, 20] {
-            let rows = account_rows(items.clone(), room);
+            let rows = server.account_rows(items.clone(), room, 0);
             assert!(rows.len() <= room);
             let SideRow::Entry { item, line, .. } = &rows[rows.len() - 2] else { panic!() };
             assert_eq!(item, &Some(SideItem::ReviewAccount(existing.id.clone())));
@@ -3006,7 +3315,8 @@ mod tests {
         let weekly = Some(Window { used_percent: 41.0, resets_at: Some(1_300) });
         server.usage.0.insert(account.key(), Usage { five_hour, weekly, observed_at: 1_000, ..Default::default() });
         let rows = |now| -> Vec<Line<'static>> {
-            account_rows(server.accounts_picker_at(None, now).items, 20)
+            server
+                .account_rows(server.accounts_picker_at(None, now).items, 20, now)
                 .into_iter()
                 .filter_map(|row| match row {
                     SideRow::Entry { line, .. } => Some(line),
@@ -3014,7 +3324,7 @@ mod tests {
                 })
                 .collect()
         };
-        let shown = |now| rows(now)[1].to_string();
+        let shown = |now| rows(now)[1].to_string().trim().to_string();
         for (from, until, figure) in
             [(1_000, Some(1_100), "93% used"), (1_100, Some(1_300), "41% used"), (1_300, None, "Last checked 5m ago")]
         {
