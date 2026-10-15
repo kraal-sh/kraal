@@ -536,6 +536,7 @@ impl Controller {
             message: format!(
                 "{server}'s file manager asks to list and copy files from {scope}.\nCopying into this laptop, moving and deleting are not yet available.\nAllow lasts until this kraal attach ends. Always is kept in ~/.config/kraal/laptop-files.toml."
             ),
+            transfer: None,
             files: String::new(),
             scroll: 0,
             buttons: vec!["Allow".into(), format!("Always for {}", crate::text::truncate(server, 24)), "Cancel".into()],

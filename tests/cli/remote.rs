@@ -1637,7 +1637,9 @@ fn palette_attachment_transfers_a_complete_batch_over_host_attach_and_keeps_it_a
     host.type_keys(b"\x02 Attach files\r");
     host.wait_for("Enter absolute local paths");
     host.type_keys(format!("'{}' {}\r", first.display(), second.display()).as_bytes());
-    host.wait_for("Sent 2 files to box");
+    host.wait_for("Sent to box");
+    host.wait_for("2 files");
+    host.wait_for("(100%)");
     let root = remote.root.join("state/kraal/attachments-v1").join(&remote.session);
     let batches: Vec<_> = std::fs::read_dir(&root).unwrap().map(|e| e.unwrap().path()).collect();
     assert_eq!(batches.len(), 1);
@@ -1656,7 +1658,7 @@ fn palette_attachment_transfers_a_complete_batch_over_host_attach_and_keeps_it_a
     host.type_keys(b"\x03");
     remote.wait_for_text("main", "CTRL_C_REACHED_PANE");
     wait_until(PATIENCE, "attachment success disappears", || {
-        !text_after(&host.written.lock().unwrap(), 100, 30).iter().any(|row| row.contains("Sent 2 files to box"))
+        !text_after(&host.written.lock().unwrap(), 100, 30).iter().any(|row| row.contains("Sent to box"))
     });
     host.type_keys(b"\x02d");
     assert_eq!(host.left("attachment detach").0, 0);
@@ -1720,7 +1722,9 @@ fn clipboard_images_use_local_private_storage_and_host_attachment_transport() {
         client.wait_for("Send reads the local clipboard once.");
         assert!(!log.exists(), "offering the action must not read the clipboard");
         client.type_keys(b"\r");
-        client.wait_for(if remote { "Sent the image to box" } else { "Sent the image to this machine" });
+        client.wait_for(if remote { "Sent to box" } else { "Sent to this machine" });
+        client.wait_for("clipboard.png");
+        client.wait_for("(100%)");
         let root = destination.root.join("state/kraal/attachments-v1").join(&destination.session);
         let batches: Vec<_> = std::fs::read_dir(&root).unwrap().map(|e| e.unwrap().path()).collect();
         assert_eq!(batches.len(), 1);
@@ -1860,7 +1864,9 @@ fn host_control_v_sends_agent_images_and_preserves_shell_local_and_text_clipboar
         text_after(&client.written.lock().unwrap(), 100, 30).iter().any(|row| row.contains("Always for box"))
     });
     client.type_keys(b"\t\r");
-    client.wait_for("Sent the image to box");
+    client.wait_for("Sent to box");
+    client.wait_for("clipboard.png");
+    client.wait_for("(100%)");
     wait_until(PATIENCE, "server image path pasted", || received().ends_with(b"clipboard.png"));
     let pasted = String::from_utf8(received()[before.len()..].to_vec()).unwrap();
     assert!(!pasted.contains('\x16'));
@@ -1873,7 +1879,9 @@ fn host_control_v_sends_agent_images_and_preserves_shell_local_and_text_clipboar
     let before = received().len();
     let mut client = attach(true);
     client.type_keys(b"\x16");
-    client.wait_for("Sent the image to box");
+    client.wait_for("Sent to box");
+    client.wait_for("clipboard.png");
+    client.wait_for("(100%)");
     wait_until(PATIENCE, "remembered image path pasted", || received().len() > before);
     assert!(!String::from_utf8_lossy(&client.written.lock().unwrap()).contains("Send the clipboard image"));
     assert_eq!(received().iter().filter(|&&b| b == 0x16).count(), 3);
@@ -1993,7 +2001,9 @@ fn host_pasted_paths_preserve_text_send_complete_batches_and_remember_revocable_
     host.type_keys(pasted.as_bytes());
     visible(&host, "Send 2 files to box?");
     host.type_keys(b"\t\r");
-    visible(&host, "Sent 2 files to box");
+    visible(&host, "Sent to box");
+    visible(&host, "2 files");
+    visible(&host, "(100%)");
     let permission = local.root.join("config/kraal/paste-files.toml");
     assert!(std::fs::read_to_string(&permission).unwrap().contains("pasted.invalid"));
     let batches = || {
@@ -2010,7 +2020,9 @@ fn host_pasted_paths_preserve_text_send_complete_batches_and_remember_revocable_
     }
     host.type_keys(pasted.as_bytes());
     wait_until(PATIENCE, "automatic second batch", || batches().len() == 2);
-    visible(&host, "Sent 2 files to box");
+    visible(&host, "Sent to box");
+    visible(&host, "2 files");
+    visible(&host, "(100%)");
     std::fs::remove_file(permission).unwrap();
     host.type_keys(pasted.as_bytes());
     visible(&host, "Send 2 files to box?");

@@ -304,8 +304,9 @@ or `xclip` for your desktop. macOS uses `osascript` to export the clipboard as P
 file. Each helper has a two-second timeout. Missing tools, an unavailable PNG representation,
 failed reads and images larger than **16 MiB** produce a visible failure without pasting a path.
 Save a larger image and use **Attach files**. A failure stays open with **Retry** and **Close**.
-Retry shows the local question again before reading the clipboard. Success says **Sent the image
-to SERVER** and disappears after four seconds.
+Retry shows the local question again before reading the clipboard. Success shows **Sent to SERVER**,
+the image filename, its final size and full progress bar, and **Path pasted into PANE.**
+It disappears after 1.5 seconds and passes typing to the pane.
 
 The image uses the same acknowledged attachment chunks, quotas, reserved target and paste
 protections as files. A local session also stores `clipboard.png` in its private session
@@ -326,11 +327,7 @@ opened for transfer. At 124 columns:
 │ capture one.png                                                                                  │
 │ notes.txt                                                                                        │
 │                                                                                                  │
-│                                                                                                  │
-│                                                                                                  │
 │  Send     Always for SERVER     Paste as text     Cancel                                         │
-│                                                                                                  │
-│                                                                                                  │
 │ Enter Send · Tab Choose · Esc Cancel                                                             │
 ╰──────────────────────────────────────────────────────────────────────────────────────────────────╯
 ```
@@ -343,11 +340,7 @@ At 80 columns:
 │ capture one.png                                                          │
 │ notes.txt                                                                │
 │                                                                          │
-│                                                                          │
-│                                                                          │
 │  Send     Always for SERVER     Paste as text     Cancel                 │
-│                                                                          │
-│                                                                          │
 │ Enter Send · Tab Choose · Esc Cancel                                     │
 ╰──────────────────────────────────────────────────────────────────────────╯
 ```
@@ -379,8 +372,8 @@ stream unchanged. A local session always pastes paths unchanged, including into 
 Use **Upload to this pane's server** or `kraal cp` for that topology.
 
 For a longer transfer, the choice is replaced after 200 ms by a box titled **Sending to SERVER**,
-with the filename (or file count), sent and total size, percentage, a progress bar, an
-animated spinner and a Cancel button. Progress updates at most five times per second.
+with the filename (or file count), sent and total size, percentage, a progress bar spanning
+the box beside an animated spinner and a Cancel button. Progress updates at most five times per second.
 The spinner keeps moving while waiting for the server. The ASCII theme uses ASCII spinner
 and bar characters:
 
@@ -388,16 +381,21 @@ and bar characters:
 Sending to SERVER
 2 files
 2.1 MiB / 3.2 MiB (66%)
-⠙ ▓▓▓▓▓░░░
+⠙ ▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓░░░░░░░░░░░░░░░░░░░░░░░░
 Typing waits until it finishes.
 
  Cancel
 Ctrl+C Cancel
 ```
 
-A short transfer goes directly to **Sent 2 files to SERVER**, without flashing progress.
-Success disappears after four seconds. Typing and Ctrl+C reach the pane as usual during that
-time. The client draws these boxes locally, above the bottom bar, and restores the covered
+Success shows **Sent to SERVER**, keeping the filename or file count, the final byte total at
+100% and the full bar with a done mark in place of the spinner. Its body ends with
+**Paths pasted into PANE.** (or **Path pasted into PANE.** for one file or an image).
+If focus changed, the existing warning to select the destination pane appears instead.
+A short transfer goes directly to this final state, without flashing progress.
+Success disappears after 1.5 seconds. Typing and Ctrl+C reach the pane as usual during that
+time. Boxes fit their content, with one blank row before the buttons and the key line directly
+below them. The client draws these boxes locally, above the bottom bar, and restores the covered
 frames and pane content when they close. Files stay in their original order, and all remote
 paths go together to the chosen pane after the whole batch succeeds. A failure retains the
 original text and offers **Retry**, **Paste as text**, and **Close** until answered. Retry
@@ -418,7 +416,7 @@ and incomplete files, with a clear result. After failure, further typing is held
 the result is closed or another choice is selected, so the tail of a large paste cannot reach
 the pane. If focus changed, the paths still go to the chosen pane but queued typing is discarded;
 the result asks you to select that pane before typing again. Retry returns to a local choice.
-Success disappears after four seconds and never captures Ctrl+C. Ctrl+C cancels only while a
+Success disappears after 1.5 seconds and never captures Ctrl+C. Ctrl+C cancels only while a
 local choice is open or a transfer is running; on a failure box, it closes the box.
 
 The defaults are 64 MiB per file, 128 MiB per batch, 32 files and 1 GiB per session. All four

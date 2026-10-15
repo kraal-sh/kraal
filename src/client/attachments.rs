@@ -23,6 +23,7 @@ use crate::protocol::{self, ClientMsg, ServerMsg};
 use crate::theme::NoticeKind;
 
 const PROGRESS_INTERVAL: Duration = Duration::from_millis(200);
+const SUCCESS_DURATION: Duration = Duration::from_millis(1500);
 
 type Writer = Arc<Mutex<Option<Box<dyn Write + Send>>>>;
 
@@ -50,25 +51,59 @@ struct Active {
 }
 
 impl Active {
-    fn status(&self, theme: crate::theme::Theme, now: Instant) -> String {
+    fn spinner(&self, theme: crate::theme::Theme, now: Instant) -> char {
         let frames = if theme.ascii {
             &['|', '/', '-', '\\'][..]
         } else {
             &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'][..]
         };
         let frame = (now.saturating_duration_since(self.started).as_millis() / PROGRESS_INTERVAL.as_millis()) as usize;
-        let spinner = frames[frame % frames.len()];
-        let Some((received, total)) = self.progress else {
-            return format!("{spinner} Preparing attachment.\nTyping waits until it finishes.");
-        };
-        let percent = (received.saturating_mul(100)).checked_div(total).unwrap_or(100).min(100);
-        let label: String = self.label.chars().filter(|c| !c.is_control()).collect();
+        frames[frame % frames.len()]
+    }
+
+    fn status(&self, theme: crate::theme::Theme, now: Instant) -> String {
+        if self.progress.is_none() {
+            format!("{} Preparing attachment.\nTyping waits until it finishes.", self.spinner(theme, now))
+        } else {
+            "Typing waits until it finishes.".into()
+        }
+    }
+
+    fn transfer(&self, theme: crate::theme::Theme, now: Instant, done: bool) -> Option<TransferProgress> {
+        let (received, total) = self.progress?;
+        Some(TransferProgress {
+            label: self.label.chars().filter(|c| !c.is_control()).collect(),
+            received: if done { total } else { received },
+            total,
+            marker: if done { if theme.ascii { 'v' } else { '✓' } } else { self.spinner(theme, now) },
+            ascii: theme.ascii,
+        })
+    }
+}
+
+#[derive(Clone)]
+pub(super) struct TransferProgress {
+    label: String,
+    received: u64,
+    total: u64,
+    marker: char,
+    ascii: bool,
+}
+
+impl TransferProgress {
+    fn message(&self, width: usize) -> String {
+        let percent = (self.received.saturating_mul(100)).checked_div(self.total).unwrap_or(100).min(100);
+        let bar_width = width.saturating_sub(2);
+        let filled = (percent as usize * bar_width + 50) / 100;
+        let (on, off) = if self.ascii { ("#", "-") } else { ("▓", "░") };
         format!(
-            "{}\n{} / {} ({percent}%)\n{spinner} {}\nTyping waits until it finishes.",
-            crate::text::truncate(&label, 64),
-            crate::text::human_size(received),
-            crate::text::human_size(total),
-            theme.bar(percent as f64),
+            "{}\n{} / {} ({percent}%)\n{} {}{}",
+            crate::text::truncate(&self.label, 64),
+            crate::text::human_size(self.received),
+            crate::text::human_size(self.total),
+            self.marker,
+            on.repeat(filled),
+            off.repeat(bar_width - filled),
         )
     }
 }
@@ -105,6 +140,9 @@ struct State {
     workers: Vec<Receiver<()>>,
     status: Option<String>,
     success_until: Option<Instant>,
+    completed: Option<TransferProgress>,
+    displayed: Option<TransferProgress>,
+    drawn_area: Option<Rect>,
     status_kind: NoticeKind,
     uncertain: Option<String>,
     result_token: Option<String>,
@@ -401,13 +439,15 @@ impl Controller {
             state.parser.flush();
             return;
         }
+        let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
+        let screen = Rect::new(0, 0, cols, rows.saturating_sub(1));
         for (index, byte) in bytes.iter().enumerate() {
             let events = state.parser.feed(std::slice::from_ref(byte));
             let cancel = events.iter().any(|event| match event {
                 InputEvent::Key(key) => key.code == KeyCode::Char('c') && key.mods.ctrl,
                 InputEvent::Mouse(mouse) => {
                     mouse.kind == crate::input::MouseKind::Press(crate::input::MouseButton::Left)
-                        && self.button_at(&state, mouse.col, mouse.row).is_some()
+                        && self.button_at(&state, screen, mouse.col, mouse.row).is_some()
                 }
                 _ => false,
             });
@@ -464,13 +504,21 @@ impl Controller {
 
     fn draw_with(&self, cols: u16, rows: u16, write: impl FnOnce(&[u8])) {
         // Keep the snapshot and its terminal write ordered with state changes and other draws.
-        let state = self.state.lock().unwrap();
+        let mut state = self.state.lock().unwrap();
         if let Some(view) = state.view(&self.host()) {
             let (buf, _) = view.render(Rect::new(0, 0, cols, rows.saturating_sub(1)));
-            write(&crate::ansi::overlay(&buf));
+            write(&self.overlay(&mut state, &buf));
         } else {
+            state.drawn_area = None;
             write(&state.image_notices.render(cols, rows));
         }
+    }
+
+    fn overlay(&self, state: &mut State, buf: &Buffer) -> Vec<u8> {
+        if state.drawn_area.replace(buf.area).is_some_and(|previous| previous.intersection(buf.area) != previous) {
+            self.redraw();
+        }
+        crate::ansi::overlay(buf)
     }
 
     pub fn output(&self, bytes: &[u8]) -> std::io::Result<bool> {
@@ -487,9 +535,12 @@ impl Controller {
     ) -> std::io::Result<bool> {
         // A server frame and the local question are one write, so incoming output cannot
         // briefly replace the question while a local key is authorizing a transfer.
-        let state = self.state.lock().unwrap();
+        let mut state = self.state.lock().unwrap();
         let view = state.view(&self.host());
         let notice = state.image_notices.render(cols, rows);
+        if view.is_none() {
+            state.drawn_area = None;
+        }
         if view.is_none() && notice.is_empty() {
             return write(bytes);
         }
@@ -500,7 +551,7 @@ impl Controller {
         }
         if let Some(view) = view {
             let (buf, _) = view.render(Rect::new(0, 0, cols, rows.saturating_sub(1)));
-            out.extend(crate::ansi::overlay(&buf));
+            out.extend(self.overlay(&mut state, &buf));
         } else {
             out.extend(notice);
         }
@@ -508,9 +559,8 @@ impl Controller {
         write(&out)
     }
 
-    fn button_at(&self, state: &State, col: u16, row: u16) -> Option<usize> {
-        let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
-        let (_, buttons) = state.view(&self.host())?.render(Rect::new(0, 0, cols, rows.saturating_sub(1)));
+    fn button_at(&self, state: &State, screen: Rect, col: u16, row: u16) -> Option<usize> {
+        let (_, buttons) = state.view(&self.host())?.render(screen);
         buttons.iter().position(|area| area.contains((col, row).into()))
     }
 
@@ -554,6 +604,7 @@ impl Controller {
             return;
         }
         state.success_until = None;
+        state.completed = None;
         state.status = None;
         state.result_token = None;
         drop(state);
@@ -658,6 +709,11 @@ impl Controller {
                 if !active && !prompt && !uncertain && !dropped {
                     return;
                 }
+                let completed = state
+                    .active
+                    .as_ref()
+                    .filter(|a| a.token == token)
+                    .and_then(|a| a.transfer(crate::theme::current(), Instant::now(), true));
                 if active && let Some(active) = state.active.take() {
                     active.cancelled.store(true, Ordering::SeqCst);
                     if let Some(failure) = active.failure {
@@ -674,25 +730,30 @@ impl Controller {
                 if pasted && dropped {
                     let drop = state.dropped.take().unwrap();
                     if !message.is_empty() {
-                        let summary = if message.starts_with("Text submitted") {
+                        let text = message.starts_with("Text submitted");
+                        let summary = if text {
                             "Text pasted".into()
                         } else if !self.remote && !drop.image {
                             "Paths pasted".into()
-                        } else if drop.image {
-                            format!("Sent the image to {}", self.host())
+                        } else {
+                            format!("Sent to {}", self.host())
+                        };
+                        let destination = if message.contains("Focus changed") {
+                            format!("Focus changed. Select {} before typing again.", pane_name(&drop.target))
                         } else {
                             format!(
-                                "Sent {} {} to {}",
-                                drop.paths.len(),
-                                if drop.paths.len() == 1 { "file" } else { "files" },
-                                self.host()
+                                "{} pasted into {}.",
+                                if text {
+                                    "Text"
+                                } else if drop.image || drop.paths.len() == 1 {
+                                    "Path"
+                                } else {
+                                    "Paths"
+                                },
+                                pane_name(&drop.target)
                             )
                         };
-                        message = if message.contains("Focus changed") {
-                            format!("{summary}\nFocus changed. Select {} before typing again.", pane_name(&drop.target))
-                        } else {
-                            summary
-                        };
+                        message = format!("{summary}\n{destination}");
                     }
                 } else if dropped {
                     let drop = state.dropped.as_mut().unwrap();
@@ -708,7 +769,8 @@ impl Controller {
                         // A successful paste may have discarded queued input after a focus change.
                         // Release the server's input hold before forwarding any new local keys.
                         let _ = send(&self.writer, &ClientMsg::AttachmentDismiss { token: token.clone() });
-                        state.success_until = Some(Instant::now() + Duration::from_secs(4));
+                        state.success_until = Some(Instant::now() + SUCCESS_DURATION);
+                        state.completed = completed;
                         state.parser = InputParser::new();
                         success = true;
                     } else {
@@ -721,6 +783,9 @@ impl Controller {
             }
             _ => {}
         }
+        if repaint {
+            state.drawn_area = None;
+        }
         drop(state);
         if repaint {
             self.redraw();
@@ -729,7 +794,7 @@ impl Controller {
         if success {
             let this = Arc::downgrade(self);
             let _ = crate::threads::named("attachment-notice").spawn(move || {
-                std::thread::sleep(Duration::from_secs(4));
+                std::thread::sleep(SUCCESS_DURATION);
                 if let Some(this) = this.upgrade() {
                     this.expire_success(Instant::now());
                 }
@@ -739,6 +804,11 @@ impl Controller {
 
     /// True when the local form consumed the input. Normal typing stays on the same wire.
     pub fn keys(self: &Arc<Self>, bytes: &[u8]) -> bool {
+        let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
+        self.keys_with_screen(bytes, Rect::new(0, 0, cols, rows.saturating_sub(1)))
+    }
+
+    fn keys_with_screen(self: &Arc<Self>, bytes: &[u8], screen: Rect) -> bool {
         let mut state = self.state.lock().unwrap();
         if state.dropped.is_some() && state.active.is_none() && state.uncertain.is_none() {
             if state.dropped.as_ref().is_some_and(|d| !d.ready && !d.result) {
@@ -754,7 +824,7 @@ impl Controller {
                 for event in events {
                     if let InputEvent::Mouse(mouse) = event {
                         if mouse.kind == crate::input::MouseKind::Press(crate::input::MouseButton::Left) {
-                            action = self.button_at(&state, mouse.col, mouse.row);
+                            action = self.button_at(&state, screen, mouse.col, mouse.row);
                             action = action.map(|index| state.dropped.as_ref().unwrap().action(index));
                         }
                         if action.is_some() {
@@ -765,9 +835,7 @@ impl Controller {
                     }
                     let InputEvent::Key(key) = event else { continue };
                     if matches!(key.code, KeyCode::Up | KeyCode::Down | KeyCode::PageUp | KeyCode::PageDown) {
-                        let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
-                        let layout =
-                            state.view(&self.host()).unwrap().layout(Rect::new(0, 0, cols, rows.saturating_sub(1)));
+                        let layout = state.view(&self.host()).unwrap().layout(screen);
                         let dropped = state.dropped.as_mut().unwrap();
                         let step = if matches!(key.code, KeyCode::PageUp | KeyCode::PageDown) {
                             layout.file_rows.max(1)
@@ -835,7 +903,7 @@ impl Controller {
                         }
                         InputEvent::Mouse(mouse) => {
                             mouse.kind == crate::input::MouseKind::Press(crate::input::MouseButton::Left)
-                                && self.button_at(&state, mouse.col, mouse.row).is_some()
+                                && self.button_at(&state, screen, mouse.col, mouse.row).is_some()
                         }
                         _ => false,
                     })
@@ -851,10 +919,7 @@ impl Controller {
             }
             return false;
         }
-        let clicked = state.prompt.as_ref().map(|_| {
-            let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
-            state.view(&self.host()).unwrap().render(Rect::new(0, 0, cols, rows.saturating_sub(1))).1
-        });
+        let clicked = state.prompt.as_ref().map(|_| state.view(&self.host()).unwrap().render(screen).1);
         let Some(prompt) = state.prompt.as_mut() else { return false };
         let mut submit = false;
         let mut tail = &bytes[bytes.len()..];
@@ -1007,6 +1072,7 @@ impl Controller {
             failure: None,
         });
         state.status = None;
+        state.displayed = None;
         state.parser = InputParser::new();
         drop(state);
         self.start_progress(prompt.token.clone());
@@ -1217,11 +1283,13 @@ impl Controller {
             return true;
         }
         active.last_draw = Some(now);
-        state.status = Some(active.status(crate::theme::current(), now));
+        let status = active.status(crate::theme::current(), now);
+        state.displayed = active.transfer(crate::theme::current(), now, false);
+        state.status = Some(status);
         state.status_kind = NoticeKind::Notice;
         if let Some(view) = state.view(&self.host()) {
             let (buf, _) = view.render(Rect::new(0, 0, cols, rows.saturating_sub(1)));
-            write(&crate::ansi::overlay(&buf));
+            write(&self.overlay(&mut state, &buf));
         }
         true
     }
@@ -1372,6 +1440,7 @@ pub(super) struct View {
     pub(super) kind: NoticeKind,
     pub(super) error_start: Option<usize>,
     pub(super) message: String,
+    pub(super) transfer: Option<TransferProgress>,
     pub(super) files: String,
     pub(super) scroll: usize,
     pub(super) buttons: Vec<String>,
@@ -1386,6 +1455,7 @@ impl State {
             kind: NoticeKind::Notice,
             error_start: None,
             message: String::new(),
+            transfer: None,
             files: String::new(),
             scroll: 0,
             buttons: Vec::new(),
@@ -1393,6 +1463,7 @@ impl State {
             keys: Vec::new(),
         };
         if self.active.is_some() {
+            view.transfer = self.displayed.clone();
             view.title = format!("Sending to {host}");
             view.message = self.status.clone()?;
             view.buttons = vec!["Cancel".into()];
@@ -1491,12 +1562,19 @@ impl State {
         } else if let Some(status) = &self.status {
             view.kind = self.status_kind;
             view.title = if self.success_until.is_some() {
-                status.lines().next().unwrap_or(status).into()
+                if self.completed.is_some() { format!("Sent to {host}") } else { "Attachment complete".into() }
             } else {
                 "Attachment".into()
             };
             if self.success_until.is_some() {
-                view.message = status.lines().skip(1).collect::<Vec<_>>().join("\n");
+                view.transfer = self.completed.clone();
+                view.message =
+                    if let Some((title, body)) = status.split_once('\n').filter(|(_, body)| !body.trim().is_empty()) {
+                        view.title = title.into();
+                        body.into()
+                    } else {
+                        status.clone()
+                    };
             }
             if self.success_until.is_none() {
                 view.message = status.clone();
@@ -1537,22 +1615,34 @@ impl View {
     fn layout(&self, screen: Rect) -> ViewLayout {
         let width = screen.width.saturating_sub(4).min(100);
         let text_width = width.saturating_sub(4) as usize;
-        let message = crate::text::wrap(&self.message, text_width);
-        let files = self.files.lines().flat_map(|line| crate::text::fold(line, text_width)).collect::<Vec<_>>();
-        let height = if self.buttons.is_empty() {
-            4
+        let content = if let Some(transfer) = &self.transfer {
+            format!("{}\n{}", transfer.message(text_width), self.message)
         } else {
-            (message.len() + files.len() + 7).max(12).min(screen.height.saturating_sub(2) as usize) as u16
+            self.message.clone()
         };
+        let message = crate::text::wrap(&content, text_width);
+        let files = self.files.lines().flat_map(|line| crate::text::fold(line, text_width)).collect::<Vec<_>>();
+        let mut button_rows = 0;
+        let mut used = 0;
+        for label in &self.buttons {
+            let width = crate::text::columns(label).min(text_width.saturating_sub(2)) + 2;
+            if button_rows == 0 || used + width > text_width {
+                button_rows += 1;
+                used = 0;
+            }
+            used += width + 3;
+        }
+        let base = if button_rows == 0 { 2 } else { 4 + button_rows };
+        let height = (message.len() + files.len() + base).min(screen.height.saturating_sub(2) as usize) as u16;
         let area = overlays::centered(screen, width, height);
-        let body = area.height.saturating_sub(if self.buttons.is_empty() { 2 } else { 7 }) as usize;
+        let body = area.height.saturating_sub(base as u16) as usize;
         let mut file_rows = body.saturating_sub(message.len());
         if files.len() > file_rows {
             file_rows = file_rows.saturating_sub(1);
         }
         let max_scroll = files.len().saturating_sub(file_rows);
         let error_start = self.error_start.map(|start| crate::text::wrap(&self.message[..start], text_width).len());
-        ViewLayout { area, message, error_start, files, file_rows, max_scroll }
+        ViewLayout { area, message, error_start, files, file_rows, max_scroll, body, button_rows: button_rows as u16 }
     }
 
     pub(super) fn render(&self, screen: Rect) -> (Buffer, Vec<Rect>) {
@@ -1572,7 +1662,7 @@ impl View {
         let width = inner.width.saturating_sub(2);
         let x = inner.x + 1;
         let mut bx = x;
-        let mut by = inner.bottom().saturating_sub(4);
+        let mut by = inner.bottom().saturating_sub(1 + layout.button_rows);
         for (index, label) in self.buttons.iter().enumerate() {
             let label = crate::text::truncate(label, width.saturating_sub(2) as usize);
             let w = crate::text::columns(&label) as u16 + 2;
@@ -1594,7 +1684,7 @@ impl View {
             buttons.push(rect);
             bx += w + 3;
         }
-        let body = if self.buttons.is_empty() { inner.height } else { inner.height.saturating_sub(5) } as usize;
+        let body = layout.body;
         let scroll = self.scroll.min(layout.max_scroll);
         for (row, line) in
             layout.message.iter().chain(layout.files.iter().skip(scroll).take(layout.file_rows)).take(body).enumerate()
@@ -1628,7 +1718,9 @@ impl View {
                 }
             })
             .collect();
-        buf.set_line(x, inner.bottom() - 1, &overlays::key_line(&keys, "", width), width);
+        if !keys.is_empty() {
+            buf.set_line(x, inner.bottom() - 1, &overlays::key_line(&keys, "", width), width);
+        }
         (buf, buttons)
     }
 }
@@ -1640,6 +1732,8 @@ struct ViewLayout {
     files: Vec<String>,
     file_rows: usize,
     max_scroll: usize,
+    body: usize,
+    button_rows: u16,
 }
 
 fn send(writer: &Writer, msg: &ClientMsg) -> Result<()> {
@@ -1744,7 +1838,14 @@ mod tests {
                         active.label = label.into();
                         active.progress = Some((4 * 1048576 * percent / 100, 4 * 1048576));
                         state.status = Some(active.status(theme, started + PROGRESS_INTERVAL));
-                        let (buf, buttons) = state.view("SERVER").unwrap().render(Rect::new(0, 0, cols, 23));
+                        let mut view = state.view("SERVER").unwrap();
+                        view.transfer =
+                            state.active.as_ref().unwrap().transfer(theme, started + PROGRESS_INTERVAL, false);
+                        let (buf, buttons) = view.render(Rect::new(0, 0, cols, 35));
+                        assert_eq!(buf.area.height, 9);
+                        let bar_width = buf.area.width as usize - 6;
+                        let filled = (percent as usize * bar_width + 50) / 100;
+                        let (on, off) = if theme.ascii { ("#", "-") } else { ("▓", "░") };
                         let text = buf
                             .content
                             .chunks(buf.area.width as usize)
@@ -1755,7 +1856,12 @@ mod tests {
                             "Sending to SERVER".to_string(),
                             label.into(),
                             format!("{} / 4.0 MiB ({percent}%)", crate::text::human_size(4 * 1048576 * percent / 100)),
-                            format!("{} {}", if theme.ascii { "/" } else { "⠙" }, theme.bar(percent as f64)),
+                            format!(
+                                "{} {}{}",
+                                if theme.ascii { "/" } else { "⠙" },
+                                on.repeat(filled),
+                                off.repeat(bar_width - filled)
+                            ),
                             "Typing waits until it finishes.".into(),
                             "Ctrl+C Cancel".into(),
                         ] {
@@ -1793,6 +1899,77 @@ mod tests {
     }
 
     #[test]
+    fn incoming_output_reuses_progress_until_the_next_tick() {
+        let (client, _peer, started) = progress_client();
+        client.state.lock().unwrap().active.as_mut().unwrap().progress = None;
+        for millis in [200, 400] {
+            let mut displayed = Vec::new();
+            client.draw_progress_with("ab", started + Duration::from_millis(millis), 80, 24, |out| {
+                displayed.extend_from_slice(out);
+            });
+            client.progress("ab", millis * 1024, 4 * 1048576);
+            client.draw_progress_with("ab", started + Duration::from_millis(millis + 199), 80, 24, |_| {
+                panic!("progress must wait for its next tick");
+            });
+            client
+                .output_with(b"\x1b[1;1Hpane output", 80, 24, |out| {
+                    let mut expected = b"\x1b[?2026h\x1b[1;1Hpane output".to_vec();
+                    expected.extend_from_slice(&displayed);
+                    expected.extend_from_slice(b"\x1b[?2026l");
+                    assert_eq!(out, expected, "incoming output must reuse the entire displayed snapshot");
+                    Ok(true)
+                })
+                .unwrap();
+        }
+        client.draw_progress_with("ab", started + Duration::from_millis(600), 80, 24, |out| {
+            assert!(String::from_utf8_lossy(out).contains("400 KiB / 4.0 MiB (9%)"));
+        });
+    }
+
+    #[test]
+    fn clearing_a_validation_error_repaints_uncovered_pane_content() {
+        use alacritty_terminal::event::VoidListener;
+        use alacritty_terminal::index::{Column, Line};
+        use alacritty_terminal::term::{Config, Term};
+        use alacritty_terminal::vte::ansi::Processor;
+
+        let (client, mut peer) = controller(false);
+        let mut terminal = Term::new(Config::default(), &Size(80, 24), VoidListener);
+        let mut parser: Processor = Processor::new();
+        let background = (1..=24).map(|row| format!("\x1b[{row};1H{}", "p".repeat(80))).collect::<String>();
+        parser.advance(&mut terminal, background.as_bytes());
+        client.message(ServerMsg::AttachmentOffer {
+            token: "ab".into(),
+            target: "pane".into(),
+            limits: Default::default(),
+        });
+        assert!(client.keys(b"\r"));
+        client.draw_with(80, 24, |out| parser.advance(&mut terminal, out));
+        let previous = client.state.lock().unwrap().drawn_area.unwrap();
+        assert_eq!(previous.height, 10);
+        assert_eq!(terminal.grid()[Line(previous.y as i32)][Column(previous.x as usize)].c, '╭');
+        assert!(client.keys(b"\x15"));
+        assert!(matches!(read(&mut peer), ClientMsg::Repaint));
+        client
+            .output_with(background.as_bytes(), 80, 24, |out| {
+                parser.advance(&mut terminal, out);
+                Ok(true)
+            })
+            .unwrap();
+        let current = client.state.lock().unwrap().drawn_area.unwrap();
+        assert_eq!(current.height, 8);
+        for row in previous.y..previous.bottom() {
+            for col in previous.x..previous.right() {
+                if !current.contains((col, row).into()) {
+                    assert_eq!(terminal.grid()[Line(row as i32)][Column(col as usize)].c, 'p');
+                }
+            }
+        }
+        assert_eq!(terminal.grid()[Line(current.y as i32)][Column(current.x as usize)].c, '╭');
+        assert!(peer.incoming.try_recv().is_err());
+    }
+
+    #[test]
     fn acknowledgements_do_not_wait_for_terminal_redraw() {
         let (client, _peer, started) = progress_client();
         client.draw_progress_with("ab", started + PROGRESS_INTERVAL, 80, 24, |_| {});
@@ -1818,6 +1995,7 @@ mod tests {
                 let mut frames = Vec::new();
                 client.draw_progress_with("ab", started + elapsed, 80, 24, |bytes| frames.push(bytes.to_vec()));
                 assert_eq!(frames.len(), usize::from(elapsed == PROGRESS_INTERVAL));
+                client.progress("ab", 8 * 1048576, 8 * 1048576);
                 let result = if pasted { "Files received." } else { "Transfer interrupted." };
                 client.message(ServerMsg::AttachmentResult {
                     token: "ab".into(),
@@ -1832,6 +2010,9 @@ mod tests {
                 client.draw_with(80, 24, |bytes| {
                     let text = String::from_utf8_lossy(bytes);
                     assert!(text.contains(result));
+                    if pasted {
+                        assert!(text.contains("8.0 MiB / 8.0 MiB (100%)"));
+                    }
                     assert!(!text.contains("Sending to") && !text.contains("Ctrl+C Cancel"));
                 });
                 assert!(!client.draw_progress_with("ab", started + Duration::from_secs(1), 80, 24, |_| {
@@ -1854,7 +2035,7 @@ mod tests {
                 [(0, 0, "0 B / 0 B (100%)"), (0, 3, "0 B / 3 B (0%)"), (512, 1024, "512 B / 1.0 KiB (50%)")]
             {
                 active.progress = Some((received, total));
-                let status = active.status(theme, started);
+                let status = active.transfer(theme, started, false).unwrap().message(72);
                 assert!(status.contains(expected));
                 let label = status.lines().next().unwrap();
                 assert!(!label.contains('\x1b'));
@@ -2509,16 +2690,18 @@ mod tests {
     fn long_filenames_scroll_without_hiding_destination_or_validation_error() {
         let root = std::env::temp_dir().join(format!("kraal-long-names-{}", std::process::id()));
         std::fs::create_dir_all(&root).unwrap();
-        let paths: Vec<_> = (0..6).map(|i| root.join(format!("{i}{}-end.txt", "x".repeat(190)))).collect();
+        let paths: Vec<_> = (0..32).map(|i| root.join(format!("{i}{}-end.txt", "x".repeat(190)))).collect();
         for path in &paths {
             std::fs::write(path, b"abc").unwrap();
         }
-        for count in [2, 6] {
+        for (cols, count) in [124, 80].into_iter().flat_map(|cols| [2, 32].map(|count| (cols, count))) {
             let (client, mut peer) = controller(true);
             let original = paths[..count].iter().map(|p| p.to_str().unwrap()).collect::<Vec<_>>().join(" ");
             let expected: Vec<_> = paths[..count]
                 .iter()
-                .flat_map(|p| crate::text::fold(p.file_name().unwrap().to_str().unwrap(), 72))
+                .flat_map(|p| {
+                    crate::text::fold(p.file_name().unwrap().to_str().unwrap(), if cols == 124 { 96 } else { 72 })
+                })
                 .collect();
             prepare_drop(&client, &mut peer, original.as_bytes());
             {
@@ -2529,7 +2712,7 @@ mod tests {
             }
             client.input(b"\r");
             assert!(client.state.lock().unwrap().active.is_none());
-            let screen = Rect::new(0, 0, 80, 23);
+            let screen = Rect::new(0, 0, cols, 23);
             let mut seen = std::collections::HashSet::new();
             let mut previous = None;
             loop {
@@ -2551,7 +2734,7 @@ mod tests {
                         seen.insert(line.clone());
                     }
                 }
-                if count == 6 {
+                if count == 32 {
                     assert!(layout.max_scroll > 0);
                     assert!(shown.contains("PgUp/PgDn: filenames"));
                 }
@@ -2561,10 +2744,10 @@ mod tests {
                 }
                 previous = Some(view.scroll);
                 drop(state);
-                client.input(b"\x1b[6~");
+                client.keys_with_screen(b"\x1b[6~", screen);
             }
-            client.input(b"\x1b[5~");
-            if count == 6 {
+            client.keys_with_screen(b"\x1b[5~", screen);
+            if count == 32 {
                 assert!(client.state.lock().unwrap().dropped.as_ref().unwrap().scroll < previous.unwrap());
             }
         }
@@ -3402,6 +3585,9 @@ mod tests {
                 client.expire_success(Instant::now());
             } else {
                 client.keys(if phase == "progress" { b"\x03" } else { b"\x1b" });
+                if phase == "failure" {
+                    assert!(matches!(read(&mut peer), ClientMsg::Repaint));
+                }
                 client.keys(&[]);
                 let message = read(&mut peer);
                 if phase == "failure" {
@@ -3440,38 +3626,232 @@ mod tests {
     }
 
     #[test]
-    fn mouse_choices_and_progress_cancellation_use_the_displayed_buttons() {
-        let path = dropped_file("mouse");
-        for progress in [false, true] {
-            let (client, mut peer) = controller(true);
-            let token = prepare_drop(&client, &mut peer, path.to_str().unwrap().as_bytes());
-            let cancelled = Arc::new(AtomicBool::new(false));
-            if progress {
-                let mut state = client.state.lock().unwrap();
-                state.active = Some(Active {
-                    token: token.clone(),
-                    cancelled: cancelled.clone(),
-                    ack: bounded(2).0,
-                    started: Instant::now(),
-                    last_draw: None,
-                    label: String::new(),
-                    progress: None,
-                    failure: None,
-                });
-                state.status = Some("0.0 / 3.2 MiB (0%)".into());
-            }
-            let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
-            let (_, buttons) =
-                client.state.lock().unwrap().view("this machine").unwrap().render(Rect::new(0, 0, cols, rows - 1));
-            let rect = buttons[if progress { 0 } else { 2 }];
-            client.keys(format!("\x1b[<0;{};{}M", rect.x + 1, rect.y + 1).as_bytes());
-            if progress {
-                assert!(matches!(read(&mut peer), ClientMsg::AttachmentCancel { token: sent } if sent == token));
-                assert!(cancelled.load(Ordering::SeqCst));
-            } else {
-                assert!(matches!(read(&mut peer), ClientMsg::AttachmentText { token: sent, .. } if sent == token));
+    fn compact_boxes_and_every_button_at_124_and_80_columns() {
+        if !crate::testing::in_own_process(
+            "client::attachments::tests::compact_boxes_and_every_button_at_124_and_80_columns",
+        ) {
+            return;
+        }
+        let root = crate::testing::TempDir::new("attachment-buttons");
+        let path = root.0.join("capture.png");
+        std::fs::write(&path, b"image").unwrap();
+        #[cfg(not(target_os = "macos"))]
+        let (tool, script) = ("wl-paste", "#!/bin/sh\nprintf '\\211PNG\\r\\n\\032\\n'\n");
+        #[cfg(target_os = "macos")]
+        let (tool, script) =
+            ("osascript", "#!/bin/sh\nfor arg; do file=$arg; done\nprintf '\\211PNG\\r\\n\\032\\n' > \"$file\"\n");
+        crate::testing::write_script(&root.0.join(tool), script);
+        // This isolated test has not started workers yet.
+        unsafe {
+            std::env::set_var("PATH", &root.0);
+            std::env::set_var("WAYLAND_DISPLAY", "test");
+            std::env::remove_var("DISPLAY");
+        }
+        for cols in [124, 80] {
+            for (phase, height, labels, expected) in [
+                ("question", 7, vec!["Send", "Always for this machine", "Paste as text", "Cancel"], "capture.png"),
+                ("image", 6, vec!["Send", "Cancel"], "Its path on this machine goes to Claude."),
+                (
+                    "shortcut",
+                    6,
+                    vec!["Send", "Always for this machine", "Cancel"],
+                    "Its path on this machine goes to Claude.",
+                ),
+                ("prompt", 8, vec!["Send", "Cancel"], "Enter absolute local paths, quoting spaces."),
+                ("image prompt", 7, vec!["Send", "Cancel"], "Send reads the local clipboard once."),
+                ("progress", 9, vec!["Cancel"], "0 B / 4.0 MiB (0%)"),
+                (
+                    "failure",
+                    6,
+                    vec!["Retry", "Paste as text", "Close"],
+                    "Transfer interrupted. Choose Retry to try again.",
+                ),
+                ("image failure", 6, vec!["Retry", "Close"], "Transfer interrupted. Choose Retry to try again."),
+                ("result", 6, vec!["Close"], "No paths pasted. Close and try again."),
+            ] {
+                for index in 0..labels.len() {
+                    let (client, mut peer) = controller(true);
+                    let token = prepare_drop(&client, &mut peer, path.to_str().unwrap().as_bytes());
+                    {
+                        let mut state = client.state.lock().unwrap();
+                        if phase.contains("image") || phase == "shortcut" {
+                            let dropped = state.dropped.as_mut().unwrap();
+                            dropped.image = true;
+                            dropped.shortcut = phase == "shortcut";
+                            dropped.paths.clear();
+                        }
+                        if phase.contains("prompt") {
+                            state.dropped = None;
+                            state.prompt = Some(Prompt {
+                                image: phase == "image prompt",
+                                token: token.clone(),
+                                target: "Claude".into(),
+                                limits: Default::default(),
+                                text: path.to_str().unwrap().into(),
+                                cursor: 0,
+                                error: None,
+                                paste_failed: false,
+                                parser: InputParser::new(),
+                            });
+                        } else if phase == "progress" {
+                            state.active = Some(Active {
+                                token: token.clone(),
+                                cancelled: Arc::new(AtomicBool::new(false)),
+                                ack: bounded(2).0,
+                                started: Instant::now(),
+                                last_draw: None,
+                                label: "capture.png".into(),
+                                progress: Some((0, 4 * 1048576)),
+                                failure: None,
+                            });
+                            state.displayed =
+                                state.active.as_ref().unwrap().transfer(crate::theme::current(), Instant::now(), false);
+                            state.status = Some("Typing waits until it finishes.".into());
+                        } else if phase.contains("failure") {
+                            state.dropped.as_mut().unwrap().result = true;
+                            state.status = Some(expected.into());
+                            state.result_token = Some(token.clone());
+                        } else if phase == "result" {
+                            state.dropped = None;
+                            state.status = Some(expected.into());
+                            state.result_token = Some(token.clone());
+                        }
+                    }
+                    let screen = Rect::new(0, 0, cols, 35);
+                    let view = client.state.lock().unwrap().view("this machine").unwrap();
+                    assert_eq!(view.buttons, labels);
+                    let (buf, buttons) = view.render(screen);
+                    assert_eq!(buf.area.width, if cols == 124 { 100 } else { 76 });
+                    assert_eq!(buf.area.height, height, "{phase} at {cols}");
+                    let rows = buffer_rows(&buf);
+                    assert!(rows.join("\n").contains(expected), "{phase}: {rows:?}");
+                    assert_eq!(buttons.len(), labels.len());
+                    assert_eq!(buttons[index].y, buf.area.bottom() - 3);
+                    assert!(rows[height as usize - 4].trim_matches(['│', ' ']).is_empty());
+                    assert!(rows[height as usize - 2].contains("Enter") || phase == "progress");
+                    let rect = buttons[index];
+                    assert_eq!(client.button_at(&client.state.lock().unwrap(), screen, rect.x, rect.y - 1), None);
+                    client.keys_with_screen(format!("\x1b[<0;{};{}M", rect.x + 1, rect.y + 1).as_bytes(), screen);
+                    match labels[index] {
+                        "Send" | "Always for this machine" => {
+                            assert!(matches!(read_without_repaint(&mut peer), ClientMsg::AttachmentStart { .. }));
+                            assert!(client.state.lock().unwrap().active.is_some());
+                            client.shutdown();
+                        }
+                        "Retry" => {
+                            assert!(matches!(read(&mut peer), ClientMsg::AttachmentDismiss { .. }));
+                            assert!(matches!(read(&mut peer), ClientMsg::AttachmentRequest { .. }));
+                        }
+                        "Paste as text" if phase == "question" => {
+                            assert!(matches!(read(&mut peer), ClientMsg::AttachmentText { .. }));
+                        }
+                        "Paste as text" => {
+                            assert!(matches!(read(&mut peer), ClientMsg::AttachmentDismiss { .. }));
+                            assert_eq!(
+                                protocol::read_frame(&mut peer).unwrap().unwrap(),
+                                (protocol::BYTES, paste::bracket(path.to_str().unwrap().as_bytes()))
+                            );
+                        }
+                        "Close" => assert!(matches!(read(&mut peer), ClientMsg::AttachmentDismiss { .. })),
+                        "Cancel" => assert!(matches!(read(&mut peer), ClientMsg::AttachmentCancel { .. })),
+                        _ => unreachable!(),
+                    }
+                }
             }
         }
+    }
+
+    fn buffer_rows(buf: &Buffer) -> Vec<String> {
+        buf.content.chunks(buf.area.width as usize).map(|row| row.iter().map(|cell| cell.symbol()).collect()).collect()
+    }
+
+    #[test]
+    fn final_transfer_keeps_its_content_and_closes_automatically() {
+        let path = dropped_file("final");
+        for cols in [124, 80] {
+            for (image, count, label) in [(false, 2, "2 files"), (false, 1, "capture.png"), (true, 1, "clipboard.png")]
+            {
+                for focus_changed in [false, true] {
+                    let (client, mut peer) = controller(true);
+                    let token = prepare_drop(&client, &mut peer, path.to_str().unwrap().as_bytes());
+                    {
+                        let mut state = client.state.lock().unwrap();
+                        let dropped = state.dropped.as_mut().unwrap();
+                        dropped.image = image;
+                        dropped.paths = vec![path.clone(); count];
+                        state.active = Some(Active {
+                            token: token.clone(),
+                            cancelled: Arc::new(AtomicBool::new(false)),
+                            ack: bounded(2).0,
+                            started: Instant::now(),
+                            last_draw: None,
+                            label: label.into(),
+                            progress: Some((57 * 1048576, 57 * 1048576)),
+                            failure: None,
+                        });
+                    }
+                    let before = Instant::now();
+                    client.message(ServerMsg::AttachmentResult {
+                        token,
+                        pasted: true,
+                        kind: if focus_changed { NoticeKind::Warning } else { NoticeKind::Notice },
+                        message: if focus_changed { "Files received. Focus changed." } else { "Files received." }
+                            .into(),
+                    });
+                    assert!(matches!(read(&mut peer), ClientMsg::AttachmentDismiss { .. }));
+                    assert!(matches!(read(&mut peer), ClientMsg::Repaint));
+                    let (mut view, until) = {
+                        let state = client.state.lock().unwrap();
+                        (state.view("SERVER").unwrap(), state.success_until.unwrap())
+                    };
+                    // Both themes use the same final size and geometry.
+                    for ascii in [false, true] {
+                        let transfer = view.transfer.as_mut().unwrap();
+                        transfer.ascii = ascii;
+                        transfer.marker = if ascii { 'v' } else { '✓' };
+                        let (buf, buttons) = view.render(Rect::new(0, 0, cols, 35));
+                        assert_eq!(buf.area.height, 6);
+                        assert!(buttons.is_empty());
+                        let rows = buffer_rows(&buf);
+                        assert!(rows[0].contains("Sent to this machine"));
+                        assert!(rows[1].contains(label));
+                        assert!(rows[2].contains("57 MiB / 57 MiB (100%)"));
+                        assert!(rows[3].contains(&format!(
+                            "{} {}",
+                            if ascii { 'v' } else { '✓' },
+                            if ascii { "#" } else { "▓" }.repeat(buf.area.width as usize - 6)
+                        )));
+                        assert!(rows[4].contains(if focus_changed {
+                            "Focus changed. Select Claude before typing again."
+                        } else if image || count == 1 {
+                            "Path pasted into Claude."
+                        } else {
+                            "Paths pasted into Claude."
+                        }));
+                        assert!(!rows.join("\n").contains("Typing waits"));
+                    }
+                    assert!(until >= before + SUCCESS_DURATION);
+                    assert!(until <= Instant::now() + SUCCESS_DURATION);
+                    client.input(b"typing\x03");
+                    assert_eq!(
+                        protocol::read_frame(&mut peer).unwrap().unwrap(),
+                        (protocol::BYTES, b"typing\x03".to_vec())
+                    );
+                    client.expire_success(until);
+                }
+            }
+        }
+        let (client, mut peer, _) = progress_client();
+        client.message(ServerMsg::AttachmentResult {
+            token: "ab".into(),
+            pasted: true,
+            kind: NoticeKind::Notice,
+            message: "Files received.".into(),
+        });
+        assert!(matches!(read(&mut peer), ClientMsg::AttachmentDismiss { .. }));
+        assert!(matches!(read(&mut peer), ClientMsg::Repaint));
+        assert!(matches!(read(&mut peer), ClientMsg::Repaint));
+        assert!(client.state.lock().unwrap().view("SERVER").is_none());
         std::fs::remove_file(path).unwrap();
     }
 
@@ -3492,10 +3872,7 @@ mod tests {
             assert!(matches!(read(&mut peer), ClientMsg::Repaint));
             let until = {
                 let state = client.state.lock().unwrap();
-                assert_eq!(
-                    state.status.as_deref(),
-                    Some(if image { "Sent the image to this machine" } else { "Sent 1 file to this machine" })
-                );
+                assert_eq!(state.status.as_deref(), Some("Sent to this machine\nPath pasted into Claude."));
                 assert!(state.view("this machine").unwrap().buttons.is_empty());
                 state.success_until.unwrap()
             };
@@ -3617,7 +3994,9 @@ mod tests {
             }
             let started = Instant::now();
             loop {
-                if let Some(status) = &client.state.lock().unwrap().status {
+                if let Some(view) = client.state.lock().unwrap().view("SERVER") {
+                    let (buf, _) = view.render(Rect::new(0, 0, 80, 23));
+                    let status = buffer_rows(&buf).join("\n");
                     assert!(status.contains(path.file_name().unwrap().to_str().unwrap()));
                     assert!(status.contains("0 B / 3 B (0%)"));
                     assert!(status.contains("Typing waits"));
@@ -3781,12 +4160,14 @@ mod tests {
         assert!(client.keys(b"\r"));
         assert!(client.state.lock().unwrap().active.is_none());
         client.keys(b"\x15");
+        assert!(matches!(read(&mut peer), ClientMsg::Repaint));
         client.keys(b"\x1b[200~");
         client.keys(&vec![b'x'; 128 * 1024]);
         client.keys(format!(" {}\x1b[201~\r", path.display()).as_bytes());
         assert!(client.state.lock().unwrap().prompt.as_ref().unwrap().error.is_some());
         assert!(client.state.lock().unwrap().active.is_none());
         client.keys(b"\x15");
+        assert!(matches!(read(&mut peer), ClientMsg::Repaint));
         client.keys(format!("{}\rlater", path.display()).as_bytes());
         let mut started = false;
         let mut typed = false;
