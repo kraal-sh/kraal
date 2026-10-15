@@ -1162,15 +1162,14 @@ impl Server {
     }
 
     fn yield_before_poll(&self, rx: &EventReceiver, timeout: Duration, mut yield_now: impl FnMut()) {
-        if !timeout.is_zero() || self.ready.is_empty() || self.ready_set.len() <= 2 {
+        if !timeout.is_zero() || self.ready.is_empty() {
             return;
         }
-        // On a scarce CPU, the client and pane readers carrying a key and its echo need
-        // to run between output passes. Before #80, an expired recv_timeout yielded up
-        // to four times. On 2026-10-14, release compare.rs with 16 panes on one CPU
-        // measured 2.82 -> 1.79 ms with 15 floods after restoring these yields.
-        // Count active and watched panes: one flood plus its echo stays on the fast
-        // path, preserving #80's one-flood CPU gain and 0.074/0.082 ms key latency.
+        // On a scarce CPU, the threads that feed the loop (a client's reader carrying a key,
+        // the pane readers carrying output and echoes) need to run between output passes.
+        // Before #80, an expired recv_timeout yielded up to four times. Release compare.rs on
+        // one CPU: with 15 floods, key latency 2.82 -> 1.79 ms (2026-10-14); with one flood
+        // too, seq3m back to 0.3.0's time and 7 to 8% less CPU under floods (2026-10-15).
         for _ in 0..4 {
             if !rx.is_idle() {
                 break;
@@ -2278,8 +2277,8 @@ mod tests {
         }
     }
     #[test]
-    fn output_poll_yields_only_with_more_than_two_active_or_watched_panes() {
-        for (ready, watched, expected) in [(0, 0, 0), (0, 3, 0), (1, 0, 0), (2, 0, 0), (1, 1, 0), (3, 0, 4), (1, 2, 4)]
+    fn output_poll_yields_while_output_waits() {
+        for (ready, watched, expected) in [(0, 0, 0), (0, 3, 0), (1, 0, 4), (2, 0, 4), (1, 1, 4), (3, 0, 4), (1, 2, 4)]
         {
             for timeout in [Duration::ZERO, Duration::from_millis(1)] {
                 let (tx, rx) = queue::channel(1);

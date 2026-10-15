@@ -9,11 +9,10 @@ when several panes are redrawing after a resize. The focused pane's echo can int
 panes' output even when that pane is already being watched for more output. Background panes
 still take turns, and interrupted output is kept for their next turn.
 
-While output remains to process and more than two panes are active or watched for continuing
-output, kraal gives reader threads a chance to run between output passes so keys and their
-echoes can arrive even on a busy CPU. It gives way at most four times, stopping as soon as an
-event or a notification recovery is waiting. A single busy pane plus the pane echoing a key
-does not add these turns, and idle waits are unchanged. No setting is needed.
+While output remains to process, kraal gives reader threads a chance to run between output
+passes so keys, their echoes and more output can arrive even on a busy CPU. It gives way at
+most four times, stopping as soon as an event or a notification recovery is waiting. Idle
+waits are unchanged. No setting is needed.
 
 ## Clipboard
 
