@@ -1,4 +1,16 @@
+use std::time::Duration;
+
+use super::super::Server;
+use super::super::ui::{ConfirmAction, Mode, PickAction, PickItem, Picker, PickerKind};
+use super::choices::switch_effect;
+use super::discovery::{PROCESS_UNVERIFIED, observed_command};
+use super::switching::switch_timing;
 use super::*;
+use crate::account_status;
+use crate::accounts::{self, Accounts, Mode as LimitMode};
+use crate::agent::AgentState;
+use crate::protocol::Placement;
+use crate::theme::NoticeKind;
 
 #[test]
 fn launch_picker_lists_only_installed_registry_entries() {
