@@ -23,7 +23,7 @@ fn a_protocol_three_remote_refusal_names_remote_install_for_the_selected_session
     write_script(&bin.join("ssh"), &format!("#!/bin/sh\ncat '{}'\n", refusal.display()));
     for session in ["main", "work"] {
         let reason = format!(
-            "protocol mismatch: client protocol 4, server protocol 3 (kraal 0.4.0, session {session}); run `kraal -s {session} restart`"
+            "protocol mismatch: client protocol 5, server protocol 3 (kraal 0.4.0, session {session}); run `kraal -s {session} restart`"
         );
         let payload = serde_json::to_vec(&serde_json::json!({ "type": "exit", "reason": reason })).unwrap();
         let mut frame = (payload.len() as u32).to_le_bytes().to_vec();
@@ -36,7 +36,7 @@ fn a_protocol_three_remote_refusal_names_remote_install_for_the_selected_session
         let shown = in_terminal(command, b"");
         let recovery = if session == "main" { "kraal remote-install box" } else { "kraal -s work remote-install box" };
         assert!(shown.contains(recovery), "{shown}");
-        assert!(shown.contains("client protocol 4, server protocol 3 (kraal 0.4.0"), "{shown}");
+        assert!(shown.contains("client protocol 5, server protocol 3 (kraal 0.4.0"), "{shown}");
         assert!(shown.contains(&format!("session {session}")), "{shown}");
         assert!(!shown.contains(" restart") && !shown.contains("\x1b[?1049h"), "{shown}");
     }
@@ -1925,7 +1925,7 @@ fn attachment_wire_cancellation_disconnect_and_repeated_finish_do_not_paste_part
         raw_frame(
             &mut client.stream,
             0,
-            br#"{"type":"attach","version":4,"cols":120,"rows":40,"workspace":"w","remote":true}"#,
+            br#"{"type":"attach","version":5,"cols":120,"rows":40,"workspace":"w","remote":true}"#,
         );
         client.send(b"\x02 Attach files\r");
         client.wait_for_message("attachment_offer");

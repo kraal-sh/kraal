@@ -22,23 +22,16 @@ const SKIP: &str = "needs KRAAL_OLD, another release's kraal: tests/compat.sh ru
 struct Kraal {
     bin: PathBuf,
     version: String,
+    protocol: u32,
 }
 
 impl Kraal {
     fn this() -> Kraal {
-        Kraal { bin: env!("CARGO_BIN_EXE_kraal").into(), version: env!("CARGO_PKG_VERSION").into() }
-    }
-
-    fn protocol(&self) -> u32 {
-        match self.version.as_str() {
-            "0.2.0" | "0.3.0" => 2,
-            "0.4.0" => 3,
-            _ => 4,
-        }
+        Kraal { bin: env!("CARGO_BIN_EXE_kraal").into(), version: env!("CARGO_PKG_VERSION").into(), protocol: 5 }
     }
 
     fn state_dir(&self) -> &str {
-        if self.protocol() == 2 { "sessions" } else { "sessions-v2" }
+        if self.protocol == 2 { "sessions" } else { "sessions-v2" }
     }
 
     fn old() -> Kraal {
@@ -47,7 +40,12 @@ impl Kraal {
         let said = String::from_utf8_lossy(&out.stdout);
         let version = said.trim().trim_start_matches("kraal ").to_string();
         assert!(out.status.success() && !version.is_empty(), "{}: {said}", bin.display());
-        Kraal { bin, version }
+        let protocol = match version.as_str() {
+            "0.2.0" | "0.3.0" => 2,
+            "0.4.0" => 3,
+            _ => 4,
+        };
+        Kraal { bin, version, protocol }
     }
 }
 
@@ -209,12 +207,11 @@ impl Drop for Env {
 #[ignore = "needs KRAAL_OLD, another release's kraal: tests/compat.sh runs it"]
 fn different_protocols_refuse_attachment_in_both_directions() {
     let (old, this) = (Kraal::old(), Kraal::this());
-    let older = old.protocol();
-    if older == this.protocol() {
+    if old.protocol == this.protocol {
         return;
     }
-    for (name, server, client, cp, sp) in [("refuse-new", &old, &this, 4, older), ("refuse-old", &this, &old, older, 4)]
-    {
+    for (name, server, client) in [("refuse-new", &old, &this), ("refuse-old", &this, &old)] {
+        let (cp, sp) = (client.protocol, server.protocol);
         let env = Env::new(name);
         env.run(server, &["open", "w"]);
         env.run(server, &["send", "-p", "first", "--enter", "echo", "kept-$((40+2))"]);
@@ -263,7 +260,7 @@ fn this_kraal_stops_other_releases_and_restores_only_current_state() {
     assert!(std::os::unix::net::UnixStream::connect(env.socket()).is_err());
     let saved = env.root.join("state/kraal").join(old.state_dir()).join("compat-kill.json");
     let original = std::fs::read(&saved).unwrap();
-    if old.protocol() == 2 {
+    if old.protocol == 2 {
         let scrollback = saved_scrollback(&env, "scrollback");
         assert!(!scrollback.is_empty());
         for args in [&["open", "w"][..], &["workspaces", "restore", "w"]] {
@@ -333,7 +330,7 @@ fn neither_release_starts_or_forgets_a_session_the_other_runs() {
 #[ignore = "needs KRAAL_OLD, another release's kraal: tests/compat.sh runs it"]
 fn old_accounts_are_refused_without_conversion() {
     let (old, this) = (Kraal::old(), Kraal::this());
-    if old.protocol() != 2 {
+    if old.protocol != 2 {
         return;
     }
     let env = Env::new("compat-accounts");
@@ -363,7 +360,7 @@ fn restarting_requires_state_from_at_least_04() {
     let before = env.server_pid();
     let listed = env.run(&this, &["ls"]);
     assert!(listed.contains(&old.version), "{listed}");
-    if old.protocol() == 2 {
+    if old.protocol == 2 {
         for args in [&["restart"][..], &["restart", "--yes"]] {
             let out = env.try_run(&this, args);
             let error = String::from_utf8_lossy(&out.stderr);
@@ -378,7 +375,7 @@ fn restarting_requires_state_from_at_least_04() {
     assert_ne!(env.server_pid(), before, "the same server still runs");
     let pong = env.pong();
     assert_eq!(pong["version"], this.version.as_str(), "{pong}");
-    assert_eq!(pong["protocol"], 4, "the session runs this kraal: {pong}");
+    assert_eq!(pong["protocol"], this.protocol, "the session runs this kraal: {pong}");
     env.wait_for_text(&this, "first", "before-42");
     env.run(&this, &["send", "-p", "first", "--enter", "echo", "after-$((40+2))"]);
     env.wait_for_text(&this, "first", "after-42");
@@ -406,7 +403,7 @@ fn saved_scrollback(env: &Env, folder: &str) -> std::collections::BTreeMap<PathB
 #[ignore = "needs KRAAL_OLD, another release's kraal: tests/compat.sh runs it"]
 fn a_new_empty_session_is_invisible_to_an_older_release() {
     let (old, this) = (Kraal::old(), Kraal::this());
-    if old.protocol() != 2 {
+    if old.protocol != 2 {
         return;
     }
     let env = Env::new("compat-new-state");

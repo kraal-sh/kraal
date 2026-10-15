@@ -37,8 +37,8 @@ See [Workspace identities](workspaces.md#workspace-identities) and [Accounts](ag
 
 ## Clients and servers
 
-This version uses protocol 4 for laptop listings, copies, moves, deletion and SSH copy relays.
-Kraal 0.4.0 used protocol 3; Kraal 0.2.0 and 0.3.0 use protocol 2.
+This version uses protocol 5, which binds a pasted clipboard text to the agent pane that received
+Ctrl+V. Kraal 0.4.1 used protocol 4, Kraal 0.4.0 protocol 3, and Kraal 0.2.0 and 0.3.0 protocol 2.
 Different protocol versions refuse attachment and ordinary commands. There are no older-peer
 adapters or optional feature negotiation. A refusal names both protocol versions and one next step:
 
@@ -64,7 +64,7 @@ See [Persistence](workspaces.md#persistence).
 Workspaces are saved automatically. KDL is imported and exported explicitly with `kraal import`
 and `kraal export`; `kraal save` and its historical `SaveWorkspace` request are removed.
 Clipboard, file attachments, pasted paths and clipboard images introduced in protocol 3 remain
-part of protocol 4.
+part of protocol 5.
 The client applies its clipboard policy, including the terminal OSC 52 fallback where configured.
 The server no longer emits OSC 52 as an adapter for old clients.
 

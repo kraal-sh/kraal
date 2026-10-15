@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::agent::AgentState;
 
-pub const PROTOCOL_VERSION: u32 = 4;
+pub const PROTOCOL_VERSION: u32 = 5;
 pub const KRAAL_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Kraal 0.2.0 and 0.3.0 used protocol 2 and omitted it from Pong.
