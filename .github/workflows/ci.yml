@@ -19,8 +19,11 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+          targets: x86_64-unknown-linux-musl, aarch64-unknown-linux-musl
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
+      # The releases' Linux targets: musl's libc bindings are not glibc's.
+      - run: cargo check --all-targets --target x86_64-unknown-linux-musl --target aarch64-unknown-linux-musl
       # The scripts people run: the runner's image has shellcheck, the macOS one does not.
       - run: shellcheck install.sh tests/compat.sh examples/scripts/*.sh
       - run: cargo test
