@@ -95,17 +95,17 @@ impl Server {
             self.toast(client, NoticeKind::Notice, agent.account_message());
             return Mode::Normal;
         }
-        if self.switches.contains_key(&pane) {
+        if self.switches.contains(pane) {
             return self.pending_switch_mode(pane);
         }
         let managed = self.panes.get(&pane).is_some_and(|p| p.spec.account.is_some() || p.spec.account_id.is_some());
         if !managed {
             match self.observed_agent(pane) {
                 Ok(Some(a)) if accounts::check_resume(&a.account, &a.session).is_ok() => {
-                    self.observed_agents.insert(pane, a);
+                    self.account_discovery.observe(pane, a);
                 }
                 Ok(_) => {
-                    self.observed_agents.remove(&pane);
+                    self.account_discovery.forget_pane(pane);
                 }
                 Err(error) => {
                     self.toast(client, NoticeKind::Error, error.to_string());

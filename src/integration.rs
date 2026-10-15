@@ -1450,7 +1450,8 @@ pub fn statusline() {
         }
         None => {
             let label = account.as_ref().map(crate::accounts::label).unwrap_or_else(|| "claude".into());
-            let text = usage.as_ref().map(|u| crate::server::usage_text(u, crate::accounts::now())).unwrap_or_default();
+            let text =
+                usage.as_ref().map(|u| crate::accounts::usage_text(u, crate::accounts::now())).unwrap_or_default();
             if text.is_empty() {
                 println!("{label}");
             } else {

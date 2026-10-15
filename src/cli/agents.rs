@@ -5,7 +5,7 @@ use anyhow::{Context, Result, bail};
 use super::Session;
 use super::args::{AccountsCmd, WtCmd};
 use crate::protocol::{PaneInfo, Placement, Request, Response};
-use crate::{account_status, accounts, codex_usage, git, integration, paths, server, worktree_setup};
+use crate::{account_status, accounts, codex_usage, git, integration, paths, worktree_setup};
 
 pub(super) fn accounts(action: AccountsCmd) -> Result<()> {
     let mut all = accounts::Accounts::load()?;
@@ -56,7 +56,8 @@ pub(super) fn accounts(action: AccountsCmd) -> Result<()> {
             }
             for (a, st) in list.iter().zip(&status) {
                 let login = st.label();
-                let u = usage.get(a).map(|u| server::usage_text(u, now)).unwrap_or_else(|| "no usage seen yet".into());
+                let u =
+                    usage.get(a).map(|u| accounts::usage_text(u, now)).unwrap_or_else(|| "no usage seen yet".into());
                 println!(
                     "{:<18} {:<14} {:<34} {u}",
                     accounts::label(a),
@@ -99,20 +100,7 @@ pub(super) fn accounts(action: AccountsCmd) -> Result<()> {
             let home = home
                 .or_else(|| existing.as_ref().map(|a| a.home.clone()))
                 .unwrap_or_else(|| accounts::default_home_for(&agent, &name).display().to_string());
-            let a = accounts::Account {
-                id: crate::identity::new_uuid(),
-                name,
-                agent,
-                home: accounts::absolute_home(&home)?,
-                threshold,
-                note: None,
-                sign_in_required: !no_login,
-                login_revision: String::new(),
-                review: false,
-                public_identity: None,
-                linked_to: None,
-                references: Vec::new(),
-            };
+            let a = accounts::Account::new(&agent, &name, accounts::absolute_home(&home)?, threshold, !no_login);
             // Adding a home already linked by Review uses its chosen account and home.
             let effective = all.clone().add(a.clone())?;
             let checked = if existing.as_ref().is_some_and(|a| a.id == effective.id && a.same_home(&effective)) {
@@ -143,17 +131,7 @@ pub(super) fn accounts(action: AccountsCmd) -> Result<()> {
                     );
                 }
                 a.sign_in_required = !no_login && !verified;
-                let mut a = all.add(a)?;
-                anyhow::ensure!(
-                    a.id == effective.id && a.same_home(&effective),
-                    "the account changed while checking sign-in; run the add command again"
-                );
-                if verified {
-                    all.set_sign_in_required(&a, false);
-                    a.sign_in_required = false;
-                }
-                let notes = if verified { Vec::new() } else { accounts::prepare_home(&a)? };
-                Ok((a, notes))
+                all.add_prepared(a, Some((&effective, verified)))
             })?;
             for note in notes {
                 println!("  {note}");
@@ -204,7 +182,7 @@ pub(super) fn accounts(action: AccountsCmd) -> Result<()> {
                     Ok(l) => {
                         let u = accounts::Usage::from(l);
                         accounts::save_usage(&a, &u)?;
-                        println!("{:<18} {}", accounts::label(&a), server::usage_text(&u, accounts::now()));
+                        println!("{:<18} {}", accounts::label(&a), accounts::usage_text(&u, accounts::now()));
                     }
                     Err(e) => println!("{:<18} {e:#}", accounts::label(&a)),
                 }
@@ -317,11 +295,7 @@ fn find_account(all: &accounts::Accounts, spec: &str) -> Result<accounts::Accoun
 
 /// The agent's own login for account `a`, in this terminal; a failed login is an error.
 fn login(a: &accounts::Account) -> Result<()> {
-    let _lock = accounts::lock_login(a)?;
-    accounts::Accounts::update(|all| {
-        all.set_sign_in_required(a, true);
-        Ok(())
-    })?;
+    let _lock = account_status::begin_login(a)?;
     let status = run_with(&accounts::login(a)?, false)?;
     if !status.success() {
         bail!("{}'s login did not succeed ({status})", accounts::label(a));
@@ -330,10 +304,7 @@ fn login(a: &accounts::Account) -> Result<()> {
     if checked != account_status::Status::SignedIn {
         bail!("{}: {}", accounts::label(a), checked.label());
     }
-    accounts::Accounts::update(|all| {
-        all.set_sign_in_required(a, false);
-        Ok(())
-    })?;
+    account_status::finish_login(a)?;
     println!("{} is signed in", accounts::label(a));
     Ok(())
 }

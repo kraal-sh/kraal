@@ -607,7 +607,7 @@ impl Server {
             return Err(e);
         }
         for &id in &panes {
-            self.switches.remove(&id);
+            self.switches.finish(id);
             self.pane_edits.remove(&id);
             if let Some(pane) = self.panes.get_mut(&id) {
                 pane.restart_with = None;

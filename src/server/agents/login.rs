@@ -19,25 +19,8 @@ impl Server {
             kind.command
         );
         let home = accounts::default_home_for(agent, name);
-        let a = Account {
-            id: crate::identity::new_uuid(),
-            name: name.into(),
-            agent: agent.into(),
-            home: home.display().to_string(),
-            threshold: None,
-            note: None,
-            sign_in_required: true,
-            login_revision: String::new(),
-            review: false,
-            public_identity: None,
-            linked_to: None,
-            references: Vec::new(),
-        };
-        let a = self.update_accounts(|all| {
-            let a = all.add(a)?;
-            accounts::prepare_home(&a)?;
-            Ok(a)
-        })?;
+        let a = Account::new(agent, name, home.display().to_string(), None, true);
+        let (a, _) = self.update_accounts(|all| all.add_prepared(a, None))?;
         self.reload_accounts();
         self.open_login(client, &a)
             .context("Account saved. Press Esc to return to Accounts, then choose Sign in to retry")
@@ -52,11 +35,7 @@ impl Server {
         }
         let l = accounts::login(a)?;
         let ws = self.clients.get(&client).map(|c| c.workspace).context("no client")?;
-        let lock = accounts::lock_login(a)?;
-        self.update_accounts(|all| {
-            all.set_sign_in_required(a, true);
-            Ok(())
-        })?;
+        let lock = account_status::begin_login(a)?;
         self.invalidate_account_identities(&a.agent);
         let spec = PaneSpec {
             command: l.argv,
@@ -117,13 +96,7 @@ impl Server {
         let account = login.account.clone();
         self.invalidate_account_identities(&account.agent);
         if status == Status::SignedIn {
-            if self
-                .update_accounts(|all| {
-                    all.set_sign_in_required(&account, false);
-                    Ok(())
-                })
-                .is_err()
-            {
+            if account_status::finish_login(&account).is_err() {
                 let login = self.panes.get_mut(&id).unwrap().spec.login.as_mut().unwrap();
                 login.state = LoginState::SaveFailed;
                 login.lock = None;
@@ -145,11 +118,7 @@ impl Server {
     pub(in crate::server) fn retry_login(&mut self, id: PaneId) -> Result<()> {
         let Some(login) = self.panes.get(&id).and_then(|p| p.spec.login.as_ref()) else { return Ok(()) };
         let account = login.account.clone();
-        let lock = accounts::lock_login(&account)?;
-        self.update_accounts(|all| {
-            all.set_sign_in_required(&account, true);
-            Ok(())
-        })?;
+        let lock = account_status::begin_login(&account)?;
         self.invalidate_account_identities(&account.agent);
         let Some(pane) = self.panes.get_mut(&id) else { return Ok(()) };
         let Some(login) = &mut pane.spec.login else { return Ok(()) };

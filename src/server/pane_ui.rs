@@ -159,7 +159,7 @@ impl Server {
             "A pane edit is already being applied. Cancel and wait for it to finish."
         );
         ensure!(
-            !self.switches.contains_key(&form.pane),
+            !self.switches.contains(form.pane),
             "An account change is pending. Cancel it in Change account before editing this pane."
         );
         ensure!(
@@ -400,7 +400,7 @@ impl Server {
             pane.agent = crate::agent::AgentTracker { session_id: edit.spec.session.clone(), ..Default::default() };
             pane.close_at = None;
             self.limit_alerts.remove(&id);
-            self.observed_agents.remove(&id);
+            self.account_discovery.forget_pane(id);
             let result = if edit.run {
                 let folder = edit.spec.cwd.as_ref().unwrap();
                 (|| -> Result<()> {
@@ -1330,7 +1330,7 @@ mod tests {
         t.server.switch_account(t.pane, &to, Some(t.client), true).unwrap();
         let back = form(t.apply(draft));
         assert!(back.error.as_deref().unwrap().contains("account change is pending"));
-        t.server.switches.remove(&t.pane);
+        t.server.switches.finish(t.pane);
         let next = t.apply(back);
         t.confirm(next);
         let error = t.server.switch_account(t.pane, &to, Some(t.client), true).unwrap_err();

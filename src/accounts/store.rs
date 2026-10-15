@@ -273,6 +273,28 @@ impl Accounts {
         })?
     }
 
+    /// Revalidate a CLI check before preparing a home or publishing its sign-in state.
+    pub fn add_prepared(
+        &mut self,
+        account: Account,
+        checked: Option<(&Account, bool)>,
+    ) -> Result<(Account, Vec<String>)> {
+        let mut account = self.add(account)?;
+        if let Some((expected, _)) = checked {
+            anyhow::ensure!(
+                account.id == expected.id && account.same_home(expected),
+                "the account changed while checking sign-in; run the add command again"
+            );
+        }
+        let verified = checked.is_some_and(|(_, verified)| verified);
+        if verified {
+            self.set_sign_in_required(&account, false);
+            account.sign_in_required = false;
+        }
+        let notes = if verified { Vec::new() } else { super::prepare_home(&account)? };
+        Ok((account, notes))
+    }
+
     pub fn add(&mut self, mut account: Account) -> Result<Account> {
         let kind = agent_kind(&account.agent).with_context(|| match crate::agent_registry::find(&account.agent) {
             Some(agent) => agent.account_message(),

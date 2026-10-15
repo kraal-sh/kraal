@@ -3241,7 +3241,7 @@ mod tests {
         let (tx, _rx) = super::super::queue::channel(32);
         let mut server = super::super::tests::server(tx);
         let (client, _peer) = super::super::tests::client(&mut server);
-        server.existing_checks.insert("claude".into(), super::super::agents::ExistingCheck::Checking);
+        server.account_discovery.set_check("claude", super::super::agents::ExistingCheck::Checking);
         for (width, expected) in [(28, "   Checking sign-in"), (14, "   Checking")] {
             server.config.sidebar.width = width;
             let rows = server.sidebar_rows(&server.clients[&client], 36, 1_000);

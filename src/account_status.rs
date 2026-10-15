@@ -61,6 +61,22 @@ pub struct Checked {
     pub identity: Option<Identity>,
 }
 
+pub fn begin_login(account: &Account) -> anyhow::Result<std::sync::Arc<std::fs::File>> {
+    let lock = accounts::lock_login(account)?;
+    accounts::Accounts::update(|all| {
+        all.set_sign_in_required(account, true);
+        Ok(())
+    })?;
+    Ok(lock)
+}
+
+pub fn finish_login(account: &Account) -> anyhow::Result<()> {
+    accounts::Accounts::update(|all| {
+        all.set_sign_in_required(account, false);
+        Ok(())
+    })
+}
+
 pub fn check(account: &Account) -> Status {
     inspect(account).status
 }
@@ -213,6 +229,42 @@ mod tests {
 
     fn run(launch: &Launch, limit: Duration) -> Status {
         inspect_launch(launch, limit, "claude").status
+    }
+
+    #[test]
+    fn shared_login_transitions_hold_the_home_lock_and_preserve_revisions() {
+        if !crate::testing::in_own_process(
+            "account_status::tests::shared_login_transitions_hold_the_home_lock_and_preserve_revisions",
+        ) {
+            return;
+        }
+        let dir = crate::testing::TempDir::new("login-transitions");
+        let account = Account::new("codex", "work", dir.text(), None, false);
+        accounts::Accounts::update(|all| all.add(account.clone())).unwrap();
+        let lock = begin_login(&account).unwrap();
+        let started = accounts::Accounts::load().unwrap().by_id(&account.id).unwrap();
+        assert!(started.sign_in_required);
+        assert!(!started.login_revision.is_empty());
+        assert!(begin_login(&account).unwrap_err().to_string().contains("sign-in already running"));
+        assert_eq!(accounts::Accounts::load().unwrap().by_id(&account.id).unwrap(), started);
+        finish_login(&account).unwrap();
+        let finished = accounts::Accounts::load().unwrap().by_id(&account.id).unwrap();
+        assert!(!finished.sign_in_required);
+        assert_eq!(finished.login_revision, started.login_revision);
+        assert!(accounts::lock_login(&account).is_err());
+        drop(lock);
+        let _retry = begin_login(&account).unwrap();
+        let retried = accounts::Accounts::load().unwrap().by_id(&account.id).unwrap();
+        assert!(retried.sign_in_required);
+        assert_ne!(retried.login_revision, started.login_revision);
+        let replacement = Account::new("codex", "work", account.home.clone(), None, true);
+        accounts::Accounts::update(|all| {
+            assert!(all.remove("codex", "work"));
+            all.add(replacement.clone())
+        })
+        .unwrap();
+        finish_login(&account).unwrap();
+        assert!(accounts::Accounts::load().unwrap().by_id(&replacement.id).unwrap().sign_in_required);
     }
 
     #[test]

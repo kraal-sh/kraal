@@ -360,6 +360,9 @@ files or databases; a new home receives a copy of `~/.codex/config.toml` when av
 An agent kraal starts on an account gets `$KRAAL_ACCOUNT` (`claude:pro`) and an internal
 `$KRAAL_ACCOUNT_ID` that stays the same when renamed. It does not inherit the API keys of
 your environment (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`…), which would bill another account.
+Removing an account does not let a replacement with the same name or home take over its
+panes. Refreshing a pane's account label keeps the home it launched with, including after
+accounts are joined.
 Command-line logins and sign-in checks use the same account environment. Logins use your
 terminal; checks run with no terminal input and keep the agent's output private.
 

@@ -9,7 +9,43 @@ use super::{Account, Accounts, AgentKind, agent_kind, agents};
 use crate::identity::new_uuid;
 use crate::paths;
 
+enum PaneIdentity<'a> {
+    Id(&'a str),
+    Reference { agent: &'a str, name: &'a str },
+}
+
+impl<'a> PaneIdentity<'a> {
+    fn new(reference: Option<&'a str>, id: Option<&'a str>, env: &'a [(String, String)]) -> Option<Self> {
+        if let Some(id) = id {
+            return Some(Self::Id(id));
+        }
+        let reference = reference?;
+        if let Some((_, id)) = env.iter().find(|(k, _)| k == "KRAAL_ACCOUNT_ID") {
+            return Some(Self::Id(id));
+        }
+        let (agent, name) = reference.split_once(':')?;
+        Some(Self::Reference { agent, name })
+    }
+}
+
 impl Account {
+    pub fn new(agent: &str, name: &str, home: String, threshold: Option<u8>, sign_in_required: bool) -> Self {
+        Self {
+            id: new_uuid(),
+            name: name.into(),
+            agent: agent.into(),
+            home,
+            threshold,
+            note: None,
+            sign_in_required,
+            login_revision: String::new(),
+            review: false,
+            public_identity: None,
+            linked_to: None,
+            references: Vec::new(),
+        }
+    }
+
     pub fn key(&self) -> String {
         key(&self.agent, &format!("@{}", self.id))
     }
@@ -322,34 +358,31 @@ impl Accounts {
         a
     }
 
-    /// Stable references never fall back to a reused name or home. Old panes have their
+    /// Stable references never fall back to a reused name or home. Old panes use their
     /// launch environment to distinguish a renamed account from a replacement of its name.
-    pub fn launched_on(&self, reference: &str, env: &[(String, String)]) -> Option<Account> {
-        if let Some((_, id)) = env.iter().find(|(k, _)| k == "KRAAL_ACCOUNT_ID") {
-            return self.by_id(id).map(|a| self.at_launch_home(a, env));
-        }
-        let (agent, name) = reference.split_once(':')?;
-        if name.starts_with('@') {
-            return self.get(agent, name).map(|a| self.at_launch_home(a, env));
-        }
+    pub fn pane_account(&self, spec: &crate::pane::PaneSpec) -> Option<Account> {
+        self.resolve_pane(spec.account.as_deref(), spec.account_id.as_deref(), &spec.env)
+            .map(|a| self.at_launch_home(a, &spec.env))
+    }
+
+    fn resolve_pane(&self, reference: Option<&str>, id: Option<&str>, env: &[(String, String)]) -> Option<Account> {
+        let (agent, name) = match PaneIdentity::new(reference, id, env)? {
+            PaneIdentity::Id(id) => return self.by_id(id),
+            PaneIdentity::Reference { agent, name } if name.starts_with('@') => return self.get(agent, name),
+            PaneIdentity::Reference { agent, name } => (agent, name),
+        };
         let kind = agent_kind(agent)?;
         let home = env
             .iter()
             .find(|(k, _)| k == kind.home_env)
             .map(|(_, home)| PathBuf::from(home))
             .unwrap_or_else(|| paths::expand_tilde(kind.default_home));
-        self.get(agent, name)
-            .filter(|a| paths::expand_tilde(&a.home) == home)
-            .or_else(|| self.by_home(agent, &home))
-            .map(|a| self.at_launch_home(a, env))
+        self.get(agent, name).filter(|a| paths::expand_tilde(&a.home) == home).or_else(|| self.by_home(agent, &home))
     }
 
     pub fn bind_pane(&self, spec: &mut crate::pane::PaneSpec) {
         let Some(reference) = spec.account.as_deref() else { return };
-        let account = match spec.account_id.as_deref() {
-            Some(id) => self.by_id(id),
-            None => self.launched_on(reference, &spec.env),
-        };
+        let account = self.resolve_pane(Some(reference), spec.account_id.as_deref(), &spec.env);
         if let Some(a) = account {
             spec.account = Some(key(&a.agent, &a.name));
             spec.account_id = Some(a.id.clone());

@@ -10,10 +10,7 @@ use crate::protocol::Placement;
 
 impl Server {
     pub(super) fn spec_account(&self, spec: &PaneSpec) -> Option<Account> {
-        match spec.account_id.as_deref() {
-            Some(id) => self.accounts.by_id(id).map(|a| self.accounts.at_launch_home(a, &spec.env)),
-            None => self.accounts.launched_on(spec.account.as_deref()?, &spec.env),
-        }
+        self.accounts.pane_account(spec)
     }
 
     /// Spec of a pane running `agent` on account `a`, resuming `resume` if given.
