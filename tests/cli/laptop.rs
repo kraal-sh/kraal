@@ -19,6 +19,16 @@ fn copy_job_output_describes_both_directions_and_finishes_below_progress() {
         value["message"].clone()
     }
 
+    /// The next message other than the keepalive a slow installation sends.
+    fn read_past_progress(stream: &mut UnixStream) -> serde_json::Value {
+        loop {
+            let message = read(stream);
+            if message != "Progress" {
+                return message;
+            }
+        }
+    }
+
     fn reply(stream: &mut UnixStream, message: serde_json::Value) {
         let message = serde_json::json!({"type":"laptop_copy", "token":"abc", "message":message});
         raw_frame(stream, 0, message.to_string().as_bytes());
@@ -95,7 +105,7 @@ fn copy_job_output_describes_both_directions_and_finishes_below_progress() {
                         packet(serde_json::json!("End"));
                     }
                     packet(serde_json::json!("Done"));
-                    assert_eq!(read(&mut stream), serde_json::json!({"Finish":{"Ok":null}}));
+                    assert_eq!(read_past_progress(&mut stream), serde_json::json!({"Finish":{"Ok":null}}));
                     assert_eq!(std::fs::read(destination.join("report")).unwrap(), contents);
                     if entries == 2 {
                         assert_eq!(std::fs::read(destination.join("empty")).unwrap(), b"");
