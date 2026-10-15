@@ -345,7 +345,7 @@ impl TermPane {
         for (k, v) in spec.env.iter().chain(&spec.secret_env.0) {
             cmd.env(k, v);
         }
-        let token = crate::accounts::new_uuid();
+        let token = crate::identity::new_uuid();
         cmd.env("KRAAL_PROCESS", &token);
         // Ready to start: a program that cannot be found fails here. It starts below, or after
         // the other panes of its batch are set up (see `super::spawn::batch`).

@@ -4,6 +4,20 @@ use std::path::PathBuf;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
+/// Where typed keys go besides the focused pane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SyncScope {
+    #[default]
+    Off,
+    /// Every terminal pane of the current tab.
+    Tab,
+    /// Every terminal pane of the workspace, all tabs.
+    Workspace,
+    /// The panes the user marked.
+    Marked,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NameError {
     Empty,

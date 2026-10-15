@@ -41,10 +41,11 @@ impl Server {
         if workspace.delete_pending || workspace.kept.as_ref().is_some_and(|s| s.close_pending.is_some()) {
             return Err("This workspace has an unfinished Close or Delete. Cancel and finish that action, then retry Duplicate.".into());
         }
-        let copy = crate::persist::snapshot(self).workspaces[wi]
+        let copy = crate::server::persistence::snapshot(self).workspaces[wi]
             .duplicate(name)
             .map_err(|e| format!("Couldn't copy the layout. Fix the saved layout and retry.\n{e:#}"))?;
-        crate::persist::apply_workspace(self, &copy).map_err(|e| format!("Couldn't copy the workspace.\n{e:#}"))?;
+        crate::server::persistence::apply_workspace(self, &copy)
+            .map_err(|e| format!("Couldn't copy the workspace.\n{e:#}"))?;
         let ws = self.workspaces.last().unwrap().id;
         if let Err(e) = self.save_now() {
             self.workspaces.pop();
@@ -157,7 +158,7 @@ impl Server {
                 "Couldn't finish deleting the workspace. Its layout is kept.\nRetry Delete to finish.\n{e}"
             ));
         }
-        let mut saved = crate::persist::snapshot(self).workspaces.remove(wi);
+        let mut saved = crate::server::persistence::snapshot(self).workspaces.remove(wi);
         saved.delete_pending = false;
         let identity = saved.id.clone();
         let order_position = self
@@ -229,7 +230,7 @@ impl Server {
         })?;
         let pending_layout = crate::workspace::bind_source_accounts(&source, &self.accounts)
             .map_err(|e| format!("Couldn't keep the accounts. Nothing was deleted.\n{e:#}"))?;
-        let identity = crate::accounts::new_uuid();
+        let identity = crate::identity::new_uuid();
         let saved = WorkspaceSnap {
             id: identity.clone(),
             name,
@@ -393,7 +394,7 @@ impl Server {
         saved.delete_pending = false;
         saved.close_pending = None;
         saved.restore_error = None;
-        crate::persist::apply_workspace(self, &saved).map_err(|e| format!("{e:#}"))?;
+        crate::server::persistence::apply_workspace(self, &saved).map_err(|e| format!("{e:#}"))?;
         let workspace = self.workspaces.pop().unwrap();
         let ws = workspace.id;
         let position = deleted.position.min(self.workspaces.len());
@@ -500,9 +501,9 @@ mod tests {
         let (tx, _rx) = super::super::queue::channel(32);
         let mut server = super::super::tests::server(tx);
         server.new_workspace("old\nname".into(), None);
-        let snapshot = persist::snapshot(&server);
+        let snapshot = crate::server::persistence::snapshot(&server);
         server.workspaces.clear();
-        persist::apply(&mut server, snapshot).unwrap();
+        crate::server::persistence::apply(&mut server, snapshot).unwrap();
         assert_eq!(server.workspaces[0].name, "old\nname");
         writer(&mut server, vec![]);
         let identity = server.keep_and_delete_workspace(server.workspaces[0].id).unwrap();
@@ -565,13 +566,13 @@ while IFS= read -r line; do :; done
         server.reopen_workspace(copied).unwrap();
         let resumed = format!("{fresh}--resume {session}\n");
         until(&mut server, &rx, |_| std::fs::read_to_string(&launches).is_ok_and(|s| s == resumed));
-        let saved = persist::snapshot(&server).workspaces.remove(server.ws_index(copied).unwrap());
+        let saved = crate::server::persistence::snapshot(&server).workspaces.remove(server.ws_index(copied).unwrap());
         server.keep_and_close_workspace(copied).unwrap();
         server.keep_and_close_workspace(ws).unwrap();
         let (tx, rx) = super::super::queue::channel(4096);
         let mut restarted = super::super::tests::server(tx);
         restarted.accounts.add(account).unwrap();
-        persist::apply_workspace(&mut restarted, &saved).unwrap();
+        crate::server::persistence::apply_workspace(&mut restarted, &saved).unwrap();
         let resumed = format!("{resumed}--resume {session}\n");
         until(&mut restarted, &rx, |_| std::fs::read_to_string(&launches).is_ok_and(|s| s == resumed));
         writer(&mut restarted, vec![]);
@@ -606,7 +607,8 @@ while IFS= read -r line; do :; done
             if closed {
                 server.keep_and_close_workspace(ws).unwrap();
             }
-            let source_before = serde_json::to_value(persist::snapshot(&server).workspaces.remove(0)).unwrap();
+            let source_before =
+                serde_json::to_value(crate::server::persistence::snapshot(&server).workspaces.remove(0)).unwrap();
             let pane_ids: std::collections::HashSet<_> = server.panes.keys().copied().collect();
             let tab_ids: Vec<_> = server.workspaces[0].tabs.iter().map(|t| t.id).collect();
             let copied = server.duplicate_workspace(ws, "api-copy").unwrap();
@@ -632,10 +634,13 @@ while IFS= read -r line; do :; done
                     assert!(pane.agent.session_id.is_none());
                 }
             }
-            assert_eq!(serde_json::to_value(persist::snapshot(&server).workspaces.remove(0)).unwrap(), source_before);
+            assert_eq!(
+                serde_json::to_value(crate::server::persistence::snapshot(&server).workspaces.remove(0)).unwrap(),
+                source_before
+            );
             let (tx, _rx) = super::super::queue::channel(4096);
             let mut restarted = super::super::tests::server(tx);
-            persist::apply(&mut restarted, serde_json::from_value(persisted).unwrap()).unwrap();
+            crate::server::persistence::apply(&mut restarted, serde_json::from_value(persisted).unwrap()).unwrap();
             assert!(restarted.workspaces[1].closed());
             let ws = restarted.workspaces[1].id;
             restarted.reopen_workspace(ws).unwrap();
@@ -652,7 +657,7 @@ while IFS= read -r line; do :; done
             let (tx, _rx) = super::super::queue::channel(4096);
             let mut server = super::super::tests::server(tx);
             let ws = workspace(&mut server);
-            let before = serde_json::to_value(persist::snapshot(&server)).unwrap();
+            let before = serde_json::to_value(crate::server::persistence::snapshot(&server)).unwrap();
             let saved = writer(
                 &mut server,
                 vec![Err("disk full".into()), if rollback_fails { Err("still full".into()) } else { Ok(()) }],
@@ -663,7 +668,7 @@ while IFS= read -r line; do :; done
             } else {
                 "No workspace was added"
             }));
-            assert_eq!(serde_json::to_value(persist::snapshot(&server)).unwrap(), before);
+            assert_eq!(serde_json::to_value(crate::server::persistence::snapshot(&server)).unwrap(), before);
             assert_eq!(saved.lock().unwrap().last().unwrap(), &before);
             let copied = server.duplicate_workspace(ws, "api-copy").unwrap();
             assert_eq!(server.workspaces.len(), 2);
@@ -777,7 +782,7 @@ while IFS= read -r line; do :; done
     }
 
     fn source(server: &mut Server) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("kraal-delete-{}", crate::accounts::new_uuid()));
+        let dir = std::env::temp_dir().join(format!("kraal-delete-{}", crate::identity::new_uuid()));
         std::fs::create_dir(&dir).unwrap();
         let path = dir.join("api.kdl");
         std::fs::write(&path, "// keep this source\nlayout { pane command=\"sleep\" { args \"60\"; }; }\n").unwrap();
@@ -797,7 +802,7 @@ while IFS= read -r line; do :; done
             if closed {
                 server.keep_and_close_workspace(ws).unwrap();
             }
-            let expected = persist::snapshot(&server).workspaces.remove(1);
+            let expected = crate::server::persistence::snapshot(&server).workspaces.remove(1);
             let identity = server.keep_and_delete_workspace(ws).unwrap();
             assert_eq!(identity, expected.id);
             assert_eq!(server.workspaces.iter().map(|w| w.name.as_str()).collect::<Vec<_>>(), ["before", "after"]);
@@ -848,7 +853,7 @@ while IFS= read -r line; do :; done
                 if closed {
                     server.keep_and_close_workspace(ws).unwrap();
                 }
-                let before = serde_json::to_value(persist::snapshot(&server)).unwrap();
+                let before = serde_json::to_value(crate::server::persistence::snapshot(&server)).unwrap();
                 let saved = writer(
                     &mut server,
                     vec![Err("disk full".into()), if rollback_fails { Err("disk full".into()) } else { Ok(()) }],
@@ -857,7 +862,7 @@ while IFS= read -r line; do :; done
                 assert!(error.contains("Nothing was stopped"), "{error}");
                 assert_eq!(error.contains("Couldn't confirm cancellation"), rollback_fails);
                 assert_eq!(server.panes.len(), if closed { 0 } else { 4 });
-                assert_eq!(serde_json::to_value(persist::snapshot(&server)).unwrap(), before);
+                assert_eq!(serde_json::to_value(crate::server::persistence::snapshot(&server)).unwrap(), before);
                 assert!(server.deleted_workspaces.is_empty());
                 assert_ne!(saved.lock().unwrap().last().unwrap()["workspaces"][0]["delete_pending"], true);
                 assert!(server.keep_and_delete_workspace(ws).is_ok());
@@ -963,18 +968,18 @@ while IFS= read -r line; do :; done
         let NodeSnap::Pane(pane) = saved.tabs[1].root.as_mut().unwrap() else { panic!() };
         pane.scrollback = Some("1-2-3.ans".into());
         let identity = server.keep_and_delete_workspace(ws).unwrap();
-        let snap = persist::snapshot(&server);
+        let snap = crate::server::persistence::snapshot(&server);
         assert!(persist::scrollback_files(&snap).contains("1-2-3.ans"));
         let mut recovered = super::super::tests::server(tx);
         recovered.apply_snapshot(serde_json::from_slice(&serde_json::to_vec(&snap).unwrap()).unwrap()).unwrap();
         assert!(recovered.panes.is_empty());
         writer(&mut recovered, vec![]);
         recovered.restore_deleted_workspace(&identity, "api").unwrap();
-        assert!(persist::scrollback_files(&persist::snapshot(&recovered)).contains("1-2-3.ans"));
+        assert!(persist::scrollback_files(&crate::server::persistence::snapshot(&recovered)).contains("1-2-3.ans"));
         recovered.config.save_scrollback = false;
-        assert!(persist::scrollback_files(&persist::snapshot(&recovered)).is_empty());
+        assert!(persist::scrollback_files(&crate::server::persistence::snapshot(&recovered)).is_empty());
         server.config.save_scrollback = false;
-        assert!(persist::scrollback_files(&persist::snapshot(&server)).is_empty());
+        assert!(persist::scrollback_files(&crate::server::persistence::snapshot(&server)).is_empty());
     }
 
     #[test]
@@ -1002,7 +1007,7 @@ while IFS= read -r line; do :; done
             assert_eq!(other.definitions().len(), 1, "removal belongs to one session");
             let mut recovered = super::super::tests::server(tx);
             recovered.config.workspace_dirs = server.config.workspace_dirs.clone();
-            recovered.apply_snapshot(persist::snapshot(&server)).unwrap();
+            recovered.apply_snapshot(crate::server::persistence::snapshot(&server)).unwrap();
             recovered.scan_definitions();
             assert!(recovered.definitions().is_empty());
             if missing {
@@ -1040,7 +1045,7 @@ while IFS= read -r line; do :; done
             let mut accounts = crate::accounts::Accounts::empty();
             let account = accounts
                 .add(crate::accounts::Account {
-                    id: crate::accounts::new_uuid(),
+                    id: crate::identity::new_uuid(),
                     name: "work".into(),
                     home: path.parent().unwrap().join("original").display().to_string(),
                     ..accounts.get("claude", "default").unwrap()
@@ -1057,14 +1062,14 @@ while IFS= read -r line; do :; done
             accounts.rename("claude", "work", "renamed").unwrap();
             let replacement = accounts
                 .add(crate::accounts::Account {
-                    id: crate::accounts::new_uuid(),
+                    id: crate::identity::new_uuid(),
                     home: path.parent().unwrap().join("replacement").display().to_string(),
                     ..account.clone()
                 })
                 .unwrap();
             assert_ne!(replacement.id, account.id);
             if restart {
-                let bytes = serde_json::to_vec(&persist::snapshot(&server)).unwrap();
+                let bytes = serde_json::to_vec(&crate::server::persistence::snapshot(&server)).unwrap();
                 let mut recovered = super::super::tests::server(tx);
                 recovered.config.workspace_dirs = server.config.workspace_dirs.clone();
                 recovered.accounts = accounts.clone();
@@ -1101,7 +1106,7 @@ while IFS= read -r line; do :; done
         let account = server
             .accounts
             .add(crate::accounts::Account {
-                id: crate::accounts::new_uuid(),
+                id: crate::identity::new_uuid(),
                 name: "work".into(),
                 home: path.parent().unwrap().join("work").display().to_string(),
                 ..server.accounts.get("claude", "default").unwrap()
@@ -1124,7 +1129,7 @@ while IFS= read -r line; do :; done
         assert!(!exported.contains("claude:work"));
         assert_eq!(std::fs::read_to_string(path.with_extension("kdl.bak")).unwrap(), original);
         assert_eq!(server.workspaces[wi].definition_source.as_deref(), Some(exported.as_str()));
-        let bytes = serde_json::to_vec(&persist::snapshot(&server)).unwrap();
+        let bytes = serde_json::to_vec(&crate::server::persistence::snapshot(&server)).unwrap();
         let mut recovered = super::super::tests::server(tx);
         recovered.accounts = accounts;
         recovered.apply_snapshot(serde_json::from_slice(&bytes).unwrap()).unwrap();
@@ -1170,7 +1175,7 @@ while IFS= read -r line; do :; done
         for imported in [false, true] {
             let (tx, _rx) = super::super::queue::channel(4096);
             let mut server = super::super::tests::server(tx);
-            let name = format!("api-{}", crate::accounts::new_uuid());
+            let name = format!("api-{}", crate::identity::new_uuid());
             let restored_name = format!("{name}-restored");
             let path = crate::paths::workspaces_dir().join(format!("{name}.kdl"));
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -1252,7 +1257,7 @@ while IFS= read -r line; do :; done
         std::fs::write(&path, &original).unwrap();
         let ws = workspace(&mut server);
         server.workspaces[0].set_definition(Some(&path));
-        let mut saved = persist::snapshot(&server).workspaces.remove(0);
+        let mut saved = crate::server::persistence::snapshot(&server).workspaces.remove(0);
         saved.restore_error = Some("shell missing".into());
         for pane in server.workspaces[0].panes() {
             server.close_pane(pane);
@@ -1278,7 +1283,7 @@ while IFS= read -r line; do :; done
         writer(&mut server, vec![]);
         let identity = server.keep_and_delete_workspace(ws).unwrap();
         let mut recovered = super::super::tests::server(tx);
-        recovered.apply_snapshot(persist::snapshot(&server)).unwrap();
+        recovered.apply_snapshot(crate::server::persistence::snapshot(&server)).unwrap();
         let new = recovered.new_workspace("api".into(), None);
         let new_identity = recovered.workspaces[0].stable_id.clone();
         recovered.new_workspace("api-restored".into(), None);

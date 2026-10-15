@@ -19,7 +19,7 @@ mod usage;
 
 pub use conversations::{carry_conversation, check_carry, check_resume, conversation_exists};
 pub use home::{absolute_home, default_home_for, lock_login, prepare_home};
-pub use identity::{agent_names, existing_label, key, label, missing_account, new_uuid, rename, review_question};
+pub use identity::{agent_names, existing_label, key, label, missing_account, rename, review_question};
 pub use launch::{Launch, duplicate_args, launch, launch_args, login, login_status, resumable_args, resume_argv};
 pub use usage::{Usage, UsageMap, Window, describe_reset, limit_from_screen, now, save_usage, usage_from_statusline};
 

@@ -127,7 +127,7 @@ pub fn fetch(codex_bin: &str, home: &Path, timeout: Duration) -> anyhow::Result<
     // behind however it left (see [`crate::exec::supervise`]). Unit tests are another program:
     // they talk to Codex directly.
     // Whatever it starts carries this tag, so that even a daemon that left its tree goes too.
-    let tag = crate::accounts::new_uuid();
+    let tag = crate::identity::new_uuid();
     let spawn = |supervised: bool| {
         let mut command = if supervised {
             let mut c = Command::new("/proc/self/exe");

@@ -15,7 +15,7 @@ use super::*;
 
 #[test]
 fn home_paths_are_shortened_through_a_symlink() {
-    let root = std::env::temp_dir().join(format!("kraal-home-paths-{}", crate::accounts::new_uuid()));
+    let root = std::env::temp_dir().join(format!("kraal-home-paths-{}", crate::identity::new_uuid()));
     let home = root.join("home");
     let alias = root.join("alias");
     std::fs::create_dir_all(&home).unwrap();
@@ -34,7 +34,7 @@ fn home_paths_are_shortened_through_a_symlink() {
 
 #[test]
 fn a_session_directory_that_cannot_be_read_is_not_treated_as_empty() {
-    let root = std::env::temp_dir().join(format!("kraal-saved-dirs-{}", crate::accounts::new_uuid()));
+    let root = std::env::temp_dir().join(format!("kraal-saved-dirs-{}", crate::identity::new_uuid()));
     std::fs::create_dir(&root).unwrap();
     assert!(saved_sessions_in(&root).unwrap().is_empty());
     for dir in ["sessions", "sessions-v2"] {
@@ -48,7 +48,7 @@ fn a_session_directory_that_cannot_be_read_is_not_treated_as_empty() {
 
 #[test]
 fn saved_sessions_find_both_formats_once_and_resolve_shortened_sockets() {
-    let id = crate::accounts::new_uuid();
+    let id = crate::identity::new_uuid();
     let session = format!("{}{id}", "s".repeat(SESSION_NAME_MAX - id.len()));
     let current = session_state_path(&session);
     let legacy = legacy_session_state_path(&session);

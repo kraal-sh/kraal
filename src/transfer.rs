@@ -879,7 +879,7 @@ fn plan_staged(
     into_dir: bool,
 ) -> Result<Vec<Step>> {
     let prefix = stage_prefix(sources, dest);
-    let run = crate::accounts::new_uuid().replace('-', "");
+    let run = crate::identity::new_uuid().replace('-', "");
     let stage_name = format!("{prefix}-{run}");
     // One source to a name that is not a directory takes that name; otherwise the sources go
     // into the destination, which an existing directory is, whether or not it ends in `/`.
@@ -1417,7 +1417,7 @@ pub fn check_move(sources: &[Endpoint], dest: &Endpoint) -> Result<()> {
 /// looked for at the destination: the first in the directory the sources go to, the second there
 /// and in every directory above it.
 pub fn check_move_across(sources: &[Endpoint], dest: &Endpoint, ssh: SshOptions) -> Result<()> {
-    let id = crate::accounts::new_uuid();
+    let id = crate::identity::new_uuid();
     let marks = Marks { next_to: format!(".kraal-move-{id}-by"), inside: format!(".kraal-move-{id}-in") };
     let into = sources.len() > 1 || dest.display().ends_with('/');
     // One source to a new name lands on itself only under its own name.

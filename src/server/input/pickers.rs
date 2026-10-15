@@ -1002,7 +1002,7 @@ mod tests {
         let (client, _peer) = crate::server::tests::client(&mut server);
         let current = server.clients[&client].workspace;
         let ws = server.new_workspace("closed".into(), None);
-        let mut saved = crate::persist::snapshot(&server).workspaces.remove(1);
+        let mut saved = crate::server::persistence::snapshot(&server).workspaces.remove(1);
         saved.closed = true;
         for line in [0, 1] {
             server.workspaces[1].kept = Some(saved.clone());
@@ -1346,7 +1346,7 @@ mod tests {
         let a = server
             .accounts
             .add(crate::accounts::Account {
-                id: crate::accounts::new_uuid(),
+                id: crate::identity::new_uuid(),
                 agent: "claude".into(),
                 name: "work".into(),
                 home: "/nonexistent/work".into(),
@@ -1390,7 +1390,7 @@ mod tests {
         let a = server
             .accounts
             .add(crate::accounts::Account {
-                id: crate::accounts::new_uuid(),
+                id: crate::identity::new_uuid(),
                 agent: "claude".into(),
                 name: "work".into(),
                 home: "/nonexistent/work".into(),
@@ -1519,7 +1519,7 @@ mod deletion_tests {
         assert!(updated.message.contains("sleep 60"));
         assert_eq!(server.panes.len(), 1);
         assert!(server.deleted_workspaces.is_empty());
-        let path = std::env::temp_dir().join(format!("kraal-delete-question-{}.kdl", crate::accounts::new_uuid()));
+        let path = std::env::temp_dir().join(format!("kraal-delete-question-{}.kdl", crate::identity::new_uuid()));
         std::fs::write(&path, "layout { pane; }\n").unwrap();
         let Mode::Confirm(question) = server.ask_delete_workspace(DeleteTarget::Source(path.clone())) else { panic!() };
         server.open_definition(&path).unwrap();
@@ -1627,7 +1627,6 @@ mod workspace_action_tests {
     use super::*;
     use crate::input::{InputEvent, Key, KeySpec, Mods, MouseButton, MouseEvent, MouseKind};
     use crate::pane::PaneSpec;
-    use crate::persist;
     use crate::protocol::Placement;
     use crate::server::{overlays, persistence, queue, tests};
     use ratatui::buffer::Buffer;
@@ -1649,7 +1648,7 @@ mod workspace_action_tests {
                 let c = server.clients.get_mut(&client).unwrap();
                 (c.cols, c.rows) = (cols, rows);
                 if closed {
-                    let mut kept = crate::persist::snapshot(&server).workspaces.remove(1);
+                    let mut kept = crate::server::persistence::snapshot(&server).workspaces.remove(1);
                     kept.closed = true;
                     server.workspaces[1].kept = Some(kept);
                 }
@@ -1725,7 +1724,7 @@ mod workspace_action_tests {
         let web = server.clients[&other].workspace;
         server.workspaces[1].name = "web".into();
         let docs = server.new_workspace("docs".into(), None);
-        let mut closed = persist::snapshot(&server).workspaces.remove(2);
+        let mut closed = crate::server::persistence::snapshot(&server).workspaces.remove(2);
         closed.closed = true;
         server.workspaces[2].kept = Some(closed);
         let _batch = crate::pane::batch();
@@ -1768,7 +1767,7 @@ mod workspace_action_tests {
         );
         let (tx, _rx2) = queue::channel(32);
         let mut restored = tests::server(tx);
-        persist::apply(&mut restored, serde_json::from_value(snap).unwrap()).unwrap();
+        crate::server::persistence::apply(&mut restored, serde_json::from_value(snap).unwrap()).unwrap();
         assert_eq!(names(&restored), ["api", "docs", "web"]);
         assert_eq!(
             restored.workspaces.iter().map(|w| &w.stable_id).collect::<Vec<_>>(),
@@ -1827,7 +1826,7 @@ mod workspace_action_tests {
         let (tx, _rx2) = queue::channel(32);
         let mut restored = tests::server(tx);
         restored.config.workspace_dirs = server.config.workspace_dirs.clone();
-        persist::apply(&mut restored, serde_json::from_value(snap).unwrap()).unwrap();
+        crate::server::persistence::apply(&mut restored, serde_json::from_value(snap).unwrap()).unwrap();
         assert_eq!(names(&restored), ["b", "a"]);
         std::fs::remove_dir_all(dir).unwrap();
     }
@@ -1845,7 +1844,7 @@ mod workspace_action_tests {
             server.workspaces[1].name = "web".into();
             let middle = server.new_workspace("middle".into(), None);
             let docs = server.new_workspace("docs".into(), None);
-            let mut closed = persist::snapshot(&server).workspaces.remove(3);
+            let mut closed = crate::server::persistence::snapshot(&server).workspaces.remove(3);
             closed.closed = true;
             server.workspaces[3].kept = Some(closed);
             let saved = persistence::tests::writer(&mut server, vec![]);

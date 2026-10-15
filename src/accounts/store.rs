@@ -5,9 +5,8 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
 use super::identity::{check_name, valid_name};
-use super::{
-    Account, Accounts, ClaudeOptions, Limits, Rule, absolute_home, agent_kind, agent_names, missing_account, new_uuid,
-};
+use super::{Account, Accounts, ClaudeOptions, Limits, Rule, absolute_home, agent_kind, agent_names, missing_account};
+use crate::identity::new_uuid;
 use crate::paths;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

@@ -430,7 +430,7 @@ impl Server {
             text.push_str(&line);
         }
         d.reviewed = Some(self.identities(&d));
-        let token = crate::accounts::new_uuid();
+        let token = crate::identity::new_uuid();
         self.plans.retain(|_, (made, _)| made.elapsed() < PLAN_LIFETIME);
         self.plans.insert(token.clone(), (Instant::now(), d));
         self.answer_runbook(reply, Ok(Response::Plan { text, token }));

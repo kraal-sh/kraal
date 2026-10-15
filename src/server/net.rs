@@ -14,29 +14,7 @@ use super::Server;
 use crate::layout::PaneId;
 use crate::theme::NoticeKind;
 
-/// What a tunnel forwards; kept across restarts.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TunnelSpec {
-    /// A known server's name, or the address of `via`.
-    pub server: String,
-    /// The connection itself, for a server kraal does not know by name: resolving a short name
-    /// again later could find another machine, and an address alone loses the key and the jump
-    /// host.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub via: Option<crate::servers::Server>,
-    /// Port on this machine (127.0.0.1).
-    pub local: u16,
-    /// Host as seen from the server (`localhost` for the server itself).
-    pub remote_host: String,
-    pub remote_port: u16,
-}
-
-impl TunnelSpec {
-    pub fn describe(&self) -> String {
-        let host = if self.remote_host == "localhost" { String::new() } else { format!("{}:", self.remote_host) };
-        format!("{}:{}{} → localhost:{}", self.server, host, self.remote_port, self.local)
-    }
-}
+pub use crate::servers::TunnelSpec;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]

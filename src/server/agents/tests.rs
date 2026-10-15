@@ -27,7 +27,7 @@ fn launch_picker_lists_only_installed_registry_entries() {
     assert!(!picker.items.iter().any(|i| i.label == "Aider"));
 
     let mut codex = t.server.accounts.get("claude", "from").unwrap();
-    codex.id = accounts::new_uuid();
+    codex.id = crate::identity::new_uuid();
     codex.agent = "codex".into();
     codex.home = t.dir.join("codex").display().to_string();
     t.server.accounts.add(codex).unwrap();
@@ -162,7 +162,7 @@ fn finishing_discovery_keeps_the_clicked_account_in_place() {
                 server
                     .accounts
                     .add(Account {
-                        id: accounts::new_uuid(),
+                        id: crate::identity::new_uuid(),
                         agent: "codex".into(),
                         name: name.into(),
                         home: format!("/nonexistent/{name}"),
@@ -309,7 +309,7 @@ fn signed_in(home: &std::path::Path, email: &str) {
 
 #[test]
 fn automatic_join_leaves_sources_unchanged_and_keeps_the_notice_until_attachment() {
-    use crate::{paths, persist};
+    use crate::paths;
 
     if !crate::testing::in_own_process(
         "server::agents::tests::automatic_join_leaves_sources_unchanged_and_keeps_the_notice_until_attachment",
@@ -338,7 +338,7 @@ fn automatic_join_leaves_sources_unchanged_and_keeps_the_notice_until_attachment
         assert_eq!(t.server.workspaces[0].definition_source.as_deref(), Some(baseline));
         t.server.refresh_source_status();
         assert_eq!(t.server.workspaces[0].source_status, edited.then_some("File changed"));
-        let snapshot = persist::snapshot(&t.server);
+        let snapshot = crate::server::persistence::snapshot(&t.server);
         assert_eq!(snapshot.workspaces[0].definition_source.as_deref(), Some(baseline));
 
         let notice = "~/.claude is Claude · work";
@@ -695,7 +695,7 @@ fn unrestored_accounts_follow_renames_but_never_replacements() {
                 "focus": null, "show_floating": true, "zoomed": false, "sync": false }] });
     let ws: crate::persist::WorkspaceSnap = serde_json::from_value(ws).unwrap();
     t.server.env.shell = t.dir.join("missing-shell").display().to_string();
-    crate::persist::apply(
+    crate::server::persistence::apply(
         &mut t.server,
         crate::persist::SessionSnapshot {
             version: 2,
@@ -735,7 +735,7 @@ fn unrestored_accounts_follow_renames_but_never_replacements() {
     };
     check(&t.server);
     t.server.accounts.remove("claude", "renamed");
-    t.server.accounts.add(Account { id: accounts::new_uuid(), name: "renamed".into(), ..old.clone() }).unwrap();
+    t.server.accounts.add(Account { id: crate::identity::new_uuid(), name: "renamed".into(), ..old.clone() }).unwrap();
     t.server.follow_renamed_accounts();
     check(&t.server);
     assert!(t.server.accounts.by_id(&old.id).is_none());
@@ -790,7 +790,7 @@ impl SwitchTest {
         std::fs::write(dir.join("from/projects/work/session.jsonl"), "{\"message\":1}\n").unwrap();
         let dir = dir.canonicalize().unwrap();
         let account = |name: &str| Account {
-            id: accounts::new_uuid(),
+            id: crate::identity::new_uuid(),
             agent: "claude".into(),
             name: name.into(),
             home: dir.join(name).display().to_string(),
@@ -989,7 +989,7 @@ fn queued_changes_recheck_the_current_conversation_and_account() {
                 let old = t.server.accounts.get("claude", "to").unwrap();
                 t.server.accounts.remove("claude", "to");
                 if changed == "replaced" {
-                    t.server.accounts.add(Account { id: accounts::new_uuid(), ..old }).unwrap();
+                    t.server.accounts.add(Account { id: crate::identity::new_uuid(), ..old }).unwrap();
                 }
             }
         }

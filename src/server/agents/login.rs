@@ -20,7 +20,7 @@ impl Server {
         );
         let home = accounts::default_home_for(agent, name);
         let a = Account {
-            id: crate::accounts::new_uuid(),
+            id: crate::identity::new_uuid(),
             name: name.into(),
             agent: agent.into(),
             home: home.display().to_string(),

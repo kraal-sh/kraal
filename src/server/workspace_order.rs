@@ -211,7 +211,7 @@ mod tests {
         let (tx, _rx2) = queue::channel(32);
         let mut restored = tests::server(tx);
         restored.config.workspace_dirs = server.config.workspace_dirs.clone();
-        persist::apply(&mut restored, persist::load(&session).unwrap().unwrap()).unwrap();
+        crate::server::persistence::apply(&mut restored, persist::load(&session).unwrap().unwrap()).unwrap();
         assert_eq!(names(&restored), ["b", "test", "a", "broken"]);
         let _writer = persistence::tests::writer(&mut restored, vec![]);
         let ws = restored.open_definition(&dir.join("b.kdl")).unwrap();
@@ -264,7 +264,7 @@ mod tests {
         let (tx, _rx2) = queue::channel(32);
         let mut restored = tests::server(tx);
         restored.config.workspace_dirs = server.config.workspace_dirs.clone();
-        persist::apply(&mut restored, serde_json::from_value(snap).unwrap()).unwrap();
+        crate::server::persistence::apply(&mut restored, serde_json::from_value(snap).unwrap()).unwrap();
         let _writer = persistence::tests::writer(&mut restored, vec![]);
         let ws = restored.restore_deleted_workspace(&identity, "b").unwrap();
         assert_eq!(names(&restored), ["x", "a", "b"]);

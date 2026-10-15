@@ -1,4 +1,4 @@
-//! Tiled layout of a tab: a tree of splits whose leaves are panes, or stacks of panes sharing a
+//! Layout of a tab: a tree of splits whose leaves are panes, or stacks of panes sharing a
 //! place.
 
 use std::collections::HashMap;
@@ -7,6 +7,36 @@ use ratatui::layout::Rect;
 use serde::{Deserialize, Serialize};
 
 pub use crate::workspace::Axis;
+
+/// A floating pane's position as fractions of the main area, so it follows resizes.
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct FloatRect {
+    pub x: f32,
+    pub y: f32,
+    pub w: f32,
+    pub h: f32,
+}
+
+impl FloatRect {
+    pub fn to_rect(self, area: Rect) -> Rect {
+        let w = ((self.w * area.width as f32).round() as u16).clamp(10.min(area.width), area.width);
+        let h = ((self.h * area.height as f32).round() as u16).clamp(5.min(area.height), area.height);
+        let x = area.x + ((self.x * area.width as f32).round() as u16).min(area.width - w);
+        let y = area.y + ((self.y * area.height as f32).round() as u16).min(area.height - h);
+        Rect::new(x, y, w, h)
+    }
+
+    pub fn from_rect(r: Rect, area: Rect) -> FloatRect {
+        let fw = area.width.max(1) as f32;
+        let fh = area.height.max(1) as f32;
+        FloatRect {
+            x: (r.x - area.x) as f32 / fw,
+            y: (r.y - area.y) as f32 / fh,
+            w: r.width as f32 / fw,
+            h: r.height as f32 / fh,
+        }
+    }
+}
 
 pub type PaneId = u32;
 

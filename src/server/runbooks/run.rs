@@ -788,7 +788,7 @@ mod tests {
                     None,
                 )
                 .unwrap();
-            let mut saved = crate::persist::snapshot(&server).workspaces.remove(0);
+            let mut saved = crate::server::persistence::snapshot(&server).workspaces.remove(0);
             saved.close_pending = Some(crate::persist::CloseIntent::new(Vec::new(), Vec::new()));
             server.workspaces[0].kept = Some(saved);
             let mut d = draft();
@@ -819,7 +819,7 @@ mod tests {
         let mut server = crate::server::tests::server(tx);
         let (client, _peer) = crate::server::tests::client(&mut server);
         crate::server::persistence::tests::writer(&mut server, vec![]);
-        let dir = std::env::temp_dir().join(format!("kraal-run-edit-{}", crate::accounts::new_uuid()));
+        let dir = std::env::temp_dir().join(format!("kraal-run-edit-{}", crate::identity::new_uuid()));
         std::fs::create_dir_all(dir.join("next")).unwrap();
         let release = dir.join("release");
         let marker = dir.join("queued-must-not-run");
@@ -895,7 +895,7 @@ mod tests {
         let ws = server.new_workspace("closed".into(), None);
         crate::server::persistence::tests::writer(&mut server, vec![]);
         server.keep_and_close_workspace(ws).unwrap();
-        let dir = std::env::temp_dir().join(format!("kraal-run-after-close-{}", crate::accounts::new_uuid()));
+        let dir = std::env::temp_dir().join(format!("kraal-run-after-close-{}", crate::identity::new_uuid()));
         std::fs::create_dir(&dir).unwrap();
         let spec = PaneSpec { command: vec!["sleep".into(), "60".into()], ..Default::default() };
         server.start_run(&draft(), 50, &dir.join("run.log"), vec![("job".into(), spec)], 1, None).unwrap();
@@ -904,7 +904,7 @@ mod tests {
         let pane = server.workspaces[1].panes()[0];
         assert!(server.workspaces[1].kept.is_none());
         assert!(server.panes[&pane].process_hold().unwrap().group_running());
-        let saved = crate::persist::snapshot(&server);
+        let saved = crate::server::persistence::snapshot(&server);
         assert!(!saved.workspaces[1].closed);
         let crate::persist::NodeSnap::Pane(job) = saved.workspaces[1].tabs[0].root.as_ref().unwrap() else {
             panic!("saved runbook pane")

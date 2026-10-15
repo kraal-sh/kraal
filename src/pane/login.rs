@@ -135,7 +135,7 @@ mod tests {
         let mut pane = super::super::tests::fed_pane(80, 24, 100);
         pane.spec.login = Some(Login {
             account: Account {
-                id: crate::accounts::new_uuid(),
+                id: crate::identity::new_uuid(),
                 name: "work".into(),
                 agent: "claude".into(),
                 home: "/tmp/work".into(),

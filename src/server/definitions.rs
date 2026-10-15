@@ -569,7 +569,7 @@ impl Server {
 
     /// Export from retained data so a closed workspace needs no processes.
     fn snapshot_definition(&self, wi: usize, name: &str) -> Result<WorkspaceDef> {
-        let snap = crate::persist::snapshot(self)
+        let snap = crate::server::persistence::snapshot(self)
             .workspaces
             .into_iter()
             .find(|w| w.id == self.workspaces[wi].stable_id)
@@ -647,7 +647,7 @@ mod tests {
         let path = dir.join("original.kdl");
         linked(&mut server, &path, "// unchanged\nlayout { pane; }");
         server.workspaces[0].name = "personal name".into();
-        server.unrestored = crate::persist::snapshot(&server).workspaces;
+        server.unrestored = crate::server::persistence::snapshot(&server).workspaces;
         server.unrestored[0].restore_error = Some("shell missing".into());
         server.workspaces.clear();
         for error in [server.open_definition(&path).unwrap_err(), server.open_workspace("personal name").unwrap_err()] {
@@ -680,7 +680,7 @@ mod tests {
             },
         );
         assert!(result.unwrap().unwrap_err().contains("several saved workspaces"));
-        server.unrestored = crate::persist::snapshot(&server).workspaces.into_iter().skip(1).collect();
+        server.unrestored = crate::server::persistence::snapshot(&server).workspaces.into_iter().skip(1).collect();
         server.workspaces.pop();
         assert!(server.open_workspace("same").unwrap_err().to_string().contains("several saved workspaces"));
         server.workspaces.clear();
@@ -746,7 +746,7 @@ mod tests {
         server.workspaces[oi].set_definition(Some(&dir.join("symlink.kdl")));
         assert!(server.prepare_layout_export(wi, &path).is_err(), "a missing file is still owned through its symlink");
         // A workspace whose panes could not be restored owns its file too.
-        server.unrestored = crate::persist::snapshot(&server).workspaces.into_iter().skip(1).collect();
+        server.unrestored = crate::server::persistence::snapshot(&server).workspaces.into_iter().skip(1).collect();
         server.workspaces.pop();
         assert!(server.prepare_layout_export(wi, &path).is_err());
         std::fs::remove_dir_all(dir).unwrap();
@@ -775,7 +775,7 @@ mod tests {
         assert!(error.contains(&backup.display().to_string()), "{error}");
         assert!(server.prepare_layout_export(wi, &a).err().unwrap().to_string().contains("belongs to workspace \"b\""));
         // A workspace that could not restore its panes also owns its backup destination.
-        server.unrestored = crate::persist::snapshot(&server).workspaces.into_iter().skip(1).collect();
+        server.unrestored = crate::server::persistence::snapshot(&server).workspaces.into_iter().skip(1).collect();
         server.workspaces.pop();
         assert!(server.prepare_layout_export(wi, &a).err().unwrap().to_string().contains("belongs to workspace \"b\""));
         assert_eq!(std::fs::read_to_string(&a).unwrap(), source);
@@ -808,11 +808,11 @@ mod tests {
             old.start_definition_inner(&def, Some(dir.join(file))).unwrap();
         }
         // Older snapshots have different layouts at two aliases, and no recorded source.
-        let json = serde_json::to_value(crate::persist::snapshot(&old)).unwrap();
+        let json = serde_json::to_value(crate::server::persistence::snapshot(&old)).unwrap();
         assert!(json["workspaces"].as_array().unwrap().iter().all(|w| w.get("definition_source").is_none()));
         let mut restored = server();
         restored.config.workspace_dirs.push(dir.display().to_string());
-        crate::persist::apply(&mut restored, serde_json::from_value(json).unwrap()).unwrap();
+        crate::server::persistence::apply(&mut restored, serde_json::from_value(json).unwrap()).unwrap();
         assert_eq!(restored.workspaces.len(), 2);
         let (alpha, beta) = (restored.workspaces[0].id, restored.workspaces[1].id);
         assert_eq!(restored.workspaces[0].panes().len(), 1);

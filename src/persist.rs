@@ -11,17 +11,15 @@
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::time::Instant;
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::layout::{Axis, Node, PaneId, Preset};
+use crate::layout::{Axis, FloatRect, Preset};
 use crate::pane::PaneSpec;
 use crate::paths;
-use crate::server::{FloatRect, Floating, Server, Tab};
 
-const VERSION: u32 = 2;
+pub(crate) const VERSION: u32 = 2;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct SessionSnapshot {
@@ -34,7 +32,7 @@ pub struct SessionSnapshot {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub removed_sources: Vec<PathBuf>,
     #[serde(default)]
-    pub tunnels: Vec<crate::server::net::TunnelSpec>,
+    pub tunnels: Vec<crate::servers::TunnelSpec>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -93,7 +91,7 @@ pub struct WorkspaceSnap {
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub unopened: bool,
     #[serde(default)]
-    pub sync: crate::server::SyncScope,
+    pub sync: crate::workspace::SyncScope,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub restore_error: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -130,7 +128,7 @@ impl CloseIntent {
 impl WorkspaceSnap {
     pub fn duplicate(&self, name: &str) -> Result<Self> {
         let mut copy = self.clone();
-        copy.id = crate::accounts::new_uuid();
+        copy.id = crate::identity::new_uuid();
         copy.name = name.into();
         copy.definition = None;
         copy.definition_source = None;
@@ -141,7 +139,7 @@ impl WorkspaceSnap {
         copy.close_pending = None;
         copy.delete_pending = false;
         copy.restore_error = None;
-        copy.sync = crate::server::SyncScope::Off;
+        copy.sync = crate::workspace::SyncScope::Off;
         if self.unopened {
             let mut def = crate::workspace::parse_workspace(
                 name,
@@ -201,7 +199,7 @@ impl WorkspaceSnap {
                 if (p.spec.account.is_some() || p.spec.account_id.is_some())
                     && let Some(flag) = kind.session_flag
                 {
-                    let id = crate::accounts::new_uuid();
+                    let id = crate::identity::new_uuid();
                     command.extend([flag.to_string(), id.clone()]);
                     p.spec.session = Some(id);
                 }
@@ -234,7 +232,7 @@ impl WorkspaceSnap {
         Ok(copy)
     }
 
-    fn clear_scrollback(&mut self) {
+    pub(crate) fn clear_scrollback(&mut self) {
         if let Some(undo) = &mut self.layout_undo {
             undo.clear_scrollback();
         }
@@ -347,164 +345,6 @@ pub struct PaneSnap {
     /// The file in the session's scrollback directory holding what the pane showed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scrollback: Option<String>,
-}
-
-/// What is saved of a pane's scrollback.
-#[derive(Debug, Clone)]
-pub struct SavedScrollback {
-    /// Its file in the session's scrollback directory, once there was text to save.
-    pub file: Option<String>,
-    /// When it was read from the pane: output since is not in it.
-    pub taken: Instant,
-    /// Writing it failed: it is saved again, whether the pane printed since or not.
-    pub retry: bool,
-}
-
-pub fn snapshot(server: &Server) -> SessionSnapshot {
-    let pane_snap = |id: PaneId| -> PaneSnap {
-        if let Some(pane) = server.edited_pane_snapshot(id) {
-            return pane;
-        }
-        let p = &server.panes[&id];
-        let mut spec = p.spec.clone();
-        server.accounts.bind_pane(&mut spec);
-        if !p.suspended {
-            spec.startup_input = None;
-        }
-        if let crate::pane::Content::Files(f) = &p.content {
-            use crate::files::Side;
-            spec.files = Some([f.location(Side::Left).saved(), f.location(Side::Right).saved()]);
-        }
-        if spec.preview.is_none()
-            && let Some(cwd) = p.current_cwd()
-        {
-            spec.cwd = Some(cwd);
-        }
-        // An agent that exited keeps its conversation, not what kind of agent it was: the
-        // command it ran tells, so that a restart can still resume it.
-        let agent = p.agent.kind.clone().or_else(|| {
-            let program = spec.command.first()?.rsplit('/').next()?;
-            p.agent.session_id.as_ref()?;
-            crate::accounts::agents().find(|k| k.command == program).map(|k| k.name.to_string())
-        });
-        PaneSnap {
-            name: p.name.clone(),
-            spec,
-            agent,
-            agent_session: p.agent.session_id.clone(),
-            stopped: p.exit_code.is_some() || p.suspended,
-            scrollback: server.scrollback.get(&id).and_then(|s| s.file.clone()),
-        }
-    };
-    fn node(n: &Node, f: &dyn Fn(PaneId) -> PaneSnap) -> NodeSnap {
-        match n {
-            Node::Leaf(id) => NodeSnap::Pane(Box::new(f(*id))),
-            Node::Split { axis, children } => NodeSnap::Split {
-                axis: *axis,
-                children: children.iter().map(|(c, w)| (node(c, f), *w)).collect(),
-                stacked: false,
-                open: None,
-            },
-            Node::Stack { panes, open } => NodeSnap::Split {
-                axis: Axis::Column,
-                children: panes.iter().map(|p| (NodeSnap::Pane(Box::new(f(*p))), 1.0)).collect(),
-                stacked: true,
-                open: panes.iter().position(|p| p == open),
-            },
-        }
-    }
-    let mut workspaces: Vec<WorkspaceSnap> = server
-        .workspaces
-        .iter()
-        .map(|ws| {
-            if let Some(kept) = &ws.kept {
-                let mut kept = kept.clone();
-                kept.name = ws.name.clone();
-                kept.definition = ws.definition.clone();
-                // Older snapshots kept the recipe in definition_source.
-                if kept.unopened && kept.pending_layout.is_none() {
-                    kept.pending_layout = kept.definition_source.clone();
-                }
-                kept.definition_source = ws.definition_source.clone();
-                kept.source_reviewed = ws.source_reviewed.clone();
-                kept.layout_undo = ws.layout_undo.clone();
-                kept.delete_pending = ws.delete_pending;
-                kept.bind_accounts(&server.accounts);
-                return kept;
-            }
-            let mut saved = WorkspaceSnap {
-                id: ws.stable_id.clone(),
-                name: ws.name.clone(),
-                definition: ws.definition.clone(),
-                definition_source: ws.definition_source.clone(),
-                source_reviewed: ws.source_reviewed.clone(),
-                layout_undo: ws.layout_undo.clone(),
-                cwd: ws.cwd.clone(),
-                active: ws.active,
-                // Typing is never broadcast after a restart: it starts again only when asked.
-                sync: crate::server::SyncScope::Off,
-                restore_error: None,
-                pending_layout: None,
-                closed: false,
-                empty: false,
-                close_pending: None,
-                delete_pending: ws.delete_pending,
-                unopened: false,
-                tabs: ws
-                    .tabs
-                    .iter()
-                    .map(|t| {
-                        // Login panes and shown paste buffers may hold secrets and must not return.
-                        let floating: Vec<&crate::server::Floating> = t
-                            .floating
-                            .iter()
-                            .filter(|f| {
-                                !server.panes.get(&f.pane).is_some_and(|p| p.shows_text() || p.spec.login.is_some())
-                            })
-                            .collect();
-                        let mut kept = t.root.as_ref().map(|r| r.leaves()).unwrap_or_default();
-                        kept.extend(floating.iter().map(|f| f.pane));
-                        TabSnap {
-                            name: t.name.clone(),
-                            root: t.root.as_ref().map(|r| node(r, &pane_snap)),
-                            floating: floating.iter().map(|f| (pane_snap(f.pane), f.rect)).collect(),
-                            focus: t.focus.and_then(|f| kept.iter().position(|p| *p == f)),
-                            show_floating: t.show_floating && !floating.is_empty(),
-                            zoomed: t.zoom.is_some(),
-                            sync: false,
-                            preset: t.preset,
-                        }
-                    })
-                    .collect(),
-            };
-            let has_panes = |t: &&TabSnap| t.root.is_some() || !t.floating.is_empty();
-            if let Some(undo) = &mut saved.layout_undo {
-                undo.bind_accounts(&server.accounts);
-            }
-            saved.active = saved.tabs.iter().take(ws.active).filter(has_panes).count();
-            saved.tabs.retain(|t| t.root.is_some() || !t.floating.is_empty());
-            saved.empty = saved.tabs.is_empty();
-            saved
-        })
-        .chain(server.unrestored.iter().cloned())
-        .collect();
-    let mut deleted_workspaces = server.deleted_workspaces.clone();
-    for deleted in &mut deleted_workspaces {
-        deleted.workspace.bind_accounts(&server.accounts);
-    }
-    if !server.config.save_scrollback {
-        for ws in workspaces.iter_mut().chain(deleted_workspaces.iter_mut().map(|d| &mut d.workspace)) {
-            ws.clear_scrollback();
-        }
-    }
-    SessionSnapshot {
-        workspace_order: server.workspace_order.clone(),
-        version: VERSION,
-        workspaces,
-        deleted_workspaces,
-        removed_sources: server.removed_sources.clone(),
-        tunnels: server.tunnels.iter().map(|t| t.spec.clone()).collect(),
-    }
 }
 
 /// Write the state, in place once a crash of the machine cannot undo it (and so the scrollback
@@ -630,7 +470,7 @@ pub fn forget_scrollback(session: &str) -> std::io::Result<bool> {
 }
 
 /// Whether the state may name `file` as a pane's scrollback: a plain name in its directory.
-fn scrollback_name(file: &str) -> bool {
+pub(crate) fn scrollback_name(file: &str) -> bool {
     !file.is_empty()
         && !file.starts_with('.')
         && file.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
@@ -829,207 +669,6 @@ pub fn resume_command(agent: &str, session: &str) -> Option<String> {
     }
 }
 
-pub fn apply(server: &mut Server, mut snap: SessionSnapshot) -> Result<()> {
-    server.workspace_order = snap.workspace_order;
-    server.deleted_workspaces = snap.deleted_workspaces;
-    server.removed_sources = snap.removed_sources;
-    for deleted in &mut server.deleted_workspaces {
-        deleted.workspace.bind_accounts(&server.accounts);
-    }
-    for t in &snap.tunnels {
-        let host = if t.remote_host.contains(':') { format!("[{}]", t.remote_host) } else { t.remote_host.clone() };
-        let remote = format!("{host}:{}", t.remote_port);
-        // A tunnel through a connection kraal knows by no name goes through that same connection.
-        let added = match &t.via {
-            Some(via) => server.add_tunnel_to(via.clone(), &remote, Some(t.local)),
-            None => server.add_tunnel(&t.server, &remote, Some(t.local)),
-        };
-        if let Err(e) = added {
-            server.warnings.push(format!("tunnel {}: {e:#}", t.describe()));
-        }
-    }
-    snap.workspaces
-        .sort_by_key(|w| WorkspaceKey::position(&server.workspace_order, Some(&w.id), w.definition.as_deref()));
-    for mut ws in snap.workspaces {
-        if ws.id.is_empty() {
-            ws.id = crate::accounts::new_uuid();
-        }
-        ws.bind_accounts(&server.accounts);
-        let panes_before: std::collections::HashSet<PaneId> = server.panes.keys().copied().collect();
-        let workspaces_before: Vec<u32> = server.workspaces.iter().map(|w| w.id).collect();
-        if let Err(e) = apply_workspace(server, &ws) {
-            server.rollback(&panes_before, &workspaces_before);
-            ws.restore_error = Some(format!("{e:#}"));
-            server.warnings.push(format!(
-                "could not restore workspace {}: {e:#}; it stays saved; fix the cause and restart the session",
-                ws.name
-            ));
-            server.unrestored.push(ws);
-        }
-    }
-    server.sort_workspaces();
-    server.relayout();
-    Ok(())
-}
-
-pub(crate) fn apply_workspace(server: &mut Server, ws: &WorkspaceSnap) -> Result<()> {
-    let closed = ws.closed || ws.close_pending.is_some() || ws.delete_pending;
-    let id = if closed {
-        server.new_workspace_record(ws.name.clone(), ws.definition.clone())
-    } else {
-        server.new_workspace(ws.name.clone(), ws.definition.clone())
-    };
-    let wi = server.ws_index(id).unwrap();
-    server.workspaces[wi].stable_id = ws.id.clone();
-    server.workspaces[wi].name = ws.name.clone();
-    server.workspaces[wi].cwd = ws.cwd.clone();
-    server.workspaces[wi].definition_source = ws.definition_source.clone();
-    server.workspaces[wi].source_reviewed = ws.source_reviewed.clone();
-    server.workspaces[wi].layout_undo = ws.layout_undo.clone();
-    server.workspaces[wi].delete_pending = ws.delete_pending;
-    if closed {
-        server.workspaces[wi].kept = Some(ws.clone());
-    } else {
-        restore_workspace_tabs(server, wi, ws)?;
-    }
-    Ok(())
-}
-
-pub(crate) fn restore_workspace_tabs(server: &mut Server, wi: usize, ws: &WorkspaceSnap) -> Result<()> {
-    if ws.empty {
-        return Ok(());
-    }
-    for t in &ws.tabs {
-        let tab_id = server.alloc_id();
-        let mut tab = Tab::new(tab_id, t.name.clone());
-        tab.preset = t.preset;
-        if let Some(root) = &t.root {
-            tab.root = Some(build(server, root)?);
-        }
-        for (p, rect) in &t.floating {
-            if p.spec.close_on_success {
-                continue;
-            }
-            let pane = spawn(server, p)?;
-            tab.floating.push(Floating { pane, rect: *rect });
-        }
-        let panes = tab.panes();
-        if panes.is_empty() {
-            continue;
-        }
-        let focus = t.focus.and_then(|i| panes.get(i).copied()).unwrap_or(panes[0]);
-        tab.show_floating = t.show_floating && !tab.floating.is_empty();
-        tab.set_focus(focus);
-        if t.zoomed && !tab.is_floating(focus) {
-            tab.zoom = Some(focus);
-        }
-        server.workspaces[wi].tabs.push(tab);
-    }
-    anyhow::ensure!(!server.workspaces[wi].tabs.is_empty(), "the saved workspace has no restorable panes");
-    server.workspaces[wi].active = ws.active.min(server.workspaces[wi].tabs.len() - 1);
-    Ok(())
-}
-
-fn build(server: &mut Server, n: &NodeSnap) -> Result<Node> {
-    Ok(match n {
-        NodeSnap::Pane(p) => Node::Leaf(spawn(server, p)?),
-        NodeSnap::Split { children, stacked: true, open, .. } => {
-            let mut panes = Vec::new();
-            for (c, _) in children {
-                panes.extend(build(server, c)?.leaves());
-            }
-            let open = open.and_then(|i| panes.get(i)).or(panes.first()).copied().context("an empty stack")?;
-            let mut node = Node::Stack { panes, open };
-            node.normalize();
-            node
-        }
-        NodeSnap::Split { axis, children, .. } => {
-            let mut out = Vec::new();
-            for (c, w) in children {
-                out.push((build(server, c)?, *w));
-            }
-            let mut node = Node::Split { axis: *axis, children: out };
-            node.normalize();
-            node
-        }
-    })
-}
-
-fn spawn(server: &mut Server, p: &PaneSnap) -> Result<PaneId> {
-    // An agent that was still waiting for its account waits again, and is resolved again.
-    if p.spec.pending_agent.is_some() {
-        let id = server.spawn_pane_suspended(p.name.clone(), p.spec.clone(), "choosing the account")?;
-        restore_scrollback(server, id, p);
-        server.resolve_pending_agent(id);
-        return Ok(id);
-    }
-    let mut spec = p.spec.clone();
-    let mut resumed = false;
-    if spec.account.is_some() {
-        // Agents started from the agent manager resume on their account; a one-shot run or a
-        // prompt on the command line waits for Enter instead of running again by itself.
-        (spec, resumed) = server.resume_spec(&spec, p.agent_session.as_deref());
-    } else if let (Some(agent), Some(session)) = (&p.agent, &p.agent_session) {
-        if spec.command.is_empty() {
-            spec.startup_input = resume_command(agent, session);
-        } else if let Some(kind) = crate::accounts::agent_kind(agent)
-            && let Some((command, exact)) = crate::accounts::resume_argv(kind, &spec.command, session)
-        {
-            // An agent run as a plain command (`kraal run -- claude`) resumes too.
-            spec.command = command;
-            resumed = exact;
-        }
-    }
-    // Reconnecting an SSH shell and resuming agents is safe; any other command (a deploy, a
-    // cleanup, a tool run on a server…) waits for Enter, and so does one that had finished.
-    let ssh_shell = spec.command.first().is_some_and(|c| c.rsplit('/').next() == Some("ssh"))
-        && !crate::servers::ssh_runs_command(&spec.command[1..]);
-    let auto = ssh_shell || resumed;
-    let id = if p.stopped || (!spec.command.is_empty() || p.spec.startup_input.is_some()) && !auto {
-        let why = if p.stopped { "it was not running before the restart" } else { "restored session" };
-        server.spawn_pane_suspended(p.name.clone(), spec, why)?
-    } else {
-        server.spawn_pane(p.name.clone(), spec)?
-    };
-    restore_scrollback(server, id, p);
-    if let (Some(agent), Some(pane)) = (&p.agent, server.panes.get_mut(&id))
-        && p.agent_session.is_some()
-    {
-        pane.agent.session_id = p.agent_session.clone();
-        let _ = agent;
-    }
-    Ok(id)
-}
-
-/// Show in pane `id` what the pane it replaces showed, before anything its program writes (that
-/// is read later, on the event loop). The file stays the pane's until its text is saved again.
-fn restore_scrollback(server: &mut Server, id: PaneId, p: &PaneSnap) {
-    let Some(file) = p.scrollback.as_deref().filter(|f| scrollback_name(f)) else { return };
-    if !server.config.save_scrollback {
-        return;
-    }
-    let path = paths::scrollback_dir(&server.session).join(file);
-    let text = match paths::read_regular(&path, crate::pane::MAX_SAVED_BYTES as u64) {
-        Ok(t) => t,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
-        Err(e) => {
-            server.warnings.push(format!("could not show the scrollback saved in {}: {e}", paths::shorten_home(&path)));
-            return;
-        }
-    };
-    let saved_at = std::fs::metadata(&path).and_then(|m| m.modified()).ok().map(crate::text::unix_seconds);
-    let Some(pane) = server.panes.get_mut(&id) else { return };
-    // What the pane's history holds: older lines would only scroll out of it.
-    let lines = server.env.scrollback + usize::from(pane.rows);
-    // A file is one pane's: another naming it gets a new one when its text is saved.
-    if pane.restore_scrollback(&text, saved_at, lines)
-        && !server.scrollback.values().any(|s| s.file.as_deref() == Some(file))
-    {
-        let saved = SavedScrollback { file: Some(file.to_string()), taken: Instant::now(), retry: false };
-        server.scrollback.insert(id, saved);
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1044,8 +683,47 @@ mod tests {
     }
 
     #[test]
+    fn shared_types_keep_the_v2_names_geometry_and_saved_connection() {
+        let original = saved_state();
+        let defaults = parse(&serde_json::to_vec(&original).unwrap()).unwrap();
+        assert_eq!(defaults.workspaces[0].sync, crate::workspace::SyncScope::Off);
+        assert!(!defaults.workspaces[0].empty);
+        assert!(defaults.tunnels.is_empty());
+        for sync in ["off", "tab", "workspace", "marked"] {
+            let mut value = original.clone();
+            value["workspaces"][0]["sync"] = sync.into();
+            let pane = value["workspaces"][0]["tabs"][0]["root"]["Pane"].clone();
+            value["workspaces"][0]["tabs"][0]["floating"] = serde_json::json!([
+                [pane, {"x": 0.125, "y": 0.25, "w": 0.5, "h": 0.75}]
+            ]);
+            value["tunnels"] = serde_json::json!([{
+                "server": "saved-connection",
+                "via": {"name": "", "host": "example.invalid", "user": "alice", "port": 2222,
+                    "jump": "gateway", "identity": "/saved/key"},
+                "local": 15432, "remote_host": "::1", "remote_port": 5432
+            }]);
+            let snap = parse(&serde_json::to_vec(&value).unwrap()).unwrap();
+            let encoded = serde_json::to_value(&snap).unwrap();
+            assert_eq!(encoded["workspaces"][0]["sync"], value["workspaces"][0]["sync"]);
+            assert_eq!(
+                encoded["workspaces"][0]["tabs"][0]["floating"][0][1],
+                value["workspaces"][0]["tabs"][0]["floating"][0][1]
+            );
+            let via = snap.tunnels[0].via.as_ref().unwrap();
+            assert_eq!(via.host, "example.invalid");
+            assert_eq!(via.user.as_deref(), Some("alice"));
+            assert_eq!(via.port, Some(2222));
+            assert_eq!(via.jump.as_deref(), Some("gateway"));
+            assert_eq!(via.identity.as_deref(), Some("/saved/key"));
+            assert_eq!(snap.tunnels[0].describe(), "saved-connection:::1:5432 → localhost:15432");
+            let again = parse(&serde_json::to_vec(&snap).unwrap()).unwrap();
+            assert_eq!(again.tunnels, snap.tunnels);
+        }
+    }
+
+    #[test]
     fn old_state_is_refused_and_current_state_takes_precedence() {
-        let dir = std::env::temp_dir().join(format!("kraal-state-refusal-{}", crate::accounts::new_uuid()));
+        let dir = std::env::temp_dir().join(format!("kraal-state-refusal-{}", crate::identity::new_uuid()));
         let current = dir.join("sessions-v2/main.json");
         let legacy = dir.join("sessions/main.json");
         let scrollback = dir.join("scrollback/main/1-2-3.ans");
@@ -1107,7 +785,7 @@ mod tests {
         ws.definition = Some("/source.kdl".into());
         ws.definition_source = Some("original source".into());
         ws.cwd = Some("/project".into());
-        ws.sync = crate::server::SyncScope::Workspace;
+        ws.sync = crate::workspace::SyncScope::Workspace;
         ws.tabs[0].sync = true;
         ws.tabs[0].zoomed = true;
         let Some(NodeSnap::Pane(p)) = &mut ws.tabs[0].root else { panic!() };
@@ -1145,7 +823,7 @@ mod tests {
         assert!(copied.closed);
         assert_eq!(copied.counts(), (1, 2));
         assert!(copied.definition.is_none() && copied.definition_source.is_none());
-        assert_eq!(copied.sync, crate::server::SyncScope::Off);
+        assert_eq!(copied.sync, crate::workspace::SyncScope::Off);
         let tab = &copied.tabs[0];
         assert!(!tab.sync);
         assert!(tab.zoomed);
@@ -1239,7 +917,7 @@ mod tests {
     }
 
     fn assert_state_refused(source: &[u8], reason: &str) {
-        let session = format!("invalid-state-{}", crate::accounts::new_uuid());
+        let session = format!("invalid-state-{}", crate::identity::new_uuid());
         let path = paths::session_state_path(&session);
         let dir = path.parent().unwrap();
         std::fs::create_dir_all(dir).unwrap();

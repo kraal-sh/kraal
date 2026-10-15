@@ -100,7 +100,7 @@ pub(super) fn accounts(action: AccountsCmd) -> Result<()> {
                 .or_else(|| existing.as_ref().map(|a| a.home.clone()))
                 .unwrap_or_else(|| accounts::default_home_for(&agent, &name).display().to_string());
             let a = accounts::Account {
-                id: accounts::new_uuid(),
+                id: crate::identity::new_uuid(),
                 name,
                 agent,
                 home: accounts::absolute_home(&home)?,
@@ -410,7 +410,7 @@ fn exec_agent(
             .choose(agent, workspace, cwd.as_deref(), &usage, accounts::now())
             .context("no account allowed here: the matching rule in accounts.toml names none")?,
     };
-    let session = accounts::agent_kind(agent).and_then(|k| k.session_flag).map(|_| accounts::new_uuid());
+    let session = accounts::agent_kind(agent).and_then(|k| k.session_flag).map(|_| crate::identity::new_uuid());
     let mut launch = accounts::launch(&a, args, None, session.as_deref())?;
     launch.env.extend(env.iter().cloned());
     run_with(&launch, true).map(|_| ())
