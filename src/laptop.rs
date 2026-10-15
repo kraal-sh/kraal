@@ -1,4 +1,4 @@
-//! Listings served by the attached laptop, within its own configured scope.
+//! Files served by the attached laptop, within its own configured scope.
 
 use std::ffi::{CStr, CString};
 use std::fs::File;
@@ -11,6 +11,8 @@ use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 
 use crate::files::Entry;
+
+pub mod copy;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Identity {
@@ -95,9 +97,8 @@ fn errno() -> *mut libc::c_int {
     unsafe { libc::__error() }
 }
 
-pub fn list(path: &str, home: &Path, scope: Scope, macos: bool) -> Result<(String, Vec<Entry>)> {
-    ensure!(scope != Scope::Off, "Laptop files are off: change laptop_files.scope on the laptop to enable listing");
-    ensure!(!path.is_empty(), "choose a directory inside the laptop scope");
+fn scoped_path(path: &str, home: &Path, scope: Scope, macos: bool) -> Result<(PathBuf, PathBuf)> {
+    ensure!(scope != Scope::Off, "Laptop files are off: enable them in config.toml on the laptop");
     let home = home.canonicalize().context("cannot resolve the laptop home directory")?;
     let requested = Path::new(path);
     let path = if let Ok(rest) = requested.strip_prefix("~") { home.join(rest) } else { PathBuf::from(path) };
@@ -115,6 +116,17 @@ pub fn list(path: &str, home: &Path, scope: Scope, macos: bool) -> Result<(Strin
             );
         }
     }
+    Ok((home, path))
+}
+
+pub fn list(path: &str, home: &Path, scope: Scope, macos: bool) -> Result<(String, Vec<Entry>)> {
+    list_directory(path, home, scope, macos, false)
+}
+
+fn list_directory(path: &str, home: &Path, scope: Scope, macos: bool, strict: bool) -> Result<(String, Vec<Entry>)> {
+    ensure!(scope != Scope::Off, "Laptop files are off: change laptop_files.scope on the laptop to enable listing");
+    ensure!(!path.is_empty(), "choose a directory inside the laptop scope");
+    let (home, path) = scoped_path(path, home, scope, macos)?;
     let fd = open_directory(&path)?;
     // SAFETY: fd is a live directory descriptor. Ownership passes only on success.
     let raw = unsafe { libc::fdopendir(fd.as_raw_fd()) };
@@ -147,6 +159,7 @@ pub fn list(path: &str, home: &Path, scope: Scope, macos: bool) -> Result<(Strin
         // SAFETY: name belongs to this directory stream and stat has space for libc::stat.
         let ok = unsafe { libc::fstatat(dirfd, name.as_ptr(), stat.as_mut_ptr(), libc::AT_SYMLINK_NOFOLLOW) };
         if ok != 0 {
+            ensure!(!strict, "cannot inspect laptop item: {}", io::Error::last_os_error());
             continue;
         }
         let stat = unsafe { stat.assume_init() };

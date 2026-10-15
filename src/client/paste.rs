@@ -92,6 +92,8 @@ struct Permissions {
     server: Vec<Permission>,
     #[serde(default)]
     clipboard_image: Vec<Permission>,
+    #[serde(default)]
+    laptop_copy: Vec<Permission>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -121,20 +123,33 @@ pub fn image_allowed(path: &Path, ssh: &[String]) -> bool {
 }
 
 pub fn remember_image(path: &Path, ssh: &[String], name: &str) -> Result<()> {
-    remember_permission(path, ssh, name, true)
+    remember_permission(path, ssh, name, |p| &mut p.clipboard_image)
 }
 
 pub fn remember(path: &Path, ssh: &[String], name: &str) -> Result<()> {
-    remember_permission(path, ssh, name, false)
+    remember_permission(path, ssh, name, |p| &mut p.server)
 }
 
-fn remember_permission(path: &Path, ssh: &[String], name: &str, image: bool) -> Result<()> {
+pub fn laptop_allowed(path: &Path, ssh: &[String]) -> bool {
+    permissions(path).is_ok_and(|p| p.laptop_copy.iter().any(|server| server.ssh == ssh))
+}
+
+pub fn remember_laptop(path: &Path, ssh: &[String], name: &str) -> Result<()> {
+    remember_permission(path, ssh, name, |p| &mut p.laptop_copy)
+}
+
+fn remember_permission(
+    path: &Path,
+    ssh: &[String],
+    name: &str,
+    entries: impl FnOnce(&mut Permissions) -> &mut Vec<Permission>,
+) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
     crate::paths::locked(path, || {
         let mut p = permissions(path)?;
-        let entries = if image { &mut p.clipboard_image } else { &mut p.server };
+        let entries = entries(&mut p);
         if !entries.iter().any(|server| server.ssh == ssh) {
             entries.push(Permission { name: name.into(), ssh: ssh.to_vec() });
         }

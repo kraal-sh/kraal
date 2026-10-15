@@ -365,6 +365,7 @@ fn exchange(stream: &mut UnixStream, msg: &ClientMsg) -> Result<Result<Response,
                 | ServerMsg::AttachmentOffer { .. }
                 | ServerMsg::AttachmentAck { .. }
                 | ServerMsg::AttachmentResult { .. }
+                | ServerMsg::LaptopCopy { .. }
                 | ServerMsg::LaptopList { .. }
                 | ServerMsg::LaptopListAck { .. }
                 | ServerMsg::Unknown(_) => continue,
@@ -1322,6 +1323,7 @@ pub fn attach(mut target: Target, mut workspace: Option<String>, mouse: bool, at
                                 attachments.connected();
                                 attachments.reconnect();
                             }
+                            Ok(ServerMsg::LaptopCopy { token, message }) => laptop.copy_message(token, message),
                             Ok(ServerMsg::LaptopListAck { pane, side, request }) => {
                                 laptop.acknowledge(pane, side, request)
                             }
@@ -1508,7 +1510,7 @@ mod tests {
         assert_eq!(refusal_version("no such workspace"), None);
         assert_eq!(
             refusal_version(
-                "protocol mismatch: client protocol 4, server protocol 3 (kraal 0.4.0, session work); run `kraal -s work restart`"
+                "protocol mismatch: client protocol 5, server protocol 3 (kraal 0.4.0, session work); run `kraal -s work restart`"
             ),
             Some((3, "0.4.0")),
         );
@@ -1532,7 +1534,7 @@ mod tests {
                 clipboard_native: false,
             };
             let reason = format!(
-                "protocol mismatch: client protocol 4, server protocol 3 (kraal 0.4.0, session {session}); run `kraal -s {session} restart`"
+                "protocol mismatch: client protocol 5, server protocol 3 (kraal 0.4.0, session {session}); run `kraal -s {session} restart`"
             );
             let rewritten = attach_refusal(&reason, &target).unwrap();
             let command =
@@ -1540,7 +1542,7 @@ mod tests {
             assert_eq!(
                 rewritten,
                 format!(
-                    "protocol mismatch: client protocol 4, server protocol 3 (kraal 0.4.0, session {session}); run `{command}`"
+                    "protocol mismatch: client protocol 5, server protocol 3 (kraal 0.4.0, session {session}); run `{command}`"
                 )
             );
             assert_eq!(attach_refusal("no such workspace", &target), None);

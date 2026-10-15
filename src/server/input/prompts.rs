@@ -474,6 +474,7 @@ impl Server {
                     ConfirmAction::AttachFiles(pane) => return self.offer_attachments(id, Some(pane)),
                     ConfirmAction::PurgeAttachments => self.purge_attachments(id),
                     ConfirmAction::Quit => self.quit(id),
+                    ConfirmAction::LaptopCopy { owner, spec } => self.start_laptop_copy(id, &owner, spec),
                     ConfirmAction::Job { label, args } => self.start_job(id, &label, args),
                     ConfirmAction::GitJob { label, script } => {
                         self.git_job(id, &label, script, crate::server::worktrees::JobEnd::CloseOnSuccess)

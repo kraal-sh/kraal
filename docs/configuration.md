@@ -163,7 +163,8 @@ Larger or recursive transfers use `kraal cp`. See
 ## Laptop files
 
 This setting belongs to the laptop running `attach --host`. It is read again for each file
-manager listing request. The local client asks for permission before listing anything.
+manager listing or copy request. The local client asks for permission before listing or
+reading anything. Permission to copy sends files from the laptop to the session machine.
 
 ```toml config
 [laptop_files]
@@ -174,7 +175,10 @@ scope = "home"
 entries directly inside your home, and `~/Library` on macOS, even when hidden files are shown.
 Hidden files in deeper directories follow the file manager's `.` key. All allows directories
 anywhere your user can read; off refuses every request, including remembered permissions.
-Neither enabled scope follows symbolic links. An unreadable or invalid config refuses listing.
+Neither enabled scope follows symbolic links when opening directories or files. Copies preserve
+links whose targets resolve inside the scope and refuse links that escape it. An unreadable
+or invalid config refuses both listing and copying. A selected folder is copied recursively,
+including its nested hidden files.
 
 **Allow** lasts for the current attach, including reconnects. **Always** stores a `[[server]]`
 entry with `name` and `ssh` in `~/.config/kraal/laptop-files.toml` (or under

@@ -359,7 +359,9 @@ remembers permission on the laptop for this SSH destination, including its conne
 Subsequent eligible pastes, including on another attach, send without asking. Broadcasting still
 asks to send only to the named pane. The choice is never permission for the server to read laptop
 files on its own. Browsing the laptop in the [file manager](servers.md#the-file-manager)
-has a separate local consent question and permission file, `laptop-files.toml`.
+and copying its files to the session machine have a separate local consent question and
+permission file, `laptop-files.toml`. File-manager copies keep the laptop originals and are
+cancelled by closing their transfer window.
 
 Permissions are in `~/.config/kraal/paste-files.toml` (or
 `$XDG_CONFIG_HOME/kraal/paste-files.toml`). Remove the matching `[[server]]` entry to revoke it,

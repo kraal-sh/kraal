@@ -1,10 +1,14 @@
-//! Local consent and directory listing for a remote session's file manager.
+//! Local consent, directory listings and copies for a remote session's file manager.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::io::Write;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+use crate::laptop::copy::{self, FromClient, Packet, ToClient, Window};
+use anyhow::{Result, bail, ensure};
 
 use ratatui::layout::Rect;
 
@@ -22,6 +26,7 @@ type Writer = Arc<Mutex<Option<Box<dyn Write + Send>>>>;
 
 #[derive(Clone)]
 struct Request {
+    copy: Option<(String, Vec<String>)>,
     pane: PaneId,
     side: Side,
     request: u64,
@@ -42,7 +47,15 @@ struct State {
     busy: bool,
     parser: InputParser,
     queued: VecDeque<Request>,
+    copies: HashMap<String, CopyWorker>,
+    notice: Option<(Instant, String)>,
     ack: Option<(PaneId, Side, u64, crossbeam_channel::Sender<()>)>,
+}
+
+struct CopyWorker {
+    control: crossbeam_channel::Sender<ToClient>,
+    cancelled: Arc<AtomicBool>,
+    count: usize,
 }
 
 pub struct Controller {
@@ -77,11 +90,15 @@ impl Controller {
     }
 
     fn reply(&self, r: Request, result: Listing) {
-        self.send(&ClientMsg::LaptopListed { pane: r.pane, side: r.side, request: r.request, result });
+        if let Some((token, _)) = r.copy {
+            self.send(&ClientMsg::LaptopCopy { token, message: FromClient::Finish(result.map(|_| ())) });
+        } else {
+            self.send(&ClientMsg::LaptopListed { pane: r.pane, side: r.side, request: r.request, result });
+        }
     }
 
     pub fn request(self: &Arc<Self>, pane: PaneId, side: Side, request: u64, path: String) {
-        let request = Request { pane, side, request, path };
+        let request = Request { copy: None, pane, side, request, path };
         self.state.lock().unwrap().queued.push_back(request);
         self.next();
     }
@@ -93,16 +110,17 @@ impl Controller {
                 return;
             }
             let Some(request) = state.queued.pop_front() else { return };
+            let retry = if request.copy.is_some() { "retry the copy" } else { "press r" };
             let scope = crate::config::Config::load()
                 .map(|config| config.laptop_files.scope)
                 .map_err(|e| {
-                    format!("Cannot read laptop configuration: {e}. Fix config.toml on the laptop and press r")
+                    format!("Cannot read laptop configuration: {e}. Fix config.toml on the laptop and {retry}")
                 })
                 .and_then(|scope| {
                     if self.destination.is_none() {
                         Err("Laptop files require attach --host".into())
                     } else if scope == Scope::Off {
-                        Err("Laptop files are off: change laptop_files.scope on the laptop and press r".into())
+                        Err(format!("Laptop files are off: change laptop_files.scope on the laptop and {retry}"))
                     } else {
                         Ok(scope)
                     }
@@ -116,7 +134,7 @@ impl Controller {
                 }
             };
             let (ssh, _) = self.destination.as_ref().unwrap();
-            if state.allowed || paste::allowed(&self.permissions, ssh) {
+            if state.allowed || paste::laptop_allowed(&self.permissions, ssh) {
                 state.busy = true;
                 let generation = state.generation;
                 drop(state);
@@ -131,6 +149,10 @@ impl Controller {
     }
 
     fn start(self: &Arc<Self>, request: Request, scope: Scope, generation: u64) {
+        if let Some((token, sources)) = &request.copy {
+            self.start_copy(token.clone(), sources.clone(), scope, generation);
+            return;
+        }
         let this = self.clone();
         let retry = request.clone();
         let spawned = crate::threads::named("laptop-list").spawn(move || {
@@ -237,6 +259,166 @@ impl Controller {
         }
     }
 
+    pub fn copy_message(self: &Arc<Self>, token: String, message: ToClient) {
+        match message {
+            ToClient::Start { sources } => {
+                if !crate::attachments::token_valid(&token) || sources.is_empty() || sources.len() > 100_000 {
+                    return;
+                }
+                let mut state = self.state.lock().unwrap();
+                if state.copies.contains_key(&token)
+                    || state.queued.iter().any(|r| r.copy.as_ref().is_some_and(|(t, _)| t == &token))
+                    || state.prompt.as_ref().is_some_and(|p| p.request.copy.as_ref().is_some_and(|(t, _)| t == &token))
+                {
+                    return;
+                }
+                state.queued.push_back(Request {
+                    copy: Some((token, sources)),
+                    pane: 0,
+                    side: Side::Left,
+                    request: 0,
+                    path: String::new(),
+                });
+                drop(state);
+                self.next();
+            }
+            ToClient::Ack(_) => {
+                if let Some(worker) = self.state.lock().unwrap().copies.get(&token)
+                    && worker.control.try_send(message).is_err()
+                {
+                    worker.cancelled.store(true, Ordering::Release);
+                }
+            }
+            ToClient::Finish(result) => {
+                let mut state = self.state.lock().unwrap();
+                state.queued.retain(|r| r.copy.as_ref().is_none_or(|(t, _)| t != &token));
+                if state.prompt.as_ref().is_some_and(|p| p.request.copy.as_ref().is_some_and(|(t, _)| t == &token)) {
+                    state.prompt = None;
+                }
+                if let Some(worker) = state.copies.remove(&token) {
+                    if result.is_err() {
+                        worker.cancelled.store(true, Ordering::Release);
+                    }
+                    let _ = worker.control.try_send(ToClient::Finish(result.clone()));
+                    let server = self.destination.as_ref().map_or("server", |(_, label)| label.as_str());
+                    let text = match result {
+                        Ok(()) => format!("{server} copied {} items from this laptop", worker.count),
+                        Err(error) => format!("Laptop copy failed: {}", clean(&error)),
+                    };
+                    state.notice = Some((Instant::now() + Duration::from_secs(4), text));
+                    let this = Arc::downgrade(self);
+                    let _ = crate::threads::named("laptop-notice").spawn(move || {
+                        std::thread::sleep(Duration::from_secs(4));
+                        if let Some(this) = this.upgrade() {
+                            let mut state = this.state.lock().unwrap();
+                            if state.notice.as_ref().is_some_and(|(until, _)| Instant::now() >= *until) {
+                                state.notice = None;
+                                drop(state);
+                                this.send(&ClientMsg::Repaint);
+                            }
+                        }
+                    });
+                }
+                drop(state);
+                self.send(&ClientMsg::Repaint);
+                self.draw();
+                self.next();
+            }
+            _ => {}
+        }
+    }
+
+    fn start_copy(self: &Arc<Self>, token: String, sources: Vec<String>, scope: Scope, generation: u64) {
+        let (control, incoming) = crossbeam_channel::bounded(copy::WINDOW + 1);
+        let cancelled = Arc::new(AtomicBool::new(false));
+        {
+            let mut state = self.state.lock().unwrap();
+            if state.generation != generation {
+                return;
+            }
+            state
+                .copies
+                .insert(token.clone(), CopyWorker { control, cancelled: cancelled.clone(), count: sources.len() });
+        }
+        let this = self.clone();
+        let retry = token.clone();
+        let spawned = crate::threads::named("laptop-copy").spawn(move || {
+            let result = this.read_copy(&token, &sources, scope, generation, &cancelled, incoming);
+            this.copy_read_finished(&token, generation, result);
+        });
+        if let Err(error) = spawned {
+            self.copy_read_finished(&retry, generation, Err(error.into()));
+        }
+    }
+
+    fn read_copy(
+        &self,
+        token: &str,
+        sources: &[String],
+        scope: Scope,
+        generation: u64,
+        cancelled: &AtomicBool,
+        incoming: crossbeam_channel::Receiver<ToClient>,
+    ) -> Result<()> {
+        let check = || -> Result<()> {
+            ensure!(!cancelled.load(Ordering::Acquire), "Laptop copy cancelled: retry from the file manager");
+            Ok(())
+        };
+        let mut window = Window::new();
+        let acknowledge = |window: &mut Window| -> Result<()> {
+            check()?;
+            match incoming.recv_timeout(copy::TIMEOUT) {
+                Ok(ToClient::Ack(sequence)) => window.acknowledge(sequence),
+                Ok(ToClient::Finish(Err(error))) => bail!("{error}"),
+                _ => bail!("Laptop copy stalled or disconnected: reconnect and retry the copy"),
+            }
+        };
+        let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Cannot find the laptop home directory"))?;
+        copy::send(
+            sources,
+            &home,
+            scope,
+            |packet| {
+                check()?;
+                if window.full() {
+                    acknowledge(&mut window)?;
+                }
+                let wait = matches!(packet, Packet::Begin { .. } | Packet::Done);
+                let sequence = window.sent()?;
+                ensure!(
+                    self.send_current(
+                        generation,
+                        &ClientMsg::LaptopCopy { token: token.into(), message: FromClient::Data { sequence, packet } }
+                    ),
+                    "Laptop connection lost: reconnect and retry the copy"
+                );
+                if wait {
+                    while !window.empty() {
+                        acknowledge(&mut window)?;
+                    }
+                }
+                Ok(())
+            },
+            check,
+        )
+    }
+
+    fn copy_read_finished(self: &Arc<Self>, token: &str, generation: u64, result: Result<()>) {
+        if let Err(error) = result {
+            self.send_current(
+                generation,
+                &ClientMsg::LaptopCopy { token: token.into(), message: FromClient::Finish(Err(format!("{error:#}"))) },
+            );
+        }
+        let mut state = self.state.lock().unwrap();
+        if state.generation != generation {
+            return;
+        }
+        state.busy = false;
+        drop(state);
+        self.next();
+    }
+
     pub fn pending_keys(&self) -> bool {
         self.state.lock().unwrap().parser.has_pending()
     }
@@ -286,6 +468,7 @@ impl Controller {
         }
         if let Some(answer) = answer {
             let prompt = state.prompt.take().unwrap();
+            let retry = if prompt.request.copy.is_some() { "retry the copy" } else { "press r" };
             let mut error = None;
             if answer == 0 {
                 state.allowed = true;
@@ -293,8 +476,8 @@ impl Controller {
             if answer == 1
                 && let Some((ssh, label)) = &self.destination
             {
-                error = paste::remember(&self.permissions, ssh, label).err().map(|e| {
-                    format!("Cannot save laptop permission: {e}. Fix laptop-files.toml on the laptop and press r")
+                error = paste::remember_laptop(&self.permissions, ssh, label).err().map(|e| {
+                    format!("Cannot save laptop permission: {e}. Fix laptop-files.toml on the laptop and {retry}")
                 });
             }
             state.busy = answer != 2 && error.is_none();
@@ -303,7 +486,12 @@ impl Controller {
             self.send(&ClientMsg::Repaint);
             if answer == 2 {
                 let host = self.identity.as_ref().map_or("laptop", |i| i.host.as_str());
-                self.reply(prompt.request, Err(format!("{host} refused: nothing was listed. Press r to ask again")));
+                let message = if prompt.request.copy.is_some() {
+                    format!("{host} refused: nothing was copied. Press c to ask again")
+                } else {
+                    format!("{host} refused: nothing was listed. Press r to ask again")
+                };
+                self.reply(prompt.request, Err(message));
                 self.next();
             } else if let Some(error) = error {
                 self.reply(prompt.request, Err(error));
@@ -325,6 +513,10 @@ impl Controller {
         state.busy = false;
         state.queued.clear();
         state.ack = None;
+        for (_, worker) in state.copies.drain() {
+            worker.cancelled.store(true, Ordering::Release);
+        }
+        state.notice = None;
     }
 
     fn view(&self, prompt: &Prompt) -> View {
@@ -342,7 +534,7 @@ impl Controller {
             kind: NoticeKind::Notice,
             error_start: None,
             message: format!(
-                "{server}'s file manager asks to list {scope}.\nCopy, move and delete are not yet available.\nAllow lasts until this kraal attach ends. Always is kept in ~/.config/kraal/laptop-files.toml."
+                "{server}'s file manager asks to list and copy files from {scope}.\nCopying into this laptop, moving and deleting are not yet available.\nAllow lasts until this kraal attach ends. Always is kept in ~/.config/kraal/laptop-files.toml."
             ),
             files: String::new(),
             scroll: 0,
@@ -370,6 +562,17 @@ impl Controller {
     ) -> std::io::Result<bool> {
         let state = self.state.lock().unwrap();
         let Some(prompt) = &state.prompt else {
+            if let Some((until, message)) = &state.notice
+                && Instant::now() < *until
+            {
+                let mut out = bytes.to_vec();
+                let lines = crate::text::wrap(message, usize::from(cols).saturating_sub(2).max(1))
+                    .into_iter()
+                    .map(|line| (line, Some(NoticeKind::Notice)))
+                    .collect::<Vec<_>>();
+                out.extend(super::notice_lines(&lines, cols, rows));
+                return write(&out);
+            }
             return write(bytes);
         };
         let (buffer, _) = self.view(prompt).render(Rect::new(0, 0, cols, rows.saturating_sub(1)));
@@ -390,7 +593,6 @@ fn clean(text: &str) -> String {
 mod tests {
     use super::*;
     use crate::testing::TempDir;
-    use std::time::Duration;
 
     #[derive(Clone, Default)]
     struct Wire(Arc<Mutex<Vec<u8>>>);
@@ -532,6 +734,42 @@ mod tests {
     }
 
     #[test]
+    fn legacy_listing_grant_requires_fresh_consent_before_copying() {
+        if !crate::testing::in_own_process(
+            "client::laptop::tests::legacy_listing_grant_requires_fresh_consent_before_copying",
+        ) {
+            return;
+        }
+        let dir = TempDir::new("laptop-upgrade-consent");
+        let permissions =
+            dir.write("laptop-files.toml", "[[server]]\nname = 'anvil'\nssh = ['-p', '2222', 'me@anvil']\n");
+        let (client, mut peer) = controller(permissions.clone());
+        let (ssh, _) = client.destination.as_ref().unwrap();
+        assert!(paste::allowed(&permissions, ssh));
+        assert!(!paste::laptop_allowed(&permissions, ssh));
+        client.copy_message("abc".into(), ToClient::Start { sources: vec!["~/file".into()] });
+        nothing(&mut peer);
+        let state = client.state.lock().unwrap();
+        let prompt = state.prompt.as_ref().unwrap();
+        assert!(client.view(prompt).message.contains("list and copy files"));
+        drop(state);
+        client.input(b"\x03");
+        assert!(matches!(copy_reply(&mut peer).1, FromClient::Finish(Err(_))));
+        assert!(!paste::laptop_allowed(&permissions, ssh));
+        // Remember the expanded permission through the local prompt, then attach again.
+        client.request(1, Side::Left, 1, "~".into());
+        nothing(&mut peer);
+        client.input(b"\t\r");
+        assert!(result(&mut peer).is_ok());
+        assert!(paste::allowed(&permissions, ssh), "the old listing grant is retained");
+        assert!(paste::laptop_allowed(&permissions, ssh));
+        let (next, mut next_peer) = controller(permissions);
+        next.request(1, Side::Left, 2, "~".into());
+        assert!(result(&mut next_peer).is_ok());
+        assert!(next.state.lock().unwrap().prompt.is_none());
+    }
+
+    #[test]
     fn scope_off_and_invalid_config_refuse_even_a_remembered_server() {
         if !crate::testing::in_own_process(
             "client::laptop::tests::scope_off_and_invalid_config_refuse_even_a_remembered_server",
@@ -541,7 +779,7 @@ mod tests {
         let dir = TempDir::new("laptop-off");
         let (client, mut peer) = controller(dir.0.join("laptop-files.toml"));
         let (ssh, name) = client.destination.as_ref().unwrap();
-        paste::remember(&client.permissions, ssh, name).unwrap();
+        paste::remember_laptop(&client.permissions, ssh, name).unwrap();
         let config = crate::paths::config_path();
         std::fs::create_dir_all(config.parent().unwrap()).unwrap();
         std::fs::write(&config, "[laptop_files]\nscope = 'off'\n").unwrap();
@@ -554,11 +792,11 @@ mod tests {
     }
 
     #[test]
-    fn consent_names_come_from_the_client_and_describe_only_listing() {
+    fn consent_names_come_from_the_client_and_describe_listing_and_copying() {
         let dir = TempDir::new("laptop-dialog");
         let (client, _) = controller(dir.0.join("laptop-files.toml"));
         let prompt = Prompt {
-            request: Request { pane: 1, side: Side::Left, request: 1, path: "server-controlled".into() },
+            request: Request { copy: None, pane: 1, side: Side::Left, request: 1, path: "server-controlled".into() },
             scope: Scope::Home,
             selected: 0,
         };
@@ -582,7 +820,7 @@ mod tests {
         client.state.lock().unwrap().busy = true;
         client.finish(
             0,
-            Request { pane: 1, side: Side::Left, request: 1, path: "~".into() },
+            Request { copy: None, pane: 1, side: Side::Left, request: 1, path: "~".into() },
             Ok(("~".into(), Vec::new())),
         );
         nothing(&mut peer);
@@ -593,7 +831,7 @@ mod tests {
         let dir = TempDir::new("laptop-frame");
         let (client, _) = controller(dir.0.join("laptop-files.toml"));
         client.state.lock().unwrap().prompt = Some(Prompt {
-            request: Request { pane: 1, side: Side::Left, request: 1, path: "~".into() },
+            request: Request { copy: None, pane: 1, side: Side::Left, request: 1, path: "~".into() },
             scope: Scope::Home,
             selected: 0,
         });
@@ -649,7 +887,7 @@ mod tests {
         let thread = std::thread::spawn(move || {
             worker.finish(
                 0,
-                Request { pane: 1, side: Side::Left, request: 1, path: "~".into() },
+                Request { copy: None, pane: 1, side: Side::Left, request: 1, path: "~".into() },
                 Ok(("~".into(), Vec::new())),
             )
         });
@@ -720,7 +958,7 @@ mod tests {
         let result = expected.clone();
         let worker = client.clone();
         let thread = std::thread::spawn(move || {
-            worker.finish(0, Request { pane: 1, side: Side::Left, request: 1, path: "~".into() }, result)
+            worker.finish(0, Request { copy: None, pane: 1, side: Side::Left, request: 1, path: "~".into() }, result)
         });
         let (_, _, _, mut listing, done) = chunk(&mut peer);
         assert!(!done);
@@ -760,7 +998,11 @@ mod tests {
         let mut peer = pipe_peer(&client);
         let worker = client.clone();
         let thread = std::thread::spawn(move || {
-            worker.finish(0, Request { pane: 1, side: Side::Left, request: 1, path: "~".into() }, large_listing())
+            worker.finish(
+                0,
+                Request { copy: None, pane: 1, side: Side::Left, request: 1, path: "~".into() },
+                large_listing(),
+            )
         });
         let (_, _, _, _, done) = chunk(&mut peer);
         assert!(!done);
@@ -784,7 +1026,11 @@ mod tests {
         let mut peer = pipe_peer(&client);
         let worker = client.clone();
         let thread = std::thread::spawn(move || {
-            worker.finish(0, Request { pane: 1, side: Side::Left, request: 1, path: "~".into() }, large_listing())
+            worker.finish(
+                0,
+                Request { copy: None, pane: 1, side: Side::Left, request: 1, path: "~".into() },
+                large_listing(),
+            )
         });
         assert!(!chunk(&mut peer).4);
         client.disconnect();
@@ -862,13 +1108,13 @@ mod tests {
         let dir = TempDir::new("laptop-queued-permission");
         let (client, mut peer) = controller(dir.0.join("laptop-files.toml"));
         let (ssh, name) = client.destination.as_ref().unwrap();
-        paste::remember(&client.permissions, ssh, name).unwrap();
+        paste::remember_laptop(&client.permissions, ssh, name).unwrap();
         client.state.lock().unwrap().busy = true;
         client.request(2, Side::Left, 2, "~".into());
         std::fs::remove_file(&client.permissions).unwrap();
         client.finish(
             0,
-            Request { pane: 1, side: Side::Left, request: 1, path: "~".into() },
+            Request { copy: None, pane: 1, side: Side::Left, request: 1, path: "~".into() },
             Ok(("~".into(), Vec::new())),
         );
         assert!(result(&mut peer).is_ok());
@@ -880,7 +1126,7 @@ mod tests {
         drop(state);
         client.finish(
             0,
-            Request { pane: 3, side: Side::Left, request: 3, path: "~".into() },
+            Request { copy: None, pane: 3, side: Side::Left, request: 3, path: "~".into() },
             Ok(("~".into(), Vec::new())),
         );
         nothing(&mut peer);
@@ -892,5 +1138,117 @@ mod tests {
         client.state.lock().unwrap().busy = false;
         client.next();
         assert!(result(&mut peer).unwrap_err().contains("off"));
+    }
+    fn copy_packet(peer: &mut impl std::io::Read) -> (String, FromClient) {
+        loop {
+            let (_, bytes) = protocol::read_frame(peer).unwrap().unwrap();
+            if let ClientMsg::LaptopCopy { token, message } = serde_json::from_slice(&bytes).unwrap() {
+                return (token, message);
+            }
+        }
+    }
+
+    fn copy_reply(peer: &mut Wire) -> (String, FromClient) {
+        let bytes = std::mem::take(&mut *peer.0.lock().unwrap());
+        copy_packet(&mut bytes.as_slice())
+    }
+
+    #[test]
+    fn copy_permission_is_local_rechecked_and_cancel_sends_no_file_data() {
+        if !crate::testing::in_own_process(
+            "client::laptop::tests::copy_permission_is_local_rechecked_and_cancel_sends_no_file_data",
+        ) {
+            return;
+        }
+        let dir = TempDir::new("copy-consent");
+        let (client, mut peer) = controller(dir.0.join("laptop-files.toml"));
+        client.copy_message("abc".into(), ToClient::Start { sources: vec!["~/.ssh/key".into()] });
+        nothing(&mut peer);
+        assert!(client.state.lock().unwrap().prompt.is_some());
+        client.input(b"\x03");
+        assert!(matches!(copy_reply(&mut peer), (token, FromClient::Finish(Err(_))) if token == "abc"));
+        let (ssh, name) = client.destination.as_ref().unwrap();
+        paste::remember_laptop(&client.permissions, ssh, name).unwrap();
+        std::fs::remove_file(&client.permissions).unwrap();
+        client.copy_message("def".into(), ToClient::Start { sources: vec!["~/file".into()] });
+        assert!(client.state.lock().unwrap().prompt.is_some());
+        client.copy_message("def".into(), ToClient::Finish(Err("cancelled".into())));
+        assert!(client.state.lock().unwrap().prompt.is_none());
+        let config = crate::paths::config_path();
+        std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+        std::fs::write(config, "[laptop_files]\nscope = 'off'\n").unwrap();
+        client.state.lock().unwrap().allowed = true;
+        client.copy_message("fed".into(), ToClient::Start { sources: vec!["~/file".into()] });
+        assert!(
+            matches!(copy_reply(&mut peer), (token, FromClient::Finish(Err(error))) if token == "fed" && error.contains("off"))
+        );
+    }
+
+    #[test]
+    fn copy_waits_for_total_ack_then_windows_data_without_blocking_input_and_disconnect() {
+        if !crate::testing::in_own_process(
+            "client::laptop::tests::copy_waits_for_total_ack_then_windows_data_without_blocking_input_and_disconnect",
+        ) {
+            return;
+        }
+        let dir = TempDir::new("copy-window");
+        std::fs::write(dirs::home_dir().unwrap().join("large"), vec![0; copy::CHUNK * 10]).unwrap();
+        let (client, mut next) = controller(dir.0.join("laptop-files.toml"));
+        let mut peer = pipe_peer(&client);
+        client.state.lock().unwrap().allowed = true;
+        client.copy_message("abc".into(), ToClient::Start { sources: vec!["~/large".into()] });
+        assert!(
+            matches!(copy_packet(&mut peer).1, FromClient::Data { sequence: 0, packet: Packet::Begin { bytes, .. } } if bytes == (copy::CHUNK * 10) as u64)
+        );
+        client.send(&ClientMsg::Resize { cols: 80, rows: 24 });
+        let (_, bytes) = protocol::read_frame(&mut peer).unwrap().unwrap();
+        assert!(matches!(serde_json::from_slice(&bytes).unwrap(), ClientMsg::Resize { .. }));
+        client.copy_message("abc".into(), ToClient::Ack(0));
+        for expected in 1..=4 {
+            assert!(matches!(copy_packet(&mut peer).1, FromClient::Data { sequence, .. } if sequence == expected));
+        }
+        assert!(!client.input(b"typing"));
+        client.send(&ClientMsg::Detach);
+        let (_, bytes) = protocol::read_frame(&mut peer).unwrap().unwrap();
+        assert!(
+            matches!(serde_json::from_slice(&bytes).unwrap(), ClientMsg::Detach),
+            "a fifth packet cannot pass the window"
+        );
+        client.disconnect();
+        *client.writer.lock().unwrap() = Some(Box::new(next.clone()));
+        client.state.lock().unwrap().busy = true;
+        std::thread::sleep(Duration::from_millis(30));
+        nothing(&mut next);
+        assert!(client.state.lock().unwrap().busy);
+        assert!(client.state.lock().unwrap().copies.is_empty());
+    }
+
+    #[test]
+    fn copy_success_notice_uses_local_server_name_and_does_not_consume_keys() {
+        let dir = TempDir::new("copy-notice");
+        let (client, _) = controller(dir.0.join("laptop-files.toml"));
+        let (control, _incoming) = crossbeam_channel::bounded(1);
+        client
+            .state
+            .lock()
+            .unwrap()
+            .copies
+            .insert("abc".into(), CopyWorker { control, cancelled: Arc::new(AtomicBool::new(false)), count: 3 });
+        client.copy_message("abc".into(), ToClient::Finish(Ok(())));
+        assert_eq!(client.state.lock().unwrap().notice.as_ref().unwrap().1, "anvil copied 3 items from this laptop");
+        assert!(!client.input(b"typing"));
+        client
+            .output_with(b"", 80, 24, |bytes| {
+                assert!(String::from_utf8_lossy(bytes).contains("anvil copied 3 items"));
+                Ok(true)
+            })
+            .unwrap();
+        client.state.lock().unwrap().notice.as_mut().unwrap().0 = Instant::now();
+        client
+            .output_with(b"", 80, 24, |bytes| {
+                assert!(bytes.is_empty());
+                Ok(true)
+            })
+            .unwrap();
     }
 }

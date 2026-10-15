@@ -783,10 +783,10 @@ impl FilesPane {
         }
         if (laptop && matches!(key, FileKey::Char('d') | FileKey::Delete | FileKey::F(8)))
             || (self.panels.iter().any(|p| matches!(p.location, Location::Laptop { .. }))
-                && matches!(key, FileKey::Char('c' | 'm') | FileKey::F(5 | 6)))
+                && matches!(key, FileKey::Char('m') | FileKey::F(6)))
         {
             return FilesAction::Refused(
-                "Laptop copy, move and delete: not yet available. Use kraal cp on the laptop to copy files".into(),
+                "Laptop move and delete: not yet available. Use kraal cp on the laptop to copy files".into(),
             );
         }
         let page = isize::try_from(self.list_height().saturating_sub(1).max(1)).unwrap_or(1);
@@ -1050,6 +1050,16 @@ impl FilesPane {
     }
 
     fn transfer(&mut self, side: Side, is_move: bool) -> FilesAction {
+        if matches!(self.panel(side.other()).location, Location::Laptop { .. }) {
+            return FilesAction::Refused(
+                "Copying into the laptop: not yet available. Run kraal cp on the laptop".into(),
+            );
+        }
+        if matches!(self.panel(side).location, Location::Laptop { .. })
+            && matches!(self.panel(side.other()).location, Location::Remote(_))
+        {
+            return FilesAction::Refused("Copy to the session's machine first, or run kraal cp on the laptop".into());
+        }
         let sources = match self.sources(side) {
             Ok(s) => s,
             Err(why) => return FilesAction::Refused(why),

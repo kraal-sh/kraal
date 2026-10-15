@@ -497,6 +497,7 @@ impl Server {
 
     /// Close a pane and remove its empty tab, keeping the workspace.
     pub fn close_pane(&mut self, id: PaneId) {
+        self.cancel_laptop_pane(id);
         self.abandon_added_login(id);
         if !self.panes.contains_key(&id) {
             return;
