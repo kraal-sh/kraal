@@ -368,51 +368,30 @@ only the files it wrote there, and nothing through a link put in place of that d
 files from before 0.4 stay available for [recovery](compatibility.md#saved-files-and-sessions). Paste buffers are
 not saved unless `[buffers] persist = true` ([Configuration](configuration.md)).
 
-### Workspace identities and migration
+### Workspace identities
 
 A saved workspace has an identity independent of its name, position and source path.
 `kraal workspaces --json` includes it as `id` on open and closed workspaces; file-only entries omit it.
 Restarting keeps that identity. The pane and tab numbers used within a running server remain
 local to that server.
 
-On the first start with a session saved by 0.2.0 or 0.3.0, kraal 0.4 assigns missing workspace
-identities and writes format 2 atomically to `sessions-v2/<session>.json`, before restoring any
-programs. Its scrollback goes in `scrollback-v2/<session>/`. It keeps the saved layout,
-source paths, recorded source contents, account identities and initial order. It does not match
-sources by name or rewrite KDL files, their backups, or accounts. Existing name collisions stay;
-a command that cannot choose one workspace by name asks you to select and rename a workspace.
+Sessions use format 2 in `sessions-v2/<session>.json` with scrollback in
+`scrollback-v2/<session>/`. Saved sessions from 0.4.x keep their workspace identities,
+layout, source links and account references across restarts. Binding account identities
+in retained recipes during ordinary workspace operations remains.
 
-If the old session has no recorded source contents, migration records the file as it is then.
-Your saved layout stays as it was, even if you edited it since importing the file. Only later
-changes to the file report **File changed**, including after a restart. Unreadable or missing
-sources do not prevent migration; their workspaces keep the saved layout and show the source error.
+Kraal 0.5 leaves older `sessions/<session>.json` and `scrollback/<session>/` files untouched.
+Without a current session file, start, attach and restore refuse old state with
+`run kraal 0.4 once first`. A newer state format is refused with `use a newer kraal`.
+If reading or validating state fails, kraal leaves it in place and refuses to start the session.
+Fix the reported cause and retry. See [Compatibility](compatibility.md#saved-files-and-sessions).
 
-Separately, changing accounts in 0.4 binds old account names in saved sessions and readable KDL files
-before writing the account change. KDL files gain account identities while keeping their labels and
-formatting. This temporary migration is removed in 0.5.0; binding accounts in retained recipes during
-ordinary workspace operations remains. See [Accounts](agents.md#accounts).
+`kraal forget` removes current state and scrollback only. If old state remains, the next
+start refuses it with the same next step. Account changes do not rewrite saved sessions
+or external workspace files. See [Accounts](agents.md#accounts).
 
-Session conversion leaves `~/.local/state/kraal/sessions/<session>.json` and
-`scrollback/<session>/` untouched. These original files are the recovery copy; kraal makes
-no additional session backup. They can contain the same secrets as the saved session.
-Remove them manually when no longer needed.
-
-To go back to 0.2.0 or 0.3.0, stop the session and start the older kraal. It finds those original
-files, or no saved session if there was none before. It never reads or changes `sessions-v2/`
-or `scrollback-v2/`. Returning to 0.4 uses the newer files, ignoring changes made by the older
-kraal. See [Compatibility](compatibility.md#saved-files-and-sessions) for recovery and the
-separate `accounts.toml.kraal-bak` backup.
-
-`kraal forget` in 0.4 removes the current session files and scrollback, keeping the old files
-untouched. A marker in `sessions-v2/` prevents importing the forgotten legacy session on the
-next start. From 0.5.0, an unconverted state older than 0.4 is left untouched and refused:
-run kraal 0.4 once first.
-
-If reading, validating or copying the state fails, kraal leaves the original in place and
-refuses to start the session. Fix the reported cause and retry. Unsupported versions or revisions
-require a kraal that supports them. A workspace whose panes cannot be restored keeps its identity,
-layout, source and failure reason in the saved session. Fix that cause and restart to retry;
-opening its source does not replace the saved workspace with a fresh copy.
+A workspace whose panes cannot be restored keeps its identity, layout, source and failure reason.
+Fix that cause and restart to retry; opening its source does not replace the saved workspace.
 
 ## Workspace files
 
@@ -466,8 +445,10 @@ for, is typed into a shell: that shell is what is left when the agent exits.
 
 A saved agent account keeps an internal `account_id` beside its readable `agent="claude:name"`.
 Renaming the account keeps that binding; removing and recreating its name does not replace it.
-Old definitions using only `agent="claude:name"` still work and are bound before an account
-change. To choose a different account by editing the file, set `agent` and remove its old
+External definitions using only `agent="claude:name"` resolve by name when opened and are not
+rewritten before account changes. Renaming that account leaves the definition unresolved;
+reusing its old name makes the definition select the replacement account.
+To choose a different account by editing the file, set `agent` and remove its old
 `account_id`. A bare `agent="claude"` continues to choose by the account rules each time.
 
 `stacked=true` makes a pane's children a stack: they share its place, one open and
@@ -613,7 +594,7 @@ workspace. **Open** still uses your saved layout. A missing source is never recr
 automatic save.
 
 **File changed** compares the file's contents with the source contents recorded when kraal
-imported, loaded, or exported it (or first migrated a session without that record). Editing tabs,
+imported, loaded, or exported it. Editing tabs,
 panes, or workspace names never triggers it. The recorded contents survive a restart.
 
 Choose **Review** from the notification or the workspace's Actions. **Load from file** in Actions

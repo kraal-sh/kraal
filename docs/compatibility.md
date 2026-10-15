@@ -2,60 +2,35 @@
 
 ## Saved files and sessions
 
-Kraal 0.4 migrates sessions and `accounts.toml` from **0.2.0** and **0.3.0** once,
-leaving the old session and scrollback files untouched. The accounts file is backed up before
-conversion. This migration belongs to 0.4 and is removed in **0.5.0**.
-Existing workspace KDL and configuration files keep working.
+Kraal 0.5 reads the session and account formats written by 0.4.x. Sessions use
+`sessions-v2/<session>.json` and `scrollback-v2/<session>/` in the kraal state directory
+(`~/.local/state/kraal`, or `$XDG_STATE_HOME/kraal` when set). Existing workspace KDL and
+configuration files keep working. Each save writes only the current format.
 
-The unreleased `[keys.prefixed]` table is ignored with an unknown-key warning; use
-`[keys.leader]` for bindings after the prefix. The unreleased session format `version: 1,
-revision: 2` is refused with `unsupported state revision 2; use a newer kraal`, leaving the
-saved session untouched. Both supported releases wrote revision 1.
+Sessions from **0.2.0** and **0.3.0** in `sessions/<session>.json`, without a current
+`sessions-v2/<session>.json`, are left untouched and refused by start, attach and restore:
+`run kraal 0.4 once first`. Account commands likewise refuse an `accounts.toml` containing
+accounts without identities, with the same next step. Run 0.4 to convert those files before
+returning to 0.5. Kraal keeps migrations for one version only.
 
-Each save writes the current state format only. Kraal does not also write a downgraded copy
-for older versions. The untouched legacy session and the accounts backup are recovery copies,
-not synchronized views of the current session.
-Session migration preserves the personal layout, identities, source links, account references,
-restore failures and available scrollback. When an old session has no recorded source contents,
-migration records the source file as it is then, without replacing the personal layout. This
-baseline survives restart, so local layout edits do not report **File changed**, but later file
-edits do. Missing or unreadable sources leave the saved layout available with a source error.
-Account migration happens on the next change to the file, keeping comments, order and unknown keys.
-Before account changes, the 0.4 migration copies
-legacy usage to identity-based caches, binds saved pane references (including layout Undo in kept
-and deleted workspaces), and adds account identities to readable KDL files in configured workspace
-directories. Unknown session fields and KDL formatting are preserved. If this preparation fails,
-the account change is not written; fix the reported file or directory and retry.
-These disk adapters are removed in 0.5.0. Resolving identities during ordinary account and workspace
-operations remains, including retained references and homes after renaming or removing an account.
-See [Workspace migration](workspaces.md#workspace-identities-and-migration) and [Accounts](agents.md#accounts).
+A saved session from a newer format is left untouched and refused with `use a newer kraal`.
+Invalid or unreadable state also prevents restoration; fix the reported file and retry.
+Kraal never falls back from an unreadable or unsupported current session to an older copy.
 
-A kraal older than the saved state does not read that state. Starting with 0.4, sessions use
-`sessions-v2/<session>.json` and `scrollback-v2/<session>/` in the kraal state directory.
-Kraal 0.2.0 and 0.3.0 never open these paths. Going back to either finds the session as it was
-at upgrade, or no saved session if there was none before. Its saves and `kraal forget` cannot
-overwrite the newer session or its scrollback. Changes made after upgrade do not appear in the
-older kraal; changes made while downgraded do not replace the newer state when returning to 0.4.
+Current session files take precedence over old files. Kraal does not import, rewrite or remove
+`sessions/<session>.json` or `scrollback/<session>/`. The older binaries never open the current
+paths, so their saves and Forget cannot replace the current state or scrollback. Changes made
+in either format do not synchronize to the other.
 
-For recovery or a return to 0.2.0 or 0.3.0, stop the session first. The original files are
-`~/.local/state/kraal/sessions/<session>.json` and
-`~/.local/state/kraal/scrollback/<session>/` (under `$XDG_STATE_HOME/kraal` when set).
-Kraal 0.4 never rewrites or removes them, including on account changes, Close, Delete, Undo,
-or `kraal forget`. No additional session backup is made. An older kraal can still change
-these files; they are not a history of changes made after upgrading.
+`kraal forget` removes current state and scrollback. If an old session remains, a later start
+refuses it with `run kraal 0.4 once first`. Forget creates no import marker.
 
-`kraal forget` removes current state and scrollback. When legacy state exists, it first records
-`sessions-v2/<session>.forgotten` so the next start does not import that state again. To recover
-that legacy session in 0.4, while the session is stopped, move aside any current
-`sessions-v2/<session>.json` and `scrollback-v2/<session>/`, then remove the `.forgotten` marker
-if present. The next start imports the original files again.
-
-`accounts.toml` is rewritten in place, so its original remains in `accounts.toml.kraal-bak`
-beside it. Restore that backup before using the old account configuration with an older kraal.
-
-From 0.5.0, state older than 0.4 will be left untouched and refused with this next step:
-`run kraal 0.4 once first`. The one-way session and account migration is removed in 0.5.0.
-A state from a newer format is also left untouched, with a message to use a newer kraal.
+Account changes preserve comments, order and unknown keys without making a migration backup.
+Usage is read from identity-based caches in `usage/by-id`; old name-based caches are untouched.
+Account changes do not rewrite saved sessions or external workspace KDL files. Identity
+resolution during ordinary account and workspace operations remains, including retained
+references and homes after renaming or removing an account.
+See [Workspace identities](workspaces.md#workspace-identities) and [Accounts](agents.md#accounts).
 
 ## Clients and servers
 
@@ -74,16 +49,14 @@ changes the session. Updating the binary does not
 stop a running session automatically. Existing attached terminals keep using their server until
 it stops; a newly installed client needs the matching protocol before attaching.
 
-The upgrade control path remains: `kraal ls` and the update notice identify running releases;
-`kraal kill` saves and stops a 0.2.0 or 0.3.0 server; `kraal restart` saves, stops and restores it
-with the installed binary. Old socket locations remain discoverable for this purpose and to
-avoid starting a second server for the same session. Restart lists the programs it will stop
-and asks before stopping them. Layout and available scrollback survive through the migration
-above. Restart refuses if newer saved state or a Forget marker would hide the old running
-session. See [Persistence](workspaces.md#persistence).
-
-A restart from 0.2.0 ends its attached terminals. Attach again with the current client.
-A 0.3.0 client waiting for a restarted server receives the protocol refusal and must be updated.
+The upgrade control path still identifies running releases in `kraal ls` and the update notice.
+`kraal kill` saves and stops a 0.2.0 or 0.3.0 server. Old socket locations remain discoverable
+for this purpose and to avoid starting a second server for the same session.
+Restarting those releases requires the removed disk adapters: `kraal restart` now refuses
+before stopping them, with `run kraal 0.4 once first`. Use 0.4 for that upgrade first.
+Restarting a 0.4.x server still saves, stops and restores it with the installed binary.
+Restart lists the programs it will stop and asks before stopping them.
+See [Persistence](workspaces.md#persistence).
 
 Workspaces are saved automatically. KDL is imported and exported explicitly with `kraal import`
 and `kraal export`; `kraal save` and its historical `SaveWorkspace` request are removed.
@@ -136,20 +109,20 @@ The client and server exchange JSON messages in `src/protocol.rs`. Change `PROTO
 when the wire contract changes. Peers must agree on that generation before interactive use.
 Do not add capabilities or adapters for older peers. Keep the protocol 2 ping, pane listing and
 stop requests used to upgrade released servers, and their response readers, until their upgrade
-path is removed. Saved-file migration is separate and remains in 0.4.
+path is removed. The 0.4 saved-file migration is removed in 0.5.
 
 ## The cross-version test
 
-`tests/compat.sh` downloads 0.2.0 and 0.3.0 and checks their release checksums before running
-`tests/compat.rs` against each real binary. The tests cover attachment refusal in both
-directions, stopping and restarting old servers with their layout and scrollback, migration with
-untouched original files, and downgrade isolation, including saves and
-Forget by the older binary. They also check that old workspace and configuration files keep
-working. CI runs these tests, including terminal refusal, on Linux and macOS.
+`tests/compat.sh` downloads **0.2.0**, **0.3.0**, **0.4.0** and **0.4.1** and checks their release
+checksums before running `tests/compat.rs` against each real binary. The tests cover protocol
+refusal in both directions when generations differ, saving and stopping old servers, refusal
+of sessions older than 0.4 without changing their files, and restoring and restarting 0.4.x
+sessions with their layout and scrollback. They also check downgrade isolation and that existing
+workspace and configuration files keep working. CI runs these tests on Linux and macOS.
 
 | Command | Releases |
 |---|---|
-| `tests/compat.sh` | 0.2.0 and 0.3.0 |
+| `tests/compat.sh` | 0.2.0, 0.3.0, 0.4.0 and 0.4.1 |
 | `tests/compat.sh v0.2.0` | 0.2.0 only |
 | `tests/compat.sh --build v0.2.0` | Built from its tag (`git fetch --tags` first) |
 

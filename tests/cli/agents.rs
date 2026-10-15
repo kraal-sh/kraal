@@ -252,7 +252,7 @@ fn codex_usage_leaves_nothing_behind() {
     std::fs::create_dir_all(home.join(".codex")).unwrap();
     std::fs::write(
         env.root.join("config/kraal/accounts.toml"),
-        "[[account]]\nname = \"work\"\nagent = \"codex\"\nhome = \"~/.codex\"\n",
+        "[[account]]\nid = 'test-codex-work'\nname = \"work\"\nagent = \"codex\"\nhome = \"~/.codex\"\n",
     )
     .unwrap();
     let bin = env.root.join("bin");
@@ -388,7 +388,7 @@ fn an_agent_waiting_for_its_account_waits_again_after_a_restart() {
     std::fs::write(
         env.root.join("config/kraal/accounts.toml"),
         format!(
-            "[[account]]\nname = \"pro\"\nagent = \"claude\"\nhome = {:?}\n\n[[rule]]\npath = {:?}\naccounts = [\"pro\"]\n",
+            "[[account]]\nid = 'test-claude-pro'\nname = \"pro\"\nagent = \"claude\"\nhome = {:?}\n\n[[rule]]\npath = {:?}\naccounts = [\"pro\"]\n",
             pro.display().to_string(),
             canonical.display().to_string()
         ),

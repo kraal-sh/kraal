@@ -165,7 +165,7 @@ pub(super) const AMBIGUOUS: &str =
 
 impl Server {
     pub(super) fn update_accounts<T>(&mut self, f: impl FnOnce(&mut Accounts) -> Result<T>) -> Result<T> {
-        Accounts::update_with_sources(&Accounts::path(), f, |written| self.record_source_write(written))
+        Accounts::update(f)
     }
 
     pub(super) fn reload_accounts(&mut self) {
@@ -250,17 +250,10 @@ impl Server {
         let status = result.status;
         let started = self.background(
             move || {
-                let mut written = Vec::new();
-                let saved = account_status::save_discovery(&[(a.clone(), result)], &cached, |source| {
-                    written.push(source.clone());
-                });
-                (a, cached, saved, written)
+                let saved = account_status::save_discovery(&[(a.clone(), result)], &cached);
+                (a, cached, saved)
             },
-            move |server, (a, cached, saved, written)| {
-                // Migrations may have succeeded even when saving failed or a login started.
-                for source in written {
-                    server.record_source_write(&source);
-                }
+            move |server, (a, cached, saved)| {
                 if server.account_identity_generations.get(&a.agent).copied().unwrap_or_default() != generation {
                     server.reload_accounts();
                     return;

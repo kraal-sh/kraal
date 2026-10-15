@@ -888,7 +888,10 @@ esac
     );
     std::fs::write(
         env.root.join("config/kraal/accounts.toml"),
-        format!("[[account]]\nname = \"work\"\nagent = {agent:?}\nhome = {:?}\n", home.to_str().unwrap()),
+        format!(
+            "[[account]]\nid = 'test-{agent}-work'\nname = \"work\"\nagent = {agent:?}\nhome = {:?}\n",
+            home.to_str().unwrap()
+        ),
     )
     .unwrap();
     let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap_or_default());

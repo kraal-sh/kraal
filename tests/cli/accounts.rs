@@ -42,7 +42,7 @@ fn account_rules_see_a_worktree_anywhere_as_its_repository() {
     std::fs::write(
         env.root.join("config/kraal/accounts.toml"),
         format!(
-            "[[account]]\nname = \"pro\"\nagent = \"claude\"\nhome = {:?}\n\n[[rule]]\npath = {:?}\naccounts = [\"pro\"]\n",
+            "[[account]]\nid = 'test-claude-pro'\nname = \"pro\"\nagent = \"claude\"\nhome = {:?}\n\n[[rule]]\npath = {:?}\naccounts = [\"pro\"]\n",
             pro.display().to_string(),
             repo.display().to_string()
         ),
@@ -104,7 +104,7 @@ fn choosing_the_current_account_keeps_running_and_exited_panes_as_they_are() {
             let home = env.root.join(format!("{agent}-{name}-home"));
             std::fs::create_dir_all(&home).unwrap();
             accounts.push_str(&format!(
-                "[[account]]\nname = {name:?}\nagent = {agent:?}\nhome = {:?}\n",
+                "[[account]]\nid = 'test-{agent}-{name}'\nname = {name:?}\nagent = {agent:?}\nhome = {:?}\n",
                 home.display().to_string()
             ));
         }
@@ -183,7 +183,7 @@ while IFS= read -r line; do :; done
     std::fs::write(
         env.root.join("config/kraal/accounts.toml"),
         format!(
-            "[[account]]\nname = \"alpha\"\nagent = \"claude\"\nhome = {:?}\n\n[[account]]\nname = \"beta\"\nagent = \"claude\"\nhome = {:?}\n",
+            "[[account]]\nid = 'test-claude-alpha'\nname = \"alpha\"\nagent = \"claude\"\nhome = {:?}\n\n[[account]]\nid = 'test-claude-beta'\nname = \"beta\"\nagent = \"claude\"\nhome = {:?}\n",
             alpha.display().to_string(),
             beta.display().to_string()
         ),
@@ -1267,17 +1267,17 @@ fn account_list_joins_only_one_exact_identity_and_reports_the_joined_home_and_us
             if i > 0 {
                 let name = if i == 1 { "patron.bzh" } else { "gmail" };
                 config.push_str(&format!(
-                    "[[account]]\nagent = 'claude'\nname = {name:?}\nhome = {:?}\n",
+                    "[[account]]\nid = 'test-claude-{name}'\nagent = 'claude'\nname = {name:?}\nhome = {:?}\n",
                     home.display().to_string()
                 ));
             }
         }
         let file = env.root.join("config/kraal/accounts.toml");
         std::fs::write(&file, config).unwrap();
-        let usage = env.root.join("state/kraal/usage");
+        let usage = env.root.join("state/kraal/usage/by-id");
         std::fs::create_dir_all(&usage).unwrap();
         let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
-        std::fs::write(usage.join("claude-default.json"), serde_json::json!({
+        std::fs::write(usage.join("claude-default-claude.json"), serde_json::json!({
             "five_hour": { "used_percent": 57, "resets_at": now + 3600 }, "observed_at": now, "source": "statusline",
         }).to_string()).unwrap();
         if case == "review" {
@@ -1334,7 +1334,10 @@ fn automatic_join_rejects_pending_and_completed_cli_logins() {
         let file = env.root.join("config/kraal/accounts.toml");
         std::fs::write(
             &file,
-            format!("[[account]]\nagent = 'claude'\nname = 'work'\nhome = {:?}\n", named.display().to_string()),
+            format!(
+                "[[account]]\nid = 'test-claude-work'\nagent = 'claude'\nname = 'work'\nhome = {:?}\n",
+                named.display().to_string()
+            ),
         )
         .unwrap();
         let assert_not_joined = || {
@@ -1454,7 +1457,10 @@ fn automatic_join_preserves_a_live_agent_and_caches_the_named_home_checks() {
     }
     std::fs::write(
         env.root.join("config/kraal/accounts.toml"),
-        format!("[[account]]\nagent = 'claude'\nname = 'patron.bzh'\nhome = {:?}\n", named.display().to_string()),
+        format!(
+            "[[account]]\nid = 'test-claude-patron.bzh'\nagent = 'claude'\nname = 'patron.bzh'\nhome = {:?}\n",
+            named.display().to_string()
+        ),
     )
     .unwrap();
     env.workspace("w", "layout { pane name=\"agent\" agent=\"claude:default\" }\n");
@@ -1505,7 +1511,7 @@ fn command_line_review_can_keep_a_different_account_without_login() {
     std::fs::write(
         &file,
         format!(
-            "[[account]]\nagent = 'claude'\nname = 'work'\nhome = {:?}\n",
+            "[[account]]\nid = 'test-claude-work'\nagent = 'claude'\nname = 'work'\nhome = {:?}\n",
             env.root.join("work").display().to_string()
         ),
     )
@@ -1554,7 +1560,7 @@ fn reviewing_the_existing_account_keeps_live_agents_and_reports_usage_once() {
             std::fs::write(home.join("status"), "0").unwrap();
             std::fs::write(home.join("credential"), name).unwrap();
             config.push_str(&format!(
-                "[[account]]\nagent = 'claude'\nname = '{name}'\nhome = {:?}\n",
+                "[[account]]\nid = 'test-claude-{name}'\nagent = 'claude'\nname = '{name}'\nhome = {:?}\n",
                 home.to_str().unwrap()
             ));
         }
@@ -1564,12 +1570,12 @@ fn reviewing_the_existing_account_keeps_live_agents_and_reports_usage_once() {
         std::fs::create_dir_all(&standard).unwrap();
         std::fs::write(standard.join("status"), "0").unwrap();
         std::fs::write(standard.join("credential"), "standard").unwrap();
-        let usage = env.root.join("state/kraal/usage");
+        let usage = env.root.join("state/kraal/usage/by-id");
         std::fs::create_dir_all(&usage).unwrap();
         let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
-        for (name, percent, at) in [("default", 57, now), ("patron.bzh", 40, now - 1)] {
+        for (id, percent, at) in [("default-claude", 57, now), ("test-claude-patron.bzh", 40, now - 1)] {
             std::fs::write(
-                usage.join(format!("claude-{name}.json")),
+                usage.join(format!("claude-{id}.json")),
                 serde_json::json!({
                     "five_hour": { "used_percent": percent, "resets_at": now + 3600 },
                     "weekly": null, "observed_at": at, "source": "statusline"
@@ -1633,7 +1639,6 @@ fn reviewing_the_existing_account_keeps_live_agents_and_reports_usage_once() {
         let patron = list.as_array().unwrap().iter().find(|a| a["name"] == "patron.bzh").unwrap();
         assert_eq!(patron["usage"]["five_hour"]["used_percent"], 57.0);
         assert!(list.as_array().unwrap().iter().all(|a| a["status"] != "review_required"));
-        assert_eq!(std::fs::read_to_string(file.with_extension("toml.kraal-bak")).unwrap(), config);
         for (home, credential) in
             [(&standard, "standard"), (&env.root.join("patron.bzh"), "patron.bzh"), (&env.root.join("gmail"), "gmail")]
         {
@@ -1835,14 +1840,14 @@ fn a_renamed_account_keeps_its_rules_its_usage_and_its_agents() {
     std::fs::write(
         &file,
         format!(
-            "[[account]]\nname = \"alpha\"\nagent = \"claude\"\nhome = {:?}\n\n[[rule]]\nworkspace = \"w\"\naccounts = [\"alpha\"]\n",
+            "[[account]]\nid = 'test-claude-alpha'\nname = \"alpha\"\nagent = \"claude\"\nhome = {:?}\n\n[[rule]]\nworkspace = \"w\"\naccounts = [\"alpha\"]\n",
             home.display().to_string()
         ),
     )
     .unwrap();
-    let usage = env.root.join("state/kraal/usage");
+    let usage = env.root.join("state/kraal/usage/by-id");
     std::fs::create_dir_all(&usage).unwrap();
-    std::fs::write(usage.join("claude-alpha.json"), r#"{"observed_at":0,"source":"statusline"}"#).unwrap();
+    std::fs::write(usage.join("claude-test-claude-alpha.json"), r#"{"observed_at":0,"source":"statusline"}"#).unwrap();
     let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap_or_default());
     env.workspace("w", "layout {\n    pane name=\"shell\"\n}\n");
     let out = env.cmd(&["open", "w"]).env("PATH", &path).output().unwrap();
@@ -1901,13 +1906,11 @@ fn a_renamed_account_keeps_its_rules_its_usage_and_its_agents() {
     let text = std::fs::read_to_string(&file).unwrap();
     let parsed: toml::Value = toml::from_str(&text).unwrap();
     let id = parsed["account"][0]["id"].as_str().unwrap();
-    assert!(
-        text.contains(&format!("account_ids = [\"claude:@{id}\"]"))
-            && text.contains("accounts = [\"gamma\"]")
-            && !text.contains("alpha\""),
-        "{text}"
-    );
-    assert!(usage.join("by-id").join(format!("claude-{id}.json")).exists());
+    assert_eq!(id, "test-claude-alpha", "the account keeps its identity");
+    assert_eq!(parsed["account"][0]["name"].as_str(), Some("gamma"));
+    assert_eq!(parsed["rule"][0]["accounts"], toml::Value::try_from(["gamma"]).unwrap());
+    assert_eq!(parsed["rule"][0]["account_ids"], toml::Value::try_from([format!("claude:@{id}")]).unwrap());
+    assert!(usage.join(format!("claude-{id}.json")).exists());
     hook(r#"{"hook_event_name":"Stop","session_id":"s-1"}"#);
     assert_eq!(account_said("agent.done"), "claude:gamma");
 
@@ -1917,7 +1920,7 @@ fn a_renamed_account_keeps_its_rules_its_usage_and_its_agents() {
     hook(r#"{"hook_event_name":"UserPromptSubmit","session_id":"s-1"}"#);
     assert_eq!(account_said("agent.working"), "claude:zulu");
     assert!(std::fs::read_to_string(&file).unwrap().contains(&format!("account_ids = [\"claude:@{id}\"]")));
-    assert!(usage.join("by-id").join(format!("claude-{id}.json")).exists());
+    assert!(usage.join(format!("claude-{id}.json")).exists());
     let out = env.try_run(&["accounts", "rename", "claude:default", "mine"]);
     assert!(String::from_utf8_lossy(&out.stderr).contains("check the existing sign-in") && !out.status.success());
     let screen = env.run(&["read", "-p", &agent]);
@@ -1942,49 +1945,24 @@ fn reused_account_names_leave_running_and_saved_references_on_the_original_accou
         panes().as_array().unwrap().iter().any(|p| p["account"] == "claude:work" && p["account_id"] == id)
     });
     let definition = std::fs::read_to_string(env.root.join("config/kraal/workspaces/closed.kdl")).unwrap();
-    assert!(definition.contains("// Kept closed.") && definition.contains(&format!("account_id={id:?}")));
+    assert_eq!(definition, "// Kept closed.\nlayout { pane agent=\"claude:alpha\" }\n");
+    let out = env.try_run(&["open", "closed"]);
+    let error = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success() && error.contains("claude has no account named \"alpha\""), "{error}");
     env.run(&["kill"]);
 
-    // A session of an older release carries the label and launch environment, but no identity.
-    let saved = env.root.join(format!("state/kraal/sessions-v2/{}.json", env.session));
-    let mut state: serde_json::Value = serde_json::from_slice(&std::fs::read(&saved).unwrap()).unwrap();
-    fn old_specs(value: &mut serde_json::Value) {
-        match value {
-            serde_json::Value::Object(object) => {
-                if let Some(spec) = object.get_mut("spec").and_then(serde_json::Value::as_object_mut) {
-                    spec.remove("account_id");
-                    if let Some(env) = spec.get_mut("env").and_then(serde_json::Value::as_array_mut) {
-                        env.retain(|pair| pair[0] != "KRAAL_ACCOUNT_ID");
-                    }
-                }
-                object.values_mut().for_each(old_specs);
-            }
-            serde_json::Value::Array(values) => values.iter_mut().for_each(old_specs),
-            _ => {}
-        }
-    }
-    old_specs(&mut state);
-    state["version"] = serde_json::json!(1);
-    state["revision"] = serde_json::json!(1);
-    let legacy = env.legacy_state_file();
-    let source = serde_json::to_vec(&state).unwrap();
-    std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
-    std::fs::write(&legacy, &source).unwrap();
-    std::fs::remove_file(&saved).unwrap();
+    let saved = env.state_file();
+    let source = std::fs::read(&saved).unwrap();
     env.run(&["accounts", "rm", "claude:work"]);
-    assert_eq!(std::fs::read(&legacy).unwrap(), source);
-    let migrated = std::fs::read_to_string(&saved).unwrap();
-    assert!(migrated.contains(id), "closed legacy sessions are bound before removal");
+    assert_eq!(std::fs::read(&saved).unwrap(), source);
     let replacement = env.root.join("replacement").display().to_string();
     env.run(&["accounts", "add", "claude", "alpha", "--home", &replacement, "--no-login"]);
     let out = env.cmd(&["open", "w"]).env("PATH", &path).output().unwrap();
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     assert!(panes().as_array().unwrap().iter().any(|p| p["account"] == "claude:work" && p["account_id"] == id));
-    for name in ["closed", "saved"] {
-        let out = env.try_run(&["open", name]);
-        let error = String::from_utf8_lossy(&out.stderr);
-        assert!(!out.status.success() && error.contains("account was removed") && !error.contains(id), "{error}");
-    }
+    let out = env.try_run(&["open", "saved"]);
+    let error = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success() && error.contains("account was removed") && !error.contains(id), "{error}");
     let refused = raw_request(
         &env,
         serde_json::json!({ "cmd": "open_agent", "agent": "claude",
@@ -1999,6 +1977,13 @@ fn reused_account_names_leave_running_and_saved_references_on_the_original_accou
     );
     assert!(opened.get("Ok").is_some(), "{opened}");
     assert!(panes().as_array().unwrap().iter().any(|p| p["account"] == "claude:alpha" && p["account_id"] != id));
+    // The untouched external definition resolves the reused name too.
+    env.run(&["open", "closed"]);
+    assert!(panes().as_array().unwrap().iter().any(|p| {
+        p["workspace"] == "closed"
+            && p["account"] == "claude:alpha"
+            && p["account_id"].as_str().is_some_and(|new| new != id)
+    }));
     let selected = raw_request(
         &env,
         serde_json::json!({ "cmd": "open_agent", "agent": "claude",
@@ -2068,8 +2053,14 @@ while IFS= read -r line; do printf 'reply:%s\n' "$line"; done
         std::fs::write(home.join("signed-in"), "credential").unwrap();
         std::fs::write(home.join("conversation"), "history").unwrap();
         let file = env.root.join("config/kraal/accounts.toml");
-        std::fs::write(&file, format!("[[account]]\nname='work'\nagent='codex'\nhome={:?}\n", home.to_str().unwrap()))
-            .unwrap();
+        std::fs::write(
+            &file,
+            format!(
+                "[[account]]\nid = 'test-codex-work'\nname='work'\nagent='codex'\nhome={:?}\n",
+                home.to_str().unwrap()
+            ),
+        )
+        .unwrap();
         env.workspace("w", "layout { pane name=\"agent\" agent=\"codex:work\" }\n");
         let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap_or_default());
         let out = env.cmd(&["open", "w"]).env("PATH", &path).output().unwrap();
@@ -2182,7 +2173,10 @@ fn the_add_form_names_an_existing_sign_in_without_running_login() {
     let file = env.root.join("config/kraal/accounts.toml");
     std::fs::write(
         &file,
-        format!("[[account]]\nagent='claude'\nname='work'\nhome={:?}\n", env.root.join("work").to_str().unwrap()),
+        format!(
+            "[[account]]\nid = 'test-claude-work'\nagent='claude'\nname='work'\nhome={:?}\n",
+            env.root.join("work").to_str().unwrap()
+        ),
     )
     .unwrap();
     env.workspace("w", "layout { pane name=\"shell\" }\n");
@@ -2251,7 +2245,10 @@ fn a_different_account_review_after_sign_out_exposes_sign_in() {
     let file = env.root.join("config/kraal/accounts.toml");
     std::fs::write(
         &file,
-        format!("[[account]]\nagent='claude'\nname='work'\nhome={:?}\n", env.root.join("work").to_str().unwrap()),
+        format!(
+            "[[account]]\nid = 'test-claude-work'\nagent='claude'\nname='work'\nhome={:?}\n",
+            env.root.join("work").to_str().unwrap()
+        ),
     )
     .unwrap();
     env.workspace("w", "layout { pane name=\"shell\" }\n");
@@ -2301,7 +2298,10 @@ fn sidebar_accounts_discover_a_sign_in_completed_after_startup() {
         let file = env.root.join("config/kraal/accounts.toml");
         std::fs::write(
             &file,
-            format!("[[account]]\nagent='claude'\nname='work'\nhome={:?}\n", env.root.join("work").to_str().unwrap()),
+            format!(
+                "[[account]]\nid = 'test-claude-work'\nagent='claude'\nname='work'\nhome={:?}\n",
+                env.root.join("work").to_str().unwrap()
+            ),
         )
         .unwrap();
         env.workspace("w", "layout { pane name=\"shell\" }\n");
@@ -2329,4 +2329,30 @@ fn sidebar_accounts_discover_a_sign_in_completed_after_startup() {
         assert!(std::fs::read_to_string(&file).unwrap().contains("review = true"));
         assert!(!env.root.join("home/logins").exists());
     }
+}
+
+#[test]
+fn account_changes_leave_saved_sessions_workspace_files_and_name_caches_untouched() {
+    let env = Env::new("account-files");
+    let accounts = env.root.join("config/kraal/accounts.toml");
+    std::fs::write(&accounts, "[[account]]\nid = 'work'\nname = 'work'\nagent = 'claude'\nhome = '/work'\n").unwrap();
+    let source = "// Keep the label.\nlayout { pane agent=\"claude:work\"; }\n";
+    env.workspace("w", source);
+    let usage = env.root.join("state/kraal/usage/claude-work.json");
+    let files = [
+        (env.legacy_state_file(), b"unreadable old session".as_slice()),
+        (env.state_file(), b"unreadable current session".as_slice()),
+        (usage, b"old usage".as_slice()),
+    ];
+    for (path, bytes) in &files {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, bytes).unwrap();
+    }
+    env.run(&["accounts", "rename", "claude:work", "renamed"]);
+    for (path, bytes) in &files {
+        assert_eq!(std::fs::read(path).unwrap(), *bytes);
+    }
+    assert_eq!(std::fs::read_to_string(env.root.join("config/kraal/workspaces/w.kdl")).unwrap(), source);
+    assert!(!env.root.join("state/kraal/usage/by-id").exists());
+    assert!(!accounts.with_extension("toml.kraal-bak").exists());
 }

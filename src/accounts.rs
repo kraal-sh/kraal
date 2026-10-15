@@ -13,8 +13,6 @@ use serde::{Deserialize, Serialize};
 
 use crate::paths;
 
-mod migration;
-
 /// How kraal runs one kind of agent.
 #[derive(Debug, Clone, Copy)]
 pub struct AgentKind {
@@ -88,7 +86,7 @@ impl Default for Limits {
 /// An `[[account]]` of accounts.toml: one subscription of one agent.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Account {
-    /// Stable identity; absent in files written before account identities were introduced.
+    /// Stable account identity.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub id: String,
     /// Unique among the agent's accounts.
@@ -199,8 +197,7 @@ struct File {
 }
 
 impl File {
-    fn expanded_accounts(mut self) -> Vec<Account> {
-        migration::identify(&mut self);
+    fn expanded_accounts(self) -> Vec<Account> {
         let mut accounts = Vec::new();
         for mut account in self.accounts {
             let references = std::mem::take(&mut account.references);
@@ -234,8 +231,7 @@ fn expanded_document(source: &str) -> Result<String> {
     let mut accounts = ArrayOfTables::new();
     doc.remove("account");
     for mut table in stored {
-        let mut account: Account = toml::from_str(&table.to_string())?;
-        migration::identify_account(&mut account);
+        let account: Account = toml::from_str(&table.to_string())?;
         let id = account.id;
         let references = table.remove("references");
         accounts.push(table);
@@ -370,10 +366,7 @@ impl Accounts {
             Some(text) => crate::rewrite::rewrite(&expanded_document(text)?, &file)?,
             None => format!("{HEADER}{}", toml::to_string_pretty(&file)?),
         };
-        let text = self
-            .compact_document(&text)
-            .and_then(migration::without_empty_sections)
-            .with_context(|| format!("editing {}", self.path.display()))?;
+        let text = self.compact_document(&text).with_context(|| format!("editing {}", self.path.display()))?;
         // Compaction changes ordering and flattens links, but must preserve what kraal reads.
         let mut read: File = toml::from_str(&text).context("reading the compacted accounts")?;
         read.accounts = read.clone().expanded_accounts();
@@ -440,7 +433,6 @@ impl Accounts {
             std::fs::create_dir_all(dir)?;
         }
         let text = self.text()?;
-        migration::backup(self, &text)?;
         paths::write_atomic(&self.path, text.as_bytes()).with_context(|| format!("writing {}", self.path.display()))
     }
 
@@ -452,15 +444,6 @@ impl Accounts {
 
     /// [`Accounts::update`] on the accounts file at `path`.
     pub fn update_at<T>(path: &Path, f: impl FnOnce(&mut Accounts) -> Result<T>) -> Result<T> {
-        Self::update_with_sources(path, f, |_| {})
-    }
-
-    /// Record each completed source migration even if a later migration or account save fails.
-    pub(crate) fn update_with_sources<T>(
-        path: &Path,
-        f: impl FnOnce(&mut Accounts) -> Result<T>,
-        mut source_written: impl FnMut(&crate::workspace::migration::SourceWrite),
-    ) -> Result<T> {
         paths::locked(path, || {
             let mut all = Self::load_from(path)?;
             let before = all.text()?;
@@ -468,11 +451,9 @@ impl Accounts {
                 old.accounts.iter().any(|a| a.linked_to.is_some())
                     || old.expanded_accounts().iter().zip(&all.accounts).any(|(a, b)| a.linked_to != b.linked_to)
             });
-            let previous = all.clone();
             let out = f(&mut all)?;
             all.bind_rules();
             if joined || all.text()? != before {
-                migration::before_account_change(&previous, &mut source_written)?;
                 all.save()?;
             }
             Ok(out)
@@ -1087,16 +1068,7 @@ fn check_name(kind: &AgentKind, name: &str) -> Result<()> {
 /// Rename the account label, keeping its rules and usage on the same identity.
 /// Its home stays where it is: agents running on it go on.
 pub fn rename(agent: &str, old: &str, new: &str) -> Result<()> {
-    rename_in(&Accounts::path(), &usage_dir(), agent, old, new)
-}
-
-/// [`rename`] in the accounts file `file`, with the usage saved in `usage`.
-fn rename_in(file: &Path, usage: &Path, agent: &str, old: &str, new: &str) -> Result<()> {
-    Accounts::update_at(file, |all| {
-        let a = all.get(agent, old).with_context(|| missing_account(agent, old))?;
-        all.rename(agent, old, new)?;
-        migration::migrate_usage(usage, &a)
-    })
+    Accounts::update(|all| all.rename(agent, old, new))
 }
 
 pub fn review_question(account: &Account) -> String {
@@ -1988,14 +1960,7 @@ impl UsageMap {
         let mut usage = UsageMap::default();
         for a in accounts.known() {
             let Some(target) = accounts.by_id(&a.id) else { continue };
-            let _ = migration::migrate_usage(dir, &a);
             if let Some(u) = load_usage(dir, &a.agent, &a.id) {
-                usage.observe(&target, u);
-            }
-            if let Some(name) = migration::legacy_usage_name(&a)
-                && let Ok(bytes) = std::fs::read(dir.join(usage_file(&a.agent, name)))
-                && let Ok(u) = serde_json::from_slice(&bytes)
-            {
                 usage.observe(&target, u);
             }
         }

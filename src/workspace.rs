@@ -18,8 +18,6 @@ use anyhow::{Context as _, Result, anyhow};
 use kdl::{KdlDocument, KdlEntry, KdlError, KdlNode, KdlValue};
 use serde::{Deserialize, Serialize};
 
-pub(crate) mod migration;
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NameError {
     Empty,
@@ -528,7 +526,7 @@ pub fn bind_source_accounts(source: &str, accounts: &crate::accounts::Accounts) 
         for (offset, text) in insertions.into_iter().rev() {
             source.insert_str(offset, &text);
         }
-        parse_kdl(&source).context("checking migrated workspace accounts")?;
+        parse_kdl(&source).context("checking workspace account identities")?;
     }
     Ok(source)
 }

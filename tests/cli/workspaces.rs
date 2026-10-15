@@ -654,7 +654,7 @@ fn export_in_a_pane_uses_the_workspace_of_that_pane() {
 
     std::fs::remove_file(dir.join("v.kdl")).unwrap();
     assert!(in_pane(&["export", dir.join("v.kdl").to_str().unwrap()]).contains("/v.kdl"));
-    // Recreating a missing definition keeps the persistent lock shared with account migration.
+    // Recreating a missing definition keeps the persistent workspace file lock.
     assert_eq!(names_in(&dir), [".v.kdl.lock", "v.kdl", "w.kdl"]);
     assert!(in_pane(&["export", dir.join("copy.kdl").to_str().unwrap()]).contains("/copy.kdl"));
     assert!(saved("copy.kdl").contains("name=\"second\"") && !saved("copy.kdl").contains("first"));
@@ -1030,7 +1030,10 @@ fn commands_outside_kraal_skip_a_closed_first_workspace() {
     write_script(&bin.join("claude"), "#!/bin/sh\n[ \"$2\" = status ] && exit 0\necho agent-ready\nexec sleep 60\n");
     std::fs::write(
         env.root.join("config/kraal/accounts.toml"),
-        format!("[[account]]\nname = \"work\"\nagent = \"claude\"\nhome = {:?}\n", home.display().to_string()),
+        format!(
+            "[[account]]\nid = 'test-claude-work'\nname = \"work\"\nagent = \"claude\"\nhome = {:?}\n",
+            home.display().to_string()
+        ),
     )
     .unwrap();
     let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap_or_default());

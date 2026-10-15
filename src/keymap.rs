@@ -1277,24 +1277,6 @@ mod tests {
     }
 
     #[test]
-    fn prefixed_is_an_unknown_key_and_does_not_change_bindings() {
-        let (cfg, warnings) = crate::config::Config::parse(
-            "[keys.prefixed]\nsplit_right = [\"~\"]\nmenu_servers = [\"J\"]\n\
-             [keys.leader]\nsplit_right = [\"%\"]\nmenu_servers = [\"M\"]\n\
-             [keys.direct]\nnew_tab = [\"alt+;\"]\n",
-        )
-        .unwrap();
-        assert_eq!(warnings, ["keys.prefixed: unknown key (did you mean prefix?)"]);
-        let (km, warnings) = Keymap::build(&cfg.keys);
-        assert!(warnings.is_empty(), "{warnings:?}");
-        assert_eq!(km.lookup(&[key('~')]), Lookup::Nothing);
-        assert_eq!(km.lookup(&[key('J')]), Lookup::Nothing);
-        assert_eq!(km.lookup(&[key('%')]), Lookup::Run(Command::Action(SplitRight)));
-        assert_eq!(km.lookup(&[key('M'), key('u')]), Lookup::Run(Command::Action(Upload)));
-        assert_eq!(km.direct(&Key { mods: Mods::ALT, ..key(';') }), Some(NewTab));
-    }
-
-    #[test]
     fn the_keys_given_to_an_action_are_listed_where_the_preset_lists_it() {
         // The order of a preset is the order of the listings: no action has two places in it.
         for preset in PRESETS {

@@ -112,7 +112,7 @@ fn duplicate_codex_keeps_subcommand_names_as_prompts_and_trailing_options_as_opt
 }
 
 #[test]
-fn linked_files_rewrite_to_one_entry_per_account_with_all_references_and_legacy_fields() {
+fn linked_files_rewrite_to_one_entry_per_account_with_all_references_and_unknown_fields() {
     let dir = std::env::temp_dir().join(format!("kraal-compact-{}", new_uuid()));
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("accounts.toml");
@@ -148,23 +148,6 @@ fn linked_files_rewrite_to_one_entry_per_account_with_all_references_and_legacy_
     assert_eq!(launched.id, "work");
     assert!(launched.same_home(&Accounts::standard("claude").unwrap()));
 
-    #[derive(Deserialize)]
-    struct LegacyAccount {
-        name: String,
-        agent: String,
-        home: String,
-        threshold: Option<u8>,
-    }
-    #[derive(Deserialize)]
-    struct LegacyFile {
-        account: Vec<LegacyAccount>,
-    }
-    let old: LegacyFile = toml::from_str(&saved).unwrap();
-    assert_eq!(old.account.len(), 3);
-    for (a, b) in old.account.iter().zip(all.all()) {
-        assert_eq!((&a.name, &a.agent, &a.home, a.threshold), (&b.name, &b.agent, &b.home, b.threshold));
-    }
-    assert_eq!(std::fs::read_to_string(path.with_extension("toml.kraal-bak")).unwrap(), source);
     Accounts::update_at(&path, |all| all.save()).unwrap();
     assert_eq!(std::fs::read_to_string(&path).unwrap(), saved, "rewriting is idempotent");
     Accounts::update_at(&path, |all| {
@@ -240,7 +223,6 @@ fn compaction_keeps_nested_unknown_fields_with_their_reference() {
         .unwrap();
         assert_eq!(Accounts::load_from(&path).unwrap().limits.threshold, 75);
     }
-    assert_eq!(std::fs::read_to_string(path.with_extension("toml.kraal-bak")).unwrap(), source);
     std::fs::remove_dir_all(dir).unwrap();
 }
 
@@ -433,7 +415,7 @@ fn persisted_review_preserves_the_original_file_and_is_not_offered_again() {
     let dir = std::env::temp_dir().join(format!("kraal-review-file-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("accounts.toml");
-    let source = "# My accounts.\n[[account]]\nagent = 'claude'\nname = 'default'\nhome = '~/.claude'\nnote = 'keep me'\nfuture = 7\n\n[[account]]\nagent = 'claude'\nname = 'patron.bzh'\nhome = '/patron'\n";
+    let source = "# My accounts.\n[[account]]\nid = 'old-default'\nagent = 'claude'\nname = 'default'\nhome = '~/.claude'\nnote = 'keep me'\nfuture = 7\n\n[[account]]\nid = 'patron'\nagent = 'claude'\nname = 'patron.bzh'\nhome = '/patron'\n";
     std::fs::write(&path, source).unwrap();
     let existing = Accounts::load_from(&path).unwrap().unlisted().into_iter().find(|a| a.agent == "claude").unwrap();
     Accounts::update_at(&path, |all| all.adopt_checked(&existing, None)).unwrap();
@@ -449,7 +431,6 @@ fn persisted_review_preserves_the_original_file_and_is_not_offered_again() {
     assert_eq!(all.all().len(), 1);
     let saved = std::fs::read_to_string(&path).unwrap();
     assert!(saved.contains("# My accounts.") && saved.contains("note = 'keep me'") && saved.contains("future = 7"));
-    assert_eq!(std::fs::read_to_string(path.with_extension("toml.kraal-bak")).unwrap(), source);
     Accounts::update_at(&path, |all| all.adopt_checked(&existing, None)).unwrap();
     assert_eq!(std::fs::read_to_string(&path).unwrap(), saved, "late discovery cannot undo a review");
     std::fs::remove_dir_all(dir).unwrap();
@@ -497,7 +478,7 @@ fn same_canonical_home_is_one_account_and_keeps_legacy_names_ids_and_notes() {
     std::os::unix::fs::symlink(dir.join("home"), &alias).unwrap();
     let path = dir.join("accounts.toml");
     let source = format!(
-        "# Mine.\n[[account]]\nname = 'work'\nagent = 'claude'\nhome = {:?}\n\n# Keep this note.\n[[account]]\nname = 'other'\nagent = 'claude'\nhome = {:?}\nnote = 'old label'\nfuture = 7\n",
+        "# Mine.\n[[account]]\nid = 'work'\nname = 'work'\nagent = 'claude'\nhome = {:?}\n\n# Keep this note.\n[[account]]\nid = 'other'\nname = 'other'\nagent = 'claude'\nhome = {:?}\nnote = 'old label'\nfuture = 7\n",
         dir.join("home").display().to_string(),
         alias.display().to_string()
     );
@@ -515,7 +496,6 @@ fn same_canonical_home_is_one_account_and_keeps_legacy_names_ids_and_notes() {
     );
     assert!(saved.contains("[[account.references]]"));
     assert_eq!(saved.matches("[[account]]").count(), 1);
-    assert_eq!(std::fs::read_to_string(path.with_extension("toml.kraal-bak")).unwrap(), source);
     let mut all = Accounts::load_from(&path).unwrap();
     let added = all.add(acct("claude", "third", alias.to_str().unwrap())).unwrap();
     assert_eq!(added.id, first.id);
@@ -710,12 +690,6 @@ fn linked_usage_uses_the_latest_observation_and_never_adds_two_homes() {
     .unwrap();
     assert_eq!(UsageMap::load_from(&all, &dir).peak(&target, 300), Some(20.0));
     assert!(dir.join("by-id").join(usage_file(&original.agent, &original.id)).exists());
-    std::fs::write(dir.join("claude-default.json"), serde_json::to_vec(&observation(60.0, 400)).unwrap()).unwrap();
-    assert_eq!(
-        UsageMap::load_from(&all, &dir).peak(&target, 400),
-        Some(60.0),
-        "a hook from an older kraal still reports usage"
-    );
     std::fs::remove_dir_all(dir).unwrap();
 }
 
@@ -1258,12 +1232,13 @@ fn renaming_an_account_takes_its_rules_and_usage_along() {
     let mut rules = a.rules.clone();
     let pro_id = a.get("claude", "pro").unwrap().id;
     a.save().unwrap();
-    std::fs::write(usage.join("claude-pro.json"), "pro's").unwrap();
+    std::fs::create_dir_all(usage.join("by-id")).unwrap();
+    std::fs::write(usage.join("by-id").join(usage_file("claude", &pro_id)), "pro's").unwrap();
     // A removed account's usage, under the name perso takes.
     std::fs::write(usage.join("claude-me.json"), "stale").unwrap();
 
-    rename_in(&file, &usage, "claude", "pro", "work").unwrap();
-    rename_in(&file, &usage, "claude", "perso", "me").unwrap();
+    Accounts::update_at(&file, |all| all.rename("claude", "pro", "work")).unwrap();
+    Accounts::update_at(&file, |all| all.rename("claude", "perso", "me")).unwrap();
     let a = Accounts::load_from(&file).unwrap();
     let names: Vec<String> = a.all().iter().map(label).collect();
     assert_eq!(names, ["claude·work", "claude·me", "codex·pro"]);
@@ -1275,12 +1250,11 @@ fn renaming_an_account_takes_its_rules_and_usage_along() {
     assert_eq!(a.choose("claude", Some("work"), None, &none, 0).unwrap().name, "work");
     assert_eq!(a.choose("codex", Some("work"), None, &none, 0).unwrap().name, "pro");
     assert_eq!(std::fs::read_to_string(usage.join("by-id").join(format!("claude-{pro_id}.json"))).unwrap(), "pro's");
-    assert!(usage.join("claude-pro.json").exists(), "legacy cache is kept for rollback");
     assert_eq!(std::fs::read_to_string(usage.join("claude-me.json")).unwrap(), "stale", "unrelated cache is untouched");
 
     let text = std::fs::read_to_string(&file).unwrap();
     let refused = |agent: &str, old: &str, new: &str, why: &str| {
-        let e = format!("{:#}", rename_in(&file, &usage, agent, old, new).unwrap_err());
+        let e = format!("{:#}", Accounts::update_at(&file, |all| all.rename(agent, old, new)).unwrap_err());
         assert!(e.contains(why), "{old} to {new}: {e}");
         assert_eq!(std::fs::read_to_string(&file).unwrap(), text, "{old} to {new} changed the file");
     };
@@ -1521,9 +1495,11 @@ fn naming_the_default_home_keeps_its_identity_and_bindings() {
     all.bind_pane(&mut pane);
     let definition = dir.join("w.kdl");
     std::fs::write(&definition, "layout { pane agent=\"claude:default\" }\n").unwrap();
-    crate::workspace::migration::bind_accounts(&definition, &all).unwrap();
+    let source = crate::workspace::bind_source_accounts("layout { pane agent=\"claude:default\" }\n", &all).unwrap();
+    std::fs::write(&definition, source).unwrap();
+    std::fs::create_dir_all(dir.join("by-id")).unwrap();
     std::fs::write(
-        dir.join("claude-default.json"),
+        dir.join("by-id").join(usage_file("claude", &old.id)),
         serde_json::to_vec(&Usage {
             five_hour: Some(Window { used_percent: 42.0, resets_at: Some(i64::MAX) }),
             ..Default::default()
@@ -1531,7 +1507,6 @@ fn naming_the_default_home_keeps_its_identity_and_bindings() {
         .unwrap(),
     )
     .unwrap();
-    migration::migrate_usage(&dir, &old).unwrap();
     let adopted = all.add(Account { id: new_uuid(), name: "personal".into(), ..old.clone() }).unwrap();
     assert_eq!(adopted.id, old.id, "callers get the adopted identity too");
     assert_eq!(all.for_agent("claude"), std::slice::from_ref(&adopted));
@@ -1721,7 +1696,7 @@ fn setting_and_clearing_a_statusline_keeps_unknown_claude_settings() {
             all.claude.statusline = None;
             Ok(())
         });
-        assert_eq!(text, if settings.is_empty() { old.replace("[claude]", "") } else { old });
+        assert_eq!(text, old);
     }
 }
 
@@ -1769,7 +1744,7 @@ fn keys_the_accounts_file_does_not_read_are_warnings() {
     let path = dir.join("accounts.toml");
     std::fs::write(
         &path,
-        "[limits]\ntreshold = 80\n\n[[account]]\nname = \"pro\"\nagent = \"claude\"\nhome = \"/tmp/x\"\n\
+        "[limits]\ntreshold = 80\n\n[[account]]\nid = \"pro\"\nname = \"pro\"\nagent = \"claude\"\nhome = \"/tmp/x\"\n\
              notes = \"team plan\"\n\n[[rule]]\nworkspce = \"shop\"\naccounts = [\"pro\"]\n",
     )
     .unwrap();
@@ -1930,5 +1905,44 @@ fn codex_resume_requires_readable_matching_session_metadata() {
     check_resume(&a, "original").unwrap();
     assert!(check_resume(&a, "../original").is_err());
     assert!(check_resume(&a, "").is_err());
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn old_account_files_are_refused_without_rewriting() {
+    let dir = std::env::temp_dir().join(format!("kraal-old-accounts-{}", new_uuid()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("accounts.toml");
+    for source in [
+        "[[account]]\nagent = 'claude'\nname = 'work'\nhome = '/work'\n",
+        "[[account]]\nid = 'owner'\nagent = 'claude'\nname = 'work'\nhome = '/work'\n[[account.references]]\nagent = 'claude'\nname = 'old'\nhome = '/old'\n",
+        "[[forgotten]]\nagent = 'claude'\nname = 'old'\nhome = '/old'\n",
+    ] {
+        std::fs::write(&path, source).unwrap();
+        assert!(Accounts::load_from(&path).unwrap_err().to_string().ends_with("run kraal 0.4 once first"));
+        assert!(Accounts::check(&path).unwrap_err().to_string().ends_with("run kraal 0.4 once first"));
+        let error = Accounts::update_at::<()>(&path, |_| panic!("refuse before changing accounts")).unwrap_err();
+        assert!(error.to_string().ends_with("run kraal 0.4 once first"));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), source);
+        assert!(!path.with_extension("toml.kraal-bak").exists());
+    }
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn usage_reads_only_identity_caches_and_leaves_name_caches_untouched() {
+    let dir = std::env::temp_dir().join(format!("kraal-old-usage-{}", new_uuid()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let all = accounts();
+    let account = all.get("claude", "pro").unwrap();
+    let bytes = serde_json::to_vec(&Usage { observed_at: 20, ..Default::default() }).unwrap();
+    let legacy = dir.join(usage_file("claude", "pro"));
+    std::fs::write(&legacy, &bytes).unwrap();
+    assert!(UsageMap::load_from(&all, &dir).get(&account).is_none());
+    assert!(!dir.join("by-id").exists());
+    std::fs::create_dir_all(dir.join("by-id")).unwrap();
+    std::fs::write(dir.join("by-id").join(usage_file("claude", &account.id)), &bytes).unwrap();
+    assert_eq!(UsageMap::load_from(&all, &dir).get(&account).unwrap().observed_at, 20);
+    assert_eq!(std::fs::read(&legacy).unwrap(), bytes);
     std::fs::remove_dir_all(dir).unwrap();
 }

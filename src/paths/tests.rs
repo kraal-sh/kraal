@@ -54,25 +54,6 @@ fn saved_sessions_find_both_formats_once_and_resolve_shortened_sockets() {
 }
 
 #[test]
-fn forgotten_sessions_stay_unlisted_until_current_state_is_saved_again() {
-    let root = std::env::temp_dir().join(format!("kraal-forgotten-{}", crate::accounts::new_uuid()));
-    let current = root.join("sessions-v2/main.json");
-    let legacy = root.join("sessions/main.json");
-    for path in [&current, &legacy] {
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(path, "{}").unwrap();
-    }
-    std::fs::write(current.with_extension("forgotten"), "").unwrap();
-    assert!(saved_sessions_in(&root).unwrap().contains("main"));
-    std::fs::remove_file(&current).unwrap();
-    assert!(saved_sessions_in(&root).unwrap().is_empty());
-    std::fs::write(&current, "{}").unwrap();
-    assert!(saved_sessions_in(&root).unwrap().contains("main"));
-    assert_eq!(std::fs::read_to_string(&legacy).unwrap(), "{}");
-    std::fs::remove_dir_all(root).unwrap();
-}
-
-#[test]
 fn every_valid_session_has_a_socket_path_that_fits() {
     // Names as long as kraal ever accepted stay valid.
     let longest = "s".repeat(SESSION_NAME_MAX);

@@ -1235,10 +1235,6 @@ fn saved_sessions_in(state: &Path) -> std::io::Result<std::collections::BTreeSet
             if path.extension().is_some_and(|e| e == "json")
                 && let Some(name) = path.file_stem().and_then(|s| s.to_str()).filter(|s| valid_session_name(s))
             {
-                let current = state.join("sessions-v2").join(format!("{name}.json"));
-                if dir == "sessions" && !current.try_exists()? && current.with_extension("forgotten").try_exists()? {
-                    continue;
-                }
                 names.insert(name.to_string());
             }
         }

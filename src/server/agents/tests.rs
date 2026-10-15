@@ -296,11 +296,11 @@ fn signed_in(home: &std::path::Path, email: &str) {
 }
 
 #[test]
-fn automatic_join_records_its_source_write_and_keeps_the_notice_until_attachment() {
+fn automatic_join_leaves_sources_unchanged_and_keeps_the_notice_until_attachment() {
     use crate::{paths, persist};
 
     if !crate::testing::in_own_process(
-        "server::agents::tests::automatic_join_records_its_source_write_and_keeps_the_notice_until_attachment",
+        "server::agents::tests::automatic_join_leaves_sources_unchanged_and_keeps_the_notice_until_attachment",
     ) {
         return;
     }
@@ -321,9 +321,8 @@ fn automatic_join_records_its_source_write_and_keeps_the_notice_until_attachment
         t.server.check_existing_accounts();
         t.until("the account joins", |t| t.server.jobs.is_empty());
         assert_eq!(t.server.accounts.get("claude", "default").unwrap().id, work.id);
-        let migrated = std::fs::read_to_string(&target).unwrap();
-        assert_eq!(migrated, source.replace("; }", " account_id=\"default-claude\"; }"));
-        let baseline = if edited { original } else { &migrated };
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), source);
+        let baseline = original;
         assert_eq!(t.server.workspaces[0].definition_source.as_deref(), Some(baseline));
         t.server.refresh_source_status();
         assert_eq!(t.server.workspaces[0].source_status, edited.then_some("File changed"));
@@ -348,7 +347,7 @@ fn automatic_join_records_its_source_write_and_keeps_the_notice_until_attachment
         assert!(t.server.clients[&client].toast.is_none());
         assert_eq!(t.server.messages.iter().filter(|m| m.text == notice).count(), 1);
 
-        std::fs::write(&target, format!("{migrated}// Outside edit after joining.\n")).unwrap();
+        std::fs::write(&target, format!("{source}// Outside edit after joining.\n")).unwrap();
         t.server.refresh_source_status();
         assert_eq!(t.server.workspaces[0].source_status, Some("File changed"));
         assert_eq!(t.server.workspaces[0].definition_source.as_deref(), Some(baseline));
