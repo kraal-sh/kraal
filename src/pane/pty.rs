@@ -1010,10 +1010,15 @@ impl PtyReader {
     /// The next output, as much as the PTY has, waiting for it; None at the end or once told to
     /// stop (what woke the reader then is dropped).
     fn read(&mut self, buf: &mut [u8], stop: &AtomicBool) -> Option<usize> {
+        self.read_after_check(buf, stop, || {})
+    }
+
+    fn read_after_check(&mut self, buf: &mut [u8], stop: &AtomicBool, mut checked: impl FnMut()) -> Option<usize> {
         loop {
             if stop.load(Ordering::Acquire) {
                 return None;
             }
+            checked();
             if !self.woken && !self.ready(Duration::from_millis(200)).ok()? {
                 continue;
             }
@@ -1170,23 +1175,42 @@ mod tests {
 
     #[test]
     fn a_reader_stops_while_the_program_is_silent() {
-        let pair = portable_pty::native_pty_system()
-            .openpty(PtySize { rows: 5, cols: 20, pixel_width: 0, pixel_height: 0 })
-            .unwrap();
         // Woken by a byte from the other end, or (without its name) checking now and then.
-        for tty in [pair.master.tty_name(), None] {
-            let stop = ReaderStop::new(tty);
+        for woken in [true, false] {
+            let pair = portable_pty::native_pty_system()
+                .openpty(PtySize { rows: 5, cols: 20, pixel_width: 0, pixel_height: 0 })
+                .unwrap();
+            let tty = pair.master.tty_name().unwrap();
+            let stop = ReaderStop::new(woken.then(|| tty.clone()));
             let mut reader = PtyReader::new(&*pair.master, stop.wakes()).unwrap();
             let stopped = stop.flag.clone();
+            let (read_tx, read_rx) = crossbeam_channel::bounded(1);
+            let (checked_tx, checked_rx) = crossbeam_channel::bounded(1);
+            let (resume_tx, resume_rx) = crossbeam_channel::bounded(1);
             let (done_tx, done_rx) = crossbeam_channel::bounded(1);
-            std::thread::spawn(move || {
+            let worker = std::thread::spawn(move || {
                 let mut buf = [0u8; 64];
-                let _ = done_tx.send(reader.read(&mut buf, &stopped));
+                let n = reader.read(&mut buf, &stopped).unwrap();
+                read_tx.send(buf[..n].to_vec()).unwrap();
+                let mut first = true;
+                let result = reader.read_after_check(&mut buf, &stopped, || {
+                    if std::mem::take(&mut first) {
+                        checked_tx.send(()).unwrap();
+                        resume_rx.recv_timeout(crate::testing::PATIENCE).unwrap();
+                    }
+                });
+                let _ = done_tx.send(result);
             });
-            std::thread::sleep(Duration::from_millis(50));
+            std::fs::OpenOptions::new().write(true).open(tty).unwrap().write_all(b"x").unwrap();
+            assert_eq!(read_rx.recv_timeout(crate::testing::PATIENCE).unwrap(), b"x");
+            checked_rx.recv_timeout(crate::testing::PATIENCE).unwrap();
             assert!(done_rx.is_empty());
+            // The next read has passed its stop check: it must consume the wake byte (or
+            // finish its timed poll), even if the worker is descheduled until after stop.
             stop.stop();
-            assert_eq!(done_rx.recv_timeout(Duration::from_secs(2)), Ok(None));
+            resume_tx.send(()).unwrap();
+            assert_eq!(done_rx.recv_timeout(crate::testing::PATIENCE), Ok(None));
+            worker.join().unwrap();
         }
     }
 
@@ -1250,11 +1274,18 @@ mod tests {
             }
             told.load(Ordering::SeqCst)
         };
+        let wait_for_output = |bytes: &[u8]| {
+            let deadline = Instant::now() + crate::testing::PATIENCE;
+            while out.lock().bytes != bytes {
+                assert!(Instant::now() < deadline, "output never reached {bytes:?}: {:?}", out.lock().bytes);
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        };
         tty.write_all(b"one").unwrap();
         assert_eq!(wait_for(1), 1);
         // More output before the server came: it is not told again, and takes all of it.
         tty.write_all(b" two").unwrap();
-        std::thread::sleep(Duration::from_millis(50));
+        wait_for_output(b"one two");
         assert_eq!(told.load(Ordering::SeqCst), 1);
         let mut got = Vec::new();
         assert!(out.take(&mut got, false));
@@ -1262,7 +1293,7 @@ mod tests {
         // Found empty by a server that comes back on its own: it is not told.
         assert!(!out.take(&mut got, true) && got.is_empty());
         tty.write_all(b"three").unwrap();
-        std::thread::sleep(Duration::from_millis(50));
+        wait_for_output(b"three");
         assert_eq!(told.load(Ordering::SeqCst), 1);
         assert!(out.take(&mut got, true) && got == b"three");
         // Found empty otherwise: the next output is told again.

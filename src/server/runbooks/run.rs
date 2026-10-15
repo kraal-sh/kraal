@@ -781,6 +781,7 @@ mod tests {
                 server.run_logs = crossbeam_channel::unbounded().0;
             }
             let outcome = server.request(id, Request::RunbookRun { token: "plan".into() });
+            let job = crate::server::jobs::JobId(server.next_id - 1);
             assert!(receive.is_empty());
             if mode == "writer gone" {
                 let RequestOutcome::Immediate { reply, result } = outcome else { panic!("writer gone") };
@@ -798,7 +799,7 @@ mod tests {
                 .join()
                 .unwrap();
                 let _batch = crate::pane::batch();
-                finish_job(&mut server, &rx);
+                finish_job(&mut server, &rx, job);
                 if mode == "record failed" {
                     assert_eq!(
                         response(&receive).unwrap_err(),

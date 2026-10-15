@@ -725,6 +725,7 @@ pub(super) mod tests {
     use super::*;
 
     use crate::server::{
+        jobs::JobId,
         persistence::tests::writer,
         tests::{client, server},
     };
@@ -740,14 +741,50 @@ pub(super) mod tests {
         result
     }
 
-    pub(in crate::server) fn finish_job(server: &mut Server, rx: &crate::server::queue::EventReceiver) {
+    pub(in crate::server) fn finish_job(server: &mut Server, rx: &crate::server::queue::EventReceiver, job: JobId) {
+        let deadline = Instant::now() + PATIENCE;
         loop {
-            let event = rx.recv_timeout(PATIENCE).unwrap();
-            if matches!(event, crate::server::Event::Job(..)) {
-                server.handle(event);
+            let remaining = deadline.checked_duration_since(Instant::now()).expect("job did not finish");
+            let event = rx.recv_timeout(remaining).expect("job did not finish");
+            let finished = matches!(event, crate::server::Event::Job(id, _) if id == job);
+            server.handle(event);
+            if finished {
                 return;
             }
         }
+    }
+
+    #[test]
+    fn finishing_a_job_handles_intermediate_events_and_waits_for_its_id() {
+        use crate::server::Event;
+
+        let (tx, rx) = crate::server::event_channel(32);
+        let mut server = server(tx.clone());
+        let (client, _peer) = client(&mut server);
+        let unrelated = JobId(server.alloc_id());
+        let target = JobId(server.alloc_id());
+        let later = JobId(server.alloc_id());
+        let other = server.jobs.register(unrelated, tx.clone(), |s, ()| s.warnings.push("other job".into()));
+        let wanted = server.jobs.register(target, tx.clone(), |s, ()| {
+            assert!(s.clients.is_empty());
+            assert_eq!(s.warnings, ["before", "other job", "between"]);
+            s.warnings.push("target job".into());
+        });
+        let after = server.jobs.register(later, tx.clone(), |_, ()| panic!("wait went past its target"));
+        std::thread::spawn(move || {
+            tx.send(Event::Warning("before".into())).unwrap();
+            other.complete(Ok(()));
+            tx.send(Event::ClientGone(client)).unwrap();
+            tx.send(Event::Warning("between".into())).unwrap();
+            wanted.complete(Ok(()));
+            after.complete(Ok(()));
+        })
+        .join()
+        .unwrap();
+        finish_job(&mut server, &rx, target);
+        assert_eq!(server.warnings, ["before", "other job", "between", "target job"]);
+        assert_eq!(server.jobs.len(), 1);
+        assert!(matches!(rx.try_recv(), Ok(Event::Job(id, _)) if id == later));
     }
 
     fn files(server: &mut Server) -> PaneId {
@@ -953,6 +990,7 @@ pub(super) mod tests {
                     }
                 };
                 super::super::jobs::FAIL_START.set(mode == "start failure");
+                let job = JobId(server.next_id);
                 let outcome = server.request(id, req);
                 assert!(receive.is_empty());
                 if mode == "start failure" {
@@ -973,7 +1011,7 @@ pub(super) mod tests {
                     server.drop_client(id);
                 }
                 let _batch = crate::pane::batch();
-                finish_job(&mut server, &rx);
+                finish_job(&mut server, &rx, job);
                 if mode != "disconnected" {
                     if agent {
                         assert!(response(&receive).unwrap_err().contains("missing"));

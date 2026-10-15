@@ -17,9 +17,14 @@ use crate::protocol::{self, ClientMsg, ServerMsg};
 
 /// Clients connected at once (attached terminals, CLI commands, event streams).
 const MAX_CLIENTS: usize = 256;
+const FIRST_MESSAGE_TIMEOUT: Duration = Duration::from_secs(10);
 
 impl Server {
     pub(super) fn new_connection(&mut self, stream: UnixStream) {
+        self.new_connection_with_timeout(stream, Some(FIRST_MESSAGE_TIMEOUT));
+    }
+
+    pub(super) fn new_connection_with_timeout(&mut self, stream: UnixStream, first_message: Option<Duration>) {
         // Every connection costs two threads: a runaway script must not open thousands.
         if self.clients.len() + self.subscribers.len() + self.waits.len() >= MAX_CLIENTS {
             let mut stream = stream;
@@ -31,7 +36,7 @@ impl Server {
         let peer = crate::process::socket_peer(&stream).ok().and_then(|(pid, _)| u32::try_from(pid).ok());
         let Ok(read_half) = stream.try_clone() else { return };
         // One that connects without saying anything is let go.
-        let _ = read_half.set_read_timeout(Some(Duration::from_secs(10)));
+        let _ = read_half.set_read_timeout(first_message);
         // Without a thread to read or write it, the connection is closed (dropped).
         let Ok(out) = Outbox::start(stream, id) else { return };
         let tx = self.tx.clone();
@@ -374,6 +379,8 @@ pub fn frame_bytes(bytes: &[u8]) -> Vec<u8> {
 /// thread, as far as the socket takes it without waiting and when nothing waits before it;
 /// the rest is queued, in order, for the client's writer thread.
 pub struct Outbox {
+    #[cfg(test)]
+    captured_writer: Option<crossbeam_channel::Sender<Vec<u8>>>,
     queue: crossbeam_channel::Sender<Vec<u8>>,
     /// Messages queued and not written yet.
     queued: Arc<AtomicUsize>,
@@ -390,7 +397,9 @@ impl Outbox {
     #[cfg(test)]
     pub(super) fn capture(&mut self) -> crossbeam_channel::Receiver<Vec<u8>> {
         let (send, receive) = crossbeam_channel::bounded(4);
-        self.queue = send;
+        // Closing the original queue would shut down the socket and report ClientGone.
+        let writer = std::mem::replace(&mut self.queue, send);
+        self.captured_writer.get_or_insert(writer);
         // Keep handler tests on the queue, independent of the socket writer's scheduling.
         self.queued.store(1, Ordering::Release);
         receive
@@ -401,8 +410,14 @@ impl Outbox {
         let (tx, rx) = crossbeam_channel::bounded::<Vec<u8>>(QUEUE);
         // A client that stops reading is let go rather than holding its writer forever.
         let _ = stream.set_write_timeout(Some(Duration::from_secs(10)));
-        let out =
-            Outbox { queue: tx, queued: Arc::new(AtomicUsize::new(0)), socket: Arc::new(stream), last: Arc::default() };
+        let out = Outbox {
+            #[cfg(test)]
+            captured_writer: None,
+            queue: tx,
+            queued: Arc::new(AtomicUsize::new(0)),
+            socket: Arc::new(stream),
+            last: Arc::default(),
+        };
         let (queued, socket, last) = (out.queued.clone(), out.socket.clone(), out.last.clone());
         crate::threads::named(format!("client-{id}-write")).spawn(move || {
             let mut w = &*socket;
@@ -531,6 +546,40 @@ mod tests {
 
     fn outgoing(server: &mut Server, id: ClientId) -> crossbeam_channel::Receiver<Vec<u8>> {
         server.clients.get_mut(&id).unwrap().out.capture()
+    }
+
+    #[test]
+    fn fixture_clients_capture_replies_without_a_first_message_timeout() {
+        use super::super::tests::{client, server};
+        let (tx, rx) = super::super::queue::channel(32);
+        let mut server = server(tx);
+        let (id, _peer) = client(&mut server);
+        let captured = outgoing(&mut server, id);
+        // No first frame is sent. In particular, ClientGone must not discard a delayed reply.
+        assert!(matches!(rx.wait(FIRST_MESSAGE_TIMEOUT + Duration::from_secs(1)), super::super::queue::Wait::Timeout));
+        server.send_msg(id, &ServerMsg::Response { result: Ok(crate::protocol::Response::Ok) });
+        assert!(matches!(super::super::requests::tests::response(&captured), Ok(crate::protocol::Response::Ok)));
+    }
+
+    #[test]
+    fn capturing_replies_keeps_the_original_writer_until_the_outbox_is_dropped() {
+        let (queue, original) = crossbeam_channel::bounded(1);
+        let (socket, _peer) = UnixStream::pair().unwrap();
+        let mut out = Outbox {
+            captured_writer: None,
+            queue,
+            queued: Arc::new(AtomicUsize::new(0)),
+            socket: Arc::new(socket),
+            last: Arc::default(),
+        };
+        let captured = out.capture();
+        assert_eq!(original.try_recv(), Err(crossbeam_channel::TryRecvError::Empty));
+        out.try_send(b"reply".to_vec()).unwrap();
+        assert_eq!(captured.try_recv().unwrap(), b"reply");
+        assert_eq!(original.try_recv(), Err(crossbeam_channel::TryRecvError::Empty));
+        drop(out);
+        assert_eq!(original.try_recv(), Err(crossbeam_channel::TryRecvError::Disconnected));
+        assert_eq!(captured.try_recv(), Err(crossbeam_channel::TryRecvError::Disconnected));
     }
 
     #[test]

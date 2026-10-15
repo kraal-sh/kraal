@@ -135,10 +135,8 @@ mod tests {
     fn until(server: &mut Server, rx: &crate::server::queue::EventReceiver, done: impl Fn(&Server) -> bool) {
         let deadline = std::time::Instant::now() + PATIENCE;
         while !done(server) {
-            assert!(std::time::Instant::now() < deadline, "jobs did not finish");
-            // Capturing replies replaces the socket writer and ends its reader. These
-            // tests drive job completions, not that fixture's ClientGone notification.
-            finish_job(server, rx);
+            let remaining = deadline.checked_duration_since(std::time::Instant::now()).expect("jobs did not finish");
+            server.handle(rx.recv_timeout(remaining).expect("jobs did not finish"));
         }
     }
 
@@ -231,6 +229,7 @@ mod tests {
             let (entered, reading) = crossbeam_channel::bounded(1);
             let (release, held) = crossbeam_channel::bounded(1);
             let owner = std::thread::current().id();
+            let job = crate::server::jobs::JobId(server.next_id);
             server.start_inventory_scan(Vec::new(), move || {
                 assert_ne!(std::thread::current().id(), owner);
                 let mut accounts = Accounts::empty();
@@ -252,7 +251,7 @@ mod tests {
             let threshold = server.accounts.limits.threshold;
             release.send(()).unwrap();
             // The first completion must discard its stale data before starting another read.
-            finish_job(&mut server, &rx);
+            finish_job(&mut server, &rx, job);
             assert_eq!(server.accounts.limits.threshold, threshold);
             assert!(server.config_scan.upgrade().is_some());
             until(&mut server, &rx, |s| s.config_scan.upgrade().is_none());
@@ -285,6 +284,7 @@ mod tests {
         server.dirwatch.watch_config(std::slice::from_ref(&usage));
         let (entered, reading) = crossbeam_channel::bounded(1);
         let (release, held) = crossbeam_channel::bounded(1);
+        let job = crate::server::jobs::JobId(server.next_id);
         server.start_inventory_scan(Vec::new(), move || {
             let read = Inventories { accounts: Accounts::load(), servers: Inventory::load(), hosts: Vec::new() };
             entered.send(()).unwrap();
@@ -305,14 +305,15 @@ mod tests {
         assert_eq!(server.config_generation, generation);
         std::fs::write(Accounts::path(), "[limits]\nthreshold = 82\n").unwrap();
         release.send(()).unwrap();
-        finish_job(&mut server, &rx);
+        finish_job(&mut server, &rx, job);
         assert_eq!(server.accounts.limits.threshold, 81, "the held result applies despite usage events");
         assert!(server.known_servers.iter().any(|s| s.server.name == "fresh"));
         assert!(server.config_scan.upgrade().is_some(), "the pending rescan starts");
+        let job = crate::server::jobs::JobId(server.next_id - 1);
         for _ in 0..8 {
             server.handle(crate::server::Event::Watched(changes.clone()));
         }
-        finish_job(&mut server, &rx);
+        finish_job(&mut server, &rx, job);
         assert_eq!(server.accounts.limits.threshold, 82, "the next result also applies during usage events");
         until(&mut server, &rx, |s| s.config_scan.upgrade().is_none());
         assert!(!server.config_scan_again);

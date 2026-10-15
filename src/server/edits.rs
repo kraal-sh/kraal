@@ -845,10 +845,11 @@ mod tests {
                     sudo,
                 };
                 super::super::jobs::FAIL_START.set(fail_start);
+                let job = crate::server::jobs::JobId(server.next_id);
                 server.start_edit(None, target, Some(ReplyHandle::new(id)));
                 if !fail_start {
                     assert!(receive.is_empty());
-                    finish_job(&mut server, &rx);
+                    finish_job(&mut server, &rx, job);
                 }
                 let expected = match (sudo, fail_start) {
                     (false, true) => "cannot start reading the file",

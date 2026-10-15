@@ -2052,7 +2052,8 @@ mod tests {
         server.workspaces.last_mut().unwrap().tabs.push(Tab::new(tab, "test".into()));
         let (stream, peer) = std::os::unix::net::UnixStream::pair().unwrap();
         let id = server.next_id;
-        server.new_connection(stream);
+        // Handler tests send frames directly and may wait longer than the initial protocol timeout.
+        server.new_connection_with_timeout(stream, None);
         let c = server.clients.get_mut(&id).unwrap();
         c.attached = true;
         c.workspace = ws;

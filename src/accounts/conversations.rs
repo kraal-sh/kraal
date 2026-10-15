@@ -211,8 +211,26 @@ fn carry_plan(from: &Account, to: &Account, session: &str) -> Result<Carry> {
     )
 }
 
+struct TransferLock(std::fs::File);
+
+impl Drop for TransferLock {
+    fn drop(&mut self) {
+        use std::os::fd::AsRawFd;
+        // The transfer is over even if a child forked on another thread still has the file
+        // open before exec. Closing our descriptor alone would leave its copy holding the lock.
+        loop {
+            // SAFETY: flock on a descriptor we own.
+            if unsafe { libc::flock(self.0.as_raw_fd(), libc::LOCK_UN) } == 0
+                || std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted
+            {
+                break;
+            }
+        }
+    }
+}
+
 // Lock both stores so a reverse transfer, another project or a home alias cannot bypass it.
-fn transfer_locks(from: &Account, to: &Account, session: &str) -> Result<Vec<std::fs::File>> {
+fn transfer_locks(from: &Account, to: &Account, session: &str) -> Result<Vec<TransferLock>> {
     use std::os::unix::fs::OpenOptionsExt;
     valid_session(session)?;
     let mut dirs = Vec::new();
@@ -234,7 +252,7 @@ fn transfer_locks(from: &Account, to: &Account, session: &str) -> Result<Vec<std
                 .open(dir.join(format!(".kraal-transfer-{session}.lock")))?;
             anyhow::ensure!(lock.metadata()?.is_file(), "the conversation transfer lock is not a regular file");
             anyhow::ensure!(paths::try_lock(&lock)?, "another kraal is transferring this conversation; try again");
-            Ok(lock)
+            Ok(TransferLock(lock))
         })
         .collect()
 }
@@ -386,9 +404,12 @@ mod tests {
         let alias = Account { home: t.dir.0.join("alias").display().to_string(), ..t.from.clone() };
         assert!(carry_conversation(&alias, &t.to, "session").is_err());
         assert!(transfer_locks(&t.from, &t.to, "other").is_ok());
+        // A child forked on another thread can inherit the descriptors until it execs.
+        let inherited: Vec<_> = held.iter().map(|lock| lock.0.try_clone().unwrap()).collect();
         drop(held);
         assert!(carry_conversation(&t.from, &t.to, "session").unwrap());
         assert_eq!(std::fs::read_to_string(t.saved()).unwrap(), "first\n");
+        drop(inherited);
     }
 
     #[test]

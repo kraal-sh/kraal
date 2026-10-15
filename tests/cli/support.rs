@@ -113,9 +113,14 @@ impl Env {
                 None => c.env_remove(k),
             };
         }
-        c.stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
-        let child = c.spawn().expect("script (util-linux)");
-        std::thread::sleep(Duration::from_millis(800));
+        c.stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::null());
+        let mut child = c.spawn().expect("script (util-linux)");
+        let drawn = client_output(child.stdout.take().unwrap());
+        if let Err(error) = drawn.recv_timeout(PATIENCE) {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("the attached client never drew a frame: {error}");
+        }
         child
     }
 
@@ -136,6 +141,76 @@ impl Env {
         let out = self.cmd(&["open", name]).env("KRAAL_TEST_FRAMES", &notes).output().unwrap();
         assert!(out.status.success(), "kraal open {name}: {}", String::from_utf8_lossy(&out.stderr));
         move || std::fs::read_to_string(&notes).unwrap_or_default().lines().map(String::from).collect()
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn client_output(mut output: impl std::io::Read + Send + 'static) -> crossbeam_channel::Receiver<()> {
+    let (drawn, receive) = crossbeam_channel::bounded(1);
+    std::thread::spawn(move || {
+        let mut drawn = Some(drawn);
+        let mut pending = Vec::new();
+        let mut started = false;
+        let mut buf = [0u8; 8192];
+        while let Ok(n @ 1..) = output.read(&mut buf) {
+            // A complete synchronized update proves attachment; terminal setup alone does not.
+            // Keep draining after it, or the client's terminal could fill and block later input.
+            if drawn.is_some() {
+                pending.extend_from_slice(&buf[..n]);
+                for sequence in pending.windows(8) {
+                    if sequence == b"\x1b[?2026h" {
+                        started = true;
+                    } else if started && sequence == b"\x1b[?2026l" {
+                        let _ = drawn.take().unwrap().send(());
+                        break;
+                    }
+                }
+                pending.drain(..pending.len().saturating_sub(7));
+            }
+        }
+    });
+    receive
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn client_readiness_requires_a_complete_frame_and_keeps_draining() {
+    struct Output {
+        chunks: crossbeam_channel::Receiver<Vec<u8>>,
+        reading: crossbeam_channel::Sender<()>,
+    }
+    impl std::io::Read for Output {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            self.reading.send(()).unwrap();
+            let Ok(chunk) = self.chunks.recv_timeout(PATIENCE) else { return Ok(0) };
+            buf[..chunk.len()].copy_from_slice(&chunk);
+            Ok(chunk.len())
+        }
+    }
+    let (send, chunks) = crossbeam_channel::unbounded();
+    let (reading, read) = crossbeam_channel::unbounded();
+    let drawn = client_output(Output { chunks, reading });
+    read.recv_timeout(PATIENCE).unwrap();
+    send.send(b"terminal setup\x1b[?2026l\x1b[?20".to_vec()).unwrap();
+    read.recv_timeout(PATIENCE).unwrap();
+    assert!(drawn.is_empty(), "a partial frame is not attachment");
+    send.send(b"26hframe contents\x1b[?20".to_vec()).unwrap();
+    read.recv_timeout(PATIENCE).unwrap();
+    assert!(drawn.is_empty(), "the frame has not ended");
+    send.send(b"26l".to_vec()).unwrap();
+    read.recv_timeout(PATIENCE).unwrap();
+    drawn.recv_timeout(PATIENCE).unwrap();
+    send.send(b"another frame".to_vec()).unwrap();
+    read.recv_timeout(PATIENCE).unwrap();
+    assert!(matches!(drawn.try_recv(), Err(crossbeam_channel::TryRecvError::Disconnected)));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn client_output_ending_before_a_frame_does_not_report_attachment() {
+    for bytes in [b"".as_slice(), b"setup\x1b[?2026l", b"\x1b[?2026hpartial frame"] {
+        let drawn = client_output(std::io::Cursor::new(bytes));
+        assert_eq!(drawn.recv_timeout(PATIENCE), Err(crossbeam_channel::RecvTimeoutError::Disconnected));
     }
 }
 
