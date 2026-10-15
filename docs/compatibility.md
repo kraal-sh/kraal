@@ -59,7 +59,7 @@ A state from a newer format is also left untouched, with a message to use a newe
 
 ## Clients and servers
 
-This version uses protocol 5 for laptop listings and copies to the session machine. Kraal 0.4.0 used protocol 3;
+This version uses protocol 6 for laptop listings and copies in both directions. Kraal 0.4.0 used protocol 3;
 Kraal 0.2.0 and 0.3.0 use protocol 2.
 Different protocol versions refuse attachment and ordinary commands. There are no older-peer
 adapters or optional feature negotiation. A refusal names both protocol versions and one next step:
@@ -88,7 +88,7 @@ A 0.3.0 client waiting for a restarted server receives the protocol refusal and 
 Workspaces are saved automatically. KDL is imported and exported explicitly with `kraal import`
 and `kraal export`; `kraal save` and its historical `SaveWorkspace` request are removed.
 Clipboard, file attachments, pasted paths and clipboard images introduced in protocol 3 remain
-part of protocol 5.
+part of protocol 6.
 The client applies its clipboard policy, including the terminal OSC 52 fallback where configured.
 The server no longer emits OSC 52 as an adapter for old clients.
 
@@ -107,8 +107,14 @@ The job receives into a private spool, then uses the existing local copy engine 
 no-replace semantics. Linux uses `renameat2(RENAME_NOREPLACE)` and macOS uses
 `renamex_np(RENAME_EXCL)` for exclusive installation. Filesystems that cannot support the
 copy engine's exclusive installation fail without silently replacing an unapproved name.
-Copying into the laptop and its native staging remain unavailable. Modes without setuid/setgid
-and modification times are preserved; extended attributes and ACLs are not copied.
+Copies into the laptop use a private `.kraal-stage-*` directory in the destination, in
+`kraal-stage 2` format. The client probes exclusive rename support before receiving contents;
+an unsupported filesystem refuses the copy. On macOS the descriptor-relative
+`renameatx_np(RENAME_EXCL)` form of `renamex_np` anchors installation to the opened directory.
+The client announces directory case sensitivity using `_PC_CASE_SENSITIVE` on macOS so
+replacement names compare without case where needed. Replacement approval is always drawn
+and checked locally, even with Always. A name taken meanwhile stays staged and is named.
+Modes without setuid/setgid and modification times are preserved; extended attributes and ACLs are not copied.
 
 Laptop panels save as the session machine's home directory, with no laptop paths or listings
 in the saved session. The session format and its downgrade isolation remain unchanged.

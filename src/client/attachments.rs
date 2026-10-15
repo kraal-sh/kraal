@@ -1612,6 +1612,11 @@ fn pane_name(target: &str) -> &str {
 }
 
 impl View {
+    pub(super) fn scroll_limits(&self, screen: Rect) -> (usize, usize) {
+        let layout = self.layout(screen);
+        (layout.max_scroll, layout.file_rows.max(1))
+    }
+
     fn layout(&self, screen: Rect) -> ViewLayout {
         let width = screen.width.saturating_sub(4).min(100);
         let text_width = width.saturating_sub(4) as usize;

@@ -197,7 +197,7 @@ impl Drop for Env {
 #[ignore = "needs KRAAL_OLD, another release's kraal: tests/compat.sh runs it"]
 fn different_protocols_refuse_attachment_in_both_directions() {
     let (old, this) = (Kraal::old(), Kraal::this());
-    for (name, server, client, cp, sp) in [("refuse-new", &old, &this, 5, 2), ("refuse-old", &this, &old, 2, 5)] {
+    for (name, server, client, cp, sp) in [("refuse-new", &old, &this, 6, 2), ("refuse-old", &this, &old, 2, 6)] {
         let env = Env::new(name);
         env.run(server, &["open", "w"]);
         env.run(server, &["send", "-p", "first", "--enter", "echo", "kept-$((40+2))"]);
@@ -397,7 +397,7 @@ fn a_session_of_another_release_restarts_on_this_kraal() {
     assert_ne!(env.server_pid(), before, "the same server still runs");
     let pong = env.pong();
     assert_eq!(pong["version"], this.version.as_str(), "{pong}");
-    assert_eq!(pong["protocol"], 5, "the session runs this kraal: {pong}");
+    assert_eq!(pong["protocol"], 6, "the session runs this kraal: {pong}");
     env.wait_for_text(&this, "first", "before-42");
     env.run(&this, &["send", "-p", "first", "--enter", "echo", "after-$((40+2))"]);
     env.wait_for_text(&this, "first", "after-42");

@@ -137,7 +137,9 @@ hostname instead of **local**. Choosing the laptop opens a question drawn by you
 nothing is listed before you agree. **Allow** lasts until this attach ends, including automatic
 reconnections. **Always** remembers the SSH destination and arguments in
 `~/.config/kraal/laptop-files.toml` (under `$XDG_CONFIG_HOME/kraal` when set). Remove its
-`[[server]]` entry, or the file, to revoke Always. Permission is checked again for every request.
+`[[laptop_copy]]` entry, or the file, to revoke Always. Permission is checked again for every request.
+An older grant without `write = true` still permits reading; the first copy into the laptop
+asks for consent again. **Always** then records `write = true`.
 **Cancel** leaves the panel saying **refused: nothing was listed**; `r` asks again.
 
 The default scope is your home directory without hidden top-level entries such as `.ssh` and
@@ -154,13 +156,17 @@ has a new identity and sees **is not attached** until a machine is chosen with `
 
 Laptop browsing is available in one panel at a time. To copy from it, select files or
 folders, choose a destination on the session's machine in the other panel, and press `c`
-or `F5`. The local permission covers listing and copying from the laptop. Existing names
-are confirmed before copying; a name taken after that is never silently replaced.
+or `F5`. To copy to the laptop, select files on the session's machine and choose the laptop
+as the destination in the other panel. The local permission covers listing and copying in
+both directions. Replacing anything on the laptop always asks in the laptop client's own
+box, including with Always. Approved folders are replaced in full. Cancel keeps the existing items. The client checks actual
+names, including case-insensitive names on macOS. A name taken after approval stays staged
+and is named in the failed transfer window.
 
 The usual transfer window shows the announced total and received bytes. Closing that window
 cancels. Chunks are 64 KiB with acknowledgements and at most 256 KiB in flight; 30 seconds
 without transfer progress fails the copy. A lost connection also fails it, without resuming.
-Reconnect and copy again. The laptop originals stay untouched, even if installation fails.
+Reconnect and copy again. The source originals stay untouched, even if installation fails.
 
 The receiving job checks the announced total against free space in its private spool and the
 destination before accepting contents. There is no per-file size limit; recursive copies
@@ -169,14 +175,24 @@ links are copied as links only when their targets resolve inside the allowed sco
 and devices are skipped. File modes (without setuid or setgid) and modification times are
 preserved, but owners, extended attributes and ACLs are not.
 
-The job receives into a private spool under `~/.local/state/kraal/laptop-v1/` (under
+For copies from the laptop, the job receives into a private spool under `~/.local/state/kraal/laptop-v1/` (under
 `$XDG_STATE_HOME/kraal` when set), then uses the existing local move and no-replace copy
 handling to install it. The spool is removed when the job ends; abandoned spools are removed
 on session startup. If an installation race leaves files in staging, the failed transfer
 window names that staging directory. Check that message and the destination before retrying.
 The client shows a local notice for four seconds when the copy finishes or fails.
+The laptop destination panel refreshes after the transfer.
 
-Copying into the laptop, moving and deleting are **not yet available**. Copying between the
+For copies into the laptop, the job reads without following links and the client writes
+into a private `.kraal-stage-*` directory in the destination, in `kraal-stage 2` format.
+Exclusive native renames install each completed item. Unsupported filesystems refuse before
+contents are sent. Cancelling or disconnecting removes uninstalled staging; completed items
+stay installed. An installation conflict keeps the remaining copy in the named staging
+path; if a replacement raced, its previous item can also be kept in `work`. Check those
+names before copying again. Incoming link chains must stay inside the laptop scope; loops and escapes are refused.
+Links are preserved as links, and no link is followed while writing.
+
+Moving and deleting are **not yet available**. Copying between the
 laptop and an SSH server is unavailable: copy to the session's machine first, or run `kraal cp`
 on the laptop. Editing, previews and shells are unavailable on the laptop panel. There is no
 laptop path syntax in `kraal files`, `kraal cp` or ordinary control requests.
@@ -285,7 +301,7 @@ remote session opens it on your machine. A `localhost` address there is
 the server's, not yours: kraal keeps it in paste buffers, sends a copy to your terminal, and
 says where the address works instead of opening the wrong page.
 
-To browse this laptop or copy its files to the session machine, open the
+To browse this laptop or copy files between it and the session machine, open the
 [file manager](#the-file-manager) and choose it with `o`.
 Its local consent is separate from attachment and clipboard permissions.
 

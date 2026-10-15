@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 use crate::files::Entry;
 
 pub mod copy;
+pub mod stage;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Identity {
@@ -119,6 +120,11 @@ fn scoped_path(path: &str, home: &Path, scope: Scope, macos: bool) -> Result<(Pa
     Ok((home, path))
 }
 
+pub fn listing_case_sensitive(path: &str, home: &Path, scope: Scope) -> Result<bool> {
+    let (_, path) = scoped_path(path, home, scope, cfg!(target_os = "macos"))?;
+    stage::case_sensitive(&open_directory(&path)?)
+}
+
 pub fn list(path: &str, home: &Path, scope: Scope, macos: bool) -> Result<(String, Vec<Entry>)> {
     list_directory(path, home, scope, macos, false)
 }
@@ -159,7 +165,7 @@ fn list_directory(path: &str, home: &Path, scope: Scope, macos: bool, strict: bo
         // SAFETY: name belongs to this directory stream and stat has space for libc::stat.
         let ok = unsafe { libc::fstatat(dirfd, name.as_ptr(), stat.as_mut_ptr(), libc::AT_SYMLINK_NOFOLLOW) };
         if ok != 0 {
-            ensure!(!strict, "cannot inspect laptop item: {}", io::Error::last_os_error());
+            ensure!(!strict, "cannot inspect source item: {}", io::Error::last_os_error());
             continue;
         }
         let stat = unsafe { stat.assume_init() };

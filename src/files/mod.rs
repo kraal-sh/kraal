@@ -286,6 +286,7 @@ struct Panel {
     owner: Option<u32>,
     pending: bool,
     laptop_bytes: Vec<u8>,
+    case_sensitive: bool,
     /// Every entry of the last listing, sorted.
     entries: Vec<Entry>,
     /// Indices into `entries` of the rows shown after the `..` row.
@@ -317,6 +318,7 @@ impl Panel {
             owner: None,
             pending: false,
             laptop_bytes: Vec::new(),
+            case_sensitive: true,
             has_parent: location.parent().is_some(),
             location,
             entries: Vec::new(),
@@ -638,6 +640,13 @@ impl FilesPane {
         }
     }
 
+    pub fn laptop_case_sensitive(&mut self, client: u32, side: Side, request: u64, sensitive: bool) {
+        let panel = self.panel_mut(side);
+        if panel.owner == Some(client) && panel.request == request && panel.loading {
+            panel.case_sensitive = sensitive;
+        }
+    }
+
     pub fn laptop_result(
         &mut self,
         client: u32,
@@ -658,6 +667,17 @@ impl FilesPane {
             (Location::Laptop { owner_id: owner_id.clone(), host: host.clone(), path }, entries)
         });
         panel.apply(result, hidden);
+    }
+
+    pub fn refresh_laptop(&mut self, client: u32, destination: &str) {
+        for side in [Side::Left, Side::Right] {
+            let panel = self.panel(side);
+            if panel.owner == Some(client)
+                && matches!(&panel.location, Location::Laptop { path, .. } if path == destination)
+            {
+                self.load(side);
+            }
+        }
     }
 
     /// Reloads session and SSH panels after a job finishes.
@@ -1050,13 +1070,10 @@ impl FilesPane {
     }
 
     fn transfer(&mut self, side: Side, is_move: bool) -> FilesAction {
-        if matches!(self.panel(side.other()).location, Location::Laptop { .. }) {
-            return FilesAction::Refused(
-                "Copying into the laptop: not yet available. Run kraal cp on the laptop".into(),
-            );
-        }
-        if matches!(self.panel(side).location, Location::Laptop { .. })
-            && matches!(self.panel(side.other()).location, Location::Remote(_))
+        if (matches!(self.panel(side).location, Location::Laptop { .. })
+            && matches!(self.panel(side.other()).location, Location::Remote(_)))
+            || (matches!(self.panel(side.other()).location, Location::Laptop { .. })
+                && matches!(self.panel(side).location, Location::Remote(_)))
         {
             return FilesAction::Refused("Copy to the session's machine first, or run kraal cp on the laptop".into());
         }
@@ -1073,7 +1090,12 @@ impl FilesPane {
         let replaces: Vec<String> = sources
             .iter()
             .filter_map(Location::name)
-            .filter(|n| !target.loading && target.entries.iter().any(|e| &e.name == n))
+            .filter(|n| {
+                !target.loading
+                    && target.entries.iter().any(|e| {
+                        if target.case_sensitive { &e.name == n } else { e.name.to_lowercase() == n.to_lowercase() }
+                    })
+            })
             .collect();
         if is_move {
             FilesAction::Move { sources, dest, replaces }

@@ -3,7 +3,7 @@ use crate::common::{Env, wait_until};
 
 fn advertise(client: &mut RawClient, id: &str) {
     let message = serde_json::json!({
-        "type": "attach", "version": 5, "cols": 120, "rows": 40,
+        "type": "attach", "version": 6, "cols": 120, "rows": 40,
         "workspace": "w", "remote": true,
         "laptop": { "id": id, "host": "travel", "os": "linux" }
     });
@@ -202,5 +202,115 @@ fn laptop_copy_window_close_and_disconnect_remove_partial_spools_without_install
         }
         wait_until(PATIENCE, "cancelled spool removed", || !spool.exists());
         assert!(!destination.join("report").exists());
+    }
+}
+
+#[test]
+fn session_copy_to_laptop_sends_only_after_client_readiness_and_refuses_source_link_races() {
+    for race in [false, true] {
+        let env = Env::new(if race { "laptop-write-link" } else { "laptop-write" });
+        let source = env.root.join("source");
+        std::fs::create_dir(&source).unwrap();
+        std::fs::write(source.join("report"), b"abc").unwrap();
+        // Like /tmp on macOS, the directory shown by the file manager can be a link.
+        let linked = env.root.join("linked-source");
+        std::os::unix::fs::symlink(&source, &linked).unwrap();
+        let secret = env.root.join("secret");
+        std::fs::write(&secret, b"not transferred").unwrap();
+        env.workspace("w", "layout { pane name=\"shell\" }\n");
+        env.run(&["open", "w"]);
+        let mut owner = RawClient::attach(&env, "w");
+        advertise(&mut owner, "abc123");
+        env.run(&["files", linked.to_str().unwrap(), "~"]);
+        owner.wait_for_row("report");
+        owner.send(b"\to");
+        owner.wait_for_row("this laptop");
+        owner.send(b"travel\r");
+        owner.wait_for_message("laptop_list");
+        let request = owner
+            .messages
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|m| serde_json::from_str::<serde_json::Value>(m).ok())
+            .find(|m| m["type"] == "laptop_list")
+            .unwrap();
+        let response = serde_json::json!({
+            "type":"laptop_listed", "pane":request["pane"], "side":request["side"], "request":request["request"],
+            "result":{"Ok":["~",[{"name":"report", "is_dir":false, "is_link":false, "size":1, "mtime":0, "exact":true}]]}
+        });
+        raw_frame(&mut owner.stream, 0, response.to_string().as_bytes());
+        owner.send(b"\t\x1b[Bc");
+        let mut write = None;
+        wait_until(PATIENCE, "copy asks the laptop client to prepare its destination", || {
+            write = owner
+                .messages
+                .lock()
+                .unwrap()
+                .iter()
+                .filter_map(|m| serde_json::from_str::<serde_json::Value>(m).ok())
+                .find(|m| m["message"]["Write"].is_object());
+            write.is_some()
+        });
+        let write = write.unwrap();
+        let token = write["token"].as_str().unwrap();
+        assert_eq!(write["message"]["Write"]["destination"], "~");
+        assert_eq!(
+            write["message"]["Write"]["allow"],
+            serde_json::json!([]),
+            "the server cannot approve replacements on the laptop"
+        );
+        assert!(!owner.messages.lock().unwrap().iter().any(|m| m.contains("\"Data\"")));
+        let ack = |owner: &mut RawClient, sequence| {
+            let message = serde_json::json!({"type":"laptop_copy", "token":token, "message":{"Ack":sequence}});
+            raw_frame(&mut owner.stream, 0, message.to_string().as_bytes());
+        };
+        ack(&mut owner, 0);
+        let mut content = Vec::new();
+        for sequence in 0..5 {
+            let mut data = None;
+            wait_until(PATIENCE, "job sends a bounded packet", || {
+                data = owner
+                    .messages
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter_map(|m| serde_json::from_str::<serde_json::Value>(m).ok())
+                    .find(|m| {
+                        m["token"] == token
+                            && (m["message"]["Data"]["sequence"] == sequence || m["message"]["Finish"].is_object())
+                    });
+                data.is_some()
+            });
+            let data = data.unwrap();
+            assert!(data["message"]["Data"].is_object(), "copy ended before packet {sequence}: {data}");
+            let packet = &data["message"]["Data"]["packet"];
+            if sequence == 0 {
+                assert_eq!(packet["Begin"]["bytes"], 3);
+                if race {
+                    std::fs::remove_file(source.join("report")).unwrap();
+                    std::os::unix::fs::symlink(&secret, source.join("report")).unwrap();
+                }
+            }
+            if let Some(chunk) = packet["Chunk"].as_str() {
+                use base64::Engine;
+                content.extend(base64::engine::general_purpose::STANDARD.decode(chunk).unwrap());
+            }
+            ack(&mut owner, sequence);
+            if race {
+                break;
+            }
+        }
+        if race {
+            assert!(copy_finished(&owner, token).get("Err").is_some());
+            assert!(content.is_empty());
+        } else {
+            assert_eq!(content, b"abc");
+            let message = serde_json::json!({"type":"laptop_copy", "token":token, "message":{"Finish":{"Ok":null}}});
+            raw_frame(&mut owner.stream, 0, message.to_string().as_bytes());
+            assert!(copy_finished(&owner, token).get("Ok").is_some());
+            assert_eq!(std::fs::read(source.join("report")).unwrap(), b"abc");
+        }
+        assert_eq!(std::fs::read(secret).unwrap(), b"not transferred");
     }
 }
