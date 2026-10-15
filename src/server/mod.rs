@@ -23,6 +23,7 @@ mod geometry;
 mod graphics;
 mod hints;
 mod input;
+mod jobs;
 mod laptop;
 pub mod net;
 #[cfg(test)]
@@ -107,8 +108,8 @@ pub enum Event {
     Warning(String),
     /// Publish an event once what it describes is on disk (a run's log).
     Emit(&'static str, serde_json::Value),
-    /// A job started with [`Server::background`] finished with this result, or panicked.
-    Job(u32, std::thread::Result<Box<dyn std::any::Any + Send>>),
+    /// A job finished and its typed result is ready, or it panicked.
+    Job(jobs::JobId, std::thread::Result<()>),
     /// The agents a server's session has now, from the connection with this id.
     RemoteAgents(u32, Vec<remote::RemoteAgent>),
     /// Watched directories changed (see [`crate::watch`]).
@@ -571,7 +572,7 @@ pub struct Server {
     /// Markdown runbooks in progress, by client.
     md_sessions: HashMap<ClientId, runbooks::MdSession>,
     /// What to do with the result of each background job.
-    jobs: HashMap<u32, JobDone>,
+    jobs: jobs::Jobs,
     /// Files of servers being edited in the local editor.
     edits: Vec<edits::Edit>,
     /// Links to open on a client once their tunnel is up: (client, tunnel id, URL).
@@ -647,9 +648,6 @@ pub struct Server {
     /// Panes closed since the last tick: the memory they held goes back to the system with it.
     panes_closed: bool,
 }
-
-/// Finishes a background job on the server thread with its result.
-type JobDone = Box<dyn FnOnce(&mut Server, Box<dyn std::any::Any + Send>)>;
 
 /// The periodic work (agents, previews, runbooks...) runs this often while something happens:
 /// output, keys, requests, or work that needs watching (see [`Server::busy`]).
@@ -924,7 +922,7 @@ pub fn run(session: &str) -> Result<()> {
         stray_groups: Vec::new(),
         run_output: HashMap::new(),
         md_sessions: HashMap::new(),
-        jobs: HashMap::new(),
+        jobs: jobs::Jobs::default(),
         edits: Vec::new(),
         preview_loads: Default::default(),
         pending_opens: Vec::new(),
@@ -1022,36 +1020,6 @@ fn take_ready_pipe() -> Option<std::fs::File> {
 }
 
 impl Server {
-    /// Run `work` on a helper thread (slow git, commands), then `then` with its result on the
-    /// server thread, so nothing slow ever blocks the event loop. `false` when no thread could
-    /// be started: `then` never runs, nor does it when `work` panics (a warning says so).
-    pub fn background<T: Send + 'static>(
-        &mut self,
-        work: impl FnOnce() -> T + Send + 'static,
-        then: impl FnOnce(&mut Server, T) + 'static,
-    ) -> bool {
-        let id = self.alloc_id();
-        self.jobs.insert(
-            id,
-            Box::new(move |server, result| {
-                if let Ok(value) = result.downcast::<T>() {
-                    then(server, *value);
-                }
-            }),
-        );
-        let tx = self.tx.clone();
-        let spawned = crate::threads::named("job").spawn(move || {
-            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(work));
-            let _ = tx.send(Event::Job(id, result.map(|value| Box::new(value) as Box<dyn std::any::Any + Send>)));
-        });
-        if let Err(e) = spawned {
-            self.jobs.remove(&id);
-            self.warnings.push(format!("cannot start a background job: {e}"));
-            return false;
-        }
-        true
-    }
-
     /// Show `mode` (a question a background job prepared) unless the client is busy with
     /// another picker or prompt: then the question is dropped (the client is told to ask again).
     pub fn set_mode_if_idle(&mut self, client: ClientId, mode: Mode) {
@@ -1688,11 +1656,11 @@ impl Server {
             Event::Warning(w) => self.warnings.push(w),
             Event::Emit(ty, fields) => self.emit(ty, fields),
             Event::Job(id, result) => {
-                let done = self.jobs.remove(&id);
+                let done = self.jobs.take(id);
                 match result {
-                    Ok(value) => {
+                    Ok(()) => {
                         if let Some(done) = done {
-                            done(self, value);
+                            done(self);
                         }
                     }
                     Err(panic) => self.warnings.push(format!("a background job failed: {}", panic_text(&*panic))),
@@ -2202,7 +2170,7 @@ mod tests {
             stray_groups: Vec::new(),
             run_output: HashMap::new(),
             md_sessions: HashMap::new(),
-            jobs: HashMap::new(),
+            jobs: jobs::Jobs::default(),
             edits: Vec::new(),
             preview_loads: Default::default(),
             pending_opens: Vec::new(),

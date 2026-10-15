@@ -893,22 +893,23 @@ mod tests {
             let mut server = super::super::tests::server(tx);
             let spec = broken();
             let file = spec.command[0].clone();
-            server.jobs.insert(
-                99,
-                Box::new(move |server, _| {
-                    server.new_workspace("empty".into(), None);
-                    server.focus_reported.insert(999);
-                    server.with_batch(|server| {
-                        let ws = server.new_workspace("kept".into(), None);
-                        server.spawn_pane_in(ws, None, spec, protocol::Placement::Tab, None).unwrap();
-                    });
-                    assert!(server.panes.values().all(|p| p.suspended));
-                    assert!(server.workspaces.iter().any(|w| w.name == "empty"));
-                    assert!(server.focus_reported.contains(&999));
-                    assert!(server.warnings.is_empty(), "queued work has not run");
-                }),
-            );
-            server.handle_and_follow(Event::Job(99, Ok(Box::new(()))));
+            let (done_tx, done_rx) = super::super::queue::channel(1);
+            let job = super::super::jobs::JobId(server.alloc_id());
+            let delivery = server.jobs.register(job, done_tx, move |server, ()| {
+                server.new_workspace("empty".into(), None);
+                server.focus_reported.insert(999);
+                server.with_batch(|server| {
+                    let ws = server.new_workspace("kept".into(), None);
+                    server.spawn_pane_in(ws, None, spec, protocol::Placement::Tab, None).unwrap();
+                });
+                assert!(server.panes.values().all(|p| p.suspended));
+                assert!(server.workspaces.iter().any(|w| w.name == "empty"));
+                assert!(server.focus_reported.contains(&999));
+                assert!(server.warnings.is_empty(), "queued work has not run");
+            });
+            // The server queue is full; keep this completion separate until the handler runs.
+            std::thread::spawn(move || delivery.complete(Ok(()))).join().unwrap();
+            server.handle_and_follow(done_rx.recv_timeout(crate::testing::PATIENCE).unwrap());
             assert_eq!(server.workspaces.len(), 2, "empty workspaces are kept");
             assert!(server.focus_reported.is_empty(), "focus at the handler boundary");
             for i in 0..capacity {
