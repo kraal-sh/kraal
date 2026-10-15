@@ -77,11 +77,7 @@ impl Server {
             _ => None,
         });
         if remote.is_some() && operation == Operation::Move {
-            self.toast(
-                client,
-                NoticeKind::Error,
-                "Moving between the laptop and an SSH server is unavailable: copy, then delete",
-            );
+            self.toast(client, NoticeKind::Error, crate::files::LAPTOP_SERVER_MOVE);
             return Mode::Normal;
         }
         let Some(identity) = self.clients.get(&client).and_then(|c| c.laptop.as_ref()) else { return Mode::Normal };
@@ -160,11 +156,7 @@ impl Server {
         }
         if let Some(remote) = &spec.remote {
             if spec.operation != Operation::Copy {
-                self.toast(
-                    client,
-                    NoticeKind::Error,
-                    "Moving between the laptop and an SSH server is unavailable: copy, then delete",
-                );
+                self.toast(client, NoticeKind::Error, crate::files::LAPTOP_SERVER_MOVE);
                 return;
             }
             if self.panel_ssh_args(&remote.server).as_ref() != Some(&remote.ssh_args) {

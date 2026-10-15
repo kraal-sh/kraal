@@ -86,13 +86,14 @@ pub fn bracket(text: &[u8]) -> Vec<u8> {
     [START, text, END].concat()
 }
 
+/// The kinds of permission share one struct; each file only spells out its own.
 #[derive(Default, Serialize, Deserialize)]
 struct Permissions {
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     server: Vec<Permission>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     clipboard_image: Vec<Permission>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     laptop_copy: Vec<Permission>,
 }
 
@@ -283,6 +284,8 @@ mod tests {
         remember_laptop(&path, &ssh, "anvil").unwrap();
         assert!(laptop_allowed(&path, &ssh) && laptop_write_allowed(&path, &ssh));
         assert_eq!(permissions(&path).unwrap().laptop_copy.len(), 1);
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.starts_with("[[laptop_copy]]") && !text.contains(" = []"), "only its own kind: {text}");
         assert!(!laptop_write_allowed(&path, &["other".into()]));
         std::fs::remove_file(&path).unwrap();
         assert!(!laptop_write_allowed(&path, &ssh));

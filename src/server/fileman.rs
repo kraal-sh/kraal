@@ -326,9 +326,11 @@ impl Server {
             });
         }
         for k in &self.known_servers {
+            let groups =
+                if k.server.groups.is_empty() { String::new() } else { format!(" · {}", k.server.groups.join(", ")) };
             items.push(PickItem {
                 label: k.server.name.clone(),
-                detail: format!("{} · {}", k.server.address(), k.server.groups.join(", ")),
+                detail: format!("{}{groups}", k.server.address()),
                 action: PickAction::FilesSet { pane, side, target: format!("{}:~", k.server.name) },
                 state: None,
                 dim: false,

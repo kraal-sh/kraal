@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::agent::AgentState;
 
-pub const PROTOCOL_VERSION: u32 = 8;
+pub const PROTOCOL_VERSION: u32 = 4;
 pub const KRAAL_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Both released migration sources used protocol 2 and omitted it from Pong.

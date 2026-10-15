@@ -59,7 +59,7 @@ A state from a newer format is also left untouched, with a message to use a newe
 
 ## Clients and servers
 
-This version uses protocol 8 for laptop listings, copies, moves, deletion and SSH copy relays.
+This version uses protocol 4 for laptop listings, copies, moves, deletion and SSH copy relays.
 Kraal 0.4.0 used protocol 3; Kraal 0.2.0 and 0.3.0 use protocol 2.
 Different protocol versions refuse attachment and ordinary commands. There are no older-peer
 adapters or optional feature negotiation. A refusal names both protocol versions and one next step:
@@ -88,7 +88,7 @@ A 0.3.0 client waiting for a restarted server receives the protocol refusal and 
 Workspaces are saved automatically. KDL is imported and exported explicitly with `kraal import`
 and `kraal export`; `kraal save` and its historical `SaveWorkspace` request are removed.
 Clipboard, file attachments, pasted paths and clipboard images introduced in protocol 3 remain
-part of protocol 8.
+part of protocol 4.
 The client applies its clipboard policy, including the terminal OSC 52 fallback where configured.
 The server no longer emits OSC 52 as an adapter for old clients.
 

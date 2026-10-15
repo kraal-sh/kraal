@@ -1,9 +1,141 @@
 use super::support::{PATIENCE, RawClient, fake_ssh, raw_frame};
 use crate::common::{Env, wait_until, write_script};
 
+#[test]
+fn copy_job_output_describes_both_directions_and_finishes_below_progress() {
+    use base64::Engine;
+    use std::io::Read;
+    use std::os::unix::net::{UnixListener, UnixStream};
+
+    fn read(stream: &mut UnixStream) -> serde_json::Value {
+        let mut header = [0; 5];
+        stream.read_exact(&mut header).unwrap();
+        assert_eq!(header[4], 0);
+        let mut bytes = vec![0; u32::from_le_bytes(header[..4].try_into().unwrap()) as usize];
+        stream.read_exact(&mut bytes).unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(value["type"], "laptop_copy");
+        assert_eq!(value["token"], "abc");
+        value["message"].clone()
+    }
+
+    fn reply(stream: &mut UnixStream, message: serde_json::Value) {
+        let message = serde_json::json!({"type":"laptop_copy", "token":"abc", "message":message});
+        raw_frame(stream, 0, message.to_string().as_bytes());
+    }
+
+    for to_laptop in [false, true] {
+        for entries in [1, 2] {
+            for (bytes, size) in [(0, "0 B"), (3, "3 B"), (10 * 1024 * 1024, "10 MiB")] {
+                let env = Env::new(&format!("copy-output-{to_laptop}-{entries}-{bytes}"));
+                let source = env.root.join("source");
+                let destination = env.root.join("destination");
+                std::fs::create_dir(&source).unwrap();
+                std::fs::create_dir(&destination).unwrap();
+                let contents = vec![b'x'; bytes];
+                std::fs::write(source.join("report"), &contents).unwrap();
+                let mut sources = vec![source.join("report")];
+                if entries == 2 {
+                    std::fs::write(source.join("empty"), []).unwrap();
+                    sources.push(source.join("empty"));
+                }
+                let sockets = env.root.join("run/kraal");
+                std::fs::create_dir(&sockets).unwrap();
+                let listener = UnixListener::bind(sockets.join(format!("{}.sock", env.session))).unwrap();
+                let mut command = env.cmd(&["laptop-cp"]);
+                command.env("KRAAL_LAPTOP_COPY_TOKEN", "abc");
+                let job = std::thread::spawn(move || command.output().unwrap());
+                let (mut stream, _) = listener.accept().unwrap();
+                stream.set_read_timeout(Some(PATIENCE)).unwrap();
+                assert!(read(&mut stream)["Open"].is_object());
+                reply(
+                    &mut stream,
+                    serde_json::json!({"Ready": {
+                        "to_laptop":to_laptop, "remote":null, "sources":sources,
+                        "destination":destination, "allow":[]
+                    }}),
+                );
+                if to_laptop {
+                    reply(&mut stream, serde_json::json!({"Ack":0}));
+                    let mut received = Vec::new();
+                    let mut sequence = 0;
+                    loop {
+                        let message = read(&mut stream);
+                        assert_eq!(message["Data"]["sequence"], sequence);
+                        let packet = &message["Data"]["packet"];
+                        if let Some(chunk) = packet["Chunk"].as_str() {
+                            received.extend(base64::engine::general_purpose::STANDARD.decode(chunk).unwrap());
+                        }
+                        reply(&mut stream, serde_json::json!({"Ack":sequence}));
+                        sequence += 1;
+                        if packet == "Done" {
+                            break;
+                        }
+                    }
+                    assert_eq!(received, contents);
+                } else {
+                    let mut sequence = 0;
+                    let mut packet = |packet| {
+                        reply(&mut stream, serde_json::json!({"Data":{"sequence":sequence, "packet":packet}}));
+                        assert_eq!(read(&mut stream), serde_json::json!({"Ack":sequence}));
+                        sequence += 1;
+                    };
+                    packet(serde_json::json!({"Begin":{"bytes":bytes, "entries":entries}}));
+                    for path in &sources {
+                        let data = std::fs::read(path).unwrap();
+                        packet(serde_json::json!({"Entry":{
+                            "path":path.file_name().unwrap().to_str().unwrap(), "kind":"File", "size":data.len(),
+                            "mode":420, "seconds":1_600_000_000, "nanos":0
+                        }}));
+                        for chunk in data.chunks(64 * 1024) {
+                            packet(
+                                serde_json::json!({"Chunk":base64::engine::general_purpose::STANDARD.encode(chunk)}),
+                            );
+                        }
+                        packet(serde_json::json!("End"));
+                    }
+                    packet(serde_json::json!("Done"));
+                    assert_eq!(read(&mut stream), serde_json::json!({"Finish":{"Ok":null}}));
+                    assert_eq!(std::fs::read(destination.join("report")).unwrap(), contents);
+                    if entries == 2 {
+                        assert_eq!(std::fs::read(destination.join("empty")).unwrap(), b"");
+                    }
+                }
+                reply(&mut stream, serde_json::json!({"Finish":{"Ok":null}}));
+                let output = job.join().unwrap();
+                let output_text = String::from_utf8(output.stderr).unwrap();
+                assert!(output.status.success(), "{output_text}");
+                let noun = if entries == 1 { "entry" } else { "entries" };
+                let announcement = format!("Copying {entries} {noun} ({size}). Close this window to cancel.\n");
+                assert!(output_text.starts_with(&announcement), "{output_text:?}");
+                assert!(output_text.ends_with("\nLaptop copy complete.\n"), "{output_text:?}");
+                let verb = if to_laptop { "Sent" } else { "Received" };
+                let after_progress = if to_laptop { "Laptop copy complete." } else { "Installing the copy." };
+                if bytes == 0 {
+                    assert!(!output_text.contains('\r'), "{output_text:?}");
+                    assert!(output_text.starts_with(&format!("{announcement}{after_progress}\n")), "{output_text:?}");
+                } else {
+                    assert!(
+                        output_text.contains(&format!("\r{verb} {size} / {size}\x1b[K\n{after_progress}\n")),
+                        "{output_text:?}"
+                    );
+                    if bytes > 3 {
+                        assert!(output_text.contains(&format!("\r{verb} 64 KiB / 10 MiB\x1b[K")), "{output_text:?}");
+                        assert!(
+                            output_text
+                                .contains(&format!("\r{verb} 9.9 MiB / 10 MiB\x1b[K\r{verb} 10 MiB / 10 MiB\x1b[K")),
+                            "{output_text:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
 fn advertise(client: &mut RawClient, id: &str) {
     let message = serde_json::json!({
-        "type": "attach", "version": 8, "cols": 120, "rows": 40,
+        "type": "attach", "version": 4, "cols": 120, "rows": 40,
         "workspace": "w", "remote": true,
         "laptop": { "id": id, "host": "travel", "os": "linux" }
     });

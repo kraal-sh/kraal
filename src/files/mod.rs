@@ -241,6 +241,8 @@ pub enum FilesAction {
     Refused(String),
 }
 
+/// Why a move between the laptop and an SSH server is refused, wherever it is caught.
+pub const LAPTOP_SERVER_MOVE: &str = "No laptop ⇄ SSH server move: copy, then delete";
 const INEXACT: &str = "a name here is not valid UTF-8: kraal cannot point at it safely; use a shell (key s)";
 
 /// One of the two panels.
@@ -797,9 +799,7 @@ impl FilesPane {
         }
         let laptop = matches!(self.panel(side).location, Location::Laptop { .. });
         if laptop && matches!(key, FileKey::Char('e' | 's') | FileKey::F(4)) {
-            return FilesAction::Refused(
-                "Editing and shells are unavailable on the laptop: open them on that machine".into(),
-            );
+            return FilesAction::Refused("Edit or open a shell on the laptop itself".into());
         }
         let page = isize::try_from(self.list_height().saturating_sub(1).max(1)).unwrap_or(1);
         match key {
@@ -1014,9 +1014,7 @@ impl FilesPane {
             }
             Some(Row::Entry(entry)) => {
                 if matches!(panel.location, Location::Laptop { .. }) {
-                    return FilesAction::Refused(
-                        "Preview is unavailable on the laptop: open the file on that machine".into(),
-                    );
+                    return FilesAction::Refused("Preview laptop files on the laptop itself".into());
                 }
                 if let Location::Local(path) = panel.location.join(&entry.name) {
                     return FilesAction::Preview(path);
@@ -1061,16 +1059,19 @@ impl FilesPane {
         Ok(entries.into_iter().map(|e| panel.location.join(&e.name)).collect())
     }
 
+    /// One panel shows the laptop and the other an SSH server: files are copied between them,
+    /// never moved.
+    pub(super) fn laptop_and_server(&self) -> bool {
+        let (left, right) = (&self.panel(Side::Left).location, &self.panel(Side::Right).location);
+        matches!(
+            (left, right),
+            (Location::Laptop { .. }, Location::Remote(_)) | (Location::Remote(_), Location::Laptop { .. })
+        )
+    }
+
     fn transfer(&mut self, side: Side, is_move: bool) -> FilesAction {
-        if is_move
-            && ((matches!(self.panel(side).location, Location::Laptop { .. })
-                && matches!(self.panel(side.other()).location, Location::Remote(_)))
-                || (matches!(self.panel(side.other()).location, Location::Laptop { .. })
-                    && matches!(self.panel(side).location, Location::Remote(_))))
-        {
-            return FilesAction::Refused(
-                "Moving between the laptop and an SSH server is unavailable: copy, then delete".into(),
-            );
+        if is_move && self.laptop_and_server() {
+            return FilesAction::Refused(LAPTOP_SERVER_MOVE.into());
         }
         let sources = match self.sources(side) {
             Ok(s) => s,
