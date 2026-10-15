@@ -44,7 +44,7 @@ pub(super) fn create(fd: &OwnedFd, name: &CStr) -> Result<File> {
     Ok(unsafe { File::from_raw_fd(raw) })
 }
 
-fn mkdir(fd: &OwnedFd, name: &CStr) -> Result<OwnedFd> {
+pub(super) fn mkdir(fd: &OwnedFd, name: &CStr) -> Result<OwnedFd> {
     checked(unsafe { libc::mkdirat(fd.as_raw_fd(), name.as_ptr(), 0o700) })?;
     Ok(super::directory(fd.as_raw_fd(), name)?)
 }
@@ -88,7 +88,7 @@ pub(super) fn metadata(root: &OwnedFd, entry: &Entry, file: Option<&File>) -> Re
     Ok(())
 }
 
-fn rename(from: &OwnedFd, source: &CStr, to: &OwnedFd, target: &CStr) -> io::Result<()> {
+pub(super) fn rename(from: &OwnedFd, source: &CStr, to: &OwnedFd, target: &CStr) -> io::Result<()> {
     #[cfg(target_os = "linux")]
     let rc = unsafe {
         libc::syscall(
@@ -108,13 +108,13 @@ fn rename(from: &OwnedFd, source: &CStr, to: &OwnedFd, target: &CStr) -> io::Res
     checked(rc)
 }
 
-fn stat(fd: &OwnedFd, name: &CStr) -> io::Result<libc::stat> {
+pub(super) fn stat(fd: &OwnedFd, name: &CStr) -> io::Result<libc::stat> {
     let mut stat = std::mem::MaybeUninit::uninit();
     checked(unsafe { libc::fstatat(fd.as_raw_fd(), name.as_ptr(), stat.as_mut_ptr(), libc::AT_SYMLINK_NOFOLLOW) })?;
     Ok(unsafe { stat.assume_init() })
 }
 
-fn same(a: &libc::stat, b: &libc::stat) -> bool {
+pub(super) fn same(a: &libc::stat, b: &libc::stat) -> bool {
     a.st_dev == b.st_dev
         && a.st_ino == b.st_ino
         && a.st_mode == b.st_mode
@@ -593,6 +593,7 @@ mod tests {
 
     fn spec(source: &TempDir, destination: &TempDir, item: &str) -> Spec {
         Spec {
+            operation: crate::laptop::copy::Operation::Copy,
             to_laptop: true,
             sources: vec![source.0.join(item).to_str().unwrap().into()],
             destination: destination.0.clone(),

@@ -24,8 +24,18 @@ pub const TIMEOUT: Duration = Duration::from_secs(30);
 const ENTRIES: usize = 100_000;
 pub const TOKEN_ENV: &str = "KRAAL_LAPTOP_COPY_TOKEN";
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Operation {
+    #[default]
+    Copy,
+    Move,
+    Delete,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Spec {
+    #[serde(default)]
+    pub operation: Operation,
     pub to_laptop: bool,
     pub sources: Vec<String>,
     pub destination: PathBuf,
@@ -46,6 +56,9 @@ pub enum ToClient {
     Ready(Spec),
     Start { sources: Vec<String> },
     Write(Spec),
+    Installed,
+    Move(Spec),
+    Delete { sources: Vec<String> },
     Progress,
     Data { sequence: u64, packet: Packet },
     Ack(u64),
@@ -89,10 +102,12 @@ impl Packet {
     }
 }
 
+#[derive(Debug)]
 struct Source {
     path: PathBuf,
     entry: Entry,
     metadata: Option<fs::Metadata>,
+    info: libc::stat,
 }
 
 fn same(a: &fs::Metadata, b: &fs::Metadata) -> bool {
@@ -126,6 +141,7 @@ fn manifest(
     home: &Path,
     scope: Scope,
     macos: bool,
+    deleting: bool,
     check: &mut impl FnMut() -> Result<()>,
 ) -> Result<Vec<Source>> {
     ensure!(!paths.is_empty() && paths.len() <= ENTRIES, "choose between 1 and 100,000 items");
@@ -156,7 +172,9 @@ fn manifest(
         if ![libc::S_IFREG, libc::S_IFDIR, libc::S_IFLNK].contains(&kind) {
             continue;
         }
-        let (kind, metadata) = if kind == libc::S_IFLNK {
+        let (kind, metadata) = if deleting && kind != libc::S_IFDIR {
+            (if kind == libc::S_IFLNK { Kind::Link(String::new()) } else { Kind::File }, None)
+        } else if kind == libc::S_IFLNK {
             let mut bytes = vec![0u8; 16 * 1024 + 1];
             let len =
                 unsafe { libc::readlinkat(parent.as_raw_fd(), name.as_ptr(), bytes.as_mut_ptr().cast(), bytes.len()) };
@@ -196,7 +214,7 @@ fn manifest(
                 (Kind::File, Some(metadata))
             }
         };
-        let size = if matches!(kind, Kind::File) { metadata.as_ref().unwrap().len() } else { 0 };
+        let size = if matches!(kind, Kind::File) && !deleting { metadata.as_ref().unwrap().len() } else { 0 };
         // mode_t is 16 bits on macOS and 32 bits on Linux.
         #[allow(clippy::unnecessary_cast)]
         let mode = stat.st_mode as u32;
@@ -208,7 +226,7 @@ fn manifest(
             seconds: stat.st_mtime,
             nanos: stat.st_mtime_nsec,
         };
-        sources.push(Source { path, entry, metadata });
+        sources.push(Source { path, entry, metadata, info: stat });
     }
     ensure!(!sources.is_empty(), "no regular files, directories or symbolic links to copy");
     Ok(sources)
@@ -250,12 +268,12 @@ pub fn send(
     scope: Scope,
     mut emit: impl FnMut(Packet) -> Result<()>,
     mut check: impl FnMut() -> Result<()>,
-) -> Result<()> {
-    let sources = manifest(paths, home, scope, cfg!(target_os = "macos"), &mut check)?;
+) -> Result<Removal> {
+    let sources = manifest(paths, home, scope, cfg!(target_os = "macos"), false, &mut check)?;
     let total = sources.iter().try_fold(0u64, |n, s| n.checked_add(s.entry.size).context("copy size overflow"))?;
     emit(Packet::Begin { bytes: total, entries: sources.len() })?;
     let mut bytes = vec![0u8; CHUNK];
-    for source in sources {
+    for source in &sources {
         check()?;
         let mut file = if matches!(source.entry.kind, Kind::File) {
             let file = open_file(&source.path)?;
@@ -281,7 +299,96 @@ pub fn send(
         }
         emit(Packet::End)?;
     }
-    emit(Packet::Done)
+    emit(Packet::Done)?;
+    Ok(Removal { sources, home: super::open_directory(&home.canonicalize()?)? })
+}
+
+#[derive(Debug)]
+pub struct Removal {
+    sources: Vec<Source>,
+    home: OwnedFd,
+}
+
+impl Removal {
+    pub fn read(paths: &[String], home: &Path, scope: Scope, mut check: impl FnMut() -> Result<()>) -> Result<Self> {
+        let sources = manifest(paths, home, scope, cfg!(target_os = "macos"), true, &mut check)?;
+        Ok(Self { sources, home: super::open_directory(&home.canonicalize()?)? })
+    }
+
+    pub fn remove(self, mut check: impl FnMut() -> Result<()>) -> Result<()> {
+        // Validate the whole selection before removing any entry, including aliases of home.
+        let home = super::stage::stat(&self.home, c".")?;
+        for source in &self.sources {
+            check()?;
+            let (fd, leaf) = source_parent(source)?;
+            let current = super::stage::stat(&fd, &leaf)?;
+            ensure!(
+                source.path.parent().is_some() && !(current.st_dev == home.st_dev && current.st_ino == home.st_ino),
+                "Cannot remove the home or root directory: select items inside it"
+            );
+            ensure!(
+                super::stage::same(&source.info, &current),
+                "Source changed: {} was kept. Check both locations before retrying",
+                source.path.display()
+            );
+        }
+        for source in self.sources.iter().rev() {
+            check()?;
+            let (fd, leaf) = source_parent(source)?;
+            let name = CString::new(format!(".kraal-remove-{}", super::Identity::new()?.id))?;
+            let stage = super::stage::mkdir(&fd, &name)?;
+            let mut captured = false;
+            let result = (|| -> Result<()> {
+                // Capture the entry atomically. A concurrent save at the old name is never unlinked.
+                super::stage::rename(&fd, &leaf, &stage, &leaf)?;
+                captured = true;
+                check()?;
+                let current = super::stage::stat(&stage, &leaf)?;
+                let directory = matches!(source.entry.kind, Kind::Directory);
+                let unchanged = if directory {
+                    // Our own child removals change directory size and mtime after the initial check.
+                    source.info.st_dev == current.st_dev
+                        && source.info.st_ino == current.st_ino
+                        && source.info.st_mode == current.st_mode
+                } else {
+                    super::stage::same(&source.info, &current)
+                };
+                ensure!(
+                    unchanged,
+                    "Source changed: {} was kept. Check both locations before retrying",
+                    source.path.display()
+                );
+                check()?;
+                // Only remove the captured leaf. rmdir preserves new or skipped children.
+                let flags = if directory { libc::AT_REMOVEDIR } else { 0 };
+                let rc = unsafe { libc::unlinkat(stage.as_raw_fd(), leaf.as_ptr(), flags) };
+                ensure!(
+                    rc == 0,
+                    "Could not remove {}: {}. Check the source before retrying",
+                    source.path.display(),
+                    std::io::Error::last_os_error()
+                );
+                Ok(())
+            })();
+            if result.is_err() && captured {
+                // Exclusive rename never overwrites a save that appeared while we held the source.
+                if let Err(error) = super::stage::rename(&stage, &leaf, &fd, &leaf) {
+                    let kept = source.path.parent().unwrap().join(name.to_str()?).join(leaf.to_str()?);
+                    return result.with_context(|| format!("Source retained at {}: {error}", kept.display()));
+                }
+            }
+            // Never recursively clean a staging directory that might retain an unverified source.
+            let _ = unsafe { libc::unlinkat(fd.as_raw_fd(), name.as_ptr(), libc::AT_REMOVEDIR) };
+            result?;
+        }
+        Ok(())
+    }
+}
+
+fn source_parent(source: &Source) -> Result<(OwnedFd, CString)> {
+    let fd = super::open_directory(source.path.parent().context("missing source parent")?)?;
+    let leaf = CString::new(source.path.file_name().context("missing source name")?.as_bytes())?;
+    Ok((fd, leaf))
 }
 
 fn session_sources(paths: &[String]) -> Result<Vec<String>> {
@@ -642,7 +749,7 @@ impl Connection {
             let mut window = Window::new();
             let mut sent = 0;
             let cancelled = self.cancelled.clone();
-            send(
+            let removal = send(
                 &sources,
                 Path::new("/"),
                 Scope::All,
@@ -680,7 +787,17 @@ impl Connection {
             )?;
             loop {
                 match self.receive()? {
-                    ToClient::Finish(Ok(())) => break,
+                    ToClient::Finish(Ok(())) if spec.operation == Operation::Copy => break,
+                    ToClient::Installed if spec.operation == Operation::Move => {
+                        self.remove_sources(removal)
+                            .context("Copy installed; source removal stopped. Check both locations before retrying")?;
+                        self.send(FromClient::Finish(Ok(())))?;
+                        ensure!(
+                            matches!(self.receive()?, ToClient::Finish(Ok(()))),
+                            "move completion was not acknowledged: check both locations"
+                        );
+                        break;
+                    }
                     ToClient::Progress => {}
                     _ => bail!("copy completion was not acknowledged"),
                 }
@@ -691,8 +808,25 @@ impl Connection {
             let _ = self.send(FromClient::Finish(Err(format!("{error:#}"))));
         }
         result?;
-        eprintln!("Laptop copy complete.");
+        eprintln!("Laptop {} complete.", if spec.operation == Operation::Move { "move" } else { "copy" });
         Ok(())
+    }
+
+    fn remove_sources(&mut self, removal: Removal) -> Result<()> {
+        let mut reported = Instant::now();
+        removal.remove(|| {
+            self.check()?;
+            match self.incoming.try_recv() {
+                Ok(Ok(ToClient::Finish(Err(error)))) | Ok(Err(error)) => bail!("{error}"),
+                Err(crossbeam_channel::TryRecvError::Empty) => {}
+                _ => bail!("Laptop connection lost during source removal: check both locations before retrying"),
+            }
+            if reported.elapsed() >= Duration::from_millis(500) {
+                self.send(FromClient::Progress)?;
+                reported = Instant::now();
+            }
+            Ok(())
+        })
     }
 
     fn install(&mut self, command: &mut std::process::Command) -> Result<()> {
@@ -767,6 +901,17 @@ pub fn run(socket: &Path, session: &str) -> Result<()> {
         ToClient::Ready(spec) => spec,
         _ => bail!("laptop copy was not authorized"),
     };
+    if spec.operation == Operation::Delete {
+        loop {
+            match connection.receive()? {
+                ToClient::Finish(Ok(())) => break,
+                ToClient::Progress => {}
+                _ => bail!("deletion was not acknowledged: check the laptop"),
+            }
+        }
+        eprintln!("Laptop deletion complete.");
+        return Ok(());
+    }
     if spec.to_laptop {
         return connection.send_files(&spec);
     }
@@ -804,11 +949,14 @@ pub fn run(socket: &Path, session: &str) -> Result<()> {
     let sent = connection.send(FromClient::Finish(result.as_ref().map(|_| ()).map_err(|e| format!("{e:#}"))));
     result.context("Laptop copy failed: check the message above and retry from the file manager")?;
     sent.context("Connection lost after installation: check the destination before retrying")?;
-    ensure!(
-        matches!(connection.receive()?, ToClient::Finish(Ok(()))),
-        "copy completion was not acknowledged: check the destination"
-    );
-    eprintln!("Laptop copy complete.");
+    loop {
+        match connection.receive()? {
+            ToClient::Finish(Ok(())) => break,
+            ToClient::Progress => {}
+            _ => bail!("completion was not acknowledged: check both locations before retrying"),
+        }
+    }
+    eprintln!("Laptop {} complete.", if spec.operation == Operation::Move { "move" } else { "copy" });
     Ok(())
 }
 
@@ -820,6 +968,7 @@ mod tests {
 
     fn spec(home: &TempDir, destination: &TempDir, name: &str) -> Spec {
         Spec {
+            operation: crate::laptop::copy::Operation::Copy,
             to_laptop: false,
             sources: vec![home.0.join(name).to_str().unwrap().into()],
             destination: destination.0.clone(),
@@ -829,6 +978,229 @@ mod tests {
 
     fn entry(path: &str, kind: Kind, size: u64) -> Packet {
         Packet::Entry(Entry { path: path.into(), kind, size, mode: 0o6755, seconds: 1_600_000_000, nanos: 123_456_789 })
+    }
+
+    #[test]
+    fn move_removes_only_unchanged_sources_after_installation() {
+        for change in ["none", "size", "inode", "mtime", "child", "new-child", "parent-link", "cancel"] {
+            let home = TempDir::new("move-source");
+            let destination = TempDir::new("move-destination");
+            let outside = TempDir::new("move-outside");
+            home.mkdir("tree");
+            let file = home.write("tree/report", "original");
+            outside.write("report", "outside");
+            let mut spec = spec(&home, &destination, "tree");
+            spec.operation = Operation::Move;
+            spec.to_laptop = true;
+            let mut stage = super::super::stage::Stage::new(&spec, &destination.0, Scope::All).unwrap();
+            let removal =
+                send(&spec.sources, &home.0, Scope::Home, |p| stage.receive(p).map(|_| ()), || Ok(())).unwrap();
+            assert_eq!(fs::read(&file).unwrap(), b"original");
+            stage.install(|| Ok(())).unwrap();
+            match change {
+                "size" => {
+                    fs::write(&file, "longer contents").unwrap();
+                }
+                "inode" => {
+                    fs::rename(&file, home.0.join("kept")).unwrap();
+                    fs::write(&file, "original").unwrap();
+                }
+                "mtime" => {
+                    let info = fs::metadata(&file).unwrap();
+                    metadata(
+                        &file,
+                        &Entry {
+                            path: "report".into(),
+                            kind: Kind::File,
+                            size: 8,
+                            mode: info.mode(),
+                            seconds: info.mtime() + 1,
+                            nanos: info.mtime_nsec(),
+                        },
+                    )
+                    .unwrap();
+                }
+                "child" => {
+                    fs::write(&file, "modified").unwrap();
+                }
+                "new-child" => {
+                    home.write("tree/new", "new");
+                }
+                "parent-link" => {
+                    fs::rename(home.0.join("tree"), home.0.join("kept-tree")).unwrap();
+                    symlink(&outside.0, home.0.join("tree")).unwrap();
+                }
+                _ => {}
+            }
+            let result = removal.remove(|| {
+                ensure!(change != "cancel", "cancelled");
+                Ok(())
+            });
+            assert_eq!(result.is_ok(), change == "none", "{change}: {result:?}");
+            assert_eq!(fs::read(destination.0.join("tree/report")).unwrap(), b"original");
+            assert_eq!(fs::read(outside.0.join("report")).unwrap(), b"outside");
+            assert_eq!(file.exists(), change != "none");
+        }
+    }
+
+    #[test]
+    fn removal_compares_device_inode_size_and_nanosecond_mtime() {
+        let home = TempDir::new("remove-identity");
+        let path = home.write("report", "original");
+        for field in ["device", "inode", "size", "seconds", "nanos"] {
+            let mut removal = Removal::read(&["~/report".into()], &home.0, Scope::Home, || Ok(())).unwrap();
+            let info = &mut removal.sources[0].info;
+            match field {
+                "device" => info.st_dev ^= 1,
+                "inode" => info.st_ino ^= 1,
+                "size" => info.st_size += 1,
+                "seconds" => info.st_mtime += 1,
+                _ => info.st_mtime_nsec ^= 1,
+            }
+            assert!(removal.remove(|| Ok(())).unwrap_err().to_string().contains("Source changed"));
+            assert_eq!(fs::read(&path).unwrap(), b"original");
+        }
+    }
+
+    #[test]
+    fn removal_captures_concurrent_saves_and_never_overwrites_them_on_restore() {
+        for change in ["before-capture", "after-verification", "restore-conflict"] {
+            let home = TempDir::new("remove-save");
+            let destination = TempDir::new("remove-save-destination");
+            let path = home.write("report", "original");
+            let saved = home.write("saved", "edited");
+            let spec = spec(&home, &destination, "report");
+            let mut stage = super::super::stage::Stage::new(&spec, &destination.0, Scope::All).unwrap();
+            let removal =
+                send(&spec.sources, &home.0, Scope::Home, |p| stage.receive(p).map(|_| ()), || Ok(())).unwrap();
+            stage.install(|| Ok(())).unwrap();
+            let mut checks = 0;
+            let result = removal.remove(|| {
+                checks += 1;
+                // The whole selection has passed verification. Replace either before capture
+                // or after the captured leaf's final verification, immediately before unlink.
+                if (checks == 2 && change != "after-verification") || (checks == 4 && change == "after-verification") {
+                    fs::rename(&saved, &path).unwrap();
+                }
+                if checks == 3 && change == "restore-conflict" {
+                    fs::write(&path, "newer edit").unwrap();
+                }
+                Ok(())
+            });
+            assert_eq!(result.is_ok(), change == "after-verification", "{change}: {result:?}");
+            assert_eq!(fs::read(destination.0.join("report")).unwrap(), b"original");
+            assert_eq!(
+                fs::read(&path).unwrap(),
+                if change == "restore-conflict" { b"newer edit".as_slice() } else { b"edited".as_slice() }
+            );
+            let retained: Vec<_> = fs::read_dir(&home.0)
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .filter(|path| path.file_name().unwrap().to_string_lossy().starts_with(".kraal-remove-"))
+                .collect();
+            if change == "restore-conflict" {
+                assert_eq!(retained.len(), 1);
+                assert_eq!(fs::metadata(&retained[0]).unwrap().mode() & 0o777, 0o700);
+                let kept = retained[0].join("report");
+                assert_eq!(fs::read(&kept).unwrap(), b"edited");
+                assert!(format!("{:#}", result.unwrap_err()).contains(kept.to_str().unwrap()));
+            } else {
+                assert!(retained.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn removal_protects_home_through_an_alternate_case_spelling() {
+        let root = TempDir::new("remove-home-case");
+        let home = root.mkdir("Home");
+        let alias = root.0.join("hOME");
+        let home = super::super::open_directory(&home).unwrap();
+        let sensitive = super::super::stage::case_sensitive(&home).unwrap();
+        if sensitive {
+            // Also exercise identity protection on case-sensitive filesystems: the opened home
+            // keeps its identity when renamed to the alternate spelling before removal.
+            fs::rename(root.0.join("Home"), &alias).unwrap();
+        }
+        fs::write(alias.join("keep"), "home contents").unwrap();
+        let sources = manifest(
+            &[alias.to_str().unwrap().into()],
+            &alias,
+            Scope::All,
+            cfg!(target_os = "macos"),
+            true,
+            &mut || Ok(()),
+        )
+        .unwrap();
+        let removal = Removal { sources, home };
+        let error = removal.remove(|| Ok(())).unwrap_err();
+        assert!(error.to_string().contains("Cannot remove the home or root directory"));
+        assert_eq!(fs::read(alias.join("keep")).unwrap(), b"home contents");
+    }
+
+    #[test]
+    fn delete_is_scoped_recursive_and_unlinks_links_without_following_them() {
+        let home = TempDir::new("delete-source");
+        let outside = TempDir::new("delete-outside");
+        outside.write("secret", "outside");
+        home.mkdir("tree/empty");
+        let unreadable = home.write("tree/.hidden", "hidden");
+        fs::set_permissions(unreadable, fs::Permissions::from_mode(0o0)).unwrap();
+        home.mkdir(".ssh");
+        home.write(".ssh/key", "private");
+        symlink(&outside.0, home.0.join("tree/link")).unwrap();
+        symlink("missing", home.0.join("broken")).unwrap();
+        for path in ["~/.ssh", "~/../escape", "~/tree/link/secret"] {
+            assert!(Removal::read(&[path.into()], &home.0, Scope::Home, || Ok(())).is_err());
+        }
+        assert!(Removal::read(&["~/tree".into()], &home.0, Scope::Off, || Ok(())).is_err());
+        assert!(Removal::read(&["~".into()], &home.0, Scope::Home, || Ok(())).unwrap().remove(|| Ok(())).is_err());
+        Removal::read(&["~/tree".into(), "~/broken".into()], &home.0, Scope::Home, || Ok(()))
+            .unwrap()
+            .remove(|| Ok(()))
+            .unwrap();
+        assert!(!home.0.join("tree").exists());
+        assert!(fs::symlink_metadata(home.0.join("broken")).is_err());
+        assert_eq!(fs::read(outside.0.join("secret")).unwrap(), b"outside");
+        assert_eq!(fs::read(home.0.join(".ssh/key")).unwrap(), b"private");
+    }
+
+    #[test]
+    fn removal_rechecks_each_leaf_and_keeps_new_or_skipped_children() {
+        for change in ["leaf", "new-child", "fifo"] {
+            let home = TempDir::new("delete-race");
+            home.mkdir("tree");
+            let path = home.write("tree/report", "original");
+            if change == "fifo" {
+                let name = CString::new(home.0.join("tree/fifo").as_os_str().as_bytes()).unwrap();
+                assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+            }
+            let removal = Removal::read(&["~/tree".into()], &home.0, Scope::Home, || Ok(())).unwrap();
+            let mut checks = 0;
+            let result = removal.remove(|| {
+                checks += 1;
+                if checks == 3 {
+                    if change == "leaf" {
+                        fs::write(&path, "changed").unwrap();
+                    }
+                    if change == "new-child" {
+                        home.write("tree/new", "new");
+                    }
+                }
+                Ok(())
+            });
+            assert!(result.is_err(), "{change}");
+            assert!(home.0.join("tree").exists());
+            if change == "leaf" {
+                assert_eq!(fs::read(&path).unwrap(), b"changed");
+            }
+            if change == "new-child" {
+                assert_eq!(fs::read(home.0.join("tree/new")).unwrap(), b"new");
+            }
+            if change == "fifo" {
+                assert!(fs::symlink_metadata(home.0.join("tree/fifo")).is_ok());
+            }
+        }
     }
 
     #[test]
@@ -994,10 +1366,17 @@ mod tests {
         assert!(send(&["~/file".into()], &home.0, Scope::Off, |_| panic!("scope off"), || Ok(())).is_err());
         home.mkdir("Library");
         home.write("Library/file", "private");
-        assert!(manifest(&["~/Library/file".into()], &home.0, Scope::Home, true, &mut || Ok(())).is_err());
+        assert!(manifest(&["~/Library/file".into()], &home.0, Scope::Home, true, false, &mut || Ok(())).is_err());
         assert!(
-            manifest(&[outside.0.join("secret").to_str().unwrap().into()], &home.0, Scope::All, false, &mut || Ok(()))
-                .is_ok()
+            manifest(
+                &[outside.0.join("secret").to_str().unwrap().into()],
+                &home.0,
+                Scope::All,
+                false,
+                false,
+                &mut || Ok(())
+            )
+            .is_ok()
         );
     }
 
@@ -1008,7 +1387,7 @@ mod tests {
         home.write("dir/file", "");
         let fifo = CString::new(home.0.join("dir/fifo").as_os_str().as_bytes()).unwrap();
         assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
-        let sources = manifest(&["~/dir".into()], &home.0, Scope::Home, false, &mut || Ok(())).unwrap();
+        let sources = manifest(&["~/dir".into()], &home.0, Scope::Home, false, false, &mut || Ok(())).unwrap();
         assert_eq!(sources.len(), 3);
         assert!(sources.iter().all(|s| s.entry.size == 0));
     }
@@ -1069,10 +1448,15 @@ mod tests {
         let home = TempDir::new("copy-limits");
         let file = home.write("large", "");
         File::options().write(true).open(file).unwrap().set_len(100 * 1024 * 1024).unwrap();
-        let source = manifest(&["~/large".into()], &home.0, Scope::Home, false, &mut || Ok(())).unwrap();
+        let source = manifest(&["~/large".into()], &home.0, Scope::Home, false, false, &mut || Ok(())).unwrap();
         assert_eq!(source[0].entry.size, 100 * 1024 * 1024);
-        assert!(manifest(&vec!["~/large".into(); ENTRIES + 1], &home.0, Scope::Home, false, &mut || Ok(())).is_err());
-        assert!(manifest(&["~/large".into(), "~/large".into()], &home.0, Scope::Home, false, &mut || Ok(())).is_err());
+        assert!(
+            manifest(&vec!["~/large".into(); ENTRIES + 1], &home.0, Scope::Home, false, false, &mut || Ok(())).is_err()
+        );
+        assert!(
+            manifest(&["~/large".into(), "~/large".into()], &home.0, Scope::Home, false, false, &mut || Ok(()))
+                .is_err()
+        );
     }
 
     #[test]
@@ -1150,6 +1534,7 @@ mod tests {
     #[test]
     fn install_reuses_move_no_replace_and_only_approved_names_as_literal_arguments() {
         let spec = Spec {
+            operation: crate::laptop::copy::Operation::Copy,
             to_laptop: false,
             sources: vec!["~/dir/-file with 'quotes'".into()],
             destination: "/dest space".into(),
@@ -1203,6 +1588,112 @@ mod tests {
         drop(spool);
         assert!(!root.0.join("op").exists());
         assert_eq!(fs::read(outside.0.join("keep")).unwrap(), b"untouched");
+    }
+
+    #[test]
+    fn sending_a_move_waits_for_installation_and_preserves_changed_sources() {
+        for outcome in ["success", "changed", "failed", "disconnect", "premature"] {
+            let source = TempDir::new("job-move-source");
+            let destination = TempDir::new("job-move-destination");
+            let path = source.write("report", "original");
+            let mut spec = spec(&source, &destination, "report");
+            spec.to_laptop = true;
+            spec.operation = Operation::Move;
+            let (stream, mut peer) = UnixStream::pair().unwrap();
+            let mut connection = Connection::new(stream, "abc".into()).unwrap();
+            let job = std::thread::spawn(move || connection.send_files(&spec));
+            let reply = |peer: &mut UnixStream, message| {
+                protocol::write_json(peer, &ServerMsg::LaptopCopy { token: "abc".into(), message }).unwrap();
+            };
+            reply(&mut peer, ToClient::Ack(0));
+            loop {
+                let (_, bytes) = protocol::read_frame(&mut peer).unwrap().unwrap();
+                let ClientMsg::LaptopCopy { message: FromClient::Data { sequence, packet }, .. } =
+                    serde_json::from_slice(&bytes).unwrap()
+                else {
+                    panic!("expected copy data")
+                };
+                let done = matches!(packet, Packet::Done);
+                reply(&mut peer, ToClient::Ack(sequence));
+                if done {
+                    break;
+                }
+            }
+            assert_eq!(fs::read(&path).unwrap(), b"original");
+            match outcome {
+                "failed" => reply(&mut peer, ToClient::Finish(Err("Installation failed".into()))),
+                "premature" => reply(&mut peer, ToClient::Finish(Ok(()))),
+                "disconnect" => {
+                    peer.shutdown(std::net::Shutdown::Both).unwrap();
+                }
+                _ => {
+                    if outcome == "changed" {
+                        fs::write(&path, "changed").unwrap();
+                    }
+                    reply(&mut peer, ToClient::Installed);
+                    let (_, bytes) = protocol::read_frame(&mut peer).unwrap().unwrap();
+                    let ClientMsg::LaptopCopy { message: FromClient::Finish(result), .. } =
+                        serde_json::from_slice(&bytes).unwrap()
+                    else {
+                        panic!("expected source removal result")
+                    };
+                    assert_eq!(result.is_ok(), outcome == "success");
+                    if outcome == "success" {
+                        assert!(!path.exists());
+                        reply(&mut peer, ToClient::Finish(Ok(())));
+                    } else {
+                        assert!(result.unwrap_err().contains("Source changed"));
+                    }
+                }
+            }
+            let result = job.join().unwrap();
+            assert_eq!(result.is_ok(), outcome == "success", "{result:?}");
+            if outcome != "success" {
+                assert_eq!(
+                    fs::read(&path).unwrap(),
+                    if outcome == "changed" { b"changed".as_slice() } else { b"original".as_slice() }
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn session_source_removal_observes_cancellation_after_installation_acknowledgement() {
+        for failure in ["finish", "read-error", "disconnect"] {
+            let source = TempDir::new("move-cancel-source");
+            let paths: Vec<_> = (0..3)
+                .map(|index| source.write(&format!("report-{index}"), "original").to_str().unwrap().to_owned())
+                .collect();
+            let removal = send(&paths, &source.0, Scope::All, |_| Ok(()), || Ok(())).unwrap();
+            let (stream, _peer) = UnixStream::pair().unwrap();
+            let (outgoing, incoming) = crossbeam_channel::bounded(WINDOW + 1);
+            // Keep the server socket connected, as it is when only the laptop disconnects.
+            // Feed its reader queue directly so the cancellation is deterministic.
+            let mut connection = Connection {
+                stream,
+                incoming,
+                cancelled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                signals: Vec::new(),
+                token: "abc".into(),
+            };
+            outgoing.send(Ok(ToClient::Installed)).unwrap();
+            assert!(matches!(connection.receive().unwrap(), ToClient::Installed));
+            match failure {
+                "finish" => outgoing.send(Ok(ToClient::Finish(Err("laptop disconnected".into())))).unwrap(),
+                "read-error" => outgoing.send(Err("laptop disconnected".into())).unwrap(),
+                _ => {}
+            }
+            drop(outgoing);
+            let error = connection.remove_sources(removal).unwrap_err();
+            assert!(error.to_string().contains(if failure == "disconnect" {
+                "connection lost"
+            } else {
+                "laptop disconnected"
+            }));
+            for path in paths {
+                assert_eq!(fs::read(path).unwrap(), b"original");
+            }
+        }
     }
 
     #[test]

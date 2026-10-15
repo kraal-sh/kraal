@@ -801,14 +801,6 @@ impl FilesPane {
                 "Editing and shells are unavailable on the laptop: open them on that machine".into(),
             );
         }
-        if (laptop && matches!(key, FileKey::Char('d') | FileKey::Delete | FileKey::F(8)))
-            || (self.panels.iter().any(|p| matches!(p.location, Location::Laptop { .. }))
-                && matches!(key, FileKey::Char('m') | FileKey::F(6)))
-        {
-            return FilesAction::Refused(
-                "Laptop move and delete: not yet available. Use kraal cp on the laptop to copy files".into(),
-            );
-        }
         let page = isize::try_from(self.list_height().saturating_sub(1).max(1)).unwrap_or(1);
         match key {
             FileKey::Up | FileKey::Char('k') => self.panel_mut(side).move_by(-1),

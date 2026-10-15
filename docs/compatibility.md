@@ -59,7 +59,7 @@ A state from a newer format is also left untouched, with a message to use a newe
 
 ## Clients and servers
 
-This version uses protocol 6 for laptop listings and copies in both directions. Kraal 0.4.0 used protocol 3;
+This version uses protocol 7 for laptop listings, copies, moves and deletion. Kraal 0.4.0 used protocol 3;
 Kraal 0.2.0 and 0.3.0 use protocol 2.
 Different protocol versions refuse attachment and ordinary commands. There are no older-peer
 adapters or optional feature negotiation. A refusal names both protocol versions and one next step:
@@ -88,7 +88,7 @@ A 0.3.0 client waiting for a restarted server receives the protocol refusal and 
 Workspaces are saved automatically. KDL is imported and exported explicitly with `kraal import`
 and `kraal export`; `kraal save` and its historical `SaveWorkspace` request are removed.
 Clipboard, file attachments, pasted paths and clipboard images introduced in protocol 3 remain
-part of protocol 6.
+part of protocol 7.
 The client applies its clipboard policy, including the terminal OSC 52 fallback where configured.
 The server no longer emits OSC 52 as an adapter for old clients.
 
@@ -115,6 +115,12 @@ The client announces directory case sensitivity using `_PC_CASE_SENSITIVE` on ma
 replacement names compare without case where needed. Replacement approval is always drawn
 and checked locally, even with Always. A name taken meanwhile stays staged and is named.
 Modes without setuid/setgid and modification times are preserved; extended attributes and ACLs are not copied.
+
+Moves wait for installation before removing any source. Both directions recheck device,
+inode, size and modification time, including nanoseconds, and keep changed sources.
+Deletion and move-away confirmation is drawn by the laptop client even with Always.
+Removal uses descriptor-relative operations on Linux and macOS and never follows links.
+These operations do not change the saved session, workspace or configuration formats.
 
 Laptop panels save as the session machine's home directory, with no laptop paths or listings
 in the saved session. The session format and its downgrade isolation remain unchanged.

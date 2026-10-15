@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::agent::AgentState;
 
-pub const PROTOCOL_VERSION: u32 = 6;
+pub const PROTOCOL_VERSION: u32 = 7;
 pub const KRAAL_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Both released migration sources used protocol 2 and omitted it from Pong.
@@ -1128,6 +1128,7 @@ mod tests {
             ServerMsg::LaptopCopy {
                 token: s("abc"),
                 message: ToClient::Ready(Spec {
+                    operation: crate::laptop::copy::Operation::Copy,
                     to_laptop: false,
                     sources: vec![s("~/report")],
                     destination: p("/destination"),
@@ -1138,9 +1139,22 @@ mod tests {
             ServerMsg::LaptopCopy {
                 token: s("abc"),
                 message: ToClient::Write(Spec {
+                    operation: crate::laptop::copy::Operation::Copy,
                     to_laptop: true,
                     sources: vec![s("/server/report")],
                     destination: p("~/Downloads"),
+                    allow: vec![],
+                }),
+            },
+            ServerMsg::LaptopCopy { token: s("abc"), message: ToClient::Installed },
+            ServerMsg::LaptopCopy { token: s("abc"), message: ToClient::Delete { sources: vec![s("~/report")] } },
+            ServerMsg::LaptopCopy {
+                token: s("abc"),
+                message: ToClient::Move(Spec {
+                    operation: crate::laptop::copy::Operation::Move,
+                    to_laptop: false,
+                    sources: vec![s("~/report")],
+                    destination: p("/destination"),
                     allow: vec![],
                 }),
             },
