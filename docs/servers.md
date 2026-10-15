@@ -256,13 +256,28 @@ says so in a message. The editor must stay in the foreground until you are done 
 
 Nothing is written blindly: kraal keeps a hash of what it read, made on the server, and checks it
 before each save. If the file changed there meanwhile, it asks: keep your version as a local file
-(in `download_dir`; your next saves go there), keep the server's version (the editor's copy
-becomes it, unless you save again before it arrives: then it asks again), or replace it with
-yours. A save writes a new file next to the old one, with its mode (and owner when you may give
-it), then renames it over it. Once the new version is there, the check and the rename happen
-under a lock next to the file (`.kraal-edit-lock-…`, gone right after), so two kraal editors of
-the same file never overwrite each other unseen: the later one is asked. kraal edits regular
-files of up to 16 MiB, following symbolic links to them. On a production server it asks first,
+(in `download_dir`; your next saves go there), keep the server's version (reload it in the
+editor after kraal updates its copy), or replace it with yours. Reloading checks the local
+entry it moves aside. A save detected meanwhile is kept or restored, and kraal asks again.
+If another entry has appeared at its name, kraal leaves it alone and reports a recovery
+directory beside the edit's private directory. That directory survives closing the editor; inspect its
+`previous` and `new` files before removing it. Successful reloads also keep the moved inode
+as `previous` in a sibling directory, in case the editor still has it open.
+
+A save stages a new file next to the old one, with its mode (and owner when you may give it),
+moves the original aside and checks that preserved version before linking the new file into
+place. Required link operations are checked before the original is moved; unsupported
+filesystems are refused with the destination intact. Publication and restoration both refuse
+to replace an entry that appeared meanwhile.
+An interrupted or conflicting save restores the original where possible; otherwise the error
+names a `.kraal-edit-*` recovery directory on the server, with `old` and `new` subdirectories.
+Keep those copies until you have checked the destination. A forced termination can also leave
+that directory behind, or leave the destination temporarily absent. A lock next to the file
+(`.kraal-edit-lock-*`, removed after the save) serializes kraal saves. An editor with the old
+file still open can continue writing to that inode; kraal checks it again after publication,
+and keeps it in the recovery directory even after success so that later writes remain
+recoverable. Successful saves leave only `old`; remove it once other editors have closed the
+file. kraal edits regular files of up to 16 MiB, following symbolic links to them. On a production server it asks first,
 and `kraal edit` refuses unless given `--production`. If kraal stops while you edit, what was not
 saved is kept in `download_dir`.
 
@@ -270,7 +285,7 @@ saved is kept in `download_dir`.
 --sudo`, or yes to the question `e` in the file manager and a hint ask then. One connection runs
 sudo for the whole edit: a small pane asks for your password, and kraal passes it on to sudo
 without keeping it (it is never written to a disk, and is wiped once given); no password is asked
-where sudo needs none. Each save then goes through the same checks, lock and rename as root,
+where sudo needs none. Each save then goes through the same checks, lock and publication as root,
 which keeps the file's mode and owner. sudo must accept a password on its input (`-S`): one that
 asks for more than a password (a one-time code), or that requires a terminal, is not supported.
 
